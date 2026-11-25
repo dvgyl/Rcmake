@@ -6,10 +6,9 @@ use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use rcmake_eval::ProbeCacheMode;
-use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, ReadRange, WriteMode, path};
+use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, WriteMode, path};
 use rcmake_store::{Digest, Domain, Entry, InputStamp, Store, StoreConfig, StoreMode, TraceMemo};
 use serde::{Deserialize, Serialize};
 
@@ -395,36 +394,6 @@ impl ProbeCache {
             }
             let key = compute_probe_key(recipe);
             let store = Store::new(host, config.clone())?.with_trace_memo(&self.memo);
-            let markers = config.root.join("probe-generations");
-            ensure_directory(host, &config.root)?;
-            ensure_directory(host, &markers)?;
-            let [shard, ..] = key.as_bytes();
-            let marker = markers.join(format!("{shard:02x}"));
-            // A bounded generation table lets Store replace a stale result
-            // without using Store's private file layout. A changed supplemental
-            // input invalidates this shard's entries until the next publication.
-            let lock = marker.with_extension("lock");
-            check_regular_or_missing(host, &lock)?;
-            let _guard = match host.lock_file(&lock, Some(Duration::ZERO)) {
-                Ok(guard) => guard,
-                Err(error) if error.kind == ErrorKind::TimedOut => {
-                    return Ok(ProbePublishOutcome::Skipped(SkipReason::Busy));
-                }
-                Err(error) if error.kind == ErrorKind::Unsupported => {
-                    return Ok(ProbePublishOutcome::Skipped(SkipReason::Unsupported));
-                }
-                Err(error) => return Err(error),
-            };
-            let existing = store.get_entry::<CachedProbe>(Domain::ProbeV1, key)?;
-            if existing.is_some() && read_outcome(host, &store, recipe).is_some() {
-                return Ok(ProbePublishOutcome::AlreadyPresent);
-            }
-            check_regular_or_missing(host, &marker)?;
-            let mut generation = match host.read(&marker, ReadRange::All { limit: 32 }) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind == ErrorKind::NotFound => Vec::new(),
-                Err(error) => return Err(error),
-            };
             let blobs = match &outcome.artifact {
                 Some(artifact) => vec![store.put_blob(&artifact.bytes)?],
                 None => Vec::new(),
@@ -432,52 +401,31 @@ impl ProbeCache {
             if cancelled() {
                 return Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled));
             }
-            if existing.is_some() || generation.len() != 32 {
-                generation = Digest::hash(&generation).as_bytes().to_vec();
-                let id = NEXT_ARTIFACT.fetch_add(1, Ordering::Relaxed);
-                let staged = markers.join(format!(".generation-{}-{id:x}", host.system().pid));
-                host.write(&staged, &generation, WriteMode::CreateNew)?;
-                if let Err(error) = host.rename(&staged, &marker) {
-                    let _ = host.remove_file(&staged);
-                    return Err(error);
-                }
-            }
-            let mut trace = trace.clone();
-            trace.push(InputStamp::FileHash {
-                path: marker,
-                digest: Digest::hash(&generation),
-            });
-            if !entry_fits(&trace, checks, &payload) {
-                return Ok(ProbePublishOutcome::Skipped(SkipReason::Outcome));
-            }
             let entry = Entry {
-                trace,
+                trace: trace.clone(),
                 blobs,
                 payload: CachedProbe {
                     outcome: payload,
                     checks: checks.clone(),
                 },
             };
-            if recipe.environment != environment_fingerprint(&host.env_all())
-                || journal.verified_inputs(host).is_none()
-            {
-                return Ok(inputs_changed());
-            }
-            if cancelled() {
-                return Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled));
-            }
             use rcmake_store::PublishOutcome;
-            match store.put_entry(Domain::ProbeV1, key, &entry)? {
-                status @ (PublishOutcome::Published | PublishOutcome::AlreadyPresent) => {
-                    if read_outcome(host, &store, recipe).is_some() {
-                        Ok(if status == PublishOutcome::Published {
-                            ProbePublishOutcome::Published
-                        } else {
-                            ProbePublishOutcome::AlreadyPresent
-                        })
-                    } else {
-                        Ok(ProbePublishOutcome::Skipped(SkipReason::Busy))
-                    }
+            let fresh_valid = || {
+                !cancelled()
+                    && recipe.environment == environment_fingerprint(&host.env_all())
+                    && checks.verify(host)
+            };
+            match store.put_entry_checked(
+                Domain::ProbeV1,
+                key,
+                &entry,
+                |previous, reader| decode_outcome(host, reader, recipe, previous).is_some(),
+                fresh_valid,
+            )? {
+                PublishOutcome::Published => Ok(ProbePublishOutcome::Published),
+                PublishOutcome::AlreadyPresent => Ok(ProbePublishOutcome::AlreadyPresent),
+                PublishOutcome::Stale if cancelled() => {
+                    Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled))
                 }
                 PublishOutcome::Stale => Ok(ProbePublishOutcome::Skipped(SkipReason::Stale)),
                 PublishOutcome::SkippedBusy => Ok(ProbePublishOutcome::Skipped(SkipReason::Busy)),
@@ -605,15 +553,6 @@ fn ensure_directory(host: &dyn Host, path: &Path) -> HostResult<()> {
         Ok(meta) if meta.kind == FileKind::Dir => Ok(()),
         Err(error) if error.kind == ErrorKind::NotFound => host.create_dir_all(path),
         Ok(_) => Err(HostError::unsupported("Expected a cache directory.")),
-        Err(error) => Err(error),
-    }
-}
-
-fn check_regular_or_missing(host: &dyn Host, path: &Path) -> HostResult<()> {
-    match host.metadata(path, Follow::No) {
-        Ok(meta) if meta.kind == FileKind::File && meta.nlink <= 1 => Ok(()),
-        Err(error) if error.kind == ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(HostError::unsupported("Expected a regular cache file.")),
         Err(error) => Err(error),
     }
 }
@@ -757,21 +696,21 @@ fn read_outcome(
     let entry = store
         .get_entry::<CachedProbe>(Domain::ProbeV1, compute_probe_key(recipe))
         .ok()??;
-    decode_outcome(host, store, recipe, entry)
+    decode_outcome(host, store, recipe, &entry)
 }
 
 pub(super) fn decode_outcome(
     host: &dyn Host,
     store: &Store<'_>,
     recipe: &ProbeRecipe,
-    entry: Entry<CachedProbe>,
+    entry: &Entry<CachedProbe>,
 ) -> Option<ObservedOutcome> {
     if !entry.payload.checks.verify(host) {
         return None;
     }
     let bindings = recipe.bindings.clone().with_canonical(host);
-    let outcome = entry.payload.outcome;
-    if !entry_fits(&entry.trace, &entry.payload.checks, &outcome) {
+    let outcome = &entry.payload.outcome;
+    if !entry_fits(&entry.trace, &entry.payload.checks, outcome) {
         return None;
     }
     let artifact = match (&outcome.artifact, entry.blobs.as_slice()) {
@@ -820,11 +759,11 @@ pub(super) fn rebind_speculation(
         }
         _ => return None,
     };
-    render_outcome(templated, &bindings, artifact)
+    render_outcome(&templated, &bindings, artifact)
 }
 
 fn render_outcome(
-    outcome: ProbeOutcome,
+    outcome: &ProbeOutcome,
     bindings: &super::template::PathBindings,
     artifact: Option<Artifact>,
 ) -> Option<ObservedOutcome> {
@@ -834,7 +773,7 @@ fn render_outcome(
     let output = outcome.output.render(bindings)?;
     let mut remaining = MAX_ARTIFACT_BYTES.checked_sub(output.len())?;
     let mut diagnostics = Vec::with_capacity(outcome.diagnostics.len());
-    for diagnostic in outcome.diagnostics {
+    for diagnostic in &outcome.diagnostics {
         let message = diagnostic.message.render_bounded(bindings, remaining)?;
         remaining -= message.len();
         diagnostics.push(ProbeDiagnostic {

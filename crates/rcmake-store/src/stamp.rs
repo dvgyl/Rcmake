@@ -1,3 +1,7 @@
+mod tree;
+
+pub use tree::{sdk_tree_listing_digest, tree_listing_digest};
+
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -54,6 +58,22 @@ impl From<&Metadata> for FastStat {
     }
 }
 
+/// Select how a search listing handles directory links.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum TreePolicy {
+    /// Reject directory links.
+    #[default]
+    Ordinary,
+    /// Traverse SDK directory links in a bounded graph.
+    Sdk,
+}
+
+impl TreePolicy {
+    fn is_ordinary(&self) -> bool {
+        *self == Self::Ordinary
+    }
+}
+
 /// One input observed during a computation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum InputStamp {
@@ -81,12 +101,15 @@ pub enum InputStamp {
         /// Observed digest from [directory_digest].
         digest: Digest,
     },
-    /// A directory identified by its bounded recursive listing.
+    /// A directory identified by a bounded search listing.
     TreeListing {
         /// Absolute search directory.
         path: PathBuf,
-        /// Observed digest from [tree_listing_digest].
+        /// Observed digest from the selected listing policy.
         digest: Digest,
+        /// Select whether the listing follows SDK directory links.
+        #[serde(default, skip_serializing_if = "TreePolicy::is_ordinary")]
+        policy: TreePolicy,
     },
     /// A path that did not exist.
     Missing {
@@ -166,7 +189,7 @@ pub fn file_digest(host: &dyn Host, path: &Path) -> HostResult<Digest> {
 /// Reuse file digests within one session while file identity and metadata match.
 #[derive(Default)]
 pub struct TraceMemo {
-    files: Mutex<BTreeMap<FastStat, Digest>>,
+    files: Mutex<BTreeMap<(FastStat, rcmake_host::FileTime), Digest>>,
 }
 
 impl TraceMemo {
@@ -176,7 +199,15 @@ impl TraceMemo {
         if metadata.kind != FileKind::File || metadata.ino == 0 {
             return hash_file(host, path, &metadata);
         }
-        let stat = FastStat::from(&metadata);
+        let Some(ctime) = metadata.ctime else {
+            return hash_file(host, path, &metadata);
+        };
+        // Keep files with recent or second-resolution change times out of the memo.
+        let now = host.now();
+        if ctime.nanos == 0 || ctime.secs >= now.secs.saturating_sub(1) {
+            return hash_file(host, path, &metadata);
+        }
+        let stat = (FastStat::from(&metadata), ctime);
         if let Ok(files) = self.files.lock()
             && let Some(&digest) = files.get(&stat)
         {
@@ -232,6 +263,7 @@ fn hash_file(host: &dyn Host, path: &Path, before: &Metadata) -> HostResult<Dige
     let after = host.metadata(path, Follow::Yes)?;
     if offset != before.len
         || after.kind != FileKind::File
+        || before.ctime != after.ctime
         || FastStat::from(before) != FastStat::from(&after)
     {
         return Err(crate::io_at(
@@ -261,67 +293,6 @@ pub fn directory_digest(host: &dyn Host, path: &Path) -> HostResult<Digest> {
         hasher.field(tag, &entry.name);
     }
     Ok(hasher.finish())
-}
-
-/// Hash the names, kinds, and link targets below a search directory.
-///
-/// Reject trees over 20,000 entries or 16 levels deep. Reject links to directories
-/// because changes below those links would not appear in this listing.
-pub fn tree_listing_digest(host: &dyn Host, root: &Path) -> HostResult<Digest> {
-    let mut key = KeyHasher::new(Domain::BlobV1);
-    key.field(0, b"tree-listing");
-    if host.metadata(root, Follow::No)?.kind == FileKind::Symlink {
-        key.field(1, host.read_link(root)?.as_os_str().as_encoded_bytes());
-    }
-    let mut directories = vec![(root.to_path_buf(), 0)];
-    let mut remaining = 20_000_usize;
-    while let Some((directory, depth)) = directories.pop() {
-        let mut entries = host.read_dir(&directory)?;
-        remaining = remaining
-            .checked_sub(entries.len())
-            .filter(|_| depth <= 16)
-            .ok_or_else(|| HostError::unsupported("Search directory exceeds the listing limit."))?;
-        entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-        let relative = directory
-            .strip_prefix(root)
-            .map_err(|_| HostError::unsupported("Search directory is outside its root."))?;
-        key.field(2, relative.as_os_str().as_encoded_bytes());
-        for entry in entries {
-            let name = rcmake_host::path::to_native(&entry.name);
-            if !matches!(name.components().next(), Some(Component::Normal(_)))
-                || name.components().count() != 1
-            {
-                return Err(HostError::unsupported("Invalid search directory entry."));
-            }
-            let path = directory.join(name);
-            match entry.kind {
-                FileKind::File => key.field(3, &entry.name),
-                FileKind::Dir => {
-                    key.field(4, &entry.name);
-                    directories.push((path, depth + 1));
-                }
-                FileKind::Symlink => {
-                    key.field(5, &entry.name);
-                    key.field(6, host.read_link(&path)?.as_os_str().as_encoded_bytes());
-                    match host.metadata(&path, Follow::Yes) {
-                        Ok(stat) if stat.kind == FileKind::File => key.field(7, b"file"),
-                        Err(error) if error.kind == ErrorKind::NotFound => key.field(7, b"missing"),
-                        _ => {
-                            return Err(HostError::unsupported(
-                                "Search directory contains an unverifiable link.",
-                            ));
-                        }
-                    }
-                }
-                FileKind::Other => {
-                    return Err(HostError::unsupported(
-                        "Search directory contains an unsupported entry.",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(key.finish())
 }
 
 /// Check all inputs through the host. A changed, invalid, or unreadable input is a miss.
@@ -360,8 +331,16 @@ fn matches_input(host: &dyn Host, input: &InputStamp, memo: Option<&TraceMemo>) 
         InputStamp::DirEntries { path, digest } => {
             directory_digest(host, path).as_ref() == Ok(digest)
         }
-        InputStamp::TreeListing { path, digest } => {
-            tree_listing_digest(host, path).as_ref() == Ok(digest)
+        InputStamp::TreeListing {
+            path,
+            digest,
+            policy,
+        } => {
+            let current = match policy {
+                TreePolicy::Ordinary => tree_listing_digest(host, path),
+                TreePolicy::Sdk => sdk_tree_listing_digest(host, path),
+            };
+            current.as_ref() == Ok(digest)
         }
         InputStamp::Missing { path } => missing(host, path),
         InputStamp::EnvVar { name, digest } => {

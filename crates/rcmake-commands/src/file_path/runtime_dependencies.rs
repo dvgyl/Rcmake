@@ -115,6 +115,15 @@ fn run_command(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         ));
     }
 
+    if matches!(platform, b"linux+elf" | b"freebsd+elf") {
+        let tool = cx.var_or_empty(b"CMAKE_LDCONFIG_TOOL");
+        if !matches!(tool.as_slice(), b"" | b"ldconfig") {
+            return Err(error(format!(
+                "Invalid value for CMAKE_LDCONFIG_TOOL: {tool}"
+            )));
+        }
+    }
+
     let mut scan = Scan::new(cx, &args);
     if !INPUTS.iter().any(|key| !args.multi(key).is_empty()) {
         return scan.report(&args);

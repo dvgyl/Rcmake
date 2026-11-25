@@ -199,7 +199,12 @@ impl ProcessVerifier for Compiler<'_> {
         (request == self.request).then(Vec::new)
     }
 
-    fn dependencies(&self, request: &RunRequest, output: &RunOutput) -> Option<DependencyClosure> {
+    fn dependencies(
+        &self,
+        request: &RunRequest,
+        output: &RunOutput,
+        _preflight: &[InputStamp],
+    ) -> Option<DependencyClosure> {
         if self.empty_trace {
             return Some(DependencyClosure {
                 files: Default::default(),

@@ -96,6 +96,7 @@ impl ChildConfig {
             config.host = host.clone();
             let mut child = Interp::new(config, crate::register_all);
             initialize(&mut child);
+            child.set_project_injection(!source_signature);
             child.inherit_recursion_depth(self.depth);
             if let Some(mut trace) = self.trace {
                 let redirect = trace.redirect.replace(PathBuf::new());

@@ -85,6 +85,7 @@ pub(super) struct Override {
 
 impl Override {
     fn apply(&self, stat: &mut Metadata) {
+        stat.ctime = None;
         if let Some(bytes) = &self.bytes {
             stat.len = bytes.0.len() as u64;
         }
@@ -289,6 +290,7 @@ impl<H: Host + ?Sized> State<H> {
                 len: 0,
                 atime: now,
                 mtime: now,
+                ctime: None,
                 dev: u64::MAX,
                 ino: self.next_ino,
                 nlink: if kind == FileKind::Dir { 2 } else { 1 },

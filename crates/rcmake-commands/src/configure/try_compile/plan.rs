@@ -280,7 +280,7 @@ pub(crate) fn compute_probe_key(recipe: &ProbeRecipe) -> Digest {
 
 fn recipe_key(recipe: &ProbeRecipe, bind_exact: bool) -> Digest {
     let mut key = KeyHasher::new(Domain::ProbeV1);
-    key.field(1, &2_u16.to_le_bytes());
+    key.field(1, &3_u16.to_le_bytes());
     key.field(2, recipe.rcmake.0.as_bytes());
     key.field(3, recipe.cmake_root.as_bytes());
     key.field(4, recipe.host.as_bytes());

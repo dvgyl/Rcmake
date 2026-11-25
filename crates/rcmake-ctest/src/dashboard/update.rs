@@ -33,6 +33,7 @@ pub(super) fn run(
     let program = definition(invocation, b"CTEST_UPDATE_COMMAND")
         .filter(|value| !value.is_empty())
         .unwrap_or(&config.update_command);
+    let update_type = setting(b"CTEST_UPDATE_TYPE", b"UpdateType")?;
     let git = setting(b"CTEST_GIT_COMMAND", b"GITCommand")?;
     let version_only = setting(b"CTEST_UPDATE_VERSION_ONLY", b"UpdateVersionOnly")?;
     let revision = setting(b"CTEST_UPDATE_VERSION_OVERRIDE", b"UpdateVersionOverride")?;
@@ -45,17 +46,19 @@ pub(super) fn run(
         Options {
             program,
             git: &git,
+            update_type: &update_type,
             version_only: truth::is_on(&version_only),
             revision: &revision,
             log: !invocation.options.quiet,
         },
     )
-    .map(|_| 0)
+    .map(|count| i32::from(count < 0))
 }
 
 pub(crate) struct Options<'a> {
     pub(crate) program: &'a [u8],
     pub(crate) git: &'a [u8],
+    pub(crate) update_type: &'a [u8],
     pub(crate) version_only: bool,
     pub(crate) revision: &'a [u8],
     pub(crate) log: bool,
@@ -70,8 +73,7 @@ pub(crate) fn update(
     options: Options<'_>,
 ) -> Result<i32, String> {
     let started = host.now();
-    let is_git = host.metadata(&source.join(".git"), Follow::Yes).is_ok();
-    let repository = if is_git { "GIT" } else { "Unknown" };
+    let repository = repository(host, source, options.update_type, options.program);
     if options.log {
         host.write_out(
             Stream::Stdout,
@@ -91,26 +93,24 @@ pub(crate) fn update(
         status: String::new(),
     };
     if report.revision.is_empty() {
-        let program = if !options.program.is_empty() {
-            options.program
-        } else if !is_git {
-            b"".as_slice()
-        } else if !options.git.is_empty() {
-            options.git
-        } else {
-            b"git".as_slice()
+        let status = match repository {
+            "GIT" => {
+                let program = if !options.program.is_empty() {
+                    options.program
+                } else if !options.git.is_empty() {
+                    options.git
+                } else {
+                    b"git"
+                };
+                collect(host, source, program, options.version_only, &mut report)
+            }
+            "Unknown" if options.program.is_empty() => {
+                return Err("Update command is not specified.".into());
+            }
+            "Unknown" => Ok(()),
+            _ => Err(format!("The {repository} update backend is unavailable.")),
         };
-        if program.is_empty() {
-            return Err("Update command is not specified.".into());
-        }
-        if let Err(message) = collect(
-            host,
-            source,
-            program,
-            is_git,
-            options.version_only,
-            &mut report,
-        ) {
+        if let Err(message) = status {
             host.write_out(Stream::Stderr, format!("   {message}\n").as_bytes());
             report.status = message;
         }
@@ -130,11 +130,43 @@ pub(crate) fn update(
     }
 }
 
+fn repository(host: &dyn Host, source: &Path, update_type: &[u8], program: &[u8]) -> &'static str {
+    const TOOLS: [(&[u8], &str, &str); 6] = [
+        (b"git", "GIT", ".git"),
+        (b"svn", "SVN", ".svn"),
+        (b"cvs", "CVS", "CVS"),
+        (b"bzr", "BZR", ".bzr"),
+        (b"hg", "HG", ".hg"),
+        (b"p4", "P4", ""),
+    ];
+    let filename = program
+        .rsplit(|&byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or_default();
+    let filename = filename.strip_suffix(b".exe").unwrap_or(filename);
+    let select = |value: &[u8]| {
+        TOOLS
+            .iter()
+            .find(|(tool, _, _)| value.eq_ignore_ascii_case(tool))
+            .map(|(_, name, _)| *name)
+    };
+    select(update_type)
+        .or_else(|| {
+            TOOLS
+                .iter()
+                .find(|(_, _, marker)| {
+                    !marker.is_empty() && host.metadata(&source.join(marker), Follow::Yes).is_ok()
+                })
+                .map(|(_, name, _)| *name)
+        })
+        .or_else(|| select(filename))
+        .unwrap_or("Unknown")
+}
+
 fn collect(
     host: &dyn Host,
     source: &Path,
     program: &[u8],
-    is_git: bool,
     version_only: bool,
     report: &mut Report,
 ) -> Result<(), String> {
@@ -163,11 +195,6 @@ fn collect(
             Err("Update command failed.".to_owned())
         }
     };
-    // An unrecognized source tree uses the generic `cmCTestVC`, which does not run the
-    // update command (`* Unknown VCS tool, not updating!`).
-    if !is_git {
-        return Ok(());
-    }
     let revision = || -> Result<BString, String> {
         let output = run(vec!["rev-parse".into(), "HEAD".into()])?;
         let hash = output.trim_ascii();

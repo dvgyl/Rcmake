@@ -409,7 +409,7 @@ fn configure_checks_final_generated_contents() -> HostResult<()> {
         assert_eq!(seen, [false, true, false]);
     }
     let mut future_snapshot = snapshot.clone();
-    future_snapshot.schema = "configure.v2".into();
+    future_snapshot.schema = "configure.v3".into();
     assert!(matches!(
         verify_configure(&host, &future_snapshot, &key, &context, unavailable),
         Err(ReplayMiss {
@@ -572,6 +572,29 @@ fn frame_round_trips_native_paths_and_rejects_wrong_lengths()
     assert_eq!(ConfigureSnapshot::<Vec<u8>>::decode(&framed)?, snapshot);
     framed.push(0);
     assert!(ConfigureSnapshot::<Vec<u8>>::decode(&framed).is_err());
+    Ok(())
+}
+
+#[test]
+fn snapshot_codec_rejects_truncation_and_bit_changes() -> Result<(), Box<dyn std::error::Error>> {
+    let (_, key, context) = fixture(RegionKind::Configure);
+    let region = RegionState::default().finish(key, context);
+    let snapshot = ConfigureSnapshot::new(region, vec![0, 1, 255])?;
+    let seed = snapshot.encode()?;
+    assert_eq!(ConfigureSnapshot::<Vec<u8>>::decode(&seed)?, snapshot);
+    for offset in (0..seed.len()).step_by(7) {
+        let mut changed = seed.clone();
+        if let Some(byte) = changed.get_mut(offset) {
+            *byte ^= 0x40;
+        }
+        assert!(ConfigureSnapshot::<Vec<u8>>::decode(&changed).is_err());
+        assert!(
+            ConfigureSnapshot::<Vec<u8>>::decode(seed.get(..offset).unwrap_or_default()).is_err()
+        );
+    }
+    let mut previous = snapshot;
+    previous.schema = "configure.v1".into();
+    assert!(ConfigureSnapshot::<Vec<u8>>::decode(&previous.encode()?).is_err());
     Ok(())
 }
 

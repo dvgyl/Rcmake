@@ -48,7 +48,7 @@ impl RemoteProbe {
             if verify_trace(host, &entry.trace) != VerifyOutcome::Hit {
                 return None;
             }
-            decode_outcome(host, &store, recipe, entry)
+            decode_outcome(host, &store, recipe, &entry)
         })
     }
 

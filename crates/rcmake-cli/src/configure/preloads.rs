@@ -3,7 +3,7 @@ use rcmake_eval::IncludeOptions;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use rcmake_base::BString;
+use rcmake_base::{BString, list};
 use rcmake_commands::ConfigureRuntime;
 use rcmake_eval::{Interp, RunMode, Services};
 use rcmake_host::{FileKind, Follow, Host};
@@ -142,22 +142,16 @@ impl ConfigureSession<'_> {
             .collect::<BTreeSet<_>>();
         configure.untrack_variable_reads(pending.difference(&unread).cloned());
         *configure.cx().cache() = std::mem::take(interp.cx().cache());
-        // A preload script shares global state with the project (for example
-        // `cmake_file_api(QUERY)` and `set_property(GLOBAL)`).
-        let props: Vec<_> = {
-            let mut cx = interp.cx();
-            let global = &cx.global().props;
-            global
-                .names()
-                .into_iter()
-                .filter_map(|name| global.get(&name).cloned().map(|value| (name, value)))
-                .collect()
-        };
-        {
-            let mut cx = configure.cx();
-            for (name, value) in props {
-                cx.global().props.set(name, value);
+        let name = b"_RCMAKE_FILE_API_PROJECT_QUERIES";
+        let mut preload = interp.cx();
+        if let Some(queries) = preload.global().props.get(name) {
+            let mut project = configure.cx();
+            let props = &mut project.global().props;
+            let mut merged = BTreeSet::new();
+            for value in props.get(name).into_iter().chain([queries]) {
+                merged.extend(list::split(value, list::Empty::Drop));
             }
+            props.set(name.as_slice().into(), list::join(merged));
         }
         let code = interp.exit_code();
         if code != 0 {

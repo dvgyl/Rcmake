@@ -11,7 +11,7 @@ use rcmake_store::{Digest, Domain, KeyHasher, StoreConfig, StoreMode, file_diges
 
 use super::args::{Options, Signature, Source};
 use super::cache::{Artifact, ObservedOutcome, ProbeCache, VerifyContext};
-use super::journal::{Journal, JournalHost};
+use super::journal::{CompileIntervals, Journal, JournalHost};
 use super::plan::{
     Admission, PathBindings, ProbeEligibility, ProbeRecipe, RcmakeBuildId, ReuseScope, Templated,
     compute_probe_key, environment_fingerprint,
@@ -31,6 +31,7 @@ pub(in crate::configure) struct ProbeRuntime {
     build: PathBuf,
     executable: OnceLock<Option<Digest>>,
     compiler: compiler::SessionEvidence,
+    intervals: Option<Arc<CompileIntervals>>,
     remote: Option<remote::RemoteProbe>,
 }
 
@@ -65,8 +66,13 @@ impl ProbeRuntime {
         let remote = (mode != ProbeCacheMode::Off)
             .then(|| remote::RemoteProbe::new(host.as_ref()))
             .flatten();
+        let intervals = (host
+            .env_get(b"RCMAKE_MEASURE_PROBE_INTERVALS")
+            .is_some_and(|value| value == "1"))
+        .then(|| Arc::new(CompileIntervals::default()));
         Some(Self {
             host,
+            intervals,
             store,
             cache: ProbeCache::for_session(mode),
             mode,
@@ -180,7 +186,6 @@ impl PreparedProbe {
             &name,
             &runtime.cache.memo,
             external.then(|| (file, Digest::hash(&contents))),
-            runtime.mode == ProbeCacheMode::Off,
         )?;
         let cmake_root = path::to_native(&cx.var_or_empty(b"CMAKE_ROOT"));
 

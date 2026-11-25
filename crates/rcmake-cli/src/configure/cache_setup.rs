@@ -42,7 +42,7 @@ pub(super) fn apply_environment_defaults(host: &dyn Host, cache: &mut Cache, has
         (b"CMAKE_CROSSCOMPILING_EMULATOR", CacheType::String),
         (b"CMAKE_DISABLE_PRECOMPILE_HEADERS", CacheType::Bool),
     ] {
-        if !has_cache
+        if (!has_cache || name == b"CMAKE_DISABLE_PRECOMPILE_HEADERS")
             && !cache.contains(name)
             && let Some(value) = host.env_get(name).filter(|v| !v.is_empty())
         {

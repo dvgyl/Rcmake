@@ -73,6 +73,7 @@ pub(super) fn metadata(path: &Path, follow: Follow) -> HostResult<Metadata> {
         len: meta.len(),
         mode,
         mtime: io_at(meta.modified().and_then(from_system_time), path)?,
+        ctime: None,
         atime: io_at(meta.accessed().and_then(from_system_time), path)?,
         dev: info.volume_serial_number(),
         ino: info.file_index(),

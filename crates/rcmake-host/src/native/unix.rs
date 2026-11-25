@@ -35,6 +35,13 @@ pub(super) fn metadata(p: &Path, follow: Follow) -> HostResult<Metadata> {
             secs: m.mtime(),
             nanos: u32::try_from(m.mtime_nsec()).unwrap_or_default(),
         },
+        ctime: u32::try_from(m.ctime_nsec())
+            .ok()
+            .filter(|&nanos| nanos < 1_000_000_000)
+            .map(|nanos| FileTime {
+                secs: m.ctime(),
+                nanos,
+            }),
         atime: FileTime {
             secs: m.atime(),
             nanos: u32::try_from(m.atime_nsec()).unwrap_or_default(),

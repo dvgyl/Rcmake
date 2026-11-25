@@ -4,7 +4,8 @@ use std::{
 };
 
 use rcmake_archive::{
-    ArchiveFormat, CreateOptions, ExtractOptions, create_archive, extract_archive,
+    ArchiveFormat, CreateOptions, ExtractOptions, SevenZipCompression, create_archive,
+    extract_archive,
 };
 use rcmake_base::Limits;
 use rcmake_host::{FileKind, Follow, Host, Metadata, ReadRange, path::to_native};
@@ -18,7 +19,7 @@ pub(super) fn check(rng: &mut Rng, limits: &Limits) -> Check {
     let destination = root().join("extract");
     let outside = root().join("outside");
     setup(host.seed_file(&outside.join("marker"), b"outside"))?;
-    let mode = rng.below(12);
+    let mode = rng.below(18);
     let payload = random_bytes(rng);
     let mut expected_link = None;
     let mut expected_file = None;
@@ -63,16 +64,27 @@ pub(super) fn check(rng: &mut Rng, limits: &Limits) -> Check {
                 &source,
                 &[PathBuf::from("data")],
                 &CreateOptions {
-                    format: *pick(
-                        rng,
-                        &[
-                            ArchiveFormat::ZipStored,
-                            ArchiveFormat::Zip,
-                            ArchiveFormat::TarGz,
-                        ],
-                    ),
+                    format: match mode {
+                        12 | 13 => ArchiveFormat::TarZ,
+                        14 | 15 => ArchiveFormat::SevenZip {
+                            compression: SevenZipCompression::Store,
+                            threads: 1,
+                        },
+                        16 | 17 => ArchiveFormat::SevenZip {
+                            compression: SevenZipCompression::Ppmd,
+                            threads: 1,
+                        },
+                        _ => *pick(
+                            rng,
+                            &[
+                                ArchiveFormat::ZipStored,
+                                ArchiveFormat::Zip,
+                                ArchiveFormat::TarGz,
+                            ],
+                        ),
+                    },
                     mtime: Some(0),
-                    compression_level: None,
+                    compression_level: (mode >= 16).then_some(1),
                     verbose: false,
                 },
             ))?;
@@ -82,7 +94,7 @@ pub(super) fn check(rng: &mut Rng, limits: &Limits) -> Check {
                     limit: limits.max_file_read,
                 },
             ))?;
-            if mode == 9 {
+            if matches!(mode, 9 | 12 | 14 | 16) {
                 mutate(rng, &mut input, b"\xffPK");
             } else {
                 expected_file = Some(destination.join("data"));

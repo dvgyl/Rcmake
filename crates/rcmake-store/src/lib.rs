@@ -4,6 +4,7 @@
 #![deny(missing_docs)]
 
 mod digest;
+mod entry_publish;
 mod frame;
 mod gc;
 pub mod remote;
@@ -19,16 +20,13 @@ use rcmake_host::{
     FileKind, FileLockGuard, Follow, Host, HostError, HostResult, Metadata, ReadRange, WriteMode,
     path,
 };
-use serde::{
-    Deserialize, Serialize,
-    de::{DeserializeOwned, IgnoredAny},
-};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub use digest::{Digest, Domain, KeyHasher};
 pub use gc::{GcReport, gc};
 pub use stamp::{
-    FastStat, InputStamp, MissReason, Trace, TraceMemo, VerifyOutcome, directory_digest,
-    file_digest, tree_listing_digest, verify_trace,
+    FastStat, InputStamp, MissReason, Trace, TraceMemo, TreePolicy, VerifyOutcome,
+    directory_digest, file_digest, sdk_tree_listing_digest, tree_listing_digest, verify_trace,
 };
 
 use frame::{BLOB_MAGIC, ENTRY_LIMIT, ENTRY_MAGIC};
@@ -336,45 +334,6 @@ impl<'a> Store<'a> {
         };
         self.host.write(destination, &bytes, mode)?;
         Ok(true)
-    }
-
-    /// Publish an entry. Keep the first valid entry for a key.
-    ///
-    /// All referenced blobs must already be present. Wait up to 250 milliseconds
-    /// for the cache lock. Return the publication outcome if the store skips a write.
-    pub fn put_entry<T: Serialize>(
-        &self,
-        domain: Domain,
-        key: Digest,
-        entry: &Entry<T>,
-    ) -> HostResult<PublishOutcome> {
-        if !self.writable() {
-            return Ok(PublishOutcome::Disabled);
-        }
-        let path = self.entry_path(domain, key);
-        let frame = entry_frame(domain, key, entry, &path)?;
-        self.with_publication(|locked| {
-            for &digest in &entry.blobs {
-                let path = self.blob_path(digest);
-                if self.file_metadata(&path)?.is_none() {
-                    return Err(io_at(
-                        io::Error::new(ErrorKind::NotFound, "A referenced cache blob is missing."),
-                        &path,
-                    ));
-                }
-            }
-            let previous = self.read_entry::<Entry<IgnoredAny>>(domain, key, &path, false)?;
-            if let CacheRead::Found(previous) = &previous
-                && self.entry_matches(previous, blob_limit(), false)?
-            {
-                return Ok(PublishOutcome::AlreadyPresent);
-            }
-            if self.verify_inputs(&entry.trace) != VerifyOutcome::Hit {
-                return Ok(PublishOutcome::Stale);
-            }
-            locked.publish(&path, &frame, !matches!(previous, CacheRead::Missing))?;
-            Ok(PublishOutcome::Published)
-        })
     }
 
     /// Read and verify an entry, its input trace, and its blob references.

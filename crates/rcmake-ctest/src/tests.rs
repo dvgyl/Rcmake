@@ -250,7 +250,7 @@ fn sets_the_working_directory_and_isolates_environment_changes() -> TestResult {
             ("NEW".into(), "v".into()),
             (
                 "PATH".into(),
-                if cfg!(windows) {
+                if host.system().sysname == "Windows" {
                     "/base;/b"
                 } else {
                     "/base:/b"

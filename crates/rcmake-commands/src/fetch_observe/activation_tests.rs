@@ -462,3 +462,63 @@ fn frozen_archive_checks_warm_stamp_hash_skip_and_disconnected_reuse() -> TestRe
     );
     Ok(())
 }
+
+#[test]
+fn frozen_replaces_an_old_receipt_after_a_lock_update() -> TestResult {
+    use rcmake_fetch::{ArchiveCache, ContentHash, LockEntry, LockFile, UrlEntry};
+    use rcmake_store::{Store, StoreConfig};
+
+    let host = host()?;
+    let old_url = "https://example.org/payload";
+    let new_url = "https://example.org/next/payload";
+    let old = UrlEntry::from_bytes(vec![old_url.into()], b"abc");
+    let new = UrlEntry::from_bytes(vec![new_url.into()], b"def");
+    let mut lock = LockFile::default();
+    lock.insert("archive", LockEntry::Url(old.clone()))?;
+    host.seed_file(&absolute("project/rcmake-fetch.lock"), &lock.to_json()?)?;
+    let store = Store::new(host.as_ref(), StoreConfig::from_host(host.as_ref()))?;
+    let cache = ArchiveCache::new(host.as_ref(), &store);
+    cache.insert(old_url, &ContentHash::sha256(old.sha256), b"abc")?;
+    cache.insert(new_url, &ContentHash::sha256(new.sha256), b"def")?;
+    host.set_command_handler(|_, _, _| Err(HostError::unsupported("Unexpected process.")))?;
+    host.env_set(b"RCMAKE_FETCH_OFFLINE", Some(b"1"));
+
+    let project = |url: &str, entry: &UrlEntry| {
+        let args = format!("URL_HASH SHA256={}", entry.sha256);
+        let commands = declaration(&absolute("receipt-update"), &args)
+            .replace(old_url, url)
+            .replace(
+                "FetchContent_Populate(archive",
+                "FetchContent_Declare(archive",
+            );
+        format!(
+            "cmake_minimum_required(VERSION 4.5)\nproject(Frozen NONE)\n{commands}\nFetchContent_MakeAvailable(archive)"
+        )
+    };
+    let run = |mode, script: &str| -> TestResult {
+        assert_eq!(
+            evaluate(host.clone(), mode, RunMode::Configure, script.as_bytes())?,
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        Ok(())
+    };
+    let original = project(old_url, &old);
+    let changed = project(new_url, &new);
+    run(FetchLockMode::Frozen, &original)?;
+    let receipt = absolute("build/CMakeFiles/fc-stamp/archive/download.stamp.rcmake");
+    let read = |path: &Path| host.read(path, ReadRange::All { limit: 8192 });
+    let before = read(&receipt)?;
+    run(FetchLockMode::Update, &changed)?;
+    assert_eq!(read(&receipt)?, before);
+
+    run(FetchLockMode::Frozen, &changed)?;
+    assert_ne!(read(&receipt)?, before);
+    assert_eq!(
+        read(&absolute("receipt-update/archive-src/payload"))?,
+        b"def"
+    );
+    run(FetchLockMode::Frozen, &changed)?;
+    Ok(())
+}

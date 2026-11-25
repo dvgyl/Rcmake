@@ -11,7 +11,7 @@ use rcmake_eval::{CmdError, Cx, FetchLockMode};
 use rcmake_fetch::{ContentHash, GitMirror, UrlEntry, atomic_write};
 use rcmake_host::{
     FileKind, Follow, Metadata, ReadRange,
-    path::{from_native, to_native},
+    path::{from_native_cmake, to_native},
 };
 use rcmake_store::Digest;
 
@@ -298,14 +298,6 @@ impl Archive {
         let mut previous = None;
         if let Some(stamp_meta) = warm_stamp {
             let receipt = read_receipt(cx, stamp);
-            if let Some(bytes) = &receipt
-                && bytes.first() == Some(&1)
-                && bytes
-                    .get(1..33)
-                    .is_some_and(|pin| pin != self.pin_digest().as_bytes())
-            {
-                return Err(failure(cx, pop, "The archive receipt has a different pin."));
-            }
             let verified = self.verified(cx, file);
             if metadata(cx, file).is_some() && verified.is_none() {
                 return Err(failure(
@@ -424,35 +416,42 @@ impl Archive {
         wrapper: Digest,
     ) -> Option<Vec<u8>> {
         let meta = metadata(cx, stamp)?;
-        let file = from_native(file);
+        let file = from_native_cmake(file);
         if file.len() > RECEIPT_LIMIT as usize - HEADER_SIZE {
             return None;
         }
-        let mut identity = vec![u8::from(self.no_extract)];
-        for value in [
-            pop.dependency.as_bytes(),
-            &from_native(&pop.source),
-            &file,
-            &from_native(stamp),
-        ] {
-            identity.extend_from_slice(Digest::hash(value).as_bytes());
-        }
+        let identity =
+            receipt_identity(&pop.dependency, self.no_extract, &pop.source, &file, stamp);
         let stamp: Vec<_> = file_fingerprint(&meta)
             .into_iter()
             .flat_map(u64::to_le_bytes)
             .collect();
         let mut bytes = vec![1];
-        for digest in [
-            self.pin_digest(),
-            Digest::hash(&identity),
-            wrapper,
-            Digest::hash(&stamp),
-        ] {
+        for digest in [self.pin_digest(), identity, wrapper, Digest::hash(&stamp)] {
             bytes.extend_from_slice(digest.as_bytes());
         }
         bytes.extend_from_slice(&file);
         Some(bytes)
     }
+}
+
+fn receipt_identity(
+    dependency: &str,
+    no_extract: bool,
+    source: &Path,
+    archive: &[u8],
+    stamp: &Path,
+) -> Digest {
+    let mut identity = vec![u8::from(no_extract)];
+    for value in [
+        dependency.as_bytes(),
+        &from_native_cmake(source),
+        archive,
+        &from_native_cmake(stamp),
+    ] {
+        identity.extend_from_slice(Digest::hash(value).as_bytes());
+    }
+    Digest::hash(&identity)
 }
 
 fn file_fingerprint(meta: &Metadata) -> [u64; 5] {
@@ -550,4 +549,34 @@ fn failure(cx: &mut Cx<'_>, pop: &Population, reason: &str) -> CmdError {
             pop.dependency
         ),
     )
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receipt_identity_uses_cmake_path_separators() {
+        let identity = |source, archive, stamp| {
+            receipt_identity(
+                "archive",
+                true,
+                Path::new(source),
+                &from_native_cmake(Path::new(archive)),
+                Path::new(stamp),
+            )
+        };
+        assert_eq!(
+            identity(
+                "C:/work\\src",
+                "C:/work/tmp\\archive.zip",
+                "C:/work\\stamps/download.stamp"
+            ),
+            identity(
+                "C:/work/src",
+                "C:/work/tmp/archive.zip",
+                "C:/work/stamps/download.stamp"
+            )
+        );
+    }
 }

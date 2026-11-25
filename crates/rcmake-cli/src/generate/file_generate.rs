@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 
 use rcmake_base::{BString, truth};
-use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyStatus, format_paragraphs};
+use rcmake_diag::{
+    Backtrace, Diagnostic, Effect, Frame, FrameKind, Location, MessageKind, PolicyStatus,
+    RenderOptions, format_paragraphs, render,
+};
 use rcmake_gen_common::{
     GenError,
     export::{
@@ -11,7 +14,7 @@ use rcmake_gen_common::{
         FileGenerateRequest, write_generated_files,
     },
 };
-use rcmake_genex::{ConfigId, EvalContext, EvalSite, GenexHost, evaluate, parse};
+use rcmake_genex::{ConfigId, EvalContext, EvalSite, GenexError, GenexHost, evaluate, parse};
 use rcmake_host::{Host, Stream, path::to_native};
 use rcmake_model::{DirId, ProjectModel, PropertyMap};
 use rcmake_resolve::{
@@ -30,6 +33,21 @@ pub(super) fn write(
     host: &dyn Host,
 ) -> Result<(), GenError> {
     rcmake_commands::print_deferred_properties(model, result, host).map_err(GenError::Invalid)?;
+    generate(model, &result.configs, &result.targets, host, false)
+}
+
+/// Report expression errors when another part of generation has already failed.
+pub(super) fn report_errors(model: &ProjectModel, configs: &[ConfigId], host: &dyn Host) {
+    let _ = generate(model, configs, &[], host, true);
+}
+
+fn generate(
+    model: &ProjectModel,
+    configs: &[ConfigId],
+    targets: &[rcmake_resolve::ResolvedTarget],
+    host: &dyn Host,
+    diagnostics_only: bool,
+) -> Result<(), GenError> {
     let props = &model.global.props;
     let Some(count) = props.get(b"_RCMAKE_FILE_GENERATE_COUNT") else {
         return Ok(());
@@ -80,7 +98,7 @@ pub(super) fn write(
             newline: FileGenerateNewline::Native,
         };
         apply_options(&mut request, options)?;
-        if policy == PolicyStatus::Warn {
+        if !diagnostics_only && policy == PolicyStatus::Warn {
             if !output.windows(2).any(|part| part == b"$<") {
                 warn_relative_path(model, host, *id, "OUTPUT", output);
             }
@@ -100,7 +118,7 @@ pub(super) fn write(
         .map(std::ptr::from_ref)
         .zip(request_dirs)
         .collect();
-    let eval_contexts = file_generate_contexts(model, &result.configs);
+    let eval_contexts = file_generate_contexts(model, configs);
     let contexts = eval_contexts
         .iter()
         .map(|context| FileGenerateContext {
@@ -112,14 +130,14 @@ pub(super) fn write(
         })
         .collect::<Vec<_>>();
     let mut usage = UsageResolver::new(model);
-    let objects = ObjectPaths::new(&result.targets);
+    let objects = ObjectPaths::new(targets);
     let root = &model.dir(DirId::ROOT).source_dir;
     let timestamp = |format: Option<&[u8]>, utc| format_timestamp(host, format, utc);
     let mut condition_result: Option<BString> = None;
     let mut request_dir = None;
-    let evaluate = |value: &[u8],
-                    request: &FileGenerateRequest<'_>,
-                    context: FileGenerateContext<'_>| {
+    let mut evaluate = |value: &[u8],
+                        request: &FileGenerateRequest<'_>,
+                        context: FileGenerateContext<'_>| {
         let (dir, backtrace, policy, cmp0189) = request_dirs
             .get(&std::ptr::from_ref(request))
             .ok_or_else(invalid_record)?;
@@ -163,14 +181,17 @@ pub(super) fn write(
             parse(value)
                 .and_then(|ast| evaluate(&ast, &ctx, host))
                 .map(|(value, _)| value)
-                .map_err(|err| GenError::Invalid(err.at(backtrace, root).to_string().into()))
+                .map_err(|err| expression_error(err, backtrace, root))
         };
         // The shared writer asks for the output name before the condition.
         // Check the condition first and pass its result back to the writer.
-        if let Some(result) = condition_result.take() {
+        if !std::ptr::eq(value, request.output)
+            && let Some(result) = condition_result.take()
+        {
             return Ok(result);
         }
         if std::ptr::eq(value, request.output) {
+            condition_result = None;
             if let Some(condition) = request.condition {
                 let condition_value = evaluate_value(condition, &mut genex_host)?;
                 match condition_value.as_slice() {
@@ -189,7 +210,7 @@ pub(super) fn write(
                 }
             }
             let output = evaluate_value(value, &mut genex_host)?;
-            if *policy == PolicyStatus::Warn {
+            if !diagnostics_only && *policy == PolicyStatus::Warn {
                 warn_relative_path(model, host, *dir, "OUTPUT", &output);
             }
             return Ok(output);
@@ -197,9 +218,98 @@ pub(super) fn write(
         let content = evaluate_value(value, &mut genex_host)?;
         Ok(terminate_content(request, content))
     };
+    if diagnostics_only {
+        for request in &requests {
+            let input = match request.input {
+                FileGenerateInput::Content(input) => input.to_vec(),
+                FileGenerateInput::File(input) => {
+                    let path = request.input_base.join(to_native(input));
+                    let Ok(input) =
+                        host.read(&path, rcmake_host::ReadRange::All { limit: 16 << 20 })
+                    else {
+                        continue;
+                    };
+                    input
+                }
+            };
+            for &context in &contexts {
+                let result = evaluate(request.output, request, context).and_then(|output| {
+                    if let Some(condition) = request.condition
+                        && evaluate(condition, request, context)? != "1"
+                    {
+                        return Ok(output);
+                    }
+                    evaluate(&input, request, context)
+                });
+                if let Err(GenError::Invalid(message)) = result {
+                    host.write_out(Stream::Stderr, &message);
+                }
+            }
+        }
+        return Ok(());
+    }
     let generated = write_generated_files(&requests, &contexts, evaluate, host);
     generated.map_err(|error| collision_error(model, request_dir, error))?;
     Ok(())
+}
+
+fn expression_error(error: GenexError, backtrace: &Backtrace, root: &[u8]) -> GenError {
+    let message = if matches!(error, GenexError::Located(_)) && !backtrace.is_empty() {
+        rebase_expression_error(&error.to_string(), backtrace, root)
+    } else {
+        error.at(backtrace, root).to_string().into()
+    };
+    if message.starts_with(b"\n") {
+        GenError::Invalid(message)
+    } else {
+        GenError::Invalid([b"\n".as_slice(), &message].concat().into())
+    }
+}
+
+fn rebase_expression_error(message: &str, backtrace: &Backtrace, root: &[u8]) -> BString {
+    // A nested property can report the location where its value was set.
+    // A file generation request reports the failure at its own call site.
+    let message = message.trim_start_matches('\n');
+    let mut result = BString::default();
+    let mut rest = Some(message);
+    while let Some(current) = rest {
+        let Some((_, body)) = current.split_once('\n') else {
+            return message.into();
+        };
+        let body = if let Some(offset) = body.find("\nCMake Error") {
+            let (block, trailing) = body.split_at(offset);
+            rest = trailing.strip_prefix('\n');
+            block
+        } else {
+            rest = None;
+            body
+        };
+        let body = body
+            .split_once("\nCall Stack (most recent call first):")
+            .map_or(body, |(body, _)| body);
+        let body = body
+            .trim_end()
+            .lines()
+            .map(|line| line.strip_prefix("  ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        result.extend_from_slice(&render(
+            &Diagnostic {
+                annotations: None,
+                kind: MessageKind::Error,
+                effect: Effect::SetError,
+                category: None,
+                policy: None,
+                location: Location::Backtrace(backtrace.clone()),
+                body: body.into(),
+            },
+            &RenderOptions {
+                relative_base: Some(root.into()),
+                ..Default::default()
+            },
+        ));
+    }
+    result
 }
 
 fn terminate_content(request: &FileGenerateRequest<'_>, mut content: BString) -> BString {

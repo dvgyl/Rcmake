@@ -5,7 +5,7 @@ use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{
     Follow, Stream,
-    path::{from_native, to_native},
+    path::{from_native_cmake, to_native},
 };
 use rcmake_model::{BT, InstallKind, InstallOptions, InstallRule, TargetBinding};
 use rcmake_regex::MatchOptions;
@@ -202,15 +202,18 @@ fn matching_paths(cx: &mut Cx<'_>, pattern: &[u8]) -> Result<Vec<BString>, CmdEr
 
 fn install_source(cx: &Cx<'_>, value: &[u8]) -> BString {
     let path = to_native(value);
-    if path.is_absolute() || value.starts_with(b"$<") {
+    if value.starts_with(b"$<") {
         return value.into();
+    }
+    if path.is_absolute() {
+        return from_native_cmake(&path);
     }
     let binary = cx.current_binary_dir().join(&path);
     let source = cx.current_source_dir().join(path);
     if exists(cx, &binary) || !exists(cx, &source) {
-        from_native(&binary)
+        from_native_cmake(&binary)
     } else {
-        from_native(&source)
+        from_native_cmake(&source)
     }
 }
 
@@ -334,7 +337,7 @@ mod tests {
             return Err("Expected a file install rule".into());
         };
         let expected: Vec<_> = ["a.txt", "b.txt", "z.txt"]
-            .map(|name| from_native(&source.join(name)))
+            .map(|name| from_native_cmake(&source.join(name)))
             .into();
         assert_eq!(
             files.iter().map(|file| &file.value).collect::<Vec<_>>(),

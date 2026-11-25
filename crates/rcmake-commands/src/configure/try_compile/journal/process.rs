@@ -42,10 +42,11 @@ impl JournalHost<'_> {
     pub(super) fn process_request<'request>(
         &self,
         request: &'request RunRequest,
-    ) -> HostResult<std::borrow::Cow<'request, RunRequest>> {
+    ) -> HostResult<(std::borrow::Cow<'request, RunRequest>, Option<Trace>)> {
         use std::borrow::Cow;
 
-        let mut request = Cow::Borrowed(request);
+        let original = request;
+        let mut request = Cow::Borrowed(original);
         if let Some(spec) = &self.speculation {
             let request = request.to_mut();
             request.env.clone_from(&spec.environment);
@@ -54,9 +55,15 @@ impl JournalHost<'_> {
         if let Some(verifier) = self.verify_process.as_deref() {
             verifier.instrument(request.to_mut());
         }
-        if let Err(error) = self.before_process(&request) {
-            self.record_request(&request);
-            return Err(error);
+        let preflight = match self.before_process(&request) {
+            Ok(trace) => trace,
+            Err(error) => {
+                self.record_request(&request);
+                return Err(error);
+            }
+        };
+        if preflight.is_none() && self.mode == JournalMode::Observe {
+            request = Cow::Borrowed(original);
         }
         if let Cow::Owned(request) = &mut request {
             self.limit_speculative_request(request)?;
@@ -67,10 +74,10 @@ impl JournalHost<'_> {
                 "Cannot verify speculative probe inputs.",
             ));
         }
-        Ok(request)
+        Ok((request, preflight))
     }
 
-    fn before_process(&self, request: &RunRequest) -> HostResult<()> {
+    fn before_process(&self, request: &RunRequest) -> HostResult<Option<Trace>> {
         if let Input::File(path) = &request.stdin {
             self.record_dependency(path)
                 .or_else(|_| self.guard_effect(ImpureReason::UnverifiableInput))?;
@@ -90,23 +97,31 @@ impl JournalHost<'_> {
             && request.stderr != Output::Inherit
             && (self.mode == JournalMode::Observe || !request.tee);
         if !bounded || !private {
-            return self.guard_effect(ImpureReason::UnverifiedProcess);
+            return self
+                .guard_effect(ImpureReason::UnverifiedProcess)
+                .map(|()| None);
         }
         let Some(trace) = self
             .verify_process
             .as_deref()
             .and_then(|verify| verify.preflight(request))
         else {
-            return self.guard_effect(ImpureReason::UnverifiedProcess);
+            return self
+                .guard_effect(ImpureReason::UnverifiedProcess)
+                .map(|()| None);
         };
         // A pipeline needs separate evidence for every stage.
         if request.pipeline.len() != 1 {
-            return self.guard_effect(ImpureReason::UnverifiedProcess);
+            return self
+                .guard_effect(ImpureReason::UnverifiedProcess)
+                .map(|()| None);
         }
         for command in &request.pipeline {
             let program = path::to_native(&command.program);
             if !is_absolute(&program) || self.record_dependency(&program).is_err() {
-                return self.guard_effect(ImpureReason::UnverifiedProcess);
+                return self
+                    .guard_effect(ImpureReason::UnverifiedProcess)
+                    .map(|()| None);
             }
         }
         if trace
@@ -114,20 +129,22 @@ impl JournalHost<'_> {
             .any(|stamp| matches!(stamp, InputStamp::FileStat { .. }))
             || verify_inputs(&*self.inner, &trace, self.memo.as_deref()) != VerifyOutcome::Hit
         {
-            return self.guard_effect(ImpureReason::ChangedInput);
+            return self.guard_effect(ImpureReason::ChangedInput).map(|()| None);
         }
         for stamp in &trace {
             if let InputStamp::FileHash { path, .. } = stamp
                 && self.record_dependency(path).is_err()
             {
-                return self.guard_effect(ImpureReason::UnverifiedProcess);
+                return self
+                    .guard_effect(ImpureReason::UnverifiedProcess)
+                    .map(|()| None);
             }
         }
         let mut state = self.state();
-        for stamp in trace {
-            state.stamp(stamp);
+        for stamp in &trace {
+            state.stamp(stamp.clone());
         }
-        Ok(())
+        Ok(Some(trace))
     }
 
     pub(super) fn after_process(
@@ -135,7 +152,11 @@ impl JournalHost<'_> {
         request: &RunRequest,
         spawn: FileTime,
         result: &HostResult<RunOutput>,
+        preflight: Option<&[InputStamp]>,
     ) {
+        let Some(preflight) = preflight else {
+            return;
+        };
         let Ok(output) = result else {
             self.mark_impure(ImpureReason::ProcessFailure);
             return;
@@ -153,7 +174,7 @@ impl JournalHost<'_> {
             self.mark_impure(ImpureReason::UnverifiedProcess);
             return;
         };
-        let Some(closure) = verifier.dependencies(request, output) else {
+        let Some(closure) = verifier.dependencies(request, output, preflight) else {
             self.mark_impure(ImpureReason::UnverifiedProcess);
             return;
         };
@@ -180,16 +201,18 @@ impl JournalHost<'_> {
             self.mark_impure(ImpureReason::UnverifiedProcess);
             return;
         }
-        let cutoff = time_nanos(spawn) - verifier.timestamp_granularity().as_nanos() as i128;
+        let spawn = time_nanos(spawn);
+        let time = Some(ObservationTime {
+            spawn,
+            cutoff: spawn - verifier.timestamp_granularity().as_nanos() as i128,
+        });
         for file in &closure.files {
-            if self.record_dependency_since(file, Some(cutoff)).is_err() {
+            if self.record_dependency_since(file, time).is_err() {
                 self.mark_impure(ImpureReason::UnverifiableInput);
             }
         }
         for search in &closure.searches {
-            if self.record_search_since(&search.root, &search.relative, Some(cutoff))
-                != Ok(search.found)
-            {
+            if self.record_search_since(&search.root, &search.relative, time) != Ok(search.found) {
                 self.mark_impure(ImpureReason::ChangedInput);
             }
         }

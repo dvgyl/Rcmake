@@ -12,7 +12,8 @@ pub(super) struct Flags {
     pub(super) inputs: Vec<PathBuf>,
     pub(super) depfile: Option<PathBuf>,
     pub(super) search: Vec<BString>,
-    pub(super) directories: Vec<PathBuf>,
+    pub(super) include_directories: Vec<PathBuf>,
+    pub(super) library_directories: Vec<PathBuf>,
     pub(super) frameworks: bool,
     /// The command asks the driver or linker to print its commands.
     pub(super) verbose: bool,
@@ -29,7 +30,8 @@ pub(super) fn classify(
         inputs: Vec::new(),
         depfile: None,
         search: Vec::new(),
-        directories: Vec::new(),
+        include_directories: Vec::new(),
+        library_directories: Vec::new(),
         frameworks: false,
         verbose: false,
     };
@@ -134,7 +136,9 @@ fn msvc(
             b"/c" | b"-c" => compile = true,
             b"/I" | b"-I" | b"/external:I" => {
                 let option = args.next()?;
-                flags.directories.push(absolute_search(cwd, option)?);
+                flags
+                    .include_directories
+                    .push(absolute_search(cwd, option)?);
             }
             b"/sourceDependencies" => {
                 let file = path::to_native(args.next()?);
@@ -153,12 +157,12 @@ fn msvc(
             }
             value if value.starts_with(b"/I") || value.starts_with(b"-I") => {
                 flags
-                    .directories
+                    .include_directories
                     .push(absolute_search(cwd, value.get(2..)?)?);
             }
             value if value.starts_with(b"/external:I") => {
                 flags
-                    .directories
+                    .include_directories
                     .push(absolute_search(cwd, value.strip_prefix(b"/external:I")?)?);
             }
             value if value.starts_with(b"/external:env:") => flags.search.push(value.into()),
@@ -285,8 +289,13 @@ pub(super) fn attached_search(value: &[u8]) -> Option<(&'static [u8], &[u8])> {
 
 fn search_path(flags: &mut Flags, arg: &[u8], value: &[u8], cwd: &Path) -> Option<()> {
     let directory = absolute_search(cwd, value)?;
-    flags.directories.push(directory);
-    if arg != b"-L" {
+    if arg == b"-L" {
+        flags.library_directories.push(directory);
+    } else {
+        if matches!(arg, b"-F" | b"-iframework") {
+            flags.library_directories.push(directory.clone());
+        }
+        flags.include_directories.push(directory);
         flags.search.extend([arg.into(), value.into()]);
     }
     Some(())

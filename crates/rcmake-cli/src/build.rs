@@ -442,6 +442,15 @@ fn dispatch(
         let Some((program, args)) = command.argv.split_first() else {
             continue;
         };
+        let args = if matches!(kind, GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+            && let [flag, directory, rest @ ..] = args
+            && flag == "-C"
+            && directory == &command.working_dir
+        {
+            rest
+        } else {
+            args
+        };
         exit = run_native(
             host,
             &RunRequest {

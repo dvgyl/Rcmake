@@ -39,6 +39,7 @@ struct Inode {
     links: u64,
     atime: FileTime,
     mtime: FileTime,
+    ctime: FileTime,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -229,6 +230,7 @@ impl FileSystem {
                 links: 1,
                 atime: self.now,
                 mtime: self.now,
+                ctime: self.now,
             },
         );
         self.paths.insert(path, ino);
@@ -379,6 +381,7 @@ impl FileSystem {
             len,
             mode: inode.mode,
             mtime: inode.mtime,
+            ctime: Some(inode.ctime),
             atime: inode.atime,
             dev: 1,
             ino,
@@ -453,6 +456,7 @@ impl FileSystem {
             }
             data.extend_from_slice(bytes);
             inode.mtime = now;
+            inode.ctime = now;
             inode.atime = now;
         } else {
             self.insert(resolved, Data::File(bytes.to_vec()));
@@ -681,7 +685,10 @@ impl FileSystem {
             return Err(SyntheticError::InvalidInput.at(Some(path)));
         }
         let (_, ino) = self.existing(path, follow)?;
+        self.advance(Duration::from_nanos(1));
+        let now = self.now;
         let inode = self.inode_mut(ino, path)?;
+        inode.ctime = now;
         if let Some(atime) = atime {
             inode.atime = atime;
         }

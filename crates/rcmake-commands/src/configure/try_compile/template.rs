@@ -268,7 +268,7 @@ fn join_like(base: &Path, suffix: &Path) -> std::path::PathBuf {
         b'/'
     };
     for part in suffix.components() {
-        if !bytes.ends_with(b"/") && !bytes.ends_with(b"\\") {
+        if !(bytes.ends_with(b"/") || cfg!(windows) && bytes.ends_with(b"\\")) {
             bytes.push(separator);
         }
         bytes.extend_from_slice(&path::from_native(Path::new(part.as_os_str())));
@@ -803,6 +803,18 @@ mod windows_tests {
 mod canonical_tests {
     use super::*;
     use rcmake_host::PureHost;
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_scratch_joins_a_unix_parent_with_a_literal_backslash() -> rcmake_host::HostResult<()>
+    {
+        let host = PureHost::default();
+        let root = Path::new(r"/work\");
+        host.create_dir_all(root)?;
+        let scratch = root.join("scratch");
+        assert_eq!(canonical_with_missing_tail(&host, &scratch), Some(scratch));
+        Ok(())
+    }
 
     #[test]
     fn missing_scratch_keeps_the_canonical_separator_style() -> Result<(), String> {

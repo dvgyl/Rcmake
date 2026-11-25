@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use rcmake_base::BString;
 use rcmake_eval::Cx;
 use rcmake_host::{FileKind, Follow, Host, ProcessResult, ReadRange, RunOutput, RunRequest, path};
-use rcmake_store::{Digest, InputStamp, Trace, TraceMemo, tree_listing_digest};
+use rcmake_store::{Digest, InputStamp, Trace, TraceMemo, VerifyOutcome};
 
 use crate::configure::platform_queries::{PlatformQueries, RecordedQueries};
 
@@ -16,14 +16,15 @@ use super::super::plan::environment_fingerprint;
 mod flags;
 mod hazards;
 mod link;
-mod opaque;
+mod search;
+mod selection;
 mod toolchain;
 mod wrapper;
 
 use flags::{Flags, attached_search, library_file, private_path, pure_flag};
 use hazards::source_hazards;
 use link::link_dependencies;
-pub(super) use opaque::ProbeCompiler;
+pub(super) use selection::ProbeCompiler;
 use toolchain::{Family, ToolchainEvidence, query_in};
 
 const LINK_TRACE: &str = ".rcmake-link-dependencies";
@@ -151,8 +152,8 @@ pub(super) fn admit_link(flag: &[u8]) -> bool {
 }
 
 type ToolKey = (PathBuf, PathBuf, BString, bool, Digest);
-type SearchKey = (Vec<BString>, Digest);
-type SearchMemo = Mutex<BTreeMap<SearchKey, Vec<PathBuf>>>;
+type SearchKey = (PathBuf, Vec<BString>, Digest);
+type SearchMemo = Mutex<BTreeMap<SearchKey, (Vec<PathBuf>, Vec<bool>)>>;
 
 #[derive(Default)]
 pub(super) struct SessionEvidence {
@@ -206,6 +207,12 @@ impl CompilerEvidence {
             environment_fingerprint(&host.env_all()),
         );
         let mut tools = session.tools.lock().ok()?;
+        if tools.get(&key).is_some_and(|toolchain| {
+            memo.verify(host.as_ref(), &toolchain.tools) != VerifyOutcome::Hit
+        }) {
+            tools.remove(&key);
+            session.searches.lock().ok()?.clear();
+        }
         let toolchain = if let Some(toolchain) = tools.get(&key) {
             Arc::clone(toolchain)
         } else {
@@ -536,19 +543,42 @@ impl ProcessVerifier for CompilerEvidence {
         let original = strip_instrumentation(request);
         let flags = self.classify(&original)?;
         for directory in self.search_directories(&original, &flags)? {
-            if let Some(stamp) = self.coverage(&directory, &request.cwd)? {
+            if let Some(stamp) = self.coverage(&directory, &request.cwd, flags.source.is_some())? {
                 tools.push(stamp);
             }
         }
         Some(tools)
     }
 
-    fn dependencies(&self, request: &RunRequest, output: &RunOutput) -> Option<DependencyClosure> {
+    fn is_probe_compile(&self, request: &RunRequest) -> bool {
+        self.classify(&strip_instrumentation(request))
+            .is_some_and(|flags| flags.source.is_some())
+    }
+
+    fn dependencies(
+        &self,
+        request: &RunRequest,
+        output: &RunOutput,
+        preflight: &[InputStamp],
+    ) -> Option<DependencyClosure> {
         let mut closure = self.closure(request, output)?;
-        // The toolchain identity covers the sealed roots, as in `coverage`.
-        closure
-            .searches
-            .retain(|search| !self.in_sealed_root(&search.root));
+        if self.archive_inputs(request).is_some() {
+            return Some(closure);
+        }
+        let original = strip_instrumentation(request);
+        let flags = self.classify(&original)?;
+        if let Some(source) = &flags.source {
+            let source = request.cwd.join(path::to_native(source));
+            if !closure.files.iter().all(|file| {
+                file == &source || self.header_is_covered(file, &request.cwd, preflight)
+            }) {
+                return None;
+            }
+        } else {
+            closure
+                .searches
+                .retain(|search| !self.in_sealed_root(&search.root));
+        }
         Some(closure)
     }
 }
@@ -628,150 +658,6 @@ impl CompilerEvidence {
 }
 
 impl CompilerEvidence {
-    fn search_directories(&self, request: &RunRequest, flags: &Flags) -> Option<BTreeSet<PathBuf>> {
-        let mut directories = flags.directories.iter().cloned().collect::<BTreeSet<_>>();
-        if let Some((file, _)) = &self.external_source {
-            directories.insert(file.parent()?.to_owned());
-        }
-        let env = &request.env;
-        for (name, value) in env {
-            let name = name.to_ascii_uppercase();
-            if matches!(
-                name.as_slice(),
-                b"CPATH"
-                    | b"C_INCLUDE_PATH"
-                    | b"CPLUS_INCLUDE_PATH"
-                    | b"OBJC_INCLUDE_PATH"
-                    | b"LIBRARY_PATH"
-                    | b"INCLUDE"
-                    | b"LIB"
-                    | b"LIBPATH"
-            ) {
-                for directory in std::env::split_paths(&path::to_native(value)) {
-                    directories.insert(request.cwd.join(directory));
-                }
-            }
-        }
-        if self.toolchain.family == Family::Msvc {
-            for variable in &flags.search {
-                let name = variable.strip_prefix(b"/external:env:")?;
-                let value = env
-                    .iter()
-                    .find(|(key, _)| key.eq_ignore_ascii_case(name))?
-                    .1
-                    .clone();
-                directories.extend(
-                    std::env::split_paths(&path::to_native(&value))
-                        .map(|file| request.cwd.join(file)),
-                );
-            }
-        } else if let Some(source) = &flags.source {
-            let file = request.cwd.join(path::to_native(source));
-            let bytes = self
-                .host
-                .read(&file, ReadRange::All { limit: 1 << 20 })
-                .ok()?;
-            if bytes.contains(&b'#') || self.toolchain.family == Family::Gnu {
-                let mut search = flags.search.clone();
-                for pair in search.windows(2) {
-                    if let [key, value] = pair
-                        && matches!(
-                            key.as_slice(),
-                            b"-I"
-                                | b"-isystem"
-                                | b"-iquote"
-                                | b"-idirafter"
-                                | b"-F"
-                                | b"-iframework"
-                        )
-                        && !path::to_native(value).is_absolute()
-                    {
-                        return None;
-                    }
-                }
-                search.extend([
-                    "-x".into(),
-                    if self.cxx { "c++".into() } else { "c".into() },
-                    "-E".into(),
-                    "-v".into(),
-                    "-".into(),
-                ]);
-                let key = (search.clone(), environment_fingerprint(env));
-                let mut memo = self.searches.lock().ok()?;
-                let found = if let Some(paths) = memo.get(&key) {
-                    paths.clone()
-                } else {
-                    let output = query_in(
-                        self.host.as_ref(),
-                        &self.toolchain.driver,
-                        &search,
-                        &request.cwd,
-                        env.clone(),
-                    )?;
-                    let paths = include_searches(&output.stderr)?;
-                    if memo.len() < 128 {
-                        memo.insert(key, paths.clone());
-                    }
-                    paths
-                };
-                directories.extend(found);
-            }
-        } else if self.toolchain.family == Family::AppleClang {
-            directories.insert(PathBuf::from("/usr/local/lib"));
-            if flags.frameworks {
-                directories.insert(PathBuf::from("/Library/Frameworks"));
-            }
-        } else {
-            let output = query_in(
-                self.host.as_ref(),
-                &self.toolchain.driver,
-                &["-print-search-dirs".into()],
-                &request.cwd,
-                env.clone(),
-            )?;
-            let locations = output
-                .stdout
-                .split(|&byte| byte == b'\n')
-                .find_map(|line| line.strip_prefix(b"libraries: ="))?;
-            directories.extend(std::env::split_paths(&path::to_native(locations)));
-        }
-        Some(directories)
-    }
-
-    fn coverage(&self, directory: &Path, scratch: &Path) -> Option<Option<InputStamp>> {
-        if directory == scratch || private_path(scratch, directory) {
-            return Some(None);
-        }
-        let stamp = match self.host.canonicalize(directory) {
-            Ok(canonical)
-                if self
-                    .toolchain
-                    .sealed
-                    .iter()
-                    .any(|root| canonical.starts_with(root)) =>
-            {
-                return Some(None);
-            }
-            Ok(_) => InputStamp::TreeListing {
-                path: directory.to_owned(),
-                digest: tree_listing_digest(self.host.as_ref(), directory).ok()?,
-            },
-            Err(error)
-                if error.kind == ErrorKind::NotFound
-                    && self
-                        .host
-                        .metadata(directory, Follow::No)
-                        .is_err_and(|error| error.kind == ErrorKind::NotFound) =>
-            {
-                InputStamp::Missing {
-                    path: directory.to_owned(),
-                }
-            }
-            Err(_) => return None,
-        };
-        Some(Some(stamp))
-    }
-
     fn failure_dependencies(
         &self,
         request: &RunRequest,
@@ -868,8 +754,7 @@ impl CompilerEvidence {
         {
             return true;
         }
-        // The toolchain identity covers headers in the SDK and compiler
-        // installation, as it covers their directories in `coverage`.
+        // Installed toolchain headers use the same trust boundary as the compiler.
         if self.in_sealed_root(file) {
             return true;
         }
@@ -891,33 +776,6 @@ impl CompilerEvidence {
                 .canonicalize(file)
                 .is_ok_and(|canonical| sealed(&canonical))
     }
-}
-
-fn include_searches(output: &[u8]) -> Option<Vec<PathBuf>> {
-    let mut searching = false;
-    let mut found = false;
-    let mut paths = BTreeSet::new();
-    for line in output.split(|&byte| byte == b'\n').map(<[u8]>::trim_ascii) {
-        if line.starts_with(b"#include ") && line.ends_with(b" search starts here:") {
-            searching = true;
-        } else if line == b"End of search list." {
-            searching = false;
-            found = true;
-        } else if searching || line.starts_with(b"ignoring nonexistent directory ") {
-            let value = if searching {
-                line.strip_suffix(b" (framework directory)").unwrap_or(line)
-            } else {
-                line.strip_prefix(b"ignoring nonexistent directory \"")?
-                    .strip_suffix(b"\"")?
-            };
-            let directory = path::to_native(value);
-            if !directory.is_absolute() {
-                return None;
-            }
-            paths.insert(directory);
-        }
-    }
-    found.then(|| paths.into_iter().collect())
 }
 
 fn strip_instrumentation(request: &RunRequest) -> std::borrow::Cow<'_, RunRequest> {

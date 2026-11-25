@@ -127,6 +127,9 @@ fn generate(
         Ok(result) => result,
         Err(rcmake_resolve::ResolveError::Reported(_)) => return Err(Failure::Reported),
         Err(err) => {
+            if matches!(err, rcmake_resolve::ResolveError::Genex(_)) {
+                file_generate::report_errors(interp.cx().project(), &configs, host);
+            }
             let message = err
                 .with_export_linker_language(interp.cx().project())
                 .to_string();

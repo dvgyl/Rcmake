@@ -46,7 +46,8 @@ project(M6Determinism LANGUAGES C CXX)
 try_compile(M6_C_PROBE SOURCE_FROM_CONTENT probe.c "int main(void) { return 0; }")
 try_compile(M6_CXX_PROBE SOURCE_FROM_CONTENT probe.cpp "int main() { return 0; }")
 try_compile(M6_OTHER_PROBE SOURCE_FROM_CONTENT other.c "int main(void) { return 1; }")
-if(NOT M6_C_PROBE OR NOT M6_CXX_PROBE OR NOT M6_OTHER_PROBE)
+try_compile(M6_LAST_PROBE SOURCE_FROM_CONTENT last.cpp "int main() { return 1; }")
+if(NOT M6_C_PROBE OR NOT M6_CXX_PROBE OR NOT M6_OTHER_PROBE OR NOT M6_LAST_PROBE)
   message(FATAL_ERROR "A Milestone 6 compiler probe failed.")
 endif()
 add_library(c_part STATIC part.c)
@@ -317,37 +318,6 @@ def configure_streams(streams: tuple[bytes, bytes], build: Path, tools: dict[Pat
     return {"stdout": PHASE_TIME.sub(rb"\g<1> (<elapsed>)", stdout), "stderr": stderr}
 
 
-COMPILER_OBSERVER = """\
-import json
-import os
-from pathlib import Path
-import re
-import subprocess
-import sys
-import time
-
-compiler = sys.argv[1:]
-cwd = Path.cwd()
-log = os.environ.get("RCMAKE_M6_PROBE_LOG")
-scratch = next((part for part in cwd.parts
-                if re.fullmatch(r"TryCompile-.+|CMakeTmp|Spec-[0-9a-f]{16}-[0-9a-f]+", part)), None)
-if not log or not scratch or "-c" not in compiler:
-    os.execv(compiler[0], compiler)
-inputs = []
-for arg in compiler[compiler.index("-c") + 1:]:
-    path = Path(arg)
-    if path.suffix in (".c", ".cc", ".cpp", ".cxx", ".C") and path.is_file():
-        inputs.append(path.name)
-start = time.monotonic_ns()
-result = subprocess.run(compiler, check=False)
-record = json.dumps([str(cwd), scratch, inputs, start, time.monotonic_ns(), result.returncode])
-fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-os.write(fd, (record + "\\n").encode())
-os.close(fd)
-sys.exit(result.returncode)
-"""
-
-
 PROBE_INPUT_OBSERVER = """\
 case "$PWD" in
     */TryCompile-*|*/CMakeTmp|*/CMakeTmp/*|*/Spec-*)
@@ -371,25 +341,19 @@ esac
 """
 
 
-def observe_compilers(root: Path, env: dict[str, str], *, intervals: bool = True) -> dict[str, str]:
-    """Record probe compiler intervals or inputs in a trial log."""
-    prefix = "#!/bin/sh\n"
-    observer = []
+def observe_compilers(root: Path, env: dict[str, str], *, intervals: bool = False) -> dict[str, str]:
+    """Record probe input names for the benchmark."""
     if intervals:
-        script = root / "observe-probe.py"
-        script.write_text(COMPILER_OBSERVER, encoding="utf-8")
-        observer = [sys.executable, str(script)]
-    else:
-        prefix += PROBE_INPUT_OBSERVER
-    log = root / ("probe-compiles.jsonl" if intervals else "probe-inputs.bin")
-    observed = {**env, "RCMAKE_M6_PROBE_LOG": str(log)}
+        raise ValueError("Use the native compiler interval recorder.")
+    prefix = "#!/bin/sh\n" + PROBE_INPUT_OBSERVER
+    observed = {**env, "RCMAKE_M6_PROBE_LOG": str(root / "probe-inputs.bin")}
     for key, default in (("CC", "cc"), ("CXX", "c++")):
         command = shlex.split(env.get(key) or default)
         if not command or not (compiler := shutil.which(command[0], path=env.get("PATH"))):
             continue
         wrapper = root / f"observe-{key}"
         wrapper.write_text(
-            f"{prefix}exec {shlex.join([*observer, compiler, *command[1:]])} \"$@\"\n",
+            f'{prefix}exec {shlex.join([compiler, *command[1:]])} "$@"\n',
             encoding="utf-8",
         )
         wrapper.chmod(0o755)
@@ -397,17 +361,23 @@ def observe_compilers(root: Path, env: dict[str, str], *, intervals: bool = True
     return observed
 
 
-def probe_compiles(env: dict[str, str]) -> list:
-    """Read the compiler calls from the current configure."""
-    path = Path(env["RCMAKE_M6_PROBE_LOG"])
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.is_file() else []
+def probe_compiles(build: Path) -> list[tuple[str, int, int, int]]:
+    """Read the verified compiler intervals from this build."""
+    path = build / "CMakeFiles/rcmake-probe-intervals.txt"
+    if not path.is_file():
+        return []
+    records = []
+    for line in path.read_text().splitlines():
+        scratch, start, end, status = line.split()
+        records.append((scratch, int(start), int(end), int(status)))
+    return records
 
 
 def overlap_on_workers(records: list) -> bool:
     """Require two successful compiler calls in distinct, overlapping worker trees."""
     active = {}
-    for _, scratch, inputs, start, end, status in sorted(records, key=lambda row: row[3]):
-        if status or not inputs or end <= start or not SPECULATIVE.fullmatch(scratch):
+    for scratch, start, end, status in sorted(records, key=lambda row: row[1]):
+        if status or end <= start or not SPECULATIVE.fullmatch(scratch):
             continue
         active = {path: finish for path, finish in active.items() if finish > start}
         if active.keys() - {scratch}:
@@ -420,14 +390,13 @@ def check_project(args, source: Path, work: Path, compat: Path, native: Path,
                   reference: Path | None, enabled_flags: list[str], env: dict[str, str]) -> bool:
     """Compare stable output and report whether parallel workers ran."""
     work.mkdir()
-    env = observe_compilers(work, {**env, "RCMAKE_CACHE_DIR": str(work / "cache")})
-    log = Path(env["RCMAKE_M6_PROBE_LOG"])
+    env = {**env, "RCMAKE_MEASURE_PROBE_INTERVALS": "1"}
     paths = {compat: "<cmake-command>", native: "<cmake-command>"}
     build = work / "compat-jobs-1"
     streams = configure(args, compat, source, build, {**env, "RCMAKE_PROBE_JOBS": "1"})
     baseline = snapshot(build, paths)
     baseline_streams = configure_streams(streams, build, paths)
-    if overlap_on_workers(probe_compiles(env)):
+    if probe_compiles(build):
         raise ValueError("Parallel probe workers ran with RCMAKE_PROBE_JOBS=1.")
     if reference:
         build = work / "stderr-reference"
@@ -440,18 +409,16 @@ def check_project(args, source: Path, work: Path, compat: Path, native: Path,
         ("compat-jobs-4", compat, {}),
         ("oracle-mode", native, {"RCMAKE_ORACLE_MODE": "1", "RCMAKE_DIAGNOSTICS": "rich"}),
     ):
-        log.unlink(missing_ok=True)
         build = work / label
         streams = configure(args, binary, source, build, {**env, **overrides})
         compare({**baseline, **baseline_streams},
                 {**snapshot(build, paths), **configure_streams(streams, build, paths)}, label)
-        if overlap_on_workers(probe_compiles(env)):
+        if probe_compiles(build):
             raise ValueError(f"Parallel probe workers ran in {label}.")
 
     parallel = False
     native_baseline = None
     for jobs in ("1", "4"):
-        log.unlink(missing_ok=True)
         label = f"native-jobs-{jobs}"
         build = work / label
         native_env = {**env, "RCMAKE_PROBE_JOBS": jobs, "RCMAKE_NO_PROBE_CACHE": "1"}
@@ -459,10 +426,11 @@ def check_project(args, source: Path, work: Path, compat: Path, native: Path,
                                     build, paths, compat=False)
         artifacts = {**snapshot(build, paths), "stdout": streams["stdout"]}
         compare({**baseline, "stdout": baseline_streams["stdout"]}, artifacts, label)
-        parallel = overlap_on_workers(probe_compiles(env))
+        records = probe_compiles(build)
+        parallel = overlap_on_workers(records)
         if jobs == "1":
             native_baseline = {**artifacts, "stderr": streams["stderr"]}
-            if parallel:
+            if records:
                 raise ValueError("Parallel probe workers ran with RCMAKE_PROBE_JOBS=1.")
         else:
             compare(native_baseline, {**artifacts, "stderr": streams["stderr"]}, label)
@@ -492,8 +460,139 @@ def check_project(args, source: Path, work: Path, compat: Path, native: Path,
     return parallel
 
 
+OPAQUE_COMPILER = """\
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+compiler = sys.argv[1:]
+scratch = Path.cwd()
+root = Path(os.environ["RCMAKE_TEST_OPAQUE_LOG"])
+sentinel = root.with_suffix(".sentinel")
+names = {Path(arg).name for arg in compiler}
+probe = next((name for name in ("first.c", "second.c", "third.c") if name in names), None)
+if "-c" not in compiler or probe is None:
+    os.execv(compiler[0], compiler)
+with root.open("a", encoding="utf-8") as output:
+    print(scratch.name, probe, file=output)
+if probe == "second.c" and not sentinel.is_file():
+    sys.exit(1)
+if probe == "first.c":
+    time.sleep(0.10)
+status = subprocess.run(compiler, check=False, timeout=15).returncode
+if probe == "first.c" and status == 0:
+    sentinel.touch()
+sys.exit(status)
+"""
+
+
+def check_opaque_compiler(args, root: Path, native: Path, env: dict[str, str]) -> None:
+    """Ensure an opaque compiler with dependencies between calls runs in order."""
+    command = shlex.split(env.get("CC") or "cc")
+    compiler = shutil.which(command[0], path=env.get("PATH")) if command else None
+    if not compiler:
+        if args.require_workers or args.require_native:
+            raise ValueError("The opaque compiler fixture requires a C compiler.")
+        return
+    root.mkdir()
+    observer = root / "opaque.py"
+    observer.write_text(OPAQUE_COMPILER, encoding="utf-8")
+    wrapper = root / "opaque-cc"
+    wrapper.write_text(
+        f'#!/bin/sh\nexec {shlex.join([sys.executable, str(observer), compiler, *command[1:]])} "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    source = root / "src"
+    source.mkdir()
+    (source / "CMakeLists.txt").write_text("""\
+cmake_minimum_required(VERSION 4.5)
+project(Opaque C)
+try_compile(FIRST SOURCE_FROM_CONTENT first.c "int main(void) { return 0; }")
+try_compile(SECOND SOURCE_FROM_CONTENT second.c "int main(void) { return 0; }")
+try_compile(THIRD SOURCE_FROM_CONTENT third.c "int main(void) { return 0; }")
+if(NOT FIRST OR NOT SECOND OR NOT THIRD)
+  message(FATAL_ERROR "The compiler calls ran out of order.")
+endif()
+""", encoding="utf-8")
+    expected = None
+    for jobs in ("1", "4"):
+        log = root / f"jobs-{jobs}.log"
+        build = root / f"build-{jobs}"
+        trial_env = {**env, "CC": str(wrapper), "RCMAKE_NO_PROBE_CACHE": "1",
+                     "RCMAKE_PROBE_JOBS": jobs, "RCMAKE_TEST_OPAQUE_LOG": str(log)}
+        streams = configure_streams(configure(args, native, source, build, trial_env),
+                                    build, {native: "<cmake-command>"}, compat=False)
+        records = [line.split() for line in log.read_text().splitlines()]
+        if any(SPECULATIVE.fullmatch(scratch) for scratch, _ in records):
+            raise ValueError("A worker started the opaque compiler.")
+        if [name for _, name in records] != ["first.c", "second.c", "third.c"]:
+            raise ValueError("The opaque compiler calls ran out of order.")
+        if expected is None:
+            expected = streams
+        else:
+            compare(expected, streams, "opaque compiler jobs 4")
+    print("PASS opaque compiler. The probe calls ran in order without workers.")
+
+
+def check_replay_order(args, root: Path, native: Path, env: dict[str, str]) -> None:
+    """Check target and test order after the child directory replays."""
+    source = root / "src"
+    child = source / "child"
+    child.mkdir(parents=True)
+    (source / "CMakeLists.txt").write_text("""\
+cmake_minimum_required(VERSION 4.5)
+project(ReplayOrder NONE)
+enable_testing()
+add_subdirectory(child)
+get_property(targets DIRECTORY child PROPERTY BUILDSYSTEM_TARGETS)
+get_property(tests DIRECTORY child PROPERTY TESTS)
+if(NOT targets STREQUAL "second;first" OR NOT tests STREQUAL "test_second;test_first")
+  message(FATAL_ERROR "Wrong order. Targets=[${targets}], tests=[${tests}]")
+endif()
+""", encoding="utf-8")
+    entry = child / "CMakeLists.txt"
+    entry.write_text("""\
+foreach(kind IN ITEMS second first)
+  if(kind STREQUAL first)
+    add_library(first INTERFACE)
+    add_test(NAME test_first COMMAND "${CMAKE_COMMAND}" -E true)
+  else()
+    add_library(second INTERFACE)
+    add_test(NAME test_second COMMAND "${CMAKE_COMMAND}" -E true)
+  endif()
+endforeach()
+""", encoding="utf-8")
+    build = root / "build"
+    command = [native, "-S", source, "-B", build, "-G", "Ninja"]
+    measure = {**env, "RCMAKE_MEASURE_REPLAY": "1"}
+    run(command, root, measure, args.timeout)
+    journal = build / "CMakeFiles/rcmake/configure.v1.bin"
+    journal.unlink()
+    run(command, root, measure, args.timeout)
+    ctest = build / "child/CTestTestfile.cmake"
+    cold = ctest.read_bytes()
+    first = cold.index(b"test_second")
+    if first >= cold.index(b"test_first"):
+        raise ValueError("CTest registration differs from test creation order.")
+    run(command, root, measure, args.timeout)
+    report = json.loads((journal.parent / "replay-result.v1.json").read_bytes())
+    if entry.as_posix() not in report["replayed"]:
+        raise ValueError("The child directory did not replay.")
+    if ctest.read_bytes() != cold:
+        raise ValueError("CTest registration changed after replay.")
+    run(command, root, {**measure, "RCMAKE_NO_INCREMENTAL": "1"}, args.timeout)
+    if ctest.read_bytes() != cold:
+        raise ValueError("CTest registration changed with replay disabled.")
+    print("PASS replay order. The child replayed with the same targets and tests.")
+
+
 def persona_path(binary: Path, name: str, aliases: Path) -> Path:
     """Use the staged tool name or create a temporary link to the same binary."""
+    if binary.suffix.lower() == ".exe":
+        name += ".exe"
     sibling = binary.with_name(name)
     if sibling.is_file() and sibling.samefile(binary):
         return executable(sibling)
@@ -645,6 +744,10 @@ def main() -> int:
                 (source / name).write_text(contents, encoding="utf-8")
             sources.append(source)
         complete = True
+        if args.require_native:
+            check_replay_order(args, root / "replay-order", native, env)
+        if os.name != "nt":
+            check_opaque_compiler(args, root / "opaque", native, env)
         for index, source in enumerate(sources):
             if not (source / "CMakeLists.txt").is_file():
                 raise ValueError(f"No CMakeLists.txt in {source}.")

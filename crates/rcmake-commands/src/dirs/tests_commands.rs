@@ -68,6 +68,21 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     } else {
         parse_test_options(&mut test, args)?;
     }
+    let model = cx.project();
+    if let Some(id) = model.find_test(test.dir, name) {
+        if let Some(existing) = model.test_mut(id).filter(|t| t.old_style && old_style) {
+            existing.command = test.command;
+            return Ok(Flow::Normal);
+        }
+        return Err(CmdError::status(
+            [
+                b"given test NAME \"".as_slice(),
+                name,
+                b"\" which already exists in this directory.",
+            ]
+            .concat(),
+        ));
+    }
     // A test with build dependencies gets a build target, so its name must be a valid
     // target name (`cmGeneratorExpression::IsValidTargetName`).
     if !test.build_depends.is_empty()
@@ -80,21 +95,6 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 b"Cannot set build dependencies for a test with NAME \"".as_slice(),
                 name,
                 b"\" which is not a valid target name.",
-            ]
-            .concat(),
-        ));
-    }
-    let model = cx.project();
-    if let Some(id) = model.find_test(test.dir, name) {
-        if let Some(existing) = model.test_mut(id).filter(|t| t.old_style && old_style) {
-            existing.command = test.command;
-            return Ok(Flow::Normal);
-        }
-        return Err(CmdError::status(
-            [
-                b"given test NAME \"".as_slice(),
-                name,
-                b"\" which already exists in this directory.",
             ]
             .concat(),
         ));

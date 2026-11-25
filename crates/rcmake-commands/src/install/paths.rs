@@ -109,7 +109,7 @@ pub(super) fn parse(
             )));
         }
         if !directory {
-            reject_export_output(cx, &path)?;
+            reject_export_output(cx, input)?;
         }
         paths.push(BT::new(path, backtrace.clone()));
     }
@@ -123,11 +123,7 @@ pub(super) fn parse(
 /// CMP0062 (its `OLD` behavior is removed): a file that `export()` writes cannot be
 /// installed with `install(FILES)` or `install(PROGRAMS)`.
 fn reject_export_output(cx: &mut Cx<'_>, path: &[u8]) -> Result<()> {
-    let key = [
-        b"_RCMAKE_EXPORT_OUTPUT_".as_slice(),
-        Lexical::new(path).normalize().as_slice(),
-    ]
-    .concat();
+    let key = [b"_RCMAKE_TARGET_EXPORT_OUTPUT_".as_slice(), path].concat();
     if cx.global().props.get(&key).is_none() {
         return Ok(());
     }

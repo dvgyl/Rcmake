@@ -18,6 +18,7 @@ impl ProjectModel {
     }
 
     /// Restore local declarations after validation of all names and arena positions.
+    /// Supply targets and tests in their original creation order.
     pub fn restore_directory_objects(
         &mut self,
         dir: DirId,
@@ -110,6 +111,66 @@ mod tests {
             Default::default(),
             Default::default(),
         )
+    }
+
+    fn test(name: &str) -> TestEntry {
+        TestEntry {
+            name: name.into(),
+            dir: DirId::ROOT,
+            backtrace: Default::default(),
+            command: Vec::new(),
+            configurations: Vec::new(),
+            working_directory: None,
+            command_expand_lists: false,
+            old_style: false,
+            policies: Default::default(),
+            props: Default::default(),
+            build_depends: Vec::new(),
+            kind: crate::TestKind::Single,
+        }
+    }
+
+    #[test]
+    fn restores_targets_and_tests_in_order_after_an_atomic_collision()
+    -> Result<(), crate::ModelError> {
+        let mut model = ProjectModel::default();
+        let existing = model.add_test(test("existing"))?;
+        assert!(!model.restore_directory_objects(
+            DirId::ROOT,
+            vec![target("second"), target("first")],
+            vec![("alias".into(), "first".into())],
+            vec![test("test_second"), test("existing")]
+        ));
+        assert_eq!(model.targets().count(), 0);
+        assert!(model.find_target(DirId::ROOT, b"alias").is_none());
+        assert_eq!(
+            model
+                .dir_tests(DirId::ROOT)
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            [existing]
+        );
+        assert!(model.restore_directory_objects(
+            DirId::ROOT,
+            vec![target("second"), target("first")],
+            Vec::new(),
+            vec![test("test_second"), test("test_first")]
+        ));
+        assert_eq!(
+            model
+                .targets()
+                .map(|(_, target)| target.name.as_slice())
+                .collect::<Vec<_>>(),
+            [b"second".as_slice(), b"first"]
+        );
+        assert_eq!(
+            model
+                .dir_tests(DirId::ROOT)
+                .map(|(_, test)| test.name.as_slice())
+                .collect::<Vec<_>>(),
+            [b"existing".as_slice(), b"test_second", b"test_first"]
+        );
+        Ok(())
     }
 
     #[test]

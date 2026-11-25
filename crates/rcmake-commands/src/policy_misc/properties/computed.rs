@@ -134,3 +134,14 @@ fn cache_names(cx: &mut Cx<'_>) -> BString {
 pub(super) fn boolean(value: bool) -> BString {
     if value { "1" } else { "0" }.into()
 }
+
+pub(crate) fn manual_dependencies(target: &rcmake_model::Target) -> Option<BString> {
+    let mut deps: Vec<_> = target
+        .utility_deps
+        .iter()
+        .map(|dep| dep.value.as_slice())
+        .collect();
+    deps.sort_unstable();
+    deps.dedup();
+    (!deps.is_empty()).then(|| list::join(deps))
+}

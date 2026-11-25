@@ -10,6 +10,7 @@ pub(super) use print::print_value;
 pub(super) use rule::set;
 pub(super) use set::{set_directory, set_sources};
 
+pub(crate) use computed::manual_dependencies;
 mod computed;
 mod define;
 mod file_set;

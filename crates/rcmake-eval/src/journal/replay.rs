@@ -24,14 +24,23 @@ use super::trace::{
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigureSnapshot<M = ()> {
+    #[serde(rename = "schema")]
+    frame_schema: FrameSchema,
+    #[serde(rename = "replay_schema")]
     pub(super) schema: String,
     pub(super) region: RegionRecord,
     pub(super) model: M,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum FrameSchema {
+    #[serde(rename = "configure.v1")]
+    V1,
+}
+
 impl<M> ConfigureSnapshot<M> {
-    /// Version identifier in the serialized manifest.
-    pub const SCHEMA: &'static str = "configure.v1";
+    /// Version of the replay records in the configure frame.
+    pub const SCHEMA: &'static str = "configure.v2";
 
     /// File name for the manifest under `CMakeFiles/rcmake`.
     pub const FILE_NAME: &'static str = "configure.v1.bin";
@@ -47,11 +56,16 @@ impl<M> ConfigureSnapshot<M> {
                 ReplayMissReason::Opaque(operation),
             ));
         }
-        Ok(Self {
+        Ok(Self::from_region(region, model))
+    }
+
+    pub(super) fn from_region(region: RegionRecord, model: M) -> Self {
+        Self {
+            frame_schema: FrameSchema::V1,
             schema: Self::SCHEMA.into(),
             region,
             model,
-        })
+        }
     }
 }
 

@@ -17,8 +17,8 @@ use rcmake_host::{
     RunRequest, Stream, SystemInfo, WriteMode, path,
 };
 use rcmake_store::{
-    Digest, Domain, InputStamp, KeyHasher, Trace, TraceMemo, VerifyOutcome, directory_digest,
-    file_digest, verify_trace,
+    Digest, Domain, InputStamp, KeyHasher, Trace, TraceMemo, TreePolicy, VerifyOutcome,
+    directory_digest, file_digest, verify_trace,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,8 @@ use host_impl::SharedOrBorrowed;
 pub(super) mod depfile;
 #[path = "journal_host.rs"]
 mod host_impl;
+mod intervals;
+pub(crate) use intervals::CompileIntervals;
 mod process;
 
 /// Total time budget for one queued and running speculative job.
@@ -116,11 +118,41 @@ pub(crate) trait ProcessVerifier: Send + Sync {
     fn preflight(&self, request: &RunRequest) -> Option<Trace>;
 
     /// Read the dependency evidence for the exact request that ran.
-    fn dependencies(&self, request: &RunRequest, output: &RunOutput) -> Option<DependencyClosure>;
+    fn dependencies(
+        &self,
+        request: &RunRequest,
+        output: &RunOutput,
+        preflight: &[InputStamp],
+    ) -> Option<DependencyClosure>;
+
+    /// Return whether a verified request compiles the probe source.
+    fn is_probe_compile(&self, _request: &RunRequest) -> bool {
+        false
+    }
 
     /// Maximum timestamp granularity in the verified file systems.
     fn timestamp_granularity(&self) -> Duration {
         Duration::from_secs(2)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ObservationTime {
+    spawn: i128,
+    cutoff: i128,
+}
+
+impl ObservationTime {
+    fn changed(self, metadata: &Metadata) -> bool {
+        time_nanos(metadata.mtime) >= self.cutoff
+            || metadata.ctime.is_some_and(|ctime| {
+                let threshold = if ctime.nanos == 0 {
+                    self.cutoff
+                } else {
+                    self.spawn
+                };
+                time_nanos(ctime) >= threshold
+            })
     }
 }
 
@@ -131,7 +163,7 @@ enum StampKey {
     Stat(PathBuf),
     File(PathBuf),
     Directory(PathBuf),
-    Tree(PathBuf),
+    Tree(PathBuf, TreePolicy),
     Missing(PathBuf),
     Env(Vec<u8>),
     Lookup(PathBuf, PathBuf),
@@ -143,7 +175,7 @@ impl From<&InputStamp> for StampKey {
             InputStamp::FileStat { path, .. } => Self::Stat(path.clone()),
             InputStamp::FileHash { path, .. } => Self::File(path.clone()),
             InputStamp::DirEntries { path, .. } => Self::Directory(path.clone()),
-            InputStamp::TreeListing { path, .. } => Self::Tree(path.clone()),
+            InputStamp::TreeListing { path, policy, .. } => Self::Tree(path.clone(), *policy),
             InputStamp::Missing { path } => Self::Missing(path.clone()),
             InputStamp::EnvVar { name, .. } => Self::Env(name.clone()),
             InputStamp::NegativeLookup { root, relative, .. } => {
@@ -430,6 +462,7 @@ pub(crate) struct JournalHost<'a> {
     verify_process: Option<SharedOrBorrowed<'a, dyn ProcessVerifier + 'a>>,
     memo: Option<Arc<TraceMemo>>,
     speculation: Option<Speculation>,
+    compile_intervals: Option<Arc<CompileIntervals>>,
     sorted_listings: bool,
     /// Files whose contents the probe key binds. Reads do not stamp them.
     bound: BTreeSet<PathBuf>,
@@ -487,6 +520,7 @@ impl<'a> JournalHost<'a> {
             verify_process,
             memo: None,
             speculation: None,
+            compile_intervals: None,
             sorted_listings: false,
             bound: BTreeSet::new(),
             state: Mutex::default(),
@@ -539,7 +573,11 @@ impl<'a> JournalHost<'a> {
         self.record_dependency_since(path, None)
     }
 
-    fn record_dependency_since(&self, path: &Path, cutoff: Option<i128>) -> HostResult<()> {
+    fn record_dependency_since(
+        &self,
+        path: &Path,
+        time: Option<ObservationTime>,
+    ) -> HostResult<()> {
         if !path.is_absolute() {
             return Err(HostError::not_absolute(path.to_owned()));
         }
@@ -548,12 +586,12 @@ impl<'a> JournalHost<'a> {
         }
         let metadata = self.inner.metadata(path, Follow::Yes)?;
         let canonical = self.inner.canonicalize(path)?;
-        if cutoff.is_some_and(|cutoff| {
-            time_nanos(metadata.mtime) >= cutoff
+        if time.is_some_and(|time| {
+            time.changed(&metadata)
                 || path.ancestors().any(|ancestor| {
-                    self.inner.metadata(ancestor, Follow::No).is_ok_and(|stat| {
-                        stat.kind == FileKind::Symlink && time_nanos(stat.mtime) >= cutoff
-                    })
+                    self.inner
+                        .metadata(ancestor, Follow::No)
+                        .is_ok_and(|stat| stat.kind == FileKind::Symlink && time.changed(&stat))
                 })
         }) {
             self.mark_impure(ImpureReason::ChangedInput);
@@ -593,7 +631,7 @@ impl<'a> JournalHost<'a> {
         &self,
         root: &Path,
         relative: &Path,
-        cutoff: Option<i128>,
+        time: Option<ObservationTime>,
     ) -> HostResult<bool> {
         if !is_absolute(root)
             || relative.as_os_str().is_empty()
@@ -609,14 +647,15 @@ impl<'a> JournalHost<'a> {
         let candidate = root.join(relative);
         match self.inner.metadata(&candidate, Follow::Yes) {
             Ok(metadata) if metadata.kind == FileKind::File => {
-                self.record_dependency_since(&candidate, cutoff)?;
+                self.record_dependency_since(&candidate, time)?;
                 Ok(true)
             }
             Err(error) if error.kind == ErrorKind::NotFound && self.private_path(&candidate) => {
                 Ok(false)
             }
             Err(error) if error.kind == ErrorKind::NotFound => {
-                let result = self.record_negative_search(root, relative, cutoff);
+                let result =
+                    self.record_negative_search(root, relative, time.map(|time| time.cutoff));
                 if result.is_err() {
                     self.mark_impure(ImpureReason::UnverifiableInput);
                 }

@@ -113,6 +113,8 @@ pub struct Metadata {
     pub mode: u32,
     /// Modification timestamp.
     pub mtime: FileTime,
+    /// Time of the last inode or content change, if the host can establish it.
+    pub ctime: Option<FileTime>,
     /// Access timestamp.
     pub atime: FileTime,
     /// Device ID (for symlink cycle detection in glob walks).

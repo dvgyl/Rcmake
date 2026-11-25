@@ -903,3 +903,101 @@ fn run_paused<T: Send>(
             .map_err(|_| HostError::unsupported("Store test thread failed."))?
     })
 }
+
+#[test]
+fn checked_publication_replaces_only_the_stale_key() -> HostResult<()> {
+    let host = host();
+    let store = store(&host)?;
+    let mut first = [0xA5; 32];
+    let second = Digest::from_bytes(first);
+    first[31] = 0x5A;
+    let first = Digest::from_bytes(first);
+    for key in [first, second] {
+        assert_eq!(
+            store.put_entry(Domain::ProbeV1, key, &entry("old"))?,
+            PublishOutcome::Published
+        );
+    }
+    host.seed_file(&store.root().join("probe-generations/a5"), &[0; 33])?;
+    assert_eq!(
+        store.put_entry_checked(
+            Domain::ProbeV1,
+            first,
+            &entry("new"),
+            |_, _| false,
+            || false
+        )?,
+        PublishOutcome::Stale
+    );
+    assert_eq!(
+        store.put_entry_checked(Domain::ProbeV1, first, &entry("new"), |_, _| false, || true)?,
+        PublishOutcome::Published
+    );
+    let read = |key| -> HostResult<_> {
+        Ok(store
+            .get_entry::<String>(Domain::ProbeV1, key)?
+            .map(|entry| entry.payload))
+    };
+    assert_eq!(read(first)?.as_deref(), Some("new"));
+    assert_eq!(read(second)?.as_deref(), Some("old"));
+    Ok(())
+}
+
+#[test]
+fn memo_detects_hard_link_writes_with_restored_modification_time() -> HostResult<()> {
+    let host = host();
+    let file = host.initial_cwd().join("header.h");
+    let alias = host.initial_cwd().join("alias.h");
+    host.seed_file(&file, b"old")?;
+    host.hard_link(&file, &alias)?;
+    host.sleep(Duration::from_secs(3));
+    let memo = TraceMemo::default();
+    let old = memo.file_digest(&host, &file)?;
+    let mtime = host.metadata(&file, Follow::Yes)?.mtime;
+    host.write(&alias, b"new", WriteMode::Truncate)?;
+    host.set_times(&file, None, Some(mtime))?;
+    host.sleep(Duration::from_secs(3));
+    assert_ne!(old, memo.file_digest(&host, &file)?);
+    Ok(())
+}
+
+#[test]
+fn sdk_listing_checks_linked_directories_and_dangling_targets() -> HostResult<()> {
+    let host = host();
+    let sdk = host.initial_cwd().join("sdk");
+    let headers = host.initial_cwd().join("headers");
+    let missing = host.initial_cwd().join("missing");
+    host.create_dir_all(&sdk)?;
+    host.create_dir_all(&headers.join("nested"))?;
+    host.symlink(&headers, &sdk.join("include"))?;
+    host.symlink(&sdk, &headers.join("back"))?;
+    host.symlink(&missing, &sdk.join("optional"))?;
+    let before = sdk_tree_listing_digest(&host, &sdk)?;
+    host.seed_file(&headers.join("nested/extra.h"), b"new")?;
+    let inserted = sdk_tree_listing_digest(&host, &sdk)?;
+    assert_ne!(before, inserted);
+    host.seed_file(&missing, b"new")?;
+    assert_ne!(inserted, sdk_tree_listing_digest(&host, &sdk)?);
+    Ok(())
+}
+
+#[test]
+fn memo_hashes_again_when_the_host_cannot_verify_change_time() -> HostResult<()> {
+    let base = host();
+    let path = base.initial_cwd().join("header.h");
+    base.seed_file(&path, b"old")?;
+    let host = rcmake_host::OverlayHost::new(base);
+    host.write(&path, b"old", WriteMode::Truncate)?;
+    let before = host.metadata(&path, Follow::Yes)?;
+    assert_eq!(before.ctime, None);
+    let memo = TraceMemo::default();
+    let first = memo.file_digest(&host, &path)?;
+    host.write(&path, b"new", WriteMode::Truncate)?;
+    host.set_times(&path, None, Some(before.mtime))?;
+    let after = host.metadata(&path, Follow::Yes)?;
+    assert_eq!(FastStat::read(&host, &path)?.ino, before.ino);
+    assert_eq!(after.mtime, before.mtime);
+    assert_eq!(after.ctime, None);
+    assert_ne!(first, memo.file_digest(&host, &path)?);
+    Ok(())
+}

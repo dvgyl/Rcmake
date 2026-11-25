@@ -73,6 +73,16 @@ impl Fixture {
                     .ok_or_else(|| HostError::unsupported("Expected a tool name."))?;
                 return Ok(success(format!("{TOOLCHAIN}/{tool}\n").into_bytes()));
             }
+            if command.args.iter().any(|arg| arg == "-E")
+                && command.args.iter().any(|arg| arg == "-v")
+            {
+                let mut output = success(Vec::new());
+                output.stderr = format!(
+                    "#include <...> search starts here:\n {SDK}/usr/include\nEnd of search list.\n"
+                )
+                .into_bytes();
+                return Ok(output);
+            }
             if command.program == format!("{TOOLCHAIN}/clang").as_str()
                 || command.program == format!("{TOOLCHAIN}/clang++").as_str()
             {
@@ -95,6 +105,11 @@ impl Fixture {
             count.fetch_add(1, Ordering::Relaxed);
             if std::thread::current().name() == Some("rcmake-probe") {
                 worker_count.fetch_add(1, Ordering::Relaxed);
+                if host.env_get(b"RCMAKE_MEASURE_PROBE_INTERVALS").is_some()
+                    && command.args.iter().any(|arg| arg == "-c")
+                {
+                    std::thread::sleep(Duration::from_millis(30));
+                }
             }
             let argument = |flag: &[u8]| {
                 command.args.windows(2).find_map(|pair| match pair {
@@ -278,6 +293,9 @@ try_compile(THIRD SOURCE_FROM_CONTENT third.c [[int main(void) { return 3; }]] N
     assert_eq!(serial.speculative.load(Ordering::Relaxed), 0);
     for mode in [ProbeCacheMode::ReadWrite, ProbeCacheMode::Off] {
         let parallel = Fixture::new(script)?;
+        parallel
+            .inner
+            .env_set(b"RCMAKE_MEASURE_PROBE_INTERVALS", Some(b"1"));
         assert_eq!(parallel.configure(mode, 4, &names)?, expected);
         assert!(parallel.speculative.load(Ordering::Relaxed) >= 2);
         assert_eq!(
@@ -285,6 +303,33 @@ try_compile(THIRD SOURCE_FROM_CONTENT third.c [[int main(void) { return 3; }]] N
             serial.runs.load(Ordering::Relaxed)
         );
         if mode == ProbeCacheMode::Off {
+            let records = parallel.inner.read(
+                Path::new("/work/build/CMakeFiles/rcmake-probe-intervals.txt"),
+                ReadRange::All { limit: 8192 },
+            )?;
+            let intervals = std::str::from_utf8(&records)?
+                .lines()
+                .filter_map(|line| {
+                    let fields: Vec<_> = line.split_ascii_whitespace().collect();
+                    let [scratch, start, end, "0"] = fields.as_slice() else {
+                        return None;
+                    };
+                    Some((
+                        *scratch,
+                        start.parse::<u64>().ok()?,
+                        end.parse::<u64>().ok()?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                intervals.iter().any(|(name, start, end)| {
+                    intervals.iter().any(|(other, other_start, other_end)| {
+                        name != other && start < other_end && other_start < end
+                    })
+                }),
+                "{}",
+                String::from_utf8_lossy(&records)
+            );
             assert!(
                 parallel
                     .inner
@@ -292,6 +337,40 @@ try_compile(THIRD SOURCE_FROM_CONTENT third.c [[int main(void) { return 3; }]] N
                     .is_err()
             );
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn optional_sdk_header_insertion_invalidates_a_warm_probe() -> TestResult {
+    let fixture = Fixture::new(
+        r#"
+try_compile(OK SOURCE_FROM_CONTENT main.c [[
+#if __has_include(<nested/optional.h>)
+#include <nested/optional.h>
+#endif
+int main(void) { return 0; }
+]] NO_CACHE)
+"#,
+    )?;
+    let include = Path::new(SDK).join("usr/include/nested");
+    fixture.inner.create_dir_all(&include)?;
+    for (index, expected_runs) in [2, 2, 4, 4].into_iter().enumerate() {
+        if index == 2 {
+            fixture
+                .inner
+                .seed_file(&include.join("optional.h"), b"new")?;
+        }
+        assert_eq!(
+            fixture.configure_in(
+                &format!("/work/header-{index}"),
+                ProbeCacheMode::ReadWrite,
+                1,
+                &[b"OK"]
+            )?,
+            [BString::from("TRUE")]
+        );
+        assert_eq!(fixture.runs.load(Ordering::Relaxed), expected_runs);
     }
     Ok(())
 }

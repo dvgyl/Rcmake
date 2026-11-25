@@ -25,6 +25,7 @@ pub(super) fn scan(scan: &mut Scan<'_, '_, '_>, args: &Parsed, platform: &[u8]) 
     let mut elf = ElfScan {
         tools: tool::Tools::new(scan.cx, platform)?,
         images: HashMap::new(),
+        visited: HashMap::new(),
         machine: 0,
         probes: 0,
         retained: 0,
@@ -52,6 +53,7 @@ pub(super) fn scan(scan: &mut Scan<'_, '_, '_>, args: &Parsed, platform: &[u8]) 
 struct ElfScan {
     tools: tool::Tools,
     images: HashMap<BString, Arc<ElfDeps>>,
+    visited: HashMap<BString, HashSet<FileKey>>,
     machine: u16,
     probes: usize,
     retained: usize,
@@ -135,7 +137,6 @@ impl ElfScan {
         directories: &[BString],
         root: &BString,
     ) -> Result<()> {
-        let mut seen = HashSet::from([file_key(scan, root)]);
         let mut names = HashSet::new();
         let mut queue = VecDeque::from([Visit {
             path: root.clone(),
@@ -229,7 +230,12 @@ impl ElfScan {
                         rpaths: None,
                     },
                 );
-                if seen.insert(file_key(scan, &path)) {
+                if self
+                    .visited
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(file_key(scan, &path))
+                {
                     if visit.depth >= scan.cx.limits().max_recursion.min(256) {
                         return Err(error("Runtime dependency scan exceeds the depth limit"));
                     }

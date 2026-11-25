@@ -228,13 +228,7 @@ impl ReplaySession {
                 },
             )
         });
-        Manifest {
-            schema: Manifest::SCHEMA.into(),
-            region,
-            model: self.pending,
-        }
-        .encode()
-        .ok()
+        Manifest::from_region(region, self.pending).encode().ok()
     }
 }
 

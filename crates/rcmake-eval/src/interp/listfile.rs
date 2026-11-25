@@ -16,26 +16,38 @@ pub(crate) const CMP0198: PolicyId = PolicyId::new(198);
 impl Interp {
     /// Execute a standalone `-P` script at `path`.
     pub fn run_script(&mut self, path: &Path) -> RunOutcome {
-        self.run_script_impl(path, true)
+        self.run_script_impl(path, true, true)
     }
 
     /// Run a listfile for a caller that reports its own file processing errors.
     pub fn run_embedded_script(&mut self, path: &Path) -> RunOutcome {
-        self.run_script_impl(path, false)
+        self.run_script_impl(path, false, true)
     }
 
-    fn run_script_impl(&mut self, path: &Path, report_processing_error: bool) -> RunOutcome {
+    /// Execute the find-package module in a session that permits project commands.
+    pub fn run_find_package_script(&mut self, path: &Path) -> RunOutcome {
+        self.run_script_impl(path, true, false)
+    }
+
+    fn run_script_impl(
+        &mut self,
+        path: &Path,
+        report_processing_error: bool,
+        standalone: bool,
+    ) -> RunOutcome {
         self.init_policy_minimum();
         let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
         let abs = collapse_full_path(&rcmake_host::path::from_native_cmake(path), &cwd);
 
-        self.vars.set(b"CMAKE_SCRIPT_MODE_FILE", abs.clone());
-        // The script-mode root snapshot has no listfile.
-        self.listfiles.push(Arc::from(&b""[..]));
-        let argc = self.config.script_args.len();
-        self.vars.set(b"CMAKE_ARGC", argc.to_string().into());
-        for (i, arg) in self.config.script_args.clone().into_iter().enumerate() {
-            self.vars.set(format!("CMAKE_ARGV{i}").as_bytes(), arg);
+        if standalone {
+            self.vars.set(b"CMAKE_SCRIPT_MODE_FILE", abs.clone());
+            // The script-mode root snapshot has no listfile.
+            self.listfiles.push(Arc::from(&b""[..]));
+            let argc = self.config.script_args.len();
+            self.vars.set(b"CMAKE_ARGC", argc.to_string().into());
+            for (i, arg) in self.config.script_args.clone().into_iter().enumerate() {
+                self.vars.set(format!("CMAKE_ARGV{i}").as_bytes(), arg);
+            }
         }
 
         if !self.is_regular_file(&abs) {

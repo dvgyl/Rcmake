@@ -54,6 +54,7 @@ impl ProcessVerifier for TestCompiler {
         &self,
         _: &RunRequest,
         _: &rcmake_host::RunOutput,
+        _: &[rcmake_store::InputStamp],
     ) -> Option<super::super::try_compile::journal::DependencyClosure> {
         use super::super::try_compile::journal::DependencyClosure;
         Some(DependencyClosure {

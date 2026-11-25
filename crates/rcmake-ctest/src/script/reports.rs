@@ -101,6 +101,7 @@ pub(super) fn ctest_update(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult 
             let tag = Tag::read(host, &build).map_err(|failure| error(failure.to_string()))?;
             let program = cx.var_or_empty(b"CTEST_UPDATE_COMMAND");
             let git = cx.var_or_empty(b"CTEST_GIT_COMMAND");
+            let update_type = cx.var_or_empty(b"CTEST_UPDATE_TYPE");
             let revision = args
                 .value(b"VERSION_OVERRIDE")
                 .filter(|value| !value.is_empty())
@@ -115,6 +116,7 @@ pub(super) fn ctest_update(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult 
                 Options {
                     program: &program,
                     git: &git,
+                    update_type: &update_type,
                     version_only: args.flag(b"VERSION_ONLY")
                         || cx.var_is_on(b"CTEST_UPDATE_VERSION_ONLY"),
                     revision: &revision,

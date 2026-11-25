@@ -323,38 +323,8 @@ fn cmd_include(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 }
 
 fn is_target_export(cx: &mut Cx<'_>, path: &[u8]) -> bool {
-    let model = cx.project();
-    let props = &model.global.props;
-    let key = cat(&[b"_RCMAKE_EXPORT_OUTPUT_", path]);
-    if props.get(&key).is_none() {
-        return false;
-    }
-    let count = props
-        .get(b"_RCMAKE_BUILD_EXPORT_COUNT")
-        .and_then(|value| core::str::from_utf8(value).ok()?.parse::<usize>().ok())
-        .unwrap_or_default();
-    let mut requests = (0..count).map_while(|index| {
-        let prefix = format!("_RCMAKE_BUILD_EXPORT_{index}");
-        let kind = props.get(format!("{prefix}_ARG0").as_bytes())?;
-        Some((prefix, kind))
-    });
-    requests.any(|(prefix, kind)| {
-        if kind != b"TARGETS" {
-            return false;
-        }
-        let Some(dir) = props
-            .get(format!("{prefix}_DIRECTORY").as_bytes())
-            .and_then(|value| core::str::from_utf8(value).ok()?.parse::<usize>().ok())
-            .and_then(|index| model.dirs().nth(index).map(|(_, dir)| dir))
-        else {
-            return false;
-        };
-        let mut args = (1..).map_while(|arg| props.get(format!("{prefix}_ARG{arg}").as_bytes()));
-        args.find(|arg| *arg == b"FILE").is_some()
-            && args
-                .next()
-                .is_some_and(|file| collapse_full_path(file, &dir.binary_dir) == path)
-    })
+    let key = cat(&[b"_RCMAKE_TARGET_EXPORT_OUTPUT_", path]);
+    cx.global().props.get(&key).is_some()
 }
 
 fn cmd_include_guard(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {

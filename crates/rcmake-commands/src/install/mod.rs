@@ -14,7 +14,9 @@ use rcmake_model::{
     UsageScope,
 };
 
+mod components;
 mod destinations;
+pub(crate) use components::registered;
 mod export_options;
 mod mapped_package;
 mod metadata;
@@ -219,11 +221,13 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     let mut options = InstallOptions::default();
     let mut extra_destinations = Vec::new();
     let mut library_namelink_only = false;
+    let mut target_components = None;
     let kind = match *signature {
         b"TARGETS" => {
-            let (kind, namelink_only) =
+            let (kind, namelink_only, components) =
                 targets(cx, &mut args, &mut options, &mut extra_destinations)?;
             library_namelink_only = namelink_only;
+            target_components = Some(components);
             kind
         }
         b"FILES" | b"PROGRAMS" | b"DIRECTORY" => {
@@ -327,6 +331,12 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     });
     let section = format!("_RCMAKE_INSTALL_{index}");
     record_args(cx, &section, &input);
+    if let Some(components) = target_components {
+        cx.global().props.set(
+            format!("{section}_COMPONENTS").into(),
+            rcmake_base::list::join(components),
+        );
+    }
     for (id, entries) in snapshots {
         for (key, value) in entries {
             let key = String::from_utf8_lossy(key);
@@ -398,7 +408,7 @@ fn targets(
     args: &mut Args<'_>,
     options: &mut InstallOptions,
     destinations: &mut Vec<(usize, BString, bool)>,
-) -> Result<(InstallKind, bool)> {
+) -> Result<(InstallKind, bool, std::collections::BTreeSet<BString>)> {
     let argument_count = args.len() + 1;
     let targets = target_ids(cx, values(args), true)?;
     let mut export = None;
@@ -407,6 +417,9 @@ fn targets(
     let mut group: Option<&[u8]> = None;
     let mut dependencies = None;
     let mut namelink = None;
+    let mut namelink_component = None;
+    let mut component_groups = Vec::new();
+    let mut file_set = None;
     let mut library_namelink_only = false;
     let mut file_sets = Vec::new();
     while let Some(key) = args.next() {
@@ -448,7 +461,7 @@ fn targets(
                     )));
                 }
                 if key == b"NAMELINK_COMPONENT" {
-                    value(args, key)?;
+                    namelink_component = Some(value(args, key)?);
                 } else if namelink
                     .replace(key)
                     .is_some_and(|previous| previous != key)
@@ -458,6 +471,15 @@ fn targets(
                 library_namelink_only |= group == Some(b"LIBRARY") && key == b"NAMELINK_ONLY";
             }
             key if artifact(key) => {
+                if let Some(group) = group {
+                    component_groups.push(components::Group {
+                        key: group,
+                        file_set,
+                        component: artifact_options.component.take(),
+                        namelink,
+                        namelink_component,
+                    });
+                }
                 destinations.extend(
                     destination_argument
                         .take()
@@ -467,6 +489,8 @@ fn targets(
                 artifact_options = InstallOptions::default();
                 group = Some(key);
                 namelink = None;
+                namelink_component = None;
+                file_set = None;
                 if key == b"FILE_SET" {
                     let name = args
                         .next_if(|token| !token.is_empty() && !keyword(token))
@@ -474,6 +498,7 @@ fn targets(
                             fail("TARGETS given FILE_SET option without file set name.")
                         })?;
                     file_sets.push(name);
+                    file_set = Some(name);
                 }
             }
             _ => {
@@ -494,6 +519,15 @@ fn targets(
             }
         }
     }
+    if let Some(group) = group {
+        component_groups.push(components::Group {
+            key: group,
+            file_set,
+            component: artifact_options.component.take(),
+            namelink,
+            namelink_component,
+        });
+    }
     destinations.extend(
         destination_argument
             .zip(artifact_options.destination)
@@ -502,9 +536,11 @@ fn targets(
     if export.is_some() {
         require_exported_file_sets(cx, &targets, &file_sets)?;
     }
+    let components = components::for_targets(cx, &targets, options, &component_groups);
     Ok((
         InstallKind::Targets { targets, export },
         library_namelink_only,
+        components,
     ))
 }
 
@@ -845,6 +881,10 @@ fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         let key = [b"_RCMAKE_EXPORT_OUTPUT_".as_slice(), output.as_slice()].concat();
         if !append && cx.global().props.get(&key).is_some() {
             export_options::repeat(cx, &file)?;
+        }
+        if *signature == b"TARGETS" {
+            let target_key = [b"_RCMAKE_TARGET_EXPORT_OUTPUT_".as_slice(), &output].concat();
+            cx.global().props.set(target_key.into(), "1".into());
         }
         cx.global().props.set(key.into(), b"1".as_slice().into());
         record_request(cx, "_RCMAKE_BUILD_EXPORT", input);

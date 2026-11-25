@@ -217,15 +217,7 @@ fn build_ninja_multi_config_streams_output_and_cleans_first() {
     let mut stages = requests.iter();
     let clean = stages.next().unwrap();
     let build = stages.next().unwrap();
-    let common = [
-        "-C",
-        "/work/out",
-        "-f",
-        "build-Release.ninja",
-        "-j",
-        "4",
-        "-v",
-    ];
+    let common = ["-f", "build-Release.ninja", "-j", "4", "-v"];
     assert_eq!(clean.program, "/tools/ninja");
     assert_eq!(build.program, "/tools/ninja");
     assert_eq!(
@@ -331,7 +323,7 @@ fn build_stops_after_a_failed_clean() {
     host.set_command_handler(|_, request, _| {
         let command = request.pipeline.first().unwrap();
         assert_eq!(command.program, "ninja");
-        assert_eq!(command.args, argv(&["-C", "/work", "-j", "5", "clean"]));
+        assert_eq!(command.args, argv(&["-j", "5", "clean"]));
         Ok(RunOutput {
             results: vec![ProcessResult::Exited(9)],
             ..RunOutput::default()

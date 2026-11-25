@@ -210,7 +210,7 @@ fn origin_soname_transitive_and_runpath_precedence() -> TestResult {
 }
 
 #[test]
-fn rpath_inheritance_is_per_root_and_runpath_is_local() -> TestResult {
+fn shared_dependencies_are_walked_once_with_the_first_root_search() -> TestResult {
     let (host, mut interp) = setup()?;
     for (path, tag, search) in [
         ("/work/one", 15, "/one:/common"),
@@ -227,10 +227,9 @@ fn rpath_inheritance_is_per_root_and_runpath_is_local() -> TestResult {
         &mut interp,
         "file(GET_RUNTIME_DEPENDENCIES EXECUTABLES /work/one /work/two /work/three RESOLVED_DEPENDENCIES_VAR result CONFLICTING_DEPENDENCIES_PREFIX clash UNRESOLVED_DEPENDENCIES_VAR missing)",
     )?;
-    value(&mut interp, "result", "/common/parent.so");
-    value(&mut interp, "clash_FILENAMES", "leaf.so");
-    value(&mut interp, "clash_leaf.so", "/one/leaf.so;/two/leaf.so");
-    value(&mut interp, "missing", "leaf.so");
+    value(&mut interp, "result", "/one/leaf.so;/common/parent.so");
+    value(&mut interp, "clash_FILENAMES", "");
+    value(&mut interp, "missing", "");
     Ok(())
 }
 
@@ -437,7 +436,7 @@ fn freebsd_search_and_depth_limit() -> TestResult {
     let code = run(
         &host,
         &mut interp,
-        "set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM freebsd+elf)\nset(CMAKE_LDCONFIG_TOOL bsd-ldconfig)\nunset(CMAKE_LDCONFIG_COMMAND)\nfile(GET_RUNTIME_DEPENDENCIES EXECUTABLES /work/root)",
+        "set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM freebsd+elf)\nset(CMAKE_LDCONFIG_TOOL ldconfig)\nset(CMAKE_LDCONFIG_COMMAND bsd-ldconfig)\nfile(GET_RUNTIME_DEPENDENCIES EXECUTABLES /work/root)",
     )?;
     assert_ne!(code, 0);
     let stderr = host.stream_bytes(Stream::Stderr);
@@ -469,5 +468,24 @@ fn native_backslashes_do_not_split_elf_dependency_names() -> TestResult {
         value(&mut interp, "result", r"/work/nested\leaf.so");
         value(&mut interp, "missing", "");
     }
+    Ok(())
+}
+
+#[test]
+fn ldconfig_tool_selects_the_type() -> TestResult {
+    let (host, mut interp) = setup()?;
+    let code = run(
+        &host,
+        &mut interp,
+        "set(CMAKE_LDCONFIG_TOOL custom-loader)\nfile(GET_RUNTIME_DEPENDENCIES)",
+    )?;
+    assert_ne!(code, 0);
+    let stderr = host.stream_bytes(Stream::Stderr);
+    assert!(
+        stderr
+            .to_string()
+            .contains("Invalid value for CMAKE_LDCONFIG_TOOL: custom-loader"),
+        "{stderr}"
+    );
     Ok(())
 }

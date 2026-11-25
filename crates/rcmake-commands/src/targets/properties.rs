@@ -158,16 +158,9 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 let local = model.dir(dir).local_targets.contains_key(bytes(name));
                 Some(if local { "FALSE" } else { "TRUE" }.into())
             }
-            (_, b"MANUALLY_ADDED_DEPENDENCIES") => model.target(binding.id()).and_then(|target| {
-                let mut deps: Vec<_> = target
-                    .utility_deps
-                    .iter()
-                    .map(|dep| dep.value.as_slice())
-                    .collect();
-                deps.sort_unstable();
-                deps.dedup();
-                (!deps.is_empty()).then(|| list::join(deps))
-            }),
+            (_, b"MANUALLY_ADDED_DEPENDENCIES") => model
+                .target(binding.id())
+                .and_then(crate::policy_misc::properties::manual_dependencies),
             _ if model
                 .global
                 .defined_property(b"TARGET", property)

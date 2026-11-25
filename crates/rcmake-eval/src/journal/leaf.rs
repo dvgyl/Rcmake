@@ -392,15 +392,19 @@ impl LocalState {
     ) -> Option<Self> {
         let dir = interp.current_dir_id();
         let path = interp.current_binary_dir();
-        let mut targets = Vec::new();
+        let mut targets = BTreeMap::new();
         for (name, kind) in &writes.targets {
-            let target = interp
-                .project
-                .target(interp.project.find_target(dir, name)?)?;
-            if target.dir != dir || target.kind != *kind {
+            let id = interp.project.find_target(dir, name)?;
+            let target = interp.project.target(id)?;
+            if target.dir != dir || target.kind != *kind || &target.name != name {
                 return None;
             }
-            targets.push(TargetRecord::capture(target, &path)?);
+            if targets
+                .insert(id, TargetRecord::capture(target, &path)?)
+                .is_some()
+            {
+                return None;
+            }
         }
         let mut aliases = Vec::new();
         for (alias, target) in &writes.aliases {
@@ -410,14 +414,20 @@ impl LocalState {
             }
             aliases.push((alias.to_vec(), target.to_vec()));
         }
-        let tests = writes
-            .tests
-            .iter()
-            .map(|name| {
-                let id = interp.project.find_test(dir, name)?;
-                TestRecord::capture(interp.project.test(id)?, &path, interp.policies.top())
-            })
-            .collect::<Option<Vec<_>>>()?;
+        let mut tests = BTreeMap::new();
+        for name in &writes.tests {
+            let id = interp.project.find_test(dir, name)?;
+            let test = interp.project.test(id)?;
+            if test.dir != dir || &test.name != name {
+                return None;
+            }
+            if tests
+                .insert(id, TestRecord::capture(test, &path, interp.policies.top())?)
+                .is_some()
+            {
+                return None;
+            }
+        }
         let installs = match install_start {
             Some((start, target_start)) => Some(install::Installs::capture(
                 &interp.project,
@@ -435,9 +445,9 @@ impl LocalState {
         };
         Some(Self {
             variable_inputs: None,
-            targets,
+            targets: targets.into_values().collect(),
             aliases,
-            tests,
+            tests: tests.into_values().collect(),
             installs,
             link_check,
             directory_usage,
@@ -459,11 +469,7 @@ impl LocalState {
                     .aliases
                     .iter()
                     .map(|(alias, target)| (alias.as_slice(), target.as_slice())))
-            || !self
-                .tests
-                .iter()
-                .map(|test| test.name.as_slice())
-                .eq(writes.tests.iter().map(|name| name.as_slice()))
+            || self.tests.len() != writes.tests.len()
             || writes.directory_usage != self.directory_usage.is_some()
             || (!writes.record_variable_reads
                 && self
@@ -473,10 +479,17 @@ impl LocalState {
         {
             return false;
         }
+        let mut target_kinds: BTreeMap<_, _> = writes
+            .targets
+            .iter()
+            .map(|(name, kind)| (name.as_slice(), (name, *kind)))
+            .collect();
         let mut targets = Vec::with_capacity(self.targets.len());
-        for (record, (name, kind)) in self.targets.iter().zip(&writes.targets) {
-            let Some(target) = record.restore(name, *kind, dir, &bin, *interp.policies.top())
-            else {
+        for record in &self.targets {
+            let Some((name, kind)) = target_kinds.remove(record.name.as_slice()) else {
+                return false;
+            };
+            let Some(target) = record.restore(name, kind, dir, &bin, *interp.policies.top()) else {
                 return false;
             };
             targets.push(target);
@@ -493,10 +506,16 @@ impl LocalState {
             .iter()
             .map(|(alias, target)| (alias.as_slice().into(), target.as_slice().into()))
             .collect();
+        let mut test_names: BTreeSet<_> = writes.tests.iter().map(|name| name.as_slice()).collect();
         let Some(tests) = self
             .tests
             .iter()
-            .map(|test| test.restore(dir, &bin, *interp.policies.top()))
+            .map(|test| {
+                if !test_names.remove(test.name.as_slice()) {
+                    return None;
+                }
+                test.restore(dir, &bin, *interp.policies.top())
+            })
             .collect::<Option<Vec<_>>>()
         else {
             return false;

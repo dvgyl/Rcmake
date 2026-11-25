@@ -13,7 +13,9 @@ use crate::configure::probe_pool::{
 use super::super::args::{Signature, Source};
 use super::super::cache::ObservedOutcome;
 use super::super::child::{ChildBuild, ChildConfig};
-use super::super::journal::{Journal, JournalHost, JournalMode, ProcessVerifier, speculative_now};
+use super::super::journal::{
+    CompileIntervals, Journal, JournalHost, JournalMode, ProcessVerifier, speculative_now,
+};
 use super::super::plan::{ProbeRecipe, Templated, compute_probe_key};
 use super::super::{ProbeDirs, ProbeResult};
 use super::{PreparedProbe, ProbeRuntime, compiler};
@@ -43,7 +45,7 @@ impl ProbeRuntime {
             scratch_root: &scratch_root,
             process_verifier: None,
         };
-        ProbePool::scoped(
+        let result = ProbePool::scoped(
             &context,
             physical_memory(host),
             services.speed.probe_jobs,
@@ -52,7 +54,11 @@ impl ProbeRuntime {
                 interp.add_session_data(pool.queue());
                 evaluate(interp)
             },
-        )
+        );
+        if let Some(intervals) = &self.intervals {
+            let _ = intervals.write(host, &self.build);
+        }
+        result
     }
 }
 
@@ -132,7 +138,6 @@ impl PreparedProbe {
                 &name,
                 &self.runtime.cache.memo,
                 None,
-                self.runtime.mode == ProbeCacheMode::Off,
             ) else {
                 continue;
             };
@@ -149,6 +154,7 @@ impl PreparedProbe {
             let child_bytes = child.retained_bytes();
             let child = child.clone();
             let bound = self.bound.clone();
+            let intervals = self.runtime.intervals.clone();
             queue.submit(
                 recipe,
                 environment.clone(),
@@ -160,6 +166,7 @@ impl PreparedProbe {
                         target,
                         child,
                         bound,
+                        intervals,
                     };
                     execution.run(scratch, recipe, environment, budget)
                 })),
@@ -176,6 +183,7 @@ struct SpeculativeExecution {
     target: BString,
     child: ChildConfig,
     bound: std::collections::BTreeSet<PathBuf>,
+    intervals: Option<Arc<CompileIntervals>>,
 }
 
 impl SpeculativeExecution {
@@ -195,6 +203,7 @@ impl SpeculativeExecution {
             JournalHost::from_shared(self.host, scratch, self.compiler, JournalMode::Speculate)?
                 .with_trace_memo(self.memo)
                 .with_bound_inputs(self.bound)
+                .with_compile_intervals(self.intervals)
                 .with_speculation(environment, budget.cancel, budget.shutdown, budget.deadline),
         );
         for (name, template) in &recipe.files {

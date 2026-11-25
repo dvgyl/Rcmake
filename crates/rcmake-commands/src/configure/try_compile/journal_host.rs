@@ -291,14 +291,16 @@ impl Host for JournalHost<'_> {
             }
             return Ok(result);
         }
-        let request = self.process_request(request)?;
+        let (request, preflight) = self.process_request(request)?;
         let spawn = self.inner.now();
+        let start = self.compile_start(&request, preflight.is_some());
         let result = if self.mode == JournalMode::Speculate {
             self.inner.run_bounded(&request, MAX_PROCESS_OUTPUT)
         } else {
             self.inner.run(&request, on_output)
         };
-        self.after_process(&request, spawn, &result);
+        self.compile_end(start, &result);
+        self.after_process(&request, spawn, &result, preflight.as_deref());
         result
     }
 
@@ -308,15 +310,17 @@ impl Host for JournalHost<'_> {
         {
             return Ok(result);
         }
-        let request = self.process_request(request)?;
+        let (request, preflight) = self.process_request(request)?;
         let limit = if self.mode == JournalMode::Speculate {
             limit.min(MAX_PROCESS_OUTPUT)
         } else {
             limit
         };
         let spawn = self.inner.now();
+        let start = self.compile_start(&request, preflight.is_some());
         let result = self.inner.run_bounded(&request, limit);
-        self.after_process(&request, spawn, &result);
+        self.compile_end(start, &result);
+        self.after_process(&request, spawn, &result, preflight.as_deref());
         result
     }
 

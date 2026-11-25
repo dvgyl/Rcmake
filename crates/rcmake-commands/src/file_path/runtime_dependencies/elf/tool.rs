@@ -21,20 +21,14 @@ impl Tools {
     pub(super) fn new(cx: &Cx<'_>, platform: &[u8]) -> Result<Self> {
         let objdump = configured(cx, b"CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND")?;
         let freebsd = platform == b"freebsd+elf";
-        let tool = cx.var_or_empty(b"CMAKE_LDCONFIG_TOOL");
-        let explicit = configured(cx, b"CMAKE_LDCONFIG_COMMAND")?;
-        let command = explicit.or_else(|| {
-            (!tool.is_empty()).then(|| CommandSpec {
-                program: tool,
-                args: Vec::new(),
-            })
-        });
-        let directories = if let Some(command) = command {
+        let directories = if let Some(command) = configured(cx, b"CMAKE_LDCONFIG_COMMAND")? {
             Some(ldconfig(cx, command, freebsd)?)
-        } else if matches!(
-            (cx.host().system().sysname.as_slice(), freebsd),
-            (b"Linux", false) | (b"FreeBSD", true)
-        ) {
+        } else if cx.var_or_empty(b"CMAKE_LDCONFIG_TOOL") == "ldconfig"
+            || matches!(
+                (cx.host().system().sysname.as_slice(), freebsd),
+                (b"Linux", false) | (b"FreeBSD", true)
+            )
+        {
             default_ldconfig(cx).and_then(|command| ldconfig(cx, command, freebsd).ok())
         } else {
             None
