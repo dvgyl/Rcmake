@@ -793,10 +793,11 @@ mod tests {
 
     #[test]
     fn lock_update_rejects_credential_paths_before_download() -> Result<(), FetchError> {
-        let host = PureHost::new("/work".into(), "/tools/rcmake".into());
-        let store = Store::new(&host, StoreConfig::new("/cache".into()))?;
+        let root = PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = PureHost::new(root.clone(), root.join("tools").join("rcmake"));
+        let store = Store::new(&host, StoreConfig::new(root.join("cache")))?;
         let cache = ArchiveCache::new(&host, &store);
-        let mut lock = LockSession::open(&host, Path::new("/work"), LockMode::Update)?;
+        let mut lock = LockSession::open(&host, &root, LockMode::Update)?;
         let mut called = false;
         let source = "https://example.invalid/download/access_token%3Dprivate/archive.tar.gz";
         let result = lock.fetch_archive_with(&cache, "dep", source, None, || {

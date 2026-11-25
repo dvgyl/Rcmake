@@ -24,12 +24,21 @@ const URL: &str = "https://example.invalid/archive";
 const REPO: &str = "https://example.invalid/repo.git";
 const PIN: &str = "0123456789abcdef0123456789abcdef01234567";
 
+fn work_root() -> PathBuf {
+    PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" })
+}
+
+fn cache_root() -> PathBuf {
+    work_root().join("cache")
+}
+
 fn host() -> PureHost {
-    PureHost::new("/work".into(), "/tools/rcmake".into())
+    let root = work_root();
+    PureHost::new(root.clone(), root.join("tools").join("rcmake"))
 }
 
 fn config() -> StoreConfig {
-    StoreConfig::new("/cache".into())
+    StoreConfig::new(cache_root())
 }
 
 fn hash(algorithm: &str, algo: HashAlgo, bytes: &[u8]) -> Result<ContentHash, FetchError> {
@@ -99,14 +108,14 @@ fn rejects_malformed_duplicate_unsupported_and_oversized_lockfiles() {
 #[test]
 fn lock_modes_apply_and_concurrent_updates_merge() -> Result<(), Box<dyn std::error::Error>> {
     let host = host();
-    let source = Path::new("/work");
+    let source = work_root();
     let path = source.join("rcmake-fetch.lock");
     let store = Store::new(&host, config())?;
     let cache = ArchiveCache::new(&host, &store);
-    assert!(LockSession::open(&host, source, LockMode::Frozen).is_err());
+    assert!(LockSession::open(&host, &source, LockMode::Frozen).is_err());
     host.seed_file(&path, b"malformed")?;
-    let mut off = LockSession::open(&host, source, LockMode::Off)?;
-    assert!(LockSession::open(&host, source, LockMode::Auto).is_err());
+    let mut off = LockSession::open(&host, &source, LockMode::Off)?;
+    assert!(LockSession::open(&host, &source, LockMode::Auto).is_err());
     assert!(
         off.fetch_archive_with(&cache, "dep", URL, None, || Ok(b"old".to_vec()))?
             .1
@@ -115,8 +124,8 @@ fn lock_modes_apply_and_concurrent_updates_merge() -> Result<(), Box<dyn std::er
     off.commit()?;
     host.remove_file(&path)?;
 
-    let mut update = LockSession::open(&host, source, LockMode::Update)?;
-    let mut concurrent = LockSession::open(&host, source, LockMode::Update)?;
+    let mut update = LockSession::open(&host, &source, LockMode::Update)?;
+    let mut concurrent = LockSession::open(&host, &source, LockMode::Update)?;
     update.fetch_archive_with(&cache, "dep", URL, None, || Ok(b"new".to_vec()))?;
     concurrent.record(
         "git",
@@ -129,7 +138,7 @@ fn lock_modes_apply_and_concurrent_updates_merge() -> Result<(), Box<dyn std::er
     update.commit()?;
     concurrent.commit()?;
 
-    let mut frozen = LockSession::open(&host, source, LockMode::Frozen)?;
+    let mut frozen = LockSession::open(&host, &source, LockMode::Frozen)?;
     assert_eq!(frozen.git_pin("GIT", REPO, Some("v1"))?, Some(PIN));
     assert!(frozen.git_pin("git", REPO, Some("v2")).is_err());
     let (archive, warning) =
@@ -141,13 +150,13 @@ fn lock_modes_apply_and_concurrent_updates_merge() -> Result<(), Box<dyn std::er
             .fetch_archive_with(&cache, "absent", URL, None, || Ok(Vec::new()))
             .is_err()
     );
-    let empty = Store::new(&host, StoreConfig::new("/empty".into()))?;
+    let empty = Store::new(&host, StoreConfig::new(source.join("empty")))?;
     let empty = ArchiveCache::new(&host, &empty);
     assert!(matches!(
         frozen.fetch_archive_with(&empty, "dep", URL, None, || Ok(b"changed".to_vec())),
         Err(FetchError::Archive { cause, .. }) if matches!(*cause, FetchError::HashMismatch { .. })
     ));
-    let mut auto = LockSession::open(&host, source, LockMode::Auto)?;
+    let mut auto = LockSession::open(&host, &source, LockMode::Auto)?;
     assert_eq!(auto.git_pin("git", REPO, Some("v1"))?, None);
     let (archive, warning) =
         auto.fetch_archive_with(&cache, "dep", URL, None, || Ok(b"changed".to_vec()))?;
@@ -165,7 +174,7 @@ fn lock_modes_apply_and_concurrent_updates_merge() -> Result<(), Box<dyn std::er
         .is_none()
     );
     auto.commit()?;
-    let frozen = LockSession::open(&host, source, LockMode::Frozen)?;
+    let frozen = LockSession::open(&host, &source, LockMode::Frozen)?;
     assert_eq!(frozen.git_pin("git", REPO, Some("v1"))?, Some(PIN));
     Ok(())
 }
@@ -206,12 +215,13 @@ fn archive_cache_checks_non_sha256_aliases_and_offline_misses()
 #[test]
 fn git_offline_miss_does_not_run_a_process() -> Result<(), Box<dyn std::error::Error>> {
     let host = host();
+    let cache = cache_root();
     host.env_set(b"RCMAKE_FETCH_OFFLINE", Some(b"1"));
     host.set_command_handler(|_, _, _| panic!("offline miss must not run Git"))?;
-    let mirror = GitMirror::new(&host, Path::new("/cache"))?;
+    let mirror = GitMirror::new(&host, &cache)?;
     assert!(matches!(mirror.prefetch(REPO, PIN), Err(FetchError::Git {
         repository, commit, path, ..
-    }) if repository == REPO && commit.as_deref() == Some(PIN) && path.starts_with("/cache/git")));
+    }) if repository == REPO && commit.as_deref() == Some(PIN) && path.starts_with(cache.join("git"))));
     assert!(mirror.prefetch(REPO, "main").is_err());
     Ok(())
 }
@@ -249,7 +259,7 @@ fn pinned_git_mirror_reuses_local_commit() -> Result<(), Box<dyn std::error::Err
             ..RunOutput::default()
         })
     })?;
-    let mirrors = GitMirror::new(&host, Path::new("/cache"))?;
+    let mirrors = GitMirror::new(&host, &cache_root())?;
     let first = mirrors.prefetch(REPO, PIN)?;
     host.env_set(b"RCMAKE_FETCH_OFFLINE", Some(b"1"));
     assert_eq!(mirrors.prefetch(REPO, PIN)?, first);
@@ -315,9 +325,10 @@ fn pool_deduplicates_pins_and_populates_store() -> Result<(), Box<dyn std::error
 fn store_write_errors_leave_verified_downloads_usable_in_each_lock_mode()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = host();
-    let bad_root = Path::new("/work/cache-file");
-    host.seed_file(bad_root, b"not a directory")?;
-    let store = Store::new(&host, StoreConfig::new(bad_root.into()))?;
+    let source = work_root();
+    let bad_root = source.join("cache-file");
+    host.seed_file(&bad_root, b"not a directory")?;
+    let store = Store::new(&host, StoreConfig::new(bad_root.clone()))?;
     let cache = ArchiveCache::new(&host, &store);
     let expected = hash("SHA256", HashAlgo::Sha256, b"valid")?;
     let download = || Ok(b"valid".to_vec());
@@ -330,12 +341,12 @@ fn store_write_errors_leave_verified_downloads_usable_in_each_lock_mode()
     assert!(
         matches!(&error, FetchError::Archive { cause, .. }
             if matches!(cause.as_ref(), FetchError::CacheAndDownload { cache, download }
-                if matches!(cache.as_ref(), FetchError::CacheRead { path, .. } if path == bad_root)
+                if matches!(cache.as_ref(), FetchError::CacheRead { path, .. } if path == &bad_root)
                     && matches!(download.as_ref(), FetchError::HashMismatch { .. }))),
         "{error}"
     );
 
-    let mut update = LockSession::open(&host, Path::new("/work"), LockMode::Update)?;
+    let mut update = LockSession::open(&host, &source, LockMode::Update)?;
     let (result, warning) = update.fetch_archive_with(&cache, "dep", URL, None, download)?;
     assert!(warning.is_none());
     assert!(
@@ -343,7 +354,7 @@ fn store_write_errors_leave_verified_downloads_usable_in_each_lock_mode()
     );
     update.commit()?;
 
-    let mut frozen = LockSession::open(&host, Path::new("/work"), LockMode::Frozen)?;
+    let mut frozen = LockSession::open(&host, &source, LockMode::Frozen)?;
     let (result, warning) = frozen.fetch_archive_with(&cache, "dep", URL, None, download)?;
     assert_eq!(result.bytes, b"valid");
     assert!(warning.is_none());
@@ -458,8 +469,9 @@ fn curl_and_git_default_to_no_timeout_and_accept_a_caller_timeout()
     ArchiveCache::new(&host, &store)
         .with_timeout(timeout)
         .fetch(URL, None)?;
-    GitMirror::new(&host, Path::new("/cache/default"))?.prefetch(REPO, PIN)?;
-    GitMirror::new(&host, Path::new("/cache/custom"))?
+    let cache = cache_root();
+    GitMirror::new(&host, &cache.join("default"))?.prefetch(REPO, PIN)?;
+    GitMirror::new(&host, &cache.join("custom"))?
         .with_timeout(timeout)
         .prefetch(REPO, PIN)?;
     assert_eq!(calls.load(Ordering::SeqCst), 12);
@@ -472,8 +484,8 @@ fn prefetch_propagates_the_timeout_and_reports_cache_warnings()
     use std::time::Duration;
 
     let host = Arc::new(host());
-    let path = Path::new("/work/cache-file");
-    host.seed_file(path, b"not a directory")?;
+    let path = work_root().join("cache-file");
+    host.seed_file(&path, b"not a directory")?;
     host.env_set(b"RCMAKE_FETCH_JOBS", Some(b"1"));
     let timeout = Duration::from_secs(420);
     host.set_command_handler(move |_, req, _| {
@@ -484,7 +496,7 @@ fn prefetch_propagates_the_timeout_and_reports_cache_warnings()
             ..RunOutput::default()
         })
     })?;
-    let pool = FetchPool::new_with_timeout(host, StoreConfig::new(path.into()), Some(timeout))?;
+    let pool = FetchPool::new_with_timeout(host, StoreConfig::new(path), Some(timeout))?;
     let ticket = pool.submit(PrefetchSource::Url {
         url: URL.into(),
         hash: hash("SHA256", HashAlgo::Sha256, b"download")?,
@@ -505,15 +517,15 @@ fn seed_bare(host: &PureHost, path: &Path) -> rcmake_host::HostResult<()> {
 fn archive_lock_preserves_mirrors_when_the_primary_fails() -> Result<(), Box<dyn std::error::Error>>
 {
     let host = host();
+    let source_dir = work_root();
     let store = Store::new(&host, config())?;
-    let empty = Store::new(&host, StoreConfig::new("/empty".into()))?;
+    let empty = Store::new(&host, StoreConfig::new(source_dir.join("empty")))?;
     let cache = ArchiveCache::new(&host, &store);
     let cold = ArchiveCache::new(&host, &empty);
-    let source_dir = Path::new("/work");
     let mirror = "https://mirror.invalid/archive";
     let mirrors = [URL, mirror];
     let archive = b"archive from mirror";
-    let mut update = LockSession::open(&host, source_dir, LockMode::Update)?;
+    let mut update = LockSession::open(&host, &source_dir, LockMode::Update)?;
     let mut attempts = Vec::new();
     let (download, warning) =
         update.fetch_archive_urls_with(&cache, "dep", &mirrors, None, |url| {
@@ -534,7 +546,7 @@ fn archive_lock_preserves_mirrors_when_the_primary_fails() -> Result<(), Box<dyn
     )?;
     let lock = LockFile::parse(&file)?;
     assert!(matches!(lock.get("dep"), Some(LockEntry::Url(entry)) if entry.urls == mirrors));
-    let mut frozen = LockSession::open(&host, source_dir, LockMode::Frozen)?;
+    let mut frozen = LockSession::open(&host, &source_dir, LockMode::Frozen)?;
     let (warm, _) =
         frozen.fetch_archive_urls_with(&cache.cache_only(), "dep", &mirrors, None, |_| {
             panic!("Frozen warm fetch must use the content pin.")
@@ -562,10 +574,10 @@ fn archive_lock_preserves_mirrors_when_the_primary_fails() -> Result<(), Box<dyn
 fn concurrent_lock_updates_agree_or_preserve_the_first_file()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = host();
-    let source = Path::new("/work");
+    let source = work_root();
     let path = source.join("rcmake-fetch.lock");
     let make_entry = |bytes: &[u8]| LockEntry::Url(UrlEntry::from_bytes(vec![URL.into()], bytes));
-    let session = || LockSession::open(&host, source, LockMode::Update);
+    let session = || LockSession::open(&host, &source, LockMode::Update);
     let mut first = session()?;
     let mut identical = session()?;
     let mut conflict = session()?;
@@ -590,8 +602,8 @@ fn fetch_errors_and_lockfiles_remove_credentials() -> Result<(), Box<dyn std::er
     let store = Store::new(&host, config())?;
     let cache = ArchiveCache::new(&host, &store);
     let url = "https://user:secret@example.invalid/archive";
-    let source = Path::new("/work");
-    let mut update = LockSession::open(&host, source, LockMode::Update)?;
+    let source = work_root();
+    let mut update = LockSession::open(&host, &source, LockMode::Update)?;
     update.fetch_archive_with(&cache, "dep", url, None, || Ok(b"archive".to_vec()))?;
     update.commit()?;
     let lock = host.read(
@@ -601,7 +613,7 @@ fn fetch_errors_and_lockfiles_remove_credentials() -> Result<(), Box<dyn std::er
     let lock = String::from_utf8(lock)?;
     assert!(lock.contains(URL));
     assert!(!lock.contains("user") && !lock.contains("secret"));
-    let mut frozen = LockSession::open(&host, source, LockMode::Frozen)?;
+    let mut frozen = LockSession::open(&host, &source, LockMode::Frozen)?;
     let expected = hash("SHA512", HashAlgo::Sha512, b"another archive")?;
     let message =
         fetch_error(
@@ -785,7 +797,7 @@ fn archive_offline_error_names_the_corrupt_cache_object() -> Result<(), Box<dyn 
 #[test]
 fn legacy_lockfiles_load_and_remove_secrets_on_update() -> Result<(), Box<dyn std::error::Error>> {
     let host = host();
-    let dir = Path::new("/work");
+    let dir = work_root();
     let path = dir.join("rcmake-fetch.lock");
     let mut legacy = LockFile::default();
     let entry = LockEntry::Url(UrlEntry::from_bytes(vec![URL.into()], b"archive"));
@@ -795,8 +807,8 @@ fn legacy_lockfiles_load_and_remove_secrets_on_update() -> Result<(), Box<dyn st
         "https://legacy:secret@example.invalid/archive?token=hidden",
     );
     host.seed_file(&path, raw.as_bytes())?;
-    LockSession::open(&host, dir, LockMode::Auto)?;
-    let mut update = LockSession::open(&host, dir, LockMode::Update)?;
+    LockSession::open(&host, &dir, LockMode::Auto)?;
+    let mut update = LockSession::open(&host, &dir, LockMode::Update)?;
     update.record("another-dependency", entry)?;
     update.commit()?;
     let bytes = host.read(&path, ReadRange::All { limit: 4096 })?;
