@@ -91,11 +91,35 @@ pub(super) fn sdk_root_digest(host: &dyn Host, root: &Path, graph: Digest) -> Ho
 }
 
 pub(super) fn sdk_graph_digest(host: &dyn Host, canonical: &Path) -> HostResult<Digest> {
-    sdk_graph(host, canonical).map(|(digest, _)| digest)
+    sdk_graph(host, canonical, |_, _| {})
 }
 
-pub(super) fn sdk_graph(host: &dyn Host, canonical: &Path) -> HostResult<(Digest, bool)> {
-    let mut confined = true;
+#[derive(Clone, Debug)]
+pub(super) struct SdkLink {
+    pub(super) path: PathBuf,
+    pub(super) resolved: Option<(PathBuf, FileKind)>,
+}
+
+impl SdkLink {
+    pub(super) fn matches(&self, host: &dyn Host) -> bool {
+        match &self.resolved {
+            Some((target, kind)) => {
+                host.metadata(&self.path, Follow::Yes)
+                    .is_ok_and(|stat| stat.kind == *kind)
+                    && host.canonicalize(&self.path).as_ref() == Ok(target)
+            }
+            None => host
+                .metadata(&self.path, Follow::Yes)
+                .is_err_and(|error| error.kind == ErrorKind::NotFound),
+        }
+    }
+}
+
+pub(super) fn sdk_graph(
+    host: &dyn Host,
+    canonical: &Path,
+    mut observe_link: impl FnMut(PathBuf, Option<(PathBuf, FileKind)>),
+) -> HostResult<Digest> {
     let mut key = KeyHasher::new(Domain::BlobV1);
     key.field(0, b"sdk-tree-graph");
     key.field(1, canonical.as_os_str().as_encoded_bytes());
@@ -131,18 +155,23 @@ pub(super) fn sdk_graph(host: &dyn Host, canonical: &Path) -> HostResult<(Digest
                 }
                 FileKind::Symlink => {
                     key.field(6, &entry.name);
-                    key.field(7, host.read_link(&child)?.as_os_str().as_encoded_bytes());
+                    let target = host.read_link(&child)?;
+                    key.field(7, target.as_os_str().as_encoded_bytes());
                     let kind = match host.metadata(&child, Follow::Yes) {
                         Ok(stat) => stat.kind,
                         Err(error) if error.kind == ErrorKind::NotFound => {
                             key.field(8, b"missing");
-                            confined = false;
+                            observe_link(child, None);
                             continue;
                         }
                         Err(error) => return Err(error),
                     };
                     let resolved = host.canonicalize(&child)?;
-                    confined &= resolved.starts_with(canonical);
+                    if !resolved.starts_with(canonical)
+                        || !link_stays_in_tree(canonical, &directory, &target)
+                    {
+                        observe_link(child, Some((resolved.clone(), kind)));
+                    }
                     match kind {
                         FileKind::Dir => {
                             key.field(8, b"directory");
@@ -159,5 +188,33 @@ pub(super) fn sdk_graph(host: &dyn Host, canonical: &Path) -> HostResult<(Digest
             }
         }
     }
-    Ok((key.finish(), confined))
+    Ok(key.finish())
+}
+
+fn link_stays_in_tree(root: &Path, directory: &Path, target: &Path) -> bool {
+    let absolute = target.is_absolute();
+    let (Some(directory), Some(target)) = (
+        directory.strip_prefix(root).ok(),
+        if target.is_absolute() {
+            target.strip_prefix(root).ok()
+        } else {
+            Some(target)
+        },
+    ) else {
+        return false;
+    };
+    let mut depth = if absolute {
+        0
+    } else {
+        directory.components().count()
+    };
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir if depth > 0 => depth -= 1,
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    true
 }

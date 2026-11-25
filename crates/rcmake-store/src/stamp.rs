@@ -193,10 +193,17 @@ pub struct TraceMemo {
     files: Mutex<BTreeMap<(FastStat, rcmake_host::FileTime), Digest>>,
     generation_host: Option<Arc<rcmake_host::MemoHost<dyn Host>>>,
     tools: Mutex<BTreeMap<PathBuf, (u64, FastStat, Digest)>>,
-    sdk: Mutex<BTreeMap<PathBuf, (u64, Digest)>>,
+    sdk: Mutex<BTreeMap<PathBuf, Arc<SdkListing>>>,
     ordinary: Mutex<BTreeMap<PathBuf, OrdinaryListing>>,
     sdk_coverage_failures: AtomicU64,
     sdk_graph_hits: AtomicU64,
+}
+
+struct SdkListing {
+    digest: Digest,
+    generation: u64,
+    links: Vec<tree::SdkLink>,
+    target_generations: BTreeMap<PathBuf, u64>,
 }
 
 struct OrdinaryListing {
@@ -292,32 +299,80 @@ impl TraceMemo {
             let graph = tree::sdk_graph_digest(host, &canonical)?;
             return tree::sdk_root_digest(host, root, graph);
         };
-        let cached = self.sdk.lock().ok().and_then(|sdk| {
-            sdk.get(&canonical)
-                .filter(|(revision, _)| *revision == generation)
-                .map(|(_, digest)| *digest)
-        });
-        let (graph, confined) = match cached {
-            Some(graph) => {
+        let cached = self
+            .sdk
+            .lock()
+            .ok()
+            .and_then(|sdk| sdk.get(&canonical).cloned());
+        if let Some(listing) = cached.filter(|listing| {
+            listing.generation == generation && self.sdk_links_match(host, listing)
+        }) {
+            let digest = tree::sdk_root_digest(host, root, listing.digest)?;
+            if self.generation(&canonical) == Some(generation)
+                && self.sdk_targets_unchanged(&listing)
+            {
                 self.sdk_graph_hits.fetch_add(1, Ordering::Relaxed);
-                (graph, true)
+                return Ok(digest);
             }
-            None => tree::sdk_graph(host, &canonical)?,
+            return Err(HostError::unsupported(
+                "The host changed during the SDK listing.",
+            ));
+        }
+
+        let mut links = Vec::new();
+        let mut target_generations = BTreeMap::new();
+        let mut reusable = true;
+        let graph = tree::sdk_graph(host, &canonical, |path, resolved| {
+            if links.len() >= 512 {
+                reusable = false;
+                return;
+            }
+            if let Some((target, _)) = &resolved {
+                if let Some(generation) = self.generation(target) {
+                    target_generations
+                        .entry(target.clone())
+                        .or_insert(generation);
+                } else {
+                    reusable = false;
+                }
+            }
+            links.push(tree::SdkLink { path, resolved });
+        })?;
+        let listing = SdkListing {
+            digest: graph,
+            generation,
+            links,
+            target_generations,
         };
-        let digest = tree::sdk_root_digest(host, root, graph)?;
+        let digest = tree::sdk_root_digest(host, root, listing.digest)?;
         if self.generation(&canonical) != Some(generation) {
             return Err(HostError::unsupported(
                 "The host changed during the SDK listing.",
             ));
         }
-        if confined
-            && cached.is_none()
+        if reusable && !self.sdk_links_match(host, &listing) {
+            return Err(HostError::unsupported(
+                "The host changed during the SDK listing.",
+            ));
+        }
+        if reusable
             && let Ok(mut sdk) = self.sdk.lock()
             && (sdk.len() < 128 || sdk.contains_key(&canonical))
         {
-            sdk.insert(canonical, (generation, graph));
+            sdk.insert(canonical, Arc::new(listing));
         }
         Ok(digest)
+    }
+
+    fn sdk_links_match(&self, host: &dyn Host, listing: &SdkListing) -> bool {
+        listing.links.iter().all(|link| link.matches(host)) && self.sdk_targets_unchanged(listing)
+    }
+
+    fn sdk_targets_unchanged(&self, listing: &SdkListing) -> bool {
+        listing
+            .target_generations
+            .iter()
+            .all(|(path, generation)| self.generation(path) == Some(*generation))
     }
 
     /// Hash a search tree. Reuse the listing while its generation stays stable.

@@ -1083,3 +1083,34 @@ fn confined_processes_keep_only_disjoint_search_digests() -> HostResult<()> {
     assert_eq!(memo.sdk_graph_hits(), 1);
     Ok(())
 }
+
+#[test]
+fn sdk_memo_rechecks_aliases_outside_the_search_directory() -> HostResult<()> {
+    let base: std::sync::Arc<dyn Host> = std::sync::Arc::new(host());
+    let host = std::sync::Arc::new(rcmake_host::MemoHost::from_shared(base.clone()));
+    let sdk = host.initial_cwd().join("sdk");
+    let include = sdk.join("usr/include");
+    let headers = sdk.join("System/Headers");
+    let scratch = host.initial_cwd().join("scratch");
+    host.create_dir_all(&include)?;
+    host.create_dir_all(&headers)?;
+    host.create_dir_all(&scratch)?;
+    host.symlink(&headers, &include.join("System"))?;
+    host.symlink(&headers.join("missing.h"), &include.join("alias.h"))?;
+
+    let memo = TraceMemo::with_generation(host.clone());
+    let first = memo.sdk_digest(base.as_ref(), &include)?;
+    host.write(&scratch.join("probe.c"), b"int x;", WriteMode::CreateNew)?;
+    assert_eq!(memo.sdk_digest(base.as_ref(), &include)?, first);
+    assert_eq!(memo.sdk_graph_hits(), 1);
+
+    host.write(&headers.join("other.h"), b"", WriteMode::CreateNew)?;
+    let second = memo.sdk_digest(base.as_ref(), &include)?;
+    assert_ne!(second, first);
+    assert_eq!(memo.sdk_graph_hits(), 1);
+
+    host.write(&headers.join("missing.h"), b"", WriteMode::CreateNew)?;
+    assert_ne!(memo.sdk_digest(base.as_ref(), &include)?, second);
+    assert_eq!(memo.sdk_graph_hits(), 1);
+    Ok(())
+}
