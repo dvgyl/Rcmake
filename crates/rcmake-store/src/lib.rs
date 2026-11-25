@@ -455,13 +455,14 @@ impl<'a> Store<'a> {
 
     fn gc_lock_path(&self) -> HostResult<PathBuf> {
         let path = self.config.root.join("gc.lock");
-        if self.file_metadata(&path)?.is_some() || stamp::missing(self.host, &path) {
-            Ok(path)
-        } else {
-            Err(io_at(
+        match self.host.metadata(&path, Follow::No) {
+            Ok(meta) if meta.kind == FileKind::File => Ok(path),
+            Err(error) if error.kind == ErrorKind::NotFound => Ok(path),
+            Ok(_) => Err(io_at(
                 io::Error::new(ErrorKind::InvalidData, "Invalid cache collection lock."),
                 &path,
-            ))
+            )),
+            Err(error) => Err(error),
         }
     }
 
