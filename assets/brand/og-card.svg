@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" fill="none" role="img" aria-label="Rcmake: Drop-in CMake 4.5.1 in safe Rust">
+  <title>Rcmake: Drop-in CMake 4.5.1 in safe Rust</title>
+  <defs>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M 48 0 L 0 0 0 48" fill="none" stroke="#181C24" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="630" fill="#09090B"/>
+  <rect width="1200" height="630" fill="url(#grid)" opacity="0.65"/>
+
+  <rect x="0" y="0" width="400" height="5" fill="#EF4444"/>
+  <rect x="400" y="0" width="400" height="5" fill="#22B55A"/>
+  <rect x="800" y="0" width="400" height="5" fill="#3B82F6"/>
+
+  <g transform="translate(80 112) scale(1.45)">
+    <polygon points="64,8 20.70,33 107.30,33" fill="#EF4444"/>
+    <polygon points="15.50,42 15.50,92 58.80,117" fill="#22B55A"/>
+    <polygon points="112.50,42 112.50,92 69.20,117" fill="#3B82F6"/>
+  </g>
+
+  <rect x="304" y="128" width="194" height="32" rx="16" fill="#131720" stroke="#272D3B" stroke-width="1"/>
+  <circle cx="322" cy="144" r="4" fill="#22B55A"/>
+  <text x="336" y="149" fill="#D4D4D8" font-family="'SF Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="14" font-weight="500">CMAKE 4.5.1 PARITY</text>
+
+  <text x="300" y="236" fill="#FAFAFA" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="86" font-weight="700" letter-spacing="-3.2">Rcmake</text>
+  <text x="304" y="286" fill="#A1A1AA" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="30" font-weight="400" letter-spacing="-0.4">Drop-in CMake 4.5.1 in safe Rust</text>
+
+  <line x1="80" y1="354" x2="1120" y2="354" stroke="#222631" stroke-width="1"/>
+
+  <g transform="translate(80 390)">
+    <rect x="0" y="0" width="246" height="122" rx="10" fill="#101319" stroke="#232834" stroke-width="1"/>
+    <rect x="20" y="22" width="18" height="3" rx="1.5" fill="#EF4444"/>
+    <text x="20" y="58" fill="#FAFAFA" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600">34 Safe-Rust Crates</text>
+    <text x="20" y="88" fill="#9CA3AF" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" font-size="14">#![forbid(unsafe_code)]</text>
+  </g>
+
+  <g transform="translate(345 390)">
+    <rect x="0" y="0" width="246" height="122" rx="10" fill="#101319" stroke="#232834" stroke-width="1"/>
+    <rect x="20" y="22" width="18" height="3" rx="1.5" fill="#22B55A"/>
+    <text x="20" y="58" fill="#FAFAFA" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600">5 Native Generators</text>
+    <text x="20" y="88" fill="#9CA3AF" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15">Ninja, Make, Xcode, VS 17 &amp; 18</text>
+  </g>
+
+  <g transform="translate(610 390)">
+    <rect x="0" y="0" width="246" height="122" rx="10" fill="#101319" stroke="#232834" stroke-width="1"/>
+    <rect x="20" y="22" width="18" height="3" rx="1.5" fill="#3B82F6"/>
+    <text x="20" y="58" fill="#FAFAFA" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600">Unified Multi-Call</text>
+    <text x="20" y="88" fill="#9CA3AF" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15">cmake, ctest, cpack, Presets v13</text>
+  </g>
+
+  <g transform="translate(874 390)">
+    <rect x="0" y="0" width="246" height="122" rx="10" fill="#101319" stroke="#232834" stroke-width="1"/>
+    <rect x="20" y="22" width="18" height="3" rx="1.5" fill="#D4D4D8"/>
+    <text x="20" y="58" fill="#FAFAFA" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600">Deterministic Host</text>
+    <text x="20" y="88" fill="#9CA3AF" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15">rcmake-lsp, explain &amp; WASI</text>
+  </g>
+
+  <text x="80" y="576" fill="#71717A" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" font-size="16">github.com/dvgyl/Rcmake</text>
+  <text x="1120" y="576" text-anchor="end" fill="#71717A" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" font-size="16">MIT OR Apache-2.0</text>
+</svg>

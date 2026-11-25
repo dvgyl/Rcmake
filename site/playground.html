@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WASM Playground | Rcmake</title>
+  <meta name="description" content="Interactive Rcmake WebAssembly playground: inspect CMake 4.5.1 diagnostics, resolved targets, generated Ninja files, and rcmake explain provenance.">
+  <meta property="og:title" content="Rcmake WASM Playground">
+  <meta property="og:description" content="Explore CMake 4.5.1 configure output, generator expressions, Presets v13, and provenance tracing in the browser.">
+  <meta property="og:image" content="./assets/og-card.svg">
+  <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
+  <link rel="stylesheet" href="./styles.css">
+  <script>
+    try {
+      const saved = localStorage.getItem("rcmake-theme");
+      const preferred = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      document.documentElement.dataset.theme = saved || preferred;
+    } catch (_) {}
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="rgb-hairline" aria-hidden="true"><span></span><span></span><span></span></div>
+    <div class="container-wide nav-inner">
+      <a class="nav-brand" href="./index.html">
+        <img class="brand-only-light" src="./assets/rcmake-mark.svg" alt="" width="26" height="26">
+        <img class="brand-only-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="26" height="26">
+        <span>Rcmake</span>
+      </a>
+      <nav class="nav-links" aria-label="Primary">
+        <a class="nav-link" href="./index.html">Overview</a>
+        <a class="nav-link" href="./playground.html" aria-current="page">Playground</a>
+        <a class="nav-link" href="./dashboard.html">Dashboard</a>
+        <a class="nav-link" href="https://github.com/dvgyl/Rcmake" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle light or dark theme">
+          <svg id="theme-icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
+          </svg>
+          <svg id="theme-icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+          </svg>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="pg-header">
+      <div class="container-wide">
+        <div class="pg-title-row">
+          <div>
+            <h1>Rcmake WASM Playground</h1>
+          </div>
+          <div id="pg-mode-badge">
+            <span class="badge badge-pending"><span class="badge-dot"></span>Checking ./wasm/rcmake_wasm.js...</span>
+          </div>
+        </div>
+
+        <div class="pg-toolbar">
+          <div class="pg-controls">
+            <label for="example-select" class="sr-only">Select example</label>
+            <select id="example-select" class="pg-select" aria-label="Example project"></select>
+
+            <label for="config-select" class="sr-only">Build configuration</label>
+            <select id="config-select" class="pg-select" aria-label="Build configuration">
+              <option value="Debug">Debug</option>
+              <option value="Release">Release</option>
+              <option value="RelWithDebInfo">RelWithDebInfo</option>
+            </select>
+
+            <label for="generator-select" class="sr-only">Generator</label>
+            <select id="generator-select" class="pg-select" aria-label="Generator">
+              <option value="Ninja">Ninja</option>
+              <option value="Ninja Multi-Config">Ninja Multi-Config</option>
+            </select>
+          </div>
+
+          <div class="pg-controls">
+            <button id="reset-btn" class="btn btn-secondary btn-sm" type="button">Reset Example</button>
+            <button id="run-btn" class="btn btn-primary btn-sm" type="button">
+              Run Configure <span class="mono" style="opacity:0.78;font-size:0.75rem;">(&#8984;/Ctrl+Enter)</span>
+            </button>
+          </div>
+        </div>
+
+        <div id="pg-runtime-banner" class="pg-banner">
+          <span id="pg-runtime-msg">Loading runtime adapter...</span>
+          <span id="pg-example-desc" style="color:var(--ink-muted);"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="pg-workspace">
+      <div class="container-wide">
+        <div class="pg-split">
+          <!-- Left: Editor Pane -->
+          <div class="pane">
+            <div class="pane-bar">
+              <div id="file-tabs" class="pane-tabs" role="tablist" aria-label="Project files"></div>
+              <span id="dirty-indicator" class="mono" style="font-size:0.75rem;color:var(--ink-muted);">Unmodified</span>
+            </div>
+
+            <div class="editor-wrap">
+              <pre id="editor-gutter" class="editor-gutter" aria-hidden="true">1</pre>
+              <textarea
+                id="editor-textarea"
+                class="editor-input"
+                spellcheck="false"
+                autocapitalize="off"
+                autocomplete="off"
+                autocorrect="off"
+                aria-label="CMake source editor"
+              ></textarea>
+            </div>
+
+            <div class="pane-footer">
+              <span id="editor-cursor">Ln 1, Col 1</span>
+              <span>PureHost | ProcessPolicy::Deny | WriteMode::Overlay</span>
+            </div>
+          </div>
+
+          <!-- Right: Inspector Pane -->
+          <div class="pane">
+            <div class="pane-bar">
+              <div class="pane-tabs" role="tablist" aria-label="Inspector views">
+                <button class="tab-btn" type="button" role="tab" aria-selected="true" data-inspector-tab="diagnostics">
+                  Diagnostics <span id="tab-count-diag" class="mono" style="opacity:0.75;">(0)</span>
+                </button>
+                <button class="tab-btn" type="button" role="tab" aria-selected="false" data-inspector-tab="targets">
+                  Resolved Targets <span id="tab-count-targets" class="mono" style="opacity:0.75;">(0)</span>
+                </button>
+                <button class="tab-btn" type="button" role="tab" aria-selected="false" data-inspector-tab="ninja">
+                  Generated Ninja
+                </button>
+                <button class="tab-btn" type="button" role="tab" aria-selected="false" data-inspector-tab="explain">
+                  Explain / Provenance
+                </button>
+              </div>
+              <button id="copy-ninja-btn" class="btn btn-secondary btn-sm" type="button" style="display:none;">Copy Ninja</button>
+            </div>
+
+            <div id="inspector-body" class="inspector-body"></div>
+
+            <div class="pane-footer">
+              <span id="run-status">Ready</span>
+              <span id="run-timing" class="tabular"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container-wide footer-inner">
+      <div class="footer-left">
+        <img class="brand-only-light" src="./assets/rcmake-mark.svg" alt="" width="20" height="20">
+        <img class="brand-only-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="20" height="20">
+        <span>Adapter contract: <code>site/wasm-adapter.js</code> (loads <code>./wasm/rcmake_wasm.js</code> automatically when present).</span>
+      </div>
+      <div class="footer-links">
+        <a href="./index.html">Overview</a>
+        <a href="./dashboard.html">Dashboard</a>
+        <a href="https://github.com/dvgyl/Rcmake" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </div>
+    </div>
+  </footer>
+
+  <script type="module" src="./playground.js"></script>
+</body>
+</html>

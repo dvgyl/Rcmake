@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dvgyl.github.io/Rcmake/data/dashboard.schema.json",
+  "title": "Rcmake Nightly Compatibility Dashboard Snapshot",
+  "description": "Schema for site/data/latest.json driving the Rcmake landing proof strip and 7-track compatibility dashboard.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "generatedAt",
+    "commit",
+    "rcmakeVersion",
+    "targetCmakeVersion",
+    "tracks"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "generatedAt": {
+      "type": ["string", "null"],
+      "description": "ISO-8601 UTC timestamp of the snapshot, or null before final run."
+    },
+    "commit": {
+      "type": ["string", "null"],
+      "description": "Short or full Git commit SHA for the verified binary."
+    },
+    "rcmakeVersion": { "type": "string" },
+    "targetCmakeVersion": { "type": "string" },
+    "statusNote": { "type": "string" },
+    "tracks": {
+      "type": "object",
+      "required": [
+        "coreConformance",
+        "policies",
+        "runCmakeOs",
+        "bossFight",
+        "unseenHoldout",
+        "vcpkgMatrix",
+        "benchmarksAndGates"
+      ],
+      "properties": {
+        "coreConformance": {
+          "type": "object",
+          "required": [
+            "label",
+            "status",
+            "suitesTotal",
+            "suitesAt100",
+            "casesPassed",
+            "casesTotal",
+            "passRate",
+            "highlights"
+          ],
+          "properties": {
+            "label": { "type": "string" },
+            "status": { "$ref": "#/$defs/status" },
+            "suitesTotal": { "type": "integer", "minimum": 1 },
+            "suitesAt100": { "type": ["integer", "null"], "minimum": 0 },
+            "casesPassed": { "type": ["integer", "null"], "minimum": 0 },
+            "casesTotal": { "type": ["integer", "null"], "minimum": 0 },
+            "passRate": { "$ref": "#/$defs/rate" },
+            "note": { "type": "string" },
+            "highlights": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["suite", "passed", "total", "status"],
+                "properties": {
+                  "suite": { "type": "string" },
+                  "passed": { "type": ["integer", "null"], "minimum": 0 },
+                  "total": { "type": ["integer", "null"], "minimum": 0 },
+                  "status": { "$ref": "#/$defs/status" },
+                  "note": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "policies": {
+          "type": "object",
+          "required": [
+            "label",
+            "status",
+            "baselineAlwaysNew",
+            "activeRange",
+            "suitesTotal",
+            "suitesPassed",
+            "casesPassed",
+            "casesTotal",
+            "passRate"
+          ],
+          "properties": {
+            "label": { "type": "string" },
+            "status": { "$ref": "#/$defs/status" },
+            "baselineAlwaysNew": { "type": "string" },
+            "activeRange": { "type": "string" },
+            "suitesTotal": { "type": "integer", "minimum": 1 },
+            "suitesPassed": { "type": ["integer", "null"], "minimum": 0 },
+            "casesPassed": { "type": ["integer", "null"], "minimum": 0 },
+            "casesTotal": { "type": ["integer", "null"], "minimum": 0 },
+            "passRate": { "$ref": "#/$defs/rate" },
+            "note": { "type": "string" }
+          }
+        },
+        "runCmakeOs": {
+          "type": "object",
+          "required": ["label", "status", "platforms"],
+          "properties": {
+            "label": { "type": "string" },
+            "status": { "$ref": "#/$defs/status" },
+            "note": { "type": "string" },
+            "platforms": {
+              "type": "array",
+              "minItems": 3,
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "name",
+                  "toolchain",
+                  "suitesTotal",
+                  "suitesPassed",
+                  "casesPassed",
+                  "casesTotal",
+                  "passRate",
+                  "status"
+                ],
+                "properties": {
+                  "id": { "type": "string" },
+                  "name": { "type": "string" },
+                  "toolchain": { "type": "string" },
+                  "suitesTotal": { "type": "integer", "minimum": 1 },
+                  "suitesPassed": { "type": ["integer", "null"], "minimum": 0 },
+                  "casesPassed": { "type": ["integer", "null"], "minimum": 0 },
+                  "casesTotal": { "type": ["integer", "null"], "minimum": 0 },
+                  "passRate": { "$ref": "#/$defs/rate" },
+                  "status": { "$ref": "#/$defs/status" },
+                  "note": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "bossFight": {
+          "type": "object",
+          "required": ["label", "status", "projectsTotal", "l1Passed", "l2Passed", "projects"],
+          "properties": {
+            "label": { "type": "string" },
+            "status": { "$ref": "#/$defs/status" },
+            "projectsTotal": { "type": "integer", "minimum": 1 },
+            "l1Passed": { "type": ["integer", "null"], "minimum": 0 },
+            "l2Passed": { "type": ["integer", "null"], "minimum": 0 },
+            "note": { "type": "string" },
+            "projects": {
+              "type": "array",
+              "minItems": 10,
+              "items": {
+                "type": "object",
+                "required": ["name", "repository", "version", "tier", "targets", "l1", "l2"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "repository": { "type": "string" },
+                  "version": { "type": "string" },
+                  "tier": { "type": "string", "enum": ["standard", "large"] },
+                  "targets": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                  },
+                  "l1": { "$ref": "#/$defs/status" },
+                  "l2": { "$ref": "#/$defs/status" },
+                  "note": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "unseenHoldout": {
+          "type": "object",
+          "description": "Aggregate metrics only. Repository names must never appear in this section.",
+          "required": [
+            "label",
+            "sealed",
+            "status",
+            "reposTotal",
+            "reposPassed",
+            "passRate",
+            "policy",
+            "categories"
+          ],
+          "properties": {
+            "label": { "type": "string" },
+            "sealed": { "type": "boolean", "const": true },
+            "status": { "$ref": "#/$defs/status" },
+            "reposTotal": { "type": "integer", "minimum": 1 },
+            "reposPassed": { "type": ["integer", "null"], "minimum": 0 },
+            "passRate": { "$ref": "#/$defs/rate" },
+            "policy": { "type": "string" },
+            "note": { "type": "string" },
+            "categories": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["category", "reposTotal", "reposPassed", "passRate", "status"],
+                "properties": {
+                  "category": { "type": "string" },
+                  "reposTotal": { "type": ["integer", "null"], "minimum": 0 },
+                  "reposPassed": { "type": ["integer", "null"], "minimum": 0 },
+                  "passRate": { "$ref": "#/$defs/rate" },
+                  "status": { "$ref": "#/$defs/status" }
+                }
+              }
+            }
+          }
+        },
+        "vcpkgMatrix": {
+          "type": "object",
+          "required": [
+            "label",
+            "status",
+            "shardsTotal",
+            "shardsCompleted",
+            "shardsPassed",
+            "portsTotal",
+            "portsPassed",
+            "passRate",
+            "shards"
+          ],
+          "properties": {
+            "label": { "type": "string" },
+            "status": { "$ref": "#/$defs/status" },
+            "shardsTotal": { "type": "integer", "const": 64 },
+            "shardsCompleted": { "type": "integer", "minimum": 0, "maximum": 64 },
+            "shardsPassed": { "type": ["integer", "null"], "minimum": 0, "maximum": 64 },
+            "portsTotal": { "type": ["integer", "null"], "minimum": 0 },
+            "portsPassed": { "type": ["integer", "null"], "minimum": 0 },
+            "passRate": { "$ref": "#/$defs/rate" },
+            "note": { "type": "string" },
+            "shards": {
+              "type": "array",
+              "minItems": 64,
+              "maxItems": 64,
+              "items": {
+                "type": "object",
+                "required": ["shard", "status", "portsTotal", "portsPassed", "durationSeconds"],
+                "properties": {
+                  "shard": { "type": "integer", "minimum": 0, "maximum": 63 },
+                  "status": { "$ref": "#/$defs/status" },
+                  "portsTotal": { "type": ["integer", "null"], "minimum": 0 },
+                  "portsPassed": { "type": ["integer", "null"], "minimum": 0 },
+                  "portsFailed": { "type": ["integer", "null"], "minimum": 0 },
+                  "durationSeconds": { "type": ["number", "null"], "minimum": 0 },
+                  "note": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "benchmarksAndGates": {
+          "type": "object",
+          "required": ["label", "benchmarks", "gates"],
+          "properties": {
+            "label": { "type": "string" },
+            "benchmarks": {
+              "type": "object",
+              "required": [
+                "warmProbeSpeedup",
+                "incrementalLeafP95Ms",
+                "coldConfigureSpeedup",
+                "peakRssMiB"
+              ],
+              "properties": {
+                "warmProbeSpeedup": { "$ref": "#/$defs/benchmarkMetric" },
+                "incrementalLeafP95Ms": { "$ref": "#/$defs/benchmarkMetric" },
+                "coldConfigureSpeedup": { "$ref": "#/$defs/benchmarkMetric" },
+                "peakRssMiB": { "$ref": "#/$defs/benchmarkMetric" }
+              }
+            },
+            "gates": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "label", "status", "passed", "total", "failures", "summary", "detail"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "label": { "type": "string" },
+                  "status": { "$ref": "#/$defs/status" },
+                  "passed": { "type": ["integer", "null"], "minimum": 0 },
+                  "total": { "type": ["integer", "null"], "minimum": 0 },
+                  "failures": { "type": ["integer", "null"], "minimum": 0 },
+                  "scenariosPassed": { "type": ["integer", "null"], "minimum": 0 },
+                  "scenariosTotal": { "type": ["integer", "null"], "minimum": 0 },
+                  "summary": { "type": "string" },
+                  "detail": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "status": {
+      "type": "string",
+      "enum": ["pass", "partial", "fail", "pending"]
+    },
+    "rate": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 100
+    },
+    "benchmarkMetric": {
+      "type": "object",
+      "required": ["label", "value", "unit", "baseline", "status"],
+      "properties": {
+        "label": { "type": "string" },
+        "value": { "type": ["number", "null"] },
+        "unit": { "type": "string" },
+        "baseline": { "type": "string" },
+        "status": { "$ref": "#/$defs/status" },
+        "note": { "type": "string" }
+      }
+    }
+  }
+}

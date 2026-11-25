@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" fill="none">
+  <style>
+    .r { fill: #D92626; }
+    .g { fill: #15803D; }
+    .b { fill: #1D4ED8; }
+    @media (prefers-color-scheme: dark) {
+      .r { fill: #EF4444; }
+      .g { fill: #22B55A; }
+      .b { fill: #3B82F6; }
+    }
+  </style>
+  <polygon class="r" points="64,4 19.83,29.5 108.17,29.5"/>
+  <polygon class="g" points="12.04,43 12.04,94 56.21,119.5"/>
+  <polygon class="b" points="115.96,43 115.96,94 71.79,119.5"/>
+</svg>
