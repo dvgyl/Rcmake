@@ -28,6 +28,7 @@ commit = "49486f61fb25722cbcf586b7f4320921d46fb38e"
 apt = ["libjpeg-dev", "libpng-dev", "zlib1g-dev"]
 configure_args = [
     "-DBUILD_LIST=core,imgproc,imgcodecs", "-DBUILD_TESTS=ON",
+    "-DOPENCV_BUILD_TEST_MODULES_LIST=core",
     "-DBUILD_PERF_TESTS=OFF", "-DBUILD_EXAMPLES=OFF", "-DBUILD_JAVA=OFF",
     "-DWITH_IPP=OFF", "-DWITH_ITT=OFF", "-DWITH_OPENCL=OFF", "-DWITH_CUDA=OFF",
     "-DWITH_FFMPEG=OFF", "-DWITH_GSTREAMER=OFF", "-DWITH_GTK=OFF",
@@ -62,8 +63,8 @@ repository = "boostorg/boost"
 version = "boost-1.88.0"
 commit = "199ef13d6034c85232431130142159af3adfce22"
 submodules = true
-# Boost 1.88 libs/locale fails on CMake 4.5.1 too: source_group(TREE) rejects
-# boost/locale as a prefix of boost/locale.hpp. Exclude it from both engines.
+# BUILD_TESTING also configures libraries outside BOOST_INCLUDE_LIBRARIES.
+# Exclude Locale because its source_group(TREE) call fails with CMake 4.5.1.
 configure_args = [
     "-DBOOST_INCLUDE_LIBRARIES=filesystem;system", "-DBOOST_EXCLUDE_LIBRARIES=locale",
     "-DBUILD_TESTING=ON",
@@ -71,7 +72,8 @@ configure_args = [
 l1 = true
 l2_targets = ["boost_filesystem"]
 l3_targets = ["boost_filesystem"]
-l4 = { ninja = ["tests"], ctest = ["-R", "boost_filesystem"], install = true }
+# Boost 1.88 registers the System tests with CTest. Filesystem uses Boost.Build.
+l4 = { ninja = ["boost_system-quick", "boost_system-error_code_test"], ctest = ["-R", "^run-boost_system-(quick|error_code_test)$"], install = true }
 runner = { memory_gib = 8, gpu = "none", tier = "standard" }
 
 [[project]]
@@ -81,14 +83,15 @@ version = "v9.5.0"
 commit = "e70c856bd9122ad759921c61d86a153e0311e20d"
 apt = ["libgl1-mesa-dev", "libx11-dev", "libxcursor-dev", "libxfixes-dev", "libxrandr-dev"]
 configure_args = [
-    "-DVTK_BUILD_TESTING=OFF", "-DVTK_BUILD_EXAMPLES=OFF",
+    "-DVTK_BUILD_TESTING=WANT", "-DVTK_BUILD_EXAMPLES=OFF",
+    "-DVTK_DATA_EXCLUDE_FROM_ALL=ON", "-DVTK_DATA_EXCLUDE_FROM_ALL_NO_WARNING=ON",
     "-DVTK_GROUP_ENABLE_Qt=NO", "-DVTK_GROUP_ENABLE_Web=NO",
     "-DVTK_GROUP_ENABLE_MPI=NO", "-DVTK_WRAP_PYTHON=OFF",
 ]
 l1 = true
 l2_targets = ["CommonCore", "FiltersCore"]
-l3_targets = ["CommonCore", "FiltersCore"]
-l4 = { install = true }
+l3_targets = ["CommonCore", "FiltersCore", "vtkCommonCoreCxxTests"]
+l4 = { ctest = ["-R", "^VTK::CommonCoreCxx-UnitTestMath$"], install = true }
 runner = { memory_gib = 12, gpu = "none", tier = "large" }
 
 [[project]]
@@ -98,13 +101,14 @@ version = "v6.8.3"
 commit = "c07c2d5a527a644d36e7853d55132ae38921682f"
 apt = ["libdbus-1-dev", "libglib2.0-dev", "libicu-dev", "libssl-dev"]
 configure_args = [
-    "-DQT_BUILD_TESTS=OFF", "-DQT_BUILD_EXAMPLES=OFF", "-DFEATURE_gui=OFF",
+    "-DQT_BUILD_TESTS=ON", "-DQT_BUILD_TESTS_BY_DEFAULT=OFF",
+    "-DQT_BUILD_EXAMPLES=OFF", "-DFEATURE_gui=OFF",
     "-DFEATURE_widgets=OFF", "-DFEATURE_sql=OFF", "-DFEATURE_xcb=OFF",
 ]
 l1 = true
 l2_targets = ["Core", "Network"]
-l3_targets = ["Core", "Network"]
-l4 = { install = true }
+l3_targets = ["Core", "Network", "tst_qversionnumber"]
+l4 = { ctest = ["-R", "^tst_qversionnumber$"], install = true }
 runner = { memory_gib = 12, gpu = "none", tier = "large" }
 
 [[project]]
@@ -114,12 +118,12 @@ version = "v6.15.0"
 commit = "f53fad49b1ee7821e6a23f709192883260624298"
 apt = ["libudev-dev", "libdbus-1-dev", "libglib2.0-dev", "libicu-dev", "libssl-dev"]
 use_qt = true
-configure_args = ["-DBUILD_TESTING=OFF", "-DBUILD_QCH=OFF", "-DKCOREADDONS_USE_QML=OFF",
+configure_args = ["-DBUILD_TESTING=ON", "-DBUILD_QCH=OFF", "-DKCOREADDONS_USE_QML=OFF",
                   "-DBUILD_PYTHON_BINDINGS=OFF"]
 l1 = true
 l2_targets = ["KF6CoreAddons"]
-l3_targets = ["KF6CoreAddons"]
-l4 = { install = true }
+l3_targets = ["KF6CoreAddons", "kstringhandlertest"]
+l4 = { ctest = ["-R", "^kstringhandlertest$"], install = true }
 runner = { memory_gib = 12, gpu = "none", tier = "large" }
 
 [[project.prerequisite]]
@@ -134,11 +138,16 @@ version = "28.1.8"
 commit = "3ca1e69c206613124fad01d8cef5df651e3bad80"
 source_subdir = "rclcpp"
 use_ros_jazzy = true
-configure_args = ["-DBUILD_TESTING=OFF"]
+apt = [
+    "ros-jazzy-ament-cmake-gmock", "ros-jazzy-ament-cmake-google-benchmark",
+    "ros-jazzy-ament-cmake-gtest", "ros-jazzy-ament-lint-auto", "ros-jazzy-ament-lint-common",
+    "ros-jazzy-mimick-vendor", "ros-jazzy-performance-test-fixture", "ros-jazzy-test-msgs",
+]
+configure_args = ["-DBUILD_TESTING=ON"]
 l1 = true
 l2_targets = ["rclcpp"]
-l3_targets = ["rclcpp"]
-l4 = { install = true }
+l3_targets = ["rclcpp", "test_rclcpp_gtest_macros"]
+l4 = { ctest = ["-R", "^test_rclcpp_gtest_macros$"], install = true }
 runner = { memory_gib = 8, gpu = "none", tier = "standard" }
 
 [[project]]
@@ -151,6 +160,7 @@ apt = ["libboost-dev", "libeigen3-dev", "libepoxy-dev", "libfreetype-dev", "libg
        "libpng-dev", "libtiff-dev", "libzstd-dev"]
 configure_args = [
     "-DWITH_HEADLESS=ON", "-DWITH_LIBS_PRECOMPILED=OFF", "-DWITH_PYTHON=OFF",
+    "-DWITH_GTESTS=ON", "-DWITH_TESTS_SINGLE_BINARY=OFF",
     "-DWITH_CYCLES=OFF", "-DWITH_VULKAN_BACKEND=OFF", "-DWITH_GHOST_X11=OFF",
     "-DWITH_GHOST_WAYLAND=OFF", "-DWITH_ALEMBIC=OFF", "-DWITH_USD=OFF",
     "-DWITH_OPENCOLLADA=OFF", "-DWITH_OPENVDB=OFF", "-DWITH_OPENSUBDIV=OFF",
@@ -161,8 +171,9 @@ configure_args = [
 ]
 l1 = true
 l2_targets = ["blender"]
-l3_targets = ["blender"]
-l4 = { install = true }
+l3_targets = ["blender", "BLI_math_base_test"]
+# Run this test directly. CTest registration requires the render test assets.
+l4 = { executables = ["bin/tests/BLI_math_base_test"], install = true }
 runner = { memory_gib = 16, gpu = "none", tier = "large" }
 
 [[project]]
@@ -173,13 +184,14 @@ commit = "e2d141dbde55c2a4370fac5165b0561b6af4798b"
 submodules = true
 python = ["numpy==2.2.6", "PyYAML==6.0.2", "setuptools==80.9.0", "typing_extensions==4.14.0"]
 configure_args = [
-    "-DBUILD_PYTHON=OFF", "-DBUILD_TEST=OFF", "-DBUILD_CAFFE2_OPS=OFF",
+    "-DBUILD_PYTHON=OFF", "-DBUILD_TEST=ON", "-DINSTALL_TEST=OFF", "-DBUILD_CAFFE2_OPS=OFF",
     "-DUSE_CUDA=OFF", "-DUSE_ROCM=OFF", "-DUSE_DISTRIBUTED=OFF", "-DUSE_KINETO=OFF",
     "-DUSE_MKLDNN=OFF", "-DUSE_XNNPACK=OFF", "-DUSE_QNNPACK=OFF", "-DUSE_FBGEMM=OFF",
     "-DUSE_NNPACK=OFF", "-DUSE_PYTORCH_QNNPACK=OFF",
 ]
 l1 = true
 l2_targets = ["torch_cpu"]
-l3_targets = ["torch_cpu"]
-l4 = { install = true }
+l3_targets = ["torch_cpu", "c10_ArrayRef_test"]
+# The install target builds all enabled test binaries.
+l4 = { ctest = ["-R", "^c10_ArrayRef_test$"] }
 runner = { memory_gib = 16, gpu = "none", tier = "large" }

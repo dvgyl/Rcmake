@@ -45,14 +45,14 @@ SUITES = (
     "Policy", "get_property", "set_property", "define_property",
     "cmake_host_system_information", "variable_watch", "CMP0219",
 )
-M3_SUITES = (
+EXTENDED_SUITES = (
     "CPackCommandLine", "discover_tests", "CMakePresetsTest", "CMakePresetsPackage",
     "CMakePresetsWorkflow", "CTestCommandLine", "CPackConfig", "FileSet-SOURCES",
     "FileSetProperties", "GoogleTest", "find_package-CPS", "InstallPackageInfo",
     "ExportPackageInfo", "InstallSbom", "ExportSbom", "CPack", "ctest_test",
     "ctest_start", "ctest_fixtures", "Instrumentation", "CXXModules",
 )
-SUITE_GROUPS = {"m1m2": SUITES, "m3": M3_SUITES, "all": SUITES + M3_SUITES}
+SUITE_GROUPS = {"m1m2": SUITES, "m3": EXTENDED_SUITES, "all": SUITES + EXTENDED_SUITES}
 WIDE_SUITES = (
     "GeneratorExpression", "GeneratorExpressionShortCircuit", "GenEx-TARGET_PROPERTY",
     "GenEx-TARGET_FILE", "target_link_libraries", "target_compile_features", "target_sources",
@@ -406,7 +406,7 @@ def run_suite(driver, target, source, build, wrapper, settings, env, timeout):
         "RunCMake_TEST_TIMEOUT": min(timeout, 20),
         "EVAL_TEST_BINARY": target,
     }
-    if source.name in M3_SUITES:
+    if source.name in EXTENDED_SUITES:
         if target == driver:
             ctest = os.environ.get("RCMAKE_ORACLE_CTEST", driver.with_name("ctest"))
             cpack = os.environ.get("RCMAKE_ORACLE_CPACK", driver.with_name("cpack"))

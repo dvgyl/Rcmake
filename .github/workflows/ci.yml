@@ -169,6 +169,23 @@ jobs:
             done
             cp -R modules/cmake-4.5 target/stage/share/
           fi
+      - name: Test CMake tool aliases on PATH
+        timeout-minutes: 2
+        run: |
+          stage="$(cd target/stage/bin && pwd)"
+          export PATH="$stage:$PATH"
+          for tool in cmake ctest cpack; do
+            resolved="$(command -v "$tool")"
+            test "${resolved%.exe}" = "$stage/$tool"
+          done
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          cmake -S conformance/ecosystem/recursive-driver/sub -B "$work/build" -G Ninja
+          cmake --build "$work/build"
+          ctest --test-dir "$work/build" --output-on-failure --no-tests=error
+          cpack --config "$work/build/CPackConfig.cmake" -G TGZ -B "$work/packages" \
+            -D CPACK_PACKAGE_FILE_NAME=path-swap
+          test -s "$work/packages/path-swap.tar.gz"
       - name: Test native C and C++ builds
         timeout-minutes: 15
         run: |

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Compare generated build trees between a baseline and candidate Rcmake binary."""
+"""Compare generated build trees and File API replies from two Rcmake binaries."""
 
 from __future__ import annotations
 
@@ -8,103 +8,124 @@ import argparse
 import json
 import os
 from pathlib import Path
-import re
+import shutil
+import subprocess
 import sys
 import tempfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import determinism  # noqa: E402
+import determinism
+from mutation_eval import API, QUERIES
+from ninja_canon import Normalizer
+from oracle_prop_test import executable
 
-REPLY_HASH_RE = re.compile(rb"-[0-9a-f]{20}\.json")
-REPLY_KEY_HASH_RE = re.compile(r"-[0-9a-f]{20}\.json$")
-INDEX_KEY_RE = re.compile(r"^\.cmake/api/v1/reply/index-.*\.json$")
-INDEX_REF_RE = re.compile(rb"index-[0-9T:\-\.]+\.json")
+CONFIGURE_TIMEOUT = 600
 
-FILE_API_QUERY = {
-    "requests": [
-        {"kind": "codemodel", "version": 2},
-        {"kind": "cache", "version": 2},
-        {"kind": "cmakeFiles", "version": 1},
-        {"kind": "toolchains", "version": 1},
+
+def available_generators(binary: Path, root: Path, env: dict[str, str]) -> list[str]:
+    """Return generators from the determinism suite that can run on this host."""
+    stdout, _ = determinism.run([binary, "-E", "capabilities"], root, env, 30)
+    advertised = {generator["name"] for generator in json.loads(stdout)["generators"]}
+    requirements = {"Ninja": "ninja", "Ninja Multi-Config": "ninja", "Unix Makefiles": "make"}
+    return [
+        name for name in determinism.GENERATORS
+        if name in advertised
+        and (name not in requirements or shutil.which(requirements[name], path=env.get("PATH")))
+        and (name != "Xcode" or sys.platform == "darwin")
     ]
-}
 
 
-def write_file_api_query(build: Path) -> None:
-    query = build / ".cmake/api/v1/query/client-refactor-equiv"
-    query.mkdir(parents=True, exist_ok=True)
-    (query / "query.json").write_text(json.dumps(FILE_API_QUERY, indent=2) + "\n", encoding="utf-8")
+def capture(binary: Path, source: Path, build: Path, generator: str,
+            definitions: list[str], env: dict[str, str]) -> dict[str, bytes]:
+    """Configure a clean tree and read its generated files and File API replies."""
+    query = build / API / "query"
+    query.mkdir(parents=True)
+    for name in QUERIES:
+        (query / name).touch()
+
+    determinism.run([binary, "-S", source, "-B", build, "-G", generator,
+                     "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                     *(f"-D{definition}" for definition in definitions)],
+                    build.parent, env, CONFIGURE_TIMEOUT)
+
+    suffix = ".exe" if os.name == "nt" else ""
+    paths = determinism.ninja_paths(Normalizer(build, replacements={
+        binary.with_name(f"cmake{suffix}"): "<RCMAKE>",
+        binary.with_name(f"ctest{suffix}"): "<CTEST>",
+        binary.with_name(f"cpack{suffix}"): "<CPACK>",
+        binary.parent.parent / "share/cmake-4.5": "<CMAKE_DATA>",
+        binary: "<RCMAKE>",
+    }))
+    reply_prefix = (API / "reply").as_posix() + "/"
+    generated = {
+        name: determinism.normalized(data, paths)
+        for name, data in determinism.generator_snapshot(build).items()
+        if not name.replace(os.sep, "/").startswith(reply_prefix)
+    }
+    if "CMakeCache.txt" not in generated:
+        raise ValueError(f"No CMake cache in {build}.")
+    return {**generated, **determinism.file_api(build, paths)}
 
 
-def normalize_snapshot(snap: determinism.Snapshot, binary: Path) -> determinism.Snapshot:
-    bin_bytes = os.fsencode(binary.resolve())
-    raw_bin = os.fsencode(binary)
-    out: determinism.Snapshot = {}
-    for name, (kind, data) in snap.items():
-        if INDEX_KEY_RE.match(name):
-            key = ".cmake/api/v1/reply/index-NORMALIZED.json"
-        elif name.startswith(".cmake/api/v1/reply/"):
-            key = REPLY_KEY_HASH_RE.sub("-<HASH>.json", name)
-        else:
-            key = name
-        cleaned = data.replace(bin_bytes, b"<RCMAKE>").replace(raw_bin, b"<RCMAKE>")
-        if name.startswith(".cmake/api/v1/reply/"):
-            cleaned = REPLY_HASH_RE.sub(b"-<HASH>.json", cleaned)
-            cleaned = INDEX_REF_RE.sub(b"index-NORMALIZED.json", cleaned)
-        out[key] = (kind, cleaned)
-    return out
-
-
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """Compare the synthetic fixture and each requested project."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, required=True, help="Baseline Rcmake binary.")
     parser.add_argument("--candidate", type=Path, required=True, help="Candidate Rcmake binary.")
-    parser.add_argument(
-        "--generator",
-        action="append",
-        help="Limit comparison to specific generator(s); defaults to all available generators.",
-    )
-    args = parser.parse_args()
-    baseline = args.baseline.absolute()
-    candidate = args.candidate.absolute()
+    parser.add_argument("--source", action="append", type=Path, default=[],
+                        help="Project directory to copy and check. Repeat for more projects.")
+    parser.add_argument("--define", action="append", default=[], metavar="KEY=VAL",
+                        help="Set a CMake cache entry for each configure. Repeat for more entries.")
+    parser.add_argument("--generator", action="append",
+                        help="Generator to check. Repeat to select more generators.")
+    args = parser.parse_args(argv)
 
-    passed = True
-    checked = 0
-    with tempfile.TemporaryDirectory(prefix="rcmake-refactor-equiv-") as directory:
-        root = Path(directory).resolve()
-        source = root / "src"
-        source.mkdir()
-        for name, content in determinism.PROJECT.items():
-            (source / name).write_text(content, encoding="utf-8")
+    sources = [source.resolve() for source in args.source]
+    for source in sources:
+        if not (source / "CMakeLists.txt").is_file():
+            parser.error(f"No CMakeLists.txt in {source}.")
+    for definition in args.define:
+        key, separator, _ = definition.partition("=")
+        if not key or not separator:
+            parser.error(f"Expected KEY=VAL for --define. Got {definition!r}.")
 
-        generators = args.generator or list(determinism.available_generators(baseline))
-        for gen in generators:
-            print(f"Checking equivalence for {gen}.", flush=True)
-            checked += 1
-            with tempfile.TemporaryDirectory(dir=root) as case:
-                b_dir = Path(case) / "baseline"
-                c_dir = Path(case) / "candidate"
-                for binary, build in ((baseline, b_dir), (candidate, c_dir)):
-                    write_file_api_query(build)
-                    determinism.run(
-                        binary,
-                        "-S",
-                        source,
-                        "-B",
-                        build,
-                        "-G",
-                        gen,
-                        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-                    )
-                snap_b = normalize_snapshot(determinism.snapshot(b_dir), baseline)
-                snap_c = normalize_snapshot(determinism.snapshot(c_dir), candidate)
-                if not determinism.compare(snap_b, snap_c):
-                    passed = False
+    env = {**os.environ, "RCMAKE_NO_INCREMENTAL": "1", "RCMAKE_NO_PROBE_CACHE": "1"}
+    try:
+        baseline, candidate = map(executable, (args.baseline, args.candidate))
+        with tempfile.TemporaryDirectory(prefix="rcmake-refactor-equiv-") as directory:
+            root = Path(directory).resolve()
+            generators = args.generator or available_generators(baseline, root, env)
+            if not generators:
+                raise ValueError("No generators were available.")
 
-    if not checked:
-        print("No generators were checked.", file=sys.stderr)
+            fixture = root / "src"
+            fixture.mkdir()
+            for name, content in determinism.GENERATOR_FIXTURE.items():
+                (fixture / name).write_text(content, encoding="utf-8")
+
+            failures = 0
+            for source in (fixture, *sources):
+                for generator in generators:
+                    label = f"{'synthetic fixture' if source == fixture else source} ({generator})"
+                    print(f"Checking {label}.", flush=True)
+                    try:
+                        with tempfile.TemporaryDirectory(dir=root) as case:
+                            # Reuse both paths and restore inputs that configure can change.
+                            checkout = Path(case) / "source" / source.name
+                            build = Path(case) / "build"
+                            shutil.copytree(source, checkout, symlinks=True)
+                            expected = capture(baseline, checkout, build, generator, args.define, env)
+                            shutil.rmtree(checkout)
+                            shutil.rmtree(build)
+                            shutil.copytree(source, checkout, symlinks=True)
+                            actual = capture(candidate, checkout, build, generator, args.define, env)
+                            determinism.compare(expected, actual, label)
+                    except (OSError, ValueError, subprocess.SubprocessError) as error:
+                        print(f"FAIL {label}. {error}", file=sys.stderr)
+                        failures += 1
+            return int(bool(failures))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"Equivalence check failed. {error}", file=sys.stderr)
         return 1
-    return 0 if passed else 1
 
 
 if __name__ == "__main__":

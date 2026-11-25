@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from filecmp import cmp
 import hashlib
@@ -25,6 +27,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from typing import BinaryIO
 from xml.etree.ElementTree import ParseError
 
 from pathswap import check_exec_log, executable, write_json
@@ -102,6 +105,28 @@ def load_projects(selection: str, manifest: Path = MANIFEST) -> list[dict]:
     return [pins[name] for name in (PROJECT_SPACE if selection == "all" else (selection,))]
 
 
+def group_rss(pid: int) -> int:
+    """Return the sampled resident memory of a process group in bytes."""
+    processes = subprocess.check_output(["/bin/ps", "-axo", "pgid=,rss="], text=True, timeout=5)
+    return sum(int(kib) for group, kib in map(str.split, processes.splitlines())
+               if int(group) == pid) * 1024
+
+
+@contextmanager
+def process_group(argv: list[str], cwd: Path, env: dict[str, str],
+                  out: BinaryIO, err: BinaryIO) -> Iterator[subprocess.Popen[bytes]]:
+    """Stop remaining group members and wait for the leader on exit."""
+    with subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                          stdout=out, stderr=err, start_new_session=True) as proc:
+        try:
+            yield proc
+        finally:
+            # The group can still contain children after the leader exits.
+            with suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+
+
 def run_command(log: Path, label: str, argv: list, timeout: int,
                 env: dict[str, str], cwd: Path) -> Path:
     """Run one process group and save its streams and status."""
@@ -110,50 +135,34 @@ def run_command(log: Path, label: str, argv: list, timeout: int,
     start = time.monotonic()
     peak_rss = 0
     min_free = shutil.disk_usage(log).free
-    code = None
-    stop = None
+    proc = None
+    stop = "disk limit" if min_free < MIN_FREE else None
     stdout, stderr = (log / f"{label}.{suffix}" for suffix in ("stdout", "stderr"))
     with stdout.open("wb") as out, stderr.open("wb") as err:
         try:
-            if min_free < MIN_FREE:
-                stop = "disk limit"
-            else:
-                with subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                      stdout=out, stderr=err, start_new_session=True) as proc:
-                    try:
-                        while proc.poll() is None:
-                            free = shutil.disk_usage(log).free
-                            processes = subprocess.check_output(
-                                ["/bin/ps", "-axo", "pgid=,rss="], text=True, timeout=5)
-                            rss = sum(int(kib) for group, kib in
-                                      (line.split() for line in processes.splitlines())
-                                      if int(group) == proc.pid) * 1024
-                            min_free = min(min_free, free)
-                            peak_rss = max(peak_rss, rss)
-                            remaining = timeout - (time.monotonic() - start)
-                            if remaining <= 0:
-                                stop = "timeout"
-                            elif free < MIN_FREE:
-                                stop = "disk limit"
-                            elif rss > MAX_RSS:
-                                stop = "memory limit"
-                            if stop:
-                                break
-                            try:
-                                proc.wait(timeout=min(1, remaining))
-                            except subprocess.TimeoutExpired:
-                                continue
-                    finally:
-                        # The group can still contain children after the leader exits.
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                        code = proc.wait()
+            if stop is None:
+                with process_group(argv, cwd, env, out, err) as proc:
+                    while proc.poll() is None:
+                        free = shutil.disk_usage(log).free
+                        rss = group_rss(proc.pid)
+                        min_free = min(min_free, free)
+                        peak_rss = max(peak_rss, rss)
+                        remaining = timeout - (time.monotonic() - start)
+                        if remaining <= 0:
+                            stop = "timeout"
+                        elif free < MIN_FREE:
+                            stop = "disk limit"
+                        elif rss > MAX_RSS:
+                            stop = "memory limit"
+                        if stop:
+                            break
+                        with suppress(subprocess.TimeoutExpired):
+                            proc.wait(timeout=min(1, remaining))
         except BaseException as error:
             stop = str(error) or type(error).__name__
             raise
         finally:
+            code = proc.returncode if proc is not None else None
             write_json(log / f"{label}.json", {
                 "argv": argv, "cwd": str(cwd), "returncode": code, "stop": stop,
                 "limit_s": timeout, "wall_s": round(time.monotonic() - start, 2),
@@ -457,6 +466,10 @@ def representative_test(name: str, log: Path, build: Path, prefix: Path,
                                            "-o", smoke / "probe"], 300, env, lane)
         run_command(log, "clang-run", [smoke / "probe"], 60, env, lane)
     else:
+        if l4.get("ctest"):
+            run_command(log, "upstream-test", ["ctest", "--test-dir", build, *l4["ctest"],
+                                               "--no-tests=error", "--output-on-failure"],
+                        1800, env, lane)
         run_command(log, "install", [tc.ninja, "-C", build, "-j", jobs, "install"], 7200, env, lane)
         smoke = lane / "smoke"
         smoke.mkdir()
