@@ -73,15 +73,15 @@ pub(super) fn write_project(
             let message = [
                 b"Unknown extension \"".as_slice(),
                 &extension,
-                b"\" for file\n\n  ",
+                b"\" for file\n  ",
                 source_name,
-                b"\n\ntry_compile() works only for enabled languages.  Currently these are:\n\n  ",
+                b"\ntry_compile() works only for enabled languages.  Currently these are:\n  ",
                 &enabled
                     .iter()
                     .map(|language| language.as_slice())
                     .collect::<Vec<_>>()
                     .join(b" ".as_slice()),
-                b"\n\nSee project() command to enable other languages.",
+                b"\nSee project() command to enable other languages.",
             ]
             .concat();
             return Err(probe_error(cx, message));
@@ -359,14 +359,15 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str
         }
     }
     if options.has(b"LINK_LIBRARIES") {
-        cmake_command(
-            &mut code,
-            &format!("target_link_libraries({target} PRIVATE"),
-            options.many(b"LINK_LIBRARIES").iter().copied(),
-        );
+        code.extend_from_slice(format!("target_link_libraries({target}").as_bytes());
+        for item in options.many(b"LINK_LIBRARIES") {
+            code.push(b' ');
+            write_quoted_arg(&mut code, item.trim_ascii());
+        }
+        code.extend_from_slice(b")\n");
     } else {
         code.extend_from_slice(
-            format!("target_link_libraries({target} PRIVATE ${{LINK_LIBRARIES}})\n").as_bytes(),
+            format!("target_link_libraries({target} ${{LINK_LIBRARIES}})\n").as_bytes(),
         );
     }
     if let Some(language) = language {
@@ -398,6 +399,17 @@ fn cmake_command<'a>(code: &mut BString, prefix: &str, args: impl IntoIterator<I
         write_bracket_arg(code, arg);
     }
     code.extend_from_slice(b")\n");
+}
+
+pub(super) fn write_quoted_arg(code: &mut BString, arg: &[u8]) {
+    code.push(b'"');
+    for &byte in arg {
+        if matches!(byte, b'\\' | b'"' | b'$' | b'@') {
+            code.push(b'\\');
+        }
+        code.push(byte);
+    }
+    code.push(b'"');
 }
 
 pub(super) fn write_bracket_arg(code: &mut BString, arg: &[u8]) {

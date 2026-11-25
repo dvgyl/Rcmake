@@ -28,7 +28,9 @@ pub(super) fn directory_value(
     inherited: bool,
 ) -> Option<BString> {
     match name {
-        b"VARIABLES" if dir == cx.current_dir_id() => Some(list::join(cx.variable_names())),
+        b"VARIABLES" if dir == cx.current_dir_id() => {
+            Some(list::join(cx.variables_property_names()))
+        }
         b"CACHE_VARIABLES" => Some(cache_names(cx)),
         b"RULES" => Some(list::join(cx.project().directory_rules(dir))),
         b"MACROS" => Some(

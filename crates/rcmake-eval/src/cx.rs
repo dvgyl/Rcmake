@@ -16,6 +16,7 @@ use rcmake_regex::{Captures, Regex, RegexError};
 use rcmake_syntax::{Argument, CommandInvocation};
 
 mod language_scope;
+mod variables;
 
 use crate::{
     Binding, CmdError, CmdResult, Command, IncludeOptions, Interp, LogLevel, RunMode,
@@ -286,16 +287,6 @@ impl Cx<'_> {
         self.interp
             .lookup_var(name)
             .is_some_and(|v| rcmake_base::truth::is_on(v))
-    }
-
-    /// All visible variable names plus cache names, sorted (`VARIABLES` property).
-    #[must_use]
-    pub fn variable_names(&self) -> Vec<BString> {
-        let mut names = self.interp.vars.visible_names();
-        names.extend(self.interp.project.cache.iter().map(|(k, _)| k.clone()));
-        names.sort();
-        names.dedup();
-        names
     }
 
     /// Set a normal variable in the current scope, enforcing `limits.max_value_bytes`.

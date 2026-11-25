@@ -249,7 +249,7 @@ fn warm_probe_replays_output_and_copy_without_a_compiler() -> TestResult {
         first
             .last()
             .ok_or("Missing output variable.")?
-            .ends_with(b"compiler output\n")
+            .ends_with(b"compiler output\n\n")
     );
     assert_eq!(fixture.runs.load(Ordering::Relaxed), 2);
     let copy = Path::new("/work/probes/copied");
@@ -260,7 +260,7 @@ fn warm_probe_replays_output_and_copy_without_a_compiler() -> TestResult {
         second
             .last()
             .ok_or("Missing output variable.")?
-            .ends_with(b"compiler output\n")
+            .ends_with(b"compiler output\n\n")
     );
     assert_eq!(fixture.runs.load(Ordering::Relaxed), 2);
     assert_eq!(

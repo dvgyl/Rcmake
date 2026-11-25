@@ -107,7 +107,7 @@ project(Parent NONE)
 set(CMAKE_C_COMPILER /work/probe-cc)
 set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES PASSED)
 set(PASSED parent)
-try_compile(NEW SOURCES /work/main.c CMAKE_FLAGS "-DCOMPILE_DEFINITIONS=--probe-driver-flag" NO_CACHE NO_LOG)
+try_compile(NEW SOURCES /work/main.c CMAKE_FLAGS "-DCOMPILE_DEFINITIONS=--probe-driver-flag" LINK_LIBRARIES " m " OUTPUT_VARIABLE SOURCE_OUT NO_CACHE NO_LOG)
 try_compile(LEGACY /work/legacy /work/main.c NO_LOG)
 try_compile(PROJECT_NEW PROJECT Child SOURCE_DIR /work/sub BINARY_DIR /work/build/project-new TARGET app
     CMAKE_FLAGS -DPASSED:STRING=override OUTPUT_VARIABLE CHILD_OUT LOG_DESCRIPTION "Child build")
@@ -148,18 +148,33 @@ try_compile(PROJECT_OLD /work/project-old /work/sub Child app OUTPUT_VARIABLE CH
         assert_eq!(entry.value, "TRUE");
         assert_eq!(entry.ty, CacheType::Internal);
     }
-    let captured = cx.var_or_empty(b"CHILD_OUT");
+    let source = cx.var_or_empty(b"SOURCE_OUT");
+    assert!(source.starts_with(b"Change Dir: '"), "{source}");
     assert!(
-        captured.starts_with(b"-- child nested=1 flag=override\n"),
+        source.to_string().contains("\n\nRun Build Command(s): "),
+        "{source}"
+    );
+    let captured = cx.var_or_empty(b"CHILD_OUT");
+    assert!(captured.starts_with(b"Change Dir: '"), "{captured}");
+    assert!(
+        captured.to_string().contains("\n\nRun Build Command(s): "),
         "{captured}"
     );
     assert!(
-        captured.ends_with(b"compiler output\ncompiler output\n"),
+        captured
+            .to_string()
+            .contains("-- child nested=1 flag=override\n"),
+        "{captured}"
+    );
+    assert!(
+        captured.ends_with(b"compiler output\ncompiler output\n\n"),
         "{captured}"
     );
     let inherited = cx.var_or_empty(b"CHILD_OLD");
     assert!(
-        inherited.starts_with(b"-- child nested=1 flag=parent\n"),
+        inherited
+            .to_string()
+            .contains("-- child nested=1 flag=parent\n"),
         "{inherited}"
     );
     assert!(host.stream_bytes(Stream::Stdout).is_empty());
@@ -329,10 +344,9 @@ message(STATUS "inside probe")
         }));
         let result = interp.run_configure(root, &root.join("build"), &[]);
         assert_eq!(result.exit_code, 0, "{}", host.stream_bytes(Stream::Stderr));
-        assert_eq!(
-            interp.cx().var_or_empty(b"child_output"),
-            "-- inside probe\n"
-        );
+        let output = interp.cx().var_or_empty(b"child_output");
+        assert!(output.starts_with(b"Change Dir: '"), "{output}");
+        assert!(output.ends_with(b"-- inside probe\n\n"), "{output}");
 
         let trace = if let Some(path) = redirect {
             assert!(host.stream_bytes(Stream::Stderr).is_empty());

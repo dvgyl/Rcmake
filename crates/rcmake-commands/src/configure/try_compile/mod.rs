@@ -148,7 +148,7 @@ fn explicit_binary_dir(cx: &mut Cx<'_>, value: &[u8]) -> Result<PathBuf, CmdErro
     if !dir.is_absolute() {
         return Err(probe_error(
             cx,
-            [b"<bindir> is not an absolute path:\n\n '", value, b"'"].concat(),
+            [b"<bindir> is not an absolute path:\n '", value, b"'"].concat(),
         ));
     }
     Ok(absolute(Path::new("/"), value))
@@ -186,7 +186,7 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
     let (signature, options) =
         parse(&first.value, args, run).map_err(|message| probe_error(cx, message))?;
     if !options.unknown.is_empty() {
-        let mut message = BString::from("Unknown arguments:\n");
+        let mut message = BString::from("Unknown arguments:");
         for arg in &options.unknown {
             message.extend_from_slice(b"\n  \"");
             message.extend_from_slice(arg);
@@ -224,7 +224,7 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
             Effect::None,
             None,
             format!(
-                "Executing {command} ({}) in:\n\n  {}",
+                "Executing {command} ({}) in:\n  {}",
                 BString::from(build_var),
                 dirs.binary.display()
             )
@@ -378,6 +378,7 @@ fn build_probe(
     // A cache hit does not configure the test project, so only silent probes are kept.
     #[cfg(all(feature = "native", any(unix, windows)))]
     if let Some(probe) = cached_probe
+        && result.failure.is_none()
         && result.diagnostics.is_empty()
         && let Some(journal) = journal.and_then(|host| std::sync::Arc::try_unwrap(host).ok())
     {
@@ -408,6 +409,7 @@ struct ProbeResult {
     /// Standard error of the test project configure, which CMake shows to the user.
     diagnostics: BString,
     artifact: Option<PathBuf>,
+    failure: Option<&'static str>,
 }
 
 fn apply_probe(
@@ -422,6 +424,7 @@ fn apply_probe(
         outcome,
         output,
         artifact,
+        failure,
         ..
     } = result;
     set_build_result(cx, build_var, options, outcome.success, &output);
@@ -460,6 +463,11 @@ fn apply_probe(
             &output,
             run_var.map(|var| (var, run_result.as_ref())),
         )?;
+    }
+    if let Some(message) = failure {
+        let error = probe_error(cx, message);
+        cx.set_fatal();
+        return Err(error);
     }
     if let Some(message) = missing {
         cx.error_no_location(message);

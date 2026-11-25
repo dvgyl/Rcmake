@@ -299,7 +299,7 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
             MessageKind::DeprecationWarning,
             Effect::None,
             Some(DiagCategory::Deprecated),
-            format!("Compatibility with CMake < 3.10 will be removed from a future version of CMake.\n\n{VERSION_ADVICE}").into(),
+            format!("Compatibility with CMake < 3.10 will be removed from a future version of CMake.\n{VERSION_ADVICE}").into(),
         );
     }
     for policy in POLICIES {
@@ -339,7 +339,7 @@ fn set_policy(cx: &mut Cx<'_>, id: PolicyId, state: PolicyStatus) -> Result<(), 
             MessageKind::DeprecationWarning,
             Effect::None,
             Some(DiagCategory::Deprecated),
-            format!("The OLD behavior for policy {id} will be removed from a future version of CMake.\n\nThe cmake-policies(7) manual explains that the OLD behaviors of all policies are deprecated and that a policy should be set to OLD only under specific short-term circumstances.  Projects should be ported to the NEW behavior and not rely on setting a policy to OLD.").into(),
+            format!("The OLD behavior for policy {id} will be removed from a future version of CMake.\nThe cmake-policies(7) manual explains that the OLD behaviors of all policies are deprecated and that a policy should be set to OLD only under specific short-term circumstances.  Projects should be ported to the NEW behavior and not rely on setting a policy to OLD.").into(),
         );
     }
     Ok(())

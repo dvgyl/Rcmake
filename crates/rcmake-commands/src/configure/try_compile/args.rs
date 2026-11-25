@@ -210,12 +210,12 @@ pub(super) fn parse<'a>(
             .map(|(keyword, reasons)| {
                 let reasons = reasons.into_iter().collect::<Vec<_>>().join("\n  ");
                 format!(
-                    "Error after keyword \"{}\":\n\n  {reasons}",
+                    "Error after keyword \"{}\":\n  {reasons}",
                     String::from_utf8_lossy(keyword)
                 )
             })
             .collect::<Vec<_>>()
-            .join("\n\n");
+            .join("\n");
         text.push('\n');
         return Err(text.into());
     }

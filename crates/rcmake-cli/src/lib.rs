@@ -592,7 +592,7 @@ fn build_capabilities_json() -> Value {
         ]),
     );
     root.insert(BString::from("serverMode"), Value::Bool(false));
-    root.insert(BString::from("tls"), Value::Bool(false));
+    root.insert(BString::from("tls"), Value::Bool(true));
     root.insert(BString::from("version"), Value::Object(version));
     Value::Object(root)
 }

@@ -15,7 +15,7 @@ pub(super) fn report_missing(
         if let Some(setting) = &request.required_by {
             message = text(&[
                 message.trim_ascii_end(),
-                b"\n\nThis package is considered required because the ",
+                b"\nThis package is considered required because the ",
                 setting,
                 b" variable has been enabled.\n",
             ]);
@@ -45,7 +45,7 @@ pub(super) fn warn_config_fallback(cx: &mut Cx<'_>, name: &[u8]) {
             name,
             b"Config.cmake or ",
             &lower,
-            b"-config.cmake).\n\n(Variable CMAKE_FIND_PACKAGE_WARN_NO_MODULE enabled this warning.)",
+            b"-config.cmake).\n(Variable CMAKE_FIND_PACKAGE_WARN_NO_MODULE enabled this warning.)",
         ]),
     );
 }
@@ -58,7 +58,7 @@ pub(super) fn warn_module_path(cx: &mut Cx<'_>, name: &[u8]) {
         text(&[
             b"Find",
             name,
-            b".cmake must either be part of this project itself, in this case adjust CMAKE_MODULE_PATH so that it points to the correct location inside its source tree.\n\nOr it must be installed by a package which has already been found via find_package().  In this case make sure that package has indeed been found and adjust CMAKE_MODULE_PATH to contain the location where that package has installed Find",
+            b".cmake must either be part of this project itself, in this case adjust CMAKE_MODULE_PATH so that it points to the correct location inside its source tree.\nOr it must be installed by a package which has already been found via find_package().  In this case make sure that package has indeed been found and adjust CMAKE_MODULE_PATH to contain the location where that package has installed Find",
             name,
             b".cmake.  This must be a location provided by that package.  This error in general means that the buildsystem of this project is relying on a Find-module without ensuring that it is actually available.\n",
         ]),
@@ -72,7 +72,7 @@ impl ConfigSearch<'_> {
             text(&[
                 b"By not providing \"Find", name,
                 b".cmake\" in CMAKE_MODULE_PATH this project has asked CMake to find a package configuration file provided by \"",
-                name, b"\", but CMake did not find one.\n\n",
+                name, b"\", but CMake did not find one.\n",
             ])
         } else {
             BString::default()
@@ -120,7 +120,7 @@ impl ConfigSearch<'_> {
                 name,
                 b"\"",
                 requested,
-                b".\n\nThe following configuration files were considered but not accepted:\n",
+                b".\nThe following configuration files were considered but not accepted:",
                 &list_lines(&files),
             ]);
         }
@@ -139,9 +139,9 @@ impl ConfigSearch<'_> {
             name,
             b"\"",
             &requested,
-            b" with any of the following names:\n",
+            b" with any of the following names:",
             &list_lines(&configs),
-            b"\nAdd the installation prefix of \"",
+            b"Add the installation prefix of \"",
             name,
             b"\" to CMAKE_PREFIX_PATH or set \"",
             name,

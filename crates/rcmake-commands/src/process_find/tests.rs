@@ -1307,3 +1307,36 @@ find_library(second NAMES test NO_DEFAULT_PATH PATHS /work/mylib64)
     );
     Ok(())
 }
+
+#[test]
+fn wave8a_config_package_preserves_true_and_rejects_non_on_values() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    host.seed_file(
+        Path::new("/work/prefix/WidgetConfig.cmake"),
+        br#"
+if(DEFINED called AND NOT Widget_FOUND)
+  message(FATAL_ERROR "The previous successful result was lost")
+endif()
+set(called ON)
+"#,
+    )?;
+    host.seed_file(
+        Path::new("/work/prefix/OtherConfig.cmake"),
+        b"set(Other_FOUND arbitrary)",
+    )?;
+    let exit = run(
+        &host,
+        &mut interp,
+        r#"
+set(Widget_FOUND arbitrary)
+find_package(Widget CONFIG REQUIRED NO_DEFAULT_PATH PATHS /work/prefix)
+find_package(Widget CONFIG REQUIRED NO_DEFAULT_PATH PATHS /work/prefix)
+find_package(Other QUIET CONFIG NO_DEFAULT_PATH PATHS /work/prefix)
+if(Other_FOUND)
+  message(FATAL_ERROR "The package set a result that is not true")
+endif()
+"#,
+    )?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    Ok(())
+}

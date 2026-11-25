@@ -1047,3 +1047,30 @@ fn android_mk_install_validates_options_and_registers_component() -> TestResult 
     }
     Ok(())
 }
+
+#[test]
+fn wave8a_install_registers_export_sets_before_targets() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+project(Example NONE)
+install(EXPORT Standard DESTINATION lib)
+install(EXPORT_ANDROID_MK Android DESTINATION lib)
+install(PACKAGE_INFO Example EXPORT Package)
+install(SBOM Example EXPORTS Document Other)
+export(EXPORT Standard FILE Standard.cmake)
+export(EXPORT Android FILE Android.cmake)
+export(EXPORT Package FILE Package.cmake)
+export(EXPORT Document FILE Document.cmake)
+export(EXPORT Other FILE Other.cmake)
+install(TARGETS core EXPORT Standard)
+"#,
+        0,
+    )?;
+    assert_eq!(
+        interp.cx().project().exports[b"Standard".as_slice()]
+            .targets
+            .len(),
+        1
+    );
+    Ok(())
+}

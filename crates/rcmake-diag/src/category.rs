@@ -30,10 +30,10 @@ impl DiagCategory {
         Self::Author,
         Self::Deprecated,
         Self::Experimental,
-        Self::Policy,
         Self::Strict,
-        Self::NonTargetDirective,
         Self::InstallAbsoluteDestination,
+        Self::NonTargetDirective,
+        Self::Policy,
         Self::Uninitialized,
         Self::UnusedCli,
     ];

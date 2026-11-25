@@ -5,7 +5,7 @@ use rcmake_build::{BuildOptions, BuildOutcome};
 use rcmake_eval::Cx;
 use rcmake_genex::ConfigId;
 use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest, path};
-use rcmake_model::DirId;
+use rcmake_model::{DirId, GeneratorKind};
 use rcmake_resolve::BuildStep;
 
 mod apple;
@@ -15,12 +15,17 @@ use super::args::Options;
 use super::seed::toolchain_variable;
 use super::{TIMEOUT, absolute, set_result};
 
+pub(super) enum ChildError {
+    Generate(String),
+    Build(String),
+}
+
 pub(super) fn build_child(
     child: &mut Cx<'_>,
     directory: &Path,
     target: Option<&[u8]>,
-    verbose: bool,
-) -> Result<(BuildOutcome, Option<PathBuf>), String> {
+    source_signature: bool,
+) -> Result<(BuildOutcome, Option<PathBuf>, BString), ChildError> {
     let config = ConfigId(child.var_or_empty(b"CMAKE_BUILD_TYPE"));
     let mut model = child.project().clone();
     // Lowering reads toolchain variables from the directory model or cache.
@@ -30,13 +35,13 @@ pub(super) fn build_child(
             model.dir_mut(DirId::ROOT).props.set(name, value);
         }
     }
-    apple::resolve(child, &mut model, directory, &config)?;
+    apple::resolve(child, &mut model, directory, &config).map_err(ChildError::Generate)?;
     let graph = rcmake_resolve::resolve(&model, child.host(), std::slice::from_ref(&config))
-        .map_err(|error| error.to_string())?
+        .map_err(|error| ChildError::Generate(error.to_string()))?
         .graphs
         .into_iter()
         .next()
-        .ok_or_else(|| "The resolver returned no build graph.".to_owned())?;
+        .ok_or_else(|| ChildError::Generate("The resolver returned no build graph.".into()))?;
     let artifact = target
         .and_then(|name| {
             graph
@@ -59,12 +64,77 @@ pub(super) fn build_child(
     let options = BuildOptions {
         build_dir: directory.to_path_buf(),
         targets: target.into_iter().map(BString::from).collect(),
-        verbose,
+        verbose: source_signature,
         ..BuildOptions::default()
     };
-    let outcome =
-        rcmake_build::execute(&graph, child.host(), &options).map_err(|error| error.to_string())?;
-    Ok((outcome, artifact))
+    let header = build_log_header(child, directory, target, source_signature);
+    let outcome = rcmake_build::execute(&graph, child.host(), &options)
+        .map_err(|error| ChildError::Build(error.to_string()))?;
+    Ok((outcome, artifact, header))
+}
+
+fn build_log_header(
+    child: &mut Cx<'_>,
+    directory: &Path,
+    target: Option<&[u8]>,
+    source_signature: bool,
+) -> BString {
+    let generator = child.project().generator;
+    let make_program = child
+        .var(b"CMAKE_MAKE_PROGRAM")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            match generator {
+                Some(GeneratorKind::UnixMakefiles) | None => "make",
+                Some(GeneratorKind::Xcode) => "xcodebuild",
+                Some(GeneratorKind::VisualStudio(_)) => "MSBuild.exe",
+                _ => "ninja",
+            }
+            .into()
+        });
+    let mut command = Vec::new();
+    if generator == Some(GeneratorKind::UnixMakefiles) {
+        command.extend([
+            child.var_or_empty(b"CMAKE_COMMAND"),
+            "-E".into(),
+            "env".into(),
+            "VERBOSE=1".into(),
+            make_program,
+            "-f".into(),
+            "Makefile".into(),
+        ]);
+    } else {
+        command.push(make_program);
+        if matches!(
+            generator,
+            Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+        ) {
+            command.push("-v".into());
+        }
+        if generator == Some(GeneratorKind::NinjaMultiConfig) {
+            let config = child.var_or_empty(b"CMAKE_BUILD_TYPE");
+            if !config.is_empty() {
+                command.extend(["-f".into(), format!("build-{config}.ninja").into()]);
+            }
+        }
+    }
+    if let Some(target) = target {
+        let mut target = BString::from(target);
+        if source_signature && generator == Some(GeneratorKind::UnixMakefiles) {
+            target.extend_from_slice(b"/fast");
+        }
+        command.push(target);
+    }
+    let command = command
+        .iter()
+        .map(|word| rcmake_base::shell::quote(word).to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "Change Dir: '{}'\n\nRun Build Command(s): {command}\n",
+        path::from_native_cmake(directory)
+    )
+    .into()
 }
 
 pub(super) struct RunResult {

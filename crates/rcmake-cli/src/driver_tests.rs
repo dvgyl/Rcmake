@@ -545,6 +545,7 @@ fn capabilities_advertises_supported_generators_and_file_api() {
     let host = project_host();
     assert_eq!(invoke(&host, &["cmake", "-E", "capabilities"]), 0);
     let json = host.stream_bytes(Stream::Stdout);
+    assert!(String::from_utf8_lossy(&json).contains("\"tls\":true"));
     for field in [
         "Ninja",
         "Ninja Multi-Config",
@@ -816,4 +817,156 @@ fn compile_no_warning_as_error_records_the_ignore_entry() {
             .windows(b"_RCMAKE_NO_WARNING_AS_ERROR:INTERNAL=ON".len())
             .any(|window| window == b"_RCMAKE_NO_WARNING_AS_ERROR:INTERNAL=ON")
     );
+}
+
+#[test]
+fn wave8a_cache_records_generator_metadata_and_omits_placeholders() {
+    let host = project_host();
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        br#"
+cmake_minimum_required(VERSION 4.5)
+project(Example NONE)
+cmake_policy(SET CMP0102 OLD)
+mark_as_advanced(FORCE ABSENT PRESENT)
+set(PRESENT "value" CACHE STRING "")
+add_subdirectory(sub)
+"#,
+    )
+    .unwrap();
+    host.seed_file(Path::new("/work/sub/CMakeLists.txt"), b"")
+        .unwrap();
+    assert_eq!(
+        invoke(&host, &["cmake", "-S", ".", "-B", "out", "-G", "Ninja"]),
+        0
+    );
+    let cache = host
+        .read(
+            Path::new("/work/out/CMakeCache.txt"),
+            ReadRange::All { limit: 16384 },
+        )
+        .unwrap();
+    let cache = String::from_utf8(cache).unwrap();
+    assert!(!cache.contains("ABSENT"), "{cache}");
+    let diagnostic_init = cache
+        .lines()
+        .find_map(|line| line.strip_prefix("CMAKE_DIAGNOSTIC_INIT:INTERNAL="))
+        .unwrap();
+    let categories: Vec<_> = diagnostic_init
+        .split(';')
+        .filter_map(|entry| entry.split_once('=').map(|(name, _)| name))
+        .collect();
+    assert_eq!(
+        categories,
+        [
+            "CMD_AUTHOR",
+            "CMD_DEPRECATED",
+            "CMD_EXPERIMENTAL",
+            "CMD_STRICT",
+            "CMD_INSTALL_ABSOLUTE_DESTINATION",
+            "CMD_NON_TARGET_DIRECTIVE",
+            "CMD_POLICY",
+            "CMD_UNINITIALIZED",
+            "CMD_UNUSED_CLI",
+        ]
+    );
+    for entry in [
+        "CMAKE_EXTRA_GENERATOR:INTERNAL=",
+        "CMAKE_GENERATOR_INSTANCE:INTERNAL=",
+        "CMAKE_GENERATOR_PLATFORM:INTERNAL=",
+        "CMAKE_GENERATOR_TOOLSET:INTERNAL=",
+        "CMAKE_NUMBER_OF_MAKEFILES:INTERNAL=2",
+        "PRESENT:STRING=value",
+        "PRESENT-ADVANCED:INTERNAL=1",
+    ] {
+        assert!(
+            cache.lines().any(|line| line == entry),
+            "Missing {entry} in {cache}"
+        );
+    }
+}
+
+#[test]
+fn wave8a_failed_configure_saves_cache() {
+    let host = project_host();
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        br#"
+cmake_minimum_required(VERSION 4.5)
+project(Example NONE)
+set(RESULT pending CACHE STRING "")
+message(FATAL_ERROR "Stop")
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        invoke(&host, &["cmake", "-S", ".", "-B", "out", "-G", "Ninja"]),
+        1
+    );
+    let cache = host
+        .read(
+            Path::new("/work/out/CMakeCache.txt"),
+            ReadRange::All { limit: 16384 },
+        )
+        .unwrap();
+    assert!(
+        String::from_utf8(cache)
+            .unwrap()
+            .lines()
+            .any(|line| line == "RESULT:STRING=pending")
+    );
+}
+
+#[test]
+fn wave8a_variables_property_includes_normal_and_cache_bindings() {
+    let host = project_host();
+    host.seed_file(
+        Path::new("/work/check.cmake"),
+        br#"
+cmake_minimum_required(VERSION 4.5)
+set(WAVE8A_CACHE 1 CACHE STRING "")
+set(WAVE8A_CACHE 2)
+get_property(names DIRECTORY PROPERTY VARIABLES)
+list(FILTER names INCLUDE REGEX "^WAVE8A_CACHE$")
+if(NOT names STREQUAL "WAVE8A_CACHE;WAVE8A_CACHE")
+  message(FATAL_ERROR "Incorrect variable names: ${names}")
+endif()
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        invoke(&host, &["cmake", "-P", "/work/check.cmake"]),
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+}
+
+#[test]
+fn wave8a_generation_rejects_empty_install_export_sets() {
+    let host = project_host();
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        br#"
+cmake_minimum_required(VERSION 4.5)
+project(Example NONE)
+install(EXPORT Standard DESTINATION lib)
+install(EXPORT_ANDROID_MK Android DESTINATION lib)
+install(PACKAGE_INFO Example EXPORT Package)
+install(SBOM Example EXPORTS Document)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        invoke(&host, &["cmake", "-S", ".", "-B", "out", "-G", "Ninja"]),
+        1
+    );
+    let stderr = String::from_utf8(host.stream_bytes(Stream::Stderr).to_vec()).unwrap();
+    for expected in [
+        r#"CMake Error: INSTALL(EXPORT) given unknown export "Standard""#,
+        r#"CMake Error: INSTALL(EXPORT_ANDROID_MK) given unknown export "Android""#,
+        r#"CMake Error: INSTALL(PACKAGE_INFO) given unknown export "Package""#,
+    ] {
+        assert!(stderr.lines().any(|line| line == expected), "{stderr}");
+    }
 }

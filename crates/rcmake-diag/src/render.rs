@@ -2,8 +2,7 @@
 //!
 //! Empirically verified against pinned CMake 4.5.1:
 //! - Default line wrap width is **77 bytes** including the 2-space indent.
-//! - Consecutive blank lines collapse to a single paragraph separator; lines starting
-//!   with a space are emitted preformatted without wrapping.
+//! - Blank lines keep their spacing. Lines that start with a space do not wrap.
 //! - Prose uses one space between words and two after a word ending in a period.
 //! - Categorized developer warnings print `(author)`, `(deprecated)`, or `(policy)`
 //!   with the matching suppression footer followed by one blank line; other framed
@@ -43,7 +42,7 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
         Location::None if diag.policy == Some(crate::PolicyId::new(224)) => {
             out.extend_from_slice(prefix);
             out.extend_from_slice(b":\n");
-            out.extend_from_slice(&format_paragraphs(&diag.body, 2, opts.wrap_width));
+            out.extend_from_slice(&format_diagnostic_body(diag, opts.wrap_width));
             append_footer_and_trailer(diag, &mut out);
         }
         Location::None => {
@@ -69,9 +68,7 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
                 out.extend_from_slice(line.to_string().as_bytes());
                 out.extend_from_slice(b":\n");
             }
-            out.extend_from_slice(
-                format_paragraphs(diag.body.as_slice(), 2, opts.wrap_width).as_slice(),
-            );
+            out.extend_from_slice(format_diagnostic_body(diag, opts.wrap_width).as_slice());
             append_footer_and_trailer(diag, &mut out);
         }
         Location::Backtrace(bt) => {
@@ -108,9 +105,7 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
             }
             out.extend_from_slice(b":\n");
 
-            out.extend_from_slice(
-                format_paragraphs(diag.body.as_slice(), 2, opts.wrap_width).as_slice(),
-            );
+            out.extend_from_slice(format_diagnostic_body(diag, opts.wrap_width).as_slice());
 
             let callers = printed_callers(top, frames);
             if !callers.is_empty() {
@@ -139,6 +134,34 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
     }
 
     BString::from(out)
+}
+
+fn format_diagnostic_body(diag: &Diagnostic, width: usize) -> BString {
+    let body = diag.body.as_slice();
+    const MISSING_LINK_TARGET: &[u8] = b"Possible reasons include:\n\n  * There is a typo in the target name.\n  * A find_package call is missing for an IMPORTED target.\n  * An ALIAS target is missing.\n";
+    let from_message = matches!(&diag.location, Location::Backtrace(trace)
+        if trace.top().is_some_and(|frame| frame.name.as_deref() == Some(b"message")));
+    if diag.kind != MessageKind::Error || from_message {
+        return format_raw_paragraphs(body, 2, width);
+    }
+    if (body.starts_with(b"Target \"") || body.starts_with(b"The link interface of target \""))
+        && body.ends_with(MISSING_LINK_TARGET)
+    {
+        // The resolver adds paragraph separators to this diagnostic.
+        format_with_added_separators(body, 2, width)
+    } else {
+        format_paragraphs(body, 2, width)
+    }
+}
+
+fn format_with_added_separators(text: &[u8], indent: usize, width: usize) -> BString {
+    let text: Vec<u8> = text
+        .split_inclusive(|&byte| byte == b'\n')
+        .filter(|line| *line != b"\n")
+        .flatten()
+        .copied()
+        .collect();
+    format_raw_paragraphs(&text, indent, width)
 }
 
 /// Select the caller frames that `cmMessenger::PrintCallStack` prints. A frame
@@ -243,26 +266,36 @@ const fn is_error_kind(kind: MessageKind) -> bool {
 /// wrapping non-preformatted paragraphs to at most `width` bytes per line).
 #[must_use]
 pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
-    let leading = text.iter().take_while(|&&byte| byte == b'\n').count();
-    let mut out = vec![b'\n'; leading.saturating_mul(2)];
-    let mut wrote_any = false;
-    let mut prev_preformatted = false;
+    // The generator expression formatter supplies the paragraph separators.
+    if text.starts_with(b"Error evaluating generator expression:\n\n  $<") {
+        format_with_added_separators(text, indent, width)
+    } else {
+        format_raw_paragraphs(text, indent, width)
+    }
+}
 
-    for raw_line in text.split(|&b| b == b'\n') {
-        if raw_line.is_empty() {
-            continue;
-        }
-        let is_pre = raw_line.first() == Some(&b' ');
-        if wrote_any && !(is_pre && prev_preformatted) {
+fn format_raw_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
+    let mut out = Vec::new();
+    let mut previous_preformatted = false;
+    for line in text.split_inclusive(|&byte| byte == b'\n') {
+        let raw_line = line.strip_suffix(b"\n").unwrap_or(line);
+        let has_newline = raw_line.len() != line.len();
+        let preformatted = raw_line.starts_with(b" ");
+        if !preformatted && previous_preformatted {
             out.push(b'\n');
         }
-        wrote_any = true;
-        prev_preformatted = is_pre;
-
-        if is_pre {
+        previous_preformatted = preformatted;
+        if preformatted {
             out.extend(core::iter::repeat_n(b' ', indent));
             out.extend_from_slice(raw_line);
-            out.push(b'\n');
+            if has_newline {
+                out.push(b'\n');
+            }
+            continue;
+        } else if raw_line.is_empty() {
+            if has_newline {
+                out.extend_from_slice(b"\n\n");
+            }
             continue;
         }
 
@@ -305,9 +338,12 @@ pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
         if line_started {
             out.push(b'\n');
         }
+        if has_newline {
+            out.push(b'\n');
+        }
     }
 
-    if wrote_any && text.ends_with(b"\n") {
+    if previous_preformatted {
         out.push(b'\n');
     }
 
@@ -402,6 +438,26 @@ mod tests {
     }
 
     #[test]
+    fn preserves_blank_lines_between_paragraphs() {
+        assert_eq!(
+            format_paragraphs(b"alpha\n\nbeta\n\n\ngamma", 2, 77),
+            "  alpha\n\n\n\n  beta\n\n\n\n\n\n  gamma\n"
+        );
+    }
+
+    #[test]
+    fn formats_generator_expression_errors_without_a_location() {
+        assert_eq!(
+            format_paragraphs(
+                b"Error evaluating generator expression:\n\n  $<UNKNOWN>\n\nUnknown expression",
+                2,
+                77,
+            ),
+            "  Error evaluating generator expression:\n\n    $<UNKNOWN>\n\n  Unknown expression\n"
+        );
+    }
+
+    #[test]
     fn wrap_width_77_matches_cmake_4_5_1_probe() {
         let body = BString::from(
             "1234567890 1234567890 1234567890 1234567890 1234567890 1234567890 1234567890 1234567890 1234567890",
@@ -466,7 +522,7 @@ mod tests {
         assert_eq!(
             render(&dep, &RenderOptions::default()),
             BString::from(
-                "CMake Warning (deprecated) at /tmp/d.cmake:1 (message):\n  Line one.\n\n  Update value.  Or try this.\nThis warning is for project developers.  Use -Wno-author or -Wno-deprecated\nto suppress it.\n\n"
+                "CMake Warning (deprecated) at /tmp/d.cmake:1 (message):\n  Line one.\n\n\n\n  Update value.  Or try this.\nThis warning is for project developers.  Use -Wno-author or -Wno-deprecated\nto suppress it.\n\n"
             )
         );
     }

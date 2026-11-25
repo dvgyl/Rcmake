@@ -164,7 +164,10 @@ impl PreparedProbe {
                 && options
                     .many(b"LINK_LIBRARIES")
                     .iter()
-                    .chain(options.many(b"LINK_OPTIONS"))
+                    .all(|flag| compiler::admit_link(flag.trim_ascii()))
+                && options
+                    .many(b"LINK_OPTIONS")
+                    .iter()
                     .all(|flag| compiler::admit_link(flag))
                 && options
                     .many(b"COMPILE_DEFINITIONS")
@@ -324,6 +327,7 @@ impl PreparedProbe {
             artifact,
             output: result.output.into(),
             diagnostics: BString::default(),
+            failure: None,
         })
     }
 

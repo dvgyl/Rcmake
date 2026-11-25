@@ -441,7 +441,9 @@ impl<'a> ConfigSearch<'a> {
                 }
                 vars.apply(cx);
             }
-            cx.unset_var(found_var);
+            if cx.var_defined(found_var) && !truth::is_on(&cx.var_or_empty(found_var)) {
+                cx.unset_var(found_var);
+            }
             cx.unset_var(&message);
             if let Some(candidate) = found.cps {
                 cx.set_var(found_var, "1".into());
@@ -469,7 +471,7 @@ impl<'a> ConfigSearch<'a> {
                 return Err(CmdError::Reported);
             }
             let found_package =
-                !cx.var_defined(found_var) || !truth::is_off(&cx.var_or_empty(found_var));
+                !cx.var_defined(found_var) || truth::is_on(&cx.var_or_empty(found_var));
             if found_package {
                 cx.set_var(&config, found.file);
             } else {

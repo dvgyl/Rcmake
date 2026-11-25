@@ -10,7 +10,7 @@ use rcmake_model::{
     SbomSpec,
 };
 
-use super::{Result, destination, fail, type_destination};
+use super::{Result, destination, ensure_export_set, fail, type_destination};
 
 const PROJECT_OPTIONS: &[&[u8]] = &[
     b"PROJECT",
@@ -377,6 +377,7 @@ pub(super) fn install(
             [lib.as_slice(), b"/cps/", &name].concat()
         };
         *options = args.install_options(cx, path.into())?;
+        ensure_export_set(cx, &spec.export);
         Ok(InstallKind::PackageInfo(Box::new(spec)))
     } else {
         let spec = sbom(cx, &args)?;
@@ -388,6 +389,9 @@ pub(super) fn install(
                 && rule.options.destination.as_ref() == path
         }) {
             return Err(duplicate_sbom(&spec.name));
+        }
+        for name in &spec.exports {
+            ensure_export_set(cx, name);
         }
         Ok(InstallKind::Sbom(Box::new(spec)))
     }

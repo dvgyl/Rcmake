@@ -8,7 +8,7 @@ use rcmake_host::{Host, WriteMode, path};
 use rcmake_model::{DirId, GeneratorKind, GeneratorSpec, Target};
 
 use super::capture::CapturingHost;
-use super::run::build_child;
+use super::run::{ChildError, build_child};
 use super::seed::TryCompileSeed;
 use super::{ProbeDirs, ProbeResult, probe_cache};
 
@@ -90,7 +90,8 @@ impl ChildConfig {
             source_signature,
         } = build;
         let mut recursion_exceeded = false;
-        let (built, mut output, diagnostics) = CapturingHost::capture(host, &dirs.binary, |host| {
+        let mut failure = None;
+        let (built, stdout, diagnostics) = CapturingHost::capture(host, &dirs.binary, |host| {
             let mut config = self.config;
             config.cwd = dirs.binary.clone();
             config.host = host.clone();
@@ -117,11 +118,11 @@ impl ChildConfig {
             for (imported, aliases) in imports {
                 let id = model
                     .add_target(imported)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| ChildError::Build(error.to_string()))?;
                 for alias in aliases {
                     model
                         .add_alias(DirId::ROOT, alias, id)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| ChildError::Build(error.to_string()))?;
                 }
             }
             let configure = child.run_configure(&dirs.source, &dirs.binary, &[]);
@@ -132,38 +133,57 @@ impl ChildConfig {
                     &data,
                     WriteMode::Truncate,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| ChildError::Build(error.to_string()))?;
             }
             if configure.exit_code != 0 {
                 recursion_exceeded = child.recursion_exceeded();
+                failure = Some("Failed to configure test project build system.");
                 return Ok((
                     BuildOutcome {
                         exit_code: configure.exit_code,
                         ..Default::default()
                     },
                     None,
+                    BString::default(),
                 ));
             }
             build_child(&mut child.cx(), &dirs.binary, target, source_signature)
         });
-        let (outcome, artifact) = match built {
+        let (outcome, artifact, header) = match built {
             Ok(values) => values,
-            Err(error) => (
-                BuildOutcome {
-                    exit_code: 1,
-                    output: error.into(),
-                    ..Default::default()
-                },
-                None,
-            ),
+            Err(error) => {
+                let output = match error {
+                    ChildError::Build(output) => output,
+                    ChildError::Generate(output) => {
+                        failure = Some("Failed to generate test project build system.");
+                        output
+                    }
+                };
+                (
+                    BuildOutcome {
+                        exit_code: 1,
+                        output: output.into(),
+                        ..Default::default()
+                    },
+                    None,
+                    BString::default(),
+                )
+            }
         };
+        let built = !header.is_empty();
+        let mut output = header;
+        output.extend_from_slice(&stdout);
         output.extend_from_slice(&outcome.output);
+        if built {
+            output.push(b'\n');
+        }
         (
             ProbeResult {
                 output,
                 diagnostics,
                 outcome,
                 artifact,
+                failure,
             },
             recursion_exceeded,
         )

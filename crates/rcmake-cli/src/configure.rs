@@ -391,6 +391,42 @@ impl<'a> ConfigureSession<'a> {
         self.prepare_presentation(&mut interp, style);
         *interp.cx().cache() = saved;
         interp.cx().project().generator = generator_kind;
+        for (key, value, help) in [
+            (
+                b"CMAKE_EXTRA_GENERATOR".as_slice(),
+                BString::default(),
+                "Name of external makefile project generator.",
+            ),
+            (
+                b"CMAKE_GENERATOR_INSTANCE",
+                generator_spec.instance.clone(),
+                "Generator instance identifier.",
+            ),
+            (
+                b"CMAKE_GENERATOR_PLATFORM",
+                generator_spec.platform.clone(),
+                "Name of generator platform.",
+            ),
+            (
+                b"CMAKE_GENERATOR_TOOLSET",
+                generator_spec.toolset.clone(),
+                "Name of generator toolset.",
+            ),
+        ] {
+            let mut cx = interp.cx();
+            if !cx.cache().contains(key) {
+                cx.cache().insert(
+                    key.into(),
+                    rcmake_model::CacheEntry {
+                        value,
+                        ty: CacheType::Internal,
+                        help: help.into(),
+                        advanced: false,
+                        props: Default::default(),
+                    },
+                );
+            }
+        }
         interp.cx().project().generator_spec = generator_spec;
         cache::insert(
             interp.cx().cache(),
@@ -557,7 +593,22 @@ impl<'a> ConfigureSession<'a> {
         } else {
             result.exit_code
         };
+        let directories = interp.cx().project().dirs().count();
+        let key = b"CMAKE_NUMBER_OF_MAKEFILES";
+        let mut cx = interp.cx();
+        cache::insert(
+            cx.cache(),
+            key,
+            directories.to_string().into(),
+            Some(CacheType::Internal),
+        );
+        if let Some(entry) = cx.cache().get_mut(key) {
+            entry.help = "number of local generators".into();
+        }
         if exit_code != 0 {
+            if let Err(error) = cache::save(host, &self.bin, interp.cx().cache()) {
+                emit_cli_error(host, format!("Could not write CMakeCache.txt: {error}"));
+            }
             if let Err(error) = rcmake_gen_common::fileapi::write_error_replies(
                 interp.cx().project(),
                 host,

@@ -132,9 +132,9 @@ impl Request {
         if request.module && !request.config_options.is_empty() {
             let options = list_lines(request.config_options.iter());
             return Err(CmdError::status(text(&[
-                b"given options exclusive to Module mode:\n\n  MODULE\n\nand options exclusive to Config mode:\n",
+                b"given options exclusive to Module mode:\n  MODULE\nand options exclusive to Config mode:",
                 &options,
-                b"\nThe options are incompatible.",
+                b"The options are incompatible.",
             ])));
         }
         let required: BTreeSet<_> = request
@@ -147,9 +147,8 @@ impl Request {
         }));
         if !overlap.is_empty() {
             return Err(CmdError::status(text(&[
-                b"called with components that are both required and optional:\n",
+                b"called with components that are both required and optional:",
                 &overlap,
-                b"\n",
             ])));
         }
         Ok(request)

@@ -4,7 +4,9 @@ use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_eval::Cx;
 use rcmake_model::{InstallKind, InstallOptions};
 
-use super::{Args, Result, common, fail, keyword, value, warn_absolute_destination};
+use super::{
+    Args, Result, common, ensure_export_set, fail, keyword, value, warn_absolute_destination,
+};
 
 pub(super) fn parse(
     cx: &mut Cx<'_>,
@@ -12,7 +14,7 @@ pub(super) fn parse(
     options: &mut InstallOptions,
 ) -> Result<InstallKind> {
     const SIGNATURE: &[u8] = b"EXPORT_ANDROID_MK";
-    args.next_if(|token| !keyword(token));
+    let set = args.next_if(|token| !keyword(token)).unwrap_or_default();
     let mut file = b"".as_slice();
     while let Some(key) = args.next() {
         match key {
@@ -46,6 +48,7 @@ pub(super) fn parse(
     } else if !file.is_empty() && !file.ends_with(b".mk") {
         "The FILE argument must specify a name ending in \".mk\"."
     } else {
+        ensure_export_set(cx, set);
         return Ok(InstallKind::Code(BString::default()));
     };
     Err(fail(format!(

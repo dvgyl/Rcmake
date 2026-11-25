@@ -38,7 +38,7 @@ pub(super) fn normalize<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Vec<&'
         }
     }
     if !missing.is_empty() {
-        let message = format!("EXPORT given invalid argument:\n\n{}", missing.join("\n"));
+        let message = format!("EXPORT given invalid argument:\n{}", missing.join("\n"));
         match cx.policy(CMP0208) {
             PolicyStatus::New => return Err(fail(message)),
             PolicyStatus::Warn => {
@@ -57,9 +57,8 @@ pub(super) fn normalize<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Vec<&'
 }
 
 pub(super) fn repeat(cx: &mut Cx<'_>, file: &BString) -> Result<()> {
-    let message = format!(
-        "command already specified for the file\n\n  {file}\n\nDid you miss 'APPEND' keyword?"
-    );
+    let message =
+        format!("command already specified for the file\n  {file}\nDid you miss 'APPEND' keyword?");
     match cx.policy(CMP0103) {
         PolicyStatus::New => Err(fail(message)),
         PolicyStatus::Warn => {

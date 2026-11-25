@@ -374,18 +374,21 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
             .set(format!("{section}_ARG{argument}").into(), path);
     }
     if let Some((name, targets)) = members {
-        let set = cx
-            .project()
-            .exports
-            .entry(name.clone())
-            .or_insert_with(|| ExportSet {
-                name,
-                ..ExportSet::default()
-            });
+        let set = ensure_export_set(cx, &name);
         set.targets.extend(targets);
         set.install_rules.push(index);
     }
     Ok(Flow::Normal)
+}
+
+fn ensure_export_set<'a>(cx: &'a mut Cx<'_>, name: &[u8]) -> &'a mut ExportSet {
+    cx.project()
+        .exports
+        .entry(name.into())
+        .or_insert_with(|| ExportSet {
+            name: name.into(),
+            ..ExportSet::default()
+        })
 }
 
 fn warn_absolute_destination(cx: &mut Cx<'_>, path: &[u8]) {
@@ -394,7 +397,7 @@ fn warn_absolute_destination(cx: &mut Cx<'_>, path: &[u8]) {
         Effect::None,
         Some(DiagCategory::InstallAbsoluteDestination),
         [
-            b"INSTALL command given absolute DESTINATION path:\n\n  ",
+            b"INSTALL command given absolute DESTINATION path:\n  ",
             path,
         ]
         .concat()
@@ -630,7 +633,7 @@ fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
                 let input = args.next_if(|token| payload(token)).ok_or_else(|| {
                     let key = BString::from(key);
                     fail(format!(
-                        "{key} given invalid argument:\n\n  {key}: missing required value"
+                        "{key} given invalid argument:\n  {key}: missing required value"
                     ))
                 })?;
                 let kind = if key == b"SCRIPT" {
@@ -715,7 +718,7 @@ fn install_export(
     options: &mut InstallOptions,
 ) -> Result<InstallKind> {
     let packages = package_dependencies::enabled(cx);
-    let set = value(args, b"EXPORT")?.into();
+    let set = value(args, b"EXPORT")?;
     let mut namespace = BString::default();
     let mut file = None;
     let mut cxx_modules_directory = None;
@@ -755,8 +758,9 @@ fn install_export(
     {
         return Err(fail("EXPORT given no DESTINATION!"));
     }
+    ensure_export_set(cx, set);
     Ok(InstallKind::Export {
-        set,
+        set: set.into(),
         namespace,
         file,
         cxx_modules_directory,
@@ -882,7 +886,7 @@ fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
                     return Err(fail(
                         [
                             *signature,
-                            b" given invalid argument:\n\n  NAMESPACE: missing required value",
+                            b" given invalid argument:\n  NAMESPACE: missing required value",
                         ]
                         .concat(),
                     ));

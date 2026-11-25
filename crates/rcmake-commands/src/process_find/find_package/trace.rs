@@ -69,7 +69,7 @@ impl SearchTrace {
     pub(super) fn module_not_found(&mut self, found_var: &[u8]) {
         if let Some(body) = &mut self.body {
             body.extend_from_slice(&super::text(&[
-                b"\nThe module is considered not found due to ",
+                b"The module is considered not found due to ",
                 found_var,
                 b" being FALSE.",
             ]));

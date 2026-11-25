@@ -443,9 +443,9 @@ fn search(
                     .collect::<Vec<_>>();
                 if !targets.is_empty() {
                     diagnostics.push(cps_import::PackageDiagnostic::new(text(&[
-                        b"Found package configuration file:\n\n  ",
+                        b"Found package configuration file:\n  ",
                         &file,
-                        b"\n\nbut the following required targets were not found: ",
+                        b"\nbut the following required targets were not found: ",
                         &list::join(targets.iter()),
                     ])));
                     cx.set_var(found_var, "0".into());
@@ -455,9 +455,9 @@ fn search(
             if !found {
                 let reason = cx.var_or_empty(&text(&[name, b"_NOT_FOUND_MESSAGE"]));
                 let message = text(&[
-                    b"Found package configuration file:\n\n  ",
+                    b"Found package configuration file:\n  ",
                     &file,
-                    b"\n\nbut it set ",
+                    b"\nbut it set ",
                     found_var,
                     b" to FALSE so package \"",
                     name,
@@ -465,7 +465,7 @@ fn search(
                     if reason.is_empty() {
                         b""
                     } else {
-                        b"\nReason given by package:\n\n"
+                        b"\nReason given by package:\n"
                     },
                     &reason,
                 ]);

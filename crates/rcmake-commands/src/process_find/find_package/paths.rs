@@ -488,18 +488,16 @@ fn warn_ignored_root(
     {
         if let Some(value) = value {
             body.extend_from_slice(&text(&[
-                b"\n",
                 source,
                 b" variable ",
                 key,
-                b" is set to:\n\n  ",
+                b" is set to:\n  ",
                 &value,
                 b"\n",
             ]));
         }
     }
     if !body.is_empty() {
-        body.push(b'\n');
         body.extend_from_slice(explanation);
         cx.global().props.set(warned, "1".into());
         crate::policy_misc::issue_warning(cx, policy, b"", &body);

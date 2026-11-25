@@ -303,7 +303,12 @@ pub(crate) fn insert(cache: &mut Cache, name: &[u8], value: BString, ty: Option<
 pub(crate) fn save(host: &dyn Host, dir: &Path, cache: &Cache) -> HostResult<()> {
     let mut data = BString::from("# This is the CMakeCache file.\n\n");
     for (name, entry) in sorted(cache) {
-        if name.iter().any(|byte| matches!(byte, b'\n' | b'\r' | b'"')) {
+        if entry
+            .props
+            .get(rcmake_eval::Cx::CACHE_PLACEHOLDER)
+            .is_some()
+            || name.iter().any(|byte| matches!(byte, b'\n' | b'\r' | b'"'))
+        {
             continue;
         }
         for line in entry

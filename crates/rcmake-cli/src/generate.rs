@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use rcmake_instrument::snippet::{self, ContentTarget};
 use rcmake_instrument::{
     CustomContent, CustomContentType, InstrumentError, InstrumentOption, Query,
 };
-use rcmake_model::{FileSetId, GeneratorKind, ProjectModel, TargetOrigin};
+use rcmake_model::{FileSetId, GeneratorKind, InstallKind, ProjectModel, TargetOrigin};
 use rcmake_resolve::ide::IdeFlavor;
 use rcmake_resolve::{GenerationResult, InstallActionKind, InstallManifest, ResolveOptions};
 
@@ -141,6 +142,15 @@ fn generate(
             return Err(message.into());
         }
     };
+    if matches!(
+        kind,
+        GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig | GeneratorKind::UnixMakefiles
+    ) {
+        check_scoped_compile_rules(interp.cx().project(), &result)?;
+    }
+    if !interp.cx().var_is_on(b"CMAKE_SKIP_INSTALL_RULES") {
+        check_install_export_sets(interp.cx().project())?;
+    }
     if result.graphs.iter().flat_map(|graph| &graph.steps).any(|step| {
         matches!(step, rcmake_resolve::BuildStep::Collate { depend_info, .. } if matches!(depend_info.as_ref(), rcmake_resolve::DependInfo::Cxx(info) if info.database_info.is_some()))
     }) {
@@ -249,6 +259,75 @@ fn generate(
         Err(GenError::Unimplemented(_)) => Ok(false),
         Err(err) => Err(err.to_string().into()),
     }
+}
+
+fn check_install_export_sets(model: &ProjectModel) -> Result<(), Failure> {
+    let mut errors = String::new();
+    for (index, rule) in model.installs.iter().enumerate() {
+        let (signature, set) = match &rule.kind {
+            InstallKind::Export { set, .. } => ("EXPORT", set.as_slice()),
+            InstallKind::PackageInfo(spec) => ("PACKAGE_INFO", spec.export.as_slice()),
+            InstallKind::Code(code) if code.is_empty() => {
+                let args = &model.global.props;
+                let key = format!("_RCMAKE_INSTALL_{index}_ARG0");
+                if !args
+                    .get(key.as_bytes())
+                    .is_some_and(|name| name == "EXPORT_ANDROID_MK")
+                {
+                    continue;
+                }
+                let key = format!("_RCMAKE_INSTALL_{index}_ARG1");
+                (
+                    "EXPORT_ANDROID_MK",
+                    args.get(key.as_bytes())
+                        .map_or(b"".as_slice(), |name| name.as_slice()),
+                )
+            }
+            _ => continue,
+        };
+        if model
+            .exports
+            .get(set)
+            .is_none_or(|exports| exports.install_rules.is_empty() && exports.targets.is_empty())
+        {
+            let set = BString::from(set);
+            let _ = writeln!(
+                errors,
+                "CMake Error: INSTALL({signature}) given unknown export \"{set}\""
+            );
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.into())
+    }
+}
+
+fn check_scoped_compile_rules(
+    model: &ProjectModel,
+    result: &GenerationResult,
+) -> Result<(), Failure> {
+    for target in &result.targets {
+        let Some(target_model) = model.target(target.id) else {
+            continue;
+        };
+        for group in &target.compile_groups {
+            let key = format!("CMAKE_{}_COMPILE_OBJECT", group.language);
+            // CMP0220 OLD can leave a language rule visible only in the directory that enabled it.
+            if model.definition(target_model.dir, key.as_bytes()).is_none()
+                && model.languages().enabled.contains(&group.language)
+                && model
+                    .dirs()
+                    .any(|(dir, _)| model.definition(dir, key.as_bytes()).is_some())
+            {
+                return Err(format!(
+                    "CMake Error: Error required internal CMake variable not set, cmake may not be built correctly.\nMissing variable is:\n{key}"
+                ).into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Store `<project>_REQUIRES_VS_PACKAGE_RESTORE` for the projects that need a
