@@ -413,10 +413,7 @@ impl Interp {
 
     pub(super) fn record_list_file(&mut self, abs: &[u8]) {
         let id = self.current_dir_id();
-        let files = &mut self.project.dir_mut(id).listfiles;
-        if !files.iter().any(|f| f.as_slice() == abs) {
-            files.push(BString::from(abs));
-        }
+        self.project.dir_mut(id).listfiles.push(BString::from(abs));
     }
 
     /// `cmMakefile::AddSubDirectory` + `ConfigureSubDirectory` (see

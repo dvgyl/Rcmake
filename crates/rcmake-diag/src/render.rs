@@ -137,30 +137,7 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
 }
 
 fn format_diagnostic_body(diag: &Diagnostic, width: usize) -> BString {
-    let body = diag.body.as_slice();
-    const MISSING_LINK_TARGET: &[u8] = b"Possible reasons include:\n\n  * There is a typo in the target name.\n  * A find_package call is missing for an IMPORTED target.\n  * An ALIAS target is missing.\n";
-    let from_message = matches!(&diag.location, Location::Backtrace(trace)
-        if trace.top().is_some_and(|frame| frame.name.as_deref() == Some(b"message")));
-    if diag.kind == MessageKind::Error
-        && !from_message
-        && (body.starts_with(b"Target \"") || body.starts_with(b"The link interface of target \""))
-        && body.ends_with(MISSING_LINK_TARGET)
-    {
-        // The resolver adds paragraph separators to this diagnostic.
-        format_with_added_separators(body, 2, width)
-    } else {
-        format_paragraphs(body, 2, width)
-    }
-}
-
-fn format_with_added_separators(text: &[u8], indent: usize, width: usize) -> BString {
-    let text: Vec<u8> = text
-        .split_inclusive(|&byte| byte == b'\n')
-        .filter(|line| *line != b"\n")
-        .flatten()
-        .copied()
-        .collect();
-    format_paragraphs(&text, indent, width)
+    format_paragraphs(diag.body.as_slice(), 2, width)
 }
 
 /// Select the caller frames that `cmMessenger::PrintCallStack` prints. A frame

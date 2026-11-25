@@ -734,7 +734,7 @@ fn validate_link_items(
                 "it links to"
             };
             format!(
-                "Target \"{}\" has LINK_LIBRARIES_ONLY_TARGETS enabled, but {verb}:\n\n  {name}\n\nwhich is not a target.",
+                "Target \"{}\" has LINK_LIBRARIES_ONLY_TARGETS enabled, but {verb}:\n  {name}\nwhich is not a target.",
                 target.name
             )
         } else {
@@ -743,10 +743,10 @@ fn validate_link_items(
             } else {
                 format!("Target \"{}\" links to:", target.name)
             };
-            format!("{head}\n\n  {name}\n\nbut the target was not found.")
+            format!("{head}\n  {name}\nbut the target was not found.")
         };
         let body = BString::from(format!(
-            "{message}  Possible reasons include:\n\n  * There is a typo in the target name.\n  * A find_package call is missing for an IMPORTED target.\n  * An ALIAS target is missing.\n"
+            "{message}  Possible reasons include:\n  * There is a typo in the target name.\n  * A find_package call is missing for an IMPORTED target.\n  * An ALIAS target is missing.\n"
         ));
         let location = Location::Backtrace(item.text.backtrace.clone());
         pending.push(((id.index(), interface), location, body));
