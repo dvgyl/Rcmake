@@ -966,7 +966,10 @@ def s17_file_api(ctx: Ctx) -> None:
     ctx.check("configureLog", log.get("path", "").endswith("CMakeFiles/CMakeConfigureLog.yaml")
               and "try_compile-v1" in log.get("eventKindNames", []), log)
 
-    ctx.observe("index", {key: value for key, value in index.items() if key != "reply"})
+    ctx.observe(
+        "index",
+        canonical_codemodel(without_install_layout({key: value for key, value in index.items() if key != "reply"})),
+    )
     for key in sorted(reply):
         ctx.observe(f"reply {key}", canonical_codemodel(without_install_layout(reply[key])))
 
