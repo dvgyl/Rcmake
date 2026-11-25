@@ -75,14 +75,15 @@ def check_exec_log(log: Path, offset: int, expected: tuple[str, ...]) -> dict:
             for line in stream:
                 try:
                     record = json.loads(line)
-                    if (not isinstance(record, dict) or record.get("persona") not in TOOLS
+                    if (not isinstance(record, dict) or record.get("tool") not in TOOLS
+                            or record.get("persona") not in {"compat", "native"}
                             or not isinstance(record.get("argv"), list)):
-                        raise ValueError("Expected an argv list and a CMake tool persona.")
+                        raise ValueError("Expected an argv list, a CMake tool, and a persona.")
                     if "--version" not in record["argv"]:
                         records.append(record)
                 except (ValueError, RecursionError) as error:
                     return {"status": "invalid_exec_log", "error": str(error)}
-    seen = {record["persona"] for record in records}
+    seen = {record["tool"] for record in records}
     missing = sorted(set(expected) - seen)
     return {
         "status": "missing_exec_log" if missing else "pass",
