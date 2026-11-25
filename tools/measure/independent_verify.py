@@ -10,6 +10,9 @@ passes for each tool set and the normalized observations are equal.
 Use --oracle-only to run the checks with the oracle only. This mode proves
 that the suite itself is correct.
 
+Scenarios s15 to s20 are in independent_scenarios_extra.py. This module
+loads them into the same registry.
+
 Examples:
   source env/env.sh
   python3 tools/measure/independent_verify.py --oracle "$RCMAKE_ORACLE_CMAKE" --oracle-only
@@ -291,6 +294,7 @@ class Ctx:
         self.skips: list[str] = []
         self.observations: dict[str, Any] = {}
         self.transcript: list[str] = []
+        self.aliases: list[tuple[str, str]] = []
         root.mkdir(parents=True, exist_ok=True)
 
     # Files ---------------------------------------------------------------
@@ -380,10 +384,23 @@ class Ctx:
         """Record a normalized value for the differential comparison."""
         self.observations[key] = self.normalize(value)
 
+    def learn_tool_paths(self, build: Path) -> None:
+        """Read the tool paths that a configured tree records and alias them.
+
+        A tool can resolve symbolic links in its own path. The cache then
+        holds a path that is not the path of the Toolset. The aliases give
+        both paths the same placeholder.
+        """
+        entries = cache_entries(build, TOOL_PATH_ENTRIES)
+        for name, placeholder in TOOL_PATH_ENTRIES.items():
+            value = entries.get(name, "").partition("=")[2]
+            if value and (value, placeholder) not in self.aliases:
+                self.aliases.append((value, placeholder))
+
     def normalize(self, value: Any) -> Any:
         """Replace host-specific paths in nested values."""
         if isinstance(value, str):
-            return normalize_text(value, self.root, self.tools)
+            return normalize_text(value, self.root, self.tools, getattr(self, "aliases", ()))
         if isinstance(value, Mapping):
             return {self.normalize(k): self.normalize(v) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
@@ -393,11 +410,20 @@ class Ctx:
 
 SINGLE_CONFIG = ("Ninja", "Unix Makefiles")
 MULTI_CONFIG = ("Ninja Multi-Config", "Xcode")
+# Cache entries that hold tool paths, and the placeholder of each path.
+TOOL_PATH_ENTRIES = {
+    "CMAKE_COMMAND": "<CMAKE>",
+    "CMAKE_CTEST_COMMAND": "<CTEST>",
+    "CMAKE_CPACK_COMMAND": "<CPACK>",
+    "CMAKE_ROOT": "<CMAKE_ROOT>",
+}
 
 
-def normalize_text(text: str, root: Path, tools: Toolset | None = None) -> str:
-    """Replace the run root and tool paths with stable placeholders."""
-    pairs: list[tuple[str, str]] = []
+def normalize_text(
+    text: str, root: Path, tools: Toolset | None = None, aliases: Iterable[tuple[str, str]] = (),
+) -> str:
+    """Replace the run root, tool paths, and aliases with stable placeholders."""
+    pairs: list[tuple[str, str]] = list(aliases)
     for candidate in {str(root), os.path.realpath(root)}:
         pairs.append((candidate, "<ROOT>"))
     if tools is not None:
@@ -2539,6 +2565,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(card, indent=2) + "\n", encoding="utf-8")
     return 1 if summary["fail"] else 0
+
+
+def load_extra_scenarios() -> None:
+    """Register the scenarios of independent_scenarios_extra.py.
+
+    The extra module imports this module by name. When this file runs as a
+    script, its module name is __main__, so the alias makes the import give
+    this module and not a second copy with a second registry.
+    """
+    sys.modules.setdefault("independent_verify", sys.modules[__name__])
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import independent_scenarios_extra  # noqa: F401  # pylint: disable=import-outside-toplevel
+
+
+load_extra_scenarios()
 
 
 if __name__ == "__main__":

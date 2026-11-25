@@ -24,6 +24,7 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import independent_verify as iv  # noqa: E402
+import independent_scenarios_extra as ix  # noqa: E402
 
 
 def fake_tools(root: Path, label: str = "oracle") -> iv.Toolset:
@@ -102,6 +103,30 @@ class NormalizeTest(unittest.TestCase):
         ctx.root, ctx.tools = root, None
         self.assertEqual(ctx.normalize({"/r/x/k": ["/r/x/a", 3, ("/r/x/b",)]}),
                          {"<ROOT>/k": ["<ROOT>/a", 3, ["<ROOT>/b"]]})
+
+
+class AliasTest(TempDirTest):
+    def test_normalize_text_aliases(self) -> None:
+        root = Path("/r/x")
+        text = "/opt/real/bin/cmake -P /opt/real/share/cmake-4.5/Modules/A.cmake /r/x/b"
+        aliases = [("/opt/real/bin/cmake", "<CMAKE>"), ("/opt/real/share/cmake-4.5", "<CMAKE_ROOT>")]
+        self.assertEqual(iv.normalize_text(text, root, None, aliases),
+                         "<CMAKE> -P <CMAKE_ROOT>/Modules/A.cmake <ROOT>/b")
+
+    def test_learn_tool_paths_reads_the_cache(self) -> None:
+        (self.tmp / "CMakeCache.txt").write_text(textwrap.dedent("""\
+            CMAKE_COMMAND:INTERNAL=/real/bin/cmake
+            CMAKE_ROOT:INTERNAL=/real/share/cmake-4.5
+            CMAKE_CTEST_COMMAND:INTERNAL=/real/bin/ctest
+            """))
+        ctx = iv.Ctx(fake_tools(Path("/stage")), self.tmp / "run", iv.Options())
+        ctx.learn_tool_paths(self.tmp)
+        ctx.learn_tool_paths(self.tmp)  # A second read adds nothing.
+        self.assertEqual(sorted(ctx.aliases), [
+            ("/real/bin/cmake", "<CMAKE>"), ("/real/bin/ctest", "<CTEST>"),
+            ("/real/share/cmake-4.5", "<CMAKE_ROOT>")])
+        self.assertEqual(ctx.normalize(["/real/bin/cmake", "/stage/bin/cmake", "/real/share/cmake-4.5/x"]),
+                         ["<CMAKE>", "<CMAKE>", "<CMAKE_ROOT>/x"])
 
 
 class DiffTest(unittest.TestCase):
@@ -229,13 +254,31 @@ class HelperTest(TempDirTest):
 
 
 class RegistryTest(unittest.TestCase):
-    def test_fourteen_unique_scenarios_in_order(self) -> None:
+    def test_twenty_unique_scenarios_in_order(self) -> None:
         ids = [sc.sid for sc in iv.SCENARIOS]
-        self.assertEqual(ids, [f"s{i:02d}" for i in range(1, 15)])
+        self.assertEqual(ids, [f"s{i:02d}" for i in range(1, 21)])
+
+    def test_extra_module_uses_the_same_registry(self) -> None:
+        self.assertIs(ix.iv, iv)
+        iv.load_extra_scenarios()  # A second load must not add the scenarios again.
+        self.assertEqual(len(iv.SCENARIOS), 20)
+
+    def test_script_lists_every_scenario_once(self) -> None:
+        script = Path(iv.__file__).resolve()
+        proc = iv.run_process([sys.executable, script, "--list"], self.tmp_dir(), iv.child_env(), 120)
+        ids = [line.split()[0] for line in proc.stdout.splitlines() if line.strip()]
+        self.assertEqual(proc.returncode, 0, proc.tail())
+        self.assertEqual(ids, [f"s{i:02d}" for i in range(1, 21)])
+
+    def tmp_dir(self) -> Path:
+        tmp = tempfile.TemporaryDirectory(prefix="indep-unit-")
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name)
 
     def test_select(self) -> None:
         self.assertEqual([sc.sid for sc in iv.select("s05, s01")], ["s05", "s01"])
-        self.assertEqual(len(iv.select(None)), 14)
+        self.assertEqual(len(iv.select(None)), 20)
+        self.assertEqual([sc.sid for sc in iv.select("s20,s15")], ["s20", "s15"])
         with self.assertRaises(SystemExit):
             iv.select("s99")
 
@@ -246,6 +289,7 @@ class RegistryTest(unittest.TestCase):
         with mock.patch("sys.stdout", new=io.StringIO()) as out:
             self.assertEqual(iv.main(["--list"]), 0)
         self.assertIn("s14", out.getvalue())
+        self.assertIn("s20", out.getvalue())
         with mock.patch("sys.stderr", new=io.StringIO()):
             self.assertEqual(iv.main(["--oracle", "/nonexistent/cmake", "--oracle-only"]), 2)
 
@@ -295,6 +339,201 @@ class RunnerTest(TempDirTest):
         self.assertEqual(self.run_fake(skip)["status"], "skip")
         record = self.run_fake(lambda ctx: None, requires=lambda options: "needs X")
         self.assertEqual((record["status"], record["reason"]), ("skip", "needs X"))
+
+
+class ExtraHelperTest(TempDirTest):
+    def test_is_appledouble(self) -> None:
+        self.assertTrue(ix.is_appledouble("d/._a.txt"))
+        self.assertTrue(ix.is_appledouble("._d/"))
+        self.assertTrue(ix.is_appledouble("x/.DS_Store"))
+        self.assertFalse(ix.is_appledouble("d/a._txt"))
+
+    def test_tree_digest(self) -> None:
+        (self.tmp / "d/sub").mkdir(parents=True)
+        (self.tmp / "d/a.txt").write_text("a")
+        os.chmod(self.tmp / "d/a.txt", 0o640)
+        (self.tmp / "d/._a.txt").write_text("meta")
+        (self.tmp / "d/l").symlink_to("a.txt")
+        digest = ix.tree_digest(self.tmp / "d")
+        self.assertEqual(digest[0].split(" ")[:2], ["a.txt", "640"])
+        self.assertEqual(digest[1:], ["l -> a.txt", "sub/"])
+        (self.tmp / "d/a.txt").write_text("b")
+        self.assertNotEqual(ix.tree_digest(self.tmp / "d")[0], digest[0])
+
+    def test_archive_kind(self) -> None:
+        for name, head in (("g", b"\x1f\x8b\x08"), ("b", b"BZh9"), ("x", b"\xfd7zXZ\x00"),
+                           ("z", b"\x28\xb5\x2f\xfd"), ("p", b"PK\x03\x04"), ("s", b"7z\xbc\xaf\x27\x1c")):
+            (self.tmp / name).write_bytes(head + bytes(600))
+        kinds = [ix.archive_kind(self.tmp / n) for n in "gbxzps"]
+        self.assertEqual(kinds, ["gzip", "bzip2", "xz", "zstd", "zip", "7zip"])
+        for fmt, kind in ((tarfile.GNU_FORMAT, "tar-gnu"), (tarfile.PAX_FORMAT, "tar-posix"),
+                          (tarfile.USTAR_FORMAT, "tar-posix")):
+            path = self.tmp / f"t{fmt}.tar"
+            with tarfile.open(path, "w", format=fmt) as tar:
+                info = tarfile.TarInfo("f")
+                info.size = 1
+                tar.addfile(info, io.BytesIO(b"x"))
+            self.assertEqual(ix.archive_kind(path), kind)
+        self.assertEqual(ix.archive_kind(self.tmp / "absent"), "missing")
+        (self.tmp / "junk").write_bytes(bytes(600))
+        self.assertEqual(ix.archive_kind(self.tmp / "junk"), "unknown")
+
+    def test_listing_lines_and_python_members(self) -> None:
+        self.assertEqual(ix.listing_lines("d/\nd/._a\nd/a\n\n"), ["d", "d/a"])
+        path = self.tmp / "m.zip"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("d/", "")
+            zf.writestr("d/a", "x")
+            zf.writestr("d/._a", "x")
+        self.assertEqual(ix.python_members(path), [("d", 0), ("d/a", 0)])
+        tpath = self.tmp / "m.tar"
+        with tarfile.open(tpath, "w") as tar:
+            info = tarfile.TarInfo("d/a")
+            info.size, info.mtime = 1, ix.FIXED_EPOCH
+            tar.addfile(info, io.BytesIO(b"x"))
+        self.assertEqual(ix.python_members(tpath), [("d/a", ix.FIXED_EPOCH)])
+
+    def test_cmake_errors_and_message_lines(self) -> None:
+        text = textwrap.dedent("""\
+            -- Configuring done (0.5s)
+            CMake Error in CMakeLists.txt:
+              The target named "m" has
+
+                Unix Makefiles
+
+            CMake Warning (dev) at a.cmake:3 (message):
+              w
+            -- Generating done (0.0s)
+            CMake Generate step failed.
+            """)
+        self.assertEqual(ix.cmake_errors(text), [
+            'CMake Error in CMakeLists.txt: The target named "m" has Unix Makefiles',
+            "CMake Warning (dev) at a.cmake:3 (message): w"])
+        self.assertEqual(ix.cmake_errors("CMake Error: last\n  line"), ["CMake Error: last line"])
+        self.assertEqual(ix.message_lines(text, "-- Gen", "CMake Gen"), [
+            "-- Generating done (0.0s)", "CMake Generate step failed."])
+
+    def test_resolve_reply_inlines_files_and_stops(self) -> None:
+        reply = self.tmp
+        (reply / "a.json").write_text(json.dumps({"x": 1, "jsonFile": "b.json"}))
+        (reply / "b.json").write_text(json.dumps({"loop": {"jsonFile": "a.json"}}))
+        (reply / "bad.json").write_text("{")
+        out = ix.resolve_reply(reply, {"objs": [{"jsonFile": "a.json"}, {"jsonFile": "bad.json"},
+                                                {"jsonFile": "../escape.json"}, {"jsonFile": "absent.json"}]})
+        first = out["objs"][0]["json"]
+        self.assertEqual(first["x"], 1)
+        # a.json -> b.json -> a.json ... stops after four file references.
+        node = first
+        for _ in range(12):
+            if not isinstance(node, dict):
+                break
+            node = node.get("json", node.get("loop"))
+        self.assertEqual(node, "<not resolved a.json>")
+        self.assertEqual(out["objs"][1]["json"], "<unreadable JSONDecodeError>")
+        self.assertEqual(out["objs"][2]["json"], "<not resolved ../escape.json>")
+        self.assertEqual(out["objs"][3]["json"], "<unreadable FileNotFoundError>")
+
+    def test_file_api_reply_and_find_target(self) -> None:
+        build = self.tmp
+        self.assertEqual(ix.file_api_reply(build), ([], {}))
+        reply = build / ".cmake/api/v1/reply"
+        reply.mkdir(parents=True)
+        (reply / "t.json").write_text(json.dumps({"name": "app", "type": "EXECUTABLE"}))
+        (reply / "index-2.json").write_text(json.dumps({"targets": [{"name": "app", "jsonFile": "t.json"}]}))
+        (reply / "index-1.json").write_text(json.dumps({}))
+        names, index = ix.file_api_reply(build)
+        self.assertEqual(names, ["index-1.json", "index-2.json"])
+        self.assertEqual(ix.find_target(index, "app"), {"name": "app", "type": "EXECUTABLE"})
+        self.assertEqual(ix.find_target({"abstractTargets": [{"name": "e", "json": {"imported": True}}]}, "e"),
+                         {"imported": True})
+        self.assertEqual(ix.find_target(index, "absent"), {})
+
+    def test_without_install_layout(self) -> None:
+        value = {"json": {"entries": [{"name": "CMAKE_EDIT_COMMAND", "value": "/x/ccmake"},
+                                      {"name": "A", "value": "1"}]}}
+        self.assertEqual(ix.without_install_layout(value), {"json": {"entries": [{"name": "A", "value": "1"}]}})
+
+    def test_build_ninja_rules(self) -> None:
+        (self.tmp / "build.ninja").write_text(textwrap.dedent("""\
+            build dep$ sub/new.txt | ${cmake_ninja_workdir}dep$ sub/new.txt: CUSTOM_COMMAND
+              COMMAND = cd x && cmake -E cmake_transform_depfile Ninja gccdepfile CMakeFiles/d/%s.d
+              DESC = Generating new.txt
+              depfile = CMakeFiles/d/%s.d
+              deps = gcc
+            build dep$ sub/old.txt: CUSTOM_COMMAND
+              COMMAND = cd y
+              depfile = old.d
+            build other: phony dep$ sub/new.txt
+            """ % ("a" * 64, "b" * 64)))
+        self.assertEqual(ix.build_ninja_rules(self.tmp, "new.txt"), [
+            "COMMAND = cd x && cmake -E cmake_transform_depfile Ninja gccdepfile CMakeFiles/d/<HASH>.d",
+            "depfile = CMakeFiles/d/<HASH>.d", "deps = gcc"])
+        self.assertEqual(ix.build_ninja_rules(self.tmp, "old.txt"), ["COMMAND = cd y", "depfile = old.d"])
+        self.assertEqual(ix.build_ninja_rules(self.tmp / "none", "old.txt"), [])
+
+    def test_shared_names(self) -> None:
+        with mock.patch.object(ix, "DARWIN", True):
+            self.assertEqual(ix.shared_names("v", "1.0", "1"), ("libv.1.0.dylib", "@rpath/libv.1.dylib"))
+        with mock.patch.object(ix, "DARWIN", False):
+            self.assertEqual(ix.shared_names("v", "1.0", "1"), ("libv.so.1.0", "libv.so.1"))
+            self.assertIn("lib/libpkg_shared.so.2", ix.pkg_library_files())
+
+    def test_binary_inspection_parsers(self) -> None:
+        readelf = textwrap.dedent("""\
+             0x0000000000000001 (NEEDED)             Shared library: [libpkg_shared.so.2]
+             0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+             0x000000000000000e (SONAME)             Library soname: [libpkg_shared.so.2]
+             0x000000000000001d (RUNPATH)            Library runpath: [$ORIGIN/../lib]
+            """)
+        otool_l = ("Load command 12\n          cmd LC_LOAD_DYLIB\n      cmdsize 56\n"
+                   "         name @rpath/libpkg_shared.2.dylib (offset 24)\n"
+                   "Load command 13\n          cmd LC_LOAD_DYLIB\n      cmdsize 56\n"
+                   "         name /usr/lib/libSystem.B.dylib (offset 24)\n")
+        otool_big_l = ("app:\n\t@rpath/libpkg_shared.2.dylib (compatibility version 2.0.0, current version 2.3.4)\n"
+                       "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n")
+        outputs = {"readelf": readelf, "otool -l": otool_l, "otool -L": otool_big_l}
+        def fake(binary, *args):
+            return outputs.get(" ".join(args), "")
+        outputs["readelf -d"] = outputs.pop("readelf")
+        with mock.patch.object(ix, "tool_output", side_effect=fake):
+            self.assertEqual(ix.elf_dynamic(Path("x")), {
+                "NEEDED": ["libpkg_shared.so.2", "libc.so.6"], "SONAME": ["libpkg_shared.so.2"],
+                "RUNPATH": ["$ORIGIN/../lib"]})
+            self.assertEqual(ix.macho_load_dylibs(Path("x")), ["@rpath/libpkg_shared.2.dylib"])
+            self.assertEqual(ix.macho_versions(Path("x"), "@rpath/libpkg_shared.2.dylib"),
+                             "compatibility version 2.0.0, current version 2.3.4")
+            self.assertEqual(ix.macho_versions(Path("x"), "@rpath/absent.dylib"), "")
+        self.assertEqual(ix.tool_output(self.tmp, "/nonexistent/tool"), "")
+
+    def test_exported_symbols(self) -> None:
+        with mock.patch.object(ix, "DARWIN", True), \
+                mock.patch.object(ix, "tool_output", return_value="0000 T _pkg_a\n0000 T _pkg_b\nbad\n"):
+            self.assertEqual(ix.exported_symbols(Path("x")), ["pkg_a", "pkg_b"])
+        with mock.patch.object(ix, "DARWIN", False), \
+                mock.patch.object(ix, "tool_output", return_value="0000 T pkg_b\n0000 T pkg_a\n"):
+            self.assertEqual(ix.exported_symbols(Path("x")), ["pkg_a", "pkg_b"])
+
+    def test_write_tar_gz_is_reproducible(self) -> None:
+        one, two = self.tmp / "1.tar.gz", self.tmp / "2/2.tar.gz"
+        ix.write_tar_gz(one, "top", {"b.txt": "b\n", "a/x.txt": "\n    x\n"})
+        ix.write_tar_gz(two, "top", {"a/x.txt": "\n    x\n", "b.txt": "b\n"})
+        self.assertEqual(one.read_bytes(), two.read_bytes())
+        with tarfile.open(one) as tar:
+            self.assertEqual(tar.getnames(), ["top/a/x.txt", "top/b.txt"])
+            self.assertEqual(tar.extractfile("top/a/x.txt").read(), b"x\n")
+            self.assertTrue(all(m.mtime == ix.FIXED_EPOCH for m in tar.getmembers()))
+
+    def test_file_api_queries(self) -> None:
+        ix.write_file_api_queries(self.tmp)
+        query = self.tmp / ".cmake/api/v1/query"
+        self.assertEqual(sorted(p.name for p in query.iterdir()), [
+            "cache-v2", "client-indep", "client-other", "cmakeFiles-v1", "codemodel-v2", "configureLog-v1",
+            "toolchains-v1"])
+        data = json.loads((query / "client-indep/query.json").read_text())
+        self.assertEqual(len(data["requests"]), 7)
+
+    def test_result(self) -> None:
+        self.assertEqual(ix.result(iv.Proc([], "", 2, "o", "e", 0.0)), [2, "o", "e"])
 
 
 @unittest.skipUnless(
