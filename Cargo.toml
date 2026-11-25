@@ -143,6 +143,15 @@ strip = "symbols"
 debug = false
 incremental = false
 
+[profile.size-probe]
+inherits = "release"
+strip = false
+debug = false
+
+[profile.fuzz]
+inherits = "release"
+panic = "unwind"
+
 [profile.release-dev]
 inherits = "release"
 lto = "thin"
