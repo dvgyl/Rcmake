@@ -976,8 +976,8 @@ export class RcmakeWasmAdapter {
       if (typeof mod.default === "function") {
         await mod.default();
       }
-      if (typeof mod.configure_json !== "function") {
-        throw new Error("Module loaded but missing configure_json export.");
+      if (typeof mod.configure_json !== "function" || typeof mod.explain_json !== "function") {
+        throw new Error("Module loaded but missing configure_json or explain_json export.");
       }
       this.module = mod;
       this.mode = "wasm";
@@ -1021,7 +1021,15 @@ export class RcmakeWasmAdapter {
       const durationMs = typeof parsed.durationMs === "number"
         ? parsed.durationMs
         : Number((performance.now() - started).toFixed(2));
-      this._lastContext = { files, generator, buildType, exampleId, parsed };
+      this._lastContext = {
+        files,
+        generator,
+        buildType,
+        preset: options.preset || null,
+        defines: options.defines || {},
+        exampleId,
+        parsed
+      };
       return {
         mode: "wasm",
         editedInPreview: false,
@@ -1087,6 +1095,8 @@ export class RcmakeWasmAdapter {
           symbol: trimmed,
           generator: this._lastContext.generator,
           buildType: this._lastContext.buildType,
+          preset: this._lastContext.preset || null,
+          defines: this._lastContext.defines || {},
           config: options.config || this._lastContext.buildType
         })
       );
