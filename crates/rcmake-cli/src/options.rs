@@ -11,6 +11,8 @@ use crate::resolve_cli_path;
 mod cache;
 mod debug;
 mod diagnostics;
+#[allow(dead_code, reason = "Wave 1B connects this module to configure")]
+mod extensions;
 mod generator;
 mod presets;
 mod trace;

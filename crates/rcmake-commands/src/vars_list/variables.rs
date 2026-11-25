@@ -211,12 +211,12 @@ pub(super) fn unset(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if let Some(key) = wrapped(name, b"ENV{") {
         cx.host().env_set(key, None);
     } else if let Some(key) = wrapped(name, b"CACHE{") {
-        cx.cache().remove(key);
+        cx.remove_cache_entry(key);
     } else {
         match rest.first().map(bytes) {
             None => cx.unset_var(name),
             Some(b"CACHE") => {
-                cx.cache().remove(name);
+                cx.remove_cache_entry(name);
             }
             Some(b"PARENT_SCOPE") => cx.set_parent_scope(name, None),
             Some(_) => return Err(CmdError::status("called with an invalid second argument")),

@@ -8,13 +8,10 @@ mod lexical;
 mod syntax;
 mod tolerant;
 
-// For W0, add both lines under [dependencies] in crates/rcmake-fuzz/Cargo.toml.
-// rcmake-fortran.workspace = true
-// rcmake-store.workspace = true
-// Then register fortran and store_frame here and add their Surface entries.
-// Register binfmt when rcmake-base exports the binfmt module.
-// Register diagnostics when rcmake-diag exports annotate, rich, and suggest
-// and adds the annotations field to Diagnostic.
+mod binfmt;
+mod diagnostics;
+mod fortran;
+mod store_frame;
 
 use std::path::{Path, PathBuf};
 
@@ -39,6 +36,10 @@ pub(super) fn run(surface: Surface, seed: u64) -> Check {
         Surface::Archive => archive::check(&mut rng, &limits),
         Surface::Path => lexical::path_list(&mut rng, &limits),
         Surface::Tolerant => tolerant::check(&mut rng),
+        Surface::Binfmt => binfmt::check(&mut rng),
+        Surface::Diagnostics => diagnostics::check(&mut rng),
+        Surface::Fortran => fortran::check(&mut rng, &limits),
+        Surface::StoreFrame => store_frame::check(&mut rng),
     }
 }
 

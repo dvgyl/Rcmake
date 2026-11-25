@@ -54,7 +54,7 @@ pub(crate) enum ArchPhase {
 /// of an explicit target property before it passes architecture names to the compiler.
 pub(crate) fn target_architectures(target: &Target) -> Result<ArchSpec, BString> {
     let value = target.props.get(b"CUDA_ARCHITECTURES");
-    parse_architectures(value.map_or(b"", |value| value.as_slice())).map_err(|error| {
+    parse_architectures(value.map_or(b"".as_slice(), |value| value.as_slice())).map_err(|error| {
         format!(
             "Invalid CUDA_ARCHITECTURES property for target \"{}\". {error}",
             target.name
@@ -158,7 +158,8 @@ pub(crate) fn expand_architectures(
         ArchSpec::AllMajor => b"CMAKE_CUDA_ARCHITECTURES_ALL_MAJOR",
         ArchSpec::Native => b"CMAKE_CUDA_ARCHITECTURES_NATIVE",
     };
-    let values = definition(model, target.dir, key).map_or(b"", |value| value.as_slice());
+    let values =
+        definition(model, target.dir, key).map_or(b"".as_slice(), |value| value.as_slice());
     if matches!(spec, ArchSpec::Native) && values.is_empty() {
         return Err(
             "CUDA_ARCHITECTURES is set to \"native\", but no NVIDIA GPU was detected.".into(),
@@ -193,7 +194,9 @@ pub(crate) fn architecture_flags(
         return (Vec::new(), Vec::new());
     }
 
-    let get = |key: &[u8]| definition(model, target.dir, key).map_or(b"", |value| value.as_slice());
+    let get = |key: &[u8]| {
+        definition(model, target.dir, key).map_or(b"".as_slice(), |value| value.as_slice())
+    };
     let compiler = get(b"CMAKE_CUDA_COMPILER_ID");
     let version = get(b"CMAKE_CUDA_COMPILER_VERSION");
     let at_least = |minimum: &[u8]| version::compare(version, minimum).is_ge();
@@ -381,6 +384,7 @@ fn diagnostic(
     body: BString,
 ) -> Diagnostic {
     Diagnostic {
+        annotations: None,
         kind,
         effect,
         category: None,

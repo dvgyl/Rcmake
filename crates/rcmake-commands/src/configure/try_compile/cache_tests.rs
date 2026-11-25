@@ -9,7 +9,7 @@ use rcmake_store::{Digest, InputStamp, StoreConfig, Trace, file_digest};
 
 use super::super::journal::{
     DependencyClosure, ImpureReason, JournalHost, JournalMode, ProcessVerifier, SearchObservation,
-    make_dependencies,
+    depfile::make_dependencies,
 };
 use super::super::plan::{Admission, DiagnosticStream, RcmakeBuildId, environment_fingerprint};
 use super::super::template::PathBindings;
@@ -162,6 +162,7 @@ fn enforces_bypass_purity_and_verify_mode() -> HostResult<()> {
     ));
     assert!(cache.lookup(&host, &store, &recipe).is_none());
     assert_eq!(cache.stats().impure, 1);
+    host.env_set(b"LC_ALL", None);
 
     let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?.finish();
     assert_eq!(

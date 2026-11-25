@@ -26,14 +26,22 @@ use super::plan::{environment_fingerprint, request_digest};
 use depfile::missing_input_diagnostic;
 
 #[path = "depfile.rs"]
-mod depfile;
+pub(super) mod depfile;
 #[path = "journal_host.rs"]
 mod host_impl;
 
-pub(crate) use depfile::{make_dependencies, msvc_dependencies, msvc_show_includes};
-
 /// Total time budget for one queued and running speculative job.
 pub(crate) const SPECULATIVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Read the clock that limits real worker waits and processes.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "The limit must also work with a fixed host clock"
+)]
+pub(crate) fn speculative_now() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
 const MAX_PROCESS_OUTPUT: usize = 4 * 1024 * 1024;
 
 /// The first operation that prevented cache publication.
@@ -728,9 +736,7 @@ impl<'a> JournalHost<'a> {
         let Some(spec) = &self.speculation else {
             return Ok(());
         };
-        let remaining = spec
-            .deadline
-            .saturating_duration_since(std::time::Instant::now());
+        let remaining = spec.deadline.saturating_duration_since(speculative_now());
         if spec.cancel.is_cancelled() || spec.shutdown.is_cancelled() || remaining.is_zero() {
             self.mark_impure(ImpureReason::ProcessFailure);
             return Err(HostError::unsupported(

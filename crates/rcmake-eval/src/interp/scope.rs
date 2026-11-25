@@ -32,6 +32,11 @@ impl Interp {
             return;
         }
         let watched = self.watches.contains_key(name).then(|| value.clone());
+        self.record_var_write(
+            name,
+            crate::VarOp::ParentScope,
+            value.as_ref().map(|v| v.as_slice()),
+        );
         if !self.vars.set_parent(name, value) {
             self.issue_here(
                 MessageKind::AuthorWarning,

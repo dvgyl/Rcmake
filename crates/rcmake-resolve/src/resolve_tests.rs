@@ -69,6 +69,7 @@ fn target(name: &str, kind: TargetKind, sources: &[&str]) -> Target {
 
 fn link_item(name: &str) -> LinkItem {
     LinkItem {
+        scope: None,
         text: entry(name),
         lookup_dir: DirId::ROOT,
     }
@@ -1648,7 +1649,7 @@ fn lowers_clang_module_scans_and_linked_module_inputs() -> TestResult {
         target, implicit_inputs, depend_info, ..
     } if target == "app"
         && implicit_inputs == &[consumer.tdi.clone(), format!("{}/CXXModules.json", producer.module_dir).into()]
-        && depend_info.linked_target_dirs == consumer.linked_target_dirs)));
+        && matches!(depend_info.as_ref(), crate::DependInfo::Cxx(info) if info.linked_target_dirs == consumer.linked_target_dirs))));
     Ok(())
 }
 
@@ -1965,6 +1966,7 @@ fn xcode_ide_facts_keep_raw_settings_and_resolve_apple_artifacts() -> TestResult
         &host,
         &configs,
         &ResolveOptions {
+            provenance: false,
             ide: Some(IdeFlavor::Xcode),
         },
     )?;
@@ -2199,6 +2201,7 @@ fn visual_studio_layout_and_per_configuration_source_union() -> TestResult {
         &host,
         &[ConfigId("Debug".into()), ConfigId("Release".into())],
         &ResolveOptions {
+            provenance: false,
             ide: Some(IdeFlavor::VisualStudio),
         },
     )?;
@@ -2286,6 +2289,7 @@ fn xcode_rejects_sources_that_vary_by_configuration() -> TestResult {
             ConfigId("RelWithDebInfo".into()),
         ],
         &ResolveOptions {
+            provenance: false,
             ide: Some(ide::IdeFlavor::Xcode),
         },
     );
@@ -2333,8 +2337,15 @@ fn default_resolve_keeps_ninja_and_make_layouts() -> TestResult {
         model.generator = Some(generator);
         let configs = [ConfigId("Debug".into())];
         let legacy = resolve(&model, &host, &configs)?;
-        let explicit =
-            resolve_with_options(&model, &host, &configs, &ResolveOptions { ide: None })?;
+        let explicit = resolve_with_options(
+            &model,
+            &host,
+            &configs,
+            &ResolveOptions {
+                provenance: false,
+                ide: None,
+            },
+        )?;
         assert_eq!(legacy.graphs, explicit.graphs);
         assert!(
             legacy
@@ -2373,6 +2384,7 @@ fn xcode_reports_configuration_with_no_sources_before_link_language_error() -> T
         &host,
         &[ConfigId("Debug".into()), ConfigId("Release".into())],
         &ResolveOptions {
+            provenance: false,
             ide: Some(ide::IdeFlavor::Xcode),
         },
     );
@@ -2425,6 +2437,7 @@ fn xcode_uses_root_object_directory_for_subdirectory_targets() -> TestResult {
             &host,
             std::slice::from_ref(&debug),
             &ResolveOptions {
+                provenance: false,
                 ide: Some(IdeFlavor::Xcode),
             },
         )?;
@@ -2461,6 +2474,7 @@ fn xcode_resolves_embed_paths_and_records_per_config_diagnostic() -> TestResult 
     host.seed_file(Path::new("/src/main.c"), b"")?;
     let configs = [ConfigId("Debug".into())];
     let options = ResolveOptions {
+        provenance: false,
         ide: Some(IdeFlavor::Xcode),
     };
     let result = resolve_with_options(&model, &host, &configs, &options)?;

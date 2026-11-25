@@ -33,6 +33,8 @@ mod explain_render;
 mod index;
 mod overlay_diff;
 mod result;
+mod runner;
+pub use runner::run_configure;
 mod variable_history;
 
 pub use config::{ApiError, ConfigureRequest, PreparedConfigure, ProcessPolicy, WriteMode};

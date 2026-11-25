@@ -156,15 +156,20 @@ pub fn write_module_exports(
                                 ddis,
                                 depend_info,
                                 ..
-                            } if name == &target.name => Some((
-                                dd,
-                                ddis,
-                                depend_info
-                                    .bmi_installation
-                                    .as_ref()
-                                    .map(|install| install.destination.as_slice())
-                                    .filter(|destination| !destination.is_empty()),
-                            )),
+                            } if name == &target.name => {
+                                let rcmake_resolve::DependInfo::Cxx(info) = depend_info.as_ref()
+                                else {
+                                    return None;
+                                };
+                                Some((
+                                    dd,
+                                    ddis,
+                                    info.bmi_installation
+                                        .as_ref()
+                                        .map(|install| install.destination.as_slice())
+                                        .filter(|destination| !destination.is_empty()),
+                                ))
+                            }
                             _ => None,
                         })
                     else {

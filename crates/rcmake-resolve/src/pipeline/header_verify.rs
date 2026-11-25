@@ -400,6 +400,7 @@ fn verification_target(
             if original.kind != TargetKind::Executable || is_on(original, b"ENABLE_EXPORTS") =>
         {
             target.usage.link_libraries = Some(vec![LinkItem {
+                scope: None,
                 text: original_name,
                 lookup_dir: original.dir,
             }]);
@@ -576,6 +577,7 @@ fn policy_warning(model: &ProjectModel, host: &dyn Host, target: &Target) {
         target.name
     );
     let diag = Diagnostic {
+        annotations: None,
         kind: MessageKind::AuthorWarning,
         effect: Effect::None,
         category: Some(DiagCategory::Policy),

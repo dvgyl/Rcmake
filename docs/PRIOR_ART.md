@@ -24,8 +24,8 @@ The licence expression lists the upstream terms. Rcmake uses an option on the sc
 | `md-5` | `0.10.6` | `MIT OR Apache-2.0` | Calculate MD5 hashes and generate stable Visual Studio identifiers. |
 | `memchr` | `2.8.3` | `Unlicense OR MIT` | Find bytes for list parsing and other byte operations. |
 | `rustix` | `1.1.6` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | Give the host safe access to POSIX system calls, including `uname` and process-group operations. |
-| `serde` | `1.0.229` | `MIT OR Apache-2.0` | Define the test harness data that can be read from or written to a file. |
-| `serde_json` | `1.0.154` | `MIT OR Apache-2.0` | Read and write JSON manifests in the test harness. |
+| `serde` | `1.0.229` | `MIT OR Apache-2.0` | Define file records for the test harness, evaluator journal, and probe cache. |
+| `serde_json` | `1.0.154` | `MIT OR Apache-2.0` | Read and write test harness manifests and evaluator journal records. |
 | `sha1` | `0.10.7` | `MIT OR Apache-2.0` | Calculate SHA-1 hashes for CMake commands. |
 | `sha2` | `0.10.9` | `MIT OR Apache-2.0` | Calculate SHA-2 hashes and generate stable Xcode identifiers. |
 | `sha3` | `0.10.9` | `MIT OR Apache-2.0` | Calculate SHA-3 hashes for CMake commands. |

@@ -76,7 +76,7 @@ pub(crate) fn emit(
         .collect();
     let output = graph.node(output);
     match mode {
-        DeviceLinkMode::Driver { invocation } => {
+        DeviceLinkMode::Driver { invocation, .. } => {
             ninja.edge(
                 b"CUDA_DEVICE_LINK",
                 Edge {
@@ -123,7 +123,6 @@ pub(crate) fn emit(
                         inputs: &inputs,
                         implicit_inputs: &implicit_inputs,
                         order_only: &order_only,
-                        ..Edge::default()
                     },
                 );
                 ninja.invocation(graph, &cubin.invocation);
@@ -283,6 +282,7 @@ mod tests {
             output: "obj/device link.o".into(),
             inputs: vec!["z.a".into(), "a $.o".into(), "z.a".into()],
             mode: DeviceLinkMode::Driver {
+                response_file: None,
                 invocation: invocation(&["cuda nvcc", "-dlink", "z.a", "a $.o"]),
             },
         };
@@ -299,11 +299,11 @@ mod tests {
             "build obj/device$ link.o: CUDA_DEVICE_LINK a$ $$.o z.a | device$ script.ld || order\n"
         ));
         let argv = if cfg!(windows) {
-            "  COMMAND = \"cuda$ nvcc\"$ -dlink$ z.a$ \"a$ $$.o\"\n"
+            "  COMMAND = \"cuda nvcc\" -dlink z.a \"a $$.o\"\n"
         } else {
-            "  COMMAND = 'cuda$ nvcc'$ -dlink$ z.a$ 'a$ $$.o'\n"
+            "  COMMAND = 'cuda nvcc' -dlink z.a 'a $$.o'\n"
         };
-        assert!(text.contains(argv));
+        assert!(text.contains(argv), "{text}");
         Ok(())
     }
 

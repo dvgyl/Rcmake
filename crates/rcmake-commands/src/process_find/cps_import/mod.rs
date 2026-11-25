@@ -68,6 +68,7 @@ impl PackageDiagnostic {
             })
         });
         let diagnostic = Diagnostic {
+            annotations: None,
             kind,
             effect: Effect::None,
             category: None,

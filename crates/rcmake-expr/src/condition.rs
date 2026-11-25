@@ -381,6 +381,7 @@ fn warn_policy(id: PolicyId, note: &str, env: &mut dyn CondEnv) {
         body.push_str(note);
     }
     env.warn(Diagnostic {
+        annotations: None,
         kind: MessageKind::AuthorWarning,
         effect: Effect::None,
         category: Some(DiagCategory::Policy),

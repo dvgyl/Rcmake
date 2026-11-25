@@ -28,6 +28,7 @@ impl UsageResolver<'_> {
         id: TargetId,
         ctx: &EvalContext,
         value: &mut UsageValue,
+        mut chains: Option<&mut super::UsagePaths>,
     ) -> Result<(), ResolveError> {
         let target = self.target(id)?;
         let prefix = if target.kind == TargetKind::StaticLibrary {
@@ -44,7 +45,11 @@ impl UsageResolver<'_> {
             prefix,
         );
         let mut result = Vec::new();
+        let mut original_chains = chains
+            .as_mut()
+            .map(|chains| std::mem::take(*chains).into_iter());
         for entry in std::mem::take(&mut value.entries) {
+            let path = original_chains.as_mut().and_then(Iterator::next);
             let args = entry
                 .value
                 .strip_prefix(b"SHELL:")
@@ -64,6 +69,9 @@ impl UsageResolver<'_> {
                         error
                     }
                 })?;
+                if let (Some(chains), Some(path)) = (chains.as_deref_mut(), path.as_ref()) {
+                    chains.extend(std::iter::repeat_with(|| path.clone()).take(args.len()));
+                }
                 result.extend(args.into_iter().map(|arg| {
                     // Preserve literal prefixes through link fragment lowering.
                     let arg = if arg.starts_with(b"LINKER:") || arg.starts_with(b"SHELL:") {

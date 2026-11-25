@@ -224,6 +224,7 @@ pub(crate) fn component(target: &Target, namespace: &[u8]) -> BString {
 
 pub(crate) fn generator_diagnostic(body: impl Into<BString>, author_warning: bool) -> BString {
     let diagnostic = Diagnostic {
+        annotations: None,
         kind: if author_warning {
             MessageKind::AuthorWarning
         } else {
@@ -266,6 +267,7 @@ pub(crate) fn author_warning(
         });
     Some(render(
         &Diagnostic {
+            annotations: None,
             kind: MessageKind::AuthorWarning,
             effect: Effect::None,
             category: Some(DiagCategory::Author),

@@ -49,6 +49,7 @@ fn writes_hierarchy_and_escapes_make_and_shell_words() {
                     ..CustomStep::default()
                 }),
                 BuildStep::Compile {
+                    compile_input: None,
                     object: "obj $/foo.o".into(),
                     source: "/src/source file.c".into(),
                     invocation: invocation("cc -o 'obj $/foo.o' -c '/src/source file.c'"),

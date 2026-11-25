@@ -517,7 +517,7 @@ impl Interp {
             ForeachPlan::Items { var, items } => {
                 let saved = self.loop_var_saved(&var);
                 for item in items {
-                    if self.over_budget() {
+                    if self.over_budget() || (start == end && !self.take_step()) {
                         return Err(CmdError::Reported);
                     }
                     self.define(&var, item);
@@ -541,7 +541,7 @@ impl Interp {
                 let saved = self.loop_var_saved(&var);
                 let mut value = first;
                 for _ in 0..count {
-                    if self.over_budget() {
+                    if self.over_budget() || (start == end && !self.take_step()) {
                         return Err(CmdError::Reported);
                     }
                     self.define(&var, value.to_string().into());
@@ -562,7 +562,7 @@ impl Interp {
                     vars.iter().map(|v| self.loop_var_saved(v)).collect();
                 let max = lists.iter().map(Vec::len).max().unwrap_or(0);
                 for n in 0..max {
-                    if self.over_budget() {
+                    if self.over_budget() || (start == end && !self.take_step()) {
                         return Err(CmdError::Reported);
                     }
                     for (var, list) in vars.iter().zip(&lists) {
@@ -631,10 +631,12 @@ impl Interp {
         cmd: &CommandInvocation,
     ) -> CmdResult {
         let bt = self.command_backtrace(&code.file, cmd.line, &cmd.name);
+        let mut repeated = false;
         loop {
-            if self.fatal || self.over_budget() {
+            if self.fatal || self.over_budget() || (repeated && !self.take_step()) {
                 return Err(CmdError::Reported);
             }
+            repeated = true;
             let outcome = self.with_plain_backtrace(bt.clone(), cmd.line, |this| {
                 let expanded = this.expand(&cmd.args)?;
                 Ok::<_, CmdError>((this.eval_command_condition(&expanded), expanded))
@@ -891,6 +893,7 @@ mod tests {
             let host = Arc::new(PureHost::default());
             let mut interp = Interp::new(
                 InterpConfig {
+                    services: Default::default(),
                     host: host.clone(),
                     mode: RunMode::Script,
                     cmake_root: PathBuf::new(),

@@ -437,6 +437,7 @@ fn new_interp(files: &[(&str, &str)], mode: RunMode) -> (Interp, Arc<PureHost>) 
             .expect("seed file");
     }
     let config = InterpConfig {
+        services: Default::default(),
         host: host.clone(),
         mode,
         cmake_root: PathBuf::from(ROOT),
@@ -790,6 +791,7 @@ fn cli_defines_are_cache_entries() {
     )
     .unwrap();
     let config = InterpConfig {
+        services: Default::default(),
         host: host.clone(),
         mode: RunMode::Script,
         cmake_root: PathBuf::from(ROOT),
@@ -1533,6 +1535,7 @@ fn issue_marks_command_failed_and_fatal_in_script_mode() {
     )
     .unwrap();
     let config = InterpConfig {
+        services: Default::default(),
         host: host.clone(),
         mode: RunMode::Script,
         cmake_root: PathBuf::from(ROOT),

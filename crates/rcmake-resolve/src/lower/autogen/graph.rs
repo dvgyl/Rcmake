@@ -811,7 +811,7 @@ impl GlobalUtilities {
         ] {
             let Some(origin) = model
                 .targets()
-                .find(|(_, target)| deps.iter().any(|name| target.name == *name))
+                .find(|(_, target)| deps.contains(&target.name))
                 .map(|(_, target)| target.clone())
             else {
                 continue;

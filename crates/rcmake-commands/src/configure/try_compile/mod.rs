@@ -18,11 +18,23 @@ use run::{build_child, run_executable};
 use seed::{TryCompileSeed, probe_imports};
 
 mod args;
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
+pub(super) mod cache;
 mod capture;
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
+pub(super) mod journal;
 mod log;
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
+pub(super) mod plan;
 mod project;
 mod run;
 mod seed;
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
+mod template;
 #[cfg(test)]
 mod tests;
 
@@ -233,6 +245,9 @@ fn probe(cx: &mut Cx<'_>, args: &[ExpandedArg], run: bool) -> CmdResult {
 }
 
 fn process_denial(host: &dyn Host) -> Option<BString> {
+    if host.supports_process_execution() {
+        return None;
+    }
     // An empty pipeline cannot start a process. Denying hosts reject the request
     // before pipeline validation.
     let request = RunRequest {
@@ -250,10 +265,7 @@ fn process_denial(host: &dyn Host) -> Option<BString> {
     {
         return Some(error.os_message.into());
     }
-    if cfg!(target_family = "wasm") {
-        return Some("The host does not support the test build.".into());
-    }
-    None
+    Some("The host does not support the test build.".into())
 }
 
 fn build_probe(
@@ -311,9 +323,14 @@ fn build_probe(
     let generator_spec = cx.project().generator_spec.clone();
     let save_cache = dirs.scratch.is_none() || cx.var_is_on(b"CMAKE_DEBUG_TRY_COMPILE");
     let mut recursion_exceeded = false;
-    let (build, mut output) = CapturingHost::capture(cx.host(), &dirs.binary, |host| {
+    let services = std::sync::Arc::new(rcmake_eval::Services {
+        cancel: cx.services().cancel.clone(),
+        ..Default::default()
+    });
+    let (build, mut output) = CapturingHost::capture(cx.host_arc(), &dirs.binary, |host| {
         let mut child = Interp::new(
             InterpConfig {
+                services,
                 host: host.clone(),
                 mode: RunMode::Configure,
                 cmake_root,
@@ -374,8 +391,7 @@ fn build_probe(
             ));
         }
         build_child(&mut child.cx(), &dirs.binary, target, source_signature)
-    })
-    .map_err(error_text)?;
+    });
     if recursion_exceeded {
         cx.host().write_out(rcmake_host::Stream::Stderr, &output);
         cx.fail_nested_recursion();

@@ -80,6 +80,9 @@ pub struct ProjectModel {
     tests: Vec<TestEntry>,
     file_sets: Vec<FileSet>,
     global_targets: IndexMap<BString, TargetBinding>,
+    languages: crate::LanguageRegistry,
+    prop_ledger: Option<Box<crate::PropLedger>>,
+    prop_seq: u64,
 }
 
 fn push_arena<T, I>(
@@ -93,6 +96,74 @@ fn push_arena<T, I>(
 }
 
 impl ProjectModel {
+    /// Get the project cache.
+    #[must_use]
+    pub fn cache(&self) -> &Cache {
+        &self.cache
+    }
+
+    /// Get the mutable project cache.
+    pub fn cache_mut(&mut self) -> &mut Cache {
+        &mut self.cache
+    }
+
+    /// Get the enabled language registry.
+    #[must_use]
+    pub fn languages(&self) -> &crate::LanguageRegistry {
+        &self.languages
+    }
+
+    /// Get the mutable language registry.
+    pub fn languages_mut(&mut self) -> &mut crate::LanguageRegistry {
+        &mut self.languages
+    }
+
+    /// Get the property history, if enabled.
+    #[must_use]
+    pub fn prop_ledger(&self) -> Option<&crate::PropLedger> {
+        self.prop_ledger.as_deref()
+    }
+
+    /// Set the property history for this model.
+    pub fn set_prop_ledger(&mut self, ledger: Option<Box<crate::PropLedger>>) {
+        self.prop_ledger = ledger;
+    }
+
+    /// Iterate over global names and bindings in registration order.
+    pub fn global_target_bindings(&self) -> impl Iterator<Item = (&BString, TargetBinding)> {
+        self.global_targets
+            .iter()
+            .map(|(name, binding)| (name, *binding))
+    }
+
+    fn record_prop(
+        &mut self,
+        scope: &PropScope,
+        name: &[u8],
+        op: crate::PropOp,
+        old: Option<BString>,
+        origin: PropOrigin<'_>,
+    ) {
+        if self.prop_ledger.is_none() {
+            return;
+        }
+        let new = self.get_prop(scope, name);
+        if let Some(ledger) = &mut self.prop_ledger {
+            self.prop_seq = self.prop_seq.saturating_add(1);
+            ledger.record(
+                scope,
+                name,
+                crate::PropEvent::new(
+                    self.prop_seq,
+                    op,
+                    old.as_ref().map(|v| v.as_slice()),
+                    new.as_ref().map(|v| v.as_slice()),
+                    origin.backtrace,
+                ),
+            );
+        }
+    }
+
     /// Look up a variable definition as seen at the end of configuring `dir`:
     /// normal variable snapshot first, else `CMakeCache.txt` value.
     #[must_use]
@@ -527,6 +598,27 @@ impl ProjectModel {
         value: Option<BString>,
         origin: PropOrigin<'_>,
     ) -> Result<(), ModelError> {
+        let old = self
+            .prop_ledger
+            .as_ref()
+            .and_then(|_| self.get_prop(scope, name));
+        let op = if value.is_some() {
+            crate::PropOp::Set
+        } else {
+            crate::PropOp::Unset
+        };
+        self.set_prop_value(scope, name, value, origin)?;
+        self.record_prop(scope, name, op, old, origin);
+        Ok(())
+    }
+
+    fn set_prop_value(
+        &mut self,
+        scope: &PropScope,
+        name: &[u8],
+        value: Option<BString>,
+        origin: PropOrigin<'_>,
+    ) -> Result<(), ModelError> {
         match scope {
             PropScope::Global => {
                 set_map(&mut self.global.props, name, value);
@@ -605,7 +697,12 @@ impl ProjectModel {
         if value.is_empty() {
             return Ok(());
         }
+        let previous = self
+            .prop_ledger
+            .as_ref()
+            .and_then(|_| self.get_prop(scope, name));
         if mode == AppendMode::List && self.append_entry(scope, name, value, origin)? {
+            self.record_prop(scope, name, crate::PropOp::Append(mode), previous, origin);
             return Ok(());
         }
         let old = match scope {
@@ -622,7 +719,9 @@ impl ProjectModel {
             (Some(old), AppendMode::String) => [old.as_slice(), value].concat().into(),
             _ => BString::from(value),
         };
-        self.set_prop(scope, name, Some(new), origin)
+        self.set_prop_value(scope, name, Some(new), origin)?;
+        self.record_prop(scope, name, crate::PropOp::Append(mode), previous, origin);
+        Ok(())
     }
 
     /// Append one backtrace-tagged entry to a usage, `SOURCES`, or link property.
@@ -654,6 +753,7 @@ impl ProjectModel {
                             &mut usage.interface_link_libraries
                         };
                         items.get_or_insert_default().push(LinkItem {
+                            scope: None,
                             text: entry,
                             lookup_dir: origin.dir,
                         });
@@ -709,6 +809,7 @@ fn set_target_prop(
                 let mut items = Vec::new();
                 if !v.is_empty() {
                     items.push(LinkItem {
+                        scope: None,
                         text: bt(v),
                         lookup_dir: origin.dir,
                     });

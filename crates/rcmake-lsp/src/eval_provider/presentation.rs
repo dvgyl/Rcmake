@@ -324,6 +324,8 @@ fn append_list<'a>(
 fn prose(text: &str, markdown: bool) -> String {
     if markdown {
         escape_markdown(text)
+            .replace('_', "\\_")
+            .replace('.', "\\.")
     } else {
         text.to_owned()
     }

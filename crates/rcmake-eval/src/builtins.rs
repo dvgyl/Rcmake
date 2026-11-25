@@ -487,6 +487,7 @@ fn display_message(
         state.set(cat, action, false);
     }
     let diag = Diagnostic {
+        annotations: None,
         kind,
         effect,
         category: category.map(|(c, _)| c),

@@ -31,6 +31,7 @@ const FOO: &str = r#"
 fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Interp {
     Interp::new(
         InterpConfig {
+            services: Default::default(),
             host,
             mode: RunMode::Configure,
             cmake_root: "/cmake".into(),

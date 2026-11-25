@@ -83,6 +83,7 @@ fn resolve_target(
     };
     let artifacts = compute_artifacts(model, &raw, config);
     Ok(ResolvedTarget {
+        fortran: None,
         id: model.add_target(raw)?,
         config: config.clone(),
         metadata,
@@ -219,6 +220,7 @@ fn windows_ninja_links_resources_and_import_libraries() -> TestResult {
         ["shared", "sdk", "bare", "ready.LIB"]
             .into_iter()
             .map(|name| LinkItem {
+                scope: None,
                 text: bt(name),
                 lookup_dir: DirId::ROOT,
             })
@@ -338,6 +340,7 @@ fn windows_ninja_links_resources_and_import_libraries() -> TestResult {
                 inputs,
                 step,
                 invocations,
+                ..
             } if step.kind == kind => Some((inputs, invocations)),
             _ => None,
         })
@@ -473,6 +476,10 @@ fn executable_rules_preserve_paths_and_library_inputs() -> TestResult {
     main.props.set("OUTPUT_NAME_DEBUG".into(), "my app".into());
     main.props
         .set("RUNTIME_OUTPUT_DIRECTORY_DEBUG".into(), "my bin".into());
+    main.props.set(
+        "LINK_DEPENDS".into(),
+        "custom.ld;custom.ld;main file.c".into(),
+    );
     let mut target = resolve_target(&mut model, main, &config, &["main file.c"])?;
     assert_eq!(target.artifacts.file, Some("/build/my bin/my app".into()));
     target.link = Some(LinkStep {
@@ -499,6 +506,7 @@ fn executable_rules_preserve_paths_and_library_inputs() -> TestResult {
         },
         BuildStep::Link {
             inputs,
+            implicit_inputs,
             step,
             invocations,
         },
@@ -524,6 +532,10 @@ fn executable_rules_preserve_paths_and_library_inputs() -> TestResult {
     assert_eq!(
         *inputs,
         ["CMakeFiles/main.dir/main_file.c.o", "/other libs/libx.a"]
+    );
+    assert_eq!(
+        *implicit_inputs,
+        ["/project/custom.ld", "/project/main file.c"]
     );
     let [linker] = invocations.as_slice() else {
         return Err("Expected one linker invocation.".into());

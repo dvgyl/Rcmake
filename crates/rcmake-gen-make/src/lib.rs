@@ -3,10 +3,22 @@
 #![forbid(unsafe_code)]
 
 mod build;
+#[allow(
+    dead_code,
+    reason = "The language activation wave uses this emitter or planner"
+)]
+mod cuda;
+#[allow(
+    dead_code,
+    reason = "The language activation wave uses this emitter or planner"
+)]
+mod fortran;
+mod plan_step;
 mod prep;
 mod progress;
 
 pub use build::build_commands;
+use plan_step::plan_step;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
@@ -152,69 +164,6 @@ fn build_path(value: &[u8], build_dir: &Path) -> BString {
     let path = path.strip_prefix(build_dir).unwrap_or(&path);
     let path: std::path::PathBuf = path.components().collect();
     rcmake_base::path_lex::cmake_style(&path::from_native(&path))
-}
-
-fn plan_step<'a>(
-    action: &'a BuildStep,
-    step_index: usize,
-    result: &GenerationResult,
-    build_dir: &Path,
-) -> Result<Step<'a>, GenError> {
-    let make_path = |value: &BString| build_path(value, build_dir);
-    let step = match action {
-        BuildStep::Compile {
-            object,
-            source,
-            depfile,
-            ..
-        } => Step {
-            action,
-            goal: make_path(object),
-            outputs: vec![make_path(object)],
-            inputs: std::iter::once(source)
-                .chain(result.compile_inputs.get(object).into_iter().flatten())
-                .map(make_path)
-                .collect(),
-            depfile: depfile.as_ref().map(make_path),
-            always: false,
-            progress: None,
-            jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
-        },
-        BuildStep::Link { step, inputs, .. } => Step {
-            action,
-            goal: make_path(&step.output),
-            outputs: vec![make_path(&step.output)],
-            inputs: inputs.iter().map(make_path).collect(),
-            depfile: None,
-            always: false,
-            progress: None,
-            jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
-        },
-        BuildStep::Custom(custom) => Step {
-            action,
-            goal: custom.outputs.first().map_or_else(
-                || format!("CMakeFiles/rcmake-step-{step_index}").into(),
-                make_path,
-            ),
-            outputs: custom
-                .outputs
-                .iter()
-                .chain(&custom.byproducts)
-                .map(make_path)
-                .collect(),
-            inputs: custom.depends.clone(),
-            depfile: custom.depfile.as_ref().map(make_path),
-            always: custom.outputs.is_empty() || custom.symbolic,
-            progress: None,
-            jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
-        },
-        BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
-            return Err(GenError::Unimplemented(
-                "C++ module build steps for Unix Makefiles",
-            ));
-        }
-    };
-    Ok(step)
 }
 
 fn plan_targets<'a>(
@@ -733,6 +682,9 @@ fn write_step(
                 .map_or_else(Vec::new, |comment| comment.to_vec()),
             custom.invocations.as_slice(),
         ),
+        BuildStep::DeviceLink { .. } => {
+            return Err(GenError::Unimplemented("device linking for Unix Makefiles"));
+        }
         // Step collection rejects module steps before recipes are written.
         BuildStep::Scan { .. } | BuildStep::Collate { .. } => (Vec::new(), [].as_slice()),
     };

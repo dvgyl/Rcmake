@@ -4,10 +4,10 @@
 #![deny(missing_docs)]
 
 mod analysis;
-// Use the shared annotation types until rcmake-diag exports this module.
-#[path = "../../rcmake-diag/src/annotate.rs"]
-pub mod annotate;
+pub use rcmake_diag::annotate;
 mod catalog;
+#[cfg(feature = "eval")]
+pub mod eval_provider;
 mod expression;
 mod features;
 mod generated_catalog;
@@ -28,8 +28,6 @@ use std::ops::Range;
 
 use annotate::Annotations;
 use rcmake_diag::{Diagnostic, SourceId};
-#[cfg(test)]
-use rcmake_diag::{SourceMap, source};
 use rcmake_json::Value;
 
 /// Current in-memory document and cursor information for a semantic provider.

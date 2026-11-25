@@ -23,11 +23,19 @@ pub enum Surface {
     Path,
     /// `rcmake-syntax`: recover syntax from an editor buffer.
     Tolerant,
+    /// Check the binfmt surface.
+    Binfmt,
+    /// Check the diagnostics surface.
+    Diagnostics,
+    /// Check the fortran surface.
+    Fortran,
+    /// Check the store-frame surface.
+    StoreFrame,
 }
 
 impl Surface {
     /// All surfaces, with the original ADR-016 surfaces first.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 14] = [
         Self::Syntax,
         Self::Expr,
         Self::Regex,
@@ -38,6 +46,10 @@ impl Surface {
         Self::Archive,
         Self::Path,
         Self::Tolerant,
+        Self::Binfmt,
+        Self::Diagnostics,
+        Self::Fortran,
+        Self::StoreFrame,
     ];
 
     /// Command-line name of the surface.
@@ -54,6 +66,10 @@ impl Surface {
             Self::Archive => "archive",
             Self::Path => "path",
             Self::Tolerant => "tolerant",
+            Self::Binfmt => "binfmt",
+            Self::Diagnostics => "diagnostics",
+            Self::Fortran => "fortran",
+            Self::StoreFrame => "store-frame",
         }
     }
 

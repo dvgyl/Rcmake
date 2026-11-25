@@ -90,6 +90,7 @@ fn run(host: &NativeHost, cwd: &Path, program: &str, args: &[&str]) -> String {
 fn compile(source: &str, object: &str) -> BuildStep {
     let depfile = format!("{object}.d");
     BuildStep::Compile {
+        compile_input: None,
         object: object.into(),
         source: source.into(),
         invocation: invocation(&format!(
@@ -103,6 +104,7 @@ fn compile(source: &str, object: &str) -> BuildStep {
 
 fn link(kind: LinkKind, inputs: &[&str], output: &str, commands: &[&str]) -> BuildStep {
     BuildStep::Link {
+        implicit_inputs: Vec::new(),
         inputs: inputs.iter().copied().map(BString::from).collect(),
         step: LinkStep {
             kind,

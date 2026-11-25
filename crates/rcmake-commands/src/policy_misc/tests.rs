@@ -15,6 +15,7 @@ fn context(mode: RunMode) -> (Arc<PureHost>, Interp) {
     let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
     let interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: host.clone(),
             mode,
             cmake_root: "/share/cmake-4.5".into(),

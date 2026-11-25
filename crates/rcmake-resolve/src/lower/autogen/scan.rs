@@ -443,6 +443,7 @@ fn is_file(host: &dyn Host, path: &[u8]) -> bool {
 /// Create an author warning at the target declaration.
 pub(super) fn warning(target: &Target, policy: Option<PolicyId>, body: BString) -> Diagnostic {
     Diagnostic {
+        annotations: None,
         kind: MessageKind::AuthorWarning,
         effect: Effect::None,
         category: None,

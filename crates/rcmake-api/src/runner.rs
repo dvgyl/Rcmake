@@ -77,6 +77,30 @@ impl PreparedConfigure {
         } else {
             host
         };
+        let mut runtime = rcmake_commands::ConfigureRuntime::new(
+            host,
+            &prepared.source_dir,
+            &prepared.build_dir,
+            &prepared.services,
+            false,
+        );
+        let result = prepared.evaluate_in(&mut runtime, generator, command, &reads);
+        let complete = result.as_ref().is_ok_and(|result| {
+            result.completion == CompletionState::Complete && prepared.denied_processes().is_empty()
+        });
+        runtime.finish(complete);
+        result
+    }
+
+    fn evaluate_in(
+        &self,
+        runtime: &mut rcmake_commands::ConfigureRuntime,
+        generator: GeneratorKind,
+        command: PathBuf,
+        reads: &Mutex<SourceReads>,
+    ) -> Result<ConfigureResult, ApiError> {
+        let prepared = self;
+        let host = runtime.host();
         let config = InterpConfig {
             host: Arc::clone(&host),
             mode: RunMode::Configure,
@@ -102,9 +126,7 @@ impl PreparedConfigure {
         let outcome = if interp.fatal_occurred() {
             interp.exit_code()
         } else {
-            interp
-                .run_configure(&prepared.source_dir, &prepared.build_dir, &[])
-                .exit_code
+            runtime.run(&mut interp, &[]).exit_code
         };
         let stop = interp.stop_reason();
         diagnostics.extend_from_slice(interp.diag_engine().diagnostics());
@@ -127,9 +149,12 @@ impl PreparedConfigure {
         );
         let has_snapshot = result.model.dir(DirId::ROOT).final_policies.is_some()
             || result.model.targets().next().is_some();
-        match stop {
+        let resolution = match stop {
             Some(StopReason::Cancelled) if !has_snapshot => return Err(ApiError::Cancelled),
-            Some(StopReason::Cancelled) => result.completion = partial(true),
+            Some(StopReason::Cancelled) => {
+                result.completion = partial(true);
+                Ok(())
+            }
             Some(StopReason::StepBudgetExceeded { limit }) if !has_snapshot => {
                 return Err(ApiError::StepBudgetExceeded { limit });
             }
@@ -139,21 +164,26 @@ impl PreparedConfigure {
                     &mut result,
                     ApiError::StepBudgetExceeded { limit }.to_string(),
                 );
+                Ok(())
             }
             Some(StopReason::DeniedProcess) if !has_snapshot => {
                 return Err(ApiError::DeniedProcess {
                     commands: prepared.denied_processes(),
                 });
             }
-            Some(StopReason::DeniedProcess) => result.completion = partial(false),
-            None if outcome == 0 => resolve_project(prepared, generator, &mut result)?,
+            Some(StopReason::DeniedProcess) => {
+                result.completion = partial(false);
+                Ok(())
+            }
+            None if outcome == 0 => resolve_project(prepared, generator, &mut result),
             None => {
                 return Err(ApiError::ConfigureFailed {
                     exit_code: outcome,
                     diagnostics: result.diagnostics,
                 });
             }
-        }
+        };
+        resolution?;
         Ok(result)
     }
 }
@@ -509,7 +539,7 @@ impl SourceReads {
 
 struct ParsedSource {
     id: SourceId,
-    commands: Vec<CommandInvocation>,
+    commands: Arc<[CommandInvocation]>,
 }
 
 fn evaluation_facts(
@@ -532,7 +562,7 @@ fn evaluation_facts(
             continue;
         };
         let commands = parse_list_file(bytes, id, SourceKind::File, limits)
-            .map_or_else(|_| Vec::new(), |list| list.commands);
+            .map_or_else(|_| Arc::from([]), |list| list.commands);
         parsed.insert(file.clone(), ParsedSource { id, commands });
     }
     if !parsed.is_empty() {
@@ -603,6 +633,7 @@ fn evaluation_facts(
                     event.seq,
                     VariableWriteDetails {
                         dir,
+                        binding_dir: event.binding_dir,
                         command: event
                             .backtrace
                             .top()
@@ -612,7 +643,6 @@ fn evaluation_facts(
                             .old_value
                             .clone()
                             .map_or(PreviousValue::Unset, PreviousValue::Value),
-                        ..VariableWriteDetails::default()
                     },
                 );
             }

@@ -671,12 +671,19 @@ impl<'a> TargetPlan<'a> {
                 error
             })?;
             let mut link = link;
-            if let (BuildStep::Link { inputs, .. }, Some(target_inputs)) = (&mut link, self.inputs)
+            if let (
+                BuildStep::Link {
+                    inputs,
+                    implicit_inputs,
+                    ..
+                },
+                Some(target_inputs),
+            ) = (&mut link, self.inputs)
             {
                 for dependency in &target_inputs.xcframework_inputs {
                     let dependency = super::build_relative(model, dependency);
-                    if !inputs.contains(&dependency) {
-                        inputs.push(dependency);
+                    if !inputs.contains(&dependency) && !implicit_inputs.contains(&dependency) {
+                        implicit_inputs.push(dependency);
                     }
                 }
             }

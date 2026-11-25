@@ -108,6 +108,7 @@ fn compile(source: BString, object: BString) -> BuildStep {
         ..Invocation::default()
     };
     BuildStep::Compile {
+        compile_input: None,
         object,
         source,
         invocation,
@@ -119,6 +120,7 @@ fn compile(source: BString, object: BString) -> BuildStep {
 
 fn link(kind: LinkKind, output: BString, inputs: Vec<BString>, args: Vec<BString>) -> BuildStep {
     BuildStep::Link {
+        implicit_inputs: Vec::new(),
         inputs,
         step: LinkStep {
             kind,
@@ -340,6 +342,7 @@ fn ninja_builds_an_executable_whose_output_name_matches_its_library()
     let mut shell = c_target("sqlite_shell", TargetKind::Executable, "main.c");
     shell.props.set("OUTPUT_NAME".into(), "sqlite3".into());
     shell.usage.link_libraries = Some(vec![LinkItem {
+        scope: None,
         text: BT::new("sqlite3".into(), Default::default()),
         lookup_dir: DirId::ROOT,
     }]);
@@ -413,6 +416,7 @@ fn versioned_library_model(
     model.add_target(library)?;
     let mut app = c_target("app", TargetKind::Executable, "main.c");
     app.usage.link_libraries = Some(vec![LinkItem {
+        scope: None,
         text: BT::new("demo".into(), Default::default()),
         lookup_dir: DirId::ROOT,
     }]);
@@ -528,6 +532,8 @@ printf '%s\n' 'module\ state/unit.o.ddi: main.c' > "$2"
         graphs: vec![BuildGraph {
             steps: vec![
                 BuildStep::Scan {
+                    lang: "CXX".into(),
+                    preprocessed: None,
                     source: "main.c".into(),
                     object: object.clone(),
                     ddi: ddi.clone(),
@@ -538,16 +544,18 @@ printf '%s\n' 'module\ state/unit.o.ddi: main.c' > "$2"
                     depfile: Some(depfile),
                 },
                 BuildStep::Collate {
+                    lang: "CXX".into(),
                     target: "demo".into(),
                     ddis: vec![ddi],
                     dd: dd.clone(),
                     modmaps: vec![map.clone()],
                     tdi: "module state/CXXDependInfo.json".into(),
-                    depend_info: Box::default(),
-                    modmap_format: rcmake_cxxmodules::ModmapFormat::Clang,
+                    depend_info: Box::new(rcmake_resolve::DependInfo::Cxx(Default::default())),
+                    modmap_format: Some(rcmake_cxxmodules::ModmapFormat::Clang),
                     implicit_inputs: vec![],
                 },
                 BuildStep::Compile {
+                    compile_input: None,
                     object: object.clone(),
                     source: "main.c".into(),
                     invocation: Invocation {

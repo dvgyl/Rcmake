@@ -174,6 +174,7 @@ fn defines_unopened_functions_targets_and_aliases() -> TestResult {
             vec![BT::new("headers".into(), Backtrace::default())],
         );
         tools.usage.interface_link_libraries = Some(vec![LinkItem {
+            scope: None,
             text: BT::new("m".into(), Backtrace::default()),
             lookup_dir: DirId::ROOT,
         }]);

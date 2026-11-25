@@ -155,6 +155,7 @@ pub(super) fn abstract_targets(
         .map(|(id, raw)| {
             let dir = model.dir(raw.dir);
             let mut target = ResolvedTarget {
+                fortran: None,
                 id,
                 config: Default::default(),
                 metadata: TargetMetadata {

@@ -5,14 +5,17 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write as _};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use rcmake_api::{
     ApiError, CacheDefine, CancelToken, CompletionState, ConfigureRequest, ExplainQuery,
     ExplainReport, LedgerLevel, ProcessPolicy, Services, WriteMode, run_configure,
 };
 use rcmake_base::CMAKE_VERSION_STR;
-use rcmake_host::{Follow, Host, PureHost, path};
+use rcmake_host::{Follow, Host, ProcessResult, PureHost, RunOutput, path};
 use rcmake_json::{Value, write_compact};
 use rcmake_model::{CacheType, DirId, GeneratorKind, UsageScope};
 
@@ -44,10 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ("complete", Value::Bool(true)),
             ("provisional", Value::Bool(true)),
             ("denied_processes", Value::UInt(*denials)),
-            (
-                "try_compile",
-                Value::string("skipped: child configure uses a scoped thread"),
-            ),
+            ("try_compile", Value::string("passed")),
             ("cancelled", Value::Bool(true)),
         ]),
         Err(error) => object([
@@ -188,9 +188,69 @@ fn verify() -> Result<u64, Box<dyn std::error::Error>> {
         ),
         "The cancelled request did not stop at preparation.",
     )?;
+    verify_try_compile(root)?;
     Ok(u64::try_from(
         denied_processes.len().saturating_add(omitted_denials),
     )?)
+}
+
+fn verify_try_compile(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let host = Arc::new(PureHost::new(root.to_owned(), root.join("bin/rcmake")));
+    let mut script = PROJECT.to_vec();
+    script.extend_from_slice(br#"
+try_compile(W0_PROBE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/app.cpp" NO_CACHE NO_LOG OUTPUT_VARIABLE W0_PROBE_OUT)
+"#);
+    host.seed_file(&root.join("src/CMakeLists.txt"), &script)?;
+    host.seed_file(&root.join("src/core.cpp"), b"int core() { return 0; }\n")?;
+    host.seed_file(&root.join("src/app.cpp"), b"int main() { return 0; }\n")?;
+    seed_toolchain(&host, root)?;
+    let ran = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&ran);
+    let compiler = path::from_native_cmake(&root.join("bin/c++"));
+    let marker = b"W0 mock compiler output";
+    host.set_command_handler(move |_, request, _| {
+        if request
+            .pipeline
+            .iter()
+            .any(|stage| stage.program == compiler && stage.args.iter().any(|arg| arg == "-c"))
+        {
+            observed.store(true, Ordering::Relaxed);
+        }
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0); request.pipeline.len()],
+            stdout: marker.to_vec(),
+            ..RunOutput::default()
+        })
+    })?;
+    let result = run_configure(
+        ConfigureRequest::new("src", "build", "cmake", host)
+            .generator(GeneratorKind::UnixMakefiles)
+            .define(cache_entry("CMAKE_PLATFORM_INFO_INITIALIZED", "1"))
+            .define(cache_entry(
+                "CMAKE_MAKE_PROGRAM",
+                path::from_native_cmake(&root.join("bin/make")),
+            ))
+            .write_mode(WriteMode::Direct)
+            .process_policy(ProcessPolicy::Allow),
+    )?;
+    require(
+        ran.load(Ordering::Relaxed),
+        "The mock compiler did not run.",
+    )?;
+    require(
+        result
+            .model
+            .definition(DirId::ROOT, b"W0_PROBE")
+            .is_some_and(|value| value == b"TRUE"),
+        "try_compile did not report success.",
+    )?;
+    require(
+        result
+            .model
+            .definition(DirId::ROOT, b"W0_PROBE_OUT")
+            .is_some_and(|output| output.windows(marker.len()).any(|part| part == marker)),
+        "try_compile output did not include the mock compiler output.",
+    )
 }
 
 fn cache_entry(name: &str, value: impl Into<rcmake_base::BString>) -> CacheDefine {

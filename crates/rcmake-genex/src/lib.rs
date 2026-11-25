@@ -493,6 +493,7 @@ impl std::fmt::Display for GenexDiagnostic {
             }
             rcmake_diag::render(
                 &Diagnostic {
+                    annotations: None,
                     kind: MessageKind::Error,
                     effect: Effect::SetError,
                     category: None,

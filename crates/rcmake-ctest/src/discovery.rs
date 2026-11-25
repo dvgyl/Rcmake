@@ -102,6 +102,7 @@ fn interpreter(host: Arc<dyn Host>, dir: &Path, commands: fn(&mut Registry)) -> 
     let (_, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), None);
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host,
             mode: RunMode::Script,
             cmake_root: cmake_root.unwrap_or_default(),

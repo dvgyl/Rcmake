@@ -42,7 +42,7 @@ impl Interp {
         if !self.is_regular_file(&abs) {
             self.error_no_location(cat(&[b"Not a file: ", &abs]));
         }
-        if !self.read_list_file(&abs) && report_processing_error {
+        if !self.read_list_file(&abs) && report_processing_error && self.stop_reason().is_none() {
             self.error_no_location(cat(&[b"Error processing file: ", &abs]));
         }
         RunOutcome {
@@ -60,6 +60,9 @@ impl Interp {
     /// applies `CMP0198` and runs the deferred calls that it queues
     /// (`cmMakefile::Configure` and `RunListFile`).
     fn run_list_file(&mut self, abs: &[u8], directory: bool) -> bool {
+        if self.poll_cancel() {
+            return false;
+        }
         let saved_bt = self.push_file_frame(abs);
         let vars = self.push_list_file_vars(abs);
         if directory {
@@ -141,6 +144,11 @@ impl Interp {
         binary_dir: &Path,
         preload_scripts: &[PathBuf],
     ) -> RunOutcome {
+        if self.poll_cancel() {
+            return RunOutcome {
+                exit_code: self.exit_code(),
+            };
+        }
         let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
         let src_abs = collapse_full_path(&rcmake_host::path::from_native_cmake(source_dir), &cwd);
         let bin_abs = collapse_full_path(&rcmake_host::path::from_native_cmake(binary_dir), &cwd);
@@ -201,6 +209,7 @@ impl Interp {
         }
 
         let _ = self.run_list_file(&lists_bytes, true);
+        self.poll_cancel();
         self.write_configure_log(&bin_native);
         self.snapshot_dir_vars(DirId::ROOT);
         if !probe && self.exit_code() != 0 && self.exit_override.is_none() {
@@ -248,6 +257,9 @@ impl Interp {
 
     /// Execute one `-C` initial cache script in the current session.
     pub fn run_preload_script(&mut self, path: &Path) -> bool {
+        if self.poll_cancel() {
+            return false;
+        }
         self.init_policy_minimum();
         let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
         let abs = collapse_full_path(&rcmake_host::path::from_native_cmake(path), &cwd);
@@ -376,7 +388,7 @@ impl Interp {
             .host
             .create_dir_all(&rcmake_host::path::to_native(&bin_abs));
 
-        self.vars.push();
+        self.vars.push_directory(id);
         self.loop_blocks.push(0);
         self.policies.push_copy();
         self.diags.push_copy();

@@ -17,6 +17,11 @@ use rcmake_model::{DirId, GeneratorKind, ProjectModel};
 use rcmake_resolve::GenerationResult;
 
 pub mod build;
+#[allow(
+    dead_code,
+    reason = "The language activation wave uses this emitter or planner"
+)]
+mod fortran_asm;
 pub mod ids;
 pub mod object;
 pub mod phases;

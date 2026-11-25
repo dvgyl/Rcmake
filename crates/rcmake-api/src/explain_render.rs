@@ -303,20 +303,20 @@ impl Renderer<'_> {
             self.row(6, &format!("From variable {}", text(&input.name)));
             self.location(8, input.location.as_ref());
         }
-        if let Some(chain) = &entry.chain {
-            if !chain.is_empty() {
-                let hops: Vec<_> = chain.iter().map(hop_name).collect();
-                let mut path = text(target);
-                for (hop, name) in chain.iter().zip(&hops) {
-                    let _ = write!(path, " -> {} {name}", usage_scope(hop.via));
-                }
-                self.row(6, &path);
-                let mut from = text(target);
-                for (hop, to) in chain.iter().zip(hops) {
-                    self.row(8, &format!("{from} -> {} {to}", usage_scope(hop.via)));
-                    self.trace(10, &hop.origin);
-                    from = to;
-                }
+        if let Some(chain) = &entry.chain
+            && !chain.is_empty()
+        {
+            let hops: Vec<_> = chain.iter().map(hop_name).collect();
+            let mut path = text(target);
+            for (hop, name) in chain.iter().zip(&hops) {
+                let _ = write!(path, " -> {} {name}", usage_scope(hop.via));
+            }
+            self.row(6, &path);
+            let mut from = text(target);
+            for (hop, to) in chain.iter().zip(hops) {
+                self.row(8, &format!("{from} -> {} {to}", usage_scope(hop.via)));
+                self.trace(10, &hop.origin);
+                from = to;
             }
         }
         self.trace(6, &entry.origin);

@@ -64,6 +64,7 @@ fn link(model: &mut ProjectModel, id: TargetId, interface: bool, items: &[&str])
     entries
         .get_or_insert_default()
         .extend(items.iter().map(|name| LinkItem {
+            scope: None,
             text: BT::new((*name).into(), Backtrace::default()),
             lookup_dir: dir,
         }));

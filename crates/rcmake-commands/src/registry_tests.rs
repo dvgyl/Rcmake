@@ -49,6 +49,7 @@ fn session(mode: RunMode, source: &str) -> HostResult<(Arc<PureHost>, Interp, i3
     let host = Arc::new(PureHost::default());
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: host.clone(),
             mode,
             cmake_root: "/share/cmake".into(),

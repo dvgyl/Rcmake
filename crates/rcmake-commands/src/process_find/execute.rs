@@ -131,6 +131,12 @@ pub(super) fn execute_process(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
             output_value(&run.stderr, parsed.flag("ERROR_STRIP_TRAILING_WHITESPACE")),
         );
     }
+    let denied = |result: &ProcessResult| matches!(result, ProcessResult::SpawnFailed(error) if rcmake_host::no_process::is_process_denial(error));
+    let fatal_denial = match fatal {
+        Fatal::None => false,
+        Fatal::Last => run.results.last().is_some_and(denied),
+        Fatal::Any => run.results.iter().any(denied),
+    } && !run.results.contains(&ProcessResult::TimedOut);
     let results: Vec<_> = run.results.iter().map(result_text).collect();
     if let (Some(var), Some(last)) = (value(&parsed, "RESULT_VARIABLE"), results.last()) {
         let result = if run.results.contains(&ProcessResult::TimedOut) {
@@ -146,7 +152,11 @@ pub(super) fn execute_process(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
 
     match fatal_error(fatal, &run.results, &results) {
         Some(error) => {
-            cx.set_fatal();
+            if fatal_denial {
+                cx.stop_for_denied_process();
+            } else {
+                cx.set_fatal();
+            }
             Err(CmdError::Status(error))
         }
         None => Ok(Flow::Normal),

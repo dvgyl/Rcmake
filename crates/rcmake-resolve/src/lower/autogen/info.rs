@@ -307,7 +307,7 @@ fn add_moc_info(
     config_values(info, "MOC_INCLUDES", &includes, |values| strings(values));
 
     let filters = target_list(target, b"AUTOMOC_DEPEND_FILTERS");
-    if filters.len() % 2 != 0 {
+    if !filters.len().is_multiple_of(2) {
         return Err(ResolveError::Message(
             "AUTOMOC_DEPEND_FILTERS must contain keyword and regular expression pairs.".into(),
         ));

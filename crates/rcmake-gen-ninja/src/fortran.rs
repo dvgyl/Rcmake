@@ -319,6 +319,7 @@ mod tests {
             Path::new("/build/prefix"),
             None,
             b"prefix",
+            crate::commands::Commands::default(),
         )?;
         let mut ninja = Ninja::default();
         let compile = BuildStep::Compile {
@@ -341,74 +342,49 @@ mod tests {
     #[test]
     fn collate_declares_the_module_summary_and_linked_target_inputs()
     -> Result<(), Box<dyn std::error::Error>> {
-        use rcmake_diag::{Backtrace, PolicyMap};
-        use rcmake_host::PureHost;
-        use rcmake_model::{
-            BT, DirId, GeneratorKind, ProjectModel, Target, TargetKind, TargetOrigin,
+        let input = rcmake_resolve::BuildGraph::default();
+        let step = BuildStep::Collate {
+            lang: "Fortran".into(),
+            target: "app".into(),
+            ddis: vec!["obj/a $.ddi".into()],
+            dd: "obj/Fortran.dd".into(),
+            modmaps: Vec::new(),
+            tdi: "obj/FortranDependInfo.json".into(),
+            implicit_inputs: vec!["lib/FortranModules.json".into()],
+            modmap_format: None,
+            depend_info: Box::new(DependInfo::Fortran(rcmake_fortran::FortranBuildTdi {
+                dir_cur_src: "/src".into(),
+                dir_top_src: "/src".into(),
+                forward_modules_from_target_dirs: Vec::new(),
+                building_intrinsic_modules: false,
+                source_formats: BTreeMap::new(),
+                defines: Vec::new(),
+                scan: rcmake_fortran::FortranTdi {
+                    dir_cur_bld: "/build".into(),
+                    dir_top_bld: "/build".into(),
+                    include_dirs: Vec::new(),
+                    module_dir: None,
+                    linked_target_dirs: vec!["lib".into()],
+                    compiler_id: "GNU".into(),
+                    submodule_sep: "@".into(),
+                    submodule_ext: ".smod".into(),
+                    module_case: rcmake_fortran::ModuleCase::Lower,
+                    sources: Vec::new(),
+                },
+            })),
         };
-
-        let mut model = ProjectModel::default();
-        model.generator = Some(GeneratorKind::Ninja);
-        model.set_root_dirs("/src".into(), "/build".into());
-        let mut target = Target::new(
-            "app".into(),
-            TargetKind::ObjectLibrary,
-            TargetOrigin::Normal,
-            DirId::ROOT,
-            Backtrace::default(),
-            PolicyMap::default(),
-        );
-        target.props.set("Fortran_PREPROCESS".into(), "OFF".into());
-        target
-            .sources
-            .push(BT::new("test.f90".into(), Backtrace::default()));
-        model.add_target(target)?;
-        model
-            .dir_mut(DirId::ROOT)
-            .source_props
-            .entry("/src/test.f90".into())
-            .or_default()
-            .set("LANGUAGE".into(), "Fortran".into());
-        let host = PureHost::default();
-        host.seed_file(Path::new("/src/test.f90"), b"end\n")?;
-        let result = rcmake_resolve::resolve(&model, &host, &[])?;
-        let input = result.graphs.first().ok_or("Missing build graph.")?;
-        let mut step = input
-            .steps
-            .iter()
-            .find(|step| {
-                matches!(
-                    step, BuildStep::Collate { depend_info, .. }
-                    if matches!(depend_info.as_ref(), DependInfo::Fortran(_))
-                )
-            })
-            .cloned()
-            .ok_or("Missing Fortran collation step.")?;
-        if let BuildStep::Collate {
-            ddis,
-            dd,
-            tdi,
-            implicit_inputs,
-            ..
-        } = &mut step
-        {
-            *ddis = vec!["obj/a $.ddi".into()];
-            *dd = "obj/Fortran.dd".into();
-            *tdi = "obj/FortranDependInfo.json".into();
-            *implicit_inputs = vec!["lib/FortranModules.json".into()];
-        }
-        let graph = Graph::new(input, &BTreeMap::new(), Path::new("/build"), None)?;
+        let graph = Graph::new(&input, &BTreeMap::new(), Path::new("/build"), None)?;
         let mut ninja = Ninja::default();
         assert!(emit_collate(&mut ninja, &graph, &step, b"/my tools/cmake"));
         let text = String::from_utf8_lossy(&ninja.0);
         assert!(text.contains("build obj/Fortran.dd | obj/FortranModules.json: Fortran_DYNDEP obj/a$ $$.ddi | obj/FortranDependInfo.json lib/FortranModules.json"));
-        assert!(text.contains("cmake_ninja_dyndep$ --tdi=obj/FortranDependInfo.json$ --lang=Fortran$ --dd=obj/Fortran.dd$ @obj/Fortran.dd.rsp"));
+        assert!(text.contains("cmake_ninja_dyndep --tdi=obj/FortranDependInfo.json --lang=Fortran --dd=obj/Fortran.dd @obj/Fortran.dd.rsp"));
         let quoted = if cfg!(windows) {
-            "  RSP_ARGS = \"obj/a$ $$.ddi\"\n"
+            "  RSP_ARGS = \"obj/a $$.ddi\"\n"
         } else {
-            "  RSP_ARGS = 'obj/a$ $$.ddi'\n"
+            "  RSP_ARGS = 'obj/a $$.ddi'\n"
         };
-        assert!(text.contains(quoted));
+        assert!(text.contains(quoted), "{text}");
         assert!(RULES.contains("restat = 1"));
         Ok(())
     }

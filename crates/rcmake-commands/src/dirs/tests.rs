@@ -62,6 +62,7 @@ fn subdirectory_commands_share_the_model_with_property_commands() -> TestResult 
     )?;
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: host.clone(),
             mode: RunMode::Configure,
             cmake_root: "/share/cmake-4.5".into(),
@@ -136,6 +137,7 @@ fn source_group_model(
     host.seed_file(&src.join("CMakeLists.txt"), source)?;
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: host.clone(),
             mode: RunMode::Configure,
             cmake_root: "/share/cmake-4.5".into(),

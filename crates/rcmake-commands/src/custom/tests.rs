@@ -26,6 +26,7 @@ impl Fixture {
         let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
         let interp = Interp::new(
             InterpConfig {
+                services: Default::default(),
                 host: host.clone(),
                 mode: RunMode::Configure,
                 cmake_root: cwd.join("share/cmake-4.5"),

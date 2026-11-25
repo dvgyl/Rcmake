@@ -9,12 +9,12 @@ use rcmake_diag::{
 use rcmake_genex::{ConfigId, EvalContext, UsageTraversal};
 use rcmake_host::{Host, Stream};
 use rcmake_model::{
-    CommandId, CustomCommandKind, DirId, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId,
+    CustomCommandKind, DirId, FileSetKind, GeneratorKind, ProjectModel, Target, TargetId,
 };
 
 use crate::{
-    BuildGraph, BuildStep, CrossConfiguration, GenerationResult, InstallActionKind, ResolveError,
-    ResolveOptions, ResolvedTarget,
+    BuildGraph, BuildStep, GenerationResult, InstallActionKind, ResolveError, ResolveOptions,
+    ResolvedTarget,
     cxx_modules::{generation_location, module_error, std_module_model},
     exports::resolve_exports,
     ide, lower,
@@ -27,6 +27,10 @@ use crate::{
     unity,
     usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver, handle},
 };
+
+mod cross;
+use crate::usage::provenance::Provenance;
+use cross::CrossPlan;
 
 mod header_verify;
 mod rule_output_sets;
@@ -98,7 +102,7 @@ fn resolve_project(
     paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
     let mut configured_targets = configs
         .iter()
-        .map(|config| resolve_targets(model, &mut paths, config))
+        .map(|config| resolve_targets(model, &mut paths, config, options.provenance))
         .collect::<Result<Vec<_>, _>>()?;
     let prepared = header_verify::prepare(model, &paths, &configs, &configured_targets)?;
     let model = if let Some(prepared) = &prepared {
@@ -128,6 +132,7 @@ fn resolve_project(
         },
         verification: prepared.as_ref(),
     };
+    let mut provenance = Provenance::default();
     let mut targets = Vec::new();
     let mut graphs = Vec::with_capacity(configs.len());
     let mut cross_graphs = IndexMap::new();
@@ -148,6 +153,7 @@ fn resolve_project(
             &mut xcode_sources,
             &plan,
         )?;
+        provenance.extend(output.provenance.unwrap_or_default());
         targets.extend(output.targets);
         cross_graphs.extend(output.cross_graphs);
         match output.graph {
@@ -221,7 +227,13 @@ fn resolve_project(
             .iter()
             .flat_map(|graph| &graph.steps)
             .find_map(|step| match step {
-                BuildStep::Collate { modmap_format, .. } => Some(modmap_format),
+                BuildStep::Collate {
+                    modmap_format,
+                    depend_info,
+                    ..
+                } if matches!(depend_info.as_ref(), crate::DependInfo::Cxx(_)) => {
+                    modmap_format.as_ref()
+                }
                 _ => None,
             })
     {
@@ -237,10 +249,13 @@ fn resolve_project(
         install,
         exports,
         metadata,
+        provenance_entries: provenance.entries,
+        chains: options.provenance.then(|| Box::new(provenance.chains)),
     })
 }
 
 struct ConfigOutput {
+    provenance: Option<Provenance>,
     targets: Vec<ResolvedTarget>,
     graph: Result<BuildGraph, ResolveError>,
     cross_graphs: IndexMap<(ConfigId, ConfigId), BuildGraph>,
@@ -253,62 +268,8 @@ struct ConfigurationPlan<'a> {
 }
 
 #[derive(Default)]
-struct CrossPlan<'a> {
-    commands: &'a [ConfigId],
-    outputs: IndexSet<ConfigId>,
-    shared_outputs: IndexSet<CommandId>,
-}
-
-impl<'a> CrossPlan<'a> {
-    fn new(model: &ProjectModel, configs: &'a [ConfigId]) -> Result<Self, ResolveError> {
-        let Some(setting) = lower::definition(model, DirId::ROOT, b"CMAKE_CROSS_CONFIGS")
-            .filter(|_| model.generator == Some(GeneratorKind::NinjaMultiConfig))
-        else {
-            return Ok(Self::default());
-        };
-        let values = list::split(setting, list::Empty::Drop);
-        let outputs: IndexSet<_> = configs
-            .iter()
-            .filter(|config| setting == "all" || values.contains(&config.0))
-            .cloned()
-            .collect();
-        if outputs.is_empty() || !model.commands().any(|_| true) {
-            return Ok(Self::default());
-        }
-        let mut shared_outputs = IndexSet::new();
-        let mut usage = UsageResolver::new(model);
-        for (id, command) in model.commands() {
-            let mut seen = IndexSet::new();
-            for config in configs {
-                let (outputs, byproducts) =
-                    lower::command_outputs(model, command, config, &mut usage)?;
-                let paths: IndexSet<_> = outputs.into_iter().chain(byproducts).collect();
-                if paths.into_iter().any(|path| !seen.insert(path)) {
-                    shared_outputs.insert(id);
-                    break;
-                }
-            }
-        }
-        Ok(Self {
-            commands: configs,
-            outputs,
-            shared_outputs,
-        })
-    }
-
-    fn commands_for(&self, output: &ConfigId) -> impl Iterator<Item = CrossConfiguration<'_>> {
-        self.commands
-            .iter()
-            .filter(move |command| *command != output && self.outputs.contains(output))
-            .map(|command| CrossConfiguration {
-                command,
-                shared_outputs: &self.shared_outputs,
-            })
-    }
-}
-
-#[derive(Default)]
 struct ConfigTargets {
+    provenance: Option<Provenance>,
     targets: IndexMap<TargetId, ResolvedTarget>,
     inputs: IndexMap<TargetId, TargetInputs>,
     linked_object_sources: IndexSet<TargetId>,
@@ -318,11 +279,13 @@ fn resolve_targets(
     model: &ProjectModel,
     paths: &mut SourcePaths<'_>,
     config: &ConfigId,
+    provenance: bool,
 ) -> Result<ConfigTargets, ResolveError> {
     paths.index_generated(model, config)?;
     validate_file_sets(model, paths, config)?;
     paths.index_objects(model, config);
     let mut usage = UsageResolver::with_source_paths(model, paths);
+    usage.provenance = provenance.then(Provenance::default);
     let ctx = EvalContext {
         config: config.clone(),
         ..EvalContext::default()
@@ -369,6 +332,7 @@ fn resolve_targets(
             configured.linked_object_sources.insert(id);
         }
     }
+    configured.provenance = usage.provenance;
     Ok(configured)
 }
 
@@ -382,6 +346,7 @@ fn resolve_verification_targets(
     paths.index_generated(prepared, config)?;
     paths.index_objects(prepared, config);
     let mut usage = UsageResolver::with_source_paths(prepared, paths);
+    usage.provenance = configured.provenance.take();
     let ctx = EvalContext {
         config: config.clone(),
         ..EvalContext::default()
@@ -394,6 +359,7 @@ fn resolve_verification_targets(
         configured.targets.insert(id, facts);
         configured.inputs.insert(id, inputs);
     }
+    configured.provenance = usage.provenance;
     Ok(())
 }
 
@@ -496,7 +462,7 @@ fn policy_warning(
             .map_or("", |info| info.summary)
             .replace("``", ""),
     };
-    let warning = Diagnostic {
+    let warning = Diagnostic { annotations: None,
         kind: MessageKind::AuthorWarning,
         effect: Effect::None,
         category: Some(DiagCategory::Policy),
@@ -766,6 +732,7 @@ fn resolve_config(
     let ConfigTargets {
         targets: mut resolved,
         mut inputs,
+        provenance,
         ..
     } = configured;
     let ctx = EvalContext {
@@ -782,6 +749,7 @@ fn resolve_config(
     };
     let model = std_model.as_ref().map_or(model, |(model, _)| model);
     let mut usage = UsageResolver::with_source_paths(model, paths);
+    usage.provenance = provenance;
     let std_id = std_model.as_ref().map(|(_, id)| *id);
     if let Some(id) = std_id
         && let Some(target) = model.target(id)
@@ -810,6 +778,7 @@ fn resolve_config(
             // A configuration with no sources can also have no link language.
             // Compare the source lists before returning the link error.
             return Ok(ConfigOutput {
+                provenance: usage.provenance,
                 targets: resolved.into_values().collect(),
                 graph: Err(error),
                 cross_graphs: IndexMap::new(),
@@ -866,6 +835,7 @@ fn resolve_config(
         }
     }
     Ok(ConfigOutput {
+        provenance: usage.provenance,
         targets: resolved,
         graph: Ok(graph),
         cross_graphs,

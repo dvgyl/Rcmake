@@ -11,17 +11,23 @@ repository.workspace = true
 [features]
 default = []
 stdio = []
+eval = ["dep:rcmake-api"]
 
 [[bin]]
 name = "rcmake-lsp"
 required-features = ["stdio"]
 
 [dependencies]
+rcmake-api = { workspace = true, optional = true, default-features = false }
 rcmake-base.workspace = true
 rcmake-diag.workspace = true
 rcmake-host.workspace = true
 rcmake-json.workspace = true
 rcmake-syntax.workspace = true
+
+[dev-dependencies]
+rcmake-eval.workspace = true
+rcmake-model.workspace = true
 
 [lints]
 workspace = true

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rcmake_base::{BString, list};
 use rcmake_genex::{ConfigId, EvalContext, EvalFlags, GenexError, UsageTraversal};
-use rcmake_model::{BT, LinkItem, ProjectModel, Target, TargetId, TargetKind};
+use rcmake_model::{BT, LinkItem, ProjectModel, Target, TargetId, TargetKind, UsageScope};
 
 use super::{Limits, UsageResolver, UsageValue, context, handle};
 use crate::ResolveError;
@@ -12,7 +12,7 @@ mod language;
 mod order;
 
 /// A link entry with its evaluated text, provenance, and link semantics.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ResolvedLinkItem {
     /// Evaluated link text with the backtrace of the original entry.
     pub text: BT<BString>,
@@ -22,6 +22,8 @@ pub struct ResolvedLinkItem {
     pub feature: Option<BString>,
     /// Whether the item appears in the direct dependencies after injections.
     pub direct: bool,
+    /// Scope of the original dependency edge.
+    pub scope: UsageScope,
 }
 
 /// The role of one resolved link item.
@@ -46,6 +48,15 @@ pub enum ResolvedLinkKind {
     },
 }
 
+impl PartialEq for ResolvedLinkItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.kind == other.kind
+            && self.feature == other.feature
+            && self.direct == other.direct
+    }
+}
+
 impl ResolvedLinkItem {
     /// Targets named by this entry, including members of a link group.
     pub fn targets(&self) -> Box<dyn Iterator<Item = TargetId> + '_> {
@@ -61,6 +72,18 @@ impl ResolvedLinkItem {
     }
 
     pub(super) fn edge_targets(&self) -> impl DoubleEndedIterator<Item = TargetId> + '_ {
+        self.edges().map(|(target, _)| target)
+    }
+
+    pub(super) fn hop(&self, from: TargetId) -> crate::Hop {
+        crate::Hop {
+            from,
+            via: self.scope,
+            link_bt: self.text.backtrace.clone(),
+        }
+    }
+
+    pub(super) fn edges(&self) -> impl DoubleEndedIterator<Item = (TargetId, &Self)> + '_ {
         // Decoded groups have only one level of members.
         let items = match &self.kind {
             ResolvedLinkKind::Group { members, .. } => members.as_slice(),
@@ -69,7 +92,7 @@ impl ResolvedLinkItem {
         items.iter().filter_map(|item| match item.kind {
             ResolvedLinkKind::Library(id)
             | ResolvedLinkKind::Objects(id)
-            | ResolvedLinkKind::Interface(id) => Some(id),
+            | ResolvedLinkKind::Interface(id) => Some((id, item)),
             _ => None,
         })
     }
@@ -406,9 +429,14 @@ impl<'a> UsageResolver<'a> {
                             self.eval_entry(owner, entry.lookup_dir, name, &entry.text, ctx, true)?;
                         output.value.flags = output.value.flags.union(deps);
                         let values = list::split(&value, list::Empty::Drop);
+                        let scope = entry.scope.unwrap_or(if name.starts_with(b"INTERFACE_") {
+                            UsageScope::Interface
+                        } else {
+                            UsageScope::Private
+                        });
                         output
                             .items
-                            .extend(self.decode_links(entry, &values, direct)?);
+                            .extend(self.decode_links(entry, &values, direct, scope)?);
                         if collect_text {
                             output.value.entries.extend(
                                 values
@@ -439,6 +467,7 @@ impl<'a> UsageResolver<'a> {
         origin: &LinkItem,
         values: &[BString],
         direct: bool,
+        scope: UsageScope,
     ) -> Result<Vec<ResolvedLinkItem>, ResolveError> {
         let mut feature = None;
         let mut group: Option<ResolvedLinkItem> = None;
@@ -471,6 +500,7 @@ impl<'a> UsageResolver<'a> {
                     },
                     feature: None,
                     direct,
+                    scope,
                 });
                 continue;
             }
@@ -500,6 +530,7 @@ impl<'a> UsageResolver<'a> {
                 kind,
                 feature: feature.clone(),
                 direct,
+                scope,
             };
             if let Some(ResolvedLinkItem {
                 kind: ResolvedLinkKind::Group { members, .. },
@@ -621,6 +652,7 @@ impl Injection {
                     continue;
                 };
                 let raw = LinkItem {
+                    scope: None,
                     text: BT::new(raw.clone(), target.backtrace.clone()),
                     lookup_dir: target.dir,
                 };

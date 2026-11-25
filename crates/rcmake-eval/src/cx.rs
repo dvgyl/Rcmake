@@ -92,23 +92,55 @@ impl Cx<'_> {
 
     /// Write a cache entry and preserve its additional properties.
     pub fn write_cache(&mut self, name: &[u8], value: BString, ty: CacheType, help: &[u8]) {
-        if let Some(entry) = self.cache().get_mut(name) {
-            entry.value = value;
-            entry.ty = ty;
-            entry.help = BString::from(help);
-            entry.props.unset(Self::CACHE_PLACEHOLDER);
-        } else {
-            self.cache().insert(
-                name.into(),
-                CacheEntry {
-                    value,
-                    ty,
-                    help: help.into(),
-                    advanced: false,
-                    props: Default::default(),
-                },
-            );
+        let mut entry = self
+            .cache()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| CacheEntry {
+                value: BString::default(),
+                ty,
+                help: BString::default(),
+                advanced: false,
+                props: Default::default(),
+            });
+        entry.value = value;
+        entry.ty = ty;
+        entry.help = BString::from(help);
+        entry.props.unset(Self::CACHE_PLACEHOLDER);
+        self.insert_cache_entry(name.into(), entry);
+    }
+
+    /// Insert a cache entry and record the write if history is enabled.
+    pub fn insert_cache_entry(&mut self, name: BString, entry: CacheEntry) {
+        self.interp
+            .record_var_write(&name, crate::VarOp::CacheSet, Some(&entry.value));
+        self.cache().insert(name, entry);
+    }
+
+    /// Remove an existing cache entry and record the write if history is enabled.
+    pub fn remove_cache_entry(&mut self, name: &[u8]) {
+        if self.cache().get(name).is_some() {
+            self.interp
+                .record_var_write(name, crate::VarOp::CacheUnset, None);
+            self.cache().remove(name);
         }
+    }
+
+    /// Clone the session host for a child evaluator.
+    #[must_use]
+    pub fn host_arc(&self) -> Arc<dyn Host> {
+        Arc::clone(&self.interp.config.host)
+    }
+
+    /// Get the optional services for this session.
+    #[must_use]
+    pub fn services(&self) -> &crate::Services {
+        &self.interp.config.services
+    }
+
+    /// Stop after a denied process caused the current command to fail fatally.
+    pub fn stop_for_denied_process(&mut self) {
+        self.interp.stop(crate::StopReason::DeniedProcess);
     }
 
     /// Access the [`Host`].

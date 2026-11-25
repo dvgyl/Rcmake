@@ -40,11 +40,15 @@ mod cx;
 mod env;
 mod file_lock;
 mod flow;
+pub mod hermetic;
 mod hooks;
 mod interp;
+pub mod journal;
 mod md5;
 mod profiler;
+mod provenance;
 mod scope;
+mod services;
 mod stack;
 mod util;
 
@@ -55,8 +59,14 @@ pub use configure_log::FindEvent;
 pub use cx::Cx;
 pub use file_lock::FileLockScope;
 pub use hooks::{TraceConfig, TraceFormat, WatchAccess};
-pub use profiler::CommandProfiler;
+pub use interp::StopReason;
+pub use profiler::{CommandProfiler, CommandSample, SampleKind};
+pub use provenance::{ValuePreview, VarEvent, VarLedger, VarOp, VarWrite};
 pub use scope::Binding;
+pub use services::{
+    CancelToken, FetchLockMode, HermeticMode, LedgerLevel, ProbeCacheMode, Services, Site,
+    SpeedOptions,
+};
 
 use code::Code;
 use scope::VarStack;
@@ -212,6 +222,8 @@ pub struct InterpConfig {
     pub limits: Limits,
     /// Initial diagnostic options (`-W*`, `--sarif-output`, etc.).
     pub diag: DiagOptions,
+    /// Optional services for this session.
+    pub services: Arc<Services>,
     /// Pre-script `-D` definitions in CLI order.
     pub defines: Vec<CacheDefine>,
     /// Script arguments (`CMAKE_ARGV0..N` / `CMAKE_ARGC`): the complete command line,
@@ -412,6 +424,10 @@ pub struct Interp {
     /// `LoopBlockCounter`: one counter per function/directory barrier.
     loop_blocks: Vec<u32>,
     fatal: bool,
+    stop_reason: Option<StopReason>,
+    steps: u64,
+    var_ledger: Option<VarLedger>,
+    write_seq: u64,
     /// The command being executed issued an error (`SetNestedError`).
     cmd_failed: bool,
     cur_line: u32,
@@ -487,7 +503,15 @@ impl Interp {
         let started = config.host.monotonic();
         let initial_dir = rcmake_host::path::from_native(&config.cwd);
         project.set_root_dirs(initial_dir.clone(), initial_dir);
+        let var_ledger = (!matches!(config.services.provenance, LedgerLevel::Off)).then(|| {
+            project.set_prop_ledger(Some(Box::default()));
+            VarLedger::new(config.services.provenance.clone())
+        });
         let mut interp = Self {
+            var_ledger,
+            write_seq: 0,
+            stop_reason: None,
+            steps: 0,
             config,
             project,
             root_frame: DirFrame {

@@ -475,6 +475,7 @@ impl ResolveError {
 fn export_diagnostic(model: &ProjectModel, target: &Target, body: impl Into<BString>) -> BString {
     render_diagnostic(
         &Diagnostic {
+            annotations: None,
             kind: MessageKind::Error,
             effect: Effect::Fatal,
             category: None,

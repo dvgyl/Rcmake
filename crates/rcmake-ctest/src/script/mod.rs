@@ -202,6 +202,7 @@ fn execute_script(
     let (_, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), None);
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: Arc::clone(host),
             mode: RunMode::Script,
             cmake_root: cmake_root.unwrap_or_default(),
@@ -554,6 +555,7 @@ pub(crate) fn split_dashboard_command(
 ) -> Result<Vec<BString>, String> {
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: Arc::clone(host),
             mode: RunMode::Script,
             cmake_root: PathBuf::new(),

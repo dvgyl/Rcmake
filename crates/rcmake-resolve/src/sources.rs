@@ -445,7 +445,7 @@ impl<'a> SourcePaths<'a> {
                                 .borrow_mut()
                                 .insert((dir.binary_dir.clone(), identity))
                         {
-                            let warning = Diagnostic {
+                            let warning = Diagnostic { annotations: None,
                                 kind: MessageKind::AuthorWarning,
                                 effect: Effect::None,
                                 category: Some(DiagCategory::Policy),
@@ -528,6 +528,7 @@ impl<'a> SourcePaths<'a> {
         };
         let location = generation_source_location(location);
         let diagnostic = Diagnostic {
+            annotations: None,
             kind,
             effect: Effect::None,
             category: None,

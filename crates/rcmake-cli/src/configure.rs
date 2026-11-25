@@ -113,7 +113,14 @@ fn configure_project(
     cmake_root: PathBuf,
 ) -> Result<(), Exit> {
     let (mut session, saved) = ConfigureSession::resolve(argv, opts, host)?;
-    let (mut interp, has_cache) = session.initialize(saved, cmake_command, cmake_root)?;
+    let mut runtime = rcmake_commands::ConfigureRuntime::new(
+        Arc::clone(&session.host),
+        &session.src,
+        &session.bin,
+        &Default::default(),
+        false,
+    );
+    let (mut interp, has_cache) = session.initialize(&runtime, saved, cmake_command, cmake_root)?;
     let start = session.host.monotonic();
     let time = session.host.now();
     let mut preloads = session.apply_cache_edits(&mut interp);
@@ -130,9 +137,11 @@ fn configure_project(
         if preloads.missing {
             return Err(Exit::Code(1));
         }
-        let configured = session.configure(&mut interp, has_cache, start, preloads)?;
+        let configured =
+            session.configure(&mut runtime, &mut interp, has_cache, start, preloads)?;
         session.generate(&mut interp, configured, &mut results)
     })();
+    runtime.finish(outcome.is_ok());
     let code = match &outcome {
         Ok(()) => 0,
         Err(Exit::Code(code)) => *code,
@@ -240,6 +249,7 @@ impl<'a> ConfigureSession<'a> {
 
     fn initialize(
         &self,
+        runtime: &rcmake_commands::ConfigureRuntime,
         saved: Cache,
         cmake_command: PathBuf,
         cmake_root: PathBuf,
@@ -297,7 +307,7 @@ impl<'a> ConfigureSession<'a> {
         let mut interp = new_interp_with_paths(
             &self.opts,
             RunMode::Configure,
-            Arc::clone(&self.host),
+            runtime.host(),
             cmake_command,
             cmake_root,
             self.argv,
@@ -478,6 +488,7 @@ impl<'a> ConfigureSession<'a> {
 
     fn configure(
         &self,
+        runtime: &mut rcmake_commands::ConfigureRuntime,
         interp: &mut Interp,
         has_cache: bool,
         start: Duration,
@@ -521,7 +532,7 @@ impl<'a> ConfigureSession<'a> {
             entry.value =
                 path::from_native_cmake(&host.initial_cwd().join(path::to_native(&entry.value)));
         }
-        let result = interp.run_configure(&self.src, &self.bin, &[]);
+        let result = runtime.run(interp, &[]);
         if result.exit_code == 0
             && rcmake_resolve::validate_codegen_name(interp.cx().project(), host).is_err()
         {

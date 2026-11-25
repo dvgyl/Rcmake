@@ -46,6 +46,7 @@ pub(super) fn validate(
         format!("contains path:\n\n  \"{value}\"\n\nwhich is prefixed in the {kind} directory.")
     };
     let diagnostic = Diagnostic {
+        annotations: None,
         kind: MessageKind::Error,
         effect: Effect::None,
         category: None,

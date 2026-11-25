@@ -20,6 +20,7 @@ fn target(name: &str, kind: TargetKind) -> Target {
 
 fn item(value: &str, kind: ResolvedLinkKind) -> ResolvedLinkItem {
     ResolvedLinkItem {
+        scope: rcmake_model::UsageScope::Private,
         text: BT::new(value.into(), Backtrace::default()),
         kind,
         feature: None,

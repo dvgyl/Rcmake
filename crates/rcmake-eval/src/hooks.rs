@@ -300,6 +300,7 @@ impl Interp {
         let already_exceeded = self.recursion_exceeded;
         let direct_call_exceeds = self.depth.saturating_add(1) > self.recursion_limit();
         if self.exec_command(&code, 0).is_err()
+            && self.stop_reason().is_none()
             && (!self.recursion_exceeded || direct_call_exceeds && !already_exceeded)
         {
             self.error_no_location(cat(&[
@@ -326,6 +327,7 @@ impl Interp {
     /// Define a normal variable and notify its watches (`cmMakefile::AddDefinition`).
     pub(crate) fn define(&mut self, name: &[u8], value: BString) {
         self.record_variable_access(name);
+        self.record_var_write(name, crate::VarOp::Set, Some(&value));
         if deprecated_cache_variable(name) || self.watches.contains_key(name) {
             self.vars.set(name, value.clone());
             self.fire_watches(name, WatchAccess::Modified, Some(&value));
@@ -337,6 +339,7 @@ impl Interp {
     /// Undefine a normal variable and notify its watches (`RemoveDefinition`).
     pub(crate) fn undefine(&mut self, name: &[u8]) {
         self.record_variable_access(name);
+        self.record_var_write(name, crate::VarOp::Unset, None);
         self.vars.unset(name);
         self.fire_watches(name, WatchAccess::Removed, None);
     }

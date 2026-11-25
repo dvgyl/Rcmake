@@ -6,7 +6,9 @@ mod diagnostics;
 mod dispatch;
 mod listfile;
 mod scope;
+mod services;
 mod source;
+pub use services::StopReason;
 
 pub(crate) use listfile::CMP0198;
 

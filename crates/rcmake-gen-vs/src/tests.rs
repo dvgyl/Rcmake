@@ -462,6 +462,7 @@ fn fixture(
             always_run: false,
         };
         result.targets.push(ResolvedTarget {
+            fortran: None,
             id: app,
             config: config.clone(),
             metadata: TargetMetadata {
@@ -591,6 +592,7 @@ fn fixture(
 fn fallback_steps(bin: &Path, name: &str) -> Vec<BuildStep> {
     vec![
         BuildStep::Compile {
+            compile_input: None,
             object: format!("{name}/fallback.obj").into(),
             source: "/source tree/fallback.c".into(),
             invocation: Invocation {
@@ -931,6 +933,7 @@ fn writes_windows_link_artifacts_and_resource_options() {
         compile: None,
     };
     result.targets.push(ResolvedTarget {
+        fortran: None,
         id: shared,
         config: release,
         metadata: TargetMetadata {

@@ -84,6 +84,7 @@ fn resolved(model: &ProjectModel, host: &dyn Host) -> GenerationResult {
         host,
         &configs,
         &ResolveOptions {
+            provenance: false,
             ide: Some(IdeFlavor::Xcode),
         },
     )
@@ -670,6 +671,7 @@ fn native_xcodebuild_compiles_and_runs_program() {
         ["core", "shared", "object"]
             .into_iter()
             .map(|name| rcmake_model::LinkItem {
+                scope: None,
                 text: BT::new(name.into(), Default::default()),
                 lookup_dir: DirId::ROOT,
             })
@@ -820,6 +822,7 @@ fn applies_ide_facts_and_checks_config_source_lists() {
         &host,
         &result.configs,
         &ResolveOptions {
+            provenance: false,
             ide: Some(IdeFlavor::Xcode),
         },
     )

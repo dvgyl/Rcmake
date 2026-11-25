@@ -8,8 +8,10 @@ pub mod backtrace;
 pub mod category;
 #[allow(missing_docs)]
 pub mod generated_policies;
+mod history;
 pub mod policy;
 pub mod render;
+pub mod rich;
 pub mod source;
 pub mod suggest;
 
@@ -87,6 +89,8 @@ pub struct Diagnostic {
     pub location: Location,
     /// Raw, unwrapped message body.
     pub body: BString,
+    /// Optional source labels, fixes, and notes.
+    pub annotations: Option<Box<annotate::Annotations>>,
 }
 
 /// Top-level diagnostic configuration derived from cache, presets, and CLI flags.
@@ -105,6 +109,7 @@ pub struct DiagEngine {
     error_occurred: bool,
     fatal_occurred: bool,
     sarif_results: Vec<Value>,
+    history: history::History,
 }
 
 impl DiagEngine {
@@ -116,6 +121,7 @@ impl DiagEngine {
             error_occurred: false,
             fatal_occurred: false,
             sarif_results: Vec::new(),
+            history: history::History::default(),
         }
     }
 
@@ -150,7 +156,14 @@ impl DiagEngine {
             self.record_sarif(diag, effective);
         }
 
+        self.history.push(diag, effective);
         Some(render(diag, render_opts))
+    }
+
+    /// Get the retained diagnostics in issue order.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        self.history.diagnostics()
     }
 
     /// Returns `true` if any `SetError` or `Fatal` diagnostic was issued.

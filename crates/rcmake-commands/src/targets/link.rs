@@ -164,6 +164,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             continue;
         }
         let item = |value| LinkItem {
+            scope: Some(scope),
             text: BT::new(value, bt.clone()),
             lookup_dir: dir,
         };

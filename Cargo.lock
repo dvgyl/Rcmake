@@ -497,6 +497,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "rcmake-api"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "jiff",
+ "rcmake-base",
+ "rcmake-commands",
+ "rcmake-diag",
+ "rcmake-eval",
+ "rcmake-genex",
+ "rcmake-host",
+ "rcmake-json",
+ "rcmake-model",
+ "rcmake-resolve",
+ "rcmake-syntax",
+ "thiserror",
+]
+
+[[package]]
 name = "rcmake-archive"
 version = "0.1.0"
 dependencies = [
@@ -544,6 +563,7 @@ name = "rcmake-cli"
 version = "0.1.0"
 dependencies = [
  "jiff",
+ "rcmake-api",
  "rcmake-base",
  "rcmake-commands",
  "rcmake-cpack",
@@ -580,6 +600,7 @@ dependencies = [
  "rcmake-diag",
  "rcmake-eval",
  "rcmake-expr",
+ "rcmake-fetch",
  "rcmake-genex",
  "rcmake-host",
  "rcmake-instrument",
@@ -587,7 +608,9 @@ dependencies = [
  "rcmake-model",
  "rcmake-regex",
  "rcmake-resolve",
+ "rcmake-store",
  "rcmake-syntax",
+ "serde",
 ]
 
 [[package]]
@@ -662,6 +685,9 @@ dependencies = [
  "rcmake-model",
  "rcmake-regex",
  "rcmake-syntax",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror",
 ]
 
@@ -705,11 +731,13 @@ dependencies = [
  "rcmake-cps",
  "rcmake-diag",
  "rcmake-expr",
+ "rcmake-fortran",
  "rcmake-genex",
  "rcmake-host",
  "rcmake-json",
  "rcmake-presets",
  "rcmake-regex",
+ "rcmake-store",
  "rcmake-syntax",
 ]
 
@@ -750,6 +778,7 @@ dependencies = [
  "rcmake-base",
  "rcmake-cxxmodules",
  "rcmake-diag",
+ "rcmake-fortran",
  "rcmake-gen-common",
  "rcmake-genex",
  "rcmake-host",
@@ -839,10 +868,13 @@ dependencies = [
 name = "rcmake-lsp"
 version = "0.1.0"
 dependencies = [
+ "rcmake-api",
  "rcmake-base",
  "rcmake-diag",
+ "rcmake-eval",
  "rcmake-host",
  "rcmake-json",
+ "rcmake-model",
  "rcmake-syntax",
 ]
 
@@ -885,6 +917,7 @@ dependencies = [
  "rcmake-base",
  "rcmake-cxxmodules",
  "rcmake-diag",
+ "rcmake-fortran",
  "rcmake-genex",
  "rcmake-host",
  "rcmake-json",

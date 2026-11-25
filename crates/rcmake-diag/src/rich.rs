@@ -449,7 +449,7 @@ impl Renderer {
 
     fn snippet(&mut self, file: &SourceFile, labels: &[&Label], name: Option<&[u8]>) {
         let mut rows: BTreeMap<u32, (&[u8], Vec<Mark<'_>>)> = BTreeMap::new();
-        let mut anchor = None;
+        let mut anchor: Option<(_, _, bool)> = None;
         for label in labels {
             let bytes = clamped_range(file, label.span);
             let first = Line::at(file, bytes.start);

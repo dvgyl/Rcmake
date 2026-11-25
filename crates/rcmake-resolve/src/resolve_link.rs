@@ -61,7 +61,7 @@ pub(crate) fn resolve_link(
     ctx.link_language = usage.select_link_language(id, target, resolved, &ctx)?;
     let kind = LinkKind::for_target(target.kind);
     let items = if kind.is_some() {
-        usage.ordered_links(id, &ctx)?
+        usage.ordered_links_for_result(id, &ctx)?
     } else {
         Vec::new()
     };
@@ -103,9 +103,11 @@ pub(crate) fn resolve_link(
             .into(),
         )
     })?;
-    let options = usage.collect(id, UsageField::LinkOptions, &ctx)?.entries;
+    let options = usage
+        .collect_for_result(id, UsageField::LinkOptions, &ctx)?
+        .entries;
     let directories = usage
-        .collect(id, UsageField::LinkDirectories, &ctx)?
+        .collect_for_result(id, UsageField::LinkDirectories, &ctx)?
         .entries;
     let naming = LinkLibraryFlags::new(model, target, &language);
     let mut fragments = Vec::with_capacity(options.len() + directories.len() + items.len());

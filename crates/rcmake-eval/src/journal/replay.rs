@@ -349,9 +349,9 @@ impl<'a> VerifiedRegion<'a> {
                         let entry = entry
                             .to_entry()
                             .ok_or(ReplayApplyError::InvalidCacheEntry)?;
-                        cx.cache().insert(name.as_slice().into(), entry);
+                        cx.insert_cache_entry(name.as_slice().into(), entry);
                     } else {
-                        cx.cache().remove(name);
+                        cx.remove_cache_entry(name);
                     }
                 }
                 JournalEffect::Property { key, edit, origin } => {

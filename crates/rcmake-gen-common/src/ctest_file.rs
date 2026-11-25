@@ -428,6 +428,7 @@ fn warn_policy(
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
     let diagnostic = Diagnostic {
+        annotations: None,
         kind: MessageKind::AuthorWarning,
         effect: Effect::None,
         category: Some(DiagCategory::Policy),

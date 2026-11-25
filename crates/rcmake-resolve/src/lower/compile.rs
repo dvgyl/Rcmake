@@ -610,6 +610,7 @@ pub(super) fn compile(
         && (dep_flags.is_some_and(|f| has_placeholder(f, b"<DEP_FILE>"))
             || has_placeholder(template_text, b"<DEP_FILE>"));
     Ok(BuildStep::Compile {
+        compile_input: None,
         object,
         source,
         invocation,

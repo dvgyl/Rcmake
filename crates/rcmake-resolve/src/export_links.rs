@@ -223,6 +223,7 @@ fn closure_error(
         "export"
     };
     let diagnostic = rcmake_diag::Diagnostic {
+        annotations: None,
         kind: rcmake_diag::MessageKind::Error,
         effect: rcmake_diag::Effect::SetError,
         category: None,
@@ -311,6 +312,7 @@ fn expands_plain_cps_package_links_in_cmake_exports() -> Result<(), Box<dyn std:
             components
                 .into_iter()
                 .map(|name| LinkItem {
+                    scope: None,
                     text: BT::new(name.into(), Default::default()),
                     lookup_dir: dir,
                 })

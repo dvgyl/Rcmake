@@ -15,6 +15,7 @@ const INFO_DIR: &str = "/work/build/CMakeFiles/4.5.1";
 fn interp(host: &Arc<PureHost>, defines: Vec<CacheDefine>) -> Interp {
     Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: host.clone(),
             mode: RunMode::Configure,
             cmake_root: "/share/cmake-4.5".into(),

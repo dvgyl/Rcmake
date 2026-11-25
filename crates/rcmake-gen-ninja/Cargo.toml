@@ -18,5 +18,8 @@ rcmake-host.workspace = true
 rcmake-model.workspace = true
 rcmake-resolve.workspace = true
 
+[dev-dependencies]
+rcmake-fortran.workspace = true
+
 [lints]
 workspace = true

@@ -197,6 +197,7 @@ fn inherit_directory_usage(cx: &mut Cx<'_>, target: &mut Target) {
         let items = list::split(libraries, list::Empty::Drop)
             .into_iter()
             .map(|value| LinkItem {
+                scope: None,
                 text: BT::new(value, target.backtrace.clone()),
                 lookup_dir: target.dir,
             });

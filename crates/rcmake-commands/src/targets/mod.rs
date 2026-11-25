@@ -379,6 +379,7 @@ fn generation_diagnostic(
     }
     let failed = matches!(kind, MessageKind::Error | MessageKind::AuthorError);
     let diagnostic = Diagnostic {
+        annotations: None,
         kind,
         effect: if failed {
             Effect::SetError

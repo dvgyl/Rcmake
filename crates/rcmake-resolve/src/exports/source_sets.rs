@@ -35,7 +35,7 @@ pub(crate) fn validate(model: &ProjectModel) -> Result<(), ResolveError> {
                 {
                     continue;
                 }
-                let diagnostic = Diagnostic {
+                let diagnostic = Diagnostic { annotations: None,
                     kind: MessageKind::Error,
                     effect: Effect::SetError,
                     category: None,

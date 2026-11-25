@@ -307,6 +307,7 @@ fn interp_script(host: Arc<dyn Host>, dir: &Path, script: &[u8], limits: Limits)
     host.write(&path, script, WriteMode::Truncate)
         .expect("write script");
     let cfg = InterpConfig {
+        services: Default::default(),
         host: host.clone(),
         mode: RunMode::Script,
         cmake_root: PathBuf::from("/nonexistent/share/cmake-4.5"),

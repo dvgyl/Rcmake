@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use rcmake_base::{BString, Limits, list, path_lex::Lexical, truth};
 use rcmake_diag::{Frame, Location, MessageKind};
 use rcmake_genex::{
@@ -28,8 +29,10 @@ use crate::{
 mod artifacts;
 mod compatible;
 mod host;
+mod includes;
 mod link;
 pub(crate) mod link_options;
+pub(crate) mod provenance;
 #[cfg(test)]
 mod tests;
 mod wrappers;
@@ -69,6 +72,7 @@ pub struct UsageValue {
 #[derive(Default)]
 struct WalkValue {
     contributions: Vec<(TargetId, Arc<[BT<BString>]>)>,
+    chains: Option<IndexMap<TargetId, Vec<crate::Hop>>>,
     flags: EvalFlags,
 }
 
@@ -102,6 +106,8 @@ impl MemoKey<'_> {
     }
 }
 
+type UsagePaths = Vec<Vec<crate::Hop>>;
+
 const MAX_WALK_DEPTH: usize = 128;
 
 /// Evaluate usage requirements against one immutable project model.
@@ -118,6 +124,7 @@ pub struct UsageResolver<'a> {
     cycle_count: usize,
     has_injections: bool,
     compatible: compatible::Properties,
+    pub(crate) provenance: Option<provenance::Provenance>,
 }
 
 impl<'a> UsageResolver<'a> {
@@ -140,6 +147,7 @@ impl<'a> UsageResolver<'a> {
             active: Vec::new(),
             cycle_count: 0,
             compatible: compatible::Properties::default(),
+            provenance: None,
             has_injections: model.targets().any(|(_, target)| {
                 target.props.get(link::DIRECT).is_some()
                     || target.props.get(link::EXCLUDE).is_some()
@@ -168,6 +176,7 @@ impl<'a> UsageResolver<'a> {
             active: Vec::new(),
             cycle_count: 0,
             compatible: compatible::Properties::default(),
+            provenance: None,
             has_injections: self.has_injections,
         }
     }
@@ -220,34 +229,86 @@ impl<'a> UsageResolver<'a> {
         field: UsageField,
         ctx: &EvalContext,
     ) -> Result<UsageValue, ResolveError> {
+        self.collect_usage(target, field, ctx, false)
+            .map(|(value, _)| value)
+    }
+
+    pub(crate) fn collect_for_result(
+        &mut self,
+        target: TargetId,
+        field: UsageField,
+        ctx: &EvalContext,
+    ) -> Result<UsageValue, ResolveError> {
+        let (value, chains) = self.collect_usage(target, field, ctx, self.provenance.is_some())?;
+        if let (Some(provenance), Some(chains)) = (&mut self.provenance, chains) {
+            for (entry, hops) in value.entries.iter().zip(chains) {
+                provenance.record(
+                    target,
+                    &ctx.config,
+                    crate::ChainKind::Usage(field),
+                    entry,
+                    hops,
+                    Vec::new(),
+                );
+            }
+        }
+        Ok(value)
+    }
+
+    fn collect_usage(
+        &mut self,
+        target: TargetId,
+        field: UsageField,
+        ctx: &EvalContext,
+        record: bool,
+    ) -> Result<(UsageValue, Option<UsagePaths>), ResolveError> {
         let name = field.name().as_bytes();
         let mut ctx = self.property_context(target, name, ctx)?;
+        let mut chains = record.then(Vec::new);
+        let mut seen = HashSet::new();
         let mut value = if field == UsageField::LinkOptions
             && self.target(target)?.kind == TargetKind::StaticLibrary
         {
-            self.archive_options(target, &ctx)?
+            let mut value = self.archive_options(target, &ctx)?;
+            value
+                .entries
+                .retain(|entry| seen.insert(entry.value.clone()));
+            if let Some(chains) = &mut chains {
+                chains.resize_with(value.entries.len(), Vec::new);
+            }
+            value
         } else {
             if field == UsageField::LinkOptions {
                 ctx.traversal = link_options::traversal(self.target(target)?);
             }
             let result = self.walk(target, name, &ctx)?;
-            UsageValue {
-                entries: result
-                    .contributions
-                    .iter()
-                    .flat_map(|(_, entries)| entries.iter().cloned())
-                    .collect(),
+            let mut value = UsageValue {
+                entries: Vec::new(),
                 flags: result.flags,
+            };
+            for (owner, entries) in &result.contributions {
+                for entry in &**entries {
+                    if seen.insert(entry.value.clone()) {
+                        value.entries.push(entry.clone());
+                        if let Some(chains) = &mut chains {
+                            chains.push(
+                                result
+                                    .chains
+                                    .as_ref()
+                                    .and_then(|paths| paths.get(owner))
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                }
             }
+            value
         };
-        let mut seen = HashSet::new();
-        value
-            .entries
-            .retain(|entry| seen.insert(entry.value.clone()));
         if field == UsageField::LinkOptions {
-            self.prepare_link_options(target, &ctx, &mut value)?;
+            self.prepare_link_options(target, &ctx, &mut value, chains.as_mut())?;
         }
-        Ok(value)
+        Ok((value, chains))
     }
 
     /// Collect a usage property by name, including sources and custom transitive properties.
@@ -473,16 +534,25 @@ impl<'a> UsageResolver<'a> {
             result.contributions.push((id, own.entries.into()));
         }
         let mut seen = HashSet::from([id]);
-        for dependency in links.iter().flat_map(|item| item.edge_targets()) {
+        for (dependency, edge) in links.iter().flat_map(|item| item.edges()) {
             let value = self.walk(dependency, &dependency_name, ctx)?;
             result.flags = result.flags.union(value.flags);
-            result.contributions.extend(
-                value
-                    .contributions
-                    .iter()
-                    .filter(|(owner, _)| seen.insert(*owner))
-                    .cloned(),
-            );
+            for (owner, entries) in &value.contributions {
+                if !seen.insert(*owner) {
+                    continue;
+                }
+                result.contributions.push((*owner, Arc::clone(entries)));
+                if self.provenance.is_some() {
+                    let mut chain = vec![edge.hop(dependency)];
+                    if let Some(path) = value.chains.as_ref().and_then(|chains| chains.get(owner)) {
+                        chain.extend_from_slice(path);
+                    }
+                    result
+                        .chains
+                        .get_or_insert_with(IndexMap::new)
+                        .insert(*owner, chain);
+                }
+            }
         }
         Ok(result)
     }
@@ -640,123 +710,6 @@ impl<'a> UsageResolver<'a> {
                 error.at(&entry.backtrace, root).into()
             }
         })
-    }
-
-    /// Collect includes in search order and mark system paths.
-    pub fn collect_includes(
-        &mut self,
-        target: TargetId,
-        ctx: &EvalContext,
-    ) -> Result<Vec<InterfaceInclude>, ResolveError> {
-        use UsageField::*;
-        let entries = self.collect(target, IncludeDirectories, ctx)?.entries;
-        let mut ctx = context(target, ctx, UsageTraversal::Compile);
-        let head = ctx.head.get_or_insert(handle(target));
-        let no_imported_system = self
-            .ids
-            .get(head.0 as usize)
-            .and_then(|id| self.model.target(*id))
-            .is_some_and(|head| on(head, b"NO_SYSTEM_FROM_IMPORTED"));
-        let owner = self.target(target)?;
-        let mut system = UsageValue::default();
-        self.eval_entries(
-            target,
-            b"SYSTEM_INCLUDE_DIRECTORIES",
-            self.model
-                .dir(owner.dir)
-                .usage
-                .entries(InterfaceSystemIncludeDirectories),
-            &ctx,
-            &mut system,
-        )?;
-        // A SYSTEM PUBLIC include has matching entries from the same command.
-        let own_includes: HashSet<_> = owner
-            .usage
-            .entries(IncludeDirectories)
-            .iter()
-            .map(entry_origin)
-            .collect();
-        self.eval_entries(
-            target,
-            InterfaceSystemIncludeDirectories.name().as_bytes(),
-            owner
-                .usage
-                .entries(InterfaceSystemIncludeDirectories)
-                .iter()
-                .filter(|entry| own_includes.contains(&entry_origin(entry))),
-            &ctx,
-            &mut system,
-        )?;
-        if let Some(raw) = owner.props.get(b"SYSTEM_INCLUDE_DIRECTORIES") {
-            self.eval_entries(
-                target,
-                b"SYSTEM_INCLUDE_DIRECTORIES",
-                &[BT::new(raw.clone(), owner.backtrace.clone())],
-                &ctx,
-                &mut system,
-            )?;
-        }
-
-        let (links, _) = self.usage_links(target, false, &ctx)?;
-        let mut todo: Vec<_> = links.iter().flat_map(|item| item.edge_targets()).collect();
-        let mut visited = HashSet::new();
-        while let Some(id) = todo.pop() {
-            if !visited.insert(id) {
-                continue;
-            }
-            let dependency = self.target(id)?;
-            let default_system = dependency
-                .props
-                .get(b"SYSTEM")
-                .map_or(dependency.is_imported(), |value| truth::is_on(value));
-            self.eval_entries(
-                id,
-                InterfaceSystemIncludeDirectories.name().as_bytes(),
-                dependency.usage.entries(InterfaceSystemIncludeDirectories),
-                &ctx,
-                &mut system,
-            )?;
-            if default_system && !(dependency.is_imported() && no_imported_system) {
-                self.eval_entries(
-                    id,
-                    InterfaceIncludeDirectories.name().as_bytes(),
-                    dependency.usage.entries(InterfaceIncludeDirectories),
-                    &ctx,
-                    &mut system,
-                )?;
-            }
-            let (links, _) = self.usage_links(id, true, &ctx)?;
-            todo.extend(links.iter().flat_map(|item| item.edge_targets()));
-        }
-
-        let system: HashSet<_> = system
-            .entries
-            .iter()
-            .map(|entry| without_trailing_slashes(&entry.value))
-            .collect();
-        let directory = self.model.dir(owner.dir);
-        let current_dirs = definition(self.model, owner.dir, b"CMAKE_INCLUDE_CURRENT_DIR")
-            .filter(|value| truth::is_on(value))
-            .into_iter()
-            .flat_map(|_| [&directory.binary_dir, &directory.source_dir])
-            .filter(|path| !path.is_empty())
-            .map(|path| BT::new(path.clone(), Default::default()));
-        let mut seen = HashSet::new();
-        let mut includes: Vec<_> = current_dirs
-            .chain(entries)
-            .map(|mut path| {
-                let len = without_trailing_slashes(&path.value).len();
-                path.value.truncate(len);
-                path
-            })
-            .filter(|path| seen.insert(path.value.clone()))
-            .map(|path| InterfaceInclude {
-                system: system.contains(path.value.as_slice()),
-                path,
-            })
-            .collect();
-        includes.sort_by_key(|include| include.system);
-        Ok(includes)
     }
 }
 

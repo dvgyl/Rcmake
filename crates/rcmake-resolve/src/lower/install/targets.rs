@@ -49,6 +49,7 @@ pub(super) fn warn_framework_change(
             target.name,
         ).into();
         let diagnostic = Diagnostic {
+            annotations: None,
             kind: if error {
                 MessageKind::AuthorError
             } else {

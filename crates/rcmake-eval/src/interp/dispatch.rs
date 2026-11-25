@@ -256,6 +256,9 @@ impl Interp {
         defer_id: Option<BString>,
         f: impl FnOnce(&mut Self) -> CmdResult,
     ) -> CmdResult {
+        if !self.take_step() {
+            return Err(CmdError::Reported);
+        }
         let bt = self.command_backtrace(file, line, name);
         let saved_bt = core::mem::replace(&mut self.bt, bt);
         let saved_defer = core::mem::replace(&mut self.top_defer_id, defer_id);
@@ -291,7 +294,15 @@ impl Interp {
         } else {
             f(self)
         };
-        let result = self.finish_command(name, result);
+        let result = if self.poll_cancel()
+            || matches!(
+                self.stop_reason,
+                Some(crate::StopReason::StepBudgetExceeded { .. })
+            ) {
+            Err(CmdError::Reported)
+        } else {
+            self.finish_command(name, result)
+        };
 
         self.cmd_failed = saved_failed;
         self.cur_line = saved_line;
@@ -654,6 +665,9 @@ impl Interp {
 
     /// Stop execution if the optional wall-clock budget has expired.
     pub(crate) fn over_budget(&mut self) -> bool {
+        if self.poll_cancel() {
+            return true;
+        }
         let Some(budget) = self.config.limits.wall_budget else {
             return false;
         };

@@ -50,6 +50,7 @@ fn scan(args: &[BString], host: &Arc<dyn Host>) -> Result<i32, String> {
     let directory_info = build.join("CMakeFiles/CMakeDirectoryInformation.cmake");
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: Arc::clone(host),
             mode: RunMode::Script,
             cmake_root: PathBuf::new(),

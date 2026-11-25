@@ -7,12 +7,18 @@ mod cache;
 mod configure;
 #[cfg(test)]
 mod ctest;
+#[allow(dead_code, reason = "Wave 1B connects this module to configure")]
+mod exec_log;
+#[allow(dead_code, reason = "Wave 1B connects this module to configure")]
+mod explain_cmd;
 mod generate;
 mod help;
 mod install;
 mod instrumentation;
 mod make_depends;
 mod options;
+#[allow(dead_code, reason = "Wave 1B connects this module to configure")]
+mod persona;
 mod presets;
 mod profile;
 mod resource;
@@ -360,6 +366,7 @@ fn new_interp_with_paths(
         cmake_command
     };
     let cfg = InterpConfig {
+        services: Default::default(),
         cwd: host.initial_cwd(),
         host,
         mode,
@@ -550,6 +557,7 @@ fn object<const N: usize>(entries: [(&str, Value); N]) -> Value {
 
 fn emit_cli_error(host: &dyn Host, body: impl Into<BString>) {
     let diag = Diagnostic {
+        annotations: None,
         kind: MessageKind::Error,
         effect: Effect::Fatal,
         category: None,

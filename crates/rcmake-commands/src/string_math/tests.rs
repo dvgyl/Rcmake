@@ -17,6 +17,7 @@ fn setup(script: &str) -> (Interp, Arc<PureHost>) {
     );
     let interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: host.clone(),
             mode: RunMode::Script,
             cmake_root: PathBuf::from("/share/cmake"),

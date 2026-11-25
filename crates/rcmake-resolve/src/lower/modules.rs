@@ -273,13 +273,14 @@ pub(super) fn lower_modules_with_standard(
         .into_iter()
         .collect();
     steps.push(BuildStep::Collate {
+        lang: "CXX".into(),
         target: resolved.metadata.name.clone(),
         ddis,
         dd: module_info.dyndep.clone(),
         modmaps,
         tdi: module_info.tdi.clone(),
-        depend_info: Box::new(info),
-        modmap_format: module_map_format,
+        depend_info: Box::new(crate::DependInfo::Cxx(info)),
+        modmap_format: Some(module_map_format),
         implicit_inputs,
     });
     Ok(steps)
@@ -393,6 +394,8 @@ fn scan(
     }
     .wrap(model, target, invocation);
     Ok(BuildStep::Scan {
+        lang: "CXX".into(),
+        preprocessed: None,
         source: unit.source.value.clone(),
         ddi,
         object: unit.object.clone(),

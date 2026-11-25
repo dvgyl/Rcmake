@@ -474,6 +474,7 @@ fn add_links(target: &mut Target, links: impl IntoIterator<Item = BString>) {
             .interface_link_libraries
             .get_or_insert_with(Vec::new)
             .push(LinkItem {
+                scope: None,
                 text: BT::new(value, target.backtrace.clone()),
                 lookup_dir: target.dir,
             });

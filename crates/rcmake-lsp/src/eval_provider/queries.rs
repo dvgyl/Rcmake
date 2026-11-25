@@ -2,7 +2,6 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     ops::Range,
-    path::Path,
 };
 
 use rcmake_api::{CompletionKind, ExecutedSymbol, SourceLocation, WorkspaceIndex};
@@ -21,7 +20,7 @@ use crate::{
     expression::{self, Kind as ExprKind},
     json::{object, uint},
     lexical,
-    position::{Lines, range},
+    position::Lines,
     roles::{Arguments, Role, Variable},
     uri,
 };
@@ -34,6 +33,8 @@ use super::{
 const MAX_DEFINITIONS: usize = 32;
 const MAX_COMPLETIONS: usize = 256;
 const MAX_HOVER_BYTES: usize = 8192;
+
+type HoverText = (String, Option<i64>);
 
 impl EvalSemanticProvider {
     /// Get a Markdown hover and the version of the buffer that supplied it.
@@ -59,7 +60,7 @@ impl EvalSemanticProvider {
         &self,
         context: &SemanticContext<'_>,
         markdown: bool,
-    ) -> Option<SnapshotReply<Option<(String, Option<i64>)>>> {
+    ) -> Option<SnapshotReply<Option<HoverText>>> {
         self.snapshots.query(|snapshot, buffers| {
             let query = Query::new(self.host(), snapshot, buffers, context)?;
             let (kind, name) = query.subject()?;

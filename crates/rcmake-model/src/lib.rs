@@ -23,6 +23,8 @@ mod property_print;
 pub use property_print::PropertyPrint;
 mod project;
 mod props;
+mod provenance;
+pub use provenance::{LanguageRegistry, PropEvent, PropLedger, PropOp, PropValuePreview};
 mod target;
 
 pub use command::{CustomCommand, CustomCommandKind, TargetEvent};

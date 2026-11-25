@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use rcmake_base::BString;
 use rcmake_diag::Backtrace;
+use rcmake_model::DirId;
 
 use crate::services::LedgerLevel;
 
@@ -66,6 +67,8 @@ pub struct VarEvent {
     pub scope_depth: u32,
     /// Stable identity of the scope for this session.
     pub scope_id: u64,
+    /// Directory whose variable scope changed, when the write is directory-scoped.
+    pub binding_dir: Option<DirId>,
     /// Value before the write, or absence.
     pub old_value: Option<ValuePreview>,
     /// Value after the write, or absence.
@@ -143,6 +146,15 @@ impl VarLedger {
 
     /// Record one write. Pass the values observed at the mutation point.
     pub fn record(&mut self, name: &[u8], write: VarWrite<'_>) {
+        self.record_at(name, write, None);
+    }
+
+    pub(crate) fn record_at(
+        &mut self,
+        name: &[u8],
+        write: VarWrite<'_>,
+        binding_dir: Option<DirId>,
+    ) {
         let cap = match &self.level {
             LedgerLevel::Off => return,
             LedgerLevel::Names(names) if names.contains(name) => MAX_HISTORY,
@@ -220,6 +232,7 @@ impl VarLedger {
                 op: write.op,
                 scope_depth: write.scope_depth,
                 scope_id: write.scope_id,
+                binding_dir,
                 old_value: write.old_value.map(ValuePreview::new),
                 new_value: write.new_value.map(ValuePreview::new),
                 backtrace: write.backtrace.clone(),
@@ -312,7 +325,7 @@ mod tests {
                 .history(b"Z")
                 .map(|event| event.seq)
                 .collect::<Vec<_>>(),
-            [2, 3]
+            [3, 4]
         );
         assert!(ledger.history(b"A").next().is_none());
         assert_eq!(ledger.dropped(b"Z"), 1);

@@ -162,6 +162,7 @@ pub(super) fn write_project(
             kind: FrameKind::Command,
         });
         let diagnostic = Diagnostic {
+            annotations: None,
             kind: MessageKind::Error,
             effect: Effect::Fatal,
             category: None,

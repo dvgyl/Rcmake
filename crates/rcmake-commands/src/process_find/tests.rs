@@ -19,6 +19,7 @@ fn setup() -> (Arc<PureHost>, Interp) {
     let host = Arc::new(PureHost::default());
     let interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: host.clone(),
             mode: RunMode::Script,
             cmake_root: "/share/cmake".into(),
@@ -798,6 +799,7 @@ fn setup_package() -> (Arc<PureHost>, Interp) {
 fn package_interp(host: Arc<PureHost>, mode: RunMode) -> Interp {
     Interp::new(
         InterpConfig {
+            services: Default::default(),
             host,
             mode,
             cmake_root: "/share/cmake".into(),

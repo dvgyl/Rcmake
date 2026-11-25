@@ -10,6 +10,14 @@ use rcmake_eval::{CmdError, CmdFlags, Cx, IncludeOptions, Registry};
 mod build_command;
 mod enable_language;
 mod generator_env;
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
+mod lookahead;
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[allow(dead_code, reason = "Wave 1A connects this module to configure")]
+mod probe_pool;
+mod session;
+pub use session::ConfigureRuntime;
 #[cfg(test)]
 mod tests;
 mod try_compile;

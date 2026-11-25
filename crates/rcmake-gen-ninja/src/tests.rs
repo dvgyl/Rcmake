@@ -45,6 +45,7 @@ fn single_config_writes_rules_edges_and_utilities() {
                     symbolic: false,
                 }),
                 BuildStep::Compile {
+                    compile_input: None,
                     object: "obj/a $:file.o".into(),
                     source: "/work/src/a $:file.c".into(),
                     invocation: Invocation {
@@ -56,6 +57,7 @@ fn single_config_writes_rules_edges_and_utilities() {
                     dyndep: None,
                 },
                 BuildStep::Link {
+                    implicit_inputs: Vec::new(),
                     inputs: vec!["obj/a $:file.o".into()],
                     step: LinkStep {
                         kind: LinkKind::SharedLibrary,
@@ -180,6 +182,7 @@ fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std
     let input = BuildGraph {
         steps: vec![
             BuildStep::Link {
+                implicit_inputs: Vec::new(),
                 inputs: Vec::new(),
                 step: LinkStep {
                     kind: LinkKind::SharedLibrary,
@@ -220,7 +223,7 @@ fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std
             Some(b"Debug"),
         )?;
         let mut ninja = Ninja::default();
-        graph.emit(&mut ninja, b"cmake", b"", &[]);
+        graph.emit(&mut ninja, b"cmake", b"", &[])?;
         graph.emit_entry_aliases(&mut ninja);
         let manifest = String::from_utf8(ninja.0)?;
         assert_eq!(
@@ -252,6 +255,7 @@ fn target_dependencies_use_the_library_when_its_name_matches_an_executable_outpu
         ),
     ] {
         let link = |kind, output: &str, inputs| BuildStep::Link {
+            implicit_inputs: Vec::new(),
             inputs,
             step: LinkStep {
                 kind,
@@ -269,6 +273,7 @@ fn target_dependencies_use_the_library_when_its_name_matches_an_executable_outpu
             steps: vec![
                 link(LinkKind::StaticArchive, "libsqlite3.a", Vec::new()),
                 BuildStep::Compile {
+                    compile_input: None,
                     object: "shell.o".into(),
                     source: "shell.c".into(),
                     invocation: Invocation::default(),
@@ -315,7 +320,7 @@ fn target_dependencies_use_the_library_when_its_name_matches_an_executable_outpu
             config.map(str::as_bytes),
         )?;
         let mut ninja = Ninja::default();
-        graph.emit(&mut ninja, b"cmake", b"", &[]);
+        graph.emit(&mut ninja, b"cmake", b"", &[])?;
         if config.is_some() {
             graph.emit_entry_aliases(&mut ninja);
         }
@@ -508,6 +513,8 @@ fn module_pipeline_writes_edges_and_target_metadata() -> Result<(), Box<dyn std:
             let source: BString = format!("/work/source/{name}.cxx").into();
             [
                 BuildStep::Scan {
+                    lang: "CXX".into(),
+                    preprocessed: None,
                     source: source.clone(),
                     object: object.clone(),
                     ddi: ddi.clone(),
@@ -515,16 +522,18 @@ fn module_pipeline_writes_edges_and_target_metadata() -> Result<(), Box<dyn std:
                     depfile: Some(format!("{base}/unit.o.ddi.d").into()),
                 },
                 BuildStep::Collate {
+                    lang: "CXX".into(),
                     target: name.into(),
                     ddis: vec![ddi],
                     dd: dd.clone(),
                     modmaps: vec![map.clone()],
                     tdi: format!("{base}/CXXDependInfo.json").into(),
-                    depend_info: Box::default(),
-                    modmap_format: rcmake_cxxmodules::ModmapFormat::Clang,
+                    depend_info: Box::new(rcmake_resolve::DependInfo::Cxx(Default::default())),
+                    modmap_format: Some(rcmake_cxxmodules::ModmapFormat::Clang),
                     implicit_inputs,
                 },
                 BuildStep::Compile {
+                    compile_input: None,
                     object,
                     source,
                     invocation: Invocation::default(),
@@ -561,6 +570,7 @@ fn module_pipeline_writes_edges_and_target_metadata() -> Result<(), Box<dyn std:
             ],
         });
         result.targets.push(ResolvedTarget {
+            fortran: None,
             id,
             config,
             metadata: TargetMetadata {

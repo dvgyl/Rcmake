@@ -233,6 +233,7 @@ pub(super) fn link(
     inputs.extend(manifests.iter().cloned());
     let manifests = join_words(manifests.iter().map(|path| quote(path)));
     let libraries = link_libraries(model, target, config, &step, darwin, &mut inputs, &wrapper)?;
+    let mut implicit_inputs = Vec::new();
     if kind != LinkKind::StaticArchive
         && let Some(id) = model.find_target(target.dir, &target.name)
     {
@@ -248,8 +249,8 @@ pub(super) fn link(
         {
             let path = join(&model.dir(target.dir).source_dir, &entry.value);
             let path = build_relative(model, &path);
-            if !inputs.contains(&path) {
-                inputs.push(path);
+            if !inputs.contains(&path) && !implicit_inputs.contains(&path) {
+                implicit_inputs.push(path);
             }
         }
     }
@@ -501,7 +502,9 @@ pub(super) fn link(
         ));
     }
     before_link.append(&mut invocations);
+    implicit_inputs.retain(|path| !inputs.contains(path));
     Ok(BuildStep::Link {
+        implicit_inputs,
         inputs,
         step,
         invocations: before_link,

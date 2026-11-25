@@ -407,6 +407,7 @@ mod tests {
             ..GenerationResult::default()
         };
         let resolved = |id, dependencies: Vec<TargetId>| ResolvedTarget {
+            fortran: None,
             id,
             config: rcmake_genex::ConfigId("Debug".into()),
             metadata: TargetMetadata {

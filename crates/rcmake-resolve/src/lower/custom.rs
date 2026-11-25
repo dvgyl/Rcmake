@@ -655,6 +655,7 @@ pub(super) fn attach_link_events(
     let BuildStep::Link {
         step,
         inputs,
+        implicit_inputs,
         invocations,
     } = link
     else {
@@ -673,17 +674,23 @@ pub(super) fn attach_link_events(
     {
         let mut inputs = inputs;
         for dependency in before.depends {
-            if !inputs.contains(&dependency) && dependency != step.output {
+            if !inputs.contains(&dependency)
+                && !implicit_inputs.contains(&dependency)
+                && dependency != step.output
+            {
                 inputs.push(dependency);
             }
         }
         return BuildStep::Link {
+            implicit_inputs,
             inputs,
             step,
             invocations: before.invocations,
         };
     }
-    before.depends.splice(..0, inputs);
+    before
+        .depends
+        .splice(..0, inputs.into_iter().chain(implicit_inputs));
     before.outputs.insert(0, step.output);
     before.byproducts.extend(
         [

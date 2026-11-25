@@ -26,6 +26,7 @@ fn interpreter_in(mode: RunMode, cwd: &str) -> (Arc<PureHost>, Interp) {
     let host = Arc::new(PureHost::new(cwd.into(), "/cmake/bin/cmake".into()));
     let interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: host.clone(),
             mode,
             cmake_root: "/cmake".into(),
@@ -1328,6 +1329,7 @@ file(READ_MACHO "{}" ARCHITECTURES arm)
     native.write(&input, code.as_bytes(), rcmake_host::WriteMode::Truncate)?;
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: native,
             mode: RunMode::Script,
             cmake_root: folder.clone(),
@@ -1744,6 +1746,7 @@ fn scoped_locks_are_released_before_the_next_lock_command() -> TestResult {
         let host = Arc::new(PureHost::default());
         let mut interp = Interp::new(
             InterpConfig {
+                services: Default::default(),
                 host: host.clone(),
                 mode: RunMode::Script,
                 cmake_root: "/cmake".into(),
@@ -1898,6 +1901,7 @@ fn download_hashes_existing_files_above_the_single_read_limit() -> TestResult {
     let host = Arc::new(PureHost::default());
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: host.clone(),
             mode: RunMode::Script,
             cmake_root: "/cmake".into(),

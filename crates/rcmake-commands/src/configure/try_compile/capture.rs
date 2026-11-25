@@ -1,21 +1,18 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rcmake_base::BString;
 use rcmake_host::{
-    CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, Host, HostError, HostResult, Metadata,
-    Output, ReadRange, RunOutput, RunRequest, Stream, SystemInfo, WriteMode,
+    CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, GracefulTimeout, Host, HostResult,
+    Metadata, Output, ReadRange, RunOutput, RunRequest, Stream, SystemInfo, WriteMode,
 };
 
 use super::TIMEOUT;
 
-type HostCall = Box<dyn FnOnce(&dyn Host) + Send>;
-
-/// The evaluator owns its host, but the command context only provides a borrow.
-/// Keep the borrow on a scoped thread and forward child calls to that thread.
+/// Capture test-project output while forwarding operations to the parent host.
 pub(super) struct CapturingHost {
-    calls: mpsc::Sender<HostCall>,
+    parent: Arc<dyn Host>,
     output: Mutex<BString>,
     pub(super) trace_output: OnceLock<Option<PathBuf>>,
     system: SystemInfo,
@@ -24,149 +21,127 @@ pub(super) struct CapturingHost {
 
 impl CapturingHost {
     pub(super) fn capture<T>(
-        parent: &dyn Host,
+        parent: Arc<dyn Host>,
         cwd: &Path,
         configure: impl FnOnce(Arc<Self>) -> T,
-    ) -> HostResult<(T, BString)> {
-        std::thread::scope(|scope| {
-            let (calls, requests) = mpsc::channel::<HostCall>();
-            std::thread::Builder::new()
-                .name("rcmake-probe-host".to_owned())
-                .spawn_scoped(scope, move || {
-                    for call in requests {
-                        call(parent);
-                    }
-                })
-                .map_err(|error| HostError::from_io(error, None))?;
-            let host = Arc::new(Self {
-                calls,
-                output: Mutex::default(),
-                trace_output: OnceLock::new(),
-                system: parent.system(),
-                cwd: cwd.to_path_buf(),
-            });
-            let outcome = configure(host.clone());
-            let output = std::mem::take(
-                &mut *host
-                    .output
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-            Ok((outcome, output))
-        })
+    ) -> (T, BString) {
+        let host = Arc::new(Self {
+            system: parent.system(),
+            parent,
+            output: Mutex::default(),
+            trace_output: OnceLock::new(),
+            cwd: cwd.to_owned(),
+        });
+        let outcome = configure(Arc::clone(&host));
+        let output = std::mem::take(
+            &mut *host
+                .output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        (outcome, output)
     }
 
-    fn forward<T: Send + 'static>(
+    fn run_captured(
         &self,
-        call: impl FnOnce(&dyn Host) -> T + Send + 'static,
-    ) -> HostResult<T> {
-        let (reply, result) = mpsc::sync_channel(1);
-        self.send(Box::new(move |host| {
-            let _ = reply.send(call(host));
-        }))?;
-        result
-            .recv()
-            .map_err(|_| HostError::unsupported("The test project host stopped."))
-    }
-
-    fn send(&self, call: HostCall) -> HostResult<()> {
-        self.calls
-            .send(call)
-            .map_err(|_| HostError::unsupported("The test project host stopped."))
+        request: &RunRequest,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+        run: impl FnOnce(&RunRequest, &mut dyn FnMut(Stream, &[u8])) -> HostResult<RunOutput>,
+    ) -> HostResult<RunOutput> {
+        let (request, stdout, stderr) = capture_request(request);
+        let mut output = run(&request, &mut |stream, bytes| {
+            if (stream == Stream::Stdout && stdout) || (stream == Stream::Stderr && stderr) {
+                self.write_out(stream, bytes);
+            } else {
+                on_output(stream, bytes);
+            }
+        })?;
+        if stdout {
+            output.stdout.clear();
+        }
+        if stderr {
+            output.stderr.clear();
+        }
+        Ok(output)
     }
 }
 
+fn capture_request(request: &RunRequest) -> (RunRequest, bool, bool) {
+    let mut request = request.clone();
+    request.timeout = Some(
+        request
+            .timeout
+            .map_or(TIMEOUT, |timeout| timeout.min(TIMEOUT)),
+    );
+    let stdout = request.stdout == Output::Inherit;
+    let stderr = request.stderr == Output::Inherit;
+    if stdout {
+        request.stdout = Output::Capture;
+    }
+    if stderr {
+        request.stderr = Output::Capture;
+    }
+    request.tee |= stdout || stderr;
+    (request, stdout, stderr)
+}
+
 macro_rules! forward_host {
-    ($name:ident($($arg:ident: $ty:ty),*) -> $result:ty; $($owned:ident),* $(,)?) => {
-        fn $name(&self, $($arg: $ty),*) -> HostResult<$result> {
-            $(let $owned = $owned.to_owned();)*
-            self.forward(move |host| host.$name($($arg.as_ref()),*))?
+    ($name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty) => {
+        fn $name(&self, $($arg: $ty),*) -> $result {
+            self.parent.$name($($arg),*)
         }
     };
 }
 
 impl Host for CapturingHost {
-    forward_host!(read_dir(p: &Path) -> Vec<DirEntry>; p);
-    forward_host!(create_dir_all(p: &Path) -> (); p);
-    forward_host!(remove_file(p: &Path) -> (); p);
-    forward_host!(remove_dir(p: &Path) -> (); p);
-    forward_host!(remove_dir_all(p: &Path) -> (); p);
-    forward_host!(rename(from: &Path, to: &Path) -> (); from, to);
-    forward_host!(rename_noreplace(from: &Path, to: &Path) -> (); from, to);
-    forward_host!(symlink(target: &Path, link: &Path) -> (); target, link);
-    forward_host!(hard_link(src: &Path, dst: &Path) -> (); src, dst);
-    forward_host!(read_link(p: &Path) -> PathBuf; p);
-    forward_host!(canonicalize(p: &Path) -> PathBuf; p);
+    forward_host!(read_dir(p: &Path) -> HostResult<Vec<DirEntry>>);
+    forward_host!(create_dir_all(p: &Path) -> HostResult<()>);
+    forward_host!(remove_file(p: &Path) -> HostResult<()>);
+    forward_host!(remove_dir(p: &Path) -> HostResult<()>);
+    forward_host!(remove_dir_all(p: &Path) -> HostResult<()>);
+    forward_host!(rename(from: &Path, to: &Path) -> HostResult<()>);
+    forward_host!(rename_noreplace(from: &Path, to: &Path) -> HostResult<()>);
+    forward_host!(symlink(target: &Path, link: &Path) -> HostResult<()>);
+    forward_host!(hard_link(src: &Path, dst: &Path) -> HostResult<()>);
+    forward_host!(read_link(p: &Path) -> HostResult<PathBuf>);
+    forward_host!(canonicalize(p: &Path) -> HostResult<PathBuf>);
 
-    fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
-        let p = p.to_owned();
-        self.forward(move |host| host.metadata(&p, follow))?
-    }
-
-    fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
-        let p = p.to_owned();
-        self.forward(move |host| host.read(&p, range))?
-    }
+    forward_host!(metadata(p: &Path, follow: Follow) -> HostResult<Metadata>);
+    forward_host!(read(p: &Path, range: ReadRange) -> HostResult<Vec<u8>>);
+    forward_host!(read_chunks(p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()>);
+    forward_host!(
+        lock_file(path: &Path, timeout: Option<Duration>) -> HostResult<Box<dyn FileLockGuard>>
+    );
+    forward_host!(copy_file(from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()>);
+    forward_host!(set_permissions(p: &Path, mode: u32) -> HostResult<()>);
+    forward_host!(
+        set_times(p: &Path, atime: Option<FileTime>, mtime: Option<FileTime>) -> HostResult<()>
+    );
+    forward_host!(
+        set_symlink_times(
+            p: &Path,
+            atime: Option<FileTime>,
+            mtime: Option<FileTime>,
+        ) -> HostResult<()>
+    );
+    forward_host!(env_get(key: &[u8]) -> Option<BString>);
+    forward_host!(env_set(key: &[u8], value: Option<&[u8]>) -> ());
+    forward_host!(env_all() -> Vec<(BString, BString)>);
+    forward_host!(supports_process_execution() -> bool);
 
     fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {
-        let data = data.to_vec();
-        // The empty path routes trace lines. The parent already initialized its trace output.
+        // The empty path routes trace lines to the parent's trace destination.
         if p.as_os_str().is_empty() {
             return match self.trace_output.get() {
-                Some(Some(path)) => {
-                    let path = path.clone();
-                    self.forward(move |host| host.write(&path, &data, mode))?
+                Some(Some(path)) => self.parent.write(path, data, mode),
+                Some(None) => {
+                    self.parent.write_out(Stream::Stderr, data);
+                    Ok(())
                 }
-                Some(None) => self.forward(move |host| host.write_out(Stream::Stderr, &data)),
                 None => Ok(()),
             };
         }
-        let p = p.to_owned();
-        self.forward(move |host| host.write(&p, &data, mode))?
-    }
-
-    fn lock_file(
-        &self,
-        path: &Path,
-        timeout: Option<Duration>,
-    ) -> HostResult<Box<dyn FileLockGuard>> {
-        let path = path.to_owned();
-        self.forward(move |host| host.lock_file(&path, timeout))?
-    }
-
-    fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
-        let (from, to) = (from.to_owned(), to.to_owned());
-        self.forward(move |host| host.copy_file(&from, &to, opts))?
-    }
-
-    fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
-        let p = p.to_owned();
-        self.forward(move |host| host.set_permissions(&p, mode))?
-    }
-
-    fn set_times(
-        &self,
-        p: &Path,
-        atime: Option<FileTime>,
-        mtime: Option<FileTime>,
-    ) -> HostResult<()> {
-        let p = p.to_owned();
-        self.forward(move |host| host.set_times(&p, atime, mtime))?
-    }
-
-    fn env_get(&self, key: &[u8]) -> Option<BString> {
-        let key = key.to_vec();
-        self.forward(move |host| host.env_get(&key)).ok().flatten()
-    }
-
-    fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
-        let key = key.to_vec();
-        let value = value.map(<[u8]>::to_vec);
-        let _ = self.forward(move |host| host.env_set(&key, value.as_deref()));
-    }
-
-    fn env_all(&self) -> Vec<(BString, BString)> {
-        self.forward(|host| host.env_all()).unwrap_or_default()
+        self.parent.write(p, data, mode)
     }
 
     fn run(
@@ -174,58 +149,31 @@ impl Host for CapturingHost {
         req: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        enum Event {
-            Chunk(Stream, Vec<u8>),
-            Done(HostResult<RunOutput>),
-        }
-        let mut req = req.clone();
-        req.timeout = Some(req.timeout.map_or(TIMEOUT, |timeout| timeout.min(TIMEOUT)));
-        let stdout = req.stdout == Output::Inherit;
-        let stderr = req.stderr == Output::Inherit;
+        self.run_captured(req, on_output, |req, output| self.parent.run(req, output))
+    }
+
+    fn run_with_timeout_signal(
+        &self,
+        req: &RunRequest,
+        timeout: GracefulTimeout,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        self.run_captured(req, on_output, |req, output| {
+            self.parent.run_with_timeout_signal(req, timeout, output)
+        })
+    }
+
+    fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
+        let (mut req, stdout, stderr) = capture_request(req);
+        req.tee = false;
+        let mut result = self.parent.run_bounded(&req, limit)?;
         if stdout {
-            req.stdout = Output::Capture;
+            self.write_out(Stream::Stdout, &std::mem::take(&mut result.stdout));
         }
         if stderr {
-            req.stderr = Output::Capture;
+            self.write_out(Stream::Stderr, &std::mem::take(&mut result.stderr));
         }
-        if stdout || stderr {
-            req.tee = true;
-        }
-        let (output, events) = mpsc::sync_channel(1);
-        self.send(Box::new(move |host| {
-            let result = host.run(&req, &mut |stream, bytes| {
-                let _ = output.send(Event::Chunk(stream, bytes.to_vec()));
-            });
-            let _ = output.send(Event::Done(result));
-        }))?;
-        for event in events {
-            match event {
-                Event::Chunk(stream, bytes) => {
-                    let inherit = if stream == Stream::Stdout {
-                        stdout
-                    } else {
-                        stderr
-                    };
-                    if inherit {
-                        self.write_out(stream, &bytes);
-                    } else {
-                        on_output(stream, &bytes);
-                    }
-                }
-                Event::Done(result) => {
-                    return result.map(|mut output| {
-                        if stdout {
-                            output.stdout.clear();
-                        }
-                        if stderr {
-                            output.stderr.clear();
-                        }
-                        output
-                    });
-                }
-            }
-        }
-        Err(HostError::unsupported("The test project host stopped."))
+        Ok(result)
     }
 
     fn write_out(&self, _stream: Stream, bytes: &[u8]) {
@@ -235,35 +183,13 @@ impl Host for CapturingHost {
             .extend_from_slice(bytes);
     }
 
-    fn read_stdin(&self, limit: u64) -> HostResult<Vec<u8>> {
-        self.forward(move |host| host.read_stdin(limit))?
-    }
-
-    fn is_terminal(&self, stream: Stream) -> bool {
-        self.forward(move |host| host.is_terminal(stream))
-            .unwrap_or(false)
-    }
-
-    fn now(&self) -> FileTime {
-        self.forward(|host| host.now()).unwrap_or_default()
-    }
-
-    fn monotonic(&self) -> Duration {
-        self.forward(|host| host.monotonic()).unwrap_or_default()
-    }
-
-    fn sleep(&self, duration: Duration) {
-        let _ = self.forward(move |host| host.sleep(duration));
-    }
-
-    fn time_zone(&self) -> jiff::tz::TimeZone {
-        self.forward(|host| host.time_zone())
-            .unwrap_or(jiff::tz::TimeZone::UTC)
-    }
-
-    fn current_exe(&self) -> HostResult<PathBuf> {
-        self.forward(|host| host.current_exe())?
-    }
+    forward_host!(read_stdin(limit: u64) -> HostResult<Vec<u8>>);
+    forward_host!(is_terminal(stream: Stream) -> bool);
+    forward_host!(now() -> FileTime);
+    forward_host!(monotonic() -> Duration);
+    forward_host!(sleep(duration: Duration) -> ());
+    forward_host!(time_zone() -> jiff::tz::TimeZone);
+    forward_host!(current_exe() -> HostResult<PathBuf>);
 
     fn initial_cwd(&self) -> PathBuf {
         self.cwd.clone()

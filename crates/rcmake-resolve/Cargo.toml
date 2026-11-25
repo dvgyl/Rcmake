@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rcmake-fortran.workspace = true
 indexmap.workspace = true
 rcmake-base.workspace = true
 rcmake-cxxmodules.workspace = true

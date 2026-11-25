@@ -74,6 +74,9 @@ pub enum BuildError {
     /// A step index does not identify a graph step.
     #[error("invalid step index {0}")]
     InvalidStep(usize),
+    /// The executor does not support this step.
+    #[error("unsupported build step: {0}")]
+    UnsupportedStep(&'static str),
     /// The host could not perform a build operation.
     #[error(transparent)]
     Host(#[from] HostError),
@@ -173,12 +176,19 @@ pub fn execute(
                     ddi,
                     invocation,
                     depfile,
+                    preprocessed,
                     ..
                 } => {
                     if let Some(depfile) = depfile {
                         create_output_parent(host, &build_dir, depfile)?;
                     }
+                    if let Some(preprocessed) = preprocessed {
+                        create_output_parent(host, &build_dir, preprocessed)?;
+                    }
                     (std::slice::from_ref(ddi), std::slice::from_ref(invocation))
+                }
+                BuildStep::DeviceLink { .. } => {
+                    return Err(BuildError::UnsupportedStep("device link"));
                 }
                 BuildStep::Collate { .. } => {
                     return Err(module_error("Expected a compiler or scanner invocation."));
@@ -248,7 +258,10 @@ fn collate_modules(
         let file = Lexical::new(directory).append(b"CXXModules.json");
         Ok(read_modules_json(&read(&file)?)?)
     };
-    let mut info = depend_info.as_ref().clone();
+    let rcmake_resolve::DependInfo::Cxx(info) = depend_info.as_ref() else {
+        return Err(BuildError::UnsupportedStep("Fortran collation"));
+    };
+    let mut info = info.clone();
     let module_dir = Lexical::new(dd).parent();
     info.dir_top_bld = path::from_native(build_dir);
     info.module_dir = Lexical::new(&info.dir_top_bld).append(module_dir);
@@ -274,7 +287,7 @@ fn collate_modules(
             .iter()
             .map(|ddi| Ok(parse_ddi(&read(ddi)?, ddi)?))
             .collect::<Result<_, BuildError>>()?,
-        modmap_format: Some(*modmap_format),
+        modmap_format: *modmap_format,
     };
     let output = collate(&input)?;
     if !output.diagnostics.is_empty() {

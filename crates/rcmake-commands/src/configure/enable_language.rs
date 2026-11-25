@@ -451,7 +451,9 @@ impl Bootstrap {
         }
         let compiler_file = cat(&[&self.root_bin, b"/CMake", &lang, b"Compiler.cmake"]);
         let mut fatal = false;
-        if let Some(problem) = self.compiler_problem(cx, &lang) {
+        let problem = self.compiler_problem(cx, &lang);
+        let compiler_available = problem.is_none();
+        if let Some(problem) = problem {
             state.need_test = false;
             if !self.optional {
                 let _ = cx.host().remove_file(&path::to_native(&compiler_file));
@@ -522,6 +524,20 @@ impl Bootstrap {
                 let inspect = cat(&[b"Internal/CMakeInspect", &lang, b"Linker.cmake"]);
                 self.require_module(cx, &String::from_utf8_lossy(&inspect))?;
             }
+        }
+        if compiler_available
+            && !cx.fatal_occurred()
+            && (!state.need_test || self.in_try_compile || cx.var_is_on(&works))
+        {
+            let source = cx.var_or_empty(&lang_var(&lang, b"_SOURCE_FILE_EXTENSIONS"));
+            let ignored = cx.var_or_empty(&lang_var(&lang, b"_IGNORE_EXTENSIONS"));
+            let registry = cx.project().languages_mut();
+            registry.register_language(&lang);
+            registry.set_extensions(
+                &lang,
+                list::split(&source, Empty::Drop),
+                list::split(&ignored, Empty::Drop),
+            );
         }
         Ok(fatal)
     }

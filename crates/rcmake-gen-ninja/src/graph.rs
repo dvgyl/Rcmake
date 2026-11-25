@@ -133,7 +133,17 @@ impl<'a> Graph<'a> {
             match step {
                 BuildStep::Compile { object, .. } => nodes.outputs.push(graph.node(object)),
                 BuildStep::Link { step, .. } => nodes.outputs.push(graph.node(&step.output)),
-                BuildStep::Scan { ddi, .. } => nodes.outputs.push(graph.node(ddi)),
+                BuildStep::DeviceLink { .. } => {
+                    return Err(GenError::Unimplemented("device linking for Ninja"));
+                }
+                BuildStep::Scan {
+                    ddi, preprocessed, ..
+                } => {
+                    nodes.outputs.push(graph.node(ddi));
+                    nodes
+                        .byproducts
+                        .extend(preprocessed.iter().map(|output| graph.node(output)));
+                }
                 BuildStep::Collate { dd, modmaps, .. } => {
                     nodes.outputs.push(graph.node(dd));
                     nodes
@@ -584,8 +594,8 @@ impl<'a> Graph<'a> {
         cmake: &[u8],
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
-    ) {
-        self.emit_into(ninja, cmake, modmap_flag, exports, None);
+    ) -> Result<(), GenError> {
+        self.emit_into(ninja, cmake, modmap_flag, exports, None)
     }
 
     pub(crate) fn emit_into(
@@ -595,7 +605,7 @@ impl<'a> Graph<'a> {
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
         mut emitted: Option<&mut HashSet<BString>>,
-    ) {
+    ) -> Result<(), GenError> {
         for (step, nodes) in self.input.steps.iter().zip(&self.steps) {
             if let Some(emitted) = &mut emitted {
                 if nodes.outputs.iter().any(|node| emitted.contains(node)) {
@@ -609,12 +619,12 @@ impl<'a> Graph<'a> {
                     let mut unique = nodes.clone();
                     unique.byproducts.retain(|node| !emitted.contains(node));
                     emitted.extend(unique.outputs.iter().chain(&unique.byproducts).cloned());
-                    self.emit_step(ninja, step, &unique, cmake, modmap_flag, exports);
+                    self.emit_step(ninja, step, &unique, cmake, modmap_flag, exports)?;
                     continue;
                 }
                 emitted.extend(nodes.outputs.iter().chain(&nodes.byproducts).cloned());
             }
-            self.emit_step(ninja, step, nodes, cmake, modmap_flag, exports);
+            self.emit_step(ninja, step, nodes, cmake, modmap_flag, exports)?;
         }
 
         let mut all = Vec::new();
@@ -658,6 +668,7 @@ impl<'a> Graph<'a> {
                 ninja.phony(&alias, inputs);
             }
         }
+        Ok(())
     }
 
     pub(crate) fn emit_clean_inputs(&self, ninja: &mut Ninja) {
@@ -706,8 +717,8 @@ impl<'a> Graph<'a> {
         cmake: &[u8],
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
-    ) {
-        let plan = self.plan_step(step, nodes, cmake, modmap_flag, exports);
+    ) -> Result<(), GenError> {
+        let plan = self.plan_step(step, nodes, cmake, modmap_flag, exports)?;
         let inputs = unique(plan.inputs);
         let implicit = unique(plan.implicit_inputs);
         let mut order_only = Vec::new();
@@ -760,6 +771,7 @@ impl<'a> Graph<'a> {
         for (key, value) in plan.bindings {
             ninja.binding(key, &value);
         }
+        Ok(())
     }
 }
 

@@ -160,6 +160,9 @@ pub(crate) fn write_metadata(
             else {
                 continue;
             };
+            let rcmake_resolve::DependInfo::Cxx(depend_info) = depend_info.as_ref() else {
+                return Err(GenError::Unimplemented("Fortran collation for Ninja"));
+            };
             let file = absolute(&top_bld, tdi);
             let path = path::to_native(&file);
             if !seen.insert(file) {
@@ -211,7 +214,7 @@ pub(crate) fn write_metadata(
                     add_target_metadata(&mut info, target, model, &path, multi_config)?;
                 }
             } else {
-                info = depend_info.as_ref().clone();
+                info = depend_info.clone();
                 if let Some(install) = &mut info.bmi_installation {
                     install.script_location = rcmake_resolve::lower::bmi_script_path(
                         &top_bld,

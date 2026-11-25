@@ -105,6 +105,7 @@ impl Project<'_> {
             GenError::Invalid(body) => {
                 let file = to_native(&self.model.dir(dir).source_dir).join("CMakeLists.txt");
                 let diagnostic = Diagnostic {
+                    annotations: None,
                     kind: MessageKind::Error,
                     effect: Effect::Fatal,
                     category: None,

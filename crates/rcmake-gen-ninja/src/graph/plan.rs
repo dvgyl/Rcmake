@@ -1,6 +1,6 @@
 use rcmake_base::BString;
-use rcmake_gen_common::export::ModuleExportJob;
-use rcmake_resolve::{BuildStep, progress};
+use rcmake_gen_common::{GenError, export::ModuleExportJob};
+use rcmake_resolve::{BuildStep, DependInfo, progress};
 
 use super::{Graph, StepNodes, is_library_symlink};
 use crate::response::{COMPILE_MSVC, Response};
@@ -50,11 +50,12 @@ impl<'a> Graph<'a> {
         cmake: &[u8],
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
-    ) -> EdgePlan {
-        match step {
+    ) -> Result<EdgePlan, GenError> {
+        let plan = match step {
             BuildStep::Compile {
                 object,
                 source,
+                compile_input,
                 invocation,
                 depfile,
                 modmap,
@@ -73,7 +74,11 @@ impl<'a> Graph<'a> {
                 } else {
                     crate::instrumented::compile(invocation, scanned, depfile.is_some())
                 };
-                let mut plan = EdgePlan::new(rule, vec![self.node(source)], nodes);
+                let mut plan = EdgePlan::new(
+                    rule,
+                    vec![self.node(compile_input.as_ref().unwrap_or(source))],
+                    nodes,
+                );
                 plan.implicit_inputs
                     .extend(modmap.iter().map(|map| self.node(map)));
                 plan.implicit_inputs.extend(
@@ -170,6 +175,9 @@ impl<'a> Graph<'a> {
                 depend_info,
                 ..
             } => {
+                let DependInfo::Cxx(depend_info) = depend_info.as_ref() else {
+                    return Err(GenError::Unimplemented("Fortran collation for Ninja"));
+                };
                 let inputs = ddis.iter().map(|ddi| self.node(ddi)).collect();
                 let rule: &[u8] = if self.commands.windows() {
                     b"CXX_DYNDEP_WINDOWS"
@@ -240,13 +248,19 @@ impl<'a> Graph<'a> {
                 }
                 plan
             }
+            BuildStep::DeviceLink { .. } => {
+                return Err(GenError::Unimplemented("device linking for Ninja"));
+            }
             BuildStep::Link {
                 inputs,
+                implicit_inputs,
                 step,
                 invocations,
             } => {
                 let path_inputs = inputs.iter().map(|input| self.node(input)).collect();
                 let mut plan = EdgePlan::new(step.kind.ninja_rule(), path_inputs, nodes);
+                plan.implicit_inputs
+                    .extend(implicit_inputs.iter().map(|input| self.node(input)));
                 let command = self.command_line(invocations, false);
                 let response = self.link_response(step, inputs, invocations, &command);
                 plan.bind_command(command, response);
@@ -265,7 +279,7 @@ impl<'a> Graph<'a> {
                     .map(|input| self.custom_input(input))
                     .collect();
                 if custom.invocations.is_empty() {
-                    return EdgePlan::new(b"phony", inputs, nodes);
+                    return Ok(EdgePlan::new(b"phony", inputs, nodes));
                 }
                 let rule = if is_library_symlink(custom) {
                     b"CMAKE_SYMLINK_LIBRARY".as_slice()
@@ -315,6 +329,7 @@ impl<'a> Graph<'a> {
                 }
                 plan
             }
-        }
+        };
+        Ok(plan)
     }
 }

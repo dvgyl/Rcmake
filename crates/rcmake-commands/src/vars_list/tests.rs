@@ -18,6 +18,7 @@ impl Script {
         let host = Arc::new(PureHost::default());
         let interp = Interp::new(
             InterpConfig {
+                services: Default::default(),
                 host: host.clone(),
                 mode: RunMode::Script,
                 cmake_root: PathBuf::from("/opt/cmake/share/cmake-4.5"),

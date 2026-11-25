@@ -22,7 +22,7 @@ use rcmake_store::{Digest, StoreConfig};
 
 use super::try_compile::{
     cache::{Artifact, ObservedOutcome, ProbeCache, ProbePublishOutcome, SkipReason},
-    journal::{JournalHost, JournalMode, ProcessVerifier, SPECULATIVE_TIMEOUT},
+    journal::{JournalHost, JournalMode, ProcessVerifier, SPECULATIVE_TIMEOUT, speculative_now},
     plan::{
         DiagnosticStream, ProbeDiagnostic, ProbeEligibility, ProbeRecipe, ReuseScope,
         compute_probe_key, environment_fingerprint, request_digest,
@@ -311,7 +311,7 @@ impl ProbePool {
         {
             return reject();
         }
-        let deadline = Instant::now() + SPECULATIVE_TIMEOUT;
+        let deadline = speculative_now() + SPECULATIVE_TIMEOUT;
         state.inflight.insert(key, deadline);
         state.bytes += bytes;
         state.pending.push_back(Job {
@@ -331,7 +331,7 @@ impl ProbePool {
     pub(crate) fn wait_for(&self, key: Digest) {
         let mut state = self.shared.state();
         while let Some(deadline) = state.inflight.get(&key) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(speculative_now());
             if remaining.is_zero() || self.shared.cancelled() {
                 break;
             }
@@ -453,7 +453,7 @@ fn execute(context: &WorkerContext<'_>, job: Job, shared: &Shared) -> HostResult
         deadline,
         ..
     } = job;
-    let cancelled = || shared.cancelled() || Instant::now() >= deadline;
+    let cancelled = || shared.cancelled() || speculative_now() >= deadline;
     if cancelled() {
         return Ok(JobResult::Cancelled);
     }
@@ -478,7 +478,7 @@ fn execute(context: &WorkerContext<'_>, job: Job, shared: &Shared) -> HostResult
         Some(context.process_verifier),
     )?
     .with_speculation(&environment, &shared.cancel, &shared.shutdown, deadline);
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    let remaining = deadline.saturating_duration_since(speculative_now());
     let plan = prepare(&recipe, &environment, &scratch.path, remaining)?;
     let mut outcome = run_plan(&journal, &scratch.path, &recipe, &plan)?;
     let journal = journal.finish();

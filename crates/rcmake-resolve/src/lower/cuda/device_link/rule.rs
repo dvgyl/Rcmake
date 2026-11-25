@@ -47,7 +47,7 @@ impl Rule<'_> {
         } else {
             BString::default()
         };
-        let compiler_key = compiler_key(self.lang, b"_COMPILER");
+        let compiler_var = compiler_key(self.lang, b"_COMPILER");
         let arg1_key = compiler_key(self.lang, b"_COMPILER_ARG1");
         let launcher_key = compiler_key(self.lang, b"_COMPILER_LAUNCHER");
         let linker_launcher_key = compiler_key(self.lang, b"_LINKER_LAUNCHER");
@@ -88,41 +88,44 @@ impl Rule<'_> {
                 implicit(&rule, &arg1_key, &arg1),
                 toolchain.clone(),
             ]);
-            let expanded = expand_rule(&join_words([launcher.clone(), rule]), |key| {
-                Some(match key {
-                    b"TARGET" | b"OBJECT" => quote(self.output),
-                    b"TARGET_BASE" => quote(base),
-                    b"OBJECT_DIR" => quote(self.dir),
-                    b"TARGET_SUPPORT_DIR" => quote(&support),
-                    b"OBJECTS" => words(self.input.objects),
-                    b"LINK_LIBRARIES" => libraries.clone(),
-                    b"FLAGS" | b"LANGUAGE_COMPILE_FLAGS" => words(self.input.compile_flags),
-                    b"LINK_FLAGS" => words(self.link_flags),
-                    b"LINK_PATH" => link_path.clone(),
-                    b"TARGET_NAME" => quote(&self.target.name),
-                    b"TARGET_TYPE" => self.target.kind.as_str().into(),
-                    b"CONFIG" => quote(&self.config.0),
-                    b"LANGUAGE" => language.clone(),
-                    b"FATBINARY" => macro_path(stub?.0),
-                    b"REGISTER_FILE" => macro_path(stub?.1),
-                    b"CMAKE_CURRENT_BINARY_DIR" => {
-                        quote(&self.model.dir(self.target.dir).binary_dir)
-                    }
-                    b"CMAKE_BINARY_DIR" => quote(&self.model.dir(DirId::ROOT).binary_dir),
-                    b"LINKER" => quote(get(b"_DEVICE_LINKER")?),
-                    b"CMAKE_COMMAND" => {
-                        quote(definition(key).map_or(b"cmake".as_slice(), |path| path.as_slice()))
-                    }
-                    key if key == compiler_key.as_slice() => compiler.clone(),
-                    key if key == arg1_key.as_slice() => arg1.clone(),
-                    key if key == launcher_key.as_slice()
-                        || key == linker_launcher_key.as_slice() =>
-                    {
-                        BString::default()
-                    }
-                    _ => return definition(key).cloned(),
-                })
-            });
+            let expanded = expand_rule(
+                &join_words([launcher.clone(), rule.as_ref().into()]),
+                |key| {
+                    Some(match key {
+                        b"TARGET" | b"OBJECT" => quote(self.output),
+                        b"TARGET_BASE" => quote(base),
+                        b"OBJECT_DIR" => quote(self.dir),
+                        b"TARGET_SUPPORT_DIR" => quote(&support),
+                        b"OBJECTS" => words(self.input.objects),
+                        b"LINK_LIBRARIES" => libraries.clone(),
+                        b"FLAGS" | b"LANGUAGE_COMPILE_FLAGS" => words(self.input.compile_flags),
+                        b"LINK_FLAGS" => words(self.link_flags),
+                        b"LINK_PATH" => link_path.clone(),
+                        b"TARGET_NAME" => quote(&self.target.name),
+                        b"TARGET_TYPE" => self.target.kind.as_str().into(),
+                        b"CONFIG" => quote(&self.config.0),
+                        b"LANGUAGE" => language.clone(),
+                        b"FATBINARY" => macro_path(stub?.0),
+                        b"REGISTER_FILE" => macro_path(stub?.1),
+                        b"CMAKE_CURRENT_BINARY_DIR" => {
+                            quote(&self.model.dir(self.target.dir).binary_dir)
+                        }
+                        b"CMAKE_BINARY_DIR" => quote(&self.model.dir(DirId::ROOT).binary_dir),
+                        b"LINKER" => quote(get(b"_DEVICE_LINKER")?),
+                        b"CMAKE_COMMAND" => quote(
+                            definition(key).map_or(b"cmake".as_slice(), |path| path.as_slice()),
+                        ),
+                        key if key == compiler_var.as_slice() => compiler.clone(),
+                        key if key == arg1_key.as_slice() => arg1.clone(),
+                        key if key == launcher_key.as_slice()
+                            || key == linker_launcher_key.as_slice() =>
+                        {
+                            BString::default()
+                        }
+                        _ => return definition(key).cloned(),
+                    })
+                },
+            );
             if expanded.iter().any(|byte| !byte.is_ascii_whitespace()) {
                 if !shell.is_empty() {
                     shell.extend_from_slice(b" && ");

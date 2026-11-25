@@ -582,6 +582,7 @@ mod tests {
                     PolicyMap::default(),
                 );
                 let link = |name: &str| LinkItem {
+                    scope: None,
                     text: BT::new(name.into(), Backtrace::default()),
                     lookup_dir: DirId::ROOT,
                 };

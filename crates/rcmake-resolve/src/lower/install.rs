@@ -165,6 +165,7 @@ impl InstallManifest {
                         format!("INSTALL command given absolute DESTINATION path:\n\n  {path}")
                             .into();
                     let diagnostic = Diagnostic {
+                        annotations: None,
                         kind: if action == DiagAction::Warn {
                             MessageKind::Warning
                         } else {

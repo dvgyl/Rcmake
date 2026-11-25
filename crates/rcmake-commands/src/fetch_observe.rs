@@ -2,7 +2,6 @@
 
 //! Observe FetchContent declarations and match transfers from bundled population code.
 
-#![cfg(all(feature = "native", any(unix, windows)))]
 #![forbid(unsafe_code)]
 
 use std::{collections::BTreeMap, fmt};
@@ -24,7 +23,7 @@ use rcmake_fetch::{
 
 /// The source selected by a FetchContent declaration.
 #[derive(Clone, Eq, PartialEq)]
-pub enum DeclaredSource {
+pub(crate) enum DeclaredSource {
     /// One or more archive mirrors.
     Archive {
         /// Full ordered list of download URLs.
@@ -48,22 +47,22 @@ pub enum DeclaredSource {
 }
 /// The first declaration of one dependency in a configure.
 #[derive(Clone, Eq, PartialEq)]
-pub struct DeclaredFetch {
+pub(crate) struct DeclaredFetch {
     /// ASCII-lowercased dependency name.
-    pub name: String,
+    pub(crate) name: String,
     /// Declared source.
-    pub source: DeclaredSource,
+    pub(crate) source: DeclaredSource,
     /// Whether DOWNLOAD_COMMAND occurs, including an explicitly empty command.
-    pub custom_download: bool,
+    pub(crate) custom_download: bool,
     /// Nonempty SOURCE_DIR specified in the declaration.
-    pub source_dir: Option<BString>,
+    pub(crate) source_dir: Option<BString>,
     transfer_settings: bool,
     custom_update: bool,
     package_lookup: bool,
 }
 impl DeclaredFetch {
     /// Return the explicit Git pin if the tag is a full commit ID.
-    pub fn git_commit(&self) -> Option<&str> {
+    pub(crate) fn git_commit(&self) -> Option<&str> {
         match &self.source {
             DeclaredSource::Git { tag: Some(tag), .. }
                 if tag.len() == 40 && tag.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
@@ -78,7 +77,7 @@ impl DeclaredFetch {
     }
 }
 /// Parse a valid, expanded bundled FetchContent_Declare call.
-pub fn parse_fetchcontent_declare(args: &[ExpandedArg]) -> Option<DeclaredFetch> {
+pub(crate) fn parse_fetchcontent_declare(args: &[ExpandedArg]) -> Option<DeclaredFetch> {
     let (name, args) = args.split_first()?;
     let name = text(&name.value)
         .filter(|name| name.len() <= 256)?
@@ -200,7 +199,7 @@ fn is_option(value: &[u8]) -> bool {
         .any(|key| key.as_bytes() == value)
 }
 /// A configure-local index of FetchContent declarations and requested fetch rules.
-pub struct FetchSession {
+pub(crate) struct FetchSession {
     declarations: BTreeMap<String, DeclaredFetch>,
     mode: FetchLockMode,
     offline: bool,
@@ -208,17 +207,17 @@ pub struct FetchSession {
 }
 /// Population identity after the hook verifies the bundled call and command source.
 #[derive(Clone, Copy)]
-pub struct PopulationSite<'a> {
+pub(crate) struct PopulationSite<'a> {
     /// Dependency name from the enclosing bundled call.
-    pub dependency: &'a str,
+    pub(crate) dependency: &'a str,
     /// Whether FETCHCONTENT_SOURCE_DIR_<NAME> currently overrides population.
-    pub source_override: bool,
+    pub(crate) source_override: bool,
     /// Repository resolved by the bundled CMP0150 logic for a relative declaration.
-    pub effective_git_repository: Option<&'a str>,
+    pub(crate) effective_git_repository: Option<&'a str>,
 }
 impl FetchSession {
     /// Start a session with the evaluator settings and the Host offline setting.
-    pub fn new(services: &Services, host: &dyn Host) -> Self {
+    pub(crate) fn new(services: &Services, host: &dyn Host) -> Self {
         Self {
             declarations: BTreeMap::new(),
             mode: services.speed.fetch_lock,
@@ -229,7 +228,7 @@ impl FetchSession {
         }
     }
     /// Record an expanded bundled FetchContent_Declare call. The first valid declaration wins.
-    pub fn observe(
+    pub(crate) fn observe(
         &mut self,
         args: &[ExpandedArg],
     ) -> Result<Option<&DeclaredFetch>, BlockedFetch> {
@@ -273,12 +272,12 @@ impl FetchSession {
         self.offline || matches!(self.mode, FetchLockMode::Update | FetchLockMode::Frozen)
     }
     /// Find the observed declaration by its case-insensitive name.
-    pub fn get(&self, name: &str) -> Option<&DeclaredFetch> {
+    pub(crate) fn get(&self, name: &str) -> Option<&DeclaredFetch> {
         self.declarations.get(&name.to_ascii_lowercase())
     }
     /// Match a bundled file(DOWNLOAD) by dependency, URL, and hash.
     /// Pass the arguments after the URL. Stop on error.
-    pub fn match_archive<'a>(
+    pub(crate) fn match_archive<'a>(
         &'a self,
         site: PopulationSite<'_>,
         url: &'a str,
@@ -310,7 +309,11 @@ impl FetchSession {
         }))
     }
     /// Reject unenforced transfers in Offline or Frozen mode.
-    pub fn blocked(&self, site: PopulationSite<'_>, failure: BlockReason) -> Option<BlockedFetch> {
+    pub(crate) fn blocked(
+        &self,
+        site: PopulationSite<'_>,
+        failure: BlockReason,
+    ) -> Option<BlockedFetch> {
         if site.source_override || !(self.offline || self.mode == FetchLockMode::Frozen) {
             return None;
         }
@@ -335,17 +338,17 @@ impl FetchSession {
     }
 }
 /// Arguments required for an archive cache lookup and the original transfer.
-pub struct ArchiveTransfer<'a> {
+pub(crate) struct ArchiveTransfer<'a> {
     /// Dependency name used by the fetch lockfile.
-    pub dependency: &'a str,
+    pub(crate) dependency: &'a str,
     /// All URLs in declaration order.
-    pub urls: &'a [String],
+    pub(crate) urls: &'a [String],
     /// Original declared hash, when present.
-    pub declared_hash: Option<&'a str>,
+    pub(crate) declared_hash: Option<&'a str>,
     /// Endpoint selected by this download attempt.
-    pub url: &'a str,
+    pub(crate) url: &'a str,
     /// Original arguments after the URL, including the destination.
-    pub args: &'a [&'a [u8]],
+    pub(crate) args: &'a [&'a [u8]],
 }
 fn matches_transfer_hash(declared: Option<&str>, args: &[&[u8]]) -> bool {
     const OPTIONS: &str = "STATUS LOG TIMEOUT INACTIVITY_TIMEOUT TLS_VERIFY TLS_CAINFO TLS_VERSION NETRC NETRC_FILE HTTPHEADER";
@@ -385,7 +388,7 @@ fn matches_transfer_hash(declared: Option<&str>, args: &[&[u8]]) -> bool {
 }
 /// Reason a FetchContent transfer cannot proceed under the requested mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BlockReason {
+pub(crate) enum BlockReason {
     /// A content pin is required.
     Unpinned,
     /// The transfer would run custom or unsupported population code.
@@ -405,7 +408,7 @@ pub enum BlockReason {
 }
 /// A diagnostic safe to display without the original transfer arguments or process output.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BlockedFetch {
+pub(crate) struct BlockedFetch {
     dependency: String,
     endpoint: Option<String>,
     reason: BlockReason,
@@ -454,7 +457,7 @@ fn safe_name(value: &str) -> String {
     }
 }
 /// Return a diagnostic URL identity without user info, path, query, or fragment.
-pub fn sanitize_url(url: &str) -> String {
+pub(crate) fn sanitize_url(url: &str) -> String {
     LockEntry::source_endpoint(url)
 }
 fn credentialed_option(key: &[u8], value: &[u8]) -> bool {
@@ -501,11 +504,11 @@ fn relative_repo(repository: &str) -> bool {
     repository.starts_with("../") && portable_source(repository)
 }
 /// Check a public archive or Git identity before transport or lockfile use.
-pub fn portable_source(source: &str) -> bool {
+pub(crate) fn portable_source(source: &str) -> bool {
     LockEntry::is_portable_source(source)
 }
 /// Convert the evaluator mode explicitly so the two defaults do not affect each other.
-pub const fn lock_mode(mode: FetchLockMode) -> LockMode {
+pub(crate) const fn lock_mode(mode: FetchLockMode) -> LockMode {
     match mode {
         FetchLockMode::Off => LockMode::Off,
         FetchLockMode::Auto => LockMode::Auto,
@@ -514,7 +517,7 @@ pub const fn lock_mode(mode: FetchLockMode) -> LockMode {
     }
 }
 /// Recognized Git commands from the bundled clone template.
-pub enum GitTransfer<'a> {
+pub(crate) enum GitTransfer<'a> {
     /// A clone of the observed repository with the original template options.
     Clone(GitClone<'a>),
     /// Checkout of the declared tag or commit.
@@ -522,7 +525,7 @@ pub enum GitTransfer<'a> {
 }
 impl FetchSession {
     /// Prefetch a pinned source with default options. Pass current population settings.
-    pub fn prefetch(
+    pub(crate) fn prefetch(
         &self,
         pool: &FetchPool,
         declaration: &DeclaredFetch,
@@ -575,7 +578,7 @@ impl FetchSession {
             .map_err(|_| FetchError::Invalid("Cannot queue fetch prefetch.".into()))
     }
     /// Match a bundled Git clone or checkout. The hook verifies its working directory.
-    pub fn match_git<'a>(
+    pub(crate) fn match_git<'a>(
         &self,
         site: PopulationSite<'_>,
         program: &[u8],
@@ -617,7 +620,7 @@ impl FetchSession {
         })
     }
     /// Apply cache and lock rules to a download. In Update, record successful results.
-    pub fn fetch_archive_with(
+    pub(crate) fn fetch_archive_with(
         &self,
         cache: &ArchiveCache<'_>,
         transfer: &ArchiveTransfer<'_>,
@@ -698,7 +701,7 @@ impl FetchSession {
 }
 impl ArchiveTransfer<'_> {
     /// Record the full mirror list and content identity in an Update session.
-    pub fn record(
+    pub(crate) fn record(
         &self,
         lock: &mut LockSession<'_>,
         result: &ArchiveResult,

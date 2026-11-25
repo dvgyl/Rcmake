@@ -179,3 +179,85 @@ fn step_budget_stops_a_loop_and_reports_the_limit() -> Result<(), ApiError> {
     ));
     Ok(())
 }
+
+#[test]
+fn empty_foreach_uses_the_step_budget() -> Result<(), ApiError> {
+    let script =
+        format!("{PROJECT}\nforeach(item RANGE 1000)\nendforeach()\nadd_library(late INTERFACE)\n");
+    let (_, request) = fixture(&script)?;
+    let result = run_configure(request.step_budget(20))?;
+    assert_eq!(result.model.targets().count(), 3);
+    assert!(result.generation.is_none());
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.body == b"Configure reached its limit of 20 commands."
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn variable_history_tracks_scope_and_cache_writes() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_eval::VarOp;
+
+    let script = format!(
+        "{PROJECT}\n{}",
+        r#"
+set(TRACKED original)
+function(write_value value)
+  set(TRACKED local)
+  set(TRACKED "${value}" PARENT_SCOPE)
+endfunction()
+write_value(first)
+write_value(second)
+set(TRACKED cache CACHE STRING "Test value" FORCE)
+unset(TRACKED CACHE)
+"#
+    );
+    let (_, request) = fixture(&script)?;
+    let result = run_configure(request)?;
+    let ledger = result
+        .var_ledger
+        .as_ref()
+        .ok_or("Missing variable history.")?;
+    let events: Vec<_> = ledger.history(b"TRACKED").collect();
+    let [
+        root,
+        local_first,
+        parent_first,
+        local_second,
+        parent_second,
+        cache_set,
+        cache_unset,
+    ] = events.as_slice()
+    else {
+        return Err(format!("Unexpected variable history: {events:?}").into());
+    };
+    assert_ne!(local_first.scope_id, local_second.scope_id);
+    assert_eq!(local_first.scope_depth, local_second.scope_depth);
+    assert_eq!(parent_first.scope_id, root.scope_id);
+    assert_eq!(parent_second.scope_id, root.scope_id);
+    assert_eq!(parent_second.op, VarOp::ParentScope);
+    assert_eq!(
+        parent_second
+            .old_value
+            .as_ref()
+            .map(|value| value.prefix.as_slice()),
+        Some(b"first".as_slice())
+    );
+    assert_eq!(cache_set.op, VarOp::CacheSet);
+    assert_eq!(cache_unset.op, VarOp::CacheUnset);
+    assert_eq!(
+        cache_unset
+            .old_value
+            .as_ref()
+            .map(|value| value.prefix.as_slice()),
+        Some(b"cache".as_slice())
+    );
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| { matches!(pair, [previous, next] if previous.seq < next.seq) })
+    );
+    Ok(())
+}

@@ -34,6 +34,7 @@ fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Result<Interp, Box<dyn std::e
     }
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host,
             mode: RunMode::Configure,
             cmake_root: cwd.join("cmake"),

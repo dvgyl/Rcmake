@@ -34,6 +34,7 @@ fn compile_step(
     object: BString,
 ) -> BuildStep {
     BuildStep::Compile {
+        compile_input: None,
         object,
         source,
         depfile: None,

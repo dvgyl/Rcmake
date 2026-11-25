@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use rcmake_base::BString;
+use rcmake_model::DirId;
 
 /// One binding in a variable scope.
 ///
@@ -17,16 +18,29 @@ pub enum Binding {
     Unset,
 }
 
+#[derive(Debug)]
+struct Scope {
+    id: u64,
+    directory: Option<DirId>,
+    bindings: BTreeMap<BString, Binding>,
+}
+
 /// Stack of variable scopes. Index `0` is the outermost (directory) scope.
 #[derive(Debug)]
 pub(crate) struct VarStack {
-    scopes: Vec<BTreeMap<BString, Binding>>,
+    scopes: Vec<Scope>,
+    next_id: u64,
 }
 
 impl Default for VarStack {
     fn default() -> Self {
         Self {
-            scopes: vec![BTreeMap::new()],
+            scopes: vec![Scope {
+                id: 0,
+                directory: Some(DirId::ROOT),
+                bindings: BTreeMap::new(),
+            }],
+            next_id: 1,
         }
     }
 }
@@ -40,12 +54,31 @@ impl VarStack {
 
     /// Find the innermost binding for `name`.
     pub(crate) fn lookup(&self, name: &[u8]) -> Option<&Binding> {
-        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.bindings.get(name))
     }
 
     /// Value of the innermost normal binding, if it is [`Binding::Set`].
     pub(crate) fn get(&self, name: &[u8]) -> Option<&BString> {
-        match self.lookup(name) {
+        self.get_from(name, false)
+    }
+
+    pub(crate) fn scope_identity(&self, parent: bool) -> Option<(u32, u64, Option<DirId>)> {
+        let depth = self.scopes.len().checked_sub(1 + usize::from(parent))?;
+        let scope = self.scopes.get(depth)?;
+        Some((u32::try_from(depth).ok()?, scope.id, scope.directory))
+    }
+
+    pub(crate) fn get_from(&self, name: &[u8], parent: bool) -> Option<&BString> {
+        let binding = self
+            .scopes
+            .iter()
+            .rev()
+            .skip(usize::from(parent))
+            .find_map(|scope| scope.bindings.get(name));
+        match binding {
             Some(Binding::Set(v)) => Some(v),
             Some(Binding::Unset) | None => None,
         }
@@ -63,17 +96,30 @@ impl VarStack {
 
     fn insert_top(&mut self, name: &[u8], binding: Binding) {
         if let Some(top) = self.scopes.last_mut() {
-            if let Some(current) = top.get_mut(name) {
+            if let Some(current) = top.bindings.get_mut(name) {
                 *current = binding;
             } else {
-                top.insert(BString::from(name), binding);
+                top.bindings.insert(BString::from(name), binding);
             }
         }
     }
 
     /// Push a new empty scope.
     pub(crate) fn push(&mut self) {
-        self.scopes.push(BTreeMap::new());
+        self.push_scope(None);
+    }
+
+    pub(crate) fn push_directory(&mut self, dir: DirId) {
+        self.push_scope(Some(dir));
+    }
+
+    fn push_scope(&mut self, directory: Option<DirId>) {
+        self.scopes.push(Scope {
+            id: self.next_id,
+            directory,
+            bindings: BTreeMap::new(),
+        });
+        self.next_id = self.next_id.saturating_add(1);
     }
 
     /// Pop the innermost scope. The outermost scope is never removed.
@@ -97,7 +143,7 @@ impl VarStack {
         self.insert_top(name, current);
         if let Some(parent) = self.scopes.get_mut(len - 2) {
             let binding = value.map_or(Binding::Unset, Binding::Set);
-            parent.insert(BString::from(name), binding);
+            parent.bindings.insert(BString::from(name), binding);
         }
         true
     }
@@ -106,7 +152,7 @@ impl VarStack {
     pub(crate) fn visible_names(&self) -> Vec<BString> {
         let mut seen: BTreeMap<&BString, bool> = BTreeMap::new();
         for scope in self.scopes.iter().rev() {
-            for (name, binding) in scope {
+            for (name, binding) in &scope.bindings {
                 seen.entry(name)
                     .or_insert(matches!(binding, Binding::Set(_)));
             }

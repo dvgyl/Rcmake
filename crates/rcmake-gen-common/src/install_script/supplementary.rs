@@ -466,11 +466,18 @@ impl Outputs {
         for graph in &result.graphs {
             for step in &graph.steps {
                 let BuildStep::Collate {
-                    target, dd, ddis, ..
+                    target,
+                    dd,
+                    ddis,
+                    depend_info,
+                    ..
                 } = step
                 else {
                     continue;
                 };
+                if !matches!(depend_info.as_ref(), rcmake_resolve::DependInfo::Cxx(_)) {
+                    continue;
+                }
                 let Some(rule) = result
                     .targets
                     .iter()

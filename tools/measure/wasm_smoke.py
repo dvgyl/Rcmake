@@ -3,7 +3,8 @@
 """Run the Milestone 6 WebAssembly acceptance checks.
 
 Source env/env.sh before use. The rcmake-api wasm_smoke example checks three
-generated targets, cancellation, and a partial result on a denied process.
+generated targets, provenance, cancellation, try_compile, and a partial result
+on a denied process.
 Use --wasi-bin to run a prebuilt copy of that example.
 """
 
@@ -51,10 +52,12 @@ def check_smoke(output: str) -> str:
     if (result.get("ok") is not True or result.get("targets") != ["core", "util", "app"]
             or result.get("provenance") != "-DCORE_API=1"
             or type(result.get("denied_processes")) is not int or result["denied_processes"] != 1
-            or result.get("cancelled") is not True):
+            or result.get("cancelled") is not True
+            or result.get("complete") is not True or result.get("provisional") is not True
+            or result.get("try_compile") != "passed"):
         raise ValueError("The wasm_smoke report lacks evidence of all required checks.")
     # The example reports a denial only after it verifies the partial result and index.
-    return "Verified three generated targets, provenance, cancellation, and the partial result."
+    return "Verified three targets, provenance, the partial result, cancellation, and try_compile."
 
 
 def run_gate(report: dict, args, env: dict[str, str], name: str, command: list[str],

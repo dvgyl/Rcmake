@@ -34,6 +34,7 @@ members = [
     "crates/rcmake-cli",
     "crates/rcmake-harness",
     "crates/rcmake-fuzz",
+    "crates/rcmake-api",
 ]
 
 [workspace.package]
@@ -80,7 +81,8 @@ rcmake-model = { path = "crates/rcmake-model" }
 rcmake-eval = { path = "crates/rcmake-eval" }
 rcmake-presets = { path = "crates/rcmake-presets" }
 rcmake-archive = { path = "crates/rcmake-archive" }
-rcmake-commands = { path = "crates/rcmake-commands" }
+rcmake-commands = { path = "crates/rcmake-commands", default-features = false }
+rcmake-api = { path = "crates/rcmake-api", default-features = false }
 rcmake-tool-e = { path = "crates/rcmake-tool-e" }
 rcmake-genex = { path = "crates/rcmake-genex" }
 rcmake-resolve = { path = "crates/rcmake-resolve" }

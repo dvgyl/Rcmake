@@ -142,6 +142,10 @@ pub(crate) enum SkipReason {
     Outcome,
     /// Another store operation prevented publication.
     Busy,
+    /// The store does not allow writes.
+    Disabled,
+    /// The host cannot lock the store.
+    Unsupported,
     /// The job was cancelled before publication.
     Cancelled,
 }
@@ -449,8 +453,9 @@ impl ProbeCache {
             if cancelled() {
                 return Ok(ProbePublishOutcome::Skipped(SkipReason::Cancelled));
             }
-            match store.put_entry(Domain::ProbeV1, key, &entry) {
-                Ok(_) => {
+            use rcmake_store::PublishOutcome;
+            match store.put_entry(Domain::ProbeV1, key, &entry)? {
+                PublishOutcome::Published | PublishOutcome::AlreadyPresent => {
                     let visible = store.get_entry::<CachedProbe>(Domain::ProbeV1, key)?;
                     if visible.is_some_and(|entry| entry.payload.checks.verify(host)) {
                         Ok(ProbePublishOutcome::Published)
@@ -458,7 +463,12 @@ impl ProbeCache {
                         Ok(ProbePublishOutcome::Skipped(SkipReason::Busy))
                     }
                 }
-                Err(error) => Err(error),
+                PublishOutcome::Stale => Ok(inputs_changed()),
+                PublishOutcome::SkippedBusy => Ok(ProbePublishOutcome::Skipped(SkipReason::Busy)),
+                PublishOutcome::Disabled => Ok(ProbePublishOutcome::Skipped(SkipReason::Disabled)),
+                PublishOutcome::SkippedUnsupported => {
+                    Ok(ProbePublishOutcome::Skipped(SkipReason::Unsupported))
+                }
             }
         };
         publish().unwrap_or_else(|error| ProbePublishOutcome::StoreError(error.to_string()))

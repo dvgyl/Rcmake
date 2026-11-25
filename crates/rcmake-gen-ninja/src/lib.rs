@@ -5,6 +5,16 @@
 mod build;
 mod clean;
 mod commands;
+#[allow(
+    dead_code,
+    reason = "The language activation wave uses this emitter or planner"
+)]
+mod cuda;
+#[allow(
+    dead_code,
+    reason = "The language activation wave uses this emitter or planner"
+)]
+mod fortran;
 mod graph;
 mod install;
 
@@ -183,7 +193,7 @@ fn generate_single(
     }
     let mut ninja = graph.manifest();
     ninja.include(&graph.node(RULES_PATH.as_bytes()));
-    graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports);
+    graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports)?;
     graph.emit_entry_aliases(&mut ninja);
     graph.emit_assumed_sources(&mut ninja, model);
     prep.emit(&mut ninja, &graph);
@@ -397,7 +407,7 @@ fn generate_multi(
                 &module_flag,
                 &exports,
                 Some(&mut emitted),
-            );
+            )?;
             graph.emit_clean_inputs(&mut ninja);
             files.prep.emit(&mut ninja, graph);
         }

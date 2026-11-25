@@ -32,6 +32,7 @@ fn resolves_executable_and_command_expressions_by_configuration() {
     for (id_config, config) in result.configs.iter_mut().zip(["Debug", "Release"]) {
         id_config.0 = config.into();
         result.targets.push(ResolvedTarget {
+            fortran: None,
             id,
             config: id_config.clone(),
             metadata: TargetMetadata {

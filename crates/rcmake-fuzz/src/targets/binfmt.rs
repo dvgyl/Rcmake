@@ -163,7 +163,10 @@ fn elf_image(wide: bool, big: bool, sections: bool, count: usize, name: &[u8]) -
         };
         number(&mut image, dynamic_row + 4, 6, 4); // SHT_DYNAMIC.
         number(&mut image, dynamic_row + file_at, dynamic, word);
-        number(&mut image, dynamic_row + size_at, strings - dynamic, word);
+        number(&mut image, dynamic_row + address_at, BASE + dynamic, word);
+        let dynamic_size = strings - dynamic;
+        number(&mut image, dynamic_row + size_at, dynamic_size, word);
+        number(&mut image, dynamic_row + size_at + word, dynamic_size, word);
         number(&mut image, dynamic_row + link_at, 2, 4);
         number(&mut image, dynamic_row + entry_at, 2 * word, word);
         number(&mut image, string_row + 4, 3, 4); // SHT_STRTAB.
@@ -182,7 +185,10 @@ fn elf_image(wide: bool, big: bool, sections: bool, count: usize, name: &[u8]) -
         let dynamic_row = header + row_size;
         number(&mut image, dynamic_row, 2, 4); // PT_DYNAMIC.
         number(&mut image, dynamic_row + file_at, dynamic, word);
-        number(&mut image, dynamic_row + size_at, strings - dynamic, word);
+        number(&mut image, dynamic_row + address_at, BASE + dynamic, word);
+        let dynamic_size = strings - dynamic;
+        number(&mut image, dynamic_row + size_at, dynamic_size, word);
+        number(&mut image, dynamic_row + size_at + word, dynamic_size, word);
     }
     let tags = [(5, BASE + strings), (10, strings_size)]
         .into_iter()
@@ -208,10 +214,12 @@ fn pe_image(plus: bool, import_kind: u64, count: usize, name: &[u8]) -> Vec<u8> 
         (13, 32, 4)
     };
     let table_size = (count + 1) * stride;
-    let raw_size = table_size + name.len() + 1;
+    let virtual_size = table_size + name.len() + 1;
+    let raw_size = virtual_size.next_multiple_of(RAW);
+    let image_size = (RVA + virtual_size).next_multiple_of(RVA);
     let mut image = vec![0; RAW + table_size];
     image.extend_from_slice(name);
-    image.push(0);
+    image.resize(RAW + raw_size, 0);
     let dir_at = OPTIONAL + if plus { 112 } else { 96 };
     let section = dir_at + (directory + 1) * 8;
     let number =
@@ -219,6 +227,7 @@ fn pe_image(plus: bool, import_kind: u64, count: usize, name: &[u8]) -> Vec<u8> 
     put(&mut image, 0, b"MZ");
     number(&mut image, 0x3c, PE, 4);
     put(&mut image, PE, b"PE\0\0");
+    number(&mut image, PE + 4, if plus { 0x8664 } else { 0x14c }, 2);
     number(&mut image, PE + 6, 1, 2);
     number(&mut image, PE + 20, section - OPTIONAL, 2);
     number(&mut image, OPTIONAL, if plus { 0x20b } else { 0x10b }, 2);
@@ -228,11 +237,14 @@ fn pe_image(plus: bool, import_kind: u64, count: usize, name: &[u8]) -> Vec<u8> 
         BASE,
         if plus { 8 } else { 4 },
     );
+    number(&mut image, OPTIONAL + 32, RVA, 4);
+    number(&mut image, OPTIONAL + 36, RAW, 4);
+    number(&mut image, OPTIONAL + 56, image_size, 4);
     number(&mut image, OPTIONAL + 60, RAW, 4);
     number(&mut image, dir_at - 4, directory + 1, 4);
     number(&mut image, dir_at + directory * 8, RVA, 4);
     number(&mut image, dir_at + directory * 8 + 4, table_size, 4);
-    number(&mut image, section + 8, raw_size, 4);
+    number(&mut image, section + 8, virtual_size, 4);
     number(&mut image, section + 12, RVA, 4);
     number(&mut image, section + 16, raw_size, 4);
     number(&mut image, section + 20, RAW, 4);

@@ -69,6 +69,7 @@ pub(super) fn report(host: &dyn Host, interp: &mut Interp, results: &mut Vec<Val
         sarif: true,
     });
     let diagnostic = Diagnostic {
+        annotations: None,
         kind: if is_error {
             MessageKind::Error
         } else {

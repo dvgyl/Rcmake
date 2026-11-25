@@ -240,6 +240,7 @@ fn fixture(
         };
         result.configs.push(config.clone());
         result.targets.push(ResolvedTarget {
+            fortran: None,
             id: core,
             config,
             metadata: TargetMetadata {

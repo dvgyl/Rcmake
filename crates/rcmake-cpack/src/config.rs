@@ -240,6 +240,7 @@ pub(crate) fn interpreter(
     let (_, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), argv0);
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: Arc::clone(host),
             mode: RunMode::Script,
             cmake_root: cmake_root.unwrap_or_default(),

@@ -11,7 +11,7 @@ repository.workspace = true
 [dependencies]
 rcmake-archive.workspace = true
 rcmake-base.workspace = true
-rcmake-commands.workspace = true
+rcmake-commands = { workspace = true, features = ["archive"] }
 rcmake-diag.workspace = true
 rcmake-eval.workspace = true
 rcmake-host.workspace = true

@@ -15,6 +15,7 @@ fn configure(
     let host = Arc::new(PureHost::default());
     let mut interp = Interp::new(
         InterpConfig {
+            services: Default::default(),
             host: host.clone(),
             mode: RunMode::Configure,
             cmake_root: "/cmake".into(),

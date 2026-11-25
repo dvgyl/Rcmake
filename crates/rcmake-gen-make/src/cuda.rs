@@ -70,7 +70,7 @@ pub(crate) fn emit(
     add_directory(&output);
     let mut invocations = Vec::new();
     match mode {
-        DeviceLinkMode::Driver { invocation } => invocations.push(invocation),
+        DeviceLinkMode::Driver { invocation, .. } => invocations.push(invocation),
         DeviceLinkMode::Explicit {
             cubins,
             fatbinary,
@@ -217,6 +217,7 @@ mod tests {
     #[test]
     fn driver_adds_link_depends_only_to_the_rule() -> Result<(), GenError> {
         let (text, products) = render(DeviceLinkMode::Driver {
+            response_file: None,
             invocation: invocation(&["nvcc", "-dlink", "obj/kernel.o"]),
         })?;
         assert!(text.starts_with(

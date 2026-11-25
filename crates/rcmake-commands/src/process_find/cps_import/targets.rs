@@ -307,6 +307,7 @@ fn add_link(target: &mut Target, value: BString) {
         .interface_link_libraries
         .get_or_insert_with(Vec::new)
         .push(LinkItem {
+            scope: None,
             text: BT::new(value, target.backtrace.clone()),
             lookup_dir: target.dir,
         });

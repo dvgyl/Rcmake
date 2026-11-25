@@ -243,7 +243,7 @@ fn install_dependency(
         InstallKind::Code(_) => "CODE",
         _ => return Ok(None),
     };
-    let diagnostic = rcmake_diag::Diagnostic {
+    let diagnostic = rcmake_diag::Diagnostic { annotations: None,
         kind: rcmake_diag::MessageKind::Error,
         effect: rcmake_diag::Effect::SetError,
         category: None,

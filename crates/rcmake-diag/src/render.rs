@@ -379,6 +379,7 @@ mod tests {
             kind: FrameKind::Command,
         });
         let d = Diagnostic {
+            annotations: None,
             kind: MessageKind::Warning,
             effect: crate::Effect::None,
             category: None,
@@ -404,6 +405,7 @@ mod tests {
             kind: FrameKind::Command,
         });
         let author = Diagnostic {
+            annotations: None,
             kind: MessageKind::AuthorWarning,
             effect: crate::Effect::None,
             category: Some(DiagCategory::Author),
@@ -419,6 +421,7 @@ mod tests {
         );
 
         let dep = Diagnostic {
+            annotations: None,
             kind: MessageKind::DeprecationWarning,
             effect: crate::Effect::None,
             category: Some(DiagCategory::Deprecated),
@@ -437,6 +440,7 @@ mod tests {
     #[test]
     fn no_location_error_has_no_indent_or_extra_newlines() {
         let d = Diagnostic {
+            annotations: None,
             kind: MessageKind::Error,
             effect: crate::Effect::Fatal,
             category: None,

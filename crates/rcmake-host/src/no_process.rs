@@ -68,6 +68,12 @@ const MAX_ARGS: usize = 64;
 const MAX_REASON_BYTES: usize = 1024;
 pub(super) const DENIED_MESSAGE: &str = "process execution is disabled in this host mode";
 
+/// Check whether the process-denial adapter produced this error.
+#[must_use]
+pub fn is_process_denial(error: &HostError) -> bool {
+    error.kind == std::io::ErrorKind::Unsupported && error.os_message == DENIED_MESSAGE
+}
+
 /// Host method that received the process request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeniedMethod {

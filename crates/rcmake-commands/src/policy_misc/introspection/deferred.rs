@@ -112,7 +112,7 @@ fn print_request(
             }
         }
         if block.is_empty() && request.names.is_none() {
-            let diagnostic = Diagnostic {
+            let diagnostic = Diagnostic { annotations: None,
                 kind: MessageKind::Warning,
                 effect: Effect::None,
                 category: None,

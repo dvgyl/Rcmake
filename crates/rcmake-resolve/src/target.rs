@@ -75,6 +75,7 @@ pub(crate) fn resolve_target<'a>(
         (artifacts, None)
     };
     let mut resolved = ResolvedTarget {
+        fortran: None,
         id,
         config: ctx.config.clone(),
         metadata,
@@ -197,7 +198,8 @@ pub(crate) fn resolve_target<'a>(
                     language: Some(language.clone()),
                     ..ctx.clone()
                 };
-                let features = usage.collect(id, UsageField::CompileFeatures, &compile_ctx)?;
+                let features =
+                    usage.collect_for_result(id, UsageField::CompileFeatures, &compile_ctx)?;
                 for feature in &features.entries {
                     if let Err(message) = model.validate_compile_feature(&feature.value, |key| {
                         lower::definition(model, target.dir, key)
@@ -252,18 +254,18 @@ pub(crate) fn resolve_target<'a>(
                 }
                 flags.extend(
                     usage
-                        .collect(id, UsageField::CompileOptions, &compile_ctx)?
+                        .collect_for_result(id, UsageField::CompileOptions, &compile_ctx)?
                         .entries,
                 );
                 let mut defines = usage
-                    .collect(id, UsageField::CompileDefinitions, &compile_ctx)?
+                    .collect_for_result(id, UsageField::CompileDefinitions, &compile_ctx)?
                     .entries;
                 if let Some(symbol) = &export_symbol
                     && !defines.iter().any(|define| define.value == *symbol)
                 {
                     defines.insert(0, BT::new(symbol.clone(), target.backtrace.clone()));
                 }
-                let includes = usage.collect_includes(id, &compile_ctx)?;
+                let includes = usage.collect_includes_for_result(id, &compile_ctx)?;
                 let group = entry.index();
                 let mut facts = CompileGroup {
                     language,

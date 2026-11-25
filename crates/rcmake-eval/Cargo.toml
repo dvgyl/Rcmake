@@ -19,5 +19,9 @@ rcmake-regex.workspace = true
 rcmake-syntax.workspace = true
 thiserror.workspace = true
 
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
 [lints]
 workspace = true

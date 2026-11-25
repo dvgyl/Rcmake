@@ -24,6 +24,7 @@ fn custom(program: &str) -> BuildStep {
 
 fn link(file: &str, invocations: Vec<Invocation>) -> BuildStep {
     BuildStep::Link {
+        implicit_inputs: Vec::new(),
         inputs: vec!["obj/main.o".into()],
         step: LinkStep {
             kind: LinkKind::Executable,
@@ -186,6 +187,7 @@ fn uses_argv_and_shell_fallback_and_stops_at_first_failed_invocation() -> Result
     let graph = BuildGraph {
         steps: vec![
             BuildStep::Compile {
+                compile_input: None,
                 object: "obj/main.o".into(),
                 source: "main.c".into(),
                 invocation: invocation(&["compiler", "arg with spaces"]),
@@ -269,6 +271,7 @@ fn builds_and_links_c_with_native_host() -> Result<(), Box<dyn std::error::Error
     let graph = BuildGraph {
         steps: vec![
             BuildStep::Compile {
+                compile_input: None,
                 object: "obj/main.o".into(),
                 source: "main.c".into(),
                 depfile: None,
@@ -333,6 +336,8 @@ fn scans_and_collates_before_compiling_module_providers() -> Result<(), Box<dyn 
         Ok(RunOutput { results: vec![ProcessResult::Exited(0)], ..RunOutput::default() })
     })?;
     let scan = |source: &str, object: &str, ddi: &str| BuildStep::Scan {
+        lang: "CXX".into(),
+        preprocessed: None,
         source: source.into(),
         object: object.into(),
         ddi: ddi.into(),
@@ -340,6 +345,7 @@ fn scans_and_collates_before_compiling_module_providers() -> Result<(), Box<dyn 
         depfile: None,
     };
     let compile = |source: &str, object: &str, map: &str| BuildStep::Compile {
+        compile_input: None,
         source: source.into(),
         object: object.into(),
         modmap: Some(map.into()),
@@ -352,12 +358,13 @@ fn scans_and_collates_before_compiling_module_providers() -> Result<(), Box<dyn 
             scan("use.cpp", "obj/use.o", "obj/use.o.ddi"),
             scan("math.cppm", "obj/math.o", "obj/math.o.ddi"),
             BuildStep::Collate {
+                lang: "CXX".into(),
                 target: "main".into(),
                 ddis: vec!["obj/use.o.ddi".into(), "obj/math.o.ddi".into()],
                 dd: "obj/CXX.dd".into(),
                 modmaps: vec!["obj/use.o.modmap".into(), "obj/math.o.modmap".into()],
                 tdi: "obj/CXXDependInfo.json".into(),
-                depend_info: Box::new(TargetDependInfo {
+                depend_info: Box::new(rcmake_resolve::DependInfo::Cxx(TargetDependInfo {
                     language: "CXX".into(),
                     cxx_modules: BTreeMap::from([(
                         "obj/math.o".into(),
@@ -369,8 +376,8 @@ fn scans_and_collates_before_compiling_module_providers() -> Result<(), Box<dyn 
                         },
                     )]),
                     ..TargetDependInfo::default()
-                }),
-                modmap_format: ModmapFormat::Clang,
+                })),
+                modmap_format: Some(ModmapFormat::Clang),
                 implicit_inputs: vec!["obj/CXXDependInfo.json".into()],
             },
             compile("use.cpp", "obj/use.o", "obj/use.o.modmap"),

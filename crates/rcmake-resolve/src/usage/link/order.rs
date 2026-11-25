@@ -4,22 +4,38 @@ use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, ByteSlice, list, truth};
-use rcmake_diag::{
-    DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus, RenderOptions,
-    render,
-};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::EvalContext;
-use rcmake_host::Stream;
-use rcmake_model::{DirId, ProjectModel, Target, TargetId, TargetKind};
+use rcmake_model::{ProjectModel, Target, TargetId, TargetKind};
 
 use super::{Limits, LinkKey, ResolvedLinkItem, ResolvedLinkKind, UsageResolver, link_context};
 use crate::{ResolveError, lower::definition, sources::SourcePaths};
+
+mod diagnostics;
+use diagnostics::{print_link_order, warn_policy};
 
 impl UsageResolver<'_> {
     pub(crate) fn ordered_links(
         &mut self,
         target: TargetId,
         ctx: &EvalContext,
+    ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
+        self.order_links(target, ctx, false)
+    }
+
+    pub(crate) fn ordered_links_for_result(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
+        self.order_links(target, ctx, self.provenance.is_some())
+    }
+
+    fn order_links(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+        record: bool,
     ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
         let ctx = link_context(target, ctx);
         let owner = self.target(target)?;
@@ -49,6 +65,12 @@ impl UsageResolver<'_> {
             .iter()
             .map(|item| (graph.insert(item), Arc::clone(item)))
             .collect();
+        let mut chains = record.then(|| {
+            direct
+                .iter()
+                .map(|item| (item.key(), Vec::new()))
+                .collect::<HashMap<_, _>>()
+        });
         let mut inferred = IndexMap::new();
         let mut edge_budget = Limits::default().max_value_bytes / 64;
         graph.infer_raw_edges(
@@ -60,8 +82,15 @@ impl UsageResolver<'_> {
         while let Some((_, (item, _))) = graph.nodes.get_index(index) {
             let item = Arc::clone(item);
             let mut edges = IndexSet::new();
-            for parent in item.edge_targets() {
+            for (parent, edge) in item.edges() {
                 let (items, _) = self.usage_links(parent, true, &ctx)?;
+                if let Some(chains) = &mut chains {
+                    let mut path = chains.get(&item.key()).cloned().unwrap_or_default();
+                    path.push(edge.hop(parent));
+                    for child in items.iter() {
+                        chains.entry(child.key()).or_insert_with(|| path.clone());
+                    }
+                }
                 let indices: Vec<_> = items.iter().map(|item| graph.insert(item)).collect();
                 graph.infer_raw_edges(&mut inferred, &mut edge_budget, indices.iter().copied())?;
                 edges.extend(indices);
@@ -116,6 +145,19 @@ impl UsageResolver<'_> {
                 ResolvedLinkKind::Objects(_) | ResolvedLinkKind::ObjectFile
             )
         });
+        if let (Some(provenance), Some(chains)) = (&mut self.provenance, chains) {
+            for item in &ordered {
+                let path = chains.get(&item.key()).cloned().unwrap_or_default();
+                provenance.record(
+                    target,
+                    &ctx.config,
+                    crate::ChainKind::LinkItem,
+                    &item.text,
+                    path,
+                    item.targets().collect(),
+                );
+            }
+        }
         Ok(ordered)
     }
 
@@ -657,74 +699,6 @@ fn describe_feature(feature: &[u8]) -> String {
     } else {
         format!("with the feature '{}'", BString::from(feature))
     }
-}
-
-fn warn_policy(model: &ProjectModel, paths: &SourcePaths<'_>, target: &Target, number: u16) {
-    let policy = PolicyId::new(number);
-    let defined_on =
-        |key: &[u8]| definition(model, target.dir, key).is_some_and(|value| truth::is_on(value));
-    if target.policies.policies.get(policy) != PolicyStatus::Warn
-        || !defined_on(format!("CMAKE_POLICY_WARNING_{policy}").as_bytes())
-        || defined_on(b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
-        || model
-            .global
-            .props
-            .get(b"IN_TRY_COMPILE")
-            .is_some_and(|value| truth::is_on(value))
-    {
-        return;
-    }
-    let summary = policy.info().map_or("", |info| info.summary);
-    let behavior = if number == 156 {
-        "legacy libraries de-duplication strategy will be applied."
-    } else {
-        "static libraries de-duplication will keep the last occurrence of the static libraries."
-    };
-    let diagnostic = Diagnostic {
-        kind: MessageKind::AuthorWarning,
-        effect: Effect::None,
-        category: Some(DiagCategory::Policy),
-        policy: Some(policy),
-        location: Location::Backtrace(target.backtrace.clone()),
-        body: format!("Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nSince the policy is not set, {behavior}").into(),
-    };
-    paths.host.write_out(
-        Stream::Stderr,
-        &render(
-            &diagnostic,
-            &RenderOptions {
-                relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
-                ..RenderOptions::default()
-            },
-        ),
-    );
-}
-
-fn print_link_order(
-    paths: &SourcePaths<'_>,
-    model: &ProjectModel,
-    target: &Target,
-    heading: &str,
-    items: &[Arc<ResolvedLinkItem>],
-) {
-    let mut output = format!("target [{}] {heading}:\n", target.name);
-    for item in items {
-        if let ResolvedLinkKind::Group { feature, .. } = &item.kind {
-            let _ = writeln!(output, "  group, feature [{feature}]");
-            continue;
-        }
-        if let Some(target) = item.edge_targets().next().and_then(|id| model.target(id)) {
-            let _ = write!(output, "  target [{}]", target.name);
-        } else {
-            let _ = write!(output, "  item [{}]", item.text.value);
-        }
-        if let Some(feature) = &item.feature {
-            let _ = write!(output, ", feature [{feature}]");
-        }
-        output.push('\n');
-    }
-    output.push('\n');
-    paths.host.write_out(Stream::Stderr, output.as_bytes());
 }
 
 #[derive(Default)]

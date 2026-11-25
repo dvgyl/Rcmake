@@ -85,6 +85,7 @@ fn generate(
         vec![ConfigId(interp.cx().var_or_empty(b"CMAKE_BUILD_TYPE"))]
     };
     let options = ResolveOptions {
+        provenance: false,
         ide: match kind {
             GeneratorKind::Xcode => Some(IdeFlavor::Xcode),
             GeneratorKind::VisualStudio(_) => Some(IdeFlavor::VisualStudio),
@@ -123,13 +124,13 @@ fn generate(
         }
     };
     if result.graphs.iter().flat_map(|graph| &graph.steps).any(|step| {
-        matches!(step, rcmake_resolve::BuildStep::Collate { depend_info, .. } if depend_info.database_info.is_some())
+        matches!(step, rcmake_resolve::BuildStep::Collate { depend_info, .. } if matches!(depend_info.as_ref(), rcmake_resolve::DependInfo::Cxx(info) if info.database_info.is_some()))
     }) {
         let category = DiagCategory::Experimental;
         let action = interp.cx().diag_state().get(category);
         if action != DiagAction::Ignore {
             let failure = action > DiagAction::Warn;
-            let diagnostic = Diagnostic {
+            let diagnostic = Diagnostic { annotations: None,
                 kind: if failure { MessageKind::AuthorError } else { MessageKind::AuthorWarning },
                 effect: if failure { Effect::SetError } else { Effect::None },
                 category: Some(category),
@@ -440,7 +441,7 @@ fn write_common(
     manifest.actions.extend(supplementary.actions);
     if interp.cx().var_is_on(b"CMAKE_SKIP_INSTALL_RULES") {
         if !manifest.actions.is_empty() {
-            let warning = Diagnostic {
+            let warning = Diagnostic { annotations: None,
                 kind: MessageKind::Warning,
                 effect: Effect::None,
                 category: None,

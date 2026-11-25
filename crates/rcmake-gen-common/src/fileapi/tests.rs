@@ -245,6 +245,7 @@ fn fixture(source: &Path, build: &Path) -> TestResult<(ProjectModel, GenerationR
             });
         }
         result.targets.push(ResolvedTarget {
+            fortran: None,
             id,
             config: Default::default(),
             metadata: TargetMetadata {

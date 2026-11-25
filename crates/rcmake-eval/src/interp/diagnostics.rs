@@ -114,6 +114,7 @@ impl Interp {
             }
         }
         let diag = Diagnostic {
+            annotations: None,
             kind,
             effect,
             category,
@@ -138,6 +139,7 @@ impl Interp {
     pub(crate) fn error_no_location(&mut self, body: BString) {
         let state = *self.diag_top();
         let diag = Diagnostic {
+            annotations: None,
             kind: MessageKind::Error,
             effect: Effect::SetError,
             category: None,

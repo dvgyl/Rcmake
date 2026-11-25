@@ -177,7 +177,7 @@ fn check_rich(rng: &mut Rng) -> Result<(), String> {
     let options = RichOptions {
         color: false,
         terminal_width: width,
-        unicode: mode % 2 != 0,
+        unicode: !mode.is_multiple_of(2),
     };
     let rendered = render_rich(&diagnostic, Some(&annotations), &sources, options);
     let text = std::str::from_utf8(rendered.as_slice())

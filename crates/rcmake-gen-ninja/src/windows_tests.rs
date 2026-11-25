@@ -37,6 +37,7 @@ fn msvc_compile() -> BuildStep {
     ]);
     invocation.shell = "cl.exe -c 'POSIX shell text'".into();
     BuildStep::Compile {
+        compile_input: None,
         object: object.into(),
         source: source.into(),
         invocation,
@@ -131,6 +132,7 @@ fn windows_uses_configured_response_files_and_moves_long_archive_inputs()
     let graph = result.graphs.first_mut().ok_or("Missing build graph.")?;
     graph.steps.clear();
     graph.steps.push(BuildStep::Link {
+        implicit_inputs: Vec::new(),
         inputs: vec!["obj dir/main.obj".into()],
         step: LinkStep {
             kind: LinkKind::Executable,
@@ -165,6 +167,7 @@ fn windows_uses_configured_response_files_and_moves_long_archive_inputs()
     let mut libr = argv(&["C:/VC/lib.exe", "/nologo", "/out:archive.lib"]);
     libr.argv.extend(objects.iter().cloned());
     let archive = BuildStep::Link {
+        implicit_inputs: Vec::new(),
         inputs: objects,
         step: LinkStep {
             kind: LinkKind::StaticArchive,
@@ -271,6 +274,7 @@ fn prefixed_windows_graph_keeps_real_import_outputs() -> Result<(), Box<dyn std:
 
     let input = BuildGraph {
         steps: vec![BuildStep::Link {
+            implicit_inputs: Vec::new(),
             inputs: vec!["C:/build root/generated.res".into()],
             step: LinkStep {
                 kind: LinkKind::SharedLibrary,
@@ -309,7 +313,7 @@ fn prefixed_windows_graph_keeps_real_import_outputs() -> Result<(), Box<dyn std:
         windows(),
     )?;
     let mut ninja = crate::Ninja::default();
-    graph.emit(&mut ninja, b"cmake", b"", &[]);
+    graph.emit(&mut ninja, b"cmake", b"", &[])?;
     let manifest = String::from_utf8(ninja.0)?;
     assert!(manifest.contains("build build$ root/runtime/app.dll | build$ root/lib/app.lib: LINK_SHARED_LIBRARY build$ root/generated.res\n"));
     assert!(manifest.contains(r#" /C "cd /D "C:\build root" && link.exe generated.res /out:runtime/app.dll /implib:lib/app.lib /pdb:app.pdb""#));

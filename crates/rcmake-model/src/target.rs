@@ -194,6 +194,8 @@ pub struct LinkItem {
     /// Directory whose target names resolve the item (`CMP0079`: the directory of the
     /// `target_link_libraries()` call).
     pub lookup_dir: DirId,
+    /// Original scope of the link command, when available.
+    pub scope: Option<UsageScope>,
 }
 
 /// A usage-requirement property with backtraces per entry (ADR-007).

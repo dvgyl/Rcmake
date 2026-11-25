@@ -167,6 +167,7 @@ pub(super) fn check_separation(
             ));
         }
         warnings.push(Diagnostic {
+            annotations: None,
             kind: MessageKind::AuthorWarning,
             effect: Effect::None,
             category: Some(DiagCategory::Author),
