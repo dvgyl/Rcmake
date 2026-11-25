@@ -87,18 +87,11 @@ fn project_cache_key(name: &str) -> String {
     format!("PROJECT_{name}_GUID_CMAKE")
 }
 
-fn target_type(target: &Target, result: &GenerationResult, id: TargetId) -> Option<Isa> {
+fn target_type(model: &ProjectModel, target: &Target) -> Option<Isa> {
+    if !model.is_in_build_system(target) {
+        return None;
+    }
     match target.kind {
-        TargetKind::UnknownLibrary => None,
-        TargetKind::InterfaceLibrary
-            if target.sources.is_empty()
-                && target.file_sets.is_empty()
-                && !result.targets.iter().any(|t| {
-                    t.id == id && t.ide.as_ref().is_some_and(|f| !f.sources.is_empty())
-                }) =>
-        {
-            None
-        }
         TargetKind::Utility | TargetKind::GlobalTarget | TargetKind::InterfaceLibrary => {
             Some(Isa::PBXAggregateTarget)
         }
@@ -106,11 +99,7 @@ fn target_type(target: &Target, result: &GenerationResult, id: TargetId) -> Opti
     }
 }
 
-pub(crate) fn populate_guid_cache(
-    result: &GenerationResult,
-    model: &mut ProjectModel,
-    host: &dyn Host,
-) {
+pub(crate) fn populate_guid_cache(model: &mut ProjectModel, host: &dyn Host) {
     for project in project_roots(GeneratorKind::Xcode, model) {
         let name = text(&project.name);
         ids::store(
@@ -122,8 +111,8 @@ pub(crate) fn populate_guid_cache(
     }
     let mut targets = model
         .targets()
-        .filter_map(|(id, target)| {
-            let isa = target_type(target, result, id).filter(|_| !target.is_imported())?;
+        .filter_map(|(_, target)| {
+            let isa = target_type(model, target)?;
             Some((text(&target.name), isa))
         })
         .collect::<Vec<_>>();
@@ -233,7 +222,7 @@ impl Project<'_> {
         let first_config = self.configs.first().cloned().unwrap_or_default();
         for id in targets_for_root(self.model, self.result, root.dir) {
             if let Some(raw) = self.model.target(id)
-                && let Some(isa) = target_type(raw, self.result, id)
+                && let Some(isa) = target_type(self.model, raw)
             {
                 let reference = self.reserve_target(isa, &text(&raw.name))?;
                 let facts = self.resolved.get(&(id, first_config.clone())).copied();
@@ -341,7 +330,7 @@ impl Project<'_> {
                 },
                 &self.configs,
                 &cmake,
-                &ctest,
+                (&ctest, &self.result.metadata.ctest_arguments),
                 &cpack,
             );
             let phase = script.shell(

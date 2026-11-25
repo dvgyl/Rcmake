@@ -25,6 +25,8 @@ use crate::{
 mod imported_runtime;
 mod legacy;
 mod objects;
+mod projection;
+mod script_policy;
 mod targets;
 
 pub(crate) use objects::exported_path as exported_object_path;
@@ -62,6 +64,7 @@ pub(crate) fn lower_install_manifest_with_configs(
 ) -> Result<InstallManifest, ResolveError> {
     for (index, rule, _) in ordered_install_rules(model) {
         targets::warn_framework_change(model, index, rule, host)?;
+        script_policy::warn(model, rule, host);
     }
     super::warn_install_name_policy(model, host);
     let edits = runtime_edits(model, targets, languages, |rule, raw, edit| {
@@ -559,9 +562,15 @@ fn lower_install_rules<E>(
                 }
                 InstallKind::Script(value) | InstallKind::Code(value) => {
                     let script = matches!(rule.kind, InstallKind::Script(_));
-                    let value =
-                        rcmake_genex::rewrite_install_prefix(value, b"${CMAKE_INSTALL_PREFIX}");
-                    for config in action_configs(configs, options, has_genex(&value), multi) {
+                    let allow_genex =
+                        script_policy::status(model, rule.dir) == rcmake_diag::PolicyStatus::New;
+                    let expand = allow_genex && has_genex(value);
+                    let value = if expand {
+                        rcmake_genex::rewrite_install_prefix(value, b"${CMAKE_INSTALL_PREFIX}")
+                    } else {
+                        value.clone()
+                    };
+                    for config in action_configs(configs, options, expand, multi) {
                         let value = if let Some(config) = config {
                             eval(rule.dir, config, &rule.backtrace, &value)?
                         } else {
@@ -775,20 +784,7 @@ struct Group<'a> {
 
 impl Group<'_> {
     fn merge(&self, base: &InstallOptions) -> InstallOptions {
-        let mut options = base.clone();
-        let group = &self.options;
-        options.destination = group.destination.clone().or(options.destination);
-        options.component = group.component.clone().or(options.component);
-        options.rename = group.rename.clone().or(options.rename);
-        if !group.permissions.is_empty() {
-            options.permissions.clone_from(&group.permissions);
-        }
-        if !group.configurations.is_empty() {
-            options.configurations.clone_from(&group.configurations);
-        }
-        options.optional |= group.optional;
-        options.exclude_from_all |= group.exclude_from_all;
-        options
+        base.with_group(&self.options)
     }
 }
 
@@ -920,4 +916,27 @@ fn permission_keyword(value: &[u8]) -> bool {
         || value.starts_with(b"GROUP_")
         || value.starts_with(b"WORLD_")
         || matches!(value, b"SETUID" | b"SETGID")
+}
+
+/// Return the effective options for an artifact group in a target install rule.
+#[must_use]
+pub fn install_target_group_options(
+    model: &ProjectModel,
+    index: usize,
+    group: &[u8],
+) -> Option<InstallOptions> {
+    let base = &model.installs.get(index)?.options;
+    let recorded = recorded_args(model, index);
+    let groups = target_options(&recorded);
+    Some(
+        groups
+            .get(group)
+            .map_or_else(|| base.clone(), |group| group.merge(base)),
+    )
+}
+
+/// Check whether a target install rule requests an unnamed dependency set.
+#[must_use]
+pub fn installs_unnamed_runtime_dependencies(model: &ProjectModel, rule: usize) -> bool {
+    recorded_args(model, rule).contains(&b"RUNTIME_DEPENDENCIES".as_slice())
 }

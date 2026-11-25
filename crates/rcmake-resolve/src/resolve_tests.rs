@@ -76,6 +76,8 @@ fn target(name: &str, kind: TargetKind, sources: &[&str]) -> Target {
 
 fn link_item(name: &str) -> LinkItem {
     LinkItem {
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
         scope: None,
         text: entry(name),
         lookup_dir: DirId::ROOT,
@@ -843,7 +845,15 @@ fn keeps_local_dependency_order_and_links_imported_artifacts() -> TestResult {
     let app = &result.targets[2];
     assert_eq!(app.dependencies, [utility, interface]);
     assert!(app.metadata.exclude_from_all);
-    assert!(!result.graphs[0].targets[2].in_all);
+    let graph = &result.graphs[0];
+    let names: Vec<_> = graph
+        .targets
+        .iter()
+        .map(|target| target.name.as_slice())
+        .collect();
+    assert_eq!(names, [b"prepare".as_slice(), b"app"]);
+    assert_eq!(graph.targets[1].depends, [0]);
+    assert!(!graph.targets[1].in_all);
     let link = app.link.as_ref().ok_or("Expected a link step.")?;
     assert_eq!(link.fragments[0].text.value, "/pkg/libexternal.a");
     Ok(())

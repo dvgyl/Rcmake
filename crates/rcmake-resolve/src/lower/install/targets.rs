@@ -7,12 +7,14 @@ use rcmake_host::{Host, Stream};
 use rcmake_model::{InstallKind, Target, TargetId, TargetKind};
 
 use super::super::compute_artifacts;
+use super::projection::{Projection, file_path};
 use super::{
     BString, Backtrace, ConfigId, DirId, GeneratorKind, Group, InstallAction, InstallActionKind,
     InstallManifest, InstallOptions, InstallRule, Lexical, ProjectModel, ResolvedTarget,
     RuntimeEdits, action_configs, add_bmi_include, definition, eval_destination, file_action, join,
     list, matches_config, target_options,
 };
+use crate::NamelinkMode;
 
 pub(super) fn warn_framework_change(
     model: &ProjectModel,
@@ -146,7 +148,13 @@ pub(super) fn lower<E>(
                     .destination
                     .as_deref()
                     .map_or(b"".as_slice(), Vec::as_slice);
-                let destination = super::super::artifacts::object_install_directory(
+                let projection = Projection {
+                    rule: index,
+                    target: *id,
+                    config: &target.config,
+                };
+                let mut paths = Vec::new();
+                let object_directory = super::super::artifacts::object_install_directory(
                     model,
                     raw,
                     &target.config,
@@ -158,18 +166,27 @@ pub(super) fn lower<E>(
                         model,
                         raw,
                         unit,
-                        &destination,
+                        &object_directory,
                         &custom_name,
                     );
+                    paths.push(object.installer_path(destination));
                     let mut action = object.action(&options, make_action);
                     action.configurations = vec![target.config.0.clone()];
                     manifest.actions.push(action);
                 }
+                let action =
+                    make_action(&options, b"", InstallActionKind::Code(BString::default()));
+                projection.add(manifest, &action, false, NamelinkMode::None, paths);
             }
             continue;
         }
         for target in &matching {
             let per_config = multi || matching.len() > 1;
+            let projection = Projection {
+                rule: index,
+                target: *id,
+                config: &target.config,
+            };
             if raw.kind == TargetKind::SharedLibrary
                 && super::super::artifacts::is_dll_platform(model, raw.dir)
             {
@@ -225,9 +242,17 @@ pub(super) fn lower<E>(
                         options.destination = Some(default.into());
                     }
                     eval_destination(&mut options, raw.dir, &target.config, rule, eval)?;
-                    let files = vec![join(&model.dir(DirId::ROOT).binary_dir, file)];
-                    let kind = file_action(file_type, files, &options);
-                    manifest.actions.push(make_action(&options, default, kind));
+                    let path = file_path(&model.dir(DirId::ROOT).binary_dir, file);
+                    let kind = file_action(file_type, vec![path.0.clone()], &options);
+                    let action = make_action(&options, default, kind);
+                    projection.add(
+                        manifest,
+                        &action,
+                        file_type == b"STATIC_LIBRARY",
+                        NamelinkMode::None,
+                        vec![path],
+                    );
+                    manifest.actions.push(action);
                 }
                 continue;
             }
@@ -277,6 +302,52 @@ pub(super) fn lower<E>(
             if !configs.is_empty() {
                 options.destination.get_or_insert_with(|| default.into());
                 eval_destination(&mut options, raw.dir, &target.config, rule, eval)?;
+            }
+            if matches!(layout, crate::ide::BundleKind::Framework { .. })
+                && groups
+                    .get(b"LIBRARY".as_slice())
+                    .is_some_and(|group| group.namelink_only)
+            {
+                continue;
+            }
+            let projection_action = make_action(
+                &options,
+                default,
+                InstallActionKind::Code(BString::default()),
+            );
+            if raw.kind == TargetKind::SharedLibrary && layout == crate::ide::BundleKind::None {
+                projection.library(
+                    manifest,
+                    &projection_action,
+                    bin,
+                    (&artifacts, extra, false),
+                );
+            } else {
+                let paths = if let Some(root) = &bundle_root {
+                    let installed = artifacts
+                        .file
+                        .as_ref()
+                        .and_then(|file| {
+                            Lexical::new(file).relative(Lexical::new(Lexical::new(root).parent()))
+                        })
+                        .unwrap_or_else(|| Lexical::new(root).filename().into());
+                    vec![(join(bin, root), installed)]
+                } else {
+                    files
+                        .iter()
+                        .map(|file| {
+                            let (from, to) = file_path(bin, file);
+                            (from, options.rename.clone().unwrap_or(to))
+                        })
+                        .collect()
+                };
+                projection.add(
+                    manifest,
+                    &projection_action,
+                    false,
+                    NamelinkMode::None,
+                    paths,
+                );
             }
             let namelink = take_namelink(&artifacts, extra, &mut files);
             if !files.is_empty() {
@@ -353,6 +424,12 @@ pub(super) fn lower<E>(
                         linker_file: path(rcmake_genex::ArtifactKind::LinkerImportFile),
                         ..Default::default()
                     };
+                    let stub_action = make_action(
+                        &stub_options,
+                        default,
+                        InstallActionKind::Code(BString::default()),
+                    );
+                    projection.library(manifest, &stub_action, bin, (&stubs, group, true));
                     let mut files = artifact_paths(&stubs, group);
                     let namelink = take_namelink(&stubs, group, &mut files);
                     if !files.is_empty() {

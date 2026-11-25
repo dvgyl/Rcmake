@@ -150,6 +150,13 @@ fn resolve_project(
             IndexMap::new()
         },
         verification: prepared.as_ref(),
+        trace_config: configs.first().filter(|_| {
+            model
+                .global
+                .props
+                .get(b"GLOBAL_DEPENDS_DEBUG_MODE")
+                .is_some_and(|value| truth::is_on(value))
+        }),
     };
     let mut provenance = Provenance::default();
     let mut targets = Vec::new();
@@ -307,6 +314,7 @@ struct ConfigOutput {
 
 struct ConfigurationPlan<'a> {
     cross: CrossPlan<'a>,
+    trace_config: Option<&'a ConfigId>,
     link_languages: IndexMap<TargetId, BString>,
     verification: Option<&'a header_verify::Verification>,
 }
@@ -905,6 +913,9 @@ fn resolve_config(
         &mut ide_lowering,
         compile_inputs,
         plan.cross.native_for(config),
+        plan.trace_config
+            .filter(|&first| first == config)
+            .map(|_| paths.host),
     )?;
     let mut cross_graphs = IndexMap::new();
     for settings in plan.cross.commands_for(config) {
@@ -919,6 +930,7 @@ fn resolve_config(
             &mut lower::IdeLowering::default(),
             &mut BTreeMap::new(),
             Some(settings),
+            None,
         )?;
         cross_graphs.insert(key, graph);
     }

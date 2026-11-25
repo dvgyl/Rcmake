@@ -345,3 +345,133 @@ fn install_components_default_to_unspecified_and_sort() {
     let names: Vec<_> = model.install_components().into_iter().collect();
     assert_eq!(names, vec![BString::from("Unspecified"), "dev".into()]);
 }
+
+#[test]
+fn empty_source_entries_keep_interface_targets_in_the_build_system() {
+    let mut model = ProjectModel::default();
+    let mut interface = target("interface", DirId::ROOT, TargetOrigin::Normal);
+    interface.kind = TargetKind::InterfaceLibrary;
+    let id = model.add_target(interface).unwrap();
+    let scope = PropScope::Target(id);
+    let backtrace = Backtrace::default();
+    let origin = origin(&backtrace);
+    assert!(!model.is_in_build_system(model.target(id).unwrap()));
+    assert_eq!(model.get_prop(&scope, b"SOURCES"), None);
+
+    model
+        .append_prop(&scope, b"SOURCES", b"", AppendMode::List, origin)
+        .unwrap();
+    assert!(model.is_in_build_system(model.target(id).unwrap()));
+    assert_eq!(model.get_prop(&scope, b"SOURCES"), Some("".into()));
+
+    model
+        .append_prop(&scope, b"SOURCES", b"main.c", AppendMode::String, origin)
+        .unwrap();
+    assert_eq!(model.get_prop(&scope, b"SOURCES"), Some("main.c".into()));
+
+    model.set_prop(&scope, b"SOURCES", None, origin).unwrap();
+    assert!(!model.is_in_build_system(model.target(id).unwrap()));
+}
+
+#[test]
+fn serialized_link_scopes_survive_property_round_trip() {
+    let mut model = ProjectModel::default();
+    let backtrace = Backtrace::default();
+    let child = model
+        .add_directory(
+            DirId::ROOT,
+            "/src/sub".into(),
+            "/bin/sub".into(),
+            backtrace.clone(),
+        )
+        .unwrap();
+    let id = model
+        .add_target(target("main", DirId::ROOT, TargetOrigin::Normal))
+        .unwrap();
+    let value = b"::@(0x1);$<1:a;b>;;::@;::@(0xdeadbeef);outside";
+    let scope = PropScope::Target(id);
+    let name = b"INTERFACE_LINK_LIBRARIES";
+    model
+        .set_prop(
+            &scope,
+            name,
+            Some(value.as_slice().into()),
+            origin(&backtrace),
+        )
+        .unwrap();
+    model
+        .append_prop(
+            &scope,
+            name,
+            b"suffix",
+            AppendMode::String,
+            origin(&backtrace),
+        )
+        .unwrap();
+    assert_eq!(
+        model.get_prop(&scope, name),
+        Some([value.as_slice(), b";suffix"].concat().into()),
+    );
+    let items = model
+        .target(id)
+        .unwrap()
+        .usage
+        .interface_link_libraries
+        .as_deref()
+        .unwrap();
+    assert!(items[0].opens_lookup_scope);
+    assert_eq!(items[1].lookup_dir, child);
+    assert_eq!(items[1].text.value, "$<1:a;b>");
+    assert!(items[3].closes_lookup_scope);
+    assert_eq!(items[4].lookup_dir, DirId::ROOT);
+    assert_eq!(items[4].text.value, "::@(0xdeadbeef)");
+}
+
+#[test]
+fn direct_link_properties_keep_the_origin_of_each_write() {
+    use rcmake_diag::{Frame, FrameKind};
+
+    let mut model = ProjectModel::default();
+    let id = model
+        .add_target(target("main", DirId::ROOT, TargetOrigin::Normal))
+        .unwrap();
+    let scope = PropScope::Target(id);
+    let name = b"INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE";
+    let write = |line| {
+        Backtrace::default().push(Frame {
+            file: b"write.cmake".as_slice().into(),
+            line,
+            name: Some(b"set_property".as_slice().into()),
+            kind: FrameKind::Command,
+        })
+    };
+    let first = write(1);
+    let second = write(2);
+    model
+        .set_prop(&scope, name, Some("a".into()), origin(&first))
+        .unwrap();
+    model
+        .set_prop(&scope, name, Some("b".into()), origin(&second))
+        .unwrap();
+    model
+        .append_prop(&scope, name, b"c", AppendMode::List, origin(&first))
+        .unwrap();
+    model
+        .append_prop(&scope, name, b"d", AppendMode::String, origin(&second))
+        .unwrap();
+    assert_eq!(model.get_prop(&scope, name), Some("b;c;d".into()));
+    let entries = model.target(id).unwrap().direct_link_entries(name).unwrap();
+    let origins: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.backtrace.top().unwrap().line)
+        .collect();
+    assert_eq!(origins, [2, 1, 2]);
+    model.set_prop(&scope, name, None, origin(&first)).unwrap();
+    assert!(
+        model
+            .target(id)
+            .unwrap()
+            .direct_link_entries(name)
+            .is_none()
+    );
+}

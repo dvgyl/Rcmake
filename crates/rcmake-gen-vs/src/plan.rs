@@ -173,24 +173,14 @@ fn target_projects(
     use_folders: bool,
 ) -> Result<Vec<Project>, GenError> {
     let mut projects = Vec::new();
-    for (id, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
+    for (id, target) in model
+        .targets()
+        .filter(|(_, target)| model.is_in_build_system(target))
+    {
         let dir = model.dir(target.dir);
         let name = string(&target.name);
         validate_name(&name)?;
         let facts = resolved.get(&id);
-        if target.kind == TargetKind::InterfaceLibrary
-            && target.sources.is_empty()
-            && target.file_sets.is_empty()
-            && facts.is_none_or(|facts| {
-                facts.values().all(|fact| {
-                    fact.ide
-                        .as_ref()
-                        .is_none_or(|ide| ide.sources.is_empty() && ide.custom.is_empty())
-                })
-            })
-        {
-            continue;
-        }
         let mut in_all = Vec::new();
         let mut build = Vec::new();
         let mut deploy = Vec::new();

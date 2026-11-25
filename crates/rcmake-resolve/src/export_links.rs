@@ -325,6 +325,8 @@ fn expands_plain_cps_package_links_in_cmake_exports() -> Result<(), Box<dyn std:
             components
                 .into_iter()
                 .map(|name| LinkItem {
+                    opens_lookup_scope: false,
+                    closes_lookup_scope: false,
                     scope: None,
                     text: BT::new(name.into(), Default::default()),
                     lookup_dir: dir,

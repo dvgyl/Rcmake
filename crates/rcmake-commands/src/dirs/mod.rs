@@ -432,6 +432,8 @@ fn link_libraries(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .link_libraries
             .get_or_insert_default()
             .extend(values(args).map(|lib| rcmake_model::LinkItem {
+                opens_lookup_scope: false,
+                closes_lookup_scope: false,
                 scope: None,
                 text: BT::new(lib.into(), bt.clone()),
                 lookup_dir: dir,

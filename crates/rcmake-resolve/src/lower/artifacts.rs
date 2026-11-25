@@ -129,21 +129,6 @@ pub(crate) fn is_darwin(model: &ProjectModel, dir: DirId) -> bool {
         .unwrap_or(cfg!(target_vendor = "apple"))
 }
 
-fn configured_property<'a>(
-    target: &'a Target,
-    name: &[u8],
-    config: &ConfigId,
-) -> Option<&'a BString> {
-    if !config.0.is_empty()
-        && let Some(value) = target
-            .props
-            .get(&[name, b"_", &config.0.to_ascii_uppercase()].concat())
-    {
-        return Some(value);
-    }
-    target.props.get(name)
-}
-
 fn imported_property<'a>(target: &'a Target, key: &[u8], config: &ConfigId) -> Option<&'a BString> {
     let config = config.0.to_ascii_uppercase();
     let mapped = target
@@ -231,8 +216,10 @@ pub fn compute_artifacts(model: &ProjectModel, target: &Target, config: &ConfigI
         dir = join(&dir, &config.0);
     }
 
-    let name = configured_property(target, format!("{class}_OUTPUT_NAME").as_bytes(), config)
-        .or_else(|| configured_property(target, b"OUTPUT_NAME", config))
+    let name = super::output_name_keys(class, &config.0.to_ascii_uppercase())
+        .iter()
+        .find_map(|key| target.props.get(key.as_slice()))
+        .filter(|value| !value.is_empty())
         .unwrap_or(&target.name);
     let postfix_key = [&config.0.to_ascii_uppercase()[..], b"_POSTFIX"].concat();
     let postfix = if !config.0.is_empty() {
@@ -677,6 +664,8 @@ pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
         configure_log: definition(model, DirId::ROOT, b"CMAKE_CONFIGURE_LOG").cloned(),
         cmake_command: definition(model, DirId::ROOT, b"CMAKE_COMMAND").cloned(),
         ctest_command: definition(model, DirId::ROOT, b"CMAKE_CTEST_COMMAND").cloned(),
+        ctest_arguments: definition(model, DirId::ROOT, b"CMAKE_CTEST_ARGUMENTS")
+            .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop)),
         jobserver_steps: model
             .commands()
             .map(|(_, command)| command)

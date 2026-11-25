@@ -429,3 +429,57 @@ fn selects_direct_linker_in_the_link_language_context() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn target_installers_keep_platform_artifact_groups() -> TestResult {
+    let (source, build) = roots();
+    for system in ["Linux", "Windows"] {
+        let mut model = project_with_roots(&source, &build);
+        model
+            .global
+            .props
+            .set("CMAKE_SYSTEM_NAME".into(), system.into());
+        let mut library = target("example", TargetKind::SharedLibrary, &["main.c"]);
+        library.props.set("VERSION".into(), "1.2.3".into());
+        library.props.set("SOVERSION".into(), "1".into());
+        let id = model.add_target(library)?;
+        let rule = model.add_install(InstallRule {
+            dir: DirId::ROOT,
+            backtrace: backtrace(10),
+            kind: InstallKind::Targets {
+                targets: vec![id],
+                export: None,
+            },
+            options: InstallOptions::default(),
+        });
+        let result = resolve(&model, &seeded(&source, &["main.c"])?, &[])?;
+        let installers = &result.install.target_installers;
+        let [first, second] = installers.as_slice() else {
+            return Err(
+                format!("Expected two target installers on {system}, got {installers:?}").into(),
+            );
+        };
+        assert_eq!((first.rule, first.target), (rule, id));
+        if system == "Windows" {
+            assert!(first.import_library);
+            assert!(!second.import_library);
+            assert_eq!(first.destination, "lib");
+            assert_eq!(second.destination, "bin");
+            assert_eq!(first.namelink, NamelinkMode::None);
+            assert_eq!(second.namelink, NamelinkMode::None);
+        } else {
+            assert_eq!(first.namelink, NamelinkMode::Skip);
+            assert_eq!(second.namelink, NamelinkMode::Only);
+            let names = |installer: &TargetInstaller| {
+                installer
+                    .paths
+                    .iter()
+                    .map(|(_, to)| to.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(names(first), ["libexample.so.1.2.3", "libexample.so.1"]);
+            assert_eq!(names(second), ["libexample.so"]);
+        }
+    }
+    Ok(())
+}

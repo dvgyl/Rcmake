@@ -494,7 +494,12 @@ fn top_level(
     phony(&mut out, b"install", [b"preinstall".as_slice()]);
     out.push_str(b"\t$(SILENT)$(CMAKE_COMMAND) -P cmake_install.cmake\n");
     phony(&mut out, b"test", []);
-    out.push_str(b"\t$(SILENT)$(CTEST_COMMAND) --force-new-ctest-process\n");
+    out.push_str(b"\t$(SILENT)$(CTEST_COMMAND) --force-new-ctest-process");
+    for argument in &result.metadata.ctest_arguments {
+        out.push(b' ');
+        make_recipe_text(&mut out, &quote_always(argument))?;
+    }
+    out.push(b'\n');
 
     let mut configure = b"$(CMAKE_COMMAND) -B .".to_vec();
     let listfiles = &result.metadata.listfiles;

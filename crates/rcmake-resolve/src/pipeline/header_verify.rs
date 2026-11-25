@@ -400,6 +400,8 @@ fn verification_target(
             if original.kind != TargetKind::Executable || is_on(original, b"ENABLE_EXPORTS") =>
         {
             target.usage.link_libraries = Some(vec![LinkItem {
+                opens_lookup_scope: false,
+                closes_lookup_scope: false,
                 scope: None,
                 text: original_name,
                 lookup_dir: original.dir,

@@ -342,6 +342,8 @@ fn ninja_builds_an_executable_whose_output_name_matches_its_library()
     let mut shell = c_target("sqlite_shell", TargetKind::Executable, "main.c");
     shell.props.set("OUTPUT_NAME".into(), "sqlite3".into());
     shell.usage.link_libraries = Some(vec![LinkItem {
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
         scope: None,
         text: BT::new("sqlite3".into(), Default::default()),
         lookup_dir: DirId::ROOT,
@@ -416,6 +418,8 @@ fn versioned_library_model(
     model.add_target(library)?;
     let mut app = c_target("app", TargetKind::Executable, "main.c");
     app.usage.link_libraries = Some(vec![LinkItem {
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
         scope: None,
         text: BT::new("demo".into(), Default::default()),
         lookup_dir: DirId::ROOT,

@@ -6,7 +6,7 @@ use std::path::Path;
 use rcmake_base::{hash::HashAlgo, list, truth::is_on};
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_host::path::{from_native, from_native_cmake, to_native};
-use rcmake_model::{BT, DirId, Directory, InstallRule, ProjectModel, Target, TargetId, TargetKind};
+use rcmake_model::{BT, DirId, Directory, ProjectModel, Target, TargetId, TargetKind};
 use rcmake_resolve::{
     ArtifactSet, CompileGroup, LinkFragmentRole, LinkKind, ResolvedTarget, TargetMetadata,
     usage::UsageResolver,
@@ -102,7 +102,7 @@ impl<'a> TargetReferences<'a> {
                     target.metadata.kind == TargetKind::InterfaceLibrary
                         && target.compile_units.is_empty()
                 },
-                is_abstract,
+                |raw| !model.is_in_build_system(raw),
             );
             let (list, directory, project) = if abstract_target {
                 (
@@ -151,7 +151,7 @@ pub(super) fn abstract_targets(
     let resolved_ids: BTreeSet<_> = targets.iter().map(|target| target.id).collect();
     model
         .targets()
-        .filter(|(id, raw)| is_abstract(raw) && !resolved_ids.contains(id))
+        .filter(|(id, raw)| !model.is_in_build_system(raw) && !resolved_ids.contains(id))
         .map(|(id, raw)| {
             let dir = model.dir(raw.dir);
             let mut target = ResolvedTarget {
@@ -282,16 +282,12 @@ impl FileApi<'_, '_> {
         config: &[u8],
         ids: &[TargetId],
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
-        install_rules: &BTreeMap<TargetId, Vec<&InstallRule>>,
     ) -> Result<Vec<Value>, GenError> {
         let mut usage = UsageResolver::new(self.model);
         ids.iter()
             .filter_map(|id| targets.get(id))
             .map(|reference| {
-                let rules = install_rules
-                    .get(&reference.target.id)
-                    .map_or(&[][..], Vec::as_slice);
-                let mut value = self.target_object(config, reference, targets, rules);
+                let mut value = self.target_object(config, reference, targets);
                 if let Some(target) = self.model.target(reference.target.id) {
                     let includes =
                         interface_includes(self.model, &mut usage, reference.target, target)?;
@@ -317,7 +313,6 @@ impl FileApi<'_, '_> {
         config: &[u8],
         reference: &TargetRef<'_>,
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
-        rules: &[&InstallRule],
     ) -> Members {
         let target = reference.target;
         let metadata = &target.metadata;
@@ -386,11 +381,16 @@ impl FileApi<'_, '_> {
         .map(|file| object([("path", Value::string(file))]));
         optional_array(&mut body, "artifacts", artifact_paths);
 
-        let destinations = rules
+        let destinations = self
+            .result
+            .install
+            .target_installers
             .iter()
-            .filter_map(|rule| {
-                let path = self.target_destination(target, rule, config)?;
-                let mut destination = members([("path", Value::string(path))]);
+            .filter(|installer| installer.target == target.id && installer.config.matches(config))
+            .filter_map(|installer| {
+                let rule = self.model.installs.get(installer.rule)?;
+                let mut destination =
+                    members([("path", Value::string(installer.destination.clone()))]);
                 graph.tag(&mut destination, &rule.backtrace);
                 Some(Object(destination))
             })
@@ -553,13 +553,6 @@ impl FileApi<'_, '_> {
         );
         body.insert("sources".into(), array(sources.into_iter().map(Object)));
     }
-}
-
-fn is_abstract(target: &Target) -> bool {
-    target.is_imported()
-        || (target.kind == TargetKind::InterfaceLibrary
-            && target.sources.is_empty()
-            && target.file_sets.is_empty())
 }
 
 fn target_id(name: &rcmake_base::BString, dir: &[u8]) -> String {

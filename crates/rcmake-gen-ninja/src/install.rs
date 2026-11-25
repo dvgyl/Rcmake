@@ -212,6 +212,10 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
         });
         let mut test = programs.ctest.clone();
         test.extend_from_slice(b" --force-new-ctest-process");
+        for argument in &programs.ctest_arguments {
+            test.push(b' ');
+            graph.commands.word(argument, &mut test);
+        }
         if let Some(config) = graph.config {
             test.extend_from_slice(b" -C ");
             graph.commands.word(config, &mut test);

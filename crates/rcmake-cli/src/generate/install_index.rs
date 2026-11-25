@@ -75,7 +75,12 @@ pub(super) fn write(
         }
         let mut options = options;
         options.top_level = false;
-        let mut content = install_script::render_with_options(&local, &dir.binary_dir, &options)?;
+        let mut content = install_script::render_with_runtime_definitions(
+            &local,
+            &dir.binary_dir,
+            &options,
+            |name| model.definition(id, name),
+        )?;
         content.extend_from_slice(
             br#"if(CMAKE_INSTALL_LOCAL_ONLY)
   string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT "${CMAKE_INSTALL_MANIFEST_FILES}")

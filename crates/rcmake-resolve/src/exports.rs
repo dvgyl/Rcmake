@@ -334,6 +334,12 @@ fn export_windows_paths(model: &ProjectModel, dir: DirId) -> Option<bool> {
     if system.is_some_and(|name| name == b"CYGWIN") {
         return Some(false);
     }
+    if crate::lower::definition(model, dir, b"CMAKE_HOST_SYSTEM_NAME")
+        .is_some_and(|name| name == b"Windows")
+        || model.dir(DirId::ROOT).source_dir.get(1) == Some(&b':')
+    {
+        return Some(true);
+    }
     if model
         .generator
         .is_some_and(|generator| matches!(generator, rcmake_model::GeneratorKind::VisualStudio(_)))

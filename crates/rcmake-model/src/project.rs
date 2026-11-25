@@ -3,6 +3,9 @@
 /// Snapshot helpers for incremental configure replay.
 pub mod replay;
 
+mod membership;
+mod target_properties;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::{IndexMap, IndexSet};
@@ -12,9 +15,9 @@ use rcmake_diag::Backtrace;
 use crate::{
     AppendMode, BT, BuildExport, Cache, CacheEntry, CacheType, CommandId, CustomCommand, DirId,
     Directory, ExportDependencySetup, ExportSet, FileSet, FileSetId, GeneratorKind, GeneratorSpec,
-    GlobCheck, GlobKey, GlobalState, ImportedVisibility, InstallRule, LinkItem, PropOrigin,
-    PropScope, PropertyMap, PropertyPrint, Target, TargetBinding, TargetId, TargetOrigin,
-    TestEntry, TestId, UsageField, UsageProps,
+    GlobCheck, GlobKey, GlobalState, ImportedVisibility, InstallRule, PropOrigin, PropScope,
+    PropertyMap, PropertyPrint, Target, TargetBinding, TargetId, TargetOrigin, TestEntry, TestId,
+    UsageField, UsageProps,
 };
 
 /// Error of a [`ProjectModel`] operation.
@@ -57,6 +60,8 @@ pub struct ProjectModel {
     pub generator_spec: GeneratorSpec,
     /// Install rules in call order.
     pub installs: Vec<InstallRule>,
+    /// Named runtime dependency set installers in call order.
+    pub runtime_dependency_installs: Vec<crate::RuntimeDependencyInstall>,
     /// Properties by install file name.
     pub install_props: BTreeMap<BString, PropertyMap>,
     /// Export sets by name.
@@ -687,8 +692,11 @@ impl ProjectModel {
                 Ok(())
             }
             PropScope::Target(id) => {
+                if target_properties::is_scoped_link(name) {
+                    return self.write_link_property(*id, name, value, origin, false);
+                }
                 let target = self.target_mut(*id).ok_or(ModelError::UnknownObject)?;
-                set_target_prop(target, name, value, origin)
+                target_properties::set_target_prop(target, name, value, origin)
             }
             PropScope::Source { dir, path } => {
                 let props = self
@@ -734,7 +742,7 @@ impl ProjectModel {
     }
 
     /// Append `value` to property `name` on `scope` (`set_property(APPEND)` or
-    /// `APPEND_STRING`). An empty value changes nothing.
+    /// `APPEND_STRING`). Keep empty entries for target `SOURCES`.
     pub fn append_prop(
         &mut self,
         scope: &PropScope,
@@ -743,14 +751,30 @@ impl ProjectModel {
         mode: AppendMode,
         origin: PropOrigin<'_>,
     ) -> Result<(), ModelError> {
-        if value.is_empty() {
+        let target_sources = matches!(scope, PropScope::Target(_)) && name == b"SOURCES";
+        if value.is_empty() && !target_sources {
             return Ok(());
         }
         let previous = self
             .prop_ledger
             .as_ref()
             .and_then(|_| self.get_prop(scope, name));
-        if mode == AppendMode::List && self.append_entry(scope, name, value, origin)? {
+        if let PropScope::Target(id) = scope {
+            if target_properties::is_scoped_link(name) {
+                self.write_link_property(*id, name, Some(value.into()), origin, true)?;
+                self.record_prop(scope, name, crate::PropOp::Append(mode), previous, origin);
+                return Ok(());
+            }
+            if target_properties::is_direct_link(name) {
+                let target = self.target_mut(*id).ok_or(ModelError::UnknownObject)?;
+                target.append_direct_link(name, value, origin.backtrace);
+                self.record_prop(scope, name, crate::PropOp::Append(mode), previous, origin);
+                return Ok(());
+            }
+        }
+        if (target_sources || mode == AppendMode::List)
+            && self.append_entry(scope, name, value, origin)?
+        {
             self.record_prop(scope, name, crate::PropOp::Append(mode), previous, origin);
             return Ok(());
         }
@@ -795,18 +819,6 @@ impl ProjectModel {
                 match (field, name) {
                     (Some(field), _) => usage.push(field, entry),
                     (None, b"SOURCES") => target.sources.push(entry),
-                    (None, b"LINK_LIBRARIES" | b"INTERFACE_LINK_LIBRARIES") => {
-                        let items = if name == b"LINK_LIBRARIES" {
-                            &mut usage.link_libraries
-                        } else {
-                            &mut usage.interface_link_libraries
-                        };
-                        items.get_or_insert_default().push(LinkItem {
-                            scope: None,
-                            text: entry,
-                            lookup_dir: origin.dir,
-                        });
-                    }
                     _ => return Ok(false),
                 }
             }
@@ -833,50 +845,6 @@ fn set_usage(usage: &mut UsageProps, field: UsageField, value: Option<BString>, 
             usage.fields.shift_remove(&field);
         }
     }
-}
-
-fn set_target_prop(
-    target: &mut Target,
-    name: &[u8],
-    value: Option<BString>,
-    origin: PropOrigin<'_>,
-) -> Result<(), ModelError> {
-    let bt = |v: BString| BT::new(v, origin.backtrace.clone());
-    match name {
-        b"NAME" | b"TYPE" | b"IMPORTED" | b"SOURCE_DIR" | b"BINARY_DIR" => {
-            return Err(ModelError::ReadOnly);
-        }
-        b"SOURCES" => {
-            target.sources = value
-                .into_iter()
-                .filter(|v| !v.is_empty())
-                .map(bt)
-                .collect();
-        }
-        b"LINK_LIBRARIES" | b"INTERFACE_LINK_LIBRARIES" => {
-            let items = value.map(|v| {
-                let mut items = Vec::new();
-                if !v.is_empty() {
-                    items.push(LinkItem {
-                        scope: None,
-                        text: bt(v),
-                        lookup_dir: origin.dir,
-                    });
-                }
-                items
-            });
-            if name == b"LINK_LIBRARIES" {
-                target.usage.link_libraries = items;
-            } else {
-                target.usage.interface_link_libraries = items;
-            }
-        }
-        _ => match UsageField::from_name(name) {
-            Some(field) => set_usage(&mut target.usage, field, value, origin.backtrace),
-            None => set_map(&mut target.props, name, value),
-        },
-    }
-    Ok(())
 }
 
 fn set_cache_prop(

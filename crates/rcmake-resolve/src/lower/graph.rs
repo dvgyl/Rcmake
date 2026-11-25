@@ -6,9 +6,7 @@ use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{ConfigId, EvalContext};
-use rcmake_model::{
-    BT, DirId, GeneratorKind, ProjectModel, Target, TargetEvent, TargetId, TargetKind,
-};
+use rcmake_model::{BT, DirId, GeneratorKind, ProjectModel, Target, TargetEvent, TargetId};
 
 use super::artifacts::build_relative;
 use super::compile::{Settings, compile};
@@ -23,7 +21,9 @@ use crate::{
     unity::TargetUnity, usage::UsageResolver,
 };
 
+mod debug;
 mod device;
+mod membership;
 mod order;
 mod utility;
 
@@ -45,6 +45,7 @@ pub fn lower(
         &mut pch::IdeLowering::default(),
         &mut BTreeMap::new(),
         None,
+        None,
     )
 }
 
@@ -62,19 +63,14 @@ pub(crate) fn lower_with_inputs(
     ide: &mut pch::IdeLowering,
     compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
     cross: Option<CrossConfiguration<'_>>,
+    trace_host: Option<&dyn rcmake_host::Host>,
 ) -> Result<BuildGraph, ResolveError> {
     let resolved_targets: IndexMap<_, _> = targets
         .iter()
         .filter(|target| config.matches(&target.config.0))
         .map(|target| (target.id, target))
         .collect();
-    let local: Vec<_> = model
-        .targets()
-        .filter_map(|(id, target)| {
-            let resolved = *resolved_targets.get(&id)?;
-            (!target.is_imported()).then_some((target, resolved))
-        })
-        .collect();
+    let local = membership::emitted_targets(model, &resolved_targets);
     let target_indices: IndexMap<_, _> = local
         .iter()
         .enumerate()
@@ -178,32 +174,31 @@ pub(crate) fn lower_with_inputs(
                 .insert(resolved.id, rules.chain(events).collect());
         }
 
-        strong_edges.push(
-            plan.dependencies
-                .iter()
-                .filter_map(|id| target_indices.get(id).copied())
-                .collect(),
+        let (depends, strong) = membership::dependencies(
+            model,
+            &target_indices,
+            resolved.id,
+            &plan.dependencies,
+            &resolved.dependencies,
         );
+        strong_edges.push(strong);
         graph.targets.push(GraphTarget {
             name: resolved.metadata.name.clone(),
             steps: plan.steps.into_iter().collect(),
-            depends: plan
-                .dependencies
-                .iter()
-                .chain(&resolved.dependencies)
-                .filter(|id| **id != resolved.id)
-                .filter_map(|id| target_indices.get(id).copied())
-                .chain(unity_prerequisite)
-                .collect::<IndexSet<_>>()
-                .into_iter()
-                .collect(),
-            in_all: !resolved.metadata.exclude_from_all
-                && (target.kind != TargetKind::InterfaceLibrary
-                    || !resolved.compile_units.is_empty()),
+            depends: depends.into_iter().chain(unity_prerequisite).collect(),
+            in_all: !resolved.metadata.exclude_from_all,
         });
     }
     graph.targets.extend(unity_prerequisites);
-    order::dependencies(model, &local, &strong_edges, &mut graph.targets)?;
+    let trace =
+        trace_host.map(|host| debug::Trace::new(host, model, &local, &target_indices, &graph));
+    order::dependencies(
+        model,
+        &local,
+        &strong_edges,
+        &mut graph.targets,
+        trace.as_ref(),
+    )?;
     if matches!(
         model.generator,
         Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig | GeneratorKind::UnixMakefiles)
@@ -460,13 +455,16 @@ impl<'a> TargetPlan<'a> {
                 unity_prerequisites.push(GraphTarget {
                     name,
                     steps: std::mem::take(&mut self.steps).into_iter().collect(),
-                    depends: self
-                        .dependencies
-                        .iter()
-                        .chain(&resolved.dependencies)
-                        .filter(|id| **id != resolved.id)
-                        .filter_map(|id| target_indices.get(id).copied())
-                        .collect(),
+                    depends: membership::dependencies(
+                        model,
+                        target_indices,
+                        resolved.id,
+                        &self.dependencies,
+                        &resolved.dependencies,
+                    )
+                    .0
+                    .into_iter()
+                    .collect(),
                     in_all: false,
                 });
                 Some(index)

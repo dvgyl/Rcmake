@@ -29,14 +29,18 @@ pub(super) fn windows_path_rules(
     dir: DirId,
     paths: Option<&SourcePaths<'_>>,
 ) -> bool {
+    if crate::lower::definition(model, dir, b"CMAKE_SYSTEM_NAME")
+        .is_some_and(|name| name == b"CYGWIN")
+    {
+        return false;
+    }
     paths.map_or(cfg!(windows), |paths| {
         paths.host.system().sysname == b"Windows"
-    }) || (crate::lower::definition(model, dir, b"CMAKE_SYSTEM_NAME")
-        .is_none_or(|system| system != b"CYGWIN")
-        && crate::lower::artifacts::is_dll_platform(model, dir))
-        || model
-            .generator
-            .is_some_and(|generator| matches!(generator, GeneratorKind::VisualStudio(_)))
+    }) || crate::lower::definition(model, dir, b"CMAKE_HOST_SYSTEM_NAME")
+        .is_some_and(|name| name == b"Windows")
+        || model.dir(DirId::ROOT).source_dir.get(1) == Some(&b':')
+        || crate::lower::artifacts::is_dll_platform(model, dir)
+        || matches!(model.generator, Some(GeneratorKind::VisualStudio(_)))
 }
 
 pub(crate) fn usage_path_is_full(

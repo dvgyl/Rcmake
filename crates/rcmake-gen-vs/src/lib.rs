@@ -49,6 +49,7 @@ pub(crate) struct Settings {
     nasm_templates: Option<String>,
     cmake: String,
     ctest: String,
+    ctest_arguments: Vec<String>,
     cpack: String,
 }
 
@@ -259,6 +260,12 @@ impl Settings {
                 b"CMAKE_COMMAND",
                 "cmake",
             ),
+            ctest_arguments: result
+                .metadata
+                .ctest_arguments
+                .iter()
+                .map(|arg| string(arg))
+                .collect(),
             ctest: executable(
                 result.metadata.ctest_command.as_ref(),
                 b"CMAKE_CTEST_COMMAND",

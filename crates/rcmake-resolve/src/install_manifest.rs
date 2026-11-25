@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, ops::Range};
 
 use rcmake_base::BString;
-use rcmake_model::DirId;
+use rcmake_genex::ConfigId;
+use rcmake_model::{DirId, TargetId};
 
 /// One install action of `cmake_install.cmake`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +62,8 @@ pub enum InstallActionKind {
 pub struct InstallManifest {
     /// Actions.
     pub actions: Vec<InstallAction>,
+    /// Target installers in rule and artifact group order.
+    pub target_installers: Vec<TargetInstaller>,
     /// Local actions and child scripts in each directory's install order.
     pub directories: BTreeMap<DirId, Vec<InstallEntry>>,
 }
@@ -72,4 +75,40 @@ pub enum InstallEntry {
     Actions(Range<usize>),
     /// A child script included during serial installation.
     Child(DirId),
+}
+
+/// Whether a library installer copies the linker symlink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamelinkMode {
+    /// The installer has no separate linker symlink.
+    None,
+    /// Copy only the linker symlink.
+    Only,
+    /// Copy the library and its SONAME link.
+    Skip,
+}
+
+/// The files that an install target rule selects for one artifact group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetInstaller {
+    /// Index of the rule in the project model.
+    pub rule: usize,
+    /// Installed target.
+    pub target: TargetId,
+    /// Build configuration.
+    pub config: ConfigId,
+    /// Install destination.
+    pub destination: BString,
+    /// Install component.
+    pub component: BString,
+    /// Whether the files can be missing.
+    pub optional: bool,
+    /// Whether a full install skips this group.
+    pub exclude_from_all: bool,
+    /// Whether this group installs an import library.
+    pub import_library: bool,
+    /// Library linker symlink selection.
+    pub namelink: NamelinkMode,
+    /// Ordered source paths and paths under the install destination.
+    pub paths: Vec<(BString, BString)>,
 }

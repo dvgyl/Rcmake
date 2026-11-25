@@ -1,6 +1,6 @@
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_eval::{CmdResult, Cx, Flow};
-use rcmake_model::InstallOptions;
+use rcmake_model::{InstallOptions, RuntimeDependencyInstall};
 
 use super::{Result, common, fail, keyword, record_request, values, warn_absolute_destination};
 
@@ -13,7 +13,7 @@ struct DependencySetOptions {
 }
 
 pub(super) fn set(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
-    let Some((_, options)) = input.split_first().filter(|(name, _)| !name.is_empty()) else {
+    let Some((name, options)) = input.split_first().filter(|(name, _)| !name.is_empty()) else {
         return Err(fail(
             "RUNTIME_DEPENDENCY_SET not given a runtime dependency set.",
         ));
@@ -52,7 +52,7 @@ pub(super) fn set(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
         groups.library
     };
     let frameworks = (system == b"Darwin").then_some(groups.framework);
-    for artifact in std::iter::once(libraries).chain(frameworks) {
+    for artifact in std::iter::once(&libraries).chain(frameworks.as_ref()) {
         if let Some(destination) = artifact
             .destination
             .as_ref()
@@ -64,6 +64,25 @@ pub(super) fn set(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
     }
     if !cx.fatal_occurred() {
         record_request(cx, "_RCMAKE_RUNTIME_DEPENDENCY_SET", input);
+        groups
+            .common
+            .component
+            .get_or_insert_with(|| super::default_component(cx));
+        let dir = cx.current_dir_id();
+        let backtrace = cx.backtrace();
+        let model = cx.project();
+        model
+            .runtime_dependency_installs
+            .push(RuntimeDependencyInstall {
+                dir,
+                position: model.installs.len(),
+                name: (*name).into(),
+                backtrace,
+                library: groups.common.with_group(&libraries),
+                framework: frameworks
+                    .as_ref()
+                    .map(|group| groups.common.with_group(group)),
+            });
     }
     Ok(Flow::Normal)
 }

@@ -226,7 +226,26 @@ impl ProjectModel {
 }
 
 fn link_value(items: Option<&[LinkItem]>) -> Option<BString> {
-    items.map(|items| join_entries(items.iter().map(|i| i.text.value.as_slice())))
+    items.map(|items| {
+        let mut values = Vec::new();
+        for item in items {
+            if item.opens_lookup_scope {
+                values.push(BString::from(format!(
+                    "::@(0x{:x})",
+                    item.lookup_dir.index()
+                )));
+            }
+            if !item.text.value.is_empty()
+                || (!item.opens_lookup_scope && !item.closes_lookup_scope)
+            {
+                values.push(item.text.value.clone());
+            }
+            if item.closes_lookup_scope {
+                values.push(BString::from("::@"));
+            }
+        }
+        list::join(values)
+    })
 }
 
 fn cache_prop(entry: &CacheEntry, name: &[u8]) -> Option<BString> {

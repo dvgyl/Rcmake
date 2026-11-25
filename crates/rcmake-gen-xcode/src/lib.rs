@@ -35,8 +35,8 @@ pub mod workspace;
 pub use build::build_commands;
 
 /// Add the Xcode GUIDs to the model cache before the caller saves it.
-pub fn populate_guid_cache(result: &GenerationResult, model: &mut ProjectModel, host: &dyn Host) {
-    project::populate_guid_cache(result, model, host);
+pub fn populate_guid_cache(_result: &GenerationResult, model: &mut ProjectModel, host: &dyn Host) {
+    project::populate_guid_cache(model, host);
 }
 
 /// Write the Xcode project files of `result` into the build directory `bin`.

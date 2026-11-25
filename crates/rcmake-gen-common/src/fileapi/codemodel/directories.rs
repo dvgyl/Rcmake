@@ -2,11 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use rcmake_base::BString;
-use rcmake_model::{
-    DirId, Directory, InstallKind, InstallRule, ProjectModel, TargetId, TargetKind,
-};
-use rcmake_resolve::{InstallActionKind, ResolvedTarget};
+use rcmake_base::{BString, path_lex::Lexical};
+use rcmake_genex::ConfigId;
+use rcmake_model::{DirId, Directory, InstallKind, InstallRule, ProjectModel, TargetId};
 
 use crate::GenError;
 
@@ -15,34 +13,26 @@ use super::super::{
 };
 use super::{
     backtraces::Backtraces,
-    file_prefix, indices, number, relative_or_root,
+    file_prefix, indices, installers, number, other_installers, relative_or_root,
     targets::{TargetIndexes, TargetRef},
 };
 
 type RulesByDir<'a> = BTreeMap<DirId, Vec<(usize, &'a InstallRule)>>;
 
 pub(super) struct InstallRules<'a> {
-    pub(super) by_target: BTreeMap<TargetId, Vec<&'a InstallRule>>,
     pub(super) by_dir: RulesByDir<'a>,
 }
 
 impl<'a> InstallRules<'a> {
     pub(super) fn collect(model: &'a ProjectModel) -> Self {
-        let mut rules_by_target: BTreeMap<_, Vec<_>> = BTreeMap::new();
         let mut rules_by_dir: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for (index, rule) in model.installs.iter().enumerate() {
             rules_by_dir
                 .entry(rule.dir)
                 .or_default()
                 .push((index, rule));
-            if let InstallKind::Targets { targets, .. } = &rule.kind {
-                for id in targets {
-                    rules_by_target.entry(*id).or_default().push(rule);
-                }
-            }
         }
         Self {
-            by_target: rules_by_target,
             by_dir: rules_by_dir,
         }
     }
@@ -63,7 +53,12 @@ impl FileApi<'_, '_> {
             let Some(has_rule) = has_install.get_mut(id.index()) else {
                 continue;
             };
-            *has_rule |= rules_by_dir.contains_key(id);
+            *has_rule |= rules_by_dir.contains_key(id)
+                || self
+                    .model
+                    .runtime_dependency_installs
+                    .iter()
+                    .any(|rule| rule.dir == *id);
             if *has_rule
                 && let Some(parent) = dir.parent.and_then(|id| has_install.get_mut(id.index()))
             {
@@ -79,7 +74,7 @@ impl FileApi<'_, '_> {
             let source = relative_or_root(&dir.source_dir, self.source);
             let build = relative_or_root(&dir.binary_dir, self.build);
             let directory_rules = rules_by_dir.get(id).map_or(&[][..], Vec::as_slice);
-            let directory = self.directory_object(dir, config, directory_rules, targets);
+            let directory = self.directory_object(*id, dir, config, directory_rules, targets)?;
             let prefix = file_prefix("directory", &build, config);
             let file = self.writer.hashed(&prefix, &directory)?;
             let mut reference = members([
@@ -119,63 +114,100 @@ impl FileApi<'_, '_> {
         Ok(directory_refs)
     }
 
-    pub(super) fn target_destination(
-        &self,
-        target: &ResolvedTarget,
-        rule: &InstallRule,
-        config: &[u8],
-    ) -> Option<BString> {
-        if !applies(&rule.options.configurations, config) {
-            return None;
-        }
-        if let Some(destination) = &rule.options.destination {
-            return Some(destination.clone());
-        }
-        if let Some(file) = &target.artifacts.file {
-            let file = relative(file, self.build);
-            let component = install_component(self.model, rule);
-            let matching = self.result.install.actions.iter().find(|action| {
-                let InstallActionKind::Files { files, .. } = &action.kind else {
-                    return false;
-                };
-                applies(&action.configurations, config)
-                    && action.component == component
-                    && files
-                        .iter()
-                        .any(|source| relative(source, self.build) == file)
-            });
-            if let Some(action) = matching {
-                return Some(action.destination.clone());
-            }
-        }
-        let (var, default) = match target.metadata.kind {
-            TargetKind::Executable => (b"CMAKE_INSTALL_BINDIR".as_slice(), b"bin".as_slice()),
-            TargetKind::StaticLibrary | TargetKind::SharedLibrary | TargetKind::ModuleLibrary => {
-                (b"CMAKE_INSTALL_LIBDIR".as_slice(), b"lib".as_slice())
-            }
-            _ => return None,
-        };
-        Some(cache_value(self.model, var).unwrap_or(default).into())
-    }
-
     fn directory_object(
         &self,
+        id: DirId,
         dir: &Directory,
         config: &[u8],
         rules: &[(usize, &InstallRule)],
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
-    ) -> Value {
+    ) -> Result<Value, GenError> {
         let mut graph = Backtraces::new(self.source);
-        let mut installers = Vec::new();
-        for &(index, rule) in rules
+        let rows = other_installers::Rows {
+            api: self,
+            config: ConfigId(config.into()),
+        };
+        let mut named = self
+            .model
+            .runtime_dependency_installs
             .iter()
-            .filter(|(_, rule)| applies(&rule.options.configurations, config))
-        {
+            .filter(|rule| rule.dir == id)
+            .peekable();
+        let mut installers = Vec::new();
+        for &(index, rule) in rules {
+            while let Some(set) = named.next_if(|set| set.position <= index) {
+                other_installers::append(
+                    &mut installers,
+                    rows.dependencies(
+                        set.dir,
+                        &set.backtrace,
+                        &set.name,
+                        &set.library,
+                        set.framework.as_ref(),
+                    )?,
+                    &set.backtrace,
+                    &mut graph,
+                );
+            }
+            if let InstallKind::Targets { targets: ids, .. } = &rule.kind {
+                for id in ids {
+                    let Some(reference) = targets
+                        .get(id)
+                        .filter(|reference| !reference.abstract_target)
+                    else {
+                        continue;
+                    };
+                    let projected = self
+                        .result
+                        .install
+                        .target_installers
+                        .iter()
+                        .filter(|installer| {
+                            installer.rule == index
+                                && installer.target == *id
+                                && installer.config.matches(config)
+                        })
+                        .map(|installer| installers::target(installer, reference, self.build));
+                    other_installers::append(
+                        &mut installers,
+                        projected,
+                        &rule.backtrace,
+                        &mut graph,
+                    );
+                    if let Some(raw) = self.model.target(*id) {
+                        other_installers::append(
+                            &mut installers,
+                            rows.file_sets(index, rule, reference, raw)?,
+                            &rule.backtrace,
+                            &mut graph,
+                        );
+                        other_installers::append(
+                            &mut installers,
+                            rows.bmi(index, rule, reference)?,
+                            &rule.backtrace,
+                            &mut graph,
+                        );
+                    }
+                }
+                other_installers::append(
+                    &mut installers,
+                    rows.unnamed_dependencies(index, rule)?,
+                    &rule.backtrace,
+                    &mut graph,
+                );
+                continue;
+            }
+            if !applies(&rule.options.configurations, config) {
+                continue;
+            }
             let mut base = members([(
                 "component",
                 Value::string(install_component(self.model, rule)),
             )]);
             graph.tag(&mut base, &rule.backtrace);
+            if rule.options.all_components {
+                base.insert("isForAllComponents".into(), Bool(true));
+            }
             if rule.options.optional {
                 base.insert("isOptional".into(), Bool(true));
             }
@@ -186,30 +218,7 @@ impl FileApi<'_, '_> {
                 base.insert("destination".into(), Value::string(destination.clone()));
             }
             let kind = match &rule.kind {
-                InstallKind::Targets { targets: ids, .. } => {
-                    for target in ids.iter().filter_map(|id| targets.get(id)) {
-                        let Some(destination) =
-                            self.target_destination(target.target, rule, config)
-                        else {
-                            continue;
-                        };
-                        let mut item = base.clone();
-                        item.insert("type".into(), Value::string("target"));
-                        item.insert("targetId".into(), Value::string(target.id.as_str()));
-                        if !target.abstract_target {
-                            item.insert("targetIndex".into(), number(target.index));
-                        }
-                        item.insert("destination".into(), Value::string(destination));
-                        if let Some(file) = &target.target.artifacts.file {
-                            item.insert(
-                                "paths".into(),
-                                array([Value::string(relative(file, self.build))]),
-                            );
-                        }
-                        installers.push(Object(item));
-                    }
-                    continue;
-                }
+                InstallKind::Targets { .. } => continue,
                 InstallKind::Files(_) | InstallKind::Programs(_)
                     if self
                         .model
@@ -223,23 +232,30 @@ impl FileApi<'_, '_> {
                 InstallKind::Files(files)
                 | InstallKind::Programs(files)
                 | InstallKind::Directory(files) => {
+                    if files.is_empty() {
+                        continue;
+                    }
+                    let directory = matches!(rule.kind, InstallKind::Directory(_));
+                    let rename = rule
+                        .options
+                        .rename
+                        .as_ref()
+                        .filter(|name| !name.is_empty() && files.len() == 1);
                     let files = files.iter().map(|file| {
-                        let from = relative(&file.value, self.source);
-                        if let Some(to) = &rule.options.rename {
-                            object([
-                                ("from", Value::string(from)),
-                                ("to", Value::string(to.clone())),
-                            ])
+                        if directory {
+                            let (from, to) = file.value.strip_suffix(b"/").map_or_else(
+                                || (file.value.as_slice(), Lexical::new(&file.value).filename()),
+                                |from| (from, b".".as_slice()),
+                            );
+                            installers::path(self.source, from, to)
+                        } else if let Some(to) = rename {
+                            installers::path(self.source, &file.value, to)
                         } else {
-                            Value::string(from)
+                            Value::string(relative(&file.value, self.source))
                         }
                     });
                     base.insert("paths".into(), array(files));
-                    if matches!(rule.kind, InstallKind::Directory(_)) {
-                        "directory"
-                    } else {
-                        "file"
-                    }
+                    if directory { "directory" } else { "file" }
                 }
                 InstallKind::Script(script) => {
                     base.insert(
@@ -256,7 +272,15 @@ impl FileApi<'_, '_> {
                     let file = file
                         .clone()
                         .unwrap_or_else(|| format!("{set}.cmake").into());
-                    base.insert("paths".into(), array([Value::string(file)]));
+                    let destination = rule
+                        .options
+                        .destination
+                        .as_ref()
+                        .map_or(b"".as_slice(), |value| value.as_slice());
+                    base.insert(
+                        "paths".into(),
+                        array([Value::string(installers::export_path(destination, &file))]),
+                    );
                     if let Some(export) = self.model.exports.get(set) {
                         base.insert(
                             "exportTargets".into(),
@@ -279,7 +303,21 @@ impl FileApi<'_, '_> {
             installers.push(Object(base));
         }
 
-        object([
+        for set in named {
+            other_installers::append(
+                &mut installers,
+                rows.dependencies(
+                    set.dir,
+                    &set.backtrace,
+                    &set.name,
+                    &set.library,
+                    set.framework.as_ref(),
+                )?,
+                &set.backtrace,
+                &mut graph,
+            );
+        }
+        Ok(object([
             ("codemodelVersion", Kind::Codemodel.version_json()),
             (
                 "paths",
@@ -287,7 +325,7 @@ impl FileApi<'_, '_> {
             ),
             ("installers", array(installers)),
             ("backtraceGraph", graph.into_json()),
-        ])
+        ]))
     }
 }
 
@@ -300,7 +338,7 @@ fn install_component<'a>(model: &'a ProjectModel, rule: &'a InstallRule) -> &'a 
         .unwrap_or(b"Unspecified")
 }
 
-fn applies(configurations: &[BString], config: &[u8]) -> bool {
+pub(super) fn applies(configurations: &[BString], config: &[u8]) -> bool {
     configurations.is_empty()
         || configurations
             .iter()

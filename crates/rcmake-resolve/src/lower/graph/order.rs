@@ -14,6 +14,7 @@ pub(super) fn dependencies(
     local: &[(&Target, &crate::ResolvedTarget)],
     strong_edges: &[IndexSet<usize>],
     graph: &mut [GraphTarget],
+    trace: Option<&super::debug::Trace<'_>>,
 ) -> Result<(), ResolveError> {
     let mut usage = UsageResolver::new(model);
     for (target, resolved) in local {
@@ -27,7 +28,17 @@ pub(super) fn dependencies(
             Flags::new(model, target, language).validate_visibility()?;
         }
     }
+    if let Some(trace) = trace {
+        let initial = trace.snapshot(graph, strong_edges);
+        trace.graph("initial", &initial);
+        trace.side_effects(&initial);
+    }
     prune_dependencies(model, local, strong_edges, graph);
+    let intermediate = trace.map(|trace| {
+        let snapshot = trace.snapshot(graph, strong_edges);
+        trace.graph("intermediate", &snapshot);
+        snapshot
+    });
     let mut reverse = vec![Vec::new(); graph.len()];
     for (id, target) in graph.iter().enumerate() {
         for &dep in &target.depends {
@@ -55,6 +66,8 @@ pub(super) fn dependencies(
     visited.clear();
     let mut endpoints: Vec<_> = (0..graph.len()).map(|id| (id, id)).collect();
     let mut dependencies = vec![IndexSet::new(); graph.len()];
+    let mut final_strong = trace.map(|_| vec![IndexSet::new(); graph.len()]);
+    let mut components = Vec::new();
     for id in finished.into_iter().rev() {
         if visited.contains(&id) {
             continue;
@@ -66,6 +79,9 @@ pub(super) fn dependencies(
                 component.insert(node);
                 pending.extend(reverse.get(node).into_iter().flatten().copied());
             }
+        }
+        if trace.is_some() && component.len() > 1 {
+            components.push(component.clone());
         }
         if component.len() < 2 {
             continue;
@@ -107,13 +123,23 @@ pub(super) fn dependencies(
             }
             if let Some(deps) = dependencies.get_mut(next) {
                 deps.extend(strong_dependencies(graph, strong_edges, &component, next));
+                if let Some(strong) = final_strong
+                    .as_mut()
+                    .and_then(|strong| strong.get_mut(next))
+                {
+                    strong.clone_from(deps);
+                    strong.extend(previous);
+                }
                 deps.extend(previous);
             }
             previous = Some(next);
         }
     }
 
-    for (target, &(tail, _)) in graph.iter().zip(&endpoints) {
+    if let (Some(trace), Some(intermediate)) = (trace, &intermediate) {
+        trace.components(intermediate, &components);
+    }
+    for (index, (target, &(tail, _))) in graph.iter().zip(&endpoints).enumerate() {
         let Some(edges) = dependencies.get_mut(tail) else {
             continue;
         };
@@ -122,11 +148,23 @@ pub(super) fn dependencies(
                 && tail != dep_tail
             {
                 edges.insert(dep_head);
+                if let Some(strong) = final_strong
+                    .as_mut()
+                    .and_then(|strong| strong.get_mut(tail))
+                    && strong_edges
+                        .get(index)
+                        .is_some_and(|edges| edges.contains(&dep))
+                {
+                    strong.insert(dep_head);
+                }
             }
         }
     }
     for (target, edges) in graph.iter_mut().zip(dependencies) {
         target.depends = edges.into_iter().collect();
+    }
+    if let (Some(trace), Some(strong)) = (trace, &final_strong) {
+        trace.graph("final", &trace.snapshot(graph, strong));
     }
     Ok(())
 }

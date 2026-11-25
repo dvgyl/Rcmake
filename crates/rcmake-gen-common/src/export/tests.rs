@@ -96,6 +96,8 @@ fn renders_namespace_qualified_sibling_links() -> Result<(), Box<dyn std::error:
     model.add_alias(DirId::ROOT, "Local::dep".into(), dependency)?;
     let mut consumer = interface("consumer");
     consumer.usage.interface_link_libraries = Some(vec![LinkItem {
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
         scope: None,
         text: BT::new(
             concat!(

@@ -815,6 +815,7 @@ fn cache_setting(cache: &[u8], name: &[u8]) -> Option<BString> {
 struct Programs {
     cmake: Vec<u8>,
     ctest: Vec<u8>,
+    ctest_arguments: Vec<BString>,
     cpack: Vec<u8>,
     ninja: Vec<u8>,
     package: bool,
@@ -892,6 +893,7 @@ impl Programs {
                 ),
                 b"ctest",
             ),
+            ctest_arguments: result.metadata.ctest_arguments.clone(),
             cpack: program(cpack, b"cpack"),
             ninja: program(
                 setting(definition(b"CMAKE_MAKE_PROGRAM"), b"CMAKE_MAKE_PROGRAM"),

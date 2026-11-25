@@ -307,6 +307,7 @@ fn fixture(source: &Path, build: &Path) -> TestResult<(ProjectModel, GenerationR
         },
     );
     cache_entry(&mut model, "CMAKE_ROOT", b"/cmake", CacheType::Internal, "");
+    result.install = rcmake_resolve::lower::lower_install_manifest(&model, &result.targets);
     Ok((model, result))
 }
 
@@ -625,6 +626,7 @@ fn indexes_subprojects_and_abstract_targets_per_configuration() -> TestResult {
     let install = model.installs.first_mut().ok_or("missing install rule")?;
     install.options.configurations = vec!["Release".into()];
     install.options.destination = Some("bin/release".into());
+    result.install = rcmake_resolve::lower::lower_install_manifest(&model, &result.targets);
 
     write(&host, &build.join(API_DIR).join("query/codemodel-v2"), b"")?;
     write_replies(&model, &result, &host, build)?;

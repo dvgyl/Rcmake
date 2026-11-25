@@ -428,6 +428,11 @@ impl<'a> UsageResolver<'a> {
         // CMake reports a located error for each entry that fails.
         let mut failures = Vec::new();
         for entry in entries {
+            if entry.text.value.is_empty()
+                && (entry.opens_lookup_scope || entry.closes_lookup_scope)
+            {
+                continue;
+            }
             match entry.text.value.as_slice() {
                 b"debug" => take_next = debug,
                 b"optimized" => take_next = !debug,
@@ -688,12 +693,19 @@ impl Injection {
                 let Some(raw) = target.props.get(property) else {
                     continue;
                 };
-                let raw = LinkItem {
-                    scope: None,
-                    text: BT::new(raw.clone(), target.backtrace.clone()),
-                    lookup_dir: target.dir,
-                };
-                let links = resolver.evaluate_links(id, property, &[raw], ctx, true, false)?;
+                let fallback = [BT::new(raw.clone(), target.backtrace.clone())];
+                let entries = target.direct_link_entries(property).unwrap_or(&fallback);
+                let items: Vec<_> = entries
+                    .iter()
+                    .map(|entry| LinkItem {
+                        opens_lookup_scope: false,
+                        closes_lookup_scope: false,
+                        scope: None,
+                        text: entry.clone(),
+                        lookup_dir: target.dir,
+                    })
+                    .collect();
+                let links = resolver.evaluate_links(id, property, &items, ctx, true, false)?;
                 self.flags = self.flags.union(links.value.flags);
                 for link in links.items {
                     if property == EXCLUDE {

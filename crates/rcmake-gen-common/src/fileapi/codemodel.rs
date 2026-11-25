@@ -1,6 +1,8 @@
 mod backtraces;
 mod directories;
 mod includes;
+mod installers;
+mod other_installers;
 mod projects;
 mod targets;
 
@@ -55,18 +57,10 @@ impl FileApi<'_, '_> {
             &mut projects,
         );
         let install_rules = InstallRules::collect(self.model);
-        let mut target_refs = self.target_references(
-            config,
-            &targets.build,
-            &targets.identities,
-            &install_rules.by_target,
-        )?;
-        let abstract_refs = self.target_references(
-            config,
-            &targets.abstract_targets,
-            &targets.identities,
-            &install_rules.by_target,
-        )?;
+        let mut target_refs =
+            self.target_references(config, &targets.build, &targets.identities)?;
+        let abstract_refs =
+            self.target_references(config, &targets.abstract_targets, &targets.identities)?;
         self.add_utility_targets(
             config,
             &targets.identities,

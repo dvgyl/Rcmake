@@ -39,7 +39,7 @@ pub use glob::{GlobCall, GlobCheck, GlobKey};
 pub use ids::{BT, CommandId, DirId, FileSetId, TargetId, TestId};
 pub use install::{
     BuildExport, DiscoverySpec, ExportKind, ExportSet, InstallKind, InstallOptions, InstallRule,
-    PackageInfoSpec, ProjectMetadata, SbomSpec, TestEntry, TestKind,
+    PackageInfoSpec, ProjectMetadata, RuntimeDependencyInstall, SbomSpec, TestEntry, TestKind,
 };
 pub use project::{ModelError, ProjectModel, replay};
 pub use props::{AppendMode, PropOrigin, PropScope};

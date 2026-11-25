@@ -349,13 +349,10 @@ impl UsageResolver<'_> {
                 id,
                 config,
                 "OUTPUT_NAME",
-                &[
-                    format!("{category}_OUTPUT_NAME_{config_upper}"),
-                    format!("{category}_OUTPUT_NAME"),
-                    format!("OUTPUT_NAME_{config_upper}"),
-                    format!("{config_upper}_OUTPUT_NAME"),
-                    "OUTPUT_NAME".into(),
-                ],
+                &lower::output_name_keys(category, config_upper.as_slice())
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
             )?
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| target.name.clone())

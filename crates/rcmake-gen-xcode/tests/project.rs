@@ -671,6 +671,8 @@ fn native_xcodebuild_compiles_and_runs_program() {
         ["core", "shared", "object"]
             .into_iter()
             .map(|name| rcmake_model::LinkItem {
+                opens_lookup_scope: false,
+                closes_lookup_scope: false,
                 scope: None,
                 text: BT::new(name.into(), Default::default()),
                 lookup_dir: DirId::ROOT,
@@ -889,6 +891,8 @@ fn built_only_link_phase_searches_product_dirs_and_skips_libtool_flags() {
         ["core", "bundle"]
             .into_iter()
             .map(|name| rcmake_model::LinkItem {
+                opens_lookup_scope: false,
+                closes_lookup_scope: false,
                 scope: None,
                 text: BT::new(name.into(), Default::default()),
                 lookup_dir: DirId::ROOT,
@@ -897,6 +901,8 @@ fn built_only_link_phase_searches_product_dirs_and_skips_libtool_flags() {
     );
     model.target_mut(core).expect("core").usage.link_libraries =
         Some(vec![rcmake_model::LinkItem {
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
             scope: None,
             text: BT::new("m".into(), Default::default()),
             lookup_dir: DirId::ROOT,
@@ -955,6 +961,8 @@ fn known_location_uses_darwin_absolute_framework_paths() {
         ]
         .into_iter()
         .map(|path| rcmake_model::LinkItem {
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
             scope: None,
             text: BT::new(path.into(), Default::default()),
             lookup_dir: DirId::ROOT,

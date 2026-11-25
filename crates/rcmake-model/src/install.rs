@@ -32,6 +32,43 @@ pub struct InstallOptions {
     pub export_package_dependencies: bool,
 }
 
+impl InstallOptions {
+    /// Apply the options for an artifact group over the generic options.
+    #[must_use]
+    pub fn with_group(&self, group: &Self) -> Self {
+        let mut options = self.clone();
+        options.destination = group.destination.clone().or(options.destination);
+        options.component = group.component.clone().or(options.component);
+        options.rename = group.rename.clone().or(options.rename);
+        if !group.permissions.is_empty() {
+            options.permissions.clone_from(&group.permissions);
+        }
+        if !group.configurations.is_empty() {
+            options.configurations.clone_from(&group.configurations);
+        }
+        options.optional |= group.optional;
+        options.exclude_from_all |= group.exclude_from_all;
+        options
+    }
+}
+
+/// A named runtime dependency set install request.
+#[derive(Clone, Debug)]
+pub struct RuntimeDependencyInstall {
+    /// Directory of the install call.
+    pub dir: DirId,
+    /// Index of the next ordinary install rule.
+    pub position: usize,
+    /// Runtime dependency set name.
+    pub name: BString,
+    /// Backtrace of the install call.
+    pub backtrace: Backtrace,
+    /// Options for the library or DLL runtime artifacts.
+    pub library: InstallOptions,
+    /// Options for the framework artifacts, if supported.
+    pub framework: Option<InstallOptions>,
+}
+
 /// The `install()` signature of a rule.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InstallKind {

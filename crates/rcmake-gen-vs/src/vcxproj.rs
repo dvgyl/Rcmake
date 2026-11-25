@@ -501,7 +501,12 @@ impl Context<'_> {
                 "--config".into(),
                 name.into(),
             ],
-            UtilityKind::RunTests => vec![self.settings.ctest.clone(), "-C".into(), name.into()],
+            UtilityKind::RunTests => {
+                let mut argv = vec![self.settings.ctest.clone()];
+                argv.extend(self.settings.ctest_arguments.iter().cloned());
+                argv.extend(["-C".into(), name.into()]);
+                argv
+            }
             UtilityKind::Package | UtilityKind::PackageSource => {
                 let filename = if utility == UtilityKind::Package {
                     "CPackConfig.cmake"

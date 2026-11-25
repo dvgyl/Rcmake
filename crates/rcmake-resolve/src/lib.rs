@@ -32,7 +32,9 @@ pub mod lower;
 pub mod progress;
 pub mod usage;
 
-pub use install_manifest::{InstallAction, InstallActionKind, InstallEntry, InstallManifest};
+pub use install_manifest::{
+    InstallAction, InstallActionKind, InstallEntry, InstallManifest, NamelinkMode, TargetInstaller,
+};
 pub use model::*;
 pub use pipeline::{resolve, resolve_with_options, validate_codegen_name};
 

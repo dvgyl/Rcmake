@@ -401,7 +401,7 @@ pub(crate) fn utility(
     cwd: &Path,
     configs: &[String],
     cmake: &str,
-    ctest: &str,
+    (ctest, ctest_arguments): (&str, &[rcmake_base::BString]),
     cpack: &str,
 ) -> Script {
     let command = match kind {
@@ -414,10 +414,15 @@ pub(crate) fn utility(
             "{} \"-DBUILD_TYPE=$CONFIGURATION\" \"-DEFFECTIVE_PLATFORM_NAME=$EFFECTIVE_PLATFORM_NAME\" -P cmake_install.cmake",
             quote(cmake)
         ),
-        UtilityKind::RunTests => format!(
-            "{} -C \"$CONFIGURATION$EFFECTIVE_PLATFORM_NAME\"",
-            quote(ctest)
-        ),
+        UtilityKind::RunTests => {
+            let mut command = quote(ctest);
+            for argument in ctest_arguments {
+                command.push(' ');
+                command.push_str(&quote(&argument.to_string()));
+            }
+            command.push_str(" -C \"$CONFIGURATION$EFFECTIVE_PLATFORM_NAME\"");
+            command
+        }
         UtilityKind::Package => format!(
             "{} -C \"$CONFIGURATION$EFFECTIVE_PLATFORM_NAME\" --config ./CPackConfig.cmake",
             quote(cpack)

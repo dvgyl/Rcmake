@@ -14,6 +14,7 @@ use rcmake_model::{
     UsageScope,
 };
 
+mod apple;
 mod components;
 mod destinations;
 pub(crate) use components::registered;
@@ -421,6 +422,7 @@ fn targets(
     let mut component_groups = Vec::new();
     let mut file_set = None;
     let mut library_namelink_only = false;
+    let mut apple_destinations = Vec::new();
     let mut file_sets = Vec::new();
     while let Some(key) = args.next() {
         match key {
@@ -507,6 +509,11 @@ fn targets(
                 }
                 if group.is_some() && key == b"DESTINATION" {
                     destination_argument = Some(argument_count - args.len());
+                    if let (Some(group @ (b"BUNDLE" | b"FRAMEWORK")), Some(path)) =
+                        (group, args.peek())
+                    {
+                        apple_destinations.push((group.into(), destination(cx, path)));
+                    }
                 }
                 let options = if group.is_some() {
                     &mut artifact_options
@@ -533,6 +540,13 @@ fn targets(
             .zip(artifact_options.destination)
             .map(|(index, path)| (index, path, group == Some(b"CXX_MODULES_BMI"))),
     );
+    apple::validate_destinations(
+        cx,
+        &targets,
+        options,
+        &apple_destinations,
+        library_namelink_only,
+    )?;
     if export.is_some() {
         require_exported_file_sets(cx, &targets, &file_sets)?;
     }

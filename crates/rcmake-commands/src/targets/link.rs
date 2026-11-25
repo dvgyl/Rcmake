@@ -86,6 +86,8 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         scope: UsageScope::Public,
         signature: Signature::Plain,
     });
+    let policy = PolicyId::new(79);
+    let remote_policy = cx.policy(policy);
     let bt = cx.backtrace();
     let model = cx.project();
     let target = model
@@ -100,6 +102,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let mut own = Vec::new();
     let mut interface = Vec::new();
     let mut warnings = Vec::new();
+    let mut remote_warnings = Vec::new();
     let debug = debug_condition(model.global.props.get(b"DEBUG_CONFIGURATIONS"));
     let mut has_item = false;
     let mut args = rest.iter().enumerate().peekable();
@@ -163,7 +166,26 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         if value.is_empty() {
             continue;
         }
+        if owner != dir && remote_policy != PolicyStatus::New {
+            if scope != UsageScope::Interface {
+                cx.issue_in_directory(
+                    MessageKind::Error,
+                    Effect::SetError,
+                    None,
+                    format!(
+                        "Attempt to add link library \"{text}\" to target \"{}\" which is not built in this directory.\n\nThis is allowed only when policy CMP0079 is set to NEW.",
+                        name.value
+                    ).into(),
+                );
+                return Err(CmdError::Reported);
+            }
+            if remote_policy == PolicyStatus::Warn {
+                remote_warnings.push(text.clone());
+            }
+        }
         let item = |value| LinkItem {
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
             scope: Some(scope),
             text: BT::new(value, bt.clone()),
             lookup_dir: dir,
@@ -217,23 +239,28 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             warning.into(),
         );
     }
-    if owner != dir && cx.policy(PolicyId::new(79)) != PolicyStatus::New {
-        if let Some(item) = own.first() {
-            let text = &item.text.value;
-            cx.issue_in_directory(
-                MessageKind::Error,
-                Effect::SetError,
-                None,
-                format!(
-                    "Attempt to add link library \"{text}\" to target \"{}\" which is not built in this directory.\n\nThis is allowed only when policy CMP0079 is set to NEW.",
-                    name.value
-                ).into(),
-            );
-            return Err(CmdError::Reported);
+    if owner != dir {
+        if remote_policy == PolicyStatus::New {
+            for batch in [&mut own, &mut interface] {
+                if let Some(first) = batch.first_mut() {
+                    first.opens_lookup_scope = true;
+                }
+                if let Some(last) = batch.last_mut() {
+                    last.closes_lookup_scope = true;
+                }
+            }
+        } else {
+            for item in &mut interface {
+                item.lookup_dir = owner;
+            }
         }
-        for item in &mut interface {
-            item.lookup_dir = owner;
-        }
+    }
+    for text in remote_warnings {
+        let body = format!(
+            "Target\n  {}\nis not created in this directory.  For compatibility with older versions of CMake, link library\n  {text}\nwill be looked up in the directory in which the target was created rather than in this calling directory.",
+            name.value,
+        );
+        cx.issue_policy_warning(policy, b"", body.as_bytes());
     }
     let model = cx.project();
     let root = model.dir(DirId::ROOT).source_dir.clone();

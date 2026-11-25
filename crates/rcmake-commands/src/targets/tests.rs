@@ -592,9 +592,11 @@ fn records_link_lookup_directory_and_backtrace() -> TestResult {
     assert_eq!(own[0].lookup_dir, child);
     assert_eq!(interface[0].lookup_dir, child);
     assert!(!own[0].text.backtrace.is_empty());
+    assert!(own[0].opens_lookup_scope && own[0].closes_lookup_scope);
+    assert!(interface[0].opens_lookup_scope && interface[0].closes_lookup_scope);
     assert_eq!(
         model.get_prop(&PropScope::Target(root), b"INTERFACE_LINK_LIBRARIES"),
-        Some("$<LINK_ONLY:local>".into())
+        Some(format!("::@(0x{:x});$<LINK_ONLY:local>;::@", child.index()).into())
     );
     Ok(())
 }

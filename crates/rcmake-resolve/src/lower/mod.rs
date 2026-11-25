@@ -54,7 +54,10 @@ pub(crate) use custom::{checked_command_outputs, command_outputs};
 pub use graph::lower;
 pub(crate) use graph::lower_with_inputs;
 pub(crate) use install::lower_install_manifest_with_configs;
-pub use install::{collect_metadata, lower_install_manifest};
+pub use install::{
+    collect_metadata, install_target_group_options, installs_unnamed_runtime_dependencies,
+    lower_install_manifest,
+};
 pub use launcher::instrumentation_launcher;
 pub(crate) use link::{
     ide_rpaths, install_name_dir, install_name_prefix, warn_install_name_policy,
@@ -164,4 +167,19 @@ pub fn expand_rule(template: &[u8], lookup: impl Fn(&[u8]) -> Option<BString>) -
     }
     out.extend_from_slice(rest);
     out.into()
+}
+
+pub(crate) fn output_name_keys(class: &str, config: &[u8]) -> Vec<BString> {
+    let class: BString = format!("{class}_OUTPUT_NAME").into();
+    let mut keys = Vec::new();
+    if !config.is_empty() {
+        keys.push([class.as_slice(), b"_", config].concat().into());
+    }
+    keys.push(class);
+    if !config.is_empty() {
+        keys.push([b"OUTPUT_NAME_", config].concat().into());
+        keys.push([config, b"_OUTPUT_NAME"].concat().into());
+    }
+    keys.push("OUTPUT_NAME".into());
+    keys
 }

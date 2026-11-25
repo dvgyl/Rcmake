@@ -194,6 +194,10 @@ pub struct LinkItem {
     /// Directory whose target names resolve the item (`CMP0079`: the directory of the
     /// `target_link_libraries()` call).
     pub lookup_dir: DirId,
+    /// Emit a directory lookup marker before this entry.
+    pub opens_lookup_scope: bool,
+    /// Reset directory lookup after this entry.
+    pub closes_lookup_scope: bool,
     /// Original scope of the link command, when available.
     pub scope: Option<UsageScope>,
 }
@@ -424,6 +428,8 @@ pub struct Target {
     pub policies: TargetPolicySnapshot,
     /// Properties that are not usage requirements or sources.
     pub props: PropertyMap,
+    pub(crate) direct_links: Option<Vec<BT<BString>>>,
+    pub(crate) direct_excludes: Option<Vec<BT<BString>>>,
     /// Usage requirements.
     pub usage: UsageProps,
     /// `SOURCES` entries.
@@ -455,6 +461,8 @@ impl Target {
             backtrace,
             policies: TargetPolicySnapshot { policies },
             props: PropertyMap::default(),
+            direct_links: None,
+            direct_excludes: None,
             usage: UsageProps::default(),
             sources: Vec::new(),
             file_sets: Vec::new(),

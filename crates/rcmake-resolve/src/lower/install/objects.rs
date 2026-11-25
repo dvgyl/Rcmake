@@ -31,6 +31,18 @@ impl ObjectPaths {
         }
     }
 
+    pub(super) fn installer_path(&self, base: &[u8]) -> (BString, BString) {
+        let installed = Lexical::new(&self.installed);
+        let relative = if base.is_empty() {
+            self.installed.clone()
+        } else {
+            installed
+                .relative(Lexical::new(base))
+                .unwrap_or_else(|| self.installed.clone())
+        };
+        (self.built.clone(), relative)
+    }
+
     pub(super) fn action(
         self,
         options: &InstallOptions,

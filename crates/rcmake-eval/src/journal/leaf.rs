@@ -669,6 +669,12 @@ struct TargetRecord {
 impl TargetRecord {
     fn capture(target: &Target, path: &Path) -> Option<Self> {
         if target.is_imported()
+            || target
+                .direct_link_entries(b"INTERFACE_LINK_LIBRARIES_DIRECT")
+                .is_some()
+            || target
+                .direct_link_entries(b"INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE")
+                .is_some()
             || !target.file_sets.is_empty()
             || !target.utility_deps.is_empty()
             || !target.event_commands.is_empty()
@@ -773,7 +779,7 @@ fn capture_links(items: Option<&[LinkItem]>, bin: &Path, dir: DirId) -> Option<O
     items
         .iter()
         .map(|item| {
-            if item.lookup_dir != dir {
+            if item.lookup_dir != dir || item.opens_lookup_scope || item.closes_lookup_scope {
                 return None;
             }
             let scope = item.scope.map(|scope| match scope {
@@ -812,6 +818,8 @@ fn restore_links(items: Option<&[Link]>, bin: &Path, dir: DirId) -> Option<Optio
                 Some(_) => return None,
             };
             Some(LinkItem {
+                opens_lookup_scope: false,
+                closes_lookup_scope: false,
                 text: BT::new(text.as_slice().into(), origin.backtrace()),
                 lookup_dir: dir,
                 scope,

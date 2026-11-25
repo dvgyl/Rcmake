@@ -67,6 +67,8 @@ pub struct ConfigureMetadata {
     pub cmake_command: Option<BString>,
     /// Executable path from `CMAKE_CTEST_COMMAND`.
     pub ctest_command: Option<BString>,
+    /// Arguments from the root directory's `CMAKE_CTEST_ARGUMENTS` list.
+    pub ctest_arguments: Vec<BString>,
     /// Output command step indices that need the GNU Make jobserver.
     pub jobserver_steps: IndexSet<usize>,
     /// Auxiliary files that the configure step writes.

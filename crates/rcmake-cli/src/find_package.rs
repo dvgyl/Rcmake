@@ -119,6 +119,8 @@ fn link_flags(cx: &mut Cx<'_>) -> Result<BString, String> {
         list::split(&libraries, list::Empty::Drop)
             .into_iter()
             .map(|library| LinkItem {
+                opens_lookup_scope: false,
+                closes_lookup_scope: false,
                 text: BT::new(library, Default::default()),
                 lookup_dir: dir,
                 scope: None,

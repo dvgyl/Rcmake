@@ -155,6 +155,7 @@ fn install_script_covers_each_action_and_manifest_scope() {
     file.optional = true;
     let manifest = InstallManifest {
         directories: Default::default(),
+        target_installers: Vec::new(),
         actions: vec![
             file,
             action(
@@ -697,6 +698,7 @@ mod differential {
             let fixture = Fixture::new(&host);
             let manifest = InstallManifest {
                 directories: Default::default(),
+                target_installers: Vec::new(),
                 actions: ["Debug", "Release"]
                     .into_iter()
                     .map(|config| {
@@ -779,6 +781,7 @@ mod differential {
             dirs.push(b'/');
             let manifest = InstallManifest {
                 directories: Default::default(),
+        target_installers: Vec::new(),
                 actions: vec![
                     skipped,
                     wrong_config,

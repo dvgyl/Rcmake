@@ -220,6 +220,8 @@ fn windows_ninja_links_resources_and_import_libraries() -> TestResult {
         ["shared", "sdk", "bare", "ready.LIB"]
             .into_iter()
             .map(|name| LinkItem {
+                opens_lookup_scope: false,
+                closes_lookup_scope: false,
                 scope: None,
                 text: bt(name),
                 lookup_dir: DirId::ROOT,

@@ -56,6 +56,16 @@ pub fn render_with_options(
     binary_dir: &[u8],
     options: &InstallScriptOptions<'_>,
 ) -> Result<BString, GenError> {
+    render_with_runtime_definitions(manifest, binary_dir, options, |_| None)
+}
+
+/// Render an install script with the configured runtime dependency scanner settings.
+pub fn render_with_runtime_definitions<'a>(
+    manifest: &InstallManifest,
+    binary_dir: &[u8],
+    options: &InstallScriptOptions<'_>,
+    definitions: impl Fn(&[u8]) -> Option<&'a BString>,
+) -> Result<BString, GenError> {
     let mut out = BString::from(
         "# CMake generated install script\n\nif(NOT DEFINED CMAKE_INSTALL_PREFIX)\n  set(CMAKE_INSTALL_PREFIX ",
     );
@@ -100,6 +110,18 @@ endif()
         out.extend_from_slice(
             format!("if(NOT DEFINED {name})\n  set({name} \"{value}\")\nendif()\n\n").as_bytes(),
         );
+    }
+    for name in [
+        "CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM",
+        "CMAKE_GET_RUNTIME_DEPENDENCIES_TOOL",
+        "CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND",
+        "CMAKE_OBJDUMP",
+    ] {
+        if let Some(value) = definitions(name.as_bytes()) {
+            out.extend_from_slice(format!("if(NOT DEFINED {name})\n  set({name} ").as_bytes());
+            quote(&mut out, value);
+            out.extend_from_slice(b")\nendif()\n\n");
+        }
     }
     for action in &manifest.actions {
         render_action(&mut out, action, options)?;
