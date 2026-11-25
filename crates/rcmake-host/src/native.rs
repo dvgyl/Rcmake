@@ -470,7 +470,8 @@ impl Host for NativeHost {
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
         validate_run(req, require_absolute)?;
-        process::run_pipeline(req, None, usize::MAX, on_output)
+        process::run_pipeline(req, None, usize::MAX, on_output, None, None)
+            .map(|result| result.output)
     }
 
     fn run_with_timeout_signal(
@@ -480,12 +481,32 @@ impl Host for NativeHost {
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
         validate_run(req, require_absolute)?;
-        process::run_pipeline(req, Some(timeout), usize::MAX, on_output)
+        process::run_pipeline(req, Some(timeout), usize::MAX, on_output, None, None)
+            .map(|result| result.output)
+    }
+
+    fn run_controlled(
+        &self,
+        req: &RunRequest,
+        graceful: Option<GracefulTimeout>,
+        hard_limit: Option<Duration>,
+        update: &mut crate::DeadlineUpdate<'_>,
+    ) -> HostResult<crate::ControlledOutput> {
+        validate_run(req, require_absolute)?;
+        process::run_pipeline(
+            req,
+            graceful,
+            usize::MAX,
+            &mut |_, _| {},
+            hard_limit,
+            Some(update),
+        )
     }
 
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
         validate_run(req, require_absolute)?;
-        process::run_pipeline(req, None, limit, &mut |_, _| {})
+        process::run_pipeline(req, None, limit, &mut |_, _| {}, None, None)
+            .map(|result| result.output)
     }
 
     fn write_out(&self, stream: Stream, bytes: &[u8]) {

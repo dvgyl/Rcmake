@@ -403,16 +403,15 @@ pub(crate) fn write_test_xml(
         }
         xml.push_str("\t\t\t<Results>\n");
         if xml_status == "failed" {
-            measurement(
-                &mut xml,
-                "text/string",
-                "Exit Code",
-                if status == Status::Timeout {
-                    "Timeout"
-                } else {
-                    "Failed"
-                },
-            );
+            let exit_code = if status == Status::Timeout {
+                record.timeout_signal.map_or_else(
+                    || "Timeout".into(),
+                    |signal| format!("Timeout ({})", crate::timeout::signal_name(signal)),
+                )
+            } else {
+                "Failed".into()
+            };
+            measurement(&mut xml, "text/string", "Exit Code", &exit_code);
             measurement(
                 &mut xml,
                 "text/string",

@@ -1,6 +1,6 @@
 //! macOS `DragNDrop` generator (`.dmg` through `hdiutil`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -10,9 +10,9 @@ use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{FileKind, Follow, Host, ReadRange, WriteMode};
 
 use super::{ScratchDir, copy_asset, option, run_tool};
-use crate::config::absolute;
-use crate::stage::{clear_output_file, ensure_dir};
-use crate::{CpackError, PackageContext, PackageGenerator, error, safe_name};
+use crate::config::{CpackConfig, absolute};
+use crate::stage::{clear_output_file, component_group, component_roots, ensure_dir};
+use crate::{ComponentGrouping, CpackError, PackageContext, PackageGenerator, error, safe_name};
 
 /// The `DragNDrop` generator.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -28,7 +28,59 @@ impl PackageGenerator for DragNDropGenerator {
     }
 
     fn package(&self, cx: &PackageContext<'_>) -> Result<Vec<PathBuf>, CpackError> {
-        create_image(cx, cx.staging_dir)
+        let cfg = CpackConfig {
+            vars: cx.vars.clone(),
+        };
+        let roots = component_roots(&cfg)?;
+        if roots.is_empty() {
+            return create_image(cx, cx.staging_dir);
+        }
+        let mut images = BTreeMap::<_, BTreeSet<_>>::new();
+        for (component, roots) in roots {
+            let name = match cx.grouping {
+                ComponentGrouping::AllComponentsInOne => None,
+                ComponentGrouping::Ignore => Some((false, component)),
+                ComponentGrouping::OnePerGroup => match component_group(&cfg, &component) {
+                    Some(group) => Some((true, BString::from(group))),
+                    None => Some((false, component)),
+                },
+            };
+            images.entry(name).or_default().extend(roots);
+        }
+        let mut paths = BTreeSet::new();
+        let images = images
+            .into_iter()
+            .map(|(component, roots)| {
+                let name = component.map_or_else(
+                    || BString::from(cx.file_name),
+                    |(_, component)| {
+                        let upper = BString::from(component.to_ascii_uppercase());
+                        option(cx, format!("CPACK_DMG_{upper}_FILE_NAME").as_bytes()).map_or_else(
+                            || [cx.file_name, b"-", component.as_slice()].concat().into(),
+                            BString::from,
+                        )
+                    },
+                );
+                let output = image_path(cx, &name)?;
+                if !paths.insert(output.clone()) {
+                    return Err(error(format!(
+                        "Duplicate disk image name: {}",
+                        output.display()
+                    )));
+                }
+                Ok((output, roots))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut outputs = Vec::new();
+        for (output, roots) in images {
+            let scratch = ScratchDir::new(cx.host, cx.output_dir)?;
+            for root in roots {
+                crate::source::merge_component(cx.host, &cx.staging_dir.join(root), &scratch.path)?;
+            }
+            write_image(cx, &scratch.path, &output)?;
+            outputs.push(output);
+        }
+        Ok(outputs)
     }
 }
 
@@ -36,9 +88,16 @@ pub(super) fn create_image(
     cx: &PackageContext<'_>,
     staging: &Path,
 ) -> Result<Vec<PathBuf>, CpackError> {
-    let output = cx
-        .output_dir
-        .join(safe_name(&[cx.file_name, b".dmg"].concat())?);
+    let output = image_path(cx, cx.file_name)?;
+    write_image(cx, staging, &output)?;
+    Ok(vec![output])
+}
+
+fn image_path(cx: &PackageContext<'_>, name: &[u8]) -> Result<PathBuf, CpackError> {
+    Ok(cx.output_dir.join(safe_name(&[name, b".dmg"].concat())?))
+}
+
+fn write_image(cx: &PackageContext<'_>, staging: &Path, output: &Path) -> Result<(), CpackError> {
     let license = license_resources(cx)?;
     stage_layout(cx, staging)?;
     let volume = option(cx, b"CPACK_DMG_VOLUME_NAME").unwrap_or(cx.file_name);
@@ -46,14 +105,14 @@ pub(super) fn create_image(
     let tool = option(cx, b"CPACK_COMMAND_HDIUTIL").unwrap_or(b"hdiutil");
 
     if let Some(script) = option(cx, b"CPACK_DMG_DS_STORE_SETUP_SCRIPT") {
-        create_with_setup(cx, staging, &output, tool, volume, format, script)?;
+        create_with_setup(cx, staging, output, tool, volume, format, script)?;
     } else {
-        clear_output_file(cx.host, &output)?;
+        clear_output_file(cx.host, output)?;
         run_tool(
             cx.host,
             cx.output_dir,
             tool,
-            create_args(staging, &output, volume, format),
+            create_args(staging, output, volume, format),
         )?;
     }
 
@@ -72,18 +131,18 @@ pub(super) fn create_image(
                 "-xml".into(),
                 from_native(&xml),
                 "resources".into(),
-                from_native(&output),
+                from_native(output),
             ],
         )?;
     }
 
-    if cx.host.metadata(&output, Follow::No)?.kind != FileKind::File {
+    if cx.host.metadata(output, Follow::No)?.kind != FileKind::File {
         return Err(error(format!(
             "Expected a disk image at {}",
             output.display()
         )));
     }
-    Ok(vec![output])
+    Ok(())
 }
 
 fn stage_layout(cx: &PackageContext<'_>, staging: &Path) -> Result<(), CpackError> {
@@ -197,7 +256,7 @@ fn create_with_setup(
 
 fn license_resources(cx: &PackageContext<'_>) -> Result<Option<String>, CpackError> {
     let Some(directory) = option(cx, b"CPACK_DMG_SLA_DIR") else {
-        return Ok(None);
+        return resource_file_license(cx);
     };
     let languages = list::split(
         option(cx, b"CPACK_DMG_SLA_LANGUAGES")
@@ -234,12 +293,7 @@ fn license_resources(cx: &PackageContext<'_>) -> Result<Option<String>, CpackErr
             }
             result => ("TEXT", result?),
         };
-        let mut text = Vec::new();
-        for line in resource_lines(&license) {
-            text.extend(line);
-            text.push(b'\r');
-        }
-        text.push(b'\r');
+        let text = license_text(resource_lines(&license));
 
         let menu_file = path("menu.txt")?;
         let menu = read_resource(cx.host, &menu_file)?;
@@ -273,13 +327,85 @@ fn license_resources(cx: &PackageContext<'_>) -> Result<Option<String>, CpackErr
     }
     write_resource(resources.entry("LPic").or_default(), 5000, "", &regions)?;
 
+    Ok(Some(resource_xml(resources)?))
+}
+
+fn resource_file_license(cx: &PackageContext<'_>) -> Result<Option<String>, CpackError> {
+    if !option(cx, b"CPACK_DMG_SLA_USE_RESOURCE_FILE_LICENSE").is_some_and(truth::is_on) {
+        return Ok(None);
+    }
+    let Some(file) = option(cx, b"CPACK_RESOURCE_FILE_LICENSE") else {
+        return Ok(None);
+    };
+    let file = absolute(&cx.host.initial_cwd(), file);
+    if option(cx, b"CMAKE_ROOT")
+        .is_some_and(|root| file == to_native(root).join("Templates/CPack.GenericLicense.txt"))
+    {
+        return Ok(None);
+    }
+    let raw = read_resource(cx.host, &file)?;
+    let kind = if file
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("rtf"))
+    {
+        "RTF "
+    } else {
+        "TEXT"
+    };
+
+    // The default LPic table maps classic Mac regions to language entries.
+    // Regions without a resource for their language use entry 2 (English).
+    let regions: [u16; 53] = [
+        2, 17, 3, 1, 0, 0, 2, 0, 8, 3, 0, 1, 4, 0, 4, 5, 0, 14, 6, 1, 5, 7, 0, 7, 8, 0, 71, 9, 0,
+        52, 10, 1, 53, 11, 1, 32, 12, 0, 17, 13, 0, 91, 4, 0, 51, 15, 1, 12, 16, 0, 11, 14, 0,
+    ];
+    let regions: Vec<_> = regions.into_iter().flat_map(u16::to_be_bytes).collect();
+    let labels = [
+        "English",
+        "Agree",
+        "Disagree",
+        "Print",
+        "Save...",
+        "You agree to the License Agreement terms when you click the \"Agree\" button.",
+        "Software License Agreement",
+        "This text cannot be saved.  This disk may be full or locked, or the file may be locked.",
+        "Unable to print.  Make sure you have selected a printer.",
+    ];
+    let mut menu = 9_u16.to_be_bytes().to_vec();
+    for label in labels {
+        menu.push(u8::try_from(label.len()).map_err(|_| resource_error(std::fmt::Error))?);
+        menu.extend(label.as_bytes());
+    }
+    let mut resources = BTreeMap::new();
+    write_resource(resources.entry("LPic").or_default(), 5000, "", &regions)?;
+    write_resource(resources.entry("STR#").or_default(), 5002, "English", &menu)?;
+    write_resource(
+        resources.entry(kind).or_default(),
+        5002,
+        "English",
+        &license_text(resource_lines(&raw).filter(|line| !line.is_empty())),
+    )?;
+    Ok(Some(resource_xml(resources)?))
+}
+
+fn resource_xml(resources: BTreeMap<&str, String>) -> Result<String, CpackError> {
     let mut xml =
         String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>");
     for (kind, entries) in resources {
         write!(xml, "<key>{kind}</key><array>{entries}</array>").map_err(resource_error)?;
     }
     xml.push_str("</dict></plist>\n");
-    Ok(Some(xml))
+    Ok(xml)
+}
+
+fn license_text<'a>(lines: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut text = Vec::new();
+    for line in lines {
+        text.extend(line);
+        text.push(b'\r');
+    }
+    text.push(b'\r');
+    text
 }
 
 fn resource_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {

@@ -23,6 +23,7 @@ mod sources;
 mod usage;
 
 pub(crate) use create::schedule_generated_name_validation;
+pub(crate) use init::initialize;
 pub(crate) use sources::{find_file_set, replace_file_set_paths, require_sycl, scope_name};
 
 #[cfg(test)]

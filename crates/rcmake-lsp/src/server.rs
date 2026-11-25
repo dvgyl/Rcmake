@@ -117,6 +117,8 @@ pub struct Server<'a> {
     markdown_hover: bool,
     workspace_roots: Vec<uri::Root>,
     watch_files: bool,
+    #[cfg(all(feature = "eval", feature = "stdio"))]
+    disk_watches: evaluated_stdio::DiskWatches,
     versioned_edits: bool,
     bundled_modules: Option<PathBuf>,
     workspace_cache: RefCell<WorkspaceCache>,
@@ -136,6 +138,8 @@ impl<'a> Server<'a> {
             markdown_hover: false,
             workspace_roots: Vec::new(),
             watch_files: false,
+            #[cfg(all(feature = "eval", feature = "stdio"))]
+            disk_watches: evaluated_stdio::DiskWatches::default(),
             versioned_edits: false,
             bundled_modules: None,
             workspace_cache: RefCell::default(),
@@ -220,6 +224,13 @@ impl<'a> Server<'a> {
                 .and_then(|caps| get(caps, "didChangeWatchedFiles"))
                 .and_then(|caps| get(caps, "dynamicRegistration"))
                 == Some(&Value::Bool(true));
+            #[cfg(all(feature = "eval", feature = "stdio"))]
+            {
+                self.disk_watches.relative = workspace
+                    .and_then(|caps| get(caps, "didChangeWatchedFiles"))
+                    .and_then(|caps| get(caps, "relativePatternSupport"))
+                    == Some(&Value::Bool(true));
+            }
             self.versioned_edits = workspace
                 .and_then(|caps| get(caps, "workspaceEdit"))
                 .and_then(|caps| get(caps, "documentChanges"))

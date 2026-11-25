@@ -8,7 +8,7 @@ use rcmake_eval::Registry;
 mod active;
 mod compat;
 mod configure;
-pub use configure::ConfigureRuntime;
+pub use configure::{ConfigureRuntime, ConfigureSelection};
 mod custom;
 mod dirs;
 #[cfg(all(feature = "native", any(unix, windows)))]

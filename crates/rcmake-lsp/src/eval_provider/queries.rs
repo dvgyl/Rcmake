@@ -393,7 +393,7 @@ impl<'a> Query<'a> {
             doc,
             offset: context.offset,
             encoding: context.encoding,
-            fresh: same_buffer && std::ptr::eq(buffers, snapshot.inputs.as_ref()),
+            fresh: same_buffer && snapshot.fresh(buffers),
             checked_sources: RefCell::default(),
         })
     }

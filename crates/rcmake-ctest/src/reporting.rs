@@ -283,6 +283,7 @@ impl<'a> Report<'a> {
                 record.output.clone_from(&result.output);
                 record.detail.clone_from(&result.detail);
                 record.exit_code = result.exit_code;
+                record.timeout_signal = result.timeout_signal;
                 record.skip_reason = result.skip_reason;
                 record.snippet.clone_from(&result.snippet);
             }
@@ -311,8 +312,11 @@ impl<'a> Report<'a> {
             |completed| format!("{completed:>progress_width$}/{}", self.total),
         );
         let number = format!("#{}", test.number);
+        let signal = result.timeout_signal.map_or_else(String::new, |signal| {
+            format!(" ({})", crate::timeout::signal_name(signal))
+        });
         self.write(format_args!(
-            "{progress} Test {number:>width$}: {} {dots}{} {:>6.2} sec\n",
+            "{progress} Test {number:>width$}: {} {dots}{}{signal} {:>6.2} sec\n",
             test.name,
             status_text(result.status),
             result.elapsed.as_secs_f64(),
@@ -599,6 +603,7 @@ pub(crate) struct TestRecord {
     pub(crate) output: Vec<u8>,
     pub(crate) detail: Option<String>,
     pub(crate) exit_code: Option<i32>,
+    pub(crate) timeout_signal: Option<rcmake_host::TimeoutSignal>,
     pub(crate) skip_reason: Option<SkipReason>,
     pub(crate) snippet: Option<Box<PathBuf>>,
 }

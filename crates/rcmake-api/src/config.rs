@@ -399,11 +399,15 @@ impl PreparedConfigure {
         read: impl Fn(&Path, &[u8]) + Send + Sync + 'static,
         output: impl Fn(Stream, &[u8]) -> bool + Send + Sync + 'static,
     ) -> Arc<dyn Host> {
-        Arc::new(ObservedHost {
-            base: self.host(),
-            read,
+        observe_reads(
+            self.host(),
+            move |path, _, range, result| {
+                if let (ReadRange::All { .. }, Ok(bytes)) = (range, result) {
+                    read(path, bytes);
+                }
+            },
             output,
-        })
+        )
     }
 
     /// Observe the host used by this session without changing its policies.
@@ -421,6 +425,14 @@ impl PreparedConfigure {
         self.denied
             .as_ref()
             .map_or_else(Vec::new, |host| host.denied_commands())
+    }
+
+    /// Check if the prepared host recorded or omitted any denied requests.
+    #[must_use]
+    pub fn has_denied_processes(&self) -> bool {
+        self.denied
+            .as_ref()
+            .is_some_and(|host| host.has_denied_commands())
     }
 
     /// Attach the host's observations and build the requested index.
@@ -465,6 +477,19 @@ impl PreparedConfigure {
     }
 }
 
+/// Report the result and exact range of each read from a host.
+///
+/// Wrap the disk host before adding overlays to observe disk inputs. The second
+/// path is the original spelling, before an overlay resolved it.
+#[must_use]
+pub fn observe_reads(
+    base: Arc<dyn Host>,
+    read: impl Fn(&Path, &Path, ReadRange, &HostResult<Vec<u8>>) + Send + Sync + 'static,
+    output: impl Fn(Stream, &[u8]) -> bool + Send + Sync + 'static,
+) -> Arc<dyn Host> {
+    Arc::new(ObservedHost { base, read, output })
+}
+
 struct ObservedHost<R, O> {
     base: Arc<dyn Host>,
     read: R,
@@ -473,7 +498,7 @@ struct ObservedHost<R, O> {
 
 impl<R, O> Host for ObservedHost<R, O>
 where
-    R: Fn(&Path, &[u8]) + Send + Sync,
+    R: Fn(&Path, &Path, ReadRange, &HostResult<Vec<u8>>) + Send + Sync,
     O: Fn(Stream, &[u8]) -> bool + Send + Sync,
 {
     fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
@@ -481,11 +506,13 @@ where
     }
 
     fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
-        let bytes = self.base.read(p, range)?;
-        if matches!(range, ReadRange::All { .. }) {
-            (self.read)(p, &bytes);
-        }
-        Ok(bytes)
+        self.read_with_origin(p, range, p)
+    }
+
+    fn read_with_origin(&self, p: &Path, range: ReadRange, origin: &Path) -> HostResult<Vec<u8>> {
+        let result = self.base.read_with_origin(p, range, origin);
+        (self.read)(p, origin, range, &result);
+        result
     }
 
     fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
@@ -601,6 +628,16 @@ where
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
         self.base.run_with_timeout_signal(req, timeout, on_output)
+    }
+
+    fn run_controlled(
+        &self,
+        req: &RunRequest,
+        graceful: Option<GracefulTimeout>,
+        hard_limit: Option<Duration>,
+        update: &mut rcmake_host::DeadlineUpdate<'_>,
+    ) -> HostResult<rcmake_host::ControlledOutput> {
+        self.base.run_controlled(req, graceful, hard_limit, update)
     }
 
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {

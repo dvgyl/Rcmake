@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use rcmake_base::BString;

@@ -29,9 +29,13 @@ const BUILD_DEFAULTS: &[(&str, &str)] = &[
     ("OSX_ARCHITECTURES", ""),
 ];
 
-pub(super) fn initialize(cx: &mut Cx<'_>, target: &mut Target) {
+pub(crate) fn initialize(cx: &mut Cx<'_>, target: &mut Target) {
     super::properties::initialize_file_set_properties(target);
-    let builds = !target.is_imported() && target.kind != TargetKind::InterfaceLibrary;
+    let builds = !target.is_imported()
+        && !matches!(
+            target.kind,
+            TargetKind::InterfaceLibrary | TargetKind::Utility
+        );
     if builds {
         for &(property, value) in BUILD_DEFAULTS {
             target.props.set(property.into(), value.into());
@@ -123,6 +127,19 @@ fn applies_to_target(
     use TargetKind::{Executable, InterfaceLibrary, SharedLibrary, StaticLibrary};
 
     let kind = target.kind;
+    if kind == TargetKind::Utility {
+        return matches!(
+            property,
+            "FOLDER"
+                | "VERIFY_INTERFACE_HEADER_SETS"
+                | "VERIFY_PRIVATE_HEADER_SETS"
+                | "EXPORT_FIND_PACKAGE_NAME"
+                | "DOTNET_SDK"
+                | "DOTNET_TARGET_FRAMEWORK"
+                | "DOTNET_TARGET_FRAMEWORK_VERSION"
+                | "VS_USE_DEBUG_LIBRARIES"
+        ) || (property == "XCODE_GENERATE_SCHEME" && xcode);
+    }
     match property {
         "FOLDER"
         | "VERIFY_INTERFACE_HEADER_SETS"

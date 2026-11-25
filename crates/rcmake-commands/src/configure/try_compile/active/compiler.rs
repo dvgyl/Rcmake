@@ -164,6 +164,7 @@ pub(super) struct SessionEvidence {
 pub(super) struct CompilerEvidence {
     host: Arc<dyn Host>,
     program: PathBuf,
+    memo: Arc<TraceMemo>,
     toolchain: Arc<ToolchainEvidence>,
     archive: BTreeMap<PathBuf, InputStamp>,
     searches: Arc<SearchMemo>,
@@ -253,6 +254,7 @@ impl CompilerEvidence {
         Some(Self {
             host,
             program,
+            memo: Arc::clone(memo),
             toolchain,
             archive,
             searches: Arc::clone(&session.searches),

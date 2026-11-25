@@ -345,6 +345,10 @@ impl Bootstrap {
         let system_file = cat(&[&self.root_bin, b"/CMakeSystem.cmake"]);
         let read_system = !cx.var_defined(b"CMAKE_SYSTEM_LOADED");
         if read_system && exists(cx, &path::to_native(&system_file)) {
+            if !self.in_try_compile && super::selection_change::toolchain_changed(cx) {
+                cx.request_exit(0);
+                return Err(CmdError::Reported);
+            }
             read_list_file(cx, &system_file)?;
         }
         if !cx.var_defined(b"CMAKE_SYSTEM") {
@@ -425,8 +429,15 @@ impl Bootstrap {
         if (!language_enabled(cx, lang) || !cx.var_defined(&lang_var(lang, b"_COMPILER_LOADED")))
             && exists(cx, &path::to_native(&compiler_file))
         {
+            let compiler = lang_var(lang, b"_COMPILER");
+            let arg_key = lang_var(lang, b"_COMPILER_ARG1");
+            let requested = cx.var(&compiler);
+            let args = cx.var(&arg_key);
             if !read_list_file(cx, &compiler_file)? {
                 return Err(missing_module(cx, &compiler_file));
+            }
+            if !self.in_try_compile {
+                super::selection_change::record_compiler(cx, &compiler, &arg_key, requested, args);
             }
             set_language_enabled(cx, lang);
         }

@@ -7,8 +7,6 @@ use super::*;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Installs {
-    start: usize,
-    target_start: usize,
     rules: Vec<Rule>,
 }
 
@@ -18,7 +16,14 @@ struct Rule {
     export: Option<Vec<u8>>,
     origin: PropertyOrigin,
     options: Options,
-    properties: Vec<(Vec<u8>, Vec<u8>)>,
+    properties: Vec<Property>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Property {
+    field: Vec<u8>,
+    target: Option<Vec<u8>>,
+    value: Vec<u8>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -84,6 +89,46 @@ fn property_prefix(index: usize) -> String {
     format!("_RCMAKE_INSTALL_{index}_")
 }
 
+const INSTALL_PREFIX: &[u8] = b"_RCMAKE_INSTALL_";
+const TARGET_FIELDS: &[&[u8]] = &[
+    b"PUBLIC_HEADER",
+    b"PRIVATE_HEADER",
+    b"RESOURCE",
+    b"FRAMEWORK",
+];
+
+fn index(value: &[u8]) -> Option<usize> {
+    let digits = std::str::from_utf8(value).ok()?;
+    let index = digits.parse::<usize>().ok()?;
+    (index.to_string() == digits).then_some(index)
+}
+
+fn simple_field(field: &[u8]) -> bool {
+    matches!(
+        field,
+        b"ARGC" | b"DIRECTORY" | b"ABSOLUTE_ACTION" | b"AUTHOR_ACTION" | b"MESSAGE" | b"COMPONENTS"
+    ) || field.strip_prefix(b"ARG").and_then(index).is_some()
+}
+
+fn target_field(field: &[u8]) -> Option<(&[u8], usize)> {
+    TARGET_FIELDS.iter().find_map(|&key| {
+        let id = field.strip_prefix(key)?.strip_prefix(b"_")?;
+        Some((key, index(id)?))
+    })
+}
+
+pub(in crate::journal) fn earlier_install_property(name: &[u8], count: usize) -> bool {
+    let Some(suffix) = name.strip_prefix(INSTALL_PREFIX) else {
+        return false;
+    };
+    let mut parts = suffix.splitn(2, |byte| *byte == b'_');
+    let (Some(rule), Some(field)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    index(rule).is_some_and(|rule| rule < count)
+        && (simple_field(field) || target_field(field).is_some())
+}
+
 impl Installs {
     pub(super) fn capture(
         model: &ProjectModel,
@@ -100,22 +145,50 @@ impl Installs {
             if rule.dir != dir || targets.iter().any(|id| id.index() < target_start) {
                 return None;
             }
-            let targets = targets
+            if let Some(export) = export
+                && !model.exports.get(export).is_some_and(|set| {
+                    set.install_rules.contains(&index)
+                        && targets.iter().all(|target| set.targets.contains(target))
+                })
+            {
+                return None;
+            }
+            let names = targets
                 .iter()
-                .map(|id| Some(model.target(*id)?.name.to_vec()))
-                .collect::<Option<Vec<_>>>()?;
+                .map(|id| Some((id.index(), model.target(*id)?.name.to_vec())))
+                .collect::<Option<BTreeMap<_, _>>>()?;
             let prefix = property_prefix(index);
             let properties = model
                 .global
                 .props
                 .names()
                 .into_iter()
-                .filter_map(|name| {
-                    name.starts_with(prefix.as_bytes())
-                        .then(|| Some((name.to_vec(), model.global.props.get(&name)?.to_vec())))
-                        .flatten()
+                .filter(|name| name.starts_with(prefix.as_bytes()))
+                .map(|name| {
+                    let field = name.strip_prefix(prefix.as_bytes())?;
+                    let (field, target) = if simple_field(field) {
+                        (field, None)
+                    } else {
+                        let (field, id) = target_field(field)?;
+                        (field, Some(names.get(&id)?.clone()))
+                    };
+                    let value = model.global.props.get(&name)?;
+                    if field == b"DIRECTORY"
+                        && value.as_slice() != dir.index().to_string().as_bytes()
+                    {
+                        return None;
+                    }
+                    Some(Property {
+                        field: field.to_vec(),
+                        target,
+                        value: value.to_vec(),
+                    })
                 })
-                .collect();
+                .collect::<Option<Vec<_>>>()?;
+            let targets = targets
+                .iter()
+                .map(|id| names.get(&id.index()).cloned())
+                .collect::<Option<Vec<_>>>()?;
             rules.push(Rule {
                 targets,
                 export: export.as_ref().map(|value| value.to_vec()),
@@ -124,11 +197,7 @@ impl Installs {
                 properties,
             });
         }
-        Some(Self {
-            start,
-            target_start,
-            rules,
-        })
+        Some(Self { rules })
     }
 
     pub(super) fn resolve(
@@ -138,32 +207,64 @@ impl Installs {
         bin: &Path,
         dir: DirId,
     ) -> Option<Vec<RestoredRule>> {
-        if self.start != model.installs.len() || self.target_start != model.targets().count() {
-            return None;
-        }
+        let properties = model.global.props.names();
+        let target_id = |name: &[u8]| {
+            let offset = targets
+                .iter()
+                .position(|target| target.name.as_slice() == name)?;
+            model.replay_target_id(offset)
+        };
         self.rules
             .iter()
             .enumerate()
             .map(|(offset, rule)| {
-                let prefix = property_prefix(self.start.checked_add(offset)?);
+                let prefix = property_prefix(model.installs.len().checked_add(offset)?);
                 if !valid_origin(&rule.origin, bin)
-                    || rule.properties.iter().any(|(name, _)| {
-                        !name.starts_with(prefix.as_bytes())
-                            || model.global.props.get(name).is_some()
-                    })
+                    || properties
+                        .iter()
+                        .any(|name| name.starts_with(prefix.as_bytes()))
                 {
                     return None;
                 }
                 let targets = rule
                     .targets
                     .iter()
-                    .map(|name| {
-                        let relative = targets
-                            .iter()
-                            .position(|target| target.name.as_slice() == name)?;
-                        model.replay_target_id(relative)
-                    })
+                    .map(|name| target_id(name))
                     .collect::<Option<Vec<_>>>()?;
+                let mut properties = BTreeMap::new();
+                for property in &rule.properties {
+                    let field = property.field.as_slice();
+                    let (key, value) = match &property.target {
+                        None if simple_field(field) => (
+                            [prefix.as_bytes(), field].concat(),
+                            if field == b"DIRECTORY" {
+                                dir.index().to_string().into_bytes()
+                            } else {
+                                property.value.clone()
+                            },
+                        ),
+                        Some(name) if TARGET_FIELDS.contains(&field) => {
+                            let id = target_id(name)?;
+                            if !targets.contains(&id) {
+                                return None;
+                            }
+                            (
+                                [
+                                    prefix.as_bytes(),
+                                    field,
+                                    b"_",
+                                    id.index().to_string().as_bytes(),
+                                ]
+                                .concat(),
+                                property.value.clone(),
+                            )
+                        }
+                        _ => return None,
+                    };
+                    if properties.insert(key, value).is_some() {
+                        return None;
+                    }
+                }
                 Some(RestoredRule {
                     rule: InstallRule {
                         dir,
@@ -174,7 +275,7 @@ impl Installs {
                         },
                         options: (&rule.options).into(),
                     },
-                    properties: rule.properties.clone(),
+                    properties,
                 })
             })
             .collect()
@@ -183,7 +284,7 @@ impl Installs {
 
 pub(super) struct RestoredRule {
     rule: InstallRule,
-    properties: Vec<(Vec<u8>, Vec<u8>)>,
+    properties: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 impl RestoredRule {

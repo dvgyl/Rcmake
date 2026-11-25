@@ -207,6 +207,16 @@ impl<H: Host + ?Sized> NoProcessHost<H> {
             .collect()
     }
 
+    /// Check if the log has retained or omitted requests.
+    #[must_use]
+    pub fn has_denied_commands(&self) -> bool {
+        let state = self
+            .denied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.log.commands.is_empty() || state.log.omitted_entries != 0
+    }
+
     /// Transfer the records and eviction counts to the caller and clear the log.
     #[must_use]
     pub fn take_denied(&self) -> DeniedLog {

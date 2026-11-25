@@ -1,6 +1,6 @@
 //! Stage installed files through the host and the CMake interpreter.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -439,12 +439,37 @@ pub(crate) fn grouping(cfg: &CpackConfig) -> ComponentGrouping {
 }
 
 pub(crate) fn package_components(cfg: &CpackConfig, selection: &[u8]) -> Vec<BString> {
-    if !cfg.on(b"CPACK_ARCHIVE_COMPONENT_INSTALL")
-        && cfg.get(b"CPACK_GENERATOR") != Some(b"External")
-    {
-        return Vec::new();
+    let enabled = match cfg.get(b"CPACK_GENERATOR") {
+        Some(b"External") => true,
+        Some(b"DragNDrop") => cfg
+            .get(b"CPACK_DMG_COMPONENT_INSTALL")
+            .is_none_or(truth::is_on),
+        _ => cfg.on(b"CPACK_ARCHIVE_COMPONENT_INSTALL"),
+    };
+    if enabled {
+        project_components(cfg, selection)
+    } else {
+        Vec::new()
     }
-    project_components(cfg, selection)
+}
+
+pub(crate) fn component_roots(
+    cfg: &CpackConfig,
+) -> Result<BTreeMap<BString, BTreeSet<PathBuf>>, CpackError> {
+    let mut roots = BTreeMap::<_, BTreeSet<_>>::new();
+    let projects = cfg.list(b"CPACK_INSTALL_CMAKE_PROJECTS");
+    for [_, _, selection, subdir] in projects.as_chunks::<4>().0 {
+        let components = package_components(cfg, selection);
+        if components.is_empty() {
+            continue;
+        }
+        let subdir = relative_install_path(subdir)?;
+        for component in components {
+            let root = subdir.join(component_dir(&component));
+            roots.entry(component).or_default().insert(root);
+        }
+    }
+    Ok(roots)
 }
 
 pub(crate) fn project_components(cfg: &CpackConfig, selection: &[u8]) -> Vec<BString> {

@@ -45,7 +45,8 @@ def cross(work, cmake, generator):
     staging = work / "stage"
     override = work / "override"
     runtime = []
-    if sys.platform == "darwin" and shutil.which("otool"):
+    if sys.platform == "darwin":
+        assert shutil.which("otool") and shutil.which("cc"), "This fixture requires otool and cc."
         lib = staging / "lib" / "libstage_dependency.dylib"
         lib.parent.mkdir(parents=True)
         source = work / "staged.c"
@@ -129,12 +130,25 @@ def main():
     parser.add_argument("cmake", type=Path)
     parser.add_argument("--qt", type=Path)
     parser.add_argument("--define", action="append", default=[])
-    parser.add_argument("--fortran")
+    parser.add_argument("--fortran", type=Path)
     parser.add_argument("--case", choices=("cross", "fortran", "autogen"), required=True)
     parser.add_argument("--generator", choices=("Ninja", "Unix Makefiles"), required=True)
     args = parser.parse_args()
     cmake = args.cmake.absolute()
+    if cmake.name != f"cmake{EXE}" or not cmake.is_file():
+        parser.error("Use the staged cmake compatibility executable.")
     ctest = cmake.with_name(f"ctest{EXE}")
+    if args.case in ("fortran", "autogen") and not ctest.is_file():
+        parser.error("The staged cmake executable must have a ctest sibling.")
+    if os.name == "nt":
+        if args.generator != "Ninja":
+            parser.error("Use Ninja for the Windows language fixtures.")
+        if args.case == "fortran" and not args.fortran:
+            parser.error("Use --fortran with a native Fortran compiler on Windows.")
+    if args.fortran:
+        args.fortran = args.fortran.resolve(strict=True)
+    if args.qt:
+        args.qt = args.qt.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="rcmake-m6-langs-") as temporary:
         work = Path(temporary).resolve()
         if args.case == "cross":

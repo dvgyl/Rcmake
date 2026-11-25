@@ -1001,3 +1001,19 @@ fn memo_hashes_again_when_the_host_cannot_verify_change_time() -> HostResult<()>
     assert_ne!(first, memo.file_digest(&host, &path)?);
     Ok(())
 }
+
+#[test]
+fn sdk_memo_rechecks_the_graph_after_a_host_write() -> HostResult<()> {
+    let base: std::sync::Arc<dyn Host> = std::sync::Arc::new(host());
+    let host = std::sync::Arc::new(rcmake_host::MemoHost::from_shared(base.clone()));
+    let sdk = host.initial_cwd().join("sdk");
+    host.create_dir_all(&sdk)?;
+    let memo = TraceMemo::with_generation(host.clone());
+    let old = memo.sdk_digest(base.as_ref(), &sdk)?;
+    assert_eq!(old, memo.sdk_digest(base.as_ref(), &sdk)?);
+    host.write(&sdk.join("new.h"), b"header", WriteMode::CreateNew)?;
+    let fresh = memo.sdk_digest(base.as_ref(), &sdk)?;
+    assert_ne!(old, fresh);
+    assert_eq!(fresh, sdk_tree_listing_digest(base.as_ref(), &sdk)?);
+    Ok(())
+}

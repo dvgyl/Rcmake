@@ -204,8 +204,10 @@ fn dispatch(
             }
             Ok(0)
         }
-        Mode::Instrument { .. } => rcmake_instrument::launcher::run_launcher(host.as_ref(), args)
-            .map_err(|error| error.to_string()),
+        Mode::Instrument { .. } => {
+            rcmake_instrument::launcher::run_ctest_launcher(host.as_ref(), args)
+                .map_err(|error| error.to_string())
+        }
         Mode::ListPresets { .. } => list_presets(host.as_ref(), invocation),
         Mode::Version { json, file } => {
             let version = if *json {

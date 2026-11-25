@@ -312,7 +312,15 @@ impl ToolchainEvidence {
         if !path.is_absolute() {
             return None;
         }
-        let stamp = match self.memo.file_digest(host, path) {
+        let binary = path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("dll")
+        });
+        let digest = if binary {
+            self.memo.tool_digest(host, path)
+        } else {
+            self.memo.file_digest(host, path)
+        };
+        let stamp = match digest {
             Ok(digest) => InputStamp::FileHash {
                 path: path.to_owned(),
                 digest,

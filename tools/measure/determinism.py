@@ -270,6 +270,10 @@ def check_trace(path: Path) -> None:
 def check_profile(build: Path) -> None:
     """Check the trace, folded stack rows, and HTML flamegraph data."""
     directory = build / "rcmake-profile"
+    current = (directory / "current").read_text(encoding="utf-8")
+    if not re.fullmatch(r"run-[0-9-]+\n", current):
+        raise ValueError(f"Invalid profile pointer in {directory}.")
+    directory /= current.rstrip("\n")
     check_trace(directory / "trace.json")
     folded = (directory / "stacks.folded").read_text(encoding="utf-8").splitlines()
     if not folded or any(not re.fullmatch(r".+ [1-9][0-9]*", row) for row in folded):
@@ -567,7 +571,7 @@ endforeach()
 """, encoding="utf-8")
     build = root / "build"
     command = [native, "-S", source, "-B", build, "-G", "Ninja"]
-    measure = {**env, "RCMAKE_MEASURE_REPLAY": "1"}
+    measure = {**env, "RCMAKE_MEASURE_REPLAY": "1", "RCMAKE_CACHE_DIR": str(root / "store")}
     run(command, root, measure, args.timeout)
     journal = build / "CMakeFiles/rcmake/configure.v1.bin"
     journal.unlink()

@@ -38,7 +38,7 @@ impl EvalSemanticProvider {
     pub fn diagnostics_reply(&self, document_uri: &str) -> Option<SnapshotReply<Vec<Value>>> {
         let path = uri::path(document_uri)?;
         self.snapshots.query(|snapshot, buffers| {
-            if !std::ptr::eq(snapshot.inputs.as_ref(), buffers) {
+            if !snapshot.fresh(buffers) {
                 return Vec::new();
             }
             self.query_diagnostics(document_uri, &path, snapshot, buffers)
@@ -409,7 +409,7 @@ impl EvalSemanticProvider {
         self.snapshots
             .query(|snapshot, buffers| {
                 let open = buffers.by_uri.get(document.uri)?;
-                if !std::ptr::eq(snapshot.inputs.as_ref(), buffers)
+                if !snapshot.fresh(buffers)
                     || open.document.version != document.version
                     || open.document.text != document.text
                     || open.path != buffer_path(self.host(), &path)

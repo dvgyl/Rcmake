@@ -5,7 +5,7 @@ pub use tree::{sdk_tree_listing_digest, tree_listing_digest};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rcmake_base::Limits;
@@ -190,9 +190,98 @@ pub fn file_digest(host: &dyn Host, path: &Path) -> HostResult<Digest> {
 #[derive(Default)]
 pub struct TraceMemo {
     files: Mutex<BTreeMap<(FastStat, rcmake_host::FileTime), Digest>>,
+    generation_host: Option<Arc<rcmake_host::MemoHost<dyn Host>>>,
+    tools: Mutex<BTreeMap<PathBuf, (u64, FastStat, Digest)>>,
+    sdk: Mutex<BTreeMap<PathBuf, (u64, Digest)>>,
 }
 
 impl TraceMemo {
+    /// Use a configure host to invalidate SDK and tool digests after mutations.
+    #[must_use]
+    pub fn with_generation(host: Arc<rcmake_host::MemoHost<dyn Host>>) -> Self {
+        Self {
+            generation_host: Some(host),
+            ..Self::default()
+        }
+    }
+
+    fn generation(&self) -> Option<u64> {
+        self.generation_host.as_ref()?.stable_generation()
+    }
+
+    /// Hash a compiler executable or compiler library.
+    ///
+    /// Hosts without change times reuse a digest only while the file identity
+    /// and configure generation agree. A rewrite outside the configure host
+    /// that preserves both identity and timestamps can require a new session.
+    pub fn tool_digest(&self, host: &dyn Host, path: &Path) -> HostResult<Digest> {
+        let metadata = host.metadata(path, Follow::Yes)?;
+        if metadata.ctime.is_some() {
+            return self.file_digest(host, path);
+        }
+        self.tool_digest_with_metadata(host, path, &metadata)
+    }
+
+    fn tool_digest_with_metadata(
+        &self,
+        host: &dyn Host,
+        path: &Path,
+        metadata: &Metadata,
+    ) -> HostResult<Digest> {
+        let Some(generation) = self
+            .generation()
+            .filter(|_| metadata.ino != 0 && metadata.kind == FileKind::File)
+        else {
+            return hash_file(host, path, metadata);
+        };
+        let stat = FastStat::from(metadata);
+        if let Ok(tools) = self.tools.lock()
+            && let Some(&(cached_generation, cached_stat, digest)) = tools.get(path)
+            && cached_generation == generation
+            && cached_stat == stat
+        {
+            return Ok(digest);
+        }
+        let digest = hash_file(host, path, metadata)?;
+        if self.generation() == Some(generation)
+            && let Ok(mut tools) = self.tools.lock()
+            && (tools.len() < 1024 || tools.contains_key(path))
+        {
+            tools.insert(path.to_owned(), (generation, stat, digest));
+        }
+        Ok(digest)
+    }
+
+    /// Hash a bounded SDK search graph and retain it for the current host generation.
+    pub fn sdk_digest(&self, host: &dyn Host, root: &Path) -> HostResult<Digest> {
+        let Some(generation) = self.generation() else {
+            return sdk_tree_listing_digest(host, root);
+        };
+        let canonical = host.canonicalize(root)?;
+        let cached = self.sdk.lock().ok().and_then(|sdk| {
+            sdk.get(&canonical)
+                .filter(|(revision, _)| *revision == generation)
+                .map(|(_, digest)| *digest)
+        });
+        let graph = match cached {
+            Some(graph) => graph,
+            None => tree::sdk_graph_digest(host, &canonical)?,
+        };
+        let digest = tree::sdk_root_digest(host, root, graph)?;
+        if self.generation() != Some(generation) {
+            return Err(HostError::unsupported(
+                "The host changed during the SDK listing.",
+            ));
+        }
+        if cached.is_none()
+            && let Ok(mut sdk) = self.sdk.lock()
+            && (sdk.len() < 128 || sdk.contains_key(&canonical))
+        {
+            sdk.insert(canonical, (generation, graph));
+        }
+        Ok(digest)
+    }
+
     /// Read the current metadata, then return or calculate the file digest.
     pub fn file_digest(&self, host: &dyn Host, path: &Path) -> HostResult<Digest> {
         let metadata = host.metadata(path, Follow::Yes)?;
@@ -200,6 +289,13 @@ impl TraceMemo {
             return hash_file(host, path, &metadata);
         }
         let Some(ctime) = metadata.ctime else {
+            if self
+                .tools
+                .lock()
+                .is_ok_and(|tools| tools.contains_key(path))
+            {
+                return self.tool_digest_with_metadata(host, path, &metadata);
+            }
             return hash_file(host, path, &metadata);
         };
         // Keep files with recent or second-resolution change times out of the memo.
@@ -338,7 +434,10 @@ fn matches_input(host: &dyn Host, input: &InputStamp, memo: Option<&TraceMemo>) 
         } => {
             let current = match policy {
                 TreePolicy::Ordinary => tree_listing_digest(host, path),
-                TreePolicy::Sdk => sdk_tree_listing_digest(host, path),
+                TreePolicy::Sdk => memo.map_or_else(
+                    || sdk_tree_listing_digest(host, path),
+                    |memo| memo.sdk_digest(host, path),
+                ),
             };
             current.as_ref() == Ok(digest)
         }

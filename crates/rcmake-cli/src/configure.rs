@@ -24,6 +24,7 @@ mod diagnostics;
 mod graphviz;
 mod preloads;
 mod profiling;
+mod restart;
 mod speed;
 #[cfg(test)]
 mod tests;
@@ -124,59 +125,76 @@ fn configure_project(
     cmake_root: PathBuf,
 ) -> Result<(), Exit> {
     let start = host.monotonic();
-    let (mut session, saved) = ConfigureSession::resolve(argv, opts, host)?;
-    let (mut runtime, mut interp, has_cache) =
-        session.initialize(saved, cmake_command, cmake_root)?;
-    let configure_start = session.host.monotonic();
-    let time = session.host.now();
-    let mut preloads = session.apply_cache_edits(&runtime, &mut interp);
-    let mut results = std::mem::take(&mut preloads.results);
-    let outcome = (|| {
-        if runtime.denied() {
-            return Err(Exit::Code(1));
+    let (mut session, mut saved) = ConfigureSession::resolve(argv, opts, host)?;
+    for attempt in 0..=1 {
+        let selection = restart::selection(&saved);
+        let (mut runtime, mut interp, has_cache) =
+            session.initialize(saved, cmake_command.clone(), cmake_root.clone())?;
+        interp.add_session_data(Arc::clone(&selection));
+        let configure_start = session.host.monotonic();
+        let time = session.host.now();
+        let mut preloads = session.apply_cache_edits(&runtime, &mut interp);
+        let mut results = std::mem::take(&mut preloads.results);
+        let outcome = (|| {
+            if runtime.denied() {
+                return Err(Exit::Code(1));
+            }
+            if session.opts.view {
+                session.list_cache(&mut interp);
+                return Ok(());
+            }
+            if preloads.fatal {
+                return Err(Exit::Code(preloads.exit_code));
+            }
+            session.check_source()?;
+            if preloads.missing {
+                return Err(Exit::Code(1));
+            }
+            let configured = session.configure(
+                &mut runtime,
+                &mut interp,
+                has_cache,
+                configure_start,
+                preloads,
+                &selection,
+            )?;
+            session.generate(&mut interp, configured, &mut results)
+        })();
+        let changes = selection.take_changes();
+        if !changes.is_empty() && !runtime.denied() {
+            let _ = runtime.finish(false);
+            if attempt != 0 {
+                return Err(Exit::Message(
+                    "The platform selection changed again during configure.".into(),
+                ));
+            }
+            saved = restart::reset(&session, &mut interp, changes)?;
+            continue;
         }
-        if session.opts.view {
-            session.list_cache(&mut interp);
-            return Ok(());
-        }
-        if preloads.fatal {
-            return Err(Exit::Code(preloads.exit_code));
-        }
-        session.check_source()?;
-        if preloads.missing {
-            return Err(Exit::Code(1));
-        }
-        let configured = session.configure(
-            &mut runtime,
-            &mut interp,
-            has_cache,
-            configure_start,
-            preloads,
-        )?;
-        session.generate(&mut interp, configured, &mut results)
-    })();
-    let finish = runtime.finish(outcome.is_ok() && !session.opts.view);
-    let outcome = match (outcome, finish) {
-        (Ok(()), Some(error)) => {
-            interp.cx().issue(
-                MessageKind::Error,
-                Effect::Fatal,
-                None,
-                error.to_string().into(),
-            );
-            Err(Exit::Code(1))
-        }
-        (outcome, _) => outcome,
-    };
-    let code = match &outcome {
-        Ok(()) => 0,
-        Err(Exit::Code(code)) => *code,
-        Err(Exit::Message(_)) => 1,
-    };
-    let profile = session.profiling.write(session.host.as_ref(), start);
-    session.write_sarif(&mut interp, results, time, code)?;
-    profile?;
-    outcome
+        let finish = runtime.finish(outcome.is_ok() && !session.opts.view);
+        let outcome = match (outcome, finish) {
+            (Ok(()), Some(error)) => {
+                interp.cx().issue(
+                    MessageKind::Error,
+                    Effect::Fatal,
+                    None,
+                    error.to_string().into(),
+                );
+                Err(Exit::Code(1))
+            }
+            (outcome, _) => outcome,
+        };
+        let code = match &outcome {
+            Ok(()) => 0,
+            Err(Exit::Code(code)) => *code,
+            Err(Exit::Message(_)) => 1,
+        };
+        let profile = session.profiling.write(session.host.as_ref(), start);
+        session.write_sarif(&mut interp, results, time, code)?;
+        profile?;
+        return outcome;
+    }
+    Err(Exit::Code(1))
 }
 
 impl<'a> ConfigureSession<'a> {
@@ -449,6 +467,7 @@ impl<'a> ConfigureSession<'a> {
         has_cache: bool,
         start: Duration,
         preloads: Preloads,
+        selection: &rcmake_commands::ConfigureSelection,
     ) -> Result<Configured, Exit> {
         let host = self.host.as_ref();
         // The system module loads the toolchain when project() starts platform setup.
@@ -495,6 +514,9 @@ impl<'a> ConfigureSession<'a> {
                 || runtime.run(interp, &[]),
             )
         });
+        if selection.changed() {
+            return Err(Exit::Code(1));
+        }
         if result.exit_code == 0
             && rcmake_resolve::validate_codegen_name(interp.cx().project(), host).is_err()
         {

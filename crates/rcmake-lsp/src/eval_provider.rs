@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod adapters;
+mod disk;
 mod presentation;
 mod queries;
 
@@ -27,6 +28,7 @@ use rcmake_host::{
 };
 
 use crate::{SemanticUpdate, analysis::Document, uri};
+use disk::DiskReads;
 
 const MAX_WALL_BUDGET: Duration = Duration::from_secs(5);
 const DEFAULT_STEP_BUDGET: u64 = 250_000;
@@ -188,6 +190,7 @@ struct Snapshot {
     paths: BTreeMap<PathBuf, BTreeSet<BString>>,
     inputs: Arc<Buffers>,
     reads: InputReads,
+    disk: DiskReads,
 }
 
 impl Snapshot {
@@ -195,6 +198,7 @@ impl Snapshot {
         result: ConfigureResult,
         inputs: Arc<Buffers>,
         reads: InputReads,
+        disk: DiskReads,
         host: &dyn Host,
     ) -> Self {
         let mut paths = BTreeMap::<_, BTreeSet<_>>::new();
@@ -217,7 +221,12 @@ impl Snapshot {
             paths,
             inputs,
             reads,
+            disk,
         }
+    }
+
+    fn fresh(&self, buffers: &Buffers) -> bool {
+        self.disk.complete() && std::ptr::eq(self.inputs.as_ref(), buffers)
     }
 
     fn matches(&self, path: &Path, bytes: &[u8]) -> bool {
@@ -323,6 +332,7 @@ impl SnapshotProvider {
     /// Return a preparation, evaluation, or cancellation error. Evaluation
     /// errors with configure diagnostics also publish a partial snapshot.
     pub fn refresh(&self) -> Result<RefreshStatus, ApiError> {
+        self.check_disk_inputs();
         self.refresh_pending(true)
     }
 
@@ -347,9 +357,25 @@ impl SnapshotProvider {
             let token = CancelToken::default();
             state.running = Some(token.clone());
             let buffers = Arc::clone(&state.buffers);
+            let previous = state.snapshot.clone();
             drop(state);
 
-            let result = self.evaluate(buffers, &token);
+            let result = self.evaluate(buffers, &token).map(|mut evaluation| {
+                if let Some(previous) = previous
+                    && (evaluation.error.is_some()
+                        || !matches!(
+                            evaluation.snapshot.result.completion,
+                            CompletionState::Complete
+                        ))
+                {
+                    evaluation
+                        .snapshot
+                        .disk
+                        .retain_missing(self.request.host.as_ref(), &previous.disk);
+                }
+                let changed = evaluation.snapshot.disk.changed(self.request.host.as_ref());
+                (evaluation, changed)
+            });
             state = self.lock();
             state.running = None;
             if token.is_cancelled() {
@@ -358,7 +384,11 @@ impl SnapshotProvider {
                 }
                 return Err(ApiError::Cancelled);
             }
-            let evaluation = result?;
+            let (evaluation, changed) = result?;
+            if changed {
+                Self::invalidate_state(&mut state);
+                return Err(ApiError::Cancelled);
+            }
             state.revision = Arc::new(());
             state.snapshot = Some(Arc::new(evaluation.snapshot));
             return match evaluation.error {
@@ -384,7 +414,39 @@ impl SnapshotProvider {
 
     /// Mark a snapshot stale after an input file changes on disk.
     pub fn invalidate(&self) {
+        Self::invalidate_state(&mut self.lock());
+    }
+
+    /// Check the retained disk reads and invalidate a stale snapshot.
+    pub fn check_disk_inputs(&self) -> bool {
+        let (snapshot, revision) = {
+            let state = self.lock();
+            if state.dirty {
+                return false;
+            }
+            (state.snapshot.clone(), Arc::clone(&state.revision))
+        };
+        if !snapshot.is_some_and(|snapshot| snapshot.disk.changed(self.request.host.as_ref())) {
+            return false;
+        }
         let mut state = self.lock();
+        if !Arc::ptr_eq(&state.revision, &revision) {
+            return false;
+        }
+        Self::invalidate_state(&mut state);
+        true
+    }
+
+    /// Get the disk paths tracked by the last accepted evaluation.
+    #[must_use]
+    pub fn disk_paths(&self) -> Vec<PathBuf> {
+        let snapshot = self.lock().snapshot.clone();
+        snapshot.map_or_else(Vec::new, |snapshot| {
+            snapshot.disk.paths().map(Path::to_owned).collect()
+        })
+    }
+
+    fn invalidate_state(state: &mut State) {
         if let Some(token) = &state.running {
             token.cancel();
         }
@@ -455,7 +517,20 @@ impl SnapshotProvider {
     }
 
     fn evaluate(&self, buffers: Arc<Buffers>, token: &CancelToken) -> Result<Evaluation, ApiError> {
-        let overlay = BufferOverlayHost::new(Arc::clone(&self.request.host));
+        let disk = Arc::new(Mutex::new(DiskReads::default()));
+        let observed = Arc::clone(&disk);
+        let base = Arc::clone(&self.request.host);
+        let disk_host = rcmake_api::observe_reads(
+            Arc::clone(&base),
+            move |path, origin, range, result| {
+                observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record(base.as_ref(), path, origin, range, result);
+            },
+            |_, _| false,
+        );
+        let overlay = BufferOverlayHost::new(disk_host);
         for (path, buffer) in &buffers.selected {
             if token.is_cancelled() {
                 return Err(ApiError::Cancelled);
@@ -540,7 +615,12 @@ impl SnapshotProvider {
             }
             Err(ApiError::DeniedProcess { commands }) => (
                 ConfigureResult {
-                    completion: partial(commands),
+                    // The prepared host supplies its denial log when the session ends.
+                    completion: partial(if session.has_denied_processes() {
+                        Vec::new()
+                    } else {
+                        commands
+                    }),
                     ..ConfigureResult::default()
                 },
                 None,
@@ -580,8 +660,13 @@ impl SnapshotProvider {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        let disk = std::mem::take(
+            &mut *disk
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         Ok(Evaluation {
-            snapshot: Snapshot::new(result, buffers, reads, overlay.overlay.as_ref()),
+            snapshot: Snapshot::new(result, buffers, reads, disk, overlay.overlay.as_ref()),
             error,
         })
     }

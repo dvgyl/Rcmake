@@ -343,7 +343,7 @@ try_compile(THIRD SOURCE_FROM_CONTENT third.c [[int main(void) { return 3; }]] N
 
 #[test]
 fn optional_sdk_header_insertion_invalidates_a_warm_probe() -> TestResult {
-    let fixture = Fixture::new(
+    check_sdk_insertion(
         r#"
 try_compile(OK SOURCE_FROM_CONTENT main.c [[
 #if __has_include(<nested/optional.h>)
@@ -352,7 +352,23 @@ try_compile(OK SOURCE_FROM_CONTENT main.c [[
 int main(void) { return 0; }
 ]] NO_CACHE)
 "#,
-    )?;
+    )
+}
+
+#[test]
+fn pragma_operators_use_header_search_verification() -> TestResult {
+    check_sdk_insertion(
+        r#"
+try_compile(OK SOURCE_FROM_CONTENT main.c [[
+_Pragma("pack(1)")
+int main(void) { return 0; }
+]] NO_CACHE)
+"#,
+    )
+}
+
+fn check_sdk_insertion(project: &str) -> TestResult {
+    let fixture = Fixture::new(project)?;
     let include = Path::new(SDK).join("usr/include/nested");
     fixture.inner.create_dir_all(&include)?;
     for (index, expected_runs) in [2, 2, 4, 4].into_iter().enumerate() {

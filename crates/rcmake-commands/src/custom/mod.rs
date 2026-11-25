@@ -766,6 +766,7 @@ fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         body.backtrace.clone(),
         body.policies,
     );
+    crate::targets::initialize(cx, &mut target);
     if !all {
         target.props.set("EXCLUDE_FROM_ALL".into(), "TRUE".into());
     }

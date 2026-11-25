@@ -85,16 +85,6 @@ def run_gate(report: dict, args, env: dict[str, str], name: str, command: list[s
         return False
 
 
-def find_module() -> Path | None:
-    """Find the pinned prebuilt example in a standard Cargo target directory."""
-    target_dir = ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
-    for profile in ("release", "debug"):
-        module = target_dir / WASI / profile / "examples" / "wasm_smoke.wasm"
-        if module.is_file():
-            return module
-    return None
-
-
 def selection(target: str) -> list[str]:
     return ["-p", "rcmake-api", "--no-default-features", "--target", target, "--locked"]
 
@@ -102,8 +92,6 @@ def selection(target: str) -> list[str]:
 def check_wasi(args, report: dict, env: dict[str, str], prerequisite: str | None) -> None:
     """Build and run the pinned example, or use a prebuilt copy."""
     module = args.wasi_bin.expanduser().absolute() if args.wasi_bin else None
-    if module is None and prerequisite and not args.dry_run:
-        module = find_module()
     if module is None:
         def built_example(output: str) -> str:
             nonlocal module
@@ -227,7 +215,7 @@ def main() -> int:
     print(json.dumps(report, indent=2))
     print(formatted, end="", file=sys.stderr)
     return int(report["status"] == "fail"
-               or (report["status"] == "incomplete" and not args.allow_incomplete))
+               or (report["status"] == "incomplete" and (args.require_wasi or not args.allow_incomplete)))
 
 
 if __name__ == "__main__":

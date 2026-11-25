@@ -342,7 +342,9 @@ pub(in crate::native) fn run_pipeline(
     mut graceful: Option<GracefulTimeout>,
     output_limit: usize,
     on_output: &mut dyn FnMut(Stream, &[u8]),
-) -> HostResult<RunOutput> {
+    hard_limit: Option<Duration>,
+    mut update: Option<&mut crate::DeadlineUpdate<'_>>,
+) -> HostResult<crate::ControlledOutput> {
     let start = Instant::now();
     let (input, mut feed) = process_input(&req.stdin)?;
     let mut captures = Vec::new();
@@ -357,29 +359,51 @@ pub(in crate::native) fn run_pipeline(
     };
     let mut pipeline = Pipeline {
         stages: Vec::new(),
-        grouped: req.timeout.is_some(),
+        grouped: req.timeout.is_some() || hard_limit.is_some() || update.is_some(),
     };
     spawn_pipeline(req, input, stdout, stderr, &mut pipeline, start)?;
     let mut output = RunOutput::default();
     let mut time_limit = req.timeout;
-    let mut timed_out = false;
+    let mut timeout_signal = None;
+    let mut graceful_exit = false;
     loop {
         let done = io_at_process(pipeline.collect_status())?;
         let read = io_at_process(pump_output(
             &mut captures,
             &mut output,
-            req.tee,
+            req.tee || update.is_some(),
             output_limit,
-            on_output,
+            &mut |stream, bytes| {
+                if req.tee {
+                    on_output(stream, bytes);
+                }
+                if timeout_signal.is_none()
+                    && let Some(delay) = update.as_mut().and_then(|update| update(stream, bytes))
+                {
+                    time_limit = Some(start.elapsed().saturating_add(delay));
+                }
+            },
         ))?;
         if done && captures.is_empty() {
-            pipeline.reap();
+            graceful_exit = timeout_signal.is_some();
+            if graceful_exit {
+                pipeline.stop();
+            } else {
+                pipeline.reap();
+            }
             break;
         }
-        if time_limit.is_some_and(|timeout| start.elapsed() >= timeout) {
-            if let Some(timeout) = graceful.take().filter(|_| !done) {
+        let limit = match (time_limit, hard_limit) {
+            (Some(base), Some(hard)) => Some(base.min(hard)),
+            (base, hard) => base.or(hard),
+        };
+        if limit.is_some_and(|timeout| start.elapsed() >= timeout) {
+            if let Some(timeout) = graceful
+                .take()
+                .filter(|_| !done && !hard_limit.is_some_and(|hard| start.elapsed() >= hard))
+            {
                 pipeline.signal(timeout.signal);
-                timed_out = true;
+                timeout_signal = Some(timeout.signal);
                 time_limit = Some(start.elapsed().saturating_add(timeout.grace));
                 continue;
             }
@@ -397,20 +421,22 @@ pub(in crate::native) fn run_pipeline(
         let wrote = io_at_process(pump_input(&mut feed))?;
         if !read && !wrote {
             let pause = Duration::from_millis(2);
-            let remaining =
-                time_limit.map_or(pause, |timeout| timeout.saturating_sub(start.elapsed()));
+            let remaining = limit.map_or(pause, |timeout| timeout.saturating_sub(start.elapsed()));
             std::thread::sleep(pause.min(remaining));
         }
     }
     output.results = std::mem::take(&mut pipeline.stages)
         .into_iter()
         .map(|stage| {
-            if timed_out {
+            if timeout_signal.is_some() {
                 ProcessResult::TimedOut
             } else {
                 stage.result.unwrap_or(ProcessResult::TimedOut)
             }
         })
         .collect();
-    Ok(output)
+    Ok(crate::ControlledOutput {
+        output,
+        timeout_signal: timeout_signal.filter(|_| graceful_exit),
+    })
 }

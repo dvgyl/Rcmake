@@ -144,6 +144,7 @@ struct ObservationTime {
 
 impl ObservationTime {
     fn changed(self, metadata: &Metadata) -> bool {
+        // The mtime cutoff includes the host timestamp granularity.
         time_nanos(metadata.mtime) >= self.cutoff
             || metadata.ctime.is_some_and(|ctime| {
                 let threshold = if ctime.nanos == 0 {

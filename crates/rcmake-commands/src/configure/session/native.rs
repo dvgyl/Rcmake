@@ -57,7 +57,9 @@ impl NativeSession {
             .then(|| Arc::new(MemoHost::from_shared(Arc::clone(&base))));
         let fetch = FetchRuntime::new(Arc::clone(&base), source, services);
         let probe = can_accelerate
-            .then(|| ProbeRuntime::new(Arc::clone(&base), build, services).map(Arc::new))
+            .then(|| {
+                ProbeRuntime::new(Arc::clone(&base), build, services, memo.clone()).map(Arc::new)
+            })
             .flatten();
         let snapshot = build
             .join("CMakeFiles/rcmake")

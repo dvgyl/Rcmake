@@ -43,11 +43,11 @@ impl Interp {
             self.vars.set(b"CMAKE_SCRIPT_MODE_FILE", abs.clone());
             // The script-mode root snapshot has no listfile.
             self.listfiles.push(Arc::from(&b""[..]));
-            let argc = self.config.script_args.len();
-            self.vars.set(b"CMAKE_ARGC", argc.to_string().into());
-            for (i, arg) in self.config.script_args.clone().into_iter().enumerate() {
-                self.vars.set(format!("CMAKE_ARGV{i}").as_bytes(), arg);
-            }
+        }
+        let argc = self.config.script_args.len();
+        self.vars.set(b"CMAKE_ARGC", argc.to_string().into());
+        for (i, arg) in self.config.script_args.clone().into_iter().enumerate() {
+            self.vars.set(format!("CMAKE_ARGV{i}").as_bytes(), arg);
         }
 
         if !self.is_regular_file(&abs) {

@@ -471,6 +471,10 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
     }
 
     fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
+        self.read_with_origin(p, range, p)
+    }
+
+    fn read_with_origin(&self, p: &Path, range: ReadRange, origin: &Path) -> HostResult<Vec<u8>> {
         let state = self.read_state()?;
         let resolved = state.existing(p, Follow::Yes)?;
         let node = resolved.existing(p)?;
@@ -480,7 +484,7 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
         let Some(bytes) = state.bytes(node) else {
             let backing = node.backing(p)?;
             drop(state);
-            return self.base.read(backing, range);
+            return self.base.read_with_origin(backing, range, origin);
         };
         let bytes = &bytes.0;
         match range {

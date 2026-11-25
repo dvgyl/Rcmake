@@ -114,7 +114,7 @@ fn escape_semicolons(arg: BString) -> BString {
     escaped.into()
 }
 
-fn find_program(cx: &Cx<'_>, token: &[u8]) -> Option<BString> {
+pub(crate) fn find_program(cx: &Cx<'_>, token: &[u8]) -> Option<BString> {
     if token.is_empty() {
         return None;
     }

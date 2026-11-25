@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::*;
-use rcmake_store::{TreePolicy, sdk_tree_listing_digest, tree_listing_digest};
+use rcmake_store::{TreePolicy, tree_listing_digest};
 
 impl CompilerEvidence {
     pub(super) fn search_directories(
@@ -9,7 +11,7 @@ impl CompilerEvidence {
     ) -> Option<BTreeSet<PathBuf>> {
         let compile = flags.source.is_some();
         if let Some(source) = &flags.source
-            && matches!(self.toolchain.family, Family::AppleClang | Family::Clang)
+            && self.toolchain.family == Family::AppleClang
         {
             let file = request.cwd.join(path::to_native(source));
             let bytes = self
@@ -19,6 +21,13 @@ impl CompilerEvidence {
             if !bytes
                 .iter()
                 .any(|byte| matches!(byte, b'#' | b'%' | b'?' | b'\\'))
+                && !bytes
+                    .windows(b"_Pragma".len())
+                    .any(|word| word == b"_Pragma")
+                && !bytes
+                    .windows(b"__pragma".len())
+                    .any(|word| word == b"__pragma")
+                && (!self.cxx || !bytes.windows(b"import".len()).any(|word| word == b"import"))
             {
                 return Some(BTreeSet::new());
             }
@@ -159,7 +168,7 @@ impl CompilerEvidence {
                 InputStamp::TreeListing {
                     path: directory.to_owned(),
                     policy: TreePolicy::Sdk,
-                    digest: sdk_tree_listing_digest(self.host.as_ref(), directory).ok()?,
+                    digest: self.memo.sdk_digest(self.host.as_ref(), directory).ok()?,
                 }
             }
             Ok(_) => InputStamp::TreeListing {

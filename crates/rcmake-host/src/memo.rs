@@ -108,6 +108,13 @@ impl<H: Host + ?Sized> MemoHost<H> {
         }
     }
 
+    /// Return the current generation while no mutation or process is active.
+    #[must_use]
+    pub fn stable_generation(&self) -> Option<u64> {
+        let cache = self.read_cache();
+        (cache.active_changes == 0).then_some(cache.generation)
+    }
+
     /// Invalidate queries after changes made through another host handle.
     pub fn clear(&self) {
         drop(self.begin_change());
@@ -366,6 +373,17 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     ) -> HostResult<RunOutput> {
         let _change = self.begin_change();
         self.base.run_with_timeout_signal(req, timeout, on_output)
+    }
+
+    fn run_controlled(
+        &self,
+        req: &RunRequest,
+        graceful: Option<GracefulTimeout>,
+        hard_limit: Option<Duration>,
+        update: &mut crate::DeadlineUpdate<'_>,
+    ) -> HostResult<crate::ControlledOutput> {
+        let _change = self.begin_change();
+        self.base.run_controlled(req, graceful, hard_limit, update)
     }
 
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {

@@ -39,8 +39,8 @@ enum FrameSchema {
 }
 
 impl<M> ConfigureSnapshot<M> {
-    /// Version of the replay records in the configure frame.
-    pub const SCHEMA: &'static str = "configure.v2";
+    /// Version of the replay records. The frame encoding and its file name still use version 1.
+    pub const SCHEMA: &'static str = "configure.v3";
 
     /// File name for the manifest under `CMakeFiles/rcmake`.
     pub const FILE_NAME: &'static str = "configure.v1.bin";

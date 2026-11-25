@@ -382,7 +382,10 @@ def configure_runs(binary, project, work, generator, env, timeout, *, synthetic,
                     raise ValueError(f"{leaf} is absent from the cold codemodel.")
                 if control != Path("CMakeLists.txt"):
                     control_targets = cold_leaves[control].targets
-                with (source / leaf).open("ab") as stream:
+                editable = source / leaf
+                if editable.resolve() != editable.absolute():
+                    raise ValueError(f"Cannot edit a symlinked listfile at {leaf}.")
+                with editable.open("ab") as stream:
                     stream.write(f"\nset({LEAF_MARKER} 1)\n".encode())
             except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
                 results[phase] = Sample(error=f"Could not edit a configured leaf. {error}")
@@ -760,7 +763,7 @@ def markdown(report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rcmake", type=Path, default=ROOT / "target/stage/bin/cmake")
+    parser.add_argument("--rcmake", type=Path, default=ROOT / "target/stage/bin/rcmake")
     parser.add_argument("--oracle", type=Path, default=os.environ.get("RCMAKE_ORACLE_CMAKE"))
     parser.add_argument("--projects", nargs="+", default=["synthetic"],
                         help="Project names under conformance/corpus, or synthetic. Warm fetch uses its own fixture.")
@@ -790,6 +793,8 @@ def main():
     scenarios = [phase for name, phase in SCENARIOS.items() if name in selected]
     phases = (COLD, *(phase for phase in scenarios if phase != WARM_FETCH)) if selected else PHASES
     binaries = {"rcmake": args.rcmake.absolute(), "oracle": args.oracle.absolute()}
+    if binaries["rcmake"].name != "rcmake":
+        parser.error("Use an executable named rcmake for the Native benchmark.")
     ctests = {tool: path.with_name("ctest") for tool, path in binaries.items()}
     for path in (*binaries.values(), *(ctests.values() if not selected else ())):
         if not path.is_file() or not os.access(path, os.X_OK):

@@ -141,77 +141,80 @@ fn defines_unopened_functions_targets_and_aliases() -> TestResult {
     let root = "include(defs.cmake)\nMY_HELPER(arg)\ntarget_link_libraries(app PRIVATE tools tools_alias)\n";
     let defs = "function(My_Helper input)\nendfunction()\nadd_library(tools INTERFACE)\nadd_library(tools_alias ALIAS tools)\n";
     project.file("defs.cmake", defs)?;
-    let provider = project.provider(|session| {
-        let mut result = model_at(session);
-        let defs = session.source_dir.join("defs.cmake");
-        let text = read(session.host().as_ref(), &defs)?;
-        let mut sources = SourceMap::default();
-        let source_id = sources.add(from_native_cmake(&defs), SourceKind::File, text.into());
-        result.facts.source_map = Some(Arc::new(sources));
-        result.facts.callables.push(CallableDefinition {
-            name: "My_Helper".into(),
-            kind: UserCommandKind::Function,
-            location: SourceLocation {
-                source_id,
-                range: Some(SourceRange { start: 9, end: 18 }),
-                ..location(&defs, 1)
-            },
-            parameters: vec!["input".into()],
-            documentation: None,
-        });
-        let mut tools = Target::new(
-            "tools".into(),
-            TargetKind::InterfaceLibrary,
-            TargetOrigin::Normal,
-            DirId::ROOT,
-            Backtrace::default(),
-            PolicyMap::default(),
-        );
-        tools.usage.fields.insert(
-            UsageField::InterfaceCompileDefinitions,
-            vec![BT::new("TOOLS".into(), Backtrace::default())],
-        );
-        tools.usage.fields.insert(
-            UsageField::InterfaceIncludeDirectories,
-            vec![BT::new("headers".into(), Backtrace::default())],
-        );
-        tools.usage.interface_link_libraries = Some(vec![LinkItem {
-            scope: None,
-            text: BT::new("m".into(), Backtrace::default()),
-            lookup_dir: DirId::ROOT,
-        }]);
-        let id = result
-            .model
-            .add_target(tools)
-            .map_err(|_| invalid_fixture())?;
-        result.facts.target_sites.insert(id, location(&defs, 3));
-        result
-            .model
-            .add_alias(DirId::ROOT, "tools_alias".into(), id)
-            .map_err(|_| invalid_fixture())?;
-        let decoy = result
-            .model
-            .add_target(Target::new(
-                "PRIVATE".into(),
+    let provider = project
+        .provider(|session| {
+            let mut result = model_at(session);
+            let defs = session.source_dir.join("defs.cmake");
+            let text = read(session.host().as_ref(), &defs)?;
+            let mut sources = SourceMap::default();
+            let source_id = sources.add(from_native_cmake(&defs), SourceKind::File, text.into());
+            result.facts.source_map = Some(Arc::new(sources));
+            result.facts.callables.push(CallableDefinition {
+                name: "My_Helper".into(),
+                kind: UserCommandKind::Function,
+                location: SourceLocation {
+                    source_id,
+                    range: Some(SourceRange { start: 9, end: 18 }),
+                    ..location(&defs, 1)
+                },
+                parameters: vec!["input".into()],
+                documentation: None,
+            });
+            let mut tools = Target::new(
+                "tools".into(),
                 TargetKind::InterfaceLibrary,
                 TargetOrigin::Normal,
                 DirId::ROOT,
                 Backtrace::default(),
                 PolicyMap::default(),
-            ))
-            .map_err(|_| invalid_fixture())?;
-        result.facts.target_sites.insert(decoy, location(&defs, 3));
-        result.facts.aliases.push(AliasSite {
-            name: "tools_alias".into(),
-            dir: DirId::ROOT,
-            global: true,
-            location: location(&defs, 4),
-        });
-        Ok(result)
-    });
+            );
+            tools.usage.fields.insert(
+                UsageField::InterfaceCompileDefinitions,
+                vec![BT::new("TOOLS".into(), Backtrace::default())],
+            );
+            tools.usage.fields.insert(
+                UsageField::InterfaceIncludeDirectories,
+                vec![BT::new("headers".into(), Backtrace::default())],
+            );
+            tools.usage.interface_link_libraries = Some(vec![LinkItem {
+                scope: None,
+                text: BT::new("m".into(), Backtrace::default()),
+                lookup_dir: DirId::ROOT,
+            }]);
+            let id = result
+                .model
+                .add_target(tools)
+                .map_err(|_| invalid_fixture())?;
+            result.facts.target_sites.insert(id, location(&defs, 3));
+            result
+                .model
+                .add_alias(DirId::ROOT, "tools_alias".into(), id)
+                .map_err(|_| invalid_fixture())?;
+            let decoy = result
+                .model
+                .add_target(Target::new(
+                    "PRIVATE".into(),
+                    TargetKind::InterfaceLibrary,
+                    TargetOrigin::Normal,
+                    DirId::ROOT,
+                    Backtrace::default(),
+                    PolicyMap::default(),
+                ))
+                .map_err(|_| invalid_fixture())?;
+            result.facts.target_sites.insert(decoy, location(&defs, 3));
+            result.facts.aliases.push(AliasSite {
+                name: "tools_alias".into(),
+                dir: DirId::ROOT,
+                global: true,
+                location: location(&defs, 4),
+            });
+            Ok(result)
+        })
+        .with_explicit_refresh();
     let root_uri = project.uri("CMakeLists.txt");
     let defs_uri = project.uri("defs.cmake");
     open(&provider, &root_uri, root, 1);
+    provider.snapshots().refresh()?;
 
     for (word, line, column) in [
         ("MY_HELPER", 0, 9),
@@ -681,5 +684,95 @@ fn undefined_cache_reference_does_not_use_the_final_cache_value() -> TestResult 
             .hover(&later)
             .is_some_and(|hover| hover.contains("VALUE = later"))
     );
+    Ok(())
+}
+
+#[test]
+fn early_fatal_denial_counts_each_request_once() -> TestResult {
+    let project = Project::new();
+    project.file(
+        "CMakeLists.txt",
+        "cmake_minimum_required(VERSION 4.5)\nproject(p NONE)\n",
+    )?;
+    project.file(
+        "PreLoad.cmake",
+        concat!(
+            "execute_process(COMMAND same RESULT_VARIABLE result)\n",
+            "execute_process(COMMAND same COMMAND_ERROR_IS_FATAL ANY)\n",
+        ),
+    )?;
+    let provider = project.provider(PreparedConfigure::evaluate);
+    assert_eq!(provider.snapshots().refresh()?, RefreshStatus::Completed);
+    let state = provider.snapshots().lock();
+    let snapshot = state.snapshot.as_ref().ok_or("Missing partial snapshot.")?;
+    assert!(matches!(
+        &snapshot.result.completion,
+        CompletionState::Partial { denied_processes, omitted_denials: 0, .. }
+            if denied_processes.len() == 2
+    ));
+    assert!(
+        snapshot
+            .result
+            .index
+            .as_ref()
+            .is_some_and(|index| index.is_provisional())
+    );
+    Ok(())
+}
+
+#[test]
+fn disk_slice_refreshes_when_the_file_changes_at_the_same_size() -> TestResult {
+    let project = Project::new();
+    let top = concat!(
+        "cmake_minimum_required(VERSION 4.5)\nproject(p NONE)\n",
+        "file(READ \"${CMAKE_CURRENT_SOURCE_DIR}/settings.txt\" VALUE OFFSET 2 LIMIT 3)\n",
+        "file(WRITE \"${CMAKE_CURRENT_SOURCE_DIR}/settings.txt\" overlay)\n",
+    );
+    project.file("CMakeLists.txt", top)?;
+    project.file("settings.txt", "xxold")?;
+    let provider = project.provider(PreparedConfigure::evaluate);
+    assert_eq!(provider.snapshots().refresh()?, RefreshStatus::Completed);
+    let path = project.root.join("settings.txt");
+    assert!(provider.snapshots().disk_paths().contains(&path));
+    assert_eq!(provider.snapshots().refresh()?, RefreshStatus::UpToDate);
+    project.file("settings.txt", "xxnew")?;
+    assert_eq!(provider.snapshots().refresh()?, RefreshStatus::Completed);
+    let state = provider.snapshots().lock();
+    let snapshot = state.snapshot.as_ref().ok_or("Missing snapshot.")?;
+    assert_eq!(
+        snapshot
+            .result
+            .model
+            .definition(DirId::ROOT, b"VALUE")
+            .map(|value| value.as_slice()),
+        Some(b"new".as_slice()),
+    );
+    Ok(())
+}
+
+#[test]
+fn missing_disk_input_stays_tracked_until_recreated() -> TestResult {
+    let project = Project::new();
+    project.file(
+        "CMakeLists.txt",
+        concat!(
+            "cmake_minimum_required(VERSION 4.5)\nproject(p NONE)\n",
+            "file(READ \"${CMAKE_CURRENT_SOURCE_DIR}/settings.txt\" VALUE)\n",
+        ),
+    )?;
+    project.file("settings.txt", "before")?;
+    let provider = project.provider(PreparedConfigure::evaluate);
+    let snapshots = provider.snapshots();
+    assert_eq!(snapshots.refresh()?, RefreshStatus::Completed);
+    let input = project.root.join("settings.txt");
+    project.host.remove_file(&input)?;
+    assert!(matches!(
+        snapshots.refresh(),
+        Err(ApiError::ConfigureFailed { .. })
+    ));
+    assert!(snapshots.disk_paths().contains(&input));
+    assert_eq!(snapshots.refresh()?, RefreshStatus::UpToDate);
+    project.file("settings.txt", "after")?;
+    assert_eq!(snapshots.refresh()?, RefreshStatus::Completed);
     Ok(())
 }

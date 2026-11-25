@@ -40,6 +40,7 @@ impl ProbeRuntime {
         host: Arc<dyn Host>,
         build: &Path,
         services: &Services,
+        generation: Option<Arc<rcmake_host::MemoHost<dyn Host>>>,
     ) -> Option<Self> {
         let mode = services.speed.probe_cache;
         if mode == ProbeCacheMode::Off
@@ -70,11 +71,15 @@ impl ProbeRuntime {
             .env_get(b"RCMAKE_MEASURE_PROBE_INTERVALS")
             .is_some_and(|value| value == "1"))
         .then(|| Arc::new(CompileIntervals::default()));
+        let mut cache = ProbeCache::for_session(mode);
+        if let Some(host) = generation {
+            cache.memo = Arc::new(rcmake_store::TraceMemo::with_generation(host));
+        }
         Some(Self {
             host,
             intervals,
             store,
-            cache: ProbeCache::for_session(mode),
+            cache,
             mode,
             build: build.to_owned(),
             executable: OnceLock::new(),

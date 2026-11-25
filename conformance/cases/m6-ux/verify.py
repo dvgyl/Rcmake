@@ -77,7 +77,7 @@ def check_cli(native, oracle, source, root, env):
     target = json.loads(explained_target.stdout)
     assert target["schema"] == "rcmake-explain-v1", target
     assert target["name"] == "Demo::component" and target["details"]["target"] == "component", target
-    assert target["details"]["alias_definition"]["path"] == str(source / "CMakeLists.txt"), target
+    assert target["details"]["alias_definition"]["path"] == (source / "CMakeLists.txt").as_posix(), target
     variable = json.loads(run(native, "explain", "EDITABLE", "-B", done, "--var", "--json").stdout)
     cache = variable["details"]["cache"]
     assert cache["advanced"] is True and cache["help"] == "Choice for the fixture", cache
@@ -100,6 +100,9 @@ def check_cli(native, oracle, source, root, env):
 
     profiles = root / "native-profile"
     run(native, *options, RCMAKE_PROFILE=str(profiles))
+    current = (profiles / "current").read_text(encoding="utf-8")
+    assert re.fullmatch(r"run-[0-9-]+\n", current), current
+    profiles /= current.rstrip("\n")
     profile = json.loads(profiles.joinpath("trace.json").read_bytes())
     assert profiles.joinpath("flamegraph.html").is_file() and profile
     assert b"invocation wall time" in run(native, *options, "--profile").stderr
@@ -144,6 +147,87 @@ def check_replay(native, root, env):
             assert b'Unknown target property "CXX_STANDARD"' not in result.stderr, result
 
 
+
+def check_install_replay(native, root, env):
+    source = root / "install-source"
+    early = source / "early"
+    leaf = source / "leaf"
+    build = root / "install-build"
+    early.mkdir(parents=True)
+    leaf.mkdir()
+    top = source / "CMakeLists.txt"
+    project = ("cmake_minimum_required(VERSION 4.5)\nproject(InstallReplay C)\n"
+               "set(unrelated before)\nset(destination lib)\n"
+               "set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME Unspecified)\n"
+               "set(sources first.c second.c)\nadd_subdirectory(early)\nadd_subdirectory(leaf)\n"
+               "install(EXPORT exported DESTINATION cmake)\n")
+    top.write_text(project, encoding="utf-8")
+    (early / "CMakeLists.txt").write_text("", encoding="utf-8")
+    for file in ("first.c", "second.c", "extra.c", "core.h"):
+        (leaf / file).write_text("/* replay fixture */\n", encoding="utf-8")
+    entry = leaf / "CMakeLists.txt"
+    entry.write_text(
+        "add_library(core STATIC)\n"
+        "target_sources(core PRIVATE ${sources})\n"
+        "set_target_properties(core PROPERTIES PUBLIC_HEADER core.h)\n"
+        'install(TARGETS core EXPORT exported ARCHIVE DESTINATION "${destination}" '
+        "PUBLIC_HEADER DESTINATION include)\n"
+        "add_library(extra STATIC extra.c)\n"
+        'install(TARGETS extra ARCHIVE DESTINATION "${destination}")\n',
+        encoding="utf-8",
+    )
+    run_env = env | {"RCMAKE_MEASURE_REPLAY": "1"}
+    report_path = build / "CMakeFiles/rcmake/replay-result.v1.json"
+    def run(*args, **flags):
+        return subprocess.run(
+            [native, *args], cwd=root, env=run_env | flags, capture_output=True,
+            check=True, timeout=45,
+        )
+
+    def configure(**flags):
+        run("-S", source, "-B", build, "-G", "Ninja", **flags)
+        return json.loads(report_path.read_bytes())["replayed"]
+
+    configure()
+    project = project.replace("set(unrelated before)", "set(unrelated after)")
+    top.write_text(project, encoding="utf-8")
+    assert entry.as_posix() in configure(), "The install leaf did not replay."
+    (early / "earlier.c").write_text("/* earlier target */\n", encoding="utf-8")
+    (early / "CMakeLists.txt").write_text(
+        "add_library(earlier STATIC earlier.c)\n"
+        "install(TARGETS earlier EXPORT exported ARCHIVE DESTINATION early-lib)\n",
+        encoding="utf-8",
+    )
+    assert entry.as_posix() in configure(), "The install leaf did not rebase."
+    script = leaf.name + "/cmake_install.cmake"
+    replayed = (build / script).read_bytes()
+    ninja = (build / "build.ninja").read_bytes()
+    export_dir = build / "CMakeFiles/Export"
+
+    def exports():
+        return {file.relative_to(export_dir): file.read_bytes() for file in export_dir.rglob("*.cmake")}
+
+    replay_exports = exports()
+    configure(RCMAKE_NO_INCREMENTAL="1")
+    assert replayed == (build / script).read_bytes()
+    assert ninja == (build / "build.ninja").read_bytes()
+    assert replay_exports and replay_exports == exports()
+    project = project.replace("set(destination lib)", "set(destination changed-lib)")
+    top.write_text(project, encoding="utf-8")
+    assert entry.as_posix() not in configure()
+    assert b"changed-lib" in (build / script).read_bytes()
+    project = project.replace("CMAKE_INSTALL_DEFAULT_COMPONENT_NAME Unspecified",
+                              "CMAKE_INSTALL_DEFAULT_COMPONENT_NAME part")
+    top.write_text(project, encoding="utf-8")
+    assert entry.as_posix() not in configure()
+    assert b'COMPONENT STREQUAL "part"' in (build / script).read_bytes()
+    run("--build", build, "--parallel", "2")
+    installed = root / "install-prefix"
+    run("--install", build, "--prefix", installed)
+    assert (installed / "include/core.h").is_file()
+    assert list(installed.joinpath("early-lib").iterdir())
+    assert len(list(installed.joinpath("changed-lib").iterdir())) == 2
+
 def check_rich_source_reuse(native, root, env):
     source = root / "rich-source"
     source.mkdir()
@@ -165,6 +249,7 @@ def check_rich_source_reuse(native, root, env):
 class Protocol:
     def __init__(self, process):
         self.process = process
+        self.registrations = []
         self.incoming = queue.Queue()
         self.next_id = 0
         threading.Thread(target=self.read, daemon=True).start()
@@ -189,6 +274,9 @@ class Protocol:
         if request:
             self.next_id += 1
             data["id"] = self.next_id
+        self.write(data)
+
+    def write(self, data):
         payload = json.dumps(data).encode()
         self.process.stdin.write(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
         self.process.stdin.flush()
@@ -202,6 +290,10 @@ class Protocol:
                 break
             if isinstance(message, Exception):
                 raise message
+            if "method" in message and "id" in message:
+                if message["method"] == "client/registerCapability":
+                    self.registrations.extend(message["params"]["registrations"])
+                self.write({"jsonrpc": "2.0", "id": message["id"], "result": None})
             if matches(message):
                 return message
         raise TimeoutError(description)
@@ -286,14 +378,81 @@ def check_lsp(binary, source, env):
                 process.kill()
 
 
+
+def check_lsp_disk(binary, source, env, watch):
+    top = source / "CMakeLists.txt"
+    settings = source / "settings.txt"
+    lists = ('cmake_minimum_required(VERSION 4.5)\n'
+             'project(DiskInput NONE)\n'
+             'file(READ "${CMAKE_CURRENT_SOURCE_DIR}/settings.txt" VALUE OFFSET 2 LIMIT 6)\n'
+             'message(STATUS "${VALUE}")\n')
+    top.write_text(lists, encoding="utf-8")
+    settings.write_text("xxbefore", encoding="utf-8")
+    capabilities = {"workspace": {"didChangeWatchedFiles": {
+        "dynamicRegistration": True, "relativePatternSupport": True,
+    }}} if watch else {}
+    with subprocess.Popen([binary], cwd=source, env=env, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE) as process:
+        try:
+            client = Protocol(process)
+            client.request("initialize", {"rootUri": source.as_uri(), "capabilities": capabilities})
+            client.send("initialized", {})
+            client.send("textDocument/didOpen", {"textDocument": {
+                "uri": top.as_uri(), "version": 1, "languageId": "cmake", "text": lists,
+            }})
+
+            def wait_for(text):
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    result = client.request("textDocument/hover", {
+                        "textDocument": {"uri": top.as_uri()},
+                        "position": {"line": 3, "character": 20},
+                    })
+                    contents = json.dumps(result)
+                    if text in contents:
+                        return
+                    time.sleep(0.05)
+                raise TimeoutError(text)
+
+            wait_for("before")
+            if watch:
+                patterns = [item["globPattern"]
+                            for registration in client.registrations
+                            for item in registration["registerOptions"]["watchers"]]
+                assert {"baseUri": source.as_uri(), "pattern": "settings.txt"} in patterns, patterns
+            settings.write_text("xxnewest", encoding="utf-8")
+            if watch:
+                client.send("workspace/didChangeWatchedFiles", {
+                    "changes": [{"uri": settings.as_uri(), "type": 2}],
+                })
+            wait_for("newest")
+            assert not source.joinpath(".rcmake-lsp").exists()
+            client.request("shutdown")
+            client.send("exit")
+            assert process.wait(timeout=10) == 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rcmake", type=Path, required=True)
     parser.add_argument("--lsp", type=Path, required=True)
     parser.add_argument("--oracle", type=Path, required=True)
     args = parser.parse_args()
+    args.rcmake = args.rcmake.absolute()
+    args.lsp = args.lsp.absolute()
+    args.oracle = args.oracle.absolute()
+    if args.rcmake.name != ("rcmake.exe" if os.name == "nt" else "rcmake"):
+        parser.error("--rcmake must name the Native executable.")
     env = {key: value for key, value in os.environ.items()
            if not key.startswith("RCMAKE_") or key == "RCMAKE_VENDORED_DATA_ROOT"}
+    if "RCMAKE_VENDORED_DATA_ROOT" in env:
+        env["RCMAKE_VENDORED_DATA_ROOT"] = str(Path(env["RCMAKE_VENDORED_DATA_ROOT"]).resolve())
+    elif os.name == "nt":
+        env["RCMAKE_VENDORED_DATA_ROOT"] = str(
+            args.rcmake.parent.parent / "share" / "cmake-4.5"
+        )
     with tempfile.TemporaryDirectory(prefix="rcmake-m6-ux-") as temporary:
         root = Path(temporary).resolve()
         source = root / "src"
@@ -304,9 +463,12 @@ def main():
         check_cli(args.rcmake, args.oracle, source, root, env)
         print("PASS Native CLI, Explain, profiles, diagnostic modes, and execution logging.")
         check_replay(args.rcmake, root, env)
+        check_install_replay(args.rcmake, root, env)
         check_rich_source_reuse(args.rcmake, root, env)
         print("PASS Replay in both diagnostic formats, rich warnings, and source reuse.")
         check_lsp(args.lsp, source, env)
+        check_lsp_disk(args.lsp, source, env, watch=True)
+        check_lsp_disk(args.lsp, source, env, watch=False)
         print("PASS LSP framing, evaluated hover and definition, stale results, successive edits, diagnostics, quick fixes, and overlay isolation.")
 
 

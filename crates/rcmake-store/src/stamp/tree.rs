@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::collections::BTreeSet;
 
 use super::*;
@@ -66,18 +68,29 @@ pub fn tree_listing_digest(host: &dyn Host, root: &Path) -> HostResult<Digest> {
 /// Hash a bounded SDK search graph, including directory links and dangling links.
 ///
 /// Visit each canonical directory once. Reject inaccessible paths and graphs
-/// over 20,000 entries or 32 levels deep.
+/// over 65,536 entries or 32 levels deep.
 pub fn sdk_tree_listing_digest(host: &dyn Host, root: &Path) -> HostResult<Digest> {
-    let mut key = KeyHasher::new(Domain::BlobV1);
-    key.field(0, b"sdk-tree-listing");
     let canonical = host.canonicalize(root)?;
-    key.field(1, canonical.as_os_str().as_encoded_bytes());
+    sdk_root_digest(host, root, sdk_graph_digest(host, &canonical)?)
+}
+
+pub(super) fn sdk_root_digest(host: &dyn Host, root: &Path, graph: Digest) -> HostResult<Digest> {
+    let mut key = KeyHasher::new(Domain::BlobV1);
+    key.field(0, b"sdk-tree-root");
+    key.field(1, graph.as_bytes());
     if host.metadata(root, Follow::No)?.kind == FileKind::Symlink {
         key.field(2, host.read_link(root)?.as_os_str().as_encoded_bytes());
     }
-    let mut directories = vec![(canonical, 0)];
+    Ok(key.finish())
+}
+
+pub(super) fn sdk_graph_digest(host: &dyn Host, canonical: &Path) -> HostResult<Digest> {
+    let mut key = KeyHasher::new(Domain::BlobV1);
+    key.field(0, b"sdk-tree-graph");
+    key.field(1, canonical.as_os_str().as_encoded_bytes());
+    let mut directories = vec![(canonical.to_owned(), 0)];
     let mut visited = BTreeSet::new();
-    let mut remaining = 20_000_usize;
+    let mut remaining = 65_536_usize;
     while let Some((directory, depth)) = directories.pop() {
         if !visited.insert(directory.clone()) {
             continue;

@@ -488,6 +488,11 @@ impl Interp {
             return self.invoke(lower, command, &[]);
         }
         let args = self.expand(&cmd.args)?;
+        if self.replay_observations.is_some()
+            && !crate::journal::valid_expansion(lower, &cmd.args, &args)
+        {
+            self.mark_replay_opaque();
+        }
         if self
             .session_data::<crate::hermetic::HermeticContext>()
             .is_some_and(crate::hermetic::HermeticContext::denied)

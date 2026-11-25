@@ -791,10 +791,34 @@ mod windows_tests {
             Path::new("C:/old/cmake"),
         )
         .ok_or("Missing original bindings.")?;
-        let input = br#"c:\old\source files\probe.c C:/old/buildtools/cc"#;
+        let relocated = PathBindings::new(
+            Path::new("D:/new/build/scratch"),
+            Path::new("D:/new/build"),
+            Path::new("D:/new/source files"),
+            Path::new("D:/new/cmake"),
+        )
+        .ok_or("Missing relocated bindings.")?;
+        let input = br#"c:\old\source files\probe.c C:/old/build/probe.obj"#;
         let template = Templated::capture(input, &bindings).ok_or("Cannot capture output.")?;
         assert!(round_trip_verify(&template, &bindings, input));
+        assert!(!template.has_leak(&bindings));
+        assert_eq!(
+            template.render(&relocated).as_deref(),
+            Some(br#"d:\new\source files\probe.c D:/new/build/probe.obj"#.as_slice())
+        );
+
+        let neighbor = b"C:/old/buildtools/cc";
+        let template = Templated::capture(neighbor, &bindings).ok_or("Cannot capture neighbor.")?;
+        assert_eq!(
+            template.render(&relocated).as_deref(),
+            Some(neighbor.as_slice())
+        );
         assert!(template.has_leak(&bindings));
+
+        let alias = r"c:\OLD\BUILD\SCRATCH\a.obj";
+        let utf16: Vec<_> = alias.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(bindings.has_path_leak(alias.as_bytes()));
+        assert!(bindings.has_path_leak(&utf16));
         Ok(())
     }
 }

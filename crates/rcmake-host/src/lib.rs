@@ -180,6 +180,18 @@ pub struct GracefulTimeout {
     pub grace: Duration,
 }
 
+/// Return a replacement timeout measured from receipt of an output chunk.
+pub type DeadlineUpdate<'a> = dyn FnMut(Stream, &[u8]) -> Option<Duration> + 'a;
+
+/// Output from a process with an adjustable deadline.
+#[derive(Debug, Default)]
+pub struct ControlledOutput {
+    /// Process status and captured output.
+    pub output: RunOutput,
+    /// Signal sent on timeout if the child completed during the grace period.
+    pub timeout_signal: Option<TimeoutSignal>,
+}
+
 /// Standard output/error configuration for a child process or pipeline.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output {
@@ -295,6 +307,11 @@ pub trait Host: Send + Sync {
 
     /// Read bytes from an absolute file path.
     fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>>;
+
+    /// Read a file and preserve the caller's path when an overlay resolves it.
+    fn read_with_origin(&self, p: &Path, range: ReadRange, _origin: &Path) -> HostResult<Vec<u8>> {
+        self.read(p, range)
+    }
 
     /// Read a file in order and pass each chunk to `consume`.
     fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
@@ -451,6 +468,36 @@ pub trait Host: Send + Sync {
     ) -> HostResult<RunOutput> {
         let _ = timeout;
         self.run(req, on_output)
+    }
+
+    /// Run a process with a deadline that can change when captured output arrives.
+    ///
+    /// The callback can replace the relative timeout. The separate hard limit,
+    /// measured from launch, still applies. An update does not change signal grace.
+    fn run_controlled(
+        &self,
+        req: &RunRequest,
+        graceful: Option<GracefulTimeout>,
+        hard_limit: Option<Duration>,
+        update: &mut DeadlineUpdate<'_>,
+    ) -> HostResult<ControlledOutput> {
+        let mut request = req.clone();
+        request.timeout = match (request.timeout, hard_limit) {
+            (Some(base), Some(hard)) => Some(base.min(hard)),
+            (base, hard) => base.or(hard),
+        };
+        request.tee = true;
+        let mut observe = |stream, bytes: &[u8]| {
+            let _ = update(stream, bytes);
+        };
+        let output = match graceful {
+            Some(timeout) => self.run_with_timeout_signal(&request, timeout, &mut observe),
+            None => self.run(&request, &mut observe),
+        }?;
+        Ok(ControlledOutput {
+            output,
+            timeout_signal: None,
+        })
     }
 
     /// Run a process with a byte limit for all captured output.

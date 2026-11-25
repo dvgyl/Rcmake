@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use super::{Options, cache, emit_cli_error, new_interp, options};
 
+/// `cmake --find-package` (`cmake::FindPackage`): run `CMakeFindPackageMode.cmake`
+/// with the `FIND_PACKAGE` role and print the result for the requested `MODE`.
 pub(super) fn run(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
     let (_, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), argv.first());
     let script = cmake_root
@@ -168,9 +170,6 @@ fn link_flags(cx: &mut Cx<'_>) -> Result<BString, String> {
             ResolvedLinkKind::ObjectFile => item.text.value,
             _ => continue,
         };
-        if !flags.is_empty() {
-            flags.push(b' ');
-        }
         flags.extend_from_slice(&quote(&word));
         flags.push(b' ');
     }

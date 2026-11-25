@@ -36,7 +36,7 @@ impl ConfigureSession<'_> {
         let host = self.host.as_ref();
         let mut preloads = Preloads::default();
         let mut configured_diagnostics = false;
-        for edit in std::mem::take(&mut self.opts.cache_edits) {
+        for edit in self.opts.cache_edits.clone() {
             match edit {
                 CacheEdit::Define(def) => {
                     let name = def.name.clone();

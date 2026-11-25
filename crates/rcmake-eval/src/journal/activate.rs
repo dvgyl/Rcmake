@@ -826,6 +826,12 @@ impl Interp {
                 h.field(16, current.props.get(&name)?);
             }
             for name in self.project.global.props.names() {
+                if writes.installs
+                    && writes.record_variable_reads
+                    && super::leaf::earlier_install_property(&name, self.project.installs.len())
+                {
+                    continue;
+                }
                 h.field(20, &name);
                 h.field(21, self.project.global.props.get(&name)?);
             }

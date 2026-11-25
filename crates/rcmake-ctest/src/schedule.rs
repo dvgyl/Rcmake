@@ -406,10 +406,11 @@ fn run_attempts(
     let count = repeat.map_or(1, |repeat| repeat.count);
     let timeout = request.timeout;
     for attempt in 1..=count {
-        request.timeout = remaining_time(host, deadline)
+        let hard_limit = remaining_time(host, deadline);
+        request.timeout = hard_limit
             .map(|remaining| remaining.min(timeout.unwrap_or(Duration::MAX)))
             .or(timeout);
-        let result = execution::execute(host, test, &request, instrument);
+        let result = execution::execute(host, test, &request, instrument, hard_limit);
         let again = attempt < count
             && !matches!(
                 result.status,

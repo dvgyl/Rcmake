@@ -20,6 +20,7 @@ enum Event {
 }
 
 const EDIT_DEBOUNCE: Duration = Duration::from_millis(250);
+const DISK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 struct Worker {
     provider: Arc<EvalSemanticProvider>,
@@ -37,7 +38,14 @@ impl Worker {
             .name("rcmake-lsp-eval".to_owned())
             .stack_size(32 * 1024 * 1024)
             .spawn(move || {
-                while work.recv().is_ok() {
+                loop {
+                    match work.recv_timeout(DISK_POLL_INTERVAL) {
+                        Ok(()) => {}
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            evaluator.snapshots().check_disk_inputs();
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
                     loop {
                         match work.recv_timeout(EDIT_DEBOUNCE) {
                             Ok(()) => continue,
@@ -110,6 +118,8 @@ pub(super) fn serve() -> io::Result<ExitCode> {
     while let Ok(event) = events.recv() {
         match event {
             Event::Message(message) => {
+                let initialized = matches!(&message, RpcMessage::Call { method, id: None, .. }
+                    if method == "initialized");
                 let (initialize, refresh, disk_change) = match &message {
                     RpcMessage::Call {
                         method,
@@ -146,6 +156,16 @@ pub(super) fn serve() -> io::Result<ExitCode> {
                     && let Some(provider) = server.attach_workspace_evaluator(host.clone())
                 {
                     worker = Worker::start(provider, sender.clone()).ok();
+                    if let Some(worker) = &worker {
+                        worker.wake();
+                    }
+                }
+                if initialized && let Some(worker) = &worker {
+                    for request in
+                        server.reconcile_disk_watches(worker.provider.snapshots().disk_paths())
+                    {
+                        super::send(&mut output, request)?;
+                    }
                 }
                 if refresh && let Some(worker) = &worker {
                     worker.wake();
@@ -159,6 +179,13 @@ pub(super) fn serve() -> io::Result<ExitCode> {
                 }
             }
             Event::SnapshotReady => {
+                if let Some(worker) = &worker {
+                    for request in
+                        server.reconcile_disk_watches(worker.provider.snapshots().disk_paths())
+                    {
+                        super::send(&mut output, request)?;
+                    }
+                }
                 for response in server.refresh_open_diagnostics() {
                     super::send(&mut output, response)?;
                 }

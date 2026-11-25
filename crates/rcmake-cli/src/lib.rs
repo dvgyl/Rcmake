@@ -381,8 +381,6 @@ fn run_cmake(
     configure::run(argv, opts, host)
 }
 
-/// `cmake --find-package` (`cmake::FindPackage`): run `CMakeFindPackageMode.cmake`
-/// with the `FIND_PACKAGE` role and print the result for the requested `MODE`.
 fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Host>) -> Interp {
     let (cmake_command, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), argv.first());
     new_interp_with_paths(

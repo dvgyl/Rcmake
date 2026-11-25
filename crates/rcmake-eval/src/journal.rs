@@ -7,6 +7,7 @@ pub(crate) use activate::ReplayObservations;
 pub(crate) use leaf::REPLAY_LINK_CHECK;
 mod frame;
 mod leaf;
+pub(crate) use leaf::shape::valid_expansion;
 mod path_bytes;
 mod receipts;
 mod region;

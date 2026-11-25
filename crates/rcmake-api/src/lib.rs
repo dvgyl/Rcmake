@@ -37,7 +37,9 @@ mod runner;
 pub use runner::run_configure;
 mod variable_history;
 
-pub use config::{ApiError, ConfigureRequest, PreparedConfigure, ProcessPolicy, WriteMode};
+pub use config::{
+    ApiError, ConfigureRequest, PreparedConfigure, ProcessPolicy, WriteMode, observe_reads,
+};
 pub use explain::{
     CompilePosition, ExplainCache, ExplainCompileGroup, ExplainConfig, ExplainEntry, ExplainHop,
     ExplainInput, ExplainItemKind, ExplainProperty, ExplainQuery, ExplainReport, ExplainRoots,

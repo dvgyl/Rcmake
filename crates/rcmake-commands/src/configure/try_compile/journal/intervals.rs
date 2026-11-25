@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use super::*;
 
 #[derive(Default)]
+/// Records compile intervals from speculative workers.
 pub(crate) struct CompileIntervals(Mutex<Vec<CompileInterval>>);
 
 struct CompileInterval {

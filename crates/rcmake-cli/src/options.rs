@@ -17,6 +17,7 @@ mod generator;
 mod presets;
 mod trace;
 
+#[derive(Clone)]
 pub(crate) enum CacheEdit {
     Define(CacheDefine),
     Remove(BString),
@@ -186,6 +187,7 @@ fn parse_args(
         ..Options::default()
     };
     let mut first_extension = None;
+    let mut first_unknown = None;
     let mut iter = args.iter().peekable();
     let mut profile_format = None;
     while let Some(raw) = iter.next() {
@@ -221,7 +223,12 @@ fn parse_args(
         {
             continue;
         }
-        return Err(unknown_option(raw));
+        first_unknown.get_or_insert(raw);
+    }
+    if opts.script.is_none()
+        && let Some(flag) = first_unknown
+    {
+        return Err(unknown_option(flag));
     }
     if opts.script.is_some()
         && let Some(flag) = first_extension

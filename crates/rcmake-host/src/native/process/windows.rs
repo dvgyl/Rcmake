@@ -218,6 +218,7 @@ struct Supervisor<'a> {
     req: &'a RunRequest,
     start: Instant,
     output_limit: usize,
+    hard_limit: Option<Duration>,
 }
 
 impl Supervisor<'_> {
@@ -227,6 +228,7 @@ impl Supervisor<'_> {
         captures: Vec<Capture>,
         feed: Option<Feed<'_>>,
         on_output: &mut dyn FnMut(Stream, &[u8]),
+        mut update: Option<&mut crate::DeadlineUpdate<'_>>,
     ) -> HostResult<RunOutput> {
         thread::scope(|scope| {
             let (tx, rx) = mpsc::sync_channel(8);
@@ -258,6 +260,7 @@ impl Supervisor<'_> {
                 let feed = feed?;
                 let mut output = RunOutput::default();
                 let mut closed = false;
+                let mut time_limit = self.req.timeout;
                 loop {
                     let done = process_io(pipeline.collect_status())?;
                     if done && active_captures == 0 {
@@ -268,10 +271,11 @@ impl Supervisor<'_> {
                         break;
                     }
                     let pause = Duration::from_millis(2);
-                    let remaining = self
-                        .req
-                        .timeout
-                        .map(|limit| limit.saturating_sub(self.start.elapsed()));
+                    let limit = match (time_limit, self.hard_limit) {
+                        (Some(base), Some(hard)) => Some(base.min(hard)),
+                        (base, hard) => base.or(hard),
+                    };
+                    let remaining = limit.map(|limit| limit.saturating_sub(self.start.elapsed()));
                     if remaining == Some(Duration::ZERO) {
                         if done
                             && let Some(last) = pipeline
@@ -313,6 +317,11 @@ impl Supervisor<'_> {
                             if self.req.tee {
                                 on_output(stream, &bytes);
                             }
+                            if let Some(delay) =
+                                update.as_mut().and_then(|update| update(stream, &bytes))
+                            {
+                                time_limit = Some(self.start.elapsed().saturating_add(delay));
+                            }
                         }
                         Err(RecvTimeoutError::Disconnected) => closed = true,
                         Err(RecvTimeoutError::Timeout) => {}
@@ -337,7 +346,9 @@ pub(in crate::native) fn run_pipeline(
     _graceful: Option<GracefulTimeout>,
     output_limit: usize,
     on_output: &mut dyn FnMut(Stream, &[u8]),
-) -> HostResult<RunOutput> {
+    hard_limit: Option<Duration>,
+    update: Option<&mut crate::DeadlineUpdate<'_>>,
+) -> HostResult<crate::ControlledOutput> {
     let start = Instant::now();
     let (input, feed) = input(&req.stdin)?;
     let mut captures = Vec::new();
@@ -357,6 +368,11 @@ pub(in crate::native) fn run_pipeline(
         req,
         start,
         output_limit,
+        hard_limit,
     }
-    .collect(pipeline, captures, feed, on_output)
+    .collect(pipeline, captures, feed, on_output, update)
+    .map(|output| crate::ControlledOutput {
+        output,
+        timeout_signal: None,
+    })
 }

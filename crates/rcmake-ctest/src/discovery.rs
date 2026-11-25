@@ -235,14 +235,22 @@ fn set_properties(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                         for [key, value] in pairs {
                             test.timeout.apply(&key.value, &value.value);
                             if key.value == "TIMEOUT_AFTER_MATCH" {
-                                let count = list::split(&value.value, list::Empty::Drop).len();
-                                if count != 2 {
+                                let args = list::split(&value.value, list::Empty::Drop);
+                                let [delay, pattern] = args.as_slice() else {
                                     let message = format!(
-                                        "TIMEOUT_AFTER_MATCH expects two arguments, found {count}\n"
+                                        "TIMEOUT_AFTER_MATCH expects two arguments, found {}\n",
+                                        args.len()
                                     );
                                     cx.host()
                                         .write_out(rcmake_host::Stream::Stderr, message.as_bytes());
                                     continue;
+                                };
+                                if let Err(error) = test.timeout.set_after_match(delay, pattern) {
+                                    let message = format!(
+                                        "{error}\nRegularExpression::compile(): Error in compile.\n"
+                                    );
+                                    cx.host()
+                                        .write_out(rcmake_host::Stream::Stdout, message.as_bytes());
                                 }
                             }
                             if matches!(key.value.as_slice(), b"REQUIRED_FILES" | b"LABELS") {

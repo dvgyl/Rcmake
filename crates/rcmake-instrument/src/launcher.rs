@@ -86,6 +86,7 @@ pub fn command_line(command: &[BString]) -> BString {
 
 #[derive(Default)]
 struct Metadata {
+    ctest: bool,
     target: Option<BString>,
     config: Option<BString>,
     outputs: Vec<BString>,
@@ -266,6 +267,7 @@ fn run(
     let dynamic = before.map(|before| (before, SystemSample::collect(host)));
     let (code, result, interrupt_signal) = match output.results.first() {
         Some(ProcessResult::Exited(code)) => (*code, Some(i64::from(*code)), None),
+        Some(ProcessResult::Signaled(_)) if metadata.ctest => (1, Some(1), None),
         Some(ProcessResult::Signaled(signal)) => {
             (128_i32.saturating_add(*signal), None, Some(*signal))
         }
@@ -381,7 +383,7 @@ pub fn run_install(
     )
 }
 
-/// Run the arguments of `ctest --instrument`, with or without the leading flag.
+/// Run the arguments of an instrumentation wrapper, with or without the leading flag.
 ///
 /// The command runs in the current working directory. The build directory is
 /// used to find queries and outputs and to store the snippet.
@@ -391,6 +393,23 @@ pub fn run_install(
 ///
 /// Returns an error if command setup or execution fails before an exit code is available.
 pub fn run_launcher(host: &dyn Host, argv: &[BString]) -> Result<i32, InstrumentError> {
+    run_launcher_with_policy(host, argv, false)
+}
+
+/// Run the CTest instrumentation wrapper and report a signaled child as a failed test.
+///
+/// # Errors
+///
+/// Returns an error if command setup or execution fails before an exit code is available.
+pub fn run_ctest_launcher(host: &dyn Host, argv: &[BString]) -> Result<i32, InstrumentError> {
+    run_launcher_with_policy(host, argv, true)
+}
+
+fn run_launcher_with_policy(
+    host: &dyn Host,
+    argv: &[BString],
+    ctest: bool,
+) -> Result<i32, InstrumentError> {
     let mut args = argv.iter().peekable();
     if argv
         .first()
@@ -398,7 +417,10 @@ pub fn run_launcher(host: &dyn Host, argv: &[BString]) -> Result<i32, Instrument
     {
         args.next();
     }
-    let mut metadata = Metadata::default();
+    let mut metadata = Metadata {
+        ctest,
+        ..Metadata::default()
+    };
     let mut role = None;
     let mut build = None;
     while let Some(flag) = args.next() {

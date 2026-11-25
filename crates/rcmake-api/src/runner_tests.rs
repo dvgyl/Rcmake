@@ -318,3 +318,22 @@ set_property(CACHE CHOICE PROPERTY STRINGS first second)
     assert_eq!(choice.help, "Select an item");
     Ok(())
 }
+
+#[test]
+fn fatal_denial_in_preload_returns_one_process_request() -> Result<(), ApiError> {
+    let (host, request) = fixture(PROJECT)?;
+    host.seed_file(
+        &host.initial_cwd().join("src/PreLoad.cmake"),
+        b"execute_process(COMMAND skipped COMMAND_ERROR_IS_FATAL ANY)\n",
+    )?;
+    host.set_command_handler(|host, _, _| {
+        host.env_set(b"RAN_PROCESS", Some(b"YES"));
+        Ok(RunOutput::default())
+    })?;
+    assert!(matches!(
+        run_configure(request.process_policy(ProcessPolicy::Deny)),
+        Err(ApiError::DeniedProcess { commands }) if commands.len() == 1
+    ));
+    assert_eq!(host.env_get(b"RAN_PROCESS"), None);
+    Ok(())
+}

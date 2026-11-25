@@ -409,7 +409,7 @@ fn configure_checks_final_generated_contents() -> HostResult<()> {
         assert_eq!(seen, [false, true, false]);
     }
     let mut future_snapshot = snapshot.clone();
-    future_snapshot.schema = "configure.v3".into();
+    future_snapshot.schema = "configure.future".into();
     assert!(matches!(
         verify_configure(&host, &future_snapshot, &key, &context, unavailable),
         Err(ReplayMiss {

@@ -474,38 +474,85 @@ impl ProfileRecorder {
 
         let (trace, trace_omitted) =
             trace::render(&spans, host.system().pid, self.trace_limit, dropped);
-        let trace = Artifact::stage(host, &directory, "trace.json", &trace, trace_omitted)?;
         let (folded, folded_omitted) = graph.folded(FOLDED_BYTES, dropped);
-        let folded = Artifact::stage(
-            host,
-            &directory,
-            "stacks.folded",
-            folded.as_bytes(),
-            folded_omitted,
-        )?;
         let (html, html_omitted) = graph.html(HTML_BYTES, dropped);
-        let html = Artifact::stage(
-            host,
-            &directory,
-            "flamegraph.html",
-            html.as_bytes(),
-            html_omitted,
-        )?;
-
-        let artifacts = [trace, folded, html];
         let _lock = host.lock_file(
             &directory.join(".rcmake-profile.lock"),
             Some(Duration::from_secs(10)),
         )?;
-        for artifact in &artifacts {
-            artifact.check_destination()?;
+        let (mut staged, run_name) = StagedRun::reserve(host, &directory)?;
+        for (name, bytes, omitted) in [
+            ("trace.json", trace.as_slice(), trace_omitted),
+            ("stacks.folded", folded.as_bytes(), folded_omitted),
+            ("flamegraph.html", html.as_bytes(), html_omitted),
+        ] {
+            if omitted > 0 {
+                let message = format!("{name} omitted entries at the export limit ({omitted}).\n");
+                host.write_out(Stream::Stderr, message.as_bytes());
+            }
+            host.write(&staged.path.join(name), bytes, WriteMode::CreateNew)?;
         }
-        for artifact in artifacts {
-            artifact.publish()?;
-        }
-        let message = format!("Profile files: {}\n", terminal::display_path(&directory));
+        let run_directory = directory.join(&run_name);
+        host.rename(&staged.path, &run_directory)?;
+        staged.path = run_directory.clone();
+        let current = Artifact::stage(
+            host,
+            &directory,
+            "current",
+            format!("{run_name}\n").as_bytes(),
+        )?;
+        current.check_destination()?;
+        current.publish()?;
+        staged.path.clear();
+        let message = format!(
+            "Profile files: {}\n",
+            terminal::display_path(&run_directory)
+        );
         host.write_out(Stream::Stderr, message.as_bytes());
         Ok(())
+    }
+}
+
+struct StagedRun<'a> {
+    host: &'a dyn Host,
+    path: std::path::PathBuf,
+}
+
+impl<'a> StagedRun<'a> {
+    fn reserve(host: &'a dyn Host, directory: &Path) -> HostResult<(Self, String)> {
+        static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
+        let pid = host.system().pid;
+        let now = host.now();
+        for _ in 0..64 {
+            let serial = NEXT_RUN.fetch_add(1, AtomicOrdering::Relaxed);
+            let run = format!("run-{pid}-{}-{}-{serial}", now.secs, now.nanos);
+            let path = directory.join(format!(".{run}.tmp"));
+            if [path.clone(), directory.join(&run)]
+                .iter()
+                .try_fold(false, |exists, path| {
+                    match host.metadata(path, Follow::No) {
+                        Ok(_) => Ok(true),
+                        Err(error) if error.kind == ErrorKind::NotFound => Ok(exists),
+                        Err(error) => Err(error),
+                    }
+                })?
+            {
+                continue;
+            }
+            host.create_dir_all(&path)?;
+            return Ok((Self { host, path }, run));
+        }
+        Err(HostError::unsupported(
+            "Cannot allocate a profile run directory.",
+        ))
+    }
+}
+
+impl Drop for StagedRun<'_> {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = self.host.remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -516,17 +563,7 @@ struct Artifact<'a> {
 }
 
 impl<'a> Artifact<'a> {
-    fn stage(
-        host: &'a dyn Host,
-        directory: &Path,
-        name: &str,
-        bytes: &[u8],
-        omitted: usize,
-    ) -> HostResult<Self> {
-        if omitted > 0 {
-            let message = format!("{name} omitted entries at the export limit ({omitted}).\n");
-            host.write_out(Stream::Stderr, message.as_bytes());
-        }
+    fn stage(host: &'a dyn Host, directory: &Path, name: &str, bytes: &[u8]) -> HostResult<Self> {
         static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
         let pid = host.system().pid;
         let now = host.now();
@@ -778,6 +815,16 @@ mod tests {
 
     const RANGE: ReadRange = ReadRange::All { limit: 100_000 };
 
+    fn pinned_run(host: &dyn Host, directory: &Path) -> HostResult<std::path::PathBuf> {
+        let name = host.read(&directory.join("current"), RANGE)?;
+        let name = std::str::from_utf8(&name)
+            .ok()
+            .and_then(|name| name.strip_suffix('\n'))
+            .filter(|name| name.starts_with("run-") && !name.contains(['/', '\\']))
+            .ok_or_else(|| HostError::unsupported("Invalid profile run name."))?;
+        Ok(directory.join(name))
+    }
+
     fn sample(kind: ProfileKind, name: &[u8]) -> ProfileSample<'_> {
         ProfileSample {
             name,
@@ -812,6 +859,8 @@ mod tests {
         let b = host.initial_cwd().join("second");
         first.write(&host, &a, wall)?;
         second.write(&host, &b, wall)?;
+        let a = pinned_run(&host, &a)?;
+        let b = pinned_run(&host, &b)?;
         for name in ["trace.json", "stacks.folded", "flamegraph.html"] {
             assert_eq!(
                 host.read(&a.join(name), RANGE)?,
@@ -834,6 +883,29 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_can_keep_a_previous_profile_run() -> HostResult<()> {
+        let host = PureHost::default();
+        let recorder = ProfileRecorder::new();
+        let directory = host.initial_cwd().join("profile");
+        recorder.record(sample(ProfileKind::Builtin, b"first"));
+        recorder.write(&host, &directory, Duration::from_secs(4))?;
+        let first = pinned_run(&host, &directory)?;
+        let trace = host.read(&first.join("trace.json"), RANGE)?;
+
+        recorder.record(sample(ProfileKind::Builtin, b"second"));
+        recorder.write(&host, &directory, Duration::from_secs(4))?;
+        let second = pinned_run(&host, &directory)?;
+        assert_ne!(first, second);
+        assert_eq!(host.read(&first.join("trace.json"), RANGE)?, trace);
+        assert_ne!(host.read(&second.join("trace.json"), RANGE)?, trace);
+        for run in [first, second] {
+            assert!(!host.read(&run.join("stacks.folded"), RANGE)?.is_empty());
+            assert!(!host.read(&run.join("flamegraph.html"), RANGE)?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn keeps_call_counts_and_marks_recording_omissions() -> HostResult<()> {
         let host = PureHost::default();
         let recorder = ProfileRecorder::with_limits(1, 4096);
@@ -842,6 +914,7 @@ mod tests {
         recorder.record(entry);
         let directory = host.initial_cwd().join("limited");
         recorder.write(&host, &directory, Duration::from_secs(5))?;
+        let directory = pinned_run(&host, &directory)?;
         let trace = host.read(&directory.join("trace.json"), RANGE)?;
         assert!(
             matches!(parse(&trace, &ReadOptions::default()), Ok(Value::Array(events)) if events.len() == 2)
@@ -896,14 +969,15 @@ mod tests {
         recorder.record(sample(ProfileKind::Builtin, b"include"));
         recorder.record_phase(ProfilePhase::Eval, Duration::ZERO, Duration::from_secs(4));
         let directory = host.initial_cwd().join("profile");
-        host.create_dir_all(&directory.join("flamegraph.html"))?;
+        host.create_dir_all(&directory.join("current"))?;
         assert!(
             recorder
                 .write(&host, &directory, Duration::from_secs(4))
                 .is_err()
         );
-        assert!(host.read(&directory.join("trace.json"), RANGE).is_err());
-        assert!(host.read(&directory.join("stacks.folded"), RANGE).is_err());
+        assert!(host.read_dir(&directory)?.iter().all(|entry| {
+            matches!(entry.name.as_slice(), b"current" | b".rcmake-profile.lock")
+        }));
         let report = host.stream_bytes(Stream::Stderr);
         assert!(String::from_utf8_lossy(&report).contains("4.00 s of recorded wall time"));
         Ok(())

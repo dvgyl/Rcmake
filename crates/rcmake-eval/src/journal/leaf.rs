@@ -16,6 +16,9 @@ use super::{JournalEffect, PropertyOrigin, VariableScope};
 use crate::{Interp, Registry, code::Code};
 
 mod install;
+pub(crate) mod shape;
+
+pub(super) use install::earlier_install_property;
 
 pub(crate) const REPLAY_LINK_CHECK: &[u8] = b"\0rcmake-check-links";
 
@@ -109,22 +112,23 @@ impl Writes {
         let mut names = BTreeSet::new();
         for cmd in code.cmds.iter() {
             let name = cmd.lower.as_slice();
-            writes.record_variable_reads &=
-                matches!(
-                    name,
-                    b"add_library"
-                        | b"add_executable"
-                        | b"add_compile_definitions"
-                        | b"target_compile_definitions"
-                        | b"target_compile_options"
-                        | b"target_sources"
-                        | b"target_include_directories"
-                        | b"target_compile_features"
-                        | b"target_link_options"
-                        | b"target_link_libraries"
-                        | b"set_target_properties"
-                        | b"set_property"
-                ) && cmd.args.iter().all(|arg| !arg.text.contains(&b'$'));
+            writes.record_variable_reads &= matches!(
+                name,
+                b"add_library"
+                    | b"add_executable"
+                    | b"add_compile_definitions"
+                    | b"target_compile_definitions"
+                    | b"target_compile_options"
+                    | b"target_sources"
+                    | b"target_include_directories"
+                    | b"target_compile_features"
+                    | b"target_link_options"
+                    | b"target_link_libraries"
+                    | b"set_target_properties"
+                    | b"set_property"
+                    | b"install"
+            ) && (name != b"target_link_libraries"
+                || cmd.args.iter().all(|arg| !arg.text.contains(&b'$')));
             let flow = matches!(
                 name,
                 b"if" | b"elseif" | b"else" | b"endif" | b"foreach" | b"endforeach"
@@ -165,7 +169,11 @@ impl Writes {
                 {
                     writes.tests.push((*test).into());
                 }
-                (b"install", [b"TARGETS", target, ..]) if names.contains(target) => {
+                (b"install", args)
+                    if shape::install_targets(args).is_some_and(|targets| {
+                        targets.iter().all(|target| names.contains(target))
+                    }) =>
+                {
                     writes.installs = true;
                 }
                 (b"add_library", [alias, b"ALIAS", target])
@@ -205,25 +213,7 @@ impl Writes {
                     ],
                 )
                 | (b"add_executable", [target, sources @ ..])
-                    if plain_target(target)
-                        && sources.iter().all(|item| {
-                            !matches!(
-                                *item,
-                                b"ALIAS"
-                                    | b"IMPORTED"
-                                    | b"EXCLUDE_FROM_ALL"
-                                    | b"GLOBAL"
-                                    | b"WIN32"
-                                    | b"MACOSX_BUNDLE"
-                                    | b"STATIC"
-                                    | b"SHARED"
-                                    | b"MODULE"
-                                    | b"INTERFACE"
-                                    | b"OBJECT"
-                                    | b"UNKNOWN"
-                                    | b"SYMBOLIC"
-                            )
-                        }) =>
+                    if plain_target(target) && shape::ordinary_sources(sources) =>
                 {
                     if interp.project.find_target(dir, target).is_some()
                         || !names.insert(*target)
@@ -258,12 +248,7 @@ impl Writes {
                 {
                     writes.links = true;
                 }
-                (b"set_target_properties", args)
-                    if ordinary_properties(args, &names)
-                        && !cmd.args.iter().any(|arg| {
-                            arg.kind == ArgKind::Unquoted
-                                && arg.text.iter().any(|byte| matches!(byte, b'$' | b';'))
-                        }) => {}
+                (b"set_target_properties", args) if ordinary_properties(args, &names) => {}
                 (
                     b"set_property",
                     [
@@ -337,6 +322,9 @@ fn ordinary_properties(args: &[&[u8]], targets: &BTreeSet<&[u8]>) -> bool {
                     | b"CXX_STANDARD"
                     | b"POSITION_INDEPENDENT_CODE"
                     | b"DEBUG_POSTFIX"
+                    | b"PUBLIC_HEADER"
+                    | b"PRIVATE_HEADER"
+                    | b"RESOURCE"
             )
         })
 }
@@ -427,6 +415,15 @@ impl LocalState {
             {
                 return None;
             }
+        }
+        if install_start.is_some()
+            && writes.record_variable_reads
+            && !targets
+                .values()
+                .map(|target| target.name.as_slice())
+                .eq(writes.targets.iter().map(|(name, _)| name.as_slice()))
+        {
+            return None;
         }
         let installs = match install_start {
             Some((start, target_start)) => Some(install::Installs::capture(
@@ -521,6 +518,14 @@ impl LocalState {
             return false;
         };
         let rules = if let Some(installs) = &self.installs {
+            if writes.record_variable_reads
+                && !targets
+                    .iter()
+                    .map(|target| target.name.as_slice())
+                    .eq(writes.targets.iter().map(|(name, _)| name.as_slice()))
+            {
+                return false;
+            }
             let Some(rules) = installs.resolve(&interp.project, &targets, &bin, dir) else {
                 return false;
             };

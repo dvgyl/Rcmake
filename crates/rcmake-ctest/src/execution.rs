@@ -37,6 +37,7 @@ pub(crate) struct ResultLine {
     pub(crate) output: Vec<u8>,
     pub(crate) detail: Option<String>,
     pub(crate) exit_code: Option<i32>,
+    pub(crate) timeout_signal: Option<rcmake_host::TimeoutSignal>,
     pub(crate) skip_reason: Option<SkipReason>,
     pub(crate) regex_reason: Option<String>,
     pub(crate) snippet: Option<Box<std::path::PathBuf>>,
@@ -50,6 +51,7 @@ impl ResultLine {
             output: Vec::new(),
             detail: None,
             exit_code: None,
+            timeout_signal: None,
             skip_reason: None,
             regex_reason: None,
             snippet: None,
@@ -266,24 +268,37 @@ pub(crate) fn execute(
     test: &PlannedTest,
     request: &RunRequest,
     instrument: Option<&crate::instrumentation::Recorder<'_>>,
+    hard_limit: Option<Duration>,
 ) -> ResultLine {
     if test.command.program == "NOT_AVAILABLE" {
         return ResultLine::not_run("The test is unavailable in this configuration.");
     }
     let sample = instrument.map(crate::instrumentation::Recorder::start_test);
     let started = host.monotonic();
-    let run = if let Some(timeout) = test.timeout.graceful() {
-        host.run_with_timeout_signal(request, timeout, &mut |_, _| {})
-            .map(|output| (output, None))
+    let mut matched_at = None;
+    let mut matcher = test.timeout.matcher();
+    let graceful = test.timeout.graceful();
+    let run = if graceful.is_some() || matcher.is_some() {
+        host.run_controlled(request, graceful, hard_limit, &mut |stream, bytes| {
+            if matched_at.is_some() {
+                return None;
+            }
+            let delay = matcher.as_mut()?.update(stream, bytes)?;
+            matched_at = Some(host.monotonic());
+            Some(delay)
+        })
+        .map(|outcome| (outcome.output, None, outcome.timeout_signal))
     } else if let Some(instrument) = instrument {
-        instrument.run_test(request)
+        instrument
+            .run_test(request)
+            .map(|(output, metrics)| (output, metrics, None))
     } else {
         host.run(request, &mut |_, _| {})
-            .map(|output| (output, None))
+            .map(|output| (output, None, None))
     };
     let elapsed = host.monotonic().saturating_sub(started);
     let mut result = match run {
-        Ok((run, metrics)) => {
+        Ok((run, metrics, timeout_signal)) => {
             let snippet = instrument.zip(sample).and_then(|(instrument, sample)| {
                 instrument.test(test, request, (&run, metrics), sample, elapsed)
             });
@@ -303,12 +318,14 @@ pub(crate) fn execute(
                 None => ResultLine::not_run("The host returned no process status."),
             };
             result.output = output;
+            result.timeout_signal = timeout_signal;
             result.snippet = snippet.map(Box::new);
             result
         }
         Err(error) => ResultLine::not_run(error.to_string()),
     };
-    result.elapsed = elapsed;
+    result.elapsed =
+        elapsed.saturating_sub(matched_at.map_or(Duration::ZERO, |at| at.saturating_sub(started)));
     result
 }
 

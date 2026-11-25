@@ -16,7 +16,9 @@ mod lookahead;
 pub(crate) mod platform_queries;
 #[cfg(all(feature = "native", any(unix, windows)))]
 mod probe_pool;
+mod selection_change;
 mod session;
+pub use selection_change::ConfigureSelection;
 pub use session::ConfigureRuntime;
 #[cfg(test)]
 mod tests;

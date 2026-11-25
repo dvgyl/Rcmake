@@ -49,13 +49,24 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 let policy = PolicyId::new(76);
                 let status = cx.policy(policy);
                 let items = || items.iter().map(bytes).filter(|item| !item.is_empty());
-                let needs_conversion = different_dir || scope != UsageScope::Private;
-                if needs_conversion
-                    && status == PolicyStatus::Warn
-                    && items()
-                        .any(|item| !item.starts_with(b"$<") && !Lexical::new(item).absolute())
+                if status == PolicyStatus::Warn
+                    && (different_dir || scope != UsageScope::Private)
+                    && items().any(relative_source)
                 {
-                    cx.issue_policy_warning(policy, b"", b"");
+                    if different_dir && scope != UsageScope::Interface {
+                        let message = format!(
+                            "A private source from a directory other than that of target \"{}\" has a relative path.",
+                            name.value
+                        );
+                        cx.issue_policy_warning(policy, b"", message.as_bytes());
+                    }
+                    if scope != UsageScope::Private {
+                        let message = format!(
+                            "An interface source of target \"{}\" has a relative path.",
+                            name.value
+                        );
+                        cx.issue_policy_warning(policy, b"", message.as_bytes());
+                    }
                 }
                 let target = cx
                     .project()
@@ -64,7 +75,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 usage::validate_scope(target, scope, true)?;
                 let value = |convert| {
                     list::join(items().map(|item| {
-                        if convert && status == PolicyStatus::New {
+                        if convert && status == PolicyStatus::New && relative_source(item) {
                             absolute(item, &dir)
                         } else {
                             BString::from(item)
@@ -92,6 +103,10 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     }
     crate::dirs::source_groups::apply_to_target(cx, id)?;
     Ok(Flow::Normal)
+}
+
+fn relative_source(item: &[u8]) -> bool {
+    !item.starts_with(b"$<") && !Lexical::new(item).absolute()
 }
 
 #[derive(Default)]
