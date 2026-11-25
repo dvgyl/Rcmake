@@ -129,7 +129,7 @@ No single test suite catches every class of incompatibility. We stacked seven ve
 
 CMake's upstream `Tests/RunCMake` suite tests regressions that CMake developers expect to break in CMake. It rarely tests things CMake itself never got wrong, such as whether an installed macOS binary actually runs with `@rpath` load commands or whether `cpack` archive listings match byte structure across generators.
 
-We wrote 20 independent black-box scenarios (`tools/measure/independent_verify.py` and `tools/measure/independent_scenarios_extra.py`) covering 679 checks across C, C++, Objective-C++, Fortran, presets, multi-generator builds, install trees, Mach-O and ELF runtime paths, archive listings, and File API replies. A scenario passes only when all explicit checks pass for both binaries and all normalized observations match. Running the suite with `--oracle-only` first proves every assertion holds on CMake 4.5.1 itself.
+We wrote 20 independent black-box scenarios (`tools/measure/independent_verify.py` and `tools/measure/verify/`) covering 679 checks across C, C++, Objective-C++, Fortran, presets, multi-generator builds, install trees, Mach-O and ELF runtime paths, archive listings, and File API replies. A scenario passes only when all explicit checks pass for both binaries and all normalized observations match. Running the suite with `--oracle-only` first proves every assertion holds on CMake 4.5.1 itself.
 
 ### Large-project corpus and sealed unseen holdout
 
@@ -139,7 +139,7 @@ Separately, a 240-repository unseen holdout manifest lives in the repository and
 
 ### Documented normalizers only
 
-Differential comparison needs narrow normalizers for machine paths, timestamps, and intentional differences, and every normalizer risks hiding a bug. Each normalizer in `tools/corpus/normalize.py` and `tools/measure/independent_scenarios_extra.py` carries a written rationale checked against CMake 4.5.1 (see commits `f28b50e` and `fb13e49`):
+Differential comparison needs narrow normalizers for machine paths, timestamps, and intentional differences, and every normalizer risks hiding a bug. Each normalizer in `tools/corpus/normalize.py` and `tools/measure/verify/` carries a written rationale checked against CMake 4.5.1 (see commits `f28b50e` and `fb13e49`):
 
 - `tar tvf` owner and group columns are masked because `rcmake` intentionally writes uid 0 and gid 0 for reproducible archives.
 - `OPENCV_TIMESTAMP` holds wall-clock configure time, so only its value is masked.
