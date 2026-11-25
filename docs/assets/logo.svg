@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Rcmake logo">
-  <title>Rcmake</title>
-  <!-- Left facet: Rust vermilion -->
-  <path d="M61.5 14 L14 98 L51.5 76.5 L51.5 57.5 L61.5 51.7 Z" fill="#DF572E"/>
-  <!-- Right facet: Steel blue -->
-  <path d="M66.5 14 L114 98 L76.5 76.5 L76.5 57.5 L66.5 51.7 Z" fill="#498AF5"/>
-  <!-- Base facet: Brushed slate -->
-  <path d="M18.5 103 L54 82.5 L64 88.3 L74 82.5 L109.5 103 L106.5 107 L21.5 107 Z" fill="#47505E"/>
-</svg>
