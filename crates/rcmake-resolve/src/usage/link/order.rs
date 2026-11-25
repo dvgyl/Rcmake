@@ -852,7 +852,10 @@ fn deduplicate(
     let mut all = false;
     let mut shared = true;
     let mut forward = false;
+    // A static library has no link step, so CMake does not read the
+    // processing options for it.
     if policy(156)
+        && target.kind != TargetKind::StaticLibrary
         && let Some(language) = language
     {
         let variable = format!("CMAKE_{language}_LINK_LIBRARIES_PROCESSING");
