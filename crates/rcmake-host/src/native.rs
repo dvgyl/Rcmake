@@ -189,6 +189,12 @@ impl Host for NativeHost {
         Ok(Box::new(file))
     }
 
+    fn scratch_file_in(&self, dir: &Path) -> HostResult<Box<dyn crate::ScratchFile + '_>> {
+        require_absolute(dir)?;
+        let file = io_at(tempfile::tempfile_in(dir), dir)?;
+        Ok(Box::new(file))
+    }
+
     fn write_from(
         &self,
         p: &Path,

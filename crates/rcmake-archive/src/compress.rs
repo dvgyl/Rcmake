@@ -186,7 +186,7 @@ impl<R: Read> Decoder<R> {
                 return Ok(false);
             };
             if self.block_mode && code == CLEAR {
-                if self.previous.is_none() || self.group.len() != self.width {
+                if self.previous.is_none() || self.len != self.width {
                     return Err(invalid_stream());
                 }
                 self.len = 0;
@@ -241,4 +241,35 @@ impl<R: Read> Read for Decoder<R> {
 
 fn invalid_stream() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "Invalid Unix compress stream")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_clear_at_twelve_bits() -> io::Result<()> {
+        let mut stream = Encoder::new();
+        stream.bytes = vec![0x1f, 0x9d, 0x8c];
+        for width in START_WIDTH..12 {
+            stream.width = width;
+            for _ in 0..1 << (width - 1) {
+                stream.emit(u16::from(b'A'));
+            }
+            stream.align();
+        }
+        stream.width = 12;
+        stream.emit(u16::from(b'A'));
+        stream.emit(CLEAR);
+        stream.align();
+        stream.width = START_WIDTH;
+        stream.emit(u16::from(b'B'));
+
+        let mut decoded = Vec::new();
+        Decoder::new(stream.finish().as_slice())?.read_to_end(&mut decoded)?;
+        let mut expected = vec![b'A'; 256 + 512 + 1024 + 1];
+        expected.push(b'B');
+        assert_eq!(decoded, expected);
+        Ok(())
+    }
 }

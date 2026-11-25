@@ -13,21 +13,24 @@ pub(crate) fn open(
     len: u64,
     limit: u64,
 ) -> Result<Directory, ArchiveError> {
-    let mut end = len;
+    let start = len.saturating_sub(END_RECORD_SIZE as u64 + u64::from(u16::MAX));
+    input.seek(SeekFrom::Start(start)).map_err(archive_error)?;
+    let mut tail = vec![0; (len - start) as usize];
+    input.read_exact(&mut tail).map_err(archive_error)?;
     let mut selected = None;
     let mut error = None;
-    while let Some(position) = magic(input, 0, end, END, true)? {
-        end = position + 3;
+    for (offset, record) in tail.windows(END_RECORD_SIZE).enumerate().rev() {
+        let position = start + offset as u64;
         if selected.as_ref().is_some_and(|(selected, _)| {
             position + END_RECORD_SIZE as u64 + u64::from(u16::MAX) <= *selected
         }) {
             break;
         }
-        let Ok(fields) = read_at::<18>(input, position + 4) else {
+        let Some(fields) = record.strip_prefix(END) else {
             continue;
         };
         let comment_start = position + END_RECORD_SIZE as u64;
-        let comment_end = comment_start + u64::from(word(&fields, 16)?);
+        let comment_end = comment_start + u64::from(word(fields, 16)?);
         if comment_end > len
             || selected
                 .as_ref()
@@ -35,7 +38,7 @@ pub(crate) fn open(
         {
             continue;
         }
-        match directory(input, position, &fields, limit) {
+        match directory(input, position, fields, limit) {
             Ok(directory) => selected = Some((position, directory)),
             Err(failure) => {
                 error.get_or_insert(failure);
@@ -123,7 +126,7 @@ fn zip32(input: &mut dyn ReadSeek, footer: u64, fields: &[u8]) -> Result<Layout,
     let start = if count == 0 && size == 0 {
         footer
     } else {
-        magic(input, relative, end + 4, CENTRAL, false)?.ok_or_else(invalid_header)?
+        magic(input, relative, end + 4, CENTRAL)?.ok_or_else(invalid_header)?
     };
     Ok(Layout {
         start,
@@ -140,7 +143,7 @@ fn zip64(input: &mut dyn ReadSeek, locator: u64, fields: &[u8]) -> Result<Layout
         return Err(invalid_header());
     }
     let mut start = relative;
-    while let Some(position) = magic(input, start, locator, ZIP64_END, false)? {
+    while let Some(position) = magic(input, start, locator, ZIP64_END)? {
         start = position + 1;
         if position + 56 > locator {
             break;
@@ -188,31 +191,38 @@ pub(super) fn read_at<const N: usize>(
 fn magic(
     input: &mut dyn ReadSeek,
     mut start: u64,
-    mut end: u64,
+    end: u64,
     signature: &[u8; 4],
-    reverse: bool,
 ) -> Result<Option<u64>, ArchiveError> {
     let mut bytes = vec![0; 64 * 1024];
     while end.saturating_sub(start) >= 4 {
         let len = (end - start).min(bytes.len() as u64) as usize;
-        let offset = if reverse { end - len as u64 } else { start };
-        input.seek(SeekFrom::Start(offset)).map_err(archive_error)?;
+        input.seek(SeekFrom::Start(start)).map_err(archive_error)?;
         let chunk = bytes.get_mut(..len).ok_or_else(invalid_header)?;
         input.read_exact(chunk).map_err(archive_error)?;
-        let mut windows = chunk.windows(4);
-        let hit = if reverse {
-            windows.rposition(|window| window == signature)
-        } else {
-            windows.position(|window| window == signature)
-        };
-        if let Some(hit) = hit {
-            return Ok(Some(offset + hit as u64));
+        if let Some(hit) = chunk.windows(4).position(|window| window == signature) {
+            return Ok(Some(start + hit as u64));
         }
-        if reverse {
-            end = offset + 3;
-        } else {
-            start = offset + len as u64 - 3;
-        }
+        start += len as u64 - 3;
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn end_record_search_stays_within_the_maximum_comment_length() {
+        let mut zip = END.to_vec();
+        zip.resize(END_RECORD_SIZE - 2, 0);
+        zip.extend(u16::MAX.to_le_bytes());
+        zip.resize(END_RECORD_SIZE + usize::from(u16::MAX), 0);
+        assert!(open(&mut Cursor::new(&zip), zip.len() as u64, 0).is_ok());
+        zip.push(0);
+        let mut input = Cursor::new(&zip);
+        assert!(open(&mut input, zip.len() as u64, 0).is_err());
+    }
 }

@@ -466,6 +466,12 @@ pub trait Host: Send + Sync {
         Ok(stream::scratch())
     }
 
+    /// Create an anonymous temporary file on the filesystem that contains `dir`.
+    /// In-memory hosts can use their default scratch storage.
+    fn scratch_file_in(&self, _dir: &Path) -> HostResult<Box<dyn ScratchFile + '_>> {
+        self.scratch_file()
+    }
+
     /// Write exactly `len` bytes from a stream.
     fn write_from(
         &self,

@@ -608,3 +608,37 @@ fn dashboard_start_runs_checkout_before_source_validation() -> Result<(), Box<dy
     );
     Ok(())
 }
+
+#[test]
+fn dashboard_start_reports_failed_checkout_on_stderr() -> Result<(), Box<dyn Error>> {
+    let host = Arc::new(PureHost::default());
+    host.seed_file(
+        Path::new("/work/dashboard.cmake"),
+        br#"
+        set(CTEST_SOURCE_DIRECTORY "/work/checkout/src")
+        set(CTEST_BINARY_DIRECTORY "/work/build")
+        set(CTEST_CHECKOUT_COMMAND checkout)
+        ctest_start(Experimental QUIET)
+        "#,
+    )?;
+    host.set_command_handler(|_, _, _| {
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(1)],
+            stdout: Vec::new(),
+            stderr: b"checkout output\n".to_vec(),
+        })
+    })?;
+    assert_ne!(invoke(host.clone(), &["-S", "dashboard.cmake"]), 0);
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(stderr.starts_with("Initial checkout failed!\n"), "{stderr}");
+    assert!(stderr.contains("ctest_start unknown error."), "{stderr}");
+    let log = host.read(
+        Path::new("/work/build/Testing/Temporary/LastStart.log"),
+        ReadRange::All { limit: 4096 },
+    )?;
+    assert_eq!(
+        std::str::from_utf8(&log)?,
+        "--- Begin Initial Checkout ---\ncheckout\nco-err> checkout output\n--- End Initial Checkout ---\n"
+    );
+    Ok(())
+}

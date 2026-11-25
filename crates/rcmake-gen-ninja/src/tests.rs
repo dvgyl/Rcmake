@@ -233,6 +233,122 @@ fn custom_command_orders_after_a_target_without_a_file() {
 }
 
 #[test]
+fn unity_source_command_omits_the_target_that_needs_its_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let targets = vec![
+        GraphTarget {
+            name: "app".into(),
+            depends: vec![1],
+            ..GraphTarget::default()
+        },
+        GraphTarget {
+            name: "unity_prerequisites".into(),
+            steps: vec![0],
+            ..GraphTarget::default()
+        },
+    ];
+    assert_eq!(
+        custom_command_build_edge(targets, 1, &[0])?,
+        "build generated | /work/build/generated: CUSTOM_COMMAND"
+    );
+    Ok(())
+}
+
+#[test]
+fn shared_custom_command_keeps_prerequisites_of_an_owner() -> Result<(), Box<dyn std::error::Error>>
+{
+    let targets = vec![
+        GraphTarget {
+            name: "prepare".into(),
+            ..GraphTarget::default()
+        },
+        GraphTarget {
+            name: "producer".into(),
+            steps: vec![0],
+            depends: vec![0],
+            ..GraphTarget::default()
+        },
+        GraphTarget {
+            name: "consumer".into(),
+            steps: vec![0],
+            depends: vec![1],
+            ..GraphTarget::default()
+        },
+    ];
+    assert_eq!(
+        custom_command_build_edge(targets, 3, &[1, 2])?,
+        "build generated | /work/build/generated: CUSTOM_COMMAND || prepare"
+    );
+    Ok(())
+}
+
+fn custom_command_build_edge(
+    targets: Vec<GraphTarget>,
+    project_targets: usize,
+    owners: &[usize],
+) -> Result<String, Box<dyn std::error::Error>> {
+    use rcmake_model::{
+        CustomCommand, CustomCommandKind, DirId, ProjectModel, Target, TargetKind, TargetOrigin,
+    };
+
+    let mut model = ProjectModel::default();
+    let command = model.add_command(CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::Output,
+        Default::default(),
+        Default::default(),
+    ))?;
+    let target_ids = targets
+        .iter()
+        .take(project_targets)
+        .map(|target| {
+            model.add_target(Target::new(
+                target.name.clone(),
+                TargetKind::Utility,
+                TargetOrigin::Normal,
+                DirId::ROOT,
+                Default::default(),
+                Default::default(),
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let owners = rcmake_resolve::CustomOutputOwners {
+        command,
+        targets: owners
+            .iter()
+            .map(|&owner| target_ids.get(owner).copied())
+            .collect::<Option<_>>()
+            .ok_or("Missing the command owner")?,
+        explicit_only: false,
+        shared_output: false,
+    };
+    let result = GenerationResult {
+        graphs: vec![BuildGraph {
+            steps: vec![BuildStep::Custom(CustomStep {
+                outputs: vec!["generated".into()],
+                invocations: vec![Invocation {
+                    argv: vec!["touch".into(), "generated".into()],
+                    ..Invocation::default()
+                }],
+                ..CustomStep::default()
+            })],
+            custom_output_owners: [(0, owners)].into_iter().collect(),
+            target_ids,
+            targets,
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    let host = PureHost::default();
+    generate_single_config(&result, &host, Path::new("/work/build"))?;
+    read(&host, "build.ninja")
+        .lines()
+        .find(|line| line.starts_with("build generated "))
+        .map(str::to_owned)
+        .ok_or_else(|| "Missing the generated file build edge".into())
+}
+
+#[test]
 fn continues_ninja_lines_and_keeps_escaped_values() {
     let mut ninja = Ninja::default();
     ninja.0.extend_from_slice(b"ninja_pipe = |\n");

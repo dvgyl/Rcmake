@@ -82,7 +82,7 @@ pub(super) fn run_with_output_limit(
         .ok_or_else(|| ArchiveError::new("Invalid archive prefix length"))?;
     source.read_exact(prefix).map_err(archive_error)?;
     source.seek(SeekFrom::Start(0)).map_err(archive_error)?;
-    let mut staged = Stage::new(host);
+    let mut staged = Stage::new(host, &options.destination);
     let mut scan = Scan {
         excludes: Patterns::new(&options.excludes)?,
         patterns: Patterns::new(&options.patterns)?,

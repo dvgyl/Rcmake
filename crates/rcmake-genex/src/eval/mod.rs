@@ -34,7 +34,7 @@ pub fn evaluate(
     Ok((value, evaluator.flags))
 }
 
-/// Evaluate an expression and record successful named target lookups in evaluated branches.
+/// Evaluate an expression and record named targets seen by property and artifact nodes.
 pub fn evaluate_with_target_lookups(
     ast: &GenexAst,
     ctx: &EvalContext,
@@ -181,12 +181,6 @@ impl<'a> Evaluator<'a> {
             emitted_link_feature: false,
             active_rules: Vec::new(),
         }
-    }
-
-    fn named_target(&mut self, name: &[u8], ctx: &EvalContext) -> Option<TargetHandle> {
-        let target = self.host.find_target_in_context(name, ctx)?;
-        self.record_lookup(name, target);
-        Some(target)
     }
 
     fn record_lookup(&mut self, name: &[u8], target: TargetHandle) {

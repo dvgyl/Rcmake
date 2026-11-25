@@ -182,7 +182,7 @@ impl Evaluator<'_> {
                     )));
                 }
                 self.flags.context_sensitive = true;
-                let exists = self.named_target(&name, call.ctx).is_some();
+                let exists = self.host.find_target_in_context(&name, call.ctx).is_some();
                 if call.name == b"TARGET_EXISTS" {
                     return Ok(boolean(exists));
                 }
@@ -198,6 +198,7 @@ impl Evaluator<'_> {
                     return Err(call.error("Target name not supported."));
                 }
                 let target = self.require_target(call, &name)?;
+                self.record_lookup(&name, target);
                 self.host.target_intermediate_directory(target, &call.ctx.config).ok_or_else(|| {
                     call.error("The evaluation of the TARGET_INTERMEDIATE_DIR generator expression is only suitable for consumption by CMake (limited under Xcode with multiple architectures).  It is not suitable for writing out elsewhere.")
                 })
@@ -212,18 +213,22 @@ impl Evaluator<'_> {
         name: &[u8],
     ) -> Result<TargetHandle, GenexError> {
         self.flags.context_sensitive = true;
-        self.named_target(name, call.ctx).ok_or_else(|| {
-            let name = BString::from(name);
-            call.error(match call.name {
-                b"TARGET_PROPERTY" | b"TARGET_INTERMEDIATE_DIR" => {
-                    format!("Target \"{name}\" not found.")
-                }
-                b"TARGET_OBJECTS" | b"TARGET_RUNTIME_DLLS" | b"TARGET_RUNTIME_DLL_DIRS" => {
-                    format!("Objects of target \"{name}\" referenced but no such target exists.")
-                }
-                _ => format!("No target \"{name}\""),
+        self.host
+            .find_target_in_context(name, call.ctx)
+            .ok_or_else(|| {
+                let name = BString::from(name);
+                call.error(match call.name {
+                    b"TARGET_PROPERTY" | b"TARGET_INTERMEDIATE_DIR" => {
+                        format!("Target \"{name}\" not found.")
+                    }
+                    b"TARGET_OBJECTS" | b"TARGET_RUNTIME_DLLS" | b"TARGET_RUNTIME_DLL_DIRS" => {
+                        format!(
+                            "Objects of target \"{name}\" referenced but no such target exists."
+                        )
+                    }
+                    _ => format!("No target \"{name}\""),
+                })
             })
-        })
     }
 
     fn policy(&mut self, call: Call<'_>) -> Value {
@@ -341,6 +346,7 @@ impl Evaluator<'_> {
             return Err(call.error("Expression syntax not recognized."));
         }
         let target = self.require_target(call, name)?;
+        self.record_lookup(name, target);
         let target_type = self.host.raw_property(target, b"TYPE");
         let target_type = target_type.as_ref().map(|kind| kind.as_slice());
         let diagnostic_operator = artifact_diagnostic_operator(call.name, kind, part);

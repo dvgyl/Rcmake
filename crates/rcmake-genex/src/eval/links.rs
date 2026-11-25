@@ -156,7 +156,7 @@ impl Evaluator<'_> {
             } else if only_targets
                 && (in_library || in_group)
                 && possible_target_name(name)
-                && self.named_target(name, ctx).is_none()
+                && self.host.find_target_in_context(name, ctx).is_none()
             {
                 return Err(not_a_target(
                     self.host.target_name(owner),

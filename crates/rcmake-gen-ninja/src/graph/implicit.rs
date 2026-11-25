@@ -97,11 +97,13 @@ impl Graph<'_> {
     }
 
     fn owns_command(&self, index: usize, command: CommandId) -> bool {
-        self.input.target_ids.get(index).is_some_and(|id| {
-            self.input
-                .custom_output_owners
-                .values()
-                .any(|owners| owners.command == command && owners.targets.contains(id))
+        self.input.targets.get(index).is_some_and(|target| {
+            target.steps.iter().any(|step| {
+                self.input
+                    .custom_output_owners
+                    .get(step)
+                    .is_some_and(|owners| owners.command == command)
+            })
         })
     }
 
@@ -142,8 +144,9 @@ impl Graph<'_> {
                     let graph = if file_config { file_graph } else { self };
                     if !graph.reaches_command(dependency, command) {
                         nodes.extend(graph.concrete_node(dependency));
-                        pending.push((file_config, dependency));
                     }
+                    // A target that needs this command can have prerequisites of its own.
+                    pending.push((file_config, dependency));
                 }
             };
             let command_targets: Vec<_> = target

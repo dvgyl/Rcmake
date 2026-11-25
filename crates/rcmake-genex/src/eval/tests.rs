@@ -207,6 +207,29 @@ fn run(
     evaluate(&parse(input)?, ctx, host)
 }
 
+#[test]
+fn target_lookup_tracking_records_property_and_artifact_references() -> Result<(), GenexError> {
+    let mut host = Host::default();
+    host.set(OTHER, "TYPE", "SHARED_LIBRARY");
+    host.set(OTHER, "VALUE", "property");
+    let ast = parse(
+        concat!(
+            "$<TARGET_EXISTS:left>;",
+            "$<TARGET_NAME_IF_EXISTS:right>;",
+            "$<TARGET_GENEX_EVAL:head,literal>;",
+            "$<TARGET_PROPERTY:other,VALUE>;",
+            "$<TARGET_FILE:alias>"
+        )
+        .as_bytes(),
+    )?;
+    let mut lookups = Vec::new();
+    let (value, _) =
+        crate::evaluate_with_target_lookups(&ast, &context(), &mut host, &mut lookups)?;
+    assert_eq!(value, "1;right;literal;property;/out/libother_d.so");
+    assert_eq!(lookups, [("other".into(), OTHER), ("alias".into(), OTHER)]);
+    Ok(())
+}
+
 fn error_text(result: Result<(BString, EvalFlags), GenexError>) -> String {
     assert!(result.is_err(), "Expected an error. Got {result:?}.");
     result

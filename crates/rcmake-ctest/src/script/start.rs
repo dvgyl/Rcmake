@@ -147,27 +147,30 @@ fn checkout(cx: &mut Cx<'_>, source: &Path, log: &Path) -> Result<(), CmdError> 
     else {
         return Ok(());
     };
+    let cwd = source.parent().unwrap_or(source);
+    if cx.host().create_dir_all(cwd).is_err() {
+        cx.host().write_out(
+            Stream::Stderr,
+            format!("Cannot create directory: {}\n", cwd.display()).as_bytes(),
+        );
+        return Err(error("unknown error."));
+    }
     let mut record = BString::from("--- Begin Initial Checkout ---\n");
     record.extend_from_slice(&command);
     record.push(b'\n');
-    let result = (|| {
-        let argv = split_command(cx, &command)?;
-        let (program, args) = argv
-            .split_first()
-            .ok_or_else(|| error("Initial checkout failed!"))?;
-        let cwd = source.parent().unwrap_or(source);
+    let argv = split_command(cx, &command)?;
+    let succeeded = argv.split_first().is_some_and(|(program, args)| {
         let host = cx.host();
-        host.create_dir_all(cwd)
-            .map_err(|err| error(err.to_string()))?;
-        let output = run_process(
+        let Ok(output) = run_process(
             host,
             cwd.to_owned(),
             program.clone(),
             args.to_vec(),
             host.env_all(),
             false,
-        )
-        .map_err(|err| error(err.to_string()))?;
+        ) else {
+            return false;
+        };
         for (prefix, bytes) in [(b"co-out> ", &output.stdout), (b"co-err> ", &output.stderr)] {
             for line in bytes.split_inclusive(|&byte| byte == b'\n') {
                 record.extend_from_slice(prefix);
@@ -177,20 +180,19 @@ fn checkout(cx: &mut Cx<'_>, source: &Path, log: &Path) -> Result<(), CmdError> 
                 }
             }
         }
-        if process_code(&output) != Some(0) {
-            return Err(error("Initial checkout failed!"));
-        }
-        Ok(())
-    })();
-    if let Err(CmdError::Status(message)) = &result {
-        record.extend_from_slice(message);
-        record.push(b'\n');
-    }
+        process_code(&output) == Some(0)
+    });
     record.extend_from_slice(b"--- End Initial Checkout ---\n");
     cx.host()
         .write(log, &record, WriteMode::Truncate)
         .map_err(|err| error(err.to_string()))?;
-    result
+    if succeeded {
+        Ok(())
+    } else {
+        cx.host()
+            .write_out(Stream::Stderr, b"Initial checkout failed!\n");
+        Err(error("unknown error."))
+    }
 }
 
 struct StartArgs<'a> {

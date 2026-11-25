@@ -66,6 +66,7 @@ impl Evaluator<'_> {
                     return Err(call.error(message));
                 }
                 let target = self.require_target(call, name)?;
+                self.record_lookup(name, target);
                 if let Some(value) = self.host.alias_property(name, property, call.ctx) {
                     return Ok(value);
                 }
@@ -315,7 +316,8 @@ impl Evaluator<'_> {
         if name.is_empty() {
             return Err(call.error("No value provided for the TARGET: option."));
         }
-        self.named_target(name, call.ctx)
+        self.host
+            .find_target_in_context(name, call.ctx)
             .ok_or_else(|| call.error(format!("Non-existent target: {}", BString::from(name))))
     }
 }

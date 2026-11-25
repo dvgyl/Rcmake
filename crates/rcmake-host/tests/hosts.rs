@@ -20,6 +20,29 @@ fn native_conformance() {
     conformance::run_all(&host, temp.path());
 }
 
+#[test]
+fn native_scratch_file_uses_the_requested_directory_without_leaving_a_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Seek, Write};
+
+    let host = rcmake_host::MemoHost::new(rcmake_host::NoProcessHost::new(NativeHost::new()?));
+    let directory = tempfile::tempdir()?;
+    let missing = directory.path().join("missing");
+    assert!(host.scratch_file_in(&missing).is_err());
+    {
+        let mut scratch = host.scratch_file_in(directory.path())?;
+        scratch.write_all(b"archive payload")?;
+        scratch.rewind()?;
+        let mut payload = Vec::new();
+        scratch.read_to_end(&mut payload)?;
+        assert_eq!(payload, b"archive payload");
+        #[cfg(unix)]
+        assert!(host.read_dir(directory.path())?.is_empty());
+    }
+    assert!(host.read_dir(directory.path())?.is_empty());
+    Ok(())
+}
+
 #[cfg(windows)]
 #[test]
 fn native_windows_system_values_and_path_validation() {
