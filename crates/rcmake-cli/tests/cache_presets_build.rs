@@ -1,5 +1,5 @@
-//! Wave 6 supplement regressions for cache edits, presets, `--build`,
-//! `--install`, and `--fresh`. Each test drives the CLI on an in-memory host.
+//! CLI tests for cache edits, presets, `--build`, `--install`, and `--fresh`.
+//! Each test drives the CLI on an in-memory host.
 
 #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 

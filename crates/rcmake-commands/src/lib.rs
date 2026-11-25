@@ -1,5 +1,4 @@
-//! Built-in CMake 4.5.1 command families organized into disjoint submodules so parallel
-//! workers can implement command families concurrently without merge conflicts.
+//! Built-in CMake 4.5.1 commands, grouped by command family.
 
 #![forbid(unsafe_code)]
 

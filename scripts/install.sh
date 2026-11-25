@@ -61,7 +61,7 @@ case "$mode" in
       Darwin:arm64) target=aarch64-apple-darwin ;;
       *) printf 'No release tarball for this host. Use --from-source on Linux or macOS.\n' >&2; exit 1 ;;
     esac
-    releases=https://github.com/dvgyl/Rcmake/releases
+    releases=https://github.com/dvgyl/rcmake/releases
     checksum="$work/SHA256SUMS.txt"
     curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 \
       "$releases/latest/download/SHA256SUMS.txt" -o "$checksum"

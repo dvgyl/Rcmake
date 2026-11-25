@@ -975,4 +975,4 @@ set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
     );
 }
 
-mod wave6_staging;
+mod staging;

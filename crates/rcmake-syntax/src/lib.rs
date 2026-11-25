@@ -1,6 +1,6 @@
 //! Byte-preserving lexer and parser for CMake 4.5.1 listfiles.
 //!
-//! Public contracts are locked in Milestone 0 (ADR-005):
+//! Contracts (ADR-005):
 //! - Preserves raw bytes (stripping a leading UTF-8 BOM, rejecting UTF-16/UTF-32 BOM,
 //!   converting CRLF to LF for file inputs, preserving lone CR inside quoted/bracket args).
 //! - Produces a flat list of [`CommandInvocation`]s with original-case command names,

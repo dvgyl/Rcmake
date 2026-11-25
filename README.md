@@ -2,37 +2,37 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/brand/rcmake-wordmark-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="assets/brand/rcmake-wordmark-light.svg">
-    <img alt="Rcmake" src="assets/brand/rcmake-wordmark-light.svg" width="360">
+    <img alt="rcmake" src="assets/brand/rcmake-wordmark-light.svg" width="360">
   </picture>
 </p>
 
 <p align="center">
-  <a href="https://dvgyl.github.io/Rcmake/">Website</a> ·
-  <a href="https://dvgyl.github.io/Rcmake/playground.html">Playground</a> ·
-  <a href="https://dvgyl.github.io/Rcmake/dashboard.html">Compatibility</a> ·
+  <a href="https://dvgyl.github.io/rcmake/">Website</a> ·
+  <a href="https://dvgyl.github.io/rcmake/playground.html">Playground</a> ·
+  <a href="https://dvgyl.github.io/rcmake/dashboard.html">Compatibility</a> ·
   <a href="docs/ARCHITECTURE.md">Architecture</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
-# Rcmake
+# rcmake
 
-Rcmake is a clean-room replacement for CMake 4.5.1, written in safe Rust. One
+rcmake is a clean-room replacement for CMake 4.5.1, written in safe Rust. One
 binary provides `cmake`, `ctest`, and `cpack`. It reads the same
 `CMakeLists.txt` files, presets, and cache files as CMake 4.5.1, and writes
 compatible build trees. An optional language server, `rcmake-lsp`, provides
 editor support for CMake files.
 
-The Rust engine is licensed under `MIT OR Apache-2.0`. Rcmake bundles the
+The Rust engine is licensed under `MIT OR Apache-2.0`. rcmake bundles the
 CMake 4.5.1 `Modules/` and `Templates/` directories under their original
 `BSD-3-Clause` licence, with all copyright notices preserved.
 
-Rcmake is not affiliated with Kitware. "CMake" is a trademark of Kitware, Inc.
+rcmake is not affiliated with Kitware. "CMake" is a trademark of Kitware, Inc.
 
 ## Status
 
-Rcmake is pre-release (`0.1.0-dev`). Compatibility and performance numbers for
+rcmake is pre-release (`0.1.0-dev`). Compatibility and performance numbers for
 the frozen `0.1.0` release binary will be published here and on the
-[compatibility report](https://dvgyl.github.io/Rcmake/dashboard.html) once the
+[compatibility report](https://dvgyl.github.io/rcmake/dashboard.html) once the
 final release gate run finishes.
 
 | Check | Current status |
@@ -92,7 +92,7 @@ Please report differences from CMake 4.5.1 as GitHub issues.
 - Diagnostics with `cmake_diagnostic()` and SARIF 2.1.0 output
 - `compile_commands.json`
 
-### Rcmake extensions
+### rcmake extensions
 
 These features are available only when running the binary under the name
 `rcmake`. The names `cmake`, `ctest`, and `cpack` follow CMake 4.5.1.
@@ -132,11 +132,11 @@ Pass `--alias-cmake` to also install `cmake`, `ctest`, and `cpack` links.
 
 ### Build from source
 
-Rcmake uses the Rust toolchain pinned in `rust-toolchain.toml`.
+rcmake uses the Rust toolchain pinned in `rust-toolchain.toml`.
 
 ```sh
-git clone https://github.com/dvgyl/Rcmake.git
-cd Rcmake
+git clone https://github.com/dvgyl/rcmake.git
+cd rcmake
 source env/env.sh
 scripts/stage.sh
 ```
@@ -184,7 +184,7 @@ The binary selects its mode from `argv[0]`:
 | Name | Behavior |
 | --- | --- |
 | `cmake`, `ctest`, `cpack` | Compatibility mode matching CMake 4.5.1 output, diagnostics, and exit codes. |
-| `rcmake` | Native mode enabling Rcmake extensions and caching features. |
+| `rcmake` | Native mode enabling rcmake extensions and caching features. |
 
 Set `RCMAKE_ORACLE_MODE=1` to force compatibility mode under the `rcmake` name.
 
@@ -206,7 +206,7 @@ implemented.
 
 ## Compatibility testing
 
-Rcmake is tested differentially against the official CMake 4.5.1 binary across
+rcmake is tested differentially against the official CMake 4.5.1 binary across
 four layers:
 
 | Layer | Scope | Pass criterion |
@@ -279,5 +279,5 @@ by Kitware, Inc. and the CMake contributors
 Rust dependency licences.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in Rcmake is dual-licensed as above, without any additional terms
+for inclusion in rcmake is dual-licensed as above, without any additional terms
 or conditions.

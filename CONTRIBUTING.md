@@ -1,14 +1,14 @@
-# Contributing to Rcmake
+# Contributing to rcmake
 
-Thank you for your interest in Rcmake. This guide gives the rules and checks
+Thank you for your interest in rcmake. This guide gives the rules and checks
 for every change. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first for
 the crate structure and the data flow.
 
 ## Goal of the project
 
-Rcmake must behave as CMake 4.5.1 behaves. The official CMake 4.5.1 binary is
-the reference (the "oracle"). When Rcmake and CMake 4.5.1 give different
-results, Rcmake has the bug, unless CMake 4.5.1 itself is nondeterministic or
+rcmake must behave as CMake 4.5.1 behaves. The official CMake 4.5.1 binary is
+the reference (the "oracle"). When rcmake and CMake 4.5.1 give different
+results, rcmake has the bug, unless CMake 4.5.1 itself is nondeterministic or
 crashes.
 
 ## Set up
@@ -43,7 +43,7 @@ memory.
 - The CMake 4.5.1 files in `modules/cmake-4.5/` stay under `BSD-3-Clause`.
   Do not remove or change their copyright headers.
 - Do not add files under GPL, LGPL, AGPL, MPL, or other copyleft licences.
-- Rcmake never runs the upstream `cmake` binary at runtime. Only
+- rcmake never runs the upstream `cmake` binary at runtime. Only
   `rcmake-harness`, `tools/`, and the differential tests use
   `RCMAKE_ORACLE_CMAKE`. The licence scanner checks this rule.
 
@@ -196,12 +196,12 @@ test(presets): cover schema 13 include cycles
 
 ## Report a security problem
 
-Rcmake reads untrusted project files and archives. Do not open a public issue
+rcmake reads untrusted project files and archives. Do not open a public issue
 for a security problem. Use GitHub private vulnerability reporting for this
 repository.
 
 ## Licence of contributions
 
 Unless you state otherwise, any contribution that you submit for inclusion in
-Rcmake is licensed as `MIT OR Apache-2.0`, with no additional terms or
+rcmake is licensed as `MIT OR Apache-2.0`, with no additional terms or
 conditions.

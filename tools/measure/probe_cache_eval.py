@@ -35,23 +35,23 @@ from oracle_prop_test import clean_environment, executable, run_command, write_j
 
 WORKERS = 8
 TRIGGERS = {
-    "cpath": '#include <rcmake_m6_cpath.h>\n',
-    "cpath-add": '#include <rcmake_m6_cpath_add.h>\n',
-    "has-include": ('#if !__has_include(<rcmake_m6_optional.h>)\n'
-                    'int rcmake_m6_header_required = ;\n#endif\n'),
-    "header-shadow": ('#include <limits.h>\n#ifndef RCMAKE_M6_SHADOW\n'
-                      'int rcmake_m6_shadow_required = ;\n#endif\n'),
-    "lang": "#ifndef RCMAKE_M6_POSIX\nint rcmake_m6_posix_required = ;\n#endif\n",
-    "compiler": "#ifndef RCMAKE_M6_SWAP\nint rcmake_m6_wrapper_change_required = ;\n#endif\n",
-    "header-root": '#include <rcmake_m6_root.h>\n',
-    "header-subdir": '#include <existing/rcmake_m6_subdir.h>\n',
-    "library": "int m6_archive(void);\n",
-    "toolchain": "#ifndef RCMAKE_M6_TOOLCHAIN\nint rcmake_m6_toolchain_change_required = ;\n#endif\n",
-    "developer-dir": "#ifndef RCMAKE_M6_DEVELOPER\nint rcmake_m6_developer_change_required = ;\n#endif\n",
-    "transitive": '#include <rcmake_m6_outer.h>\n',
+    "cpath": '#include <rcmake_probe_cpath.h>\n',
+    "cpath-add": '#include <rcmake_probe_cpath_add.h>\n',
+    "has-include": ('#if !__has_include(<rcmake_probe_optional.h>)\n'
+                    'int rcmake_probe_header_required = ;\n#endif\n'),
+    "header-shadow": ('#include <limits.h>\n#ifndef RCMAKE_PROBE_SHADOW\n'
+                      'int rcmake_probe_shadow_required = ;\n#endif\n'),
+    "lang": "#ifndef RCMAKE_PROBE_POSIX\nint rcmake_probe_posix_required = ;\n#endif\n",
+    "compiler": "#ifndef RCMAKE_PROBE_SWAP\nint rcmake_probe_wrapper_change_required = ;\n#endif\n",
+    "header-root": '#include <rcmake_probe_root.h>\n',
+    "header-subdir": '#include <existing/rcmake_probe_subdir.h>\n',
+    "library": "int probe_archive(void);\n",
+    "toolchain": "#ifndef RCMAKE_PROBE_TOOLCHAIN\nint rcmake_probe_toolchain_change_required = ;\n#endif\n",
+    "developer-dir": "#ifndef RCMAKE_PROBE_DEVELOPER\nint rcmake_probe_developer_change_required = ;\n#endif\n",
+    "transitive": '#include <rcmake_probe_outer.h>\n',
 }
-PROBE_STATUS = b"-- M6 probe results "
-COMPILER_MARKER = b"M6 compiler reached the probe"
+PROBE_STATUS = b"-- Probe results "
+COMPILER_MARKER = b"Compiler reached the probe"
 PRIVATE_EVIDENCE = (b".rcmake-compile-dependencies", b".rcmake-link-dependencies",
                     b".rcmake-source-dependencies", b".rcmake-failed-dependencies")
 SCRATCH_ID = re.compile(rb"\b(?:TryCompile-[A-Za-z0-9]+|cmTC_[A-Za-z0-9]+)\b")
@@ -82,24 +82,24 @@ class Fixture:
 
     def wrapper(self, swapped: bool = False) -> None:
         """Log attempted fixture compilations and invoke the system compiler."""
-        swap = '    set -- -DRCMAKE_M6_SWAP=1 "$@"\n' if swapped else ""
+        swap = '    set -- -DRCMAKE_PROBE_SWAP=1 "$@"\n' if swapped else ""
         script = f"""#!/bin/sh
 compile=no
 source=
 for arg do
     case "$arg" in
         -c) compile=yes ;;
-        */m6_probe_*.c|m6_probe_*.c) source=${{arg##*/}} ;;
+        */probe_*.c|probe_*.c) source=${{arg##*/}} ;;
     esac
 done
 if [ "$compile" = yes ] && [ -n "$source" ]; then
     printf '%s\\t%s\\n' "$PWD" "$source" >> {shlex.quote(str(self.log))}
     printf '%s\\n' '{COMPILER_MARKER.decode()}' >&2
     if [ "${{LANG-}}" = POSIX ]; then
-        set -- -DRCMAKE_M6_POSIX=1 "$@"
+        set -- -DRCMAKE_PROBE_POSIX=1 "$@"
     fi
     if [ -n "${{DEVELOPER_DIR-}}" ] && [ "$DEVELOPER_DIR" = {shlex.quote(self.alternate_developer_dir)} ]; then
-        set -- -DRCMAKE_M6_DEVELOPER=1 "$@"
+        set -- -DRCMAKE_PROBE_DEVELOPER=1 "$@"
     fi
 {swap}fi
 exec {shlex.quote(self.compiler)} "$@"
@@ -124,15 +124,15 @@ def fixture(root: Path, compiler: str, prefix: str = "", probes: int = 1,
     (root / "toolchain.cmake").write_text(
         'set(CMAKE_C_COMPILER "${CMAKE_CURRENT_LIST_DIR}/compiler")\n'
         'set(CMAKE_C_COMPILER_FORCED TRUE)\n'
-        'set(M6_TOOLCHAIN_DEFINITION "")\n', encoding="utf-8",
+        'set(PROBE_TOOLCHAIN_DEFINITION "")\n', encoding="utf-8",
     )
     (case.source / "CMakeLists.txt").write_text(
-        "cmake_minimum_required(VERSION 4.5)\nproject(M6ProbeCache C)\n"
+        "cmake_minimum_required(VERSION 4.5)\nproject(ProbeCache C)\n"
         "add_subdirectory(leaf)\n", encoding="utf-8",
     )
     link = ('LINK_OPTIONS "-L${CMAKE_CURRENT_SOURCE_DIR}/../../library" '
-            'LINK_LIBRARIES "-lrcmake_m6_probe"') if library else ""
-    result_code = "m6_archive() + ${index} - 1" if library else "${index}"
+            'LINK_LIBRARIES "-lrcmake_probe_archive"') if library else ""
+    result_code = "probe_archive() + ${index} - 1" if library else "${index}"
     # Keep each probe source different so a cold storm performs many writes.
     leaf = f"""\
 set(results "")
@@ -140,9 +140,9 @@ set(prefix [==[{prefix}]==])
 foreach(index RANGE 1 {probes})
   set(log "${{CMAKE_BINARY_DIR}}/probe-${{index}}.log")
   try_compile(result
-    SOURCE_FROM_CONTENT "m6_probe_${{index}}.c"
+    SOURCE_FROM_CONTENT "probe_${{index}}.c"
       "${{prefix}}int main(void) {{ return {result_code}; }}"
-    COMPILE_DEFINITIONS "-I${{CMAKE_CURRENT_SOURCE_DIR}}/../../include" ${{M6_TOOLCHAIN_DEFINITION}}
+    COMPILE_DEFINITIONS "-I${{CMAKE_CURRENT_SOURCE_DIR}}/../../include" ${{PROBE_TOOLCHAIN_DEFINITION}}
     {link}
     OUTPUT_VARIABLE compile_output
     COPY_FILE "${{CMAKE_BINARY_DIR}}/probe-${{index}}"
@@ -152,7 +152,7 @@ foreach(index RANGE 1 {probes})
 endforeach()
 file(WRITE "${{CMAKE_BINARY_DIR}}/probe-results.txt" "${{results}}")
 string(REPLACE "\\n" " " display "${{results}}")
-message(STATUS "M6 probe results ${{display}}")
+message(STATUS "Probe results ${{display}}")
 """
     (case.source / "leaf/CMakeLists.txt").write_text(leaf, encoding="utf-8")
     backdate(*root.rglob("*"), root)
@@ -162,8 +162,8 @@ message(STATUS "M6 probe results ${{display}}")
 def backdate(*paths: Path) -> None:
     """Model inputs that existed before the build.
 
-    Rcmake does not publish a probe that read a file or directory changed
-    within its 2 s timestamp window.
+    rcmake publishes a probe only if the files and directories it read
+    are older than 2 s.
     """
     old = time.time() - 10
     for path in paths:
@@ -267,16 +267,16 @@ def configure(args, case: Fixture, name: str, env: dict, *, oracle: bool = False
 def change_input(name: str, case: Fixture, env: dict, args) -> None:
     """Change only the input selected for this invalidation check."""
     headers = {
-        "header-root": "include/rcmake_m6_root.h",
-        "header-subdir": "include/existing/rcmake_m6_subdir.h",
-        "transitive": "include/existing/rcmake_m6_inner.h",
-        "cpath-add": "empty/rcmake_m6_cpath_add.h",
-        "has-include": "include/rcmake_m6_optional.h",
+        "header-root": "include/rcmake_probe_root.h",
+        "header-subdir": "include/existing/rcmake_probe_subdir.h",
+        "transitive": "include/existing/rcmake_probe_inner.h",
+        "cpath-add": "empty/rcmake_probe_cpath_add.h",
+        "has-include": "include/rcmake_probe_optional.h",
     }
     if name in headers:
-        (case.root / headers[name]).write_text("#define RCMAKE_M6_HEADER 1\n", encoding="utf-8")
+        (case.root / headers[name]).write_text("#define RCMAKE_PROBE_HEADER 1\n", encoding="utf-8")
     elif name == "header-shadow":
-        (case.root / "include/limits.h").write_text("#define RCMAKE_M6_SHADOW 1\n", encoding="utf-8")
+        (case.root / "include/limits.h").write_text("#define RCMAKE_PROBE_SHADOW 1\n", encoding="utf-8")
     elif name == "cpath":
         env["CPATH"] = str(case.root / "alternate")
     elif name == "lang":
@@ -285,14 +285,14 @@ def change_input(name: str, case: Fixture, env: dict, args) -> None:
         case.wrapper(swapped=True)
     elif name == "toolchain":
         with (case.root / "toolchain.cmake").open("a", encoding="utf-8") as stream:
-            stream.write('set(M6_TOOLCHAIN_DEFINITION "-DRCMAKE_M6_TOOLCHAIN=1")\n')
+            stream.write('set(PROBE_TOOLCHAIN_DEFINITION "-DRCMAKE_PROBE_TOOLCHAIN=1")\n')
     elif name == "developer-dir":
         env["DEVELOPER_DIR"] = args.developer_dirs[1]
     elif name == "library":
         source = case.root / "archive.c"
-        source.write_text("int m6_archive(void) { return 1; }\n", encoding="utf-8")
+        source.write_text("int probe_archive(void) { return 1; }\n", encoding="utf-8")
         obj = case.root / "archive.o"
-        archive = case.root / "library/librcmake_m6_probe.a"
+        archive = case.root / "library/librcmake_probe_archive.a"
         for cmd in ([case.compiler, "-c", source, "-o", obj], ["ar", "rcs", archive, obj]):
             result = run_command(cmd, case.root, args.timeout, env)
             if result["error"] or result["returncode"]:
@@ -305,11 +305,11 @@ def invalidation(args, root: Path, name: str, row: dict) -> None:
     case = fixture(root, args.compiler, TRIGGERS[name], library=name == "library",
                    alternate_developer_dir=alternate)
     if name == "cpath":
-        (root / "alternate/rcmake_m6_cpath.h").write_text(
-            "#define RCMAKE_M6_HEADER 1\n", encoding="utf-8")
+        (root / "alternate/rcmake_probe_cpath.h").write_text(
+            "#define RCMAKE_PROBE_HEADER 1\n", encoding="utf-8")
     if name == "transitive":
-        outer = root / "include/rcmake_m6_outer.h"
-        outer.write_text("#include <existing/rcmake_m6_inner.h>\n", encoding="utf-8")
+        outer = root / "include/rcmake_probe_outer.h"
+        outer.write_text("#include <existing/rcmake_probe_inner.h>\n", encoding="utf-8")
         backdate(outer, outer.parent)
     store = root / "store"
     env = environment(case, store)
@@ -676,7 +676,7 @@ def crash_recovery(args, root: Path, row: dict) -> None:
     recovered, row["recovery_compiler_calls"] = configure(args, case, "recovery", env)
     compare(recovered, oracle, PARITY_KEYS, "Crash recovery parity")
     require_calls(row, "recovery_compiler_calls", probes - intact)
-    expected = [f"m6_probe_{index}.c" for index in range(intact + 1, probes + 1)]
+    expected = [f"probe_{index}.c" for index in range(intact + 1, probes + 1)]
     actual = [line.split("\t")[-1] for line in case.invocations()[-len(expected):]]
     if actual != expected:
         raise ValueError(f"Recovery compiled {actual}. Expected {expected}.")
@@ -707,7 +707,7 @@ def corrupt_entry(args, root: Path, row: dict) -> None:
     compare(recovered, cold, (*PARITY_KEYS, "logs"), "Corrupt entry recovery parity")
     require_calls(row, "recovery_compiler_calls", 1)
     actual_source = case.invocations()[-1].split("\t")[-1]
-    if actual_source != f"m6_probe_{index}.c":
+    if actual_source != f"probe_{index}.c":
         raise ValueError(f"Recovery compiled {actual_source}. Expected probe {index}.")
     final = audit_store(store)
     require_artifacts(final, set(recovered["copies"]), exact=True)
@@ -810,7 +810,7 @@ def main() -> int:
         args.rcmake = executable(args.rcmake)
         args.oracle = executable(args.oracle)
         args.compiler = str(executable(args.cc))
-        with tempfile.TemporaryDirectory(prefix="rcmake-m6-probes-") as directory:
+        with tempfile.TemporaryDirectory(prefix="rcmake-probes-") as directory:
             evaluate(args, Path(directory).resolve(), report)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report["error"] = str(error)
@@ -818,7 +818,7 @@ def main() -> int:
     report["passed"] = ("error" not in report and any(row["passed"] for row in report["cases"])
                         and all(row["status"] in ("passed", "skipped") for row in report["cases"]))
     write_json(args.out_json, report)
-    lines = ["# M6 compiler probe cache", "", f"Mode {report['mode']}. Seed {args.seed}."]
+    lines = ["# Compiler probe cache", "", f"Mode {report['mode']}. Seed {args.seed}."]
     if args.smoke:
         lines.extend(("", "Smoke mode checks compiler success, compiler failure, output and copied executables.",
                       "G3 and G4 require gate mode."))

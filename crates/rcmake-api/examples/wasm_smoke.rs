@@ -208,7 +208,7 @@ try_compile(W0_PROBE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/app.cpp" NO_CACHE NO_L
     let ran = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&ran);
     let compiler = path::from_native_cmake(&root.join("bin/c++"));
-    let marker = b"W0 mock compiler output";
+    let marker = b"mock compiler output";
     host.set_command_handler(move |_, request, _| {
         if request
             .pipeline

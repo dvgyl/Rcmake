@@ -1,6 +1,6 @@
 # Contributors
 
-Rcmake is developed and maintained by:
+rcmake is developed and maintained by:
 
 - **Dev D.** ([@dvgyl](https://github.com/dvgyl)): creator and maintainer
 

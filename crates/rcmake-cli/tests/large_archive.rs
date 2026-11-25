@@ -1,4 +1,4 @@
-//! Exercise extraction above the previous archive size limit.
+//! Exercise extraction above the default archive size limit.
 
 #![cfg(unix)]
 

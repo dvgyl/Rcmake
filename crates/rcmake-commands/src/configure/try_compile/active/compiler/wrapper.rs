@@ -374,7 +374,8 @@ impl<'a> Parser<'a> {
                     } else {
                         let (name, suffix) = expansion(word)?;
                         if !suffix.is_empty()
-                            || !name.starts_with("RCMAKE_M6_")
+                            || !(name.starts_with("RCMAKE_PROBE_")
+                                || name.starts_with("RCMAKE_M6_"))
                             || !word.starts_with('"')
                         {
                             return None;
@@ -492,11 +493,11 @@ compile=no
 for arg do
     case "$arg" in
         -c) compile=yes ;;
-        */m6_probe_*.c|m6_probe_*.c) compile=yes ;;
+        */probe_*.c|probe_*.c) compile=yes ;;
     esac
 done
 if [ "$compile" = yes ] && [ -n "${LANG-}" ]; then
-    printf '%s\n' 'compiled' >> /work/probes.log
+    printf '%s\n' 'compiled' >> "$RCMAKE_PROBE_LOG"
     set -- -DMARKER=1 "$@"
 fi
 exec /usr/bin/cc "$@"
@@ -505,6 +506,10 @@ exec /usr/bin/cc "$@"
         let wrapper = Wrapper::read(&host, script)
             .ok_or_else(|| rcmake_host::HostError::unsupported("Expected an admitted wrapper."))?;
         assert_eq!(wrapper.target, Path::new("/usr/bin/cc"));
+        assert_eq!(
+            wrapper.telemetry,
+            vec![BString::from("\"$RCMAKE_PROBE_LOG\"")]
+        );
         assert_eq!(
             wrapper.prefixes,
             vec![vec![], vec![BString::from("-DMARKER=1")]]

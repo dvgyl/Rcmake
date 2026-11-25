@@ -1,6 +1,6 @@
 # Security Policy
 
-Rcmake parses untrusted `CMakeLists.txt` scripts, cache files, presets, CPS and
+rcmake parses untrusted `CMakeLists.txt` scripts, cache files, presets, CPS and
 SBOM documents, binary headers, and compressed archives (`tar`, `gzip`, `bzip2`,
 `xz`, `zstd`, `zip`, `7z`).
 
@@ -11,12 +11,12 @@ path traversal during archive extraction, unbounded resource consumption,
 command injection, or hermetic sandbox bypass).
 
 Instead, report vulnerabilities privately through
-[GitHub Private Vulnerability Reporting](https://github.com/dvgyl/Rcmake/security/advisories/new).
+[GitHub Private Vulnerability Reporting](https://github.com/dvgyl/rcmake/security/advisories/new).
 
 Include:
 
 - A minimal reproducer (`CMakeLists.txt`, archive, or CLI command)
-- The Rcmake version or commit SHA and host platform
+- The rcmake version or commit SHA and host platform
 - Observed behavior versus expected behavior
 
 ## Hardening guarantees
