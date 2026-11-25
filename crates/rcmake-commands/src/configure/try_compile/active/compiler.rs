@@ -555,6 +555,15 @@ impl ProcessVerifier for CompilerEvidence {
         Some(tools)
     }
 
+    fn confines_writes(&self, request: &RunRequest) -> bool {
+        // A compiler wrapper can write telemetry to an external path.
+        self.toolchain.telemetry.is_empty()
+            && request
+                .pipeline
+                .first()
+                .is_some_and(|command| path::to_native(&command.program) == self.program)
+    }
+
     fn is_probe_compile(&self, request: &RunRequest) -> bool {
         self.classify(&strip_instrumentation(request))
             .is_some_and(|flags| flags.source.is_some())

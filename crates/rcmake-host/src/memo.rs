@@ -383,6 +383,36 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         self.base.run(req, on_output)
     }
 
+    fn run_confined(
+        &self,
+        req: &RunRequest,
+        scope: crate::WriteScope<'_>,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        let paths = if scope.0.iter().all(|path| path.is_absolute()) {
+            scope.0
+        } else {
+            &[]
+        };
+        let _change = self.begin_change_for(paths);
+        self.base.run_confined(req, scope, on_output)
+    }
+
+    fn run_bounded_confined(
+        &self,
+        req: &RunRequest,
+        limit: usize,
+        scope: crate::WriteScope<'_>,
+    ) -> HostResult<RunOutput> {
+        let paths = if scope.0.iter().all(|path| path.is_absolute()) {
+            scope.0
+        } else {
+            &[]
+        };
+        let _change = self.begin_change_for(paths);
+        self.base.run_bounded_confined(req, limit, scope)
+    }
+
     fn run_with_timeout_signal(
         &self,
         req: &RunRequest,

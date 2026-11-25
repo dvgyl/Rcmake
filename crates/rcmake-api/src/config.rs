@@ -721,6 +721,24 @@ where
         self.base.run_controlled(req, graceful, hard_limit, update)
     }
 
+    fn run_confined(
+        &self,
+        req: &RunRequest,
+        scope: rcmake_host::WriteScope<'_>,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        self.base.run_confined(req, scope, on_output)
+    }
+
+    fn run_bounded_confined(
+        &self,
+        req: &RunRequest,
+        limit: usize,
+        scope: rcmake_host::WriteScope<'_>,
+    ) -> HostResult<RunOutput> {
+        self.base.run_bounded_confined(req, limit, scope)
+    }
+
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
         self.base.run_bounded(req, limit)
     }

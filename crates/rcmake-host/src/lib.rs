@@ -67,6 +67,11 @@ pub enum ReadRange {
     },
 }
 
+/// Absolute paths that a process can write, as certified by its caller.
+/// An empty scope requests full invalidation.
+#[derive(Clone, Copy)]
+pub struct WriteScope<'a>(pub &'a [&'a Path]);
+
 /// Write mode for [`Host::write`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteMode {
@@ -508,6 +513,26 @@ pub trait Host: Send + Sync {
         req: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput>;
+
+    /// Run a process with a caller-certified write scope.
+    fn run_confined(
+        &self,
+        req: &RunRequest,
+        _scope: WriteScope<'_>,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        self.run(req, on_output)
+    }
+
+    /// Run a process with a caller-certified write scope and output limit.
+    fn run_bounded_confined(
+        &self,
+        req: &RunRequest,
+        limit: usize,
+        _scope: WriteScope<'_>,
+    ) -> HostResult<RunOutput> {
+        self.run_bounded(req, limit)
+    }
 
     /// Run a process and allow it time to handle its timeout signal.
     fn run_with_timeout_signal(

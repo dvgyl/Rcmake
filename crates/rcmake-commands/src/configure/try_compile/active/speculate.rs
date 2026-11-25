@@ -147,7 +147,7 @@ impl PreparedProbe {
             if compute_probe_key(&recipe) == compute_probe_key(&self.recipe) {
                 continue;
             }
-            let host = Arc::clone(&self.runtime.host);
+            let host = Arc::clone(&self.runtime.journal_host);
             let compiler = compiler.verifier;
             let memo = Arc::clone(&self.runtime.cache.memo);
             let target = BString::from(target);

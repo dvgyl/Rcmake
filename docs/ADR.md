@@ -593,3 +593,16 @@ On Darwin, pass `-x` for libraries. For executables, pass `-u -r` only after a
 bounded probe identifies the configured program as the Apple `strip` tool.
 
 Sources: [Strip action](../crates/rcmake-resolve/src/lower/install/strip.rs) and [install script rendering](../crates/rcmake-gen-common/src/install_script/strip.rs).
+
+
+## ADR-032: Probe compiler write scope
+
+- **Status:** Accepted
+
+A classified compiler or linker can write its certified outputs and temporary
+files. The probe host gives those paths to the memo host. The memo host
+invalidates any tracked root that overlaps a write path.
+
+If the probe host cannot certify the write scope, the memo host invalidates all
+tracked roots. This includes compiler wrappers that write telemetry outside
+the probe directory.

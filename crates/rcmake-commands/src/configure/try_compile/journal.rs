@@ -107,6 +107,11 @@ pub(crate) struct SearchObservation {
 /// step verifies fresh dependency evidence from the completed request. A depfile
 /// alone cannot certify the complete process tree.
 pub(crate) trait ProcessVerifier: Send + Sync {
+    /// Return whether the verified process writes only to scratch or temporary paths.
+    fn confines_writes(&self, _request: &RunRequest) -> bool {
+        false
+    }
+
     /// Return a certified platform query sampled during this configure.
     fn recorded_platform_query(&self, _request: &RunRequest) -> Option<RunOutput> {
         None

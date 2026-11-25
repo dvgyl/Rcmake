@@ -346,10 +346,14 @@ impl Host for JournalHost<'_> {
         let (request, preflight) = self.process_request(request)?;
         let spawn = self.inner.now();
         let start = self.compile_start(&request, preflight.is_some());
+        let paths = self.write_scope(&request, preflight.is_some());
+        let scope: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+        let scope = rcmake_host::WriteScope(&scope);
         let result = if self.mode == JournalMode::Speculate {
-            self.inner.run_bounded(&request, MAX_PROCESS_OUTPUT)
+            self.inner
+                .run_bounded_confined(&request, MAX_PROCESS_OUTPUT, scope)
         } else {
-            self.inner.run(&request, on_output)
+            self.inner.run_confined(&request, scope, on_output)
         };
         self.compile_end(start, &result);
         self.after_process(&request, spawn, &result, preflight.as_deref());
@@ -370,7 +374,11 @@ impl Host for JournalHost<'_> {
         };
         let spawn = self.inner.now();
         let start = self.compile_start(&request, preflight.is_some());
-        let result = self.inner.run_bounded(&request, limit);
+        let paths = self.write_scope(&request, preflight.is_some());
+        let scope: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+        let result =
+            self.inner
+                .run_bounded_confined(&request, limit, rcmake_host::WriteScope(&scope));
         self.compile_end(start, &result);
         self.after_process(&request, spawn, &result, preflight.as_deref());
         result

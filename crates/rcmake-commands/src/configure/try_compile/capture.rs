@@ -89,6 +89,23 @@ impl CapturingHost {
         }
         Ok(output)
     }
+
+    fn run_bounded_captured(
+        &self,
+        req: &RunRequest,
+        run: impl FnOnce(&RunRequest) -> HostResult<RunOutput>,
+    ) -> HostResult<RunOutput> {
+        let (mut req, stdout, stderr) = capture_request(req);
+        req.tee = false;
+        let mut result = run(&req)?;
+        if stdout {
+            self.capture_process_output(&std::mem::take(&mut result.stdout));
+        }
+        if stderr {
+            self.capture_process_output(&std::mem::take(&mut result.stderr));
+        }
+        Ok(result)
+    }
 }
 
 fn capture_request(request: &RunRequest) -> (RunRequest, bool, bool) {
@@ -241,6 +258,17 @@ impl Host for CapturingHost {
         self.run_captured(req, on_output, |req, output| self.parent.run(req, output))
     }
 
+    fn run_confined(
+        &self,
+        req: &RunRequest,
+        scope: rcmake_host::WriteScope<'_>,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        self.run_captured(req, on_output, |req, output| {
+            self.parent.run_confined(req, scope, output)
+        })
+    }
+
     fn run_with_timeout_signal(
         &self,
         req: &RunRequest,
@@ -253,16 +281,18 @@ impl Host for CapturingHost {
     }
 
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
-        let (mut req, stdout, stderr) = capture_request(req);
-        req.tee = false;
-        let mut result = self.parent.run_bounded(&req, limit)?;
-        if stdout {
-            self.capture_process_output(&std::mem::take(&mut result.stdout));
-        }
-        if stderr {
-            self.capture_process_output(&std::mem::take(&mut result.stderr));
-        }
-        Ok(result)
+        self.run_bounded_captured(req, |req| self.parent.run_bounded(req, limit))
+    }
+
+    fn run_bounded_confined(
+        &self,
+        req: &RunRequest,
+        limit: usize,
+        scope: rcmake_host::WriteScope<'_>,
+    ) -> HostResult<RunOutput> {
+        self.run_bounded_captured(req, |req| {
+            self.parent.run_bounded_confined(req, limit, scope)
+        })
     }
 
     fn write_out(&self, stream: Stream, bytes: &[u8]) {

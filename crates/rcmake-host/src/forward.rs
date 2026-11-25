@@ -61,6 +61,14 @@ macro_rules! forward_host {
         $crate::forward_host!(@method $base, run(req: &$crate::RunRequest,
             on_output: &mut dyn FnMut($crate::Stream, &[u8]),
         ) -> $crate::HostResult<$crate::RunOutput>);
+        $crate::forward_host!(@method $base, run_confined(req: &$crate::RunRequest,
+            scope: $crate::WriteScope<'_>,
+            on_output: &mut dyn FnMut($crate::Stream, &[u8]),
+        ) -> $crate::HostResult<$crate::RunOutput>);
+        $crate::forward_host!(@method $base, run_bounded_confined(req: &$crate::RunRequest,
+            limit: usize,
+            scope: $crate::WriteScope<'_>,
+        ) -> $crate::HostResult<$crate::RunOutput>);
         $crate::forward_host!(@method $base, run_with_timeout_signal(req: &$crate::RunRequest,
             timeout: $crate::GracefulTimeout,
             on_output: &mut dyn FnMut($crate::Stream, &[u8]),

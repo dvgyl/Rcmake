@@ -77,6 +77,40 @@ impl JournalHost<'_> {
         Ok((request, preflight))
     }
 
+    pub(super) fn write_scope(&self, request: &RunRequest, verified: bool) -> Vec<PathBuf> {
+        if !cfg!(unix)
+            || !verified
+            || self.state().impure.is_some()
+            || !self
+                .verify_process
+                .as_deref()
+                .is_some_and(|tool| tool.confines_writes(request))
+            || [&request.stdout, &request.stderr].into_iter().any(
+                |output| matches!(output, Output::File { path, .. } if !self.private_path(path)),
+            )
+        {
+            return Vec::new();
+        }
+        let mut paths = vec![self.scratch.clone(), self.canonical_scratch.clone()];
+        paths.extend(["/tmp", "/var/tmp"].map(PathBuf::from));
+        if cfg!(target_os = "macos") {
+            paths.extend(
+                ["/private/tmp", "/private/var/tmp", "/private/var/folders"].map(PathBuf::from),
+            );
+        }
+        paths.extend(
+            request
+                .env
+                .iter()
+                .filter(|(key, value)| {
+                    !value.is_empty()
+                        && matches!(key.as_slice(), b"TMPDIR" | b"TMP" | b"TEMP" | b"TEMPDIR")
+                })
+                .map(|(_, value)| request.cwd.join(path::to_native(value))),
+        );
+        paths
+    }
+
     fn before_process(&self, request: &RunRequest) -> HostResult<Option<Trace>> {
         if let Input::File(path) = &request.stdin {
             self.record_dependency(path)

@@ -27,6 +27,7 @@ mod speculate;
 
 pub(in crate::configure) struct ProbeRuntime {
     host: Arc<dyn Host>,
+    journal_host: Arc<dyn Host>,
     store: StoreConfig,
     cache: ProbeCache,
     mode: ProbeCacheMode,
@@ -79,11 +80,15 @@ impl ProbeRuntime {
             .filter(|value| !value.is_empty())
             .map(|value| host.initial_cwd().join(path::to_native(&value)));
         let mut cache = ProbeCache::for_session(mode);
+        let journal_host = generation
+            .as_ref()
+            .map_or_else(|| host.clone(), |memo| memo.clone() as Arc<dyn Host>);
         if let Some(host) = generation {
             cache.memo = Arc::new(rcmake_store::TraceMemo::with_generation(host));
         }
         Some(Self {
             host,
+            journal_host,
             intervals,
             purity_log,
             store,
@@ -426,7 +431,7 @@ impl PreparedProbe {
             return None;
         }
         JournalHost::from_shared(
-            Arc::clone(&self.runtime.host),
+            Arc::clone(&self.runtime.journal_host),
             &dirs.binary,
             Arc::clone(&self.compiler),
             super::journal::JournalMode::Observe,
