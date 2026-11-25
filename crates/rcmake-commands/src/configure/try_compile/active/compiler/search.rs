@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::*;
-use rcmake_store::{TreePolicy, tree_listing_digest};
+use rcmake_store::TreePolicy;
 
 impl CompilerEvidence {
     pub(super) fn search_directories(
@@ -174,7 +174,7 @@ impl CompilerEvidence {
             Ok(_) => InputStamp::TreeListing {
                 path: directory.to_owned(),
                 policy: TreePolicy::Ordinary,
-                digest: tree_listing_digest(self.host.as_ref(), directory).ok()?,
+                digest: self.memo.tree_digest(self.host.as_ref(), directory).ok()?,
             },
             Err(error)
                 if error.kind == ErrorKind::NotFound

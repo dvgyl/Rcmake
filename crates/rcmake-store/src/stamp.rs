@@ -194,8 +194,16 @@ pub struct TraceMemo {
     generation_host: Option<Arc<rcmake_host::MemoHost<dyn Host>>>,
     tools: Mutex<BTreeMap<PathBuf, (u64, FastStat, Digest)>>,
     sdk: Mutex<BTreeMap<PathBuf, (u64, Digest)>>,
+    ordinary: Mutex<BTreeMap<PathBuf, OrdinaryListing>>,
     sdk_coverage_failures: AtomicU64,
     sdk_graph_hits: AtomicU64,
+}
+
+struct OrdinaryListing {
+    canonical: PathBuf,
+    generation: u64,
+    root_link: Option<PathBuf>,
+    digest: Digest,
 }
 
 impl TraceMemo {
@@ -308,6 +316,50 @@ impl TraceMemo {
             && (sdk.len() < 128 || sdk.contains_key(&canonical))
         {
             sdk.insert(canonical, (generation, graph));
+        }
+        Ok(digest)
+    }
+
+    /// Hash a search tree. Reuse the listing while its generation stays stable.
+    pub fn tree_digest(&self, host: &dyn Host, root: &Path) -> HostResult<Digest> {
+        let canonical = host.canonicalize(root)?;
+        let Some(generation) = self.generation(&canonical) else {
+            return tree_listing_digest(host, root);
+        };
+        let root_link = if host.metadata(root, Follow::No)?.kind == FileKind::Symlink {
+            Some(host.read_link(root)?)
+        } else {
+            None
+        };
+        let mut ordinary = self
+            .ordinary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cached = ordinary.get(root).filter(|listing| {
+            listing.canonical == canonical
+                && listing.generation == generation
+                && listing.root_link == root_link
+        });
+        let (digest, confined) = match cached {
+            Some(listing) => (listing.digest, true),
+            None => tree::ordinary_tree(host, root)?,
+        };
+        if self.generation(&canonical) != Some(generation) || host.canonicalize(root)? != canonical
+        {
+            return Err(HostError::unsupported(
+                "The host changed during the search listing.",
+            ));
+        }
+        if confined && cached.is_none() && (ordinary.len() < 256 || ordinary.contains_key(root)) {
+            ordinary.insert(
+                root.to_owned(),
+                OrdinaryListing {
+                    canonical,
+                    generation,
+                    root_link,
+                    digest,
+                },
+            );
         }
         Ok(digest)
     }
@@ -463,7 +515,10 @@ fn matches_input(host: &dyn Host, input: &InputStamp, memo: Option<&TraceMemo>) 
             policy,
         } => {
             let current = match policy {
-                TreePolicy::Ordinary => tree_listing_digest(host, path),
+                TreePolicy::Ordinary => memo.map_or_else(
+                    || tree_listing_digest(host, path),
+                    |memo| memo.tree_digest(host, path),
+                ),
                 TreePolicy::Sdk => memo.map_or_else(
                     || sdk_tree_listing_digest(host, path),
                     |memo| memo.sdk_digest(host, path),

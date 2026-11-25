@@ -9,6 +9,11 @@ use super::*;
 /// Reject trees over 20,000 entries or 16 levels deep. Reject links to directories
 /// because changes below those links would not appear in this listing.
 pub fn tree_listing_digest(host: &dyn Host, root: &Path) -> HostResult<Digest> {
+    ordinary_tree(host, root).map(|(digest, _)| digest)
+}
+
+pub(super) fn ordinary_tree(host: &dyn Host, root: &Path) -> HostResult<(Digest, bool)> {
+    let mut confined = true;
     let mut key = KeyHasher::new(Domain::BlobV1);
     key.field(0, b"tree-listing");
     if host.metadata(root, Follow::No)?.kind == FileKind::Symlink {
@@ -42,6 +47,7 @@ pub fn tree_listing_digest(host: &dyn Host, root: &Path) -> HostResult<Digest> {
                     directories.push((path, depth + 1));
                 }
                 FileKind::Symlink => {
+                    confined = false;
                     key.field(5, &entry.name);
                     key.field(6, host.read_link(&path)?.as_os_str().as_encoded_bytes());
                     match host.metadata(&path, Follow::Yes) {
@@ -62,7 +68,7 @@ pub fn tree_listing_digest(host: &dyn Host, root: &Path) -> HostResult<Digest> {
             }
         }
     }
-    Ok(key.finish())
+    Ok((key.finish(), confined))
 }
 
 /// Hash a bounded SDK search graph, including directory links and dangling links.
