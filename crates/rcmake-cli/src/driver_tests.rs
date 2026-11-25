@@ -265,12 +265,13 @@ fn build_make_preset_uses_cli_overrides_and_inherits_environment() {
     .unwrap();
     host.set_command_handler(|_, request, _| {
         let command = request.pipeline.first().unwrap();
+        assert_eq!(request.cwd, Path::new("/work/out"));
         assert_eq!(command.program, "/tools/make");
         assert_eq!(
             command.args,
             argv(&[
-                "-C",
-                "/work/out",
+                "-f",
+                "Makefile",
                 "-j",
                 "3",
                 "VERBOSE=1",
