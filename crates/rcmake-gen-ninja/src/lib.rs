@@ -163,7 +163,7 @@ fn generate_single(
     graph.connect_custom_dependencies(model);
     graph.set_compile_metadata(result);
     graph.set_command_settings(model, host);
-    graph.set_clean_files(model)?;
+    graph.set_clean_files(model, &result.metadata.clean_files)?;
     let prep = PrepTargets::new(&graph, result, model, host)?;
     let programs = Programs::new(result, host, build_dir, model, &commands);
     let uses_modules = modules::uses_modules(input);
@@ -184,7 +184,14 @@ fn generate_single(
         graph.node(RULES_PATH.as_bytes()),
     ];
     manifests.extend(exports.iter().map(|job| graph.node(&job.script)));
-    if uses_modules {
+    manifests.extend(
+        result
+            .metadata
+            .generated_files
+            .iter()
+            .map(|file| graph.node(file)),
+    );
+    if uses_modules || fortran::uses_fortran(input) {
         manifests.extend(
             modules::write_metadata(result, model, &[input], host, build_dir, false)?
                 .iter()
@@ -296,7 +303,7 @@ fn generate_multi(
         graph.resolve_custom_inputs(model, host);
         graph.set_compile_metadata(result);
         graph.set_command_settings(model, host);
-        graph.set_clean_files(model)?;
+        graph.set_clean_files(model, &result.metadata.clean_files)?;
         let prep = PrepTargets::new(&graph, result, model, host)?;
         configs.push((graph, ConfigFiles::new(name, prep)));
     }
@@ -349,7 +356,14 @@ fn generate_multi(
         .transpose()?
         .unwrap_or_default();
     manifests.extend(exports.iter().map(|job| default.node(&job.script)));
-    if uses_modules {
+    manifests.extend(
+        result
+            .metadata
+            .generated_files
+            .iter()
+            .map(|file| default.node(file)),
+    );
+    if uses_modules || graphs.iter().any(|graph| fortran::uses_fortran(graph)) {
         manifests.extend(
             modules::write_metadata(result, model, &graphs, host, build_dir, true)?
                 .iter()
@@ -536,17 +550,31 @@ fn write_rules(
     model: Option<&ProjectModel>,
     commands: &Commands,
 ) -> Result<(), GenError> {
-    let mut ninja = if uses_modules {
+    let uses_fortran = result.graphs.iter().any(fortran::uses_fortran);
+    let mut ninja = if uses_modules || uses_fortran {
         let mut rules = RULES.replacen(
             "ninja_required_version = 1.7",
             "ninja_required_version = 1.10",
             1,
         );
-        rules.push_str(modules::RULES);
+        if uses_modules {
+            rules.push_str(modules::RULES);
+        }
+        if uses_fortran {
+            rules.push_str(fortran::RULES);
+        }
         Ninja(rules.into_bytes())
     } else {
         Ninja(RULES.as_bytes().to_vec())
     };
+    if result
+        .graphs
+        .iter()
+        .flat_map(|graph| &graph.steps)
+        .any(|step| matches!(step, rcmake_resolve::BuildStep::DeviceLink { .. }))
+    {
+        ninja.0.extend_from_slice(cuda::RULES.as_bytes());
+    }
     response::emit_rules(&mut ninja);
     if !commands.windows() {
         instrumented::emit_rules(&mut ninja, result);

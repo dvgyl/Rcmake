@@ -205,6 +205,7 @@ impl FortranPlan {
                 dyndep: join(&dir, b"Fortran.dd"),
                 modules_json: join(&dir, b"FortranModules.json"),
                 linked_target_dirs,
+                make_depend_info: None,
             },
             tdi: FortranBuildTdi {
                 scan,
@@ -219,6 +220,11 @@ impl FortranPlan {
             units,
             ninja,
         }))
+    }
+
+    /// Record the metadata needed to generate a Make dependency pass.
+    pub(crate) fn set_make_depend_info(&mut self) {
+        self.info.make_depend_info = Some(Box::new(DependInfo::Fortran(self.tdi.clone())));
     }
 
     /// Create the compiler's module output directory through the host.
@@ -452,6 +458,7 @@ impl FortranPlan {
 
 /// Find the owners of object files included through source or link expressions.
 pub(crate) fn forwarded_object_libraries(
+    model: &ProjectModel,
     paths: &SourcePaths<'_>,
     inputs: &TargetInputs,
     links: &[ResolvedLinkItem],
@@ -472,7 +479,7 @@ pub(crate) fn forwarded_object_libraries(
         .iter()
         .map(|object| object.as_slice())
         .chain(object_files(links))
-        .filter_map(|object| paths.object_owner(object))
+        .filter_map(|object| paths.object_owner(&join(&model.dir(DirId::ROOT).binary_dir, object)))
         .collect()
 }
 
@@ -783,6 +790,7 @@ fn chain_commands(
             "cmd.exe".into(),
             "/D".into(),
             "/S".into(),
+            "/V:OFF".into(),
             "/C".into(),
             shell.clone(),
         ];

@@ -23,7 +23,7 @@ use crate::{
     usage::UsageResolver,
 };
 
-mod driver;
+pub(super) mod driver;
 use driver::{
     LinkerDriver, archive_commands, deduplicate_darwin_flags, definition_file, library_file,
     shared_library, without_empty_output_flags,
@@ -42,6 +42,7 @@ pub(super) fn link(
     objects: Vec<BString>,
     sources: Option<&IndexSet<BString>>,
     position_independent: Option<bool>,
+    link_languages: &IndexSet<BString>,
     usage: &mut UsageResolver<'_>,
 ) -> Result<BuildStep, ResolveError> {
     if step.output.is_empty()
@@ -64,7 +65,11 @@ pub(super) fn link(
     let msvc = is_msvc(model, target.dir, language);
     let kind = step.kind;
     let policy = Flags::new(model, target, language);
-    let ipo = policy.ipo(config);
+    let ipo = if language == b"CUDA" {
+        super::cuda::arch::ipo_enabled(model, target, config, language)
+    } else {
+        policy.ipo(config)
+    };
     let mut driver = language_flags(model, target, config, language);
     if kind != LinkKind::StaticArchive {
         driver.extend(apple_flags(model, target, config, language));
@@ -232,7 +237,18 @@ pub(super) fn link(
         .collect::<Vec<_>>();
     inputs.extend(manifests.iter().cloned());
     let manifests = join_words(manifests.iter().map(|path| quote(path)));
-    let libraries = link_libraries(model, target, config, &step, darwin, &mut inputs, &wrapper)?;
+    let runtime =
+        super::cuda::runtime::host_args(model, target, config, &step, link_languages, usage)?;
+    let libraries = link_libraries(
+        model,
+        target,
+        config,
+        &step,
+        darwin,
+        &mut inputs,
+        &wrapper,
+        runtime,
+    )?;
     let mut implicit_inputs = Vec::new();
     if kind != LinkKind::StaticArchive
         && let Some(id) = model.find_target(target.dir, &target.name)
@@ -511,6 +527,10 @@ pub(super) fn link(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Runtime libraries follow explicit link fragments."
+)]
 fn link_libraries(
     model: &ProjectModel,
     target: &Target,
@@ -519,6 +539,7 @@ fn link_libraries(
     darwin: bool,
     inputs: &mut Vec<BString>,
     wrapper: &LinkerDriver<'_>,
+    runtime_args: Vec<BString>,
 ) -> Result<BString, ResolveError> {
     if step.kind == LinkKind::StaticArchive {
         return Ok(BString::default());
@@ -543,6 +564,7 @@ fn link_libraries(
         arguments.push(wrapper.argument(&fragment.text.value)?);
     }
     arguments.extend(rpaths.into_iter().flatten());
+    arguments.extend(runtime_args.iter().map(|arg| quote(arg)));
     if let Some(standard) = definition(
         model,
         target.dir,
@@ -905,13 +927,27 @@ fn rpath_entries(
             let path = Lexical::new(&join(build, library)).normalize();
             let file = Lexical::new(&path);
             if darwin
-                && build_path.prefix(file)
-                && let Some(parent) = framework_search_path(&path)
+                && let Some(parent) =
+                    super::install_rpath::framework_runtime_directory(model, target, &path)
             {
-                paths.insert(parent.into());
-            } else if build_path.prefix(file) && shared_library(file.filename()) {
+                let directory =
+                    super::install_rpath::translated_link_directory(model, target, parent);
+                paths.insert(directory.unwrap_or_else(|| parent.into()));
+            } else if shared_library(file.filename())
+                && (build_path.prefix(file)
+                    || super::install_rpath::translated_link_directory(
+                        model,
+                        target,
+                        file.parent(),
+                    )
+                    .is_some())
+            {
                 let parent = Lexical::new(file.parent());
-                let path = if origin {
+                let translated =
+                    super::install_rpath::translated_link_directory(model, target, file.parent());
+                let path = if let Some(directory) = translated {
+                    directory
+                } else if origin {
                     parent.relative(output_dir).map_or_else(
                         || file.parent().into(),
                         |rel| {
@@ -928,13 +964,12 @@ fn rpath_entries(
                 paths.insert(path);
             }
         }
+    } else if target_property(model, target, b"INSTALL_RPATH_USE_LINK_PATH")
+        .is_some_and(|value| truth::is_on(value))
+    {
+        paths.extend(super::install_rpath::external_link_directories(
+            model, target, libraries,
+        ));
     }
     paths
-}
-
-fn framework_search_path(path: &[u8]) -> Option<&[u8]> {
-    let suffix = b".framework/";
-    let index = path.windows(suffix.len()).position(|part| part == suffix)?;
-    let framework = path.get(..index + suffix.len() - 1)?;
-    Some(Lexical::new(framework).parent())
 }

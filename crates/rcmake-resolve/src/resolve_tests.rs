@@ -1,5 +1,6 @@
 mod app_bundle;
 mod excluded_export;
+mod languages;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -198,6 +199,57 @@ fn darwin_framework_items_keep_linker_argument_boundaries() -> TestResult {
             .map(BString::from),
         )
     );
+    Ok(())
+}
+
+#[test]
+fn darwin_imported_framework_adds_search_and_runtime_paths() -> TestResult {
+    let mut model = project();
+    let binary = "/sdk/lib/QtCore.framework/Versions/A/QtCore";
+    let mut core = target("QtCore", TargetKind::SharedLibrary, &[]);
+    core.origin = TargetOrigin::Imported(ImportedVisibility::Global);
+    core.props.set("FRAMEWORK".into(), "1".into());
+    core.props.set("IMPORTED_LOCATION".into(), binary.into());
+    model.add_target(core)?;
+    let mut plain = target("Plain", TargetKind::SharedLibrary, &[]);
+    plain.origin = TargetOrigin::Imported(ImportedVisibility::Global);
+    plain.props.set(
+        "IMPORTED_LOCATION".into(),
+        "/other/Plain.framework/Plain".into(),
+    );
+    model.add_target(plain)?;
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.usage.link_libraries = Some(vec![link_item("QtCore"), link_item("Plain")]);
+    model.add_target(app)?;
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.c"), b"")?;
+    let result = resolve(&model, &host, &[])?;
+    let link = result
+        .targets
+        .last()
+        .and_then(|target| target.link.as_ref())
+        .ok_or("Expected a link step.")?;
+    let fragments = link
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.text.value.as_slice(), fragment.role))
+        .collect::<Vec<_>>();
+    assert!(fragments.contains(&(b"-F/sdk/lib".as_slice(), LinkFragmentRole::FrameworkPath)));
+    assert!(
+        !fragments
+            .iter()
+            .any(|(text, _)| text.starts_with(b"-F/other")),
+        "A target without FRAMEWORK must not add a framework search path."
+    );
+    let BuildStep::Link { invocations, .. } = link_build_step(&result.graphs[0], "app")? else {
+        return Err("Expected a link command.".into());
+    };
+    let argv = invocations
+        .iter()
+        .flat_map(|invocation| invocation.argv.iter())
+        .collect::<Vec<_>>();
+    assert!(argv.contains(&&BString::from("-Wl,-rpath,/sdk/lib")));
+    assert!(argv.contains(&&BString::from(binary)));
     Ok(())
 }
 

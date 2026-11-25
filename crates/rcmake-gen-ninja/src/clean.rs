@@ -9,10 +9,17 @@ use rcmake_resolve::usage::UsageResolver;
 use crate::{Graph, generation_error};
 
 impl Graph<'_> {
-    pub(crate) fn set_clean_files(&mut self, model: Option<&ProjectModel>) -> Result<(), GenError> {
-        let Some(model) = model else { return Ok(()) };
+    pub(crate) fn set_clean_files(
+        &mut self,
+        model: Option<&ProjectModel>,
+        generated: &[BString],
+    ) -> Result<(), GenError> {
+        let mut files: BTreeSet<_> = generated.iter().cloned().collect();
+        let Some(model) = model else {
+            self.clean_files = files;
+            return Ok(());
+        };
         let mut usage = UsageResolver::new(model);
-        let mut files = BTreeSet::new();
         let mut add = |dir: DirId, target, value: &BString| -> Result<(), GenError> {
             let context = EvalContext {
                 config: self.input.config.clone(),

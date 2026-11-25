@@ -263,32 +263,28 @@ pub(super) struct ToolDiscovery<'a> {
 }
 
 impl ToolDiscovery<'_> {
+    /// Return whether a requested tool is disabled because no Qt version was
+    /// found and the target names no explicit executable for it.
+    pub(super) fn missing_qt(&self, kind: Tool) -> bool {
+        let key = kind.property_key(b"_EXECUTABLE");
+        kind.requested(self.target)
+            && self.version.0 == 0
+            && self
+                .target
+                .props
+                .get(&key)
+                .is_none_or(|value| truth::is_off(value))
+    }
+
     /// Resolve the executable and its capabilities for an enabled tool.
-    pub(super) fn find(
-        &self,
-        kind: Tool,
-        diagnostics: &mut Vec<Diagnostic>,
-    ) -> Result<ToolPlan, ResolveError> {
+    pub(super) fn find(&self, kind: Tool) -> Result<ToolPlan, ResolveError> {
         let model = self.model;
         let target = self.target;
-        if !kind.requested(target) {
+        if !kind.requested(target) || self.missing_qt(kind) {
             return Ok(ToolPlan::default());
         }
         let key = kind.property_key(b"_EXECUTABLE");
         let explicit = target.props.get(&key).filter(|value| !truth::is_off(value));
-        if explicit.is_none() && self.version.0 == 0 {
-            diagnostics.push(warning(
-                target,
-                None,
-                format!(
-                    "AUTOGEN: No valid Qt version found for target {}. {} disabled.",
-                    target.name,
-                    String::from_utf8_lossy(kind.property()),
-                )
-                .into(),
-            ));
-            return Ok(ToolPlan::default());
-        }
         let name = format!("Qt{}::{}", self.version.0, kind.name());
         let dependency = explicit
             .is_none()

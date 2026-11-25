@@ -7,6 +7,8 @@ use rcmake_model::{BT, CommandId, TargetId, TargetKind, UsageField, UsageScope};
 
 use crate::{InstallManifest, ide};
 
+mod device_response;
+
 /// Error of resolution or lowering.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ResolveError {
@@ -67,6 +69,10 @@ pub struct ConfigureMetadata {
     pub ctest_command: Option<BString>,
     /// Output command step indices that need the GNU Make jobserver.
     pub jobserver_steps: IndexSet<usize>,
+    /// Auxiliary files that the configure step writes.
+    pub generated_files: Vec<BString>,
+    /// Auxiliary paths that the build system removes on clean.
+    pub clean_files: Vec<BString>,
 }
 
 /// Compiler facts of one language (`toolchains-v1`).
@@ -191,6 +197,8 @@ pub struct FortranTargetInfo {
     pub modules_json: BString,
     /// Directories of module summaries that this target reads.
     pub linked_target_dirs: Vec<BString>,
+    /// Scanner metadata for a Make dependency pass.
+    pub make_depend_info: Option<Box<DependInfo>>,
 }
 
 /// Target data for a module collation step.

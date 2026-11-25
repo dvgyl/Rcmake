@@ -7,17 +7,22 @@ use std::collections::BTreeSet;
 use std::slice::from_ref;
 
 use rcmake_base::BString;
-use rcmake_host::path;
-use rcmake_resolve::{BuildStep, DeviceLinkMode, Invocation};
+use rcmake_resolve::{BuildStep, DeviceLinkMode};
 
 use crate::graph::Graph;
-use crate::syntax::{Edge, Ninja, shell_word};
+use crate::syntax::{Edge, Ninja};
 
 /// Rules shared by the device-link edges of all configurations.
 pub(crate) const RULES: &str = "
 rule CUDA_DEVICE_LINK
   command = $COMMAND
   description = $DESC
+
+rule CUDA_DEVICE_LINK_RSP
+  command = $COMMAND
+  description = $DESC
+  rspfile = $RSP_FILE
+  rspfile_content = $RSP_ARGS
 
 rule CUDA_DEVICE_LINK_CUBIN
   command = $COMMAND
@@ -74,11 +79,25 @@ pub(crate) fn emit(
             inputs.binary_search(input).is_err() && implicit_inputs.binary_search(input).is_err()
         })
         .collect();
+    let raw_output = output;
     let output = graph.node(output);
     match mode {
-        DeviceLinkMode::Driver { invocation, .. } => {
+        DeviceLinkMode::Driver {
+            invocation,
+            response_file,
+        } => {
+            let rsp: BString = [raw_output.as_slice(), b".rsp"].concat().into();
+            let response = response_file
+                .as_ref()
+                .filter(|_| graph.command_settings.force || invocation.shell.len() > 7_500)
+                .and_then(|response| response.rewrite(invocation, &rsp));
+            let rule: &[u8] = if response.is_some() {
+                b"CUDA_DEVICE_LINK_RSP"
+            } else {
+                b"CUDA_DEVICE_LINK"
+            };
             ninja.edge(
-                b"CUDA_DEVICE_LINK",
+                rule,
                 Edge {
                     outputs: from_ref(&output),
                     inputs: &inputs,
@@ -87,7 +106,23 @@ pub(crate) fn emit(
                     ..Edge::default()
                 },
             );
-            ninja.invocation(graph, invocation);
+            if let Some((command, args)) = response {
+                let mut content = Vec::new();
+                for arg in args {
+                    if !content.is_empty() {
+                        content.push(b' ');
+                    }
+                    graph.commands.word(&arg, &mut content);
+                }
+                ninja.invocation(graph, &command);
+                ninja.binding(b"RSP_FILE", &graph.node(&rsp));
+                ninja.binding(b"RSP_ARGS", &content);
+            } else {
+                ninja.invocation(graph, invocation);
+            }
+            if let Some(pool) = graph.pools.get(raw_output) {
+                ninja.binding(b"pool", pool);
+            }
             ninja.binding(
                 b"DESC",
                 format!("Linking {lang} device code {output}").as_bytes(),
@@ -151,117 +186,10 @@ pub(crate) fn emit(
     true
 }
 
-impl Ninja {
-    /// Bind a lowered command and run it from the build directory.
-    pub(crate) fn invocation(&mut self, graph: &Graph<'_>, invocation: &Invocation) {
-        if cfg!(windows) {
-            let build_dir = (!graph.prefix.is_empty()).then(|| path::from_native(graph.build_dir));
-            self.binding(
-                b"COMMAND",
-                &windows_invocation(invocation, build_dir.as_ref()),
-            );
-            return;
-        }
-        let mut command = Vec::new();
-        if let Some(directory) = &invocation.working_dir {
-            command.extend_from_slice(b"cd -- ");
-            shell_word(directory, &mut command);
-            command.extend_from_slice(b" && ");
-        }
-        if invocation.shell.is_empty() {
-            if let Some((program, args)) = invocation.argv.split_first() {
-                shell_word(program, &mut command);
-                for arg in args {
-                    command.push(b' ');
-                    shell_word(arg, &mut command);
-                }
-            } else {
-                command.push(b':');
-            }
-        } else {
-            if invocation.working_dir.is_some() {
-                command.push(b'(');
-            }
-            command.extend_from_slice(&invocation.shell);
-            if invocation.working_dir.is_some() {
-                command.push(b')');
-            }
-        }
-        self.binding(b"COMMAND", &graph.in_build_dir(&command));
-    }
-}
-
-/// Quote one argument for the Windows executable or response-file parser.
-pub(crate) fn windows_argument(word: &[u8], out: &mut Vec<u8>) {
-    if !word.is_empty()
-        && word
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_+-./:=@\\".contains(byte))
-    {
-        out.extend_from_slice(word);
-        return;
-    }
-    out.push(b'"');
-    let mut slashes = 0;
-    for &byte in word {
-        if byte == b'\\' {
-            slashes += 1;
-            continue;
-        }
-        out.extend(std::iter::repeat_n(
-            b'\\',
-            if byte == b'"' {
-                2 * slashes + 1
-            } else {
-                slashes
-            },
-        ));
-        out.push(byte);
-        slashes = 0;
-    }
-    out.extend(std::iter::repeat_n(b'\\', 2 * slashes));
-    out.push(b'"');
-}
-
-fn windows_invocation(invocation: &Invocation, build_dir: Option<&BString>) -> Vec<u8> {
-    let mut script = Vec::new();
-    for directory in build_dir.into_iter().chain(&invocation.working_dir) {
-        // CD parses the quoted path itself, including a trailing backslash.
-        script.extend_from_slice(b"cd /D \"");
-        script.extend_from_slice(directory);
-        script.extend_from_slice(b"\" && ");
-    }
-    let chain =
-        invocation
-            .argv
-            .starts_with(&["cmd.exe".into(), "/D".into(), "/S".into(), "/C".into()]);
-    let uses_shell = chain || invocation.argv.is_empty();
-    let needs_shell = uses_shell || !script.is_empty();
-    if uses_shell {
-        if invocation.shell.is_empty() {
-            script.extend_from_slice(b"ver >NUL");
-        } else {
-            script.extend_from_slice(&invocation.shell);
-        }
-    } else {
-        for (index, word) in invocation.argv.iter().enumerate() {
-            if index != 0 {
-                script.push(b' ');
-            }
-            windows_argument(word, &mut script);
-        }
-    }
-    if needs_shell {
-        [b"cmd.exe /D /S /V:OFF /C \"".as_slice(), &script, b"\""].concat()
-    } else {
-        script
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use rcmake_gen_common::GenError;
-    use rcmake_resolve::{BuildGraph, CubinLink};
+    use rcmake_resolve::{BuildGraph, CubinLink, Invocation};
     use std::{collections::BTreeMap, path::Path};
 
     use super::*;
@@ -298,11 +226,7 @@ mod tests {
         assert!(text.contains(
             "build obj/device$ link.o: CUDA_DEVICE_LINK a$ $$.o z.a | device$ script.ld || order\n"
         ));
-        let argv = if cfg!(windows) {
-            "  COMMAND = \"cuda nvcc\" -dlink z.a \"a $$.o\"\n"
-        } else {
-            "  COMMAND = 'cuda nvcc' -dlink z.a 'a $$.o'\n"
-        };
+        let argv = "  COMMAND = 'cuda nvcc' -dlink z.a 'a $$.o'\n";
         assert!(text.contains(argv), "{text}");
         Ok(())
     }
@@ -358,9 +282,46 @@ mod tests {
     fn windows_quotes_program_arguments_and_working_directory() {
         let mut call = invocation(&[r"C:\Program Files\NVIDIA\nvcc.exe", r"obj\a b.o"]);
         call.working_dir = Some(r"D:\build files\".into());
-        assert_eq!(
-            windows_invocation(&call, None),
-            br#"cmd.exe /D /S /V:OFF /C "cd /D "D:\build files\" && "C:\Program Files\NVIDIA\nvcc.exe" "obj\a b.o"""#
+        let command = crate::commands::Commands::for_windows(b"cmd.exe").line(
+            &[call],
+            false,
+            b"C:/build",
+            false,
         );
+        let script = String::from_utf8_lossy(&command);
+        assert!(script.starts_with("cmd.exe /D /S /V:OFF /C "));
+        assert!(script.contains(r#""C:\Program Files\NVIDIA\nvcc.exe" "obj\a b.o""#));
+        assert!(script.contains("cd /D "));
+        assert!(script.contains("build files"));
+    }
+
+    #[test]
+    fn forced_device_response_file_preserves_input_order() -> Result<(), GenError> {
+        let build = Path::new(if cfg!(windows) { "C:/build" } else { "/build" });
+        let input = BuildGraph::default();
+        let mut graph = Graph::new(&input, &BTreeMap::new(), build, None)?;
+        graph.command_settings.force = true;
+        let step = BuildStep::DeviceLink {
+            lang: "CUDA".into(),
+            output: "device.o".into(),
+            inputs: vec!["a b.o".into(), "c.o".into()],
+            mode: DeviceLinkMode::Driver {
+                invocation: invocation(&[
+                    "nvcc", "-dlink", "a b.o", "c.o", "-o", "device.o", "-lcudart",
+                ]),
+                response_file: Some(rcmake_resolve::DeviceLinkResponseFile {
+                    flag: "--options-file ".into(),
+                    objects: vec!["a b.o".into(), "c.o".into()],
+                    libraries: vec!["-lcudart".into()],
+                }),
+            },
+        };
+        let mut ninja = Ninja::default();
+        assert!(emit(&mut ninja, &graph, &step, &[], &[]));
+        let text = String::from_utf8_lossy(&ninja.0);
+        assert!(text.contains("CUDA_DEVICE_LINK_RSP"));
+        assert!(text.contains("COMMAND = nvcc -dlink --options-file device.o.rsp -o device.o"));
+        assert!(text.contains("RSP_ARGS = 'a b.o' c.o -lcudart"));
+        Ok(())
     }
 }

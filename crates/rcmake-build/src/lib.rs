@@ -119,6 +119,16 @@ pub fn execute(
                 compile_steps.entry(dd).or_default().insert(object, step);
             }
         }
+        for step in &order {
+            if let BuildStep::Collate {
+                tdi, depend_info, ..
+            } = step
+                && let rcmake_resolve::DependInfo::Fortran(info) = depend_info.as_ref()
+            {
+                let data = rcmake_resolve::lower::fortran_depend_info_json(info);
+                write_module_file(host, &build_dir, tdi, &data)?;
+            }
+        }
         let mut module_order: BTreeMap<_, VecDeque<_>> = BTreeMap::new();
         for step in order {
             let step = match step {
@@ -134,9 +144,7 @@ pub fn execute(
                             ddis.get(index)
                                 .and_then(|ddi| scan_objects.get(ddi))
                                 .and_then(|object| compiles.get(object).copied())
-                                .ok_or_else(|| {
-                                    module_error("A C++ module scan has no compile step.")
-                                })
+                                .ok_or_else(|| module_error("A module scan has no compile step."))
                         })
                         .collect::<Result<VecDeque<_>, _>>()?;
                     module_order.insert(dd, sorted);
@@ -148,9 +156,10 @@ pub fn execute(
                 } => module_order
                     .get_mut(dd)
                     .and_then(VecDeque::pop_front)
-                    .ok_or_else(|| module_error("A C++ compile step has no collated scan."))?,
+                    .ok_or_else(|| module_error("A compile step has no collated scan."))?,
                 _ => step,
             };
+            let device_invocations;
             let (outputs, invocations): (&[BString], &[Invocation]) = match step {
                 BuildStep::Custom(step) => {
                     for byproduct in &step.byproducts {
@@ -187,8 +196,32 @@ pub fn execute(
                     }
                     (std::slice::from_ref(ddi), std::slice::from_ref(invocation))
                 }
-                BuildStep::DeviceLink { .. } => {
-                    return Err(BuildError::UnsupportedStep("device link"));
+                BuildStep::DeviceLink { output, mode, .. } => {
+                    use rcmake_resolve::DeviceLinkMode;
+                    device_invocations = match mode {
+                        DeviceLinkMode::Driver { invocation, .. } => vec![invocation.clone()],
+                        DeviceLinkMode::Explicit {
+                            cubins,
+                            fatbinary,
+                            fatbin_header,
+                            register_header,
+                            compile,
+                        } => {
+                            for file in cubins
+                                .iter()
+                                .map(|cubin| &cubin.output)
+                                .chain([fatbin_header, register_header])
+                            {
+                                create_output_parent(host, &build_dir, file)?;
+                            }
+                            cubins
+                                .iter()
+                                .map(|cubin| cubin.invocation.clone())
+                                .chain([fatbinary.clone(), compile.clone()])
+                                .collect()
+                        }
+                    };
+                    (std::slice::from_ref(output), &device_invocations)
                 }
                 BuildStep::Collate { .. } => {
                     return Err(module_error("Expected a compiler or scanner invocation."));
@@ -259,7 +292,10 @@ fn collate_modules(
         Ok(read_modules_json(&read(&file)?)?)
     };
     let rcmake_resolve::DependInfo::Cxx(info) = depend_info.as_ref() else {
-        return Err(BuildError::UnsupportedStep("Fortran collation"));
+        return ddis
+            .iter()
+            .map(|ddi| Ok(parse_ddi(&read(ddi)?, ddi)?))
+            .collect();
     };
     let mut info = info.clone();
     let module_dir = Lexical::new(dd).parent();

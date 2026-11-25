@@ -70,9 +70,16 @@ pub(super) fn plan_step<'a>(
             progress: None,
             jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
         },
-        BuildStep::DeviceLink { .. } => {
-            return Err(GenError::Unimplemented("device linking for Unix Makefiles"));
-        }
+        BuildStep::DeviceLink { output, inputs, .. } => Step {
+            action,
+            goal: make_path(output),
+            outputs: super::cuda::clean_artifacts(action, build_dir),
+            inputs: inputs.iter().map(make_path).collect(),
+            depfile: None,
+            always: false,
+            progress: None,
+            jobserver_aware: false,
+        },
         BuildStep::Scan { .. } | BuildStep::Collate { .. } => {
             return Err(GenError::Unimplemented(
                 "C++ module build steps for Unix Makefiles",

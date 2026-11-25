@@ -6,8 +6,8 @@ use rcmake_resolve::{
 };
 
 use super::{
-    Config, Context, Kind, Plan, absolute, flags_table, ide_flags, join, msbuild, msbuild_value,
-    object_path, source_kind, string, windows,
+    Command, Config, Context, Kind, Plan, Rule, absolute, flags_table, ide_flags, join, msbuild,
+    msbuild_value, object_path, source_kind, string, windows,
 };
 
 impl Context<'_> {
@@ -55,6 +55,26 @@ impl Context<'_> {
         if config.link.has("ModuleDefinitionFile") {
             return;
         }
+        if let Some(fact) = fact
+            && let Some(command) = self.definition_command(fact)
+            && let Some(output) = command.argv.get(3)
+        {
+            let output = absolute(&self.settings.bin, &string(output));
+            config
+                .link
+                .set("ModuleDefinitionFile", msbuild(&windows(&output)));
+            config.events.get_mut(1).into_iter().for_each(|rules| {
+                rules.push(Rule {
+                    commands: vec![Command {
+                        argv: command.argv.iter().map(|arg| string(arg)).collect(),
+                        dir: self.settings.bin.clone(),
+                    }],
+                    message: "Generate the module definition file".into(),
+                    ..Rule::default()
+                });
+            });
+            return;
+        }
         let mut definitions = plan.items.values().filter(|item| {
             item.kind == Kind::Other
                 && item
@@ -71,6 +91,34 @@ impl Context<'_> {
                 .link
                 .set("ModuleDefinitionFile", msbuild(&windows(&file.path)));
         }
+    }
+
+    fn definition_command(&self, fact: &ResolvedTarget) -> Option<&rcmake_resolve::Invocation> {
+        let graph = self
+            .result
+            .graphs
+            .iter()
+            .find(|graph| graph.config == fact.config)?;
+        let target = graph
+            .targets
+            .iter()
+            .find(|target| target.name == fact.metadata.name)?;
+        target
+            .steps
+            .iter()
+            .filter_map(|index| graph.steps.get(*index))
+            .find_map(|step| {
+                let BuildStep::Link { invocations, .. } = step else {
+                    return None;
+                };
+                invocations.iter().find(|command| {
+                    command.argv.get(1).is_some_and(|arg| arg == b"-E")
+                        && command
+                            .argv
+                            .get(2)
+                            .is_some_and(|arg| arg == b"__create_def")
+                })
+            })
     }
 
     pub(super) fn ide_link(&self, ide: &IdeFacts, config: &str) -> flags_table::Settings {

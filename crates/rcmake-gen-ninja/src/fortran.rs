@@ -9,12 +9,19 @@ use std::slice::from_ref;
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_resolve::{BuildStep, DependInfo, FortranTargetInfo, Invocation};
 
-use crate::cuda::windows_argument;
+use crate::commands::windows_argument;
 use crate::graph::Graph;
 use crate::syntax::{Edge, Ninja, shell_word};
 
 /// Minimum Ninja version that supports Fortran dyndep files.
 pub(crate) const REQUIRED_VERSION: &str = "1.10";
+
+pub(crate) fn uses_fortran(graph: &rcmake_resolve::BuildGraph) -> bool {
+    graph
+        .steps
+        .iter()
+        .any(|step| matches!(step, BuildStep::Collate { lang, .. } if lang == "Fortran"))
+}
 
 /// Rules for scanning and collation.
 ///
@@ -168,7 +175,7 @@ pub(crate) fn emit_collate(
         if !response.is_empty() {
             response.push(b' ');
         }
-        response_argument(ddi, &mut response, cfg!(windows));
+        response_argument(ddi, &mut response, graph.commands.windows());
     }
     ninja.binding(b"RSP_ARGS", &response);
     true
@@ -246,7 +253,7 @@ fn option(flag: &[u8], path: &[u8]) -> BString {
 
 fn response_argument(path: &[u8], out: &mut Vec<u8>, windows: bool) {
     if windows {
-        windows_argument(path, out);
+        windows_argument(path, out, false);
     } else {
         shell_word(path, out);
     }

@@ -170,9 +170,12 @@ impl PlanContext<'_, '_> {
             configurations: self.configs,
             per_config: multi && better,
         };
-        let moc = discovery.find(Tool::Moc, diagnostics)?;
-        let uic = discovery.find(Tool::Uic, diagnostics)?;
-        let rcc = discovery.find(Tool::Rcc, diagnostics)?;
+        if let Some(warning) = missing_qt_warning(model, target, &discovery) {
+            diagnostics.push(warning);
+        }
+        let moc = discovery.find(Tool::Moc)?;
+        let uic = discovery.find(Tool::Uic)?;
+        let rcc = discovery.find(Tool::Rcc)?;
         if !(moc.enabled || uic.enabled || rcc.enabled) {
             return Ok(None);
         }
@@ -913,4 +916,41 @@ fn missing_origin() -> ResolveError {
 fn stable_unique(values: &mut Vec<BString>) {
     let mut seen = BTreeSet::new();
     values.retain(|value| seen.insert(value.clone()));
+}
+
+/// Report, in one author warning, the requested tools that have no Qt version.
+fn missing_qt_warning(
+    model: &ProjectModel,
+    target: &Target,
+    discovery: &ToolDiscovery<'_>,
+) -> Option<Diagnostic> {
+    let tools = Tool::ALL
+        .into_iter()
+        .filter(|&tool| discovery.missing_qt(tool))
+        .collect::<Vec<_>>();
+    let names = tools
+        .iter()
+        .map(|tool| String::from_utf8_lossy(tool.property()))
+        .collect::<Vec<_>>();
+    let listed = match names.split_last() {
+        None => return None,
+        Some((last, [])) => last.to_string(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    };
+    let component = if tools.contains(&Tool::Uic) {
+        "Widgets"
+    } else {
+        "Core"
+    };
+    let mut warning = scan::warning(
+        target,
+        None,
+        format!(
+            "AUTOGEN: No valid Qt version found for target {}.  {listed} disabled.  Consider adding:\n  find_package(Qt<QTVERSION> COMPONENTS {component})\nto your CMakeLists.txt file.",
+            target.name,
+        )
+        .into(),
+    );
+    warning.location = crate::cxx_modules::generation_location(model, target);
+    Some(warning)
 }

@@ -414,6 +414,8 @@ fn write_common(
     let prefix = prefix
         .as_ref()
         .map_or(b"/usr/local".as_slice(), |value| value.as_slice());
+    let staging = interp.cx().var(b"CMAKE_STAGING_PREFIX");
+    let install_prefix = staging.as_ref().map_or(prefix, |value| value.as_slice());
     let configuration = interp.cx().var_or_empty(b"CMAKE_BUILD_TYPE");
     let configuration = if configuration.is_empty()
         && interp
@@ -456,7 +458,7 @@ fn write_common(
         }
     } else {
         let options = common::install_script::InstallScriptOptions {
-            prefix,
+            prefix: install_prefix,
             configuration,
             export_files: &export_files,
             ..Default::default()

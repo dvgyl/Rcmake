@@ -7,6 +7,7 @@ use std::{collections::BTreeSet, path::Path};
 
 use rcmake_base::{BString, path_lex::Lexical, shell::quote_always};
 use rcmake_gen_common::GenError;
+use rcmake_host::Host;
 use rcmake_resolve::{BuildStep, DeviceLinkMode, Invocation};
 
 use crate::{
@@ -31,6 +32,7 @@ pub(crate) fn emit(
     link_depends: &[BString],
     build_file: &[u8],
     progress_number: Option<usize>,
+    host: &dyn Host,
 ) -> Result<bool, GenError> {
     let BuildStep::DeviceLink {
         lang,
@@ -43,7 +45,11 @@ pub(crate) fn emit(
     };
     let intermediates = intermediate_paths(mode).map(|path| build_path(path, build_dir));
     let output = build_path(output, build_dir);
-    let inputs = prerequisites(inputs.iter().chain(link_depends), build_dir)?;
+    let mut inputs = prerequisites(inputs.iter().chain(link_depends), build_dir)?;
+    let response = response_invocation(host, build_dir, &output, mode)?;
+    if let Some((file, _)) = &response {
+        inputs.insert(file.clone());
+    }
     check_make_path(&output)?;
     check_make_path(build_file)?;
     rule(
@@ -70,7 +76,9 @@ pub(crate) fn emit(
     add_directory(&output);
     let mut invocations = Vec::new();
     match mode {
-        DeviceLinkMode::Driver { invocation, .. } => invocations.push(invocation),
+        DeviceLinkMode::Driver { invocation, .. } => {
+            invocations.push(response.as_ref().map_or(invocation, |(_, command)| command));
+        }
         DeviceLinkMode::Explicit {
             cubins,
             fatbinary,
@@ -104,6 +112,40 @@ pub(crate) fn emit(
         out.extend_from_slice(b"endif\n");
     }
     Ok(true)
+}
+
+fn response_invocation(
+    host: &dyn Host,
+    build_dir: &Path,
+    output: &[u8],
+    mode: &DeviceLinkMode,
+) -> Result<Option<(BString, Invocation)>, GenError> {
+    let DeviceLinkMode::Driver {
+        invocation,
+        response_file: Some(response),
+    } = mode
+    else {
+        return Ok(None);
+    };
+    let forced = host
+        .env_get(b"CMAKE_CUDA_USE_RESPONSE_FILE_FOR_OBJECTS")
+        .is_some_and(|value| rcmake_base::truth::is_on(&value));
+    if !forced && invocation.shell.len() <= 7_500 {
+        return Ok(None);
+    }
+    let file: BString = [output, b".rsp"].concat().into();
+    let Some((command, args)) = response.rewrite(invocation, &file) else {
+        return Ok(None);
+    };
+    let mut contents = Vec::new();
+    for argument in args {
+        if !contents.is_empty() {
+            contents.push(b' ');
+        }
+        contents.extend_from_slice(&rcmake_base::shell::quote(&argument));
+    }
+    crate::write_makefile(host, build_dir, &file, &contents)?;
+    Ok(Some((file, command)))
 }
 
 /// Return the device object and all intermediate files for Make clean.
@@ -210,6 +252,7 @@ mod tests {
             &["a $file.ld".into(), "a $file.ld".into()],
             b"CMakeFiles/app.dir/build.make",
             None,
+            &rcmake_host::PureHost::default(),
         )?);
         Ok((String::from_utf8_lossy(&out).into_owned(), products))
     }

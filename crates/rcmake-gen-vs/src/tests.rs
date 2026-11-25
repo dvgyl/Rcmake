@@ -1019,3 +1019,85 @@ fn writes_windows_link_artifacts_and_resource_options() {
     assert!(client.contains(r"\build tree\archive files\shared import.lib"));
     assert!(client.contains("<LinkLibraryDependencies>false</LinkLibraryDependencies>"));
 }
+
+#[test]
+fn writes_the_configured_module_definition_pre_link_command()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = if cfg!(windows) { "C:/work" } else { "/work" };
+    let bin = Path::new(root).join("build");
+    let source = Path::new(root).join("src");
+    let host = PureHost::new(bin.clone(), bin.join("cmake"));
+    let mut model = ProjectModel::default();
+    model.set_root_dirs(
+        rcmake_host::path::from_native_cmake(&source),
+        rcmake_host::path::from_native_cmake(&bin),
+    );
+    let id = model.add_target(target("dll", TargetKind::SharedLibrary, ""))?;
+    let mut config = BuildGraph::default().config;
+    config.0 = "Debug".into();
+    let result = GenerationResult {
+        configs: vec![config.clone()],
+        targets: vec![ResolvedTarget {
+            id,
+            config: config.clone(),
+            metadata: TargetMetadata {
+                name: "dll".into(),
+                kind: TargetKind::SharedLibrary,
+                source_dir: rcmake_host::path::from_native_cmake(&source),
+                binary_dir: rcmake_host::path::from_native_cmake(&bin),
+                backtrace: Default::default(),
+                folder: None,
+                exclude_from_all: false,
+                generator_provided: false,
+            },
+            ide: Some(Box::new(IdeFacts::default())),
+            artifacts: Default::default(),
+            compile_groups: Vec::new(),
+            compile_units: Vec::new(),
+            link: None,
+            dependencies: Vec::new(),
+            cxx_modules: None,
+            fortran: None,
+        }],
+        graphs: vec![BuildGraph {
+            config,
+            steps: vec![BuildStep::Link {
+                step: rcmake_resolve::LinkStep {
+                    kind: rcmake_resolve::LinkKind::SharedLibrary,
+                    language: "C".into(),
+                    fragments: Vec::new(),
+                    output: "dll.dll".into(),
+                },
+                inputs: Vec::new(),
+                implicit_inputs: Vec::new(),
+                invocations: vec![Invocation {
+                    argv: [
+                        "cmake",
+                        "-E",
+                        "__create_def",
+                        "dll.dir/exports.def",
+                        "dll.dir/exports.def.objs",
+                    ]
+                    .into_iter()
+                    .map(BString::from)
+                    .collect(),
+                    ..Default::default()
+                }],
+            }],
+            targets: vec![GraphTarget {
+                name: "dll".into(),
+                steps: vec![0],
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    };
+    generate(VsVersion::Vs17, &result, &model, &host, &bin)?;
+    let xml = host.read(&bin.join("dll.vcxproj"), ReadRange::All { limit: 65_536 })?;
+    let xml = String::from_utf8(xml)?;
+    assert!(xml.contains("ModuleDefinitionFile"));
+    assert!(xml.contains(r"dll.dir\exports.def"));
+    assert!(xml.contains("PreLinkEvent"));
+    assert!(xml.contains("__create_def dll.dir/exports.def dll.dir/exports.def.objs"));
+    Ok(())
+}

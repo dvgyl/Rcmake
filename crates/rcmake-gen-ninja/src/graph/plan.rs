@@ -9,6 +9,7 @@ pub(super) struct EdgePlan {
     pub(super) rule: &'static [u8],
     pub(super) inputs: Vec<BString>,
     pub(super) implicit_inputs: Vec<BString>,
+    pub(super) order_only: Vec<BString>,
     pub(super) implicit_outputs: Vec<BString>,
     pub(super) dyndep: Option<BString>,
     pub(super) bindings: Vec<(&'static [u8], BString)>,
@@ -20,6 +21,7 @@ impl EdgePlan {
             rule,
             inputs,
             implicit_inputs: Vec::new(),
+            order_only: Vec::new(),
             implicit_outputs: nodes.byproducts.clone(),
             dyndep: None,
             bindings: Vec::new(),
@@ -273,20 +275,37 @@ impl<'a> Graph<'a> {
                 plan
             }
             BuildStep::Custom(custom) => {
-                let inputs = custom
+                let resolved = custom
                     .depends
                     .iter()
                     .map(|input| self.custom_input(input))
-                    .collect();
+                    .collect::<Vec<_>>();
+                // CMake also lists the absolute path of each file in the build tree,
+                // so a depfile that names the absolute path finds this edge.
+                let aliases = custom
+                    .outputs
+                    .iter()
+                    .chain(&custom.byproducts)
+                    .filter_map(|name| self.absolute_alias(&self.node(name)))
+                    .collect::<Vec<_>>();
                 if custom.invocations.is_empty() {
-                    return Ok(EdgePlan::new(b"phony", inputs, nodes));
+                    let inputs = resolved.into_iter().map(|input| input.node).collect();
+                    let mut plan = EdgePlan::new(b"phony", inputs, nodes);
+                    plan.implicit_outputs.extend(aliases);
+                    return Ok(plan);
                 }
+                // A target without a file only orders the command, as in CMake.
+                let (targets, files): (Vec<_>, Vec<_>) =
+                    resolved.into_iter().partition(|input| input.target_only);
+                let inputs = files.into_iter().map(|input| input.node).collect();
                 let rule = if is_library_symlink(custom) {
                     b"CMAKE_SYMLINK_LIBRARY".as_slice()
                 } else {
                     b"CUSTOM_COMMAND"
                 };
                 let mut plan = EdgePlan::new(rule, inputs, nodes);
+                plan.order_only = targets.into_iter().map(|input| input.node).collect();
+                plan.implicit_outputs.extend(aliases);
                 let script = nodes
                     .outputs
                     .first()

@@ -424,7 +424,7 @@ pub(crate) struct FileSetMember<'a> {
     pub(crate) relative_directory: BString,
 }
 
-fn collect_file_sets<'a>(
+pub(crate) fn collect_file_sets<'a>(
     model: &'a ProjectModel,
     paths: &SourcePaths<'_>,
     usage: &mut UsageResolver<'a>,

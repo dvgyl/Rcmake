@@ -28,7 +28,10 @@ use crate::{
     usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver, handle},
 };
 
+mod autogen;
 mod cross;
+mod cuda;
+mod fortran;
 use crate::usage::provenance::Provenance;
 use cross::CrossPlan;
 
@@ -99,6 +102,9 @@ fn resolve_project(
     paths.ide = options.ide;
     paths.collect_source_errors = collect_source_errors;
     paths.index_source_records(model);
+    let autogen = autogen::prepare(model, &mut paths, &configs)?;
+    let model = autogen.as_ref().map_or(model, |plan| &plan.model);
+    paths.index_source_records(model);
     paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
     let mut configured_targets = configs
         .iter()
@@ -119,6 +125,13 @@ fn resolve_project(
     ) {
         validate_languages(model, &paths, &configured_targets)?;
     }
+    cuda::validate(
+        model,
+        &paths,
+        configured_targets
+            .iter()
+            .flat_map(|config| config.targets.values()),
+    )?;
     validate_target_sources(model, &paths, &configured_targets)?;
     if paths.missing_sources() {
         return Err(ResolveError::Reported("Cannot find source file.".into()));
@@ -170,6 +183,9 @@ fn resolve_project(
     if let Some(error) = xcode_link_error {
         return Err(error);
     }
+    if let Some(autogen) = &autogen {
+        autogen.write_info(host, &targets)?;
+    }
     warn_link_flags(model, host, &targets);
     let mut install =
         lower::lower_install_manifest_with_configs(model, &targets, &configs, options.ide, host)
@@ -196,6 +212,13 @@ fn resolve_project(
         }
     }
     let mut metadata = lower::collect_metadata(model);
+    if let Some(autogen) = &autogen {
+        metadata
+            .listfiles
+            .extend(autogen.reconfigure_inputs.iter().cloned());
+        metadata.generated_files.clone_from(&autogen.info_outputs);
+        metadata.clean_files.clone_from(&autogen.clean_paths);
+    }
     if model.generator == Some(GeneratorKind::UnixMakefiles)
         && let Some(graph) = graphs.first()
     {
@@ -802,6 +825,7 @@ fn resolve_config(
             }
         }
     }
+    let fortran = fortran::prepare(model, paths, &mut usage, &mut resolved, &inputs, &ctx)?;
     let mut resolved = resolved.into_values().collect::<Vec<_>>();
     let mut ide_custom = IndexMap::new();
     let graph = lower::lower_with_inputs(
@@ -809,6 +833,7 @@ fn resolve_config(
         &resolved,
         config,
         &inputs,
+        &fortran,
         &mut usage,
         &mut ide_custom,
         compile_inputs,
@@ -822,6 +847,7 @@ fn resolve_config(
             &resolved,
             config,
             &inputs,
+            &fortran,
             &mut usage,
             &mut IndexMap::new(),
             &mut BTreeMap::new(),

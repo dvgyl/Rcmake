@@ -78,6 +78,9 @@ pub(crate) fn require_device_linking(
     if let Some(value) = target.props.get(&resolves) {
         return truth::is_on(value);
     }
+    if target.kind == TargetKind::StaticLibrary {
+        return false;
+    }
     if !closure_langs
         .iter()
         .any(|language| language.as_slice() == lang)

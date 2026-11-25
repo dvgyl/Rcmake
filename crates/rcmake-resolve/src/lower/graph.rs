@@ -25,6 +25,7 @@ use crate::{
     unity::TargetUnity, usage::UsageResolver,
 };
 
+mod device;
 mod order;
 
 /// Lower resolved targets for one configuration.
@@ -39,6 +40,7 @@ pub fn lower(
         model,
         targets,
         config,
+        &IndexMap::new(),
         &IndexMap::new(),
         &mut UsageResolver::new(model),
         &mut IndexMap::new(),
@@ -56,6 +58,7 @@ pub(crate) fn lower_with_inputs(
     targets: &[ResolvedTarget],
     config: &ConfigId,
     inputs: &IndexMap<TargetId, TargetInputs>,
+    fortran: &IndexMap<TargetId, super::fortran::FortranPlan>,
     usage: &mut UsageResolver<'_>,
     ide_custom: &mut IndexMap<TargetId, Vec<IdeCustomStep>>,
     compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
@@ -133,11 +136,19 @@ pub(crate) fn lower_with_inputs(
             &commands,
             &precompiled,
             (&lint, &framework_dirs),
+            fortran.get(&resolved.id),
             usage,
             &mut graph.steps,
             compile_inputs,
         )?;
-        plan.add_link_and_target_commands(&artifacts, objects, &commands, usage, &mut graph.steps)?;
+        plan.add_link_and_target_commands(
+            &artifacts,
+            objects,
+            &commands,
+            usage,
+            &resolved_targets,
+            &mut graph.steps,
+        )?;
 
         if let Some(events) = plan.ide_steps {
             let rules = plan
@@ -468,6 +479,7 @@ impl<'a> TargetPlan<'a> {
         commands: &Commands<'_>,
         precompiled: &pch::Plans,
         (lint, framework_dirs): (&IndexMap<BString, bool>, &[(BString, bool)]),
+        fortran: Option<&super::fortran::FortranPlan>,
         usage: &mut UsageResolver<'_>,
         graph_steps: &mut Vec<BuildStep>,
         compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
@@ -491,6 +503,11 @@ impl<'a> TargetPlan<'a> {
             position_independent,
         )? {
             self.steps.insert(push(graph_steps, step));
+        }
+        if let Some(plan) = fortran {
+            for step in plan.scan_steps(model, target, resolved, position_independent)? {
+                self.steps.insert(push(graph_steps, step));
+            }
         }
         let mut pch_languages = IndexSet::new();
         for unit in &resolved.compile_units {
@@ -532,6 +549,7 @@ impl<'a> TargetPlan<'a> {
                             position_independent,
                             skip_file_set_linting: None,
                             extra_framework_dirs: framework_dirs,
+                            compile_input: None,
                         },
                         usage,
                     )?;
@@ -549,13 +567,16 @@ impl<'a> TargetPlan<'a> {
                     self.steps.insert(push(graph_steps, step));
                 }
             }
+            let fortran_group = fortran
+                .filter(|_| group.language == "Fortran")
+                .map(|plan| plan.compile_group(model, target, unit, group));
             let mut step = compile(
                 model,
                 target,
                 config,
                 artifacts,
                 unit,
-                group,
+                fortran_group.as_ref().unwrap_or(group),
                 Settings {
                     standard: required_standard,
                     pch: pch.map(|(_, plan)| PchFlags::Use(plan)),
@@ -564,6 +585,7 @@ impl<'a> TargetPlan<'a> {
                         .get(&Lexical::new(&unit.source.value).normalize())
                         .copied(),
                     extra_framework_dirs: framework_dirs,
+                    compile_input: fortran.and_then(|plan| plan.compile_input(&unit.object)),
                 },
                 usage,
             )?;
@@ -584,6 +606,9 @@ impl<'a> TargetPlan<'a> {
                         .map(|info| info.dyndep.clone());
                 }
             }
+            if let Some(plan) = fortran {
+                plan.bind_compile(&mut step);
+            }
             self.steps.insert(push(graph_steps, step));
         }
         Ok(objects)
@@ -592,9 +617,10 @@ impl<'a> TargetPlan<'a> {
     fn add_link_and_target_commands(
         &mut self,
         artifacts: &ArtifactSet,
-        objects: Vec<BString>,
+        mut objects: Vec<BString>,
         commands: &Commands<'_>,
         usage: &mut UsageResolver<'_>,
+        resolved_targets: &IndexMap<TargetId, &ResolvedTarget>,
         graph_steps: &mut Vec<BuildStep>,
     ) -> Result<(), ResolveError> {
         let (model, config, target, resolved) =
@@ -657,6 +683,13 @@ impl<'a> TargetPlan<'a> {
                         .clone_from(&linker_artifacts.file);
                 }
             }
+            let languages = device::link_languages(resolved, resolved_targets);
+            let device = device::plan(model, target, resolved, &step, &languages, &objects, usage)?;
+            if let Some(device) = &device
+                && !objects.contains(&device.output)
+            {
+                objects.push(device.output.clone());
+            }
             let link = link(
                 model,
                 target,
@@ -666,6 +699,7 @@ impl<'a> TargetPlan<'a> {
                 objects,
                 self.inputs.map(|inputs| &inputs.sources),
                 position_independent,
+                &languages,
                 usage,
             )
             .map_err(|error| {
@@ -692,6 +726,27 @@ impl<'a> TargetPlan<'a> {
                         implicit_inputs.push(dependency);
                     }
                 }
+            }
+            if let Some(device) = device
+                && let BuildStep::Link {
+                    implicit_inputs, ..
+                } = &link
+            {
+                let mut inputs = device.inputs;
+                for dependency in implicit_inputs {
+                    if !inputs.contains(dependency) {
+                        inputs.push(dependency.clone());
+                    }
+                }
+                self.steps.insert(push(
+                    graph_steps,
+                    BuildStep::DeviceLink {
+                        lang: device.lang,
+                        output: device.output,
+                        inputs,
+                        mode: device.mode,
+                    },
+                ));
             }
             let symlink = if matches!(
                 model.generator,

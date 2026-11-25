@@ -105,6 +105,32 @@ def architecture(option: str, value: str) -> str:
     return f"{option}={value}"
 
 
+def expand_response_files(argv: list[str], depth: int = 0) -> list[str]:
+    if depth >= 8:
+        raise ValueError("The response file nesting limit is 8.")
+    result = []
+    arguments = iter(argv)
+    for argument in arguments:
+        option, _, value = argument.partition("=")
+        if option in {"--options-file", "-optf"}:
+            value = value or next(arguments, "")
+            if not value:
+                raise ValueError(f"Missing response file for {option}.")
+            paths = value.split(",")
+        elif argument.startswith("@"):
+            paths = [argument[1:]]
+        else:
+            result.append(argument)
+            continue
+        for path in paths:
+            with open(path, "r", encoding="utf-8") as stream:
+                content = stream.read(1024 * 1024 + 1)
+            if len(content) > 1024 * 1024:
+                raise ValueError(f"Response file is too large: {path}.")
+            result.extend(expand_response_files(shlex.split(content), depth + 1))
+    return result
+
+
 def parse(argv: list[str]) -> Invocation:
     result = Invocation()
     arguments = iter(argv)
@@ -316,7 +342,7 @@ def run(argv: list[str]) -> int:
         if argv != ["-v"]:
             return 0
 
-    options = parse(argv)
+    options = parse(expand_response_files(argv))
     root = Path(os.environ.get("MOCK_CUDA_ROOT", Path(sys.argv[0]).absolute().parent.parent))
     if options.mode not in {"host", "device-link"}:
         output = options.output

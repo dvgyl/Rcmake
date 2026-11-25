@@ -477,6 +477,18 @@ fn append_link_item(
                     .or_else(|| usage.artifact(*id, ArtifactKind::File, ArtifactPart::Full, config))
             };
             if let Some(path) = path {
+                if lower::is_darwin(model, dir)
+                    && model.target(*id).is_some_and(|target| {
+                        target.is_imported()
+                            && target
+                                .props
+                                .get(b"FRAMEWORK")
+                                .is_some_and(|value| truth::is_on(value))
+                    })
+                    && let Some(directory) = imported_framework_parent(&path)
+                {
+                    append_framework_dir(model, dir, directory, &item.text, fragments);
+                }
                 append_library_path(model, dir, &path, &item.text, fragments);
                 return;
             }
@@ -511,6 +523,16 @@ fn append_link_item(
         ResolvedLinkKind::Raw => (naming.library(value), Libraries),
     };
     fragments.push(link_fragment(text, &item.text, role));
+}
+
+/// Return the directory that contains `<Name>.framework` for a binary inside
+/// that bundle, for example `/sdk/lib` for `/sdk/lib/Qt.framework/Versions/A/Qt`.
+fn imported_framework_parent(path: &[u8]) -> Option<&[u8]> {
+    let marker = b".framework/";
+    let end = path.windows(marker.len()).position(|part| part == marker)?;
+    let bundle = path.get(..end + marker.len() - 1)?;
+    let parent = Lexical::new(bundle).parent();
+    (!parent.is_empty()).then_some(parent)
 }
 
 fn is_framework_option(value: &[u8]) -> bool {

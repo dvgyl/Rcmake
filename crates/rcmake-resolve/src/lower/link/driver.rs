@@ -166,7 +166,10 @@ pub(super) fn definition_file(
         .is_none_or(|value| truth::is_on(value));
     let generated = result.inputs.len() > 1 || export_all;
     let file = if generated
-        && usage.ide().is_none()
+        && matches!(
+            usage.ide(),
+            None | Some(crate::ide::IdeFlavor::VisualStudio)
+        )
         && let Some(paths) = usage.source_paths()
     {
         let dir = object_dir(model, target, config);
@@ -348,7 +351,7 @@ pub(super) fn library_file(arg: &[u8]) -> bool {
         && (arg.contains(&b'/') || arg.contains(&b'\\') || library_extension)
 }
 
-pub(super) fn shared_library(name: &[u8]) -> bool {
+pub(in crate::lower) fn shared_library(name: &[u8]) -> bool {
     name.ends_with(b".dylib")
         || name.ends_with(b".so")
         || name.windows(4).any(|part| part == b".so.")

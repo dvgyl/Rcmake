@@ -32,6 +32,7 @@ pub(crate) struct Graph<'a> {
     pub(crate) command_settings: crate::response::Settings<'a>,
     custom_scripts: HashMap<BString, BString>,
     names: HashMap<BString, usize>,
+    fortran_info: HashMap<&'a [u8], &'a rcmake_resolve::FortranTargetInfo>,
     scan_responses: HashMap<&'a [u8], &'a ScanResponse>,
     pub(crate) compile_languages: HashMap<&'a [u8], &'a [u8]>,
     compile_inputs: Option<&'a std::collections::BTreeMap<BString, Vec<BString>>>,
@@ -40,7 +41,7 @@ pub(crate) struct Graph<'a> {
     artifact_targets: HashSet<usize>,
     producers: HashMap<BString, usize>,
     generated_inputs: HashMap<BString, BString>,
-    pools: HashMap<BString, BString>,
+    pub(crate) pools: HashMap<BString, BString>,
     steps: Vec<StepNodes<'a>>,
     order_only_alias_bytes: usize,
     compile_prerequisites: Vec<Vec<usize>>,
@@ -98,6 +99,7 @@ impl<'a> Graph<'a> {
             command_settings: crate::response::Settings::default(),
             custom_scripts: HashMap::new(),
             names: HashMap::with_capacity(input.targets.len()),
+            fortran_info: HashMap::new(),
             scan_responses: HashMap::new(),
             compile_languages: HashMap::new(),
             compile_inputs: None,
@@ -133,8 +135,22 @@ impl<'a> Graph<'a> {
             match step {
                 BuildStep::Compile { object, .. } => nodes.outputs.push(graph.node(object)),
                 BuildStep::Link { step, .. } => nodes.outputs.push(graph.node(&step.output)),
-                BuildStep::DeviceLink { .. } => {
-                    return Err(GenError::Unimplemented("device linking for Ninja"));
+                BuildStep::DeviceLink { output, mode, .. } => {
+                    nodes.outputs.push(graph.node(output));
+                    if let rcmake_resolve::DeviceLinkMode::Explicit {
+                        cubins,
+                        fatbin_header,
+                        register_header,
+                        ..
+                    } = mode
+                    {
+                        nodes
+                            .byproducts
+                            .extend(cubins.iter().map(|cubin| graph.node(&cubin.output)));
+                        nodes
+                            .byproducts
+                            .extend([graph.node(fatbin_header), graph.node(register_header)]);
+                    }
                 }
                 BuildStep::Scan {
                     ddi, preprocessed, ..
@@ -144,11 +160,15 @@ impl<'a> Graph<'a> {
                         .byproducts
                         .extend(preprocessed.iter().map(|output| graph.node(output)));
                 }
-                BuildStep::Collate { dd, modmaps, .. } => {
+                BuildStep::Collate {
+                    lang, dd, modmaps, ..
+                } => {
                     nodes.outputs.push(graph.node(dd));
-                    nodes
-                        .byproducts
-                        .push(graph.node(&modules::modules_json(dd)));
+                    nodes.byproducts.push(graph.node(&if lang == "Fortran" {
+                        Lexical::new(Lexical::new(dd).parent()).append(b"FortranModules.json")
+                    } else {
+                        modules::modules_json(dd)
+                    }));
                     nodes
                         .byproducts
                         .extend(modmaps.iter().map(|map| graph.node(map)));
@@ -377,6 +397,9 @@ impl<'a> Graph<'a> {
                     BuildStep::Link { step, .. } => {
                         (b"JOB_POOL_LINK".as_slice(), &step.output, None)
                     }
+                    BuildStep::DeviceLink { output, .. } => {
+                        (b"JOB_POOL_LINK".as_slice(), output, None)
+                    }
                     _ => continue,
                 };
                 let dir = model.dir(target.dir);
@@ -506,8 +529,12 @@ impl<'a> Graph<'a> {
                         "Invalid Ninja build step index.",
                     ));
                 };
-                if matches!(step, BuildStep::Compile { .. } | BuildStep::Scan { .. })
-                    && let Some(nodes) = self.steps.get_mut(index)
+                if matches!(
+                    step,
+                    BuildStep::Compile { .. }
+                        | BuildStep::Scan { .. }
+                        | BuildStep::DeviceLink { .. }
+                ) && let Some(nodes) = self.steps.get_mut(index)
                     && has_prerequisites
                 {
                     nodes
@@ -576,6 +603,20 @@ impl<'a> Graph<'a> {
     pub(crate) fn set_compile_metadata(&mut self, result: &'a GenerationResult) {
         self.compile_languages = progress::compile_languages(result, self.input);
         self.command_settings.result = Some(result);
+        self.fortran_info.extend(
+            result
+                .targets
+                .iter()
+                .filter(|target| target.config == self.input.config)
+                .filter_map(|target| Some((target, target.fortran.as_ref()?)))
+                .flat_map(|(target, info)| {
+                    target
+                        .compile_units
+                        .iter()
+                        .map(move |unit| (unit.object.as_slice(), info))
+                }),
+        );
+
         self.compile_inputs = Some(&result.compile_inputs);
         self.scan_responses.extend(
             result
@@ -684,13 +725,31 @@ impl<'a> Graph<'a> {
         );
     }
 
-    fn custom_input(&self, input: &[u8]) -> BString {
+    /// Return the absolute path of a node in the build tree. Nodes outside the
+    /// build tree, and nodes under an output path prefix, have no alias.
+    fn absolute_alias(&self, node: &[u8]) -> Option<BString> {
+        if !self.prefix.is_empty() || node.is_empty() || self.commands.absolute(node) {
+            return None;
+        }
+        let mut alias = self.build_root.clone();
+        if !alias.ends_with(b"/") {
+            alias.push(b'/');
+        }
+        alias.extend_from_slice(node);
+        Some(alias)
+    }
+
+    fn custom_input(&self, input: &[u8]) -> CustomInput {
         let node = self.node(input);
+        let file = |node: BString| CustomInput {
+            node,
+            target_only: false,
+        };
         if let Some(output) = self.generated_inputs.get(&node) {
-            return output.clone();
+            return file(output.clone());
         }
         let Some(&index) = self.names.get(&node) else {
-            return node;
+            return file(node);
         };
         // The resolver converts target dependencies with artifacts to file paths.
         // Bare target names can still refer to targets without artifacts.
@@ -703,9 +762,12 @@ impl<'a> Graph<'a> {
                     .get(index)
                     .is_some_and(|target| target.steps.contains(producer)))
         {
-            return node;
+            return file(node);
         }
-        self.aliases.get(index).cloned().unwrap_or(node)
+        CustomInput {
+            node: self.aliases.get(index).cloned().unwrap_or(node),
+            target_only: true,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -718,18 +780,58 @@ impl<'a> Graph<'a> {
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
     ) -> Result<(), GenError> {
-        let plan = self.plan_step(step, nodes, cmake, modmap_flag, exports)?;
-        let inputs = unique(plan.inputs);
-        let implicit = unique(plan.implicit_inputs);
+        let mut language_inputs = Vec::new();
+        let mut plan = match step {
+            BuildStep::DeviceLink { .. } => None,
+            BuildStep::Collate { lang, .. } if lang == "Fortran" => None,
+            BuildStep::Scan { lang, object, .. } if lang == "Fortran" => {
+                language_inputs.extend(
+                    self.compile_inputs
+                        .and_then(|inputs| inputs.get(object))
+                        .into_iter()
+                        .flatten()
+                        .map(|path| self.node(path)),
+                );
+                None
+            }
+            BuildStep::Compile {
+                object,
+                dyndep: Some(_),
+                modmap: None,
+                ..
+            } if self.compile_languages.get(object.as_slice()) == Some(&b"Fortran".as_slice()) => {
+                language_inputs.extend(
+                    self.compile_inputs
+                        .and_then(|inputs| inputs.get(object))
+                        .into_iter()
+                        .flatten()
+                        .map(|path| self.node(path)),
+                );
+                None
+            }
+            _ => Some(self.plan_step(step, nodes, cmake, modmap_flag, exports)?),
+        };
+        let inputs = plan
+            .as_mut()
+            .map_or_else(Vec::new, |plan| unique(std::mem::take(&mut plan.inputs)));
+        let implicit = plan.as_mut().map_or_else(
+            || unique(language_inputs),
+            |plan| unique(std::mem::take(&mut plan.implicit_inputs)),
+        );
+        let dyndep = plan.as_ref().and_then(|plan| plan.dyndep.as_ref());
+        let planned = plan
+            .as_ref()
+            .map_or(&[][..], |plan| plan.order_only.as_slice());
         let mut order_only = Vec::new();
-        if plan.dyndep.is_some() || !nodes.order_only.is_empty() {
+        if dyndep.is_some() || !nodes.order_only.is_empty() || !planned.is_empty() {
             let mut seen: HashSet<_> = inputs
                 .iter()
                 .chain(&implicit)
                 .chain(&nodes.outputs)
                 .chain(&nodes.byproducts)
                 .collect();
-            order_only.extend(plan.dyndep.iter().filter(|node| seen.insert(node)));
+            order_only.extend(dyndep.into_iter().filter(|node| seen.insert(node)));
+            order_only.extend(planned.iter().filter(|node| seen.insert(node)));
             for entry in &nodes.order_only {
                 match entry {
                     OrderOnly::Targets(indices) => order_only.extend(
@@ -757,6 +859,44 @@ impl<'a> Graph<'a> {
                 }
             }
         }
+        let Some(plan) = plan.as_ref() else {
+            match step {
+                BuildStep::DeviceLink { .. } => {
+                    crate::cuda::emit(ninja, self, step, &[], &order_only);
+                }
+                BuildStep::Collate { .. } => {
+                    let raw = self
+                        .command_settings
+                        .result
+                        .and_then(|result| {
+                            result
+                                .metadata
+                                .cmake_command
+                                .as_ref()
+                                .map(|path| path.as_slice())
+                        })
+                        .filter(|path| !path.is_empty())
+                        .unwrap_or(b"cmake");
+                    crate::fortran::emit_collate(ninja, self, step, raw);
+                }
+                BuildStep::Scan { object, .. } => {
+                    let info = self.fortran_info.get(object.as_slice()).ok_or_else(|| {
+                        generation_error(self.build_dir, "Missing Fortran dependency information.")
+                    })?;
+                    crate::fortran::emit_scan(ninja, self, step, info, &implicit, &order_only);
+                }
+                BuildStep::Compile { .. } => {
+                    crate::fortran::emit_compile(ninja, self, step, &implicit, &order_only);
+                }
+                _ => {
+                    return Err(generation_error(
+                        self.build_dir,
+                        "Invalid language build step.",
+                    ));
+                }
+            }
+            return Ok(());
+        };
         ninja.edge(
             plan.rule,
             Edge {
@@ -768,11 +908,18 @@ impl<'a> Graph<'a> {
             },
         );
 
-        for (key, value) in plan.bindings {
-            ninja.binding(key, &value);
+        for (key, value) in &plan.bindings {
+            ninja.binding(key, value);
         }
         Ok(())
     }
+}
+
+/// A custom command input after target names map to Ninja nodes.
+struct CustomInput {
+    node: BString,
+    /// The input names a target without a file, so it only orders the command.
+    target_only: bool,
 }
 
 fn is_library_symlink(custom: &rcmake_resolve::CustomStep) -> bool {

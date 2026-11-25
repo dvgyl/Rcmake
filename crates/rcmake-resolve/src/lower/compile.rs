@@ -157,7 +157,19 @@ fn compile_flags(
     flags.extend(standard);
     flags.extend(apple_flags(model, target, config, language));
     let policy = Flags::new(model, target, language);
-    flags.extend(policy.compile(policy.ipo(config), position_independent));
+    let ipo = if language == b"CUDA" {
+        super::cuda::arch::ipo_enabled(model, target, config, language)
+    } else {
+        policy.ipo(config)
+    };
+    flags.extend(policy.compile(ipo, position_independent));
+    if language == b"CUDA" {
+        flags.extend(
+            super::cuda::compile_flags(model, target, config)
+                .iter()
+                .map(|flag| quote(flag)),
+        );
+    }
 
     if let Some(default) = definition(model, target.dir, b"CMAKE_MSVC_RUNTIME_LIBRARY_DEFAULT")
         .filter(|value| !value.is_empty())
@@ -419,6 +431,7 @@ pub(super) struct Settings<'a> {
     pub(super) pch: Option<PchFlags<'a>>,
     pub(super) position_independent: Option<bool>,
     pub(super) skip_file_set_linting: Option<bool>,
+    pub(super) compile_input: Option<&'a BString>,
     pub(super) extra_framework_dirs: &'a [(BString, bool)],
 }
 
@@ -517,7 +530,8 @@ pub(super) fn compile(
         None
     };
     let lookup_paths = |key: &[u8]| match key {
-        b"SOURCE" => Some(quote(&source)),
+        b"SOURCE" => Some(quote(settings.compile_input.unwrap_or(&source))),
+        b"CUDA_COMPILE_MODE" => Some(super::cuda::compile_mode(model, target)),
         b"TARGET_NAME" => Some(quote(&target.name)),
         b"LANGUAGE" => Some(quote(language)),
         b"CMAKE_CURRENT_BINARY_DIR" => Some(quote(&model.dir(target.dir).binary_dir)),

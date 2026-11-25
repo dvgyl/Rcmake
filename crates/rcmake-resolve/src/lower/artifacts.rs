@@ -416,46 +416,7 @@ pub fn source_language(model: &ProjectModel, target: &Target, source: &[u8]) -> 
         return Some(language.clone());
     }
     let (_, extension) = Lexical::new(source).stem_extension(true);
-    ["C", "CXX", "OBJC", "OBJCXX", "ASM", "Fortran", "CUDA", "RC"]
-        .into_iter()
-        .find(|language| source_extension(model, target, language, extension))
-        .map(BString::from)
-}
-
-fn source_extension(
-    model: &ProjectModel,
-    target: &Target,
-    language: &str,
-    extension: &[u8],
-) -> bool {
-    let extension = extension.strip_prefix(b".").unwrap_or(extension);
-    if language == "RC" {
-        return extension.eq_ignore_ascii_case(b"rc")
-            && definition(model, target.dir, b"CMAKE_RC_COMPILER")
-                .is_some_and(|compiler| !truth::is_off(compiler));
-    }
-    if let Some(values) = definition(
-        model,
-        target.dir,
-        format!("CMAKE_{language}_SOURCE_FILE_EXTENSIONS").as_bytes(),
-    ) {
-        return list::split(values, list::Empty::Drop)
-            .iter()
-            .any(|value| value == extension);
-    }
-    match language {
-        "C" => extension == b"c",
-        "CXX" => matches!(
-            extension,
-            b"C" | b"cc" | b"cpp" | b"CPP" | b"cxx" | b"c++" | b"ixx" | b"cppm"
-        ),
-        "OBJC" => extension == b"m",
-        "OBJCXX" => extension == b"mm",
-        "ASM" => matches!(extension, b"s" | b"S" | b"asm"),
-        "Fortran" => matches!(extension, b"f" | b"F" | b"f90" | b"F90"),
-        "CUDA" => extension == b"cu",
-        _ => false,
-    }
+    crate::sources::language_for_extension(model, target.dir, extension)
 }
 
 pub(crate) fn compile_object_path(
@@ -532,13 +493,19 @@ fn object_name(
         .cloned()
         .or_else(|| source_language(model, target, source))
         .and_then(|lang| {
+            if lang == "CUDA"
+                && let Some(extension) = super::cuda::output_extension(target)
+            {
+                return Some(extension);
+            }
             definition(
                 model,
                 target.dir,
                 &[b"CMAKE_", lang.as_slice(), b"_OUTPUT_EXTENSION"].concat(),
             )
+            .map(|value| value.as_slice())
         })
-        .map_or(b".o".as_slice(), |v| v.as_slice());
+        .unwrap_or(b".o");
     if short {
         let hash_input = relative.unwrap_or_else(|| absolute.normalize());
         let hash = sha3_prefix(&hash_input, 8);
@@ -713,6 +680,7 @@ pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
             .enumerate()
             .filter_map(|(step, command)| command.job_server_aware.then_some(step))
             .collect(),
+        ..ConfigureMetadata::default()
     }
 }
 

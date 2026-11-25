@@ -94,3 +94,17 @@ pub(crate) fn shell_word(word: &[u8], out: &mut Vec<u8>) {
 
     out.extend_from_slice(&quote_always(word));
 }
+
+impl Ninja {
+    /// Bind an invocation using the graph command dialect and build directory.
+    pub(crate) fn invocation(
+        &mut self,
+        graph: &crate::graph::Graph<'_>,
+        invocation: &rcmake_resolve::Invocation,
+    ) {
+        self.binding(
+            b"COMMAND",
+            &graph.command_line(std::slice::from_ref(invocation), false),
+        );
+    }
+}

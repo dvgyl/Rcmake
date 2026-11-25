@@ -69,16 +69,14 @@ pub(crate) fn uses_modules(graph: &BuildGraph) -> bool {
     graph.steps.iter().any(|step| {
         matches!(
             step,
-            BuildStep::Scan { .. }
-                | BuildStep::Collate { .. }
-                | BuildStep::Compile {
-                    modmap: Some(_),
-                    ..
-                }
-                | BuildStep::Compile {
-                    dyndep: Some(_),
-                    ..
-                }
+            BuildStep::Compile {
+                modmap: Some(_),
+                ..
+            }
+        ) || matches!(
+            step,
+
+            BuildStep::Scan { lang, .. } | BuildStep::Collate { lang, .. } if lang == "CXX"
         )
     })
 }
@@ -160,17 +158,30 @@ pub(crate) fn write_metadata(
             else {
                 continue;
             };
-            let rcmake_resolve::DependInfo::Cxx(depend_info) = depend_info.as_ref() else {
-                return Err(GenError::Unimplemented("Fortran collation for Ninja"));
-            };
             let file = absolute(&top_bld, tdi);
             let path = path::to_native(&file);
             if !seen.insert(file) {
                 return Err(generation_error(
                     &path,
-                    "Duplicate Ninja C++ dependency metadata file.",
+                    "Duplicate Ninja dependency metadata file.",
                 ));
             }
+            if let Some(directory) = path.parent() {
+                host.create_dir_all(directory)
+                    .map_err(|error| generation_error(directory, error.to_string()))?;
+            }
+            let depend_info = match depend_info.as_ref() {
+                rcmake_resolve::DependInfo::Fortran(info) => {
+                    crate::write_if_changed(
+                        host,
+                        &path,
+                        &rcmake_resolve::lower::fortran_depend_info_json(info),
+                    )?;
+                    files.push(tdi.clone());
+                    continue;
+                }
+                rcmake_resolve::DependInfo::Cxx(info) => info,
+            };
             let resolved = targets.get(&(&graph.config, target)).copied();
             let mut info = TargetDependInfo {
                 language: "CXX".into(),
@@ -278,10 +289,6 @@ pub(crate) fn write_metadata(
             }
             let contents =
                 write_tdi(&info).map_err(|error| generation_error(&path, error.to_string()))?;
-            if let Some(directory) = path.parent() {
-                host.create_dir_all(directory)
-                    .map_err(|error| generation_error(directory, error.to_string()))?;
-            }
             write_if_changed(host, &path, &contents)?;
             files.push(tdi.clone());
         }

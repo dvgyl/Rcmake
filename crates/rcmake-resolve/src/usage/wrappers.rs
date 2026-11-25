@@ -270,6 +270,7 @@ impl UsageResolver<'_> {
             head: None,
             traversal: Default::default(),
             link_language: None,
+            device_link: false,
             command_config: None,
             output_config: None,
         };

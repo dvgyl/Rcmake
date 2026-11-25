@@ -69,7 +69,7 @@ fn rcc_checks_imported_paths_and_preserves_explicit_overrides()
             configurations: &[],
             per_config: false,
         }
-        .find(Tool::Rcc, &mut Vec::new())
+        .find(Tool::Rcc)
     };
     let Err(error) = find(&app) else {
         return Err("Expected an invalid imported rcc path.".into());

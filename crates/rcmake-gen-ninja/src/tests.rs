@@ -118,7 +118,7 @@ fn single_config_writes_rules_edges_and_utilities() {
     let build = read(&host, "build.ninja");
     for line in [
         "include CMakeFiles/rules.ninja",
-        "build generated$ $$$:file | include${ninja_pipe}generated.h: CUSTOM_COMMAND /work/config.in",
+        "build generated$ $$$:file | include${ninja_pipe}generated.h /work/build/generated$ $$$:file /work/build/include${ninja_pipe}generated.h: CUSTOM_COMMAND /work/config.in",
         "  COMMAND = (cd -- '/work/a dir' && printf '%s' '$$value')",
         "  DESC = Generate $$: file",
         "  depfile = a $$:file.d",
@@ -162,6 +162,70 @@ fn single_config_writes_rules_edges_and_utilities() {
         original,
         host.metadata(&manifest, Follow::Yes)
             .map(|metadata| metadata.mtime)
+    );
+}
+
+#[test]
+fn custom_command_orders_after_a_target_without_a_file() {
+    let host = PureHost::default();
+    let result = GenerationResult {
+        graphs: vec![BuildGraph {
+            steps: vec![
+                BuildStep::Custom(CustomStep {
+                    invocations: vec![Invocation {
+                        argv: vec!["true".into()],
+                        ..Invocation::default()
+                    }],
+                    ..CustomStep::default()
+                }),
+                BuildStep::Custom(CustomStep {
+                    outputs: vec!["stamp".into()],
+                    depends: vec!["order_deps".into(), "/work/tool".into()],
+                    invocations: vec![Invocation {
+                        argv: vec!["touch".into(), "stamp".into()],
+                        ..Invocation::default()
+                    }],
+                    ..CustomStep::default()
+                }),
+                BuildStep::Custom(CustomStep {
+                    depends: vec!["stamp".into(), "order_deps".into()],
+                    ..CustomStep::default()
+                }),
+            ],
+            targets: vec![
+                GraphTarget {
+                    name: "order_deps".into(),
+                    steps: vec![0],
+                    ..GraphTarget::default()
+                },
+                GraphTarget {
+                    name: "generate".into(),
+                    steps: vec![1, 2],
+                    depends: vec![0],
+                    in_all: true,
+                },
+            ],
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    generate_single_config(&result, &host, Path::new("/work/build"))
+        .unwrap_or_else(|error| panic!("{error}"));
+    let build = read(&host, "build.ninja");
+    let stamp = build
+        .lines()
+        .find(|line| line.starts_with("build stamp "))
+        .unwrap_or_else(|| panic!("Missing the stamp edge in:\n{build}"));
+    // A phony target with no inputs is always dirty, so it must not be an explicit input.
+    assert_eq!(
+        stamp,
+        "build stamp | /work/build/stamp: CUSTOM_COMMAND /work/tool || order_deps"
+    );
+    assert!(
+        build
+            .lines()
+            .any(|line| line.starts_with("build generate: phony") && line.contains("order_deps")),
+        "A phony edge keeps the target as an input:\n{build}"
     );
 }
 
@@ -232,7 +296,7 @@ fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std
                 "build libdemo.so.1 | libdemo.so libdemo.lib: LINK_SHARED_LIBRARY\n",
                 "  COMMAND = :\n",
                 "  DESC = Linking C shared library libdemo.so.1\n",
-                "build check: phony libdemo.so\n",
+                "build check | /work/build/check: phony libdemo.so\n",
                 "build libdemo.so$:Debug: phony libdemo.so.1 libdemo.so libdemo.lib\n",
                 "build all$:Debug: phony libdemo.so$:Debug\n",
                 "build all: phony all$:Debug\n"

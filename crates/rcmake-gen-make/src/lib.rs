@@ -108,14 +108,23 @@ fn generate_impl(
         report_progress,
         verify_globs,
     )?;
-    let dispatch = dispatch(graph, &targets, &prep, report_progress)?;
+    let dispatch = dispatch(
+        graph,
+        &targets,
+        &prep,
+        report_progress,
+        &result.metadata.clean_files,
+    )?;
     let languages = rcmake_resolve::progress::compile_languages(result, graph);
     let build_files = targets
         .iter()
-        .map(|target| build_file(target, &languages))
+        .map(|target| build_file(target, &languages, &build_dir, &cmake, host))
         .collect::<Result<Vec<_>, _>>()?;
 
     for (target, contents) in targets.iter().zip(build_files) {
+        if let Some(fortran) = &target.fortran {
+            fortran.write(host, &build_dir, target)?;
+        }
         write_makefile(host, &build_dir, &target.file, &contents)?;
     }
     write_makefile(host, &build_dir, MAKEFILE2, &dispatch)?;
@@ -139,6 +148,7 @@ struct Target<'a> {
     dependencies: BTreeSet<usize>,
     rules: Vec<Step<'a>>,
     products: Vec<BString>,
+    fortran: Option<fortran::TargetDepend<'a>>,
 }
 
 struct Step<'a> {
@@ -167,12 +177,18 @@ fn build_path(value: &[u8], build_dir: &Path) -> BString {
 }
 
 fn plan_targets<'a>(
-    result: &GenerationResult,
+    result: &'a GenerationResult,
     graph: &'a BuildGraph,
     build_dir: &Path,
     project: Option<&ProjectModel>,
 ) -> Result<Vec<Target<'a>>, GenError> {
     let mut targets = Vec::with_capacity(graph.targets.len());
+    let resolved: BTreeMap<_, _> = result
+        .targets
+        .iter()
+        .filter(|target| target.config == graph.config)
+        .map(|target| (target.metadata.name.as_slice(), target))
+        .collect();
     let mut names = BTreeMap::new();
     for (index, target) in graph.targets.iter().enumerate() {
         let name = target.name.as_slice();
@@ -202,6 +218,9 @@ fn plan_targets<'a>(
             dependencies: target.depends.iter().copied().collect(),
             rules: Vec::new(),
             products: Vec::new(),
+            fortran: resolved
+                .get(name)
+                .and_then(|target| fortran::TargetDepend::new(target)),
         });
     }
 
@@ -545,6 +564,7 @@ fn dispatch(
     targets: &[Target<'_>],
     prep: &prep::Targets,
     report_progress: bool,
+    clean_paths: &[BString],
 ) -> Result<Vec<u8>, GenError> {
     let mut out = makefile();
     phony(
@@ -562,6 +582,11 @@ fn dispatch(
         b"clean",
         targets.iter().map(|target| target.clean_goal.as_slice()),
     );
+    for path in clean_paths {
+        out.push_str(b"	$(SILENT)rm -rf -- ");
+        make_recipe_text(&mut out, &quote_always(path))?;
+        out.push(b'\n');
+    }
     phony(&mut out, b"preinstall", []);
     for target in targets {
         phony(
@@ -573,6 +598,9 @@ fn dispatch(
                 .filter_map(|&index| targets.get(index))
                 .map(|target| target.goal.as_slice()),
         );
+        if let Some(fortran) = &target.fortran {
+            recursive_make(&mut out, &target.file, &fortran.scan_goal);
+        }
         recursive_make(&mut out, &target.file, &target.goal);
         if report_progress {
             progress::complete(&mut out, target)?;
@@ -593,6 +621,9 @@ fn dispatch(
 fn build_file(
     target: &Target<'_>,
     languages: &std::collections::HashMap<&[u8], &[u8]>,
+    build_dir: &Path,
+    cmake: &[u8],
+    host: &dyn Host,
 ) -> Result<Vec<u8>, GenError> {
     let mut out = makefile();
     out.push_str(b".DELETE_ON_ERROR:\n");
@@ -602,13 +633,31 @@ fn build_file(
         target.rules.iter().map(|step| step.goal.as_slice()),
     );
     phony(&mut out, &target.clean_goal, []);
+    if let Some(fortran) = &target.fortran {
+        fortran.emit_clean(&mut out, cmake)?;
+    }
     for product in target.products.iter().collect::<BTreeSet<_>>() {
         out.push_str(b"\t$(SILENT)rm -f -- ");
         make_recipe_text(&mut out, &quote_always(product))?;
         out.push(b'\n');
     }
     phony(&mut out, FORCE, []);
+    if let Some(fortran) = &target.fortran {
+        fortran.emit(&mut out, target, cmake, build_dir)?;
+    }
     for step in &target.rules {
+        if cuda::emit(
+            &mut out,
+            build_dir,
+            step.action,
+            &[],
+            &target.file,
+            step.progress,
+            host,
+        )? {
+            continue;
+        }
+        cuda::emit_link_depends(&mut out, build_dir, step.action)?;
         write_step(&mut out, step, &target.file, languages)?;
     }
     Ok(out)

@@ -180,6 +180,72 @@ pub(crate) fn apply_compile_properties(
     Ok(())
 }
 
+pub(crate) fn language_for_extension(
+    model: &ProjectModel,
+    dir: DirId,
+    extension: &[u8],
+) -> Option<BString> {
+    let extension = extension.strip_prefix(b".").unwrap_or(extension);
+    let registry = model.languages();
+    if let Some(language) = registry.language_for_extension(extension) {
+        return Some(language.clone());
+    }
+    let definition = |key: &[u8]| crate::lower::definition(model, dir, key);
+    let defaults = ["C", "CXX", "OBJC", "OBJCXX", "ASM", "Fortran", "CUDA", "RC"];
+    let enabled = model.global.props.get(b"ENABLED_LANGUAGES");
+    let languages = enabled.map_or_else(
+        || defaults.iter().map(|lang| BString::from(*lang)).collect(),
+        |value| list::split(value, list::Empty::Drop),
+    );
+    let mut ignored = registry.is_ignored(extension);
+    for language in languages.iter().rev() {
+        let key = [b"CMAKE_", language.as_slice(), b"_SOURCE_FILE_EXTENSIONS"].concat();
+        if definition(&key)
+            .is_some_and(|value| list::iter(value, list::Empty::Drop).any(|item| item == extension))
+        {
+            return Some(language.clone());
+        }
+        let key = [b"CMAKE_", language.as_slice(), b"_IGNORE_EXTENSIONS"].concat();
+        ignored |= definition(&key).is_some_and(|value| {
+            list::iter(value, list::Empty::Drop).any(|item| item == extension)
+        });
+    }
+    if ignored {
+        return None;
+    }
+    // CMake maps an extension only to an enabled language. A source with no
+    // enabled language is not compiled, for example AUTOMOC's
+    // mocs_compilation.cpp in a C-only project.
+    defaults
+        .into_iter()
+        .filter(|language| languages.iter().any(|enabled| enabled == language))
+        .find(|language| {
+            if *language == "RC" {
+                return extension.eq_ignore_ascii_case(b"rc")
+                    && definition(b"CMAKE_RC_COMPILER")
+                        .is_some_and(|compiler| !truth::is_off(compiler));
+            }
+            let key = format!("CMAKE_{language}_SOURCE_FILE_EXTENSIONS");
+            if definition(key.as_bytes()).is_some() {
+                return false;
+            }
+            match *language {
+                "C" => extension == b"c",
+                "CXX" => matches!(
+                    extension,
+                    b"C" | b"cc" | b"cpp" | b"CPP" | b"cxx" | b"c++" | b"ixx" | b"cppm"
+                ),
+                "OBJC" => extension == b"m",
+                "OBJCXX" => extension == b"mm",
+                "ASM" => matches!(extension, b"s" | b"S" | b"asm"),
+                "Fortran" => matches!(extension, b"f" | b"F" | b"f90" | b"F90"),
+                "CUDA" => extension == b"cu",
+                _ => false,
+            }
+        })
+        .map(BString::from)
+}
+
 pub(crate) fn append_compile_flags(
     flags: &mut Vec<BT<BString>>,
     value: &[u8],

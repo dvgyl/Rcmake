@@ -14,6 +14,7 @@ pub(super) struct CudaConfig {
     defines: Vec<String>,
     options: String,
     architectures: Vec<String>,
+    device_options: String,
     runtime: Option<String>,
     separable: bool,
     mode: Option<CompileMode>,
@@ -185,14 +186,14 @@ impl Context<'_> {
         let separable = own_cuda
             && property(b"CUDA_SEPARABLE_COMPILATION", None)?
                 .is_some_and(|value| truth::is_on(&value));
-        let device_link = (separable || !dependencies.is_empty())
-            && property(b"CUDA_RESOLVE_DEVICE_SYMBOLS", None)?.map_or(
-                matches!(
+        let device_link = property(b"CUDA_RESOLVE_DEVICE_SYMBOLS", None)?.map_or(
+            (separable || !dependencies.is_empty())
+                && matches!(
                     self.project.kind,
                     TargetKind::Executable | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
                 ),
-                |value| truth::is_on(&value),
-            );
+            |value| truth::is_on(&value),
+        );
         let runtime = if let Some(default) = self
             .definition(b"CMAKE_CUDA_RUNTIME_LIBRARY_DEFAULT")
             .filter(|value| !value.is_empty())
@@ -201,11 +202,37 @@ impl Context<'_> {
         } else {
             None
         };
-        let architectures = property(
+        let architecture = property(
             b"CUDA_ARCHITECTURES",
             self.definition(b"CMAKE_CUDA_ARCHITECTURES"),
-        )?
-        .map_or_else(Vec::new, |value| self.architecture_flags(&value));
+        )?;
+        let flags = |device| {
+            rcmake_resolve::lower::cuda_ide_flags(
+                self.model,
+                id,
+                name.as_bytes(),
+                architecture.as_ref(),
+                device,
+            )
+            .map(|flags| flags.iter().map(|flag| string(flag)).collect::<Vec<_>>())
+            .map_err(gen_error)
+        };
+        let (architectures, device_options) =
+            if self.definition(b"CMAKE_CUDA_COMPILER_ID").is_some() {
+                (
+                    flags(false)?,
+                    if device_link {
+                        flags(true)?.join(" ")
+                    } else {
+                        String::new()
+                    },
+                )
+            } else {
+                let flags =
+                    architecture.map_or_else(Vec::new, |value| self.architecture_flags(&value));
+                let options = flags.join(" ");
+                (flags, options)
+            };
         let compile = fact.and_then(|fact| fact.ide.as_deref()).and_then(|ide| {
             ide.compile
                 .iter()
@@ -229,6 +256,7 @@ impl Context<'_> {
             defines,
             options: options.join(" "),
             architectures,
+            device_options,
             runtime,
             separable,
             mode,
@@ -291,14 +319,13 @@ impl Context<'_> {
                 ..Default::default()
             },
         );
-        let architecture_flags = config.architectures.join(" ");
         cuda::link_options(
             xml,
             &cuda::LinkOptions {
                 target_kind: Some(self.project.kind),
                 perform_device_link: config.device_link,
                 dependencies: &config.dependencies,
-                additional_options: OptionText::Literal(&architecture_flags),
+                additional_options: OptionText::Literal(&config.device_options),
                 ..Default::default()
             },
         );

@@ -343,6 +343,41 @@ impl TargetSettings<'_> {
         }
         self.add_product_settings(&mut settings, product, plist);
         self.add_compile_settings(&mut settings, ide);
+        if let Some(target) = self.target
+            && let Some(fortran) = &target.fortran
+        {
+            let groups = target
+                .compile_groups
+                .iter()
+                .filter(|group| group.language == "Fortran");
+            let flags = ide
+                .into_iter()
+                .flat_map(|ide| &ide.compile)
+                .filter(|group| group.language == "Fortran")
+                .flat_map(|group| group.flags.iter().map(|flag| flag_text(&flag.value)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let includes = fortran
+                .module_dir
+                .iter()
+                .cloned()
+                .chain(groups.flat_map(|group| {
+                    group
+                        .includes
+                        .iter()
+                        .map(|include| include.path.value.clone())
+                }))
+                .collect::<Vec<_>>();
+            crate::fortran_asm::add_fortran_settings(
+                &mut settings,
+                &includes,
+                &flags,
+                self.raw
+                    .props
+                    .get(b"Fortran_FORMAT")
+                    .map(|format| format.as_slice()),
+            );
+        }
         self.add_link_settings(&mut settings, product, ide);
         if let Some(ide) = ide {
             for (key, value) in &ide.attributes {

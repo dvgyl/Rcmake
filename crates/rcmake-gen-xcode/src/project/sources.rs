@@ -98,6 +98,30 @@ impl Project<'_> {
                     _ => None,
                 };
                 if let Some((items, label)) = phase {
+                    if let IdeSourceKind::Compile { language } = &file.kind
+                        && matches!(language.as_slice(), b"Fortran" | b"ASM")
+                    {
+                        let key = format!("{file_key}/build");
+                        let build = if language == "Fortran" {
+                            let format = props.and_then(|props| props.get(b"Fortran_FORMAT"));
+                            crate::fortran_asm::fortran_build_file(
+                                &mut self.objects,
+                                &key,
+                                &file_ref,
+                                format.map(|format| format.as_slice()),
+                                &file.flags,
+                            )?
+                        } else {
+                            crate::fortran_asm::source_build_file(
+                                &mut self.objects,
+                                &key,
+                                &file_ref,
+                                &file.flags,
+                            )?
+                        };
+                        items.push(build);
+                        continue;
+                    }
                     let mut build_settings = Attrs::new();
                     if let Some(visibility) = file.visibility {
                         build_settings.insert("ATTRIBUTES".into(), list([visibility]));
@@ -372,15 +396,18 @@ fn object_reference_path(value: &str, config: &str) -> String {
 
 fn file_type(file: &Source<'_>) -> &'static str {
     match &file.kind {
-        IdeSourceKind::Compile { language } => match language.as_slice() {
-            b"C" => "sourcecode.c.c",
-            b"CXX" => "sourcecode.cpp.cpp",
-            b"OBJC" => "sourcecode.c.objc",
-            b"OBJCXX" => "sourcecode.cpp.objcpp",
-            b"Swift" => "sourcecode.swift",
-            b"ASM" => "sourcecode.asm",
-            _ => "text",
-        },
+        IdeSourceKind::Compile { language } => {
+            crate::fortran_asm::file_type(file.path.as_bytes(), language).unwrap_or(match language
+                .as_slice()
+            {
+                b"C" => "sourcecode.c.c",
+                b"CXX" => "sourcecode.cpp.cpp",
+                b"OBJC" => "sourcecode.c.objc",
+                b"OBJCXX" => "sourcecode.cpp.objcpp",
+                b"Swift" => "sourcecode.swift",
+                _ => "text",
+            })
+        }
         IdeSourceKind::Object | IdeSourceKind::ExternalObject => "compiled.mach-o.objfile",
         IdeSourceKind::Header => "sourcecode.c.h",
         IdeSourceKind::ListFile => "sourcecode.text",

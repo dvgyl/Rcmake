@@ -68,6 +68,99 @@ fn runtime_list(paths: &[BString]) -> BString {
     }))
 }
 
+/// Translate a runtime directory taken from a linker input.
+pub(super) fn translated_link_directory(
+    model: &rcmake_model::ProjectModel,
+    target: &rcmake_model::Target,
+    directory: &[u8],
+) -> Option<BString> {
+    let get = |key| super::definition(model, target.dir, key);
+    let sysroot = get(b"CMAKE_SYSROOT_LINK".as_slice()).or_else(|| get(b"CMAKE_SYSROOT"));
+    if let Some(suffix) = sysroot
+        .filter(|root| !root.is_empty() && *root != b"/")
+        .and_then(|root| prefix_suffix(directory, root))
+    {
+        return Some(super::join(b"/", suffix));
+    }
+    let staging = get(b"CMAKE_STAGING_PREFIX").filter(|prefix| !prefix.is_empty())?;
+    let suffix = prefix_suffix(directory, staging)?;
+    let prefix =
+        get(b"CMAKE_INSTALL_PREFIX").map_or(b"/usr/local".as_slice(), |value| value.as_slice());
+    Some(super::join(prefix, suffix))
+}
+
+fn prefix_suffix<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let suffix = path.strip_prefix(super::without_trailing_slashes(prefix))?;
+    if suffix.is_empty() {
+        Some(suffix)
+    } else {
+        suffix.strip_prefix(b"/")
+    }
+}
+
+pub(super) fn external_link_directories<'a>(
+    model: &'a rcmake_model::ProjectModel,
+    target: &'a rcmake_model::Target,
+    libraries: &'a [BString],
+) -> impl Iterator<Item = BString> + 'a {
+    use rcmake_base::path_lex::Lexical;
+    use rcmake_model::DirId;
+
+    let root = model.dir(DirId::ROOT);
+    libraries.iter().filter_map(move |library| {
+        let path = Lexical::new(library);
+        let directory = if super::is_darwin(model, target.dir) {
+            framework_runtime_directory(model, target, library)
+        } else {
+            None
+        }
+        .or_else(|| super::link::driver::shared_library(path.filename()).then(|| path.parent()))?;
+        if !path.absolute()
+            || directory.is_empty()
+            || [
+                Lexical::new(&root.source_dir),
+                Lexical::new(&root.binary_dir),
+            ]
+            .iter()
+            .any(|root| root.prefix(Lexical::new(directory)))
+        {
+            return None;
+        }
+        Some(
+            translated_link_directory(model, target, directory).unwrap_or_else(|| directory.into()),
+        )
+    })
+}
+
+pub(super) fn framework_runtime_directory<'a>(
+    model: &rcmake_model::ProjectModel,
+    target: &rcmake_model::Target,
+    path: &'a [u8],
+) -> Option<&'a [u8]> {
+    use rcmake_base::{list, path_lex::Lexical};
+
+    let suffix = b".framework/";
+    let framework = if path.ends_with(b".framework") {
+        path
+    } else {
+        let index = path.windows(suffix.len()).position(|part| part == suffix)?;
+        path.get(..index + suffix.len() - 1)?
+    };
+    let parent = Lexical::new(framework).parent();
+    if parent.ends_with(b"/System/Library/Frameworks")
+        || super::definition(
+            model,
+            target.dir,
+            b"CMAKE_PLATFORM_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES",
+        )
+        .is_some_and(|paths| list::iter(paths, list::Empty::Drop).any(|path| path == parent))
+    {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

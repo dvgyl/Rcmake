@@ -183,6 +183,10 @@ pub(crate) fn architecture_flags(
         Err(body) => return (Vec::new(), vec![fatal(target, None, body)]),
     };
     if spec == ArchSpec::Empty {
+        // Compiler checks can run before the parent selects an architecture.
+        if in_try_compile && target.props.get(b"CUDA_ARCHITECTURES").is_none() {
+            return (Vec::new(), Vec::new());
+        }
         return (
             Vec::new(),
             empty_diagnostic(target, in_try_compile)
@@ -254,7 +258,7 @@ pub(crate) fn architecture_flags(
 }
 
 /// Check the target's interprocedural optimization property for this configuration.
-pub(super) fn ipo_enabled(
+pub(crate) fn ipo_enabled(
     model: &ProjectModel,
     target: &Target,
     config: &ConfigId,

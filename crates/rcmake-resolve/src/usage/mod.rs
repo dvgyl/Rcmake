@@ -85,6 +85,7 @@ struct MemoKey<'a> {
     head: Option<TargetId>,
     traversal: UsageTraversal,
     link_language: Option<Cow<'a, [u8]>>,
+    device_link: bool,
     command_config: Option<Cow<'a, [u8]>>,
     output_config: Option<Cow<'a, [u8]>>,
 }
@@ -100,6 +101,7 @@ impl MemoKey<'_> {
             head: self.head,
             traversal: self.traversal,
             link_language: self.link_language.map(owned),
+            device_link: self.device_link,
             command_config: self.command_config.map(owned),
             output_config: self.output_config.map(owned),
         }
@@ -441,6 +443,7 @@ impl<'a> UsageResolver<'a> {
                 .link_language
                 .as_ref()
                 .map(|value| Cow::Borrowed(value.as_slice())),
+            device_link: ctx.device_link,
             command_config: ctx
                 .command_config
                 .as_ref()

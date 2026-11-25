@@ -307,6 +307,103 @@ pub(crate) fn emit_module_directory(
     Ok(())
 }
 
+pub(crate) struct TargetDepend<'a> {
+    target: &'a rcmake_resolve::FortranTargetInfo,
+    info: &'a DependInfo,
+    pub(crate) scan_goal: BString,
+}
+
+impl<'a> TargetDepend<'a> {
+    pub(crate) fn new(resolved: &'a rcmake_resolve::ResolvedTarget) -> Option<Self> {
+        let target = resolved.fortran.as_ref()?;
+        let info = target.make_depend_info.as_deref()?;
+        let support = Lexical::new(&target.depend_info).parent();
+        let scan_goal = Lexical::new(support).append(b"depend");
+        Some(Self {
+            target,
+            info,
+            scan_goal,
+        })
+    }
+
+    pub(crate) fn write(
+        &self,
+        host: &dyn Host,
+        build_dir: &Path,
+        _target: &crate::Target<'_>,
+    ) -> Result<(), GenError> {
+        write_depend_info(
+            host,
+            build_dir,
+            &self.target.depend_info,
+            self.info,
+            &DependencyFiles::default(),
+        )
+    }
+
+    pub(crate) fn emit_clean(&self, out: &mut Vec<u8>, cmake: &[u8]) -> Result<(), GenError> {
+        let support = Lexical::new(Lexical::new(&self.target.depend_info).parent());
+        let clean = support.append(b"cmake_clean_Fortran.cmake");
+        out.extend_from_slice(b"\t$(SILENT)if test -f ");
+        make_recipe_text(out, &quote_always(&clean))?;
+        out.extend_from_slice(b"; then ");
+        make_recipe_text(out, &quote_always(cmake))?;
+        out.extend_from_slice(b" -P ");
+        make_recipe_text(out, &quote_always(&clean))?;
+        out.extend_from_slice(b"; fi\n");
+        Ok(())
+    }
+
+    pub(crate) fn emit(
+        &self,
+        out: &mut Vec<u8>,
+        target: &crate::Target<'_>,
+        cmake: &[u8],
+        build_dir: &Path,
+    ) -> Result<(), GenError> {
+        let DependInfo::Fortran(tdi) = self.info else {
+            return Ok(());
+        };
+        let support = Lexical::new(Lexical::new(&self.target.depend_info).parent());
+        let depend_make = support.append(b"depend.make");
+        include_depend_make(out, &depend_make, &target.goal, cmake)?;
+        let generated = tdi
+            .scan
+            .sources
+            .iter()
+            .map(|source| build_path(&source.source, build_dir))
+            .filter(|source| {
+                target
+                    .rules
+                    .iter()
+                    .any(|step| step.outputs.contains(source))
+            })
+            .collect::<Vec<_>>();
+        emit_depend(
+            out,
+            &DependencyRule {
+                source_dir: &tdi.dir_top_src,
+                target_source_dir: &tdi.dir_cur_src,
+                build_dir: &tdi.scan.dir_top_bld,
+                target_build_dir: &tdi.scan.dir_cur_bld,
+                depend_info: &self.target.depend_info,
+                goal: &self.scan_goal,
+            },
+            &generated,
+        )?;
+        if let Some(directory) = &tdi.scan.module_dir {
+            let objects = tdi
+                .scan
+                .sources
+                .iter()
+                .map(|source| build_path(&source.object, build_dir))
+                .collect::<Vec<_>>();
+            emit_module_directory(out, directory, &objects)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

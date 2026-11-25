@@ -544,6 +544,46 @@ mod tests {
     }
 
     #[test]
+    fn missing_qt_reports_one_directory_warning() -> Result<(), Box<dyn std::error::Error>> {
+        let host = PureHost::new("/".into(), "/cmake".into());
+        let plan = fixture_with(&host, GeneratorKind::Ninja, "8", None, |model, id, _| {
+            let vars = &mut model.dir_mut(DirId::ROOT).vars;
+            vars.shift_remove(b"Qt6Core_VERSION_MAJOR".as_slice());
+            vars.shift_remove(b"Qt6Core_VERSION_MINOR".as_slice());
+            let props = &mut model
+                .target_mut(id)
+                .ok_or("Expected the sample target.")?
+                .props;
+            // An explicit executable keeps RCC enabled without a Qt version.
+            props.set("AUTOMOC_EXECUTABLE".into(), "".into());
+            props.set("AUTOUIC_EXECUTABLE".into(), "".into());
+            Ok(())
+        })?;
+        let warnings = plan
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .body
+                    .windows(19)
+                    .any(|part| part == b"No valid Qt version")
+            })
+            .collect::<Vec<_>>();
+        let [warning] = warnings.as_slice() else {
+            return Err(format!("Expected one warning, found {warnings:?}.").into());
+        };
+        assert_eq!(
+            warning.body,
+            "AUTOGEN: No valid Qt version found for target sample.  AUTOMOC and AUTOUIC disabled.  Consider adding:\n  find_package(Qt<QTVERSION> COMPONENTS Widgets)\nto your CMakeLists.txt file."
+        );
+        assert!(matches!(
+            &warning.location,
+            rcmake_diag::Location::FileLine { file, line: 0 } if file.ends_with(b"CMakeLists.txt")
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn autogen_requires_an_absolute_build_directory() -> Result<(), Box<dyn std::error::Error>> {
         let host = PureHost::new("/".into(), "/cmake".into());
         let result = fixture_with(&host, GeneratorKind::Ninja, "8", None, |model, id, _| {
