@@ -499,19 +499,15 @@ enum Segment {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct Templated(Vec<Segment>);
 
-impl Templated {
-    /// Preserve bytes as a literal, including text that looks like a path or marker.
-    pub(crate) fn literal(bytes: &[u8]) -> Option<Self> {
-        (bytes.len() <= MAX_BYTES).then(|| Self(vec![Segment::Literal(bytes.to_vec())]))
-    }
+/// Reuse the path spellings when capturing several values for one probe.
+pub(crate) struct TemplateCapture<'a> {
+    bindings: &'a PathBindings,
+    matches: Vec<(Vec<u8>, Vec<Binding>)>,
+    object_directory: Option<Vec<u8>>,
+}
 
-    /// Substitute the longest matching binding at each byte position.
-    ///
-    /// Keep all aliases of a binding. Render only when they still have equal values.
-    pub(crate) fn capture(bytes: &[u8], bindings: &PathBindings) -> Option<Self> {
-        if bytes.len() > MAX_BYTES {
-            return None;
-        }
+impl<'a> TemplateCapture<'a> {
+    pub(crate) fn new(bindings: &'a PathBindings) -> Self {
         let mut matches = BTreeMap::<Vec<u8>, Vec<Binding>>::new();
         for (&token, value) in &bindings.0 {
             for (binding, spelling) in spellings(token, value) {
@@ -520,16 +516,38 @@ impl Templated {
         }
         let mut matches: Vec<_> = matches.into_iter().collect();
         matches.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
-        let mut segments = Vec::new();
-        let mut literal = Vec::new();
-        let mut rest = bytes;
         let object_directory = bindings
             .0
             .get(&Token::Target)
             .map(|target| [b"CMakeFiles/".as_slice(), target, b".dir"].concat());
+        Self {
+            bindings,
+            matches,
+            object_directory,
+        }
+    }
+
+    /// Keep all equal spellings and confirm that the substitutions preserve the bytes.
+    pub(crate) fn capture(&self, bytes: &[u8]) -> Option<Templated> {
+        if bytes.len() > MAX_BYTES {
+            return None;
+        }
+        if bytes.is_empty() {
+            return Some(Templated(Vec::new()));
+        }
+        if self
+            .matches
+            .last()
+            .is_none_or(|(value, _)| value.len() > bytes.len())
+        {
+            return Templated::literal(bytes);
+        }
+        let mut segments = Vec::new();
+        let mut literal = Vec::new();
+        let mut rest = bytes;
         while let Some((&byte, tail)) = rest.split_first() {
             let offset = bytes.len() - rest.len();
-            if let Some((value, tokens)) = matches.iter().find(|(value, tokens)| {
+            if let Some((value, tokens)) = self.matches.iter().find(|(value, tokens)| {
                 rest.starts_with(value)
                     && tokens.iter().all(|binding| {
                         boundary(
@@ -537,7 +555,7 @@ impl Templated {
                             offset,
                             value.len(),
                             binding.token,
-                            object_directory.as_deref(),
+                            self.object_directory.as_deref(),
                         )
                     })
             }) {
@@ -557,8 +575,21 @@ impl Templated {
         if !literal.is_empty() {
             segments.push(Segment::Literal(literal));
         }
-        let template = Self(segments);
-        round_trip_verify(&template, bindings, bytes).then_some(template)
+        let template = Templated(segments);
+        round_trip_verify(&template, self.bindings, bytes).then_some(template)
+    }
+}
+
+impl Templated {
+    /// Preserve bytes as a literal, including text that looks like a path or marker.
+    pub(crate) fn literal(bytes: &[u8]) -> Option<Self> {
+        (bytes.len() <= MAX_BYTES).then(|| Self(vec![Segment::Literal(bytes.to_vec())]))
+    }
+
+    /// Substitute the longest matching binding at each byte position.
+    #[cfg(test)]
+    pub(crate) fn capture(bytes: &[u8], bindings: &PathBindings) -> Option<Self> {
+        TemplateCapture::new(bindings).capture(bytes)
     }
 
     /// Render bytes for the current call. Reject missing or conflicting bindings.

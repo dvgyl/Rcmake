@@ -19,6 +19,7 @@ use super::plan::{
     compute_probe_key, process_environment_fingerprint,
 };
 use super::seed::TryCompileSeed;
+use super::template::TemplateCapture;
 use super::{ProbeDirs, ProbeResult};
 
 mod compiler;
@@ -299,11 +300,9 @@ impl PreparedProbe {
                 ReadRange::All { limit: 1 << 20 },
             )
             .ok()?;
+        let template = TemplateCapture::new(&bindings);
         let files = BTreeMap::from([
-            (
-                BString::from("CMakeLists.txt"),
-                Templated::capture(&project, &bindings)?,
-            ),
+            (BString::from("CMakeLists.txt"), template.capture(&project)?),
             (name, Templated::literal(&contents)?),
         ]);
         let (seed, bound) = seed_digest(
@@ -311,7 +310,7 @@ impl PreparedProbe {
             &seed.defines,
             &seed.enabled_languages,
             &seed.probe_languages,
-            &bindings,
+            &template,
             host,
         )?;
         let system = host.system();
@@ -339,7 +338,9 @@ impl PreparedProbe {
             target: BString::default(),
             sysroot: cx.var_or_empty(b"CMAKE_OSX_SYSROOT"),
             seed,
-            imports: Templated::capture(format!("{imports:?}").as_bytes(), &bindings)?.digest(),
+            imports: template
+                .capture(format!("{imports:?}").as_bytes())?
+                .digest(),
             environment: process_environment_fingerprint(&environment),
             scope: ReuseScope::VerifiedRelocation,
             bindings,
@@ -568,7 +569,7 @@ fn seed_digest(
     defines: &[rcmake_eval::CacheDefine],
     enabled_languages: &[u8],
     probe_languages: &[BString],
-    bindings: &PathBindings,
+    template: &TemplateCapture<'_>,
     host: &dyn Host,
 ) -> Option<(Digest, std::collections::BTreeSet<PathBuf>)> {
     let mut bound = std::collections::BTreeSet::new();
@@ -577,12 +578,7 @@ fn seed_digest(
     key.field(7, &cx.var_or_empty(b"CMAKE_COMMAND"));
     for define in defines {
         key.field(8, &define.name);
-        key.field(
-            9,
-            Templated::capture(&define.value, bindings)?
-                .digest()
-                .as_bytes(),
-        );
+        key.field(9, template.capture(&define.value)?.digest().as_bytes());
         key.field(
             10,
             define
@@ -622,10 +618,7 @@ fn seed_digest(
                 .read(&file_path, ReadRange::All { limit: 1 << 20 })
                 .ok()?;
             bound.insert(file_path);
-            key.field(
-                13,
-                Templated::capture(&bytes, bindings)?.digest().as_bytes(),
-            );
+            key.field(13, template.capture(&bytes)?.digest().as_bytes());
         }
     }
     Some((key.finish(), bound))

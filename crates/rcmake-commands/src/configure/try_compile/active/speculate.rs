@@ -119,6 +119,7 @@ impl PreparedProbe {
             return;
         };
         let environment = self.runtime.host.env_all();
+        let template = super::TemplateCapture::new(&self.recipe.bindings);
         for (name, content) in candidates {
             let Some((project, language)) = super::super::project::render_literal_probe(
                 cx,
@@ -127,7 +128,7 @@ impl PreparedProbe {
             ) else {
                 continue;
             };
-            let Some(project) = Templated::capture(&project, &self.recipe.bindings) else {
+            let Some(project) = template.capture(&project) else {
                 continue;
             };
             let (defines, enabled_languages) = child.seed_inputs();
@@ -136,7 +137,7 @@ impl PreparedProbe {
                 defines,
                 enabled_languages,
                 &[language],
-                &self.recipe.bindings,
+                &template,
                 self.runtime.host.as_ref(),
             ) else {
                 continue;

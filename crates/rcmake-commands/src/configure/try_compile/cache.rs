@@ -812,11 +812,12 @@ fn template_outcome(
     if recipe.scope == ReuseScope::VerifiedRelocation && !bindings.can_scan_aliases() {
         return None;
     }
+    let template_capture = super::template::TemplateCapture::new(bindings);
     let capture = |bytes: &[u8]| {
         let template = match recipe.scope {
             ReuseScope::ExactBindings => Templated::literal(bytes)?,
             ReuseScope::VerifiedRelocation => {
-                let template = Templated::capture(bytes, bindings)?;
+                let template = template_capture.capture(bytes)?;
                 if template.has_leak(bindings) {
                     return None;
                 }
