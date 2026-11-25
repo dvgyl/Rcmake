@@ -2,10 +2,40 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: install.sh [--from-source | --archive <path>] [--alias-cmake] [--force]
+       install.sh --uninstall
+
+Install rcmake and rcmake-lsp into $PREFIX/bin and the bundled CMake 4.5.1
+data into $PREFIX/share/cmake-4.5. The default PREFIX is $HOME/.local.
+
+Sources (select one, the default is the latest GitHub Release):
+  --from-source      Build a release archive from this checkout (needs Cargo).
+  --archive <path>   Install a local .tar.gz archive. The script checks
+                     <path>.sha256 if that file exists.
+
+Options:
+  --alias-cmake      Also create cmake, ctest, and cpack links to rcmake.
+  --force            Replace existing cmake, ctest, or cpack files.
+  --uninstall        Remove rcmake, rcmake-lsp, the links to rcmake, and
+                     share/cmake-4.5 from $PREFIX.
+  -h, --help         Show this help.
+
+Requirements: bash, python3, and curl (for release downloads).
+EOF
+}
+
+die() {
+  printf 'install.sh: %s\n' "$*" >&2
+  exit 1
+}
+
 mode=release
 archive=""
 alias_cmake=false
 force=false
+uninstall=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --from-source|--archive)
@@ -27,16 +57,88 @@ while [[ $# -gt 0 ]]; do
       ;;
     --alias-cmake) alias_cmake=true ;;
     --force) force=true ;;
-    -h|--help)
-      printf 'Usage: %s [--from-source | --archive <path>] [--alias-cmake] [--force]\n' "$0"
-      printf "Install into PREFIX, if set. The default is \$HOME/.local.\n"
-      printf 'The default source is the latest GitHub Release.\n'
-      exit 0
-      ;;
-    *) printf 'Unknown option %s.\n' "$1" >&2; exit 2 ;;
+    --uninstall) uninstall=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'Unknown option %s. Run install.sh --help.\n' "$1" >&2; exit 2 ;;
   esac
   shift
 done
+
+prefix="${PREFIX:-$HOME/.local}"
+bin_dir="$prefix/bin"
+data_dir="$prefix/share/cmake-4.5"
+tools=(cmake ctest cpack)
+
+is_rcmake_link() {
+  [[ -L "$1" && "$(readlink "$1")" == rcmake ]]
+}
+
+if "$uninstall"; then
+  if [[ "$mode" != release || "$alias_cmake" == true || "$force" == true ]]; then
+    printf 'Use --uninstall alone.\n' >&2
+    exit 2
+  fi
+  removed=()
+  for tool in "${tools[@]}"; do
+    if is_rcmake_link "$bin_dir/$tool"; then
+      rm -f "$bin_dir/$tool"
+      removed+=("$bin_dir/$tool")
+    fi
+  done
+  for name in rcmake rcmake-lsp; do
+    if [[ -f "$bin_dir/$name" || -L "$bin_dir/$name" ]]; then
+      rm -f "$bin_dir/$name"
+      removed+=("$bin_dir/$name")
+    fi
+  done
+  if [[ -d "$data_dir" ]]; then
+    if [[ -e "$bin_dir/cmake" ]] && ! is_rcmake_link "$bin_dir/cmake"; then
+      printf 'Kept %s because %s is another CMake installation.\n' "$data_dir" "$bin_dir/cmake"
+    else
+      rm -rf "$data_dir"
+      removed+=("$data_dir")
+    fi
+  fi
+  if [[ ${#removed[@]} -eq 0 ]]; then
+    printf 'Found no rcmake installation in %s.\n' "$prefix"
+  else
+    printf 'Removed:\n'
+    printf '  %s\n' "${removed[@]}"
+  fi
+  case "$(uname -s)" in
+    Darwin) cache="$HOME/Library/Caches/rcmake" ;;
+    *) cache="${XDG_CACHE_HOME:-$HOME/.cache}/rcmake" ;;
+  esac
+  if [[ -d "${RCMAKE_CACHE_DIR:-$cache}" ]]; then
+    printf 'The probe and fetch cache stays in %s. Delete it to free disk space.\n' "${RCMAKE_CACHE_DIR:-$cache}"
+  fi
+  exit 0
+fi
+
+command -v python3 >/dev/null 2>&1 || die 'python3 is required.'
+
+# Find alias collisions before the script downloads or writes anything.
+# A partial alias set would run a mix of rcmake and another CMake.
+if "$alias_cmake"; then
+  blocked=()
+  for tool in "${tools[@]}"; do
+    alias="$bin_dir/$tool"
+    if is_rcmake_link "$alias" || [[ ! -e "$alias" && ! -L "$alias" ]]; then
+      continue
+    fi
+    if [[ -d "$alias" && ! -L "$alias" ]]; then
+      die "$alias is a directory. Remove it, then run the installer again."
+    fi
+    blocked+=("$alias")
+  done
+  if [[ ${#blocked[@]} -gt 0 ]] && ! "$force"; then
+    printf 'install.sh: These files exist and are not links to rcmake:\n' >&2
+    printf '  %s\n' "${blocked[@]}" >&2
+    printf 'Run again with --force to replace them, or omit --alias-cmake.\n' >&2
+    printf 'The installer changed nothing.\n' >&2
+    exit 1
+  fi
+fi
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/rcmake-install.XXXXXXXX")"
 trap 'rm -rf "$work"' EXIT
@@ -44,41 +146,49 @@ checksum=""
 case "$mode" in
   source)
     root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+    printf 'Build a release archive from %s.\n' "$root"
     "$root/scripts/dist.sh" --out-dir "$work"
     archives=("$work"/*.tar.gz)
     archive="${archives[0]}"
     checksum="$archive.sha256"
     ;;
   archive)
+    [[ -f "$archive" ]] || die "$archive does not exist."
     if [[ -f "$archive.sha256" ]]; then
       checksum="$archive.sha256"
+    else
+      printf 'Warning: %s.sha256 does not exist. The installer cannot verify the SHA-256 checksum of this archive.\n' "$archive" >&2
     fi
     ;;
   release)
+    command -v curl >/dev/null 2>&1 || die 'curl is required to download a release.'
     case "$(uname -s):$(uname -m)" in
       Linux:x86_64) target=x86_64-unknown-linux-gnu ;;
       Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-gnu ;;
       Darwin:arm64) target=aarch64-apple-darwin ;;
-      *) printf 'No release tarball for this host. Use --from-source on Linux or macOS.\n' >&2; exit 1 ;;
+      *) die 'No release archive for this host. Use --from-source in a checkout on Linux or macOS.' ;;
     esac
     releases=https://github.com/dvgyl/rcmake/releases
     checksum="$work/SHA256SUMS.txt"
-    curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 \
-      "$releases/latest/download/SHA256SUMS.txt" -o "$checksum"
+    printf 'Download the latest release checksums.\n'
+    if ! curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 \
+      "$releases/latest/download/SHA256SUMS.txt" -o "$checksum"; then
+      die "Could not download $releases/latest/download/SHA256SUMS.txt. If no release exists yet, clone the repository and run scripts/install.sh --from-source."
+    fi
     name="$(awk -v suffix="-$target.tar.gz" '
       substr($2, length($2) - length(suffix) + 1) == suffix { print $2 }
     ' "$checksum")"
     if [[ ! "$name" =~ ^rcmake-[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?-${target}\.tar\.gz$ ]]; then
-      printf 'No unique release archive for %s.\n' "$target" >&2
-      exit 1
+      die "No unique release archive for $target."
     fi
     archive="$work/$name"
-    curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 \
+    printf 'Download %s.\n' "$name"
+    curl -fSL --retry 3 --connect-timeout 20 --max-time 600 --progress-bar \
       "$releases/latest/download/$name" -o "$archive"
     ;;
 esac
 
-python3 - "$archive" "$checksum" "${PREFIX:-$HOME/.local}" "$alias_cmake" "$force" <<'PY'
+python3 - "$archive" "$checksum" "$prefix" "$alias_cmake" "$force" <<'PY'
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
@@ -92,6 +202,7 @@ archive, checksum, prefix, aliases, force = sys.argv[1:]
 archive, prefix = Path(archive), Path(prefix)
 tools = ("cmake", "ctest", "cpack")
 data_dir = Path("share/cmake-4.5")
+binaries = (Path("bin/rcmake"), Path("bin/rcmake-lsp"))
 
 try:
     if checksum:
@@ -100,6 +211,7 @@ try:
                     and fields[1].lstrip("*") == archive.name]
         if expected != [hashlib.sha256(archive.read_bytes()).hexdigest()]:
             raise ValueError(f"SHA-256 mismatch for {archive.name}.")
+        print(f"Verified the SHA-256 checksum of {archive.name}.")
 
     prefix.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=prefix, prefix=".rcmake-install-") as temporary:
@@ -115,7 +227,7 @@ try:
                 if path.parts[0] != top:
                     raise ValueError("The archive must have one top-level directory.")
                 relative = Path(*path.parts[1:])
-                if relative == Path("bin/rcmake") or relative.is_relative_to(data_dir):
+                if relative in binaries or relative.is_relative_to(data_dir):
                     output = work / relative
                     if member.isdir():
                         output.mkdir(parents=True, exist_ok=True)
@@ -128,7 +240,12 @@ try:
                         raise ValueError(f"Invalid archive entry {member.name!r}.")
 
         staged_bin = work / "bin/rcmake"
+        if not staged_bin.is_file():
+            raise ValueError("Missing bin/rcmake in the archive.")
         staged_bin.chmod(0o755)
+        staged_lsp = work / "bin/rcmake-lsp"
+        if staged_lsp.is_file():
+            staged_lsp.chmod(0o755)
         for required in ("Modules/CMake.cmake", "Templates/CPackConfig.cmake.in"):
             if not (work / data_dir / required).is_file():
                 raise ValueError(f"Missing {required} in the archive.")
@@ -150,19 +267,48 @@ try:
             if os.path.lexists(backup):
                 backup.replace(installed_data)
             raise
+        installed = [bin_dir / "rcmake"]
+        if staged_lsp.is_file():
+            staged_lsp.replace(bin_dir / "rcmake-lsp")
+            installed.append(bin_dir / "rcmake-lsp")
 
         if aliases == "true":
             for tool in tools:
                 alias = bin_dir / tool
-                if alias.is_symlink() and os.readlink(alias) == "rcmake":
-                    continue
-                if os.path.lexists(alias) and (force != "true" or (alias.is_dir() and not alias.is_symlink())):
-                    print(f"Keep existing {alias}.", file=sys.stderr)
-                    continue
-                new_alias = work / tool
-                new_alias.symlink_to("rcmake")
-                new_alias.replace(alias)
-        subprocess.run([bin_dir.resolve() / "rcmake", "--version"], check=True, timeout=30)
+                if not (alias.is_symlink() and os.readlink(alias) == "rcmake"):
+                    if os.path.lexists(alias) and (force != "true" or (alias.is_dir() and not alias.is_symlink())):
+                        raise ValueError(f"{alias} exists. Run again with --force to replace it.")
+                    new_alias = work / tool
+                    new_alias.symlink_to("rcmake")
+                    new_alias.replace(alias)
+                installed.append(f"{alias} -> rcmake")
+        installed.append(installed_data)
+
+        version = subprocess.run([bin_dir.resolve() / "rcmake", "--version"], check=True, timeout=30,
+                                 stdout=subprocess.PIPE, text=True).stdout.splitlines()
+        name = next((line for line in version if line.lower().startswith("rcmake ")), "rcmake")
+        print(f"Installed {name.lower()} into {prefix}:")
+        for item in installed:
+            print(f"  {item}")
 except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:
     sys.exit(f"Install failed. {error}")
 PY
+
+bin_real="$(cd "$bin_dir" && pwd -P)"
+on_path=false
+IFS=: read -r -a path_entries <<< "${PATH:-}"
+for entry in ${path_entries[@]+"${path_entries[@]}"}; do
+  if [[ -n "$entry" && -d "$entry" && "$(cd "$entry" && pwd -P)" == "$bin_real" ]]; then
+    on_path=true
+    break
+  fi
+done
+if ! "$on_path"; then
+  printf '\n%s is not on PATH. Add this line to your shell profile (for example ~/.bashrc or ~/.zshrc):\n' "$bin_dir"
+  printf '  export PATH="%s:$PATH"\n' "$bin_dir"
+elif "$alias_cmake"; then
+  first="$(command -v cmake || true)"
+  if [[ -n "$first" && "$(cd "$(dirname "$first")" && pwd -P)" != "$bin_real" ]]; then
+    printf '\n%s comes before %s on PATH. Put %s first to use rcmake as cmake.\n' "$first" "$bin_dir/cmake" "$bin_dir"
+  fi
+fi
