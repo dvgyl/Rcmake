@@ -363,3 +363,198 @@ The CMake 4.5.1 oracle cannot create a Visual Studio generator on macOS. This ma
 Use Windows job objects for process pipelines. Assign each child to a job while the child is suspended. Retain the job handle until output capture ends. Use a bounded channel to deliver pipe output to the thread that checks deadlines. Use safe handle APIs to compare file identities before a copy truncates its destination. Read the Windows version with a safe registry API.
 
 Use `sevenz-rust2` for 7-Zip headers and the standard compression methods. Use `ppmd-turbo` for PPMd because the optional PPMd dependency in `sevenz-rust2` has no licence on the project's allowlist. Use the existing archive path checks for all formats. Keep the Windows dependencies in the Windows target configuration. Keep unsafe code forbidden in the host and archive crates.
+
+---
+
+The following records describe changes through revision `9b5d508`.
+
+## ADR-018 Native compiler probe cache
+
+- **Status:** Accepted
+
+Cache eligible compiler probe results by recipe. Verify the observed inputs
+and required artifacts before reuse. Rebind supported paths when a result
+moves to a different build directory.
+
+At publication, check the old and new entries under the store lock. Keep a
+valid entry. Replace a stale entry only if the new inputs and artifacts still
+pass their checks. The earlier generation markers applied to a shard of keys.
+Revision `9b5d508` removes those markers and limits replacement to the recipe key.
+
+Record bounded compiler search directory listings to detect added or removed
+files. In software development kit (SDK) listings, follow directory links,
+visit each canonical directory once, and record dangling links. Verify the
+contents of files that the probe uses. Within one configure, reuse file
+digests only when the file identity, metadata, and change time (`ctime`) match.
+Read and hash the file again if the change time is unavailable, recent, or
+has no sub-second component.
+
+Remote recovery uses HTTPS and requires a local pin. Check the remote entry
+and its inputs before use. Uploads require permission to write and to export
+captured output. Either offline setting disables remote probe access.
+
+Sources: [Probe lookup and publication](../crates/rcmake-commands/src/configure/try_compile/cache.rs), [store publication](../crates/rcmake-store/src/entry_publish.rs), [input verification](../crates/rcmake-store/src/stamp.rs), and [search listings](../crates/rcmake-store/src/stamp/tree.rs).
+
+## ADR-019 Verified probe lookahead
+
+- **Status:** Accepted
+
+Look ahead for eligible probes and run them in separate scratch directories
+with a bounded worker pool. Check the compiler command and its inputs in
+each worker. At the original command, use a result only if its recipe matches
+and its evidence passes validation. Run the foreground probe when the
+speculative result is missing or fails a check.
+
+Sources: [Lookahead](../crates/rcmake-commands/src/configure/lookahead.rs), [worker pool](../crates/rcmake-commands/src/configure/probe_pool.rs), and [speculative probe execution](../crates/rcmake-commands/src/configure/try_compile/active/speculate.rs).
+
+## ADR-020 Incremental configure replay in creation order
+
+- **Status:** Accepted
+
+Record reusable configure state and observed inputs in a versioned snapshot.
+Check the entry context and input trace before replaying an eligible root or
+subdirectory region. Evaluate the region if that check fails. Restore targets
+and tests in their original creation order. Check names and identifiers before
+inserting any of them into the model.
+
+Publish `CMakeFiles/rcmake/configure.v1.bin` after configure completes.
+Disable replay when configure requires live observation. See the replay
+conditions in the [environment variable reference](ENV_VARS.md#incremental-replay).
+
+Sources: [Replay engine](../crates/rcmake-eval/src/journal/replay.rs), [model restoration](../crates/rcmake-model/src/project/replay.rs), and [configure session](../crates/rcmake-commands/src/configure/session/native.rs).
+
+## ADR-021 FetchContent lockfiles and frozen reuse
+
+- **Status:** Accepted
+
+Use a content-addressed archive cache and Git mirrors. Prefetch eligible
+pinned sources with a bounded worker pool. Support `off`, `auto`, `update`,
+and `frozen` lock modes. Publish lockfile updates after configure succeeds.
+
+In frozen mode, verify retained archive content against the lock pin before
+reuse. The download receipt binds the pin, declaration identity, generated
+wrapper, and download stamp. For a reused Git checkout, verify the top-level
+directory and pinned HEAD. Preserve explicit source overrides and dependency
+provider results. Offline mode uses local or verified cached sources.
+Windows drive-letter file URLs are local sources.
+
+Sources: [Fetch storage](../crates/rcmake-fetch/src/lib.rs), [configure integration](../crates/rcmake-commands/src/fetch_observe.rs), and [frozen checks](../crates/rcmake-commands/src/fetch_observe/frozen.rs).
+
+## ADR-022 Native and compatibility command lines
+
+- **Status:** Accepted
+
+Select the tool from the invocation name. The `rcmake` name selects Native.
+The CMake tool names and oracle mode select Compat, which uses CMake diagnostic
+formatting. Native supports `--diagnostics`, `--profile`, `--no-probe-cache`,
+`--fetch-lock`, `--hermetic`, and the `explain` subcommand. Explicit options
+take precedence over their environment equivalents.
+
+Hermetic mode checks environment reads, file reads, subprocesses, and network
+access through the host. Warn mode reports violations. Strict mode rejects
+them. Native profiles contain a trace, folded stacks, and an HTML flamegraph.
+The invocation log records the tool and effective persona in separate fields.
+
+Sources: [Persona](../crates/rcmake-cli/src/persona.rs), [Native options](../crates/rcmake-cli/src/options/extensions.rs), [profile](../crates/rcmake-cli/src/profile.rs), [invocation log](../crates/rcmake-cli/src/exec_log.rs), and [hermetic policy](../crates/rcmake-eval/src/hermetic.rs).
+
+## ADR-023 In-process configure API and evaluated editor queries
+
+- **Status:** Accepted
+
+Run the shared configure engine through `rcmake_api::run_configure`. The
+caller controls the host, write mode, and process policy. The caller can
+supply a cancellation token. The result includes the model. It can also
+include a workspace index, overlay changes, and provenance. A denied process
+can give a partial result.
+
+For Language Server Protocol (LSP) queries, evaluate unsaved buffers in a
+read overlay. Keep configure writes in a separate overlay and deny subprocesses.
+Use evaluated facts from the current snapshot. Cancel or discard outdated
+evaluations. Use syntax results when current evaluated facts are unavailable.
+
+Sources: [Configure API](../crates/rcmake-api/src/config.rs), [configure runner](../crates/rcmake-api/src/runner.rs), and [evaluated language server](../crates/rcmake-lsp/src/eval_provider.rs).
+
+## ADR-024 WebAssembly configure engine
+
+- **Status:** Accepted
+
+Build `rcmake-api` with `--no-default-features` for `wasm32-unknown-unknown`
+and `wasm32-wasip1`. Use `PureHost` to supply files and scripted processes.
+The WebAssembly target configurations omit native store, archive, and system
+time zone dependencies. The smoke check compiles the bare target and runs the
+WebAssembly System Interface (WASI) example in Wasmtime. The example checks
+target discovery, provenance, cancellation, and process policy.
+
+Sources: [API features](../crates/rcmake-api/Cargo.toml), [host features](../crates/rcmake-host/Cargo.toml), and [WebAssembly smoke check](../tools/measure/wasm_smoke.py).
+
+## ADR-025 CUDA, Fortran, and Qt AUTOGEN build rules
+
+- **Status:** Accepted
+
+Use evaluated target properties to create rules in the shared build graph.
+For CUDA, resolve architecture policy and runtime selection. Plan device
+links before host links and evaluate each link in its own context. For
+Fortran, use module producers and users to order compilation. Ninja uses
+dynamic dependencies. Make uses module stamps. In-process compiler checks
+use the same module dependency information.
+
+Plan Qt `AUTOMOC`, `AUTOUIC`, and `AUTORCC` before final source resolution
+and write the metadata for their tool drivers. Resolve staging destinations
+from the cross-toolchain settings. Keep explicit file dependencies on the
+link rule. Generate the Microsoft Visual C++ module definition file before
+the link when `WINDOWS_EXPORT_ALL_SYMBOLS` requires it.
+
+Sources: [Resolution pipeline](../crates/rcmake-resolve/src/pipeline.rs), [Fortran scanner](../crates/rcmake-fortran/src/lib.rs), and [language fixtures](../conformance/cases/m6-langs/verify.py).
+
+## ADR-026 ELF runtime dependency scans and install runtime paths
+
+- **Status:** Accepted
+
+For Linux and FreeBSD, read Executable and Linkable Format (ELF) dynamic
+metadata in `file(GET_RUNTIME_DEPENDENCIES)`. Use the configured `objdump`
+command when specified. Use bounded `ldconfig` queries and platform fallback
+paths to find system libraries. Traverse dependencies by file identity and
+apply the applicable RPATH and RUNPATH search rules, filters, and conflict
+checks.
+
+Use the evaluated target and configuration to calculate build and install
+runtime paths. Use the staged install destination where applicable. When
+an installed ELF file needs a runtime path change, emit guarded
+`file(RPATH_CHECK)` and `file(RPATH_CHANGE)` actions in the normal install
+script. Apply the runtime path skip and build-with-install settings.
+
+Sources: [ELF dependency scanner](../crates/rcmake-commands/src/file_path/runtime_dependencies/elf.rs), [install rule generation](../crates/rcmake-resolve/src/lower/install_rpath.rs), and [ELF runtime path operations](../crates/rcmake-commands/src/file_path/elf_rpath.rs).
+
+## ADR-027 File API reply reuse by content hash
+
+- **Status:** Accepted
+
+Name each reply object with a prefix and the first 20 hexadecimal digits of
+the SHA-256 digest of its serialized bytes. Reuse an existing regular file
+with that name and mark it for retention. This preserves its timestamp.
+Write new replies through temporary files. Publish the current index, then
+remove obsolete files according to the reply retention rules.
+
+Source: [File API reply writer](../crates/rcmake-gen-common/src/fileapi.rs).
+
+## ADR-028 CMake runtime policy warning summaries
+
+- **Status:** Accepted
+
+Use warning summaries recorded from `cmake_policy(GET_WARNING)` in CMake
+4.5.1 for policies `CMP0000` through `CMP0226`. The policy registry supplies
+help titles. Both tables carry CMake attribution in the
+[third-party notices](../THIRD_PARTY_NOTICES.md).
+
+Sources: [Warning summaries](../crates/rcmake-diag/src/policy_warnings.rs) and [policy registry](../crates/rcmake-diag/src/generated_policies.rs).
+
+## ADR-029 Stable legacy regex install order
+
+- **Status:** Accepted
+
+For the regular expression forms of `install_files()` and
+`install_programs()`, sort the current source directory entries by name in
+byte order before matching. Use the shared regular expression step limit.
+The sorted order makes the install rules reproducible across filesystems.
+
+Source: [Legacy install commands](../crates/rcmake-commands/src/compat/install.rs).

@@ -6,8 +6,14 @@ This log records the licences and purpose of the vendored assets and direct work
 
 | Asset | Upstream version | Licence | Location | Purpose |
 | --- | --- | --- | --- | --- |
-| CMake standard modules and templates | CMake 4.5.1 | `BSD-3-Clause` | `modules/cmake-4.5/` | Supply the standard CMake module library and templates. The original copyright notices stay with the files. |
-| Rendered command-line help and reference manuals | CMake 4.5.1 | `BSD-3-Clause` | `crates/rcmake-cli/help/` | Supply CMake help when only the Rcmake binary is present. |
+| CMake standard modules and templates | CMake 4.5.1 | `BSD-3-Clause` | `modules/cmake-4.5/Modules/`, `modules/cmake-4.5/Templates/` | Supply the standard CMake modules and templates. The original copyright notices stay with the files. |
+| Rendered command-line help and reference manuals | CMake 4.5.1 | `BSD-3-Clause` | `crates/rcmake-cli/help/usage.txt`, `modules/cmake-4.5/Help/reference.zst` | Supply CMake help for the installed tool. |
+| Policy warning summaries | CMake 4.5.1 | `BSD-3-Clause` | `crates/rcmake-diag/src/policy_warnings.rs` | Supply runtime warning text from `cmake_policy(GET_WARNING)`. |
+| Policy registry | CMake 4.5.1 | `BSD-3-Clause` | `crates/rcmake-diag/src/generated_policies.rs` | Supply policy metadata and titles from CMake help output. |
+| Language server catalog | CMake 4.5.1 | `BSD-3-Clause` | `crates/rcmake-lsp/src/generated_catalog.rs` | Supply summaries and signatures from CMake Help and module documentation for editor queries. |
+| Target property initializer table | CMake 4.5.1 | `BSD-3-Clause` | `crates/rcmake-commands/src/targets/generated_init.rs` | Supply target property and initializer variable pairs from CMake Help. |
+
+The [third-party notices](../THIRD_PARTY_NOTICES.md#1-cmake-451-modules-templates-help-and-derived-tables-bsd-3-clause) list the CMake licence and contributor files.
 
 ## Direct Third-Party Dependencies
 

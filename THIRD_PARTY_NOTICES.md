@@ -1,16 +1,20 @@
 # Third-Party Notices
 
-Rcmake's native Rust source code (`crates/*`, `tools/*`, `scripts/*`) is dual-licensed under **MIT OR Apache-2.0** (see `LICENSE-MIT` and `LICENSE-APACHE`).
+Rcmake's original Rust source uses **MIT OR Apache-2.0**. See `LICENSE-MIT` and `LICENSE-APACHE`. The CMake assets and data below use **BSD-3-Clause**.
 
 Rcmake also bundles and attributes the following permissively licensed third-party assets and dependencies:
 
-## 1. CMake 4.5.1 Modules, Templates, and Help (`BSD-3-Clause`)
+## 1. CMake 4.5.1 modules, templates, help, and derived tables (`BSD-3-Clause`)
 
 - **Upstream project:** CMake 4.5.1 (Kitware, Inc. and Contributors)
 - **Upstream URL:** <https://github.com/Kitware/CMake/releases/tag/v4.5.1>
 - **Licence:** OSI-approved BSD 3-Clause License
-- **Vendored paths:** `modules/cmake-4.5/Modules/`, `modules/cmake-4.5/Templates/`, `modules/cmake-4.5/Help/reference.zst`, and `crates/rcmake-lsp/src/generated_catalog.rs`
+- **Vendored paths:** `modules/cmake-4.5/Modules/`, `modules/cmake-4.5/Templates/`, and `modules/cmake-4.5/Help/reference.zst`
 - **Rendered CLI usage:** `crates/rcmake-cli/help/usage.txt`
+- `crates/rcmake-diag/src/policy_warnings.rs` contains summaries from `cmake_policy(GET_WARNING)` in CMake 4.5.1.
+- `crates/rcmake-diag/src/generated_policies.rs` contains policy metadata and help titles from CMake 4.5.1.
+- `crates/rcmake-lsp/src/generated_catalog.rs` contains summaries and signatures from CMake Help and module documentation.
+- `crates/rcmake-commands/src/targets/generated_init.rs` contains target property and initializer variable pairs from CMake Help.
 - **Full licence & contributors:**
   - `third_party/licences/CMake-BSD-3-Clause.txt`
   - `third_party/licences/CMake-CONTRIBUTORS.rst`
