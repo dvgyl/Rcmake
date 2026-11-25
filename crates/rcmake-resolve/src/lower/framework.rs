@@ -4,7 +4,7 @@ use rcmake_host::{Host, ReadRange, WriteMode, path::to_native};
 use rcmake_model::{ProjectModel, Target, TargetId, TargetKind};
 
 use super::{build_relative, definition, join, shell::direct};
-use crate::{ArtifactSet, CustomStep, ResolveError};
+use crate::{ArtifactSet, CustomStep, ResolveError, ResolvedTarget, sources::TargetInputs};
 
 /// Apple bundle form of a target.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -107,14 +107,17 @@ pub(crate) fn wrapper_root<'a>(mut path: &'a [u8], suffix: &[u8]) -> Option<&'a 
 pub(super) fn prepare(
     model: &ProjectModel,
     target: &Target,
-    id: TargetId,
-    config: &ConfigId,
+    resolved: &ResolvedTarget,
     artifacts: &ArtifactSet,
+    inputs: Option<&TargetInputs>,
     host: &dyn Host,
 ) -> Result<CustomStep, ResolveError> {
     let layout = bundle_kind(target);
-    let BundleKind::Framework { version, .. } = &layout else {
-        return Ok(CustomStep::default());
+    let app = matches!(layout, BundleKind::App { .. });
+    let framework_version = match &layout {
+        BundleKind::Framework { version, .. } => Some(version),
+        BundleKind::App { .. } => None,
+        _ => return Ok(CustomStep::default()),
     };
     let Some(file) = &artifacts.file else {
         return Ok(CustomStep::default());
@@ -125,19 +128,29 @@ pub(super) fn prepare(
     let binary_dir = &model.dir(target.dir).binary_dir;
     let source_dir = &model.dir(target.dir).source_dir;
     let relative = |path: &[u8]| build_relative(model, path);
-    let content = Lexical::new(file).parent();
-    let desktop = content != root;
+    let executable_dir = Lexical::new(file).parent();
+    let desktop = executable_dir != root;
+    let content = if app && desktop {
+        Lexical::new(executable_dir).parent()
+    } else {
+        executable_dir
+    };
     let executable = Lexical::new(file).filename();
     let resources = if desktop {
         join(content, b"Resources")
     } else {
         content.into()
     };
-    let plist = join(&resources, b"Info.plist");
-    let input_plist = join(
+    let plist = join(if app { content } else { &resources }, b"Info.plist");
+    let support_dir = join(
         binary_dir,
-        &[b"CMakeFiles/", target.name.as_slice(), b".dir/Info.plist"].concat(),
+        &[b"CMakeFiles/", target.name.as_slice(), b".dir"].concat(),
     );
+    let input_plist = if app && !resolved.config.0.is_empty() {
+        join(&join(&support_dir, &resolved.config.0), b"Info.plist")
+    } else {
+        join(&support_dir, b"Info.plist")
+    };
     let mut step = CustomStep::default();
     let cmake = definition(model, target.dir, b"CMAKE_COMMAND")
         .cloned()
@@ -147,33 +160,60 @@ pub(super) fn prepare(
         argv.extend_from_slice(args);
         step.invocations.push(direct(argv, None));
     };
-    run("make_directory", &[relative(&resources)]);
-    let template = target
-        .props
-        .get(b"MACOSX_FRAMEWORK_INFO_PLIST")
-        .map(|path| join(source_dir, path))
-        .or_else(|| {
-            definition(model, target.dir, b"CMAKE_ROOT")
-                .map(|root| join(root, b"Modules/MacOSXFrameworkInfo.plist.in"))
-        });
+    run("make_directory", &[relative(Lexical::new(&plist).parent())]);
+    let template = if app {
+        app_template(model, target, host)?
+    } else {
+        target
+            .props
+            .get(b"MACOSX_FRAMEWORK_INFO_PLIST")
+            .map(|path| join(source_dir, path))
+            .or_else(|| {
+                definition(model, target.dir, b"CMAKE_ROOT")
+                    .map(|root| join(root, b"Modules/MacOSXFrameworkInfo.plist.in"))
+            })
+    };
     let input = if let Some(template) = template {
         step.depends.push(relative(&template));
         host.read(&to_native(&template), ReadRange::All { limit: 1024 * 1024 })
             .map_err(|error| {
                 ResolveError::Message(format!("Cannot read {template}: {error}").into())
             })?
+    } else if app {
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleIdentifier</key><string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string></dict></plist>
+"#.to_vec()
     } else {
         br#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>CFBundleExecutable</key><string>${MACOSX_FRAMEWORK_NAME}</string><key>CFBundlePackageType</key><string>FMWK</string><key>CFBundleIdentifier</key><string>${MACOSX_FRAMEWORK_IDENTIFIER}</string></dict></plist>
 "#.to_vec()
     };
+    let executable_key = if app {
+        b"MACOSX_BUNDLE_EXECUTABLE_NAME".as_slice()
+    } else {
+        b"MACOSX_FRAMEWORK_NAME"
+    };
     let info = expand(&input, |key| {
-        if key == b"MACOSX_FRAMEWORK_NAME" {
+        if key == executable_key {
             executable
         } else {
-            target
-                .props
-                .get(key)
+            let property = if !app
+                || matches!(
+                    key,
+                    b"MACOSX_BUNDLE_BUNDLE_NAME"
+                        | b"MACOSX_BUNDLE_BUNDLE_VERSION"
+                        | b"MACOSX_BUNDLE_COPYRIGHT"
+                        | b"MACOSX_BUNDLE_GUI_IDENTIFIER"
+                        | b"MACOSX_BUNDLE_ICON_FILE"
+                        | b"MACOSX_BUNDLE_INFO_STRING"
+                        | b"MACOSX_BUNDLE_LONG_VERSION_STRING"
+                        | b"MACOSX_BUNDLE_SHORT_VERSION_STRING"
+                ) {
+                target.props.get(key)
+            } else {
+                None
+            };
+            property
                 .or_else(|| definition(model, target.dir, key))
                 .map_or(b"", |value| value.as_slice())
         }
@@ -198,7 +238,7 @@ pub(super) fn prepare(
     step.depends.push(relative(&input_plist));
     step.byproducts.push(relative(&plist));
 
-    if desktop {
+    if let Some(version) = framework_version.filter(|_| desktop) {
         for (destination, source) in [
             (join(root, b"Versions/Current"), version.clone()),
             (
@@ -214,52 +254,89 @@ pub(super) fn prepare(
             step.byproducts.push(relative(&destination));
         }
     }
-    for (property, directory) in [
-        (b"PUBLIC_HEADER".as_slice(), b"Headers".as_slice()),
-        (b"PRIVATE_HEADER", b"PrivateHeaders"),
-        (b"RESOURCE", b"Resources"),
-    ] {
-        let Some(values) = target.props.get(property).filter(|value| !value.is_empty()) else {
-            continue;
-        };
-        let dest = if directory == b"Resources" {
-            resources.clone()
-        } else {
-            join(content, directory)
-        };
-        run("make_directory", &[relative(&dest)]);
-        if desktop && directory != b"Resources" {
-            let link = relative(&join(root, directory));
-            run(
-                "create_symlink",
-                &[join(b"Versions/Current", directory), link.clone()],
-            );
-            step.byproducts.push(link);
-        }
-        for value in list::split(values, list::Empty::Drop) {
-            let source = join(source_dir, &value);
-            let output = join(&dest, Lexical::new(&source).filename());
-            let source = relative(&source);
-            run("copy_if_different", &[source.clone(), relative(&output)]);
-            step.depends.push(source);
-            step.byproducts.push(relative(&output));
+    if !app {
+        for (property, directory) in [
+            (b"PUBLIC_HEADER".as_slice(), b"Headers".as_slice()),
+            (b"PRIVATE_HEADER", b"PrivateHeaders"),
+            (b"RESOURCE", b"Resources"),
+        ] {
+            let Some(values) = target.props.get(property).filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let dest = if directory == b"Resources" {
+                resources.clone()
+            } else {
+                join(content, directory)
+            };
+            run("make_directory", &[relative(&dest)]);
+            if desktop && directory != b"Resources" {
+                let link = relative(&join(root, directory));
+                run(
+                    "create_symlink",
+                    &[join(b"Versions/Current", directory), link.clone()],
+                );
+                step.byproducts.push(link);
+            }
+            for value in list::split(values, list::Empty::Drop) {
+                let source = join(source_dir, &value);
+                let output = join(&dest, Lexical::new(&source).filename());
+                let source = relative(&source);
+                run("copy_if_different", &[source.clone(), relative(&output)]);
+                step.depends.push(source);
+                step.byproducts.push(relative(&output));
+            }
         }
     }
-    let context = EvalContext {
-        config: config.clone(),
-        ..Default::default()
-    };
-    let mut usage = crate::usage::UsageResolver::new(model);
     let directory = model.dir(target.dir);
-    for entry in usage.collect_property(id, b"SOURCES", &context)?.entries {
-        let source = join(source_dir, &entry.value);
-        let Some(location) =
-            crate::sources::properties(directory, &source).get(b"MACOSX_PACKAGE_LOCATION")
-        else {
+    let sources = if app {
+        inputs
+            .into_iter()
+            .flat_map(|inputs| &inputs.sources)
+            .cloned()
+            .collect()
+    } else {
+        let context = EvalContext {
+            config: resolved.config.clone(),
+            ..Default::default()
+        };
+        crate::usage::UsageResolver::new(model)
+            .collect_property(resolved.id, b"SOURCES", &context)?
+            .entries
+            .into_iter()
+            .map(|entry| join(source_dir, &entry.value))
+            .collect::<Vec<_>>()
+    };
+    let resources_list = target
+        .props
+        .get(b"RESOURCE")
+        .filter(|_| app)
+        .map(|values| {
+            list::split(values, list::Empty::Drop)
+                .into_iter()
+                .map(|value| {
+                    let source = crate::sources::absolute_path(source_dir, &value);
+                    if inputs.is_some_and(|inputs| inputs.sources.contains(&source)) {
+                        source
+                    } else {
+                        crate::sources::absolute_path(binary_dir, &value)
+                    }
+                })
+                .collect::<indexmap::IndexSet<_>>()
+        })
+        .unwrap_or_default();
+    for source in sources {
+        let location = if resources_list.contains(&source) {
+            Some(b"Resources".as_slice())
+        } else {
+            crate::sources::properties(directory, &source)
+                .get(b"MACOSX_PACKAGE_LOCATION")
+                .map(|value| value.as_slice())
+        };
+        let Some(location) = location else {
             continue;
         };
         let location = if desktop {
-            location.as_slice()
+            location
         } else if location == b"Resources" {
             b""
         } else {
@@ -282,6 +359,48 @@ pub(super) fn prepare(
         step.byproducts.push(output);
     }
     Ok(step)
+}
+
+fn app_template(
+    model: &ProjectModel,
+    target: &Target,
+    host: &dyn Host,
+) -> Result<Option<BString>, ResolveError> {
+    let custom = target.props.get(b"MACOSX_BUNDLE_INFO_PLIST");
+    let name = custom.map_or(b"MacOSXBundleInfo.plist.in".as_slice(), |name| {
+        name.as_slice()
+    });
+    if Lexical::new(name).absolute() || Lexical::windows(name).absolute() {
+        return Ok(Some(name.into()));
+    }
+    let module_paths = definition(model, target.dir, b"CMAKE_MODULE_PATH");
+    let cmake_root = definition(model, target.dir, b"CMAKE_ROOT");
+    let source_dir = &model.dir(target.dir).source_dir;
+    let paths = module_paths
+        .into_iter()
+        .flat_map(|paths| list::split(paths, list::Empty::Drop))
+        .map(|path| join(source_dir, &path))
+        .chain(cmake_root.map(|root| join(root, b"Modules")));
+    for path in paths {
+        let candidate = join(&path, name);
+        if host
+            .metadata(&to_native(&candidate), rcmake_host::Follow::Yes)
+            .is_ok()
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    if custom.is_none() && cmake_root.is_none() {
+        return Ok(None);
+    }
+    Err(ResolveError::Message(
+        format!(
+            "CMake Error: Target {} Info.plist template \"{}\" could not be found.",
+            target.name,
+            BString::from(name),
+        )
+        .into(),
+    ))
 }
 
 pub(super) fn append_text_stub(

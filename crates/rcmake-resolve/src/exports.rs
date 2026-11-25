@@ -30,9 +30,6 @@ pub(crate) fn resolve_exports(
 ) -> Result<Vec<ExportPlan>, ResolveError> {
     let mut install_catalog = ExportCatalog::new();
     for rule in &model.installs {
-        if model.dir_excluded_from_all(rule.dir) {
-            continue;
-        }
         let InstallKind::Export {
             set,
             namespace,
@@ -58,9 +55,6 @@ pub(crate) fn resolve_exports(
     }
     let mut plans = Vec::new();
     for (index, rule) in model.installs.iter().enumerate() {
-        if model.dir_excluded_from_all(rule.dir) {
-            continue;
-        }
         let InstallKind::Export {
             set,
             namespace,
@@ -145,7 +139,11 @@ pub(crate) fn resolve_exports(
         if rule.options.export_package_dependencies {
             plan.package_dependencies = package_dependencies(model, &plan.set, packages);
         }
-        plans.push(plan);
+        // The parent install omits excluded directories. Their export rules
+        // still take part in dependency resolution and validation.
+        if !model.dir_excluded_from_all(rule.dir) {
+            plans.push(plan);
+        }
     }
 
     let build_plans = build_exports(model)?;

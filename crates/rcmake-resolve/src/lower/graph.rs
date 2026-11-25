@@ -618,22 +618,28 @@ impl<'a> TargetPlan<'a> {
             )?;
             let position_independent = self.inputs.and_then(|inputs| inputs.position_independent);
             let mut linker_artifacts = artifacts.clone();
-            let framework = matches!(
-                crate::ide::bundle_kind(target),
-                crate::ide::BundleKind::Framework { .. }
-            );
+            let bundle = crate::ide::bundle_kind(target);
+            let framework = matches!(bundle, crate::ide::BundleKind::Framework { .. });
+            let app = matches!(bundle, crate::ide::BundleKind::App { .. });
             if super::is_darwin(model, target.dir)
-                && (framework || artifacts.import_file.is_some())
+                && (app || framework || artifacts.import_file.is_some())
                 && usage.ide().is_none()
                 && let Some(paths) = usage.source_paths()
             {
-                let mut resources =
-                    prepare_framework(model, target, config, resolved, artifacts, paths.host)?;
+                let mut resources = super::framework::prepare(
+                    model,
+                    target,
+                    resolved,
+                    artifacts,
+                    self.inputs,
+                    paths.host,
+                )?;
                 if !resources.invocations.is_empty() {
                     resources.outputs = std::mem::take(&mut resources.byproducts);
                     before.depends.extend(resources.outputs.iter().cloned());
+                    let kind = if app { "bundle" } else { "framework" };
                     resources.comment =
-                        Some(format!("Copying framework resources for {}", target.name).into());
+                        Some(format!("Copying {kind} resources for {}", target.name).into());
                     self.steps
                         .insert(push(graph_steps, BuildStep::Custom(resources)));
                 }
@@ -793,18 +799,6 @@ fn separate_library_symlinks(link: &mut BuildStep, after: &mut CustomStep) -> Op
     symlink.depends.push(step.output.clone());
     symlink.invocations.insert(0, command);
     Some(symlink)
-}
-
-fn prepare_framework(
-    model: &ProjectModel,
-    target: &Target,
-    config: &ConfigId,
-    resolved: &ResolvedTarget,
-    artifacts: &ArtifactSet,
-    host: &dyn rcmake_host::Host,
-) -> Result<CustomStep, ResolveError> {
-    debug_assert!(config.matches(&resolved.config.0));
-    super::framework::prepare(model, target, resolved.id, config, artifacts, host)
 }
 
 fn link_step(
