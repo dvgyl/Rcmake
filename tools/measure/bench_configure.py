@@ -24,7 +24,6 @@ import platform
 import re
 import shlex
 import shutil
-import signal
 import statistics
 import subprocess
 import sys
@@ -34,6 +33,10 @@ import threading
 import time
 import tomllib
 
+try:
+    from ._proc import kill_group
+except ImportError:
+    from _proc import kill_group
 from determinism import observe_compilers
 from mutation_eval import API, REPLAY_RESULT, discover_leaves, replay_leaves
 from oracle_prop_test import run_command
@@ -130,15 +133,9 @@ def measure(command, cwd, env, timeout):
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,
         ) as process:
-            def kill_group():
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-
             def deadline():
                 timed_out.set()
-                kill_group()
+                kill_group(process)
 
             timer = threading.Timer(timeout, deadline)
             timer.start()
@@ -146,7 +143,7 @@ def measure(command, cwd, env, timeout):
                 process.wait()
                 elapsed = (time.perf_counter() - start) * 1000
             except KeyboardInterrupt:
-                kill_group()
+                kill_group(process)
                 process.wait()
                 raise
             finally:
@@ -173,17 +170,17 @@ def synthetic_project(source, directories, probes):
     source.mkdir()
     lines = [
         "cmake_minimum_required(VERSION 4.5)",
-        "project(M6Bench LANGUAGES C)",
+        "project(ConfigureBench LANGUAGES C)",
         "include(CheckCSourceCompiles)",
-        'check_c_source_compiles("int main(void) { return 0; }" M6_PROBE)',
-        "if(NOT M6_PROBE)",
+        'check_c_source_compiles("int main(void) { return 0; }" BENCH_PROBE)',
+        "if(NOT BENCH_PROBE)",
         '  message(FATAL_ERROR "The C compiler probe failed.")',
         "endif()",
     ]
     for index in range(1, probes):
         lines.extend((
-            f'check_c_source_compiles("int main(void) {{ return {index} - {index}; }}" M6_PROBE_{index})',
-            f"if(NOT M6_PROBE_{index})",
+            f'check_c_source_compiles("int main(void) {{ return {index} - {index}; }}" BENCH_PROBE_{index})',
+            f"if(NOT BENCH_PROBE_{index})",
             f'  message(FATAL_ERROR "C compiler probe {index} failed.")',
             "endif()",
         ))
@@ -402,7 +399,7 @@ def configure_runs(binary, project, work, generator, env, timeout, *, synthetic,
                                   timed=timed)
         if not sample.error and synthetic:
             cache = build / "CMakeCache.txt"
-            if "M6_PROBE:INTERNAL=1" not in cache.read_text(errors="replace").splitlines():
+            if "BENCH_PROBE:INTERNAL=1" not in cache.read_text(errors="replace").splitlines():
                 sample.error = "The synthetic compiler probe result is missing."
         if not sample.error and log and phase == COLD:
             cold_inputs = compiler_inputs(log)

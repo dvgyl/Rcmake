@@ -16,7 +16,6 @@ from pathlib import Path
 import re
 import shlex
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -26,6 +25,11 @@ import time
 import tomllib
 from urllib.request import urlopen
 import zipfile
+
+try:
+    from ._proc import run_process as _run_process
+except ImportError:
+    from _proc import run_process as _run_process
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -104,30 +108,17 @@ def extract(archive: Path, destination: Path) -> Path:
 
 def run_process(command: list[str], cwd: Path, timeout: int, env: dict[str, str]) -> dict:
     """Run one command and stop its process group if the timeout expires."""
-    start = time.monotonic()
-    result = {"returncode": None}
-    try:
-        with subprocess.Popen(
-            command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", start_new_session=True,
-        ) as process:
-            try:
-                output, _ = process.communicate(timeout=timeout)
-                result["returncode"] = process.returncode
-            except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                output, _ = process.communicate()
-                if isinstance(error, KeyboardInterrupt):
-                    raise
-                result["error"] = f"Command timed out after {timeout} seconds."
-            result["output"] = output
-    except OSError as error:
-        result["error"] = str(error)
-    result["seconds"] = round(time.monotonic() - start, 2)
+    completed = _run_process(command, cwd, timeout, env, text=True, merge_stderr=True)
+    result: dict = {
+        "returncode": None if completed.timed_out or completed.start_error else completed.returncode,
+        "seconds": round(completed.seconds, 2),
+    }
+    if completed.start_error is not None:
+        result["error"] = completed.start_error
+        return result
+    if completed.timed_out:
+        result["error"] = f"Command timed out after {timeout} seconds."
+    result["output"] = completed.stdout
     return result
 
 

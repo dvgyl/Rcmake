@@ -21,10 +21,14 @@ from pathlib import Path
 import random
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
+
+try:
+    from ._proc import run_process as _run_process
+except ImportError:
+    from _proc import run_process as _run_process
 
 ORACLE_VERSION = "4.5.1"
 DEFAULT_WORK_DIR = Path("/tmp/rcmake-proptest-work")
@@ -58,26 +62,14 @@ class Case:
 
 def run_command(command, cwd: Path, timeout: int, env: dict[str, str]) -> dict:
     """Capture both streams and stop the process group at the timeout."""
-    command = [os.fspath(arg) for arg in command]
-    with subprocess.Popen(
-        command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        encoding="utf-8", errors="replace", start_new_session=True,
-    ) as process:
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-            error = None
-        except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            if isinstance(exc, KeyboardInterrupt):
-                raise
-            stdout, stderr = process.communicate(timeout=5)
-            error = f"Command timed out after {timeout} seconds."
-    return {"returncode": process.returncode, "stdout": stdout, "stderr": stderr,
-            "error": error}
+    result = _run_process(command, cwd, timeout, env, text=True, catch_oserror=False, drain_timeout=5)
+    error = f"Command timed out after {timeout} seconds." if result.timed_out else None
+    return {
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "error": error,
+    }
 
 
 def executable(path: str | Path) -> Path:

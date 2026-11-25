@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Unit tests for independent_verify.py.
+"""Unit tests for independent_verify.py and the verify package.
 
 Most tests do not need CMake. The integration test runs one fast scenario
 with the CMake 4.5.1 oracle when RCMAKE_ORACLE_CMAKE names a program.
@@ -24,7 +24,8 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import independent_verify as iv  # noqa: E402
-import independent_scenarios_extra as ix  # noqa: E402
+import verify  # noqa: E402
+from verify import context as verify_context  # noqa: E402
 
 
 def fake_tools(root: Path, label: str = "oracle") -> iv.Toolset:
@@ -121,10 +122,16 @@ class AliasTest(TempDirTest):
             """))
         ctx = iv.Ctx(fake_tools(Path("/stage")), self.tmp / "run", iv.Options())
         ctx.learn_tool_paths(self.tmp)
-        ctx.learn_tool_paths(self.tmp)  # A second read adds nothing.
-        self.assertEqual(sorted(ctx.aliases), [
-            ("/real/bin/cmake", "<CMAKE>"), ("/real/bin/ctest", "<CTEST>"),
-            ("/real/share/cmake-4.5", "<CMAKE_ROOT>")])
+        ctx.learn_tool_paths(self.tmp)
+        self.assertEqual(
+            sorted(ctx.aliases),
+            [
+                ("/real/bin/cmake", "<CMAKE>"),
+                ("/real/bin/ctest", "<CTEST>"),
+                ("/real/share/cmake-4.5", "<CMAKE_ROOT>"),
+            ],
+            "a second learn_tool_paths read must not duplicate aliases",
+        )
         self.assertEqual(ctx.normalize(["/real/bin/cmake", "/stage/bin/cmake", "/real/share/cmake-4.5/x"]),
                          ["<CMAKE>", "<CMAKE>", "<CMAKE_ROOT>/x"])
 
@@ -148,7 +155,8 @@ class SandboxTest(TempDirTest):
         self.assertTrue(box.path.name.startswith("rcmake-indep-"))
         box.cleanup()
         self.assertFalse(box.path.exists())
-        box.cleanup()  # A second call does nothing.
+        box.cleanup()
+        self.assertFalse(box.path.exists(), "a second cleanup call must be a no-op")
 
     def test_keep(self) -> None:
         with iv.Sandbox(str(self.tmp), keep=True) as box:
@@ -258,10 +266,9 @@ class RegistryTest(unittest.TestCase):
         ids = [sc.sid for sc in iv.SCENARIOS]
         self.assertEqual(ids, [f"s{i:02d}" for i in range(1, 21)])
 
-    def test_extra_module_uses_the_same_registry(self) -> None:
-        self.assertIs(ix.iv, iv)
-        iv.load_extra_scenarios()  # A second load must not add the scenarios again.
-        self.assertEqual(len(iv.SCENARIOS), 20)
+    def test_package_and_entrypoint_share_the_same_registry(self) -> None:
+        self.assertIs(iv.SCENARIOS, verify.SCENARIOS)
+        self.assertEqual(len(iv.SCENARIOS), 20, "all 20 scenarios must register once without duplicates")
 
     def test_script_lists_every_scenario_once(self) -> None:
         script = Path(iv.__file__).resolve()
@@ -343,10 +350,10 @@ class RunnerTest(TempDirTest):
 
 class ExtraHelperTest(TempDirTest):
     def test_is_appledouble(self) -> None:
-        self.assertTrue(ix.is_appledouble("d/._a.txt"))
-        self.assertTrue(ix.is_appledouble("._d/"))
-        self.assertTrue(ix.is_appledouble("x/.DS_Store"))
-        self.assertFalse(ix.is_appledouble("d/a._txt"))
+        self.assertTrue(iv.is_appledouble("d/._a.txt"))
+        self.assertTrue(iv.is_appledouble("._d/"))
+        self.assertTrue(iv.is_appledouble("x/.DS_Store"))
+        self.assertFalse(iv.is_appledouble("d/a._txt"))
 
     def test_tree_digest(self) -> None:
         (self.tmp / "d/sub").mkdir(parents=True)
@@ -354,17 +361,17 @@ class ExtraHelperTest(TempDirTest):
         os.chmod(self.tmp / "d/a.txt", 0o640)
         (self.tmp / "d/._a.txt").write_text("meta")
         (self.tmp / "d/l").symlink_to("a.txt")
-        digest = ix.tree_digest(self.tmp / "d")
+        digest = iv.tree_digest(self.tmp / "d")
         self.assertEqual(digest[0].split(" ")[:2], ["a.txt", "640"])
         self.assertEqual(digest[1:], ["l -> a.txt", "sub/"])
         (self.tmp / "d/a.txt").write_text("b")
-        self.assertNotEqual(ix.tree_digest(self.tmp / "d")[0], digest[0])
+        self.assertNotEqual(iv.tree_digest(self.tmp / "d")[0], digest[0])
 
     def test_archive_kind(self) -> None:
         for name, head in (("g", b"\x1f\x8b\x08"), ("b", b"BZh9"), ("x", b"\xfd7zXZ\x00"),
                            ("z", b"\x28\xb5\x2f\xfd"), ("p", b"PK\x03\x04"), ("s", b"7z\xbc\xaf\x27\x1c")):
             (self.tmp / name).write_bytes(head + bytes(600))
-        kinds = [ix.archive_kind(self.tmp / n) for n in "gbxzps"]
+        kinds = [iv.archive_kind(self.tmp / n) for n in "gbxzps"]
         self.assertEqual(kinds, ["gzip", "bzip2", "xz", "zstd", "zip", "7zip"])
         for fmt, kind in ((tarfile.GNU_FORMAT, "tar-gnu"), (tarfile.PAX_FORMAT, "tar-posix"),
                           (tarfile.USTAR_FORMAT, "tar-posix")):
@@ -373,25 +380,25 @@ class ExtraHelperTest(TempDirTest):
                 info = tarfile.TarInfo("f")
                 info.size = 1
                 tar.addfile(info, io.BytesIO(b"x"))
-            self.assertEqual(ix.archive_kind(path), kind)
-        self.assertEqual(ix.archive_kind(self.tmp / "absent"), "missing")
+            self.assertEqual(iv.archive_kind(path), kind)
+        self.assertEqual(iv.archive_kind(self.tmp / "absent"), "missing")
         (self.tmp / "junk").write_bytes(bytes(600))
-        self.assertEqual(ix.archive_kind(self.tmp / "junk"), "unknown")
+        self.assertEqual(iv.archive_kind(self.tmp / "junk"), "unknown")
 
     def test_listing_lines_and_python_members(self) -> None:
-        self.assertEqual(ix.listing_lines("d/\nd/._a\nd/a\n\n"), ["d", "d/a"])
+        self.assertEqual(iv.listing_lines("d/\nd/._a\nd/a\n\n"), ["d", "d/a"])
         path = self.tmp / "m.zip"
         with zipfile.ZipFile(path, "w") as zf:
             zf.writestr("d/", "")
             zf.writestr("d/a", "x")
             zf.writestr("d/._a", "x")
-        self.assertEqual(ix.python_members(path), [("d", 0), ("d/a", 0)])
+        self.assertEqual(iv.python_members(path), [("d", 0), ("d/a", 0)])
         tpath = self.tmp / "m.tar"
         with tarfile.open(tpath, "w") as tar:
             info = tarfile.TarInfo("d/a")
-            info.size, info.mtime = 1, ix.FIXED_EPOCH
+            info.size, info.mtime = 1, iv.FIXED_EPOCH
             tar.addfile(info, io.BytesIO(b"x"))
-        self.assertEqual(ix.python_members(tpath), [("d/a", ix.FIXED_EPOCH)])
+        self.assertEqual(iv.python_members(tpath), [("d/a", iv.FIXED_EPOCH)])
 
     def test_cmake_errors_and_message_lines(self) -> None:
         text = textwrap.dedent("""\
@@ -406,11 +413,11 @@ class ExtraHelperTest(TempDirTest):
             -- Generating done (0.0s)
             CMake Generate step failed.
             """)
-        self.assertEqual(ix.cmake_errors(text), [
+        self.assertEqual(iv.cmake_errors(text), [
             'CMake Error in CMakeLists.txt: The target named "m" has Unix Makefiles',
             "CMake Warning (dev) at a.cmake:3 (message): w"])
-        self.assertEqual(ix.cmake_errors("CMake Error: last\n  line"), ["CMake Error: last line"])
-        self.assertEqual(ix.message_lines(text, "-- Gen", "CMake Gen"), [
+        self.assertEqual(iv.cmake_errors("CMake Error: last\n  line"), ["CMake Error: last line"])
+        self.assertEqual(iv.message_lines(text, "-- Gen", "CMake Gen"), [
             "-- Generating done (0.0s)", "CMake Generate step failed."])
 
     def test_resolve_reply_inlines_files_and_stops(self) -> None:
@@ -418,65 +425,79 @@ class ExtraHelperTest(TempDirTest):
         (reply / "a.json").write_text(json.dumps({"x": 1, "jsonFile": "b.json"}))
         (reply / "b.json").write_text(json.dumps({"loop": {"jsonFile": "a.json"}}))
         (reply / "bad.json").write_text("{")
-        out = ix.resolve_reply(reply, {"objs": [{"jsonFile": "a.json"}, {"jsonFile": "bad.json"},
+        out = iv.resolve_reply(reply, {"objs": [{"jsonFile": "a.json"}, {"jsonFile": "bad.json"},
                                                 {"jsonFile": "../escape.json"}, {"jsonFile": "absent.json"}]})
         first = out["objs"][0]["json"]
         self.assertEqual(first["x"], 1)
-        # a.json -> b.json -> a.json ... stops after four file references.
         node = first
         for _ in range(12):
             if not isinstance(node, dict):
                 break
             node = node.get("json", node.get("loop"))
-        self.assertEqual(node, "<not resolved a.json>")
+        self.assertEqual(
+            node, "<not resolved a.json>",
+            "cyclic jsonFile resolution must stop after four file references",
+        )
         self.assertEqual(out["objs"][1]["json"], "<unreadable JSONDecodeError>")
         self.assertEqual(out["objs"][2]["json"], "<not resolved ../escape.json>")
         self.assertEqual(out["objs"][3]["json"], "<unreadable FileNotFoundError>")
 
     def test_file_api_reply_and_find_target(self) -> None:
         build = self.tmp
-        self.assertEqual(ix.file_api_reply(build), ([], {}))
+        self.assertEqual(iv.file_api_reply(build), ([], {}))
         reply = build / ".cmake/api/v1/reply"
         reply.mkdir(parents=True)
         (reply / "t.json").write_text(json.dumps({"name": "app", "type": "EXECUTABLE"}))
         (reply / "index-2.json").write_text(json.dumps({"targets": [{"name": "app", "jsonFile": "t.json"}]}))
         (reply / "index-1.json").write_text(json.dumps({}))
-        names, index = ix.file_api_reply(build)
+        names, index = iv.file_api_reply(build)
         self.assertEqual(names, ["index-1.json", "index-2.json"])
-        self.assertEqual(ix.find_target(index, "app"), {"name": "app", "type": "EXECUTABLE"})
-        self.assertEqual(ix.find_target({"abstractTargets": [{"name": "e", "json": {"imported": True}}]}, "e"),
+        self.assertEqual(iv.find_target(index, "app"), {"name": "app", "type": "EXECUTABLE"})
+        self.assertEqual(iv.find_target({"abstractTargets": [{"name": "e", "json": {"imported": True}}]}, "e"),
                          {"imported": True})
-        self.assertEqual(ix.find_target(index, "absent"), {})
+        self.assertEqual(iv.find_target(index, "absent"), {})
 
     def test_without_install_layout(self) -> None:
         value = {"json": {"entries": [{"name": "CMAKE_EDIT_COMMAND", "value": "/x/ccmake"},
                                       {"name": "A", "value": "1"}]}}
-        self.assertEqual(ix.without_install_layout(value), {"json": {"entries": [{"name": "A", "value": "1"}]}})
+        self.assertEqual(iv.without_install_layout(value), {"json": {"entries": [{"name": "A", "value": "1"}]}})
 
     def test_collapse_repeats_keeps_text_order_and_distinct_blocks(self) -> None:
         err, warn = "CMake Error in CMakeLists.txt: E", "CMake Warning at a:1 (x): W"
-        self.assertEqual(ix.collapse_repeats([warn, err, err, err]), [warn, err])
-        self.assertEqual(ix.collapse_repeats([err, warn, err]), [err, warn, err])
-        self.assertEqual(ix.collapse_repeats([]), [])
-        # The oracle repeats the error, Rcmake gives it once: the observations are equal.
-        self.assertEqual(ix.collapse_repeats([err] * 4), ix.collapse_repeats([err]))
-        # Different text stays different.
-        self.assertNotEqual(ix.collapse_repeats([err, err]), ix.collapse_repeats([err + "x"]))
+        self.assertEqual(iv.collapse_repeats([warn, err, err, err]), [warn, err])
+        self.assertEqual(iv.collapse_repeats([err, warn, err]), [err, warn, err])
+        self.assertEqual(iv.collapse_repeats([]), [])
+        self.assertEqual(
+            iv.collapse_repeats([err] * 4),
+            iv.collapse_repeats([err]),
+            "consecutive repeated errors must collapse to match a single occurrence",
+        )
+        self.assertNotEqual(
+            iv.collapse_repeats([err, err]),
+            iv.collapse_repeats([err + "x"]),
+            "distinct diagnostic text must stay different",
+        )
 
     def test_without_tar_owner(self) -> None:
         oracle = "-rw-------  0 devg   wheel      11  3 Feb 2001 d/sp ace.txt"
         rcmake = "-rw-------  0 0      0          11  3 Feb 2001 d/sp ace.txt"
-        self.assertEqual(ix.without_tar_owner(oracle), "-rw------- 0 <OWNER> <GROUP> 11 3 Feb 2001 d/sp ace.txt")
-        self.assertEqual(ix.without_tar_owner(oracle), ix.without_tar_owner(rcmake))
-        self.assertEqual(ix.without_tar_owner("lrwxr-xr-x 0 devg wheel 0 3 Feb 2001 d/link -> a.txt"),
+        self.assertEqual(iv.without_tar_owner(oracle), "-rw------- 0 <OWNER> <GROUP> 11 3 Feb 2001 d/sp ace.txt")
+        self.assertEqual(iv.without_tar_owner(oracle), iv.without_tar_owner(rcmake))
+        self.assertEqual(iv.without_tar_owner("lrwxr-xr-x 0 devg wheel 0 3 Feb 2001 d/link -> a.txt"),
                          "lrwxr-xr-x 0 <OWNER> <GROUP> 0 3 Feb 2001 d/link -> a.txt")
-        # The mode, size, date, path, and link target are still compared.
         for other in ("-rw-r--r-- 0 0 0 11 3 Feb 2001 d/sp ace.txt", "-rw------- 0 0 0 12 3 Feb 2001 d/sp ace.txt",
                       "-rw------- 0 0 0 11 4 Feb 2001 d/sp ace.txt", "-rw------- 0 0 0 11 3 Feb 2001 d/space.txt"):
-            self.assertNotEqual(ix.without_tar_owner(other), ix.without_tar_owner(oracle))
-        self.assertNotEqual(ix.without_tar_owner("l 0 a b 0 d/link -> a.txt"),
-                            ix.without_tar_owner("l 0 a b 0 d/link -> b.txt"))
-        self.assertEqual(ix.without_tar_owner("short line"), "short line")
+            self.assertNotEqual(
+                iv.without_tar_owner(other),
+                iv.without_tar_owner(oracle),
+                "mode, size, date, and path must remain compared",
+            )
+        self.assertNotEqual(
+            iv.without_tar_owner("l 0 a b 0 d/link -> a.txt"),
+            iv.without_tar_owner("l 0 a b 0 d/link -> b.txt"),
+            "symlink target must remain compared",
+        )
+        self.assertEqual(iv.without_tar_owner("short line"), "short line")
 
     def test_supported_capabilities(self) -> None:
         def gen(name: str, extra: list[str], toolset: bool = False) -> dict:
@@ -491,33 +512,42 @@ class ExtraHelperTest(TempDirTest):
         rcmake = common | {"debugger": False, "generators": [
             gen("Unix Makefiles", []), gen("Ninja", []), gen("Ninja Multi-Config", []), gen("Xcode", [], True),
             gen("Visual Studio 17 2022", [])]}
-        self.assertEqual(ix.supported_capabilities(oracle), ix.supported_capabilities(rcmake))
-        self.assertEqual([g["name"] for g in ix.supported_capabilities(oracle)["generators"]],
+        self.assertEqual(iv.supported_capabilities(oracle), iv.supported_capabilities(rcmake))
+        self.assertEqual([g["name"] for g in iv.supported_capabilities(oracle)["generators"]],
                          ["Ninja", "Ninja Multi-Config", "Unix Makefiles", "Visual Studio 17 2022", "Xcode"])
-        # tls, version, fileApi, instrumentation, serverMode, and generator details stay strict.
         for key, value in (("tls", False), ("version", {"string": "4.5.0"}), ("fileApi", {}),
                            ("instrumentation", {}), ("serverMode", True)):
-            self.assertNotEqual(ix.supported_capabilities(rcmake | {key: value}),
-                                ix.supported_capabilities(oracle), key)
+            self.assertNotEqual(
+                iv.supported_capabilities(rcmake | {key: value}),
+                iv.supported_capabilities(oracle),
+                f"{key} must stay strict in supported_capabilities",
+            )
         no_xcode = rcmake | {"generators": rcmake["generators"][:3]}
-        self.assertNotEqual(ix.supported_capabilities(no_xcode), ix.supported_capabilities(oracle))
+        self.assertNotEqual(
+            iv.supported_capabilities(no_xcode),
+            iv.supported_capabilities(oracle),
+            "missing supported generator must differ",
+        )
         no_toolset = rcmake | {"generators": rcmake["generators"][:3] + [gen("Xcode", [])]}
-        self.assertNotEqual(ix.supported_capabilities(no_toolset), ix.supported_capabilities(oracle))
-        self.assertEqual(ix.supported_capabilities({}), {})
+        self.assertNotEqual(
+            iv.supported_capabilities(no_toolset),
+            iv.supported_capabilities(oracle),
+            "generator toolsetSupport detail must stay strict",
+        )
+        self.assertEqual(iv.supported_capabilities({}), {})
 
     def test_backtrace_chain(self) -> None:
         graph = {"commands": ["add_executable", "include"], "files": ["CMakeLists.txt", "x.cmake"],
                  "nodes": [{"file": 0}, {"command": 1, "file": 0, "line": 3, "parent": 0},
                            {"file": 1, "parent": 1}, {"command": 0, "file": 1, "line": 2, "parent": 2},
                            {"file": 0, "parent": 4}]}
-        self.assertEqual(ix.backtrace_chain(graph, 3),
+        self.assertEqual(iv.backtrace_chain(graph, 3),
                          ["x.cmake:2 (add_executable)", "x.cmake", "CMakeLists.txt:3 (include)", "CMakeLists.txt"])
-        self.assertEqual(ix.backtrace_chain(graph, 9), ["<bad node 9>"])
-        self.assertEqual(ix.backtrace_chain(graph, 4)[-1], "<bad node 4>")
-        self.assertEqual(ix.backtrace_chain(graph, True), ["<bad node True>"])
+        self.assertEqual(iv.backtrace_chain(graph, 9), ["<bad node 9>"])
+        self.assertEqual(iv.backtrace_chain(graph, 4)[-1], "<bad node 4>")
+        self.assertEqual(iv.backtrace_chain(graph, True), ["<bad node True>"])
 
     def test_canonical_codemodel_sorts_dependencies_and_resolves_backtraces(self) -> None:
-        # The same target as CMake writes it and with a different node order.
         oracle = {"name": "app", "backtrace": 1, "dependencies": [
             {"backtrace": 2, "id": "core::@1"}, {"backtrace": 3, "id": "stamp::@2"}],
             "sources": [{"backtrace": 1, "backtraces": [1], "path": "main.cpp"}],
@@ -534,14 +564,13 @@ class ExtraHelperTest(TempDirTest):
                                "nodes": [{"file": 0}, {"command": 0, "file": 0, "line": 15, "parent": 0},
                                          {"command": 1, "file": 0, "line": 14, "parent": 0},
                                          {"command": 2, "file": 0, "line": 12, "parent": 0}]}}
-        left, right = ix.canonical_codemodel({"t": [oracle]}), ix.canonical_codemodel({"t": [rcmake]})
-        self.assertEqual(left, right)
+        left, right = iv.canonical_codemodel({"t": [oracle]}), iv.canonical_codemodel({"t": [rcmake]})
+        self.assertEqual(left, right, "equivalent targets with different backtrace node orders must match")
         target = left["t"][0]
         self.assertEqual([d["id"] for d in target["dependencies"]], ["core::@1", "stamp::@2"])
         self.assertEqual(target["dependencies"][0]["backtrace"],
                          ["CMakeLists.txt:14 (target_link_libraries)", "CMakeLists.txt"])
         self.assertEqual(target["sources"][0]["backtraces"], [["CMakeLists.txt:12 (add_executable)", "CMakeLists.txt"]])
-        # A wrong frame, a wrong dependency backtrace, or an extra node is still a difference.
         wrong_line = json.loads(json.dumps(rcmake))
         wrong_line["backtraceGraph"]["nodes"][3]["line"] = 13
         wrong_dep = json.loads(json.dumps(rcmake))
@@ -550,16 +579,20 @@ class ExtraHelperTest(TempDirTest):
         extra_node["backtraceGraph"]["nodes"].append({"command": 0, "file": 0, "line": 99, "parent": 0})
         missing_dep = json.loads(json.dumps(rcmake))
         missing_dep["dependencies"].pop()
-        for bad in (wrong_line, wrong_dep, extra_node, missing_dep):
-            self.assertNotEqual(ix.canonical_codemodel({"t": [bad]}), left)
-        # Each object uses its own graph. Other orders and values do not change.
+        for label, bad in (("wrong line", wrong_line), ("wrong dep backtrace", wrong_dep),
+                           ("extra node", extra_node), ("missing dep", missing_dep)):
+            self.assertNotEqual(
+                iv.canonical_codemodel({"t": [bad]}),
+                left,
+                f"{label} must remain a codemodel difference",
+            )
         nested = {"backtraceGraph": {"commands": [], "files": ["a"], "nodes": [{"file": 0}]},
                   "inner": [{"backtrace": 0}], "linkLibraries": [{"id": "z"}, {"id": "a"}], "other": {"backtrace": 5}}
-        out = ix.canonical_codemodel(nested)
-        self.assertEqual(out["inner"], [{"backtrace": ["a"]}])
-        self.assertEqual(out["linkLibraries"], [{"id": "z"}, {"id": "a"}])
-        self.assertEqual(out["other"], {"backtrace": ["<bad node 5>"]})
-        self.assertEqual(ix.canonical_codemodel({"backtrace": 2}), {"backtrace": 2})
+        out = iv.canonical_codemodel(nested)
+        self.assertEqual(out["inner"], [{"backtrace": ["a"]}], "each object resolves against its own graph")
+        self.assertEqual(out["linkLibraries"], [{"id": "z"}, {"id": "a"}], "non-dependency lists keep their order")
+        self.assertEqual(out["other"], {"backtrace": ["<bad node 5>"]}, "invalid backtrace indices stay explicit")
+        self.assertEqual(iv.canonical_codemodel({"backtrace": 2}), {"backtrace": 2})
 
     def test_build_ninja_rules(self) -> None:
         (self.tmp / "build.ninja").write_text(textwrap.dedent("""\
@@ -573,18 +606,18 @@ class ExtraHelperTest(TempDirTest):
               depfile = old.d
             build other: phony dep$ sub/new.txt
             """ % ("a" * 64, "b" * 64)))
-        self.assertEqual(ix.build_ninja_rules(self.tmp, "new.txt"), [
+        self.assertEqual(iv.build_ninja_rules(self.tmp, "new.txt"), [
             "COMMAND = cd x && cmake -E cmake_transform_depfile Ninja gccdepfile CMakeFiles/d/<HASH>.d",
             "depfile = CMakeFiles/d/<HASH>.d", "deps = gcc"])
-        self.assertEqual(ix.build_ninja_rules(self.tmp, "old.txt"), ["COMMAND = cd y", "depfile = old.d"])
-        self.assertEqual(ix.build_ninja_rules(self.tmp / "none", "old.txt"), [])
+        self.assertEqual(iv.build_ninja_rules(self.tmp, "old.txt"), ["COMMAND = cd y", "depfile = old.d"])
+        self.assertEqual(iv.build_ninja_rules(self.tmp / "none", "old.txt"), [])
 
     def test_shared_names(self) -> None:
-        with mock.patch.object(ix, "DARWIN", True):
-            self.assertEqual(ix.shared_names("v", "1.0", "1"), ("libv.1.0.dylib", "@rpath/libv.1.dylib"))
-        with mock.patch.object(ix, "DARWIN", False):
-            self.assertEqual(ix.shared_names("v", "1.0", "1"), ("libv.so.1.0", "libv.so.1"))
-            self.assertIn("lib/libpkg_shared.so.2", ix.pkg_library_files())
+        with mock.patch.object(verify_context, "DARWIN", True):
+            self.assertEqual(iv.shared_names("v", "1.0", "1"), ("libv.1.0.dylib", "@rpath/libv.1.dylib"))
+        with mock.patch.object(verify_context, "DARWIN", False):
+            self.assertEqual(iv.shared_names("v", "1.0", "1"), ("libv.so.1.0", "libv.so.1"))
+            self.assertIn("lib/libpkg_shared.so.2", iv.pkg_library_files())
 
     def test_binary_inspection_parsers(self) -> None:
         readelf = textwrap.dedent("""\
@@ -599,40 +632,39 @@ class ExtraHelperTest(TempDirTest):
                    "         name /usr/lib/libSystem.B.dylib (offset 24)\n")
         otool_big_l = ("app:\n\t@rpath/libpkg_shared.2.dylib (compatibility version 2.0.0, current version 2.3.4)\n"
                        "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n")
-        outputs = {"readelf": readelf, "otool -l": otool_l, "otool -L": otool_big_l}
+        outputs = {"readelf -d": readelf, "otool -l": otool_l, "otool -L": otool_big_l}
         def fake(binary, *args):
             return outputs.get(" ".join(args), "")
-        outputs["readelf -d"] = outputs.pop("readelf")
-        with mock.patch.object(ix, "tool_output", side_effect=fake):
-            self.assertEqual(ix.elf_dynamic(Path("x")), {
+        with mock.patch.object(verify_context, "tool_output", side_effect=fake):
+            self.assertEqual(iv.elf_dynamic(Path("x")), {
                 "NEEDED": ["libpkg_shared.so.2", "libc.so.6"], "SONAME": ["libpkg_shared.so.2"],
                 "RUNPATH": ["$ORIGIN/../lib"]})
-            self.assertEqual(ix.macho_load_dylibs(Path("x")), ["@rpath/libpkg_shared.2.dylib"])
-            self.assertEqual(ix.macho_versions(Path("x"), "@rpath/libpkg_shared.2.dylib"),
+            self.assertEqual(iv.macho_load_dylibs(Path("x")), ["@rpath/libpkg_shared.2.dylib"])
+            self.assertEqual(iv.macho_versions(Path("x"), "@rpath/libpkg_shared.2.dylib"),
                              "compatibility version 2.0.0, current version 2.3.4")
-            self.assertEqual(ix.macho_versions(Path("x"), "@rpath/absent.dylib"), "")
-        self.assertEqual(ix.tool_output(self.tmp, "/nonexistent/tool"), "")
+            self.assertEqual(iv.macho_versions(Path("x"), "@rpath/absent.dylib"), "")
+        self.assertEqual(iv.tool_output(self.tmp, "/nonexistent/tool"), "")
 
     def test_exported_symbols(self) -> None:
-        with mock.patch.object(ix, "DARWIN", True), \
-                mock.patch.object(ix, "tool_output", return_value="0000 T _pkg_a\n0000 T _pkg_b\nbad\n"):
-            self.assertEqual(ix.exported_symbols(Path("x")), ["pkg_a", "pkg_b"])
-        with mock.patch.object(ix, "DARWIN", False), \
-                mock.patch.object(ix, "tool_output", return_value="0000 T pkg_b\n0000 T pkg_a\n"):
-            self.assertEqual(ix.exported_symbols(Path("x")), ["pkg_a", "pkg_b"])
+        with mock.patch.object(verify_context, "DARWIN", True), \
+                mock.patch.object(verify_context, "tool_output", return_value="0000 T _pkg_a\n0000 T _pkg_b\nbad\n"):
+            self.assertEqual(iv.exported_symbols(Path("x")), ["pkg_a", "pkg_b"])
+        with mock.patch.object(verify_context, "DARWIN", False), \
+                mock.patch.object(verify_context, "tool_output", return_value="0000 T pkg_b\n0000 T pkg_a\n"):
+            self.assertEqual(iv.exported_symbols(Path("x")), ["pkg_a", "pkg_b"])
 
     def test_write_tar_gz_is_reproducible(self) -> None:
         one, two = self.tmp / "1.tar.gz", self.tmp / "2/2.tar.gz"
-        ix.write_tar_gz(one, "top", {"b.txt": "b\n", "a/x.txt": "\n    x\n"})
-        ix.write_tar_gz(two, "top", {"a/x.txt": "\n    x\n", "b.txt": "b\n"})
+        iv.write_tar_gz(one, "top", {"b.txt": "b\n", "a/x.txt": "\n    x\n"})
+        iv.write_tar_gz(two, "top", {"a/x.txt": "\n    x\n", "b.txt": "b\n"})
         self.assertEqual(one.read_bytes(), two.read_bytes())
         with tarfile.open(one) as tar:
             self.assertEqual(tar.getnames(), ["top/a/x.txt", "top/b.txt"])
             self.assertEqual(tar.extractfile("top/a/x.txt").read(), b"x\n")
-            self.assertTrue(all(m.mtime == ix.FIXED_EPOCH for m in tar.getmembers()))
+            self.assertTrue(all(m.mtime == iv.FIXED_EPOCH for m in tar.getmembers()))
 
     def test_file_api_queries(self) -> None:
-        ix.write_file_api_queries(self.tmp)
+        iv.write_file_api_queries(self.tmp)
         query = self.tmp / ".cmake/api/v1/query"
         self.assertEqual(sorted(p.name for p in query.iterdir()), [
             "cache-v2", "client-indep", "client-other", "cmakeFiles-v1", "codemodel-v2", "configureLog-v1",
@@ -641,7 +673,7 @@ class ExtraHelperTest(TempDirTest):
         self.assertEqual(len(data["requests"]), 7)
 
     def test_result(self) -> None:
-        self.assertEqual(ix.result(iv.Proc([], "", 2, "o", "e", 0.0)), [2, "o", "e"])
+        self.assertEqual(iv.result(iv.Proc([], "", 2, "o", "e", 0.0)), [2, "o", "e"])
 
 
 @unittest.skipUnless(

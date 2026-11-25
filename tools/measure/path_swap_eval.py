@@ -17,7 +17,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -27,6 +26,10 @@ import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 
+try:
+    from ._proc import run_process as _run_process
+except ImportError:
+    from _proc import run_process as _run_process
 from corpus_eval import (
     JOBS, PACKAGE_EXTENSIONS, install_manifest, install_tree, normalize_roots, package_tree, row_key,
 )
@@ -117,43 +120,19 @@ def lane_environment(root: Path, paths: list[Path]) -> dict[str, str]:
 
 def run_command(command: list[str], cwd: Path, timeout: int, env: dict[str, str]) -> dict:
     """Capture output and stop the process tree when a command times out."""
-    error = None
-    returncode = None
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        try:
-            with subprocess.Popen(
-                command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                start_new_session=os.name != "nt",
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-            ) as process:
-                try:
-                    returncode = process.wait(timeout)
-                except (subprocess.TimeoutExpired, KeyboardInterrupt) as interrupted:
-                    if os.name == "nt":
-                        taskkill = Path(env["SYSTEMROOT"]) / "System32/taskkill.exe"
-                        try:
-                            subprocess.run([taskkill, "/F", "/T", "/PID", str(process.pid)],
-                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                           timeout=5, check=False)
-                        except (OSError, subprocess.TimeoutExpired):
-                            pass
-                        process.kill()
-                    else:
-                        try:
-                            os.killpg(process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    returncode = process.wait()
-                    if isinstance(interrupted, KeyboardInterrupt):
-                        raise
-                    error = f"Command timed out after {timeout} seconds."
-        except OSError as failure:
-            error = str(failure)
-        stdout.seek(0)
-        stderr.seek(0)
-        return {"returncode": returncode, "error": error,
-                "stdout": stdout.read().decode("utf-8", errors="replace"),
-                "stderr": stderr.read().decode("utf-8", errors="replace")}
+    completed = _run_process(command, cwd, timeout, env, use_tempfiles=True)
+    if completed.start_error is not None:
+        error = completed.start_error
+    elif completed.timed_out:
+        error = f"Command timed out after {timeout} seconds."
+    else:
+        error = None
+    return {
+        "returncode": completed.returncode,
+        "error": error,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
 
 
 def succeeded(result: dict) -> bool:

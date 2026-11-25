@@ -58,10 +58,6 @@ CORPUS_PROJECTS = ("zlib", "fmt", "nlohmann/json")
 MIB = 1024 * 1024
 
 
-# ---------------------------------------------------------------------------
-# Path discovery
-# ---------------------------------------------------------------------------
-
 def checkout_roots() -> list[Path]:
     """Return this checkout and, for a Git worktree, the main checkout."""
     roots = [ROOT]
@@ -135,10 +131,6 @@ def find_generator(requested: str) -> str:
         return requested
     return "Ninja" if shutil.which("ninja") else "Unix Makefiles"
 
-
-# ---------------------------------------------------------------------------
-# Measurement
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Sample:
@@ -228,10 +220,6 @@ def percentile(values: list[float], fraction: float) -> float:
     rank = max(1, math.ceil(fraction * len(ordered)))
     return ordered[rank - 1]
 
-
-# ---------------------------------------------------------------------------
-# Benchmark definitions
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Context:
@@ -592,10 +580,6 @@ def corpus_benches(shared: Path) -> list[Bench]:
                              command, prepare=prepare))
     return benches
 
-
-# ---------------------------------------------------------------------------
-# Runner and report
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Result:

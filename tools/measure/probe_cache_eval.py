@@ -29,6 +29,10 @@ import sys
 import tempfile
 import time
 
+try:
+    from ._proc import kill_group
+except ImportError:
+    from _proc import kill_group
 from mutation_eval import diff_bytes, normalize
 from oracle_prop_test import clean_environment, executable, run_command, write_json
 
@@ -264,39 +268,51 @@ def configure(args, case: Fixture, name: str, env: dict, *, oracle: bool = False
     return output(result, case, build, args, env), len(case.invocations()) - before
 
 
+PROBE_HEADERS = {
+    "header-root": ("include/rcmake_probe_root.h", "#define RCMAKE_PROBE_HEADER 1\n"),
+    "header-subdir": ("include/existing/rcmake_probe_subdir.h", "#define RCMAKE_PROBE_HEADER 1\n"),
+    "transitive": ("include/existing/rcmake_probe_inner.h", "#define RCMAKE_PROBE_HEADER 1\n"),
+    "cpath-add": ("empty/rcmake_probe_cpath_add.h", "#define RCMAKE_PROBE_HEADER 1\n"),
+    "has-include": ("include/rcmake_probe_optional.h", "#define RCMAKE_PROBE_HEADER 1\n"),
+    "header-shadow": ("include/limits.h", "#define RCMAKE_PROBE_SHADOW 1\n"),
+}
+
+
+def _build_probe_library(case: Fixture, env: dict, args) -> None:
+    source = case.root / "archive.c"
+    source.write_text("int probe_archive(void) { return 1; }\n", encoding="utf-8")
+    obj = case.root / "archive.o"
+    archive = case.root / "library/librcmake_probe_archive.a"
+    for cmd in ([case.compiler, "-c", source, "-o", obj], ["ar", "rcs", archive, obj]):
+        result = run_command(cmd, case.root, args.timeout, env)
+        if result["error"] or result["returncode"]:
+            raise ValueError(f"Could not create the test library. {result}")
+
+
 def change_input(name: str, case: Fixture, env: dict, args) -> None:
     """Change only the input selected for this invalidation check."""
-    headers = {
-        "header-root": "include/rcmake_probe_root.h",
-        "header-subdir": "include/existing/rcmake_probe_subdir.h",
-        "transitive": "include/existing/rcmake_probe_inner.h",
-        "cpath-add": "empty/rcmake_probe_cpath_add.h",
-        "has-include": "include/rcmake_probe_optional.h",
-    }
-    if name in headers:
-        (case.root / headers[name]).write_text("#define RCMAKE_PROBE_HEADER 1\n", encoding="utf-8")
-    elif name == "header-shadow":
-        (case.root / "include/limits.h").write_text("#define RCMAKE_PROBE_SHADOW 1\n", encoding="utf-8")
-    elif name == "cpath":
+    if name in PROBE_HEADERS:
+        rel, content = PROBE_HEADERS[name]
+        (case.root / rel).write_text(content, encoding="utf-8")
+        return
+    if name == "cpath":
         env["CPATH"] = str(case.root / "alternate")
-    elif name == "lang":
+        return
+    if name == "lang":
         env["LANG"] = "POSIX"
-    elif name == "compiler":
+        return
+    if name == "compiler":
         case.wrapper(swapped=True)
-    elif name == "toolchain":
+        return
+    if name == "toolchain":
         with (case.root / "toolchain.cmake").open("a", encoding="utf-8") as stream:
             stream.write('set(PROBE_TOOLCHAIN_DEFINITION "-DRCMAKE_PROBE_TOOLCHAIN=1")\n')
-    elif name == "developer-dir":
+        return
+    if name == "developer-dir":
         env["DEVELOPER_DIR"] = args.developer_dirs[1]
-    elif name == "library":
-        source = case.root / "archive.c"
-        source.write_text("int probe_archive(void) { return 1; }\n", encoding="utf-8")
-        obj = case.root / "archive.o"
-        archive = case.root / "library/librcmake_probe_archive.a"
-        for cmd in ([case.compiler, "-c", source, "-o", obj], ["ar", "rcs", archive, obj]):
-            result = run_command(cmd, case.root, args.timeout, env)
-            if result["error"] or result["returncode"]:
-                raise ValueError(f"Could not create the test library. {result}")
+        return
+    if name == "library":
+        _build_probe_library(case, env, args)
 
 
 def invalidation(args, root: Path, name: str, row: dict) -> None:
@@ -541,14 +557,6 @@ def require_artifacts(entries: dict[Path, PublishedProbe], copies: set, *, exact
                          f"Entry count {len(entries)}. Copied executable count {len(copies)}.")
 
 
-def kill_group(process: subprocess.Popen) -> None:
-    """Stop the configure and all children in its process group."""
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-
-
 def parallel(args, case: Fixture, env: dict) -> list[dict]:
     """Start all workers before waiting and check each result."""
     workers = []
@@ -690,7 +698,7 @@ def crash_recovery(args, root: Path, row: dict) -> None:
 
 
 def corrupt_entry(args, root: Path, row: dict) -> None:
-    """Recompile just the probe whose published entry was corrupted."""
+    """Recompile only the probe whose published entry was corrupted."""
     case = fixture(root, args.compiler, probes=2)
     store = root / "store"
     env = environment(case, store)

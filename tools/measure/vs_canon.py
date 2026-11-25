@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 import json
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -149,60 +150,63 @@ def filters_xml(root: ET.Element) -> set:
     return set(items)
 
 
-def sln_text(path: Path) -> tuple[list[str], dict]:
-    lines = [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
-    require(lines[:2] == ["Microsoft Visual Studio Solution File, Format Version 12.00",
-                          "# Visual Studio Version 17"], "Invalid Visual Studio 17 solution header")
-    require(lines.count("Global") == 1 and lines[-1] == "EndGlobal", "Invalid Global block")
-    entries = {}
-    dependencies = {}
-    sections = {}
-    current_project = None
-    section = None
-    in_dependencies = False
-    normalized = []
-    for line in lines:
-        if match := SLN_PROJECT.fullmatch(line):
-            kind, name, project_path, value = match.groups()
-            identifier = guid(value)
-            require(current_project is None, "Missing EndProject")
-            current_project = identifier
-            relative = path_text(project_path.replace('""', '"'))
-            insert(entries, identifier, None if guid(kind) == FOLDER_TYPE else local_path(path, relative), "solution GUID")
-            if entries[identifier] is not None:
-                line = f'Project("{kind}") = "{name}", "{relative.replace(chr(34), chr(34) * 2)}", "{value}"'
-        elif line == "EndProject":
-            require(current_project is not None and not in_dependencies, "Unexpected EndProject")
-            current_project = None
-        elif line == "ProjectSection(ProjectDependencies) = postProject":
-            require(current_project is not None and not in_dependencies, "Unexpected dependency section")
-            insert(dependencies, current_project, set(), "dependency section")
-            in_dependencies = True
-        elif line == "EndProjectSection":
-            require(in_dependencies, "Unexpected EndProjectSection")
-            in_dependencies = False
-        elif match := SECTION.fullmatch(line):
-            require(section is None, "Missing EndGlobalSection")
-            section = match[1]
-            insert(sections, section, {}, "global section")
-        elif line == "EndGlobalSection":
-            require(section is not None, "Unexpected EndGlobalSection")
-            section = None
-        elif in_dependencies or section:
-            key, separator, value = line.partition(" = ")
-            require(bool(separator), f"Invalid section entry: {line}")
-            if in_dependencies:
-                require(guid(key) == guid(value), f"Invalid dependency: {line}")
-                dependencies[current_project].add(guid(key))
-            else:
-                insert(sections[section], key, value, "section entry")
-        normalized.append(line)
-    require(current_project is None and section is None, "Unclosed solution section")
-    projects = {key: value for key, value in entries.items() if value is not None}
-    require(len(set(projects.values())) == len(projects), "Duplicate solution project path")
-    for project, deps in dependencies.items():
-        require(project in projects and deps <= projects.keys() and project not in deps,
-                f"Invalid solution dependencies for {project}")
+@dataclass
+class _SlnState:
+    entries: dict[str, Path | None] = field(default_factory=dict)
+    dependencies: dict[str, set[str]] = field(default_factory=dict)
+    sections: dict[str, dict[str, str]] = field(default_factory=dict)
+    current_project: str | None = None
+    section: str | None = None
+    in_dependencies: bool = False
+
+
+def _apply_sln_line(path: Path, line: str, state: _SlnState) -> str:
+    if match := SLN_PROJECT.fullmatch(line):
+        kind, name, project_path, value = match.groups()
+        identifier = guid(value)
+        require(state.current_project is None, "Missing EndProject")
+        state.current_project = identifier
+        relative = path_text(project_path.replace('""', '"'))
+        target = None if guid(kind) == FOLDER_TYPE else local_path(path, relative)
+        insert(state.entries, identifier, target, "solution GUID")
+        if target is None:
+            return line
+        escaped = relative.replace('"', '""')
+        return f'Project("{kind}") = "{name}", "{escaped}", "{value}"'
+    if line == "EndProject":
+        require(state.current_project is not None and not state.in_dependencies, "Unexpected EndProject")
+        state.current_project = None
+        return line
+    if line == "ProjectSection(ProjectDependencies) = postProject":
+        require(state.current_project is not None and not state.in_dependencies, "Unexpected dependency section")
+        insert(state.dependencies, state.current_project, set(), "dependency section")
+        state.in_dependencies = True
+        return line
+    if line == "EndProjectSection":
+        require(state.in_dependencies, "Unexpected EndProjectSection")
+        state.in_dependencies = False
+        return line
+    if match := SECTION.fullmatch(line):
+        require(state.section is None, "Missing EndGlobalSection")
+        state.section = match[1]
+        insert(state.sections, state.section, {}, "global section")
+        return line
+    if line == "EndGlobalSection":
+        require(state.section is not None, "Unexpected EndGlobalSection")
+        state.section = None
+        return line
+    if state.in_dependencies or state.section:
+        key, separator, value = line.partition(" = ")
+        require(bool(separator), f"Invalid section entry: {line}")
+        if state.in_dependencies:
+            require(guid(key) == guid(value), f"Invalid dependency: {line}")
+            state.dependencies[state.current_project].add(guid(key))
+            return line
+        insert(state.sections[state.section], key, value, "section entry")
+    return line
+
+
+def _validate_sln_folders(entries: dict[str, Path | None], sections: dict[str, dict[str, str]]) -> None:
     nested = {guid(child): guid(parent) for child, parent in sections.get("NestedProjects", {}).items()}
     for child, parent in nested.items():
         require(child in entries and parent in entries and entries[parent] is None, "Invalid nested project")
@@ -215,19 +219,20 @@ def sln_text(path: Path) -> tuple[list[str], dict]:
     if solution_guid:
         require(guid(solution_guid) not in entries, "Solution GUID duplicates a project GUID")
 
+
+def _validate_sln_configs(projects: dict[str, Path], sections: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
     configs = sections.get("SolutionConfigurationPlatforms", {})
     require(bool(configs), "Missing solution configuration matrix")
     for name, mapped in configs.items():
         require(pair(name) == pair(mapped), f"Invalid solution configuration: {name}")
     matrix = sections.get("ProjectConfigurationPlatforms", {})
-    mappings = {key: {} for key in projects}
+    mappings: dict[str, dict[str, str]] = {key: {} for key in projects}
     for name, mapped in matrix.items():
         identifier, _, key = name.partition(".")
         identifier = guid(identifier)
         require(identifier in projects, f"Unknown project in configuration matrix: {identifier}")
         pair(mapped)
-        suffix = next((suffix for suffix in (".ActiveCfg", ".Build.0", ".Deploy.0")
-                       if key.endswith(suffix)), None)
+        suffix = next((s for s in (".ActiveCfg", ".Build.0", ".Deploy.0") if key.endswith(s)), None)
         require(suffix is not None, f"Invalid project configuration entry: {name}")
         config = key.removesuffix(suffix)
         require(config in configs, f"Unknown solution configuration: {config}")
@@ -235,6 +240,24 @@ def sln_text(path: Path) -> tuple[list[str], dict]:
             insert(mappings[identifier], config, mapped, "active configuration")
     require(all(mapped.keys() == configs.keys() for mapped in mappings.values()),
             "Incomplete project configuration matrix")
+    return mappings
+
+
+def sln_text(path: Path) -> tuple[list[str], dict]:
+    lines = [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    require(lines[:2] == ["Microsoft Visual Studio Solution File, Format Version 12.00",
+                          "# Visual Studio Version 17"], "Invalid Visual Studio 17 solution header")
+    require(lines.count("Global") == 1 and lines[-1] == "EndGlobal", "Invalid Global block")
+    state = _SlnState()
+    normalized = [_apply_sln_line(path, line, state) for line in lines]
+    require(state.current_project is None and state.section is None, "Unclosed solution section")
+    projects = {key: value for key, value in state.entries.items() if value is not None}
+    require(len(set(projects.values())) == len(projects), "Duplicate solution project path")
+    for project, deps in state.dependencies.items():
+        require(project in projects and deps <= projects.keys() and project not in deps,
+                f"Invalid solution dependencies for {project}")
+    _validate_sln_folders(state.entries, state.sections)
+    mappings = _validate_sln_configs(projects, state.sections)
     return normalized, {
         file: (identifier, set(mappings[identifier].values()))
         for identifier, file in projects.items()

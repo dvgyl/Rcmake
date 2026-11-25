@@ -11,9 +11,13 @@ from pathlib import Path
 import re
 import sys
 
+try:
+    from ._rst import expand_includes
+except ImportError:
+    from _rst import expand_includes
+
 
 ROOT = Path(__file__).resolve().parents[2]
-INCLUDE = re.compile(r"^\.\. include:: (\S+)\s*$", re.MULTILINE)
 REPLACE = re.compile(r"^\.\. \|([^|]+)\| replace:: ([^\n]+)$", re.MULTILINE)
 VARIABLE = r"(?::variable:`|``)(CMAKE_[A-Za-z0-9_<>]+)(?: <[^`]+>)?`{1,2}"
 INITIALIZERS = [
@@ -54,21 +58,6 @@ def property_docs(override: Path | None) -> Path:
     raise ValueError(
         "CMake 4.5.1 Help files are unavailable. Set RCMAKE_ORACLE_RUNCMAKE_DIR or use --help-dir."
     )
-
-
-def expand_includes(path: Path, help_root: Path, stack: tuple[Path, ...] = ()) -> str:
-    """Read the Help page and expand its shared sections."""
-    if path in stack or len(stack) >= 16:
-        raise ValueError(f"Cannot expand the include chain for {path}.")
-    if not path.is_relative_to(help_root):
-        raise ValueError(f"Include outside the Help tree: {path}")
-
-    def include(match: re.Match[str]) -> str:
-        target = match[1]
-        included = help_root / target.lstrip("/") if target.startswith("/") else path.parent / target
-        return expand_includes(included.resolve(), help_root, (*stack, path))
-
-    return INCLUDE.sub(include, path.read_text(encoding="utf-8"))
 
 
 def resolve_substitutions(document: str) -> str:

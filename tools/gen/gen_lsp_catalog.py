@@ -9,6 +9,11 @@ import re
 import subprocess
 from textwrap import dedent
 
+try:
+    from ._rst import expand_includes as _expand_includes
+except ImportError:
+    from _rst import expand_includes as _expand_includes
+
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLED = ROOT / "modules/cmake-4.5"
 OUTPUT = ROOT / "crates/rcmake-lsp/src/generated_catalog.rs"
@@ -21,7 +26,6 @@ CATEGORIES = {
 }
 HEADING = re.compile(r"\A([^\n]+)\n[=~^`-]{2,}\s*\n")
 ROLE = re.compile(r":([a-z_]+):`([^`]+)`")
-INCLUDE = re.compile(r"(?m)^\.\. include:: +(\S+)[ \t]*$")
 SUBSTITUTION = re.compile(r"(?m)^\.\. \|([^|\n]+)\| replace::[ \t]*(.*(?:\n[ \t]+[^\n]+)*)")
 RST_CODE = re.compile(
     r"(?m)^\.\. (?:code-block|code|parsed-literal|signature)::([^\n]*)\n"
@@ -87,17 +91,10 @@ def render_role(match):
 
 
 def expand_includes(text, path, help_dir, depth=0):
-    if depth >= 4:
-        return text
-
-    def include(match):
-        name = match[1]
-        included = (help_dir / name[1:]) if name.startswith("/") else path.parent / name
-        if included.is_file():
-            return "\n\n" + expand_includes(documentation(included), included, help_dir, depth + 1)
-        return ""
-
-    return INCLUDE.sub(include, text)
+    return _expand_includes(
+        path, help_dir, text=text, read_file=documentation,
+        max_depth=max(0, 4 - depth), strict=False, prefix="\n\n",
+    )
 
 
 def replace_substitutions(text):

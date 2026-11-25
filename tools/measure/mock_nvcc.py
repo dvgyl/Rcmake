@@ -7,6 +7,7 @@ The toolkit metadata matches Linux. Set MOCK_NVCC_CXX to select a host
 compiler and MOCK_NVCC_LOG to record build operations as JSON lines.
 """
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 import json
 import os
@@ -45,6 +46,8 @@ ARTIFACT_MODES = {
     "-ptx": "ptx", "--ptx": "ptx", "-cubin": "cubin", "--cubin": "cubin",
     "-fatbin": "fatbin", "--fatbin": "fatbin", "-optix-ir": "optixir", "--optix-ir": "optixir",
 }
+COMPILE_OPTIONS = {"-c", "-dc", "--device-c", "--compile", "-dw", "--device-w"}
+VALUE_TAKING_OPTIONS = ARCH_OPTIONS | VALUE_OPTIONS | IGNORED_VALUES | HOST_VALUE_OPTIONS | RELOCATABLE_OPTIONS
 RUNTIME_HEADER = """#pragma once
 #include <cstdlib>
 #define __global__
@@ -131,6 +134,58 @@ def expand_response_files(argv: list[str], depth: int = 0) -> list[str]:
     return result
 
 
+def _apply_value_option(
+    result: Invocation,
+    argument: str,
+    option: str,
+    equals: str,
+    value: str,
+) -> None:
+    if option in ARCH_OPTIONS:
+        result.architectures.append(architecture(option, value))
+        return
+    if option in RELOCATABLE_OPTIONS:
+        if value not in {"true", "false"}:
+            raise ValueError(f"Use true or false for {option}.")
+        result.relocatable = value == "true"
+        return
+    if option in {"-ccbin", "--compiler-bindir"}:
+        result.compiler = value
+        return
+    if option in {"-Xcompiler", "--compiler-options"}:
+        flags = value.split(",")
+        result.host_flags.extend(flags)
+        result.host_args.extend(flags)
+        return
+    if option in {"-o", "--output-file"}:
+        result.output = Path(value)
+        result.host_args.extend(["-o", value])
+        return
+    if option in HOST_VALUE_OPTIONS:
+        result.host_args.extend([argument] if equals else [option, value])
+
+
+def _add_input(
+    result: Invocation,
+    argument: str,
+    cuda_language: bool,
+    host_cuda_language: bool,
+) -> bool:
+    result.inputs.append(Path(argument))
+    is_cuda = cuda_language or argument.endswith(".cu")
+    if is_cuda != host_cuda_language:
+        result.host_args.extend(["-x", "c++" if is_cuda else "none"])
+        host_cuda_language = is_cuda
+    if is_cuda:
+        result.sources.append(Path(argument))
+    result.host_args.append(argument)
+    return host_cuda_language
+
+
+def _option_value(equals: str, value: str, arguments: Iterator[str]) -> str:
+    return value if equals else next(arguments, "")
+
+
 def parse(argv: list[str]) -> Invocation:
     result = Invocation()
     arguments = iter(argv)
@@ -138,60 +193,45 @@ def parse(argv: list[str]) -> Invocation:
     host_cuda_language = False
     for argument in arguments:
         option, equals, value = argument.partition("=")
-        if option in ARCH_OPTIONS | VALUE_OPTIONS | IGNORED_VALUES | HOST_VALUE_OPTIONS | RELOCATABLE_OPTIONS:
+        if option in VALUE_TAKING_OPTIONS:
             if not equals and (value := next(arguments, None)) is None:
                 raise ValueError(f"Missing value for {option}.")
-            if option in ARCH_OPTIONS:
-                result.architectures.append(architecture(option, value))
-            elif option in RELOCATABLE_OPTIONS:
-                if value not in {"true", "false"}:
-                    raise ValueError(f"Use true or false for {option}.")
-                result.relocatable = value == "true"
-            elif option in {"-ccbin", "--compiler-bindir"}:
-                result.compiler = value
-            elif option in {"-Xcompiler", "--compiler-options"}:
-                flags = value.split(",")
-                result.host_flags.extend(flags)
-                result.host_args.extend(flags)
-            elif option in {"-o", "--output-file"}:
-                result.output = Path(value)
-                result.host_args.extend(["-o", value])
-            elif option in HOST_VALUE_OPTIONS:
-                result.host_args.extend([argument] if equals else [option, value])
-        elif option in IGNORED_FLAGS:
+            _apply_value_option(result, argument, option, equals, value)
             continue
-        elif option in {"-v", "--verbose"}:
+        if option in IGNORED_FLAGS:
+            continue
+        if option in {"-v", "--verbose"}:
             result.verbose = True
-        elif option in {"-dlink", "--device-link"}:
+            continue
+        if option in {"-dlink", "--device-link"}:
             result.mode = "device-link"
-        elif option in ARTIFACT_MODES:
+            continue
+        if option in ARTIFACT_MODES:
             result.mode = ARTIFACT_MODES[option]
-        elif option in {"-c", "-dc", "--device-c", "--compile", "-dw", "--device-w"}:
+            continue
+        if option in COMPILE_OPTIONS:
             result.host_args.append("-c")
             result.compile_only = True
             if option in {"-dc", "--device-c"}:
                 result.relocatable = True
-        elif option in {"-x", "--x"}:
-            language = value if equals else next(arguments, "")
+            continue
+        if option in {"-x", "--x"}:
+            language = _option_value(equals, value, arguments)
             cuda_language = language in {"cu", "cuda"}
             if not cuda_language:
                 result.host_args.extend(["-x", language])
                 host_cuda_language = False
-        elif option == "--std":
-            result.host_args.append("-std=" + (value if equals else next(arguments, "")))
-        elif option == "--dependency-output":
-            result.host_args.extend(["-MF", value if equals else next(arguments, "")])
-        elif argument.startswith("-"):
+            continue
+        if option == "--std":
+            result.host_args.append("-std=" + _option_value(equals, value, arguments))
+            continue
+        if option == "--dependency-output":
+            result.host_args.extend(["-MF", _option_value(equals, value, arguments)])
+            continue
+        if argument.startswith("-"):
             result.host_args.append(argument)
-        else:
-            result.inputs.append(Path(argument))
-            is_cuda = cuda_language or argument.endswith(".cu")
-            if is_cuda != host_cuda_language:
-                result.host_args.extend(["-x", "c++" if is_cuda else "none"])
-                host_cuda_language = is_cuda
-            if is_cuda:
-                result.sources.append(Path(argument))
-            result.host_args.append(argument)
+            continue
+        host_cuda_language = _add_input(result, argument, cuda_language, host_cuda_language)
     return result
 
 
