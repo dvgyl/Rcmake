@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use rcmake_base::BString;
-use rcmake_json::{ReadOptions, Value, parse};
+use rcmake_json::{ReadOptions, Value, parse, write_compact};
 
 use crate::{
     CpsComponent, CpsComponentType, CpsConfigSupplement, CpsError, CpsPackage, CpsRequirement,
@@ -401,15 +401,18 @@ fn language_lists(object: &Object, key: &str) -> Result<BTreeMap<BString, Vec<BS
     }
 }
 
+/// Read the definitions of one language. As `BuildDefinition` does, a value that
+/// converts to a string gives `NAME=value`, and any other value gives `NAME`.
 fn definitions(value: &Value) -> Result<BTreeMap<BString, Option<BString>>, CpsError> {
-    read_map(
-        as_object(value, "language definitions")?,
-        |value| match value {
-            Value::Null => Ok(None),
-            Value::String(value) => Ok(Some(value.clone())),
-            _ => Err(invalid("A definition value must be a string or null.")),
-        },
-    )
+    read_map(as_object(value, "language definitions")?, |value| {
+        Ok(match value {
+            Value::String(value) => Some(value.clone()),
+            Value::Bool(_) | Value::Int(_) | Value::UInt(_) | Value::Real(_) => {
+                Some(write_compact(value))
+            }
+            Value::Null | Value::Array(_) | Value::Object(_) => None,
+        })
+    })
 }
 
 fn file_sets(object: &Object) -> Result<Vec<CpsTargetFileSet>, CpsError> {

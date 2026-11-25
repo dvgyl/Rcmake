@@ -139,15 +139,29 @@ set_property(TARGET dep PROPERTY INTERFACE_COMPILE_DEFINITIONS REQUIRED_FLAG=1)
 add_library(root INTERFACE IMPORTED)
 set_property(TARGET root PROPERTY INTERFACE_LINK_LIBRARIES
   "$<$<CONFIG:Debug>:$<TARGET_NAME_IF_EXISTS:dep>>;$<$<CONFIG:Release>:missing::name>")
-try_compile(compiled SOURCE_FROM_CONTENT probe.c [=[
+set(probe_source [=[
 #ifndef REQUIRED_FLAG
 #error Missing compile definition
 #endif
 int main(void) { return 0; }
-]=] CMAKE_FLAGS -DCMAKE_BUILD_TYPE:STRING=Debug LINK_LIBRARIES root OUTPUT_VARIABLE log)
+]=])
+try_compile(flags_config SOURCE_FROM_CONTENT probe.c "${probe_source}"
+  CMAKE_FLAGS -DCMAKE_BUILD_TYPE:STRING=Debug LINK_LIBRARIES root)
+if(flags_config)
+  message(FATAL_ERROR "CMAKE_FLAGS must not select the import configuration")
+endif()
+try_compile(direct_genex SOURCE_FROM_CONTENT probe.c "${probe_source}"
+  LINK_LIBRARIES "$<TARGET_NAME_IF_EXISTS:dep>")
+if(direct_genex)
+  message(FATAL_ERROR "A direct LINK_LIBRARIES genex must not import a target")
+endif()
+set(CMAKE_TRY_COMPILE_CONFIGURATION Debug)
+try_compile(compiled SOURCE_FROM_CONTENT probe.c "${probe_source}"
+  LINK_LIBRARIES root OUTPUT_VARIABLE log)
 if(NOT compiled)
   message(FATAL_ERROR "Probe failed\n${log}")
 endif()
+unset(CMAKE_TRY_COMPILE_CONFIGURATION)
 set(CMAKE_CROSSCOMPILING TRUE)
 set(CROSS_RUN 17 CACHE STRING "Original help")
 set(CROSS_RUN__TRYRUN_OUTPUT "" CACHE STRING "Original output help")
@@ -175,7 +189,28 @@ endif()
     );
     let missing = fixture.cmake(&["-S", ".", "-B", "missing", "-G", "Ninja", "-DMISSING=ON"])?;
     assert_eq!(missing.results, [ProcessResult::Exited(1)]);
-    assert!(std::str::from_utf8(&missing.stderr)?.contains("MISSING_RUN__TRYRUN_OUTPUT"));
+    let stderr = std::str::from_utf8(&missing.stderr)?;
+    assert!(
+        stderr.contains("   MISSING_RUN (advanced)\n   MISSING_RUN__TRYRUN_OUTPUT (advanced)\n"),
+        "{stderr}"
+    );
+    let partial = fixture.cmake(&[
+        "-S",
+        ".",
+        "-B",
+        "partial",
+        "-G",
+        "Ninja",
+        "-DMISSING=ON",
+        "-DMISSING_RUN=0",
+    ])?;
+    assert_eq!(partial.results, [ProcessResult::Exited(1)]);
+    let stderr = std::str::from_utf8(&partial.stderr)?;
+    assert!(
+        stderr.contains("   MISSING_RUN (advanced)\n   MISSING_RUN__TRYRUN_OUTPUT (advanced)\n"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("_STDOUT"), "{stderr}");
     let results = fixture.host.read(
         &fixture.root.join("missing/TryRunResults.cmake"),
         ReadRange::All { limit: 8192 },

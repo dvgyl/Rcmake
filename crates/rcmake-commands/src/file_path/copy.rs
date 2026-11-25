@@ -279,13 +279,13 @@ pub(super) fn copy_entry(
             host.create_dir_all(target)
                 .map_err(|e| copy_error(command, "make directory", target, &e))?;
         }
+        // `cmFileCopier::InstallDirectory` reports a symlink to a directory as installed.
         observe(
             target,
             true,
-            linked_dir
-                || existing
-                    .as_ref()
-                    .is_some_and(|meta| meta.kind == FileKind::Dir),
+            existing
+                .as_ref()
+                .is_some_and(|meta| meta.kind == FileKind::Dir),
         );
         let mut children = host
             .read_dir(source)

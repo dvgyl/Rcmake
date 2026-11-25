@@ -109,12 +109,18 @@ pub(in crate::configure::try_compile) fn resolve(
             assignment(&mut block, &combined_name, &stdout, b"Output from try_run");
         }
         cx.write_try_run_result(&result_file, &block)?;
+        // `cmTryRunCommand::DoNotRunExecutable` always lists the result variable, and the
+        // combined output variable when it applies. It never lists the split output names.
         let mut message = BString::from(
             "try_run() invoked in cross-compiling mode, please set the following cache variables appropriately:\n",
         );
-        for name in missing {
+        let listed = [
+            Some(run_var),
+            (combined && !split).then_some(combined_name.as_slice()),
+        ];
+        for name in listed.into_iter().flatten() {
             message.extend_from_slice(b"   ");
-            message.extend_from_slice(&name);
+            message.extend_from_slice(name);
             message.extend_from_slice(b" (advanced)\n");
         }
         message.extend_from_slice(details.as_bytes());

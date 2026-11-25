@@ -63,12 +63,9 @@ pub(super) fn discover(
     if libraries.is_empty() {
         return Ok(Vec::new());
     }
-    let config = seed
-        .defines
-        .iter()
-        .rev()
-        .find(|define| define.name == b"CMAKE_BUILD_TYPE")
-        .map_or_else(ConfigId::default, |define| ConfigId(define.value.clone()));
+    // `cmCoreTryCompile` evaluates the imported target properties for the
+    // `CMAKE_TRY_COMPILE_CONFIGURATION` configuration, not for `CMAKE_FLAGS` values.
+    let config = ConfigId(cx.var_or_empty(b"CMAKE_TRY_COMPILE_CONFIGURATION"));
     let kind = if !run && cx.var_or_empty(b"CMAKE_TRY_COMPILE_TARGET_TYPE") == b"STATIC_LIBRARY" {
         TargetKind::StaticLibrary
     } else {
@@ -81,7 +78,7 @@ pub(super) fn discover(
         kind,
         TargetOrigin::Normal,
         dir,
-        backtrace.clone(),
+        backtrace,
         Default::default(),
     );
     if let Some(linker) = options.one(b"LINKER_LANGUAGE") {
@@ -109,8 +106,13 @@ pub(super) fn discover(
         link_languages: &link_languages,
         remaining: cx.limits().max_value_bytes,
     };
-    for name in libraries {
-        walker.evaluate(dir, head, b"LINK_LIBRARIES", name, &backtrace, true)?;
+    // `FindTargetToUse` matches each direct item by its literal name, so a
+    // generator expression in `LINK_LIBRARIES` never names an imported target.
+    for &name in libraries {
+        walker.charge(name.len())?;
+        if let Some(id) = model.find_target(dir, name) {
+            walker.push(id, name.into())?;
+        }
     }
     let mut targets = BTreeMap::<TargetId, (Target, Vec<BString>)>::new();
     while let Some((id, name)) = walker.pending.pop_front() {

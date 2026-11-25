@@ -118,7 +118,8 @@ if(NOT Foo_VERSION STREQUAL "2.4.3+suffix" OR NOT Foo_VERSION_MAJOR EQUAL 2
 endif()
 get_target_property(location Foo::bar IMPORTED_LOCATION_NOCONFIG)
 get_target_property(implib Foo::bar IMPORTED_IMPLIB_NOCONFIG)
-get_target_property(langs Foo::bar IMPORTED_LINK_INTERFACE_LANGUAGES_NOCONFIG)
+get_target_property(langs Foo::bar INTERFACE_LINK_LANGUAGES)
+get_target_property(old_langs Foo::bar IMPORTED_LINK_INTERFACE_LANGUAGES_NOCONFIG)
 get_target_property(configs Foo::bar IMPORTED_CONFIGURATIONS)
 get_target_property(includes Foo::bar INTERFACE_INCLUDE_DIRECTORIES)
 get_target_property(system_includes Foo::bar INTERFACE_SYSTEM_INCLUDE_DIRECTORIES)
@@ -130,9 +131,10 @@ get_target_property(internal_link Foo::extra INTERFACE_LINK_LIBRARIES)
 get_target_property(external_link Foo::bar INTERFACE_LINK_LIBRARIES)
 get_target_property(global Foo::bar IMPORTED_GLOBAL)
 if(NOT global OR NOT includes STREQUAL "/work/prefix/include"
-   OR NOT system_includes STREQUAL "/work/prefix/include"
+   OR system_includes OR old_langs
    OR NOT location STREQUAL "/work/prefix/lib/libbar.a"
-   OR NOT implib STREQUAL "/work/prefix/lib/bar.imp" OR NOT langs STREQUAL "CXX"
+   OR NOT implib STREQUAL "/work/prefix/lib/bar.imp"
+   OR NOT langs STREQUAL "$<$<CONFIG:noconfig>:CXX>"
    OR NOT configs STREQUAL "NOCONFIG" OR NOT defs STREQUAL "HAVE_FOO"
    OR NOT options STREQUAL "-Wall;$<$<COMPILE_LANGUAGE:CXX>:-Wextra>"
    OR NOT link_options STREQUAL "-flag" OR NOT default_link STREQUAL "Foo::bar"
@@ -393,5 +395,97 @@ fn imports_cps_features_and_link_requirements_in_order() -> TestResult {
         cx.var_or_empty(b"links"),
         "Threads::Threads;Threads::Threads;Foo::core;$<COMPILE_ONLY:Foo::headers>;$<LINK_ONLY:Foo::runtime>;m;z"
     );
+    Ok(())
+}
+
+#[test]
+fn imports_cps_definitions_and_languages_as_cmake_does() -> TestResult {
+    let host = Arc::new(PureHost::default());
+    host.seed_file(
+        Path::new("/work/prefix/lib/cps/Foo/Foo.cps"),
+        br#"{
+        "cps_version":"0.15.0", "name":"Foo", "cps_path":"@prefix@/lib/cps/Foo",
+        "configurations":["Release"],
+        "components":{"bar":{
+            "type":"interface",
+            "includes":{"c++":["@prefix@/inc_cxx"], "C":["@prefix@/inc_c"],
+                        "asm":["@prefix@/inc_asm"], "*":["@prefix@/inc"]},
+            "compile_flags":{"asm":["-x"], "OBJC++":["-objcxx"], "c#":["-cs"],
+                             "Swift":["-sw"], "ISPC":["-i"]},
+            "definitions":{
+                "*":{"FOO":"1", "NUM":3, "REAL":1.5, "BIG":1e3, "T":true, "N":null,
+                     "ARR":[1], "ONLY":"x"},
+                "c":{"FOO":"2"}, "C":{"FOO":"3"}, "cxx":{"FOO":"4", "NUM":7}, "asm":{"Q":1}},
+            "link_languages":["c++", "C", "asm", "*", "Fortran"],
+            "link_directories":["@prefix@/ld"],
+            "configurations":{"Release":{
+                "link_languages":["c"], "definitions":{"*":{"R":"1"}, "c":{"R":"2"}}}}
+        }}
+    }"#,
+    )?;
+    let source = Path::new("/work/src");
+    host.seed_file(
+        &source.join("CMakeLists.txt"),
+        br#"
+        cmake_minimum_required(VERSION 4.5)
+        find_package(Foo CONFIG REQUIRED NO_DEFAULT_PATH PATHS /work/prefix)
+        foreach(name INCLUDE_DIRECTORIES SYSTEM_INCLUDE_DIRECTORIES COMPILE_OPTIONS
+                COMPILE_DEFINITIONS LINK_LANGUAGES LINK_DIRECTORIES)
+          get_target_property(${name} Foo::bar INTERFACE_${name})
+        endforeach()
+        get_target_property(old_langs Foo::bar IMPORTED_LINK_INTERFACE_LANGUAGES)
+        get_target_property(old_release_langs Foo::bar IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE)
+    "#,
+    )?;
+    let mut interp = interpreter(host.clone(), Path::new("/work"));
+    let outcome = interp.run_configure(source, Path::new("/work/build"), &[]);
+    let stderr = host.stream_bytes(Stream::Stderr);
+    assert_eq!(outcome.exit_code, 0, "{stderr}");
+    let warnings: Vec<_> = ["compile_flags", "definitions", "includes"]
+        .iter()
+        .map(|key| {
+            let warning = format!("ignoring unknown language \"asm\" in {key} for Foo::bar");
+            stderr.find(warning.as_bytes())
+        })
+        .collect();
+    assert!(
+        warnings.iter().all(Option::is_some) && warnings.is_sorted(),
+        "{stderr}"
+    );
+    let cx = interp.cx();
+    assert_eq!(
+        cx.var_or_empty(b"INCLUDE_DIRECTORIES"),
+        "/work/prefix/inc;$<$<COMPILE_LANGUAGE:C>:/work/prefix/inc_c>;\
+         $<$<COMPILE_LANGUAGE:CXX>:/work/prefix/inc_cxx>"
+    );
+    assert_eq!(
+        cx.var_or_empty(b"COMPILE_OPTIONS"),
+        "$<$<COMPILE_LANGUAGE:ISPC>:-i>;$<$<COMPILE_LANGUAGE:OBJCXX>:-objcxx>;\
+         $<$<COMPILE_LANGUAGE:swift>:-sw>;$<$<COMPILE_LANGUAGE:CSharp>:-cs>"
+    );
+    assert_eq!(
+        cx.var_or_empty(b"COMPILE_DEFINITIONS"),
+        "ARR;BIG=1000.0;$<$<NOT:$<COMPILE_LANGUAGE:C,CXX>>:FOO=1>;\
+         $<$<COMPILE_LANGUAGE:C>:FOO=3>;$<$<COMPILE_LANGUAGE:CXX>:FOO=4>;N;\
+         $<$<NOT:$<COMPILE_LANGUAGE:CXX>>:NUM=3>;$<$<COMPILE_LANGUAGE:CXX>:NUM=7>;\
+         ONLY=x;REAL=1.5;T=true;$<$<CONFIG:Release>:$<$<NOT:$<COMPILE_LANGUAGE:C>>:R=1>>;\
+         $<$<CONFIG:Release>:$<$<COMPILE_LANGUAGE:C>:R=2>>"
+    );
+    assert_eq!(
+        cx.var_or_empty(b"LINK_LANGUAGES"),
+        "CXX;C;Fortran;$<$<CONFIG:Release>:C>"
+    );
+    for name in [
+        "SYSTEM_INCLUDE_DIRECTORIES",
+        "LINK_DIRECTORIES",
+        "old_langs",
+        "old_release_langs",
+    ] {
+        assert_eq!(
+            cx.var_or_empty(name.as_bytes()),
+            format!("{name}-NOTFOUND"),
+            "{name}"
+        );
+    }
     Ok(())
 }

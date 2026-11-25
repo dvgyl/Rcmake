@@ -1972,6 +1972,10 @@ fn install_directory_preserves_the_destination_symlink() -> TestResult {
         host.metadata(&root.join("original/marker"), Follow::No)
             .is_ok()
     );
+    let stdout = host.stream_bytes(Stream::Stdout).to_string();
+    let linked = format!("-- Installing: {work}/destination/source\n");
+    assert!(stdout.contains(&linked), "{stdout}");
+    assert!(!stdout.contains("Up-to-date"), "{stdout}");
     Ok(())
 }
 

@@ -1,13 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rcmake_base::{BString, ByteSlice as _, list};
 use rcmake_cps::{CpsComponentType, CpsPackage, CpsUsage};
+use rcmake_diag::MessageKind;
 use rcmake_eval::{CmdError, Cx};
 use rcmake_model::{
     BT, GeneratorKind, ImportedVisibility, LinkItem, Target, TargetKind, TargetOrigin, UsageField,
 };
 
-use super::text;
+use super::{PackageDiagnostic, text};
 
 const SOURCE: &[u8] = b"_RCMAKE_CPS_SOURCE";
 
@@ -32,6 +33,7 @@ pub(in crate::process_find) fn import(
     let policies = *cx.policies_mut();
     let configuration_maps = configuration_maps(cx);
     let mut targets = Vec::new();
+    let mut warnings = Vec::new();
     let new_target = |name, kind| {
         let mut target = Target::new(
             name,
@@ -65,7 +67,13 @@ pub(in crate::process_find) fn import(
         if component.ty == CpsComponentType::Symbolic {
             target.props.set("SYMBOLIC".into(), "TRUE".into());
         }
-        apply_usage(&mut target, &package.name, &component.usage, b"");
+        apply_usage(
+            &mut target,
+            &package.name,
+            &component.usage,
+            b"",
+            &mut warnings,
+        );
         let mut seen = BTreeSet::new();
         let configurations: Vec<_> = package
             .configurations
@@ -89,7 +97,7 @@ pub(in crate::process_find) fn import(
                 ),
             );
             for (name, usage) in configurations {
-                apply_usage(&mut target, &package.name, usage, name);
+                apply_usage(&mut target, &package.name, usage, name, &mut warnings);
             }
         }
         targets.push(target);
@@ -105,6 +113,13 @@ pub(in crate::process_find) fn import(
         targets.push(target);
     }
 
+    for body in warnings {
+        PackageDiagnostic {
+            body,
+            files: vec![source.clone()],
+        }
+        .emit_as(cx, MessageKind::Warning);
+    }
     let project = cx.project();
     let mut new_targets = Vec::new();
     for target in targets {
@@ -154,83 +169,19 @@ fn configuration_maps(cx: &mut Cx<'_>) -> Vec<(BString, BString)> {
         .collect()
 }
 
-fn apply_usage(target: &mut Target, package: &[u8], usage: &CpsUsage, config: &[u8]) {
+/// Apply one usage block in the order of `cmPackageInfoReader::SetTargetProperties`.
+fn apply_usage(
+    target: &mut Target,
+    package: &[u8],
+    usage: &CpsUsage,
+    config: &[u8],
+    warnings: &mut Vec<BString>,
+) {
     let suffix = if config.is_empty() {
         BString::default()
     } else {
         text(&[b"_", &config.to_ascii_uppercase()])
     };
-    for (prop, value) in [
-        (b"IMPORTED_LOCATION".as_slice(), &usage.location),
-        (b"IMPORTED_IMPLIB", &usage.link_location),
-        (b"IMPORTED_SONAME", &usage.link_name),
-    ] {
-        if let Some(value) = value {
-            target.props.set(text(&[prop, &suffix]), value.clone());
-        }
-    }
-    if !usage.link_languages.is_empty() {
-        target.props.set(
-            text(&[b"IMPORTED_LINK_INTERFACE_LANGUAGES", &suffix]),
-            list::join(
-                usage
-                    .link_languages
-                    .iter()
-                    .filter_map(|name| language(name)),
-            ),
-        );
-    }
-    if !usage.dyld_requires.is_empty() {
-        target.props.set(
-            text(&[b"IMPORTED_LINK_DEPENDENT_LIBRARIES", &suffix]),
-            list::join(
-                usage
-                    .dyld_requires
-                    .iter()
-                    .map(|name| reference(package, name)),
-            ),
-        );
-    }
-
-    for (field, entries) in [
-        (UsageField::InterfaceLinkOptions, &usage.link_flags),
-        (
-            UsageField::InterfaceLinkDirectories,
-            &usage.link_directories,
-        ),
-    ] {
-        for entry in entries {
-            add_usage(target, field, entry.clone(), config, b"*");
-        }
-    }
-    for (field, by_language) in [
-        (UsageField::InterfaceIncludeDirectories, &usage.includes),
-        (
-            UsageField::InterfaceSystemIncludeDirectories,
-            &usage.includes,
-        ),
-        (UsageField::InterfaceCompileOptions, &usage.compile_flags),
-    ] {
-        for (lang, entries) in by_language {
-            for entry in entries {
-                add_usage(target, field, entry.clone(), config, lang);
-            }
-        }
-    }
-    for (lang, definitions) in &usage.definitions {
-        for (key, value) in definitions {
-            let definition = value
-                .as_ref()
-                .map_or_else(|| key.clone(), |value| text(&[key, b"=", value]));
-            add_usage(
-                target,
-                UsageField::InterfaceCompileDefinitions,
-                definition,
-                config,
-                lang,
-            );
-        }
-    }
     for feature in &usage.compile_features {
         let standard = match feature.as_slice() {
             [b'c' | b'C', a, b] if a.is_ascii_digit() && b.is_ascii_digit() => {
@@ -247,7 +198,6 @@ fn apply_usage(target: &mut Target, package: &[u8], usage: &CpsUsage, config: &[
                 UsageField::InterfaceCompileFeatures,
                 standard,
                 config,
-                b"*",
             );
         } else if feature.eq_ignore_ascii_case(b"threads") {
             add_link(
@@ -261,6 +211,49 @@ fn apply_usage(target: &mut Target, package: &[u8], usage: &CpsUsage, config: &[
             add_link(
                 target,
                 condition("Threads::Threads".into(), b"CONFIG", config),
+            );
+        }
+    }
+    add_language_lists(
+        target,
+        UsageField::InterfaceCompileOptions,
+        b"compile_flags",
+        &usage.compile_flags,
+        config,
+        warnings,
+    );
+    for entry in &usage.link_flags {
+        add_usage(
+            target,
+            UsageField::InterfaceLinkOptions,
+            entry.clone(),
+            config,
+        );
+    }
+    add_definitions(target, &usage.definitions, config, warnings);
+    add_language_lists(
+        target,
+        UsageField::InterfaceIncludeDirectories,
+        b"includes",
+        &usage.includes,
+        config,
+        warnings,
+    );
+    for (prop, value) in [
+        (b"IMPORTED_LOCATION".as_slice(), &usage.location),
+        (b"IMPORTED_IMPLIB", &usage.link_location),
+        (b"IMPORTED_SONAME", &usage.link_name),
+    ] {
+        if let Some(value) = value {
+            target.props.set(text(&[prop, &suffix]), value.clone());
+        }
+    }
+    // `MapLanguage(..., DisallowGlob)` drops `*` and unknown names without a warning.
+    for name in &usage.link_languages {
+        if let Some(lang) = language(name, false) {
+            target.props.append(
+                "INTERFACE_LINK_LANGUAGES".into(),
+                &condition(lang.into(), b"CONFIG", config),
             );
         }
     }
@@ -279,9 +272,118 @@ fn apply_usage(target: &mut Target, package: &[u8], usage: &CpsUsage, config: &[
             add_link(target, condition(link, b"CONFIG", config));
         }
     }
+    if !usage.dyld_requires.is_empty() {
+        target.props.set(
+            text(&[b"IMPORTED_LINK_DEPENDENT_LIBRARIES", &suffix]),
+            list::join(
+                usage
+                    .dyld_requires
+                    .iter()
+                    .map(|name| reference(package, name)),
+            ),
+        );
+    }
     for entry in &usage.link_libraries {
         add_link(target, condition(entry.clone(), b"CONFIG", config));
     }
+}
+
+/// `AppendLanguageProperties`: add each list, and limit a language list to that language.
+fn add_language_lists(
+    target: &mut Target,
+    field: UsageField,
+    key: &[u8],
+    by_language: &BTreeMap<BString, Vec<BString>>,
+    config: &[u8],
+    warnings: &mut Vec<BString>,
+) {
+    for (name, entries) in by_language {
+        let Some(lang) = language(name, true) else {
+            warnings.push(unknown_language(name, key, &target.name));
+            continue;
+        };
+        for entry in entries {
+            let value = if lang == b"*" {
+                entry.clone()
+            } else {
+                condition(entry.clone(), b"COMPILE_LANGUAGE", lang)
+            };
+            add_usage(target, field, value, config);
+        }
+    }
+}
+
+/// Definition values of one name by CMake language. `*` sorts before every language name.
+type LanguageValues<'a> = BTreeMap<&'static [u8], Option<&'a BString>>;
+
+/// `AddDefinitions`: order the definitions by name. When a language overrides a `*`
+/// definition, limit the `*` definition to the other languages.
+fn add_definitions(
+    target: &mut Target,
+    definitions: &BTreeMap<BString, BTreeMap<BString, Option<BString>>>,
+    config: &[u8],
+    warnings: &mut Vec<BString>,
+) {
+    let mut by_name = BTreeMap::<&[u8], LanguageValues<'_>>::new();
+    for (name, values) in definitions {
+        let Some(lang) = language(name, true) else {
+            warnings.push(unknown_language(name, b"definitions", &target.name));
+            continue;
+        };
+        for (key, value) in values {
+            by_name
+                .entry(key.as_slice())
+                .or_default()
+                .entry(lang)
+                .or_insert(value.as_ref());
+        }
+    }
+    let field = UsageField::InterfaceCompileDefinitions;
+    for (key, languages) in by_name {
+        if let Some(&value) = languages.get(b"*".as_slice()) {
+            let all = definition(key, value);
+            if languages.len() == 1 {
+                add_usage(target, field, all, config);
+                continue;
+            }
+            let excluded: Vec<&[u8]> = languages
+                .keys()
+                .copied()
+                .filter(|lang| *lang != b"*".as_slice())
+                .collect();
+            let excluded = excluded.join(b",".as_slice());
+            let value = text(&[
+                b"$<$<NOT:$<COMPILE_LANGUAGE:",
+                &excluded,
+                b">>:",
+                &all,
+                b">",
+            ]);
+            add_usage(target, field, value, config);
+        }
+        for (lang, value) in languages {
+            if lang != b"*".as_slice() {
+                let value = condition(definition(key, value), b"COMPILE_LANGUAGE", lang);
+                add_usage(target, field, value, config);
+            }
+        }
+    }
+}
+
+/// `BuildDefinition`: `NAME=value`, or `NAME` without a value.
+fn definition(key: &[u8], value: Option<&BString>) -> BString {
+    value.map_or_else(|| key.into(), |value| text(&[key, b"=", value]))
+}
+
+fn unknown_language(name: &[u8], key: &[u8], target: &[u8]) -> BString {
+    text(&[
+        b"ignoring unknown language \"",
+        name,
+        b"\" in ",
+        key,
+        b" for ",
+        target,
+    ])
 }
 
 fn reference(package: &[u8], entry: &[u8]) -> BString {
@@ -297,17 +399,23 @@ fn reference(package: &[u8], entry: &[u8]) -> BString {
     }
 }
 
-fn language(name: &[u8]) -> Option<&'static [u8]> {
-    Some(match name {
+/// `MapLanguage`: map a CPS language name to a CMake language name. Case is ignored.
+/// CMake 4.5.1 maps `swift` to the lowercase name `swift`.
+fn language(name: &[u8], glob: bool) -> Option<&'static [u8]> {
+    if glob && name == b"*" {
+        return Some(b"*");
+    }
+    Some(match name.to_ascii_lowercase().as_slice() {
         b"c" => b"C",
-        b"cpp" => b"CXX",
-        b"fortran" => b"Fortran",
+        b"c++" | b"cpp" | b"cxx" => b"CXX",
         b"objc" => b"OBJC",
-        b"objcxx" => b"OBJCXX",
-        b"cuda" => b"CUDA",
+        b"objc++" | b"objcpp" | b"objcxx" => b"OBJCXX",
+        b"swift" => b"swift",
         b"hip" => b"HIP",
-        b"swift" => b"Swift",
-        b"asm" => b"ASM",
+        b"cuda" => b"CUDA",
+        b"ispc" => b"ISPC",
+        b"c#" | b"csharp" => b"CSharp",
+        b"fortran" => b"Fortran",
         _ => return None,
     })
 }
@@ -320,15 +428,8 @@ fn condition(entry: BString, key: &[u8], value: &[u8]) -> BString {
     }
 }
 
-fn add_usage(target: &mut Target, field: UsageField, entry: BString, config: &[u8], lang: &[u8]) {
-    let value = if lang == b"*" {
-        entry
-    } else if let Some(lang) = language(lang) {
-        condition(entry, b"COMPILE_LANGUAGE", lang)
-    } else {
-        return;
-    };
-    let value = condition(value, b"CONFIG", config);
+fn add_usage(target: &mut Target, field: UsageField, entry: BString, config: &[u8]) {
+    let value = condition(entry, b"CONFIG", config);
     target
         .usage
         .push(field, BT::new(value, target.backtrace.clone()));
