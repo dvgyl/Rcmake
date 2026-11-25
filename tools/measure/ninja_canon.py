@@ -197,17 +197,18 @@ class Normalizer:
             roots[self.source] = "<source>"
         self.labels = {}
         for path, label in roots.items():
-            for absolute in {str(path.absolute()), str(path.resolve())}:
+            for absolute in {spelling for p in (path.absolute(), path.resolve())
+                             for spelling in (str(p), p.as_posix())}:
                 self.labels[absolute] = label
                 self.labels[shlex.quote(absolute)] = label
         alternatives = "|".join(map(re.escape, sorted(self.labels, key=len, reverse=True)))
-        self.pattern = re.compile(rf"(?:{alternatives})(?=$|[/\s'\":;,|)&\]])")
+        self.pattern = re.compile(rf"(?:{alternatives})(?=$|[/\\\s'\":;,|)&\]])")
 
     def text(self, value: str) -> str:
         return self.pattern.sub(lambda match: self.labels[match[0]], value)
 
     def path(self, value: str) -> str:
-        return self.text(os.path.normpath(self.build / value)) if value else ""
+        return self.text(Path(os.path.normpath(self.build / value)).as_posix()) if value else ""
 
 
 def row_key(row: dict | str) -> str:
@@ -231,6 +232,35 @@ def canonicalize(normalize: Normalizer, manifest: str = "build.ninja") -> list[d
             "rspfile_content": normalize.text(edge.evaluate("rspfile_content")),
         })
     return sorted(rows, key=lambda row: (row["outputs"], row["implicit_outputs"], row_key(row)))
+
+
+def artifact_graph(rows: list[dict], normalize: Normalizer, artifacts: list[str]) -> list[dict]:
+    """Trace each artifact to project sources and other requested artifacts."""
+    producers = {output: row for row in rows for output in row["outputs"] + row["implicit_outputs"]}
+    requested = {normalize.path(artifact): artifact for artifact in artifacts}
+    result = []
+    for output, artifact in sorted(requested.items()):
+        if output not in producers or not producers[output]["command"]:
+            raise ValueError(f"No build command produces {artifact}.")
+        sources, dependencies, seen = set(), set(), {output}
+        pending = [producers[output]]
+        while pending:
+            row = pending.pop()
+            for path in row["inputs"] + row["implicit_inputs"]:
+                if path in seen:
+                    continue
+                seen.add(path)
+                if path in requested:
+                    dependencies.add(requested[path])
+                elif path in producers:
+                    pending.append(producers[path])
+                elif path.startswith("<source>/"):
+                    sources.add(path.removeprefix("<source>/"))
+        if not sources:
+            raise ValueError(f"No project sources produce {artifact}.")
+        result.append({"artifact": artifact, "sources": sorted(sources),
+                       "dependencies": sorted(dependencies)})
+    return result
 
 
 def normalized_commands(stdout: str, normalize: Normalizer) -> list[str]:
@@ -266,15 +296,21 @@ def main() -> int:
     parser.add_argument("--source", type=Path)
     parser.add_argument("--other-source", type=Path)
     parser.add_argument("--manifest", default="build.ninja")
-    parser.add_argument("--dry-run", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--artifact", action="append", default=[],
+                      help="Compare source and artifact dependencies for this output. Repeat for each output.")
     parser.add_argument("--target", action="append", default=[])
     args = parser.parse_args()
+    if args.artifact and args.source is None:
+        parser.error("--artifact requires --source.")
 
     def read(build: Path, source: Path | None) -> list:
         normalizer = Normalizer(build, source)
         if args.dry_run:
             return dry_run(normalizer, args.target, manifest=args.manifest)
-        return canonicalize(normalizer, args.manifest)
+        rows = canonicalize(normalizer, args.manifest)
+        return artifact_graph(rows, normalizer, args.artifact) if args.artifact else rows
 
     try:
         left = read(args.build, args.source)

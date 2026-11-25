@@ -213,6 +213,7 @@ jobs:
             --edits 8 --timeout 30 --out-json "$reports/mutation.json" --out-md "$reports/mutation.md"
           python3 tools/measure/probe_cache_eval.py --smoke --rcmake target/stage/bin/rcmake \
             --timeout 30 --out-json "$reports/probe.json" --out-md "$reports/probe.md"
+          PYTHONPATH=tools/measure python3 -m unittest -v tools/measure/test_path_swap_eval.py
           python3 tools/measure/path_swap_eval.py --smoke --rcmake-bin target/stage/bin/rcmake \
             --timeout 30 --out "$reports/path-swap.json"
       # Require the full replay and probe-cache gates when the configure path enables both.
@@ -331,4 +332,69 @@ jobs:
                   subprocess.run([cmake, "--install", build, "--prefix", prefix], check=True, timeout=300)
                   if not any(path.is_file() for path in prefix.rglob("*")):
                       sys.exit(f"{name} did not install any files.")
+          PY
+      - name: Compare generator artifacts with CMake 4.5.1
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          oracle_env="$(scripts/fetch-oracle.sh --print-env)"
+          eval "$oracle_env"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            export RCMAKE_ORACLE_CMAKE="$(cygpath -am "$RCMAKE_ORACLE_CMAKE")"
+          fi
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          from tempfile import TemporaryDirectory
+
+          windows = os.name == "nt"
+          oracle = Path(os.environ["RCMAKE_ORACLE_CMAKE"])
+          rcmake = Path("target/stage/bin/rcmake.exe" if windows else "target/stage/bin/rcmake").resolve()
+
+          def run(*command):
+              subprocess.run(command, check=True, timeout=300)
+
+          with TemporaryDirectory(prefix="generator-parity-") as temporary:
+              work = Path(temporary).resolve()
+              source = work / "source"
+              source.mkdir()
+              (source / "CMakeLists.txt").write_text("""\
+          cmake_minimum_required(VERSION 4.5)
+          project(GeneratorParity LANGUAGES C CXX)
+          add_library(parity_lib STATIC parity.c)
+          add_executable(parity main.cxx)
+          target_link_libraries(parity PRIVATE parity_lib)
+          """, encoding="utf-8")
+              (source / "parity.c").write_text("int parity_value(void) { return 42; }\n", encoding="utf-8")
+              (source / "main.cxx").write_text(
+                  'extern "C" int parity_value(void);\nint main() { return parity_value() == 42 ? 0 : 1; }\n',
+                  encoding="utf-8",
+              )
+
+              def configure(generator, *args):
+                  left, right = (work / generator / engine for engine in ("oracle", "rcmake"))
+                  for cmake, build in ((oracle, left), (rcmake, right)):
+                      run(cmake, "-S", source, "-B", build, "-G", generator, *args)
+                  return left, right
+
+              compiler_args = ("-DCMAKE_C_COMPILER=cl.exe", "-DCMAKE_CXX_COMPILER=cl.exe") if windows else ()
+              left, right = configure("Ninja", "-DCMAKE_BUILD_TYPE=Release", *compiler_args)
+              executable, library = ("parity.exe", "parity_lib.lib") if windows else ("parity", "libparity_lib.a")
+              run(sys.executable, "tools/measure/ninja_canon.py", left, right,
+                  "--source", source, "--artifact", executable, "--artifact", library)
+              print("Ninja artifact dependencies match.", flush=True)
+
+              if sys.platform == "darwin":
+                  left, right = configure("Xcode")
+                  project = "GeneratorParity.xcodeproj"
+                  run(sys.executable, "tools/measure/pbxproj_canon.py", left / project, right / project,
+                      "--source-root", source, "--native-targets")
+                  print("Xcode native targets match.", flush=True)
+              if windows:
+                  left, right = configure("Visual Studio 17 2022", "-A", "x64")
+                  run(sys.executable, "tools/measure/vs_canon.py", left, "--compare-to", right,
+                      "--source-root", source)
+                  print("Visual Studio native targets match.", flush=True)
           PY

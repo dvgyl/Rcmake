@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Compare CMake and Rcmake through PATH.
 
-Run a fixture that checks child tools, a passing test, and known file contents.
+Compare command output, child tools, test results, and file contents.
 Use --smoke to run the fixture without a compiler. Use --source to compare a
 project with reproducible outputs after the fixture passes. Set
 RCMAKE_ORACLE_BIN_DIR to the bin directory of CMake 4.5.1.
@@ -11,11 +11,13 @@ RCMAKE_ORACLE_BIN_DIR to the bin directory of CMake 4.5.1.
 from __future__ import annotations
 
 import argparse
+from difflib import unified_diff
 import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -31,7 +33,7 @@ try:
 except ImportError:
     from _proc import run_process as _run_process
 from corpus_eval import (
-    JOBS, PACKAGE_EXTENSIONS, install_manifest, install_tree, normalize_roots, package_tree, row_key,
+    PACKAGE_EXTENSIONS, install_manifest, install_tree, normalize_roots, package_tree, row_key,
 )
 from oracle_prop_test import ORACLE_VERSION, executable, write_json
 
@@ -46,6 +48,19 @@ DEFAULT_WORK_DIR = Path(tempfile.gettempdir()) / "rcmake-path-swap"
 FIXTURE_FILE = "share/path-swap/payload.txt"
 FIXTURE_TEST = "path-swap-payload"
 FIXTURE_PAYLOAD = b"Rcmake PATH fixture"
+OUTPUT_STAGES = ("configure", "build", "test", "package")
+VERSION_FOOTER = re.compile(
+    rf"^((?:cmake|ctest|cpack) version {re.escape(ORACLE_VERSION)}\n)"
+    r"(?:\nCMake suite maintained and supported by Kitware \(kitware\.com/cmake\)\."
+    r"|Rcmake \d+\.\d+\.\d+(?:[-+][\w.+-]+)?)\n",
+    re.MULTILINE,
+)
+CONFIGURE_TIME = re.compile(r"^(-- (?:Configuring|Generating) done) \(\d+(?:\.\d+)?s\)$", re.MULTILINE)
+TEST_TIME = re.compile(
+    r"^(\d+/\d+ Test +#\d+: .*?\.{2,} +(?:Passed|\*\*\*[^\r\n]+?)"
+    r"|Total Test time \(real\) =) +\d+(?:\.\d+)? sec$",
+    re.MULTILINE,
+)
 
 
 def tool_stem(path: Path) -> str:
@@ -359,16 +374,18 @@ endif()
             encoding="utf-8",
         )
     language = "C" if compile_app else "NONE"
-    target = "add_executable(path_swap_app main.c)" if compile_app else ""
+    target = ("add_executable(path_swap_app main.c)\n"
+              "add_dependencies(path_swap_app path_swap_payload)") if compile_app else ""
     app_arg = '"-DAPP=$<TARGET_FILE:path_swap_app>"' if compile_app else ""
     (source / "CMakeLists.txt").write_text(f"""\
 cmake_minimum_required(VERSION 4.5)
 project(PathSwap VERSION 1.0 LANGUAGES {language})
-{target}
 set(child "${{CMAKE_CURRENT_SOURCE_DIR}}/child.cmake")
 set(payload "${{CMAKE_CURRENT_BINARY_DIR}}/payload.txt")
 add_custom_target(path_swap_payload ALL
-  COMMAND cmake "-DPAYLOAD=${{payload}}" -P "${{child}}" VERBATIM)
+  COMMAND cmake "-DPAYLOAD=${{payload}}" -P "${{child}}"
+  COMMENT "Write the PATH fixture payload." VERBATIM)
+{target}
 enable_testing()
 add_test(NAME {FIXTURE_TEST}
   COMMAND cmake "-DPAYLOAD_TO_TEST=${{payload}}" {app_arg} -P "${{child}}")
@@ -376,6 +393,14 @@ install(CODE "execute_process(COMMAND cmake -P \\"${{child}}\\" COMMAND_ERROR_IS
 install(FILES "${{payload}}" DESTINATION "share/path-swap")
 set(CPACK_PACKAGE_FILE_NAME "path-swap")
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+# Use a package staging script with no install progress messages.
+set(package_stage "${{CMAKE_CURRENT_BINARY_DIR}}/package-stage")
+file(GENERATE OUTPUT "${{package_stage}}/cmake_install.cmake" CONTENT "
+  execute_process(COMMAND cmake -P \\"${{child}}\\" COMMAND_ERROR_IS_FATAL ANY)
+  file(MAKE_DIRECTORY \\"\\${{CMAKE_INSTALL_PREFIX}}/share/path-swap\\")
+  configure_file(\\"${{payload}}\\" \\"\\${{CMAKE_INSTALL_PREFIX}}/{FIXTURE_FILE}\\" COPYONLY)
+")
+set(CPACK_INSTALL_CMAKE_PROJECTS "${{package_stage}};PathSwap;ALL;/")
 include(CPack)
 """, encoding="utf-8")
 
@@ -420,7 +445,9 @@ def evaluate(name: str, bin_dir: Path, root: Path, source: Path, env: dict[str, 
     candidate = name == "rcmake"
     result = {"stages": {}, "children": {}, "artifacts": {},
               "paths": {"home": env["HOME"], "cache": env["XDG_CACHE_HOME"],
-                        "search": env["PATH"].split(os.pathsep)}}
+                        "search": env["PATH"].split(os.pathsep),
+                        "scratch": env["TMPDIR"], "installation": str(bin_dir.parent),
+                        "project": str(root)}}
     try:
         result["tools"] = verify_path(bin_dir, root, args.timeout, env, candidate=candidate)
     except ValueError as error:
@@ -430,9 +457,9 @@ def evaluate(name: str, bin_dir: Path, root: Path, source: Path, env: dict[str, 
     commands = {
         "configure": ["cmake", "-S", "source", "-B", "build", "-G", args.generator, build_type,
                       *(() if fixture and args.source else args.configure_arg)],
-        "build": ["cmake", "--build", "build", "--config", args.config, "--parallel", JOBS],
+        "build": ["cmake", "--build", "build", "--config", args.config, "--parallel", "1"],
         "test": ["ctest", "--test-dir", "build", "-C", args.config, "--output-on-failure",
-                 "--no-tests=error", "--parallel", JOBS, "--output-junit", str(root / "ctest.xml")],
+                 "--no-tests=error", "--parallel", "1", "--output-junit", str(root / "ctest.xml")],
         "install": ["cmake", "--install", "build", "--config", args.config,
                     "--prefix", str(root / "install")],
         "package": ["cpack", "--config", "build/CPackConfig.cmake", "-C", args.config,
@@ -474,8 +501,26 @@ def evaluate(name: str, bin_dir: Path, root: Path, source: Path, env: dict[str, 
     return result
 
 
-def compare(oracle: dict, rcmake: dict) -> list[str]:
-    """List the outcome and artifact fields that differ."""
+def normalize_output(output: str, paths: dict, stage: str) -> str:
+    """Replace only lane paths, tool version footers, and known timing fields."""
+    roots = {}
+    for key in ("home", "cache", "scratch", "installation", "project"):
+        if key in paths:
+            root = Path(paths[key])
+            for spelling in (str(root), root.as_posix()):
+                roots[spelling] = f"<{key}>"
+    for root, label in sorted(roots.items(), key=lambda entry: len(entry[0]), reverse=True):
+        output = re.sub(re.escape(root) + r"""(?=$|[/\s\\'"=:;,()\]])""", label, output)
+    output = VERSION_FOOTER.sub(r"\1", output.replace("\r\n", "\n"))
+    if stage == "configure":
+        output = CONFIGURE_TIME.sub(r"\1 (<time>)", output)
+    if stage == "test":
+        output = TEST_TIME.sub(r"\1 <time> sec", output)
+    return output
+
+
+def compare(oracle: dict, rcmake: dict) -> tuple[list[str], dict[str, str]]:
+    """List the fields that differ and show differences in command output."""
     differences = []
     for stage in oracle["stages"].keys() | rcmake["stages"].keys():
         expected = oracle["stages"].get(stage, {})
@@ -486,7 +531,18 @@ def compare(oracle: dict, rcmake: dict) -> list[str]:
     differences.extend(key for key in left.keys() | right.keys() if left.get(key) != right.get(key))
     differences.extend(key for key in ("identity_error", "artifact_error")
                        if oracle.get(key) != rcmake.get(key))
-    return sorted(differences)
+    output_diffs = {}
+    for stage in OUTPUT_STAGES:
+        for stream in ("stdout", "stderr"):
+            left, right = (normalize_output(engine["stages"].get(stage, {}).get(stream, ""),
+                                            engine.get("paths", {}), stage)
+                           for engine in (oracle, rcmake))
+            if left != right:
+                key = f"{stage}.{stream}"
+                output_diffs[key] = "\n".join(unified_diff(
+                    left.split("\n"), right.split("\n"), f"cmake/{key}", f"rcmake/{key}", lineterm="",
+                ))
+    return sorted([*differences, *output_diffs]), output_diffs
 
 
 def evaluate_project(source: Path, root: Path, installations: dict[str, Path],
@@ -500,7 +556,7 @@ def evaluate_project(source: Path, root: Path, installations: dict[str, Path],
                                [bin_dir, *support])
         results[name] = evaluate(name, bin_dir, project, source, env, args, fixture=fixture)
         shutil.rmtree(project)
-    differences = compare(results["oracle"], results["rcmake"])
+    differences, output_diffs = compare(results["oracle"], results["rcmake"])
 
     def passed(result):
         return (not result.get("identity_error") and not result.get("artifact_error")
@@ -509,7 +565,7 @@ def evaluate_project(source: Path, root: Path, installations: dict[str, Path],
     oracle_ok = passed(results["oracle"])
     rcmake_ok = passed(results["rcmake"])
     status = "oracle_error" if not oracle_ok else "fail" if differences or not rcmake_ok else "pass"
-    return {"status": status, "differences": differences, **results}
+    return {"status": status, "differences": differences, "output_diffs": output_diffs, **results}
 
 
 def main() -> int:
@@ -566,6 +622,8 @@ def main() -> int:
         print(f"Could not complete the PATH comparison. {error}", file=sys.stderr)
         return 2
     print(json.dumps({key: report[key] for key in ("status", "differences")}))
+    for diff in report["output_diffs"].values():
+        print(diff, file=sys.stderr)
     return {"pass": 0, "fail": 1, "oracle_error": 2}[report["status"]]
 
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+from difflib import unified_diff
 import json
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -84,6 +85,7 @@ def project_xml(path: Path, root: ET.Element) -> dict:
     require(bool(configs), "Missing project configuration matrix")
 
     order = []
+    types = {}
     labels = ("Configuration", "ItemDefinitionGroup")
     configured = {label: set() for label in labels}
     for child in root:
@@ -105,6 +107,8 @@ def project_xml(path: Path, root: ET.Element) -> dict:
             config = unquote(match[1])
             require(config not in configured[name], f"Duplicate {name} condition: {config}")
             configured[name].add(config)
+            if name == "Configuration":
+                types[config] = child.findtext(f"{MSBUILD}ConfigurationType")
     require(order == sorted(order), "MSBuild project elements are out of order")
     for name in ("ProjectConfigurations", "Globals", "Microsoft.Cpp.Default.props", "Microsoft.Cpp.props", "Microsoft.Cpp.targets"):
         require(order.count(ORDER[name]) == 1, f"Expected one {name} element")
@@ -124,7 +128,7 @@ def project_xml(path: Path, root: ET.Element) -> dict:
              for group in root.findall(f"./{MSBUILD}ItemGroup")
              for item in group
              if tag(item) not in ("ProjectConfiguration", "ProjectReference")}
-    return {"guid": identifier, "configs": set(configs), "refs": refs, "items": items}
+    return {"guid": identifier, "configs": set(configs), "refs": refs, "items": items, "types": types}
 
 
 def filters_xml(root: ET.Element) -> set:
@@ -322,7 +326,7 @@ def canonical_xml(element: ET.Element) -> dict:
             "children": [canonical_xml(child) for child in element]}
 
 
-def validate(paths: list[Path], base: Path) -> dict:
+def validate(paths: list[Path], base: Path, *, source: Path | None = None) -> dict:
     documents = {}
     projects = {}
     solutions = {}
@@ -371,23 +375,84 @@ def validate(paths: list[Path], base: Path) -> dict:
         for target, identifier in projects[path]["refs"].items():
             require(load(target)["guid"] == identifier, f"{path}: Incorrect ProjectReference GUID for {target}")
             pending.append(target)
-    return documents
+    if source is None:
+        return documents
+
+    native = {path for path, project in projects.items()
+              if any(kind in {"Application", "DynamicLibrary", "StaticLibrary"}
+                     for kind in project["types"].values())}
+    require(bool(native), f"No native Visual Studio targets at {base}.")
+    require(any(path.suffix.lower() == ".sln" for path in solutions), f"No .sln file at {base}.")
+
+    def relative(path: Path, root: Path) -> str:
+        return path.relative_to(root).as_posix() if path.is_relative_to(root) else path.as_posix()
+
+    return {
+        "solutions": {
+            relative(path, base): {relative(member, base): sorted(configs)
+                                   for member, (_, configs) in members.items() if member in native}
+            for path, members in solutions.items()
+        },
+        "projects": {
+            relative(path, base): {
+                "configurations": projects[path]["types"],
+                "dependencies": sorted(relative(ref, base) for ref in projects[path]["refs"] if ref in native),
+                "sources": sorted(relative(local_path(path, value), source)
+                                  for tag, value in projects[path]["items"] if tag == "ClCompile"),
+            }
+            for path in native
+        },
+    }
+
+
+def visual_studio_files(path: Path) -> set[Path]:
+    candidates = path.rglob("*") if path.is_dir() else [path]
+    found = {file.resolve() for file in candidates if file.is_file()
+             and file.name.lower().endswith(SUFFIXES) and not file.name.startswith("._")}
+    require(bool(found), f"No Visual Studio files at {path}")
+    return found
+
+
+def solution_files(build: Path) -> list[Path]:
+    """Read the root solutions and their projects, excluding compiler probes."""
+    files = set(build.glob("*.sln"))
+    require(bool(files), f"No .sln file at {build}.")
+    for solution in sorted(files):
+        _, members = sln_text(solution)
+        for project in members:
+            require(project.is_relative_to(build), f"Project is outside the build at {project}.")
+            files.add(project)
+            filters = project.with_suffix(".vcxproj.filters")
+            if filters.is_file():
+                files.add(filters)
+    return sorted(files)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", type=Path, help="Solution files, project files, or build directories")
     parser.add_argument("--check", action="store_true", help="Report the number of files that pass validation")
+    parser.add_argument("--compare-to", type=Path, help="Compare native targets with this build directory")
+    parser.add_argument("--source-root", type=Path, help="Common source directory for both builds")
     options = parser.parse_args()
+    base = options.paths[0].resolve()
+    if options.compare_to and (len(options.paths) != 1 or not base.is_dir()
+                               or not options.compare_to.is_dir() or not options.source_root
+                               or options.check):
+        parser.error("--compare-to requires two build directories and --source-root.")
     try:
-        files = set()
-        for path in options.paths:
-            candidates = path.rglob("*") if path.is_dir() else [path]
-            found = {file.resolve() for file in candidates if file.is_file()
-                     and file.name.lower().endswith(SUFFIXES) and not file.name.startswith("._")}
-            require(bool(found), f"No Visual Studio files at {path}")
-            files.update(found)
-        base = options.paths[0].resolve()
+        if options.compare_to:
+            source = options.source_root.resolve()
+            other = options.compare_to.resolve()
+            documents = validate(solution_files(base), base, source=source)
+            candidate = validate(solution_files(other), other, source=source)
+            if documents == candidate:
+                return 0
+            left, right = (json.dumps(data, indent=2, sort_keys=True).splitlines()
+                           for data in (documents, candidate))
+            print("\n".join(unified_diff(left, right, str(base), str(other), lineterm="")))
+            return 1
+        files = set().union(*(visual_studio_files(path) for path in options.paths))
         documents = validate(sorted(files), base if base.is_dir() else base.parent)
     except (ValueError, OSError, ET.ParseError) as error:
         print(error, file=sys.stderr)
