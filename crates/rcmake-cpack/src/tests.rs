@@ -891,7 +891,7 @@ endif()
 }
 
 #[test]
-fn archive_reads_component_staging_from_each_project_subdirectory() {
+fn archive_reads_components_from_the_component_directory() {
     let host = memory_host();
     write(
         host.as_ref(),
@@ -902,11 +902,11 @@ set(CPACK_PACKAGE_NAME demo)
 set(CPACK_PACKAGE_VERSION 1)
 set(CPACK_PACKAGE_FILE_NAME demo)
 set(CPACK_CMAKE_GENERATOR Ninja)
-set(CPACK_INSTALL_CMAKE_PROJECTS "/work/one;One;ALL;/first;/work/two;Two;ALL;/second")
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/one;One;ALL;/;/work/two;Two;ALL;/")
 set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
 set(CPACK_COMPONENTS_ALL tools)
 set(CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY ON)
-set(CPACK_PACKAGING_INSTALL_PREFIX "/package")
+set(CPACK_PACKAGING_INSTALL_PREFIX "/")
 set(CPACK_INSTALL_PREFIX "/install")
 set(CPACK_SET_DESTDIR ON)
 "#,
@@ -942,9 +942,15 @@ set(CPACK_SET_DESTDIR ON)
         read(host.as_ref(), &unpacked.join("demo/install/bin/first.txt")),
         b"one"
     );
-    assert_eq!(
-        read(host.as_ref(), &unpacked.join("demo/install/bin/second.txt")),
-        b"two"
+
+    // CPack reads each component from its directory below the staging root, so files
+    // that a project installs below a project subdirectory are not available.
+    let projects =
+        "-DCPACK_INSTALL_CMAKE_PROJECTS=/work/one;One;ALL;/first;/work/two;Two;ALL;/second";
+    assert_eq!(invoke(host.clone(), &["-B", "/work/subdir", projects]), 1);
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .contains_str("Failed to change working directory")
     );
 }
 

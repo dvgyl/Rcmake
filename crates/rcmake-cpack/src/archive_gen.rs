@@ -18,8 +18,8 @@ use crate::config::CpackConfig;
 mod stgz;
 
 use crate::{
-    ComponentGrouping, ComponentMembers, CpackError, PackageContext, PackageGenerator, error,
-    safe_name,
+    ComponentGrouping, ComponentMembers, CpackError, InstalledComponent, PackageContext,
+    PackageGenerator, error, safe_name,
 };
 
 /// Archive format of an [`ArchiveGenerator`].
@@ -249,7 +249,12 @@ impl ArchiveGenerator {
             .then(|| stgz::header(cx, &cfg))
             .transpose()?;
         let header = header.as_ref().map(|header| header.as_slice());
-        let archives = component_archives(&cfg, archive_name, self.name())?;
+        // Components that the install recorded do not depend on the configuration that
+        // the pre-build scripts leave.
+        let archives = match members.filter(|members| !members.is_empty()) {
+            Some(members) => recorded_archives(cx, &cfg, archive_name, self.name(), members)?,
+            None => component_archives(&cfg, archive_name, self.name())?,
+        };
         if archives.is_empty() {
             let (base, inputs) = if header.is_none()
                 && (cfg.get(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY").is_none()
@@ -290,23 +295,18 @@ impl ArchiveGenerator {
                 Ok(path)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let prefix = component_prefix(cx, &cfg)?;
         for (archive, path) in archives.iter().zip(&paths) {
-            let roots = archive
-                .roots
-                .iter()
-                .map(|root| members.and_then(|members| members.get(root)))
-                .collect::<Option<Vec<_>>>();
             let output = ArchiveOutput {
                 path,
                 options: &options,
                 header,
             };
-            match roots {
-                Some(recorded) => {
-                    write_recorded_archive(cx, &output, &archive.roots, &recorded)?;
+            match &archive.source {
+                ArchiveSource::Live(roots) => {
+                    let prefix = component_prefix(cx, &cfg)?;
+                    write_component_archive(cx, &output, &prefix, roots)?;
                 }
-                None => write_component_archive(cx, &output, &prefix, &archive.roots)?,
+                ArchiveSource::Recorded(roots) => write_recorded_archive(cx, &output, roots)?,
             }
         }
         Ok(paths)
@@ -321,7 +321,96 @@ struct ArchiveOutput<'a> {
 
 struct ComponentArchive {
     name: BString,
-    roots: Vec<PathBuf>,
+    source: ArchiveSource,
+}
+
+enum ArchiveSource {
+    // Component roots relative to the staging directory, scanned when packaging.
+    Live(Vec<PathBuf>),
+    // Recorded archive paths below each component directory.
+    Recorded(Vec<RecordedRoot>),
+}
+
+struct RecordedRoot {
+    dir: PathBuf,
+    paths: Vec<PathBuf>,
+}
+
+// Group the recorded components as `cmCPackArchiveGenerator` does. CPack reads each
+// component from `<staging>/<component>` and adds its prefix to each recorded path.
+fn recorded_archives(
+    cx: &PackageContext<'_>,
+    cfg: &CpackConfig,
+    base: &[u8],
+    generator: &str,
+    members: &[InstalledComponent],
+) -> Result<Vec<ComponentArchive>, CpackError> {
+    let prefix = recorded_prefix(cx, cfg)?;
+    let root = |component: &InstalledComponent| RecordedRoot {
+        dir: cx
+            .staging_dir
+            .join(crate::stage::component_dir(&component.name)),
+        paths: component
+            .files
+            .iter()
+            .map(|file| prefix.join(file))
+            .collect(),
+    };
+    let grouping = crate::stage::grouping(cfg);
+    if grouping == ComponentGrouping::AllComponentsInOne {
+        let mut components = members.iter().collect::<Vec<_>>();
+        components.sort_by(|left, right| left.name.cmp(&right.name));
+        return Ok(vec![ComponentArchive {
+            name: base.into(),
+            source: ArchiveSource::Recorded(components.into_iter().map(&root).collect()),
+        }]);
+    }
+    let mut groups: BTreeMap<&[u8], Vec<RecordedRoot>> = BTreeMap::new();
+    let mut singles: BTreeMap<&[u8], RecordedRoot> = BTreeMap::new();
+    for component in members {
+        match component
+            .group
+            .as_ref()
+            .filter(|_| grouping == ComponentGrouping::OnePerGroup)
+        {
+            Some(group) => groups
+                .entry(group.as_slice())
+                .or_default()
+                .push(root(component)),
+            None => {
+                singles.insert(component.name.as_slice(), root(component));
+            }
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .map(|(group, roots)| ComponentArchive {
+            name: component_archive_name(cfg, base, group, generator, "COMPONENT_GROUP"),
+            source: ArchiveSource::Recorded(roots),
+        })
+        .chain(singles.into_iter().map(|(name, root)| ComponentArchive {
+            name: component_archive_name(cfg, base, name, generator, "COMPONENT"),
+            source: ArchiveSource::Recorded(vec![root]),
+        }))
+        .collect())
+}
+
+// CPack adds the top-level directory and an absolute packaging prefix without its
+// leading slash.
+fn recorded_prefix(cx: &PackageContext<'_>, cfg: &CpackConfig) -> Result<PathBuf, CpackError> {
+    let mut prefix = if cfg.on(b"CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY") {
+        safe_name(cx.file_name)?
+    } else {
+        PathBuf::new()
+    };
+    if let Some(install) = cfg
+        .get(b"CPACK_PACKAGING_INSTALL_PREFIX")
+        .and_then(|value| value.strip_prefix(b"/"))
+        .filter(|value| !value.is_empty())
+    {
+        prefix.extend(crate::stage::relative_install_path(install)?.iter());
+    }
+    Ok(prefix)
 }
 
 fn component_archives(
@@ -357,21 +446,21 @@ fn component_archives(
     if grouping == ComponentGrouping::AllComponentsInOne && !singles.is_empty() {
         return Ok(vec![ComponentArchive {
             name: base.into(),
-            roots: singles.into_values().flatten().collect(),
+            source: ArchiveSource::Live(singles.into_values().flatten().collect()),
         }]);
     }
     Ok(groups
         .into_iter()
         .map(|(group, roots)| ComponentArchive {
             name: component_archive_name(cfg, base, &group, generator, "COMPONENT_GROUP"),
-            roots,
+            source: ArchiveSource::Live(roots),
         })
         .chain(
             singles
                 .into_iter()
                 .map(|(component, roots)| ComponentArchive {
                     name: component_archive_name(cfg, base, &component, generator, "COMPONENT"),
-                    roots,
+                    source: ArchiveSource::Live(roots),
                 }),
         )
         .collect())
@@ -492,26 +581,25 @@ fn write_component_archive(
 fn write_recorded_archive(
     cx: &PackageContext<'_>,
     output: &ArchiveOutput<'_>,
-    roots: &[PathBuf],
-    recorded: &[&BTreeSet<PathBuf>],
+    roots: &[RecordedRoot],
 ) -> Result<(), CpackError> {
-    let roots = roots
+    let sets = roots
         .iter()
-        .map(|root| cx.staging_dir.join(root))
+        .map(|root| root.paths.iter().cloned().collect::<BTreeSet<_>>())
         .collect::<Vec<_>>();
     let mut members = BTreeSet::new();
     let mut complete = true;
-    for (root, recorded) in roots.iter().zip(recorded) {
-        component_root(cx, root)?;
-        complete &= check_recorded(cx.host, root, recorded)?;
+    for (root, recorded) in roots.iter().zip(&sets) {
+        component_root(cx, &root.dir)?;
+        complete &= check_recorded(cx.host, &root.dir, recorded)?;
         members.extend(recorded.iter().cloned());
     }
-    let inputs = top_members(&members, recorded);
-    if complete && let [root] = roots.as_slice() {
+    let inputs = top_members(&members, roots.iter().flat_map(|root| &root.paths));
+    if complete && let [root] = roots {
         return write_archive(
             cx,
             output.path,
-            root,
+            &root.dir,
             &inputs,
             output.options,
             output.header,
@@ -519,8 +607,8 @@ fn write_recorded_archive(
     }
     let merged = component_workspace(cx)?;
     let result: Result<(), CpackError> = (|| {
-        for (root, recorded) in roots.iter().zip(recorded) {
-            crate::source::merge_recorded(cx.host, root, recorded, &merged)?;
+        for (root, recorded) in roots.iter().zip(&sets) {
+            crate::source::merge_recorded(cx.host, &root.dir, recorded, &merged)?;
         }
         write_archive(
             cx,
@@ -573,13 +661,14 @@ fn check_recorded(
     Ok(complete)
 }
 
-// List the recorded paths without a recorded ancestor, one root after another. The
-// archive adds each recorded directory with its recorded children.
-fn top_members(members: &BTreeSet<PathBuf>, recorded: &[&BTreeSet<PathBuf>]) -> Vec<PathBuf> {
+// List the recorded paths without a recorded ancestor in recorded order. The archive
+// adds each recorded directory with its recorded children.
+fn top_members<'a>(
+    members: &BTreeSet<PathBuf>,
+    ordered: impl Iterator<Item = &'a PathBuf>,
+) -> Vec<PathBuf> {
     let mut seen = BTreeSet::new();
-    recorded
-        .iter()
-        .flat_map(|paths| paths.iter())
+    ordered
         .filter(|path| {
             path.ancestors()
                 .skip(1)

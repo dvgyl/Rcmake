@@ -47,6 +47,8 @@ impl Presets {
     /// List presets of this kind in declaration order.
     ///
     /// The list contains presets that can be resolved in the supplied environment.
+    /// It omits a preset whose configure preset has a false condition, although
+    /// [`Presets::resolve`] accepts that preset.
     #[must_use]
     pub fn list_visible(&self, kind: PresetKind, env: &EnvSnapshot) -> Vec<PresetSummary> {
         self.records
@@ -55,7 +57,12 @@ impl Presets {
             .flat_map(|records| records.values())
             .filter(|record| {
                 self.resolve(kind, record.summary.name.as_slice(), env)
-                    .is_ok()
+                    .is_ok_and(|preset| {
+                        preset.configure_preset.is_none_or(|configure| {
+                            self.resolve_definition(PresetKind::Configure, &configure, env)
+                                .is_ok()
+                        })
+                    })
             })
             .map(|record| record.summary.clone())
             .collect()
@@ -336,11 +343,14 @@ impl Presets {
             .map(schema::literal)
             .transpose()?;
 
+        let macro_generator = if record.hidden {
+            None
+        } else {
+            self.macro_generator(&record.summary.name)?
+        };
         let mut macros = Macros::new(self, env, Some(record), variables);
         macros.configure_name = Some(&configure_name);
-        if kind != PresetKind::Package {
-            macros.generator = generator.as_ref();
-        }
+        macros.generator = macro_generator.as_ref();
         let environment = macros
             .environment()
             .map_err(|error| expansion_error(record, error, Some("Invalid macro expansion")))?;
@@ -377,6 +387,23 @@ impl Presets {
             ),
             enabled,
         ))
+    }
+
+    // `${generator}` looks up presets by name only. A build or test preset with this
+    // name selects its configure preset. Otherwise the configure preset with this
+    // name supplies the generator.
+    fn macro_generator(&self, name: &[u8]) -> Result<Option<BString>, PresetsError> {
+        let mut configure = BString::from(name);
+        for kind in [PresetKind::Build, PresetKind::Test] {
+            if let Some(record) = self.get(kind, name) {
+                configure = optional_configure_name(record)?.unwrap_or_default();
+                break;
+            }
+        }
+        self.get(PresetKind::Configure, configure.as_slice())
+            .and_then(|config| config.fields.get(b"generator".as_slice()))
+            .map(schema::literal)
+            .transpose()
     }
 
     fn source_relative(&self, value: &mut Option<BString>) {

@@ -80,6 +80,53 @@ fn package_fields_expand_macros_once() {
 }
 
 #[test]
+fn generator_macro_looks_up_presets_by_name() {
+    let presets = root(
+        r#"{
+      "version":13,
+      "configurePresets":[
+        {"name":"cfg","generator":"Ninja","binaryDir":"out"},
+        {"name":"other","generator":"Unix Makefiles","binaryDir":"other"},
+        {"name":"same","generator":"Xcode","binaryDir":"same"}
+      ],
+      "buildPresets":[
+        {"name":"same","configurePreset":"other","targets":["${generator}"]},
+        {"name":"base","hidden":true,"configurePreset":"cfg"}
+      ],
+      "testPresets":[{"name":"same","configurePreset":"cfg",
+        "output":{"outputJUnitFile":"${generator}.xml"}}],
+      "packagePresets":[
+        {"name":"cfg","configurePreset":"other","packageName":"package-${generator}"},
+        {"name":"pkg","configurePreset":"cfg","packageName":"package-${generator}"},
+        {"name":"child","inherits":"hidden-pkg","configurePreset":"cfg"},
+        {"name":"hidden-pkg","hidden":true,"packageVersion":"v${generator}"}
+      ]
+    }"#,
+    )
+    .expect("valid presets");
+    let package_name = |name: &str| package_settings(named(&presets, PresetKind::Package, name));
+    assert_eq!(
+        package_name("cfg").package_name,
+        Some("package-Ninja".into())
+    );
+    assert_eq!(package_name("pkg").package_name, Some("package-".into()));
+    assert_eq!(package_name("child").package_version, Some("v".into()));
+    let PresetSettings::Build(build) = named(&presets, PresetKind::Build, "same").settings else {
+        panic!("build settings")
+    };
+    assert_eq!(build.targets, Some(vec!["Unix Makefiles".into()]));
+    let PresetSettings::Test(test) = named(&presets, PresetKind::Test, "same").settings else {
+        panic!("test settings")
+    };
+    assert_eq!(
+        test.output.and_then(|output| output.output_junit_file),
+        Some("Unix Makefiles.xml".into())
+    );
+    let configure = named(&presets, PresetKind::Configure, "same");
+    assert_eq!(configure.generator, Some("Xcode".into()));
+}
+
+#[test]
 fn fixtures_exclusion_replaces_inherited_object() {
     let presets = root(
         r#"{
@@ -146,6 +193,7 @@ fn build_uses_disabled_configure_preset_binary_dir() {
       "configurePresets":[
         {"name":"off","binaryDir":"${sourceDir}/out/$env{SUB}","environment":{"SUB":"tree"},
          "condition":false},
+        {"name":"on","binaryDir":"on"},
         {"name":"hidden","hidden":true,"binaryDir":"hidden"},
         {"name":"vendor","binaryDir":"vendor",
          "condition":{"type":"equals","lhs":"$vendor{x}","rhs":"y"}},
@@ -153,6 +201,7 @@ fn build_uses_disabled_configure_preset_binary_dir() {
       ],
       "buildPresets":[
         {"name":"b","configurePreset":"off"},
+        {"name":"b-on","configurePreset":"on"},
         {"name":"b-hidden","configurePreset":"hidden"},
         {"name":"b-vendor","configurePreset":"vendor"},
         {"name":"b-bad","configurePreset":"bad-macro"},
@@ -227,9 +276,15 @@ fn build_uses_disabled_configure_preset_binary_dir() {
     );
     assert_eq!(
         names(&presets, PresetKind::Build, &env),
-        [BString::from("b")]
+        [BString::from("b-on")]
     );
-    assert!(names(&presets, PresetKind::Configure, &env).is_empty());
+    for kind in [PresetKind::Test, PresetKind::Package] {
+        assert!(names(&presets, kind, &env).is_empty());
+    }
+    assert_eq!(
+        names(&presets, PresetKind::Configure, &env),
+        [BString::from("on")]
+    );
 
     for input in [
         r#"{"version":13,"buildPresets":[{"name":"b","configurePreset":"missing"}]}"#,

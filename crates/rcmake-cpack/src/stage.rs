@@ -14,7 +14,10 @@ use crate::archive_gen::ArchiveKind;
 use crate::config::{
     CpackConfig, Environment, absolute, cmake_executable, interpreter, script, snapshot,
 };
-use crate::{CPackOptions, ComponentGrouping, ComponentMembers, CpackError, error, log, safe_name};
+use crate::{
+    CPackOptions, ComponentGrouping, ComponentMembers, CpackError, InstalledComponent, error, log,
+    safe_name,
+};
 
 mod component_files;
 
@@ -40,8 +43,8 @@ pub fn stage(
 
 /// Stage the configured files and run the pre-build scripts.
 ///
-/// Returns the paths that each archive component install added, recorded before the
-/// pre-build scripts ran.
+/// Returns the archive components that the project installs staged, with the paths
+/// that each install added before the pre-build scripts ran.
 pub(crate) fn install(
     host: &Arc<dyn Host>,
     cwd: &Path,
@@ -171,7 +174,8 @@ fn install_projects(
                 }
                 let location = InstallLocation::new(cfg, destination, prefix)?;
                 ensure_dir(host.as_ref(), staging, &location.directory)?;
-                // DESTDIR installs can write outside the install prefix.
+                // CPack lists the install prefix directory, or the DESTDIR directory
+                // because DESTDIR installs can write outside the install prefix.
                 let scanned = if location.destdir.is_some() {
                     destination.clone()
                 } else {
@@ -183,14 +187,20 @@ fn install_projects(
                 install_project(host, options, cfg, &build, config, component, location)?;
                 if let Some(before) = before {
                     let after = component_files::snapshot(host.as_ref(), &scanned)?;
-                    let root = relative_install_path(subdir)?.join(component_dir(component));
-                    let offset = scanned
-                        .strip_prefix(staging.join(&root))
-                        .map_err(|err| error(err.to_string()))?;
-                    members
-                        .entry(root)
-                        .or_default()
-                        .extend(after.difference(&before).map(|path| offset.join(path)));
+                    let index = match members.iter().position(|item| &item.name == component) {
+                        Some(index) => index,
+                        None => {
+                            members.push(InstalledComponent {
+                                name: component.clone(),
+                                group: component_group(cfg, component).map(BString::from),
+                                files: Vec::new(),
+                            });
+                            members.len() - 1
+                        }
+                    };
+                    if let Some(item) = members.get_mut(index) {
+                        item.files.extend(after.difference(&before).cloned());
+                    }
                 }
             }
         }

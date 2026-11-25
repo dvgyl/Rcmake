@@ -15,7 +15,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -107,11 +107,21 @@ pub enum ComponentGrouping {
     Ignore,
 }
 
-/// Paths that each archive component install added before the pre-build scripts ran.
-///
-/// Each key is a component root relative to the staging directory. Each value holds
-/// paths relative to that root, including directories and symbolic links.
-pub type ComponentMembers = BTreeMap<PathBuf, BTreeSet<PathBuf>>;
+/// One archive component that the project installs staged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstalledComponent {
+    /// Component name.
+    pub name: BString,
+    /// Component group (`CPACK_COMPONENT_<NAME>_GROUP`) when the component was installed.
+    pub group: Option<BString>,
+    /// Paths that the installs of this component added before the pre-build scripts ran,
+    /// in install order. Each path is relative to the install prefix directory of the
+    /// component, or to its `DESTDIR` directory when `DESTDIR` staging is on.
+    pub files: Vec<PathBuf>,
+}
+
+/// Archive components that the project installs staged, in install order.
+pub type ComponentMembers = Vec<InstalledComponent>;
 
 /// Everything a [`PackageGenerator`] needs for one package run.
 pub struct PackageContext<'a> {

@@ -73,6 +73,61 @@ endif()
 }
 
 #[test]
+fn empty_package_preset_strings_use_the_configuration() {
+    let host = memory_host();
+    write(
+        host.as_ref(),
+        "/work/CMakePresets.json",
+        br#"{
+        "version": 13,
+        "configurePresets": [{"name": "cfg", "generator": "Ninja", "binaryDir": "out"}],
+        "packagePresets": [{
+            "name": "pkg", "configurePreset": "cfg", "generators": ["TGZ"],
+            "configFile": "$env{RCMAKE_TEST_UNSET}",
+            "packageName": "$env{RCMAKE_TEST_UNSET}",
+            "vendorName": "$env{RCMAKE_TEST_UNSET}",
+            "variables": {"CPACK_EMPTY_VALUE": "$env{RCMAKE_TEST_UNSET}"}
+        }]
+    }"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/out/CPackConfig.cmake",
+        br#"
+set(CPACK_PACKAGE_NAME default-name)
+set(CPACK_PACKAGE_VENDOR default-vendor)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME default-file)
+set(CPACK_EMPTY_VALUE from-config)
+set(CPACK_INSTALLED_DIRECTORIES "/work/input;/")
+set(CPACK_POST_BUILD_SCRIPTS "/work/check.cmake")
+"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/check.cmake",
+        br#"
+if(NOT CPACK_PACKAGE_NAME STREQUAL "default-name"
+    OR NOT CPACK_PACKAGE_VENDOR STREQUAL "default-vendor"
+    OR NOT CPACK_EMPTY_VALUE STREQUAL "")
+  message(FATAL_ERROR "Unexpected preset values")
+endif()
+"#,
+    );
+    write(host.as_ref(), "/work/input/content", b"data");
+    assert_eq!(
+        invoke(host.clone(), &["--preset", "pkg"]),
+        0,
+        "{}",
+        stderr(&host)
+    );
+    assert_eq!(
+        kind(host.as_ref(), Path::new("/work/out/default-file.tar.gz")),
+        Some(FileKind::File)
+    );
+}
+
+#[test]
 fn installed_directory_pairs_use_packaging_prefix_without_destdir() {
     let host = memory_host();
     write(
@@ -338,6 +393,7 @@ file(WRITE "${root}/nested/before" "updated")
 file(WRITE "${root}/nested/after" "hook")
 file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/runtime/marker" "hook")
 file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/docs/usr/extra.txt" "hook")
+set(CPACK_COMPONENTS_ALL "")
 "#,
     );
     assert_eq!(invoke(host.clone(), &[]), 0, "{}", stderr(&host));
@@ -373,6 +429,7 @@ file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/docs/usr/extra.txt" "hook")
         Path::new("/work/unpacked/docs"),
     );
     assert_eq!(file_names(&docs), ["usr/doc.txt"]);
+    assert_eq!(kind(host.as_ref(), Path::new("/work/demo.tar.gz")), None);
 
     write(
         host.as_ref(),
@@ -430,7 +487,7 @@ set(CPACK_PACKAGE_NAME demo)
 set(CPACK_PACKAGE_VERSION 1)
 set(CPACK_PACKAGE_FILE_NAME demo)
 set(CPACK_CMAKE_GENERATOR Ninja)
-set(CPACK_INSTALL_CMAKE_PROJECTS "/work/one;One;ALL;/;/work/two;Two;ALL;/sub")
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/one;One;ALL;/;/work/two;Two;ALL;/")
 set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
 set(CPACK_COMPONENTS_ALL "runtime;docs")
 set(CPACK_COMPONENT_RUNTIME_GROUP Main)
@@ -440,6 +497,7 @@ set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
 set(CPACK_PRE_BUILD_SCRIPTS "/work/pre.cmake")
 "#,
     );
+    // Both components install `shared.txt`. A group archive accepts identical copies.
     let install = |project: &str, shared: &str| {
         format!(
             r#"
@@ -447,6 +505,7 @@ if(CMAKE_INSTALL_COMPONENT STREQUAL "runtime")
   file(WRITE "${{CMAKE_INSTALL_PREFIX}}/shared.txt" "{shared}")
   file(WRITE "${{CMAKE_INSTALL_PREFIX}}/{project}.txt" "{project}")
 else()
+  file(WRITE "${{CMAKE_INSTALL_PREFIX}}/shared.txt" "same")
   file(WRITE "${{CMAKE_INSTALL_PREFIX}}/{project}-doc.txt" "{project}")
 endif()
 "#
@@ -467,7 +526,7 @@ endif()
         "/work/pre.cmake",
         br#"
 file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/runtime/demo/usr/hook-only" "one")
-file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/sub/runtime/demo/usr/hook-only" "two")
+file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/docs/demo/usr/hook-only" "two")
 "#,
     );
     assert_eq!(invoke(host.clone(), &[]), 0, "{}", stderr(&host));
@@ -488,15 +547,100 @@ file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/sub/runtime/demo/usr/hook-only" "two")
         b"same"
     );
 
-    write(
-        host.as_ref(),
-        "/work/two/cmake_install.cmake",
-        install("two", "different").as_bytes(),
-    );
+    for project in ["one", "two"] {
+        write(
+            host.as_ref(),
+            format!("/work/{project}/cmake_install.cmake"),
+            install(project, "different").as_bytes(),
+        );
+    }
     assert_eq!(invoke(host.clone(), &["-B", "/work/conflict"]), 1);
     assert!(
         stderr(&host).contains("The data in files with the same filename is different"),
         "{}",
         stderr(&host)
     );
+}
+
+#[test]
+fn component_archives_read_recorded_paths_from_the_component_directory() {
+    let host = memory_host();
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+set(CPACK_GENERATOR TGZ)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/one;One;ALL;/;/work/two;Two;ALL;/sub")
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_ALL runtime)
+set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+"#,
+    );
+    for project in ["one", "two"] {
+        write(
+            host.as_ref(),
+            format!("/work/{project}/cmake_install.cmake"),
+            format!(r#"file(WRITE "${{CMAKE_INSTALL_PREFIX}}/{project}.txt" "{project}")"#)
+                .as_bytes(),
+        );
+    }
+    // The second project installs below `sub/runtime`, but CPack reads `runtime`.
+    assert_eq!(invoke(host.clone(), &[]), 1);
+    assert!(
+        stderr(&host).contains("CPack cannot read the installed component file"),
+        "{}",
+        stderr(&host)
+    );
+
+    let host = memory_host();
+    write(host.as_ref(), "/work/build/file", b"data");
+    write(
+        host.as_ref(),
+        "/work/build/cmake_install.cmake",
+        br#"file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/nested" TYPE FILE FILES "/work/build/file")"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+set(CPACK_GENERATOR TGZ)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_ALL runtime)
+set(CPACK_SET_DESTDIR ON)
+set(CPACK_INSTALL_PREFIX "/opt")
+set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
+"#,
+    );
+    // With DESTDIR, the recorded paths contain the install prefix and CPack adds the
+    // packaging prefix, so `usr/opt/nested` does not exist.
+    assert_eq!(invoke(host.clone(), &["-B", "/work/destdir"]), 1);
+    assert!(
+        stderr(&host).contains("CPack cannot read the installed component file"),
+        "{}",
+        stderr(&host)
+    );
+    assert_eq!(
+        invoke(
+            host.clone(),
+            &["-B", "/work/root", "-DCPACK_PACKAGING_INSTALL_PREFIX=/"]
+        ),
+        0,
+        "{}",
+        stderr(&host)
+    );
+    let tree = extract(
+        host.as_ref(),
+        Path::new("/work/root/demo-runtime.tar.gz"),
+        Path::new("/work/root/unpacked"),
+    );
+    assert_eq!(file_names(&tree), ["opt/nested/file"]);
 }

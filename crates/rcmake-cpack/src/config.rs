@@ -120,17 +120,26 @@ pub(crate) fn resolve_options(
             }
             environment = preset.environment;
             if let PresetSettings::Package(settings) = preset.settings {
-                cli.config_file = cli.config_file.or(settings.config_file);
-                cli.generators = cli
-                    .generators
-                    .or_else(|| settings.generators.as_ref().map(list::join));
-                cli.build_config = cli
-                    .build_config
-                    .or_else(|| settings.configurations.as_ref().map(list::join));
-                cli.package_name = cli.package_name.or(settings.package_name);
-                cli.package_version = cli.package_version.or(settings.package_version);
-                cli.package_directory = cli.package_directory.or(settings.package_directory);
-                cli.vendor = cli.vendor.or(settings.vendor_name);
+                // An empty value on either side counts as absent.
+                let choose = |given: Option<BString>, preset: Option<BString>| {
+                    given
+                        .filter(|value| !value.is_empty())
+                        .or(preset.filter(|value| !value.is_empty()))
+                };
+                cli.config_file = choose(cli.config_file.take(), settings.config_file);
+                cli.generators = choose(
+                    cli.generators.take(),
+                    settings.generators.as_ref().map(list::join),
+                );
+                cli.build_config = choose(
+                    cli.build_config.take(),
+                    settings.configurations.as_ref().map(list::join),
+                );
+                cli.package_name = choose(cli.package_name.take(), settings.package_name);
+                cli.package_version = choose(cli.package_version.take(), settings.package_version);
+                cli.package_directory =
+                    choose(cli.package_directory.take(), settings.package_directory);
+                cli.vendor = choose(cli.vendor.take(), settings.vendor_name);
                 let mut defines: Vec<_> =
                     settings.variables.unwrap_or_default().into_iter().collect();
                 defines.append(&mut cli.defines);
