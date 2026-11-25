@@ -88,6 +88,7 @@ impl ChildConfig {
             imports,
             save_cache,
             source_signature,
+            generator_facts,
         } = build;
         let mut recursion_exceeded = false;
         let mut failure = None;
@@ -147,7 +148,13 @@ impl ChildConfig {
                     BString::default(),
                 ));
             }
-            build_child(&mut child.cx(), &dirs.binary, target, source_signature)
+            build_child(
+                &mut child.cx(),
+                &dirs.binary,
+                target,
+                source_signature,
+                generator_facts,
+            )
         });
         let (outcome, artifact, header) = match built {
             Ok(values) => values,
@@ -195,4 +202,5 @@ pub(super) struct ChildBuild<'a> {
     pub(super) imports: Vec<(Target, Vec<BString>)>,
     pub(super) save_cache: bool,
     pub(super) source_signature: bool,
+    pub(super) generator_facts: Option<Arc<dyn rcmake_resolve::GeneratorFacts>>,
 }

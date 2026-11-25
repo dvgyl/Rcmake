@@ -9,6 +9,8 @@ use rcmake_eval::{Cx, LedgerLevel, ProbeCacheMode, Services};
 use rcmake_host::{FileKind, Follow, Host, ReadRange, path};
 use rcmake_store::{Digest, Domain, KeyHasher, StoreConfig, StoreMode, file_digest};
 
+use crate::configure::build_tool_facts::BuildToolFacts;
+
 use super::args::{Options, Signature, Source};
 use super::cache::{Artifact, ObservedOutcome, ProbeCache, VerifyContext};
 use super::journal::{CompileIntervals, Journal, JournalHost};
@@ -100,6 +102,84 @@ impl ProbeRuntime {
             file_digest(self.host.as_ref(), &exe).ok()
         })
     }
+}
+
+pub(super) struct ProbeGeneratorFacts {
+    pub(super) real: Arc<dyn Host>,
+    pub(super) facts: Arc<BuildToolFacts>,
+    pub(super) journal: Option<Arc<JournalHost<'static>>>,
+    pub(super) memo: Arc<rcmake_store::TraceMemo>,
+}
+
+impl rcmake_resolve::GeneratorFacts for ProbeGeneratorFacts {
+    fn ninja_cxx_dyndep(&self, host: &dyn Host, request: &rcmake_host::RunRequest) -> Option<bool> {
+        use rcmake_resolve::query_ninja_cxx_dyndep;
+
+        let program = path::to_native(&request.pipeline.first()?.program);
+        let fallback = || query_ninja_cxx_dyndep(host, request);
+        if !program.is_absolute() || !compiler::admit_environment(&request.env) {
+            return fallback();
+        }
+        let Some(canonical) = self.real.canonicalize(&program).ok() else {
+            return fallback();
+        };
+        // The capability contract applies to native Ninja programs.
+        // A script can read its working directory or run other programs.
+        if !native_ninja(self.real.as_ref(), &canonical) {
+            return fallback();
+        }
+        let Some(digest) = self.memo.file_digest(self.real.as_ref(), &program).ok() else {
+            return fallback();
+        };
+        if self.journal.as_ref().is_some_and(|journal| {
+            journal
+                .record_generator_dependency(&program, digest)
+                .is_err()
+        }) {
+            return fallback();
+        }
+        let result = self.facts.ninja_cxx_dyndep(
+            self.real.as_ref(),
+            request,
+            program.clone(),
+            digest,
+            environment_fingerprint(&request.env),
+        );
+        if let Some(journal) = &self.journal {
+            if result.is_none()
+                || journal
+                    .record_generator_dependency(&program, digest)
+                    .is_err()
+            {
+                journal.reject_generator_fact();
+            }
+        }
+        result
+    }
+}
+
+fn native_ninja(host: &dyn Host, path: &Path) -> bool {
+    if !path.file_stem().is_some_and(|name| name == "ninja") {
+        return false;
+    }
+    host.read(
+        path,
+        ReadRange::Slice {
+            offset: 0,
+            len: Some(4),
+        },
+    )
+    .is_ok_and(|bytes| {
+        matches!(
+            bytes.as_slice(),
+            b"\x7fELF"
+                | [b'M', b'Z', ..]
+                | b"\xcf\xfa\xed\xfe"
+                | b"\xfe\xed\xfa\xcf"
+                | b"\xca\xfe\xba\xbe"
+                | b"\xca\xfe\xba\xbf"
+        )
+    })
 }
 
 pub(super) struct PreparedProbe {
@@ -335,6 +415,10 @@ impl PreparedProbe {
             diagnostics: BString::default(),
             failure: None,
         })
+    }
+
+    pub(super) fn trace_memo(&self) -> Arc<rcmake_store::TraceMemo> {
+        Arc::clone(&self.runtime.cache.memo)
     }
 
     pub(super) fn journal(&self, dirs: &ProbeDirs) -> Option<Arc<JournalHost<'static>>> {

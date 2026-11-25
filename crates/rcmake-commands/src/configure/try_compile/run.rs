@@ -25,6 +25,7 @@ pub(super) fn build_child(
     directory: &Path,
     target: Option<&[u8]>,
     source_signature: bool,
+    generator_facts: Option<std::sync::Arc<dyn rcmake_resolve::GeneratorFacts>>,
 ) -> Result<(BuildOutcome, Option<PathBuf>, BString), ChildError> {
     let config = ConfigId(child.var_or_empty(b"CMAKE_BUILD_TYPE"));
     let mut model = child.project().clone();
@@ -36,7 +37,12 @@ pub(super) fn build_child(
         }
     }
     apple::resolve(child, &mut model, directory, &config).map_err(ChildError::Generate)?;
-    let graph = rcmake_resolve::resolve(&model, child.host(), std::slice::from_ref(&config))
+    let configs = std::slice::from_ref(&config);
+    let resolved = match generator_facts {
+        Some(facts) => rcmake_resolve::resolve_with_facts(&model, child.host(), configs, facts),
+        None => rcmake_resolve::resolve(&model, child.host(), configs),
+    };
+    let graph = resolved
         .map_err(|error| ChildError::Generate(error.to_string()))?
         .graphs
         .into_iter()

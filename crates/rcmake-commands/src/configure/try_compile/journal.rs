@@ -601,6 +601,29 @@ impl<'a> JournalHost<'a> {
         self.record_dependency_since(path, None)
     }
 
+    pub(super) fn record_generator_dependency(
+        &self,
+        path: &Path,
+        digest: Digest,
+    ) -> HostResult<()> {
+        if self.private_path(path) {
+            return Err(HostError::unsupported(
+                "The Ninja program is in probe scratch space.",
+            ));
+        }
+        self.record_dependency(path)?;
+        let mut state = self.state();
+        state.stamp(InputStamp::FileHash {
+            path: path.to_owned(),
+            digest,
+        });
+        Ok(())
+    }
+
+    pub(super) fn reject_generator_fact(&self) {
+        self.mark_impure(ImpureReason::UnverifiedProcess);
+    }
+
     fn record_dependency_since(
         &self,
         path: &Path,

@@ -18,7 +18,7 @@ use super::super::journal::{
 };
 use super::super::plan::{ProbeRecipe, Templated, compute_probe_key};
 use super::super::{ProbeDirs, ProbeResult};
-use super::{PreparedProbe, ProbeRuntime, compiler};
+use super::{PreparedProbe, ProbeGeneratorFacts, ProbeRuntime, compiler};
 
 impl ProbeRuntime {
     pub(in crate::configure) fn evaluate<R>(
@@ -155,6 +155,9 @@ impl PreparedProbe {
             let child = child.clone();
             let bound = self.bound.clone();
             let intervals = self.runtime.intervals.clone();
+            let facts = cx
+                .session_data::<Arc<crate::configure::build_tool_facts::BuildToolFacts>>()
+                .cloned();
             queue.submit(
                 recipe,
                 environment.clone(),
@@ -167,6 +170,7 @@ impl PreparedProbe {
                         child,
                         bound,
                         intervals,
+                        facts,
                     };
                     execution.run(scratch, recipe, environment, budget)
                 })),
@@ -184,6 +188,7 @@ struct SpeculativeExecution {
     child: ChildConfig,
     bound: std::collections::BTreeSet<PathBuf>,
     intervals: Option<Arc<CompileIntervals>>,
+    facts: Option<Arc<crate::configure::build_tool_facts::BuildToolFacts>>,
 }
 
 impl SpeculativeExecution {
@@ -200,11 +205,21 @@ impl SpeculativeExecution {
             budget.shutdown.clone(),
         );
         let journal = Arc::new(
-            JournalHost::from_shared(self.host, scratch, self.compiler, JournalMode::Speculate)?
-                .with_trace_memo(self.memo)
-                .with_bound_inputs(self.bound)
-                .with_compile_intervals(self.intervals)
-                .with_speculation(environment, budget.cancel, budget.shutdown, budget.deadline),
+            JournalHost::from_shared(
+                self.host.clone(),
+                scratch,
+                self.compiler,
+                JournalMode::Speculate,
+            )?
+            .with_trace_memo(self.memo.clone())
+            .with_bound_inputs(self.bound)
+            .with_compile_intervals(self.intervals)
+            .with_speculation(
+                environment,
+                budget.cancel,
+                budget.shutdown,
+                budget.deadline,
+            ),
         );
         for (name, template) in &recipe.files {
             let file = path::to_native(name);
@@ -235,6 +250,14 @@ impl SpeculativeExecution {
                 imports: Vec::new(),
                 save_cache: false,
                 source_signature: true,
+                generator_facts: self.facts.map(|facts| {
+                    Arc::new(ProbeGeneratorFacts {
+                        real: self.host,
+                        facts,
+                        journal: Some(journal.clone()),
+                        memo: self.memo,
+                    }) as Arc<dyn rcmake_resolve::GeneratorFacts>
+                }),
             },
             |_| {},
         );

@@ -352,6 +352,21 @@ fn build_probe(
     #[cfg(all(feature = "native", any(unix, windows)))]
     let journal = cached_probe.as_ref().and_then(|probe| probe.journal(dirs));
     #[cfg(all(feature = "native", any(unix, windows)))]
+    let generator_facts = cx
+        .session_data::<std::sync::Arc<super::build_tool_facts::BuildToolFacts>>()
+        .map(|facts| {
+            std::sync::Arc::new(active::ProbeGeneratorFacts {
+                real: parent.clone(),
+                facts: facts.clone(),
+                journal: journal.clone(),
+                memo: cached_probe
+                    .as_ref()
+                    .map_or_else(Default::default, active::PreparedProbe::trace_memo),
+            }) as std::sync::Arc<dyn rcmake_resolve::GeneratorFacts>
+        });
+    #[cfg(not(all(feature = "native", any(unix, windows))))]
+    let generator_facts = None;
+    #[cfg(all(feature = "native", any(unix, windows)))]
     let parent = journal.as_ref().map_or(parent, |host| {
         std::sync::Arc::clone(host) as std::sync::Arc<dyn Host>
     });
@@ -364,6 +379,7 @@ fn build_probe(
             imports,
             save_cache,
             source_signature,
+            generator_facts,
         },
         |child| crate::hermetic::inherit(cx, child),
     );

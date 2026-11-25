@@ -71,6 +71,10 @@ impl ConfigureRuntime {
             hermetic.install(interp);
         }
         #[cfg(all(feature = "native", any(unix, windows)))]
+        if self.hermetic.is_none() {
+            interp.add_session_data(Arc::new(super::build_tool_facts::BuildToolFacts::default()));
+        }
+        #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(native) = &self.native {
             native.attach(interp);
         }
