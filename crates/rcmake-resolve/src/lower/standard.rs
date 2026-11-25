@@ -221,23 +221,20 @@ fn other_standard_flag(
     } else {
         b"_STANDARD_COMPILE_OPTION"
     };
-    let flag = paired
-        .and_then(|_| {
-            definition(
-                model,
-                target.dir,
-                &[b"CMAKE_", language, standard, option].concat(),
-            )
-        })
-        .or_else(|| {
-            definition(
-                model,
-                target.dir,
-                &[b"CMAKE_", language, b"_", standard, option].concat(),
-            )
-        });
+    let flag = definition(
+        model,
+        target.dir,
+        &[b"CMAKE_", language, standard, option].concat(),
+    )
+    .or_else(|| {
+        definition(
+            model,
+            target.dir,
+            &[b"CMAKE_", language, b"_", standard, option].concat(),
+        )
+    });
     if let Some(flag) = flag {
-        return Some(standard_options(flag));
+        return (!flag.is_empty()).then(|| standard_options(flag));
     }
     let dialect: &[u8] = match (language, extensions) {
         (b"CXX" | b"OBJCXX", true) => b"gnu++",
