@@ -212,6 +212,9 @@ opt-level = "z"
 [profile.release.package.rcmake-commands]
 opt-level = "s"
 
+[profile.release.package.rcmake-gen-common]
+opt-level = "s"
+
 [profile.size-probe]
 inherits = "release"
 strip = false
@@ -248,4 +251,7 @@ opt-level = "z"
 opt-level = "z"
 
 [profile.wasm-release.package.rcmake-commands]
+opt-level = "z"
+
+[profile.wasm-release.package.rcmake-gen-common]
 opt-level = "z"
