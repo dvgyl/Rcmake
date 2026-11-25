@@ -1,5 +1,8 @@
 //! The arena-based [`ProjectModel`] and its scoped property API.
 
+/// Snapshot helpers for incremental configure replay.
+pub mod replay;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::{IndexMap, IndexSet};
