@@ -33,6 +33,24 @@ pub(super) fn set_target_prop(
                 if let Some(entries) = target.direct_link_slot(name) {
                     *entries = value.clone().map(|value| vec![entry(value)]);
                 }
+                if matches!(
+                    name,
+                    b"C_STANDARD"
+                        | b"CXX_STANDARD"
+                        | b"CUDA_STANDARD"
+                        | b"HIP_STANDARD"
+                        | b"OBJC_STANDARD"
+                        | b"OBJCXX_STANDARD"
+                        | b"SYCL_CXX_STANDARD"
+                ) {
+                    if value.is_some() {
+                        target
+                            .standard_origins
+                            .insert(name.into(), origin.backtrace.clone());
+                    } else {
+                        target.standard_origins.shift_remove(name);
+                    }
+                }
                 set_map(&mut target.props, name, value);
             }
         },
@@ -41,6 +59,14 @@ pub(super) fn set_target_prop(
 }
 
 impl Target {
+    /// Return the origin of a language standard property write or initializer.
+    #[must_use]
+    pub fn standard_origin(&self, property: &[u8]) -> &Backtrace {
+        self.standard_origins
+            .get(property)
+            .unwrap_or(&self.backtrace)
+    }
+
     /// Return the recorded entries for a direct link interface property.
     #[must_use]
     pub fn direct_link_entries(&self, name: &[u8]) -> Option<&[BT<BString>]> {

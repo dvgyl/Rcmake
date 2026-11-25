@@ -8,7 +8,9 @@ use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_genex::EvalContext;
 use rcmake_model::{BT, CustomCommandKind, Target, TargetId, TargetKind, UsageField};
 use rcmake_resolve::{
-    BuildStep, CompileGroup, ResolvedTarget, lower::codemodel_compile_flags, usage::UsageResolver,
+    BuildStep, CompileGroup, ResolvedTarget,
+    lower::{LanguageStandard, codemodel_compile_info},
+    usage::UsageResolver,
 };
 
 use crate::GenError;
@@ -446,6 +448,7 @@ fn add_rule(sources: &mut Vec<Source>, mut output: BString, trace: &Backtrace) {
 
 struct CompileData {
     group: CompileGroup,
+    standard: Option<LanguageStandard>,
     headers: Vec<BT<BString>>,
     flags: Vec<BT<BString>>,
 }
@@ -464,9 +467,12 @@ impl CompileData {
             |error: rcmake_resolve::ResolveError| GenError::Invalid(error.to_string().into());
         let mut group = group.clone();
         let mut flags = Vec::new();
+        let mut standard = None;
         if let Some(raw) = raw {
-            let base = codemodel_compile_flags(api.model, raw, &target.config, &group, usage)
-                .map_err(error)?;
+            let (base, language_standard) =
+                codemodel_compile_info(api.model, raw, &target.config, &group, usage)
+                    .map_err(error)?;
+            standard = language_standard;
             if !base.is_empty() {
                 flags.push(BT::new(base, Backtrace::default()));
             }
@@ -518,6 +524,7 @@ impl CompileData {
         headers.retain(|header| !header.value.is_empty() && seen.insert(header.value.clone()));
         Ok(Self {
             group,
+            standard,
             headers,
             flags,
         })
@@ -528,6 +535,19 @@ impl CompileData {
             ("language", Value::string(self.group.language)),
             ("sourceIndexes", array(sources.into_iter().map(number))),
         ]);
+        if let Some(standard) = self.standard {
+            let mut entry = members([("standard", Value::string(standard.value))]);
+            optional_array(
+                &mut entry,
+                "backtraces",
+                standard
+                    .backtraces
+                    .iter()
+                    .filter_map(|trace| graph.add(trace))
+                    .map(number),
+            );
+            body.insert("languageStandard".into(), Object(entry));
+        }
         for (field, key, items) in [
             ("compileCommandFragments", "fragment", self.flags),
             ("defines", "define", self.group.defines),

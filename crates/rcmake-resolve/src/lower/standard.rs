@@ -2,13 +2,101 @@
 
 use rcmake_base::{BString, list, shell::quote, truth};
 use rcmake_diag::{
-    Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus, RenderOptions, render,
+    Backtrace, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus, RenderOptions,
+    render,
 };
 use rcmake_model::{BT, DirId, ProjectModel, Target};
 
 use super::shell::join_words;
 use super::{definition, target_property};
 use crate::ResolveError;
+
+/// A language standard property and the calls that contributed to its value.
+pub struct LanguageStandard {
+    /// Selected standard, such as `17` for C++17.
+    pub value: BString,
+    /// Property write or compile feature backtraces in encounter order.
+    pub backtraces: Vec<Backtrace>,
+}
+
+pub(super) fn codemodel_standard(
+    model: &ProjectModel,
+    target: &Target,
+    language: &[u8],
+    features: &[BT<BString>],
+) -> Option<LanguageStandard> {
+    let standard = language_standard(model, target, language, features);
+    let paired = match language {
+        b"OBJC" => b"C".as_slice(),
+        b"OBJCXX" | b"CUDA" | b"HIP" => b"CXX".as_slice(),
+        _ => return standard,
+    };
+    standard.or_else(|| {
+        let mut standard = language_standard(model, target, paired, features).or_else(|| {
+            Some(LanguageStandard {
+                value: default_standard(model, target, paired)?.into(),
+                backtraces: Vec::new(),
+            })
+        })?;
+        if language == b"CUDA" && standard.value == "98" {
+            standard.value = "03".into();
+        }
+        Some(standard)
+    })
+}
+
+fn language_standard(
+    model: &ProjectModel,
+    target: &Target,
+    language: &[u8],
+    features: &[BT<BString>],
+) -> Option<LanguageStandard> {
+    let property = if language == b"SYCL" {
+        b"SYCL_CXX_STANDARD".to_vec()
+    } else {
+        [language, b"_STANDARD"].concat()
+    };
+    let explicit = target
+        .props
+        .get(&property)
+        .filter(|value| !value.is_empty());
+    let default = default_standard(model, target, language);
+    let mut value = explicit.map(|value| value.as_slice());
+    let mut backtraces = Vec::new();
+    for feature in features {
+        let Some(required) = feature_standard(language, &feature.value) else {
+            continue;
+        };
+        if rank(language, required) > value.or(default).and_then(|value| rank(language, value)) {
+            value = Some(required);
+            backtraces.clear();
+        }
+        if value.is_some() {
+            backtraces.push(feature.backtrace.clone());
+        }
+    }
+    if backtraces.is_empty() && explicit.is_some() {
+        backtraces.push(target.standard_origin(&property).clone());
+    }
+    Some(LanguageStandard {
+        value: value?.into(),
+        backtraces,
+    })
+}
+
+fn default_standard<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+    language: &[u8],
+) -> Option<&'a [u8]> {
+    definition(
+        model,
+        target.dir,
+        &[b"CMAKE_", language, b"_STANDARD_DEFAULT"].concat(),
+    )
+    .map(|value| value.as_slice())
+    .filter(|value| !value.is_empty())
+}
 
 pub(crate) fn required_standard(
     language: &[u8],

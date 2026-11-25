@@ -13,7 +13,7 @@ use super::launcher;
 use super::pch::PchFlags;
 use super::policy_flags::Flags;
 use super::shell::{command, join_words, raw_flags, rule_invocations};
-use super::standard::checked_standard_flag;
+use super::standard::{LanguageStandard, checked_standard_flag, codemodel_standard};
 use super::{
     definition, expand_rule, join, object_path, target_property, without_trailing_slashes,
 };
@@ -128,16 +128,16 @@ fn compile_flags(
     Ok(flags)
 }
 
-/// Compute the compiler flags that apply to a target's language as a whole.
-pub fn codemodel_compile_flags(
+/// Compute the compiler flags and language standard for a File API compile group.
+pub fn codemodel_compile_info(
     model: &ProjectModel,
     target: &Target,
     config: &ConfigId,
     group: &CompileGroup,
     usage: &mut UsageResolver<'_>,
-) -> Result<BString, ResolveError> {
+) -> Result<(BString, Option<LanguageStandard>), ResolveError> {
     let Some(id) = model.find_target(target.dir, &target.name) else {
-        return Ok(BString::default());
+        return Ok((BString::default(), None));
     };
     let context = EvalContext {
         config: config.clone(),
@@ -146,7 +146,9 @@ pub fn codemodel_compile_flags(
     };
     let features = usage.collect(id, rcmake_model::UsageField::CompileFeatures, &context)?;
     let standard = super::required_standard(&group.language, &features.entries);
-    compile_flags(model, target, config, group, standard, None, None).map(join_words)
+    let flags = compile_flags(model, target, config, group, standard, None, None)?;
+    let standard = codemodel_standard(model, target, &group.language, &features.entries);
+    Ok((join_words(flags), standard))
 }
 
 fn compile_argument(model: &ProjectModel, target: &Target, prefix: &[u8], value: &[u8]) -> BString {

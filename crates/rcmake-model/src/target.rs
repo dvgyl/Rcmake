@@ -428,6 +428,7 @@ pub struct Target {
     pub policies: TargetPolicySnapshot,
     /// Properties that are not usage requirements or sources.
     pub props: PropertyMap,
+    pub(crate) standard_origins: indexmap::IndexMap<BString, Backtrace>,
     pub(crate) direct_links: Option<Vec<BT<BString>>>,
     pub(crate) direct_excludes: Option<Vec<BT<BString>>>,
     /// Usage requirements.
@@ -461,6 +462,7 @@ impl Target {
             backtrace,
             policies: TargetPolicySnapshot { policies },
             props: PropertyMap::default(),
+            standard_origins: indexmap::IndexMap::new(),
             direct_links: None,
             direct_excludes: None,
             usage: UsageProps::default(),
