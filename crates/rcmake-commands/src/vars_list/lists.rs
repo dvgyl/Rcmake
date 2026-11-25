@@ -299,7 +299,9 @@ fn list_number(cx: &mut Cx<'_>, arg: &[u8]) -> Result<i64, CmdError> {
             c_long::MAX
         }
     });
-    Ok(i64::from(value as i32))
+    #[allow(clippy::unnecessary_cast)] // c_long is i32 on Windows/wasm32 and i64 on 64-bit Unix.
+    let narrowed = value as i32;
+    Ok(i64::from(narrowed))
 }
 
 fn signed_len(len: usize) -> i64 {
