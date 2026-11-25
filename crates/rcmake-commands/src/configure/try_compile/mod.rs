@@ -320,6 +320,9 @@ fn build_probe(
             value,
         });
     }
+    if let Some(languages) = &probe_languages {
+        seed.probe_languages.clone_from(languages);
+    }
     let save_cache = dirs.scratch.is_none() || cx.var_is_on(b"CMAKE_DEBUG_TRY_COMPILE");
     #[cfg(all(feature = "native", any(unix, windows)))]
     let mut cached_probe = if run_var.is_none() {

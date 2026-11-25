@@ -152,14 +152,13 @@ impl rcmake_resolve::GeneratorFacts for ProbeGeneratorFacts {
             digest,
             process_environment_fingerprint(&request.env),
         );
-        if let Some(journal) = &self.journal {
-            if result.is_none()
+        if let Some(journal) = &self.journal
+            && (result.is_none()
                 || journal
                     .record_generator_dependency(&program, digest)
-                    .is_err()
-            {
-                journal.reject_generator_fact();
-            }
+                    .is_err())
+        {
+            journal.reject_generator_fact();
         }
         result
     }
@@ -586,30 +585,34 @@ fn seed_digest(
     key.field(11, &seed.enabled_languages);
     let platform = path::to_native(&cx.var_or_empty(b"CMAKE_PLATFORM_INFO_DIR"));
     if platform.is_absolute() {
-        let mut entries = host.read_dir(&platform).ok()?;
-        bound.insert(platform.clone());
-        if entries.len() > 256 {
+        if host.metadata(&platform, Follow::Yes).ok()?.kind != FileKind::Dir {
             return None;
         }
-        entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-        for file in entries
-            .into_iter()
-            .filter(|file| file.name.ends_with(b".cmake"))
-        {
-            if file.kind != FileKind::File
-                || !file
-                    .name
-                    .iter()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(byte))
-            {
+        bound.insert(platform.clone());
+        let mut files = vec![BString::from("CMakeSystem.cmake")];
+        for language in &seed.probe_languages {
+            if !language.iter().all(u8::is_ascii_alphanumeric) {
                 return None;
             }
-            let file_path = platform.join(path::to_native(&file.name));
+            files.push(format!("CMake{language}Compiler.cmake").into());
+        }
+        files.sort_unstable();
+        files.dedup();
+        for name in files {
+            key.field(12, &name);
+            let file_path = platform.join(path::to_native(&name));
+            match host.metadata(&file_path, Follow::No) {
+                Ok(stat) if stat.kind == FileKind::File => {}
+                Err(error) if error.kind == std::io::ErrorKind::NotFound => {
+                    key.field(14, b"missing");
+                    continue;
+                }
+                _ => return None,
+            }
             let bytes = host
                 .read(&file_path, ReadRange::All { limit: 1 << 20 })
                 .ok()?;
             bound.insert(file_path);
-            key.field(12, &file.name);
             key.field(
                 13,
                 Templated::capture(&bytes, bindings)?.digest().as_bytes(),

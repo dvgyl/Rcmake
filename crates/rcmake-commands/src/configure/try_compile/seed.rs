@@ -51,6 +51,7 @@ const PLATFORM_VARIABLES: &[&[u8]] = &[
 pub(super) struct TryCompileSeed {
     pub(super) defines: Vec<CacheDefine>,
     pub(super) enabled_languages: BString,
+    pub(super) probe_languages: Vec<BString>,
 }
 
 pub(super) fn toolchain_variable(name: &[u8]) -> bool {
@@ -249,6 +250,7 @@ impl TryCompileSeed {
         Self {
             defines,
             enabled_languages: list::join(enabled_languages(cx)),
+            probe_languages: Vec::new(),
         }
     }
 }
