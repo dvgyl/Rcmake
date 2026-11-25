@@ -20,6 +20,29 @@ pub mod server;
 mod uri;
 mod workspace;
 
+#[cfg(all(any(unix, windows), feature = "eval", feature = "stdio"))]
+extern crate self as rcmake_lsp;
+#[cfg(all(any(unix, windows), feature = "eval", feature = "stdio"))]
+mod stdio_eval;
+
+/// Run the evaluated language server over standard input and output.
+#[cfg(all(any(unix, windows), feature = "eval", feature = "stdio"))]
+pub fn run_stdio() -> std::process::ExitCode {
+    stdio_eval::serve().unwrap_or(std::process::ExitCode::FAILURE)
+}
+
+#[cfg(all(any(unix, windows), feature = "eval", feature = "stdio"))]
+fn send(output: &mut impl std::io::Write, message: RpcMessage) -> std::io::Result<()> {
+    let body = message.encode();
+    if body.len() <= rpc::MAX_MESSAGE_BYTES {
+        rpc::write_frame(output, &body)?;
+    } else if let RpcMessage::Result { id, .. } = message {
+        let error = RpcMessage::error(id, -32603, "Response exceeds the message size limit.");
+        rpc::write_frame(output, &error.encode())?;
+    }
+    output.flush()
+}
+
 pub use position::{Position, PositionEncoding};
 pub use rpc::{RequestId, RpcMessage};
 pub use server::Server;

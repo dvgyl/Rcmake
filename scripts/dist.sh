@@ -220,9 +220,7 @@ done
 export CARGO_ENCODED_RUSTFLAGS="$flags"
 unset RUSTFLAGS
 
-cargo build --locked --release --bin rcmake --target "$target" --target-dir "$target_dir"
-cargo build --locked --release -p rcmake-lsp --bin rcmake-lsp --features eval,stdio \
-  --target "$target" --target-dir "$target_dir"
+cargo build --locked --release -p rcmake-cli --bin rcmake --target "$target" --target-dir "$target_dir"
 
 name="rcmake-$version-$target"
 work="$(mktemp -d "$out_dir/.rcmake-dist.XXXXXXXX")"
@@ -240,10 +238,8 @@ root, work, binaries = map(Path, (root, work, binaries))
 package = work / name
 bin_dir = package / "bin"
 bin_dir.mkdir(parents=True)
-standalone = ("rcmake", "rcmake-lsp")
-for tool in standalone:
-    shutil.copyfile(binaries / tool, bin_dir / tool)
-for tool in ("cmake", "ctest", "cpack"):
+shutil.copyfile(binaries / "rcmake", bin_dir / "rcmake")
+for tool in ("cmake", "ctest", "cpack", "rcmake-lsp"):
     (bin_dir / tool).symlink_to("rcmake")
 ignore = shutil.ignore_patterns("._*", ".DS_Store")
 shutil.copytree(root / "modules/cmake-4.5", package / "share/cmake-4.5", ignore=ignore)
@@ -256,7 +252,7 @@ def normalize(member):
     member.uname = member.gname = ""
     if member.issym():
         member.mode = 0o777
-    elif member.isdir() or member.name in {f"{name}/bin/{tool}" for tool in standalone}:
+    elif member.isdir() or member.name == f"{name}/bin/rcmake":
         member.mode = 0o755
     else:
         member.mode = 0o644

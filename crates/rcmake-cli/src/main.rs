@@ -1,8 +1,9 @@
-//! Binary entry point for `rcmake` (multi-call `cmake`/`ctest`/`cpack`).
+//! Entry point for the CMake command-line tools and language server.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::disallowed_methods, clippy::exit)]
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -38,9 +39,33 @@ fn install_panic_hook() {
     }));
 }
 
+fn stem_is(path: &OsStr, expected: &str) -> bool {
+    Path::new(path).file_stem().is_some_and(|stem| {
+        if cfg!(windows) {
+            stem.eq_ignore_ascii_case(expected)
+        } else {
+            stem == expected
+        }
+    })
+}
+
 fn main() -> ExitCode {
+    let mut args = std::env::args_os();
+    let program = args.next();
+    let first = args.next();
+    if program.as_deref().is_some_and(|path| {
+        stem_is(path, "rcmake-lsp")
+            || (first.as_deref() == Some(OsStr::new("lsp"))
+                && stem_is(path, "rcmake")
+                && std::env::var_os("RCMAKE_ORACLE_MODE").as_deref() != Some(OsStr::new("1")))
+    }) {
+        return rcmake_lsp::run_stdio();
+    }
     install_panic_hook();
-    let argv: Vec<_> = std::env::args_os()
+    let argv: Vec<_> = program
+        .into_iter()
+        .chain(first)
+        .chain(args)
         .map(|a| rcmake_host::path::from_native(Path::new(&a)))
         .collect();
 

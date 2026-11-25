@@ -31,6 +31,7 @@ rcmake-genex.workspace = true
 rcmake-host.workspace = true
 rcmake-instrument.workspace = true
 rcmake-json.workspace = true
+rcmake-lsp = { workspace = true, features = ["eval", "stdio"] }
 rcmake-model.workspace = true
 rcmake-presets.workspace = true
 rcmake-resolve.workspace = true
