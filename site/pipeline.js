@@ -28,8 +28,10 @@ export function renderPipeline(model = PIPELINE_MODEL, orientation = "horizontal
   const sel = state.selected || "eval";
   const isPure = state.hostMode === "pure";
   const host = isPure ? model.hosts.pure : model.hosts.native;
-  const edge = (d, ch, delay, end) => `<path class="pipe-edge" d="${d}"/><path class="pipe-pulse" d="${d}" stroke="${ch}" style="--p-delay:${delay}ms;--p-end:${end}"/>`;
+  const edge = (d, ch, delay, end, arrow = "") => `<path class="pipe-edge" d="${d}"/>${arrow}<path class="pipe-pulse" d="${d}" stroke="${ch}" style="--p-delay:${delay}ms;--p-end:${end}"/>`;
   const tap = (d, i) => `<path class="pipe-tap${isPure ? " is-pure" : ""}" d="${d}"/><path class="pipe-tap-pulse" d="${d}" style="--t-delay:${i * 180}ms"/>`;
+  const arrowR = (x, y) => `<polygon class="pipe-arrow" points="${x},${y} ${x - 6},${y - 3.5} ${x - 6},${y + 3.5}"/>`;
+  const arrowD = (x, y) => `<polygon class="pipe-arrow" points="${x},${y} ${x - 3.5},${y - 6} ${x + 3.5},${y - 6}"/>`;
 
   if (orientation === "vertical") {
     const ns = [
@@ -38,8 +40,10 @@ export function renderPipeline(model = PIPELINE_MODEL, orientation = "horizontal
     ];
     const outs = model.outputs.map((label, i) => ({ label, x: i % 2 ? 186 : 20, y: i < 2 ? 418 : 462 }));
     const edges = [
-      edge("M 130 56 L 130 90", "var(--ch-r)", 0, -120), edge("M 130 134 L 130 170", "var(--ch-r)", 150, -120),
-      edge("M 130 214 L 130 250", "var(--ch-r)", 300, -120), edge("M 130 294 L 130 330", "var(--ch-g)", 450, -120),
+      edge("M 130 56 L 130 88", "var(--ch-r)", 0, -120, arrowD(130, 90)),
+      edge("M 130 134 L 130 168", "var(--ch-r)", 150, -120, arrowD(130, 170)),
+      edge("M 130 214 L 130 248", "var(--ch-r)", 300, -120, arrowD(130, 250)),
+      edge("M 130 294 L 130 328", "var(--ch-g)", 450, -120, arrowD(130, 330)),
       ...outs.map((o) => edge(`M 130 374 C 130 398, ${o.x + 76} 398, ${o.x + 76} ${o.y}`, "var(--ch-b)", 600, -120))
     ].join("");
     const taps = ns.map((n, i) => tap(`M 230 ${n.y + 22} L 272 ${n.y + 22}`, i)).join("");
@@ -50,18 +54,20 @@ export function renderPipeline(model = PIPELINE_MODEL, orientation = "horizontal
 
   const ns = [
     { id: "syntax", x: 230, w: 140, ch: "var(--ch-r)" }, { id: "eval", x: 410, w: 140, ch: "var(--ch-r)" },
-    { id: "resolve", x: 590, w: 140, ch: "var(--ch-g)" }, { id: "gen", x: 770, w: 110, ch: "var(--ch-b)" }
+    { id: "resolve", x: 590, w: 140, ch: "var(--ch-g)" }, { id: "gen", x: 770, w: 108, ch: "var(--ch-b)" }
   ];
-  const outs = model.outputs.map((label, i) => ({ label, y: 40 + i * 60 }));
+  const outs = model.outputs.map((label, i) => ({ label, y: 36 + i * 56 }));
   const edges = [
-    edge("M 170 142 L 230 142", "var(--ch-r)", 0, -100), edge("M 370 142 L 410 142", "var(--ch-r)", 140, -80),
-    edge("M 550 142 L 590 142", "var(--ch-r)", 280, -80), edge("M 730 142 L 770 142", "var(--ch-g)", 440, -80),
-    ...outs.map((o) => edge(`M 880 142 C 900 142, 900 ${o.y + 16}, 920 ${o.y + 16}`, "var(--ch-b)", 600, -160))
+    edge("M 176 138 L 228 138", "var(--ch-r)", 0, -100, arrowR(230, 138)),
+    edge("M 370 138 L 408 138", "var(--ch-r)", 140, -80, arrowR(410, 138)),
+    edge("M 550 138 L 588 138", "var(--ch-r)", 280, -80, arrowR(590, 138)),
+    edge("M 730 138 L 768 138", "var(--ch-g)", 440, -80, arrowR(770, 138)),
+    ...outs.map((o) => edge(`M 878 138 C 898 138, 898 ${o.y + 16}, 916 ${o.y + 16}`, "var(--ch-b)", 600, -160, arrowR(918, o.y + 16)))
   ].join("");
-  const taps = ns.map((n, i) => tap(`M ${n.x + n.w / 2} 164 L ${n.x + n.w / 2} 280`, i)).join("");
-  const boxes = ns.map((n) => `<g class="pipe-node-group${sel === n.id ? " is-selected" : ""}" data-pipe-stage="${n.id}" style="--node-ch:${n.ch}"><rect class="pipe-node-bg" x="${n.x}" y="120" width="${n.w}" height="44" rx="6"/><rect x="${n.x + 1}" y="120" width="${n.w - 2}" height="2.5" rx="1" fill="${n.ch}"/><text class="pipe-label" x="${n.x + n.w / 2}" y="147" text-anchor="middle">${escapeHtml(n.id)}</text></g>`).join("");
-  const outBoxes = outs.map((o) => `<g><rect class="pipe-node-bg" x="920" y="${o.y}" width="110" height="32" rx="5"/><rect x="921" y="${o.y}" width="108" height="2" rx="1" fill="var(--ch-b)"/><text class="pipe-label-muted" x="975" y="${o.y + 20}" text-anchor="middle">${escapeHtml(o.label)}</text></g>`).join("");
-  return `<svg class="pipe-svg" viewBox="0 0 1040 344" role="img" aria-label="Configure pipeline from CMakeLists.txt through syntax, eval, resolve, and gen to build files over Host">${edges}${taps}<g><rect class="pipe-node-bg" x="20" y="120" width="150" height="44" rx="6"/><text class="pipe-label" x="95" y="147" text-anchor="middle">CMakeLists.txt</text></g>${boxes}${outBoxes}<g class="pipe-node-group${sel === "host" ? " is-selected" : ""}" data-pipe-stage="host" style="--node-ch:var(--ink)"><rect class="pipe-node-bg" x="20" y="280" width="1000" height="48" rx="6"/><text class="pipe-label" x="44" y="309">Host</text><text class="pipe-label-muted" x="108" y="309">${escapeHtml(host.label)}</text><text class="pipe-label-muted" x="996" y="309" text-anchor="end">${escapeHtml(host.chips.join("  \u00b7  "))}</text></g></svg>`;
+  const taps = ns.map((n, i) => tap(`M ${n.x + n.w / 2} 160 L ${n.x + n.w / 2} 274`, i)).join("");
+  const boxes = ns.map((n) => `<g class="pipe-node-group${sel === n.id ? " is-selected" : ""}" data-pipe-stage="${n.id}" style="--node-ch:${n.ch}"><rect class="pipe-node-bg" x="${n.x}" y="116" width="${n.w}" height="44" rx="6"/><rect x="${n.x + 1}" y="116" width="${n.w - 2}" height="2.5" rx="1" fill="${n.ch}"/><text class="pipe-label" x="${n.x + n.w / 2}" y="143" text-anchor="middle">${escapeHtml(n.id)}</text></g>`).join("");
+  const outBoxes = outs.map((o) => `<g><rect class="pipe-node-bg" x="918" y="${o.y}" width="114" height="32" rx="5"/><rect x="919" y="${o.y}" width="112" height="2" rx="1" fill="var(--ch-b)"/><text class="pipe-label-muted" x="975" y="${o.y + 20}" text-anchor="middle">${escapeHtml(o.label)}</text></g>`).join("");
+  return `<svg class="pipe-svg" viewBox="0 0 1052 336" role="img" aria-label="Configure pipeline from CMakeLists.txt through syntax, eval, resolve, and gen to build files over Host">${edges}${taps}<g><rect class="pipe-node-bg" x="16" y="116" width="160" height="44" rx="6"/><use href="#i-file" x="28" y="130" width="16" height="16" stroke="var(--ink-2)" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><text class="pipe-label" x="106" y="143" text-anchor="middle">CMakeLists.txt</text></g>${boxes}${outBoxes}<g class="pipe-node-group${sel === "host" ? " is-selected" : ""}" data-pipe-stage="host" style="--node-ch:var(--ink)"><rect class="pipe-node-bg" x="16" y="274" width="1016" height="46" rx="6"/><use href="#i-host" x="32" y="289" width="16" height="16" stroke="var(--ink-2)" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><text class="pipe-label" x="58" y="302">Host</text><text class="pipe-label-muted" x="114" y="302">${escapeHtml(host.label)}</text><text class="pipe-label-muted" x="1010" y="302" text-anchor="end">${escapeHtml(host.chips.join("  \u00b7  "))}</text></g></svg>`;
 }
 
 export function initPipeline(root, motion) {

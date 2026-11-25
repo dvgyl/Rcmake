@@ -88,6 +88,14 @@ export function initThemeToggle(doc = document) {
   });
 }
 
+export function initTopbarScroll(doc = document) {
+  const bar = doc.querySelector(".topbar.is-hero-bleed");
+  if (!bar || typeof window === "undefined") return;
+  const sync = () => bar.classList.toggle("is-scrolled", window.scrollY > 10);
+  sync();
+  window.addEventListener("scroll", sync, { passive: true });
+}
+
 export async function copyWithFeedback(button, text, label = "Copy") {
   const node = button.querySelector("[data-copy-label]");
   const set = (v) => { if (node) node.textContent = v; else button.textContent = v; };
@@ -162,4 +170,7 @@ export function snapshotMeta(data) {
   return [data?.commit ? `commit ${String(data.commit).slice(0, 12)}` : "commit pending", `CMake ${data?.targetCmakeVersion || "4.5.1"}`, d ? `generated ${d}` : "not yet generated"].join(" \u00b7 ");
 }
 
-if (typeof document !== "undefined") initThemeToggle(document);
+if (typeof document !== "undefined") {
+  initThemeToggle(document);
+  initTopbarScroll(document);
+}

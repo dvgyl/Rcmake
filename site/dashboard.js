@@ -6,7 +6,7 @@ import { animateCountUp, createMotionController } from "./motion.js";
 
 export function renderSummary(data) {
   const body = overviewRows(data).map((r) => `<tr data-status="${r.status}"><td><a href="#${escapeHtml(r.id)}">${escapeHtml(r.check)}</a></td><td>${r.result ? `<span data-value>${escapeHtml(r.result)}</span>` : `<span class="dim"><span data-value></span>${escapeHtml(r.scope)}</span>`}</td><td class="inline-bar-cell">${inlineBar(r.ratio, r.status)}</td><td>${statusHtml(r.status)}</td></tr>`).join("");
-  return `<section id="summary" class="report-section" data-animate data-test="section-summary"><h2>Summary</h2><div class="table-panel"><table class="runner-table"><thead><tr><th>check</th><th>result</th><th></th><th>status</th></tr></thead><tbody>${body}</tbody></table></div></section>`;
+  return `<section id="summary" class="report-section" data-animate data-test="section-summary"><h2>Summary</h2><div class="table-panel"><table class="runner-table"><thead><tr><th>Check</th><th>Result</th><th></th><th>Status</th></tr></thead><tbody>${body}</tbody></table></div></section>`;
 }
 
 export function renderRunCmake(track) {
@@ -77,7 +77,7 @@ export function renderBenchmarks(benchTrack) {
       testId: `dash-gate-${g.id}`
     });
   }).join("");
-  return `<section id="gates" class="report-section" data-animate data-test="section-gates"><h2>Soundness gates</h2><div class="gates-grid">${cards}</div></section>`;
+  return `<section id="gates" class="report-section" data-animate data-test="section-gates"><h2>Soundness gates</h2><div class="panel gates-shell"><div class="gates-grid">${cards}</div></div></section>`;
 }
 
 export function renderReport(data) {
