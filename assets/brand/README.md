@@ -11,9 +11,10 @@ Vector brand marks, wordmarks, favicon, and Open Graph artwork for **rcmake**.
 | `rcmake-wordmark-light.svg` | `0 0 360 80` | Light backgrounds | Horizontal mark + `rcmake` lockup |
 | `rcmake-wordmark-dark.svg` | `0 0 360 80` | Dark backgrounds | Horizontal mark + `rcmake` lockup |
 | `favicon.svg` | `0 0 128 128` | Light & dark browser tabs | High-legibility 16x16 icon with `prefers-color-scheme` support |
-| `og-card.svg` | `0 0 1200 630` | Social & link unfurls | Open Graph preview card |
+| `og-card.svg` | `0 0 1200 630` | Social & link unfurls | Open Graph vector source |
+| `og-card.png` | `1200 x 630` | Social & link unfurls | Rasterized Open Graph preview card |
 
-Self-contained copies of these SVGs also live in `site/assets/` so publishing `site/` directly as a GitHub Pages root requires no parent-directory traversal.
+Self-contained copies of these assets also live in `site/assets/` so publishing `site/` directly as a GitHub Pages root requires no parent-directory traversal.
 
 ## Color Tokens
 

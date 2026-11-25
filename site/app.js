@@ -1,11 +1,24 @@
-/* Rcmake shared site helpers and the Overview page controller.
- * Plain ES module, no dependencies. MIT OR Apache-2.0.
- */
+/* rcmake shared site helpers. Plain ES module, importable in Node. MIT OR Apache-2.0. */
 
 const STATUSES = ["pass", "partial", "fail", "pending"];
 const PLACEHOLDER = /\[FINAL_METRIC\]\s*/g;
+const ICON_BY_STATUS = { pass: "i-check", partial: "i-differs", fail: "i-cross", pending: "i-pending" };
 
-/** Escape a value for safe use in HTML text and attribute values. */
+export const TRACK_LABELS = Object.freeze({
+  coreConformance: "Core suites",
+  policies: "Policies",
+  runCmakeOs: "Tests/RunCMake by OS",
+  bossFight: "Large projects",
+  unseenHoldout: "Blind holdout",
+  vcpkgMatrix: "vcpkg ports",
+  benchmarksAndGates: "Speed and soundness"
+});
+
+export function trackLabel(id, data) {
+  if (id === "policies" && data?.tracks?.policies?.activeRange) return `Policies ${data.tracks.policies.activeRange}`;
+  return TRACK_LABELS[id] || String(id || "");
+}
+
 export function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -15,227 +28,138 @@ export function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-/** Format an integer with thousands separators, or return null. */
 export function formatNumber(value) {
   return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString("en-US") : null;
 }
 
-/** Format a percentage with at most two decimals, or return null. */
 export function formatPercent(value) {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return null;
-  }
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
   return `${value.toFixed(Number.isInteger(value) ? 0 : 2)}%`;
 }
 
-/** Format "passed / total", or return null when either side is unknown. */
 export function formatRatio(passed, total) {
   const p = formatNumber(passed);
   const t = formatNumber(total);
   return p !== null && t !== null ? `${p} / ${t}` : null;
 }
 
-/** Remove the internal placeholder token from a note. */
 export function cleanNote(text) {
-  return String(text ?? "").replace(PLACEHOLDER, "").trim();
+  return String(text ?? "")
+    .replace(PLACEHOLDER, "")
+    .replace(/\bCore-62\b/g, "Core suites")
+    .replace(/\bBoss-Fight(\s+Giants)?\b/gi, "Large projects")
+    .replace(/\bUnseen Holdout\b/g, "Blind holdout")
+    .replace(/\bunseen holdout\b/gi, "blind holdout")
+    .trim();
 }
 
-/** Return a known status value. Unknown values become "pending". */
 export function normalizeStatus(status) {
   return STATUSES.includes(status) ? status : "pending";
 }
 
-/** Render a status as a plain colored monospace word. */
 export function statusHtml(status, text) {
   const s = normalizeStatus(status);
-  return `<span class="st st-${s}">${escapeHtml(text || s)}</span>`;
+  return `<span class="st st-${s}" data-status="${s}"><svg class="i" aria-hidden="true"><use href="#${ICON_BY_STATUS[s]}"/></svg><span>${escapeHtml(text || s)}</span></span>`;
 }
 
-/** Fetch and parse the compatibility snapshot. */
 export async function loadLatestData(url = "./data/latest.json") {
-  const response = await fetch(url, { cache: "no-cache" });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} for ${url}`);
-  }
-  return response.json();
+  const res = await fetch(url, { cache: "no-cache" });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return res.json();
 }
 
-/** Wire the plain-text "Light" / "Dark" toggle in the top bar (dark default). */
 export function initThemeToggle(doc = document) {
   const root = doc.documentElement;
   const btn = doc.getElementById("theme-toggle");
-  if (!root.dataset.theme) {
-    root.dataset.theme = "dark";
-  }
+  if (!root.dataset.theme) root.dataset.theme = "dark";
   const sync = () => {
-    if (btn) {
-      const dark = root.dataset.theme !== "light";
-      btn.textContent = dark ? "Light" : "Dark";
-      btn.setAttribute("aria-label", dark ? "Use light theme" : "Use dark theme");
-    }
+    if (!btn) return;
+    const dark = root.dataset.theme !== "light";
+    const lbl = btn.querySelector(".theme-label");
+    if (lbl) lbl.textContent = dark ? "Light" : "Dark";
+    else if (!btn.querySelector("svg")) btn.textContent = dark ? "Light" : "Dark";
+    btn.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
   };
   sync();
   btn?.addEventListener("click", () => {
     root.dataset.theme = root.dataset.theme === "light" ? "dark" : "light";
-    try {
-      localStorage.setItem("rcmake-theme", root.dataset.theme);
-    } catch (_) {
-      // Storage can be blocked. The theme still applies to this page view.
-    }
+    try { localStorage.setItem("rcmake-theme", root.dataset.theme); } catch (_) {}
     sync();
   });
 }
 
-/** Copy text to the clipboard and show the result on the button for a moment. */
-export async function copyWithFeedback(button, text, label = "copy") {
-  try {
-    await navigator.clipboard.writeText(text);
-    button.textContent = "copied";
-  } catch (_) {
-    button.textContent = "select and copy";
-  }
-  setTimeout(() => {
-    button.textContent = label;
-  }, 1500);
+export async function copyWithFeedback(button, text, label = "Copy") {
+  const node = button.querySelector("[data-copy-label]");
+  const set = (v) => { if (node) node.textContent = v; else button.textContent = v; };
+  try { await navigator.clipboard.writeText(text); set("Copied"); } catch (_) { set("Select and copy"); }
+  setTimeout(() => set(label), 1500);
 }
 
-function initCopyButtons(doc) {
-  for (const btn of doc.querySelectorAll("[data-copy]")) {
-    const source = doc.getElementById(btn.dataset.copy);
-    if (!source) {
-      continue;
-    }
-    btn.addEventListener("click", () => {
-      const lines = Array.from(source.querySelectorAll("[data-line]"), (el) => el.textContent);
-      copyWithFeedback(btn, lines.length ? lines.join("\n") : source.textContent);
-    });
-  }
+export function initRovingGroup(container, selector, onActivate) {
+  if (!container) return;
+  const items = () => Array.from(container.querySelectorAll(selector));
+  const sync = (active) => items().forEach((el) => { el.tabIndex = el === active ? 0 : -1; });
+  const initial = items().find((el) =>
+    ["aria-selected", "aria-checked", "aria-pressed"].some((a) => el.getAttribute(a) === "true")
+  ) || items()[0];
+  if (initial) sync(initial);
+  container.addEventListener("keydown", (e) => {
+    const list = items();
+    const idx = list.indexOf(e.target.closest(selector));
+    if (idx < 0 || !list.length) return;
+    let next = -1;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") next = (idx + 1) % list.length;
+    else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = (idx - 1 + list.length) % list.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = list.length - 1;
+    if (next < 0) return;
+    e.preventDefault();
+    sync(list[next]);
+    list[next].focus();
+    onActivate?.(list[next]);
+  });
+  container.addEventListener("click", (e) => {
+    const target = e.target.closest(selector);
+    if (!target || !container.contains(target)) return;
+    sync(target);
+    onActivate?.(target);
+  });
 }
 
-/** Build the Overview summary rows from a parsed `latest.json` object. */
+const ratioOf = (p, t) =>
+  typeof p === "number" && Number.isFinite(p) && typeof t === "number" && t > 0 ? Math.max(0, Math.min(1, p / t)) : null;
+
 export function overviewRows(data) {
-  const t = data.tracks;
-  const gates = t.benchmarksAndGates.gates;
+  const t = data?.tracks || {};
+  const gates = t.benchmarksAndGates?.gates || [];
   const gate = (id) => gates.find((g) => g.id === id) || { status: "pending" };
-  const blackbox = gate("blackbox");
-  const fuzz = gate("fuzz");
-  const wasi = gate("wasi");
-  const platforms = t.runCmakeOs.platforms;
-  const measured = platforms.every((p) => typeof p.passRate === "number");
-  const boss = t.bossFight;
-  const unseen = t.unseenHoldout;
-  const vcpkg = t.vcpkgMatrix;
-  const warm = t.benchmarksAndGates.benchmarks.warmProbeSpeedup;
+  const [bb, fuzz, wasi] = [gate("blackbox"), gate("fuzz"), gate("wasi")];
+  const { coreConformance: core = {}, policies: pol = {}, runCmakeOs: rc = {}, bossFight: boss = {}, unseenHoldout: hold = {}, vcpkgMatrix: vc = {} } = t;
+  const plats = rc.platforms || [];
+  const osDone = plats.length > 0 && plats.every((p) => typeof p.passRate === "number");
+  const warm = t.benchmarksAndGates?.benchmarks?.warmProbeSpeedup || {};
 
   return [
-    {
-      check: "Core-62 conformance",
-      result: formatPercent(t.coreConformance.passRate),
-      scope: `${t.coreConformance.suitesTotal} suites`,
-      status: t.coreConformance.status
-    },
-    {
-      check: `Policies ${t.policies.activeRange}`,
-      result: formatPercent(t.policies.passRate),
-      scope: `${t.policies.suitesTotal} suites`,
-      status: t.policies.status
-    },
-    {
-      check: "Tests/RunCMake, 3 OS",
-      result: measured ? platforms.map((p) => formatPercent(p.passRate)).join(" / ") : null,
-      scope: `${platforms.map((p) => p.suitesTotal).join(" / ")} suites`,
-      status: t.runCmakeOs.status
-    },
-    {
-      check: "Independent black-box suite",
-      result: formatRatio(blackbox.passed, blackbox.total),
-      scope: `${blackbox.scenariosTotal ?? "?"} scenarios, ${formatNumber(blackbox.total) ?? "?"} checks`,
-      status: blackbox.status
-    },
-    {
-      check: "Large projects, L1 / L2",
-      result: boss.l1Passed !== null && boss.l2Passed !== null
-        ? `${boss.l1Passed} / ${boss.l2Passed} of ${boss.projectsTotal}`
-        : null,
-      scope: `${boss.projectsTotal} projects`,
-      status: boss.status
-    },
-    {
-      check: "Sealed unseen holdout",
-      result: formatPercent(unseen.passRate),
-      scope: `${unseen.reposTotal} repositories`,
-      status: unseen.status
-    },
-    {
-      check: "vcpkg port matrix",
-      result: formatPercent(vcpkg.passRate),
-      scope: `${vcpkg.shardsTotal} shards`,
-      status: vcpkg.status
-    },
-    {
-      check: "Fuzzing",
-      result: fuzz.passed !== null && fuzz.passed !== undefined
-        ? `${formatNumber(fuzz.passed)} inputs, ${fuzz.failures ?? 0} failures`
-        : null,
-      scope: "9 parser surfaces",
-      status: fuzz.status
-    },
-    {
-      check: "WASI and wasm32",
-      result: formatRatio(wasi.passed, wasi.total),
-      scope: `${wasi.total ?? "?"} checks`,
-      status: wasi.status
-    },
-    {
-      check: "Warm configure vs CMake",
-      result: typeof warm.value === "number" ? `${warm.value}${warm.unit}` : null,
-      scope: "real-world corpus",
-      status: warm.status
-    }
+    { id: "core", check: "Core suites", result: formatRatio(core.suitesAt100, core.suitesTotal), scope: `- / ${formatNumber(core.suitesTotal) ?? "?"}`, ratio: ratioOf(core.suitesAt100, core.suitesTotal), status: normalizeStatus(core.status) },
+    { id: "core", check: `Policies ${pol.activeRange || ""}`.trim(), result: formatRatio(pol.suitesPassed, pol.suitesTotal), scope: `- / ${formatNumber(pol.suitesTotal) ?? "?"}`, ratio: ratioOf(pol.suitesPassed, pol.suitesTotal), status: normalizeStatus(pol.status) },
+    { id: "runcmake", check: "Tests/RunCMake, 3 OS", result: osDone ? plats.map((p) => formatPercent(p.passRate)).join(" / ") : null, scope: `${plats.map((p) => p.suitesTotal).join(" / ")} suites`, ratio: osDone ? plats.reduce((a, p) => a + p.passRate, 0) / (plats.length * 100) : null, status: normalizeStatus(rc.status) },
+    { id: "gates", check: "Black-box scenarios", result: formatRatio(bb.scenariosPassed, bb.scenariosTotal), scope: `- / ${formatNumber(bb.scenariosTotal) ?? "?"}`, ratio: ratioOf(bb.scenariosPassed, bb.scenariosTotal), status: normalizeStatus(bb.status) },
+    { id: "projects", check: "Large projects, L1 / L2", result: typeof boss.l1Passed === "number" && typeof boss.l2Passed === "number" ? `${boss.l1Passed} / ${boss.l2Passed} of ${boss.projectsTotal}` : null, scope: `- / ${formatNumber(boss.projectsTotal) ?? "?"}`, ratio: ratioOf(boss.l2Passed, boss.projectsTotal), status: normalizeStatus(boss.status) },
+    { id: "holdout", check: "Blind holdout", result: formatRatio(hold.reposPassed, hold.reposTotal), scope: `- / ${formatNumber(hold.reposTotal) ?? "?"}`, ratio: ratioOf(hold.reposPassed, hold.reposTotal), status: normalizeStatus(hold.status) },
+    { id: "vcpkg", check: "vcpkg ports", result: typeof vc.portsPassed === "number" && typeof vc.portsTotal === "number" ? `${formatRatio(vc.portsPassed, vc.portsTotal)} ports` : null, scope: `${formatNumber(vc.shardsCompleted) ?? "0"} / ${formatNumber(vc.shardsTotal) ?? "64"} shards`, ratio: typeof vc.passRate === "number" ? Math.max(0, Math.min(1, vc.passRate / 100)) : null, status: normalizeStatus(vc.status) },
+    { id: "gates", check: "Fuzzing", result: typeof fuzz.passed === "number" ? `${formatNumber(fuzz.passed)} inputs, ${fuzz.failures ?? 0} fail` : null, scope: "pending", ratio: ratioOf(fuzz.passed, fuzz.total), status: normalizeStatus(fuzz.status) },
+    { id: "gates", check: "WASI and wasm32", result: formatRatio(wasi.passed, wasi.total), scope: `- / ${formatNumber(wasi.total) ?? "?"}`, ratio: ratioOf(wasi.passed, wasi.total), status: normalizeStatus(wasi.status) },
+    { id: "speed", check: "Warm configure", result: typeof warm.value === "number" && Number.isFinite(warm.value) ? `${warm.value}${warm.unit === "x" ? "\u00d7" : ` ${warm.unit || ""}`}` : null, scope: "pending", ratio: typeof warm.value === "number" && warm.value > 0 ? Math.min(1, 1 / warm.value) : null, status: normalizeStatus(warm.status) }
   ];
 }
 
-/** Render Overview rows as table body HTML. */
 export function overviewRowsHtml(rows) {
-  return rows
-    .map(
-      (row) => `<tr>
-        <td>${escapeHtml(row.check)}</td>
-        <td class="mono">${row.result ? escapeHtml(row.result) : `<span class="muted">${escapeHtml(row.scope)}</span>`}</td>
-        <td class="r">${statusHtml(row.status)}</td>
-      </tr>`
-    )
-    .join("");
+  return rows.map((r) => `<tr><td>${escapeHtml(r.check)}</td><td class="mono">${r.result ? escapeHtml(r.result) : `<span class="dim">${escapeHtml(r.scope)}</span>`}</td><td>${statusHtml(r.status)}</td></tr>`).join("");
 }
 
-/** Describe the snapshot origin: commit, target, and date. */
 export function snapshotMeta(data) {
-  return [
-    data.commit ? `commit ${String(data.commit).slice(0, 12)}` : "commit pending",
-    `target CMake ${data.targetCmakeVersion}`,
-    data.generatedAt ? `generated ${data.generatedAt}` : "not yet generated"
-  ].join(" · ");
+  const d = data?.generatedAt ? String(data.generatedAt).slice(0, 10) : null;
+  return [data?.commit ? `commit ${String(data.commit).slice(0, 12)}` : "commit pending", `CMake ${data?.targetCmakeVersion || "4.5.1"}`, d ? `generated ${d}` : "not yet generated"].join(" \u00b7 ");
 }
 
-async function hydrateOverview(doc) {
-  const body = doc.getElementById("spec-rows");
-  if (!body) {
-    return;
-  }
-  const meta = doc.getElementById("spec-meta");
-  try {
-    const data = await loadLatestData();
-    body.innerHTML = overviewRowsHtml(overviewRows(data));
-    if (meta) {
-      meta.textContent = snapshotMeta(data);
-    }
-  } catch (error) {
-    body.innerHTML = `<tr><td colspan="3" class="muted">Could not read data/latest.json (${escapeHtml(error.message)}). Serve the site over HTTP.</td></tr>`;
-  }
-}
-
-if (typeof document !== "undefined") {
-  initThemeToggle(document);
-  initCopyButtons(document);
-  hydrateOverview(document);
-}
+if (typeof document !== "undefined") initThemeToggle(document);
