@@ -27,7 +27,7 @@ use super::try_compile::{
     },
     plan::{
         DiagnosticStream, ProbeDiagnostic, ProbeEligibility, ProbeRecipe, ReuseScope,
-        compute_probe_key, environment_fingerprint, request_digest,
+        compute_probe_key, process_environment, process_environment_fingerprint, request_digest,
     },
 };
 
@@ -402,7 +402,9 @@ impl ProbeQueue {
                     .saturating_add(value.len())
             },
         );
-        if bytes > MAX_QUEUE_BYTES || recipe.environment != environment_fingerprint(&environment) {
+        if bytes > MAX_QUEUE_BYTES
+            || recipe.environment != process_environment_fingerprint(&environment)
+        {
             return reject();
         }
         let key = compute_probe_key(&recipe);
@@ -713,7 +715,8 @@ fn execute_process_plan(
         deadline,
     );
     let remaining = deadline.saturating_duration_since(speculative_now());
-    let plan = prepare(recipe, &environment, scratch, remaining)?;
+    let mut plan = prepare(recipe, &environment, scratch, remaining)?;
+    process_environment(&mut plan.env);
     let mut outcome = run_plan(&journal, scratch, recipe, &plan)?;
     let journal = journal.finish();
     outcome.diagnostics.extend(
@@ -741,7 +744,7 @@ fn execute_process_plan(
         ));
     }
     expected.timeout = executed.timeout;
-    if environment_fingerprint(&executed.env) != recipe.environment
+    if process_environment_fingerprint(&executed.env) != recipe.environment
         || request_digest(executed) != request_digest(&expected)
     {
         return Err(HostError::unsupported(

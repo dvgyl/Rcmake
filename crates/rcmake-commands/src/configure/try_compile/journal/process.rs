@@ -15,9 +15,11 @@ impl JournalHost<'_> {
         {
             return None;
         }
+        let mut request = request.clone();
+        super::super::plan::process_environment(&mut request.env);
         self.verify_process
             .as_deref()?
-            .recorded_platform_query(request)
+            .recorded_platform_query(&request)
     }
 
     fn limit_speculative_request(&self, request: &mut RunRequest) -> HostResult<()> {

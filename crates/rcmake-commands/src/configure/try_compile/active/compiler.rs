@@ -11,7 +11,7 @@ use rcmake_store::{Digest, InputStamp, Trace, TraceMemo, VerifyOutcome};
 use crate::configure::platform_queries::{PlatformQueries, RecordedQueries};
 
 use super::super::journal::{DependencyClosure, ProcessVerifier, SearchObservation, depfile};
-use super::super::plan::process_environment_fingerprint;
+use super::super::plan::{process_environment, process_environment_fingerprint};
 
 mod flags;
 mod hazards;
@@ -44,7 +44,8 @@ pub(super) fn admit_source(name: &[u8], source: &[u8]) -> bool {
 
 /// Copy the platform queries that a try-compile child can reuse.
 fn platform_snapshot(host: &dyn Host, cx: &Cx<'_>) -> RecordedQueries {
-    let environment = host.env_all();
+    let mut environment = host.env_all();
+    process_environment(&mut environment);
     cx.session_data::<Arc<PlatformQueries>>()
         .and_then(|memo| {
             memo.refresh(host, &environment);
