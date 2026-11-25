@@ -543,7 +543,8 @@ def preflight(binaries, project, cases, work, generator, env, timeout, *, synthe
                 lane.mkdir()
                 sample = configure_runs(binary, project, lane, generator, env, timeout,
                                         synthetic=synthetic, cases=(COLD, INCREMENTAL_LEAF),
-                                        leaf_pair=leaf_pair, timed=False)[INCREMENTAL_LEAF]
+                                        leaf_pair=leaf_pair, timed=False,
+                                        replay_evidence=tool == "rcmake")[INCREMENTAL_LEAF]
                 if sample.error or not sample.edited_leaf_executed:
                     raise ValueError(sample.error or f"{tool} did not execute the leaf edit.")
                 if tool == "rcmake" and not sample.replayed_regions:
@@ -711,7 +712,7 @@ def markdown(report):
         "",
         "Cold configure starts with an empty build directory and probe cache. "
         "Warm probe and FetchContent runs use a fresh build directory and the same store. "
-        "Both tools trace the edited leaf and unchanged control in separate, untimed runs. "
+        "Untimed runs check Rcmake replay results and trace the CMake leaf edit. "
         "Both tools record compiler calls during probe timings. "
         "The operating system keeps its file cache across runs.",
         "Each tool and trial uses a private home and XDG cache. "
