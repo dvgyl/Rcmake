@@ -13,7 +13,7 @@ pub(super) fn render(
 ) {
     let destination = &action.destination;
     let mut path = BString::from("\"$ENV{DESTDIR}");
-    if !Lexical::new(destination).absolute() && !Lexical::windows(destination).absolute() {
+    if !destination.starts_with(b"/") && !Lexical::windows(destination).absolute() {
         path.extend_from_slice(b"${CMAKE_INSTALL_PREFIX}/");
     }
     quoted_content(&mut path, destination);
