@@ -378,11 +378,16 @@ fn build_probe(
     // A cache hit does not configure the test project, so only silent probes are kept.
     #[cfg(all(feature = "native", any(unix, windows)))]
     if let Some(probe) = cached_probe
-        && result.failure.is_none()
-        && result.diagnostics.is_empty()
         && let Some(journal) = journal.and_then(|host| std::sync::Arc::try_unwrap(host).ok())
     {
-        probe.record(cx, dirs, build_var, &result, journal.finish());
+        probe.record(
+            cx,
+            dirs,
+            build_var,
+            &result,
+            journal.finish(),
+            result.failure.is_none() && result.diagnostics.is_empty(),
+        );
     }
     let source = match signature {
         Signature::Sources { sources, .. } => sources.first().map(|source| match source {

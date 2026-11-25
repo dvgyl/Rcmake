@@ -69,3 +69,24 @@ fn ignores_internal_time_and_private_link_reads() -> HostResult<()> {
     );
     Ok(())
 }
+
+#[test]
+fn logs_distinct_impurity_sites_and_preserves_the_first_reason() -> HostResult<()> {
+    let host = PureHost::default();
+    let scratch = Path::new("/work/scratch");
+    host.create_dir_all(scratch)?;
+    let journal =
+        JournalHost::new(&host, scratch, JournalMode::Observe, None)?.with_impurity_sites(true);
+    journal.guard_effect(ImpureReason::ExternalWrite)?;
+    journal.guard_effect(ImpureReason::SharedState)?;
+    let journal = journal.finish();
+    assert_eq!(journal.impure(), Some(ImpureReason::ExternalWrite));
+    let [(first, write), (second, shared)] = journal.impurities() else {
+        panic!("Expected two impurity sites.");
+    };
+    assert_eq!(*first, ImpureReason::ExternalWrite);
+    assert_eq!(*second, ImpureReason::SharedState);
+    assert_eq!(write.file(), file!());
+    assert_eq!(shared.line(), write.line() + 1);
+    Ok(())
+}

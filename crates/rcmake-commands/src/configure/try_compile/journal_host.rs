@@ -248,7 +248,7 @@ impl Host for JournalHost<'_> {
         let mut state = self.state();
         if state.can_record() {
             if conflicts(&mut state.environment, name.to_vec(), value.clone()) {
-                state.impure.get_or_insert(ImpureReason::ChangedInput);
+                state.mark_impure(ImpureReason::ChangedInput);
             } else {
                 state.stamp(InputStamp::EnvVar {
                     name: name.to_vec(),
@@ -400,7 +400,7 @@ impl Host for JournalHost<'_> {
                 state.output_bytes += bytes.len();
                 state.output.push((stream, bytes.to_vec()));
             } else {
-                state.impure.get_or_insert(ImpureReason::JournalLimit);
+                state.mark_impure(ImpureReason::JournalLimit);
             }
         }
     }
@@ -514,6 +514,7 @@ impl JournalHost<'_> {
             processes: state.processes,
             output: state.output,
             impure: state.impure,
+            impurities: state.impurities,
         }
     }
 }

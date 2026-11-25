@@ -32,6 +32,7 @@ pub(in crate::configure) struct ProbeRuntime {
     executable: OnceLock<Option<Digest>>,
     compiler: compiler::SessionEvidence,
     intervals: Option<Arc<CompileIntervals>>,
+    purity_log: Option<PathBuf>,
     remote: Option<remote::RemoteProbe>,
 }
 
@@ -71,6 +72,10 @@ impl ProbeRuntime {
             .env_get(b"RCMAKE_MEASURE_PROBE_INTERVALS")
             .is_some_and(|value| value == "1"))
         .then(|| Arc::new(CompileIntervals::default()));
+        let purity_log = host
+            .env_get(b"RCMAKE_PROBE_PURITY_LOG")
+            .filter(|value| !value.is_empty())
+            .map(|value| host.initial_cwd().join(path::to_native(&value)));
         let mut cache = ProbeCache::for_session(mode);
         if let Some(host) = generation {
             cache.memo = Arc::new(rcmake_store::TraceMemo::with_generation(host));
@@ -78,6 +83,7 @@ impl ProbeRuntime {
         Some(Self {
             host,
             intervals,
+            purity_log,
             store,
             cache,
             mode,
@@ -346,6 +352,7 @@ impl PreparedProbe {
             journal
                 .with_trace_memo(Arc::clone(&self.runtime.cache.memo))
                 .with_bound_inputs(self.bound.clone())
+                .with_impurity_sites(self.runtime.purity_log.is_some())
         })
         .map(Arc::new)
     }
@@ -357,6 +364,7 @@ impl PreparedProbe {
         name: &[u8],
         built: &ProbeResult,
         journal: Journal,
+        eligible: bool,
     ) {
         let runtime = &self.runtime;
         if cx
@@ -365,6 +373,12 @@ impl PreparedProbe {
             .as_ref()
             .is_some_and(rcmake_eval::CancelToken::is_cancelled)
         {
+            return;
+        }
+        if !eligible {
+            if let Some(log) = &runtime.purity_log {
+                self.log_purity(log, name, &journal, false);
+            }
             return;
         }
         let host = runtime.host.as_ref();
@@ -402,17 +416,47 @@ impl PreparedProbe {
                 );
             }
         }
-        if (fresh.compiled && fresh.artifact.is_none()) || !journal.output().is_empty() {
-            return;
+        let published = (!fresh.compiled || fresh.artifact.is_some())
+            && journal.output().is_empty()
+            && runtime
+                .cache
+                .publish(host, &runtime.store, &self.recipe, &fresh, &journal)
+                .available();
+        if let Some(log) = &runtime.purity_log {
+            self.log_purity(log, name, &journal, published);
         }
-        if runtime
-            .cache
-            .publish(host, &runtime.store, &self.recipe, &fresh, &journal)
-            .available()
-            && let Some(remote) = &runtime.remote
-        {
+        if published && let Some(remote) = &runtime.remote {
             remote.put(host, &runtime.store, &self.recipe);
         }
+    }
+
+    fn log_purity(&self, log: &Path, name: &[u8], journal: &Journal, published: bool) {
+        use rcmake_json::Value;
+        let entry = Value::object_from([
+            ("variable", Value::string(name)),
+            (
+                "key",
+                Value::string(compute_probe_key(&self.recipe).to_string()),
+            ),
+            ("published", Value::Bool(published)),
+            (
+                "impurities",
+                Value::array_from(journal.impurities().iter().map(|(reason, site)| {
+                    Value::object_from([
+                        ("reason", Value::string(format!("{reason:?}"))),
+                        ("file", Value::string(site.file())),
+                        ("line", Value::UInt(site.line().into())),
+                        ("column", Value::UInt(site.column().into())),
+                    ])
+                })),
+            ),
+        ]);
+        let mut line = rcmake_json::write_compact(&entry).to_vec();
+        line.push(b'\n');
+        let _ = self
+            .runtime
+            .host
+            .write(log, &line, rcmake_host::WriteMode::Append);
     }
 }
 

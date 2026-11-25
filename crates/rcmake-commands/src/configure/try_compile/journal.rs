@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
+use std::panic::Location;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -312,6 +313,8 @@ fn system_digest(system: &SystemInfo) -> Digest {
     key.finish()
 }
 
+type Impurity = (ImpureReason, &'static Location<'static>);
+
 #[derive(Default)]
 struct State {
     stamps: BTreeMap<StampKey, InputStamp>,
@@ -322,14 +325,26 @@ struct State {
     output: Vec<(Stream, Vec<u8>)>,
     output_bytes: usize,
     impure: Option<ImpureReason>,
+    impurities: Option<Vec<Impurity>>,
 }
 
 impl State {
+    #[track_caller]
+    fn mark_impure(&mut self, reason: ImpureReason) {
+        self.impure.get_or_insert(reason);
+        if let Some(impurities) = &mut self.impurities {
+            let entry = (reason, Location::caller());
+            if !impurities.contains(&entry) {
+                impurities.push(entry);
+            }
+        }
+    }
+
     fn can_record(&mut self) -> bool {
         if self.stamps.len() + self.checks.len() + self.environment.len() + self.processes.len()
             >= MAX_OBSERVATIONS
         {
-            self.impure.get_or_insert(ImpureReason::JournalLimit);
+            self.mark_impure(ImpureReason::JournalLimit);
             return false;
         }
         true
@@ -337,13 +352,13 @@ impl State {
 
     fn stamp(&mut self, stamp: InputStamp) {
         if self.can_record() && conflicts(&mut self.stamps, StampKey::from(&stamp), stamp) {
-            self.impure.get_or_insert(ImpureReason::ChangedInput);
+            self.mark_impure(ImpureReason::ChangedInput);
         }
     }
 
     fn check(&mut self, check: Check, expected: Digest) {
         if self.can_record() && conflicts(&mut self.checks, check, expected) {
-            self.impure.get_or_insert(ImpureReason::ChangedInput);
+            self.mark_impure(ImpureReason::ChangedInput);
         }
     }
 }
@@ -405,12 +420,17 @@ pub(crate) struct Journal {
     processes: Vec<RunRequest>,
     output: Vec<(Stream, Vec<u8>)>,
     impure: Option<ImpureReason>,
+    impurities: Option<Vec<Impurity>>,
 }
 
 impl Journal {
     /// Return the first reason that the outcome cannot be stored.
     pub(crate) fn impure(&self) -> Option<ImpureReason> {
         self.impure
+    }
+
+    pub(super) fn impurities(&self) -> &[Impurity] {
+        self.impurities.as_deref().unwrap_or_default()
     }
 
     /// Return recorded scalar environment reads, including absent values.
@@ -526,6 +546,13 @@ impl<'a> JournalHost<'a> {
             bound: BTreeSet::new(),
             state: Mutex::default(),
         })
+    }
+
+    pub(super) fn with_impurity_sites(self, enabled: bool) -> Self {
+        if enabled {
+            self.state().impurities = Some(Vec::new());
+        }
+        self
     }
 
     /// Skip read evidence for files whose contents the probe key binds.
@@ -750,10 +777,12 @@ impl<'a> JournalHost<'a> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    #[track_caller]
     fn mark_impure(&self, reason: ImpureReason) {
-        self.state().impure.get_or_insert(reason);
+        self.state().mark_impure(reason);
     }
 
+    #[track_caller]
     fn guard_effect(&self, reason: ImpureReason) -> HostResult<()> {
         self.mark_impure(reason);
         match self.mode {
