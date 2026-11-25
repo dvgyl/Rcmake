@@ -52,6 +52,25 @@ impl InstallOptions {
     }
 }
 
+/// Filter and search options for `install(RUNTIME_DEPENDENCY_SET ...)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeDependencyFilters {
+    /// Additional search directories (`DIRECTORIES`).
+    pub directories: Vec<BString>,
+    /// `PRE_INCLUDE_REGEXES`.
+    pub pre_include_regexes: Vec<BString>,
+    /// `PRE_EXCLUDE_REGEXES`.
+    pub pre_exclude_regexes: Vec<BString>,
+    /// `POST_INCLUDE_REGEXES`.
+    pub post_include_regexes: Vec<BString>,
+    /// `POST_EXCLUDE_REGEXES`.
+    pub post_exclude_regexes: Vec<BString>,
+    /// `POST_INCLUDE_FILES`.
+    pub post_include_files: Vec<BString>,
+    /// `POST_EXCLUDE_FILES`.
+    pub post_exclude_files: Vec<BString>,
+}
+
 /// A named runtime dependency set install request.
 #[derive(Clone, Debug)]
 pub struct RuntimeDependencyInstall {
@@ -67,6 +86,8 @@ pub struct RuntimeDependencyInstall {
     pub library: InstallOptions,
     /// Options for the framework artifacts, if supported.
     pub framework: Option<InstallOptions>,
+    /// Search directories and include/exclude filter lists.
+    pub filters: RuntimeDependencyFilters,
 }
 
 /// The `install()` signature of a rule.

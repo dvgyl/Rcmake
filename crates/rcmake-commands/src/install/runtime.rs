@@ -1,6 +1,8 @@
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_eval::{CmdResult, Cx, Flow};
-use rcmake_model::{InstallOptions, RuntimeDependencyInstall, TargetId, TargetKind};
+use rcmake_model::{
+    InstallOptions, RuntimeDependencyFilters, RuntimeDependencyInstall, TargetId, TargetKind,
+};
 use rcmake_resolve::ide::{BundleKind, bundle_kind};
 
 use super::{Result, common, fail, keyword, record_request, values, warn_absolute_destination};
@@ -22,6 +24,7 @@ pub(super) fn set(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
     let system = require_supported(cx, b"RUNTIME_DEPENDENCY_SET")?;
 
     let mut groups = DependencySetOptions::default();
+    let mut filters = RuntimeDependencyFilters::default();
     let mut group = &mut groups.common;
     let mut options = options.iter().copied().peekable();
     while let Some(key) = options.next() {
@@ -31,7 +34,17 @@ pub(super) fn set(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
             b"FRAMEWORK" => group = &mut groups.framework,
             b"DESTINATION" | b"COMPONENT" if options.peek().is_none_or(|arg| keyword(arg)) => {}
             key if filter_keyword(key) => {
-                values(&mut options);
+                let items = values(&mut options).into_iter().map(BString::from);
+                match key {
+                    b"DIRECTORIES" => filters.directories.extend(items),
+                    b"PRE_INCLUDE_REGEXES" => filters.pre_include_regexes.extend(items),
+                    b"PRE_EXCLUDE_REGEXES" => filters.pre_exclude_regexes.extend(items),
+                    b"POST_INCLUDE_REGEXES" => filters.post_include_regexes.extend(items),
+                    b"POST_EXCLUDE_REGEXES" => filters.post_exclude_regexes.extend(items),
+                    b"POST_INCLUDE_FILES" => filters.post_include_files.extend(items),
+                    b"POST_EXCLUDE_FILES" => filters.post_exclude_files.extend(items),
+                    _ => {}
+                }
             }
             key if common(cx, b"RUNTIME_DEPENDENCY_SET", group, key, &mut options)? => {}
             _ => {
@@ -83,6 +96,7 @@ pub(super) fn set(cx: &mut Cx<'_>, input: &[&[u8]]) -> CmdResult {
                 framework: frameworks
                     .as_ref()
                     .map(|group| groups.common.with_group(group)),
+                filters,
             });
     }
     Ok(Flow::Normal)
