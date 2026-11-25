@@ -30,24 +30,15 @@ impl Evaluator<'_> {
         let [op, rest @ ..] = args.as_slice() else {
             return Err(call.error("$<PATH> expression requires at least two parameters."));
         };
-        let component = path_component(op);
-        let (count, allowed_modifier) = match op.as_slice() {
-            b"IS_PREFIX" | b"ABSOLUTE_PATH" => (2, Some("NORMALIZE")),
-            b"CMAKE_PATH" | b"NATIVE_PATH" => (1, Some("NORMALIZE")),
-            b"GET_EXTENSION" | b"GET_STEM" | b"REMOVE_EXTENSION" => (1, Some("LAST_ONLY")),
-            b"REPLACE_EXTENSION" => (2, Some("LAST_ONLY")),
-            b"REPLACE_FILENAME" | b"RELATIVE_PATH" => (2, None),
-            b"IS_ABSOLUTE" | b"IS_RELATIVE" | b"APPEND" | b"NORMAL_PATH" | b"REMOVE_FILENAME" => {
-                (1, None)
-            }
-            _ if component.is_some() => (1, None),
-            _ => return Err(call.error(format!("{op}: invalid option."))),
-        };
+        let operation =
+            PathOp::parse(op).ok_or_else(|| call.error(format!("{op}: invalid option.")))?;
+        let count = operation.arity();
+        let allowed_modifier = operation.modifier();
         let (modifier, rest) = match (allowed_modifier, rest) {
             (Some(modifier), [item, rest @ ..]) if item == modifier => (Some(modifier), rest),
             _ => (None, rest),
         };
-        let variadic = op == "APPEND";
+        let variadic = operation == PathOp::Append;
         let arity = || {
             operation_arity(
                 call,
@@ -65,16 +56,13 @@ impl Evaluator<'_> {
         };
         let option = modifier.is_some();
         let lexical = Lexical::new(path);
-        if let Some(component) = component.filter(|_| op.starts_with(b"HAS_")) {
-            let has = component_value(lexical, component, false)
-                .ok_or_else(|| call.error(format!("{op}: invalid option.")))?;
-            return Ok(boolean(!has.is_empty()));
-        }
-        match op.as_slice() {
-            b"IS_ABSOLUTE" | b"IS_RELATIVE" => {
-                return Ok(boolean(lexical.absolute() == (op == "IS_ABSOLUTE")));
+        match operation {
+            PathOp::Has(component) => {
+                return Ok(boolean(!component.value(lexical, false).is_empty()));
             }
-            b"IS_PREFIX" => {
+            PathOp::IsAbsolute => return Ok(boolean(lexical.absolute())),
+            PathOp::IsRelative => return Ok(boolean(!lexical.absolute())),
+            PathOp::IsPrefix => {
                 let [input] = tail else {
                     return Err(arity());
                 };
@@ -101,13 +89,9 @@ impl Evaluator<'_> {
         let mut out = BString::default();
         for (index, item) in paths.iter().enumerate() {
             let path = Lexical::new(item);
-            let transformed = match op.as_slice() {
-                name if name.starts_with(b"GET_") => {
-                    let component = component.unwrap_or_default();
-                    component_value(path, component, option)
-                        .ok_or_else(|| call.error(format!("{op}: invalid option.")))?
-                }
-                b"CMAKE_PATH" => {
+            let transformed = match operation {
+                PathOp::Get(component) => component.value(path, option),
+                PathOp::CmakePath => {
                     let cmake = path_lex::cmake_style(item);
                     if option {
                         Lexical::new(&cmake).normalize()
@@ -115,14 +99,14 @@ impl Evaluator<'_> {
                         cmake
                     }
                 }
-                b"NATIVE_PATH" => {
+                PathOp::NativePath => {
                     if option {
                         path_lex::native_style(&path.normalize())
                     } else {
                         path_lex::native_style(item)
                     }
                 }
-                b"APPEND" => {
+                PathOp::Append => {
                     let mut value = item.clone();
                     for suffix in tail {
                         value = Lexical::new(&value).append(suffix);
@@ -134,15 +118,15 @@ impl Evaluator<'_> {
                     }
                     value
                 }
-                b"REMOVE_FILENAME" => path.without_filename().into(),
-                b"REPLACE_FILENAME" => {
+                PathOp::RemoveFilename => path.without_filename().into(),
+                PathOp::ReplaceFilename => {
                     if path.filename().is_empty() {
                         item.clone()
                     } else {
                         Lexical::new(path.without_filename()).append(replacement)
                     }
                 }
-                b"REMOVE_EXTENSION" | b"REPLACE_EXTENSION" => {
+                PathOp::RemoveExtension | PathOp::ReplaceExtension => {
                     let extension = path.stem_extension(option).1;
                     let prefix = item.get(..item.len() - extension.len()).unwrap_or_default();
                     let mut value = BString::from(prefix);
@@ -152,9 +136,11 @@ impl Evaluator<'_> {
                     self.append(&mut value, replacement)?;
                     value
                 }
-                b"NORMAL_PATH" => path.normalize(),
-                b"RELATIVE_PATH" => path.relative(Lexical::new(replacement)).unwrap_or_default(),
-                b"ABSOLUTE_PATH" => {
+                PathOp::NormalPath => path.normalize(),
+                PathOp::RelativePath => {
+                    path.relative(Lexical::new(replacement)).unwrap_or_default()
+                }
+                PathOp::AbsolutePath => {
                     let value = if path.absolute() {
                         item.clone()
                     } else {
@@ -166,7 +152,9 @@ impl Evaluator<'_> {
                         value
                     }
                 }
-                _ => return Err(call.error(format!("{op}: invalid option."))),
+                PathOp::Has(_) | PathOp::IsAbsolute | PathOp::IsRelative | PathOp::IsPrefix => {
+                    unreachable!("Path predicates return before transforming the list");
+                }
             };
             if index != 0 {
                 self.append(&mut out, b";")?;
@@ -177,36 +165,114 @@ impl Evaluator<'_> {
     }
 }
 
-fn path_component(operation: &[u8]) -> Option<&[u8]> {
-    let component = operation
-        .strip_prefix(b"GET_")
-        .or_else(|| operation.strip_prefix(b"HAS_"))?;
-    matches!(
-        component,
-        b"ROOT_NAME"
-            | b"ROOT_DIRECTORY"
-            | b"ROOT_PATH"
-            | b"FILENAME"
-            | b"EXTENSION"
-            | b"STEM"
-            | b"RELATIVE_PART"
-            | b"PARENT_PATH"
-    )
-    .then_some(component)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathOp {
+    Get(Component),
+    Has(Component),
+    IsPrefix,
+    IsAbsolute,
+    IsRelative,
+    CmakePath,
+    NativePath,
+    Append,
+    RemoveFilename,
+    ReplaceFilename,
+    RemoveExtension,
+    ReplaceExtension,
+    NormalPath,
+    RelativePath,
+    AbsolutePath,
 }
 
-fn component_value(path: Lexical<'_>, component: &[u8], last: bool) -> Option<BString> {
-    Some(match component {
-        b"ROOT_NAME" => path.root_name().into(),
-        b"ROOT_DIRECTORY" => path.root_directory().into(),
-        b"ROOT_PATH" => path.root_path(),
-        b"FILENAME" => path.filename().into(),
-        b"EXTENSION" => path.stem_extension(last).1.into(),
-        b"STEM" => path.stem_extension(last).0.into(),
-        b"RELATIVE_PART" => path.relative_part().into(),
-        b"PARENT_PATH" => path.parent().into(),
-        _ => return None,
-    })
+impl PathOp {
+    fn parse(name: &[u8]) -> Option<Self> {
+        if let Some(component) = name.strip_prefix(b"GET_") {
+            return Component::parse(component).map(Self::Get);
+        }
+        if let Some(component) = name.strip_prefix(b"HAS_") {
+            return Component::parse(component).map(Self::Has);
+        }
+        Some(match name {
+            b"IS_PREFIX" => Self::IsPrefix,
+            b"IS_ABSOLUTE" => Self::IsAbsolute,
+            b"IS_RELATIVE" => Self::IsRelative,
+            b"CMAKE_PATH" => Self::CmakePath,
+            b"NATIVE_PATH" => Self::NativePath,
+            b"APPEND" => Self::Append,
+            b"REMOVE_FILENAME" => Self::RemoveFilename,
+            b"REPLACE_FILENAME" => Self::ReplaceFilename,
+            b"REMOVE_EXTENSION" => Self::RemoveExtension,
+            b"REPLACE_EXTENSION" => Self::ReplaceExtension,
+            b"NORMAL_PATH" => Self::NormalPath,
+            b"RELATIVE_PATH" => Self::RelativePath,
+            b"ABSOLUTE_PATH" => Self::AbsolutePath,
+            _ => return None,
+        })
+    }
+
+    fn arity(self) -> usize {
+        match self {
+            Self::IsPrefix
+            | Self::AbsolutePath
+            | Self::ReplaceExtension
+            | Self::ReplaceFilename
+            | Self::RelativePath => 2,
+            _ => 1,
+        }
+    }
+
+    fn modifier(self) -> Option<&'static str> {
+        match self {
+            Self::IsPrefix | Self::AbsolutePath | Self::CmakePath | Self::NativePath => {
+                Some("NORMALIZE")
+            }
+            Self::Get(Component::Extension | Component::Stem)
+            | Self::RemoveExtension
+            | Self::ReplaceExtension => Some("LAST_ONLY"),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Component {
+    RootName,
+    RootDirectory,
+    RootPath,
+    Filename,
+    Extension,
+    Stem,
+    RelativePart,
+    ParentPath,
+}
+
+impl Component {
+    fn parse(name: &[u8]) -> Option<Self> {
+        Some(match name {
+            b"ROOT_NAME" => Self::RootName,
+            b"ROOT_DIRECTORY" => Self::RootDirectory,
+            b"ROOT_PATH" => Self::RootPath,
+            b"FILENAME" => Self::Filename,
+            b"EXTENSION" => Self::Extension,
+            b"STEM" => Self::Stem,
+            b"RELATIVE_PART" => Self::RelativePart,
+            b"PARENT_PATH" => Self::ParentPath,
+            _ => return None,
+        })
+    }
+
+    fn value(self, path: Lexical<'_>, last: bool) -> BString {
+        match self {
+            Self::RootName => path.root_name().into(),
+            Self::RootDirectory => path.root_directory().into(),
+            Self::RootPath => path.root_path(),
+            Self::Filename => path.filename().into(),
+            Self::Extension => path.stem_extension(last).1.into(),
+            Self::Stem => path.stem_extension(last).0.into(),
+            Self::RelativePart => path.relative_part().into(),
+            Self::ParentPath => path.parent().into(),
+        }
+    }
 }
 
 fn split_paths(value: &[u8]) -> Vec<BString> {

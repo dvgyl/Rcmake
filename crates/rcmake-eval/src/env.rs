@@ -57,7 +57,7 @@ impl ExpandEnv for Interp {
             if self.trace_expanding {
                 return Some(self.read_var(name).unwrap_or_default());
             }
-            if let Some(id) = &self.top_defer_id {
+            if let Some(id) = &self.hooks.top_defer_id {
                 let mut line = b"DEFERRED:".to_vec();
                 line.extend_from_slice(id);
                 return Some(BString::from(line));

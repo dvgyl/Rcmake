@@ -3,8 +3,7 @@ use std::{path::Path, sync::Arc};
 use rcmake_base::suggest::{Threshold, closest};
 use rcmake_base::{BString, fold_command_name, truth};
 use rcmake_diag::{
-    Backtrace, DiagCategory, Diagnostic, Effect, Frame, FrameKind, Location, MessageKind, PolicyId,
-    PolicyStatus,
+    Backtrace, DiagCategory, Diagnostic, Frame, FrameKind, Location, PolicyId, PolicyStatus,
 };
 use rcmake_expr::{CondEnv, CondError, ExpandEnv, ExpandedArg};
 use rcmake_host::Host;
@@ -14,6 +13,7 @@ use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
 use super::BodyMode;
 use crate::code::Code;
 use crate::hooks::display_line;
+use crate::interp::IssueClass;
 use crate::profiler::{CommandSample, SampleKind};
 use crate::util::cat;
 use crate::{
@@ -267,7 +267,7 @@ impl Interp {
         }
         let bt = self.command_backtrace(file, line, name);
         let saved_bt = core::mem::replace(&mut self.bt, bt);
-        let saved_defer = core::mem::replace(&mut self.top_defer_id, defer_id);
+        let saved_defer = core::mem::replace(&mut self.hooks.top_defer_id, defer_id);
         self.depth = self.depth.saturating_add(1);
         let saved_line = core::mem::replace(&mut self.cur_line, line);
         let saved_failed = core::mem::replace(&mut self.cmd_failed, false);
@@ -334,7 +334,7 @@ impl Interp {
         self.cmd_failed = saved_failed;
         self.cur_line = saved_line;
         self.depth = self.depth.saturating_sub(1);
-        self.top_defer_id = saved_defer;
+        self.hooks.top_defer_id = saved_defer;
         self.bt = saved_bt;
         result
     }
@@ -488,7 +488,7 @@ impl Interp {
             return self.invoke(lower, command, &[]);
         }
         let args = self.expand(&cmd.args)?;
-        if self.replay_observations.is_some()
+        if self.replay.observations.is_some()
             && !crate::journal::valid_expansion(lower, &cmd.args, &args)
         {
             self.mark_replay_opaque();
@@ -500,7 +500,7 @@ impl Interp {
             self.fatal = true;
             return Err(CmdError::Reported);
         }
-        if self.running_deferred
+        if self.hooks.running_deferred
             && lower == b"enable_language"
             && matches!(command, Command::Builtin(..))
         {
@@ -624,10 +624,7 @@ impl Interp {
                 continue;
             }
             self.issue_at(
-                MessageKind::AuthorWarning,
-                Effect::None,
-                Some(DiagCategory::Policy),
-                Some(id),
+                IssueClass::policy(id),
                 Location::Backtrace(self.bt.clone()),
                 cat(&[
                     b"Policy CMP0102 is not set: The variable named \"",
@@ -704,7 +701,7 @@ impl Interp {
         if mode == BodyMode::File
             && !self.fatal
             && !code.file.is_empty()
-            && let Some(paths) = &mut self.executed_listfiles
+            && let Some(paths) = &mut self.replay.executed_listfiles
         {
             paths.insert(rcmake_host::path::to_native(&code.file));
         }
@@ -763,13 +760,13 @@ impl Interp {
             b"foreach" => {
                 let name = cmd.args.first().map(|arg| arg.text.as_slice());
                 let before = name
-                    .filter(|_| self.replay_observations.is_some())
+                    .filter(|_| self.replay.observations.is_some())
                     .and_then(|name| self.vars.lookup(name))
                     .cloned();
                 let result = self.exec_foreach(code, i);
                 if let Some(name) = name
                     && before.as_ref() != self.vars.lookup(name)
-                    && let Some(observed) = &mut self.replay_observations
+                    && let Some(observed) = &mut self.replay.observations
                 {
                     observed.vars.insert(name.into());
                 }

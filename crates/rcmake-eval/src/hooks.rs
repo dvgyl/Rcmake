@@ -2,6 +2,7 @@
 //! (`--trace`, `--trace-expand`, `--trace-format`, `--trace-source`,
 //! `--trace-redirect`), and deferred calls (`cmake_language(DEFER)`).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -61,6 +62,17 @@ impl WatchAccess {
             Self::Removed => "REMOVED_ACCESS",
         }
     }
+}
+
+#[derive(Default)]
+pub(crate) struct Hooks {
+    /// Variable watches by variable name.
+    pub(crate) watches: BTreeMap<BString, Vec<Watch>>,
+    next_watch_id: u64,
+    pub(crate) next_defer_id: u64,
+    pub(crate) running_deferred: bool,
+    /// Identifier of the deferred call at the top of the backtrace.
+    pub(crate) top_defer_id: Option<BString>,
 }
 
 /// One registered variable watch.
@@ -134,13 +146,14 @@ fn trace_source_matches(path: &[u8], source: &[u8]) -> bool {
 impl Interp {
     /// `cmVariableWatch::AddWatch`: every call adds a new watch.
     pub(crate) fn add_watch(&mut self, var: &[u8], command: &[u8]) {
-        self.next_watch_id = self.next_watch_id.saturating_add(1);
+        self.hooks.next_watch_id = self.hooks.next_watch_id.saturating_add(1);
         let watch = Watch {
-            id: self.next_watch_id,
+            id: self.hooks.next_watch_id,
             command: BString::from(command),
             in_callback: false,
         };
-        self.watches
+        self.hooks
+            .watches
             .entry(BString::from(var))
             .or_default()
             .push(watch);
@@ -149,7 +162,8 @@ impl Interp {
     /// Callback commands of the watches of `var` (an empty name means the default log
     /// message), in registration order.
     pub(crate) fn watch_commands(&self, var: &[u8]) -> Vec<BString> {
-        self.watches
+        self.hooks
+            .watches
             .get(var)
             .map(|list| list.iter().map(|w| w.command.clone()).collect())
             .unwrap_or_default()
@@ -168,7 +182,7 @@ impl Interp {
         if deprecated_cache_variable(name) && self.policy_status(policy) == PolicyStatus::Warn {
             self.issue_policy_warning(policy, b"", b"");
         }
-        let Some(list) = self.watches.get(name) else {
+        let Some(list) = self.hooks.watches.get(name) else {
             return false;
         };
         let ids: Vec<u64> = list.iter().map(|w| w.id).collect();
@@ -187,6 +201,7 @@ impl Interp {
     /// command, or `None` if the watch is gone or its callback is already running.
     fn set_in_callback(&mut self, name: &[u8], id: u64, on: bool) -> Option<BString> {
         let watch = self
+            .hooks
             .watches
             .get_mut(name)?
             .iter_mut()
@@ -277,7 +292,7 @@ impl Interp {
     pub(crate) fn define(&mut self, name: &[u8], value: BString) {
         self.record_variable_access(name);
         self.record_var_write(name, crate::VarOp::Set, Some(&value));
-        if deprecated_cache_variable(name) || self.watches.contains_key(name) {
+        if deprecated_cache_variable(name) || self.hooks.watches.contains_key(name) {
             self.vars.set(name, value.clone());
             self.fire_watches(name, WatchAccess::Modified, Some(&value));
         } else {
@@ -296,7 +311,7 @@ impl Interp {
     /// Read a variable and notify its watches (`cmMakefile::GetDefinition`).
     pub(crate) fn read_var(&mut self, name: &[u8]) -> Option<BString> {
         let value = self.lookup_var(name).cloned();
-        if !deprecated_cache_variable(name) && !self.watches.contains_key(name) {
+        if !deprecated_cache_variable(name) && !self.hooks.watches.contains_key(name) {
             return value;
         }
         let access = if value.is_some() {
@@ -362,7 +377,7 @@ impl Interp {
                 args.push(arg.text.clone());
             }
         }
-        let defer_id = self.top_defer_id.clone();
+        let defer_id = self.hooks.top_defer_id.clone();
         let mut out = Vec::new();
         match format {
             TraceFormat::Human => {
@@ -423,8 +438,8 @@ impl Interp {
 
     /// `cmGlobalGenerator::NewDeferId`: `__0`, `__1`, and so on.
     pub(crate) fn new_defer_id(&mut self) -> BString {
-        let id = format!("__{}", self.next_defer_id);
-        self.next_defer_id = self.next_defer_id.saturating_add(1);
+        let id = format!("__{}", self.hooks.next_defer_id);
+        self.hooks.next_defer_id = self.hooks.next_defer_id.saturating_add(1);
         BString::from(id)
     }
 
@@ -529,7 +544,7 @@ impl Interp {
             name: None,
             kind: FrameKind::Deferred,
         });
-        self.running_deferred = true;
+        self.hooks.running_deferred = true;
         self.push_snapshot();
         let mut i = 0;
         while !self.fatal && self.exit_override.is_none() && !self.over_budget() {
@@ -550,7 +565,7 @@ impl Interp {
             self.exec_deferred(&code, id);
         }
         self.pop_snapshot(!self.fatal);
-        self.running_deferred = false;
+        self.hooks.running_deferred = false;
         self.bt = saved_bt;
     }
 }

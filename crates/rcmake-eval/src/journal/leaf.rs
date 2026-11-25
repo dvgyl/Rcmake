@@ -88,7 +88,7 @@ impl Writes {
         let dir = interp.current_dir_id();
         if code.cmds.is_empty()
             || code.len() > 4096
-            || !interp.watches.is_empty()
+            || !interp.hooks.watches.is_empty()
             || interp
                 .project
                 .dir(dir)

@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod activate;
-pub(crate) use activate::ReplayObservations;
+pub(crate) use activate::ReplayState;
 pub(crate) use leaf::REPLAY_LINK_CHECK;
 mod frame;
 mod leaf;
@@ -15,7 +15,6 @@ mod replay;
 mod trace;
 
 pub use activate::ReplayHost;
-pub(crate) use activate::ReplaySession;
 pub use receipts::ReplayReceipts;
 
 pub use region::{

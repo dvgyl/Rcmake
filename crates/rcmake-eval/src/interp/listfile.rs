@@ -7,6 +7,7 @@ use rcmake_diag::{DiagCategory, Effect, Location, MessageKind, PolicyId, PolicyS
 use rcmake_host::{FileKind, Follow, HostResult, Stream, path};
 use rcmake_model::{CacheEntry, CacheType, DirId};
 
+use crate::interp::IssueClass;
 use crate::util::{cat, collapse_full_path};
 use crate::{CmdError, DirFrame, Flow, Interp, RunMode, RunOutcome, SubdirOptions};
 
@@ -132,10 +133,12 @@ impl Interp {
             return;
         }
         self.issue_at(
-            MessageKind::AuthorWarning,
-            Effect::None,
-            Some(DiagCategory::Author),
-            None,
+            IssueClass {
+                kind: MessageKind::AuthorWarning,
+                effect: Effect::None,
+                category: Some(DiagCategory::Author),
+                policy: None,
+            },
             Location::FileLine {
                 file: abs.into(),
                 line: 0,
@@ -424,7 +427,7 @@ impl Interp {
         bin: &Path,
         options: SubdirOptions,
     ) -> Result<DirId, CmdError> {
-        if self.running_deferred {
+        if self.hooks.running_deferred {
             self.error_here("Subdirectories may not be created during deferred execution.".into());
             return Err(CmdError::Reported);
         }
@@ -543,10 +546,7 @@ impl Interp {
         if different_order {
             let file = cat(&[&directory.source_dir, b"/CMakeLists.txt"]);
             self.issue_at(
-                MessageKind::AuthorWarning,
-                Effect::None,
-                Some(DiagCategory::Policy),
-                Some(POLICY),
+                IssueClass::policy(POLICY),
                 Location::FileLine {
                     file: file.as_slice().into(),
                     line: 0,

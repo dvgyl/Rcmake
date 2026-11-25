@@ -20,7 +20,8 @@ use super::trace::JournalHasher;
 use super::{
     CacheValue, ConfigureSnapshot, EntryContext, JournalDigest, JournalEffect, JournalFileStat,
     JournalInput, JournalStamp, OpaqueReason, PropertyOrigin, RegionKey, RegionKind, RegionRecord,
-    RegionState, StateLookup, VariableScope, file_digest, verify_configure, verify_region,
+    RegionState, StateLookup, VariableScope, VerifiedRegion, file_digest, verify_configure,
+    verify_region,
 };
 use crate::code::Code;
 use crate::interp::BodyMode;
@@ -74,6 +75,24 @@ pub(crate) struct ReplaySession {
     receipts: Option<Arc<ReplayReceipts>>,
     root_record: Option<RegionRecord>,
     bytes_left: usize,
+}
+
+struct ReplayPlan {
+    writes: Writes,
+    key: RegionKey,
+    context: EntryContext,
+    source: PathBuf,
+    digest: JournalDigest,
+    tools: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+pub(crate) struct ReplayState {
+    session: Option<ReplaySession>,
+    hits: u64,
+    replayed_listfiles: BTreeSet<PathBuf>,
+    pub(crate) executed_listfiles: Option<BTreeSet<PathBuf>>,
+    pub(crate) observations: Option<ReplayObservations>,
 }
 
 impl ReplaySession {
@@ -242,11 +261,11 @@ impl Interp {
         preloads: &[PathBuf],
         cached: Option<&[u8]>,
     ) -> (RunOutcome, Option<Vec<u8>>) {
-        self.replay_hits = 0;
-        self.replayed_listfiles.clear();
-        self.replay_session = ReplaySession::start(self, source, build, cached);
+        self.replay.hits = 0;
+        self.replay.replayed_listfiles.clear();
+        self.replay.session = ReplaySession::start(self, source, build, cached);
         let result = self.run_configure(source, build, preloads);
-        let session = self.replay_session.take();
+        let session = self.replay.session.take();
         let bytes = if result.exit_code == 0 && self.can_replay() {
             session.and_then(ReplaySession::finish)
         } else {
@@ -258,23 +277,24 @@ impl Interp {
     /// Number of listfile bodies restored by the last incremental configure.
     #[must_use]
     pub fn replay_hits(&self) -> u64 {
-        self.replay_hits
+        self.replay.hits
     }
 
     /// Absolute paths of the listfiles restored by the last incremental configure.
     #[must_use]
     pub fn replayed_listfiles(&self) -> &std::collections::BTreeSet<PathBuf> {
-        &self.replayed_listfiles
+        &self.replay.replayed_listfiles
     }
 
     /// Start a new record of listfile bodies that enter the evaluator.
     pub fn track_executed_listfiles(&mut self) {
-        self.executed_listfiles = Some(Default::default());
+        self.replay.executed_listfiles = Some(Default::default());
     }
 
     /// Return the recorded paths, or an empty iterator when tracking is off.
     pub fn executed_listfiles(&self) -> impl Iterator<Item = &Path> {
-        self.executed_listfiles
+        self.replay
+            .executed_listfiles
             .iter()
             .flatten()
             .map(PathBuf::as_path)
@@ -301,14 +321,10 @@ impl Interp {
     }
 
     pub(crate) fn note_replay_source(&mut self, abs: &[u8], data: &[u8]) {
-        if let Some(session) = &mut self.replay_session {
+        if let Some(session) = &mut self.replay.session {
             session.source =
                 (data.len() <= 1024 * 1024).then(|| (abs.into(), JournalDigest::hash(data)));
         }
-    }
-
-    pub(crate) fn run_replayable_listfile(&mut self, code: &Code, abs: &[u8]) -> CmdResult {
-        self.run_listfile_body(code, abs, false)
     }
 
     pub(crate) fn run_listfile_body(
@@ -317,110 +333,175 @@ impl Interp {
         abs: &[u8],
         directory: bool,
     ) -> CmdResult {
-        let Some(mut session) = self.replay_session.take() else {
+        let Some(mut session) = self.replay.session.take() else {
             return self.run_code(code, 0, code.len(), BodyMode::File);
         };
-        let plan = session
-            .source
-            .take()
-            .filter(|(p, _)| p.as_slice() == abs)
-            .and_then(|(_, digest)| {
-                if !self.can_replay() || self.depth > 128 || self.unwinding_package {
-                    return None;
-                }
-                let mut writes = Writes::classify(self, code)?;
-                let source = path::to_native(abs);
-                let key = self.replay_key(&source, directory, &session.root);
-                writes.record_variable_reads = match key.kind {
-                    RegionKind::Subdirectory => writes.record_variable_reads,
-                    RegionKind::Bootstrap { .. } => Writes::bootstrap_variable_reads(code),
-                    RegionKind::Include { .. } if self.generated_system_file(&source) => {
-                        Writes::bootstrap_variable_reads(code)
-                    }
-                    _ => false,
-                };
-                let tools = self.replay_tool_paths(&key.kind, &writes)?;
-                let context = self.entry_context(&session, &writes, digest)?;
-                Some((writes, key, context, source, digest, tools))
-            });
-        let Some((writes, key, context, source, digest, tools)) = plan else {
-            self.replay_session = Some(session);
+        let Some(plan) = self.plan_replay(code, abs, directory, &mut session) else {
+            self.replay.session = Some(session);
             return self.run_code(code, 0, code.len(), BodyMode::File);
         };
 
-        let valid_record = |record: &RegionRecord| {
-            matches!(&record.payload, RegionPayload::Complete {inputs, effects}
-                if matches!(inputs.split_first(), Some((JournalInput::Host(JournalStamp::FileHash { path, digest: sum }), rest))
-                    if *path == source && *sum == digest && rest.len() >= tools.len()
-                        && rest.iter().zip(&tools).all(|(input, tool)| matches!(input,
-                            JournalInput::Host(JournalStamp::FileHash { path, .. }) if path == tool))
-                        && rest.iter().skip(tools.len()).all(|input| matches!(input,
-                            JournalInput::Host(JournalStamp::Metadata { .. } | JournalStamp::Missing { .. }
-                                | JournalStamp::EnvVar { .. }))))
-                    && writes.check_effects(effects, self.config.limits.max_value_bytes))
-        };
-        let candidate = session.previous.as_ref().and_then(|snapshot| {
-            if key.kind == RegionKind::Configure {
-                if !valid_record(&snapshot.region) {
-                    return None;
-                }
-                let checked =
-                    verify_configure(session.host.as_ref(), snapshot, &key, &context, |_| {
-                        StateLookup::Unavailable
-                    })
-                    .ok()?;
-                Some((
-                    &snapshot.region,
-                    checked.model.root.as_ref()?,
-                    checked.region,
-                ))
-            } else {
-                snapshot
-                    .model
-                    .nested
-                    .iter()
-                    .filter(|(r, _)| r.key == key && r.context == context && valid_record(r))
-                    .find_map(|(r, s)| {
-                        match s.variable_inputs {
-                            Some((index, digest)) if writes.record_variable_reads => {
-                                let variables = snapshot.model.variable_inputs.get(index)?;
-                                if self.variable_input_digest(variables) != digest {
-                                    return None;
-                                }
-                            }
-                            None if !writes.record_variable_reads => {}
-                            _ => return None,
-                        }
-                        let checked =
-                            verify_region(session.host.as_ref(), r, &key, &context, |_| {
-                                StateLookup::Unavailable
-                            })
-                            .ok()?;
-                        Some((r, s, checked))
-                    })
-            }
-        });
-        if let Some((record, state, checked)) = candidate
-            && state.restore(self, &writes)
+        let result = if let Some((record, state, checked)) = self.find_candidate(&session, &plan)
+            && state.restore(self, &plan.writes)
         {
             checked
                 .replay_into(&mut self.cx())
-                .map_err(|error| crate::CmdError::status(error.to_string()))?;
-            self.replay_hits += 1;
-            self.replayed_listfiles.insert(source);
-            let record = record.clone();
-            let mut model = state.clone();
-            if let Some((index, digest)) = model.variable_inputs {
-                if let Some(index) = session.retain_variable_inputs(index) {
-                    model.variable_inputs = Some((index, digest));
-                    session.keep(record, model);
-                }
-            } else {
-                session.keep(record, model);
-            }
-            self.replay_session = Some(session);
-            return Ok(Flow::Normal);
+                .map_err(|error| crate::CmdError::status(error.to_string()))
+                .map(|()| (record.clone(), state.clone()))
+                .map(|(record, mut model)| {
+                    self.replay.hits += 1;
+                    self.replay.replayed_listfiles.insert(plan.source);
+                    if let Some((index, digest)) = model.variable_inputs {
+                        if let Some(index) = session.retain_variable_inputs(index) {
+                            model.variable_inputs = Some((index, digest));
+                            session.keep(record, model);
+                        }
+                    } else {
+                        session.keep(record, model);
+                    }
+                    Flow::Normal
+                })
+        } else {
+            self.record_region(code, &mut session, plan)
+        };
+        self.replay.session = Some(session);
+        result
+    }
+
+    fn plan_replay(
+        &self,
+        code: &Code,
+        abs: &[u8],
+        directory: bool,
+        session: &mut ReplaySession,
+    ) -> Option<ReplayPlan> {
+        let (_, digest) = session
+            .source
+            .take()
+            .filter(|(path, _)| path.as_slice() == abs)?;
+        if !self.can_replay() || self.depth > 128 || self.unwinding_package {
+            return None;
         }
+        let mut writes = Writes::classify(self, code)?;
+        let source = path::to_native(abs);
+        let key = self.replay_key(&source, directory, &session.root);
+        writes.record_variable_reads = match key.kind {
+            RegionKind::Subdirectory => writes.record_variable_reads,
+            RegionKind::Bootstrap { .. } => Writes::bootstrap_variable_reads(code),
+            RegionKind::Include { .. } if self.generated_system_file(&source) => {
+                Writes::bootstrap_variable_reads(code)
+            }
+            _ => false,
+        };
+        let tools = self.replay_tool_paths(&key.kind, &writes)?;
+        let context = self.entry_context(session, &writes, digest)?;
+        Some(ReplayPlan {
+            writes,
+            key,
+            context,
+            source,
+            digest,
+            tools,
+        })
+    }
+
+    fn find_candidate<'a>(
+        &self,
+        session: &'a ReplaySession,
+        plan: &ReplayPlan,
+    ) -> Option<(&'a RegionRecord, &'a LocalState, VerifiedRegion<'a>)> {
+        let ReplayPlan {
+            writes,
+            key,
+            context,
+            source,
+            digest,
+            tools,
+        } = plan;
+        let valid_record = |record: &RegionRecord| {
+            let RegionPayload::Complete { inputs, effects } = &record.payload else {
+                return false;
+            };
+            let Some((JournalInput::Host(JournalStamp::FileHash { path, digest: sum }), rest)) =
+                inputs.split_first()
+            else {
+                return false;
+            };
+            let Some((tool_inputs, other_inputs)) = rest.split_at_checked(tools.len()) else {
+                return false;
+            };
+            path == source
+                && sum == digest
+                && tool_inputs.iter().zip(tools).all(|(input, tool)| {
+                    matches!(input,
+                    JournalInput::Host(JournalStamp::FileHash { path, .. }) if path == tool)
+                })
+                && other_inputs.iter().all(|input| {
+                    matches!(
+                        input,
+                        JournalInput::Host(
+                            JournalStamp::Metadata { .. }
+                                | JournalStamp::Missing { .. }
+                                | JournalStamp::EnvVar { .. }
+                        )
+                    )
+                })
+                && writes.check_effects(effects, self.config.limits.max_value_bytes)
+        };
+        let snapshot = session.previous.as_ref()?;
+        if key.kind == RegionKind::Configure {
+            if !valid_record(&snapshot.region) {
+                return None;
+            }
+            let checked = verify_configure(session.host.as_ref(), snapshot, key, context, |_| {
+                StateLookup::Unavailable
+            })
+            .ok()?;
+            Some((
+                &snapshot.region,
+                checked.model.root.as_ref()?,
+                checked.region,
+            ))
+        } else {
+            snapshot
+                .model
+                .nested
+                .iter()
+                .filter(|(r, _)| r.key == *key && r.context == *context && valid_record(r))
+                .find_map(|(r, s)| {
+                    match s.variable_inputs {
+                        Some((index, digest)) if writes.record_variable_reads => {
+                            let variables = snapshot.model.variable_inputs.get(index)?;
+                            if self.variable_input_digest(variables) != digest {
+                                return None;
+                            }
+                        }
+                        None if !writes.record_variable_reads => {}
+                        _ => return None,
+                    }
+                    let checked = verify_region(session.host.as_ref(), r, key, context, |_| {
+                        StateLookup::Unavailable
+                    })
+                    .ok()?;
+                    Some((r, s, checked))
+                })
+        }
+    }
+
+    fn record_region(
+        &mut self,
+        code: &Code,
+        session: &mut ReplaySession,
+        plan: ReplayPlan,
+    ) -> CmdResult {
+        let ReplayPlan {
+            writes,
+            key,
+            context,
+            source,
+            digest,
+            tools,
+        } = plan;
         let diagnostics = self.engine.diagnostics().len();
         let log_bytes = self.configure_log.len();
         let unread: Vec<_> = if writes.record_variable_reads {
@@ -431,14 +512,14 @@ impl Interp {
         let install_start = writes
             .installs
             .then(|| (self.project.installs.len(), self.project.targets().count()));
-        self.replay_observations = Some(ReplayObservations {
+        self.replay.observations = Some(ReplayObservations {
             variable_reads: writes
                 .record_variable_reads
                 .then(|| RefCell::new(Some(BTreeMap::new()))),
             ..ReplayObservations::default()
         });
         let result = self.run_code(code, 0, code.len(), BodyMode::File);
-        let observations = self.replay_observations.take().unwrap_or_default();
+        let observations = self.replay.observations.take().unwrap_or_default();
         let used_cli = if writes.record_variable_reads {
             let mut used = observations.cli_reads.into_inner();
             used.extend(observations.vars.iter().cloned());
@@ -527,12 +608,11 @@ impl Interp {
                 session.keep(journal.finish(key, context), state);
             }
         }
-        self.replay_session = Some(session);
         result
     }
 
     pub(crate) fn observe_replay_variable(&self, name: &[u8]) {
-        if let Some(observations) = &self.replay_observations
+        if let Some(observations) = &self.replay.observations
             && !observations.vars.contains(name)
             && let Some(reads) = &observations.variable_reads
         {
@@ -551,7 +631,7 @@ impl Interp {
 
     pub(crate) fn observe_replay_variable_access(&self, name: &[u8]) {
         self.observe_replay_variable(name);
-        if let Some(observations) = &self.replay_observations
+        if let Some(observations) = &self.replay.observations
             && observations
                 .variable_reads
                 .as_ref()
@@ -587,7 +667,7 @@ impl Interp {
     }
 
     pub(crate) fn observe_replay_env(&mut self, name: &[u8]) {
-        if self.replay_observations.is_none() {
+        if self.replay.observations.is_none() {
             return;
         }
         let digest = self
@@ -595,7 +675,7 @@ impl Interp {
             .host
             .env_get(name)
             .map(|value| JournalDigest::hash(&value));
-        if let Some(observed) = &mut self.replay_observations {
+        if let Some(observed) = &mut self.replay.observations {
             observed.record(JournalStamp::EnvVar {
                 name: name.to_vec(),
                 digest,
@@ -604,12 +684,12 @@ impl Interp {
     }
 
     pub(crate) fn observe_replay_condition(&mut self, args: &[ExpandedArg]) {
-        if self.replay_observations.is_none() {
+        if self.replay.observations.is_none() {
             return;
         }
         let base = <Self as rcmake_expr::CondEnv>::base_dir(self).to_path_buf();
         let host = self.config.host.as_ref();
-        let Some(observed) = &mut self.replay_observations else {
+        let Some(observed) = &mut self.replay.observations else {
             return;
         };
         if args.iter().any(|arg| {
@@ -652,7 +732,7 @@ impl Interp {
     }
 
     pub(crate) fn mark_replay_opaque(&mut self) {
-        if let Some(observed) = &mut self.replay_observations {
+        if let Some(observed) = &mut self.replay.observations {
             observed.opaque = true;
         }
     }
@@ -847,7 +927,7 @@ impl Interp {
             );
         }
         if writes.links || (!writes.record_variable_reads && !writes.targets.is_empty()) {
-            h.field(22, &self.next_defer_id.to_le_bytes());
+            h.field(22, &self.hooks.next_defer_id.to_le_bytes());
             h.field(23, &[u8::from(self.root_frame.defer.is_some())]);
         }
         if writes.links {

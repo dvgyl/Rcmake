@@ -40,6 +40,24 @@ fn warning_kind(kind: MessageKind) -> MessageKind {
     }
 }
 
+pub(crate) struct IssueClass {
+    pub(crate) kind: MessageKind,
+    pub(crate) effect: Effect,
+    pub(crate) category: Option<DiagCategory>,
+    pub(crate) policy: Option<PolicyId>,
+}
+
+impl IssueClass {
+    pub(crate) fn policy(id: PolicyId) -> Self {
+        Self {
+            kind: MessageKind::AuthorWarning,
+            effect: Effect::None,
+            category: Some(DiagCategory::Policy),
+            policy: Some(id),
+        }
+    }
+}
+
 impl Interp {
     /// Use rich formatting for diagnostics written by this interpreter.
     pub fn set_rich_diagnostics(&mut self, options: RichOptions) {
@@ -122,20 +140,32 @@ impl Interp {
         } else {
             Location::Backtrace(self.bt.clone())
         };
-        self.issue_at(kind, effect, category, None, location, body, mark_failed);
+        self.issue_at(
+            IssueClass {
+                kind,
+                effect,
+                category,
+                policy: None,
+            },
+            location,
+            body,
+            mark_failed,
+        );
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn issue_at(
         &mut self,
-        kind: MessageKind,
-        effect: Effect,
-        category: Option<DiagCategory>,
-        policy: Option<PolicyId>,
+        class: IssueClass,
         location: Location,
         body: BString,
         mark_failed: bool,
     ) {
+        let IssueClass {
+            kind,
+            effect,
+            category,
+            policy,
+        } = class;
         let state = *self.diag_top();
         let (kind, effect) = match category {
             Some(cat) => match state.get(cat) {
@@ -341,15 +371,7 @@ impl Interp {
             body.push(b'\n');
             body.extend_from_slice(postface);
         }
-        self.issue_at(
-            MessageKind::AuthorWarning,
-            Effect::None,
-            Some(DiagCategory::Policy),
-            Some(id),
-            location,
-            BString::from(body),
-            true,
-        );
+        self.issue_at(IssueClass::policy(id), location, BString::from(body), true);
     }
 
     pub(crate) fn log_level(&self) -> LogLevel {

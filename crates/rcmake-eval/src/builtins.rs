@@ -9,6 +9,7 @@ use rcmake_diag::{
 use rcmake_expr::ExpandedArg;
 use rcmake_host::Stream;
 
+use crate::interp::IssueClass;
 use crate::util::cat;
 use crate::util::collapse_full_path;
 use crate::{CmdError, CmdFlags, CmdResult, Cx, Flow, IncludeOptions, Interp, LogLevel, Registry};
@@ -257,10 +258,7 @@ fn cmd_include(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 PolicyStatus::Warn => {
                     let interp = &mut *cx.interp;
                     interp.issue_at(
-                        MessageKind::AuthorWarning,
-                        Effect::None,
-                        Some(DiagCategory::Policy),
-                        Some(id),
+                        IssueClass::policy(id),
                         Location::Backtrace(interp.local_command_backtrace()),
                         Interp::policy_warning_text(id),
                         true,

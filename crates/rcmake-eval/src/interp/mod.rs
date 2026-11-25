@@ -3,6 +3,7 @@
 mod calls;
 mod defaults;
 mod diagnostics;
+pub(crate) use diagnostics::IssueClass;
 mod dispatch;
 mod listfile;
 mod scope;

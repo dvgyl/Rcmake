@@ -54,7 +54,7 @@ impl Interp {
         if name.is_empty() {
             return;
         }
-        let watched = self.watches.contains_key(name).then(|| value.clone());
+        let watched = self.hooks.watches.contains_key(name).then(|| value.clone());
         self.record_var_write(
             name,
             crate::VarOp::ParentScope,

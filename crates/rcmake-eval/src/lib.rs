@@ -37,8 +37,6 @@ mod builtins;
 mod code;
 mod configure_log;
 mod cx;
-mod cx_messages;
-mod cx_try_run;
 mod env;
 mod file_lock;
 mod flow;
@@ -494,10 +492,9 @@ pub struct Interp {
     /// Optional explicit exit code requested by `cmake_language(EXIT <code>)`.
     exit_override: Option<i32>,
     frontend: Frontend,
-    /// Variable watches by variable name (`cmVariableWatch`).
-    watches: BTreeMap<BString, Vec<hooks::Watch>>,
+    hooks: hooks::Hooks,
+    replay: journal::ReplayState,
     variable_access: BTreeMap<BString, std::sync::atomic::AtomicBool>,
-    next_watch_id: u64,
     /// Command tracing configuration (`--trace*`).
     trace: Option<TraceConfig>,
     command_profiler: Option<Arc<CommandProfiler>>,
@@ -507,21 +504,12 @@ pub struct Interp {
     trace_stack: Vec<bool>,
     find_debug_variables: Vec<BString>,
     find_debug_packages: Vec<BString>,
-    next_defer_id: u64,
-    running_deferred: bool,
-    /// Identifier of the deferred call whose frame is on top of the backtrace.
-    top_defer_id: Option<BString>,
     /// The listfile command being executed (raw arguments for [`Cx::raw_args`]).
     cur_cmd: Option<(Arc<[CommandInvocation]>, usize)>,
     command_end: usize,
     session_data: services::SessionData,
     expanded_observer: Option<services::ExpandedObserver>,
     parse_cache: Option<code::ParseCache>,
-    replay_session: Option<journal::ReplaySession>,
-    replay_hits: u64,
-    replayed_listfiles: BTreeSet<PathBuf>,
-    executed_listfiles: Option<BTreeSet<PathBuf>>,
-    replay_observations: Option<journal::ReplayObservations>,
     /// `--trace-expand` is expanding the arguments of a traced command.
     trace_expanding: bool,
     /// Listfile of each file and function call scope (`LISTFILE_STACK`).
@@ -613,28 +601,20 @@ impl Interp {
             started,
             exit_override: None,
             frontend: Frontend::default(),
-            watches: BTreeMap::new(),
+            hooks: hooks::Hooks::default(),
+            replay: journal::ReplayState::default(),
             variable_access: BTreeMap::new(),
-            next_watch_id: 0,
             trace: None,
             command_profiler: None,
             configure_log: Vec::new(),
             trace_stack: Vec::new(),
             find_debug_variables: Vec::new(),
             find_debug_packages: Vec::new(),
-            next_defer_id: 0,
-            running_deferred: false,
-            top_defer_id: None,
             cur_cmd: None,
             command_end: 0,
             session_data: services::SessionData::default(),
             expanded_observer: None,
             parse_cache: None,
-            replay_session: None,
-            replay_hits: 0,
-            replayed_listfiles: BTreeSet::new(),
-            executed_listfiles: None,
-            replay_observations: None,
             trace_expanding: false,
             listfiles: Vec::new(),
             file_locks: Vec::new(),

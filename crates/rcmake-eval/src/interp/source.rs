@@ -8,6 +8,7 @@ use rcmake_syntax::ParseError;
 
 use super::BodyMode;
 use crate::code::{Code, ParsedSource};
+use crate::interp::IssueClass;
 use crate::util::{cat, collapse_full_path};
 use crate::{CmdError, CmdResult, Flow, IncludeOptions, Interp};
 
@@ -127,10 +128,12 @@ impl Interp {
             Effect::SetError
         };
         self.issue_at(
-            MessageKind::Error,
-            effect,
-            None,
-            None,
+            IssueClass {
+                kind: MessageKind::Error,
+                effect,
+                category: None,
+                policy: None,
+            },
             Location::Backtrace(bt),
             err.message.clone(),
             true,
@@ -152,7 +155,7 @@ impl Interp {
         let vars = self.push_list_file_vars(abs);
         let read = match self.parse_file(abs) {
             Some(code) => {
-                let r = self.run_replayable_listfile(&code, abs);
+                let r = self.run_listfile_body(&code, abs, false);
                 if let Ok(Flow::Return {
                     propagate: Some(names),
                 }) = &r

@@ -535,6 +535,13 @@ fn path_operations() {
     check(
         &[
             ("$<PATH_EQUAL:/a//b,/a/b>/$<PATH_EQUAL:/a/../b,/b>", "1/0"),
+            ("$<PATH:HAS_ROOT_NAME,/a>", "0"),
+            ("$<PATH:HAS_ROOT_PATH,/a>", "1"),
+            ("$<PATH:HAS_EXTENSION,a.tar.gz>", "1"),
+            ("$<PATH:HAS_STEM,a.tar.gz>", "1"),
+            ("$<PATH:HAS_RELATIVE_PART,/>", "0"),
+            ("$<PATH:CMAKE_PATH,a>", "a"),
+            ("$<PATH:NATIVE_PATH,a>", "a"),
             (
                 "$<PATH:HAS_ROOT_DIRECTORY,/a>/$<PATH:HAS_FILENAME,/a/>/$<PATH:HAS_PARENT_PATH,/>/$<PATH:IS_ABSOLUTE,/a>/$<PATH:IS_RELATIVE,a>",
                 if cfg!(windows) {
