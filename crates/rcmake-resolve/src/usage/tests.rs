@@ -462,7 +462,11 @@ fn active_property_cycle_is_distinct_from_a_static_link_cycle() {
         collect(&model, app, UsageField::CompileDefinitions, &ctx)
             .unwrap_err()
             .to_string(),
-        "Self reference on target \"two\"."
+        concat!(
+            "CMake Error:\n  Error evaluating generator expression:\n\n",
+            "    $<TARGET_PROPERTY:two,INTERFACE_COMPILE_DEFINITIONS>\n\n",
+            "  Self reference on target \"two\".\n\n\n",
+        )
     );
 }
 
