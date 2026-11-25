@@ -792,7 +792,8 @@ fn rpath_entries(
                 let directory =
                     crate::lower::install_rpath::translated_link_directory(model, target, parent);
                 paths.insert(directory.unwrap_or_else(|| parent.into()));
-            } else if shared_library(file.filename()) && file.absolute() {
+            } else if shared_library(file.filename()) && (path.starts_with(b"/") || file.absolute())
+            {
                 paths.insert(runtime_directory(file.parent()));
             }
         }
@@ -802,7 +803,7 @@ fn rpath_entries(
         let root = model.dir(DirId::ROOT);
         for directory in &libraries.user_dirs {
             let path = Lexical::new(directory);
-            if path.absolute()
+            if (directory.starts_with(b"/") || path.absolute())
                 && !Lexical::new(&root.source_dir).prefix(path)
                 && !Lexical::new(&root.binary_dir).prefix(path)
             {
