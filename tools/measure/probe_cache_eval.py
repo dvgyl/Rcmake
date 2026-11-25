@@ -96,7 +96,7 @@ source=
 for arg do
     case "$arg" in
         -c) compile=yes ;;
-        */probe_*.c|probe_*.c) source=${{arg##*/}} ;;
+        */probe_*.c|probe_*.c|*/probe_*.cxx|probe_*.cxx|*/src.c|src.c|*/src.cxx|src.cxx) source=${{arg##*/}} ;;
     esac
 done
 if [ "$compile" = yes ] && [ -n "$source" ]; then
@@ -882,6 +882,591 @@ def ninja_present(args, root: Path, row: dict) -> None:
         raise ValueError("Ninja-present probe cache failed. " + "\n".join(errors))
 
 
+def resolve_cxx(args) -> str:
+    """Locate a POSIX C++ compiler for C++20 soundness traps."""
+    configured = getattr(args, "cxx", None)
+    if configured:
+        return str(executable(configured))
+    for candidate in ("c++", "clang++", "g++"):
+        found = shutil.which(candidate)
+        if found:
+            return str(executable(found))
+    raise ValueError("The ninja-swap case requires a POSIX C++ compiler on PATH or via --cxx.")
+
+
+def write_ninja_version_wrapper(staged: Path, real_ninja: Path, version: str) -> None:
+    """Atomically replace staged ninja with a wrapper reporting a different version."""
+    script = (
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then\n'
+        f"    printf '%s\\n' {shlex.quote(version)}\n"
+        "    exit 0\n"
+        "fi\n"
+        f'exec {shlex.quote(str(real_ninja))} "$@"\n'
+    )
+    replacement = staged.parent / "ninja.new"
+    replacement.write_text(script, encoding="utf-8")
+    replacement.chmod(0o755)
+    backdate(replacement)
+    replacement.replace(staged)
+    backdate(staged, staged.parent)
+
+
+def ninja_swap_expected_calls(has_scan_rule: bool) -> int:
+    """Return expected compiler calls after swapping ninja for a C++20 probe.
+
+    Compilers with CMAKE_CXX_SCANDEP_SOURCE (Linux Clang, GCC 14+) consult
+    ninja --version and stamp the ninja executable, so swapping ninja must
+    invalidate the cache. Compilers without a scan rule (macOS AppleClang)
+    never consult ninja --version, so the warm entry stays valid.
+    """
+    return 1 if has_scan_rule else 0
+
+
+def read_cache_entries(build: Path, names: tuple[str, ...]) -> dict[str, str | None]:
+    """Read a fixed set of CMakeCache.txt entries for exact parity checks."""
+    return {name: cache_entry_value(build, name) for name in names}
+
+
+def check_configure_streams(result: dict, case: Fixture, build: Path) -> dict[str, bytes]:
+    """Validate configure success, normalized streams, and private evidence hygiene."""
+    stdout = normalize(result["stdout"].encode(), case.source, build)
+    stderr = normalize(result["stderr"].encode(), case.source, build)
+    if result["error"] or result["returncode"] != 0 or PANIC.search(stdout + b"\n" + stderr):
+        raise ValueError(f"Configure failed in {build}. {result}")
+    configure_log = build / "CMakeFiles/CMakeConfigureLog.yaml"
+    if configure_log.is_file():
+        contents = configure_log.read_bytes()
+        if any(name in contents for name in PRIVATE_EVIDENCE):
+            raise ValueError("The configure log contains private probe evidence flags.")
+    return {"stdout": stdout, "stderr": stderr}
+
+
+def configure_raw(args, case: Fixture, name: str, env: dict, *, oracle: bool = False,
+                  no_cache: bool = False, generator: str | None = None,
+                  cwd: Path | None = None) -> tuple[dict, int]:
+    """Configure a custom fixture and return normalized streams, build path, and call count."""
+    build = case.root / name
+    binary = args.oracle if oracle else args.rcmake
+    selected_generator = generator or getattr(args, "generator", "Ninja")
+    before = len(case.invocations())
+    result = run_command(command(binary, case, build, no_cache, generator=selected_generator),
+                         cwd or case.root, args.timeout, env)
+    data = check_configure_streams(result, case, build)
+    data["build"] = build
+    return data, len(case.invocations()) - before
+
+
+def _write_custom_fixture(root: Path, compiler: str, lists_text: str, *,
+                          language: str = "C", extra_files: dict[str, bytes] | None = None) -> Fixture:
+    """Create a minimal single-directory project with a logged compiler wrapper."""
+    case = Fixture(root, compiler, 1)
+    for name in ("source", "include", "empty"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    case.wrapper()
+    (root / "toolchain.cmake").write_text(
+        f'set(CMAKE_{language}_COMPILER "${{CMAKE_CURRENT_LIST_DIR}}/compiler")\n'
+        f'set(CMAKE_{language}_COMPILER_FORCED TRUE)\n',
+        encoding="utf-8",
+    )
+    (case.source / "CMakeLists.txt").write_text(lists_text, encoding="utf-8")
+    for rel, content in (extra_files or {}).items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    backdate(*root.rglob("*"), root)
+    return case
+
+
+def cxx20_fixture(root: Path, cxx_compiler: str) -> Fixture:
+    """Create a C++20 project with a leaf try_compile probe."""
+    case = Fixture(root, cxx_compiler, 1)
+    for name in ("source/leaf", "include/existing", "empty"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    case.wrapper()
+    (root / "toolchain.cmake").write_text(
+        'set(CMAKE_CXX_COMPILER "${CMAKE_CURRENT_LIST_DIR}/compiler")\n'
+        'set(CMAKE_CXX_COMPILER_FORCED TRUE)\n',
+        encoding="utf-8",
+    )
+    (case.source / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 4.5)\n"
+        "project(ProbeNinjaSwap CXX)\n"
+        "set(CMAKE_CXX_STANDARD 20)\n"
+        "set(CMAKE_CXX_STANDARD_REQUIRED ON)\n"
+        "add_subdirectory(leaf)\n",
+        encoding="utf-8",
+    )
+    leaf = """\
+file(WRITE "${CMAKE_BINARY_DIR}/compiler-id.txt" "${CMAKE_CXX_COMPILER_ID}\\n")
+if(DEFINED CMAKE_CXX_SCANDEP_SOURCE AND NOT "${CMAKE_CXX_SCANDEP_SOURCE}" STREQUAL "")
+  file(WRITE "${CMAKE_BINARY_DIR}/has-scan-rule.txt" "YES\\n")
+else()
+  file(WRITE "${CMAKE_BINARY_DIR}/has-scan-rule.txt" "NO\\n")
+endif()
+set(results "")
+try_compile(result
+  SOURCE_FROM_CONTENT "probe_1.cxx"
+    "int main() { return 1; }"
+  CXX_STANDARD 20
+  COMPILE_DEFINITIONS "-I${CMAKE_CURRENT_SOURCE_DIR}/../../include"
+  OUTPUT_VARIABLE compile_output
+  COPY_FILE "${CMAKE_BINARY_DIR}/probe-1"
+  NO_CACHE)
+file(WRITE "${CMAKE_BINARY_DIR}/probe-1.log" "${compile_output}")
+string(APPEND results "${result}\\n")
+file(WRITE "${CMAKE_BINARY_DIR}/probe-results.txt" "${results}")
+string(REPLACE "\\n" " " display "${results}")
+message(STATUS "Probe results ${display}")
+"""
+    (case.source / "leaf/CMakeLists.txt").write_text(leaf, encoding="utf-8")
+    backdate(*root.rglob("*"), root)
+    return case
+
+
+def ninja_swap(args, root: Path, row: dict) -> None:
+    """Check ninja binary swap invalidation with platform-specific scan-rule expectations."""
+    real_ninja = resolve_ninja(args)
+    cxx_compiler = resolve_cxx(args)
+    case = cxx20_fixture(root, cxx_compiler)
+    store = root / "store"
+    base_env = environment(case, store)
+    staged = stage_ninja(real_ninja, root / "ninja-bin", args.timeout, base_env)
+    env = prepend_path(base_env, staged.parent)
+    row["ninja"] = str(real_ninja)
+    row["ninja_version_before"] = ninja_version(staged, root, args.timeout, env)
+    row["platform"] = sys.platform
+    calls = row["compiler_calls"] = {}
+
+    cold, calls["cold"] = configure(args, case, "cold", env, generator="Ninja")
+    row["make_program"] = require_ninja_make_program(case.root / "cold", staged)
+    check_result(cold, True)
+    require_calls(calls, "cold", 1)
+
+    compiler_id = (case.root / "cold/compiler-id.txt").read_text(encoding="utf-8").strip()
+    has_scan_rule = (case.root / "cold/has-scan-rule.txt").read_text(encoding="utf-8").strip() == "YES"
+    expected_changed = ninja_swap_expected_calls(has_scan_rule)
+    row["compiler_id"] = compiler_id
+    row["has_scan_rule"] = has_scan_rule
+    row["expected_changed_calls"] = expected_changed
+
+    oracle_before, calls["oracle_before"] = configure(args, case, "oracle-before", env, oracle=True,
+                                                      generator="Ninja")
+    require_calls(calls, "oracle_before", 1)
+    compare(cold, oracle_before, PARITY_KEYS, "Ninja-swap cold CMake parity")
+    if args.smoke:
+        return
+
+    entries = audit_store(store)
+    row["published"] = len(entries)
+    require_artifacts(entries, set(cold["copies"]), exact=True)
+    warm, calls["warm"] = configure(args, case, "warm", env, generator="Ninja")
+    require_calls(calls, "warm", 0)
+    compare(warm, cold, cold.keys(), "Ninja-swap warm configure")
+
+    write_ninja_version_wrapper(staged, real_ninja, "1.10.0")
+    row["ninja_version_after"] = ninja_version(staged, root, args.timeout, env)
+    if row["ninja_version_after"] != "1.10.0":
+        raise ValueError(f"Expected swapped ninja to report 1.10.0. Found {row['ninja_version_after']!r}.")
+
+    changed, calls["changed"] = configure(args, case, "changed", env, generator="Ninja")
+    oracle, calls["oracle"] = configure(args, case, "oracle", env, oracle=True, generator="Ninja")
+    require_calls(calls, "oracle", 1)
+    compare(changed, oracle, PARITY_KEYS, "Ninja-swap changed CMake parity")
+    require_calls(calls, "changed", expected_changed)
+
+
+def flag_plugin(args, root: Path, row: dict) -> None:
+    """Require denied compiler flags (plugin, linker, host arch, profile) to fail closed."""
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbeFlagPlugin C)
+include(CheckCSourceCompiles)
+
+set(FLAG_CASES
+  "FLAG_PLUGIN|-fplugin=${CMAKE_CURRENT_SOURCE_DIR}/../plugin.so"
+  "FLAG_USE_LD|-fuse-ld=lld"
+  "FLAG_MARCH_NATIVE|-march=native"
+  "FLAG_PROFILE_USE|-fprofile-use=${CMAKE_CURRENT_SOURCE_DIR}/../probe.profdata"
+)
+set(results "")
+foreach(spec IN LISTS FLAG_CASES)
+  string(REPLACE "|" ";" parts "${spec}")
+  list(GET parts 0 var)
+  list(GET parts 1 flag)
+  set(CMAKE_REQUIRED_FLAGS "${flag}")
+  check_c_source_compiles("int main(void) { return 0; }" ${var})
+  if(${var})
+    string(APPEND results "${var}=1\\n")
+  else()
+    string(APPEND results "${var}=0\\n")
+  endif()
+endforeach()
+file(WRITE "${CMAKE_BINARY_DIR}/flag-results.txt" "${results}")
+"""
+    case = _write_custom_fixture(
+        root,
+        args.compiler,
+        lists,
+        extra_files={"plugin.so": b"plugin-v1\n", "probe.profdata": b"profdata-v1\n"},
+    )
+    store = root / "store"
+    env = environment(case, store)
+    calls = row["compiler_calls"] = {}
+
+    def run_lane(name: str, *, oracle: bool = False) -> tuple[dict, int]:
+        data, count = configure_raw(args, case, name, env, oracle=oracle)
+        data["results"] = (data["build"] / "flag-results.txt").read_bytes()
+        return data, count
+
+    cold, calls["cold"] = run_lane("cold")
+    require_calls(calls, "cold", 4)
+    oracle_before, calls["oracle_before"] = run_lane("oracle-before", oracle=True)
+    require_calls(calls, "oracle_before", 4)
+    compare(cold, oracle_before, ("results", "stdout", "stderr"), "Flag-plugin cold CMake parity")
+    if args.smoke:
+        return
+
+    entries = audit_store(store)
+    row["published"] = len(entries)
+    if entries:
+        raise ValueError(f"Denied compiler flags must not publish probe entries. Found {len(entries)}.")
+
+    (root / "plugin.so").write_bytes(b"plugin-v2\n")
+    (root / "probe.profdata").write_bytes(b"profdata-v2\n")
+    backdate(root / "plugin.so", root / "probe.profdata")
+
+    changed, calls["changed"] = run_lane("changed")
+    require_calls(calls, "changed", 4)
+    oracle, calls["oracle"] = run_lane("oracle", oracle=True)
+    require_calls(calls, "oracle", 4)
+    compare(changed, oracle, ("results", "stdout", "stderr"), "Flag-plugin changed CMake parity")
+    entries_after = audit_store(store)
+    row["published_after_change"] = len(entries_after)
+    if entries_after:
+        raise ValueError(
+            f"Denied compiler flags published entries after plugin change. Found {len(entries_after)}."
+        )
+
+
+def env_inert(args, root: Path, row: dict) -> None:
+    """Require a warm probe cache hit when only proven-inert shell and CI variables change."""
+    case = fixture(root, args.compiler)
+    cwd_a = root / "cwd-a"
+    cwd_b = root / "cwd-b"
+    cwd_a.mkdir(parents=True)
+    cwd_b.mkdir(parents=True)
+    backdate(cwd_a, cwd_b)
+    store = root / "store"
+    base_env = environment(case, store)
+    env_cold = {
+        **base_env,
+        "PWD": str(cwd_a),
+        "OLDPWD": str(root),
+        "SHLVL": "1",
+        "TERM_SESSION_ID": "rcmake-session-a",
+        "GITHUB_RUN_ID": "1001",
+        "CI_JOB_ID": "job-a",
+        "RUNNER_NAME": "runner-a",
+    }
+    env_warm = {
+        **base_env,
+        "PWD": str(cwd_b),
+        "OLDPWD": str(cwd_a),
+        "SHLVL": "2",
+        "TERM_SESSION_ID": "rcmake-session-b",
+        "GITHUB_RUN_ID": "2002",
+        "CI_JOB_ID": "job-b",
+        "RUNNER_NAME": "runner-b",
+    }
+    row["mutated_vars"] = ["PWD", "OLDPWD", "SHLVL", "TERM_SESSION_ID",
+                           "GITHUB_RUN_ID", "CI_JOB_ID", "RUNNER_NAME"]
+    calls = row["compiler_calls"] = {}
+
+    cold, calls["cold"] = configure(args, case, "cold", env_cold, cwd=cwd_a)
+    check_result(cold, True)
+    require_calls(calls, "cold", 1)
+    oracle, calls["oracle"] = configure(args, case, "oracle", env_cold, oracle=True, cwd=cwd_a)
+    require_calls(calls, "oracle", 1)
+    compare(cold, oracle, PARITY_KEYS, "Inert-env cold CMake parity")
+    if args.smoke:
+        return
+
+    entries = audit_store(store)
+    row["published"] = len(entries)
+    require_artifacts(entries, set(cold["copies"]), exact=True)
+    warm, calls["warm"] = configure(args, case, "warm", env_warm, cwd=cwd_b)
+    require_calls(calls, "warm", 0)
+    compare(warm, cold, cold.keys(), "Inert-env warm configure")
+    if audit_store(store) != entries:
+        raise ValueError("The inert-env warm lane changed the seeded probe entries.")
+
+
+def _read_try_run_outputs(data: dict) -> dict:
+    """Validate and attach try_run compile/run outputs for parity assertions."""
+    build = data["build"]
+    log = (build / "compile-output.log").read_bytes()
+    if any(name in log for name in PRIVATE_EVIDENCE):
+        raise ValueError("COMPILE_OUTPUT_VARIABLE contains private probe evidence flags.")
+    if COMPILER_MARKER not in log:
+        raise ValueError("COMPILE_OUTPUT_VARIABLE did not contain the compiler output.")
+    data["compile"] = (build / "compile-result.txt").read_bytes()
+    data["exit"] = (build / "run-result.txt").read_bytes()
+    data["run_output"] = (build / "run-output.txt").read_bytes()
+    return data
+
+
+def run_env(args, root: Path, row: dict) -> None:
+    """Require try_run build caching while observing changed runtime environment variables."""
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbeRunEnv C)
+try_run(run_result compile_result
+  SOURCE_FROM_CONTENT "probe_1.c"
+    "#include <stdio.h>\\n#include <stdlib.h>\\nint main(void) {\\n  const char *trap = getenv(\\"RCMAKE_TRAP\\");\\n  const char *run_id = getenv(\\"GITHUB_RUN_ID\\");\\n  printf(\\"trap=%s;run=%s\\\\n\\", trap ? trap : \\"\\", run_id ? run_id : \\"\\");\\n  return 0;\\n}\\n"
+  COMPILE_DEFINITIONS "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
+  COMPILE_OUTPUT_VARIABLE compile_output
+  RUN_OUTPUT_VARIABLE run_output
+  NO_CACHE)
+file(WRITE "${CMAKE_BINARY_DIR}/compile-result.txt" "${compile_result}\\n")
+file(WRITE "${CMAKE_BINARY_DIR}/run-result.txt" "${run_result}\\n")
+file(WRITE "${CMAKE_BINARY_DIR}/run-output.txt" "${run_output}")
+file(WRITE "${CMAKE_BINARY_DIR}/compile-output.log" "${compile_output}")
+message(STATUS "TryRun compile=${compile_result} exit=${run_result}")
+"""
+    case = _write_custom_fixture(root, args.compiler, lists)
+    store = root / "store"
+    base_env = environment(case, store)
+    calls = row["compiler_calls"] = {}
+    keys = ("compile", "exit", "run_output", "stdout", "stderr")
+
+    def run_lane(name: str, trap_value: str, run_id: str, *, oracle: bool = False) -> tuple[dict, int]:
+        lane_env = {**base_env, "RCMAKE_TRAP": trap_value, "GITHUB_RUN_ID": run_id}
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle)
+        return _read_try_run_outputs(data), count
+
+    cold, calls["cold"] = run_lane("cold", "alpha", "101")
+    require_calls(calls, "cold", 1)
+    if cold["compile"] != b"TRUE\n" or cold["exit"] != b"0\n" or cold["run_output"] != b"trap=alpha;run=101\n":
+        raise ValueError(f"Unexpected cold try_run output: {cold['run_output']!r}.")
+    oracle_cold, calls["oracle_cold"] = run_lane("oracle-cold", "alpha", "101", oracle=True)
+    require_calls(calls, "oracle_cold", 1)
+    compare(cold, oracle_cold, keys, "Run-env cold CMake parity")
+    if args.smoke:
+        return
+
+    entries = audit_store(store)
+    row["published"] = len(entries)
+    if len(entries) != 1:
+        raise ValueError(f"Expected one published entry for the try_run build. Found {len(entries)}.")
+
+    warm, calls["warm"] = run_lane("warm", "alpha", "101")
+    require_calls(calls, "warm", 0)
+    compare(warm, cold, keys, "Run-env warm configure")
+    if audit_store(store) != entries:
+        raise ValueError("The run-env warm lane changed the seeded probe entries.")
+
+    changed_inert, calls["changed_inert"] = run_lane("changed-inert", "alpha", "202")
+    oracle_inert, calls["oracle_inert"] = run_lane("oracle-inert", "alpha", "202", oracle=True)
+    require_calls(calls, "oracle_inert", 1)
+    if changed_inert["run_output"] != b"trap=alpha;run=202\n":
+        raise ValueError(f"try_run returned stale GITHUB_RUN_ID output: {changed_inert['run_output']!r}.")
+    compare(changed_inert, oracle_inert, keys, "Run-env inert-var CMake parity")
+
+    changed_trap, calls["changed_trap"] = run_lane("changed-trap", "beta", "202")
+    oracle_changed, calls["oracle_changed"] = run_lane("oracle-changed", "beta", "202", oracle=True)
+    require_calls(calls, "oracle_changed", 1)
+    if changed_trap["run_output"] != b"trap=beta;run=202\n":
+        raise ValueError(f"try_run returned stale RCMAKE_TRAP output: {changed_trap['run_output']!r}.")
+    compare(changed_trap, oracle_changed, keys, "Run-env changed CMake parity")
+
+
+def run_file(args, root: Path, row: dict) -> None:
+    """Require try_run build cache hit while observing a modified runtime input file."""
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbeRunFile C)
+try_run(run_result compile_result
+  SOURCE_FROM_CONTENT "probe_1.c"
+    "#include <stdio.h>\\nint main(int argc, char **argv) {\\n  if (argc < 2) return 2;\\n  FILE *f = fopen(argv[1], \\"rb\\");\\n  if (!f) return 3;\\n  char buf[128];\\n  size_t n = fread(buf, 1, sizeof(buf) - 1, f);\\n  fclose(f);\\n  buf[n] = '\\\\0';\\n  fputs(buf, stdout);\\n  return 0;\\n}\\n"
+  COMPILE_DEFINITIONS "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
+  COMPILE_OUTPUT_VARIABLE compile_output
+  RUN_OUTPUT_VARIABLE run_output
+  ARGS "${CMAKE_CURRENT_SOURCE_DIR}/../data.txt"
+  NO_CACHE)
+file(WRITE "${CMAKE_BINARY_DIR}/compile-result.txt" "${compile_result}\\n")
+file(WRITE "${CMAKE_BINARY_DIR}/run-result.txt" "${run_result}\\n")
+file(WRITE "${CMAKE_BINARY_DIR}/run-output.txt" "${run_output}")
+file(WRITE "${CMAKE_BINARY_DIR}/compile-output.log" "${compile_output}")
+message(STATUS "TryRun compile=${compile_result} exit=${run_result}")
+"""
+    case = _write_custom_fixture(root, args.compiler, lists, extra_files={"data.txt": b"runtime-before\n"})
+    store = root / "store"
+    env = environment(case, store)
+    calls = row["compiler_calls"] = {}
+    keys = ("compile", "exit", "run_output", "stdout", "stderr")
+
+    def run_lane(name: str, *, oracle: bool = False) -> tuple[dict, int]:
+        data, count = configure_raw(args, case, name, env, oracle=oracle)
+        return _read_try_run_outputs(data), count
+
+    cold, calls["cold"] = run_lane("cold")
+    require_calls(calls, "cold", 1)
+    if cold["compile"] != b"TRUE\n" or cold["exit"] != b"0\n" or cold["run_output"] != b"runtime-before\n":
+        raise ValueError(f"Unexpected cold try_run file output: {cold['run_output']!r}.")
+    oracle_before, calls["oracle_before"] = run_lane("oracle-before", oracle=True)
+    require_calls(calls, "oracle_before", 1)
+    compare(cold, oracle_before, keys, "Run-file cold CMake parity")
+    if args.smoke:
+        return
+
+    entries = audit_store(store)
+    row["published"] = len(entries)
+    if len(entries) != 1:
+        raise ValueError(f"Expected one published entry for the try_run build. Found {len(entries)}.")
+
+    (root / "data.txt").write_bytes(b"runtime-after\n")
+    changed, calls["changed"] = run_lane("changed")
+    require_calls(calls, "changed", 0)
+    if changed["run_output"] != b"runtime-after\n":
+        raise ValueError(f"try_run returned stale file output: {changed['run_output']!r}.")
+    oracle_after, calls["oracle_after"] = run_lane("oracle-after", oracle=True)
+    require_calls(calls, "oracle_after", 1)
+    compare(changed, oracle_after, keys, "Run-file changed CMake parity")
+    if audit_store(store) != entries:
+        raise ValueError("The run-file warm lane changed the seeded probe entries.")
+
+
+def runahead_effects(args, root: Path, row: dict) -> None:
+    """Require file(WRITE), message(STATUS), and set(CACHE) to happen once in oracle order."""
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbeRunaheadEffects C)
+include(CheckCSourceCompiles)
+
+check_c_source_compiles("int main(void) { return 0; }" RUNAHEAD_EFFECT_PROBE_1)
+message(STATUS "Runahead effect 1 = ${RUNAHEAD_EFFECT_PROBE_1}")
+set(RUNAHEAD_CACHE_1 "val-1-${RUNAHEAD_EFFECT_PROBE_1}" CACHE STRING "Runahead cache 1")
+
+check_c_source_compiles("int main(void) { int a = 1; return a - 1; }" RUNAHEAD_EFFECT_PROBE_2)
+message(STATUS "Runahead effect 2 = ${RUNAHEAD_EFFECT_PROBE_2}")
+set(RUNAHEAD_CACHE_2 "val-2-${RUNAHEAD_EFFECT_PROBE_2}" CACHE STRING "Runahead cache 2")
+
+check_c_source_compiles("int main(void) { int b = 2; return b - 2; }" RUNAHEAD_EFFECT_PROBE_3)
+file(WRITE "${CMAKE_BINARY_DIR}/effect-write.txt"
+  "written:${RUNAHEAD_EFFECT_PROBE_1}:${RUNAHEAD_EFFECT_PROBE_2}:${RUNAHEAD_EFFECT_PROBE_3}\\n")
+file(APPEND "${CMAKE_BINARY_DIR}/effects.log"
+  "stage-1:${RUNAHEAD_EFFECT_PROBE_1}:${RUNAHEAD_EFFECT_PROBE_2}:${RUNAHEAD_EFFECT_PROBE_3}\\n")
+message(STATUS "Runahead effect 3 = ${RUNAHEAD_EFFECT_PROBE_3}")
+set(RUNAHEAD_CACHE_3 "val-3-${RUNAHEAD_EFFECT_PROBE_3}" CACHE STRING "Runahead cache 3")
+
+check_c_source_compiles("int main(void) { int c = 3; return c - 3; }" RUNAHEAD_EFFECT_PROBE_4)
+file(APPEND "${CMAKE_BINARY_DIR}/effects.log"
+  "stage-2:${RUNAHEAD_EFFECT_PROBE_4}\\n")
+message(STATUS "Runahead effect 4 = ${RUNAHEAD_EFFECT_PROBE_4}")
+set(RUNAHEAD_CACHE_4 "val-4-${RUNAHEAD_EFFECT_PROBE_4}" CACHE STRING "Runahead cache 4")
+"""
+    cache_keys = (
+        "RUNAHEAD_EFFECT_PROBE_1", "RUNAHEAD_EFFECT_PROBE_2",
+        "RUNAHEAD_EFFECT_PROBE_3", "RUNAHEAD_EFFECT_PROBE_4",
+        "RUNAHEAD_CACHE_1", "RUNAHEAD_CACHE_2", "RUNAHEAD_CACHE_3", "RUNAHEAD_CACHE_4",
+    )
+    case = _write_custom_fixture(root, args.compiler, lists)
+    env_jobs8 = {**environment(case, root / "store-jobs8"), "RCMAKE_PROBE_JOBS": "8"}
+    env_jobs1 = {**environment(case, root / "store-jobs1"), "RCMAKE_PROBE_JOBS": "1"}
+    calls = row["compiler_calls"] = {}
+    compare_keys = ("effects_log", "effect_write", "stdout", "stderr", "cache")
+
+    def run_lane(name: str, lane_env: dict, *, oracle: bool = False) -> tuple[dict, int]:
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle)
+        build = data["build"]
+        data["effects_log"] = (build / "effects.log").read_bytes()
+        data["effect_write"] = (build / "effect-write.txt").read_bytes()
+        data["cache"] = read_cache_entries(build, cache_keys)
+        return data, count
+
+    jobs8, calls["jobs8"] = run_lane("jobs8", env_jobs8)
+    oracle, calls["oracle"] = run_lane("oracle", env_jobs1, oracle=True)
+    require_calls(calls, "oracle", 4)
+    if jobs8["effects_log"] != b"stage-1:1:1:1\nstage-2:1\n":
+        raise ValueError(f"Unexpected effects.log under RCMAKE_PROBE_JOBS=8: {jobs8['effects_log']!r}.")
+    if jobs8["effect_write"] != b"written:1:1:1\n":
+        raise ValueError(f"Unexpected effect-write.txt under RCMAKE_PROBE_JOBS=8: {jobs8['effect_write']!r}.")
+    compare(jobs8, oracle, compare_keys, "Runahead-effects CMake parity")
+    if args.smoke:
+        return
+
+    jobs1, calls["jobs1"] = run_lane("jobs1", env_jobs1)
+    require_calls(calls, "jobs1", 4)
+    compare(jobs8, jobs1, compare_keys, "Runahead-effects jobs=8 vs jobs=1 parity")
+
+
+def runahead_mispredict(args, root: Path, row: dict) -> None:
+    """Require oracle-equal results when a failing check changes CMAKE_REQUIRED_FLAGS."""
+    lists = """\
+cmake_minimum_required(VERSION 4.5)
+project(ProbeRunaheadMispredict C)
+include(CheckCSourceCompiles)
+
+check_c_source_compiles(
+  "int rcmake_missing_symbol_requires_failure = ;\\nint main(void) { return 0; }"
+  MISPREDICT_FIRST)
+
+if(MISPREDICT_FIRST)
+  set(CMAKE_REQUIRED_FLAGS "-DRCMAKE_BRANCH_TAKEN=1")
+else()
+  set(CMAKE_REQUIRED_FLAGS "-DRCMAKE_BRANCH_FALLBACK=1")
+endif()
+
+check_c_source_compiles(
+  "#ifndef RCMAKE_BRANCH_FALLBACK\\nint rcmake_fallback_required = ;\\n#endif\\nint main(void) { return 0; }"
+  MISPREDICT_SECOND)
+
+check_c_source_compiles(
+  "#ifdef RCMAKE_BRANCH_TAKEN\\nint rcmake_branch_leaked = ;\\n#endif\\nint main(void) { return 0; }"
+  MISPREDICT_THIRD)
+
+set(summary "")
+foreach(var IN ITEMS MISPREDICT_FIRST MISPREDICT_SECOND MISPREDICT_THIRD)
+  if(${var})
+    string(APPEND summary "${var}=1\\n")
+  else()
+    string(APPEND summary "${var}=0\\n")
+  endif()
+endforeach()
+file(WRITE "${CMAKE_BINARY_DIR}/mispredict-results.txt" "${summary}")
+message(STATUS "Mispredict summary ${MISPREDICT_FIRST}|${MISPREDICT_SECOND}|${MISPREDICT_THIRD}")
+"""
+    cache_keys = ("MISPREDICT_FIRST", "MISPREDICT_SECOND", "MISPREDICT_THIRD")
+    expected_summary = b"MISPREDICT_FIRST=0\nMISPREDICT_SECOND=1\nMISPREDICT_THIRD=1\n"
+    case = _write_custom_fixture(root, args.compiler, lists)
+    env_jobs8 = {**environment(case, root / "store-jobs8"), "RCMAKE_PROBE_JOBS": "8"}
+    env_jobs1 = {**environment(case, root / "store-jobs1"), "RCMAKE_PROBE_JOBS": "1"}
+    calls = row["compiler_calls"] = {}
+    compare_keys = ("summary", "stdout", "stderr", "cache")
+
+    def run_lane(name: str, lane_env: dict, *, oracle: bool = False) -> tuple[dict, int]:
+        data, count = configure_raw(args, case, name, lane_env, oracle=oracle)
+        build = data["build"]
+        data["summary"] = (build / "mispredict-results.txt").read_bytes()
+        data["cache"] = read_cache_entries(build, cache_keys)
+        return data, count
+
+    jobs8, calls["jobs8"] = run_lane("jobs8", env_jobs8)
+    oracle, calls["oracle"] = run_lane("oracle", env_jobs1, oracle=True)
+    require_calls(calls, "oracle", 3)
+    if jobs8["summary"] != expected_summary:
+        raise ValueError(f"Unexpected mispredict results under RCMAKE_PROBE_JOBS=8: {jobs8['summary']!r}.")
+    compare(jobs8, oracle, compare_keys, "Runahead-mispredict CMake parity")
+    if args.smoke:
+        return
+
+    jobs1, calls["jobs1"] = run_lane("jobs1", env_jobs1)
+    require_calls(calls, "jobs1", 3)
+    compare(jobs8, jobs1, compare_keys, "Runahead-mispredict jobs=8 vs jobs=1 parity")
+    row["wasted_compiler_calls"] = max(0, calls["jobs8"] - calls["jobs1"])
+
+
 @dataclass(frozen=True)
 class CaseSpec:
     """Describe one selectable probe-cache evaluation case."""
@@ -910,6 +1495,27 @@ EXTENDED_CASES: tuple[CaseSpec, ...] = (
     CaseSpec("ninja-present", "G3/G4", "extended",
              "Publish and reuse a probe with real ninja first on PATH and -G Ninja.",
              ninja_present),
+    CaseSpec("ninja-swap", "G3", "extended",
+             "Verify cache invalidation when the ninja executable content and version change.",
+             ninja_swap),
+    CaseSpec("flag-plugin", "G3", "extended",
+             "Refuse to cache probes using plugin, linker, host-arch, or profile flags.",
+             flag_plugin),
+    CaseSpec("env-inert", "G3", "extended",
+             "Hit the probe cache across mutated proven-inert shell and CI environment variables.",
+             env_inert),
+    CaseSpec("run-env", "G3", "extended",
+             "Cache try_run compilation while observing changed runtime environment variables.",
+             run_env),
+    CaseSpec("run-file", "G3", "extended",
+             "Cache try_run compilation while observing a modified runtime input file.",
+             run_file),
+    CaseSpec("runahead-effects", "G4", "extended",
+             "Preserve single in-order file(WRITE), message(STATUS), and set(CACHE) under RCMAKE_PROBE_JOBS=8.",
+             runahead_effects),
+    CaseSpec("runahead-mispredict", "G4", "extended",
+             "Match oracle cache and output when a failing check alters CMAKE_REQUIRED_FLAGS under RCMAKE_PROBE_JOBS=8.",
+             runahead_mispredict),
 )
 
 ALL_CASES: tuple[CaseSpec, ...] = BASELINE_CASES + EXTENDED_CASES
@@ -1046,6 +1652,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rcmake")
     parser.add_argument("--oracle", default=os.environ.get("RCMAKE_ORACLE_CMAKE"))
     parser.add_argument("--cc", default=shutil.which("cc"))
+    parser.add_argument("--cxx", default=None,
+                        help="Path to the POSIX C++ compiler for C++20 soundness traps.")
     parser.add_argument("--ninja", default=None,
                         help="Path to the real ninja executable for Ninja-present lanes.")
     parser.add_argument("--generator", default="Ninja",
