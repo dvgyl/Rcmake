@@ -655,9 +655,10 @@ def run_project(pin: dict, root: Path, engines: dict[str, Path], tc: Toolchain,
         first, second = (result["lanes"][engine] for engine in ("oracle", "rcmake"))
         if "error" in first:
             result["status"] = "oracle_error"
-        elif "error" in second or result["l2"] != "equal":
+        elif ("error" in second or result["l2"] != "equal"
+              or any(status != "equal" for status in result["l1"].values())):
             result["status"] = "fail"
-        elif "incomplete" not in result["l1"].values():
+        else:
             result["status"] = "pass"
     except RUN_ERRORS as error:
         result["error"] = str(error)

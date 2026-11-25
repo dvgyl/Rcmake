@@ -9,7 +9,7 @@ name: Ecosystem parity
       lane:
         description: "Select the tests to run."
         type: choice
-        options: [all, vcpkg, conan, large-projects, toolchains, qt]
+        options: [all, vcpkg, conan, large-projects, toolchains, qt, runcmake, runcmake-windows, runcmake-linux, runcmake-macos, conformance]
         default: all
       vcpkg_shard_count:
         description: "Number of vcpkg shards (1 to 128)."
@@ -19,6 +19,10 @@ name: Ecosystem parity
         description: "Zero-based vcpkg shard index. Use -1 to run all shards."
         type: number
         default: -1
+      large_projects_full:
+        description: "Build the selected targets and run the project checks after configure and dry-run comparison."
+        type: boolean
+        default: false
       cuda:
         description: "Select the CUDA toolkit for the Linux lane."
         type: choice
@@ -78,10 +82,11 @@ jobs:
               print("shards=" + json.dumps(list(range(count)) if index == -1 else [index]), file=output)
               print("large_projects=" + json.dumps(large_projects), file=output)
           PY
-      - name: Find the CI binary for this commit
+      - name: Find the CI binaries for this commit
         id: binary
         env:
           GH_TOKEN: ${{ github.token }}
+          ECOSYSTEM_LANE: ${{ inputs.lane || 'all' }}
         run: |
           source env/env.sh
           python3 - <<'PY'
@@ -95,13 +100,21 @@ jobs:
           workflow = f"{repo}/actions/workflows/ci.yml"
           sha = os.environ["GITHUB_SHA"]
           ref = os.environ["GITHUB_REF_NAME"]
-          artifact_name = "rcmake-ci-ubuntu-24.04"
+          lane = os.environ["ECOSYSTEM_LANE"]
+          systems = {
+              "runcmake-windows": ["windows-2025"],
+              "runcmake-linux": ["ubuntu-24.04"],
+              "runcmake-macos": ["macos-15"],
+              "runcmake": ["ubuntu-24.04", "macos-15", "windows-2025"],
+              "all": ["ubuntu-24.04", "macos-15", "windows-2025"],
+          }.get(lane, ["ubuntu-24.04"])
+          artifacts = {f"rcmake-ci-{system}" for system in systems}
           deadline = time.monotonic() + 5200
 
           def pause(seconds):
               remaining = deadline - time.monotonic()
               if remaining <= 0:
-                  raise SystemExit(f"::error::Timed out waiting for {artifact_name} at {sha}.")
+                  raise SystemExit(f"::error::Timed out waiting for CI artifacts at {sha}.")
               time.sleep(min(seconds, remaining))
 
           def api(path, *args, method="GET", attempts=3):
@@ -124,9 +137,8 @@ jobs:
               return api(f"{workflow}/runs", "-f", f"head_sha={sha}", "-F", "per_page=50")["workflow_runs"]
 
           def available(run_id):
-              artifacts = api(f"{repo}/actions/runs/{run_id}/artifacts",
-                              "-f", f"name={artifact_name}")["artifacts"]
-              return any(row["name"] == artifact_name and not row["expired"] for row in artifacts)
+              rows = api(f"{repo}/actions/runs/{run_id}/artifacts", "-F", "per_page=100")["artifacts"]
+              return artifacts <= {row["name"] for row in rows if not row["expired"]}
 
           def publish(run_id):
               with open(os.environ["GITHUB_OUTPUT"], "a") as output:
@@ -179,7 +191,7 @@ jobs:
                   break
               if run["status"] == "completed":
                   raise SystemExit(f"::error::CI run {run_id} concluded with {run['conclusion']} "
-                                   f"and did not publish {artifact_name}.")
+                                   f"and did not publish {sorted(artifacts)}.")
               pause(30)
           PY
 
@@ -261,8 +273,10 @@ jobs:
           import shutil
           import signal
           import subprocess
+          import time
           from tempfile import TemporaryDirectory
 
+          started = time.monotonic()
           root = Path(os.environ["RUNNER_TEMP"])
           vcpkg = root / "vcpkg"
           report = root / "vcpkg-report"
@@ -277,10 +291,17 @@ jobs:
           seconds_per_port = 2 * (engine_timeout + kill_wait)
           budget = 60 * int(os.environ["VCPKG_COMPARE_MINUTES"])
           worst_case = len(ports) * seconds_per_port
-          (report / "shard.json").write_text(json.dumps({
+          shard = {
               "shard_index": index, "shard_count": count, "expected_ports": len(ports),
               "worst_case_seconds": worst_case, "budget_seconds": budget,
-          }) + "\n", encoding="utf-8")
+              "install_passed": {"oracle": 0, "rcmake": 0},
+          }
+
+          def save_shard():
+              shard["duration_seconds"] = round(time.monotonic() - started, 3)
+              (report / "shard.json").write_text(json.dumps(shard, indent=2) + "\n", encoding="utf-8")
+
+          save_shard()
           print(f"vcpkg shard {index}/{count} has {len(ports)} ports. "
                 f"Allow up to {worst_case} seconds for the two engines.", flush=True)
           # Reserve time for report and build directory cleanup.
@@ -367,13 +388,20 @@ jobs:
                   status = score(left, right)
                   scored += bool(left["configure_profiles"])
                   summary[status] += 1
+                  shard["install_passed"]["oracle"] += left["install_exit"] == 0
+                  shard["install_passed"]["rcmake"] += right["install_exit"] == 0
                   print(json.dumps({"port": port, "status": status, "oracle": left, "rcmake": right}),
                         file=rows)
+                  shard["configure_results"] = dict(summary)
+                  save_shard()
                   print(port, status, flush=True)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
               print(f"vcpkg shard {index}/{count}. {scored} of {len(ports)} ports scored.", file=output)
               for status, total in sorted(summary.items()):
-                  print(f"- {status}: {total}", file=output)
+                  print(f"- Configure {status}: {total}", file=output)
+              for engine, total in shard["install_passed"].items():
+                  print(f"- {engine} installs passed: {total}/{len(ports)}", file=output)
+              print(f"- Duration: {shard['duration_seconds']:.1f} seconds", file=output)
           if not scored:
               raise SystemExit("The shard did not score any CMake ports.")
           raise SystemExit(bool(summary["configure-mismatch"] or summary["cmake-identity-mismatch"]))
@@ -497,11 +525,11 @@ jobs:
           PY
 
   large-projects:
-    name: Large-project L1 and L2 / ${{ matrix.project }}
+    name: Large-project parity / ${{ matrix.project }}
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'large-projects'
     needs: prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: ${{ inputs.large_projects_full && 350 || 75 }}
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -509,6 +537,8 @@ jobs:
         project: ${{ fromJSON(needs.prepare.outputs.large_projects) }}
     env:
       CORPUS_PROJECT: ${{ matrix.project }}
+      LARGE_PROJECTS_FULL: ${{ inputs.large_projects_full }}
+      GIT_LFS_SKIP_SMUDGE: "1"
     steps:
       - *checkout
       - *python
@@ -555,19 +585,24 @@ jobs:
               subprocess.run([sys.executable, "-m", "aqt", "install-qt", "linux", "desktop", "6.8.3",
                               "linux_gcc_64", "--outputdir", output], timeout=780, check=True)
           PY
-      - name: Compare configure data and Ninja commands
+      - name: Compare configure data and run the selected checks
         run: |
           source env/env.sh
           if [[ "$CORPUS_PROJECT" == rclcpp ]]; then
             source /opt/ros/jazzy/setup.bash
           fi
-          timeout --kill-after=15s 44m python3 - <<'PY'
+          limit=44m
+          if [[ "$LARGE_PROJECTS_FULL" == true ]]; then
+            limit=300m
+          fi
+          timeout --signal=INT --kill-after=15s "$limit" python3 - <<'PY'
           from collections import Counter
           import itertools
           import json
           import os
           from pathlib import Path
           import resource
+          import shutil
           import subprocess
           import sys
           import tomllib
@@ -589,6 +624,19 @@ jobs:
           work.mkdir()
           report = work / "report"
           report.mkdir()
+          full = os.environ.get("LARGE_PROJECTS_FULL") == "true"
+          result = {
+              "project": pin["name"], "commit": pin["commit"], "rcmake_sha": os.environ["GITHUB_SHA"],
+              "l1_status": "incomplete", "l2_status": "incomplete",
+              "l3_status": "incomplete" if full else "not_requested",
+              "l4_status": "incomplete" if full else "not_requested",
+              "l1": {}, "l2": "incomplete", "status": "incomplete", "checks": {},
+          }
+
+          def save_result():
+              (report / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+
+          save_result()
           oracle = Path(os.environ["ECOSYSTEM_ORACLE"])
           rcmake = Path(os.environ["ECOSYSTEM_RCMAKE"])
           memory = pin["runner"]["memory_gib"] * 1024**3
@@ -607,20 +655,26 @@ jobs:
                   run(["git", "-C", destination, "submodule", "update", "--init", "--recursive",
                        "--depth=1", "--jobs=4"], 900)
 
-          prefix = [work / "prerequisites"]
-          if pin.get("use_qt"):
-              prefix.append(Path(os.environ["RUNNER_TEMP"]) / "qt/6.8.3/gcc_64")
-          for index, prerequisite in enumerate(pin.get("prerequisite", [])):
-              dependency = work / f"dependency-{index}"
-              checkout(prerequisite, dependency)
-              deps_build = work / f"dependency-{index}-build"
-              run([oracle, "-S", dependency, "-B", deps_build, "-G", "Ninja",
-                   *prerequisite["configure_args"]])
-              run([oracle, "--build", deps_build, "--parallel", "2"])
-              run([oracle, "--install", deps_build, "--prefix", prefix[0]])
-
           source = work / "source"
-          checkout(pin, source)
+          git = ["git", "-C", source]
+          prefix = [work / "prerequisites"]
+
+          def source_status():
+              revision = subprocess.check_output([*git, "rev-parse", "HEAD"], timeout=20, text=True).strip()
+              if revision != pin["commit"]:
+                  raise ValueError(f"The source commit changed to {revision}.")
+              return subprocess.check_output(
+                  [*git, "status", "--porcelain", "--ignored", "--ignore-submodules=none"],
+                  timeout=120, text=True,
+              )
+
+          def reset_source():
+              run([*git, "checkout", pin["commit"], "--", "."], 120)
+              run([*git, "clean", "-fdx"], 120)
+              if pin.get("submodules"):
+                  run([*git, "submodule", "update", "--checkout", "--force", "--recursive"], 300)
+                  run([*git, "submodule", "foreach", "--recursive", "git clean -fdx"], 300)
+
           cmake_source = source / pin.get("source_subdir", ".")
           build = work / "build"
           install = work / "install"
@@ -649,7 +703,31 @@ jobs:
 
               return [read(json.loads((reply / name).read_text()))]
 
-          def configure(name, cmake):
+          def full_checks(name, cmake, checks):
+              def check(label, command, timeout=3600):
+                  checks[label] = "fail"
+                  with (report / f"{name}-{label}.log").open("w") as log:
+                      subprocess.run(command, cwd=build, stdout=log, stderr=subprocess.STDOUT,
+                                     check=True, timeout=timeout)
+                  checks[label] = "pass"
+                  save_result()
+
+              check("l3", [cmake, "--build", build, "--parallel", "2", "--target", *pin["l3_targets"]])
+              l4 = pin["l4"]
+              checks["l4"] = "fail"
+              if l4.get("ninja"):
+                  check("test-targets", [cmake, "--build", build, "--parallel", "2",
+                                         "--target", *l4["ninja"]])
+              if l4.get("ctest"):
+                  check("ctest", [cmake.with_name("ctest"), "--test-dir", build, "--no-tests=error",
+                                  "--output-on-failure", *l4["ctest"]], 1800)
+              for index, target in enumerate(l4.get("executables", [])):
+                  check(f"test-executable-{index}", [build / target], 1800)
+              if l4.get("install"):
+                  check("install", [cmake, "--build", build, "--parallel", "2", "--target", "install"])
+              checks["l4"] = "pass"
+
+          def configure(name, cmake, checks):
               query = build / ".cmake/api/v1/query"
               query.mkdir(parents=True)
               (query / "codemodel-v2").touch()
@@ -667,6 +745,9 @@ jobs:
                          *pin["configure_args"]]
               if pin.get("use_ros_jazzy"):
                   command.append("-DPython3_EXECUTABLE=/usr/bin/python3")
+              if full and pin["name"] == "opencv":
+                  command += ["-DBUILD_LIST=core,imgproc,imgcodecs,ts",
+                              f"-DOPENCV_TEST_DATA_PATH={work / 'opencv-extra/testdata'}"]
               try:
                   with (report / f"{name}.stderr").open("w") as log:
                       subprocess.run(command, timeout=600, check=True, stderr=log)
@@ -677,36 +758,66 @@ jobs:
                       for line in (build / "CMakeCache.txt").read_text().splitlines()
                       if line and not line.startswith(("#", "//")))
                   diagnostics = [normalize.text((report / f"{name}.stderr").read_text())]
-                  return {
+                  observed = {
                       "diagnostics": diagnostics,
                       "cache": cache,
                       "codemodel": codemodel(normalize),
                       "edges": canonicalize(normalize),
-                      "commands": dry_run(normalize, pin["l2_targets"]),
                   }
-              finally:
-                  build.rename(work / name)
-
-          results = {}
-          for name, cmake in (("oracle", oracle), ("rcmake", rcmake)):
-              try:
-                  results[name] = configure(name, cmake)
               except (OSError, KeyError, ValueError, StopIteration, subprocess.SubprocessError) as error:
-                  print(f"{pin['name']} {name}: {error}", flush=True)
-          if "oracle" not in results:
-              raise SystemExit("Oracle configure or dry run failed. See the oracle diagnostics.")
-          if "rcmake" not in results:
-              raise SystemExit("Rcmake configure or dry run failed. See the Rcmake diagnostics.")
+                  checks["configure"] = "fail"
+                  checks["configure_error"] = str(error)
+                  return {}
+              checks["configure"] = "pass"
+              try:
+                  commands = dry_run(normalize, pin["l2_targets"])
+                  if not commands:
+                      raise ValueError("The Ninja dry run produced no commands.")
+                  observed["commands"] = commands
+                  checks["dry_run"] = "pass"
+              except (OSError, ValueError, subprocess.SubprocessError) as error:
+                  checks.update(dry_run="fail", dry_run_error=str(error))
+              return observed
 
-          mismatches = set()
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+          def run_lane(name, cmake):
+              checks = result["checks"][name] = {}
+              before = source_status()
+              if before:
+                  raise ValueError(f"Source was modified before the {name} run.\n{before}")
+              try:
+                  observed = configure(name, cmake, checks)
+                  if observed and full:
+                      try:
+                          full_checks(name, cmake, checks)
+                      except (OSError, subprocess.SubprocessError) as error:
+                          checks["full_error"] = str(error)
+              finally:
+                  after = source_status()
+                  (report / f"{name}-source-status.txt").write_text(after, encoding="utf-8")
+                  checks["source_clean"] = not after
+                  save_result()
+                  if full:
+                      for directory in (build, install):
+                          if directory.exists():
+                              shutil.rmtree(directory)
+                  elif build.exists():
+                      build.rename(work / name)
+              return observed
+
+          def compare(results, summary):
               for key, left in results["oracle"].items():
+                  if key not in results["rcmake"]:
+                      continue
                   right = results["rcmake"][key]
                   level = "L2" if key == "commands" else "L1"
-                  if left == right:
+                  status = "equal" if left == right else "different"
+                  if level == "L1":
+                      result["l1"][key] = status
+                  else:
+                      result["l2"] = status
+                  if status == "equal":
                       print(f"- {level} {key}: pass", file=summary)
                       continue
-                  mismatches.add(key)
                   with (report / f"{key}.diff").open("w") as output:
                       for line in itertools.islice(differences(left, right), DIFF_LINES):
                           print(line, file=output)
@@ -721,7 +832,56 @@ jobs:
                   }, indent=2) + "\n")
                   print(f"- {level} {key}: different ({sum(oracle_only.values())} oracle-only, "
                         f"{sum(rcmake_only.values())} Rcmake-only rows)", file=summary)
-          raise SystemExit(bool(mismatches))
+          try:
+              if pin.get("use_qt"):
+                  prefix.append(Path(os.environ["RUNNER_TEMP"]) / "qt/6.8.3/gcc_64")
+              for index, prerequisite in enumerate(pin.get("prerequisite", [])):
+                  dependency = work / f"dependency-{index}"
+                  checkout(prerequisite, dependency)
+                  deps_build = work / f"dependency-{index}-build"
+                  run([oracle, "-S", dependency, "-B", deps_build, "-G", "Ninja",
+                       *prerequisite["configure_args"]])
+                  run([oracle, "--build", deps_build, "--parallel", "2"])
+                  run([oracle, "--install", deps_build, "--prefix", prefix[0]])
+
+              checkout(pin, source)
+              if full and pin["name"] == "opencv":
+                  checkout({"repository": "opencv/opencv_extra", "commit": "refs/tags/4.12.0"},
+                           work / "opencv-extra")
+                  os.environ["OPENCV_TEST_DATA_PATH"] = str(work / "opencv-extra/testdata")
+              results = {"oracle": run_lane("oracle", oracle)}
+              reset_source()
+              results["rcmake"] = run_lane("rcmake", rcmake)
+
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                  compare(results, summary)
+                  if result["l1"]:
+                      result["l1_status"] = "pass" if all(
+                          value == "equal" for value in result["l1"].values()) else "fail"
+                  if result["l2"] != "incomplete":
+                      result["l2_status"] = "pass" if result["l2"] == "equal" else "fail"
+                  required = ["l1_status", "l2_status"]
+                  if full:
+                      for level in ("l3", "l4"):
+                          states = [lane.get(level, "incomplete") for lane in result["checks"].values()]
+                          status = "pass" if states == ["pass", "pass"] else (
+                              "fail" if "fail" in states else "incomplete")
+                          result[f"{level}_status"] = status
+                          required.append(f"{level}_status")
+                  for key in required:
+                      print(f"- {key}: {result[key]}", file=summary)
+                  for name, checks in result["checks"].items():
+                      print(f"- {name} source clean: {checks['source_clean']}", file=summary)
+                  passed = all(result[key] == "pass" for key in required) and all(
+                      lane["source_clean"] for lane in result["checks"].values())
+                  result["status"] = "pass" if passed else (
+                      "oracle_error" if not results["oracle"] else "fail")
+          except (OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+              result["error"] = str(error) or "Project comparison interrupted."
+              raise
+          finally:
+              save_result()
+          raise SystemExit(result["status"] != "pass")
           PY
       - uses: actions/upload-artifact@v6
         if: always()
@@ -729,6 +889,210 @@ jobs:
           name: large-projects-${{ matrix.project }}
           path: ${{ runner.temp }}/large-projects/report
           if-no-files-found: ignore
+
+  runcmake-linux:
+    name: Full RunCMake on Linux
+    if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-linux'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      CI_BINARY: rcmake-ci-ubuntu-24.04
+      RUNCMAKE_PROFILE: linux
+      RUNCMAKE_REPORT: runcmake-linux.json
+    steps:
+      - *checkout
+      - *python
+      - &runcmake_binary
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ env.CI_BINARY }}
+          path: target/stage/bin
+          run-id: ${{ needs.prepare.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ clang ninja-build make binutils libzstd1 pkg-config rpm
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/appimagetool" \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/appimage-runtime" \
+            https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          sha256sum --check <<EOF
+          ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  $RUNNER_TEMP/appimagetool
+          2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  $RUNNER_TEMP/appimage-runtime
+          EOF
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - &runcmake_stage
+        name: Stage the Rcmake tools and data
+        run: |
+          mkdir -p target/stage/share
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            for tool in cmake ctest cpack; do
+              cp target/stage/bin/rcmake.exe "target/stage/bin/$tool.exe"
+            done
+            cp -R modules/cmake-4.5 target/stage/share/
+          else
+            chmod +x target/stage/bin/rcmake
+            for tool in cmake ctest cpack; do
+              ln -sfn rcmake "target/stage/bin/$tool"
+            done
+            ln -sfn "$GITHUB_WORKSPACE/modules/cmake-4.5" target/stage/share/cmake-4.5
+          fi
+      - &runcmake_run
+        name: Compare RunCMake cases with CMake 4.5.1
+        timeout-minutes: 330
+        run: |
+          source env/env.sh
+          oracle_env="$(scripts/fetch-oracle.sh --print-env)"
+          eval "$oracle_env"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            for variable in RCMAKE_ORACLE_CMAKE RCMAKE_ORACLE_CTEST RCMAKE_ORACLE_CPACK \
+                            RCMAKE_ORACLE_SRC RCMAKE_ORACLE_RUNCMAKE_DIR RCMAKE_VENDORED_DATA_ROOT; do
+              export "$variable=$(cygpath -am "${!variable}")"
+            done
+            msvc_bin="$(cygpath -u "${VCToolsInstallDir%\\}/bin/Hostx64/x64")"
+            export PATH="$msvc_bin:$PATH"
+            command -v cl.exe link.exe nmake.exe ninja
+          fi
+          options=()
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            export APPIMAGE_EXTRACT_AND_RUN=1
+            options=(--test-var CMake_TEST_CPACK_APPIMAGE=ON
+                     --test-var "CMake_TEST_CPACK_APPIMAGE_RUNTIME_FILE=$RUNNER_TEMP/appimage-runtime")
+          fi
+          python tools/measure/runcmake_eval.py --profile "$RUNCMAKE_PROFILE" \
+            --stage target/stage/bin --json "$RUNCMAKE_REPORT" --min-pass-rate 99.0 "${options[@]}"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: runcmake-linux-full
+          path: ${{ env.RUNCMAKE_REPORT }}
+          if-no-files-found: error
+
+  runcmake-macos:
+    name: Full RunCMake on macOS
+    if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-macos'
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 350
+    env:
+      CI_BINARY: rcmake-ci-macos-15
+      RUNCMAKE_PROFILE: all-macos
+      RUNCMAKE_REPORT: runcmake-macos.json
+    steps:
+      - *checkout
+      - *python
+      - *runcmake_binary
+      - name: Check Xcode and install missing build tools
+        run: |
+          xcodebuild -version
+          if ! command -v ninja >/dev/null; then
+            brew install ninja
+          fi
+          if ! command -v pkg-config >/dev/null; then
+            brew install pkgconf
+          fi
+          ninja --version
+      - *runcmake_stage
+      - *runcmake_run
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: runcmake-macos-full
+          path: ${{ env.RUNCMAKE_REPORT }}
+          if-no-files-found: error
+
+  runcmake-windows:
+    name: Full RunCMake on Windows
+    if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-windows'
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 350
+    env:
+      CI_BINARY: rcmake-ci-windows-2025
+      RUNCMAKE_PROFILE: windows
+      RUNCMAKE_REPORT: runcmake-windows.json
+    steps:
+      - *checkout
+      - *python
+      - *runcmake_binary
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          vsversion: "2022"
+      - name: Install Windows build and packaging tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($tool in @{ninja='ninja'; nuget='nuget.commandline'; candle='wixtoolset'}.GetEnumerator()) {
+            if (-not (Get-Command "$($tool.Key).exe" -ErrorAction SilentlyContinue)) {
+              choco install $tool.Value -y --no-progress
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
+          if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue)) {
+            $wix = Get-ChildItem "${env:ProgramFiles(x86)}" -Directory -Filter 'WiX Toolset v3.*' |
+              Sort-Object Name -Descending | Select-Object -First 1
+            if (-not $wix) { throw 'WiX 3 is missing.' }
+            $wixBin = Join-Path $wix.FullName bin
+            $wixBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+      - *runcmake_stage
+      - *runcmake_run
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: runcmake-windows
+          path: ${{ env.RUNCMAKE_REPORT }}
+          if-no-files-found: error
+
+  conformance:
+    name: CLI and differential conformance
+    if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'conformance'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - *checkout
+      - *python
+      - *binary
+      - *stage
+      - *oracle
+      - name: Install Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: conformance-lsp
+      - name: Build the evaluated language server
+        run: |
+          source env/env.sh
+          cargo build --locked -p rcmake-lsp --bin rcmake-lsp --features eval,stdio
+      - name: Check CLI behavior and the language server
+        run: |
+          source env/env.sh
+          mkdir -p conformance-report
+          python3 conformance/cases/cli-ux/verify.py --rcmake target/stage/bin/rcmake \
+            --lsp target/debug/rcmake-lsp --oracle "$ECOSYSTEM_ORACLE" 2>&1 | tee conformance-report/cli-ux.log
+      - name: Run differential tests with the CMake oracle
+        if: success() || failure()
+        run: |
+          source env/env.sh
+          mkdir -p conformance-report
+          RCMAKE_ORACLE_CMAKE="$ECOSYSTEM_ORACLE" python3 tools/measure/oracle_prop_test.py \
+            --rcmake-bin target/stage/bin/rcmake --out conformance-report/oracle-prop.json
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: conformance
+          path: conformance-report
+          if-no-files-found: error
 
   linux-extended:
     name: Linux extended conformance

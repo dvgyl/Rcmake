@@ -216,6 +216,7 @@ def compare(offline, timeout):
         "modules_removed": sorted(known_modules.keys() - modules.keys()),
         "runcmake_suites_added": sorted(suite_ids - old_suites - known_suites),
     }
+    has_delta = any(delta.values())
     return {
         "baseline": {
             "version": version_text(BASELINE),
@@ -234,8 +235,8 @@ def compare(offline, timeout):
             "runcmake_suite_count": len(suite_ids),
         },
         "delta": delta,
-        "has_delta": any(delta.values()),
-        "issue_required": bool(new_releases or new_policies),
+        "has_delta": has_delta,
+        "issue_required": has_delta,
     }
 
 

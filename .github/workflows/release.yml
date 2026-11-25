@@ -113,15 +113,19 @@ jobs:
           cargo build --locked --release --bin rcmake --target $env:RELEASE_TARGET --target-dir $targetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          $binary = "$targetDir/$env:RELEASE_TARGET/release/rcmake.exe"
+          cargo build --locked --release -p rcmake-lsp --bin rcmake-lsp --features eval,stdio --target $env:RELEASE_TARGET --target-dir $targetDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $binaries = "$targetDir/$env:RELEASE_TARGET/release"
           $name = "rcmake-$env:RELEASE_VERSION-$env:RELEASE_TARGET"
           $work = Join-Path $env:RUNNER_TEMP ([Guid]::NewGuid().ToString())
           $package = Join-Path $work $name
           try {
             New-Item -ItemType Directory -Path "$package/bin", "$package/share", "$package/third_party", 'dist' -Force | Out-Null
             foreach ($tool in 'rcmake', 'cmake', 'ctest', 'cpack') {
-              Copy-Item $binary "$package/bin/$tool.exe"
+              Copy-Item "$binaries/rcmake.exe" "$package/bin/$tool.exe"
             }
+            Copy-Item "$binaries/rcmake-lsp.exe" "$package/bin/"
             Copy-Item modules/cmake-4.5 "$package/share/" -Recurse
             Copy-Item third_party/licences "$package/third_party/" -Recurse
             Copy-Item LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md $package

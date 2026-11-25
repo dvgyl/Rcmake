@@ -185,6 +185,29 @@ class LargeProjectTests(unittest.TestCase):
         self.assertEqual(json.loads((self.root / "command-count-diff.json").read_text()),
                          {"oracle_only": {"cc": 2}, "rcmake_only": {}})
 
+    def test_different_l1_fails_even_with_matching_ninja_commands(self):
+        run = self.root / "run"
+        (run / "reports").mkdir(parents=True)
+        pin, = runner.load_projects("duckdb")
+        args = runner.parse_args(["--project", "duckdb", "--rcmake-stage", "stage",
+                                  "--oracle", "oracle/bin/cmake", "--run-dir", str(run)])
+        tc = runner.Toolchain(self.root, self.root, Path("/usr/bin/cc"), Path("/usr/bin/c++"),
+                              Path("ninja"), Path(sys.executable))
+
+        def lane(engine, _engines, _pin, _build, log, *_args):
+            for key in runner.L1_FILES:
+                runner.write_json(log / key, engine)
+            runner.write_json(log / "commands.json", ["cc"])
+
+        disk = type("Disk", (), {"free": 100 * runner.GIB})()
+        with patch.object(runner, "checkout", return_value=pin["commit"]), \
+                patch.object(runner, "run_command"), patch.object(runner, "run_lane", side_effect=lane), \
+                patch.object(runner.shutil, "disk_usage", return_value=disk):
+            result = runner.run_project(pin, run, {"oracle": None, "rcmake": None}, tc, args)
+        self.assertEqual(result["l2"], "equal")
+        self.assertIn("different", result["l1"].values())
+        self.assertEqual(result["status"], "fail")
+
     def fake_engines(self):
         engines = {}
         for name in ("oracle", "rcmake"):
@@ -217,6 +240,7 @@ class LargeProjectTests(unittest.TestCase):
         run_command = runner.run_command
 
         def checkout(log, work, source, repository, revision, env, **kwargs):
+            self.assertEqual(env["GIT_LFS_SKIP_SMUDGE"], "1")
             source.mkdir()
             return revision
 

@@ -12,8 +12,9 @@ original groups and the core portion of the wide profile keep their legacy
 settings on POSIX hosts.
 
 The score includes cases that pass with CMake 4.5.1. A missing Rcmake result
-counts as a failure. Exit status 1 means the results differ. Exit status 2
-means a setup or driver error prevented the full comparison.
+counts as a failure. Use --min-pass-rate to allow case differences within a
+required pass rate. Exit status 1 means the comparison failed the case gate.
+Exit status 2 means the script could not complete the comparison.
 """
 
 from __future__ import annotations
@@ -102,12 +103,13 @@ HELPERS = {
 }
 TEST_ENVIRONMENT = (
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
-    "SDKROOT", "DEVELOPER_DIR", "RCMAKE_VENDORED_DATA_ROOT",
+    "SDKROOT", "DEVELOPER_DIR", "RCMAKE_VENDORED_DATA_ROOT", "APPIMAGE_EXTRACT_AND_RUN",
 )
 WINDOWS_ENVIRONMENT = (
     "SystemRoot", "SystemDrive", "ComSpec", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
     "ProgramData", "ProgramFiles", "ProgramFiles(x86)", "INCLUDE", "LIB", "LIBPATH",
-    "VCINSTALLDIR", "VCToolsInstallDir", "WindowsSdkDir", "WindowsSDKVersion",
+    "VCINSTALLDIR", "VCToolsInstallDir", "VSINSTALLDIR", "VisualStudioVersion",
+    "WindowsSdkDir", "WindowsSDKVersion", "DOTNET_ROOT", "WIX",
 )
 COMPLETE = "-- runcmake_eval: suite complete"
 CASE_RESULT = re.compile(
@@ -115,6 +117,15 @@ CASE_RESULT = re.compile(
     r"|^CMake Error at .*[/\\]RunCMake\.cmake:\d+ \(message\):\n"
     r"  (?P<failed>.+) - FAILED:\n(?P<detail>(?:^[ \t].*\n|^\n)*)",
     re.MULTILINE,
+)
+
+RUN_CMAKE_SKIP = re.compile(
+    r"^-- (?P<name>.+?)(?: - | )(?:All checks )?SKIPPED\b(?P<reason>.*)$",
+    re.IGNORECASE,
+)
+CTEST_SKIP = re.compile(
+    r"^\s*\d+/\d+\s+Test\s+#\d+:\s+(?P<name>.+?)\s+\.{2,}\s*"
+    r"\*{0,3}(?P<reason>Skipped|Not Run)\b.*$", re.IGNORECASE,
 )
 
 
@@ -240,10 +251,11 @@ def registration_generators(suites, driver, work, env, timeout):
     return generators
 
 
-def read_registrations(suites, driver, source, work, env, timeout, test_vars, use_upstream_timeout):
+def read_registrations(suites, driver, source, work, env, timeout, test_vars, use_upstream_timeout, inventory):
     """Ask upstream CMake to register tests. Keep each registration with its arguments."""
     registrations = defaultdict(list)
     generators = registration_generators(suites, driver, work, env, timeout)
+    inventory["registration_generators"] = generators
     # These tests use the file system in the temporary workspace.
     (work / "FilesystemCase").touch()
     case_sensitive = int(not (work / "filesystemcase").exists())
@@ -275,6 +287,7 @@ def read_registrations(suites, driver, source, work, env, timeout, test_vars, us
                 continue
             raise
         configured_vs |= visual_studio
+        inventory["configured_generators"].append(generator)
         listing = checked_run([
             companion(driver, "ctest"), "--test-dir", build, "-C", "Debug", "--show-only=json-v1",
             "-R", r"^RunCMake\.",
@@ -358,7 +371,7 @@ def run_registered_suite(registrations, driver, target, source, root, tools, wra
             test_env.update(HOME=str(home), CTEST_REAL_HOME=env["HOME"])
         code, timed_out, log = run(command, cwd, test_env, entry.timeout)
         reported, result = case_results(code, timed_out, log)
-        if not reported and result["complete"] and not result["driver_errors"]:
+        if not reported and not result["skips"] and result["complete"] and not result["driver_errors"]:
             if entry.name == "CacheVarHelpCoverage" and "Built-in cache documentation coverage OK:" in log:
                 reported[entry.name, 1] = {"passed": True, "detail": ""}
             else:
@@ -376,6 +389,8 @@ def run_registered_suite(registrations, driver, target, source, root, tools, wra
         "timed_out": any(item["timed_out"] for item in variants.values()),
         "driver_errors": [line for item in variants.values() for line in item["driver_errors"]],
         "variants": variants,
+        "skips": [{"registration": name, **skip}
+                  for name, item in variants.items() for skip in item["skips"]],
     }
     return cases, result
 
@@ -426,11 +441,18 @@ def case_results(code, timed_out, log):
             ),
         }
     complete = COMPLETE in log.splitlines() and code in (0, 1) and not timed_out
-    other_errors = [
-        line for line in CASE_RESULT.sub("", log).splitlines()
-        if line.startswith(("CMake Error", "CMake Internal Error"))
-    ]
-    result = {"complete": complete, "timed_out": timed_out, "driver_errors": other_errors}
+    other_errors, skips = [], []
+    for line in CASE_RESULT.sub("", log).splitlines():
+        if line.startswith(("CMake Error", "CMake Internal Error")):
+            other_errors.append(line)
+        match = RUN_CMAKE_SKIP.fullmatch(line) or CTEST_SKIP.fullmatch(line)
+        if match:
+            skips.append({"name": match["name"], "reason": match["reason"].strip(" :()") or None,
+                          "line": line})
+        elif line.startswith("-- ") and re.search(r"\b(?:skipping|being skipped)\b", line, re.IGNORECASE):
+            skips.append({"name": None, "reason": line.removeprefix("-- "), "line": line})
+    result = {"complete": complete, "timed_out": timed_out, "driver_errors": other_errors,
+              "skips": skips}
     if not complete or other_errors:
         result["log"] = log
     return cases, result
@@ -458,7 +480,7 @@ def compare(reference, candidate):
     return results
 
 
-def evaluate(suites, driver, candidate, source, timeout, profile=None, test_vars=(), use_upstream_timeout=False):
+def evaluate(suites, driver, candidate, source, timeout, profile, test_vars, use_upstream_timeout, report):
     """Run the selected suites in separate reference and candidate workspaces."""
     # A CLI case can print the test environment into the report.
     env = {key: os.environ[key] for key in TEST_ENVIRONMENT if key in os.environ}
@@ -476,7 +498,9 @@ def evaluate(suites, driver, candidate, source, timeout, profile=None, test_vars
     if ninja:
         settings["RunCMake_MAKE_PROGRAM"] = ninja
     print(f"{'Suite':<32} {'Passed':>6} {'Failed':>6} {'Total':>6} {'Ref. fail':>9}", flush=True)
-    results = {}
+    report["generator"] = generator
+    results = report["suites"]
+    inventory = report["suite_inventory"]
     # Use the physical path. CMake and some checks canonicalize /tmp on macOS.
     with tempfile.TemporaryDirectory(prefix="runcmake-eval-", dir=None if os.name == "nt" else "/tmp") as temporary:
         work = Path(temporary).resolve()
@@ -503,8 +527,12 @@ def evaluate(suites, driver, candidate, source, timeout, profile=None, test_vars
         legacy = set(SUITE_GROUPS["all"]) if profile in (None, "core", "wide") and os.name == "posix" else set()
         modern = [suite for suite in suites if suite not in legacy]
         registered = read_registrations(
-            modern, driver, source.parents[1], work, env, timeout, test_vars, use_upstream_timeout,
+            modern, driver, source.parents[1], work, env, timeout, test_vars, use_upstream_timeout, inventory,
         ) if modern else {}
+        inventory["suite_generators"] = {
+            suite: sorted({entry.generator for entry in entries}) for suite, entries in registered.items()
+        }
+        inventory["suite_generators"].update({suite: [generator] for suite in suites if suite in legacy})
         if {"CommandLine", "execute_process"}.intersection(suites, legacy):
             settings.update(prepare_helpers(source, work / "helpers", env, timeout))
         relative_source = source.relative_to(source.parents[1])
@@ -559,14 +587,14 @@ def evaluate(suites, driver, candidate, source, timeout, profile=None, test_vars
                     print(f"  {lane} reported a driver error.", flush=True)
                     if suite not in legacy and metadata["driver_errors"]:
                         print(f"  {metadata['driver_errors'][0]}", flush=True)
-        # Keep failure messages readable after the temporary directories are removed.
-        for suite in results.values():
-            for case in suite["cases"]:
+            # Keep failure messages readable after the temporary directories are removed.
+            suite_result = results[suite]
+            for case in suite_result["cases"]:
                 for lane in ("oracle", "rcmake"):
                     if case[lane] is not None:
                         case[lane]["detail"] = case[lane]["detail"].replace(str(work), "<sandbox>")
             for lane in ("oracle_driver", "rcmake_driver"):
-                for metadata in (suite[lane], *suite[lane].get("variants", {}).values()):
+                for metadata in (suite_result[lane], *suite_result[lane].get("variants", {}).values()):
                     metadata["driver_errors"] = [
                         line.replace(str(work), "<sandbox>") for line in metadata["driver_errors"]
                     ]
@@ -575,7 +603,6 @@ def evaluate(suites, driver, candidate, source, timeout, profile=None, test_vars
                     if "arguments" in metadata:
                         metadata["arguments"] = [arg.replace(work.as_posix(), "<sandbox>")
                                                  for arg in metadata["arguments"]]
-    return generator, results
 
 
 def main():
@@ -599,6 +626,8 @@ def main():
         "--timeout", type=float, metavar="SECONDS",
         help="Limit each suite run. Legacy groups default to 180 seconds. Other suites use CTest timeouts.",
     )
+    parser.add_argument("--min-pass-rate", type=float, metavar="PERCENT",
+                        help="Require this case pass rate and completion of every selected suite.")
     binary = parser.add_mutually_exclusive_group()
     binary.add_argument(
         "--rcmake-bin", "--bin", type=Path, metavar="PATH",
@@ -614,30 +643,47 @@ def main():
         parser.error("--timeout must be a finite number greater than zero.")
     if any(not re.fullmatch(r"CMake_TEST_\w+=.*", value) for value in args.test_var):
         parser.error("--test-var requires CMake_TEST_NAME=VALUE.")
-    source_value = os.environ.get("RCMAKE_ORACLE_RUNCMAKE_DIR")
-    if source_value is None and "RCMAKE_ORACLE_SRC" in os.environ:
-        source_value = Path(os.environ["RCMAKE_ORACLE_SRC"]) / "Tests" / "RunCMake"
-    if source_value is None:
-        parser.error("Set RCMAKE_ORACLE_SRC or source env/env.sh.")
-    source = Path(source_value).resolve()
-    if source.parts[-2:] != ("Tests", "RunCMake") or not (source / "RunCMake.cmake").is_file():
-        parser.error("RCMAKE_ORACLE_RUNCMAKE_DIR must select Tests/RunCMake in the CMake source tree.")
-    group = profile_suites(source, args.profile) if args.profile else SUITE_GROUPS[args.suite_group]
-    suites = list(dict.fromkeys(
-        suite for name in (args.suite or ["all"])
-        for suite in (group if name == "all" else ALIASES.get(name, (name,)))
-    ))
-    for suite in suites:
-        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*", suite) or not (source / suite / "RunCMakeTest.cmake").is_file():
-            parser.error(f"Unknown upstream RunCMake suite {suite!r}.")
-    if args.list:
-        print("\n".join(suites))
-        return 0
-    host = {"all-macos": "Darwin", "linux": "Linux", "windows": "Windows"}.get(args.profile)
-    if host and platform.system() != host:
-        parser.error(f"The {args.profile} profile requires a {host} host. Use --list-suites to list its suites.")
+    if args.min_pass_rate is not None and not 0 <= args.min_pass_rate <= 100:
+        parser.error("--min-pass-rate must be a percentage from 0 to 100.")
+
+    inventory = {"included": [], "excluded_external": {}, "registration_generators": [],
+                 "configured_generators": [], "suite_generators": {}}
+    report = {"profile": args.profile, "timeout_seconds": timeout, "min_pass_rate": args.min_pass_rate,
+              "rcmake_sha": os.environ.get("GITHUB_SHA"), "suite_inventory": inventory, "suites": {}}
     try:
+        source_value = os.environ.get("RCMAKE_ORACLE_RUNCMAKE_DIR")
+        if source_value is None and "RCMAKE_ORACLE_SRC" in os.environ:
+            source_value = Path(os.environ["RCMAKE_ORACLE_SRC"]) / "Tests" / "RunCMake"
+        if source_value is None:
+            raise ValueError("Set RCMAKE_ORACLE_SRC or source env/env.sh.")
+        source = Path(source_value).resolve()
+        report["source"] = str(source)
+        if source.parts[-2:] != ("Tests", "RunCMake") or not (source / "RunCMake.cmake").is_file():
+            raise ValueError("RCMAKE_ORACLE_RUNCMAKE_DIR must select Tests/RunCMake in the CMake source tree.")
+        group = profile_suites(source, args.profile) if args.profile else SUITE_GROUPS[args.suite_group]
+        suites = list(dict.fromkeys(
+            suite for name in (args.suite or ["all"])
+            for suite in (group if name == "all" else ALIASES.get(name, (name,)))
+        ))
+        inventory["included"] = suites
+        inventory["excluded_external"] = {
+            name: "Requires an external tool, package, or test fixture outside the standard profile."
+            for name in sorted(EXTERNAL_SUITES - set(suites))
+            if (source / name / "RunCMakeTest.cmake").is_file()
+        }
+        for suite in suites:
+            if (not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*", suite)
+                    or not (source / suite / "RunCMakeTest.cmake").is_file()):
+                raise ValueError(f"Unknown upstream RunCMake suite {suite!r}.")
+        if args.list:
+            print("\n".join(suites))
+            return 0
+        host = {"all-macos": "Darwin", "linux": "Linux", "windows": "Windows"}.get(args.profile)
+        if host and platform.system() != host:
+            raise ValueError(f"The {args.profile} profile requires a {host} host. Use --list-suites to list its suites.")
+
         driver = Path(os.environ["RCMAKE_ORACLE_CMAKE"]).absolute()
+        report["oracle"] = str(driver)
         candidate = args.rcmake_bin
         if candidate is None:
             stage = args.stage
@@ -646,44 +692,56 @@ def main():
             elif (stage / "bin").is_dir():
                 stage /= "bin"
             candidate = stage / ("cmake" + EXE_SUFFIX)
-    except KeyError as exc:
-        parser.error(f"Source env/env.sh to set {exc.args[0]}.")
-    candidate = candidate.absolute()  # Keep the cmake symlink for multi-call dispatch.
-    try:
-        version = subprocess.check_output(
-            [driver, "--version"], timeout=timeout, text=True,
-        ).splitlines()
+        candidate = candidate.absolute()  # Keep the cmake symlink for multi-call dispatch.
+        report["rcmake"] = str(candidate)
+        version = subprocess.check_output([driver, "--version"], timeout=timeout, text=True).splitlines()
         if version[:1] != ["cmake version 4.5.1"]:
-            parser.error("RCMAKE_ORACLE_CMAKE must select CMake 4.5.1.")
+            raise ValueError("RCMAKE_ORACLE_CMAKE must select CMake 4.5.1.")
         if not candidate.is_file() or not os.access(candidate, os.X_OK):
-            parser.error(f"Rcmake binary is missing or cannot run: {candidate}")
-        generator, results = evaluate(
-            suites, driver, candidate, source, timeout, args.profile, args.test_var, args.timeout is None,
-        )
+            raise ValueError(f"Rcmake binary is missing or cannot run: {candidate}")
+        evaluate(suites, driver, candidate, source, timeout, args.profile, args.test_var,
+                 args.timeout is None, report)
+    except (KeyError, OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
+        error = (f"Source env/env.sh to set {exc.args[0]}." if isinstance(exc, KeyError)
+                 else str(exc) or "Run interrupted.")
+        report["error"] = error
+        print(f"{parser.prog}: {error}", file=sys.stderr)
+        return 2
+    finally:
+        results = report["suites"]
         totals = {
             key: sum(suite[key] for suite in results.values())
             for key in ("passed", "failed", "total", "missing", "reference_failed", "no_reference")
         }
         rate = 100 * totals["passed"] / totals["total"] if totals["total"] else None
-        print(
-            f"{'Overall':<32} {totals['passed']:>6} {totals['failed']:>6} "
-            f"{totals['total']:>6} {totals['reference_failed']:>9}"
-        )
-        print(f"Pass rate: {rate:.2f}%" if rate is not None else "Pass rate unavailable.")
-        if args.json:
-            report = {
-                "oracle": str(driver), "rcmake": str(candidate), "source": str(source),
-                "generator": generator, "timeout_seconds": timeout, "totals": totals,
-                "pass_rate_percent": rate, "suites": results,
-            }
+        incomplete = [
+            name for name in inventory["included"]
+            if name not in results or any(
+                not results[name][f"{lane}_driver"]["complete"] or results[name][f"{lane}_driver"]["driver_errors"]
+                for lane in ("oracle", "rcmake")
+            )
+        ]
+        report.update(totals=totals, pass_rate_percent=rate, incomplete_suites=incomplete)
+        report["skips"] = [
+            {"suite": name, "engine": lane, **skip}
+            for name, suite in results.items() for lane in ("oracle", "rcmake")
+            for skip in suite[f"{lane}_driver"].get("skips", [])
+        ]
+        if args.json and (not args.list or "error" in report):
+            args.json.parent.mkdir(parents=True, exist_ok=True)
             args.json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        parser.exit(2, f"{parser.prog}: {exc}\n")
-    if not totals["total"] or any(
-        not suite[f"{lane}_driver"]["complete"] or suite[f"{lane}_driver"]["driver_errors"]
-        for suite in results.values() for lane in ("oracle", "rcmake")
-    ):
+
+    print(
+        f"{'Overall':<32} {totals['passed']:>6} {totals['failed']:>6} "
+        f"{totals['total']:>6} {totals['reference_failed']:>9}"
+    )
+    print(f"Pass rate: {rate:.2f}%" if rate is not None else "Pass rate unavailable.")
+    if incomplete:
+        print(f"Incomplete suites: {len(incomplete)}", file=sys.stderr)
+    if rate is None or incomplete:
         return 2
+    if args.min_pass_rate is not None:
+        return int(rate < args.min_pass_rate)
     return int(bool(totals["failed"] or totals["reference_failed"] or totals["no_reference"]))
 
 

@@ -6,6 +6,7 @@ verify_extracted() {
   local python=python3
   case "$(uname -s)" in MINGW*|MSYS*) python=python ;; esac
   MSYS2_ARG_CONV_EXCL='*' "$python" - "$@" <<'PYVERIFY'
+import json
 import os
 from pathlib import Path
 import platform
@@ -21,8 +22,10 @@ windows = target.endswith("-windows-msvc")
 suffix = ".exe" if windows else ""
 bin_dir = package / "bin"
 tools = [bin_dir / (tool + suffix) for tool in ("rcmake", "cmake", "ctest", "cpack")]
-if set(bin_dir.iterdir()) != set(tools) or not all(tool.is_file() for tool in tools):
-    sys.exit("Expected four CLI entry points in the extracted package.")
+lsp = bin_dir / ("rcmake-lsp" + suffix)
+executables = [*tools, lsp]
+if set(bin_dir.iterdir()) != set(executables) or not all(tool.is_file() for tool in executables):
+    sys.exit("Expected the four CLI entry points and rcmake-lsp in the extracted package.")
 
 paths = set()
 for entry in roots:
@@ -36,7 +39,7 @@ for entry in roots:
         if windows and path.startswith(("\\\\", "//")) and len(path) > 2 and path[2] not in "?.":
             paths.add((category, "\\\\?\\UNC\\" + path[2:]))
 
-for tool in tools:
+for tool in executables:
     contents = tool.read_bytes()
     if windows:
         decoded = [("UTF-8", contents.decode("utf-8", errors="replace"))]
@@ -72,6 +75,33 @@ for tool, expected in zip(tools, ("cmake", "cmake", "ctest", "cpack")):
     print(version, end="", flush=True)
 subprocess.run([cmake, "--help-command", "install"], env=env, check=True, timeout=15,
                stdout=subprocess.DEVNULL)
+
+# The language server uses standard input and output for protocol messages.
+def frame(message):
+    body = json.dumps({"jsonrpc": "2.0", **message}).encode("utf-8")
+    return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+
+
+requests = b"".join(frame(message) for message in (
+    {"id": 1, "method": "initialize", "params": {"capabilities": {}}},
+    {"method": "initialized", "params": {}},
+    {"id": 2, "method": "shutdown"},
+    {"method": "exit"},
+))
+output = subprocess.run([lsp], input=requests, stdout=subprocess.PIPE, env=env,
+                        check=True, timeout=15).stdout
+replies = {}
+while output:
+    header, _, body = output.partition(b"\r\n\r\n")
+    size = int(header.removeprefix(b"Content-Length: "))
+    message = json.loads(body[:size])
+    if "id" in message:
+        replies[message["id"]] = message
+    output = body[size:]
+if not replies.get(1, {}).get("result", {}).get("capabilities") or (
+        "result" not in replies.get(2, {}) or replies[2]["result"] is not None):
+    sys.exit("The packaged rcmake-lsp failed the initialize or shutdown request.")
+print("Verified rcmake-lsp initialize and shutdown.")
 
 with TemporaryDirectory(prefix="rcmake-release-smoke-") as temporary:
     source = Path(temporary)
@@ -191,11 +221,13 @@ export CARGO_ENCODED_RUSTFLAGS="$flags"
 unset RUSTFLAGS
 
 cargo build --locked --release --bin rcmake --target "$target" --target-dir "$target_dir"
+cargo build --locked --release -p rcmake-lsp --bin rcmake-lsp --features eval,stdio \
+  --target "$target" --target-dir "$target_dir"
 
 name="rcmake-$version-$target"
 work="$(mktemp -d "$out_dir/.rcmake-dist.XXXXXXXX")"
 trap 'rm -rf "$work"' EXIT
-python3 - "$root" "$work" "$name" "$target_dir/$target/release/rcmake" <<'PY'
+python3 - "$root" "$work" "$name" "$target_dir/$target/release" <<'PY'
 import gzip
 import hashlib
 from pathlib import Path
@@ -203,12 +235,14 @@ import shutil
 import sys
 import tarfile
 
-root, work, name, binary = sys.argv[1:]
-root, work, binary = map(Path, (root, work, binary))
+root, work, name, binaries = sys.argv[1:]
+root, work, binaries = map(Path, (root, work, binaries))
 package = work / name
 bin_dir = package / "bin"
 bin_dir.mkdir(parents=True)
-shutil.copyfile(binary, bin_dir / "rcmake")
+standalone = ("rcmake", "rcmake-lsp")
+for tool in standalone:
+    shutil.copyfile(binaries / tool, bin_dir / tool)
 for tool in ("cmake", "ctest", "cpack"):
     (bin_dir / tool).symlink_to("rcmake")
 ignore = shutil.ignore_patterns("._*", ".DS_Store")
@@ -222,7 +256,7 @@ def normalize(member):
     member.uname = member.gname = ""
     if member.issym():
         member.mode = 0o777
-    elif member.isdir() or member.name == f"{name}/bin/rcmake":
+    elif member.isdir() or member.name in {f"{name}/bin/{tool}" for tool in standalone}:
         member.mode = 0o755
     else:
         member.mode = 0o644
