@@ -139,6 +139,15 @@ fn compile_flags(
     Ok(flags)
 }
 
+fn compile_argument(model: &ProjectModel, target: &Target, prefix: &[u8], value: &[u8]) -> BString {
+    if super::shell::windows_host(model, target.dir) {
+        return quote(&[prefix, value].concat());
+    }
+    [prefix, &super::shell::cmake_posix_quote(value)]
+        .concat()
+        .into()
+}
+
 fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BString {
     let darwin = is_darwin(model, target.dir);
     let key = [
@@ -169,9 +178,12 @@ fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BStr
             });
         }
         Some(if include.system {
-            join_words(["-isystem".into(), quote(&path)])
+            join_words([
+                "-isystem".into(),
+                compile_argument(model, target, b"", &path),
+            ])
         } else {
-            quote(&[b"-I".as_slice(), &path].concat())
+            compile_argument(model, target, b"-I", &path)
         })
     }))
 }
@@ -325,15 +337,13 @@ fn compile_arguments_for_arch(
             definitions
         });
     let intdir = (model.generator == Some(GeneratorKind::NinjaMultiConfig)).then(|| {
-        let mut define = BString::from(b"-DCMAKE_INTDIR=\\\"".as_slice());
-        define.extend_from_slice(&quote(&config.0));
-        define.extend_from_slice(b"\\\"");
-        define
+        let value = [b"CMAKE_INTDIR=\"".as_slice(), &config.0, b"\""].concat();
+        compile_argument(model, target, b"-D", &value)
     });
     let defines = join_words(
         intdir
             .into_iter()
-            .chain(defines.map(|define| quote(&[b"-D", define].concat()))),
+            .chain(defines.map(|define| compile_argument(model, target, b"-D", define))),
     );
     let includes = includes(model, target, group);
     let explicit_language = model

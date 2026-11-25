@@ -66,7 +66,7 @@ pub(crate) use modules::scan_responses;
 pub use modules::{bmi_script_path, lower_modules};
 pub(crate) use pch::{IdeLowering, Plans as PchPlans};
 pub(crate) use policy_flags::warn_about_wrappers;
-pub use shell::{rule_command_chain, simple_args as rule_arguments};
+pub use shell::{cmake_posix_quote, rule_command_chain, simple_args as rule_arguments};
 pub(crate) use standard::{
     checked_standard_flag, cmp0128_warnings, cxx_standard_mode, required_standard,
 };
@@ -111,7 +111,7 @@ pub fn listed_backtrace(backtrace: &rcmake_diag::Backtrace) -> rcmake_diag::Back
         })
 }
 
-fn target_property<'a>(
+pub(crate) fn target_property<'a>(
     model: &'a ProjectModel,
     target: &'a Target,
     key: &[u8],

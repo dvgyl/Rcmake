@@ -1,25 +1,35 @@
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_host::Host;
-use rcmake_resolve::Invocation;
+use rcmake_resolve::{Invocation, lower::cmake_posix_quote};
 
 use crate::syntax::shell_word;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Commands {
     comspec: Option<BString>,
+    pub(crate) posix_limit: usize,
+}
+
+impl Default for Commands {
+    fn default() -> Self {
+        Self {
+            comspec: None,
+            posix_limit: rcmake_gen_common::link_response::command_line_limit(b"Linux"),
+        }
+    }
 }
 
 impl Commands {
     pub(crate) fn new(host: &dyn Host) -> Self {
-        if host.system().sysname != b"Windows" {
-            return Self::default();
-        }
+        let system = host.system().sysname;
+        let comspec = (system == b"Windows").then(|| {
+            host.env_get(b"COMSPEC")
+                .filter(|path| !path.is_empty())
+                .unwrap_or_else(|| "cmd.exe".into())
+        });
         Self {
-            comspec: Some(
-                host.env_get(b"COMSPEC")
-                    .filter(|path| !path.is_empty())
-                    .unwrap_or_else(|| "cmd.exe".into()),
-            ),
+            comspec,
+            posix_limit: rcmake_gen_common::link_response::command_line_limit(&system),
         }
     }
 
@@ -27,6 +37,7 @@ impl Commands {
     pub(crate) fn for_windows(comspec: &[u8]) -> Self {
         Self {
             comspec: Some(comspec.into()),
+            posix_limit: 0,
         }
     }
 
@@ -193,8 +204,10 @@ impl Commands {
                 }
             }
             self.cmd(&self.windows_script(invocations, custom, build_dir, prefix, false))
+        } else if custom {
+            posix_custom_line(invocations, build_dir, prefix)
         } else {
-            let command = posix_line(invocations, custom);
+            let command = posix_line(invocations);
             if prefix {
                 self.in_directory(&command, build_dir)
             } else {
@@ -477,7 +490,48 @@ fn shell_argument(word: &[u8], out: &mut Vec<u8>, batch: bool, called: bool) {
 
 pub(crate) use rcmake_gen_common::link_response::windows_argument;
 
-fn posix_line(invocations: &[Invocation], custom: bool) -> Vec<u8> {
+fn posix_custom_line(invocations: &[Invocation], build_dir: &[u8], prefix: bool) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut current = (!prefix).then_some(build_dir);
+    for (index, invocation) in invocations.iter().enumerate() {
+        if index != 0 {
+            result.extend_from_slice(b" && ");
+        }
+        let directory = invocation
+            .working_dir
+            .as_deref()
+            .map_or(build_dir, |dir| dir.as_ref());
+        if current != Some(directory) || (index == 0 && invocation.working_dir.is_some()) {
+            result.extend_from_slice(b"cd ");
+            result.extend_from_slice(&cmake_posix_quote(directory));
+            result.extend_from_slice(b" && ");
+            current = Some(directory);
+        }
+        if invocation.shell.is_empty() {
+            if let Some((program, args)) = invocation.argv.split_first() {
+                result.extend_from_slice(&cmake_posix_quote(program));
+                for arg in args {
+                    result.push(b' ');
+                    if operator(arg) {
+                        result.extend_from_slice(arg);
+                    } else {
+                        result.extend_from_slice(&cmake_posix_quote(arg));
+                    }
+                }
+            } else {
+                result.push(b':');
+            }
+        } else {
+            result.extend_from_slice(&invocation.shell);
+        }
+    }
+    if result.is_empty() {
+        result.push(b':');
+    }
+    result
+}
+
+fn posix_line(invocations: &[Invocation]) -> Vec<u8> {
     let mut result = Vec::new();
     for invocation in invocations {
         if !result.is_empty() {
@@ -492,17 +546,13 @@ fn posix_line(invocations: &[Invocation], custom: bool) -> Vec<u8> {
             shell_word(directory, &mut result);
             result.extend_from_slice(b" && ");
         }
-        if !invocation.shell.is_empty() && (!custom || invocation.argv.is_empty()) {
+        if !invocation.shell.is_empty() {
             result.extend_from_slice(&invocation.shell);
         } else if let Some((first, rest)) = invocation.argv.split_first() {
             shell_word(first, &mut result);
             for arg in rest {
                 result.push(b' ');
-                if custom && operator(arg) {
-                    result.extend_from_slice(arg);
-                } else {
-                    shell_word(arg, &mut result);
-                }
+                shell_word(arg, &mut result);
             }
         } else {
             result.push(b':');
@@ -515,4 +565,31 @@ fn posix_line(invocations: &[Invocation], custom: bool) -> Vec<u8> {
         result.push(b':');
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_commands_share_one_working_directory_change() {
+        let command = |shell: &str| Invocation {
+            working_dir: Some("/work/build with space".into()),
+            shell: shell.into(),
+            ..Invocation::default()
+        };
+        let line = Commands::default().line(
+            &[
+                command(r#"echo -DDET_NAME=\"det\""#),
+                command("touch stamp"),
+            ],
+            true,
+            b"/work/build with space",
+            false,
+        );
+        assert_eq!(
+            line,
+            br#"cd "/work/build with space" && echo -DDET_NAME=\"det\" && touch stamp"#
+        );
+    }
 }

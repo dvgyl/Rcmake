@@ -570,6 +570,18 @@ pub(super) fn install_object_name(
     source: &[u8],
     custom_name: &[u8],
 ) -> BString {
+    if model.generator == Some(rcmake_model::GeneratorKind::Xcode) {
+        let name = if custom_name.is_empty() {
+            let name = Lexical::new(source).filename();
+            name.iter()
+                .rposition(|&byte| byte == b'.')
+                .and_then(|dot| name.get(..dot))
+                .unwrap_or(name)
+        } else {
+            custom_name
+        };
+        return [name, b".o"].concat().into();
+    }
     let short =
         install_object_name_strategy(model, target).is_some_and(|strategy| strategy == b"SHORT");
     object_name(model, target, source, short, Some(custom_name))

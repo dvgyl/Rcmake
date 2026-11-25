@@ -511,6 +511,12 @@ fn long_posix_link_or_archive(archive: bool) {
             .vars
             .insert(key.into(), value.into());
     }
+    if !archive {
+        model
+            .dir_mut(DirId::ROOT)
+            .vars
+            .insert("CMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS".into(), "ON".into());
+    }
     let kind = if archive {
         TargetKind::StaticLibrary
     } else {
@@ -545,6 +551,13 @@ fn long_posix_link_or_archive(archive: bool) {
     let result = resolve(&model, &host, &[]).expect("resolve model");
     rcmake_gen_make::generate_with_model(&result, &host, &build, &model)
         .expect("generate build files");
+    if !archive {
+        host.metadata(
+            &build.join("CMakeFiles/long_input.dir/objects1.rsp"),
+            Follow::Yes,
+        )
+        .expect("read the object response file");
+    }
     let stdout = build_run("make", &["-j2"]);
     assert!(!stdout.is_empty());
     if archive {

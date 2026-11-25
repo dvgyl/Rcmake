@@ -484,7 +484,7 @@ fn render_file_set<'a>(
         return Ok(sources);
     }
     out.extend_from_slice(b"if(NOT CMAKE_VERSION VERSION_LESS \"3.28\")\n  target_sources(");
-    quote(out, name);
+    super::target_argument(out, name);
     out.extend_from_slice(b" INTERFACE FILE_SET ");
     quote(out, &set.name);
     out.extend_from_slice(b" TYPE CXX_MODULES");
@@ -543,7 +543,7 @@ fn write_property_script(
 ) -> Result<(), GenError> {
     let mut out = BString::from("cmake_minimum_required(VERSION 3.28)\n");
     let mut property = BString::from("set_property(TARGET ");
-    quote(&mut property, target);
+    super::target_argument(&mut property, target);
     property.extend_from_slice(b" PROPERTY IMPORTED_CXX_MODULES_");
     property.extend_from_slice(&super::config_label(&config.0));
     out.extend_from_slice(b"set(_properties ");

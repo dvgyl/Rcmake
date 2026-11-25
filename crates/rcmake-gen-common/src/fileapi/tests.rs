@@ -220,7 +220,21 @@ fn fixture(source: &Path, build: &Path) -> TestResult<(ProjectModel, GenerationR
         let mut fragments = Vec::new();
         if kind == TargetKind::Executable {
             group.flags = vec![tagged(source, 9, "target_compile_options", b"-Wall")];
-            group.defines = vec![tagged(source, 8, "target_compile_definitions", b"NAME=1")];
+            group.defines = vec![
+                tagged(source, 8, "target_compile_definitions", b"Z_LAST"),
+                tagged(source, 8, "target_compile_definitions", b"NAME=1"),
+            ];
+            let raw = model.target_mut(id).ok_or("Missing app.")?;
+            for header in [
+                b"$<$<COMPILE_LANGUAGE:C>:<stdio.h$<ANGLE-R>>".as_slice(),
+                b"<stdio.h>",
+                b"$<$<COMPILE_LANGUAGE:CXX>:<vector$<ANGLE-R>>",
+            ] {
+                raw.usage.push(
+                    rcmake_model::UsageField::PrecompileHeaders,
+                    tagged(source, 12, "target_precompile_headers", header),
+                );
+            }
             group.includes = vec![InterfaceInclude {
                 path: tagged(
                     source,
@@ -288,6 +302,7 @@ fn fixture(source: &Path, build: &Path) -> TestResult<(ProjectModel, GenerationR
     result.metadata.listfiles = vec![
         from_native_cmake(&source.join("CMakeLists.txt")),
         from_native_cmake(&build.join("generated.cmake")),
+        "/elsewhere/module.cmake".into(),
         "/elsewhere/module.cmake".into(),
         "/cmake/Modules/Check.cmake".into(),
     ];
@@ -529,6 +544,14 @@ fn links_object_replies_and_backtraces() -> TestResult {
         get(at(items(get(group, "includes")), 0)?, "path"),
         &Value::string("/src/inc")
     );
+    let pch = items(get(group, "precompileHeaders"));
+    assert_eq!(pch.len(), 1);
+    let header = at(pch, 0)?;
+    assert_eq!(get(header, "header"), &Value::string("<stdio.h>"));
+    assert_eq!(
+        uint(get(at(nodes, uint(get(header, "backtrace"))?)?, "line"))?,
+        12
+    );
     let link = at(items(get(get(&app, "link"), "commandFragments")), 0)?;
     assert_eq!(get(link, "role"), &Value::string("libraries"));
     assert_eq!(get(link, "fragment"), &Value::string("liblib.a"));
@@ -556,6 +579,13 @@ fn links_object_replies_and_backtraces() -> TestResult {
     assert_eq!(get(c, "sourceFileExtensions"), &array([Value::string("c")]));
     let cmake_files = follow(&host, &reply, get(replies, "cmakeFiles-v1"))?;
     let inputs = get(&cmake_files, "inputs");
+    assert_eq!(
+        items(inputs)
+            .iter()
+            .filter(|input| string(get(input, "path")) == b"/elsewhere/module.cmake")
+            .count(),
+        1
+    );
     for (path, flag) in [
         ("/build/generated.cmake", "isGenerated"),
         ("/elsewhere/module.cmake", "isExternal"),
@@ -628,6 +658,19 @@ fn indexes_subprojects_and_abstract_targets_per_configuration() -> TestResult {
     install.options.destination = Some("bin/release".into());
     result.install = rcmake_resolve::lower::lower_install_manifest(&model, &result.targets);
 
+    let mut imported = Target::new(
+        "external".into(),
+        TargetKind::SharedLibrary,
+        TargetOrigin::Imported(rcmake_model::ImportedVisibility::Local),
+        DirId::ROOT,
+        Backtrace::default(),
+        PolicyMap::default(),
+    );
+    imported.props.set(
+        "IMPORTED_LOCATION".into(),
+        "/third-party/libexternal.dylib".into(),
+    );
+    model.add_target(imported)?;
     write(&host, &build.join(API_DIR).join("query/codemodel-v2"), b"")?;
     write_replies(&model, &result, &host, build)?;
     let reply = build.join(API_DIR).join("reply");
@@ -650,6 +693,19 @@ fn indexes_subprojects_and_abstract_targets_per_configuration() -> TestResult {
     for config in [debug, release] {
         let directories = items(get(config, "directories"));
         let projects = items(get(config, "projects"));
+        let imported = follow(
+            &host,
+            &reply,
+            entry(get(config, "abstractTargets"), "name", "external"),
+        )?;
+        assert_eq!(
+            get(&imported, "nameOnDisk"),
+            &Value::string("libexternal.dylib")
+        );
+        assert_eq!(
+            get(at(items(get(&imported, "artifacts")), 0)?, "path"),
+            &Value::string("/third-party/libexternal.dylib")
+        );
         let api = entry(get(config, "abstractTargets"), "name", "api");
         let definition = follow(&host, &reply, api)?;
         assert_eq!(get(&definition, "abstract"), &Bool(true));

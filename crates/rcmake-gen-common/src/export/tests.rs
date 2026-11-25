@@ -47,9 +47,9 @@ fn install_export_uses_the_target_path_dialect() -> Result<(), Box<dyn std::erro
         let main = String::from_utf8(host.read(files.next().ok_or("main file")?, range)?)?;
         let config = String::from_utf8(host.read(files.next().ok_or("config file")?, range)?)?;
         assert!(main.contains("set(_IMPORT_PREFIX \"/prefix\")"));
-        assert!(config.contains(&format!("\"IMPORTED_LOCATION_RELEASE\" \"{absolute}\"")));
+        assert!(config.contains(&format!("IMPORTED_LOCATION_RELEASE \"{absolute}\"")));
         assert!(config.contains(&format!(
-            "\"IMPORTED_IMPLIB_RELEASE\" \"${{_IMPORT_PREFIX}}/{relative}\""
+            "IMPORTED_IMPLIB_RELEASE \"${{_IMPORT_PREFIX}}/{relative}\""
         )));
     }
     Ok(())
@@ -270,21 +270,19 @@ fn install_export_writes_relocatable_configuration_files() {
             .count(),
         5
     );
-    assert!(main.contains("add_library(\"fmt::headers\" INTERFACE IMPORTED)"));
-    assert!(main.contains("add_executable(\"fmt::tool\" IMPORTED)"));
+    assert!(main.contains("add_library(fmt::headers INTERFACE IMPORTED)"));
+    assert!(main.contains("add_executable(fmt::tool IMPORTED)"));
     assert!(main.contains("${_IMPORT_PREFIX}/include;${_IMPORT_PREFIX}/include"));
     // `cmExportFileGeneratorEscape` escapes every `$` of a generator expression.
     assert!(main.contains(r"\$<\$<CONFIG:Release>:fmt::headers>"));
     assert!(main.contains("${CMAKE_CURRENT_LIST_DIR}/fmt-targets-*.cmake"));
     let no_config = read_text(&host, &out.join("fmt-targets-noconfig.cmake"));
-    assert!(
-        no_config.contains("\"IMPORTED_LOCATION_NOCONFIG\" \"${_IMPORT_PREFIX}/lib/libfmt.a\"")
-    );
+    assert!(no_config.contains("IMPORTED_LOCATION_NOCONFIG \"${_IMPORT_PREFIX}/lib/libfmt.a\""));
     assert!(no_config.contains("IMPORTED_LINK_INTERFACE_LANGUAGES_NOCONFIG \"CXX\""));
     let release = read_text(&host, &out.join("fmt-targets-release.cmake"));
     assert!(release.contains("IMPORTED_SONAME_RELEASE \"libfmt.so.2\""));
     assert!(release.contains(
-        "\"_cmake_import_check_files_for_fmt::tool\" \"${_IMPORT_PREFIX}/bin/tool\\\\;driver\""
+        "_cmake_import_check_files_for_fmt::tool \"${_IMPORT_PREFIX}/bin/tool\\\\;driver\""
     ));
 }
 
@@ -299,8 +297,8 @@ fn build_export_is_self_contained() {
         std::slice::from_ref(&path)
     );
     let script = read_text(&host, &path);
-    assert!(script.contains("add_library(\"fmt::fmt\" STATIC IMPORTED)"));
-    assert!(script.contains("add_library(\"fmt::shared\" SHARED IMPORTED)"));
+    assert!(script.contains("add_library(fmt::fmt STATIC IMPORTED)"));
+    assert!(script.contains("add_library(fmt::shared SHARED IMPORTED)"));
     assert!(script.contains("IMPORTED_LOCATION_NOCONFIG \"/build/lib/libfmt.a\""));
     assert!(script.contains("IMPORTED_LOCATION_RELEASE \"/build/lib/libfmt.so.2\""));
     assert!(!script.contains("_IMPORT_PREFIX"));

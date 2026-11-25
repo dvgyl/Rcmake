@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 
 use indexmap::{IndexMap, IndexSet};
-use rcmake_base::{BString, ByteSlice, hash::HashAlgo, list, path_lex::Lexical, truth};
+use rcmake_base::{BString, ByteSlice, list, path_lex::Lexical, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate_diagnostics, parse};
 use rcmake_model::{
@@ -20,6 +20,7 @@ use crate::usage::{ModelGenexHost, ObjectPaths, UsageResolver, handle};
 use crate::{ArtifactSet, BuildStep, CrossConfiguration, CustomStep, ResolveError, ResolvedTarget};
 
 mod attachments;
+mod depfile;
 mod outputs;
 
 pub(crate) use outputs::checked_command_outputs;
@@ -209,8 +210,12 @@ impl<'a> Commands<'a> {
         let working_dir = eval
             .optional(&command.working_directory)?
             .map_or_else(|| binary.clone(), |dir| join(binary, &dir));
+        let ninja_posix = matches!(
+            self.model.generator,
+            Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+        ) && !super::shell::windows_host(self.model, command.dir);
         let working_dir = (!working_dir.is_empty()
-            && working_dir != self.model.dir(DirId::ROOT).binary_dir)
+            && (ninja_posix || working_dir != self.model.dir(DirId::ROOT).binary_dir))
             .then_some(working_dir);
         let comment = eval.optional(&command.comment)?;
         let depfile = eval
@@ -307,7 +312,12 @@ impl<'a> Commands<'a> {
                     argv.splice(0..0, list::split(&emulator, list::Empty::Drop));
                 }
             }
-            invocations.push(direct(argv, working_dir.clone()));
+            let invocation = if ninja_posix {
+                super::shell::ninja_custom(argv, working_dir.clone(), command.verbatim)
+            } else {
+                direct(argv, working_dir.clone())
+            };
+            invocations.push(invocation);
         }
         take_warnings(&mut errors);
         if failed {
@@ -370,6 +380,24 @@ impl<'a> Commands<'a> {
         );
         let symbolic = outputs.first().is_some_and(symbolic);
         let depfile = depfile.map(|path| self.depfile(command, &path, &outputs, &mut invocations));
+        if let Some(path) = depfile
+            .as_ref()
+            .filter(|path| path.starts_with(b"CMakeFiles/d/"))
+            && let Some(paths) = paths
+        {
+            let parent = join(
+                &self.model.dir(DirId::ROOT).binary_dir,
+                Lexical::new(path).parent(),
+            );
+            paths
+                .host
+                .create_dir_all(&rcmake_host::path::to_native(&parent))
+                .map_err(|error| {
+                    ResolveError::Message(
+                        format!("Cannot create depfile directory {parent}: {error}").into(),
+                    )
+                })?;
+        }
         let mut step = CustomStep {
             outputs: relative(outputs),
             byproducts: relative(byproducts),
@@ -385,97 +413,6 @@ impl<'a> Commands<'a> {
         };
         step.byproducts.retain(|path| !step.outputs.contains(path));
         Ok((step, dependencies))
-    }
-
-    fn depfile(
-        &self,
-        command: &CustomCommand,
-        path: &[u8],
-        outputs: &[BString],
-        invocations: &mut Vec<crate::Invocation>,
-    ) -> BString {
-        let root = self.model.dir(DirId::ROOT);
-        let dir = self.model.dir(command.dir);
-        let Some(generator) = self.model.generator else {
-            return command_path(self.model, &dir.binary_dir, path);
-        };
-        let ninja = matches!(
-            generator,
-            GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig
-        );
-        if ninja && command.policies.get(PolicyId::new(116)) != PolicyStatus::New {
-            return command_path(self.model, &root.binary_dir, path);
-        }
-        let original = absolute_path(&dir.binary_dir, path);
-        let mut identity = HashAlgo::Sha256.hasher();
-        let xcode = generator == GeneratorKind::Xcode;
-        let declared_depfile = command
-            .depfile
-            .as_deref()
-            .map_or(path, |value| value.as_ref());
-        let id = if xcode {
-            declared_depfile
-        } else {
-            original.as_slice()
-        };
-        identity.update(id);
-        identity.update(b"\0");
-        if xcode {
-            identity.update(&dir.binary_dir);
-            identity.update(b"\0");
-        }
-        let declared = command.outputs.iter().map(|entry| &entry.value);
-        let resolved = outputs.iter();
-        let parts: Box<dyn Iterator<Item = &BString>> = if xcode {
-            Box::new(declared)
-        } else {
-            Box::new(resolved)
-        };
-        for part in parts {
-            identity.update(part);
-            identity.update(b"\0");
-        }
-        let config = if xcode { ".$(CONFIGURATION)" } else { "" };
-        let name = BString::from(format!(
-            "CMakeFiles/rcmake-depfile-{}{config}.d",
-            identity.finish_hex()
-        ));
-        let transformed = absolute_path(&root.binary_dir, &name);
-        let cmake = definition(self.model, command.dir, b"CMAKE_COMMAND")
-            .cloned()
-            .unwrap_or_else(|| "cmake".into());
-        if !invocations.is_empty()
-            && matches!(
-                generator,
-                GeneratorKind::Ninja
-                    | GeneratorKind::NinjaMultiConfig
-                    | GeneratorKind::UnixMakefiles
-                    | GeneratorKind::Xcode
-            )
-        {
-            invocations.push(direct(
-                vec![
-                    cmake,
-                    "-E".into(),
-                    "cmake_transform_depfile".into(),
-                    generator.name().into(),
-                    if generator == GeneratorKind::UnixMakefiles {
-                        "makedepfile"
-                    } else {
-                        "gccdepfile"
-                    }
-                    .into(),
-                    root.source_dir.clone(),
-                    dir.source_dir.clone(),
-                    root.binary_dir.clone(),
-                    dir.binary_dir.clone(),
-                    original,
-                    transformed,
-                ],
-                None,
-            ));
-        }
-        name
     }
 
     fn dependency_path(

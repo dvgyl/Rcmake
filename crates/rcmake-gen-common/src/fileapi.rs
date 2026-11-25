@@ -381,21 +381,28 @@ impl FileApi<'_, '_> {
 
     fn cmake_files(&self) -> Members {
         let cmake_root = self.cmake_root();
-        let inputs = self.result.metadata.listfiles.iter().map(|file| {
-            let in_source = is_under(file, self.source);
-            let in_build = is_under(file, self.build);
-            let mut input = members([("path", Value::string(relative(file, self.source)))]);
-            if in_build && self.build != self.source {
-                input.insert("isGenerated".into(), Bool(true));
-            }
-            if !in_source && !in_build {
-                input.insert("isExternal".into(), Bool(true));
-            }
-            if is_under(file, &cmake_root) {
-                input.insert("isCMake".into(), Bool(true));
-            }
-            Object(input)
-        });
+        let mut seen = BTreeSet::new();
+        let inputs = self
+            .result
+            .metadata
+            .listfiles
+            .iter()
+            .filter(|file| seen.insert(file.as_slice()))
+            .map(|file| {
+                let in_source = is_under(file, self.source);
+                let in_build = is_under(file, self.build);
+                let mut input = members([("path", Value::string(relative(file, self.source)))]);
+                if in_build && self.build != self.source {
+                    input.insert("isGenerated".into(), Bool(true));
+                }
+                if !in_source && !in_build {
+                    input.insert("isExternal".into(), Bool(true));
+                }
+                if is_under(file, &cmake_root) {
+                    input.insert("isCMake".into(), Bool(true));
+                }
+                Object(input)
+            });
         let mut body = members([
             ("paths", paths(self.source, self.build)),
             ("inputs", array(inputs)),

@@ -356,10 +356,12 @@ impl<'a> Graph<'a> {
                 if let Some(depfile) = &custom.depfile {
                     let depfile = self.node(depfile);
                     // Ninja removes the depfile when it records dependencies in its database.
-                    if !nodes.outputs.contains(&depfile) && !nodes.byproducts.contains(&depfile) {
+                    let persistent =
+                        nodes.outputs.contains(&depfile) || nodes.byproducts.contains(&depfile);
+                    plan.bind(b"depfile", depfile);
+                    if !persistent {
                         plan.bind(b"deps", b"gcc".as_slice());
                     }
-                    plan.bind(b"depfile", depfile);
                 }
                 let description = custom
                     .outputs

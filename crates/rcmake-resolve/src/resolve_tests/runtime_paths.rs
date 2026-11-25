@@ -375,3 +375,207 @@ fn elf_link_paths_respect_origin_and_the_install_path_switch() -> TestResult {
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn darwin_rpath_follows_the_install_name_of_an_import_through_a_static_library() -> TestResult {
+    for (soname, expected) in [
+        ("@rpath/libvendor.dylib", true),
+        ("/sdk/libvendor.dylib", false),
+    ] {
+        let (mut model, host) = fixture("Darwin")?;
+        model
+            .global
+            .props
+            .set("CMAKE_PLATFORM_HAS_INSTALLNAME".into(), "ON".into());
+        let mut vendor = target("vendor", TargetKind::SharedLibrary, &[]);
+        vendor.origin = TargetOrigin::Imported(ImportedVisibility::Local);
+        vendor.props.set(
+            "IMPORTED_LOCATION".into(),
+            "/sdk with space/libvendor.dylib".into(),
+        );
+        vendor.props.set("IMPORTED_SONAME".into(), soname.into());
+        model.add_target(vendor)?;
+        let mut mid = target("mid", TargetKind::StaticLibrary, &["lib.c"]);
+        mid.usage.link_libraries = Some(vec![link_item("vendor")]);
+        mid.usage.interface_link_libraries = Some(vec![link_item("$<LINK_ONLY:vendor>")]);
+        model.add_target(mid)?;
+        let mut app = target("app", TargetKind::Executable, &["main.c"]);
+        app.usage.link_libraries = Some(vec![link_item("mid")]);
+        model.add_target(app)?;
+        let result = resolve(&model, &host, &[])?;
+        let link = recipe(&result, b"app")?;
+        assert_eq!(link.contains("-Wl,-rpath,"), expected, "{link}");
+        if expected {
+            assert!(link.contains("-Wl,-rpath,'/sdk with space'"), "{link}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn darwin_rpath_recognizes_the_linker_name_of_a_versioned_library() -> TestResult {
+    let (mut model, host) = fixture("Darwin")?;
+    model.generator = Some(GeneratorKind::UnixMakefiles);
+    model
+        .global
+        .props
+        .set("CMAKE_PLATFORM_HAS_INSTALLNAME".into(), "ON".into());
+    let mut library = target("driver", TargetKind::SharedLibrary, &["lib.c"]);
+    library.props.set("VERSION".into(), "1.2".into());
+    library.props.set("SOVERSION".into(), "1".into());
+    model.add_target(library)?;
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.usage.link_libraries = Some(vec![link_item("driver")]);
+    model.add_target(app)?;
+    let result = resolve(&model, &host, &[])?;
+    let link = recipe(&result, b"app")?;
+    assert!(
+        link.contains("-Wl,-rpath,") && link.ends_with("/libdriver.dylib"),
+        "{link}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn elf_runtime_paths_exclude_implicit_directories_and_include_private_shared_dependencies()
+-> TestResult {
+    let (mut model, host) = fixture("Linux")?;
+    for (name, value) in [
+        ("CMAKE_EXECUTABLE_FORMAT", "ELF"),
+        ("CMAKE_SHARED_LIBRARY_RUNTIME_C_FLAG_SEP", ":"),
+        ("CMAKE_C_IMPLICIT_LINK_DIRECTORIES", "/usr/lib/example/"),
+        ("CMAKE_SHARED_LIBRARY_RPATH_LINK_C_FLAG", "-Wl,-rpath-link,"),
+    ] {
+        model.global.props.set(name.into(), value.into());
+    }
+    for (name, file) in [
+        ("implicit", "/usr/lib/example/libimplicit.so"),
+        ("indirect", "/opt/vendor/lib/libindirect.so.1"),
+    ] {
+        let mut library = target(name, TargetKind::SharedLibrary, &[]);
+        library.origin = TargetOrigin::Imported(ImportedVisibility::Local);
+        library.props.set("IMPORTED_LOCATION".into(), file.into());
+        model.add_target(library)?;
+    }
+    let mut library = target("direct", TargetKind::SharedLibrary, &["lib.c"]);
+    library.usage.link_libraries = Some(vec![link_item("indirect")]);
+    model.add_target(library)?;
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.usage.link_libraries = Some(vec![link_item("direct"), link_item("implicit")]);
+    app.props
+        .set("INSTALL_RPATH_USE_LINK_PATH".into(), "ON".into());
+    app.props.set("BUILD_RPATH_USE_ORIGIN".into(), "ON".into());
+    let id = model.add_target(app)?;
+    install(&mut model, id);
+    let result = resolve(&model, &host, &[])?;
+    let link = recipe(&result, b"app")?;
+    assert!(link.contains("-Wl,-rpath-link,/opt/vendor/lib"), "{link}");
+    assert!(link.contains("$ORIGIN:/opt/vendor/lib"), "{link}");
+    assert!(!link.contains("-Wl,-rpath,/usr"), "{link}");
+    assert!(result.install.actions.iter().any(|action| {
+        matches!(&action.kind, InstallActionKind::Code(code)
+            if code.contains_str("NEW_RPATH") && code.contains_str("/opt/vendor/lib")
+                && !code.contains_str("/usr/lib/example"))
+    }));
+    Ok(())
+}
+
+#[test]
+fn named_runtime_dependency_install_scans_between_the_surrounding_rules() -> TestResult {
+    use rcmake_model::{RuntimeDependencyFilters, RuntimeDependencyInstall};
+
+    let (mut model, host) = fixture("Linux")?;
+    let app = model.add_target(target("app", TargetKind::Executable, &["main.c"]))?;
+    install(&mut model, app);
+    for (key, arg) in ["TARGETS", "app", "RUNTIME_DEPENDENCY_SET", "sdk"]
+        .into_iter()
+        .enumerate()
+    {
+        model
+            .global
+            .props
+            .set(format!("_RCMAKE_INSTALL_0_ARG{key}").into(), arg.into());
+    }
+    model
+        .runtime_dependency_installs
+        .push(RuntimeDependencyInstall {
+            dir: DirId::ROOT,
+            position: 1,
+            name: "sdk".into(),
+            backtrace: Backtrace::default(),
+            library: InstallOptions {
+                destination: Some("vendor lib".into()),
+                component: Some("Vendor".into()),
+                ..Default::default()
+            },
+            framework: None,
+            filters: RuntimeDependencyFilters {
+                directories: vec!["/vendor path".into()],
+                post_exclude_regexes: vec!["^/usr/".into()],
+                ..Default::default()
+            },
+        });
+    model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: Backtrace::default(),
+        kind: InstallKind::Code("message(STATUS after)".into()),
+        options: InstallOptions::default(),
+    });
+    let result = resolve(&model, &host, &[])?;
+    let [app, scan, copy, after] = result.install.actions.as_slice() else {
+        return Err("Expected four install actions.".into());
+    };
+    assert!(matches!(app.kind, InstallActionKind::Files { .. }));
+    let (InstallActionKind::Code(scan_code), InstallActionKind::Code(copy_code)) =
+        (&scan.kind, &copy.kind)
+    else {
+        return Err("Expected runtime dependency code.".into());
+    };
+    assert_eq!(scan.component, "Vendor");
+    assert_eq!(copy.component, "Vendor");
+    assert!(scan_code.contains_str("file(GET_RUNTIME_DEPENDENCIES"));
+    assert!(scan_code.contains_str("EXECUTABLES\n"));
+    assert!(scan_code.contains_str("/build/app"));
+    assert!(scan_code.contains_str("DIRECTORIES\n    \"/vendor path\""));
+    assert!(scan_code.contains_str("POST_EXCLUDE_REGEXES\n    \"^/usr/\""));
+    assert!(copy_code.contains_str("${CMAKE_INSTALL_PREFIX}/vendor lib"));
+    assert!(copy_code.contains_str("FOLLOW_SYMLINK_CHAIN"));
+    assert_eq!(
+        after.kind,
+        InstallActionKind::Code("message(STATUS after)".into())
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn elf_links_private_import_stubs_without_adding_them_to_the_runtime_path() -> TestResult {
+    let (mut model, host) = fixture("Linux")?;
+    for (name, value) in [
+        ("CMAKE_EXECUTABLE_FORMAT", "ELF"),
+        ("CMAKE_C_COMPILER_LINKER_ID", "GNU"),
+        ("CMAKE_SHARED_LIBRARY_RPATH_LINK_C_FLAG", "-Wl,-rpath-link,"),
+    ] {
+        model.global.props.set(name.into(), value.into());
+    }
+    let mut stub = target("stub", TargetKind::SharedLibrary, &[]);
+    stub.origin = TargetOrigin::Imported(ImportedVisibility::Local);
+    stub.props.set(
+        "IMPORTED_IMPLIB".into(),
+        "/opt/vendor/stubs/libstub.so".into(),
+    );
+    model.add_target(stub)?;
+    let mut library = target("direct", TargetKind::SharedLibrary, &["lib.c"]);
+    library.usage.link_libraries = Some(vec![link_item("stub")]);
+    model.add_target(library)?;
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.usage.link_libraries = Some(vec![link_item("direct")]);
+    model.add_target(app)?;
+    let result = resolve(&model, &host, &[])?;
+    let link = recipe(&result, b"app")?;
+    assert!(link.contains(" /opt/vendor/stubs/libstub.so"), "{link}");
+    assert!(!link.contains("-Wl,-rpath,/opt/vendor/stubs"), "{link}");
+    Ok(())
+}

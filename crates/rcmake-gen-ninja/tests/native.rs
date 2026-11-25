@@ -362,6 +362,7 @@ fn ninja_builds_an_executable_whose_output_name_matches_its_library()
     check
         .depends
         .push(BT::new("sqlite_shell".into(), Default::default()));
+    check.verbatim = true;
     check
         .command_lines
         .push(vec!["sh".into(), "-c".into(), "./sqlite3 > check".into()]);

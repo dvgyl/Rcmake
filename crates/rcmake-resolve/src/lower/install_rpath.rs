@@ -269,6 +269,7 @@ pub(super) fn external_link_directories<'a>(
     model: &'a rcmake_model::ProjectModel,
     target: &'a rcmake_model::Target,
     libraries: &'a [BString],
+    implicit: &'a indexmap::IndexSet<BString>,
 ) -> impl Iterator<Item = BString> + 'a {
     use rcmake_base::path_lex::Lexical;
     use rcmake_model::DirId;
@@ -284,6 +285,7 @@ pub(super) fn external_link_directories<'a>(
         .or_else(|| super::link::driver::shared_library(path.filename()).then(|| path.parent()))?;
         if !path.absolute()
             || directory.is_empty()
+            || implicit.contains(&Lexical::new(directory).normalize())
             || [
                 Lexical::new(&root.source_dir),
                 Lexical::new(&root.binary_dir),

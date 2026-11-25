@@ -1,6 +1,5 @@
 //! Install actions and configure metadata.
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 
 use indexmap::{IndexMap, IndexSet};
@@ -22,15 +21,18 @@ use crate::{
     usage::UsageResolver,
 };
 
+mod entries;
 mod imported_runtime;
 mod legacy;
 mod objects;
 mod projection;
+mod runtime_set;
 mod script_policy;
 mod strip;
 mod targets;
 pub(super) mod transitive;
 
+use entries::{InstallEntry, ordered_entries, ordered_install_rules};
 use transitive::RuntimeTargets;
 
 pub(crate) use objects::exported_path as exported_object_path;
@@ -45,8 +47,15 @@ pub use super::artifacts::collect_metadata;
 pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) -> InstallManifest {
     let runtime =
         transitive::collect(model, &mut UsageResolver::new(model), targets).unwrap_or_default();
-    let edits =
-        runtime_edits(model, targets, &IndexMap::new(), &runtime, |_, _, _| {}).unwrap_or_default();
+    let edits = runtime_edits(
+        model,
+        targets,
+        &IndexMap::new(),
+        &runtime,
+        None,
+        |_, _, _| {},
+    )
+    .unwrap_or_default();
     match lower_install_rules(
         model,
         targets,
@@ -76,15 +85,22 @@ pub(crate) fn lower_install_manifest_with_configs(
     super::warn_install_name_policy(model, host);
     let mut usage = UsageResolver::new(model).with_ide(ide);
     let runtime = transitive::collect(model, &mut usage, targets)?;
-    let edits = runtime_edits(model, targets, languages, &runtime, |rule, raw, edit| {
-        if let super::install_rpath::RuntimeEdit::Elf(elf) = edit
-            && raw.policies.policies.get(rcmake_diag::PolicyId::new(95))
-                == rcmake_diag::PolicyStatus::Warn
-            && elf.new.windows(2).any(|pair| pair == b"${")
-        {
-            warn_rpath_escaping(model, host, rule, raw);
-        }
-    })?;
+    let edits = runtime_edits(
+        model,
+        targets,
+        languages,
+        &runtime,
+        Some(host),
+        |rule, raw, edit| {
+            if let super::install_rpath::RuntimeEdit::Elf(elf) = edit
+                && raw.policies.policies.get(rcmake_diag::PolicyId::new(95))
+                    == rcmake_diag::PolicyStatus::Warn
+                && elf.new.windows(2).any(|pair| pair == b"${")
+            {
+                warn_rpath_escaping(model, host, rule, raw);
+            }
+        },
+    )?;
     lower_install_rules(
         model,
         targets,
@@ -277,84 +293,6 @@ fn matches_config(options: &InstallOptions, config: &ConfigId) -> bool {
             .any(|name| config.matches(name))
 }
 
-#[derive(Clone, Copy)]
-enum InstallEntry<'a> {
-    Rule(usize, &'a InstallRule, Option<usize>),
-    Directory(DirId),
-}
-
-fn ordered_install_rules(model: &ProjectModel) -> Vec<(usize, &InstallRule, Option<usize>)> {
-    ordered_entries(model)
-        .into_iter()
-        .filter_map(|entry| match entry {
-            InstallEntry::Rule(index, rule, export) => Some((index, rule, export)),
-            InstallEntry::Directory(_) => None,
-        })
-        .collect()
-}
-
-fn ordered_entries(model: &ProjectModel) -> Vec<InstallEntry<'_>> {
-    use rcmake_diag::{PolicyId, PolicyStatus};
-
-    let mut entries: BTreeMap<_, Vec<_>> = BTreeMap::new();
-    let mut export_count = 0;
-    for (index, rule) in model.installs.iter().enumerate() {
-        let included = !model.dir_excluded_from_all(rule.dir);
-        let export = if included && matches!(rule.kind, InstallKind::Export { .. }) {
-            let plan = export_count;
-            export_count += 1;
-            Some(plan)
-        } else {
-            None
-        };
-        if included {
-            entries.entry(rule.dir).or_default().push((
-                index,
-                true,
-                InstallEntry::Rule(index, rule, export),
-            ));
-        }
-    }
-    for (id, directory) in model.dirs().skip(1) {
-        let Some(parent) = directory.parent else {
-            continue;
-        };
-        if model.dir_excluded_from_all(id) {
-            continue;
-        }
-        let interleave = model
-            .dir(parent)
-            .final_policies
-            .is_none_or(|policies| policies.get(PolicyId::new(82)) == PolicyStatus::New);
-        let position = if interleave {
-            directory.install_position
-        } else {
-            usize::MAX
-        };
-        entries
-            .entry(parent)
-            .or_default()
-            .push((position, false, InstallEntry::Directory(id)));
-    }
-    for directory in entries.values_mut() {
-        directory.sort_by_key(|&(position, is_rule, _)| (position, is_rule));
-    }
-    let mut pending = vec![InstallEntry::Directory(DirId::ROOT)];
-    let mut ordered = Vec::with_capacity(model.installs.len());
-    while let Some(entry) = pending.pop() {
-        match entry {
-            InstallEntry::Rule(..) => ordered.push(entry),
-            InstallEntry::Directory(id) => {
-                ordered.push(entry);
-                if let Some(items) = entries.remove(&id) {
-                    pending.extend(items.into_iter().rev().map(|entry| entry.2));
-                }
-            }
-        }
-    }
-    ordered
-}
-
 type RuntimeEdits = IndexMap<(TargetId, ConfigId), super::install_rpath::RuntimeEdit>;
 
 fn runtime_edits(
@@ -362,6 +300,7 @@ fn runtime_edits(
     targets: &[ResolvedTarget],
     languages: &IndexMap<(TargetId, ConfigId), IndexSet<BString>>,
     runtime: &RuntimeTargets,
+    host: Option<&dyn Host>,
     mut warn: impl FnMut(&InstallRule, &Target, &super::install_rpath::RuntimeEdit),
 ) -> Result<RuntimeEdits, ResolveError> {
     let facts: IndexMap<_, _> = targets
@@ -390,7 +329,7 @@ fn runtime_edits(
             &fallback
         };
         if let Some(edit) =
-            super::link::rpath::install_rpath(model, raw, target, languages, &facts)?
+            super::link::rpath::install_rpath(model, raw, target, languages, &facts, host)?
         {
             for rule in rules {
                 warn(rule, raw, &edit);
@@ -482,6 +421,25 @@ fn lower_install_rules<E>(
     for entry in ordered_entries(model) {
         let (index, rule, export_plan) = match entry {
             InstallEntry::Rule(index, rule, export) => (index, rule, export),
+            InstallEntry::RuntimeSet(set) => {
+                let first = manifest.actions.len();
+                runtime_set::lower(
+                    model,
+                    targets,
+                    configs,
+                    set,
+                    &mut eval,
+                    &mut manifest.actions,
+                )?;
+                if first < manifest.actions.len() {
+                    manifest
+                        .directories
+                        .entry(set.dir)
+                        .or_default()
+                        .push(crate::InstallEntry::Actions(first..manifest.actions.len()));
+                }
+                continue;
+            }
             InstallEntry::Directory(dir) => {
                 manifest.directories.entry(dir).or_default();
                 if let Some(parent) = model.dir(dir).parent {
@@ -504,7 +462,7 @@ fn lower_install_rules<E>(
                 .props
                 .get(format!("_RCMAKE_INSTALL_{index}_MESSAGE").as_bytes());
             let make_action = |options: &InstallOptions, destination: &[u8], kind| {
-                let mut action = action(model, rule, options, destination, kind);
+                let mut action = action(model, rule.dir, options, destination, kind);
                 if let Some(message) = message {
                     action.message.clone_from(message);
                 }
@@ -677,7 +635,7 @@ fn action_configs<'a>(
 
 fn action(
     model: &ProjectModel,
-    rule: &InstallRule,
+    dir: DirId,
     options: &InstallOptions,
     destination: &[u8],
     kind: InstallActionKind,
@@ -688,9 +646,7 @@ fn action(
         component: options
             .component
             .clone()
-            .or_else(|| {
-                definition(model, rule.dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME").cloned()
-            })
+            .or_else(|| definition(model, dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME").cloned())
             .unwrap_or_else(|| "Unspecified".into()),
         destination: options
             .destination
@@ -746,7 +702,7 @@ fn add_bmi_include(
     );
     let mut action = action(
         model,
-        rule,
+        rule.dir,
         options,
         b"",
         InstallActionKind::Script(path.clone()),

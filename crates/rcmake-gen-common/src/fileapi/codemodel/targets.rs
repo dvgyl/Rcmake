@@ -3,11 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rcmake_base::{hash::HashAlgo, list, path_lex::Lexical, truth::is_on};
+use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical, truth::is_on};
 use rcmake_diag::{Backtrace, Frame, FrameKind};
+use rcmake_genex::{ArtifactKind, ArtifactPart, EvalContext};
 use rcmake_host::path::{from_native, from_native_cmake, to_native};
 use rcmake_model::{
-    BT, DirId, Directory, GeneratorKind, ProjectModel, Target, TargetId, TargetKind,
+    BT, DirId, Directory, GeneratorKind, ProjectModel, Target, TargetId, TargetKind, UsageField,
 };
 use rcmake_resolve::{
     ArtifactSet, CompileGroup, LinkFragmentRole, LinkKind, ResolvedTarget, TargetMetadata,
@@ -150,16 +151,35 @@ pub(super) fn abstract_targets(
     config: &[u8],
     targets: &[&ResolvedTarget],
 ) -> Vec<ResolvedTarget> {
+    let usage = UsageResolver::new(model);
+    let config = rcmake_genex::ConfigId(config.into());
     let resolved_ids: BTreeSet<_> = targets.iter().map(|target| target.id).collect();
     model
         .targets()
         .filter(|(id, raw)| !model.is_in_build_system(raw) && !resolved_ids.contains(id))
         .map(|(id, raw)| {
             let dir = model.dir(raw.dir);
-            let mut target = ResolvedTarget {
+            let artifact = |kind| usage.artifact(id, kind, ArtifactPart::Full, &config);
+            let artifacts = if raw.is_imported()
+                && matches!(
+                    raw.kind,
+                    TargetKind::Executable
+                        | TargetKind::StaticLibrary
+                        | TargetKind::SharedLibrary
+                        | TargetKind::ModuleLibrary
+                ) {
+                ArtifactSet {
+                    file: artifact(ArtifactKind::File),
+                    import_file: artifact(ArtifactKind::ImportFile),
+                    ..Default::default()
+                }
+            } else {
+                ArtifactSet::default()
+            };
+            ResolvedTarget {
                 fortran: None,
                 id,
-                config: Default::default(),
+                config: config.clone(),
                 metadata: TargetMetadata {
                     name: raw.name.clone(),
                     kind: raw.kind,
@@ -170,16 +190,14 @@ pub(super) fn abstract_targets(
                     exclude_from_all: false,
                     generator_provided: false,
                 },
-                artifacts: ArtifactSet::default(),
+                artifacts,
                 compile_groups: Vec::new(),
                 compile_units: Vec::new(),
                 link: None,
                 dependencies: Vec::new(),
                 cxx_modules: None,
                 ide: None,
-            };
-            target.config.0 = config.into();
-            target
+            }
         })
         .collect()
 }
@@ -289,7 +307,7 @@ impl FileApi<'_, '_> {
         ids.iter()
             .filter_map(|id| targets.get(id))
             .map(|reference| {
-                let mut value = self.target_object(config, reference, targets);
+                let mut value = self.target_object(config, reference, targets, &mut usage)?;
                 if let Some(target) = self.model.target(reference.target.id) {
                     let includes =
                         interface_includes(self.model, &mut usage, reference.target, target)?;
@@ -315,7 +333,8 @@ impl FileApi<'_, '_> {
         config: &[u8],
         reference: &TargetRef<'_>,
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
-    ) -> Members {
+        usage: &mut UsageResolver<'_>,
+    ) -> Result<Members, GenError> {
         let target = reference.target;
         let metadata = &target.metadata;
         let raw = self.model.target(target.id);
@@ -470,9 +489,9 @@ impl FileApi<'_, '_> {
                 Some(Object(item))
             }),
         );
-        self.target_sources(target, raw, &mut body, &mut graph);
+        self.target_sources(target, raw, &mut body, &mut graph, usage)?;
         body.insert("backtraceGraph".into(), graph.into_json());
-        body
+        Ok(body)
     }
 
     fn target_sources(
@@ -481,7 +500,8 @@ impl FileApi<'_, '_> {
         raw: Option<&Target>,
         body: &mut Members,
         graph: &mut Backtraces<'_>,
-    ) {
+        usage: &mut UsageResolver<'_>,
+    ) -> Result<(), GenError> {
         let mut sources = Vec::new();
         let mut source_groups = [Vec::new(), Vec::new(), Vec::new()];
         let mut seen = BTreeSet::new();
@@ -559,16 +579,37 @@ impl FileApi<'_, '_> {
                 units.push(index);
             }
         }
-        optional_array(
-            body,
-            "compileGroups",
-            target
-                .compile_groups
-                .iter()
-                .zip(units_by_group)
-                .map(|(group, units)| compile_group(group, units, graph)),
-        );
+        let mut headers = BTreeMap::new();
+        let mut compile_groups = Vec::new();
+        for (group, units) in target.compile_groups.iter().zip(units_by_group) {
+            let entries = match headers.entry(&group.language) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let context = EvalContext {
+                        config: target.config.clone(),
+                        language: Some(group.language.clone()),
+                        ..EvalContext::default()
+                    };
+                    let collected = usage
+                        .collect(target.id, UsageField::PrecompileHeaders, &context)
+                        .map_err(|error| GenError::Invalid(error.to_string().into()))?;
+                    let mut seen = BTreeSet::new();
+                    entry.insert(
+                        collected
+                            .entries
+                            .into_iter()
+                            .filter(|header| {
+                                !header.value.is_empty() && seen.insert(header.value.clone())
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            };
+            compile_groups.push(compile_group(group, units, entries, graph));
+        }
+        optional_array(body, "compileGroups", compile_groups);
         body.insert("sources".into(), array(sources.into_iter().map(Object)));
+        Ok(())
     }
 }
 
@@ -597,19 +638,29 @@ fn dependency_backtrace<'a>(
         })
 }
 
-fn compile_group(group: &CompileGroup, sources: Vec<usize>, graph: &mut Backtraces<'_>) -> Value {
+fn compile_group(
+    group: &CompileGroup,
+    sources: Vec<usize>,
+    headers: &[BT<BString>],
+    graph: &mut Backtraces<'_>,
+) -> Value {
     let mut body = members([
         ("language", Value::string(group.language.clone())),
         ("sourceIndexes", array(sources.into_iter().map(number))),
     ]);
+    let mut defines: Vec<_> = group.defines.iter().collect();
+    defines.sort_by(|a, b| a.value.cmp(&b.value));
+    let flags: Vec<_> = group.flags.iter().collect();
+    let headers: Vec<_> = headers.iter().collect();
     for (field, key, items) in [
-        ("compileCommandFragments", "fragment", &group.flags),
-        ("defines", "define", &group.defines),
+        ("compileCommandFragments", "fragment", flags),
+        ("defines", "define", defines),
+        ("precompileHeaders", "header", headers),
     ] {
         optional_array(
             &mut body,
             field,
-            items.iter().map(|value| {
+            items.into_iter().map(|value| {
                 let mut item = Members::new();
                 graph.tagged_value(&mut item, key, value);
                 Object(item)

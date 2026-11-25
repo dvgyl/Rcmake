@@ -199,7 +199,7 @@ foreach(_cmake_expected_target IN ITEMS"#,
     );
     for target in &plan.targets {
         out.push(b' ');
-        quote(out, &qualified_name(plan, target));
+        target_argument(out, &qualified_name(plan, target));
     }
     out.extend_from_slice(
         br#")
@@ -330,9 +330,7 @@ fn render_target(
         }
         out.extend_from_slice(b")\n");
     }
-    for set in &target.source_sets {
-        render_source_set(out, &name, set, plan.install);
-    }
+    render_source_sets(out, &name, &target.source_sets, plan.install);
     out.push(b'\n');
     Ok(())
 }
@@ -347,52 +345,110 @@ fn computed_file_set_property(property: &[u8]) -> bool {
         .is_some_and(|kind| rcmake_model::FileSetKind::from_name(kind).is_some())
 }
 
-fn render_source_set(
+fn render_source_sets(
     out: &mut BString,
     target: &[u8],
-    set: &rcmake_resolve::ExportedSourceSet,
+    sets: &[rcmake_resolve::ExportedSourceSet],
     install: bool,
 ) {
-    let version = if set.kind == rcmake_model::FileSetKind::Headers {
-        b"3.23".as_slice()
-    } else {
-        b"4.5"
-    };
-    out.extend_from_slice(b"if(NOT CMAKE_VERSION VERSION_LESS ");
-    out.extend_from_slice(version);
-    out.extend_from_slice(b")\n  target_sources(");
-    quote(out, target);
-    out.extend_from_slice(b" INTERFACE FILE_SET ");
-    quote(out, &set.name);
-    out.extend_from_slice(b" TYPE ");
-    out.extend_from_slice(set.kind.as_str().as_bytes());
-    for (key, entries) in [
-        (b" BASE_DIRS".as_slice(), &set.bases),
-        (b" FILES", &set.files),
-    ] {
-        if entries.is_empty() {
+    use rcmake_model::FileSetKind::{CxxModules, Headers, Sources};
+    for kind in [Headers, Sources, CxxModules] {
+        let sets: Vec<_> = sets.iter().filter(|set| set.kind == kind).collect();
+        if sets.is_empty() {
             continue;
         }
-        out.extend_from_slice(key);
-        for value in entries {
-            out.extend_from_slice(b" \"");
-            quote_export_content(out, value, install, true, false);
-            out.push(b'"');
+        let language = sets
+            .iter()
+            .any(|set| set.properties.contains_key(b"LANGUAGE".as_slice()));
+        let version: &[u8] = if language
+            || sets
+                .iter()
+                .any(|set| set.name == b"SYCL" || set.name == b"SYCL_HEADERS")
+        {
+            b"4.5.0"
+        } else {
+            match kind {
+                Headers => b"3.23.0",
+                Sources => b"4.4.0",
+                CxxModules => b"3.28.0",
+            }
+        };
+        out.extend_from_slice(b"if(NOT CMAKE_VERSION VERSION_LESS ");
+        quote(out, version);
+        out.extend_from_slice(b")\n  target_sources(");
+        target_argument(out, target);
+        for set in &sets {
+            out.extend_from_slice(b"\n    INTERFACE\n      FILE_SET ");
+            quote(out, &set.name);
+            out.extend_from_slice(b"\n      TYPE ");
+            quote(out, kind.as_str().as_bytes());
+            for (key, entries) in [
+                (b"\n      BASE_DIRS".as_slice(), &set.bases),
+                (b"\n      FILES", &set.files),
+            ] {
+                if !entries.is_empty() {
+                    out.extend_from_slice(key);
+                    for value in entries {
+                        out.push(b' ');
+                        source_set_value(out, value, install, true);
+                    }
+                }
+            }
         }
+        out.extend_from_slice(b"\n  )");
+        for set in &sets {
+            for (key, value) in &set.properties {
+                out.extend_from_slice(b"\n\n  set_property(FILE_SET ");
+                quote(out, &set.name);
+                out.extend_from_slice(b" TARGET ");
+                target_argument(out, target);
+                out.extend_from_slice(b"\n    PROPERTY ");
+                target_argument(out, key);
+                out.push(b' ');
+                source_set_value(out, value, install, false);
+                out.extend_from_slice(b"\n  )");
+            }
+        }
+        out.extend_from_slice(b"\nelse()\n");
+        if kind == Headers && !language {
+            out.extend_from_slice(b"  set_property(TARGET ");
+            target_argument(out, target);
+            out.extend_from_slice(b"\n    APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES");
+            for set in &sets {
+                for base in &set.bases {
+                    out.extend_from_slice(b"\n      ");
+                    source_set_value(out, base, install, true);
+                }
+            }
+            out.extend_from_slice(b"\n  )");
+        } else {
+            let (level, requirement) = match kind {
+                Headers => (
+                    "FATAL_ERROR",
+                    "the 'LANGUAGE' property of a 'HEADERS' file set which is not supported",
+                ),
+                Sources => (
+                    "FATAL_ERROR",
+                    "'FILE_SET' of type 'SOURCES' which is not supported",
+                ),
+                CxxModules => ("AUTHOR_WARNING", "C++ modules which are not supported"),
+            };
+            out.extend_from_slice(format!("  message({level} ").as_bytes());
+            quote(out, format!(
+                "The target '{}' cannot be imported{} because it relies on {requirement} by this CMake version.",
+                BString::from(target),
+                if kind == CxxModules { " properly" } else { "" },
+            ).as_bytes());
+            out.push(b')');
+        }
+        out.extend_from_slice(b"\nendif()\n\n");
     }
-    out.extend_from_slice(b")\n");
-    for (key, value) in &set.properties {
-        out.extend_from_slice(b"  set_property(FILE_SET ");
-        quote(out, &set.name);
-        out.extend_from_slice(b" TARGET ");
-        quote(out, target);
-        out.extend_from_slice(b" PROPERTY ");
-        quote(out, key);
-        out.extend_from_slice(b" \"");
-        quote_export_content(out, value, install, false, false);
-        out.extend_from_slice(b"\")\n");
-    }
-    out.extend_from_slice(b"endif()\n");
+}
+
+fn source_set_value(out: &mut BString, value: &[u8], install: bool, path: bool) {
+    out.push(b'"');
+    quote_export_content(out, value, install, path, false);
+    out.push(b'"');
 }
 
 type ConfigTargets<'a> = Vec<(&'a ExportedTarget, &'a BString)>;
@@ -430,9 +486,9 @@ fn render_config_target(
     let suffix = [b"_", config].concat();
     let name = qualified_name(plan, target);
     out.extend_from_slice(b"set_property(TARGET ");
-    quote(out, &name);
+    target_argument(out, &name);
     out.extend_from_slice(b" APPEND PROPERTY IMPORTED_CONFIGURATIONS ");
-    quote(out, config);
+    target_argument(out, config);
     out.extend_from_slice(b")\n");
     start_properties(out, &name);
     let mut paths = Vec::new();
@@ -485,9 +541,9 @@ fn render_config_target(
     }
     if !paths.is_empty() {
         out.extend_from_slice(b"list(APPEND _cmake_import_check_targets ");
-        quote(out, &name);
+        target_argument(out, &name);
         out.extend_from_slice(b")\nlist(APPEND ");
-        quote(
+        target_argument(
             out,
             &[b"_cmake_import_check_files_for_", name.as_slice()].concat(),
         );
@@ -566,7 +622,7 @@ fn target_argument(out: &mut BString, name: &[u8]) {
     if !name.is_empty()
         && name
             .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.+:-".contains(byte))
     {
         out.extend_from_slice(name);
     } else {
@@ -576,7 +632,7 @@ fn target_argument(out: &mut BString, name: &[u8]) {
 
 fn start_property(out: &mut BString, key: &[u8]) {
     out.extend_from_slice(b"  ");
-    quote(out, key);
+    target_argument(out, key);
     out.extend_from_slice(b" \"");
 }
 
@@ -708,7 +764,7 @@ fn exports_file_sets_via_target_sources() -> Result<(), Box<dyn std::error::Erro
     );
     let output = String::from_utf8(output.into())?;
     assert!(output.contains(&format!(
-        "target_sources(\"sdk::library\" INTERFACE FILE_SET \"headers\" TYPE HEADERS BASE_DIRS \"{base}\" FILES \"{base}/api.h\")"
+        "target_sources(sdk::library\n    INTERFACE\n      FILE_SET \"headers\"\n      TYPE \"HEADERS\"\n      BASE_DIRS \"{base}\"\n      FILES \"{base}/api.h\"\n  )"
     )));
     assert!(!output.contains("INTERFACE_HEADER_SETS"));
     assert!(!output.contains("INTERFACE_SOURCE_SETS"));

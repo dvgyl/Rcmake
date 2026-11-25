@@ -17,6 +17,76 @@ pub(super) fn join_words(words: impl IntoIterator<Item = BString>) -> BString {
     result
 }
 
+/// Quote an argument as CMake does for a POSIX shell.
+#[must_use]
+pub fn cmake_posix_quote(argument: &[u8]) -> BString {
+    let quoted = argument.is_empty()
+        || argument
+            .iter()
+            .any(|byte| b" \t\r\n'`;#&$()~<>|*^\\".contains(byte));
+    let mut result = BString::default();
+    if quoted {
+        result.push(b'"');
+    }
+    for &byte in argument {
+        if matches!(byte, b'\\' | b'"' | b'`' | b'$') {
+            result.push(b'\\');
+        }
+        result.push(byte);
+    }
+    if quoted {
+        result.push(b'"');
+    }
+    result
+}
+
+pub(super) fn ninja_custom(
+    argv: Vec<BString>,
+    working_dir: Option<BString>,
+    verbatim: bool,
+) -> Invocation {
+    let shell = join_words(argv.iter().enumerate().map(|(index, arg)| {
+        if index == 0 {
+            return cmake_posix_quote(arg);
+        }
+        if matches!(
+            arg.as_slice(),
+            b"<" | b">"
+                | b"<<"
+                | b">>"
+                | b"|"
+                | b"||"
+                | b"&&"
+                | b"&"
+                | b"2>"
+                | b"2>>"
+                | b"1>"
+                | b"1>>"
+                | b"2>&1"
+                | b"1>&2"
+        ) {
+            return arg.clone();
+        }
+        if verbatim {
+            return cmake_posix_quote(arg);
+        }
+        let mut escaped = BString::default();
+        for &byte in arg.iter() {
+            if byte == b' ' {
+                escaped.push(b'\\');
+            }
+            escaped.push(byte);
+        }
+        escaped
+    }));
+    Invocation {
+        argv,
+        shell,
+        working_dir,
+        link_response: None,
+    }
+}
+
 pub(super) fn windows_host(model: &ProjectModel, dir: DirId) -> bool {
     definition(model, dir, b"CMAKE_HOST_SYSTEM_NAME").map_or_else(
         || {

@@ -341,7 +341,7 @@ impl<'a> Graph<'a> {
                     32756
                 }
         } else {
-            command.len() >= rcmake_gen_common::link_response::POSIX_BUDGET
+            command.len() >= self.commands.posix_limit
         }
     }
 

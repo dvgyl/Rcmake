@@ -19,6 +19,7 @@ mod prep;
 mod progress;
 mod recipe;
 mod response;
+mod subdirectories;
 use recipe::{make_recipe_text, shell_invocation, write_step};
 
 pub use build::build_commands;
@@ -82,7 +83,7 @@ fn generate_impl(
     let empty = BuildGraph::default();
     let graph = result.graphs.first().unwrap_or(&empty);
     let mut targets = plan_targets(result, graph, &build_dir, model)?;
-    response::prepare(&mut targets, &graph.config.0, &build_dir, host)?;
+    response::prepare(&mut targets, &build_dir, host)?;
     let cmake_command = result
         .metadata
         .cmake_command
@@ -104,7 +105,7 @@ fn generate_impl(
     };
     let prep = prep::targets(result, graph, &targets, &build_dir, model)?;
     let verify_globs = rcmake_gen_common::glob::write_verification(model, &build_dir, host)?;
-    let top = top_level(
+    let mut top = top_level(
         result,
         graph,
         &targets,
@@ -113,7 +114,7 @@ fn generate_impl(
         (model, report_progress),
         verify_globs,
     )?;
-    let dispatch = dispatch(
+    let mut dispatch = dispatch(
         graph,
         &targets,
         &prep,
@@ -131,6 +132,16 @@ fn generate_impl(
             fortran.write(host, &build_dir, target)?;
         }
         write_makefile(host, &build_dir, &target.file, &contents)?;
+    }
+    if let Some(model) = model {
+        subdirectories::write(
+            host,
+            &build_dir,
+            model,
+            result,
+            &targets,
+            (&mut top, &mut dispatch),
+        )?;
     }
     write_makefile(host, &build_dir, MAKEFILE2, &dispatch)?;
     write_makefile(host, &build_dir, b"Makefile", &top)?;

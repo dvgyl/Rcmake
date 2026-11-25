@@ -122,7 +122,7 @@ fn single_config_writes_rules_edges_and_utilities() {
     for line in [
         "include CMakeFiles/rules.ninja",
         "build generated$ $$$:file | include${ninja_pipe}generated.h /work/build/generated$ $$$:file /work/build/include${ninja_pipe}generated.h: CUSTOM_COMMAND /work/config.in",
-        "  COMMAND = (cd -- '/work/a dir' && printf '%s' '$$value')",
+        r#"  COMMAND = cd "/work/a dir" && printf '%s' '$$value'"#,
         "  DESC = Generate $$: file",
         "  depfile = a $$:file.d",
         "  pool = console",
@@ -155,6 +155,7 @@ fn single_config_writes_rules_edges_and_utilities() {
         );
     }
 
+    assert!(build.contains("  depfile = a $$:file.d\n  deps = gcc\n"));
     let manifest = dir.join("build.ninja");
     let original = host
         .metadata(&manifest, Follow::Yes)

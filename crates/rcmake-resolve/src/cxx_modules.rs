@@ -164,9 +164,12 @@ pub(crate) fn validate_module_scanning(
         ));
     }
     if has_module_sets && !allows_module_scanning(model, target, inputs) {
-        let standard = cxx_standard(model, target).map_or_else(|| "98".into(), BString::clone);
+        let detail = diagnostic_standard(model, target, inputs).map_or_else(
+            || "no C++ standard found.".to_owned(),
+            |standard| format!("found \"cxx_std_{}\".", BString::from(standard)),
+        );
         return Err(module_error(model, paths, target, format!(
-            "The target named \"{}\" has C++ sources that use modules, but does not include \"cxx_std_20\" (or newer) among its `target_compile_features`; found \"cxx_std_{standard}\".",
+            "The target named \"{}\" has C++ sources that use modules, but does not include \"cxx_std_20\" (or newer) among its `target_compile_features`; {detail}",
             target.name,
         ).into()));
     }
@@ -187,7 +190,40 @@ fn cxx_standard<'a>(model: &'a ProjectModel, target: &'a Target) -> Option<&'a B
         .get(b"CXX_STANDARD")
         .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_STANDARD"))
         .filter(|standard| !standard.is_empty())
-        .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_STANDARD_DEFAULT"))
+}
+
+fn diagnostic_standard<'a>(
+    model: &'a ProjectModel,
+    target: &'a Target,
+    inputs: &'a TargetInputs,
+) -> Option<&'a [u8]> {
+    let default = lower::definition(model, target.dir, b"CMAKE_CXX_STANDARD_DEFAULT")
+        .filter(|standard| !standard.is_empty())?;
+    let default_extensions = lower::definition(model, target.dir, b"CMAKE_CXX_EXTENSIONS_DEFAULT")
+        .is_some_and(|value| truth::is_on(value));
+    let new = target.policies.policies.get(PolicyId::new(128)) == PolicyStatus::New;
+    let extensions = lower::target_property(model, target, b"CXX_EXTENSIONS")
+        .map_or(!new || default_extensions, |value| truth::is_on(value));
+    let standard = inputs
+        .standard_requirements
+        .get(b"CXX".as_slice())
+        .copied()
+        .or_else(|| cxx_standard(model, target).map(|value| value.as_slice()));
+    if let Some(standard) = standard {
+        let required = lower::target_property(model, target, b"CXX_STANDARD_REQUIRED")
+            .is_some_and(|value| truth::is_on(value));
+        return (required
+            || !new
+            || extensions != default_extensions
+            || standard != default.as_slice())
+        .then_some(standard);
+    }
+    (if new {
+        extensions != default_extensions
+    } else {
+        extensions
+    })
+    .then_some(default.as_slice())
 }
 
 fn allows_module_scanning(model: &ProjectModel, target: &Target, inputs: &TargetInputs) -> bool {

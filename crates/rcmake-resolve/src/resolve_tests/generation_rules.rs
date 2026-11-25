@@ -483,3 +483,65 @@ fn target_installers_keep_platform_artifact_groups() -> TestResult {
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn ninja_transformed_depfile_hashes_the_absolute_input_and_creates_its_directory() -> TestResult {
+    use rcmake_base::hash::HashAlgo;
+    use rcmake_model::{CustomCommand, CustomCommandKind, GeneratorKind};
+
+    let mut model = project();
+    model.generator = Some(GeneratorKind::Ninja);
+    let mut policies = rcmake_diag::PolicyMap::default();
+    policies.set(PolicyId::new(116), PolicyStatus::New)?;
+    let mut command = CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::Output,
+        Backtrace::default(),
+        policies,
+    );
+    command.outputs.push(entry("generated.c"));
+    command.depfile = Some("generated.d".into());
+    command.verbatim = true;
+    command.command_lines.push(vec![
+        "echo".into(),
+        r#"-DDET_NAME="det""#.into(),
+        "two words".into(),
+    ]);
+    model.add_command(command)?;
+    model.add_target(target(
+        "generated",
+        TargetKind::ObjectLibrary,
+        &["generated.c"],
+    ))?;
+    let host = PureHost::default();
+    let result = resolve(&model, &host, &[])?;
+    let custom = result
+        .graphs
+        .iter()
+        .flat_map(|graph| &graph.steps)
+        .find_map(|step| {
+            if let BuildStep::Custom(custom) = step {
+                Some(custom)
+            } else {
+                None
+            }
+        })
+        .ok_or("Missing custom command.")?;
+    let hash = HashAlgo::Sha256.hex_digest(b"/out/generated.d");
+    let expected = format!("CMakeFiles/d/{hash}.d");
+    assert_eq!(
+        custom.depfile.as_ref().map(|path| path.as_slice()),
+        Some(expected.as_bytes())
+    );
+    host.read_dir(Path::new("/out/CMakeFiles/d"))?;
+    let [command, transform] = custom.invocations.as_slice() else {
+        return Err("Expected the command and depfile transform.".into());
+    };
+    assert_eq!(
+        command.shell,
+        br#"echo -DDET_NAME=\"det\" "two words""#.as_slice()
+    );
+    assert_eq!(command.working_dir, transform.working_dir);
+    Ok(())
+}

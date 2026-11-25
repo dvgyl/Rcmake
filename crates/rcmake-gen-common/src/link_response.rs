@@ -8,8 +8,16 @@ use rcmake_resolve::{Invocation, ResponseQuoting, ResponseRole, ResponseSpan};
 
 use crate::{GenError, write_if_changed};
 
-/// Maximum POSIX shell argument length, with room for wrappers and termination.
-pub const POSIX_BUDGET: usize = 120 * 1024;
+/// Command-line limit before a generator switches to files or scripts.
+#[must_use]
+pub fn command_line_limit(system: &[u8]) -> usize {
+    match system {
+        b"Darwin" => 1024 * 1024 - 1000,
+        b"Linux" => 128 * 1024,
+        b"Windows" => 8191,
+        _ => 120 * 1024,
+    }
+}
 
 /// A generated link input file with a build-relative path.
 pub struct File {
@@ -43,6 +51,20 @@ pub fn rewrite(
     build: &Path,
     select: impl Fn(ResponseRole, usize, Option<bool>) -> bool,
 ) -> Option<(Invocation, Vec<File>)> {
+    let id = HashAlgo::Sha256.hex_digest(&[output, b"\0", config].concat());
+    rewrite_named(invocation, build, true, select, |_, ordinal| {
+        format!("CMakeFiles/rcmake-link-{id}-{index}-{ordinal}.rsp").into()
+    })
+}
+
+/// Rewrite selected expansions and name each response file with `name`.
+pub fn rewrite_named(
+    invocation: &Invocation,
+    build: &Path,
+    merge: bool,
+    select: impl Fn(ResponseRole, usize, Option<bool>) -> bool,
+    name: impl Fn(ResponseRole, usize) -> BString,
+) -> Option<(Invocation, Vec<File>)> {
     let settings = invocation.link_response.as_ref()?;
     let flag = settings.flag.trim_ascii_end();
     if flag.is_empty() {
@@ -57,9 +79,10 @@ pub fn rewrite(
         if !select(span.role, span.shell.len(), setting) {
             continue;
         }
-        if let Some(previous) = spans
-            .last_mut()
-            .filter(|previous| previous.argv.end == span.argv.start)
+        if merge
+            && let Some(previous) = spans
+                .last_mut()
+                .filter(|previous| previous.argv.end == span.argv.start)
         {
             previous.argv.end = span.argv.end;
             previous.shell.end = span.shell.end;
@@ -74,8 +97,7 @@ pub fn rewrite(
     let mut files = Vec::with_capacity(spans.len());
     for (ordinal, span) in spans.into_iter().enumerate().rev() {
         let contents = encode(invocation.argv.get(span.argv.clone())?, settings.quoting);
-        let id = HashAlgo::Sha256.hex_digest(&[output, b"\0", config].concat());
-        let path: BString = format!("CMakeFiles/rcmake-link-{id}-{index}-{ordinal}.rsp").into();
+        let path = name(span.role, ordinal);
         let reference_path = if invocation
             .working_dir
             .as_ref()

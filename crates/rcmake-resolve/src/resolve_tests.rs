@@ -108,6 +108,8 @@ fn compile_flags_keep_shell_arguments_and_property_order() -> TestResult {
         .push(UsageField::CompileOptions, entry("-DTARGET_OPTION"));
     app.usage
         .push(UsageField::CompileDefinitions, entry("TARGET_DEF"));
+    app.usage
+        .push(UsageField::CompileDefinitions, entry(r#"QUOTED="value""#));
     model.add_target(app)?;
     let source = model
         .dir_mut(DirId::ROOT)
@@ -140,6 +142,7 @@ fn compile_flags_keep_shell_arguments_and_property_order() -> TestResult {
         return Err("Expected three compile commands.".into());
     };
     let shared = [
+        r#"-DQUOTED="value""#,
         "-DTARGET_DEF",
         "-Dapp_EXPORTS",
         "-DLANGUAGE_FLAG",
@@ -1629,6 +1632,39 @@ fn module_set(model: &mut ProjectModel, target: TargetId, file: &str) -> TestRes
 }
 
 #[test]
+fn module_diagnostic_does_not_report_the_compiler_default_as_a_requested_standard() -> TestResult {
+    let mut model = project();
+    let host = PureHost::default();
+    host.seed_file(
+        Path::new("/src/lib/example.cppm"),
+        b"export module example;",
+    )?;
+    clang_scan(&mut model);
+    model
+        .global
+        .props
+        .set("CMAKE_CXX_STANDARD_DEFAULT".into(), "14".into());
+    let mut library = target("example", TargetKind::StaticLibrary, &[]);
+    library
+        .policies
+        .policies
+        .set(PolicyId::new(128), PolicyStatus::New)?;
+    let id = model.add_target(library)?;
+    module_set(&mut model, id, "lib/example.cppm")?;
+    assert!(resolve(&model, &host, &[]).is_err());
+    let message = host.stream_bytes(rcmake_host::Stream::Stderr).to_string();
+    assert!(
+        message
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("; no C++ standard found."),
+        "{message}"
+    );
+    Ok(())
+}
+
+#[test]
 fn lowers_clang_module_scans_and_linked_module_inputs() -> TestResult {
     let mut model = project();
     let host = PureHost::default();
@@ -2470,6 +2506,7 @@ fn xcode_uses_root_object_directory_for_subdirectory_targets() -> TestResult {
     use ide::{IdeFlavor, IdeSourceKind};
 
     let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Xcode);
     let sub = model.add_directory(
         DirId::ROOT,
         "/src/sub".into(),
@@ -2480,7 +2517,19 @@ fn xcode_uses_root_object_directory_for_subdirectory_targets() -> TestResult {
     obj.dir = sub;
     obj.props
         .set("OSX_ARCHITECTURES_DEBUG".into(), "ignored".into());
-    model.add_target(obj)?;
+    let obj = model.add_target(obj)?;
+    model.add_install(InstallRule {
+        dir: sub,
+        backtrace: Backtrace::default(),
+        kind: InstallKind::Targets {
+            targets: vec![obj],
+            export: None,
+        },
+        options: InstallOptions {
+            destination: Some("lib".into()),
+            ..Default::default()
+        },
+    });
     let app = model.add_target(target(
         "app",
         TargetKind::Executable,
@@ -2511,6 +2560,15 @@ fn xcode_uses_root_object_directory_for_subdirectory_targets() -> TestResult {
             },
         )?;
         let object = format!("/out/build/obj.build/Debug/Objects-normal/{arch}/core.o");
+        assert!(
+            result
+                .install
+                .actions
+                .iter()
+                .any(|action| matches!(&action.kind,
+            InstallActionKind::Files { rename: Some(name), files, .. }
+            if name == b"core.o" && files.iter().any(|file| file == object.as_bytes())))
+        );
         let facts = result
             .targets
             .iter()

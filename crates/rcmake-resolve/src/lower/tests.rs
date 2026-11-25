@@ -677,6 +677,7 @@ fn darwin_shared_library_uses_install_name_versions_and_symlinks() -> TestResult
 #[test]
 fn executable_uses_runtime_search_paths_for_shared_libraries_in_the_build_tree() -> TestResult {
     let mut model = fixture("Darwin");
+    var(&mut model, "CMAKE_C_IMPLICIT_LINK_DIRECTORIES", "/usr/lib");
     let config = ConfigId::default();
     let mut app = resolve_target(
         &mut model,

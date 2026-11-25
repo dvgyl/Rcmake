@@ -24,6 +24,7 @@ mod linker_type;
 pub(crate) use install_name::{install_name_dir, install_name_prefix, warn_install_name_policy};
 mod response;
 pub(super) mod rpath;
+mod rpath_macho;
 use driver::{
     LinkerDriver, archive_commands, deduplicate_darwin_flags, definition_file, library_file,
     shared_library, without_empty_output_flags,
@@ -611,6 +612,7 @@ fn link_libraries(
     let runtime = rpath::runtime_libraries(model, target, config, step, &libraries, usage)?;
     let rpaths = rpath::link_flags(model, target, config, step, usage, &runtime, link_languages)?;
     inputs.extend(libraries);
+    inputs.extend(runtime.link_stubs.iter().cloned());
     let (mut arguments, mut rpaths) = if darwin {
         (Vec::new(), Some(rpaths))
     } else {
@@ -623,6 +625,7 @@ fn link_libraries(
         arguments.push(wrapper.argument(&fragment.text.value)?);
     }
     arguments.extend(rpaths.into_iter().flatten());
+    arguments.extend(runtime.link_stubs.iter().map(|file| quote(file)));
     arguments.extend(runtime_args.iter().map(|arg| quote(arg)));
     if let Some(standard) = definition(
         model,

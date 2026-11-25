@@ -211,3 +211,80 @@ fn make_test_depends_on_all_only_if_explicitly_enabled() {
         );
     }
 }
+
+#[test]
+fn subdirectory_makefile_builds_only_the_directory_and_included_children()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = Path::new("/build");
+    let host = PureHost::new(root.into(), "/tools/rcmake".into());
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/src".into(), "/build".into());
+    let sub = model.add_directory(
+        DirId::ROOT,
+        "/src/sub".into(),
+        "/build/sub".into(),
+        Default::default(),
+    )?;
+    let child = model.add_directory(
+        sub,
+        "/src/sub/child".into(),
+        "/build/sub/child".into(),
+        Default::default(),
+    )?;
+    let skipped = model.add_directory(
+        sub,
+        "/src/sub/skipped".into(),
+        "/build/sub/skipped".into(),
+        Default::default(),
+    )?;
+    model.dir_mut(skipped).exclude_from_all = true;
+    for (dir, name) in [
+        (DirId::ROOT, "outside"),
+        (sub, "inside"),
+        (sub, "manual"),
+        (child, "child"),
+        (skipped, "skipped"),
+    ] {
+        let mut target = rcmake_model::Target::new(
+            name.into(),
+            rcmake_model::TargetKind::Utility,
+            rcmake_model::TargetOrigin::Normal,
+            dir,
+            Default::default(),
+            Default::default(),
+        );
+        if name == "manual" {
+            target.props.set("EXCLUDE_FROM_ALL".into(), "ON".into());
+        }
+        model.add_target(target)?;
+    }
+    let result = GenerationResult {
+        graphs: vec![BuildGraph {
+            targets: ["outside", "inside", "manual", "child", "skipped"]
+                .map(|name| graph_target(name, Vec::new(), Vec::new(), true))
+                .into(),
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    generate_with_model(&result, &host, root, &model)?;
+    let wrapper = read(&host, &root.join("sub/Makefile"));
+    assert!(
+        wrapper.contains("$(MAKE) -C '/build' -f 'Makefile' 'sub/all'"),
+        "{wrapper}"
+    );
+    assert!(wrapper.contains(".PHONY: inside/fast"), "{wrapper}");
+    let dispatch = read(&host, &root.join("CMakeFiles/Makefile2"));
+    let all = dispatch
+        .lines()
+        .find(|line| line.starts_with("sub/all:"))
+        .ok_or("Missing sub/all.")?;
+    assert!(
+        all.contains("sub/child/all") && all.contains("inside.dir/all"),
+        "{all}"
+    );
+    for name in ["outside", "manual", "skipped"] {
+        assert!(!all.contains(name), "{all}");
+    }
+    Ok(())
+}
