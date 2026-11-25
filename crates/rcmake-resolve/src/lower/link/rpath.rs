@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
+use rcmake_diag::{Location, MessageKind};
 use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext};
 use rcmake_model::{DirId, ProjectModel, Target, TargetId};
 
@@ -23,32 +24,52 @@ pub(super) fn link_flags(
     target: &Target,
     config: &ConfigId,
     step: &LinkStep,
-    darwin: bool,
+    source_paths: Option<&crate::sources::SourcePaths<'_>>,
     libraries: &[BString],
     languages: &IndexSet<BString>,
 ) -> Result<Vec<BString>, ResolveError> {
+    let darwin = is_darwin(model, target.dir);
+    let installed = crate::lower::install::has_target_install(model, target);
+    let chrpath = installed
+        && !on(model, target, b"CMAKE_SKIP_RPATH")
+        && !build_with_install_rpath(model, target)
+        && !on(model, target, b"CMAKE_NO_BUILTIN_CHRPATH")
+        && (darwin || elf_chrpath_supported(model, target, step));
+    if installed
+        && !on(model, target, b"CMAKE_SKIP_RPATH")
+        && !build_with_install_rpath(model, target)
+        && !chrpath
+        && model.generator.is_some_and(|generator| {
+            matches!(
+                generator,
+                rcmake_model::GeneratorKind::Ninja | rcmake_model::GeneratorKind::NinjaMultiConfig
+            )
+        })
+        && shared_runtime_setting(model, target, step, b"_FLAG").is_some_and(|value| {
+            !value.is_empty() && !value.ends_with(b"-NOTFOUND") && value != b"NOTFOUND"
+        })
+        && needs_tree_rpath(model, target, config, step)?
+    {
+        let message: BString = format!(
+            "The install of the {} target requires changing an RPATH from the build tree, but this is not supported with the Ninja generator unless on an ELF-based or XCOFF-based platform.  The CMAKE_BUILD_WITH_INSTALL_RPATH variable may be set to avoid this relinking step.",
+            target.name
+        ).into();
+        if let Some(paths) = source_paths {
+            paths.emit(
+                model,
+                MessageKind::Error,
+                Location::Backtrace(target.backtrace.clone()),
+                message.clone(),
+            );
+            return Err(ResolveError::Reported(message));
+        }
+        return Err(ResolveError::Message(message));
+    }
     let prefix = runtime_setting(model, target, step, b"_FLAG").unwrap_or(b"-Wl,-rpath,");
     if prefix.is_empty() {
         return Ok(Vec::new());
     }
     let paths = RuntimePaths::new(model, target, config, step, darwin, libraries, languages)?;
-    if !darwin
-        && matches!(
-            model.generator,
-            Some(
-                rcmake_model::GeneratorKind::Ninja | rcmake_model::GeneratorKind::NinjaMultiConfig
-            )
-        )
-        && on(model, target, b"CMAKE_NO_BUILTIN_CHRPATH")
-        && !build_with_install_rpath(model, target)
-        && paths.build != paths.install
-        && crate::lower::install::has_runtime_install(model, target, config)
-    {
-        return Err(ResolveError::Message(format!(
-            "The install of the {} target requires changing an RPATH from the build tree, but this is not supported with the Ninja generator unless on an ELF-based or XCOFF-based platform.  The CMAKE_BUILD_WITH_INSTALL_RPATH variable may be set to avoid this relinking step.",
-            target.name
-        ).into()));
-    }
     let build = if build_with_install_rpath(model, target) {
         &paths.install
     } else {
@@ -63,7 +84,8 @@ pub(super) fn link_flags(
     if separator.is_empty() {
         return Ok(build.iter().map(|path| format(path)).collect());
     }
-    if elf_edit_enabled(model, target, config, step)
+    if !darwin
+        && chrpath
         && let Some(edit) = paths.elf_edit(model, target, step)
     {
         return Ok(vec![format(&edit.old)]);
@@ -176,29 +198,35 @@ fn join_paths(paths: &IndexSet<BString>, separator: &[u8]) -> BString {
     joined
 }
 
-fn elf_edit_enabled(
-    model: &ProjectModel,
-    target: &Target,
-    config: &ConfigId,
-    step: &LinkStep,
-) -> bool {
+fn elf_chrpath_supported(model: &ProjectModel, target: &Target, step: &LinkStep) -> bool {
     definition(model, target.dir, b"CMAKE_EXECUTABLE_FORMAT").is_some_and(|format| format == "ELF")
-        && definition(
-            model,
-            target.dir,
-            &[
-                b"CMAKE_SHARED_LIBRARY_RUNTIME_".as_slice(),
-                &step.language,
-                b"_FLAG_SEP",
-            ]
-            .concat(),
-        )
-        .is_some_and(|separator| !separator.is_empty())
+        && shared_runtime_setting(model, target, step, b"_FLAG_SEP")
+            .is_some_and(|separator| !separator.is_empty())
+}
+
+fn elf_edit_enabled(model: &ProjectModel, target: &Target, step: &LinkStep) -> bool {
+    elf_chrpath_supported(model, target, step)
         && runtime_setting(model, target, step, b"_FLAG") != Some(b"")
         && !on(model, target, b"CMAKE_SKIP_RPATH")
         && !on(model, target, b"CMAKE_NO_BUILTIN_CHRPATH")
         && !build_with_install_rpath(model, target)
-        && crate::lower::install::has_runtime_install(model, target, config)
+}
+
+fn needs_tree_rpath(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    step: &LinkStep,
+) -> Result<bool, ResolveError> {
+    let build = !property_on(model, target, b"SKIP_BUILD_RPATH")
+        && (target_property(model, target, b"BUILD_RPATH").is_some()
+            || step
+                .fragments
+                .iter()
+                .any(|part| part.role == LinkFragmentRole::Libraries));
+    Ok(build
+        || (!on(model, target, b"CMAKE_SKIP_INSTALL_RPATH")
+            && !rpath_value(model, target, config, step, b"INSTALL_RPATH")?.is_empty()))
 }
 
 fn build_with_install_rpath(model: &ProjectModel, target: &Target) -> bool {
@@ -303,6 +331,25 @@ fn runtime_setting<'a>(
         .map(|value| value.as_slice())
 }
 
+fn shared_runtime_setting<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+    step: &LinkStep,
+    suffix: &[u8],
+) -> Option<&'a [u8]> {
+    definition(
+        model,
+        target.dir,
+        &[
+            b"CMAKE_SHARED_LIBRARY_RUNTIME_".as_slice(),
+            &step.language,
+            suffix,
+        ]
+        .concat(),
+    )
+    .map(|value| value.as_slice())
+}
+
 fn open_link_paths(
     model: &ProjectModel,
     target: &Target,
@@ -340,7 +387,7 @@ pub(in crate::lower) fn install_rpath(
         return Ok(None);
     };
     let darwin = is_darwin(model, target.dir);
-    if !darwin && !elf_edit_enabled(model, target, &resolved.config, link) {
+    if !darwin && !elf_edit_enabled(model, target, link) {
         return Ok(None);
     }
     let libraries = open_link_paths(model, target, &resolved.config, link)?;

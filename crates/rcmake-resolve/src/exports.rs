@@ -245,11 +245,11 @@ fn build_exports(model: &ProjectModel) -> Result<IndexMap<BString, BuildExport>,
             .map(|value| value.as_slice())
             .collect();
         let (set, ids, mut options) = match args.as_slice() {
-            [b"EXPORT", set, options @ ..] => (
-                BString::from(*set),
-                export_set(model, set)?.targets.clone(),
-                options,
-            ),
+            [b"EXPORT", set, options @ ..] => {
+                let export = export_set(model, set)?;
+                source_sets::validate_export(model, &export.targets, &export.install_rules)?;
+                (BString::from(*set), export.targets.clone(), options)
+            }
             [b"TARGETS", rest @ ..] => {
                 let end = rest
                     .iter()
@@ -330,13 +330,17 @@ fn build_exports(model: &ProjectModel) -> Result<IndexMap<BString, BuildExport>,
 }
 
 fn export_windows_paths(model: &ProjectModel, dir: DirId) -> Option<bool> {
+    let system = crate::lower::definition(model, dir, b"CMAKE_SYSTEM_NAME");
+    if system.is_some_and(|name| name == b"CYGWIN") {
+        return Some(false);
+    }
     if model
         .generator
         .is_some_and(|generator| matches!(generator, rcmake_model::GeneratorKind::VisualStudio(_)))
     {
         return Some(true);
     }
-    crate::lower::definition(model, dir, b"CMAKE_SYSTEM_NAME")
+    system
         .or_else(|| crate::lower::definition(model, dir, b"WIN32"))
         .map(|_| crate::lower::artifacts::is_dll_platform(model, dir))
 }
@@ -883,8 +887,7 @@ pub(crate) fn export_property_items(
     value: &[u8],
     mode: PreprocessMode,
 ) -> Result<Vec<BString>, ResolveError> {
-    let mut parsed = rcmake_genex::parse(value)?;
-    drop_build_local(&mut parsed.nodes);
+    let parsed = rcmake_genex::parse(value)?;
     let ast = rcmake_genex::strip(&parsed, mode);
     let mut items = Vec::new();
     let mut item = BString::default();
@@ -910,23 +913,6 @@ pub(crate) fn export_property_items(
         items.push(item);
     }
     Ok(items)
-}
-
-/// Remove `$<BUILD_LOCAL_INTERFACE:...>` at any depth. Only consumers in the same
-/// build tree see that content, so no export file keeps it.
-fn drop_build_local(nodes: &mut Vec<GenexNode>) {
-    nodes.retain(|node| {
-        !matches!(node, GenexNode::Expr(expr)
-            if render(&expr.identifier).as_slice() == b"BUILD_LOCAL_INTERFACE")
-    });
-    for node in nodes {
-        if let GenexNode::Expr(expr) = node {
-            drop_build_local(&mut expr.identifier);
-            for param in expr.params.iter_mut().flatten() {
-                drop_build_local(param);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

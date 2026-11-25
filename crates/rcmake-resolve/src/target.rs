@@ -4,7 +4,7 @@ use rcmake_diag::{Backtrace, Location, MessageKind};
 use rcmake_genex::EvalContext;
 use rcmake_model::{
     BT, CustomCommand, CustomCommandKind, DirId, FileSet, FileSetId, FileSetKind, ProjectModel,
-    PropertyMap, Target, TargetId, TargetKind, UsageField,
+    PropertyMap, Target, TargetId, TargetKind, UsageField, UsageScope,
 };
 
 use crate::{
@@ -96,6 +96,36 @@ pub(crate) fn resolve_target<'a>(
     let sources = usage.collect_property(id, b"SOURCES", ctx)?.entries;
     let mut membership = crate::pipeline::file_set_membership::Membership::default();
     let (file_sets, members) = collect_file_sets(model, paths, usage, id, ctx, &mut membership)?;
+    if !target.file_sets.is_empty()
+        && target
+            .policies
+            .policies
+            .get(rcmake_diag::PolicyId::new(154))
+            == rcmake_diag::PolicyStatus::New
+        && matches!(
+            model.generator,
+            Some(
+                rcmake_model::GeneratorKind::Ninja | rcmake_model::GeneratorKind::NinjaMultiConfig
+            )
+        )
+    {
+        let mut order = crate::FileSetOrder::default();
+        for (file, member) in &members {
+            let path = || lower::build_relative(model, file);
+            if member.set.kind == FileSetKind::Sources
+                && member
+                    .set
+                    .props
+                    .get(b"INDEPENDENT_FILES")
+                    .is_some_and(|value| truth::is_on(value))
+            {
+                order.independent.insert(path());
+            } else if member.set.scope != UsageScope::Private {
+                order.public.insert(path());
+            }
+        }
+        inputs.file_set_order = Some(order);
+    }
     if !membership.is_empty() {
         for source in &sources {
             if let Some(value) = paths.resolve_at(model, dir, source)? {
@@ -213,24 +243,6 @@ pub(crate) fn resolve_target<'a>(
                     if let Err(message) = model.validate_compile_feature(&feature.value, |key| {
                         lower::definition(model, target.dir, key)
                     }) {
-                        if lower::definition(model, target.dir, b"CMAKE_DEBUG_TARGET_PROPERTIES")
-                            .is_some_and(|properties| {
-                                list::split(properties, list::Empty::Drop)
-                                    .iter()
-                                    .any(|property| property == "COMPILE_FEATURES")
-                            })
-                        {
-                            paths.emit(
-                                model,
-                                MessageKind::Log,
-                                Location::Backtrace(feature.backtrace.clone()),
-                                format!(
-                                    "Used compile features for target {}:\n\n * {}\n",
-                                    target.name, feature.value
-                                )
-                                .into(),
-                            );
-                        }
                         let mut message = message;
                         if let Some(first) = message.first_mut() {
                             first.make_ascii_uppercase();
@@ -300,9 +312,7 @@ pub(crate) fn resolve_target<'a>(
                     file.apply_compile_properties(model, &ctx.config, &mut facts);
                 }
                 if let (Some(ide), Some(base)) = (&mut ide_compile, base) {
-                    ide.record_group(group, base, &facts, || {
-                        lower::language_flags(model, target, &ctx.config, &facts.language)
-                    });
+                    ide.record_group(group, base, &facts);
                 }
                 let facts = entry.insert(facts);
                 (group, facts)
@@ -358,7 +368,7 @@ pub(crate) fn resolve_target<'a>(
     }
     resolved.compile_groups = groups.into_values().collect();
     if let Some(ide) = ide_compile {
-        ide.finish(&mut resolved, dir, paths, &inputs, &members);
+        ide.finish(&mut resolved, model, target, paths, &inputs, &members)?;
     }
     resolve_module_info(
         model,
@@ -463,7 +473,7 @@ pub(crate) fn collect_file_sets<'a>(
             bases.push(dir.source_dir.clone());
         }
         for file in usage.file_set_paths(set.target, b"SOURCES", &set.files, &ctx)? {
-            let Some(value) = paths.resolve_at(model, dir, &file)? else {
+            let Some(value) = resolved_file_set_member(model, paths, dir, &file)? else {
                 continue;
             };
             if set.kind != FileSetKind::Headers {
@@ -531,6 +541,33 @@ fn export_symbol(target: &Target) -> Option<BString> {
     }));
     symbol.extend_from_slice(b"_EXPORTS");
     Some(symbol)
+}
+
+fn resolved_file_set_member(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+    dir: &rcmake_model::Directory,
+    file: &BT<BString>,
+) -> Result<Option<BString>, ResolveError> {
+    if file.value.windows(2).any(|pair| pair == b"\\;") {
+        if let Some(path) = paths.find(dir, &file.value) {
+            return Ok(Some(path));
+        }
+        // File set entries can carry escaping from more than one list expansion.
+        let mut name = BString::default();
+        for byte in file.value.iter().copied() {
+            if byte == b';' {
+                while name.last() == Some(&b'\\') {
+                    name.pop();
+                }
+            }
+            name.push(byte);
+        }
+        if let Some(path) = paths.find(dir, &name) {
+            return Ok(Some(path));
+        }
+    }
+    paths.resolve_at(model, dir, file)
 }
 
 pub(crate) fn instantiate_rules(

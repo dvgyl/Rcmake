@@ -25,6 +25,7 @@ pub use generate::{
 pub use modules::{ModuleExportJob, write_module_exports};
 
 const IMPORT_PREFIX: &[u8] = b"${_IMPORT_PREFIX}";
+const IMPORT_LIBRARY_SUFFIX: &[u8] = b"${CMAKE_IMPORT_LIBRARY_SUFFIX}";
 const IMPORT_VERSION: &[u8] = b"set(CMAKE_IMPORT_FILE_VERSION 1)\n";
 const END_IMPORT_VERSION: &[u8] = b"unset(CMAKE_IMPORT_FILE_VERSION)\n";
 
@@ -232,7 +233,7 @@ fn render_prefix(
     destination: &[u8],
     prefix: Option<&[u8]>,
 ) -> Result<(), GenError> {
-    if to_native(destination).is_absolute() {
+    if is_absolute(plan, destination) {
         let prefix = prefix.ok_or_else(|| {
             output_error(
                 &plan.file,
@@ -251,7 +252,9 @@ fn render_prefix(
     // CMake goes up one level for each non-empty destination component, which includes
     // `.` and `..` components of a destination that is not normalized (`CMP0177`).
     let levels = destination
-        .split(|&byte| byte == b'/')
+        .split(|&byte| {
+            byte == b'/' || (plan.windows_paths.unwrap_or(cfg!(windows)) && byte == b'\\')
+        })
         .filter(|component| !component.is_empty())
         .count();
     for _ in 0..levels {
@@ -449,7 +452,7 @@ fn render_config_target(
         match base {
             b"IMPORTED_LOCATION" | b"IMPORTED_IMPLIB" => {
                 start_property(out, &key);
-                render_relative_path(out, value, false);
+                render_relative_path(out, plan, value, false);
                 out.extend_from_slice(b"\"\n");
                 if !value.is_empty() {
                     paths.push(value.clone());
@@ -461,7 +464,7 @@ fn render_config_target(
                     if index != 0 {
                         out.push(b';');
                     }
-                    render_relative_path(out, &path, true);
+                    render_relative_path(out, plan, &path, true);
                     if !path.is_empty() {
                         paths.push(path);
                     }
@@ -475,7 +478,7 @@ fn render_config_target(
 
     let alternate = target.xcframework_locations.get(source_config);
     if let Some(path) = alternate {
-        xcframework::render(out, &name, config, path, plan.install);
+        xcframework::render(out, plan, &name, config, path);
         if !paths.is_empty() {
             out.extend_from_slice(b"else()\n");
         }
@@ -490,7 +493,7 @@ fn render_config_target(
         );
         for path in paths {
             out.extend_from_slice(b" \"");
-            render_relative_path(out, &path, true);
+            render_relative_path(out, plan, &path, true);
             out.push(b'"');
         }
         out.extend_from_slice(b")\n");
@@ -593,9 +596,20 @@ fn render_property(out: &mut BString, key: &[u8], value: &[u8], install: bool) {
     out.extend_from_slice(b"\"\n");
 }
 
-fn render_relative_path(out: &mut BString, path: &[u8], list_element: bool) {
+fn is_absolute(plan: &ExportPlan, path: &[u8]) -> bool {
+    match plan.windows_paths {
+        Some(true) => {
+            path.len() >= 2
+                && (path.get(1) == Some(&b':') || matches!(path.first(), Some(b'\\' | b'/')))
+        }
+        Some(false) => matches!(path.first(), Some(b'/' | b'~')),
+        None => to_native(path).is_absolute(),
+    }
+}
+
+fn render_relative_path(out: &mut BString, plan: &ExportPlan, path: &[u8], list_element: bool) {
     if !path.is_empty()
-        && !to_native(path).is_absolute()
+        && !is_absolute(plan, path)
         && !path.starts_with(b"$<")
         && !path.starts_with(IMPORT_PREFIX)
     {
@@ -613,13 +627,17 @@ fn quote_export_content(
     escape_genex: bool,
 ) {
     while let Some((byte, rest)) = value.split_first() {
-        if install
-            && let Some(after_prefix) = value
-                .strip_prefix(b"$<INSTALL_PREFIX>")
-                .or_else(|| value.strip_prefix(IMPORT_PREFIX))
+        if let Some((variable, rest)) = [IMPORT_PREFIX, IMPORT_LIBRARY_SUFFIX]
+            .into_iter()
+            .find_map(|variable| value.strip_prefix(variable).map(|rest| (variable, rest)))
         {
+            out.extend_from_slice(variable);
+            value = rest;
+            continue;
+        }
+        if install && let Some(rest) = value.strip_prefix(b"$<INSTALL_PREFIX>") {
             out.extend_from_slice(IMPORT_PREFIX);
-            value = after_prefix;
+            value = rest;
             continue;
         }
         if *byte == b'$' && rest.starts_with(b"<") && !escape_genex {

@@ -19,6 +19,7 @@ use crate::{generation_error, modules};
 
 mod aliases;
 mod implicit;
+mod order;
 mod plan;
 
 pub(crate) struct Graph<'a> {
@@ -44,7 +45,7 @@ pub(crate) struct Graph<'a> {
     pub(crate) pools: HashMap<BString, BString>,
     steps: Vec<StepNodes<'a>>,
     order_only_alias_bytes: usize,
-    compile_prerequisites: Vec<Vec<usize>>,
+    compile_prerequisites: Vec<Vec<order::Prerequisite>>,
 }
 
 #[derive(Clone, Default)]
@@ -515,104 +516,6 @@ impl<'a> Graph<'a> {
         }
     }
 
-    fn connect_targets(&mut self) -> Result<(), GenError> {
-        for (target_index, (target, alias)) in
-            self.input.targets.iter().zip(&self.aliases).enumerate()
-        {
-            let dependencies = target.depends.as_slice();
-            let alias_bytes = dependencies
-                .iter()
-                .try_fold(0usize, |bytes, &index| {
-                    self.aliases
-                        .get(index)
-                        .map(|name| bytes.saturating_add(name.len()).saturating_add(1))
-                })
-                .ok_or_else(|| {
-                    generation_error(self.build_dir, "Invalid Ninja target dependency index.")
-                })?;
-            let prerequisites = self.custom_prerequisites(target_index);
-            let has_prerequisites = !prerequisites.is_empty();
-            self.compile_prerequisites.push(prerequisites);
-            for &index in &target.steps {
-                let Some(step) = self.input.steps.get(index) else {
-                    return Err(generation_error(
-                        self.build_dir,
-                        "Invalid Ninja build step index.",
-                    ));
-                };
-                if matches!(
-                    step,
-                    BuildStep::Compile { .. }
-                        | BuildStep::Scan { .. }
-                        | BuildStep::DeviceLink { .. }
-                ) && let Some(nodes) = self.steps.get_mut(index)
-                    && has_prerequisites
-                {
-                    nodes
-                        .order_only
-                        .push(OrderOnly::CompilePrerequisites(target_index));
-                }
-                // As in CMake, the link step runs after the target dependencies, so a
-                // tool target that the link rule runs is ready.
-                if !dependencies.is_empty()
-                    && self.producers.get(alias) != Some(&index)
-                    && let Some(nodes) = self.steps.get_mut(index)
-                    && (matches!(step, BuildStep::Link { .. }) || nodes.link)
-                {
-                    nodes
-                        .order_only
-                        .push(OrderOnly::Targets(Cow::Borrowed(dependencies)));
-                    self.order_only_alias_bytes =
-                        self.order_only_alias_bytes.saturating_add(alias_bytes);
-                }
-            }
-            if let Some(&producer) = self.producers.get(alias)
-                && let Some(nodes) = self.steps.get_mut(producer)
-            {
-                // A real output can also be the target name, such as a root executable.
-                if !dependencies.is_empty() {
-                    nodes
-                        .order_only
-                        .push(OrderOnly::Targets(Cow::Borrowed(dependencies)));
-                    self.order_only_alias_bytes =
-                        self.order_only_alias_bytes.saturating_add(alias_bytes);
-                }
-                nodes.order_only.extend(
-                    target
-                        .steps
-                        .iter()
-                        .copied()
-                        .filter(|&index| index != producer)
-                        .map(OrderOnly::StepOutputs),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn custom_prerequisites(&self, target: usize) -> Vec<usize> {
-        let mut pending = vec![target];
-        let mut visited = HashSet::new();
-        let mut seen_steps = HashSet::new();
-        let mut steps = Vec::new();
-        while let Some(index) = pending.pop() {
-            if !visited.insert(index) {
-                continue;
-            }
-            let Some(target) = self.input.targets.get(index) else {
-                continue;
-            };
-            steps.extend(target.steps.iter().copied().filter(|&step| {
-                matches!(self.input.steps.get(step), Some(BuildStep::Custom(custom))
-                    if !is_library_symlink(custom))
-                    && self.steps.get(step).is_some_and(|nodes| !nodes.link)
-                    && seen_steps.insert(step)
-            }));
-            pending.extend(target.depends.iter().rev().copied());
-        }
-        steps
-    }
-
     pub(crate) fn manifest(&self) -> Ninja {
         // Allow space for edge syntax and commands in addition to the alias paths.
         let capacity = self
@@ -671,7 +574,10 @@ impl<'a> Graph<'a> {
         exports: &[ModuleExportJob],
         mut emitted: Option<&mut HashSet<BString>>,
     ) -> Result<(), GenError> {
-        for (step, nodes) in self.input.steps.iter().zip(&self.steps) {
+        for (index, (step, nodes)) in self.input.steps.iter().zip(&self.steps).enumerate() {
+            if self.input.native_custom_steps.contains(&index) {
+                continue;
+            }
             if let Some(emitted) = &mut emitted {
                 if nodes.outputs.iter().any(|node| emitted.contains(node)) {
                     continue;
@@ -699,9 +605,13 @@ impl<'a> Graph<'a> {
                     .as_mut()
                     .is_none_or(|nodes| nodes.insert(alias.clone()))
             {
+                let utilities = &self.input.utility_steps;
+                let utility_first = |index: &&usize| utilities.contains(*index);
                 let inputs: Vec<_> = target
                     .steps
                     .iter()
+                    .filter(utility_first)
+                    .chain(target.steps.iter().filter(|index| !utility_first(index)))
                     .filter_map(|&index| self.steps.get(index))
                     .flat_map(|nodes| nodes.outputs.iter().chain(&nodes.byproducts))
                     .cloned()
@@ -872,12 +782,7 @@ impl<'a> Graph<'a> {
                             .filter(|node| seen.insert(node)),
                     ),
                     OrderOnly::CompilePrerequisites(index) => order_only.extend(
-                        self.compile_prerequisites
-                            .get(*index)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|&step| self.steps.get(step))
-                            .flat_map(|step| &step.outputs)
+                        self.compile_prerequisite_paths(*index)
                             .filter(|node| seen.insert(node)),
                     ),
                 }

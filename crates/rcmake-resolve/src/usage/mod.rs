@@ -28,6 +28,7 @@ use crate::{
 
 pub(crate) mod artifacts;
 mod compatible;
+mod debug;
 mod host;
 mod includes;
 pub(crate) mod paths;
@@ -122,6 +123,7 @@ pub struct UsageResolver<'a> {
     memo: HashMap<MemoKey<'static>, Arc<WalkValue>>,
     link_memo: HashMap<link::LinkMemoKey, link::SharedLinks>,
     debug_configs: Vec<BString>,
+    debug_properties: bool,
     active: Vec<(TargetId, BString)>,
     cycle_count: usize,
     has_injections: bool,
@@ -150,6 +152,10 @@ impl<'a> UsageResolver<'a> {
                 .props
                 .get(b"DEBUG_CONFIGURATIONS")
                 .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop)),
+            debug_properties: model.dirs().any(|(id, _)| {
+                definition(model, id, b"CMAKE_DEBUG_TARGET_PROPERTIES")
+                    .is_some_and(|value| !value.is_empty())
+            }),
             active: Vec::new(),
             cycle_count: 0,
             compatible: compatible::Properties::default(),
@@ -180,6 +186,7 @@ impl<'a> UsageResolver<'a> {
             memo: HashMap::new(),
             link_memo: HashMap::new(),
             debug_configs: self.debug_configs.clone(),
+            debug_properties: self.debug_properties,
             active: Vec::new(),
             cycle_count: 0,
             compatible: compatible::Properties::default(),
@@ -301,6 +308,7 @@ impl<'a> UsageResolver<'a> {
                 ctx.traversal = link_options::traversal(self.target(target)?);
             }
             let result = self.walk(target, name, &ctx)?;
+            self.log_usage(target, name, &result);
             let mut value = UsageValue {
                 entries: Vec::new(),
                 flags: result.flags,
@@ -381,6 +389,9 @@ impl<'a> UsageResolver<'a> {
             return self.link_property(target, name, &ctx);
         }
         let result = self.walk(target, name, &ctx)?;
+        if self.property_reads == 0 {
+            self.log_usage(target, name, &result);
+        }
         Ok(UsageValue {
             entries: result
                 .contributions
@@ -590,7 +601,7 @@ impl<'a> UsageResolver<'a> {
                     continue;
                 }
                 result.contributions.push((*owner, Arc::clone(entries)));
-                if self.provenance.is_some() {
+                if self.provenance.is_some() || self.debug_properties {
                     let mut chain = vec![edge.hop(dependency)];
                     if let Some(path) = value.chains.as_ref().and_then(|chains| chains.get(owner)) {
                         chain.extend_from_slice(path);
@@ -623,14 +634,7 @@ impl<'a> UsageResolver<'a> {
             .filter(|(_, set)| {
                 let own = set.target == target;
                 match set.kind {
-                    // An interface library has no other sources, so its header files
-                    // carry its dependencies on generated headers.
-                    FileSetKind::Headers => {
-                        own && (self.ide.is_some()
-                            || model
-                                .target(target)
-                                .is_some_and(|target| target.kind == TargetKind::InterfaceLibrary))
-                    }
+                    FileSetKind::Headers => own,
                     FileSetKind::Sources if !own => set.scope != UsageScope::Private,
                     _ => {
                         own && (set.scope != UsageScope::Interface

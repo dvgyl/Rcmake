@@ -273,6 +273,7 @@ pub(crate) struct TargetInputs {
     pub(crate) position_independent: Option<bool>,
     pub(crate) standard_requirements: IndexMap<BString, &'static [u8]>,
     pub(crate) unity_groups: IndexMap<BString, Option<BString>>,
+    pub(crate) file_set_order: Option<crate::FileSetOrder>,
 }
 
 pub(crate) struct SourcePaths<'a> {

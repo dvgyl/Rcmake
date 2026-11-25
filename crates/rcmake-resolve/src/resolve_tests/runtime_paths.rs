@@ -364,7 +364,7 @@ fn elf_link_paths_respect_origin_and_the_install_path_switch() -> TestResult {
                 })
                 .ok_or("Missing install runtime path change.")?;
             assert!(
-                code.contains_str(r#"NEW_RPATH "\${ORIGIN}/installed:/platform""#),
+                code.contains_str("NEW_RPATH [[${ORIGIN}/installed:/platform]]"),
                 "{code}"
             );
             assert!(

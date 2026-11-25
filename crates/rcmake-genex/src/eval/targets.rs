@@ -245,6 +245,7 @@ impl Evaluator<'_> {
             for policy in TARGET_POLICIES {
                 message.push_str(&format!("\n * {}", BString::from(*policy)));
             }
+            message.push('\n');
             return Err(call.error(message));
         }
         Ok(boolean(

@@ -270,7 +270,16 @@ impl<'a> Graph<'a> {
                     plan.bind(b"pool", pool.clone());
                 }
                 if let Some(output) = nodes.outputs.first() {
-                    plan.bind(b"DESC", progress::link_description(step, output));
+                    let description = self
+                        .input
+                        .link_descriptions
+                        .get(&step.output)
+                        .cloned()
+                        .unwrap_or_else(|| progress::link_description(step, output).into());
+                    plan.bind(b"DESC", description);
+                }
+                if let Some(directory) = self.input.install_name_dirs.get(&step.output) {
+                    plan.bind(b"INSTALLNAME_DIR", directory.clone());
                 }
                 plan
             }
@@ -324,21 +333,32 @@ impl<'a> Graph<'a> {
                     plan.implicit_inputs.push(script.clone());
                 }
                 if let Some(depfile) = &custom.depfile {
-                    plan.bind(b"depfile", self.node(depfile));
+                    let depfile = self.node(depfile);
+                    // Ninja removes the depfile when it records dependencies in its database.
+                    if !nodes.outputs.contains(&depfile) && !nodes.byproducts.contains(&depfile) {
+                        plan.bind(b"deps", b"gcc".as_slice());
+                    }
+                    plan.bind(b"depfile", depfile);
                 }
-                let description = custom.comment.clone().unwrap_or_else(|| {
-                    if custom.outputs.is_empty() {
-                        return "Running custom command".into();
-                    }
-                    let mut description = BString::from("Generating ");
-                    for (index, output) in custom.outputs.iter().enumerate() {
-                        if index > 0 {
-                            description.extend_from_slice(b", ");
+                let description = custom
+                    .outputs
+                    .first()
+                    .and_then(|output| self.input.link_descriptions.get(output))
+                    .cloned()
+                    .or_else(|| custom.comment.clone())
+                    .unwrap_or_else(|| {
+                        if custom.outputs.is_empty() {
+                            return "Running custom command".into();
                         }
-                        description.extend_from_slice(output);
-                    }
-                    description
-                });
+                        let mut description = BString::from("Generating ");
+                        for (index, output) in custom.outputs.iter().enumerate() {
+                            if index > 0 {
+                                description.extend_from_slice(b", ");
+                            }
+                            description.extend_from_slice(output);
+                        }
+                        description
+                    });
                 plan.bind(b"DESC", description);
                 if custom.uses_terminal {
                     plan.bind(b"pool", b"console".as_slice());

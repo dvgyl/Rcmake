@@ -191,6 +191,7 @@ fn generate_single(
             .iter()
             .map(|file| graph.node(file)),
     );
+    add_install_scripts(&mut manifests, &graph, result, model);
     if uses_modules || fortran::uses_fortran(input) {
         manifests.extend(
             modules::write_metadata(result, model, &[input], host, build_dir, false)?
@@ -364,6 +365,7 @@ fn generate_multi(
             .iter()
             .map(|file| default.node(file)),
     );
+    add_install_scripts(&mut manifests, default, result, model);
     if uses_modules || graphs.iter().any(|graph| fortran::uses_fortran(graph)) {
         manifests.extend(
             modules::write_metadata(result, model, &graphs, host, build_dir, true)?
@@ -657,6 +659,29 @@ fn write_rules(
         ninja.binding(b"depth", depth.to_string().as_bytes());
     }
     write_if_changed(host, &build_dir.join(RULES_PATH), &ninja.0)
+}
+
+fn add_install_scripts(
+    outputs: &mut Vec<BString>,
+    graph: &Graph<'_>,
+    result: &GenerationResult,
+    model: Option<&ProjectModel>,
+) {
+    let Some(model) = model.filter(|model| {
+        !model
+            .definition(DirId::ROOT, b"CMAKE_SKIP_INSTALL_RULES")
+            .is_some_and(|value| rcmake_base::truth::is_on(value))
+    }) else {
+        return;
+    };
+    let mut seen: HashSet<_> = outputs.iter().cloned().collect();
+    for &id in result.install.directories.keys() {
+        let dir = rcmake_base::path_lex::Lexical::new(&model.dir(id).binary_dir);
+        let script = graph.node(&dir.append(b"cmake_install.cmake"));
+        if seen.insert(script.clone()) {
+            outputs.push(script);
+        }
+    }
 }
 
 fn emit_regeneration(

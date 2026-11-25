@@ -61,4 +61,11 @@ impl<'a> CrossPlan<'a> {
                 shared_outputs: &self.shared_outputs,
             })
     }
+
+    pub(super) fn native_for<'b>(&'b self, config: &'b ConfigId) -> Option<CrossConfiguration<'b>> {
+        (!self.commands.is_empty()).then_some(CrossConfiguration {
+            command: config,
+            shared_outputs: &self.shared_outputs,
+        })
+    }
 }

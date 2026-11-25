@@ -656,6 +656,25 @@ pub struct BuildGraph {
     pub steps: Vec<BuildStep>,
     /// Targets in model order.
     pub targets: Vec<GraphTarget>,
+    /// Generated file set ordering by target index for CMP0154 NEW.
+    pub file_set_order: IndexMap<usize, FileSetOrder>,
+    /// Mach-O install name directories by link output path.
+    pub install_name_dirs: IndexMap<BString, BString>,
+    /// Ninja progress descriptions for link edges with custom commands.
+    pub link_descriptions: IndexMap<BString, BString>,
+    /// Custom rule indices that use the native configuration in a cross-config graph.
+    pub native_custom_steps: IndexSet<usize>,
+    /// Steps that run custom target commands.
+    pub utility_steps: IndexSet<usize>,
+}
+
+/// File set members that affect compile ordering under CMP0154.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileSetOrder {
+    /// Public files that consumers may include during compilation.
+    pub public: IndexSet<BString>,
+    /// Files that can build independently of other sources.
+    pub independent: IndexSet<BString>,
 }
 
 /// One exported target of an [`ExportPlan`].

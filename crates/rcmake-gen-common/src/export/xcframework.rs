@@ -1,11 +1,18 @@
 use rcmake_base::BString;
+use rcmake_resolve::ExportPlan;
 
 use crate::{quote, quoted_content};
 
-pub(super) fn render(out: &mut BString, target: &[u8], config: &[u8], path: &[u8], install: bool) {
+pub(super) fn render(
+    out: &mut BString,
+    plan: &ExportPlan,
+    target: &[u8],
+    config: &[u8],
+    path: &[u8],
+) {
     out.extend_from_slice(b"set(_cmake_xcframework_location \"");
-    if install {
-        super::render_relative_path(out, path, false);
+    if plan.install {
+        super::render_relative_path(out, plan, path, false);
     } else {
         quoted_content(out, path);
     }

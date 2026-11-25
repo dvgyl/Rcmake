@@ -12,9 +12,7 @@ use rcmake_model::{
 
 use super::artifacts::build_relative;
 use super::compile::{Settings, compile};
-use super::custom::{
-    Commands, attach_link_events, command_path, ide_custom_step, remove_own_outputs,
-};
+use super::custom::{Commands, attach_link_events, command_path, ide_custom_step};
 use super::link::link;
 use super::pch::{self, PchFlags};
 use super::{compute_artifacts, linker_language};
@@ -27,6 +25,7 @@ use crate::{
 
 mod device;
 mod order;
+mod utility;
 
 /// Lower resolved targets for one configuration.
 ///
@@ -105,7 +104,7 @@ pub(crate) fn lower_with_inputs(
     let rule_count = graph.steps.len();
     let mut unity_prerequisites = Vec::new();
     let mut strong_edges = Vec::new();
-    for &(target, resolved) in &local {
+    for (index, &(target, resolved)) in local.iter().enumerate() {
         let mut plan = TargetPlan::new(model, config, target, resolved, inputs.get(&resolved.id));
         let unity = usage
             .source_paths()
@@ -118,6 +117,12 @@ pub(crate) fn lower_with_inputs(
             &mut unity_prerequisites,
             &mut graph.steps,
         )?;
+        if let Some(order) = plan
+            .inputs
+            .and_then(|inputs| inputs.file_set_order.as_ref())
+        {
+            graph.file_set_order.insert(index, order.clone());
+        }
         let artifacts = artifacts(model, target, resolved);
         let lint = lint_settings(model, resolved.id, usage, config)?;
         let framework_dirs = if !resolved.compile_units.is_empty()
@@ -155,7 +160,7 @@ pub(crate) fn lower_with_inputs(
             &commands,
             usage,
             &resolved_targets,
-            &mut graph.steps,
+            &mut graph,
         )?;
 
         if let Some(events) = plan.ide_steps {
@@ -212,6 +217,7 @@ pub(crate) fn lower_with_inputs(
     if usage.ide() == Some(crate::ide::IdeFlavor::Xcode) {
         remove_inherited_xcode_rules(&graph, &target_indices, rule_count, &mut ide.custom);
     }
+    graph.native_custom_steps = commands.native_steps;
     Ok(graph)
 }
 
@@ -639,8 +645,9 @@ impl<'a> TargetPlan<'a> {
         commands: &Commands<'_>,
         usage: &mut UsageResolver<'_>,
         resolved_targets: &IndexMap<TargetId, &ResolvedTarget>,
-        graph_steps: &mut Vec<BuildStep>,
+        graph: &mut BuildGraph,
     ) -> Result<(), ResolveError> {
+        let graph_steps = &mut graph.steps;
         let (model, config, target, resolved) =
             (self.model, self.config, self.target, self.resolved);
         if let Some(step) = link_step(model, target, resolved, artifacts)? {
@@ -726,7 +733,7 @@ impl<'a> TargetPlan<'a> {
             {
                 objects.push(device.output.clone());
             }
-            let link = link(
+            let (link, install_name_dir) = link(
                 model,
                 target,
                 config,
@@ -746,6 +753,13 @@ impl<'a> TargetPlan<'a> {
                 }
                 error
             })?;
+            if !install_name_dir.is_empty()
+                && let BuildStep::Link { step, .. } = &link
+            {
+                graph
+                    .install_name_dirs
+                    .insert(step.output.clone(), install_name_dir);
+            }
             let mut link = link;
             if let (
                 BuildStep::Link {
@@ -797,35 +811,21 @@ impl<'a> TargetPlan<'a> {
                 link_outputs.soname_file = None;
                 link_outputs.linker_file = None;
             }
-            let link = attach_link_events(model, &link_outputs, link, before, after);
+            let link = attach_link_events(
+                model,
+                &link_outputs,
+                link,
+                before,
+                after,
+                &mut graph.link_descriptions,
+            );
             self.steps.insert(push(graph_steps, link));
             if let Some(symlink) = symlink {
                 self.steps
                     .insert(push(graph_steps, BuildStep::Custom(symlink)));
             }
         } else {
-            // Ninja and Make run the utility command before PRE_BUILD and POST_BUILD.
-            let mut utility = commands.events(
-                resolved.id,
-                &[
-                    None,
-                    Some(TargetEvent::PreBuild),
-                    Some(TargetEvent::PostBuild),
-                ],
-                usage,
-                &mut self.steps,
-                &mut self.dependencies,
-                self.ide_steps.as_mut(),
-            )?;
-            if utility != CustomStep::default() {
-                remove_own_outputs(&mut utility);
-                utility
-                    .depends
-                    .retain(|dep| dep != &target.name || commands.producer(dep).is_some());
-                self.dependencies.shift_remove(&resolved.id);
-                self.steps
-                    .insert(push(graph_steps, BuildStep::Custom(utility)));
-            }
+            self.add_utility_commands(commands, usage, graph)?;
         }
 
         Ok(())

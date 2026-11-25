@@ -109,14 +109,7 @@ impl Graph<'_> {
                 if let Some(nodes) = self.steps.get(index) {
                     for entry in &nodes.order_only {
                         if let OrderOnly::CompilePrerequisites(index) = entry {
-                            inputs.extend(
-                                self.compile_prerequisites
-                                    .get(*index)
-                                    .into_iter()
-                                    .flatten()
-                                    .filter_map(|&step| self.steps.get(step))
-                                    .flat_map(|step| &step.outputs),
-                            );
+                            inputs.extend(self.compile_prerequisite_paths(*index));
                         }
                     }
                 }

@@ -32,6 +32,7 @@ pub(super) struct Commands<'a> {
     outputs: IndexMap<BString, usize>,
     inputs: Vec<Vec<BString>>,
     pub(super) codegen: IndexSet<usize>,
+    pub(super) native_steps: IndexSet<usize>,
     dependencies: Vec<IndexSet<TargetId>>,
 }
 
@@ -79,6 +80,7 @@ impl<'a> Commands<'a> {
             outputs: IndexMap::new(),
             inputs: Vec::new(),
             codegen: IndexSet::new(),
+            native_steps: IndexSet::new(),
             dependencies: Vec::new(),
         };
         let mut errors = Vec::new();
@@ -95,6 +97,9 @@ impl<'a> Commands<'a> {
                 }
             };
             let index = steps.len();
+            if commands.shared_output(id) && commands.is_cross() {
+                commands.native_steps.insert(index);
+            }
             if command.codegen {
                 commands.codegen.insert(index);
             }
@@ -112,6 +117,18 @@ impl<'a> Commands<'a> {
         self.outputs.get(path).copied()
     }
 
+    fn shared_output(&self, id: CommandId) -> bool {
+        self.cross
+            .as_ref()
+            .is_some_and(|cross| cross.shared_outputs.contains(&id))
+    }
+
+    fn is_cross(&self) -> bool {
+        self.cross
+            .as_ref()
+            .is_some_and(|cross| cross.command != self.config)
+    }
+
     fn lower_command(
         &self,
         id: CommandId,
@@ -125,11 +142,7 @@ impl<'a> Commands<'a> {
             .cross
             .as_ref()
             .map_or(self.config, |cross| cross.command);
-        let argument_config = if self
-            .cross
-            .as_ref()
-            .is_some_and(|cross| cross.shared_outputs.contains(&id))
-        {
+        let argument_config = if self.shared_output(id) {
             command_config
         } else {
             self.config
@@ -456,15 +469,24 @@ impl<'a> Commands<'a> {
                 .commands()
                 .filter(|(_, command)| command.kind == kind)
             {
-                if event.is_some()
-                    && self
-                        .cross
-                        .as_ref()
-                        .is_some_and(|cross| cross.shared_outputs.contains(&command_id))
-                {
+                let shared = self.shared_output(command_id);
+                if event.is_some() && shared && self.is_cross() {
                     continue;
                 }
-                let (step, command_deps) = self.lower_command(command_id, command, usage)?;
+                let (mut step, command_deps) = self.lower_command(command_id, command, usage)?;
+                if event.is_none()
+                    && self.model.generator == Some(GeneratorKind::NinjaMultiConfig)
+                    && let Some(target) = self.model.target(id)
+                {
+                    let binary = &self.model.dir(command.dir).binary_dir;
+                    let name = [b"CMakeFiles/", target.name.as_slice()].concat();
+                    let mut output = command_path(self.model, binary, &name);
+                    if !shared {
+                        output.push(b'-');
+                        output.extend_from_slice(&self.config.0);
+                    }
+                    step.outputs.push(output);
+                }
                 dependencies.extend(command_deps);
                 self.add_producers(
                     step.depends.iter().filter_map(|path| self.producer(path)),
@@ -479,6 +501,12 @@ impl<'a> Commands<'a> {
                         Some(TargetEvent::PostBuild) => IdeCustomPhase::PostBuild,
                     };
                     steps.push(ide_custom_step(self.model, &step, phase, event.is_none()));
+                }
+                if event.is_some()
+                    && let (Some(existing), Some(comment)) = (&mut recipe.comment, &step.comment)
+                {
+                    existing.extend_from_slice(b"; ");
+                    existing.extend_from_slice(comment);
                 }
                 merge(&mut recipe, step);
             }
@@ -756,6 +784,7 @@ pub(super) fn attach_link_events(
     link: BuildStep,
     mut before: CustomStep,
     after: CustomStep,
+    descriptions: &mut IndexMap<BString, BString>,
 ) -> BuildStep {
     let BuildStep::Link {
         step,
@@ -766,6 +795,21 @@ pub(super) fn attach_link_events(
     else {
         return link;
     };
+    if matches!(
+        model.generator,
+        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+    ) && (before.comment.is_some() || after.comment.is_some())
+    {
+        let link = BString::from(crate::progress::link_description(&step, &step.output));
+        let description = [before.comment.as_ref(), Some(&link), after.comment.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|text| !text.is_empty())
+            .map(|text| text.as_slice())
+            .collect::<Vec<_>>()
+            .join(b"; ".as_slice());
+        descriptions.insert(step.output.clone(), description.into());
+    }
     before.invocations.extend(invocations);
     merge(&mut before, after);
 

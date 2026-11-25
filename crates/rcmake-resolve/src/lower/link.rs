@@ -45,7 +45,7 @@ pub(super) fn link(
     position_independent: Option<bool>,
     link_languages: &IndexSet<BString>,
     usage: &mut UsageResolver<'_>,
-) -> Result<BuildStep, ResolveError> {
+) -> Result<(BuildStep, BString), ResolveError> {
     if step.output.is_empty()
         && let Some(file) = &artifacts.file
     {
@@ -528,12 +528,15 @@ pub(super) fn link(
     }
     before_link.append(&mut invocations);
     implicit_inputs.retain(|path| !inputs.contains(path));
-    Ok(BuildStep::Link {
-        implicit_inputs,
-        inputs,
-        step,
-        invocations: before_link,
-    })
+    Ok((
+        BuildStep::Link {
+            implicit_inputs,
+            inputs,
+            step,
+            invocations: before_link,
+        },
+        install_name_dir,
+    ))
 }
 
 #[expect(
@@ -568,7 +571,7 @@ fn link_libraries(
         target,
         config,
         step,
-        darwin,
+        usage.source_paths(),
         &runtime,
         link_languages,
     )?;

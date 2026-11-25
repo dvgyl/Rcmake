@@ -29,9 +29,11 @@ pub(super) fn windows_path_rules(
     dir: DirId,
     paths: Option<&SourcePaths<'_>>,
 ) -> bool {
-    cfg!(windows)
-        || paths.is_some_and(|paths| paths.host.system().sysname == b"Windows")
-        || crate::lower::artifacts::is_dll_platform(model, dir)
+    paths.map_or(cfg!(windows), |paths| {
+        paths.host.system().sysname == b"Windows"
+    }) || (crate::lower::definition(model, dir, b"CMAKE_SYSTEM_NAME")
+        .is_none_or(|system| system != b"CYGWIN")
+        && crate::lower::artifacts::is_dll_platform(model, dir))
         || model
             .generator
             .is_some_and(|generator| matches!(generator, GeneratorKind::VisualStudio(_)))
@@ -86,6 +88,6 @@ fn full_path(path: &[u8], windows: bool) -> bool {
     if windows {
         path.get(1) == Some(&b':') || path.starts_with(b"/")
     } else {
-        crate::file_is_full_path(path)
+        matches!(path.first(), Some(b'/' | b'~'))
     }
 }

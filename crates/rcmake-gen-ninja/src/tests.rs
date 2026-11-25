@@ -639,6 +639,7 @@ fn module_pipeline_writes_edges_and_target_metadata() -> Result<(), Box<dyn std:
                     ..GraphTarget::default()
                 },
             ],
+            ..BuildGraph::default()
         });
         result.targets.push(ResolvedTarget {
             fortran: None,

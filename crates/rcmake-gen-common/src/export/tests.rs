@@ -8,6 +8,70 @@ use rcmake_host::{PureHost, ReadRange};
 use std::time::Duration;
 
 #[test]
+fn install_export_uses_the_target_path_dialect() -> Result<(), Box<dyn std::error::Error>> {
+    for (windows, absolute, relative) in [
+        (true, "D:/sdk/lib/pkg.lib", "lib/pkg.dll"),
+        (false, "/sdk/lib/pkg.so", "D:/pkg.so"),
+    ] {
+        let plan = ExportPlan {
+            file: "pkg.cmake".into(),
+            install: true,
+            windows_paths: Some(windows),
+            targets: vec![ExportedTarget {
+                name: "pkg".into(),
+                kind: "SHARED".into(),
+                config_properties: [(
+                    "Release".into(),
+                    [
+                        ("IMPORTED_LOCATION".into(), absolute.into()),
+                        ("IMPORTED_IMPLIB".into(), relative.into()),
+                    ]
+                    .into(),
+                )]
+                .into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let host = PureHost::default();
+        let dir = if cfg!(windows) { "C:/out" } else { "/out" };
+        let files = write_export_plan_with_prefix(
+            &plan,
+            Path::new(dir),
+            Some(absolute.as_bytes()),
+            Some(b"/prefix"),
+            &host,
+        )?;
+        let mut files = files.iter();
+        let range = ReadRange::All { limit: 32_768 };
+        let main = String::from_utf8(host.read(files.next().ok_or("main file")?, range)?)?;
+        let config = String::from_utf8(host.read(files.next().ok_or("config file")?, range)?)?;
+        assert!(main.contains("set(_IMPORT_PREFIX \"/prefix\")"));
+        assert!(config.contains(&format!("\"IMPORTED_LOCATION_RELEASE\" \"{absolute}\"")));
+        assert!(config.contains(&format!(
+            "\"IMPORTED_IMPLIB_RELEASE\" \"${{_IMPORT_PREFIX}}/{relative}\""
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn build_export_keeps_import_variables() {
+    let mut out = BString::default();
+    render_property(
+        &mut out,
+        b"IMPORTED_IMPLIB_RELEASE",
+        b"${_IMPORT_PREFIX}/lib/pkg${CMAKE_IMPORT_LIBRARY_SUFFIX}${OTHER}",
+        false,
+    );
+    assert_eq!(
+        out,
+        r#"  IMPORTED_IMPLIB_RELEASE "${_IMPORT_PREFIX}/lib/pkg${CMAKE_IMPORT_LIBRARY_SUFFIX}\${OTHER}"
+"#
+    );
+}
+
+#[test]
 fn renders_namespace_qualified_sibling_links() -> Result<(), Box<dyn std::error::Error>> {
     use rcmake_model::{
         BT, DirId, ExportSet, InstallKind, InstallOptions, InstallRule, LinkItem, ProjectModel,

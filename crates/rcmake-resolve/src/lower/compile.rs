@@ -399,13 +399,26 @@ pub(super) fn compile_arguments(
             .chain(defines.map(|define| quote(&[b"-D", define].concat()))),
     );
     let includes = includes(model, target, group);
-    if (model
+    let explicit_language = model
         .dir(target.dir)
         .source_props
         .get(&Lexical::new(source).normalize())
         .and_then(|props| props.get(b"LANGUAGE"))
-        .is_some()
-        || super::source_language(model, target, source).is_none_or(|natural| natural != language))
+        .map_or_else(
+            || {
+                super::source_language(model, target, source)
+                    .is_none_or(|natural| natural != language)
+            },
+            |declared| {
+                declared != language
+                    || target
+                        .policies
+                        .policies
+                        .get(rcmake_diag::PolicyId::new(119))
+                        == rcmake_diag::PolicyStatus::New
+            },
+        );
+    if explicit_language
         && let Some(options) = definition(
             model,
             target.dir,

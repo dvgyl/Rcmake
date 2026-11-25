@@ -108,7 +108,9 @@ pub(crate) fn compile(flags: impl IntoIterator<Item = String>) -> Settings {
     let mut flags = flags.into_iter();
     let mut settings = Settings::default();
     while let Some(flag) = flags.next() {
-        let key = flag.strip_prefix('-').or_else(|| flag.strip_prefix('/'));
+        let key = flag
+            .strip_prefix(['-', '/'])
+            .or_else(|| flag.starts_with("std:").then_some(flag.as_str()));
         match key {
             Some("D" | "I") => {
                 let property = if key == Some("D") {
@@ -190,10 +192,14 @@ fn compile_property(flag: &str) -> Option<(&'static str, &'static str)> {
         "EHsc" => ("ExceptionHandling", "Sync"),
         "GR" => ("RuntimeTypeInfo", "true"),
         "GR-" => ("RuntimeTypeInfo", "false"),
+        "std:c++14" => ("LanguageStandard", "stdcpp14"),
         "std:c++17" => ("LanguageStandard", "stdcpp17"),
         "std:c++20" => ("LanguageStandard", "stdcpp20"),
         "std:c++23latest" => ("LanguageStandard", "stdcpp23"),
         "std:c++latest" => ("LanguageStandard", "stdcpplatest"),
+        "std:c11" => ("LanguageStandard_C", "stdc11"),
+        "std:c17" => ("LanguageStandard_C", "stdc17"),
+        "std:clatest" => ("LanguageStandard_C", "stdclatest"),
         "permissive-" => ("ConformanceMode", "true"),
         "permissive" => ("ConformanceMode", "false"),
         "Zc:wchar_t" => ("TreatWChar_tAsBuiltInType", "true"),

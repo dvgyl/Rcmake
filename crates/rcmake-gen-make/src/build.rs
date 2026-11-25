@@ -6,7 +6,7 @@ use rcmake_gen_common::ide::{BuildCommand, BuildRequest, Jobs};
 
 /// The `make` processes of `cmake --build`, in run order.
 ///
-/// - `make -C <dir> [-j [<n>]] [VERBOSE=1] <targets> <native args>`
+/// - Run `make -f Makefile [-j [<n>]] [VERBOSE=1] <targets> <native args>` in the build directory.
 /// - `-j` without a count means the default parallel level.
 /// - With `--clean-first`, a `clean` command comes first (unless the only target is
 ///   `clean`).
@@ -20,7 +20,7 @@ pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenEr
     } else {
         req.make_program.into()
     };
-    let mut base = vec![program, "-C".into(), req.build_dir.into()];
+    let mut base = vec![program, "-f".into(), "Makefile".into()];
     match req.jobs {
         Jobs::Count(count) => base.extend(["-j".into(), count.to_string().into()]),
         Jobs::Default => base.push("-j".into()),
@@ -59,7 +59,7 @@ mod tests {
         let commands = build_commands(&req).unwrap_or_default();
         let argv: Vec<Vec<BString>> = commands.into_iter().map(|command| command.argv).collect();
         let expected = |target: &str| -> Vec<BString> {
-            ["make", "-C", "/b", "-j", "VERBOSE=1", target, "-k"]
+            ["make", "-f", "Makefile", "-j", "VERBOSE=1", target, "-k"]
                 .map(BString::from)
                 .into()
         };

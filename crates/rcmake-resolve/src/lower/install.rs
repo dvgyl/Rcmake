@@ -6,8 +6,8 @@ use std::convert::Infallible;
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_diag::{
-    Backtrace, DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, RenderOptions,
-    render,
+    Backtrace, DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId,
+    RenderOptions, render,
 };
 use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
 use rcmake_host::{Host, Stream};
@@ -23,6 +23,7 @@ use crate::{
 };
 
 mod imported_runtime;
+mod legacy;
 mod objects;
 mod targets;
 
@@ -36,7 +37,7 @@ pub use super::artifacts::collect_metadata;
 /// same order.
 #[must_use]
 pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) -> InstallManifest {
-    let edits = runtime_edits(model, targets, &IndexMap::new(), |_, _| {}).unwrap_or_default();
+    let edits = runtime_edits(model, targets, &IndexMap::new(), |_, _, _| {}).unwrap_or_default();
     match lower_install_rules(
         model,
         targets,
@@ -63,19 +64,13 @@ pub(crate) fn lower_install_manifest_with_configs(
         targets::warn_framework_change(model, index, rule, host)?;
     }
     super::warn_install_name_policy(model, host);
-    let edits = runtime_edits(model, targets, languages, |raw, edit| {
+    let edits = runtime_edits(model, targets, languages, |rule, raw, edit| {
         if let super::install_rpath::RuntimeEdit::Elf(elf) = edit
             && raw.policies.policies.get(rcmake_diag::PolicyId::new(95))
                 == rcmake_diag::PolicyStatus::Warn
             && elf.new.windows(2).any(|pair| pair == b"${")
         {
-            crate::pipeline::policy_warning(
-                model,
-                host,
-                rcmake_diag::PolicyId::new(95),
-                raw,
-                "RPATH entries for the install tree may be accidentally evaluated as CMake variables.",
-            );
+            warn_rpath_escaping(model, host, rule, raw);
         }
     })?;
     let mut usage = UsageResolver::new(model).with_ide(ide);
@@ -118,6 +113,41 @@ pub(crate) fn lower_install_manifest_with_configs(
             })
         },
     )
+}
+
+fn warn_rpath_escaping(model: &ProjectModel, host: &dyn Host, rule: &InstallRule, target: &Target) {
+    if definition(model, rule.dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+        .is_some_and(|value| rcmake_base::truth::is_on(value))
+    {
+        return;
+    }
+    let policy = PolicyId::new(95);
+    let warning = Diagnostic {
+        annotations: None,
+        kind: MessageKind::AuthorWarning,
+        effect: Effect::None,
+        category: Some(DiagCategory::Policy),
+        policy: Some(policy),
+        location: crate::sources::generation_source_location(Location::Backtrace(rule.backtrace.clone())),
+        body: format!(
+            concat!(
+                "Policy CMP0095 is not set: RPATH entries are properly escaped in the intermediary CMake install script.  ",
+                "Run \"cmake --help-policy CMP0095\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\n",
+                "RPATH entries for target '{}' will not be escaped in the intermediary cmake_install.cmake script."
+            ),
+            target.name,
+        ).into(),
+    };
+    host.write_out(
+        Stream::Stderr,
+        &render(
+            &warning,
+            &RenderOptions {
+                relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+                ..Default::default()
+            },
+        ),
+    );
 }
 
 impl InstallManifest {
@@ -320,7 +350,7 @@ fn runtime_edits(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
     languages: &IndexMap<(TargetId, ConfigId), IndexSet<BString>>,
-    mut warn: impl FnMut(&Target, &super::install_rpath::RuntimeEdit),
+    mut warn: impl FnMut(&InstallRule, &Target, &super::install_rpath::RuntimeEdit),
 ) -> Result<RuntimeEdits, ResolveError> {
     let facts: IndexMap<_, _> = targets
         .iter()
@@ -328,10 +358,11 @@ fn runtime_edits(
         .collect();
     let mut edits = IndexMap::new();
     for target in targets {
-        let Some(raw) = model
-            .target(target.id)
-            .filter(|raw| has_runtime_install(model, raw, &target.config))
-        else {
+        let Some(raw) = model.target(target.id) else {
+            continue;
+        };
+        let mut rules = runtime_install_rules(model, raw, &target.config).peekable();
+        if rules.peek().is_none() {
             continue;
         };
         let key = (target.id, target.config.clone());
@@ -349,44 +380,64 @@ fn runtime_edits(
         if let Some(edit) =
             super::link::rpath::install_rpath(model, raw, target, languages, &facts)?
         {
-            warn(raw, &edit);
+            for rule in rules {
+                warn(rule, raw, &edit);
+            }
             edits.insert(key, edit);
         }
     }
     Ok(edits)
 }
 
-pub(super) fn has_runtime_install(
-    model: &ProjectModel,
+pub(super) fn has_target_install(model: &ProjectModel, target: &Target) -> bool {
+    model
+        .find_target(target.dir, &target.name)
+        .is_some_and(|id| {
+            model.installs.iter().any(|rule| {
+            matches!(&rule.kind, InstallKind::Targets { targets, .. } if targets.contains(&id))
+        })
+        })
+}
+
+fn runtime_install_rules<'a>(
+    model: &'a ProjectModel,
     target: &Target,
-    config: &ConfigId,
-) -> bool {
-    let Some(id) = model.find_target(target.dir, &target.name) else {
-        return false;
-    };
-    let group = match (target.kind, crate::ide::bundle_kind(target)) {
+    config: &'a ConfigId,
+) -> impl Iterator<Item = &'a InstallRule> {
+    let id = model.find_target(target.dir, &target.name);
+    let group: Option<&[u8]> = match (target.kind, crate::ide::bundle_kind(target)) {
         (TargetKind::SharedLibrary, crate::ide::BundleKind::Framework { .. }) => {
-            b"FRAMEWORK".as_slice()
+            Some(b"FRAMEWORK".as_slice())
         }
         (TargetKind::Executable, crate::ide::BundleKind::App { .. })
-        | (TargetKind::ModuleLibrary, crate::ide::BundleKind::Bundle { .. }) => b"BUNDLE",
-        (TargetKind::Executable, _) => b"RUNTIME",
-        (TargetKind::SharedLibrary | TargetKind::ModuleLibrary, _) => b"LIBRARY",
-        _ => return false,
+        | (TargetKind::ModuleLibrary, crate::ide::BundleKind::Bundle { .. }) => Some(b"BUNDLE"),
+        (TargetKind::Executable, _) => Some(b"RUNTIME"),
+        (TargetKind::SharedLibrary | TargetKind::ModuleLibrary, _) => Some(b"LIBRARY"),
+        _ => None,
     };
-    model.installs.iter().enumerate().any(|(index, rule)| {
-        let InstallKind::Targets { targets, .. } = &rule.kind else {
-            return false;
-        };
-        if !targets.contains(&id) {
-            return false;
-        }
-        let recorded = recorded_args(model, index);
-        target_options(&recorded).get(group).map_or_else(
-            || matches_config(&rule.options, config),
-            |group| !group.namelink_only && matches_config(&group.merge(&rule.options), config),
-        )
-    })
+    model
+        .installs
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, rule)| {
+            let group = group?;
+            let InstallKind::Targets { targets, .. } = &rule.kind else {
+                return None;
+            };
+            if !id.is_some_and(|id| targets.contains(&id)) {
+                return None;
+            }
+            let recorded = recorded_args(model, index);
+            target_options(&recorded)
+                .get(group)
+                .map_or_else(
+                    || matches_config(&rule.options, config),
+                    |group| {
+                        !group.namelink_only && matches_config(&group.merge(&rule.options), config)
+                    },
+                )
+                .then_some(rule)
+        })
 }
 
 fn lower_install_rules<E>(
@@ -459,13 +510,23 @@ fn lower_install_rules<E>(
                         return Ok(());
                     }
                     let expand_paths = paths.iter().any(|path| has_genex(&path.value));
-                    for config in action_configs(configs, options, expand_paths, multi) {
+                    let expand_rename = options
+                        .rename
+                        .as_ref()
+                        .is_some_and(|rename| has_genex(rename));
+                    for config in
+                        action_configs(configs, options, expand_paths || expand_rename, multi)
+                    {
                         let mut options = options.clone();
                         let mut files = Vec::new();
                         if let Some(config) = config {
                             if let Some(destination) = &mut options.destination {
                                 *destination =
                                     eval(rule.dir, config, &rule.backtrace, destination)?;
+                            }
+                            if let Some(rename) = options.rename.as_mut().filter(|_| expand_rename)
+                            {
+                                *rename = eval(rule.dir, config, &Backtrace::default(), rename)?;
                             }
                             if multi {
                                 options.configurations = vec![config.0.clone()];
@@ -545,6 +606,7 @@ fn lower_install_rules<E>(
                 .push(crate::InstallEntry::Actions(first..manifest.actions.len()));
         }
     }
+    legacy::append_scripts(model, &mut manifest);
     Ok(manifest)
 }
 

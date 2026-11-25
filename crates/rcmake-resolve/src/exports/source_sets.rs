@@ -21,39 +21,47 @@ pub(crate) fn validate(model: &ProjectModel) -> Result<(), ResolveError> {
         let Some(export) = model.exports.get(set) else {
             continue;
         };
-        for &id in &export.targets {
-            let Some(target) = model.target(id) else {
+        validate_export(model, &export.targets, &export.install_rules)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_export(
+    model: &ProjectModel,
+    targets: &[TargetId],
+    rules: &[usize],
+) -> Result<(), ResolveError> {
+    for &id in targets {
+        let Some(target) = model.target(id) else {
+            continue;
+        };
+        for source_set in target.file_sets.iter().filter_map(|id| model.file_set(*id)) {
+            if source_set.scope == UsageScope::Private
+                || rules
+                    .iter()
+                    .any(|&index| install_options(model, index, source_set).is_some())
+            {
                 continue;
-            };
-            for source_set in target.file_sets.iter().filter_map(|id| model.file_set(*id)) {
-                if source_set.kind != FileSetKind::Sources
-                    || source_set.scope == UsageScope::Private
-                    || export
-                        .install_rules
-                        .iter()
-                        .any(|&index| install_options(model, index, source_set).is_some())
-                {
-                    continue;
-                }
-                let diagnostic = Diagnostic { annotations: None,
-                    kind: MessageKind::Error,
-                    effect: Effect::SetError,
-                    category: None,
-                    policy: None,
-                    location: generation_location(model, target),
-                    body: format!(
-                        "File set \"{}\" is listed in interface file sets of {} but has not been exported",
-                        source_set.name, target.name
-                    ).into(),
-                };
-                return Err(ResolveError::Message(render(
-                    &diagnostic,
-                    &RenderOptions {
-                        relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
-                        ..Default::default()
-                    },
-                )));
             }
+            let diagnostic = Diagnostic {
+                annotations: None,
+                kind: MessageKind::Error,
+                effect: Effect::SetError,
+                category: None,
+                policy: None,
+                location: generation_location(model, target),
+                body: format!(
+                    "File set \"{}\" is listed in interface file sets of {} but has not been exported",
+                    source_set.name, target.name
+                ).into(),
+            };
+            return Err(ResolveError::Message(render(
+                &diagnostic,
+                &RenderOptions {
+                    relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+                    ..Default::default()
+                },
+            )));
         }
     }
     Ok(())

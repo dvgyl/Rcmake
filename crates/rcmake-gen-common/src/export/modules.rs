@@ -216,7 +216,7 @@ pub fn write_module_exports(
                     &target_name,
                     config,
                     &scans,
-                    plan.install,
+                    plan,
                     bmi_destination,
                 )?;
                 jobs.push(ModuleExportJob {
@@ -514,7 +514,7 @@ fn render_file_set<'a>(
                     out.extend_from_slice(b">:");
                 }
                 if plan.install {
-                    render_relative_path(out, path, false);
+                    render_relative_path(out, plan, path, false);
                 } else {
                     quoted_content(out, path);
                 }
@@ -538,7 +538,7 @@ fn write_property_script(
     target: &[u8],
     config: &ConfigId,
     scans: &[(PathBuf, BString)],
-    install: bool,
+    plan: &ExportPlan,
     bmi_destination: Option<&[u8]>,
 ) -> Result<(), GenError> {
     let mut out = BString::from("cmake_minimum_required(VERSION 3.28)\n");
@@ -549,18 +549,20 @@ fn write_property_script(
     out.extend_from_slice(b"set(_properties ");
     quote(&mut out, &property);
     out.extend_from_slice(b")\n");
-    if !install || bmi_destination.is_some() {
+    if !plan.install || bmi_destination.is_some() {
         out.extend_from_slice(b"file(READ ");
         quote(&mut out, &from_native(table));
         out.extend_from_slice(b" _module_table)\n");
     }
-    if install && let Some(destination) = bmi_destination {
+    if plan.install
+        && let Some(destination) = bmi_destination
+    {
         out.extend_from_slice(b"set(_bmi_destination ");
         quote(&mut out, destination);
         out.extend_from_slice(b")\nset(_bmi_prefix ");
         quote(
             &mut out,
-            if to_native(destination).is_absolute() {
+            if super::is_absolute(plan, destination) {
                 b""
             } else {
                 b"${_IMPORT_PREFIX}/"
@@ -611,7 +613,7 @@ endfunction()
         out.push(b' ');
         quote(
             &mut out,
-            if install && !to_native(source).is_absolute() {
+            if plan.install && !super::is_absolute(plan, source) {
                 b"${_IMPORT_PREFIX}/"
             } else {
                 b""

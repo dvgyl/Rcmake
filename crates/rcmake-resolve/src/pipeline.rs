@@ -904,7 +904,7 @@ fn resolve_config(
         &mut usage,
         &mut ide_lowering,
         compile_inputs,
-        None,
+        plan.cross.native_for(config),
     )?;
     let mut cross_graphs = IndexMap::new();
     for settings in plan.cross.commands_for(config) {

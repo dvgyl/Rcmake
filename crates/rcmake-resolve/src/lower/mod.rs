@@ -64,7 +64,7 @@ pub use modules::{bmi_script_path, lower_modules};
 pub(crate) use pch::IdeLowering;
 pub(crate) use policy_flags::warn_about_wrappers;
 pub use shell::{rule_command_chain, simple_args as rule_arguments};
-pub(crate) use standard::{cmp0128_warnings, required_standard};
+pub(crate) use standard::{checked_standard_flag, cmp0128_warnings, required_standard};
 
 pub(crate) fn definition<'a>(
     model: &'a ProjectModel,

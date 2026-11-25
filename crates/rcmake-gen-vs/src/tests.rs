@@ -98,6 +98,93 @@ fn compile_flags_use_last_values_and_inherit_options() {
 }
 
 #[test]
+fn selects_msvc_language_standard_properties() {
+    for (flag, property, value) in [
+        ("std:c++14", "LanguageStandard", "stdcpp14"),
+        ("std:c++20", "LanguageStandard", "stdcpp20"),
+        ("std:c11", "LanguageStandard_C", "stdc11"),
+        ("std:c17", "LanguageStandard_C", "stdc17"),
+        ("std:clatest", "LanguageStandard_C", "stdclatest"),
+    ] {
+        for prefix in ["", "-", "/"] {
+            let mut xml = xml::Writer::new(false, "utf-8");
+            flags_table::compile(std::iter::once(format!("{prefix}{flag}"))).write(&mut xml);
+            assert!(
+                xml.finish()
+                    .contains(&format!("<{property}>{value}</{property}>")),
+                "{prefix}{flag}"
+            );
+        }
+    }
+}
+
+#[test]
+fn writes_visual_studio_standards_from_resolved_ide_settings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = if cfg!(windows) { "C:/work" } else { "/work" };
+    let source = Path::new(root).join("src");
+    let bin = Path::new(root).join("build");
+    let host = PureHost::new(bin.clone(), bin.join("cmake"));
+    host.seed_file(
+        &source.join("main.cpp"),
+        b"consteval int value() { return 42; }",
+    )?;
+    let mut model = ProjectModel::default();
+    model.set_root_dirs(from_native(&source), from_native(&bin));
+    model.generator = Some(GeneratorKind::VisualStudio(VsVersion::Vs17));
+    let vars = &mut model.dir_mut(DirId::ROOT).vars;
+    for (name, value) in [
+        ("CMAKE_BUILD_TYPE", "Debug"),
+        ("CMAKE_SYSTEM_NAME", "Windows"),
+        ("CMAKE_CXX_COMPILER", "cl.exe"),
+        ("CMAKE_CXX_COMPILER_ID", "MSVC"),
+        ("CMAKE_CXX_STANDARD_DEFAULT", "14"),
+        ("CMAKE_CXX_COMPILE_FEATURES", "cxx_std_20"),
+        ("CMAKE_CXX20_STANDARD_COMPILE_OPTION", "-std:c++20"),
+        ("CMAKE_CXX20_EXTENSION_COMPILE_OPTION", "-std:c++20"),
+    ] {
+        vars.insert(name.into(), value.into());
+    }
+    for name in ["explicit", "feature", "override"] {
+        let mut app = target(name, TargetKind::StaticLibrary, "main.cpp");
+        if name == "feature" {
+            app.usage
+                .push(UsageField::CompileFeatures, bt("cxx_std_20"));
+        } else {
+            app.props.set("CXX_STANDARD".into(), "20".into());
+        }
+        if name == "override" {
+            app.usage.push(UsageField::CompileOptions, bt("/std:c++17"));
+        }
+        model.add_target(app)?;
+    }
+    let result = rcmake_resolve::resolve_with_options(
+        &model,
+        &host,
+        &[],
+        &rcmake_resolve::ResolveOptions {
+            ide: Some(rcmake_resolve::ide::IdeFlavor::VisualStudio),
+            ..Default::default()
+        },
+    )?;
+    generate(VsVersion::Vs17, &result, &model, &host, &bin)?;
+    for (name, standard) in [("explicit", 20), ("feature", 20), ("override", 17)] {
+        let file = host.read(
+            &bin.join(format!("{name}.vcxproj")),
+            ReadRange::All { limit: 65536 },
+        )?;
+        let project = string(&file);
+        assert!(
+            project.contains(&format!(
+                "<LanguageStandard>stdcpp{standard}</LanguageStandard>"
+            )),
+            "{name}\n{project}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn writes_link_output_directories_and_cuda_and_nasm_tool_imports() {
     let host = PureHost::default();
     let bin = Path::new("/out");
@@ -579,6 +666,7 @@ fn fixture(
                 ..Default::default()
             }],
             steps: fallback_steps(bin, name),
+            ..BuildGraph::default()
         });
     }
     result.metadata.listfiles = vec![
@@ -1089,6 +1177,7 @@ fn writes_the_configured_module_definition_pre_link_command()
                 steps: vec![0],
                 ..Default::default()
             }],
+            ..BuildGraph::default()
         }],
         ..Default::default()
     };

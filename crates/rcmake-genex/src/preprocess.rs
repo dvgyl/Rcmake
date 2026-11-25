@@ -60,8 +60,8 @@ pub fn genex_strip(input: &[u8]) -> BString {
     out.into()
 }
 
-/// Keep the content of the interface that `mode` selects and drop the other one,
-/// preserving all other expressions (`install(EXPORT)`, `export()`).
+/// Keep the content of the selected interface and discard the other interfaces.
+/// Preserve expressions inside the selected content.
 #[must_use]
 pub fn strip(ast: &GenexAst, mode: PreprocessMode) -> GenexAst {
     GenexAst {
@@ -80,7 +80,12 @@ fn strip_nodes(nodes: &[GenexNode], mode: PreprocessMode) -> Vec<GenexNode> {
                     (b"BUILD_INTERFACE", PreprocessMode::Build)
                     | (b"INSTALL_INTERFACE", PreprocessMode::Install) => Some(true),
                     (b"BUILD_INTERFACE", PreprocessMode::Install)
-                    | (b"INSTALL_INTERFACE", PreprocessMode::Build) => Some(false),
+                    | (b"INSTALL_INTERFACE", PreprocessMode::Build)
+                    | (b"BUILD_LOCAL_INTERFACE", _)
+                        if expr.params.is_some() =>
+                    {
+                        Some(false)
+                    }
                     _ => None,
                 };
                 match (keep, &expr.params) {
@@ -89,7 +94,7 @@ fn strip_nodes(nodes: &[GenexNode], mode: PreprocessMode) -> Vec<GenexNode> {
                             if i > 0 {
                                 out.push(GenexNode::Text(",".into()));
                             }
-                            out.extend(strip_nodes(param, mode));
+                            out.extend(param.iter().cloned());
                         }
                     }
                     (Some(_), _) => {}

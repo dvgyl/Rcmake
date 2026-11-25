@@ -27,12 +27,17 @@ impl RuntimeEdit {
     pub(super) fn check(&self, dir: &[u8], name: &[u8], configured: bool) -> Option<BString> {
         let Self::Elf(edit) = self else { return None };
         let path = installed_file(dir, name);
-        let mut command = BString::from("file(RPATH_CHECK FILE ");
-        command.extend_from_slice(&path);
-        command.extend_from_slice(b" RPATH ");
-        quote_rpath(&mut command, &edit.new, true);
-        command.push(b')');
-        Some(guard(&path, &command, configured))
+        Some(elf_guard(&path, configured, |command, indent| {
+            command.extend_from_slice(b"file(RPATH_CHECK");
+            argument(command, indent, b"FILE ", &path);
+            argument(
+                command,
+                indent,
+                b"RPATH ",
+                &quote_rpath(&edit.new, edit.escape_new),
+            );
+            command.push(b')');
+        }))
     }
 
     pub(super) fn render(&self, dir: &[u8], name: &[u8], configured: bool) -> BString {
@@ -40,16 +45,26 @@ impl RuntimeEdit {
         let mut command = BString::default();
         match self {
             Self::Elf(edit) => {
-                command.extend_from_slice(b"file(RPATH_CHANGE FILE ");
-                command.extend_from_slice(&path);
-                command.extend_from_slice(b" OLD_RPATH ");
-                cmake_quote(&mut command, &edit.old);
-                command.extend_from_slice(b" NEW_RPATH ");
-                quote_rpath(&mut command, &edit.new, edit.escape_new);
-                if edit.strip {
-                    command.extend_from_slice(b" INSTALL_REMOVE_ENVIRONMENT_RPATH");
-                }
-                command.push(b')');
+                return elf_guard(&path, configured, |command, indent| {
+                    command.extend_from_slice(b"file(RPATH_CHANGE");
+                    argument(command, indent, b"FILE ", &path);
+                    argument(
+                        command,
+                        indent,
+                        b"OLD_RPATH ",
+                        &quote_rpath(&edit.old, true),
+                    );
+                    argument(
+                        command,
+                        indent,
+                        b"NEW_RPATH ",
+                        &quote_rpath(&edit.new, edit.escape_new),
+                    );
+                    if edit.strip {
+                        argument(command, indent, b"INSTALL_REMOVE_ENVIRONMENT_RPATH", b"");
+                    }
+                    command.push(b')');
+                });
             }
             Self::MachO(edit) => {
                 if edit.old != edit.new {
@@ -114,19 +129,66 @@ fn escaped_name(name: &[u8]) -> BString {
     out
 }
 
-fn quote_rpath(out: &mut BString, value: &[u8], escape_dollars: bool) {
-    if escape_dollars {
-        cmake_quote(out, value);
-    } else {
-        out.push(b'"');
-        for &byte in value {
-            if matches!(byte, b'\\' | b'"') {
-                out.push(b'\\');
-            }
-            out.push(byte);
-        }
-        out.push(b'"');
+fn quote_rpath(value: &[u8], escape: bool) -> BString {
+    if !escape || !value.iter().any(|byte| b"\"$\\".contains(byte)) {
+        return [b"\"".as_slice(), value, b"\""].concat().into();
     }
+    let mut suffix = BString::from("]");
+    while value
+        .windows(suffix.len())
+        .enumerate()
+        .any(|(index, part)| {
+            part == suffix.as_slice()
+                && value
+                    .get(index + suffix.len())
+                    .is_none_or(|&byte| byte == b']')
+        })
+    {
+        suffix.push(b'=');
+    }
+    let equals = suffix.strip_prefix(b"]").unwrap_or_default();
+    let mut out = BString::from("[");
+    out.extend_from_slice(equals);
+    out.push(b'[');
+    if value.starts_with(b"\n") || value.starts_with(b"\r\n") {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(value);
+    out.extend_from_slice(&suffix);
+    out.push(b']');
+    out
+}
+
+fn argument(out: &mut BString, indent: &[u8], keyword: &[u8], value: &[u8]) {
+    for part in [b"\n".as_slice(), indent, b"       ", keyword, value] {
+        out.extend_from_slice(part);
+    }
+}
+
+fn elf_guard(path: &[u8], configured: bool, body: impl FnOnce(&mut BString, &[u8])) -> BString {
+    let indent = if configured {
+        b"    ".as_slice()
+    } else {
+        b"  "
+    };
+    let mut out: BString = [
+        b"if(EXISTS ".as_slice(),
+        path,
+        b" AND\n",
+        indent,
+        b"   NOT IS_SYMLINK ",
+        path,
+        b")\n",
+        indent,
+        b"  ",
+    ]
+    .concat()
+    .into();
+    body(&mut out, indent);
+    for part in [b"\n".as_slice(), indent, b"endif()"] {
+        out.extend_from_slice(part);
+    }
+    out
 }
 
 fn installed_file(dir: &[u8], name: &[u8]) -> BString {

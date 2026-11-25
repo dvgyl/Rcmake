@@ -135,7 +135,7 @@ pub(super) fn standard_flag(
 }
 
 /// Select the standard flag and report invalid standard settings.
-pub(super) fn checked_standard_flag(
+pub(crate) fn checked_standard_flag(
     model: &ProjectModel,
     target: &Target,
     language: &[u8],

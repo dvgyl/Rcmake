@@ -7,7 +7,7 @@ use rcmake_model::GeneratorKind;
 
 /// The `ninja` processes of `cmake --build`, in run order.
 ///
-/// - `ninja -C <dir> [-f build-<config>.ninja] [-j <n>] [-v] <targets> <native args>`
+/// - Run `ninja [-f build-<config>.ninja] [-j <n>] [-v] <targets> <native args>` in the build directory.
 /// - The `-f` file is used only by `Ninja Multi-Config` with `--config`.
 /// - With `--clean-first`, a `clean` command comes first (unless the only target is
 ///   `clean`).
@@ -21,7 +21,7 @@ pub fn build_commands(req: &BuildRequest<'_>) -> Result<Vec<BuildCommand>, GenEr
     } else {
         req.make_program.into()
     };
-    let mut base = vec![program, "-C".into(), req.build_dir.into()];
+    let mut base = vec![program];
     if req.generator == GeneratorKind::NinjaMultiConfig
         && let Some(config) = req.config.filter(|config| !config.is_empty())
     {
@@ -83,8 +83,8 @@ mod tests {
         assert_eq!(
             argv(&commands),
             [
-                "/bin/ninja -C /b -f build-Release.ninja -j 4 -v clean",
-                "/bin/ninja -C /b -f build-Release.ninja -j 4 -v app",
+                "/bin/ninja -f build-Release.ninja -j 4 -v clean",
+                "/bin/ninja -f build-Release.ninja -j 4 -v app",
             ]
         );
         assert!(commands.iter().all(|command| command.working_dir == "/b"));
@@ -97,7 +97,7 @@ mod tests {
         req.clean_first = false;
         assert_eq!(
             argv(&build_commands(&req).unwrap_or_default()),
-            ["/bin/ninja -C /b -j 4 -v"]
+            ["/bin/ninja -j 4 -v"]
         );
     }
 
@@ -112,7 +112,7 @@ mod tests {
         req.native_args = &native;
         assert_eq!(
             argv(&build_commands(&req).unwrap_or_default()),
-            ["ninja -C /b clean -k0"]
+            ["ninja clean -k0"]
         );
     }
 }

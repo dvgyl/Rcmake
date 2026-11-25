@@ -546,7 +546,6 @@ impl IdeCompile {
         group: usize,
         base: IdeCompileSettings,
         compiled: &CompileGroup,
-        language_flags: impl FnOnce() -> Vec<BString>,
     ) {
         let mut overrides = self.settings(compiled);
         if overrides.flags.starts_with(&base.flags) {
@@ -564,28 +563,39 @@ impl IdeCompile {
         {
             self.overrides.insert(group, overrides);
         }
-        self.base.entry(base.language.clone()).or_insert_with(|| {
-            let mut base = base;
-            let mut flags = Vec::new();
-            for value in language_flags() {
-                append_compile_flags(&mut flags, &value, Backtrace::default());
-            }
-            flags.append(&mut base.flags);
-            base.flags = flags;
-            base
-        });
+        self.base.entry(base.language.clone()).or_insert(base);
     }
 
     pub(crate) fn finish(
         self,
         resolved: &mut ResolvedTarget,
-        dir: &Directory,
+        model: &ProjectModel,
+        target: &Target,
         paths: &SourcePaths<'_>,
         inputs: &TargetInputs,
         members: &IndexMap<BString, FileSetMember<'_>>,
-    ) {
+    ) -> Result<(), ResolveError> {
         if let Some(facts) = &mut resolved.ide {
-            facts.compile = self.base.into_values().collect();
+            for mut base in self.base.into_values() {
+                let mut flags = Vec::new();
+                for value in lower::language_flags(model, target, &resolved.config, &base.language)
+                {
+                    append_compile_flags(&mut flags, &value, Backtrace::default());
+                }
+                if self.flavor == IdeFlavor::VisualStudio
+                    && let Some(standard) = lower::checked_standard_flag(
+                        model,
+                        target,
+                        &base.language,
+                        inputs.standard_requirements.get(&base.language).copied(),
+                    )?
+                {
+                    append_compile_flags(&mut flags, &standard, Backtrace::default());
+                }
+                flags.append(&mut base.flags);
+                base.flags = flags;
+                facts.compile.push(base);
+            }
             let compiled = resolved
                 .compile_units
                 .iter()
@@ -600,8 +610,16 @@ impl IdeCompile {
                     ))
                 })
                 .collect();
-            collect_sources(facts, dir, paths, inputs, members, compiled);
+            collect_sources(
+                facts,
+                model.dir(target.dir),
+                paths,
+                inputs,
+                members,
+                compiled,
+            );
         }
+        Ok(())
     }
 }
 
