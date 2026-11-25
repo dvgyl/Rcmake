@@ -1,7 +1,8 @@
 use rcmake_base::{BString, list};
 use rcmake_diag::Backtrace;
 
-use super::{ModelError, ProjectModel, set_map, set_usage};
+use super::props::{set_map, set_usage};
+use super::{ModelError, ProjectModel};
 use crate::{BT, DirId, LinkItem, PropOrigin, Target, TargetId, UsageField};
 
 pub(super) fn is_scoped_link(name: &[u8]) -> bool {

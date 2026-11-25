@@ -53,7 +53,7 @@ impl Writer<'_> {
             Value::Int(n) => self.out.extend_from_slice(n.to_string().as_bytes()),
             Value::UInt(n) => self.out.extend_from_slice(n.to_string().as_bytes()),
             Value::Real(n) => write_real(*n, &mut self.out),
-            Value::String(s) => write_string(s.as_slice(), &mut self.out),
+            Value::String(s) => write_string(&mut self.out, s.as_slice()),
             Value::Array(_) => self.out.extend_from_slice(b"[]"),
             Value::Object(_) => self.out.extend_from_slice(b"{}"),
         }
@@ -110,7 +110,7 @@ impl Writer<'_> {
         self.out.push(b'{');
         for (index, (key, value)) in members.iter().enumerate() {
             self.start_item(index, depth + 1);
-            write_string(key.as_slice(), &mut self.out);
+            write_string(&mut self.out, key.as_slice());
             if self.indent.is_empty() {
                 self.out.push(b':');
             } else {
@@ -179,7 +179,8 @@ fn write_real(number: f64, out: &mut Vec<u8>) {
     }
 }
 
-fn write_string(mut bytes: &[u8], out: &mut Vec<u8>) {
+/// Append a quoted JSON string with jsoncpp-compatible escaping.
+pub fn write_string(out: &mut Vec<u8>, mut bytes: &[u8]) {
     out.push(b'"');
     while let Some((&byte, rest)) = bytes.split_first() {
         bytes = rest;

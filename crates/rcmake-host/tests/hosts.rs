@@ -427,3 +427,37 @@ fn pure_host_keeps_virtual_roots_and_resolves_cross_root_links() -> rcmake_host:
     host.remove_dir(Path::new(r"C:\work\empty\"))?;
     Ok(())
 }
+
+#[test]
+fn host_adapters_follow_the_shared_contract() {
+    let root = Path::new("/work/conformance");
+    let memo = rcmake_host::MemoHost::new(PureHost::default());
+    conformance::run_all(&memo, root);
+
+    let no_process = rcmake_host::NoProcessHost::new(PureHost::default());
+    conformance::run_all(&no_process, root);
+}
+
+mod forwarding {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    struct Adapter {
+        base: Arc<dyn rcmake_host::Host>,
+    }
+
+    impl rcmake_host::Host for Adapter {
+        rcmake_host::forward_host!(base, fs, env, process, services);
+    }
+
+    #[test]
+    fn exports_all_groups_to_other_crates() {
+        let host = Adapter {
+            base: Arc::new(rcmake_host::NoProcessHost::new(
+                rcmake_host::PureHost::default(),
+            )),
+        };
+        rcmake_host::conformance::run_all(&host, Path::new("/work/conformance"));
+        assert!(!rcmake_host::Host::supports_process_execution(&host));
+    }
+}

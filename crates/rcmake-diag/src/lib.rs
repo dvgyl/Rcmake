@@ -206,31 +206,24 @@ impl DiagEngine {
     /// Export recorded diagnostics as a SARIF 2.1.0 JSON document.
     #[must_use]
     pub fn sarif_json(&self) -> Value {
-        let mut driver = BTreeMap::new();
-        driver.insert(BString::from("name"), Value::string("CMake"));
-        driver.insert(BString::from("version"), Value::string(CMAKE_VERSION_STR));
-
-        let mut tool = BTreeMap::new();
-        tool.insert(BString::from("driver"), Value::Object(driver));
-
-        let mut run = BTreeMap::new();
-        run.insert(BString::from("tool"), Value::Object(tool));
-        run.insert(
-            BString::from("results"),
-            Value::Array(self.sarif_results.clone()),
-        );
-
-        let mut root = BTreeMap::new();
-        root.insert(
-            BString::from("$schema"),
-            Value::string("https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json"),
-        );
-        root.insert(BString::from("version"), Value::string("2.1.0"));
-        root.insert(
-            BString::from("runs"),
-            Value::Array(vec![Value::Object(run)]),
-        );
-        Value::Object(root)
+        let driver = Value::object_from([
+            ("name", Value::string("CMake")),
+            ("version", Value::string(CMAKE_VERSION_STR)),
+        ]);
+        let run = Value::object_from([
+            ("tool", Value::object_from([("driver", driver)])),
+            ("results", Value::Array(self.sarif_results.clone())),
+        ]);
+        Value::object_from([
+            (
+                "$schema",
+                Value::string(
+                    "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json",
+                ),
+            ),
+            ("version", Value::string("2.1.0")),
+            ("runs", Value::array_from([run])),
+        ])
     }
 
     fn record_sarif(&mut self, diag: &Diagnostic, effective: Effect) {
@@ -251,12 +244,11 @@ impl DiagEngine {
             },
         };
 
-        let mut msg = BTreeMap::new();
-        msg.insert(BString::from("text"), Value::String(diag.body.clone()));
+        let msg = Value::object_from([("text", Value::String(diag.body.clone()))]);
 
         let mut entry = BTreeMap::new();
         entry.insert(BString::from("level"), Value::string(level));
-        entry.insert(BString::from("message"), Value::Object(msg));
+        entry.insert(BString::from("message"), msg);
         entry.insert(BString::from("ruleId"), Value::string(rule_id));
 
         sarif_location::record(&mut entry, &diag.location);

@@ -843,7 +843,7 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
         Err(HostError::unsupported(crate::no_process::DENIED_MESSAGE))
     }
 
-    crate::no_process::forward_host_services!(base);
+    crate::forward_host!(base, services);
 }
 
 fn env_key(key: &[u8]) -> BString {

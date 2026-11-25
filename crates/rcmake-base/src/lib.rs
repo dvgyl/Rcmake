@@ -13,11 +13,13 @@ pub mod limits;
 pub mod list;
 pub mod list_ops;
 pub mod path_lex;
+pub mod permissions;
 pub mod qt_resource;
 pub mod shell;
 mod source_date_epoch;
 pub mod suggest;
 pub mod truth;
+pub mod unicode;
 pub mod version;
 
 pub use bstr::{BStr, BString, ByteSlice, ByteVec};

@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use rcmake_base::ByteSlice as _;
+use rcmake_base::{ByteSlice as _, unicode::is_unicode_format};
 
 const TAB_WIDTH: usize = 4;
 const CHECKPOINT_SPACING: usize = 256;
@@ -154,7 +154,7 @@ impl Glyph {
             .unwrap_or_default();
         if content.len() > MAX_GLYPH_BYTES {
             text.extend(std::iter::repeat_n('�', width));
-        } else if is_format(self.head) {
+        } else if is_unicode_format(self.head) {
             let _ = write!(text, "<U+{:04X}>", u32::from(self.head));
         } else if self.head == '\t' {
             text.extend(std::iter::repeat_n(' ', width));
@@ -176,7 +176,7 @@ fn glyphs(bytes: &[u8], from: Boundary) -> impl Iterator<Item = Glyph> + '_ {
     let mut column = from.column;
     std::iter::from_fn(move || {
         let (start, mut end, head) = scalars.next()?;
-        let format = is_format(head);
+        let format = is_unicode_format(head);
         let mut width = if format {
             4 + if u32::from(head) > 0xffff { 5 } else { 4 }
         } else if head == '\t' {
@@ -235,7 +235,7 @@ pub(super) fn editor_column(bytes: &[u8], byte: usize) -> usize {
 
 /// Replace terminal control and format characters with a visible character.
 pub(super) fn visible_char(ch: char) -> char {
-    if ch.is_control() || is_format(ch) {
+    if ch.is_control() || is_unicode_format(ch) {
         '�'
     } else {
         ch
@@ -290,18 +290,6 @@ fn is_wide(ch: char) -> bool {
         '\u{1b000}'..='\u{1b2ff}' | '\u{1f004}' | '\u{1f0cf}' | '\u{1f18e}' |
         '\u{1f191}'..='\u{1f19a}' | '\u{1f1e6}'..='\u{1f1ff}' | '\u{1f200}'..='\u{1f251}' |
         '\u{1f300}'..='\u{1faff}' | '\u{20000}'..='\u{3fffd}'
-    )
-}
-
-fn is_format(ch: char) -> bool {
-    // Unicode 17.0 General_Category=Cf.
-    matches!(ch,
-        '\u{00ad}' | '\u{0600}'..='\u{0605}' | '\u{061c}' | '\u{06dd}' | '\u{070f}' |
-        '\u{0890}'..='\u{0891}' | '\u{08e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}' |
-        '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' |
-        '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}' |
-        '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' |
-        '\u{e0001}' | '\u{e0020}'..='\u{e007f}'
     )
 }
 

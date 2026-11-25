@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-/// Convenience result alias for [`crate::Host`] operations.
+/// Result of a [`crate::Host`] operation.
 pub type HostResult<T> = Result<T, HostError>;
 
 /// Error returned by a [`crate::Host`] operation.
@@ -24,6 +24,18 @@ pub struct HostError {
 }
 
 impl HostError {
+    /// Require a native absolute path.
+    ///
+    /// # Errors
+    /// Return an invalid-input error if the path is relative.
+    pub fn require_absolute(path: &Path) -> HostResult<()> {
+        if path.is_absolute() {
+            Ok(())
+        } else {
+            Err(Self::not_absolute(path.to_path_buf()))
+        }
+    }
+
     /// Error returned whenever a relative path is passed to a [`crate::Host`] FS method.
     #[must_use]
     pub fn not_absolute(path: PathBuf) -> Self {
@@ -156,4 +168,15 @@ mod tests {
             "Permission denied"
         );
     }
+}
+
+#[test]
+fn requires_native_absolute_paths() {
+    let absolute = Path::new(if cfg!(windows) { "C:/file" } else { "/file" });
+    assert_eq!(HostError::require_absolute(absolute), Ok(()));
+    let relative = Path::new("dir/file");
+    assert_eq!(
+        HostError::require_absolute(relative),
+        Err(HostError::not_absolute(relative.into()))
+    );
 }

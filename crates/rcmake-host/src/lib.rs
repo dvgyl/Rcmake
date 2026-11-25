@@ -11,6 +11,7 @@
 mod cmake_root;
 pub mod conformance;
 pub mod error;
+mod forward;
 pub mod memo;
 #[cfg(any(unix, windows))]
 pub mod native;
@@ -18,12 +19,14 @@ pub mod no_process;
 pub mod overlay;
 pub mod path;
 pub mod pure;
+pub mod timestamp;
 
 use core::time::Duration;
 use std::path::{Path, PathBuf};
 
-use jiff::tz::TimeZone;
-use rcmake_base::BString;
+pub use jiff::tz::TimeZone;
+#[doc(hidden)]
+pub use rcmake_base::BString;
 
 pub use cmake_root::discover_cmake_root;
 pub use error::{HostError, HostResult};
@@ -369,8 +372,8 @@ pub trait Host: Send + Sync {
     /// ([`HostError::unsupported`]). The default implementation always fails with
     /// [`std::io::ErrorKind::Unsupported`].
     fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
-        require_absolute(from)?;
-        require_absolute(to)?;
+        HostError::require_absolute(from)?;
+        HostError::require_absolute(to)?;
         Err(HostError::unsupported(
             "atomic no-replace rename is not supported",
         ))
@@ -392,7 +395,7 @@ pub trait Host: Send + Sync {
         path: &Path,
         timeout: Option<Duration>,
     ) -> HostResult<Box<dyn FileLockGuard>> {
-        require_absolute(path)?;
+        HostError::require_absolute(path)?;
         let _ = timeout;
         Err(HostError::unsupported("file locks are not supported"))
     }
@@ -434,7 +437,7 @@ pub trait Host: Send + Sync {
         _atime: Option<FileTime>,
         _mtime: Option<FileTime>,
     ) -> HostResult<()> {
-        require_absolute(path)?;
+        HostError::require_absolute(path)?;
         Err(HostError::unsupported(
             "This host cannot set symbolic link timestamps",
         ))
@@ -587,14 +590,6 @@ pub trait Host: Send + Sync {
 
     /// Static host OS and hardware identity.
     fn system(&self) -> SystemInfo;
-}
-
-fn require_absolute(path: &Path) -> HostResult<()> {
-    if path.is_absolute() {
-        Ok(())
-    } else {
-        Err(HostError::not_absolute(path.to_path_buf()))
-    }
 }
 
 fn validate_run(req: &RunRequest, require_absolute: fn(&Path) -> HostResult<()>) -> HostResult<()> {

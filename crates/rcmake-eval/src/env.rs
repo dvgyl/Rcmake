@@ -12,8 +12,42 @@ use rcmake_expr::{CondEnv, ExpandEnv};
 use rcmake_host::Host;
 use rcmake_regex::{Captures, Regex, RegexError};
 
-use crate::Interp;
 use crate::hooks::WatchAccess;
+use crate::{Cx, Interp};
+
+/// Expand variables in a command context.
+pub struct CxEnv<'a, 'b> {
+    /// Command context that supplies variable values.
+    pub cx: &'a mut Cx<'b>,
+    /// Override for the current line number.
+    pub line: Option<u32>,
+    /// Emit diagnostics for uninitialized variables when enabled.
+    pub warn_missing: bool,
+}
+
+impl ExpandEnv for CxEnv<'_, '_> {
+    fn var(&mut self, name: &[u8]) -> Option<BString> {
+        self.cx.var(name)
+    }
+
+    fn cache_var(&mut self, name: &[u8]) -> Option<BString> {
+        self.cx.cache().get(name).map(|entry| entry.value.clone())
+    }
+
+    fn env_var(&mut self, name: &[u8]) -> Option<BString> {
+        self.cx.host().env_get(name)
+    }
+
+    fn missing_reference(&mut self, name: &[u8]) {
+        if self.warn_missing {
+            self.cx.warn_uninitialized(name);
+        }
+    }
+
+    fn current_line(&self) -> u32 {
+        self.line.unwrap_or_else(|| self.cx.current_line())
+    }
+}
 
 impl ExpandEnv for Interp {
     fn var(&mut self, name: &[u8]) -> Option<BString> {

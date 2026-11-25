@@ -1,7 +1,9 @@
 use rcmake_diag::PolicyMap;
 
 use super::*;
-use crate::TargetKind;
+use crate::{
+    AppendMode, ImportedVisibility, PropOrigin, PropScope, TargetKind, TargetOrigin, UsageField,
+};
 
 fn origin(bt: &Backtrace) -> PropOrigin<'_> {
     PropOrigin {

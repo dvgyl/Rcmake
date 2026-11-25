@@ -1,5 +1,4 @@
 //! Restore validated targets from a configure journal.
-#![allow(unreachable_pub)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,7 +12,8 @@ impl ProjectModel {
 
     /// Insert the targets for a replayed directory. Check all names and arena
     /// positions before the first insertion. A failed check leaves the model intact.
-    pub fn restore_directory_targets(&mut self, dir: DirId, targets: Vec<Target>) -> bool {
+    #[cfg(test)]
+    fn restore_directory_targets(&mut self, dir: DirId, targets: Vec<Target>) -> bool {
         self.restore_directory_objects(dir, targets, Vec::new(), Vec::new())
     }
 

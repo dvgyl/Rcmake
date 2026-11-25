@@ -66,6 +66,12 @@ pub fn iter(v: &[u8], empty: Empty) -> Elements<'_> {
     }
 }
 
+/// Iterate over list elements without removing escape backslashes.
+pub fn iter_raw(v: &[u8], empty: Empty) -> impl Iterator<Item = &[u8]> {
+    let mut elements = iter(v, empty);
+    std::iter::from_fn(move || elements.next_raw().map(|(bytes, _)| bytes))
+}
+
 /// An iterator over the elements of a CMake list.
 pub struct Elements<'a> {
     remaining: Option<&'a [u8]>,
@@ -137,12 +143,33 @@ impl<'a> Iterator for Elements<'a> {
     }
 }
 
-/// Convenience wrapper around [`split_into`] returning a newly allocated `Vec<BString>`.
+/// Split a CMake list into owned elements.
 #[must_use]
 pub fn split(v: &[u8], empty: Empty) -> Vec<BString> {
     let mut out = Vec::new();
     split_into(v, empty, &mut out);
     out
+}
+
+/// Escape semicolons in an item for use in a CMake list.
+#[must_use]
+pub fn escape_item(item: &[u8]) -> BString {
+    let mut out = Vec::with_capacity(item.len());
+    for &byte in item {
+        if byte == b';' {
+            out.push(b'\\');
+        }
+        out.push(byte);
+    }
+    out.into()
+}
+
+/// Append an item as-is. Insert a semicolon if the destination has bytes.
+pub fn push(out: &mut Vec<u8>, item: &[u8]) {
+    if !out.is_empty() {
+        out.push(b';');
+    }
+    out.extend_from_slice(item);
 }
 
 /// Join elements with `;`. Matches CMake by never escaping embedded semicolons.
@@ -231,6 +258,23 @@ mod tests {
             iter(raw, Empty::Keep).nth(3).as_deref(),
             Some(b"a;b;c".as_slice())
         );
+    }
+
+    #[test]
+    fn appends_and_iterates_over_raw_items() {
+        let mut out = Vec::new();
+        let item = escape_item(br"a\;b;");
+        assert_eq!(item, br"a\\;b\;".as_slice());
+        push(&mut out, &item);
+        push(&mut out, b"[c;d]");
+        push(&mut out, b"");
+        assert!(iter_raw(&[], Empty::Keep).next().is_none());
+        assert_eq!(
+            iter_raw(&out, Empty::Keep).collect::<Vec<_>>(),
+            [item.as_slice(), b"[c;d]", b""]
+        );
+        assert_eq!(iter_raw(&out, Empty::Drop).count(), 2);
+        assert_eq!(split(&out, Empty::Keep)[0], br"a\;b;".as_slice());
     }
 
     #[test]

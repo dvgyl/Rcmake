@@ -1,8 +1,8 @@
 //! CMake cache store (`CMakeCache.txt`), property maps, global state, and the arena-based
 //! [`ProjectModel`] (ADR-007).
 //!
-//! The project model holds the raw configure-time state: directories, targets, custom
-//! commands, tests, file sets, install rules, and export sets. Each arena hands out a
+//! The project model stores directories, targets, custom commands, tests, file sets,
+//! install rules, and export sets from configuration. Each arena hands out a
 //! typed id ([`DirId`], [`TargetId`], [`CommandId`], [`TestId`], [`FileSetId`]). Ids are
 //! only created by the arenas, and arenas never shrink.
 

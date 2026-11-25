@@ -14,12 +14,12 @@ pub(super) fn record(entry: &mut BTreeMap<BString, Value>, location: &Location) 
             let frames: Vec<_> = trace
                 .frames()
                 .filter(|frame| frame.line > 0 || frame.kind == FrameKind::Deferred)
-                .map(|frame| object([("location", frame_location(frame))]))
+                .map(|frame| Value::object_from([("location", frame_location(frame))]))
                 .collect();
             if !frames.is_empty() {
                 entry.insert(
                     "stacks".into(),
-                    Value::Array(vec![object([("frames", Value::Array(frames))])]),
+                    Value::Array(vec![Value::object_from([("frames", Value::Array(frames))])]),
                 );
             }
             frame_location(top)
@@ -40,19 +40,19 @@ fn frame_location(frame: &Frame) -> Value {
 fn make_location(file: &[u8], line: u32, name: Option<&[u8]>, deferred: bool) -> Value {
     let mut physical = BTreeMap::from([(
         "artifactLocation".into(),
-        object([("uri", Value::string(file))]),
+        Value::object_from([("uri", Value::string(file))]),
     )]);
     if line > 0 && !deferred {
         physical.insert(
             "region".into(),
-            object([("startLine", Value::UInt(line.into()))]),
+            Value::object_from([("startLine", Value::UInt(line.into()))]),
         );
     }
     let mut result = BTreeMap::from([("physicalLocation".into(), Value::Object(physical))]);
     if let Some(name) = name.filter(|name| !name.is_empty()) {
         result.insert(
             "logicalLocations".into(),
-            Value::Array(vec![object([
+            Value::Array(vec![Value::object_from([
                 ("name", Value::string(name)),
                 ("kind", Value::string("function")),
             ])]),
@@ -61,19 +61,10 @@ fn make_location(file: &[u8], line: u32, name: Option<&[u8]>, deferred: bool) ->
     if deferred {
         result.insert(
             "message".into(),
-            object([("text", Value::string("DEFERRED"))]),
+            Value::object_from([("text", Value::string("DEFERRED"))]),
         );
     }
     Value::Object(result)
-}
-
-fn object<const N: usize>(entries: [(&str, Value); N]) -> Value {
-    Value::Object(
-        entries
-            .into_iter()
-            .map(|(key, value)| (key.into(), value))
-            .collect(),
-    )
 }
 
 #[cfg(test)]
@@ -106,11 +97,11 @@ mod tests {
         let frames = trace
             .frames()
             .take(3)
-            .map(|frame| object([("location", frame_location(frame))]))
+            .map(|frame| Value::object_from([("location", frame_location(frame))]))
             .collect();
         assert_eq!(
             entry.get(b"stacks".as_slice()),
-            Some(&Value::Array(vec![object([(
+            Some(&Value::Array(vec![Value::object_from([(
                 "frames",
                 Value::Array(frames)
             )])]))

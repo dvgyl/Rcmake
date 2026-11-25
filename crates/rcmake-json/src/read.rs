@@ -78,7 +78,6 @@ impl Parser<'_> {
                 _ => return Err(self.error(start, EXPECT_VALUE)),
             };
 
-            // Close completed containers until the next member or the end of the document.
             loop {
                 self.skip_trivia()?;
                 match frames.pop() {

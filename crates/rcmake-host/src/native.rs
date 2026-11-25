@@ -17,7 +17,7 @@ use crate::error::{HostError, HostResult, SyntheticError};
 use crate::{
     CopyOptions, DirEntry, FILE_CHUNK_SIZE, FileKind, FileLockGuard, FileTime, Follow,
     GracefulTimeout, Host, Metadata, ReadRange, RunOutput, RunRequest, Stream, SystemInfo,
-    WriteMode, require_absolute, validate_run,
+    WriteMode, validate_run,
 };
 
 #[cfg(unix)]
@@ -68,7 +68,7 @@ impl NativeHost {
         mtime: Option<FileTime>,
         follow: Follow,
     ) -> HostResult<()> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         if atime
             .into_iter()
             .chain(mtime)
@@ -169,12 +169,12 @@ fn rename_noreplace_with_link(from: &Path, to: &Path) -> HostResult<()> {
 
 impl Host for NativeHost {
     fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         platform::metadata(p, follow)
     }
 
     fn open_read(&self, p: &Path) -> HostResult<Box<dyn crate::ReadSeek + '_>> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         let file = io_at(platform::open_input(p), p)?;
         if !io_at(file.metadata(), p)?.is_file() {
             return Err(HostError::unsupported(
@@ -190,7 +190,7 @@ impl Host for NativeHost {
     }
 
     fn scratch_file_in(&self, dir: &Path) -> HostResult<Box<dyn crate::ScratchFile + '_>> {
-        require_absolute(dir)?;
+        HostError::require_absolute(dir)?;
         let file = io_at(tempfile::tempfile_in(dir), dir)?;
         Ok(Box::new(file))
     }
@@ -202,7 +202,7 @@ impl Host for NativeHost {
         input: &mut dyn Read,
         len: u64,
     ) -> HostResult<()> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         let mut file = open_output(p, mode)?;
         let result = io_at(crate::stream::copy_exact(input, &mut file, len), p);
         drop(file);
@@ -213,7 +213,7 @@ impl Host for NativeHost {
     }
 
     fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         let mut file = io_at(platform::open_input(p), p)?;
         let metadata = io_at(file.metadata(), p)?;
         if metadata.is_dir() {
@@ -252,7 +252,7 @@ impl Host for NativeHost {
     }
 
     fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         let mut file = io_at(platform::open_input(p), p)?;
         let mut buffer = vec![0; FILE_CHUNK_SIZE];
         loop {
@@ -274,12 +274,12 @@ impl Host for NativeHost {
     }
 
     fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         io_at(open_output(p, mode)?.write_all(data), p)
     }
 
     fn read_dir(&self, p: &Path) -> HostResult<Vec<DirEntry>> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         io_at(fs::read_dir(p), p)?
             .map(|entry| {
                 let entry = io_at(entry, p)?;
@@ -292,14 +292,14 @@ impl Host for NativeHost {
     }
 
     fn create_dir_all(&self, p: &Path) -> HostResult<()> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         // `fs::create_dir_all` fails for a missing parent when the path ends in `/.`.
         let clean: PathBuf = p.components().collect();
         io_at(fs::create_dir_all(clean), p)
     }
 
     fn remove_file(&self, p: &Path) -> HostResult<()> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         // macOS reports EPERM when unlinking a directory.
         if io_at(fs::symlink_metadata(p), p)?.is_dir() {
             return Err(SyntheticError::IsADirectory.at(Some(p)));
@@ -308,7 +308,8 @@ impl Host for NativeHost {
     }
 
     fn remove_dir(&self, p: &Path) -> HostResult<()> {
-        let path = crate::path::directory_removal_path(p, require_absolute, cfg!(windows))?;
+        let path =
+            crate::path::directory_removal_path(p, HostError::require_absolute, cfg!(windows))?;
         if !io_at(fs::symlink_metadata(&path), p)?.is_dir() {
             return Err(SyntheticError::NotADirectory.at(Some(p)));
         }
@@ -316,19 +317,20 @@ impl Host for NativeHost {
     }
 
     fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
-        let path = crate::path::directory_removal_path(p, require_absolute, cfg!(windows))?;
+        let path =
+            crate::path::directory_removal_path(p, HostError::require_absolute, cfg!(windows))?;
         io_at(platform::remove_dir_all(&path), p)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
-        require_absolute(from)?;
-        require_absolute(to)?;
+        HostError::require_absolute(from)?;
+        HostError::require_absolute(to)?;
         io_at(fs::rename(from, to), from)
     }
 
     fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
-        require_absolute(from)?;
-        require_absolute(to)?;
+        HostError::require_absolute(from)?;
+        HostError::require_absolute(to)?;
         platform::rename_noreplace(from, to)
     }
 
@@ -337,7 +339,7 @@ impl Host for NativeHost {
         path: &Path,
         timeout: Option<Duration>,
     ) -> HostResult<Box<dyn FileLockGuard>> {
-        require_absolute(path)?;
+        HostError::require_absolute(path)?;
         let file = io_at(
             OpenOptions::new()
                 .read(true)
@@ -379,8 +381,8 @@ impl Host for NativeHost {
     }
 
     fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
-        require_absolute(from)?;
-        require_absolute(to)?;
+        HostError::require_absolute(from)?;
+        HostError::require_absolute(to)?;
         let mut src = io_at(platform::open_input(from), from)?;
         let metadata = io_at(src.metadata(), from)?;
         if !metadata.is_file() {
@@ -409,23 +411,23 @@ impl Host for NativeHost {
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
-        require_absolute(link)?;
+        HostError::require_absolute(link)?;
         io_at(platform::symlink(target, link), link)
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
-        require_absolute(src)?;
-        require_absolute(dst)?;
+        HostError::require_absolute(src)?;
+        HostError::require_absolute(dst)?;
         io_at(platform::hard_link(src, dst), dst)
     }
 
     fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         io_at(fs::read_link(p), p).map(platform::normalize_path)
     }
 
     fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         #[cfg(windows)]
         {
             use std::path::Component;
@@ -456,7 +458,7 @@ impl Host for NativeHost {
     }
 
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
-        require_absolute(p)?;
+        HostError::require_absolute(p)?;
         io_at(platform::set_permissions(p, mode), p)
     }
 
@@ -524,7 +526,7 @@ impl Host for NativeHost {
         req: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        validate_run(req, require_absolute)?;
+        validate_run(req, HostError::require_absolute)?;
         process::run_pipeline(req, None, usize::MAX, on_output, None, None)
             .map(|result| result.output)
     }
@@ -535,7 +537,7 @@ impl Host for NativeHost {
         timeout: GracefulTimeout,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        validate_run(req, require_absolute)?;
+        validate_run(req, HostError::require_absolute)?;
         process::run_pipeline(req, Some(timeout), usize::MAX, on_output, None, None)
             .map(|result| result.output)
     }
@@ -547,7 +549,7 @@ impl Host for NativeHost {
         hard_limit: Option<Duration>,
         update: &mut crate::DeadlineUpdate<'_>,
     ) -> HostResult<crate::ControlledOutput> {
-        validate_run(req, require_absolute)?;
+        validate_run(req, HostError::require_absolute)?;
         process::run_pipeline(
             req,
             graceful,
@@ -559,7 +561,7 @@ impl Host for NativeHost {
     }
 
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
-        validate_run(req, require_absolute)?;
+        validate_run(req, HostError::require_absolute)?;
         process::run_pipeline(req, None, limit, &mut |_, _| {}, None, None)
             .map(|result| result.output)
     }

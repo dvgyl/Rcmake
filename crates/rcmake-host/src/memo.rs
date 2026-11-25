@@ -10,11 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use rcmake_base::BString;
-
 use crate::{
     CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, GracefulTimeout, Host, HostResult,
-    Metadata, ReadRange, RunOutput, RunRequest, Stream, WriteMode,
+    Metadata, RunOutput, RunRequest, Stream, WriteMode,
 };
 
 /// Counts of cache operations since the adapter was created.
@@ -272,14 +270,6 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         )
     }
 
-    fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
-        self.base.read(p, range)
-    }
-
-    fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
-        self.base.read_chunks(p, consume)
-    }
-
     fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {
         let _change = self.begin_change_for(&[p]);
         self.base.write(p, data, mode)
@@ -349,10 +339,6 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         self.base.hard_link(src, dst)
     }
 
-    fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
-        self.base.read_link(p)
-    }
-
     fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
         self.lookup(
             p,
@@ -388,22 +374,6 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         self.base.set_symlink_times(p, atime, mtime)
     }
 
-    fn env_get(&self, key: &[u8]) -> Option<BString> {
-        self.base.env_get(key)
-    }
-
-    fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
-        self.base.env_set(key, value);
-    }
-
-    fn env_all(&self) -> Vec<(BString, BString)> {
-        self.base.env_all()
-    }
-
-    fn supports_process_execution(&self) -> bool {
-        self.base.supports_process_execution()
-    }
-
     fn run(
         &self,
         req: &RunRequest,
@@ -421,18 +391,6 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     ) -> HostResult<RunOutput> {
         let _change = self.begin_change();
         self.base.run_with_timeout_signal(req, timeout, on_output)
-    }
-
-    fn open_read(&self, p: &Path) -> HostResult<Box<dyn crate::ReadSeek + '_>> {
-        self.base.open_read(p)
-    }
-
-    fn scratch_file(&self) -> HostResult<Box<dyn crate::ScratchFile + '_>> {
-        self.base.scratch_file()
-    }
-
-    fn scratch_file_in(&self, dir: &Path) -> HostResult<Box<dyn crate::ScratchFile + '_>> {
-        self.base.scratch_file_in(dir)
     }
 
     fn write_from(
@@ -462,13 +420,26 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         self.base.run_bounded(req, limit)
     }
 
-    crate::no_process::forward_host_services!(base);
+    crate::forward_host!(
+        base,
+        env,
+        services,
+        read,
+        read_with_origin,
+        read_chunks,
+        read_link,
+        open_read,
+        scratch_file,
+        scratch_file_in,
+        supports_process_execution,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CommandSpec, FileKind, Input, Output, PureHost, TimeoutSignal};
+    use crate::{CommandSpec, FileKind, Input, Output, PureHost, ReadRange, TimeoutSignal};
+    use rcmake_base::BString;
 
     use crate::HostError;
     use std::sync::Mutex;
@@ -630,7 +601,7 @@ mod tests {
             self.base.env_all()
         }
 
-        crate::no_process::forward_host_services!(base);
+        crate::forward_host!(base, services);
     }
 
     #[test]

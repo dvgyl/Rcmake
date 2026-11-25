@@ -32,7 +32,7 @@ pub struct ExpandedArg {
 }
 
 impl ExpandedArg {
-    /// Convenience predicate: `true` for quoted and bracket arguments (literal in `if()`).
+    /// Return true for quoted or bracket arguments. These are literal in `if()`.
     #[must_use]
     pub const fn is_quoted_or_bracket(&self) -> bool {
         matches!(self.kind, ArgKind::Quoted | ArgKind::Bracket)

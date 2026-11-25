@@ -27,8 +27,7 @@ pub fn strip_spaces(item: &[u8]) -> &[u8] {
     item.get(start..end).unwrap_or_default()
 }
 
-/// Parse a list index or count: leading whitespace, then a signed decimal integer.
-/// Returns `None` for any other text.
+/// Parse a signed decimal list index or count. Accept leading whitespace.
 #[must_use]
 pub fn parse_index(arg: &[u8]) -> Option<i64> {
     let first = arg.iter().position(|&byte| !is_space(byte))?;

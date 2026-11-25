@@ -1,4 +1,4 @@
-//! CMake 4.5.1 policy registry (`CMP0000`–`CMP0226`) and compact policy state map.
+//! CMake 4.5.1 policy registry (`CMP0000` to `CMP0226`) and compact policy state map.
 
 use core::fmt;
 
@@ -88,7 +88,7 @@ pub struct PolicyInfo {
     pub id: PolicyId,
     /// CMake `(major, minor, patch)` version that introduced this policy.
     pub introduced: (u16, u16, u16),
-    /// `true` for `CMP0000`–`CMP0065` whose `OLD` behaviors were removed in CMake 4.0+.
+    /// `true` for `CMP0000` to `CMP0065` whose `OLD` behaviors were removed in CMake 4.0+.
     pub removed_old: bool,
     /// One-line summary from CMake 4.5.1's policy manual.
     pub summary: &'static str,
@@ -111,7 +111,7 @@ pub enum PolicyError {
     /// Policy ID is outside `CMP0000`..=`CMP0226`.
     #[error("Policy \"{0}\" is not known to this version of CMake.")]
     UnknownPolicy(String),
-    /// Attempted to set `CMP0000`–`CMP0065` to `OLD` (removed in CMake 4.0+).
+    /// Attempted to set `CMP0000` to `CMP0065` to `OLD` (removed in CMake 4.0+).
     #[error("The OLD behavior for policy {0} will be removed from a future version of CMake.")]
     RemovedOldBehavior(PolicyId),
     /// Effective policy version is below `3.5`.
@@ -145,7 +145,7 @@ impl PolicyMap {
         }
     }
 
-    /// Explicitly set `id` to `status`. Rejects setting `CMP0000`–`CMP0065` to `Old`.
+    /// Explicitly set `id` to `status`. Rejects setting `CMP0000` to `CMP0065` to `Old`.
     pub fn set(&mut self, id: PolicyId, status: PolicyStatus) -> Result<(), PolicyError> {
         if id.number() > MAX_POLICY_ID {
             return Err(PolicyError::UnknownPolicy(id.to_string()));

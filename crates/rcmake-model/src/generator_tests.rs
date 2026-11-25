@@ -199,7 +199,6 @@ fn non_ide_generators_reject_every_option() {
         )),
         "Generator\n  Unix Makefiles\ndoes not support platform specification, but platform\n  x64\nwas specified."
     );
-    // The instance is checked first.
     assert_eq!(
         message(GeneratorSpec::parse(
             GeneratorKind::Xcode,

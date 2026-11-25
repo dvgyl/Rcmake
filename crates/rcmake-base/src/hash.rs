@@ -185,6 +185,28 @@ mod tests {
     }
 
     #[test]
+    fn md5_matches_rfc_1321_vectors() {
+        assert_eq!(
+            HashAlgo::Md5.hex_digest(b""),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+        assert_eq!(
+            HashAlgo::Md5.hex_digest(b"a"),
+            "0cc175b9c0f1b6a831c399e269772661"
+        );
+        assert_eq!(
+            HashAlgo::Md5.hex_digest(b"abc"),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+        assert_eq!(
+            HashAlgo::Md5.hex_digest(
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
+            ),
+            "57edf4a22be3c955ac49da2e2107b67a"
+        );
+    }
+
+    #[test]
     fn streaming_digest_equals_one_shot_digest_for_every_algorithm() {
         let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         for algo in [

@@ -2,77 +2,15 @@
 
 #![forbid(unsafe_code)]
 
-use core::time::Duration;
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rcmake_base::BString;
 
 use crate::{
-    CommandSpec, CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, GracefulTimeout, Host,
-    HostError, HostResult, Metadata, ReadRange, RunOutput, RunRequest, Stream, WriteMode,
+    CommandSpec, GracefulTimeout, Host, HostError, HostResult, RunOutput, RunRequest, Stream,
 };
-
-// Forward services that these adapters do not change.
-macro_rules! forward_host_services {
-    ($base:ident) => {
-        fn registry_host_view(&self) -> Option<crate::RegistryView> {
-            self.$base.registry_host_view()
-        }
-
-        fn registry_value(
-            &self,
-            root: crate::RegistryRoot,
-            subkey: &[u8],
-            name: Option<&[u8]>,
-            view: crate::RegistryView,
-        ) -> HostResult<Option<BString>> {
-            self.$base.registry_value(root, subkey, name, view)
-        }
-
-        fn write_out(&self, stream: Stream, bytes: &[u8]) {
-            self.$base.write_out(stream, bytes);
-        }
-
-        fn read_stdin(&self, limit: u64) -> HostResult<Vec<u8>> {
-            self.$base.read_stdin(limit)
-        }
-
-        fn is_terminal(&self, stream: Stream) -> bool {
-            self.$base.is_terminal(stream)
-        }
-
-        fn now(&self) -> FileTime {
-            self.$base.now()
-        }
-
-        fn monotonic(&self) -> Duration {
-            self.$base.monotonic()
-        }
-
-        fn sleep(&self, duration: Duration) {
-            self.$base.sleep(duration);
-        }
-
-        fn time_zone(&self) -> jiff::tz::TimeZone {
-            self.$base.time_zone()
-        }
-
-        fn current_exe(&self) -> HostResult<PathBuf> {
-            self.$base.current_exe()
-        }
-
-        fn initial_cwd(&self) -> PathBuf {
-            self.$base.initial_cwd()
-        }
-
-        fn system(&self) -> crate::SystemInfo {
-            self.$base.system()
-        }
-    };
-}
-pub(crate) use forward_host_services;
 
 const DENIED_LIMIT: usize = 128;
 const MAX_LOG_BYTES: usize = 1024 * 1024;
@@ -330,28 +268,6 @@ impl<H: Host + ?Sized> Host for NoProcessHost<H> {
         false
     }
 
-    fn open_read(&self, p: &Path) -> HostResult<Box<dyn crate::ReadSeek + '_>> {
-        self.base.open_read(p)
-    }
-
-    fn scratch_file(&self) -> HostResult<Box<dyn crate::ScratchFile + '_>> {
-        self.base.scratch_file()
-    }
-
-    fn scratch_file_in(&self, dir: &Path) -> HostResult<Box<dyn crate::ScratchFile + '_>> {
-        self.base.scratch_file_in(dir)
-    }
-
-    fn write_from(
-        &self,
-        p: &Path,
-        mode: WriteMode,
-        input: &mut dyn std::io::Read,
-        len: u64,
-    ) -> HostResult<()> {
-        self.base.write_from(p, mode, input, len)
-    }
-
     fn run_controlled(
         &self,
         req: &RunRequest,
@@ -383,122 +299,20 @@ impl<H: Host + ?Sized> Host for NoProcessHost<H> {
         self.deny(req, DeniedMethod::RunBounded)
     }
 
-    fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
-        self.base.metadata(p, follow)
-    }
-
-    fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
-        self.base.read(p, range)
-    }
-
-    fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
-        self.base.read_chunks(p, consume)
-    }
-
-    fn write(&self, p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {
-        self.base.write(p, data, mode)
-    }
-
-    fn read_dir(&self, p: &Path) -> HostResult<Vec<DirEntry>> {
-        self.base.read_dir(p)
-    }
-
-    fn create_dir_all(&self, p: &Path) -> HostResult<()> {
-        self.base.create_dir_all(p)
-    }
-
-    fn remove_file(&self, p: &Path) -> HostResult<()> {
-        self.base.remove_file(p)
-    }
-
-    fn remove_dir(&self, p: &Path) -> HostResult<()> {
-        self.base.remove_dir(p)
-    }
-
-    fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
-        self.base.remove_dir_all(p)
-    }
-
-    fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
-        self.base.rename(from, to)
-    }
-
-    fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
-        self.base.rename_noreplace(from, to)
-    }
-
-    fn lock_file(
-        &self,
-        path: &Path,
-        timeout: Option<Duration>,
-    ) -> HostResult<Box<dyn FileLockGuard>> {
-        self.base.lock_file(path, timeout)
-    }
-
-    fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
-        self.base.copy_file(from, to, opts)
-    }
-
-    fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
-        self.base.symlink(target, link)
-    }
-
-    fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
-        self.base.hard_link(src, dst)
-    }
-
-    fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
-        self.base.read_link(p)
-    }
-
-    fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
-        self.base.canonicalize(p)
-    }
-
-    fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
-        self.base.set_permissions(p, mode)
-    }
-
-    fn set_times(
-        &self,
-        p: &Path,
-        atime: Option<FileTime>,
-        mtime: Option<FileTime>,
-    ) -> HostResult<()> {
-        self.base.set_times(p, atime, mtime)
-    }
-
-    fn set_symlink_times(
-        &self,
-        p: &Path,
-        atime: Option<FileTime>,
-        mtime: Option<FileTime>,
-    ) -> HostResult<()> {
-        self.base.set_symlink_times(p, atime, mtime)
-    }
-
-    fn env_get(&self, key: &[u8]) -> Option<BString> {
-        self.base.env_get(key)
-    }
-
-    fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
-        self.base.env_set(key, value);
-    }
-
-    fn env_all(&self) -> Vec<(BString, BString)> {
-        self.base.env_all()
-    }
-
-    forward_host_services!(base);
+    crate::forward_host!(base, fs, env, services);
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::ErrorKind;
+    use std::path::Path;
+    use std::time::Duration;
 
     use super::*;
     use crate::overlay::OverlayHost;
-    use crate::{Input, Output, PureHost, TimeoutSignal};
+    use crate::{
+        CopyOptions, FileTime, Follow, Input, Output, PureHost, ReadRange, TimeoutSignal, WriteMode,
+    };
 
     const ALL: ReadRange = ReadRange::All { limit: 128 };
 

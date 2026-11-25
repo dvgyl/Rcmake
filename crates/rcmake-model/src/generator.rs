@@ -126,6 +126,18 @@ impl GeneratorKind {
         !matches!(self, Self::Ninja | Self::UnixMakefiles)
     }
 
+    /// Return true for either Ninja generator.
+    #[must_use]
+    pub const fn is_ninja(self) -> bool {
+        matches!(self, Self::Ninja | Self::NinjaMultiConfig)
+    }
+
+    /// Return true for Unix Makefiles or either Ninja generator.
+    #[must_use]
+    pub const fn is_make_or_ninja(self) -> bool {
+        matches!(self, Self::UnixMakefiles) || self.is_ninja()
+    }
+
     /// `true` for a generator that writes IDE project files (Xcode, Visual Studio).
     #[must_use]
     pub const fn is_ide(self) -> bool {
@@ -349,8 +361,7 @@ pub struct GeneratorSpec {
 }
 
 impl GeneratorSpec {
-    /// Check and parse the raw values for `kind`, in CMake order: instance, then
-    /// platform, then toolset.
+    /// Parse the instance, platform, and toolset for `kind` in CMake order.
     ///
     /// `xcode` is the Xcode version for the `buildsystem=` check. With `None`, that
     /// check is not done.

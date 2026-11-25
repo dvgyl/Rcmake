@@ -276,3 +276,54 @@ fn writes_jsoncpp_string_and_real_representations() {
         b"[-0.0,0.0001,10000000000000000.0,1e-300,null,1e+9999,-1e+9999]"
     );
 }
+
+#[test]
+fn constructs_sorted_objects_and_ordered_arrays() {
+    let array = Value::array_from([Value::Bool(true), Value::Int(-1)]);
+    let object = Value::object_from([
+        ("z", Value::Null),
+        ("a", array.clone()),
+        ("z", Value::string("last")),
+    ]);
+    assert_eq!(object.as_object().map(|entries| entries.len()), Some(2));
+    assert_eq!(object.get("a"), Some(&array));
+    assert_eq!(object.get(b"z").and_then(Value::as_str), Some("last"));
+    assert_eq!(object.get("missing"), None);
+    assert_eq!(
+        array.as_array(),
+        Some([Value::Bool(true), Value::Int(-1)].as_slice())
+    );
+    assert_eq!(array.as_object(), None);
+    assert_eq!(array.get("a"), None);
+    assert_eq!(object.as_array(), None);
+    assert_eq!(
+        Value::object_from([(BString::from(b"\xff".as_slice()), Value::Null)]).get(b"\xff"),
+        Some(&Value::Null)
+    );
+}
+
+#[test]
+fn scalar_accessors_require_matching_types() {
+    assert_eq!(Value::string("é").as_str(), Some("é"));
+    assert_eq!(Value::string(b"\xff".as_slice()).as_str(), None);
+    assert_eq!(
+        Value::string(b"\xff".as_slice()).as_bytes(),
+        Some(b"\xff".as_slice())
+    );
+    assert_eq!(Value::Null.as_bytes(), None);
+    assert_eq!(Value::Int(i64::MIN).as_i64(), Some(i64::MIN));
+    assert_eq!(Value::UInt(i64::MAX as u64).as_i64(), Some(i64::MAX));
+    assert_eq!(Value::UInt(i64::MAX as u64 + 1).as_i64(), None);
+    assert_eq!(Value::Real(1.0).as_i64(), None);
+    assert_eq!(Value::Bool(true).as_i64(), None);
+    assert_eq!(Value::Bool(true).as_bool(), Some(true));
+    assert_eq!(Value::Bool(false).as_bool(), Some(false));
+    assert_eq!(Value::Int(1).as_bool(), None);
+}
+
+#[test]
+fn appends_string_with_jsoncpp_escapes() {
+    let mut out = b"prefix ".to_vec();
+    crate::write_string(&mut out, b"\"\\\0\n\x7f\xc3\xa9");
+    assert_eq!(out, b"prefix \"\\\"\\\\\\u0000\\n\x7f\\u00e9\"");
+}

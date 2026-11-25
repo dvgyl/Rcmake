@@ -59,6 +59,7 @@ mod tests;
 
 pub use configure_log::{FindEvent, TryBuildOutcome, TryCompileEvent, TryRunOutcome};
 pub use cx::Cx;
+pub use env::CxEnv;
 pub use file_lock::FileLockScope;
 pub use hooks::{TraceConfig, TraceFormat, WatchAccess};
 pub use interp::StopReason;
@@ -247,6 +248,31 @@ pub struct InterpConfig {
     /// Script arguments (`CMAKE_ARGV0..N` / `CMAKE_ARGC`): the complete command line,
     /// starting with the `cmake` executable.
     pub script_args: Vec<BString>,
+}
+
+impl InterpConfig {
+    /// Create a configuration with default limits, diagnostics, and services.
+    #[must_use]
+    pub fn new(
+        host: Arc<dyn Host>,
+        mode: RunMode,
+        cmake_root: impl Into<PathBuf>,
+        cmake_command: impl Into<PathBuf>,
+        cwd: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            host,
+            mode,
+            cmake_root: cmake_root.into(),
+            cmake_command: cmake_command.into(),
+            cwd: cwd.into(),
+            limits: Limits::default(),
+            diag: DiagOptions::default(),
+            services: Arc::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        }
+    }
 }
 
 /// Options for [`Cx::include_file`].

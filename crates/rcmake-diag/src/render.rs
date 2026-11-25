@@ -539,7 +539,6 @@ mod tests {
             location: Location::Backtrace(bt),
             body: BString::from("Body."),
         };
-        // The file frame below a command in the same file adds nothing.
         let included = Backtrace::default()
             .push(frame(&lists, 0, None, FrameKind::ModuleInclude))
             .push(frame(&lists, 3, Some("include"), FrameKind::Command))
@@ -556,7 +555,6 @@ mod tests {
                 "CMake Error at inc.cmake:2 (add_custom_target):\n  Body.\nCall Stack (most recent call first):\n  CMakeLists.txt:3 (include)\n\n\n"
             )
         );
-        // A file frame of another file is printed.
         let foreign = Backtrace::default()
             .push(frame(&other, 0, None, FrameKind::ModuleInclude))
             .push(frame(

@@ -5,8 +5,7 @@
 use bstr::BString;
 
 #[derive(Clone, Copy)]
-/// Borrowed lexical view of a `cmake_path` path value: root name, root directory, and
-/// relative part. No filesystem access is made.
+/// Lexical view of the root name, root directory, and relative part of a path.
 pub struct Lexical<'a> {
     raw: &'a [u8],
     root_name_len: usize,
@@ -181,6 +180,11 @@ impl<'a> Lexical<'a> {
         output
     }
 
+    /// Resolve a path against a base and normalize the result.
+    pub fn absolute_from(base: &[u8], path: &[u8]) -> BString {
+        Lexical::new(&Lexical::new(base).append(path)).normalize()
+    }
+
     /// Append `input` with `cmake_path(APPEND)` semantics.
     pub fn append(self, input: &[u8]) -> BString {
         let rhs = Lexical::with_dialect(input, self.windows);
@@ -318,5 +322,20 @@ pub fn native_style(input: &[u8]) -> BString {
             .into()
     } else {
         input.into()
+    }
+}
+
+#[test]
+fn resolves_and_normalizes_absolute_paths() {
+    let root = if cfg!(windows) { "C:" } else { "" };
+    let base = format!("{root}/work/src");
+    for (path, suffix) in [
+        ("../project//file", "/work/project/file"),
+        ("/another/./file", "/another/file"),
+    ] {
+        assert_eq!(
+            Lexical::absolute_from(base.as_bytes(), path.as_bytes()),
+            format!("{root}{suffix}")
+        );
     }
 }
