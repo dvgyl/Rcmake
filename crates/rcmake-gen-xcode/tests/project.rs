@@ -85,6 +85,7 @@ fn resolved(model: &ProjectModel, host: &dyn Host) -> GenerationResult {
         &configs,
         &ResolveOptions {
             provenance: false,
+            generator_facts: None,
             ide: Some(IdeFlavor::Xcode),
         },
     )
@@ -825,6 +826,7 @@ fn applies_ide_facts_and_checks_config_source_lists() {
         &result.configs,
         &ResolveOptions {
             provenance: false,
+            generator_facts: None,
             ide: Some(IdeFlavor::Xcode),
         },
     )

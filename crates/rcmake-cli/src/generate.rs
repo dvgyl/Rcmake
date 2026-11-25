@@ -104,6 +104,7 @@ fn generate(
     };
     let options = ResolveOptions {
         provenance: false,
+        generator_facts: None,
         ide: match kind {
             GeneratorKind::Xcode => Some(IdeFlavor::Xcode),
             GeneratorKind::VisualStudio(_) => Some(IdeFlavor::VisualStudio),

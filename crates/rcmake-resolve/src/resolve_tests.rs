@@ -2078,6 +2078,7 @@ fn xcode_ide_facts_keep_raw_settings_and_resolve_apple_artifacts() -> TestResult
         &configs,
         &ResolveOptions {
             provenance: false,
+            generator_facts: None,
             ide: Some(IdeFlavor::Xcode),
         },
     )?;
@@ -2313,6 +2314,7 @@ fn visual_studio_layout_and_per_configuration_source_union() -> TestResult {
         &[ConfigId("Debug".into()), ConfigId("Release".into())],
         &ResolveOptions {
             provenance: false,
+            generator_facts: None,
             ide: Some(IdeFlavor::VisualStudio),
         },
     )?;
@@ -2401,6 +2403,7 @@ fn xcode_rejects_sources_that_vary_by_configuration() -> TestResult {
         ],
         &ResolveOptions {
             provenance: false,
+            generator_facts: None,
             ide: Some(ide::IdeFlavor::Xcode),
         },
     );
@@ -2454,6 +2457,7 @@ fn default_resolve_keeps_ninja_and_make_layouts() -> TestResult {
             &configs,
             &ResolveOptions {
                 provenance: false,
+                generator_facts: None,
                 ide: None,
             },
         )?;
@@ -2496,6 +2500,7 @@ fn xcode_reports_configuration_with_no_sources_before_link_language_error() -> T
         &[ConfigId("Debug".into()), ConfigId("Release".into())],
         &ResolveOptions {
             provenance: false,
+            generator_facts: None,
             ide: Some(ide::IdeFlavor::Xcode),
         },
     );
@@ -2562,6 +2567,7 @@ fn xcode_uses_root_object_directory_for_subdirectory_targets() -> TestResult {
             std::slice::from_ref(&debug),
             &ResolveOptions {
                 provenance: false,
+                generator_facts: None,
                 ide: Some(IdeFlavor::Xcode),
             },
         )?;
@@ -2608,6 +2614,7 @@ fn xcode_resolves_embed_paths_and_records_per_config_diagnostic() -> TestResult 
     let configs = [ConfigId("Debug".into())];
     let options = ResolveOptions {
         provenance: false,
+        generator_facts: None,
         ide: Some(IdeFlavor::Xcode),
     };
     let result = resolve_with_options(&model, &host, &configs, &options)?;

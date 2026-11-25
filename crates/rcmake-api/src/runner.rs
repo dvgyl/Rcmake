@@ -523,6 +523,7 @@ fn resolve_project(
     let configs = configurations(&result.model, generator);
     let options = ResolveOptions {
         provenance: !matches!(prepared.services.provenance, LedgerLevel::Off),
+        generator_facts: None,
         ide: match generator {
             GeneratorKind::Xcode => Some(IdeFlavor::Xcode),
             GeneratorKind::VisualStudio(_) => Some(IdeFlavor::VisualStudio),

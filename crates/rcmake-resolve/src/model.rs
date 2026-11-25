@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::BString;
@@ -132,13 +133,35 @@ pub struct ResolvedTarget {
     pub ide: Option<Box<ide::IdeFacts>>,
 }
 
+/// Supply build tool capabilities during resolution.
+pub trait GeneratorFacts: Send + Sync {
+    /// Query whether Ninja supports dynamic dependencies for C++ modules.
+    fn ninja_cxx_dyndep(
+        &self,
+        host: &dyn rcmake_host::Host,
+        request: &rcmake_host::RunRequest,
+    ) -> Option<bool>;
+}
+
 /// Options of [`resolve_with_options`](crate::resolve_with_options).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct ResolveOptions {
     /// Compute [`ResolvedTarget::ide`] for this IDE flavor.
     pub ide: Option<ide::IdeFlavor>,
     /// Collect each resolved entry and its dependency path.
     pub provenance: bool,
+    /// Capability source. Without a source, the resolver queries its host.
+    pub generator_facts: Option<Arc<dyn GeneratorFacts>>,
+}
+
+impl std::fmt::Debug for ResolveOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolveOptions")
+            .field("ide", &self.ide)
+            .field("provenance", &self.provenance)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Kind of resolved entry.

@@ -3,7 +3,7 @@ use rcmake_base::{BString, path_lex::Lexical, truth};
 use rcmake_cxxmodules::ModuleVisibility;
 use rcmake_diag::{Location, MessageKind, PolicyId, PolicyStatus};
 use rcmake_genex::ConfigId;
-use rcmake_host::{Host, path::to_native};
+use rcmake_host::{CommandSpec, Host, Input, Output, ProcessResult, RunRequest, path::to_native};
 use rcmake_model::{
     DirId, FileSetKind, GeneratorKind, InstallKind, ProjectModel, Target, TargetId, UsageScope,
 };
@@ -34,42 +34,39 @@ fn scan_rule<'a>(model: &'a ProjectModel, target: &Target) -> Option<&'a BString
 fn generator_supports_scanning(model: &ProjectModel, paths: &SourcePaths<'_>) -> bool {
     match model.generator {
         None | Some(GeneratorKind::VisualStudio(_)) => true,
-        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig) => {
-            paths.ninja_cxx_dyndep.unwrap_or(true)
-        }
+        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig) => paths
+            .ninja_cxx_dyndep
+            .get_or_init(|| ninja_cxx_dyndep(model, paths))
+            .unwrap_or(true),
         _ => false,
     }
 }
 
-pub(crate) fn ninja_cxx_dyndep(model: &ProjectModel, host: &dyn Host) -> Option<bool> {
-    use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest};
-
-    if !matches!(
-        model.generator,
-        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
-    ) {
-        return None;
-    }
+fn ninja_cxx_dyndep(model: &ProjectModel, paths: &SourcePaths<'_>) -> Option<bool> {
     let program = lower::definition(model, DirId::ROOT, b"CMAKE_MAKE_PROGRAM")
         .filter(|program| !truth::is_off(program))?;
-    let result = host
-        .run_bounded(
-            &RunRequest {
-                pipeline: vec![CommandSpec {
-                    program: program.clone(),
-                    args: vec!["--version".into()],
-                }],
-                cwd: to_native(&model.dir(DirId::ROOT).binary_dir),
-                env: host.env_all(),
-                stdin: Input::Null,
-                stdout: Output::Capture,
-                stderr: Output::Capture,
-                timeout: Some(std::time::Duration::from_secs(5)),
-                tee: false,
-            },
-            4096,
-        )
-        .ok()?;
+    let request = RunRequest {
+        pipeline: vec![CommandSpec {
+            program: program.clone(),
+            args: vec!["--version".into()],
+        }],
+        cwd: to_native(&model.dir(DirId::ROOT).binary_dir),
+        env: paths.host.env_all(),
+        stdin: Input::Null,
+        stdout: Output::Capture,
+        stderr: Output::Capture,
+        timeout: Some(std::time::Duration::from_secs(5)),
+        tee: false,
+    };
+    match paths.generator_facts {
+        Some(facts) => facts.ninja_cxx_dyndep(paths.host, &request),
+        None => query_ninja_cxx_dyndep(paths.host, &request),
+    }
+}
+
+/// Run the Ninja version query and check for version 1.11 or later.
+pub fn query_ninja_cxx_dyndep(host: &dyn Host, request: &RunRequest) -> Option<bool> {
+    let result = host.run_bounded(request, 4096).ok()?;
     if result.results != [ProcessResult::Exited(0)] {
         return None;
     }
@@ -250,9 +247,11 @@ pub(crate) fn resolve_module_info(
     unity: Option<&unity::TargetUnity>,
 ) {
     let allows_scanning = allows_module_scanning(model, target, inputs);
-    let by_default = target.policies.policies.get(PolicyId::new(155)) == PolicyStatus::New
-        && generator_supports_scanning(model, paths)
-        && scan_rule(model, target).is_some();
+    let by_default = || {
+        target.policies.policies.get(PolicyId::new(155)) == PolicyStatus::New
+            && scan_rule(model, target).is_some()
+            && generator_supports_scanning(model, paths)
+    };
     let target_setting = target
         .props
         .get(b"CXX_SCAN_FOR_MODULES")
@@ -307,7 +306,7 @@ pub(crate) fn resolve_module_info(
                     sources::properties(dir, &unit.source.value).get(b"CXX_SCAN_FOR_MODULES")
                 })
                 .or(target_setting)
-                .map_or(by_default, |value| truth::is_on(value));
+                .map_or_else(by_default, |value| truth::is_on(value));
         }
     }
     if has_module_sets || resolved.compile_units.iter().any(|unit| unit.scan) {

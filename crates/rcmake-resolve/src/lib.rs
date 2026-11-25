@@ -33,11 +33,12 @@ pub mod lower;
 pub mod progress;
 pub mod usage;
 
+pub use cxx_modules::query_ninja_cxx_dyndep;
 pub use install_manifest::{
     InstallAction, InstallActionKind, InstallEntry, InstallManifest, NamelinkMode, TargetInstaller,
 };
 pub use model::*;
-pub use pipeline::{resolve, resolve_with_options, validate_codegen_name};
+pub use pipeline::{resolve, resolve_with_facts, resolve_with_options, validate_codegen_name};
 
 /// Return `true` when CMake treats `path` as a full path (`cmSystemTools::FileIsFullPath`).
 ///

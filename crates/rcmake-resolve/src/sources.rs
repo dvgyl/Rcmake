@@ -1,6 +1,6 @@
 //! Source paths and their build-time producers.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
@@ -281,7 +281,8 @@ pub(crate) struct SourcePaths<'a> {
     pub(crate) xcframeworks: crate::xcframework::Plists,
     pub(crate) ide: Option<crate::ide::IdeFlavor>,
     pub(crate) collect_source_errors: bool,
-    pub(crate) ninja_cxx_dyndep: Option<bool>,
+    pub(crate) ninja_cxx_dyndep: OnceCell<Option<bool>>,
+    pub(crate) generator_facts: Option<&'a dyn crate::GeneratorFacts>,
     extension_warnings: RefCell<IndexSet<(BString, BString)>>,
     missing: RefCell<IndexSet<(BString, BString)>>,
     /// Rendered generation warnings, so that a repeated evaluation warns once.
@@ -301,7 +302,8 @@ impl<'a> SourcePaths<'a> {
             xcframeworks: crate::xcframework::Plists::default(),
             ide: None,
             collect_source_errors: true,
-            ninja_cxx_dyndep: None,
+            ninja_cxx_dyndep: OnceCell::new(),
+            generator_facts: None,
             extension_warnings: RefCell::default(),
             missing: RefCell::default(),
             warnings: RefCell::default(),

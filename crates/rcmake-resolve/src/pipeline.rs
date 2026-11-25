@@ -52,6 +52,20 @@ pub fn resolve(
     resolve_project(model, host, configs, &ResolveOptions::default(), false)
 }
 
+/// Resolve with a capability source. Return the first missing source as an error.
+pub fn resolve_with_facts(
+    model: &ProjectModel,
+    host: &dyn Host,
+    configs: &[ConfigId],
+    facts: std::sync::Arc<dyn crate::GeneratorFacts>,
+) -> Result<GenerationResult, ResolveError> {
+    let options = ResolveOptions {
+        generator_facts: Some(facts),
+        ..Default::default()
+    };
+    resolve_project(model, host, configs, &options, false)
+}
+
 /// Resolve and lower the project in configuration order, with `options`.
 /// Use `CMAKE_BUILD_TYPE` if `configs` is empty.
 /// Report missing sources with their call stacks before returning an error.
@@ -106,7 +120,7 @@ fn resolve_project(
     crate::InstallManifest::validate_bmi_destinations(model, &configs, host)?;
     let mut paths = SourcePaths::new(host);
     paths.ide = options.ide;
-    paths.ninja_cxx_dyndep = crate::cxx_modules::ninja_cxx_dyndep(model, host);
+    paths.generator_facts = options.generator_facts.as_deref();
     paths.collect_source_errors = collect_source_errors;
     for (dir, _) in model.dirs().filter(|(id, _)| lower::is_darwin(model, *id)) {
         lower::apple::arch::sdk_map(model, dir)?;
