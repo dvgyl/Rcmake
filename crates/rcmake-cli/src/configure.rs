@@ -19,6 +19,7 @@ use crate::persona::{
 use crate::profile::ProfilePhase;
 use crate::{cache, emit_cli_error, new_interp_with_paths, presets};
 
+mod cache_glob;
 mod cache_setup;
 mod diagnostics;
 mod graphviz;
@@ -29,6 +30,7 @@ mod speed;
 #[cfg(test)]
 mod tests;
 
+use cache_glob::CacheGlob;
 use graphviz::write_graphviz;
 use preloads::Preloads;
 use profiling::Profilers;
@@ -788,44 +790,26 @@ fn set_directory_vars(interp: &mut Interp, src: &Path, bin: &Path) {
     cx.set_var(b"CMAKE_CURRENT_BINARY_DIR", binary);
 }
 
-fn remove_entries(interp: &mut Interp, pattern: &[u8], tracked: &mut BTreeSet<BString>) {
+/// Remove the non-`STATIC` cache entries that `pattern` matches and return
+/// their names.
+fn remove_entries(
+    interp: &mut Interp,
+    pattern: &CacheGlob,
+    tracked: &mut BTreeSet<BString>,
+) -> Vec<BString> {
     let mut cx = interp.cx();
     let names: Vec<_> = cx
         .cache()
         .iter()
-        .filter(|(name, entry)| entry.ty != CacheType::Static && matches_glob(pattern, name))
+        .filter(|(name, entry)| entry.ty != CacheType::Static && pattern.matches(name))
         .map(|(name, _)| name.clone())
         .collect();
     for name in &names {
         cx.cache().remove(name);
         tracked.remove(name);
     }
-    interp.untrack_variable_reads(names);
-}
-
-pub(crate) fn matches_glob(mut pattern: &[u8], mut name: &[u8]) -> bool {
-    let mut wildcard = None;
-    while let Some((byte, tail)) = name.split_first() {
-        match pattern.split_first() {
-            Some((b'*', rest)) => {
-                wildcard = Some((rest, name));
-                pattern = rest;
-            }
-            Some((matched, rest)) if matched == byte || *matched == b'?' => {
-                pattern = rest;
-                name = tail;
-            }
-            _ => {
-                let Some((rest, [_, next @ ..])) = wildcard else {
-                    return false;
-                };
-                name = next;
-                pattern = rest;
-                wildcard = Some((rest, next));
-            }
-        }
-    }
-    pattern.iter().all(|byte| *byte == b'*')
+    interp.untrack_variable_reads(names.iter().cloned());
+    names
 }
 
 fn list_cache(host: &dyn Host, interp: &mut Interp, list: &options::ListCache) {

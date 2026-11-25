@@ -319,11 +319,44 @@ fn unavailable(
     }
 }
 
+/// A preset cache definition as the verbose report prints it.
+pub(crate) type ReportEntry = (Option<CacheType>, BString);
+
 #[derive(Default)]
 pub(crate) struct Application {
     pub binary: Option<PathBuf>,
     pub warnings: Vec<BString>,
-    pub log: String,
+    /// Number of preset definitions at the front of `Options::cache_edits`.
+    pub definitions: usize,
+    /// Preset cache definitions that no later `-D` or `-U` has replaced.
+    pub report: BTreeMap<BString, ReportEntry>,
+    /// Pre-rendered `Preset environment variables:` section.
+    pub environment: String,
+    /// `true` when the log level is verbose or more, so the report prints.
+    pub verbose: bool,
+}
+
+impl Application {
+    /// Render the preset report with the definitions that remain in `report`.
+    pub(crate) fn render_report(&self, report: &BTreeMap<BString, ReportEntry>) -> String {
+        if !self.verbose {
+            return String::new();
+        }
+        let mut log = String::new();
+        if !report.is_empty() {
+            log.push_str("Preset CMake variables:\n\n");
+            for (name, (ty, value)) in report {
+                log.push_str(&format!("  {name}"));
+                if let Some(ty) = ty {
+                    log.push_str(&format!(":{}", ty.as_str()));
+                }
+                log.push_str(&format!("=\"{value}\"\n"));
+            }
+            log.push('\n');
+        }
+        log.push_str(&self.environment);
+        log
+    }
 }
 
 pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<Application, i32> {
@@ -418,56 +451,37 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
             definitions.insert(name.into(), (Some(ty), value.clone()));
         }
     }
-    for edit in &opts.cache_edits {
-        if let CacheEdit::Define(def) = edit {
-            definitions.remove(&def.name);
-        }
-    }
-    let report: Vec<_> = definitions
-        .iter()
-        .filter(|(name, _)| {
-            !opts.cache_edits.iter().any(|edit| {
-                matches!(edit, CacheEdit::Remove(pattern) if crate::configure::matches_glob(pattern, name))
-            })
-        })
-        .collect();
-    let mut log = String::new();
-    if !report.is_empty() {
-        log.push_str("Preset CMake variables:\n\n");
-        for (name, (ty, value)) in report {
-            log.push_str(&format!("  {name}"));
-            if let Some(ty) = ty {
-                log.push_str(&format!(":{}", ty.as_str()));
-            }
-            log.push_str(&format!("=\"{value}\"\n"));
-        }
-        log.push('\n');
-    }
+    let mut environment = String::new();
     if resolved.environment.values().any(Option::is_some) {
-        log.push_str("Preset environment variables:\n\n");
+        environment.push_str("Preset environment variables:\n\n");
         for (key, value) in &resolved.environment {
             if let Some(value) = value {
-                log.push_str(&format!("  {key}=\"{value}\"\n"));
+                environment.push_str(&format!("  {key}=\"{value}\"\n"));
             }
         }
-        log.push('\n');
+        environment.push('\n');
     }
-    if !opts
+    let verbose = opts
         .log_level
-        .is_some_and(|level| level >= LogLevel::Verbose)
-    {
-        log.clear();
-    }
+        .is_some_and(|level| level >= LogLevel::Verbose);
     for (key, value) in resolved.environment {
         if let Some(value) = value {
             host.env_set(&key, Some(&value));
         }
     }
+    // CMake applies every preset definition before the command-line cache
+    // arguments. Later `-D` and `-U` arguments erase entries from the report
+    // when they apply.
+    let count = definitions.len();
     opts.cache_edits.splice(
         0..0,
-        definitions
-            .into_iter()
-            .map(|(name, (ty, value))| CacheEdit::Define(CacheDefine { name, ty, value })),
+        definitions.iter().map(|(name, (ty, value))| {
+            CacheEdit::Define(CacheDefine {
+                name: name.clone(),
+                ty: *ty,
+                value: value.clone(),
+            })
+        }),
     );
     if opts.graphviz.is_none() {
         opts.graphviz = settings
@@ -554,7 +568,10 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
     Ok(Application {
         binary,
         warnings: warning_flags(&settings),
-        log,
+        definitions: count,
+        report: definitions,
+        environment,
+        verbose,
     })
 }
 

@@ -13,8 +13,8 @@ use crate::options::{self, CacheEdit};
 use crate::{emit_cli_error, new_interp_with_paths};
 
 use super::{
-    ConfigureSession, diagnostics, initialize_diagnostics, is_file, remove_entries,
-    set_directory_vars, unused_cli,
+    ConfigureSession, cache_glob::CacheGlob, diagnostics, initialize_diagnostics, is_file,
+    remove_entries, set_directory_vars, unused_cli,
 };
 
 #[derive(Default)]
@@ -36,10 +36,17 @@ impl ConfigureSession<'_> {
         let host = self.host.as_ref();
         let mut preloads = Preloads::default();
         let mut configured_diagnostics = false;
-        for edit in self.opts.cache_edits.clone() {
+        // Preset definitions come first. A later `-D` erases its name from
+        // the preset report even when the value does not change. A later
+        // `-U` erases only the entries that it removes.
+        let mut report = self.preset.report.clone();
+        for (index, edit) in self.opts.cache_edits.clone().into_iter().enumerate() {
             match edit {
                 CacheEdit::Define(def) => {
                     let name = def.name.clone();
+                    if index >= self.preset.definitions {
+                        report.remove(&name);
+                    }
                     diagnostics::warn_legacy_define(host, &name);
                     if unused_cli::apply_define(interp.cx().cache(), def)
                         && preloads.tracked.insert(name.clone())
@@ -48,7 +55,10 @@ impl ConfigureSession<'_> {
                     }
                 }
                 CacheEdit::Remove(pattern) => {
-                    remove_entries(interp, &pattern, &mut preloads.tracked)
+                    let pattern = CacheGlob::new(&pattern);
+                    for name in remove_entries(interp, &pattern, &mut preloads.tracked) {
+                        report.remove(&name);
+                    }
                 }
                 CacheEdit::Preload(script) => {
                     if !configured_diagnostics {
@@ -81,8 +91,9 @@ impl ConfigureSession<'_> {
         if !configured_diagnostics {
             self.apply_diagnostics(interp);
         }
-        if !self.preset.log.is_empty() {
-            options::out(host, &self.preset.log);
+        let log = self.preset.render_report(&report);
+        if !log.is_empty() {
+            options::out(host, &log);
         }
         for (index, dir) in [&self.src, &self.bin].into_iter().enumerate() {
             if runtime.denied() || (index == 1 && self.src == self.bin) {

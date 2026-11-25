@@ -11,7 +11,7 @@ use std::path::Path;
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_gen_common::{GenError, write_if_changed};
 use rcmake_host::{FileKind, Follow, Host, SystemInfo, path::from_native};
-use rcmake_model::{DirId, ParsedToolset, ProjectModel, VsVersion};
+use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, VsVersion};
 use rcmake_resolve::GenerationResult;
 
 use plan::Project;
@@ -65,7 +65,31 @@ pub fn generate(
     host: &dyn Host,
     bin: &Path,
 ) -> Result<(), GenError> {
+    generate_with_restore_requirements(version, result, model, host, bin).map(drop)
+}
+
+/// Write the Visual Studio files and return the names of the projects that
+/// need a NuGet package restore before a build.
+///
+/// A project needs a restore when its target or a direct project dependency
+/// has `VS_PACKAGE_REFERENCES`. The caller stores
+/// `<name>_REQUIRES_VS_PACKAGE_RESTORE` in the cache for each returned name.
+///
+/// # Errors
+///
+/// Returns an error if the project data is invalid or the host cannot write a file.
+pub fn generate_with_restore_requirements(
+    version: VsVersion,
+    result: &GenerationResult,
+    model: &ProjectModel,
+    host: &dyn Host,
+    bin: &Path,
+) -> Result<Vec<String>, GenError> {
     let plan = plan::plan(version, result, model, host, bin)?;
+    // The `ZERO_CHECK` pre-build event runs the glob verification script.
+    // Write it before the projects so that the first build finds it.
+    let verify_globs =
+        plan.regenerate && rcmake_gen_common::glob::write_verification(Some(model), bin, host)?;
     for project in &plan.projects {
         let facts = project.target.and_then(|id| plan.resolved.get(&id));
         let context = vcxproj::Context {
@@ -80,7 +104,11 @@ pub fn generate(
         write_project(host, &context)?;
     }
     if plan.regenerate {
-        let list = format!("{}\n", plan.inputs.join("\n"));
+        let mut list = format!("{}\n", plan.inputs.join("\n"));
+        if verify_globs {
+            list.push_str(&join(&plan.settings.bin, rcmake_gen_common::glob::STAMP));
+            list.push('\n');
+        }
         write(
             host,
             &join(&plan.settings.bin, "CMakeFiles/generate.stamp.depend"),
@@ -107,7 +135,41 @@ pub fn generate(
             data.as_bytes(),
         )?;
     }
-    Ok(())
+    Ok(restore_requirements(&plan.projects, model))
+}
+
+/// Target property that lists NuGet packages as `<name>_<version>` items.
+pub(crate) const PACKAGE_REFERENCES: &[u8] = b"VS_PACKAGE_REFERENCES";
+
+/// Return `true` when a target declares NuGet package references.
+pub(crate) fn has_package_references(target: &Target) -> bool {
+    target
+        .props
+        .get(PACKAGE_REFERENCES)
+        .is_some_and(|value| !value.is_empty())
+}
+
+/// Names of the projects whose target, or a direct project dependency of
+/// it, has package references.
+fn restore_requirements(projects: &[Project], model: &ProjectModel) -> Vec<String> {
+    let references = |project: &Project| {
+        project
+            .target
+            .and_then(|id| model.target(id))
+            .is_some_and(has_package_references)
+    };
+    projects
+        .iter()
+        .filter(|project| {
+            references(project)
+                || project
+                    .dependencies
+                    .iter()
+                    .filter_map(|&index| projects.get(index))
+                    .any(references)
+        })
+        .map(|project| project.name.clone())
+        .collect()
 }
 
 fn write_project(host: &dyn Host, context: &vcxproj::Context<'_>) -> Result<(), GenError> {

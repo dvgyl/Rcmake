@@ -447,35 +447,22 @@ fn new_interp_with_paths(
     interp
 }
 
+/// Parse a command-line `-D` definition with the shared cache-entry rules.
+///
+/// An untyped definition needs a name. An unknown type text gives `STRING`,
+/// as in `cmState::StringToCacheEntryType`.
 fn parse_define(raw: &[u8]) -> Option<CacheDefine> {
-    let eq = raw.iter().position(|&b| b == b'=')?;
-    let lhs = raw.get(..eq)?;
-    if lhs.is_empty() {
+    let parsed = cache::parse_definition(raw)?;
+    if parsed.ty.is_none() && parsed.name.is_empty() {
         return None;
     }
-    let value = raw.get(eq + 1..)?;
-    let trimmed = value
-        .iter()
-        .rposition(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
-        .and_then(|end| value.get(..=end))
-        .unwrap_or(value);
-    let value = BString::from(
-        trimmed
-            .strip_prefix(b"'")
-            .and_then(|inner| inner.strip_suffix(b"'"))
-            .unwrap_or(trimmed),
-    );
-    if let Some(colon) = lhs.iter().position(|&b| b == b':') {
-        let name = BString::from(lhs.get(..colon)?);
-        let ty = CacheType::parse(lhs.get(colon + 1..).unwrap_or(&[]));
-        Some(CacheDefine { name, ty, value })
-    } else {
-        Some(CacheDefine {
-            name: BString::from(lhs),
-            ty: None,
-            value,
-        })
-    }
+    Some(CacheDefine {
+        name: BString::from(parsed.name),
+        ty: parsed
+            .ty
+            .map(|text| CacheType::parse(text).unwrap_or(CacheType::String)),
+        value: BString::from(parsed.value),
+    })
 }
 
 fn apply_warning_flag(flag: &[u8], state: &mut DiagState) -> bool {
@@ -669,6 +656,38 @@ mod tests {
             let definition = parse_define(argument).expect("valid definition");
             assert_eq!(definition.value.as_slice(), expected);
         }
+    }
+
+    #[test]
+    fn parse_define_keeps_quoted_key_and_value_bytes() {
+        let cases: [(&[u8], &[u8], Option<CacheType>, &[u8]); 12] = [
+            (
+                b"\"a:b=c\":STRING=v",
+                b"a:b=c",
+                Some(CacheType::String),
+                b"v",
+            ),
+            // The typed form wins, as in CMake: the name is `"a`.
+            (b"\"a:b=c\"=v", b"\"a", Some(CacheType::String), b"c\"=v"),
+            (b"\"q=r\"=x=y", b"q=r", None, b"x=y"),
+            (b"K:PATH='  x  ' \t", b"K", Some(CacheType::Path), b"  x  "),
+            (b"K=  x \t\r", b"K", None, b"  x"),
+            (b"K:BOOL=   ", b"K", Some(CacheType::Bool), b"   "),
+            (b"K=", b"K", None, b""),
+            (b"K='x", b"K", None, b"'x"),
+            (b"K=a'b'c", b"K", None, b"a'b'c"),
+            (b"K=B:C=D", b"K", None, b"B:C=D"),
+            (b":STRING=x", b"", Some(CacheType::String), b"x"),
+            (b"\"un:closed=v", b"\"un", Some(CacheType::String), b"v"),
+        ];
+        for (argument, name, ty, value) in cases {
+            let definition = parse_define(argument).expect("valid definition");
+            assert_eq!(definition.name.as_slice(), name);
+            assert_eq!(definition.ty, ty);
+            assert_eq!(definition.value.as_slice(), value);
+        }
+        assert!(parse_define(b"=x").is_none());
+        assert!(parse_define(b"NOVALUE").is_none());
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rcmake_base::BString;
+use rcmake_base::{BString, list};
 use rcmake_eval::RunMode;
 use rcmake_host::{Host, Stream, discover_cmake_root, path};
 
@@ -95,9 +95,14 @@ fn parse(args: &[BString], host: &dyn Host) -> Result<Options, ParseError> {
                 permissions(value()?).ok_or(ParseError::Permissions)?,
             ),
             b"--component" => {
-                opts.components.push(value()?.into());
-                opts.components
-                    .extend(std::iter::from_fn(|| take_value(&mut args)).map(BString::from));
+                // Each value is a CMake list of component names.
+                let first = value()?;
+                for value in
+                    std::iter::once(first).chain(std::iter::from_fn(|| take_value(&mut args)))
+                {
+                    opts.components
+                        .extend(list::split(value, list::Empty::Drop));
+                }
                 continue;
             }
             b"--parallel" | b"-j" => {
@@ -257,4 +262,38 @@ fn install(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_base::BString;
+    use rcmake_host::PureHost;
+
+    use super::{ParseError, parse};
+
+    fn components(args: &[&str]) -> Vec<String> {
+        let args: Vec<BString> = args.iter().copied().map(BString::from).collect();
+        match parse(&args, &PureHost::default()) {
+            Ok(opts) => opts.components.iter().map(ToString::to_string).collect(),
+            Err(ParseError::Usage(message)) => panic!("usage error: {message}"),
+            Err(ParseError::Permissions) => panic!("permissions error"),
+        }
+    }
+
+    #[test]
+    fn install_component_arguments_split_cmake_lists() {
+        assert_eq!(
+            components(&["build", "--component", "Runtime;Development", "Docs"]),
+            ["Runtime", "Development", "Docs"]
+        );
+        assert_eq!(
+            components(&["build", "--component=A;;B", "--component", "C", "--strip"]),
+            ["A", "B", "C"]
+        );
+        assert_eq!(
+            components(&["build", "--component", r"a\;b", "[x;y]"]),
+            ["a;b", "[x;y]"]
+        );
+        assert!(components(&["build", "--component", ";"]).is_empty());
+    }
 }

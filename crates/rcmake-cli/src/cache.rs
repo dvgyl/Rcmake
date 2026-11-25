@@ -90,26 +90,100 @@ pub(crate) fn load(host: &dyn Host, dir: &Path) -> HostResult<Cache> {
     Ok(entries)
 }
 
+/// Parse one `CMakeCache.txt` record as `cmCacheManager::LoadCache` does.
+///
+/// An untyped record gets `UNINITIALIZED`. An unknown type text gets
+/// `STRING`, as in `cmState::StringToCacheEntryType`.
 fn parse_entry(line: &[u8]) -> Option<(&[u8], CacheType, &[u8])> {
     if line.starts_with(b"#") || line.starts_with(b"//") {
         return None;
     }
-    let (name, typed_value) = if let Some(quoted) = line.strip_prefix(b"\"") {
-        let end = quoted.iter().position(|b| *b == b'"')?;
-        let (name, tail) = quoted.split_at(end);
-        (name, tail.strip_prefix(b"\":")?)
-    } else {
-        let colon = line.iter().position(|b| *b == b':')?;
-        (line.get(..colon)?, line.get(colon + 1..)?)
+    let entry = parse_definition(line)?;
+    let ty = entry.ty.map_or(CacheType::Uninitialized, |text| {
+        CacheType::parse(text).unwrap_or(CacheType::String)
+    });
+    Some((entry.name, ty, entry.value))
+}
+
+/// A cache definition split as `cmState::ParseCacheEntry` splits it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Definition<'a> {
+    /// Entry name, without the enclosing double quotes of a quoted name.
+    pub(crate) name: &'a [u8],
+    /// Type text between `:` and `=`, or `None` for `NAME=VALUE`.
+    pub(crate) ty: Option<&'a [u8]>,
+    /// Value after the trim and quote rules.
+    pub(crate) value: &'a [u8],
+}
+
+/// Split `NAME:TYPE=VALUE`, `"NAME":TYPE=VALUE`, `NAME=VALUE`, or
+/// `"NAME"=VALUE`.
+///
+/// A quoted name can contain `:` and `=`. An unquoted typed name ends at
+/// its first `:` and cannot contain `=`. An unquoted untyped name ends at the
+/// first `=`. The value loses trailing spaces, tabs, and carriage returns,
+/// unless it contains only those bytes. Then one enclosing pair of single
+/// quotes is removed.
+pub(crate) fn parse_definition(entry: &[u8]) -> Option<Definition<'_>> {
+    parse_typed(entry).or_else(|| parse_untyped(entry))
+}
+
+fn parse_typed(entry: &[u8]) -> Option<Definition<'_>> {
+    let quoted = quoted_name(entry).and_then(|(name, rest)| {
+        let typed = rest.strip_prefix(b":")?;
+        typed.contains(&b'=').then_some((name, typed))
+    });
+    let (name, typed) = match quoted {
+        Some(found) => found,
+        None => {
+            let end = entry.iter().position(|b| matches!(b, b'=' | b':'))?;
+            if entry.get(end) != Some(&b':') {
+                return None;
+            }
+            (entry.get(..end)?, entry.get(end + 1..)?)
+        }
     };
-    let eq = typed_value.iter().position(|b| *b == b'=')?;
-    let ty = CacheType::parse(typed_value.get(..eq)?)?;
-    let value = typed_value.get(eq + 1..)?.trim_ascii_end();
-    let value = value
-        .strip_prefix(b"'")
-        .and_then(|v| v.strip_suffix(b"'"))
+    let eq = typed.iter().position(|b| *b == b'=')?;
+    Some(Definition {
+        name,
+        ty: Some(typed.get(..eq)?),
+        value: clean_value(typed.get(eq + 1..)?),
+    })
+}
+
+fn parse_untyped(entry: &[u8]) -> Option<Definition<'_>> {
+    let (name, value) =
+        match quoted_name(entry).and_then(|(name, rest)| Some((name, rest.strip_prefix(b"=")?))) {
+            Some(found) => found,
+            None => {
+                let eq = entry.iter().position(|b| *b == b'=')?;
+                (entry.get(..eq)?, entry.get(eq + 1..)?)
+            }
+        };
+    Some(Definition {
+        name,
+        ty: None,
+        value: clean_value(value),
+    })
+}
+
+/// Split `"NAME"REST` into `NAME` and `REST`.
+fn quoted_name(entry: &[u8]) -> Option<(&[u8], &[u8])> {
+    let inner = entry.strip_prefix(b"\"")?;
+    let end = inner.iter().position(|b| *b == b'"')?;
+    Some((inner.get(..end)?, inner.get(end + 1..)?))
+}
+
+fn clean_value(value: &[u8]) -> &[u8] {
+    let trimmed = value
+        .iter()
+        .rposition(|byte| !matches!(byte, b' ' | b'\t' | b'\r'))
+        .and_then(|last| value.get(..=last))
         .unwrap_or(value);
-    Some((name, ty, value))
+    match trimmed {
+        [b'\'', inner @ .., b'\''] => inner,
+        _ => trimmed,
+    }
 }
 
 pub(crate) fn apply(cache: &mut Cache, def: CacheDefine) {
@@ -262,4 +336,39 @@ fn write_entry(data: &mut BString, name: &[u8], ty: CacheType, value: &[u8]) {
 
 pub(crate) fn sorted(cache: &Cache) -> BTreeMap<&BString, &CacheEntry> {
     cache.iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_model::CacheType;
+
+    use super::parse_entry;
+
+    #[test]
+    fn cache_records_use_the_command_line_entry_rules() {
+        let cases: [(&[u8], &[u8], CacheType, &[u8]); 7] = [
+            (
+                b"\"K:EY=1\":STRING='  sp  '",
+                b"K:EY=1",
+                CacheType::String,
+                b"  sp  ",
+            ),
+            (
+                b"A=B:STRING=v",
+                b"A",
+                CacheType::Uninitialized,
+                b"B:STRING=v",
+            ),
+            (b"FOO=bar", b"FOO", CacheType::Uninitialized, b"bar"),
+            (b"X:BOGUS=1", b"X", CacheType::String, b"1"),
+            (b"SP:STRING=  x  \t", b"SP", CacheType::String, b"  x"),
+            (b"Q:STRING=' q '", b"Q", CacheType::String, b" q "),
+            (b"W:STRING=   ", b"W", CacheType::String, b"   "),
+        ];
+        for (line, name, ty, value) in cases {
+            assert_eq!(parse_entry(line), Some((name, ty, value)));
+        }
+        assert_eq!(parse_entry(b"# comment=1"), None);
+        assert_eq!(parse_entry(b"NOVALUE"), None);
+    }
 }

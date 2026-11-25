@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use rcmake_base::BString;
+use rcmake_base::{BString, list};
 use rcmake_gen_common::ide::{BuildRequest, Jobs as BuildJobs};
 use rcmake_host::{
     CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, Stream, path,
 };
 use rcmake_model::GeneratorKind;
-use rcmake_presets::{BuildSettings, EnvSnapshot, PresetKind, PresetSettings, ResolvedPreset};
+use rcmake_presets::{
+    BuildSettings, EnvSnapshot, PackageReferences, PresetKind, PresetSettings, ResolvedPreset,
+};
 
 use crate::options::{split_flag, take_value, unknown_mode_option};
 use crate::presets::{self, Listing};
@@ -69,6 +71,9 @@ struct Options {
     clean_first: bool,
     verbose: bool,
     native: Vec<BString>,
+    /// `--resolve-package-references`, or the preset value when it is absent.
+    /// Only the Visual Studio generators use it.
+    resolve_packages: Option<PackageReferences>,
 }
 
 #[derive(Clone, Copy)]
@@ -194,22 +199,28 @@ fn parse(host: &dyn Host, args: &[BString]) -> Result<Options, String> {
             }
             b"--config" => opts.config = Some(required(None)?.into()),
             b"--target" | b"-t" => {
-                opts.targets.push(required(None)?.into());
-                while let Some(target) = take_value(&mut args) {
-                    opts.targets.push(target.into());
+                // Each value is a CMake list of target names.
+                let first = required(None)?;
+                for value in
+                    std::iter::once(first).chain(std::iter::from_fn(|| take_value(&mut args)))
+                {
+                    opts.targets.extend(list::split(value, list::Empty::Drop));
                 }
             }
             b"--resolve-package-references" => {
-                if !inline
-                    .or_else(|| take_value(&mut args))
-                    .is_some_and(|mode| {
-                        [b"on".as_slice(), b"only", b"off"]
-                            .iter()
-                            .any(|value| value.eq_ignore_ascii_case(mode))
-                    })
-                {
+                let mode = inline.or_else(|| take_value(&mut args)).and_then(|mode| {
+                    [
+                        (b"on".as_slice(), PackageReferences::On),
+                        (b"only", PackageReferences::Only),
+                        (b"off", PackageReferences::Off),
+                    ]
+                    .into_iter()
+                    .find_map(|(name, value)| name.eq_ignore_ascii_case(mode).then_some(value))
+                });
+                let Some(mode) = mode else {
                     return Err(String::new());
-                }
+                };
+                opts.resolve_packages = Some(mode);
             }
             b"--clean-first" if inline.is_none() => opts.clean_first = true,
             b"-v" | b"--verbose" if inline.is_none() => opts.verbose = true,
@@ -221,7 +232,9 @@ fn parse(host: &dyn Host, args: &[BString]) -> Result<Options, String> {
 
 impl Options {
     fn apply_preset(&mut self, settings: BuildSettings) -> Result<(), &'static str> {
-        if self.jobs.is_none()
+        // The preset fills a parallel level that the command line and the
+        // environment leave unset or at the native default.
+        if matches!(self.jobs, None | Some(Jobs::Default))
             && let Some(count) = settings.jobs
         {
             let jobs = match i32::try_from(count) {
@@ -238,9 +251,14 @@ impl Options {
             self.config = settings.configuration;
         }
         self.clean_first |= settings.clean_first.unwrap_or(false);
+        if self.resolve_packages.is_none() {
+            self.resolve_packages = settings.resolve_package_references;
+        }
         self.verbose |= settings.verbose.unwrap_or(false);
-        if let Some(mut native) = settings.native_tool_options {
-            native.append(&mut self.native);
+        // Native tool arguments from the command line replace the preset list.
+        if self.native.is_empty()
+            && let Some(native) = settings.native_tool_options
+        {
             self.native = native;
         }
         Ok(())
@@ -324,7 +342,9 @@ pub(crate) fn run(argv: &[BString], args: &[BString], host: &dyn Host) -> i32 {
     let Some(dir) = opts.dir.as_deref() else {
         return usage(host, "");
     };
-    if opts.targets.len() > 1 && opts.targets.iter().any(|target| target == b"clean") {
+    if opts.targets.iter().any(|target| target == b"clean")
+        && opts.targets.iter().any(|target| target != b"clean")
+    {
         return usage(
             host,
             "Error: Building 'clean' and other targets together is not supported.",
@@ -361,13 +381,14 @@ fn dispatch(
             &format!("{} is not a directory", path::from_native_cmake(dir)),
         );
     }
+    let cache_dir = cache_dir(host, dir);
     if !host
-        .metadata(&dir.join("CMakeCache.txt"), Follow::Yes)
+        .metadata(&cache_dir.join("CMakeCache.txt"), Follow::Yes)
         .is_ok_and(|meta| meta.kind == FileKind::File)
     {
         return error(host, "not a CMake build directory (missing CMakeCache.txt)");
     }
-    let Ok(cache) = cache::load(host, dir) else {
+    let Ok(cache) = cache::load(host, &cache_dir) else {
         return error(host, "could not load cache");
     };
     let Some(generator) = cache.get(b"CMAKE_GENERATOR") else {
@@ -416,7 +437,12 @@ fn dispatch(
         #[cfg(any(target_os = "macos", feature = "xcode-cross"))]
         GeneratorKind::Xcode => rcmake_gen_xcode::build_commands(&request),
         #[cfg(any(windows, feature = "vs-cross"))]
-        GeneratorKind::VisualStudio(_) => rcmake_gen_vs::build_commands(&request, host),
+        GeneratorKind::VisualStudio(_) => rcmake_gen_vs::build::build_commands_with_restore(
+            &request,
+            restore_mode(opts.resolve_packages),
+            &cache,
+            host,
+        ),
         #[cfg(not(any(target_os = "macos", feature = "xcode-cross")))]
         GeneratorKind::Xcode => {
             return error(
@@ -472,6 +498,35 @@ fn dispatch(
         }
     }
     exit
+}
+
+/// Return the directory whose `CMakeCache.txt` a build of `requested` uses.
+///
+/// This is `cmake::FindCacheFile`: when `requested` has no cache but has a
+/// `CMakeFiles` directory, the nearest ancestor with a cache is used. The
+/// build itself still runs in `requested`.
+fn cache_dir(host: &dyn Host, requested: &Path) -> PathBuf {
+    let exists = |path: &Path| host.metadata(path, Follow::Yes).is_ok();
+    if exists(&requested.join("CMakeCache.txt")) || !exists(&requested.join("CMakeFiles")) {
+        return requested.to_path_buf();
+    }
+    requested
+        .ancestors()
+        .skip(1)
+        .find(|dir| exists(&dir.join("CMakeCache.txt")))
+        .unwrap_or(requested)
+        .to_path_buf()
+}
+
+#[cfg(any(windows, feature = "vs-cross"))]
+fn restore_mode(mode: Option<PackageReferences>) -> rcmake_gen_vs::build::RestoreMode {
+    use rcmake_gen_vs::build::RestoreMode;
+    match mode {
+        None => RestoreMode::Default,
+        Some(PackageReferences::On) => RestoreMode::On,
+        Some(PackageReferences::Off) => RestoreMode::Off,
+        Some(PackageReferences::Only) => RestoreMode::Only,
+    }
 }
 
 fn run_native(host: &dyn Host, request: &RunRequest) -> CommandExit {

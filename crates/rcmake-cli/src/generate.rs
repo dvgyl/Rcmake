@@ -176,13 +176,16 @@ fn generate(
             Some(generated)
         }
         #[cfg(any(windows, feature = "vs-cross"))]
-        GeneratorKind::VisualStudio(version) => Some(rcmake_gen_vs::generate(
-            version,
-            &result,
-            interp.cx().project(),
-            host,
-            bin,
-        )),
+        GeneratorKind::VisualStudio(version) => {
+            let generated = rcmake_gen_vs::generate_with_restore_requirements(
+                version,
+                &result,
+                interp.cx().project(),
+                host,
+                bin,
+            );
+            Some(generated.map(|names| record_package_restore(interp.cx().cache(), &names)))
+        }
         #[cfg(not(any(target_os = "macos", feature = "xcode-cross")))]
         GeneratorKind::Xcode => {
             return Err(format!("Could not create named generator {}", kind.name()).into());
@@ -245,6 +248,26 @@ fn generate(
         }
         Err(GenError::Unimplemented(_)) => Ok(false),
         Err(err) => Err(err.to_string().into()),
+    }
+}
+
+/// Store `<project>_REQUIRES_VS_PACKAGE_RESTORE` for the projects that need a
+/// NuGet restore, as `cmVisualStudio10TargetGenerator::UpdateCache` does.
+/// CMake only sets these entries. It does not remove an entry when the
+/// package references go away.
+#[cfg(any(windows, feature = "vs-cross"))]
+fn record_package_restore(cache: &mut rcmake_model::Cache, names: &[String]) {
+    for name in names {
+        let key = format!("{name}{}", rcmake_gen_vs::build::RESTORE_SUFFIX);
+        crate::cache::insert(
+            cache,
+            key.as_bytes(),
+            "ON".into(),
+            Some(rcmake_model::CacheType::Static),
+        );
+        if let Some(entry) = cache.get_mut(key.as_bytes()) {
+            entry.help = "Value Computed by CMake".into();
+        }
     }
 }
 

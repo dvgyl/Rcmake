@@ -7,29 +7,36 @@ use rcmake_host::{
 };
 use rcmake_model::{Cache, CacheType};
 
-use super::{Exit, GENERATOR, HOME_DIR, matches_glob};
+use super::{Exit, GENERATOR, HOME_DIR, cache_glob::CacheGlob};
 use crate::{cache, options::CacheEdit};
 
+/// Delete the cache for `--fresh`.
+///
+/// CMake removes `CMakeFiles` only when it removed `CMakeCache.txt`. A
+/// missing cache is not an error and leaves `CMakeFiles` in place. A
+/// `CMakeFiles` symlink is removed without following it.
 pub(super) fn clear(host: &dyn Host, bin: &Path) -> rcmake_host::HostResult<()> {
-    let ignore_missing = |result: rcmake_host::HostResult<()>| {
-        result.or_else(|err| {
-            if err.kind == std::io::ErrorKind::NotFound {
-                Ok(())
-            } else {
-                Err(err)
-            }
-        })
-    };
-    ignore_missing(host.remove_file(&bin.join("CMakeCache.txt")))?;
+    match host.remove_file(&bin.join("CMakeCache.txt")) {
+        Ok(()) => {}
+        Err(err) if err.kind == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    }
     let files = bin.join("CMakeFiles");
-    if host
+    let removed = if host
         .metadata(&files, Follow::No)
         .is_ok_and(|m| m.kind == FileKind::Symlink)
     {
-        ignore_missing(host.remove_file(&files))
+        host.remove_file(&files)
     } else {
-        ignore_missing(host.remove_dir_all(&files))
-    }
+        host.remove_dir_all(&files)
+    };
+    removed.or_else(|err| {
+        if err.kind == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    })
 }
 
 pub(super) fn apply_environment_defaults(host: &dyn Host, cache: &mut Cache, has_cache: bool) {
@@ -109,7 +116,9 @@ pub(super) fn refresh_toolchain(
         CacheEdit::Define(definition) if definition.name == TOOLCHAIN_FILE => {
             Some(Some(definition.value.as_slice()))
         }
-        CacheEdit::Remove(pattern) if matches_glob(pattern, TOOLCHAIN_FILE) => Some(Some(b"")),
+        CacheEdit::Remove(pattern) if CacheGlob::new(pattern).matches(TOOLCHAIN_FILE) => {
+            Some(Some(b""))
+        }
         CacheEdit::Preload(_) => Some(None),
         _ => None,
     });

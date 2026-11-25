@@ -9,6 +9,8 @@ use crate::{
 
 use super::*;
 
+mod nuget;
+
 const EVENTS: [&str; 3] = ["PreBuildEvent", "PreLinkEvent", "PostBuildEvent"];
 
 pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
@@ -65,6 +67,12 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
                 xml.text(property, &[], &string(value));
             }
         }
+    }
+    // CMake sets `VS_GLOBAL_DisableFastUpToDateCheck` on `ZERO_CHECK` when it
+    // verifies `CONFIGURE_DEPENDS` globs, so MSBuild always runs its
+    // pre-build event.
+    if project.utility == Some(UtilityKind::ZeroCheck) && !ctx.model.glob_checks.is_empty() {
+        xml.text("DisableFastUpToDateCheck", &[], "true");
     }
     xml.end();
     xml.empty(
@@ -206,6 +214,9 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
     }
     write_items(&mut xml, ctx, plan, true);
     write_items(&mut xml, ctx, plan, false);
+    if let Some(target) = project.target.and_then(|id| ctx.model.target(id)) {
+        nuget::write(&mut xml, target);
+    }
     if !project.dependencies.is_empty() {
         xml.start("ItemGroup", &[]);
         for dep in project
