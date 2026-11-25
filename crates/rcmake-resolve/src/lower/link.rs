@@ -150,6 +150,38 @@ pub(super) fn link(
             flags.push(parse_flags(value.clone())?);
         }
     }
+    if kind == LinkKind::Executable {
+        let exports = target
+            .props
+            .get(b"ENABLE_EXPORTS")
+            .is_some_and(|v| truth::is_on(v));
+        let shared_build =
+            definition(model, target.dir, b"BUILD_SHARED_LIBS").is_some_and(|v| truth::is_on(v));
+        let shared_exports = exports
+            && model
+                .global
+                .props
+                .get(b"TARGET_SUPPORTS_SHARED_LIBS")
+                .is_some_and(|v| truth::is_on(v))
+            && definition(model, target.dir, b"CMAKE_SYSTEM_NAME").is_none_or(|v| v != b"AIX");
+        for (enabled, prefix, suffix) in [
+            (
+                exports,
+                b"CMAKE_EXE_EXPORTS_".as_slice(),
+                b"_FLAG".as_slice(),
+            ),
+            (shared_build, b"CMAKE_SHARED_BUILD_", b"_FLAGS"),
+            (shared_exports, b"CMAKE_SHARED_LIBRARY_LINK_", b"_FLAGS"),
+        ] {
+            if enabled
+                && let Some(value) =
+                    definition(model, target.dir, &[prefix, language, suffix].concat())
+                        .filter(|value| !value.is_empty())
+            {
+                flags.push(wrapper.driver_flags(value));
+            }
+        }
+    }
     let raw_flags = kind.target_flags_property();
     flags.extend(
         target
@@ -577,15 +609,7 @@ fn link_libraries(
     let named = frameworks::named_framework_files(model, target, config, step, &libraries);
     libraries.extend(named);
     let runtime = rpath::runtime_libraries(model, target, config, step, &libraries, usage)?;
-    let rpaths = rpath::link_flags(
-        model,
-        target,
-        config,
-        step,
-        usage.source_paths(),
-        &runtime,
-        link_languages,
-    )?;
+    let rpaths = rpath::link_flags(model, target, config, step, usage, &runtime, link_languages)?;
     inputs.extend(libraries);
     let (mut arguments, mut rpaths) = if darwin {
         (Vec::new(), Some(rpaths))

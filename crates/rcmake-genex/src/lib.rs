@@ -483,6 +483,12 @@ pub enum GenexError {
         /// Name of the target whose sources depend on themselves.
         target: BString,
     },
+    /// Generation error reported by an operator without expression text.
+    #[error("{message}")]
+    Generation {
+        /// CMake's message text.
+        message: BString,
+    },
     /// A generator expression failure with its originating call stack.
     #[error("{0}")]
     Located(Box<GenexDiagnostic>),

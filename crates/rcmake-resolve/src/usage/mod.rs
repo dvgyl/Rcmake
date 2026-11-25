@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, Limits, list, path_lex::Lexical, truth};
 use rcmake_diag::{Frame, Location, MessageKind};
 use rcmake_genex::{
@@ -132,6 +132,7 @@ pub struct UsageResolver<'a> {
     has_injections: bool,
     compatible: compatible::Properties,
     pub(crate) provenance: Option<provenance::Provenance>,
+    pub(crate) runtime_install_targets: IndexSet<TargetId>,
     /// Number of active `$<TARGET_PROPERTY>` reads. CMake checks for relative
     /// interface paths only when it collects the usage requirements of a
     /// consumer, not when an expression reads the property.
@@ -147,6 +148,7 @@ impl<'a> UsageResolver<'a> {
             ide: crate::ide::IdeFlavor::from_model(model),
             artifact_properties: Vec::new(),
             pch_objects: IndexMap::new(),
+            runtime_install_targets: IndexSet::new(),
             source_paths: None,
             ids: model.targets().map(|(id, _)| id).collect(),
             memo: HashMap::new(),
@@ -186,6 +188,7 @@ impl<'a> UsageResolver<'a> {
             ide: self.ide,
             artifact_properties: self.artifact_properties.clone(),
             pch_objects: self.pch_objects.clone(),
+            runtime_install_targets: IndexSet::new(),
             source_paths: None,
             ids: Arc::clone(&self.ids),
             memo: HashMap::new(),

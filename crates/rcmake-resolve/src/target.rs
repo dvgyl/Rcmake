@@ -144,10 +144,19 @@ pub(crate) fn resolve_target<'a>(
         .into_iter()
         .chain(members.values().map(|member| member.source.clone()))
         .map(|source| (source, None));
+    let mut entry_start = 0;
+    let mut entry_backtrace = None::<rcmake_diag::Backtrace>;
     for (mut source, unity_file) in unity_sources.chain(original_sources) {
+        if entry_backtrace
+            .as_ref()
+            .is_none_or(|trace| !trace.frames().eq(source.backtrace.frames()))
+        {
+            entry_start = inputs.sources.len();
+            entry_backtrace = Some(source.backtrace.clone());
+        }
         if unity_file.is_none() {
             let Some(value) = paths.resolve_at(model, dir, &source)? else {
-                inputs.sources.clear();
+                inputs.sources.truncate(entry_start);
                 break;
             };
             source.value = value;

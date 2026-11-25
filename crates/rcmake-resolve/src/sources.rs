@@ -898,7 +898,7 @@ fn object_property(
         || (config.is_none() && flags.context_sensitive)
     {
         format!(
-            "contains a context-sensitive condition which is not supported\n  ({}).",
+            "contains a context-sensitive condition which is not supported ({}).",
             raw
         )
     } else if path.absolute() || !path.root_name().is_empty() {

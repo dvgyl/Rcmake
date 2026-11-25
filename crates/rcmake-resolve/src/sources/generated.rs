@@ -1,6 +1,5 @@
 use rcmake_diag::PolicyStatus;
 use rcmake_genex::{ConfigId, EvalContext, GenexHost, evaluate, parse};
-use rcmake_host::path::from_native_cmake;
 use rcmake_model::ProjectModel;
 
 use super::{SourcePaths, absolute_path};
@@ -25,7 +24,6 @@ impl SourcePaths<'_> {
             return Ok(());
         };
         let contexts = file_generate_contexts(model, std::slice::from_ref(config));
-        let cwd = from_native_cmake(&self.host.initial_cwd());
         let directories: Vec<_> = model.dirs().collect();
         for index in 0..count {
             let key = format!("_RCMAKE_FILE_GENERATE_{index}");
@@ -39,7 +37,7 @@ impl SourcePaths<'_> {
             let base = if file_generate_policy(model, id, index) == PolicyStatus::New {
                 &dir.binary_dir
             } else {
-                &cwd
+                &dir.source_dir
             };
             let ast = parse(output)?;
             let mut host = usage.host(id);

@@ -131,8 +131,10 @@ pub(crate) fn resolve_exports(
                     legacy_interface,
                 },
             )?;
-            if let Some(rules) = include_rules.get(&id) {
-                add_include_destinations(usage, id, rules, &mut target)?;
+            if let Some(rules) = include_rules.get(&id)
+                && let Some(raw) = model.target(id)
+            {
+                add_include_destinations(model, usage, id, raw, rules, &mut target)?;
             }
             packages.extend(export_links::qualify(
                 model,
@@ -380,8 +382,10 @@ fn package_dependencies(
 }
 
 fn add_include_destinations(
+    model: &ProjectModel,
     usage: &mut UsageResolver<'_>,
     id: TargetId,
+    raw: &Target,
     rules: &[&InstallRule],
     target: &mut ExportedTarget,
 ) -> Result<(), ResolveError> {
@@ -401,10 +405,18 @@ fn add_include_destinations(
             let ast = rcmake_genex::strip(&rcmake_genex::parse(&value)?, PreprocessMode::Install);
             let (paths, flags) = rcmake_genex::evaluate(&ast, &ctx, &mut host)?;
             if flags.context_sensitive || flags.head_sensitive || flags.link_language_sensitive {
-                return Err(ResolveError::Message(
-                    "INCLUDES DESTINATION requires paths that do not depend on the evaluation context."
-                        .into(),
-                ));
+                return Err(ResolveError::Message(export_diagnostic(
+                    model,
+                    raw,
+                    format!(
+                        concat!(
+                            "Target \"{}\" is installed with INCLUDES DESTINATION set to a context sensitive path.  ",
+                            "Paths which depend on the configuration, policy values or the link interface are not supported.  ",
+                            "Consider using target_include_directories instead."
+                        ),
+                        raw.name,
+                    ),
+                )));
             }
             for path in list::split(&paths, list::Empty::Drop) {
                 if !includes.is_empty() {

@@ -140,6 +140,24 @@ pub(crate) fn resolve_link(
             LinkFragmentRole::LibraryPath,
         ));
     }
+    if kind != LinkKind::StaticArchive
+        && let Some(standard) = lower::definition(
+            model,
+            target.dir,
+            &[
+                b"CMAKE_",
+                language.as_slice(),
+                b"_STANDARD_LINK_DIRECTORIES",
+            ]
+            .concat(),
+        )
+    {
+        for directory in list::split(standard, list::Empty::Drop) {
+            let text = quote(&[naming.path, directory.as_slice(), naming.path_terminator].concat());
+            let origin = BT::new(directory, target.backtrace.clone());
+            fragments.push(link_fragment(text, &origin, LinkFragmentRole::LibraryPath));
+        }
+    }
     let mut slices = IndexMap::new();
     if lower::is_darwin(model, target.dir) {
         for item in link_items(&items) {
@@ -664,6 +682,7 @@ fn append_framework_dir(
 
 struct LinkLibraryFlags<'a> {
     path: &'a [u8],
+    path_terminator: &'a [u8],
     prefix: &'a [u8],
     suffix: &'a [u8],
     msvc: bool,
@@ -686,6 +705,7 @@ impl<'a> LinkLibraryFlags<'a> {
                 b"LIBRARY_PATH_FLAG",
                 if msvc { b"-LIBPATH:" } else { b"-L" },
             ),
+            path_terminator: flag(b"LIBRARY_PATH_TERMINATOR", b""),
             prefix: flag(b"LINK_LIBRARY_FLAG", if msvc { b"" } else { b"-l" }),
             suffix: flag(b"LINK_LIBRARY_SUFFIX", if msvc { b".lib" } else { b"" }),
             msvc,

@@ -112,9 +112,9 @@ fn single_config_writes_rules_edges_and_utilities() {
     generate_single_config(&result, &host, dir).unwrap_or_else(|error| panic!("{error}"));
     let rules = read(&host, "CMakeFiles/rules.ninja");
     assert!(rules.contains("rule COMPILE_DEPFILE\n  command = $COMMAND\n  description = $DESC\n  depfile = $DEP_FILE\n  deps = gcc"));
-    assert!(rules.contains(
-        "rule CUSTOM_COMMAND\n  command = $COMMAND\n  description = $DESC\n  restat = 1"
-    ));
+    assert!(
+        rules.contains("rule CUSTOM_COMMAND\n  command = $COMMAND\n  description = $DESC\n\nrule")
+    );
     assert!(rules.contains("rule RERUN_CMAKE\n  command = $COMMAND\n  description = Re-running CMake\n  generator = 1\n  pool = console\n  restat = 1"));
     assert!(rules.contains("pool slow\n  depth = 3"));
     assert!(!rules.contains("pool ignored"));
@@ -1006,4 +1006,100 @@ fn directory_all_omits_targets_excluded_by_expressions() -> Result<(), Box<dyn s
         "{manifest}"
     );
     Ok(())
+}
+
+#[test]
+fn custom_command_restat_depends_on_symbolic_outputs_and_byproducts() {
+    let host = PureHost::default();
+    let steps = [
+        ("ordinary", false, false, Vec::new()),
+        ("symbolic", true, false, Vec::new()),
+        ("later-output", false, true, Vec::new()),
+        (
+            "symbolic-with-byproduct",
+            true,
+            false,
+            vec!["side-effect".into()],
+        ),
+    ]
+    .into_iter()
+    .map(|(name, symbolic, later_output, byproducts)| {
+        let mut outputs = vec![name.into()];
+        let mut symbolic_outputs = Vec::new();
+        if later_output {
+            outputs.push("second".into());
+            symbolic_outputs.push("second".into());
+        }
+        BuildStep::Custom(CustomStep {
+            outputs,
+            symbolic,
+            symbolic_outputs,
+            byproducts,
+            invocations: vec![Invocation {
+                shell: "touch output".into(),
+                ..Invocation::default()
+            }],
+            ..CustomStep::default()
+        })
+    })
+    .collect();
+    let result = GenerationResult {
+        graphs: vec![BuildGraph {
+            steps,
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    generate_single_config(&result, &host, Path::new("/work/build"))
+        .unwrap_or_else(|error| panic!("{error}"));
+    let build = read(&host, "build.ninja");
+    for (output, restat) in [
+        ("ordinary", true),
+        ("symbolic", false),
+        ("later-output", false),
+        ("symbolic-with-byproduct", true),
+        ("CMakeFiles/test.util", true),
+    ] {
+        let edge = build
+            .split("build ")
+            .find(|edge| {
+                edge.strip_prefix(output)
+                    .is_some_and(|tail| tail.starts_with([' ', ':']))
+            })
+            .unwrap_or_else(|| panic!("Missing edge for {output}"));
+        assert_eq!(edge.contains("  restat = 1\n"), restat, "{edge}");
+    }
+}
+
+#[test]
+fn ninja_test_depends_on_all_only_if_explicitly_enabled() {
+    use rcmake_model::ProjectModel;
+
+    for (skip, dependency) in [(None, ""), (Some("ON"), ""), (Some("OFF"), " all")] {
+        let mut model = ProjectModel::default();
+        model
+            .dir_mut(rcmake_model::DirId::ROOT)
+            .vars
+            .insert("CMAKE_TESTING_ENABLED".into(), "1".into());
+        if let Some(skip) = skip {
+            model
+                .dir_mut(rcmake_model::DirId::ROOT)
+                .vars
+                .insert("CMAKE_SKIP_TEST_ALL_DEPENDENCY".into(), skip.into());
+        }
+        let host = PureHost::default();
+        let result = GenerationResult {
+            graphs: vec![BuildGraph::default()],
+            ..GenerationResult::default()
+        };
+        super::generate_single_config_with_model(&result, &host, Path::new("/work/build"), &model)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let build = read(&host, "build.ninja");
+        assert!(
+            build.contains(&format!(
+                "build CMakeFiles/test.util: CUSTOM_COMMAND{dependency}\n"
+            )),
+            "{build}"
+        );
+    }
 }

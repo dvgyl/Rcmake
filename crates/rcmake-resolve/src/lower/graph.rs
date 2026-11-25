@@ -66,6 +66,14 @@ pub(crate) fn lower_with_inputs(
     cross: Option<CrossConfiguration<'_>>,
     trace_host: Option<&dyn rcmake_host::Host>,
 ) -> Result<BuildGraph, ResolveError> {
+    usage.runtime_install_targets = super::install::transitive::collect(model, usage, targets)?
+        .into_values()
+        .flat_map(|targets| {
+            targets
+                .into_iter()
+                .filter_map(|(id, configs)| configs.contains(config).then_some(id))
+        })
+        .collect();
     let resolved_targets: IndexMap<_, _> = targets
         .iter()
         .filter(|target| config.matches(&target.config.0))

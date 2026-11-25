@@ -186,3 +186,28 @@ fn target_messages_follow_the_global_property_and_variable() {
         .set("TARGET_MESSAGES".into(), "OFF".into());
     assert!(!target_messages(Some(&model)));
 }
+
+#[test]
+fn make_test_depends_on_all_only_if_explicitly_enabled() {
+    for (skip, dependency) in [(None, ""), (Some("ON"), ""), (Some("OFF"), " all")] {
+        let mut model = ProjectModel::default();
+        if let Some(skip) = skip {
+            model
+                .dir_mut(rcmake_model::DirId::ROOT)
+                .vars
+                .insert("CMAKE_SKIP_TEST_ALL_DEPENDENCY".into(), skip.into());
+        }
+        let root = Path::new("/build");
+        let host = PureHost::new(root.into(), "/tools/rcmake".into());
+        let result = GenerationResult {
+            graphs: vec![BuildGraph::default()],
+            ..GenerationResult::default()
+        };
+        generate_with_model(&result, &host, root, &model).expect("Generate Makefiles");
+        let makefile = read(&host, &root.join("Makefile"));
+        assert!(
+            makefile.contains(&format!("\ntest:{dependency}\n")),
+            "{makefile}"
+        );
+    }
+}

@@ -4,6 +4,7 @@ mod generation_rules;
 mod languages;
 mod parity;
 mod runtime_paths;
+mod wave7b;
 
 use std::path::Path;
 use std::sync::Arc;

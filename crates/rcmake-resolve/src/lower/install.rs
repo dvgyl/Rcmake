@@ -29,6 +29,9 @@ mod projection;
 mod script_policy;
 mod strip;
 mod targets;
+pub(super) mod transitive;
+
+use transitive::RuntimeTargets;
 
 pub(crate) use objects::exported_path as exported_object_path;
 
@@ -40,11 +43,14 @@ pub use super::artifacts::collect_metadata;
 /// same order.
 #[must_use]
 pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) -> InstallManifest {
-    let edits = runtime_edits(model, targets, &IndexMap::new(), |_, _, _| {}).unwrap_or_default();
+    let runtime =
+        transitive::collect(model, &mut UsageResolver::new(model), targets).unwrap_or_default();
+    let edits =
+        runtime_edits(model, targets, &IndexMap::new(), &runtime, |_, _, _| {}).unwrap_or_default();
     match lower_install_rules(
         model,
         targets,
-        (&[], &edits, None),
+        (&[], &edits, &runtime, None),
         |_, _, _, value| Ok::<_, Infallible>(value.into()),
         |dir, config, source| {
             Ok(crate::sources::install_object_name(model, dir, source, config).unwrap_or_default())
@@ -68,7 +74,9 @@ pub(crate) fn lower_install_manifest_with_configs(
         script_policy::warn(model, rule, host);
     }
     super::warn_install_name_policy(model, host);
-    let edits = runtime_edits(model, targets, languages, |rule, raw, edit| {
+    let mut usage = UsageResolver::new(model).with_ide(ide);
+    let runtime = transitive::collect(model, &mut usage, targets)?;
+    let edits = runtime_edits(model, targets, languages, &runtime, |rule, raw, edit| {
         if let super::install_rpath::RuntimeEdit::Elf(elf) = edit
             && raw.policies.policies.get(rcmake_diag::PolicyId::new(95))
                 == rcmake_diag::PolicyStatus::Warn
@@ -77,11 +85,10 @@ pub(crate) fn lower_install_manifest_with_configs(
             warn_rpath_escaping(model, host, rule, raw);
         }
     })?;
-    let mut usage = UsageResolver::new(model).with_ide(ide);
     lower_install_rules(
         model,
         targets,
-        (configs, &edits, Some(host)),
+        (configs, &edits, &runtime, Some(host)),
         |dir, config, backtrace, value| {
             if !has_genex(value) {
                 return Ok(value.into());
@@ -354,6 +361,7 @@ fn runtime_edits(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
     languages: &IndexMap<(TargetId, ConfigId), IndexSet<BString>>,
+    runtime: &RuntimeTargets,
     mut warn: impl FnMut(&InstallRule, &Target, &super::install_rpath::RuntimeEdit),
 ) -> Result<RuntimeEdits, ResolveError> {
     let facts: IndexMap<_, _> = targets
@@ -365,7 +373,7 @@ fn runtime_edits(
         let Some(raw) = model.target(target.id) else {
             continue;
         };
-        let mut rules = runtime_install_rules(model, raw, &target.config).peekable();
+        let mut rules = runtime_install_rules(model, raw, &target.config, runtime).peekable();
         if rules.peek().is_none() {
             continue;
         };
@@ -407,6 +415,7 @@ fn runtime_install_rules<'a>(
     model: &'a ProjectModel,
     target: &Target,
     config: &'a ConfigId,
+    runtime: &'a RuntimeTargets,
 ) -> impl Iterator<Item = &'a InstallRule> {
     let id = model.find_target(target.dir, &target.name);
     let group: Option<&[u8]> = match (target.kind, crate::ide::bundle_kind(target)) {
@@ -428,16 +437,27 @@ fn runtime_install_rules<'a>(
             let InstallKind::Targets { targets, .. } = &rule.kind else {
                 return None;
             };
-            if !id.is_some_and(|id| targets.contains(&id)) {
+            let id = id?;
+            let runtime_only = runtime
+                .get(&index)
+                .and_then(|deps| deps.get(&id))
+                .is_some_and(|configs| configs.contains(config));
+            if !runtime_only && !targets.contains(&id) {
                 return None;
             }
+            let group = if runtime_only && super::artifacts::is_dll_platform(model, target.dir) {
+                b"RUNTIME"
+            } else {
+                group
+            };
             let recorded = recorded_args(model, index);
             target_options(&recorded)
                 .get(group)
                 .map_or_else(
                     || matches_config(&rule.options, config),
                     |group| {
-                        !group.namelink_only && matches_config(&group.merge(&rule.options), config)
+                        (runtime_only || !group.namelink_only)
+                            && matches_config(&group.merge(&rule.options), config)
                     },
                 )
                 .then_some(rule)
@@ -447,7 +467,12 @@ fn runtime_install_rules<'a>(
 fn lower_install_rules<E>(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
-    (configs, edits, host): (&[ConfigId], &RuntimeEdits, Option<&dyn Host>),
+    (configs, edits, runtime, host): (
+        &[ConfigId],
+        &RuntimeEdits,
+        &RuntimeTargets,
+        Option<&dyn Host>,
+    ),
     mut eval: impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
     mut object_name: impl FnMut(DirId, &ConfigId, &[u8]) -> Result<BString, E>,
 ) -> Result<InstallManifest, E> {
@@ -490,7 +515,13 @@ fn lower_install_rules<E>(
                     targets::lower(
                         model,
                         (index, rule),
-                        (targets, configs, ids, edits, &mut strip),
+                        (
+                            targets,
+                            configs,
+                            (ids, runtime.get(&index)),
+                            edits,
+                            &mut strip,
+                        ),
                         &recorded,
                         &mut manifest,
                         &make_action,
@@ -813,6 +844,7 @@ fn target_option(key: &[u8]) -> bool {
             key,
             b"EXPORT"
                 | b"INCLUDES"
+                | b"RUNTIME_DEPENDENCY_TARGETS"
                 | b"DESTINATION"
                 | b"COMPONENT"
                 | b"PERMISSIONS"

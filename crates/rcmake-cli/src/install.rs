@@ -195,28 +195,46 @@ pub(crate) fn run(argv: &[BString], args: &[BString], host: Arc<dyn Host>) -> i3
     )
 }
 
+impl Options {
+    fn configurations<'a>(&'a self, defaults: &'a [BString]) -> Vec<Option<&'a BString>> {
+        match self.vars.get(b"CMAKE_INSTALL_CONFIG_NAME".as_slice()) {
+            Some(config) => vec![Some(config)],
+            None if !defaults.is_empty() => defaults.iter().map(Some).collect(),
+            None => vec![None],
+        }
+    }
+}
+
 fn install(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
-    match parallel::Index::load(host.as_ref(), &opts.dir) {
-        Ok(Some(index)) => {
+    let index = match parallel::Index::load(host.as_ref(), &opts.dir) {
+        Ok(Some(index)) if index.parallel => {
             return parallel::run(argv, &opts, host.as_ref(), index).unwrap_or_else(|error| {
                 crate::emit_cli_error(host.as_ref(), error);
                 1
             });
         }
-        Ok(None) => {}
+        Ok(index) => index,
         Err(error) => {
             crate::emit_cli_error(host.as_ref(), error);
             return 1;
         }
-    }
-    let script = opts.dir.join("cmake_install.cmake");
+    };
+    let configs = opts.configurations(index.as_ref().map_or(&[], |index| &index.configs));
+    let script = index
+        .as_ref()
+        .and_then(|index| index.scripts.first())
+        .cloned()
+        .unwrap_or_else(|| opts.dir.join("cmake_install.cmake"));
     let components = if opts.components.is_empty() {
         vec![None]
     } else {
-        opts.components.into_iter().map(Some).collect()
+        opts.components.iter().map(Some).collect()
     };
     let command = path::from_native(&discover_cmake_root(host.as_ref(), argv.first()).0);
-    for component in components {
+    for (component, config) in components
+        .into_iter()
+        .flat_map(|component| configs.iter().map(move |config| (component, *config)))
+    {
         let defines = [
             (
                 b"CMAKE_INSTALL_PREFIX".as_slice(),
@@ -231,11 +249,8 @@ fn install(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
                 opts.vars
                     .get(b"CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS".as_slice()),
             ),
-            (b"CMAKE_INSTALL_COMPONENT", component.as_ref()),
-            (
-                b"CMAKE_INSTALL_CONFIG_NAME",
-                opts.vars.get(b"CMAKE_INSTALL_CONFIG_NAME".as_slice()),
-            ),
+            (b"CMAKE_INSTALL_COMPONENT", component),
+            (b"CMAKE_INSTALL_CONFIG_NAME", config),
         ];
         let definitions = defines
             .into_iter()

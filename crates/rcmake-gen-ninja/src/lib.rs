@@ -77,7 +77,6 @@ rule STATIC_ARCHIVE
 rule CUSTOM_COMMAND
   command = $COMMAND
   description = $DESC
-  restat = 1
 
 rule VERIFY_GLOBS
   command = $COMMAND
@@ -830,6 +829,7 @@ struct Programs {
     package_source: bool,
     package_inputs: Vec<BString>,
     testing: bool,
+    test_depends_all: bool,
     install: bool,
     strip: bool,
     parallel_install: bool,
@@ -912,6 +912,8 @@ impl Programs {
             testing: model.is_none()
                 || definition(b"CMAKE_TESTING_ENABLED")
                     .is_some_and(|value| rcmake_base::truth::is_on(value)),
+            test_depends_all: definition(b"CMAKE_SKIP_TEST_ALL_DEPENDENCY")
+                .is_some_and(|value| rcmake_base::truth::is_off(value)),
             install: model.is_none()
                 || (!result.install.actions.is_empty()
                     && !definition(b"CMAKE_SKIP_INSTALL_RULES")

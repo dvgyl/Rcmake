@@ -1,4 +1,4 @@
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use rcmake_base::truth;
 use rcmake_diag::{
     DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, RenderOptions,
@@ -106,13 +106,18 @@ fn framework_added_after_install(
         .is_some_and(|value| !truth::is_on(value))
 }
 
+type TargetSelection<'a> = (
+    &'a [TargetId],
+    Option<&'a IndexMap<TargetId, IndexSet<ConfigId>>>,
+);
+
 pub(super) fn lower<E>(
     model: &ProjectModel,
     (index, rule): (usize, &InstallRule),
-    (targets, configs, ids, edits, strip): (
+    (targets, configs, (ids, dependencies), edits, strip): (
         &[ResolvedTarget],
         &[ConfigId],
-        &[TargetId],
+        TargetSelection<'_>,
         &RuntimeEdits,
         &mut super::strip::Tools<'_>,
     ),
@@ -128,11 +133,22 @@ pub(super) fn lower<E>(
     let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
     let source = &model.dir(rule.dir).source_dir;
     let groups = target_options(recorded);
-    for id in ids {
+    let roots = ids.iter().map(|id| (id, None));
+    let dependencies = dependencies
+        .into_iter()
+        .flatten()
+        .map(|(id, configs)| (id, Some(configs)));
+    for (id, dependency_configs) in roots.chain(dependencies) {
+        let runtime_only = dependency_configs.is_some();
         let Some(raw) = model.target(*id).filter(|raw| !raw.is_imported()) else {
             continue;
         };
-        let matching: Vec<_> = targets.iter().filter(|t| t.id == *id).collect();
+        let matching: Vec<_> = targets
+            .iter()
+            .filter(|t| {
+                t.id == *id && dependency_configs.is_none_or(|configs| configs.contains(&t.config))
+            })
+            .collect();
         if raw.kind == TargetKind::ObjectLibrary {
             let object_options = groups
                 .get(b"OBJECTS".as_slice())
@@ -196,9 +212,10 @@ pub(super) fn lower<E>(
             if raw.kind == TargetKind::SharedLibrary
                 && super::super::artifacts::is_dll_platform(model, raw.dir)
             {
-                if groups
-                    .get(b"LIBRARY".as_slice())
-                    .is_some_and(|group| group.namelink_only)
+                if !runtime_only
+                    && groups
+                        .get(b"LIBRARY".as_slice())
+                        .is_some_and(|group| group.namelink_only)
                 {
                     continue;
                 }
@@ -233,7 +250,8 @@ pub(super) fn lower<E>(
                     ),
                 ] {
                     let Some(file) = file else { continue };
-                    if (explicit && !has_destination(&options))
+                    if (runtime_only && file_type == b"STATIC_LIBRARY")
+                        || (!runtime_only && explicit && !has_destination(&options))
                         || ((configs.is_empty() || per_config)
                             && !matches_config(&options, &target.config))
                     {
@@ -294,6 +312,15 @@ pub(super) fn lower<E>(
             }
             let extra = groups.get(class);
             let mut options = extra.map_or_else(|| options.clone(), |extra| extra.merge(options));
+            let runtime_group = Group {
+                namelink_skip: true,
+                ..Group::default()
+            };
+            let extra = if runtime_only {
+                Some(&runtime_group)
+            } else {
+                extra
+            };
             if (configs.is_empty() || per_config) && !matches_config(&options, &target.config) {
                 continue;
             }
@@ -322,7 +349,8 @@ pub(super) fn lower<E>(
                 options.destination.get_or_insert_with(|| default.into());
                 eval_destination(&mut options, raw.dir, &target.config, rule, eval)?;
             }
-            if matches!(layout, crate::ide::BundleKind::Framework { .. })
+            if !runtime_only
+                && matches!(layout, crate::ide::BundleKind::Framework { .. })
                 && groups
                     .get(b"LIBRARY".as_slice())
                     .is_some_and(|group| group.namelink_only)
@@ -428,7 +456,8 @@ pub(super) fn lower<E>(
                 manifest.actions.extend(change);
                 manifest.actions.extend(strip_action);
             }
-            if layout == crate::ide::BundleKind::None
+            if !runtime_only
+                && layout == crate::ide::BundleKind::None
                 && let Some(stub) = &artifacts.import_file
                 && stub.ends_with(b".tbd")
             {
@@ -484,6 +513,9 @@ pub(super) fn lower<E>(
                 let kind = file_action(file_type, vec![join(bin, file)], &options);
                 manifest.actions.push(make_action(&options, default, kind));
             }
+        }
+        if runtime_only {
+            continue;
         }
         if matches!(
             model.generator,

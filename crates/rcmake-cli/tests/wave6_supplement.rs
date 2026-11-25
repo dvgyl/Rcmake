@@ -761,3 +761,70 @@ fn vs_package_restore_uses_preset_and_cli_modes() {
         Some("ON")
     );
 }
+
+#[test]
+fn install_uses_nonparallel_index_configurations_in_component_order() {
+    let host = new_host();
+    seed(
+        &host,
+        "/work/out/CMakeFiles/InstallScripts.json",
+        r#"{"Parallel":false,"Configs":["Debug","Release"],"InstallScripts":["cmake_install.cmake","child.cmake"]}"#,
+    );
+    seed(
+        &host,
+        "/work/out/cmake_install.cmake",
+        "file(APPEND \"${CMAKE_INSTALL_PREFIX}/order.txt\" \"<${CMAKE_INSTALL_COMPONENT}:${CMAKE_INSTALL_CONFIG_NAME}>\")\n",
+    );
+    for (prefix, extra, expected) in [
+        (
+            "/work/stage",
+            &[][..],
+            "<A:Debug><A:Release><B:Debug><B:Release>",
+        ),
+        (
+            "/work/explicit",
+            &["--config", "RelWithDebInfo"][..],
+            "<A:RelWithDebInfo><B:RelWithDebInfo>",
+        ),
+    ] {
+        let mut args = vec!["--install", "out", "--prefix", prefix, "--component", "A;B"];
+        args.extend_from_slice(extra);
+        success(&host, &args);
+        assert_eq!(read(&host, &format!("{prefix}/order.txt")), expected);
+    }
+}
+
+#[test]
+fn file_generate_reports_missing_imported_location_at_directory() {
+    let host = new_host();
+    seed(
+        &host,
+        "/work/CMakeLists.txt",
+        r#"cmake_minimum_required(VERSION 4.5)
+project(artifact NONE)
+add_library(missing UNKNOWN IMPORTED)
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/path.txt" CONTENT "$<TARGET_FILE:missing>")
+"#,
+    );
+    let result = cmake(&host, &["-S", ".", "-B", "out", "-G", "Ninja"]);
+    assert_ne!(result.code, 0);
+    assert!(
+        result.stderr.contains("CMake Error in CMakeLists.txt:"),
+        "{}",
+        result.stderr
+    );
+    assert!(
+        result
+            .stderr
+            .contains("IMPORTED_LOCATION not set for imported target \"missing\""),
+        "{}",
+        result.stderr
+    );
+    assert!(
+        !result
+            .stderr
+            .contains("Error evaluating generator expression"),
+        "{}",
+        result.stderr
+    );
+}

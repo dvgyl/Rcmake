@@ -14,8 +14,9 @@ use rcmake_json::{ReadOptions, Value, parse};
 use super::{Options, job_count};
 
 pub(super) struct Index {
-    scripts: Vec<PathBuf>,
-    configs: Vec<BString>,
+    pub(super) parallel: bool,
+    pub(super) scripts: Vec<PathBuf>,
+    pub(super) configs: Vec<BString>,
 }
 
 impl Index {
@@ -45,15 +46,17 @@ impl Index {
         else {
             return Err("The install script index must contain a JSON object.".into());
         };
-        if value.get(b"Parallel".as_slice()) != Some(&Value::Bool(true)) {
-            return Ok(None);
-        }
+        let parallel = value.get(b"Parallel".as_slice()) == Some(&Value::Bool(true));
         let scripts = strings(value.get(b"InstallScripts".as_slice()), "InstallScripts")?
             .into_iter()
             .map(|script| dir.join(path::to_native(&script)))
             .collect();
         let configs = strings(value.get(b"Configs".as_slice()), "Configs")?;
-        Ok(Some(Self { scripts, configs }))
+        Ok(Some(Self {
+            parallel,
+            scripts,
+            configs,
+        }))
     }
 }
 
@@ -92,11 +95,7 @@ pub(super) fn run(
             .transpose()?
             .unwrap_or(1),
     } as usize;
-    let configs = match opts.vars.get(b"CMAKE_INSTALL_CONFIG_NAME".as_slice()) {
-        Some(config) => vec![Some(config)],
-        None if !index.configs.is_empty() => index.configs.iter().map(Some).collect(),
-        None => vec![None],
-    };
+    let configs = opts.configurations(&index.configs);
     let components = if opts.components.is_empty() {
         vec![None]
     } else {

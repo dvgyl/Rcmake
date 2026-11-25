@@ -872,3 +872,79 @@ fn config_rejects_only_an_invalid_first_name() {
         )]
     );
 }
+
+#[test]
+fn linker_language_property_is_rejected_in_static_link_and_source_properties() {
+    let mut host = Host::default();
+    host.set(OTHER, "TYPE", "STATIC_LIBRARY");
+    host.set(OTHER, "LINKER_LANGUAGE", "C");
+    for property in [
+        "LINK_LIBRARIES",
+        "INTERFACE_LINK_LIBRARIES",
+        "SOURCES",
+        "INTERFACE_SOURCES",
+    ] {
+        let mut ctx = context();
+        ctx.site.property = Some(property.into());
+        let error = run(b"$<TARGET_PROPERTY:other,LINKER_LANGUAGE>", &ctx, &mut host)
+            .expect_err("The static library linker language is not available here.");
+        assert_eq!(
+            error.to_string(),
+            "LINKER_LANGUAGE target property can not be used while evaluating link libraries for a static library"
+        );
+    }
+    check(
+        &[("$<TARGET_PROPERTY:other,LINKER_LANGUAGE>", "C")],
+        &context(),
+        &mut host,
+    );
+}
+
+#[test]
+fn target_file_queries_allow_other_targets_during_link_evaluation() {
+    let mut host = Host::default();
+    host.set(HEAD, "TYPE", "EXECUTABLE");
+    host.set(OTHER, "TYPE", "SHARED_LIBRARY");
+    for property in ["LINK_LIBRARIES", "SOURCES", "INTERFACE_SOURCES"] {
+        let mut ctx = context();
+        ctx.site.property = Some(property.into());
+        let error = run(b"$<TARGET_FILE_NAME:head>", &ctx, &mut host)
+            .expect_err("The head target artifact needs the linker language.");
+        assert_eq!(
+            error.to_string(),
+            "Expressions which require the linker language may not be used while evaluating link libraries"
+        );
+        check(
+            &[("$<TARGET_FILE:other>", "/out/libother_d.so")],
+            &ctx,
+            &mut host,
+        );
+    }
+}
+
+#[test]
+fn missing_imported_artifact_follows_cmp0111() {
+    let mut host = Host::default();
+    host.set(LEFT, "TYPE", "STATIC_LIBRARY");
+    host.set(LEFT, "IMPORTED", "TRUE");
+    let expression = b"$<TARGET_FILE:left>";
+    let ctx = context();
+    assert_eq!(
+        run(expression, &ctx, &mut host).expect("CMP0111 WARN").0,
+        "left-NOTFOUND"
+    );
+    host.set(LEFT, "CMP0111", "OLD");
+    assert_eq!(
+        run(expression, &ctx, &mut host).expect("CMP0111 OLD").0,
+        "left-NOTFOUND"
+    );
+    host.set(LEFT, "CMP0111", "NEW");
+    assert_eq!(
+        run(expression, &ctx, &mut host),
+        Err(GenexError::Generation {
+            message:
+                "IMPORTED_LOCATION not set for imported target \"left\" configuration \"Debug\"."
+                    .into(),
+        })
+    );
+}

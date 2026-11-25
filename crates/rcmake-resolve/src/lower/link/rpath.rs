@@ -24,12 +24,15 @@ pub(super) fn link_flags(
     target: &Target,
     config: &ConfigId,
     step: &LinkStep,
-    source_paths: Option<&crate::sources::SourcePaths<'_>>,
+    usage: &UsageResolver<'_>,
     libraries: &[BString],
     languages: &IndexSet<BString>,
 ) -> Result<Vec<BString>, ResolveError> {
     let darwin = is_darwin(model, target.dir);
-    let installed = crate::lower::install::has_target_install(model, target);
+    let installed = crate::lower::install::has_target_install(model, target)
+        || model
+            .find_target(target.dir, &target.name)
+            .is_some_and(|id| usage.runtime_install_targets.contains(&id));
     let chrpath = installed
         && !on(model, target, b"CMAKE_SKIP_RPATH")
         && !build_with_install_rpath(model, target)
@@ -54,7 +57,7 @@ pub(super) fn link_flags(
             "The install of the {} target requires changing an RPATH from the build tree, but this is not supported with the Ninja generator unless on an ELF-based or XCOFF-based platform.  The CMAKE_BUILD_WITH_INSTALL_RPATH variable may be set to avoid this relinking step.",
             target.name
         ).into();
-        if let Some(paths) = source_paths {
+        if let Some(paths) = usage.source_paths() {
             paths.emit(
                 model,
                 MessageKind::Error,

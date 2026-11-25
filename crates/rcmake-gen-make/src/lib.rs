@@ -110,7 +110,7 @@ fn generate_impl(
         &targets,
         &cmake,
         &prep,
-        report_progress,
+        (model, report_progress),
         verify_globs,
     )?;
     let dispatch = dispatch(
@@ -465,7 +465,7 @@ fn top_level(
     targets: &[Target<'_>],
     cmake: &[u8],
     prep: &prep::Targets,
-    report_progress: bool,
+    (model, report_progress): (Option<&ProjectModel>, bool),
     verify_globs: bool,
 ) -> Result<Vec<u8>, GenError> {
     let mut out = makefile();
@@ -500,7 +500,14 @@ fn top_level(
     recursive_make(&mut out, MAKEFILE2, b"preinstall");
     phony(&mut out, b"install", [b"preinstall".as_slice()]);
     out.push_str(b"\t$(SILENT)$(CMAKE_COMMAND) -P cmake_install.cmake\n");
-    phony(&mut out, b"test", []);
+    let test_depends_all = model
+        .and_then(|model| model.definition(DirId::ROOT, b"CMAKE_SKIP_TEST_ALL_DEPENDENCY"))
+        .is_some_and(|value| rcmake_base::truth::is_off(value));
+    phony(
+        &mut out,
+        b"test",
+        test_depends_all.then_some(b"all".as_slice()),
+    );
     out.push_str(b"\t$(SILENT)$(CTEST_COMMAND) --force-new-ctest-process");
     for argument in &result.metadata.ctest_arguments {
         out.push(b' ');

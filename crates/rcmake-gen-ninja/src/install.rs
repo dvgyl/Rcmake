@@ -226,6 +226,7 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
             .commands
             .word(b"No interactive CMake dialog available.", &mut edit_cache);
 
+        let all = BString::from(name("all"));
         for (utility, command, enabled, per_config) in [
             ("test", test, programs.testing, true),
             ("rebuild_cache", rebuild.to_vec(), true, false),
@@ -236,7 +237,11 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
                     name: name(utility),
                     command,
                     cwd: cwd.clone().filter(|_| utility != "rebuild_cache"),
-                    inputs: Vec::new(),
+                    inputs: if utility == "test" && programs.test_depends_all {
+                        vec![all.clone()]
+                    } else {
+                        Vec::new()
+                    },
                     pool: b"console",
                     rule: b"CUSTOM_COMMAND",
                     per_config,
@@ -265,7 +270,6 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
                 graph.commands.word(config, &mut install);
             }
         }
-        let all = BString::from(name("all"));
         for (utility, flags, enabled) in [
             ("install", b"".as_slice(), true),
             ("install/local", b" -DCMAKE_INSTALL_LOCAL_ONLY=1", true),
@@ -334,6 +338,7 @@ fn emit_qualified_utility(ninja: &mut Ninja, graph: &Graph<'_>, spec: &Spec) {
         ninja.binding(b"pool", spec.pool);
     }
     write_description(ninja, &spec.name, &name);
+    ninja.binding(b"restat", b"1");
     ninja.phony(&qualified(&name, graph.config), &[output]);
 }
 
@@ -371,6 +376,7 @@ fn emit_utility(ninja: &mut Ninja, graph: &Graph<'_>, utility: Utility<'_>) {
     }
     if utility.rule == b"CUSTOM_COMMAND" {
         write_description(ninja, utility.name, &name);
+        ninja.binding(b"restat", b"1");
     }
     ninja.phony(&name, std::slice::from_ref(&output));
     if graph.config.is_some() {

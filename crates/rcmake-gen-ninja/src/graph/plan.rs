@@ -326,6 +326,10 @@ impl<'a> Graph<'a> {
                     b"CUSTOM_COMMAND"
                 };
                 let mut plan = EdgePlan::new(rule, inputs, nodes);
+                let symbolic = custom.symbolic || !custom.symbolic_outputs.is_empty();
+                if rule == b"CUSTOM_COMMAND" && (!symbolic || !custom.byproducts.is_empty()) {
+                    plan.bind(b"restat", b"1".as_slice());
+                }
                 plan.order_only = targets.into_iter().map(|input| input.node).collect();
                 plan.implicit_outputs.extend(aliases);
                 let script = nodes

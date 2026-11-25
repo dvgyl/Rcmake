@@ -181,7 +181,12 @@ fn generate(
             parse(value)
                 .and_then(|ast| evaluate(&ast, &ctx, host))
                 .map(|(value, _)| value)
-                .map_err(|err| expression_error(err, backtrace, root))
+                .map_err(|err| match err {
+                    GenexError::Generation { message } => {
+                        generation_error(model, *dir, &message.to_string())
+                    }
+                    _ => expression_error(err, backtrace, root),
+                })
         };
         // The shared writer asks for the output name before the condition.
         // Check the condition first and pass its result back to the writer.

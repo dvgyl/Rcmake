@@ -91,6 +91,21 @@ impl Evaluator<'_> {
                 .property
                 .as_ref()
                 .is_some_and(|name| is_link_libraries_property(name));
+        if property == b"LINKER_LANGUAGE"
+            && (link_evaluation
+                || matches!(
+                    call.ctx.site.property.as_deref().map(Vec::as_slice),
+                    Some(b"SOURCES" | b"INTERFACE_SOURCES")
+                ))
+            && self
+                .host
+                .raw_property(target, b"TYPE")
+                .is_some_and(|kind| kind == b"STATIC_LIBRARY")
+        {
+            return Err(call.error(
+                "LINKER_LANGUAGE target property can not be used while evaluating link libraries for a static library",
+            ));
+        }
         let built_in = requires_link_closure(property);
         if link_evaluation && built_in {
             return Err(call.error(

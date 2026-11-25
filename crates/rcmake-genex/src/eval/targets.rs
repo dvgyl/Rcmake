@@ -411,6 +411,27 @@ impl Evaluator<'_> {
             ArtifactKind::BundleDir | ArtifactKind::BundleContentDir => {
                 Err(call.error(format!("{operator} is allowed only for Bundle targets.")))
             }
+            _ if self.target_option(target, b"IMPORTED") => {
+                if self.host.target_policy(target, b"CMP0111") != Some(true) {
+                    return Ok(format!("{name}-NOTFOUND").into());
+                }
+                let property = if target_type == Some(b"SHARED_LIBRARY") {
+                    "IMPORTED_LOCATION or IMPORTED_IMPLIB"
+                } else {
+                    "IMPORTED_LOCATION"
+                };
+                let configuration = if config.0.is_empty() {
+                    String::new()
+                } else {
+                    format!(" configuration \"{}\"", config.0)
+                };
+                Err(GenexError::Generation {
+                    message: format!(
+                        "{property} not set for imported target \"{name}\"{configuration}."
+                    )
+                    .into(),
+                })
+            }
             _ => Err(call.error(format!(
                 "Target \"{name}\" has no artifact for $<{operator}>."
             ))),
@@ -440,6 +461,16 @@ impl Evaluator<'_> {
             return Err(call.error(format!(
                 "Target \"{name}\" is not an executable or library."
             )));
+        }
+        if call.ctx.head == Some(target)
+            && matches!(
+                call.ctx.site.property.as_deref().map(Vec::as_slice),
+                Some(b"LINK_LIBRARIES" | b"SOURCES" | b"INTERFACE_SOURCES")
+            )
+        {
+            return Err(call.error(
+                "Expressions which require the linker language may not be used while evaluating link libraries",
+            ));
         }
         let message = match kind {
             PdbFile | BundleDir | BundleContentDir if self.target_option(target, b"IMPORTED") => {
