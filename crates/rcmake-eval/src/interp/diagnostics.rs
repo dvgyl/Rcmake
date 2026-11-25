@@ -1,12 +1,26 @@
+use std::ops::Range;
+use std::path::Path;
+use std::sync::Arc;
+
 use rcmake_base::BString;
 use rcmake_diag::{
     Backtrace, DiagAction, DiagCategory, DiagState, Diagnostic, Effect, Frame, FrameKind, Location,
-    MessageKind, PolicyId,
+    MessageKind, PolicyId, SourceFile, SourceId, SourceMap,
+    annotate::{Annotations, Confidence, Edit, Fix, SourceSpan},
+    rich::{RichOptions, SourceLookup, render_rich},
+    source::SourceKind,
+    suggest::{Namespace, suggest_candidates_in},
 };
-use rcmake_host::Stream;
+use rcmake_host::{ReadRange, Stream, path::to_native};
+use rcmake_syntax::CommandInvocation;
 
 use crate::util::cat;
 use crate::{Interp, LogLevel};
+
+struct EditSuggestions {
+    range: Range<usize>,
+    candidates: Vec<(BString, Confidence)>,
+}
 
 /// Map a warning kind to the matching error kind.
 fn error_kind(kind: MessageKind) -> MessageKind {
@@ -29,7 +43,17 @@ fn warning_kind(kind: MessageKind) -> MessageKind {
 }
 
 impl Interp {
-    /// Write a rendered diagnostic to stderr through the [`rcmake_diag::DiagEngine`].
+    /// Use rich formatting for diagnostics written by this interpreter.
+    pub fn set_rich_diagnostics(&mut self, options: RichOptions) {
+        self.engine.set_rich_options(options);
+    }
+
+    /// Take the source map that contains the retained diagnostic labels.
+    pub fn take_diagnostic_sources(&mut self) -> SourceMap {
+        std::mem::take(&mut self.sources)
+    }
+
+    /// Write an issued diagnostic to standard error.
     pub(crate) fn emit(&mut self, diag: &Diagnostic, state: &DiagState) {
         let shown;
         let diag = if let Location::Backtrace(bt) = &diag.location {
@@ -41,9 +65,22 @@ impl Interp {
         } else {
             diag
         };
-        if let Some(bytes) = self.engine.issue(diag, state, &self.render) {
+        if let Some(options) = self.engine.rich_options() {
+            if self.engine.record(diag, state) {
+                self.write_rich(diag, options);
+            }
+        } else if let Some(bytes) = self.engine.issue(diag, state, &self.render) {
             self.config.host.write_out(Stream::Stderr, &bytes);
         }
+    }
+
+    fn write_rich(&self, diag: &Diagnostic, options: RichOptions) {
+        let lookup = DiagnosticSources {
+            sources: &self.sources,
+            cmake_root: &self.config.cmake_root,
+        };
+        let bytes = render_rich(diag, None, &lookup, options);
+        self.config.host.write_out(Stream::Stderr, &bytes);
     }
 
     /// Issue a diagnostic at the current backtrace.
@@ -113,8 +150,15 @@ impl Interp {
                 }
             }
         }
+        let annotations = self
+            .config
+            .services
+            .collect_annotations
+            .then(|| self.annotate(&location, &body))
+            .flatten()
+            .map(Box::new);
         let diag = Diagnostic {
-            annotations: None,
+            annotations,
             kind,
             effect,
             category,
@@ -123,6 +167,122 @@ impl Interp {
             body,
         };
         self.emit(&diag, &state);
+    }
+
+    fn annotate(&mut self, location: &Location, body: &[u8]) -> Option<Annotations> {
+        let Location::Backtrace(trace) = location else {
+            return None;
+        };
+        let frame = trace.top()?;
+        let (commands, index) = self.cur_cmd.as_ref()?;
+        let command = commands.get(*index)?;
+        if frame.line != command.line || frame.name.as_deref() != Some(command.name.as_slice()) {
+            return None;
+        }
+        let path = to_native(&frame.file);
+        if !path.is_absolute() {
+            return None;
+        }
+        let limit = self
+            .engine
+            .annotation_bytes_left()
+            .min(self.config.limits.max_file_read)
+            .min(1024 * 1024);
+        if limit == 0 {
+            return None;
+        }
+        let bytes = self
+            .config
+            .host
+            .read(&path, ReadRange::All { limit })
+            .ok()?;
+        let name_span = command.span.start..command.span.start.checked_add(command.name.len())?;
+        if bytes.get(name_span.clone())? != command.name.as_slice() {
+            return None;
+        }
+
+        let suggestion = self.suggestion(body, command, &bytes, name_span.clone());
+        let selected = suggestion
+            .as_ref()
+            .map_or(name_span, |suggestions| suggestions.range.clone());
+        let start = u32::try_from(selected.start).ok()?;
+        let end = u32::try_from(selected.end).ok()?;
+        self.engine
+            .count_annotation_bytes(u64::try_from(bytes.len()).ok()?);
+        let source = self.sources.add(
+            BString::from(frame.file.as_ref()),
+            SourceKind::File,
+            Arc::from(bytes),
+        )?;
+        let span = SourceSpan { source, start, end };
+        let mut annotations = Annotations::primary(span, "");
+        if let Some(suggestions) = suggestion {
+            for (name, confidence) in suggestions.candidates {
+                annotations.fixes.push(Fix {
+                    message: format!("Use `{name}`.").into(),
+                    edits: vec![Edit {
+                        span,
+                        replacement: name,
+                    }],
+                    confidence,
+                });
+            }
+        }
+        Some(annotations)
+    }
+
+    fn suggestion(
+        &self,
+        body: &[u8],
+        command: &CommandInvocation,
+        source: &[u8],
+        name_span: Range<usize>,
+    ) -> Option<EditSuggestions> {
+        if quoted_name(body, b"Unknown CMake command \"", b'"') == Some(command.name.as_slice()) {
+            let names = self.registry.names().chain(self.scripted.keys());
+            let matches = suggest_candidates_in(Namespace::Command, &command.name, names);
+            return Some(EditSuggestions {
+                range: name_span,
+                candidates: matches,
+            });
+        }
+        if let Some(name) = quoted_name(body, b"uninitialized variable '", b'\'') {
+            let range = variable_span(command, source, name)?;
+            let names = self.vars.visible_names();
+            let matches = suggest_candidates_in(
+                Namespace::Name,
+                name,
+                names
+                    .iter()
+                    .chain(self.project.cache.iter().map(|(key, _)| key)),
+            );
+            return Some(EditSuggestions {
+                range,
+                candidates: matches,
+            });
+        }
+        let dir = self.current_dir_id();
+        if let Some(name) = target_name(body) {
+            let range = argument_span(command, source, name)?;
+            let global = self.project.global_target_bindings().map(|(name, _)| name);
+            let local = self
+                .project
+                .ancestors(dir)
+                .flat_map(|id| self.project.dir(id).local_targets.keys());
+            let matches = suggest_candidates_in(Namespace::Name, name, global.chain(local));
+            return Some(EditSuggestions {
+                range,
+                candidates: matches,
+            });
+        }
+        let unknown = quoted_name(body, b"Unknown target property \"", b'"')?;
+        let target = command.args.get(1)?.text.as_slice();
+        let id = self.project.find_target(dir, target)?;
+        let candidate = self.project.suggest_target_property(id, unknown)?;
+        Some(EditSuggestions {
+            range: argument_span(command, source, unknown)?,
+            candidates: vec![candidate],
+        })
     }
 
     /// `IssueMessage(FATAL_ERROR, text)`: an error that fails the current command.
@@ -205,6 +365,112 @@ impl Interp {
             .and_then(|v| LogLevel::parse(v))
             .unwrap_or(LogLevel::Status)
     }
+}
+
+struct DiagnosticSources<'a> {
+    sources: &'a SourceMap,
+    cmake_root: &'a Path,
+}
+
+impl SourceLookup for DiagnosticSources<'_> {
+    fn source(&self, id: SourceId) -> Option<&SourceFile> {
+        self.sources.get(id)
+    }
+
+    fn is_bundled_module(&self, path: &[u8]) -> bool {
+        !self.cmake_root.as_os_str().is_empty()
+            && to_native(path).starts_with(self.cmake_root.join("Modules"))
+    }
+}
+
+impl crate::Cx<'_> {
+    /// Return whether this session collects diagnostic annotations.
+    #[must_use]
+    pub fn collects_diagnostic_annotations(&self) -> bool {
+        self.interp.config.services.collect_annotations
+    }
+
+    /// Supply advice for a successful command that can still contain a typo.
+    pub fn advise(&mut self, body: BString) {
+        if !self.collects_diagnostic_annotations() {
+            return;
+        }
+        let interp = &mut *self.interp;
+        let location = Location::Backtrace(display_backtrace(&interp.bt));
+        let annotations = interp.annotate(&location, &body).map(Box::new);
+        let diag = Diagnostic {
+            kind: MessageKind::Log,
+            effect: Effect::None,
+            category: None,
+            policy: None,
+            location,
+            body,
+            annotations,
+        };
+        interp.engine.record_advice(&diag);
+        if let Some(options) = interp.engine.rich_options() {
+            interp.write_rich(&diag, options);
+        }
+    }
+}
+
+fn quoted_name<'a>(body: &'a [u8], prefix: &[u8], end: u8) -> Option<&'a [u8]> {
+    let tail = body.strip_prefix(prefix)?;
+    let name = tail.split(|&byte| byte == end).next()?;
+    (name.len() < tail.len()).then_some(name)
+}
+
+fn target_name(body: &[u8]) -> Option<&[u8]> {
+    if let Some(name) = quoted_name(
+        body,
+        b"get_target_property() called with non-existent target \"",
+        b'"',
+    ) {
+        return Some(name);
+    }
+    let body = body.strip_prefix(b"Cannot specify ")?;
+    let prefix = b" for target \"";
+    let start = body
+        .windows(prefix.len())
+        .position(|bytes| bytes == prefix)?;
+    quoted_name(body.get(start..)?, prefix, b'"')
+}
+
+fn variable_span(command: &CommandInvocation, source: &[u8], name: &[u8]) -> Option<Range<usize>> {
+    let token = [b"${".as_slice(), name, b"}"].concat();
+    let token = token.as_slice();
+    let mut spans = command.args.iter().flat_map(|arg| {
+        source
+            .get(arg.span.clone())
+            .into_iter()
+            .flat_map(move |bytes| {
+                bytes
+                    .windows(token.len())
+                    .enumerate()
+                    .filter(move |(_, raw)| *raw == token)
+                    .map(move |(offset, _)| arg.span.start + offset + 2)
+            })
+    });
+    let start = spans.next().filter(|_| spans.next().is_none())?;
+    Some(start..start + name.len())
+}
+
+fn argument_span(command: &CommandInvocation, source: &[u8], name: &[u8]) -> Option<Range<usize>> {
+    let mut spans = command.args.iter().filter_map(|arg| {
+        let raw = source.get(arg.span.clone())?;
+        if raw == name {
+            Some(arg.span.clone())
+        } else if raw
+            .strip_prefix(b"\"")
+            .and_then(|text| text.strip_suffix(b"\""))
+            == Some(name)
+        {
+            Some(arg.span.start + 1..arg.span.end - 1)
+        } else {
+            None
+        }
+    });
+    spans.next().filter(|_| spans.next().is_none())
 }
 
 /// Backtrace as CMake prints it: the top frame, then only command frames. File frames

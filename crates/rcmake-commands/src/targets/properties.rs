@@ -179,6 +179,18 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 .or_else(|| model.get_prop(&owner, property)),
         }
     };
+    if value.is_none()
+        && cx.collects_diagnostic_annotations()
+        && let Some((candidate, _)) = cx.project().suggest_target_property(binding.id(), property)
+    {
+        cx.advise(
+            format!(
+                "Unknown target property \"{}\". Use \"{candidate}\".",
+                BString::from(property)
+            )
+            .into(),
+        );
+    }
     let value = value.unwrap_or_else(|| [bytes(var), b"-NOTFOUND"].concat().into());
     cx.set_var(bytes(var), value);
     Ok(Flow::Normal)

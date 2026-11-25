@@ -72,6 +72,8 @@ pub enum ApiError {
         exit_code: i32,
         /// Diagnostics emitted during evaluation.
         diagnostics: Vec<Diagnostic>,
+        /// Source map for the diagnostic annotations, if available.
+        sources: Option<Arc<rcmake_diag::SourceMap>>,
     },
     /// Resolution or generation failed after evaluation.
     #[error("Generation failed. {message}")]
@@ -80,6 +82,8 @@ pub enum ApiError {
         message: String,
         /// Diagnostics emitted during evaluation and generation.
         diagnostics: Vec<Diagnostic>,
+        /// Source map for the diagnostic annotations, if available.
+        sources: Option<Arc<rcmake_diag::SourceMap>>,
     },
     /// A host operation failed.
     #[error(transparent)]
@@ -371,6 +375,10 @@ pub struct PreparedConfigure {
 }
 
 impl PreparedConfigure {
+    pub(crate) fn allows_persistence(&self) -> bool {
+        cfg!(feature = "native") && self.overlay.is_none() && self.denied.is_none()
+    }
+
     pub(crate) fn wants_index(&self) -> bool {
         self.collect_index
     }

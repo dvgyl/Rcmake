@@ -420,7 +420,7 @@ def check_project(args, source: Path, work: Path, compat: Path, native: Path,
                   reference: Path | None, enabled_flags: list[str], env: dict[str, str]) -> bool:
     """Compare stable output and report whether parallel workers ran."""
     work.mkdir()
-    env = observe_compilers(work, env)
+    env = observe_compilers(work, {**env, "RCMAKE_CACHE_DIR": str(work / "cache")})
     log = Path(env["RCMAKE_M6_PROBE_LOG"])
     paths = {compat: "<cmake-command>", native: "<cmake-command>"}
     build = work / "compat-jobs-1"
@@ -436,7 +436,6 @@ def check_project(args, source: Path, work: Path, compat: Path, native: Path,
         compare({"stderr": reference_stderr}, {"stderr": baseline_streams["stderr"]}, "Compat jobs 1")
 
     env = {**env, "RCMAKE_PROBE_JOBS": "4"}
-    parallel = False
     for label, binary, overrides in (
         ("compat-jobs-4", compat, {}),
         ("oracle-mode", native, {"RCMAKE_ORACLE_MODE": "1", "RCMAKE_DIAGNOSTICS": "rich"}),
@@ -446,8 +445,27 @@ def check_project(args, source: Path, work: Path, compat: Path, native: Path,
         streams = configure(args, binary, source, build, {**env, **overrides})
         compare({**baseline, **baseline_streams},
                 {**snapshot(build, paths), **configure_streams(streams, build, paths)}, label)
-        if label == "compat-jobs-4":
-            parallel = overlap_on_workers(probe_compiles(env))
+        if overlap_on_workers(probe_compiles(env)):
+            raise ValueError(f"Parallel probe workers ran in {label}.")
+
+    parallel = False
+    native_baseline = None
+    for jobs in ("1", "4"):
+        log.unlink(missing_ok=True)
+        label = f"native-jobs-{jobs}"
+        build = work / label
+        native_env = {**env, "RCMAKE_PROBE_JOBS": jobs, "RCMAKE_NO_PROBE_CACHE": "1"}
+        streams = configure_streams(configure(args, native, source, build, native_env),
+                                    build, paths, compat=False)
+        artifacts = {**snapshot(build, paths), "stdout": streams["stdout"]}
+        compare({**baseline, "stdout": baseline_streams["stdout"]}, artifacts, label)
+        parallel = overlap_on_workers(probe_compiles(env))
+        if jobs == "1":
+            native_baseline = {**artifacts, "stderr": streams["stderr"]}
+            if parallel:
+                raise ValueError("Parallel probe workers ran with RCMAKE_PROBE_JOBS=1.")
+        else:
+            compare(native_baseline, {**artifacts, "stderr": streams["stderr"]}, label)
 
     for flag in enabled_flags:
         label = flag[2:].split("=")[0]
@@ -571,12 +589,15 @@ def main() -> int:
     parser.add_argument("--cmake-arg", action="append", default=[],
                         help="Add a configure argument. Use --cmake-arg=-DNAME=VALUE.")
     parser.add_argument("--timeout", type=int, default=120, help="Seconds per command.")
-    parser.add_argument("--require-native", action="store_true", help="Fail if a native flag is absent.")
+    parser.add_argument("--require-native", action="store_true",
+                        help="Require the Native flags and overlapping probe workers.")
+    parser.add_argument("--require-workers", action="store_true",
+                        help="Fail if the Native jobs-4 configure has no overlapping probe jobs.")
     parser.add_argument("--dry-run", action="store_true", help="Print the plan without running commands.")
     args = parser.parse_args()
     if args.timeout < 1:
         parser.error("Use a positive timeout.")
-    if not args.rcmake and (args.projects or args.cmake_arg or args.require_native):
+    if not args.rcmake and (args.projects or args.cmake_arg or args.require_native or args.require_workers):
         parser.error("Use --rcmake to select the Milestone 6 gate.")
     if not args.rcmake:
         binary = args.rcmake_bin or Path(os.environ.get("RCMAKE_BIN", ROOT / "target/stage/bin/rcmake"))
@@ -588,7 +609,7 @@ def main() -> int:
                                     dict(os.environ, SOURCE_DATE_EPOCH="946684800", TZ="UTC"))
     if args.dry_run:
         print(f"Executable {args.rcmake}. Projects {', '.join(map(str, args.projects)) or 'built-in C/C++ fixture'}.")
-        print("Compare Compat jobs 1 and 4, oracle mode, and the available native flags.")
+        print("Compare Compat and Native jobs 1 and 4, oracle mode, and the available Native flags.")
         print("Check Ninja, the CMake cache, compile commands, File API replies, both streams, and profiles.")
         if args.baseline:
             print(f"Compare Compat stderr with {args.baseline}.")
@@ -629,7 +650,7 @@ def main() -> int:
                 raise ValueError(f"No CMakeLists.txt in {source}.")
             complete &= check_project(args, source, root / f"project-{index}", compat, native,
                                       reference, enabled, env)
-    return 0 if complete else 2
+    return 2 if (args.require_native or args.require_workers) and not complete else 0
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+use crate::{SemanticContext, SemanticProvider};
+
 use std::{
     path::{Path, PathBuf},
     sync::{

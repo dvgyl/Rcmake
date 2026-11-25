@@ -2,16 +2,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rcmake_base::{BString, Limits, list};
-use rcmake_diag::{
-    Backtrace, Diagnostic, Effect, FrameKind, Location, MessageKind, SourceId, SourceMap,
-    source::SourceKind,
-};
+use rcmake_base::{BString, list};
+use rcmake_diag::{Diagnostic, Effect, Location, MessageKind, SourceMap};
 use rcmake_eval::{
     BuiltinFn, CmdError, IncludeOptions, Interp, InterpConfig, Registry, RunMode, StopReason,
 };
@@ -21,13 +16,14 @@ use rcmake_model::{
     Cache, CacheEntry, CacheType, DirId, GeneratorKind, GeneratorSpec, ProjectModel,
 };
 use rcmake_resolve::{ResolveError, ResolveOptions, ide::IdeFlavor, resolve_with_options};
-use rcmake_syntax::{CommandInvocation, parse_list_file};
 
 use crate::{
-    ApiError, CompletionState, ConfigureRequest, ConfigureResult, EvaluationFacts, FileEdge,
-    FileEdgeKind, LedgerLevel, PreparedConfigure, PreviousValue, ResolvedEntry, SourceLocation,
-    SourceRange, VarLedgerSnapshot, VariableWriteDetails,
+    ApiError, CompletionState, ConfigureRequest, ConfigureResult, LedgerLevel, PreparedConfigure,
+    ResolvedEntry, SourceLocation, VarLedgerSnapshot,
 };
+
+mod facts;
+use facts::{SourceReads, evaluation_facts, merge_diagnostics};
 
 /// Evaluate CMakeLists.txt and resolve the configured project's build graphs.
 ///
@@ -63,7 +59,9 @@ impl PreparedConfigure {
         let command = host.current_exe()?;
         let command = host.canonicalize(&command).unwrap_or(command);
         let reads = Arc::new(Mutex::new(SourceReads::default()));
-        let host = if prepared.wants_index() {
+        let host = if prepared.wants_index()
+            || !matches!(prepared.services.provenance, LedgerLevel::Off)
+        {
             let reads = Arc::clone(&reads);
             prepared.observed_host(
                 move |path, bytes| {
@@ -77,14 +75,29 @@ impl PreparedConfigure {
         } else {
             host
         };
+        let mut services = prepared.services.clone();
+        if prepared.wants_index()
+            || !matches!(services.provenance, LedgerLevel::Off)
+            || services.collect_annotations
+            || prepared.initial_cache.is_some()
+            || prepared
+                .defines
+                .iter()
+                .any(|define| define.name == b"CMAKE_TOOLCHAIN_FILE")
+            || [&prepared.source_dir, &prepared.build_dir]
+                .into_iter()
+                .any(|dir| is_file(host.as_ref(), &dir.join("PreLoad.cmake")))
+        {
+            Arc::make_mut(&mut services).speed.incremental = false;
+        }
         let mut runtime = rcmake_commands::ConfigureRuntime::new(
             host,
             &prepared.source_dir,
             &prepared.build_dir,
-            &prepared.services,
-            false,
+            &services,
+            prepared.allows_persistence(),
         );
-        let result = prepared.evaluate_in(&mut runtime, generator, command, &reads);
+        let result = prepared.evaluate_in(&mut runtime, generator, command, &reads, services);
         let complete = result.as_ref().is_ok_and(|result| {
             result.completion == CompletionState::Complete && prepared.denied_processes().is_empty()
         });
@@ -98,6 +111,7 @@ impl PreparedConfigure {
         generator: GeneratorKind,
         command: PathBuf,
         reads: &Mutex<SourceReads>,
+        services: Arc<crate::Services>,
     ) -> Result<ConfigureResult, ApiError> {
         let prepared = self;
         let host = runtime.host();
@@ -111,11 +125,11 @@ impl PreparedConfigure {
             diag: prepared.diag.clone(),
             defines: Vec::new(),
             script_args: Vec::new(),
-            services: prepared.services.clone(),
+            services,
         };
         let mut interp = Interp::new(config.clone(), register);
         seed_cache(&mut interp, prepared);
-        let mut diagnostics = run_preloads(&mut interp, prepared, &config)?;
+        let (preload_diagnostics, preload_sources) = run_preloads(&mut interp, prepared, &config)?;
         initialize(&mut interp, prepared, generator);
         set_directory_vars(&mut interp, prepared);
         if let Some(toolchain) = toolchain_file(&mut interp, prepared, host.as_ref()) {
@@ -129,6 +143,18 @@ impl PreparedConfigure {
             runtime.run(&mut interp, &[]).exit_code
         };
         let stop = interp.stop_reason();
+        let mut sources = if prepared.wants_index() || prepared.services.collect_annotations {
+            interp.take_diagnostic_sources()
+        } else {
+            SourceMap::default()
+        };
+        let mut diagnostics = Vec::new();
+        merge_diagnostics(
+            &mut diagnostics,
+            &mut sources,
+            &preload_diagnostics,
+            &preload_sources,
+        );
         diagnostics.extend_from_slice(interp.diag_engine().diagnostics());
         let var_ledger = interp.take_var_ledger().map(|ledger| {
             VarLedgerSnapshot::from_ledger(ledger, prepared.services.provenance.clone())
@@ -146,7 +172,29 @@ impl PreparedConfigure {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             &prepared.limits,
+            sources,
+            prepared.wants_index(),
         );
+        if prepared.wants_index() {
+            result.facts.callables = interp
+                .callable_definitions()
+                .map(
+                    |(kind, name, file, line, params)| crate::CallableDefinition {
+                        name: name.clone(),
+                        kind,
+                        location: SourceLocation {
+                            path: file.into(),
+                            line,
+                            byte_offset: None,
+                            source_id: None,
+                            range: None,
+                        },
+                        parameters: params.to_vec(),
+                        documentation: None,
+                    },
+                )
+                .collect();
+        }
         let has_snapshot = result.model.dir(DirId::ROOT).final_policies.is_some()
             || result.model.targets().next().is_some();
         let resolution = match stop {
@@ -175,11 +223,14 @@ impl PreparedConfigure {
                 result.completion = partial(false);
                 Ok(())
             }
-            None if outcome == 0 => resolve_project(prepared, generator, &mut result),
+            None if outcome == 0 => {
+                resolve_project(prepared, host.as_ref(), generator, &mut result)
+            }
             None => {
                 return Err(ApiError::ConfigureFailed {
                     exit_code: outcome,
                     diagnostics: result.diagnostics,
+                    sources: result.facts.source_map,
                 });
             }
         };
@@ -364,8 +415,9 @@ fn run_preloads(
     interp: &mut Interp,
     prepared: &PreparedConfigure,
     config: &InterpConfig,
-) -> Result<Vec<Diagnostic>, ApiError> {
+) -> Result<(Vec<Diagnostic>, SourceMap), ApiError> {
     let mut diagnostics = Vec::new();
+    let mut sources = SourceMap::default();
     let source = &prepared.source_dir;
     let build = &prepared.build_dir;
     for dir in std::iter::once(source).chain((build != source).then_some(build)) {
@@ -378,7 +430,13 @@ fn run_preloads(
         *preload.cx().cache() = std::mem::take(interp.cx().cache());
         let _ = preload.cx().include_file(&file, IncludeOptions::default());
         *interp.cx().cache() = std::mem::take(preload.cx().cache());
-        diagnostics.extend_from_slice(preload.diag_engine().diagnostics());
+        let preload_sources = preload.take_diagnostic_sources();
+        merge_diagnostics(
+            &mut diagnostics,
+            &mut sources,
+            preload.diag_engine().diagnostics(),
+            &preload_sources,
+        );
         match preload.stop_reason() {
             Some(StopReason::Cancelled) => return Err(ApiError::Cancelled),
             Some(StopReason::StepBudgetExceeded { limit }) => {
@@ -393,12 +451,13 @@ fn run_preloads(
                 return Err(ApiError::ConfigureFailed {
                     exit_code: preload.exit_code(),
                     diagnostics,
+                    sources: Some(Arc::new(sources)),
                 });
             }
             None => {}
         }
     }
-    Ok(diagnostics)
+    Ok((diagnostics, sources))
 }
 
 fn is_file(host: &dyn Host, path: &Path) -> bool {
@@ -436,6 +495,7 @@ fn toolchain_file(
 
 fn resolve_project(
     prepared: &PreparedConfigure,
+    host: &dyn Host,
     generator: GeneratorKind,
     result: &mut ConfigureResult,
 ) -> Result<(), ApiError> {
@@ -452,8 +512,7 @@ fn resolve_project(
             _ => None,
         },
     };
-    let host = prepared.host();
-    let resolved = resolve_with_options(&result.model, host.as_ref(), &configs, &options);
+    let resolved = resolve_with_options(&result.model, host, &configs, &options);
     let mut generation = match resolved {
         Ok(generation) if !cancelled(prepared) => generation,
         Ok(_) => {
@@ -471,6 +530,7 @@ fn resolve_project(
             return Err(ApiError::GenerateFailed {
                 message,
                 diagnostics: std::mem::take(&mut result.diagnostics),
+                sources: result.facts.source_map.clone(),
             });
         }
     };
@@ -508,277 +568,6 @@ fn missing_source(error: &ResolveError) -> bool {
         }
         _ => false,
     }
-}
-
-const MAX_SOURCE_READS: usize = 4096;
-const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
-
-#[derive(Default)]
-struct SourceReads {
-    files: BTreeMap<PathBuf, Option<Arc<[u8]>>>,
-    bytes: usize,
-}
-
-impl SourceReads {
-    fn record(&mut self, path: &Path, bytes: &[u8]) {
-        if let Some(previous) = self.files.get_mut(path) {
-            if previous
-                .as_deref()
-                .is_some_and(|previous| previous != bytes)
-            {
-                *previous = None;
-            }
-        } else if self.files.len() < MAX_SOURCE_READS
-            && self.bytes.saturating_add(bytes.len()) <= MAX_SOURCE_BYTES
-        {
-            self.files.insert(path.to_owned(), Some(Arc::from(bytes)));
-            self.bytes += bytes.len();
-        }
-    }
-}
-
-struct ParsedSource {
-    id: SourceId,
-    commands: Arc<[CommandInvocation]>,
-}
-
-fn evaluation_facts(
-    model: &ProjectModel,
-    ledger: Option<&VarLedgerSnapshot>,
-    reads: &SourceReads,
-    limits: &Limits,
-) -> EvaluationFacts {
-    let mut facts = EvaluationFacts::default();
-    let mut sources = SourceMap::default();
-    let mut parsed = BTreeMap::new();
-    for file in model.dirs().flat_map(|(_, directory)| &directory.listfiles) {
-        if parsed.contains_key(file) {
-            continue;
-        }
-        let Some(Some(bytes)) = reads.files.get(&path::to_native(file)) else {
-            continue;
-        };
-        let Some(id) = sources.add(file.clone(), SourceKind::File, Arc::clone(bytes)) else {
-            continue;
-        };
-        let commands = parse_list_file(bytes, id, SourceKind::File, limits)
-            .map_or_else(|_| Arc::from([]), |list| list.commands);
-        parsed.insert(file.clone(), ParsedSource { id, commands });
-    }
-    if !parsed.is_empty() {
-        facts.source_map = Some(Arc::new(sources));
-    }
-
-    for (id, target) in model.targets() {
-        if let Some(mut site) = SourceLocation::from_backtrace(&target.backtrace) {
-            let name = target
-                .backtrace
-                .top()
-                .and_then(|frame| frame.name.as_deref());
-            let (source, command) = command_at(&parsed, &site, name);
-            site.source_id = source;
-            site.range = command.and_then(|command| {
-                command
-                    .args
-                    .first()
-                    .filter(|arg| arg.text == target.name)
-                    .and_then(|arg| source_range(&arg.span))
-            });
-            facts.target_sites.insert(id, site);
-        }
-        include_edges(
-            model,
-            &parsed,
-            target.dir,
-            &target.backtrace,
-            &mut facts.file_edges,
-        );
-    }
-    for (_, dir) in model.dirs() {
-        let Some((parent, site)) = dir
-            .parent
-            .zip(SourceLocation::from_backtrace(&dir.backtrace))
-        else {
-            continue;
-        };
-        let destination =
-            path::from_native_cmake(&path::to_native(&dir.source_dir).join("CMakeLists.txt"));
-        if parsed.contains_key(&destination) {
-            add_file_edge(
-                &parsed,
-                &mut facts.file_edges,
-                FileEdgeKind::AddSubdirectory,
-                parent,
-                site,
-                b"add_subdirectory",
-                destination,
-            );
-        }
-        include_edges(
-            model,
-            &parsed,
-            parent,
-            &dir.backtrace,
-            &mut facts.file_edges,
-        );
-    }
-    if let Some(ledger) = ledger {
-        for name in ledger.names() {
-            for event in ledger.history(name) {
-                let dir = write_directory(model, &event.backtrace);
-                if let Some(dir) = dir {
-                    include_edges(model, &parsed, dir, &event.backtrace, &mut facts.file_edges);
-                }
-                facts.variable_writes.insert(
-                    event.seq,
-                    VariableWriteDetails {
-                        dir,
-                        binding_dir: event.binding_dir,
-                        command: event
-                            .backtrace
-                            .top()
-                            .and_then(|frame| frame.name.as_deref())
-                            .map(BString::from),
-                        previous: event
-                            .old_value
-                            .clone()
-                            .map_or(PreviousValue::Unset, PreviousValue::Value),
-                    },
-                );
-            }
-        }
-    }
-    facts
-}
-
-fn write_directory(model: &ProjectModel, trace: &Backtrace) -> Option<DirId> {
-    let mut frames = trace.frames().peekable();
-    while let Some(frame) = frames.next() {
-        if frame.kind != FrameKind::ModuleInclude
-            || frames.peek().is_some_and(|caller| {
-                !caller
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(b"add_subdirectory"))
-            })
-        {
-            continue;
-        }
-        let src = path::to_native(&frame.file);
-        if src.file_name().is_none_or(|name| name != "CMakeLists.txt") {
-            continue;
-        }
-        let dir = path::from_native_cmake(src.parent()?);
-        let mut matching = model
-            .dirs()
-            .filter(|(_, candidate)| candidate.source_dir == dir);
-        if let Some((id, _)) = matching.next() {
-            return matching.next().is_none().then_some(id);
-        }
-    }
-    None
-}
-
-fn include_edges(
-    model: &ProjectModel,
-    parsed: &BTreeMap<BString, ParsedSource>,
-    dir: DirId,
-    trace: &Backtrace,
-    edges: &mut Vec<FileEdge>,
-) {
-    let mut frames = trace.frames().peekable();
-    while let Some(frame) = frames.next() {
-        if frame.kind != FrameKind::ModuleInclude {
-            continue;
-        }
-        let Some(caller) = frames.peek() else {
-            break;
-        };
-        if !caller
-            .name
-            .as_deref()
-            .is_some_and(|name| name.eq_ignore_ascii_case(b"include"))
-            || !model
-                .dir(dir)
-                .listfiles
-                .iter()
-                .any(|file| file.as_slice() == frame.file.as_ref())
-        {
-            continue;
-        }
-        add_file_edge(
-            parsed,
-            edges,
-            FileEdgeKind::Include,
-            dir,
-            SourceLocation {
-                path: caller.file.as_ref().into(),
-                line: caller.line,
-                byte_offset: None,
-                source_id: None,
-                range: None,
-            },
-            b"include",
-            frame.file.as_ref().into(),
-        );
-    }
-}
-
-fn add_file_edge(
-    parsed: &BTreeMap<BString, ParsedSource>,
-    edges: &mut Vec<FileEdge>,
-    kind: FileEdgeKind,
-    dir: DirId,
-    mut site: SourceLocation,
-    name: &[u8],
-    destination: BString,
-) {
-    let (source, command) = command_at(parsed, &site, Some(name));
-    let Some(argument_range) = command
-        .and_then(|command| command.args.first())
-        .and_then(|arg| source_range(&arg.span))
-    else {
-        return;
-    };
-    site.source_id = source;
-    let edge = FileEdge {
-        kind,
-        dir,
-        site,
-        argument_range: Some(argument_range),
-        destination,
-    };
-    if edges.len() < MAX_SOURCE_READS && !edges.contains(&edge) {
-        edges.push(edge);
-    }
-}
-
-fn source_range(range: &Range<usize>) -> Option<SourceRange> {
-    Some(SourceRange {
-        start: u32::try_from(range.start).ok()?,
-        end: u32::try_from(range.end).ok()?,
-    })
-}
-
-fn command_at<'a>(
-    parsed: &'a BTreeMap<BString, ParsedSource>,
-    site: &SourceLocation,
-    name: Option<&[u8]>,
-) -> (Option<SourceId>, Option<&'a CommandInvocation>) {
-    let Some(source) = parsed.get(&site.path) else {
-        return (None, None);
-    };
-    let first = source
-        .commands
-        .partition_point(|command| command.line < site.line);
-    let mut commands = source
-        .commands
-        .iter()
-        .skip(first)
-        .take_while(|command| command.line == site.line)
-        .filter(|command| name.is_some_and(|name| command.name.eq_ignore_ascii_case(name)));
-    let command = commands.next().filter(|_| commands.next().is_none());
-    (Some(source.id), command)
 }
 
 fn configurations(model: &ProjectModel, generator: GeneratorKind) -> Vec<ConfigId> {

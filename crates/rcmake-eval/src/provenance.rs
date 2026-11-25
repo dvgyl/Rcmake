@@ -17,6 +17,27 @@ const HISTORY_BYTES: usize = 192;
 const EVENT_BYTES: usize = 2 * std::mem::size_of::<(VarEvent, usize)>();
 const PREVIEW_BYTES: usize = 256;
 
+impl crate::Interp {
+    /// Return the names, declaration sites and parameters of user-defined commands.
+    pub fn callable_definitions(
+        &self,
+    ) -> impl Iterator<Item = (crate::UserCommandKind, &BString, &[u8], u32, &[BString])> {
+        self.scripted.iter().filter_map(|(key, cmd)| {
+            let crate::Command::User(cmd) = cmd else {
+                return None;
+            };
+            // Renamed previous definitions have a separate internal lookup key.
+            (key.eq_ignore_ascii_case(&cmd.name)).then_some((
+                cmd.kind,
+                &cmd.name,
+                cmd.body.file.as_ref(),
+                cmd.line,
+                cmd.params.as_slice(),
+            ))
+        })
+    }
+}
+
 /// A change to a normal or cache variable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VarOp {
@@ -45,15 +66,26 @@ pub struct ValuePreview {
 
 impl ValuePreview {
     fn new(value: &[u8]) -> Self {
-        let hash = value.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-        });
         Self {
             prefix: value.get(..PREVIEW_BYTES).unwrap_or(value).into(),
             len: value.len(),
-            hash,
+            hash: value_hash(value),
         }
     }
+
+    /// Check whether these recorded bytes and hash match a full value.
+    #[must_use]
+    pub fn matches(&self, value: &[u8]) -> bool {
+        self.len == value.len()
+            && value.starts_with(&self.prefix)
+            && (self.len == self.prefix.len() || self.hash == value_hash(value))
+    }
+}
+
+fn value_hash(value: &[u8]) -> u64 {
+    value.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// A recorded variable write.

@@ -33,20 +33,14 @@ pub(crate) struct ExecLogEntry<'a> {
     pub(crate) duration: Duration,
 }
 
-/// Append a JSON line when `RCMAKE_EXEC_LOG` names a log file.
+/// Append a JSON line to the file selected by `RCMAKE_EXEC_LOG`.
 ///
 /// Reject symbolic links at the log and lock paths.
 /// On Unix, restrict access to the file owner.
 /// On Windows, use a trusted directory with private access controls.
 /// A logging error leaves the tool's output and exit code intact.
-pub(crate) fn append_exec_log(host: &dyn Host, entry: &ExecLogEntry<'_>) {
-    let Some(path) = host
-        .env_get(b"RCMAKE_EXEC_LOG")
-        .filter(|path| !path.is_empty())
-    else {
-        return;
-    };
-    let requested = host.initial_cwd().join(to_native(path.as_slice()));
+pub(crate) fn append_exec_log(host: &dyn Host, path: &[u8], entry: &ExecLogEntry<'_>) {
+    let requested = host.initial_cwd().join(to_native(path));
     let _ = append_at_path(host, &requested, &json_line(entry));
 }
 
@@ -424,15 +418,14 @@ mod tests {
             duration: Duration::from_micros(16_750),
         };
         let log_name = from_native(&path);
-        host.env_set(b"RCMAKE_EXEC_LOG", Some(&log_name));
         host.write(&target, b"unchanged", WriteMode::CreateNew)?;
         match host.symlink(&target, &lock) {
             Ok(()) => {
-                append_exec_log(host, &entry);
+                append_exec_log(host, &log_name, &entry);
                 assert!(host.metadata(&path, Follow::No).is_err());
                 host.remove_file(&lock)?;
                 host.symlink(&target, &path)?;
-                append_exec_log(host, &entry);
+                append_exec_log(host, &log_name, &entry);
                 assert_eq!(host.read(&target, range)?, b"unchanged");
                 host.remove_file(&path)?;
             }
@@ -441,7 +434,7 @@ mod tests {
             Err(error) => return Err(error),
         }
 
-        append_exec_log(host, &entry);
+        append_exec_log(host, &log_name, &entry);
         #[cfg(unix)]
         for private in [&path, &lock] {
             assert_eq!(host.metadata(private, Follow::No)?.mode & 0o7777, 0o600);
@@ -453,7 +446,7 @@ mod tests {
         );
         assert!(!String::from_utf8_lossy(&first).contains("secret"));
         host.write(&path, b"{\"argv\":[", WriteMode::Append)?;
-        append_exec_log(host, &entry);
+        append_exec_log(host, &log_name, &entry);
         assert_eq!(host.read(&path, range)?, first.repeat(2));
         Ok(())
     }

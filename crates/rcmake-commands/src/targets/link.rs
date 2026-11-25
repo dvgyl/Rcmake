@@ -237,40 +237,58 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     }
     let model = cx.project();
     let root = model.dir(DirId::ROOT).source_dir.clone();
-    let target = model
-        .target_mut(id)
-        .ok_or_else(|| model_error(ModelError::UnknownObject))?;
-    if has_item && let Some(frame) = bt.top() {
-        let relative = frame
-            .file
-            .strip_prefix(root.as_slice())
-            .and_then(|file| file.strip_prefix(b"/"));
-        let file = BString::from(relative.unwrap_or(&frame.file));
-        let name = frame
-            .name
-            .as_deref()
-            .map_or_else(|| "target_link_libraries".into(), BString::from);
-        let call = format!("\n * {file}:{} ({name})", frame.line);
-        target
-            .props
-            .append_string(signature.property(), call.as_bytes());
-    }
     let check_links = !own.is_empty();
-    let cache_key = (!legacy_dependencies.is_empty()).then(|| legacy_link_cache_key(&target.name));
-    if check_links {
-        target
-            .usage
-            .link_libraries
-            .get_or_insert_default()
-            .extend(own);
-    }
-    if !interface.is_empty() {
-        target
-            .usage
-            .interface_link_libraries
-            .get_or_insert_default()
-            .extend(interface);
-    }
+    let fields = [
+        check_links.then_some(b"LINK_LIBRARIES".as_slice()),
+        (!interface.is_empty()).then_some(b"INTERFACE_LINK_LIBRARIES"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|field| (field, rcmake_model::AppendMode::List));
+    let cache_key = model
+        .update_target_properties(
+            id,
+            fields,
+            rcmake_model::PropOrigin {
+                dir,
+                backtrace: &bt,
+            },
+            |target| {
+                if has_item && let Some(frame) = bt.top() {
+                    let relative = frame
+                        .file
+                        .strip_prefix(root.as_slice())
+                        .and_then(|file| file.strip_prefix(b"/"));
+                    let file = BString::from(relative.unwrap_or(&frame.file));
+                    let name = frame
+                        .name
+                        .as_deref()
+                        .map_or_else(|| "target_link_libraries".into(), BString::from);
+                    let call = format!("\n * {file}:{} ({name})", frame.line);
+                    target
+                        .props
+                        .append_string(signature.property(), call.as_bytes());
+                }
+                let cache_key =
+                    (!legacy_dependencies.is_empty()).then(|| legacy_link_cache_key(&target.name));
+                if check_links {
+                    target
+                        .usage
+                        .link_libraries
+                        .get_or_insert_default()
+                        .extend(own);
+                }
+                if !interface.is_empty() {
+                    target
+                        .usage
+                        .interface_link_libraries
+                        .get_or_insert_default()
+                        .extend(interface);
+                }
+                cache_key
+            },
+        )
+        .map_err(model_error)?;
     if let Some(key) = cache_key {
         let mut value = cx
             .cache()

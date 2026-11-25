@@ -4,23 +4,33 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use rcmake_base::{BString, truth::is_on};
+use rcmake_commands::ConfigureRuntime;
 use rcmake_diag::{Effect, MessageKind};
-use rcmake_eval::{BuiltinFn, CmdError, Cx, IncludeOptions, Interp, Registry, RunMode};
+use rcmake_eval::{BuiltinFn, CmdError, Cx, Interp, Registry, RunMode, Services};
 use rcmake_host::{FileKind, FileTime, Follow, Host, Stream, WriteMode, path};
 use rcmake_instrument::Query;
 use rcmake_json::Value;
 use rcmake_model::{Cache, CacheType, GeneratorKind};
 
-use crate::options::{self, CacheEdit, DirectoryArg, Options};
-use crate::{cache, emit_cli_error, new_interp, new_interp_with_paths, presets};
+use crate::options::{self, DirectoryArg, Options};
+use crate::persona::{
+    DiagStyle, Persona, oracle_mode, resolve_diag_style, resolve_rich_color, stick_diag_style,
+};
+use crate::profile::ProfilePhase;
+use crate::{cache, emit_cli_error, new_interp_with_paths, presets};
 
 mod cache_setup;
 mod diagnostics;
 mod graphviz;
+mod preloads;
+mod profiling;
+mod speed;
 #[cfg(test)]
 mod tests;
 
 use graphviz::write_graphviz;
+use preloads::Preloads;
+use profiling::Profilers;
 mod unused_cli;
 
 pub(crate) use diagnostics::initialize_diagnostics;
@@ -97,7 +107,8 @@ struct ConfigureSession<'a> {
     src: PathBuf,
     bin: PathBuf,
     preset: presets::Application,
-    profiler: Option<Arc<crate::profile::Recorder>>,
+    profiling: Profilers,
+    services: Services,
 }
 
 struct Configured {
@@ -112,16 +123,11 @@ fn configure_project(
     cmake_command: PathBuf,
     cmake_root: PathBuf,
 ) -> Result<(), Exit> {
+    let start = host.monotonic();
     let (mut session, saved) = ConfigureSession::resolve(argv, opts, host)?;
-    let mut runtime = rcmake_commands::ConfigureRuntime::new(
-        Arc::clone(&session.host),
-        &session.src,
-        &session.bin,
-        &Default::default(),
-        false,
-    );
-    let (mut interp, has_cache) = session.initialize(&runtime, saved, cmake_command, cmake_root)?;
-    let start = session.host.monotonic();
+    let (mut runtime, mut interp, has_cache) =
+        session.initialize(saved, cmake_command, cmake_root)?;
+    let configure_start = session.host.monotonic();
     let time = session.host.now();
     let mut preloads = session.apply_cache_edits(&mut interp);
     let mut results = std::mem::take(&mut preloads.results);
@@ -137,26 +143,24 @@ fn configure_project(
         if preloads.missing {
             return Err(Exit::Code(1));
         }
-        let configured =
-            session.configure(&mut runtime, &mut interp, has_cache, start, preloads)?;
+        let configured = session.configure(
+            &mut runtime,
+            &mut interp,
+            has_cache,
+            configure_start,
+            preloads,
+        )?;
         session.generate(&mut interp, configured, &mut results)
     })();
-    runtime.finish(outcome.is_ok());
+    runtime.finish(outcome.is_ok() && !session.opts.view);
     let code = match &outcome {
         Ok(()) => 0,
         Err(Exit::Code(code)) => *code,
         Err(Exit::Message(_)) => 1,
     };
-    if let Some((profiler, path)) = session
-        .profiler
-        .as_ref()
-        .zip(session.opts.profile_output.as_deref())
-    {
-        profiler
-            .write(session.host.as_ref(), path)
-            .map_err(|error| Exit::Message(format!("Could not write profiling output: {error}")))?;
-    }
+    let profile = session.profiling.write(session.host.as_ref(), start);
     session.write_sarif(&mut interp, results, time, code)?;
+    profile?;
     outcome
 }
 
@@ -229,10 +233,7 @@ impl<'a> ConfigureSession<'a> {
             })?;
             saved = Cache::default();
         }
-        let profiler = opts
-            .profile_output
-            .as_ref()
-            .map(|_| Arc::new(crate::profile::Recorder::new(host.as_ref())));
+        let profiling = Profilers::new(host.as_ref(), &opts, &bin);
         Ok((
             Self {
                 argv,
@@ -241,19 +242,19 @@ impl<'a> ConfigureSession<'a> {
                 src,
                 bin,
                 preset,
-                profiler,
+                profiling,
+                services: Services::default(),
             },
             saved,
         ))
     }
 
     fn initialize(
-        &self,
-        runtime: &rcmake_commands::ConfigureRuntime,
+        &mut self,
         saved: Cache,
         cmake_command: PathBuf,
         cmake_root: PathBuf,
-    ) -> Result<(Interp, bool), Exit> {
+    ) -> Result<(ConfigureRuntime, Interp, bool), Exit> {
         let host = self.host.as_ref();
         let generator = self
             .opts
@@ -304,6 +305,33 @@ impl<'a> ConfigureSession<'a> {
             instance: spec_value(None, b"CMAKE_GENERATOR_INSTANCE"),
             ..rcmake_model::GeneratorSpec::default()
         };
+        let (mut speed, persistent) = speed::settings(host, &self.opts, self.profiling.active());
+        let style = resolve_diag_style(self.opts.persona, self.opts.extensions.diagnostics, host);
+        if self.opts.persona == Persona::Native && !oracle_mode(host) {
+            stick_diag_style(host, style);
+        }
+        if speed.incremental
+            && (style == DiagStyle::Rich
+                || saved.contains(b"CMAKE_TOOLCHAIN_FILE")
+                || host.env_get(b"CMAKE_TOOLCHAIN_FILE").is_some()
+                || [&self.src, &self.bin]
+                    .into_iter()
+                    .any(|dir| is_file(host, &dir.join("PreLoad.cmake"))))
+        {
+            speed.incremental = false;
+        }
+        self.services = Services {
+            speed,
+            collect_annotations: style == DiagStyle::Rich,
+            ..Services::default()
+        };
+        let runtime = ConfigureRuntime::new(
+            Arc::clone(&self.host),
+            &self.src,
+            &self.bin,
+            &self.services,
+            persistent,
+        );
         let mut interp = new_interp_with_paths(
             &self.opts,
             RunMode::Configure,
@@ -311,10 +339,9 @@ impl<'a> ConfigureSession<'a> {
             cmake_command,
             cmake_root,
             self.argv,
+            self.services.clone(),
         );
-        if let Some(profiler) = &self.profiler {
-            profiler.attach(&mut interp);
-        }
+        self.prepare_presentation(&mut interp);
         *interp.cx().cache() = saved;
         interp.cx().project().generator = generator_kind;
         interp.cx().project().generator_spec = generator_spec;
@@ -349,125 +376,18 @@ impl<'a> ConfigureSession<'a> {
             cache::insert(interp.cx().cache(), key, value, Some(CacheType::Internal));
         }
         set_directory_vars(&mut interp, &self.src, &self.bin);
-        Ok((interp, has_cache))
+        Ok((runtime, interp, has_cache))
     }
 
-    fn apply_cache_edits(&mut self, interp: &mut Interp) -> Preloads {
-        let host = self.host.as_ref();
-        let mut preloads = Preloads::default();
-        let mut configured_diagnostics = false;
-        for edit in std::mem::take(&mut self.opts.cache_edits) {
-            match edit {
-                CacheEdit::Define(def) => {
-                    let name = def.name.clone();
-                    diagnostics::warn_legacy_define(host, &name);
-                    if unused_cli::apply_define(interp.cx().cache(), def)
-                        && preloads.tracked.insert(name.clone())
-                    {
-                        interp.track_variable_reads([name]);
-                    }
-                }
-                CacheEdit::Remove(pattern) => {
-                    remove_entries(interp, &pattern, &mut preloads.tracked)
-                }
-                CacheEdit::Preload(script) => {
-                    if !configured_diagnostics {
-                        self.apply_diagnostics(interp);
-                        configured_diagnostics = true;
-                    }
-                    let path = host.initial_cwd().join(&script);
-                    if is_preload_file(host, &path) {
-                        self.run_preload(interp, &script, true, &mut preloads);
-                    } else {
-                        options::out(
-                            host,
-                            &format!("loading initial cache file {}\n", script.display()),
-                        );
-                        emit_cli_error(host, format!("Not a file: {}", path.display()));
-                        if self.opts.view || is_file(host, &self.src.join("CMakeLists.txt")) {
-                            emit_cli_error(
-                                host,
-                                format!("Error processing file: {}", path.display()),
-                            );
-                        }
-                        preloads.missing = true;
-                    }
-                }
-            }
-            if preloads.fatal {
-                break;
-            }
+    fn prepare_presentation(&self, interp: &mut Interp) {
+        self.profiling.attach(interp);
+        if self.services.collect_annotations {
+            let host = self.host.as_ref();
+            interp.set_rich_diagnostics(rcmake_diag::rich::RichOptions {
+                color: resolve_rich_color(host, host.is_terminal(Stream::Stderr), DiagStyle::Rich),
+                ..rcmake_diag::rich::RichOptions::default()
+            });
         }
-        if !configured_diagnostics {
-            self.apply_diagnostics(interp);
-        }
-        if !self.preset.log.is_empty() {
-            options::out(host, &self.preset.log);
-        }
-        for (index, dir) in [&self.src, &self.bin].into_iter().enumerate() {
-            if index == 1 && self.src == self.bin {
-                break;
-            }
-            let file = dir.join("PreLoad.cmake");
-            if is_file(host, &file) {
-                self.run_preload(interp, &file, false, &mut preloads);
-            }
-        }
-        preloads
-    }
-
-    fn run_preload(
-        &self,
-        configure: &mut Interp,
-        script: &Path,
-        initial_cache: bool,
-        preloads: &mut Preloads,
-    ) {
-        let mut interp = new_interp(
-            self.argv,
-            &self.opts,
-            RunMode::Configure,
-            Arc::clone(&self.host),
-        );
-        if let Some(profiler) = &self.profiler {
-            profiler.attach(&mut interp);
-        }
-        *interp.cx().diag_state_mut() = *configure.cx().diag_state();
-        *interp.cx().cache() = std::mem::take(configure.cx().cache());
-        set_directory_vars(&mut interp, &self.src, &self.bin);
-        let pending = configure
-            .unread_variables()
-            .map(BString::from)
-            .collect::<BTreeSet<_>>();
-        interp.track_variable_reads(pending.iter().cloned());
-        if initial_cache {
-            let _ = interp.run_preload_script(script);
-        } else {
-            let _ = interp.cx().include_file(script, IncludeOptions::default());
-        }
-        let unread = interp
-            .unread_variables()
-            .map(BString::from)
-            .collect::<BTreeSet<_>>();
-        configure.untrack_variable_reads(pending.difference(&unread).cloned());
-        *configure.cx().cache() = std::mem::take(interp.cx().cache());
-        let code = interp.exit_code();
-        if code != 0 {
-            preloads.exit_code = code;
-        }
-        preloads.fatal |= interp.fatal_occurred();
-        preloads.results.extend(crate::sarif::take_results(&interp));
-    }
-
-    fn apply_diagnostics(&self, interp: &mut Interp) {
-        let state = initialize_diagnostics(
-            self.host.as_ref(),
-            interp.cx().cache(),
-            &self.preset.warnings,
-            &self.opts.warning_flags,
-            true,
-        );
-        *interp.cx().diag_state_mut() = state;
     }
 
     fn check_source(&self) -> Result<(), Exit> {
@@ -532,7 +452,12 @@ impl<'a> ConfigureSession<'a> {
             entry.value =
                 path::from_native_cmake(&host.initial_cwd().join(path::to_native(&entry.value)));
         }
-        let result = runtime.run(interp, &[]);
+        let result = self.profiling.measure(host, ProfilePhase::Eval, || {
+            self.profiling
+                .measure_listfile(host, &self.src.join("CMakeLists.txt"), || {
+                    runtime.run(interp, &[])
+                })
+        });
         if result.exit_code == 0
             && rcmake_resolve::validate_codegen_name(interp.cx().project(), host).is_err()
         {
@@ -602,7 +527,10 @@ impl<'a> ConfigureSession<'a> {
         }
         let start = host.monotonic();
         let generate_step = crate::InstrumentationStep::start(host, sample);
-        let generated = match crate::generate::run(interp, host, &self.bin, &queries) {
+        let result = self.profiling.measure(host, ProfilePhase::Generate, || {
+            crate::generate::run(interp, host, &self.bin, &queries)
+        });
+        let generated = match result {
             Ok(generated) => generated,
             Err(failure) => {
                 if let crate::generate::Failure::Message(message) = failure {
@@ -718,15 +646,6 @@ impl<'a> ConfigureSession<'a> {
             Err(Exit::Code(1))
         }
     }
-}
-
-#[derive(Default)]
-struct Preloads {
-    tracked: BTreeSet<BString>,
-    results: Vec<Value>,
-    exit_code: i32,
-    fatal: bool,
-    missing: bool,
 }
 
 fn resolve_directories(
@@ -872,16 +791,6 @@ fn list_cache(host: &dyn Host, interp: &mut Interp, list: &options::ListCache) {
         }
     }
     host.write_out(Stream::Stdout, &out);
-}
-
-fn is_preload_file(host: &dyn Host, path: &Path) -> bool {
-    host.metadata(path, Follow::Yes).is_ok_and(|meta| {
-        meta.kind == FileKind::File
-            || (meta.kind == FileKind::Other
-                && path.parent().is_some_and(|dir| {
-                    dir == Path::new("/dev/fd") || dir == Path::new("/proc/self/fd")
-                }))
-    })
 }
 
 pub(crate) fn is_file(host: &dyn Host, path: &Path) -> bool {

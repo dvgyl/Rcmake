@@ -364,6 +364,9 @@ fn alias(
             }
         })?;
     }
+    let trace = cx.backtrace();
+    cx.project()
+        .record_alias_declaration(dir, name, global, trace);
     if global && generated_reservation(name).is_some() {
         schedule_alias_validation(cx, name);
     }

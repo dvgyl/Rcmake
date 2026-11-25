@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::ops::Bound::{Excluded, Unbounded};
-use std::sync::Weak;
+use std::sync::{Mutex, Weak};
 
 use super::paths::{Key, Part, child_path, display_name, validate_length};
 use super::*;
@@ -12,6 +12,15 @@ const MAX_SYMLINK_HOPS: usize = 40;
 const MAX_REMOVAL_ENTRIES: usize = 1_000_000;
 const MAX_PENDING_COMPONENTS: usize = 512;
 const MAX_ENTRIES: usize = 65_536;
+const MAX_BASE_NAMES: usize = 32_768;
+const MAX_BASE_NAME_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Default)]
+struct BaseNames {
+    directories: BTreeMap<PathBuf, BTreeMap<Vec<u8>, BString>>,
+    names: usize,
+    bytes: usize,
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum Inode {
@@ -237,6 +246,7 @@ fn env_cost(key: &[u8], value_len: usize) -> usize {
 
 pub(super) struct State<H: Host + ?Sized> {
     base: Arc<H>,
+    base_names: Mutex<BaseNames>,
     pub(super) paths: BTreeMap<Key, Entry>,
     pub(super) overrides: BTreeMap<Inode, Override>,
     pub(super) env: BTreeMap<BString, Option<BString>>,
@@ -252,6 +262,7 @@ impl<H: Host + ?Sized> State<H> {
     pub(super) fn new(base: Arc<H>, policy: OverlayPathPolicy, limit: usize) -> Self {
         Self {
             base,
+            base_names: Mutex::default(),
             paths: BTreeMap::new(),
             overrides: BTreeMap::new(),
             env: BTreeMap::new(),
@@ -322,14 +333,48 @@ impl<H: Host + ?Sized> State<H> {
         if self.policy.case_sensitive {
             return Ok(name.into());
         }
-        match self.base.read_dir(dir) {
-            Ok(entries) => Ok(entries
-                .into_iter()
-                .find(|entry| self.policy.name_key(&entry.name) == key)
-                .map_or_else(|| name.into(), |entry| entry.name)),
-            Err(err) if err.kind == ErrorKind::PermissionDenied => Ok(name.into()),
-            Err(err) => Err(err),
+        if let Some(entries) = self.base_names.lock().ok().and_then(|cache| {
+            cache
+                .directories
+                .get(dir)
+                .map(|entries| entries.get(key).cloned())
+        }) {
+            return Ok(entries.unwrap_or_else(|| name.into()));
         }
+
+        let entries = match self.base.read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind == ErrorKind::PermissionDenied => return Ok(name.into()),
+            Err(err) => return Err(err),
+        };
+        let result = entries
+            .iter()
+            .find(|entry| self.policy.name_key(&entry.name) == key)
+            .map_or_else(|| name.into(), |entry| entry.name.clone());
+        if let Ok(mut cache) = self.base_names.lock()
+            && !cache.directories.contains_key(dir)
+            && cache.names.saturating_add(entries.len().max(1)) <= MAX_BASE_NAMES
+        {
+            let mut names = BTreeMap::new();
+            let mut bytes = path_len(dir);
+            for entry in entries {
+                let key = self.policy.name_key(&entry.name);
+                bytes = bytes
+                    .saturating_add(key.len())
+                    .saturating_add(entry.name.len());
+                if cache.bytes.saturating_add(bytes) > MAX_BASE_NAME_BYTES {
+                    return Ok(result);
+                }
+                names.entry(key).or_insert(entry.name);
+            }
+            // Only spelling is cached. Metadata and file contents still come from the base.
+            if cache.bytes.saturating_add(bytes) <= MAX_BASE_NAME_BYTES {
+                cache.bytes += bytes;
+                cache.names += names.len().max(1);
+                cache.directories.insert(dir.to_owned(), names);
+            }
+        }
+        Ok(result)
     }
 
     fn root(&self, root: &[u8], windows: bool) -> HostResult<Resolved> {

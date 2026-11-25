@@ -1,7 +1,11 @@
 //! Typed property scopes for `set_property()` / `get_property()` (ADR-007).
 
 use rcmake_base::{BString, list, truth};
-use rcmake_diag::Backtrace;
+use rcmake_diag::{
+    Backtrace,
+    annotate::Confidence,
+    suggest::{Namespace, best_match_in},
+};
 
 use crate::target::join_entries;
 use crate::{
@@ -63,6 +67,37 @@ pub struct PropOrigin<'a> {
 }
 
 impl ProjectModel {
+    /// Find a close match among the known property names for a target.
+    pub fn suggest_target_property(
+        &self,
+        id: TargetId,
+        name: &[u8],
+    ) -> Option<(BString, Confidence)> {
+        if self.global.defined_property(b"TARGET", name).is_some() {
+            return None;
+        }
+        let target = self.target(id)?;
+        let names = target.props.names();
+        let candidates = names
+            .iter()
+            .map(|value| value.as_slice())
+            .chain(
+                target
+                    .usage
+                    .fields
+                    .keys()
+                    .map(|field| field.name().as_bytes()),
+            )
+            .chain(
+                self.global
+                    .defined_props
+                    .iter()
+                    .filter(|property| property.scope == b"TARGET")
+                    .map(|property| property.name.as_slice()),
+            );
+        best_match_in(Namespace::Name, name, candidates)
+    }
+
     /// Value of property `name` on `scope`, without inheritance. `None` when not set.
     #[must_use]
     pub fn get_prop(&self, scope: &PropScope, name: &[u8]) -> Option<BString> {

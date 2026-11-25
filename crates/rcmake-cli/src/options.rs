@@ -5,14 +5,14 @@ use rcmake_eval::{CacheDefine, LogLevel, TraceConfig};
 use rcmake_host::{Host, Stream};
 use rcmake_model::GeneratorKind;
 
+use crate::persona::Persona;
 use crate::presets::Listing;
 use crate::resolve_cli_path;
 
 mod cache;
 mod debug;
 mod diagnostics;
-#[allow(dead_code, reason = "Wave 1B connects this module to configure")]
-mod extensions;
+pub(crate) mod extensions;
 mod generator;
 mod presets;
 mod trace;
@@ -31,6 +31,8 @@ pub(crate) enum DirectoryArg {
 
 #[derive(Default)]
 pub(crate) struct Options {
+    pub persona: Persona,
+    pub extensions: extensions::RcmakeExt,
     pub directories: Vec<DirectoryArg>,
     pub cache_edits: Vec<CacheEdit>,
     pub check_system_vars: bool,
@@ -113,12 +115,12 @@ const LONG_OPTIONS: &[&[u8]] = &[
     b"--print-config-dir",
 ];
 
-pub(crate) fn parse(args: &[BString], host: &dyn Host) -> ParseResult {
+pub(crate) fn parse(args: &[BString], persona: Persona, host: &dyn Host) -> ParseResult {
     if args.is_empty() {
         out(host, USAGE);
         return ParseResult::Exit(0);
     }
-    match parse_args(args, host) {
+    match parse_args(args, persona, host) {
         Ok(Some(opts)) => ParseResult::Run(Box::new(opts)),
         Ok(None) => ParseResult::Exit(0),
         Err(body) => ParseResult::Exit(cli_usage_error(host, &body)),
@@ -166,8 +168,16 @@ impl<'a, 'rest> Argument<'a, 'rest> {
     }
 }
 
-fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, String> {
-    let mut opts = Options::default();
+fn parse_args(
+    args: &[BString],
+    persona: Persona,
+    host: &dyn Host,
+) -> Result<Option<Options>, String> {
+    let mut opts = Options {
+        persona,
+        ..Options::default()
+    };
+    let mut first_extension = None;
     let mut iter = args.iter().peekable();
     let mut profile_format = None;
     while let Some(raw) = iter.next() {
@@ -182,6 +192,13 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
             print_config_dir(host);
             return Ok(None);
         }
+        if persona == Persona::Native
+            && extensions::parse_native_extension_flag(arg.original, &mut opts.extensions)
+                .map_err(|error| error.to_string())?
+        {
+            first_extension.get_or_insert(raw);
+            continue;
+        }
         if parse_project(&mut arg, &mut opts, host)?
             || presets::parse(&mut arg, &mut opts, host)?
             || generator::parse(&mut arg, &mut opts, host)?
@@ -193,6 +210,11 @@ fn parse_args(args: &[BString], host: &dyn Host) -> Result<Option<Options>, Stri
             continue;
         }
         return Err(unknown_option(raw));
+    }
+    if opts.script.is_some()
+        && let Some(flag) = first_extension
+    {
+        return Err(unknown_option(flag));
     }
     validate_script_mode(&opts, host)?;
     debug::validate_profile(host, &opts, profile_format)?;

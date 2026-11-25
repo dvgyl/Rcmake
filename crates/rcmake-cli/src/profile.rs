@@ -13,16 +13,12 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use rcmake_base::{BString, Limits};
-use rcmake_eval::Interp;
+use rcmake_eval::{Interp, SampleKind};
 use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, Stream, WriteMode};
 use rcmake_json::{Value, write_compact};
 
-// Activated in Milestone 6 Wave 1B
-#[allow(dead_code)]
 mod flamegraph;
-#[allow(dead_code)]
 mod terminal;
-#[allow(dead_code)]
 mod trace;
 
 /// Record a CMake-compatible Google Trace.
@@ -122,7 +118,9 @@ pub(crate) fn attach_profilers(
     let legacy = legacy.cloned();
     let native = native.cloned();
     interp.set_command_profiler(Some(Arc::new(move |sample| {
-        if let Some(legacy) = &legacy {
+        if let Some(legacy) = &legacy
+            && sample.kind != SampleKind::ListFile
+        {
             legacy.event(
                 sample.name,
                 sample.file,
@@ -139,12 +137,11 @@ pub(crate) fn attach_profilers(
                 depth: sample.depth,
                 start: sample.start,
                 elapsed: sample.elapsed,
-                // The evaluator keeps SampleKind in a private module.
-                kind: match format!("{:?}", sample.kind).as_str() {
-                    "Function" => ProfileKind::Function,
-                    "Macro" => ProfileKind::Macro,
-                    "ListFile" => ProfileKind::ListFile,
-                    _ => ProfileKind::Builtin,
+                kind: match sample.kind {
+                    SampleKind::Function => ProfileKind::Function,
+                    SampleKind::Macro => ProfileKind::Macro,
+                    SampleKind::ListFile => ProfileKind::ListFile,
+                    SampleKind::Builtin => ProfileKind::Builtin,
                 },
             });
         }
@@ -371,8 +368,6 @@ impl Coverage {
 
 impl ProfileRecorder {
     /// Start an empty native profile.
-    // Activated in Milestone 6 Wave 1B
-    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::with_limits(
             MAX_SAMPLES.min(MAX_SAMPLE_BYTES / size_of::<Span>()),
@@ -441,8 +436,6 @@ impl ProfileRecorder {
     }
 
     /// Store a phase sample with times from the host's monotonic clock.
-    // Activated in Milestone 6 Wave 1B
-    #[allow(dead_code)]
     pub(crate) fn record_phase(&self, phase: ProfilePhase, start: Duration, finish: Duration) {
         self.record(ProfileSample {
             name: phase.name().as_bytes(),
@@ -456,8 +449,6 @@ impl ProfileRecorder {
     }
 
     /// Write the terminal summary and publish the complete native profile files.
-    // Activated in Milestone 6 Wave 1B
-    #[allow(dead_code)]
     pub(crate) fn write(
         &self,
         host: &dyn Host,

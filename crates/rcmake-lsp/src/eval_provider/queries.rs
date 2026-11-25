@@ -15,7 +15,8 @@ use rcmake_json::Value;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
 
 use crate::{
-    Position, PositionEncoding, SemanticContext, SemanticLocation,
+    Position, PositionEncoding, SemanticContext, SemanticDefinition, SemanticLocation,
+    SemanticResult,
     analysis::Document,
     expression::{self, Kind as ExprKind},
     json::{object, uint},
@@ -61,6 +62,15 @@ impl EvalSemanticProvider {
         context: &SemanticContext<'_>,
         markdown: bool,
     ) -> Option<SnapshotReply<Option<HoverText>>> {
+        self.query_hover(context, markdown, |_, version, text| (text, version))
+    }
+
+    pub(super) fn query_hover<T>(
+        &self,
+        context: &SemanticContext<'_>,
+        markdown: bool,
+        format: impl FnOnce(&[u8], Option<i64>, String) -> T,
+    ) -> Option<SnapshotReply<Option<T>>> {
         self.snapshots.query(|snapshot, buffers| {
             let query = Query::new(self.host(), snapshot, buffers, context)?;
             let (kind, name) = query.subject()?;
@@ -104,7 +114,11 @@ impl EvalSemanticProvider {
                 .by_uri
                 .get(context.uri)
                 .map(|buffer| buffer.document.version);
-            Some((format!("{label}{}", sections.join(separator)), version))
+            Some(format(
+                name,
+                version,
+                format!("{label}{}", sections.join(separator)),
+            ))
         })
     }
 
@@ -133,6 +147,33 @@ impl EvalSemanticProvider {
             };
             Self::query_definitions(&query)
         })
+    }
+
+    pub(super) fn versioned_definition(
+        &self,
+        context: &SemanticContext<'_>,
+    ) -> Option<SemanticResult<SemanticDefinition>> {
+        self.snapshots
+            .query(|snapshot, buffers| {
+                let query = Query::new(self.host(), snapshot, buffers, context)?;
+                if !query.fresh {
+                    return None;
+                }
+                let location = Self::query_definitions(&query).into_iter().next()?;
+                let target_version = buffers
+                    .by_uri
+                    .get(&location.uri)
+                    .map(|buffer| buffer.document.version);
+                Some(SemanticResult {
+                    uri: context.uri.to_owned(),
+                    version: context.version,
+                    value: SemanticDefinition {
+                        location,
+                        target_version,
+                    },
+                })
+            })?
+            .current(&self.snapshots)?
     }
 
     fn query_definitions(query: &Query<'_>) -> Vec<SemanticLocation> {
@@ -542,9 +583,14 @@ impl<'a> Query<'a> {
         if !path.is_absolute() {
             return None;
         }
-        let disk = read_file(self.host, &path).ok()?;
         let buffer = self.buffers.at(self.host, &path);
-        let text = buffer.map_or(disk.as_slice(), |buffer| buffer.document.text.as_bytes());
+        let disk;
+        let text = if let Some(buffer) = buffer {
+            buffer.document.text.as_bytes()
+        } else {
+            disk = read_file(self.host, &path).ok()?;
+            &disk
+        };
         if self.snapshot.reads.files.contains_key(&path) && !self.snapshot.matches(&path, text) {
             return None;
         }

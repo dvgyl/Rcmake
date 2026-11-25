@@ -7,9 +7,7 @@ mod cache;
 mod configure;
 #[cfg(test)]
 mod ctest;
-#[allow(dead_code, reason = "Wave 1B connects this module to configure")]
 mod exec_log;
-#[allow(dead_code, reason = "Wave 1B connects this module to configure")]
 mod explain_cmd;
 mod generate;
 mod help;
@@ -17,7 +15,6 @@ mod install;
 mod instrumentation;
 mod make_depends;
 mod options;
-#[allow(dead_code, reason = "Wave 1B connects this module to configure")]
 mod persona;
 mod presets;
 mod profile;
@@ -93,14 +90,35 @@ pub fn tool_from_argv0(argv0: &OsStr) -> Tool {
 /// Run the Rcmake CLI with `argv` (including `argv[0]`) against `host`, returning the process exit code.
 #[must_use]
 pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
-    let tool = argv
-        .first()
-        .map(|a| {
-            let p = rcmake_host::path::to_native(a.as_slice());
-            tool_from_argv0(p.as_os_str())
-        })
-        .unwrap_or(Tool::Cmake);
+    let invoked = argv.first().map(|a| rcmake_host::path::to_native(a));
+    let name = invoked.as_deref().map(Path::as_os_str).unwrap_or_default();
+    let tool = tool_from_argv0(name);
+    let persona = persona::persona_from_argv0(name);
+    let Some(log) = host
+        .env_get(b"RCMAKE_EXEC_LOG")
+        .filter(|value| !value.is_empty())
+    else {
+        return run_tool(argv, tool, persona, host);
+    };
+    let start = host.monotonic();
+    let code = run_tool(argv, tool, persona, Arc::clone(&host));
+    exec_log::append_exec_log(
+        host.as_ref(),
+        &log,
+        &exec_log::ExecLogEntry {
+            argv,
+            persona: tool,
+            cwd: &host.initial_cwd(),
+            pid: host.system().pid,
+            parent_pid: None,
+            exit_code: code,
+            duration: host.monotonic().saturating_sub(start),
+        },
+    );
+    code
+}
 
+fn run_tool(argv: &[BString], tool: Tool, persona: persona::Persona, host: Arc<dyn Host>) -> i32 {
     let rest = argv.get(1..).unwrap_or(&[]);
     if let Some(first) = rest.first() {
         let fb = first.as_slice();
@@ -124,7 +142,7 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     }
 
     match tool {
-        Tool::Cmake => run_cmake(argv, rest, host),
+        Tool::Cmake => run_cmake(argv, rest, persona, host),
         Tool::Ctest => {
             presets::list_for_tool(host.as_ref(), rcmake_presets::PresetKind::Test, rest)
                 .unwrap_or_else(|| run_ctest(argv, rest, host))
@@ -211,7 +229,18 @@ fn run_version_format(tool: Tool, fmt: &[u8], host: &dyn Host, output: Option<&B
     write_version(host, output, text.as_slice())
 }
 
-fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
+fn run_cmake(
+    argv: &[BString],
+    rest: &[BString],
+    persona: persona::Persona,
+    host: Arc<dyn Host>,
+) -> i32 {
+    if persona == persona::Persona::Native
+        && !persona::oracle_mode(host.as_ref())
+        && let Some(args) = rest.strip_prefix(&[BString::from("explain")])
+    {
+        return explain_cmd::run(argv.first(), args, host);
+    }
     if let Some(sub_args) = rest.strip_prefix(&[BString::from("-E")]) {
         if let [command, args @ ..] = sub_args {
             match command.as_slice() {
@@ -260,7 +289,7 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
         return workflow::run(args, host);
     }
 
-    if let Some(code) = help::run(argv.first(), rest, host.as_ref()) {
+    if let Some(code) = help::run(argv.first(), rest, persona, host.as_ref()) {
         return code;
     }
 
@@ -268,7 +297,7 @@ fn run_cmake(argv: &[BString], rest: &[BString], host: Arc<dyn Host>) -> i32 {
         return system_information::run(argv, args, host.as_ref());
     }
 
-    let mut opts = match options::parse(rest, host.as_ref()) {
+    let mut opts = match options::parse(rest, persona, host.as_ref()) {
         ParseResult::Run(opts) => *opts,
         ParseResult::Exit(code) => return code,
     };
@@ -343,6 +372,7 @@ fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Hos
         cmake_command,
         cmake_root.unwrap_or_default(),
         argv,
+        rcmake_eval::Services::default(),
     )
 }
 
@@ -353,6 +383,7 @@ fn new_interp_with_paths(
     cmake_command: PathBuf,
     cmake_root: PathBuf,
     argv: &[BString],
+    services: rcmake_eval::Services,
 ) -> Interp {
     let name = if cfg!(windows) { "cmake.exe" } else { "cmake" };
     let alias = cmake_command.with_file_name(name);
@@ -366,7 +397,7 @@ fn new_interp_with_paths(
         cmake_command
     };
     let cfg = InterpConfig {
-        services: Default::default(),
+        services: services.into(),
         cwd: host.initial_cwd(),
         host,
         mode,

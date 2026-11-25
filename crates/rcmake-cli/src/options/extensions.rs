@@ -42,38 +42,6 @@ impl ProfileRequest {
     }
 }
 
-/// Identifies a subcommand and its arguments in the Native persona.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "Reserved until the Native subcommand handlers are available."
-)]
-pub(crate) enum NativeSubcommand {
-    /// Explain where a value came from.
-    Explain(Vec<BString>),
-    /// Start the language server.
-    Lsp(Vec<BString>),
-}
-
-/// Identifies an explicit probe cache request from the command line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProbeCacheRequest {
-    /// Bypass the probe cache.
-    Off,
-    /// Compare cached probe results with fresh results.
-    #[allow(
-        dead_code,
-        reason = "Reserved until probe cache verification is available."
-    )]
-    Verify,
-    /// Request probe cache maintenance.
-    #[allow(
-        dead_code,
-        reason = "Reserved until probe cache maintenance is available."
-    )]
-    Clear,
-}
-
 /// Collects extension flags for the Native persona.
 #[derive(Default)]
 pub(crate) struct RcmakeExt {
@@ -81,29 +49,13 @@ pub(crate) struct RcmakeExt {
     pub(crate) diagnostics: Option<DiagStyle>,
     /// Output directory requested on the command line.
     pub(crate) profile: Option<ProfileRequest>,
-    /// Subcommand requested on the command line.
-    #[allow(
-        dead_code,
-        reason = "Reserved until the Native subcommand handlers are available."
-    )]
-    pub(crate) subcommand: Option<NativeSubcommand>,
-    /// Probe cache mode requested on the command line.
-    pub(crate) probe_cache: Option<ProbeCacheRequest>,
+    /// Bypass the probe cache for this invocation.
+    pub(crate) no_probe_cache: bool,
     /// Fetch lock mode requested on the command line.
     pub(crate) fetch_lock: Option<FetchLockMode>,
     /// Hermetic mode requested on the command line.
     pub(crate) hermetic: Option<HermeticMode>,
 }
-
-/// Help text for `rcmake --help` in the Native persona.
-pub(crate) const NATIVE_EXTENSION_HELP: &str = "\
-\nRcmake extensions\n\
-  --diagnostics=cmake|rich           Select the diagnostic format.\n\
-  --profile                         Write a profile to rcmake-profile in the build directory.\n\
-  --profile=<dir>                   Write a profile to <dir>. For example, use --profile=dir.\n\
-  --no-probe-cache                  Bypass the probe cache.\n\
-  --fetch-lock=off|auto|update|frozen  Select the fetch lock mode.\n\
-  --hermetic[=warn|strict]           Check for undeclared inputs. Omit the value to warn.\n";
 
 /// Parse one Native extension flag without consuming another argument.
 ///
@@ -140,7 +92,7 @@ pub(crate) fn parse_native_extension_flag(
                 Some(dir) => ProfileRequest::Directory(to_native(dir)),
             });
         }
-        b"--no-probe-cache" if value.is_none() => ext.probe_cache = Some(ProbeCacheRequest::Off),
+        b"--no-probe-cache" if value.is_none() => ext.no_probe_cache = true,
         b"--no-probe-cache" => return Err("Use --no-probe-cache without a value.".into()),
         b"--fetch-lock" => {
             ext.fetch_lock = Some(match value {
@@ -195,7 +147,7 @@ mod tests {
         )?);
         assert_eq!(ext.diagnostics, Some(DiagStyle::Rich));
         assert_eq!(ext.profile, Some(ProfileRequest::BuildDefault));
-        assert_eq!(ext.probe_cache, Some(ProbeCacheRequest::Off));
+        assert!(ext.no_probe_cache);
         assert_eq!(ext.fetch_lock, Some(FetchLockMode::Frozen));
         assert_eq!(ext.hermetic, Some(HermeticMode::Warn));
 
@@ -222,7 +174,7 @@ mod tests {
             assert!(parse_native_extension_flag(flag.as_bytes(), &mut ext).is_err());
         }
         assert_eq!(ext.profile, None);
-        assert_eq!(ext.probe_cache, None);
+        assert!(!ext.no_probe_cache);
     }
 
     #[test]
@@ -251,11 +203,7 @@ mod tests {
         ] {
             assert!(!parse_native_extension_flag(name.as_bytes(), &mut ext)?);
         }
-        assert_eq!(ext.probe_cache, None);
-        assert_eq!(ext.subcommand, None);
-        assert!(!NATIVE_EXTENSION_HELP.contains("--probe-cache="));
-        assert!(!NATIVE_EXTENSION_HELP.contains("explain"));
-        assert!(!NATIVE_EXTENSION_HELP.contains("lsp"));
+        assert!(!ext.no_probe_cache);
         Ok(())
     }
 

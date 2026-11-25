@@ -67,12 +67,10 @@ pub(crate) fn resolve_diag_style(
     cli_override: Option<DiagStyle>,
     host: &dyn Host,
 ) -> DiagStyle {
-    if oracle_mode(host) {
+    if persona == Persona::Compat || oracle_mode(host) {
         return DiagStyle::Cmake;
     }
-    if persona == Persona::Native
-        && let Some(style) = cli_override
-    {
+    if let Some(style) = cli_override {
         return style;
     }
     if let Some(style) = host
@@ -136,7 +134,7 @@ mod tests {
         host.env_set(b"RCMAKE_DIAGNOSTICS", Some(b"rich"));
         assert_eq!(
             resolve(Persona::Compat, Some(DiagStyle::Cmake)),
-            DiagStyle::Rich
+            DiagStyle::Cmake
         );
         assert_eq!(
             resolve(Persona::Native, Some(DiagStyle::Cmake)),
@@ -180,7 +178,7 @@ mod tests {
         let host = PureHost::default();
         stick_diag_style(&host, DiagStyle::Rich);
         assert_eq!(
-            resolve_diag_style(Persona::Compat, None, &host),
+            resolve_diag_style(Persona::Native, None, &host),
             DiagStyle::Rich
         );
 

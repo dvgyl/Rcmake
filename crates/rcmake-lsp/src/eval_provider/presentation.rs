@@ -362,3 +362,184 @@ fn clip(text: &mut String, limit: usize) {
         text.push('…');
     }
 }
+
+impl EvalSemanticProvider {
+    pub(super) fn typed_diagnostics(
+        &self,
+        document: &crate::SemanticDocument<'_>,
+        selection: Option<std::ops::Range<Position>>,
+    ) -> Option<(Vec<crate::SemanticDiagnostic>, Vec<Value>)> {
+        let path = uri::path(document.uri)?;
+        self.snapshots
+            .query(|snapshot, buffers| {
+                let open = buffers.by_uri.get(document.uri)?;
+                if !std::ptr::eq(snapshot.inputs.as_ref(), buffers)
+                    || open.document.version != document.version
+                    || open.document.text != document.text
+                    || open.path != buffer_path(self.host(), &path)
+                {
+                    return None;
+                }
+                let mut fallback = rcmake_diag::SourceMap::default();
+                let fallback = fallback.add(
+                    "".into(),
+                    rcmake_diag::source::SourceKind::File,
+                    std::sync::Arc::from(b"".as_slice()),
+                )?;
+                let root = buffer_path(
+                    self.host(),
+                    &self.snapshots.project_root().join("CMakeLists.txt"),
+                );
+                let result = &snapshot.result;
+                let mut diagnostics = Vec::new();
+                let mut actions = Vec::new();
+                if open.path == root
+                    && matches!(&result.completion, CompletionState::Partial {
+                    denied_processes, omitted_denials, ..
+                } if !denied_processes.is_empty() || *omitted_denials > 0)
+                {
+                    diagnostics.push(crate::SemanticDiagnostic::new(
+                        rcmake_diag::Diagnostic {
+                            kind: MessageKind::Log,
+                            effect: rcmake_diag::Effect::None,
+                            category: None,
+                            policy: None,
+                            location: Location::None,
+                            body: DENIED_HINT.into(),
+                            annotations: None,
+                        },
+                        fallback,
+                        Default::default(),
+                    ));
+                }
+                for entry in &result.diagnostics {
+                    if let Some(item) =
+                        typed_diagnostic(self, entry, snapshot, buffers, open, &root, fallback)
+                    {
+                        if let Some(range) = selection.as_ref() {
+                            actions.extend(advice_actions(&item, open, document.encoding, range));
+                            if actions.len() >= MAX_DIAGNOSTICS {
+                                actions.truncate(MAX_DIAGNOSTICS);
+                                break;
+                            }
+                        }
+                        diagnostics.push(item);
+                        if diagnostics.len() == MAX_DIAGNOSTICS {
+                            break;
+                        }
+                    }
+                }
+                Some((diagnostics, actions))
+            })?
+            .current(&self.snapshots)?
+    }
+}
+
+fn typed_diagnostic(
+    provider: &EvalSemanticProvider,
+    diagnostic: &rcmake_diag::Diagnostic,
+    snapshot: &Snapshot,
+    buffers: &Buffers,
+    open: &super::Buffer,
+    root: &std::path::Path,
+    fallback: rcmake_diag::SourceId,
+) -> Option<crate::SemanticDiagnostic> {
+    let file = match &diagnostic.location {
+        Location::FileLine { file, .. } => Some(file.as_ref()),
+        Location::Backtrace(trace) => trace.top().map(|frame| frame.file.as_ref()),
+        Location::None => None,
+    };
+    if let Some(file) = file.filter(|file| !file.is_empty()) {
+        let path = provider.snapshots.project_root().join(to_native(file));
+        if buffer_path(provider.host(), &path) != open.path
+            || !snapshot.matches(&path, open.document.text.as_bytes())
+        {
+            return None;
+        }
+    } else if open.path != root {
+        return None;
+    }
+
+    let mut retained = diagnostic.clone();
+    let annotations = retained.annotations.take();
+    let mut item = crate::SemanticDiagnostic::new(retained, fallback, Default::default());
+    let Some((annotations, sources)) = annotations.zip(snapshot.result.facts.source_map.as_ref())
+    else {
+        return Some(item);
+    };
+    let known = |id| {
+        let file = sources.get(id)?;
+        let path = to_native(&file.path);
+        let buffer = buffers.at(provider.host(), &path)?;
+        (file.text.as_ref() == buffer.document.text.as_bytes()).then_some(buffer)
+    };
+    let Some(primary) = annotations.labels.iter().find(|label| {
+        label.primary && known(label.span.source).is_some_and(|buffer| buffer.uri == open.uri)
+    }) else {
+        return Some(item);
+    };
+    item.source = primary.span.source;
+    item.annotations = *annotations;
+    for source in item
+        .annotations
+        .fixes
+        .iter()
+        .flat_map(|fix| &fix.edits)
+        .map(|edit| edit.span.source)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if source != item.source
+            && let Some(buffer) = known(source)
+        {
+            item.related_sources.push(crate::SemanticSource {
+                source,
+                uri: buffer.uri.clone(),
+                version: buffer.document.version,
+            });
+        }
+    }
+    Some(item)
+}
+
+fn advice_actions(
+    item: &crate::SemanticDiagnostic,
+    open: &super::Buffer,
+    encoding: crate::PositionEncoding,
+    selection: &std::ops::Range<Position>,
+) -> Vec<Value> {
+    let Some(label) = item
+        .annotations
+        .labels
+        .iter()
+        .find(|label| label.primary && label.span.source == item.source)
+    else {
+        return Vec::new();
+    };
+    let start =
+        open.document
+            .lines
+            .position(&open.document.text, label.span.start as usize, encoding);
+    let end = open
+        .document
+        .lines
+        .position(&open.document.text, label.span.end as usize, encoding);
+    let position = |position: Position| (position.line, position.character);
+    if position(end) < position(selection.start) || position(selection.end) < position(start) {
+        return Vec::new();
+    }
+    item.annotations
+        .fixes
+        .iter()
+        .filter(|fix| fix.edits.is_empty())
+        .map(|fix| {
+            object([
+                ("title", Value::string(fix.message.as_slice())),
+                ("kind", Value::string("quickfix")),
+                (
+                    "disabled",
+                    object([("reason", Value::string("Apply this suggestion manually."))]),
+                ),
+            ])
+        })
+        .collect()
+}

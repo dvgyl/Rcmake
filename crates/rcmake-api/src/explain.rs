@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
-use rcmake_base::BString;
+use rcmake_base::{BString, list};
 use rcmake_diag::{
     Backtrace,
     suggest::{Namespace, suggest_candidates_in},
@@ -309,6 +309,10 @@ pub struct ExplainCache {
     pub kind: CacheType,
     /// Cache help string.
     pub help: BString,
+    /// Whether the entry is marked advanced.
+    pub advanced: bool,
+    /// Allowed values from the STRINGS cache property, if set.
+    pub strings: Option<Vec<BString>>,
     /// Location of the write that supplied the cache value, when recorded.
     pub location: Option<SourceLocation>,
     /// Whether the write used `FORCE`, when recorded.
@@ -481,6 +485,11 @@ impl ConfigureResult {
             value: entry.value.clone(),
             kind: entry.ty,
             help: entry.help.clone(),
+            advanced: entry.advanced,
+            strings: entry
+                .props
+                .get(b"STRINGS")
+                .map(|value| list::split(value, list::Empty::Keep)),
             location: self.cache_location(name, &entry.value),
             force: self.facts.cache_force.get(name).copied(),
         });

@@ -44,6 +44,7 @@ pub fn render_explain_json(report: &ExplainReport, config: Option<&[u8]>) -> BSt
 ///   `dropped_writes`, which counts discarded events for that property.
 /// - `variable` contains `value`, `location`, `binding`, `directory`, `cache`,
 ///   `writes`, `history`, `session_history_truncated`, and `provisional`.
+///   Cache entries include their type, help, advanced flag and optional strings.
 ///   History is `unavailable`, `excluded`, `complete`, `truncated`, or
 ///   `unknown`. Complete history can have zero writes. A write's `previous`
 ///   field has a `state` of `unknown`, `unset`, or `value`. The value state
@@ -280,6 +281,16 @@ fn variable_json(variable: &ExplainVariable) -> Value {
             ("value", bytes(&cache.value)),
             ("type", Value::string(cache.kind.as_str())),
             ("help", bytes(&cache.help)),
+            ("advanced", Value::Bool(cache.advanced)),
+            (
+                "strings",
+                optional(
+                    cache
+                        .strings
+                        .as_ref()
+                        .map(|values| array(values.iter().map(|value| bytes(value)))),
+                ),
+            ),
             ("force", optional(cache.force.map(Value::Bool))),
             ("location", optional(cache.location.as_ref().map(location))),
         ])

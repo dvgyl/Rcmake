@@ -86,6 +86,7 @@ pub struct ProjectModel {
     languages: crate::LanguageRegistry,
     prop_ledger: Option<Box<crate::PropLedger>>,
     prop_seq: u64,
+    alias_declarations: Vec<(DirId, BString, bool, Backtrace)>,
 }
 
 fn push_arena<T, I>(
@@ -165,6 +166,30 @@ impl ProjectModel {
                 ),
             );
         }
+    }
+
+    /// Update target properties with their native storage rules and record the writes.
+    pub fn update_target_properties<T>(
+        &mut self,
+        id: TargetId,
+        append: impl IntoIterator<Item = (&'static [u8], AppendMode)>,
+        origin: PropOrigin<'_>,
+        update: impl FnOnce(&mut Target) -> T,
+    ) -> Result<T, ModelError> {
+        let scope = PropScope::Target(id);
+        let previous: Vec<_> = if self.prop_ledger.is_some() {
+            append
+                .into_iter()
+                .map(|(name, mode)| (name, mode, self.get_prop(&scope, name)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let result = update(self.target_mut(id).ok_or(ModelError::UnknownObject)?);
+        for (name, mode, value) in previous {
+            self.record_prop(&scope, name, crate::PropOp::Append(mode), value, origin);
+        }
+        Ok(result)
     }
 
     /// Look up a variable definition as seen at the end of configuring `dir`:
@@ -445,6 +470,27 @@ impl ProjectModel {
             self.dir_mut(dir).local_targets.insert(alias, binding);
         }
         Ok(())
+    }
+
+    /// Record an alias declaration when property provenance is enabled.
+    pub fn record_alias_declaration(
+        &mut self,
+        dir: DirId,
+        name: &BString,
+        global: bool,
+        trace: Backtrace,
+    ) {
+        if self.prop_ledger.is_some() {
+            self.alias_declarations
+                .push((dir, name.clone(), global, trace));
+        }
+    }
+
+    /// Get the recorded alias declarations in evaluation order.
+    pub fn alias_declarations(&self) -> impl Iterator<Item = (DirId, &BString, bool, &Backtrace)> {
+        self.alias_declarations
+            .iter()
+            .map(|(dir, name, global, trace)| (*dir, name, *global, trace))
     }
 
     /// Promote an imported target to global visibility (`IMPORTED_GLOBAL`).

@@ -177,10 +177,6 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
                 }
             }
         }
-        let target = cx
-            .project()
-            .target_mut(id)
-            .ok_or_else(|| model_error(ModelError::UnknownObject))?;
         let value = list::join(items.iter().map(|arg| {
             let value = bytes(arg);
             if paths {
@@ -191,26 +187,45 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
                 arg.value.clone()
             }
         }));
-        if scope != UsageScope::Interface {
-            record(target, own, BT::new(value.clone(), bt.clone()), before);
-            if system && scope == UsageScope::Private && !value.is_empty() {
-                target
-                    .props
-                    .append("SYSTEM_INCLUDE_DIRECTORIES".into(), &value);
-            }
-        }
-        if scope != UsageScope::Private {
-            let entry = BT::new(value, bt.clone());
-            if system {
-                record(
-                    target,
-                    Field::InterfaceSystemIncludeDirectories,
-                    entry.clone(),
-                    false,
-                );
-            }
-            record(target, interface, entry, before);
-        }
+        let fields = [
+            (scope != UsageScope::Interface).then_some(own.name()),
+            (system && scope == UsageScope::Private && !value.is_empty())
+                .then_some("SYSTEM_INCLUDE_DIRECTORIES"),
+            (system && scope != UsageScope::Private)
+                .then_some(Field::InterfaceSystemIncludeDirectories.name()),
+            (scope != UsageScope::Private).then_some(interface.name()),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|field| (field.as_bytes(), rcmake_model::AppendMode::List));
+        let origin = rcmake_model::PropOrigin {
+            dir: cx.current_dir_id(),
+            backtrace: &bt,
+        };
+        cx.project()
+            .update_target_properties(id, fields, origin, |target| {
+                if scope != UsageScope::Interface {
+                    record(target, own, BT::new(value.clone(), bt.clone()), before);
+                    if system && scope == UsageScope::Private && !value.is_empty() {
+                        target
+                            .props
+                            .append("SYSTEM_INCLUDE_DIRECTORIES".into(), &value);
+                    }
+                }
+                if scope != UsageScope::Private {
+                    let entry = BT::new(value, bt.clone());
+                    if system {
+                        record(
+                            target,
+                            Field::InterfaceSystemIncludeDirectories,
+                            entry.clone(),
+                            false,
+                        );
+                    }
+                    record(target, interface, entry, before);
+                }
+            })
+            .map_err(model_error)?;
     }
     Ok(Flow::Normal)
 }

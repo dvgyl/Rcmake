@@ -3,7 +3,8 @@ use rcmake_host::{Host, ReadRange, Stream, WriteMode, discover_cmake_root};
 
 use crate::{options, resolve_cli_path};
 
-const USAGE: &[u8] = include_bytes!("../help/usage.txt");
+const NATIVE_USAGE: &[u8] = include_bytes!("../help/usage.txt");
+const NATIVE_MARKER: &[u8] = b"\nRcmake extensions\n";
 
 const MISSING_MANUAL: &str =
     "is not an available manual.  Use --help-manual-list to see all available manuals.";
@@ -53,7 +54,12 @@ fn argument<'a>(
     args.next_if(|arg| !arg.starts_with(b"-") && !matches!(arg.as_slice(), b"/V" | b"/?"))
 }
 
-pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: &dyn Host) -> Option<i32> {
+pub(crate) fn run(
+    argv0: Option<&BString>,
+    args: &[BString],
+    persona: crate::persona::Persona,
+    host: &dyn Host,
+) -> Option<i32> {
     let mut args = args.iter().peekable();
     let mut requests = Vec::new();
     while let Some(flag) = args.next() {
@@ -134,9 +140,13 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: &dyn Host) ->
     for (request, output) in requests {
         if matches!(request, Request::Usage) {
             separate(host, &mut stdout);
-            host.write_out(Stream::Stdout, USAGE);
+            let (compat, native) = usage();
+            host.write_out(Stream::Stdout, compat);
             options::print_help_generators(host);
             host.write_out(Stream::Stdout, b"\n");
+            if persona == crate::persona::Persona::Native && !crate::persona::oracle_mode(host) {
+                host.write_out(Stream::Stdout, native);
+            }
             continue;
         }
         let content = match request.text(&reference) {
@@ -163,6 +173,14 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: &dyn Host) ->
         }
     }
     Some(status)
+}
+
+fn usage() -> (&'static [u8], &'static [u8]) {
+    let split = NATIVE_USAGE
+        .windows(NATIVE_MARKER.len())
+        .position(|bytes| bytes == NATIVE_MARKER)
+        .unwrap_or(NATIVE_USAGE.len());
+    NATIVE_USAGE.split_at(split)
 }
 
 fn separate(host: &dyn Host, seen: &mut bool) {
@@ -204,7 +222,7 @@ impl Request<'_> {
                 lookup(reference, &format!("{kind}-list"), "").ok_or_else(missing_help)
             }
             Self::Full => lookup(reference, "full", "").ok_or_else(missing_help),
-            Self::Usage => Ok(USAGE),
+            Self::Usage => Ok(usage().0),
         }
     }
 }

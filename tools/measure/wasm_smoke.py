@@ -54,10 +54,10 @@ def check_smoke(output: str) -> str:
             or type(result.get("denied_processes")) is not int or result["denied_processes"] != 1
             or result.get("cancelled") is not True
             or result.get("complete") is not True or result.get("provisional") is not True
-            or result.get("try_compile") != "passed"):
+            or result.get("try_compile") != "passed" or result.get("try_compile_denied") is not True):
         raise ValueError("The wasm_smoke report lacks evidence of all required checks.")
     # The example reports a denial only after it verifies the partial result and index.
-    return "Verified three targets, provenance, the partial result, cancellation, and try_compile."
+    return "Verified three targets, provenance, cancellation, and permitted and denied try_compile."
 
 
 def run_gate(report: dict, args, env: dict[str, str], name: str, command: list[str],

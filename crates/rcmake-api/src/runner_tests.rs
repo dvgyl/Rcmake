@@ -261,3 +261,60 @@ unset(TRACKED CACHE)
     );
     Ok(())
 }
+
+#[test]
+fn reports_aliases_callables_and_usage_writes() -> Result<(), Box<dyn std::error::Error>> {
+    let script = format!(
+        "{PROJECT}\n{}",
+        r#"
+function(set_flag item)
+  target_compile_definitions(util INTERFACE "ITEM=${item}")
+endfunction()
+set_flag(first)
+set_flag(second)
+add_library(demo::util ALIAS util)
+set(CHOICE first CACHE STRING "Select an item" FORCE)
+mark_as_advanced(CHOICE)
+set_property(CACHE CHOICE PROPERTY STRINGS first second)
+"#,
+    );
+    let (_, request) = fixture(&script)?;
+    let result = run_configure(request)?;
+    let index = result.index.as_ref().ok_or("Missing index.")?;
+    let alias = index
+        .lookup_target(DirId::ROOT, b"demo::util")
+        .ok_or("Missing alias.")?;
+    let location = alias
+        .location
+        .as_ref()
+        .ok_or("Missing alias declaration.")?;
+    assert!(location.source_id.is_some() && location.range.is_some());
+    let callable = index
+        .lookup_callable(b"SET_FLAG")
+        .ok_or("Missing function definition.")?;
+    assert_eq!(callable.parameters, [rcmake_base::BString::from("item")]);
+    let ledger = result
+        .model
+        .prop_ledger()
+        .ok_or("Missing property history.")?;
+    let (_, _, writes) = ledger
+        .iter()
+        .find(|(scope, name, _)| {
+            **scope == rcmake_model::PropScope::Target(alias.id)
+                && name.as_slice() == b"INTERFACE_COMPILE_DEFINITIONS"
+        })
+        .ok_or("Missing usage property writes.")?;
+    assert_eq!(writes.len(), 2);
+    assert_eq!(
+        result.facts.cache_force.get(b"CHOICE".as_slice()),
+        Some(&true)
+    );
+    let choice = result
+        .model
+        .cache()
+        .get(b"CHOICE")
+        .ok_or("Missing cache entry.")?;
+    assert!(choice.advanced);
+    assert_eq!(choice.help, "Select an item");
+    Ok(())
+}

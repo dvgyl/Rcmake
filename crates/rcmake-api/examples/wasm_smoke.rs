@@ -48,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ("provisional", Value::Bool(true)),
             ("denied_processes", Value::UInt(*denials)),
             ("try_compile", Value::string("passed")),
+            ("try_compile_denied", Value::Bool(true)),
             ("cancelled", Value::Bool(true)),
         ]),
         Err(error) => object([
@@ -222,14 +223,32 @@ try_compile(W0_PROBE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/app.cpp" NO_CACHE NO_L
             ..RunOutput::default()
         })
     })?;
+    let request = ConfigureRequest::new("src", "build", "cmake", host.clone())
+        .generator(GeneratorKind::UnixMakefiles)
+        .define(cache_entry("CMAKE_PLATFORM_INFO_INITIALIZED", "1"))
+        .define(cache_entry(
+            "CMAKE_MAKE_PROGRAM",
+            path::from_native_cmake(&root.join("bin/make")),
+        ));
+    let denied = run_configure(
+        request
+            .clone()
+            .write_mode(WriteMode::Overlay)
+            .process_policy(ProcessPolicy::Deny),
+    )?;
+    require(
+        matches!(&denied.completion, CompletionState::Partial { denied_processes, .. }
+            if !denied_processes.is_empty())
+            && !ran.load(Ordering::Relaxed),
+        "The process-denied configure must record the try_compile denial.",
+    )?;
+    require(
+        matches!(host.metadata(&root.join("build/overlay.txt"), Follow::No),
+            Err(error) if error.kind == io::ErrorKind::NotFound),
+        "The process-denied configure wrote to the base host.",
+    )?;
     let result = run_configure(
-        ConfigureRequest::new("src", "build", "cmake", host)
-            .generator(GeneratorKind::UnixMakefiles)
-            .define(cache_entry("CMAKE_PLATFORM_INFO_INITIALIZED", "1"))
-            .define(cache_entry(
-                "CMAKE_MAKE_PROGRAM",
-                path::from_native_cmake(&root.join("bin/make")),
-            ))
+        request
             .write_mode(WriteMode::Direct)
             .process_policy(ProcessPolicy::Allow),
     )?;

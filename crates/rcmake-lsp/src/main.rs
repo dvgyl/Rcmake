@@ -8,21 +8,28 @@ use std::process::ExitCode;
 #[cfg(any(unix, windows))]
 use std::io::{self, Write};
 
-#[cfg(any(unix, windows))]
+#[cfg(all(any(unix, windows), not(feature = "eval")))]
 use rcmake_host::native::NativeHost;
 #[cfg(any(unix, windows))]
 use rcmake_lsp::{
-    RequestId, RpcMessage, Server,
-    rpc::{MAX_MESSAGE_BYTES, read_frame, write_frame},
+    RpcMessage,
+    rpc::{MAX_MESSAGE_BYTES, write_frame},
 };
+
+#[cfg(all(any(unix, windows), feature = "eval"))]
+mod stdio_eval;
 
 #[cfg(any(unix, windows))]
 fn main() -> ExitCode {
+    #[cfg(feature = "eval")]
+    use stdio_eval::serve;
+
     serve().unwrap_or(ExitCode::FAILURE)
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(all(any(unix, windows), not(feature = "eval")))]
 fn serve() -> io::Result<ExitCode> {
+    use rcmake_lsp::{RequestId, Server, rpc::read_frame};
     let host = NativeHost::new().map_err(io::Error::other)?;
     let mut server = Server::new(&host);
     let mut input = io::stdin().lock();

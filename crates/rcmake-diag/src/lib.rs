@@ -110,6 +110,8 @@ pub struct DiagEngine {
     fatal_occurred: bool,
     sarif_results: Vec<Value>,
     history: history::History,
+    rich_options: Option<rich::RichOptions>,
+    annotation_bytes_left: u64,
 }
 
 impl DiagEngine {
@@ -122,6 +124,8 @@ impl DiagEngine {
             fatal_occurred: false,
             sarif_results: Vec::new(),
             history: history::History::default(),
+            rich_options: None,
+            annotation_bytes_left: 16 * 1024 * 1024,
         }
     }
 
@@ -133,9 +137,36 @@ impl DiagEngine {
         state: &DiagState,
         render_opts: &RenderOptions,
     ) -> Option<BString> {
+        self.record(diag, state).then(|| render(diag, render_opts))
+    }
+
+    /// Set the options for rich terminal diagnostics.
+    pub fn set_rich_options(&mut self, options: rich::RichOptions) {
+        self.rich_options = Some(options);
+    }
+
+    /// Get the configured rich terminal options, if enabled.
+    #[must_use]
+    pub fn rich_options(&self) -> Option<rich::RichOptions> {
+        self.rich_options
+    }
+
+    /// Get the remaining budget for source excerpts retained by annotations.
+    #[must_use]
+    pub fn annotation_bytes_left(&self) -> u64 {
+        self.annotation_bytes_left
+    }
+
+    /// Count retained source bytes against the annotation budget.
+    pub fn count_annotation_bytes(&mut self, bytes: u64) {
+        self.annotation_bytes_left = self.annotation_bytes_left.saturating_sub(bytes);
+    }
+
+    /// Record an issued diagnostic without rendering it. Return true if visible.
+    pub fn record(&mut self, diag: &Diagnostic, state: &DiagState) -> bool {
         let effective = match diag.category {
             Some(cat) => match state.get(cat) {
-                DiagAction::Ignore => return None,
+                DiagAction::Ignore => return false,
                 DiagAction::Warn => Effect::None,
                 DiagAction::SendError => Effect::SetError,
                 DiagAction::FatalError => Effect::Fatal,
@@ -157,7 +188,12 @@ impl DiagEngine {
         }
 
         self.history.push(diag, effective);
-        Some(render(diag, render_opts))
+        true
+    }
+
+    /// Retain optional presentation advice without changing SARIF or the exit status.
+    pub fn record_advice(&mut self, diag: &Diagnostic) {
+        self.history.push(diag, Effect::None);
     }
 
     /// Get the retained diagnostics in issue order.

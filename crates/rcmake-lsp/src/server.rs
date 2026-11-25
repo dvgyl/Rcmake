@@ -16,6 +16,12 @@ use crate::{
     workspace::{Workspace, WorkspaceCache},
 };
 
+#[cfg(all(feature = "eval", feature = "stdio"))]
+mod evaluated_stdio;
+
+mod capabilities;
+use capabilities::capabilities;
+
 const MAX_DOCUMENTS: usize = 512;
 const MAX_BUFFER_BYTES: usize = MAX_MESSAGE_BYTES;
 const MAX_OPEN_BYTES: usize = MAX_BUFFER_BYTES * 4;
@@ -96,10 +102,16 @@ impl OpenDocument {
     }
 }
 
+enum Provider<'a> {
+    Borrowed(&'a dyn SemanticProvider),
+    #[cfg(all(feature = "eval", feature = "stdio"))]
+    Shared(Arc<dyn SemanticProvider>),
+}
+
 /// Language Server Protocol state for one client. Use [Self::handle] to dispatch messages.
 pub struct Server<'a> {
     host: &'a dyn Host,
-    semantic: Option<&'a dyn SemanticProvider>,
+    semantic: Option<Provider<'a>>,
     state: State,
     encoding: PositionEncoding,
     markdown_hover: bool,
@@ -135,8 +147,16 @@ impl<'a> Server<'a> {
 
     /// Add a semantic provider to the server.
     pub fn with_semantic_provider(mut self, provider: &'a dyn SemanticProvider) -> Self {
-        self.semantic = Some(provider);
+        self.semantic = Some(Provider::Borrowed(provider));
         self
+    }
+
+    fn semantic(&self) -> Option<&dyn SemanticProvider> {
+        match self.semantic.as_ref()? {
+            Provider::Borrowed(provider) => Some(*provider),
+            #[cfg(all(feature = "eval", feature = "stdio"))]
+            Provider::Shared(provider) => Some(provider.as_ref()),
+        }
     }
 
     /// Return the process status after the client sends `exit`.
@@ -278,7 +298,7 @@ impl<'a> Server<'a> {
                     "textDocument/hover" => self.hover(doc, &context),
                     "textDocument/definition" => self.definition(doc, &context),
                     _ => self
-                        .semantic
+                        .semantic()
                         .and_then(|provider| provider.completions(&context))
                         .filter(|result| self.current_result(result, uri, doc.version))
                         .map_or_else(
@@ -377,7 +397,7 @@ impl<'a> Server<'a> {
                 self.open_bytes -= doc.len();
                 self.workspace_cache.get_mut().invalidate_documents();
                 if doc.current().is_some()
-                    && let Some(provider) = self.semantic
+                    && let Some(provider) = self.semantic()
                 {
                     provider.update(SemanticUpdate::Closed { uri });
                 }
@@ -411,7 +431,7 @@ impl<'a> Server<'a> {
         self.open_bytes -= previous.as_ref().map_or(0, OpenDocument::len);
         self.workspace_cache.get_mut().invalidate_documents();
         if matches!(previous, Some(OpenDocument::Synced { .. }))
-            && let Some(provider) = self.semantic
+            && let Some(provider) = self.semantic()
         {
             provider.update(SemanticUpdate::Closed { uri });
         }
@@ -516,7 +536,7 @@ impl<'a> Server<'a> {
         check_buffer_size(text.len(), other_bytes)?;
         self.open_bytes = other_bytes + text.len();
         let doc = Arc::new(Document::new(text, version));
-        if let Some(provider) = self.semantic {
+        if let Some(provider) = self.semantic() {
             provider.update(SemanticUpdate::Changed {
                 uri,
                 text: &doc.text,
@@ -570,7 +590,7 @@ impl<'a> Server<'a> {
     }
 
     fn semantic_diagnostics(&self, document: &SemanticDocument<'_>) -> Vec<SemanticDiagnostic> {
-        self.semantic
+        self.semantic()
             .and_then(|provider| provider.diagnostics(document))
             .filter(|result| self.current_result(result, document.uri, document.version))
             .map_or_else(Vec::new, |result| result.value)
@@ -618,7 +638,7 @@ impl<'a> Server<'a> {
             Vec::new()
         };
         if let Some(result) = self
-            .semantic
+            .semantic()
             .and_then(|provider| provider.code_actions(&document, selection))
             .filter(|result| self.current_result(result, uri, doc.version))
         {
@@ -638,7 +658,7 @@ impl<'a> Server<'a> {
     }
 
     fn hover(&self, doc: &Document, context: &SemanticContext<'_>) -> Value {
-        if let Some(provider) = self.semantic {
+        if let Some(provider) = self.semantic() {
             let content = match provider.hover_doc(context) {
                 Some(result)
                     if result.version <= context.version
@@ -698,7 +718,7 @@ impl<'a> Server<'a> {
     }
 
     fn definition(&self, doc: &Document, context: &SemanticContext<'_>) -> Value {
-        if let Some(provider) = self.semantic {
+        if let Some(provider) = self.semantic() {
             let target = match provider.definition_result(context) {
                 Some(result) if self.current_result(&result, context.uri, doc.version) => {
                     let definition = result.value;
@@ -875,63 +895,4 @@ fn edit_position(span: &Value, endpoint: &str) -> Result<Position, SyncFailure> 
     get(span, endpoint)
         .and_then(Position::parse)
         .ok_or(SyncFailure::InvalidChange)
-}
-
-fn capabilities(encoding: PositionEncoding) -> Value {
-    object([
-        (
-            "serverInfo",
-            object([
-                ("name", Value::string("rcmake-lsp")),
-                ("version", Value::string(env!("CARGO_PKG_VERSION"))),
-            ]),
-        ),
-        (
-            "capabilities",
-            object([
-                ("positionEncoding", Value::string(encoding.name())),
-                (
-                    "textDocumentSync",
-                    object([
-                        ("openClose", Value::Bool(true)),
-                        ("change", Value::Int(2)),
-                        ("save", object([("includeText", Value::Bool(true))])),
-                    ]),
-                ),
-                ("documentSymbolProvider", Value::Bool(true)),
-                ("documentFormattingProvider", Value::Bool(true)),
-                ("definitionProvider", Value::Bool(true)),
-                ("hoverProvider", Value::Bool(true)),
-                ("codeActionProvider", Value::Bool(true)),
-                (
-                    "completionProvider",
-                    object([(
-                        "triggerCharacters",
-                        Value::Array(["$", "{", "<", ":"].map(Value::string).into()),
-                    )]),
-                ),
-                (
-                    "semanticTokensProvider",
-                    object([
-                        ("full", Value::Bool(true)),
-                        (
-                            "legend",
-                            object([
-                                (
-                                    "tokenTypes",
-                                    Value::Array(analysis::TOKEN_TYPES.map(Value::string).into()),
-                                ),
-                                (
-                                    "tokenModifiers",
-                                    Value::Array(
-                                        analysis::TOKEN_MODIFIERS.map(Value::string).into(),
-                                    ),
-                                ),
-                            ]),
-                        ),
-                    ]),
-                ),
-            ]),
-        ),
-    ])
 }

@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod adapters;
 mod presentation;
 mod queries;
 
@@ -24,9 +25,7 @@ use rcmake_host::{
     overlay::OverlayHost, path::to_native,
 };
 
-use crate::{
-    SemanticContext, SemanticLocation, SemanticProvider, SemanticUpdate, analysis::Document, uri,
-};
+use crate::{SemanticUpdate, analysis::Document, uri};
 
 const DEFAULT_STEP_BUDGET: u64 = 250_000;
 const MAX_TRACKED_FILES: usize = 4096;
@@ -368,6 +367,18 @@ impl SnapshotProvider {
         }
     }
 
+    /// Mark a snapshot stale after an input file changes on disk.
+    pub fn invalidate(&self) {
+        let mut state = self.lock();
+        if let Some(token) = &state.running {
+            token.cancel();
+        }
+        state.dirty = true;
+        state.generation = state.generation.saturating_add(1);
+        state.revision = Arc::new(());
+        state.buffers = Arc::new(state.buffers.as_ref().clone());
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -388,11 +399,13 @@ impl SnapshotProvider {
             if prior.is_some_and(|buffer| {
                 buffer.document.version > version
                     || (buffer.document.version == version && buffer.document.text == text)
-            }) || i32::try_from(version).is_err()
-            {
+            }) {
                 return;
             }
             let path = buffer_path(self.request.host.as_ref(), &path);
+            if !path.starts_with(buffer_path(self.request.host.as_ref(), &self.project_root)) {
+                return;
+            }
             Some(Arc::new(Buffer {
                 uri: uri.to_owned(),
                 path,
@@ -433,12 +446,15 @@ impl SnapshotProvider {
             }
             overlay.write(path, &buffer.document.text)?;
         }
+        let mut services = self.request.services.clone();
+        services.collect_annotations = true;
         let request = self
             .request
             .clone()
             .process_policy(ProcessPolicy::Deny)
             .write_mode(WriteMode::Overlay)
             .collect_index(true)
+            .services(services)
             .cancel(token.clone())
             .step_budget(
                 self.request
@@ -472,14 +488,26 @@ impl SnapshotProvider {
         let (result, error) = match (self.evaluate)(&session) {
             Ok(result) => (result, None),
             Err(error @ (ApiError::ConfigureFailed { .. } | ApiError::GenerateFailed { .. })) => {
-                let diagnostics = match &error {
-                    ApiError::ConfigureFailed { diagnostics, .. }
-                    | ApiError::GenerateFailed { diagnostics, .. } => diagnostics.clone(),
-                    _ => Vec::new(),
+                let (diagnostics, source_map) = match &error {
+                    ApiError::ConfigureFailed {
+                        diagnostics,
+                        sources,
+                        ..
+                    }
+                    | ApiError::GenerateFailed {
+                        diagnostics,
+                        sources,
+                        ..
+                    } => (diagnostics.clone(), sources.clone()),
+                    _ => (Vec::new(), None),
                 };
                 (
                     ConfigureResult {
                         diagnostics,
+                        facts: rcmake_api::EvaluationFacts {
+                            source_map,
+                            ..Default::default()
+                        },
                         completion: partial(Vec::new()),
                         ..ConfigureResult::default()
                     },
@@ -604,23 +632,5 @@ impl EvalSemanticProvider {
     #[must_use]
     pub fn snapshots(&self) -> &SnapshotProvider {
         &self.snapshots
-    }
-}
-
-impl SemanticProvider for EvalSemanticProvider {
-    fn update(&self, update: SemanticUpdate<'_>) {
-        self.snapshots.update(update);
-    }
-
-    fn hover(&self, context: &SemanticContext<'_>) -> Option<String> {
-        self.hover_with_version(context).map(|(text, _)| text)
-    }
-
-    fn hover_with_version(&self, context: &SemanticContext<'_>) -> Option<(String, Option<i64>)> {
-        self.render_hover(context, false)
-    }
-
-    fn definition(&self, context: &SemanticContext<'_>) -> Option<SemanticLocation> {
-        self.definitions(context).into_iter().next()
     }
 }

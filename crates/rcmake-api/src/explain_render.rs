@@ -360,6 +360,15 @@ impl Renderer<'_> {
             if !cache.help.is_empty() {
                 self.row(4, &format!("Help  {}", text(&cache.help)));
             }
+            if cache.advanced {
+                self.row(4, "Advanced cache entry");
+            }
+            if let Some(values) = &cache.strings {
+                self.row(4, "Allowed strings");
+                for value in values {
+                    self.full_value(6, value);
+                }
+            }
         }
         if !variable.writes.is_empty() {
             self.row(2, "Write history");
