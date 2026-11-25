@@ -17,4 +17,10 @@ impl Cx<'_> {
     ) {
         self.interp.issue_here(kind, effect, category, body, false);
     }
+
+    /// Report `CMake Error: <body>` without a location and continue
+    /// (`cmSystemTools::Error`). The current command does not fail.
+    pub fn error_no_location(&mut self, body: BString) {
+        self.interp.error_no_location(body);
+    }
 }

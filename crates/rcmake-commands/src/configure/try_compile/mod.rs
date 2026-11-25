@@ -462,7 +462,7 @@ fn apply_probe(
         )?;
     }
     if let Some(message) = missing {
-        cx.issue(MessageKind::Error, Effect::SetError, None, message);
+        cx.error_no_location(message);
     }
     if let Some(destination) = options.one(b"COPY_FILE") {
         let destination = absolute(&cx.host().initial_cwd(), destination);

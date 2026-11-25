@@ -191,6 +191,10 @@ endif()
     assert_eq!(missing.results, [ProcessResult::Exited(1)]);
     let stderr = std::str::from_utf8(&missing.stderr)?;
     assert!(
+        stderr.contains("CMake Error: try_run() invoked in cross-compiling mode"),
+        "{stderr}"
+    );
+    assert!(
         stderr.contains("   MISSING_RUN (advanced)\n   MISSING_RUN__TRYRUN_OUTPUT (advanced)\n"),
         "{stderr}"
     );
@@ -206,6 +210,10 @@ endif()
     ])?;
     assert_eq!(partial.results, [ProcessResult::Exited(1)]);
     let stderr = std::str::from_utf8(&partial.stderr)?;
+    assert!(
+        stderr.contains("CMake Error: try_run() invoked in cross-compiling mode"),
+        "{stderr}"
+    );
     assert!(
         stderr.contains("   MISSING_RUN (advanced)\n   MISSING_RUN__TRYRUN_OUTPUT (advanced)\n"),
         "{stderr}"

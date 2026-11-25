@@ -175,6 +175,10 @@ impl Host for HermeticHost {
         self.inner.scratch_file()
     }
 
+    fn scratch_file_in(&self, dir: &Path) -> HostResult<Box<dyn rcmake_host::ScratchFile + '_>> {
+        self.inner.scratch_file_in(&self.guard_path(dir)?)
+    }
+
     fn write_from(
         &self,
         p: &Path,

@@ -191,6 +191,10 @@ impl Host for CapturingHost {
         self.parent.scratch_file()
     }
 
+    fn scratch_file_in(&self, dir: &Path) -> HostResult<Box<dyn rcmake_host::ScratchFile + '_>> {
+        self.parent.scratch_file_in(dir)
+    }
+
     fn write_from(
         &self,
         p: &Path,

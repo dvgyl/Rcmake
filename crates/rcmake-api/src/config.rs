@@ -697,6 +697,10 @@ where
         self.base.scratch_file()
     }
 
+    fn scratch_file_in(&self, dir: &Path) -> HostResult<Box<dyn rcmake_host::ScratchFile + '_>> {
+        self.base.scratch_file_in(dir)
+    }
+
     fn write_from(
         &self,
         p: &Path,
