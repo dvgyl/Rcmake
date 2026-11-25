@@ -1,0 +1,86 @@
+name: Bug or CMake 4.5.1 difference
+description: rcmake crashed, failed, or gave a different result from CMake 4.5.1.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security problems here. Follow SECURITY.md to report them privately.
+
+        A short `CMakeLists.txt` and the output of both tools let a maintainer reproduce the problem.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the problem in one or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: rcmake version
+      description: Paste the output of `rcmake --version`, or give the commit SHA of your build.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - Windows (x86_64)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: entry
+    attributes:
+      label: How did you run it?
+      description: The executable name selects the mode.
+      options:
+        - As cmake, ctest, or cpack (compatibility mode)
+        - As rcmake (native mode)
+        - Through rcmake-lsp (editor)
+        - In the browser playground
+    validations:
+      required: true
+  - type: input
+    id: generator
+    attributes:
+      label: Generator and compiler
+      placeholder: Ninja, Apple clang 17
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal CMakeLists.txt
+      description: The smallest project that shows the problem. Add other files if they are necessary.
+      render: cmake
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command that you ran.
+      placeholder: cmake -S . -B build -G Ninja
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: cmake-output
+    attributes:
+      label: CMake 4.5.1 output
+      description: The output and exit code of the same command with the official CMake 4.5.1 binary. Leave empty for a crash that does not depend on CMake behavior.
+      render: text
+  - type: textarea
+    id: rcmake-output
+    attributes:
+      label: rcmake output
+      description: The output and exit code from rcmake.
+      render: text
+    validations:
+      required: true
