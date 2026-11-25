@@ -218,7 +218,7 @@ fn source_location(
                     .into();
                 if accept(cx, &candidate) {
                     if status == PolicyStatus::Warn {
-                        let detail = [b"File:\n\n  ", candidate.as_slice()].concat();
+                        let detail = [b"File:\n  ", candidate.as_slice()].concat();
                         cx.issue_policy_warning(policy, b"", &detail);
                     }
                     return Some(candidate);
@@ -226,9 +226,9 @@ fn source_location(
             }
         }
     }
-    let mut body: BString = [b"Cannot find source file:\n\n  ", source].concat().into();
+    let mut body: BString = [b"Cannot find source file:\n  ", source].concat().into();
     if status != PolicyStatus::New {
-        body.extend_from_slice(b"\n\nTried extensions");
+        body.extend_from_slice(b"\nTried extensions");
         for extension in SOURCE_EXTENSIONS.split_ascii_whitespace() {
             body.extend_from_slice(b" .");
             body.extend_from_slice(extension.as_bytes());

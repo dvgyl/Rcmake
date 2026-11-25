@@ -79,7 +79,7 @@ pub(crate) fn feature_enabled(cx: &mut Cx<'_>, name: &[u8]) -> Result<bool, CmdE
                 )
             } else {
                 format!(
-                    "{} is set to incorrect value\n\n  {}\n\nSee 'Help/dev/experimental.rst' in the source tree of this version of CMake for documentation of the experimental feature and the corresponding activation value.  This project's code may require changes to work with this CMake's version of the feature.",
+                    "{} is set to incorrect value\n  {}\nSee 'Help/dev/experimental.rst' in the source tree of this version of CMake for documentation of the experimental feature and the corresponding activation value.  This project's code may require changes to work with this CMake's version of the feature.",
                     BString::from(feature.variable),
                     value
                 )

@@ -891,7 +891,7 @@ fn config_rejects_only_an_invalid_first_name() {
     assert_eq!(
         host.warnings,
         [BString::from(
-            "Warning evaluating generator expression:\n\n  $<CONFIG:Debug,Foo-Second>\n\nThe config name of \"Foo-Second\" is invalid"
+            "Warning evaluating generator expression:\n  $<CONFIG:Debug,Foo-Second>\nThe config name of \"Foo-Second\" is invalid"
         )]
     );
 }

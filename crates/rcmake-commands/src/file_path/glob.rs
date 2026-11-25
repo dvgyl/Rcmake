@@ -181,7 +181,7 @@ fn record(
     Err(crate::command_error(
         cx,
         format!(
-            "The glob expression\n\n {}\n\nwas already present in the glob cache but the directory contents have changed during the configuration run.\n\nMatching glob expressions:\n\n{locations}",
+            "The glob expression\n {}\nwas already present in the glob cache but the directory contents have changed during the configuration run.\nMatching glob expressions:\n{locations}",
             key.expression,
         ),
     ))

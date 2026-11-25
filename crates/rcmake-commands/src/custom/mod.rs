@@ -508,7 +508,7 @@ fn append(
     Err(crate::command_error(
         cx,
         format!(
-            "Attempt to APPEND to custom command with output\n\n  {}\n\nwhich is not already a custom command output.",
+            "Attempt to APPEND to custom command with output\n  {}\nwhich is not already a custom command output.",
             output.value
         ),
     ))

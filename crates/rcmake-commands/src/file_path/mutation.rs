@@ -72,7 +72,7 @@ fn write(cx: &Cx<'_>, append: bool, args: &[&[u8]]) -> Result {
     };
     operation().map_err(|e| {
         error(format!(
-            "failed to open for writing ({}):\n\n  {}\n",
+            "failed to open for writing ({}):\n  {}\n",
             e.os_message,
             path.display()
         ))

@@ -311,16 +311,16 @@ fn object_query_filters_require_absolute_sources_from_the_target() {
     for (expr, expected) in [
         (
             "$<TARGET_OBJECTS:other,BAD,EXTRA>",
-            "Unrecognized argument:\n\n  BAD",
+            "Unrecognized argument:\n  BAD",
         ),
         (
             "$<TARGET_OBJECTS:other,SOURCE_FILES:other.c>",
-            "Source file:\n\n  other.c\n\nis not an absolute path",
+            "Source file:\n  other.c\nis not an absolute path",
         ),
         (
             &format!("$<TARGET_OBJECTS:other,SOURCE_FILES:{source_root}/missing.c>"),
             &format!(
-                "Source file:\n\n  {source_root}/missing.c\n\ndoes not exist for target \"other\""
+                "Source file:\n  {source_root}/missing.c\ndoes not exist for target \"other\""
             ),
         ),
     ] {

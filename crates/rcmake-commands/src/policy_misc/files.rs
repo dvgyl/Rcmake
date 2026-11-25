@@ -200,9 +200,9 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
         .map_err(file_error)?;
     if metadata.kind == FileKind::Dir {
         return Err(CmdError::status(quoted(
-            "input location\n\n  ",
+            "input location\n  ",
             &path::from_native_cmake(&source),
-            "\n\nis a directory but a file was expected.",
+            "\nis a directory but a file was expected.",
         )));
     }
     if metadata.kind != FileKind::File {

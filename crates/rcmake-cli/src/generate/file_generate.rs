@@ -353,7 +353,7 @@ fn warn_relative_path(model: &ProjectModel, host: &dyn Host, dir: DirId, role: &
     }
     let file = listfile(model, dir);
     let body = format!(
-        "Policy CMP0070 is not set: Define file(GENERATE) behavior for relative paths.  Run \"cmake --help-policy CMP0070\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nfile(GENERATE) given relative {role} path:\n\n  {}\n\nThis is not defined behavior unless CMP0070 is set to NEW.  For compatibility with older versions of CMake, the previous undefined behavior will be used.",
+        "Policy CMP0070 is not set: Define file(GENERATE) behavior for relative paths.  Run \"cmake --help-policy CMP0070\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\nfile(GENERATE) given relative {role} path:\n  {}\nThis is not defined behavior unless CMP0070 is set to NEW.  For compatibility with older versions of CMake, the previous undefined behavior will be used.",
         BString::from(path)
     );
     let mut body = format_paragraphs(body.as_bytes(), 2, 77);

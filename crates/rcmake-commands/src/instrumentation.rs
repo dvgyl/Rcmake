@@ -53,7 +53,7 @@ fn parse(
     }) {
         return Err(crate::command_error(
             cx,
-            format!("Error after keyword {key:?}:\n\n  missing required value"),
+            format!("Error after keyword {key:?}:\n  missing required value"),
         ));
     }
     let mut request = InstrumentationRequest::default();
@@ -172,7 +172,7 @@ fn custom_content(values: &[ExpandedArg]) -> Result<InstrumentationContent, CmdE
                         .unwrap_or_default();
                     let padding = (error.column.saturating_sub(1) as usize).min(line.len());
                     CmdError::status(format!(
-                        "failed to parse custom content as JSON:\n\n {}\n\n{}\n\n{}^",
+                        "failed to parse custom content as JSON:\n {}\n{}\n{}^",
                         error.message,
                         BString::from(line),
                         " ".repeat(padding)

@@ -141,10 +141,9 @@ fn format_diagnostic_body(diag: &Diagnostic, width: usize) -> BString {
     const MISSING_LINK_TARGET: &[u8] = b"Possible reasons include:\n\n  * There is a typo in the target name.\n  * A find_package call is missing for an IMPORTED target.\n  * An ALIAS target is missing.\n";
     let from_message = matches!(&diag.location, Location::Backtrace(trace)
         if trace.top().is_some_and(|frame| frame.name.as_deref() == Some(b"message")));
-    if diag.kind != MessageKind::Error || from_message {
-        return format_raw_paragraphs(body, 2, width);
-    }
-    if (body.starts_with(b"Target \"") || body.starts_with(b"The link interface of target \""))
+    if diag.kind == MessageKind::Error
+        && !from_message
+        && (body.starts_with(b"Target \"") || body.starts_with(b"The link interface of target \""))
         && body.ends_with(MISSING_LINK_TARGET)
     {
         // The resolver adds paragraph separators to this diagnostic.
@@ -161,7 +160,7 @@ fn format_with_added_separators(text: &[u8], indent: usize, width: usize) -> BSt
         .flatten()
         .copied()
         .collect();
-    format_raw_paragraphs(&text, indent, width)
+    format_paragraphs(&text, indent, width)
 }
 
 /// Select the caller frames that `cmMessenger::PrintCallStack` prints. A frame
@@ -266,15 +265,6 @@ const fn is_error_kind(kind: MessageKind) -> bool {
 /// wrapping non-preformatted paragraphs to at most `width` bytes per line).
 #[must_use]
 pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
-    // The generator expression formatter supplies the paragraph separators.
-    if text.starts_with(b"Error evaluating generator expression:\n\n  $<") {
-        format_with_added_separators(text, indent, width)
-    } else {
-        format_raw_paragraphs(text, indent, width)
-    }
-}
-
-fn format_raw_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
     let mut out = Vec::new();
     let mut previous_preformatted = false;
     for line in text.split_inclusive(|&byte| byte == b'\n') {
@@ -449,7 +439,7 @@ mod tests {
     fn formats_generator_expression_errors_without_a_location() {
         assert_eq!(
             format_paragraphs(
-                b"Error evaluating generator expression:\n\n  $<UNKNOWN>\n\nUnknown expression",
+                b"Error evaluating generator expression:\n  $<UNKNOWN>\nUnknown expression",
                 2,
                 77,
             ),

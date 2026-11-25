@@ -1,11 +1,12 @@
 use std::path::Path;
 
 use rcmake_base::{BString, path_lex::Lexical, truth::is_on};
+use rcmake_eval::Cx;
 use rcmake_host::{
     FileKind, Follow, Host, Stream,
     path::{from_native_cmake, to_native},
 };
-use rcmake_model::{Cache, CacheType};
+use rcmake_model::{Cache, CacheType, GeneratorSpec};
 
 use super::{Exit, GENERATOR, HOME_DIR, cache_glob::CacheGlob};
 use crate::{cache, options::CacheEdit};
@@ -81,6 +82,95 @@ fn is_cmake_script(name: &[u8]) -> bool {
     }
 }
 
+pub(super) fn initialize_standard_cache(
+    cx: &mut Cx<'_>,
+    generator: BString,
+    spec: &GeneratorSpec,
+    src: &Path,
+    bin: &Path,
+    list_file: &BString,
+) {
+    let cache = cx.cache();
+    if cache
+        .get(GENERATOR)
+        .is_none_or(|entry| entry.ty == CacheType::Uninitialized)
+    {
+        cache::insert_internal(cache, GENERATOR, generator, "Name of generator.");
+        cache::insert_internal(
+            cache,
+            b"CMAKE_EXTRA_GENERATOR",
+            BString::default(),
+            "Name of external makefile project generator.",
+        );
+    }
+    for (key, value, help) in [
+        (
+            b"CMAKE_GENERATOR_INSTANCE".as_slice(),
+            &spec.instance,
+            "Generator instance identifier.",
+        ),
+        (
+            b"CMAKE_GENERATOR_PLATFORM",
+            &spec.platform,
+            "Name of generator platform.",
+        ),
+        (
+            b"CMAKE_GENERATOR_TOOLSET",
+            &spec.toolset,
+            "Name of generator toolset.",
+        ),
+    ] {
+        if !cache.contains(key) {
+            cache::insert_internal(cache, key, value.clone(), help);
+        }
+    }
+    for (key, value, help) in [
+        (
+            LIST_FILE_NAME,
+            list_file.clone(),
+            "Name of CMakeLists files to read",
+        ),
+        (
+            HOME_DIR,
+            from_native_cmake(src),
+            "Source directory with the top level CMakeLists.txt file for this project",
+        ),
+        (
+            b"CMAKE_CACHEFILE_DIR",
+            from_native_cmake(bin),
+            "This is the directory where this CMakeCache.txt was created",
+        ),
+        (
+            b"CMAKE_CACHE_MAJOR_VERSION",
+            "4".into(),
+            "Major version of cmake used to create the current loaded cache",
+        ),
+        (
+            b"CMAKE_CACHE_MINOR_VERSION",
+            "5".into(),
+            "Minor version of cmake used to create the current loaded cache",
+        ),
+        (
+            b"CMAKE_CACHE_PATCH_VERSION",
+            "1".into(),
+            "Patch version of cmake used to create the current loaded cache",
+        ),
+    ] {
+        cache::insert_internal(cache, key, value, help);
+    }
+    for (key, help) in [
+        (b"CMAKE_ROOT".as_slice(), "Path to CMake installation."),
+        (b"CMAKE_COMMAND", "Path to CMake executable."),
+        (b"CMAKE_CTEST_COMMAND", "Path to ctest program executable."),
+        (b"CMAKE_CPACK_COMMAND", "Path to cpack program executable."),
+    ] {
+        let value = cx.var_or_empty(key);
+        cache::insert_internal(cx.cache(), key, value, help);
+    }
+}
+
+const INSTALL_PREFIX_HELP: &str = "Install path prefix, prepended onto install directories.";
+
 pub(super) fn apply_environment_defaults(host: &dyn Host, cache: &mut Cache, has_cache: bool) {
     for (name, ty) in [
         (b"CMAKE_TOOLCHAIN_FILE".as_slice(), CacheType::Filepath),
@@ -101,15 +191,22 @@ pub(super) fn apply_environment_defaults(host: &dyn Host, cache: &mut Cache, has
                 value
             };
             cache::insert(cache, name, value, Some(ty));
-            if name == b"CMAKE_DISABLE_PRECOMPILE_HEADERS"
-                && let Some(entry) = cache.get_mut(name)
-            {
-                entry.help = "Default value for DISABLE_PRECOMPILE_HEADERS of targets.".into();
+            if let Some(entry) = cache.get_mut(name) {
+                entry.help = match name {
+                    b"CMAKE_DISABLE_PRECOMPILE_HEADERS" => {
+                        "Default value for DISABLE_PRECOMPILE_HEADERS of targets.".into()
+                    }
+                    b"CMAKE_INSTALL_PREFIX" => INSTALL_PREFIX_HELP.into(),
+                    _ => BString::default(),
+                };
             }
         }
         if let Some(entry) = cache.get_mut(name) {
             if entry.ty == CacheType::Uninitialized {
                 entry.ty = ty;
+                if name == b"CMAKE_INSTALL_PREFIX" {
+                    entry.help = INSTALL_PREFIX_HELP.into();
+                }
             }
             if name == b"CMAKE_TOOLCHAIN_FILE" {
                 let path = Lexical::new(&entry.value);
@@ -203,12 +300,7 @@ pub(super) fn refresh_toolchain(
         .map(|entry| entry.value.clone());
     *cache = Cache::default();
     if let Some(environment) = environment {
-        cache::insert(
-            cache,
-            SYSTEM_ENVIRONMENT_ID,
-            environment,
-            Some(CacheType::Internal),
-        );
+        set_environment_identity(cache, environment);
     }
     host.write_out(
         Stream::Stderr,
@@ -253,7 +345,7 @@ pub(super) fn apply_environment_identity(
             }
         };
         let warning = format!(
-            "CMAKE_SYSTEM_ENVIRONMENT_ID: {current}\n\nDoes not match the previous value: {previous}\n\n{advice}"
+            "CMAKE_SYSTEM_ENVIRONMENT_ID: {current}\nDoes not match the previous value: {previous}\n{advice}"
         );
         let message = rcmake_diag::format_paragraphs(warning.as_bytes(), 2, 77);
         host.write_out(
@@ -271,13 +363,17 @@ pub(super) fn apply_environment_identity(
         })?;
         *cache = Cache::default();
     }
-    cache::insert(
+    set_environment_identity(cache, current);
+    Ok(())
+}
+
+fn set_environment_identity(cache: &mut Cache, value: BString) {
+    cache::insert_internal(
         cache,
         SYSTEM_ENVIRONMENT_ID,
-        current,
-        Some(CacheType::Internal),
+        value,
+        "Opaque identifier for the current system environment",
     );
-    Ok(())
 }
 
 /// Cache entry that records the project file name (`cmake --project-file`).

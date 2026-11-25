@@ -385,7 +385,7 @@ pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
         return Err(crate::command_error(
             cx,
             format!(
-                "Cannot add target-level dependencies to non-existent target \"{}\".\n\nThe add_dependencies works for top-level logical targets created by the add_executable, add_library, or add_custom_target commands.  If you want to add file-level dependencies see the DEPENDS option of the add_custom_target and add_custom_command commands.",
+                "Cannot add target-level dependencies to non-existent target \"{}\".\nThe add_dependencies works for top-level logical targets created by the add_executable, add_library, or add_custom_target commands.  If you want to add file-level dependencies see the DEPENDS option of the add_custom_target and add_custom_command commands.",
                 name.value
             ),
         ));

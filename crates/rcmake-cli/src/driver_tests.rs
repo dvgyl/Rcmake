@@ -942,31 +942,4 @@ endif()
     );
 }
 
-#[test]
-fn wave8a_generation_rejects_empty_install_export_sets() {
-    let host = project_host();
-    host.seed_file(
-        Path::new("/work/CMakeLists.txt"),
-        br#"
-cmake_minimum_required(VERSION 4.5)
-project(Example NONE)
-install(EXPORT Standard DESTINATION lib)
-install(EXPORT_ANDROID_MK Android DESTINATION lib)
-install(PACKAGE_INFO Example EXPORT Package)
-install(SBOM Example EXPORTS Document)
-"#,
-    )
-    .unwrap();
-    assert_eq!(
-        invoke(&host, &["cmake", "-S", ".", "-B", "out", "-G", "Ninja"]),
-        1
-    );
-    let stderr = String::from_utf8(host.stream_bytes(Stream::Stderr).to_vec()).unwrap();
-    for expected in [
-        r#"CMake Error: INSTALL(EXPORT) given unknown export "Standard""#,
-        r#"CMake Error: INSTALL(EXPORT_ANDROID_MK) given unknown export "Android""#,
-        r#"CMake Error: INSTALL(PACKAGE_INFO) given unknown export "Package""#,
-    ] {
-        assert!(stderr.lines().any(|line| line == expected), "{stderr}");
-    }
-}
+mod generation;

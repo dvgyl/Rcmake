@@ -654,7 +654,7 @@ impl Evaluator<'_> {
         for (index, option) in options.iter().enumerate() {
             let filter = option
                 .strip_prefix(b"SOURCE_FILES:")
-                .ok_or_else(|| call.error(format!("Unrecognized argument:\n\n  {option}")))?;
+                .ok_or_else(|| call.error(format!("Unrecognized argument:\n  {option}")))?;
             if index != 0 {
                 self.append(&mut sources, b";")?;
             }
@@ -685,7 +685,7 @@ impl Evaluator<'_> {
         };
         let invalid_source = |source: &[u8], message: &str| {
             call.error(format!(
-                "Source file:\n\n  {}\n\n{message}",
+                "Source file:\n  {}\n{message}",
                 BString::from(source)
             ))
         };

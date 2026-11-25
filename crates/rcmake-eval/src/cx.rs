@@ -48,7 +48,7 @@ impl Cx<'_> {
                     Some(cmp0126),
                     Location::Backtrace(self.interp.bt.clone()),
                     crate::util::cat(&[
-                        b"Policy CMP0126 is not set: set(CACHE) does not remove a normal variable of the same name.  Run \"cmake --help-policy CMP0126\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\n",
+                        b"Policy CMP0126 is not set: set(CACHE) does not remove a normal variable of the same name.  Run \"cmake --help-policy CMP0126\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n",
                         b"For compatibility with older versions of CMake, normal variable \"",
                         name,
                         b"\" will be removed from the current scope.",

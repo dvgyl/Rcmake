@@ -251,13 +251,16 @@ fn unix_path(host: &dyn Host, path: &[u8]) -> BString {
 pub(crate) fn apply(cache: &mut Cache, def: CacheDefine) {
     insert(cache, &def.name, def.value, def.ty);
     if let Some(entry) = cache.get_mut(&def.name)
-        && entry.help.is_empty()
+        && (entry.help.is_empty() || def.name == b"CMAKE_INSTALL_PREFIX")
     {
         entry.help = command_line_help(&def.name).into();
     }
 }
 
 fn command_line_help(name: &[u8]) -> &'static str {
+    if name == b"CMAKE_INSTALL_PREFIX" {
+        return "Install directory prepended to all install() destinations. Defaults to c:/Program Files/${PROJECT_NAME} on Windows and /usr/local on UNIX; may be overridden at install time via cmake --install --prefix.";
+    }
     if name == b"CMAKE_COMPILE_WARNING_AS_ERROR" {
         return "Specify whether to treat warnings on compile as errors. This variable is used to initialize the COMPILE_WARNING_AS_ERROR property on all the targets.";
     }
@@ -297,6 +300,13 @@ pub(crate) fn insert(cache: &mut Cache, name: &[u8], value: BString, ty: Option<
                 props: Default::default(),
             },
         );
+    }
+}
+
+pub(crate) fn insert_internal(cache: &mut Cache, name: &[u8], value: BString, help: &str) {
+    insert(cache, name, value, Some(CacheType::Internal));
+    if let Some(entry) = cache.get_mut(name) {
+        entry.help = help.into();
     }
 }
 

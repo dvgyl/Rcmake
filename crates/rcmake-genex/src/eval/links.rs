@@ -231,7 +231,7 @@ fn not_a_target(target: BString, name: &[u8], implementation: bool) -> GenexErro
     GenexError::Message {
         expression: BString::default(),
         message: format!(
-            "Target \"{target}\" has LINK_LIBRARIES_ONLY_TARGETS enabled, but {message}:\n\n  {name}\n\nwhich is not a target.  Possible reasons include:\n\n  * There is a typo in the target name.\n  * A find_package call is missing for an IMPORTED target.\n  * An ALIAS target is missing.\n"
+            "Target \"{target}\" has LINK_LIBRARIES_ONLY_TARGETS enabled, but {message}:\n  {name}\nwhich is not a target.  Possible reasons include:\n  * There is a typo in the target name.\n  * A find_package call is missing for an IMPORTED target.\n  * An ALIAS target is missing.\n"
         )
         .into(),
     }

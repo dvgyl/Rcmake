@@ -595,11 +595,10 @@ impl GenexError {
                 expression,
                 message,
             } if !expression.is_empty() => {
-                format!("Error evaluating generator expression:\n\n  {expression}\n\n{message}")
-                    .into()
+                format!("Error evaluating generator expression:\n  {expression}\n{message}").into()
             }
             Self::DependencyLoop { expression, .. } => format!(
-                "Error evaluating generator expression:\n\n  {expression}\n\nDependency loop found."
+                "Error evaluating generator expression:\n  {expression}\nDependency loop found."
             )
             .into(),
             _ => self.to_string().into(),

@@ -37,7 +37,7 @@ pub(super) fn run(cx: &mut Cx<'_>, command: &[u8], args: &[&[u8]]) -> Result {
                 Some(size) => set(cx, out, size.to_string()),
                 None => Err(error(
                     [
-                        b"SIZE requested of path that is not readable:\n\n  ".as_slice(),
+                        b"SIZE requested of path that is not readable:\n  ".as_slice(),
                         input,
                     ]
                     .concat(),
@@ -243,7 +243,7 @@ fn open_error(path: &std::path::Path, err: &HostError) -> rcmake_eval::CmdError 
         [
             b"failed to open for reading (",
             err.os_message.as_bytes(),
-            b"):\n\n  ",
+            b"):\n  ",
             &from_native(path),
         ]
         .concat(),

@@ -391,81 +391,17 @@ impl<'a> ConfigureSession<'a> {
         self.prepare_presentation(&mut interp, style);
         *interp.cx().cache() = saved;
         interp.cx().project().generator = generator_kind;
-        for (key, value, help) in [
-            (
-                b"CMAKE_EXTRA_GENERATOR".as_slice(),
-                BString::default(),
-                "Name of external makefile project generator.",
-            ),
-            (
-                b"CMAKE_GENERATOR_INSTANCE",
-                generator_spec.instance.clone(),
-                "Generator instance identifier.",
-            ),
-            (
-                b"CMAKE_GENERATOR_PLATFORM",
-                generator_spec.platform.clone(),
-                "Name of generator platform.",
-            ),
-            (
-                b"CMAKE_GENERATOR_TOOLSET",
-                generator_spec.toolset.clone(),
-                "Name of generator toolset.",
-            ),
-        ] {
-            let mut cx = interp.cx();
-            if !cx.cache().contains(key) {
-                cx.cache().insert(
-                    key.into(),
-                    rcmake_model::CacheEntry {
-                        value,
-                        ty: CacheType::Internal,
-                        help: help.into(),
-                        advanced: false,
-                        props: Default::default(),
-                    },
-                );
-            }
-        }
-        interp.cx().project().generator_spec = generator_spec;
-        cache::insert(
-            interp.cx().cache(),
-            GENERATOR,
+        cache_setup::initialize_standard_cache(
+            &mut interp.cx(),
             generator,
-            Some(CacheType::Internal),
+            &generator_spec,
+            &self.src,
+            &self.bin,
+            &self.list_file,
         );
-        cache::insert(
-            interp.cx().cache(),
-            cache_setup::LIST_FILE_NAME,
-            self.list_file.clone(),
-            Some(CacheType::Internal),
-        );
+        interp.cx().project().generator_spec = generator_spec;
         interp.set_list_file_name(self.list_file.clone());
         interp.set_project_injection(true);
-        cache::insert(
-            interp.cx().cache(),
-            HOME_DIR,
-            path::from_native_cmake(&self.src),
-            Some(CacheType::Internal),
-        );
-        for key in [
-            b"CMAKE_ROOT".as_slice(),
-            b"CMAKE_COMMAND",
-            b"CMAKE_CTEST_COMMAND",
-            b"CMAKE_CPACK_COMMAND",
-        ] {
-            let value = interp.cx().var_or_empty(key);
-            cache::insert(interp.cx().cache(), key, value, Some(CacheType::Internal));
-        }
-        let directory = path::from_native_cmake(&self.bin);
-        for (key, value) in [
-            (b"CMAKE_CACHEFILE_DIR".as_slice(), directory),
-            (b"CMAKE_CACHE_MAJOR_VERSION", "4".into()),
-            (b"CMAKE_CACHE_MINOR_VERSION", "5".into()),
-            (b"CMAKE_CACHE_PATCH_VERSION", "1".into()),
-        ] {
-            cache::insert(interp.cx().cache(), key, value, Some(CacheType::Internal));
-        }
         set_directory_vars(&mut interp, &self.src, &self.bin);
         Ok((runtime, interp, has_cache))
     }
@@ -555,14 +491,31 @@ impl<'a> ConfigureSession<'a> {
         if selection.changed() {
             return Err(Exit::Code(1));
         }
-        if result.exit_code == 0
-            && rcmake_resolve::validate_codegen_name(interp.cx().project(), host).is_err()
-        {
-            if self.show_status() {
-                options::out(host, "-- Configuring incomplete, errors occurred!\n");
+        let codegen_error = result.exit_code == 0
+            && rcmake_resolve::validate_codegen_name(interp.cx().project(), host).is_err();
+        if codegen_error && self.show_status() {
+            options::out(host, "-- Configuring incomplete, errors occurred!\n");
+        }
+        let exit_code = if codegen_error {
+            1
+        } else if result.exit_code == 0 {
+            preloads.exit_code
+        } else {
+            result.exit_code
+        };
+        let directories = interp.cx().project().dirs().count();
+        cache::insert_internal(
+            interp.cx().cache(),
+            b"CMAKE_NUMBER_OF_MAKEFILES",
+            directories.to_string().into(),
+            "number of local generators",
+        );
+        let cache_result = cache::save(host, &self.bin, interp.cx().cache());
+        if let Err(error) = cache_result {
+            emit_cli_error(host, format!("Could not write CMakeCache.txt: {error}"));
+            if exit_code == 0 {
+                return Err(Exit::Code(1));
             }
-            self.list_cache(interp);
-            return Err(Exit::Code(1));
         }
         let queries =
             rcmake_instrument::query::read_queries(host, &self.bin).map_err(Exit::message)?;
@@ -577,38 +530,18 @@ impl<'a> ConfigureSession<'a> {
                     &self.bin,
                     self.argv,
                     rcmake_instrument::SnippetRole::Configure,
-                    &crate::CommandExit::Code(result.exit_code),
+                    &crate::CommandExit::Code(exit_code),
                 )
                 .map_err(Exit::message)?;
         }
-        if result.exit_code == 0 && self.show_status() {
+        if result.exit_code == 0 && !codegen_error && self.show_status() {
             let elapsed = host.monotonic().saturating_sub(start);
             options::out(
                 host,
                 &format!("-- Configuring done ({:.1}s)\n", elapsed.as_secs_f64()),
             );
         }
-        let exit_code = if result.exit_code == 0 {
-            preloads.exit_code
-        } else {
-            result.exit_code
-        };
-        let directories = interp.cx().project().dirs().count();
-        let key = b"CMAKE_NUMBER_OF_MAKEFILES";
-        let mut cx = interp.cx();
-        cache::insert(
-            cx.cache(),
-            key,
-            directories.to_string().into(),
-            Some(CacheType::Internal),
-        );
-        if let Some(entry) = cx.cache().get_mut(key) {
-            entry.help = "number of local generators".into();
-        }
         if exit_code != 0 {
-            if let Err(error) = cache::save(host, &self.bin, interp.cx().cache()) {
-                emit_cli_error(host, format!("Could not write CMakeCache.txt: {error}"));
-            }
             if let Err(error) = rcmake_gen_common::fileapi::write_error_replies(
                 interp.cx().project(),
                 host,
@@ -654,8 +587,9 @@ impl<'a> ConfigureSession<'a> {
         let result = self.profiling.measure(host, ProfilePhase::Generate, || {
             crate::generate::run(interp, host, &self.bin, &queries)
         });
-        let generated = match result {
-            Ok(generated) => generated,
+        use crate::generate::Outcome;
+        let outcome = match result {
+            Ok(outcome) => outcome,
             Err(failure) => {
                 if let crate::generate::Failure::Message(message) = failure {
                     if message.starts_with("CMake Error ") || message.starts_with("CMake Error:") {
@@ -672,6 +606,17 @@ impl<'a> ConfigureSession<'a> {
             }
         };
         let elapsed = host.monotonic().saturating_sub(start);
+        if !matches!(outcome, Outcome::Unsupported) && show_status {
+            options::out(
+                host,
+                &format!("-- Generating done ({:.1}s)\n", elapsed.as_secs_f64()),
+            );
+        }
+        let generated = matches!(outcome, Outcome::Complete);
+        if unused_cli::report(host, interp, results) || matches!(outcome, Outcome::DeferredError) {
+            generation_failed(host);
+            return Err(Exit::Code(1));
+        }
         if generated && !queries.is_empty() {
             generate_step
                 .record(
@@ -685,16 +630,6 @@ impl<'a> ConfigureSession<'a> {
         }
         cache::save(host, &self.bin, interp.cx().cache())
             .map_err(|err| Exit::Message(format!("Could not write CMakeCache.txt: {err}")))?;
-        if generated && show_status {
-            options::out(
-                host,
-                &format!("-- Generating done ({:.1}s)\n", elapsed.as_secs_f64()),
-            );
-        }
-        if unused_cli::report(host, interp, results) {
-            generation_failed(host);
-            return Err(Exit::Code(1));
-        }
         if generated && !queries.is_empty() {
             rcmake_instrument::hooks::run_hook(
                 host,

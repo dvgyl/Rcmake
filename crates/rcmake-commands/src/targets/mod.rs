@@ -683,12 +683,12 @@ pub(crate) fn validate_target_property_value(
         format!("{name} property may be set only on imported INTERFACE library targets.")
     } else if value.starts_with(b"-") {
         format!(
-            "{name} property value\n\n  {}\n\nmay not start with '-'.",
+            "{name} property value\n  {}\nmay not start with '-'.",
             BString::from(value)
         )
     } else if let Some(&byte) = b":;/\\".iter().find(|byte| value.contains(byte)) {
         format!(
-            "{name} property value\n\n  {}\n\nmay not contain '{}'.",
+            "{name} property value\n  {}\nmay not contain '{}'.",
             BString::from(value),
             char::from(byte)
         )

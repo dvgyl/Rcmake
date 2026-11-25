@@ -306,7 +306,7 @@ impl<'a> Declaration<'a> {
                 "arguments"
             };
             return Err(RuleError::fatal(format!(
-                "given invalid {count}:\n\n{}",
+                "given invalid {count}:\n{}",
                 entries.join("\n")
             )));
         }

@@ -173,7 +173,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     Effect::SetError,
                     None,
                     format!(
-                        "Attempt to add link library \"{text}\" to target \"{}\" which is not built in this directory.\n\nThis is allowed only when policy CMP0079 is set to NEW.",
+                        "Attempt to add link library \"{text}\" to target \"{}\" which is not built in this directory.\nThis is allowed only when policy CMP0079 is set to NEW.",
                         name.value
                     ).into(),
                 );
@@ -489,7 +489,7 @@ fn validate_links(cx: &mut Cx<'_>) {
                             location: Location::Backtrace(link.text.backtrace.clone()),
                             kind: MessageKind::AuthorWarning,
                             category: Some(DiagCategory::Author),
-                            body: format!("The library that is being linked to, {}, is marked as being deprecated by the owner.  The message provided by the developer is:\n\n{message}\n", linked.name).into(),
+                            body: format!("The library that is being linked to, {}, is marked as being deprecated by the owner.  The message provided by the developer is:\n{message}\n", linked.name).into(),
                         });
                         }
                         if let Some(error) = missing_import(&resolver, linked, &config)
@@ -570,7 +570,7 @@ fn ipo_diagnostic(
             category: Some(DiagCategory::Policy),
             location,
             body: format!(
-                "Policy CMP0069 is not set: INTERPROCEDURAL_OPTIMIZATION is enforced when enabled.  Run \"cmake --help-policy CMP0069\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nINTERPROCEDURAL_OPTIMIZATION property will be ignored for target '{}'.",
+                "Policy CMP0069 is not set: INTERPROCEDURAL_OPTIMIZATION is enforced when enabled.  Run \"cmake --help-policy CMP0069\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\nINTERPROCEDURAL_OPTIMIZATION property will be ignored for target '{}'.",
                 target.name
             ).into(),
         });
@@ -654,7 +654,7 @@ fn missing_import(
         format!(" configuration \"{}\"", config.0)
     };
     let prefix = if kind == MessageKind::AuthorWarning {
-        "Policy CMP0111 is not set: An imported target missing its location property fails during generation.  Run \"cmake --help-policy CMP0111\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\n"
+        "Policy CMP0111 is not set: An imported target missing its location property fails during generation.  Run \"cmake --help-policy CMP0111\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n"
     } else {
         ""
     };
@@ -731,7 +731,7 @@ fn signature_error(target: &Target, signature: Signature, has_item: bool) -> Opt
     let calls = target.props.get(property)?;
     let name = &target.name;
     Some(format!(
-        "The {previous} signature for target_link_libraries has already been used with the target \"{name}\".  All uses of target_link_libraries with a target must be either all-keyword or all-plain.\n\nThe uses of the {previous} signature are here:\n{calls}\n"
+        "The {previous} signature for target_link_libraries has already been used with the target \"{name}\".  All uses of target_link_libraries with a target must be either all-keyword or all-plain.\nThe uses of the {previous} signature are here:\n{calls}\n"
     ))
 }
 

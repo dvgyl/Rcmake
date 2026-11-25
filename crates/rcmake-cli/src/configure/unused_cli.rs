@@ -52,11 +52,9 @@ pub(super) fn report(host: &dyn Host, interp: &mut Interp, results: &mut Vec<Val
     });
     display.extend_from_slice(message);
     display.extend_from_slice(b"\n\n");
-    body.extend_from_slice(b"\n\n");
     for name in names {
-        body.extend_from_slice(b"  ");
+        body.extend_from_slice(b"\n  ");
         body.extend_from_slice(&name);
-        body.push(b'\n');
         display.extend_from_slice(b"    ");
         display.extend_from_slice(&name);
         display.push(b'\n');

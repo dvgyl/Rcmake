@@ -127,14 +127,8 @@ fn validate_keywords(cx: &mut Cx<'_>, request: &Parsed) -> Result<()> {
             [b"Unrecognized argument: \"".as_slice(), unparsed, b"\""].concat(),
         ));
     }
-    if request.has_errors() {
-        let mut text = request
-            .keyword_errors()
-            .map(|(key, _)| format!("Error after keyword \"{key}\":\n\n  missing required value"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        text.push('\n');
-        return Err(crate::command_error(cx, text));
+    if let Some(message) = request.report_error_text() {
+        return Err(crate::command_error(cx, message));
     }
     Ok(())
 }
@@ -302,7 +296,7 @@ pub(super) fn extract(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         } else {
             error(
                 [
-                    b"failed to extract:\n\n  ".as_slice(),
+                    b"failed to extract:\n  ".as_slice(),
                     &from_native(&archive_path),
                 ]
                 .concat(),

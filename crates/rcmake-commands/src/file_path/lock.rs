@@ -49,7 +49,7 @@ fn lock(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                     Some(b"PROCESS") => FileLockScope::Process,
                     Some(value) => {
                         return Err(error(
-                            [expected.as_slice(), b", but got:\n\n  \"", value, b"\"."].concat(),
+                            [expected.as_slice(), b", but got:\n  \"", value, b"\"."].concat(),
                         ));
                     }
                     None => return Err(error(expected.as_slice())),
@@ -86,7 +86,7 @@ fn lock(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                     [
                         b"expected DIRECTORY, RELEASE, GUARD, RESULT_VARIABLE or TIMEOUT"
                             .as_slice(),
-                        b"\n\nbut got: \"",
+                        b"\nbut got: \"",
                         option,
                         b"\".",
                     ]
@@ -123,7 +123,7 @@ fn lock(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
         Ok(()) => set(cx, output, "0"),
         Err(reason) if !output.is_empty() => set(cx, output, reason),
         Err(reason) => Err(error(format!(
-            "error locking file\n\n  \"{}\"\n\n{reason}.",
+            "error locking file\n  \"{}\"\n{reason}.",
             path.display()
         ))),
     }
@@ -131,7 +131,7 @@ fn lock(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
 
 fn creation_error(kind: &str, path: &Path) -> CmdError {
     error(format!(
-        "{kind}\n\n  \"{}\"\n\ncreation failed (check permissions).",
+        "{kind}\n  \"{}\"\ncreation failed (check permissions).",
         path.display()
     ))
 }

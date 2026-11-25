@@ -364,12 +364,12 @@ fn version_error(cx: &mut Cx<'_>, message: BString) -> CmdError {
 fn policy_error(cx: &mut Cx<'_>, error: PolicyError) -> CmdError {
     let message = match error {
         PolicyError::VersionBelowMinimum => format!(
-            "{error}\n\n{VERSION_ADVICE}\n\nOr, add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to try configuring anyway."
+            "{error}\n{VERSION_ADVICE}\nOr, add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to try configuring anyway."
         ),
         PolicyError::RemovedOldBehavior(id) => {
             let version = id.info().map_or((0, 0, 0), |info| info.introduced);
             format!(
-                "Policy {id} may not be set to OLD behavior because this version of CMake no longer supports it.  The policy was introduced in CMake version {}.{}.{}, and use of NEW behavior is now required.\n\nPlease either update your CMakeLists.txt files to conform to the new behavior or use an older version of CMake that still supports the old behavior.  Run cmake --help-policy {id} for more information.",
+                "Policy {id} may not be set to OLD behavior because this version of CMake no longer supports it.  The policy was introduced in CMake version {}.{}.{}, and use of NEW behavior is now required.\nPlease either update your CMakeLists.txt files to conform to the new behavior or use an older version of CMake that still supports the old behavior.  Run cmake --help-policy {id} for more information.",
                 version.0, version.1, version.2
             )
         }

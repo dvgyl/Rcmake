@@ -102,11 +102,11 @@ pub(crate) fn initialize_diagnostics(
             serialized.push('=');
             serialized.push_str(state.get(cat).as_str());
         }
-        cache::insert(
+        cache::insert_internal(
             cache,
             DIAG_INIT,
             serialized.into(),
-            Some(CacheType::Internal),
+            "Set initial state for CMake diagnostics; used to persist state set by command-line options across invocations.",
         );
     }
     for (cat, vars) in [

@@ -71,7 +71,7 @@ fn real_path(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                 let value = options.next().ok_or_else(|| {
                     crate::command_error(
                         cx,
-                        "Error after keyword \"BASE_DIRECTORY\":\n\n  missing required value\n",
+                        "Error after keyword \"BASE_DIRECTORY\":\n  missing required value\n",
                     )
                 })?;
                 base = value.into();
@@ -141,9 +141,9 @@ fn real_path(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
             warning(
                 cx,
                 [
-                    b"Given path:\n\n  ",
+                    b"Given path:\n  ",
                     input.as_slice(),
-                    b"\n\ndoes not refer to an existing path on disk.",
+                    b"\ndoes not refer to an existing path on disk.",
                 ]
                 .concat(),
             );
