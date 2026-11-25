@@ -66,6 +66,7 @@ The table links to the licence and notice files included in each crate.
 | `digest` | `0.10.7` | `MIT OR Apache-2.0` | <https://github.com/RustCrypto/traits> | RustCrypto Developers | [`LICENSE-APACHE`](#crate-notice-7), [`LICENSE-MIT`](#crate-notice-20) |
 | `equivalent` | `1.0.3` | `Apache-2.0 OR MIT` | <https://github.com/indexmap-rs/equivalent> | — | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-21) |
 | `errno` | `0.3.15` | `MIT OR Apache-2.0` | <https://github.com/lambda-fairy/rust-errno> | Chris Wong &lt;lambda.fairy@gmail.com&gt;, Dan Gohman &lt;dev@sunfishcode.online&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-22) |
+| `fastrand` | `2.5.0` | `Apache-2.0 OR MIT` | <https://github.com/smol-rs/fastrand> | Stjepan Glavina &lt;stjepang@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-3) |
 | `filetime` | `0.2.30` | `MIT OR Apache-2.0` | <https://github.com/alexcrichton/filetime> | Alex Crichton &lt;alex@alexcrichton.com&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
 | `find-msvc-tools` | `0.1.15` | `MIT OR Apache-2.0` | <https://github.com/rust-lang/cc-rs> | — | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
 | `flate2` | `1.1.11` | `MIT OR Apache-2.0` | <https://github.com/rust-lang/flate2-rs> | Alex Crichton &lt;alex@alexcrichton.com&gt;, Josh Triplett &lt;josh@joshtriplett.org&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-23) |
@@ -96,6 +97,7 @@ The table links to the licence and notice files included in each crate.
 | `memchr` | `2.8.3` | `Unlicense OR MIT` | <https://github.com/BurntSushi/memchr> | Andrew Gallant &lt;jamslam@gmail.com&gt;, bluss | [`COPYING`](#crate-notice-32), [`LICENSE-MIT`](#crate-notice-33), [`UNLICENSE`](#crate-notice-34) |
 | `miniz_oxide` | `0.9.1` | `MIT OR Zlib OR Apache-2.0` | <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide> | Frommi &lt;daniil.liferenko@gmail.com&gt;, oyvindln &lt;oyvindln@users.noreply.github.com&gt;, Rich Geldreich richgel99@gmail.com | [`LICENSE`](#crate-notice-43), [`LICENSE-APACHE.md`](#crate-notice-44), [`LICENSE-MIT.md`](#crate-notice-45), [`LICENSE-ZLIB.md`](#crate-notice-46) |
 | `nix` | `0.31.4` | `MIT` | <https://github.com/nix-rust/nix> | — | [`LICENSE`](#crate-notice-47) |
+| `once_cell` | `1.21.4` | `MIT OR Apache-2.0` | <https://github.com/matklad/once_cell> | Aleksey Kladov &lt;aleksey.kladov@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-3) |
 | `pin-project-lite` | `0.2.18` | `Apache-2.0 OR MIT` | <https://github.com/taiki-e/pin-project-lite> | — | [`LICENSE-APACHE`](#crate-notice-44), [`LICENSE-MIT`](#crate-notice-3) |
 | `pkg-config` | `0.3.34` | `MIT OR Apache-2.0` | <https://github.com/rust-lang/pkg-config-rs> | Alex Crichton &lt;alex@alexcrichton.com&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
 | `portable-atomic` | `1.15.0` | `Apache-2.0 OR MIT` | <https://github.com/taiki-e/portable-atomic> | — | [`LICENSE-APACHE`](#crate-notice-44), [`LICENSE-MIT`](#crate-notice-3) |
@@ -122,35 +124,36 @@ The table links to the licence and notice files included in each crate.
 | `syn` | `2.0.119` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/syn> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
 | `syn` | `3.0.10` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/syn> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
 | `tar` | `0.4.46` | `MIT OR Apache-2.0` | <https://github.com/composefs/tar-rs> | Alex Crichton &lt;alex@alexcrichton.com&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-57) |
+| `tempfile` | `3.27.0` | `MIT OR Apache-2.0` | <https://github.com/Stebalien/tempfile> | Steven Allen &lt;steven@stebalien.com&gt;, The Rust Project Developers, Ashley Mannix &lt;ashleymannix@live.com.au&gt;, Jason White &lt;me@jasonwhite.io&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-58) |
 | `thiserror` | `2.0.21` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/thiserror> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
 | `thiserror-impl` | `2.0.21` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/thiserror> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
-| `typenum` | `1.20.1` | `MIT OR Apache-2.0` | <https://github.com/paholg/typenum> | — | [`LICENSE`](#crate-notice-58), [`LICENSE-APACHE`](#crate-notice-59), [`LICENSE-MIT`](#crate-notice-60) |
-| `unicode-ident` | `1.0.27` | `(MIT OR Apache-2.0) AND Unicode-3.0` | <https://github.com/dtolnay/unicode-ident> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3), [`LICENSE-UNICODE`](#crate-notice-61) |
-| `version_check` | `0.9.5` | `MIT OR Apache-2.0` | <https://github.com/SergioBenitez/version_check> | Sergio Benitez &lt;sb@sergio.bz&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-62) |
+| `typenum` | `1.20.1` | `MIT OR Apache-2.0` | <https://github.com/paholg/typenum> | — | [`LICENSE`](#crate-notice-59), [`LICENSE-APACHE`](#crate-notice-60), [`LICENSE-MIT`](#crate-notice-61) |
+| `unicode-ident` | `1.0.27` | `(MIT OR Apache-2.0) AND Unicode-3.0` | <https://github.com/dtolnay/unicode-ident> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3), [`LICENSE-UNICODE`](#crate-notice-62) |
+| `version_check` | `0.9.5` | `MIT OR Apache-2.0` | <https://github.com/SergioBenitez/version_check> | Sergio Benitez &lt;sb@sergio.bz&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-63) |
 | `wasm-bindgen` | `0.2.130` | `MIT OR Apache-2.0` | <https://github.com/wasm-bindgen/wasm-bindgen> | The wasm-bindgen Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
 | `wasm-bindgen-macro` | `0.2.130` | `MIT OR Apache-2.0` | <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro> | The wasm-bindgen Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
 | `wasm-bindgen-macro-support` | `0.2.130` | `MIT OR Apache-2.0` | <https://github.com/wasm-bindgen/wasm-bindgen/tree/main/crates/macro-support> | The wasm-bindgen Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
 | `wasm-bindgen-shared` | `0.2.130` | `MIT OR Apache-2.0` | <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared> | The wasm-bindgen Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
-| `winapi-util` | `0.1.11` | `Unlicense OR MIT` | <https://github.com/BurntSushi/winapi-util> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-32), [`LICENSE-MIT`](#crate-notice-63), [`UNLICENSE`](#crate-notice-34) |
-| `windows` | `0.62.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-collections` | `0.3.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-core` | `0.62.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-future` | `0.3.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-implement` | `0.60.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-interface` | `0.59.3` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-link` | `0.2.1` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-numerics` | `0.3.1` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-result` | `0.4.1` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-strings` | `0.5.1` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-sys` | `0.61.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `windows-threading` | `0.2.1` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-64), [`license-mit`](#crate-notice-65) |
-| `winreg` | `0.56.0` | `MIT` | <https://github.com/gentoo90/winreg-rs> | Igor Shaula &lt;gentoo90@gmail.com&gt; | [`LICENSE`](#crate-notice-66) |
-| `zip` | `2.6.1` | `MIT` | <https://github.com/zip-rs/zip2.git> | Mathijs van de Nes &lt;git@mathijs.vd-nes.nl&gt;, Marli Frost &lt;marli@frost.red&gt;, Ryan Levick &lt;ryan.levick@gmail.com&gt;, Chris Hennick &lt;hennickc@amazon.com&gt; | [`LICENSE`](#crate-notice-67) |
-| `zlib-rs` | `0.6.8` | `Zlib` | <https://github.com/trifectatechfoundation/zlib-rs> | — | [`LICENSE`](#crate-notice-68) |
+| `winapi-util` | `0.1.11` | `Unlicense OR MIT` | <https://github.com/BurntSushi/winapi-util> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-32), [`LICENSE-MIT`](#crate-notice-64), [`UNLICENSE`](#crate-notice-34) |
+| `windows` | `0.62.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-collections` | `0.3.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-core` | `0.62.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-future` | `0.3.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-implement` | `0.60.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-interface` | `0.59.3` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-link` | `0.2.1` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-numerics` | `0.3.1` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-result` | `0.4.1` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-strings` | `0.5.1` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-sys` | `0.61.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `windows-threading` | `0.2.1` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
+| `winreg` | `0.56.0` | `MIT` | <https://github.com/gentoo90/winreg-rs> | Igor Shaula &lt;gentoo90@gmail.com&gt; | [`LICENSE`](#crate-notice-67) |
+| `zip` | `2.6.1` | `MIT` | <https://github.com/zip-rs/zip2.git> | Mathijs van de Nes &lt;git@mathijs.vd-nes.nl&gt;, Marli Frost &lt;marli@frost.red&gt;, Ryan Levick &lt;ryan.levick@gmail.com&gt;, Chris Hennick &lt;hennickc@amazon.com&gt; | [`LICENSE`](#crate-notice-68) |
+| `zlib-rs` | `0.6.8` | `Zlib` | <https://github.com/trifectatechfoundation/zlib-rs> | — | [`LICENSE`](#crate-notice-69) |
 | `zmij` | `1.0.23` | `MIT` | <https://github.com/dtolnay/zmij> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-MIT`](#crate-notice-3) |
-| `zstd` | `0.14.4` | `BSD-3-Clause` | <https://github.com/gyscos/zstd-rs> | Alexandre Bury &lt;alexandre.bury@gmail.com&gt; | [`LICENSE`](#crate-notice-69) |
-| `zstd-safe` | `8.3.0` | `BSD-3-Clause` | <https://github.com/gyscos/zstd-rs> | Alexandre Bury &lt;alexandre.bury@gmail.com&gt; | [`LICENSE`](#crate-notice-69) |
-| `zstd-sys` | `2.1.3+zstd.1.5.7` | `BSD-3-Clause AND BSD-2-Clause` | <https://github.com/gyscos/zstd-rs> | Alexandre Bury &lt;alexandre.bury@gmail.com&gt; | [`LICENSE`](#crate-notice-69), [`LICENSE.BSD-2-Clause`](#crate-notice-70), [`LICENSE.BSD-3-Clause`](#crate-notice-71) |
+| `zstd` | `0.14.4` | `BSD-3-Clause` | <https://github.com/gyscos/zstd-rs> | Alexandre Bury &lt;alexandre.bury@gmail.com&gt; | [`LICENSE`](#crate-notice-70) |
+| `zstd-safe` | `8.3.0` | `BSD-3-Clause` | <https://github.com/gyscos/zstd-rs> | Alexandre Bury &lt;alexandre.bury@gmail.com&gt; | [`LICENSE`](#crate-notice-70) |
+| `zstd-sys` | `2.1.3+zstd.1.5.7` | `BSD-3-Clause AND BSD-2-Clause` | <https://github.com/gyscos/zstd-rs> | Alexandre Bury &lt;alexandre.bury@gmail.com&gt; | [`LICENSE`](#crate-notice-70), [`LICENSE.BSD-2-Clause`](#crate-notice-71), [`LICENSE.BSD-3-Clause`](#crate-notice-72) |
 
 ### Licence and notice text from Cargo packages
 
@@ -3568,10 +3571,40 @@ DEALINGS IN THE SOFTWARE.
 #### Crate notice 58
 
 ```text
-MIT OR Apache-2.0
+Copyright (c) 2015 Steven Allen
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 ```
 
 #### Crate notice 59
+
+```text
+MIT OR Apache-2.0
+```
+
+#### Crate notice 60
 
 ```text
                               Apache License
@@ -3777,7 +3810,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Crate notice 60
+#### Crate notice 61
 
 ```text
 The MIT License (MIT)
@@ -3803,7 +3836,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Crate notice 61
+#### Crate notice 62
 
 ```text
 UNICODE LICENSE V3
@@ -3847,7 +3880,7 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
-#### Crate notice 62
+#### Crate notice 63
 
 ```text
 The MIT License (MIT)
@@ -3871,7 +3904,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Crate notice 63
+#### Crate notice 64
 
 ```text
 The MIT License (MIT)
@@ -3897,7 +3930,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-#### Crate notice 64
+#### Crate notice 65
 
 ```text
                                  Apache License
@@ -4103,7 +4136,7 @@ THE SOFTWARE.
    limitations under the License.
 ```
 
-#### Crate notice 65
+#### Crate notice 66
 
 ```text
     MIT License
@@ -4129,7 +4162,7 @@ THE SOFTWARE.
     SOFTWARE
 ```
 
-#### Crate notice 66
+#### Crate notice 67
 
 ```text
 Copyright (c) 2015 Igor Shaula
@@ -4153,7 +4186,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-#### Crate notice 67
+#### Crate notice 68
 
 ```text
 The MIT License (MIT)
@@ -4182,7 +4215,7 @@ Some files in the "tests/data" subdirectory of this repository are under other
 licences; see files named LICENSE.*.txt for details.
 ```
 
-#### Crate notice 68
+#### Crate notice 69
 
 ```text
 (C) 2024 Trifecta Tech Foundation
@@ -4206,7 +4239,7 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-#### Crate notice 69
+#### Crate notice 70
 
 ```text
 BSD 3-Clause License
@@ -4239,7 +4272,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-#### Crate notice 70
+#### Crate notice 71
 
 ```text
 The decoders for legacy formats, in zstd/lib/legacy/, include code under the
@@ -4273,7 +4306,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-#### Crate notice 71
+#### Crate notice 72
 
 ```text
 The auto-generated bindings are under the 3-clause BSD license:
