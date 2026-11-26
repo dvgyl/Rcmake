@@ -194,25 +194,38 @@ impl Interp {
     }
 
     pub(crate) fn recursion_limit(&self) -> u32 {
-        let name = b"CMAKE_MAXIMUM_RECURSION_DEPTH";
-        let environment;
-        let value = if let Some(value) = self.lookup_var(name) {
-            Some(value)
-        } else {
-            environment = self.config.host.env_get(name);
-            environment.as_ref()
-        };
-        let configured = value
-            .and_then(|v| {
-                core::str::from_utf8(v.trim_ascii_start())
-                    .ok()?
-                    .parse::<u64>()
-                    .ok()
+        use crate::scope::RECURSION_LIMIT;
+        self.record_variable_access(RECURSION_LIMIT);
+        let configured = self
+            .vars
+            .recursion_limit()
+            .unwrap_or_else(|| {
+                if let Some(entry) = self.project.cache.get(RECURSION_LIMIT) {
+                    self.parse_recursion_fallback(&entry.value)
+                } else {
+                    self.config
+                        .host
+                        .env_get(RECURSION_LIMIT)
+                        .and_then(|value| self.parse_recursion_fallback(&value))
+                }
             })
-            .map_or(self.config.limits.max_recursion, |v| {
-                u32::try_from(v).unwrap_or(u32::MAX)
-            });
+            .unwrap_or(self.config.limits.max_recursion);
         configured.min(HARD_RECURSION_CEILING)
+    }
+
+    fn parse_recursion_fallback(&self, value: &[u8]) -> Option<u32> {
+        let value = value.trim_ascii_start();
+        let parse = || crate::scope::parse_recursion_limit(value);
+        if value.len() > 64 {
+            return parse();
+        }
+        let Ok(mut last) = self.recursion_fallback.try_lock() else {
+            return parse();
+        };
+        if last.0.as_slice() != value {
+            *last = (value.into(), parse());
+        }
+        last.1
     }
 
     /// Get the current backtrace with a new command frame.

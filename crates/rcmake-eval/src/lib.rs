@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rcmake_base::{BString, Limits, fold_command_name};
 use rcmake_diag::{
@@ -464,6 +464,7 @@ pub struct Interp {
     /// Name of the project file read in each directory (`cmake --project-file`).
     list_file_name: BString,
     depth: u32,
+    recursion_fallback: Mutex<(BString, Option<u32>)>,
     recursion_exceeded: bool,
     inherited_recursion: Option<(u32, u32)>,
     check_system_vars: bool,
@@ -585,6 +586,7 @@ impl Interp {
             bt: Backtrace::default(),
             list_file_name: BString::from(DEFAULT_LIST_FILE_NAME),
             depth: 0,
+            recursion_fallback: Mutex::default(),
             recursion_exceeded: false,
             inherited_recursion: None,
             check_system_vars: false,

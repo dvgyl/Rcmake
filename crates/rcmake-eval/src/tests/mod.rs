@@ -519,3 +519,37 @@ fn child_interpreters_reuse_the_same_parsed_modules() {
         }
     }
 }
+
+#[test]
+fn updates_parsed_recursion_limit_after_scope_and_host_changes() {
+    use rcmake_host::Host;
+
+    let (mut interp, host) = new_interp(&[], RunMode::Configure);
+    let limit = crate::scope::RECURSION_LIMIT;
+    let initial = interp.recursion_limit();
+    host.env_set(limit, Some(b"98"));
+    assert_eq!(interp.recursion_limit(), 98);
+    interp.vars.set(limit, " 12".into());
+    assert_eq!(interp.recursion_limit(), 12);
+    interp.vars.push();
+    assert!(interp.vars.set_parent(limit, Some("23".into())));
+    assert_eq!(interp.recursion_limit(), 12);
+    interp.vars.unset(limit);
+    assert_eq!(interp.recursion_limit(), 98);
+    interp.vars.pop();
+    assert_eq!(interp.recursion_limit(), 23);
+    interp.vars.push();
+    interp.vars.set(limit, "bad".into());
+    assert_eq!(interp.recursion_limit(), initial);
+    interp.vars.propagate_capture();
+    assert_eq!(interp.recursion_limit(), initial);
+    interp.vars.unset(limit);
+    host.env_set(limit, Some(b"19"));
+    assert_eq!(interp.recursion_limit(), 19);
+    interp
+        .cx()
+        .write_cache(limit, "17".into(), rcmake_model::CacheType::String, b"");
+    assert_eq!(interp.recursion_limit(), 17);
+    interp.cx().remove_cache_entry(limit);
+    assert_eq!(interp.recursion_limit(), 19);
+}

@@ -7,6 +7,33 @@ use rcmake_base::BString;
 use rcmake_diag::PolicyStatus;
 use rcmake_model::DirId;
 
+pub(crate) const RECURSION_LIMIT: &[u8] = b"CMAKE_MAXIMUM_RECURSION_DEPTH";
+
+pub(crate) fn parse_recursion_limit(value: &[u8]) -> Option<u32> {
+    let value = core::str::from_utf8(value.trim_ascii_start())
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    Some(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum RecursionBinding {
+    #[default]
+    Inherit,
+    Unset,
+    Defined(Option<u32>),
+}
+
+impl RecursionBinding {
+    fn configured(self) -> Option<Option<u32>> {
+        match self {
+            Self::Defined(value) => Some(value),
+            Self::Inherit | Self::Unset => None,
+        }
+    }
+}
+
 /// One binding in a variable scope.
 ///
 /// An [`Binding::Unset`] entry shadows bindings in outer scopes. A name that has no entry
@@ -25,6 +52,16 @@ struct Scope {
     directory: Option<DirId>,
     bindings: BTreeMap<BString, Binding>,
     parent_policy: Option<(usize, PolicyStatus)>,
+    recursion_limit: RecursionBinding,
+}
+
+impl Scope {
+    fn record_recursion_binding(&mut self, binding: &Binding) {
+        self.recursion_limit = match binding {
+            Binding::Unset => RecursionBinding::Unset,
+            Binding::Set(value) => RecursionBinding::Defined(parse_recursion_limit(value)),
+        };
+    }
 }
 
 /// Stack of variable scopes. Index `0` is the outermost (directory) scope.
@@ -32,6 +69,7 @@ struct Scope {
 pub(crate) struct VarStack {
     scopes: Vec<Scope>,
     next_id: u64,
+    recursion_limit: Option<Option<u32>>,
 }
 
 impl Default for VarStack {
@@ -42,8 +80,10 @@ impl Default for VarStack {
                 directory: Some(DirId::ROOT),
                 bindings: BTreeMap::new(),
                 parent_policy: None,
+                recursion_limit: RecursionBinding::Inherit,
             }],
             next_id: 1,
+            recursion_limit: None,
         }
     }
 }
@@ -53,6 +93,20 @@ impl VarStack {
     #[cfg(test)]
     pub(crate) fn depth(&self) -> usize {
         self.scopes.len()
+    }
+
+    /// Get the parsed normal value. A defined but invalid value uses the default limit.
+    pub(crate) fn recursion_limit(&self) -> Option<Option<u32>> {
+        self.recursion_limit
+    }
+
+    fn update_recursion_limit(&mut self) {
+        self.recursion_limit = self
+            .scopes
+            .iter()
+            .rev()
+            .find(|scope| !matches!(scope.recursion_limit, RecursionBinding::Inherit))
+            .and_then(|scope| scope.recursion_limit.configured());
     }
 
     /// Find the innermost binding for `name`.
@@ -99,6 +153,10 @@ impl VarStack {
 
     fn insert_top(&mut self, name: &[u8], binding: Binding) {
         if let Some(top) = self.scopes.last_mut() {
+            if name == RECURSION_LIMIT {
+                top.record_recursion_binding(&binding);
+                self.recursion_limit = top.recursion_limit.configured();
+            }
             if let Some(current) = top.bindings.get_mut(name) {
                 *current = binding;
             } else {
@@ -122,14 +180,18 @@ impl VarStack {
             directory,
             bindings: BTreeMap::new(),
             parent_policy,
+            recursion_limit: RecursionBinding::Inherit,
         });
         self.next_id = self.next_id.saturating_add(1);
     }
 
     /// Pop the innermost scope. The outermost scope is never removed.
     pub(crate) fn pop(&mut self) {
-        if self.scopes.len() > 1 {
-            self.scopes.pop();
+        if self.scopes.len() > 1
+            && let Some(scope) = self.scopes.pop()
+            && !matches!(scope.recursion_limit, RecursionBinding::Inherit)
+        {
+            self.update_recursion_limit();
         }
     }
 
@@ -148,6 +210,9 @@ impl VarStack {
         let Some(capture) = self.scopes.pop() else {
             return false;
         };
+        if !matches!(capture.recursion_limit, RecursionBinding::Inherit) {
+            self.update_recursion_limit();
+        }
         let mut bindings = capture.bindings;
         bindings.retain(|name, binding| {
             let value = match binding {
@@ -163,11 +228,19 @@ impl VarStack {
         let Some(caller) = scopes.next() else {
             return false;
         };
+        let limit = bindings.get(RECURSION_LIMIT);
+        if let Some(binding) = limit {
+            caller.record_recursion_binding(binding);
+            self.recursion_limit = caller.recursion_limit.configured();
+        }
         caller.bindings.extend(bindings.clone());
         let mut policy = caller.parent_policy;
         for parent in scopes {
             match policy.map(|(_, status)| status) {
                 Some(PolicyStatus::New) => {
+                    if let Some(binding) = limit {
+                        parent.record_recursion_binding(binding);
+                    }
                     parent.bindings.extend(bindings.clone());
                     policy = parent.parent_policy;
                 }
@@ -192,6 +265,9 @@ impl VarStack {
         self.insert_top(name, current);
         if let Some(parent) = self.scopes.get_mut(len - 2) {
             let binding = value.map_or(Binding::Unset, Binding::Set);
+            if name == RECURSION_LIMIT {
+                parent.record_recursion_binding(&binding);
+            }
             parent.bindings.insert(BString::from(name), binding);
         }
         true
