@@ -29,10 +29,11 @@ cp "$BIN_SRC" "$STAGE/bin/rcmake"
 ln -sf rcmake "$STAGE/bin/cmake"
 ln -sf rcmake "$STAGE/bin/ctest"
 ln -sf rcmake "$STAGE/bin/cpack"
+ln -sf rcmake "$STAGE/bin/rcmake-lsp"
 
 # Make the bundled CMake data available under CMAKE_ROOT.
 ln -s "$ROOT/modules/cmake-4.5/Modules" "$STAGE/share/cmake-4.5/Modules"
 ln -s "$ROOT/modules/cmake-4.5/Templates" "$STAGE/share/cmake-4.5/Templates"
 ln -s "$ROOT/modules/cmake-4.5/Help" "$STAGE/share/cmake-4.5/Help"
 
-echo "Staged Rcmake at $STAGE/bin/{rcmake,cmake,ctest,cpack} with share/cmake-4.5"
+echo "Staged rcmake at $STAGE/bin/{rcmake,cmake,ctest,cpack,rcmake-lsp} with share/cmake-4.5"

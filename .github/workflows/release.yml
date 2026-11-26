@@ -118,11 +118,12 @@ jobs:
           $work = Join-Path $env:RUNNER_TEMP ([Guid]::NewGuid().ToString())
           $package = Join-Path $work $name
           try {
-            New-Item -ItemType Directory -Path "$package/bin", "$package/share", "$package/third_party", 'dist' -Force | Out-Null
+            New-Item -ItemType Directory -Path "$package/bin", "$package/share/rcmake/completions", "$package/third_party", 'dist' -Force | Out-Null
             foreach ($tool in 'rcmake', 'cmake', 'ctest', 'cpack', 'rcmake-lsp') {
               Copy-Item "$binaries/rcmake.exe" "$package/bin/$tool.exe"
             }
             Copy-Item modules/cmake-4.5 "$package/share/" -Recurse
+            Copy-Item completions/rcmake.ps1 "$package/share/rcmake/completions/rcmake.ps1"
             Copy-Item third_party/licences "$package/third_party/" -Recurse
             Copy-Item LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md $package
 
