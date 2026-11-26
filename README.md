@@ -394,6 +394,10 @@ cargo run --release --bin rcmake-fuzz -- syntax --iterations 1000000
 python3 tools/measure/upstream_track.py --out-json upstream.json --out-md upstream.md
 ```
 
+To run every scorecard lane on this host and write the receipts that `tools/measure/assemble_release_receipts.py` reads, use `scripts/reproduce-scorecard.sh --receipts-dir <dir>`.
+Add `--dry-run` to print each command and receipt path first.
+Use `--lane <name>` to run one lane. `--help` lists the lanes.
+
 The [engineering write-up](docs/BUILD_WRITEUP.md#7-reproduce-every-claim-in-one-command) has the complete command table. It covers the large C++ projects, the sealed holdout, Conan and `vcpkg`, probe-cache soundness, and mutation replay.
 
 ## Repository layout
