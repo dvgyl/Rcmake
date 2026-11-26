@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Derived from CMake (Copyright Kitware, Inc. and Contributors);
+// see third_party/licences/CMake-BSD-3-Clause.txt.
+
 //! Runtime policy warning summaries (`cmPolicies::GetPolicyWarning`).
 //!
 //! Recorded from CMake 4.5.1 runtime output: `cmake_policy(GET_WARNING <CMP> <var>)`
