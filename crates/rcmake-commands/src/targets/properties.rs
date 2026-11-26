@@ -275,7 +275,7 @@ pub(super) fn initialize_file_set_properties(target: &mut Target) {
     }
 }
 
-// Make the file set properties available through the model's target property lookup.
+/// Make the file set properties available through the model's target property lookup.
 pub(super) fn store_file_set_properties(model: &mut ProjectModel, set: FileSetId) {
     let Some(set) = model.file_set(set) else {
         return;

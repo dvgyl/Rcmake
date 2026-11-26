@@ -2,22 +2,22 @@
 
 use std::collections::BTreeSet;
 
-use rcmake_base::{BString, list, path_lex::Lexical, truth};
-use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_base::{BString, path_lex::Lexical, truth};
+use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
-use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, find_genex, parse};
+use rcmake_genex::find_genex;
 use rcmake_host::path::from_native;
 use rcmake_model::{
-    BT, CommandId, CustomCommand, CustomCommandKind, DirId, Directory, GeneratorKind, ModelError,
-    ProjectModel, Target, TargetBinding, TargetEvent, TargetKind, TargetOrigin,
+    BT, CustomCommand, CustomCommandKind, Directory, GeneratorKind, TargetBinding, TargetEvent,
+    TargetKind,
 };
-use rcmake_resolve::usage::UsageResolver;
-use rcmake_syntax::{ArgKind, Argument};
 
 use crate::util::model_error;
 
+mod append;
 mod rule;
+mod target;
 #[cfg(test)]
 mod tests;
 
@@ -29,7 +29,7 @@ pub(crate) const SOURCE_BINARY_ALTERNATIVE: &[u8] = b"\0rcmake-source-binary-alt
 pub(crate) fn register(registry: &mut Registry) {
     let project_only = CmdFlags { scriptable: false };
     registry.add("add_custom_command", add_command, project_only);
-    registry.add("add_custom_target", add_target, project_only);
+    registry.add("add_custom_target", target::add_target, project_only);
     crate::compat::project_command!(registry, "add_custom_rule", rule::add);
 }
 
@@ -235,7 +235,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         let mut options = Options::default();
         options.parse(&mut body, rest, false);
         resolve_paths(cx, &mut body, false)?;
-        return append(cx, body, count, None);
+        return append::run(cx, body, count, None);
     }
     if args.len() < 4 {
         return Err(CmdError::status("called with wrong number of arguments."));
@@ -382,7 +382,7 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     resolve_paths(cx, &mut body, !options.append)?;
     if options.append {
         let count = cx.project().commands().count();
-        return append(cx, body, count, Some(args));
+        return append::run(cx, body, count, Some(args));
     }
     let explicit_only = options.explicit_only
         || truth::is_on(&cx.var_or_empty(b"CMAKE_ADD_CUSTOM_COMMAND_DEPENDS_EXPLICIT_ONLY"));
@@ -439,163 +439,6 @@ fn check_policy(cx: &mut Cx<'_>, message: impl Into<BString>, advice: &[u8]) -> 
         }
         PolicyStatus::Old => true,
     }
-}
-
-fn append(
-    cx: &mut Cx<'_>,
-    body: CustomCommand,
-    count: usize,
-    args: Option<&[ExpandedArg]>,
-) -> CmdResult {
-    let Some(output) = body.outputs.first() else {
-        return Err(CmdError::status("APPEND requires an OUTPUT."));
-    };
-    let generator = cx.project().generator;
-    let mut configs = if let Some(generator) = generator.filter(|kind| kind.multi_config()) {
-        cx.var(b"CMAKE_CONFIGURATION_TYPES").map_or_else(
-            || {
-                generator
-                    .default_configuration_types()
-                    .iter()
-                    .map(|name| ConfigId((*name).into()))
-                    .collect()
-            },
-            |value| {
-                list::split(&value, list::Empty::Drop)
-                    .into_iter()
-                    .map(ConfigId)
-                    .collect()
-            },
-        )
-    } else {
-        vec![ConfigId(cx.var_or_empty(b"CMAKE_BUILD_TYPE"))]
-    };
-    if configs.is_empty() {
-        configs.push(ConfigId::default());
-    }
-    let matched = find_append_command(cx.project(), body.dir, output, count, &configs);
-    if let Ok(Some(id)) = matched {
-        let existing = cx
-            .project()
-            .command_mut(id)
-            .ok_or_else(|| model_error(ModelError::UnknownObject))?;
-        existing.command_lines.extend(body.command_lines);
-        existing.depends.extend(body.depends);
-        existing.implicit_depends.extend(body.implicit_depends);
-        return Ok(Flow::Normal);
-    }
-    if let Some(args) = args
-        && cx.defer_active()
-        && (matched.is_err() || append_uses_genex(cx.project(), body.dir, output, count))
-    {
-        // Retry after configuration. Only commands that preceded APPEND can match.
-        // Move this retry to an internal post-directory hook after W11B.
-        let line = cx.current_line();
-        let deferred: Vec<_> = [DEFERRED_APPEND.into(), count.to_string().into()]
-            .into_iter()
-            .chain(args.iter().map(|arg| arg.value.clone()))
-            .map(|text| Argument {
-                kind: ArgKind::Bracket,
-                text,
-                line,
-                span: 0..0,
-            })
-            .collect();
-        let id = cx.defer_new_id();
-        if cx.defer_call(body.dir, id, b"add_custom_command", &deferred) {
-            return Ok(Flow::Normal);
-        }
-    }
-    let _ = matched?;
-    Err(crate::command_error(
-        cx,
-        format!(
-            "Attempt to APPEND to custom command with output\n  {}\nwhich is not already a custom command output.",
-            output.value
-        ),
-    ))
-}
-
-/// Return whether the match for an APPEND output can change later.
-///
-/// A generator expression in the output, or in the output of a command that
-/// can match, can depend on targets that the project creates later. Plain
-/// outputs give the final result immediately.
-fn append_uses_genex(
-    project: &ProjectModel,
-    dir: DirId,
-    output: &BT<BString>,
-    count: usize,
-) -> bool {
-    find_genex(&output.value).is_some()
-        || project
-            .commands()
-            .take(count)
-            .filter(|(_, command)| command.dir == dir && command.kind == CustomCommandKind::Output)
-            .any(|(_, command)| {
-                command
-                    .outputs
-                    .iter()
-                    .any(|output| find_genex(&output.value).is_some())
-            })
-}
-
-fn find_append_command(
-    project: &ProjectModel,
-    dir: DirId,
-    output: &BT<BString>,
-    count: usize,
-    configs: &[ConfigId],
-) -> Result<Option<CommandId>, CmdError> {
-    let binary = &project.dir(dir).binary_dir;
-    let mut usage = None;
-    let mut expand = |output: &BT<BString>| {
-        if find_genex(&output.value).is_none() {
-            return Ok(vec![output.value.clone()]);
-        }
-        let ast = parse(&output.value)?;
-        let mut host = usage
-            .get_or_insert_with(|| UsageResolver::new(project))
-            .host(dir);
-        let mut paths = Vec::new();
-        for config in configs {
-            let context = EvalContext {
-                config: config.clone(),
-                site: EvalSite {
-                    backtrace: output.backtrace.clone(),
-                    property: None,
-                },
-                ..EvalContext::default()
-            };
-            let (value, _) = evaluate(&ast, &context, &mut host)?;
-            paths.extend(
-                list::split(&value, list::Empty::Drop)
-                    .into_iter()
-                    .map(|path| Lexical::new(&Lexical::new(binary).append(&path)).normalize()),
-            );
-        }
-        Ok::<_, rcmake_genex::GenexError>(paths)
-    };
-    let requested = expand(output).map_err(|err| CmdError::status(err.to_string()))?;
-    let mut best = None;
-    for (id, command) in project.commands().take(count) {
-        if command.dir != dir || command.kind != CustomCommandKind::Output {
-            continue;
-        }
-        for output in &command.outputs {
-            // Generation reports errors in the original output expression.
-            let Ok(paths) = expand(output) else { continue };
-            if let Some(index) = requested.iter().position(|path| paths.contains(path))
-                && best.is_none_or(|(previous, _)| index < previous)
-            {
-                best = Some((index, id));
-            }
-        }
-        if best.is_some_and(|(index, _)| index == 0) {
-            break;
-        }
-    }
-    Ok(best.map(|(_, id)| id))
 }
 
 fn add_event(
@@ -696,95 +539,6 @@ fn add_event(
     if let Some(target) = cx.project().target_mut(target) {
         target.event_commands.push(id);
     }
-    Ok(Flow::Normal)
-}
-
-fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
-    let Some((name, args)) = args.split_first() else {
-        return Err(CmdError::status(
-            "called with incorrect number of arguments",
-        ));
-    };
-    let name = &name.value;
-    if name.iter().any(|byte| matches!(byte, b'/' | b'\\')) {
-        return Err(CmdError::status(format!(
-            "called with invalid target name \"{name}\".  Target names may not contain a slash.  Use ADD_CUSTOM_COMMAND to generate files."
-        )));
-    }
-    if name.is_empty()
-        || !name
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(byte))
-        || matches!(
-            name.as_slice(),
-            b"all" | b"clean" | b"help" | b"install" | b"edit_cache" | b"rebuild_cache"
-        )
-    {
-        cx.issue(MessageKind::Error, Effect::SetError, None,
-            format!(
-                "The target name \"{name}\" is reserved or not valid for certain CMake features, such as generator expressions, and may result in undefined behavior."
-            ).into(),
-        );
-        return Ok(Flow::Normal);
-    }
-    let all = args.first().is_some_and(|arg| arg.value == b"ALL");
-    let args = if all {
-        args.get(1..).unwrap_or_default()
-    } else {
-        args
-    };
-    let mut body = new_command(cx);
-    body.command_lines.push(Vec::new());
-    let mut options = Options {
-        section: Section::Command,
-        ..Options::default()
-    };
-    options.parse(&mut body, args, true);
-    if options.unknown_signature {
-        return Err(CmdError::status("Wrong syntax.  Unknown type of argument."));
-    }
-    if body.command_lines.is_empty() {
-        let required = if !body.byproducts.is_empty() {
-            Some("BYPRODUCTS")
-        } else if body.uses_terminal {
-            Some("USES_TERMINAL")
-        } else {
-            body.command_expand_lists.then_some("COMMAND_EXPAND_LISTS")
-        };
-        if let Some(keyword) = required {
-            return Err(crate::command_error(
-                cx,
-                format!("{keyword} may not be specified without any COMMAND"),
-            ));
-        }
-    }
-    resolve_paths(cx, &mut body, true)?;
-
-    let mut target = Target::new(
-        name.clone(),
-        TargetKind::Utility,
-        TargetOrigin::Normal,
-        body.dir,
-        body.backtrace.clone(),
-        body.policies,
-    );
-    crate::targets::initialize(cx, &mut target);
-    if !all {
-        target.props.set("EXCLUDE_FROM_ALL".into(), "TRUE".into());
-    }
-    target.sources = options.sources;
-    if target.name == b"codegen" {
-        let action = cx.diag_state().get(DiagCategory::Policy);
-        target.props.set(
-            "_RCMAKE_CODEGEN_NAME_DIAGNOSTIC".into(),
-            action.as_str().into(),
-        );
-    }
-    let id = cx.project().add_target(target).map_err(model_error)?;
-    body.kind = CustomCommandKind::Utility(id);
-    record(cx, body)?;
-    crate::dirs::source_groups::apply_to_target(cx, id)?;
-    crate::targets::schedule_generated_name_validation(cx, name);
     Ok(Flow::Normal)
 }
 

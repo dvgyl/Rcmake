@@ -238,8 +238,8 @@ fn error_line<'a>(source: &'a [u8], error: &JsonError) -> &'a [u8] {
     tail.get(..end).unwrap_or_default()
 }
 
-// CMake permits a trailing comma, leading zeroes, and input after the first value.
-// Keep byte offsets for diagnostics and let the shared parser validate each value.
+/// CMake permits a trailing comma, leading zeroes, and input after the first value.
+/// Keep byte offsets for diagnostics and let the shared parser validate each value.
 fn normalize(source: &[u8]) -> Vec<u8> {
     let mut normalized = source.to_vec();
     let mut pos = 0;

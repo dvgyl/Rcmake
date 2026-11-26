@@ -6,7 +6,7 @@ use rcmake_host::{
     PureHost, Stream,
     path::{from_native_cmake, to_native},
 };
-use rcmake_model::{DirId, PropScope, TargetKind};
+use rcmake_model::{DirId, PropScope, Target, TargetKind, TargetOrigin};
 
 use super::*;
 

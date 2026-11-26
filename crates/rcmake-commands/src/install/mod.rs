@@ -8,16 +8,16 @@ use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::path::{from_native, from_native_cmake, to_native};
+use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_model::{
     ExportSet, InstallKind, InstallOptions, InstallRule, TargetBinding, TargetId, TargetKind,
-    UsageScope,
 };
 
 mod android_mk;
 mod apple;
 mod components;
 mod destinations;
+mod export;
 pub(crate) use components::registered;
 mod export_options;
 mod mapped_package;
@@ -25,6 +25,7 @@ mod metadata;
 mod package_dependencies;
 mod paths;
 mod runtime;
+mod targets;
 
 type Result<T> = std::result::Result<T, CmdError>;
 type Args<'a> = Peekable<std::iter::Copied<std::slice::Iter<'a, &'a [u8]>>>;
@@ -32,7 +33,7 @@ type Args<'a> = Peekable<std::iter::Copied<std::slice::Iter<'a, &'a [u8]>>>;
 pub(crate) fn register(registry: &mut Registry) {
     let flags = CmdFlags { scriptable: false };
     registry.add("install", install, flags);
-    registry.add("export", export, flags);
+    registry.add("export", export::command, flags);
 }
 
 fn fail(message: impl Into<BString>) -> CmdError {
@@ -228,7 +229,7 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     let kind = match *signature {
         b"TARGETS" => {
             let (kind, namelink_only, components) =
-                targets(cx, &mut args, &mut options, &mut extra_destinations)?;
+                targets::parse(cx, &mut args, &mut options, &mut extra_destinations)?;
             library_namelink_only = namelink_only;
             target_components = Some(components);
             kind
@@ -414,200 +415,6 @@ pub(crate) fn default_component(cx: &mut Cx<'_>) -> BString {
     };
     name.filter(|name| !name.is_empty())
         .unwrap_or_else(|| "Unspecified".into())
-}
-
-fn targets(
-    cx: &mut Cx<'_>,
-    args: &mut Args<'_>,
-    options: &mut InstallOptions,
-    destinations: &mut Vec<(usize, BString, bool)>,
-) -> Result<(InstallKind, bool, std::collections::BTreeSet<BString>)> {
-    let argument_count = args.len() + 1;
-    let names = values(args);
-    let mut export = None;
-    let mut artifact_options = InstallOptions::default();
-    let mut destination_argument = None;
-    let mut group: Option<&[u8]> = None;
-    let mut anonymous_dependencies = false;
-    let mut dependency_set = None;
-    let mut transitive = false;
-    let mut namelink = None;
-    let mut namelink_component = None;
-    let mut component_groups = Vec::new();
-    let mut file_set = None;
-    let mut library_namelink_only = false;
-    let mut apple_destinations = Vec::new();
-    let mut file_sets = Vec::new();
-    while let Some(key) = args.next() {
-        match key {
-            b"EXPORT" if group.is_none() => export = Some(value(args, key)?.into()),
-            b"RUNTIME_DEPENDENCY_SET" if group.is_none() => {
-                dependency_set = Some(value(args, key)?).filter(|name| !name.is_empty());
-            }
-            b"RUNTIME_DEPENDENCIES" if group.is_none() => anonymous_dependencies = true,
-            b"RUNTIME_DEPENDENCY_TARGETS" if group.is_none() => transitive = true,
-            key if anonymous_dependencies && group.is_none() && runtime::filter_keyword(key) => {
-                values(args);
-            }
-            b"INCLUDES" => {
-                if args.next() != Some(b"DESTINATION") {
-                    return Err(fail("TARGETS INCLUDES requires DESTINATION."));
-                }
-                options
-                    .includes_destination
-                    .extend(values(args).into_iter().map(BString::from));
-            }
-            b"NAMELINK_COMPONENT" | b"NAMELINK_ONLY" | b"NAMELINK_SKIP" => {
-                if !matches!(group, Some(b"LIBRARY" | b"ARCHIVE")) {
-                    return Err(fail(format!(
-                        "TARGETS given {key} option not in LIBRARY or ARCHIVE group.  The {key} option may be specified only following LIBRARY or ARCHIVE.",
-                        key = BString::from(key),
-                    )));
-                }
-                if key == b"NAMELINK_COMPONENT" {
-                    namelink_component = Some(value(args, key)?);
-                } else if namelink
-                    .replace(key)
-                    .is_some_and(|previous| previous != key)
-                {
-                    return Err(fail("TARGETS given both NAMELINK_ONLY and NAMELINK_SKIP."));
-                }
-                library_namelink_only |= group == Some(b"LIBRARY") && key == b"NAMELINK_ONLY";
-            }
-            key if artifact(key) => {
-                if let Some(group) = group {
-                    component_groups.push(components::Group {
-                        key: group,
-                        file_set,
-                        component: artifact_options.component.take(),
-                        namelink,
-                        namelink_component,
-                    });
-                }
-                destinations.extend(
-                    destination_argument
-                        .take()
-                        .zip(artifact_options.destination.take())
-                        .map(|(index, path)| (index, path, group == Some(b"CXX_MODULES_BMI"))),
-                );
-                artifact_options = InstallOptions::default();
-                group = Some(key);
-                namelink = None;
-                namelink_component = None;
-                file_set = None;
-                if key == b"FILE_SET" {
-                    let name = args
-                        .next_if(|token| !token.is_empty() && !keyword(token))
-                        .ok_or_else(|| {
-                            fail("TARGETS given FILE_SET option without file set name.")
-                        })?;
-                    file_sets.push(name);
-                    file_set = Some(name);
-                }
-            }
-            _ => {
-                if key == b"DESTINATION" && args.peek().is_none_or(|next| keyword(next)) {
-                    continue;
-                }
-                if group.is_some() && key == b"DESTINATION" {
-                    destination_argument = Some(argument_count - args.len());
-                    if let (Some(group @ (b"BUNDLE" | b"FRAMEWORK")), Some(path)) =
-                        (group, args.peek())
-                    {
-                        apple_destinations.push((group.into(), destination(cx, path)));
-                    }
-                }
-                let options = if group.is_some() {
-                    &mut artifact_options
-                } else {
-                    &mut *options
-                };
-                if !common(cx, b"TARGETS", options, key, args)? {
-                    return Err(unknown(key));
-                }
-            }
-        }
-    }
-    if transitive && export.is_some() {
-        return Err(fail(
-            "TARGETS RUNTIME_DEPENDENCY_TARGETS cannot be used with EXPORT.",
-        ));
-    }
-    runtime::validate_target_dependencies(
-        cx,
-        anonymous_dependencies,
-        dependency_set,
-        options,
-        &apple_destinations,
-    )?;
-    let targets = target_ids(cx, names, true)?;
-    if let Some(group) = group {
-        component_groups.push(components::Group {
-            key: group,
-            file_set,
-            component: artifact_options.component.take(),
-            namelink,
-            namelink_component,
-        });
-    }
-    destinations.extend(
-        destination_argument
-            .zip(artifact_options.destination)
-            .map(|(index, path)| (index, path, group == Some(b"CXX_MODULES_BMI"))),
-    );
-    apple::validate_destinations(
-        cx,
-        &targets,
-        options,
-        &apple_destinations,
-        library_namelink_only,
-    )?;
-    if export.is_some() {
-        require_exported_file_sets(cx, &targets, &file_sets)?;
-    }
-    if anonymous_dependencies || dependency_set.is_some() {
-        runtime::register_target_bundles(cx, dependency_set, &targets)?;
-    }
-    let components = components::for_targets(
-        cx,
-        &targets,
-        options,
-        &component_groups,
-        anonymous_dependencies,
-    );
-    Ok((
-        InstallKind::Targets { targets, export },
-        library_namelink_only,
-        components,
-    ))
-}
-
-fn require_exported_file_sets(
-    cx: &mut Cx<'_>,
-    targets: &[TargetId],
-    file_sets: &[&[u8]],
-) -> Result<()> {
-    let project = cx.project();
-    for target in targets.iter().filter_map(|id| project.target(*id)) {
-        if target
-            .file_sets
-            .iter()
-            .filter_map(|id| project.file_set(*id))
-            .any(|set| {
-                set.scope != UsageScope::Private && !file_sets.contains(&set.name.as_slice())
-            })
-        {
-            return Err(fail(
-                [
-                    b"TARGETS target ",
-                    target.name.as_slice(),
-                    b" is exported but not all of its interface file sets are installed",
-                ]
-                .concat(),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn scripts(cx: &mut Cx<'_>, signature: &[u8], rest: &[&[u8]]) -> CmdResult {
@@ -819,119 +626,7 @@ fn unknown(option: &[u8]) -> CmdError {
     fail([b"given unknown argument \"", option, b"\"."].concat())
 }
 
-fn export(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
-    let input: Vec<_> = input.iter().map(|arg| arg.value.as_slice()).collect();
-    let [signature, rest @ ..] = input.as_slice() else {
-        return Err(fail("called with no arguments."));
-    };
-    if matches!(*signature, b"PACKAGE_INFO" | b"SBOM") {
-        metadata::export(cx, signature, rest)?;
-        return Ok(Flow::Normal);
-    }
-    if *signature == b"PACKAGE" {
-        let [name] = rest else {
-            return Err(fail("PACKAGE requires one package name."));
-        };
-        if name.is_empty()
-            || !name
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(byte))
-        {
-            return Err(fail(
-                [b"PACKAGE given invalid package name \"", *name, b"\"."].concat(),
-            ));
-        }
-        let enabled = if cx.policy(PolicyId::new(90)) == PolicyStatus::New {
-            cx.var_is_on(b"CMAKE_EXPORT_PACKAGE_REGISTRY")
-        } else {
-            !cx.var_is_on(b"CMAKE_EXPORT_NO_PACKAGE_REGISTRY")
-        };
-        if enabled {
-            record_request(cx, "_RCMAKE_PACKAGE_EXPORT", &input);
-        }
-        return Ok(Flow::Normal);
-    }
-    if *signature == b"SETUP" {
-        return package_dependencies::setup(cx, rest);
-    }
-    let packages = *signature == b"EXPORT" && package_dependencies::enabled(cx);
-    let normalized;
-    let input = if *signature == b"EXPORT" {
-        normalized = export_options::normalize(cx, &input)?;
-        normalized.as_slice()
-    } else {
-        input.as_slice()
-    };
-    let rest = input.get(1..).unwrap_or_default();
-    let mut args = rest.iter().copied().peekable();
-    let name = match *signature {
-        b"EXPORT" => Some(value(&mut args, b"EXPORT")?),
-        b"TARGETS" => {
-            target_ids(cx, values(&mut args), false)?;
-            None
-        }
-        _ => return Err(unknown(signature)),
-    };
-    let mut file = None;
-    let mut append = false;
-    while let Some(key) = args.next() {
-        match key {
-            b"FILE" => {
-                let name = value(&mut args, key)?;
-                check_file(name)?;
-                file = Some(BString::from(name));
-            }
-            b"NAMESPACE" => {
-                if args.next_if(|token| !keyword(token)).is_none() {
-                    return Err(fail(
-                        [
-                            *signature,
-                            b" given invalid argument:\n  NAMESPACE: missing required value",
-                        ]
-                        .concat(),
-                    ));
-                }
-            }
-            b"CXX_MODULES_DIRECTORY" => {
-                value(&mut args, key)?;
-            }
-            b"EXPORT_PACKAGE_DEPENDENCIES" if name.is_some() && packages => {}
-            b"APPEND" if name.is_none() => append = true,
-            b"EXPORT_LINK_INTERFACE_LIBRARIES" if name.is_none() => {}
-            _ if name.is_some() => {
-                return Err(fail(
-                    [b"EXPORT given unknown argument: \"", key, b"\"."].concat(),
-                ));
-            }
-            _ => return Err(unknown(key)),
-        }
-    }
-    if let Some(name) = name
-        && !cx.project().exports.contains_key(name)
-    {
-        return Err(fail([b"Export set \"", name, b"\" not found."].concat()));
-    }
-    let file = file.or_else(|| name.map(|name| [name, b".cmake"].concat().into()));
-    if let Some(file) = file {
-        let output = Lexical::new(&from_native(
-            &cx.current_binary_dir().join(to_native(&file)),
-        ))
-        .normalize();
-        let key = [b"_RCMAKE_EXPORT_OUTPUT_".as_slice(), output.as_slice()].concat();
-        if !append && cx.global().props.get(&key).is_some() {
-            export_options::repeat(cx, &file)?;
-        }
-        if *signature == b"TARGETS" {
-            let target_key = [b"_RCMAKE_TARGET_EXPORT_OUTPUT_".as_slice(), &output].concat();
-            cx.global().props.set(target_key.into(), "1".into());
-        }
-        cx.global().props.set(key.into(), b"1".as_slice().into());
-        record_request(cx, "_RCMAKE_BUILD_EXPORT", input);
-    }
-    Ok(Flow::Normal)
-}
-
-// Store arguments separately to preserve empty values, semicolons, and binary content.
+/// Store arguments separately to preserve empty values, semicolons, and binary content.
 pub(crate) fn record_args(cx: &mut Cx<'_>, section: &str, args: &[&[u8]]) {
     let directory = cx.current_dir_id().index();
     let props = &mut cx.global().props;

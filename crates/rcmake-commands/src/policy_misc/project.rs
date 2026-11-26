@@ -192,7 +192,7 @@ fn language_groups(unparsed: &[&[u8]], languages: Option<&[&[u8]]>) -> Vec<Vec<B
 /// Parsed `project()` arguments after the project name.
 struct Arguments<'a> {
     metadata: BTreeMap<&'a [u8], &'a [u8]>,
-    /// Arguments outside every keyword: legacy language names.
+    /// Legacy language names given outside every keyword.
     unparsed: Vec<&'a [u8]>,
     /// The `LANGUAGES` list, when the keyword is present.
     languages: Option<Vec<&'a [u8]>>,

@@ -482,8 +482,7 @@ fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     .iter()
                     .any(|dep| model.find_target(target.dir, bytes(dep)).is_none())
         }) {
-            // A later command can define the dependency. Move this check to an
-            // internal post-directory hook after W11B.
+            // A later command can define the dependency.
             schedule_target_validation(cx);
         }
     }

@@ -1293,7 +1293,7 @@ find_library(second NAMES test NO_DEFAULT_PATH PATHS /work/mylib64)
 }
 
 #[test]
-fn wave8a_config_package_preserves_true_and_rejects_non_on_values() -> HostResult<()> {
+fn config_package_preserves_true_and_rejects_non_on_values() -> HostResult<()> {
     let (host, mut interp) = setup_package();
     host.seed_file(
         Path::new("/work/prefix/WidgetConfig.cmake"),

@@ -88,8 +88,8 @@ pub(crate) fn configure_text(
     Ok(result)
 }
 
-// CMake uses the process-wide C random number generator. This is the sequence
-// from the pinned macOS oracle, including the special transition from state zero.
+// CMake uses the process-wide C random number generator. This is the sequence that
+// CMake 4.5.1 on macOS produces, including the special transition from state zero.
 static RANDOM_STATE: Mutex<Option<u32>> = Mutex::new(None);
 
 pub(super) fn random(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {

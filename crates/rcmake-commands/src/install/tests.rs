@@ -1044,7 +1044,7 @@ fn android_mk_install_validates_options_and_registers_component() -> TestResult 
 }
 
 #[test]
-fn wave8a_install_registers_export_sets_before_targets() -> TestResult {
+fn install_registers_export_sets_before_targets() -> TestResult {
     let (_, mut interp) = configure(
         r#"
 project(Example NONE)
