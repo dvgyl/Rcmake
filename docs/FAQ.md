@@ -4,7 +4,7 @@
 
 Yes. `rcmake` is an independent reimplementation of CMake 4.5.1 in Rust. No CMake C++ source is copied or translated, and `rcmake` never calls an upstream `cmake` binary at runtime.
 
-One binary provides `cmake`, `ctest`, and `cpack`, selecting the tool from `argv[0]`. It reads existing `CMakeLists.txt` files, CMake Presets schema v13 (`CMakePresets.json` and `CMakeUserPresets.json`), and `CMakeCache.txt`, and writes compatible build trees.
+One multi-call binary provides `cmake`, `ctest`, `cpack`, and `rcmake-lsp`, selecting the tool from `argv[0]`. It reads existing `CMakeLists.txt` files, CMake Presets schema v13 (`CMakePresets.json` and `CMakeUserPresets.json`), and `CMakeCache.txt`, and writes compatible build trees.
 
 `rcmake` is not affiliated with Kitware. "CMake" is a trademark of Kitware, Inc.
 
@@ -39,7 +39,7 @@ One binary provides `cmake`, `ctest`, and `cpack`, selecting the tool from `argv
 
 - `cmake`: configure and generate, `-P` scripts, `-E` utilities, `--build`, `--install`, `--workflow`, `--find-package`, `--preset`, and `--sarif-output`.
 - `ctest`: parallel test scheduling, fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML output, `discover_tests()`, and `-S` scripts.
-- `cpack`: archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`, and the `ZIP_*` and `7Z_*` compression variants), `External`, and macOS `DragNDrop` and `Bundle`.
+- `cpack`: archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z`, and the `ZIP_*` and `7Z_*` compression variants), Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop`.
 - Policies `CMP0000` to `CMP0226` (`CMP0000` to `CMP0065` always use NEW behavior as in CMake 4.x; `CMP0066` to `CMP0226` are the 161 active policies).
 - CMake Presets schema v13, File API (`codemodel` v2.12, `cache` v2, `toolchains` v1, `cmakeFiles` v1, `configureLog` v1), Common Package Specification (CPS) 0.15.0, SPDX 3.0.1 SBOM via `CMAKE_INSTALL_SBOM_FORMATS`, Instrumentation API v1, `cmake_diagnostic()` with SARIF 2.1.0, and `compile_commands.json`.
 
@@ -99,7 +99,7 @@ rcmake explain app -B build --json
 
 ## Does rcmake include a CMake language server (rcmake-lsp)?
 
-Yes. `rcmake-lsp` is a companion stdio Language Server Protocol binary for `CMakeLists.txt` and `*.cmake` files. Release archives and both install scripts (`scripts/install.sh` and `scripts/install.ps1`) install it next to `rcmake`.
+Yes. The same multi-call `rcmake` binary runs a stdio Language Server Protocol server for `CMakeLists.txt` and `*.cmake` files when started via the `rcmake-lsp` symlink or `rcmake lsp` (supporting `--help` and `--version`). Release archives and both install scripts (`scripts/install.sh` and `scripts/install.ps1`) install `rcmake-lsp` next to `rcmake`.
 
 `rcmake-lsp` provides hover, completion, go to definition, document symbols, semantic tokens, and indentation formatting. Built with `--features eval,stdio` (the release default), it evaluates unsaved editor buffers in memory via a `Host` overlay with subprocesses disabled so hover shows evaluated variables, targets, and per-configuration generator expressions. A build with `--features stdio` alone runs as a lexical-only server.
 
@@ -169,7 +169,7 @@ Run `scripts/install.sh --uninstall` with the same `PREFIX`. Uninstall keeps the
 ## What is intentionally different or not implemented in rcmake?
 
 - **No interactive front ends.** `cmake-gui` and `ccmake` are not implemented.
-- **No DAP debugger.** `cmake --debugger` is not supported.
+- **No DAP debugger.** `cmake --debugger` is not supported, and `cmake -E capabilities` reports `"debugger":false`.
 - **No legacy extra generators.** CodeBlocks, CodeLite, Eclipse CDT4, Kate, and Sublime Text 2 are omitted.
 - **No legacy or niche generators.** `NMake Makefiles`, `NMake Makefiles JOM`, `MSYS Makefiles`, `MinGW Makefiles`, `Borland Makefiles`, `Watcom WMake`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16 are not implemented.
 - **CPack platform installers.** Archive generators, `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages are implemented. `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.

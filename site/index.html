@@ -71,7 +71,7 @@
             "rcmake explain subcommand for target flag and variable provenance in terminal text or JSON",
             "Configure profiling (--profile) with trace.json, stacks.folded, and flamegraph.html",
             "Hermetic configure auditing (--hermetic=warn|strict) and FetchContent lockfiles (--fetch-lock)",
-            "rcmake-lsp Language Server Protocol binary for CMakeLists.txt and *.cmake files",
+            "Built-in Language Server Protocol server (rcmake-lsp symlink or rcmake lsp) for CMakeLists.txt and *.cmake files",
             "In-process Rust API (rcmake-api) and WebAssembly runtime (wasm32-unknown-unknown and wasm32-wasip1)"
           ]
         },
@@ -140,7 +140,7 @@
               "name": "Can I run rcmake in WebAssembly or use an editor language server?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "Yes. Because all system I/O goes through the rcmake_host::Host trait, rcmake-api compiles with --no-default-features to wasm32-unknown-unknown and wasm32-wasip1 on PureHost and runs the browser playground with no server, supporting live configure, Ninja generation, and explain. For editors, the rcmake-lsp companion binary provides hover (with evaluated values), completion, go to definition, symbols, semantic tokens, and formatting over stdio for VS Code, Neovim, Helix, Zed, Emacs, and CLion."
+                "text": "Yes. Because all system I/O goes through the rcmake_host::Host trait, rcmake-api compiles with --no-default-features to wasm32-unknown-unknown and wasm32-wasip1 on PureHost and runs the browser playground with no server, supporting live configure, Ninja generation, and explain. For editors, the same multi-call binary provides the language server over stdio when started as rcmake-lsp or rcmake lsp (supporting --help and --version), with hover (including evaluated values), completion, go to definition, symbols, semantic tokens, and formatting for VS Code, Neovim, Helix, Zed, Emacs, and CLion."
               }
             }
           ]
@@ -571,7 +571,7 @@
         </details>
         <details class="faq-item">
           <summary>Can I run rcmake in WebAssembly or use an editor language server?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p>Yes. Because all system I/O goes through the <code>rcmake_host::Host</code> trait, <code>rcmake-api</code> compiles with <code>--no-default-features</code> to <code>wasm32-unknown-unknown</code> and <code>wasm32-wasip1</code> on <code>PureHost</code> and runs the browser playground with no server, supporting live configure, Ninja generation, and <code>explain</code>. For editors, the <code>rcmake-lsp</code> companion binary provides hover (with evaluated values), completion, go to definition, symbols, semantic tokens, and formatting over stdio for VS Code, Neovim, Helix, Zed, Emacs, and CLion.</p></div></div>
+          <div class="faq-answer"><div class="faq-inner"><p>Yes. Because all system I/O goes through the <code>rcmake_host::Host</code> trait, <code>rcmake-api</code> compiles with <code>--no-default-features</code> to <code>wasm32-unknown-unknown</code> and <code>wasm32-wasip1</code> on <code>PureHost</code> and runs the browser playground with no server, supporting live configure, Ninja generation, and <code>explain</code>. For editors, the same multi-call binary provides the language server over stdio when started as <code>rcmake-lsp</code> or <code>rcmake lsp</code> (supporting <code>--help</code> and <code>--version</code>), with hover (including evaluated values), completion, go to definition, symbols, semantic tokens, and formatting for VS Code, Neovim, Helix, Zed, Emacs, and CLion.</p></div></div>
         </details>
         </div>
       </div>

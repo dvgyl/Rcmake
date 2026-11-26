@@ -149,16 +149,18 @@ export function revealScan(scope = typeof document !== "undefined" ? document : 
     if (revealIO) revealIO.observe(el);
     else el.classList?.add("is-revealed");
   });
+  revealVisible(scope.ownerDocument || scope);
 }
 
 export function revealVisible(doc = typeof document !== "undefined" ? document : null) {
   if (!doc?.querySelectorAll || typeof window === "undefined") return;
   const vh = window.innerHeight || doc.documentElement?.clientHeight || 0;
   if (!vh) return;
+  const cutoff = vh + 80;
   doc.querySelectorAll("[data-reveal]:not(.is-revealed)").forEach((el) => {
     if (typeof el.getBoundingClientRect !== "function") return;
     const rect = el.getBoundingClientRect();
-    if (rect.bottom > 0 && rect.top < vh) {
+    if (rect.top <= cutoff) {
       el.classList?.add("is-revealed");
       revealIO?.unobserve(el);
     }
@@ -171,20 +173,32 @@ export function initReveal(doc = document) {
     return;
   }
   revealIO = new IntersectionObserver((entries) => {
+    const vh = window.innerHeight || doc.documentElement?.clientHeight || 0;
+    const cutoff = vh + 80;
     for (const e of entries) {
-      if (!e.isIntersecting) continue;
+      if (!e.isIntersecting && !(vh && e.boundingClientRect.top <= cutoff)) continue;
       e.target.classList.add("is-revealed");
       revealIO.unobserve(e.target);
     }
-  }, { rootMargin: "0px 0px 0px 0px", threshold: 0.01 });
+  }, { rootMargin: "0px 0px 80px 0px", threshold: 0.01 });
   revealScan(doc);
   doc.documentElement.classList.add("reveal-on");
   revealVisible(doc);
   if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => revealVisible(doc));
-  window.addEventListener("hashchange", () => {
+  let revealQueued = false;
+  const syncReveal = () => {
     revealVisible(doc);
-    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => revealVisible(doc));
-  });
+    if (!revealQueued && typeof requestAnimationFrame === "function") {
+      revealQueued = true;
+      requestAnimationFrame(() => {
+        revealQueued = false;
+        revealVisible(doc);
+      });
+    }
+  };
+  window.addEventListener("scroll", syncReveal, { passive: true });
+  window.addEventListener("resize", syncReveal, { passive: true });
+  window.addEventListener("hashchange", syncReveal);
   const showAll = () => doc.querySelectorAll("[data-reveal]").forEach((el) => el.classList.add("is-revealed"));
   window.addEventListener("beforeprint", showAll);
 }

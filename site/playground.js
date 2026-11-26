@@ -857,14 +857,24 @@ async function runConfigure() {
         ...(res.targets || []).map((t) => t.name),
         ...(Array.isArray(res.explainSymbols) ? res.explainSymbols : [])
       ]);
-      if (!state.explainSymbol || (knownSyms.size > 0 && !knownSyms.has(state.explainSymbol))) {
-        const fallback = res.targets?.[0]?.name || curateExplainSymbols(res).quick[0] || res.explainSymbols?.[0] || "";
-        if (fallback) state.explainSymbol = fallback;
+      const fallbackSym = () => res.targets?.[0]?.name || curateExplainSymbols(res).quick[0] || res.explainSymbols?.[0] || "";
+      if (!state.explainSymbol) {
+        state.explainSymbol = fallbackSym();
       }
       try {
-        state.explainReport = state.explainSymbol
-          ? await adapter.explain(state.explainSymbol, { config: state.buildType })
-          : null;
+        if (state.explainSymbol) {
+          let rep = await adapter.explain(state.explainSymbol, { config: state.buildType });
+          if (rep?.kind === "not_found" && knownSyms.size > 0 && !knownSyms.has(state.explainSymbol)) {
+            const fallback = fallbackSym();
+            if (fallback && fallback !== state.explainSymbol) {
+              state.explainSymbol = fallback;
+              rep = await adapter.explain(state.explainSymbol, { config: state.buildType });
+            }
+          }
+          state.explainReport = rep;
+        } else {
+          state.explainReport = null;
+        }
       } catch (exErr) {
         state.explainError = exErr instanceof Error ? exErr.message : String(exErr);
         state.explainReport = null;

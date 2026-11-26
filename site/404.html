@@ -7,17 +7,33 @@
   <meta name="robots" content="noindex,follow">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f6f4f0" media="(prefers-color-scheme: light)">
-  <link rel="icon" type="image/svg+xml" href="/rcmake/assets/favicon.svg">
-  <link rel="manifest" href="/rcmake/manifest.webmanifest">
-  <link rel="stylesheet" href="/rcmake/styles.css">
   <script>
-    document.documentElement.classList.add("js");
-    try {
-      const saved = localStorage.getItem("rcmake-theme");
-      const fallback = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
-      document.documentElement.dataset.theme = saved === "light" || saved === "dark" ? saved : fallback;
-    } catch (_) {}
+    (function () {
+      var p = location.pathname || "/";
+      var base = p === "/rcmake" || p.startsWith("/rcmake/") ? "/rcmake/" : "/";
+      window.__RCMAKE_BASE__ = base;
+      var head = document.head;
+      var addLink = function (attrs) {
+        var el = document.createElement("link");
+        Object.keys(attrs).forEach(function (k) { el.setAttribute(k, attrs[k]); });
+        head.appendChild(el);
+      };
+      addLink({ rel: "icon", type: "image/svg+xml", href: base + "assets/favicon.svg" });
+      addLink({ rel: "manifest", href: base + "manifest.webmanifest" });
+      addLink({ rel: "stylesheet", href: base + "styles.css" });
+      document.documentElement.classList.add("js");
+      try {
+        var saved = localStorage.getItem("rcmake-theme");
+        var fallback = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        document.documentElement.dataset.theme = saved === "light" || saved === "dark" ? saved : fallback;
+      } catch (_) {}
+    })();
   </script>
+  <noscript>
+    <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
+    <link rel="manifest" href="./manifest.webmanifest">
+    <link rel="stylesheet" href="./styles.css">
+  </noscript>
 </head>
 <body>
   <a class="skip-link" href="#main-content">Skip to content</a>
@@ -31,15 +47,19 @@
 
   <header class="topbar is-solid">
     <div class="topbar-inner">
-      <a class="brand" href="/rcmake/index.html" aria-label="rcmake home">
-        <img class="mark-dark" src="/rcmake/assets/rcmake-mark-dark.svg" alt="" width="22" height="22">
-        <img class="mark-light" src="/rcmake/assets/rcmake-mark.svg" alt="" width="22" height="22">
+      <a class="brand" href="./index.html" data-site-href="index.html" aria-label="rcmake home">
+        <img class="mark-dark" data-site-src="assets/rcmake-mark-dark.svg" alt="" width="22" height="22" hidden>
+        <img class="mark-light" data-site-src="assets/rcmake-mark.svg" alt="" width="22" height="22" hidden>
+        <noscript>
+          <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="22" height="22">
+          <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="22" height="22">
+        </noscript>
         <span>rcmake</span>
       </a>
       <nav class="nav" aria-label="Primary">
-        <a class="opt-overview" href="/rcmake/index.html">Overview</a>
-        <a href="/rcmake/playground.html">Playground</a>
-        <a href="/rcmake/dashboard.html">Compatibility</a>
+        <a class="opt-overview" href="./index.html" data-site-href="index.html">Overview</a>
+        <a href="./playground.html" data-site-href="playground.html">Playground</a>
+        <a href="./dashboard.html" data-site-href="dashboard.html">Compatibility</a>
       </nav>
       <div class="topbar-actions">
         <a class="icon-btn" href="https://github.com/dvgyl/rcmake" aria-label="GitHub"><svg class="i i-fill" aria-hidden="true"><use href="#i-github"/></svg></a>
@@ -57,15 +77,15 @@
     <h1>Page not found</h1>
     <p class="muted">That page does not exist on the rcmake site. Jump back to the overview, try the browser playground, or view the compatibility report.</p>
     <div class="hero-actions">
-      <a class="btn btn-primary" href="/rcmake/index.html">
+      <a class="btn btn-primary" href="./index.html" data-site-href="index.html">
         <span>Back to overview</span>
         <svg class="i" aria-hidden="true"><use href="#i-arrow-right"/></svg>
       </a>
-      <a class="btn btn-soft" href="/rcmake/playground.html">
+      <a class="btn btn-soft" href="./playground.html" data-site-href="playground.html">
         <svg class="i" aria-hidden="true"><use href="#i-play"/></svg>
         <span>Playground</span>
       </a>
-      <a class="btn btn-quiet" href="/rcmake/dashboard.html">
+      <a class="btn btn-quiet" href="./dashboard.html" data-site-href="dashboard.html">
         <span>Compatibility report</span>
         <svg class="i" aria-hidden="true"><use href="#i-arrow-right"/></svg>
       </a>
@@ -74,17 +94,21 @@
 
   <footer class="footer">
     <div class="container footer-inner">
-      <a class="brand brand-sm" href="/rcmake/index.html">
-        <img class="mark-dark" src="/rcmake/assets/rcmake-mark-dark.svg" alt="" width="18" height="18">
-        <img class="mark-light" src="/rcmake/assets/rcmake-mark.svg" alt="" width="18" height="18">
+      <a class="brand brand-sm" href="./index.html" data-site-href="index.html">
+        <img class="mark-dark" data-site-src="assets/rcmake-mark-dark.svg" alt="" width="18" height="18" hidden>
+        <img class="mark-light" data-site-src="assets/rcmake-mark.svg" alt="" width="18" height="18" hidden>
+        <noscript>
+          <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="18" height="18">
+          <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="18" height="18">
+        </noscript>
         <span>rcmake</span>
       </a>
       <nav class="footer-nav" aria-label="Footer">
         <a href="https://github.com/dvgyl/rcmake">GitHub</a>
         <a href="https://github.com/dvgyl/rcmake/tree/main/docs">Docs</a>
-        <a href="/rcmake/dashboard.html">Compatibility</a>
-        <a href="/rcmake/playground.html">Playground</a>
-        <a href="/rcmake/llms.txt">LLMs.txt</a>
+        <a href="./dashboard.html" data-site-href="dashboard.html">Compatibility</a>
+        <a href="./playground.html" data-site-href="playground.html">Playground</a>
+        <a href="./llms.txt" data-site-href="llms.txt">LLMs.txt</a>
       </nav>
     </div>
     <div class="container footer-legal">
@@ -93,6 +117,22 @@
     </div>
   </footer>
 
-  <script type="module" src="/rcmake/app.js"></script>
+  <script>
+    (function () {
+      var p = location.pathname || "/";
+      var base = window.__RCMAKE_BASE__ || (p === "/rcmake" || p.startsWith("/rcmake/") ? "/rcmake/" : "/");
+      document.querySelectorAll("[data-site-href]").forEach(function (el) {
+        el.setAttribute("href", base + el.getAttribute("data-site-href"));
+      });
+      document.querySelectorAll("[data-site-src]").forEach(function (el) {
+        el.setAttribute("src", base + el.getAttribute("data-site-src"));
+        el.hidden = false;
+      });
+      var mod = document.createElement("script");
+      mod.type = "module";
+      mod.src = base + "app.js";
+      document.body.appendChild(mod);
+    })();
+  </script>
 </body>
 </html>

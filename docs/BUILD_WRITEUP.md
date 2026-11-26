@@ -1,6 +1,6 @@
 # Building rcmake, an independent CMake 4.5.1 reimplementation in Rust
 
-`rcmake` is an independent reimplementation of CMake 4.5.1 in Rust. No CMake C++ source is copied or translated. One binary acts as `cmake`, `ctest`, and `cpack` based on `argv[0]`. A companion binary, `rcmake-lsp`, provides Language Server Protocol support for CMake files.
+`rcmake` is an independent reimplementation of CMake 4.5.1 in Rust. No CMake C++ source is copied or translated. One multi-call binary acts as `cmake`, `ctest`, `cpack`, and the Language Server Protocol server (`rcmake-lsp` symlink or `rcmake lsp`) based on `argv[0]`.
 
 The goal is drop-in compatibility. A project should configure, build, install, test, and package with `rcmake` first on `PATH` and produce the same outputs as CMake 4.5.1.
 
@@ -18,7 +18,7 @@ The implementation covers:
 
 - `cmake`: configure and generate, `-P` script mode, `-E` command-line utilities, `--build`, `--install`, `--workflow`, `--find-package`, presets (schema version 13), and SARIF 2.1.0 diagnostic output.
 - `ctest`: parallel test scheduling, fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML output, `discover_tests()`, and `-S` scripts.
-- `cpack`: archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`, and their compression variants), `External`, and macOS `DragNDrop` and `Bundle`.
+- `cpack`: archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z`, and their compression variants), Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop`.
 - Interfaces: policies `CMP0000` to `CMP0226` (OLD behavior removed for `CMP0000` to `CMP0065` as in CMake 4.x), File API `codemodel` v2.12, `cache` v2, `toolchains` v1, `cmakeFiles` v1, `configureLog` v1, Common Package Specification (CPS) 0.15.0, SPDX 3.0.1 SBOM generation, Instrumentation API v1, `compile_commands.json`, and C++20 and C++23 named modules with Ninja `dyndep`.
 - Native extensions under the `rcmake` name: persistent compiler probe cache, incremental configure replay, `rcmake explain`, `--profile`, `--diagnostics=rich`, `--hermetic`, `--fetch-lock`, the in-process `rcmake-api` crate (including WebAssembly targets), and `rcmake-lsp`.
 
@@ -44,7 +44,7 @@ We do not call this work clean-room in the strict sense. Coding models wrote mos
 
 ## 2. Architecture across 35 crates and one `Host` trait
 
-The workspace spans 35 safe-Rust crates (`crates/rcmake-*`, including `rcmake-wasm` for the live browser playground) and 31 Architecture Decision Records in [`docs/ADR.md`](ADR.md). The dependency graph is acyclic and mirrors CMake's execution stages.
+The workspace spans 35 safe-Rust crates (`crates/rcmake-*`, including `rcmake-wasm` for the live browser playground) and 38 Architecture Decision Records in [`docs/ADR.md`](ADR.md). The dependency graph is acyclic and mirrors CMake's execution stages.
 
 ```text
 argv[0], presets          rcmake-cli, rcmake-presets
@@ -97,7 +97,7 @@ One human maintainer set the goals, implementation rules, and review gates, and 
 - **2026-11-25:** large-project corpus parity, 20 independent black-box scenarios, cross-platform Windows and Linux CI recovery, diagnostic formatting and File API v2.12 alignment, WebAssembly verification, brand kit, static site, and public documentation polish.
 - **2026-11-26:** `rcmake-json` in place of `serde_json`, probe and evaluation performance work, shell completions and man page, release receipts, licence notices, and site and documentation polish.
 
-The repository history starts on 2026-11-23 at 08:54 UTC. On 2026-11-26, it has 450 commits, and `crates/` holds about 328,000 lines of Rust in 936 files. The workspace-size command in [section 7](#7-reproduce-every-claim-in-one-command) prints the current count.
+The repository history starts on 2026-11-23 at 08:54 UTC. On 2026-11-26, it has over 520 commits, and `crates/` holds 375,831 lines of Rust in 957 files. The workspace-size command in [section 7](#7-one-command-for-each-claim) prints the current count.
 
 A human did not read most of this code line by line. Cross-model review, the differential oracle, and the test suites in [section 4](#4-the-differential-oracle-method) checked it. Treat the published results as the evidence, not a claim of human review.
 
@@ -155,7 +155,7 @@ Differential comparison needs narrow normalizers for machine paths, timestamps, 
 - `tar tvf` owner and group columns are masked because `rcmake` intentionally writes uid 0 and gid 0 for reproducible archives.
 - `OPENCV_TIMESTAMP` holds wall-clock configure time, so only its value is masked.
 - File API `backtraces` index arrays are dropped where `backtraceGraph` is compared as resolved frame chains, and `index-*.json` objects pass through the same documented canonicalizer as the reply files (`fb13e49`).
-- `cmake -E capabilities` drops the absent `debugger` member and empty `extraGenerators` lists while keeping `version`, `fileApi`, `instrumentation`, `serverMode`, and `tls` strict.
+- `cmake -E capabilities` normalizes the `debugger` field (`rcmake` reports `"debugger":false`) and empty `extraGenerators` lists while keeping `version`, `fileApi`, `instrumentation`, `serverMode`, and `tls` strict.
 - `Boost.Locale` is excluded on both engines in `large_projects.toml` because Boost 1.88 fails `source_group(TREE)` prefix validation on CMake 4.5.1 as well.
 
 ## 5. Hard bugs differential testing exposed
@@ -250,19 +250,19 @@ Each benchmark report records N, the generator, the configure flags, the host CP
 ### What `rcmake` does not support
 
 - **Interactive front ends.** There is no `cmake-gui` desktop application and no `ccmake` terminal interface. The `edit_cache` target prints `No interactive CMake dialog available.`, matching CMake when `ccmake` is absent.
-- **DAP debugger.** `cmake --debugger` fails with `CMake was not built with support for --debugger`, matching a CMake build compiled without debugger support. `cmake -E capabilities` omits the `debugger` key.
+- **DAP debugger.** `cmake --debugger` fails with `CMake was not built with support for --debugger`, matching a CMake build compiled without debugger support. `cmake -E capabilities` reports `"debugger":false`.
 - **Swift builds are unverified.** Basic Swift target properties and compile-rule exclusions exist in `rcmake-resolve`, but real Swift toolchain projects are not exercised in CI or in the differential suites. Treat Swift support as unverified until a differential Swift suite lands.
-- **CPack platform installers.** `rcmake` supports the archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`, and their compression variants), `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages. It does not implement `NSIS`, `WIX`, `productbuild`, or `IFW`.
+- **CPack platform installers.** `rcmake` supports the archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z`, and their compression variants), Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop` packages. It does not implement `NSIS`, `WIX`, `productbuild`, or `IFW`.
 - **Legacy and niche generators.** Supported generators are `Ninja`, `Ninja Multi-Config`, `Unix Makefiles`, `Xcode`, `Visual Studio 17 2022`, and `Visual Studio 18 2026`. Legacy extra generators (`CodeBlocks`, `CodeLite`, `Eclipse CDT4`, `Kate`, `Sublime Text 2`) and older or platform-niche generators (`NMake Makefiles`, `NMake Makefiles JOM`, `MSYS Makefiles`, `MinGW Makefiles`, `Borland Makefiles`, `Watcom WMake`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16) are omitted.
 - **Reproducible `tar` ownership.** `cmake -E tar` and CPack archive generators intentionally write uid 0 and gid 0 instead of copying host user IDs.
 - **CUDA and HIP have little test coverage.** CUDA has one end-to-end fixture in the ecosystem lane. HIP has rule wiring only, and no test uses a HIP toolchain yet.
 - **`--version` text.** Line 1 is `cmake version 4.5.1`. Line 2 is `rcmake 0.1.0` instead of the Kitware line, so the output never names Kitware as the maintainer.
-- **`try_compile` runs in-process.** Probes run through the `rcmake` executor, not through Ninja, Make, MSBuild, or xcodebuild. The result is the same. The build tool lines in `OUTPUT_VARIABLE` are different, although `rcmake` writes the same `Change Dir:` and `Run Build Command(s):` header (section 5.6). Generator settings that only MSBuild or Xcode read, such as `CMAKE_GENERATOR_TOOLSET` and `CMAKE_XCODE_ATTRIBUTE_*`, have no effect on probes.
+- **`try_compile` runs in-process.** Probes run through the `rcmake` executor, not through Ninja, Make, MSBuild, or xcodebuild. Across the tested probe suites, pass/fail outcomes and feature checks match CMake 4.5.1, while the build tool lines in `OUTPUT_VARIABLE` differ (although `rcmake` writes the same `Change Dir:` and `Run Build Command(s):` header, section 5.6). Generator settings that only MSBuild or Xcode read, such as `CMAKE_GENERATOR_TOOLSET` and `CMAKE_XCODE_ATTRIBUTE_*`, have no effect on probes.
 - **Replay limits.** Native-mode replay is off when a toolchain file, a configure preset, `-C`, or `PreLoad.cmake` is in use. This includes the `vcpkg` toolchain integration. [`ENV_VARS.md`](ENV_VARS.md#incremental-replay) lists all conditions.
 - **Large-project scope.** The 10 large projects use reduced option sets, and L2 compares only the listed targets (section 4).
 - **Windows ZIP aliases.** The Windows ZIP archive contains `cmake.exe`, `ctest.exe`, and `cpack.exe` in `bin`. A manual install that puts this folder first on `PATH` hides another CMake installation without a prompt. On Linux and macOS, `install.sh` creates the aliases only with `--alias-cmake`.
 
-## 7. Reproduce every claim in one command
+## 7. One command for each claim
 
 Prepare the pinned CMake 4.5.1 oracle and a staged `rcmake` installation once from the repository root:
 

@@ -20,9 +20,11 @@
 
 `rcmake` is an independent reimplementation of CMake 4.5.1 in Rust. No CMake C++ source is copied or translated. One binary provides `cmake`, `ctest`, and `cpack`. It reads existing `CMakeLists.txt` files, presets, and caches, writes compatible `Ninja`, `Unix Makefiles`, `Xcode`, and `Visual Studio` build trees, and works with `vcpkg` and Conan.
 
-Started as `rcmake-lsp` or `rcmake lsp`, the same binary is a language server (LSP) for CMake files. The `rcmake-api` crate compiles to WebAssembly.
+When you start it as `rcmake-lsp` or `rcmake lsp`, the same binary is a language server (LSP) for CMake files. The `rcmake-api` crate compiles to WebAssembly.
 
 All 35 `rcmake` crates have `#![forbid(unsafe_code)]`. Some dependencies, such as `rustix` and `memchr`, use `unsafe`. The binary also statically links two C codecs: zstd 1.5.7 and liblzma 5.8.
+
+Coding models wrote most of the Rust implementation, with differential testing against CMake 4.5.1 and cross-model review verifying behavior (see [docs/BUILD_WRITEUP.md](docs/BUILD_WRITEUP.md#3-timeline-and-multi-agent-division-of-work)).
 
 `rcmake` is not affiliated with Kitware. "CMake" is a trademark of Kitware, Inc.
 
@@ -34,11 +36,19 @@ Install the latest release on Linux or macOS into `~/.local`:
 curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash
 ```
 
-Or build from source (needs Rust and Python 3):
+Or download and extract a `.tar.gz` / `.zip` archive directly from [GitHub Releases](https://github.com/dvgyl/rcmake/releases) (keep `bin/` next to `share/cmake-4.5/`), or build from source (needs Rust and Python 3):
 
 ```sh
 git clone https://github.com/dvgyl/rcmake.git && cd rcmake
 scripts/install.sh --from-source
+```
+
+Verify the install:
+
+```sh
+rcmake --version
+# cmake version 4.5.1
+# rcmake 0.1.0
 ```
 
 Then use `rcmake` where you use `cmake`:
@@ -96,7 +106,7 @@ Known gaps from the frozen release run: <!-- METRIC:known_parity_gaps -->pending
 
 - `cmake`: configure and generate, `-P` scripts, `-E` utilities, `--build`, `--install`, `--workflow`, `--find-package`, and `--sarif-output`.
 - `ctest`: parallel test scheduling, fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML output, `discover_tests()`, and `-S` scripts.
-- `cpack`: archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`, and the `ZIP_*` and `7Z_*` compression variants), `External`, and macOS `DragNDrop` and `Bundle`.
+- `cpack`: archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z`, and the `ZIP_*` and `7Z_*` compression variants), Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop`.
 
 ### Generators
 
@@ -237,9 +247,10 @@ scripts/stage.sh
 target/stage/
 ├── bin/
 │   ├── rcmake
-│   ├── cmake  -> rcmake
-│   ├── ctest  -> rcmake
-│   └── cpack  -> rcmake
+│   ├── cmake      -> rcmake
+│   ├── ctest      -> rcmake
+│   ├── cpack      -> rcmake
+│   └── rcmake-lsp -> rcmake
 └── share/cmake-4.5/
     ├── Modules/
     ├── Templates/
@@ -250,7 +261,7 @@ Set `RCMAKE_STAGE_PROFILE=release` for an optimized stage. To install a local re
 
 ### Language server
 
-The release archives and `scripts/install.sh` include `rcmake-lsp`. To build it from source, use the `eval` feature for evaluated hover results:
+The release archives and `scripts/install.sh` include `rcmake-lsp` (a symlink to the same multi-call `rcmake` binary, also available as `rcmake lsp`, supporting `--help` and `--version`). To build the standalone `rcmake-lsp` crate from source, use the `eval` feature for evaluated hover results:
 
 ```sh
 cargo build --locked --release -p rcmake-lsp --features eval,stdio
@@ -313,10 +324,10 @@ rcmake -S . -B build -G Ninja --hermetic=strict
 rcmake explain app -B build --json
 ```
 
-Each `--profile` run writes its files to a new `run-<id>` directory in the profile directory. The `current` file in the profile directory holds the name of the latest run directory. To open the latest flame graph on macOS:
+Each `--profile` run writes the latest `flamegraph.html`, `trace.json`, and `stacks.folded` directly into the profile directory (and keeps each run in `run-<id>/`, with `current` recording the latest run name). To open the latest flame graph on macOS:
 
 ```sh
-open "profile-out/$(cat profile-out/current)/flamegraph.html"
+open profile-out/flamegraph.html
 ```
 
 ## Troubleshooting
@@ -334,15 +345,15 @@ open "profile-out/$(cat profile-out/current)/flamegraph.html"
 ## Intentional differences and limits
 
 - **Reproducible `tar` archives.** `cmake -E tar` and CPack archive generators write uid 0 and gid 0 instead of copying host user IDs.
-- **No DAP debugger.** `cmake --debugger` prints `CMake was not built with support for --debugger`, and `cmake -E capabilities` omits `debugger`.
+- **No DAP debugger.** `cmake --debugger` prints `CMake was not built with support for --debugger`, and `cmake -E capabilities` reports `"debugger":false`.
 - **No interactive front ends.** `cmake-gui` and `ccmake` are not implemented. `edit_cache` prints `No interactive CMake dialog available.`.
 - **No legacy extra generators.** CodeBlocks, CodeLite, Eclipse CDT4, Kate, and Sublime Text 2 are omitted (`extraGenerators` is empty).
-- **CPack platform installers.** Archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`), `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages are implemented. `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
+- **CPack platform installers.** Archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z`), Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop` packages are implemented. `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
 - **Legacy and niche generators.** `NMake Makefiles`, `NMake Makefiles JOM`, `MSYS Makefiles`, `MinGW Makefiles`, `Borland Makefiles`, `Watcom WMake`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16 are not implemented.
 - **Swift is unverified.** Basic Swift wiring exists in `rcmake-resolve`, but no test builds Swift code with a Swift toolchain yet.
 - **CUDA and HIP have little test coverage.** CUDA has one end-to-end fixture in the ecosystem lane. HIP has rule wiring only, and no test uses a HIP toolchain yet.
 - **`--version` text.** Line 1 is `cmake version 4.5.1`. Line 2 is `rcmake 0.1.0` instead of the Kitware line, so the output never names Kitware as the maintainer.
-- **`try_compile` runs in-process.** Probes run through the `rcmake` executor, not through Ninja, Make, MSBuild, or xcodebuild. The result is the same. The build tool lines in `OUTPUT_VARIABLE` are different. Generator settings that only MSBuild or Xcode read, such as `CMAKE_GENERATOR_TOOLSET` and `CMAKE_XCODE_ATTRIBUTE_*`, have no effect on probes.
+- **`try_compile` runs in-process.** Probes run through the `rcmake` executor, not through Ninja, Make, MSBuild, or xcodebuild. Across the tested probe suites, pass/fail outcomes and feature checks match CMake 4.5.1, while the build tool lines in `OUTPUT_VARIABLE` differ. Generator settings that only MSBuild or Xcode read, such as `CMAKE_GENERATOR_TOOLSET` and `CMAKE_XCODE_ATTRIBUTE_*`, have no effect on probes.
 - **Replay limits.** Native-mode replay is off when a toolchain file, a configure preset, `-C`, or `PreLoad.cmake` is in use. This includes the `vcpkg` toolchain integration. [`docs/ENV_VARS.md`](docs/ENV_VARS.md#incremental-replay) lists all conditions.
 - **Large-project scope.** The 10 large projects use unmodified sources at pinned tags, but each one uses a reduced option set from `conformance/corpus/large_projects.toml`. For example, OpenCV builds 3 modules with CUDA off, and LLVM builds only `clang` for the host target. L2 compares only the listed targets.
 - **Windows ZIP aliases.** The Windows ZIP archive contains `cmake.exe`, `ctest.exe`, and `cpack.exe` in `bin`. A manual install that puts this folder first on `PATH` hides another CMake installation without a prompt. On Linux and macOS, `install.sh` creates the aliases only with `--alias-cmake`.
@@ -391,7 +402,7 @@ python3 tools/measure/upstream_track.py --out-json upstream.json --out-md upstre
 
 To run every scorecard lane on this host and write the receipts that `tools/measure/assemble_release_receipts.py` reads, use `scripts/reproduce-scorecard.sh --receipts-dir <dir>`. Add `--dry-run` to print each command and receipt path first. Use `--lane <name>` to run one lane. `--help` lists the lanes. The large projects, `vcpkg`, the sealed holdout, fuzzing, and CI job receipts come from CI or other hosts, not from this script.
 
-The [engineering write-up](docs/BUILD_WRITEUP.md#7-reproduce-every-claim-in-one-command) has the complete command table. It covers the large C++ projects, the sealed holdout, Conan and `vcpkg`, probe-cache soundness, and mutation replay.
+The [engineering write-up](docs/BUILD_WRITEUP.md#7-one-command-for-each-claim) has the complete command table. It covers the large C++ projects, the sealed holdout, Conan and `vcpkg`, probe-cache soundness, and mutation replay.
 
 ## Repository layout
 
@@ -415,7 +426,7 @@ docs/           FAQ, build write-up, architecture, ADRs, environment variables, 
 - [`site/llms.txt`](site/llms.txt): machine-readable index for LLMs and developer Q&A (also hosted as [`llms.txt`](https://dvgyl.github.io/rcmake/llms.txt) and [`llms-full.txt`](https://dvgyl.github.io/rcmake/llms-full.txt))
 - [`docs/BUILD_WRITEUP.md`](docs/BUILD_WRITEUP.md): differential testing against CMake 4.5.1, bugs that testing found, limits, and how to reproduce every claim
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): execution pipeline, the map of 35 crates, the `Host` trait, and verification layers
-- [`docs/ADR.md`](docs/ADR.md): 31 architecture decision records
+- [`docs/ADR.md`](docs/ADR.md): 38 architecture decision records
 - [`docs/ENV_VARS.md`](docs/ENV_VARS.md): environment variables
 - [`docs/PRIOR_ART.md`](docs/PRIOR_ART.md): dependency and licence log
 - [`crates/rcmake-api/README.md`](crates/rcmake-api/README.md): embed configure and `explain` in a Rust program

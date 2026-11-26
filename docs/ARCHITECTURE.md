@@ -120,7 +120,7 @@ The "Depends on" column lists only workspace crates. All crates except
 | Crate | Responsibility | Depends on |
 | --- | --- | --- |
 | `rcmake-ctest` | `ctest`: `CTestTestfile.cmake` evaluation, parallel scheduler, fixtures, resource specifications, `discover_tests()`, JUnit and dashboard XML, and `-S` scripts | `base`, `commands`, `diag`, `eval`, `expr`, `host`, `instrument`, `json`, `presets`, `regex` |
-| `rcmake-cpack` | `cpack`: `CPackConfig.cmake` evaluation, install staging, archive generators, and the macOS `DragNDrop` and `Bundle` generators (ADR-010) | `archive`, `base`, `commands`, `diag`, `eval`, `host`, `json`, `presets` |
+| `rcmake-cpack` | `cpack`: `CPackConfig.cmake` evaluation, install staging, archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z`), Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop` generators (ADR-010) | `archive`, `base`, `commands`, `diag`, `eval`, `host`, `json`, `presets` |
 | `rcmake-cps` | Common Package Specification 0.15.0: data model, writer, and validating reader (ADR-013) | `base`, `diag`, `json` |
 | `rcmake-instrument` | Instrumentation API v1 (data v1.2): queries, snippets, index files, hooks, and trace output (ADR-013) | `base`, `host`, `json` |
 
@@ -137,7 +137,7 @@ The "Depends on" column lists only workspace crates. All crates except
 
 | Crate | Responsibility | Depends on |
 | --- | --- | --- |
-| `rcmake-cli` | The `rcmake` binary. Dispatches `cmake`, `ctest`, and `cpack` by name. Owns `--build`, `--install`, `--workflow`, `--find-package`, SARIF output, profiles, the `explain` subcommand, and the panic hook. | `api`, `base`, `commands`, `cpack`, `ctest`, `diag`, `eval`, `gen-common`, `gen-make`, `gen-ninja`, `gen-vs`, `gen-xcode`, `genex`, `host`, `instrument`, `json`, `model`, `presets`, `resolve`, `syntax`, `tool-e` |
+| `rcmake-cli` | The `rcmake` binary. Dispatches `cmake`, `ctest`, `cpack`, and `rcmake-lsp` (`rcmake lsp`) by name. Owns `--build`, `--install`, `--workflow`, `--find-package`, SARIF output, profiles, the `explain` subcommand, and the panic hook. | `api`, `base`, `commands`, `cpack`, `ctest`, `diag`, `eval`, `gen-common`, `gen-make`, `gen-ninja`, `gen-vs`, `gen-xcode`, `genex`, `host`, `instrument`, `json`, `model`, `presets`, `resolve`, `syntax`, `tool-e` |
 | `rcmake-api` | In-process configure (`run_configure`), workspace index, provenance, and `explain` queries. Builds for WebAssembly with `--no-default-features` (ADR-023, ADR-024). | `base`, `commands`, `diag`, `eval`, `genex`, `host`, `json`, `model`, `resolve`, `syntax` |
 | `rcmake-lsp` | Language server for CMake files. Gives lexical results by default. The `eval` feature adds evaluated results through `rcmake-api`. The `stdio` feature builds the `rcmake-lsp` binary. | `api` (optional), `base`, `diag`, `genex` (optional), `host`, `json`, `model` (optional), `resolve` (optional), `syntax` |
 | `rcmake-wasm` | The browser playground runtime. Reads a JSON request on standard input, configures the project on `PureHost`, and returns generated Ninja files, diagnostics, and `explain` results as JSON. `scripts/build-wasm.sh` builds it into `site/wasm/` with no `unsafe` code and no `wasm-bindgen`. | `api`, `base`, `diag`, `gen-common`, `gen-ninja`, `host`, `model`, `presets`, `resolve` |

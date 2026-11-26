@@ -11,7 +11,7 @@ GitHub repository: https://github.com/dvgyl/rcmake
 
 ## 1. Identity, licensing, and safety boundaries
 
-`rcmake` contains no copied or translated CMake C++ source and never invokes an upstream `cmake` binary at runtime. One executable provides `cmake`, `ctest`, and `cpack`. A companion executable, `rcmake-lsp`, provides Language Server Protocol support for `CMakeLists.txt` and `*.cmake` files.
+`rcmake` contains no copied or translated CMake C++ source and never invokes an upstream `cmake` binary at runtime. One multi-call executable provides `cmake`, `ctest`, `cpack`, and the Language Server Protocol server (invoked via the `rcmake-lsp` symlink or `rcmake lsp`) for `CMakeLists.txt` and `*.cmake` files.
 
 `rcmake` is not affiliated with Kitware. "CMake" is a trademark of Kitware, Inc.
 
@@ -37,7 +37,7 @@ GitHub repository: https://github.com/dvgyl/rcmake
 
 - `cmake`: Configure and generate, `-P` script mode, `-E` command-line utilities (`tar`, hash commands, `cmake_ninja_dyndep`, Fortran and Qt drivers, capabilities), `--build`, `--install`, `--workflow`, `--find-package`, `--preset`, and `--sarif-output`.
 - `ctest`: `CTestTestfile.cmake` evaluation, parallel test scheduling, test fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML output, `discover_tests()`, and `-S` scripts.
-- `cpack`: `CPackConfig.cmake` evaluation, install staging, archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`, and `ZIP_*` and `7Z_*` compression variants), `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages.
+- `cpack`: `CPackConfig.cmake` evaluation, install staging, archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z`, and `ZIP_*` and `7Z_*` compression variants), Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop` packages.
 
 ### Build system generators
 
@@ -155,11 +155,11 @@ Wrapping `Host` enables deterministic unit tests, `--hermetic` auditing, `Journa
 
 ## 6. Language server, embedded Rust API, and WebAssembly playground
 
-### `rcmake-lsp`
+### `rcmake-lsp` (`rcmake lsp`)
 
-Installed alongside `rcmake` by release archives and `scripts/install.sh`, or built from source with `cargo build --locked --release -p rcmake-lsp --features eval,stdio` (`--features stdio` alone builds a lexical-only server).
+Provided by the same multi-call `rcmake` binary via the `rcmake-lsp` symlink (installed by release archives and `scripts/install.sh`) or `rcmake lsp`. You can also build the `rcmake-lsp` crate standalone from source with `cargo build --locked --release -p rcmake-lsp --features eval,stdio` (`--features stdio` alone builds a lexical-only server).
 
-- Transport: LSP over standard input and output, taking no CLI arguments.
+- Transport and CLI: LSP over standard input and output; accepts `--help` and `--version`.
 - Capabilities: hover (showing evaluated variables, targets, and per-configuration generator expressions when built with `eval`), completion, go to definition, document symbols, semantic tokens, and indentation formatting.
 - Evaluates unsaved editor buffers in memory via a read/write `Host` overlay with subprocesses denied.
 - Editor setup guides in `crates/rcmake-lsp/README.md` cover VS Code (Generic LSP Client), Neovim 0.11+ and `nvim-lspconfig`, Helix, Zed, Emacs (Eglot), and CLion / JetBrains IDEs (LSP4IJ).
@@ -249,9 +249,9 @@ Omitted features and intentional differences from CMake 4.5.1:
 
 1. **Reproducible `tar` archives:** `cmake -E tar` and CPack archive generators write uid 0 and gid 0 instead of host user and group IDs.
 2. **No interactive front ends:** `cmake-gui` and `ccmake` are not implemented (`edit_cache` prints `No interactive CMake dialog available.`).
-3. **No DAP debugger:** `cmake --debugger` prints `CMake was not built with support for --debugger`, and `cmake -E capabilities` omits `debugger`.
+3. **No DAP debugger:** `cmake --debugger` prints `CMake was not built with support for --debugger`, and `cmake -E capabilities` reports `"debugger":false`.
 4. **No legacy extra generators:** CodeBlocks, CodeLite, Eclipse CDT4, Kate, and Sublime Text 2 are omitted (`extraGenerators` is empty).
-5. **CPack platform installers:** Archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`), `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages are implemented. `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
+5. **CPack platform installers:** Archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z`), Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop` packages are implemented. `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
 6. **Legacy and niche generators omitted:** `NMake Makefiles`, `NMake Makefiles JOM`, `MSYS Makefiles`, `MinGW Makefiles`, `Borland Makefiles`, `Watcom WMake`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16 are not implemented.
 7. **`try_compile` runs in-process:** Probes execute via `rcmake-build` rather than Ninja, Make, MSBuild, or xcodebuild. `rcmake` emits the same `Change Dir:` and `Run Build Command(s):` header in `OUTPUT_VARIABLE`, while inner build-tool output lines differ and MSBuild-only or Xcode-only attributes (`CMAKE_GENERATOR_TOOLSET`, `CMAKE_XCODE_ATTRIBUTE_*`) do not apply to probes.
 8. **`--version` output:** Line 1 is `cmake version 4.5.1`; line 2 is `rcmake 0.1.0` instead of the Kitware maintainer line.

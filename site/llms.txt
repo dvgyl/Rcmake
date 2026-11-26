@@ -6,7 +6,7 @@
 
 ## CMake 4.5.1 parity
 
-- **CLI tools in one binary (`argv[0]` dispatch):** `cmake` (configure and generate, `-P` scripts, `-E` utilities, `--build`, `--install`, `--workflow`, `--find-package`, `--sarif-output`), `ctest` (parallel scheduling, fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML, `discover_tests()`, `-S` scripts), and `cpack` (archive generators `TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z` and compression variants, `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages).
+- **CLI tools in one binary (`argv[0]` dispatch):** `cmake` (configure and generate, `-P` scripts, `-E` utilities, `--build`, `--install`, `--workflow`, `--find-package`, `--sarif-output`), `ctest` (parallel scheduling, fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML, `discover_tests()`, `-S` scripts), `cpack` (archive generators `TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z` and compression variants, Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop`), and the language server (`rcmake-lsp` symlink or `rcmake lsp`).
 - **Two execution modes:** Running as `cmake`, `ctest`, or `cpack` (or setting `RCMAKE_ORACLE_MODE=1`) selects CMake 4.5.1 compatibility mode. Running as `rcmake` selects native mode with the extensions below.
 - **Generators:** `Ninja` and `Ninja Multi-Config` (macOS, Linux, Windows), `Unix Makefiles` (macOS, Linux), `Xcode` (macOS), and `Visual Studio 17 2022` and `Visual Studio 18 2026` (Windows).
 - **Languages and tooling:** C (C90 to C23), C++ (including C++20 and C++23 named modules with Ninja `dyndep`), Objective-C, Objective-C++, Fortran (`.mod` dependency scanning), `ASM`/`ASM_MASM`/`ASM_NASM`, Windows `RC`, and Qt `AUTOMOC`/`AUTOUIC`/`AUTORCC`.
@@ -23,7 +23,7 @@
 - **`--diagnostics=rich`:** Renders source spans and annotations in a terminal.
 - **`--hermetic[=warn|strict]`:** Audits environment reads, file reads, subprocesses, and network access during configure.
 - **`--fetch-lock=off|auto|update|frozen`:** Pins FetchContent archives and Git commits in `rcmake-fetch.lock`.
-- **`rcmake-lsp`:** Stdio Language Server Protocol binary for `CMakeLists.txt` and `*.cmake` files (hover with evaluated values via `eval,stdio`, completion, go to definition, document symbols, semantic tokens, formatting).
+- **`rcmake-lsp` / `rcmake lsp`:** Language Server Protocol server built into the same multi-call binary (invoked via the `rcmake-lsp` symlink or `rcmake lsp`, supporting `--help` and `--version`) for `CMakeLists.txt` and `*.cmake` files over stdio (hover with evaluated values via `eval,stdio`, completion, go to definition, document symbols, semantic tokens, formatting).
 - **`rcmake-api` and WebAssembly playground:** In-process Rust configure and `explain` API backed by `rcmake_host::Host` (`NativeHost` and in-memory `PureHost`), running in the browser with no server.
 
 ## Install

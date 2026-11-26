@@ -297,6 +297,24 @@ export class RcmakeWasmAdapter {
       })
     );
     const parsed = JSON.parse(raw);
+    const presetCacheVars = [];
+    if (typeof files?.["CMakePresets.json"] === "string") {
+      try {
+        const presetsDoc = JSON.parse(files["CMakePresets.json"]);
+        const presetsList = Array.isArray(presetsDoc?.configurePresets) ? presetsDoc.configurePresets : [];
+        for (const preset of presetsList) {
+          if (preset?.cacheVariables && typeof preset.cacheVariables === "object") {
+            for (const key of Object.keys(preset.cacheVariables)) {
+              if (typeof key === "string" && key.trim()) presetCacheVars.push(key.trim());
+            }
+          }
+        }
+      } catch (_) {}
+    }
+    if (presetCacheVars.length) {
+      const existing = Array.isArray(parsed.explainSymbols) ? parsed.explainSymbols : [];
+      parsed.explainSymbols = Array.from(new Set([...existing, ...presetCacheVars])).sort();
+    }
     const durationMs = typeof parsed.durationMs === "number"
       ? parsed.durationMs
       : Number((performance.now() - started).toFixed(2));

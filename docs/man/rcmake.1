@@ -1,7 +1,7 @@
 .\" SPDX-License-Identifier: MIT OR Apache-2.0
 .TH RCMAKE 1 "2026-11-26" "rcmake 0.1.0" "User Commands"
 .SH NAME
-rcmake \- clean-room CMake 4.5.1 compatible build system driver
+rcmake \- native Rust CMake 4.5.1 compatible build system driver
 .SH SYNOPSIS
 .B rcmake
 .RI [ options ]
@@ -50,22 +50,31 @@ rcmake \- clean-room CMake 4.5.1 compatible build system driver
 .B rcmake \-E
 .I command
 .RI [ args... ]
+.br
+.B rcmake ctest
+.RI [ options ]
+.br
+.B rcmake cpack
+.RI [ options ]
+.br
+.B rcmake lsp
+.RI [ options ]
 .SH DESCRIPTION
 .B rcmake
-is a clean-room replacement for CMake 4.5.1 written in safe Rust.
+is a from-scratch replacement for CMake 4.5.1 written in safe Rust.
 A single multi-call binary implements
 .BR cmake ,
 .BR ctest ,
-and
 .BR cpack ,
+and the Language Server Protocol (LSP) server (invoked via the
+.B rcmake-lsp
+symlink or
+.BR "rcmake lsp" ),
 reading the same
 .IR CMakeLists.txt ,
 presets, and
 .I CMakeCache.txt
 files as CMake 4.5.1 and writing compatible build trees.
-A companion binary,
-.BR rcmake-lsp ,
-provides a Language Server Protocol (LSP) server for CMake files.
 .SS Execution modes
 The executable selects its command-line surface from
 .BR argv[0] :
@@ -87,9 +96,20 @@ forces compatibility mode even when invoked as
 .SH NATIVE EXTENSIONS
 These subcommands and flags are accepted only in native
 .B rcmake
-mode during project configure (not in
-.B \-P
-script mode or compatibility mode).
+mode (rejected in compatibility mode).
+Configure-only flags such as
+.BR \-\-profile ,
+.BR \-\-hermetic ,
+.BR \-\-fetch-lock ,
+and
+.B \-\-no-probe-cache
+apply during project configure, while
+.B \-\-diagnostics=cmake|rich
+(and default TTY rich errors) also apply in native
+.B rcmake \-P
+script mode; compatibility
+.B cmake \-P
+always stays in CMake diagnostic format.
 .SS Explain subcommand
 .TP
 .BI "rcmake explain " name
@@ -405,7 +425,9 @@ and
 .SS ctest
 When invoked through a
 .B ctest
-link (compatibility mode), the binary runs CMake test suites with support for
+link (compatibility mode) or as
+.BR "rcmake ctest" ,
+the binary runs CMake test suites with support for
 parallel scheduling, fixtures, resource specifications, labels, repeat modes,
 JUnit XML, dashboard submission, and
 .B \-S
@@ -448,7 +470,9 @@ and
 .SS cpack
 When invoked through a
 .B cpack
-link (compatibility mode), the binary packages build artifacts using
+link (compatibility mode) or as
+.BR "rcmake cpack" ,
+the binary packages build artifacts using
 .BR \-G
 .I generators
 .RB ( TGZ ,
@@ -460,7 +484,10 @@ link (compatibility mode), the binary packages build artifacts using
 .BR STGZ ,
 .BR ZIP ,
 .BR 7Z ,
-their compression variants,
+their compression variants, Linux
+.B DEB
+and
+.BR RPM ,
 .BR External ,
 and macOS
 .B Bundle
@@ -491,14 +518,20 @@ and
 and
 .BR \-\-trace-expand .
 .SS rcmake-lsp
+Invoked through the
 .B rcmake-lsp
-is a standalone Language Server Protocol server for
+symlink or as
+.BR "rcmake lsp" ,
+the same multi-call binary runs a Language Server Protocol server for
 .I CMakeLists.txt
 and
 .I *.cmake
 files communicating over standard input and standard output with JSON-RPC
 .B Content-Length
-framing.
+framing (accepting
+.B \-\-help
+and
+.BR \-\-version ).
 It provides hover, completion, go to definition, document symbols, semantic
 tokens, diagnostics, quick fixes, and formatting.
 When built with the
