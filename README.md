@@ -20,7 +20,7 @@
 
 `rcmake` is an independent reimplementation of CMake 4.5.1 in Rust. No CMake C++ source is copied or translated. One binary provides `cmake`, `ctest`, and `cpack`. It reads existing `CMakeLists.txt` files, presets, and caches, writes compatible `Ninja`, `Unix Makefiles`, `Xcode`, and `Visual Studio` build trees, and works with `vcpkg` and Conan.
 
-A second binary, `rcmake-lsp`, is a language server (LSP) for CMake files. The `rcmake-api` crate compiles to WebAssembly.
+Started as `rcmake-lsp` or `rcmake lsp`, the same binary is a language server (LSP) for CMake files. The `rcmake-api` crate compiles to WebAssembly.
 
 All 35 `rcmake` crates have `#![forbid(unsafe_code)]`. Some dependencies, such as `rustix` and `memchr`, use `unsafe`. The binary also statically links two C codecs: zstd 1.5.7 and liblzma 5.8.
 
@@ -55,7 +55,7 @@ To try `rcmake` with no install, open the [browser playground](https://dvgyl.git
 
 ## Status
 
-`rcmake` is at version `0.1.0`. A script stamps the release scorecard below from the frozen release binary at commit <!-- METRIC:release_commit -->pending frozen release run<!-- /METRIC --> on <!-- METRIC:release_date -->pending frozen release run<!-- /METRIC -->. The [compatibility report](https://dvgyl.github.io/rcmake/dashboard.html) shows the same data.
+`rcmake` is at version `0.1.0`. `tools/measure/stamp_metrics.py` fills in the scorecard below from one verification run of the frozen release binary at commit <!-- METRIC:release_commit -->pending frozen release run<!-- /METRIC --> on <!-- METRIC:release_date -->pending frozen release run<!-- /METRIC -->. A cell shows a number only after that run measures it. No value is estimated. The [compatibility report](https://dvgyl.github.io/rcmake/dashboard.html) shows the same data.
 
 | Check | Result |
 | --- | --- |
@@ -78,7 +78,7 @@ To try `rcmake` with no install, open the [browser playground](https://dvgyl.git
 
 L1 parity means that configure succeeds and writes the same standard error as CMake 4.5.1. L2 parity also compares `CMakeCache.txt`, the Ninja commands and graph edges, and the File API replies for the targets that `large_projects.toml` lists.
 
-The RunCMake counts are the suites that run on each OS. `tools/measure/runcmake_eval.py` lists each excluded suite and its reason in `LINUX_ONLY`, `WINDOWS_ONLY`, `POSIX_ONLY`, and `EXTERNAL_SUITES`. Some exclusions come from the test setup, not from the OS. Examples are `CUDA_architectures`, `Swift`, `Autogen_2` to `Autogen_7`, and `FindOpenSSL`. The runs also set `CMake_TEST_Qt5=OFF`, `CMake_TEST_Qt6=OFF`, and `CMAKE_Fortran_COMPILER=NOTFOUND`. Fortran and Qt get their tests from the independent suite, `qtbase`, `kcoreaddons`, and the ecosystem lane.
+The RunCMake counts are the suites that run on each OS. `tools/measure/runcmake_eval.py` lists each excluded suite and its reason in `LINUX_ONLY`, `WINDOWS_ONLY`, `POSIX_ONLY`, and `EXTERNAL_SUITES`. Some exclusions come from the test setup, not from the OS. Examples are `CUDA_architectures`, `Swift`, `Autogen_2` to `Autogen_7`, and `FindOpenSSL`. The runs also set `CMake_TEST_Qt5=OFF`, `CMake_TEST_Qt6=OFF`, and `CMAKE_Fortran_COMPILER=NOTFOUND`. Fortran is tested by the independent suite and the ecosystem lane. Qt is tested by the `qtbase` and `kcoreaddons` large projects.
 
 How the benchmarks are measured:
 
@@ -147,14 +147,13 @@ The extensions work only when the executable name is `rcmake`.
 
 ### Linux and macOS
 
-GitHub Releases has archives for these targets:
+GitHub Releases has `.tar.gz` archives for these targets:
 
 - `aarch64-apple-darwin`
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
-- `x86_64-pc-windows-msvc`
 
-There is no `x86_64-apple-darwin` archive. On an Intel Mac, use `--from-source`.
+The `x86_64-pc-windows-msvc` archive is a `.zip`. See [Windows](#windows). There is no `x86_64-apple-darwin` archive. On an Intel Mac, use `--from-source`.
 
 `scripts/install.sh` downloads the latest release, or the release that `--version` selects. It checks the SHA-256 sum from the same release to find damaged downloads. It installs `bin/rcmake`, `bin/rcmake-lsp`, `share/cmake-4.5`, and the bundled shell completions and `rcmake(1)` man page into `$HOME/.local`, or into `$PREFIX` if you set it. The script needs `bash`, `python3`, and `curl`.
 
@@ -342,7 +341,7 @@ open "profile-out/$(cat profile-out/current)/flamegraph.html"
 - **Legacy and niche generators.** `NMake Makefiles`, `NMake Makefiles JOM`, `MSYS Makefiles`, `MinGW Makefiles`, `Borland Makefiles`, `Watcom WMake`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16 are not implemented.
 - **Swift is unverified.** Basic Swift wiring exists in `rcmake-resolve`, but no test builds Swift code with a Swift toolchain yet.
 - **CUDA and HIP have little test coverage.** CUDA has one end-to-end fixture in the ecosystem lane. HIP has rule wiring only, and no test uses a HIP toolchain yet.
-- **`--version` text.** Line 1 is `cmake version 4.5.1`. Line 2 is `Rcmake 0.1.0` instead of the Kitware line, so the output never names Kitware as the maintainer.
+- **`--version` text.** Line 1 is `cmake version 4.5.1`. Line 2 is `rcmake 0.1.0` instead of the Kitware line, so the output never names Kitware as the maintainer.
 - **`try_compile` runs in-process.** Probes run through the `rcmake` executor, not through Ninja, Make, MSBuild, or xcodebuild. The result is the same. The build tool lines in `OUTPUT_VARIABLE` are different. Generator settings that only MSBuild or Xcode read, such as `CMAKE_GENERATOR_TOOLSET` and `CMAKE_XCODE_ATTRIBUTE_*`, have no effect on probes.
 - **Replay limits.** Native-mode replay is off when a toolchain file, a configure preset, `-C`, or `PreLoad.cmake` is in use. This includes the `vcpkg` toolchain integration. [`docs/ENV_VARS.md`](docs/ENV_VARS.md#incremental-replay) lists all conditions.
 - **Large-project scope.** The 10 large projects use unmodified sources at pinned tags, but each one uses a reduced option set from `conformance/corpus/large_projects.toml`. For example, OpenCV builds 3 modules with CUDA off, and LLVM builds only `clang` for the host target. L2 compares only the listed targets.
@@ -363,7 +362,7 @@ RCMAKE_STAGE_PROFILE=release scripts/stage.sh
 Run any verification suite with one command:
 
 ```sh
-# Rust unit tests, Clippy, Rustdoc, licence scan, and recorded CLI and script cases
+# Licence scan, rustfmt, Clippy, Rustdoc, workspace tests, and recorded CLI and script cases
 scripts/gate.sh
 
 # Upstream Tests/RunCMake (use --profile linux or --profile windows on those OSes)
@@ -390,9 +389,7 @@ cargo run --release --bin rcmake-fuzz -- syntax --iterations 1000000
 python3 tools/measure/upstream_track.py --out-json upstream.json --out-md upstream.md
 ```
 
-To run every scorecard lane on this host and write the receipts that `tools/measure/assemble_release_receipts.py` reads, use `scripts/reproduce-scorecard.sh --receipts-dir <dir>`.
-Add `--dry-run` to print each command and receipt path first.
-Use `--lane <name>` to run one lane. `--help` lists the lanes.
+To run every scorecard lane on this host and write the receipts that `tools/measure/assemble_release_receipts.py` reads, use `scripts/reproduce-scorecard.sh --receipts-dir <dir>`. Add `--dry-run` to print each command and receipt path first. Use `--lane <name>` to run one lane. `--help` lists the lanes. The large projects, `vcpkg`, the sealed holdout, fuzzing, and CI job receipts come from CI or other hosts, not from this script.
 
 The [engineering write-up](docs/BUILD_WRITEUP.md#7-reproduce-every-claim-in-one-command) has the complete command table. It covers the large C++ projects, the sealed holdout, Conan and `vcpkg`, probe-cache soundness, and mutation replay.
 

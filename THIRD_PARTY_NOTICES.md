@@ -21,9 +21,9 @@ Rcmake also bundles and attributes the following permissively licensed third-par
 
 All original Kitware and contributor copyright notices inside `modules/cmake-4.5/` are preserved intact.
 
-## 2. Rust Crate Dependencies
+## 2. Rust crate dependencies
 
-*(Updated automatically/manually whenever workspace dependencies are added; all direct and transitive crates must be compatible with `MIT OR Apache-2.0`.)*
+`python3 tools/measure/licence_scan.py --generate-notices` regenerates the crate table below from `cargo metadata --locked`. The licence scan fails when a workspace dependency has no licence option on its allowlist: `MIT`, `Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`, `0BSD`, `ISC`, `Zlib`, `Unicode-3.0`, or `bzip2-1.0.6`.
 
 ### Compression codecs of `rcmake-archive` (ADR-010)
 
