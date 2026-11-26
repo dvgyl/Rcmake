@@ -245,7 +245,12 @@ fn run_step(
             if options.fresh {
                 args.push("--fresh".into());
             }
-            args.insert(0, "cmake".into());
+            let program = if persona == crate::persona::Persona::Native {
+                "rcmake"
+            } else {
+                "cmake"
+            };
+            args.insert(0, program.into());
             let exit = crate::run(&args, Arc::clone(host));
             // Configure can change the environment through presets and set(ENV).
             // Later steps start with the caller's environment.
@@ -253,8 +258,13 @@ fn run_step(
             exit
         }
         PresetKind::Build => {
+            let program = if persona == crate::persona::Persona::Native {
+                "rcmake"
+            } else {
+                "cmake"
+            };
             let mut argv = Vec::with_capacity(args.len() + 2);
-            argv.push("cmake".into());
+            argv.push(program.into());
             argv.push("--build".into());
             argv.extend(args.iter().cloned());
             crate::build::run(&argv, &args, persona, host.as_ref())

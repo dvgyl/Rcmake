@@ -436,3 +436,72 @@ fn help_lists_required_options_and_every_long_flag_is_accepted_by_parser() {
         }
     }
 }
+
+#[test]
+fn late_version_json_matches_cmake_version_schema() {
+    let host = std::sync::Arc::new(PureHost::default());
+    let argv = [
+        BString::from("ctest"),
+        BString::from("-V"),
+        BString::from("--version=json-v1"),
+    ];
+    assert_eq!(crate::main(&argv, host.clone()), 0);
+    let out = host.stream_bytes(rcmake_host::Stream::Stdout);
+    let doc = rcmake_json::parse(out.as_slice(), &rcmake_json::ReadOptions::default()).unwrap();
+    let rcmake_json::Value::Object(root) = doc else {
+        panic!("expected JSON object");
+    };
+    assert_eq!(
+        root.get(b"dependencies".as_slice()),
+        Some(&rcmake_json::Value::Array(Vec::new()))
+    );
+    let Some(rcmake_json::Value::Object(program)) = root.get(b"program".as_slice()) else {
+        panic!("missing program object");
+    };
+    assert_eq!(
+        program.get(b"name".as_slice()),
+        Some(&rcmake_json::Value::string("ctest"))
+    );
+    let Some(rcmake_json::Value::Object(schema_ver)) = root.get(b"version".as_slice()) else {
+        panic!("missing schema version");
+    };
+    assert_eq!(
+        schema_ver.get(b"major".as_slice()),
+        Some(&rcmake_json::Value::UInt(1))
+    );
+    assert_eq!(
+        schema_ver.get(b"minor".as_slice()),
+        Some(&rcmake_json::Value::UInt(0))
+    );
+}
+
+#[test]
+fn list_presets_defined_reports_hidden_and_disabled_test_presets() {
+    let host = std::sync::Arc::new(PureHost::default());
+    host.seed_file(
+        Path::new("/work/CMakePresets.json"),
+        br#"{
+          "version": 6,
+          "configurePresets": [{"name": "cfg", "generator": "Ninja", "binaryDir": "build"}],
+          "testPresets": [
+            {"name": "visible", "displayName": "Visible", "configurePreset": "cfg"},
+            {"name": "secret", "hidden": true, "configurePreset": "cfg"},
+            {"name": "off", "configurePreset": "cfg", "condition": {"type": "equals", "lhs": "a", "rhs": "b"}}
+          ]
+        }"#,
+    )
+    .unwrap();
+    let argv = [
+        BString::from("ctest"),
+        BString::from("--list-presets=defined"),
+    ];
+    assert_eq!(crate::main(&argv, host.clone()), 0);
+    let out = String::from_utf8_lossy(&host.stream_bytes(rcmake_host::Stream::Stdout)).into_owned();
+    assert!(out.starts_with("Defined test presets:\n\n"), "{out}");
+    assert!(out.contains("\"visible\" - Visible\n"), "{out}");
+    assert!(out.contains("\"secret\"\n    Unavailable: hidden\n"), "{out}");
+    assert!(
+        out.contains("\"off\"\n    Unavailable: condition evaluated to false:"),
+        "{out}"
+    );
+}

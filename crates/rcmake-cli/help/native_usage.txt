@@ -1,8 +1,11 @@
 
 rcmake extensions
-  rcmake explain <name> [-B <build>] [--target|--var]
-                 [--config <name>] [--filter <value>] [--json]
+  rcmake explain <name> [-B <build-dir>] [--target|--var]
+                 [--config <cfg>] [--filter <val>] [--json]
                  [--verbose] [--color=auto|always|never]
+  rcmake ctest [options]       Run the bundled ctest driver.
+  rcmake cpack [options]       Run the bundled cpack driver.
+  rcmake lsp [options]         Start the CMake language server over stdio.
   --diagnostics=cmake|rich     Select the diagnostic format.
   --profile[=<dir>]            Write flamegraph.html, trace.json, and
                                stacks.folded in <dir>, and keep each run in
@@ -12,3 +15,7 @@ rcmake extensions
                                Select the fetch lock mode.
   --hermetic[=warn|strict]     Check for undeclared inputs. The default mode
                                for this option is warn.
+
+Environment
+  RCMAKE_ORACLE_MODE=1         Run in strict CMake compatibility mode
+                               (disables rcmake subcommands and extensions).

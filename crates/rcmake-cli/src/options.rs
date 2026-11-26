@@ -95,6 +95,7 @@ const NATIVE_FLAGS: &[&[u8]] = &[
 const LONG_OPTIONS: &[&[u8]] = &[
     b"--build",
     b"--install",
+    b"--open",
     b"--version",
     b"--help",
     b"--help-variable",
@@ -228,6 +229,14 @@ fn parse_args(
                 .map_err(|error| error.to_string())?
         {
             first_extension.get_or_insert(raw);
+            if arg.original == b"--profile"
+                && let Some(next) = arg.rest.peek()
+            {
+                let next = next.as_slice();
+                if !next.is_empty() && !next.starts_with(b"-") {
+                    opts.extensions.bare_profile_arg = Some(resolve_project_path(host, next));
+                }
+            }
             continue;
         }
         if parse_project(&mut arg, &mut opts, host)?
@@ -584,32 +593,84 @@ fn invalid_generator_env(host: &dyn Host) {
     );
 }
 
-fn print_config_dir(host: &dyn Host) {
-    let from_env = host.env_get(b"CMAKE_CONFIG_DIR");
-    if let Some(dir) = from_env {
-        out(host, &format!("{}\n", String::from_utf8_lossy(&dir)));
-        return;
+#[derive(Clone, Copy)]
+enum ConfigPlatform {
+    Windows,
+    Macos,
+    Unix,
+}
+
+fn format_config_output_path(dir: &str, platform: ConfigPlatform) -> String {
+    match platform {
+        ConfigPlatform::Windows => dir.replace('/', "\\"),
+        ConfigPlatform::Macos | ConfigPlatform::Unix => dir.replace(' ', "\\ "),
     }
-    let home = host.env_get(b"HOME").unwrap_or_default();
-    let home = String::from_utf8_lossy(&home);
-    let dir = if cfg!(target_os = "macos") {
-        format!("{home}/Library/Application\\ Support/CMake")
-    } else if cfg!(windows) {
-        format!("{home}/AppData/Local/CMake")
-    } else {
-        host.env_get(b"XDG_CONFIG_HOME")
-            .filter(|p| !p.is_empty())
-            .map_or_else(
-                || format!("{home}/.config/cmake"),
-                |dir| format!("{}/cmake", String::from_utf8_lossy(&dir)),
-            )
+}
+
+fn resolve_config_dir(host: &dyn Host, platform: ConfigPlatform) -> String {
+    let env_nonempty = |key: &[u8]| {
+        host.env_get(key)
+            .filter(|value| !value.is_empty())
+            .map(|value| String::from_utf8_lossy(&value).into_owned())
     };
+    if let Some(dir) = env_nonempty(b"CMAKE_CONFIG_DIR") {
+        return format_config_output_path(&dir, platform);
+    }
+    let dir = match platform {
+        ConfigPlatform::Windows => {
+            if let Some(local) = env_nonempty(b"LOCALAPPDATA") {
+                let base = local.trim_end_matches(['\\', '/']);
+                format!("{base}\\CMake")
+            } else if let Some(profile) = env_nonempty(b"USERPROFILE").or_else(|| env_nonempty(b"HOME")) {
+                let base = profile.trim_end_matches(['\\', '/']);
+                format!("{base}\\AppData\\Local\\CMake")
+            } else {
+                String::new()
+            }
+        }
+        ConfigPlatform::Macos => {
+            if let Some(xdg) = env_nonempty(b"XDG_CONFIG_HOME") {
+                let base = xdg.trim_end_matches('/');
+                format!("{base}/CMake")
+            } else if let Some(home) = env_nonempty(b"HOME") {
+                let base = home.trim_end_matches('/');
+                format!("{base}/Library/Application Support/CMake")
+            } else {
+                String::new()
+            }
+        }
+        ConfigPlatform::Unix => {
+            if let Some(xdg) = env_nonempty(b"XDG_CONFIG_HOME") {
+                let base = xdg.trim_end_matches('/');
+                format!("{base}/cmake")
+            } else if let Some(home) = env_nonempty(b"HOME") {
+                let base = home.trim_end_matches('/');
+                format!("{base}/.config/cmake")
+            } else {
+                String::new()
+            }
+        }
+    };
+    format_config_output_path(&dir, platform)
+}
+
+fn print_config_dir(host: &dyn Host) {
+    let platform = if cfg!(windows) {
+        ConfigPlatform::Windows
+    } else if cfg!(target_os = "macos") {
+        ConfigPlatform::Macos
+    } else {
+        ConfigPlatform::Unix
+    };
+    let dir = resolve_config_dir(host, platform);
     out(host, &format!("{dir}\n"));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Persona, unknown_mode_option, unknown_option};
+    use rcmake_host::PureHost;
+
+    use super::{ConfigPlatform, Persona, resolve_config_dir, unknown_mode_option, unknown_option};
 
     #[test]
     fn unknown_option_suggests_the_first_closest_flag_within_two_edits() {
@@ -624,6 +685,10 @@ mod tests {
         assert_eq!(
             unknown_mode_option(b"--xyz", &[b"--cat", b"--bar"]),
             "Unknown argument --xyz"
+        );
+        assert_eq!(
+            unknown_option(b"--opne", Persona::Compat),
+            "Unknown argument --opne. Did you mean: --open?"
         );
     }
 
@@ -640,6 +705,52 @@ mod tests {
         assert_eq!(
             unknown_option(b"--hermtic", Persona::Compat),
             "Unknown argument --hermtic"
+        );
+    }
+
+    #[test]
+    fn resolves_config_dir_across_windows_macos_and_unix() {
+        let host = PureHost::default();
+        host.env_set(b"HOME", Some(b"/Users/alice"));
+        assert_eq!(
+            resolve_config_dir(&host, ConfigPlatform::Macos),
+            "/Users/alice/Library/Application\\ Support/CMake"
+        );
+        assert_eq!(
+            resolve_config_dir(&host, ConfigPlatform::Unix),
+            "/Users/alice/.config/cmake"
+        );
+
+        host.env_set(b"XDG_CONFIG_HOME", Some(b"/xdg/config"));
+        assert_eq!(
+            resolve_config_dir(&host, ConfigPlatform::Macos),
+            "/xdg/config/CMake"
+        );
+        assert_eq!(
+            resolve_config_dir(&host, ConfigPlatform::Unix),
+            "/xdg/config/cmake"
+        );
+
+        let win = PureHost::default();
+        win.env_set(b"USERPROFILE", Some(b"C:\\Users\\alice"));
+        assert_eq!(
+            resolve_config_dir(&win, ConfigPlatform::Windows),
+            "C:\\Users\\alice\\AppData\\Local\\CMake"
+        );
+        win.env_set(b"LOCALAPPDATA", Some(b"D:/LocalAppData"));
+        assert_eq!(
+            resolve_config_dir(&win, ConfigPlatform::Windows),
+            "D:\\LocalAppData\\CMake"
+        );
+
+        win.env_set(b"CMAKE_CONFIG_DIR", Some(b"cmake_config_dir"));
+        assert_eq!(
+            resolve_config_dir(&win, ConfigPlatform::Windows),
+            "cmake_config_dir"
+        );
+        assert_eq!(
+            resolve_config_dir(&win, ConfigPlatform::Macos),
+            "cmake_config_dir"
         );
     }
 }

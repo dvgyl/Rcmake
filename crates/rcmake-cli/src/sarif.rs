@@ -55,12 +55,7 @@ pub(crate) fn write(
             }
         }
         if let Some((source, binary)) = invocation.directories {
-            let uri = |dir: &Path| {
-                let mut uri = BString::from("file://");
-                uri.extend_from_slice(&path::from_native(dir));
-                uri.push(b'/');
-                object([("uri", Value::String(uri))])
-            };
+            let uri = |dir: &Path| object([("uri", Value::String(dir_uri(dir)))]);
             run.insert(
                 "originalUriBaseIds".into(),
                 object([
@@ -207,6 +202,26 @@ fn rebase_location(location: &mut Value, bases: &[(&[u8], Lexical<'_>)]) {
     }
 }
 
+fn dir_uri(dir: &Path) -> BString {
+    dir_uri_from_cmake(&path::from_native_cmake(dir))
+}
+
+fn dir_uri_from_cmake(normalized: &[u8]) -> BString {
+    let mut uri = BString::from("file://");
+    if let Some(unc) = normalized.strip_prefix(b"//") {
+        uri.extend_from_slice(unc);
+    } else {
+        if !normalized.starts_with(b"/") {
+            uri.push(b'/');
+        }
+        uri.extend_from_slice(normalized);
+    }
+    if !uri.ends_with(b"/") {
+        uri.push(b'/');
+    }
+    uri
+}
+
 fn timestamp(time: FileTime) -> String {
     jiff::Timestamp::from_second(time.secs)
         .map(|time| time.to_string())
@@ -258,5 +273,17 @@ mod tests {
         );
         assert!(text.contains(r#""uri":"/work/src2/other.cmake""#), "{text}");
         assert!(!text.contains(r#"other.cmake","uriBaseId""#), "{text}");
+    }
+
+    #[test]
+    fn dir_uri_formats_unix_windows_drive_and_unc_paths() {
+        assert_eq!(dir_uri_from_cmake(b"/work/src"), "file:///work/src/");
+        assert_eq!(dir_uri_from_cmake(b"/"), "file:///");
+        assert_eq!(dir_uri_from_cmake(b"C:/work/src"), "file:///C:/work/src/");
+        assert_eq!(dir_uri_from_cmake(b"C:/"), "file:///C:/");
+        assert_eq!(
+            dir_uri_from_cmake(b"//server/share/src"),
+            "file://server/share/src/"
+        );
     }
 }

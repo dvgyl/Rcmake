@@ -523,7 +523,7 @@ fn dispatch(
 /// This is `cmake::FindCacheFile`: when `requested` has no cache but has a
 /// `CMakeFiles` directory, the nearest ancestor with a cache is used. The
 /// build itself still runs in `requested`.
-fn cache_dir(host: &dyn Host, requested: &Path) -> PathBuf {
+pub(crate) fn cache_dir(host: &dyn Host, requested: &Path) -> PathBuf {
     let exists = |path: &Path| host.metadata(path, Follow::Yes).is_ok();
     if exists(&requested.join("CMakeCache.txt")) || !exists(&requested.join("CMakeFiles")) {
         return requested.to_path_buf();

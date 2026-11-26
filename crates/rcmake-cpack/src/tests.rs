@@ -80,7 +80,7 @@ fn reports_the_text_version_after_options() {
     assert_eq!(
         host.stream_bytes(Stream::Stdout),
         concat!(
-            "cpack version 4.5.1\nRcmake ",
+            "cpack version 4.5.1\nrcmake ",
             env!("CARGO_PKG_VERSION"),
             "\n"
         )

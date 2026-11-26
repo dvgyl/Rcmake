@@ -1006,4 +1006,150 @@ endif()
     );
 }
 
+#[test]
+fn native_subcommands_dispatch_ctest_and_cpack_and_respect_oracle_mode() {
+    let host = Arc::new(PureHost::default());
+    assert_eq!(invoke(&host, &["rcmake", "ctest", "--version"]), 0);
+    assert_eq!(
+        host.stream_bytes(Stream::Stdout),
+        concat!(
+            "ctest version 4.5.1\nrcmake ",
+            env!("CARGO_PKG_VERSION"),
+            "\n"
+        )
+        .as_bytes()
+    );
+
+    let host = Arc::new(PureHost::default());
+    assert_eq!(invoke(&host, &["rcmake", "cpack", "--version"]), 0);
+    assert_eq!(
+        host.stream_bytes(Stream::Stdout),
+        concat!(
+            "cpack version 4.5.1\nrcmake ",
+            env!("CARGO_PKG_VERSION"),
+            "\n"
+        )
+        .as_bytes()
+    );
+
+    let host = Arc::new(PureHost::default());
+    assert_eq!(invoke(&host, &["rcmake", "cpack", "-V", "--version"]), 0);
+    assert_eq!(
+        host.stream_bytes(Stream::Stdout),
+        concat!(
+            "cpack version 4.5.1\nrcmake ",
+            env!("CARGO_PKG_VERSION"),
+            "\n"
+        )
+        .as_bytes()
+    );
+
+    let host = Arc::new(PureHost::default());
+    host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
+    assert_eq!(invoke(&host, &["rcmake", "ctest", "--version"]), 1);
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("Unknown argument --version")
+    );
+}
+
+#[test]
+fn native_help_uses_consistent_rcmake_branding_and_documents_subcommands() {
+    let host = Arc::new(PureHost::default());
+    assert_eq!(invoke(&host, &["rcmake", "--help"]), 0);
+    let native_help = host.stream_bytes(Stream::Stdout).to_string();
+    assert!(!native_help.contains("Rcmake"), "{native_help}");
+    for expected in [
+        "  rcmake [options]",
+        "\"rcmake -E\"",
+        "\"rcmake --build\"",
+        "\"rcmake --install\"",
+        "rcmake ctest [options]",
+        "rcmake cpack [options]",
+        "rcmake lsp [options]",
+        "RCMAKE_ORACLE_MODE=1",
+    ] {
+        assert!(native_help.contains(expected), "missing {expected} in:\n{native_help}");
+    }
+
+    let host = Arc::new(PureHost::default());
+    assert_eq!(invoke(&host, &["cmake", "--help"]), 0);
+    let compat_help = host.stream_bytes(Stream::Stdout).to_string();
+    assert!(compat_help.contains("\"cmake -E\""), "{compat_help}");
+    assert!(!compat_help.contains("rcmake extensions"), "{compat_help}");
+}
+
+#[test]
+fn native_workflow_preserves_native_persona_during_configure() {
+    let presets = br#"{
+  "version": 6,
+  "configurePresets": [
+    {"name": "cfg", "generator": "Ninja", "binaryDir": "out"}
+  ],
+  "workflowPresets": [
+    {"name": "wf", "steps": [{"type": "configure", "name": "cfg"}]}
+  ]
+}"#;
+    let lists = b"cmake_minimum_required(VERSION 4.5)\nproject(Flow NONE)\nmessage(FATAL_ERROR \"boom\")\n";
+
+    let host = project_host();
+    host.env_set(b"RCMAKE_DIAGNOSTICS", Some(b"rich"));
+    host.seed_file(Path::new("/work/CMakeLists.txt"), lists)
+        .unwrap();
+    host.seed_file(Path::new("/work/CMakePresets.json"), presets)
+        .unwrap();
+    assert_eq!(invoke(&host, &["rcmake", "--workflow", "--preset", "wf"]), 1);
+    let native_err = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        native_err.contains("error[CMake.FatalError]"),
+        "expected rich diagnostic in native workflow configure:\n{native_err}"
+    );
+
+    let host = project_host();
+    host.env_set(b"RCMAKE_DIAGNOSTICS", Some(b"rich"));
+    host.seed_file(Path::new("/work/CMakeLists.txt"), lists)
+        .unwrap();
+    host.seed_file(Path::new("/work/CMakePresets.json"), presets)
+        .unwrap();
+    assert_eq!(invoke(&host, &["cmake", "--workflow", "--preset", "wf"]), 1);
+    let compat_err = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        !compat_err.contains("error[CMake.FatalError]"),
+        "compat workflow configure must stay CMake-formatted:\n{compat_err}"
+    );
+    assert!(
+        compat_err.contains("CMake Error at CMakeLists.txt:3 (message):"),
+        "{compat_err}"
+    );
+}
+
+#[test]
+fn bare_profile_followed_by_non_project_path_suggests_equals_syntax() {
+    let host = project_host();
+    assert_eq!(invoke(&host, &["rcmake", "--profile", "missing_dir"]), 1);
+    let err = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(err.contains("does not exist"), "{err}");
+    assert!(err.contains("--profile=<dir>"), "{err}");
+
+    let host = project_host();
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nproject(Prof NONE)\n",
+    )
+    .unwrap();
+    assert_eq!(
+        invoke(
+            &host,
+            &["rcmake", "--profile", "out", "-S", ".", "-B", "build", "-G", "Ninja"]
+        ),
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let err = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(err.contains("Ignoring extra path from command line"), "{err}");
+    assert!(err.contains("--profile=<dir>"), "{err}");
+}
+
 mod generation;

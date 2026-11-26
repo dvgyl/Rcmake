@@ -95,7 +95,10 @@ pub(crate) fn resolve_rich_color(host: &dyn Host, stderr_is_tty: bool, style: Di
         && (host
             .env_get(b"CLICOLOR_FORCE")
             .is_some_and(|value| value.as_slice() == b"1")
-            || (stderr_is_tty && host.env_get(b"NO_COLOR").is_none()))
+            || (stderr_is_tty
+                && host
+                    .env_get(b"NO_COLOR")
+                    .is_none_or(|value| value.is_empty())))
 }
 
 /// Resolve the terminal column width for rich diagnostics.
@@ -181,6 +184,8 @@ mod tests {
         assert!(color(true, DiagStyle::Rich));
 
         host.env_set(b"NO_COLOR", Some(b""));
+        assert!(color(true, DiagStyle::Rich));
+        host.env_set(b"NO_COLOR", Some(b"1"));
         assert!(!color(true, DiagStyle::Rich));
         host.env_set(b"CLICOLOR_FORCE", Some(b"0"));
         assert!(!color(true, DiagStyle::Rich));

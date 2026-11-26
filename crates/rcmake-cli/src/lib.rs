@@ -15,6 +15,7 @@ mod help;
 mod install;
 mod instrumentation;
 mod make_depends;
+mod open;
 mod options;
 mod persona;
 mod presets;
@@ -241,10 +242,22 @@ fn run_cmake(
     persona: persona::Persona,
     host: Arc<dyn Host>,
 ) -> i32 {
-    if persona == persona::Persona::Native
-        && let Some(args) = rest.strip_prefix(&[BString::from("explain")])
-    {
-        return explain_cmd::run(argv.first(), args, host);
+    if persona == persona::Persona::Native {
+        if let Some(args) = rest.strip_prefix(&[BString::from("explain")]) {
+            return explain_cmd::run(argv.first(), args, host);
+        }
+        if let Some(args) = rest.strip_prefix(&[BString::from("ctest")]) {
+            let mut sub_argv = Vec::with_capacity(args.len() + 1);
+            sub_argv.push(BString::from("ctest"));
+            sub_argv.extend_from_slice(args);
+            return run_tool(&sub_argv, Tool::Ctest, persona, host);
+        }
+        if let Some(args) = rest.strip_prefix(&[BString::from("cpack")]) {
+            let mut sub_argv = Vec::with_capacity(args.len() + 1);
+            sub_argv.push(BString::from("cpack"));
+            sub_argv.extend_from_slice(args);
+            return run_tool(&sub_argv, Tool::Cpack, persona, host);
+        }
     }
     if let Some(sub_args) = rest.strip_prefix(&[BString::from("-E")]) {
         if let [command, args @ ..] = sub_args {
@@ -289,6 +302,9 @@ fn run_cmake(
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--install")]) {
         return install::run(argv, args, host);
+    }
+    if let Some(args) = rest.strip_prefix(&[BString::from("--open")]) {
+        return open::run(args, persona, host.as_ref());
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--workflow")]) {
         return workflow::run(args, persona, host);

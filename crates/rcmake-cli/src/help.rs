@@ -142,7 +142,10 @@ pub(crate) fn run(
             separate(host, &mut stdout);
             if persona == crate::persona::Persona::Native {
                 let native = String::from_utf8_lossy(COMPAT_USAGE)
-                    .replace("  cmake [options]", "  rcmake [options]");
+                    .replace("  cmake [options]", "  rcmake [options]")
+                    .replace("\"cmake -E\"", "\"rcmake -E\"")
+                    .replace("\"cmake --build\"", "\"rcmake --build\"")
+                    .replace("\"cmake --install\"", "\"rcmake --install\"");
                 host.write_out(Stream::Stdout, native.as_bytes());
             } else {
                 host.write_out(Stream::Stdout, COMPAT_USAGE);

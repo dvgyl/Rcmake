@@ -207,7 +207,11 @@ impl<'a> ConfigureSession<'a> {
         mut opts: Options,
         host: Arc<dyn Host>,
     ) -> Result<(Self, Cache), Exit> {
-        let (mut src, mut bin) = resolve_directories(host.as_ref(), &opts.directories);
+        let (mut src, mut bin) = resolve_directories(
+            host.as_ref(),
+            &opts.directories,
+            opts.extensions.bare_profile_arg.as_deref(),
+        );
         let cwd = host.initial_cwd();
         if let Some(listing) = opts.list_presets
             && (src.is_some()
@@ -447,8 +451,15 @@ impl<'a> ConfigureSession<'a> {
         } else {
             "Specify --help for usage, or press the help button on the CMake GUI."
         };
+        let profile_hint = if self.opts.extensions.bare_profile_arg.as_deref()
+            == Some(self.src.as_path())
+        {
+            "\nHint: pass a profile output directory with --profile=<dir>."
+        } else {
+            ""
+        };
         Err(Exit::Message(format!(
-            "The source directory \"{}\" {problem}.\n{hint}",
+            "The source directory \"{}\" {problem}.\n{hint}{profile_hint}",
             self.src.display()
         )))
     }
@@ -729,6 +740,7 @@ impl<'a> ConfigureSession<'a> {
 fn resolve_directories(
     host: &dyn Host,
     args: &[DirectoryArg],
+    bare_profile_arg: Option<&Path>,
 ) -> (Option<PathBuf>, Option<PathBuf>) {
     let mut source = None;
     let mut binary = None;
@@ -773,10 +785,15 @@ fn resolve_directories(
             } else {
                 ""
             };
+            let profile_hint = if bare_profile_arg == Some(path) {
+                "\n\n  Hint: pass a profile output directory with --profile=<dir>."
+            } else {
+                ""
+            };
             options::warn(
                 host,
                 &format!(
-                    "Ignoring extra path from command line:\n\n   \"{}{suffix}\"",
+                    "Ignoring extra path from command line:\n\n   \"{}{suffix}\"{profile_hint}",
                     path.display()
                 ),
             );

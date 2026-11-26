@@ -49,6 +49,8 @@ pub(crate) struct RcmakeExt {
     pub(crate) diagnostics: Option<DiagStyle>,
     /// Output directory requested on the command line.
     pub(crate) profile: Option<ProfileRequest>,
+    /// Positional path immediately following a bare `--profile`, for typo hints.
+    pub(crate) bare_profile_arg: Option<PathBuf>,
     /// Bypass the probe cache for this invocation.
     pub(crate) no_probe_cache: bool,
     /// Fetch lock mode requested on the command line.
@@ -73,7 +75,8 @@ pub(crate) fn parse_native_extension_flag(
                 Some(DiagStyle::Cmake) => "Use --diagnostics=cmake.",
                 None => "Use --diagnostics=cmake or --diagnostics=rich.",
             };
-            return Err(hint.into());
+            let raw = String::from_utf8_lossy(arg);
+            return Err(format!("Unknown argument {raw}. {hint}").into());
         }
         b"--diagnostics" => {
             ext.diagnostics =
@@ -188,6 +191,11 @@ mod tests {
             let result = parse_native_extension_flag(flag.as_bytes(), &mut ext);
             assert!(matches!(result, Err(message) if message.to_string().contains(hint)));
         }
+        let result = parse_native_extension_flag(b"--diagnostic=rich", &mut ext);
+        assert!(matches!(
+            result,
+            Err(message) if message.to_string().contains("Unknown argument --diagnostic=rich.")
+        ));
         let result = parse_native_extension_flag(b"--fetch-lock=bad", &mut ext);
         assert!(matches!(result, Err(message) if message.to_string().contains("\"bad\"")));
     }

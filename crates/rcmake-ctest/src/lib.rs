@@ -212,32 +212,26 @@ fn dispatch(
             rcmake_instrument::launcher::run_ctest_launcher(host.as_ref(), args)
                 .map_err(|error| error.to_string())
         }
-        Mode::ListPresets { .. } => list_presets(host.as_ref(), invocation),
+        Mode::ListPresets { defined } => list_presets(host.as_ref(), invocation, *defined),
         Mode::Version { json, file } => {
             let version = if *json {
-                format!(
-                    "{{\"version\":{{\"major\":{},\"minor\":{},\"patch\":{},\"string\":\"{}\"}}}}\n",
-                    rcmake_base::CMAKE_VERSION_MAJOR,
-                    rcmake_base::CMAKE_VERSION_MINOR,
-                    rcmake_base::CMAKE_VERSION_PATCH,
-                    rcmake_base::CMAKE_VERSION_STR
-                )
+                version_json()
             } else {
-                format!(
+                BString::from(format!(
                     "ctest version {}\nrcmake {}\n",
                     rcmake_base::CMAKE_VERSION_STR,
                     env!("CARGO_PKG_VERSION")
-                )
+                ))
             };
             if let Some(file) = file {
                 host.write(
                     &host.initial_cwd().join(file),
-                    version.as_bytes(),
+                    version.as_slice(),
                     WriteMode::Truncate,
                 )
                 .map_err(|error| error.to_string())?;
             } else {
-                host.write_out(Stream::Stdout, version.as_bytes());
+                host.write_out(Stream::Stdout, version.as_slice());
             }
             Ok(0)
         }
@@ -384,31 +378,111 @@ impl Drop for PresetEnvironment<'_> {
     }
 }
 
-fn list_presets(host: &dyn Host, invocation: &Invocation) -> Result<i32, String> {
+fn version_json() -> BString {
+    use rcmake_json::Value;
+
+    let mut prog_ver = BTreeMap::new();
+    prog_ver.insert(
+        BString::from("major"),
+        Value::UInt(u64::from(rcmake_base::CMAKE_VERSION_MAJOR)),
+    );
+    prog_ver.insert(
+        BString::from("minor"),
+        Value::UInt(u64::from(rcmake_base::CMAKE_VERSION_MINOR)),
+    );
+    prog_ver.insert(
+        BString::from("patch"),
+        Value::UInt(u64::from(rcmake_base::CMAKE_VERSION_PATCH)),
+    );
+    prog_ver.insert(
+        BString::from("string"),
+        Value::string(rcmake_base::CMAKE_VERSION_STR),
+    );
+
+    let mut program = BTreeMap::new();
+    program.insert(BString::from("name"), Value::string("ctest"));
+    program.insert(BString::from("version"), Value::Object(prog_ver));
+
+    let mut schema_ver = BTreeMap::new();
+    schema_ver.insert(BString::from("major"), Value::UInt(1));
+    schema_ver.insert(BString::from("minor"), Value::UInt(0));
+
+    let mut root = BTreeMap::new();
+    root.insert(BString::from("dependencies"), Value::Array(Vec::new()));
+    root.insert(BString::from("program"), Value::Object(program));
+    root.insert(BString::from("version"), Value::Object(schema_ver));
+
+    let mut text = rcmake_json::write_styled(&Value::Object(root), "  ");
+    text.push(b'\n');
+    text
+}
+
+fn unavailable_test_preset(
+    presets: &rcmake_presets::Presets,
+    env: &EnvSnapshot,
+    kind: PresetKind,
+    name: &[u8],
+) -> Option<String> {
+    let resolved = match presets.resolve_definition(kind, name, env) {
+        Ok(preset) => preset,
+        Err(err) if err.message.starts_with("Cannot use hidden ") => return Some("hidden".into()),
+        Err(err) if err.message.starts_with("Cannot use disabled ") => {
+            let condition = presets.preset_condition(kind, name);
+            return Some(condition.map_or_else(
+                || "condition evaluated to false".into(),
+                |condition| {
+                    format!(
+                        "condition evaluated to false: {}",
+                        rcmake_json::write_compact(condition)
+                    )
+                },
+            ));
+        }
+        Err(_) => return Some("unsupported macro expansion".into()),
+    };
+    if let Some(configure) = resolved.configure_preset
+        && let Some(reason) =
+            unavailable_test_preset(presets, env, PresetKind::Configure, &configure)
+    {
+        return Some(format!("configure preset \"{configure}\": {reason}"));
+    }
+    None
+}
+
+fn list_presets(host: &dyn Host, invocation: &Invocation, defined: bool) -> Result<i32, String> {
     let cwd = host.initial_cwd();
     let presets = match &invocation.presets_file {
         Some(file) => rcmake_presets::load_file(&cwd, file, host),
         None => rcmake_presets::load(&cwd, host),
     }
     .map_err(cli::preset_diagnostic)?;
-    let summaries = presets.list_visible(PresetKind::Test, &EnvSnapshot::from_host(host));
-    if summaries.is_empty() {
+    let env = EnvSnapshot::from_host(host);
+    let entries: Vec<_> = presets
+        .list_defined(PresetKind::Test)
+        .filter_map(|preset| {
+            let reason = unavailable_test_preset(&presets, &env, PresetKind::Test, &preset.name);
+            (defined || reason.is_none()).then_some((preset, reason))
+        })
+        .collect();
+    let Some(width) = entries.iter().map(|(preset, _)| preset.name.len()).max() else {
         return Ok(0);
-    }
-    let width = summaries
-        .iter()
-        .map(|preset| preset.name.len())
-        .max()
-        .unwrap_or(0);
-    host.write_out(Stream::Stdout, b"Available test presets:\n\n");
-    for preset in summaries {
-        let mut line = format!("  \"{}\"", preset.name);
-        if let Some(display_name) = preset.display_name.filter(|name| !name.is_empty()) {
-            let padding = " ".repeat(width - preset.name.len());
-            line.push_str(&format!("{padding} - {display_name}"));
+    };
+    let heading = if defined { "Defined" } else { "Available" };
+    let mut output = format!("{heading} test presets:\n\n");
+    for (index, (preset, reason)) in entries.iter().enumerate() {
+        output.push_str(&format!("  \"{}\"", preset.name));
+        if let Some(display_name) = preset.display_name.as_ref().filter(|name| !name.is_empty()) {
+            let padding = width.saturating_sub(preset.name.len()) + 1;
+            output.push_str(&format!("{:padding$}- {display_name}", ""));
         }
-        line.push('\n');
-        host.write_out(Stream::Stdout, line.as_bytes());
+        output.push('\n');
+        if let Some(reason) = reason {
+            output.push_str(&format!("    Unavailable: {reason}\n"));
+            if index + 1 < entries.len() {
+                output.push('\n');
+            }
+        }
     }
+    host.write_out(Stream::Stdout, output.as_bytes());
     Ok(0)
 }

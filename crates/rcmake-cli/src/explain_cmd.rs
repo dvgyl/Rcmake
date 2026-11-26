@@ -24,8 +24,8 @@ use rcmake_model::GeneratorKind;
 use crate::{cache, configure::initialize_diagnostics, resolve_cli_path};
 
 const HELP: &str = "\
-Usage: rcmake explain <NAME> [-B <build-dir>] [--target | --var]
-                      [--config <CFG>] [--filter <VAL>] [--json]
+Usage: rcmake explain <name> [-B <build-dir>] [--target | --var]
+                      [--config <cfg>] [--filter <val>] [--json]
                       [--verbose] [--color=auto|always|never]
 
 Show where a target gets its build settings or where a variable gets its value.
@@ -33,8 +33,8 @@ Show where a target gets its build settings or where a variable gets its value.
   -B <build-dir>  Read CMakeCache.txt from this directory. Default: current directory.
   --target        Look up a target or alias.
   --var           Look up a variable.
-  --config <CFG>  Select a target configuration. Implies --target.
-  --filter <VAL>  Select an exact target value or compiler flag. Implies --target.
+  --config <cfg>  Select a target configuration. Implies --target.
+  --filter <val>  Select an exact target value or compiler flag. Implies --target.
   --json          Write one JSON report to standard output.
   --verbose       Show full values and call stacks in terminal output.
   --color=<mode>  Set terminal color. Default: auto.
@@ -160,10 +160,7 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
             host.write_out(Stream::Stderr, message.as_bytes());
         } else if count > 0 {
             if options.verbose {
-                let plural = if count == 1 { "" } else { "s" };
-                let message = format!(
-                    "note: {count} cached CMake probe{plural} were skipped; their values come from CMakeCache.txt.\n"
-                );
+                let message = cached_probes_note(count);
                 host.write_out(Stream::Stderr, message.as_bytes());
             }
         } else {
@@ -175,6 +172,17 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
     }
     let report = result.explain_filtered(&query, options.filter.clone());
     write_report(host.as_ref(), &options, &report)
+}
+
+fn cached_probes_note(count: usize) -> String {
+    let (plural, verb) = if count == 1 {
+        ("", "was")
+    } else {
+        ("s", "were")
+    };
+    format!(
+        "note: {count} cached CMake probe{plural} {verb} skipped; their values come from CMakeCache.txt.\n"
+    )
 }
 
 fn request(
@@ -1067,5 +1075,17 @@ execute_process(COMMAND skipped RESULT_VARIABLE status)
         assert!(stderr.contains("Partial configure."), "{stderr}");
         assert!(stderr.contains("denied 2 subprocess requests"), "{stderr}");
         Ok(())
+    }
+
+    #[test]
+    fn cached_probes_note_uses_grammatical_number() {
+        assert_eq!(
+            cached_probes_note(1),
+            "note: 1 cached CMake probe was skipped; their values come from CMakeCache.txt.\n"
+        );
+        assert_eq!(
+            cached_probes_note(2),
+            "note: 2 cached CMake probes were skipped; their values come from CMakeCache.txt.\n"
+        );
     }
 }

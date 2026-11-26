@@ -127,7 +127,7 @@ fn unknown(arg: &BString) -> CpackError {
 pub(crate) fn print_information(host: &dyn Host, options: &CPackOptions) -> bool {
     if options.version {
         let text = format!(
-            "cpack version {CMAKE_VERSION_STR}\nRcmake {}\n",
+            "cpack version {CMAKE_VERSION_STR}\nrcmake {}\n",
             env!("CARGO_PKG_VERSION")
         );
         host.write_out(Stream::Stdout, text.as_bytes());
