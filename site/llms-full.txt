@@ -1,6 +1,6 @@
-# rcmake Technical Reference
+# rcmake technical reference
 
-> Complete, factual technical reference for `rcmake` (`0.1.0`), an independent drop-in reimplementation of CMake `4.5.1` in safe Rust.
+> Technical reference for `rcmake` (`0.1.0`), an independent drop-in reimplementation of CMake `4.5.1` in safe Rust.
 
 Canonical website: https://dvgyl.github.io/rcmake/
 Browser playground: https://dvgyl.github.io/rcmake/playground.html
@@ -11,11 +11,9 @@ GitHub repository: https://github.com/dvgyl/rcmake
 
 ## 1. Identity, licensing, and safety boundaries
 
-`rcmake` is an independent reimplementation of CMake 4.5.1 written in Rust. No CMake C++ source code is copied or translated, and `rcmake` never invokes an upstream `cmake` binary at runtime. One executable provides `cmake`, `ctest`, and `cpack`. A companion executable, `rcmake-lsp`, provides Language Server Protocol support for `CMakeLists.txt` and `*.cmake` files.
+`rcmake` contains no copied or translated CMake C++ source and never invokes an upstream `cmake` binary at runtime. One executable provides `cmake`, `ctest`, and `cpack`. A companion executable, `rcmake-lsp`, provides Language Server Protocol support for `CMakeLists.txt` and `*.cmake` files.
 
 `rcmake` is not affiliated with Kitware. "CMake" is a trademark of Kitware, Inc.
-
-Safety and dependency facts:
 
 - All 35 workspace crates in `crates/rcmake-*` enforce `#![forbid(unsafe_code)]` and workspace `unsafe_code = "forbid"` in `Cargo.toml`.
 - Workspace Clippy lints reject `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `indexing_slicing`, `string_slice`, `iter_over_hash_type`, and direct `std` filesystem, environment, process, and clock calls inside engine crates.
@@ -29,11 +27,11 @@ Safety and dependency facts:
 
 `rcmake` selects its operating mode from the executable name (`argv[0]`):
 
-- `cmake`, `ctest`, `cpack`: Compatibility mode. Output, diagnostics, flags, and exit codes match CMake 4.5.1, subject only to the documented intentional differences in Section 8. Native `rcmake` flags (such as `--profile` or `--hermetic`) are rejected in compatibility mode.
-- `rcmake`: Native mode. Adds the persistent compiler probe cache, parallel speculative compile probes, incremental configure replay, `rcmake explain`, `--profile`, `--diagnostics=rich`, `--hermetic`, and `--fetch-lock`.
-- `RCMAKE_ORACLE_MODE=1`: Forces compatibility mode even when the binary is invoked as `rcmake`.
+- `cmake`, `ctest`, `cpack`: Compatibility mode. Output, diagnostics, flags, and exit codes match CMake 4.5.1, subject to the differences in Section 8. Native `rcmake` flags (such as `--profile` or `--hermetic`) are rejected in compatibility mode.
+- `rcmake`: Native mode. Enables the persistent compiler probe cache, parallel speculative compile probes, incremental configure replay, `rcmake explain`, `--profile`, `--diagnostics=rich`, `--hermetic`, and `--fetch-lock`.
+- `RCMAKE_ORACLE_MODE=1`: Forces compatibility mode even when invoked as `rcmake`.
 
-## 3. Exact CMake 4.5.1 parity scope
+## 3. CMake 4.5.1 parity scope
 
 ### Command-line tools
 
@@ -63,7 +61,7 @@ Safety and dependency facts:
 - Qt: `AUTOMOC`, `AUTOUIC`, and `AUTORCC`.
 - CUDA (partial): One end-to-end fixture in the ecosystem lane.
 - HIP (partial): Rule wiring only; no HIP toolchain test yet.
-- Swift (unverified): Basic property and compile-rule wiring exists in `rcmake-resolve`, but real Swift toolchain builds are not yet verified in CI or differential suites.
+- Swift (unverified): Basic property and compile-rule wiring in `rcmake-resolve`, but Swift toolchain builds are not yet verified in CI or differential suites.
 
 ### Specifications and interfaces
 
@@ -75,20 +73,18 @@ Safety and dependency facts:
 - Instrumentation API v1 (data v1.2): queries, snippets, index files, hooks, and trace output.
 - Diagnostics via `cmake_diagnostic()` and SARIF 2.1.0 (`--sarif-output`).
 - `compile_commands.json` export, `install(EXPORT)`, and `GNUInstallDirs`.
-- Package managers: Works with existing `vcpkg` toolchain files, Conan fixtures, `find_package()`, and `FetchContent`.
+- Package managers: `vcpkg` toolchain files, Conan fixtures, `find_package()`, and `FetchContent`.
 
-## 4. Native extensions and performance mechanisms
-
-The extensions below apply when the binary runs as `rcmake` (native mode).
+## 4. Native extensions (`rcmake` mode)
 
 ### Persistent compiler probe cache
 
-Compiler checks (`try_compile`, `check_c_source_compiles`, `check_include_file`, `check_symbol_exists`) often dominate configure wall time. `rcmake` caches verified probe results in a content-addressed store (`rcmake-store`) shared across build directories and projects.
+Caches verified compiler checks (`try_compile`, `check_c_source_compiles`, `check_include_file`, `check_symbol_exists`) in a content-addressed store (`rcmake-store`) shared across build directories and projects.
 
 - Every probe runs under `JournalHost`, which records all file reads, compiler search directories, depfiles, environment reads, and child processes.
 - If a probe touches unverified state, the journal marks an `ImpureReason` (`ExternalWrite`, `SharedState`, `NondeterministicInput`, `UnverifiedProcess`, `ChangedInput`, or `JournalLimit`) and refuses to store the entry.
 - The probe key covers the probe recipe, toolchain, and child process environment. At lookup, every recorded input file is verified by SHA-256 content digest, including the compiler executable itself (so an in-place compiler upgrade causes a miss), clang configuration files (`clang.cfg`, `<triple>.cfg`), and the GCC `specs` file.
-- The cache skips publication when environment variables that change compiler behavior in unmodeled ways are set (for example `CCC_OVERRIDE_OPTIONS`, `COMPILER_PATH`, `GCC_EXEC_PREFIX`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, and `DYLD_*`).
+- Publication is skipped when environment variables that alter compiler behavior in unmodeled ways are set (for example `CCC_OVERRIDE_OPTIONS`, `COMPILER_PATH`, `GCC_EXEC_PREFIX`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, and `DYLD_*`).
 - Control modes via `RCMAKE_PROBE_CACHE`: `readwrite` (default), `readonly`, `verify` (compares each hit against a fresh probe and uses the fresh result; recommended for CI and release builds), or `off`. `RCMAKE_NO_PROBE_CACHE=1` or `--no-probe-cache` disables the cache.
 - Default cache roots: `~/Library/Caches/rcmake` on macOS, `$XDG_CACHE_HOME/rcmake` or `~/.cache/rcmake` on Linux, and `%LOCALAPPDATA%\rcmake\cache` on Windows. Override with `RCMAKE_CACHE_DIR` or `RCMAKE_PROBE_CACHE_DIR`. Default size limit is 2 GiB (`RCMAKE_CACHE_MAX_SIZE`).
 - Optional remote cache supports HTTPS endpoints (`RCMAKE_CACHE_REMOTE`) with `anonymous`, `bearer`, `header`, or `s3` authentication (`RCMAKE_CACHE_REMOTE_AUTH`), explicit opt-in for uploads (`RCMAKE_CACHE_REMOTE_WRITE=1` and `RCMAKE_CACHE_REMOTE_EXPORT_CAPTURED_OUTPUT=1`), and offline mode (`RCMAKE_OFFLINE=1`).
@@ -106,15 +102,13 @@ By default, `rcmake` runs up to `min(4, logical CPUs)` probes in parallel (`RCMA
 
 When reconfiguring an existing build tree after editing a file, `rcmake` re-executes edited directory regions and replays unchanged subtrees from the prior configure snapshot.
 
-- A region replays only when its entry context (executable identity, policy and diagnostic state, configure options, generator, toolchain) and all recorded inputs match. Its recorded variable, cache, and property changes are reapplied in original order.
+- A region replays only when its entry context (executable identity, policy and diagnostic state, configure options, generator, toolchain) and all recorded inputs match. Recorded variable, cache, and property changes are reapplied in original order.
 - Any operation without a replay contract (unverified subprocess, clock or random read, unrecorded state mutation) invalidates replay for that region.
-- Replay is disabled for the entire invocation when any of these are active: a toolchain file (`--toolchain` or `CMAKE_TOOLCHAIN_FILE`, including the `vcpkg` toolchain integration), a configure preset, `-C`, `PreLoad.cmake`, `--fresh`, trace options, `--profile` or `RCMAKE_PROFILE`, `--hermetic`, `RCMAKE_PROBE_CACHE=verify`, `RCMAKE_NO_INCREMENTAL=1`, `--check-system-vars`, `--log-context`, `--debug-output`, or `--debug-find*`.
+- Replay is disabled for the invocation when any of these are active: a toolchain file (`--toolchain` or `CMAKE_TOOLCHAIN_FILE`, including `vcpkg`), a configure preset, `-C`, `PreLoad.cmake`, `--fresh`, trace options, `--profile` or `RCMAKE_PROFILE`, `--hermetic`, `RCMAKE_PROBE_CACHE=verify`, `RCMAKE_NO_INCREMENTAL=1`, `--check-system-vars`, `--log-context`, `--debug-output`, or `--debug-find*`.
 
 ### Provenance queries (`rcmake explain`)
 
-`rcmake explain <NAME> -B <build>` inspects where a target gets each compile option, definition, include directory, and link library (including transitive `INTERFACE` and `PUBLIC` usage chains), or where a variable gets its value across files, macros, functions, cache entries, and `-D` command-line arguments.
-
-Examples:
+`rcmake explain <NAME> -B <build>` traces where a target gets each compile option, definition, include directory, and link library (including transitive `INTERFACE` and `PUBLIC` usage chains), or where a variable gets its value across files, macros, functions, cache entries, and `-D` command-line arguments. Output is terminal text or `rcmake-explain-v1` JSON (`--json`):
 
 ```sh
 rcmake explain app -B build
@@ -122,19 +116,17 @@ rcmake explain CMAKE_CXX_FLAGS -B build
 rcmake explain app -B build --json
 ```
 
-JSON output uses the `rcmake-explain-v1` schema.
-
 ### Configure profiling (`--profile`)
 
 `rcmake -S . -B build -G Ninja --profile[=<dir>]` (or `RCMAKE_PROFILE=<dir>`) writes `trace.json`, `stacks.folded`, and a self-contained `flamegraph.html` into a new `run-<id>` subdirectory under `<dir>` (default: `<build>/rcmake-profile`). A `current` file in `<dir>` records the latest run directory name.
 
 ### Rich diagnostics (`--diagnostics=rich`)
 
-In native mode, `--diagnostics=rich` (the default when stderr is a terminal, or controlled via `RCMAKE_DIAGNOSTICS=cmake|rich`) renders source spans, line gutters, and help annotations. Compatibility mode always emits CMake 4.5.1 diagnostic text.
+In native mode, `--diagnostics=rich` (default when stderr is a terminal, or set via `RCMAKE_DIAGNOSTICS=cmake|rich`) renders source spans, line gutters, and help annotations. Compatibility mode always emits CMake 4.5.1 diagnostic text.
 
 ### Hermetic configure auditing (`--hermetic`)
 
-`--hermetic=warn` reports undeclared environment reads, file reads outside allowed roots, subprocess spawns, and network access during configure. `--hermetic=strict` rejects them with a non-zero exit code. Allowlists can be configured through `RCMAKE_HERMETIC_ALLOW_ENV`, `RCMAKE_HERMETIC_ALLOW_PATHS`, and `RCMAKE_HERMETIC_ALLOW_PROGRAMS`.
+`--hermetic=warn` reports undeclared environment reads, file reads outside allowed roots, subprocess spawns, and network access during configure. `--hermetic=strict` rejects them with a non-zero exit code. Allowlists use `RCMAKE_HERMETIC_ALLOW_ENV`, `RCMAKE_HERMETIC_ALLOW_PATHS`, and `RCMAKE_HERMETIC_ALLOW_PROGRAMS`.
 
 ### FetchContent lockfiles and prefetch (`--fetch-lock`)
 
@@ -142,7 +134,7 @@ In native mode, `--diagnostics=rich` (the default when stderr is a terminal, or 
 
 ## 5. Architecture across 35 crates and the `Host` trait
 
-`rcmake` is structured as an acyclic graph of 35 workspace crates mirroring CMake's four stages:
+`rcmake` is an acyclic graph of 35 workspace crates mirroring CMake's four stages:
 
 1. **Command line (`rcmake-cli`, `rcmake-presets`):** `argv[0]` dispatch, CLI parsing, Presets v13 loading, `Host` creation.
 2. **Configure (`rcmake-syntax`, `rcmake-regex`, `rcmake-expr`, `rcmake-eval`, `rcmake-commands`, `rcmake-model`):** Raw-byte listfile parsing, independent KWSys regex engine (`rcmake-regex`, not the Rust `regex` crate), variable and `if()` evaluation, scope/policy/diagnostic handling, built-in commands, and arena-based `ProjectModel` with backtraces.
@@ -154,7 +146,7 @@ In native mode, `--diagnostics=rich` (the default when stderr is a terminal, or 
 
 All engine crates access files, environment variables, child processes, and clocks exclusively through `Arc<dyn Host>` (`Send + Sync`), using absolute paths without mutating process working directory or process environment (`NativeHost` snapshots the environment once and passes overlays to child processes without calling `std::env::set_var`).
 
-Two implementations pass the shared `rcmake_host::conformance::run_all` suite:
+Two implementations pass `rcmake_host::conformance::run_all`:
 
 - `NativeHost`: Real OS backend (`rustix` on Unix, job objects on Windows for process groups and timeouts).
 - `PureHost`: In-memory virtual filesystem with symlinks, virtual timestamps, scripted subprocesses, and ordered output logs.
@@ -170,20 +162,20 @@ Installed alongside `rcmake` by release archives and `scripts/install.sh`, or bu
 - Transport: LSP over standard input and output, taking no CLI arguments.
 - Capabilities: hover (showing evaluated variables, targets, and per-configuration generator expressions when built with `eval`), completion, go to definition, document symbols, semantic tokens, and indentation formatting.
 - Evaluates unsaved editor buffers in memory via a read/write `Host` overlay with subprocesses denied.
-- Editor setup guides exist in `crates/rcmake-lsp/README.md` for VS Code (Generic LSP Client), Neovim 0.11+ and `nvim-lspconfig`, Helix, Zed, Emacs (Eglot), and CLion / JetBrains IDEs (LSP4IJ).
+- Editor setup guides in `crates/rcmake-lsp/README.md` cover VS Code (Generic LSP Client), Neovim 0.11+ and `nvim-lspconfig`, Helix, Zed, Emacs (Eglot), and CLion / JetBrains IDEs (LSP4IJ).
 
 ### `rcmake-api`
 
-Embeds configure (`run_configure`), `WorkspaceIndex`, provenance tracking, and `explain` (`ExplainQuery`, `render_explain_terminal`, `render_explain_json`) directly in Rust applications. Crates are consumed as Git dependencies from `https://github.com/dvgyl/rcmake` (not published on crates.io).
+Embeds configure (`run_configure`), `WorkspaceIndex`, provenance tracking, and `explain` (`ExplainQuery`, `render_explain_terminal`, `render_explain_json`) in Rust applications. Consumed as Git dependencies from `https://github.com/dvgyl/rcmake` (not published on crates.io).
 
-- Default features `native` (`rcmake-store`, `rcmake-fetch`) and `archive` (`rcmake-archive` and native codecs) can be disabled with `default-features = false` to compile cleanly for `wasm32-unknown-unknown` and `wasm32-wasip1` with zero native C dependencies.
+- Default features `native` (`rcmake-store`, `rcmake-fetch`) and `archive` (`rcmake-archive` and native codecs) can be disabled with `default-features = false` to compile for `wasm32-unknown-unknown` and `wasm32-wasip1` with zero native C dependencies.
 
 ### Browser WebAssembly playground
 
 Hosted at `https://dvgyl.github.io/rcmake/playground.html`, the playground runs `crates/rcmake-wasm` compiled via `scripts/build-wasm.sh` into `site/wasm/rcmake_wasm.wasm` (`wasm32-wasip1` command module, zero `unsafe` code, zero `wasm-bindgen`) with a minimal in-browser WASI shim and no backend server.
 
-- Configures arbitrary edited `CMakeLists.txt` and `CMakePresets.json` files on `PureHost`.
-- Generates live `Ninja` and `Ninja Multi-Config` build files (`build.ninja`, `build-<Config>.ninja`).
+- Configures edited `CMakeLists.txt` and `CMakePresets.json` files on `PureHost`.
+- Generates `Ninja` and `Ninja Multi-Config` build files (`build.ninja`, `build-<Config>.ninja`).
 - Displays resolved targets, diagnostics with clickable source locations, and interactive `rcmake explain` provenance trees.
 
 ## 7. Installation, drop-in aliasing, upgrade, and uninstall
@@ -195,7 +187,7 @@ Prebuilt GitHub Releases archives target:
 - `aarch64-unknown-linux-gnu`
 - `x86_64-pc-windows-msvc`
 
-Intel macOS (`x86_64-apple-darwin`) has no prebuilt archive; build from source with `scripts/install.sh --from-source`.
+Intel macOS (`x86_64-apple-darwin`) builds from source with `scripts/install.sh --from-source`.
 
 ### Linux and macOS
 
@@ -212,7 +204,7 @@ curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.s
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Supported `install.sh` flags: `--version <v>`, `--from-source`, `--archive <path>`, `--alias-cmake`, `--force`, `--uninstall`. Release archives and `SHA256SUMS.txt` also include GitHub build provenance attestations verifiable via:
+Supported `install.sh` flags: `--version <v>`, `--from-source`, `--archive <path>`, `--alias-cmake`, `--force`, `--uninstall`. Release archives and `SHA256SUMS.txt` include GitHub build provenance attestations verifiable via:
 
 ```sh
 gh attestation verify rcmake-<version>-<target>.tar.gz --repo dvgyl/rcmake
@@ -228,11 +220,11 @@ Install into `%LOCALAPPDATA%\rcmake` (or `-Prefix <dir>`) on PowerShell 5.1 or P
 irm https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.ps1 | iex
 ```
 
-To pass `-AliasCmake`, `-Prefix`, `-Archive`, `-Version`, `-Force`, or `-Uninstall`, download `install.ps1` and run `.\install.ps1 -AliasCmake`. Manual extraction of the Windows `.zip` archive from GitHub Releases includes `cmake.exe`, `ctest.exe`, `cpack.exe`, `rcmake.exe`, and `rcmake-lsp.exe` in `bin\` next to `share\cmake-4.5\`.
+To pass `-AliasCmake`, `-Prefix`, `-Archive`, `-Version`, `-Force`, or `-Uninstall`, download `install.ps1` and run `.\install.ps1 -AliasCmake`. The Windows `.zip` release archive includes `cmake.exe`, `ctest.exe`, `cpack.exe`, `rcmake.exe`, and `rcmake-lsp.exe` in `bin\` next to `share\cmake-4.5\`.
 
 ### Building from source
 
-Requires the Rust toolchain pinned in `rust-toolchain.toml` (Rust 1.99.1) and Python 3:
+Requires Rust 1.99.1 (pinned in `rust-toolchain.toml`) and Python 3:
 
 ```sh
 git clone https://github.com/dvgyl/rcmake.git
@@ -249,13 +241,13 @@ RCMAKE_STAGE_PROFILE=release scripts/stage.sh
 
 ### Uninstall
 
-Run `install.sh --uninstall` with the same `PREFIX` (or remove the extracted Windows directory and PATH entry). Uninstall does not delete cached probes or FetchContent mirrors; remove the cache directory (`~/Library/Caches/rcmake`, `$XDG_CACHE_HOME/rcmake` or `~/.cache/rcmake`, or `%LOCALAPPDATA%\rcmake\cache`) to reclaim space.
+Run `install.sh --uninstall` with the same `PREFIX` (or remove the extracted Windows directory and PATH entry). Uninstall leaves cached probes and FetchContent mirrors intact; delete the cache directory (`~/Library/Caches/rcmake`, `$XDG_CACHE_HOME/rcmake` or `~/.cache/rcmake`, or `%LOCALAPPDATA%\rcmake\cache`) to reclaim space.
 
 ## 8. Intentional differences, scope limits, and troubleshooting
 
-Use upstream CMake 4.5.1 if your workflow depends on any of these omitted or different behaviors:
+Omitted features and intentional differences from CMake 4.5.1:
 
-1. **Reproducible `tar` archives:** `cmake -E tar` and CPack archive generators write uid 0 and gid 0 instead of copying host user and group IDs.
+1. **Reproducible `tar` archives:** `cmake -E tar` and CPack archive generators write uid 0 and gid 0 instead of host user and group IDs.
 2. **No interactive front ends:** `cmake-gui` and `ccmake` are not implemented (`edit_cache` prints `No interactive CMake dialog available.`).
 3. **No DAP debugger:** `cmake --debugger` prints `CMake was not built with support for --debugger`, and `cmake -E capabilities` omits `debugger`.
 4. **No legacy extra generators:** CodeBlocks, CodeLite, Eclipse CDT4, Kate, and Sublime Text 2 are omitted (`extraGenerators` is empty).
@@ -290,32 +282,32 @@ Use upstream CMake 4.5.1 if your workflow depends on any of these omitted or dif
 
 ### Current verification status (`0.1.0`)
 
-`rcmake` does not publish estimated or unmeasured numbers. All frozen release scorecard numbers populate `site/data/latest.json` and `https://dvgyl.github.io/rcmake/dashboard.html` mechanically from one frozen `v0.1.0` release verification run. Recorded pre-freeze baselines currently on disk:
+Frozen `v0.1.0` scorecard numbers populate `site/data/latest.json` and `https://dvgyl.github.io/rcmake/dashboard.html` from the release verification run. Recorded pre-freeze baselines:
 
 - 3-OS CI (`ubuntu-24.04`, `macos-15`, `windows-2025`) and corpus smoke: 6 of 6 jobs green pre-freeze.
 - Seeded generative fuzzing: 14,000,000 inputs across 14 targets, 0 failures (commit `d4356df`, `2026-11-25`).
 - WebAssembly and WASI checks (`wasm32-unknown-unknown` and `wasm32-wasip1`): 6 of 6 checks passed (commit `c583dc2`, `2026-11-25`).
 
-Benchmark methodology (published after the frozen idle release run):
+Benchmark methodology:
 
-- Cold configure (`tools/measure/bench_eval.py`): Synthetic 500-library C project, new build tree, empty private probe store, inherited `RCMAKE_*` variables cleared, median of N runs (with `--probe-jobs 1` available to isolate serial probes).
+- Cold configure (`tools/measure/bench_eval.py`): Synthetic 500-library C project, new build tree, empty private probe store, inherited `RCMAKE_*` variables cleared, median of N runs (`--probe-jobs 1` isolates serial probes).
 - New build tree with shared probe cache (`tools/measure/bench_configure.py`, `tools/measure/bench_giants.py`): Geometric mean speedup over CMake 4.5.1 in a new build tree (CMake has no cross-tree probe cache; `bench_eval.py` also reports same-tree rerun times where CMake skips cached checks).
 - Leaf edit reconfigure: p95 wall time after editing one file (default edit changes no targets; `--leaf-edit compile-definition` adds a compile definition to the edited directory).
 
-## 10. Direct answers to common developer questions
+## 10. Common questions
 
 ### What is a faster drop-in CMake replacement written in Rust?
 
-`rcmake` is an independent drop-in reimplementation of CMake 4.5.1 in safe Rust. It reads existing `CMakeLists.txt` files, Presets v13, and caches without requiring a migration to a new build language, and accelerates configures in native mode using a verified cross-project compiler probe cache, parallel speculative compile probes, and incremental configure replay.
+`rcmake` is an independent drop-in reimplementation of CMake 4.5.1 in safe Rust. It reads existing `CMakeLists.txt` files, Presets v13, and caches without migrating to a new build language, and accelerates configures in native mode using a verified cross-project compiler probe cache, parallel speculative compile probes, and incremental configure replay.
 
 ### Does rcmake work with existing CMakeLists.txt, Ninja, Xcode, Visual Studio, vcpkg, and Conan?
 
-Yes. `rcmake` runs existing `CMakeLists.txt` files and bundles the CMake 4.5.1 standard `Modules/` and `Templates/`. It generates `Ninja`, `Ninja Multi-Config`, `Unix Makefiles`, `Xcode` (macOS), and `Visual Studio 17 2022` and `18 2026` (Windows) build trees, and supports `vcpkg` toolchain files and Conan fixtures (note that incremental replay disables itself when a toolchain file such as `vcpkg` is active, while compatibility configure and the probe cache continue to work).
+Yes. `rcmake` runs existing `CMakeLists.txt` files and bundles the CMake 4.5.1 standard `Modules/` and `Templates/`. It generates `Ninja`, `Ninja Multi-Config`, `Unix Makefiles`, `Xcode` (macOS), and `Visual Studio 17 2022` and `18 2026` (Windows) build trees, and supports `vcpkg` toolchain files and Conan fixtures. Incremental replay disables itself when a toolchain file such as `vcpkg` is active, while compatibility configure and the probe cache continue to work.
 
 ### How do I verify whether rcmake matches CMake 4.5.1 on my project?
 
-Install `rcmake`, run your build with `RCMAKE_ORACLE_MODE=1` or via the `cmake` alias to stay in strict CMake 4.5.1 compatibility mode, and compare the generated `CMakeCache.txt`, Ninja commands, or File API replies. For CI and release builds using native mode, set `RCMAKE_PROBE_CACHE=verify` to check every probe cache hit against a fresh probe.
+Install `rcmake`, run your build with `RCMAKE_ORACLE_MODE=1` or via the `cmake` alias for strict CMake 4.5.1 compatibility mode, and compare the generated `CMakeCache.txt`, Ninja commands, or File API replies. For CI and release builds in native mode, set `RCMAKE_PROBE_CACHE=verify` to check every probe cache hit against a fresh probe.
 
 ### Can I run CMake in WebAssembly or in a browser?
 
-Yes. `rcmake-api` with `default-features = false` compiles for `wasm32-unknown-unknown` and `wasm32-wasip1` on the in-memory `PureHost`. The live browser playground at `https://dvgyl.github.io/rcmake/playground.html` runs the compiled `rcmake_wasm.wasm` engine client-side to configure projects, generate `build.ninja`, report diagnostics, and run `rcmake explain`.
+Yes. `rcmake-api` with `default-features = false` compiles for `wasm32-unknown-unknown` and `wasm32-wasip1` on the in-memory `PureHost`. The browser playground at `https://dvgyl.github.io/rcmake/playground.html` runs `rcmake_wasm.wasm` client-side to configure projects, generate `build.ninja`, report diagnostics, and run `rcmake explain`.
