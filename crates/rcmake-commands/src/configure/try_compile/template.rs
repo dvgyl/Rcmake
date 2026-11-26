@@ -6,14 +6,14 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
 use rcmake_host::{Host, path};
+use rcmake_json::{FieldError, FromJson, ToJson, Value, array_bounded, deny_unknown, object, req};
 use rcmake_store::{Digest, Domain, KeyHasher};
-use serde::{Deserialize, Serialize};
 
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 32 * 1024;
 const MAX_BINDING_BYTES: usize = 32 * 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Token {
     Scratch,
     Build,
@@ -32,6 +32,57 @@ enum Token {
     AlternateBuild,
     AlternateSource,
     AlternateCmakeRoot,
+}
+
+impl ToJson for Token {
+    fn to_json(&self) -> Value {
+        Value::string(match self {
+            Self::Scratch => "Scratch",
+            Self::Build => "Build",
+            Self::Source => "Source",
+            Self::CmakeRoot => "CmakeRoot",
+            Self::NativeScratch => "NativeScratch",
+            Self::NativeBuild => "NativeBuild",
+            Self::NativeSource => "NativeSource",
+            Self::NativeCmakeRoot => "NativeCmakeRoot",
+            Self::Target => "Target",
+            Self::CanonicalScratch => "CanonicalScratch",
+            Self::CanonicalBuild => "CanonicalBuild",
+            Self::CanonicalSource => "CanonicalSource",
+            Self::CanonicalCmakeRoot => "CanonicalCmakeRoot",
+            Self::AlternateScratch => "AlternateScratch",
+            Self::AlternateBuild => "AlternateBuild",
+            Self::AlternateSource => "AlternateSource",
+            Self::AlternateCmakeRoot => "AlternateCmakeRoot",
+        })
+    }
+}
+
+impl FromJson for Token {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        match rcmake_json::str(value)? {
+            "Scratch" => Ok(Self::Scratch),
+            "Build" => Ok(Self::Build),
+            "Source" => Ok(Self::Source),
+            "CmakeRoot" => Ok(Self::CmakeRoot),
+            "NativeScratch" => Ok(Self::NativeScratch),
+            "NativeBuild" => Ok(Self::NativeBuild),
+            "NativeSource" => Ok(Self::NativeSource),
+            "NativeCmakeRoot" => Ok(Self::NativeCmakeRoot),
+            "Target" => Ok(Self::Target),
+            "CanonicalScratch" => Ok(Self::CanonicalScratch),
+            "CanonicalBuild" => Ok(Self::CanonicalBuild),
+            "CanonicalSource" => Ok(Self::CanonicalSource),
+            "CanonicalCmakeRoot" => Ok(Self::CanonicalCmakeRoot),
+            "AlternateScratch" => Ok(Self::AlternateScratch),
+            "AlternateBuild" => Ok(Self::AlternateBuild),
+            "AlternateSource" => Ok(Self::AlternateSource),
+            "AlternateCmakeRoot" => Ok(Self::AlternateCmakeRoot),
+            other => Err(FieldError::invalid(format!(
+                "unknown template token '{other}'"
+            ))),
+        }
+    }
 }
 
 impl Token {
@@ -290,7 +341,7 @@ fn valid_binding(path: &Path) -> bool {
         && path::to_native(&bytes) == path
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Encoding {
     Raw,
     Forward,
@@ -299,6 +350,37 @@ enum Encoding {
     UpperDrive,
     Escaped,
     Quoted,
+}
+
+impl ToJson for Encoding {
+    fn to_json(&self) -> Value {
+        Value::string(match self {
+            Self::Raw => "Raw",
+            Self::Forward => "Forward",
+            Self::Backslash => "Backslash",
+            Self::LowerDrive => "LowerDrive",
+            Self::UpperDrive => "UpperDrive",
+            Self::Escaped => "Escaped",
+            Self::Quoted => "Quoted",
+        })
+    }
+}
+
+impl FromJson for Encoding {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        match rcmake_json::str(value)? {
+            "Raw" => Ok(Self::Raw),
+            "Forward" => Ok(Self::Forward),
+            "Backslash" => Ok(Self::Backslash),
+            "LowerDrive" => Ok(Self::LowerDrive),
+            "UpperDrive" => Ok(Self::UpperDrive),
+            "Escaped" => Ok(Self::Escaped),
+            "Quoted" => Ok(Self::Quoted),
+            other => Err(FieldError::invalid(format!(
+                "unknown template encoding '{other}'"
+            ))),
+        }
+    }
 }
 
 impl Encoding {
@@ -341,11 +423,33 @@ impl Encoding {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Binding {
     token: Token,
     encodings: Vec<Encoding>,
     raw_special: Vec<u8>,
+}
+
+impl ToJson for Binding {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("token", self.token.to_json()),
+            ("encodings", self.encodings.to_json()),
+            ("raw_special", self.raw_special.to_json()),
+        ])
+    }
+}
+
+impl FromJson for Binding {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["token", "encodings", "raw_special"])?;
+        Ok(Self {
+            token: req(obj, "token")?,
+            encodings: req(obj, "encodings")?,
+            raw_special: req(obj, "raw_special")?,
+        })
+    }
 }
 
 impl Binding {
@@ -489,15 +593,64 @@ fn boundary(
         })
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Segment {
     Literal(Vec<u8>),
     Binding(Vec<Binding>),
 }
 
+impl ToJson for Segment {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Literal(bytes) => Value::object_from([("Literal", bytes.to_json())]),
+            Self::Binding(bindings) => Value::object_from([("Binding", bindings.to_json())]),
+        }
+    }
+}
+
+impl FromJson for Segment {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        let mut iter = obj.iter();
+        let Some((tag, payload)) = iter.next() else {
+            return Err(FieldError::invalid("expected template segment variant"));
+        };
+        if iter.next().is_some() {
+            return Err(FieldError::invalid(
+                "expected single-key template segment object",
+            ));
+        }
+        let tag = core::str::from_utf8(tag.as_slice())
+            .map_err(|_| FieldError::invalid("template segment variant is not valid UTF-8"))?;
+        match tag {
+            "Literal" => Vec::<u8>::from_json(payload)
+                .map(Self::Literal)
+                .map_err(|err| err.in_field("Literal")),
+            "Binding" => Vec::<Binding>::from_json(payload)
+                .map(Self::Binding)
+                .map_err(|err| err.in_field("Binding")),
+            other => Err(FieldError::invalid(format!(
+                "unknown template segment '{other}'"
+            ))),
+        }
+    }
+}
+
 /// Probe bytes with typed substitutions. Literal marker text remains literal.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Templated(Vec<Segment>);
+
+impl ToJson for Templated {
+    fn to_json(&self) -> Value {
+        self.0.to_json()
+    }
+}
+
+impl FromJson for Templated {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        array_bounded(value, MAX_SEGMENTS).map(Self)
+    }
+}
 
 /// Reuse the path spellings when capturing several values for one probe.
 pub(crate) struct TemplateCapture<'a> {
@@ -805,6 +958,31 @@ mod tests {
         let new = bindings(Path::new("/new")).ok_or("Missing new bindings.")?;
         let template = Templated::capture(b"/old/work", &old).ok_or("Cannot capture output.")?;
         assert_eq!(template.render(&new), None);
+        Ok(())
+    }
+
+    #[test]
+    fn templated_json_round_trips_and_rejects_unknown_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let old = bindings(Path::new("/old")).ok_or("Missing original bindings.")?;
+        let original = b"\xff /old/build/scratch/cmTC_1 /old/source";
+        let template = Templated::capture(original, &old).ok_or("Cannot capture output.")?;
+        let encoded = rcmake_json::write_compact(&template.to_json());
+        let parsed = rcmake_json::parse(
+            encoded.as_slice(),
+            &rcmake_json::ReadOptions {
+                allow_comments: false,
+                dup_keys_last_wins: false,
+            },
+        )?;
+        assert_eq!(Templated::from_json(&parsed)?, template);
+        assert!(
+            Templated::from_json(&Value::array_from([Value::object_from([(
+                "Unknown",
+                Value::Array(Vec::new()),
+            )])]))
+            .is_err()
+        );
         Ok(())
     }
 }

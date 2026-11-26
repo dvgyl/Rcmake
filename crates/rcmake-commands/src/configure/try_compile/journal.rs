@@ -17,11 +17,11 @@ use rcmake_host::{
     HostError, HostResult, Input, Metadata, Output, ProcessResult, ReadRange, RunOutput,
     RunRequest, Stream, SystemInfo, WriteMode, path,
 };
+use rcmake_json::{FieldError, FromJson, ToJson, Value, deny_unknown, object, req};
 use rcmake_store::{
     Digest, Domain, InputStamp, KeyHasher, Trace, TraceMemo, TreePolicy, VerifyOutcome,
     directory_digest, file_digest, verify_trace,
 };
-use serde::{Deserialize, Serialize};
 
 use super::plan::{process_environment_fingerprint, request_digest};
 use host_impl::SharedOrBorrowed;
@@ -192,13 +192,33 @@ impl From<&InputStamp> for StampKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Slice {
     offset: u64,
     len: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+impl ToJson for Slice {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("offset", self.offset.to_json()),
+            ("len", self.len.to_json()),
+        ])
+    }
+}
+
+impl FromJson for Slice {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["offset", "len"])?;
+        Ok(Self {
+            offset: req(obj, "offset")?,
+            len: req(obj, "len")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Check {
     Metadata(PathBuf, bool),
     Slice(PathBuf, Slice),
@@ -213,6 +233,161 @@ enum Check {
     WorkingDirectory,
     System,
     Request(u32),
+}
+
+impl ToJson for Check {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Metadata(path, follow) => Value::object_from([(
+                "Metadata",
+                Value::array_from([path_to_json(path), follow.to_json()]),
+            )]),
+            Self::Slice(path, range) => Value::object_from([(
+                "Slice",
+                Value::array_from([path_to_json(path), range.to_json()]),
+            )]),
+            Self::Chunks(path) => Value::object_from([("Chunks", path_to_json(path))]),
+            Self::DirectoryOrder(path) => {
+                Value::object_from([("DirectoryOrder", path_to_json(path))])
+            }
+            Self::OrderedDirectoryMissing(path) => {
+                Value::object_from([("OrderedDirectoryMissing", path_to_json(path))])
+            }
+            Self::FollowMissing(path) => {
+                Value::object_from([("FollowMissing", path_to_json(path))])
+            }
+            Self::Link(path) => Value::object_from([("Link", path_to_json(path))]),
+            Self::Canonical(path) => Value::object_from([("Canonical", path_to_json(path))]),
+            Self::Environment => Value::string("Environment"),
+            Self::Executable => Value::string("Executable"),
+            Self::WorkingDirectory => Value::string("WorkingDirectory"),
+            Self::System => Value::string("System"),
+            Self::Request(index) => Value::object_from([("Request", index.to_json())]),
+        }
+    }
+}
+
+impl FromJson for Check {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        match value {
+            Value::String(_) => match rcmake_json::str(value)? {
+                "Environment" => Ok(Self::Environment),
+                "Executable" => Ok(Self::Executable),
+                "WorkingDirectory" => Ok(Self::WorkingDirectory),
+                "System" => Ok(Self::System),
+                other => Err(FieldError::invalid(format!(
+                    "unknown journal check '{other}'"
+                ))),
+            },
+            Value::Object(obj) => {
+                let mut iter = obj.iter();
+                let Some((tag, payload)) = iter.next() else {
+                    return Err(FieldError::invalid("expected journal check variant"));
+                };
+                if iter.next().is_some() {
+                    return Err(FieldError::invalid(
+                        "expected single-key journal check object",
+                    ));
+                }
+                let tag = core::str::from_utf8(tag.as_slice())
+                    .map_err(|_| FieldError::invalid("journal check variant is not valid UTF-8"))?;
+                match tag {
+                    "Metadata" => {
+                        let [path, follow] =
+                            array_pair(payload).map_err(|err| err.in_field("Metadata"))?;
+                        Ok(Self::Metadata(
+                            path_from_json(path).map_err(|err| err.in_field("Metadata"))?,
+                            rcmake_json::bool(follow).map_err(|err| err.in_field("Metadata"))?,
+                        ))
+                    }
+                    "Slice" => {
+                        let [path, range] =
+                            array_pair(payload).map_err(|err| err.in_field("Slice"))?;
+                        Ok(Self::Slice(
+                            path_from_json(path).map_err(|err| err.in_field("Slice"))?,
+                            Slice::from_json(range).map_err(|err| err.in_field("Slice"))?,
+                        ))
+                    }
+                    "Chunks" => path_from_json(payload)
+                        .map(Self::Chunks)
+                        .map_err(|err| err.in_field("Chunks")),
+                    "DirectoryOrder" => path_from_json(payload)
+                        .map(Self::DirectoryOrder)
+                        .map_err(|err| err.in_field("DirectoryOrder")),
+                    "OrderedDirectoryMissing" => path_from_json(payload)
+                        .map(Self::OrderedDirectoryMissing)
+                        .map_err(|err| err.in_field("OrderedDirectoryMissing")),
+                    "FollowMissing" => path_from_json(payload)
+                        .map(Self::FollowMissing)
+                        .map_err(|err| err.in_field("FollowMissing")),
+                    "Link" => path_from_json(payload)
+                        .map(Self::Link)
+                        .map_err(|err| err.in_field("Link")),
+                    "Canonical" => path_from_json(payload)
+                        .map(Self::Canonical)
+                        .map_err(|err| err.in_field("Canonical")),
+                    "Request" => u32::from_json(payload)
+                        .map(Self::Request)
+                        .map_err(|err| err.in_field("Request")),
+                    other => Err(FieldError::invalid(format!(
+                        "unknown journal check '{other}'"
+                    ))),
+                }
+            }
+            _ => Err(FieldError::expected("string or object", value)),
+        }
+    }
+}
+
+fn array_pair(value: &Value) -> Result<&[Value; 2], FieldError> {
+    let items = rcmake_json::array(value)?;
+    items.try_into().map_err(|_| {
+        FieldError::invalid(format!("expected 2-element array, found {}", items.len()))
+    })
+}
+
+fn path_to_json(path: &Path) -> Value {
+    if let Some(text) = path.to_str() {
+        return Value::string(text);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Value::object_from([("unix_bytes", path.as_os_str().as_bytes().to_json())])
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        Value::object_from([("windows_wide", wide.to_json())])
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Value::string(path.to_string_lossy().as_ref())
+    }
+}
+
+fn path_from_json(value: &Value) -> Result<PathBuf, FieldError> {
+    match value {
+        Value::String(_) => rcmake_json::str(value).map(PathBuf::from),
+        #[cfg(unix)]
+        Value::Object(obj) => {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            deny_unknown(obj, &["unix_bytes"])?;
+            let bytes: Vec<u8> = req(obj, "unix_bytes")?;
+            Ok(PathBuf::from(OsString::from_vec(bytes)))
+        }
+        #[cfg(windows)]
+        Value::Object(obj) => {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            deny_unknown(obj, &["windows_wide"])?;
+            let wide: Vec<u16> = req(obj, "windows_wide")?;
+            Ok(PathBuf::from(OsString::from_wide(&wide)))
+        }
+        _ => Err(FieldError::expected("string", value)),
+    }
 }
 
 impl Check {
@@ -380,9 +555,39 @@ fn conflicts<K: Ord, V: PartialEq>(map: &mut BTreeMap<K, V>, key: K, value: V) -
 }
 
 /// Exact observations that have no stamp in the shared store format.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct JournalChecks(Vec<(Check, Digest)>);
+
+impl ToJson for JournalChecks {
+    fn to_json(&self) -> Value {
+        Value::array_from(
+            self.0
+                .iter()
+                .map(|(check, digest)| Value::array_from([check.to_json(), digest.to_json()])),
+        )
+    }
+}
+
+impl FromJson for JournalChecks {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let items = rcmake_json::array(value)?;
+        if items.len() > MAX_OBSERVATIONS {
+            return Err(FieldError::invalid(format!(
+                "journal check count {} exceeds limit of {MAX_OBSERVATIONS}",
+                items.len()
+            )));
+        }
+        items
+            .iter()
+            .map(|item| {
+                let [check, digest] = array_pair(item)?;
+                Ok((Check::from_json(check)?, Digest::from_json(digest)?))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
+    }
+}
 
 impl JournalChecks {
     /// Estimate the serialized byte count without allocating a frame.

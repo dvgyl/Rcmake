@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use rcmake_base::BString;
 use rcmake_host::{Input, Output, RunRequest, path};
+use rcmake_json::{FieldError, FromJson, ToJson, Value, deny_unknown, object, req};
 use rcmake_store::{Digest, Domain, KeyHasher, StoreMode};
-use serde::{Deserialize, Serialize};
 
 /// Bindings and byte templates used by a probe recipe.
 pub(crate) use super::template::{PathBindings, Templated};
@@ -323,7 +323,7 @@ pub(crate) fn compute_probe_key(recipe: &ProbeRecipe) -> Digest {
 
 fn recipe_key(recipe: &ProbeRecipe, bind_exact: bool) -> Digest {
     let mut key = KeyHasher::new(Domain::ProbeV1);
-    key.field(1, &4_u16.to_le_bytes());
+    key.field(1, &5_u16.to_le_bytes());
     key.field(2, recipe.rcmake.0.as_bytes());
     key.field(3, recipe.cmake_root.as_bytes());
     key.field(4, recipe.host.as_bytes());
@@ -369,7 +369,7 @@ fn recipe_key(recipe: &ProbeRecipe, bind_exact: bool) -> Digest {
 }
 
 /// Output stream used by a captured diagnostic.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DiagnosticStream {
     /// The standard output stream.
     Stdout,
@@ -377,8 +377,29 @@ pub(crate) enum DiagnosticStream {
     Stderr,
 }
 
+impl ToJson for DiagnosticStream {
+    fn to_json(&self) -> Value {
+        Value::string(match self {
+            Self::Stdout => "Stdout",
+            Self::Stderr => "Stderr",
+        })
+    }
+}
+
+impl FromJson for DiagnosticStream {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        match rcmake_json::str(value)? {
+            "Stdout" => Ok(Self::Stdout),
+            "Stderr" => Ok(Self::Stderr),
+            other => Err(FieldError::invalid(format!(
+                "unknown diagnostic stream '{other}'"
+            ))),
+        }
+    }
+}
+
 /// A rendered diagnostic in the order in which the probe emitted it.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProbeDiagnostic<T> {
     /// The original output stream.
     pub(crate) stream: DiagnosticStream,
@@ -386,8 +407,28 @@ pub(crate) struct ProbeDiagnostic<T> {
     pub(crate) message: T,
 }
 
+impl<T: ToJson> ToJson for ProbeDiagnostic<T> {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("stream", self.stream.to_json()),
+            ("message", self.message.to_json()),
+        ])
+    }
+}
+
+impl<T: FromJson> FromJson for ProbeDiagnostic<T> {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["stream", "message"])?;
+        Ok(Self {
+            stream: req(obj, "stream")?,
+            message: req(obj, "message")?,
+        })
+    }
+}
+
 /// An artifact that the cache can materialize for the current call.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArtifactRef {
     /// Content digest in the blob store.
     pub(crate) blob: Digest,
@@ -397,8 +438,30 @@ pub(crate) struct ArtifactRef {
     pub(crate) mode: u32,
 }
 
+impl ToJson for ArtifactRef {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("blob", self.blob.to_json()),
+            ("relative_path", self.relative_path.to_json()),
+            ("mode", self.mode.to_json()),
+        ])
+    }
+}
+
+impl FromJson for ArtifactRef {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["blob", "relative_path", "mode"])?;
+        Ok(Self {
+            blob: req(obj, "blob")?,
+            relative_path: req(obj, "relative_path")?,
+            mode: req(obj, "mode")?,
+        })
+    }
+}
+
 /// Cached compile outcome. The run phase of `try_run` executes at the call site.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProbeOutcome {
     /// Largest caller depth allowed by all recursion checks during the child configure.
     pub(crate) max_start_depth: u32,
@@ -412,4 +475,42 @@ pub(crate) struct ProbeOutcome {
     pub(crate) artifact: Option<ArtifactRef>,
     /// Ordered rendered diagnostics that the caller can replay.
     pub(crate) diagnostics: Vec<ProbeDiagnostic<Templated>>,
+}
+
+impl ToJson for ProbeOutcome {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("max_start_depth", self.max_start_depth.to_json()),
+            ("compiled", self.compiled.to_json()),
+            ("exit_code", self.exit_code.to_json()),
+            ("output", self.output.to_json()),
+            ("artifact", self.artifact.to_json()),
+            ("diagnostics", self.diagnostics.to_json()),
+        ])
+    }
+}
+
+impl FromJson for ProbeOutcome {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(
+            obj,
+            &[
+                "max_start_depth",
+                "compiled",
+                "exit_code",
+                "output",
+                "artifact",
+                "diagnostics",
+            ],
+        )?;
+        Ok(Self {
+            max_start_depth: req(obj, "max_start_depth")?,
+            compiled: req(obj, "compiled")?,
+            exit_code: req(obj, "exit_code")?,
+            output: req(obj, "output")?,
+            artifact: req(obj, "artifact")?,
+            diagnostics: req(obj, "diagnostics")?,
+        })
+    }
 }

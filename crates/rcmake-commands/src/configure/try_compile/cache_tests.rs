@@ -494,3 +494,74 @@ fn a_store_error_does_not_change_the_probe_result() -> HostResult<()> {
     assert!(outcome.compiled);
     Ok(())
 }
+
+#[test]
+fn cached_probe_json_round_trips_and_rejects_unknown_fields()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_json::{ReadOptions, parse, write_compact};
+
+    let host = PureHost::default();
+    let scratch = Path::new("/work/scratch");
+    host.create_dir_all(scratch)?;
+    let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?.finish();
+    let (_, checks) = journal
+        .verified_inputs(&host)
+        .ok_or("Expected verified empty journal.")?;
+    let blob = Digest::from_bytes([0x44; 32]);
+    let probe = CachedProbe {
+        outcome: ProbeOutcome {
+            max_start_depth: 12,
+            compiled: true,
+            exit_code: 0,
+            output: Templated::literal(b"ok").ok_or("Expected literal template.")?,
+            artifact: Some(ArtifactRef {
+                blob,
+                relative_path: Templated::literal(b"bin/cmTC_1")
+                    .ok_or("Expected relative path template.")?,
+                mode: 0o755,
+            }),
+            diagnostics: vec![
+                ProbeDiagnostic {
+                    stream: DiagnosticStream::Stdout,
+                    message: Templated::literal(b"note").ok_or("Expected stdout template.")?,
+                },
+                ProbeDiagnostic {
+                    stream: DiagnosticStream::Stderr,
+                    message: Templated::literal(b"warn").ok_or("Expected stderr template.")?,
+                },
+            ],
+        },
+        checks: checks.clone(),
+    };
+    let encoded = write_compact(&probe.to_json());
+    let parsed = parse(
+        encoded.as_slice(),
+        &ReadOptions {
+            allow_comments: false,
+            dup_keys_last_wins: false,
+        },
+    )?;
+    assert_eq!(CachedProbe::from_json(&parsed)?, probe);
+
+    let failed = CachedProbe {
+        outcome: ProbeOutcome {
+            max_start_depth: 0,
+            compiled: false,
+            exit_code: 1,
+            output: Templated::literal(b"err").ok_or("Expected error output.")?,
+            artifact: None,
+            diagnostics: Vec::new(),
+        },
+        checks: checks.clone(),
+    };
+    assert_eq!(CachedProbe::from_json(&failed.to_json())?, failed);
+    assert!(
+        CachedProbe::from_json(&Value::object_from([
+            ("outcome", failed.outcome.to_json()),
+            ("checks", failed.checks.to_json()),
+            ("extra", Value::Null),
+        ]))
+        .is_err()
+    );
+    Ok(())
+}

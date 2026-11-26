@@ -5,10 +5,10 @@
 use std::collections::BTreeSet;
 
 #[cfg(test)]
+use rcmake_json::{FieldError, FromJson, ToJson, Value, deny_unknown, object, req};
+#[cfg(test)]
 use rcmake_store::Digest;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
-#[cfg(test)]
-use serde::{Deserialize, Serialize};
 
 const MAX_LOOKAHEAD: usize = 64;
 
@@ -139,7 +139,7 @@ fn valid_result(name: &[u8]) -> bool {
 }
 
 /// One recipe from the previous configure, in call order.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg(test)]
 pub(crate) struct HistoryProbe {
     /// Probe language as bytes.
@@ -148,15 +148,55 @@ pub(crate) struct HistoryProbe {
     pub(crate) recipe: Digest,
 }
 
+#[cfg(test)]
+impl ToJson for HistoryProbe {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("language", self.language.to_json()),
+            ("recipe", self.recipe.to_json()),
+        ])
+    }
+}
+
+#[cfg(test)]
+impl FromJson for HistoryProbe {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["language", "recipe"])?;
+        Ok(Self {
+            language: req(obj, "language")?,
+            recipe: req(obj, "recipe")?,
+        })
+    }
+}
+
 /// Input for the next configure's speculative jobs.
 ///
 /// The evaluator resolves the recipe digest and recomputes the key with the
 /// current toolchain, seed, and arguments before either use or publication.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[cfg(test)]
 pub(crate) struct ProbeHistory {
     /// Previous calls in evaluator order.
     pub(crate) probes: Vec<HistoryProbe>,
+}
+
+#[cfg(test)]
+impl ToJson for ProbeHistory {
+    fn to_json(&self) -> Value {
+        Value::object_from([("probes", self.probes.to_json())])
+    }
+}
+
+#[cfg(test)]
+impl FromJson for ProbeHistory {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["probes"])?;
+        Ok(Self {
+            probes: req(obj, "probes")?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +326,14 @@ check_include_file(errno.h HAVE_ERRNO)"#,
         assert_eq!(
             history.for_language(b"C").collect::<Vec<_>>(),
             [first, last]
+        );
+        assert_eq!(ProbeHistory::from_json(&history.to_json()), Ok(history));
+        assert!(
+            ProbeHistory::from_json(&Value::object_from([
+                ("probes", Value::Array(Vec::new())),
+                ("extra", Value::Bool(true)),
+            ]))
+            .is_err()
         );
     }
 }

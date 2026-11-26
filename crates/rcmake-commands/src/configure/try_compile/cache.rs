@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rcmake_eval::ProbeCacheMode;
 use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, WriteMode, path};
+use rcmake_json::{FieldError, FromJson, ToJson, Value, deny_unknown, object, req};
 use rcmake_store::{Digest, Domain, Entry, InputStamp, Store, StoreConfig, StoreMode, TraceMemo};
-use serde::{Deserialize, Serialize};
 
 use super::journal::{ImpureReason, Journal, JournalChecks};
 use super::plan::{
@@ -26,10 +26,30 @@ const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DIAGNOSTICS: usize = 16_384;
 static NEXT_ARTIFACT: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Deserialize, Serialize)]
+#[cfg_attr(test, derive(Debug, Eq, PartialEq))]
 pub(super) struct CachedProbe {
     pub(super) outcome: ProbeOutcome,
     pub(super) checks: JournalChecks,
+}
+
+impl ToJson for CachedProbe {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("outcome", self.outcome.to_json()),
+            ("checks", self.checks.to_json()),
+        ])
+    }
+}
+
+impl FromJson for CachedProbe {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["outcome", "checks"])?;
+        Ok(Self {
+            outcome: req(obj, "outcome")?,
+            checks: req(obj, "checks")?,
+        })
+    }
 }
 
 /// Compile result for the sequential evaluator, from either execution or lookup.

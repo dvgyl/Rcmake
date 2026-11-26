@@ -10,7 +10,7 @@ repository.workspace = true
 
 [features]
 default = ["native", "archive"]
-native = ["dep:rcmake-store", "dep:rcmake-fetch", "rcmake-fetch/native", "dep:serde"]
+native = ["dep:rcmake-store", "dep:rcmake-fetch", "rcmake-fetch/native"]
 archive = ["dep:rcmake-archive"]
 
 [dependencies]
@@ -35,7 +35,6 @@ rcmake-syntax.workspace = true
 [target.'cfg(any(unix, windows))'.dependencies]
 rcmake-store = { workspace = true, optional = true }
 rcmake-fetch = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
 
 [lints]
 workspace = true

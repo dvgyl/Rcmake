@@ -127,3 +127,67 @@ fn process_environment_keeps_unknown_variables_and_scalar_reads() -> HostResult<
     assert!(process_journal.verified_inputs(&host).is_none());
     Ok(())
 }
+
+#[test]
+fn journal_checks_json_round_trips_all_variants() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_json::{ReadOptions, parse, write_compact};
+
+    let digest = Digest::from_bytes([0x55; 32]);
+    let checks = JournalChecks(vec![
+        (Check::Metadata(PathBuf::from("/work/a.h"), true), digest),
+        (
+            Check::Slice(
+                PathBuf::from("/work/b.h"),
+                Slice {
+                    offset: 4,
+                    len: Some(16),
+                },
+            ),
+            digest,
+        ),
+        (
+            Check::Slice(
+                PathBuf::from("/work/c.h"),
+                Slice {
+                    offset: 0,
+                    len: None,
+                },
+            ),
+            digest,
+        ),
+        (Check::Chunks(PathBuf::from("/work/d.h")), digest),
+        (Check::DirectoryOrder(PathBuf::from("/work/dir")), digest),
+        (
+            Check::OrderedDirectoryMissing(PathBuf::from("/work/missing")),
+            digest,
+        ),
+        (
+            Check::FollowMissing(PathBuf::from("/work/dangling")),
+            digest,
+        ),
+        (Check::Link(PathBuf::from("/work/link")), digest),
+        (Check::Canonical(PathBuf::from("/work/real")), digest),
+        (Check::Environment, digest),
+        (Check::Executable, digest),
+        (Check::WorkingDirectory, digest),
+        (Check::System, digest),
+        (Check::Request(3), digest),
+    ]);
+    let encoded = write_compact(&checks.to_json());
+    let parsed = parse(
+        encoded.as_slice(),
+        &ReadOptions {
+            allow_comments: false,
+            dup_keys_last_wins: false,
+        },
+    )?;
+    assert_eq!(JournalChecks::from_json(&parsed)?, checks);
+    assert!(
+        JournalChecks::from_json(&Value::array_from([Value::array_from([
+            Value::string("UnknownVariant"),
+            digest.to_json(),
+        ])]))
+        .is_err()
+    );
+    Ok(())
+}
