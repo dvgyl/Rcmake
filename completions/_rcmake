@@ -1,0 +1,252 @@
+#compdef rcmake
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Zsh completion for rcmake.
+
+_rcmake_generators() {
+  local -a generators
+  generators=(
+    'Ninja:Generate build.ninja files'
+    'Ninja Multi-Config:Generate build-<Config>.ninja files'
+    'Unix Makefiles:Generate standard UNIX makefiles'
+    'Xcode:Generate Xcode project files (macOS)'
+    'Visual Studio 17 2022:Generate Visual Studio 2022 project files (Windows)'
+    'Visual Studio 18 2026:Generate Visual Studio 2026 project files (Windows)'
+  )
+  _describe -t generators 'generator' generators
+}
+
+_rcmake_configs() {
+  local -a configs
+  configs=(Debug Release RelWithDebInfo MinSizeRel)
+  _describe -t configs 'configuration' configs
+}
+
+_rcmake_explain() {
+  _arguments -s -S \
+    '-B+[Read CMakeCache.txt from this build directory]:build directory:_directories' \
+    '(--var)--target[Look up a target or alias]' \
+    '(--target --config --filter)--var[Look up a variable]' \
+    '(--var)--config=[Select a target configuration]:configuration:_rcmake_configs' \
+    '(--var)--filter=[Select an exact target value or compiler flag]:value:' \
+    '--json[Write one JSON report to standard output]' \
+    '--verbose[Show full values and call stacks]' \
+    '--color=[Set terminal color]:mode:(auto always never)' \
+    '(-h --help)'{-h,--help}'[Show explain help]' \
+    '1:target or variable name:'
+}
+
+_rcmake_build() {
+  _arguments -s -S \
+    '--preset=[Specify a build preset]:preset:' \
+    '--presets-file=[Specify the path to a presets file]:file:_files' \
+    '--list-presets=[List build presets]::mode:(defined)' \
+    '(-j --parallel)'{-j+,--parallel=}'[Build in parallel]::jobs:' \
+    '*'{-t+,--target=}'[Build specified target]:target:' \
+    '--config=[Choose build configuration]:configuration:_rcmake_configs' \
+    '--clean-first[Build target clean first]' \
+    '--resolve-package-references=[Restore package references during build]:mode:(on only off)' \
+    '(-v --verbose)'{-v,--verbose}'[Enable verbose build output]' \
+    '1:build directory:_directories'
+}
+
+_rcmake_install() {
+  _arguments -s -S \
+    '--config=[Choose build configuration]:configuration:_rcmake_configs' \
+    '*--component=[Install only the specified component]:component:' \
+    '--default-directory-permissions=[Set default install directory permissions]:permissions:' \
+    '(-j --parallel)'{-j+,--parallel=}'[Install in parallel]:jobs:' \
+    '--prefix=[Override CMAKE_INSTALL_PREFIX]:directory:_directories' \
+    '--strip[Strip installed binaries]' \
+    '(-v --verbose)'{-v,--verbose}'[Enable verbose install output]' \
+    '1:build directory:_directories'
+}
+
+_rcmake_workflow() {
+  _arguments -s -S \
+    '--preset=[Workflow preset to execute]:preset:' \
+    '--presets-file=[Path to a presets file]:file:_files' \
+    '--list-presets=[List workflow presets]::mode:(defined)' \
+    '--fresh[Configure a fresh build tree]' \
+    '1:preset:'
+}
+
+_rcmake_tool_e() {
+  local -a commands
+  commands=(
+    'bin2c:Convert binary file to C array'
+    'capabilities:Report tool capabilities in JSON'
+    'cat:Concatenate files to standard output'
+    'chdir:Change working directory and run command'
+    'compare_files:Compare two files'
+    'copy:Copy files'
+    'copy_directory:Copy directory contents'
+    'copy_directory_if_different:Copy changed directory contents'
+    'copy_directory_if_newer:Copy newer directory contents'
+    'copy_if_different:Copy file if contents changed'
+    'copy_if_newer:Copy file if source is newer'
+    'create_hardlink:Create a hard link'
+    'create_symlink:Create a symbolic link'
+    'echo:Display arguments as text'
+    'echo_append:Display arguments without trailing newline'
+    'env:Run command in modified environment'
+    'environment:Display current environment'
+    'false:Exit with status 1'
+    'make_directory:Create directories'
+    'md5sum:Compute MD5 checksums'
+    'remove:Remove files'
+    'remove_directory:Remove directories'
+    'rename:Rename a file or directory'
+    'rm:Remove files or directories'
+    'sha1sum:Compute SHA-1 checksums'
+    'sha224sum:Compute SHA-224 checksums'
+    'sha256sum:Compute SHA-256 checksums'
+    'sha384sum:Compute SHA-384 checksums'
+    'sha512sum:Compute SHA-512 checksums'
+    'sleep:Sleep for given seconds'
+    'tar:Create or extract archives'
+    'time:Run command and display elapsed time'
+    'touch:Create file or update timestamps'
+    'touch_nocreate:Update timestamps if file exists'
+    'true:Exit with status 0'
+  )
+  if (( CURRENT == 2 )); then
+    _describe -t commands 'command' commands
+  else
+    _files
+  fi
+}
+
+_rcmake() {
+  local first="${words[2]}"
+  if (( CURRENT >= 3 )); then
+    case "$first" in
+      explain)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_explain
+        return
+        ;;
+      --build)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_build
+        return
+        ;;
+      --install)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_install
+        return
+        ;;
+      --workflow)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_workflow
+        return
+        ;;
+      -E)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_tool_e
+        return
+        ;;
+    esac
+  fi
+
+  local -a warning_categories
+  warning_categories=(
+    dev author deprecated policy strict experimental
+    non-target-directive install-absolute-destination uninitialized unused-cli
+  )
+
+  _arguments -s -S \
+    '--diagnostics=-[Select diagnostic format]:format:(cmake rich)' \
+    '--profile=-[Write configure profile to directory]::directory:_directories' \
+    '--no-probe-cache[Disable the compiler probe cache for this configure]' \
+    '--fetch-lock=-[Select FetchContent lock mode]:mode:(off auto update frozen)' \
+    '--hermetic=-[Check for undeclared configure inputs]::mode:(warn strict)' \
+    '-S+[Specify source directory]:source directory:_directories' \
+    '-B+[Specify build directory]:build directory:_directories' \
+    '-C+[Pre-load a script to populate the cache]:script file:_files' \
+    '*-D+[Create or update a CMake cache entry]:VAR[:TYPE]=VALUE:' \
+    '*-U+[Remove matching entries from CMake cache]:globbing expression:' \
+    '-G+[Specify a build system generator]:generator:_rcmake_generators' \
+    '-T+[Specify generator toolset]:toolset:' \
+    '-A+[Specify generator platform]:platform:' \
+    '--toolchain=[Specify toolchain file]:file:_files' \
+    '--install-prefix=[Specify CMAKE_INSTALL_PREFIX]:directory:_directories' \
+    '--project-file=[Specify alternate project file name]:file:_files' \
+    '--preset=[Specify a configure preset]:preset:' \
+    '--presets-file=[Specify path to a presets file]:file:_files' \
+    '--list-presets=[List available presets]::type:(configure build test package workflow all defined configure-defined build-defined test-defined package-defined workflow-defined all-defined)' \
+    '--fresh[Configure a fresh build tree, removing existing cache]' \
+    '--build[Build a CMake-generated project binary tree]:build directory:_directories' \
+    '--install[Install a CMake-generated project binary tree]:build directory:_directories' \
+    '--workflow[Run a workflow preset]' \
+    '-E[CMake command mode]' \
+    '-P+[Process script mode]:script file:_files' \
+    '-N[View mode only]' \
+    '-L[List non-advanced cached variables]' \
+    '-LA[List all cached variables]' \
+    '-LH[List non-advanced cached variables with help]' \
+    '-LAH[List all cached variables with help]' \
+    '-LR[List non-advanced cached variables matching regex]:regex:' \
+    '-LRA[List all cached variables matching regex]:regex:' \
+    '-LRH[List non-advanced cached variables with help matching regex]:regex:' \
+    '-LRAH[List all cached variables with help matching regex]:regex:' \
+    '--find-package[Legacy pkg-config like mode]' \
+    '--graphviz=[Generate Graphviz dependency graph]:file:_files' \
+    '--sarif-output=[Write SARIF 2.1.0 diagnostics to file]:file:_files' \
+    '--system-information[Dump system information]::file:_files' \
+    '--print-config-dir[Print CMake config directory]' \
+    '--log-level=[Set message verbosity level]:level:(ERROR WARNING NOTICE STATUS VERBOSE DEBUG TRACE)' \
+    '--log-context[Prepend log messages with context]' \
+    '--debug-trycompile[Do not delete try_compile build tree]' \
+    '--debug-output[Put cmake in debug mode]' \
+    '--debug-find[Enable debug output for find commands]' \
+    '*--debug-find-pkg=[Limit debug-find to packages]:packages:' \
+    '*--debug-find-var=[Limit debug-find to result variables]:variables:' \
+    '--trace[Put cmake in trace mode]' \
+    '--trace-expand[Trace mode with variable expansion]' \
+    '--trace-format=[Set trace output format]:format:(human json-v1)' \
+    '*--trace-source=[Trace only this CMake file]:file:_files' \
+    '--trace-redirect=[Redirect trace output to file]:file:_files' \
+    '--check-system-vars[Find variable usage problems in system files]' \
+    '--warn-uninitialized[Warn about uninitialized values]' \
+    '--no-warn-unused-cli[Do not warn about unused CLI variables]' \
+    '--compile-no-warning-as-error[Ignore COMPILE_WARNING_AS_ERROR]' \
+    '--link-no-warning-as-error[Ignore LINK_WARNING_AS_ERROR]' \
+    '--profiling-format=[Output CMake profiling data]:format:(google-trace)' \
+    '--profiling-output=[Output path for CMake profiling data]:file:_files' \
+    '*-W+[Enable warning category]:category:('"${warning_categories[*]}"')' \
+    '*-Wno-[Suppress warning category]:category:('"${warning_categories[*]}"')' \
+    '*-Werror=[Make warning category an error]:category:('"${warning_categories[*]}"')' \
+    '*-Wno-error=[Make warning category not an error]:category:('"${warning_categories[*]}"')' \
+    '(-h -H --help)'{-h,-H,--help}'[Print usage information and exit]' \
+    '--version=[Print version information and exit]::format:(json-v1)' \
+    '--help-full[Print all help manuals]::file:_files' \
+    '--help-manual[Print one help manual]:manual:' \
+    '--help-manual-list[List available help manuals]::file:_files' \
+    '--help-command[Print help for one command]:command:' \
+    '--help-command-list[List commands with help available]::file:_files' \
+    '--help-commands[Print cmake-commands manual]::file:_files' \
+    '--help-diagnostic[Print help for one diagnostic]:diagnostic:' \
+    '--help-diagnostic-list[List diagnostics with help available]::file:_files' \
+    '--help-diagnostics[Print cmake-diagnostics manual]::file:_files' \
+    '--help-module[Print help for one module]:module:' \
+    '--help-module-list[List modules with help available]::file:_files' \
+    '--help-modules[Print cmake-modules manual]::file:_files' \
+    '--help-policy[Print help for one policy]:policy:' \
+    '--help-policy-list[List policies with help available]::file:_files' \
+    '--help-policies[Print cmake-policies manual]::file:_files' \
+    '--help-property[Print help for one property]:property:' \
+    '--help-property-list[List properties with help available]::file:_files' \
+    '--help-properties[Print cmake-properties manual]::file:_files' \
+    '--help-variable[Print help for one variable]:variable:' \
+    '--help-variable-list[List variables with help available]::file:_files' \
+    '--help-variables[Print cmake-variables manual]::file:_files' \
+    '1:subcommand or path:((explain\:"Explain target flags or variable provenance"))' \
+    '*:path:_directories'
+}
+
+_rcmake "$@"

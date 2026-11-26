@@ -1,0 +1,745 @@
+.\" SPDX-License-Identifier: MIT OR Apache-2.0
+.TH RCMAKE 1 "2026-11-26" "rcmake 0.1.0" "User Commands"
+.SH NAME
+rcmake \- clean-room CMake 4.5.1 compatible build system driver
+.SH SYNOPSIS
+.B rcmake
+.RI [ options ]
+.B \-S
+.I path-to-source
+.B \-B
+.I path-to-build
+.br
+.B rcmake
+.RI [ options ]
+.I path-to-source
+|
+.I path-to-existing-build
+.br
+.B rcmake \-\-build
+.I dir
+.RI [ options ]
+.RB [ \-\-
+.RI [ native-options ]]
+.br
+.B rcmake \-\-install
+.I dir
+.RI [ options ]
+.br
+.B rcmake \-\-workflow
+.I options
+.br
+.B rcmake explain
+.I name
+.RB [ \-B
+.IR build-dir ]
+.RB [ \-\-target | \-\-var ]
+.RB [ \-\-config
+.IR cfg ]
+.RB [ \-\-filter
+.IR val ]
+.RB [ \-\-json ]
+.RB [ \-\-verbose ]
+.RB [ \-\-color=auto|always|never ]
+.br
+.B rcmake \-P
+.I script.cmake
+.RB [ \-\-
+.RI [ args... ]]
+.br
+.B rcmake \-E
+.I command
+.RI [ args... ]
+.SH DESCRIPTION
+.B rcmake
+is a clean-room replacement for CMake 4.5.1 written in safe Rust.
+A single multi-call binary implements
+.BR cmake ,
+.BR ctest ,
+and
+.BR cpack ,
+reading the same
+.IR CMakeLists.txt ,
+presets, and
+.I CMakeCache.txt
+files as CMake 4.5.1 and writing compatible build trees.
+A companion binary,
+.BR rcmake-lsp ,
+provides a Language Server Protocol (LSP) server for CMake files.
+.SS Execution modes
+The executable selects its command-line surface from
+.BR argv[0] :
+.TP
+.B Native mode (\fBrcmake\fP)
+Enables the persistent compiler probe cache, incremental configure replay,
+the
+.B explain
+subcommand, rich diagnostics, configure profiling, hermetic input checks,
+and FetchContent lockfile enforcement.
+.TP
+.B Compatibility mode (\fBcmake\fP, \fBctest\fP, \fBcpack\fP)
+Matches CMake 4.5.1 command-line flags, diagnostic formatting, and exit codes.
+Native extension flags are rejected as unknown options in compatibility mode.
+Setting
+.B RCMAKE_ORACLE_MODE=1
+forces compatibility mode even when invoked as
+.BR rcmake .
+.SH NATIVE EXTENSIONS
+These subcommands and flags are accepted only in native
+.B rcmake
+mode during project configure (not in
+.B \-P
+script mode or compatibility mode).
+.SS Explain subcommand
+.TP
+.BI "rcmake explain " name
+Inspect a configured build directory and explain where target
+.I name
+gets its compile flags, definitions, include directories, and link libraries,
+or where variable
+.I name
+gets its effective value and cache provenance.
+.RS
+.TP
+.BI \-B " build-dir"
+Read
+.I CMakeCache.txt
+from
+.IR build-dir .
+Defaults to the current working directory.
+.TP
+.B \-\-target
+Look up a target or alias.
+.TP
+.B \-\-var
+Look up a variable.
+Mutually exclusive with
+.BR \-\-target ,
+.BR \-\-config ,
+and
+.BR \-\-filter .
+.TP
+.BI \-\-config " cfg"
+Select a target build configuration (for example
+.B Debug
+or
+.BR Release ).
+Implies
+.BR \-\-target .
+.TP
+.BI \-\-filter " val"
+Select a matching target value or compiler flag (for example
+.BR \-O2
+or
+.BR \-DFOO=1 ).
+Implies
+.BR \-\-target .
+.TP
+.B \-\-json
+Emit one JSON report (`rcmake-explain-v1`) to standard output.
+.TP
+.B \-\-verbose
+Show full values and call stacks in terminal output.
+.TP
+.BR \-\-color=auto | always | never
+Control ANSI color output.
+The default is
+.BR auto .
+.TP
+.BR \-h ", " \-\-help
+Show
+.B rcmake explain
+usage and exit.
+.RE
+.SS Native configure options
+Native extension flags take their value with an equals sign in the same
+argument.
+.TP
+.BR \-\-diagnostics=cmake | rich
+Select diagnostic formatting.
+.B cmake
+matches upstream CMake 4.5.1 text.
+.B rich
+renders source excerpts, spans, and suggested fixes.
+When omitted in native mode,
+.B rcmake
+checks
+.B RCMAKE_DIAGNOSTICS
+and otherwise selects
+.B rich
+when standard error is a terminal and
+.B cmake
+when standard error is redirected.
+Compatibility mode always uses
+.BR cmake .
+.TP
+.BR \-\-profile [ =\fIdir\fP ]
+Record configure timing and write
+.IR trace.json ,
+.IR stacks.folded ,
+and an interactive
+.I flamegraph.html
+under
+.IR dir .
+When
+.I dir
+is omitted, output goes to
+.I rcmake-profile
+inside the build directory.
+.TP
+.BR \-\-hermetic [ =warn | strict ]
+Audit undeclared configure inputs including environment variables, files outside
+the source, build, and tool roots, subprocesses, and network access.
+.B warn
+(the default when no value is given) reports violations and continues.
+.B strict
+rejects undeclared inputs with a non-zero exit status.
+Allowlists are configured via
+.BR RCMAKE_HERMETIC_ALLOW_ENV ,
+.BR RCMAKE_HERMETIC_ALLOW_PATHS ,
+and
+.BR RCMAKE_HERMETIC_ALLOW_PROGRAMS .
+.TP
+.BR \-\-fetch-lock=off | auto | update | frozen
+Control FetchContent lockfile verification and pinned source reuse.
+.B off
+disables lockfile checks.
+.B auto
+(default) verifies against an existing lockfile when present.
+.B update
+records resolved archive and Git pins into the lockfile.
+.B frozen
+requires every fetched dependency to match a verified pin and blocks unpinned
+or unsupported transfers.
+.TP
+.B \-\-no-probe-cache
+Disable the persistent compiler probe cache for this configure run.
+To select a custom shared cache root or probe cache root, set
+.B RCMAKE_CACHE_DIR
+or
+.B RCMAKE_PROBE_CACHE_DIR
+in the environment.
+.SH CONFIGURE OPTIONS
+.TP
+.BI \-S " path-to-source"
+Explicitly specify the source directory.
+.TP
+.BI \-B " path-to-build"
+Explicitly specify the build directory.
+.TP
+.BI \-C " initial-cache"
+Pre-load a script to populate the cache before configuring.
+.TP
+.BI \-D " var" "[:" type "]=" value
+Create or update a CMake cache entry.
+.TP
+.BI \-U " globbing-expr"
+Remove matching entries from the CMake cache.
+.TP
+.BI \-G " generator-name"
+Select a build system generator.
+Supported generators are
+.BR "Unix Makefiles" ,
+.BR Ninja ,
+.BR "Ninja Multi-Config" ,
+.B Xcode
+(on macOS),
+.B "Visual Studio 17 2022"
+(on Windows), and
+.B "Visual Studio 18 2026"
+(on Windows).
+.TP
+.BI \-T " toolset-name"
+Specify the generator toolset where supported.
+.TP
+.BI \-A " platform-name"
+Specify the generator platform where supported.
+.TP
+.BI \-\-toolchain " file"
+Specify a toolchain file
+.RB ( CMAKE_TOOLCHAIN_FILE ).
+.TP
+.BI \-\-install-prefix " dir"
+Specify the installation prefix
+.RB ( CMAKE_INSTALL_PREFIX ).
+.TP
+.BI \-\-project-file " name"
+Specify an alternate top-level project listfile name.
+.TP
+.BI \-\-preset " name"
+Use a configure preset from
+.I CMakePresets.json
+or
+.IR CMakeUserPresets.json .
+.TP
+.BI \-\-presets-file " file"
+Read presets from a specific file.
+.TP
+.BR \-\-list-presets [ =\fItype\fP ]
+List available or defined presets.
+Valid types are
+.BR configure ,
+.BR build ,
+.BR test ,
+.BR package ,
+.BR workflow ,
+.BR all ,
+.BR defined ,
+and any type suffixed with
+.BR \-defined .
+.TP
+.B \-\-fresh
+Remove any existing cache file before configuring.
+.TP
+.BI \-W category "\fR, \fP" \-Wno- category "\fR, \fP" \-Werror= category "\fR, \fP" \-Wno-error= category
+Enable, suppress, or promote diagnostic warning categories
+.RB ( dev ,
+.BR author ,
+.BR deprecated ,
+.BR policy ,
+.BR strict ,
+.BR experimental ,
+.BR non-target-directive ,
+.BR install-absolute-destination ,
+.BR uninitialized ,
+.BR unused-cli ).
+.TP
+.BR \-\-warn-uninitialized ", " \-\-no-warn-unused-cli ", " \-\-check-system-vars
+Control uninitialized variable, unused CLI variable, and system file checks.
+.TP
+.BR \-\-compile-no-warning-as-error ", " \-\-link-no-warning-as-error
+Ignore
+.B COMPILE_WARNING_AS_ERROR
+or
+.B LINK_WARNING_AS_ERROR
+properties and variables.
+.TP
+.BR \-\-log-level= ERROR|WARNING|NOTICE|STATUS|VERBOSE|DEBUG|TRACE
+Set message verbosity.
+.B \-\-log-context
+prepends message context.
+.TP
+.BR \-\-trace ", " \-\-trace-expand ", " \-\-trace-format=human|json-v1 ", " \-\-trace-source=\fIfile\fP ", " \-\-trace-redirect=\fIfile\fP
+Enable CMake script tracing and control trace output.
+.TP
+.BR \-\-debug-output ", " \-\-debug-trycompile ", " \-\-debug-find ", " \-\-debug-find-pkg=\fIpkgs\fP ", " \-\-debug-find-var=\fIvars\fP
+Enable configure and find-command debug diagnostics.
+.TP
+.BI \-\-sarif-output= file
+Write SARIF 2.1.0 diagnostic output to
+.IR file .
+.TP
+.BI \-\-graphviz= file
+Generate a Graphviz dependency graph.
+.TP
+.BR \-\-profiling-format=google-trace ", " \-\-profiling-output=\fIfile\fP
+Write CMake-format Google Trace profiling JSON.
+.TP
+.BR \-L [ A ][ H ] ", " \-LR [ A ][ H ] " " \fIregex\fP
+List cached variables, optionally including advanced entries, help strings,
+or regex filtering.
+.TP
+.BR \-N ", " \-P " " \fIfile\fP ", " \-E " " \fIcmd\fP ", " \-\-find-package ", " \-\-system-information " [" \fIfile\fP "], " \-\-print-config-dir
+View mode, script mode, cross-platform command mode, legacy find-package mode,
+system information dump, and user File API config directory lookup.
+.TP
+.BR \-h ", " \-H ", " \-\-help ", " \-\-version [ =json-v1 ] ", " \-\-help-*
+Print usage, version information, or bundled CMake 4.5.1 reference topics
+.RB ( \-\-help-command ,
+.BR \-\-help-diagnostic ,
+.BR \-\-help-manual ,
+.BR \-\-help-module ,
+.BR \-\-help-policy ,
+.BR \-\-help-property ,
+.BR \-\-help-variable ,
+and their
+.B \-list
+variants).
+.SH BUILD, INSTALL, AND WORKFLOW MODES
+.TP
+.BI "\-\-build " dir
+Build a generated project tree.
+Accepts
+.BR \-\-preset ,
+.BR \-\-presets-file ,
+.BR \-\-list-presets [ =defined ],
+.BR \-j / \-\-parallel
+.RI [ jobs ],
+.BR \-t / \-\-target
+.IR tgt ,
+.BR \-\-config
+.IR cfg ,
+.BR \-\-clean-first ,
+.BR \-\-resolve-package-references=on|only|off ,
+.BR \-v / \-\-verbose ,
+and
+.B \-\-
+followed by native build tool arguments.
+.TP
+.BI "\-\-install " dir
+Install a generated project tree.
+Accepts
+.BR \-\-config
+.IR cfg ,
+.BR \-\-component
+.IR comp ,
+.BR \-\-default-directory-permissions
+.IR perm ,
+.BR \-j / \-\-parallel
+.IR jobs ,
+.BR \-\-prefix
+.IR dir ,
+.BR \-\-strip ,
+and
+.BR \-v / \-\-verbose .
+.TP
+.B \-\-workflow
+Execute a workflow preset's configure, build, test, and package steps.
+Accepts
+.BR \-\-preset ,
+.BR \-\-presets-file ,
+.BR \-\-list-presets [ =defined ],
+and
+.BR \-\-fresh .
+.SH COMPANION TOOLS
+.SS ctest
+When invoked through a
+.B ctest
+link (compatibility mode), the binary runs CMake test suites with support for
+parallel scheduling, fixtures, resource specifications, labels, repeat modes,
+JUnit XML, dashboard submission, and
+.B \-S
+scripts.
+Common options include
+.BR \-\-test-dir
+.IR dir ,
+.BR \-C
+.IR cfg ,
+.BR \-R
+.I regex
+(include tests),
+.BR \-E
+.I regex
+(exclude tests),
+.BR \-L
+.I regex
+(include labels),
+.BR \-LE
+.I regex
+(exclude labels),
+.BR \-j / \-\-parallel
+.RI [ jobs ],
+.BR \-\-output-on-failure ,
+.BR \-\-output-junit
+.IR file ,
+.BR \-\-preset
+.IR name ,
+.BR \-\-rerun-failed ,
+.BR \-\-stop-on-failure ,
+.BR \-\-repeat
+.IR mode:n ,
+.BR \-\-timeout
+.IR secs ,
+.BR \-N / \-\-show-only [ =human|json-v1|json-v1-raw ],
+.BR \-V / \-VV / \-Q ,
+and
+.BR \-S
+.IR script .
+.SS cpack
+When invoked through a
+.B cpack
+link (compatibility mode), the binary packages build artifacts using
+.BR \-G
+.I generators
+.RB ( TGZ ,
+.BR TXZ ,
+.BR TZST ,
+.BR TBZ2 ,
+.BR TZ ,
+.BR TAR ,
+.BR STGZ ,
+.BR ZIP ,
+.BR 7Z ,
+their compression variants,
+.BR External ,
+and macOS
+.B Bundle
+and
+.BR DragNDrop ),
+.BR \-C
+.IR configs ,
+.BR \-D
+.IR var=value ,
+.BR \-\-config
+.IR file ,
+.BR \-P
+.IR name ,
+.BR \-R
+.IR version ,
+.BR \-B
+.IR dir ,
+.BR \-\-vendor
+.IR name ,
+.BR \-\-preset
+.IR name ,
+.BR \-\-presets-file
+.IR file ,
+.BR \-\-list-presets ,
+.BR \-V / \-\-verbose ,
+.BR \-\-debug ,
+.BR \-\-trace ,
+and
+.BR \-\-trace-expand .
+.SS rcmake-lsp
+.B rcmake-lsp
+is a standalone Language Server Protocol server for
+.I CMakeLists.txt
+and
+.I *.cmake
+files communicating over standard input and standard output with JSON-RPC
+.B Content-Length
+framing.
+It provides hover, completion, go to definition, document symbols, semantic
+tokens, diagnostics, quick fixes, and formatting.
+When built with the
+.B eval,stdio
+features (the default in release archives), hover evaluates variables, targets,
+and generator expressions in memory without spawning external processes.
+.SH ENVIRONMENT
+Command-line options take precedence over environment variables.
+Native speed and diagnostic variables apply only in native
+.B rcmake
+mode.
+.SS Mode and output
+.TP
+.B RCMAKE_ORACLE_MODE
+Set to
+.B 1
+to force compatibility mode even when invoked as
+.BR rcmake .
+.TP
+.B RCMAKE_DIAGNOSTICS
+Set to
+.B cmake
+or
+.B rich
+in native mode.
+Unset defaults to
+.B rich
+on a TTY standard error and
+.B cmake
+otherwise.
+.TP
+.BR NO_COLOR ", " CLICOLOR_FORCE
+Disable ANSI color when
+.B NO_COLOR
+is set.
+.B CLICOLOR_FORCE=1
+forces ANSI color in rich mode and overrides
+.BR NO_COLOR .
+.TP
+.B RCMAKE_PROFILE
+Set the native configure profile output directory.
+.TP
+.B RCMAKE_EXEC_LOG
+Write JSON Lines invocation records (including
+.B tool
+and effective
+.B persona
+fields) to this path.
+.TP
+.B RCMAKE_VENDORED_DATA_ROOT
+Override the directory containing bundled CMake 4.5.1
+.IR Modules/ ,
+.IR Templates/ ,
+and
+.I Help/
+files.
+.SS Probe cache and incremental replay
+.TP
+.B RCMAKE_CACHE_DIR
+Override the shared storage root for the compiler probe cache and FetchContent
+cache.
+.TP
+.B RCMAKE_CACHE_MAX_SIZE
+Set the shared store size limit in bytes (default 2 GiB).
+.TP
+.B RCMAKE_PROBE_CACHE
+Select
+.B readwrite
+(default),
+.BR readonly ,
+.BR verify ,
+or
+.BR off .
+.TP
+.B RCMAKE_NO_PROBE_CACHE
+Set to
+.B 1
+to disable the probe cache.
+.TP
+.B RCMAKE_PROBE_CACHE_DIR
+Override the probe storage root separately from
+.BR RCMAKE_CACHE_DIR .
+.TP
+.B RCMAKE_PROBE_JOBS
+Positive integer number of concurrent probe jobs (default min(4, CPUs)).
+.TP
+.B RCMAKE_NO_INCREMENTAL
+Set to
+.B 1
+to disable incremental configure replay.
+.TP
+.B RCMAKE_OFFLINE
+Set to
+.B 1
+to disable remote probe cache access.
+.TP
+.BR RCMAKE_CACHE_REMOTE ", " RCMAKE_CACHE_REMOTE_AUTH ", " RCMAKE_CACHE_REMOTE_TOKEN ", " RCMAKE_CACHE_REMOTE_HEADER ", " RCMAKE_CACHE_REMOTE_WRITE
+Configure an optional HTTPS remote probe cache
+.RB ( anonymous ,
+.BR bearer ,
+.BR header ,
+or
+.B s3
+authentication).
+.SS FetchContent lockfile and hermetic checks
+.TP
+.B RCMAKE_FETCH_LOCK
+Select
+.B auto
+(default),
+.BR off ,
+.BR update ,
+or
+.BR frozen .
+.TP
+.B RCMAKE_FETCH_LOCK_FILE
+Override the lockfile path (default
+.I rcmake-fetch.lock
+in the source directory).
+.TP
+.B RCMAKE_FETCH_OFFLINE
+Set to
+.B 1
+to disable network transfers for FetchContent and ExternalProject.
+.TP
+.BR RCMAKE_FETCH_PREFETCH ", " RCMAKE_FETCH_JOBS ", " RCMAKE_FETCH_GIT_READ_ONLY ", " RCMAKE_FETCH_GIT_MAX_SIZE
+Control parallel FetchContent prefetching and Git mirror cache limits.
+.TP
+.B RCMAKE_HERMETIC
+Select
+.B off
+(default),
+.BR warn ,
+or
+.BR strict .
+.TP
+.BR RCMAKE_HERMETIC_ALLOW_ENV ", " RCMAKE_HERMETIC_ALLOW_PATHS ", " RCMAKE_HERMETIC_ALLOW_PROGRAMS
+Semicolon-separated allowlists of environment variable names, absolute
+directory or file paths, and absolute executable paths permitted in hermetic
+mode.
+.SS Standard CMake and CTest variables
+.TP
+.BR CMAKE_GENERATOR ", " CMAKE_BUILD_PARALLEL_LEVEL ", " CMAKE_INSTALL_PARALLEL_LEVEL ", " CTEST_PARALLEL_LEVEL ", " CTEST_OUTPUT_ON_FAILURE
+Standard CMake and CTest defaults honored by
+.BR rcmake ,
+.BR cmake ,
+and
+.BR ctest .
+.SH EXIT STATUS
+.TP
+.B 0
+The command succeeded.
+For
+.BR "rcmake explain" ,
+the requested target or variable was found.
+.TP
+.B 1
+Configure, generation, build, install, test, packaging, or
+.B explain
+query failed (including not-found or ambiguous
+.B explain
+names).
+.TP
+.B 2
+Invalid arguments to
+.B rcmake explain
+or an unavailable configured build directory.
+.SH FILES
+.TP
+.I <prefix>/share/cmake-4.5/
+Bundled CMake 4.5.1 modules, templates, and compressed help reference installed
+next to
+.IR <prefix>/bin/rcmake .
+.TP
+.I CMakeCache.txt
+Generated build-tree cache read by
+.B rcmake explain
+and incremental reconfigures.
+.TP
+.IR CMakePresets.json ", " CMakeUserPresets.json
+Project and user CMake Presets files (schema version 13).
+.TP
+.I rcmake-fetch.lock
+Default FetchContent lockfile in the project source directory.
+.TP
+.I <build>/rcmake-profile/
+Default output directory for
+.B \-\-profile
+containing
+.IR trace.json ,
+.IR stacks.folded ,
+and
+.IR flamegraph.html .
+.TP
+.I ~/Library/Caches/rcmake
+Default cache directory on macOS.
+On Linux the default is
+.I $XDG_CACHE_HOME/rcmake
+or
+.IR ~/.cache/rcmake .
+On Windows the default is
+.IR %LOCALAPPDATA%\ercmake\ecache .
+Overridden by
+.BR RCMAKE_CACHE_DIR .
+.SH EXAMPLES
+Configure and build a project with Ninja:
+.PP
+.EX
+rcmake -S . -B build -G Ninja
+rcmake --build build
+.EE
+.PP
+Explain where target
+.B app
+gets its
+.B \-O2
+flag:
+.PP
+.EX
+rcmake explain app -B build --filter -O2
+.EE
+.PP
+Profile a configure run and audit hermetic inputs:
+.PP
+.EX
+rcmake -S . -B build -G Ninja --profile=prof --hermetic=strict
+.EE
+.PP
+Update and then enforce a FetchContent lockfile:
+.PP
+.EX
+rcmake -S . -B build --fetch-lock=update
+rcmake -S . -B build --fetch-lock=frozen
+.EE
+.PP
+Run tests via the compatibility alias:
+.PP
+.EX
+ctest --test-dir build --output-on-failure -j
+.EE
+.SH SEE ALSO
+.BR cmake (1),
+.BR ctest (1),
+.BR cpack (1)
