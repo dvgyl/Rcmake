@@ -39,7 +39,13 @@ mod property_tests;
 #[cfg(test)]
 mod tests;
 
+pub use crate::resolve_link::codemodel_frameworks;
 pub(crate) use install::exported_object_path;
+
+/// Return whether the target's platform uses Apple framework bundles.
+pub fn uses_apple_frameworks(model: &ProjectModel, target: &Target) -> bool {
+    is_darwin(model, target.dir)
+}
 
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_model::{DirId, ProjectModel, Target};

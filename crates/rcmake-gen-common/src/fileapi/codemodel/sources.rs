@@ -8,8 +8,10 @@ use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_genex::EvalContext;
 use rcmake_model::{BT, CustomCommandKind, Target, TargetId, TargetKind, UsageField};
 use rcmake_resolve::{
-    BuildStep, CompileGroup, ResolvedTarget,
-    lower::{LanguageStandard, codemodel_compile_info},
+    BuildStep, CompileGroup, InterfaceInclude, ResolvedTarget,
+    lower::{
+        LanguageStandard, codemodel_compile_info, codemodel_frameworks, uses_apple_frameworks,
+    },
     usage::UsageResolver,
 };
 
@@ -334,6 +336,21 @@ impl FileApi<'_, '_> {
                     }),
             );
         }
+        let apple = raw.is_some_and(|raw| uses_apple_frameworks(self.model, raw));
+        let linked_frameworks = raw
+            .map_or_else(
+                || Ok(Vec::new()),
+                |raw| {
+                    codemodel_frameworks(
+                        self.model,
+                        raw,
+                        target,
+                        |id| targets.get(&id)?.target.artifacts.file.as_ref(),
+                        usage,
+                    )
+                },
+            )
+            .map_err(|error| GenError::Invalid(error.to_string().into()))?;
         let groups = compile_groups
             .into_iter()
             .filter_map(|((index, flags), sources)| {
@@ -349,7 +366,7 @@ impl FileApi<'_, '_> {
                     ..EvalContext::default()
                 };
                 let data = CompileData::new(self, target, raw, usage, context, group, flags)?;
-                Ok(data.write(sources, graph))
+                Ok(data.write(sources, graph, apple, &linked_frameworks))
             })
             .collect::<Result<Vec<_>, GenError>>()?;
         optional_array(body, "compileGroups", groups);
@@ -530,7 +547,13 @@ impl CompileData {
         })
     }
 
-    fn write(self, sources: Vec<usize>, graph: &mut Backtraces<'_>) -> Value {
+    fn write(
+        self,
+        sources: Vec<usize>,
+        graph: &mut Backtraces<'_>,
+        apple: bool,
+        linked_frameworks: &[InterfaceInclude],
+    ) -> Value {
         let mut body = members([
             ("language", Value::string(self.group.language)),
             ("sourceIndexes", array(sources.into_iter().map(number))),
@@ -563,17 +586,38 @@ impl CompileData {
                 }),
             );
         }
+        let (frameworks, includes) = self
+            .group
+            .includes
+            .iter()
+            .partition::<Vec<_>, _>(|include| {
+                apple
+                    && Lexical::new(&include.path.value)
+                        .filename()
+                        .ends_with(b".framework")
+            });
+        let mut tagged_include = |value: &InterfaceInclude| {
+            let mut item = Members::new();
+            graph.tagged_value(&mut item, "path", &value.path);
+            if value.system {
+                item.insert("isSystem".into(), Bool(true));
+            }
+            Object(item)
+        };
         optional_array(
             &mut body,
             "includes",
-            self.group.includes.iter().map(|value| {
-                let mut item = Members::new();
-                graph.tagged_value(&mut item, "path", &value.path);
-                if value.system {
-                    item.insert("isSystem".into(), Bool(true));
-                }
-                Object(item)
-            }),
+            includes.into_iter().map(&mut tagged_include),
+        );
+        let mut seen = BTreeSet::new();
+        optional_array(
+            &mut body,
+            "frameworks",
+            frameworks
+                .into_iter()
+                .chain(linked_frameworks)
+                .filter(|entry| seen.insert(entry.path.value.as_slice()))
+                .map(tagged_include),
         );
         Object(body)
     }

@@ -22,12 +22,24 @@ impl Projection<'_> {
         namelink: NamelinkMode,
         paths: Vec<(BString, BString)>,
     ) {
-        if paths.is_empty()
-            || (!action.configurations.is_empty()
-                && !action
-                    .configurations
-                    .iter()
-                    .any(|config| self.config.matches(config)))
+        if !paths.is_empty() {
+            self.push(manifest, action, import_library, namelink, paths);
+        }
+    }
+
+    fn push(
+        &self,
+        manifest: &mut InstallManifest,
+        action: &InstallAction,
+        import_library: bool,
+        namelink: NamelinkMode,
+        paths: Vec<(BString, BString)>,
+    ) {
+        if !action.configurations.is_empty()
+            && !action
+                .configurations
+                .iter()
+                .any(|config| self.config.matches(config))
         {
             return;
         }
@@ -65,7 +77,7 @@ impl Projection<'_> {
         let only = group.is_some_and(|group| group.namelink_only);
         let skip = group.is_some_and(|group| group.namelink_skip);
         if !only {
-            self.add(
+            self.push(
                 manifest,
                 action,
                 import_library,
@@ -81,18 +93,17 @@ impl Projection<'_> {
                 },
             );
         }
-        if !skip && !versions.is_empty() {
+        if !skip {
             let mut action = action.clone();
             if let Some(component) = group.and_then(|group| group.namelink_component) {
                 action.component = component.into();
             }
-            self.add(
-                manifest,
-                &action,
-                import_library,
-                NamelinkMode::Only,
-                vec![file_path(bin, output)],
-            );
+            let paths = if versions.is_empty() {
+                Vec::new()
+            } else {
+                vec![file_path(bin, output)]
+            };
+            self.push(manifest, &action, import_library, NamelinkMode::Only, paths);
         }
     }
 }

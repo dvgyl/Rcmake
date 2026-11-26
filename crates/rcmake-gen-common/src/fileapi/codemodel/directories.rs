@@ -166,6 +166,7 @@ impl FileApi<'_, '_> {
                             installer.rule == index
                                 && installer.target == *id
                                 && installer.config.matches(config)
+                                && !installer.paths.is_empty()
                         })
                         .map(|installer| installers::target(installer, reference, self.build));
                     other_installers::append(

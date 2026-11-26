@@ -422,43 +422,84 @@ pub(crate) fn framework_dirs<'a>(
     artifact: &impl Fn(TargetId) -> Option<&'a BString>,
     config: &ConfigId,
 ) -> Vec<(BString, bool)> {
-    let no_imported_system = target
-        .props
-        .get(b"NO_SYSTEM_FROM_IMPORTED")
-        .is_some_and(|value| truth::is_on(value));
     let mut directories: IndexMap<BString, bool> = IndexMap::new();
-    for (directory, system) in dependencies.iter().filter_map(|&id| {
-        let dependency = model.target(id)?;
-        let imported = dependency.is_imported();
-        let layout = ide::bundle_kind(dependency);
-        if !imported && !matches!(layout, ide::BundleKind::Framework { .. }) {
-            return None;
-        }
-        let fallback;
-        let path = if let Some(path) = artifact(id) {
-            path
-        } else {
-            fallback = lower::compute_artifacts(model, dependency, config);
-            fallback.file.as_ref()?
-        };
-        let root = layout.root(path).or_else(|| {
-            imported
-                .then(|| lower::framework::wrapper_root(path, b".framework"))
-                .flatten()
-        })?;
-        let system = !(imported && no_imported_system)
-            && dependency
-                .props
-                .get(b"SYSTEM")
-                .map_or(imported, |value| truth::is_on(value));
-        Some((Lexical::new(root).parent().into(), system))
-    }) {
+    for (root, system) in linked_framework_roots(model, target, dependencies, artifact, config) {
         directories
-            .entry(directory)
+            .entry(Lexical::new(&root).parent().into())
             .and_modify(|previous| *previous &= system)
             .or_insert(system);
     }
     directories.into_iter().collect()
+}
+
+fn linked_framework_roots<'a>(
+    model: &ProjectModel,
+    target: &Target,
+    dependencies: &[TargetId],
+    artifact: &impl Fn(TargetId) -> Option<&'a BString>,
+    config: &ConfigId,
+) -> Vec<(BString, bool)> {
+    let no_imported_system = target
+        .props
+        .get(b"NO_SYSTEM_FROM_IMPORTED")
+        .is_some_and(|value| truth::is_on(value));
+    dependencies
+        .iter()
+        .filter_map(|&id| {
+            let dependency = model.target(id)?;
+            let imported = dependency.is_imported();
+            let layout = ide::bundle_kind(dependency);
+            if !imported && !matches!(layout, ide::BundleKind::Framework { .. }) {
+                return None;
+            }
+            let fallback;
+            let path = if let Some(path) = artifact(id) {
+                path
+            } else {
+                fallback = lower::compute_artifacts(model, dependency, config);
+                fallback.file.as_ref()?
+            };
+            let root = layout.root(path).or_else(|| {
+                imported
+                    .then(|| lower::framework::wrapper_root(path, b".framework"))
+                    .flatten()
+            })?;
+            let system = !(imported && no_imported_system)
+                && dependency
+                    .props
+                    .get(b"SYSTEM")
+                    .map_or(imported, |value| truth::is_on(value));
+            Some((root.into(), system))
+        })
+        .collect()
+}
+
+/// Collect the framework bundles that supply includes to a target's compile groups.
+pub fn codemodel_frameworks<'a>(
+    model: &ProjectModel,
+    target: &Target,
+    resolved: &ResolvedTarget,
+    artifact: impl Fn(TargetId) -> Option<&'a BString>,
+    usage: &mut UsageResolver<'_>,
+) -> Result<Vec<InterfaceInclude>, ResolveError> {
+    if !lower::is_darwin(model, target.dir) || resolved.compile_units.is_empty() {
+        return Ok(Vec::new());
+    }
+    let context = EvalContext {
+        config: resolved.config.clone(),
+        link_language: resolved.link.as_ref().map(|link| link.language.clone()),
+        ..EvalContext::default()
+    };
+    let dependencies = usage.compile_framework_targets(resolved.id, &context)?;
+    Ok(
+        linked_framework_roots(model, target, &dependencies, &artifact, &resolved.config)
+            .into_iter()
+            .map(|(path, system)| InterfaceInclude {
+                path: BT::new(path, Default::default()),
+                system,
+            })
+            .collect(),
+    )
 }
 
 fn append_link_item(

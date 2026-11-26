@@ -119,5 +119,8 @@ pub struct TargetInstaller {
     /// Library linker symlink selection.
     pub namelink: NamelinkMode,
     /// Ordered source paths and paths under the install destination.
+    ///
+    /// Empty if the installer selects no file, for example for `NAMELINK_ONLY`
+    /// on a library without a version.
     pub paths: Vec<(BString, BString)>,
 }
