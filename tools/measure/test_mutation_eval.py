@@ -593,6 +593,35 @@ class TrapsRunnerAndCliTests(unittest.TestCase):
         self.assertEqual(payload["project"], "fixture")
         self.assertIn("# Leaf-edit comparison", out_md.read_text(encoding="utf-8"))
 
+    def test_require_replay_record_accepts_utf8_string_and_byte_array_paths(self):
+        source = self.root / "src"
+        build = self.root / "build"
+        source.mkdir()
+        build.mkdir()
+        _write_valid_replay_record(source, build)
+        me.require_replay_record(source, build)
+
+        raw_paths = [
+            str(p).encode("utf-16-le", errors="surrogatepass") if os.name == "nt" else os.fsencode(p)
+            for p in (source, build)
+        ]
+        encoded = [p.decode("utf-8") for p in raw_paths]
+        payload = json.dumps({
+            "schema": "configure.v1",
+            "replay_schema": "configure.v4",
+            "region": {
+                "key": {"kind": "Configure", "source_dir": encoded[0], "binary_dir": encoded[1]},
+                "payload": {"Complete": {"inputs": [], "effects": []}},
+            },
+            "model": {"nested": []},
+        }).encode("utf-8")
+        header = me.REPLAY_MAGIC + bytes([1 if os.name == "nt" else 2]) + len(payload).to_bytes(4, "little")
+        frame = header + payload
+        frame += hashlib.sha256(frame).digest()
+        (build / me.REPLAY_RECORD).write_bytes(frame)
+        me.require_replay_record(source, build)
+        self.assertIsNone(me._decode_journal_bytes([True]))
+
 
 if __name__ == "__main__":
     unittest.main()

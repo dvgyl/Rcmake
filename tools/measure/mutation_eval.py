@@ -330,6 +330,18 @@ def replay_leaves(source: Path, build: Path) -> tuple[set[Path], set[Path]]:
     return leaves("executed"), leaves("replayed")
 
 
+def _decode_journal_bytes(value: object) -> bytes | None:
+    """Decode a configure journal byte field (UTF-8 string or raw byte array)."""
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if isinstance(value, list) and all(
+        isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 255
+        for item in value
+    ):
+        return bytes(value)
+    return None
+
+
 def require_replay_record(source: Path, build: Path) -> None:
     """Check the current configure journal frame and its tree identity."""
     path = build / REPLAY_RECORD
@@ -349,6 +361,8 @@ def require_replay_record(source: Path, build: Path) -> None:
     key = region.get("key", {})
     paths = [str(p).encode("utf-16-le", errors="surrogatepass") if os.name == "nt" else os.fsencode(p)
              for p in (source, build)]
+    recorded_paths = [_decode_journal_bytes(key.get("source_dir")),
+                      _decode_journal_bytes(key.get("binary_dir"))]
     complete = "Complete" in region.get("payload", {})
     nested = payload.get("model", {}).get("nested", [])
     has_nested = any(isinstance(item, list) and len(item) == 2
@@ -356,7 +370,7 @@ def require_replay_record(source: Path, build: Path) -> None:
                      for item in nested)
     if (payload.get("schema") != "configure.v1" or "model" not in payload
             or not (complete or has_nested) or key.get("kind") != "Configure"
-            or [key.get("source_dir"), key.get("binary_dir")] != [list(p) for p in paths]):
+            or recorded_paths != paths):
         raise ValueError(f"Configure replay record does not match the configure in {path}.")
 
 
