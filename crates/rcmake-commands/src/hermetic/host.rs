@@ -326,6 +326,16 @@ impl HermeticHost {
             (name == b"PATH" || (self.windows && name.eq_ignore_ascii_case(b"PATH")))
                 .then_some(value.as_slice())
         });
+        if let [stage] = request.pipeline.as_slice() {
+            let program = path::to_native(&stage.program);
+            if self.absent_program(&program, path_value) {
+                // The spawn cannot start a process, so give its error without one.
+                return Err(rcmake_host::HostError::from_io(
+                    std::io::Error::from_raw_os_error(2),
+                    Some(program),
+                ));
+            }
+        }
         for stage in &mut request.pipeline {
             let program = path::to_native(&stage.program);
             let executable = self
@@ -362,6 +372,51 @@ impl HermeticHost {
         if !env.iter().any(|(key, _)| self.is_source_date_epoch(key)) {
             env.push(("SOURCE_DATE_EPOCH".into(), "0".into()));
         }
+    }
+
+    /// Return `true` if no directory of `path_value` holds `program`.
+    ///
+    /// Each directory must be absolute and readable under the policy, so that
+    /// the absence is an observation inside the allowed roots. A search path
+    /// that names more than 128 directories is not checked.
+    fn absent_program(&self, program: &Path, path_value: Option<&[u8]>) -> bool {
+        if self.windows || self.mode == HermeticMode::Off {
+            return false;
+        }
+        let mut components = program.components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        ) || path::from_native(program).contains(&b'/')
+        {
+            return false;
+        }
+        let Some(value) = path_value else {
+            return false;
+        };
+        let native = path::to_native(value);
+        #[cfg(unix)]
+        let directories: Vec<PathBuf> = std::env::split_paths(native.as_os_str()).collect();
+        #[cfg(not(unix))]
+        let directories: Vec<PathBuf> = {
+            let _ = native;
+            Vec::new()
+        };
+        if directories.is_empty() || directories.len() > 128 {
+            return false;
+        }
+        let state = self.state();
+        directories.iter().all(|dir| {
+            let candidate = dir.join(program);
+            dir.is_absolute()
+                && state
+                    .auditor
+                    .allows_read_path(self.inner.as_ref(), dir, None)
+                && self
+                    .inner
+                    .metadata(&candidate, Follow::No)
+                    .is_err_and(|error| error.kind == std::io::ErrorKind::NotFound)
+        })
     }
 
     fn resolve_executable(

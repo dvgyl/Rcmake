@@ -765,7 +765,17 @@ impl HermeticAuditor {
             return (allowed(), Some(path));
         }
         let bundled = self.is_bundled_site(site);
-        let directory = path.parent().filter(|parent| parent.is_absolute());
+        // Never suggest the filesystem root. For a child of the root, suggest the child.
+        let directory = path
+            .parent()
+            .filter(|parent| parent.is_absolute())
+            .map(|parent| {
+                if parent.parent().is_none() {
+                    path
+                } else {
+                    parent
+                }
+            });
         let directory = directory.map_or_else(|| "<DIR>".into(), |dir| dir.to_string_lossy());
         let directory = if directory
             .chars()
@@ -872,7 +882,10 @@ impl HermeticAuditor {
         let identity = if program.is_absolute() {
             display_text(&program.to_string_lossy())
         } else {
-            "<unresolved executable>".into()
+            format!(
+                "<unresolved executable {}>",
+                display_text(&program.to_string_lossy())
+            )
         };
         let hint = if program.is_absolute() {
             format!("Allow this tool with RCMAKE_HERMETIC_ALLOW_PROGRAMS={identity}.")

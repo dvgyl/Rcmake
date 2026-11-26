@@ -84,7 +84,7 @@ impl PlatformQueries {
                 timeout: None,
                 tee: false,
             };
-            let Some(key) = query(host.as_ref(), &request) else {
+            let Some(key) = query(host.as_ref(), &request).filter(|key| !key.is_absent()) else {
                 continue;
             };
             let worker = Arc::clone(host);

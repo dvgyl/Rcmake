@@ -399,6 +399,11 @@ fn allow_host_toolchain(policy: &mut HermeticPolicy, host: &dyn Host, sysname: &
             }
         }
         for exact in [
+            // The default search path. A lookup of a missing tool reads these.
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
             "/Applications",
             "/Applications/Xcode.app/Contents/Applications",
             "/Applications/Xcode.app/Contents/Library/Frameworks",
@@ -416,6 +421,11 @@ fn allow_host_toolchain(policy: &mut HermeticPolicy, host: &dyn Host, sysname: &
             if host.metadata(path, Follow::Yes).is_ok() {
                 policy.allow_exact_path(host, path);
             }
+        }
+        // Compiler ABI detection checks the standard library directories,
+        // which macOS does not have. Allow only these exact paths.
+        for standard in ["/lib", "/lib32", "/lib64", "/usr/lib32", "/usr/lib64"] {
+            policy.allow_exact_path(host, Path::new(standard));
         }
         if let Some(home) = host
             .env_get(b"HOME")

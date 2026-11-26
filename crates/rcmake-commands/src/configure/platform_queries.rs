@@ -38,6 +38,41 @@ struct Query {
     missing_programs: Vec<PathBuf>,
 }
 
+impl Query {
+    /// Return `true` if no `PATH` directory holds the program.
+    ///
+    /// The program cannot start, so the query has a fixed result and runs no
+    /// process. A `Missing` stamp for each candidate binds that result.
+    fn is_absent(&self) -> bool {
+        self.program.as_os_str().is_empty()
+    }
+}
+
+/// Return what starting a program that no `PATH` directory holds gives.
+///
+/// This is the result of the native host for a spawn that fails with `ENOENT`.
+fn absent_output(request: &RunRequest) -> RunOutput {
+    let program = request
+        .pipeline
+        .first()
+        .map(|command| path::to_native(&command.program));
+    // `ENOENT` is 2 on every platform that admits a query.
+    let error = rcmake_host::HostError::from_io(std::io::Error::from_raw_os_error(2), program);
+    RunOutput {
+        results: vec![ProcessResult::SpawnFailed(error)],
+        ..RunOutput::default()
+    }
+}
+
+fn absent_observation(request: &RunRequest) -> Observation {
+    Observation {
+        executable: Digest::hash(b"absent program"),
+        result: absent_output(request),
+        request: request.clone(),
+        state_digest: None,
+    }
+}
+
 #[derive(Clone)]
 struct Observation {
     executable: Digest,
@@ -141,6 +176,14 @@ impl PlatformQueries {
                 let Some(key) = query(host, request) else {
                     continue;
                 };
+                if key.is_absent() {
+                    if memo.0.len() < 64 {
+                        memo.0
+                            .entry(key)
+                            .or_insert_with(|| absent_observation(request));
+                    }
+                    continue;
+                }
                 if memo.0.contains_key(&key)
                     || ready.iter().any(|(started, _)| *started == key)
                     || !admits_xcrun(host, &memo, &key, request)
@@ -445,6 +488,16 @@ pub(crate) fn run(cx: &Cx<'_>, request: &RunRequest) -> Option<HostResult<RunOut
     {
         return None;
     }
+    if key.is_absent() {
+        let observation = absent_observation(request);
+        let result = observation.result.clone();
+        if let Ok(mut memo) = memo_queries.0.lock()
+            && memo.0.len() < 64
+        {
+            memo.0.entry(key).or_insert(observation);
+        }
+        return Some(Ok(result));
+    }
     let digests = memo_queries.memo();
     let executable = program_digest(digests, host, &key.program).ok()?;
     let mut memo = memo_queries.0.lock().ok()?;
@@ -731,16 +784,18 @@ impl RecordedQueries {
 
     pub(super) fn stamps(&self) -> impl Iterator<Item = InputStamp> + '_ {
         self.0.iter().flat_map(|(query, observation)| {
-            std::iter::once(InputStamp::FileHash {
-                path: query.program.clone(),
-                digest: observation.executable,
-            })
-            .chain(
-                query
-                    .missing_programs
-                    .iter()
-                    .map(|path| InputStamp::Missing { path: path.clone() }),
-            )
+            (!query.is_absent())
+                .then(|| InputStamp::FileHash {
+                    path: query.program.clone(),
+                    digest: observation.executable,
+                })
+                .into_iter()
+                .chain(
+                    query
+                        .missing_programs
+                        .iter()
+                        .map(|path| InputStamp::Missing { path: path.clone() }),
+                )
         })
     }
 
@@ -852,7 +907,24 @@ fn query(host: &dyn Host, request: &RunRequest) -> Option<Query> {
             }
             missing_programs.push(candidate);
         }
-        selected?
+        match selected {
+            Some(selected) => selected,
+            // Only `brew` has no fixed path. When every candidate is missing,
+            // the spawn fails with a fixed error and runs no process.
+            None if fixed.is_none()
+                && !missing_programs.is_empty()
+                && std::env::split_paths(&directories).count() <= 128 =>
+            {
+                return Some(Query {
+                    program: PathBuf::new(),
+                    args: command.args.clone(),
+                    env: environment_fingerprint(&request.env),
+                    stderr,
+                    missing_programs,
+                });
+            }
+            None => return None,
+        }
     };
     // Require a system query to select the sealed system executable. A program
     // with the same name earlier in PATH can have different effects.
@@ -1433,10 +1505,52 @@ mod tests {
             assert!(query(&host, &request("brew", args, search)).is_none());
         }
         assert!(query(&host, &request("bin/brew", prefix(), search)).is_none());
-        assert!(query(&host, &request("brew", prefix(), "/work/missing:/usr/bin")).is_none());
+        // No candidate exists, so the query runs no process and binds each candidate.
+        let request_absent = request("brew", prefix(), "/work/missing:/usr/bin");
+        let absent = query(&host, &request_absent)
+            .ok_or_else(|| rcmake_host::HostError::unsupported("Expected an absent query."))?;
+        assert!(absent.is_absent());
+        assert_eq!(
+            absent.missing_programs,
+            vec![
+                PathBuf::from("/work/missing/brew"),
+                PathBuf::from("/usr/bin/brew")
+            ]
+        );
+        let mut recorded = RecordedQueries::default();
+        recorded
+            .0
+            .insert(absent.clone(), absent_observation(&request_absent));
+        let stamps: Vec<_> = recorded.stamps().collect();
+        assert_eq!(
+            stamps,
+            absent
+                .missing_programs
+                .iter()
+                .map(|path| InputStamp::Missing { path: path.clone() })
+                .collect::<Vec<_>>()
+        );
+        let replayed = recorded
+            .get(&host, &request_absent)
+            .ok_or_else(|| rcmake_host::HostError::unsupported("Expected a replay."))?;
+        let [ProcessResult::SpawnFailed(error)] = replayed.results.as_slice() else {
+            return Err(rcmake_host::HostError::unsupported(
+                "Expected a spawn failure.",
+            ));
+        };
+        assert_eq!(error.kind, ErrorKind::NotFound);
+        assert_eq!(error.errno, Some(2));
+        assert!(replayed.stdout.is_empty() && replayed.stderr.is_empty());
+        // A search path that the query cannot check fully gives no query.
+        let long = vec!["/work/unused"; 150].join(":");
+        assert!(query(&host, &request("brew", prefix(), &long)).is_none());
+        assert!(query(&host, &request("brew", prefix(), "relative:/usr/bin")).is_none());
+        assert!(query(&host, &request("brew", prefix(), "")).is_none());
         let shadow = Path::new("/work/missing/brew");
         host.seed_file(shadow, b"shadow")?;
         assert!(query(&host, &request("brew", prefix(), search)).is_none());
+        // A file that is not executable is not missing, so the absent query stops.
+        assert!(query(&host, &request_absent).is_none());
         host.set_permissions(shadow, 0o755)?;
         let shadowed = query(&host, &request("brew", prefix(), search))
             .ok_or_else(|| rcmake_host::HostError::unsupported("Expected the shadow."))?;
