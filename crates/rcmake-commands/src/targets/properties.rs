@@ -386,13 +386,16 @@ pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
     };
     let dir = cx.current_dir_id();
     let Some(id) = cx.project().find_target(dir, bytes(name)) else {
-        return Err(crate::command_error(
-            cx,
+        cx.issue_and_continue(
+            rcmake_diag::MessageKind::Error,
+            rcmake_diag::Effect::SetError,
+            None,
             format!(
                 "Cannot add target-level dependencies to non-existent target \"{}\".\nThe add_dependencies works for top-level logical targets created by the add_executable, add_library, or add_custom_target commands.  If you want to add file-level dependencies see the DEPENDS option of the add_custom_target and add_custom_command commands.",
                 name.value
-            ),
-        ));
+            ).into(),
+        );
+        return Ok(Flow::Normal);
     };
     if deps.is_empty() {
         return Ok(Flow::Normal);

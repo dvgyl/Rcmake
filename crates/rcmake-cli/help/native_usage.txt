@@ -3,6 +3,9 @@ rcmake extensions
   rcmake explain <name> [-B <build-dir>] [--target|--var]
                  [--config <cfg>] [--filter <val>] [--json]
                  [--verbose] [--color=auto|always|never]
+  rcmake doctor               Show tool paths and probe cache status.
+  rcmake cache [status|dir|clear]
+                               Inspect or clear the cache.
   rcmake ctest [options]       Run the bundled ctest driver.
   rcmake cpack [options]       Run the bundled cpack driver.
   rcmake lsp [options]         Start the CMake language server over stdio.

@@ -1,5 +1,5 @@
 use super::*;
-use rcmake_resolve::Invocation;
+use rcmake_resolve::{Invocation, lower::custom_shell_operator};
 
 pub(super) fn write_step(
     out: &mut Vec<u8>,
@@ -100,10 +100,7 @@ pub(super) fn write_step(
                     out.push_str(b" && ");
                 }
                 out.push_str(b"$(CMAKE_COMMAND)");
-                for arg in invocation.argv.iter().skip(1) {
-                    out.push(b' ');
-                    make_recipe_text(out, &rcmake_base::shell::quote(arg))?;
-                }
+                write_custom_arguments(out, invocation)?;
                 out.push(b'\n');
             } else if let Some(command) = recipe_invocation(invocation, custom)? {
                 out.push_str(b"\t+$(SILENT)");
@@ -192,20 +189,37 @@ pub(super) fn shell_invocation(invocation: &Invocation) -> Option<Vec<u8>> {
 fn recipe_invocation(invocation: &Invocation, custom: bool) -> Result<Option<Vec<u8>>, GenError> {
     let mut recipe = Vec::new();
     if custom
-        && let Some((program, arguments)) = invocation.argv.split_first()
-        && program == b"$(MAKE)"
+        && invocation
+            .argv
+            .first()
+            .is_some_and(|program| program == b"$(MAKE)")
     {
         make_recipe_text(&mut recipe, &shell_command_prefix(invocation))?;
         recipe.push_str(b"$(MAKE)");
-        for argument in arguments {
-            recipe.push(b' ');
-            make_recipe_text(&mut recipe, &rcmake_base::shell::quote(argument))?;
-        }
+        write_custom_arguments(&mut recipe, invocation)?;
         recipe.push(b')');
     } else if let Some(command) = shell_invocation(invocation) {
         make_recipe_text(&mut recipe, &command)?;
     }
     Ok((!recipe.is_empty()).then_some(recipe))
+}
+
+fn write_custom_arguments(out: &mut Vec<u8>, invocation: &Invocation) -> Result<(), GenError> {
+    if let Some((program, arguments)) = invocation.argv.split_first() {
+        let word = rcmake_base::shell::quote(program);
+        if let Some(shell) = invocation.shell.strip_prefix(word.as_slice()) {
+            return make_recipe_text(out, shell);
+        }
+        for argument in arguments {
+            out.push(b' ');
+            if custom_shell_operator(argument) {
+                make_recipe_text(out, argument)?;
+            } else {
+                make_recipe_text(out, &rcmake_base::shell::quote(argument))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn shell_command_prefix(invocation: &Invocation) -> Vec<u8> {
@@ -232,4 +246,43 @@ pub(super) fn make_recipe_text(out: &mut Vec<u8>, text: &[u8]) -> Result<(), Gen
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_recipes_keep_shell_operators_and_quote_other_arguments() -> Result<(), GenError> {
+        let invocation = Invocation {
+            argv: [
+                "$(MAKE)",
+                "value with spaces",
+                "a; b",
+                ">",
+                "out",
+                ">>",
+                "log",
+                "|",
+                "cat",
+                "&&",
+                "echo",
+                "2>&1",
+                "$HOME",
+            ]
+            .map(BString::from)
+            .to_vec(),
+            shell: "echo '>'".into(),
+            working_dir: None,
+            link_response: None,
+        };
+        assert_eq!(
+            recipe_invocation(&invocation, true)?,
+            Some(
+                b"($(MAKE) 'value with spaces' 'a; b' > out >> log | cat && echo 2>&1 '$$HOME')"
+                    .to_vec()
+            ),
+        );
+        Ok(())
+    }
 }

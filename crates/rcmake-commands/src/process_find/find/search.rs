@@ -56,6 +56,7 @@ pub(super) struct Search<'a> {
     kind: Kind,
     options: &'a Options,
     is_darwin: bool,
+    is_windows: bool,
     hermetic: bool,
     decoration: Option<LibraryNames>,
     ignored: IgnoredPaths,
@@ -274,7 +275,8 @@ impl FrameworkOrder {
 
 impl<'a> Search<'a> {
     pub(super) fn new(cx: &Cx<'_>, kind: Kind, options: &'a Options, var: &[u8]) -> Self {
-        let is_darwin = cx.host().system().sysname == b"Darwin";
+        let sysname = cx.host().system().sysname;
+        let is_darwin = sysname == b"Darwin";
         let hermetic = hermetic_active(cx);
         let debug = cx.find_variable_debug(var)
             || cx
@@ -284,6 +286,7 @@ impl<'a> Search<'a> {
             kind,
             options,
             is_darwin,
+            is_windows: sysname == b"Windows",
             hermetic,
             decoration: matches!(kind, Kind::Library).then(|| LibraryNames::new(cx, is_darwin)),
             ignored: IgnoredPaths::new(cx),
@@ -490,7 +493,7 @@ impl<'a> Search<'a> {
             if allowed_probe
                 && !self.ignored.ignores_prefix(&path)
                 && directory.may_contain_framework(root, &framework)
-                && candidate(cx, Kind::File, &path)
+                && candidate(cx, Kind::File, &path, self.is_windows)
                 && self.validate(cx, found, false)?
             {
                 self.match_path = Some(path.clone());
@@ -532,7 +535,9 @@ impl<'a> Search<'a> {
             {
                 continue;
             }
-            if !self.ignored.ignores_prefix(&path) && candidate(cx, Kind::File, &path) {
+            if !self.ignored.ignores_prefix(&path)
+                && candidate(cx, Kind::File, &path, self.is_windows)
+            {
                 self.match_path = Some(path.clone());
                 return Ok(Some(if matches!(self.kind, Kind::Path) {
                     headers.clone()
@@ -678,7 +683,7 @@ impl<'a> Search<'a> {
                 .as_ref()
                 .is_none_or(|library| library.has_suffix(name));
         let windows_program =
-            !missing_descendant && cfg!(windows) && matches!(self.kind, Kind::Program);
+            !missing_descendant && self.is_windows && matches!(self.kind, Kind::Program);
         let record_direct = self.considered.is_some()
             || (self.event.is_some()
                 && (!matches!(self.kind, Kind::Library) || !self.ignored.prefixes.is_empty()));
@@ -827,7 +832,7 @@ impl<'a> Search<'a> {
         path: &Path,
         dir: &Path,
     ) -> Result<Option<PathBuf>, CmdError> {
-        if self.ignored.ignores_prefix(path) || !candidate(cx, self.kind, path) {
+        if self.ignored.ignores_prefix(path) || !candidate(cx, self.kind, path, self.is_windows) {
             return Ok(None);
         }
         let found = if matches!(self.kind, Kind::Path) {
@@ -1584,14 +1589,14 @@ fn bundle_executable(
     )
 }
 
-fn candidate(cx: &mut Cx<'_>, kind: Kind, path: &Path) -> bool {
+fn candidate(cx: &mut Cx<'_>, kind: Kind, path: &Path, is_windows: bool) -> bool {
     if matches!(kind, Kind::Path | Kind::File) {
         return cx.host().metadata(path, Follow::Yes).is_ok();
     }
     let Some(metadata) = file_metadata(cx, path) else {
         return false;
     };
-    if !matches!(kind, Kind::Program) || cfg!(windows) {
+    if !matches!(kind, Kind::Program) || is_windows {
         return true;
     }
 

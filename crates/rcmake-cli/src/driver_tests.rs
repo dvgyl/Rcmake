@@ -1183,3 +1183,155 @@ fn bare_profile_followed_by_non_project_path_suggests_equals_syntax() {
 }
 
 mod generation;
+
+#[test]
+fn native_doctor_reports_paths_and_cache_mode() -> rcmake_host::HostResult<()> {
+    let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let host = Arc::new(PureHost::new(root.into(), root.join("rcmake")));
+    let modules = root.join("cmake-data");
+    host.seed_file(&modules.join("Modules/CMakeDetermineSystem.cmake"), b"")?;
+    host.env_set(
+        b"RCMAKE_VENDORED_DATA_ROOT",
+        Some(&rcmake_host::path::from_native(&modules)),
+    );
+    host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(b"probe-cache"));
+    host.env_set(b"RCMAKE_PROBE_CACHE", Some(b"readonly"));
+    host.env_set(b"RCMAKE_CACHE_REMOTE_TOKEN", Some(b"secret-value"));
+    let tool = root
+        .join("bin")
+        .join(if cfg!(windows) { "ninja.exe" } else { "ninja" });
+    host.seed_file(&tool, b"")?;
+    host.set_permissions(&tool, 0o755)?;
+    host.env_set(
+        b"PATH",
+        Some(&rcmake_host::path::from_native(&root.join("bin"))),
+    );
+
+    assert_eq!(invoke(&host, &["rcmake", "doctor"]), 0);
+    let output = host.stream_bytes(Stream::Stdout).to_string();
+    for line in [
+        "Persona: native".to_owned(),
+        format!(
+            "CMAKE_ROOT: {}",
+            rcmake_host::path::from_native_cmake(&modules)
+        ),
+        format!("ninja: {}", rcmake_host::path::from_native_cmake(&tool)),
+        "Probe cache mode: read-only".to_owned(),
+        "RCMAKE_CACHE_REMOTE_TOKEN".to_owned(),
+    ] {
+        assert!(output.contains(&line), "{output}");
+    }
+    assert!(!output.contains("secret-value"));
+    Ok(())
+}
+
+#[test]
+fn native_cache_commands_report_and_remove_cache_data() -> rcmake_host::HostResult<()> {
+    let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let host = Arc::new(PureHost::new(root.into(), root.join("rcmake")));
+    host.env_set(b"RCMAKE_CACHE_DIR", Some(b"probe-cache"));
+    let store = rcmake_store::Store::new(
+        host.as_ref(),
+        rcmake_store::StoreConfig::from_host(host.as_ref()),
+    )?;
+    let blob = store.put_blob(b"sample data")?;
+    let entry = rcmake_store::Entry {
+        trace: Vec::new(),
+        blobs: vec![blob],
+        payload: String::from("sample entry"),
+    };
+    let domain = rcmake_store::Domain::ProbeV1;
+    assert_eq!(
+        store.put_entry(domain, domain.key(b"key"), &entry)?,
+        rcmake_store::PublishOutcome::Published
+    );
+    let marker = store.root().join("keep.txt");
+    host.seed_file(&marker, b"Keep this file.")?;
+    assert_eq!(invoke(&host, &["rcmake", "cache", "dir"]), 0);
+    let directory = rcmake_host::path::from_native_cmake(store.root());
+    assert_eq!(
+        host.stream_bytes(Stream::Stdout).to_string(),
+        format!("{directory}\n")
+    );
+
+    assert_eq!(invoke(&host, &["rcmake", "cache"]), 0);
+    assert_eq!(invoke(&host, &["rcmake", "cache", "status"]), 0);
+    assert_eq!(
+        host.stream_bytes(Stream::Stdout)
+            .to_string()
+            .matches("Entries: 1\nBlobs: 1\n")
+            .count(),
+        2
+    );
+    let expected_bytes = store.stats()?.bytes;
+    assert_eq!(invoke(&host, &["rcmake", "cache", "clear"]), 0);
+    assert!(
+        host.stream_bytes(Stream::Stdout)
+            .to_string()
+            .contains(&format!(
+                "Removed 1 entries and 1 blobs. Reclaimed {expected_bytes} bytes."
+            ))
+    );
+    assert_eq!(store.stats()?, rcmake_store::StoreStats::default());
+    assert_eq!(
+        host.read(&marker, ReadRange::All { limit: 64 })?,
+        b"Keep this file."
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_and_cache_keep_source_directory_dispatch() -> rcmake_host::HostResult<()> {
+    for command in ["doctor", "cache"] {
+        let host = project_host();
+        assert_eq!(invoke(&host, &["cmake", command]), 1);
+        assert!(
+            host.stream_bytes(Stream::Stderr)
+                .to_string()
+                .contains("does not exist")
+        );
+
+        for persona in ["cmake", "rcmake"] {
+            let host = project_host();
+            let script = host.initial_cwd().join(command).join("CMakeLists.txt");
+            host.seed_file(
+                &script,
+                b"cmake_minimum_required(VERSION 4.5)\nproject(Example NONE)\nmessage(STATUS \"Source directory selected\")\n",
+            )?;
+            assert_eq!(
+                invoke(&host, &[persona, command, "-G", "Ninja"]),
+                0,
+                "{}",
+                host.stream_bytes(Stream::Stderr)
+            );
+            assert!(
+                host.stream_bytes(Stream::Stdout)
+                    .to_string()
+                    .contains("Source directory selected")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_build_usage_names_rcmake_on_both_lines() {
+    let host = Arc::new(PureHost::default());
+    assert_eq!(invoke(&host, &["rcmake", "--build"]), 1);
+    assert!(host.stream_bytes(Stream::Stderr).to_string().contains(
+        "Usage: rcmake --build <dir>             [options] [-- [native-options]]\n       rcmake --build --preset"
+    ));
+}
+
+#[test]
+fn explain_suggests_build_directory_when_default_cache_is_missing() -> rcmake_host::HostResult<()> {
+    let host = Arc::new(PureHost::default());
+    host.seed_file(&host.initial_cwd().join("build/CMakeCache.txt"), b"")?;
+    assert_eq!(invoke(&host, &["rcmake", "explain", "app"]), 2);
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("Hint: found ./build/CMakeCache.txt. Try `rcmake explain ... -B build`.")
+    );
+    Ok(())
+}

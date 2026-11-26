@@ -387,9 +387,11 @@ impl Interp {
                 }
                 _ => match doing {
                     Doing::Lists => {
-                        let split = self
-                            .lookup_var(arg)
-                            .map_or(Ok(()), |value| budget.split(value, Empty::Keep, &mut items));
+                        let split = self.cx().with_var(arg, |value| {
+                            value.map_or(Ok(()), |value| {
+                                budget.split(value, Empty::Keep, &mut items)
+                            })
+                        });
                         if let Err(limit) = split {
                             self.error_here(limit.to_string().into());
                             return None;
@@ -441,9 +443,9 @@ impl Interp {
             let mut lists = Vec::with_capacity(items.len());
             for list_var in &items {
                 let mut elems = Vec::new();
-                let split = self
-                    .lookup_var(list_var)
-                    .map_or(Ok(()), |value| budget.split(value, Empty::Keep, &mut elems));
+                let split = self.cx().with_var(list_var, |value| {
+                    value.map_or(Ok(()), |value| budget.split(value, Empty::Keep, &mut elems))
+                });
                 if let Err(limit) = split {
                     self.error_here(limit.to_string().into());
                     return None;

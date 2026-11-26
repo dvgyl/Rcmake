@@ -35,6 +35,7 @@ rcmake-lsp = { workspace = true, features = ["eval", "stdio"] }
 rcmake-model.workspace = true
 rcmake-presets.workspace = true
 rcmake-resolve.workspace = true
+rcmake-store.workspace = true
 rcmake-syntax.workspace = true
 rcmake-tool-e.workspace = true
 zstd.workspace = true

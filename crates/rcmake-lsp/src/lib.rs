@@ -63,6 +63,10 @@ pub fn run_stdio_with_args(program: &str, args: &[impl AsRef<[u8]>]) -> std::pro
             let _ = out.flush();
             std::process::ExitCode::from(code)
         }
+        cli::Startup::InvalidArgument(message) => {
+            let _ = std::io::stderr().lock().write_all(message.as_bytes());
+            std::process::ExitCode::from(2)
+        }
         cli::Startup::Serve => {
             if std::io::stdin().is_terminal() {
                 let mut err = std::io::stderr().lock();

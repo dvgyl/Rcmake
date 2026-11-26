@@ -7,6 +7,8 @@
 pub enum Startup {
     /// Start the LSP server on standard input and output.
     Serve,
+    /// Print an argument error on standard error and exit with code 2.
+    InvalidArgument(String),
     /// Print this text on standard output and exit with this status code.
     Exit {
         /// Text to write to standard output.
@@ -18,29 +20,37 @@ pub enum Startup {
 
 /// Inspect server command-line arguments without reading standard input.
 ///
-/// `program` is the command name shown in the usage line (for example `"rcmake-lsp"`
-/// or `"rcmake lsp"`). Unknown arguments (such as `--stdio` or `--clientProcessId=<pid>`
-/// passed by editor clients) are ignored and return [`Startup::Serve`].
+/// `program` is the command name shown in diagnostics and help.
 #[must_use]
 pub fn startup(program: &str, args: &[impl AsRef<[u8]>]) -> Startup {
+    let mut startup = Startup::Serve;
     for arg in args {
-        match arg.as_ref() {
-            b"-h" | b"--help" => {
-                return Startup::Exit {
-                    stdout: help_text(program),
-                    code: 0,
-                };
+        let arg = arg.as_ref();
+        let text: fn(&str) -> String = match arg {
+            b"-h" | b"--help" => help_text,
+            b"-V" | b"--version" => |_| version_text(),
+            b"--stdio" => continue,
+            _ if arg
+                .strip_prefix(b"--clientProcessId=")
+                .is_some_and(|pid| !pid.is_empty() && pid.iter().all(u8::is_ascii_digit)) =>
+            {
+                continue;
             }
-            b"-V" | b"--version" => {
-                return Startup::Exit {
-                    stdout: version_text(),
-                    code: 0,
-                };
+            _ => {
+                return Startup::InvalidArgument(format!(
+                    "{program}: Unknown argument {}. Run {program} --help.\n",
+                    String::from_utf8_lossy(arg)
+                ));
             }
-            _ => {}
+        };
+        if startup == Startup::Serve {
+            startup = Startup::Exit {
+                stdout: text(program),
+                code: 0,
+            };
         }
     }
-    Startup::Serve
+    startup
 }
 
 fn help_text(program: &str) -> String {

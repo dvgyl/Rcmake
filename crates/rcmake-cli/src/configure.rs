@@ -26,7 +26,7 @@ mod graphviz;
 mod preloads;
 mod profiling;
 mod restart;
-mod speed;
+pub(crate) mod speed;
 #[cfg(test)]
 mod tests;
 

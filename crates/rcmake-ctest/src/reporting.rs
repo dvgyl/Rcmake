@@ -175,10 +175,13 @@ impl<'a> Report<'a> {
             };
             self.write(format_args!(
                 "UpdateCTestConfiguration  from :{}\n",
-                config.display()
+                path::from_native_cmake(&config)
             ));
             if self.host.metadata(&config, Follow::Yes).is_ok() {
-                self.write(format_args!("Parse Config file:{}\n", config.display()));
+                self.write(format_args!(
+                    "Parse Config file:{}\n",
+                    path::from_native_cmake(&config)
+                ));
             }
         }
         self.write(format_args!("Test project {}\n", path.display()));

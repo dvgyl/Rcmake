@@ -21,6 +21,17 @@ pub struct GcReport {
     pub bytes_removed: u64,
 }
 
+/// Counts and total size of the files that contain cache data.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StoreStats {
+    /// Number of entries.
+    pub entries: usize,
+    /// Number of blobs.
+    pub blobs: usize,
+    /// Combined size of entries and blobs in bytes.
+    pub bytes: u64,
+}
+
 struct CachedFile {
     path: PathBuf,
     digest: Digest,
@@ -44,6 +55,56 @@ impl FromJson for BlobReferences {
 }
 
 impl Store<'_> {
+    /// Count entries and blobs in the current cache.
+    pub fn stats(&self) -> HostResult<StoreStats> {
+        let mut stats = StoreStats::default();
+        if !self.readable()? {
+            return Ok(stats);
+        }
+        for (directory, extension) in self.data_locations() {
+            let files = self.cache_files(&directory, extension)?;
+            if extension == "entry" {
+                stats.entries += files.len();
+            } else {
+                stats.blobs += files.len();
+            }
+            for file in files {
+                stats.bytes = stats.bytes.saturating_add(file.stat.len);
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Remove entries and blobs under the cache lock. Return the space freed.
+    pub fn clear(&self) -> HostResult<GcReport> {
+        let mut report = GcReport::default();
+        if !self.writable() || !self.readable()? {
+            return Ok(report);
+        }
+        let locked = self.lock_cache(crate::PUBLISH_WAIT)?;
+        for (directory, extension) in self.data_locations() {
+            for file in self.cache_files(&directory, extension)? {
+                if locked.remove_if_unchanged(&file.path, &file.stat)? {
+                    if extension == "entry" {
+                        report.entries_removed += 1;
+                    } else {
+                        report.blobs_removed += 1;
+                    }
+                    report.bytes_removed = report.bytes_removed.saturating_add(file.stat.len);
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    fn data_locations(&self) -> impl Iterator<Item = (PathBuf, &'static str)> {
+        let entries = self.config.root.join("entries");
+        Domain::ALL
+            .into_iter()
+            .map(move |domain| (entries.join(domain.as_str()), "entry"))
+            .chain([(self.config.root.join("blobs"), "blob")])
+    }
+
     /// Evict least recently used entries when over the size cap, then sweep old
     /// unreferenced blobs. A busy collection lock causes the pass to be skipped.
     pub fn gc(&self) -> HostResult<GcReport> {

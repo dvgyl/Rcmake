@@ -327,7 +327,7 @@ impl<H: Host + ?Sized> MemoHost<H> {
     /// Changes to intersecting paths and calls that can change any path invalidate
     /// the generation. The bounded table returns no generation when full.
     pub fn stable_generation_for(&self, path: &Path) -> Option<u64> {
-        if !path.is_absolute() || path_bytes(path) > 4096 {
+        if !scope::is_absolute(self.base.as_ref(), path) || path_bytes(path) > 4096 {
             return None;
         }
         let mut cache = self.write_cache();

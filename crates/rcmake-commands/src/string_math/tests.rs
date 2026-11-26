@@ -508,3 +508,15 @@ fn json_set_rejects_the_maximum_unsigned_array_index() {
         ],
     );
 }
+
+#[test]
+fn genex_strip_collapses_separators_after_an_escaped_semicolon() {
+    let (mut interp, host) = setup(
+        r#"
+string(GENEX_STRIP [[x\;;$<CONFIG>;z]] stripped)
+list(LENGTH stripped length)
+"#,
+    );
+    run(&mut interp, &host);
+    check(&mut interp, &[("stripped", br"x\;z"), ("length", b"1")]);
+}

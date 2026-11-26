@@ -12,7 +12,7 @@ use rcmake_model::{
 };
 
 use super::graph::push;
-use super::shell::direct;
+use super::shell::{direct, make_custom};
 use super::{build_relative, compute_artifacts, definition, join};
 use crate::ide::{IdeCustomPhase, IdeCustomStep};
 use crate::sources::{self, SourcePaths, absolute_path};
@@ -375,6 +375,8 @@ impl<'a> Commands<'a> {
             }
             let invocation = if ninja_posix {
                 super::shell::ninja_custom(argv, working_dir.clone(), command.verbatim)
+            } else if self.model.generator == Some(GeneratorKind::UnixMakefiles) {
+                make_custom(argv, working_dir.clone(), command.verbatim)
             } else {
                 direct(argv, working_dir.clone())
             };

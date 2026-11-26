@@ -24,8 +24,8 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         return Ok(Flow::Normal);
     }
     if command == b"PREPEND" {
-        let raw = cx.var(name);
         if !rest.is_empty() {
+            let raw = cx.var(name);
             // Check the exact joined size before the value grows. A separator goes between
             // two items, and between the items and a nonempty existing value.
             let existing_len = raw.as_ref().map_or(0, |raw| raw.len());

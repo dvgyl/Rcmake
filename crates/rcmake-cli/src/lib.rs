@@ -19,6 +19,7 @@ mod open;
 mod options;
 mod persona;
 mod presets;
+mod probe_cache;
 mod profile;
 mod resource;
 mod sarif;
@@ -46,7 +47,7 @@ use rcmake_diag::{
     RenderOptions, render,
 };
 use rcmake_eval::{CacheDefine, Interp, InterpConfig, RunMode};
-use rcmake_host::{Host, Stream, WriteMode};
+use rcmake_host::{FileKind, Follow, Host, Stream, WriteMode};
 use rcmake_json::Value;
 use rcmake_model::CacheType;
 
@@ -243,6 +244,18 @@ fn run_cmake(
     host: Arc<dyn Host>,
 ) -> i32 {
     if persona == persona::Persona::Native {
+        if let [command, args @ ..] = rest
+            && matches!(command.as_slice(), b"doctor" | b"cache")
+            && !host
+                .metadata(&resolve_cli_path(host.as_ref(), command), Follow::Yes)
+                .is_ok_and(|meta| meta.kind == FileKind::Dir)
+        {
+            return if command == b"doctor" {
+                probe_cache::doctor(argv.first(), args, host.as_ref())
+            } else {
+                probe_cache::cache(args, host.as_ref())
+            };
+        }
         if let Some(args) = rest.strip_prefix(&[BString::from("explain")]) {
             return explain_cmd::run(argv.first(), args, host);
         }

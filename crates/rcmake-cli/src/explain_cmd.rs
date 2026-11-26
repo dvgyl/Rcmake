@@ -205,8 +205,20 @@ fn request(
         .filter(|entry| !entry.value.is_empty())
         .map(|entry| path::to_native(&entry.value));
     let missing = || {
+        let hint = if options.build.is_none()
+            && host
+                .metadata(&build.join("CMakeCache.txt"), Follow::Yes)
+                .is_err_and(|err| err.kind == std::io::ErrorKind::NotFound)
+            && host
+                .metadata(&build.join("build/CMakeCache.txt"), Follow::Yes)
+                .is_ok_and(|meta| meta.kind == FileKind::File)
+        {
+            "\nHint: found ./build/CMakeCache.txt. Try `rcmake explain ... -B build`."
+        } else {
+            ""
+        };
         format!(
-            "No configured build directory at {}. {CONFIGURE_FIRST}",
+            "No configured build directory at {}. {CONFIGURE_FIRST}{hint}",
             build.display()
         )
     };

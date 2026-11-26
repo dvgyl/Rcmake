@@ -28,7 +28,7 @@ use rcmake_json::{
 };
 
 pub use digest::{Digest, Domain, KeyHasher};
-pub use gc::{GcReport, gc};
+pub use gc::{GcReport, StoreStats, gc};
 pub use private_dir::{PrivateDir, canonical_path, ensure_private_dir, verify_private_dir};
 pub use stamp::{
     FastStat, InputStamp, MissReason, Trace, TraceMemo, TreePolicy, VerifyOutcome,

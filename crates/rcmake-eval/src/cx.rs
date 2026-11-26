@@ -227,14 +227,11 @@ impl Cx<'_> {
         name: &[u8],
         items: &[rcmake_expr::ExpandedArg],
     ) -> Result<(), CmdError> {
-        self.interp.observe_replay_variable_access(name);
-        self.interp.record_variable_access(name);
         if items.is_empty() {
-            if self.interp.needs_var_watch(name) {
-                let _ = self.interp.read_var(name);
-            }
             return Ok(());
         }
+        self.interp.observe_replay_variable_access(name);
+        self.interp.record_variable_access(name);
         if !self.interp.needs_var_watch(name) && self.interp.var_ledger.is_none() {
             let max_value = self.interp.config.limits.max_value_bytes;
             let live_limit = self.interp.live_limit();

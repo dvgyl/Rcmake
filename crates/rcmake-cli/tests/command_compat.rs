@@ -364,3 +364,64 @@ add_executable(top main.cpp)
     );
     Ok(())
 }
+
+#[test]
+fn lsp_rejects_unknown_arguments_for_both_entry_points() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let link = fixture.root.join("rcmake-lsp");
+    fixture
+        .host
+        .symlink(Path::new(env!("CARGO_BIN_EXE_rcmake")), &link)?;
+    let direct = run(
+        &fixture.host,
+        &fixture.root,
+        link.to_str().ok_or("Invalid path")?,
+        &["--bogus"],
+    )?;
+    let subcommand = fixture.cmake(&["lsp", "--bogus"])?;
+    for output in [direct, subcommand] {
+        assert_eq!(output.results, [ProcessResult::Exited(2)]);
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Unknown argument --bogus"));
+    }
+    Ok(())
+}
+
+#[test]
+fn unix_makefiles_runs_custom_shell_operators() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    fixture.write("main.c", b"int main(void) { return 0; }\n")?;
+    fixture.write(
+        "CMakeLists.txt",
+        br#"
+cmake_minimum_required(VERSION 4.5)
+project(ShellOperators C)
+add_custom_command(OUTPUT generated.txt
+  COMMAND "${CMAKE_COMMAND}" -E echo "a; b" > generated.txt VERBATIM)
+add_custom_target(generate ALL DEPENDS generated.txt
+  COMMAND "${CMAKE_COMMAND}" -E echo one | cat > pipeline.txt ";" echo two >> pipeline.txt)
+add_executable(app main.c)
+add_custom_command(TARGET app PRE_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E echo before > events.txt VERBATIM)
+add_custom_command(TARGET app POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E echo after >> events.txt VERBATIM)
+"#,
+    )?;
+    success(&fixture.cmake(&["-S", ".", "-B", "out", "-G", "Unix Makefiles"])?);
+    success(&fixture.cmake(&["--build", "out"])?);
+    for (name, expected) in [
+        ("generated.txt", b"a; b\n".as_slice()),
+        ("pipeline.txt", b"one\ntwo\n".as_slice()),
+        ("events.txt", b"before\nafter\n".as_slice()),
+    ] {
+        assert_eq!(
+            fixture.host.read(
+                &fixture.root.join("out").join(name),
+                ReadRange::All { limit: 64 }
+            )?,
+            expected,
+            "{name}"
+        );
+    }
+    Ok(())
+}

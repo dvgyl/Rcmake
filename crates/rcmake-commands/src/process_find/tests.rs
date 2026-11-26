@@ -528,12 +528,15 @@ find_program(ABSOLUTE {absolute} NO_DEFAULT_PATH)
 }
 
 #[test]
-#[cfg(windows)]
 fn find_program_tries_windows_executable_suffixes() -> HostResult<()> {
     let (host, mut interp) = setup();
-    host.env_set(b"PATH", Some(b"C:/tools"));
+    let mut system = host.system();
+    system.sysname = "Windows".into();
+    host.set_system(system)?;
+    let tools = if cfg!(windows) { "C:/tools" } else { "/tools" };
+    host.env_set(b"PATH", Some(tools.as_bytes()));
     for name in ["ninja.exe", "tool.com", "tool.exe", "tool", "plain"] {
-        host.seed_file(&Path::new("C:/tools").join(name), b"")?;
+        host.seed_file(&Path::new(tools).join(name), b"")?;
     }
     let script = "
 find_program(NINJA ninja NAMES_PER_DIR)
@@ -541,9 +544,9 @@ find_program(TOOL tool)
 find_program(PLAIN plain)
 ";
     assert_eq!(run(&host, &mut interp, script)?, 0);
-    assert_eq!(var(&mut interp, b"NINJA"), "C:/tools/ninja.exe");
-    assert_eq!(var(&mut interp, b"TOOL"), "C:/tools/tool.com");
-    assert_eq!(var(&mut interp, b"PLAIN"), "C:/tools/plain");
+    assert_eq!(var(&mut interp, b"NINJA"), format!("{tools}/ninja.exe"));
+    assert_eq!(var(&mut interp, b"TOOL"), format!("{tools}/tool.com"));
+    assert_eq!(var(&mut interp, b"PLAIN"), format!("{tools}/plain"));
     Ok(())
 }
 
@@ -1945,7 +1948,10 @@ fn find_program_darwin_plist_handles_iso8859_and_nested_keys() -> HostResult<()>
             .and_then(|stage| stage.args.last())
             .map(|arg| arg.to_str_lossy().into_owned())
             .unwrap_or_default();
-        if plist_arg.ends_with("Cafe.app/Contents/Info.plist") {
+        if plist_arg
+            .replace('\\', "/")
+            .ends_with("Cafe.app/Contents/Info.plist")
+        {
             Ok(RunOutput {
                 results: vec![ProcessResult::Exited(0)],
                 stdout: "café\n".as_bytes().to_vec(),

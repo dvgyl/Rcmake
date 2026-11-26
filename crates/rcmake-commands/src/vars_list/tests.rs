@@ -924,3 +924,20 @@ list(REMOVE_DUPLICATES dups)
     state.var("rm_at", b"x0;x1;x3");
     state.var("dups", b"b;a;c;d");
 }
+
+#[test]
+fn empty_list_edits_do_not_notify_variable_watches() {
+    let mut script = Script::new(Vec::new());
+    script.success(
+        r#"
+set(defined value)
+variable_watch(defined)
+variable_watch(missing)
+list(APPEND defined)
+list(PREPEND defined)
+list(APPEND missing)
+list(PREPEND missing)
+"#,
+    );
+    assert!(script.stderr().is_empty(), "{}", script.stderr());
+}

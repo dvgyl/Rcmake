@@ -6,7 +6,7 @@ use rcmake_host::Host;
 use crate::options::{CacheEdit, Options};
 use crate::persona::Persona;
 
-pub(super) fn settings(host: &dyn Host, opts: &Options, profiled: bool) -> (SpeedOptions, bool) {
+pub(crate) fn settings(host: &dyn Host, opts: &Options, profiled: bool) -> (SpeedOptions, bool) {
     if opts.persona != Persona::Native || opts.view {
         return (SpeedOptions::default(), false);
     }

@@ -1251,3 +1251,35 @@ fn add_dependencies_rebuilds_index_after_in_place_target_mutation() -> TestResul
     assert_eq!(actual, expected);
     Ok(())
 }
+
+#[test]
+fn missing_dependency_target_reports_an_error_and_continues() -> TestResult {
+    let (host, mut interp) = configure(
+        "project(Test NONE)\nadd_custom_target(existing)\nadd_dependencies(missing existing)\nset(reached yes)",
+        &[],
+        1,
+    )?;
+    var(&mut interp, "reached", "yes");
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("non-existent target \"missing\"")
+    );
+    Ok(())
+}
+
+#[test]
+fn missing_link_target_stops_configure() -> TestResult {
+    let (host, mut interp) = configure(
+        "project(Test NONE)\ntarget_link_libraries(missing PRIVATE m)\nset(reached yes)",
+        &[],
+        1,
+    )?;
+    assert_eq!(interp.cx().var(b"reached"), None);
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("Cannot specify link libraries")
+    );
+    Ok(())
+}

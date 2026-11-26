@@ -49,7 +49,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             _ => None,
         }
     }) else {
-        return Err(reported(
+        return Err(crate::command_error(
             cx,
             format!(
                 "Cannot specify link libraries for target \"{}\" which is not built by this project.",

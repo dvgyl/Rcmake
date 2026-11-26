@@ -262,7 +262,7 @@ impl Dirs {
         path: &Path,
         depth: u8,
     ) -> Option<Scope> {
-        if depth > MAX_DEPTH || !plain(path) {
+        if depth > MAX_DEPTH || !plain(base, path) {
             return None;
         }
         let Some(parent) = path.parent() else {
@@ -286,7 +286,7 @@ impl Dirs {
             Err(_) => None,
             Ok(link) if link.kind == FileKind::Symlink => {
                 let target = base.read_link(path).ok()?;
-                let target = link_target(parent, &target)?;
+                let target = link_target(base, parent, &target)?;
                 let mut scope = self.resolve(base, &target, depth + 1)?;
                 scope.dirs.push(dir);
                 scope.lookups.push(lookup);
@@ -328,11 +328,20 @@ impl Dirs {
     }
 }
 
+/// Check for a full path in the host's filesystem.
+pub(super) fn is_absolute<H: Host + ?Sized>(base: &H, path: &Path) -> bool {
+    path.is_absolute()
+        || (cfg!(windows) && path.has_root() && {
+            let cwd = base.initial_cwd();
+            cwd.has_root() && !cwd.is_absolute()
+        })
+}
+
 /// Return `true` for an absolute path in normal form.
 ///
 /// A dot component, a repeated separator, or a trailing separator gives `false`.
-fn plain(path: &Path) -> bool {
-    path.is_absolute()
+fn plain<H: Host + ?Sized>(base: &H, path: &Path) -> bool {
+    is_absolute(base, path)
         && path.as_os_str().len() <= 4096
         && path.components().all(|component| {
             matches!(
@@ -340,12 +349,21 @@ fn plain(path: &Path) -> bool {
                 Component::Prefix(_) | Component::RootDir | Component::Normal(_)
             )
         })
-        && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
+        && {
+            let rebuilt = path.components().collect::<PathBuf>();
+            let expected = rebuilt.as_os_str().as_encoded_bytes();
+            let actual = path.as_os_str().as_encoded_bytes();
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(&a, &b)| a == b || (cfg!(windows) && a == b'/' && b == b'\\'))
+        }
 }
 
 /// Return the path of a link target. Reject a target with dot components.
-fn link_target(parent: &Path, target: &Path) -> Option<PathBuf> {
-    let path = if target.is_absolute() {
+fn link_target<H: Host + ?Sized>(base: &H, parent: &Path, target: &Path) -> Option<PathBuf> {
+    let path = if is_absolute(base, target) {
         target.to_path_buf()
     } else {
         if target
@@ -356,7 +374,7 @@ fn link_target(parent: &Path, target: &Path) -> Option<PathBuf> {
         }
         parent.join(target)
     };
-    plain(&path).then_some(path)
+    plain(base, &path).then_some(path)
 }
 
 #[cfg(test)]
@@ -366,11 +384,12 @@ mod tests {
     #[test]
     fn accepts_only_normal_absolute_spellings() {
         // Use an absolute root for the platform.
+        let base = crate::PureHost::default();
         let root = if cfg!(windows) { "C:\\work" } else { "/work" };
         let sep = std::path::MAIN_SEPARATOR;
         let path = |rest: &str| PathBuf::from(format!("{root}{rest}"));
         for spelling in [path(""), path(&format!("{sep}file"))] {
-            assert!(plain(&spelling), "{}", spelling.display());
+            assert!(plain(&base, &spelling), "{}", spelling.display());
         }
         for spelling in [
             PathBuf::from("work"),
@@ -379,17 +398,23 @@ mod tests {
             path(&format!("{sep}{sep}file")),
             path(&format!("{sep}..{sep}file")),
         ] {
-            assert!(!plain(&spelling), "{}", spelling.display());
+            assert!(!plain(&base, &spelling), "{}", spelling.display());
         }
         let work = path("");
         assert_eq!(
-            link_target(&work, &Path::new("dir").join("file")),
+            link_target(&base, &work, &Path::new("dir").join("file")),
             Some(work.join("dir").join("file"))
         );
-        assert_eq!(link_target(&work, &Path::new("..").join("file")), None);
-        assert_eq!(link_target(&work, &Path::new(".").join("file")), None);
         assert_eq!(
-            link_target(&work, &path(&format!("{sep}a{sep}..{sep}b"))),
+            link_target(&base, &work, &Path::new("..").join("file")),
+            None
+        );
+        assert_eq!(
+            link_target(&base, &work, &Path::new(".").join("file")),
+            None
+        );
+        assert_eq!(
+            link_target(&base, &work, &path(&format!("{sep}a{sep}..{sep}b"))),
             None
         );
     }

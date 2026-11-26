@@ -36,6 +36,10 @@ fn main() -> ExitCode {
             let _ = out.flush();
             ExitCode::from(code)
         }
+        rcmake_lsp::cli::Startup::InvalidArgument(message) => {
+            let _ = io::stderr().lock().write_all(message.as_bytes());
+            ExitCode::from(2)
+        }
         rcmake_lsp::cli::Startup::Serve => {
             if io::stdin().is_terminal() {
                 let mut err = io::stderr().lock();

@@ -87,7 +87,13 @@ fn usage(host: &dyn Host, persona: crate::persona::Persona, message: &str) -> i3
         host.write_out(Stream::Stderr, message.as_bytes());
         host.write_out(Stream::Stderr, b"\n");
     }
-    host.write_out(Stream::Stderr, persona.usage(USAGE).as_bytes());
+    let usage = persona.usage(USAGE);
+    let usage = if persona == crate::persona::Persona::Native {
+        std::borrow::Cow::Owned(usage.replace("       cmake --build", "       rcmake --build"))
+    } else {
+        usage
+    };
+    host.write_out(Stream::Stderr, usage.as_bytes());
     1
 }
 

@@ -149,7 +149,31 @@ pub(super) fn raw_flags(model: &ProjectModel, dir: DirId, value: &[u8]) -> BStri
 }
 
 pub(super) fn direct(argv: Vec<BString>, working_dir: Option<BString>) -> Invocation {
-    let shell = join_words(argv.iter().map(|arg| quote(arg)));
+    direct_with_operators(argv, working_dir, |_| false)
+}
+
+pub(super) fn make_custom(
+    argv: Vec<BString>,
+    working_dir: Option<BString>,
+    verbatim: bool,
+) -> Invocation {
+    direct_with_operators(argv, working_dir, |arg| {
+        custom_shell_operator(arg) || (!verbatim && arg == b";")
+    })
+}
+
+fn direct_with_operators(
+    argv: Vec<BString>,
+    working_dir: Option<BString>,
+    is_operator: impl Fn(&[u8]) -> bool,
+) -> Invocation {
+    let shell = join_words(argv.iter().enumerate().map(|(index, arg)| {
+        if index != 0 && is_operator(arg) {
+            arg.clone()
+        } else {
+            quote(arg)
+        }
+    }));
     Invocation {
         argv,
         shell,

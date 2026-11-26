@@ -375,3 +375,25 @@ fn variable_watch_stack_lists_files_and_function_scopes() {
         )
     );
 }
+
+#[test]
+fn foreach_reads_lists_after_the_watch_callback() {
+    let out = run(r#"
+function(refresh name access)
+  if(access STREQUAL READ_ACCESS)
+    set(${name} new again PARENT_SCOPE)
+  endif()
+endfunction()
+set(values old)
+variable_watch(values refresh)
+foreach(item IN LISTS values)
+  message("list=${item}")
+endforeach()
+set(values old)
+foreach(item IN ZIP_LISTS values)
+  message("zip=${item_0}")
+endforeach()
+"#);
+    assert_eq!(out.exit, 0, "{}", out.stderr);
+    assert_eq!(out.stderr, "list=new\nlist=again\nzip=new\nzip=again\n");
+}
