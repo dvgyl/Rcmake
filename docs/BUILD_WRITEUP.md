@@ -292,7 +292,7 @@ RCMAKE_STAGE_PROFILE=release scripts/stage.sh
 | Hermetic input auditing (`--hermetic`) | `target/stage/bin/rcmake -S . -B build -G Ninja --hermetic=strict` |
 | Build the `rcmake-lsp` language server | `cargo build --locked --release -p rcmake-lsp --features eval,stdio` |
 | WebAssembly dependency audit and WASI `PureHost` smoke (`rcmake.wasm`) | `python3 tools/measure/wasm_smoke.py --require-wasi --json wasm-smoke.json` |
-| Seeded generative fuzzing, not coverage-guided (all 14 targets, 1,000,000 inputs each) | `for s in syntax expr regex genex json presets cps archive path tolerant binfmt diagnostics fortran store-frame; do cargo run --release --bin rcmake-fuzz -- "$s" --iterations 1000000; done` |
+| Seeded generative fuzzing, not coverage-guided (all 14 targets, 1,000,000 inputs each) | `for s in syntax expr regex genex json presets cps archive path tolerant binfmt diagnostics fortran store-frame; do cargo run --profile fuzz --bin rcmake-fuzz -- "$s" --iterations 1000000; done` |
 | Upstream CMake release and policy drift tracker | `python3 tools/measure/upstream_track.py --out-json upstream.json --out-md upstream.md` |
 
 ## 8. Lessons that held up

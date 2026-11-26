@@ -383,7 +383,7 @@ python3 tools/measure/bench_configure.py --rcmake target/stage/bin/rcmake --orac
 python3 tools/measure/wasm_smoke.py --require-wasi --json wasm-smoke.json
 
 # Seeded generative fuzzing, not coverage-guided (one of 14 targets)
-cargo run --release --bin rcmake-fuzz -- syntax --iterations 1000000
+cargo run --profile fuzz --bin rcmake-fuzz -- syntax --iterations 1000000
 
 # Upstream CMake release and policy tracking
 python3 tools/measure/upstream_track.py --out-json upstream.json --out-md upstream.md
