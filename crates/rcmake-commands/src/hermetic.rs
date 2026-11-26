@@ -14,7 +14,7 @@ use rcmake_diag::{
 };
 use rcmake_eval::hermetic::{
     AuditDecision, AuditOutcome, HermeticAuditor, HermeticContext, HermeticPolicy, HermeticSite,
-    HermeticSources, HermeticViolation, ViolationKind,
+    HermeticSources, HermeticViolation, PathAccess, ViolationKind,
 };
 use rcmake_eval::{CmdError, Cx, HermeticMode, Interp, Services};
 use rcmake_host::{
@@ -172,6 +172,13 @@ impl HermeticRuntime {
 
     pub(crate) fn denied(&self) -> bool {
         self.host.context.denied()
+    }
+
+    pub(crate) fn set_cli_make_program(&self, program: Option<&Path>) {
+        self.host
+            .state()
+            .auditor
+            .set_cli_make_program(self.host.inner.as_ref(), program);
     }
 
     pub(crate) fn finish(&self) {
@@ -423,10 +430,12 @@ fn allow_host_toolchain(policy: &mut HermeticPolicy, host: &dyn Host, sysname: &
             }
         }
         // Compiler ABI detection checks the standard library directories,
-        // which macOS does not have. Allow only these exact paths.
-        for standard in ["/lib", "/lib32", "/lib64", "/usr/lib32", "/usr/lib64"] {
-            policy.allow_exact_path(host, Path::new(standard));
-        }
+        // which macOS does not have. Allow metadata probes only.
+        allow_standard_lib_metadata(
+            policy,
+            host,
+            &["/lib", "/lib32", "/lib64", "/usr/lib32", "/usr/lib64"],
+        );
         if let Some(home) = host
             .env_get(b"HOME")
             .map(|value| path::to_native(&value))
@@ -451,8 +460,6 @@ fn allow_host_toolchain(policy: &mut HermeticPolicy, host: &dyn Host, sysname: &
             "/etc/debian_version",
             "/etc/arch-release",
             "/usr",
-            "/usr/lib",
-            "/usr/lib64",
             "/usr/include",
             "/usr/local/lib",
             "/usr/local/include",
@@ -462,6 +469,7 @@ fn allow_host_toolchain(policy: &mut HermeticPolicy, host: &dyn Host, sysname: &
                 policy.allow_exact_path(host, path);
             }
         }
+        allow_standard_lib_metadata(policy, host, STANDARD_LIB_DIRS);
     }
 
     for dir in &search_dirs {
@@ -475,6 +483,57 @@ fn allow_host_toolchain(policy: &mut HermeticPolicy, host: &dyn Host, sysname: &
         }
         if matched_tool {
             policy.allow_exact_path(host, dir);
+        }
+    }
+}
+
+const STANDARD_LIB_DIRS: &[&str] = &[
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/usr/lib",
+    "/usr/lib32",
+    "/usr/lib64",
+    "/usr/libx32",
+];
+
+fn is_standard_lib_dir(path: &Path) -> bool {
+    STANDARD_LIB_DIRS
+        .iter()
+        .any(|standard| path == Path::new(standard))
+}
+
+fn allow_standard_lib_metadata(policy: &mut HermeticPolicy, host: &dyn Host, paths: &[&str]) {
+    for standard in paths {
+        let path = Path::new(standard);
+        match host.metadata(path, Follow::No) {
+            Err(error) if error.kind == std::io::ErrorKind::NotFound => {
+                let parent_ok = path.parent().is_none_or(|parent| {
+                    parent == Path::new("/")
+                        || host
+                            .metadata(parent, Follow::No)
+                            .is_err_and(|err| err.kind == std::io::ErrorKind::NotFound)
+                        || host
+                            .canonicalize(parent)
+                            .is_ok_and(|canonical| canonical == parent)
+                });
+                if parent_ok {
+                    policy.allow_metadata_exact_path(host, path);
+                }
+            }
+            Ok(_) => {
+                let Ok(canonical) = host.canonicalize(path) else {
+                    continue;
+                };
+                let is_dir = host
+                    .metadata(&canonical, Follow::No)
+                    .is_ok_and(|meta| meta.kind == FileKind::Dir);
+                if is_dir && is_standard_lib_dir(&canonical) {
+                    policy.allow_metadata_exact_path(host, &canonical);
+                }
+            }
+            Err(_) => {}
         }
     }
 }
@@ -552,11 +611,28 @@ impl HermeticHost {
     }
 
     fn guard_path<'path>(&self, path: &'path Path) -> HostResult<Cow<'path, Path>> {
+        self.guard_path_access(path, PathAccess::Read)
+    }
+
+    fn guard_metadata_path<'path>(&self, path: &'path Path) -> HostResult<Cow<'path, Path>> {
+        self.guard_path_access(path, PathAccess::Metadata)
+    }
+
+    fn guard_path_access<'path>(
+        &self,
+        path: &'path Path,
+        access: PathAccess,
+    ) -> HostResult<Cow<'path, Path>> {
         let fetch_cache = self.context.fetch_cache();
         let mut resolved = None;
         let decision = self.audit(|audit, site| {
-            let (outcome, checked_path) =
-                audit.check_read_path(self.inner.as_ref(), site, path, fetch_cache.as_deref());
+            let (outcome, checked_path) = audit.check_path_access(
+                self.inner.as_ref(),
+                site,
+                path,
+                fetch_cache.as_deref(),
+                access,
+            );
             resolved = checked_path;
             outcome
         });

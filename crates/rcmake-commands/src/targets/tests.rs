@@ -1283,3 +1283,56 @@ fn missing_link_target_stops_configure() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn extensionless_sources_follow_configure_registration_order() -> TestResult {
+    let cwd = rcmake_host::path::to_native(if cfg!(windows) {
+        b"C:/work".as_slice()
+    } else {
+        b"/work".as_slice()
+    });
+    let exe = cwd.join("cmake");
+    let src = cwd.join("src");
+    let build = cwd.join("build");
+    let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
+    host.seed_file(&src.join("foo.cxx"), b"int main() { return 0; }\n")?;
+    host.seed_file(&src.join("foo.c"), b"int main(void) { return 0; }\n")?;
+    host.seed_file(&src.join("missing.cxx"), b"int main() { return 0; }\n")?;
+    host.seed_file(
+        &src.join("CMakeLists.txt"),
+        br#"
+cmake_minimum_required(VERSION 3.20)
+project(Order NONE)
+cmake_policy(SET CMP0115 NEW)
+add_library(a OBJECT foo.cxx)
+set_source_files_properties(foo.c PROPERTIES COMPILE_DEFINITIONS X=1)
+add_library(b OBJECT foo)
+set_source_files_properties(missing.c PROPERTIES COMPILE_DEFINITIONS Y=1)
+add_library(c OBJECT missing.cxx)
+add_library(d OBJECT missing)
+"#,
+    )?;
+    let mut interp = Interp::new(
+        InterpConfig::new(host.clone(), RunMode::Configure, cwd.join("data"), exe, cwd),
+        crate::register_all,
+    );
+    let outcome = interp.run_configure(&src, &build, &[]);
+    assert_eq!(
+        outcome.exit_code,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let mut cx = interp.cx();
+    let order = cx
+        .project()
+        .dir(DirId::ROOT)
+        .props
+        .get(b"\0rcmake-source-order")
+        .ok_or("missing source order property")?;
+    assert_eq!(
+        order.as_slice(),
+        b"Rfoo.cxx\0Rfoo.c\0Rfoo\0Rmissing.c\0Rmissing.cxx\0Rmissing\0"
+    );
+    Ok(())
+}

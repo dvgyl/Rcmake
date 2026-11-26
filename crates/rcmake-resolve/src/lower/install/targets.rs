@@ -552,7 +552,7 @@ pub(super) fn lower(
         ) {
             continue;
         }
-        for key in [b"PUBLIC_HEADER".as_slice(), b"PRIVATE_HEADER", b"RESOURCE"] {
+        for key in [b"PRIVATE_HEADER".as_slice(), b"PUBLIC_HEADER", b"RESOURCE"] {
             let property = String::from_utf8_lossy(key);
             let snapshot = format!("_RCMAKE_INSTALL_{index}_{property}_{}", id.index());
             let Some(headers) = model
@@ -571,7 +571,7 @@ pub(super) fn lower(
                 let options = groups
                     .get(key)
                     .map_or_else(|| options.clone(), |extra| extra.merge(options));
-                if key != b"PUBLIC_HEADER" && options.destination.is_none() {
+                if key == b"RESOURCE" && options.destination.is_none() {
                     continue;
                 }
                 let default = definition(model, rule.dir, b"CMAKE_INSTALL_INCLUDEDIR")

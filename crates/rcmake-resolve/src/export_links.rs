@@ -1,4 +1,4 @@
-//! Target names in exported link interfaces.
+//! Target names in exported interface properties.
 
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, truth};
@@ -45,14 +45,6 @@ pub(crate) fn qualify(
     let Some(target) = model.target(id) else {
         return Ok(packages);
     };
-    if target.kind == TargetKind::Executable
-        && !target
-            .props
-            .get(b"ENABLE_EXPORTS")
-            .is_some_and(|flag| truth::is_on(flag))
-    {
-        return Ok(packages);
-    }
     let contains = |set: &[u8]| {
         model
             .exports
@@ -68,101 +60,120 @@ pub(crate) fn qualify(
             |rule| matches!(&rule.kind, ExportKind::PackageInfo(spec) if contains(&spec.export)),
         ),
     };
-    for key in [
+    let mut name = |dir: DirId,
+                    input: &[u8],
+                    expand_components|
+     -> Result<Option<BString>, ResolveError> {
+        let Some(id) = model.find_target(dir, input) else {
+            return Ok(None);
+        };
+        let Some(dependency) = model.target(id) else {
+            return Ok(None);
+        };
+        if dependency.is_imported() {
+            if let Some(package) = dependency
+                .props
+                .get(b"EXPORT_FIND_PACKAGE_NAME")
+                .filter(|name| !name.is_empty())
+                .or_else(|| dependency.props.get(b"_RCMAKE_FIND_PACKAGE_NAME"))
+            {
+                packages.insert(package.clone());
+            }
+            if expand_components
+                && let Some(components) = cps_default_component_names(model, dependency)
+            {
+                return Ok(Some(list::join(components)));
+            }
+            return Ok(Some(dependency.name.clone()));
+        }
+        let exported = export_name(dependency);
+        if members.contains(&id) {
+            return Ok(Some([namespace, exported.as_slice()].concat().into()));
+        }
+        let placements = catalog.get(&id).map(Vec::as_slice).unwrap_or_default();
+        let Some(first) = placements.first() else {
+            return Err(closure_error(
+                model,
+                target,
+                dependency,
+                scope,
+                "that is not in any export set.".into(),
+            ));
+        };
+        let multiple_sets = placements
+            .iter()
+            .any(|placement| placement.set != first.set);
+        let multiple_namespaces = placements
+            .iter()
+            .any(|placement| placement.namespace != first.namespace);
+        if multiple_sets || multiple_namespaces {
+            if package_export {
+                // Package export validation reports the combined placements.
+                return Ok(None);
+            }
+            let scenario = if multiple_sets {
+                "in multiple other export sets"
+            } else {
+                "in another export set which is exported multiple times with different namespaces"
+            };
+            let mut files = placements
+                .iter()
+                .map(|placement| placement.file.as_slice())
+                .collect::<Vec<_>>();
+            files.sort_unstable();
+            let files = files
+                .into_iter()
+                .map(String::from_utf8_lossy)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(closure_error(
+                model,
+                target,
+                dependency,
+                scope,
+                format!(
+                    "that is not in this export set, but {scenario}: {files}.\nAn exported target cannot depend upon another target which is exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
+                    dependency.name
+                ),
+            ));
+        }
+        Ok(Some(
+            [first.namespace.as_slice(), exported.as_slice()]
+                .concat()
+                .into(),
+        ))
+    };
+    const LINK_PROPERTIES: [&[u8]; 3] = [
         LINK_LIBRARIES,
         b"INTERFACE_LINK_LIBRARIES_DIRECT",
         b"INTERFACE_LINK_LIBRARIES_DIRECT_EXCLUDE",
-    ] {
+    ];
+    for (key, value) in &mut exported.properties {
+        if key.starts_with(b"INTERFACE_") && !LINK_PROPERTIES.contains(&key.as_slice()) {
+            let mut ast = parse(value)?;
+            if !ast.is_plain() {
+                qualify_expressions(&mut ast.nodes, &mut |input| name(target.dir, input, false))?;
+                *value = render(&ast.nodes);
+            }
+        }
+    }
+    if target.kind == TargetKind::Executable
+        && !target
+            .props
+            .get(b"ENABLE_EXPORTS")
+            .is_some_and(|flag| truth::is_on(flag))
+    {
+        return Ok(packages);
+    }
+    for key in LINK_PROPERTIES {
         let mut items = Vec::new();
         let mut append = |value: &[u8], dir: DirId| -> Result<(), ResolveError> {
-            let mut name = |input: &[u8],
-                            expand_components|
-             -> Result<Option<BString>, ResolveError> {
-                let Some(id) = model.find_target(dir, input) else {
-                    return Ok(None);
-                };
-                let Some(dependency) = model.target(id) else {
-                    return Ok(None);
-                };
-                if dependency.is_imported() {
-                    if let Some(package) = dependency
-                        .props
-                        .get(b"EXPORT_FIND_PACKAGE_NAME")
-                        .filter(|name| !name.is_empty())
-                        .or_else(|| dependency.props.get(b"_RCMAKE_FIND_PACKAGE_NAME"))
-                    {
-                        packages.insert(package.clone());
-                    }
-                    if expand_components
-                        && let Some(components) = cps_default_component_names(model, dependency)
-                    {
-                        return Ok(Some(list::join(components)));
-                    }
-                    return Ok(Some(dependency.name.clone()));
-                }
-                let exported = export_name(dependency);
-                if members.contains(&id) {
-                    return Ok(Some([namespace, exported.as_slice()].concat().into()));
-                }
-                let placements = catalog.get(&id).map(Vec::as_slice).unwrap_or_default();
-                let Some(first) = placements.first() else {
-                    return Err(closure_error(
-                        model,
-                        target,
-                        dependency,
-                        scope,
-                        "that is not in any export set.".into(),
-                    ));
-                };
-                let multiple_sets = placements
-                    .iter()
-                    .any(|placement| placement.set != first.set);
-                let multiple_namespaces = placements
-                    .iter()
-                    .any(|placement| placement.namespace != first.namespace);
-                if multiple_sets || multiple_namespaces {
-                    if package_export {
-                        // Package export validation reports the combined placements.
-                        return Ok(None);
-                    }
-                    let scenario = if multiple_sets {
-                        "in multiple other export sets"
-                    } else {
-                        "in another export set which is exported multiple times with different namespaces"
-                    };
-                    let mut files = placements
-                        .iter()
-                        .map(|placement| placement.file.as_slice())
-                        .collect::<Vec<_>>();
-                    files.sort_unstable();
-                    let files = files
-                        .into_iter()
-                        .map(String::from_utf8_lossy)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(closure_error(
-                        model,
-                        target,
-                        dependency,
-                        scope,
-                        format!(
-                            "that is not in this export set, but {scenario}: {files}.\nAn exported target cannot depend upon another target which is exported in more than one export set or with more than one namespace.  Consider consolidating the exports of the \"{}\" target to a single export.",
-                            dependency.name
-                        ),
-                    ));
-                }
-                Ok(Some(
-                    [first.namespace.as_slice(), exported.as_slice()]
-                        .concat()
-                        .into(),
-                ))
-            };
             for item in export_property_items(value, mode)? {
                 let mut ast = parse(&item)?;
                 let mut item = if ast.is_plain() {
-                    name(&item, true)?.unwrap_or(item)
+                    name(dir, &item, true)?.unwrap_or(item)
                 } else {
-                    qualify_expressions(&mut ast.nodes, &mut |input| name(input, false))?;
+                    qualify_expressions(&mut ast.nodes, &mut |input| name(dir, input, false))?;
                     render(&ast.nodes)
                 };
                 if mode == PreprocessMode::Install {

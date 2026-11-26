@@ -112,7 +112,15 @@ impl NativeSession {
                 let queries = Arc::new(super::super::platform_queries::PlatformQueries::with_memo(
                     memo,
                 ));
-                queries.prefetch(&self.host());
+                let warm_replay = replay
+                    && self
+                        .base
+                        .metadata(&self.snapshot, Follow::No)
+                        .is_ok_and(|metadata| {
+                            metadata.kind == FileKind::File
+                                && metadata.len <= ConfigureSnapshot::<()>::frame_limit() as u64
+                        });
+                queries.prefetch(&self.host(), warm_replay);
                 queries
             });
             interp.add_session_data(Arc::clone(queries));

@@ -115,7 +115,7 @@ fn mark_source(cx: &mut Cx<'_>, dir: DirId, source: &[u8], scoped: bool) {
         } else {
             binary_path
         };
-    let path = if let Some(PropScope::Source { path, .. }) =
+    let (path, created) = if let Some(PropScope::Source { path, .. }) =
         select_source(cx, dir, source, scoped, false)
     {
         let unresolved = cx
@@ -126,14 +126,17 @@ fn mark_source(cx: &mut Cx<'_>, dir: DirId, source: &[u8], scoped: bool) {
             .is_some_and(|props| props.get(SOURCE_BINARY_ALTERNATIVE).is_some());
         if unresolved {
             bind_source(cx.project().dir_mut(dir), &path, &fallback);
-            fallback
+            (fallback, false)
         } else {
-            path
+            (path, false)
         }
     } else {
-        fallback
+        (fallback, true)
     };
     let model = cx.project();
+    if created {
+        crate::custom::record_source_order(model.dir_mut(dir), &path, false);
+    }
     model.mark_generated(dir, path.clone());
     model
         .dir_mut(dir)

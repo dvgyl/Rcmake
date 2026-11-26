@@ -9,7 +9,10 @@ use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_host::{CopyOptions, FileKind, Follow, Host, ReadRange};
 
 use crate::config::{CpackConfig, absolute};
-use crate::stage::{clear_output_file, ensure_dir, relative_install_path, uses_destdir};
+use crate::stage::{
+    clear_output_file, ensure_dir, ensure_dir_with_mode, relative_install_path,
+    staging_directory_mode, uses_destdir,
+};
 use crate::{CpackError, error};
 
 pub(crate) fn copy_directories(
@@ -82,11 +85,12 @@ pub(crate) fn copy_directories(
             .iter(),
         );
     }
+    let directory_mode = staging_directory_mode(config)?;
     let mut remaining = 100_000;
     for [src, dest] in pairs {
         let src = host.canonicalize(&absolute(cwd, src))?;
         let dest = base.join(relative_install_path(dest)?);
-        ensure_dir(host, &staging, &dest)?;
+        ensure_dir_with_mode(host, &staging, &dest, directory_mode)?;
         copy_tree(
             host,
             &src,

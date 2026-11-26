@@ -883,54 +883,18 @@ fn query(host: &dyn Host, request: &RunRequest) -> Option<Query> {
         _ => return None,
     };
     let fixed = fixed.map(Path::new);
-    let mut missing_programs = Vec::new();
-    let selected = if requested.is_absolute() {
-        requested
+    let (selected, missing_programs) = if requested.is_absolute() {
+        if fixed.is_some_and(|fixed| requested != fixed) || !is_executable(host, &requested) {
+            return None;
+        }
+        (requested, Vec::new())
     } else {
         if requested != Path::new(name) {
             return None;
         }
         let value = &request.env.iter().find(|(key, _)| key == "PATH")?.1;
-        let directories = path::to_native(value);
-        let mut selected = None;
-        for directory in std::env::split_paths(&directories).take(128) {
-            if !directory.is_absolute() {
-                return None;
-            }
-            let candidate = directory.join(name);
-            if fixed.is_none_or(|fixed| candidate == fixed) && is_executable(host, &candidate) {
-                selected = Some(candidate);
-                break;
-            }
-            if !is_missing(host, &candidate) {
-                return None;
-            }
-            missing_programs.push(candidate);
-        }
-        match selected {
-            Some(selected) => selected,
-            // Only `brew` has no fixed path. When every candidate is missing,
-            // the spawn fails with a fixed error and runs no process.
-            None if fixed.is_none()
-                && !missing_programs.is_empty()
-                && std::env::split_paths(&directories).count() <= 128 =>
-            {
-                return Some(Query {
-                    program: PathBuf::new(),
-                    args: command.args.clone(),
-                    env: environment_fingerprint(&request.env),
-                    stderr,
-                    missing_programs,
-                });
-            }
-            None => return None,
-        }
+        search_query_path(host, name, fixed, value).ok()?
     };
-    // Require a system query to select the sealed system executable. A program
-    // with the same name earlier in PATH can have different effects.
-    if fixed.is_some_and(|fixed| selected != fixed) || !is_executable(host, &selected) {
-        return None;
-    }
     Some(Query {
         program: selected,
         args: command.args.clone(),
@@ -938,6 +902,79 @@ fn query(host: &dyn Host, request: &RunRequest) -> Option<Query> {
         stderr,
         missing_programs,
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum QueryPathError {
+    MissingDirectory,
+    Blocked(PathBuf),
+    Rejected,
+}
+
+fn search_query_path(
+    host: &dyn Host,
+    name: &str,
+    fixed: Option<&Path>,
+    value: &[u8],
+) -> Result<(PathBuf, Vec<PathBuf>), QueryPathError> {
+    let directories = path::to_native(value);
+    let mut directories = std::env::split_paths(&directories);
+    let mut missing_programs = Vec::new();
+    let mut saw_fixed_dir = false;
+    for directory in directories.by_ref().take(128) {
+        if !directory.is_absolute() {
+            return Err(QueryPathError::Rejected);
+        }
+        saw_fixed_dir |= fixed.and_then(Path::parent) == Some(directory.as_path());
+        let candidate = directory.join(name);
+        if fixed.is_none_or(|fixed| candidate == fixed) && is_executable(host, &candidate) {
+            return Ok((candidate, missing_programs));
+        }
+        if !is_missing(host, &candidate) {
+            return Err(if fixed.is_some_and(|fixed| candidate != fixed) {
+                QueryPathError::Blocked(candidate)
+            } else {
+                QueryPathError::Rejected
+            });
+        }
+        missing_programs.push(candidate);
+    }
+    if directories.next().is_some() {
+        return Err(QueryPathError::Rejected);
+    }
+    // Only brew can reuse an absent result. The earlier PATH misses bind it.
+    if fixed.is_none() && !missing_programs.is_empty() {
+        Ok((PathBuf::new(), missing_programs))
+    } else if fixed.is_some() && !saw_fixed_dir {
+        Err(QueryPathError::MissingDirectory)
+    } else {
+        Err(QueryPathError::Rejected)
+    }
+}
+
+/// Return an advisory warning when PATH prevents reuse of the macOS sysctl query.
+pub fn sysctl_path_warning(host: &dyn Host) -> Option<String> {
+    if host.system().sysname != "Darwin" {
+        return None;
+    }
+    let result = host
+        .env_get(b"PATH")
+        .map_or(Err(QueryPathError::MissingDirectory), |value| {
+            search_query_path(host, "sysctl", Some(Path::new("/usr/sbin/sysctl")), &value)
+        });
+    match result {
+        Ok(_) => None,
+        Err(QueryPathError::MissingDirectory) => Some(String::from(
+            "PATH does not include /usr/sbin. Add /usr/sbin to PATH to enable reuse of the macOS sysctl probe.",
+        )),
+        Err(QueryPathError::Blocked(program)) if is_executable(host, &program) => Some(format!(
+            "PATH selects {} before /usr/sbin/sysctl. This prevents reuse of the macOS sysctl probe.",
+            program.display(),
+        )),
+        Err(QueryPathError::Rejected | QueryPathError::Blocked(_)) => Some(String::from(
+            "Rcmake cannot verify the macOS sysctl probe with the current PATH. Use absolute directories and the system sysctl.",
+        )),
+    }
 }
 
 /// Return `true` if the environment has a variable that can change `uname` output.
@@ -2252,7 +2289,7 @@ mod tests {
         // 1. Live prefetch handoff succeeds when executable is unchanged.
         let matching_queries = PlatformQueries::default();
         let dyn_host: Arc<dyn Host> = host.clone();
-        matching_queries.prefetch(&dyn_host);
+        matching_queries.prefetch(&dyn_host, false);
         let reused = take_or_launch(
             None,
             host.as_ref(),

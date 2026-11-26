@@ -27,6 +27,7 @@ use hazards::source_hazards;
 use link::link_dependencies;
 pub(super) use selection::ProbeCompiler;
 use toolchain::{Family, ToolchainEvidence, query_in};
+pub(in crate::configure) use toolchain::{ReuseWarningReason, compiler_reuse_warning};
 
 const LINK_TRACE: &str = ".rcmake-link-dependencies";
 const GNU_LINK_TRACE: &str = "-Wl,--dependency-file=.rcmake-link-dependencies";

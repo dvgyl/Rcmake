@@ -335,8 +335,6 @@ impl Bootstrap {
         }
 
         self.determine_system(cx)?;
-        #[cfg(all(feature = "native", any(unix, windows)))]
-        self.prefetch_toolchain(cx, &languages);
 
         let mut states = Vec::with_capacity(languages.len());
         for name in languages {
@@ -477,16 +475,10 @@ impl Bootstrap {
         Ok(())
     }
 
-    /// `cmGlobalNinjaGenerator::FindMakeProgram`: verify that the selected Ninja
-    /// executable runs `--version` and meets the minimum required version.
     /// Warm the probe memo in the background while the compilers are identified.
     #[cfg(all(feature = "native", any(unix, windows)))]
-    fn prefetch_toolchain(&self, cx: &mut Cx<'_>, languages: &[BString]) {
-        if self.in_try_compile
-            || !languages
-                .iter()
-                .any(|lang| matches!(lang.as_slice(), b"C" | b"CXX" | b"OBJC" | b"OBJCXX"))
-        {
+    fn prefetch_toolchain(&self, cx: &mut Cx<'_>, lang: &[u8]) {
+        if self.in_try_compile || !matches!(lang, b"C" | b"CXX" | b"OBJC" | b"OBJCXX") {
             return;
         }
         let sysroot = [b"_CMAKE_OSX_SYSROOT_PATH".as_slice(), b"CMAKE_OSX_SYSROOT"]
@@ -500,6 +492,8 @@ impl Bootstrap {
         }
     }
 
+    /// `cmGlobalNinjaGenerator::FindMakeProgram`: verify that the selected Ninja
+    /// executable runs `--version` and meets the minimum required version.
     fn verify_ninja_program(&self, cx: &mut Cx<'_>, program: &BString) -> Result<(), CmdError> {
         if !cx.host().supports_process_execution() {
             return Ok(());
@@ -645,6 +639,8 @@ impl Bootstrap {
                 ));
             }
             let determine = cat(&[b"CMakeDetermine", lang, b"Compiler.cmake"]);
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            self.prefetch_toolchain(cx, lang);
             self.require_module(cx, &String::from_utf8_lossy(&determine))?;
             self.export_compiler_env(cx, lang);
             if !read_list_file(cx, &compiler_file)? {

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rcmake_base::{
-    BString, CMAKE_VERSION_MAJOR, CMAKE_VERSION_MINOR, CMAKE_VERSION_PATCH, version::Version,
+    BString, CMAKE_VERSION_MAJOR, CMAKE_VERSION_MINOR, CMAKE_VERSION_PATCH, truth, version::Version,
 };
 use rcmake_eval::Interp;
 use rcmake_host::{FileKind, Follow, Host, path::from_native_cmake};
@@ -56,6 +56,27 @@ pub(super) fn passes(cfg: &CpackConfig, grouping: ComponentGrouping) -> Vec<Pass
 }
 
 impl Pass {
+    fn filename_override<'a>(&self, cfg: &'a CpackConfig, generator: &str) -> Option<&'a [u8]> {
+        let name = self.name.as_ref()?;
+        let upper = BString::from(name.to_ascii_uppercase());
+        let candidates = if generator == "DEB" {
+            vec![
+                format!("CPACK_DEBIAN_{upper}_FILE_NAME"),
+                "CPACK_DEBIAN_FILE_NAME".to_owned(),
+            ]
+        } else {
+            vec![
+                format!("CPACK_RPM_{name}_FILE_NAME"),
+                format!("CPACK_RPM_{upper}_FILE_NAME"),
+                "CPACK_RPM_FILE_NAME".to_owned(),
+            ]
+        };
+        candidates.iter().find_map(|key| {
+            cfg.get(key.as_bytes())
+                .filter(|value| !truth::is_off(value))
+        })
+    }
+
     pub(super) fn module(
         &self,
         interp: &mut Interp,
@@ -74,8 +95,25 @@ impl Pass {
             filename.push(b'-');
             filename.extend_from_slice(suffix);
         }
-        filename.extend_from_slice(if generator == "DEB" { b".deb" } else { b".rpm" });
-        let proposed = cx.output_dir.join(safe_name(&filename)?);
+        let extension = if generator == "DEB" { b".deb" } else { b".rpm" };
+        filename.extend_from_slice(extension);
+        let package = match safe_name(&filename) {
+            Ok(path) => path,
+            Err(invalid_name) => {
+                let cfg = snapshot(interp);
+                let Some(override_name) = self.filename_override(&cfg, generator) else {
+                    return Err(invalid_name);
+                };
+                // Linux package modules apply their own rules to the final name.
+                // Give the module a valid temporary path before it applies them.
+                if matches!(override_name, b"DEB-DEFAULT" | b"RPM-DEFAULT") {
+                    component_dir(&filename)
+                } else {
+                    safe_name(override_name)?
+                }
+            }
+        };
+        let proposed = cx.output_dir.join(package);
         let component = format!("CPACK_{generator}_PACKAGE_COMPONENT");
         let part = format!("{component}_PART_PATH");
         let part_path = self

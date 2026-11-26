@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from tools.measure import build_dashboard_json as builder
+from tools.measure.test_runcmake_eval import debugger_receipt
 
 
 class DashboardTests(unittest.TestCase):
@@ -18,7 +19,13 @@ class DashboardTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.output = self.root / "latest.json"
+        self.live_base = builder.clean_draft_text(builder.read_json(builder.DATA / "latest.json"))
         self.base = builder.clean_draft_text(builder.read_json(builder.DATA / "latest.json"))
+        builder.reset_tracks_to_pending(self.base)
+        self.base["commit"] = None
+        for key in ("releaseSha", "binarySha256"):
+            self.base.pop(key, None)
+        self.pending_base = self.report("pending-base.json", self.base)
         self.schema = builder.read_json(builder.DATA / "dashboard.schema.json")
 
     def report(self, name, payload):
@@ -28,7 +35,8 @@ class DashboardTests(unittest.TestCase):
         return str(path)
 
     def build(self, *args):
-        self.assertEqual(builder.main(["--out", str(self.output), *args]), 0)
+        base_args = () if "--base" in args else ("--base", self.pending_base)
+        self.assertEqual(builder.main(["--out", str(self.output), *base_args, *args]), 0)
         result = builder.read_json(self.output)
         builder.validate(result, self.schema, self.schema)
         return result
@@ -38,10 +46,12 @@ class DashboardTests(unittest.TestCase):
         return next(row for row in gates if row["id"] == identifier)
 
     def test_defaults_refresh_timestamp_without_replacing_results(self):
-        result = self.build()
+        self.assertEqual(builder.main(["--out", str(self.output)]), 0)
+        result = builder.read_json(self.output)
+        builder.validate(result, self.schema, self.schema)
         generated = datetime.fromisoformat(result.pop("generatedAt").replace("Z", "+00:00"))
         self.assertLess(abs((datetime.now(timezone.utc) - generated).total_seconds()), 5)
-        expected = dict(self.base)
+        expected = dict(self.live_base)
         expected.pop("generatedAt")
         self.assertEqual(result, expected)
 
@@ -113,6 +123,29 @@ class DashboardTests(unittest.TestCase):
                          (1, 371, 371))
         self.assertEqual(tracks["coreConformance"]["status"], "partial")
         self.assertEqual(tracks["policies"], self.base["tracks"]["policies"])
+
+    def test_runcmake_rollup_scores_only_the_selected_debugger_branch(self):
+        linux = self.report("linux.json", {"suites": {"CommandLine": debugger_receipt()}})
+        tracks = self.build("--runcmake-linux", linux)["tracks"]
+        row = tracks["runCmakeOs"]["platforms"][1]
+        self.assertEqual((row["casesPassed"], row["casesTotal"], row["suitesPassed"]), (104, 104, 1))
+        self.assertEqual(tracks["coreConformance"]["highlights"][0]["status"], "pass")
+
+    def test_runcmake_full_rollup_rejects_strict_issues_above_pass_rate_gate(self):
+        for issue in ("debugger failure", "wrong suite", "missing", "reference_failed", "no_reference"):
+            with self.subTest(issue=issue):
+                command_line = debugger_receipt("DebuggerNotSupportedPipe" if issue == "debugger failure" else None)
+                suites = {f"Suite{i:03d}": {"passed": 10, "total": 10} for i in range(361)}
+                if issue == "wrong suite":
+                    suites["Suite000"] = command_line
+                    command_line = {"passed": 10, "total": 10}
+                elif issue != "debugger failure":
+                    suites["Suite000"][issue] = 1
+                suites["CommandLine"] = command_line
+                linux = self.report("linux.json", {"suites": suites})
+                row = self.build("--runcmake-linux", linux)["tracks"]["runCmakeOs"]["platforms"][1]
+                self.assertGreater(row["passRate"], 99)
+                self.assertEqual(row["status"], "fail")
 
     def test_policy_rollup_uses_the_active_suite_count(self):
         self.base["tracks"]["policies"]["suitesTotal"] = 56
@@ -519,7 +552,12 @@ class DashboardTests(unittest.TestCase):
                 {"index": 4, "case_seed": 14, "family": "string.json", "mode": "script", "status": "pass"},
             ],
         })
-        result = self.build("--differential-fuzz", report_a)
+        seeded = json.loads(json.dumps(self.base))
+        next(g for g in seeded["tracks"]["benchmarksAndGates"]["gates"] if g["id"] == "fuzz").update(
+            status="pass", passed=14000000, total=14000000,
+        )
+        seeded_base = self.report("seeded-fuzz-base.json", seeded)
+        result = self.build("--base", seeded_base, "--differential-fuzz", report_a)
         section = result["tracks"]["benchmarksAndGates"]
         diff = section["differentialFuzz"]
         self.assertEqual(diff["status"], "pass")
@@ -872,7 +910,7 @@ class DashboardTests(unittest.TestCase):
         ):
             with self.subTest(bad_args=bad_args):
                 with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit_code:
-                    builder.main(["--out", str(self.output), *bad_args])
+                    builder.main(["--base", self.pending_base, "--out", str(self.output), *bad_args])
                 self.assertEqual(exit_code.exception.code, 2)
 
 

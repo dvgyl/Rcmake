@@ -6,7 +6,7 @@ use std::path::Path;
 use rcmake_base::{BString, list};
 use rcmake_commands::ConfigureRuntime;
 use rcmake_eval::{Interp, RunMode, Services};
-use rcmake_host::{FileKind, Follow, Host};
+use rcmake_host::{FileKind, Follow, Host, path};
 use rcmake_json::Value;
 
 use crate::options::{self, CacheEdit};
@@ -25,6 +25,8 @@ pub(super) struct Preloads {
     pub(super) fatal: bool,
     pub(super) missing: bool,
 }
+
+const MAKE_PROGRAM: &[u8] = b"CMAKE_MAKE_PROGRAM";
 
 impl ConfigureSession<'_> {
     pub(super) fn apply_cache_edits(
@@ -49,6 +51,9 @@ impl ConfigureSession<'_> {
                     let name = def.name.clone();
                     if index >= self.preset.definitions {
                         report.remove(&name);
+                        if name == MAKE_PROGRAM {
+                            runtime.set_cli_make_program(Some(&path::to_native(&def.value)));
+                        }
                     }
                     diagnostics::warn_legacy_define(host, &name);
                     if unused_cli::apply_define(interp.cx().cache(), def)
@@ -59,6 +64,9 @@ impl ConfigureSession<'_> {
                 }
                 CacheEdit::Remove(pattern) => {
                     let pattern = CacheGlob::new(&pattern);
+                    if pattern.matches(MAKE_PROGRAM) {
+                        runtime.set_cli_make_program(None);
+                    }
                     for name in remove_entries(interp, &pattern, &mut preloads.tracked) {
                         report.remove(&name);
                     }

@@ -1218,6 +1218,9 @@ fn strict_linux_allows_usr_metadata_and_denies_unlisted_children() -> HostResult
     host.create_dir_all(&source)?;
     host.create_dir_all(&build)?;
     host.seed_file(&child, b"outside")?;
+    host.create_dir_all(&usr.join("lib"))?;
+    host.symlink(&usr.join("lib"), &absolute("/lib"))?;
+    host.seed_file(&usr.join("lib/other.so"), b"outside")?;
 
     let mut services = Services::default();
     services.speed.hermetic = HermeticMode::Strict;
@@ -1225,9 +1228,250 @@ fn strict_linux_allows_usr_metadata_and_denies_unlisted_children() -> HostResult
         .ok_or_else(|| HostError::unsupported("Cannot create the audit runtime."))?;
     let guarded = runtime.host();
     assert_eq!(guarded.metadata(&usr, Follow::Yes)?.kind, FileKind::Dir);
+    for directory in ["/lib", "/usr/lib"] {
+        assert_eq!(
+            guarded.metadata(&absolute(directory), Follow::Yes)?.kind,
+            FileKind::Dir
+        );
+    }
+    for directory in [
+        "/lib32",
+        "/lib64",
+        "/libx32",
+        "/usr/lib32",
+        "/usr/lib64",
+        "/usr/libx32",
+    ] {
+        assert_eq!(
+            guarded
+                .metadata(&absolute(directory), Follow::Yes)
+                .unwrap_err()
+                .kind,
+            ErrorKind::NotFound
+        );
+    }
+    assert_eq!(
+        guarded
+            .metadata(&absolute("/lib/other.so"), Follow::Yes)
+            .unwrap_err()
+            .kind,
+        ErrorKind::PermissionDenied
+    );
     assert_eq!(
         guarded.metadata(&child, Follow::Yes).unwrap_err().kind,
         ErrorKind::PermissionDenied
     );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn strict_cli_make_program_grant_is_exact_replaceable_and_separate() -> HostResult<()> {
+    let (inner, runtime) = setup(HermeticMode::Strict)?;
+    let first = absolute("/private/tool set/ninja");
+    let second = absolute("/other/ninja");
+    let neighbor = absolute("/private/tool set/neighbor");
+    let root_tool = absolute("/root-tool");
+    for tool in [&first, &second, &neighbor, &root_tool] {
+        inner.seed_file(tool, b"")?;
+        inner.set_permissions(tool, 0o755)?;
+    }
+    let alias_dir = absolute("/alias");
+    inner.create_dir_all(&alias_dir)?;
+    let alias = alias_dir.join("ninja");
+    inner.symlink(&first, &alias)?;
+    inner.set_command_handler(|_, _, _| Ok(Default::default()))?;
+    let guarded = runtime.host();
+    let run = |tool: &Path| {
+        guarded.run_bounded(&request(inner.as_ref(), &[&path::from_native(tool)]), 1024)
+    };
+    let unapproved = |tool: &Path| {
+        assert_eq!(
+            runtime
+                .host
+                .state()
+                .auditor
+                .check_process(inner.as_ref(), &HermeticSite::startup(), tool)
+                .decision,
+            AuditDecision::Deny
+        );
+    };
+
+    unapproved(&first);
+    runtime.set_cli_make_program(Some(&alias));
+    runtime.set_cli_make_program(Some(&alias));
+    run(&alias)?;
+    run(&first)?;
+    for directory in [&alias_dir, &absolute("/private/tool set")] {
+        assert_eq!(
+            guarded.metadata(directory, Follow::Yes)?.kind,
+            FileKind::Dir
+        );
+        assert_eq!(
+            guarded.metadata_fresh(directory, Follow::Yes)?.kind,
+            FileKind::Dir
+        );
+        assert_eq!(
+            guarded.read_dir(directory).unwrap_err().kind,
+            ErrorKind::PermissionDenied
+        );
+    }
+    assert!(runtime.denied());
+    // Use a fresh runtime so subsequent checks start without a latched denial.
+    let (inner, runtime) = setup(HermeticMode::Strict)?;
+    for tool in [&first, &second, &neighbor, &root_tool] {
+        inner.seed_file(tool, b"")?;
+        inner.set_permissions(tool, 0o755)?;
+    }
+    inner.create_dir_all(&alias_dir)?;
+    inner.symlink(&first, &alias)?;
+    inner.set_command_handler(|_, _, _| Ok(Default::default()))?;
+    let guarded = runtime.host();
+    let run = |tool: &Path| {
+        guarded.run_bounded(&request(inner.as_ref(), &[&path::from_native(tool)]), 1024)
+    };
+    let unapproved = |tool: &Path| {
+        assert_eq!(
+            runtime
+                .host
+                .state()
+                .auditor
+                .check_process(inner.as_ref(), &HermeticSite::startup(), tool)
+                .decision,
+            AuditDecision::Deny
+        );
+    };
+    runtime.set_cli_make_program(Some(&alias));
+    unapproved(&neighbor);
+    assert_eq!(
+        runtime
+            .host
+            .state()
+            .auditor
+            .check_path(inner.as_ref(), &HermeticSite::startup(), &neighbor)
+            .decision,
+        AuditDecision::Deny
+    );
+
+    inner.remove_file(&alias)?;
+    inner.symlink(&second, &alias)?;
+    unapproved(&alias);
+    runtime.set_cli_make_program(Some(&alias));
+    run(&alias)?;
+    unapproved(&first);
+    runtime.set_cli_make_program(Some(Path::new("ninja")));
+    unapproved(&second);
+
+    runtime.set_cli_make_program(Some(&root_tool));
+    run(&root_tool)?;
+    runtime.set_cli_make_program(None);
+    run(&absolute("/bin/approved"))?;
+    assert!(matches!(
+        guarded.metadata(Path::new("/"), Follow::Yes),
+        Err(error) if error.kind == ErrorKind::PermissionDenied
+    ));
+    unapproved(&root_tool);
+    Ok(())
+}
+
+#[test]
+#[cfg(not(windows))]
+fn strict_linux_standard_lib_dirs_are_metadata_only_and_reject_escaping_symlinks() -> HostResult<()>
+{
+    let source = absolute("/project");
+    let build = absolute("/build");
+    let new_linux_host = || -> HostResult<Arc<PureHost>> {
+        let host = Arc::new(PureHost::new(source.clone(), absolute("/stage/cmake")));
+        let mut system = host.system();
+        system.sysname = "Linux".into();
+        host.set_system(system)?;
+        host.create_dir_all(&source)?;
+        host.create_dir_all(&build)?;
+        Ok(host)
+    };
+
+    // 1. Absent `/lib32` and existing standard lib dir `/usr/lib` allow metadata probes
+    //    without permitting directory listings.
+    let host = new_linux_host()?;
+    host.create_dir_all(Path::new("/usr/lib"))?;
+    host.seed_file(Path::new("/usr/lib/libc.so"), b"")?;
+    let mut services = Services::default();
+    services.speed.hermetic = HermeticMode::Strict;
+    let runtime = HermeticRuntime::new(host, &source, &build, &services)
+        .ok_or_else(|| HostError::unsupported("Cannot create the audit runtime."))?;
+    let guarded = runtime.host();
+    assert_eq!(
+        guarded
+            .metadata(Path::new("/lib32"), Follow::Yes)
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+    assert_eq!(
+        guarded.metadata(Path::new("/usr/lib"), Follow::Yes)?.kind,
+        FileKind::Dir
+    );
+    assert!(!runtime.denied());
+    assert_eq!(
+        guarded.read_dir(Path::new("/usr/lib")).unwrap_err().kind,
+        ErrorKind::PermissionDenied
+    );
+    assert!(runtime.denied());
+
+    // 2. Real directory at `/lib32` allows metadata only, denying `read_dir`.
+    let host = new_linux_host()?;
+    host.create_dir_all(Path::new("/lib32"))?;
+    host.seed_file(Path::new("/lib32/a.so"), b"")?;
+    let runtime = HermeticRuntime::new(host, &source, &build, &services)
+        .ok_or_else(|| HostError::unsupported("Cannot create the audit runtime."))?;
+    let guarded = runtime.host();
+    assert_eq!(
+        guarded.metadata(Path::new("/lib32"), Follow::Yes)?.kind,
+        FileKind::Dir
+    );
+    assert!(!runtime.denied());
+    assert_eq!(
+        guarded.read_dir(Path::new("/lib32")).unwrap_err().kind,
+        ErrorKind::PermissionDenied
+    );
+    assert!(runtime.denied());
+
+    // 3. Symlink `/lib32 -> /secret` (existing directory or file) is denied even for metadata.
+    for target_is_dir in [true, false] {
+        let host = new_linux_host()?;
+        let secret = Path::new("/secret");
+        if target_is_dir {
+            host.create_dir_all(secret)?;
+        } else {
+            host.seed_file(secret, b"top secret")?;
+        }
+        host.symlink(secret, Path::new("/lib32"))?;
+        let runtime = HermeticRuntime::new(host, &source, &build, &services)
+            .ok_or_else(|| HostError::unsupported("Cannot create the audit runtime."))?;
+        let guarded = runtime.host();
+        assert_eq!(
+            guarded
+                .metadata(Path::new("/lib32"), Follow::Yes)
+                .unwrap_err()
+                .kind,
+            ErrorKind::PermissionDenied
+        );
+        assert!(runtime.denied());
+    }
+
+    // 4. Regular file at `/lib32` is denied.
+    let host = new_linux_host()?;
+    host.seed_file(Path::new("/lib32"), b"not a dir")?;
+    let runtime = HermeticRuntime::new(host, &source, &build, &services)
+        .ok_or_else(|| HostError::unsupported("Cannot create the audit runtime."))?;
+    let guarded = runtime.host();
+    assert_eq!(
+        guarded
+            .metadata(Path::new("/lib32"), Follow::Yes)
+            .unwrap_err()
+            .kind,
+        ErrorKind::PermissionDenied
+    );
+    assert!(runtime.denied());
     Ok(())
 }

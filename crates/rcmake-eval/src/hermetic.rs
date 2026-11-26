@@ -42,6 +42,15 @@ const USER_RECORD_LIMIT: usize = 256;
 const BUNDLED_RECORD_LIMIT: usize = 64;
 const MAX_DISPLAY_CHARS: usize = 256;
 
+/// Level of filesystem access requested by a host operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PathAccess {
+    /// Read file contents, list directory entries, copy, rename, or follow links.
+    Read,
+    /// Inspect filesystem metadata only (`stat` or `lstat`).
+    Metadata,
+}
+
 /// Allowed inputs to one configure. The caller supplies roots and exact executable paths.
 #[derive(Clone, Debug)]
 pub struct HermeticPolicy {
@@ -50,9 +59,17 @@ pub struct HermeticPolicy {
     case_insensitive_roots: bool,
     roots: BTreeSet<PathBuf>,
     exact_paths: BTreeSet<PathBuf>,
+    metadata_exact_paths: BTreeSet<PathBuf>,
     bundled_roots: BTreeSet<PathBuf>,
     programs: BTreeSet<PathBuf>,
+    make_program: Option<MakeProgramGrant>,
     warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct MakeProgramGrant {
+    executable: PathBuf,
+    parents: BTreeSet<PathBuf>,
 }
 
 impl HermeticPolicy {
@@ -71,8 +88,10 @@ impl HermeticPolicy {
             case_insensitive_roots: matches!(system.sysname.as_slice(), b"Darwin" | b"Windows"),
             roots: BTreeSet::new(),
             exact_paths: BTreeSet::new(),
+            metadata_exact_paths: BTreeSet::new(),
             bundled_roots: BTreeSet::new(),
             programs: BTreeSet::new(),
+            make_program: None,
             warnings: Vec::new(),
         };
         for name in BASE_ENV {
@@ -147,6 +166,16 @@ impl HermeticPolicy {
         true
     }
 
+    /// Allow metadata-only probes of one exact absolute path without permitting
+    /// directory listings or file reads.
+    pub fn allow_metadata_exact_path(&mut self, host: &dyn Host, path: &Path) -> bool {
+        let Some(resolved) = resolve_path(host, path) else {
+            return false;
+        };
+        self.metadata_exact_paths.insert(resolved);
+        true
+    }
+
     /// Mark one directory root as belonging to bundled CMake modules or templates.
     pub fn allow_bundled_root(&mut self, host: &dyn Host, root: &Path) -> bool {
         if !root.is_absolute() {
@@ -191,19 +220,23 @@ impl HermeticPolicy {
     /// Use [Self::allow_program_in_roots] for automatic host toolchain discovery so
     /// symlinks cannot escape verified system directories.
     pub fn allow_program(&mut self, host: &dyn Host, program: &Path) -> bool {
+        let Some(path) = self.canonical_executable(host, program) else {
+            return false;
+        };
+        self.programs.insert(path);
+        true
+    }
+
+    fn canonical_executable(&self, host: &dyn Host, program: &Path) -> Option<PathBuf> {
         if !program.is_absolute()
             || !host.metadata(program, Follow::Yes).is_ok_and(|metadata| {
                 metadata.kind == FileKind::File
                     && (self.case_insensitive_env || metadata.mode & 0o111 != 0)
             })
         {
-            return false;
+            return None;
         }
-        let Ok(path) = host.canonicalize(program) else {
-            return false;
-        };
-        self.programs.insert(path);
-        true
+        host.canonicalize(program).ok()
     }
 
     /// Allow one existing, absolute executable path only when its canonical target
@@ -279,6 +312,7 @@ impl HermeticPolicy {
         host: &dyn Host,
         path: &Path,
         fetch_cache: Option<&Path>,
+        access: PathAccess,
     ) -> Option<PathBuf> {
         resolve_path(host, path).filter(|path| {
             let contains = |root: &Path| {
@@ -287,8 +321,14 @@ impl HermeticPolicy {
                     || (self.case_insensitive_roots && same_root(host, &path, &root))
             };
             self.roots.iter().any(|root| contains(root))
-                || self.programs.contains(path)
+                || self.allows_canonical_program(path)
                 || self.exact_paths.contains(path)
+                || (access == PathAccess::Metadata
+                    && (self.metadata_exact_paths.contains(path)
+                        || self
+                            .make_program
+                            .as_ref()
+                            .is_some_and(|grant| grant.parents.contains(path))))
                 || fetch_cache
                     .and_then(|root| resolve_path(host, root))
                     .is_some_and(|root| contains(&root))
@@ -299,7 +339,15 @@ impl HermeticPolicy {
         path.is_absolute()
             && host
                 .canonicalize(path)
-                .is_ok_and(|path| self.programs.contains(&path))
+                .is_ok_and(|path| self.allows_canonical_program(&path))
+    }
+
+    fn allows_canonical_program(&self, path: &Path) -> bool {
+        self.programs.contains(path)
+            || self
+                .make_program
+                .as_ref()
+                .is_some_and(|grant| grant.executable == path)
     }
 }
 
@@ -652,6 +700,28 @@ impl HermeticAuditor {
         self.policy.allow_root(host, path)
     }
 
+    /// Replace the strict-mode grant for the build tool selected on the command line.
+    ///
+    /// Clear the grant if the request has no valid absolute executable path.
+    pub fn set_cli_make_program(&mut self, host: &dyn Host, program: Option<&Path>) {
+        if self.mode != HermeticMode::Strict {
+            return;
+        }
+        self.policy.make_program = program.and_then(|program| {
+            let executable = self.policy.canonical_executable(host, program)?;
+            let parents = [program, executable.as_path()]
+                .into_iter()
+                .filter_map(Path::parent)
+                .filter_map(|parent| resolve_path(host, parent))
+                .filter(|parent| parent.parent().is_some())
+                .collect();
+            Some(MakeProgramGrant {
+                executable,
+                parents,
+            })
+        });
+    }
+
     /// Mark a directory root as belonging to bundled CMake modules or templates.
     pub fn allow_bundled_root(&mut self, host: &dyn Host, path: &Path) -> bool {
         self.site_bundled_cache.clear();
@@ -729,7 +799,7 @@ impl HermeticAuditor {
         self.mode == HermeticMode::Off
             || self
                 .policy
-                .resolve_allowed_path(host, path, fetch_cache)
+                .resolve_allowed_path(host, path, fetch_cache, PathAccess::Read)
                 .is_some()
     }
 
@@ -758,10 +828,36 @@ impl HermeticAuditor {
         path: &Path,
         fetch_cache: Option<&Path>,
     ) -> (AuditOutcome<'_>, Option<PathBuf>) {
+        self.check_path_access(host, site, path, fetch_cache, PathAccess::Read)
+    }
+
+    /// Check a metadata-only probe and return the resolved path when allowed.
+    pub fn check_metadata_path(
+        &mut self,
+        host: &dyn Host,
+        site: &HermeticSite,
+        path: &Path,
+        fetch_cache: Option<&Path>,
+    ) -> (AuditOutcome<'_>, Option<PathBuf>) {
+        self.check_path_access(host, site, path, fetch_cache, PathAccess::Metadata)
+    }
+
+    /// Check a filesystem operation at `access` level and return the resolved path when allowed.
+    pub fn check_path_access(
+        &mut self,
+        host: &dyn Host,
+        site: &HermeticSite,
+        path: &Path,
+        fetch_cache: Option<&Path>,
+        access: PathAccess,
+    ) -> (AuditOutcome<'_>, Option<PathBuf>) {
         if self.mode == HermeticMode::Off {
             return (allowed(), None);
         }
-        if let Some(path) = self.policy.resolve_allowed_path(host, path, fetch_cache) {
+        if let Some(path) = self
+            .policy
+            .resolve_allowed_path(host, path, fetch_cache, access)
+        {
             return (allowed(), Some(path));
         }
         let bundled = self.is_bundled_site(site);

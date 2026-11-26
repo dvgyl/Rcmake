@@ -117,6 +117,15 @@ impl ConfigureRuntime {
         self.hermetic.as_ref().is_some_and(HermeticRuntime::denied)
     }
 
+    /// Replace the strict-mode permission for an explicit command-line build tool.
+    ///
+    /// Pass `None` to clear the permission after a matching cache removal.
+    pub fn set_cli_make_program(&self, program: Option<&Path>) {
+        if let Some(hermetic) = &self.hermetic {
+            hermetic.set_cli_make_program(program);
+        }
+    }
+
     /// Evaluate the listfiles for this session.
     pub fn run(&mut self, interp: &mut Interp, preloads: &[PathBuf]) -> RunOutcome {
         self.attach(interp);

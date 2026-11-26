@@ -7,6 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 from difflib import unified_diff
 import filecmp
+from functools import lru_cache
 from hashlib import sha256
 import json
 import os
@@ -14,7 +15,11 @@ from pathlib import Path
 import posixpath
 import re
 import shlex
+import sys
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "measure"))
+from ninja_canon import Normalizer, canonicalize_strict
 
 BUCKETS = ("byte_identical", "identical_after_normalization", "different")
 EXACT_NAMES = {
@@ -28,7 +33,11 @@ PATTERNS = {
     "*.pc": ("*.pc",),
 }
 RULES = {
+    "cache.layout": "Compare sorted cache entries. Ignore comments and blank lines.",
     "cache.tool_path": "The cache records the executable path of the selected CMake tool.",
+    "cache.edit_command": "One installation can have a cache editor when the other has none.",
+    "conan.home_path": "Replace each Conan home path and the 13-digit hexadecimal suffix of build folders under p/b. Keep the package prefix and remaining path.",
+    "ninja.canonical_graph": "Compare Ninja build edges with rule variables expanded.",
     "json.layout": "JSON object key order and whitespace do not change the JSON value.",
     "file_api.index_name": "The File API puts the time in the index file name.",
     "file_api.reply_hash": "The File API puts a content hash in reply file names and references.",
@@ -36,6 +45,9 @@ RULES = {
     "compile_commands.order": "Compilation database entries are independent translation units whose array order is not significant.",
 }
 CACHE_TOOLS = {"CMAKE_COMMAND": "cmake", "CMAKE_CTEST_COMMAND": "ctest", "CMAKE_CPACK_COMMAND": "cpack"}
+CACHE_ENTRY = re.compile(r"(.+?):([^:=]+)=(.*)")
+EDIT_COMMAND = "CMAKE_EDIT_COMMAND"
+CONAN_BUILD_HASH = re.compile(r"(<conan-home>/p/b/[a-z0-9_+.-]+)[0-9a-f]{13}(?=/)")
 IDE_FILE_API_QUERIES = ("codemodel-v2", "cache-v2", "toolchains-v1", "cmakeFiles-v1")
 REPLY_HASH = re.compile(
     r"(codemodel|cache|cmakeFiles|toolchains|configureLog|target|directory)"
@@ -204,6 +216,133 @@ def _tool_lookup(tools: dict[str, set[str]] | None) -> dict[str, str]:
     return lookup
 
 
+@lru_cache(maxsize=64)
+def _conan_home_pattern(home: str) -> re.Pattern[str]:
+    paths = "|".join(map(re.escape, _root_variants(Path(home))))
+    return re.compile(
+        rf"(?:(?<![\w./-])|(?<=-I)|(?<=-L)|(?<=-F)|(?<=-isystem)|(?<=-iquote))"
+        rf"(?:{paths})(?=$|[/\\\s'\"\x60:;,|)&\]])"
+    )
+
+
+def conan_paths(value: str, home: str | None) -> str:
+    """Replace the selected Conan home and its per-build folder suffixes."""
+    if not home:
+        return value
+    value = _conan_home_pattern(home).sub("<conan-home>", value)
+    return CONAN_BUILD_HASH.sub(r"\1<conan-hash>", value)
+
+
+def _compile_conan_paths(value: object, home: str | None) -> object:
+    if not isinstance(value, list) or not home:
+        return value
+    entries = []
+    for entry in value:
+        if isinstance(entry, dict):
+            entry = entry.copy()
+            for key in ("command", "directory", "file", "output"):
+                if isinstance(entry.get(key), str):
+                    entry[key] = conan_paths(entry[key], home)
+            if isinstance(entry.get("arguments"), list):
+                entry["arguments"] = [conan_paths(arg, home) if isinstance(arg, str) else arg
+                                      for arg in entry["arguments"]]
+        entries.append(entry)
+    return entries
+
+
+class BuildNormalizer(Normalizer):
+    """Normalize tool, project, and Conan paths in Ninja commands and edges."""
+
+    def __init__(self, build, project, tools, *, cmake_roots=(), conan_home=None,
+                 recorded_build=None):
+        replacements = {project: "<project>", build: "<build>"}
+        if recorded_build is not None:
+            replacements[recorded_build] = "<build>"
+        replacements.update({Path(root): "<cmake_root>" for root in cmake_roots if root})
+        super().__init__(build, replacements=replacements)
+        self.recorded_build = recorded_build or self.build
+        self.conan_home = conan_home
+        tool_labels = _tool_lookup(tools)
+        self.labels.update(tool_labels)
+        self.labels.update({shlex.quote(path): label for path, label in tool_labels.items()})
+        alternatives = "|".join(map(re.escape, sorted(self.labels, key=len, reverse=True)))
+        self.pattern = re.compile(rf"(?:{alternatives})(?=$|[/\\\s'\":;,|)&\]])")
+
+    def text(self, value: str) -> str:
+        return super().text(conan_paths(value, self.conan_home))
+
+    def path(self, value: str) -> str:
+        return self.text(Path(os.path.normpath(self.recorded_build / value)).as_posix()) if value else ""
+
+
+def _cache_lines(data: bytes) -> list[str]:
+    return [line for line in os.fsdecode(data).split("\n")
+            if line.strip() and not line.lstrip().startswith(("#", "//"))]
+
+
+def _read_cache(build: Path) -> bytes:
+    path = build / "CMakeCache.txt"
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_NORMALIZE_BYTES:
+        return b""
+    return path.read_bytes()
+
+
+def _internal_cache(data: bytes) -> dict[str, str]:
+    return {match[1]: match[3].removesuffix("\r")
+            for line in _cache_lines(data) if (match := CACHE_ENTRY.fullmatch(line))
+            and match[2] == "INTERNAL"}
+
+
+def build_cmake_roots(tree: Path) -> set[str]:
+    """Collect CMake installation roots recorded in build caches."""
+    return {root for path in tree.rglob("CMakeCache.txt")
+            if (root := _internal_cache(_read_cache(path.parent)).get("CMAKE_ROOT")) and Path(root).is_absolute()}
+
+
+def _has_cache_editor(command: str) -> bool:
+    path = Path(command)
+    return path.is_absolute() and path.name.lower().removesuffix(".exe") in {"ccmake", "cmake-gui"}
+
+
+def _normalize_cache(data: bytes, tools: dict, conan_home: str | None,
+                     omit_editor: bool) -> tuple[bytes, set[str]]:
+    lines = []
+    rules = {"cache.layout"}
+    for line in _cache_lines(data):
+        line = line.removesuffix("\r")
+        key = line
+        if match := CACHE_ENTRY.fullmatch(line):
+            key, kind, value = match.groups()
+            if omit_editor and key == EDIT_COMMAND and kind == "INTERNAL":
+                rules.add("cache.edit_command")
+                continue
+            tool = CACHE_TOOLS.get(key)
+            if (tool and kind in {"INTERNAL", "FILEPATH"} and value in tools.get(tool, ())) or (
+                key == "CMAKE_ROOT" and kind == "INTERNAL" and Path(value).is_absolute()
+            ):
+                value = f"<{tool or 'cmake_root'}>"
+                rules.add("cache.tool_path")
+            replaced = conan_paths(value, conan_home)
+            if replaced != value:
+                rules.add("conan.home_path")
+            line = f"{key}:{kind}={replaced}"
+        lines.append((key, line))
+    # Preserve the order of repeated keys because CMake uses the last value.
+    return os.fsencode("\n".join(line for _, line in sorted(lines, key=lambda entry: entry[0]))), rules
+
+
+def _optional_cache_editor(before: bytes, after: bytes) -> tuple[bool, bool]:
+    editors = [
+        [match.groups()[1:] for line in _cache_lines(data)
+         if (match := CACHE_ENTRY.fullmatch(line.removesuffix("\r")))
+         and match[1].strip('"') == EDIT_COMMAND]
+        for data in (before, after)
+    ]
+    return tuple(len(entries) == 1 and entries[0][0] == "INTERNAL"
+                 and _has_cache_editor(entries[0][1]) and not other
+                 for entries, other in (editors, editors[::-1]))
+
+
 def _rewrite_file_api_tools(
     value: object,
     tools: dict[str, set[str]],
@@ -296,22 +435,13 @@ def normalize(
     references: dict[Path, dict[str, str]],
     *,
     cmake_root: str | None = None,
+    conan_home: str | None = None,
+    omit_cache_editor: bool = False,
 ) -> tuple[bytes, set[str]]:
     """Apply only the rules for this file class."""
     rules = set()
     if file.file_class == "CMakeCache.txt":
-        lines = []
-        for line in data.splitlines(keepends=True):
-            match = re.fullmatch(rb"([^#/:=\r\n]+):(?:INTERNAL|FILEPATH)=([^\r\n]+)(\r?\n)?", line)
-            if match:
-                key = match[1].decode("utf-8", errors="replace")
-                tool = CACHE_TOOLS.get(key)
-                if tool and os.fsdecode(match[2]) in tools.get(tool, ()):
-                    start, end = match.span(2)
-                    line = line[:start] + f"<{tool}>".encode() + line[end:]
-                    rules.add("cache.tool_path")
-            lines.append(line)
-        return b"".join(lines), rules
+        return _normalize_cache(data, tools, conan_home, omit_cache_editor)
     if file.file_class in {"File API reply", "compile_commands.json"}:
         try:
             value = json.loads(
@@ -320,6 +450,11 @@ def normalize(
             raw = json.dumps(value, sort_keys=True, allow_nan=False).encode()
             rewritten = raw
             if file.file_class == "compile_commands.json" and isinstance(value, list):
+                with_paths = _compile_conan_paths(value, conan_home)
+                if with_paths != value:
+                    value = with_paths
+                    rules.add("conan.home_path")
+                    rewritten = json.dumps(value, sort_keys=True, allow_nan=False).encode()
                 ordered = sorted(value, key=_compile_command_sort_key)
                 if ordered != value:
                     value = ordered
@@ -1255,6 +1390,7 @@ def compare_ide_build_trees(
     rcmake_tools: dict[str, set[str]] | None = None,
     required_queries: tuple[str, ...] = (),
     oracle_root: Path | None = None,
+    conan_homes: tuple[str | None, str | None] = (None, None),
 ) -> dict[str, Any]:
     """Compare IDE data. Use oracle_root for paths recorded before a tree move."""
     oracle_root = oracle_root if oracle_root is not None else oracle_tree
@@ -1301,8 +1437,10 @@ def compare_ide_build_trees(
                 }
             else:
                 try:
-                    oracle_cc = json.loads(oracle_cc_path.read_text(encoding="utf-8"))
-                    rcmake_cc = json.loads(rcmake_cc_path.read_text(encoding="utf-8"))
+                    oracle_cc, rcmake_cc = (
+                        _compile_conan_paths(json.loads(path.read_text(encoding="utf-8")), home)
+                        for path, home in zip((oracle_cc_path, rcmake_cc_path), conan_homes)
+                    )
                     norm_cc["oracle"] = normalize_compile_commands(
                         oracle_cc, root=oracle_root, tools=oracle_tools, cmake_root=oracle_cmake_root,
                     )
@@ -1411,6 +1549,7 @@ def compare_pair(
     references: tuple[dict, dict],
     *,
     cmake_roots: tuple[dict[Path, str], dict[Path, str]] = ({}, {}),
+    conan_homes: tuple[str | None, str | None] = (None, None),
 ) -> tuple[str, list[str]]:
     if left is None or right is None:
         return "different", []
@@ -1420,14 +1559,23 @@ def compare_pair(
                  and contents(left) == contents(right))
     else:
         equal = filecmp.cmp(left.path, right.path, shallow=False)
-        if not equal and max(left.path.stat().st_size, right.path.stat().st_size) <= MAX_NORMALIZE_BYTES:
+        side_paths = conan_homes[0] != conan_homes[1] and left.file_class in {
+            "CMakeCache.txt", "compile_commands.json",
+        }
+        if (not equal or side_paths) and max(left.path.stat().st_size, right.path.stat().st_size) <= MAX_NORMALIZE_BYTES:
+            left_data, right_data = (contents(file, MAX_NORMALIZE_BYTES) for file in (left, right))
+            omit_editors = (
+                _optional_cache_editor(left_data, right_data) if left.file_class == "CMakeCache.txt" else (False, False)
+            )
             before, left_rules = normalize(
-                left, contents(left, MAX_NORMALIZE_BYTES), tools[0], references[0],
+                left, left_data, tools[0], references[0],
                 cmake_root=cmake_roots[0].get(left.relative.parent),
+                conan_home=conan_homes[0], omit_cache_editor=omit_editors[0],
             )
             after, right_rules = normalize(
-                right, contents(right, MAX_NORMALIZE_BYTES), tools[1], references[1],
+                right, right_data, tools[1], references[1],
                 cmake_root=cmake_roots[1].get(right.relative.parent),
+                conan_home=conan_homes[1], omit_cache_editor=omit_editors[1],
             )
             equal = before == after
             rules.update(left_rules | right_rules)
@@ -1436,9 +1584,38 @@ def compare_pair(
     return ("identical_after_normalization", sorted(rules)) if rules else ("byte_identical", [])
 
 
+def _ninja_build(file: File) -> Path:
+    parent = file.path.parent
+    return parent.parent if file.file_class == "rules.ninja" and parent.name == "CMakeFiles" else parent
+
+
+def _normalize_editor_edges(rows, normalizer, cache, has_editor):
+    """Replace the cache editor command when it matches the generated utility."""
+    for row in rows:
+        if row.get("outputs") not in (["<build>/CMakeFiles/edit_cache.util"], ["<build>/edit_cache.util"]):
+            continue
+        if has_editor:
+            editor = cache.get(EDIT_COMMAND)
+            source = cache.get("CMAKE_HOME_DIRECTORY")
+            if not editor or not source:
+                continue
+            expected = [normalizer.text(editor), "-S" + normalizer.text(source), "-B<build>"]
+        else:
+            expected = ["<cmake>", "-E", "echo", "No interactive CMake dialog available."]
+        try:
+            tokens = shlex.split(row["command"])
+        except ValueError:
+            continue
+        direct = tokens == expected
+        in_build = tokens == ["cd", "<build>", "&&", *expected]
+        if in_build or (direct and not has_editor):
+            row["command"] = "<edit-cache>"
+
+
 def compare(oracle: Path, rcmake: Path, diff_dir: Path, *,
             configured_outputs: tuple[str, ...] = (), tools: tuple[dict, dict] = ({}, {}),
-            oracle_root: Path | None = None) -> dict:
+            oracle_root: Path | None = None,
+            conan_homes: tuple[str | None, str | None] = (None, None)) -> dict:
     """Return file class counts and write a unified diff for every difference."""
     trees = (oracle, rcmake)
     if any(Path(pattern).is_absolute() or ".." in Path(pattern).parts for pattern in configured_outputs):
@@ -1450,11 +1627,60 @@ def compare(oracle: Path, rcmake: Path, diff_dir: Path, *,
     inventories = tuple(inventory(tree, configured) for tree in trees)
     cmake_roots = tuple(_reply_cmake_roots(tree, inv) for tree, inv in zip(trees, inventories))
     pairs, references = align(*inventories)
+    project_roots = (oracle_root or oracle, rcmake)
+
+    @lru_cache(maxsize=None)
+    def ninja_diff(before: Path, after: Path) -> tuple[list[str], list[str], bool]:
+        builds = (before, after)
+        cache_data = tuple(map(_read_cache, builds))
+        caches = map(_internal_cache, cache_data)
+        editors = _optional_cache_editor(*cache_data)
+        graphs = []
+        for index, (build, cache, editor) in enumerate(zip(builds, caches, editors)):
+            root = cache.get("CMAKE_ROOT")
+            normalizer = BuildNormalizer(
+                build, project_roots[index], tools[index],
+                cmake_roots=(root,) if root and Path(root).is_absolute() else (),
+                conan_home=conan_homes[index],
+                recorded_build=project_roots[index] / build.relative_to(trees[index]),
+            )
+            rows = canonicalize_strict(normalizer)
+            if any(editors):
+                _normalize_editor_edges(rows, normalizer, cache, editor)
+            graphs.append([json.dumps(row, sort_keys=True) + "\n" for row in rows])
+        return graphs[0], graphs[1], any(editors)
+
     classes = {}
     files = []
     for index, (left, right, rule) in enumerate(pairs, 1):
         file = left or right
-        status, rules = compare_pair(left, right, rule, tools, references, cmake_roots=cmake_roots)
+        graph_lines = None
+        graph_error = None
+        if left and right and file.file_class in {"build.ninja", "rules.ninja"} and not (
+            left.path.is_symlink() or right.path.is_symlink()
+        ):
+            status, rules = "different", []
+            try:
+                before, after, editors = ninja_diff(_ninja_build(left), _ninja_build(right))
+                graph_lines = (before, after)
+                if before == after:
+                    status = "identical_after_normalization"
+                    rules = ["ninja.canonical_graph"]
+                    if editors:
+                        rules.append("cache.edit_command")
+                    if any(conan_homes):
+                        rules.append("conan.home_path")
+                # Keep this bucket for intact, byte-identical manifests.
+                if before == after and file.file_class == "build.ninja" and filecmp.cmp(
+                    left.path, right.path, shallow=False
+                ):
+                    status, rules = "byte_identical", []
+            except (OSError, ValueError) as error:
+                graph_error = str(error)
+        else:
+            status, rules = compare_pair(
+                left, right, rule, tools, references, cmake_roots=cmake_roots, conan_homes=conan_homes,
+            )
         row = {
             "oracle": str(left.relative) if left else None,
             "rcmake": str(right.relative) if right else None,
@@ -1463,17 +1689,22 @@ def compare(oracle: Path, rcmake: Path, diff_dir: Path, *,
         if status == "different":
             diff_dir.mkdir(parents=True, exist_ok=True)
             diff = diff_dir / f"{index:05d}.diff"
-            diff.write_text("".join(unified_diff(
-                diff_lines(left), diff_lines(right),
+            first, second = graph_lines if graph_lines is not None else (diff_lines(left), diff_lines(right))
+            details = "".join(unified_diff(
+                first, second,
                 fromfile=f"oracle/{left.relative}" if left else "/dev/null",
                 tofile=f"rcmake/{right.relative}" if right else "/dev/null",
-            )), encoding="utf-8", errors="backslashreplace")
+            ))
+            if graph_error:
+                row["error"] = graph_error
+                details = f"{graph_error}\n{details}"
+            diff.write_text(details, encoding="utf-8", errors="backslashreplace")
             row["diff"] = str(diff)
         classes.setdefault(file.file_class, dict.fromkeys(BUCKETS, 0))[status] += 1
         files.append(row)
     result: dict[str, Any] = {"classes": classes, "files": files, "rules": RULES}
     ide = compare_ide_build_trees(oracle, rcmake, oracle_tools=tools[0], rcmake_tools=tools[1],
-                                  oracle_root=oracle_root)
+                                  oracle_root=oracle_root, conan_homes=conan_homes)
     if ide["build_dirs"]:
         result["ide"] = ide
     return result

@@ -3,7 +3,7 @@ use rcmake_eval::{CmdError, Cx, RunMode};
 use rcmake_host::{Follow, path};
 use rcmake_model::{DirId, PropScope, TargetBinding, TargetId};
 
-use crate::custom::{SOURCE_BINARY_ALTERNATIVE, bind_source};
+use crate::custom::{SOURCE_BINARY_ALTERNATIVE, bind_source, record_source_order};
 use crate::dirs::{find_directory, normalized_path, scoped_test_directory};
 
 use super::quoted;
@@ -80,15 +80,14 @@ pub(super) fn select_source(
         None if !create => return None,
         None => {
             let key = first.clone();
-            let props = cx
-                .project()
-                .dir_mut(dir)
-                .source_props
-                .entry(key.clone())
-                .or_default();
+            let directory = cx.project().dir_mut(dir);
+            let props = directory.source_props.entry(key.clone()).or_default();
             if let Some(alternate) = alternative {
                 // An absolute lookup can bind this record to either directory.
                 props.set(SOURCE_BINARY_ALTERNATIVE.into(), alternate.clone());
+                record_source_order(directory, source, true);
+            } else {
+                record_source_order(directory, &key, false);
             }
             key
         }

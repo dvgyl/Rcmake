@@ -23,7 +23,7 @@ impl Host for HermeticHost {
         {
             return Err(error);
         }
-        let checked = self.guard_path(path)?;
+        let checked = self.guard_metadata_path(path)?;
         let path = if follow == Follow::Yes {
             checked.as_ref()
         } else {
@@ -33,7 +33,7 @@ impl Host for HermeticHost {
     }
 
     fn metadata_fresh(&self, path: &Path, follow: Follow) -> HostResult<Metadata> {
-        let checked = self.guard_path(path)?;
+        let checked = self.guard_metadata_path(path)?;
         let path = if follow == Follow::Yes {
             checked.as_ref()
         } else {

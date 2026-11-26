@@ -261,6 +261,7 @@ impl rcmake_resolve::GeneratorFacts for ProbeGeneratorFacts {
 }
 
 pub(in crate::configure) use compiler::admit_environment;
+pub(in crate::configure) use compiler::{ReuseWarningReason, compiler_reuse_warning};
 
 pub(super) fn native_ninja(host: &dyn Host, path: &Path) -> bool {
     crate::configure::build_tool_facts::is_native_ninja(host, path)

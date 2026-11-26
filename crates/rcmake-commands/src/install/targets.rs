@@ -43,12 +43,13 @@ pub(super) fn parse(
                 values(args);
             }
             b"INCLUDES" => {
-                if args.next() != Some(b"DESTINATION") {
-                    return Err(fail("TARGETS INCLUDES requires DESTINATION."));
+                if args.next_if_eq(&b"DESTINATION".as_slice()).is_some()
+                    || args.next_if(|token| !keyword(token)).is_some()
+                {
+                    options
+                        .includes_destination
+                        .extend(values(args).into_iter().map(BString::from));
                 }
-                options
-                    .includes_destination
-                    .extend(values(args).into_iter().map(BString::from));
             }
             b"NAMELINK_COMPONENT" | b"NAMELINK_ONLY" | b"NAMELINK_SKIP" => {
                 if !matches!(group, Some(b"LIBRARY" | b"ARCHIVE")) {

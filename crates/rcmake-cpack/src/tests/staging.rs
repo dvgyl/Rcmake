@@ -688,3 +688,181 @@ set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
         assert!(stderr(&host).contains("plain-notice\n"));
     }
 }
+
+#[test]
+fn cpack_applies_default_directory_modes_to_package_entries() {
+    let host = memory_host();
+    write(host.as_ref(), "/work/input.txt", b"data");
+    write(
+        host.as_ref(),
+        "/work/build/cmake_install.cmake",
+        br#"
+if(NOT DEFINED CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS)
+  set(CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
+endif()
+file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/foo/bar" TYPE FILE FILES "/work/input.txt")
+"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+set(CPACK_GENERATOR TAR)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
+"#,
+    );
+    for (output, override_mode, directory_mode) in [
+        ("/work/implicit", None, 0o700),
+        (
+            "/work/empty-override",
+            Some("-DCPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS="),
+            0o700,
+        ),
+        (
+            "/work/override",
+            Some(
+                "-DCPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS=OWNER_READ;OWNER_WRITE;OWNER_EXECUTE;GROUP_READ",
+            ),
+            0o740,
+        ),
+    ] {
+        let mut args = vec!["-B", output];
+        args.extend(override_mode);
+        assert_eq!(invoke(host.clone(), &args), 0, "{}", stderr(&host));
+        let output = Path::new(output);
+        let destination = output.join("extract");
+        extract(host.as_ref(), &output.join("demo.tar"), &destination);
+        let modes = directory_modes(host.as_ref(), &destination);
+        assert_eq!(modes[&PathBuf::from("usr/foo")], directory_mode);
+        assert_eq!(modes[&PathBuf::from("usr/foo/bar")], directory_mode);
+        if override_mode
+            == Some(
+                "-DCPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS=OWNER_READ;OWNER_WRITE;OWNER_EXECUTE;GROUP_READ",
+            )
+        {
+            assert_eq!(modes[&PathBuf::from("usr")], directory_mode);
+        }
+    }
+    assert_eq!(
+        invoke(
+            host.clone(),
+            &["-DCPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS=INVALID"]
+        ),
+        1
+    );
+    assert!(stderr(&host).contains("CPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS value is invalid"));
+    write(
+        host.as_ref(),
+        "/work/build/cmake_install.cmake",
+        br#"
+set(CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS INVALID)
+file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/foo" TYPE FILE FILES "/work/input.txt")
+"#,
+    );
+    assert_eq!(invoke(host.clone(), &[]), 1);
+    assert!(stderr(&host).contains("CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS variable"));
+}
+
+#[test]
+fn cpack_installed_directories_apply_default_directory_mode_to_parent_dirs() {
+    let host = memory_host();
+    write(host.as_ref(), "/work/payload/real.txt", b"data");
+    host.symlink(Path::new("real.txt"), Path::new("/work/payload/link.txt"))
+        .unwrap();
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        br#"
+set(CPACK_GENERATOR TAR)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+set(CPACK_PACKAGING_INSTALL_PREFIX /opt/demo)
+set(CPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS OWNER_READ;OWNER_WRITE;OWNER_EXECUTE;GROUP_READ)
+set(CPACK_INSTALLED_DIRECTORIES "/work/payload;/assets/links")
+"#,
+    );
+    assert_eq!(invoke(host.clone(), &[]), 0, "{}", stderr(&host));
+    let destination = Path::new("/work/extract");
+    let tree = extract(host.as_ref(), Path::new("/work/demo.tar"), destination);
+    assert_eq!(
+        file_names(&tree),
+        [
+            "opt/demo/assets/links/link.txt",
+            "opt/demo/assets/links/real.txt"
+        ]
+    );
+    assert_eq!(
+        tree["opt/demo/assets/links/link.txt"].target.as_deref(),
+        Some(Path::new("real.txt"))
+    );
+    let modes = directory_modes(host.as_ref(), destination);
+    for dir in [
+        "opt",
+        "opt/demo",
+        "opt/demo/assets",
+        "opt/demo/assets/links",
+    ] {
+        assert_eq!(modes[&PathBuf::from(dir)], 0o740, "{dir}");
+    }
+}
+
+#[test]
+fn deb_component_file_name_override_accepts_a_slash_in_the_component() {
+    let host = memory_host();
+    let modules = seed_package_module(
+        &host,
+        "CPackDeb.cmake",
+        include_bytes!("../../../../modules/cmake-4.5/Modules/Internal/CPack/CPackDeb.cmake"),
+    );
+    write(host.as_ref(), "/work/input.txt", b"data");
+    write(
+        host.as_ref(),
+        "/work/build/cmake_install.cmake",
+        br#"file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share" TYPE FILE FILES "/work/input.txt")"#,
+    );
+    write(
+        host.as_ref(),
+        "/work/CPackConfig.cmake",
+        format!(
+            r#"
+set(CMAKE_ROOT "{modules}")
+set(CPACK_GENERATOR DEB)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_PACKAGE_CONTACT Maintainer)
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY Summary)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
+set(CPACK_DEB_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_ALL part/variant)
+set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE all)
+set(CPACK_DEBIAN_PART/VARIANT_FILE_NAME adjusted)
+"#
+        )
+        .as_bytes(),
+    );
+    assert_eq!(invoke(host.clone(), &[]), 0, "{}", stderr(&host));
+    assert_eq!(
+        list_command_archive(
+            host.as_ref(),
+            Path::new("/work/adjusted.deb"),
+            Vec::new(),
+            None
+        )
+        .expect("read Debian archive"),
+        [
+            BString::from("debian-binary"),
+            "control.tar.gz".into(),
+            "data.tar.gz".into()
+        ]
+    );
+}

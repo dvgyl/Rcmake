@@ -578,68 +578,112 @@ pub(super) fn normalize(input: &Path) -> PathBuf {
     path
 }
 
-fn find_program(cx: &Cx<'_>, input: &[u8]) -> (BString, BString) {
+pub(crate) struct ResolvedProgram {
+    pub(crate) path: PathBuf,
+    pub(crate) cmake_spelling: BString,
+    pub(crate) tail: BString,
+}
+
+pub(crate) fn resolve_program_command(
+    host: &dyn rcmake_host::Host,
+    base_dir: &Path,
+    input: &[u8],
+) -> Option<ResolvedProgram> {
     let input = input.trim_ascii_start();
     let mut whole_path_search = false;
     let (name, tail) = if let Some(&quote @ (b'"' | b'\'')) = input.first() {
-        let Some(quoted) = input.get(1..) else {
-            return (BString::default(), BString::default());
-        };
-        let Some(end) = quoted.iter().position(|byte| *byte == quote) else {
-            return (BString::default(), BString::default());
-        };
-        (quoted.get(..end), quoted.get(end + 1..))
+        let quoted = input.get(1..)?;
+        let end = quoted.iter().position(|byte| *byte == quote)?;
+        (
+            quoted.get(..end)?,
+            quoted.get(end + 1..).unwrap_or_default(),
+        )
     } else {
         let end = input
             .iter()
             .position(u8::is_ascii_whitespace)
             .unwrap_or(input.len());
         whole_path_search = end < input.len();
-        (input.get(..end), input.get(end..))
+        (input.get(..end)?, input.get(end..).unwrap_or_default())
     };
-    if let Some(program) = name.and_then(|name| program_path(cx, name, false)) {
-        (program, tail.unwrap_or_default().into())
-    } else {
-        let program = whole_path_search
-            .then(|| program_path(cx, input, true))
-            .flatten()
-            .unwrap_or_default();
-        (program, BString::default())
+    if let Some((path, cmake_spelling)) = program_path_in(host, base_dir, name, false) {
+        return Some(ResolvedProgram {
+            path,
+            cmake_spelling,
+            tail: tail.into(),
+        });
+    }
+    if whole_path_search
+        && let Some((path, cmake_spelling)) = program_path_in(host, base_dir, input, true)
+    {
+        return Some(ResolvedProgram {
+            path,
+            cmake_spelling,
+            tail: BString::default(),
+        });
+    }
+    None
+}
+
+fn find_program(cx: &Cx<'_>, input: &[u8]) -> (BString, BString) {
+    let base = cx.current_source_dir();
+    match resolve_program_command(cx.host(), &base, input) {
+        Some(resolved) => (resolved.cmake_spelling, resolved.tail),
+        None => (BString::default(), BString::default()),
     }
 }
 
-fn program_path(cx: &Cx<'_>, name: &[u8], whole_path_search: bool) -> Option<BString> {
+fn program_path_in(
+    host: &dyn rcmake_host::Host,
+    base_dir: &Path,
+    name: &[u8],
+    whole_path_search: bool,
+) -> Option<(PathBuf, BString)> {
     if name.is_empty() {
         return None;
     }
     let name = name.replace(b"\\", b"/");
-    let local = cx.resolve_path(&name);
-    if cx
-        .host()
-        .metadata(&local, Follow::Yes)
-        .is_ok_and(|metadata| {
-            !whole_path_search
-                || metadata.kind == FileKind::File && (cfg!(windows) || metadata.mode & 0o111 != 0)
-        })
-    {
-        return Some(if path::to_native(&name).is_absolute() {
-            path::from_native_cmake(&normalize(&local))
+    let native = path::to_native(&name);
+    let local = if native.is_absolute() {
+        native.clone()
+    } else {
+        base_dir.join(&native)
+    };
+    if host.metadata(&local, Follow::Yes).is_ok_and(|metadata| {
+        !whole_path_search
+            || metadata.kind == FileKind::File && (cfg!(windows) || metadata.mode & 0o111 != 0)
+    }) {
+        let (resolved_path, cmake_spelling) = if native.is_absolute() {
+            let normalized = normalize(&local);
+            let spelling = path::from_native_cmake(&normalized);
+            (normalized, spelling)
         } else if whole_path_search {
-            path::from_native_cmake(&cx.host().canonicalize(&local).unwrap_or(local))
+            let resolved = host.canonicalize(&local).unwrap_or(local);
+            let spelling = path::from_native_cmake(&resolved);
+            (resolved, spelling)
         } else {
-            name.into()
-        });
+            (local, name.into())
+        };
+        return Some((resolved_path, cmake_spelling));
     }
     if name.contains(&b'/') {
         return None;
     }
-    let paths = cx.host().env_get(b"PATH")?;
+    let paths = host.env_get(b"PATH")?;
     let delimiter = if cfg!(windows) { b';' } else { b':' };
     paths.split(|byte| *byte == delimiter).find_map(|dir| {
-        let candidate = normalize(&cx.resolve_path(dir).join(path::to_native(&name)));
-        cx.host()
-            .metadata(&candidate, Follow::Yes)
+        let dir_native = path::to_native(dir);
+        let dir_path = if dir_native.is_absolute() {
+            dir_native
+        } else {
+            base_dir.join(dir_native)
+        };
+        let candidate = normalize(&dir_path.join(&native));
+        host.metadata(&candidate, Follow::Yes)
             .is_ok_and(|m| m.kind == FileKind::File && (cfg!(windows) || m.mode & 0o111 != 0))
-            .then(|| path::from_native_cmake(&candidate))
+            .then(|| {
+                let spelling = path::from_native_cmake(&candidate);
+                (candidate, spelling)
+            })
     })
 }

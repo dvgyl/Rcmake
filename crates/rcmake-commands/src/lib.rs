@@ -10,6 +10,8 @@ mod active;
 mod compat;
 mod configure;
 pub use configure::{ConfigureRuntime, ConfigureSelection};
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub use configure::{compiler_reuse_warning, platform_queries::sysctl_path_warning};
 mod custom;
 mod dirs;
 #[cfg(all(feature = "native", any(unix, windows)))]

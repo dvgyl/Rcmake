@@ -17,6 +17,7 @@ import unittest
 import zipfile
 
 from tools.measure import build_dashboard_json as builder
+from tools.measure.test_runcmake_eval import debugger_receipt
 from tools.measure import verify_release_receipts as verifier
 
 
@@ -60,6 +61,41 @@ def make_runcmake_payload(
         "cases_passed": cases_passed,
         "cases_total": cases_total,
     }
+
+
+class RunCMakeReceiptTests(unittest.TestCase):
+    def check_suites(self, **suites):
+        fillers = {f"Suite{i:03d}": {"passed": 10, "total": 10} for i in range(361)}
+        record = verifier.ReceiptRecord(
+            "runcmake_linux", "track1-conformance", "test", Path("."),
+            {"suites": {**fillers, **suites}}, None, None,
+        )
+        findings = []
+        verifier.check_runcmake(record, findings)
+        return findings
+
+    def test_accepts_verified_debugger_branches(self):
+        self.assertEqual(self.check_suites(CommandLine=debugger_receipt()), [])
+
+    def test_rejects_failed_or_unverified_debugger_branches_at_high_pass_rates(self):
+        failed = debugger_receipt("DebuggerNotSupportedDapLog")
+        findings = self.check_suites(CommandLine=failed)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("CommandLine:capability_branch_failed", findings[0].actual)
+
+        forged = debugger_receipt()
+        forged["cases"] = [case for case in forged["cases"] if case["name"] != "DebuggerNotSupported"]
+        findings = self.check_suites(CommandLine=forged)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("CommandLine:capability_branches", findings[0].actual)
+
+    def test_rejects_unexplained_inventory_issues_in_any_suite(self):
+        for suite in ("CommandLine", "OtherSuite"):
+            for issue in ("missing", "reference_failed", "no_reference"):
+                with self.subTest(suite=suite, issue=issue):
+                    row = debugger_receipt() if suite == "CommandLine" else {"passed": 99, "total": 100}
+                    row[issue] = 1
+                    self.assertEqual(len(self.check_suites(**{suite: row})), 1)
 
 
 def make_full_dashboard(commit: str = COMMIT_OK, binary: str = BINARY_OK) -> dict:

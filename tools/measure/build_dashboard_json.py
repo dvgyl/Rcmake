@@ -37,9 +37,9 @@ from statistics import geometric_mean
 from tempfile import NamedTemporaryFile
 
 if __package__:
-    from .runcmake_eval import SUITE_GROUPS
+    from .runcmake_eval import SUITE_GROUPS, strict_case_issue
 else:
-    from runcmake_eval import SUITE_GROUPS
+    from runcmake_eval import SUITE_GROUPS, strict_case_issue
 
 
 DATA = Path(__file__).resolve().parents[2] / "site" / "data"
@@ -387,7 +387,7 @@ def combined_status(statuses):
     return "partial"
 
 
-def suite_metrics(row):
+def suite_metrics(name, row):
     passed, total = count(row["passed"]), count(row["total"])
     drivers_ok = all(
         driver.get("complete") is True and not driver.get("driver_errors")
@@ -395,10 +395,10 @@ def suite_metrics(row):
         if (driver := row.get(key)) is not None
     )
     rate(passed, total)
-    passed_suite = (0 < passed == total and drivers_ok
-                    and not row.get("reference_failed") and not row.get("no_reference"))
+    gates_ok = drivers_ok and strict_case_issue(name, row) is None
+    passed_suite = 0 < passed == total and gates_ok
     status = "pass" if passed_suite else "fail"
-    return passed, total, status, drivers_ok
+    return passed, total, status, gates_ok
 
 
 def suite_totals(results):
@@ -414,7 +414,7 @@ def merge_runcmake(tracks, reports):
         report = reports.get(platform["id"])
         if report is None:
             continue
-        suites = {name: suite_metrics(row) for name, row in report["suites"].items()}
+        suites = {name: suite_metrics(name, row) for name, row in report["suites"].items()}
         if not suites:
             raise ValueError("A RunCMake report must contain at least one suite.")
         for name, result in suites.items():
@@ -425,11 +425,11 @@ def merge_runcmake(tracks, reports):
         expected_suites = EXPECTED_OS_SUITES[platform["id"]]
         completed_suites = len(results)
         is_partial = completed_suites < expected_suites
-        all_drivers_ok = all(row[3] for row in results)
+        all_gates_ok = all(row[3] for row in results)
         if is_partial:
             platform_status = "fail" if "fail" in statuses else "partial"
             note = f"Partial OS report: {completed_suites:,} of {expected_suites:,} expected suites completed."
-        elif all_drivers_ok and totals["passRate"] is not None and totals["passRate"] >= RUNCMAKE_MIN_PASS_RATE:
+        elif all_gates_ok and totals["passRate"] is not None and totals["passRate"] >= RUNCMAKE_MIN_PASS_RATE:
             platform_status = "pass"
             note = f"Full OS report: {completed_suites:,} suites completed (minimum {expected_suites:,})."
         else:

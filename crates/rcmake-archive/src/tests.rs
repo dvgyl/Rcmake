@@ -778,3 +778,173 @@ fn raw_archive_writes_only_the_file_data_through_each_filter() -> TestResult {
     }
     Ok(())
 }
+
+fn ar_member(name: &str, payload: &[u8]) -> Vec<u8> {
+    let header = format!(
+        "{name:16}{:12}{:6}{:6}{:8}{:10}`\n",
+        2,
+        0,
+        0,
+        "100640",
+        payload.len()
+    );
+    let mut member = [header.as_bytes(), payload].concat();
+    if !payload.len().is_multiple_of(2) {
+        member.push(b'\n');
+    }
+    member
+}
+
+#[test]
+fn ar_lists_and_extracts_members_with_short_gnu_and_bsd_names() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    let mut data = b"!<arch>\n".to_vec();
+    data.extend(ar_member("short/", b"odd"));
+    data.extend(ar_member("//", b"long-gnu-filename.txt/\n"));
+    data.extend(ar_member("/0", b"GNU"));
+    data.extend(ar_member("#1/24", b"long-bsd-filename.txt\0\0\0BSD"));
+    host.seed_file(archive, &data)?;
+    assert_eq!(
+        list_command_archive(&host, archive, Vec::new(), None)?,
+        names(&[
+            "short",
+            "//",
+            "long-gnu-filename.txt",
+            "long-bsd-filename.txt"
+        ])
+    );
+    let opts = ExtractOptions {
+        patterns: names(&["long-*"]),
+        ..extract_options()
+    };
+    assert_eq!(
+        extract_archive(&host, archive, &opts)?,
+        names(&["long-gnu-filename.txt", "long-bsd-filename.txt"])
+    );
+    assert!(absent(&host, "/extract/short"));
+    for (name, bytes) in [
+        ("long-gnu-filename.txt", b"GNU"),
+        ("long-bsd-filename.txt", b"BSD"),
+    ] {
+        let path = Path::new("/extract").join(name);
+        assert_eq!(read_bytes(&host, &path, 16)?, bytes);
+        let meta = host.metadata(&path, Follow::No)?;
+        assert_eq!(meta.mode & 0o7777, 0o640);
+        assert_eq!(meta.mtime, FileTime { secs: 2, nanos: 0 });
+    }
+    Ok(())
+}
+
+#[test]
+fn ar_rejects_unsafe_names_and_truncated_members_before_extraction() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive");
+    for invalid in [
+        ar_member("#1/10", b"../outsidebad"),
+        ar_member("second/", b"truncated")[..62].to_vec(),
+    ] {
+        let data = [
+            b"!<arch>\n".as_slice(),
+            &ar_member("valid/", b"data"),
+            &invalid,
+        ]
+        .concat();
+        host.seed_file(archive, &data)?;
+        assert!(extract_archive(&host, archive, &extract_options()).is_err());
+        assert!(absent(&host, "/extract/valid"));
+        assert!(absent(&host, "/outside"));
+    }
+    Ok(())
+}
+
+#[test]
+fn compressed_ar_archives_list_and_extract_within_bounds() -> TestResult {
+    use std::io::Write;
+
+    let mut plain = b"!<arch>\n".to_vec();
+    plain.extend(ar_member("alpha.txt/", b"hello"));
+    plain.extend(ar_member("beta.txt/", b"world!"));
+
+    for filter in [
+        TarCompression::Gzip,
+        TarCompression::Bzip2,
+        TarCompression::Xz,
+        TarCompression::Zstd,
+    ] {
+        let mut encoder = crate::codec::Encoder::new(Some(filter), None, 1)?;
+        encoder.write_all(&plain)?;
+        let encoded = encoder.finish()?;
+
+        let host = test_host();
+        let archive = Path::new("/archive.ar.compressed");
+        host.seed_file(archive, &encoded)?;
+
+        assert_eq!(
+            list_command_archive(&host, archive, Vec::new(), None)?,
+            names(&["alpha.txt", "beta.txt"])
+        );
+        assert_eq!(
+            extract_archive(&host, archive, &extract_options())?,
+            names(&["alpha.txt", "beta.txt"])
+        );
+        assert_eq!(
+            read_bytes(&host, Path::new("/extract/alpha.txt"), 16)?,
+            b"hello"
+        );
+        assert_eq!(
+            read_bytes(&host, Path::new("/extract/beta.txt"), 16)?,
+            b"world!"
+        );
+
+        // Decompression stays bounded by the output limit.
+        let bounded_opts = extract_options();
+        let bounded_err = crate::extract::run_with_output_limit(
+            &host,
+            archive,
+            ExtractRequest {
+                options: &bounded_opts,
+                confined_links: false,
+                mac_extensions: false,
+            },
+            crate::extract::Listing::Names,
+            1,
+        )
+        .unwrap_err();
+        assert!(
+            bounded_err.message.contains("size limit"),
+            "{}",
+            bounded_err.message
+        );
+    }
+
+    // External filter (grzip) producing an ar payload also routes to the ar reader.
+    let host = test_host();
+    let archive = Path::new("/archive.ar.grz");
+    host.seed_file(archive, b"GRZipII\0payload")?;
+    let grzip = Path::new("/bin/grzip");
+    host.seed_file(grzip, b"")?;
+    host.set_permissions(grzip, 0o755)?;
+    host.env_set(b"PATH", Some(b"/bin"));
+    let plain_copy = plain.clone();
+    host.set_command_handler(move |_, _, _| {
+        Ok(rcmake_host::RunOutput {
+            stdout: plain_copy.clone(),
+            stderr: Vec::new(),
+            results: vec![rcmake_host::ProcessResult::Exited(0)],
+        })
+    })?;
+    assert_eq!(
+        extract_archive(&host, archive, &extract_options())?,
+        names(&["alpha.txt", "beta.txt"])
+    );
+    assert_eq!(
+        read_bytes(&host, Path::new("/extract/alpha.txt"), 16)?,
+        b"hello"
+    );
+    assert_eq!(
+        read_bytes(&host, Path::new("/extract/beta.txt"), 16)?,
+        b"world!"
+    );
+    Ok(())
+}

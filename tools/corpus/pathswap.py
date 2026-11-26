@@ -15,10 +15,10 @@ import subprocess
 import sys
 import tempfile
 
-from normalize import compare
+from normalize import BuildNormalizer, build_cmake_roots, compare
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "measure"))
-from ninja_canon import Normalizer, normalized_commands
+from ninja_canon import normalized_commands
 from oracle_prop_test import clean_environment, executable, run_command, write_json
 from path_swap_eval import TOOLS, succeeded, support_path, verify_path
 
@@ -133,18 +133,26 @@ def evaluate(bin_dir: Path, source: Path, project: Path, stages: list[Stage],
     return result
 
 
-def tool_paths(directory: Path) -> dict[str, set[str]]:
+def tool_paths(directory: Path, binary: Path | None = None) -> dict[str, set[str]]:
     """Return selected tool names and their resolved executable paths."""
-    return {
-        name: {str(directory / name), str((directory / name).resolve())} for name in TOOLS
-    }
+    paths = {name: {str(directory / name)} for name in TOOLS}
+    if binary is None:
+        for name in TOOLS:
+            paths[name].add(str((directory / name).resolve()))
+    else:
+        resolved = binary.resolve()
+        paths["cmake"].add(str(resolved))
+        for name in TOOLS:
+            alias = resolved.with_name(name)
+            if alias.resolve() == resolved:
+                paths[name].add(str(alias))
+    return paths
 
 
-def dry_run_commands(stage: dict, project: Path, bin_dir: Path) -> Counter[str]:
+def dry_run_commands(stage: dict, project: Path, tools: dict[str, set[str]], *,
+                     cmake_roots: set[str], conan_home: str | None) -> Counter[str]:
     """Count commands from verbose Ninja dry-run output."""
-    normalizer = Normalizer(project, replacements={
-        bin_dir / name: f"<{name}>" for name in TOOLS
-    })
+    normalizer = BuildNormalizer(project, project, tools, cmake_roots=cmake_roots, conan_home=conan_home)
     return Counter(normalized_commands(stage["stdout"], normalizer))
 
 
@@ -161,20 +169,26 @@ def compare_runs(source: Path, stages: list[Stage], binary: Path, oracle: Path,
         work = Path(directory).resolve()
         shim, env = prepare_paths(work, binary)
         project = work / "project"
-        before = evaluate(oracle.parent, source, project, stages, env | (oracle_env or {}),
-                          timeout, None)
+        oracle_env = env | (oracle_env or {})
+        rcmake_env = env | (rcmake_env or {})
+        before = evaluate(oracle.parent, source, project, stages, oracle_env, timeout, None)
         snapshot = work / "oracle-project"
         project.rename(snapshot)
-        after = evaluate(shim, source, project, stages, env | (rcmake_env or {}), timeout,
+        after = evaluate(shim, source, project, stages, rcmake_env, timeout,
                          artifacts / "rcmake-exec.jsonl")
+        conan_homes = (oracle_env.get("CONAN_HOME"), rcmake_env.get("CONAN_HOME"))
+        tools = (tool_paths(oracle.parent), tool_paths(shim, binary))
         files = compare(snapshot, project, artifacts / "diffs",
                         configured_outputs=configured_outputs,
-                        tools=(tool_paths(oracle.parent), tool_paths(shim)), oracle_root=project)
+                        tools=tools, oracle_root=project, conan_homes=conan_homes)
         dry_runs = {}
+        cmake_roots = (build_cmake_roots(snapshot), build_cmake_roots(project))
         for stage, first, second in zip(stages, before["stages"], after["stages"]):
             if stage.ninja_dry_run and all(row.get("returncode") == 0 for row in (first, second)):
-                left = dry_run_commands(first, project, oracle.parent)
-                right = dry_run_commands(second, project, shim)
+                left, right = (
+                    dry_run_commands(row, project, paths, cmake_roots=roots, conan_home=home)
+                    for row, paths, roots, home in zip((first, second), tools, cmake_roots, conan_homes)
+                )
                 dry_runs[stage.name] = {
                     "oracle_only": sorted((left - right).elements()),
                     "rcmake_only": sorted((right - left).elements()),

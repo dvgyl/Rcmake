@@ -309,8 +309,8 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
             .filter_map(|id| {
                 model.target(*id).map(|target| {
                     let entries = [
-                        b"PUBLIC_HEADER".as_slice(),
-                        b"PRIVATE_HEADER",
+                        b"PRIVATE_HEADER".as_slice(),
+                        b"PUBLIC_HEADER",
                         b"RESOURCE",
                         b"FRAMEWORK",
                     ]
@@ -323,7 +323,12 @@ fn install(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     } else {
         Vec::new()
     };
-    let snapshots = destinations::drop_headers_without_destination(cx, rest, snapshots);
+    let snapshots = destinations::drop_headers_without_destination(
+        cx,
+        rest,
+        options.destination.as_ref(),
+        snapshots,
+    );
     for rule in mapped {
         cx.project().add_install(rule);
     }

@@ -1,14 +1,17 @@
 //! Stage installed files through the host and the CMake interpreter.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use rcmake_base::{BString, ByteSlice, hash::HashAlgo, list, truth};
-use rcmake_eval::Interp;
+use rcmake_eval::{CmdError, CmdResult, Cx, Interp};
 use rcmake_host::path::{from_native, to_native};
-use rcmake_host::{CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest};
+use rcmake_host::{
+    CommandSpec, FileKind, Follow, Host, HostResult, Input, Output, ProcessResult, RunRequest,
+};
 
 use crate::archive_gen::ArchiveKind;
 use crate::config::{
@@ -53,6 +56,7 @@ pub(crate) fn install(
     staging: &Path,
 ) -> Result<ComponentMembers, CpackError> {
     let cfg = snapshot(interp);
+    staging_directory_mode(&cfg)?;
     let stage_files = cfg.get(b"CPACK_GENERATOR") != Some(b"External")
         || cfg.on(b"CPACK_EXTERNAL_ENABLE_STAGING");
     let clear_destdir = BTreeMap::from([("DESTDIR".into(), None)]);
@@ -169,6 +173,7 @@ fn install_projects(
     let stage_project = !external || cfg.on(b"CPACK_EXTERNAL_ENABLE_STAGING");
     let prefix = project_install_prefix(cfg);
     let record = records_members(cfg);
+    let directory_mode = staging_directory_mode(cfg)?;
     for [build, project, component, subdir] in tuples {
         let build = absolute(cwd, build);
         for config in &configs {
@@ -189,7 +194,7 @@ fn install_projects(
                     log(host.as_ref(), format!("-   Install component: {component}"));
                 }
                 let location = InstallLocation::new(cfg, destination, prefix)?;
-                ensure_dir(host.as_ref(), staging, &location.directory)?;
+                ensure_dir_with_mode(host.as_ref(), staging, &location.directory, directory_mode)?;
                 // CPack lists the install prefix directory, or the DESTDIR directory
                 // because DESTDIR installs can write outside the install prefix.
                 let scanned = if location.destdir.is_some() {
@@ -345,7 +350,7 @@ fn install_project(
     if !component.is_empty() && component != b"ALL" {
         cx.set_var(b"CMAKE_INSTALL_COMPONENT", component.into());
     }
-    if let Some(permissions) = cfg.get(b"CPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS") {
+    if let Some(permissions) = configured_permissions(cfg).filter(|p| !p.is_empty()) {
         cx.set_var(
             b"CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS",
             permissions.into(),
@@ -392,6 +397,68 @@ fn install_project(
     ))
 }
 
+const CPACK_DIRECTORY_PERMISSIONS: &[u8] = b"CPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS";
+const CMAKE_DIRECTORY_PERMISSIONS: &[u8] = b"CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS";
+
+fn configured_permissions(cfg: &CpackConfig) -> Option<&[u8]> {
+    cfg.get(CPACK_DIRECTORY_PERMISSIONS)
+        .or_else(|| cfg.get(CMAKE_DIRECTORY_PERMISSIONS))
+}
+
+pub(crate) fn staging_directory_mode(cfg: &CpackConfig) -> Result<Option<u32>, CpackError> {
+    directory_mode(configured_permissions(cfg).unwrap_or_default()).map_err(|permission| {
+        error(format!(
+            "Invalid permission value '{permission}'. CPACK_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS value is invalid."
+        ))
+    })
+}
+
+fn directory_mode(value: &[u8]) -> Result<Option<u32>, BString> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let mut mode = 0;
+    for permission in list::iter(value, list::Empty::Drop) {
+        mode |= match permission.as_ref() {
+            b"OWNER_READ" => 0o400,
+            b"OWNER_WRITE" => 0o200,
+            b"OWNER_EXECUTE" => 0o100,
+            b"GROUP_READ" => 0o040,
+            b"GROUP_WRITE" => 0o020,
+            b"GROUP_EXECUTE" => 0o010,
+            b"WORLD_READ" => 0o004,
+            b"WORLD_WRITE" => 0o002,
+            b"WORLD_EXECUTE" => 0o001,
+            b"SETUID" => 0o4000,
+            b"SETGID" => 0o2000,
+            _ => return Err(permission.as_ref().into()),
+        };
+    }
+    Ok(Some(mode))
+}
+
+thread_local! {
+    // The file command creates directories through the install host on this thread.
+    static INSTALL_DIRECTORY_MODE: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+pub(crate) fn with_install_directory_mode(
+    cx: &mut Cx<'_>,
+    install: impl FnOnce(&mut Cx<'_>) -> CmdResult,
+) -> CmdResult {
+    let mode = directory_mode(&cx.var_or_empty(CMAKE_DIRECTORY_PERMISSIONS)).map_err(|arg| {
+        CmdError::status(format!(
+            "INSTALL given invalid permission \"{arg}\". Set with CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS variable."
+        ))
+    })?;
+    INSTALL_DIRECTORY_MODE.with(|active| {
+        let previous = active.replace(mode);
+        let result = install(cx);
+        active.set(previous);
+        result
+    })
+}
+
 /// The host of a CPack install script.
 ///
 /// CPack sends the status messages of `cmake_install.cmake` (`-- Installing:`,
@@ -403,7 +470,65 @@ struct InstallHost {
 }
 
 impl Host for InstallHost {
-    rcmake_host::forward_host!(inner, fs, env, process);
+    rcmake_host::forward_host!(inner, env, process);
+    rcmake_host::forward_host!(@method inner, metadata(p: &::std::path::Path, follow: rcmake_host::Follow) -> rcmake_host::HostResult<rcmake_host::Metadata>);
+    rcmake_host::forward_host!(@method inner, metadata_fresh(p: &::std::path::Path, follow: rcmake_host::Follow) -> rcmake_host::HostResult<rcmake_host::Metadata>);
+    rcmake_host::forward_host!(@ inner, read);
+    rcmake_host::forward_host!(@ inner, read_with_origin);
+    rcmake_host::forward_host!(@ inner, read_chunks);
+    rcmake_host::forward_host!(@method inner, write(p: &::std::path::Path, data: &[u8], mode: rcmake_host::WriteMode) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, read_dir(p: &::std::path::Path) -> rcmake_host::HostResult<Vec<rcmake_host::DirEntry>>);
+    rcmake_host::forward_host!(@method inner, create_private_dir(p: &::std::path::Path) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, remove_file(p: &::std::path::Path) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, remove_dir(p: &::std::path::Path) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, remove_dir_all(p: &::std::path::Path) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, rename(from: &::std::path::Path, to: &::std::path::Path) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, rename_noreplace(from: &::std::path::Path, to: &::std::path::Path) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, lock_file(path: &::std::path::Path,
+            timeout: Option<::core::time::Duration>,
+        ) -> rcmake_host::HostResult<Box<dyn rcmake_host::FileLockGuard>>);
+    rcmake_host::forward_host!(@method inner, copy_file(from: &::std::path::Path, to: &::std::path::Path, opts: rcmake_host::CopyOptions) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, symlink(target: &::std::path::Path, link: &::std::path::Path) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, hard_link(src: &::std::path::Path, dst: &::std::path::Path) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@ inner, read_link);
+    rcmake_host::forward_host!(@method inner, canonicalize(p: &::std::path::Path) -> rcmake_host::HostResult<::std::path::PathBuf>);
+    rcmake_host::forward_host!(@method inner, canonicalize_fresh(p: &::std::path::Path) -> rcmake_host::HostResult<::std::path::PathBuf>);
+    rcmake_host::forward_host!(@method inner, set_permissions(p: &::std::path::Path, mode: u32) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, set_times(p: &::std::path::Path,
+            atime: Option<rcmake_host::FileTime>,
+            mtime: Option<rcmake_host::FileTime>,
+        ) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@method inner, set_symlink_times(path: &::std::path::Path,
+            atime: Option<rcmake_host::FileTime>,
+            mtime: Option<rcmake_host::FileTime>,
+        ) -> rcmake_host::HostResult<()>);
+    rcmake_host::forward_host!(@ inner, open_read);
+    rcmake_host::forward_host!(@ inner, scratch_file);
+    rcmake_host::forward_host!(@ inner, scratch_file_in);
+    rcmake_host::forward_host!(@method inner, write_from(path: &::std::path::Path,
+            mode: rcmake_host::WriteMode,
+            input: &mut dyn ::std::io::Read,
+            len: u64,
+        ) -> rcmake_host::HostResult<()>);
+
+    fn create_dir_all(&self, path: &Path) -> HostResult<()> {
+        let Some(mode) = INSTALL_DIRECTORY_MODE.get() else {
+            return self.inner.create_dir_all(path);
+        };
+        let mut missing = Vec::new();
+        for directory in path.ancestors() {
+            match self.inner.metadata(directory, Follow::Yes) {
+                Ok(_) => break,
+                Err(err) if err.kind == ErrorKind::NotFound => missing.push(directory),
+                Err(err) => return Err(err),
+            }
+        }
+        self.inner.create_dir_all(path)?;
+        for directory in missing {
+            self.inner.set_permissions(directory, mode)?;
+        }
+        Ok(())
+    }
 
     fn registry_host_view(&self) -> Option<rcmake_host::RegistryView> {
         self.inner.registry_host_view()
@@ -736,6 +861,15 @@ pub(crate) fn relative_install_path(value: &[u8]) -> Result<PathBuf, CpackError>
 }
 
 pub(crate) fn ensure_dir(host: &dyn Host, root: &Path, path: &Path) -> Result<(), CpackError> {
+    ensure_dir_with_mode(host, root, path, None)
+}
+
+pub(crate) fn ensure_dir_with_mode(
+    host: &dyn Host,
+    root: &Path,
+    path: &Path,
+    mode: Option<u32>,
+) -> Result<(), CpackError> {
     let suffix = path
         .strip_prefix(root)
         .map_err(|err| error(err.to_string()))?;
@@ -750,7 +884,12 @@ pub(crate) fn ensure_dir(host: &dyn Host, root: &Path, path: &Path) -> Result<()
                     directory.display()
                 )));
             }
-            Err(err) if err.kind == ErrorKind::NotFound => host.create_dir_all(&directory)?,
+            Err(err) if err.kind == ErrorKind::NotFound => {
+                host.create_dir_all(&directory)?;
+                if let Some(mode) = mode {
+                    host.set_permissions(&directory, mode)?;
+                }
+            }
             Err(err) => return Err(err.into()),
         }
     }

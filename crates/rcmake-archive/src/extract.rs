@@ -15,6 +15,7 @@ use crate::{
 };
 use crate::{codec, external_filter, seven_zip, tar_budget, timestamp, zip_codec};
 
+mod ar;
 pub(super) mod stage;
 
 use stage::{Interval, Stage};
@@ -227,6 +228,8 @@ fn run_inner(
         .any(|magic| prefix.starts_with(*magic))
     {
         scan.zip(&mut source, len, &host.time_zone(), &mut staged)?
+    } else if prefix.starts_with(ar::MAGIC) {
+        scan.ar(&mut source, len, &mut staged)?
     } else if let Some(program) = external_filter::detect(prefix) {
         let bytes = external_filter::decompress(
             host,
@@ -235,12 +238,47 @@ fn run_inner(
             scan.tar_stream_limit(),
             scan.ratio_capped,
         )?;
-        scan.tar_headers(bytes.as_slice(), &mut staged)?
+        if bytes.starts_with(ar::MAGIC) {
+            let decoded_len = bytes.len() as u64;
+            let mut cursor = io::Cursor::new(bytes);
+            scan.ar(&mut cursor, decoded_len, &mut staged)?
+        } else {
+            scan.tar_headers(bytes.as_slice(), &mut staged)?
+        }
     } else {
         let input =
             BufReader::with_capacity(stage::BUFFER, (&mut source).take(stage::MAX_BYTES + 1));
         match codec::detect(prefix) {
-            Some(filter) => scan.tar_headers(codec::decoder(filter, input)?, &mut staged)?,
+            Some(filter) => {
+                let mut decoded = StreamBudget::new(
+                    codec::decoder(filter, input)?,
+                    scan.tar_stream_limit(),
+                    scan.ratio_capped,
+                );
+                let mut head = [0_u8; 8];
+                let mut filled = 0;
+                while let Some(slot) = head.get_mut(filled..) {
+                    if slot.is_empty() {
+                        break;
+                    }
+                    let count = decoded.read(slot).map_err(archive_error)?;
+                    if count == 0 {
+                        break;
+                    }
+                    filled += count;
+                }
+                let prefix_bytes = head.get(..filled).unwrap_or_default();
+                if prefix_bytes == ar::MAGIC {
+                    let mut bytes = Vec::with_capacity(filled);
+                    bytes.extend_from_slice(prefix_bytes);
+                    decoded.read_to_end(&mut bytes).map_err(archive_error)?;
+                    let decoded_len = bytes.len() as u64;
+                    let mut cursor = io::Cursor::new(bytes);
+                    scan.ar(&mut cursor, decoded_len, &mut staged)?
+                } else {
+                    scan.tar_headers(prefix_bytes.chain(decoded), &mut staged)?
+                }
+            }
             None => scan.tar_headers(input, &mut staged)?,
         }
     };

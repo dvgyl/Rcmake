@@ -56,21 +56,34 @@ impl Drop for Prefetched {
 
 impl PlatformQueries {
     /// Start the queries that the Darwin platform modules run.
-    pub(in crate::configure) fn prefetch(&self, host: &Arc<dyn Host>) {
+    pub(in crate::configure) fn prefetch(&self, host: &Arc<dyn Host>, warm_replay: bool) {
         let env = host.env_all();
         let cwd = host.initial_cwd();
         let Ok(mut pending) = self.1.0.lock() else {
             return;
         };
-        for (program, args, stderr) in [
-            ("xcode-select", ["-print-path"].as_slice(), Output::Capture),
-            ("sysctl", &["-q", "hw.optional.arm64"], Output::Capture),
-            ("xcrun", &["--show-sdk-path"], Output::Capture),
-            ("sw_vers", &["-productVersion"], Output::Inherit),
-            ("brew", &["--prefix"], Output::Inherit),
-            ("/usr/bin/uname", &["-r"], Output::Null),
-            ("/usr/bin/uname", &["-m"], Output::Null),
+        for (program, args, stderr, receipt) in [
+            (
+                "xcode-select",
+                ["-print-path"].as_slice(),
+                Output::Capture,
+                false,
+            ),
+            (
+                "sysctl",
+                &["-q", "hw.optional.arm64"],
+                Output::Capture,
+                true,
+            ),
+            ("xcrun", &["--show-sdk-path"], Output::Capture, false),
+            ("sw_vers", &["-productVersion"], Output::Inherit, true),
+            ("brew", &["--prefix"], Output::Inherit, false),
+            ("/usr/bin/uname", &["-r"], Output::Null, true),
+            ("/usr/bin/uname", &["-m"], Output::Null, false),
         ] {
+            if warm_replay && receipt {
+                continue;
+            }
             let request = RunRequest {
                 pipeline: vec![CommandSpec {
                     program: program.into(),

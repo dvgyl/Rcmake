@@ -2,16 +2,17 @@
 
 use std::collections::BTreeSet;
 
-use rcmake_base::{BString, path_lex::Lexical, truth};
+use rcmake_base::{BString, ByteSlice, hash::HashAlgo, list, path_lex::Lexical, truth};
 use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
-use rcmake_genex::find_genex;
+use rcmake_genex::{EvalContext, EvalSite, evaluate, find_genex, parse};
 use rcmake_host::path::from_native;
 use rcmake_model::{
-    BT, CustomCommand, CustomCommandKind, Directory, GeneratorKind, TargetBinding, TargetEvent,
-    TargetKind,
+    BT, CustomCommand, CustomCommandKind, DirId, Directory, GeneratorKind, TargetBinding,
+    TargetEvent, TargetKind,
 };
+use rcmake_resolve::usage::UsageResolver;
 
 use crate::util::model_error;
 
@@ -25,6 +26,9 @@ const DEFERRED_APPEND: &[u8] = b"\0RCMAKE_CUSTOM_APPEND";
 
 /// Possible binary path of a relative source property record.
 pub(crate) const SOURCE_BINARY_ALTERNATIVE: &[u8] = b"\0rcmake-source-binary-alternative";
+
+/// Directory property recording configure-time source registrations in call order.
+pub(crate) const SOURCE_ORDER_PROP: &[u8] = b"\0rcmake-source-order";
 
 pub(crate) fn register(registry: &mut Registry) {
     let project_only = CmdFlags { scriptable: false };
@@ -384,10 +388,17 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         let count = cx.project().commands().count();
         return append::run(cx, body, count, Some(args));
     }
+    let Some(rule_key) = new_output_rule(cx, &body)? else {
+        return Ok(Flow::Normal);
+    };
     let explicit_only = options.explicit_only
         || truth::is_on(&cx.var_or_empty(b"CMAKE_ADD_CUSTOM_COMMAND_DEPENDS_EXPLICIT_ONLY"));
     let dir = body.dir;
     let id = record(cx, body)?;
+    cx.project()
+        .dir_mut(dir)
+        .props
+        .set(rule_key, id.index().to_string().into());
     if explicit_only {
         // The command arena has no field for this option.
         cx.project().dir_mut(dir).props.set(
@@ -400,6 +411,185 @@ fn add_command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         );
     }
     Ok(Flow::Normal)
+}
+
+fn new_output_rule(cx: &mut Cx<'_>, body: &CustomCommand) -> Result<Option<BString>, CmdError> {
+    if !body.command_lines.is_empty()
+        && let Some(dependency) = body
+            .main_dependency
+            .as_ref()
+            .filter(|path| !path.is_empty())
+    {
+        let project = cx.project();
+        let dir = project.dir(body.dir);
+        let path = Lexical::new(&Lexical::new(&dir.source_dir).append(dependency)).normalize();
+        let key: BString = [b"\0rcmake-custom-main/".as_slice(), &path].concat().into();
+        let existing = dir
+            .props
+            .get(&key)
+            .and_then(|value| value.to_str().ok()?.parse::<usize>().ok())
+            .and_then(|index| project.commands().nth(index).map(|(_, command)| command));
+        match existing {
+            None => return Ok(Some(key)),
+            Some(command) if command.command_lines == body.command_lines => return Ok(None),
+            Some(_) => {}
+        }
+    }
+
+    let output = body
+        .outputs
+        .first()
+        .ok_or_else(|| CmdError::status("No OUTPUT specified."))?;
+    let rule_name = custom_rule_identity(cx, body.dir, output);
+    let key: BString = [b"\0rcmake-custom-rule/".as_slice(), &rule_name]
+        .concat()
+        .into();
+    let project = cx.project();
+    let dir = project.dir(body.dir);
+    let existing = dir
+        .props
+        .get(&key)
+        .and_then(|value| value.to_str().ok()?.parse::<usize>().ok())
+        .and_then(|index| project.commands().nth(index).map(|(_, command)| command));
+    match existing {
+        None => Ok(Some(key)),
+        Some(command) if command.command_lines == body.command_lines => Ok(None),
+        Some(_) => Err(crate::command_error(
+            cx,
+            format!(
+                "Attempt to add a custom rule to output\n  {rule_name}.rule\nwhich already has a custom rule."
+            ),
+        )),
+    }
+}
+
+/// Derive CMake's custom-command rule file stem for `output` (without `.rule`).
+fn custom_rule_identity(cx: &mut Cx<'_>, dir: DirId, output: &BT<BString>) -> BString {
+    let normalized = normalize_genex_path(&output.value);
+    if find_genex(&normalized).is_none() {
+        return normalized;
+    }
+    let simple: BString = normalized.replace(b"$<CONFIG>", b"(CONFIG)").into();
+    if find_genex(&simple).is_none() {
+        let path = if Lexical::new(&simple).absolute() {
+            simple
+        } else {
+            let source_dir = &cx.project().dir(dir).source_dir;
+            Lexical::new(source_dir).append(&simple)
+        };
+        return Lexical::new(&path).normalize();
+    }
+    let configs = append::active_configs(cx);
+    let project = cx.project();
+    let binary_dir = project.dir(dir).binary_dir.clone();
+    if let Ok(ast) = parse(&normalized) {
+        let mut usage = UsageResolver::new(project);
+        let mut host = usage.host(dir);
+        let mut expanded = BTreeSet::new();
+        let mut ok = true;
+        for config in &configs {
+            let context = EvalContext {
+                config: config.clone(),
+                site: EvalSite {
+                    backtrace: output.backtrace.clone(),
+                    property: None,
+                },
+                ..EvalContext::default()
+            };
+            match evaluate(&ast, &context, &mut host) {
+                Ok((value, _)) => {
+                    for item in list::split(&value, list::Empty::Drop) {
+                        let resolved =
+                            Lexical::new(&Lexical::new(&binary_dir).append(&item)).normalize();
+                        expanded.insert(resolved);
+                    }
+                }
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok
+            && expanded.len() == 1
+            && let Some(single) = expanded.into_iter().next()
+        {
+            return single;
+        }
+    }
+    let digest = HashAlgo::Sha256.hex_digest(&normalized);
+    let short = digest.get(..16).unwrap_or(&digest);
+    Lexical::new(&Lexical::new(&binary_dir).append(format!("CMakeFiles/{short}").as_bytes()))
+        .normalize()
+}
+
+/// Normalize path separators and dot segments outside `$<...>` generator expressions.
+fn normalize_genex_path(path: &[u8]) -> BString {
+    let slashed: Vec<u8> = path
+        .iter()
+        .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+        .collect();
+    if find_genex(&slashed).is_none() {
+        return Lexical::new(&slashed).normalize();
+    }
+    let (prefix, rest) = match slashed.as_slice() {
+        [drive, b':', b'/', tail @ ..] if drive.is_ascii_alphabetic() => {
+            (slashed.get(..3).unwrap_or_default(), tail)
+        }
+        [b'/', tail @ ..] => (b"/".as_slice(), tail),
+        tail => (b"".as_slice(), tail),
+    };
+    let absolute = !prefix.is_empty();
+    let mut segments: Vec<&[u8]> = Vec::new();
+    let mut depth = 0_usize;
+    let mut start = 0_usize;
+    let mut i = 0_usize;
+    while i < rest.len() {
+        if rest.get(i..i + 2) == Some(b"$<") {
+            depth += 1;
+            i += 2;
+        } else if rest.get(i) == Some(&b'>') && depth > 0 {
+            depth -= 1;
+            i += 1;
+        } else if rest.get(i) == Some(&b'/') && depth == 0 {
+            if let Some(segment) = rest.get(start..i) {
+                push_genex_segment(&mut segments, segment, absolute);
+            }
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if let Some(segment) = rest.get(start..) {
+        push_genex_segment(&mut segments, segment, absolute);
+    }
+    let mut out = BString::from(prefix);
+    for (idx, segment) in segments.into_iter().enumerate() {
+        if idx > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(segment);
+    }
+    out
+}
+
+fn push_genex_segment<'a>(segments: &mut Vec<&'a [u8]>, segment: &'a [u8], absolute: bool) {
+    if segment.is_empty() || segment == b"." {
+        return;
+    }
+    if segment == b".." {
+        if let Some(&last) = segments.last()
+            && last != b".."
+            && find_genex(last).is_none()
+        {
+            segments.pop();
+        } else if !absolute {
+            segments.push(segment);
+        }
+    } else {
+        segments.push(segment);
+    }
 }
 
 fn check_keywords(cx: &mut Cx<'_>, options: &Options, allowed: &[&str], context: &str) -> bool {
@@ -614,18 +804,43 @@ pub(crate) fn record(
     for path in generated {
         if find_genex(&path).is_none() {
             let directory = project.dir_mut(dir);
-            if directory.source_props.len() > directory.generated_sources.len()
-                && let Some(key) = directory.source_props.iter().find_map(|(key, props)| {
+            let bound = directory.source_props.len() > directory.generated_sources.len()
+                && if let Some(key) = directory.source_props.iter().find_map(|(key, props)| {
                     let alternate = props.get(SOURCE_BINARY_ALTERNATIVE)?;
                     (key == &path || alternate == &path).then(|| key.clone())
-                })
-            {
-                bind_source(directory, &key, &path);
+                }) {
+                    bind_source(directory, &key, &path);
+                    true
+                } else {
+                    false
+                };
+            if !bound && !directory.source_props.contains_key(&path) {
+                record_source_order(directory, &path, false);
             }
             project.mark_generated(dir, path);
         }
     }
     Ok(id)
+}
+
+/// Record a source file registration in configure-time call order for `dir`.
+pub(crate) fn record_source_order(dir: &mut Directory, path: &[u8], relative: bool) {
+    if path.is_empty() || path.contains(&0) || find_genex(path).is_some() {
+        return;
+    }
+    let slashed: Vec<u8> = path
+        .iter()
+        .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+        .collect();
+    let normalized = Lexical::new(&slashed).normalize();
+    if normalized.is_empty() {
+        return;
+    }
+    let mut entry = Vec::with_capacity(normalized.len() + 2);
+    entry.push(if relative { b'R' } else { b'A' });
+    entry.extend_from_slice(&normalized);
+    entry.push(0);
+    dir.props.append_string(SOURCE_ORDER_PROP.into(), &entry);
 }
 
 /// Bind a relative source record to its resolved path. Keep its insertion order.
@@ -641,4 +856,126 @@ pub(crate) fn bind_source(directory: &mut Directory, old: &BString, new: &BStrin
         props.unset(SOURCE_BINARY_ALTERNATIVE);
         sources.shift_insert(position, new.clone(), props);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn output_rules_keep_the_first_matching_command_details() -> crate::test_support::TestResult {
+    use std::sync::Arc;
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{PureHost, Stream, path::to_native};
+
+    let cwd = to_native(if cfg!(windows) { b"C:/work" } else { b"/work" });
+    let exe = cwd.join("cmake");
+    let src = cwd.join("src");
+    let build = cwd.join("build");
+    let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
+    let script = br#"
+cmake_minimum_required(VERSION 4.5)
+add_custom_command(OUTPUT out one COMMAND tool COMMENT first)
+add_custom_command(OUTPUT out two COMMAND tool COMMENT second)
+add_custom_command(OUTPUT out APPEND COMMAND later)
+add_custom_command(OUTPUT via_main MAIN_DEPENDENCY input COMMAND tool COMMENT main)
+add_custom_command(OUTPUT duplicate MAIN_DEPENDENCY ./input COMMAND tool)
+add_custom_command(OUTPUT fallback MAIN_DEPENDENCY input COMMAND other)
+add_custom_command(OUTPUT out COMMAND different)
+"#;
+    host.seed_file(&src.join("CMakeLists.txt"), script)?;
+    let mut interp = Interp::new(
+        InterpConfig::new(host.clone(), RunMode::Configure, cwd.join("data"), exe, cwd),
+        crate::register_all,
+    );
+    assert_eq!(interp.run_configure(&src, &build, &[]).exit_code, 1);
+    let diagnostics = host.stream_bytes(Stream::Stderr);
+    assert!(
+        diagnostics
+            .to_string()
+            .contains("which already has a custom rule")
+    );
+    let mut cx = interp.cx();
+    let commands = cx
+        .project()
+        .commands()
+        .map(|(_, command)| command)
+        .collect::<Vec<_>>();
+    assert_eq!(commands.len(), 3);
+    assert_eq!(commands[0].comment, Some("first".into()));
+    assert!(commands[0].outputs[1].value.ends_with(b"/one"));
+    assert_eq!(commands[0].command_lines.len(), 2);
+    assert!(commands[2].outputs[0].value.ends_with(b"/fallback"));
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn output_rules_normalize_equivalent_paths_and_genex_rule_identities()
+-> crate::test_support::TestResult {
+    use std::sync::Arc;
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{PureHost, Stream, path::to_native};
+
+    let run = |script: &[u8]| -> Result<(i32, String), Box<dyn std::error::Error>> {
+        let cwd = to_native(if cfg!(windows) { b"C:/work" } else { b"/work" });
+        let exe = cwd.join("cmake");
+        let src = cwd.join("src");
+        let build = cwd.join("build");
+        let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
+        host.seed_file(&src.join("CMakeLists.txt"), script)?;
+        let mut interp = Interp::new(
+            InterpConfig::new(host.clone(), RunMode::Configure, cwd.join("data"), exe, cwd),
+            crate::register_all,
+        );
+        let code = interp.run_configure(&src, &build, &[]).exit_code;
+        Ok((code, host.stream_bytes(Stream::Stderr).to_string()))
+    };
+
+    // Equivalent unnormalized plain paths conflict when commands differ.
+    let (code, stderr) = run(br#"
+cmake_minimum_required(VERSION 4.5)
+add_custom_command(OUTPUT dir/../out.txt COMMAND tool_a)
+add_custom_command(OUTPUT ./out.txt COMMAND tool_b)
+"#)?;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("out.txt.rule"), "{stderr}");
+    assert!(
+        stderr.contains("which already has a custom rule"),
+        "{stderr}"
+    );
+
+    // Equivalent unnormalized $<CONFIG> paths map to the same (CONFIG) rule file.
+    let (code, stderr) = run(br#"
+cmake_minimum_required(VERSION 4.5)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}//$<CONFIG>/out.txt COMMAND tool_a)
+add_custom_command(OUTPUT sub/../$<CONFIG>/out.txt COMMAND tool_b)
+"#)?;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("(CONFIG)/out.txt.rule"), "{stderr}");
+    assert!(
+        stderr.contains("which already has a custom rule"),
+        "{stderr}"
+    );
+
+    // A generator expression that expands to a single constant path matches that plain output.
+    let (code, stderr) = run(br#"
+cmake_minimum_required(VERSION 4.5)
+add_custom_command(OUTPUT $<IF:1,out.txt,other.txt> COMMAND tool_a)
+add_custom_command(OUTPUT out.txt COMMAND tool_b)
+"#)?;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("out.txt.rule"), "{stderr}");
+    assert!(
+        stderr.contains("which already has a custom rule"),
+        "{stderr}"
+    );
+
+    // Identical commands on equivalent $<CONFIG> spellings deduplicate cleanly.
+    let (code, stderr) = run(br#"
+cmake_minimum_required(VERSION 4.5)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}//$<CONFIG>/same.txt COMMAND tool_a)
+add_custom_command(OUTPUT sub/../$<CONFIG>/same.txt COMMAND tool_a)
+"#)?;
+    assert_eq!(code, 0, "{stderr}");
+    Ok(())
 }

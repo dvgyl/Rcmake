@@ -12,6 +12,8 @@ mod build_command;
 mod build_tool_facts;
 #[cfg(all(feature = "native", any(unix, windows)))]
 mod concurrent;
+#[cfg(all(feature = "native", any(unix, windows)))]
+mod doctor;
 mod enable_language;
 mod generator_env;
 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -22,6 +24,8 @@ pub(crate) mod platform_queries;
 mod probe_pool;
 mod selection_change;
 mod session;
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub use doctor::compiler_reuse_warning;
 pub use selection_change::ConfigureSelection;
 pub use session::ConfigureRuntime;
 #[cfg(test)]

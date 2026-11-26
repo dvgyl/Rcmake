@@ -14,9 +14,11 @@ pub(super) fn parse<'a>(
         b"--debugger" => return Err("CMake was not built with support for --debugger".into()),
         b"--debugger-pipe" => {
             arg.required("No path specified for --debugger-pipe")?;
+            return Err("CMake was not built with support for --debugger-pipe".into());
         }
         b"--debugger-dap-log" => {
             arg.required("No file specified for --debugger-dap-log")?;
+            return Err("CMake was not built with support for --debugger-dap-log".into());
         }
         b"--debug-output" => {
             out(host, "Running with debug output on.\n");

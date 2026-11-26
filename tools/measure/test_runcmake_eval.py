@@ -1,13 +1,207 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Test upstream registration, driver execution, and RunCMake results."""
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
+import os
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
+from threading import Barrier, Event, Lock
 import unittest
 from unittest.mock import patch
 
 from tools.measure import runcmake_eval
+
+
+def debugger_outcomes(prefix="", common_count=0):
+    """Create the two upstream debugger inventories with passing results."""
+    def outcomes(names):
+        return {(prefix + name, 1): {"passed": True, "detail": ""} for name in names}
+
+    common = ("DebuggerCapabilityInspect", *(f"Common{i}" for i in range(common_count)))
+    return (
+        outcomes((*common, "DebuggerArgMissingPipe", "DebuggerArgMissingDapLog")),
+        outcomes((*common, "DebuggerNotSupported", "DebuggerNotSupportedPipe", "DebuggerNotSupportedDapLog")),
+    )
+
+
+def debugger_receipt(failed_case=None):
+    """Create a scored debugger suite with an optional failed Rcmake case."""
+    oracle, candidate = debugger_outcomes(common_count=100)
+    if failed_case is not None:
+        candidate[failed_case, 1]["passed"] = False
+    statuses, branches = runcmake_eval.debugger_branches("CommandLine", oracle, candidate)
+    cases = runcmake_eval.compare(oracle, candidate, branch_statuses=statuses)
+    return {**runcmake_eval.case_counts(cases), "cases": cases, "capability_branches": branches}
+
+
+class DebuggerBranchTests(unittest.TestCase):
+    def test_scores_exact_branches_in_each_registration(self):
+        oracle, candidate = {}, {}
+        for prefix in ("", "CommandLine.ninja: ", "CommandLine.vs: "):
+            expected, actual = debugger_outcomes(prefix)
+            oracle.update(expected)
+            candidate.update(actual)
+        statuses, branches = runcmake_eval.debugger_branches("CommandLine", oracle, candidate)
+        cases = runcmake_eval.compare(oracle, candidate, branch_statuses=statuses)
+        self.assertEqual(branches, [
+            {"capability": "debugger", "registration": registration, "oracle": True, "rcmake": False}
+            for registration in (None, "CommandLine.ninja", "CommandLine.vs")
+        ])
+        self.assertEqual(runcmake_eval.case_counts(cases), {
+            "passed": 12, "failed": 0, "total": 12, "missing": 0, "reference_failed": 0,
+            "no_reference": 0, "capability_excluded": 6,
+        })
+
+    def test_incomplete_or_different_inventories_keep_strict_case_results(self):
+        for problem in ("suite", "inspection", "oracle failure", "wrong registration", "overlap"):
+            with self.subTest(problem=problem):
+                oracle, candidate = debugger_outcomes("CommandLine.ninja: ")
+                suite = "OtherSuite" if problem == "suite" else "CommandLine"
+                inspect = "CommandLine.ninja: DebuggerCapabilityInspect", 1
+                enabled = "CommandLine.ninja: DebuggerArgMissingPipe", 1
+                disabled = "CommandLine.ninja: DebuggerNotSupported", 1
+                if problem == "inspection":
+                    oracle[inspect]["passed"] = False
+                elif problem == "oracle failure":
+                    oracle[enabled]["passed"] = False
+                elif problem == "wrong registration":
+                    candidate["CommandLine.vs: DebuggerNotSupported", 1] = candidate.pop(disabled)
+                elif problem == "overlap":
+                    candidate[enabled] = oracle[enabled]
+                statuses, branches = runcmake_eval.debugger_branches(suite, oracle, candidate)
+                self.assertEqual((statuses, branches), ({}, []))
+                cases = runcmake_eval.compare(oracle, candidate, branch_statuses=statuses)
+                self.assertEqual(runcmake_eval.case_counts(cases)["capability_excluded"], 0)
+
+    def test_cli_fails_each_missing_or_failed_debugger_case_above_threshold(self):
+        with TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            source = work / "Tests" / "RunCMake"
+            (source / "CommandLine").mkdir(parents=True)
+            (source / "CommandLine" / "RunCMakeTest.cmake").touch()
+            (source / "RunCMake.cmake").touch()
+            driver, candidate = work / "oracle", work / "candidate"
+            candidate.touch()
+            candidate.chmod(0o755)
+            report = work / "report.json"
+            argv = ["runcmake_eval.py", "--suite", "CommandLine", "--rcmake-bin", str(candidate),
+                    "--json", str(report), "--min-pass-rate", "99"]
+            complete = {"complete": True, "timed_out": False, "driver_errors": []}
+            failures = [(name, status) for name in runcmake_eval.DEBUGGER_DISABLED_CASES
+                        for status in ("failed", "missing")]
+            for name, status in [(None, "passed"), *failures]:
+                with self.subTest(name=name, status=status):
+                    oracle, actual = debugger_outcomes(common_count=200)
+                    if status == "failed":
+                        actual[name, 1]["passed"] = False
+                    elif status == "missing":
+                        del actual[name, 1]
+                    lanes = [(oracle, complete.copy()), (actual, complete.copy())]
+                    registration = runcmake_eval.Registration(
+                        "CommandLine", "Ninja", Path("Tests/RunCMake/CommandLine/RunCMakeTest.cmake"),
+                        work / "g0", (), Path("Tests/RunCMake"), 10,
+                    )
+                    with (patch.object(sys, "argv", argv),
+                          patch.dict(os.environ, RCMAKE_ORACLE_CMAKE=str(driver),
+                                     RCMAKE_ORACLE_RUNCMAKE_DIR=str(source)),
+                          patch.object(runcmake_eval.subprocess, "check_output", return_value="cmake version 4.5.1\n"),
+                          patch.object(runcmake_eval, "prepare_helpers", return_value={}),
+                          patch.object(runcmake_eval, "read_registrations", return_value={"CommandLine": [registration]}),
+                          patch.object(runcmake_eval, "run_suite", side_effect=lanes),
+                          patch.object(runcmake_eval, "run_registered_suite", side_effect=lanes),
+                          redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                        self.assertEqual(runcmake_eval.main(), int(status != "passed"))
+                    receipt = json.loads(report.read_text())
+                    suite = receipt["suites"]["CommandLine"]
+                    self.assertGreater(receipt["pass_rate_percent"], 99)
+                    self.assertEqual(suite["capability_excluded"], 0 if status == "missing" else 2)
+                    self.assertEqual("capability_branches" in suite, status != "missing")
+                    if status == "failed":
+                        case = next(row for row in suite["cases"] if row["name"] == name)
+                        self.assertEqual(case["status"], "failed")
+
+
+class ParallelSuiteTests(unittest.TestCase):
+    def test_jobs_requires_a_positive_integer(self):
+        for value in ("0", "-2", "1.5"):
+            with (self.subTest(value=value),
+                  patch.object(sys, "argv", ["runcmake_eval.py", "--jobs", value]),
+                  redirect_stderr(io.StringIO()) as stderr,
+                  self.assertRaises(SystemExit) as error):
+                runcmake_eval.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("--jobs", stderr.getvalue())
+
+    def test_jobs_three_runs_isolated_suites_and_reports_in_input_order(self):
+        with TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            source = work / "source" / "Tests" / "RunCMake"
+            suites = ("Syntax", "MaxRecursionDepth", "Configure")
+            for suite in suites:
+                (source / suite).mkdir(parents=True)
+                (source / suite / "RunCMakeTest.cmake").touch()
+            (source / "RunCMake.cmake").touch()
+            driver = work / "oracle" / "cmake"
+            candidate = work / "rcmake" / "cmake"
+            candidate.parent.mkdir()
+            candidate.touch()
+            candidate.chmod(0o755)
+            shared_cwd = Path("Tests/RunCMake")
+            registrations = {
+                suite: [runcmake_eval.Registration(
+                    suite, "Ninja", shared_cwd / suite / "RunCMakeTest.cmake",
+                    work / "g0", (), shared_cwd, 10,
+                )]
+                for suite in suites if suite not in runcmake_eval.SUITE_GROUPS["all"] or os.name != "posix"
+            }
+            together = Barrier(3, timeout=10)
+            third_candidate = Event()
+            lock = Lock()
+            seen = []
+
+            def run(command, cwd, env, timeout):
+                script = next(str(arg).split("=", 1)[1] for arg in command
+                              if str(arg).startswith(("-DEVAL_TEST_SCRIPT=", "-DRunCMake_SOURCE_DIR=")))
+                script = Path(script)
+                suite = script.parent.name if script.name == "RunCMakeTest.cmake" else script.name
+                is_candidate = f"-DEVAL_TEST_BINARY={candidate.as_posix()}" in command
+                home, temp = Path(env["HOME"]), Path(env["TMPDIR"])
+                for directory in (cwd, home, temp):
+                    self.assertTrue(directory.is_dir())
+                self.assertEqual(home.name, "TestHome")
+                with lock:
+                    seen.append((suite, is_candidate, cwd, home, temp, script))
+                if not is_candidate:
+                    together.wait()
+                elif suite == suites[-1]:
+                    third_candidate.set()
+                elif suite == suites[0]:
+                    self.assertTrue(third_candidate.wait(10))
+                return 0, False, f"-- Probe - PASSED\n{runcmake_eval.COMPLETE}\n"
+
+            report = work / "report.json"
+            argv = ["runcmake_eval.py", "--jobs", "3", "--rcmake-bin", str(candidate), "--json", str(report)]
+            for suite in suites:
+                argv.extend(["--suite", suite])
+            with (patch.object(sys, "argv", argv),
+                  patch.dict(os.environ, RCMAKE_ORACLE_CMAKE=str(driver),
+                             RCMAKE_ORACLE_RUNCMAKE_DIR=str(source)),
+                  patch.object(runcmake_eval.subprocess, "check_output", return_value="cmake version 4.5.1\n"),
+                  patch.object(runcmake_eval, "read_registrations", return_value=registrations),
+                  patch.object(runcmake_eval, "target_tools", return_value={
+                      "ctest": driver.with_name("ctest"), "cpack": driver.with_name("cpack"),
+                  }),
+                  patch.object(runcmake_eval, "run", side_effect=run),
+                  redirect_stdout(io.StringIO()) as stdout):
+                self.assertEqual(runcmake_eval.main(), 0)
+            self.assertEqual(list(json.loads(report.read_text())["suites"]), list(suites))
+            self.assertEqual([line.split()[0] for line in stdout.getvalue().splitlines()[1:4]], list(suites))
+            self.assertEqual(len(seen), 6)
+            for index in (2, 3, 4, 5):
+                self.assertEqual(len({entry[index] for entry in seen}), 6)
 
 
 class RegistrationTests(unittest.TestCase):

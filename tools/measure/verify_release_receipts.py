@@ -32,6 +32,11 @@ from typing import Any, Callable
 import zipfile
 
 if __package__:
+    from .runcmake_eval import strict_case_issue
+else:
+    from runcmake_eval import strict_case_issue
+
+if __package__:
     from . import build_dashboard_json as builder
 else:
     import build_dashboard_json as builder
@@ -560,15 +565,15 @@ def check_runcmake(record: ReceiptRecord, findings: list[Finding]) -> None:
         suites_total = len(suites)
         cases_passed = 0
         cases_total = 0
-        driver_failures: list[str] = []
+        issues: list[str] = []
         for suite_name, row in suites.items():
             if not isinstance(row, dict):
-                driver_failures.append(f"{suite_name}: invalid row")
+                issues.append(f"{suite_name}: invalid row")
                 continue
             passed = row.get("passed")
             total = row.get("total")
             if not is_int(passed) or not is_int(total) or passed < 0 or total < passed:
-                driver_failures.append(f"{suite_name}: invalid passed/total")
+                issues.append(f"{suite_name}: invalid passed/total")
                 continue
             cases_passed += passed
             cases_total += total
@@ -579,17 +584,17 @@ def check_runcmake(record: ReceiptRecord, findings: list[Finding]) -> None:
                     or driver.get("complete") is not True
                     or bool(driver.get("driver_errors"))
                 ):
-                    driver_failures.append(f"{suite_name}:{lane}")
-            if row.get("reference_failed") or row.get("no_reference"):
-                driver_failures.append(f"{suite_name}:reference")
-        if driver_failures:
+                    issues.append(f"{suite_name}:{lane}")
+            if issue := strict_case_issue(suite_name, row):
+                issues.append(f"{suite_name}:{issue}")
+        if issues:
             findings.append(Finding(
                 track=record.track,
                 receipt=record.key,
                 kind="failed",
-                expected="0 incomplete drivers or reference failures",
-                actual=f"{len(driver_failures)} driver/reference issues ({', '.join(driver_failures[:5])})",
-                detail="RunCMake receipt contains incomplete drivers or oracle reference failures.",
+                expected="0 RunCMake driver or case issues",
+                actual=f"{len(issues)} issues ({', '.join(issues[:5])})",
+                detail="RunCMake driver completion or case evidence failed verification.",
             ))
         pass_rate = (100.0 * cases_passed / cases_total) if cases_total > 0 else 0.0
     else:

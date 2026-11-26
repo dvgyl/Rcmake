@@ -24,16 +24,64 @@ pub(in crate::policy_misc) fn set_directory(cx: &mut Cx<'_>, args: &[ExpandedArg
 
 pub(in crate::policy_misc) fn set_sources(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
-    let Some(split) = args.iter().position(|arg| *arg == b"PROPERTIES") else {
+    if args.len() < 2 {
         return Err(CmdError::status(
             "called with incorrect number of arguments",
         ));
-    };
-    let (sources, tail) = args.split_at(split);
-    let pairs = property_pairs(tail.get(1..).unwrap_or_default())?;
-    for scope in source_scopes(cx, sources, false)? {
-        for [name, value] in pairs {
-            update_source(cx, &scope, name, Some((*value).into()), Update::Set)?;
+    }
+    let split = args
+        .iter()
+        .position(|word| {
+            matches!(
+                *word,
+                b"ABSTRACT"
+                    | b"GENERATED"
+                    | b"WRAP_EXCLUDE"
+                    | b"COMPILE_FLAGS"
+                    | b"OBJECT_DEPENDS"
+                    | b"PROPERTIES"
+            )
+        })
+        .unwrap_or(args.len());
+    let (sources, mut tail) = args.split_at(split);
+    let scopes = source_scopes(cx, sources, false)?;
+    let mut pairs = Vec::new();
+    while let Some((&name, rest)) = tail.split_first() {
+        tail = rest;
+        match name {
+            b"ABSTRACT" | b"GENERATED" | b"WRAP_EXCLUDE" => pairs.push([name, b"1"]),
+            b"COMPILE_FLAGS" | b"OBJECT_DEPENDS" => {
+                let Some((&value, rest)) = tail.split_first() else {
+                    let missing = if name == b"COMPILE_FLAGS" {
+                        "COMPILE_FLAGS with no flags"
+                    } else {
+                        "OBJECT_DEPENDS with no dependencies"
+                    };
+                    return Err(CmdError::status(format!(
+                        "called with incorrect number of arguments {missing}"
+                    )));
+                };
+                pairs.push([name, value]);
+                tail = rest;
+            }
+            b"PROPERTIES" => {
+                pairs.extend_from_slice(
+                    property_pairs(tail).map_err(|_| {
+                        CmdError::status("called with incorrect number of arguments.")
+                    })?,
+                );
+                break;
+            }
+            _ => {
+                return Err(CmdError::status(
+                    "called with illegal arguments, maybe missing a PROPERTIES specifier?",
+                ));
+            }
+        }
+    }
+    for scope in scopes {
+        for &[name, value] in &pairs {
+            update_source(cx, &scope, name, Some(value.into()), Update::Set)?;
         }
     }
     Ok(Flow::Normal)
@@ -484,5 +532,58 @@ fn check_cache_bytes(
             "Cache storage would exceed the {limit}-byte limit."
         )));
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn source_properties_apply_legacy_options_before_modern_pairs() -> crate::test_support::TestResult {
+    use std::sync::Arc;
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{PureHost, Stream, path::to_native};
+
+    let cwd = to_native(if cfg!(windows) { b"C:/work" } else { b"/work" });
+    let exe = cwd.join("cmake");
+    let src = cwd.join("src");
+    let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
+    host.seed_file(&src.join("CMakeLists.txt"), br#"
+cmake_minimum_required(VERSION 4.5)
+add_library(target INTERFACE)
+set_source_files_properties(input.cpp TARGET_DIRECTORY target
+  ABSTRACT WRAP_EXCLUDE GENERATED COMPILE_FLAGS -old OBJECT_DEPENDS deps
+  PROPERTIES COMPILE_FLAGS -new)
+foreach(pair IN ITEMS "ABSTRACT;1" "WRAP_EXCLUDE;1" "GENERATED;1" "COMPILE_FLAGS;-new" "OBJECT_DEPENDS;deps")
+  list(GET pair 0 name)
+  list(GET pair 1 expected)
+  get_source_file_property(actual input.cpp "${name}")
+  if(NOT actual STREQUAL expected)
+    message(FATAL_ERROR "Unexpected ${name} value: ${actual}")
+  endif()
+endforeach()
+set_source_files_properties(input.cpp COMPILE_FLAGS)
+"#)?;
+    let mut interp = Interp::new(
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            cwd.join("data"),
+            exe,
+            cwd.clone(),
+        ),
+        crate::register_all,
+    );
+    assert_eq!(
+        interp
+            .run_configure(&src, &cwd.join("build"), &[])
+            .exit_code,
+        1
+    );
+    let diagnostics = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        diagnostics.contains("COMPILE_FLAGS with no flags"),
+        "{diagnostics}"
+    );
+    assert!(!diagnostics.contains("Unexpected"), "{diagnostics}");
     Ok(())
 }

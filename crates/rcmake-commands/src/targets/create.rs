@@ -164,16 +164,19 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], executable: bool) -> CmdResult {
         }
         let sources = list::join(rest.iter().map(bytes).filter(|value| !value.is_empty()));
         if !sources.is_empty() {
-            for item in rest.iter().map(bytes).filter(|value| !value.is_empty()) {
-                if !item.windows(2).any(|w| w == b"$<")
-                    && rcmake_base::path_lex::Lexical::new(item).absolute()
-                {
-                    let normalized = rcmake_base::path_lex::Lexical::new(item).normalize();
-                    cx.project()
-                        .dir_mut(dir)
-                        .source_props
-                        .entry(normalized)
-                        .or_default();
+            for item in list::iter(&sources, list::Empty::Drop) {
+                if !item.windows(2).any(|w| w == b"$<") {
+                    if rcmake_base::path_lex::Lexical::new(&item).absolute() {
+                        let normalized = rcmake_base::path_lex::Lexical::new(&item).normalize();
+                        let directory = cx.project().dir_mut(dir);
+                        directory
+                            .source_props
+                            .entry(normalized.clone())
+                            .or_default();
+                        crate::custom::record_source_order(directory, &normalized, false);
+                    } else {
+                        crate::custom::record_source_order(cx.project().dir_mut(dir), &item, true);
+                    }
                 }
             }
             target

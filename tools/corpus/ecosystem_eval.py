@@ -706,7 +706,7 @@ def scenario_environment(name: str, artifacts: Path) -> dict[str, str]:
     """Use separate package caches for the two engines."""
     env = {"CMAKE_BUILD_PARALLEL_LEVEL": "2"}
     if name.startswith("conan-"):
-        env["CONAN_HOME"] = str(artifacts / "conan")
+        env["CONAN_HOME"] = str(artifacts.resolve() / "conan")
     if name == "vcpkg-manifest":
         cache = artifacts / "binary-cache"
         cache.mkdir(parents=True)

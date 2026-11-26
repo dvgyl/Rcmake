@@ -242,6 +242,24 @@ pub(crate) fn interpreter(
 fn register_cpack_commands(registry: &mut Registry) {
     rcmake_commands::register_all(registry);
 
+    static FILE: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((builtin, flags)) = registry.get(b"file") {
+        FILE.get_or_init(|| builtin);
+        registry.add(
+            "file",
+            |cx, args| {
+                FILE.get().map_or(Ok(Flow::Normal), |builtin| {
+                    if args.first().is_some_and(|arg| arg.value == b"INSTALL") {
+                        crate::stage::with_install_directory_mode(cx, |cx| builtin(cx, args))
+                    } else {
+                        builtin(cx, args)
+                    }
+                })
+            },
+            flags,
+        );
+    }
+
     static EXECUTE_PROCESS: OnceLock<BuiltinFn> = OnceLock::new();
     if let Some((builtin, flags)) = registry.get(b"execute_process") {
         EXECUTE_PROCESS.get_or_init(|| builtin);

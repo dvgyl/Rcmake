@@ -449,6 +449,83 @@ impl Host for BufferedHost<'_> {
     }
 }
 
+const KNOWN_EXTENSIONS: &[&[u8]] = &[
+    b"c", b"C", b"c++", b"cc", b"cpp", b"cxx", b"cu", b"mpp", b"m", b"M", b"mm", b"ixx", b"cppm",
+    b"ccm", b"cxxm", b"c++m", b"h", b"hh", b"h++", b"hm", b"hpp", b"hxx", b"in", b"txx", b"f",
+    b"F", b"for", b"f77", b"f90", b"f95", b"f03", b"hip", b"ispc",
+];
+
+fn ambiguous_source_names(dir: &Directory) -> bool {
+    dir.final_policies.is_none_or(|policies| {
+        policies.get(PolicyId::new(115)) != PolicyStatus::New
+            || policies.get(PolicyId::new(187)) != PolicyStatus::New
+    })
+}
+
+fn known_extension_offset(name: &[u8]) -> Option<usize> {
+    let dot = name.iter().rposition(|&byte| byte == b'.')?;
+    KNOWN_EXTENSIONS
+        .contains(&name.get(dot + 1..)?)
+        .then_some(dot)
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum SourceRecord {
+    Absolute(BString),
+    Relative(BString),
+}
+
+impl SourceRecord {
+    fn path(&self) -> &[u8] {
+        match self {
+            Self::Absolute(path) | Self::Relative(path) => path,
+        }
+    }
+}
+
+enum AmbiguousMatch {
+    None,
+    Found(BString),
+    Missing { identity: BString, display: BString },
+}
+
+fn index_source_record(
+    records: &mut IndexMap<BString, IndexSet<SourceRecord>>,
+    dir: &Directory,
+    record: SourceRecord,
+) {
+    let path = record.path();
+    let name = Lexical::new(path).filename();
+    let stem = match known_extension_offset(name) {
+        Some(dot) => name.get(..dot).unwrap_or(name),
+        None => {
+            let is_generated = match &record {
+                SourceRecord::Absolute(abs) => dir.generated_sources.contains(abs),
+                SourceRecord::Relative(rel) => {
+                    dir.generated_sources
+                        .contains(&absolute_path(&dir.binary_dir, rel))
+                        || dir
+                            .generated_sources
+                            .contains(&absolute_path(&dir.source_dir, rel))
+                }
+            };
+            if !is_generated {
+                return;
+            }
+            name
+        }
+    };
+    records.entry(stem.into()).or_default().insert(record);
+}
+
+fn matches_source_name(path: &[u8], base: &[u8]) -> bool {
+    path == base
+        || path
+            .strip_prefix(base)
+            .and_then(|suffix| suffix.strip_prefix(b"."))
+            .is_some_and(|ext| KNOWN_EXTENSIONS.contains(&ext))
+}
+
 /// Read-only pre-indexed source and target facts shared across parallel workers.
 pub(crate) struct SourceIndex<'a> {
     pub(crate) xcframeworks: crate::xcframework::Plists,
@@ -457,6 +534,7 @@ pub(crate) struct SourceIndex<'a> {
     pub(crate) ninja_cxx_dyndep: OnceLock<Option<bool>>,
     pub(crate) generator_facts: Option<&'a dyn crate::GeneratorFacts>,
     root_source_dir: Option<BString>,
+    source_records: IndexMap<BString, IndexMap<BString, IndexSet<SourceRecord>>>,
     absolute_sources: IndexMap<BString, IndexSet<BString>>,
     pub(super) generated: IndexMap<BString, IndexSet<BString>>,
     pub(crate) output_source_reads: IndexMap<BString, IndexSet<TargetId>>,
@@ -503,6 +581,7 @@ impl<'a> SourcePaths<'a> {
                 ninja_cxx_dyndep: OnceLock::new(),
                 generator_facts: None,
                 root_source_dir: None,
+                source_records: IndexMap::new(),
                 absolute_sources: IndexMap::new(),
                 generated: IndexMap::new(),
                 output_source_reads: IndexMap::new(),
@@ -623,21 +702,74 @@ impl<'a> SourcePaths<'a> {
             return;
         };
         index.root_source_dir = Some(model.dir(DirId::ROOT).source_dir.clone());
-        for (_, target) in model.targets() {
-            let paths = index
-                .absolute_sources
-                .entry(model.dir(target.dir).binary_dir.clone())
+        for (_, dir) in model.dirs().filter(|(_, dir)| ambiguous_source_names(dir)) {
+            let records = index
+                .source_records
+                .entry(dir.binary_dir.clone())
                 .or_default();
-            paths.extend(
-                target
-                    .sources
-                    .iter()
-                    .flat_map(|entry| list::iter(&entry.value, list::Empty::Drop))
-                    .filter(|path| {
-                        Lexical::new(path).absolute() && !path.windows(2).any(|part| part == b"$<")
-                    })
-                    .map(|path| Lexical::new(&path).normalize()),
-            );
+            if let Some(order) = dir.props.get(b"\0rcmake-source-order") {
+                for entry in order.split(|&byte| byte == 0) {
+                    let Some((&tag, path)) = entry.split_first() else {
+                        continue;
+                    };
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let record = match tag {
+                        b'R' => SourceRecord::Relative(path.into()),
+                        b'A' => SourceRecord::Absolute(path.into()),
+                        _ => continue,
+                    };
+                    index_source_record(records, dir, record);
+                }
+            }
+            for (path, props) in &dir.source_props {
+                let record = if let Some(resolved) = props.get(b"\0rcmake-source-location") {
+                    SourceRecord::Absolute(resolved.clone())
+                } else if props.get(b"\0rcmake-source-binary-alternative").is_some() {
+                    if let Some(relative) =
+                        Lexical::new(path).relative(Lexical::new(&dir.source_dir))
+                    {
+                        SourceRecord::Relative(relative)
+                    } else {
+                        SourceRecord::Absolute(path.clone())
+                    }
+                } else {
+                    SourceRecord::Absolute(path.clone())
+                };
+                index_source_record(records, dir, record);
+            }
+        }
+        for (_, target) in model.targets() {
+            let dir = model.dir(target.dir);
+            let absolute = index
+                .absolute_sources
+                .entry(dir.binary_dir.clone())
+                .or_default();
+            let mut records = index.source_records.get_mut(&dir.binary_dir);
+            for path in target
+                .sources
+                .iter()
+                .flat_map(|entry| list::iter(&entry.value, list::Empty::Drop))
+                .filter(|path| !path.windows(2).any(|part| part == b"$<"))
+            {
+                let is_absolute = Lexical::new(&path).absolute();
+                if !is_absolute && records.is_none() {
+                    continue;
+                }
+                let resolved = absolute_path(&dir.source_dir, &path);
+                if let Some(records) = &mut records {
+                    let record = if is_absolute {
+                        SourceRecord::Absolute(resolved.clone())
+                    } else {
+                        SourceRecord::Relative(Lexical::new(&path).normalize())
+                    };
+                    index_source_record(records, dir, record);
+                }
+                if is_absolute {
+                    absolute.insert(resolved);
+                }
+            }
         }
     }
 
@@ -752,41 +884,51 @@ impl<'a> SourcePaths<'a> {
     pub(crate) fn find(&self, dir: &Directory, source: &[u8]) -> Option<BString> {
         let source_path = absolute_path(&dir.source_dir, source);
         let binary_path = absolute_path(&dir.binary_dir, source);
-        if let Some(ambiguous) =
-            self.find_ambiguous_generated(dir, source, &source_path, &binary_path)
-        {
-            return Some(ambiguous);
+        match self.lookup_ambiguous_record(dir, source, &source_path, &binary_path) {
+            AmbiguousMatch::Found(found) => return Some(found),
+            AmbiguousMatch::Missing { .. } => return None,
+            AmbiguousMatch::None => {}
         }
+        self.find_non_ambiguous(dir, source, &source_path, &binary_path)
+    }
+
+    fn find_non_ambiguous(
+        &self,
+        dir: &Directory,
+        source: &[u8],
+        source_path: &BString,
+        binary_path: &BString,
+    ) -> Option<BString> {
         // In CMake's cmMakefile::SourceFileSearchIndex, an explicit full-path
         // source file recorded before a same-named generated output in the build
         // tree wins over the later generated output for relative lookups.
         if !Lexical::new(source).absolute()
             && source_path != binary_path
-            && !self.generated_in(dir, &source_path)
-            && let Some((src_idx, _, src_props)) = dir.source_props.get_full(&source_path)
+            && !self.generated_in(dir, source_path)
+            && let Some((src_idx, _, src_props)) = dir.source_props.get_full(source_path)
             && src_props
                 .get(b"\0rcmake-source-binary-alternative")
                 .is_none()
             && dir
                 .source_props
-                .get_index_of(&binary_path)
+                .get_index_of(binary_path)
                 .is_none_or(|bin_idx| src_idx < bin_idx)
             && self
                 .host
-                .metadata(&to_native(&source_path), Follow::Yes)
+                .metadata(&to_native(source_path), Follow::Yes)
                 .is_ok_and(|metadata| matches!(metadata.kind, FileKind::File | FileKind::Dir))
         {
-            return Some(source_path);
+            return Some(source_path.clone());
         }
-        if self.generated_in(dir, &binary_path)
-            || self.objects.contains_key(&binary_path)
-            || generated_at_binary_alternative(dir, &source_path, &binary_path)
+        if self.generated_in(dir, binary_path)
+            || self.objects.contains_key(binary_path)
+            || generated_at_binary_alternative(dir, source_path, binary_path)
         {
-            return Some(binary_path);
+            return Some(binary_path.clone());
         }
         if let Some(path) = dir
             .source_props
-            .get(&source_path)
+            .get(source_path)
             .and_then(|props| props.get(b"\0rcmake-source-location"))
             && (self.generated_in(dir, path)
                 || self.objects.contains_key(path)
@@ -797,69 +939,128 @@ impl<'a> SourcePaths<'a> {
         {
             return Some(path.clone());
         }
-        if self.generated_in(dir, &source_path) || self.objects.contains_key(&source_path) {
-            return Some(source_path);
+        if self.generated_in(dir, source_path) || self.objects.contains_key(source_path) {
+            return Some(source_path.clone());
         }
-        [source_path, binary_path].into_iter().find(|path| {
-            self.host
-                .metadata(&to_native(path), Follow::Yes)
-                .is_ok_and(|metadata| matches!(metadata.kind, FileKind::File | FileKind::Dir))
-        })
+        [source_path, binary_path]
+            .into_iter()
+            .find(|path| {
+                self.host
+                    .metadata(&to_native(path), Follow::Yes)
+                    .is_ok_and(|metadata| matches!(metadata.kind, FileKind::File | FileKind::Dir))
+            })
+            .cloned()
     }
 
-    /// Under CMP0187 OLD or CMP0115 OLD, an extensionless source name can match an
-    /// earlier-created generated file with a known extension (for example `z.h`
-    /// created before `OUTPUT z`) in `cmMakefile::GetSource` search order.
-    fn find_ambiguous_generated(
+    /// Look up the first registered source matching an extensionless spelling.
+    ///
+    /// Mirrors CMake's `cmMakefile::GetSource`: searches registered `cmSourceFile`
+    /// records in directory creation order and binds to the first match, even if
+    /// that record does not exist on disk.
+    fn lookup_ambiguous_record(
         &self,
         dir: &Directory,
         source: &[u8],
         source_path: &BString,
         binary_path: &BString,
-    ) -> Option<BString> {
-        const KNOWN_EXTENSIONS: &[&[u8]] = &[
-            b"c", b"C", b"c++", b"cc", b"cpp", b"cxx", b"cu", b"mpp", b"m", b"M", b"mm", b"ixx",
-            b"cppm", b"ccm", b"cxxm", b"c++m", b"h", b"hh", b"h++", b"hm", b"hpp", b"hxx", b"in",
-            b"txx", b"f", b"F", b"for", b"f77", b"f90", b"f95", b"f03", b"hip", b"ispc",
-        ];
-        let no_ambiguous = dir.final_policies.is_some_and(|policies| {
-            policies.get(PolicyId::new(115)) == PolicyStatus::New
-                && policies.get(PolicyId::new(187)) == PolicyStatus::New
-        });
-        if no_ambiguous {
-            return None;
-        }
+    ) -> AmbiguousMatch {
         let file_name = Lexical::new(source).filename();
-        if let Some(dot) = file_name.iter().rposition(|&b| b == b'.')
-            && let Some(ext) = file_name.get(dot + 1..)
-            && KNOWN_EXTENSIONS.contains(&ext)
-        {
-            return None;
+        if !ambiguous_source_names(dir) || known_extension_offset(file_name).is_some() {
+            return AmbiguousMatch::None;
         }
+        // A relative extensionless name is exact if it exists in the source tree.
         if self
             .host
             .metadata(&to_native(source_path), Follow::Yes)
             .is_ok_and(|metadata| metadata.kind == FileKind::File)
         {
-            return None;
+            return AmbiguousMatch::None;
         }
-        for candidate in self.generated.keys() {
-            if !self.generated_in(dir, candidate) {
-                continue;
-            }
-            if candidate == binary_path || candidate == source_path {
-                return Some(candidate.clone());
-            }
-            for base in [binary_path, source_path] {
-                if let Some(rest) = candidate.strip_prefix(base.as_slice())
-                    && let Some(ext) = rest.strip_prefix(b".")
-                    && KNOWN_EXTENSIONS.contains(&ext)
-                {
-                    return Some(candidate.clone());
+        let is_abs_lookup = Lexical::new(source).absolute();
+        let matches = |candidate: &[u8]| {
+            matches_source_name(candidate, source_path)
+                || matches_source_name(candidate, binary_path)
+        };
+        let exists = |path: &[u8]| {
+            self.host
+                .metadata(&to_native(path), Follow::Yes)
+                .is_ok_and(|metadata| metadata.kind == FileKind::File)
+        };
+        let first = self
+            .source_records
+            .get(&dir.binary_dir)
+            .and_then(|records| records.get(file_name))
+            .into_iter()
+            .flatten()
+            .find(|record| match record {
+                SourceRecord::Absolute(abs) => matches(abs),
+                SourceRecord::Relative(rel) => {
+                    matches(&absolute_path(&dir.source_dir, rel))
+                        || matches(&absolute_path(&dir.binary_dir, rel))
                 }
-            }
+            });
+        if let Some(record) = first {
+            return match record {
+                SourceRecord::Absolute(abs) => {
+                    if self.generated_in(dir, abs) || self.objects.contains_key(abs) || exists(abs)
+                    {
+                        AmbiguousMatch::Found(abs.clone())
+                    } else {
+                        AmbiguousMatch::Missing {
+                            identity: abs.clone(),
+                            display: abs.clone(),
+                        }
+                    }
+                }
+                SourceRecord::Relative(rel) => {
+                    let rec_src = absolute_path(&dir.source_dir, rel);
+                    let rec_bin = absolute_path(&dir.binary_dir, rel);
+                    if is_abs_lookup {
+                        let target = if matches_source_name(&rec_src, source_path) {
+                            rec_src
+                        } else {
+                            rec_bin
+                        };
+                        if self.generated_in(dir, &target)
+                            || self.objects.contains_key(&target)
+                            || exists(&target)
+                        {
+                            AmbiguousMatch::Found(target)
+                        } else {
+                            AmbiguousMatch::Missing {
+                                identity: target.clone(),
+                                display: target,
+                            }
+                        }
+                    } else if self.generated_in(dir, &rec_bin)
+                        || self.objects.contains_key(&rec_bin)
+                        || generated_at_binary_alternative(dir, &rec_src, &rec_bin)
+                    {
+                        AmbiguousMatch::Found(rec_bin)
+                    } else if self.generated_in(dir, &rec_src)
+                        || self.objects.contains_key(&rec_src)
+                        || exists(&rec_src)
+                    {
+                        AmbiguousMatch::Found(rec_src)
+                    } else if exists(&rec_bin) {
+                        AmbiguousMatch::Found(rec_bin)
+                    } else {
+                        AmbiguousMatch::Missing {
+                            identity: rec_src,
+                            display: rel.clone(),
+                        }
+                    }
+                }
+            };
         }
-        None
+        if let Some(found) = self
+            .generated
+            .keys()
+            .find(|path| matches(path) && self.generated_in(dir, path))
+        {
+            return AmbiguousMatch::Found(found.clone());
+        }
+        AmbiguousMatch::None
     }
 
     fn missing_identity(&self, dir: &Directory, source: &[u8]) -> (BString, BString) {
@@ -908,64 +1109,85 @@ impl<'a> SourcePaths<'a> {
         dir: &Directory,
         source: &BT<BString>,
     ) -> Result<Option<BString>, ResolveError> {
-        if let Some(found) = self.find(dir, &source.value) {
-            return Ok(Some(found));
-        }
+        let source_path = absolute_path(&dir.source_dir, &source.value);
+        let binary_path = absolute_path(&dir.binary_dir, &source.value);
+        let ambiguous_missing =
+            match self.lookup_ambiguous_record(dir, &source.value, &source_path, &binary_path) {
+                AmbiguousMatch::Found(found) => return Ok(Some(found)),
+                AmbiguousMatch::Missing { identity, display } => Some((identity, display)),
+                AmbiguousMatch::None => {
+                    if let Some(found) =
+                        self.find_non_ambiguous(dir, &source.value, &source_path, &binary_path)
+                    {
+                        return Ok(Some(found));
+                    }
+                    None
+                }
+            };
         const EXTENSIONS: &str = "c C c++ cc cpp cxx cu mpp m M mm ixx cppm ccm cxxm c++m h hh h++ hm hpp hxx in txx f F for f77 f90 f95 f03 hip ispc";
         let policy = PolicyId::new(115);
         let status = dir
             .final_policies
             .map_or(PolicyStatus::New, |policies| policies.get(policy));
-        let (identity, display_path) = self.missing_identity(dir, &source.value);
+        let (identity, display_path) = ambiguous_missing
+            .clone()
+            .unwrap_or_else(|| self.missing_identity(dir, &source.value));
         let mut body: BString = [b"Cannot find source file:\n  ", display_path.as_slice()]
             .concat()
             .into();
         if status != PolicyStatus::New {
             let extensions = EXTENSIONS.split_ascii_whitespace();
-            for base in [&dir.source_dir, &dir.binary_dir] {
-                let path = absolute_path(base, &source.value);
-                for extension in extensions.clone() {
-                    let candidate: BString = [path.as_slice(), b".", extension.as_bytes()]
-                        .concat()
-                        .into();
-                    if self.generated_in(dir, &candidate)
-                        || self
-                            .host
-                            .metadata(&to_native(&candidate), Follow::Yes)
-                            .is_ok_and(|metadata| metadata.kind == FileKind::File)
-                    {
-                        let warning_key = (dir.binary_dir.clone(), identity);
-                        if status == PolicyStatus::Warn
-                            && self
-                                .extension_warnings
-                                .borrow_mut()
-                                .insert(warning_key.clone())
+            if ambiguous_missing.is_none() {
+                for base in [&dir.source_dir, &dir.binary_dir] {
+                    let path = absolute_path(base, &source.value);
+                    for extension in extensions.clone() {
+                        let candidate: BString = [path.as_slice(), b".", extension.as_bytes()]
+                            .concat()
+                            .into();
+                        if self.generated_in(dir, &candidate)
+                            || self
+                                .host
+                                .metadata(&to_native(&candidate), Follow::Yes)
+                                .is_ok_and(|metadata| metadata.kind == FileKind::File)
                         {
-                            let warning = Diagnostic { annotations: None,
-                                kind: MessageKind::AuthorWarning,
-                                effect: Effect::None,
-                                category: Some(DiagCategory::Policy),
-                                policy: Some(policy),
-                                location: generation_source_location(Location::Backtrace(source.backtrace.clone())),
-                                body: format!("Policy CMP0115 is not set: Source file extensions must be explicit.  Run \"cmake --help-policy CMP0115\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\nFile:\n  {candidate}").into(),
-                            };
-                            let rendered = render(
-                                &warning,
-                                &RenderOptions {
-                                    relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
-                                    ..RenderOptions::default()
-                                },
-                            );
-                            if let Some(events) = self.buffered_events {
-                                events.push(DiagEvent::ExtensionWarning {
-                                    key: warning_key,
-                                    bytes: rendered,
-                                });
-                            } else {
-                                self.host.write_out(Stream::Stderr, &rendered);
+                            let warning_key = (dir.binary_dir.clone(), identity);
+                            if status == PolicyStatus::Warn
+                                && self
+                                    .extension_warnings
+                                    .borrow_mut()
+                                    .insert(warning_key.clone())
+                            {
+                                let warning = Diagnostic {
+                                    annotations: None,
+                                    kind: MessageKind::AuthorWarning,
+                                    effect: Effect::None,
+                                    category: Some(DiagCategory::Policy),
+                                    policy: Some(policy),
+                                    location: generation_source_location(Location::Backtrace(
+                                        source.backtrace.clone(),
+                                    )),
+                                    body: format!("Policy CMP0115 is not set: Source file extensions must be explicit.  Run \"cmake --help-policy CMP0115\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\nFile:\n  {candidate}").into(),
+                                };
+                                let rendered = render(
+                                    &warning,
+                                    &RenderOptions {
+                                        relative_base: Some(
+                                            model.dir(DirId::ROOT).source_dir.clone(),
+                                        ),
+                                        ..RenderOptions::default()
+                                    },
+                                );
+                                if let Some(events) = self.buffered_events {
+                                    events.push(DiagEvent::ExtensionWarning {
+                                        key: warning_key,
+                                        bytes: rendered,
+                                    });
+                                } else {
+                                    self.host.write_out(Stream::Stderr, &rendered);
+                                }
                             }
+                            return Ok(Some(candidate));
                         }
-                        return Ok(Some(candidate));
                     }
                 }
             }
@@ -1407,4 +1629,186 @@ pub(crate) fn generation_source_location(location: Location) -> Location {
         }
         other => other,
     }
+}
+
+#[cfg(test)]
+#[test]
+fn source_record_matches_stem_only_under_compatible_policies()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::TargetOrigin;
+
+    let host = rcmake_host::PureHost::new(to_native(b"/src"), to_native(b"/bin/cmake"));
+    for path in [
+        b"/build/ordered.cxx".as_slice(),
+        b"/src/ordered.cxx",
+        b"/src/registered.cxx",
+        b"/src/unregistered.cxx",
+        b"/src/exact",
+        b"/src/exact.cxx",
+    ] {
+        host.seed_file(&to_native(path), b"")?;
+    }
+    let mut model = ProjectModel::default();
+    let dir = model.dir_mut(DirId::ROOT);
+    dir.source_dir = "/src".into();
+    dir.binary_dir = "/build".into();
+    let mut policies = rcmake_diag::PolicyMap::default();
+    policies.set(PolicyId::new(115), PolicyStatus::New)?;
+    dir.source_props
+        .entry("/build/ordered.cxx".into())
+        .or_default();
+    dir.source_props
+        .entry("/src/ordered.cxx".into())
+        .or_default();
+    dir.final_policies = Some(policies);
+    let mut target = Target::new(
+        "target".into(),
+        TargetKind::ObjectLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    target.sources.push(BT::new(
+        "registered.cxx;registered;exact.cxx".into(),
+        Default::default(),
+    ));
+    model.add_target(target)?;
+    let mut paths = SourcePaths::new(&host);
+    paths.index_source_records(&model);
+    let dir = model.dir(DirId::ROOT);
+    assert_eq!(
+        paths.find(dir, b"registered"),
+        paths.find(dir, b"registered.cxx")
+    );
+    assert_eq!(
+        paths.find(dir, b"ordered"),
+        Some("/build/ordered.cxx".into())
+    );
+    assert_eq!(paths.find(dir, b"unregistered"), None);
+    assert_eq!(paths.find(dir, b"exact"), Some("/src/exact".into()));
+    let mut strict = dir.clone();
+    policies.set(PolicyId::new(187), PolicyStatus::New)?;
+    strict.final_policies = Some(policies);
+    assert_eq!(paths.find(&strict, b"registered"), None);
+    assert_eq!(
+        paths.find(&strict, b"registered.cxx"),
+        Some("/src/registered.cxx".into())
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn extensionless_lookup_uses_directory_registration_order_and_binds_missing_first_record()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::TargetOrigin;
+
+    let host = rcmake_host::PureHost::new(to_native(b"/src"), to_native(b"/bin/cmake"));
+    for path in [
+        b"/src/foo.cxx".as_slice(),
+        b"/src/foo.c",
+        b"/src/missing.cxx",
+        b"/build/gen.cxx",
+        b"/src/gen.c",
+    ] {
+        host.seed_file(&to_native(path), b"")?;
+    }
+
+    let mut model = ProjectModel::default();
+    let dir = model.dir_mut(DirId::ROOT);
+    dir.source_dir = "/src".into();
+    dir.binary_dir = "/build".into();
+    let mut policies = rcmake_diag::PolicyMap::default();
+    policies.set(PolicyId::new(115), PolicyStatus::New)?;
+    dir.final_policies = Some(policies);
+
+    // Registration order mirrors:
+    //   add_executable(a foo.cxx)
+    //   set_source_files_properties(foo.c PROPERTIES ...)
+    //   set_source_files_properties(missing.c PROPERTIES ...)
+    //   add_executable(b missing.cxx)
+    //   add_executable(c gen.cxx)
+    //   set_source_files_properties(gen.c PROPERTIES ...)
+    dir.props.set(
+        b"\0rcmake-source-order".as_slice().into(),
+        b"Rfoo.cxx\0Rfoo.c\0Rmissing.c\0Rmissing.cxx\0Rgen.cxx\0Rgen.c\0"
+            .as_slice()
+            .into(),
+    );
+    dir.source_props
+        .entry("/src/foo.c".into())
+        .or_default()
+        .set(
+            b"\0rcmake-source-binary-alternative".as_slice().into(),
+            "/build/foo.c".into(),
+        );
+    dir.source_props
+        .entry("/src/missing.c".into())
+        .or_default()
+        .set(
+            b"\0rcmake-source-binary-alternative".as_slice().into(),
+            "/build/missing.c".into(),
+        );
+    dir.source_props
+        .entry("/src/gen.c".into())
+        .or_default()
+        .set(
+            b"\0rcmake-source-binary-alternative".as_slice().into(),
+            "/build/gen.c".into(),
+        );
+
+    let mut target = Target::new(
+        "target".into(),
+        TargetKind::ObjectLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    target.sources.push(BT::new(
+        "foo.cxx;missing.cxx;gen.cxx".into(),
+        Default::default(),
+    ));
+    model.add_target(target)?;
+
+    let mut paths = SourcePaths::new(&host);
+    paths.set_collect_source_errors(false);
+    paths.index_source_records(&model);
+    let dir = model.dir(DirId::ROOT);
+
+    // 1. Target source registered before source_props wins over later source_props.
+    assert_eq!(paths.find(dir, b"foo"), Some("/src/foo.cxx".into()));
+
+    // 2. Relative target source existing only in binary dir wins over later source_props.
+    assert_eq!(paths.find(dir, b"gen"), Some("/build/gen.cxx".into()));
+
+    // 3. First matching registered record (`missing.c`) is NOT skipped even when absent on disk,
+    //    and resolve_at reports `missing.c` rather than falling through to `missing.cxx`.
+    assert_eq!(paths.find(dir, b"missing"), None);
+    let err = paths
+        .resolve_at(&model, dir, &BT::new("missing".into(), Default::default()))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("missing.c"),
+        "expected missing.c diagnostic, got: {err}"
+    );
+
+    // Even under CMP0115 OLD, the bound missing record is reported instead of resolving missing.cxx.
+    let mut old_dir = dir.clone();
+    let mut old_policies = rcmake_diag::PolicyMap::default();
+    old_policies.set(PolicyId::new(115), PolicyStatus::Old)?;
+    old_dir.final_policies = Some(old_policies);
+    let err = paths
+        .resolve_at(
+            &model,
+            &old_dir,
+            &BT::new("missing".into(), Default::default()),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("missing.c"),
+        "expected missing.c diagnostic under CMP0115 OLD, got: {err}"
+    );
+    Ok(())
 }

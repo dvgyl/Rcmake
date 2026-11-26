@@ -970,7 +970,34 @@ def run_all_checks(rcmake: Path, lsp: Path | None) -> dict[str, Any]:
             cwd=root,
             env=warn_env,
         )
-        checks.append(eval_hermetic(strict_cap, warn_cap, forbidden_file_hint=forbidden_file))
+        hermetic = eval_hermetic(strict_cap, warn_cap, forbidden_file_hint=forbidden_file)
+        tool = shutil.which("ninja" if generator == "Ninja" else "make", path=env.get("PATH"))
+        if tool:
+            tool_dir = root / "explicit build tool"
+            tool_dir.mkdir()
+            explicit_tool = tool_dir / Path(tool).name
+            shutil.copy2(tool, explicit_tool)
+            explicit_cap = _run_cmd(
+                [
+                    rcmake, "-S", herm_clean_src, "-B", root / "herm_explicit_build",
+                    "-G", generator, "--hermetic=strict",
+                    f"-DCMAKE_MAKE_PROGRAM:FILEPATH={explicit_tool}",
+                ],
+                cwd=root,
+                env=env,
+            )
+            explicit_ok = (
+                not explicit_cap.timed_out
+                and explicit_cap.returncode == 0
+                and "RCMAKE_HERMETIC_" not in explicit_cap.combined
+            )
+            detail = (
+                "Strict configure used the explicit build tool."
+                if explicit_ok
+                else f"Exit {explicit_cap.returncode}. {explicit_cap.stderr.strip()[:240]}"
+            )
+            hermetic.subchecks.append(SubCheck("1e-strict-explicit-make-program", explicit_ok, detail))
+        checks.append(hermetic)
 
         # --- Check 2: ctest --help ---
         alias_dir = root / "aliases"

@@ -13,15 +13,7 @@ use rcmake_syntax::{ArgKind, Argument};
 use super::DEFERRED_APPEND;
 use crate::util::model_error;
 
-pub(super) fn run(
-    cx: &mut Cx<'_>,
-    body: CustomCommand,
-    count: usize,
-    args: Option<&[ExpandedArg]>,
-) -> CmdResult {
-    let Some(output) = body.outputs.first() else {
-        return Err(CmdError::status("APPEND requires an OUTPUT."));
-    };
+pub(super) fn active_configs(cx: &mut Cx<'_>) -> Vec<ConfigId> {
     let generator = cx.project().generator;
     let mut configs = if let Some(generator) = generator.filter(|kind| kind.multi_config()) {
         cx.var(b"CMAKE_CONFIGURATION_TYPES").map_or_else(
@@ -45,6 +37,19 @@ pub(super) fn run(
     if configs.is_empty() {
         configs.push(ConfigId::default());
     }
+    configs
+}
+
+pub(super) fn run(
+    cx: &mut Cx<'_>,
+    body: CustomCommand,
+    count: usize,
+    args: Option<&[ExpandedArg]>,
+) -> CmdResult {
+    let Some(output) = body.outputs.first() else {
+        return Err(CmdError::status("APPEND requires an OUTPUT."));
+    };
+    let configs = active_configs(cx);
     let matched = find_append_command(cx.project(), body.dir, output, count, &configs);
     if let Ok(Some(id)) = matched {
         let existing = cx

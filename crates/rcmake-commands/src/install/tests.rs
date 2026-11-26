@@ -827,37 +827,57 @@ install(TARGETS core ARCHIVE DESTINATION ./lib INCLUDES DESTINATION ./include)
 }
 
 #[test]
-fn headers_without_a_destination_warn_when_artifact_groups_are_named() -> TestResult {
+fn headers_default_only_when_no_applicable_artifact_destination_is_set() -> TestResult {
     let (host, mut interp) = configure(
         r#"
-set_property(TARGET core PROPERTY PUBLIC_HEADER core.h)
-set_property(TARGET api PROPERTY PUBLIC_HEADER api.h)
-install(TARGETS core LIBRARY DESTINATION lib)
-install(TARGETS api)
+add_library(static_lib STATIC a.c)
+add_library(shared_lib SHARED a.c)
+set_property(TARGET static_lib shared_lib PROPERTY PUBLIC_HEADER public.h)
+set_property(TARGET static_lib shared_lib PROPERTY PRIVATE_HEADER private.h)
+install(TARGETS static_lib shared_lib LIBRARY DESTINATION lib PUBLIC_HEADER PRIVATE_HEADER)
+install(TARGETS static_lib PUBLIC_HEADER DESTINATION api PRIVATE_HEADER DESTINATION details)
 "#,
         0,
     )?;
     let stderr = host.stream_bytes(Stream::Stderr).to_string();
-    assert_eq!(
-        stderr
-            .matches("has PUBLIC_HEADER files but no PUBLIC_HEADER DESTINATION")
-            .count(),
-        1,
-        "{stderr}"
-    );
-    assert!(stderr.contains("Target core"), "{stderr}");
+    let diagnostic = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    for header in ["PUBLIC_HEADER", "PRIVATE_HEADER"] {
+        assert_eq!(
+            diagnostic
+                .matches(&format!("has {header} files but no {header} DESTINATION"))
+                .count(),
+            1,
+            "{stderr}"
+        );
+    }
+    assert!(stderr.contains("Target shared_lib"), "{stderr}");
     let mut cx = interp.cx();
     let model = cx.project();
-    let snapshot = |rule: usize, name: &str| {
+    let snapshot = |rule: usize, name: &str, header: &str| {
         let id = model.find_target(rcmake_model::DirId::ROOT, name.as_bytes())?;
         model
             .global
             .props
-            .get(format!("_RCMAKE_INSTALL_{rule}_PUBLIC_HEADER_{}", id.index()).as_bytes())
+            .get(format!("_RCMAKE_INSTALL_{rule}_{header}_{}", id.index()).as_bytes())
             .cloned()
     };
-    assert_eq!(snapshot(0, "core"), Some(BString::default()));
-    assert_eq!(snapshot(1, "api"), Some(BString::from("api.h")));
+    for (header, file) in [
+        ("PUBLIC_HEADER", "public.h"),
+        ("PRIVATE_HEADER", "private.h"),
+    ] {
+        assert_eq!(snapshot(0, "shared_lib", header), Some(BString::default()));
+        assert_eq!(snapshot(0, "static_lib", header), Some(file.into()));
+        assert_eq!(snapshot(1, "static_lib", header), Some(file.into()));
+    }
+    let manifest = rcmake_resolve::lower::lower_install_manifest(model, &[]);
+    assert_eq!(
+        manifest
+            .actions
+            .iter()
+            .filter(|action| action.destination == b"include")
+            .count(),
+        2,
+    );
     Ok(())
 }
 
@@ -1066,6 +1086,28 @@ install(TARGETS core EXPORT Standard)
             .targets
             .len(),
         1
+    );
+    Ok(())
+}
+
+#[test]
+fn install_targets_accepts_empty_include_groups() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+install(TARGETS core EXPORT first INCLUDES)
+install(TARGETS api EXPORT second INCLUDES ARCHIVE DESTINATION lib)
+install(TARGETS core EXPORT third INCLUDES DESTINATION include extra)
+"#,
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let model = cx.project();
+    assert_eq!(model.installs.len(), 3);
+    assert!(model.installs[0].options.includes_destination.is_empty());
+    assert!(model.installs[1].options.includes_destination.is_empty());
+    assert_eq!(
+        model.installs[2].options.includes_destination,
+        [BString::from("include"), BString::from("extra")]
     );
     Ok(())
 }

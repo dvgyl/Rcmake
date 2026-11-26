@@ -137,9 +137,20 @@ def paths_by_separator(paths: list[str], scope: ChainMap[str, str]) -> dict[str,
     return result
 
 
-def read_edges(build: Path, manifest: str = "build.ninja") -> list[Edge]:
-    """Read edges in build.ninja and its include and subninja files."""
+@dataclass
+class Manifest:
+    """Store parsed Ninja edges, pool definitions, and default targets."""
+
+    edges: list[Edge]
+    pools: dict[str, dict[str, str]]
+    defaults: list[str]
+
+
+def read_manifest(build: Path, manifest: str = "build.ninja") -> Manifest:
+    """Read edges, pool definitions, and default targets from build.ninja and its includes."""
     edges: list[Edge] = []
+    pools: dict[str, dict[str, str]] = {}
+    defaults: list[str] = []
 
     def read(path: Path, scope: ChainMap[str, str],
              rules: ChainMap[str, dict[str, str]], active: tuple[Path, ...]) -> None:
@@ -156,6 +167,19 @@ def read_edges(build: Path, manifest: str = "build.ninja") -> list[Edge]:
                      rules.new_child() if subninja else rules, (*active, path))
             elif keyword == "rule":
                 rules[argument] = bindings
+            elif keyword == "pool":
+                pool_name = argument.strip()
+                if not pool_name:
+                    raise ValueError(f"Invalid Ninja pool in {path}: {statement}")
+                pools[pool_name] = {
+                    key: expand(value, lambda name: scope.get(name, ""))
+                    for key, value in bindings.items()
+                }
+            elif keyword == "default":
+                parts = tokens(argument)
+                if not parts or any(part in SEPARATORS or part == ":" for part in parts):
+                    raise ValueError(f"Invalid Ninja default in {path}: {statement}")
+                defaults.extend(paths_by_separator(parts, scope)[""])
             elif keyword == "build":
                 parts = tokens(argument)
                 try:
@@ -173,11 +197,16 @@ def read_edges(build: Path, manifest: str = "build.ninja") -> list[Edge]:
                 ))
             elif match := ASSIGNMENT.fullmatch(statement):
                 scope[match[1]] = expand(match[2], lambda key: scope.get(key, ""))
-            elif keyword not in {"pool", "default"}:
+            else:
                 raise ValueError(f"Unknown Ninja statement in {path}: {statement}")
 
     read(build / manifest, ChainMap(), ChainMap({"phony": {}}), ())
-    return edges
+    return Manifest(edges=edges, pools=pools, defaults=defaults)
+
+
+def read_edges(build: Path, manifest: str = "build.ninja") -> list[Edge]:
+    """Read edges in build.ninja and its include and subninja files."""
+    return read_manifest(build, manifest).edges
 
 
 @dataclass
@@ -215,11 +244,17 @@ def row_key(row: dict | str) -> str:
     return json.dumps(row, sort_keys=True)
 
 
-def canonicalize(normalize: Normalizer, manifest: str = "build.ninja") -> list[dict]:
+def canonicalize(
+    normalize: Normalizer,
+    manifest: str = "build.ninja",
+    *,
+    include_build_controls: bool = False,
+) -> list[dict]:
     """Expand rule variables and return one canonical record per build edge."""
+    parsed = read_manifest(normalize.build, manifest)
     rows = []
-    for edge in read_edges(normalize.build, manifest):
-        rows.append({
+    for edge in parsed.edges:
+        row = {
             "outputs": sorted(map(normalize.path, edge.outputs)),
             "implicit_outputs": sorted(map(normalize.path, edge.implicit_outputs)),
             "inputs": list(map(normalize.path, edge.inputs)),
@@ -230,8 +265,39 @@ def canonicalize(normalize: Normalizer, manifest: str = "build.ninja") -> list[d
             "command": normalize.text(edge.evaluate("command")),
             "rspfile": normalize.path(edge.evaluate("rspfile", shell_escape=False)),
             "rspfile_content": normalize.text(edge.evaluate("rspfile_content")),
-        })
-    return sorted(rows, key=lambda row: (row["outputs"], row["implicit_outputs"], row_key(row)))
+        }
+        if include_build_controls:
+            row["depfile"] = normalize.path(edge.evaluate("depfile", shell_escape=False))
+            row["deps"] = normalize.text(edge.evaluate("deps", shell_escape=False))
+            row["restat"] = normalize.text(edge.evaluate("restat", shell_escape=False))
+            row["pool"] = normalize.text(edge.evaluate("pool", shell_escape=False))
+        rows.append(row)
+    rows.sort(key=lambda row: (row["outputs"], row["implicit_outputs"], row_key(row)))
+    if include_build_controls:
+        pool_rows = [
+            {
+                "kind": "pool",
+                "name": normalize.text(name),
+                "bindings": {
+                    key: normalize.text(value)
+                    for key, value in sorted(bindings.items())
+                },
+            }
+            for name, bindings in parsed.pools.items()
+        ]
+        pool_rows.sort(key=lambda row: (row["name"], row_key(row)))
+        rows.extend(pool_rows)
+        if parsed.defaults:
+            rows.append({
+                "kind": "defaults",
+                "targets": sorted(dict.fromkeys(map(normalize.path, parsed.defaults))),
+            })
+    return rows
+
+
+def canonicalize_strict(normalize: Normalizer, manifest: str = "build.ninja") -> list[dict]:
+    """Return canonical edge records with build controls plus sorted pool and default records."""
+    return canonicalize(normalize, manifest, include_build_controls=True)
 
 
 def artifact_graph(rows: list[dict], normalize: Normalizer, artifacts: list[str]) -> list[dict]:

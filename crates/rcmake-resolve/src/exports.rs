@@ -988,32 +988,25 @@ fn add_export_property(
     value: &[u8],
     mode: PreprocessMode,
 ) -> Result<(), ResolveError> {
-    let mut items = export_property_items(value, mode)?;
+    let path_property = matches!(
+        key.as_slice(),
+        b"INTERFACE_INCLUDE_DIRECTORIES"
+            | b"INTERFACE_SYSTEM_INCLUDE_DIRECTORIES"
+            | b"INTERFACE_SOURCES"
+            | b"INTERFACE_LINK_DIRECTORIES"
+            | b"INTERFACE_LINK_DEPENDS"
+    );
+    let parsed = rcmake_genex::parse(value)?;
+    let ast = if mode == PreprocessMode::Install && path_property {
+        parsed.strip_install_paths(b"${_IMPORT_PREFIX}/")
+    } else {
+        rcmake_genex::strip(&parsed, mode)
+    };
+    let mut items = split_export_items(&ast);
     if mode == PreprocessMode::Install {
-        let path_property = matches!(
-            key.as_slice(),
-            b"INTERFACE_INCLUDE_DIRECTORIES"
-                | b"INTERFACE_SYSTEM_INCLUDE_DIRECTORIES"
-                | b"INTERFACE_SOURCES"
-        );
-        let wrapped = rcmake_genex::parse(value)?;
-        let mut install_paths = Vec::new();
-        for node in &wrapped.nodes {
-            let raw = render(std::slice::from_ref(node));
-            if raw.starts_with(b"$<INSTALL_INTERFACE:") {
-                install_paths.extend(export_property_items(&raw, mode)?);
-            }
-        }
         // CMake checks every entry and reports each bad path before it fails.
         let mut errors = BString::default();
         for item in &mut items {
-            if path_property
-                && install_paths.contains(item)
-                && !Lexical::new(item).absolute()
-                && !item.starts_with(b"$")
-            {
-                *item = [b"${_IMPORT_PREFIX}/", item.as_slice()].concat().into();
-            }
             *item = rcmake_genex::rewrite_install_prefix(item, b"${_IMPORT_PREFIX}");
             if path_property {
                 match interface_paths::validate(model, raw, &key, item) {
@@ -1038,7 +1031,10 @@ pub(crate) fn export_property_items(
     mode: PreprocessMode,
 ) -> Result<Vec<BString>, ResolveError> {
     let parsed = rcmake_genex::parse(value)?;
-    let ast = rcmake_genex::strip(&parsed, mode);
+    Ok(split_export_items(&rcmake_genex::strip(&parsed, mode)))
+}
+
+fn split_export_items(ast: &rcmake_genex::GenexAst) -> Vec<BString> {
     let mut items = Vec::new();
     let mut item = BString::default();
     for node in &ast.nodes {
@@ -1062,8 +1058,181 @@ pub(crate) fn export_property_items(
     if !item.is_empty() {
         items.push(item);
     }
-    Ok(items)
+    items
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn install_exports_prefix_paths_and_qualify_interface_target_references()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::TargetOrigin;
+
+    let mut model = ProjectModel::default();
+    let dir = DirId::ROOT;
+    let mut raw = Target::new(
+        "producer".into(),
+        TargetKind::InterfaceLibrary,
+        TargetOrigin::Normal,
+        dir,
+        Default::default(),
+        Default::default(),
+    );
+    raw.props.set("EXPORT_NAME".into(), "api".into());
+    model.dir_mut(dir).source_dir = "/src".into();
+    model.dir_mut(dir).binary_dir = "/build".into();
+    let id = model.add_target(raw)?;
+    model.add_alias(dir, "alias".into(), id)?;
+    let raw = model.target(id).ok_or("missing test target")?;
+
+    for mode in [PreprocessMode::Install, PreprocessMode::Build] {
+        let mut exported = ExportedTarget::default();
+        for key in ["INTERFACE_INCLUDE_DIRECTORIES", "INTERFACE_SOURCES"] {
+            add_export_property(
+                &model,
+                raw,
+                &mut exported,
+                key.into(),
+                b"$<BUILD_INTERFACE:/src>$<INSTALL_INTERFACE:include>/api.hpp",
+                mode,
+            )?;
+            let expected = if mode == PreprocessMode::Install {
+                b"${_IMPORT_PREFIX}/include/api.hpp".as_slice()
+            } else {
+                b"/src/api.hpp"
+            };
+            assert_eq!(
+                exported
+                    .properties
+                    .get(key.as_bytes())
+                    .map(|value| value.as_slice()),
+                Some(expected)
+            );
+        }
+        let key = b"INTERFACE_COMPILE_DEFINITIONS";
+        add_export_property(
+            &model, raw, &mut exported, key.as_slice().into(),
+            b"alias;$<$<BOOL:$<TARGET_PROPERTY:alias,TYPE>>:FOUND>;$<TARGET_PROPERTY:TYPE>;$<TARGET_PROPERTY:outside,TYPE>",
+            mode,
+        )?;
+        export_links::qualify(
+            &model,
+            id,
+            &[id],
+            export_links::ExportScope {
+                set: b"api",
+                namespace: b"test::",
+                mode,
+            },
+            &export_links::ExportCatalog::new(),
+            &mut exported,
+        )?;
+        assert_eq!(
+            exported.properties.get(key.as_slice()).map(|value| value.as_slice()),
+            Some(b"alias;$<$<BOOL:$<TARGET_PROPERTY:test::api,TYPE>>:FOUND>;$<TARGET_PROPERTY:TYPE>;$<TARGET_PROPERTY:outside,TYPE>".as_slice())
+        );
+    }
+    assert!(
+        add_export_property(
+            &model,
+            raw,
+            &mut ExportedTarget::default(),
+            "INTERFACE_SOURCES".into(),
+            b"bare",
+            PreprocessMode::Install,
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn install_exports_rewrite_and_validate_interface_link_path_properties()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::TargetOrigin;
+
+    let mut model = ProjectModel::default();
+    let dir = DirId::ROOT;
+    let raw = Target::new(
+        "producer".into(),
+        TargetKind::InterfaceLibrary,
+        TargetOrigin::Normal,
+        dir,
+        Default::default(),
+        Default::default(),
+    );
+    model.dir_mut(dir).source_dir = "/src".into();
+    model.dir_mut(dir).binary_dir = "/build".into();
+    let id = model.add_target(raw)?;
+    let raw = model.target(id).ok_or("missing test target")?;
+
+    for (key, rel, expected_install, expected_build) in [
+        (
+            "INTERFACE_LINK_DIRECTORIES",
+            b"$<BUILD_INTERFACE:/build/lib>$<INSTALL_INTERFACE:lib/custom>".as_slice(),
+            b"${_IMPORT_PREFIX}/lib/custom".as_slice(),
+            b"/build/lib".as_slice(),
+        ),
+        (
+            "INTERFACE_LINK_DEPENDS",
+            b"$<BUILD_INTERFACE:/src/linker.lds>$<INSTALL_INTERFACE:share/linker.lds>".as_slice(),
+            b"${_IMPORT_PREFIX}/share/linker.lds".as_slice(),
+            b"/src/linker.lds".as_slice(),
+        ),
+    ] {
+        let mut install_exported = ExportedTarget::default();
+        add_export_property(
+            &model,
+            raw,
+            &mut install_exported,
+            key.into(),
+            rel,
+            PreprocessMode::Install,
+        )?;
+        assert_eq!(
+            install_exported
+                .properties
+                .get(key.as_bytes())
+                .map(|value| value.as_slice()),
+            Some(expected_install)
+        );
+
+        let mut build_exported = ExportedTarget::default();
+        add_export_property(
+            &model,
+            raw,
+            &mut build_exported,
+            key.into(),
+            rel,
+            PreprocessMode::Build,
+        )?;
+        assert_eq!(
+            build_exported
+                .properties
+                .get(key.as_bytes())
+                .map(|value| value.as_slice()),
+            Some(expected_build)
+        );
+
+        // Unguarded build-tree and bare relative paths must be rejected on install export.
+        for bad in [b"/build/generated/lib".as_slice(), b"bare/relative"] {
+            assert!(
+                add_export_property(
+                    &model,
+                    raw,
+                    &mut ExportedTarget::default(),
+                    key.into(),
+                    bad,
+                    PreprocessMode::Install,
+                )
+                .is_err(),
+                "{key} should reject {:?}",
+                BString::from(bad)
+            );
+        }
+    }
+    Ok(())
+}

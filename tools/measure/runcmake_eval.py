@@ -11,8 +11,9 @@ profiles use the test commands that upstream CMake registers with CTest. The
 original groups and the core portion of the wide profile keep their legacy
 settings on POSIX hosts.
 
-The score includes cases that pass with CMake 4.5.1. A missing Rcmake result
-counts as a failure. Use --min-pass-rate to allow case differences within a
+The score includes cases that pass with CMake 4.5.1 and the Rcmake debugger
+cases that run on the verified capability branch. A missing case fails the
+comparison. Use --min-pass-rate to allow ordinary case failures within a
 required pass rate. Exit status 1 means the comparison failed the case gate.
 Exit status 2 means the script could not complete the comparison.
 """
@@ -21,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 import json
 import math
@@ -401,7 +404,7 @@ def run_registered_suite(registrations, driver, target, source, root, tools, wra
         config.mkdir(parents=True, exist_ok=True)
         test_env = {**env, "CMAKE_CONFIG_DIR": str(config), "CMAKE_MAXIMUM_RECURSION_DEPTH": "100"}
         if "HOME" in env:
-            test_env.update(HOME=str(home), CTEST_REAL_HOME=env["HOME"])
+            test_env.update(HOME=str(home), CTEST_REAL_HOME=env.get("CTEST_REAL_HOME", env["HOME"]))
         code, timed_out, log = run(command, cwd, test_env, entry.timeout)
         reported, result = case_results(code, timed_out, log)
         if not reported and not result["skips"] and result["complete"] and not result["driver_errors"]:
@@ -491,14 +494,48 @@ def case_results(code, timed_out, log):
     return cases, result
 
 
-def compare(reference, candidate):
-    """Score each case that passed with the reference binary."""
+DEBUGGER_INSPECTION = "DebuggerCapabilityInspect"
+DEBUGGER_ENABLED_CASES = ("DebuggerArgMissingPipe", "DebuggerArgMissingDapLog")
+DEBUGGER_DISABLED_CASES = (
+    "DebuggerNotSupported", "DebuggerNotSupportedPipe", "DebuggerNotSupportedDapLog",
+)
+
+
+def debugger_branches(suite, reference, candidate):
+    """Find registrations that ran the two expected debugger branches."""
+    statuses, branches = {}, []
+    if suite != "CommandLine":
+        return statuses, branches
+    for (name, occurrence), outcome in reference.items():
+        registration, separator, case = name.rpartition(": ")
+        if case != DEBUGGER_INSPECTION or occurrence != 1 or outcome["passed"] is not True:
+            continue
+        prefix = registration + separator
+        enabled = {(prefix + case, 1) for case in DEBUGGER_ENABLED_CASES}
+        disabled = {(prefix + case, 1) for case in DEBUGGER_DISABLED_CASES}
+        names = {name for name, _ in enabled | disabled}
+        if ({key for key in reference if key[0] in names} != enabled
+                or {key for key in candidate if key[0] in names} != disabled
+                or any(reference[key]["passed"] is not True for key in enabled)):
+            continue
+        statuses.update(dict.fromkeys(enabled, "capability_excluded"))
+        statuses.update({key: "passed" if candidate[key]["passed"] else "failed" for key in disabled})
+        branches.append({"capability": "debugger", "registration": registration or None,
+                         "oracle": True, "rcmake": False})
+    return statuses, branches
+
+
+def compare(reference, candidate, *, branch_statuses=None):
+    """Score the cases with the results of any verified capability branches."""
+    branch_statuses = branch_statuses or {}
     results = []
     for name, occurrence in dict.fromkeys((*reference, *candidate)):
         key = name, occurrence
         expected = reference.get(key)
         actual = candidate.get(key)
-        if expected is None:
+        if key in branch_statuses:
+            status = branch_statuses[key]
+        elif expected is None:
             status = "no_reference"
         elif not expected["passed"]:
             status = "reference_failed"
@@ -513,7 +550,80 @@ def compare(reference, candidate):
     return results
 
 
-def evaluate(suites, driver, candidate, source, timeout, profile, test_vars, use_upstream_timeout, report):
+def case_counts(cases):
+    """Count scored cases and cases with missing or failed reference results."""
+    count = Counter(case["status"] for case in cases)
+    failed = count["failed"] + count["missing"]
+    return {"passed": count["passed"], "failed": failed, "total": count["passed"] + failed,
+            "missing": count["missing"], "reference_failed": count["reference_failed"],
+            "no_reference": count["no_reference"], "capability_excluded": count["capability_excluded"]}
+
+
+def strict_case_issue(suite, row):
+    """Return a case issue that fails the gate at any pass rate."""
+    cases = row.get("cases", [])
+    if not isinstance(cases, list):
+        return "invalid cases"
+    statuses = {case["status"] for case in cases
+                if isinstance(case, dict) and isinstance(case.get("status"), str)}
+    if (row.get("reference_failed") or row.get("no_reference")
+            or statuses & {"reference_failed", "no_reference"}):
+        return "reference"
+    if row.get("missing") or "missing" in statuses:
+        return "missing"
+    if ("capability_branches" not in row and not row.get("capability_excluded")
+            and "capability_excluded" not in statuses):
+        return None
+
+    reference, candidate, recorded = {}, {}, {}
+    for case in cases:
+        if not isinstance(case, dict):
+            return "capability_branches"
+        name, occurrence = case.get("name"), case.get("occurrence")
+        if not isinstance(name, str) or type(occurrence) is not int or occurrence < 1:
+            return "capability_branches"
+        key = name, occurrence
+        if key in recorded:
+            return "capability_branches"
+        recorded[key] = case.get("status")
+        for lane, outcomes in (("oracle", reference), ("rcmake", candidate)):
+            outcome = case.get(lane)
+            if outcome is not None:
+                if not isinstance(outcome, dict) or type(outcome.get("passed")) is not bool:
+                    return "capability_branches"
+                outcomes[key] = outcome
+
+    branch_statuses, branches = debugger_branches(suite, reference, candidate)
+    expected = compare(reference, candidate, branch_statuses=branch_statuses)
+    if (not branches or row.get("capability_branches") != branches
+            or recorded != {(case["name"], case["occurrence"]): case["status"] for case in expected}
+            or any(row.get(key) != value for key, value in case_counts(expected).items())):
+        return "capability_branches"
+    if "failed" in branch_statuses.values():
+        return "capability_branch_failed"
+    return None
+
+
+def suite_environment(env, root):
+    """Create private home and temporary directories for parallel execution."""
+    home = root / "TestHome"
+    config = home / ".config" / "cmake"
+    temp = root / "tmp"
+    config.mkdir(parents=True)
+    temp.mkdir()
+    result = {**env, "HOME": str(home), "CMAKE_CONFIG_DIR": str(config), "TMPDIR": str(temp),
+              "TMP": str(temp), "TEMP": str(temp)}
+    if "HOME" in env:
+        result["CTEST_REAL_HOME"] = env["HOME"]
+    if os.name == "nt":
+        result.update(USERPROFILE=str(home), HOMEDRIVE=home.drive,
+                      HOMEPATH=str(home)[len(home.drive):],
+                      APPDATA=str(home / "AppData" / "Roaming"),
+                      LOCALAPPDATA=str(home / "AppData" / "Local"))
+    return result
+
+
+def evaluate(suites, driver, candidate, source, timeout, profile, test_vars, use_upstream_timeout, report, *, jobs=1):
     """Run the selected suites in separate reference and candidate workspaces."""
     # A CLI case can print the test environment into the report.
     env = {key: os.environ[key] for key in TEST_ENVIRONMENT if key in os.environ}
@@ -569,49 +679,65 @@ def evaluate(suites, driver, candidate, source, timeout, profile, test_vars, use
         if {"CommandLine", "execute_process"}.intersection(suites, legacy):
             settings.update(prepare_helpers(source, work / "helpers", env, timeout))
         relative_source = source.relative_to(source.parents[1])
+        lanes = (("oracle", driver), ("rcmake", candidate))
         tools = {}
-        for lane, target in (("oracle", driver), ("rcmake", candidate)):
-            shutil.copytree(
-                source.parents[1], work / lane / "source", symlinks=True,
-                ignore=shutil.ignore_patterns("._*", ".git"),
-            )
-            (work / lane / "build" / relative_source).mkdir(parents=True)
+        for lane, target in lanes:
+            (work / lane).mkdir()
+            if jobs == 1:
+                shutil.copytree(
+                    source.parents[1], work / lane / "source", symlinks=True,
+                    ignore=shutil.ignore_patterns("._*", ".git"),
+                )
+                (work / lane / "build" / relative_source).mkdir(parents=True)
             if modern:
                 tools[lane] = target_tools(driver, target, work / lane / "bin")
-        for suite in suites:
-            by_lane = {}
-            for lane, target in (("oracle", driver), ("rcmake", candidate)):
-                root = work / lane
-                if suite in legacy:
-                    by_lane[lane] = run_suite(
+
+        def run_lane(suite, lane, target):
+            if suite in legacy:
+                def run_at(root, suite_env):
+                    return run_suite(
                         driver, target, root / "source" / relative_source / suite,
-                        root / "build" / relative_source / suite, wrapper, settings, env, timeout,
+                        root / "build" / relative_source / suite, wrapper, settings, suite_env, timeout,
                     )
-                elif suite in registered:
-                    by_lane[lane] = run_registered_suite(
-                        registered[suite], driver, target, source.parents[1], root, tools[lane], wrapper, env,
+            elif suite in registered:
+                def run_at(root, suite_env):
+                    return run_registered_suite(
+                        registered[suite], driver, target, source.parents[1], root,
+                        tools[lane], wrapper, suite_env,
                     )
-                else:
-                    by_lane[lane] = {}, {
-                        "complete": False, "timed_out": False, "driver_errors": [
-                            "Upstream CMake did not register this suite with the selected generators and tools.",
-                        ],
-                    }
-            reference, oracle_driver = by_lane["oracle"]
-            actual, rcmake_driver = by_lane["rcmake"]
-            cases = compare(reference, actual)
-            count = Counter(case["status"] for case in cases)
-            failed = count["failed"] + count["missing"]
-            total = count["passed"] + failed
+            else:
+                return {}, {
+                    "complete": False, "timed_out": False, "driver_errors": [
+                        "Upstream CMake did not register this suite with the selected generators and tools.",
+                    ],
+                }
+            if jobs == 1:
+                return run_at(work / lane, env)
+            # Some upstream suites modify source fixtures. Give each worker its own copy.
+            with tempfile.TemporaryDirectory(prefix=f"{suite}-", dir=work / lane) as directory:
+                root = Path(directory)
+                shutil.copytree(source.parents[1], root / "source", symlinks=True,
+                                ignore=shutil.ignore_patterns("._*", ".git"))
+                (root / "build" / relative_source).mkdir(parents=True)
+                return run_at(root, suite_environment(env, root))
+
+        def run_pair(suite):
+            return [run_lane(suite, lane, target) for lane, target in lanes]
+
+        def record(suite, by_lane):
+            (reference, oracle_driver), (actual, rcmake_driver) = by_lane
+            branch_statuses, branches = debugger_branches(suite, reference, actual)
+            cases = compare(reference, actual, branch_statuses=branch_statuses)
+            counts = case_counts(cases)
             results[suite] = {
-                "passed": count["passed"], "failed": failed, "total": total,
-                "missing": count["missing"], "reference_failed": count["reference_failed"],
-                "no_reference": count["no_reference"], "cases": cases,
+                **counts, "cases": cases,
                 "oracle_driver": oracle_driver, "rcmake_driver": rcmake_driver,
             }
+            if branches:
+                results[suite]["capability_branches"] = branches
             print(
-                f"{suite:<32} {count['passed']:>6} {failed:>6} {total:>6}"
-                f" {count['reference_failed']:>9}", flush=True,
+                f"{suite:<32} {counts['passed']:>6} {counts['failed']:>6} {counts['total']:>6}"
+                f" {counts['reference_failed']:>9}", flush=True,
             )
             for lane, metadata in (("oracle", oracle_driver), ("Rcmake", rcmake_driver)):
                 if metadata["timed_out"]:
@@ -637,6 +763,11 @@ def evaluate(suites, driver, candidate, source, timeout, profile, test_vars, use
                         metadata["arguments"] = [arg.replace(work.as_posix(), "<sandbox>")
                                                  for arg in metadata["arguments"]]
 
+        with ThreadPoolExecutor(max_workers=jobs) if jobs > 1 else nullcontext() as executor:
+            pairs = executor.map(run_pair, suites) if executor else map(run_pair, suites)
+            for suite, by_lane in zip(suites, pairs):
+                record(suite, by_lane)
+
 
 def main():
     """Parse options, run the comparison, and write the report."""
@@ -655,6 +786,8 @@ def main():
     parser.add_argument("--list", "--list-suites", action="store_true",
                         help="List the selected upstream suites.")
     parser.add_argument("--json", type=Path, metavar="PATH", help="Write the case report to PATH.")
+    parser.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+                        help="Run up to N suites at the same time. The default is 1.")
     parser.add_argument(
         "--timeout", type=float, metavar="SECONDS",
         help="Limit each suite run. Legacy groups default to 180 seconds. Other suites use CTest timeouts.",
@@ -674,6 +807,8 @@ def main():
     timeout = DEFAULT_TIMEOUT if args.timeout is None else args.timeout
     if not math.isfinite(timeout) or timeout <= 0:
         parser.error("--timeout must be a finite number greater than zero.")
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1.")
     if any(not re.fullmatch(r"CMake_TEST_\w+=.*", value) for value in args.test_var):
         parser.error("--test-var requires CMake_TEST_NAME=VALUE.")
     if args.min_pass_rate is not None and not 0 <= args.min_pass_rate <= 100:
@@ -733,7 +868,7 @@ def main():
         if not candidate.is_file() or not os.access(candidate, os.X_OK):
             raise ValueError(f"Rcmake binary is missing or cannot run: {candidate}")
         evaluate(suites, driver, candidate, source, timeout, args.profile, args.test_var,
-                 args.timeout is None, report)
+                 args.timeout is None, report, jobs=args.jobs)
     except (KeyError, OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
         error = (f"Source env/env.sh to set {exc.args[0]}." if isinstance(exc, KeyError)
                  else str(exc) or "Run interrupted.")
@@ -744,7 +879,8 @@ def main():
         results = report["suites"]
         totals = {
             key: sum(suite[key] for suite in results.values())
-            for key in ("passed", "failed", "total", "missing", "reference_failed", "no_reference")
+            for key in ("passed", "failed", "total", "missing", "reference_failed", "no_reference",
+                        "capability_excluded")
         }
         rate = 100 * totals["passed"] / totals["total"] if totals["total"] else None
         incomplete = [
@@ -773,9 +909,13 @@ def main():
         print(f"Incomplete suites: {len(incomplete)}", file=sys.stderr)
     if rate is None or incomplete:
         return 2
+    issues = [f"{name}:{issue}" for name, row in results.items() if (issue := strict_case_issue(name, row))]
+    if issues:
+        print(f"RunCMake case issues: {', '.join(issues)}", file=sys.stderr)
+        return 1
     if args.min_pass_rate is not None:
         return int(rate < args.min_pass_rate)
-    return int(bool(totals["failed"] or totals["reference_failed"] or totals["no_reference"]))
+    return int(bool(totals["failed"]))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 use rcmake_base::{BString, path_lex::Lexical, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::Cx;
-use rcmake_model::TargetId;
+use rcmake_model::{TargetId, TargetKind};
 
 use super::{artifact, keyword};
 
@@ -31,40 +31,63 @@ pub(super) fn warn_unnormalized(cx: &mut Cx<'_>, args: &[&[u8]]) {
     }
 }
 
-/// `install(TARGETS)` installs header files without a destination to the default
-/// include directory only when the call names no artifact group. Otherwise CMake
-/// warns and does not install those headers.
+/// Use the default include directory unless an applicable artifact has an
+/// explicit destination. Warn when that destination suppresses a header list.
 pub(super) fn drop_headers_without_destination<'a>(
     cx: &mut Cx<'_>,
     args: &[&[u8]],
+    generic: Option<&BString>,
     mut snapshots: Vec<Snapshot<'a>>,
 ) -> Vec<Snapshot<'a>> {
     let found = destinations(args);
-    let artifacts_specified = args.iter().any(|token| artifact(token));
     let has_destination = |group: &[u8]| {
-        found
-            .iter()
-            .any(|(owner, path)| !path.is_empty() && owner.is_none_or(|owner| owner == group))
+        generic.is_some_and(|path| !path.is_empty())
+            || found
+                .iter()
+                .rev()
+                .find(|(owner, _)| *owner == Some(group))
+                .is_some_and(|(_, path)| !path.is_empty())
     };
-    if !artifacts_specified {
-        return snapshots;
-    }
+    let apple = super::apple::is_apple(cx);
+    let text_stubs = apple && !cx.var_or_empty(b"CMAKE_TAPI").is_empty();
+    let dll = cx.var_is_on(b"WIN32") || cx.var_is_on(b"CYGWIN");
+    let aix = cx.var_or_empty(b"CMAKE_SYSTEM_NAME") == b"AIX";
     for (id, entries) in &mut snapshots {
-        let framework = entries
-            .iter()
-            .any(|(key, value)| *key == b"FRAMEWORK" && truth::is_on(value));
-        if framework {
+        let Some(target) = cx.project().target(*id) else {
+            continue;
+        };
+        let on = |key: &[u8]| {
+            target
+                .props
+                .get(key)
+                .is_some_and(|value| truth::is_on(value))
+        };
+        if apple && on(b"FRAMEWORK") {
             continue;
         }
+        let explicit_artifact = match target.kind {
+            TargetKind::StaticLibrary => has_destination(b"ARCHIVE"),
+            TargetKind::SharedLibrary if dll => {
+                has_destination(b"ARCHIVE") || has_destination(b"RUNTIME")
+            }
+            TargetKind::SharedLibrary => {
+                has_destination(b"LIBRARY")
+                    || (text_stubs && on(b"ENABLE_EXPORTS") && has_destination(b"ARCHIVE"))
+            }
+            TargetKind::Executable => {
+                (!(apple && on(b"MACOSX_BUNDLE")) && has_destination(b"RUNTIME"))
+                    || ((dll || aix) && on(b"ENABLE_EXPORTS") && has_destination(b"ARCHIVE"))
+            }
+            _ => false,
+        };
+        if !explicit_artifact {
+            continue;
+        }
+        let name = target.name.clone();
         for (key, value) in entries.iter_mut() {
             if !HEADERS.contains(key) || value.is_empty() || has_destination(key) {
                 continue;
             }
-            let name = cx
-                .project()
-                .target(*id)
-                .map(|target| target.name.clone())
-                .unwrap_or_default();
             let key_text = String::from_utf8_lossy(key);
             crate::author_warning(
                 cx,

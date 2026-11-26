@@ -87,28 +87,15 @@ impl ToolchainEvidence {
                 return None;
             }
             evidence.stamp(host, &driver, false)?;
-            let Some(wrapper) = Wrapper::read(host, &driver) else {
-                if starts_with_shebang(host, &driver)? {
-                    return None;
-                }
+            let Some(wrapper) = wrapper_step(host, &driver, depth, evidence.prefixes.len()).ok()?
+            else {
                 break;
             };
-            if depth == 2 {
-                return None;
-            }
             evidence.stamp(host, &wrapper.interpreter, false)?;
             if let Some(interpreter) = wrapper.env_program {
                 evidence.stamp(host, &interpreter, false)?;
             }
             evidence.telemetry.extend(wrapper.telemetry);
-            if evidence
-                .prefixes
-                .len()
-                .saturating_mul(wrapper.prefixes.len())
-                > 8
-            {
-                return None;
-            }
             evidence.prefixes = wrapper
                 .prefixes
                 .into_iter()
@@ -169,16 +156,7 @@ impl ToolchainEvidence {
         if !vendor_tools(&driver) || driver.parent() != linker.parent() {
             return None;
         }
-        let shim = if cxx { "/usr/bin/c++" } else { "/usr/bin/cc" };
-        let clang = if cxx {
-            "/usr/bin/clang++"
-        } else {
-            "/usr/bin/clang"
-        };
-        if self.driver != Path::new(shim)
-            && self.driver != Path::new(clang)
-            && host.canonicalize(&self.driver).ok()? != driver
-        {
+        if !matches_apple_driver(host, &self.driver, Some(&driver), cxx) {
             return None;
         }
         let settings = sdk.join("SDKSettings.json");
@@ -483,6 +461,90 @@ fn excluded_launcher(path: &Path) -> bool {
         .is_some_and(|stem| {
             stem.eq_ignore_ascii_case("ccache") || stem.eq_ignore_ascii_case("sccache")
         })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::configure) enum ReuseWarningReason {
+    ExcludedLauncher,
+    WrapperChainTooDeep,
+    WrapperTooManyArgLists,
+    UnverifiableWrapperScript,
+    UnreadableWrapper,
+    UnverifiedAppleDriver,
+}
+
+fn wrapper_step(
+    host: &dyn Host,
+    driver: &Path,
+    depth: usize,
+    prefixes: usize,
+) -> Result<Option<Wrapper>, ReuseWarningReason> {
+    match Wrapper::read(host, driver) {
+        Some(_) if depth == 2 => Err(ReuseWarningReason::WrapperChainTooDeep),
+        Some(wrapper) if prefixes.saturating_mul(wrapper.prefixes.len()) > 8 => {
+            Err(ReuseWarningReason::WrapperTooManyArgLists)
+        }
+        Some(wrapper) => Ok(Some(wrapper)),
+        None => match starts_with_shebang(host, driver) {
+            Some(false) => Ok(None),
+            Some(true) => Err(ReuseWarningReason::UnverifiableWrapperScript),
+            None => Err(ReuseWarningReason::UnreadableWrapper),
+        },
+    }
+}
+
+fn matches_apple_driver(
+    host: &dyn Host,
+    program: &Path,
+    canonical_driver: Option<&Path>,
+    cxx: bool,
+) -> bool {
+    let (shim, clang) = if cxx {
+        ("/usr/bin/c++", "/usr/bin/clang++")
+    } else {
+        ("/usr/bin/cc", "/usr/bin/clang")
+    };
+    program == Path::new(shim)
+        || program == Path::new(clang)
+        || canonical_driver
+            .is_some_and(|driver| host.canonicalize(program).is_ok_and(|path| path == driver))
+}
+
+pub(in crate::configure) fn compiler_reuse_warning(
+    host: &dyn Host,
+    program: &Path,
+    cxx: bool,
+) -> Option<ReuseWarningReason> {
+    let mut driver = program.to_owned();
+    let mut prefixes = 1;
+    for depth in 0..=2 {
+        if excluded_launcher(&driver) {
+            return Some(ReuseWarningReason::ExcludedLauncher);
+        }
+        match wrapper_step(host, &driver, depth, prefixes) {
+            Ok(Some(wrapper)) => {
+                prefixes *= wrapper.prefixes.len();
+                driver = wrapper.target;
+            }
+            Ok(None) => break,
+            Err(reason) => return Some(reason),
+        }
+    }
+    if host.system().sysname == "Darwin" {
+        let developer = super::super::apple_developer_dir(host);
+        let clang = if cxx { "clang++" } else { "clang" };
+        let canonical = ["Toolchains/XcodeDefault.xctoolchain/usr/bin", "usr/bin"]
+            .into_iter()
+            .filter_map(|directory| {
+                host.canonicalize(&developer.join(directory).join(clang))
+                    .ok()
+            })
+            .find(|driver| vendor_tools(driver));
+        if !matches_apple_driver(host, &driver, canonical.as_deref(), cxx) {
+            return Some(ReuseWarningReason::UnverifiedAppleDriver);
+        }
+    }
+    None
 }
 
 fn linker_dependency_file(host: &dyn Host, linker: &Path) -> bool {

@@ -1,4 +1,4 @@
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -295,7 +295,11 @@ fn hash_file(host: &dyn Host, path: &Path) -> HostResult<(JournalFileStat, Journ
     if !path.is_absolute() {
         return Err(HostError::not_absolute(path.to_owned()));
     }
-    let stat = JournalFileStat::read(host, path)?;
+    let before = host.metadata_fresh(path, Follow::Yes)?;
+    if before.kind != FileKind::File {
+        return Err(HostError::unsupported("Expected a regular journal file."));
+    }
+    let stat = JournalFileStat::from(&before);
     let error =
         |kind, message| HostError::from_io(io::Error::new(kind, message), Some(path.to_owned()));
     if stat.len > Limits::default().max_file_read {
@@ -304,14 +308,67 @@ fn hash_file(host: &dyn Host, path: &Path) -> HostResult<(JournalFileStat, Journ
             "Journal file exceeds the read limit.",
         ));
     }
-    let bytes = host.read(path, ReadRange::All { limit: stat.len })?;
-    if bytes.len() as u64 != stat.len || JournalFileStat::read(host, path)? != stat {
+    let streamed = if stat.len >= 1024 * 1024 {
+        stream_digest(host, path, &before)?
+    } else {
+        None
+    };
+    let (length, digest) = if let Some(streamed) = streamed {
+        streamed
+    } else {
+        let bytes = host.read(path, ReadRange::All { limit: stat.len })?;
+        (bytes.len() as u64, JournalDigest::hash(&bytes))
+    };
+    let after = host.metadata_fresh(path, Follow::Yes)?;
+    if length != stat.len || JournalFileStat::from(&after) != stat || after.ctime != before.ctime {
         return Err(error(
             ErrorKind::InvalidData,
             "Journal file changed during the read.",
         ));
     }
-    Ok((stat, JournalDigest::hash(&bytes)))
+    Ok((stat, digest))
+}
+
+fn stream_digest(
+    host: &dyn Host,
+    path: &Path,
+    before: &Metadata,
+) -> HostResult<Option<(u64, JournalDigest)>> {
+    let (reader, opened) = match host.open_read_with_metadata(path) {
+        Ok((reader, Some(opened))) => (reader, opened),
+        Ok((_, None)) => return Ok(None),
+        Err(error) if error.kind == ErrorKind::Unsupported => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let error_at = |error| HostError::from_io(error, Some(path.to_owned()));
+    if JournalFileStat::from(&opened) != JournalFileStat::from(before)
+        || opened.ctime != before.ctime
+    {
+        return Err(error_at(io::Error::new(
+            ErrorKind::InvalidData,
+            "Journal file changed before the read.",
+        )));
+    }
+    let mut reader = reader.take(before.len + 1);
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut hash = Sha256::new();
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(len) => {
+                let bytes = buffer
+                    .get(..len)
+                    .ok_or_else(|| error_at(io::Error::other("Invalid journal read length.")))?;
+                hash.update(bytes);
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error_at(error)),
+        }
+    }
+    Ok(Some((
+        before.len + 1 - reader.limit(),
+        JournalDigest::from_bytes(hash.finalize().into()),
+    )))
 }
 
 /// Variable scope relative to the region entry.
@@ -830,6 +887,16 @@ mod tests {
         host.set_times(&path, None, Some(old))?;
         assert!(!recent.matches(&host));
         assert!(!stable.matches(&host));
+        Ok(())
+    }
+
+    #[test]
+    fn large_file_digest_supports_hosts_without_bound_metadata() -> HostResult<()> {
+        let (host, root) = fixture();
+        let path = root.join("large-input");
+        let bytes = vec![b'x'; 1024 * 1024 + 1];
+        host.seed_file(&path, &bytes)?;
+        assert_eq!(file_digest(&host, &path)?, JournalDigest::hash(&bytes));
         Ok(())
     }
 

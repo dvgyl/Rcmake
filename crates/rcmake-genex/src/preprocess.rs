@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use rcmake_base::{BString, ByteSlice};
+use rcmake_base::{BString, ByteSlice, path_lex::Lexical};
 
 use crate::parse::render;
 use crate::{GenexAst, GenexExpr, GenexNode};
@@ -67,11 +67,21 @@ pub fn genex_strip(input: &[u8]) -> BString {
 #[must_use]
 pub fn strip(ast: &GenexAst, mode: PreprocessMode) -> GenexAst {
     GenexAst {
-        nodes: strip_nodes(&ast.nodes, mode),
+        nodes: strip_nodes(&ast.nodes, mode, b""),
     }
 }
 
-fn strip_nodes(nodes: &[GenexNode], mode: PreprocessMode) -> Vec<GenexNode> {
+impl GenexAst {
+    /// Select the install interface and prefix relative paths in its payload.
+    #[must_use]
+    pub fn strip_install_paths(&self, prefix: &[u8]) -> Self {
+        Self {
+            nodes: strip_nodes(&self.nodes, PreprocessMode::Install, prefix),
+        }
+    }
+}
+
+fn strip_nodes(nodes: &[GenexNode], mode: PreprocessMode, prefix: &[u8]) -> Vec<GenexNode> {
     let mut out = Vec::with_capacity(nodes.len());
     for node in nodes {
         match node {
@@ -95,26 +105,76 @@ fn strip_nodes(nodes: &[GenexNode], mode: PreprocessMode) -> Vec<GenexNode> {
                 };
                 match (keep, &expr.params) {
                     (Some(true), Some(params)) => {
+                        let mut payload = Vec::new();
                         for (i, param) in params.iter().enumerate() {
                             if i > 0 {
-                                out.push(GenexNode::Text(",".into()));
+                                payload.push(GenexNode::Text(",".into()));
                             }
-                            out.extend(param.iter().cloned());
+                            payload.extend(param.iter().cloned());
+                        }
+                        if prefix.is_empty() {
+                            out.extend(payload);
+                        } else {
+                            prefix_items(payload, prefix, &mut out);
                         }
                     }
                     (Some(_), _) => {}
                     (None, _) => out.push(GenexNode::Expr(GenexExpr {
-                        identifier: strip_nodes(&expr.identifier, mode),
+                        identifier: strip_nodes(&expr.identifier, mode, prefix),
                         params: expr
                             .params
                             .as_ref()
-                            .map(|ps| ps.iter().map(|p| strip_nodes(p, mode)).collect()),
+                            .map(|ps| ps.iter().map(|p| strip_nodes(p, mode, prefix)).collect()),
                     })),
                 }
             }
         }
     }
     out
+}
+
+fn prefix_items(payload: Vec<GenexNode>, prefix: &[u8], out: &mut Vec<GenexNode>) {
+    let mut start = true;
+    let mut escaped = false;
+    for node in payload {
+        if let GenexNode::Text(text) = node {
+            let mut offset = 0;
+            for (i, &byte) in text.iter().enumerate() {
+                if byte == b';' && !escaped {
+                    push_path_text(
+                        text.get(offset..=i).unwrap_or_default(),
+                        prefix,
+                        &mut start,
+                        out,
+                    );
+                    start = true;
+                    offset = i + 1;
+                }
+                escaped = byte == b'\\' && !escaped;
+            }
+            push_path_text(
+                text.get(offset..).unwrap_or_default(),
+                prefix,
+                &mut start,
+                out,
+            );
+        } else {
+            out.push(node);
+            start = false;
+            escaped = false;
+        }
+    }
+}
+
+fn push_path_text(text: &[u8], prefix: &[u8], start: &mut bool, out: &mut Vec<GenexNode>) {
+    if text.is_empty() {
+        return;
+    }
+    if *start && text != b";" && !Lexical::new(text).absolute() {
+        out.push(GenexNode::Text(prefix.into()));
+    }
+    out.push(GenexNode::Text(text.into()));
+    *start = false;
 }
 
 /// Replace each `$<INSTALL_PREFIX>` in `input` with `replacement` (for example
@@ -182,4 +242,17 @@ mod tests {
             ""
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn prefixes_install_paths_before_joining_adjacent_text() -> Result<(), crate::GenexError> {
+    let ast = crate::parse(
+        b"$<BUILD_INTERFACE:src>$<INSTALL_INTERFACE:include>/api;$<INSTALL_INTERFACE:a;/opt/b;$<INSTALL_PREFIX>/c;d$<CONFIG>>;bare",
+    )?;
+    assert_eq!(
+        render(&ast.strip_install_paths(b"${_IMPORT_PREFIX}/").nodes),
+        "${_IMPORT_PREFIX}/include/api;${_IMPORT_PREFIX}/a;/opt/b;$<INSTALL_PREFIX>/c;${_IMPORT_PREFIX}/d$<CONFIG>;bare"
+    );
+    Ok(())
 }

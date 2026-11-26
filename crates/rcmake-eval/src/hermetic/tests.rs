@@ -103,7 +103,7 @@ fn checks_roots_by_component_and_blocks_symlink_escape() -> Result<(), Box<dyn s
     ] {
         assert!(
             policy
-                .resolve_allowed_path(&host, &abs(path), None)
+                .resolve_allowed_path(&host, &abs(path), None, PathAccess::Read)
                 .is_some()
         );
     }
@@ -114,7 +114,7 @@ fn checks_roots_by_component_and_blocks_symlink_escape() -> Result<(), Box<dyn s
     ] {
         assert!(
             policy
-                .resolve_allowed_path(&host, &abs(path), None)
+                .resolve_allowed_path(&host, &abs(path), None, PathAccess::Read)
                 .is_none()
         );
     }
@@ -247,6 +247,7 @@ fn allows_symlinked_modules_and_templates_without_allowing_outside()
                 &host,
                 &abs("/stage/share/cmake-4.5/Modules/CMakeDetermineSystem.cmake"),
                 None,
+                PathAccess::Read,
             )
             .is_some()
     );
@@ -255,7 +256,8 @@ fn allows_symlinked_modules_and_templates_without_allowing_outside()
             .resolve_allowed_path(
                 &host,
                 &abs("/stage/share/cmake-4.5/Templates/Test.in"),
-                None
+                None,
+                PathAccess::Read,
             )
             .is_some()
     );
@@ -264,7 +266,8 @@ fn allows_symlinked_modules_and_templates_without_allowing_outside()
             .resolve_allowed_path(
                 &host,
                 &abs("/stage/share/cmake-4.5/../../../outside/secret.txt"),
-                None
+                None,
+                PathAccess::Read,
             )
             .is_none()
     );

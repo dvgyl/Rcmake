@@ -99,6 +99,29 @@ impl FromJson for Regions {
 
 type Manifest = ConfigureSnapshot<Regions>;
 
+fn decode_and_digest(
+    bytes: &[u8],
+    digest: impl FnOnce() -> Option<JournalDigest>,
+) -> (Option<JournalDigest>, Option<Manifest>) {
+    let decode = || Manifest::decode(bytes).ok();
+    #[cfg(not(target_arch = "wasm32"))]
+    if bytes.len() >= 256 * 1024 && bytes.len() <= Manifest::frame_limit() {
+        return std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .name("rcmake-replay-decode".into())
+                .spawn_scoped(scope, decode);
+            let executable = digest();
+            let manifest = match worker {
+                Ok(worker) => worker.join().ok().flatten(),
+                Err(_) => executable.and_then(|_| decode()),
+            };
+            (executable, manifest)
+        });
+    }
+    let executable = digest();
+    (executable, executable.and_then(|_| decode()))
+}
+
 pub(crate) struct ReplaySession {
     host: Arc<dyn Host>,
     executable: JournalDigest,
@@ -142,7 +165,14 @@ impl ReplaySession {
             .session_data::<ReplayHost>()
             .map_or(&interp.config.host, |h| &h.0)
             .clone();
-        let executable = file_digest(host.as_ref(), &host.current_exe().ok()?).ok()?;
+        let program = host.current_exe().ok()?;
+        let digest = || file_digest(host.as_ref(), &program).ok();
+        let (executable, previous) = if let Some(bytes) = cached {
+            decode_and_digest(bytes, digest)
+        } else {
+            (digest(), None)
+        };
+        let executable = executable?;
         let absolute = |p: &Path| {
             path::to_native(&crate::util::collapse_full_path(
                 &path::from_native_cmake(p),
@@ -174,13 +204,11 @@ impl ReplaySession {
         }
         h.field(6, format!("{:?}", interp.config.limits).as_bytes());
         h.field(7, format!("{:?}", interp.config.diag).as_bytes());
-        let previous = cached
-            .and_then(|bytes| Manifest::decode(bytes).ok())
-            .filter(|s| {
-                s.region.key == root
-                    && s.model.nested.len() <= 4096
-                    && s.model.variable_inputs.len() <= 4096
-            });
+        let previous = previous.filter(|s| {
+            s.region.key == root
+                && s.model.nested.len() <= 4096
+                && s.model.variable_inputs.len() <= 4096
+        });
         let receipts = interp.session_data::<Arc<ReplayReceipts>>().cloned();
         if let Some(receipts) = &receipts {
             let recorded = previous
