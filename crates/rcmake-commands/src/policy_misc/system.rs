@@ -24,7 +24,7 @@ pub(super) fn site_name(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     };
     if !cx.var_defined(&arg.value) {
         let hostname = cx.host().system().hostname;
-        cx.cache().insert(
+        cx.insert_cache_entry_unrecorded(
             arg.value.clone(),
             CacheEntry {
                 value: hostname,

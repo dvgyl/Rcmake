@@ -403,5 +403,50 @@ fn set_cache(
             )));
         }
     }
+    check_cache_bytes(cx, entry, name, value.as_ref(), update)?;
     update_scoped(cx, &PropScope::Cache(entry.into()), name, value, update)
+}
+
+/// Refuse a cache property write that would pass `limits.max_cache_bytes`, before the
+/// entry changes.
+fn check_cache_bytes(
+    cx: &mut Cx<'_>,
+    entry: &[u8],
+    name: &[u8],
+    value: Option<&BString>,
+    update: Update,
+) -> Result<(), CmdError> {
+    let Some(new) = value else {
+        return Ok(());
+    };
+    let limit = cx.limits().max_cache_bytes;
+    let cache = cx.cache();
+    let (old_len, key_len) = cache.get(entry).map_or((0, 0), |cached| match name {
+        b"VALUE" => (cached.value.len(), 0),
+        b"HELPSTRING" => (cached.help.len(), 0),
+        b"TYPE" => (0, 0),
+        _ => cached
+            .props
+            .get(name)
+            .map_or((0, name.len()), |old| (old.len(), 0)),
+    });
+    let new_len = match update {
+        Update::Set => new.len(),
+        Update::Append if old_len > 0 && !new.is_empty() => {
+            old_len.saturating_add(1).saturating_add(new.len())
+        }
+        Update::Append | Update::AppendString => old_len.saturating_add(new.len()),
+    };
+    let projected = cache
+        .bytes()
+        .saturating_sub(old_len)
+        .saturating_add(new_len)
+        .saturating_add(key_len);
+    if projected > limit {
+        cx.set_fatal();
+        return Err(CmdError::status(format!(
+            "Cache storage would exceed the {limit}-byte limit."
+        )));
+    }
+    Ok(())
 }

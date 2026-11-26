@@ -410,17 +410,17 @@ pub(super) fn filename_component(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRe
 
 fn filename_result(cx: &mut Cx<'_>, name: &[u8], value: BString, cache: bool) {
     if cache {
-        cx.cache().insert(
-            name.into(),
-            CacheEntry {
-                value,
-                ty: CacheType::String,
-                help: BString::default(),
-                advanced: false,
-                props: Default::default(),
-            },
-        );
-        cx.unset_var(name);
+        let entry = CacheEntry {
+            value,
+            ty: CacheType::String,
+            help: BString::default(),
+            advanced: false,
+            props: Default::default(),
+        };
+        // A refused entry also leaves the normal variable unchanged.
+        if cx.insert_cache_entry(name.into(), entry) {
+            cx.unset_var(name);
+        }
     } else {
         cx.set_var(name, value);
     }

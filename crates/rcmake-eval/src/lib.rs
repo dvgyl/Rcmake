@@ -53,6 +53,7 @@ mod provenance;
 mod scope;
 mod services;
 mod stack;
+pub mod stack_guard;
 mod util;
 
 #[cfg(test)]
@@ -470,6 +471,11 @@ pub struct Interp {
     /// Name of the project file read in each directory (`cmake --project-file`).
     list_file_name: BString,
     depth: u32,
+    /// Nesting depth of structured block bodies (`if`, `foreach`, `while`, `block`, ...).
+    block_depth: u32,
+    /// Bytes of temporary call data (macro argument copies and substituted bodies) that
+    /// active calls hold. They count against `limits.max_live_variable_bytes`.
+    temp_bytes: usize,
     recursion_fallback: Mutex<(BString, Option<u32>)>,
     recursion_exceeded: bool,
     inherited_recursion: Option<(u32, u32)>,
@@ -593,6 +599,8 @@ impl Interp {
             bt: Backtrace::default(),
             list_file_name: BString::from(DEFAULT_LIST_FILE_NAME),
             depth: 0,
+            block_depth: 0,
+            temp_bytes: 0,
             recursion_fallback: Mutex::default(),
             recursion_exceeded: false,
             inherited_recursion: None,

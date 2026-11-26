@@ -157,6 +157,15 @@ impl PropertyMap {
     pub fn names(&self) -> Vec<BString> {
         self.entries.keys().cloned().collect()
     }
+
+    /// Total bytes of all property names and values.
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .fold(0, usize::saturating_add)
+    }
 }
 
 /// Single entry inside [`Cache`].
@@ -174,13 +183,62 @@ pub struct CacheEntry {
     pub props: PropertyMap,
 }
 
-/// Ordered store of CMake cache variables (`CMakeCache.txt`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Cache {
-    entries: IndexMap<BString, CacheEntry>,
+/// Fixed cost of one cache entry for [`Cache::bytes`] (map slot and string headers).
+const CACHE_ENTRY_OVERHEAD: usize = 128;
+
+/// Estimated bytes of one cache entry with a name of `name_len` bytes: name, value, help
+/// text, additional properties (such as `STRINGS`), and a fixed overhead.
+fn cache_entry_cost(name_len: usize, entry: &CacheEntry) -> usize {
+    name_len
+        .saturating_add(entry.value.len())
+        .saturating_add(entry.props.byte_len())
+        .saturating_add(entry.help.len())
+        .saturating_add(CACHE_ENTRY_OVERHEAD)
 }
 
+/// Ordered store of CMake cache variables (`CMakeCache.txt`).
+#[derive(Clone, Debug, Default)]
+pub struct Cache {
+    entries: IndexMap<BString, CacheEntry>,
+    /// Sum of the entry costs while `dirty` is false.
+    bytes: usize,
+    /// [`Cache::get_mut`] gave out an entry, so `bytes` must be counted again.
+    dirty: bool,
+}
+
+impl PartialEq for Cache {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for Cache {}
+
 impl Cache {
+    /// Estimated bytes of all entries (name, value, help text, and a fixed overhead).
+    pub fn bytes(&mut self) -> usize {
+        if self.dirty {
+            self.bytes = self
+                .entries
+                .iter()
+                .map(|(name, entry)| cache_entry_cost(name.len(), entry))
+                .fold(0, usize::saturating_add);
+            self.dirty = false;
+        }
+        self.bytes
+    }
+
+    /// Estimated bytes of all entries after [`Cache::insert`] of `entry` as `name`.
+    pub fn bytes_after_insert(&mut self, name: &[u8], entry: &CacheEntry) -> usize {
+        let replaced = self
+            .entries
+            .get(name)
+            .map_or(0, |old| cache_entry_cost(name.len(), old));
+        self.bytes()
+            .saturating_sub(replaced)
+            .saturating_add(cache_entry_cost(name.len(), entry))
+    }
+
     /// Get a cache entry by name.
     #[must_use]
     pub fn get(&self, name: &[u8]) -> Option<&CacheEntry> {
@@ -189,17 +247,31 @@ impl Cache {
 
     /// Get a mutable reference to a cache entry by name.
     pub fn get_mut(&mut self, name: &[u8]) -> Option<&mut CacheEntry> {
-        self.entries.get_mut(name)
+        let entry = self.entries.get_mut(name);
+        self.dirty |= entry.is_some();
+        entry
     }
 
     /// Insert or replace a cache entry.
     pub fn insert(&mut self, name: BString, entry: CacheEntry) {
-        self.entries.insert(name, entry);
+        let name_len = name.len();
+        let added = cache_entry_cost(name_len, &entry);
+        let removed = self
+            .entries
+            .insert(name, entry)
+            .map_or(0, |old| cache_entry_cost(name_len, &old));
+        self.bytes = self.bytes.saturating_sub(removed).saturating_add(added);
     }
 
     /// Remove a cache entry (`unset(VAR CACHE)`).
     pub fn remove(&mut self, name: &[u8]) -> Option<CacheEntry> {
-        self.entries.shift_remove(name)
+        let removed = self.entries.shift_remove(name);
+        if let Some(entry) = &removed {
+            self.bytes = self
+                .bytes
+                .saturating_sub(cache_entry_cost(name.len(), entry));
+        }
+        removed
     }
 
     /// Return `true` if a cache entry with `name` exists.

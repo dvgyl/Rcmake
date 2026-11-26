@@ -99,11 +99,24 @@ impl Interp {
     }
 
     /// Run the commands in `start..end` as a block body.
+    ///
+    /// A body runs after the command frame of its opener returns, so block nesting has its
+    /// own depth limit: the same limit as command recursion, and the native stack guard.
     fn run_body(&mut self, code: &Code, start: usize, end: usize) -> CmdResult {
         if start >= end {
             return Ok(Flow::Normal);
         }
-        self.run_code(code, start, end, BodyMode::Nested)
+        let limit = self.recursion_limit();
+        if self.block_depth >= limit || crate::stack_guard::exhausted() {
+            self.fatal_here(
+                format!("Maximum nesting depth of {limit} exceeded by structured blocks.").into(),
+            );
+            return Err(CmdError::Reported);
+        }
+        self.block_depth += 1;
+        let result = self.run_code(code, start, end, BodyMode::Nested);
+        self.block_depth -= 1;
+        result
     }
 
     /// `cmFunctionBlocker::IsFunctionBlocked` end-of-block argument checks.

@@ -95,7 +95,9 @@ impl Cx<'_> {
         }
         let result = self.with_variable_scope(|cx| {
             for (key, value) in definitions.iter() {
-                cx.interp.vars.set(key, value.clone());
+                if !cx.interp.store_var(key, value.clone()) {
+                    break;
+                }
             }
             run(cx)
         });

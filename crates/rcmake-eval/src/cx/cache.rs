@@ -69,7 +69,9 @@ impl Cx<'_> {
     }
 
     /// Write a cache entry and preserve its additional properties.
-    pub fn write_cache(&mut self, name: &[u8], value: BString, ty: CacheType, help: &[u8]) {
+    ///
+    /// Return `false` after a fatal error if the cache would pass `limits.max_cache_bytes`.
+    pub fn write_cache(&mut self, name: &[u8], value: BString, ty: CacheType, help: &[u8]) -> bool {
         let mut entry = self
             .cache()
             .get(name)
@@ -85,15 +87,51 @@ impl Cx<'_> {
         entry.ty = ty;
         entry.help = BString::from(help);
         entry.props.unset(Self::CACHE_PLACEHOLDER);
-        self.insert_cache_entry(name.into(), entry);
+        self.insert_cache_entry(name.into(), entry)
     }
 
     /// Insert a cache entry and record the write if history is enabled.
-    pub fn insert_cache_entry(&mut self, name: BString, entry: CacheEntry) {
+    ///
+    /// If the cache would pass `limits.max_cache_bytes`, report a fatal error, leave the
+    /// cache unchanged, and return `false`.
+    pub fn insert_cache_entry(&mut self, name: BString, entry: CacheEntry) -> bool {
+        if !self.admit_cache_entry(&name, &entry) {
+            return false;
+        }
         self.interp.note_replay_cache_write(&name);
         self.interp
             .record_var_write(&name, crate::VarOp::CacheSet, Some(&entry.value));
         self.cache().insert(name, entry);
+        true
+    }
+
+    /// Insert a cache entry like the raw [`Cache::insert`], after the
+    /// `limits.max_cache_bytes` check of [`Self::insert_cache_entry`].
+    ///
+    /// Commands that compute a cache value from script input use this method when they
+    /// must not add a history record. Report a fatal error and return `false` if the
+    /// cache would pass the limit.
+    pub fn insert_cache_entry_unrecorded(&mut self, name: BString, entry: CacheEntry) -> bool {
+        if !self.admit_cache_entry(&name, &entry) {
+            return false;
+        }
+        self.cache().insert(name, entry);
+        true
+    }
+
+    /// Return `true` if the cache stays within `limits.max_cache_bytes` after an insert
+    /// of `entry` as `name`. Otherwise report a fatal error and return `false`.
+    fn admit_cache_entry(&mut self, name: &[u8], entry: &CacheEntry) -> bool {
+        let limit = self.interp.config.limits.max_cache_bytes;
+        if self.cache().bytes_after_insert(name, entry) <= limit {
+            return true;
+        }
+        if !self.interp.fatal {
+            self.interp
+                .error_here(format!("Cache storage would exceed the {limit}-byte limit.").into());
+            self.interp.fatal = true;
+        }
+        false
     }
 
     /// Record a `set(... CACHE ...)` or `option(...)` declaration that kept an existing value.

@@ -338,6 +338,82 @@ fn project_include_hooks_run_around_the_bootstrap() -> TestResult {
     Ok(())
 }
 
+/// A configure session with a cache byte limit.
+fn interp_with_cache_limit(host: &Arc<PureHost>, max_cache_bytes: usize) -> Interp {
+    Interp::new(
+        InterpConfig {
+            services: Default::default(),
+            host: host.clone(),
+            mode: RunMode::Configure,
+            cmake_root: "/share/cmake-4.5".into(),
+            cmake_command: "/bin/cmake".into(),
+            cwd: "/work".into(),
+            limits: rcmake_base::Limits {
+                max_cache_bytes,
+                ..rcmake_base::Limits::default()
+            },
+            diag: DiagOptions::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        crate::register_all,
+    )
+}
+
+fn assert_cache_refusal(host: &PureHost, limit: usize) {
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains(&format!(
+            "Cache storage would exceed the {limit}-byte limit."
+        )),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn legacy_build_command_respects_the_cache_byte_limit() -> TestResult {
+    let host = new_host();
+    let mut session = interp_with_cache_limit(&host, 64 * 1024);
+    configure(
+        &host,
+        &mut session,
+        "project(P NONE)\nstring(REPEAT y 70000 big)\nset(CMAKE_COMMAND \"${big}\")\nbuild_command(legacy ignored)\n",
+        1,
+    )?;
+    assert_cache_refusal(&host, 64 * 1024);
+    assert!(session.cx().cache().get(b"legacy").is_none());
+    Ok(())
+}
+
+#[test]
+fn project_stops_before_normal_variables_when_the_cache_refuses() -> TestResult {
+    let host = new_host();
+    let mut session = interp_with_cache_limit(&host, 32 * 1024);
+    let name = "p".repeat(40_000);
+    configure(&host, &mut session, &format!("project({name} NONE)\n"), 1)?;
+    assert_cache_refusal(&host, 32 * 1024);
+    assert_eq!(var(&mut session, "PROJECT_NAME"), None);
+    assert_eq!(var(&mut session, &format!("{name}_SOURCE_DIR")), None);
+    Ok(())
+}
+
+#[test]
+fn find_package_stops_before_normal_variables_when_the_cache_refuses() -> TestResult {
+    let host = new_host();
+    let mut session = interp_with_cache_limit(&host, 64 * 1024);
+    let name = "Q".repeat(40_000);
+    configure(
+        &host,
+        &mut session,
+        &format!("project(P NONE)\nfind_package({name} CONFIG QUIET)\n"),
+        1,
+    )?;
+    assert_cache_refusal(&host, 64 * 1024);
+    assert_eq!(var(&mut session, &format!("{name}_FOUND")), None);
+    assert_eq!(var(&mut session, &format!("{name}_CONFIG")), None);
+    Ok(())
+}
+
 #[test]
 fn build_command_matches_cmake_build_syntax() -> TestResult {
     let host = new_host();

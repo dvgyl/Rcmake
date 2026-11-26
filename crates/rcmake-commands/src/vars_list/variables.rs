@@ -186,8 +186,9 @@ fn assign_cache(
             }
         }
     }
-    cx.write_cache(name, value, ty, help);
-    cx.clear_cache_shadow(name);
+    if cx.write_cache(name, value, ty, help) {
+        cx.clear_cache_shadow(name);
+    }
 }
 
 pub(super) fn unset(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {

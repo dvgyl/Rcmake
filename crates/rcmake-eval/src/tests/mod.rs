@@ -7,6 +7,7 @@ mod message_and_errors;
 mod oracle_frontend;
 mod parse_and_recovery;
 mod policies_and_includes;
+mod resource_limits;
 mod scopes_and_callables;
 
 use crate::{
@@ -23,9 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 fn err(msg: &str) -> ExpandError {
-    ExpandError {
-        message: msg.into(),
-    }
+    ExpandError::syntax(msg)
 }
 
 fn expand_until(
@@ -529,21 +528,25 @@ fn updates_parsed_recursion_limit_after_scope_and_host_changes() {
     let initial = interp.recursion_limit();
     host.env_set(limit, Some(b"98"));
     assert_eq!(interp.recursion_limit(), 98);
-    interp.vars.set(limit, " 12".into());
+    let no_limit = usize::MAX;
+    assert_eq!(interp.vars.set(limit, " 12".into(), no_limit), Ok(()));
     assert_eq!(interp.recursion_limit(), 12);
     interp.vars.push();
-    assert!(interp.vars.set_parent(limit, Some("23".into())));
+    assert_eq!(
+        interp.vars.set_parent(limit, Some("23".into()), no_limit),
+        Ok(true)
+    );
     assert_eq!(interp.recursion_limit(), 12);
-    interp.vars.unset(limit);
+    assert_eq!(interp.vars.unset(limit, no_limit), Ok(()));
     assert_eq!(interp.recursion_limit(), 98);
     interp.vars.pop();
     assert_eq!(interp.recursion_limit(), 23);
     interp.vars.push();
-    interp.vars.set(limit, "bad".into());
+    assert_eq!(interp.vars.set(limit, "bad".into(), no_limit), Ok(()));
     assert_eq!(interp.recursion_limit(), initial);
-    interp.vars.propagate_capture();
+    assert!(interp.vars.propagate_capture(no_limit).is_ok());
     assert_eq!(interp.recursion_limit(), initial);
-    interp.vars.unset(limit);
+    assert_eq!(interp.vars.unset(limit, no_limit), Ok(()));
     host.env_set(limit, Some(b"19"));
     assert_eq!(interp.recursion_limit(), 19);
     interp

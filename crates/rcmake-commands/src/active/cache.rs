@@ -145,8 +145,11 @@ fn import_cache(
                 continue;
             }
             if let Some(key) = entry.key.strip_suffix(b"-STRINGS") {
-                if let Some(owner) = cx.cache().get_mut(key) {
+                if let Some(mut owner) = cx.cache().get(key).cloned() {
                     owner.props.set("STRINGS".into(), entry.value.into());
+                    if !cx.insert_cache_entry_unrecorded(key.into(), owner) {
+                        return;
+                    }
                 }
                 continue;
             }
@@ -155,7 +158,10 @@ fn import_cache(
         let help = format!(
             "DO NOT EDIT, {key} loaded from external file.  To change this value edit this file: {filename}"
         );
-        cx.cache().insert(key, internal(entry.value, help.into()));
+        // A script chooses the imported file, so each entry passes the cache byte limit.
+        if !cx.insert_cache_entry_unrecorded(key, internal(entry.value, help.into())) {
+            return;
+        }
     }
     for (key, help) in [
         (
@@ -167,8 +173,10 @@ fn import_cache(
             "Minor version of cmake used to create the current loaded cache",
         ),
     ] {
-        if !cx.cache().contains(key.as_bytes()) {
-            cx.cache().insert(key.into(), internal(b"0", help.into()));
+        if !cx.cache().contains(key.as_bytes())
+            && !cx.insert_cache_entry_unrecorded(key.into(), internal(b"0", help.into()))
+        {
+            return;
         }
     }
 }

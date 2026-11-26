@@ -50,9 +50,11 @@ impl Interp {
     }
 
     /// `PARENT_SCOPE` for one variable (`cmMakefile::RaiseScope(var, def)`).
-    pub(crate) fn raise_var(&mut self, name: &[u8], value: Option<BString>) {
+    ///
+    /// Return `false` after a fatal error if the write would pass the live variable budget.
+    pub(crate) fn raise_var(&mut self, name: &[u8], value: Option<BString>) -> bool {
         if name.is_empty() {
-            return;
+            return true;
         }
         let watched = self.hooks.watches.contains_key(name).then(|| value.clone());
         self.record_var_write(
@@ -60,15 +62,22 @@ impl Interp {
             crate::VarOp::ParentScope,
             value.as_ref().map(|v| v.as_slice()),
         );
-        if !self.vars.set_parent(name, value) {
-            self.issue_here(
-                MessageKind::AuthorWarning,
-                Effect::None,
-                Some(DiagCategory::Author),
-                cat(&[b"Cannot set \"", name, b"\": current scope has no parent."]),
-                true,
-            );
-            return;
+        match self.vars.set_parent(name, value, self.live_limit()) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.issue_here(
+                    MessageKind::AuthorWarning,
+                    Effect::None,
+                    Some(DiagCategory::Author),
+                    cat(&[b"Cannot set \"", name, b"\": current scope has no parent."]),
+                    true,
+                );
+                return true;
+            }
+            Err(_) => {
+                self.report_variable_budget();
+                return false;
+            }
         }
         self.record_variable_access(name);
         if let Some(value) = watched {
@@ -78,13 +87,21 @@ impl Interp {
                 value.as_ref().map(|v| v.as_slice()),
             );
         }
+        true
     }
 
-    /// `cmMakefile::RaiseScope(vector)`.
+    /// `cmMakefile::RaiseScope(vector)`. The writes for all names are checked against the
+    /// live variable budget before the first value is copied, so a refusal changes nothing.
     pub(crate) fn raise_vars(&mut self, names: &[BString]) {
+        if self.vars.preflight_raise(names, self.live_limit()).is_err() {
+            self.report_variable_budget();
+            return;
+        }
         for name in names {
             let value = self.vars.get(name).cloned();
-            self.raise_var(name, value);
+            if !self.raise_var(name, value) {
+                break;
+            }
         }
     }
 

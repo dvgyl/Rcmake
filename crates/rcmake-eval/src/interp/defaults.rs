@@ -108,7 +108,9 @@ impl Interp {
             defs.push((var, cwd.clone()));
         }
         for (k, v) in defs {
-            self.vars.set(k, v);
+            if !self.store_var(k, v) {
+                break;
+            }
         }
     }
 }

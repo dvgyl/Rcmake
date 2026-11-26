@@ -825,16 +825,16 @@ fn compiler_advice(lang: &[u8], env_var: Option<&[u8]>) -> BString {
 /// `cmMakefile::AddCacheDefinition` for a value that the bootstrap computes.
 pub(super) fn add_cache(cx: &mut Cx<'_>, name: &[u8], value: BString, ty: CacheType, help: &str) {
     let advanced = cx.cache().get(name).is_some_and(|entry| entry.advanced);
-    cx.cache().insert(
-        name.into(),
-        CacheEntry {
-            value,
-            ty,
-            help: help.into(),
-            advanced,
-            props: Default::default(),
-        },
-    );
+    let entry = CacheEntry {
+        value,
+        ty,
+        help: help.into(),
+        advanced,
+        props: Default::default(),
+    };
+    if !cx.insert_cache_entry_unrecorded(name.into(), entry) {
+        return;
+    }
     if cx.var_normal_only(name).is_some() && cx.policy(PolicyId::new(126)) != PolicyStatus::New {
         cx.unset_var(name);
     }

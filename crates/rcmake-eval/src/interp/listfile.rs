@@ -41,14 +41,16 @@ impl Interp {
         let abs = collapse_full_path(&rcmake_host::path::from_native_cmake(path), &cwd);
 
         if standalone {
-            self.vars.set(b"CMAKE_SCRIPT_MODE_FILE", abs.clone());
+            self.store_var(b"CMAKE_SCRIPT_MODE_FILE", abs.clone());
             // The script-mode root snapshot has no listfile.
             self.listfiles.push(Arc::from(&b""[..]));
         }
         let argc = self.config.script_args.len();
-        self.vars.set(b"CMAKE_ARGC", argc.to_string().into());
+        self.store_var(b"CMAKE_ARGC", argc.to_string().into());
         for (i, arg) in self.config.script_args.clone().into_iter().enumerate() {
-            self.vars.set(format!("CMAKE_ARGV{i}").as_bytes(), arg);
+            if !self.store_var(format!("CMAKE_ARGV{i}").as_bytes(), arg) {
+                break;
+            }
         }
 
         if !self.is_regular_file(&abs) {
@@ -216,10 +218,10 @@ impl Interp {
         self.render.relative_base = (!probe).then(|| src_abs.clone());
 
         for var in [b"CMAKE_SOURCE_DIR".as_slice(), b"CMAKE_CURRENT_SOURCE_DIR"] {
-            self.vars.set(var, src_abs.clone());
+            self.store_var(var, src_abs.clone());
         }
         for var in [b"CMAKE_BINARY_DIR".as_slice(), b"CMAKE_CURRENT_BINARY_DIR"] {
-            self.vars.set(var, bin_abs.clone());
+            self.store_var(var, bin_abs.clone());
         }
 
         let _ = self.config.host.create_dir_all(&bin_native);

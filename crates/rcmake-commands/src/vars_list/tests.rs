@@ -15,10 +15,15 @@ struct Script {
 
 impl Script {
     fn new(defines: Vec<CacheDefine>) -> Self {
+        Self::with_limits(defines, rcmake_base::Limits::default())
+    }
+
+    fn with_limits(defines: Vec<CacheDefine>, limits: rcmake_base::Limits) -> Self {
         let host = Arc::new(PureHost::default());
         let interp = Interp::new(
             InterpConfig {
                 defines,
+                limits,
                 ..InterpConfig::new(
                     host.clone(),
                     RunMode::Script,
@@ -764,4 +769,108 @@ fn errors_match_oracle_status_text() {
             .join(" ");
         assert_eq!(body, expected, "{source}");
     }
+}
+
+#[test]
+fn list_append_and_prepend_stop_at_the_exact_value_limit() {
+    let limits = rcmake_base::Limits {
+        max_value_bytes: 16,
+        ..rcmake_base::Limits::default()
+    };
+    let mut state = Script::with_limits(Vec::new(), limits.clone());
+    // Each result has exactly 16 bytes, so each fits.
+    state.success(
+        "set(L 0123456789)\nlist(APPEND L abcde)\nset(P 0123456789)\nlist(PREPEND P abcde)\n",
+    );
+    state.var("L", "0123456789;abcde");
+    state.var("P", "abcde;0123456789");
+
+    let mut state = Script::with_limits(Vec::new(), limits.clone());
+    assert_ne!(state.run("set(L 0123456789abcdef)\nlist(APPEND L x)\n"), 0);
+    assert!(
+        state
+            .stderr()
+            .contains("Variable value exceeded maximum allowed byte length."),
+        "{}",
+        state.stderr()
+    );
+    state.var("L", "0123456789abcdef");
+
+    let mut state = Script::with_limits(Vec::new(), limits);
+    assert_ne!(state.run("set(P 0123456789abcdef)\nlist(PREPEND P x)\n"), 0);
+    state.var("P", "0123456789abcdef");
+}
+
+fn cache_value(state: &mut Script, name: &[u8]) -> Option<BString> {
+    state
+        .interp
+        .cx()
+        .cache()
+        .get(name)
+        .map(|entry| entry.value.clone())
+}
+
+#[test]
+fn cache_property_writes_stop_at_the_cache_byte_limit() {
+    let limits = rcmake_base::Limits {
+        max_cache_bytes: 4096,
+        ..rcmake_base::Limits::default()
+    };
+    let mut state = Script::with_limits(Vec::new(), limits.clone());
+    assert_ne!(
+        state.run(
+            "set(C x CACHE STRING \"\")\nstring(REPEAT y 5000 big)\nset_property(CACHE C PROPERTY VALUE \"${big}\")\n",
+        ),
+        0
+    );
+    assert!(
+        state
+            .stderr()
+            .contains("Cache storage would exceed the 4096-byte limit."),
+        "{}",
+        state.stderr()
+    );
+    assert_eq!(cache_value(&mut state, b"C"), Some(BString::from("x")));
+
+    let mut state = Script::with_limits(Vec::new(), limits);
+    assert_ne!(
+        state.run(
+            "set(C x CACHE STRING \"\")\nstring(REPEAT y 2000 part)\nset_property(CACHE C APPEND_STRING PROPERTY VALUE \"${part}\")\nset_property(CACHE C APPEND_STRING PROPERTY VALUE \"${part}\")\n",
+        ),
+        0
+    );
+    assert!(
+        state
+            .stderr()
+            .contains("Cache storage would exceed the 4096-byte limit."),
+        "{}",
+        state.stderr()
+    );
+    assert_eq!(
+        cache_value(&mut state, b"C").map(|value| value.len()),
+        Some(2001)
+    );
+}
+
+#[test]
+fn get_filename_component_cache_respects_the_cache_byte_limit() {
+    let limits = rcmake_base::Limits {
+        max_cache_bytes: 4096,
+        ..rcmake_base::Limits::default()
+    };
+    let mut state = Script::with_limits(Vec::new(), limits);
+    assert_ne!(
+        state.run("string(REPEAT y 5000 big)\nget_filename_component(V \"${big}\" NAME CACHE)\n",),
+        0
+    );
+    assert!(
+        state
+            .stderr()
+            .contains("Cache storage would exceed the 4096-byte limit."),
+        "{}",
+        state.stderr()
+    );
+    // The refused entry is not stored, and no normal variable takes its place.
+    assert_eq!(cache_value(&mut state, b"V"), None);
+    state.absent("V");
 }

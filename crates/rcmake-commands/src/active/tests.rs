@@ -183,6 +183,49 @@ fn file_api_rejects_invalid_queries_before_writing_files() -> TestResult {
 }
 
 #[test]
+fn load_cache_imports_stop_at_the_cache_byte_limit() -> TestResult {
+    let cwd = PathBuf::from("/work");
+    let exe = PathBuf::from("/bin/cmake");
+    let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
+    let mut interp = Interp::new(
+        InterpConfig {
+            limits: rcmake_base::Limits {
+                max_cache_bytes: 64 * 1024,
+                ..rcmake_base::Limits::default()
+            },
+            ..InterpConfig::new(
+                host.clone(),
+                RunMode::Configure,
+                "/share/cmake-4.5",
+                exe,
+                cwd,
+            )
+        },
+        crate::register_all,
+    );
+    let big = "y".repeat(40_000);
+    host.seed_file(
+        Path::new("/work/other/CMakeCache.txt"),
+        format!("BIG1:STRING={big}\nBIG2:STRING={big}\n").as_bytes(),
+    )?;
+    configure(&host, &mut interp, "load_cache(other)\n", 1)?;
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("Cache storage would exceed the 65536-byte limit."),
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let mut cx = interp.cx();
+    assert!(cx.cache().get(b"BIG1").is_some());
+    assert!(
+        cx.cache().get(b"BIG2").is_none(),
+        "the import stops at the refused entry"
+    );
+    Ok(())
+}
+
+#[test]
 fn cache_loads_prefixed_variables_and_legacy_internal_entries() -> TestResult {
     let cache = b"KEEP:STRING=first\nKEEP:STRING=' last  '\n\"A:B\":PATH=raw\nINCLUDED:INTERNAL=yes\nHIDDEN:INTERNAL=no\nSKIP:BOOL=ON\n";
     let (host, mut interp) = context(RunMode::Configure);

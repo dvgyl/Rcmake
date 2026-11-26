@@ -22,6 +22,19 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let raw = cx.var(name);
     if matches!(command, b"APPEND" | b"PREPEND") {
         if !rest.is_empty() {
+            // Check the exact joined size before the value grows. A separator goes between
+            // two items, and between the items and a nonempty existing value.
+            let existing_len = raw.as_ref().map_or(0, |raw| raw.len());
+            let separators = rest.len() - 1 + usize::from(existing_len > 0);
+            let joined = rest
+                .iter()
+                .try_fold(existing_len, |len, item| len.checked_add(bytes(item).len()))
+                .and_then(|len| len.checked_add(separators));
+            if joined.is_none_or(|len| len > cx.limits().max_value_bytes) {
+                return Err(CmdError::status(
+                    "Variable value exceeded maximum allowed byte length.",
+                ));
+            }
             let items = rest.iter().map(bytes);
             let mut existing = raw.unwrap_or_default();
             let has_value = !existing.is_empty();
@@ -108,7 +121,16 @@ fn change_list(
     rest: &[ExpandedArg],
     raw: Option<&BString>,
 ) -> CmdResult {
-    let mut items = raw.map_or_else(Vec::new, |raw| list::split(raw, list::Empty::Keep));
+    let mut items = Vec::new();
+    if let Some(raw) = raw {
+        let limits = cx.limits();
+        list::ListBudget::new(
+            limits.max_command_arguments,
+            limits.max_command_argument_bytes,
+        )
+        .split(raw, list::Empty::Keep, &mut items)
+        .map_err(|limit| CmdError::status(limit.to_string()))?;
+    }
     match (command, rest) {
         (b"INSERT", [at, values @ ..]) if !values.is_empty() => {
             let at = checked_index(list_number(cx, bytes(at))?, items.len(), true)?;

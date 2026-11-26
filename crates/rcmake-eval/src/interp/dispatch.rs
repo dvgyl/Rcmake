@@ -5,7 +5,7 @@ use rcmake_base::{BString, fold_command_name, truth};
 use rcmake_diag::{
     Backtrace, DiagCategory, Diagnostic, Frame, FrameKind, Location, PolicyId, PolicyStatus,
 };
-use rcmake_expr::{CondEnv, CondError, ExpandEnv, ExpandedArg};
+use rcmake_expr::{ArgumentBudget, CondEnv, CondError, ExpandEnv, ExpandedArg};
 use rcmake_host::Host;
 use rcmake_regex::{Captures, Regex, RegexError};
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
@@ -21,7 +21,8 @@ use crate::{
     UserCommand, UserCommandKind,
 };
 
-struct CommandExpansion<'a>(&'a mut Interp);
+/// Expansion environment of a command call and the argument bytes already expanded.
+struct CommandExpansion<'a>(&'a mut Interp, usize);
 
 impl ExpandEnv for CommandExpansion<'_> {
     fn var(&mut self, name: &[u8]) -> Option<BString> {
@@ -47,6 +48,12 @@ impl ExpandEnv for CommandExpansion<'_> {
 
     fn current_line(&self) -> u32 {
         self.0.current_line()
+    }
+
+    fn argument_budget(&self) -> ArgumentBudget {
+        let mut budget = self.0.argument_budget();
+        budget.used_bytes = self.1;
+        budget
     }
 }
 
@@ -210,7 +217,9 @@ impl Interp {
                 }
             })
             .unwrap_or(self.config.limits.max_recursion);
-        configured.min(HARD_RECURSION_CEILING)
+        configured
+            .min(HARD_RECURSION_CEILING)
+            .min(self.config.limits.max_recursion_ceiling)
     }
 
     fn parse_recursion_fallback(&self, value: &[u8]) -> Option<u32> {
@@ -302,11 +311,11 @@ impl Interp {
         {
             self.fatal = true;
             Err(CmdError::Reported)
-        } else if self.depth > limit {
+        } else if let Some(message) = crate::stack_guard::recursion_error(self.depth, limit) {
             self.recursion_exceeded = true;
             let local = self.local_command_backtrace();
             let backtrace = core::mem::replace(&mut self.bt, local);
-            self.fatal_here(format!("Maximum recursion depth of {limit} exceeded").into());
+            self.fatal_here(message);
             self.bt = backtrace;
             Err(CmdError::Reported)
         } else if let Some(profiler) = self.command_profiler.clone() {
@@ -383,6 +392,14 @@ impl Interp {
         Err(CmdError::Reported)
     }
 
+    /// Argument limits for one command call from the configured limits.
+    pub(crate) fn argument_budget(&self) -> ArgumentBudget {
+        ArgumentBudget::new(
+            self.config.limits.max_command_arguments,
+            self.config.limits.max_command_argument_bytes,
+        )
+    }
+
     /// Expand arguments with `rcmake_expr::expand_args`, one argument at a time
     /// (`cmMakefile::ExpandArguments`). An expansion error is fatal and reads
     /// `Syntax error in cmake code at <file>:<line> when parsing string <arg> <error>`.
@@ -390,6 +407,7 @@ impl Interp {
         let mut out = Vec::new();
         let expand = self.frontend.expand;
         let mut failed = false;
+        let mut budget = self.argument_budget();
         for arg in args {
             // Short literal arguments need no variable lookups, escape processing,
             // or list splitting. Keep their original kind and line number.
@@ -400,6 +418,10 @@ impl Interp {
                 })
             {
                 if !text.is_empty() || arg.kind != ArgKind::Unquoted {
+                    if let Err(e) = budget.take(text.len()) {
+                        self.fatal_here(e.message);
+                        return Err(CmdError::Reported);
+                    }
                     out.push(ExpandedArg {
                         value: arg.text.clone(),
                         kind: arg.kind,
@@ -408,14 +430,27 @@ impl Interp {
                 }
                 continue;
             }
-            if let Err(e) = expand(
+            let before = out.len();
+            match expand(
                 core::slice::from_ref(arg),
-                &mut CommandExpansion(self),
+                &mut CommandExpansion(self, budget.used_bytes),
                 &mut out,
             ) {
-                let body = self.syntax_error_text(arg, e.message);
-                self.fatal_here(body);
-                failed = true;
+                Ok(()) => {
+                    let added = out.iter().skip(before).map(|arg| arg.value.len());
+                    budget.used_bytes = added.fold(budget.used_bytes, usize::saturating_add);
+                    budget.used_arguments = out.len();
+                }
+                // A resource limit stops the command before more arguments are expanded.
+                Err(e) if e.is_resource_limit() => {
+                    self.fatal_here(e.message);
+                    return Err(CmdError::Reported);
+                }
+                Err(e) => {
+                    let body = self.syntax_error_text(arg, e.message);
+                    self.fatal_here(body);
+                    failed = true;
+                }
             }
         }
         if failed {
@@ -430,7 +465,7 @@ impl Interp {
         args: &[ExpandedArg],
     ) -> Result<bool, CondError> {
         self.observe_replay_condition(args);
-        (self.frontend.cond)(args, &mut CommandExpansion(self))
+        (self.frontend.cond)(args, &mut CommandExpansion(self, 0))
     }
 
     /// `ExpandVariablesInStringImpl` error text for an argument of the command on top of

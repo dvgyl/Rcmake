@@ -102,6 +102,46 @@ pub(crate) fn replace_all(hay: &[u8], needle: &[u8], rep: &[u8]) -> Vec<u8> {
     out
 }
 
+/// [`replace_all`] if the result has at most `max` bytes. Return `None` before any copy
+/// if the result would be larger.
+pub(crate) fn replace_all_bounded(
+    hay: &[u8],
+    needle: &[u8],
+    rep: &[u8],
+    max: usize,
+) -> Option<Vec<u8>> {
+    let count = count_matches(hay, needle);
+    let len = hay
+        .len()
+        .checked_sub(count.checked_mul(needle.len())?)?
+        .checked_add(count.checked_mul(rep.len())?)?;
+    if len > max {
+        return None;
+    }
+    if count == 0 {
+        return Some(hay.to_vec());
+    }
+    Some(replace_all(hay, needle, rep))
+}
+
+/// Count the matches that [`replace_all`] replaces: left to right, without overlap.
+fn count_matches(hay: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    while i < hay.len() {
+        if hay.get(i..i + needle.len()) == Some(needle) {
+            count += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
 /// Double every backslash (CMP0219 `NEW` macro argument escaping).
 pub(crate) fn escape_backslashes(value: &[u8]) -> BString {
     BString::from(replace_all(value, b"\\", b"\\\\"))

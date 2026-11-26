@@ -67,16 +67,16 @@ fn legacy(cx: &mut Cx<'_>, define: &[u8]) -> CmdResult {
     if cx.var_defined(define) {
         return Ok(Flow::Normal);
     }
-    cx.cache().insert(
-        define.into(),
-        CacheEntry {
-            value: command,
-            ty: CacheType::String,
-            help: "Command used to build entire project from the command line.".into(),
-            advanced: false,
-            props: Default::default(),
-        },
-    );
+    let entry = CacheEntry {
+        value: command,
+        ty: CacheType::String,
+        help: "Command used to build entire project from the command line.".into(),
+        advanced: false,
+        props: Default::default(),
+    };
+    if !cx.insert_cache_entry(define.into(), entry) {
+        return Err(CmdError::Reported);
+    }
     if cx.policy(rcmake_diag::PolicyId::new(126)) != rcmake_diag::PolicyStatus::New {
         cx.unset_var(define);
     }

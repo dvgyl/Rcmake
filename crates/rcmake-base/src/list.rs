@@ -42,6 +42,99 @@ pub fn split_into(v: &[u8], empty: Empty, out: &mut Vec<BString>) {
     split_with_empty_input(v, empty, EmptyInput::ZeroElements, out);
 }
 
+/// A list operation would hold more elements or bytes than its [`ListBudget`] allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListLimit {
+    /// More elements than this maximum.
+    Elements(usize),
+    /// More bytes than this maximum.
+    Bytes(usize),
+}
+
+impl core::fmt::Display for ListLimit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Elements(max) => write!(f, "The list operation needs more than {max} elements."),
+            Self::Bytes(max) => write!(f, "The list operation needs more than {max} bytes."),
+        }
+    }
+}
+
+/// Element and byte budget for the lists that one command splits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListBudget {
+    max_elements: usize,
+    max_bytes: usize,
+    elements: usize,
+    bytes: usize,
+}
+
+impl ListBudget {
+    /// Permit at most `max_elements` elements and `max_bytes` bytes in total.
+    #[must_use]
+    pub const fn new(max_elements: usize, max_bytes: usize) -> Self {
+        Self {
+            max_elements,
+            max_bytes,
+            elements: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Charge `bytes` before a copy of that size.
+    ///
+    /// # Errors
+    ///
+    /// Return [`ListLimit::Bytes`] and charge nothing if the total would pass the maximum.
+    pub fn charge_bytes(&mut self, bytes: usize) -> Result<(), ListLimit> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|&total| total <= self.max_bytes)
+            .ok_or(ListLimit::Bytes(self.max_bytes))?;
+        Ok(())
+    }
+
+    /// Reserve one element of `bytes` bytes before its copy.
+    ///
+    /// # Errors
+    ///
+    /// Return the limit that the element would pass, and reserve nothing.
+    pub fn take(&mut self, bytes: usize) -> Result<(), ListLimit> {
+        if self.elements >= self.max_elements {
+            return Err(ListLimit::Elements(self.max_elements));
+        }
+        self.charge_bytes(bytes)?;
+        self.elements += 1;
+        Ok(())
+    }
+
+    /// Split `v` like [`split_into`] and append the elements to `out`.
+    ///
+    /// The bytes of `v` are charged before the split, and each element before its copy.
+    ///
+    /// # Errors
+    ///
+    /// Return the limit that the split would pass. The elements before the limit stay in
+    /// `out`.
+    pub fn split(
+        &mut self,
+        v: &[u8],
+        empty: Empty,
+        out: &mut Vec<BString>,
+    ) -> Result<(), ListLimit> {
+        self.charge_bytes(v.len())?;
+        for element in iter(v, empty) {
+            if self.elements >= self.max_elements {
+                return Err(ListLimit::Elements(self.max_elements));
+            }
+            self.elements += 1;
+            out.push(BString::from(element.into_owned()));
+        }
+        Ok(())
+    }
+}
+
 /// Split `v` into CMake list elements with explicit empty-whole-input behavior.
 pub fn split_with_empty_input(
     v: &[u8],
@@ -192,6 +285,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_split_matches_split_into_and_stops_at_each_limit() {
+        let mut unbounded = Vec::new();
+        split_into(br"a;;b\;c;d", Empty::Drop, &mut unbounded);
+        let mut bounded = Vec::new();
+        let mut budget = ListBudget::new(3, 64);
+        assert_eq!(
+            budget.split(br"a;;b\;c;d", Empty::Drop, &mut bounded),
+            Ok(())
+        );
+        assert_eq!(bounded, unbounded);
+
+        let mut out = vec![BString::from("x")];
+        assert_eq!(
+            ListBudget::new(2, 64).split(b"a;b;c", Empty::Keep, &mut out),
+            Err(ListLimit::Elements(2))
+        );
+        assert_eq!(out, ["x", "a", "b"]);
+
+        let mut budget = ListBudget::new(100, 8);
+        assert_eq!(budget.split(b"a;b", Empty::Keep, &mut Vec::new()), Ok(()));
+        let mut untouched = Vec::new();
+        assert_eq!(
+            budget.split(b"c;d;e;f", Empty::Keep, &mut untouched),
+            Err(ListLimit::Bytes(8))
+        );
+        assert!(untouched.is_empty());
+        assert_eq!(budget.charge_bytes(usize::MAX), Err(ListLimit::Bytes(8)));
+    }
 
     #[test]
     fn split_keep_and_drop_match_cmake_oracle() {

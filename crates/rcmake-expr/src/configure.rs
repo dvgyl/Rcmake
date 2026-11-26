@@ -83,7 +83,9 @@ fn configure_lines(
             .saturating_add(1)
             > limit
         {
-            return Err(error("Template expansion exceeded the value size limit."));
+            return Err(ExpandError::resource_limit(
+                "Template expansion exceeded the value size limit.",
+            ));
         }
         output.extend_from_slice(&expanded);
         output.push(b'\n');

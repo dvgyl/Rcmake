@@ -334,7 +334,7 @@ The CMake 4.5.1 oracle cannot create a Visual Studio generator on macOS or Linux
 2. **Safe-Rust fuzzing only (locked).** `crates/rcmake-fuzz` is the only fuzzer. It uses the stable toolchain, safe Rust (`#![forbid(unsafe_code)]`), and no new dependencies. Rcmake does not use `libfuzzer-sys` or `cargo-fuzz`, and has no out-of-workspace `fuzz/` directory, so the repository has no `NCSA`-licensed dependency.
    - Harness contract: each input runs on its own thread with an 8 MiB stack, inside `catch_unwind`, with a wall-clock budget (default 2 s). A caught panic or a timeout is a failure. The SplitMix64 generator `rcmake_fuzz::Rng` makes each failure replayable from its seed.
    - Binary: `rcmake-fuzz <surface> [--seed <s>] [--iterations <n>] [--budget-ms <ms>]`. Surfaces: `syntax`, `expr`, `regex`, `genex`, `json`, `presets`, `cps`, `archive`, `path`, `tolerant`, `binfmt`, `diagnostics`, `fortran`, and `store-frame`.
-   - `rcmake_base::Limits::fuzz()` gives stricter caps for the harness only (16 MiB values and file reads, 1,000,000 regex steps, 2 s per input). Production code always uses `Limits::default()`, which never rejects input that CMake 4.5.1 accepts.
+   - `rcmake_base::Limits::fuzz()` gives stricter caps for the harness only (16 MiB values and file reads, 1,000,000 regex steps, 2 s per input). Production code always uses `Limits::default()`, which rejects only input that would exhaust memory or time (ADR-036, ADR-037).
    - Gates: the release gate runs 1,000,000 iterations for each surface with zero failures. `scripts/gate.sh` gets a 10,000-iteration smoke mode. Each crash becomes a regression test in the owning crate before the fix lands.
    - The `adversarial_fuzz.rs` integration suite stays as the in-tree regression net.
 3. **Host primitives for file locks, safe publication, and streaming checksums.**
@@ -772,3 +772,114 @@ Frame footers stay plain SHA-256 values with no key. When no other user can
 write in or replace the root, a key gives no more protection.
 
 Sources: [private directory checks](../crates/rcmake-store/src/private_dir.rs), [store](../crates/rcmake-store/src/lib.rs), [Git mirror](../crates/rcmake-fetch/src/git.rs), [host trait](../crates/rcmake-host/src/lib.rs), and [memo host](../crates/rcmake-host/src/memo.rs).
+
+## ADR-036: Command argument caps and live variable budget
+
+- **Status:** Accepted
+
+Each value is limited to 256 MiB, but several paths could still use all
+memory:
+
+- An unquoted argument whose value has 134 million elements (for example a
+  256 MiB value of `a;a;…`) expands to one argument for each element. That is
+  about 8 to 12 GB.
+- A command can hold many large arguments that each pass the value limit.
+- A script can copy a large value into many variables, into enclosing scopes,
+  into macro bodies, or into cache entries.
+
+`Limits` has these caps:
+
+| Cap | Default | Fuzz | Largest known real use |
+| --- | --- | --- | --- |
+| `max_command_arguments` | 16,777,216 elements | 1,048,576 | About 200,000 files from `file(GLOB_RECURSE)` on LLVM or Qt sources |
+| `max_command_argument_bytes` | 512 MiB | 32 MiB | About 20 MB for such a glob |
+| `max_live_variable_bytes` | 4 GiB (1 GiB on 32-bit targets) | 256 MiB | About 20 MB for a large configure (LLVM, Qt 6, VTK) |
+| `max_cache_bytes` | 1 GiB | 64 MiB | A few MB for a large `CMakeCache.txt` |
+
+Each cap is more than 10 times larger than the largest known real use, so
+valid projects do not change.
+
+**Arguments.** The evaluator reserves each argument in one budget for the
+command call before it copies the argument. This includes short literal
+arguments and each element of a split list. A resource limit (argument count,
+argument bytes, the expansion value size, or the expansion nesting depth) is a
+typed error (`ExpandErrorKind::ResourceLimit`). It stops the command with a
+fatal error, for example `Command arguments expanded to more than 16777216
+elements.`, and no later argument is expanded. A syntax error still continues
+to the later arguments, as CMake does.
+
+**Lists.** One `foreach` plan has one budget with the same caps. It charges
+the `ITEMS` copies, the elements of named `LISTS` and `ZIP_LISTS`, and the
+generated `ZIP_LISTS` variable names (`<prefix>_<n>`, also for lists that are
+not defined). The names are charged before they are made. A `ZIP_LISTS` loop
+with no iteration saves nothing. Otherwise it saves the previous value of each
+distinct loop variable once and reserves the saved bytes in the temporary
+budget (see **Calls**) before it copies them. Each saved value releases its
+reservation when it moves back into its variable. The `list()`
+subcommands that split a whole list use the same caps. `list(APPEND)` and
+`list(PREPEND)` check the exact joined size against the value limit before the
+value grows.
+
+**Variables.** The variable stack keeps an estimate of the bytes of all active
+bindings in all scopes. One binding costs its name length, its value length,
+and 64 bytes. An unset binding costs its name length and 64 bytes. The
+estimate does not include allocator overhead, so it is not the total memory of
+the process. Every write is checked at the storage boundary before it changes
+anything: set, unset, `PARENT_SCOPE`, `block(PROPAGATE)`, `return(PROPAGATE)`,
+language scope propagation, and the direct writes of the evaluator. The
+arithmetic is checked: the cost of a replaced binding is subtracted first, then
+the new cost is added, and an overflow refuses the write. Bulk writes check
+their projected totals before they copy any value: captured scope propagation
+and `PARENT_SCOPE` check the total after the bulk write. The multi-name
+propagation of `return(PROPAGATE)` and `block(PROPAGATE)` checks the total after
+each write in caller order, because a later name can free bytes that an earlier
+write needs. So when the preflight refuses a propagation, no name changes. Variable watches
+run between the writes of a multi-name propagation. A watch that writes
+variables can change the totals after the preflight. Each later write is then
+checked again at the storage boundary, and a refusal there stops the
+propagation, so the names before it stay committed. A refused write reports `Total variable storage would exceed the
+4294967296-byte limit.` and stops.
+
+**Calls.** Active calls hold a shared reservation of temporary bytes on the
+evaluator, in the same budget as the variables. Variable writes see only the
+room that the reservation leaves. A macro call reserves these copies before it
+makes them:
+
+- the argument values, `ARGN`, and `ARGV`, with room for CMP0219 to double each
+  backslash
+- the replacement patterns (`${<param>}` and `${ARGV<n>}`)
+- the slots of the copied command array, before the array is allocated
+- for each command of the copied body: both spellings of the command name, the
+  argument slots, and the bracket arguments
+- each substituted argument, sized before the substitution builds it
+
+Nested macros add to the same reservation, and each call releases its part
+when it returns. The copied body stays reserved while it runs. A function call
+checks the projected cost of `ARGV<n>`, the parameters, `ARGV`, and `ARGN`
+before it copies the arguments, and stops at the first refused binding. The
+joined `ARGV` and `ARGN` values must fit the value limit.
+
+**Cache.** The cache keeps an estimate of the bytes of all entries: name,
+value, help text, additional properties (such as `STRINGS`), and 128 bytes.
+Every cache write that a script command makes checks the projected total
+against `max_cache_bytes` before the entry changes, and a refusal stops the
+related variable update. `find_package()` and `project()` stop the command at
+the refused entry, before they change any related normal variable:
+
+- `Cx::insert_cache_entry`, with a history record: `set(CACHE)`, `option()`,
+  `mark_as_advanced` placeholders, `get_filename_component(... CACHE)`, and the
+  legacy `build_command(<cachevar> <makecommand>)`
+- `Cx::insert_cache_entry_unrecorded`, with the same check and no history
+  record: `site_name()`, `project()` values, `enable_language()` results,
+  `try_compile()` and `try_run()` results, `find_package()` `<Pkg>_DIR`,
+  generated target GUIDs, and each entry and `STRINGS` property that
+  `load_cache()` imports (the import stops at the first refused entry)
+- `set_property(CACHE ...)` for every property, with `APPEND` and
+  `APPEND_STRING`
+
+Known limits: the caps do not count directory variable snapshots or target and
+directory properties. Cache entries that come from the command line, from the
+`CMakeCache.txt` of the build tree at startup, or from the evaluator setup use
+the raw cache API without the check. File-read limits bound that input.
+
+Sources: [limits](../crates/rcmake-base/src/limits.rs), [list budget](../crates/rcmake-base/src/list.rs), [argument expansion](../crates/rcmake-expr/src/expand.rs), [command dispatch](../crates/rcmake-eval/src/interp/dispatch.rs), [foreach](../crates/rcmake-eval/src/flow/foreach.rs), [variable stack](../crates/rcmake-eval/src/scope.rs), [function and macro calls](../crates/rcmake-eval/src/interp/calls.rs), [cache](../crates/rcmake-model/src/lib.rs), and [cache properties](../crates/rcmake-commands/src/policy_misc/properties/set.rs).

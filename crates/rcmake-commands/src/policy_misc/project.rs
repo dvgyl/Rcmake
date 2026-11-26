@@ -98,23 +98,26 @@ fn configure_project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 
     let source = path::from_native(&cx.current_source_dir());
     let binary = path::from_native(&cx.current_binary_dir());
+    set_top_level(cx, b"CMAKE_PROJECT_NAME", name, top_level)?;
     cx.set_var(b"PROJECT_NAME", (*name).into());
     cx.directory_props()
         .set("_RCMAKE_PROJECT_NAME".into(), (*name).into());
-    set_top_level(cx, b"CMAKE_PROJECT_NAME", name, top_level);
     let top_level_value = if top_level { b"ON".as_slice() } else { b"OFF" };
     for (key, value) in [
         (b"_SOURCE_DIR".as_slice(), source.as_slice()),
         (b"_BINARY_DIR", binary.as_slice()),
         (b"_IS_TOP_LEVEL", top_level_value),
     ] {
-        cx.set_var(&field(b"PROJECT", key), value.into());
+        // Admit the cache entry before its normal variables change.
         let var = field(name, key);
+        if !set_static(cx, &var, value) {
+            return Err(CmdError::Reported);
+        }
+        cx.set_var(&field(b"PROJECT", key), value.into());
         if cx.policy(PolicyId::new(180)) == PolicyStatus::New || cx.var_normal_only(&var).is_some()
         {
             cx.set_var(&var, value.into());
         }
-        set_static(cx, &var, value);
     }
 
     let mut components = version.unwrap_or_default().split(|byte| *byte == b'.');
@@ -125,31 +128,31 @@ fn configure_project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         (b"_VERSION_PATCH", components.next().unwrap_or_default()),
         (b"_VERSION_TWEAK", components.next().unwrap_or_default()),
     ] {
+        let var = field(b"CMAKE_PROJECT", key);
+        if version.is_some() {
+            set_top_level(cx, &var, value, top_level)?;
+        } else if top_level && !cx.var_or_empty(&var).is_empty() {
+            cx.set_var(&var, BString::default());
+        }
         for prefix in [b"PROJECT".as_slice(), name] {
             let var = field(prefix, key);
             if version.is_some() || !cx.var_or_empty(&var).is_empty() {
                 cx.set_var(&var, value.into());
             }
         }
-        let var = field(b"CMAKE_PROJECT", key);
-        if version.is_some() {
-            set_top_level(cx, &var, value, top_level);
-        } else if top_level && !cx.var_or_empty(&var).is_empty() {
-            cx.set_var(&var, BString::default());
-        }
     }
 
     for key in METADATA.into_iter().filter(|key| *key != "VERSION") {
         let value = metadata.get(key.as_bytes()).copied().unwrap_or_default();
         let suffix = format!("_{key}");
-        cx.set_var(&field(b"PROJECT", suffix.as_bytes()), value.into());
-        cx.set_var(&field(name, suffix.as_bytes()), value.into());
         set_top_level(
             cx,
             &field(b"CMAKE_PROJECT", suffix.as_bytes()),
             value,
             top_level,
-        );
+        )?;
+        cx.set_var(&field(b"PROJECT", suffix.as_bytes()), value.into());
+        cx.set_var(&field(name, suffix.as_bytes()), value.into());
     }
 
     if cx.running_deferred() {
@@ -308,17 +311,28 @@ fn field(prefix: &[u8], suffix: &[u8]) -> BString {
     [prefix, suffix].concat().into()
 }
 
-fn set_top_level(cx: &mut Cx<'_>, name: &[u8], value: &[u8], top_level: bool) {
+/// Store a top-level `CMAKE_PROJECT_*` cache entry, then remove a normal variable with
+/// the same name. A refused cache entry stops `project()` before the variable changes.
+fn set_top_level(
+    cx: &mut Cx<'_>,
+    name: &[u8],
+    value: &[u8],
+    top_level: bool,
+) -> Result<(), CmdError> {
     if top_level || !cx.var_defined(name) {
+        if !set_static(cx, name, value) {
+            return Err(CmdError::Reported);
+        }
         if cx.var_normal_only(name).is_some() {
             cx.unset_var(name);
         }
-        set_static(cx, name, value);
     }
+    Ok(())
 }
 
-fn set_static(cx: &mut Cx<'_>, name: &[u8], value: &[u8]) {
-    cx.cache().insert(
+/// Store a `STATIC` cache entry. Return `false` if the cache byte limit refused it.
+fn set_static(cx: &mut Cx<'_>, name: &[u8], value: &[u8]) -> bool {
+    cx.insert_cache_entry_unrecorded(
         name.into(),
         CacheEntry {
             value: value.into(),
@@ -327,5 +341,5 @@ fn set_static(cx: &mut Cx<'_>, name: &[u8], value: &[u8]) {
             advanced: false,
             props: Default::default(),
         },
-    );
+    )
 }

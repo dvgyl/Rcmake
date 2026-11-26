@@ -612,7 +612,7 @@ fn set_result(cx: &mut Cx<'_>, name: &[u8], value: BString, no_cache: bool) {
     if no_cache {
         cx.set_var(name, value);
     } else {
-        cx.cache().insert(
+        cx.insert_cache_entry_unrecorded(
             name.into(),
             CacheEntry {
                 value,

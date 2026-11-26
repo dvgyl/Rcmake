@@ -171,7 +171,7 @@ fn lookup(
         ("PLEASE_FILL_OUT-NOTFOUND", "Output of try_run().")
     };
     missing.push(key.into());
-    cx.cache().insert(
+    cx.insert_cache_entry_unrecorded(
         key.into(),
         CacheEntry {
             value: value.into(),

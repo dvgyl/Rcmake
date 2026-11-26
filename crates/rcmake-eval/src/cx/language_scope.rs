@@ -16,7 +16,11 @@ impl Cx<'_> {
         self.interp.mark_replay_opaque();
         self.interp.vars.push();
         setup(self).inspect_err(|_| self.interp.vars.pop())?;
-        let warn = self.interp.vars.propagate_capture();
+        let limit = self.interp.live_limit();
+        let Ok(warn) = self.interp.vars.propagate_capture(limit) else {
+            self.interp.report_variable_budget();
+            return Err(CmdError::Reported);
+        };
         if warn
             && self
                 .interp

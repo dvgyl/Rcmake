@@ -1,24 +1,42 @@
 use rcmake_base::{
     BString,
     limits::Limits,
-    list::{Empty, split_into},
+    list::{self, Empty},
 };
 use rcmake_syntax::{ArgKind, Argument};
 
-use crate::{ExpandEnv, ExpandError, ExpandedArg};
+use crate::{ArgumentBudget, ExpandEnv, ExpandError, ExpandedArg};
 
 const MAX_DEPTH: usize = 256;
 const LINE_VAR: &[u8] = b"CMAKE_CURRENT_LIST_LINE";
 
 /// Expand each argument. Split unquoted arguments into list elements and drop empty
 /// elements. Keep quoted arguments as one element. Copy bracket arguments verbatim.
+///
+/// The arguments already in `out` belong to the same command call. Each argument is
+/// reserved in [`ExpandEnv::argument_budget`] before it is copied. On an error, `out`
+/// keeps only the arguments that it held before the call.
 pub fn expand_args(
     args: &[Argument],
     env: &mut dyn ExpandEnv,
     out: &mut Vec<ExpandedArg>,
 ) -> Result<(), ExpandError> {
-    let mut elements = Vec::new();
-    let mut expanded_args = Vec::new();
+    let mut budget = env.argument_budget();
+    budget.used_arguments = out.len();
+    let start = out.len();
+    let result = expand_into(args, env, out, &mut budget);
+    if result.is_err() {
+        out.truncate(start);
+    }
+    result
+}
+
+fn expand_into(
+    args: &[Argument],
+    env: &mut dyn ExpandEnv,
+    out: &mut Vec<ExpandedArg>,
+    budget: &mut ArgumentBudget,
+) -> Result<(), ExpandError> {
     for arg in args {
         let value = if arg.kind == ArgKind::Bracket {
             arg.text.clone()
@@ -31,13 +49,15 @@ pub fn expand_args(
             line: arg.line,
         };
         if arg.kind == ArgKind::Unquoted {
-            split_into(&value, Empty::Drop, &mut elements);
-            expanded_args.extend(elements.drain(..).map(expanded));
+            for element in list::iter(&value, Empty::Drop) {
+                budget.take(element.len())?;
+                out.push(expanded(BString::from(element.into_owned())));
+            }
         } else {
-            expanded_args.push(expanded(value));
+            budget.take(value.len())?;
+            out.push(expanded(value));
         }
     }
-    out.extend(expanded_args);
     Ok(())
 }
 
@@ -93,7 +113,9 @@ struct Scanner<'a, 'env> {
 impl<'a> Scanner<'a, '_> {
     fn scan(&mut self, reference: Option<Reference>, depth: usize) -> Result<Vec<u8>, ExpandError> {
         if depth > MAX_DEPTH {
-            return Err(error("Variable expansion exceeded the nesting limit."));
+            return Err(ExpandError::resource_limit(
+                "Variable expansion exceeded the nesting limit.",
+            ));
         }
 
         let mut output = if reference.is_none() {
@@ -280,7 +302,9 @@ impl<'a> Scanner<'a, '_> {
         self.remaining_bytes = self
             .remaining_bytes
             .checked_sub(bytes.len())
-            .ok_or_else(|| error("Variable expansion exceeded the value size limit."))?;
+            .ok_or_else(|| {
+                ExpandError::resource_limit("Variable expansion exceeded the value size limit.")
+            })?;
         output.extend_from_slice(bytes);
         Ok(())
     }
@@ -300,7 +324,5 @@ fn delimited_name(src: &[u8], delimiter: u8) -> Option<(&[u8], &[u8])> {
 }
 
 pub(crate) fn error(message: impl Into<BString>) -> ExpandError {
-    ExpandError {
-        message: message.into(),
-    }
+    ExpandError::syntax(message)
 }

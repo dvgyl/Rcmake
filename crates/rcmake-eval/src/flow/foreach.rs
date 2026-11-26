@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use rcmake_base::{
     BString,
-    list::{Empty, split_into},
+    list::{Empty, ListBudget},
 };
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_expr::ExpandedArg;
@@ -123,8 +124,12 @@ impl Interp {
                     "called with incorrect range specification: start {start}, stop {stop}, step {step}"
                 ))));
             }
-            let span = start.abs_diff(stop);
-            let count = span / step.unsigned_abs() + 1;
+            let Some(count) = range_count(start, stop, step) else {
+                self.fatal = true;
+                return Err(CmdError::Status(BString::from(format!(
+                    "called with a range that has too many iterations: start {start}, stop {stop}, step {step}"
+                ))));
+            };
             return Ok(Some(ForeachPlan::Range {
                 var: var.clone(),
                 start,
@@ -159,6 +164,12 @@ impl Interp {
             .collect();
         let mut items: Vec<BString> = Vec::new();
         let mut doing = Doing::None;
+        // One budget for the whole plan: copied items, named list elements, and the
+        // generated `ZIP_LISTS` variable names.
+        let mut budget = ListBudget::new(
+            self.config.limits.max_command_arguments,
+            self.config.limits.max_command_argument_bytes,
+        );
         for &arg in values.get(in_pos + 1..).unwrap_or_default() {
             match arg.as_slice() {
                 b"LISTS" | b"ITEMS" => {
@@ -187,10 +198,21 @@ impl Interp {
                 }
                 _ => match doing {
                     Doing::Lists => {
-                        let value = self.lookup_var(arg).cloned().unwrap_or_default();
-                        split_into(&value, Empty::Keep, &mut items);
+                        let split = self
+                            .lookup_var(arg)
+                            .map_or(Ok(()), |value| budget.split(value, Empty::Keep, &mut items));
+                        if let Err(limit) = split {
+                            self.error_here(limit.to_string().into());
+                            return None;
+                        }
                     }
-                    Doing::Items | Doing::Zip => items.push(arg.clone()),
+                    Doing::Items | Doing::Zip => {
+                        if let Err(limit) = budget.take(arg.len()) {
+                            self.error_here(limit.to_string().into());
+                            return None;
+                        }
+                        items.push(arg.clone());
+                    }
                     Doing::None => {
                         self.error_here(cat(&[b"Unknown argument:\n  ", arg, b"\n"]));
                         return None;
@@ -210,11 +232,33 @@ impl Interp {
             if items.is_empty() {
                 return Some(ForeachPlan::Nothing);
             }
+            if vars.len() <= 1 {
+                // Each generated name is `<prefix>_<index>`: check all of them first. Lists
+                // that are not defined also get a name.
+                let prefix = vars.first().map_or(0, |prefix| prefix.len());
+                let names = prefix
+                    .checked_add(1 + 20)
+                    .and_then(|name| name.checked_mul(items.len()));
+                let charged = names
+                    .ok_or(rcmake_base::list::ListLimit::Bytes(
+                        self.config.limits.max_command_argument_bytes,
+                    ))
+                    .and_then(|names| budget.charge_bytes(names));
+                if let Err(limit) = charged {
+                    self.error_here(limit.to_string().into());
+                    return None;
+                }
+            }
             let mut lists = Vec::with_capacity(items.len());
             for list_var in &items {
-                let value = self.lookup_var(list_var).cloned().unwrap_or_default();
                 let mut elems = Vec::new();
-                split_into(&value, Empty::Keep, &mut elems);
+                let split = self
+                    .lookup_var(list_var)
+                    .map_or(Ok(()), |value| budget.split(value, Empty::Keep, &mut elems));
+                if let Err(limit) = split {
+                    self.error_here(limit.to_string().into());
+                    return None;
+                }
                 lists.push(elems);
             }
             let names = if vars.len() > 1 {
@@ -240,6 +284,16 @@ impl Interp {
         } else {
             Some(self.lookup_var(name).cloned().unwrap_or_default())
         }
+    }
+
+    /// Bytes that [`Self::loop_var_saved`] would copy, without the copy.
+    fn loop_var_saved_len(&self, name: &[u8]) -> usize {
+        let value = if self.policy_status(PolicyId::new(124)) == PolicyStatus::New {
+            self.vars.get(name)
+        } else {
+            self.lookup_var(name)
+        };
+        value.map_or(0, |value| value.len())
     }
 
     fn restore_loop_var(&mut self, name: &[u8], saved: Option<BString>) {
@@ -330,12 +384,34 @@ impl Interp {
                 }
             }
             ForeachPlan::Zip { vars, lists } => {
-                let saved: Vec<Option<BString>> =
-                    vars.iter().map(|v| self.loop_var_saved(v)).collect();
                 let max = lists.iter().map(Vec::len).max().unwrap_or(0);
+                if max == 0 {
+                    // No iteration changes a loop variable, so nothing is saved.
+                    return Ok(Flow::Normal);
+                }
+                // Save each distinct loop variable once, in first-seen order. Reserve the
+                // saved bytes before the copies.
+                let mut seen = BTreeSet::new();
+                let distinct: Vec<&BString> = vars
+                    .iter()
+                    .filter(|var| seen.insert(var.as_slice()))
+                    .collect();
+                let saved_bytes = distinct
+                    .iter()
+                    .map(|var| self.loop_var_saved_len(var))
+                    .fold(0, usize::saturating_add);
+                if !self.reserve_temp(saved_bytes) {
+                    return Err(CmdError::Reported);
+                }
+                let saved: Vec<(&BString, Option<BString>)> = distinct
+                    .into_iter()
+                    .map(|var| (var, self.loop_var_saved(var)))
+                    .collect();
+                let mut stopped = false;
                 for n in 0..max {
                     if self.over_budget() || (start == end && !self.take_step()) {
-                        return Err(CmdError::Reported);
+                        stopped = true;
+                        break;
                     }
                     for (var, list) in vars.iter().zip(&lists) {
                         match list.get(n) {
@@ -350,10 +426,23 @@ impl Interp {
                         break;
                     }
                 }
-                if restore {
-                    for (var, old) in vars.iter().zip(saved) {
+                if stopped || !restore {
+                    drop(saved);
+                    self.release_temp(saved_bytes);
+                    if stopped {
+                        return Err(CmdError::Reported);
+                    }
+                } else {
+                    // Release each saved value as it moves back into the variable store,
+                    // so watch callbacks of the restore see the copies that still exist.
+                    let mut released = 0_usize;
+                    for (var, old) in saved {
+                        let charge = old.as_ref().map_or(0, |value| value.len());
+                        self.release_temp(charge);
+                        released = released.saturating_add(charge);
                         self.restore_loop_var(var, old);
                     }
+                    self.release_temp(saved_bytes.saturating_sub(released));
                 }
             }
         }
@@ -361,5 +450,29 @@ impl Interp {
             return Err(CmdError::Reported);
         }
         Ok(flow.unwrap_or(Flow::Normal))
+    }
+}
+
+/// Number of iterations of `foreach(RANGE)` from `start` to `stop` by a nonzero `step`.
+///
+/// Return `None` if the count does not fit in `u64` (the full `i64` span with step 1).
+fn range_count(start: i64, stop: i64, step: i64) -> Option<u64> {
+    start
+        .abs_diff(stop)
+        .checked_div(step.unsigned_abs())?
+        .checked_add(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::range_count;
+
+    #[test]
+    fn range_count_reports_overflow_instead_of_wrapping() {
+        assert_eq!(range_count(i64::MIN, i64::MAX, 1), None);
+        assert_eq!(range_count(i64::MAX, i64::MIN, -1), None);
+        assert_eq!(range_count(i64::MIN, i64::MAX, 2), Some(1 << 63));
+        assert_eq!(range_count(0, 10, 3), Some(4));
+        assert_eq!(range_count(5, 5, 1), Some(1));
     }
 }

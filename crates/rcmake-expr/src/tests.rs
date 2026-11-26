@@ -20,6 +20,7 @@ struct Env {
     regex_patterns: Vec<BString>,
     match_clears: usize,
     host: PureHost,
+    budget: ArgumentBudget,
 }
 
 impl Env {
@@ -34,6 +35,7 @@ impl Env {
             regex_patterns: Vec::new(),
             match_clears: 0,
             host: PureHost::new("/work".into(), "/bin/rcmake".into()),
+            budget: ArgumentBudget::default(),
         }
     }
 
@@ -66,6 +68,10 @@ impl ExpandEnv for Env {
 
     fn current_line(&self) -> u32 {
         42
+    }
+
+    fn argument_budget(&self) -> ArgumentBudget {
+        self.budget
     }
 }
 
@@ -234,6 +240,109 @@ fn expansion_tracks_raw_lines_and_reports_errors() {
     }
     let deep = format!("{}x{}", "${".repeat(257), "}".repeat(257));
     assert!(expand_string(deep.as_bytes(), &mut env).is_err());
+}
+
+fn argument(kind: ArgKind, text: &str) -> rcmake_syntax::Argument {
+    rcmake_syntax::Argument {
+        kind,
+        text: text.into(),
+        line: 1,
+        span: 0..text.len(),
+    }
+}
+
+fn list_of(count: usize) -> String {
+    vec!["a"; count].join(";")
+}
+
+#[test]
+fn unquoted_expansion_stops_at_the_element_cap() {
+    let mut env = Env::new();
+    env.budget = ArgumentBudget::new(1_000, usize::MAX);
+    env.set("FULL", list_of(1_000));
+    env.set("OVER", list_of(1_001));
+    let mut out = Vec::new();
+    expand_args(
+        &[argument(ArgKind::Unquoted, "${FULL}")],
+        &mut env,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(out.len(), 1_000);
+
+    let mut out = Vec::new();
+    let error = expand_args(
+        &[argument(ArgKind::Unquoted, "${OVER}")],
+        &mut env,
+        &mut out,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.message,
+        "Command arguments expanded to more than 1000 elements."
+    );
+    assert!(out.is_empty());
+}
+
+#[test]
+fn cap_counts_all_arguments_of_one_command() {
+    let mut env = Env::new();
+    env.budget = ArgumentBudget::new(1_000, usize::MAX);
+    env.set("L", list_of(600));
+    let args = [
+        argument(ArgKind::Unquoted, "${L}"),
+        argument(ArgKind::Unquoted, "${L}"),
+    ];
+    assert!(expand_args(&args, &mut env, &mut Vec::new()).is_err());
+
+    // The evaluator expands one argument at a time into the same output vector.
+    let mut out = Vec::new();
+    expand_args(&args[..1], &mut env, &mut out).unwrap();
+    assert!(expand_args(&args[1..], &mut env, &mut out).is_err());
+    assert_eq!(out.len(), 600);
+
+    env.set("L", list_of(1_000));
+    let quoted = [
+        argument(ArgKind::Unquoted, "${L}"),
+        argument(ArgKind::Quoted, "one more"),
+    ];
+    assert!(expand_args(&quoted, &mut env, &mut Vec::new()).is_err());
+}
+
+#[test]
+fn byte_cap_counts_all_arguments_and_the_caller_bytes() {
+    let mut env = Env::new();
+    env.budget = ArgumentBudget::new(usize::MAX, 10);
+    env.set("L", "abcd;efgh");
+    let args = [argument(ArgKind::Unquoted, "${L}")];
+    let mut out = Vec::new();
+    expand_args(&args, &mut env, &mut out).unwrap();
+    assert_eq!(out.len(), 2);
+
+    // The caller reports the bytes of the arguments that it already holds.
+    env.budget.used_bytes = 8;
+    let error = expand_args(&args, &mut env, &mut out).unwrap_err();
+    assert!(error.is_resource_limit());
+    assert_eq!(
+        error.message,
+        "Command arguments expanded to more than 10 bytes."
+    );
+    assert_eq!(
+        out.len(),
+        2,
+        "a failed call keeps only the earlier arguments"
+    );
+
+    env.budget.used_bytes = 4;
+    assert!(expand_args(&args, &mut env, &mut Vec::new()).is_err());
+}
+
+#[test]
+fn syntax_errors_are_not_resource_limits() {
+    let mut env = Env::new();
+    let args = [argument(ArgKind::Quoted, "a\\z")];
+    let error = expand_args(&args, &mut env, &mut Vec::new()).unwrap_err();
+    assert!(!error.is_resource_limit());
 }
 
 #[test]

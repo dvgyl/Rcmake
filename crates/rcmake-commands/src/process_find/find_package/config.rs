@@ -407,7 +407,7 @@ impl<'a> ConfigSearch<'a> {
             })
             .unwrap_or_else(|| cat(&[&dir, b"-NOTFOUND"]));
         let current = cx.cache().get(&dir).cloned();
-        cx.cache().insert(
+        let stored = cx.insert_cache_entry_unrecorded(
             dir.clone(),
             CacheEntry {
                 value: value.clone(),
@@ -421,6 +421,10 @@ impl<'a> ConfigSearch<'a> {
                 props: current.map_or_else(Default::default, |entry| entry.props),
             },
         );
+        // A refused entry stops the command before any normal variable changes.
+        if !stored {
+            return Err(CmdError::Reported);
+        }
         if cx.var_normal_only(&dir).is_some() {
             cx.set_var(&dir, value);
         }

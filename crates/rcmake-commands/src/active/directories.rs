@@ -145,7 +145,7 @@ pub(super) fn include_external_msproject(cx: &mut Cx<'_>, args: &[ExpandedArg]) 
         .map_err(|error| CmdError::status(error.to_string()))?;
     if !guid.is_empty() {
         let key: BString = [*name, b"_GUID_CMAKE"].concat().into();
-        cx.cache().insert(
+        cx.insert_cache_entry_unrecorded(
             key,
             CacheEntry {
                 value: guid.into(),

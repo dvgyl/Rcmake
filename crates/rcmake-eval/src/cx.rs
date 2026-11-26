@@ -237,7 +237,7 @@ impl Cx<'_> {
     /// variable watches (`MODIFIED_ACCESS`).
     pub fn set_parent_scope(&mut self, name: &[u8], value: Option<BString>) {
         self.interp.mark_replay_opaque();
-        self.interp.raise_var(name, value);
+        let _ = self.interp.raise_var(name, value);
     }
 
     /// Mutable access to [`GlobalState`].

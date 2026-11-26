@@ -1,7 +1,7 @@
 //! Variable scope stack with explicit `Set`/`Unset` bindings and raise-then-set
 //! `PARENT_SCOPE` semantics (ADR-005).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rcmake_base::BString;
 use rcmake_diag::PolicyStatus;
@@ -36,6 +36,39 @@ impl RecursionBinding {
 
 type Bindings = BTreeMap<BString, Binding>;
 
+/// Fixed cost of one binding for the live variable budget (map node and string headers).
+const BINDING_OVERHEAD: usize = 64;
+
+/// A write would make the live variables use more bytes than the limit allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BudgetExceeded;
+
+/// Bytes that one binding of `name` adds to the live variable budget, or `None` on overflow.
+fn binding_cost(name: &[u8], binding: &Binding) -> Option<usize> {
+    let value = match binding {
+        Binding::Set(value) => value.len(),
+        Binding::Unset => 0,
+    };
+    name.len().checked_add(value)?.checked_add(BINDING_OVERHEAD)
+}
+
+/// Cost of a binding that the budget already admitted.
+fn admitted_cost(name: &[u8], binding: &Binding) -> usize {
+    binding_cost(name, binding).unwrap_or(0)
+}
+
+/// Remove the cost of a replaced binding, then add the cost of the new binding.
+fn charge(total: usize, removed: usize, added: usize) -> Option<usize> {
+    total.checked_sub(removed)?.checked_add(added)
+}
+
+fn recursion_binding(binding: &Binding) -> RecursionBinding {
+    match binding {
+        Binding::Unset => RecursionBinding::Unset,
+        Binding::Set(value) => RecursionBinding::Defined(parse_recursion_limit(value)),
+    }
+}
+
 #[derive(Debug)]
 enum ScopeBindings {
     Local(Bindings),
@@ -59,26 +92,31 @@ impl ScopeBindings {
         }
     }
 
-    fn set(&mut self, name: &[u8], value: Binding) {
+    /// Bind `name` after `admit` accepts the binding that the new one replaces.
+    ///
+    /// If `admit` returns an error, the bindings do not change.
+    fn set_checked<E>(
+        &mut self,
+        name: &[u8],
+        value: Binding,
+        admit: impl FnOnce(Option<&Binding>) -> Result<(), E>,
+    ) -> Result<(), E> {
         match self {
             Self::Local(bindings) => {
                 if let Some(current) = bindings.get_mut(name) {
+                    admit(Some(current))?;
                     *current = value;
                 } else {
+                    admit(None)?;
                     bindings.insert(name.into(), value);
                 }
             }
             Self::Shared(bindings) => {
+                admit(bindings.get_at(name, VarLayer::shard_index(name)))?;
                 bindings.set(name, value);
             }
         }
-    }
-
-    fn extend(&mut self, source: Bindings) {
-        match self {
-            Self::Local(bindings) => bindings.extend(source),
-            Self::Shared(bindings) => bindings.extend(source),
-        }
+        Ok(())
     }
 
     fn iter(&self) -> impl Iterator<Item = (&BString, &Binding)> {
@@ -118,16 +156,58 @@ struct Scope {
     id: u64,
     directory: Option<DirId>,
     bindings: ScopeBindings,
+    /// Sum of [`binding_cost`] over `bindings`.
+    bytes: usize,
     parent_policy: Option<(usize, PolicyStatus)>,
     recursion_limit: RecursionBinding,
 }
 
 impl Scope {
-    fn record_recursion_binding(&mut self, binding: &Binding) {
-        self.recursion_limit = match binding {
-            Binding::Unset => RecursionBinding::Unset,
-            Binding::Set(value) => RecursionBinding::Defined(parse_recursion_limit(value)),
-        };
+    fn new(
+        id: u64,
+        directory: Option<DirId>,
+        parent_policy: Option<(usize, PolicyStatus)>,
+    ) -> Self {
+        Self {
+            id,
+            directory,
+            bindings: ScopeBindings::default(),
+            bytes: 0,
+            parent_policy,
+            recursion_limit: RecursionBinding::Inherit,
+        }
+    }
+
+    /// Bind `name` in this scope if the live total `live` stays within `limit`.
+    ///
+    /// Return the new live total. On an error, nothing changes.
+    fn bind(
+        &mut self,
+        name: &[u8],
+        binding: Binding,
+        live: usize,
+        limit: usize,
+    ) -> Result<usize, BudgetExceeded> {
+        let added = binding_cost(name, &binding).ok_or(BudgetExceeded)?;
+        let bytes = self.bytes;
+        let mut totals = (live, bytes);
+        self.bindings.set_checked(name, binding, |old| {
+            let removed = old.map_or(0, |old| admitted_cost(name, old));
+            let live = charge(live, removed, added)
+                .filter(|&live| live <= limit)
+                .ok_or(BudgetExceeded)?;
+            totals = (live, charge(bytes, removed, added).ok_or(BudgetExceeded)?);
+            Ok(())
+        })?;
+        self.bytes = totals.1;
+        Ok(totals.0)
+    }
+
+    /// Cost of the binding of `name` in this scope, or zero.
+    fn cost_of(&self, name: &[u8]) -> usize {
+        self.bindings
+            .get(name, &mut None)
+            .map_or(0, |binding| admitted_cost(name, binding))
     }
 }
 
@@ -137,25 +217,27 @@ pub(crate) struct VarStack {
     scopes: Vec<Scope>,
     next_id: u64,
     recursion_limit: Option<Option<u32>>,
+    /// Sum of `Scope::bytes` over all scopes.
+    live: usize,
 }
 
 impl Default for VarStack {
     fn default() -> Self {
         Self {
-            scopes: vec![Scope {
-                id: 0,
-                directory: Some(DirId::ROOT),
-                bindings: ScopeBindings::default(),
-                parent_policy: None,
-                recursion_limit: RecursionBinding::Inherit,
-            }],
+            scopes: vec![Scope::new(0, Some(DirId::ROOT), None)],
             next_id: 1,
             recursion_limit: None,
+            live: 0,
         }
     }
 }
 
 impl VarStack {
+    /// Bytes of all live bindings in all scopes, as counted by [`binding_cost`].
+    pub(crate) fn live_bytes(&self) -> usize {
+        self.live
+    }
+
     /// Number of active scopes.
     #[cfg(test)]
     pub(crate) fn depth(&self) -> usize {
@@ -210,24 +292,45 @@ impl VarStack {
         }
     }
 
-    /// Define `name` in the innermost scope.
-    pub(crate) fn set(&mut self, name: &[u8], value: BString) {
-        self.insert_top(name, Binding::Set(value));
+    /// Define `name` in the innermost scope if the live total stays within `limit`.
+    pub(crate) fn set(
+        &mut self,
+        name: &[u8],
+        value: BString,
+        limit: usize,
+    ) -> Result<(), BudgetExceeded> {
+        self.insert_top(name, Binding::Set(value), limit)
     }
 
-    /// Undefine `name` in the innermost scope (shadows outer bindings).
-    pub(crate) fn unset(&mut self, name: &[u8]) {
-        self.insert_top(name, Binding::Unset);
+    /// Undefine `name` in the innermost scope (shadows outer bindings) if the live total
+    /// stays within `limit`.
+    pub(crate) fn unset(&mut self, name: &[u8], limit: usize) -> Result<(), BudgetExceeded> {
+        self.insert_top(name, Binding::Unset, limit)
     }
 
-    fn insert_top(&mut self, name: &[u8], binding: Binding) {
-        if let Some(top) = self.scopes.last_mut() {
-            if name == RECURSION_LIMIT {
-                top.record_recursion_binding(&binding);
-                self.recursion_limit = top.recursion_limit.configured();
-            }
-            top.bindings.set(name, binding);
+    fn insert_top(
+        &mut self,
+        name: &[u8],
+        binding: Binding,
+        limit: usize,
+    ) -> Result<(), BudgetExceeded> {
+        let Some(top) = self.scopes.last_mut() else {
+            return Ok(());
+        };
+        let recursion = (name == RECURSION_LIMIT).then(|| recursion_binding(&binding));
+        self.live = top.bind(name, binding, self.live, limit)?;
+        if let Some(recursion) = recursion {
+            top.recursion_limit = recursion;
+            self.recursion_limit = top.recursion_limit.configured();
         }
+        Ok(())
+    }
+
+    /// Cost of the binding of `name` in the scope at `index`, or zero.
+    fn cost_at(&self, index: usize, name: &[u8]) -> usize {
+        self.scopes
+            .get(index)
+            .map_or(0, |scope| scope.cost_of(name))
     }
 
     /// Push a new empty scope.
@@ -240,13 +343,8 @@ impl VarStack {
         directory: Option<DirId>,
         parent_policy: Option<(usize, PolicyStatus)>,
     ) {
-        self.scopes.push(Scope {
-            id: self.next_id,
-            directory,
-            bindings: ScopeBindings::default(),
-            parent_policy,
-            recursion_limit: RecursionBinding::Inherit,
-        });
+        self.scopes
+            .push(Scope::new(self.next_id, directory, parent_policy));
         self.next_id = self.next_id.saturating_add(1);
     }
 
@@ -254,9 +352,11 @@ impl VarStack {
     pub(crate) fn pop(&mut self) {
         if self.scopes.len() > 1
             && let Some(scope) = self.scopes.pop()
-            && !matches!(scope.recursion_limit, RecursionBinding::Inherit)
         {
-            self.update_recursion_limit();
+            self.live = self.live.saturating_sub(scope.bytes);
+            if !matches!(scope.recursion_limit, RecursionBinding::Inherit) {
+                self.update_recursion_limit();
+            }
         }
     }
 
@@ -271,10 +371,14 @@ impl VarStack {
     }
 
     /// Install the captured bindings in the caller and its eligible enclosing scopes.
-    pub(crate) fn propagate_capture(&mut self) -> bool {
+    ///
+    /// The complete charge is checked against `limit` before any binding is copied. On an
+    /// error, the captured scope is gone and no enclosing scope changes.
+    pub(crate) fn propagate_capture(&mut self, limit: usize) -> Result<bool, BudgetExceeded> {
         let Some(capture) = self.scopes.pop() else {
-            return false;
+            return Ok(false);
         };
+        self.live = self.live.saturating_sub(capture.bytes);
         if !matches!(capture.recursion_limit, RecursionBinding::Inherit) {
             self.update_recursion_limit();
         }
@@ -287,55 +391,134 @@ impl VarStack {
             !name.is_empty() && self.get(name) != value
         });
         if bindings.is_empty() {
-            return false;
+            return Ok(false);
         }
-        let mut scopes = self.scopes.iter_mut().rev();
-        let Some(caller) = scopes.next() else {
-            return false;
+        let Some(caller) = self.scopes.len().checked_sub(1) else {
+            return Ok(false);
         };
-        let limit = bindings.get(RECURSION_LIMIT);
-        if let Some(binding) = limit {
-            caller.record_recursion_binding(binding);
-            self.recursion_limit = caller.recursion_limit.configured();
-        }
-        caller.bindings.extend(bindings.clone());
-        let mut policy = caller.parent_policy;
-        for parent in scopes {
+        // The caller, then each enclosing scope that the policy chain admits.
+        let mut targets = vec![caller];
+        let mut policy = self
+            .scopes
+            .get(caller)
+            .and_then(|scope| scope.parent_policy);
+        let mut warn = false;
+        for index in (0..caller).rev() {
             match policy.map(|(_, status)| status) {
                 Some(PolicyStatus::New) => {
-                    if let Some(binding) = limit {
-                        parent.record_recursion_binding(binding);
-                    }
-                    parent.bindings.extend(bindings.clone());
-                    policy = parent.parent_policy;
+                    targets.push(index);
+                    policy = self.scopes.get(index).and_then(|scope| scope.parent_policy);
                 }
-                Some(PolicyStatus::Warn) => return true,
+                Some(PolicyStatus::Warn) => {
+                    warn = true;
+                    break;
+                }
                 Some(PolicyStatus::Old) | None => break,
             }
         }
-        false
+        let mut projected = self.live;
+        for &index in &targets {
+            for (name, binding) in &bindings {
+                let added = binding_cost(name, binding).ok_or(BudgetExceeded)?;
+                projected =
+                    charge(projected, self.cost_at(index, name), added).ok_or(BudgetExceeded)?;
+            }
+        }
+        if projected > limit {
+            return Err(BudgetExceeded);
+        }
+        let recursion = bindings.get(RECURSION_LIMIT).map(recursion_binding);
+        for &index in &targets {
+            let Some(scope) = self.scopes.get_mut(index) else {
+                continue;
+            };
+            for (name, binding) in &bindings {
+                self.live = scope.bind(name, binding.clone(), self.live, usize::MAX)?;
+            }
+            if let Some(recursion) = recursion {
+                scope.recursion_limit = recursion;
+            }
+        }
+        if recursion.is_some() {
+            self.update_recursion_limit();
+        }
+        Ok(warn)
+    }
+
+    /// Check that `PARENT_SCOPE` writes for all `names`, in their order, keep the live total
+    /// within `limit` after every single write.
+    ///
+    /// Each name copies its current binding into the innermost scope, then its value into
+    /// the parent scope. A later name can free bytes, but an earlier write must still fit.
+    /// A repeated name adds nothing. Nothing changes.
+    pub(crate) fn preflight_raise(
+        &self,
+        names: &[BString],
+        limit: usize,
+    ) -> Result<(), BudgetExceeded> {
+        let len = self.scopes.len();
+        let (Some(top), Some(parent)) = (len.checked_sub(1), len.checked_sub(2)) else {
+            return Ok(());
+        };
+        let within = |live: Option<usize>| live.filter(|&live| live <= limit).ok_or(BudgetExceeded);
+        let mut seen = BTreeSet::new();
+        let mut projected = self.live;
+        for name in names.iter().map(|name| name.as_slice()) {
+            if name.is_empty() || !seen.insert(name) {
+                continue;
+            }
+            let current = self
+                .lookup(name)
+                .map_or_else(
+                    || binding_cost(name, &Binding::Unset),
+                    |binding| binding_cost(name, binding),
+                )
+                .ok_or(BudgetExceeded)?;
+            projected = within(charge(projected, self.cost_at(top, name), current))?;
+            projected = within(charge(projected, self.cost_at(parent, name), current))?;
+        }
+        Ok(())
     }
 
     /// Raise-then-set `PARENT_SCOPE`: copy the current effective binding of `name` into
     /// the innermost scope (so that its view does not change), then set (`Some`) or unset
     /// (`None`) `name` in the parent scope.
     ///
-    /// Returns `false` when the innermost scope has no parent.
-    pub(crate) fn set_parent(&mut self, name: &[u8], value: Option<BString>) -> bool {
+    /// Returns `false` when the innermost scope has no parent. Both writes are checked
+    /// against `limit` before the current binding is copied. On an error, nothing changes.
+    pub(crate) fn set_parent(
+        &mut self,
+        name: &[u8],
+        value: Option<BString>,
+        limit: usize,
+    ) -> Result<bool, BudgetExceeded> {
         let len = self.scopes.len();
-        if len < 2 {
-            return false;
+        let (Some(top), Some(parent)) = (len.checked_sub(1), len.checked_sub(2)) else {
+            return Ok(false);
+        };
+        let binding = value.map_or(Binding::Unset, Binding::Set);
+        let unset_cost = binding_cost(name, &Binding::Unset).ok_or(BudgetExceeded)?;
+        let current_cost = self
+            .lookup(name)
+            .map_or(Some(unset_cost), |current| binding_cost(name, current));
+        let added = binding_cost(name, &binding).ok_or(BudgetExceeded)?;
+        let projected = current_cost
+            .and_then(|current| charge(self.live, self.cost_at(top, name), current))
+            .and_then(|live| charge(live, self.cost_at(parent, name), added))
+            .ok_or(BudgetExceeded)?;
+        if projected > limit {
+            return Err(BudgetExceeded);
         }
         let current = self.lookup(name).cloned().unwrap_or(Binding::Unset);
-        self.insert_top(name, current);
-        if let Some(parent) = self.scopes.get_mut(len - 2) {
-            let binding = value.map_or(Binding::Unset, Binding::Set);
-            if name == RECURSION_LIMIT {
-                parent.record_recursion_binding(&binding);
+        self.insert_top(name, current, usize::MAX)?;
+        if let Some(scope) = self.scopes.get_mut(parent) {
+            let recursion = (name == RECURSION_LIMIT).then(|| recursion_binding(&binding));
+            self.live = scope.bind(name, binding, self.live, usize::MAX)?;
+            if let Some(recursion) = recursion {
+                scope.recursion_limit = recursion;
             }
-            parent.bindings.set(name, binding);
         }
-        true
+        Ok(true)
     }
 
     pub(crate) fn snapshot(&mut self) -> VarSnapshot {
@@ -366,17 +549,180 @@ impl VarStack {
 mod tests {
     use super::*;
 
+    impl VarStack {
+        /// Count the live bytes again from the bindings of every scope.
+        fn recount(&self) -> usize {
+            self.scopes
+                .iter()
+                .flat_map(|scope| scope.bindings.iter())
+                .map(|(name, binding)| admitted_cost(name, binding))
+                .sum()
+        }
+
+        fn put(&mut self, name: &[u8], value: BString) {
+            assert_eq!(self.set(name, value, usize::MAX), Ok(()));
+        }
+
+        fn clear(&mut self, name: &[u8]) {
+            assert_eq!(self.unset(name, usize::MAX), Ok(()));
+        }
+
+        fn raise(&mut self, name: &[u8], value: Option<BString>) -> bool {
+            self.set_parent(name, value, usize::MAX) == Ok(true)
+        }
+
+        fn capture(&mut self) -> bool {
+            self.propagate_capture(usize::MAX) == Ok(true)
+        }
+    }
+
+    #[test]
+    fn refused_writes_change_nothing() {
+        let mut stack = VarStack::default();
+        stack.put(b"a", "1".into());
+        let before = stack.live_bytes();
+        assert_eq!(
+            stack.set(b"a", "x".repeat(100).into(), before + 10),
+            Err(BudgetExceeded)
+        );
+        assert_eq!(stack.unset(b"new", before), Err(BudgetExceeded));
+        assert_eq!(stack.live_bytes(), before);
+        assert_eq!(stack.get(b"a"), Some(&"1".into()));
+        assert_eq!(stack.lookup(b"new"), None);
+        // A replacement that frees bytes passes at the current total.
+        assert_eq!(stack.set(b"a", BString::default(), before), Ok(()));
+        assert_eq!(stack.live_bytes(), stack.recount());
+    }
+
+    #[test]
+    fn refused_parent_scope_write_changes_neither_scope() {
+        let mut stack = VarStack::default();
+        stack.put(b"big", "x".repeat(1000).into());
+        stack.push();
+        let before = stack.live_bytes();
+        assert_eq!(
+            stack.set_parent(b"big", Some("y".repeat(1000).into()), before + 500),
+            Err(BudgetExceeded)
+        );
+        assert_eq!(stack.live_bytes(), before);
+        assert_eq!(stack.cost_at(1, b"big"), 0);
+        stack.pop();
+        assert_eq!(stack.get(b"big"), Some(&"x".repeat(1000).into()));
+    }
+
+    #[test]
+    fn refused_capture_changes_no_enclosing_scope() {
+        let mut stack = VarStack::default();
+        stack.push_boundary(None, Some((1, PolicyStatus::New)));
+        stack.push();
+        stack.put(b"lang", "z".repeat(1000).into());
+        let limit = stack.live_bytes();
+        assert_eq!(stack.propagate_capture(limit), Err(BudgetExceeded));
+        assert_eq!(stack.live_bytes(), 0);
+        assert_eq!(stack.recount(), 0);
+        assert_eq!(stack.get(b"lang"), None);
+    }
+
+    #[test]
+    fn refused_raise_preflight_changes_no_name() {
+        let mut stack = VarStack::default();
+        stack.push();
+        stack.put(b"small", "1".into());
+        stack.put(b"big", "x".repeat(1000).into());
+        let before = stack.live_bytes();
+        let names = [
+            BString::from("small"),
+            BString::from("big"),
+            BString::from("big"),
+        ];
+        assert_eq!(
+            stack.preflight_raise(&names, before + 500),
+            Err(BudgetExceeded)
+        );
+        assert_eq!(stack.preflight_raise(&names, before + 2000), Ok(()));
+        assert_eq!(stack.live_bytes(), before);
+        stack.pop();
+        assert_eq!(stack.lookup(b"small"), None);
+    }
+
+    #[test]
+    fn raise_preflight_checks_each_step_in_caller_order() {
+        let mut stack = VarStack::default();
+        stack.put(b"b", "x".repeat(1000).into());
+        stack.push();
+        stack.put(b"a", "y".repeat(600).into());
+        stack.put(b"b", BString::default());
+        let names = |order: [&str; 2]| order.map(BString::from);
+        // Raising `a` first goes over the limit before raising `b` frees the large value.
+        assert_eq!(
+            stack.preflight_raise(&names(["a", "b"]), 2000),
+            Err(BudgetExceeded)
+        );
+        // The final total is the same in the other order, and every step fits.
+        assert_eq!(stack.preflight_raise(&names(["b", "a"]), 2000), Ok(()));
+    }
+
+    #[test]
+    fn charge_reports_overflow_instead_of_saturating() {
+        assert_eq!(charge(usize::MAX, 0, 1), None);
+        assert_eq!(charge(5, 6, 0), None);
+        assert_eq!(charge(usize::MAX, 1, 1), Some(usize::MAX));
+    }
+
+    #[test]
+    fn live_bytes_follow_replacements_unsets_and_pops() {
+        let mut stack = VarStack::default();
+        stack.put(b"a", "xx".into());
+        assert_eq!(stack.live_bytes(), 1 + 2 + BINDING_OVERHEAD);
+        stack.put(b"a", "xxxx".into());
+        assert_eq!(stack.live_bytes(), 1 + 4 + BINDING_OVERHEAD);
+        stack.clear(b"a");
+        assert_eq!(stack.live_bytes(), 1 + BINDING_OVERHEAD);
+        let root = stack.live_bytes();
+
+        stack.push();
+        stack.put(b"local", "value".into());
+        let _ = stack.snapshot();
+        stack.put(b"local", "longer value".into());
+        stack.put(b"other", "1".into());
+        assert_eq!(stack.live_bytes(), stack.recount());
+        stack.pop();
+        assert_eq!(stack.live_bytes(), root);
+    }
+
+    #[test]
+    fn live_bytes_count_parent_scope_and_captured_copies() {
+        let mut stack = VarStack::default();
+        stack.put(b"keep", "root".into());
+        stack.push_boundary(None, Some((1, PolicyStatus::New)));
+        assert!(stack.raise(b"up", Some("value".into())));
+        assert_eq!(stack.live_bytes(), stack.recount());
+
+        stack.push_boundary(None, Some((2, PolicyStatus::New)));
+        stack.push();
+        stack.put(b"lang", "C".into());
+        stack.put(b"keep", "changed".into());
+        assert!(!stack.capture());
+        assert_eq!(stack.live_bytes(), stack.recount());
+
+        stack.pop();
+        stack.pop();
+        assert_eq!(stack.live_bytes(), stack.recount());
+        assert_eq!(stack.get(b"lang"), Some(&"C".into()));
+        assert_eq!(stack.get(b"up"), Some(&"value".into()));
+    }
+
     #[test]
     fn snapshot_keeps_visible_values_after_later_scope_writes() {
         let mut stack = VarStack::default();
-        stack.set(b"outer", "before".into());
-        stack.set(b"hidden", "outer".into());
+        stack.put(b"outer", "before".into());
+        stack.put(b"hidden", "outer".into());
         stack.push();
-        stack.unset(b"hidden");
+        stack.clear(b"hidden");
         let captured = stack.snapshot();
-        stack.set(b"outer", "after".into());
+        stack.put(b"outer", "after".into());
         stack.pop();
-        stack.set(b"outer", "next".into());
+        stack.put(b"outer", "next".into());
         let next = stack.snapshot();
 
         assert_eq!(captured.get(b"outer"), Some(&"before".into()));
@@ -388,10 +734,10 @@ mod tests {
     #[test]
     fn unset_shadows_outer_binding() {
         let mut s = VarStack::default();
-        s.set(b"a", "1".into());
+        s.put(b"a", "1".into());
         s.push();
         assert_eq!(s.get(b"a").map(|v| v.as_slice()), Some(&b"1"[..]));
-        s.unset(b"a");
+        s.clear(b"a");
         assert_eq!(s.get(b"a"), None);
         assert_eq!(s.lookup(b"a"), Some(&Binding::Unset));
         s.pop();
@@ -401,11 +747,11 @@ mod tests {
     #[test]
     fn raise_then_set_keeps_child_view() {
         let mut s = VarStack::default();
-        s.set(b"a", "outer".into());
+        s.put(b"a", "outer".into());
         s.push();
-        assert!(s.set_parent(b"a", Some("new".into())));
+        assert!(s.raise(b"a", Some("new".into())));
         assert_eq!(s.get(b"a").map(|v| v.as_slice()), Some(&b"outer"[..]));
-        assert!(s.set_parent(b"b", Some("x".into())));
+        assert!(s.raise(b"b", Some("x".into())));
         assert_eq!(s.lookup(b"b"), Some(&Binding::Unset));
         s.pop();
         assert_eq!(s.get(b"a").map(|v| v.as_slice()), Some(&b"new"[..]));
@@ -415,7 +761,7 @@ mod tests {
     #[test]
     fn root_scope_has_no_parent() {
         let mut s = VarStack::default();
-        assert!(!s.set_parent(b"a", None));
+        assert!(!s.raise(b"a", None));
         assert_eq!(s.depth(), 1);
         s.pop();
         assert_eq!(s.depth(), 1);
@@ -424,14 +770,14 @@ mod tests {
     #[test]
     fn capture_propagates_only_changed_values_and_unsets() {
         let mut stack = VarStack::default();
-        stack.set(b"unset", "prior".into());
+        stack.put(b"unset", "prior".into());
         stack.push_boundary(None, Some((1, PolicyStatus::Warn)));
-        stack.set(b"same", "inherited".into());
+        stack.put(b"same", "inherited".into());
         stack.push_boundary(None, Some((2, PolicyStatus::New)));
         stack.push();
-        stack.set(b"same", "inherited".into());
-        stack.unset(b"unset");
-        assert!(stack.propagate_capture());
+        stack.put(b"same", "inherited".into());
+        stack.clear(b"unset");
+        assert!(stack.capture());
 
         assert!(
             !stack
@@ -449,15 +795,15 @@ mod tests {
     #[test]
     fn capture_keeps_function_local_changes_out_of_the_root() {
         let mut stack = VarStack::default();
-        stack.set(b"E", "rootE".into());
-        stack.set(b"U", "rootU".into());
+        stack.put(b"E", "rootE".into());
+        stack.put(b"U", "rootU".into());
         stack.push_boundary(None, Some((1, PolicyStatus::New)));
-        stack.set(b"E", "fval".into());
-        stack.unset(b"U");
+        stack.put(b"E", "fval".into());
+        stack.clear(b"U");
         stack.push();
-        stack.set(b"E", "fval".into());
-        stack.unset(b"U");
-        assert!(!stack.propagate_capture());
+        stack.put(b"E", "fval".into());
+        stack.clear(b"U");
+        assert!(!stack.capture());
         stack.pop();
         assert_eq!(stack.get(b"E"), Some(&"rootE".into()));
         assert_eq!(stack.get(b"U"), Some(&"rootU".into()));
@@ -466,11 +812,11 @@ mod tests {
     #[test]
     fn visible_names_respect_shadowing() {
         let mut s = VarStack::default();
-        s.set(b"a", "1".into());
-        s.set(b"b", "2".into());
+        s.put(b"a", "1".into());
+        s.put(b"b", "2".into());
         s.push();
-        s.unset(b"a");
-        s.set(b"c", BString::default());
+        s.clear(b"a");
+        s.put(b"c", BString::default());
         assert_eq!(
             s.visible_names(),
             vec![BString::from("b"), BString::from("c")]

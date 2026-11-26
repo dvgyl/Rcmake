@@ -293,10 +293,66 @@ impl Interp {
         self.record_variable_access(name);
         self.record_var_write(name, crate::VarOp::Set, Some(&value));
         if deprecated_cache_variable(name) || self.hooks.watches.contains_key(name) {
-            self.vars.set(name, value.clone());
-            self.fire_watches(name, WatchAccess::Modified, Some(&value));
+            if self.store_var(name, value.clone()) {
+                self.fire_watches(name, WatchAccess::Modified, Some(&value));
+            }
         } else {
-            self.vars.set(name, value);
+            self.store_var(name, value);
+        }
+    }
+
+    /// Bind a normal variable in the current scope without watches or journal records.
+    ///
+    /// Return `false` after a fatal error if the binding would pass the live variable
+    /// budget. Then the variable does not change.
+    pub(crate) fn store_var(&mut self, name: &[u8], value: BString) -> bool {
+        if self.vars.set(name, value, self.live_limit()).is_ok() {
+            return true;
+        }
+        self.report_variable_budget();
+        false
+    }
+
+    /// Bytes that live variable bindings can use: the configured budget less the
+    /// temporary call data that active calls hold.
+    pub(crate) fn live_limit(&self) -> usize {
+        self.config
+            .limits
+            .max_live_variable_bytes
+            .saturating_sub(self.temp_bytes)
+    }
+
+    /// Bytes of the live variable budget that are still free.
+    pub(crate) fn temp_room(&self) -> usize {
+        self.live_limit().saturating_sub(self.vars.live_bytes())
+    }
+
+    /// Reserve `bytes` of temporary call data before the data is copied.
+    ///
+    /// Report a fatal error and return `false` if the budget has no room for it. Release
+    /// each successful reservation with [`Self::release_temp`].
+    pub(crate) fn reserve_temp(&mut self, bytes: usize) -> bool {
+        if bytes > self.temp_room() {
+            self.report_variable_budget();
+            return false;
+        }
+        self.temp_bytes += bytes;
+        true
+    }
+
+    /// Release temporary call data that [`Self::reserve_temp`] reserved.
+    pub(crate) fn release_temp(&mut self, bytes: usize) {
+        self.temp_bytes = self.temp_bytes.saturating_sub(bytes);
+    }
+
+    /// Report the fatal error for a write that would pass the live variable budget.
+    pub(crate) fn report_variable_budget(&mut self) {
+        if !self.fatal {
+            let limit = self.config.limits.max_live_variable_bytes;
+            self.error_here(
+                format!("Total variable storage would exceed the {limit}-byte limit.").into(),
+            );
+            self.fatal = true;
         }
     }
 
@@ -304,7 +360,10 @@ impl Interp {
     pub(crate) fn undefine(&mut self, name: &[u8]) {
         self.record_variable_access(name);
         self.record_var_write(name, crate::VarOp::Unset, None);
-        self.vars.unset(name);
+        if self.vars.unset(name, self.live_limit()).is_err() {
+            self.report_variable_budget();
+            return;
+        }
         self.fire_watches(name, WatchAccess::Removed, None);
     }
 
