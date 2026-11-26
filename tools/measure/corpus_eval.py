@@ -23,6 +23,7 @@ import tarfile
 import tempfile
 import time
 import tomllib
+from urllib.error import HTTPError
 from urllib.request import urlopen
 import zipfile
 
@@ -41,6 +42,7 @@ JOBS = "2"
 ORACLE_VERSION = "4.5.1"
 DOWNLOAD_TIMEOUT = 1800
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+RETRY_DELAYS = (1, 3)
 
 
 def corpus_cache() -> Path:
@@ -74,25 +76,50 @@ def cached_archive(pin: dict) -> Path:
                 return archive
 
     print(f"Downloading {pin['url']}", flush=True)
-    with tempfile.NamedTemporaryFile(dir=CACHE, suffix=".tmp", delete=False) as target:
+    for attempt, delay in enumerate(RETRY_DELAYS, start=1):
+        try:
+            download(pin["url"], sha256, archive)
+            return archive
+        except (OSError, HTTPException, DigestMismatch) as error:
+            if not transient(error):
+                raise
+            print(f"Download attempt {attempt} failed: {error}. Retrying in {delay} s.", file=sys.stderr, flush=True)
+            time.sleep(delay)
+    download(pin["url"], sha256, archive)
+    return archive
+
+
+class DigestMismatch(ValueError):
+    """The downloaded bytes do not have the pinned SHA-256 digest."""
+
+
+def transient(error: Exception) -> bool:
+    """Return whether a new download attempt can possibly succeed."""
+    if isinstance(error, HTTPError):
+        return error.code >= 500 or error.code in (408, 429)
+    return True
+
+
+def download(url: str, sha256: str, archive: Path) -> None:
+    """Download one archive and move it into the cache only if its digest matches."""
+    with tempfile.NamedTemporaryFile(dir=archive.parent, suffix=".tmp", delete=False) as target:
         partial = Path(target.name)
     try:
         digest = hashlib.sha256()
         deadline = time.monotonic() + DOWNLOAD_TIMEOUT
-        with urlopen(pin["url"], timeout=60) as source, partial.open("wb") as target:
+        with urlopen(url, timeout=60) as source, partial.open("wb") as target:
             while chunk := source.read1(1024 * 1024):
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"Download timed out for {pin['url']}")
+                    raise TimeoutError(f"Download timed out for {url}")
                 if target.tell() + len(chunk) > MAX_ARCHIVE_BYTES:
-                    raise ValueError(f"Download is too large for {pin['url']}")
+                    raise ValueError(f"Download is too large for {url}")
                 target.write(chunk)
                 digest.update(chunk)
         if digest.hexdigest() != sha256:
-            raise ValueError(f"SHA-256 mismatch for {pin['url']}: got {digest.hexdigest()}")
+            raise DigestMismatch(f"SHA-256 mismatch for {url}: got {digest.hexdigest()}")
         partial.replace(archive)
     finally:
         partial.unlink(missing_ok=True)
-    return archive
 
 
 def extract(archive: Path, destination: Path) -> Path:

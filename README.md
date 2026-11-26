@@ -430,7 +430,15 @@ docs/           FAQ, build write-up, architecture, ADRs, environment variables, 
 
 ## Licence
 
-The Rust code in `crates/` and tooling in `tools/` are dual-licensed under either of the licences below. The exception is the CMake-derived files that [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) §1 lists, which stay under `BSD-3-Clause`.
+The CMake-derived files that [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) §1 lists contain text and tables from CMake 4.5.1. These files use `BSD-3-Clause`:
+
+- `crates/rcmake-diag/src/generated_policies.rs`
+- `crates/rcmake-diag/src/policy_warnings.rs`
+- `crates/rcmake-lsp/src/generated_catalog.rs`
+- `crates/rcmake-commands/src/targets/generated_init.rs`
+- `crates/rcmake-cli/help/usage.txt`
+
+All other code in `crates/` and `tools/` is dual-licensed under either of these licences:
 
 - Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
 - MIT License ([`LICENSE-MIT`](LICENSE-MIT))

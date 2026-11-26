@@ -90,13 +90,14 @@ Putting every system boundary behind one trait made six higher-level features sm
 
 ## 3. Timeline and multi-agent division of work
 
-One human maintainer set the goals, implementation rules, and review gates, and coordinated coding agents over three calendar days:
+One human maintainer set the goals, implementation rules, and review gates, and coordinated coding agents over four calendar days:
 
 - **2026-11-23:** initial specification, workspace bootstrap, `Host` and `rcmake-syntax` contracts, oracle tooling, `rcmake-regex`, `rcmake-expr`, `rcmake-eval`, presets v13, and `-P` script parity.
 - **2026-11-24:** full configure and resolution pipeline, Ninja, Unix Makefiles, Xcode, Visual Studio, File API, `ctest`, `cpack`, CPS, SBOM, C++20 modules, Fortran, CUDA, Qt `AUTOGEN`, persistent probe cache, incremental replay, FetchContent lockfiles, `rcmake-api`, `rcmake-lsp`, and safe-Rust fuzzing.
 - **2026-11-25:** large-project corpus parity, 20 independent black-box scenarios, cross-platform Windows and Linux CI recovery, diagnostic formatting and File API v2.12 alignment, WebAssembly verification, brand kit, static site, and public documentation polish.
+- **2026-11-26:** `rcmake-json` in place of `serde_json`, probe and evaluation performance work, shell completions and man page, release receipts, licence notices, and site and documentation polish.
 
-The repository history starts on 2026-11-23 at 08:54 UTC. At the time of writing, it has about 400 commits, and `crates/` holds about 325,000 lines of Rust in 923 files. The workspace-size command in [section 7](#7-reproduce-every-claim-in-one-command) prints the current count.
+The repository history starts on 2026-11-23 at 08:54 UTC. On 2026-11-26, it has 450 commits, and `crates/` holds about 328,000 lines of Rust in 936 files. The workspace-size command in [section 7](#7-reproduce-every-claim-in-one-command) prints the current count.
 
 A human did not read most of this code line by line. Cross-model review, the differential oracle, and the test suites in [section 4](#4-the-differential-oracle-method) checked it. Treat the published results as the evidence, not a claim of human review.
 
@@ -110,7 +111,7 @@ A human did not read most of this code line by line. Cross-model review, the dif
 ### Engineering habits that mattered
 
 - **Disjoint worktrees.** Parallel implementation batches touched non-overlapping crates or command families inside separate git worktrees. That separation prevented merge conflicts while 3 to 5 agents worked in parallel.
-- **Cross-model review.** No agent reviewed its own code. Opus 5.5 reviewed large GPT 6.2 Sol architectural changes, GPT 6.2 Sol reviewed Opus 5.5 slices, and every patch faced automated oracle verification before landing.
+- **Cross-model review.** No agent reviewed its own code. Opus 5.5 reviewed large GPT 6.2 Sol architectural changes, GPT 6.2 Sol reviewed Opus 5.5 slices, and CI ran the oracle checks on every pull request and every push to `main`.
 - **Resource limits on a 16 GB laptop.** Every local Cargo run shared at most two build jobs (`CARGO_BUILD_JOBS=2`, `RUST_TEST_THREADS=3` in `env/env.sh`). Read-only triage, specification checks, code reviews, Python verification scripts, and documentation ran in parallel without contending for a Cargo build.
 - **Probes over debate.** Agents (like humans) write confident, plausible explanations for wrong hypotheses. Every disagreement about CMake semantics became a small script executed against CMake 4.5.1. For example, one early proposal suggested relaxing our export-file comparison to accept quoted `add_library("Demo::...")` names. Running the oracle proved CMake never quotes those target names, so the bug was in `rcmake`'s export writer and the test stayed strict.
 - **Treating test scripts as code under test.** Our large-project CI job originally truncated per-file diffs at 500 lines. On `llvm-project` and `vtk`, the first 500 lines contained only oracle entries, hiding every `rcmake` row. Commit `f28b50e` raised the cap to 2,000 lines and added per-field summaries with counts and samples from both sides.
