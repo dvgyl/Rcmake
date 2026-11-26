@@ -27,6 +27,18 @@ executables = [*tools, lsp]
 if set(bin_dir.iterdir()) != set(executables) or not all(tool.is_file() for tool in executables):
     sys.exit("Expected the four CLI entry points and rcmake-lsp in the extracted package.")
 
+if not windows:
+    for extra in (
+        "share/man/man1/rcmake.1",
+        "share/bash-completion/completions/rcmake",
+        "share/zsh/site-functions/_rcmake",
+        "share/fish/vendor_completions.d/rcmake.fish",
+        "share/rcmake/completions/rcmake.ps1",
+    ):
+        extra_path = package / extra
+        if extra_path.is_symlink() or not extra_path.is_file():
+            sys.exit(f"Missing {extra} in the extracted package.")
+
 paths = set()
 for entry in roots:
     category, _, raw = entry.partition("=")
@@ -243,6 +255,16 @@ for tool in ("cmake", "ctest", "cpack", "rcmake-lsp"):
     (bin_dir / tool).symlink_to("rcmake")
 ignore = shutil.ignore_patterns("._*", ".DS_Store")
 shutil.copytree(root / "modules/cmake-4.5", package / "share/cmake-4.5", ignore=ignore)
+for source_rel, target_rel in (
+    ("docs/man/rcmake.1", "share/man/man1/rcmake.1"),
+    ("completions/rcmake.bash", "share/bash-completion/completions/rcmake"),
+    ("completions/_rcmake", "share/zsh/site-functions/_rcmake"),
+    ("completions/rcmake.fish", "share/fish/vendor_completions.d/rcmake.fish"),
+    ("completions/rcmake.ps1", "share/rcmake/completions/rcmake.ps1"),
+):
+    destination = package / target_rel
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(root / source_rel, destination)
 shutil.copytree(root / "third_party/licences", package / "third_party/licences", ignore=ignore)
 for filename in ("LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY_NOTICES.md"):
     shutil.copyfile(root / filename, package / filename)

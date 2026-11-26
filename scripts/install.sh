@@ -7,8 +7,9 @@ usage() {
 Usage: install.sh [--from-source | --archive <path>] [--alias-cmake] [--force]
        install.sh --uninstall
 
-Install rcmake and rcmake-lsp into $PREFIX/bin and the bundled CMake 4.5.1
-data into $PREFIX/share/cmake-4.5. The default PREFIX is $HOME/.local.
+Install rcmake and rcmake-lsp into $PREFIX/bin, the bundled CMake 4.5.1
+data into $PREFIX/share/cmake-4.5, and any bundled shell completions and
+man page under $PREFIX/share. The default PREFIX is $HOME/.local.
 
 Sources (select one, the default is the latest GitHub Release):
   --from-source      Build a release archive from this checkout (needs Cargo).
@@ -18,8 +19,9 @@ Sources (select one, the default is the latest GitHub Release):
 Options:
   --alias-cmake      Also create cmake, ctest, and cpack links to rcmake.
   --force            Replace existing cmake, ctest, or cpack files.
-  --uninstall        Remove rcmake, rcmake-lsp, the links to rcmake, and
-                     share/cmake-4.5 from $PREFIX.
+  --uninstall        Remove rcmake, rcmake-lsp, the links to rcmake,
+                     share/cmake-4.5, and the rcmake completions and man
+                     page from $PREFIX.
   -h, --help         Show this help.
 
 Requirements: bash, python3, and curl (for release downloads).
@@ -68,6 +70,13 @@ prefix="${PREFIX:-$HOME/.local}"
 bin_dir="$prefix/bin"
 data_dir="$prefix/share/cmake-4.5"
 tools=(cmake ctest cpack)
+extra_share_files=(
+  "$prefix/share/man/man1/rcmake.1"
+  "$prefix/share/bash-completion/completions/rcmake"
+  "$prefix/share/zsh/site-functions/_rcmake"
+  "$prefix/share/fish/vendor_completions.d/rcmake.fish"
+  "$prefix/share/rcmake/completions/rcmake.ps1"
+)
 
 is_rcmake_link() {
   [[ -L "$1" && "$(readlink "$1")" == rcmake ]]
@@ -101,6 +110,16 @@ if "$uninstall"; then
       removed+=("$data_dir")
     fi
   fi
+  for extra in "${extra_share_files[@]}"; do
+    if [[ -f "$extra" && ! -L "$extra" ]]; then
+      rm -f "$extra"
+      removed+=("$extra")
+      if [[ "$extra" == "$prefix/share/rcmake/completions/rcmake.ps1" ]]; then
+        rmdir "$prefix/share/rcmake/completions" 2>/dev/null || true
+        rmdir "$prefix/share/rcmake" 2>/dev/null || true
+      fi
+    fi
+  done
   if [[ ${#removed[@]} -eq 0 ]]; then
     printf 'Found no rcmake installation in %s.\n' "$prefix"
   else
@@ -207,6 +226,13 @@ data_dir = Path("share/cmake-4.5")
 rcmake_rel = Path("bin/rcmake")
 lsp_rel = Path("bin/rcmake-lsp")
 binaries = (rcmake_rel, lsp_rel)
+extra_share_files = (
+    Path("share/man/man1/rcmake.1"),
+    Path("share/bash-completion/completions/rcmake"),
+    Path("share/zsh/site-functions/_rcmake"),
+    Path("share/fish/vendor_completions.d/rcmake.fish"),
+    Path("share/rcmake/completions/rcmake.ps1"),
+)
 
 try:
     if checksum:
@@ -263,6 +289,14 @@ try:
                         output.chmod(0o755 if member.mode & 0o111 else 0o644)
                     else:
                         raise ValueError(f"Invalid archive entry {member.name!r}.")
+                elif relative in extra_share_files:
+                    if not member.isfile():
+                        raise ValueError(f"Invalid archive entry {member.name!r}.")
+                    output = work / relative
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    with tar.extractfile(member) as source, output.open("xb") as destination:
+                        shutil.copyfileobj(source, destination)
+                    output.chmod(0o644)
 
         staged_bin = work / rcmake_rel
         if staged_bin.is_symlink() or not staged_bin.is_file():
@@ -278,6 +312,7 @@ try:
                 raise ValueError(f"Missing {required} in the archive.")
         subprocess.run([staged_bin, "--version"], check=True, stdout=subprocess.DEVNULL, timeout=30)
 
+        staged_extras = [rel for rel in extra_share_files if (work / rel).is_file()]
         bin_dir = prefix / "bin"
         bin_dir.mkdir(exist_ok=True)
         for target_name, present in (("rcmake", True), ("rcmake-lsp", staged_lsp_is_link or staged_lsp_is_file)):
@@ -285,6 +320,10 @@ try:
                 target_path = bin_dir / target_name
                 if target_path.is_dir() and not target_path.is_symlink():
                     raise ValueError(f"{target_path} is a directory. Remove it, then run the installer again.")
+        for rel in staged_extras:
+            target_path = prefix / rel
+            if target_path.is_dir() and not target_path.is_symlink():
+                raise ValueError(f"{target_path} is a directory. Remove it, then run the installer again.")
         installed_data = prefix / data_dir
         installed_data.parent.mkdir(exist_ok=True)
         backup = work / "previous-data"
@@ -318,6 +357,11 @@ try:
                     new_alias.replace(alias)
                 installed.append(f"{alias} -> rcmake")
         installed.append(installed_data)
+        for rel in staged_extras:
+            destination = prefix / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            (work / rel).replace(destination)
+            installed.append(destination)
 
         version = subprocess.run([bin_dir.resolve() / "rcmake", "--version"], check=True, timeout=30,
                                  stdout=subprocess.PIPE, text=True).stdout.splitlines()

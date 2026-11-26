@@ -13,5 +13,6 @@ Use this table to find the document that answers your question. To install and u
 | How do I report a security problem? | [SECURITY.md](../SECURITY.md) |
 | How do I run configure and `explain` from my own Rust program? | [crates/rcmake-api/README.md](../crates/rcmake-api/README.md) |
 | How do I connect my editor to the language server? | [crates/rcmake-lsp/README.md](../crates/rcmake-lsp/README.md) |
+| How do I enable shell completions or read the man page? | [completions/README.md](../completions/README.md) and [man/rcmake.1](man/rcmake.1) |
 
 The [compatibility report](https://dvgyl.github.io/rcmake/dashboard.html) shows the latest verification results. The [browser playground](https://dvgyl.github.io/rcmake/playground.html) runs `rcmake` with no install.

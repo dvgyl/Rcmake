@@ -18,8 +18,10 @@ function Show-Usage {
 Usage: install.ps1 [-Version <version>] [-Prefix <dir>] [-Archive <path>] [-AliasCmake] [-Force]
        install.ps1 -Uninstall [-Prefix <dir>]
 
-Install rcmake.exe and rcmake-lsp.exe into <Prefix>\bin and the bundled CMake 4.5.1
-data into <Prefix>\share\cmake-4.5. The default Prefix is %LOCALAPPDATA%\rcmake.
+Install rcmake.exe and rcmake-lsp.exe into <Prefix>\bin, the bundled CMake 4.5.1
+data into <Prefix>\share\cmake-4.5, and the PowerShell completion script into
+<Prefix>\share\rcmake\completions\rcmake.ps1 when present in the archive.
+The default Prefix is %LOCALAPPDATA%\rcmake.
 
 Options:
   -Version <ver>     Release version to download, or "latest" (default: latest).
@@ -30,7 +32,8 @@ Options:
                      from rcmake.exe (hardlink, falling back to copy).
   -Force             Replace existing cmake.exe, ctest.exe, or cpack.exe files.
   -Uninstall         Remove rcmake.exe, rcmake-lsp.exe, rcmake-owned aliases,
-                     and share\cmake-4.5 from Prefix.
+                     share\cmake-4.5, and share\rcmake\completions\rcmake.ps1
+                     from Prefix.
   -Help              Show this help.
 
 Requirements: Windows PowerShell 5.1 or PowerShell 7+.
@@ -245,10 +248,11 @@ function Expand-RcmakeArchive {
             $relPosix = $relParts -join '/'
             $isBinary = ($relPosix -ceq 'bin/rcmake.exe') -or ($relPosix -ceq 'bin/rcmake-lsp.exe')
             $isData = ($relPosix -ceq 'share/cmake-4.5') -or $relPosix.StartsWith('share/cmake-4.5/', [StringComparison]::Ordinal)
-            if (-not ($isBinary -or $isData)) {
+            $isCompletion = ($relPosix -ceq 'share/rcmake/completions/rcmake.ps1')
+            if (-not ($isBinary -or $isData -or $isCompletion)) {
                 continue
             }
-            if ($isBinary -and $isDir) {
+            if (($isBinary -or $isCompletion) -and $isDir) {
                 Stop-Install "Invalid archive entry '$rawName'."
             }
 
@@ -314,6 +318,8 @@ if ([string]::IsNullOrWhiteSpace($Prefix)) {
 $prefixFull = Resolve-FullPath -Path $Prefix
 $binDir = Join-Path $prefixFull 'bin'
 $dataDir = Join-Path (Join-Path $prefixFull 'share') 'cmake-4.5'
+$completionDir = Join-Path (Join-Path (Join-Path $prefixFull 'share') 'rcmake') 'completions'
+$completionPath = Join-Path $completionDir 'rcmake.ps1'
 $rcmakePath = Join-Path $binDir 'rcmake.exe'
 $lspPath = Join-Path $binDir 'rcmake-lsp.exe'
 $tools = @('cmake.exe', 'ctest.exe', 'cpack.exe')
@@ -348,6 +354,17 @@ if ($Uninstall) {
         } else {
             Remove-Item -LiteralPath $dataDir -Recurse -Force
             $removed += $dataDir
+        }
+    }
+
+    $completionItem = Get-ItemOrNull -Path $completionPath
+    if ($null -ne $completionItem -and -not $completionItem.PSIsContainer -and -not ($completionItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Remove-Item -LiteralPath $completionPath -Force
+        $removed += $completionPath
+        foreach ($dirToPrune in @($completionDir, (Split-Path -Parent $completionDir))) {
+            if ((Test-Path -LiteralPath $dirToPrune -PathType Container) -and (@(Get-ChildItem -LiteralPath $dirToPrune -Force).Count -eq 0)) {
+                Remove-Item -LiteralPath $dirToPrune -Force
+            }
         }
     }
 
@@ -509,6 +526,8 @@ try {
     }
     $stagedLsp = Join-Path (Join-Path $stageWork 'bin') 'rcmake-lsp.exe'
     $hasLsp = Test-Path -LiteralPath $stagedLsp -PathType Leaf
+    $stagedCompletion = Join-Path (Join-Path (Join-Path (Join-Path $stageWork 'share') 'rcmake') 'completions') 'rcmake.ps1'
+    $hasCompletion = Test-Path -LiteralPath $stagedCompletion -PathType Leaf
 
     $stagedData = Join-Path (Join-Path $stageWork 'share') 'cmake-4.5'
     foreach ($required in @('Modules\CMake.cmake', 'Templates\CPackConfig.cmake.in')) {
@@ -527,7 +546,8 @@ try {
 
     foreach ($checkTarget in @(
         @{ Path = $rcmakePath; Present = $true },
-        @{ Path = $lspPath; Present = $hasLsp }
+        @{ Path = $lspPath; Present = $hasLsp },
+        @{ Path = $completionPath; Present = $hasCompletion }
     )) {
         if ($checkTarget.Present) {
             $existing = Get-ItemOrNull -Path $checkTarget.Path
@@ -568,6 +588,11 @@ try {
         $installed += "$aliasPath -> rcmake.exe ($mode)"
     }
     $installed += $dataDir
+    if ($hasCompletion) {
+        New-Item -ItemType Directory -Path $completionDir -Force | Out-Null
+        Move-Item -LiteralPath $stagedCompletion -Destination $completionPath -Force
+        $installed += $completionPath
+    }
 
     $versionOutput = & $rcmakePath --version
     if ($LASTEXITCODE -ne 0) {

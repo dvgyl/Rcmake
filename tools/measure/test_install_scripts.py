@@ -19,6 +19,13 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SH = ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
+EXTRA_SHARE_FILES = (
+    "share/man/man1/rcmake.1",
+    "share/bash-completion/completions/rcmake",
+    "share/zsh/site-functions/_rcmake",
+    "share/fish/vendor_completions.d/rcmake.fish",
+    "share/rcmake/completions/rcmake.ps1",
+)
 
 
 def _make_fake_archive(
@@ -31,6 +38,8 @@ def _make_fake_archive(
     rcmake_is_symlink: bool = False,
     sidecar: str = "valid",
     extra_marker: str = "v1",
+    include_completions_and_man: bool = False,
+    symlink_extra_path: str | None = None,
 ) -> Path:
     """Create a synthetic release .tar.gz archive and optional .sha256 sidecar."""
     top = f"rcmake-{version}-test"
@@ -89,6 +98,16 @@ def _make_fake_archive(
             f"# fake CPackConfig {version} {extra_marker}\n".encode("utf-8"),
             0o644,
         )
+        if include_completions_and_man:
+            for relpath in EXTRA_SHARE_FILES:
+                add_bytes(
+                    tar,
+                    relpath,
+                    f"# fake {relpath} {version} {extra_marker}\n".encode("utf-8"),
+                    0o644,
+                )
+        if symlink_extra_path is not None:
+            add_symlink(tar, symlink_extra_path, "/etc/passwd")
 
     sidecar_path = Path(f"{archive_path}.sha256")
     if sidecar == "valid":
@@ -432,6 +451,117 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("Kept", res.stdout)
         self.assertIn("another CMake installation", res.stdout)
 
+    def test_install_and_uninstall_with_completions_and_man_page(self) -> None:
+        neighbors = {
+            "share/man/man1/other.1": "other man page\n",
+            "share/bash-completion/completions/other": "other bash completion\n",
+            "share/zsh/site-functions/_other": "other zsh completion\n",
+            "share/fish/vendor_completions.d/other.fish": "other fish completion\n",
+        }
+        for relpath, text in neighbors.items():
+            target = self.prefix / relpath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+
+        v1 = _make_fake_archive(
+            self.archives,
+            version="0.1.0",
+            archive_name="rcmake-with-extras-v1.tar.gz",
+            lsp_mode="symlink",
+            extra_marker="v1",
+            include_completions_and_man=True,
+        )
+        res = self.run_install("--archive", str(v1))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        for relpath in EXTRA_SHARE_FILES:
+            installed = self.prefix / relpath
+            self.assertTrue(installed.is_file() and not installed.is_symlink(), relpath)
+            self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o644, relpath)
+            self.assertIn(f"{relpath} 0.1.0 v1", installed.read_text(encoding="utf-8"))
+            self.assertIn(str(installed), res.stdout)
+
+        # Reinstall with a newer archive updates all five completion and man files.
+        v2 = _make_fake_archive(
+            self.archives,
+            version="0.2.0",
+            archive_name="rcmake-with-extras-v2.tar.gz",
+            lsp_mode="symlink",
+            extra_marker="v2",
+            include_completions_and_man=True,
+        )
+        res = self.run_install("--archive", str(v2))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        for relpath in EXTRA_SHARE_FILES:
+            installed = self.prefix / relpath
+            self.assertIn(f"{relpath} 0.2.0 v2", installed.read_text(encoding="utf-8"))
+
+        # Uninstall removes only rcmake-owned files and preserves unrelated neighbors.
+        res = self.run_install("--uninstall")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        for relpath in EXTRA_SHARE_FILES:
+            installed = self.prefix / relpath
+            self.assertFalse(os.path.lexists(installed), relpath)
+            self.assertIn(str(installed), res.stdout)
+        self.assertFalse(os.path.lexists(self.prefix / "share" / "rcmake"))
+        for relpath, text in neighbors.items():
+            neighbor = self.prefix / relpath
+            self.assertTrue(neighbor.is_file(), relpath)
+            self.assertEqual(neighbor.read_text(encoding="utf-8"), text)
+
+    def test_install_and_uninstall_without_completions_and_man_page(self) -> None:
+        legacy = _make_fake_archive(
+            self.archives,
+            version="0.1.0",
+            archive_name="rcmake-legacy-no-extras.tar.gz",
+            lsp_mode="symlink",
+            include_completions_and_man=False,
+        )
+        res = self.run_install("--archive", str(legacy))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue((self.prefix / "bin" / "rcmake").is_file())
+        for relpath in EXTRA_SHARE_FILES:
+            self.assertFalse(os.path.lexists(self.prefix / relpath), relpath)
+
+        res = self.run_install("--uninstall")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(os.path.lexists(self.prefix / "bin" / "rcmake"))
+        self.assertFalse(os.path.lexists(self.prefix / "bin" / "rcmake-lsp"))
+        self.assertFalse(os.path.lexists(self.prefix / "share" / "cmake-4.5"))
+
+    def test_completions_and_man_reject_symlinks_and_uninstall_with_foreign_cmake(self) -> None:
+        bad = _make_fake_archive(
+            self.archives,
+            archive_name="bad-extra-symlink.tar.gz",
+            lsp_mode="symlink",
+            symlink_extra_path="share/man/man1/rcmake.1",
+        )
+        res = self.run_install("--archive", str(bad))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Invalid archive entry", res.stderr)
+        self.assertFalse(os.path.lexists(self.prefix / "share" / "man" / "man1" / "rcmake.1"))
+
+        archive = _make_fake_archive(
+            self.archives,
+            archive_name="with-extras-foreign-cmake.tar.gz",
+            lsp_mode="symlink",
+            include_completions_and_man=True,
+        )
+        res = self.run_install("--archive", str(archive))
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        foreign_cmake = self.prefix / "bin" / "cmake"
+        foreign_cmake.write_text("#!/bin/sh\necho kitware-cmake\n", encoding="utf-8")
+        custom_rcmake_note = self.prefix / "share" / "rcmake" / "custom.txt"
+        custom_rcmake_note.write_text("keep me\n", encoding="utf-8")
+
+        res = self.run_install("--uninstall")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue((self.prefix / "share" / "cmake-4.5" / "Modules" / "CMake.cmake").is_file())
+        for relpath in EXTRA_SHARE_FILES:
+            self.assertFalse(os.path.lexists(self.prefix / relpath), relpath)
+        self.assertTrue(custom_rcmake_note.is_file())
+        self.assertEqual(custom_rcmake_note.read_text(encoding="utf-8"), "keep me\n")
+
 
 class InstallPs1Tests(unittest.TestCase):
     def test_spdx_flags_structure_and_safety(self) -> None:
@@ -475,6 +605,7 @@ class InstallPs1Tests(unittest.TestCase):
             "bin/rcmake.exe",
             "bin/rcmake-lsp.exe",
             "share/cmake-4.5",
+            "share/rcmake/completions/rcmake.ps1",
             "scripts/stage.sh",
             "--from-source",
             "Run again with -Force",

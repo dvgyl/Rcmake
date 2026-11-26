@@ -141,7 +141,7 @@ GitHub Releases has archives for these targets:
 - `aarch64-unknown-linux-gnu`
 - `x86_64-pc-windows-msvc`
 
-`scripts/install.sh` downloads the latest release and verifies its SHA-256 checksum. It installs `bin/rcmake`, `bin/rcmake-lsp`, and `share/cmake-4.5` into `$HOME/.local`, or into `$PREFIX` if you set it. The script needs `bash`, `python3`, and `curl`.
+`scripts/install.sh` downloads the latest release and verifies its SHA-256 checksum. It installs `bin/rcmake`, `bin/rcmake-lsp`, `share/cmake-4.5`, and the bundled shell completions and `rcmake(1)` man page into `$HOME/.local`, or into `$PREFIX` if you set it. The script needs `bash`, `python3`, and `curl`.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash
@@ -237,6 +237,10 @@ cargo build --locked --release -p rcmake-lsp --features eval,stdio
 
 A build with `--features stdio` alone gives a lexical-only server. [`crates/rcmake-lsp/README.md`](crates/rcmake-lsp/README.md) has configuration for VS Code, Neovim, Helix, Zed, Emacs, and CLion.
 
+### Shell completions and man page
+
+Release tarballs and `scripts/install.sh` install completions for Bash, Zsh, Fish, and PowerShell along with the `rcmake(1)` man page under `$PREFIX/share/`. See [`completions/README.md`](completions/README.md) for shell setup commands and [`docs/man/rcmake.1`](docs/man/rcmake.1) for the manual source.
+
 ### Upgrade
 
 Run the install command again with the same options. The script replaces `rcmake`, `rcmake-lsp`, and `share/cmake-4.5`, and keeps your links. On Windows, extract the new archive and change the `PATH` entry to the new `bin` folder.
@@ -247,7 +251,7 @@ Run the install command again with the same options. The script replaces `rcmake
 curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash -s -- --uninstall
 ```
 
-The script removes `bin/rcmake`, `bin/rcmake-lsp`, the `cmake`, `ctest`, and `cpack` links that point to `rcmake`, and `share/cmake-4.5`. Use the same `PREFIX` that you used for the install. The script does not delete the probe and FetchContent cache. To free that disk space, delete the cache directory:
+The script removes `bin/rcmake`, `bin/rcmake-lsp`, the `cmake`, `ctest`, and `cpack` links that point to `rcmake`, `share/cmake-4.5`, and the rcmake completions and man page. Use the same `PREFIX` that you used for the install. The script does not delete the probe and FetchContent cache. To free that disk space, delete the cache directory:
 
 | System | Cache directory |
 | --- | --- |
@@ -390,6 +394,7 @@ docs/           Build write-up, architecture, ADRs, environment variables, prior
 - [`docs/PRIOR_ART.md`](docs/PRIOR_ART.md): dependency and licence log
 - [`crates/rcmake-api/README.md`](crates/rcmake-api/README.md): embed configure and `explain` in a Rust program
 - [`crates/rcmake-lsp/README.md`](crates/rcmake-lsp/README.md): language server and editor setup
+- [`completions/README.md`](completions/README.md) and [`docs/man/rcmake.1`](docs/man/rcmake.1): shell completions (Bash, Zsh, Fish, PowerShell) and the `rcmake(1)` man page
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): first contribution, clean-room rules, engineering standards, and checks
 - [`CONTRIBUTORS.md`](CONTRIBUTORS.md): maintainers and attributions
 - [`SECURITY.md`](SECURITY.md): vulnerability reporting
