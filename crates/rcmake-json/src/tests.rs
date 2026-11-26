@@ -584,7 +584,7 @@ fn pretty_utf8_formats_real_exponent_boundaries() {
         assert_eq!(roundtrip.to_bits(), number.to_bits(), "{number:?}");
     }
 
-    let halfway = 112_171_935_477_118.125_f64;
+    let halfway = 112_171_935_477_118.0_f64 + 0.125;
     let rendered = pretty_utf8(&Value::Real(halfway));
     let Value::Real(roundtrip) =
         parse(rendered.as_slice(), &strict).expect("valid JSON halfway float")
