@@ -6,6 +6,7 @@ use std::path::Path;
 use rcmake_base::{BString, list};
 use rcmake_diag::{PolicyId, PolicyMap, PolicyStatus};
 use rcmake_json::{FieldError, FromJson, Value as Json, req};
+use rcmake_model::replay::{DirectorySourceMark, DirectorySources};
 use rcmake_model::{
     BT, DirId, LinkItem, PropertyMap, Target, TargetBinding, TargetKind, TargetOrigin, TestEntry,
     UsageField, UsageProps, UsageScope,
@@ -372,6 +373,8 @@ pub(super) struct LocalState {
     link_check: Option<PropertyOrigin>,
     directory_usage: Option<Usage>,
     used_cli: Vec<Vec<u8>>,
+    /// Source registrations that the listfile added to its directory.
+    sources: DirectorySources,
 }
 
 impl LocalState {
@@ -381,8 +384,10 @@ impl LocalState {
         used_cli: BTreeSet<BString>,
         install_start: Option<(usize, usize)>,
         link_check: Option<PropertyOrigin>,
+        sources: &DirectorySourceMark,
     ) -> Option<Self> {
         let dir = interp.current_dir_id();
+        let sources = interp.project.directory_sources_since(sources)?;
         let path = interp.current_binary_dir();
         let mut targets = BTreeMap::new();
         for (name, kind) in &writes.targets {
@@ -453,6 +458,7 @@ impl LocalState {
             link_check,
             directory_usage,
             used_cli: used_cli.iter().map(|name| name.to_vec()).collect(),
+            sources,
         })
     }
 
@@ -559,7 +565,7 @@ impl LocalState {
         };
         if !interp
             .project
-            .restore_directory_objects(dir, targets, aliases, tests)
+            .restore_directory_objects(dir, targets, aliases, tests, &self.sources)
         {
             return false;
         }
@@ -897,6 +903,7 @@ impl EncodeJson for LocalState {
             obj.field("directory_usage", |s| self.directory_usage.encode(s))?;
             obj.field("installs", |s| self.installs.encode(s))?;
             obj.field("link_check", |s| self.link_check.encode(s))?;
+            obj.field("sources", |s| s.bytes(&self.sources.0))?;
             obj.field("targets", |s| self.targets.encode(s))?;
             obj.field("tests", |s| self.tests.encode(s))?;
             obj.field("used_cli", |s| s.bytes_list(&self.used_cli))?;
@@ -918,6 +925,7 @@ impl FromJson for LocalState {
                 "link_check",
                 "directory_usage",
                 "used_cli",
+                "sources",
             ],
         )?;
         let variable_inputs = codec::field(obj, "variable_inputs", |value| match value {
@@ -939,6 +947,7 @@ impl FromJson for LocalState {
             link_check: req(obj, "link_check")?,
             directory_usage: req(obj, "directory_usage")?,
             used_cli: codec::field(obj, "used_cli", codec::from_bytes_list)?,
+            sources: DirectorySources(codec::field(obj, "sources", codec::from_bytes)?.into()),
         })
     }
 }

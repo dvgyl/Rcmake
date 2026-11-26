@@ -85,9 +85,9 @@ pub(crate) fn resolve_options(
                     .is_ok_and(|resolved| match resolved.settings {
                         PresetSettings::Package(settings) => {
                             settings.generators.is_none_or(|names| {
-                                names
-                                    .iter()
-                                    .all(|name| crate::generators::create(name).is_some())
+                                names.iter().all(|name| {
+                                    crate::generators::create_for_host(name, host).is_some()
+                                })
                             })
                         }
                         _ => false,

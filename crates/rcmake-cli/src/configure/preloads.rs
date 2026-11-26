@@ -1,10 +1,11 @@
 use rcmake_eval::IncludeOptions;
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, list};
 use rcmake_commands::ConfigureRuntime;
+use rcmake_eval::journal::ReplaySetupInputs;
 use rcmake_eval::{Interp, RunMode, Services};
 use rcmake_host::{FileKind, Follow, Host, path};
 use rcmake_json::Value;
@@ -20,6 +21,8 @@ use super::{
 #[derive(Default)]
 pub(super) struct Preloads {
     tracked: BTreeSet<BString>,
+    /// Absolute paths of the `-C` scripts and `PreLoad.cmake` files that ran, in order.
+    pub(super) files: Vec<PathBuf>,
     pub(super) results: Vec<Value>,
     pub(super) exit_code: i32,
     pub(super) fatal: bool,
@@ -56,6 +59,9 @@ impl ConfigureSession<'_> {
                         }
                     }
                     diagnostics::warn_legacy_define(host, &name);
+                    if let Some(setup) = interp.session_data_mut_or_init::<ReplaySetupInputs>() {
+                        setup.edit(&name, Some(&def.value));
+                    }
                     if unused_cli::apply_define(interp.cx().cache(), def)
                         && preloads.tracked.insert(name.clone())
                     {
@@ -68,6 +74,10 @@ impl ConfigureSession<'_> {
                         runtime.set_cli_make_program(None);
                     }
                     for name in remove_entries(interp, &pattern, &mut preloads.tracked) {
+                        if let Some(setup) = interp.session_data_mut_or_init::<ReplaySetupInputs>()
+                        {
+                            setup.edit(&name, None);
+                        }
                         report.remove(&name);
                     }
                 }
@@ -78,6 +88,7 @@ impl ConfigureSession<'_> {
                     }
                     let path = host.initial_cwd().join(&script);
                     if is_preload_file(evaluated.as_ref(), &path) {
+                        preloads.files.push(path);
                         self.run_preload(runtime, interp, &script, true, &mut preloads);
                     } else if !runtime.denied() {
                         options::out(
@@ -112,6 +123,7 @@ impl ConfigureSession<'_> {
             }
             let file = dir.join("PreLoad.cmake");
             if is_file(evaluated.as_ref(), &file) {
+                preloads.files.push(file.clone());
                 self.run_preload(runtime, interp, &file, false, &mut preloads);
             }
         }

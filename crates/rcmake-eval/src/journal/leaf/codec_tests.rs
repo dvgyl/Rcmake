@@ -96,9 +96,11 @@ fn leaf_records_round_trip() -> TestResult {
         link_check: Some(origin(4)),
         directory_usage: Some(usage()),
         used_cli: vec![b"CLI_VAR".to_vec(), b"\xff".to_vec()],
+        sources: DirectorySources(b"Ra.c\0A/src/\xff.c\0".as_slice().into()),
     };
     let decoded = round_trip(&full)?;
     assert_eq!(decoded.variable_inputs, full.variable_inputs);
+    assert_eq!(decoded.sources, full.sources);
     round_trip(&LocalState {
         variable_inputs: None,
         targets: Vec::new(),
@@ -108,6 +110,7 @@ fn leaf_records_round_trip() -> TestResult {
         link_check: None,
         directory_usage: None,
         used_cli: Vec::new(),
+        sources: DirectorySources::default(),
     })?;
     Ok(())
 }

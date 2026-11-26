@@ -1,11 +1,16 @@
-//! Generator registry and the External and macOS generators.
+//! Generator registry and the External, Linux, macOS, Windows, and IFW generators.
 
 pub mod bundle;
 mod deb;
 pub mod dmg;
 pub(crate) mod external;
+mod ifw;
+pub(crate) mod installer;
 mod linux;
+mod nsis;
+mod productbuild;
 mod rpm;
+mod wix;
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -16,15 +21,60 @@ use rcmake_host::{
     CommandSpec, CopyOptions, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest,
 };
 
+use self::installer::HostPlatform;
 use crate::archive_gen::{ArchiveGenerator, ArchiveKind};
 use crate::config::absolute;
 use crate::stage::clear_output_file;
 use crate::{CpackError, PackageContext, PackageGenerator, error};
 
 /// The generator named `name` (a `CPACK_GENERATOR` entry), or `None` when Rcmake does
-/// not have it.
+/// not have it on the current target platform.
 #[must_use]
 pub fn create(name: &[u8]) -> Option<Box<dyn PackageGenerator>> {
+    let platform = if cfg!(target_os = "macos") {
+        HostPlatform::MacOs
+    } else if cfg!(windows) {
+        HostPlatform::Windows
+    } else if cfg!(target_os = "linux") {
+        HostPlatform::Linux
+    } else {
+        HostPlatform::OtherUnix
+    };
+    create_for_platform(name, platform, false)
+}
+
+/// Resolve a generator for the runtime host reported by [`Host::system`].
+///
+/// Matches CMake 4.5.1's `cmCPackGeneratorFactory` platform availability:
+/// - `NSIS`, `NSIS64`, `IFW`, `External`, and all archive generators are available on all platforms.
+/// - `productbuild` is available on macOS (`Darwin`).
+/// - `WIX` is available on Windows.
+/// - `PureOS` (the default `PureHost` identity in existing unit tests) falls back to the
+///   compile-time platform for platform-gated installers while keeping existing `DragNDrop`,
+///   `Bundle`, `DEB`, and `RPM` tests working.
+pub(crate) fn create_for_host(name: &[u8], host: &dyn Host) -> Option<Box<dyn PackageGenerator>> {
+    let sysname = host.system().sysname;
+    if sysname == b"PureOS" {
+        return create(name);
+    }
+    create_for_platform(name, installer::classify_sysname(&sysname), false)
+}
+
+/// Construct any implemented generator regardless of runtime host platform (used by
+/// cross-platform portable test suites to verify every backend across macOS/Linux/Windows).
+#[cfg(test)]
+pub(crate) fn create_unrestricted(
+    name: &[u8],
+    _host: &dyn Host,
+) -> Option<Box<dyn PackageGenerator>> {
+    create_for_platform(name, HostPlatform::OtherUnix, true)
+}
+
+fn create_for_platform(
+    name: &[u8],
+    platform: HostPlatform,
+    unrestricted: bool,
+) -> Option<Box<dyn PackageGenerator>> {
     if let Some(kind) = ArchiveKind::ALL
         .into_iter()
         .find(|kind| kind.name().as_bytes() == name)
@@ -37,6 +87,13 @@ pub fn create(name: &[u8]) -> Option<Box<dyn PackageGenerator>> {
         b"External" => Some(Box::new(external::ExternalGenerator)),
         b"DragNDrop" => Some(Box::new(dmg::DragNDropGenerator)),
         b"Bundle" => Some(Box::new(bundle::BundleGenerator)),
+        b"NSIS" => Some(Box::new(nsis::Nsis::bits32())),
+        b"NSIS64" => Some(Box::new(nsis::Nsis::bits64())),
+        b"IFW" => Some(Box::new(ifw::Ifw)),
+        b"productbuild" if unrestricted || platform == HostPlatform::MacOs => {
+            Some(Box::new(productbuild::ProductBuild))
+        }
+        b"WIX" if unrestricted || platform == HostPlatform::Windows => Some(Box::new(wix::Wix)),
         _ => None,
     }
 }
@@ -217,17 +274,16 @@ impl<'a> ScratchDir<'a> {
         for _ in 0..100 {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let path = root.join(format!(".rcmake-{generator}-{}-{id}", host.system().pid));
-            match host.metadata(&path, Follow::No) {
-                Err(err) if err.kind == ErrorKind::NotFound => {
-                    host.create_dir_all(&path)?;
+            match host.create_private_dir(&path) {
+                Ok(()) => {
                     return Ok(Self {
                         host,
                         path,
                         cleanup: true,
                     });
                 }
+                Err(err) if err.kind == ErrorKind::AlreadyExists => {}
                 Err(err) => return Err(err.into()),
-                Ok(_) => {}
             }
         }
         Err(error("Cannot create a temporary staging directory"))

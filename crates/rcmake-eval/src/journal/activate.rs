@@ -18,6 +18,7 @@ use super::frame::{EncodeError, EncodeJson, JsonSink, MAX_FRAME_BYTES, encoded_s
 use super::leaf::{LocalState, Usage, Writes};
 use super::receipts::ReplayReceipts;
 use super::region::RegionPayload;
+use super::setup::{SetupRecord, SetupSession};
 use super::trace::JournalHasher;
 use super::{
     CacheValue, ConfigureSnapshot, EntryContext, JournalDigest, JournalEffect, JournalFileStat,
@@ -54,11 +55,13 @@ impl ReplayObservations {
 }
 
 #[derive(Default)]
-struct Regions {
+pub(super) struct Regions {
     root: Option<LocalState>,
     nested: Vec<(RegionRecord, LocalState)>,
     variable_inputs: Vec<Vec<String>>,
     receipts: Vec<JournalDigest>,
+    /// Setup inputs and checkpoints. `None` in a manifest without a setup section.
+    pub(super) setup: Option<SetupRecord>,
 }
 
 impl EncodeJson for Regions {
@@ -69,6 +72,9 @@ impl EncodeJson for Regions {
                 obj.field("receipts", |s| self.receipts.encode(s))?;
             }
             obj.field("root", |s| self.root.encode(s))?;
+            if let Some(setup) = &self.setup {
+                obj.field("setup", |s| setup.encode(s))?;
+            }
             if !self.variable_inputs.is_empty() {
                 obj.field("variable_inputs", |s| self.variable_inputs.encode(s))?;
             }
@@ -79,7 +85,10 @@ impl EncodeJson for Regions {
 
 impl FromJson for Regions {
     fn from_json(value: &Value) -> Result<Self, FieldError> {
-        let obj = codec::fields(value, &["root", "nested", "variable_inputs", "receipts"])?;
+        let obj = codec::fields(
+            value,
+            &["root", "nested", "variable_inputs", "receipts", "setup"],
+        )?;
         Ok(Self {
             root: req(obj, "root")?,
             nested: codec::field(obj, "nested", |nested| {
@@ -93,6 +102,7 @@ impl FromJson for Regions {
             })?,
             variable_inputs: opt_or_else(obj, "variable_inputs", Vec::new)?,
             receipts: opt_or_else(obj, "receipts", Vec::new)?,
+            setup: rcmake_json::opt(obj, "setup")?,
         })
     }
 }
@@ -154,10 +164,21 @@ pub(crate) struct ReplayState {
     replayed_listfiles: BTreeSet<PathBuf>,
     pub(crate) executed_listfiles: Option<BTreeSet<PathBuf>>,
     pub(crate) observations: Option<ReplayObservations>,
+    /// Setup spans and checkpoints of the running incremental configure. This state
+    /// stays here while a listfile body has the session.
+    pub(crate) setup: Option<SetupSession>,
+    setup_miss: Option<String>,
+    setup_sources: Vec<PathBuf>,
 }
 
 impl ReplaySession {
-    fn start(interp: &Interp, source: &Path, build: &Path, cached: Option<&[u8]>) -> Option<Self> {
+    fn start(
+        interp: &Interp,
+        source: &Path,
+        build: &Path,
+        preloads: &[PathBuf],
+        cached: Option<&[u8]>,
+    ) -> Option<(Self, SetupSession)> {
         if !interp.can_replay() {
             return None;
         }
@@ -223,19 +244,30 @@ impl ReplaySession {
                 .as_ref()
                 .map_or(0, |s| s.model.variable_inputs.len())
         ];
-        Some(Self {
-            host,
-            executable,
-            options: h.finish(),
-            root,
-            previous,
-            variable_indices,
-            source: None,
-            pending: Regions::default(),
-            receipts,
-            root_record: None,
-            bytes_left: MAX_FRAME_BYTES - 4096,
-        })
+        let options = h.finish();
+        let setup = SetupSession::start(
+            interp,
+            Arc::clone(&host),
+            options,
+            preloads,
+            previous.as_ref().map(|frame| frame.model.setup.clone()),
+        );
+        Some((
+            Self {
+                host,
+                executable,
+                options,
+                root,
+                previous,
+                variable_indices,
+                source: None,
+                pending: Regions::default(),
+                receipts,
+                root_record: None,
+                bytes_left: MAX_FRAME_BYTES - 4096,
+            },
+            setup,
+        ))
     }
 
     fn keep(&mut self, record: RegionRecord, state: LocalState) {
@@ -285,7 +317,11 @@ impl ReplaySession {
         Some(index)
     }
 
-    fn finish(mut self) -> Option<Vec<u8>> {
+    fn finish(mut self, setup: Option<SetupRecord>) -> Option<Vec<u8>> {
+        let setup = setup?;
+        let size = encoded_size(&setup, self.bytes_left)?;
+        self.bytes_left = self.bytes_left.saturating_sub(size + 16);
+        self.pending.setup = Some(setup);
         let confirmed = self
             .receipts
             .as_ref()
@@ -329,15 +365,51 @@ impl Interp {
     ) -> (RunOutcome, Option<Vec<u8>>) {
         self.replay.hits = 0;
         self.replay.replayed_listfiles.clear();
-        self.replay.session = ReplaySession::start(self, source, build, cached);
+        self.replay.setup_miss = None;
+        self.replay.setup_sources.clear();
+        let started = ReplaySession::start(self, source, build, preloads, cached);
+        let (session, setup) = started.map_or((None, None), |(session, setup)| {
+            (Some(session), Some(setup))
+        });
+        // Each configure attempt records into a new session. A failed or restarted
+        // attempt publishes nothing.
+        self.replay.session = session;
+        self.replay.setup = setup;
         let result = self.run_configure(source, build, preloads);
         let session = self.replay.session.take();
+        let setup = self.replay.setup.take();
+        if let Some(setup) = &setup {
+            self.replay.setup_miss = setup.miss().map(str::to_owned);
+        }
+        let record = setup.and_then(SetupSession::finish);
+        if let Some(record) = &record {
+            self.replay.setup_sources = record
+                .sources
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect();
+        }
         let bytes = if result.exit_code == 0 && self.can_replay() {
-            session.and_then(ReplaySession::finish)
+            session.and_then(|session| session.finish(record))
         } else {
             None
         };
         (result, bytes)
+    }
+
+    /// The reason that the last incremental configure used no recorded listfile
+    /// because of setup, for example `input file:toolchain` or
+    /// `checkpoint 0 variables`. `None` when setup allowed replay.
+    #[must_use]
+    pub fn replay_setup_miss(&self) -> Option<&str> {
+        self.replay.setup_miss.as_deref()
+    }
+
+    /// The setup files of the last incremental configure: preload scripts and the
+    /// files that the setup inputs name.
+    #[must_use]
+    pub fn replay_setup_sources(&self) -> &[PathBuf] {
+        &self.replay.setup_sources
     }
 
     /// Number of listfile bodies restored by the last incremental configure.
@@ -384,6 +456,7 @@ impl Interp {
             && self.config.services.cancel.is_none()
             && self.config.limits.wall_budget.is_none()
             && self.config.services.speed.hermetic == HermeticMode::Off
+            && !self.has_command_observers()
     }
 
     pub(crate) fn note_replay_source(&mut self, abs: &[u8], text: &crate::code::SourceText) {
@@ -444,7 +517,11 @@ impl Interp {
             .source
             .take()
             .filter(|(path, _)| path.as_slice() == abs)?;
-        if !self.can_replay() || self.depth > 128 || self.unwinding_package {
+        if !self.can_replay()
+            || self.depth > 128
+            || self.unwinding_package
+            || self.replay.setup.as_ref().is_none_or(SetupSession::blocks)
+        {
             return None;
         }
         let mut writes = Writes::classify(self, code)?;
@@ -513,6 +590,14 @@ impl Interp {
                 })
                 && writes.check_effects(effects, self.config.limits.max_value_bytes)
         };
+        if self
+            .replay
+            .setup
+            .as_ref()
+            .is_none_or(SetupSession::blocks_hits)
+        {
+            return None;
+        }
         let snapshot = session.previous.as_ref()?;
         if key.kind == RegionKind::Configure {
             if !valid_record(&snapshot.region) {
@@ -577,6 +662,7 @@ impl Interp {
         let install_start = writes
             .installs
             .then(|| (self.project.installs.len(), self.project.targets().count()));
+        let sources = self.project.directory_source_mark(self.current_dir_id());
         self.replay.observations = Some(ReplayObservations {
             variable_reads: writes
                 .record_variable_reads
@@ -612,6 +698,7 @@ impl Interp {
                 used_cli,
                 install_start,
                 observations.link_check,
+                &sources,
             )
         {
             let mut journal = RegionState::default();
@@ -732,7 +819,8 @@ impl Interp {
     }
 
     pub(crate) fn observe_replay_env(&mut self, name: &[u8]) {
-        if self.replay.observations.is_none() {
+        let in_setup = self.replay.setup.as_ref().is_some_and(SetupSession::blocks);
+        if self.replay.observations.is_none() && !in_setup {
             return;
         }
         let digest = self
@@ -740,6 +828,9 @@ impl Interp {
             .host
             .env_get(name)
             .map(|value| JournalDigest::hash(&value));
+        if let Some(setup) = &mut self.replay.setup {
+            setup.record_env(name, digest);
+        }
         if let Some(observed) = &mut self.replay.observations {
             observed.record(JournalStamp::EnvVar {
                 name: name.to_vec(),

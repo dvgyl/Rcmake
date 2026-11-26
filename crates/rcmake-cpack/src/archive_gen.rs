@@ -496,14 +496,16 @@ fn archive_name_is_set(name: &[u8]) -> bool {
 }
 
 fn component_workspace(cx: &PackageContext<'_>) -> Result<PathBuf, CpackError> {
-    for index in 0..100 {
-        let path = cx.staging_dir.join(format!(".rcmake-components-{index}"));
-        match cx.host.metadata(&path, Follow::No) {
-            Ok(_) => {}
-            Err(err) if err.kind == ErrorKind::NotFound => {
-                cx.host.create_dir_all(&path)?;
-                return Ok(path);
-            }
+    static NEXT_WORKSPACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..100 {
+        let index = NEXT_WORKSPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = cx.staging_dir.join(format!(
+            ".rcmake-components-{}-{index}",
+            cx.host.system().pid
+        ));
+        match cx.host.create_private_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind == ErrorKind::AlreadyExists => {}
             Err(err) => return Err(err.into()),
         }
     }
@@ -626,37 +628,30 @@ fn write_recorded_archive(
     Ok(())
 }
 
-/// Check that each recorded path exists below real directories. Returns whether every
-/// child of each recorded directory is also recorded.
+/// Check that each recorded path exists below real directories inside `root` and that any
+/// payload symlinks stay within `root`. Returns whether every child of each recorded
+/// directory is also recorded.
 fn check_recorded(
     host: &dyn Host,
     root: &Path,
     recorded: &BTreeSet<PathBuf>,
 ) -> Result<bool, CpackError> {
+    let canon_root = crate::source::canonical_checked_root(host, root)?;
     let mut complete = true;
     for member in recorded {
-        let mut path = root.to_owned();
-        let mut parts = member.components().peekable();
-        while let Some(part) = parts.next() {
-            path.push(part);
-            let missing = |err: rcmake_host::HostError| {
-                error(format!(
-                    "CPack cannot read the installed component file {}: {err}",
-                    path.display()
-                ))
-            };
-            let kind = host.metadata(&path, Follow::No).map_err(missing)?.kind;
-            if parts.peek().is_some() && kind != FileKind::Dir {
-                return Err(error(format!(
-                    "CPack expected a directory at {}",
-                    path.display()
-                )));
-            }
-            if parts.peek().is_none() && kind == FileKind::Dir {
-                complete &= children(host, &path)?
-                    .iter()
-                    .all(|child| recorded.contains(&member.join(child)));
-            }
+        let kind = crate::source::verify_contained_path(
+            host,
+            root,
+            &canon_root,
+            member,
+            crate::source::SymlinkPolicy::PreserveContained,
+            false,
+        )?;
+        if kind == FileKind::Dir {
+            let path = root.join(member);
+            complete &= children(host, &path)?
+                .iter()
+                .all(|child| recorded.contains(&member.join(child)));
         }
     }
     Ok(complete)

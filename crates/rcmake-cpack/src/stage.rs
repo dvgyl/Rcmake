@@ -93,18 +93,23 @@ pub(crate) fn install(
         cfg
     };
     let (members, destinations) = install_projects(host, cwd, options, &cfg, staging)?;
-    if cfg.get(b"CPACK_GENERATOR") == Some(b"RPM") {
+    if matches!(
+        cfg.get(b"CPACK_GENERATOR"),
+        Some(b"RPM" | b"NSIS" | b"NSIS64" | b"WIX" | b"IFW")
+    ) {
         let mut all = Vec::new();
         for (suffix, files) in destinations {
-            if !suffix.is_empty() {
+            if !suffix.is_empty() && cfg.get(b"CPACK_GENERATOR") == Some(b"RPM") {
                 let key = [b"CPACK_ABSOLUTE_DESTINATION_FILES_".as_slice(), &suffix].concat();
                 interp.cx().set_var(&key, list::join(&files));
             }
             all.extend(files);
         }
-        interp
-            .cx()
-            .set_var(b"CPACK_ABSOLUTE_DESTINATION_FILES", list::join(&all));
+        if cfg.get(b"CPACK_GENERATOR") == Some(b"RPM") || !all.is_empty() {
+            interp
+                .cx()
+                .set_var(b"CPACK_ABSOLUTE_DESTINATION_FILES", list::join(&all));
+        }
     }
     run_hooks(
         host.as_ref(),
@@ -188,7 +193,8 @@ fn install_projects(
                 continue;
             }
             let separate = !package_components(cfg, component).is_empty();
-            let destinations = install_destinations(cfg, staging, component, subdir)?;
+            let destinations =
+                install_destinations(host.as_ref(), cfg, staging, component, subdir)?;
             for (component, destination) in &destinations {
                 if separate {
                     log(host.as_ref(), format!("-   Install component: {component}"));
@@ -218,6 +224,7 @@ fn install_projects(
                     .extend(installed);
                 if let Some(before) = before {
                     let after = component_files::snapshot(host.as_ref(), &scanned)?;
+                    let added: Vec<PathBuf> = after.difference(&before).cloned().collect();
                     let index = match members.iter().position(|item| &item.name == component) {
                         Some(index) => index,
                         None => {
@@ -225,12 +232,26 @@ fn install_projects(
                                 name: component.clone(),
                                 group: component_group(cfg, component).map(BString::from),
                                 files: Vec::new(),
+                                staged_roots: Vec::new(),
                             });
                             members.len() - 1
                         }
                     };
                     if let Some(item) = members.get_mut(index) {
-                        item.files.extend(after.difference(&before).cloned());
+                        item.files.extend(added.iter().cloned());
+                        if let Some(existing_root) = item
+                            .staged_roots
+                            .iter_mut()
+                            .find(|entry| entry.root == *destination && entry.scanned == scanned)
+                        {
+                            existing_root.files.extend(added);
+                        } else {
+                            item.staged_roots.push(crate::StagedRoot {
+                                root: destination.clone(),
+                                scanned,
+                                files: added,
+                            });
+                        }
                     }
                 }
             }
@@ -239,16 +260,20 @@ fn install_projects(
     Ok((members, absolute_files))
 }
 
-// Archive generators package only the paths that each component install added.
+// Archive and native installer generators record each component's staged members.
 fn records_members(cfg: &CpackConfig) -> bool {
     cfg.get(b"CPACK_GENERATOR").is_some_and(|name| {
-        ArchiveKind::ALL
+        matches!(
+            name,
+            b"productbuild" | b"NSIS" | b"NSIS64" | b"WIX" | b"IFW"
+        ) || ArchiveKind::ALL
             .iter()
             .any(|kind| kind.name().as_bytes() == name)
     })
 }
 
 fn install_destinations(
+    host: &dyn Host,
     cfg: &CpackConfig,
     staging: &Path,
     component: &BString,
@@ -260,10 +285,14 @@ fn install_destinations(
     if components.is_empty() {
         return Ok(vec![(component.clone(), root)]);
     }
+    let windows_rules = crate::generators::installer::is_windows_host(host);
     components
         .into_iter()
         .map(|name| {
-            let mut destination = root.join(component_dir(linux_suffix(cfg, &name)));
+            let mut destination = root.join(component_dir_for_host(
+                linux_suffix(cfg, &name),
+                windows_rules,
+            ));
             if cfg.on(b"CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY") {
                 let file_name = safe_name(cfg.get(b"CPACK_PACKAGE_FILE_NAME").unwrap_or_default())?;
                 destination.push(file_name);
@@ -780,7 +809,7 @@ pub(crate) fn grouping(cfg: &CpackConfig) -> ComponentGrouping {
 
 pub(crate) fn package_components(cfg: &CpackConfig, selection: &[u8]) -> Vec<BString> {
     let enabled = match cfg.get(b"CPACK_GENERATOR") {
-        Some(b"External") => true,
+        Some(b"External" | b"productbuild" | b"NSIS" | b"NSIS64" | b"WIX" | b"IFW") => true,
         Some(b"DEB") => cfg.on(b"CPACK_DEB_COMPONENT_INSTALL"),
         Some(b"RPM") => cfg.on(b"CPACK_RPM_COMPONENT_INSTALL"),
         Some(b"DragNDrop") => cfg
@@ -826,12 +855,60 @@ pub(crate) fn project_components(cfg: &CpackConfig, selection: &[u8]) -> Vec<BSt
 }
 
 pub(crate) fn component_dir(name: &[u8]) -> PathBuf {
+    component_dir_for_host(name, cfg!(windows))
+}
+
+pub(crate) fn component_dir_for_host(name: &[u8], windows_rules: bool) -> PathBuf {
+    if windows_rules {
+        if is_exact_windows_reserved(name) {
+            let mut prefixed = Vec::with_capacity(name.len() + 1);
+            prefixed.push(b'_');
+            prefixed.extend_from_slice(name);
+            return to_native(&prefixed);
+        }
+        if name.ends_with(b".") {
+            let mut suffixed = Vec::with_capacity(name.len() + 1);
+            suffixed.extend_from_slice(name);
+            suffixed.push(b'_');
+            return to_native(&suffixed);
+        }
+    }
     if name.iter().any(|byte| b"<>\"/\\|?*`".contains(byte))
-        || (cfg!(windows) && name.contains(&b':'))
+        || (windows_rules && name.contains(&b':'))
     {
         return HashAlgo::Md5.hex_digest(name).into();
     }
     safe_name(name).unwrap_or_else(|_| HashAlgo::Md5.hex_digest(name).into())
+}
+
+fn is_exact_windows_reserved(name: &[u8]) -> bool {
+    let trimmed = name.strip_suffix(b".").unwrap_or(name);
+    let upper = trimmed.to_ascii_uppercase();
+    matches!(
+        upper.as_slice(),
+        b"CON"
+            | b"PRN"
+            | b"AUX"
+            | b"NUL"
+            | b"COM1"
+            | b"COM2"
+            | b"COM3"
+            | b"COM4"
+            | b"COM5"
+            | b"COM6"
+            | b"COM7"
+            | b"COM8"
+            | b"COM9"
+            | b"LPT1"
+            | b"LPT2"
+            | b"LPT3"
+            | b"LPT4"
+            | b"LPT5"
+            | b"LPT6"
+            | b"LPT7"
+            | b"LPT8"
+            | b"LPT9"
+    )
 }
 
 pub(crate) fn component_group<'a>(cfg: &'a CpackConfig, component: &[u8]) -> Option<&'a [u8]> {

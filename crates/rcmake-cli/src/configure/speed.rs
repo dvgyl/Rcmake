@@ -75,21 +75,25 @@ pub(crate) fn settings(host: &dyn Host, opts: &Options, profiled: bool) -> (Spee
         && hermetic == HermeticMode::Off
         && !enabled(b"RCMAKE_FETCH_OFFLINE")
         && !env(b"RCMAKE_FETCH_PREFETCH").is_some_and(|value| value == b"0");
+    // `RCMAKE_REPLAY_SETUP=0` keeps the earlier gates for presets, `-C` scripts, and
+    // toolchain files. Without it, replay setup checkpoints make them safe.
+    let setup_gates = setup_replay_disabled(host);
     let incremental = !profiled
         && !opts.fresh
         && opts.trace.is_none()
-        && opts.preset.is_none()
+        && (!setup_gates || opts.preset.is_none())
         && !opts.check_system_vars
         && !opts.log_context
         && !opts.debug_output
         && !opts.debug_find
         && opts.debug_find_variables.is_empty()
         && opts.debug_find_packages.is_empty()
-        && !opts.cache_edits.iter().any(|edit| match edit {
-            CacheEdit::Preload(_) => true,
-            CacheEdit::Define(define) => define.name == b"CMAKE_TOOLCHAIN_FILE",
-            CacheEdit::Remove(_) => false,
-        })
+        && !(setup_gates
+            && opts.cache_edits.iter().any(|edit| match edit {
+                CacheEdit::Preload(_) => true,
+                CacheEdit::Define(define) => define.name == b"CMAKE_TOOLCHAIN_FILE",
+                CacheEdit::Remove(_) => false,
+            }))
         && !enabled(b"RCMAKE_NO_INCREMENTAL");
 
     (
@@ -104,6 +108,13 @@ pub(crate) fn settings(host: &dyn Host, opts: &Options, profiled: bool) -> (Spee
         },
         true,
     )
+}
+
+/// Return `true` if `RCMAKE_REPLAY_SETUP` is exactly `0`. Then configure replay is off
+/// for toolchain files, presets, `-C` scripts, and `PreLoad.cmake` files.
+pub(crate) fn setup_replay_disabled(host: &dyn Host) -> bool {
+    host.env_get(b"RCMAKE_REPLAY_SETUP")
+        .is_some_and(|value| value == b"0")
 }
 
 fn env_mode<T>(
@@ -208,6 +219,35 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn setup_inputs_keep_replay_unless_the_setup_opt_out_is_set() {
+        let host = PureHost::default();
+        let mut opts = Options {
+            persona: Persona::Native,
+            preset: Some("dev".into()),
+            ..Options::default()
+        };
+        opts.cache_edits = vec![
+            CacheEdit::Preload("init.cmake".into()),
+            CacheEdit::Define(rcmake_eval::CacheDefine {
+                name: "CMAKE_TOOLCHAIN_FILE".into(),
+                ty: None,
+                value: "tc.cmake".into(),
+            }),
+        ];
+        assert!(settings(&host, &opts, false).0.incremental);
+        // Only the exact value `0` keeps the earlier gates.
+        host.env_set(b"RCMAKE_REPLAY_SETUP", Some(b"1"));
+        assert!(settings(&host, &opts, false).0.incremental);
+        host.env_set(b"RCMAKE_REPLAY_SETUP", Some(b"0"));
+        assert!(!settings(&host, &opts, false).0.incremental);
+        opts.preset = None;
+        opts.cache_edits.clear();
+        assert!(settings(&host, &opts, false).0.incremental);
+        host.env_set(b"RCMAKE_NO_INCREMENTAL", Some(b"1"));
+        assert!(!settings(&host, &opts, false).0.incremental);
     }
 
     #[test]

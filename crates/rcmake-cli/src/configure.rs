@@ -6,6 +6,7 @@ use std::time::Duration;
 use rcmake_base::{BString, truth::is_on};
 use rcmake_commands::ConfigureRuntime;
 use rcmake_diag::{Effect, MessageKind};
+use rcmake_eval::journal::ReplaySetupInputs;
 use rcmake_eval::{BuiltinFn, CmdError, Cx, Interp, Registry, RunMode, Services};
 use rcmake_host::{FileKind, FileTime, Follow, Host, Stream, WriteMode, path};
 use rcmake_instrument::Query;
@@ -368,7 +369,10 @@ impl<'a> ConfigureSession<'a> {
         if self.opts.persona == Persona::Native {
             stick_diag_style(host, style);
         }
+        // `RCMAKE_REPLAY_SETUP=0` keeps the earlier setup gates. Otherwise the setup
+        // spans and checkpoints of configure replay make these inputs safe.
         if speed.incremental
+            && speed::setup_replay_disabled(host)
             && (saved.contains(b"CMAKE_TOOLCHAIN_FILE")
                 || host.env_get(b"CMAKE_TOOLCHAIN_FILE").is_some()
                 || [&self.src, &self.bin]
@@ -376,6 +380,17 @@ impl<'a> ConfigureSession<'a> {
                     .any(|dir| is_file(host, &dir.join("PreLoad.cmake"))))
         {
             speed.incremental = false;
+        }
+        let mut setup = ReplaySetupInputs::new();
+        if speed.incremental {
+            setup.loaded_cache(&saved);
+            setup.field("generator", &generator);
+            setup.field("generator_platform", &generator_spec.platform);
+            setup.field("generator_toolset", &generator_spec.toolset);
+            setup.field("generator_instance", &generator_spec.instance);
+            setup.field("source", self.src.as_os_str().as_encoded_bytes());
+            setup.field("binary", self.bin.as_os_str().as_encoded_bytes());
+            setup.field("preset_environment", &self.preset.environment);
         }
         // Rich formatting annotates live diagnostics during emission. Replay keeps its
         // normal eligibility checks for regions that issue diagnostics.
@@ -416,10 +431,39 @@ impl<'a> ConfigureSession<'a> {
             &self.list_file,
         );
         interp.cx().project().generator_spec = generator_spec;
+        interp.add_session_data(setup);
         interp.set_list_file_name(self.list_file.clone());
         interp.set_project_injection(true);
         set_directory_vars(&mut interp, &self.src, &self.bin);
         Ok((runtime, interp, has_cache))
+    }
+
+    /// Add the effective toolchain selection and the preload scripts to the replay
+    /// setup inputs. Call this after the environment defaults and the relative
+    /// install prefix conversion, immediately before the configure starts.
+    fn add_setup_files(&self, interp: &mut Interp, preloads: &Preloads) {
+        let toolchain = interp
+            .cx()
+            .cache()
+            .get(b"CMAKE_TOOLCHAIN_FILE")
+            .map(|entry| entry.value.clone())
+            .filter(|value| !value.is_empty());
+        let host = self.host.as_ref();
+        let Some(setup) = interp.session_data_mut_or_init::<ReplaySetupInputs>() else {
+            return;
+        };
+        if let Some(value) = toolchain {
+            let file = rcmake_eval::journal::resolve_setup_file(
+                host,
+                &path::to_native(&value),
+                &self.src,
+                &self.bin,
+            );
+            setup.file("toolchain", file);
+        }
+        for file in &preloads.files {
+            setup.file("preload", file.clone());
+        }
     }
 
     fn prepare_presentation(&self, interp: &mut Interp, style: DiagStyle) {
@@ -506,6 +550,7 @@ impl<'a> ConfigureSession<'a> {
             entry.value =
                 path::from_native_cmake(&host.initial_cwd().join(path::to_native(&entry.value)));
         }
+        self.add_setup_files(interp, &preloads);
         let result = self.profiling.measure(host, ProfilePhase::Eval, || {
             self.profiling.measure_listfile(
                 host,

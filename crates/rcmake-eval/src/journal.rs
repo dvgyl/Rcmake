@@ -9,6 +9,8 @@ mod codec;
 #[cfg(feature = "replay")]
 mod frame;
 #[cfg(feature = "replay")]
+mod inputs;
+#[cfg(feature = "replay")]
 mod leaf;
 #[cfg(feature = "replay")]
 mod receipts;
@@ -16,6 +18,8 @@ mod receipts;
 mod region;
 #[cfg(feature = "replay")]
 mod replay;
+#[cfg(feature = "replay")]
+mod setup;
 #[cfg(feature = "replay")]
 mod trace;
 
@@ -26,6 +30,8 @@ pub(crate) use activate::ReplayState;
 pub use activate::ReplayHost;
 #[cfg(feature = "replay")]
 pub use frame::{EncodeError, EncodeJson, JsonSink, ObjectWriter};
+#[cfg(feature = "replay")]
+pub use inputs::{ReplaySetupInputs, resolve_setup_file};
 #[cfg(feature = "replay")]
 pub use receipts::ReplayReceipts;
 
@@ -53,7 +59,27 @@ mod disabled {
 
     use crate::code::{Code, SourceText};
     use crate::interp::BodyMode;
-    use crate::{CmdResult, Interp, Registry};
+    use crate::{CmdResult, Cx, Interp, Registry};
+
+    impl Cx<'_> {
+        /// Start a setup span. No-op when the `replay` feature is disabled.
+        #[inline(always)]
+        pub fn begin_replay_setup(&mut self) {}
+
+        /// End a setup span. No-op when the `replay` feature is disabled.
+        #[inline(always)]
+        pub fn end_replay_setup(&mut self, _ok: bool) {}
+
+        /// End the setup span of `project()`. No-op when the `replay` feature is
+        /// disabled.
+        #[inline(always)]
+        pub fn end_replay_project(&mut self, _ok: bool) {}
+
+        /// Note a system or compiler determination. No-op when the `replay`
+        /// feature is disabled.
+        #[inline(always)]
+        pub fn note_replay_determination(&mut self) {}
+    }
 
     pub(crate) struct ForeachSaved;
 

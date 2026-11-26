@@ -163,11 +163,16 @@ pub(crate) fn enable_languages(
         .props
         .get(LANGUAGES_IN_PROGRESS)
         .is_some_and(|value| !value.is_empty());
-    if nested {
+    // The toolchain file, the system and compiler modules, and the top-level includes
+    // run in this span, so configure replay restores no listfile here.
+    cx.begin_replay_setup();
+    let result = if nested {
         setup_languages(cx, languages, optional)
     } else {
         cx.with_language_scope(|cx| setup_languages(cx, languages, optional))
-    }
+    };
+    cx.end_replay_setup(result.is_ok());
+    result
 }
 
 fn setup_languages(cx: &mut Cx<'_>, languages: &[BString], optional: bool) -> Result<(), CmdError> {
@@ -403,6 +408,7 @@ impl Bootstrap {
             }
         }
         if !cx.var_defined(b"CMAKE_SYSTEM") {
+            cx.note_replay_determination();
             if let Some(module) = modules_file(cx, b"CMakeDetermineSystem.cmake") {
                 read_list_file(cx, &module)?;
             }
@@ -639,6 +645,7 @@ impl Bootstrap {
                 ));
             }
             let determine = cat(&[b"CMakeDetermine", lang, b"Compiler.cmake"]);
+            cx.note_replay_determination();
             #[cfg(all(feature = "native", any(unix, windows)))]
             self.prefetch_toolchain(cx, lang);
             self.require_module(cx, &String::from_utf8_lossy(&determine))?;
