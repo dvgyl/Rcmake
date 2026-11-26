@@ -439,6 +439,7 @@ fn check_cache_bytes(
     };
     let projected = cache
         .bytes()
+        .saturating_add(cache.reserved_bytes())
         .saturating_sub(old_len)
         .saturating_add(new_len)
         .saturating_add(key_len);

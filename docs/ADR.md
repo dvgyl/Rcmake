@@ -865,7 +865,21 @@ value, help text, additional properties (such as `STRINGS`), and 128 bytes.
 Every cache write that a script command makes checks the projected total
 against `max_cache_bytes` before the entry changes, and a refusal stops the
 related variable update. `find_package()` and `project()` stop the command at
-the refused entry, before they change any related normal variable:
+the refused entry, before they change any related normal variable. `project()`
+decides before its alias writes whether it stores each `CMAKE_PROJECT_*` entry.
+In a subdirectory, an alias with the same name (a project named
+`CMAKE_PROJECT`) defines the name, so no entry is stored and no cache room is
+needed. A stored entry reserves its full cost as a floor for its key until the insert,
+so a `variable_watch()` callback of an alias write cannot use those bytes, also
+if it shrinks or removes the entry. Each reservation has its own id, and only
+its own `project()` call releases it, so a nested `project()` in a watch cannot
+release the outer reservation. A key with more than one reservation counts its
+largest floor once. In a subdirectory, the name is checked again after the
+alias writes, as CMake does, and a name that a watch defined is not stored. If
+the name was defined before the alias writes and a watch removed it, the entry
+was not reserved: it goes through the ordinary cache check after the alias
+writes. That check can refuse the entry after the aliases changed, but
+`max_cache_bytes` still holds:
 
 - `Cx::insert_cache_entry`, with a history record: `set(CACHE)`, `option()`,
   `mark_as_advanced` placeholders, `get_filename_component(... CACHE)`, and the

@@ -204,6 +204,23 @@ pub struct Cache {
     bytes: usize,
     /// [`Cache::get_mut`] gave out an entry, so `bytes` must be counted again.
     dirty: bool,
+    /// Reservation floors of pending inserts: each key keeps at least its largest floor,
+    /// even if its live entry shrinks or disappears before the insert.
+    reservations: Vec<Reservation>,
+    /// Id of the next reservation.
+    next_reservation: u64,
+}
+
+/// Identity of one [`Cache::reserve`] call, which only [`Cache::release`] of the same id
+/// ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservationId(u64);
+
+#[derive(Clone, Debug)]
+struct Reservation {
+    id: ReservationId,
+    key: BString,
+    floor: usize,
 }
 
 impl PartialEq for Cache {
@@ -228,15 +245,70 @@ impl Cache {
         self.bytes
     }
 
-    /// Estimated bytes of all entries after [`Cache::insert`] of `entry` as `name`.
+    /// Estimated bytes of all entries and reservations after [`Cache::insert`] of `entry`
+    /// as `name`.
     pub fn bytes_after_insert(&mut self, name: &[u8], entry: &CacheEntry) -> usize {
-        let replaced = self
-            .entries
-            .get(name)
-            .map_or(0, |old| cache_entry_cost(name.len(), old));
-        self.bytes()
+        let replaced = self.live_cost(name);
+        let added = cache_entry_cost(name.len(), entry);
+        let bytes = self.bytes();
+        let reserved = self.reserved_beyond(|key| {
+            if key == name {
+                added
+            } else {
+                self.live_cost(key)
+            }
+        });
+        bytes
             .saturating_sub(replaced)
-            .saturating_add(cache_entry_cost(name.len(), entry))
+            .saturating_add(added)
+            .saturating_add(reserved)
+    }
+
+    /// Bytes that reservations hold beyond the live entries of their keys.
+    #[must_use]
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved_beyond(|key| self.live_cost(key))
+    }
+
+    /// Reserve the cost of `entry` as a floor for `name` until [`Cache::release`] of the
+    /// returned id. While the reservation lasts, `name` counts at least its largest floor,
+    /// also if a write shrinks or removes its live entry, so that other writes cannot use
+    /// the bytes.
+    pub fn reserve(&mut self, name: &[u8], entry: &CacheEntry) -> ReservationId {
+        let id = ReservationId(self.next_reservation);
+        self.next_reservation = self.next_reservation.wrapping_add(1);
+        self.reservations.push(Reservation {
+            id,
+            key: name.into(),
+            floor: cache_entry_cost(name.len(), entry),
+        });
+        id
+    }
+
+    /// Release the reservation `id`. Other reservations of the same key stay.
+    pub fn release(&mut self, id: ReservationId) {
+        self.reservations.retain(|reservation| reservation.id != id);
+    }
+
+    /// Sum, over the reserved keys, of the largest floor beyond the `live` cost of the key.
+    /// Each key counts once.
+    fn reserved_beyond(&self, live: impl Fn(&[u8]) -> usize) -> usize {
+        let mut floors: IndexMap<&[u8], usize> = IndexMap::new();
+        for reservation in &self.reservations {
+            let floor = floors.entry(reservation.key.as_slice()).or_default();
+            *floor = (*floor).max(reservation.floor);
+        }
+        floors
+            .into_iter()
+            .map(|(key, floor)| floor.saturating_sub(live(key)))
+            .fold(0, usize::saturating_add)
+    }
+
+    /// Estimated bytes of the live entry of `name`, or zero.
+    fn live_cost(&self, name: &[u8]) -> usize {
+        self.entries
+            .get(name)
+            .map_or(0, |entry| cache_entry_cost(name.len(), entry))
     }
 
     /// Get a cache entry by name.
@@ -353,5 +425,38 @@ impl GlobalState {
         self.defined_props
             .iter()
             .find(|entry| entry.scope == scope && entry.name == name)
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::{Cache, CacheEntry, CacheType, PropertyMap};
+
+    fn entry(value: &str) -> CacheEntry {
+        CacheEntry {
+            value: value.into(),
+            ty: CacheType::Static,
+            help: Default::default(),
+            advanced: false,
+            props: PropertyMap::default(),
+        }
+    }
+
+    #[test]
+    fn reservations_of_one_key_count_their_largest_floor_once() {
+        let mut cache = Cache::default();
+        let outer = cache.reserve(b"K", &entry(&"x".repeat(500)));
+        let inner = cache.reserve(b"K", &entry(""));
+        let large = cache.reserved_bytes();
+        assert_eq!(large, 1 + 500 + 128);
+
+        // The nested release keeps the outer floor, also after a small insert.
+        cache.release(inner);
+        cache.insert("K".into(), entry(""));
+        assert_eq!(cache.reserved_bytes(), large - (1 + 128));
+        assert_eq!(cache.bytes_after_insert(b"L", &entry("")), large + 1 + 128);
+
+        cache.release(outer);
+        assert_eq!(cache.reserved_bytes(), 0);
     }
 }

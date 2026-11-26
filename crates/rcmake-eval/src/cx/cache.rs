@@ -1,7 +1,7 @@
 use rcmake_base::{BString, list, truth};
 use rcmake_diag::{Location, PolicyId, PolicyStatus};
 use rcmake_host::path::{from_native_cmake, to_native};
-use rcmake_model::{Cache, CacheEntry, CacheType};
+use rcmake_model::{Cache, CacheEntry, CacheType, ReservationId};
 
 use super::Cx;
 use crate::interp::IssueClass;
@@ -117,6 +117,28 @@ impl Cx<'_> {
         }
         self.cache().insert(name, entry);
         true
+    }
+
+    /// Reserve the cost of `entry` for `name`, after the `limits.max_cache_bytes` check.
+    /// Report a fatal error and return `None` if the entry does not fit.
+    ///
+    /// Until [`Self::release_cache_reservation`] of the returned id, `name` counts at
+    /// least the cost of `entry`, also if a callback (for example of `variable_watch()`)
+    /// shrinks or removes its live entry, so that no other cache write can use the bytes.
+    pub fn reserve_cache_entry(
+        &mut self,
+        name: &[u8],
+        entry: &CacheEntry,
+    ) -> Option<ReservationId> {
+        if !self.admit_cache_entry(name, entry) {
+            return None;
+        }
+        Some(self.cache().reserve(name, entry))
+    }
+
+    /// Release the reservation `id` that [`Self::reserve_cache_entry`] returned.
+    pub fn release_cache_reservation(&mut self, id: ReservationId) {
+        self.cache().release(id);
     }
 
     /// Return `true` if the cache stays within `limits.max_cache_bytes` after an insert

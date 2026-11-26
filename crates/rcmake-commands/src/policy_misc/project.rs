@@ -5,7 +5,7 @@ use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
-use rcmake_model::{CacheEntry, CacheType, DirId};
+use rcmake_model::{CacheEntry, CacheType, DirId, ReservationId};
 
 use super::{quoted, values};
 
@@ -132,9 +132,11 @@ fn configure_project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         // a normal binding with the same name (a project named `CMAKE_PROJECT`). The cache
         // limit is checked before the first write.
         let var = field(b"CMAKE_PROJECT", key);
-        if version.is_some() {
-            admit_top_level(cx, &var, value, top_level)?;
-        }
+        let plan = if version.is_some() {
+            plan_top_level(cx, &var, value, top_level, field(name, key) == var)?
+        } else {
+            TopLevelPlan::Skip { top_level }
+        };
         for prefix in [b"PROJECT".as_slice(), name] {
             let var = field(prefix, key);
             if version.is_some() || !cx.var_or_empty(&var).is_empty() {
@@ -142,7 +144,7 @@ fn configure_project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             }
         }
         if version.is_some() {
-            set_top_level(cx, &var, value, top_level)?;
+            publish_top_level(cx, &var, value, plan)?;
         } else if top_level && !cx.var_or_empty(&var).is_empty() {
             cx.set_var(&var, BString::default());
         }
@@ -152,10 +154,11 @@ fn configure_project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         let value = metadata.get(key.as_bytes()).copied().unwrap_or_default();
         let suffix = format!("_{key}");
         let var = field(b"CMAKE_PROJECT", suffix.as_bytes());
-        admit_top_level(cx, &var, value, top_level)?;
+        let alias = field(name, suffix.as_bytes());
+        let plan = plan_top_level(cx, &var, value, top_level, alias == var)?;
         cx.set_var(&field(b"PROJECT", suffix.as_bytes()), value.into());
-        cx.set_var(&field(name, suffix.as_bytes()), value.into());
-        set_top_level(cx, &var, value, top_level)?;
+        cx.set_var(&alias, value.into());
+        publish_top_level(cx, &var, value, plan)?;
     }
 
     if cx.running_deferred() {
@@ -333,16 +336,68 @@ fn set_top_level(
     Ok(())
 }
 
-/// Check that the cache entry of [`set_top_level`] fits the cache byte limit, before any
-/// related normal variable changes. Report a refusal and stop `project()`.
-fn admit_top_level(
+/// Decide, before the alias writes, whether `project()` stores the `CMAKE_PROJECT_*`
+/// cache entry `name`, and reserve its cache bytes if it does.
+///
+/// CMake stores the entry at the top level, or when `name` is not defined after the
+/// aliases are written. `aliased` is `true` when an alias has the same name (a project
+/// named `CMAKE_PROJECT`), which defines it. Only an entry that is stored is checked
+/// against the cache byte limit. A refusal stops `project()` before any alias changes.
+/// The reservation keeps a `variable_watch()` callback of an alias write from using the
+/// bytes.
+fn plan_top_level(
     cx: &mut Cx<'_>,
     name: &[u8],
     value: &[u8],
     top_level: bool,
-) -> Result<(), CmdError> {
-    if (top_level || !cx.var_defined(name)) && !cx.admit_cache_entry(name, &static_entry(value)) {
+    aliased: bool,
+) -> Result<TopLevelPlan, CmdError> {
+    if !top_level && (aliased || cx.var_defined(name)) {
+        return Ok(TopLevelPlan::Skip { top_level });
+    }
+    let Some(id) = cx.reserve_cache_entry(name, &static_entry(value)) else {
         return Err(CmdError::Reported);
+    };
+    Ok(TopLevelPlan::Reserved { top_level, id })
+}
+
+/// What [`plan_top_level`] decided before the alias writes.
+#[derive(Clone, Copy)]
+enum TopLevelPlan {
+    /// No entry was planned, because the name was defined in a subdirectory.
+    Skip { top_level: bool },
+    /// The entry is planned and its cache bytes are reserved by `id`.
+    Reserved { top_level: bool, id: ReservationId },
+}
+
+/// Store the planned `CMAKE_PROJECT_*` entry after the alias writes, then remove a normal
+/// variable with the same name.
+///
+/// In a subdirectory CMake checks the name again after the alias writes, because a
+/// `variable_watch()` callback can define or remove it. A name that is defined now is not
+/// stored. A name that was defined at planning but is not defined now is stored with the
+/// ordinary cache byte check.
+fn publish_top_level(
+    cx: &mut Cx<'_>,
+    name: &[u8],
+    value: &[u8],
+    plan: TopLevelPlan,
+) -> Result<(), CmdError> {
+    let top_level = match plan {
+        TopLevelPlan::Skip { top_level } => top_level,
+        TopLevelPlan::Reserved { top_level, id } => {
+            cx.release_cache_reservation(id);
+            top_level
+        }
+    };
+    if !top_level && cx.var_defined(name) {
+        return Ok(());
+    }
+    if !set_static(cx, name, value) {
+        return Err(CmdError::Reported);
+    }
+    if cx.var_normal_only(name).is_some() {
+        cx.unset_var(name);
     }
     Ok(())
 }

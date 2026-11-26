@@ -420,6 +420,183 @@ fn project_named_cmake_project_leaves_no_shadowing_normal_binding() -> TestResul
 }
 
 #[test]
+fn subdirectory_project_needs_no_cache_room_for_a_same_name_alias() -> TestResult {
+    let script = "project(P NONE)\nadd_subdirectory(sub)\n";
+    let sub = b"project(CMAKE_PROJECT VERSION 1.0 LANGUAGES NONE)\n";
+    // Measure the cache with room to spare.
+    let host = new_host();
+    host.seed_file(Path::new("/work/src/sub/CMakeLists.txt"), sub)?;
+    let mut session = interp(&host, Vec::new());
+    configure(&host, &mut session, script, 0)?;
+    let bytes = session.cx().cache().bytes();
+    assert!(session.cx().cache().get(b"CMAKE_PROJECT_VERSION").is_none());
+
+    // The alias defines each CMAKE_PROJECT_VERSION* name in the subdirectory, so no cache
+    // entry is stored and an exactly full cache is enough.
+    let host = new_host();
+    host.seed_file(Path::new("/work/src/sub/CMakeLists.txt"), sub)?;
+    let mut session = interp_with_cache_limit(&host, bytes);
+    configure(&host, &mut session, script, 0)?;
+    assert_eq!(session.cx().cache().bytes(), bytes);
+    Ok(())
+}
+
+#[test]
+fn project_reserves_its_cache_entry_against_a_watch_callback() -> TestResult {
+    let project = "project(P VERSION 1.2 LANGUAGES NONE)\n";
+    let host = new_host();
+    let mut session = interp(&host, Vec::new());
+    configure(&host, &mut session, project, 0)?;
+    let bytes = session.cx().cache().bytes();
+
+    // The watch runs during the last alias write, just before the last cache entry. The
+    // filler fits only in the bytes that the project entry reserved.
+    let filler = 1000;
+    let limit = bytes + "FILLER".len() + filler + 128 - 1;
+    let script = format!(
+        "function(fill var access value)\n  string(REPEAT x {filler} text)\n  set(FILLER \"${{text}}\" CACHE STRING \"\")\nendfunction()\nvariable_watch(PROJECT_HOMEPAGE_URL fill)\n{project}"
+    );
+    let host = new_host();
+    let mut session = interp_with_cache_limit(&host, limit);
+    configure(&host, &mut session, &script, 1)?;
+    assert_cache_refusal(&host, limit);
+    let mut cx = session.cx();
+    assert!(
+        cx.cache().get(b"FILLER").is_none(),
+        "the watch cannot use reserved bytes"
+    );
+    assert!(cx.cache().get(b"CMAKE_PROJECT_HOMEPAGE_URL").is_some());
+    assert_eq!(cx.cache().reserved_bytes(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_watch_cannot_spend_the_bytes_of_a_removed_reserved_entry() -> TestResult {
+    // The project replaces a large existing entry with a small one.
+    let old = "o".repeat(500);
+    let project = format!(
+        "set(CMAKE_PROJECT_HOMEPAGE_URL \"{old}\" CACHE STRING \"\")\nproject(P VERSION 1.2 LANGUAGES NONE)\n"
+    );
+    let host = new_host();
+    let mut session = interp(&host, Vec::new());
+    configure(&host, &mut session, &project, 0)?;
+    let bytes = session.cx().cache().bytes();
+
+    // The watch removes the old entry and tries to use the freed bytes, which the
+    // reservation of the new entry keeps.
+    let filler = 1000;
+    let limit = bytes + "FILLER".len() + filler + 128 - 1;
+    let script = format!(
+        "function(fill var access value)\n  unset(CMAKE_PROJECT_HOMEPAGE_URL CACHE)\n  string(REPEAT x {filler} text)\n  set(FILLER \"${{text}}\" CACHE STRING \"\")\nendfunction()\nvariable_watch(PROJECT_HOMEPAGE_URL fill)\n{project}"
+    );
+    let host = new_host();
+    let mut session = interp_with_cache_limit(&host, limit);
+    configure(&host, &mut session, &script, 1)?;
+    assert_cache_refusal(&host, limit);
+    let mut cx = session.cx();
+    assert!(
+        cx.cache().get(b"FILLER").is_none(),
+        "the freed bytes stay reserved"
+    );
+    assert_eq!(
+        cx.cache()
+            .get(b"CMAKE_PROJECT_HOMEPAGE_URL")
+            .map(|entry| entry.value.clone()),
+        Some(BString::default())
+    );
+    assert_eq!(cx.cache().reserved_bytes(), 0);
+    Ok(())
+}
+
+#[test]
+fn subdirectory_project_checks_the_name_again_after_a_watch_defines_it() -> TestResult {
+    let host = new_host();
+    host.seed_file(
+        Path::new("/work/src/sub/CMakeLists.txt"),
+        b"variable_watch(PROJECT_VERSION define)\nproject(Q VERSION 1.0 LANGUAGES NONE)\n",
+    )?;
+    let mut session = interp(&host, Vec::new());
+    configure(
+        &host,
+        &mut session,
+        "project(P LANGUAGES NONE)\nfunction(define var access value)\n  if(access STREQUAL \"MODIFIED_ACCESS\")\n    set(CMAKE_PROJECT_VERSION from-watch PARENT_SCOPE)\n  endif()\nendfunction()\nadd_subdirectory(sub)\n",
+        0,
+    )?;
+    // CMake 4.5.1 stores no entry, because the watch defined the name first.
+    let mut cx = session.cx();
+    assert!(cx.cache().get(b"CMAKE_PROJECT_VERSION").is_none());
+    assert_eq!(cx.cache().reserved_bytes(), 0);
+    Ok(())
+}
+
+#[test]
+fn nested_project_releases_only_its_own_reservation() -> TestResult {
+    // The outer project reserves a large entry. A watch runs a nested project, which
+    // reserves and stores a small entry for the same key, and then tries to use the
+    // rest of the outer floor.
+    let url = "u".repeat(500);
+    let script = format!(
+        "function(nest var access value)\n  get_property(done GLOBAL PROPERTY nested)\n  if(NOT done)\n    set_property(GLOBAL PROPERTY nested 1)\n    project(Q LANGUAGES NONE)\n    string(REPEAT x 1000 text)\n    set(FILLER \"${{text}}\" CACHE STRING \"\")\n  endif()\nendfunction()\nvariable_watch(PROJECT_HOMEPAGE_URL nest)\nproject(P HOMEPAGE_URL \"{url}\" LANGUAGES NONE)\n"
+    );
+    let host = new_host();
+    let mut session = interp(&host, Vec::new());
+    configure(&host, &mut session, &script, 0)?;
+    let limit = session.cx().cache().bytes() - 1;
+
+    let host = new_host();
+    let mut session = interp_with_cache_limit(&host, limit);
+    configure(&host, &mut session, &script, 1)?;
+    assert_cache_refusal(&host, limit);
+    let mut cx = session.cx();
+    assert!(
+        cx.cache().get(b"FILLER").is_none(),
+        "the outer floor stays reserved"
+    );
+    assert_eq!(
+        cx.cache()
+            .get(b"CMAKE_PROJECT_HOMEPAGE_URL")
+            .map(|entry| entry.value.clone()),
+        Some(BString::from(url))
+    );
+    assert_eq!(cx.cache().reserved_bytes(), 0);
+    Ok(())
+}
+
+#[test]
+fn subdirectory_project_admits_a_name_that_a_watch_removed() -> TestResult {
+    let root = "project(P LANGUAGES NONE)\nset(CMAKE_PROJECT_VERSION old)\nfunction(drop var access value)\n  if(access STREQUAL \"MODIFIED_ACCESS\")\n    unset(CMAKE_PROJECT_VERSION PARENT_SCOPE)\n  endif()\nendfunction()\nadd_subdirectory(sub)\n";
+    let run = |sub: &[u8], limit: Option<usize>, code| -> Result<_, Box<dyn std::error::Error>> {
+        let host = new_host();
+        host.seed_file(Path::new("/work/src/sub/CMakeLists.txt"), sub)?;
+        let mut session = match limit {
+            Some(limit) => interp_with_cache_limit(&host, limit),
+            None => interp(&host, Vec::new()),
+        };
+        configure(&host, &mut session, root, code)?;
+        let mut cx = session.cx();
+        let bytes = cx.cache().bytes();
+        let value = cx
+            .cache()
+            .get(b"CMAKE_PROJECT_VERSION")
+            .map(|entry| entry.value.clone());
+        Ok((host, bytes, value))
+    };
+    let watched: &[u8] =
+        b"variable_watch(PROJECT_VERSION drop)\nproject(Q VERSION 1.0 LANGUAGES NONE)\n";
+
+    // CMake stores the entry, because the name is not defined after the alias writes.
+    let (_, _, value) = run(watched, None, 0)?;
+    assert_eq!(value, Some(BString::from("1.0")));
+
+    // The entry was not reserved, so the ordinary check after the alias writes refuses it.
+    let (_, bytes, _) = run(b"project(Q LANGUAGES NONE)\n", None, 0)?;
+    let (host, _, value) = run(watched, Some(bytes + 1), 1)?;
+    assert_cache_refusal(&host, bytes + 1);
+    assert_eq!(value, None);
+    Ok(())
+}
+
+#[test]
 fn find_package_stops_before_normal_variables_when_the_cache_refuses() -> TestResult {
     let host = new_host();
     let mut session = interp_with_cache_limit(&host, 64 * 1024);
