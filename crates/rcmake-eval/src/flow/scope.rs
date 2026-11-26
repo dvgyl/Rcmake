@@ -30,7 +30,7 @@ impl Interp {
         };
         let end = code.end_of(i);
         let mut values: Vec<BString> = Vec::new();
-        self.run_opener(code, cmd, |this| {
+        self.run_opener(code, i, cmd, |this| {
             let args = this.expand(&cmd.args)?;
             if args.is_empty() {
                 return Err(CmdError::Status(
@@ -64,16 +64,27 @@ impl Interp {
                 .props
                 .append(BString::from("MACROS"), &name);
         }
+        let params: Vec<BString> = values.collect();
+        let formal_patterns = if kind == UserCommandKind::Macro {
+            params.iter().map(|p| cat(&[b"${", p, b"}"])).collect()
+        } else {
+            Vec::new()
+        };
+        let body = code.slice(i + 1, end);
+        let file_dir = crate::util::filename_path(&body.file);
         let user = UserCommand {
             kind,
             name,
-            params: values.collect(),
-            body: code.slice(i + 1, end),
+            params,
+            formal_patterns,
+            body,
+            file_dir,
             line: cmd.line,
+            line_str: cmd.line.to_string().into(),
             policies: *self.policies.top(),
             diags: *self.diags.top(),
         };
-        let added = self.with_plain_frame(&code.file, cmd.line, &cmd.name, |this| {
+        let added = self.with_plain_frame_arc(&code.file, cmd.line, code.name_arc(i), |this| {
             this.add_scripted_command(Arc::new(user))
         });
         self.trace_unframed(code, end);
@@ -144,7 +155,7 @@ impl Interp {
         };
         let end = code.end_of(i);
         let mut plan = None;
-        self.run_opener(code, cmd, |this| {
+        self.run_opener(code, i, cmd, |this| {
             let args = this.expand(&cmd.args)?;
             plan = this.block_plan(&args)?;
             Ok(Flow::Normal)

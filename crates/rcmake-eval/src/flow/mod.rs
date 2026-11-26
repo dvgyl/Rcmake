@@ -35,14 +35,14 @@ fn same_raw_args(a: &[Argument], b: &[Argument]) -> bool {
 impl Interp {
     /// Run `f` with a backtrace frame but without a call scope (`elseif`, `while`
     /// condition re-evaluation, block-end checks).
-    fn with_plain_frame<R>(
+    fn with_plain_frame_arc<R>(
         &mut self,
         file: &Arc<[u8]>,
         line: u32,
-        name: &[u8],
+        name: Arc<[u8]>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let bt = self.command_backtrace(file, line, name);
+        let bt = self.command_backtrace_arc(file, line, name);
         self.with_plain_backtrace(bt, line, f)
     }
 
@@ -52,9 +52,7 @@ impl Interp {
         line: u32,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let audit = self
-            .session_data::<crate::hermetic::HermeticContext>()
-            .cloned();
+        let audit = self.hermetic.clone();
         let _audit_site = audit.as_ref().zip(bt.top()).map(|(audit, frame)| {
             audit.enter(crate::hermetic::HermeticSite::new(
                 &rcmake_host::path::to_native(&frame.file),
@@ -75,14 +73,15 @@ impl Interp {
         r
     }
 
-    /// Run the block opener `cmd` under a call frame and trace it.
+    /// Run the block opener at `idx` of `code` under a call frame and trace it.
     fn run_opener(
         &mut self,
         code: &Code,
+        idx: usize,
         cmd: &CommandInvocation,
         f: impl FnOnce(&mut Self) -> CmdResult,
     ) -> CmdResult {
-        self.with_command_frame(&code.file, cmd.line, &cmd.name, |this| {
+        self.with_command_frame_arc(&code.file, cmd.line, code.name_arc(idx), |this| {
             if this.trace_enabled() && !this.fatal {
                 this.trace_command(cmd, &code.file, false);
             }
@@ -109,7 +108,7 @@ impl Interp {
         if start >= end {
             return Ok(Flow::Normal);
         }
-        let limit = self.recursion_limit();
+        let limit = self.active_recursion_limit();
         if self.block_depth >= limit || crate::stack_guard::exhausted() {
             self.fatal_here(
                 format!("Maximum nesting depth of {limit} exceeded by structured blocks.").into(),

@@ -1,4 +1,4 @@
-use rcmake_base::{BString, list, truth};
+use rcmake_base::{BString, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::args::{KeywordParser, Slot};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
@@ -10,6 +10,27 @@ use super::{bytes, cat};
 const ARG_COUNT: &str = "called with incorrect number of arguments";
 const CMP0077: PolicyId = PolicyId::new(77);
 const CMP0102: PolicyId = PolicyId::new(102);
+
+fn join_expanded(args: &[ExpandedArg]) -> BString {
+    let Some((first, rest)) = args.split_first() else {
+        return BString::default();
+    };
+    if rest.is_empty() {
+        return first.value.clone();
+    }
+    let total = args
+        .iter()
+        .map(|arg| arg.value.len())
+        .sum::<usize>()
+        .saturating_add(rest.len());
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&first.value);
+    for arg in rest {
+        out.push(b';');
+        out.extend_from_slice(&arg.value);
+    }
+    BString::from(out)
+}
 
 fn wrapped<'a>(name: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     name.strip_prefix(prefix)?.strip_suffix(b"}")
@@ -44,7 +65,7 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         match rest {
             [] => cx.unset_var(name),
             [values @ .., tail] if bytes(tail) == b"PARENT_SCOPE" => {
-                let value = (!values.is_empty()).then(|| list::join(values.iter().map(bytes)));
+                let value = (!values.is_empty()).then(|| join_expanded(values));
                 cx.set_parent_scope(name, value);
             }
             _ => set_normal_or_cache(cx, name, rest)?,
@@ -54,6 +75,12 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 }
 
 fn set_normal_or_cache(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Result<(), CmdError> {
+    if let [single] = args
+        && bytes(single) != b"CACHE"
+    {
+        cx.set_var(name, single.value.clone());
+        return Ok(());
+    }
     let (values, ty, help, force) = match args {
         [.., arg] if bytes(arg) == b"CACHE" => {
             return Err(CmdError::status(
@@ -84,7 +111,7 @@ fn set_normal_or_cache(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Re
             ));
         }
         _ => {
-            cx.set_var(name, list::join(args.iter().map(bytes)));
+            cx.set_var(name, join_expanded(args));
             return Ok(());
         }
     };
@@ -95,14 +122,7 @@ fn set_normal_or_cache(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Re
         );
         CacheType::String
     });
-    assign_cache(
-        cx,
-        name,
-        list::join(values.iter().map(bytes)),
-        ty,
-        help,
-        force,
-    );
+    assign_cache(cx, name, join_expanded(values), ty, help, force);
     Ok(())
 }
 
@@ -155,7 +175,7 @@ fn set_cache_keywords(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Res
     assign_cache(
         cx,
         name,
-        list::join(value.iter().map(bytes)),
+        join_expanded(value),
         ty,
         &help,
         parsed.flag("FORCE"),

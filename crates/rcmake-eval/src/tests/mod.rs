@@ -556,3 +556,133 @@ fn updates_parsed_recursion_limit_after_scope_and_host_changes() {
     interp.cx().remove_cache_entry(limit);
     assert_eq!(interp.recursion_limit(), 19);
 }
+
+#[test]
+fn cached_recursion_limit_invalidates_on_env_and_cache_changes_during_execution() {
+    fn register_with_mutators(reg: &mut Registry) {
+        register_test(reg);
+        let s = CmdFlags { scriptable: true };
+        reg.add(
+            "test_set_env_limit",
+            |cx, args| {
+                let value = args.first().map(|a| a.value.as_slice());
+                cx.host().env_set(crate::scope::RECURSION_LIMIT, value);
+                Ok(Flow::Normal)
+            },
+            s,
+        );
+        reg.add(
+            "test_set_cache_limit",
+            |cx, args| {
+                if let Some(value) = args.first() {
+                    cx.write_cache(
+                        crate::scope::RECURSION_LIMIT,
+                        value.value.clone(),
+                        rcmake_model::CacheType::String,
+                        b"",
+                    );
+                } else {
+                    cx.remove_cache_entry(crate::scope::RECURSION_LIMIT);
+                }
+                Ok(Flow::Normal)
+            },
+            s,
+        );
+    }
+
+    let host = Arc::new(PureHost::new(
+        PathBuf::from("/work"),
+        PathBuf::from("/usr/local/bin/cmake"),
+    ));
+    let script = concat!(
+        "function(deep n)\n",
+        "  if(n GREATER 0)\n",
+        "    set(next 0)\n",
+        "    if(n EQUAL 4)\n      set(next 3)\n    elseif(n EQUAL 3)\n      set(next 2)\n    elseif(n EQUAL 2)\n      set(next 1)\n    endif()\n",
+        "    deep(${next})\n",
+        "  endif()\n",
+        "endfunction()\n",
+        "deep(3)\n",
+        "test_set_env_limit(3)\n",
+        "deep(3)\n",
+    );
+    host.seed_file(&PathBuf::from("/work/main.cmake"), script.as_bytes())
+        .expect("seed");
+    let config = InterpConfig::new(
+        host.clone(),
+        RunMode::Script,
+        ROOT,
+        "/usr/local/bin/cmake",
+        "/work",
+    );
+    let registry = Interp::build_registry(register_with_mutators);
+    let mut interp = Interp::with_registry(config, Arc::clone(&registry));
+    interp.frontend = TEST_FRONTEND;
+    let outcome = interp.run_script(&PathBuf::from("main.cmake"));
+    assert_eq!(outcome.exit_code, 1);
+    assert!(interp.recursion_exceeded());
+
+    // Cache override takes effect immediately mid-script as well.
+    let host2 = Arc::new(PureHost::new(
+        PathBuf::from("/work"),
+        PathBuf::from("/usr/local/bin/cmake"),
+    ));
+    let script2 = concat!(
+        "function(deep n)\n",
+        "  if(n GREATER 0)\n",
+        "    set(next 0)\n",
+        "    if(n EQUAL 3)\n      set(next 2)\n    elseif(n EQUAL 2)\n      set(next 1)\n    endif()\n",
+        "    deep(${next})\n",
+        "  endif()\n",
+        "endfunction()\n",
+        "deep(3)\n",
+        "test_set_cache_limit(3)\n",
+        "deep(3)\n",
+    );
+    host2
+        .seed_file(&PathBuf::from("/work/main.cmake"), script2.as_bytes())
+        .expect("seed");
+    let config2 = InterpConfig::new(
+        host2.clone(),
+        RunMode::Script,
+        ROOT,
+        "/usr/local/bin/cmake",
+        "/work",
+    );
+    let mut interp2 = Interp::with_registry(config2, registry);
+    interp2.frontend = TEST_FRONTEND;
+    let outcome2 = interp2.run_script(&PathBuf::from("main.cmake"));
+    assert_eq!(outcome2.exit_code, 1);
+    assert!(interp2.recursion_exceeded());
+}
+
+#[test]
+fn with_registry_shares_one_registry_across_interpreters() {
+    let registry = Interp::build_registry(register_test);
+    for (name, expected) in [("first", "one"), ("second", "two")] {
+        let host = Arc::new(PureHost::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/usr/local/bin/cmake"),
+        ));
+        host.seed_file(
+            &PathBuf::from("/work/main.cmake"),
+            format!("set({name} {expected})\nmessage(\"${{{name}}}\")\n").as_bytes(),
+        )
+        .expect("seed");
+        let config = InterpConfig::new(
+            host.clone(),
+            RunMode::Script,
+            ROOT,
+            "/usr/local/bin/cmake",
+            "/work",
+        );
+        let mut interp = Interp::with_registry(config, Arc::clone(&registry));
+        interp.frontend = TEST_FRONTEND;
+        let outcome = interp.run_script(&PathBuf::from("main.cmake"));
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)),
+            format!("{expected}\n")
+        );
+    }
+}

@@ -25,6 +25,7 @@ impl Cx<'_> {
     /// Clone the session host for a child evaluator.
     #[must_use]
     pub fn host_arc(&self) -> Arc<dyn Host> {
+        self.interp.invalidate_recursion_limit();
         Arc::clone(&self.interp.config.host)
     }
 
@@ -38,6 +39,13 @@ impl Cx<'_> {
     #[must_use]
     pub fn session_data<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
         self.interp.session_data()
+    }
+
+    /// Get or lazily initialize mutable session data of type `T`.
+    pub fn session_data_mut_or_init<T: std::any::Any + Send + Sync + Default>(
+        &mut self,
+    ) -> Option<&mut T> {
+        self.interp.session_data_mut_or_init()
     }
 
     /// Get the configured path to the bundled modules and templates.
@@ -147,6 +155,7 @@ impl Cx<'_> {
     /// Access the [`Host`].
     #[must_use]
     pub fn host(&self) -> &dyn Host {
+        self.interp.invalidate_recursion_limit();
         self.interp.config.host.as_ref()
     }
 
@@ -195,6 +204,87 @@ impl Cx<'_> {
     pub fn var(&mut self, name: &[u8]) -> Option<BString> {
         self.interp.observe_replay_variable_access(name);
         self.interp.read_var(name)
+    }
+
+    /// Borrow a normal or cache variable value without cloning when no watch or
+    /// deprecation warning applies. Notifies variable watches identically to [`Self::var`].
+    pub fn with_var<R>(&mut self, name: &[u8], f: impl FnOnce(Option<&[u8]>) -> R) -> R {
+        self.interp.observe_replay_variable_access(name);
+        if !self.interp.needs_var_watch(name) {
+            let value = self.interp.lookup_var(name).map(|v| v.as_slice());
+            return f(value);
+        }
+        let value = self.interp.read_var(name);
+        f(value.as_ref().map(|v| v.as_slice()))
+    }
+
+    /// Append `;`-separated list items to `name` in the current scope, mutating an
+    /// existing local binding in place when no watch or provenance ledger applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CmdError::Status`] if the joined value exceeds `limits.max_value_bytes`.
+    pub fn append_list_var(
+        &mut self,
+        name: &[u8],
+        items: &[rcmake_expr::ExpandedArg],
+    ) -> Result<(), CmdError> {
+        self.interp.observe_replay_variable_access(name);
+        self.interp.record_variable_access(name);
+        if items.is_empty() {
+            if self.interp.needs_var_watch(name) {
+                let _ = self.interp.read_var(name);
+            }
+            return Ok(());
+        }
+        if !self.interp.needs_var_watch(name) && self.interp.var_ledger.is_none() {
+            let max_value = self.interp.config.limits.max_value_bytes;
+            let live_limit = self.interp.live_limit();
+            match self
+                .interp
+                .vars
+                .append_local_in_place(name, items, max_value, live_limit)
+            {
+                crate::scope::AppendOutcome::Appended => {
+                    self.interp.note_replay_var_write(name);
+                    return Ok(());
+                }
+                crate::scope::AppendOutcome::ValueTooLarge => {
+                    return Err(CmdError::status(
+                        "Variable value exceeded maximum allowed byte length.",
+                    ));
+                }
+                crate::scope::AppendOutcome::BudgetExceeded => {
+                    self.interp.report_variable_budget();
+                    return Ok(());
+                }
+                crate::scope::AppendOutcome::NotLocal => {}
+            }
+        }
+        let raw = self.interp.read_var(name);
+        let existing_len = raw.as_ref().map_or(0, |raw| raw.len());
+        let separators = items.len() - 1 + usize::from(existing_len > 0);
+        let joined = items
+            .iter()
+            .try_fold(existing_len, |len, item| len.checked_add(item.value.len()))
+            .and_then(|len| len.checked_add(separators));
+        let Some(joined) = joined.filter(|&len| len <= self.interp.config.limits.max_value_bytes)
+        else {
+            return Err(CmdError::status(
+                "Variable value exceeded maximum allowed byte length.",
+            ));
+        };
+        let mut existing = raw.unwrap_or_default();
+        let has_value = !existing.is_empty();
+        existing.reserve(joined.saturating_sub(existing.len()));
+        for (i, item) in items.iter().enumerate() {
+            if has_value || i != 0 {
+                existing.push(b';');
+            }
+            existing.extend_from_slice(&item.value);
+        }
+        self.set_var(name, existing);
+        Ok(())
     }
 
     /// Look up a normal variable only (no cache fallback).
@@ -305,6 +395,7 @@ impl Cx<'_> {
 
     /// Mutable access to [`ProjectModel`].
     pub fn project(&mut self) -> &mut ProjectModel {
+        self.interp.invalidate_recursion_limit();
         &mut self.interp.project
     }
 

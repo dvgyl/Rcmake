@@ -51,8 +51,7 @@ mod disabled {
     use rcmake_model::DirId;
     use rcmake_syntax::Argument;
 
-    use crate::code::Code;
-    use crate::digest::JournalDigest;
+    use crate::code::{Code, SourceText};
     use crate::interp::BodyMode;
     use crate::{CmdResult, Interp, Registry};
 
@@ -67,13 +66,7 @@ mod disabled {
 
     impl Interp {
         #[inline(always)]
-        pub(crate) fn note_replay_source(
-            &mut self,
-            _abs: &[u8],
-            _data: &[u8],
-            _digest: Option<JournalDigest>,
-        ) {
-        }
+        pub(crate) fn note_replay_source(&mut self, _abs: &[u8], _text: &SourceText) {}
 
         #[inline(always)]
         pub(crate) fn run_listfile_body(

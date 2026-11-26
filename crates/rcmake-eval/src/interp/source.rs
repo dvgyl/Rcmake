@@ -6,43 +6,51 @@ use rcmake_host::{FileKind, Follow, ReadRange};
 use rcmake_syntax::ParseError;
 
 use super::BodyMode;
-use crate::code::{Code, LimitsKey, MAX_CACHE_FILE_BYTES, ParsedSource, SourceText};
-use crate::digest::JournalDigest;
+use crate::code::{
+    Code, LimitsKey, MAX_CACHE_FILE_BYTES, ParsedSource, SharedParseCache, SourceText,
+};
 use crate::interp::IssueClass;
 use crate::util::{cat, collapse_full_path};
 use crate::{CmdError, CmdResult, Flow, IncludeOptions, Interp};
 
 impl Interp {
-    pub(crate) fn is_regular_file(&self, abs: &[u8]) -> bool {
+    /// Kind of the file at `abs` after following links, or `None` if it does not
+    /// exist. One `stat` answers both the existence and the directory test.
+    pub(crate) fn file_kind(&self, abs: &[u8]) -> Option<FileKind> {
         let native = rcmake_host::path::to_native(abs);
         self.config
             .host
             .metadata(&native, Follow::Yes)
-            .is_ok_and(|m| m.kind != FileKind::Dir)
+            .ok()
+            .map(|m| m.kind)
+    }
+
+    pub(crate) fn is_regular_file(&self, abs: &[u8]) -> bool {
+        self.file_kind(abs)
+            .is_some_and(|kind| kind != FileKind::Dir)
     }
 
     pub(crate) fn exists(&self, abs: &[u8]) -> bool {
-        let native = rcmake_host::path::to_native(abs);
-        self.config.host.metadata(&native, Follow::Yes).is_ok()
+        self.file_kind(abs).is_some()
     }
 
     pub(crate) fn is_dir(&self, abs: &[u8]) -> bool {
-        let native = rcmake_host::path::to_native(abs);
-        self.config
-            .host
-            .metadata(&native, Follow::Yes)
-            .is_ok_and(|m| m.kind == FileKind::Dir)
+        self.file_kind(abs) == Some(FileKind::Dir)
     }
 
     /// Read and parse a listfile. Reports read and parse errors. Returns `None` when the
     /// file is missing, is a directory, or does not parse.
     pub(crate) fn parse_file(&mut self, abs: &[u8]) -> Option<Code> {
-        if !self.is_regular_file(abs) {
+        // Under hermetic auditing keep the pre-check so directory/missing diagnostics stay identical.
+        if self.hermetic.is_some() && !self.is_regular_file(abs) {
             return None;
         }
         let native = rcmake_host::path::to_native(abs);
         let limit = self.config.limits.max_file_read;
         let Ok(data) = self.config.host.read(&native, ReadRange::All { limit }) else {
+            if self.hermetic.is_none() && !self.is_regular_file(abs) {
+                return None;
+            }
             self.issue_here(
                 MessageKind::Error,
                 Effect::SetError,
@@ -61,42 +69,27 @@ impl Interp {
         data: &[u8],
         kind: SourceKind,
     ) -> Option<Code> {
-        let cache_key =
-            (self.parse_cache.is_some() && data.len() <= MAX_CACHE_FILE_BYTES).then(|| {
-                (
-                    JournalDigest::hash(data),
-                    LimitsKey::new(kind, &self.config.limits),
-                )
-            });
+        let cache_key = (self.parse_cache.is_some() && data.len() <= MAX_CACHE_FILE_BYTES)
+            .then(|| SharedParseCache::key(data, LimitsKey::new(kind, &self.config.limits)));
         let hit = cache_key.and_then(|key| self.parse_cache.as_ref()?.get(key, data));
-        let digest = hit
-            .as_ref()
-            .map(|(text, _)| text.digest)
-            .or(cache_key.map(|(digest, _)| digest));
+        let text = hit.as_ref().map_or_else(
+            || SourceText::new(Arc::from(data)),
+            |(text, _)| text.clone(),
+        );
         if kind == SourceKind::File {
-            self.note_replay_source(path, data, digest);
+            self.note_replay_source(path, &text);
         }
-        let text = hit
-            .as_ref()
-            .map_or_else(|| Arc::from(data), |(text, _)| text.bytes.clone());
-        let id = self.sources.add(path.into(), kind, text.clone())?;
-        if let Some(shared) = self.session_data::<crate::hermetic::HermeticSources>() {
-            shared.add(path.into(), kind, Arc::clone(&text));
+        let id = self.sources.add(path.into(), kind, text.bytes.clone())?;
+        if let Some(shared) = &self.hermetic_sources {
+            shared.add(path.into(), kind, Arc::clone(&text.bytes));
         }
         let file: Arc<[u8]> = Arc::from(path);
         let ParsedSource { code, warnings } = if let Some((_, parsed)) = hit {
             parsed
         } else {
             let parsed = ParsedSource::parse(data, id, kind, &self.config.limits);
-            if let (Some(cache), Some((digest, limits))) = (&self.parse_cache, cache_key) {
-                cache.insert(
-                    limits,
-                    SourceText {
-                        bytes: text,
-                        digest,
-                    },
-                    parsed.clone(),
-                );
+            if let (Some(cache), Some(key)) = (&self.parse_cache, cache_key) {
+                cache.insert(key, text, parsed.clone());
             }
             parsed
         };
@@ -214,11 +207,13 @@ impl Interp {
         let base = self.current_source_dir_bytes();
         let shown = rcmake_host::path::from_native(path);
         let abs = collapse_full_path(&shown, &base);
-        if !self.exists(&abs) || self.is_dir(&abs) {
+        let kind = self.file_kind(&abs);
+        let exists = kind.is_some();
+        if !exists || kind == Some(FileKind::Dir) {
             if options.optional {
                 return Ok(Flow::Normal);
             }
-            let what: &[u8] = if self.exists(&abs) {
+            let what: &[u8] = if exists {
                 b"requested file is a directory:\n  "
             } else {
                 b"could not find requested file:\n  "

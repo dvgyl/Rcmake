@@ -702,3 +702,114 @@ fn file_templates_reject_non_utf8_boms_and_stop_each_line_at_nul() {
         b"\xef\xbb\xbftext\nx\nz\n"
     );
 }
+
+#[test]
+fn condition_fast_paths_preserve_operator_precedence_and_errors() {
+    let mut env = Env::new();
+    env.set("v", "hello");
+    env.set("NOT", "hello");
+    env.set("EXISTS", "hello");
+    env.set("lhs", "ON");
+    env.set("rhs", "OFF");
+    env.host.create_dir_all(Path::new("/work/absdir")).unwrap();
+    env.host
+        .write(Path::new("/work/absfile"), b"x", WriteMode::Truncate)
+        .unwrap();
+    env.host
+        .set_permissions(Path::new("/work/absfile"), 0o644)
+        .unwrap();
+
+    assert_conditions(
+        &mut env,
+        &[
+            ("NOT v", false),
+            ("NOT missing_var", true),
+            ("NOT DEFINED missing_var", true),
+            ("NOT DEFINED v", false),
+            ("NOT EXISTS /work/nope", true),
+            ("NOT IS_DIRECTORY /work/absdir", false),
+            ("IS_DIRECTORY /work/absdir", true),
+            ("EXISTS /work/absfile", true),
+            ("NOT v STREQUAL world", true),
+            ("NOT v STREQUAL hello", false),
+            ("NOT STREQUAL hello", true),
+            ("NOT NOT STREQUAL world", true),
+            ("NOT NOT STREQUAL hello", false),
+            ("NOT 1 EQUAL 2", true),
+            ("NOT 1.0 VERSION_LESS 2.0", false),
+            ("NOT a IN_LIST missing_var", true),
+            ("NOT PATH_EQUAL /work/absfile", false),
+            (r#"" 0.0""#, false),
+            ("\"\x0b1.5\"", true),
+            (r#"" -0""#, false),
+            (r#"" +2.5""#, true),
+            ("NaN", true),
+            ("-INF", true),
+        ],
+    );
+
+    // Policy warnings on `PATH_EQUAL` must fire exactly once even with leading `NOT`.
+    env.policies.insert(139, PolicyStatus::Warn);
+    assert!(env.condition("NOT a PATH_EQUAL a").is_err());
+    assert_eq!(env.warnings.len(), 1);
+    assert!(env.condition("NOT PATH_EQUAL a").is_err());
+    assert_eq!(env.warnings.len(), 2);
+
+    for bad in [
+        "NOT NOT v",
+        "MATCHES STREQUAL foo",
+        "DEFINED v extra",
+        "v NOT world",
+        "NOT STREQUAL foo bar",
+        "v AND",
+        "NOT v extra",
+    ] {
+        assert_eq!(
+            env.condition(bad).unwrap_err().message,
+            "Unknown arguments specified",
+            "{bad}"
+        );
+    }
+
+    // 3-token AND/OR still evaluates both operands (preserving watch reads).
+    env.lookups.clear();
+    assert_conditions(&mut env, &[("lhs OR rhs", true), ("rhs AND lhs", false)]);
+    assert_eq!(env.lookups, ["lhs", "rhs", "rhs", "lhs"].map(BString::from));
+}
+
+#[test]
+fn simple_var_fast_path_matches_scanner_semantics() {
+    let mut env = Env::new();
+    env.set("PLAIN", "abc");
+    env.set("EMPTY", "");
+    env.set("WITH_BS", r"a\b");
+    env.set("LIST", r"x;y\;z;;w");
+    env.set("BIG", "a".repeat(Limits::default().max_value_bytes));
+
+    let args = expanded(
+        br#"f(${PLAIN} "${PLAIN}" ${EMPTY} "${EMPTY}" ${WITH_BS} ${LIST} ${MISSING} "${MISSING}")"#,
+        &mut env,
+    );
+    let values: Vec<_> = args
+        .iter()
+        .map(|arg| (arg.kind, arg.value.as_slice()))
+        .collect();
+    assert_eq!(
+        values,
+        [
+            (ArgKind::Unquoted, b"abc".as_slice()),
+            (ArgKind::Quoted, b"abc"),
+            (ArgKind::Quoted, b""),
+            (ArgKind::Unquoted, br"a\b"),
+            (ArgKind::Unquoted, b"x"),
+            (ArgKind::Unquoted, b"y;z"),
+            (ArgKind::Unquoted, b"w"),
+            (ArgKind::Quoted, b""),
+        ]
+    );
+    // `name.len() + value.len() > max_value_bytes` reports resource limit without double lookup.
+    env.lookups.clear();
+    let err = expand_string(b"${BIG}", &mut env).unwrap_err();
+    assert!(err.is_resource_limit());
+    assert_eq!(env.lookups, [BString::from("BIG")]);
+}

@@ -1141,3 +1141,36 @@ fn cmp0073_records_only_legacy_link_dependencies() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn add_dependencies_deduplicates_across_large_batches_in_order() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+        add_library(app STATIC main.c)
+        add_dependencies(app)
+        foreach(i RANGE 1 20)
+          add_dependencies(app "dep_${i}")
+        endforeach()
+        add_dependencies(app
+          dep_5 dep_21 dep_22 dep_23 dep_24 dep_25 dep_26 dep_27 dep_28 dep_29 dep_30
+          dep_31 dep_32 dep_33 dep_34 dep_35 dep_21 dep_35 dep_36)
+        add_dependencies(app dep_1 dep_36 dep_37)
+        "#,
+        &[],
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let model = cx.project();
+    let id = model
+        .find_target(DirId::ROOT, b"app")
+        .ok_or("missing app target")?;
+    let target = model.target(id).ok_or("missing app target")?;
+    let actual: Vec<String> = target
+        .utility_deps
+        .iter()
+        .map(|entry| entry.value.to_string())
+        .collect();
+    let expected: Vec<String> = (1..=37).map(|i| format!("dep_{i}")).collect();
+    assert_eq!(actual, expected);
+    Ok(())
+}

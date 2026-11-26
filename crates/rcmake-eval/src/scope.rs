@@ -3,9 +3,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use indexmap::IndexMap;
 use rcmake_base::BString;
 use rcmake_diag::PolicyStatus;
 use rcmake_model::{Binding, DirId, VarLayer, VarSnapshot};
+
+use crate::util::FxBuildHasher;
 
 pub(crate) const RECURSION_LIMIT: &[u8] = b"CMAKE_MAXIMUM_RECURSION_DEPTH";
 
@@ -34,7 +37,20 @@ impl RecursionBinding {
     }
 }
 
-type Bindings = BTreeMap<BString, Binding>;
+type Bindings = IndexMap<BString, Binding, FxBuildHasher>;
+
+/// Outcome of an in-place list append on the innermost scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppendOutcome {
+    /// Items were appended directly to the existing local `Binding::Set`.
+    Appended,
+    /// The variable is not currently a `Binding::Set` in an unshared innermost scope.
+    NotLocal,
+    /// Appending would exceed `max_value_bytes`.
+    ValueTooLarge,
+    /// Appending would exceed the live variable budget.
+    BudgetExceeded,
+}
 
 /// Fixed cost of one binding for the live variable budget (map node and string headers).
 const BINDING_OVERHEAD: usize = 64;
@@ -77,7 +93,7 @@ enum ScopeBindings {
 
 impl Default for ScopeBindings {
     fn default() -> Self {
-        Self::Local(Bindings::new())
+        Self::Local(Bindings::default())
     }
 }
 
@@ -299,6 +315,61 @@ impl VarStack {
         limit: usize,
     ) -> Result<(), BudgetExceeded> {
         self.insert_top(name, Binding::Set(value), limit)
+    }
+
+    /// Append `;`-separated `items` directly to `name` when it is already a `Binding::Set`
+    /// in an unshared innermost scope. Enforces `max_value_bytes` and `live_limit` before
+    /// mutating anything, avoiding O(N²) cloning in `list(APPEND)` loops.
+    pub(crate) fn append_local_in_place(
+        &mut self,
+        name: &[u8],
+        items: &[rcmake_expr::ExpandedArg],
+        max_value_bytes: usize,
+        live_limit: usize,
+    ) -> AppendOutcome {
+        if items.is_empty() || name == RECURSION_LIMIT {
+            return AppendOutcome::NotLocal;
+        }
+        let Some(top) = self.scopes.last_mut() else {
+            return AppendOutcome::NotLocal;
+        };
+        let ScopeBindings::Local(bindings) = &mut top.bindings else {
+            return AppendOutcome::NotLocal;
+        };
+        let Some(Binding::Set(existing)) = bindings.get_mut(name) else {
+            return AppendOutcome::NotLocal;
+        };
+        let existing_len = existing.len();
+        let separators = items.len() - 1 + usize::from(existing_len > 0);
+        let joined = items
+            .iter()
+            .try_fold(existing_len, |len, item| len.checked_add(item.value.len()))
+            .and_then(|len| len.checked_add(separators));
+        let Some(joined) = joined.filter(|&len| len <= max_value_bytes) else {
+            return AppendOutcome::ValueTooLarge;
+        };
+        let delta = joined - existing_len;
+        let Some(new_live) = self
+            .live
+            .checked_add(delta)
+            .filter(|&live| live <= live_limit)
+        else {
+            return AppendOutcome::BudgetExceeded;
+        };
+        let Some(new_scope_bytes) = top.bytes.checked_add(delta) else {
+            return AppendOutcome::BudgetExceeded;
+        };
+        let has_value = existing_len > 0;
+        existing.reserve(delta);
+        for (i, item) in items.iter().enumerate() {
+            if has_value || i != 0 {
+                existing.push(b';');
+            }
+            existing.extend_from_slice(&item.value);
+        }
+        top.bytes = new_scope_bytes;
+        self.live = new_live;
+        AppendOutcome::Appended
     }
 
     /// Undefine `name` in the innermost scope (shadows outer bindings) if the live total
@@ -820,5 +891,80 @@ mod tests {
             s.visible_names(),
             vec![BString::from("b"), BString::from("c")]
         );
+    }
+
+    #[test]
+    fn append_local_in_place_updates_live_bytes_and_respects_limits() {
+        let item = |s: &str| rcmake_expr::ExpandedArg {
+            value: BString::from(s),
+            kind: rcmake_syntax::ArgKind::Unquoted,
+            line: 1,
+        };
+        let mut s = VarStack::default();
+        assert_eq!(
+            s.append_local_in_place(b"missing", &[item("a")], 1024, usize::MAX),
+            AppendOutcome::NotLocal
+        );
+        s.put(b"list", BString::default());
+        assert_eq!(
+            s.append_local_in_place(b"list", &[], 1024, usize::MAX),
+            AppendOutcome::NotLocal
+        );
+        assert_eq!(
+            s.append_local_in_place(b"list", &[item("a"), item("bb")], 1024, usize::MAX),
+            AppendOutcome::Appended
+        );
+        assert_eq!(s.get(b"list"), Some(&BString::from("a;bb")));
+        assert_eq!(s.live_bytes(), s.recount());
+
+        assert_eq!(
+            s.append_local_in_place(b"list", &[item("ccc")], 1024, usize::MAX),
+            AppendOutcome::Appended
+        );
+        assert_eq!(s.get(b"list"), Some(&BString::from("a;bb;ccc")));
+        assert_eq!(s.live_bytes(), s.recount());
+
+        // Exact max_value_bytes boundary rejects without mutating value or live bytes.
+        let before = s.live_bytes();
+        assert_eq!(
+            s.append_local_in_place(b"list", &[item("dd")], 10, usize::MAX),
+            AppendOutcome::ValueTooLarge
+        );
+        assert_eq!(s.get(b"list"), Some(&BString::from("a;bb;ccc")));
+        assert_eq!(s.live_bytes(), before);
+
+        // Live budget boundary rejects without mutating value or live bytes.
+        assert_eq!(
+            s.append_local_in_place(b"list", &[item("dddd")], 1024, before + 2),
+            AppendOutcome::BudgetExceeded
+        );
+        assert_eq!(s.get(b"list"), Some(&BString::from("a;bb;ccc")));
+        assert_eq!(s.live_bytes(), before);
+
+        // Unset, parent-only, recursion limit, and shared snapshots all report NotLocal.
+        s.push();
+        assert_eq!(
+            s.append_local_in_place(b"list", &[item("child")], 1024, usize::MAX),
+            AppendOutcome::NotLocal
+        );
+        s.clear(b"list");
+        assert_eq!(
+            s.append_local_in_place(b"list", &[item("child")], 1024, usize::MAX),
+            AppendOutcome::NotLocal
+        );
+        s.put(RECURSION_LIMIT, "10".into());
+        assert_eq!(
+            s.append_local_in_place(RECURSION_LIMIT, &[item("20")], 1024, usize::MAX),
+            AppendOutcome::NotLocal
+        );
+        s.put(b"local", "x".into());
+        let _snap = s.snapshot();
+        assert_eq!(
+            s.append_local_in_place(b"local", &[item("y")], 1024, usize::MAX),
+            AppendOutcome::NotLocal
+        );
+        s.pop();
+        assert_eq!(s.get(b"list"), Some(&BString::from("a;bb;ccc")));
+        assert_eq!(s.live_bytes(), s.recount());
     }
 }

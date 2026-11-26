@@ -36,6 +36,7 @@ impl Interp {
         report_processing_error: bool,
         standalone: bool,
     ) -> RunOutcome {
+        self.invalidate_recursion_limit();
         self.init_policy_minimum();
         let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
         let abs = collapse_full_path(&rcmake_host::path::from_native_cmake(path), &cwd);
@@ -207,6 +208,7 @@ impl Interp {
 
         let bin_native = rcmake_host::path::to_native(&bin_abs);
 
+        self.invalidate_recursion_limit();
         self.init_policy_minimum();
         self.project.set_root_dirs(src_abs.clone(), bin_abs.clone());
         let probe = self
@@ -314,6 +316,7 @@ impl Interp {
         if self.poll_cancel() {
             return false;
         }
+        self.invalidate_recursion_limit();
         self.init_policy_minimum();
         let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
         let abs = collapse_full_path(&rcmake_host::path::from_native_cmake(path), &cwd);
@@ -552,7 +555,7 @@ impl Interp {
         }
     }
 
-    pub(super) fn current_source_dir_bytes(&self) -> BString {
-        rcmake_host::path::from_native_cmake(&self.current_source_dir())
+    pub(crate) fn current_source_dir_bytes(&self) -> BString {
+        rcmake_base::path_lex::cmake_style(&self.project.dir(self.current_dir_id()).source_dir)
     }
 }

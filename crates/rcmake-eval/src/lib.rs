@@ -17,8 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use indexmap::IndexMap;
 use rcmake_base::{BString, Limits, fold_command_name};
 use rcmake_diag::{
     Backtrace, DiagEngine, DiagOptions, DiagState, PolicyMap, RenderOptions, SourceMap,
@@ -132,8 +134,8 @@ pub struct CmdFlags {
 /// Registry of built-in commands indexed by ASCII-lowercased name.
 #[derive(Default)]
 pub struct Registry {
-    builtins: BTreeMap<BString, Builtin>,
-    guards: BTreeMap<BString, BuiltinGuard>,
+    builtins: IndexMap<BString, Builtin, util::FxBuildHasher>,
+    guards: Vec<(BString, BuiltinGuard)>,
 }
 
 #[derive(Clone, Copy)]
@@ -148,8 +150,26 @@ struct Builtin {
 impl Registry {
     /// Set the guard for a built-in command.
     pub fn guard(&mut self, name: &'static str, check: BuiltinGuard) {
+        let key = fold_command_name(name.as_bytes());
+        if let Some((_, existing)) = self.guards.iter_mut().find(|(k, _)| *k == key) {
+            *existing = check;
+        } else {
+            self.guards.push((key, check));
+        }
+    }
+
+    pub(crate) fn get_guard(&self, name: &[u8]) -> Option<BuiltinGuard> {
+        if self.guards.is_empty() {
+            return None;
+        }
         self.guards
-            .insert(fold_command_name(name.as_bytes()), check);
+            .iter()
+            .find(|(k, _)| k.as_slice() == name)
+            .or_else(|| {
+                let stripped = name.strip_prefix(b"_")?;
+                self.guards.iter().find(|(k, _)| k.as_slice() == stripped)
+            })
+            .map(|(_, guard)| *guard)
     }
 
     /// Register a built-in command under its canonical lowercase name.
@@ -206,7 +226,9 @@ impl Registry {
 
     /// All registered lowercase names in sorted order.
     pub fn names(&self) -> impl Iterator<Item = &BString> {
-        self.builtins.keys()
+        let mut keys: Vec<&BString> = self.builtins.keys().collect();
+        keys.sort_unstable();
+        keys.into_iter()
     }
 }
 
@@ -395,9 +417,15 @@ pub(crate) struct UserCommand {
     pub(crate) name: BString,
     /// Formal parameter names.
     pub(crate) params: Vec<BString>,
+    /// Precomputed `${<param>}` substitution patterns for macros.
+    pub(crate) formal_patterns: Vec<BString>,
     pub(crate) body: Code,
+    /// Precomputed directory of `body.file` (`CMAKE_CURRENT_FUNCTION_LIST_DIR`).
+    pub(crate) file_dir: BString,
     /// Line of the `function()`/`macro()` command.
     pub(crate) line: u32,
+    /// Precomputed decimal text of `line` (`CMAKE_CURRENT_FUNCTION_LIST_LINE`).
+    pub(crate) line_str: BString,
     /// Policy settings recorded at definition time.
     pub(crate) policies: PolicyMap,
     /// Diagnostic settings recorded at definition time.
@@ -459,9 +487,9 @@ pub struct Interp {
     root_frame: DirFrame,
     /// Active subdirectory frames (`add_subdirectory()`), innermost last.
     dir_stack: Vec<DirFrame>,
-    registry: Registry,
+    registry: Arc<Registry>,
     /// User-defined commands and renamed (`_name`) previous definitions.
-    scripted: BTreeMap<BString, Command>,
+    scripted: IndexMap<BString, Command, util::FxBuildHasher>,
     vars: VarStack,
     policies: LayeredStack<PolicyMap>,
     diags: LayeredStack<DiagState>,
@@ -478,6 +506,9 @@ pub struct Interp {
     /// active calls hold. They count against `limits.max_live_variable_bytes`.
     temp_bytes: usize,
     recursion_fallback: Mutex<(BString, Option<u32>)>,
+    /// Cached cache/env fallback for `CMAKE_MAXIMUM_RECURSION_DEPTH` during active execution
+    /// (`0` = uncached, `limit + 1` = cached `limit`). Invalidated on any cache/host access.
+    fallback_recursion_limit: AtomicU64,
     recursion_exceeded: bool,
     inherited_recursion: Option<(u32, u32)>,
     check_system_vars: bool,
@@ -512,6 +543,8 @@ pub struct Interp {
     #[cfg(feature = "replay")]
     replay: journal::ReplayState,
     variable_access: BTreeMap<BString, std::sync::atomic::AtomicBool>,
+    tracks_recursion_limit: bool,
+    unread_tracked: AtomicUsize,
     /// Command tracing configuration (`--trace*`).
     trace: Option<TraceConfig>,
     command_profiler: Option<Arc<CommandProfiler>>,
@@ -526,8 +559,21 @@ pub struct Interp {
     command_end: usize,
     foreach_frames: Vec<flow::ForeachFrame>,
     session_data: services::SessionData,
+    /// Mirrored from `session_data` to avoid per-command `BTreeMap<TypeId>` lookups.
+    hermetic: Option<hermetic::HermeticContext>,
+    hermetic_sources: Option<hermetic::HermeticSources>,
     expanded_observer: Option<services::ExpandedObserver>,
     parse_cache: Option<Arc<SharedParseCache>>,
+    /// Precomputed `<CMAKE_ROOT>/Modules/` prefix for `include()` module lookup.
+    cmake_modules_prefix: BString,
+    /// Pooled expanded argument vectors reused across hot command/condition dispatches.
+    arg_bufs: Vec<Vec<ExpandedArg>>,
+    #[cfg(any(target_os = "macos", windows))]
+    module_dir_names: std::collections::HashMap<
+        BString,
+        std::collections::HashSet<BString, util::FxBuildHasher>,
+        util::FxBuildHasher,
+    >,
     /// `--trace-expand` is expanding the arguments of a traced command.
     trace_expanding: bool,
     /// Listfile of each file and function call scope (`LISTFILE_STACK`).
@@ -537,6 +583,18 @@ pub struct Interp {
 }
 
 impl Interp {
+    /// Build a shared [`Registry`] containing core commands and `register`'s commands.
+    ///
+    /// Reuse the returned [`Arc<Registry>`] across interpreters (such as `try_compile`
+    /// children) via [`Self::with_registry`] to avoid rebuilding the command table.
+    #[must_use]
+    pub fn build_registry(register: fn(&mut Registry)) -> Arc<Registry> {
+        let mut registry = Registry::default();
+        builtins::register_core(&mut registry);
+        register(&mut registry);
+        Arc::new(registry)
+    }
+
     /// Create a new interpreter with registered command families.
     ///
     /// The core commands owned by this crate (`message`, `include`, `include_guard`,
@@ -544,9 +602,12 @@ impl Interp {
     /// other command families.
     #[must_use]
     pub fn new(config: InterpConfig, register: fn(&mut Registry)) -> Self {
-        let mut registry = Registry::default();
-        builtins::register_core(&mut registry);
-        register(&mut registry);
+        Self::with_registry(config, Self::build_registry(register))
+    }
+
+    /// Create a new interpreter backed by a prebuilt [`Registry`].
+    #[must_use]
+    pub fn with_registry(config: InterpConfig, registry: Arc<Registry>) -> Self {
         let mut project = ProjectModel::default();
         for def in &config.defines {
             project.cache.insert(
@@ -568,6 +629,10 @@ impl Interp {
         };
         let started = config.host.monotonic();
         let initial_dir = rcmake_host::path::from_native(&config.cwd);
+        let cmake_modules_prefix = util::cat(&[
+            &rcmake_host::path::from_native_cmake(&config.cmake_root),
+            b"/Modules/",
+        ]);
         project.set_root_dirs(initial_dir.clone(), initial_dir);
         let var_ledger = (!matches!(config.services.provenance, LedgerLevel::Off)).then(|| {
             project.set_prop_ledger(Some(Box::default()));
@@ -588,7 +653,7 @@ impl Interp {
             },
             dir_stack: Vec::new(),
             registry,
-            scripted: BTreeMap::new(),
+            scripted: IndexMap::default(),
             vars: VarStack::default(),
             policies: LayeredStack::new(PolicyMap::default()),
             diags: LayeredStack::new(diag_state),
@@ -604,6 +669,7 @@ impl Interp {
             block_depth: 0,
             temp_bytes: 0,
             recursion_fallback: Mutex::default(),
+            fallback_recursion_limit: AtomicU64::new(0),
             recursion_exceeded: false,
             inherited_recursion: None,
             check_system_vars: false,
@@ -627,6 +693,8 @@ impl Interp {
             #[cfg(feature = "replay")]
             replay: journal::ReplayState::default(),
             variable_access: BTreeMap::new(),
+            tracks_recursion_limit: false,
+            unread_tracked: AtomicUsize::new(0),
             trace: None,
             command_profiler: None,
             configure_log: Vec::new(),
@@ -637,8 +705,14 @@ impl Interp {
             command_end: 0,
             foreach_frames: Vec::new(),
             session_data: services::SessionData::default(),
+            hermetic: None,
+            hermetic_sources: None,
             expanded_observer: None,
-            parse_cache: None,
+            parse_cache: Some(Arc::default()),
+            cmake_modules_prefix,
+            arg_bufs: Vec::new(),
+            #[cfg(any(target_os = "macos", windows))]
+            module_dir_names: std::collections::HashMap::with_hasher(util::FxBuildHasher),
             trace_expanding: false,
             listfiles: Vec::new(),
             file_locks: Vec::new(),
@@ -648,8 +722,13 @@ impl Interp {
         interp
     }
 
+    pub(crate) fn invalidate_recursion_limit(&self) {
+        self.fallback_recursion_limit.store(0, Ordering::Relaxed);
+    }
+
     /// Execution context for embedding code (CLI setup, presets, tests).
     pub fn cx(&mut self) -> Cx<'_> {
+        self.invalidate_recursion_limit();
         Cx { interp: self }
     }
 

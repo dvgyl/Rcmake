@@ -12,8 +12,12 @@ impl Interp {
     /// Expand and evaluate a condition. On error, issue
     /// `<prefix>given arguments:\n  <args>\n<message>` as a fatal error.
     fn eval_reporting(&mut self, args: &[Argument], prefix: &[u8]) -> Result<bool, CmdError> {
-        let expanded = self.expand(args)?;
-        match self.eval_command_condition(&expanded) {
+        let mut expanded = self.take_arg_buf(args.len());
+        if let Err(err) = self.expand_into_buf(args, &mut expanded) {
+            self.recycle_arg_buf(expanded);
+            return Err(err);
+        }
+        let result = match self.eval_command_condition(&expanded) {
             Ok(v) => Ok(v),
             Err(e) => {
                 let mut msg = prefix.to_vec();
@@ -27,7 +31,9 @@ impl Interp {
                 self.fatal_here(BString::from(msg));
                 Err(CmdError::Reported)
             }
-        }
+        };
+        self.recycle_arg_buf(expanded);
+        result
     }
 
     pub(crate) fn exec_if(&mut self, code: &Code, i: usize) -> BlockResult {
@@ -37,7 +43,7 @@ impl Interp {
         };
         let end = code.end_of(i);
         let mut truth = false;
-        if let Err(e) = self.run_opener(code, cmd, |this| {
+        if let Err(e) = self.run_opener(code, i, cmd, |this| {
             truth = this.eval_reporting(&cmd.args, b"if ")?;
             Ok(Flow::Normal)
         }) {
@@ -51,35 +57,37 @@ impl Interp {
     }
 
     fn run_if_branches(&mut self, code: &Code, i: usize, end: usize, truth: bool) -> CmdResult {
-        let cmds = Arc::clone(&code.cmds);
-        let branches = code.if_branches(i);
-        let first_stop = branches.first().copied().unwrap_or(end);
+        let first_stop = code.next_branch(i);
         if truth {
             return self.run_body(code, i + 1, first_stop);
         }
-        for (n, &b) in branches.iter().enumerate() {
-            let stop = branches.get(n + 1).copied().unwrap_or(end);
+        let cmds = Arc::clone(&code.cmds);
+        let mut b = first_stop;
+        while b < end {
+            let stop = code.next_branch(b);
             let Some(bc) = cmds.get(b) else { break };
             if bc.lower.as_slice() == b"else" {
                 self.trace_unframed(code, b);
                 return self.run_body(code, b + 1, stop);
             }
             self.trace_unframed(code, b);
-            let taken = self.with_plain_frame(&code.file, bc.line, &bc.name, |this| {
-                if bc.args.is_empty() {
-                    this.issue_here(
-                        MessageKind::AuthorWarning,
-                        Effect::None,
-                        Some(DiagCategory::Author),
-                        "ELSEIF called with no arguments, it will be skipped.".into(),
-                        false,
-                    );
-                }
-                this.eval_reporting(&bc.args, b"")
-            })?;
+            let taken =
+                self.with_plain_frame_arc(&code.file, bc.line, code.name_arc(b), |this| {
+                    if bc.args.is_empty() {
+                        this.issue_here(
+                            MessageKind::AuthorWarning,
+                            Effect::None,
+                            Some(DiagCategory::Author),
+                            "ELSEIF called with no arguments, it will be skipped.".into(),
+                            false,
+                        );
+                    }
+                    this.eval_reporting(&bc.args, b"")
+                })?;
             if taken {
                 return self.run_body(code, b + 1, stop);
             }
+            b = stop;
         }
         Ok(Flow::Normal)
     }
@@ -90,7 +98,7 @@ impl Interp {
             return Ok(Ok(Flow::Normal));
         };
         let end = code.end_of(i);
-        self.run_opener(code, cmd, |_| {
+        self.run_opener(code, i, cmd, |_| {
             if cmd.args.is_empty() {
                 Err(CmdError::Status(
                     "called with incorrect number of arguments".into(),
@@ -119,43 +127,50 @@ impl Interp {
         end: usize,
         cmd: &CommandInvocation,
     ) -> CmdResult {
-        let bt = self.command_backtrace(&code.file, cmd.line, &cmd.name);
+        let bt = self.command_backtrace_arc(&code.file, cmd.line, code.name_arc(i));
         let mut repeated = false;
-        loop {
+        let mut expanded = self.take_arg_buf(cmd.args.len());
+        let result = loop {
             if self.fatal || self.over_budget() || (repeated && !self.take_step()) {
-                return Err(CmdError::Reported);
+                break Err(CmdError::Reported);
             }
             repeated = true;
             let outcome = self.with_plain_backtrace(bt.clone(), cmd.line, |this| {
-                let expanded = this.expand(&cmd.args)?;
-                Ok::<_, CmdError>((this.eval_command_condition(&expanded), expanded))
+                this.expand_into_buf(&cmd.args, &mut expanded)?;
+                Ok::<_, CmdError>(this.eval_command_condition(&expanded))
             });
-            let (truth, expanded) = outcome?;
+            let truth = match outcome {
+                Ok(truth) => truth,
+                Err(err) => break Err(err),
+            };
             match truth {
                 Ok(true) => {}
-                Ok(false) => return Ok(Flow::Normal),
+                Ok(false) => break Ok(Flow::Normal),
                 Err(e) => {
-                    self.report_while_error(code, cmd, &expanded, &e.message);
-                    return Ok(Flow::Normal);
+                    self.report_while_error(code, i, cmd, &expanded, &e.message);
+                    break Ok(Flow::Normal);
                 }
             }
             match self.run_body(code, i + 1, end) {
                 Ok(Flow::Normal | Flow::Continue) => {}
-                Ok(Flow::Break) => return Ok(Flow::Normal),
-                Ok(ret @ Flow::Return { .. }) => return Ok(ret),
+                Ok(Flow::Break) => break Ok(Flow::Normal),
+                Ok(ret @ Flow::Return { .. }) => break Ok(ret),
                 Err(e) => {
                     if self.fatal {
-                        return Err(e);
+                        break Err(e);
                     }
                 }
             }
-        }
+        };
+        self.recycle_arg_buf(expanded);
+        result
     }
 
     /// Report a `while()` condition error (`CMP0130`).
     fn report_while_error(
         &mut self,
         code: &Code,
+        i: usize,
         cmd: &CommandInvocation,
         expanded: &[ExpandedArg],
         message: &[u8],
@@ -171,7 +186,7 @@ impl Interp {
         }
         err.push(b'\n');
         err.extend_from_slice(message);
-        self.with_plain_frame(&code.file, cmd.line, &cmd.name, |this| {
+        self.with_plain_frame_arc(&code.file, cmd.line, code.name_arc(i), |this| {
             if status == PolicyStatus::Warn {
                 this.issue_policy_warning(PolicyId::new(130), b"", &err);
             } else {

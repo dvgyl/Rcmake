@@ -40,6 +40,8 @@ fn expand_into(
     for arg in args {
         let value = if arg.kind == ArgKind::Bracket {
             arg.text.clone()
+        } else if let Some(value) = try_expand_simple_var(&arg.text, env) {
+            value?
         } else {
             expand(&arg.text, arg.line, env, Mode::ListfileArgument)?
         };
@@ -49,9 +51,17 @@ fn expand_into(
             line: arg.line,
         };
         if arg.kind == ArgKind::Unquoted {
-            for element in list::iter(&value, Empty::Drop) {
-                budget.take(element.len())?;
-                out.push(expanded(BString::from(element.into_owned())));
+            if value.is_empty() {
+                continue;
+            }
+            if !value.contains(&b';') {
+                budget.take(value.len())?;
+                out.push(expanded(value));
+            } else {
+                for element in list::iter(&value, Empty::Drop) {
+                    budget.take(element.len())?;
+                    out.push(expanded(BString::from(element.into_owned())));
+                }
             }
         } else {
             budget.take(value.len())?;
@@ -61,8 +71,34 @@ fn expand_into(
     Ok(())
 }
 
+/// Fast path for an exact `${NAME}` reference in argument expansion.
+fn try_expand_simple_var(
+    src: &[u8],
+    env: &mut dyn ExpandEnv,
+) -> Option<Result<BString, ExpandError>> {
+    let name = src.strip_prefix(b"${")?.strip_suffix(b"}")?;
+    if name.is_empty() || name == LINE_VAR || !name.iter().all(|&byte| name_byte(byte)) {
+        return None;
+    }
+    let max = Limits::default().max_value_bytes;
+    let remaining = max.checked_sub(name.len())?;
+    let value = env.var(name).unwrap_or_else(|| {
+        env.missing_reference(name);
+        BString::default()
+    });
+    if value.len() > remaining {
+        return Some(Err(ExpandError::resource_limit(
+            "Variable expansion exceeded the value size limit.",
+        )));
+    }
+    Some(Ok(value))
+}
+
 /// Expand variables and escape sequences in a byte string. Keep list separators.
 pub fn expand_string(src: &[u8], env: &mut dyn ExpandEnv) -> Result<BString, ExpandError> {
+    if let Some(value) = try_expand_simple_var(src, env) {
+        return value;
+    }
     expand(src, env.current_line(), env, Mode::Argument)
 }
 
@@ -90,13 +126,22 @@ pub(crate) fn expand(
     env: &mut dyn ExpandEnv,
     mode: Mode,
 ) -> Result<BString, ExpandError> {
+    let max_bytes = Limits::default().max_value_bytes;
+    let is_plain = match mode {
+        Mode::Argument | Mode::ListfileArgument => !src.iter().any(|&b| b == b'$' || b == b'\\'),
+        Mode::Template { at_only: true, .. } => !src.contains(&b'@'),
+        Mode::Template { at_only: false, .. } => !src.iter().any(|&b| b == b'$' || b == b'@'),
+    };
+    if is_plain && src.len() <= max_bytes {
+        return Ok(BString::from(src));
+    }
     let mut scanner = Scanner {
         source: src,
         remaining: src,
         line,
         env,
         mode,
-        remaining_bytes: Limits::default().max_value_bytes,
+        remaining_bytes: max_bytes,
     };
     scanner.scan(None, 0).map(BString::from)
 }

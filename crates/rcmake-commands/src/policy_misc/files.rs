@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
@@ -10,7 +11,7 @@ use rcmake_expr::{
 use rcmake_host::{FileKind, Follow, ReadRange, WriteMode, path};
 use rcmake_model::{CacheEntry, CacheType};
 
-use super::{quoted, values};
+use super::quoted;
 
 #[derive(Default)]
 struct FileOptions {
@@ -47,11 +48,12 @@ impl Permissions {
 }
 
 impl FileOptions {
-    fn parse(mut args: &[&[u8]]) -> Result<Self, CmdError> {
+    fn parse(mut args: &[ExpandedArg]) -> Result<Self, CmdError> {
         let mut options = Self::default();
         while let Some((arg, tail)) = args.split_first() {
             args = tail;
-            match *arg {
+            let arg = arg.value.as_slice();
+            match arg {
                 b"COPYONLY" => options.copy = true,
                 b"IMMEDIATE" => {}
                 b"ESCAPE_QUOTES" => options.expand.escape_quotes = true,
@@ -63,8 +65,9 @@ impl FileOptions {
                     let mut found = false;
                     let mut invalid = Vec::new();
                     while let Some((name, rest)) = args.split_first() {
+                        let name = name.value.as_slice();
                         if matches!(
-                            *name,
+                            name,
                             b"COPYONLY"
                                 | b"IMMEDIATE"
                                 | b"ESCAPE_QUOTES"
@@ -79,7 +82,7 @@ impl FileOptions {
                         if let Some(bit) = permission(name) {
                             mode |= bit;
                         } else {
-                            invalid.push(*name);
+                            invalid.push(name);
                         }
                         found = true;
                         args = rest;
@@ -104,7 +107,7 @@ impl FileOptions {
                             "NEWLINE_STYLE must set a style: LF, CRLF, UNIX, DOS, or WIN32",
                         ));
                     };
-                    options.newline = Some(match *style {
+                    options.newline = Some(match style.value.as_slice() {
                         b"UNIX" | b"LF" => false,
                         b"DOS" | b"WIN32" | b"CRLF" => true,
                         _ => {
@@ -168,12 +171,13 @@ fn permission(name: &[u8]) -> Option<u32> {
 }
 
 pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
-    let args = values(args);
-    let [input, output, flags @ ..] = args.as_slice() else {
+    let [input, output, flags @ ..] = args else {
         return Err(CmdError::status(
             "called with incorrect number of arguments, expected 2",
         ));
     };
+    let input = input.value.as_slice();
+    let output = output.value.as_slice();
     let options = FileOptions::parse(flags)?;
     if !options.unknown.is_empty() {
         let body = quoted(
@@ -203,14 +207,17 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
         return Err(CmdError::status("input must be a regular file."));
     }
     let mut dest = normalize(&cx.current_binary_dir().join(path::to_native(output)));
-    if cx
-        .host()
-        .metadata(&dest, Follow::Yes)
+    let initial_dest_meta = cx.host().metadata(&dest, Follow::Yes);
+    let mut cached_dest_meta = if initial_dest_meta
+        .as_ref()
         .is_ok_and(|m| m.kind == FileKind::Dir)
         && let Some(name) = source.file_name()
     {
         dest.push(name);
-    }
+        None
+    } else {
+        Some(initial_dest_meta)
+    };
     let range = ReadRange::All {
         limit: cx.limits().max_file_read,
     };
@@ -232,6 +239,9 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
     let content = if options.copy {
         input
     } else {
+        if cx.observes_commands() {
+            cached_dest_meta = None;
+        }
         let mut env = CxEnv {
             cx: &mut *cx,
             line: None,
@@ -257,7 +267,8 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
         .mode(metadata.mode)
         & 0o7777;
     let host = cx.host();
-    let dest_meta = host.metadata(&dest, Follow::Yes);
+    let dest_meta = cached_dest_meta.unwrap_or_else(|| host.metadata(&dest, Follow::Yes));
+    let dest_existed = dest_meta.is_ok();
     if dest_meta
         .as_ref()
         .is_ok_and(|m| m.kind == FileKind::File && m.len == content.len() as u64)
@@ -269,7 +280,7 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
             host.set_permissions(&dest, mode).map_err(file_error)?;
         }
     } else {
-        write_configured(cx, &dest, &content, mode)?;
+        write_configured(cx, &dest, &content, mode, dest_existed)?;
     }
     let template = path::from_native_cmake(&source);
     let dir = cx.current_dir_id();
@@ -278,23 +289,30 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
     Ok(Flow::Normal)
 }
 
-fn write_configured(cx: &Cx<'_>, dest: &Path, content: &[u8], mode: u32) -> Result<(), CmdError> {
+fn write_configured(
+    cx: &Cx<'_>,
+    dest: &Path,
+    content: &[u8],
+    mode: u32,
+    dest_existed: bool,
+) -> Result<(), CmdError> {
     let host = cx.host();
     let parent = dest
         .parent()
         .ok_or_else(|| CmdError::status("output has no parent directory."))?;
-    host.create_dir_all(parent).map_err(file_error)?;
+    if !dest_existed {
+        host.create_dir_all(parent).map_err(file_error)?;
+    }
     let pid = host.system().pid;
     for index in 0..100 {
         let temp = parent.join(format!(".rcmake-configure-{pid}-{index}.tmp"));
         if temp == dest {
             continue;
         }
-        match host.write(&temp, b"", WriteMode::CreateNew) {
+        match host.write(&temp, content, WriteMode::CreateNew) {
             Ok(()) => {
                 let result = host
-                    .write(&temp, content, WriteMode::Truncate)
-                    .and_then(|()| host.set_permissions(&temp, mode))
+                    .set_permissions(&temp, mode)
                     .and_then(|()| host.rename(&temp, dest));
                 if result.is_err() {
                     let _ = host.remove_file(&temp);
@@ -302,7 +320,10 @@ fn write_configured(cx: &Cx<'_>, dest: &Path, content: &[u8], mode: u32) -> Resu
                 return result.map_err(file_error);
             }
             Err(error) if error.kind == ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(file_error(error)),
+            Err(error) => {
+                let _ = host.remove_file(&temp);
+                return Err(file_error(error));
+            }
         }
     }
     Err(CmdError::status(
@@ -314,29 +335,63 @@ fn file_error(error: rcmake_host::HostError) -> CmdError {
     CmdError::status(format!("Problem configuring file: {error}"))
 }
 
+#[cfg(unix)]
+fn is_clean_unix_abs(path: &[u8]) -> bool {
+    if !path.starts_with(b"/") {
+        return false;
+    }
+    if path.len() == 1 {
+        return true;
+    }
+    if path.ends_with(b"/") {
+        return false;
+    }
+    let mut prev = b'/';
+    let mut i = 1;
+    while let Some(&b) = path.get(i) {
+        if b == b'/' && prev == b'/' {
+            return false;
+        }
+        if b == b'.' && prev == b'/' {
+            match path.get(i + 1) {
+                None | Some(b'/') => return false,
+                Some(b'.') if matches!(path.get(i + 2), None | Some(b'/')) => return false,
+                _ => {}
+            }
+        }
+        prev = b;
+        i += 1;
+    }
+    true
+}
+
 pub(super) fn filename_component(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
-    let args = values(args);
-    let [var, input, component, flags @ ..] = args.as_slice() else {
+    let [var, input, component, flags @ ..] = args else {
         return Err(crate::command_error(
             cx,
             "get_filename_component called with incorrect number of arguments",
         ));
     };
+    let var = var.value.as_slice();
+    let input = input.value.as_slice();
+    let component = component.value.as_slice();
     let mut flags = flags;
     let mut cache = false;
     let mut base_dir = None;
     let mut program_args = None;
     while let Some((arg, rest)) = flags.split_first() {
         flags = rest;
-        match *arg {
+        match arg.value.as_slice() {
             b"CACHE" => cache = true,
-            b"BASE_DIR" | b"PROGRAM_ARGS" => {
+            b"BASE_DIR" => {
                 if let Some((value, tail)) = flags.split_first() {
-                    if *arg == b"BASE_DIR" {
-                        base_dir = Some(path::to_native(value));
-                    } else {
-                        program_args = Some(*value);
-                    }
+                    base_dir = Some(value.value.as_slice());
+                    flags = tail;
+                }
+            }
+            b"PROGRAM_ARGS" => {
+                if let Some((value, tail)) = flags.split_first() {
+                    program_args = Some(value.value.as_slice());
                     flags = tail;
                 }
             }
@@ -344,48 +399,58 @@ pub(super) fn filename_component(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRe
         }
     }
     if cache
-        && cx
-            .var(var)
-            .is_some_and(|value| value != b"NOTFOUND" && !value.ends_with(b"-NOTFOUND"))
+        && cx.with_var(var, |value| {
+            value.is_some_and(|v| v != b"NOTFOUND" && !v.ends_with(b"-NOTFOUND"))
+        })
     {
         return Ok(Flow::Normal);
     }
 
-    let path_input = input.replace(b"\\", b"/");
-    let name = path_input
-        .rsplit(|byte| *byte == b'/')
-        .next()
-        .unwrap_or_default();
+    // Most inputs have no backslash, so borrow them instead of copying.
+    let path_input: Cow<'_, [u8]> = if input.contains(&b'\\') {
+        Cow::Owned(input.replace(b"\\", b"/"))
+    } else {
+        Cow::Borrowed(input)
+    };
+    let basename = || {
+        path_input
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .unwrap_or_default()
+    };
     let mut program_tail = None;
-    let out = match *component {
+    let out = match component {
         b"DIRECTORY" | b"PATH" => directory(&path_input).into(),
-        b"NAME" => name.into(),
+        b"NAME" => basename().into(),
         b"EXT" | b"NAME_WE" => {
+            let name = basename();
             extension(name, name.iter().position(|byte| *byte == b'.'), component)
         }
         b"LAST_EXT" | b"NAME_WLE" => {
+            let name = basename();
             extension(name, name.iter().rposition(|byte| *byte == b'.'), component)
         }
         b"ABSOLUTE" | b"REALPATH" => {
-            let base = base_dir.unwrap_or_else(|| cx.current_source_dir());
-            let input = if let Some(drive) = drive_root(&path_input).filter(|_| !cfg!(windows)) {
-                let absolute = path::to_native(path_input.get(2..).unwrap_or_default());
-                let clean = path::from_native_cmake(&normalize(&absolute));
-                path::to_native(&[drive, clean.as_slice()].concat())
-            } else if let Some(tail) = path_input.strip_prefix(b"~/")
-                && let Some(home) = cx.host().env_get(b"HOME")
+            #[cfg(unix)]
+            if is_clean_unix_abs(&path_input) {
+                if component == b"ABSOLUTE" {
+                    BString::from(path_input.as_ref())
+                } else {
+                    use std::ffi::OsStr;
+                    use std::os::unix::ffi::OsStrExt;
+                    let native = Path::new(OsStr::from_bytes(&path_input));
+                    match cx.host().canonicalize(native) {
+                        Ok(resolved) => path::from_native_cmake(&resolved),
+                        Err(_) => BString::from(path_input.as_ref()),
+                    }
+                }
+            } else {
+                resolve_abs_or_realpath(cx, &path_input, base_dir, component == b"REALPATH")
+            }
+            #[cfg(not(unix))]
             {
-                path::to_native(&home).join(path::to_native(tail))
-            } else {
-                base.join(path::to_native(&path_input))
-            };
-            let normalized = normalize(&input);
-            let resolved = if *component == b"REALPATH" {
-                cx.host().canonicalize(&normalized).unwrap_or(normalized)
-            } else {
-                normalized
-            };
-            path::from_native_cmake(&resolved)
+                resolve_abs_or_realpath(cx, &path_input, base_dir, component == b"REALPATH")
+            }
         }
         b"PROGRAM" => {
             let (program, tail) = find_program(cx, input);
@@ -406,6 +471,38 @@ pub(super) fn filename_component(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRe
     }
     filename_result(cx, var, out, cache);
     Ok(Flow::Normal)
+}
+
+fn resolve_abs_or_realpath(
+    cx: &Cx<'_>,
+    path_input: &[u8],
+    base_dir: Option<&[u8]>,
+    realpath: bool,
+) -> BString {
+    let input = if let Some(drive) = drive_root(path_input).filter(|_| !cfg!(windows)) {
+        let absolute = path::to_native(path_input.get(2..).unwrap_or_default());
+        let clean = path::from_native_cmake(&normalize(&absolute));
+        path::to_native(&[drive, clean.as_slice()].concat())
+    } else if let Some(tail) = path_input.strip_prefix(b"~/")
+        && let Some(home) = cx.host().env_get(b"HOME")
+    {
+        path::to_native(&home).join(path::to_native(tail))
+    } else {
+        let native = path::to_native(path_input);
+        if native.is_absolute() {
+            native
+        } else {
+            let base = base_dir.map_or_else(|| cx.current_source_dir(), path::to_native);
+            base.join(native)
+        }
+    };
+    let normalized = normalize(&input);
+    let resolved = if realpath {
+        cx.host().canonicalize(&normalized).unwrap_or(normalized)
+    } else {
+        normalized
+    };
+    path::from_native_cmake(&resolved)
 }
 
 fn filename_result(cx: &mut Cx<'_>, name: &[u8], value: BString, cache: bool) {

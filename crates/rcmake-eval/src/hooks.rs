@@ -169,6 +169,12 @@ impl Interp {
             .unwrap_or_default()
     }
 
+    /// Return whether accessing `name` may fire a variable watch or deprecation warning.
+    pub(crate) fn needs_var_watch(&self, name: &[u8]) -> bool {
+        deprecated_cache_variable(name)
+            || (!self.hooks.watches.is_empty() && self.hooks.watches.contains_key(name))
+    }
+
     /// `cmVariableWatch::VariableAccessed`: run the callbacks of the watches that exist
     /// now. Watches added by a callback do not run for this access. Returns `true` if
     /// `name` has watches.
@@ -178,9 +184,15 @@ impl Interp {
         access: WatchAccess,
         value: Option<&[u8]>,
     ) -> bool {
+        if !deprecated_cache_variable(name) && self.hooks.watches.is_empty() {
+            return false;
+        }
         let policy = PolicyId::new(218);
         if deprecated_cache_variable(name) && self.policy_status(policy) == PolicyStatus::Warn {
             self.issue_policy_warning(policy, b"", b"");
+        }
+        if self.hooks.watches.is_empty() {
+            return false;
         }
         let Some(list) = self.hooks.watches.get(name) else {
             return false;
@@ -292,7 +304,7 @@ impl Interp {
     pub(crate) fn define(&mut self, name: &[u8], value: BString) {
         self.record_variable_access(name);
         self.record_var_write(name, crate::VarOp::Set, Some(&value));
-        if deprecated_cache_variable(name) || self.hooks.watches.contains_key(name) {
+        if self.needs_var_watch(name) {
             if self.store_var(name, value.clone()) {
                 self.fire_watches(name, WatchAccess::Modified, Some(&value));
             }
@@ -370,7 +382,7 @@ impl Interp {
     /// Read a variable and notify its watches (`cmMakefile::GetDefinition`).
     pub(crate) fn read_var(&mut self, name: &[u8]) -> Option<BString> {
         let value = self.lookup_var(name).cloned();
-        if !deprecated_cache_variable(name) && !self.hooks.watches.contains_key(name) {
+        if !self.needs_var_watch(name) {
             return value;
         }
         let access = if value.is_some() {
@@ -596,6 +608,9 @@ impl Interp {
     /// Run the queued deferred calls at the end of the directory listfile `dir_file`
     /// (`RunListFile`). A deferred call can queue more calls.
     pub(crate) fn run_deferred(&mut self, dir_file: &[u8]) {
+        if self.dir_frame().defer.as_ref().is_none_or(Vec::is_empty) {
+            return;
+        }
         let saved_bt = self.bt.clone();
         self.bt = Backtrace::default().push(Frame {
             file: Arc::from(dir_file),

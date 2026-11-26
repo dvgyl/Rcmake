@@ -1,6 +1,6 @@
 //! SHA-256 content digests shared between the parse cache and configure replay journal.
 
-#![cfg_attr(not(feature = "replay"), allow(unreachable_pub))]
+#![cfg_attr(not(feature = "replay"), allow(unreachable_pub, dead_code))]
 
 use sha2::{Digest as _, Sha256};
 

@@ -455,3 +455,34 @@ fn false_valued_names_stay_unmodified_only_for_include_directories() -> TestResu
     );
     Ok(())
 }
+
+#[test]
+fn add_subdirectory_rejects_duplicate_binary_directory() -> TestResult {
+    let (host, code) = configure_tree(
+        &[
+            (
+                "CMakeLists.txt",
+                concat!(
+                    "cmake_minimum_required(VERSION 4.5)\n",
+                    "project(p NONE)\n",
+                    "add_subdirectory(a shared_bin)\n",
+                    "add_subdirectory(b other_bin)\n",
+                    "add_subdirectory(c shared_bin)\n",
+                ),
+            ),
+            ("a/CMakeLists.txt", ""),
+            ("b/CMakeLists.txt", ""),
+            ("c/CMakeLists.txt", ""),
+        ],
+        None,
+    )?;
+    assert_ne!(code, 0);
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains("is already used to build a source directory"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("shared_bin"), "{stderr}");
+    assert!(stderr.contains("/c"), "{stderr}");
+    Ok(())
+}

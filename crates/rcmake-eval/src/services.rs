@@ -23,13 +23,27 @@ pub(crate) type SessionData = BTreeMap<TypeId, Box<dyn Any + Send + Sync>>;
 impl Interp {
     /// Install data for commands in this interpreter.
     pub fn add_session_data<T: Any + Send + Sync>(&mut self, value: T) {
-        self.session_data.insert(TypeId::of::<T>(), Box::new(value));
+        let boxed: Box<dyn Any + Send + Sync> = Box::new(value);
+        if let Some(ctx) = boxed.downcast_ref::<crate::hermetic::HermeticContext>() {
+            self.hermetic = Some(ctx.clone());
+        } else if let Some(sources) = boxed.downcast_ref::<crate::hermetic::HermeticSources>() {
+            self.hermetic_sources = Some(sources.clone());
+        }
+        self.session_data.insert(TypeId::of::<T>(), boxed);
     }
 
     /// Get the session data of type `T`.
     #[must_use]
     pub fn session_data<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.session_data.get(&TypeId::of::<T>())?.downcast_ref()
+    }
+
+    /// Get or lazily initialize mutable session data of type `T`.
+    pub fn session_data_mut_or_init<T: Any + Send + Sync + Default>(&mut self) -> Option<&mut T> {
+        self.session_data
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()))
+            .downcast_mut::<T>()
     }
 
     /// Install a hook for the listed lowercase command names.

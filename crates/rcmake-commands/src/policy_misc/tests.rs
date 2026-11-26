@@ -1383,3 +1383,85 @@ target_sources(iface_lib INTERFACE FILE_SET iset TYPE SOURCES FILES root.c)
     assert_var(&mut interp, "i_priv", Some("0"));
     Ok(())
 }
+
+#[test]
+fn filename_component_clean_and_dirty_unix_paths_match_normalization() -> TestResult {
+    let (host, mut interp) = context(RunMode::Script);
+    host.seed_file(Path::new("/real/file"), b"")?;
+    host.symlink(Path::new("/real"), Path::new("/work/link"))?;
+    run(
+        &host,
+        &mut interp,
+        r#"
+        get_filename_component(root "/" ABSOLUTE)
+        get_filename_component(hidden "/.hidden" ABSOLUTE)
+        get_filename_component(dotdot_name "/..hidden" ABSOLUTE)
+        get_filename_component(clean "/real/file" ABSOLUTE)
+        get_filename_component(double_slash "/real//file" ABSOLUTE)
+        get_filename_component(cur_dir "/real/./file" ABSOLUTE)
+        get_filename_component(parent_dir "/real/../real/file" ABSOLUTE)
+        get_filename_component(trailing "/real/file/" ABSOLUTE)
+        get_filename_component(real_link "/work/link/file" REALPATH)
+        get_filename_component(real_missing "/missing/clean/path" REALPATH)
+        get_filename_component(cached "/real/file" NAME CACHE)
+        get_filename_component(cached "/other/ignored" NAME CACHE)
+        "#,
+        0,
+    )?;
+    for (name, value) in [
+        ("root", "/"),
+        ("hidden", "/.hidden"),
+        ("dotdot_name", "/..hidden"),
+        ("clean", "/real/file"),
+        ("double_slash", "/real/file"),
+        ("cur_dir", "/real/file"),
+        ("parent_dir", "/real/file"),
+        ("trailing", "/real/file"),
+        ("real_link", "/real/file"),
+        ("real_missing", "/missing/clean/path"),
+        ("cached", "file"),
+    ] {
+        assert_var(&mut interp, name, Some(value));
+    }
+    Ok(())
+}
+
+#[test]
+fn parse_arguments_handles_duplicates_sorted_missing_and_many_argv() -> TestResult {
+    let (host, mut interp) = context(RunMode::Script);
+    run(
+        &host,
+        &mut interp,
+        r#"
+        cmake_minimum_required(VERSION 4.5)
+        cmake_parse_arguments(d "FLAG;FLAG" "Z_ONE;A_ONE" "M_LIST"
+            Z_ONE A_ONE M_LIST Z_ONE FLAG)
+        function(many)
+          cmake_parse_arguments(PARSE_ARGV 0 m "OPT" "TAIL" "ITEMS")
+          return(PROPAGATE m_OPT m_TAIL m_ITEMS m_UNPARSED_ARGUMENTS)
+        endfunction()
+        many(u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 ITEMS "x;y" z OPT TAIL "final;val")
+        "#,
+        0,
+    )?;
+    assert!(
+        host.stream_bytes(Stream::Stderr)
+            .to_string()
+            .contains("keyword defined more than once: FLAG")
+    );
+    assert_var(&mut interp, "d_FLAG", Some("TRUE"));
+    assert_var(
+        &mut interp,
+        "d_KEYWORDS_MISSING_VALUES",
+        Some("A_ONE;M_LIST;Z_ONE"),
+    );
+    assert_var(&mut interp, "m_OPT", Some("TRUE"));
+    assert_var(&mut interp, "m_TAIL", Some("final;val"));
+    assert_var(&mut interp, "m_ITEMS", Some(r"x\;y;z"));
+    assert_var(
+        &mut interp,
+        "m_UNPARSED_ARGUMENTS",
+        Some("u0;u1;u2;u3;u4;u5;u6;u7;u8;u9;u10;u11;u12;u13"),
+    );
+    Ok(())
+}

@@ -1,10 +1,82 @@
 //! Byte helpers shared by the evaluator (paths, escaping, text replacement, integers).
 
+use core::hash::{BuildHasher, Hasher};
+
 use rcmake_base::BString;
+
+/// Fast non-cryptographic hasher for internal evaluator lookup tables.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FxBuildHasher;
+
+impl BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        FxHasher(0)
+    }
+}
+
+/// Streaming multiply-rotate hasher (zero unsafe, deterministic).
+#[derive(Default)]
+pub(crate) struct FxHasher(u64);
+
+impl FxHasher {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::K);
+    }
+}
+
+impl Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, mut bytes: &[u8]) {
+        while let Some((chunk, rest)) = bytes.split_first_chunk::<8>() {
+            self.add(u64::from_ne_bytes(*chunk));
+            bytes = rest;
+        }
+        if let Some((chunk, rest)) = bytes.split_first_chunk::<4>() {
+            self.add(u64::from(u32::from_ne_bytes(*chunk)));
+            bytes = rest;
+        }
+        if let Some((chunk, rest)) = bytes.split_first_chunk::<2>() {
+            self.add(u64::from(u16::from_ne_bytes(*chunk)));
+            bytes = rest;
+        }
+        if let Some((&byte, _)) = bytes.split_first() {
+            self.add(u64::from(byte));
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+
+    fn write_u16(&mut self, i: u16) {
+        self.add(u64::from(i));
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+}
 
 /// Concatenate byte slices.
 pub(crate) fn cat(parts: &[&[u8]]) -> BString {
-    let mut out = Vec::new();
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    let mut out = Vec::with_capacity(total);
     for p in parts {
         out.extend_from_slice(p);
     }
@@ -102,26 +174,42 @@ pub(crate) fn replace_all(hay: &[u8], needle: &[u8], rep: &[u8]) -> Vec<u8> {
     out
 }
 
-/// [`replace_all`] if the result has at most `max` bytes. Return `None` before any copy
-/// if the result would be larger.
-pub(crate) fn replace_all_bounded(
-    hay: &[u8],
+/// Replace every non-overlapping occurrence of `needle` in `hay` with `rep` in place,
+/// returning `false` without copying if the result would exceed `max` bytes. Does zero
+/// allocation when `needle` does not occur.
+pub(crate) fn replace_all_bounded_in_place(
+    hay: &mut Vec<u8>,
     needle: &[u8],
     rep: &[u8],
     max: usize,
-) -> Option<Vec<u8>> {
+) -> bool {
     let count = count_matches(hay, needle);
-    let len = hay
+    let Some(len) = hay
         .len()
-        .checked_sub(count.checked_mul(needle.len())?)?
-        .checked_add(count.checked_mul(rep.len())?)?;
+        .checked_sub(count.saturating_mul(needle.len()))
+        .and_then(|base| base.checked_add(count.checked_mul(rep.len())?))
+    else {
+        return false;
+    };
     if len > max {
-        return None;
+        return false;
     }
     if count == 0 {
-        return Some(hay.to_vec());
+        return true;
     }
-    Some(replace_all(hay, needle, rep))
+    let mut out = Vec::with_capacity(len);
+    let mut i = 0;
+    while i < hay.len() {
+        if hay.get(i..i + needle.len()) == Some(needle) {
+            out.extend_from_slice(rep);
+            i += needle.len();
+        } else if let Some(&b) = hay.get(i) {
+            out.push(b);
+            i += 1;
+        }
+    }
+    *hay = out;
+    true
 }
 
 /// Count the matches that [`replace_all`] replaces: left to right, without overlap.
@@ -144,6 +232,9 @@ fn count_matches(hay: &[u8], needle: &[u8]) -> usize {
 
 /// Double every backslash (CMP0219 `NEW` macro argument escaping).
 pub(crate) fn escape_backslashes(value: &[u8]) -> BString {
+    if !value.contains(&b'\\') {
+        return BString::from(value);
+    }
     BString::from(replace_all(value, b"\\", b"\\\\"))
 }
 

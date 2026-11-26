@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::c_long;
 use std::sync::Arc;
 
@@ -19,8 +19,12 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     };
     let command = bytes(command);
     let name = bytes(name);
-    let raw = cx.var(name);
-    if matches!(command, b"APPEND" | b"PREPEND") {
+    if command == b"APPEND" {
+        cx.append_list_var(name, rest)?;
+        return Ok(Flow::Normal);
+    }
+    if command == b"PREPEND" {
+        let raw = cx.var(name);
         if !rest.is_empty() {
             // Check the exact joined size before the value grows. A separator goes between
             // two items, and between the items and a nonempty existing value.
@@ -30,73 +34,46 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 .iter()
                 .try_fold(existing_len, |len, item| len.checked_add(bytes(item).len()))
                 .and_then(|len| len.checked_add(separators));
-            if joined.is_none_or(|len| len > cx.limits().max_value_bytes) {
+            let Some(joined) = joined.filter(|&len| len <= cx.limits().max_value_bytes) else {
                 return Err(CmdError::status(
                     "Variable value exceeded maximum allowed byte length.",
                 ));
-            }
-            let items = rest.iter().map(bytes);
-            let mut existing = raw.unwrap_or_default();
-            let has_value = !existing.is_empty();
-            let value = if command == b"APPEND" {
-                for (i, item) in items.enumerate() {
-                    if has_value || i != 0 {
-                        existing.push(b';');
-                    }
-                    existing.extend_from_slice(item);
-                }
-                existing
-            } else {
-                list::join(items.chain(has_value.then_some(existing.as_slice())))
             };
-            cx.set_var(name, value);
+            let mut out = Vec::with_capacity(joined);
+            for (i, item) in rest.iter().enumerate() {
+                if i != 0 {
+                    out.push(b';');
+                }
+                out.extend_from_slice(bytes(item));
+            }
+            if let Some(existing) = raw
+                && !existing.is_empty()
+            {
+                out.push(b';');
+                out.extend_from_slice(&existing);
+            }
+            cx.set_var(name, BString::from(out));
         }
         return Ok(Flow::Normal);
     }
-    let raw_bytes = raw.as_ref().map_or(b"".as_slice(), |raw| raw.as_slice());
-    let elements = || list::iter(raw_bytes, list::Empty::Keep);
     match (command, rest) {
-        (b"LENGTH", [out]) => cx.set_var(bytes(out), elements().count().to_string().into()),
+        (b"LENGTH", [out]) => {
+            let count = cx.with_var(name, |raw| {
+                list::iter(raw.unwrap_or_default(), list::Empty::Keep).count()
+            });
+            cx.set_var(bytes(out), count.to_string().into());
+        }
         (b"LENGTH", _) => {
             return Err(CmdError::status(
                 "sub-command LENGTH requires two arguments.",
             ));
         }
-        (b"GET", [indices @ .., out]) if !indices.is_empty() => {
-            let value = if raw.is_none() {
-                BString::from("NOTFOUND")
-            } else {
-                get_elements(cx, raw_bytes, indices)?
-            };
-            cx.set_var(bytes(out), value);
-        }
-        (b"GET", _) => {
-            return Err(CmdError::status(
-                "sub-command GET requires at least three arguments.",
-            ));
-        }
-        (b"JOIN", [glue, out]) => cx.set_var(
-            bytes(out),
-            join_with(elements(), bytes(glue), cx.limits().max_value_bytes)?,
-        ),
-        (b"JOIN", _) => {
-            return Err(CmdError::status(format!(
-                "sub-command JOIN requires three arguments ({} found).",
-                rest.len() + 1
-            )));
-        }
-        (b"SUBLIST", [begin, length, out]) => {
-            let value = sublist(cx, raw_bytes, bytes(begin), bytes(length))?;
-            cx.set_var(bytes(out), value);
-        }
-        (b"SUBLIST", _) => {
-            return Err(CmdError::status(format!(
-                "sub-command SUBLIST requires four arguments ({} found).",
-                rest.len() + 1
-            )));
-        }
         (b"FIND", [needle, out]) => {
-            let found = elements().position(|item| item.as_ref() == bytes(needle));
+            let needle = bytes(needle);
+            let found = cx.with_var(name, |raw| {
+                list::iter(raw.unwrap_or_default(), list::Empty::Keep)
+                    .position(|item| item.as_ref() == needle)
+            });
             cx.set_var(
                 bytes(out),
                 found
@@ -109,28 +86,66 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 "sub-command FIND requires three arguments.",
             ));
         }
-        _ => return change_list(cx, command, name, rest, raw.as_ref()),
+        (b"JOIN", [glue, out]) => {
+            let max_bytes = cx.limits().max_value_bytes;
+            let joined = cx.with_var(name, |raw| {
+                join_with(
+                    list::iter(raw.unwrap_or_default(), list::Empty::Keep),
+                    bytes(glue),
+                    max_bytes,
+                )
+            })?;
+            cx.set_var(bytes(out), joined);
+        }
+        (b"JOIN", _) => {
+            return Err(CmdError::status(format!(
+                "sub-command JOIN requires three arguments ({} found).",
+                rest.len() + 1
+            )));
+        }
+        (b"GET", [indices @ .., out]) if !indices.is_empty() => {
+            let raw = cx.var(name);
+            let value = match raw.as_deref() {
+                None => BString::from("NOTFOUND"),
+                Some(raw_bytes) => get_elements(cx, raw_bytes, indices)?,
+            };
+            cx.set_var(bytes(out), value);
+        }
+        (b"GET", _) => {
+            return Err(CmdError::status(
+                "sub-command GET requires at least three arguments.",
+            ));
+        }
+        (b"SUBLIST", [begin, length, out]) => {
+            let raw = cx.var(name);
+            let raw_bytes = raw.as_deref().unwrap_or_default();
+            let value = sublist(cx, raw_bytes, bytes(begin), bytes(length))?;
+            cx.set_var(bytes(out), value);
+        }
+        (b"SUBLIST", _) => {
+            return Err(CmdError::status(format!(
+                "sub-command SUBLIST requires four arguments ({} found).",
+                rest.len() + 1
+            )));
+        }
+        _ => return change_list(cx, command, name, rest),
     }
     Ok(Flow::Normal)
 }
 
-fn change_list(
-    cx: &mut Cx<'_>,
-    command: &[u8],
-    name: &[u8],
-    rest: &[ExpandedArg],
-    raw: Option<&BString>,
-) -> CmdResult {
+fn change_list(cx: &mut Cx<'_>, command: &[u8], name: &[u8], rest: &[ExpandedArg]) -> CmdResult {
+    let max_args = cx.limits().max_command_arguments;
+    let max_bytes = cx.limits().max_command_argument_bytes;
     let mut items = Vec::new();
-    if let Some(raw) = raw {
-        let limits = cx.limits();
-        list::ListBudget::new(
-            limits.max_command_arguments,
-            limits.max_command_argument_bytes,
-        )
-        .split(raw, list::Empty::Keep, &mut items)
-        .map_err(|limit| CmdError::status(limit.to_string()))?;
-    }
+    let defined = cx.with_var(name, |raw| -> Result<bool, CmdError> {
+        let Some(raw) = raw else {
+            return Ok(false);
+        };
+        list::ListBudget::new(max_args, max_bytes)
+            .split(raw, list::Empty::Keep, &mut items)
+            .map_err(|limit| CmdError::status(limit.to_string()))?;
+        Ok(true)
+    })?;
     match (command, rest) {
         (b"INSERT", [at, values @ ..]) if !values.is_empty() => {
             let at = checked_index(list_number(cx, bytes(at))?, items.len(), true)?;
@@ -144,9 +159,16 @@ fn change_list(
         }
         (b"POP_BACK" | b"POP_FRONT", _) => pop(cx, command, name, rest, &items),
         (b"REMOVE_ITEM", _) => {
-            if raw.is_some() && !rest.is_empty() {
-                let remove: BTreeSet<_> = rest.iter().map(bytes).collect();
-                items.retain(|item| !remove.contains(item.as_slice()));
+            if defined && !rest.is_empty() {
+                if let [single] = rest {
+                    let needle = bytes(single);
+                    items.retain(|item| item.as_slice() != needle);
+                } else if rest.len() <= 8 {
+                    items.retain(|item| !rest.iter().any(|r| bytes(r) == item.as_slice()));
+                } else {
+                    let remove: HashSet<&[u8]> = rest.iter().map(bytes).collect();
+                    items.retain(|item| !remove.contains(item.as_slice()));
+                }
                 save(cx, name, &items);
             }
         }
@@ -157,11 +179,11 @@ fn change_list(
         }
         (b"REMOVE_AT", _) => remove_at(cx, name, rest, &mut items)?,
         (b"REMOVE_DUPLICATES" | b"REVERSE", []) => {
-            if raw.is_some() {
+            if defined {
                 if command == b"REVERSE" {
                     items.reverse();
                 } else {
-                    let mut seen = BTreeSet::new();
+                    let mut seen: HashSet<BString> = HashSet::with_capacity(items.len());
                     items.retain(|item| seen.insert(item.clone()));
                 }
                 save(cx, name, &items);
@@ -174,15 +196,15 @@ fn change_list(
                 b" only takes one argument.",
             ])));
         }
-        (b"FILTER", _) => filter(cx, name, rest, raw.is_some(), items)?,
+        (b"FILTER", _) => filter(cx, name, rest, defined, items)?,
         (b"SORT", _) => {
             let sort = Sort::parse(rest)?;
-            if raw.is_some() {
+            if defined {
                 sort.apply(cx, &mut items)?;
                 save(cx, name, &items);
             }
         }
-        (b"TRANSFORM", _) => transform::apply(cx, name, rest, raw.is_some(), items)?,
+        (b"TRANSFORM", _) => transform::apply(cx, name, rest, defined, items)?,
         _ => {
             return Err(CmdError::status(cat(&[
                 b"does not recognize sub-command ",
@@ -418,6 +440,12 @@ fn remove_at(
             &indices.join(b", ".as_slice()),
             b" out of range (0, 0)",
         ])));
+    }
+    if let [single] = args {
+        let index = checked_index(list_number(cx, bytes(single))?, items.len(), false)?;
+        items.remove(index);
+        save(cx, name, items);
+        return Ok(());
     }
     let indices = args
         .iter()

@@ -358,19 +358,9 @@ impl Interp {
             && self.config.services.speed.hermetic == HermeticMode::Off
     }
 
-    pub(crate) fn note_replay_source(
-        &mut self,
-        abs: &[u8],
-        data: &[u8],
-        digest: Option<JournalDigest>,
-    ) {
+    pub(crate) fn note_replay_source(&mut self, abs: &[u8], text: &crate::code::SourceText) {
         if let Some(session) = &mut self.replay.session {
-            session.source = (data.len() <= 1024 * 1024).then(|| {
-                (
-                    abs.into(),
-                    digest.unwrap_or_else(|| JournalDigest::hash(data)),
-                )
-            });
+            session.source = (text.bytes.len() <= 1024 * 1024).then(|| (abs.into(), text.digest()));
         }
     }
 

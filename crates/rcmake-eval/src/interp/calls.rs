@@ -1,3 +1,5 @@
+use std::cell::OnceCell;
+use std::io::{Cursor, Write};
 use std::sync::Arc;
 
 use rcmake_base::BString;
@@ -6,8 +8,45 @@ use rcmake_expr::ExpandedArg;
 use rcmake_syntax::{ArgKind, Argument, CommandInvocation};
 
 use super::BodyMode;
-use crate::util::{cat, filename_path};
+use crate::util::cat;
 use crate::{CmdError, CmdResult, Flow, Interp, UserCommand};
+
+const ARGV_NAMES: [&[u8]; 16] = [
+    b"ARGV0", b"ARGV1", b"ARGV2", b"ARGV3", b"ARGV4", b"ARGV5", b"ARGV6", b"ARGV7", b"ARGV8",
+    b"ARGV9", b"ARGV10", b"ARGV11", b"ARGV12", b"ARGV13", b"ARGV14", b"ARGV15",
+];
+
+fn with_argv_name<R>(index: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    if let Some(&name) = ARGV_NAMES.get(index) {
+        return f(name);
+    }
+    let mut buf = [0u8; 28];
+    let mut cursor = Cursor::new(buf.as_mut_slice());
+    let _ = write!(cursor, "ARGV{index}");
+    let len = usize::try_from(cursor.position()).unwrap_or(0);
+    f(buf.get(..len).unwrap_or_default())
+}
+
+fn join_expanded(args: &[ExpandedArg]) -> BString {
+    let Some((first, rest)) = args.split_first() else {
+        return BString::default();
+    };
+    if rest.is_empty() {
+        return first.value.clone();
+    }
+    let total = args
+        .iter()
+        .map(|arg| arg.value.len())
+        .sum::<usize>()
+        .saturating_add(rest.len());
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&first.value);
+    for arg in rest {
+        out.push(b';');
+        out.extend_from_slice(&arg.value);
+    }
+    BString::from(out)
+}
 
 impl Interp {
     fn push_call_scope(&mut self, u: &UserCommand, function: bool) {
@@ -105,35 +144,34 @@ impl Interp {
     }
 
     /// Define the argument variables of a function call. Stop at the first fatal error.
-    fn bind_function_arguments(&mut self, u: &UserCommand, values: &[BString]) -> bool {
-        self.define(b"ARGC", values.len().to_string().into());
-        for (i, v) in values.iter().enumerate() {
+    fn bind_function_arguments(&mut self, u: &UserCommand, args: &[ExpandedArg]) -> bool {
+        self.define(b"ARGC", args.len().to_string().into());
+        for (i, arg) in args.iter().enumerate() {
             if self.fatal {
                 return false;
             }
-            self.define(format!("ARGV{i}").as_bytes(), v.clone());
+            with_argv_name(i, |name| self.define(name, arg.value.clone()));
         }
-        for (param, v) in u.params.iter().zip(values.iter()) {
+        for (param, arg) in u.params.iter().zip(args.iter()) {
             if self.fatal {
                 return false;
             }
-            self.define(param, v.clone());
+            self.define(param, arg.value.clone());
         }
         if self.fatal {
             return false;
         }
-        let argn = values.get(u.params.len()..).unwrap_or_default();
-        self.define(b"ARGV", rcmake_base::list::join(values.iter()));
-        self.define(b"ARGN", rcmake_base::list::join(argn.iter()));
+        let argn = args.get(u.params.len()..).unwrap_or_default();
+        self.define(b"ARGV", join_expanded(args));
+        self.define(b"ARGN", join_expanded(argn));
         self.define(b"ARGNC", argn.len().to_string().into());
         self.define(b"CMAKE_CURRENT_FUNCTION", u.name.clone());
-        let file = BString::from(&u.body.file[..]);
-        self.define(b"CMAKE_CURRENT_FUNCTION_LIST_DIR", filename_path(&file));
-        self.define(b"CMAKE_CURRENT_FUNCTION_LIST_FILE", file);
+        self.define(b"CMAKE_CURRENT_FUNCTION_LIST_DIR", u.file_dir.clone());
         self.define(
-            b"CMAKE_CURRENT_FUNCTION_LIST_LINE",
-            u.line.to_string().into(),
+            b"CMAKE_CURRENT_FUNCTION_LIST_FILE",
+            BString::from(u.body.file.as_ref()),
         );
+        self.define(b"CMAKE_CURRENT_FUNCTION_LIST_LINE", u.line_str.clone());
         !self.fatal
     }
 
@@ -151,10 +189,9 @@ impl Interp {
         if !self.admit_call_arguments(u, args, true) {
             return Err(CmdError::Reported);
         }
-        let values: Vec<BString> = args.iter().map(|a| a.value.clone()).collect();
         self.push_call_scope(u, true);
 
-        let result = if self.bind_function_arguments(u, &values) {
+        let result = if self.bind_function_arguments(u, args) {
             self.run_code(&u.body, 0, u.body.len(), BodyMode::Function)
         } else {
             Err(CmdError::Reported)
@@ -239,16 +276,21 @@ impl Interp {
     fn run_macro(&mut self, u: &UserCommand, args: &[ExpandedArg]) -> CmdResult {
         let mut values: Vec<BString> = args.iter().map(|a| a.value.clone()).collect();
         let argc = values.len().to_string();
-        let mut argn =
-            rcmake_base::list::join(values.get(u.params.len()..).unwrap_or_default().iter());
-        let mut argv = rcmake_base::list::join(values.iter());
+        let mut argn = join_expanded(args.get(u.params.len()..).unwrap_or_default());
+        let mut argv = join_expanded(args);
         match self.check_cmp0219(&u.name, &values) {
             PolicyStatus::New => {
                 for v in &mut values {
-                    *v = crate::util::escape_backslashes(v);
+                    if v.contains(&b'\\') {
+                        *v = crate::util::escape_backslashes(v);
+                    }
                 }
-                argn = crate::util::escape_backslashes(&argn);
-                argv = crate::util::escape_backslashes(&argv);
+                if argn.contains(&b'\\') {
+                    argn = crate::util::escape_backslashes(&argn);
+                }
+                if argv.contains(&b'\\') {
+                    argv = crate::util::escape_backslashes(&argv);
+                }
             }
             PolicyStatus::Warn => self.issue_cmp0219_warning(&u.name, &values),
             PolicyStatus::Old => {}
@@ -263,29 +305,43 @@ impl Interp {
             }
             return Err(CmdError::Reported);
         };
-        let formals: Vec<BString> = u.params.iter().map(|p| cat(&[b"${", p, b"}"])).collect();
-        let argvs: Vec<BString> = (0..values.len())
-            .map(|i| BString::from(format!("${{ARGV{i}}}")))
-            .collect();
+        let argvs_cell: OnceCell<Vec<BString>> = OnceCell::new();
         // Each substituted argument must fit the value limit and the free part of the live
         // variable budget. The size is checked before each copy is made.
         let max_value = self.config.limits.max_value_bytes;
         let substitute = |text: &[u8], room: usize| -> Option<BString> {
-            use crate::util::replace_all_bounded as replace;
+            use crate::util::replace_all_bounded_in_place as replace;
             let max = max_value.min(room);
             if text.len() > max {
                 return None;
             }
-            let mut s = text.to_vec();
-            for (formal, value) in formals.iter().zip(values.iter()) {
-                s = replace(&s, formal, value, max)?;
+            if !contains_seq(text, b"${") {
+                return Some(BString::from(text));
             }
-            s = replace(&s, b"${ARGC}", argc.as_bytes(), max)?;
-            s = replace(&s, b"${ARGN}", &argn, max)?;
-            s = replace(&s, b"${ARGV}", &argv, max)?;
-            if contains_seq(&s, b"${ARGV") {
-                for (pat, value) in argvs.iter().zip(values.iter()) {
-                    s = replace(&s, pat, value, max)?;
+            let mut s = text.to_vec();
+            for (formal, value) in u.formal_patterns.iter().zip(values.iter()) {
+                if !replace(&mut s, formal, value, max) {
+                    return None;
+                }
+            }
+            if contains_seq(&s, b"${ARG") {
+                if !replace(&mut s, b"${ARGC}", argc.as_bytes(), max)
+                    || !replace(&mut s, b"${ARGN}", &argn, max)
+                    || !replace(&mut s, b"${ARGV}", &argv, max)
+                {
+                    return None;
+                }
+                if contains_seq(&s, b"${ARGV") {
+                    let argvs = argvs_cell.get_or_init(|| {
+                        (0..values.len())
+                            .map(|i| BString::from(format!("${{ARGV{i}}}")))
+                            .collect()
+                    });
+                    for (pat, value) in argvs.iter().zip(values.iter()) {
+                        if !replace(&mut s, pat, value, max) {
+                            return None;
+                        }
+                    }
                 }
             }
             Some(BString::from(s))

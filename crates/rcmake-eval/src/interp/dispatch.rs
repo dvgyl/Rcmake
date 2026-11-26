@@ -164,7 +164,9 @@ impl Interp {
     }
 
     pub(crate) fn lookup_command(&self, lower: &[u8]) -> Option<Command> {
-        if let Some(cmd) = self.scripted.get(lower) {
+        if !self.scripted.is_empty()
+            && let Some(cmd) = self.scripted.get(lower)
+        {
             return Some(cmd.clone());
         }
         self.registry
@@ -202,7 +204,9 @@ impl Interp {
 
     pub(crate) fn recursion_limit(&self) -> u32 {
         use crate::scope::RECURSION_LIMIT;
-        self.record_variable_access(RECURSION_LIMIT);
+        if self.tracks_recursion_limit {
+            self.record_variable_access(RECURSION_LIMIT);
+        }
         let configured = self
             .vars
             .recursion_limit()
@@ -222,6 +226,41 @@ impl Interp {
             .min(self.config.limits.max_recursion_ceiling)
     }
 
+    /// Active recursion limit during synchronous execution, caching the cache/env fallback
+    /// until any command accesses `Cx::host`, `Cx::cache`, `Cx::project`, or execution exits.
+    pub(crate) fn active_recursion_limit(&self) -> u32 {
+        use crate::scope::RECURSION_LIMIT;
+        use std::sync::atomic::Ordering;
+        if self.tracks_recursion_limit {
+            self.record_variable_access(RECURSION_LIMIT);
+        }
+        if let Some(normal) = self.vars.recursion_limit() {
+            return normal
+                .unwrap_or(self.config.limits.max_recursion)
+                .min(HARD_RECURSION_CEILING)
+                .min(self.config.limits.max_recursion_ceiling);
+        }
+        let cached = self.fallback_recursion_limit.load(Ordering::Relaxed);
+        if let Some(limit) = cached.checked_sub(1).and_then(|v| u32::try_from(v).ok()) {
+            return limit;
+        }
+        let configured = if let Some(entry) = self.project.cache.get(RECURSION_LIMIT) {
+            self.parse_recursion_fallback(&entry.value)
+        } else {
+            self.config
+                .host
+                .env_get(RECURSION_LIMIT)
+                .and_then(|value| self.parse_recursion_fallback(&value))
+        }
+        .unwrap_or(self.config.limits.max_recursion);
+        let clamped = configured
+            .min(HARD_RECURSION_CEILING)
+            .min(self.config.limits.max_recursion_ceiling);
+        self.fallback_recursion_limit
+            .store(u64::from(clamped) + 1, Ordering::Relaxed);
+        clamped
+    }
+
     fn parse_recursion_fallback(&self, value: &[u8]) -> Option<u32> {
         let value = value.trim_ascii_start();
         let parse = || crate::scope::parse_recursion_limit(value);
@@ -237,12 +276,17 @@ impl Interp {
         last.1
     }
 
-    /// Get the current backtrace with a new command frame.
-    pub(crate) fn command_backtrace(&self, file: &Arc<[u8]>, line: u32, name: &[u8]) -> Backtrace {
+    /// Get the current backtrace with a new command frame using a pre-interned name.
+    pub(crate) fn command_backtrace_arc(
+        &self,
+        file: &Arc<[u8]>,
+        line: u32,
+        name: Arc<[u8]>,
+    ) -> Backtrace {
         self.bt.push(Frame {
             file: Arc::clone(file),
             line,
-            name: Some(Arc::from(name)),
+            name: Some(name),
             kind: FrameKind::Command,
         })
     }
@@ -271,34 +315,43 @@ impl Interp {
         name: &[u8],
         f: impl FnOnce(&mut Self) -> CmdResult,
     ) -> CmdResult {
-        self.with_frame(file, line, name, None, f)
+        self.with_frame_arc(file, line, Arc::from(name), None, f)
     }
 
-    /// [`Self::with_command_frame`] with an optional deferred-call identifier
-    /// (`cmListFileContext::DeferId`).
-    fn with_frame(
+    /// [`Self::with_command_frame`] using a pre-interned command name.
+    pub(crate) fn with_command_frame_arc(
         &mut self,
         file: &Arc<[u8]>,
         line: u32,
-        name: &[u8],
+        name: Arc<[u8]>,
+        f: impl FnOnce(&mut Self) -> CmdResult,
+    ) -> CmdResult {
+        self.with_frame_arc(file, line, name, None, f)
+    }
+
+    /// [`Self::with_command_frame_arc`] with an optional deferred-call identifier
+    /// (`cmListFileContext::DeferId`).
+    fn with_frame_arc(
+        &mut self,
+        file: &Arc<[u8]>,
+        line: u32,
+        name: Arc<[u8]>,
         defer_id: Option<BString>,
         f: impl FnOnce(&mut Self) -> CmdResult,
     ) -> CmdResult {
         if !self.take_step() {
             return Err(CmdError::Reported);
         }
-        let bt = self.command_backtrace(file, line, name);
+        let bt = self.command_backtrace_arc(file, line, Arc::clone(&name));
         let saved_bt = core::mem::replace(&mut self.bt, bt);
         let saved_defer = core::mem::replace(&mut self.hooks.top_defer_id, defer_id);
         self.depth = self.depth.saturating_add(1);
         let saved_line = core::mem::replace(&mut self.cur_line, line);
         let saved_failed = core::mem::replace(&mut self.cmd_failed, false);
 
-        let limit = self.recursion_limit();
+        let limit = self.active_recursion_limit();
         self.note_recursion_limit(limit);
-        let audit = self
-            .session_data::<crate::hermetic::HermeticContext>()
-            .cloned();
+        let audit = self.hermetic.clone();
         let _audit_site = audit.as_ref().map(|audit| {
             audit.enter(crate::hermetic::HermeticSite::new(
                 &rcmake_host::path::to_native(file),
@@ -319,14 +372,14 @@ impl Interp {
             self.bt = backtrace;
             Err(CmdError::Reported)
         } else if let Some(profiler) = self.command_profiler.clone() {
-            let name = fold_command_name(name);
-            let kind = self.sample_kind(&name);
+            let folded = fold_command_name(&name);
+            let kind = self.sample_kind(&folded);
             let depth = self.depth;
             let start = self.config.host.monotonic();
             let result = f(self);
             let elapsed = self.config.host.monotonic().saturating_sub(start);
             profiler(&CommandSample {
-                name: &name,
+                name: &folded,
                 file,
                 line,
                 depth,
@@ -351,7 +404,7 @@ impl Interp {
             ) {
             Err(CmdError::Reported)
         } else {
-            self.finish_command(name, result)
+            self.finish_command(&name, result)
         };
 
         self.cmd_failed = saved_failed;
@@ -400,19 +453,51 @@ impl Interp {
         )
     }
 
-    /// Expand arguments with `rcmake_expr::expand_args`, one argument at a time
-    /// (`cmMakefile::ExpandArguments`). An expansion error is fatal and reads
-    /// `Syntax error in cmake code at <file>:<line> when parsing string <arg> <error>`.
-    pub(crate) fn expand(&mut self, args: &[Argument]) -> Result<Vec<ExpandedArg>, CmdError> {
-        let mut out = Vec::new();
+    pub(crate) fn take_arg_buf(&mut self, min_cap: usize) -> Vec<ExpandedArg> {
+        let mut buf = self.arg_bufs.pop().unwrap_or_default();
+        buf.clear();
+        if buf.capacity() < min_cap {
+            buf.reserve(min_cap);
+        }
+        buf
+    }
+
+    pub(crate) fn recycle_arg_buf(&mut self, mut buf: Vec<ExpandedArg>) {
+        if self.arg_bufs.len() < 16 && buf.capacity() <= 64 {
+            buf.clear();
+            self.arg_bufs.push(buf);
+        }
+    }
+
+    /// Expand arguments into `out` with `rcmake_expr::expand_args`, one argument at a time
+    /// (`cmMakefile::ExpandArguments`).
+    pub(crate) fn expand_into_buf(
+        &mut self,
+        args: &[Argument],
+        out: &mut Vec<ExpandedArg>,
+    ) -> Result<(), CmdError> {
+        out.clear();
         let expand = self.frontend.expand;
         let mut failed = false;
         let mut budget = self.argument_budget();
+        let max_literal = rcmake_base::Limits::default().max_value_bytes;
         for arg in args {
-            // Short literal arguments need no variable lookups, escape processing,
-            // or list splitting. Keep their original kind and line number.
             let text = arg.text.as_slice();
-            if text.len() <= 64
+            if arg.kind == ArgKind::Bracket {
+                if let Err(e) = budget.take(text.len()) {
+                    self.fatal_here(e.message);
+                    return Err(CmdError::Reported);
+                }
+                out.push(ExpandedArg {
+                    value: arg.text.clone(),
+                    kind: arg.kind,
+                    line: arg.line,
+                });
+                continue;
+            }
+            // Literal arguments without variable references, escapes, or unquoted list
+            // separators need no scanner pass or list splitting.
+            if text.len() <= max_literal
                 && !text.iter().any(|&b| {
                     matches!(b, b'$' | b'\\') || (b == b';' && arg.kind == ArgKind::Unquoted)
                 })
@@ -434,7 +519,7 @@ impl Interp {
             match expand(
                 core::slice::from_ref(arg),
                 &mut CommandExpansion(self, budget.used_bytes),
-                &mut out,
+                out,
             ) {
                 Ok(()) => {
                     let added = out.iter().skip(before).map(|arg| arg.value.len());
@@ -456,8 +541,17 @@ impl Interp {
         if failed {
             Err(CmdError::Reported)
         } else {
-            Ok(out)
+            Ok(())
         }
+    }
+
+    /// Expand arguments with `rcmake_expr::expand_args`, one argument at a time
+    /// (`cmMakefile::ExpandArguments`). An expansion error is fatal and reads
+    /// `Syntax error in cmake code at <file>:<line> when parsing string <arg> <error>`.
+    pub(crate) fn expand(&mut self, args: &[Argument]) -> Result<Vec<ExpandedArg>, CmdError> {
+        let mut out = Vec::with_capacity(args.len());
+        self.expand_into_buf(args, &mut out)?;
+        Ok(out)
     }
 
     pub(crate) fn eval_command_condition(
@@ -496,7 +590,7 @@ impl Interp {
             return Ok(Flow::Normal);
         };
         let saved = self.cur_cmd.replace((Arc::clone(&code.cmds), i));
-        let result = self.with_command_frame(&code.file, cmd.line, &cmd.name, |this| {
+        let result = self.with_command_frame_arc(&code.file, cmd.line, code.name_arc(i), |this| {
             this.dispatch(cmd, &code.file)
         });
         self.cur_cmd = saved;
@@ -510,7 +604,7 @@ impl Interp {
         };
         let saved = self.cur_cmd.replace((Arc::clone(&code.cmds), 0));
         let vars = self.push_list_file_vars(&code.file);
-        let _ = self.with_frame(&code.file, cmd.line, &cmd.name, Some(id), |this| {
+        let _ = self.with_frame_arc(&code.file, cmd.line, code.name_arc(0), Some(id), |this| {
             this.dispatch(cmd, &code.file)
         });
         self.pop_list_file_vars(vars);
@@ -523,10 +617,15 @@ impl Interp {
         }
         let lower = cmd.lower.as_slice();
         let command = self.lookup_command(lower);
-        if self.trace_enabled() && (command.is_some() || unexpected_text(lower).is_some()) {
+        let unexpected = if lower.first() == Some(&b'e') {
+            unexpected_text(lower)
+        } else {
+            None
+        };
+        if self.trace_enabled() && (command.is_some() || unexpected.is_some()) {
             self.trace_command(cmd, file, false);
         }
-        if let Some(text) = unexpected_text(lower) {
+        if let Some(text) = unexpected {
             return Err(CmdError::Status(text.into()));
         }
         let Some(command) = command else {
@@ -536,13 +635,19 @@ impl Interp {
         if matches!(command, Command::Builtin(_, _, true)) {
             return self.invoke(lower, command, &[]);
         }
-        let args = self.expand(&cmd.args)?;
+        let mut args = self.take_arg_buf(cmd.args.len());
+        if let Err(err) = self.expand_into_buf(&cmd.args, &mut args) {
+            self.recycle_arg_buf(args);
+            return Err(err);
+        }
         self.note_replay_expansion(lower, &cmd.args, &args);
         if self
-            .session_data::<crate::hermetic::HermeticContext>()
+            .hermetic
+            .as_ref()
             .is_some_and(crate::hermetic::HermeticContext::denied)
         {
             self.fatal = true;
+            self.recycle_arg_buf(args);
             return Err(CmdError::Reported);
         }
         if self.hooks.running_deferred
@@ -550,9 +655,12 @@ impl Interp {
             && matches!(command, Command::Builtin(..))
         {
             self.error_here("Languages may not be enabled during deferred execution.".into());
+            self.recycle_arg_buf(args);
             return Err(CmdError::Reported);
         }
-        self.invoke_observed(lower, command, &args)
+        let result = self.invoke_observed(lower, command, &args);
+        self.recycle_arg_buf(args);
+        result
     }
 
     fn unknown_command(&mut self, name: &[u8]) {
@@ -590,12 +698,7 @@ impl Interp {
                 if self.config.mode == RunMode::Script && !flags.scriptable {
                     return Err(CmdError::Status("command is not scriptable".into()));
                 }
-                let guard = self
-                    .registry
-                    .guards
-                    .get(name)
-                    .or_else(|| self.registry.guards.get(name.strip_prefix(b"_")?));
-                if let Some(check) = guard.copied() {
+                if let Some(check) = self.registry.get_guard(name) {
                     check(&mut self.cx(), args)?;
                 }
                 if matches!(name, b"mark_as_advanced" | b"_mark_as_advanced") {
@@ -746,6 +849,20 @@ impl Interp {
         if mode == BodyMode::File && !self.fatal && !code.file.is_empty() {
             self.note_replay_executed_listfile(&code.file);
         }
+        let result = self.run_code_inner(code, start, end, mode);
+        if mode == BodyMode::File && self.depth == 0 {
+            self.invalidate_recursion_limit();
+        }
+        result
+    }
+
+    fn run_code_inner(
+        &mut self,
+        code: &Code,
+        start: usize,
+        end: usize,
+        mode: BodyMode,
+    ) -> CmdResult {
         let mut i = start;
         while i < end {
             if self.fatal || self.over_budget() {

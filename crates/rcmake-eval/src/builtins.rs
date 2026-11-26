@@ -7,7 +7,7 @@ use rcmake_diag::{
     DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus,
 };
 use rcmake_expr::ExpandedArg;
-use rcmake_host::Stream;
+use rcmake_host::{FileKind, Stream};
 
 use crate::interp::IssueClass;
 use crate::util::cat;
@@ -141,42 +141,133 @@ impl Interp {
 
     /// `cmMakefile::GetModulesFile`: returns `(path, system)`; `path` is empty when the
     /// module is not found.
-    pub(crate) fn modules_file(&self, file: &[u8]) -> (BString, bool) {
-        let cwd = rcmake_host::path::from_native_cmake(&self.config.cwd);
-        let mut in_module_path = None;
-        if let Some(paths) = self.lookup_var(b"CMAKE_MODULE_PATH") {
-            let mut dirs = Vec::new();
-            split_into(paths, Empty::Drop, &mut dirs);
-            for dir in dirs {
-                let mut candidate = crate::util::replace_all(&dir, b"\\", b"/");
-                candidate.push(b'/');
-                candidate.extend_from_slice(file);
-                let abs = collapse_full_path(&candidate, &cwd);
-                if self.exists(&abs) {
-                    in_module_path = Some(BString::from(candidate));
-                    break;
-                }
+    pub(crate) fn modules_file(&mut self, file: &[u8]) -> (BString, bool) {
+        let current_in_mods = self
+            .lookup_var(b"CMAKE_CURRENT_LIST_FILE")
+            .is_some_and(|current| current.starts_with(&self.cmake_modules_prefix));
+        if current_in_mods {
+            let system = cat(&[&self.cmake_modules_prefix, file]);
+            if self.exists(&system) {
+                self.check_module_case_mismatch(&system);
+                return (system, true);
+            }
+            if let Some((user, abs)) = self.find_in_module_path(file) {
+                self.check_module_case_mismatch(&abs);
+                return (user, false);
+            }
+            return (BString::default(), true);
+        }
+        if let Some((user, abs)) = self.find_in_module_path(file) {
+            self.check_module_case_mismatch(&abs);
+            return (user, false);
+        }
+        let system = cat(&[&self.cmake_modules_prefix, file]);
+        if self.exists(&system) {
+            self.check_module_case_mismatch(&system);
+            return (system, true);
+        }
+        (BString::default(), true)
+    }
+
+    fn find_in_module_path(&self, file: &[u8]) -> Option<(BString, BString)> {
+        let paths = self.lookup_var(b"CMAKE_MODULE_PATH")?;
+        if paths.is_empty() {
+            return None;
+        }
+        let mut cwd: Option<BString> = None;
+        for dir in rcmake_base::list::iter(paths, Empty::Drop) {
+            let mut candidate = if dir.contains(&b'\\') {
+                crate::util::replace_all(&dir, b"\\", b"/")
+            } else {
+                let mut buf = Vec::with_capacity(dir.len() + 1 + file.len());
+                buf.extend_from_slice(&dir);
+                buf
+            };
+            candidate.push(b'/');
+            candidate.extend_from_slice(file);
+            let abs = if candidate.starts_with(b"/") {
+                collapse_full_path(&candidate, b"/")
+            } else {
+                let base = cwd
+                    .get_or_insert_with(|| rcmake_host::path::from_native_cmake(&self.config.cwd));
+                collapse_full_path(&candidate, base)
+            };
+            if self.exists(&abs) {
+                return Some((BString::from(candidate), abs));
             }
         }
-        let root = rcmake_host::path::from_native_cmake(&self.config.cmake_root);
-        let mods = cat(&[&root, b"/Modules/"]);
-        let in_root = Some(cat(&[&mods, file])).filter(|p| self.exists(p));
-        match (in_module_path, in_root) {
-            (Some(user), Some(system)) => {
-                let current = self
-                    .lookup_var(b"CMAKE_CURRENT_LIST_FILE")
-                    .cloned()
-                    .unwrap_or_default();
-                if current.starts_with(&mods) {
-                    (system, true)
-                } else {
-                    (user, false)
-                }
-            }
-            (Some(user), None) => (user, false),
-            (None, Some(system)) => (system, true),
-            (None, None) => (BString::default(), true),
+        None
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    fn check_module_case_mismatch(&mut self, _abs: &[u8]) {}
+
+    #[cfg(any(target_os = "macos", windows))]
+    fn check_module_case_mismatch(&mut self, abs: &[u8]) {
+        if self.hermetic.is_some() {
+            return;
         }
+        let Some(slash) = abs.iter().rposition(|&b| b == b'/') else {
+            return;
+        };
+        let requested = abs.get(slash + 1..).unwrap_or_default();
+        if requested.is_empty() {
+            return;
+        }
+        let dir = crate::util::filename_path(abs);
+        if self
+            .module_dir_names
+            .get(&dir)
+            .is_some_and(|names| names.contains(requested))
+        {
+            return;
+        }
+        let native_dir = rcmake_host::path::to_native(&dir);
+        let Ok(entries) = self.config.host.read_dir(&native_dir) else {
+            return;
+        };
+        let mut exact_hit = false;
+        let mut mismatched: Option<BString> = None;
+        let mut names = std::collections::HashSet::with_capacity_and_hasher(
+            entries.len(),
+            crate::util::FxBuildHasher,
+        );
+        for entry in entries {
+            if entry.name.as_slice() == requested {
+                exact_hit = true;
+            } else if mismatched.is_none() && entry.name.eq_ignore_ascii_case(requested) {
+                mismatched = Some(entry.name.clone());
+            }
+            names.insert(entry.name);
+        }
+        self.module_dir_names.insert(dir.clone(), names);
+        if exact_hit {
+            return;
+        }
+        let Some(actual) = mismatched else {
+            return;
+        };
+        let on_disk = if dir.ends_with(b"/") {
+            cat(&[&dir, &actual])
+        } else {
+            cat(&[&dir, b"/", &actual])
+        };
+        let body = cat(&[
+            b"The module name\n  ",
+            requested,
+            b"\ndoes not match the case of the module file name on disk\n  ",
+            &on_disk,
+            b"\nThis may fail on case-sensitive file systems.  Use the module name\n  ",
+            &actual,
+            b"\ninstead.",
+        ]);
+        self.issue_here(
+            MessageKind::AuthorWarning,
+            Effect::None,
+            Some(DiagCategory::Author),
+            body,
+            true,
+        );
     }
 }
 
@@ -273,7 +364,7 @@ fn cmd_include(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
     }
 
-    let base = rcmake_host::path::from_native(&cx.current_source_dir());
+    let base = cx.interp.current_source_dir_bytes();
     let abs = collapse_full_path(&fname, &base);
     if is_target_export(cx, &abs) {
         cx.interp.fatal_here(cat(&[
@@ -282,8 +373,9 @@ fn cmd_include(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         ]));
         return Err(CmdError::Reported);
     }
-    let missing = !cx.interp.exists(&abs);
-    let is_dir = cx.interp.is_dir(&abs);
+    let kind = cx.interp.file_kind(&abs);
+    let missing = kind.is_none();
+    let is_dir = kind == Some(FileKind::Dir);
     if missing || is_dir {
         if let Some(var) = &result_var {
             cx.set_var(var, "NOTFOUND".into());

@@ -222,3 +222,168 @@ fn cmp0198_does_not_apply_in_script_mode() {
     let o = run("message(\"[${CMAKE_PARENT_LIST_FILE}]\")\n");
     assert_eq!(o.stderr, "[]\n");
 }
+
+#[test]
+fn include_bundled_module_prefers_bundled_over_module_path() {
+    let o = run_files(
+        concat!(
+            "set(CMAKE_MODULE_PATH /work/cmake)\n",
+            "include(Helper)\n",
+            "include(Bundled)\n",
+        ),
+        &[
+            ("/work/cmake/Helper.cmake", "message(user-helper)\n"),
+            (
+                "/opt/cmake/share/cmake-4.5/Modules/Bundled.cmake",
+                "include(Helper)\n",
+            ),
+            (
+                "/opt/cmake/share/cmake-4.5/Modules/Helper.cmake",
+                "message(bundled-helper)\n",
+            ),
+        ],
+    );
+    assert_eq!(o.exit, 0, "{}", o.stderr);
+    assert_eq!(o.stderr, "user-helper\nbundled-helper\n");
+}
+
+#[cfg(any(target_os = "macos", windows))]
+mod case_mismatch_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use rcmake_diag::{DiagCategory, MessageKind};
+    use rcmake_host::{
+        CopyOptions, DirEntry, FileTime, Follow, Host, HostResult, Metadata, PureHost, ReadRange,
+        Stream, WriteMode,
+    };
+
+    use super::super::{ROOT, TEST_FRONTEND, register_test};
+    use crate::{Interp, InterpConfig, RunMode};
+
+    /// PureHost adapter simulating case-insensitive lookups while preserving exact on-disk
+    /// directory entry names from `read_dir`.
+    struct CaseInsensitiveHost {
+        base: Arc<PureHost>,
+    }
+
+    impl CaseInsensitiveHost {
+        fn resolve(&self, path: &Path) -> PathBuf {
+            if self.base.metadata(path, Follow::No).is_ok() {
+                return path.to_path_buf();
+            }
+            if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+                && let Ok(entries) = self.base.read_dir(parent)
+            {
+                let requested = name.as_encoded_bytes();
+                if let Some(entry) = entries
+                    .into_iter()
+                    .find(|entry| entry.name.eq_ignore_ascii_case(requested))
+                {
+                    return parent.join(rcmake_host::path::to_native(&entry.name));
+                }
+            }
+            path.to_path_buf()
+        }
+    }
+
+    impl Host for CaseInsensitiveHost {
+        rcmake_host::forward_host!(base, env, process, services);
+
+        fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
+            self.base.metadata(&self.resolve(p), follow)
+        }
+
+        fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
+            self.base.read(&self.resolve(p), range)
+        }
+
+        rcmake_host::forward_host!(@method base, write(p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()>);
+        rcmake_host::forward_host!(@method base, read_dir(p: &Path) -> HostResult<Vec<DirEntry>>);
+        rcmake_host::forward_host!(@method base, create_dir_all(p: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method base, remove_file(p: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method base, remove_dir(p: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method base, remove_dir_all(p: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method base, rename(from: &Path, to: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method base, copy_file(from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()>);
+        rcmake_host::forward_host!(@method base, symlink(target: &Path, link: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method base, hard_link(src: &Path, dst: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method base, read_link(p: &Path) -> HostResult<PathBuf>);
+        rcmake_host::forward_host!(@method base, canonicalize(p: &Path) -> HostResult<PathBuf>);
+        rcmake_host::forward_host!(@method base, set_permissions(p: &Path, mode: u32) -> HostResult<()>);
+        rcmake_host::forward_host!(@method base, set_times(p: &Path, atime: Option<FileTime>, mtime: Option<FileTime>) -> HostResult<()>);
+    }
+
+    #[test]
+    fn include_warns_on_module_case_mismatch() {
+        let base = Arc::new(PureHost::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/usr/local/bin/cmake"),
+        ));
+        for (path, text) in [
+            (
+                "/work/main.cmake",
+                concat!(
+                    "set(CMAKE_MODULE_PATH /work/mods)\n",
+                    "include(ExactMod)\n",
+                    "include(ExactMod)\n",
+                    "include(casemismatch)\n",
+                    "include(stdmod)\n",
+                ),
+            ),
+            ("/work/mods/ExactMod.cmake", "message(exact)\n"),
+            ("/work/mods/CaseMismatch.cmake", "message(matched)\n"),
+            (
+                "/opt/cmake/share/cmake-4.5/Modules/StdMod.cmake",
+                "message(std)\n",
+            ),
+        ] {
+            base.seed_file(&PathBuf::from(path), text.as_bytes())
+                .expect("seed file");
+        }
+        let host = Arc::new(CaseInsensitiveHost { base: base.clone() });
+        let config =
+            InterpConfig::new(host, RunMode::Script, ROOT, "/usr/local/bin/cmake", "/work");
+        let mut interp = Interp::new(config, register_test);
+        interp.frontend = TEST_FRONTEND;
+        let outcome = interp.run_script(&PathBuf::from("main.cmake"));
+        let stderr = String::from_utf8_lossy(&base.stream_bytes(Stream::Stderr)).into_owned();
+        assert_eq!(outcome.exit_code, 0, "{stderr}");
+        assert!(stderr.contains("exact\nexact\n"), "{stderr}");
+        assert!(stderr.contains("matched\n"), "{stderr}");
+        assert!(stderr.contains("std\n"), "{stderr}");
+        assert!(!stderr.contains("ExactMod.cmake"), "{stderr}");
+
+        let expected_user = concat!(
+            "The module name\n",
+            "  casemismatch.cmake\n",
+            "does not match the case of the module file name on disk\n",
+            "  /work/mods/CaseMismatch.cmake\n",
+            "This may fail on case-sensitive file systems.  Use the module name\n",
+            "  CaseMismatch.cmake\n",
+            "instead.",
+        );
+        let expected_std = concat!(
+            "The module name\n",
+            "  stdmod.cmake\n",
+            "does not match the case of the module file name on disk\n",
+            "  /opt/cmake/share/cmake-4.5/Modules/StdMod.cmake\n",
+            "This may fail on case-sensitive file systems.  Use the module name\n",
+            "  StdMod.cmake\n",
+            "instead.",
+        );
+        let warnings: Vec<_> = interp
+            .diag_engine()
+            .diagnostics()
+            .iter()
+            .filter(|d| {
+                d.kind == MessageKind::AuthorWarning && d.category == Some(DiagCategory::Author)
+            })
+            .map(|d| d.body.to_string())
+            .collect();
+        assert_eq!(
+            warnings,
+            vec![expected_user.to_owned(), expected_std.to_owned()]
+        );
+    }
+}

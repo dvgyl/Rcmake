@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rcmake_base::{BString, list, truth};
 use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
@@ -373,6 +373,11 @@ fn visible(scope: UsageScope, interface: bool) -> bool {
         }
 }
 
+#[derive(Default)]
+struct UtilityDepIndex {
+    by_target: HashMap<TargetId, (usize, HashSet<BString>)>,
+}
+
 pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [name, deps @ ..] = args else {
         return Err(CmdError::status(
@@ -380,7 +385,6 @@ pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
         ));
     };
     let dir = cx.current_dir_id();
-    let bt = cx.backtrace();
     let Some(id) = cx.project().find_target(dir, bytes(name)) else {
         return Err(crate::command_error(
             cx,
@@ -390,19 +394,76 @@ pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
             ),
         ));
     };
-    let target = cx
+    if deps.is_empty() {
+        return Ok(Flow::Normal);
+    }
+    let bt = cx.backtrace();
+    let existing_len = cx
         .project()
-        .target_mut(id)
-        .ok_or_else(|| model_error(ModelError::UnknownObject))?;
-    for dep in deps {
-        if !target
-            .utility_deps
-            .iter()
-            .any(|entry| entry.value == dep.value)
-        {
-            target
+        .target(id)
+        .ok_or_else(|| model_error(ModelError::UnknownObject))?
+        .utility_deps
+        .len();
+    if existing_len.saturating_add(deps.len()) < 32 {
+        let target = cx
+            .project()
+            .target_mut(id)
+            .ok_or_else(|| model_error(ModelError::UnknownObject))?;
+        for dep in deps {
+            if !target
                 .utility_deps
-                .push(BT::new(dep.value.clone(), bt.clone()));
+                .iter()
+                .any(|entry| entry.value == dep.value)
+            {
+                target
+                    .utility_deps
+                    .push(BT::new(dep.value.clone(), bt.clone()));
+            }
+        }
+        return Ok(Flow::Normal);
+    }
+
+    let needs_seed = cx
+        .session_data::<UtilityDepIndex>()
+        .and_then(|index| index.by_target.get(&id))
+        .is_none_or(|(len, _)| *len != existing_len);
+    let seed = if needs_seed {
+        let existing = &cx
+            .project()
+            .target(id)
+            .ok_or_else(|| model_error(ModelError::UnknownObject))?
+            .utility_deps;
+        let mut set = HashSet::with_capacity(existing.len().saturating_add(deps.len()));
+        for entry in existing {
+            set.insert(entry.value.clone());
+        }
+        Some(set)
+    } else {
+        None
+    };
+
+    let mut to_add = Vec::new();
+    if let Some(index) = cx.session_data_mut_or_init::<UtilityDepIndex>() {
+        if let Some(set) = seed {
+            index.by_target.insert(id, (existing_len, set));
+        }
+        if let Some((cached_len, set)) = index.by_target.get_mut(&id) {
+            for dep in deps {
+                if !set.contains(&dep.value) {
+                    set.insert(dep.value.clone());
+                    to_add.push(dep.value.clone());
+                }
+            }
+            *cached_len += to_add.len();
+        }
+    }
+    if !to_add.is_empty() {
+        let target = cx
+            .project()
+            .target_mut(id)
+            .ok_or_else(|| model_error(ModelError::UnknownObject))?;
+        for dep in to_add {
+            target.utility_deps.push(BT::new(dep, bt.clone()));
         }
     }
     Ok(Flow::Normal)

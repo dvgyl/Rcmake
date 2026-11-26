@@ -237,7 +237,7 @@ impl Interp {
         let end = code.end_of(i);
         let mut plan = None;
         let mut opener = Vec::new();
-        self.run_opener(code, cmd, |this| {
+        self.run_opener(code, i, cmd, |this| {
             let args = this.expand(&cmd.args)?;
             plan = this.foreach_plan(&args)?;
             opener = args;

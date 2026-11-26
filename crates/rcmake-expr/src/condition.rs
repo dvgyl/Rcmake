@@ -1,10 +1,11 @@
 use core::cmp::Ordering;
-use std::path::PathBuf;
+use std::borrow::Cow;
+use std::path::Path;
 
 use rcmake_base::{
     BString,
     limits::Limits,
-    list::{Empty, EmptyInput, split_with_empty_input},
+    list::{self, Empty},
     truth::{if_constant, is_off},
     version,
 };
@@ -20,8 +21,127 @@ const MAX_DEPTH: usize = 256;
 
 /// Evaluate an expanded `if()` or `while()` condition.
 pub fn eval_condition(args: &[ExpandedArg], env: &mut dyn CondEnv) -> Result<bool, CondError> {
+    // Fast paths for common paren-free conditions avoid the `Vec<Token>` pass buffers.
+    match args {
+        [] => return Ok(false),
+        [a] => {
+            let a = Token::Arg(a);
+            if is_paren(a.keyword()) {
+                return Err(error("mismatched parenthesis in condition"));
+            }
+            return Ok(a.truth(env));
+        }
+        [a, b] => {
+            let (a, b) = (Token::Arg(a), Token::Arg(b));
+            let (a_kw, b_kw) = (a.keyword(), b.keyword());
+            if !is_paren(a_kw) && !is_paren(b_kw) {
+                if let Some(res) = unary(a_kw, b.literal(), env) {
+                    return Ok(res);
+                }
+                if a_kw == b"MATCHES" {
+                    return Ok(false);
+                }
+                if a_kw == b"NOT" {
+                    return Ok(!b.truth(env));
+                }
+                return Err(error("Unknown arguments specified"));
+            }
+        }
+        [a, b, c] => {
+            let (a, b, c) = (Token::Arg(a), Token::Arg(b), Token::Arg(c));
+            let (a_kw, b_kw, c_kw) = (a.keyword(), b.keyword(), c.keyword());
+            if !is_paren(a_kw) && !is_paren(b_kw) && !is_paren(c_kw) {
+                if a_kw == b"NOT"
+                    && let Some(res) = unary(b_kw, c.literal(), env)
+                {
+                    return Ok(!res);
+                }
+                if !is_unary_op(a_kw) && !is_unary_op(b_kw) && a_kw != b"MATCHES" {
+                    if let Some(res) = binary(a, b_kw, c, env)? {
+                        return Ok(res);
+                    }
+                    if a_kw == b"NOT" {
+                        let _ = b.truth(env);
+                        return Err(error("Unknown arguments specified"));
+                    }
+                    if b_kw == b"NOT" {
+                        let _ = c.truth(env);
+                        return Err(error("Unknown arguments specified"));
+                    }
+                    return match b_kw {
+                        b"AND" => Ok(a.truth(env) & c.truth(env)),
+                        b"OR" => Ok(a.truth(env) | c.truth(env)),
+                        _ => Err(error("Unknown arguments specified")),
+                    };
+                }
+            }
+        }
+        [a, b, c, d] => {
+            let (a, b, c, d) = (Token::Arg(a), Token::Arg(b), Token::Arg(c), Token::Arg(d));
+            let (a_kw, b_kw, c_kw, d_kw) = (a.keyword(), b.keyword(), c.keyword(), d.keyword());
+            if a_kw == b"NOT"
+                && !is_paren(b_kw)
+                && !is_paren(c_kw)
+                && !is_paren(d_kw)
+                && !is_unary_op(b_kw)
+                && !is_unary_op(c_kw)
+                && !is_any_binary_op(b_kw)
+                && is_unconditional_binary_op(c_kw)
+                && let Some(res) = binary(b, c_kw, d, env)?
+            {
+                return Ok(!res);
+            }
+        }
+        _ => {}
+    }
     let mut args = args.iter();
     group(&mut args, env, 0)
+}
+
+fn is_paren(kw: &[u8]) -> bool {
+    matches!(kw, b"(" | b")")
+}
+
+fn is_unary_op(op: &[u8]) -> bool {
+    matches!(
+        op,
+        b"DEFINED"
+            | b"COMMAND"
+            | b"POLICY"
+            | b"DIAGNOSTIC"
+            | b"TARGET"
+            | b"TEST"
+            | b"RULE"
+            | b"IS_ABSOLUTE"
+            | b"EXISTS"
+            | b"IS_READABLE"
+            | b"IS_WRITABLE"
+            | b"IS_EXECUTABLE"
+            | b"IS_DIRECTORY"
+            | b"IS_SYMLINK"
+    )
+}
+
+fn is_unconditional_binary_op(op: &[u8]) -> bool {
+    if let Some(suffix) = op.strip_prefix(b"STR") {
+        return Relation::parse(suffix).is_some();
+    }
+    if let Some(suffix) = op.strip_prefix(b"VERSION_") {
+        return Relation::parse(suffix).is_some();
+    }
+    Relation::parse(op).is_some() || matches!(op, b"MATCHES" | b"IN_LIST" | b"IS_NEWER_THAN")
+}
+
+fn is_any_binary_op(op: &[u8]) -> bool {
+    is_unconditional_binary_op(op) || matches!(op, b"PATH_EQUAL" | b"PATH_IS_PREFIX")
+}
+
+fn might_be_number(lit: &[u8]) -> bool {
+    lit.first().is_some_and(|&byte| {
+        byte.is_ascii_digit()
+            || byte.is_ascii_whitespace()
+            || matches!(byte, b'+' | b'-' | b'.' | b'i' | b'I' | b'n' | b'N' | 0x0b)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -53,14 +173,29 @@ impl Token<'_> {
         }
     }
 
-    fn value(&self, env: &mut dyn CondEnv) -> BString {
-        self.variable(env).unwrap_or_else(|| self.literal().into())
+    /// The variable value of an unquoted argument, else its literal bytes. A literal is
+    /// borrowed, so comparing literals copies nothing.
+    fn value<'s>(&'s self, env: &mut dyn CondEnv) -> Cow<'s, [u8]> {
+        match self.variable(env) {
+            Some(value) => Cow::Owned(value.into()),
+            None => Cow::Borrowed(self.literal()),
+        }
     }
 
     fn truth(&self, env: &mut dyn CondEnv) -> bool {
-        if_constant(self.literal())
-            .or_else(|| number::whole(self.literal()).map(|value| value != 0.0))
-            .unwrap_or_else(|| self.variable(env).is_some_and(|value| !is_off(&value)))
+        let Self::Arg(arg) = self else {
+            return matches!(self, Self::Bool(true));
+        };
+        let literal = arg.value.as_slice();
+        if let Some(value) = if_constant(literal) {
+            return value;
+        }
+        if might_be_number(literal)
+            && let Some(value) = number::whole(literal)
+        {
+            return value != 0.0;
+        }
+        self.variable(env).is_some_and(|value| !is_off(&value))
     }
 }
 
@@ -90,12 +225,20 @@ fn group<'a>(
 
 fn reduce(mut tokens: Vec<Token<'_>>, env: &mut dyn CondEnv) -> Result<bool, CondError> {
     // Each pass consumes operands from left to right. A binary result can be
-    // the left operand of the next operator in the same pass.
-    tokens = prefix_pass(tokens, |op, operand| unary(op, operand.literal(), env));
-    tokens = binary_pass(tokens, env)?;
-    tokens = prefix_pass(tokens, |op, operand| {
-        (op == b"NOT").then(|| !operand.truth(env))
-    });
+    // the left operand of the next operator in the same pass. Every pass needs an
+    // operator and an operand, so a pass over fewer than two tokens returns them
+    // unchanged and is skipped (`if(VAR)` is the most common condition).
+    if tokens.len() > 1 {
+        tokens = prefix_pass(tokens, |op, operand| unary(op, operand.literal(), env));
+    }
+    if tokens.len() > 1 {
+        tokens = binary_pass(tokens, env)?;
+    }
+    if tokens.len() > 1 {
+        tokens = prefix_pass(tokens, |op, operand| {
+            (op == b"NOT").then(|| !operand.truth(env))
+        });
+    }
 
     while tokens.len() > 1 {
         let before = tokens.len();
@@ -125,8 +268,8 @@ fn prefix_pass<'a>(
     tokens: Vec<Token<'a>>,
     mut evaluate: impl FnMut(&[u8], Token<'a>) -> Option<bool>,
 ) -> Vec<Token<'a>> {
+    let mut output = Vec::with_capacity(tokens.len());
     let mut input = tokens.into_iter().peekable();
-    let mut output = Vec::new();
     while let Some(token) = input.next() {
         if let Some(&operand) = input.peek()
             && let Some(result) = evaluate(token.keyword(), operand)
@@ -144,8 +287,8 @@ fn binary_pass<'a>(
     tokens: Vec<Token<'a>>,
     env: &mut dyn CondEnv,
 ) -> Result<Vec<Token<'a>>, CondError> {
+    let mut output = Vec::with_capacity(tokens.len());
     let mut input = tokens.into_iter();
-    let mut output = Vec::new();
     // An empty unquoted left operand disappears during argument expansion.
     let mut left = if let [first, _, ..] = input.as_slice()
         && first.keyword() == b"MATCHES"
@@ -188,11 +331,22 @@ fn unary(op: &[u8], operand: &[u8], env: &mut dyn CondEnv) -> Option<bool> {
         b"TARGET" => env.target_exists(operand),
         b"TEST" => env.test_exists(operand),
         b"RULE" => env.rule_exists(operand),
-        b"IS_ABSOLUTE" => operand.starts_with(b"~") || to_native(operand).has_root(),
+        b"IS_ABSOLUTE" => operand.starts_with(b"~") || is_absolute_path(operand),
         b"EXISTS" | b"IS_READABLE" | b"IS_WRITABLE" | b"IS_EXECUTABLE" | b"IS_DIRECTORY"
         | b"IS_SYMLINK" => file_predicate(op, operand, env),
         _ => return None,
     })
+}
+
+fn is_absolute_path(operand: &[u8]) -> bool {
+    #[cfg(unix)]
+    {
+        operand.starts_with(b"/")
+    }
+    #[cfg(not(unix))]
+    {
+        to_native(operand).has_root()
+    }
 }
 
 fn defined_name<'a>(operand: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
@@ -209,7 +363,8 @@ fn file_predicate(op: &[u8], operand: &[u8], env: &dyn CondEnv) -> bool {
     } else {
         Follow::Yes
     };
-    let Ok(metadata) = env.host().metadata(&resolve_path(operand, env), follow) else {
+    let Ok(metadata) = with_resolved_path(operand, env, |path| env.host().metadata(path, follow))
+    else {
         return false;
     };
     match op {
@@ -222,8 +377,21 @@ fn file_predicate(op: &[u8], operand: &[u8], env: &dyn CondEnv) -> bool {
     }
 }
 
-fn resolve_path(operand: &[u8], env: &dyn CondEnv) -> PathBuf {
-    env.base_dir().join(to_native(operand))
+fn with_resolved_path<R>(operand: &[u8], env: &dyn CondEnv, f: impl FnOnce(&Path) -> R) -> R {
+    #[cfg(unix)]
+    if operand.starts_with(b"/") {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        return f(Path::new(OsStr::from_bytes(operand)));
+    }
+    let native = to_native(operand);
+    // `Path::join` with an absolute path returns that path, so skip the copy.
+    if native.is_absolute() {
+        f(&native)
+    } else {
+        let joined = env.base_dir().join(native);
+        f(&joined)
+    }
 }
 
 enum Relation {
@@ -300,22 +468,18 @@ fn in_list(left: Token<'_>, name: &[u8], env: &mut dyn CondEnv) -> bool {
     let Some(list) = env.var(name) else {
         return false;
     };
-    let mut elements = Vec::new();
-    split_with_empty_input(
-        &list,
-        Empty::Keep,
-        EmptyInput::OneEmptyElement,
-        &mut elements,
-    );
-    elements.contains(&value)
+    if list.is_empty() {
+        return value.is_empty();
+    }
+    list::iter(&list, Empty::Keep).any(|element| element.as_ref() == value.as_ref())
 }
 
 fn is_newer(left: &[u8], right: &[u8], env: &dyn CondEnv) -> bool {
     if left.is_empty() || right.is_empty() {
         return true;
     }
-    let left = env.host().metadata(&resolve_path(left, env), Follow::Yes);
-    let right = env.host().metadata(&resolve_path(right, env), Follow::Yes);
+    let left = with_resolved_path(left, env, |path| env.host().metadata(path, Follow::Yes));
+    let right = with_resolved_path(right, env, |path| env.host().metadata(path, Follow::Yes));
     match (left, right) {
         (Ok(left), Ok(right)) => left.mtime >= right.mtime,
         _ => true,

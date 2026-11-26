@@ -5,8 +5,8 @@ use std::time::Duration;
 use rcmake_base::BString;
 use rcmake_build::BuildOutcome;
 use rcmake_eval::{
-    CommandProfiler, CommandSample, Cx, Interp, InterpConfig, RunMode, SampleKind, Services,
-    TraceConfig,
+    CommandProfiler, CommandSample, Cx, Interp, InterpConfig, Registry, RunMode, SampleKind,
+    Services, TraceConfig,
 };
 use rcmake_host::{Host, WriteMode, path};
 use rcmake_model::{DirId, GeneratorKind, GeneratorSpec, Target};
@@ -15,6 +15,12 @@ use super::capture::CapturingHost;
 use super::run::{ChildError, build_child};
 use super::seed::TryCompileSeed;
 use super::{ProbeDirs, ProbeResult, probe_cache};
+
+/// Shared read-only command registry reused across all `try_compile` child interpreters.
+fn child_registry() -> Arc<Registry> {
+    static REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| Interp::build_registry(crate::register_all)))
+}
 
 #[derive(Clone)]
 pub(super) struct ChildConfig {
@@ -123,7 +129,7 @@ impl ChildConfig {
             let mut config = self.config;
             config.cwd = dirs.binary.clone();
             config.host = host.clone();
-            let mut child = Interp::new(config, crate::register_all);
+            let mut child = Interp::with_registry(config, child_registry());
             initialize(&mut child, &host);
             if let Some(cache) = self.parse_cache {
                 child.set_parse_cache(cache);

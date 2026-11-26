@@ -874,3 +874,53 @@ fn get_filename_component_cache_respects_the_cache_byte_limit() {
     assert_eq!(cache_value(&mut state, b"V"), None);
     state.absent("V");
 }
+
+#[test]
+fn list_append_in_place_preserves_scope_shadowing_watches_and_removals() {
+    let mut state = Script::new(Vec::new());
+    state.success(
+        r#"
+set(acc "")
+foreach(i RANGE 1 20)
+  list(APPEND acc "v${i}")
+endforeach()
+
+set(outer a b)
+function(shadow_append)
+  list(APPEND outer local_only)
+  set(child_view "${outer}" PARENT_SCOPE)
+endfunction()
+shadow_append()
+
+set(watch_log "")
+function(on_watch var access value)
+  list(APPEND watch_log "${access}:${value}")
+  set(watch_log "${watch_log}" PARENT_SCOPE)
+endfunction()
+set(watched init)
+variable_watch(watched on_watch)
+list(APPEND watched next)
+
+set(rm a b c d e f g h i j k l)
+list(REMOVE_ITEM rm b)
+list(REMOVE_ITEM rm c d)
+list(REMOVE_ITEM rm e f g h i j k m n)
+set(rm_at x0 x1 x2 x3)
+list(REMOVE_AT rm_at -2)
+set(dups b a b c a d c)
+list(REMOVE_DUPLICATES dups)
+"#,
+    );
+    let expected_acc: String = (1..=20)
+        .map(|i| format!("v{i}"))
+        .collect::<Vec<_>>()
+        .join(";");
+    state.var("acc", expected_acc.as_bytes());
+    state.var("outer", b"a;b");
+    state.var("child_view", b"a;b;local_only");
+    state.var("watched", b"init;next");
+    state.var("watch_log", b"READ_ACCESS:init;MODIFIED_ACCESS:init;next");
+    state.var("rm", b"a;l");
+    state.var("rm_at", b"x0;x1;x3");
+    state.var("dups", b"b;a;c;d");
+}
