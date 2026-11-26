@@ -84,6 +84,9 @@ impl Evaluator<'_> {
             );
         }
         validate_property(call, property)?;
+        if property == b"SOURCES" {
+            self.host.read_target_sources(target);
+        }
 
         let link_evaluation = !self.in_target_expression
             && call

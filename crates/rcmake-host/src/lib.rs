@@ -311,6 +311,14 @@ pub trait FileLockGuard: Send + core::fmt::Debug {
 
 const FILE_CHUNK_SIZE: usize = 256 * 1024;
 
+/// Reader and writer for GNU make jobserver tokens.
+pub struct JobServerPipe {
+    /// Read one byte for each token.
+    pub reader: Box<dyn std::io::Read + Send>,
+    /// Write each token back when it is no longer in use.
+    pub writer: Box<dyn std::io::Write + Send>,
+}
+
 /// Core OS abstraction trait for Rcmake (ADR-004).
 ///
 /// Every filesystem path argument MUST be absolute; relative paths return
@@ -495,6 +503,11 @@ pub trait Host: Send + Sync {
 
     /// Return all active environment variables as sorted `(key, value)` pairs.
     fn env_all(&self) -> Vec<(BString, BString)>;
+
+    /// Open a GNU make jobserver FIFO or pair of inherited pipe descriptors.
+    fn open_jobserver(&self, _auth: &[u8]) -> Option<JobServerPipe> {
+        None
+    }
 
     /// Return `false` if the host always rejects process requests.
     ///

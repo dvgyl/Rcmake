@@ -215,6 +215,21 @@ impl<'a> Commands<'a> {
         self.file_outputs.get(path).copied()
     }
 
+    pub(super) fn main_source(
+        &self,
+        index: usize,
+        paths: Option<&SourcePaths<'_>>,
+    ) -> Option<BString> {
+        let command = self.model.command(self.owners.get(&index)?.command)?;
+        let main = command.main_dependency.as_ref()?;
+        let dir = self.model.dir(command.dir);
+        let source = paths
+            .and_then(|paths| paths.find(dir, main))
+            .unwrap_or_else(|| absolute_path(&dir.source_dir, main));
+        let path = build_relative(self.model, &Lexical::new(&source).normalize());
+        (self.source_attachment(command.dir, &path) == Some(index)).then_some(source)
+    }
+
     pub(super) fn source_attachment(&self, dir: DirId, path: &BString) -> Option<usize> {
         self.attachments.get(dir, path)
     }
@@ -618,22 +633,39 @@ impl<'a> Commands<'a> {
                     ));
                 }
                 pending.push((step, true));
-                if let Some(inputs) = self.inputs.get(step) {
-                    pending.extend(inputs.iter().rev().flat_map(|path| {
-                        self.producer(path)
-                            .into_iter()
-                            .chain(
-                                self.command_dirs
-                                    .get(step)
-                                    .and_then(|dir| self.source_attachment(*dir, path))
-                                    .filter(|attached| *attached != step),
-                            )
-                            .map(|producer| (producer, false))
-                    }));
-                }
+                pending.extend(
+                    self.input_producers(step)
+                        .rev()
+                        .map(|producer| (producer, false)),
+                );
             }
         }
         Ok(())
+    }
+
+    fn input_producers(&self, step: usize) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.inputs
+            .get(step)
+            .into_iter()
+            .flatten()
+            .flat_map(move |path| {
+                self.producer(path).into_iter().chain(
+                    self.command_dirs
+                        .get(step)
+                        .and_then(|dir| self.source_attachment(*dir, path))
+                        .filter(|attached| *attached != step),
+                )
+            })
+    }
+
+    pub(super) fn ordered_source_steps(&self, roots: IndexSet<usize>) -> IndexSet<usize> {
+        let mut steps = roots;
+        let mut next = 0;
+        while let Some(&step) = steps.get_index(next) {
+            steps.extend(self.input_producers(step));
+            next += 1;
+        }
+        steps
     }
 
     /// Attach custom commands traced across other configurations in multi-config

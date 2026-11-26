@@ -47,9 +47,7 @@ pub(super) fn create(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     let encoding = encoding(cx, &request);
     let archive_format = format_with_compression(format, compression, threads)?;
     let failure = || error([b"failed to compress: ".as_slice(), output].concat());
-    if (format == b"raw" && !value(&request, "ENCODING").is_empty())
-        || !supported_encoding(&encoding)
-    {
+    if (format == b"raw" && encoding.as_slice() != b"OEM") || !supported_encoding(&encoding) {
         let diagnostic = if format == b"raw" {
             format!(
                 "archive_write_set_format_option(hdrcharset): Undefined option: `raw:hdrcharset={encoding}'"
@@ -248,7 +246,7 @@ fn encoding(cx: &Cx<'_>, request: &Parsed) -> BString {
     let encoding = value(request, "ENCODING");
     if encoding.is_empty() {
         let policy = cx.policy(PolicyId::new(213));
-        BString::from(if cfg!(windows) && policy != PolicyStatus::New {
+        BString::from(if policy != PolicyStatus::New {
             "OEM"
         } else {
             "UTF-8"

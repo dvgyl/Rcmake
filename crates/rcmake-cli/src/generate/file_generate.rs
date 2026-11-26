@@ -30,18 +30,28 @@ pub(super) fn write(
     host: &dyn Host,
 ) -> Result<(), GenError> {
     rcmake_commands::print_deferred_properties(model, result, host).map_err(GenError::Invalid)?;
-    generate(model, &result.configs, &result.targets, host, false)
+    generate(model, &result.configs, Some(result), host, false)?;
+    if let Some((dir, path)) = result.file_generate_cycles.first() {
+        return Err(generation_error(
+            model,
+            *dir,
+            &format!(
+                "Evaluation output file\n\n  \"{path}\"\n\ndepends on the sources of a target it is used in.  This is a dependency loop and is not allowed."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Report expression errors when another part of generation has already failed.
 pub(super) fn report_errors(model: &ProjectModel, configs: &[ConfigId], host: &dyn Host) {
-    let _ = generate(model, configs, &[], host, true);
+    let _ = generate(model, configs, None, host, true);
 }
 
 fn generate(
     model: &ProjectModel,
     configs: &[ConfigId],
-    targets: &[rcmake_resolve::ResolvedTarget],
+    result: Option<&GenerationResult>,
     host: &dyn Host,
     diagnostics_only: bool,
 ) -> Result<(), GenError> {
@@ -127,7 +137,10 @@ fn generate(
         })
         .collect::<Vec<_>>();
     let mut usage = UsageResolver::new(model);
-    let objects = ObjectPaths::new(targets);
+    if let Some(result) = result {
+        usage = usage.with_traced_sources(&result.traced_sources);
+    }
+    let objects = ObjectPaths::new(result.into_iter().flat_map(|result| &result.targets));
     let root = &model.dir(DirId::ROOT).source_dir;
     let timestamp = |format: Option<&[u8]>, utc| format_timestamp(host, format, utc);
     let mut condition_result: Option<BString> = None;

@@ -38,6 +38,7 @@ pub struct ModelGenexHost<'model, 'resolver> {
     pub(super) resolver: &'resolver mut UsageResolver<'model>,
     pub(super) lookup_dir: DirId,
     pub(crate) current: Option<TargetHandle>,
+    pub(crate) cmp0189: Option<PolicyStatus>,
     pub(crate) artifact_dependencies: Option<&'resolver RefCell<IndexSet<(TargetId, ConfigId)>>>,
     objects: Option<&'resolver ObjectPaths<'resolver>>,
     clock: Option<&'resolver dyn Host>,
@@ -60,6 +61,7 @@ impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
             resolver,
             lookup_dir,
             current: None,
+            cmp0189: None,
             artifact_dependencies: None,
             objects: None,
             clock: None,
@@ -173,6 +175,14 @@ impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
 }
 
 impl GenexHost for ModelGenexHost<'_, '_> {
+    fn read_target_sources(&mut self, target: TargetHandle) {
+        if let Some(id) = self.id(target)
+            && let Some(reads) = &self.resolver.source_reads
+        {
+            reads.borrow_mut().insert(id);
+        }
+    }
+
     fn find_target(&self, name: &[u8]) -> Option<TargetHandle> {
         self.resolver
             .model
@@ -354,6 +364,9 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         policy: PolicyId,
         _ctx: &EvalContext,
     ) -> Option<PolicyStatus> {
+        if policy == PolicyId::new(189) && self.cmp0189.is_some() {
+            return self.cmp0189;
+        }
         Some(
             self.resolver
                 .model

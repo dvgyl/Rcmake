@@ -20,7 +20,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use rcmake_base::hash::HashAlgo;
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, ByteSlice, list};
 use rcmake_eval::Interp;
 use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{CopyOptions, Host, HostResult, ReadRange, Stream, WriteMode};
@@ -171,6 +171,20 @@ pub trait PackageGenerator {
         let _ = members;
         self.package(cx)
     }
+
+    /// Create packages with access to the CPack interpreter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if staging data or a generator script is invalid.
+    fn package_with_interp(
+        &self,
+        cx: &PackageContext<'_>,
+        members: &ComponentMembers,
+        _interp: &mut Interp,
+    ) -> Result<Vec<PathBuf>, CpackError> {
+        self.package_from_stage(cx, members)
+    }
 }
 
 /// Run `cpack` with `argv` (including `argv[0]`) and return the process exit code.
@@ -241,6 +255,9 @@ fn run(host: &Arc<dyn Host>, cli: CPackOptions, argv0: Option<&BString>) -> Resu
             }
         }
         complete_version(&mut interp)?;
+        if matches!(generator.name(), "DEB" | "RPM") {
+            initialize_linux_package(&mut interp, generator.name(), &options.cwd)?;
+        }
         if generator.name() == "External" {
             generators::external::initialize(&mut interp)?;
         }
@@ -330,12 +347,15 @@ fn package(
     work.push(generator.name());
     host.create_dir_all(&output)?;
     stage::ensure_dir(host.as_ref(), &output, &work)?;
-    if generator.name() == "External"
+    if matches!(generator.name(), "External" | "DEB" | "RPM")
         && (cfg.get(b"CPACK_REMOVE_TOPLEVEL_DIRECTORY").is_none()
             || cfg.on(b"CPACK_REMOVE_TOPLEVEL_DIRECTORY"))
     {
         host.remove_dir_all(&work)?;
     }
+    let publish_dir = cfg
+        .get(b"CPACK_OUTPUT_FILE_PREFIX")
+        .map_or_else(|| output.clone(), |dir| absolute(cwd, dir));
     let staging = work.join(file);
     stage::remove_entry(host.as_ref(), &staging)?;
     host.create_dir_all(&staging)?;
@@ -346,7 +366,7 @@ fn package(
         (b"CPACK_TOPLEVEL_DIRECTORY".as_slice(), &work),
         (b"CPACK_TEMPORARY_DIRECTORY", &staging),
         (b"CPACK_TEMPORARY_INSTALL_DIRECTORY", &staging),
-        (b"CPACK_OUTPUT_FILE_PREFIX", &output),
+        (b"CPACK_OUTPUT_FILE_PREFIX", &publish_dir),
         (b"CPACK_TEMPORARY_PACKAGE_FILE_NAME", &package_file),
     ] {
         interp.cx().set_var(key, from_native(path));
@@ -377,7 +397,7 @@ fn package(
     let members = stage::install(host, cwd, cli, interp, &staging)?;
     let vars = snapshot(interp);
     log(host.as_ref(), "Create package");
-    let mut packages = generator.package_from_stage(
+    let mut packages = generator.package_with_interp(
         &PackageContext {
             host: host.as_ref(),
             vars: &vars.vars,
@@ -387,6 +407,7 @@ fn package(
             grouping: stage::grouping(&vars),
         },
         &members,
+        interp,
     )?;
     if generator.name() == "External" {
         generators::external::run_script(host.as_ref(), cwd, interp, &mut packages)?;
@@ -402,7 +423,57 @@ fn package(
         b"CPACK_POST_BUILD_SCRIPTS",
         "Executing post-build script",
     )?;
-    publish(host.as_ref(), &snapshot(interp), &output, &packages)
+    let vars = snapshot(interp);
+    let publish_dir = vars
+        .get(b"CPACK_OUTPUT_FILE_PREFIX")
+        .map_or(publish_dir, |dir| absolute(cwd, dir));
+    host.create_dir_all(&publish_dir)?;
+    publish(host.as_ref(), &vars, &publish_dir, &packages)
+}
+
+fn initialize_linux_package(
+    interp: &mut Interp,
+    generator: &str,
+    cwd: &Path,
+) -> Result<(), CpackError> {
+    let mut cx = interp.cx();
+    if cx.var(b"CPACK_PACKAGING_INSTALL_PREFIX").is_none() {
+        cx.set_var(b"CPACK_PACKAGING_INSTALL_PREFIX", "/usr".into());
+    }
+    if !cx.var_is_on(b"CPACK_SET_DESTDIR") {
+        cx.set_var(b"CPACK_SET_DESTDIR", "I_ON".into());
+    }
+    if generator == "RPM" {
+        for key in [b"CPACK_PACKAGE_NAME".as_slice(), b"CPACK_PACKAGE_FILE_NAME"] {
+            if let Some(mut value) = cx.var(key) {
+                for byte in value.iter_mut().filter(|byte| **byte == b' ') {
+                    *byte = b'-';
+                }
+                cx.set_var(key, value);
+            }
+        }
+    }
+    if cx.var(b"CPACK_PACKAGE_DESCRIPTION").is_none()
+        && let Some(file) = cx.var(b"CPACK_PACKAGE_DESCRIPTION_FILE")
+    {
+        let path = absolute(cwd, &file);
+        let default = absolute(cwd, &cx.var_or_empty(b"CMAKE_ROOT"))
+            .join("Templates/CPack.GenericDescription.txt");
+        if path == default
+            || cx.var(b"CPACK_DEFAULT_PACKAGE_DESCRIPTION_FILE").as_ref() == Some(&file)
+        {
+            cx.set_var(b"CPACK_USED_DEFAULT_PACKAGE_DESCRIPTION_FILE", "ON".into());
+        }
+        let content = cx
+            .host()
+            .read(&path, ReadRange::All { limit: 1024 * 1024 })?;
+        let mut content = content.replace(b"\r\n", b"\n");
+        if !content.is_empty() && !content.ends_with(b"\n") {
+            content.push(b'\n');
+        }
+        cx.set_var(b"CPACK_PACKAGE_DESCRIPTION", BString::from(content));
+    }
+    Ok(())
 }
 
 fn publish(

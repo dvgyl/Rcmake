@@ -8,7 +8,7 @@ use rcmake_host::path::{from_native, to_native};
 
 use super::{
     check_file, export_options, fail, keyword, metadata, package_dependencies, record_request,
-    target_ids, unknown, value, values,
+    target_ids, unknown, value,
 };
 
 pub(super) fn command(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
@@ -59,22 +59,30 @@ pub(super) fn command(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     let name = match *signature {
         b"EXPORT" => Some(value(&mut args, b"EXPORT")?),
         b"TARGETS" => {
-            target_ids(cx, values(&mut args), false)?;
+            let names =
+                std::iter::from_fn(|| args.next_if(|token| !export_keyword(token))).collect();
+            target_ids(cx, names, false)?;
             None
         }
         _ => return Err(unknown(signature)),
     };
     let mut file = None;
+    let mut android = None;
     let mut append = false;
     while let Some(key) = args.next() {
         match key {
             b"FILE" => {
                 let name = value(&mut args, key)?;
-                check_file(name)?;
                 file = Some(BString::from(name));
             }
+            b"ANDROID_MK" if name.is_none() => {
+                android = args.next_if(|token| !export_keyword(token) && !token.is_empty());
+                if android.is_none() {
+                    return Err(fail("ANDROID_MK given no file name."));
+                }
+            }
             b"NAMESPACE" => {
-                if args.next_if(|token| !keyword(token)).is_none() {
+                if args.next_if(|token| !export_keyword(token)).is_none() {
                     return Err(fail(
                         [
                             *signature,
@@ -103,8 +111,23 @@ pub(super) fn command(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
     {
         return Err(fail([b"Export set \"", name, b"\" not found."].concat()));
     }
-    let file = file.or_else(|| name.map(|name| [name, b".cmake"].concat().into()));
+    if android.is_none()
+        && let Some(file) = &file
+    {
+        check_file(file)?;
+    }
+    let file = android
+        .map(BString::from)
+        .or(file)
+        .or_else(|| name.map(|name| [name, b".cmake"].concat().into()));
     if let Some(file) = file {
+        let path = to_native(&file);
+        if path.is_absolute() && !crate::compat::can_write_project_file(cx, &path) {
+            cx.set_fatal();
+            return Err(fail(format!(
+                r#"attempted to write the file "{file}" into a source directory."#
+            )));
+        }
         let output = Lexical::new(&from_native(
             &cx.current_binary_dir().join(to_native(&file)),
         ))
@@ -121,4 +144,8 @@ pub(super) fn command(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult {
         record_request(cx, "_RCMAKE_BUILD_EXPORT", input);
     }
     Ok(Flow::Normal)
+}
+
+fn export_keyword(token: &[u8]) -> bool {
+    token == b"ANDROID_MK" || keyword(token)
 }

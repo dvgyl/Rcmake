@@ -143,6 +143,8 @@ pub struct CreateRequest<'a> {
     options: &'a CreateOptions,
     deterministic_order: bool,
     skip_apple_double: bool,
+    root_tar_entries: bool,
+    threads: u32,
 }
 
 impl CreateOptions {
@@ -156,6 +158,18 @@ impl CreateOptions {
 }
 
 impl CreateRequest<'_> {
+    /// Prefix entry names with `./` and name the numeric tar owner and group `root`.
+    pub fn with_root_tar_entries(mut self) -> Self {
+        self.root_tar_entries = true;
+        self
+    }
+
+    /// Set the number of compression threads. Zero selects the codec default.
+    pub fn with_threads(mut self, threads: u32) -> Self {
+        self.threads = threads;
+        self
+    }
+
     /// Skip paired AppleDouble files during recursive walks.
     pub fn skipping_apple_double(mut self) -> Self {
         self.skip_apple_double = true;
@@ -169,6 +183,8 @@ impl<'a> From<&'a CreateOptions> for CreateRequest<'a> {
             options,
             deterministic_order: false,
             skip_apple_double: false,
+            root_tar_entries: false,
+            threads: 0,
         }
     }
 }
@@ -246,13 +262,18 @@ pub fn create_archive<'a>(
     inputs: &[PathBuf],
     options: impl Into<CreateRequest<'a>>,
 ) -> Result<Vec<BString>, ArchiveError> {
+    let request = options.into();
+    let threads = request.threads;
     create::run(
         host,
         output,
         base_dir,
         inputs,
-        options.into(),
-        create::Selection::default(),
+        request,
+        create::Selection {
+            threads,
+            ..Default::default()
+        },
     )
 }
 

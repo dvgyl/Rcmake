@@ -5,7 +5,9 @@
 //! classification) stays separate from link-line ordering.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
@@ -123,6 +125,8 @@ pub struct UsageResolver<'a> {
     pub(crate) pch_objects: IndexMap<(TargetId, rcmake_genex::ConfigId), Vec<BString>>,
     artifact_properties: Vec<(TargetId, rcmake_genex::ConfigId, BString)>,
     source_paths: Option<&'a SourcePaths<'a>>,
+    pub(crate) source_reads: Option<Rc<RefCell<IndexSet<TargetId>>>>,
+    traced_sources: Option<&'a IndexMap<TargetId, IndexSet<BString>>>,
     ids: Arc<[TargetId]>,
     parsed: ParseCache,
     memo: HashMap<MemoKey<'static>, Arc<WalkValue>>,
@@ -155,6 +159,8 @@ impl<'a> UsageResolver<'a> {
             pch_objects: IndexMap::new(),
             runtime_install_targets: IndexSet::new(),
             source_paths: None,
+            source_reads: None,
+            traced_sources: None,
             ids: model.targets().map(|(id, _)| id).collect(),
             parsed: ParseCache::default(),
             memo: HashMap::new(),
@@ -180,6 +186,16 @@ impl<'a> UsageResolver<'a> {
                     || target.props.get(link::EXCLUDE).is_some()
             }),
         }
+    }
+
+    /// Use the generated rule sources when evaluating target source properties.
+    #[must_use]
+    pub fn with_traced_sources(
+        mut self,
+        sources: &'a IndexMap<TargetId, IndexSet<BString>>,
+    ) -> Self {
+        self.traced_sources = Some(sources);
+        self
     }
 
     /// Attribute inherited usage to the consumer's first link edge for the File API.
@@ -256,6 +272,8 @@ impl<'a> UsageResolver<'a> {
             pch_objects: self.pch_objects.clone(),
             runtime_install_targets: IndexSet::new(),
             source_paths: None,
+            source_reads: self.source_reads.clone(),
+            traced_sources: self.traced_sources,
             ids: Arc::clone(&self.ids),
             parsed: ParseCache::default(),
             memo: HashMap::new(),
@@ -605,18 +623,22 @@ impl<'a> UsageResolver<'a> {
                 .as_ref()
                 .map(|value| Cow::Borrowed(value.0.as_slice())),
         };
-        if let Some(value) = self.memo.get(&key) {
+        if self.source_reads.is_none()
+            && let Some(value) = self.memo.get(&key)
+        {
             return Ok(Arc::clone(value));
         }
         key.head = ctx.head.and_then(|id| self.ids.get(id.0 as usize).copied());
-        if let Some(value) = self.memo.get(&key) {
+        if self.source_reads.is_none()
+            && let Some(value) = self.memo.get(&key)
+        {
             return Ok(Arc::clone(value));
         }
         let cycle_count = self.cycle_count;
         let value = Arc::new(
             self.with_property(target, name, |this| this.walk_uncached(target, name, ctx))?,
         );
-        if self.cycle_count == cycle_count {
+        if self.source_reads.is_none() && self.cycle_count == cycle_count {
             if !value.flags.head_sensitive {
                 key.head = None;
             }
@@ -667,6 +689,19 @@ impl<'a> UsageResolver<'a> {
             }
         } else if name == b"SOURCES" {
             self.eval_entries(id, name, &target.sources, ctx, &mut own)?;
+            if let Some(sources) = self.traced_sources.and_then(|sources| sources.get(&id)) {
+                let dir = self.model.dir(target.dir);
+                for source in sources {
+                    if !own.entries.iter().any(|entry| {
+                        [&dir.source_dir, &dir.binary_dir].into_iter().any(|base| {
+                            crate::sources::absolute_path(base, &entry.value) == *source
+                        })
+                    }) {
+                        own.entries
+                            .push(BT::new(source.clone(), target.backtrace.clone()));
+                    }
+                }
+            }
         } else if let Some(entries) = target.props.tracked_entries(name) {
             self.eval_entries(id, name, entries, ctx, &mut own)?;
         } else if let Some(raw) = target.props.get(name) {

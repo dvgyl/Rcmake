@@ -185,6 +185,10 @@ fn resolve_project(
                 .is_some_and(|value| truth::is_on(value))
         }),
     };
+    let file_generate_cycles = configured_targets
+        .iter()
+        .flat_map(|config| config.file_generate_cycles.iter().cloned())
+        .collect();
     let mut provenance = Provenance::default();
     let mut targets = Vec::new();
     let mut runtime_languages = IndexMap::new();
@@ -316,6 +320,7 @@ fn resolve_project(
     {
         toolchain.module_map_format = Some(format.as_str().into());
     }
+    let traced_sources = crate::sources::traced_sources(model, &configs, &graphs)?;
     crate::file_sets::clean_lint_fixes(model, host, &graphs);
     Ok(GenerationResult {
         configs,
@@ -325,6 +330,8 @@ fn resolve_project(
         compile_inputs,
         install,
         exports,
+        file_generate_cycles,
+        traced_sources,
         metadata,
         provenance_entries: provenance.entries,
         chains: options.provenance.then(|| Box::new(provenance.chains)),
@@ -443,6 +450,7 @@ struct ConfigTargets {
     targets: IndexMap<TargetId, ResolvedTarget>,
     inputs: IndexMap<TargetId, TargetInputs>,
     linked_object_sources: IndexSet<TargetId>,
+    file_generate_cycles: IndexSet<(DirId, BString)>,
 }
 
 /// Print a target evaluation error that permits the next target to resolve.
@@ -568,6 +576,17 @@ fn resolve_targets(
             &ctx,
         )?;
         assign_file_set_source_groups(model, target, &mut facts);
+        for source in &target_inputs.sources {
+            if paths
+                .output_source_reads
+                .get(source)
+                .is_some_and(|reads| reads.contains(&id))
+            {
+                configured
+                    .file_generate_cycles
+                    .insert((target.dir, source.clone()));
+            }
+        }
         configured.targets.insert(id, facts);
         configured.inputs.insert(id, target_inputs);
     }

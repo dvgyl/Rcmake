@@ -838,6 +838,10 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
         values.into_iter().collect()
     }
 
+    fn open_jobserver(&self, auth: &[u8]) -> Option<crate::JobServerPipe> {
+        self.base.open_jobserver(auth)
+    }
+
     fn supports_process_execution(&self) -> bool {
         false
     }

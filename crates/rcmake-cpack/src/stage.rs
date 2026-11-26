@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use rcmake_base::{BString, ByteSlice, hash::HashAlgo, truth};
+use rcmake_base::{BString, ByteSlice, hash::HashAlgo, list, truth};
 use rcmake_eval::Interp;
 use rcmake_host::path::{from_native, to_native};
 use rcmake_host::{CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest};
@@ -19,7 +19,7 @@ use crate::{
     safe_name,
 };
 
-mod component_files;
+pub(crate) mod component_files;
 
 /// Install the configured files into the staging directory.
 ///
@@ -88,7 +88,20 @@ pub(crate) fn install(
     } else {
         cfg
     };
-    let members = install_projects(host, cwd, options, &cfg, staging)?;
+    let (members, destinations) = install_projects(host, cwd, options, &cfg, staging)?;
+    if cfg.get(b"CPACK_GENERATOR") == Some(b"RPM") {
+        let mut all = Vec::new();
+        for (suffix, files) in destinations {
+            if !suffix.is_empty() {
+                let key = [b"CPACK_ABSOLUTE_DESTINATION_FILES_".as_slice(), &suffix].concat();
+                interp.cx().set_var(&key, list::join(&files));
+            }
+            all.extend(files);
+        }
+        interp
+            .cx()
+            .set_var(b"CPACK_ABSOLUTE_DESTINATION_FILES", list::join(&all));
+    }
     run_hooks(
         host.as_ref(),
         cwd,
@@ -113,17 +126,20 @@ pub(crate) fn run_hooks(
     Ok(())
 }
 
+type AbsoluteDestinations = BTreeMap<BString, Vec<BString>>;
+
 fn install_projects(
     host: &Arc<dyn Host>,
     cwd: &Path,
     options: &CPackOptions,
     cfg: &CpackConfig,
     staging: &Path,
-) -> Result<ComponentMembers, CpackError> {
+) -> Result<(ComponentMembers, AbsoluteDestinations), CpackError> {
     let mut members = ComponentMembers::new();
+    let mut absolute_files = AbsoluteDestinations::new();
     let project_key = b"CPACK_INSTALL_CMAKE_PROJECTS";
     if cfg.get(project_key).is_none_or(<[u8]>::is_empty) {
-        return Ok(members);
+        return Ok((members, absolute_files));
     }
     let generator = cfg.get(b"CPACK_CMAKE_GENERATOR").ok_or_else(|| {
         error(
@@ -138,7 +154,7 @@ fn install_projects(
         ));
     }
     if tuples.is_empty() {
-        return Ok(members);
+        return Ok((members, absolute_files));
     }
     let build_generator = build_generator(generator).ok_or_else(|| {
         error("Specified package generator not found. CPACK_CMAKE_GENERATOR value is invalid.")
@@ -184,7 +200,17 @@ fn install_projects(
                 let before = (record && separate)
                     .then(|| component_files::snapshot(host.as_ref(), &scanned))
                     .transpose()?;
-                install_project(host, options, cfg, &build, config, component, location)?;
+                let installed =
+                    install_project(host, options, cfg, &build, config, component, location)?;
+                let suffix = if separate {
+                    linux_suffix(cfg, component)
+                } else {
+                    b""
+                };
+                absolute_files
+                    .entry(suffix.into())
+                    .or_default()
+                    .extend(installed);
                 if let Some(before) = before {
                     let after = component_files::snapshot(host.as_ref(), &scanned)?;
                     let index = match members.iter().position(|item| &item.name == component) {
@@ -205,7 +231,7 @@ fn install_projects(
             }
         }
     }
-    Ok(members)
+    Ok((members, absolute_files))
 }
 
 // Archive generators package only the paths that each component install added.
@@ -232,7 +258,7 @@ fn install_destinations(
     components
         .into_iter()
         .map(|name| {
-            let mut destination = root.join(component_dir(&name));
+            let mut destination = root.join(component_dir(linux_suffix(cfg, &name)));
             if cfg.on(b"CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY") {
                 let file_name = safe_name(cfg.get(b"CPACK_PACKAGE_FILE_NAME").unwrap_or_default())?;
                 destination.push(file_name);
@@ -303,7 +329,7 @@ fn install_project(
     config: &[u8],
     component: &[u8],
     location: InstallLocation,
-) -> Result<(), CpackError> {
+) -> Result<Vec<BString>, CpackError> {
     let mut interp = interpreter(host, build, options, None)?;
     let _env = location.environment(host.as_ref());
     let mut cx = interp.cx();
@@ -327,6 +353,20 @@ fn install_project(
     {
         cx.set_var(b"CMAKE_INSTALL_DO_STRIP", "1".into());
     }
+    for (option, variable) in [
+        (
+            b"CPACK_WARN_ON_ABSOLUTE_INSTALL_DESTINATION".as_slice(),
+            b"CMAKE_WARN_ON_ABSOLUTE_INSTALL_DESTINATION".as_slice(),
+        ),
+        (
+            b"CPACK_ERROR_ON_ABSOLUTE_INSTALL_DESTINATION",
+            b"CMAKE_ERROR_ON_ABSOLUTE_INSTALL_DESTINATION",
+        ),
+    ] {
+        if let Some(value) = cfg.get(option) {
+            cx.set_var(variable, value.into());
+        }
+    }
     for entry in cfg.list(b"CPACK_CUSTOM_INSTALL_VARIABLES") {
         let (name, value) = entry.split_once_str(b"=").unwrap_or((&entry, b""));
         if !name.is_empty() {
@@ -340,7 +380,12 @@ fn install_project(
             file.display()
         )));
     }
-    Ok(())
+    Ok(list::split(
+        &interp
+            .cx()
+            .var_or_empty(b"CMAKE_ABSOLUTE_DESTINATION_FILES"),
+        list::Empty::Drop,
+    ))
 }
 
 // CPack can install a tree generated by CMake, including generators that Rcmake does not implement.
@@ -471,7 +516,33 @@ fn preinstall(
     )))
 }
 
+fn linux_suffix<'a>(cfg: &'a CpackConfig, component: &'a [u8]) -> &'a [u8] {
+    if !matches!(cfg.get(b"CPACK_GENERATOR"), Some(b"DEB" | b"RPM")) {
+        return component;
+    }
+    match grouping(cfg) {
+        ComponentGrouping::AllComponentsInOne => b"ALL_COMPONENTS_IN_ONE",
+        ComponentGrouping::OnePerGroup => component_group(cfg, component).unwrap_or(component),
+        ComponentGrouping::Ignore => component,
+    }
+}
+
 pub(crate) fn grouping(cfg: &CpackConfig) -> ComponentGrouping {
+    if matches!(cfg.get(b"CPACK_GENERATOR"), Some(b"DEB" | b"RPM")) {
+        return match cfg.get(b"CPACK_COMPONENTS_GROUPING") {
+            Some(b"ALL_COMPONENTS_IN_ONE") => ComponentGrouping::AllComponentsInOne,
+            Some(b"IGNORE") => ComponentGrouping::Ignore,
+            Some(b"ONE_PER_GROUP") => ComponentGrouping::OnePerGroup,
+            _ if cfg.get(b"CPACK_COMPONENTS_ONE_PACKAGE_PER_GROUP").is_some() => {
+                ComponentGrouping::OnePerGroup
+            }
+            _ if cfg.get(b"CPACK_COMPONENTS_IGNORE_GROUPS").is_some() => ComponentGrouping::Ignore,
+            _ if cfg.get(b"CPACK_COMPONENTS_ALL_IN_ONE_PACKAGE").is_some() => {
+                ComponentGrouping::AllComponentsInOne
+            }
+            _ => ComponentGrouping::OnePerGroup,
+        };
+    }
     match cfg.get(b"CPACK_COMPONENTS_GROUPING") {
         Some(value) if value.eq_ignore_ascii_case(b"ALL_COMPONENTS_IN_ONE") => {
             ComponentGrouping::AllComponentsInOne
@@ -491,6 +562,8 @@ pub(crate) fn grouping(cfg: &CpackConfig) -> ComponentGrouping {
 pub(crate) fn package_components(cfg: &CpackConfig, selection: &[u8]) -> Vec<BString> {
     let enabled = match cfg.get(b"CPACK_GENERATOR") {
         Some(b"External") => true,
+        Some(b"DEB") => cfg.on(b"CPACK_DEB_COMPONENT_INSTALL"),
+        Some(b"RPM") => cfg.on(b"CPACK_RPM_COMPONENT_INSTALL"),
         Some(b"DragNDrop") => cfg
             .get(b"CPACK_DMG_COMPONENT_INSTALL")
             .is_none_or(truth::is_on),

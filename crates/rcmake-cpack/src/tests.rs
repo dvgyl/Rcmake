@@ -24,7 +24,14 @@ fn registry_lists_package_generators() {
         generators::create(b"External").map(|g| g.extension()),
         Some(".json")
     );
-    assert!(generators::create(b"DEB").is_none());
+    assert_eq!(
+        generators::create(b"DEB").map(|g| g.extension()),
+        Some(".deb")
+    );
+    assert_eq!(
+        generators::create(b"RPM").map(|g| g.extension()),
+        Some(".rpm")
+    );
 }
 
 #[test]
@@ -976,3 +983,212 @@ set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
 }
 
 mod staging;
+
+fn seed_package_module(host: &PureHost, module: &str, script: &[u8]) -> BString {
+    let root = host.initial_cwd().join("cmake-root");
+    let dir = root.join("Modules/Internal/CPack");
+    host.create_dir_all(&dir).unwrap();
+    host.seed_file(&dir.join(module), script).unwrap();
+    from_native(&root)
+}
+
+#[test]
+fn deb_wraps_control_and_payload_tars_in_an_ar_archive() {
+    let host = memory_host();
+    let modules = seed_package_module(
+        &host,
+        "CPackDeb.cmake",
+        include_bytes!("../../../modules/cmake-4.5/Modules/Internal/CPack/CPackDeb.cmake"),
+    );
+    host.env_set(b"SOURCE_DATE_EPOCH", Some(b"42"));
+    let options = format!(
+        "set(CMAKE_ROOT \"{modules}\")\n{}",
+        r#"
+set(CPACK_OUTPUT_FILE_PREFIX dist)
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Summary")
+set(CPACK_PACKAGE_CONTACT "Maintainer")
+set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE all)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libc6")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_DEBIAN_COMPRESSION_TYPE bzip2)
+"#
+    );
+    let code = generators::tests::invoke(host.clone(), "DEB", &options);
+    assert_eq!(code, 0, "{}", host.stream_bytes(Stream::Stderr));
+    let root = host.initial_cwd();
+    let file = root.join("dist/sample_1_all.deb");
+    let bytes = generators::tests::read(host.as_ref(), &file);
+    let mut archive = bytes.strip_prefix(b"!<arch>\n").unwrap();
+    for name in ["debian-binary", "control.tar.gz", "data.tar.bz2"] {
+        let (header, rest) = archive.split_at(60);
+        assert_eq!(std::str::from_utf8(&header[..16]).unwrap().trim(), name);
+        assert_eq!(&header[16..28], b"42          ");
+        assert_eq!(&header[40..48], b"100644  ");
+        assert_eq!(&header[58..], b"`\n");
+        let size = std::str::from_utf8(&header[48..58])
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        let (data, rest) = rest.split_at(size);
+        if name == "debian-binary" {
+            assert_eq!(data, b"2.0\n");
+        } else {
+            host.seed_file(&root.join(name), data).unwrap();
+        }
+        archive = if size.is_multiple_of(2) {
+            rest
+        } else {
+            rest.strip_prefix(b"\n").unwrap()
+        };
+    }
+    assert!(archive.is_empty());
+    for (name, expected) in [
+        ("control.tar.gz", b"\x1f\x8b".as_slice()),
+        ("data.tar.bz2", b"BZh".as_slice()),
+    ] {
+        let tar = root.join(name);
+        assert!(generators::tests::read(host.as_ref(), &tar).starts_with(expected));
+        extract_archive(
+            host.as_ref(),
+            &tar,
+            &ExtractOptions {
+                destination: root.join("unpacked"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    let read = |name| generators::tests::read(host.as_ref(), &root.join("unpacked").join(name));
+    assert_eq!(read("readme.txt"), b"payload");
+    assert_eq!(
+        read("control"),
+        b"Architecture: all\nDepends: libc6\nDescription: Summary\nMaintainer: Maintainer\nPackage: sample\nPriority: optional\nSection: devel\nVersion: 1\nInstalled-Size: 1\n",
+    );
+    let hash = HashAlgo::Md5.hex_digest(b"payload");
+    assert_eq!(read("md5sums"), format!("{hash}  readme.txt\n").as_bytes());
+    let checksum = HashAlgo::Md5.hex_digest(&bytes);
+    assert_eq!(
+        generators::tests::read(host.as_ref(), &root.join("dist/sample_1_all.deb.md5")),
+        format!("{checksum}  sample_1_all.deb\n").as_bytes(),
+    );
+}
+
+#[test]
+fn rpm_runs_the_bundled_spec_and_rejects_a_failed_repeat() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let host = memory_host();
+    let modules = seed_package_module(
+        &host,
+        "CPackRPM.cmake",
+        include_bytes!("../../../modules/cmake-4.5/Modules/Internal/CPack/CPackRPM.cmake"),
+    );
+    let root = host.initial_cwd();
+    let output = root.join("_CPack_Packages/RPM");
+    let tool = root.join("rpmbuild");
+    let hook = root.join("post.cmake");
+    host.seed_file(&tool, b"").unwrap();
+    host.set_permissions(&tool, 0o755).unwrap();
+    host.seed_file(
+        &hook,
+        br#"
+list(LENGTH CPACK_PACKAGE_FILES count)
+if(NOT count EQUAL 1 OR NOT CPACK_PACKAGE_FILES MATCHES "/RPMS/[^/]+/Sample-Package[.]rpm$")
+  message(FATAL_ERROR "Unexpected RPM work files: ${CPACK_PACKAGE_FILES}")
+endif()
+if(NOT EXISTS "${CPACK_PACKAGE_FILES}")
+  message(FATAL_ERROR "The package was not created")
+endif()
+"#,
+    )
+    .unwrap();
+    let failing = Arc::new(AtomicBool::new(false));
+    let builds = Arc::new(AtomicUsize::new(0));
+    let observed_fail = Arc::clone(&failing);
+    let observed_builds = Arc::clone(&builds);
+    let work = output.clone();
+    let rpmbuild = from_native(&tool);
+    host.set_command_handler(move |host, request, _| {
+        let [command] = request.pipeline.as_slice() else {
+            panic!("Unexpected process request")
+        };
+        assert_eq!(command.program, rpmbuild);
+        let mut status = 0;
+        let stdout = match command.args.first().map(|arg| arg.as_slice()) {
+            Some(b"--version") => b"RPM version 4.19.1\n".to_vec(),
+            Some(b"--querytags") => b"NAME\nVERSION\nRELEASE\n".to_vec(),
+            Some(b"-bb") => {
+                observed_builds.fetch_add(1, Ordering::Relaxed);
+                let spec = work.join("SPECS/sample.spec");
+                assert_eq!(
+                    command.args,
+                    [
+                        BString::from("-bb"),
+                        "--define".into(),
+                        format!("_topdir {}", from_native(&work)).into(),
+                        "--buildroot".into(),
+                        "%_topdir/Sample-Package".into(),
+                        "--target".into(),
+                        "noarch".into(),
+                        from_native(&spec),
+                    ]
+                );
+                assert_eq!(request.cwd, work.join("Sample-Package"));
+                assert_eq!(request.timeout, Some(Duration::from_secs(300)));
+                let content = BString::from(generators::tests::read(host, &spec));
+                assert!(content.contains_str(b"Name:"));
+                assert!(content.contains_str(b"Summary:"));
+                assert!(content.contains_str(b"/readme.txt"));
+                for output in [&request.stdout, &request.stderr] {
+                    if let Output::File { path, .. } = output {
+                        host.seed_file(path, b"")?;
+                    }
+                }
+                let rpms = work.join("RPMS/noarch");
+                host.create_dir_all(&rpms)?;
+                // A failing tool can still leave a file. CPack must check the exit status.
+                host.seed_file(&rpms.join("Sample-Package.rpm"), b"rpm payload")?;
+                status = i32::from(observed_fail.load(Ordering::Relaxed));
+                Vec::new()
+            }
+            _ => panic!("Unexpected rpmbuild arguments: {:?}", command.args),
+        };
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(status)],
+            stdout,
+            ..Default::default()
+        })
+    })
+    .unwrap();
+    let options = format!(
+        r#"
+set(CMAKE_ROOT "{modules}")
+set(RPMBUILD_EXECUTABLE "{tool}")
+set(CPACK_PACKAGE_DESCRIPTION "Description")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Summary")
+set(CPACK_RPM_PACKAGE_ARCHITECTURE noarch)
+set(CPACK_REMOVE_TOPLEVEL_DIRECTORY OFF)
+set(CPACK_OUTPUT_FILE_PREFIX dist)
+set(CPACK_POST_BUILD_SCRIPTS "{hook}")
+"#,
+        tool = from_native(&tool),
+        hook = from_native(&hook),
+    );
+    assert_eq!(
+        generators::tests::invoke(host.clone(), "RPM", &options),
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let published = root.join("dist/Sample-Package.rpm");
+    assert_eq!(
+        generators::tests::read(host.as_ref(), &published),
+        b"rpm payload"
+    );
+    host.remove_file(&published).unwrap();
+    failing.store(true, Ordering::Relaxed);
+    assert_eq!(generators::tests::invoke(host.clone(), "RPM", &options), 1);
+    assert!(host.metadata(&published, Follow::No).is_err());
+    assert_eq!(builds.load(Ordering::Relaxed), 2);
+}

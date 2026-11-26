@@ -242,6 +242,45 @@ pub(crate) fn interpreter(
 fn register_cpack_commands(registry: &mut Registry) {
     rcmake_commands::register_all(registry);
 
+    static EXECUTE_PROCESS: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((builtin, flags)) = registry.get(b"execute_process") {
+        EXECUTE_PROCESS.get_or_init(|| builtin);
+        registry.add(
+            "execute_process",
+            |cx, args| {
+                let Some(builtin) = EXECUTE_PROCESS.get() else {
+                    return Ok(Flow::Normal);
+                };
+                let module = cx.var_or_empty(b"_RCMAKE_CPACK_INTERNAL_MODULE");
+                if module.is_empty() || cx.current_list_file() != module {
+                    return builtin(cx, args);
+                }
+                let rpm_build = args.windows(2).any(|pair| {
+                    matches!(pair, [key, value] if key.value == "RESULT_VARIABLE"
+                        && value.value == "CPACK_RPMBUILD_EXEC_RESULT")
+                });
+                let mut bounded = args.to_vec();
+                if !args.iter().any(|arg| arg.value == "TIMEOUT")
+                    && let Some(arg) = args.first()
+                {
+                    let mut keyword = arg.clone();
+                    keyword.value = "TIMEOUT".into();
+                    bounded.push(keyword);
+                    let mut limit = arg.clone();
+                    limit.value = "300".into();
+                    bounded.push(limit);
+                }
+                let result = builtin(cx, &bounded)?;
+                if rpm_build {
+                    let status = cx.var_or_empty(b"CPACK_RPMBUILD_EXEC_RESULT");
+                    cx.set_parent_scope(b"_RCMAKE_CPACK_RPMBUILD_STATUS", Some(status));
+                }
+                Ok(result)
+            },
+            flags,
+        );
+    }
+
     static GET_PROPERTY: OnceLock<BuiltinFn> = OnceLock::new();
     if let Some((builtin, flags)) = registry.get(b"get_property") {
         GET_PROPERTY.get_or_init(|| builtin);

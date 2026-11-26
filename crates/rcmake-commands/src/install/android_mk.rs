@@ -16,11 +16,12 @@ pub(super) fn parse(
     const SIGNATURE: &[u8] = b"EXPORT_ANDROID_MK";
     let set = args.next_if(|token| !keyword(token)).unwrap_or_default();
     let mut file = b"".as_slice();
+    let mut namespace = b"".as_slice();
     while let Some(key) = args.next() {
         match key {
             b"FILE" => file = args.next_if(|token| !keyword(token)).unwrap_or_default(),
             b"NAMESPACE" => {
-                args.next_if(|token| !keyword(token));
+                namespace = args.next_if(|token| !keyword(token)).unwrap_or_default();
             }
             b"EXPORT_LINK_INTERFACE_LIBRARIES"
             | b"OPTIONAL"
@@ -49,7 +50,16 @@ pub(super) fn parse(
         "The FILE argument must specify a name ending in \".mk\"."
     } else {
         ensure_export_set(cx, set);
-        return Ok(InstallKind::Code(BString::default()));
+        return Ok(InstallKind::Export {
+            set: set.into(),
+            namespace: namespace.into(),
+            file: Some(if file.is_empty() {
+                BString::from("Android.mk")
+            } else {
+                file.into()
+            }),
+            cxx_modules_directory: None,
+        });
     };
     Err(fail(format!(
         "EXPORT_ANDROID_MK given invalid export file name \"{}\".  {problem}",

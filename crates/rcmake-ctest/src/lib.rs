@@ -22,6 +22,7 @@ mod discover;
 mod discovery;
 mod execution;
 mod instrumentation;
+mod jobserver;
 mod junit;
 mod launch;
 mod measurements;
@@ -54,6 +55,8 @@ pub struct CtestOptions {
     pub exclude_labels: Vec<BString>,
     /// Maximum number of concurrent test processes (`-j`). Zero uses one job.
     pub jobs: usize,
+    /// Use the jobserver limit when the parallel option has no value.
+    pub jobs_automatic: bool,
     /// Print output from failed tests (`--output-on-failure`).
     pub output_on_failure: bool,
     /// Print commands and test output (`-V`, `--verbose`).
@@ -82,6 +85,7 @@ impl Default for CtestOptions {
             include_labels: Vec::new(),
             exclude_labels: Vec::new(),
             jobs: 1,
+            jobs_automatic: false,
             output_on_failure: false,
             verbose: false,
             quiet: false,

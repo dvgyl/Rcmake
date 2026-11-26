@@ -143,6 +143,10 @@ impl<'a> Report<'a> {
         self.write(format_args!("Test project {}\n", path.display()));
     }
 
+    pub(crate) fn jobserver_connected(&self) {
+        self.write(format_args!("Connected to MAKE jobserver\n"));
+    }
+
     pub(crate) fn list(&self, plan: &Plan) {
         self.announce_tests();
         for test in &plan.tests {

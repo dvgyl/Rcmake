@@ -43,6 +43,10 @@ pub struct GenerationResult {
     pub install: InstallManifest,
     /// `install(EXPORT)` and `export()` plans.
     pub exports: Vec<ExportPlan>,
+    /// Output paths that depend on the sources of a target that uses them.
+    pub file_generate_cycles: IndexSet<(rcmake_model::DirId, BString)>,
+    /// Generated command sources by target, in dependency trace order.
+    pub traced_sources: IndexMap<TargetId, IndexSet<BString>>,
     /// Non-target metadata.
     pub metadata: ConfigureMetadata,
     /// Resolved entries for which the caller requested provenance.
@@ -790,6 +794,10 @@ pub struct BuildGraph {
     pub native_custom_steps: IndexSet<usize>,
     /// Output command ownership indexed by graph step.
     pub custom_output_owners: IndexMap<usize, CustomOutputOwners>,
+    /// Main dependencies that serve as the source of a custom output command.
+    pub custom_main_sources: IndexMap<usize, BString>,
+    /// Custom output command steps in source dependency discovery order.
+    pub custom_source_steps: IndexMap<TargetId, IndexSet<usize>>,
     /// Project target identities in graph order, before synthetic targets.
     pub target_ids: Vec<TargetId>,
     /// Steps that run custom target commands.
@@ -829,6 +837,8 @@ pub struct ExportedTarget {
     pub xcframework_locations: IndexMap<BString, BString>,
     /// Source file sets to declare on the imported target.
     pub source_sets: Vec<ExportedSourceSet>,
+    /// Target properties for an Android.mk export.
+    pub android: Option<AndroidExportTarget>,
 }
 
 /// A source file set for one imported target.
@@ -846,6 +856,21 @@ pub struct ExportedSourceSet {
     pub properties: IndexMap<BString, BString>,
 }
 
+/// Resolved values for one Android.mk target block.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AndroidExportTarget {
+    /// Artifact path used by the import.
+    pub artifact: BString,
+    /// Ordered shared library references.
+    pub shared: Vec<BString>,
+    /// Ordered static library references.
+    pub static_libraries: Vec<BString>,
+    /// Ordered raw library references.
+    pub ldlibs: Vec<BString>,
+    /// Whether a static library uses C++.
+    pub has_cpp: bool,
+}
+
 /// An `install(EXPORT)` or `export()` file plan.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExportPlan {
@@ -859,6 +884,10 @@ pub struct ExportPlan {
     pub cxx_modules_directory: Option<BString>,
     /// `true` for `install(EXPORT)`, `false` for `export()`.
     pub install: bool,
+    /// Write Android.mk syntax.
+    pub android: bool,
+    /// Append to an existing Android.mk file.
+    pub append: bool,
     /// Path syntax of the target system. An absent value uses the host syntax.
     pub windows_paths: Option<bool>,
     /// Targets in order.

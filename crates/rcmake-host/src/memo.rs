@@ -696,6 +696,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         scratch_file,
         scratch_file_in,
         supports_process_execution,
+        open_jobserver,
     );
 }
 

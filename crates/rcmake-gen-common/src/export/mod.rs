@@ -13,6 +13,7 @@ use rcmake_resolve::{ExportPlan, ExportedTarget};
 
 use crate::{GenError, quote, quoted_content, write_output};
 
+mod android_mk;
 pub mod cps;
 mod generate;
 mod modules;
@@ -32,6 +33,9 @@ const END_IMPORT_VERSION: &[u8] = b"unset(CMAKE_IMPORT_FILE_VERSION)\n";
 /// Render the main export file. For an install export, assume the file goes in the
 /// root of the install prefix. The main file loads any installed configuration files.
 pub fn render(plan: &ExportPlan) -> Result<BString, GenError> {
+    if plan.android {
+        return Ok(android_mk::render(plan, b""));
+    }
     render_main(plan, b"", None, b"")
 }
 
@@ -59,8 +63,22 @@ pub fn write_export_plan_with_prefix(
     host: &dyn Host,
 ) -> Result<Vec<PathBuf>, GenError> {
     let destination = install_dest.unwrap_or_default();
-    let main = render_main(plan, destination, install_prefix, b"")?;
     let path = export_output_directory(plan, out_dir, destination).join(to_native(&plan.file));
+    if plan.android {
+        let content = android_mk::render(plan, destination);
+        if plan.append {
+            if let Some(parent) = path.parent() {
+                host.create_dir_all(parent)
+                    .map_err(|error| crate::write_error(parent, error))?;
+            }
+            host.write(&path, &content, rcmake_host::WriteMode::Append)
+                .map_err(|error| crate::write_error(&path, error))?;
+        } else {
+            write_output(host, &path, &content)?;
+        }
+        return Ok(vec![path]);
+    }
+    let main = render_main(plan, destination, install_prefix, b"")?;
     let mut files = vec![(path.clone(), main)];
     if plan.install {
         for (config, targets) in configurations(plan) {

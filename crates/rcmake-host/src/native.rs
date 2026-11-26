@@ -526,6 +526,60 @@ impl Host for NativeHost {
             .unwrap_or_default()
     }
 
+    #[cfg(unix)]
+    fn open_jobserver(&self, auth: &[u8]) -> Option<crate::JobServerPipe> {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+        let is_fifo = |path: &Path| fs::metadata(path).is_ok_and(|meta| meta.file_type().is_fifo());
+        let nonblocking = rustix::fs::OFlags::NONBLOCK.bits().cast_signed();
+        let (reader, writer) = if let Some(name) = auth.strip_prefix(b"fifo:") {
+            let path = self.initial_cwd.join(crate::path::to_native(name));
+            if !is_fifo(&path) {
+                return None;
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nonblocking)
+                .open(path)
+                .ok()?;
+            let writer = file.try_clone().ok()?;
+            (file, writer)
+        } else {
+            let (read, write) = std::str::from_utf8(auth).ok()?.split_once(',')?;
+            let prefix = if cfg!(target_os = "linux") {
+                "/proc/self/fd"
+            } else {
+                "/dev/fd"
+            };
+            let read = PathBuf::from(format!("{prefix}/{}", read.parse::<u32>().ok()?));
+            let write = PathBuf::from(format!("{prefix}/{}", write.parse::<u32>().ok()?));
+            if !is_fifo(&read) || !is_fifo(&write) {
+                return None;
+            }
+            let reader = OpenOptions::new()
+                .read(true)
+                .custom_flags(nonblocking)
+                .open(read)
+                .ok()?;
+            let writer = OpenOptions::new()
+                .write(true)
+                .custom_flags(nonblocking)
+                .open(write)
+                .ok()?;
+            (reader, writer)
+        };
+        let read_meta = reader.metadata().ok()?;
+        let write_meta = writer.metadata().ok()?;
+        if !read_meta.file_type().is_fifo() || !write_meta.file_type().is_fifo() {
+            return None;
+        }
+        Some(crate::JobServerPipe {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+        })
+    }
+
     fn run(
         &self,
         req: &RunRequest,
@@ -666,6 +720,34 @@ impl Host for NativeHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn jobserver_opens_a_fifo_and_rejects_other_files() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let fifo = dir.path().join("make fifo");
+        if !std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()?
+            .success()
+        {
+            return Err(io::Error::other("Cannot create test FIFO"));
+        }
+        let host = NativeHost::new().map_err(io::Error::other)?;
+        let auth = |path: &Path| [b"fifo:".as_slice(), &crate::path::from_native(path)].concat();
+        let mut pipe = host
+            .open_jobserver(&auth(&fifo))
+            .ok_or_else(|| io::Error::other("Cannot open test FIFO"))?;
+        pipe.writer.write_all(b"+")?;
+        let mut byte = [0];
+        pipe.reader.read_exact(&mut byte)?;
+        assert_eq!(byte, *b"+");
+        let file = dir.path().join("file");
+        fs::write(&file, b"file")?;
+        assert!(host.open_jobserver(&auth(&file)).is_none());
+        assert!(host.open_jobserver(b"2147483647,2147483646").is_none());
+        Ok(())
+    }
 
     #[test]
     fn sets_link_times_without_changing_the_target() -> HostResult<()> {

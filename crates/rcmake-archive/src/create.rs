@@ -10,8 +10,8 @@ use tar::{Builder, EntryType, Header};
 
 use crate::pattern::Patterns;
 use crate::{
-    ArchiveError, ArchiveFormat, CreateOptions, CreateRequest, MAX_ENTRIES, absolute,
-    archive_error, archive_name, checked_name, emit_names, read_bytes, relative_path, size_limit,
+    ArchiveError, ArchiveFormat, CreateRequest, MAX_ENTRIES, absolute, archive_error, archive_name,
+    checked_name, emit_names, read_bytes, relative_path, size_limit,
 };
 use crate::{TarCompression, ZipCompression, codec::Encoder, seven_zip, timestamp, zip_codec};
 
@@ -43,7 +43,7 @@ pub(super) fn run(
         .map(timestamp::seconds);
     let mut archive = Creation {
         host,
-        writer: Writer::new(options, selection.threads)?,
+        writer: Writer::new(&request, selection.threads)?,
         zone: host.time_zone(),
         mtime,
         whole_second_mtime: !selection.header.is_empty(),
@@ -75,6 +75,8 @@ pub(super) fn run(
         };
         let name = if name.is_empty() {
             BString::from(".")
+        } else if request.root_tar_entries {
+            BString::from([b"./".as_slice(), &name].concat())
         } else {
             name
         };
@@ -139,6 +141,9 @@ impl Creation<'_> {
         mut name: BString,
         siblings: Option<&HashSet<&[u8]>>,
     ) -> Result<(), ArchiveError> {
+        if name.iter().filter(|&&byte| byte == b'/').count() > crate::MAX_DEPTH {
+            return Err(ArchiveError::new("Archive input depth exceeds the limit"));
+        }
         if self.allow_outside {
             checked_name(&name)?;
         } else {
@@ -296,8 +301,9 @@ enum Writer {
 }
 
 impl Writer {
-    fn new(options: &CreateOptions, threads: u32) -> Result<Self, ArchiveError> {
+    fn new(request: &CreateRequest<'_>, threads: u32) -> Result<Self, ArchiveError> {
         use ArchiveFormat::*;
+        let options = request.options;
         let level = options.compression_level;
         let (gnu, filter) = match options.format {
             Tar => (false, None),
@@ -360,6 +366,7 @@ impl Writer {
         Ok(Self::Tar(TarWriter {
             builder: Box::new(Builder::new(encoder)),
             gnu,
+            root_owner: request.root_tar_entries,
             metadata_left: 16 * 1024 * 1024,
         }))
     }
@@ -375,14 +382,14 @@ impl Writer {
     ) -> Result<(), ArchiveError> {
         match self {
             Self::Raw { encoder, written } => {
-                if *written {
-                    return Err(ArchiveError::new(
-                        "archive_write_header: Raw format only supports one entry per archive",
-                    ));
-                }
                 if metadata.kind != FileKind::File {
                     return Err(ArchiveError::new(
                         "archive_write_header: Raw format only supports filetype AE_IFREG",
+                    ));
+                }
+                if *written {
+                    return Err(ArchiveError::new(
+                        "archive_write_header: Raw format only supports one entry per archive",
                     ));
                 }
                 encoder.write_all(contents).map_err(archive_error)?;
@@ -426,6 +433,7 @@ impl Writer {
 struct TarWriter {
     builder: Box<Builder<Encoder>>,
     gnu: bool,
+    root_owner: bool,
     metadata_left: u64,
 }
 
@@ -458,6 +466,10 @@ impl TarWriter {
         header.set_mode(mode);
         header.set_uid(0);
         header.set_gid(0);
+        if self.root_owner {
+            header.set_username("root").map_err(archive_error)?;
+            header.set_groupname("root").map_err(archive_error)?;
+        }
         header.set_mtime(u64::try_from(mtime.secs).unwrap_or_default());
         header.set_entry_type(kind);
         header.set_size(if kind == EntryType::Regular {

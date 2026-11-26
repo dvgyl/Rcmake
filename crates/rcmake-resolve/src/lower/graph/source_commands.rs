@@ -34,6 +34,7 @@ impl TargetPlan<'_> {
             let source = crate::sources::absolute_path(&dir.source_dir, &path);
             let input = build_relative(model, &Lexical::new(&source).normalize());
             if let Some(step) = commands.source_attachment(target.dir, &input) {
+                self.source_command_roots.insert(step);
                 commands.add_producers([step], &mut self.steps, &mut self.dependencies)?;
             }
             let object_depends = crate::sources::properties(dir, &source)
@@ -52,6 +53,7 @@ impl TargetPlan<'_> {
                     })
                     .unwrap_or(direct);
                 if let Some(producer) = commands.file_producer(&input) {
+                    self.source_command_roots.insert(producer);
                     commands.add_producers([producer], &mut self.steps, &mut self.dependencies)?;
                 }
                 if let Some(&owner) = commands
@@ -69,6 +71,7 @@ impl TargetPlan<'_> {
             for base in [&dir.source_dir, &dir.binary_dir] {
                 let input = command_path(model, base, &path);
                 if let Some(step) = commands.producer(&input) {
+                    self.source_command_roots.insert(step);
                     commands.add_producers([step], &mut self.steps, &mut self.dependencies)?;
                     if ninja
                         && let Some(file) =

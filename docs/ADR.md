@@ -962,3 +962,10 @@ nesting.
 for each level, for example backtrace frames.
 
 Sources: [stack guard](../crates/rcmake-eval/src/stack_guard.rs), [command dispatch](../crates/rcmake-eval/src/interp/dispatch.rs), [block bodies](../crates/rcmake-eval/src/flow/mod.rs), [CLI entry point](../crates/rcmake-cli/src/main.rs), [probe pool](../crates/rcmake-commands/src/configure/probe_pool.rs), [API runner](../crates/rcmake-api/src/runner.rs), [WebAssembly entry point](../crates/rcmake-wasm/src/project.rs), and [LSP evaluation thread](../crates/rcmake-lsp/src/stdio_eval.rs).
+
+## ADR-038 GNU make jobserver access
+
+CTest reads GNU make tokens through `Host::open_jobserver`. Unix hosts open
+a FIFO or reopen inherited pipe descriptors with safe file APIs. One test
+can use the implicit token. Each additional test returns its pipe token
+when it finishes. Hosts without a jobserver use the local parallel limit.

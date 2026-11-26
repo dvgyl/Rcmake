@@ -21,6 +21,7 @@ use crate::{
 };
 
 mod generated;
+pub(crate) use generated::traced_sources;
 
 #[derive(Clone, Copy)]
 enum SourceUsage {
@@ -336,6 +337,7 @@ pub(crate) struct SourcePaths<'a> {
     root_source_dir: Option<BString>,
     absolute_sources: IndexMap<BString, IndexSet<BString>>,
     generated: IndexMap<BString, IndexSet<BString>>,
+    pub(crate) output_source_reads: IndexMap<BString, IndexSet<TargetId>>,
     objects: IndexMap<BString, TargetId>,
     header_only: IndexMap<DirId, IndexSet<BString>>,
     pub(crate) unity: Option<crate::unity::UnityPlan>,
@@ -357,6 +359,7 @@ impl<'a> SourcePaths<'a> {
             root_source_dir: None,
             absolute_sources: IndexMap::new(),
             generated: IndexMap::new(),
+            output_source_reads: IndexMap::new(),
             objects: IndexMap::new(),
             header_only: IndexMap::new(),
             unity: None,
@@ -399,6 +402,7 @@ impl<'a> SourcePaths<'a> {
         config: &ConfigId,
     ) -> Result<(), ResolveError> {
         self.generated.clear();
+        self.output_source_reads.clear();
         let mut usage = UsageResolver::new(model).with_ide(self.ide);
         let mut errors = Vec::new();
         for (_, command) in model.commands() {

@@ -6,17 +6,21 @@ use rcmake_diag::{
     Diagnostic, Effect, MessageKind, PolicyId, PolicyStatus, RenderOptions,
     render as render_diagnostic,
 };
-use rcmake_genex::{ConfigId, EvalContext, GenexNode, PreprocessMode, TargetHandle, render};
+use rcmake_genex::{
+    ArtifactKind, ArtifactPart, ConfigId, EvalContext, GenexNode, PreprocessMode, TargetHandle,
+    UsageTraversal, render,
+};
 use rcmake_model::{
     DirId, ExportDependencyMode, ExportSet, InstallKind, InstallRule, ProjectModel, Target,
     TargetId, TargetKind,
 };
 
 use crate::{
-    ExportPlan, ExportedTarget, InstallActionKind, InstallManifest, ResolveError, ResolvedTarget,
+    AndroidExportTarget, ExportPlan, ExportedTarget, InstallActionKind, InstallManifest,
+    ResolveError, ResolvedTarget,
     export_links::{self, ExportCatalog, ExportPlacement},
     sources::absolute_path,
-    usage::UsageResolver,
+    usage::{ResolvedLinkKind, UsageResolver},
 };
 
 pub(crate) mod source_sets;
@@ -107,11 +111,27 @@ pub(crate) fn resolve_exports(
             file: file.clone().unwrap_or_else(|| export_filename(set)),
             cxx_modules_directory: cxx_modules_directory.clone(),
             install: true,
+            android: model
+                .global
+                .props
+                .get(format!("_RCMAKE_INSTALL_{index}_ARG0").as_bytes())
+                .is_some_and(|name| name == "EXPORT_ANDROID_MK"),
             windows_paths: export_windows_paths(model, rule.dir),
             ..ExportPlan::default()
         };
         let mut packages = IndexSet::new();
         for &id in &members.targets {
+            if plan.android {
+                plan.targets.push(android_target(
+                    model,
+                    usage,
+                    targets,
+                    configs,
+                    id,
+                    Some(install),
+                )?);
+                continue;
+            }
             let mut target = export_target(
                 model,
                 usage,
@@ -184,6 +204,11 @@ pub(crate) fn resolve_exports(
         let mut packages = IndexSet::new();
         validate_members(model, &members, None)?;
         for &id in &members {
+            if plan.android {
+                plan.targets
+                    .push(android_target(model, usage, targets, configs, id, None)?);
+                continue;
+            }
             let mut target = export_target(
                 model,
                 usage,
@@ -216,6 +241,107 @@ pub(crate) fn resolve_exports(
         plans.push(plan);
     }
     Ok(plans)
+}
+
+fn android_target(
+    model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
+    facts: &[ResolvedTarget],
+    configs: &[ConfigId],
+    id: TargetId,
+    install: Option<&InstallManifest>,
+) -> Result<ExportedTarget, ResolveError> {
+    let mut target = export_target(
+        model,
+        usage,
+        b"",
+        id,
+        facts.iter().filter(|facts| facts.id == id),
+        ExportOptions {
+            install,
+            legacy_interface: false,
+        },
+    )?;
+    target
+        .properties
+        .retain(|key, value| key.starts_with(b"INTERFACE_") && !value.is_empty());
+    let config = configs.first().cloned().unwrap_or_default();
+    let context = EvalContext {
+        config: config.clone(),
+        traversal: UsageTraversal::Link,
+        ..EvalContext::default()
+    };
+    let artifact = if install.is_some() {
+        let installed = target
+            .config_properties
+            .get(&config.0)
+            .and_then(|properties| properties.get(b"IMPORTED_LOCATION".as_slice()));
+        if let Some(installed) = installed {
+            rcmake_genex::rewrite_install_prefix(installed, b"$(_IMPORT_PREFIX)")
+        } else {
+            BString::default()
+        }
+    } else {
+        usage
+            .artifact(
+                id,
+                ArtifactKind::File,
+                ArtifactPart::Full,
+                &ConfigId::default(),
+            )
+            .unwrap_or_default()
+    };
+    let mut android = AndroidExportTarget {
+        artifact,
+        ..AndroidExportTarget::default()
+    };
+    let kind = |id| model.target(id).map(|target| target.kind);
+    for link in usage.direct_link_items(id, true, &context)?.iter() {
+        let text = &link.text.value;
+        match link.kind {
+            ResolvedLinkKind::Library(dep)
+            | ResolvedLinkKind::Objects(dep)
+            | ResolvedLinkKind::Interface(dep) => {
+                if matches!(
+                    kind(dep),
+                    Some(TargetKind::SharedLibrary | TargetKind::ModuleLibrary)
+                ) {
+                    android.shared.push(text.clone());
+                } else {
+                    android.static_libraries.push(text.clone());
+                }
+            }
+            _ if Lexical::new(text).absolute()
+                || text.starts_with(b"-l")
+                || install.is_some() && text.starts_with(b"../") =>
+            {
+                android.ldlibs.push(text.clone())
+            }
+            _ if !text.is_empty() => android
+                .ldlibs
+                .push([b"-l".as_slice(), text].concat().into()),
+            _ => {}
+        }
+    }
+    if kind(id) == Some(TargetKind::StaticLibrary) {
+        let uses_cpp = |id| {
+            facts.iter().any(|facts| {
+                facts.id == id
+                    && facts.config == config
+                    && facts
+                        .compile_groups
+                        .iter()
+                        .any(|group| group.language == "CXX")
+            })
+        };
+        android.has_cpp = uses_cpp(id)
+            || usage
+                .direct_link_items(id, false, &context)?
+                .iter()
+                .any(|link| matches!(link.kind, ResolvedLinkKind::Objects(dep) if uses_cpp(dep)));
+    }
+    target.android = Some(android);
+    Ok(target)
 }
 
 struct BuildExport {
@@ -259,6 +385,7 @@ fn build_exports(model: &ProjectModel) -> Result<IndexMap<BString, BuildExport>,
                         matches!(
                             *name,
                             b"FILE"
+                                | b"ANDROID_MK"
                                 | b"NAMESPACE"
                                 | b"APPEND"
                                 | b"EXPORT_LINK_INTERFACE_LIBRARIES"
@@ -281,6 +408,7 @@ fn build_exports(model: &ProjectModel) -> Result<IndexMap<BString, BuildExport>,
         };
         let mut namespace = BString::default();
         let mut file = export_filename(&set);
+        let mut android = None;
         let mut export_packages = false;
         let mut legacy_interface = false;
         let mut append = false;
@@ -288,10 +416,12 @@ fn build_exports(model: &ProjectModel) -> Result<IndexMap<BString, BuildExport>,
         while let Some((key, rest)) = options.split_first() {
             options = rest;
             match *key {
-                b"FILE" | b"NAMESPACE" | b"CXX_MODULES_DIRECTORY" => {
+                b"FILE" | b"ANDROID_MK" | b"NAMESPACE" | b"CXX_MODULES_DIRECTORY" => {
                     let (arg, rest) = options.split_first().ok_or_else(invalid_export_record)?;
                     if *key == b"FILE" {
                         file = (*arg).into();
+                    } else if *key == b"ANDROID_MK" {
+                        android = Some(BString::from(*arg));
                     } else if *key == b"NAMESPACE" {
                         namespace = (*arg).into();
                     } else {
@@ -305,7 +435,7 @@ fn build_exports(model: &ProjectModel) -> Result<IndexMap<BString, BuildExport>,
                 _ => return Err(invalid_export_record()),
             }
         }
-        let file = absolute_path(&directory.binary_dir, &file);
+        let file = absolute_path(&directory.binary_dir, android.as_ref().unwrap_or(&file));
         if append && let Some(existing) = build_plans.get_mut(&file) {
             existing.members.extend(ids);
             existing.legacy_interface |= legacy_interface;
@@ -317,6 +447,8 @@ fn build_exports(model: &ProjectModel) -> Result<IndexMap<BString, BuildExport>,
                         set,
                         namespace,
                         file,
+                        android: android.is_some(),
+                        append,
                         cxx_modules_directory,
                         windows_paths: export_windows_paths(model, dir),
                         ..ExportPlan::default()

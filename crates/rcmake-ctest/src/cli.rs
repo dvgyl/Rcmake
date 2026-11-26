@@ -714,6 +714,7 @@ impl Invocation {
             let raw = env(b"CTEST_PARALLEL_LEVEL")?;
             parse_jobs(b"--parallel", Some(&raw)).ok()
         });
+        self.options.jobs_automatic = matches!(jobs, Some(TestJobs::Automatic));
         self.options.jobs = match jobs {
             None => 1,
             Some(TestJobs::Automatic) => processor_count(host).max(2),

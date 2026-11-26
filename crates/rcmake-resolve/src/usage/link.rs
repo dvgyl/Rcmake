@@ -371,7 +371,8 @@ impl<'a> UsageResolver<'a> {
             debug: self.debug_config(ctx),
             traversal: ctx.traversal,
         };
-        if let Some(links) = self.link_memo.get(&key)
+        if self.source_reads.is_none()
+            && let Some(links) = self.link_memo.get(&key)
             && (self.active.is_empty() || !links.1.context_sensitive)
         {
             return Ok(links.clone());
@@ -383,7 +384,8 @@ impl<'a> UsageResolver<'a> {
         let links: SharedLinks = (items.into_iter().map(Arc::new).collect(), flags);
         // Other expressions can read target properties and enter a usage walk.
         // During a property walk, evaluate any remaining expression to check its depth.
-        if (interface || !self.has_injections)
+        if self.source_reads.is_none()
+            && (interface || !self.has_injections)
             && (self.active.is_empty() || !flags.context_sensitive)
             && entries.iter().all(|entry| literal_link(&entry.text.value))
         {

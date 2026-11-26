@@ -16,7 +16,7 @@ const MAX_DEPTH: usize = 256;
 ///
 /// The list contains directories, files, symbolic links, and other entries. It skips
 /// AppleDouble (`._*`) entries. A missing directory has no entries.
-pub(super) fn snapshot(host: &dyn Host, dir: &Path) -> Result<BTreeSet<PathBuf>, CpackError> {
+pub(crate) fn snapshot(host: &dyn Host, dir: &Path) -> Result<BTreeSet<PathBuf>, CpackError> {
     let mut paths = BTreeSet::new();
     match host.metadata(dir, Follow::No) {
         Ok(meta) if meta.kind == FileKind::Dir => {}

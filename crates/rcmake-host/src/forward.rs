@@ -61,6 +61,7 @@ macro_rules! forward_host {
     };
     (@ $base:ident, process) => {
         $crate::forward_host!(@ $base, supports_process_execution);
+        $crate::forward_host!(@ $base, open_jobserver);
         $crate::forward_host!(@method $base, run(req: &$crate::RunRequest,
             on_output: &mut dyn FnMut($crate::Stream, &[u8]),
         ) -> $crate::HostResult<$crate::RunOutput>);
@@ -123,6 +124,9 @@ macro_rules! forward_host {
     };
     (@ $base:ident, scratch_file_in) => {
         $crate::forward_host!(@method $base, scratch_file_in(dir: &::std::path::Path) -> $crate::HostResult<Box<dyn $crate::ScratchFile + '_>>);
+    };
+    (@ $base:ident, open_jobserver) => {
+        $crate::forward_host!(@method $base, open_jobserver(auth: &[u8]) -> Option<$crate::JobServerPipe>);
     };
     (@ $base:ident, supports_process_execution) => {
         $crate::forward_host!(@method $base, supports_process_execution() -> bool);

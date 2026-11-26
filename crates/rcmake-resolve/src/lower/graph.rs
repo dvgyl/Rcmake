@@ -119,6 +119,18 @@ pub(crate) fn lower_with_inputs(
     let mut unity_prerequisites = Vec::new();
     let mut strong_edges = Vec::new();
     graph.custom_output_owners = commands.owners.clone();
+    if model
+        .global
+        .props
+        .get(b"_RCMAKE_FILE_GENERATE_COUNT")
+        .is_some()
+    {
+        graph.custom_main_sources = commands
+            .owners
+            .keys()
+            .filter_map(|&index| Some((index, commands.main_source(index, usage.source_paths())?)))
+            .collect();
+    }
     graph.target_ids = local.iter().map(|(_, target)| target.id).collect();
     for (index, &(target, resolved)) in local.iter().enumerate() {
         let mut plan = TargetPlan::new(model, config, target, resolved, inputs.get(&resolved.id));
@@ -134,6 +146,18 @@ pub(crate) fn lower_with_inputs(
             &mut graph.steps,
             &mut graph.custom_output_owners,
         )?;
+        if model
+            .global
+            .props
+            .get(b"_RCMAKE_FILE_GENERATE_COUNT")
+            .is_some()
+            && !plan.source_command_roots.is_empty()
+        {
+            graph.custom_source_steps.insert(
+                resolved.id,
+                commands.ordered_source_steps(std::mem::take(&mut plan.source_command_roots)),
+            );
+        }
         if let Some(traced) = traced_commands.and_then(|map| map.get(&resolved.id)) {
             commands.add_traced_commands(traced, &mut plan.steps, &mut plan.dependencies)?;
             source_commands::record_owners(
@@ -402,6 +426,7 @@ struct TargetPlan<'a> {
     resolved: &'a ResolvedTarget,
     inputs: Option<&'a TargetInputs>,
     steps: IndexSet<usize>,
+    source_command_roots: IndexSet<usize>,
     source_file_inputs: IndexMap<BString, IndexSet<BString>>,
     dependencies: IndexSet<TargetId>,
     ide_steps: Option<Vec<IdeCustomStep>>,
@@ -427,6 +452,7 @@ impl<'a> TargetPlan<'a> {
             resolved,
             inputs,
             steps: IndexSet::new(),
+            source_command_roots: IndexSet::new(),
             source_file_inputs: IndexMap::new(),
             dependencies,
             ide_steps: resolved.ide.as_ref().map(|_| Vec::new()),

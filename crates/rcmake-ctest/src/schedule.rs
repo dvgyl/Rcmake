@@ -11,6 +11,7 @@ use rcmake_presets::{RepeatMode, TestRepeat};
 
 use crate::cli::Invocation;
 use crate::execution::{self, ResultLine, Status};
+use crate::jobserver::{Event, Tokens};
 use crate::reporting::Report;
 use crate::selection::{Plan, PlannedTest};
 use crate::{CtestError, CtestOptions, state};
@@ -643,7 +644,16 @@ pub(crate) fn run(
     coverage_tool: &[u8],
 ) -> Result<Vec<Option<Status>>, CtestError> {
     let options = &invocation.options;
-    let jobs = options.jobs.max(1);
+    let (send, receive) = mpsc::channel::<Event<Attempt>>();
+    let mut tokens = Tokens::connect(host, send.clone());
+    if tokens.is_some() {
+        report.jobserver_connected();
+    }
+    let jobs = if options.jobs_automatic && tokens.is_some() {
+        0x10000
+    } else {
+        options.jobs.max(1)
+    };
     let mut scheduler = Scheduler {
         plan,
         ready: Ready::new(plan),
@@ -677,13 +687,18 @@ pub(crate) fn run(
     let instrument = crate::instrumentation::Recorder::open(host, dir, options.config.as_ref())?;
     let instrument = instrument.as_ref();
     thread::scope(|scope| -> Result<(), CtestError> {
-        let (send, receive) = mpsc::sync_channel::<Attempt>(jobs.min(64));
         let mut budget = None;
+        let mut pending_event = None;
         loop {
             let expired =
                 remaining_time(host, deadline).is_some_and(|remaining| remaining.is_zero());
-            let completion = receive.try_recv().ok();
-            let attempt = if let Some(completion) = completion {
+            if let Some(tokens) = &mut tokens
+                && (expired || scheduler.stopped || scheduler.ready.ordered.is_empty())
+            {
+                tokens.return_spare();
+            }
+            let completion = pending_event.take().or_else(|| receive.try_recv().ok());
+            let event = if let Some(completion) = completion {
                 budget = None;
                 completion
             } else if !expired
@@ -707,6 +722,16 @@ pub(crate) fn run(
                     .iter()
                     .find(|&&(_, id)| running.fits(&resources[id], spare))
                 {
+                    if let Some(tokens) = &mut tokens
+                        && !tokens.try_acquire()
+                    {
+                        budget = None;
+                        let Ok(event) = receive.recv() else {
+                            break;
+                        };
+                        pending_event = Some(event);
+                        continue;
+                    }
                     scheduler.ready.ordered.remove(&(rank, id));
                     let test = &plan.tests[id];
                     runs[id] += 1;
@@ -737,18 +762,23 @@ pub(crate) fn run(
                                             repeat,
                                             deadline,
                                             |result, again| {
-                                                send.send(Attempt { id, result, again }).is_ok()
+                                                send.send(Event::Done(Attempt {
+                                                    id,
+                                                    result,
+                                                    again,
+                                                }))
+                                                .is_ok()
                                             },
                                         );
                                     }));
                                 if result.is_err() {
-                                    let _ = send.send(Attempt {
+                                    let _ = send.send(Event::Done(Attempt {
                                         id,
                                         again: false,
                                         result: ResultLine::not_run(
                                             "The test worker stopped unexpectedly.",
                                         ),
-                                    });
+                                    }));
                                 }
                             });
                             match worker {
@@ -773,11 +803,14 @@ pub(crate) fn run(
                             result
                         }
                     };
-                    Attempt {
+                    if let Some(tokens) = &mut tokens {
+                        tokens.release();
+                    }
+                    Event::Done(Attempt {
                         id,
                         result,
                         again: false,
-                    }
+                    })
                 } else if running.slots == 0 {
                     if let Some(limit) = limit {
                         let smallest = scheduler
@@ -817,7 +850,21 @@ pub(crate) fn run(
                 break;
             };
 
-            let Attempt { id, result, again } = attempt;
+            let Attempt { id, result, again } = match event {
+                Event::Done(attempt) => attempt,
+                Event::Token(token) => {
+                    if let Some(tokens) = &mut tokens {
+                        tokens.received(token);
+                    }
+                    continue;
+                }
+                Event::Lost => {
+                    if let Some(tokens) = &mut tokens {
+                        tokens.lost();
+                    }
+                    continue;
+                }
+            };
             let test = &plan.tests[id];
             state.record(test, &result, requests.get(&id))?;
             let progress = match scheduler.repetition.individual(id) {
@@ -836,6 +883,9 @@ pub(crate) fn run(
             }
             if requests.remove(&id).is_some() {
                 running.finish(&resources[id])?;
+                if let Some(tokens) = &mut tokens {
+                    tokens.release();
+                }
             }
             scheduler.completed += 1;
             scheduler.statuses[id] = Some(result.status);
@@ -860,6 +910,8 @@ pub(crate) fn run(
         }
         Ok(())
     })?;
+    drop(tokens);
+    drop(receive);
     for id in resumed {
         scheduler.statuses[id] = None;
     }

@@ -184,6 +184,9 @@ pub trait GenexHost {
         self.find_target(name)
     }
 
+    /// Record a generator expression read of a target's `SOURCES` property.
+    fn read_target_sources(&mut self, _target: TargetHandle) {}
+
     /// Name of `target`.
     fn target_name(&self, target: TargetHandle) -> BString;
 

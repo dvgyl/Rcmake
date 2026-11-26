@@ -688,6 +688,10 @@ where
         self.base.set_symlink_times(p, atime, mtime)
     }
 
+    fn open_jobserver(&self, auth: &[u8]) -> Option<rcmake_host::JobServerPipe> {
+        self.base.open_jobserver(auth)
+    }
+
     fn supports_process_execution(&self) -> bool {
         self.base.supports_process_execution()
     }

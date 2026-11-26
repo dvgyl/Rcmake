@@ -65,24 +65,21 @@ fn check_install_export_set(
     errors: &mut String,
 ) {
     let (signature, set) = match kind {
-        InstallKind::Export { set, .. } => ("EXPORT", set.as_slice()),
-        InstallKind::PackageInfo(spec) => ("PACKAGE_INFO", spec.export.as_slice()),
-        InstallKind::Code(code) if code.is_empty() => {
-            let args = &model.global.props;
+        InstallKind::Export { set, .. } => {
             let key = format!("_RCMAKE_INSTALL_{index}_ARG0");
-            if !args
+            let signature = if model
+                .global
+                .props
                 .get(key.as_bytes())
                 .is_some_and(|name| name == "EXPORT_ANDROID_MK")
             {
-                return;
-            }
-            let key = format!("_RCMAKE_INSTALL_{index}_ARG1");
-            (
-                "EXPORT_ANDROID_MK",
-                args.get(key.as_bytes())
-                    .map_or(b"".as_slice(), |name| name.as_slice()),
-            )
+                "EXPORT_ANDROID_MK"
+            } else {
+                "EXPORT"
+            };
+            (signature, set.as_slice())
         }
+        InstallKind::PackageInfo(spec) => ("PACKAGE_INFO", spec.export.as_slice()),
         _ => return,
     };
     if model

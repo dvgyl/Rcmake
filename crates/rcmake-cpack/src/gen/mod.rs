@@ -1,8 +1,11 @@
 //! Generator registry and the External and macOS generators.
 
 pub mod bundle;
+mod deb;
 pub mod dmg;
 pub(crate) mod external;
+mod linux;
+mod rpm;
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -29,6 +32,8 @@ pub fn create(name: &[u8]) -> Option<Box<dyn PackageGenerator>> {
         return Some(Box::new(ArchiveGenerator { kind }));
     }
     match name {
+        b"DEB" => Some(Box::new(deb::Deb)),
+        b"RPM" => Some(Box::new(rpm::Rpm)),
         b"External" => Some(Box::new(external::ExternalGenerator)),
         b"DragNDrop" => Some(Box::new(dmg::DragNDropGenerator)),
         b"Bundle" => Some(Box::new(bundle::BundleGenerator)),
@@ -109,10 +114,14 @@ struct ScratchDir<'a> {
 
 impl<'a> ScratchDir<'a> {
     fn new(host: &'a dyn Host, root: &Path) -> Result<Self, CpackError> {
+        Self::for_generator(host, root, "dmg")
+    }
+
+    fn for_generator(host: &'a dyn Host, root: &Path, generator: &str) -> Result<Self, CpackError> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         for _ in 0..100 {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let path = root.join(format!(".rcmake-dmg-{}-{id}", host.system().pid));
+            let path = root.join(format!(".rcmake-{generator}-{}-{id}", host.system().pid));
             match host.metadata(&path, Follow::No) {
                 Err(err) if err.kind == ErrorKind::NotFound => {
                     host.create_dir_all(&path)?;
@@ -139,7 +148,7 @@ impl Drop for ScratchDir<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
@@ -156,7 +165,7 @@ mod tests {
         Arc::new(rcmake_host::PureHost::new("/work".into(), exe.into()))
     }
 
-    pub(super) fn invoke(host: Arc<dyn Host>, generator: &str, options: &str) -> i32 {
+    pub(crate) fn invoke(host: Arc<dyn Host>, generator: &str, options: &str) -> i32 {
         let root = host.initial_cwd();
         let source = root.join("payload");
         host.create_dir_all(&source).unwrap();
@@ -187,7 +196,7 @@ set(CPACK_PACKAGE_CHECKSUM "MD5;SHA256")
         )
     }
 
-    pub(super) fn read(host: &dyn Host, path: &Path) -> Vec<u8> {
+    pub(crate) fn read(host: &dyn Host, path: &Path) -> Vec<u8> {
         host.read(
             path,
             ReadRange::All {

@@ -1984,23 +1984,36 @@ fn file_install_drops_a_trailing_dot_from_the_destination() -> TestResult {
 #[test]
 #[cfg(feature = "archive")]
 fn raw_archive_create_validates_encoding_and_entries() -> TestResult {
-    for (extra, paths, diagnostic) in [
-        ("COMPRESSION Zstd", "one", None),
-        ("COMPRESSION None", "one", None),
-        (r#"ENCODING """#, "one", None),
+    use rcmake_diag::{PolicyId, PolicyStatus};
+
+    for (policy, extra, paths, diagnostic) in [
         (
+            Some(PolicyStatus::New),
+            "",
+            "one",
+            Some("Undefined option: `raw:hdrcharset=UTF-8'"),
+        ),
+        (Some(PolicyStatus::New), "ENCODING OEM", "one", None),
+        (Some(PolicyStatus::Old), "", "one", None),
+        (None, "COMPRESSION Zstd", "one", None),
+        (None, "COMPRESSION None", "one", None),
+        (None, r#"ENCODING """#, "one", None),
+        (
+            None,
             "ENCODING UTF-8",
             "one",
             Some("Undefined option: `raw:hdrcharset=UTF-8'"),
         ),
         (
+            None,
             "",
             "one two",
             Some("Raw format only supports one entry per archive"),
         ),
         (
+            None,
             "",
-            "dir",
+            "one dir",
             Some("Raw format only supports filetype AE_IFREG"),
         ),
     ] {
@@ -2009,15 +2022,24 @@ fn raw_archive_create_validates_encoding_and_entries() -> TestResult {
         host.seed_file(&base.join("one"), b"one")?;
         host.seed_file(&base.join("two"), b"two")?;
         host.create_dir_all(&base.join("dir"))?;
+        if let Some(policy) = policy {
+            interp.cx().set_policy(PolicyId::new(213), policy)?;
+        }
         let code = format!("file(ARCHIVE_CREATE OUTPUT out PATHS {paths} FORMAT raw {extra})");
+        let probe = base.join("test.cmake");
+        host.seed_file(&probe, code.as_bytes())?;
+        let outcome = interp.run_script(&probe);
         if let Some(diagnostic) = diagnostic {
-            let probe = base.join("test.cmake");
-            host.seed_file(&probe, code.as_bytes())?;
-            assert_ne!(interp.run_script(&probe).exit_code, 0);
+            assert_ne!(outcome.exit_code, 0);
             let stderr = host.stream_bytes(Stream::Stderr);
             assert!(stderr.to_string().contains(diagnostic), "{stderr}");
         } else {
-            script(&host, &mut interp, &code)?;
+            assert_eq!(
+                outcome.exit_code,
+                0,
+                "{}",
+                host.stream_bytes(Stream::Stderr)
+            );
             let bytes = host.read(&base.join("out"), ReadRange::All { limit: 1024 })?;
             if extra == "COMPRESSION Zstd" {
                 assert!(bytes.starts_with(b"\x28\xb5\x2f\xfd"));
