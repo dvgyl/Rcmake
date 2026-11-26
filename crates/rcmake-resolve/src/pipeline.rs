@@ -94,6 +94,7 @@ fn resolve_project(
     crate::exports::source_sets::validate(model)?;
     let strategies = intdir::prepare(model, host)?;
     let model = strategies.as_ref().unwrap_or(model);
+    intdir::warn_collisions(model, host);
     link_tags::validate(model, host)?;
     lower::warn_about_wrappers(model, host);
     lower::custom::warn_depfile_policy(model, host);
@@ -585,7 +586,7 @@ pub(crate) fn policy_warning(
         } else {
             generation_location(model, target)
         },
-        body: format!("Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\n{message}").into(),
+        body: format!("Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n{message}").into(),
     };
     host.write_out(
         Stream::Stderr,

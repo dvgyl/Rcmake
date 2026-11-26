@@ -109,10 +109,19 @@ impl CacheType {
 }
 
 /// Deterministic ordered map of CMake property names to byte values.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct PropertyMap {
     entries: IndexMap<BString, BString>,
+    tracked: Option<Box<IndexMap<BString, Vec<BT<BString>>>>>,
 }
+
+impl PartialEq for PropertyMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for PropertyMap {}
 
 impl PropertyMap {
     /// Read a property value.
@@ -121,18 +130,27 @@ impl PropertyMap {
         self.entries.get(name)
     }
 
-    /// Set a property to `value`.
+    /// Set a property to `value`. Direct writes invalidate any tracked backtrace entries.
     pub fn set(&mut self, name: BString, value: BString) {
+        if let Some(tracked) = &mut self.tracked {
+            tracked.shift_remove(&name);
+        }
         self.entries.insert(name, value);
     }
 
-    /// Remove a property.
+    /// Remove a property and any tracked backtrace entries.
     pub fn unset(&mut self, name: &[u8]) {
+        if let Some(tracked) = &mut self.tracked {
+            tracked.shift_remove(name);
+        }
         self.entries.shift_remove(name);
     }
 
     /// Append a semicolon-separated list item (`set_property(... APPEND)`).
     pub fn append(&mut self, name: BString, value: &[u8]) {
+        if let Some(tracked) = &mut self.tracked {
+            tracked.shift_remove(&name);
+        }
         if let Some(existing) = self.entries.get_mut(&name) {
             if !existing.is_empty() && !value.is_empty() {
                 existing.push(b';');
@@ -145,11 +163,53 @@ impl PropertyMap {
 
     /// Append raw text without a semicolon (`set_property(... APPEND_STRING)`).
     pub fn append_string(&mut self, name: BString, value: &[u8]) {
+        if let Some(tracked) = &mut self.tracked {
+            tracked.shift_remove(&name);
+        }
         if let Some(existing) = self.entries.get_mut(&name) {
             existing.extend_from_slice(value);
         } else {
             self.entries.insert(name, BString::from(value));
         }
+    }
+
+    /// Set a property while recording its single backtrace-tagged entry.
+    pub fn set_tracked(&mut self, name: BString, value: BString, backtrace: Backtrace) {
+        self.entries.insert(name.clone(), value.clone());
+        self.tracked
+            .get_or_insert_with(Default::default)
+            .insert(name, vec![BT::new(value, backtrace)]);
+    }
+
+    /// Append a non-empty backtrace-tagged entry and keep the joined byte value in sync.
+    pub fn append_tracked(&mut self, name: BString, value: &[u8], backtrace: Backtrace) {
+        if value.is_empty() {
+            return;
+        }
+        let previous = self.entries.get(&name).cloned();
+        let entries = self
+            .tracked
+            .get_or_insert_with(Default::default)
+            .entry(name.clone())
+            .or_insert_with(|| {
+                previous
+                    .filter(|existing| !existing.is_empty())
+                    .map(|existing| BT::new(existing, Backtrace::default()))
+                    .into_iter()
+                    .collect()
+            });
+        entries.push(BT::new(BString::from(value), backtrace));
+        let joined = rcmake_base::list::join(entries.iter().map(|entry| entry.value.as_slice()));
+        self.entries.insert(name, joined);
+    }
+
+    /// Return ordered backtrace-tagged entries recorded for `name`, if tracked.
+    #[must_use]
+    pub fn tracked_entries(&self, name: &[u8]) -> Option<&[BT<BString>]> {
+        self.tracked
+            .as_deref()
+            .and_then(|map| map.get(name))
+            .map(Vec::as_slice)
     }
 
     /// Return all property names in insertion order.

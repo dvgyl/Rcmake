@@ -60,6 +60,27 @@ impl UsageResolver<'_> {
             }
         };
         let (direct, _) = self.usage_links(target, false, &ctx)?;
+        let language = ctx.link_language.as_ref().or(ctx.language.as_ref());
+        if owner.kind != TargetKind::StaticLibrary
+            && let (Some(paths), Some(language)) = (paths, language)
+        {
+            for item in direct.iter() {
+                if let Some(depender) = item
+                    .injected_by
+                    .and_then(|id| model.target(id))
+                    .filter(|target| target.is_imported())
+                {
+                    diagnostics::warn_imported_features(
+                        model,
+                        paths,
+                        owner,
+                        depender,
+                        language,
+                        std::slice::from_ref(item),
+                    );
+                }
+            }
+        }
         let mut graph = LinkGraph::default();
         let mut original: Vec<_> = direct
             .iter()
@@ -84,6 +105,15 @@ impl UsageResolver<'_> {
             let mut edges = IndexSet::new();
             for (parent, edge) in item.edges() {
                 let (items, _) = self.usage_links(parent, true, &ctx)?;
+                if owner.kind != TargetKind::StaticLibrary
+                    && let (Some(paths), Some(language), Some(depender)) =
+                        (paths, language, model.target(parent))
+                    && depender.is_imported()
+                {
+                    diagnostics::warn_imported_features(
+                        model, paths, owner, depender, language, &items,
+                    );
+                }
                 if let Some(chains) = &mut chains {
                     let mut path = chains.get(&item.key()).cloned().unwrap_or_default();
                     path.push(edge.hop(parent));
@@ -571,7 +601,7 @@ impl LinkGraph {
             }
         };
         let mut body = format!(
-            "The inter-target dependency graph, for the target \"{}\", contains the following strongly connected component (cycle):\n\n",
+            "The inter-target dependency graph, for the target \"{}\", contains the following strongly connected component (cycle):\n",
             owner.name
         );
         for (item, edges) in component
@@ -823,7 +853,7 @@ impl FeatureAttributes {
 }
 
 fn invalid_options(variable: &str, invalid: &[BString]) -> BString {
-    let mut body = BString::from(format!("Erroneous option(s) for '{variable}':\n\n"));
+    let mut body = BString::from(format!("Erroneous option(s) for '{variable}':\n"));
     for entry in invalid {
         body.extend_from_slice(b"  ");
         body.extend_from_slice(entry);

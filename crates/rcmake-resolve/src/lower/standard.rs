@@ -233,24 +233,31 @@ pub(crate) fn checked_standard_flag(
     if language == b"CUDA" {
         return cuda_standard_flag(model, target, required, new_policy);
     }
-    validate_standard(model, target, language)?;
+    if let Some(flag) = explicit_standard_flag(model, target, language, new_policy)? {
+        return Ok((!flag.is_empty()).then(|| standard_options(flag)));
+    }
     Ok(other_standard_flag(
         model, target, language, required, new_policy,
     ))
 }
 
-/// Reject a `<LANG>_STANDARD` value that is not a standard level.
-fn validate_standard(
-    model: &ProjectModel,
-    target: &Target,
+/// Return the explicit compile option for a `<LANG>_STANDARD` value that is not
+/// a standard level, or reject the value when no option is defined.
+fn explicit_standard_flag<'a>(
+    model: &'a ProjectModel,
+    target: &'a Target,
     language: &[u8],
-) -> Result<(), ResolveError> {
+    new_policy: bool,
+) -> Result<Option<&'a BString>, ResolveError> {
     let name = [language, b"_STANDARD"].concat();
     let Some(value) = target_property(model, target, &name) else {
-        return Ok(());
+        return Ok(None);
     };
     if value.is_empty() || value.iter().all(u8::is_ascii_digit) {
-        return Ok(());
+        return Ok(None);
+    }
+    if let Some(flag) = explicit_standard_option(model, target, language, value, new_policy) {
+        return Ok(Some(flag));
     }
     let diagnostic = Diagnostic {
         annotations: None,
@@ -271,6 +278,90 @@ fn validate_standard(
     Err(ResolveError::Message(text))
 }
 
+/// Return the compile option variable of a required standard that is not a
+/// standard level.
+///
+/// With `<LANG>_STANDARD_REQUIRED` on, a toolchain can define
+/// `CMAKE_<LANG><value>_STANDARD_COMPILE_OPTION`, or the `EXTENSION` form when
+/// extensions are on, for a value that is not a built-in standard level.
+fn explicit_standard_option<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+    language: &[u8],
+    value: &[u8],
+    new_policy: bool,
+) -> Option<&'a BString> {
+    let required = paired_property(model, target, language, b"_STANDARD_REQUIRED")
+        .is_some_and(|required| truth::is_on(required));
+    if !required {
+        return None;
+    }
+    let (_, extensions) = extension_modes(model, target, language, new_policy);
+    definition(
+        model,
+        target.dir,
+        &[
+            b"CMAKE_".as_slice(),
+            language,
+            value,
+            compile_option(extensions),
+        ]
+        .concat(),
+    )
+}
+
+/// Return the language whose properties apply when a language has no value.
+fn paired_language(language: &[u8]) -> Option<&'static [u8]> {
+    match language {
+        b"OBJC" => Some(b"C"),
+        b"OBJCXX" => Some(b"CXX"),
+        _ => None,
+    }
+}
+
+/// Read a language property, or the property of its paired language.
+fn paired_property<'a>(
+    model: &'a ProjectModel,
+    target: &'a Target,
+    language: &[u8],
+    suffix: &[u8],
+) -> Option<&'a BString> {
+    target_property(model, target, &[language, suffix].concat()).or_else(|| {
+        paired_language(language)
+            .and_then(|paired| target_property(model, target, &[paired, suffix].concat()))
+    })
+}
+
+/// Return the toolchain default extension mode and the selected extension mode.
+///
+/// A `<LANG>_EXTENSIONS` value has priority. Without one, `CMP0128` `NEW` uses
+/// the toolchain default, and `OLD` or `WARN` turns extensions on.
+fn extension_modes(
+    model: &ProjectModel,
+    target: &Target,
+    language: &[u8],
+    new_policy: bool,
+) -> (bool, bool) {
+    let default = definition(
+        model,
+        target.dir,
+        &[b"CMAKE_".as_slice(), language, b"_EXTENSIONS_DEFAULT"].concat(),
+    )
+    .is_some_and(|value| truth::is_on(value));
+    let selected = paired_property(model, target, language, b"_EXTENSIONS")
+        .map_or(!new_policy || default, |value| truth::is_on(value));
+    (default, selected)
+}
+
+/// Return the compile option suffix for an extension mode.
+fn compile_option(extensions: bool) -> &'static [u8] {
+    if extensions {
+        b"_EXTENSION_COMPILE_OPTION"
+    } else {
+        b"_STANDARD_COMPILE_OPTION"
+    }
+}
+
 fn other_standard_flag(
     model: &ProjectModel,
     target: &Target,
@@ -278,16 +369,8 @@ fn other_standard_flag(
     required: Option<&[u8]>,
     new_policy: bool,
 ) -> Option<BString> {
-    let paired: Option<&[u8]> = match language {
-        b"OBJC" => Some(b"C"),
-        b"OBJCXX" => Some(b"CXX"),
-        _ => None,
-    };
-    let property = |suffix: &[u8]| {
-        target_property(model, target, &[language, suffix].concat()).or_else(|| {
-            paired.and_then(|paired| target_property(model, target, &[paired, suffix].concat()))
-        })
-    };
+    let paired = paired_language(language);
+    let property = |suffix: &[u8]| paired_property(model, target, language, suffix);
     let explicit = property(b"_STANDARD")
         .or_else(|| {
             paired.and_then(|paired| {
@@ -307,14 +390,7 @@ fn other_standard_flag(
     )
     .map(|value| value.as_slice())
     .filter(|value| rank(language, value).is_some());
-    let default_extensions = definition(
-        model,
-        target.dir,
-        &[b"CMAKE_", language, b"_EXTENSIONS_DEFAULT"].concat(),
-    )
-    .is_none_or(|value| truth::is_on(value));
-    let extensions =
-        property(b"_EXTENSIONS").map_or(default_extensions, |value| truth::is_on(value));
+    let (default_extensions, extensions) = extension_modes(model, target, language, new_policy);
     let standard = selected_standard(language, explicit, required, default).or_else(|| {
         (new_policy && extensions != default_extensions)
             .then_some(default)
@@ -329,11 +405,7 @@ fn other_standard_flag(
     {
         return None;
     }
-    let option: &[u8] = if extensions {
-        b"_EXTENSION_COMPILE_OPTION"
-    } else {
-        b"_STANDARD_COMPILE_OPTION"
-    };
+    let option = compile_option(extensions);
     let flag = definition(
         model,
         target.dir,

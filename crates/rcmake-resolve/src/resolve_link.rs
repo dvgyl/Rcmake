@@ -459,11 +459,7 @@ fn linked_framework_roots<'a>(
                 fallback = lower::compute_artifacts(model, dependency, config);
                 fallback.file.as_ref()?
             };
-            let root = layout.root(path).or_else(|| {
-                imported
-                    .then(|| lower::framework::wrapper_root(path, b".framework"))
-                    .flatten()
-            })?;
+            let root = framework_root(&layout, imported, path)?;
             let system = !(imported && no_imported_system)
                 && dependency
                     .props
@@ -472,6 +468,31 @@ fn linked_framework_roots<'a>(
             Some((root.into(), system))
         })
         .collect()
+}
+
+/// Return the framework bundle that contains the artifact `path`.
+///
+/// Only a framework layout supplies a framework directory. An imported
+/// target without a layout supplies a directory only when its artifact lies in
+/// a `.framework` wrapper. An application bundle never supplies one, also when
+/// it lies inside a framework.
+fn framework_root<'p>(
+    layout: &ide::BundleKind,
+    imported: bool,
+    path: &'p [u8],
+) -> Option<&'p [u8]> {
+    if matches!(layout, ide::BundleKind::App { .. }) {
+        return None;
+    }
+    match layout {
+        ide::BundleKind::Framework { .. } => layout.root(path),
+        _ => None,
+    }
+    .or_else(|| {
+        imported
+            .then(|| lower::framework::wrapper_root(path, b".framework"))
+            .flatten()
+    })
 }
 
 /// Collect the framework bundles that supply includes to a target's compile groups.
@@ -785,4 +806,39 @@ fn build_path(model: &ProjectModel, path: &[u8]) -> BString {
     native
         .strip_prefix(root)
         .map_or_else(|_| path.into(), rcmake_host::path::from_native)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn framework_root_accepts_only_framework_layouts() {
+        let library: &[u8] = b"/opt/Foo.framework/Versions/A/Foo";
+        let framework = ide::BundleKind::Framework {
+            extension: BString::from("framework"),
+            version: BString::from("A"),
+        };
+        assert_eq!(
+            framework_root(&framework, false, library),
+            Some(b"/opt/Foo.framework".as_slice())
+        );
+        assert_eq!(
+            framework_root(&ide::BundleKind::None, true, library),
+            Some(b"/opt/Foo.framework".as_slice())
+        );
+        assert_eq!(framework_root(&ide::BundleKind::None, false, library), None);
+
+        let app = ide::BundleKind::App {
+            extension: BString::from("app"),
+        };
+        let executable: &[u8] = b"/opt/tool.app/Contents/MacOS/tool";
+        assert_eq!(framework_root(&app, true, executable), None);
+        assert_eq!(framework_root(&app, false, executable), None);
+
+        let helper: &[u8] =
+            b"/opt/Foo.framework/Versions/A/Helpers/helper.app/Contents/MacOS/helper";
+        assert_eq!(framework_root(&app, true, helper), None);
+        assert_eq!(framework_root(&app, false, helper), None);
+    }
 }

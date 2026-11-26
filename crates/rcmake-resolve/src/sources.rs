@@ -544,7 +544,7 @@ impl<'a> SourcePaths<'a> {
                                 category: Some(DiagCategory::Policy),
                                 policy: Some(policy),
                                 location: generation_source_location(Location::Backtrace(source.backtrace.clone())),
-                                body: format!("Policy CMP0115 is not set: Source file extensions must be explicit.  Run \"cmake --help-policy CMP0115\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nFile:\n\n  {candidate}").into(),
+                                body: format!("Policy CMP0115 is not set: Source file extensions must be explicit.  Run \"cmake --help-policy CMP0115\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\nFile:\n  {candidate}").into(),
                             };
                             self.host.write_out(
                                 Stream::Stderr,
@@ -786,7 +786,7 @@ pub(crate) fn validate_object_sources(
     if invalid.is_empty() {
         return Ok(());
     }
-    let mut body = BString::from(format!("OBJECT library \"{}\" contains:\n", target.name));
+    let mut body = BString::from(format!("OBJECT library \"{}\" contains:", target.name));
     for source in invalid {
         body.extend_from_slice(b"\n  ");
         body.extend_from_slice(Lexical::new(source).filename());

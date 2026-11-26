@@ -307,3 +307,180 @@ fn cmp0211_checks_only_the_file_sets_active_in_each_configuration() -> TestResul
     }
     Ok(())
 }
+
+#[test]
+fn cmp0128_new_unset_extensions_defaults_to_standard_option() -> TestResult {
+    let (mut model, host) = fixture()?;
+    model.global.props.set(
+        "CMAKE_Cc_std_11_STANDARD_COMPILE_OPTION".into(),
+        "-std=c11".into(),
+    );
+    model.global.props.set(
+        "CMAKE_Cc_std_11_EXTENSION_COMPILE_OPTION".into(),
+        "-std=gnu11".into(),
+    );
+    let mut lib = target("lib", TargetKind::StaticLibrary, &["main.c"]);
+    lib.policies
+        .policies
+        .set(PolicyId::new(128), PolicyStatus::New)?;
+    lib.props.set("C_STANDARD".into(), "c_std_11".into());
+    lib.props.set("C_STANDARD_REQUIRED".into(), "ON".into());
+    model.add_target(lib)?;
+
+    let result = resolve(&model, &host, &[])?;
+    let compile = result.graphs[0]
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            BuildStep::Compile { invocation, .. } => Some(&invocation.argv),
+            _ => None,
+        })
+        .ok_or("Missing compile step")?;
+    assert!(compile.contains(&BString::from("-std=c11")), "{compile:?}");
+    assert!(
+        !compile.contains(&BString::from("-std=gnu11")),
+        "{compile:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn visual_studio_short_intdir_uses_local_binary_directory() -> TestResult {
+    let (mut model, host) = fixture()?;
+    model.generator = Some(rcmake_model::GeneratorKind::VisualStudio(
+        rcmake_model::VsVersion::Vs17,
+    ));
+    model.cache.insert(
+        "CMAKE_INTERMEDIATE_DIR_STRATEGY".into(),
+        rcmake_model::CacheEntry {
+            value: "SHORT".into(),
+            ty: rcmake_model::CacheType::String,
+            help: BString::default(),
+            advanced: false,
+            props: Default::default(),
+        },
+    );
+    let root_src = model.dir(DirId::ROOT).source_dir.clone();
+    let root_bin = model.dir(DirId::ROOT).binary_dir.clone();
+    // sub62 and sub347 share the 4-hex SHA3-512 prefix 0226; foo and bar share no collision
+    // unless both targets use the build root instead of their local binary directories.
+    let dir_a = model.add_directory(
+        DirId::ROOT,
+        format!("{root_src}/sub62").into(),
+        format!("{root_bin}/sub62").into(),
+        Backtrace::default(),
+    )?;
+    let dir_b = model.add_directory(
+        DirId::ROOT,
+        format!("{root_src}/sub347").into(),
+        format!("{root_bin}/sub347").into(),
+        Backtrace::default(),
+    )?;
+    host.seed_file(Path::new(&format!("{root_src}/sub62/a.c")), b"")?;
+    host.seed_file(Path::new(&format!("{root_src}/sub347/b.c")), b"")?;
+    let mut t1 = target("Collides0", TargetKind::StaticLibrary, &["a.c"]);
+    t1.dir = dir_a;
+    let mut t2 = target("Collides0_other", TargetKind::StaticLibrary, &["b.c"]);
+    t2.dir = dir_b;
+    // Use two names that collide on the 4-hex SHA3-512 target hash.
+    t1.name = "t0".into();
+    t2.name = "t2565".into();
+    // Verify both dirs hash identically to prove the local-dir prefix avoids collision.
+    let hash_a = crate::lower::artifacts::short_support_dir(&model, &t1);
+    let hash_b = crate::lower::artifacts::short_support_dir(&model, &t2);
+    assert!(hash_a.starts_with(b"sub62/.o/"), "{hash_a}");
+    assert!(hash_b.starts_with(b"sub347/.o/"), "{hash_b}");
+    model.add_target(t1)?;
+    model.add_target(t2)?;
+    let _ = resolve(&model, &host, &[])?;
+    let text = stderr(&host);
+    assert!(
+        !text.contains("share an intermediate directory"),
+        "unexpected VS cross-directory collision warning: {text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn imported_link_feature_warnings_run_before_override_and_follow_group_predicate() -> TestResult {
+    // 1. LINK_LIBRARY warning runs even when consumer sets LINK_LIBRARY_OVERRIDE_<item>=DEFAULT.
+    {
+        let (mut model, host) = fixture()?;
+        let mut imp_leaf = target("NS::lib", TargetKind::StaticLibrary, &[]);
+        imp_leaf.origin = TargetOrigin::Imported(ImportedVisibility::Global);
+        imp_leaf
+            .props
+            .set("IMPORTED_LOCATION".into(), "/work/libfoo.a".into());
+        model.add_target(imp_leaf)?;
+
+        let mut imp = target("NS::lib2", TargetKind::SharedLibrary, &[]);
+        imp.origin = TargetOrigin::Imported(ImportedVisibility::Global);
+        imp.props
+            .set("IMPORTED_LOCATION".into(), "/work/libbar.so".into());
+        imp.usage.interface_link_libraries =
+            Some(vec![link_item("$<LINK_LIBRARY:custom_feat,NS::lib>")]);
+        model.add_target(imp)?;
+
+        let mut app = target("app", TargetKind::SharedLibrary, &["main.c"]);
+        app.usage.link_libraries = Some(vec![link_item("NS::lib2")]);
+        app.props
+            .set("LINK_LIBRARY_OVERRIDE_NS::lib".into(), "DEFAULT".into());
+        model.add_target(app)?;
+
+        let _ = resolve(&model, &host, &[])?;
+        let text = stderr(&host);
+        let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            collapsed.contains("The 'IMPORTED' target 'NS::lib2' uses the generator-expression '$<LINK_LIBRARY>' with the feature 'custom_feat'"),
+            "{text}"
+        );
+    }
+
+    // 2. LINK_GROUP omits author warning when generic _SUPPORTED is ON even if per-lang is OFF,
+    //    while still reporting the fatal unsupported-feature error.
+    {
+        let (mut model, host) = fixture()?;
+        model.global.props.set(
+            "CMAKE_C_LINK_GROUP_USING_feat_SUPPORTED".into(),
+            "FALSE".into(),
+        );
+        model.global.props.set(
+            "CMAKE_LINK_GROUP_USING_feat_SUPPORTED".into(),
+            "TRUE".into(),
+        );
+        model
+            .global
+            .props
+            .set("CMAKE_LINK_GROUP_USING_feat".into(), "a;b".into());
+        let mut imp_leaf = target("NS::lib", TargetKind::StaticLibrary, &[]);
+        imp_leaf.origin = TargetOrigin::Imported(ImportedVisibility::Global);
+        imp_leaf
+            .props
+            .set("IMPORTED_LOCATION".into(), "/work/libfoo.a".into());
+        model.add_target(imp_leaf)?;
+
+        let mut imp = target("NS::lib2", TargetKind::SharedLibrary, &[]);
+        imp.origin = TargetOrigin::Imported(ImportedVisibility::Global);
+        imp.props
+            .set("IMPORTED_LOCATION".into(), "/work/libbar.so".into());
+        imp.usage.interface_link_libraries = Some(vec![link_item("$<LINK_GROUP:feat,NS::lib>")]);
+        model.add_target(imp)?;
+
+        let mut app = target("app", TargetKind::SharedLibrary, &["main.c"]);
+        app.usage.link_libraries = Some(vec![link_item("NS::lib2")]);
+        model.add_target(app)?;
+
+        let result = resolve(&model, &host, &[]);
+        assert!(result.is_err(), "expected fatal unsupported-feature error");
+        let text = stderr(&host);
+        assert!(
+            !text.contains("The 'IMPORTED' target 'NS::lib2'"),
+            "unexpected LINK_GROUP author warning when generic support is ON: {text}"
+        );
+        assert!(
+            text.contains("Feature 'feat', specified through generator-expression '$<LINK_GROUP>'"),
+            "{text}"
+        );
+    }
+    Ok(())
+}

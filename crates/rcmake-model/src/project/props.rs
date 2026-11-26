@@ -187,6 +187,14 @@ impl ProjectModel {
                 self.record_prop(scope, name, crate::PropOp::Append(mode), previous, origin);
                 return Ok(());
             }
+            if target_properties::is_tracked_wrapper(name) {
+                let target = self.target_mut(*id).ok_or(ModelError::UnknownObject)?;
+                target
+                    .props
+                    .append_tracked(name.into(), value, origin.backtrace.clone());
+                self.record_prop(scope, name, crate::PropOp::Append(mode), previous, origin);
+                return Ok(());
+            }
         }
         if (target_sources || mode == AppendMode::List)
             && self.append_entry(scope, name, value, origin)?

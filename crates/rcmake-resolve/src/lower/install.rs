@@ -156,7 +156,7 @@ fn warn_rpath_escaping(model: &ProjectModel, host: &dyn Host, rule: &InstallRule
         body: format!(
             concat!(
                 "Policy CMP0095 is not set: RPATH entries are properly escaped in the intermediary CMake install script.  ",
-                "Run \"cmake --help-policy CMP0095\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\n",
+                "Run \"cmake --help-policy CMP0095\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n",
                 "RPATH entries for target '{}' will not be escaped in the intermediary cmake_install.cmake script."
             ),
             target.name,
@@ -235,7 +235,7 @@ impl InstallManifest {
                         continue;
                     }
                     let body: BString =
-                        format!("INSTALL command given absolute DESTINATION path:\n\n  {path}")
+                        format!("INSTALL command given absolute DESTINATION path:\n  {path}")
                             .into();
                     let diagnostic = Diagnostic {
                         annotations: None,

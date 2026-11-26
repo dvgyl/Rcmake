@@ -220,14 +220,14 @@ impl<'a, 'host> Features<'a, 'host> {
             ))
         };
         let variable = if supports(&specific).is_some() {
-            specific
+            &specific
         } else {
-            generic
+            &generic
         };
-        if !supports(&variable).is_some_and(|value| truth::is_on(value)) {
+        if !supports(variable).is_some_and(|value| truth::is_on(value)) {
             return Err(describe("supported"));
         }
-        let value = find(&variable).ok_or_else(|| describe("defined"))?;
+        let value = find(variable).ok_or_else(|| describe("defined"))?;
         // CMake keeps empty elements here, so an empty value is one empty element.
         let mut elements = if value.is_empty() {
             vec![BString::default()]

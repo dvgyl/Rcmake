@@ -248,6 +248,10 @@ pub(crate) fn warning_as_error_options(
         Ok(modes)
     } else {
         let invalid = BString::from(invalid.join(b"\n  ".as_slice()));
-        Err(format!("Erroneous value(s) for 'LINK_WARNING_AS_ERROR' property of target '{}':\n\n  {invalid}", target.name).into())
+        Err(format!(
+            "Erroneous value(s) for 'LINK_WARNING_AS_ERROR' property of target '{}':\n  {invalid}",
+            target.name
+        )
+        .into())
     }
 }

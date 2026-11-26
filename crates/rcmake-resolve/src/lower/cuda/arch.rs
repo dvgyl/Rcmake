@@ -358,7 +358,7 @@ fn empty_diagnostic(target: &Target, in_try_compile: bool) -> Option<Diagnostic>
             let body: BString = body();
             let mut warning = diagnostic(
                 target, MessageKind::AuthorWarning, Effect::None, Some(policy),
-                format!("Policy CMP0104 is not set: CMAKE_CUDA_ARCHITECTURES now detected for NVCC, empty CUDA_ARCHITECTURES not allowed.  Run \"cmake --help-policy CMP0104\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\n{body}").into(),
+                format!("Policy CMP0104 is not set: CMAKE_CUDA_ARCHITECTURES now detected for NVCC, empty CUDA_ARCHITECTURES not allowed.  Run \"cmake --help-policy CMP0104\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n{body}").into(),
             );
             warning.category = Some(DiagCategory::Policy);
             Some(warning)

@@ -57,7 +57,7 @@ impl UsageResolver<'_> {
             }
         }
         for (origin, values) in groups {
-            let mut body = BString::from(format!("Used {label} for target {}:\n\n", target.name));
+            let mut body = BString::from(format!("Used {label} for target {}:\n", target.name));
             for value in values {
                 body.extend_from_slice(b" * ");
                 body.extend_from_slice(&value);

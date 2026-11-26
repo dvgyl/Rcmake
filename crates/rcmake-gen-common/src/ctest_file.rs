@@ -434,13 +434,7 @@ fn warn_policy(
         category: Some(DiagCategory::Policy),
         policy: Some(id),
         location,
-        body: parts
-            .join(if id == PolicyId::new(110) || id == PolicyId::new(224) {
-                "\n\n"
-            } else {
-                "\n"
-            })
-            .into(),
+        body: parts.join("\n").into(),
     };
     host.write_out(
         Stream::Stderr,

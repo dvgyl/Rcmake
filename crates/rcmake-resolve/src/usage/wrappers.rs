@@ -297,7 +297,7 @@ impl UsageResolver<'_> {
         }
         for (origin, names) in groups {
             let mut body = BString::from(format!(
-                "Used {kind} wrappers for target {}:\n\n",
+                "Used {kind} wrappers for target {}:\n",
                 target.name
             ));
             for name in names {

@@ -274,7 +274,7 @@ fn plan(
             .collect::<Vec<_>>()
             .join(b"\n  ".as_slice());
         let body = BString::from(format!(
-            "Property {selection} of target \"{}\" contained the following header sets that are nonexistent or not {scope}:\n\n  {}",
+            "Property {selection} of target \"{}\" contained the following header sets that are nonexistent or not {scope}:\n  {}",
             target.name,
             BString::from(names)
         ));
@@ -575,7 +575,7 @@ fn policy_warning(model: &ProjectModel, host: &dyn Host, target: &Target) {
         return;
     }
     let body = format!(
-        "Policy CMP0209 is not set: Verify interface header sets checks executables without exports.  Run \"cmake --help-policy CMP0209\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nExecutable target \"{}\" has interface header file sets, but it does not enable exports.  Those headers would be verified under CMP0209 NEW behavior.",
+        "Policy CMP0209 is not set: Verify interface header sets checks executables without exports.  Run \"cmake --help-policy CMP0209\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\nExecutable target \"{}\" has interface header file sets, but it does not enable exports.  Those headers would be verified under CMP0209 NEW behavior.",
         target.name
     );
     let diag = Diagnostic {

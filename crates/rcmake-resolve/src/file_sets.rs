@@ -257,7 +257,7 @@ fn map_set_files(
             {
                 return Err(error(
                     &base.backtrace,
-                    format!("Base directories in file set cannot be subdirectories of each other:\n\n  {spelling}\n  {path}").into(),
+                    format!("Base directories in file set cannot be subdirectories of each other:\n  {spelling}\n  {path}").into(),
                 ));
             }
         }
@@ -276,7 +276,7 @@ fn map_set_files(
             .find_map(|base| relative_member(base, &normalized).map(|relative| (base, relative)))
             .ok_or_else(|| {
                 let mut body = BString::from(format!(
-                    "File:\n\n  {path}\n\nmust be in one of the file set's base directories:\n"
+                    "File:\n  {path}\nmust be in one of the file set's base directories:"
                 ));
                 for base in bases.values() {
                     body.extend_from_slice(b"\n  ");

@@ -16,6 +16,16 @@ pub(super) fn is_direct_link(name: &[u8]) -> bool {
     )
 }
 
+pub(super) fn is_tracked_wrapper(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"COMPILE_WRAPPERS"
+            | b"INTERFACE_COMPILE_WRAPPERS"
+            | b"LINK_WRAPPERS"
+            | b"INTERFACE_LINK_WRAPPERS"
+    )
+}
+
 pub(super) fn set_target_prop(
     target: &mut Target,
     name: &[u8],
@@ -52,7 +62,18 @@ pub(super) fn set_target_prop(
                         target.standard_origins.shift_remove(name);
                     }
                 }
-                set_map(&mut target.props, name, value);
+                if is_tracked_wrapper(name) {
+                    match value {
+                        Some(value) => {
+                            target
+                                .props
+                                .set_tracked(name.into(), value, origin.backtrace.clone());
+                        }
+                        None => target.props.unset(name),
+                    }
+                } else {
+                    set_map(&mut target.props, name, value);
+                }
             }
         },
     }

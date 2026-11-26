@@ -183,12 +183,22 @@ impl<'a> Flags<'a> {
     }
 }
 
+/// Report a `LINK_WHAT_YOU_USE` setting that CMake would apply.
+///
+/// CMake reads the property as a boolean and uses it only for executables,
+/// shared libraries, and module libraries. A value that is not true, such as
+/// `lwyu`, or another target kind gives no notice.
 pub(crate) fn warn_about_wrappers(model: &ProjectModel, host: &dyn Host) {
     for (_, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
-        if target
-            .props
-            .get(b"LINK_WHAT_YOU_USE")
-            .is_some_and(|value| !value.is_empty())
+        let linked = matches!(
+            target.kind,
+            TargetKind::Executable | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+        );
+        if linked
+            && target
+                .props
+                .get(b"LINK_WHAT_YOU_USE")
+                .is_some_and(|value| truth::is_on(value))
         {
             host.write_out(
                 Stream::Stderr,

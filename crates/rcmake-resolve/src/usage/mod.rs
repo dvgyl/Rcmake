@@ -612,6 +612,8 @@ impl<'a> UsageResolver<'a> {
             }
         } else if name == b"SOURCES" {
             self.eval_entries(id, name, &target.sources, ctx, &mut own)?;
+        } else if let Some(entries) = target.props.tracked_entries(name) {
+            self.eval_entries(id, name, entries, ctx, &mut own)?;
         } else if let Some(raw) = target.props.get(name) {
             let entry = BT::new(raw.clone(), target.backtrace.clone());
             self.eval_entries(id, name, &[entry], ctx, &mut own)?;

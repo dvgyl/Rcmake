@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -47,6 +47,10 @@ pub struct ModelGenexHost<'model, 'resolver> {
     /// Keep warnings here instead of writing them, so that the caller can order them
     /// with the errors of the same command.
     pub(crate) deferred_warnings: Option<Rc<RefCell<Vec<BString>>>>,
+    /// Target whose `SOURCES` this host evaluates.
+    pub(super) sources_of: Option<TargetId>,
+    /// Set when the evaluated `SOURCES` ask for the objects of their own target.
+    pub(super) self_objects: Cell<bool>,
 }
 
 impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
@@ -62,6 +66,8 @@ impl<'model, 'resolver> ModelGenexHost<'model, 'resolver> {
             timestamp: None,
             warning_site: None,
             deferred_warnings: None,
+            sources_of: None,
+            self_objects: Cell::new(false),
         }
     }
 
@@ -495,6 +501,12 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         sources: Option<&[u8]>,
     ) -> Option<BString> {
         let id = self.id(target)?;
+        // The objects of a target come from its sources, so its own SOURCES
+        // cannot name them. The caller reports the cycle.
+        if self.sources_of == Some(id) {
+            self.self_objects.set(true);
+            return Some(BString::default());
+        }
         let model = self.resolver.model;
         let target = model.target(id)?;
         let resolved = self
@@ -660,7 +672,7 @@ impl ModelGenexHost<'_, '_> {
             .map_or("", |info| info.summary)
             .replace("``", "");
         let body = format!(
-            "Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nDependency being added to target:\n\n  \"{}\"\n",
+            "Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\nDependency being added to target:\n  \"{}\"\n",
             target.name
         );
         paths.warn_once(

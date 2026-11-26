@@ -336,7 +336,7 @@ pub(crate) fn object_dir(model: &ProjectModel, target: &Target, config: &ConfigI
     }
 }
 
-pub(super) fn short_support_dir(model: &ProjectModel, target: &Target) -> BString {
+pub(crate) fn short_support_dir(model: &ProjectModel, target: &Target) -> BString {
     let relative = build_relative(model, &model.dir(target.dir).binary_dir);
     let directory = if relative.is_empty() {
         b".".as_slice()
@@ -346,19 +346,34 @@ pub(super) fn short_support_dir(model: &ProjectModel, target: &Target) -> BStrin
     let name_hash = sha3_prefix(&target.name, 4);
     let directory_hash = sha3_prefix(directory, 4);
     let short = format!(".o/{name_hash}{directory_hash}");
-    if model.generator == Some(GeneratorKind::UnixMakefiles) {
+    if matches!(
+        model.generator,
+        Some(GeneratorKind::UnixMakefiles | GeneratorKind::VisualStudio(_))
+    ) {
         join(&relative, short.as_bytes())
     } else {
         short.into()
     }
 }
 
+/// Return whether targets use `SHORT` hashed support directories.
+///
+/// The Makefile, Ninja, and Visual Studio generators support the `SHORT`
+/// strategy. Xcode names each support directory after its target, so it always
+/// uses the full layout.
 pub(crate) fn short_object_paths(model: &ProjectModel) -> bool {
-    model.generator.is_some()
-        && model
-            .cache
-            .get(b"CMAKE_INTERMEDIATE_DIR_STRATEGY")
-            .is_some_and(|entry| entry.value == "SHORT")
+    matches!(
+        model.generator,
+        Some(
+            GeneratorKind::Ninja
+                | GeneratorKind::NinjaMultiConfig
+                | GeneratorKind::UnixMakefiles
+                | GeneratorKind::VisualStudio(_)
+        )
+    ) && model
+        .cache
+        .get(b"CMAKE_INTERMEDIATE_DIR_STRATEGY")
+        .is_some_and(|entry| entry.value == "SHORT")
 }
 
 fn sha3_prefix(input: &[u8], length: usize) -> String {

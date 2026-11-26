@@ -162,7 +162,18 @@ impl UsageResolver<'_> {
         let root = &self.model.dir(DirId::ROOT).source_dir;
         let mut host = self.host(dir);
         host.current = ctx.current;
-        evaluate(&ast, &ctx, &mut host).map_err(|error| {
+        if property == b"SOURCES" {
+            host.sources_of = Some(target);
+        }
+        let result = evaluate(&ast, &ctx, &mut host);
+        if host.self_objects.get() {
+            let owner = self.target(target)?;
+            let error = GenexError::SourcesCycle {
+                target: owner.name.clone(),
+            };
+            return Err(error.at(&owner.backtrace, root).into());
+        }
+        result.map_err(|error| {
             if matches!(property, b"LINK_DEPENDS" | b"INTERFACE_LINK_DEPENDS") {
                 return error.without_location().into();
             }

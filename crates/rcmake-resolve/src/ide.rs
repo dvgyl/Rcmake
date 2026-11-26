@@ -888,7 +888,7 @@ pub(crate) fn check_xcode_sources(
                         let mut text = format!("Config \"{}\":", config.0);
                         if !sources.is_empty() {
                             let files = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
-                            text.push_str("\n\n  ");
+                            text.push_str("\n  ");
                             text.push_str(&files.join("\n  "));
                         }
                         text
@@ -897,7 +897,7 @@ pub(crate) fn check_xcode_sources(
                     let first = block(first_config, first_sources);
                     let different = block(config, &sources);
                     let body = format!(
-                        "Target \"{name}\" has source files which vary by configuration. This is not supported by the \"Xcode\" generator.\n\n{first}\n\n{different}"
+                        "Target \"{name}\" has source files which vary by configuration. This is not supported by the \"Xcode\" generator.\n{first}\n{different}"
                     );
                     return Err(module_error(model, paths, target, body.into()));
                 }

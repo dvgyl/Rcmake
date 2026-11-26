@@ -1,7 +1,7 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use rcmake_base::truth;
+use rcmake_base::{BString, truth};
 use rcmake_diag::{
     DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, PolicyStatus, RenderOptions,
     render,
@@ -43,7 +43,7 @@ pub(super) fn warn_policy(
         category: Some(DiagCategory::Policy),
         policy: Some(policy),
         location: Location::Backtrace(crate::lower::listed_backtrace(&target.backtrace)),
-        body: format!("Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n\nSince the policy is not set, {behavior}").into(),
+        body: format!("Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\nSince the policy is not set, {behavior}").into(),
     };
     paths.host.write_out(
         Stream::Stderr,
@@ -82,4 +82,107 @@ pub(super) fn print_link_order(
     }
     output.push('\n');
     paths.host.write_out(Stream::Stderr, output.as_bytes());
+}
+
+/// Warn when an imported target lists an item with an unsupported feature.
+///
+/// Runs during dependency expansion before `LINK_LIBRARY_OVERRIDE*` overrides
+/// and deduplication, matching CMake's `cmComputeLinkDepends`.
+pub(super) fn warn_imported_features(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+    target: &Target,
+    imported: &Target,
+    language: &[u8],
+    items: &[Arc<ResolvedLinkItem>],
+) {
+    if definition(model, target.dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+        .is_some_and(|value| truth::is_on(value))
+    {
+        return;
+    }
+    let language_name = BString::from(language);
+    let warn = |operator: &str, feature: &BString| {
+        let variable = format!("CMAKE_{language_name}_{operator}_USING_{feature}");
+        paths.warn_once(
+            model,
+            MessageKind::AuthorWarning,
+            None,
+            Location::Backtrace(target.backtrace.clone()),
+            format!(
+                "The 'IMPORTED' target '{}' uses the generator-expression '$<{operator}>' with the feature '{feature}', which is undefined or unsupported.\nDid you miss to define it by setting variables \"{variable}\" and \"{variable}_SUPPORTED\"?",
+                imported.name
+            )
+            .into(),
+        );
+    };
+    let check_library = |item: &ResolvedLinkItem| {
+        if item.text.value == target.name || item.text.value.is_empty() {
+            return;
+        }
+        if let Some(feature) = item
+            .feature
+            .as_ref()
+            .filter(|feature| feature.as_slice() != b"DEFAULT")
+            && !is_library_feature_supported(model, target.dir, language, feature)
+        {
+            warn("LINK_LIBRARY", feature);
+        }
+    };
+    for item in items {
+        if let ResolvedLinkKind::Group { feature, members } = &item.kind {
+            if !members.is_empty()
+                && !is_group_feature_supported(model, target.dir, language, feature)
+            {
+                warn("LINK_GROUP", feature);
+            }
+            for member in members {
+                check_library(member);
+            }
+        } else {
+            check_library(item);
+        }
+    }
+}
+
+fn is_library_feature_supported(
+    model: &ProjectModel,
+    dir: DirId,
+    language: &[u8],
+    feature: &[u8],
+) -> bool {
+    let specific = [
+        b"CMAKE_",
+        language,
+        b"_LINK_LIBRARY_USING_",
+        feature,
+        b"_SUPPORTED",
+    ]
+    .concat();
+    if let Some(value) = definition(model, dir, &specific) {
+        return truth::is_on(value);
+    }
+    let generic = [b"CMAKE_LINK_LIBRARY_USING_", feature, b"_SUPPORTED"].concat();
+    definition(model, dir, &generic).is_some_and(|value| truth::is_on(value))
+}
+
+fn is_group_feature_supported(
+    model: &ProjectModel,
+    dir: DirId,
+    language: &[u8],
+    feature: &[u8],
+) -> bool {
+    let specific = [
+        b"CMAKE_",
+        language,
+        b"_LINK_GROUP_USING_",
+        feature,
+        b"_SUPPORTED",
+    ]
+    .concat();
+    if definition(model, dir, &specific).is_some_and(|value| truth::is_on(value)) {
+        return true;
+    }
+    let generic = [b"CMAKE_LINK_GROUP_USING_", feature, b"_SUPPORTED"].concat();
+    definition(model, dir, &generic).is_some_and(|value| truth::is_on(value))
 }
