@@ -34,11 +34,90 @@ impl RecursionBinding {
     }
 }
 
+type Bindings = BTreeMap<BString, Binding>;
+
+#[derive(Debug)]
+enum ScopeBindings {
+    Local(Bindings),
+    Shared(Box<VarLayer>),
+}
+
+impl Default for ScopeBindings {
+    fn default() -> Self {
+        Self::Local(Bindings::new())
+    }
+}
+
+impl ScopeBindings {
+    fn get(&self, name: &[u8], shard: &mut Option<usize>) -> Option<&Binding> {
+        match self {
+            Self::Local(bindings) => bindings.get(name),
+            Self::Shared(bindings) => bindings.get_at(
+                name,
+                *shard.get_or_insert_with(|| VarLayer::shard_index(name)),
+            ),
+        }
+    }
+
+    fn set(&mut self, name: &[u8], value: Binding) {
+        match self {
+            Self::Local(bindings) => {
+                if let Some(current) = bindings.get_mut(name) {
+                    *current = value;
+                } else {
+                    bindings.insert(name.into(), value);
+                }
+            }
+            Self::Shared(bindings) => {
+                bindings.set(name, value);
+            }
+        }
+    }
+
+    fn extend(&mut self, source: Bindings) {
+        match self {
+            Self::Local(bindings) => bindings.extend(source),
+            Self::Shared(bindings) => bindings.extend(source),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&BString, &Binding)> {
+        let (local, shared) = match self {
+            Self::Local(bindings) => (Some(bindings), None),
+            Self::Shared(bindings) => (None, Some(bindings.as_ref())),
+        };
+        local
+            .into_iter()
+            .flat_map(Bindings::iter)
+            .chain(shared.into_iter().flat_map(VarLayer::iter))
+    }
+
+    fn into_bindings(self) -> Bindings {
+        match self {
+            Self::Local(bindings) => bindings,
+            Self::Shared(bindings) => bindings.into_bindings().collect(),
+        }
+    }
+
+    fn snapshot(&mut self) -> VarLayer {
+        match self {
+            Self::Local(bindings) => {
+                let mut shared = VarLayer::default();
+                shared.extend(std::mem::take(bindings));
+                let snapshot = shared.clone();
+                *self = Self::Shared(Box::new(shared));
+                snapshot
+            }
+            Self::Shared(bindings) => bindings.as_ref().clone(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Scope {
     id: u64,
     directory: Option<DirId>,
-    bindings: VarLayer,
+    bindings: ScopeBindings,
     parent_policy: Option<(usize, PolicyStatus)>,
     recursion_limit: RecursionBinding,
 }
@@ -66,7 +145,7 @@ impl Default for VarStack {
             scopes: vec![Scope {
                 id: 0,
                 directory: Some(DirId::ROOT),
-                bindings: VarLayer::default(),
+                bindings: ScopeBindings::default(),
                 parent_policy: None,
                 recursion_limit: RecursionBinding::Inherit,
             }],
@@ -99,11 +178,11 @@ impl VarStack {
 
     /// Find the innermost binding for `name`.
     pub(crate) fn lookup(&self, name: &[u8]) -> Option<&Binding> {
-        let shard = VarLayer::shard_index(name);
+        let mut shard = None;
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.bindings.get_at(name, shard))
+            .find_map(|scope| scope.bindings.get(name, &mut shard))
     }
 
     /// Value of the innermost normal binding, if it is [`Binding::Set`].
@@ -118,13 +197,13 @@ impl VarStack {
     }
 
     pub(crate) fn get_from(&self, name: &[u8], parent: bool) -> Option<&BString> {
-        let shard = VarLayer::shard_index(name);
+        let mut shard = None;
         let binding = self
             .scopes
             .iter()
             .rev()
             .skip(usize::from(parent))
-            .find_map(|scope| scope.bindings.get_at(name, shard));
+            .find_map(|scope| scope.bindings.get(name, &mut shard));
         match binding {
             Some(Binding::Set(v)) => Some(v),
             Some(Binding::Unset) | None => None,
@@ -164,7 +243,7 @@ impl VarStack {
         self.scopes.push(Scope {
             id: self.next_id,
             directory,
-            bindings: VarLayer::default(),
+            bindings: ScopeBindings::default(),
             parent_policy,
             recursion_limit: RecursionBinding::Inherit,
         });
@@ -199,7 +278,7 @@ impl VarStack {
         if !matches!(capture.recursion_limit, RecursionBinding::Inherit) {
             self.update_recursion_limit();
         }
-        let mut bindings: BTreeMap<_, _> = capture.bindings.into_bindings().collect();
+        let mut bindings = capture.bindings.into_bindings();
         bindings.retain(|name, binding| {
             let value = match binding {
                 Binding::Set(value) => Some(&*value),
@@ -259,8 +338,12 @@ impl VarStack {
         true
     }
 
-    pub(crate) fn snapshot(&self) -> VarSnapshot {
-        VarSnapshot::from_layers(self.scopes.iter().map(|scope| scope.bindings.clone()))
+    pub(crate) fn snapshot(&mut self) -> VarSnapshot {
+        VarSnapshot::from_layers(
+            self.scopes
+                .iter_mut()
+                .map(|scope| scope.bindings.snapshot()),
+        )
     }
 
     /// All names with a [`Binding::Set`] value visible from the innermost scope, sorted.
@@ -282,6 +365,25 @@ impl VarStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_keeps_visible_values_after_later_scope_writes() {
+        let mut stack = VarStack::default();
+        stack.set(b"outer", "before".into());
+        stack.set(b"hidden", "outer".into());
+        stack.push();
+        stack.unset(b"hidden");
+        let captured = stack.snapshot();
+        stack.set(b"outer", "after".into());
+        stack.pop();
+        stack.set(b"outer", "next".into());
+        let next = stack.snapshot();
+
+        assert_eq!(captured.get(b"outer"), Some(&"before".into()));
+        assert_eq!(captured.get(b"hidden"), None);
+        assert_eq!(next.get(b"outer"), Some(&"next".into()));
+        assert_eq!(next.get(b"hidden"), Some(&"outer".into()));
+    }
 
     #[test]
     fn unset_shadows_outer_binding() {
@@ -331,12 +433,11 @@ mod tests {
         stack.unset(b"unset");
         assert!(stack.propagate_capture());
 
-        let same_shard = VarLayer::shard_index(b"same");
         assert!(
             !stack
                 .scopes
                 .last()
-                .is_some_and(|scope| scope.bindings.get_at(b"same", same_shard).is_some())
+                .is_some_and(|scope| scope.bindings.get(b"same", &mut None).is_some())
         );
         stack.pop();
         assert_eq!(stack.lookup(b"unset"), Some(&Binding::Unset));
