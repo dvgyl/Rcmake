@@ -559,15 +559,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcmake-ccmake"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-model",
+ "rustix",
+]
+
+[[package]]
 name = "rcmake-cli"
 version = "0.1.0"
 dependencies = [
  "jiff",
  "rcmake-api",
  "rcmake-base",
+ "rcmake-ccmake",
  "rcmake-commands",
  "rcmake-cpack",
  "rcmake-ctest",
+ "rcmake-dap",
  "rcmake-diag",
  "rcmake-eval",
  "rcmake-gen-common",
@@ -664,6 +675,18 @@ dependencies = [
  "rcmake-base",
  "rcmake-json",
  "thiserror",
+]
+
+[[package]]
+name = "rcmake-dap"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-eval",
+ "rcmake-host",
+ "rcmake-json",
+ "rcmake-model",
 ]
 
 [[package]]

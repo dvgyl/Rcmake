@@ -20,8 +20,10 @@ jiff.workspace = true
 rcmake-base.workspace = true
 rcmake-api = { workspace = true, features = ["native", "archive"] }
 rcmake-commands = { workspace = true, features = ["native", "archive"] }
+rcmake-ccmake.workspace = true
 rcmake-cpack.workspace = true
 rcmake-ctest.workspace = true
+rcmake-dap.workspace = true
 rcmake-diag.workspace = true
 rcmake-eval.workspace = true
 rcmake-gen-common.workspace = true

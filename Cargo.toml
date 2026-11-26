@@ -28,6 +28,8 @@ members = [
     "crates/rcmake-lsp",
     "crates/rcmake-instrument",
     "crates/rcmake-cpack",
+    "crates/rcmake-ccmake",
+    "crates/rcmake-dap",
     "crates/rcmake-tool-e",
     "crates/rcmake-gen-xcode",
     "crates/rcmake-gen-vs",
@@ -102,6 +104,8 @@ rcmake-fetch = { path = "crates/rcmake-fetch", default-features = false }
 rcmake-lsp = { path = "crates/rcmake-lsp", default-features = false }
 rcmake-instrument = { path = "crates/rcmake-instrument" }
 rcmake-cpack = { path = "crates/rcmake-cpack" }
+rcmake-ccmake = { path = "crates/rcmake-ccmake" }
+rcmake-dap = { path = "crates/rcmake-dap" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -159,6 +163,12 @@ opt-level = "z"
 opt-level = "z"
 
 [profile.release.package.rcmake-cpack]
+opt-level = "z"
+
+[profile.release.package.rcmake-ccmake]
+opt-level = "z"
+
+[profile.release.package.rcmake-dap]
 opt-level = "z"
 
 [profile.release.package.rcmake-cps]
