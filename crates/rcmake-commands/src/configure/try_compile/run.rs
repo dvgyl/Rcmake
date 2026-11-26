@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, list};
@@ -207,6 +207,7 @@ fn merge_probe_graphs(
         target_map: HashMap<(ConfigId, usize), usize>,
         step_map: HashMap<(ConfigId, usize), usize>,
         shared_custom: HashMap<Vec<BString>, usize>,
+        pending: VecDeque<(ConfigId, usize, usize)>,
     }
 
     impl<'a> Merger<'a> {
@@ -249,7 +250,8 @@ fn merge_probe_graphs(
             Ok(merged_idx)
         }
 
-        fn import_target(&mut self, cfg: &ConfigId, orig_idx: usize) -> Result<usize, ChildError> {
+        /// Reserve a target slot in `merged.targets` and enqueue it for iterative expansion.
+        fn reserve_target(&mut self, cfg: &ConfigId, orig_idx: usize) -> Result<usize, ChildError> {
             let key = (cfg.clone(), orig_idx);
             if let Some(&existing) = self.target_map.get(&key) {
                 return Ok(existing);
@@ -277,55 +279,68 @@ fn merge_probe_graphs(
                 depends: Vec::new(),
                 in_all: orig_target.in_all,
             });
+            self.pending.push_back((cfg.clone(), orig_idx, merged_idx));
+            Ok(merged_idx)
+        }
 
-            let orig_depends = orig_target.depends.clone();
-            let orig_steps = orig_target.steps.clone();
-            let mut merged_depends = Vec::with_capacity(orig_depends.len());
-            for dep_idx in orig_depends {
-                let merged_dep = self.import_target(cfg, dep_idx)?;
-                if !merged_depends.contains(&merged_dep) {
-                    merged_depends.push(merged_dep);
-                }
-            }
-
-            let mut merged_steps = Vec::with_capacity(orig_steps.len());
-            for orig_step in orig_steps {
-                let cross_deps = match graph.steps.get(orig_step) {
-                    Some(BuildStep::Custom(custom)) => custom
-                        .target_dependencies
-                        .iter()
-                        .filter(|(_, dep_cfg)| dep_cfg != cfg)
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    _ => Vec::new(),
+        fn drain(&mut self) -> Result<(), ChildError> {
+            while let Some((cfg, orig_idx, merged_idx)) = self.pending.pop_front() {
+                let graph = select_graph(self.resolved, self.file_config, &cfg)?;
+                let Some(orig_target) = graph.targets.get(orig_idx) else {
+                    return Err(ChildError::Generate(format!(
+                        "Missing build target {orig_idx} in configuration '{}'.",
+                        cfg.0
+                    )));
                 };
-                for (dep_id, dep_cfg) in cross_deps {
-                    let dep_graph = select_graph(self.resolved, self.file_config, &dep_cfg)?;
-                    let dep_orig = dep_graph
-                        .target_ids
-                        .iter()
-                        .position(|id| *id == dep_id)
-                        .or_else(|| {
-                            self.model.target(dep_id).and_then(|t| {
-                                dep_graph.targets.iter().position(|gt| gt.name == t.name)
-                            })
-                        });
-                    if let Some(dep_orig) = dep_orig {
-                        let merged_dep = self.import_target(&dep_cfg, dep_orig)?;
-                        if !merged_depends.contains(&merged_dep) {
-                            merged_depends.push(merged_dep);
-                        }
+                let orig_depends = orig_target.depends.clone();
+                let orig_steps = orig_target.steps.clone();
+                let mut merged_depends = Vec::with_capacity(orig_depends.len());
+                for dep_idx in orig_depends {
+                    let merged_dep = self.reserve_target(&cfg, dep_idx)?;
+                    if !merged_depends.contains(&merged_dep) {
+                        merged_depends.push(merged_dep);
                     }
                 }
-                let merged_step = self.import_step(cfg, graph, orig_step)?;
-                merged_steps.push(merged_step);
-            }
 
-            if let Some(slot) = self.merged.targets.get_mut(merged_idx) {
-                slot.steps = merged_steps;
-                slot.depends = merged_depends;
+                let mut merged_steps = Vec::with_capacity(orig_steps.len());
+                for orig_step in orig_steps {
+                    let cross_deps = match graph.steps.get(orig_step) {
+                        Some(BuildStep::Custom(custom)) => custom
+                            .target_dependencies
+                            .iter()
+                            .filter(|(_, dep_cfg)| dep_cfg != &cfg)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    };
+                    for (dep_id, dep_cfg) in cross_deps {
+                        let dep_graph = select_graph(self.resolved, self.file_config, &dep_cfg)?;
+                        let dep_orig = dep_graph
+                            .target_ids
+                            .iter()
+                            .position(|id| *id == dep_id)
+                            .or_else(|| {
+                                self.model.target(dep_id).and_then(|t| {
+                                    dep_graph.targets.iter().position(|gt| gt.name == t.name)
+                                })
+                            });
+                        if let Some(dep_orig) = dep_orig {
+                            let merged_dep = self.reserve_target(&dep_cfg, dep_orig)?;
+                            if !merged_depends.contains(&merged_dep) {
+                                merged_depends.push(merged_dep);
+                            }
+                        }
+                    }
+                    let merged_step = self.import_step(&cfg, graph, orig_step)?;
+                    merged_steps.push(merged_step);
+                }
+
+                if let Some(slot) = self.merged.targets.get_mut(merged_idx) {
+                    slot.steps = merged_steps;
+                    slot.depends = merged_depends;
+                }
             }
-            Ok(merged_idx)
+            Ok(())
         }
     }
 
@@ -340,6 +355,7 @@ fn merge_probe_graphs(
         target_map: HashMap::new(),
         step_map: HashMap::new(),
         shared_custom: HashMap::new(),
+        pending: VecDeque::new(),
     };
 
     let mut root_names = Vec::new();
@@ -365,12 +381,13 @@ fn merge_probe_graphs(
             indices
         };
         for orig_idx in root_indices {
-            let merged_idx = merger.import_target(target_cfg, orig_idx)?;
+            let merged_idx = merger.reserve_target(target_cfg, orig_idx)?;
             if let Some(target) = merger.merged.targets.get(merged_idx) {
                 root_names.push(target.name.clone());
             }
         }
     }
+    merger.drain()?;
     Ok((merger.merged, root_names))
 }
 
