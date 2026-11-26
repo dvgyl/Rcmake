@@ -331,6 +331,50 @@ fn strict_denies_file_upload_through_interpreter() -> HostResult<()> {
 }
 
 #[test]
+fn strict_glob_reports_an_earlier_cache_mismatch_before_a_later_denied_read() -> HostResult<()> {
+    let (inner, runtime) = setup(HermeticMode::Strict)?;
+    let source = absolute("/project");
+    let build = absolute("/build");
+    inner.seed_file(&source.join("A/old.txt"), b"old")?;
+    let private = path::from_native(&absolute("/private"));
+    let script = format!(
+        "cmake_minimum_required(VERSION 4.5)\n\
+         project(Audit NONE)\n\
+         file(GLOB first CONFIGURE_DEPENDS ${{CMAKE_SOURCE_DIR}}/A/*.txt)\n\
+         file(WRITE ${{CMAKE_SOURCE_DIR}}/A/new.txt new)\n\
+         file(GLOB second CONFIGURE_DEPENDS ${{CMAKE_SOURCE_DIR}}/A/*.txt {private}/*)\n"
+    );
+    inner.seed_file(&source.join("CMakeLists.txt"), script.as_bytes())?;
+    let mut interp = Interp::new(
+        InterpConfig {
+            host: runtime.host(),
+            mode: RunMode::Configure,
+            cmake_root: source.join("data"),
+            cmake_command: absolute("/bin/approved"),
+            cwd: source.clone(),
+            limits: Default::default(),
+            diag: Default::default(),
+            services: Default::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        crate::register_all,
+    );
+    runtime.install(&mut interp);
+    let outcome = interp.run_configure(&source, &build, &[]);
+    let diagnostics = inner.stream_bytes(Stream::Stderr).to_string();
+    assert_eq!(outcome.exit_code, 1, "{diagnostics}");
+    let expression = format!("{}/A/*.txt", path::from_native(&source));
+    assert!(diagnostics.contains(&expression), "{diagnostics}");
+    assert!(
+        !diagnostics.contains("RCMAKE_HERMETIC_READ"),
+        "{diagnostics}"
+    );
+    assert!(!runtime.denied(), "{diagnostics}");
+    Ok(())
+}
+
+#[test]
 fn strict_denies_undeclared_read_and_unapproved_process_from_bundled_module() -> HostResult<()> {
     let (inner, runtime) = setup(HermeticMode::Strict)?;
     let data = absolute("/data");

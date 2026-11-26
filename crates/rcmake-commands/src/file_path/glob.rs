@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rcmake_base::{BString, list, truth};
-use rcmake_diag::{PolicyId, PolicyStatus};
+use rcmake_diag::{DiagAction, DiagCategory, PolicyId, PolicyStatus};
 use rcmake_eval::{Cx, RunMode};
 use rcmake_host::{
     FileKind, Follow,
@@ -34,24 +34,24 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
         follow: recursive && cx.policy(PolicyId::new(9)) != PolicyStatus::New,
         relative: None,
     };
-    let mut output = BTreeSet::new();
-    let mut budget = cx.limits().regex_steps;
-    let mut bytes = 0_usize;
+    let mut state = State {
+        output: BTreeSet::new(),
+        budget: cx.limits().regex_steps,
+        bytes: 0,
+    };
     let mut evaluated = false;
     let mut expressions = Vec::<Expression<'_>>::new();
     let mut configure_depends = false;
     macro_rules! flush_globs {
         () => {
-            Glob::new(
-                cx,
-                &options,
-                &mut output,
-                &mut budget,
-                &mut bytes,
-                &expressions,
+            let batch = Batch {
+                options: &options,
+                expressions: &expressions,
                 configure_depends,
-            )
-            .run(out)?;
+                variable: out,
+                warning_limit: RETAINED_WARNING_BYTES,
+            };
+            batch.run(cx, &mut state)?;
             expressions.clear();
         };
     }
@@ -95,6 +95,13 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
             }
             b"CONFIGURE_DEPENDS" => {
                 flush_globs!();
+                // CMake gives this warning before it checks for the next expression.
+                if evaluated && !configure_depends {
+                    warning(
+                        cx,
+                        "CONFIGURE_DEPENDS flag was given after a glob expression was already evaluated.",
+                    );
+                }
                 if args.len() == 0 {
                     return Err(error(
                         [
@@ -104,22 +111,23 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
                         .concat(),
                     ));
                 }
-                if evaluated && !configure_depends {
-                    warning(
-                        cx,
-                        "CONFIGURE_DEPENDS flag was given after a glob expression was already evaluated.",
-                    );
-                }
                 configure_depends = true;
             }
             pattern => {
                 evaluated = true;
-                expressions.push(Expression::new(cx, pattern)?);
+                match Expression::new(cx, pattern) {
+                    Ok(expression) => expressions.push(expression),
+                    Err(cause) => {
+                        // The earlier expressions run first, so their errors come first.
+                        flush_globs!();
+                        return Err(cause);
+                    }
+                }
             }
         }
     }
     flush_globs!();
-    set(cx, out, list::join(output))
+    set(cx, out, list::join(state.output))
 }
 
 fn record(
@@ -247,18 +255,145 @@ impl<'a> Expression<'a> {
     }
 }
 
+/// The result list, the regex step budget, and the counted result bytes of one call.
+struct State {
+    output: BTreeSet<BString>,
+    budget: u64,
+    bytes: usize,
+}
+
+/// The largest total size of cycle warnings that one batch walk keeps.
+///
+/// A batch walk emits its warnings only after the walk. A larger total stops
+/// the batch, and the expressions then run one at a time with direct warnings.
+const RETAINED_WARNING_BYTES: usize = 1024 * 1024;
+
+/// The expressions between two option changes of one `file(GLOB)` call.
+struct Batch<'a> {
+    options: &'a Options,
+    expressions: &'a [Expression<'a>],
+    configure_depends: bool,
+    variable: &'a [u8],
+    warning_limit: usize,
+}
+
+impl Batch<'_> {
+    /// Run the expressions with the result, diagnostics, and errors of a run in expression order.
+    ///
+    /// One walk does the shared directory reads for all expressions. That walk
+    /// has no side effects until it completes. If the walk fails or reaches a
+    /// limit, the expressions run again one at a time, so the first error,
+    /// the cache checks, and the warnings stay in expression order.
+    ///
+    /// An audit host reports a denied read when the read occurs. A shared walk
+    /// could then report a later expression before an earlier cache mismatch,
+    /// so with an audit host the expressions always run one at a time.
+    fn run(&self, cx: &mut Cx<'_>, state: &mut State) -> Result<()> {
+        if self.expressions.len() > 1
+            && !crate::hermetic::audits_reads(cx)
+            && self.run_shared(cx, state)?
+        {
+            return Ok(());
+        }
+        for expression in self.expressions {
+            let glob = Glob::new(
+                cx,
+                self.options,
+                state,
+                std::slice::from_ref(expression),
+                self.configure_depends,
+                Warnings::Direct,
+            );
+            let (result, mut results, bytes) = glob.walk_all();
+            state.bytes = bytes;
+            result?;
+            let matched = results.pop().map(|glob| glob.matched).unwrap_or_default();
+            if self.configure_depends {
+                record(cx, self.variable, expression.text, self.options, &matched)?;
+            }
+            state.output.extend(matched);
+        }
+        Ok(())
+    }
+
+    /// Return `false` without side effects if the shared walk cannot give the exact result.
+    fn run_shared(&self, cx: &mut Cx<'_>, state: &mut State) -> Result<bool> {
+        let warnings = if cx.diag_state().get(DiagCategory::Author) == DiagAction::Ignore {
+            Warnings::Drop
+        } else {
+            Warnings::Retain {
+                left: self.warning_limit,
+            }
+        };
+        let budget = state.budget;
+        let glob = Glob::new(
+            cx,
+            self.options,
+            state,
+            self.expressions,
+            self.configure_depends,
+            warnings,
+        );
+        let (result, results, _) = glob.walk_all();
+        // Count the bytes as a run in expression order counts them.
+        let mut bytes = state.bytes;
+        let mut seen = BTreeSet::new();
+        for name in results.iter().flat_map(|glob| &glob.matched) {
+            if self.configure_depends || (!state.output.contains(name) && seen.insert(name)) {
+                bytes = bytes.saturating_add(name.len() + 1);
+            }
+        }
+        if result.is_err() || bytes > cx.limits().max_value_bytes.saturating_add(1) {
+            state.budget = budget;
+            return Ok(false);
+        }
+        state.bytes = bytes;
+        for (expression, glob) in self.expressions.iter().zip(results) {
+            for message in glob.warnings {
+                warning(cx, message);
+            }
+            if self.configure_depends {
+                record(
+                    cx,
+                    self.variable,
+                    expression.text,
+                    self.options,
+                    &glob.matched,
+                )?;
+            }
+            state.output.extend(glob.matched);
+        }
+        Ok(true)
+    }
+}
+
+/// How a walk handles cycle warnings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Warnings {
+    /// Emit each warning when the walk finds the cycle.
+    Direct,
+    /// Keep the warnings until the walk completes. Stop the walk if more than
+    /// `left` bytes are necessary.
+    Retain { left: usize },
+    /// Do not make the warnings, because author warnings are disabled.
+    Drop,
+}
+
 struct Glob<'a, 'cx> {
     cx: &'a mut Cx<'cx>,
     options: &'a Options,
-    output: &'a mut BTreeSet<BString>,
+    output: &'a BTreeSet<BString>,
     budget: &'a mut u64,
-    bytes: &'a mut usize,
+    bytes: usize,
     expressions: &'a [Expression<'a>],
     results: Vec<GlobResult>,
+    warnings: Warnings,
+    /// `true` with CONFIGURE_DEPENDS, where each expression counts its own matches.
+    configure_depends: bool,
 }
 
 struct GlobResult {
-    matched: Option<BTreeSet<BString>>,
+    matched: BTreeSet<BString>,
     warnings: Vec<BString>,
     links: Vec<FollowedLink>,
 }
@@ -280,31 +415,33 @@ impl<'a, 'cx> Glob<'a, 'cx> {
     fn new(
         cx: &'a mut Cx<'cx>,
         options: &'a Options,
-        output: &'a mut BTreeSet<BString>,
-        budget: &'a mut u64,
-        bytes: &'a mut usize,
+        state: &'a mut State,
         expressions: &'a [Expression<'a>],
         configure_depends: bool,
+        warnings: Warnings,
     ) -> Self {
         Self {
             cx,
             options,
-            output,
-            budget,
-            bytes,
+            output: &state.output,
+            budget: &mut state.budget,
+            bytes: state.bytes,
             expressions,
             results: expressions
                 .iter()
                 .map(|_| GlobResult {
-                    matched: configure_depends.then(BTreeSet::new),
+                    matched: BTreeSet::new(),
                     warnings: Vec::new(),
                     links: Vec::new(),
                 })
                 .collect(),
+            warnings,
+            configure_depends,
         }
     }
 
-    fn run(mut self, variable: &[u8]) -> Result<()> {
+    /// Walk every expression and return the walk result, the matches, and the counted bytes.
+    fn walk_all(mut self) -> (Result<()>, Vec<GlobResult>, usize) {
         let mut roots = BTreeMap::<&Path, Vec<Cursor<'_>>>::new();
         for (index, expression) in self.expressions.iter().enumerate() {
             if !expression.patterns.is_empty() {
@@ -320,18 +457,7 @@ impl<'a, 'cx> Glob<'a, 'cx> {
         let result = roots
             .into_iter()
             .try_for_each(|(root, cursors)| self.walk(root, &cursors, 0));
-        for (expression, glob) in self.expressions.iter().zip(self.results) {
-            for message in glob.warnings {
-                warning(self.cx, message);
-            }
-            if result.is_ok()
-                && let Some(matched) = glob.matched
-            {
-                record(self.cx, variable, expression.text, self.options, &matched)?;
-                self.output.extend(matched);
-            }
-        }
-        result
+        (result, self.results, self.bytes)
     }
 
     fn walk(&mut self, path: &Path, cursors: &[Cursor<'_>], depth: u32) -> Result<()> {
@@ -401,7 +527,7 @@ impl<'a, 'cx> Glob<'a, 'cx> {
                         let Some(link) = link else {
                             continue;
                         };
-                        if self.link_cycle(cursor.expression, &child, link) {
+                        if self.link_cycle(cursor.expression, &child, link)? {
                             continue;
                         }
                     }
@@ -444,19 +570,23 @@ impl<'a, 'cx> Glob<'a, 'cx> {
         Some(FollowedLink { parent, target })
     }
 
-    fn link_cycle(&mut self, index: usize, path: &Path, link: &FollowedLink) -> bool {
+    /// Return `true` if the link target is already on the followed link stack.
+    fn link_cycle(&mut self, index: usize, path: &Path, link: &FollowedLink) -> Result<bool> {
         let (Some(glob), Some(expression)) =
             (self.results.get_mut(index), self.expressions.get(index))
         else {
-            return false;
+            return Ok(false);
         };
         let Some(start) = glob
             .links
             .iter()
             .position(|previous| previous.target == link.target)
         else {
-            return false;
+            return Ok(false);
         };
+        if self.warnings == Warnings::Drop {
+            return Ok(true);
+        }
         let mut message = BString::from(
             [
                 b"Cyclic recursion detected while globbing for '",
@@ -473,8 +603,17 @@ impl<'a, 'cx> Glob<'a, 'cx> {
             message.extend_from_slice(b"\n");
             message.extend_from_slice(&from_native_cmake(&link.parent.join(name)));
         }
-        glob.warnings.push(message);
-        true
+        match &mut self.warnings {
+            Warnings::Direct => warning(self.cx, message),
+            Warnings::Retain { left } => {
+                *left = left
+                    .checked_sub(message.len())
+                    .ok_or_else(|| error("GLOB keeps too many cycle warnings"))?;
+                glob.warnings.push(message);
+            }
+            Warnings::Drop => {}
+        }
+        Ok(true)
     }
 
     fn insert(&mut self, path: &Path, index: usize) -> Result<()> {
@@ -489,17 +628,161 @@ impl<'a, 'cx> Glob<'a, 'cx> {
             full
         };
         let size = name.len();
-        let output = self
-            .results
-            .get_mut(index)
-            .and_then(|glob| glob.matched.as_mut())
-            .unwrap_or(self.output);
-        if output.insert(name) {
-            *self.bytes = self.bytes.saturating_add(size + 1);
-            if *self.bytes > self.cx.limits().max_value_bytes.saturating_add(1) {
+        let Some(glob) = self.results.get_mut(index) else {
+            return Ok(());
+        };
+        // Without CONFIGURE_DEPENDS, a name counts once for the full call.
+        let counted = self.configure_depends || !self.output.contains(&name);
+        if glob.matched.insert(name) && counted {
+            self.bytes = self.bytes.saturating_add(size + 1);
+            if self.bytes > self.cx.limits().max_value_bytes.saturating_add(1) {
                 return Err(error("GLOB exceeds the variable size limit"));
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rcmake_eval::{CmdError, Interp, InterpConfig};
+    use rcmake_host::{Host, PureHost, Stream};
+
+    use super::*;
+    use crate::test_support::TestResult;
+
+    const DRIVE: &str = if cfg!(windows) { "C:" } else { "" };
+
+    /// Make a tree in which each followed link reaches four cycles.
+    fn cyclic_tree() -> TestResult<(Arc<PureHost>, Interp)> {
+        let cwd = format!("{DRIVE}/work");
+        let host = Arc::new(PureHost::new(cwd.clone().into(), "/cmake/bin/cmake".into()));
+        host.seed_file(Path::new(&format!("{cwd}/tree/sub/file.txt")), b"data")?;
+        for index in 0..4 {
+            host.symlink(
+                Path::new(".."),
+                Path::new(&format!("{cwd}/tree/sub/loop{index}")),
+            )?;
+        }
+        let interp = Interp::new(
+            InterpConfig::new(
+                host.clone(),
+                RunMode::Script,
+                "/cmake",
+                "/cmake/bin/cmake",
+                cwd,
+            ),
+            super::super::register,
+        );
+        Ok((host, interp))
+    }
+
+    fn texts() -> [String; 2] {
+        [
+            format!("{DRIVE}/work/tree/*"),
+            format!("{DRIVE}/work/tree/*.txt"),
+        ]
+    }
+
+    fn options() -> Options {
+        Options {
+            recursive: true,
+            directories: false,
+            follow: true,
+            relative: None,
+        }
+    }
+
+    fn state(cx: &Cx<'_>) -> State {
+        State {
+            output: BTreeSet::new(),
+            budget: cx.limits().regex_steps,
+            bytes: 0,
+        }
+    }
+
+    fn run_batch(
+        interp: &mut Interp,
+        warning_limit: usize,
+    ) -> core::result::Result<BTreeSet<BString>, CmdError> {
+        let mut cx = interp.cx();
+        let texts = texts();
+        let expressions = texts
+            .iter()
+            .map(|text| Expression::new(&mut cx, text.as_bytes()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut state = state(&cx);
+        Batch {
+            options: &options(),
+            expressions: &expressions,
+            configure_depends: false,
+            variable: b"out",
+            warning_limit,
+        }
+        .run(&mut cx, &mut state)?;
+        Ok(state.output)
+    }
+
+    #[test]
+    fn disabled_author_warnings_keep_no_cycle_warning_text() -> TestResult {
+        let (_host, mut interp) = cyclic_tree()?;
+        let mut cx = interp.cx();
+        let texts = texts();
+        let expressions = texts
+            .iter()
+            .map(|text| Expression::new(&mut cx, text.as_bytes()))
+            .collect::<Result<Vec<_>>>()
+            .map_err(|error| format!("{error:?}"))?;
+        let options = options();
+        let mut kept = Vec::new();
+        for warnings in [Warnings::Retain { left: usize::MAX }, Warnings::Drop] {
+            let mut state = state(&cx);
+            let glob = Glob::new(&mut cx, &options, &mut state, &expressions, false, warnings);
+            let (result, results, _) = glob.walk_all();
+            result.map_err(|error| format!("{error:?}"))?;
+            kept.push(
+                results
+                    .iter()
+                    .map(|glob| glob.warnings.len())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let [retained, dropped] = kept.as_slice() else {
+            return Err("Expected two walks.".into());
+        };
+        assert!(retained.iter().all(|&count| count > 0), "{retained:?}");
+        assert_eq!(dropped, &[0, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_over_the_warning_limit_runs_each_expression_with_direct_warnings() -> TestResult {
+        let (wide, mut unlimited) = cyclic_tree()?;
+        let expected =
+            run_batch(&mut unlimited, usize::MAX).map_err(|error| format!("{error:?}"))?;
+        let (narrow, mut limited) = cyclic_tree()?;
+        let output = run_batch(&mut limited, 16).map_err(|error| format!("{error:?}"))?;
+        assert_eq!(output, expected);
+        assert!(
+            output
+                .iter()
+                .any(|name| name.ends_with(b"/tree/sub/file.txt"))
+        );
+        let warnings = wide.stream_bytes(Stream::Stderr).to_string();
+        assert_eq!(narrow.stream_bytes(Stream::Stderr).to_string(), warnings);
+        let [all, txt] = texts();
+        let first = warnings
+            .find(&format!("globbing for '{all}'"))
+            .ok_or("Missing warning for the first expression.")?;
+        let last = warnings
+            .rfind(&format!("globbing for '{all}'"))
+            .ok_or("Missing warning for the first expression.")?;
+        let second = warnings
+            .find(&format!("globbing for '{txt}'"))
+            .ok_or("Missing warning for the second expression.")?;
+        assert!(first < second && last < second, "{warnings}");
         Ok(())
     }
 }

@@ -50,6 +50,15 @@ pub struct GitMirror<'a> {
     program: BString,
 }
 
+/// The inputs of one mirror clone into a staging directory.
+struct MirrorCopy<'c> {
+    cwd: &'c Path,
+    global: &'c [BString],
+    options: &'c [BString],
+    mirror: &'c Path,
+    stage: &'c Path,
+}
+
 impl<'a> GitMirror<'a> {
     /// Use the `git` directory below an absolute cache root.
     pub fn new(host: &'a dyn Host, cache_root: &Path) -> Result<Self, FetchError> {
@@ -162,18 +171,14 @@ impl<'a> GitMirror<'a> {
         let normalized = repository_at(repository, &cwd)?;
         self.with_mirror(&normalized, Some(&commit), &[], &cwd, |mirror| {
             self.staged_checkout(&source_dir, |stage| {
-                self.git(
-                    &cwd,
-                    vec![
-                        "clone".into(),
-                        "--no-checkout".into(),
-                        "--no-hardlinks".into(),
-                        "--".into(),
-                        from_native(mirror),
-                        from_native(stage),
-                    ],
-                    true,
-                )?;
+                let copy = MirrorCopy {
+                    cwd: &cwd,
+                    global: &[],
+                    options: &[BString::from("--no-checkout")],
+                    mirror,
+                    stage,
+                };
+                self.copy_mirror(&copy, Some(&commit))?;
                 self.restore_remote(stage, "origin", &normalized)?;
                 self.checkout_commit(stage, &commit)
             })
@@ -212,60 +217,55 @@ impl<'a> GitMirror<'a> {
             .collect::<Vec<_>>();
         self.with_mirror(&repository, pin.as_deref(), &config, cwd, |mirror| {
             self.staged_checkout(&source_dir, |stage| {
-                if let Some(commit) = &pin
-                    && !self.read_only
-                    && !clone.options.iter().any(|flag| flag == "--depth")
-                    && self.owns_full_objects(mirror)
-                {
-                    let mut args = clone.global.to_vec();
-                    args.extend([BString::from("clone"), "--no-hardlinks".into()]);
-                    args.extend_from_slice(clone.options);
-                    args.extend(["--".into(), from_native(mirror), from_native(stage)]);
-                    if self.git(cwd, args, true).is_ok()
-                        && self.owns_full_objects(&stage.join(".git"))
-                        && self
-                            .has_commit(stage, &stage.join(".git"), commit)
-                            .is_ok_and(|found| found)
-                    {
-                        return self.restore_remote(stage, clone.origin, &repository);
-                    }
-                    self.remove_stage(stage)?;
-                }
-                let mut args = clone.global.to_vec();
-                args.extend([BString::from("clone"), "--no-local".into()]);
-                args.extend_from_slice(clone.options);
-                args.extend(["--".into(), from_native(mirror), from_native(stage)]);
-                self.git(cwd, args, true)?;
-                if let Some(commit) = &pin {
-                    self.git(
-                        stage,
-                        vec![
-                            "fetch".into(),
-                            "--no-tags".into(),
-                            "--".into(),
-                            from_native(mirror),
-                            commit.as_str().into(),
-                        ],
-                        true,
-                    )?;
-                }
+                let copy = MirrorCopy {
+                    cwd,
+                    global: clone.global,
+                    options: clone.options,
+                    mirror,
+                    stage,
+                };
+                self.copy_mirror(&copy, pin.as_deref())?;
                 self.restore_remote(stage, clone.origin, &repository)
             })
         })
     }
 
-    fn owns_full_objects(&self, repository: &Path) -> bool {
-        [
-            "shallow",
-            "objects/info/alternates",
-            "objects/info/http-alternates",
-        ]
-        .iter()
-        .all(|path| {
-            self.host
-                .metadata(&repository.join(path), Follow::No)
-                .is_err_and(|error| error.kind == ErrorKind::NotFound)
-        })
+    /// Clone the mirror into the stage and make sure that the stage has the pin.
+    ///
+    /// Use the `--no-local` transfer for every clone. The receiving side computes the ID of
+    /// each object from its contents, so Git rejects a mirror with a missing
+    /// object or with an object whose contents do not match its ID. A local
+    /// copy of the object files does not check either condition, and a full
+    /// content check of that copy costs about as much as the transfer.
+    fn copy_mirror(&self, copy: &MirrorCopy<'_>, pin: Option<&str>) -> Result<(), FetchError> {
+        let mut args = copy.global.to_vec();
+        args.extend([BString::from("clone"), "--no-local".into()]);
+        args.extend_from_slice(copy.options);
+        args.extend([
+            "--".into(),
+            from_native(copy.mirror),
+            from_native(copy.stage),
+        ]);
+        self.git(copy.cwd, args, true)?;
+        // A clone transfers only the objects that its refs reach. Fetch an older pin.
+        if let Some(commit) = pin
+            && !self
+                .has_commit(copy.stage, &copy.stage.join(".git"), commit)
+                .is_ok_and(|found| found)
+        {
+            self.git(
+                copy.stage,
+                vec![
+                    "fetch".into(),
+                    "--no-tags".into(),
+                    "--".into(),
+                    from_native(copy.mirror),
+                    commit.into(),
+                ],
+                true,
+            )?;
+        }
+        Ok(())
     }
 
     /// Detach an existing checkout at a full commit ID without network access.

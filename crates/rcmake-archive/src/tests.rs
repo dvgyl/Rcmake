@@ -8,6 +8,7 @@ use zip::{ZipArchive, ZipWriter, extra_fields::ExtraField, write::SimpleFileOpti
 
 use super::*;
 
+mod apple_double;
 mod limits;
 #[cfg(unix)]
 mod oracle;

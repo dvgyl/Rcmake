@@ -1068,6 +1068,66 @@ fn file_glob_reports_configure_depends_diagnostics() -> TestResult {
 }
 
 #[test]
+fn file_glob_warns_about_a_late_configure_depends_before_a_missing_expression() -> TestResult {
+    let (host, mut interp) = interpreter_with_mode(RunMode::Configure);
+    let source = Path::new("/work/src");
+    host.seed_file(
+        &source.join("CMakeLists.txt"),
+        b"file(GLOB v a CONFIGURE_DEPENDS)\n",
+    )?;
+    assert_eq!(
+        interp
+            .run_configure(source, Path::new("/work/build"), &[])
+            .exit_code,
+        1
+    );
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    let warning = stderr
+        .find("CONFIGURE_DEPENDS flag was given after a glob expression was already")
+        .ok_or_else(|| format!("Missing late-option warning: {stderr}"))?;
+    let error = stderr
+        .find("file GLOB requires a glob expression after CONFIGURE_DEPENDS.")
+        .ok_or_else(|| format!("Missing expression error: {stderr}"))?;
+    assert!(warning < error, "{stderr}");
+    Ok(())
+}
+
+// The synthetic link loop gives `ELOOP` only on Unix hosts.
+#[cfg(unix)]
+#[test]
+fn file_glob_keeps_expression_order_for_cache_checks_and_read_errors() -> TestResult {
+    for (expressions, mismatch) in [("A/*.txt spin/*.txt", true), ("spin/*.txt A/*.txt", false)] {
+        let (host, mut interp) = interpreter_with_mode(RunMode::Configure);
+        let source = Path::new("/work/src");
+        host.seed_file(&source.join("A/old.txt"), b"old")?;
+        host.symlink(Path::new("spin"), &source.join("spin"))?;
+        host.seed_file(
+            &source.join("CMakeLists.txt"),
+            format!(
+                "file(GLOB first CONFIGURE_DEPENDS A/*.txt)\n\
+                 file(WRITE ${{CMAKE_CURRENT_SOURCE_DIR}}/A/new.txt new)\n\
+                 file(GLOB second CONFIGURE_DEPENDS {expressions})\n"
+            )
+            .as_bytes(),
+        )?;
+        assert_eq!(
+            interp
+                .run_configure(source, Path::new("/work/build"), &[])
+                .exit_code,
+            1
+        );
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert_eq!(stderr.contains("/work/src/A/*.txt"), mismatch, "{stderr}");
+        assert_eq!(
+            stderr.contains("cannot read directory"),
+            !mismatch,
+            "{stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn file_glob_recurse_stops_only_when_a_symlink_target_repeats() -> TestResult {
     let (host, mut interp) = interpreter_in(RunMode::Script, &format!("{DRIVE}/work"));
     script(

@@ -75,6 +75,7 @@ impl Directory {
 
         let mut entry = Entry {
             name,
+            stored_name: name,
             extra,
             method: word(header, 6)?,
             flags: word(header, 4)?,
@@ -117,7 +118,10 @@ impl Directory {
 }
 
 pub(super) struct Entry<'a> {
+    /// The name after a valid Unicode Path extra field (`0x7075`) replaces it.
     pub(super) name: &'a [u8],
+    /// The name as the central directory stores it.
+    pub(super) stored_name: &'a [u8],
     pub(super) size: u64,
     pub(super) mode: Option<u32>,
     local_end: u64,
@@ -247,6 +251,86 @@ impl Entry<'_> {
             return Err(invalid_header());
         }
         Ok(())
+    }
+}
+
+impl Entry<'_> {
+    /// Read AppleDouble metadata as the macOS reader of CMake does before it discards it.
+    ///
+    /// That reader supports only stored and deflated metadata of at most 4 MiB.
+    /// It does not check the CRC.
+    pub(super) fn check_mac_metadata(&self, input: &mut dyn ReadSeek) -> Result<(), ArchiveError> {
+        const LIMIT: u64 = 4 * 1024 * 1024;
+        let error = |message: &str| {
+            ArchiveError::new(format!(
+                "Problem with archive_read_next_header(): {message}"
+            ))
+        };
+        match self.method {
+            0 if self.size != self.compressed => {
+                return Err(error("Malformed OS X metadata entry: inconsistent size"));
+            }
+            0 | 8 => {}
+            method => {
+                return Err(error(&format!(
+                    "Unsupported ZIP compression method ({})",
+                    compression_name(method)
+                )));
+            }
+        }
+        if let Some(size) = [self.size, self.compressed]
+            .into_iter()
+            .find(|&size| size > LIMIT)
+        {
+            return Err(error(&format!(
+                "Mac metadata is too large: {size} > 4M bytes"
+            )));
+        }
+        let start = self.payload_start(input)?;
+        input.seek(SeekFrom::Start(start)).map_err(archive_error)?;
+        let packed = BufReader::new(input.take(self.compressed));
+        let mut sink = std::io::sink();
+        let read = if self.method == 0 {
+            std::io::copy(&mut packed.take(self.size), &mut sink)
+        } else {
+            std::io::copy(&mut DeflateDecoder::new(packed).take(self.size), &mut sink)
+        };
+        match read {
+            Ok(_) => Ok(()),
+            Err(cause) if cause.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err(error("Truncated ZIP file body"))
+            }
+            Err(_) => Err(error("ZIP decompression failed (-3)")),
+        }
+    }
+}
+
+/// Return the libarchive name of a ZIP compression method.
+fn compression_name(method: u16) -> &'static str {
+    match method {
+        0 => "uncompressed",
+        1 => "shrinking",
+        2 => "reduced-1",
+        3 => "reduced-2",
+        4 => "reduced-3",
+        5 => "reduced-4",
+        6 => "imploded",
+        7 | 11 | 13 | 15..=17 => "reserved",
+        8 => "deflation",
+        9 => "deflation-64-bit",
+        10 => "ibm-terse",
+        12 => "bzip",
+        14 => "lzma",
+        18 => "ibm-terse-new",
+        19 => "ibm-lz777",
+        20 => "zstd-deprecated",
+        93 => "zstd",
+        95 => "xz",
+        96 => "jpeg",
+        97 => "wav-pack",
+        98 => "ppmd-1",
+        99 => "aes",
+        _ => "??",
     }
 }
 

@@ -11,7 +11,7 @@ use tar::{Builder, EntryType, Header};
 use crate::pattern::Patterns;
 use crate::{
     ArchiveError, ArchiveFormat, CreateRequest, MAX_ENTRIES, absolute, archive_error, archive_name,
-    checked_name, emit_names, read_bytes, relative_path, size_limit,
+    checked_name, emit_names, is_mac_metadata_name, read_bytes, relative_path, size_limit,
 };
 use crate::{TarCompression, ZipCompression, codec::Encoder, seven_zip, timestamp, zip_codec};
 
@@ -48,6 +48,7 @@ pub(super) fn run(
         mtime,
         whole_second_mtime: !selection.header.is_empty(),
         names: Vec::new(),
+        stubs: 0,
         links: HashMap::new(),
         bytes_left: size_limit(),
         allow_outside: selection.allow_outside,
@@ -125,6 +126,8 @@ struct Creation<'a> {
     mtime: Option<FileTime>,
     whole_second_mtime: bool,
     names: Vec<BString>,
+    /// The number of AppleDouble stub entries that the tar writer adds.
+    stubs: usize,
     links: HashMap<(u64, u64), (BString, PathBuf)>,
     bytes_left: u64,
     allow_outside: bool,
@@ -168,10 +171,20 @@ impl Creation<'_> {
             name.push(b'/');
         }
         // Match the reader's expanded-size budget. Writers check their format limits separately.
+        // A stub entry in front of the entry counts as an entry too.
+        let stub = self.writer.writes_mac_stub(&name);
+        if stub {
+            self.stubs += 1;
+        }
+        let stub_bytes = if stub {
+            name.len() as u64 + 2 + 512 + MAC_STUB.len() as u64
+        } else {
+            0
+        };
         self.bytes_left = self
             .bytes_left
-            .checked_sub(name.len() as u64 + 512)
-            .filter(|_| self.names.len() < MAX_ENTRIES)
+            .checked_sub(name.len() as u64 + 512 + stub_bytes)
+            .filter(|_| self.names.len() + self.stubs < MAX_ENTRIES)
             .ok_or_else(|| ArchiveError::new("Archive exceeds the entry or size limit"))?;
 
         let identity = (metadata.dev, metadata.ino);
@@ -366,9 +379,15 @@ impl Writer {
         Ok(Self::Tar(TarWriter {
             builder: Box::new(Builder::new(encoder)),
             gnu,
+            mac_stubs: request.mac_extensions && !gnu,
             root_owner: request.root_tar_entries,
             metadata_left: 16 * 1024 * 1024,
         }))
+    }
+
+    /// Return `true` if the writer adds an AppleDouble stub entry in front of this entry.
+    fn writes_mac_stub(&self, name: &[u8]) -> bool {
+        matches!(self, Self::Tar(writer) if writer.mac_stubs && is_mac_metadata_name(name))
     }
 
     fn add(
@@ -433,8 +452,30 @@ impl Writer {
 struct TarWriter {
     builder: Box<Builder<Encoder>>,
     gnu: bool,
+    /// Write an AppleDouble stub in front of each entry with a metadata name.
+    mac_stubs: bool,
     root_owner: bool,
     metadata_left: u64,
+}
+
+/// An AppleDouble file with an empty Finder info entry and an empty resource fork.
+///
+/// CMake on macOS and Apple tar accept this metadata entry and discard it.
+// Header (magic, version, filler, two entries), the Finder info descriptor
+// (ID 9, offset 50, length 32), the resource fork descriptor (ID 2, offset 82,
+// length 0), and 32 bytes of empty Finder info.
+const MAC_STUB: &[u8; 82] = b"\0\x05\x16\x07\0\x02\0\0Mac OS X        \0\x02\0\0\0\x09\0\0\0\x32\0\0\0\x20\0\0\0\x02\0\0\0\x52\0\0\0\0\
+    \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+
+/// Return the stub name for a metadata name, for example `d/._._foo` for `d/._foo`.
+fn mac_stub_name(name: &[u8]) -> Vec<u8> {
+    let name = name.strip_suffix(b"/").unwrap_or(name);
+    let start = name
+        .iter()
+        .rposition(|&byte| byte == b'/')
+        .map_or(0, |slash| slash + 1);
+    let (parent, last) = name.split_at(start);
+    [parent, b"._", last].concat()
 }
 
 impl TarWriter {
@@ -451,6 +492,28 @@ impl TarWriter {
     }
 
     fn add(
+        &mut self,
+        name: &[u8],
+        kind: EntryType,
+        mode: u32,
+        mtime: FileTime,
+        contents: &[u8],
+    ) -> Result<(), ArchiveError> {
+        // A reader for macOS discards a `._*` entry as metadata unless a metadata
+        // entry comes first. The stub keeps the real entry, as in CMake.
+        if self.mac_stubs && is_mac_metadata_name(name) {
+            self.append(
+                &mac_stub_name(name),
+                EntryType::Regular,
+                0o644,
+                mtime,
+                MAC_STUB,
+            )?;
+        }
+        self.append(name, kind, mode, mtime, contents)
+    }
+
+    fn append(
         &mut self,
         name: &[u8],
         kind: EntryType,

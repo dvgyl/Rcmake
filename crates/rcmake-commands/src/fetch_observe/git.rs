@@ -520,7 +520,11 @@ impl GitPlan {
 }
 
 fn no_gitlinks(host: &dyn Host, request: &RunRequest, command: &CommandSpec, pin: &str) -> bool {
+    // These variables move the repository or the configuration, or change where
+    // Git finds its helper commands. With `GIT_EXEC_PATH`, `git submodule` can
+    // fail even when the index has no gitlinks, so run the real command.
     const REDIRECTS: &[&[u8]] = &[
+        b"GIT_EXEC_PATH",
         b"GIT_DIR",
         b"GIT_COMMON_DIR",
         b"GIT_WORK_TREE",
@@ -546,30 +550,40 @@ fn no_gitlinks(host: &dyn Host, request: &RunRequest, command: &CommandSpec, pin
     {
         return false;
     }
-    let inspect = RunRequest {
-        pipeline: vec![CommandSpec {
-            program: command.program.clone(),
-            args: ["ls-files", "--stage", "-z"].map(BString::from).into(),
-        }],
-        stdin: Input::Null,
-        stdout: Output::Capture,
-        stderr: Output::Capture,
-        tee: false,
-        ..request.clone()
+    let query = |args: &[&str]| {
+        let inspect = RunRequest {
+            pipeline: vec![CommandSpec {
+                program: command.program.clone(),
+                args: args.iter().copied().map(BString::from).collect(),
+            }],
+            stdin: Input::Null,
+            stdout: Output::Capture,
+            stderr: Output::Capture,
+            tee: false,
+            ..request.clone()
+        };
+        host.run_bounded(&inspect, 1024 * 1024)
+            .ok()
+            .filter(|run| run.results == [ProcessResult::Exited(0)] && run.stderr.is_empty())
+            .map(|run| run.stdout)
     };
-    host.run_bounded(&inspect, 1024 * 1024).is_ok_and(|run| {
-        run.results == [ProcessResult::Exited(0)]
-            && run.stderr.is_empty()
-            && (run.stdout.is_empty()
-                || run.stdout.strip_suffix(b"\0").is_some_and(|entries| {
+    // `git submodule` needs a work tree. Configuration such as `core.bare` or
+    // `core.worktree` can remove it while the index stays readable, so require
+    // the top level of a work tree at the checkout directory.
+    let top_level = query(&["rev-parse", "--is-inside-work-tree", "--show-cdup"])
+        .is_some_and(|stdout| stdout == b"true\n\n");
+    top_level
+        && query(&["ls-files", "--stage", "-z"]).is_some_and(|stdout| {
+            stdout.is_empty()
+                || stdout.strip_suffix(b"\0").is_some_and(|entries| {
                     entries.split(|&byte| byte == 0).all(|entry| {
                         matches!(
                             entry.split(|&byte| byte == b' ').next(),
                             Some(b"100644" | b"100755" | b"120000")
                         )
                     })
-                }))
-    })
+                })
+        })
 }
 
 fn git_operation(mut args: &[BString]) -> &[u8] {
@@ -752,27 +766,93 @@ mod tests {
             timeout: None,
             tee: false,
         };
-        for (mode, status, expected) in [
-            ("100644", 0, true),
-            ("160000", 0, false),
-            ("100644", 1, false),
+        // A bare repository (`core.bare=true`) and a checkout below another work
+        // tree (`core.worktree`) give other `rev-parse` answers.
+        for (worktree, mode, status, expected) in [
+            ("true\n\n", "100644", 0, true),
+            ("true\n\n", "160000", 0, false),
+            ("true\n\n", "100644", 1, false),
+            ("false\n", "100644", 0, false),
+            ("true\n../\n", "100644", 0, false),
         ] {
             host.set_command_handler(move |_, request, _| {
-                assert_eq!(
-                    request
-                        .pipeline
-                        .first()
-                        .map(|command| command.args.as_slice()),
-                    Some(["ls-files", "--stage", "-z"].map(BString::from).as_slice())
-                );
+                let args = request
+                    .pipeline
+                    .first()
+                    .map(|command| command.args.as_slice())
+                    .unwrap_or_default();
+                let (stdout, status) = if args
+                    == ["rev-parse", "--is-inside-work-tree", "--show-cdup"].map(BString::from)
+                {
+                    (worktree.to_string(), 0)
+                } else {
+                    assert_eq!(args, ["ls-files", "--stage", "-z"].map(BString::from));
+                    (format!("{mode} {pin} 0\ttracked\nname\0"), status)
+                };
                 Ok(RunOutput {
-                    stdout: format!("{mode} {pin} 0\ttracked\nname\0").into_bytes(),
+                    stdout: stdout.into_bytes(),
                     results: vec![ProcessResult::Exited(status)],
                     ..RunOutput::default()
                 })
             })?;
-            assert_eq!(no_gitlinks(&host, &request, &command, pin), expected);
+            assert_eq!(
+                no_gitlinks(&host, &request, &command, pin),
+                expected,
+                "{worktree:?} {mode} {status}"
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn helper_lookup_environment_runs_the_real_submodule_command() -> HostResult<()> {
+        let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = PureHost::new(root.into(), root.join("rcmake"));
+        let pin = "0123456789012345678901234567890123456789";
+        host.seed_file(&root.join(".git/HEAD"), format!("{pin}\n").as_bytes())?;
+        host.seed_file(&root.join(".git/index"), b"index")?;
+        let command = CommandSpec {
+            program: "git".into(),
+            args: ["submodule", "update", "--recursive", "--init"]
+                .map(BString::from)
+                .into(),
+        };
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&queries);
+        host.set_command_handler(move |_, request, _| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let worktree = request
+                .pipeline
+                .first()
+                .is_some_and(|command| command.args.first().is_some_and(|arg| arg == "rev-parse"));
+            let stdout = if worktree {
+                "true\n\n".to_string()
+            } else {
+                format!("100644 {pin} 0\ttracked\0")
+            };
+            Ok(RunOutput {
+                stdout: stdout.into_bytes(),
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        let request = |env: Vec<(BString, BString)>| RunRequest {
+            pipeline: vec![command.clone()],
+            cwd: root.into(),
+            env,
+            stdin: Input::Null,
+            stdout: Output::Capture,
+            stderr: Output::Capture,
+            timeout: None,
+            tee: false,
+        };
+        assert!(no_gitlinks(&host, &request(Vec::new()), &command, pin));
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 2);
+        for key in ["GIT_EXEC_PATH", "git_exec_path"] {
+            let env = vec![(BString::from(key), BString::from("/empty"))];
+            assert!(!no_gitlinks(&host, &request(env), &command, pin));
+        }
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 2);
         Ok(())
     }
 

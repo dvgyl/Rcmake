@@ -647,6 +647,11 @@ pub(crate) fn check_network(cx: &Cx<'_>, url: &str, pinned: bool) -> Result<(), 
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub(crate) use transfer::local_file;
 
+/// Return `true` if an audit host checks the filesystem reads of this run.
+pub(crate) fn audits_reads(cx: &Cx<'_>) -> bool {
+    cx.session_data::<Arc<HermeticHost>>().is_some()
+}
+
 pub(crate) fn inherit(cx: &Cx<'_>, interp: &mut Interp) {
     if let Some(host) = cx.session_data::<Arc<HermeticHost>>() {
         interp.add_session_data(host.context.clone());

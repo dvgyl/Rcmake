@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufReader, ErrorKind, Read, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
@@ -11,7 +11,7 @@ use tar::{Archive, EntryType};
 use crate::pattern::Patterns;
 use crate::{
     ArchiveError, ExtractRequest, MAX_ENTRIES, absolute, archive_error, checked_name, emit_names,
-    read_bounded, relative_path,
+    is_mac_metadata_name, read_bounded, relative_path,
 };
 use crate::{codec, external_filter, seven_zip, tar_budget, timestamp, zip_codec};
 
@@ -40,6 +40,8 @@ const RATIO: u64 = 200;
 const FLOOR: u64 = 1024 * 1024 * 1024;
 const TRAILER_BYTES: u64 = 16 * 1024 * 1024;
 const MIN_TAR_OVERHEAD: u64 = 64 * 1024;
+/// The largest AppleDouble metadata entry that the macOS tar reader accepts.
+const MAX_MAC_METADATA: u64 = 16 * 1024 * 1024;
 
 pub(super) fn size_limit_message(ratio_capped: bool) -> &'static str {
     if ratio_capped {
@@ -159,6 +161,7 @@ pub(super) fn scan_tar_for_test(
         bytes_left: stage::MAX_BYTES,
         ratio_capped: false,
         metadata_left: stage::METADATA_BYTES,
+        mac_extensions: false,
     };
     scan.tar_headers(reader, &mut stage)?;
     Ok(scan.names)
@@ -215,6 +218,7 @@ fn run_inner(
         bytes_left: limit,
         ratio_capped,
         metadata_left: stage::METADATA_BYTES,
+        mac_extensions: request.mac_extensions,
     };
     let entries = if prefix.starts_with(seven_zip::MAGIC) {
         scan.seven_zip(&mut source, len, &mut staged)?
@@ -270,6 +274,8 @@ struct Scan<'a> {
     bytes_left: u64,
     ratio_capped: bool,
     metadata_left: usize,
+    /// Apply the macOS metadata rules of CMake (see [`crate::is_mac_metadata_name`]).
+    mac_extensions: bool,
 }
 
 type StagedEntry = (Entry, Option<Interval>);
@@ -330,6 +336,8 @@ impl Scan<'_> {
         let stream = StreamBudget::new(reader, self.tar_stream_limit(), self.ratio_capped);
         let mut archive = Archive::new(tar_budget::Reader::new(stream));
         let mut entries = Vec::new();
+        // The entry after a metadata entry is always a normal entry, whatever its name.
+        let mut after_metadata = false;
         for item in archive.entries().map_err(archive_error)? {
             let mut item = item.map_err(archive_error)?;
             let kind = item.header().entry_type();
@@ -339,6 +347,17 @@ impl Scan<'_> {
             if kind.is_pax_global_extensions() {
                 continue;
             }
+            // Discard the metadata before the path checks and the member patterns,
+            // because CMake never extracts or lists it.
+            if self.mac_extensions && !after_metadata && is_mac_metadata_name(&name) {
+                drop(name);
+                let size = item.size();
+                skip_mac_metadata(&mut item, size)?;
+                after_metadata = true;
+                continue;
+            }
+            after_metadata = false;
+            let kind = effective_kind(kind, &name);
             let path = self.path(&name)?;
             if !self.select(&name, &path)? {
                 continue;
@@ -378,7 +397,9 @@ impl Scan<'_> {
                     }
                     Data::HardLink(target)
                 }
-                EntryType::Regular | EntryType::GNUSparse => Data::File(item.size()),
+                EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
+                    Data::File(item.size())
+                }
                 EntryType::Fifo | EntryType::Char | EntryType::Block => continue,
                 _ => {
                     return Err(ArchiveError::new(format!(
@@ -548,9 +569,22 @@ impl Scan<'_> {
         })?;
         self.bytes_left = archive.bytes_left;
         self.reserve_metadata(archive.metadata_bytes())?;
+        let mac = if self.mac_extensions {
+            Some(MacZip::scan(archive.entries())?)
+        } else {
+            None
+        };
         let mut entries = Vec::new();
-        for item in archive.entries() {
+        for (index, item) in archive.entries().enumerate() {
             let item = item?;
+            if let Some(mac) = &mac {
+                if mac.hidden.get(index).copied().unwrap_or(true) {
+                    continue;
+                }
+                if let Some(fork) = mac.fork_of(item.stored_name) {
+                    fork.check_mac_metadata(source)?;
+                }
+            }
             let name: Vec<_> = item
                 .name
                 .iter()
@@ -632,6 +666,116 @@ impl Scan<'_> {
     }
 }
 
+/// Return the type that CMake gives a tar entry.
+///
+/// A regular file entry with a name that ends with `/` is a directory, as in
+/// old tar formats. This rule includes contiguous (`'7'`) and sparse files.
+fn effective_kind(kind: EntryType, name: &[u8]) -> EntryType {
+    if name.ends_with(b"/")
+        && matches!(
+            kind,
+            EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse
+        )
+    {
+        EntryType::Directory
+    } else {
+        kind
+    }
+}
+
+/// Read and discard one AppleDouble metadata entry as CMake on macOS does.
+fn skip_mac_metadata(item: &mut impl Read, size: u64) -> Result<(), ArchiveError> {
+    if size > MAX_MAC_METADATA {
+        return Err(ArchiveError::new(format!(
+            "Problem with archive_read_next_header(): Oversized AppleDouble extension has size {size} > {MAX_MAC_METADATA}"
+        )));
+    }
+    let truncated = || {
+        ArchiveError::new(
+            "Problem with archive_read_next_header(): Truncated archive detected while reading macOS metadata",
+        )
+    };
+    match io::copy(item, &mut io::sink()) {
+        Ok(copied) if copied == size => Ok(()),
+        Ok(_) => Err(truncated()),
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => Err(truncated()),
+        Err(error) => Err(archive_error(error)),
+    }
+}
+
+/// Return `true` for a ZIP entry that CMake on macOS hides as resource fork metadata.
+///
+/// The rule uses the stored name: a `__MACOSX/` directory entry, or an entry
+/// below `__MACOSX/` with a last component that starts with `._`.
+fn is_mac_zip_metadata(name: &[u8]) -> bool {
+    let last = name.rsplit(|&byte| byte == b'/').next().unwrap_or_default();
+    name.starts_with(b"__MACOSX/") && (name.ends_with(b"/") || last.starts_with(b"._"))
+}
+
+/// The ZIP entries that the macOS reader of CMake hides, and its resource fork entries.
+struct MacZip<'a> {
+    /// `true` for a hidden entry, in central directory order.
+    hidden: Vec<bool>,
+    /// The hidden metadata entries that a visible entry can pair with, by stored name.
+    forks: HashMap<&'a [u8], zip_codec::Entry<'a>>,
+}
+
+impl<'a> MacZip<'a> {
+    /// Classify all entries in central directory order, as libarchive does.
+    ///
+    /// A visible entry below `__MACOSX/` makes a hidden metadata entry visible
+    /// when that entry is its parent and comes earlier in the directory. The
+    /// walk to higher parents stops at the first parent that is not hidden metadata.
+    fn scan(
+        entries: impl Iterator<Item = Result<zip_codec::Entry<'a>, ArchiveError>>,
+    ) -> Result<Self, ArchiveError> {
+        let mut hidden = Vec::new();
+        let mut forks = HashMap::<&[u8], (usize, zip_codec::Entry<'a>)>::new();
+        for (index, item) in entries.enumerate() {
+            let item = item?;
+            let name = item.stored_name;
+            let metadata = is_mac_zip_metadata(name);
+            hidden.push(metadata);
+            if metadata {
+                // As in libarchive, a later entry with the same name stays hidden.
+                forks.entry(name).or_insert((index, item));
+            } else if name.starts_with(b"__MACOSX/") {
+                let mut parent = name;
+                while let Some(slash) = parent.iter().rposition(|&byte| byte == b'/') {
+                    parent = parent.get(..slash).unwrap_or_default();
+                    let Some((exposed, _)) = forks.remove(parent) else {
+                        break;
+                    };
+                    if let Some(flag) = hidden.get_mut(exposed) {
+                        *flag = false;
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            hidden,
+            forks: forks
+                .into_iter()
+                .map(|(name, (_, entry))| (name, entry))
+                .collect(),
+        })
+    }
+
+    /// Return the metadata entry `__MACOSX/<dir>/._<name>` of a visible entry `<dir>/<name>`.
+    fn fork_of(&self, name: &[u8]) -> Option<&zip_codec::Entry<'a>> {
+        if self.forks.is_empty() || name.starts_with(b"__MACOSX/") {
+            return None;
+        }
+        let split = name
+            .iter()
+            .rposition(|&byte| byte == b'/')
+            .map_or(0, |slash| slash + 1);
+        let (parent, base) = name.split_at(split);
+        let key = [b"__MACOSX/".as_slice(), parent, b"._", base].concat();
+        self.forks.get(key.as_slice())
+    }
+}
+
 fn tar_listing<R: Read>(
     item: &mut tar::Entry<'_, R>,
     name: &[u8],
@@ -639,7 +783,7 @@ fn tar_listing<R: Read>(
 ) -> Result<BString, ArchiveError> {
     let time = format_time(timestamp::tar_time(item)?);
     let header = item.header();
-    let kind = header.entry_type();
+    let kind = effective_kind(header.entry_type(), name);
     let file_type = match kind {
         EntryType::Directory => 0o40000,
         EntryType::Symlink => 0o120000,

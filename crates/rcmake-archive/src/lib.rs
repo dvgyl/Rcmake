@@ -145,6 +145,7 @@ pub struct CreateRequest<'a> {
     skip_apple_double: bool,
     root_tar_entries: bool,
     threads: u32,
+    mac_extensions: bool,
 }
 
 impl CreateOptions {
@@ -175,6 +176,13 @@ impl CreateRequest<'_> {
         self.skip_apple_double = true;
         self
     }
+
+    /// Select the macOS tar writer rules on every platform for in-memory tests.
+    #[cfg(test)]
+    pub(crate) fn with_mac_extensions(mut self, enabled: bool) -> Self {
+        self.mac_extensions = enabled;
+        self
+    }
 }
 
 impl<'a> From<&'a CreateOptions> for CreateRequest<'a> {
@@ -185,6 +193,7 @@ impl<'a> From<&'a CreateOptions> for CreateRequest<'a> {
             skip_apple_double: false,
             root_tar_entries: false,
             threads: 0,
+            mac_extensions: MAC_EXTENSIONS,
         }
     }
 }
@@ -212,6 +221,31 @@ pub struct ExtractOptions {
 pub struct ExtractRequest<'a> {
     options: &'a ExtractOptions,
     confined_links: bool,
+    mac_extensions: bool,
+}
+
+/// `true` if the archive rules for macOS metadata apply, as in a CMake build for macOS.
+///
+/// On macOS, CMake reads a tar entry named `._*` as AppleDouble metadata and
+/// discards it, and it hides `__MACOSX/` metadata in ZIP files. Its pax tar
+/// writer adds a metadata entry in front of each entry. This is a fact about
+/// the target platform, not an access to the host.
+const MAC_EXTENSIONS: bool = cfg!(target_os = "macos");
+
+/// Return `true` if CMake on macOS reads a tar entry with this name as AppleDouble metadata.
+///
+/// Only the last name component counts, and a trailing slash belongs to it.
+/// The component must start with `._` and have more than two bytes.
+/// For example, `d/._foo` and `._foo/` are metadata names, but `._`, `d/._`,
+/// and `._foo/bar` are not.
+pub(crate) fn is_mac_metadata_name(name: &[u8]) -> bool {
+    let body = name.get(..name.len().saturating_sub(1)).unwrap_or_default();
+    let start = body
+        .iter()
+        .rposition(|&byte| byte == b'/')
+        .map_or(0, |slash| slash + 1);
+    let last = name.get(start..).unwrap_or_default();
+    last.len() > 2 && last.starts_with(b"._")
 }
 
 impl ExtractOptions {
@@ -224,7 +258,17 @@ impl ExtractOptions {
         ExtractRequest {
             options: self,
             confined_links: true,
+            mac_extensions: MAC_EXTENSIONS,
         }
+    }
+}
+
+impl ExtractRequest<'_> {
+    /// Select the macOS metadata rules on every platform for in-memory tests.
+    #[cfg(test)]
+    pub(crate) fn with_mac_extensions(mut self, enabled: bool) -> Self {
+        self.mac_extensions = enabled;
+        self
     }
 }
 
@@ -233,6 +277,7 @@ impl<'a> From<&'a ExtractOptions> for ExtractRequest<'a> {
         Self {
             options,
             confined_links: false,
+            mac_extensions: MAC_EXTENSIONS,
         }
     }
 }

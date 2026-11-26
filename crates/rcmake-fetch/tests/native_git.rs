@@ -171,7 +171,7 @@ fn mirror_clones_updates_and_checks_out_old_pins() -> Result<(), Box<dyn std::er
         git(&host, &full, &["remote", "get-url", "origin"])?,
         repository
     );
-    for path in ["shallow", "FETCH_HEAD", "objects/info/alternates"] {
+    for path in ["shallow", "objects/info/alternates"] {
         assert!(
             host.metadata(&full.join(".git").join(path), Follow::No)
                 .is_err()
@@ -290,5 +290,129 @@ fn damaged_mirror_repairs_online_and_can_be_used_as_an_immutable_snapshot()
         mirror_path
     );
     assert!(host.metadata(&lock, Follow::No).is_err());
+    Ok(())
+}
+
+#[test]
+fn a_mirror_with_a_missing_or_altered_blob_is_not_published()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = NativeHost::new()?;
+    let time = host.now();
+    let root = PathBuf::from(format!(
+        "/tmp/rcmake-fetch-blob-{}-{}",
+        time.secs, time.nanos
+    ));
+    host.create_dir_all(&root)?;
+    let root = host.canonicalize(&root)?;
+    let scratch = Scratch { host: &host, root };
+    let root = scratch.root.as_path();
+    let upstream = root.join("upstream");
+    host.create_dir_all(&upstream)?;
+    git(&host, &upstream, &["init", "-q", "--initial-branch=main"])?;
+    for (name, body) in [("kept.txt", "kept\n"), ("lost.txt", "lost\n")] {
+        host.write(&upstream.join(name), body.as_bytes(), WriteMode::CreateNew)?;
+    }
+    git(&host, &upstream, &["add", "--", "kept.txt", "lost.txt"])?;
+    git(
+        &host,
+        &upstream,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "Two files",
+        ],
+    )?;
+    let pin = git(&host, &upstream, &["rev-parse", "HEAD"])?;
+    let blob = git(&host, &upstream, &["rev-parse", "HEAD:lost.txt"])?;
+    let repository = upstream.to_str().ok_or("The upstream path is not UTF-8.")?;
+    let (shard, object) = blob
+        .split_at_checked(2)
+        .ok_or("Missing Git blob object path.")?;
+
+    // A valid loose object with other contents, to put under the name of the original blob.
+    let other = root.join("other");
+    host.create_dir_all(&other)?;
+    git(&host, &other, &["init", "-q"])?;
+    host.write(&other.join("other.txt"), b"other\n", WriteMode::CreateNew)?;
+    let other_id = git(&host, &other, &["hash-object", "-w", "--", "other.txt"])?;
+    let (other_shard, other_object) = other_id
+        .split_at_checked(2)
+        .ok_or("Missing Git blob object path.")?;
+    let altered = host.read(
+        &other
+            .join(".git/objects")
+            .join(other_shard)
+            .join(other_object),
+        ReadRange::All { limit: 4096 },
+    )?;
+
+    for (label, replacement) in [("missing", None), ("altered", Some(altered.as_slice()))] {
+        let mirrors = GitMirror::new(&host, &root.join(format!("cache-{label}")))?
+            .with_timeout(Duration::from_secs(10));
+        let healthy = root.join(format!("healthy-{label}"));
+        mirrors.checkout(repository, &pin, &healthy)?;
+        assert_eq!(
+            host.read(&healthy.join("lost.txt"), ReadRange::All { limit: 64 })?,
+            b"lost\n"
+        );
+
+        // Damage one tracked-file blob. The commit and the root tree stay intact.
+        let mirror = mirrors.prefetch(repository, &pin)?;
+        let blob_file = mirror.join("objects").join(shard).join(object);
+        host.remove_file(&blob_file)?;
+        if let Some(bytes) = replacement {
+            host.write(&blob_file, bytes, WriteMode::CreateNew)?;
+        }
+        let mirror_dir = mirror.to_str().ok_or("The mirror path is not UTF-8.")?;
+        for object in [pin.clone(), format!("{pin}^{{tree}}")] {
+            git(
+                &host,
+                root,
+                &["--git-dir", mirror_dir, "cat-file", "-e", &object],
+            )?;
+        }
+
+        let damaged = root.join(format!("damaged-{label}"));
+        let error = mirrors
+            .checkout(repository, &pin, &damaged)
+            .err()
+            .ok_or(format!(
+                "A checkout from a mirror with a {label} blob must fail."
+            ))?;
+        assert!(
+            matches!(&error, FetchError::Git { cause, .. }
+                if matches!(cause.as_ref(), FetchError::Process { .. })),
+            "{label}: {error:?}"
+        );
+        assert!(host.metadata(&damaged, Follow::No).is_err(), "{label}");
+
+        let directory = format!("template-{label}");
+        let args = [
+            "clone".into(),
+            "--no-checkout".into(),
+            from_native(&upstream),
+            directory.as_str().into(),
+        ];
+        let clone = classify_git_clone(&args).ok_or("Invalid Git clone arguments.")?;
+        let error = mirrors
+            .clone_template(&clone, root, Some(&pin))
+            .err()
+            .ok_or(format!(
+                "A template clone from a mirror with a {label} blob must fail."
+            ))?;
+        assert!(
+            matches!(&error, FetchError::Git { cause, .. }
+                if matches!(cause.as_ref(), FetchError::Process { .. })),
+            "{label}: {error:?}"
+        );
+        assert!(
+            host.metadata(&root.join(&directory), Follow::No).is_err(),
+            "{label}"
+        );
+    }
     Ok(())
 }
