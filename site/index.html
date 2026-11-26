@@ -7,7 +7,7 @@
   <meta name="description" content="Drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, and cpack with Ninja, Xcode, Visual Studio, probe cache, explain, LSP, and WASM.">
   <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
-  <meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#f6f4f0" media="(prefers-color-scheme: light)">
   <link rel="canonical" href="https://dvgyl.github.io/rcmake/">
   <link rel="alternate" type="text/plain" title="LLMs.txt" href="https://dvgyl.github.io/rcmake/llms.txt">
   <link rel="manifest" href="./manifest.webmanifest">
@@ -49,7 +49,10 @@
           "applicationCategory": "DeveloperApplication",
           "operatingSystem": "macOS, Linux, Windows, WebAssembly",
           "softwareVersion": "0.1.0",
-          "license": "https://spdx.org/licenses/MIT.html",
+          "license": [
+            "https://spdx.org/licenses/MIT.html",
+            "https://spdx.org/licenses/Apache-2.0.html"
+          ],
           "programmingLanguage": "Rust",
           "codeRepository": "https://github.com/dvgyl/rcmake",
           "downloadUrl": "https://github.com/dvgyl/rcmake/releases",
@@ -113,7 +116,7 @@
               "name": "How do I install rcmake and alias cmake, ctest, and cpack?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "On Linux and macOS, run curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash to install rcmake, rcmake-lsp, shell completions, and the man page into ~/.local, or pass --alias-cmake to symlink cmake, ctest, and cpack. On Windows, run scripts/install.ps1 (with -AliasCmake for aliases) or extract the x86_64-pc-windows-msvc ZIP archive from GitHub Releases. Intel Macs can build from source with scripts/install.sh --from-source."
+                "text": "On Linux and macOS, run curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash to install rcmake, rcmake-lsp, shell completions, and the man page into ~/.local, or append -s -- --alias-cmake after bash to symlink cmake, ctest, and cpack. On Windows, run scripts/install.ps1 (with -AliasCmake for aliases) or extract the x86_64-pc-windows-msvc ZIP archive from GitHub Releases. Intel Macs can build from source with scripts/install.sh --from-source."
               }
             },
             {
@@ -121,7 +124,7 @@
               "name": "What is intentionally different or not implemented in rcmake?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "rcmake omits interactive front ends (cmake-gui and ccmake), the --debugger DAP server, legacy extra generators (CodeBlocks, Eclipse CDT4, Kate, Sublime Text), older Makefile and Visual Studio 14 to 16 generators, and CPack native installers (DEB, RPM, NSIS, WIX, productbuild, IFW). Its tar and CPack archive writers always record uid 0 and gid 0 for reproducibility, try_compile runs in-process, and Swift builds plus full CUDA and HIP toolchain runs are not yet verified."
+                "text": "rcmake omits interactive front ends (cmake-gui and ccmake), the --debugger DAP server, legacy extra generators (CodeBlocks, CodeLite, Eclipse CDT4, Kate, Sublime Text 2), older Makefile and Visual Studio 14 to 16 generators, and CPack native installers (DEB, RPM, NSIS, WIX, productbuild, IFW). Its tar and CPack archive writers always record uid 0 and gid 0 for reproducibility, try_compile runs in-process, and Swift builds plus full CUDA and HIP toolchain runs are not yet verified."
               }
             },
             {
@@ -149,7 +152,8 @@
     document.documentElement.classList.add("js");
     try {
       const saved = localStorage.getItem("rcmake-theme");
-      document.documentElement.dataset.theme = saved || "dark";
+      const fallback = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      document.documentElement.dataset.theme = saved === "light" || saved === "dark" ? saved : fallback;
     } catch (_) {}
   </script>
 </head>
@@ -173,7 +177,7 @@
   <div class="scroll-progress" aria-hidden="true"></div>
   <header class="topbar">
     <div class="topbar-inner">
-      <a class="brand" href="./index.html">
+      <a class="brand" href="./index.html" aria-label="rcmake home">
         <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="22" height="22">
         <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="22" height="22">
         <span>rcmake</span>
@@ -214,15 +218,17 @@
         <div class="install" data-test="install-terminal">
           <div class="seg" role="tablist" aria-label="Install methods" id="install-tabs" data-test="install-tabs">
             <button type="button" role="tab" id="tab-install" aria-controls="panel-install" aria-selected="true" data-term-tab="install">Install</button>
+            <button type="button" role="tab" id="tab-windows" aria-controls="panel-windows" aria-selected="false" data-term-tab="windows">Windows</button>
             <button type="button" role="tab" id="tab-source" aria-controls="panel-source" aria-selected="false" data-term-tab="source">From source</button>
             <button type="button" role="tab" id="tab-alias" aria-controls="panel-alias" aria-selected="false" data-term-tab="alias">Alias</button>
           </div>
           <div class="install-cmd">
-            <pre class="term-panel" id="panel-install" role="tabpanel" aria-labelledby="tab-install"><span class="term-prompt">$ </span><span data-line>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash</span></pre>
-            <pre class="term-panel" id="panel-source" role="tabpanel" aria-labelledby="tab-source" hidden><span class="term-prompt">$ </span><span data-line>git clone https://github.com/dvgyl/rcmake</span>
-<span class="term-prompt">$ </span><span data-line>cd rcmake &amp;&amp; RCMAKE_STAGE_PROFILE=release scripts/stage.sh</span>
-<span class="term-prompt">$ </span><span data-line>./target/stage/bin/rcmake --version</span></pre>
-            <pre class="term-panel" id="panel-alias" role="tabpanel" aria-labelledby="tab-alias" hidden><span class="term-prompt">$ </span><span data-line>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash -s -- --alias-cmake</span>
+            <pre class="term-panel" id="panel-install" role="tabpanel" aria-labelledby="tab-install" tabindex="0"><span class="term-prompt">$ </span><span data-line>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash</span></pre>
+            <pre class="term-panel" id="panel-windows" role="tabpanel" aria-labelledby="tab-windows" tabindex="0" hidden><span class="term-prompt">PS&gt; </span><span data-line>irm https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.ps1 | iex</span></pre>
+            <pre class="term-panel" id="panel-source" role="tabpanel" aria-labelledby="tab-source" tabindex="0" hidden><span class="term-prompt">$ </span><span data-line>git clone https://github.com/dvgyl/rcmake.git</span>
+<span class="term-prompt">$ </span><span data-line>cd rcmake &amp;&amp; scripts/install.sh --from-source</span>
+<span class="term-prompt">$ </span><span data-line>rcmake --version</span></pre>
+            <pre class="term-panel" id="panel-alias" role="tabpanel" aria-labelledby="tab-alias" tabindex="0" hidden><span class="term-prompt">$ </span><span data-line>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash -s -- --alias-cmake</span>
 <span class="term-prompt">$ </span><span data-line>export PATH="$HOME/.local/bin:$PATH"</span></pre>
             <button type="button" class="copy-btn" id="term-copy-btn" data-test="term-copy">
               <svg class="i copy-icon" aria-hidden="true"><use href="#i-copy"/></svg>
@@ -442,7 +448,7 @@
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
               <tr data-group="not-in-rcmake">
-                <td>CodeBlocks, Eclipse CDT4, Kate, and Sublime Text generators</td>
+                <td>CodeBlocks, CodeLite, Eclipse CDT4, Kate, and Sublime Text 2 generators</td>
                 <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
@@ -472,13 +478,13 @@
         <h2 class="band-title" data-reveal>Inside a configure run</h2>
         <div class="card flow" id="pipeline-widget" data-reveal data-test="pipeline-widget" aria-describedby="pipeline-fallback">
           <div class="flow-stages" role="tablist" aria-label="Pipeline stages" data-pipe-stages data-test="pipeline-stages">
-            <button type="button" role="tab" class="flow-stage" data-tone="r" aria-selected="false" data-stage-btn="syntax"><span class="flow-num">1</span><span class="flow-name">Syntax</span></button>
-            <button type="button" role="tab" class="flow-stage" data-tone="r" aria-selected="true" data-stage-btn="eval"><span class="flow-num">2</span><span class="flow-name">Eval</span></button>
-            <button type="button" role="tab" class="flow-stage" data-tone="g" aria-selected="false" data-stage-btn="resolve"><span class="flow-num">3</span><span class="flow-name">Resolve</span></button>
-            <button type="button" role="tab" class="flow-stage" data-tone="b" aria-selected="false" data-stage-btn="gen"><span class="flow-num">4</span><span class="flow-name">Generate</span></button>
-            <button type="button" role="tab" class="flow-host" aria-selected="false" data-stage-btn="host"><span class="flow-name">Host</span><span class="flow-host-impls">NativeHost · PureHost</span></button>
+            <button type="button" role="tab" id="pipe-tab-syntax" aria-controls="pipeline-detail" class="flow-stage" data-tone="r" aria-selected="false" data-stage-btn="syntax"><span class="flow-num">1</span><span class="flow-name">Syntax</span></button>
+            <button type="button" role="tab" id="pipe-tab-eval" aria-controls="pipeline-detail" class="flow-stage" data-tone="r" aria-selected="true" data-stage-btn="eval"><span class="flow-num">2</span><span class="flow-name">Eval</span></button>
+            <button type="button" role="tab" id="pipe-tab-resolve" aria-controls="pipeline-detail" class="flow-stage" data-tone="g" aria-selected="false" data-stage-btn="resolve"><span class="flow-num">3</span><span class="flow-name">Resolve</span></button>
+            <button type="button" role="tab" id="pipe-tab-gen" aria-controls="pipeline-detail" class="flow-stage" data-tone="b" aria-selected="false" data-stage-btn="gen"><span class="flow-num">4</span><span class="flow-name">Generate</span></button>
+            <button type="button" role="tab" id="pipe-tab-host" aria-controls="pipeline-detail" class="flow-host" aria-selected="false" data-stage-btn="host"><span class="flow-name">Host</span><span class="flow-host-impls">NativeHost · PureHost</span></button>
           </div>
-          <div class="flow-detail" data-pipe-inspector data-test="pipeline-inspector" aria-live="polite">
+          <div id="pipeline-detail" class="flow-detail" role="tabpanel" aria-labelledby="pipe-tab-eval" data-pipe-inspector data-test="pipeline-inspector">
             <div class="flow-detail-inner" data-tone="r"><div class="flow-detail-head"><span class="flow-dot" aria-hidden="true"></span><h3>Eval</h3></div><p>Runs commands and tracks variables, policies, and generator expressions.</p><div class="flow-crates"><span class="chip">rcmake-eval</span><span class="chip">rcmake-commands</span><span class="chip">rcmake-expr</span><span class="chip">rcmake-genex</span><span class="chip">rcmake-model</span><span class="chip">rcmake-presets</span></div></div>
           </div>
         </div>
@@ -548,11 +554,11 @@
         </details>
         <details class="faq-item">
           <summary>How do I install rcmake and alias cmake, ctest, and cpack?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p>On Linux and macOS, run <code>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash</code> to install <code>rcmake</code>, <code>rcmake-lsp</code>, shell completions, and the man page into <code>~/.local</code>, or pass <code>--alias-cmake</code> to symlink <code>cmake</code>, <code>ctest</code>, and <code>cpack</code>. On Windows, run <code>scripts/install.ps1</code> (with <code>-AliasCmake</code> for aliases) or extract the <code>x86_64-pc-windows-msvc</code> ZIP archive from GitHub Releases. Intel Macs can build from source with <code>scripts/install.sh --from-source</code>.</p></div></div>
+          <div class="faq-answer"><div class="faq-inner"><p>On Linux and macOS, run <code>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash</code> to install <code>rcmake</code>, <code>rcmake-lsp</code>, shell completions, and the man page into <code>~/.local</code>, or append <code>-s -- --alias-cmake</code> after <code>bash</code> to symlink <code>cmake</code>, <code>ctest</code>, and <code>cpack</code>. On Windows, run <code>scripts/install.ps1</code> (with <code>-AliasCmake</code> for aliases) or extract the <code>x86_64-pc-windows-msvc</code> ZIP archive from GitHub Releases. Intel Macs can build from source with <code>scripts/install.sh --from-source</code>.</p></div></div>
         </details>
         <details class="faq-item">
           <summary>What is intentionally different or not implemented in rcmake?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p><code>rcmake</code> omits interactive front ends (<code>cmake-gui</code> and <code>ccmake</code>), the <code>--debugger</code> DAP server, legacy extra generators (CodeBlocks, Eclipse CDT4, Kate, Sublime Text), older Makefile and Visual Studio 14 to 16 generators, and CPack native installers (<code>DEB</code>, <code>RPM</code>, <code>NSIS</code>, <code>WIX</code>, <code>productbuild</code>, <code>IFW</code>). Its <code>tar</code> and CPack archive writers always record uid 0 and gid 0 for reproducibility, <code>try_compile</code> runs in-process, and Swift builds plus full CUDA and HIP toolchain runs are not yet verified.</p></div></div>
+          <div class="faq-answer"><div class="faq-inner"><p><code>rcmake</code> omits interactive front ends (<code>cmake-gui</code> and <code>ccmake</code>), the <code>--debugger</code> DAP server, legacy extra generators (CodeBlocks, CodeLite, Eclipse CDT4, Kate, Sublime Text 2), older Makefile and Visual Studio 14 to 16 generators, and CPack native installers (<code>DEB</code>, <code>RPM</code>, <code>NSIS</code>, <code>WIX</code>, <code>productbuild</code>, <code>IFW</code>). Its <code>tar</code> and CPack archive writers always record uid 0 and gid 0 for reproducibility, <code>try_compile</code> runs in-process, and Swift builds plus full CUDA and HIP toolchain runs are not yet verified.</p></div></div>
         </details>
         <details class="faq-item">
           <summary>Does rcmake contain any unsafe Rust or copied CMake C++ code?</summary>

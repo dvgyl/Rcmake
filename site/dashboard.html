@@ -7,7 +7,7 @@
   <meta name="description" content="Differential parity results comparing rcmake against CMake 4.5.1 across 3-OS Tests/RunCMake, 10 large C++ projects, 64 vcpkg shards, 240 unseen repos, and speed.">
   <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
-  <meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#f6f4f0" media="(prefers-color-scheme: light)">
   <link rel="canonical" href="https://dvgyl.github.io/rcmake/dashboard.html">
   <link rel="alternate" type="text/plain" title="LLMs.txt" href="https://dvgyl.github.io/rcmake/llms.txt">
   <link rel="manifest" href="./manifest.webmanifest">
@@ -35,10 +35,13 @@
           "@type": "Dataset",
           "@id": "https://dvgyl.github.io/rcmake/dashboard.html#dataset",
           "name": "rcmake CMake 4.5.1 Compatibility and Benchmark Report",
-          "description": "Machine-readable differential compatibility, soundness, and benchmark dataset comparing rcmake 0.1.0 with CMake 4.5.1 across Tests/RunCMake on macOS, Linux, and Windows, 62 core suites, 56 policy suites, 10 large C++ projects, a 240-repository blind holdout, 64 vcpkg shards, seeded generative fuzzing, and WebAssembly/WASI checks.",
+          "description": "Machine-readable differential compatibility, soundness, and benchmark dataset comparing rcmake 0.1.0 with CMake 4.5.1 across Tests/RunCMake on macOS, Linux, and Windows, 62 core suites, 35 policy suites, 10 large C++ projects, a 240-repository blind holdout, 64 vcpkg shards, seeded generative fuzzing, and WebAssembly/WASI checks.",
           "url": "https://dvgyl.github.io/rcmake/dashboard.html",
           "version": "0.1.0",
-          "license": "https://spdx.org/licenses/MIT.html",
+          "license": [
+            "https://spdx.org/licenses/MIT.html",
+            "https://spdx.org/licenses/Apache-2.0.html"
+          ],
           "isAccessibleForFree": true,
           "creator": {
             "@type": "Organization",
@@ -55,7 +58,7 @@
           "variableMeasured": [
             "Tests/RunCMake pass rate on macOS arm64 (371 suites), Linux x86_64 (362 suites), and Windows x86_64 (367 suites)",
             "Core conformance suites (62 suites)",
-            "CMake policies CMP0066-CMP0226 (56 suites)",
+            "CMake policies CMP0066-CMP0226 (35 suites)",
             "Large C++ project L1 configure and L2 Ninja build-graph and File API parity (10 projects)",
             "Sealed unseen holdout aggregate L2 parity (240 repositories)",
             "vcpkg port matrix (64 shards)",
@@ -88,7 +91,8 @@
     document.documentElement.classList.add("js");
     try {
       const saved = localStorage.getItem("rcmake-theme");
-      document.documentElement.dataset.theme = saved || "dark";
+      const fallback = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      document.documentElement.dataset.theme = saved === "light" || saved === "dark" ? saved : fallback;
     } catch (_) {}
   </script>
 </head>
@@ -133,7 +137,7 @@
   <div class="scroll-progress" aria-hidden="true"></div>
   <header class="topbar">
     <div class="topbar-inner">
-      <a class="brand" href="./index.html">
+      <a class="brand" href="./index.html" aria-label="rcmake home">
         <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="22" height="22">
         <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="22" height="22">
         <span>rcmake</span>
@@ -168,10 +172,10 @@
         <nav class="rail-mobile" id="report-rail-mobile" aria-label="Report sections"></nav>
         <noscript>
           <div class="noscript-banner">
-            <strong>JavaScript is required to render the interactive charts.</strong> This report tracks <code>rcmake</code> 0.1.0 against CMake 4.5.1 across upstream <code>Tests/RunCMake</code> (371 macOS arm64, 362 Linux x86_64, and 367 Windows x86_64 suites), 62 core suites, 56 policy suites covering <code>CMP0066-CMP0226</code>, 20 independent black-box scenarios (679 checks), 10 large C++ projects (L1 configure and L2 Ninja/File API parity), a 240-repository blind holdout, 64 <code>vcpkg</code> shards, seeded generative fuzzing (14 formats), WebAssembly/WASI checks, probe-cache and mutation-replay soundness gates, and configure speed benchmarks. Inspect the raw dataset in <a href="./data/latest.json">data/latest.json</a> or read <a href="./llms.txt">llms.txt</a>.
+            <strong>JavaScript is required to render the interactive charts.</strong> This report tracks <code>rcmake</code> 0.1.0 against CMake 4.5.1 across upstream <code>Tests/RunCMake</code> (371 macOS arm64, 362 Linux x86_64, and 367 Windows x86_64 suites), 62 core suites, 35 policy suites covering <code>CMP0066-CMP0226</code>, 20 independent black-box scenarios (679 checks), 10 large C++ projects (L1 configure and L2 Ninja/File API parity), a 240-repository blind holdout, 64 <code>vcpkg</code> shards, seeded generative fuzzing (14 targets), WebAssembly/WASI checks, probe-cache and mutation-replay soundness gates, and configure speed benchmarks. Inspect the raw dataset in <a href="./data/latest.json">data/latest.json</a> or read <a href="./llms.txt">llms.txt</a>.
           </div>
         </noscript>
-        <div id="report" data-test="report-body" style="min-height: 1200px;"></div>
+        <div id="report" class="is-loading" data-test="report-body"></div>
       </div>
     </div>
   </main>

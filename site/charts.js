@@ -19,6 +19,35 @@ export function formatSpeed(v) {
   return isMeasured(v) && v > 0 ? v.toFixed(2) : null;
 }
 
+export function normalizeGiants(benchTrack) {
+  const gb = benchTrack?.giantsBenchmark;
+  if (gb && Array.isArray(gb.projects) && gb.projects.length > 0) return gb;
+  const rg = benchTrack?.realGiants;
+  if (!Array.isArray(rg) || rg.length === 0) return null;
+  const projects = rg.map((item) => ({
+    name: item?.project || item?.name || "",
+    repository: item?.repository || "",
+    version: item?.version || "",
+    status: normalizeStatus(item?.status),
+    note: item?.note || "",
+    cold: {
+      speedup: item?.coldConfigureSpeedup ?? null,
+      rcmakeMedianMs: item?.rcmakeMedianMs ?? null,
+      cmakeMedianMs: item?.oracleMedianMs ?? null,
+      rcmakePeakRssMiB: item?.peakRssMiB ?? null
+    },
+    warmProbe: {
+      speedup: item?.warmProbeSpeedup ?? null
+    },
+    incrementalLeaf: {
+      rcmakeP95Ms: item?.incrementalLeafP95Ms ?? null
+    }
+  }));
+  const statuses = projects.map((p) => p.status);
+  const status = statuses.includes("fail") ? "fail" : statuses.every((s) => s === "pass") ? "pass" : statuses.some((s) => s !== "pending") ? "partial" : "pending";
+  return { label: "Real-world large projects", status, projects };
+}
+
 export function statusIcon(status) {
   const s = normalizeStatus(status);
   const m = STATUS_META[s];
@@ -43,11 +72,33 @@ export function speedupBars({ label, baseline = "", value, unit = "x", status, t
     return `<figure class="speed-group" aria-label="${lbl}. Pending." data-status="pending"${attrs}>${nameBlock}<div class="speed-lanes"><div class="speed-lane"><span class="speed-bin">cmake 4.5.1</span><div class="bar-track is-pending" data-loop></div><span class="speed-val dim"><span data-value></span>pending</span></div><div class="speed-lane"><span class="speed-bin is-rcmake">rcmake</span><div class="bar-track is-pending" data-loop></div><span class="speed-val dim"><span data-value></span>pending</span></div></div></figure>`;
   }
   const st = normalizeStatus(status === "pending" ? "pass" : status);
-  const scale = String(Number(Math.min(1, Math.max(0.02, 1 / value)).toFixed(4)));
   const isRatio = unit === "x";
   const u = isRatio ? "\u00d7" : safeText(unit) ? ` ${safeText(unit)}` : "";
-  const spd = isRatio ? `${formatSpeed(value)}\u00d7 faster` : `${formatSpeed(value)}${u}`;
-  return `<figure class="speed-group" aria-label="${lbl}. CMake 4.5.1 is 1.00 times, rcmake is ${formatSpeed(value)} times faster." data-status="${st}"${attrs}>${nameBlock}<div class="speed-lanes"><div class="speed-lane"><span class="speed-bin">cmake 4.5.1</span><div class="bar-track"><div class="bar-fill is-cmake" style="--v:1" data-scale="1"></div></div><span class="speed-val dim" data-value>1.00${u}</span></div><div class="speed-lane"><span class="speed-bin is-rcmake">rcmake</span><div class="bar-track"><div class="bar-fill is-rcmake" style="--v:${scale}" data-scale="${scale}" data-test="speed-bar-rcmake"></div></div><span class="speed-val" data-value>${spd}</span></div></div></figure>`;
+  let cmScale = "1";
+  let rcScale = "1";
+  let spd = `${formatSpeed(value)}${u}`;
+  let rcCls = "is-rcmake";
+  let ariaText = `${lbl}. CMake 4.5.1 is 1.00 times, rcmake is ${formatSpeed(value)}${isRatio ? " times" : ` ${unit}`}.`;
+  if (isRatio) {
+    if (value > 1) {
+      rcScale = String(Number(Math.min(1, Math.max(0.02, 1 / value)).toFixed(4)));
+      spd = `${formatSpeed(value)}\u00d7 faster`;
+      ariaText = `${lbl}. CMake 4.5.1 is 1.00 times, rcmake is ${formatSpeed(value)} times faster.`;
+    } else if (value < 1) {
+      const slower = (1 / value).toFixed(2);
+      cmScale = String(Number(Math.min(1, Math.max(0.02, value)).toFixed(4)));
+      rcScale = "1";
+      spd = `${slower}\u00d7 slower`;
+      rcCls = st === "fail" ? "is-fail" : "is-partial";
+      ariaText = `${lbl}. CMake 4.5.1 is 1.00 times, rcmake is ${slower} times slower.`;
+    } else {
+      spd = "1.00\u00d7";
+      ariaText = `${lbl}. Parity with CMake 4.5.1 at 1.00 times.`;
+    }
+  } else {
+    rcScale = String(Number(Math.min(1, Math.max(0.02, 1 / value)).toFixed(4)));
+  }
+  return `<figure class="speed-group" aria-label="${escapeHtml(ariaText)}" data-status="${st}"${attrs}>${nameBlock}<div class="speed-lanes"><div class="speed-lane"><span class="speed-bin">cmake 4.5.1</span><div class="bar-track"><div class="bar-fill is-cmake" style="--v:${cmScale}" data-scale="${cmScale}"></div></div><span class="speed-val dim" data-value>1.00${u}</span></div><div class="speed-lane"><span class="speed-bin is-rcmake">rcmake</span><div class="bar-track"><div class="bar-fill ${rcCls}" style="--v:${rcScale}" data-scale="${rcScale}" data-test="speed-bar-rcmake"></div></div><span class="speed-val" data-value>${spd}</span></div></div></figure>`;
 }
 
 export function statRow({ label, value, unit = "", baseline = "", status, testId } = {}) {
@@ -90,9 +141,12 @@ export function osStripsHtml(platforms, { testPrefix = "os-strip" } = {}) {
     const st = pct === null ? "pending" : normalizeStatus(p.status);
     const name = String(p.name || "").split(" ")[0];
     const arch = String(p.name || "").split(" ").slice(1).join(" ");
+    const valLabel = hasCount
+      ? (isMeasured(p.passRate) ? `${formatPercent(p.passRate)} \u00b7 ${formatNumber(p.suitesPassed)}/${formatNumber(p.suitesTotal)}` : `${formatNumber(p.suitesPassed)} / ${formatNumber(p.suitesTotal)}`)
+      : formatPercent(pct);
     const value = pct === null
       ? `<span class="dim"><span data-value></span>${escapeHtml(formatNumber(p.suitesTotal) ?? "")} suites</span>`
-      : `<span data-value>${escapeHtml(hasCount ? `${formatNumber(p.suitesPassed)} / ${formatNumber(p.suitesTotal)}` : formatPercent(pct))}</span>`;
+      : `<span data-value>${escapeHtml(valLabel)}</span>`;
     const bar = pct === null
       ? '<div class="bar-track is-pending" data-loop aria-hidden="true"></div>'
       : `<div class="bar-track" aria-hidden="true"><div class="bar-fill ${st === "fail" ? "is-fail" : st === "partial" ? "is-partial" : "is-pass"}" style="--v:${Number(Math.max(0.01, pct / 100).toFixed(4))}"></div></div>`;
@@ -101,20 +155,21 @@ export function osStripsHtml(platforms, { testPrefix = "os-strip" } = {}) {
   }).join("");
 }
 
-export function horizontalBar({ label, passed, total, rate, status, testId } = {}) {
+export function horizontalBar({ label, passed, total, rate, status, testId, detail = "" } = {}) {
   const lbl = safeText(label);
   const hasCounts = isMeasured(passed) && isMeasured(total) && total > 0 && passed >= 0;
   const pct = isMeasured(rate) && rate >= 0 ? Math.min(100, rate) : hasCounts ? Math.min(100, (passed / total) * 100) : null;
   const attrs = testId ? ` data-test="${safeText(testId)}"` : "";
+  const titleAttr = detail ? ` title="${safeText(detail)}"` : "";
   if (pct === null) {
     const scope = isMeasured(total) && total > 0 ? `/ ${formatNumber(total)}` : "pending";
-    return `<div class="hbar-row" data-status="pending"${attrs}><span class="hbar-label">${lbl}</span><div class="bar-track is-pending" data-loop></div><span class="hbar-val dim"><span data-value></span>${escapeHtml(scope)}</span><span class="hbar-status">${statusIcon("pending")}</span></div>`;
+    return `<div class="hbar-row" data-status="pending"${attrs}${titleAttr}><span class="hbar-label">${lbl}</span><div class="bar-track is-pending" data-loop></div><span class="hbar-val dim"><span data-value></span>${escapeHtml(scope)}</span><span class="hbar-status">${statusIcon("pending")}</span></div>`;
   }
   const st = normalizeStatus(status);
   const v = Number(Math.max(0.01, Math.min(1, pct / 100)).toFixed(4));
   const val = hasCounts ? `${formatNumber(passed)} / ${formatNumber(total)}` : formatPercent(pct);
   const cls = st === "fail" ? "is-fail" : st === "partial" ? "is-partial" : "is-pass";
-  return `<div class="hbar-row" data-status="${st}"${attrs}><span class="hbar-label">${lbl}</span><div class="bar-track"><div class="bar-fill ${cls}" style="--v:${v}"></div></div><span class="hbar-val" data-value>${escapeHtml(val)}</span><span class="hbar-status">${statusIcon(st)}</span></div>`;
+  return `<div class="hbar-row" data-status="${st}"${attrs}${titleAttr}><span class="hbar-label">${lbl}</span><div class="bar-track"><div class="bar-fill ${cls}" style="--v:${v}"></div></div><span class="hbar-val" data-value>${escapeHtml(val)}</span><span class="hbar-status">${statusIcon(st)}</span></div>`;
 }
 
 export function arcPath(cx, cy, r, startDeg, endDeg) {
@@ -132,11 +187,18 @@ export function segmentRing({ passed, total, status, size = 88, stroke = 6, gapD
   const sz = isMeasured(size) && size > 16 ? Math.round(size) : 88;
   const sw = isMeasured(stroke) && stroke > 0 ? stroke : 6;
   const gap = isMeasured(gapDeg) && gapDeg >= 0 ? gapDeg : 1.25;
-  const n = isMeasured(total) && total > 0 ? Math.min(64, Math.floor(total)) : 0;
+  const rawTotal = isMeasured(total) && total > 0 ? Math.floor(total) : 0;
+  const n = Math.min(64, rawTotal);
   const c = sz / 2;
   const r = Math.max(4, (sz - sw) / 2);
-  const ok = n > 0 && isMeasured(passed) && passed >= 0;
-  const hit = ok ? Math.min(n, Math.floor(passed)) : 0;
+  const ok = rawTotal > 0 && isMeasured(passed) && passed >= 0;
+  const rawPassed = ok ? Math.min(rawTotal, Math.floor(passed)) : 0;
+  let segHit = 0;
+  if (ok) {
+    segHit = rawTotal === n ? rawPassed : Math.round((rawPassed / rawTotal) * n);
+    if (rawPassed < rawTotal && n > 1 && segHit >= n) segHit = n - 1;
+    if (rawPassed > 0 && segHit === 0) segHit = 1;
+  }
   const step = n > 0 ? 360 / n : 0;
   const arc = n > 0 ? Math.max(0.8, step - gap) : 0;
   const len = Number((r * ((arc * Math.PI) / 180)).toFixed(2));
@@ -147,13 +209,15 @@ export function segmentRing({ passed, total, status, size = 88, stroke = 6, gapD
     const d = arcPath(c, c, r, start, start + arc);
     if (!ok) paths += `<path class="ring-seg is-pending" data-seg-status="pending" d="${d}"/>`;
     else {
-      const segSt = preFreeze ? "partial" : i < hit ? "pass" : st === "partial" ? "partial" : "fail";
+      const segSt = preFreeze ? "partial" : i < segHit ? "pass" : st === "partial" ? "partial" : "fail";
       paths += `<path class="ring-seg is-${segSt}" data-seg-status="${segSt}" d="${d}" stroke-width="${sw}" stroke-dasharray="${len}" style="--len:${len};--seg-i:${i}"/>`;
     }
   }
+  const centerLabel = rawTotal > 0 ? `${compactNumber(rawPassed)}/${compactNumber(rawTotal)}` : "-";
+  const pendingLabel = rawTotal > 0 ? compactNumber(rawTotal) : "-";
   const center = ok
-    ? `<text class="ring-val" x="${c}" y="${(c + 6).toFixed(1)}" text-anchor="middle" data-value>${hit}/${n}</text>`
-    : `<text class="ring-val is-pending" x="${c}" y="${(c + 2).toFixed(1)}" text-anchor="middle">${n}</text><text class="ring-sub" x="${c}" y="${(c + 16).toFixed(1)}" text-anchor="middle">pending</text>`;
+    ? `<text class="ring-val" x="${c}" y="${(c + 6).toFixed(1)}" text-anchor="middle" data-value>${escapeHtml(centerLabel)}</text>`
+    : `<text class="ring-val is-pending" x="${c}" y="${(c + 2).toFixed(1)}" text-anchor="middle">${escapeHtml(pendingLabel)}</text><text class="ring-sub" x="${c}" y="${(c + 16).toFixed(1)}" text-anchor="middle">pending</text>`;
   return `<svg class="ring-svg" width="${sz}" height="${sz}" viewBox="0 0 ${sz} ${sz}" data-status="${st}" aria-hidden="true">${paths}${center}</svg>`;
 }
 
@@ -200,27 +264,41 @@ export function waffleRowsHtml(platforms, { cell = 7, gap = 2, testPrefix = "waf
     const visual = ok
       ? waffle({ passed: p.suitesPassed, total: p.suitesTotal, cols: 53, rows: 7, status: st, cell, gap })
       : '<div class="bar-track waffle-pending-bar is-pending" data-loop data-status="pending" aria-hidden="true"></div>';
-    const footLeft = ok ? `${formatNumber(p.suitesPassed)} of ${formatNumber(p.suitesTotal)} suites pass` : `${formatNumber(p.suitesTotal)} RunCMake suites`;
-    return `<figure class="waffle-row${ok ? "" : " is-pending-row"}" aria-label="${escapeHtml(aria)}" data-status="${st}" data-test="${escapeHtml(testPrefix)}-${escapeHtml(p.id)}"><div class="waffle-head"><div class="waffle-os"><span class="waffle-name">${escapeHtml(p.name)}</span><span class="waffle-tc">${escapeHtml(p.toolchain)}</span></div>${statusHtml(st)}</div>${visual}<div class="waffle-foot"><span>${escapeHtml(footLeft)}</span></div></figure>`;
+    const footParts = [];
+    if (ok) {
+      if (isMeasured(p.passRate)) footParts.push(formatPercent(p.passRate));
+      footParts.push(`${formatNumber(p.suitesPassed)} of ${formatNumber(p.suitesTotal)} suites pass`);
+      if (isMeasured(p.casesPassed) && isMeasured(p.casesTotal)) {
+        footParts.push(`${formatNumber(p.casesPassed)} / ${formatNumber(p.casesTotal)} cases`);
+      }
+      if (p.partial && isMeasured(p.completedSuites) && isMeasured(p.expectedSuites)) {
+        footParts.push(`partial: ${formatNumber(p.completedSuites)} / ${formatNumber(p.expectedSuites)} run`);
+      }
+    } else {
+      footParts.push(`${formatNumber(p.suitesTotal)} RunCMake suites`);
+    }
+    return `<figure class="waffle-row${ok ? "" : " is-pending-row"}" aria-label="${escapeHtml(aria)}" data-status="${st}" data-test="${escapeHtml(testPrefix)}-${escapeHtml(p.id)}"><div class="waffle-head"><div class="waffle-os"><span class="waffle-name">${escapeHtml(p.name)}</span><span class="waffle-tc">${escapeHtml(p.toolchain)}</span></div>${statusHtml(st)}</div>${visual}<div class="waffle-foot"><span>${escapeHtml(footParts.join(" \u00b7 "))}</span></div></figure>`;
   }).join("");
 }
 
-export function fuzzGaugeCard({ label, passed, failures, status, summary, testId, preFreeze = false } = {}) {
+export function fuzzGaugeCard({ label, passed, failures, status, summary, detail = "", testId, preFreeze = false } = {}) {
   const ok = isMeasured(passed);
   const st = ok ? (preFreeze ? "partial" : normalizeStatus(status)) : "pending";
   const lbl = safeText(label);
   const failCount = failures ?? 0;
-  const subText = failCount === 0 ? "0 panics" : `${failCount} failures`;
+  const subText = failCount === 0 ? "0 panics" : failCount === 1 ? "1 failure" : `${formatNumber(failCount)} failures`;
   const aria = ok ? `${lbl}. ${formatNumber(passed)} inputs, ${subText}.${preFreeze ? " Pre-freeze baseline." : ""}` : `${lbl}. Pending.`;
-  return `<div class="gauge-card" data-status="${st}"${testId ? ` data-test="${safeText(testId)}"` : ""}><figure class="gauge-fig" aria-label="${aria}"><div class="fuzz-box">${ok ? `<span class="fuzz-num" data-fuzz-target="${passed}" data-value>${escapeHtml(formatNumber(passed))}</span><div class="fuzz-bar" aria-hidden="true"><div class="fuzz-bar-fill"></div></div><span class="gauge-sub">${escapeHtml(subText)}</span>` : '<span class="fuzz-num dim"><span data-value></span>pending</span>'}</div><figcaption class="gauge-label">${lbl}</figcaption></figure>${summary ? `<div class="gate-summary">${safeText(summary)}</div>` : ""}</div>`;
+  const titleAttr = detail ? ` title="${safeText(detail)}"` : "";
+  return `<div class="gauge-card" data-status="${st}"${testId ? ` data-test="${safeText(testId)}"` : ""}${titleAttr}><figure class="gauge-fig" aria-label="${escapeHtml(aria)}"><div class="fuzz-box">${ok ? `<span class="fuzz-num" data-fuzz-target="${passed}" data-value>${escapeHtml(formatNumber(passed))}</span><div class="fuzz-bar" aria-hidden="true"><div class="fuzz-bar-fill"></div></div><span class="gauge-sub">${escapeHtml(subText)}</span>` : '<span class="fuzz-num dim"><span data-value></span>pending</span>'}</div><figcaption class="gauge-label">${lbl}</figcaption></figure>${summary ? `<div class="gate-summary">${safeText(summary)}</div>` : ""}</div>`;
 }
 
-export function ringGaugeCard({ label, passed, total, status, summary, testId, preFreeze = false } = {}) {
+export function ringGaugeCard({ label, passed, total, status, summary, sub = "", detail = "", testId, preFreeze = false } = {}) {
   const ok = isMeasured(passed) && isMeasured(total) && total > 0;
   const st = ok ? (preFreeze ? "partial" : normalizeStatus(status)) : "pending";
   const lbl = safeText(label);
-  const aria = ok ? `${lbl}. ${passed} of ${total} pass.${preFreeze ? " Pre-freeze baseline." : ""}` : `${lbl}. Pending.`;
-  return `<div class="gauge-card" data-status="${st}"${testId ? ` data-test="${safeText(testId)}"` : ""}><figure class="gauge-fig" aria-label="${aria}">${segmentRing({ passed, total, status: st, preFreeze })}<figcaption class="gauge-label">${lbl}</figcaption></figure>${summary ? `<div class="gate-summary">${safeText(summary)}</div>` : ""}</div>`;
+  const aria = ok ? `${lbl}. ${passed} of ${total} pass.${sub ? ` ${sub}.` : ""}${preFreeze ? " Pre-freeze baseline." : ""}` : `${lbl}. Pending.`;
+  const titleAttr = detail ? ` title="${safeText(detail)}"` : "";
+  return `<div class="gauge-card" data-status="${st}"${testId ? ` data-test="${safeText(testId)}"` : ""}${titleAttr}><figure class="gauge-fig" aria-label="${escapeHtml(aria)}">${segmentRing({ passed, total, status: st, preFreeze })}<figcaption class="gauge-label">${lbl}</figcaption></figure>${sub ? `<div class="gauge-sub">${safeText(sub)}</div>` : ""}${summary ? `<div class="gate-summary">${safeText(summary)}</div>` : ""}</div>`;
 }
 
 export function shardHeatmap(shards, { cols = 8 } = {}) {
@@ -228,11 +306,16 @@ export function shardHeatmap(shards, { cols = 8 } = {}) {
   return (Array.isArray(shards) ? shards : []).map((s, idx) => {
     const id = isMeasured(s?.shard) ? Math.floor(s.shard) : idx;
     const st = normalizeStatus(s?.status);
-    const ok = isMeasured(s?.portsPassed) && isMeasured(s?.portsTotal) && s.portsTotal > 0 && s.portsPassed >= 0;
-    const pct = ok ? (s.portsPassed / s.portsTotal) * 100 : -1;
-    const bucket = !ok ? "is-pending" : pct >= 100 ? "hm-4" : pct >= 99 ? "hm-3" : pct >= 95 ? "hm-2" : pct >= 80 ? "hm-1" : "hm-0";
-    const cls = `hm-cell ${bucket}${st === "fail" ? " is-fail" : ""}`;
-    const tip = ok ? `shard ${id} \u00b7 ${formatNumber(s.portsPassed)} / ${formatNumber(s.portsTotal)} ports${isMeasured(s.durationSeconds) ? ` \u00b7 ${Math.round(s.durationSeconds)} s` : ""}` : `shard ${id} \u00b7 pending`;
+    const hasScored = isMeasured(s?.portsPassed) && isMeasured(s?.portsTotal) && s.portsTotal > 0 && s.portsPassed >= 0;
+    const measured = hasScored || st !== "pending";
+    const pct = hasScored ? (s.portsPassed / s.portsTotal) * 100 : -1;
+    const bucket = !measured ? "is-pending" : !hasScored ? "hm-0" : pct >= 100 ? "hm-4" : pct >= 99 ? "hm-3" : pct >= 95 ? "hm-2" : pct >= 80 ? "hm-1" : "hm-0";
+    const cls = `hm-cell ${bucket}${st === "fail" ? " is-fail" : st === "partial" ? " is-partial" : ""}`;
+    const tip = hasScored
+      ? `shard ${id} \u00b7 ${formatNumber(s.portsPassed)} / ${formatNumber(s.portsTotal)} ports${isMeasured(s.durationSeconds) ? ` \u00b7 ${Math.round(s.durationSeconds)} s` : ""}`
+      : measured
+        ? `shard ${id} \u00b7 ${st}${isMeasured(s?.portsInspected) ? ` \u00b7 ${formatNumber(s.portsInspected)} inspected` : ""}`
+        : `shard ${id} \u00b7 pending`;
     return `<button type="button" class="${cls}" data-shard="${id}" data-status="${st}" style="--diag:${Math.floor(idx / c) + (idx % c)}" tabindex="${idx === 0 ? 0 : -1}" aria-pressed="false" data-tip="${escapeHtml(tip)}" aria-label="${escapeHtml(tip)}">${String(id).padStart(2, "0")}</button>`;
   }).join("");
 }

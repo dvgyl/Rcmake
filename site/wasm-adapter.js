@@ -125,7 +125,7 @@ target_link_libraries(codec_app PRIVATE codec_flags)
   "presets-v13": {
     id: "presets-v13",
     title: "Presets v13",
-    description: "CMakePresets.json schema v13 inheritance with ${configurePresetName} macro expansion and Ninja Multi-Config.",
+    description: "CMakePresets.json schema v13 inheritance with ${sourceDir} and ${presetName} macro expansion and Ninja Multi-Config.",
     defaultSymbol: "CMAKE_EXPORT_COMPILE_COMMANDS",
     files: {
       "CMakeLists.txt": `cmake_minimum_required(VERSION 3.30...4.5)
@@ -251,7 +251,12 @@ export class RcmakeWasmAdapter {
       }
       this.module = mod;
       this.mode = "wasm";
-      this.loadReason = `Loaded WebAssembly PureHost runtime (engine ${this.engineCommit}).`;
+      if (typeof mod.ENGINE_COMMIT === "string" && mod.ENGINE_COMMIT.trim()) {
+        this.engineCommit = mod.ENGINE_COMMIT.trim();
+        this.loadReason = `Loaded WebAssembly PureHost runtime (engine ${this.engineCommit}).`;
+      } else {
+        this.loadReason = "Loaded WebAssembly PureHost runtime (rcmake_wasm.wasm).";
+      }
       return { mode: "wasm", url, engineCommit: this.engineCommit };
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);

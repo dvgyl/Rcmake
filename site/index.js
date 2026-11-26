@@ -1,7 +1,7 @@
 /* rcmake home page controller. MIT OR Apache-2.0. */
 
 import { copyWithFeedback, escapeHtml, formatNumber, initRovingGroup, isPreFreezeGate, loadLatestData, normalizeStatus, revealScan, statusHtml } from "./app.js";
-import { formatSpeed, isMeasured, osStripsHtml, speedupBars, statRow, statTile } from "./charts.js";
+import { formatSpeed, isMeasured, normalizeGiants, osStripsHtml, speedupBars, statRow, statTile } from "./charts.js";
 import { createMotionController, prefersReducedMotion } from "./motion.js";
 import { initPipeline } from "./pipeline.js";
 
@@ -72,7 +72,7 @@ function initTerminal(doc) {
   });
   copyBtn?.addEventListener("click", () => {
     const panel = doc.getElementById(`panel-${active}`);
-    if (panel) copyWithFeedback(copyBtn, Array.from(panel.querySelectorAll("[data-line]"), (el) => el.textContent).join("\n"), "Copy");
+    if (panel) copyWithFeedback(copyBtn, Array.from(panel.querySelectorAll("[data-line]"), (el) => el.textContent).join("\n"), "Copy", panel);
   });
 }
 
@@ -86,6 +86,7 @@ function initRace(doc, motion) {
   if (!widget) return { setData() {} };
   let mode = "warm";
   let bench = null;
+  let giants = null;
   let timer = null;
 
   const drawLines = (win) => {
@@ -100,6 +101,7 @@ function initRace(doc, motion) {
     const cfg = RACE_MODES[mode];
     const m = bench?.[cfg.key];
     const val = m?.value;
+    const st = normalizeStatus(m?.status === "pending" ? "pass" : m?.status);
     if (cmCmdEl) cmCmdEl.innerHTML = cfg.cmakeCmd;
     if (rcCmdEl) rcCmdEl.innerHTML = cfg.rcmakeCmd;
     if (!isMeasured(val) || val <= 0) {
@@ -111,19 +113,38 @@ function initRace(doc, motion) {
       motion.scan(widget);
       return;
     }
-    cmBar.dataset.status = rcBar.dataset.status = "pass";
+    cmBar.dataset.status = rcBar.dataset.status = st;
     if (cfg.kind === "leaf") {
-      drawLines("rcmake");
-      cmBar.innerHTML = '<div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim">full reconfigure</span></div>';
-      rcBar.innerHTML = `<div class="bar-track"><div class="bar-fill is-rcmake" style="--v:1;--bar-dur:320ms" data-scale="1"></div></div><div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${escapeHtml(formatNumber(val))} ms p95</span></div>`;
-      caption.textContent = cfg.caption;
+      const leafSpeedup = giants?.summary?.incrementalLeafSpeedupGeomean;
+      if (isMeasured(leafSpeedup) && leafSpeedup > 0) {
+        const isFaster = leafSpeedup >= 1;
+        const cmScale = isFaster ? "1" : String(Number(Math.min(1, Math.max(0.02, leafSpeedup)).toFixed(4)));
+        const rcScale = isFaster ? String(Number(Math.min(1, Math.max(0.02, 1 / leafSpeedup)).toFixed(4))) : "1";
+        const rcCls = isFaster ? "is-rcmake" : st === "fail" ? "is-fail" : "is-partial";
+        const spdTxt = leafSpeedup > 1 ? `${formatSpeed(leafSpeedup)}\u00d7 faster \u00b7 ${formatNumber(val)} ms p95` : leafSpeedup < 1 ? `${(1 / leafSpeedup).toFixed(2)}\u00d7 slower \u00b7 ${formatNumber(val)} ms p95` : `${formatNumber(val)} ms p95`;
+        drawLines(isFaster ? "rcmake" : "cmake");
+        cmBar.innerHTML = `<div class="bar-track"><div class="bar-fill is-cmake" style="--v:${cmScale};--bar-dur:800ms" data-scale="${cmScale}"></div></div><div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim" data-value>full reconfigure</span></div>`;
+        rcBar.innerHTML = `<div class="bar-track"><div class="bar-fill ${rcCls}" style="--v:${rcScale};--bar-dur:${Math.max(160, Math.round(800 / Math.max(0.2, leafSpeedup)))}ms" data-scale="${rcScale}" data-test="race-fill-rcmake"></div></div><div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${escapeHtml(spdTxt)}</span></div>`;
+        caption.textContent = "Incremental replay re-runs the edited file and replays unchanged subtrees.";
+      } else {
+        drawLines("rcmake");
+        cmBar.innerHTML = '<div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim">full reconfigure</span></div>';
+        rcBar.innerHTML = `<div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${escapeHtml(formatNumber(val))} ms p95</span></div>`;
+        caption.textContent = m?.baseline || "Single-file change replay (p95 wall time).";
+      }
       return;
     }
-    const scale = String(Number(Math.min(1, Math.max(0.02, 1 / val)).toFixed(4)));
-    drawLines(val >= 1 ? "rcmake" : "cmake");
-    cmBar.innerHTML = '<div class="bar-track"><div class="bar-fill is-cmake" style="--v:1;--bar-dur:800ms" data-scale="1"></div></div><div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim" data-value>1.00\u00d7</span></div>';
-    rcBar.innerHTML = `<div class="bar-track"><div class="bar-fill is-rcmake" style="--v:${scale};--bar-dur:${Math.max(160, Math.round(800 / val))}ms" data-scale="${scale}" data-test="race-fill-rcmake"></div></div><div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${formatSpeed(val)}\u00d7 faster</span></div>`;
-    caption.textContent = cfg.caption;
+    const isFaster = val >= 1;
+    const cmScale = isFaster ? "1" : String(Number(Math.min(1, Math.max(0.02, val)).toFixed(4)));
+    const rcScale = isFaster ? String(Number(Math.min(1, Math.max(0.02, 1 / val)).toFixed(4))) : "1";
+    const rcCls = isFaster ? "is-rcmake" : st === "fail" ? "is-fail" : "is-partial";
+    const rcLabel = val > 1 ? `${formatSpeed(val)}\u00d7 faster` : val < 1 ? `${(1 / val).toFixed(2)}\u00d7 slower` : "1.00\u00d7";
+    const cmDur = isFaster ? 800 : Math.max(160, Math.round(800 * val));
+    const rcDur = isFaster ? Math.max(160, Math.round(800 / val)) : 800;
+    drawLines(isFaster ? "rcmake" : "cmake");
+    cmBar.innerHTML = `<div class="bar-track"><div class="bar-fill is-cmake" style="--v:${cmScale};--bar-dur:${cmDur}ms" data-scale="${cmScale}"></div></div><div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim" data-value>1.00\u00d7</span></div>`;
+    rcBar.innerHTML = `<div class="bar-track"><div class="bar-fill ${rcCls}" style="--v:${rcScale};--bar-dur:${rcDur}ms" data-scale="${rcScale}" data-test="race-fill-rcmake"></div></div><div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${escapeHtml(rcLabel)}</span></div>`;
+    caption.textContent = cfg.caption || m?.baseline || "";
   };
 
   const play = () => {
@@ -144,7 +165,7 @@ function initRace(doc, motion) {
   replayBtn?.addEventListener("click", play);
   render();
   motion.observeReveal(widget, play);
-  return { setData(d) { bench = d; widget.classList.contains("is-in") ? play() : render(); } };
+  return { setData(d, g = null) { bench = d; giants = g; widget.classList.contains("is-in") ? play() : render(); } };
 }
 
 function renderSnapshot(el, data) {
@@ -159,7 +180,7 @@ function renderSnapshot(el, data) {
   const fails = fuzz.failures ?? 0;
 
   el.innerHTML = [
-    statTile({ label: "Fuzz inputs", value: fuzz.passed, detail: fails === 0 ? "0 panics" : `${formatNumber(fails)} failures`, status: fuzzPre ? "partial" : fuzz.status, tag: fuzzPre ? "pre-freeze" : "", testId: "gauge-fuzz" }),
+    statTile({ label: "Fuzz inputs", value: fuzz.passed, detail: fails === 0 ? "0 panics" : fails === 1 ? "1 failure" : `${formatNumber(fails)} failures`, status: fuzzPre ? "partial" : fuzz.status, tag: fuzzPre ? "pre-freeze" : "", testId: "gauge-fuzz" }),
     statTile({ label: "WASI checks", value: wasi.passed, total: wasi.total ?? 6, status: wasiPre ? "partial" : wasi.status, tag: wasiPre ? "pre-freeze" : "", testId: "gauge-wasi" }),
     statTile({ label: "Core suites", value: core.suitesAt100, total: core.suitesTotal ?? 62, unit: isMeasured(core.suitesAt100) ? "" : "suites", detail: "fully passing", status: core.status, testId: "gauge-core" }),
     statTile({ label: "Blind holdout", value: hold.reposPassed, total: hold.reposTotal ?? 240, unit: isMeasured(hold.reposPassed) ? "" : "repos", detail: "L2 parity", status: hold.status, testId: "gauge-holdout" })
@@ -169,7 +190,10 @@ function renderSnapshot(el, data) {
 function renderGiantsTable(giants) {
   if (!giants || !Array.isArray(giants.projects) || giants.projects.length === 0) return "";
   if (!giants.projects.some((p) => normalizeStatus(p?.status) !== "pending")) return "";
-  const fmtRatio = (v) => (formatSpeed(v) ? `${formatSpeed(v)}\u00d7` : "-");
+  const fmtRatio = (v) => {
+    if (!formatSpeed(v)) return "-";
+    return v < 1 ? `${(1 / v).toFixed(2)}\u00d7 slower` : `${formatSpeed(v)}\u00d7`;
+  };
   const fmtRss = (p) => {
     const rc = [p?.cold?.rcmakePeakRssMiB, p?.warmProbe?.rcmakePeakRssMiB, p?.incrementalLeaf?.rcmakePeakRssMiB].filter(isMeasured);
     const cm = [p?.cold?.cmakePeakRssMiB, p?.warmProbe?.cmakePeakRssMiB, p?.incrementalLeaf?.cmakePeakRssMiB].filter(isMeasured);
@@ -180,8 +204,9 @@ function renderGiantsTable(giants) {
   const rows = giants.projects.map((p) => {
     const st = normalizeStatus(p?.status);
     const leafP95 = isMeasured(p?.incrementalLeaf?.rcmakeP95Ms) ? ` (${formatNumber(p.incrementalLeaf.rcmakeP95Ms)} ms)` : "";
-    const leaf = formatSpeed(p?.incrementalLeaf?.speedup) ? `${formatSpeed(p.incrementalLeaf.speedup)}\u00d7${leafP95}` : (leafP95 ? leafP95.slice(2, -1) : "-");
-    return `<tr data-status="${st}"><td>${escapeHtml(p?.name || "")}</td><td>${escapeHtml(fmtRatio(p?.cold?.speedup))}</td><td>${escapeHtml(fmtRatio(p?.warmProbe?.speedup))}</td><td>${escapeHtml(leaf)}</td><td>${escapeHtml(fmtRss(p))}</td><td>${statusHtml(st)}</td></tr>`;
+    const leafRatio = formatSpeed(p?.incrementalLeaf?.speedup) ? fmtRatio(p.incrementalLeaf.speedup) : "";
+    const leaf = leafRatio ? `${leafRatio}${leafP95}` : (leafP95 ? leafP95.slice(2, -1) : "-");
+    return `<tr data-status="${st}"><td>${escapeHtml(p?.name || "")}</td><td class="mono nowrap">${escapeHtml(fmtRatio(p?.cold?.speedup))}</td><td class="mono nowrap">${escapeHtml(fmtRatio(p?.warmProbe?.speedup))}</td><td class="mono nowrap">${escapeHtml(leaf)}</td><td class="mono nowrap">${escapeHtml(fmtRss(p))}</td><td>${statusHtml(st)}</td></tr>`;
   }).join("");
   return `<div style="border-top:1px solid var(--line);overflow-x:auto" data-test="home-giants-bench"><table class="runner-table"><thead><tr><th>Project</th><th>Cold</th><th>New tree (probe cache)</th><th>Leaf edit</th><th>Peak RSS</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
@@ -192,7 +217,7 @@ function renderSpeed(el, bench, motion, giants = null) {
   const c = b.coldConfigureSpeedup || {};
   const l = b.incrementalLeafP95Ms || {};
   const r = b.peakRssMiB || {};
-  el.innerHTML = `${speedupBars({ label: "New tree, shared probe cache", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, status: l.status, testId: "speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
+  el.innerHTML = `${speedupBars({ label: w.label || "New tree, shared probe cache", baseline: w.baseline || "", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: c.label || "Cold configure, 500 targets", baseline: c.baseline || "", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: l.label || "Leaf edit reconfigure, p95", baseline: l.baseline || "", value: l.value, unit: l.unit, status: l.status, testId: "speed-leaf" })}${statRow({ label: r.label || "Peak memory, 500 targets", baseline: r.baseline || "", value: r.value, unit: r.unit, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
   motion.scan(el);
 }
 
@@ -268,26 +293,42 @@ async function init() {
   revealScan(gauges);
   renderSpeed(speed, null, motion);
 
+  let data;
   try {
-    const data = await loadLatestData();
+    data = await loadLatestData();
+  } catch (err) {
+    console.error("Failed to load data/latest.json:", err);
+    if (errEl) { errEl.textContent = "Could not load data/latest.json. Serve the site over HTTP."; errEl.hidden = false; }
+    return;
+  }
+
+  try {
     const range = data?.tracks?.policies?.activeRange;
     if (range) document.querySelectorAll("[data-policy-range]").forEach((el) => { el.textContent = range; });
     const syncCmpGate = (gateKey, trackStatus) => {
       const cell = document.querySelector(`[data-cmp-gate="${gateKey}"]`);
-      if (!cell || normalizeStatus(trackStatus) !== "pass") return;
-      cell.classList.add("st-pass");
-      cell.innerHTML = '<svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span>';
+      if (!cell) return;
+      const st = normalizeStatus(trackStatus);
+      cell.classList.remove("st-pass", "st-partial", "st-fail", "st-pending");
+      if (st === "pass") {
+        cell.classList.add("st-pass");
+        cell.innerHTML = '<svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span>';
+      } else if (st === "partial" || st === "fail") {
+        cell.innerHTML = statusHtml(st);
+      }
     };
     syncCmpGate("policies", data?.tracks?.policies?.status);
     syncCmpGate("generators", data?.tracks?.runCmakeOs?.status);
     waffles.innerHTML = osStripsHtml(data?.tracks?.runCmakeOs?.platforms || DEFAULT_PLATFORMS);
     renderSnapshot(gauges, data);
     revealScan(gauges);
-    renderSpeed(speed, data?.tracks?.benchmarksAndGates?.benchmarks, motion, data?.tracks?.benchmarksAndGates?.giantsBenchmark || null);
-    race.setData(data?.tracks?.benchmarksAndGates?.benchmarks || null);
+    const giants = normalizeGiants(data?.tracks?.benchmarksAndGates);
+    renderSpeed(speed, data?.tracks?.benchmarksAndGates?.benchmarks, motion, giants);
+    race.setData(data?.tracks?.benchmarksAndGates?.benchmarks || null, giants);
     motion.scan(document);
-  } catch (_) {
-    if (errEl) { errEl.textContent = "Could not load data/latest.json. Serve the site over HTTP."; errEl.hidden = false; }
+  } catch (err) {
+    console.error("Failed to render home dashboard snapshot:", err);
+    if (errEl) { errEl.textContent = "Could not render compatibility metrics."; errEl.hidden = false; }
   }
 }
 

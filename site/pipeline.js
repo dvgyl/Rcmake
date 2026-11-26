@@ -47,6 +47,7 @@ export function initPipeline(root, motion) {
       const on = b.dataset.stageBtn === id;
       b.setAttribute("aria-selected", String(on));
       b.tabIndex = on ? 0 : -1;
+      if (on && b.id) detail.setAttribute("aria-labelledby", b.id);
     });
     if (!animate || !changed) { detail.innerHTML = renderDetail(PIPELINE_MODEL, id); return; }
     detail.classList.add("is-swapping");
@@ -58,9 +59,6 @@ export function initPipeline(root, motion) {
   };
 
   initRovingGroup(bar, "[data-stage-btn]", (b) => select(b.dataset.stageBtn));
-  if (typeof window !== "undefined" && window.matchMedia?.("(hover: hover)").matches) {
-    bar.querySelectorAll("[data-stage-btn]").forEach((b) => b.addEventListener("mouseenter", () => select(b.dataset.stageBtn)));
-  }
   select(selected, false);
   motion?.observeLoop(root);
 }

@@ -42,12 +42,30 @@ export function formatRatio(passed, total) {
   return p !== null && t !== null ? `${p} / ${t}` : null;
 }
 
+export function formatMiB(bytes) {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) return null;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
+}
+
+export function formatBytes(bytes) {
+  const mib = formatMiB(bytes);
+  if (!mib) return null;
+  return `${mib} (${formatNumber(bytes)} bytes)`;
+}
+
 export function cleanNote(text) {
   return String(text ?? "").trim();
 }
 
 export function isPreFreezeGate(gate, data) {
-  return !data?.commit && Boolean(gate?.preFreeze);
+  if (!gate?.preFreeze) return false;
+  if (!data?.commit) return true;
+  if (gate.commit) {
+    const gc = String(gate.commit).trim().toLowerCase();
+    const dc = String(data.commit).trim().toLowerCase();
+    if (gc && dc && !dc.startsWith(gc) && !gc.startsWith(dc)) return true;
+  }
+  return false;
 }
 
 export function normalizeStatus(status) {
@@ -68,12 +86,15 @@ export async function loadLatestData(url = "./data/latest.json") {
 export function initThemeToggle(doc = document) {
   const root = doc.documentElement;
   const btn = doc.getElementById("theme-toggle");
-  if (!root.dataset.theme) root.dataset.theme = "dark";
+  if (root.dataset.theme !== "light" && root.dataset.theme !== "dark") {
+    const prefersLight = typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-color-scheme: light)").matches;
+    root.dataset.theme = prefersLight ? "light" : "dark";
+  }
   const sync = () => {
     if (!btn) return;
     const dark = root.dataset.theme !== "light";
     btn.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
-    btn.setAttribute("aria-pressed", String(!dark));
+    btn.removeAttribute("aria-pressed");
   };
   sync();
   btn?.addEventListener("click", () => {
@@ -180,14 +201,42 @@ export function initSegPills(doc = document) {
   doc.querySelectorAll(".seg, .pane-tabs").forEach(initSegPill);
 }
 
-export async function copyWithFeedback(button, text, label = "Copy") {
+function execCopyFallback(text) {
+  if (typeof document === "undefined" || typeof document.execCommand !== "function") return false;
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  ta.style.pointerEvents = "none";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (_) {}
+  ta.remove();
+  return ok;
+}
+
+export async function copyWithFeedback(button, text, label = "Copy", fallbackEl = null) {
   const node = button.querySelector("[data-copy-label]");
   const set = (v) => { if (node) node.textContent = v; else button.textContent = v; };
+  let copied = false;
   try {
-    await navigator.clipboard.writeText(text);
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    }
+  } catch (_) {}
+  if (!copied) copied = execCopyFallback(text);
+  if (copied) {
     set("Copied");
     button.classList.add("is-copied");
-  } catch (_) { set("Select and copy"); }
+  } else {
+    if (fallbackEl && typeof window !== "undefined" && typeof window.getSelection === "function") {
+      try { window.getSelection().selectAllChildren(fallbackEl); } catch (_) {}
+    }
+    set("Select and copy");
+  }
   clearTimeout(button._copyTimer);
   button._copyTimer = setTimeout(() => { set(label); button.classList.remove("is-copied"); }, 1600);
 }
@@ -226,34 +275,105 @@ export function initRovingGroup(container, selector, onActivate) {
 const ratioOf = (p, t) =>
   typeof p === "number" && Number.isFinite(p) && typeof t === "number" && t > 0 ? Math.max(0, Math.min(1, p / t)) : null;
 
+function formatSpeedSummary(metric) {
+  const v = metric?.value;
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return null;
+  if (metric.unit === "x") {
+    if (v > 1) return `${v.toFixed(2)}\u00d7 faster`;
+    if (v < 1) return `${(1 / v).toFixed(2)}\u00d7 slower`;
+    return "1.00\u00d7";
+  }
+  return `${v.toFixed(2)}${metric.unit ? ` ${metric.unit}` : ""}`;
+}
+
+function speedRowRatio(metric) {
+  const v = metric?.value;
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return null;
+  const st = normalizeStatus(metric.status);
+  if (st === "pass") return 1;
+  if (st === "fail") return Math.max(0.15, Math.min(0.85, v < 1 ? v : 0.35));
+  return 0.5;
+}
+
 export function overviewRows(data) {
   const t = data?.tracks || {};
   const gates = t.benchmarksAndGates?.gates || [];
-  const gate = (id) => gates.find((g) => g.id === id) || { status: "pending" };
-  const [bb, fuzz, wasi] = [gate("blackbox"), gate("fuzz"), gate("wasi")];
+  const findGate = (id) => gates.find((g) => g.id === id);
+  const gateOrPending = (id) => findGate(id) || { status: "pending" };
+  const [bb, fuzz, wasi, probe, mutation] = [
+    gateOrPending("blackbox"),
+    gateOrPending("fuzz"),
+    gateOrPending("wasi"),
+    gateOrPending("probe-cache"),
+    gateOrPending("mutation-replay")
+  ];
+  const conan = findGate("conan-ecosystem");
+  const pathSwap = findGate("path-swap");
+  const determinism = findGate("determinism");
+  const diff = t.benchmarksAndGates?.differentialFuzz;
+  const diffTotal = typeof diff?.casesTotal === "number" ? diff.casesTotal : diff?.total;
+  const diffPassed = typeof diff?.casesPassed === "number" ? diff.casesPassed : diff?.passed;
+
   const { coreConformance: core = {}, policies: pol = {}, runCmakeOs: rc = {}, bossFight: boss = {}, unseenHoldout: hold = {}, vcpkgMatrix: vc = {} } = t;
   const plats = rc.platforms || [];
-  const osDone = plats.length > 0 && plats.every((p) => typeof p.passRate === "number");
+  const measuredPlats = plats.filter((p) => typeof p.passRate === "number");
+  const osAny = measuredPlats.length > 0;
   const warm = t.benchmarksAndGates?.benchmarks?.warmProbeSpeedup || {};
+  const cold = t.benchmarksAndGates?.benchmarks?.coldConfigureSpeedup || {};
 
   const fuzzPre = isPreFreezeGate(fuzz, data);
   const wasiPre = isPreFreezeGate(wasi, data);
   const fuzzTag = fuzzPre && fuzz.commit ? ` (${fuzz.commit})` : "";
   const wasiTag = wasiPre && wasi.commit ? ` (${wasi.commit})` : "";
-  const fuzzUnit = fuzz.failures ? "fail" : "panics";
+  const fuzzFails = fuzz.failures ?? 0;
+  const fuzzUnit = fuzzFails === 0 ? "panics" : fuzzFails === 1 ? "failure" : "failures";
 
-  return [
+  const hasL3 = typeof boss.l3Passed === "number";
+  const hasL4 = typeof boss.l4Passed === "number";
+  const bossCheck = hasL4 ? "Large projects, L1-L4" : hasL3 ? "Large projects, L1-L3" : "Large projects, L1 / L2";
+  let bossResult = null;
+  if (typeof boss.l1Passed === "number" && typeof boss.l2Passed === "number") {
+    const parts = [boss.l1Passed, boss.l2Passed];
+    if (hasL3) parts.push(boss.l3Passed);
+    if (hasL4) parts.push(boss.l4Passed);
+    bossResult = `${parts.join(" / ")} of ${boss.projectsTotal}`;
+  }
+
+  const rows = [
     { id: "core", check: "Core suites", result: formatRatio(core.suitesAt100, core.suitesTotal), scope: `- / ${formatNumber(core.suitesTotal) ?? "?"}`, ratio: ratioOf(core.suitesAt100, core.suitesTotal), status: normalizeStatus(core.status) },
     { id: "core", check: `Policies ${pol.activeRange || ""}`.trim(), result: formatRatio(pol.suitesPassed, pol.suitesTotal), scope: `- / ${formatNumber(pol.suitesTotal) ?? "?"}`, ratio: ratioOf(pol.suitesPassed, pol.suitesTotal), status: normalizeStatus(pol.status) },
-    { id: "runcmake", check: "Tests/RunCMake, 3 OS", result: osDone ? plats.map((p) => formatPercent(p.passRate)).join(" / ") : null, scope: `${plats.map((p) => p.suitesTotal).join(" / ")} suites`, ratio: osDone ? plats.reduce((a, p) => a + p.passRate, 0) / (plats.length * 100) : null, status: normalizeStatus(rc.status) },
+    { id: "runcmake", check: "Tests/RunCMake, 3 OS", result: osAny ? plats.map((p) => formatPercent(p.passRate) ?? "-").join(" / ") : null, scope: `${plats.map((p) => p.suitesTotal).join(" / ")} suites`, ratio: osAny ? measuredPlats.reduce((a, p) => a + p.passRate, 0) / (plats.length * 100) : null, status: normalizeStatus(rc.status) },
     { id: "gates", check: "Black-box scenarios", result: formatRatio(bb.scenariosPassed, bb.scenariosTotal), scope: `- / ${formatNumber(bb.scenariosTotal) ?? "?"}`, ratio: ratioOf(bb.scenariosPassed, bb.scenariosTotal), status: normalizeStatus(bb.status) },
-    { id: "projects", check: "Large projects, L1 / L2", result: typeof boss.l1Passed === "number" && typeof boss.l2Passed === "number" ? `${boss.l1Passed} / ${boss.l2Passed} of ${boss.projectsTotal}` : null, scope: `- / ${formatNumber(boss.projectsTotal) ?? "?"}`, ratio: ratioOf(boss.l2Passed, boss.projectsTotal), status: normalizeStatus(boss.status) },
+    { id: "projects", check: bossCheck, result: bossResult, scope: `- / ${formatNumber(boss.projectsTotal) ?? "?"}`, ratio: ratioOf(boss.l2Passed, boss.projectsTotal), status: normalizeStatus(boss.status) },
     { id: "holdout", check: "Blind holdout", result: formatRatio(hold.reposPassed, hold.reposTotal), scope: `- / ${formatNumber(hold.reposTotal) ?? "?"}`, ratio: ratioOf(hold.reposPassed, hold.reposTotal), status: normalizeStatus(hold.status) },
-    { id: "vcpkg", check: "vcpkg ports", result: typeof vc.portsPassed === "number" && typeof vc.portsTotal === "number" ? `${formatRatio(vc.portsPassed, vc.portsTotal)} ports` : null, scope: `${formatNumber(vc.shardsCompleted) ?? "0"} / ${formatNumber(vc.shardsTotal) ?? "64"} shards`, ratio: typeof vc.passRate === "number" ? Math.max(0, Math.min(1, vc.passRate / 100)) : null, status: normalizeStatus(vc.status) },
-    { id: "gates", check: "Seeded generative fuzzing", result: typeof fuzz.passed === "number" ? `${formatNumber(fuzz.passed)} inputs, ${fuzz.failures ?? 0} ${fuzzUnit}${fuzzTag}` : null, scope: "pending", ratio: ratioOf(fuzz.passed, fuzz.total), status: fuzzPre ? "partial" : normalizeStatus(fuzz.status), statusText: fuzzPre ? "pre-freeze" : undefined },
-    { id: "gates", check: "WASI and wasm32", result: formatRatio(wasi.passed, wasi.total) ? `${formatRatio(wasi.passed, wasi.total)}${wasiTag}` : null, scope: `- / ${formatNumber(wasi.total) ?? "?"}`, ratio: ratioOf(wasi.passed, wasi.total), status: wasiPre ? "partial" : normalizeStatus(wasi.status), statusText: wasiPre ? "pre-freeze" : undefined },
-    { id: "speed", check: "New tree, shared probe cache", result: typeof warm.value === "number" && Number.isFinite(warm.value) ? `${warm.value}${warm.unit === "x" ? "\u00d7" : ` ${warm.unit || ""}`}` : null, scope: "pending", ratio: typeof warm.value === "number" && warm.value > 0 ? Math.min(1, 1 / warm.value) : null, status: normalizeStatus(warm.status) }
+    { id: "vcpkg", check: "vcpkg ports", result: typeof vc.portsPassed === "number" && typeof vc.portsTotal === "number" ? `${formatRatio(vc.portsPassed, vc.portsTotal)} ports` : null, scope: `${formatNumber(vc.shardsCompleted) ?? "0"} / ${formatNumber(vc.shardsTotal) ?? "64"} shards`, ratio: typeof vc.passRate === "number" ? Math.max(0, Math.min(1, vc.passRate / 100)) : null, status: normalizeStatus(vc.status) }
   ];
+
+  if (conan) {
+    rows.push({ id: "gates", check: "Conan ecosystem", result: formatRatio(conan.passed, conan.total), scope: `- / ${formatNumber(conan.total) ?? "?"}`, ratio: ratioOf(conan.passed, conan.total), status: normalizeStatus(conan.status) });
+  }
+  rows.push(
+    { id: "gates", check: "Probe cache", result: formatRatio(probe.passed, probe.total), scope: `- / ${formatNumber(probe.total) ?? "?"}`, ratio: ratioOf(probe.passed, probe.total), status: normalizeStatus(probe.status) },
+    { id: "gates", check: "Mutation replay", result: formatRatio(mutation.passed, mutation.total), scope: `- / ${formatNumber(mutation.total) ?? "?"}`, ratio: ratioOf(mutation.passed, mutation.total), status: normalizeStatus(mutation.status) }
+  );
+  if (pathSwap) {
+    rows.push({ id: "gates", check: "Silent PATH swap", result: formatRatio(pathSwap.passed, pathSwap.total), scope: `- / ${formatNumber(pathSwap.total) ?? "1"}`, ratio: ratioOf(pathSwap.passed, pathSwap.total), status: normalizeStatus(pathSwap.status) });
+  }
+  if (determinism) {
+    rows.push({ id: "gates", check: "Path-swap determinism", result: formatRatio(determinism.passed, determinism.total), scope: `- / ${formatNumber(determinism.total) ?? "1"}`, ratio: ratioOf(determinism.passed, determinism.total), status: normalizeStatus(determinism.status) });
+  }
+  rows.push(
+    { id: "gates", check: "Seeded generative fuzzing", result: typeof fuzz.passed === "number" ? `${formatNumber(fuzz.passed)} inputs, ${formatNumber(fuzzFails)} ${fuzzUnit}${fuzzTag}` : null, scope: "pending", ratio: ratioOf(fuzz.passed, fuzz.total), status: fuzzPre ? "partial" : normalizeStatus(fuzz.status), statusText: fuzzPre ? "pre-freeze" : undefined }
+  );
+  if (diff && typeof diffTotal === "number" && diffTotal > 0) {
+    rows.push({ id: "gates", check: "Oracle differential fuzzing", result: formatRatio(diffPassed, diffTotal), scope: `- / ${formatNumber(diffTotal)}`, ratio: ratioOf(diffPassed, diffTotal), status: normalizeStatus(diff.status) });
+  }
+  rows.push(
+    { id: "gates", check: "WASI and wasm32", result: formatRatio(wasi.passed, wasi.total) ? `${formatRatio(wasi.passed, wasi.total)}${wasiTag}` : null, scope: `- / ${formatNumber(wasi.total) ?? "?"}`, ratio: ratioOf(wasi.passed, wasi.total), status: wasiPre ? "partial" : normalizeStatus(wasi.status), statusText: wasiPre ? "pre-freeze" : undefined },
+    { id: "speed", check: "Cold configure, 500 targets", result: formatSpeedSummary(cold), scope: "pending", ratio: speedRowRatio(cold), status: normalizeStatus(cold.status) },
+    { id: "speed", check: "New tree, shared probe cache", result: formatSpeedSummary(warm), scope: "pending", ratio: speedRowRatio(warm), status: normalizeStatus(warm.status) }
+  );
+  return rows;
 }
 
 export function overviewRowsHtml(rows) {
@@ -261,8 +381,15 @@ export function overviewRowsHtml(rows) {
 }
 
 export function snapshotMeta(data) {
+  const parts = [];
+  if (data?.rcmakeVersion) parts.push(`rcmake ${String(data.rcmakeVersion)}`);
+  parts.push(data?.commit ? `commit ${String(data.commit).slice(0, 12)}` : "commit pending");
+  parts.push(`CMake ${data?.targetCmakeVersion || "4.5.1"}`);
+  const size = formatMiB(data?.receipt?.binarySizeBytes);
+  if (size) parts.push(`binary ${size}`);
   const d = data?.generatedAt ? String(data.generatedAt).slice(0, 10) : null;
-  return [data?.commit ? `commit ${String(data.commit).slice(0, 12)}` : "commit pending", `CMake ${data?.targetCmakeVersion || "4.5.1"}`, d ? `generated ${d}` : "not yet generated"].join(" \u00b7 ");
+  parts.push(d ? `generated ${d}` : "not yet generated");
+  return parts.join(" \u00b7 ");
 }
 
 if (typeof document !== "undefined") {

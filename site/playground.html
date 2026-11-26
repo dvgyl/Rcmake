@@ -7,7 +7,7 @@
   <meta name="description" content="Run CMake 4.5.1 configure, Ninja and Ninja Multi-Config generation, diagnostics, and rcmake explain directly in your browser via WebAssembly with no server.">
   <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
-  <meta name="theme-color" content="#f7f5f1" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#f6f4f0" media="(prefers-color-scheme: light)">
   <link rel="canonical" href="https://dvgyl.github.io/rcmake/playground.html">
   <link rel="alternate" type="text/plain" title="LLMs.txt" href="https://dvgyl.github.io/rcmake/llms.txt">
   <link rel="manifest" href="./manifest.webmanifest">
@@ -27,6 +27,9 @@
   <meta name="twitter:image:alt" content="rcmake: Drop-in CMake 4.5.1 in safe Rust. One binary runs as cmake, ctest, and cpack.">
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
   <link rel="stylesheet" href="./styles.css">
+  <link rel="modulepreload" href="./playground.js">
+  <link rel="modulepreload" href="./wasm-adapter.js">
+  <link rel="modulepreload" href="./wasm/rcmake_wasm.js">
   <script type="application/ld+json">
     {
       "@context": "https://schema.org",
@@ -41,7 +44,10 @@
           "operatingSystem": "Any (WebAssembly-capable browser)",
           "browserRequirements": "Requires JavaScript and WebAssembly",
           "softwareVersion": "0.1.0",
-          "license": "https://spdx.org/licenses/MIT.html",
+          "license": [
+            "https://spdx.org/licenses/MIT.html",
+            "https://spdx.org/licenses/Apache-2.0.html"
+          ],
           "isAccessibleForFree": true,
           "offers": {
             "@type": "Offer",
@@ -77,7 +83,8 @@
     document.documentElement.classList.add("js");
     try {
       const saved = localStorage.getItem("rcmake-theme");
-      document.documentElement.dataset.theme = saved || "dark";
+      const fallback = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      document.documentElement.dataset.theme = saved === "light" || saved === "dark" ? saved : fallback;
     } catch (_) {}
   </script>
 </head>
@@ -116,13 +123,14 @@
     <symbol id="i-arrow-right" viewBox="0 0 20 20"><path d="M4 10h12M11 5l5 5-5 5"/></symbol>
     <symbol id="i-sun" viewBox="0 0 20 20"><circle cx="10" cy="10" r="3.5"/><path d="M10 2.5v1.5M10 16v1.5M2.5 10H4M16 10h1.5M4.7 4.7l1 1M14.3 14.3l1 1M4.7 15.3l1-1M14.3 5.7l1-1"/></symbol>
     <symbol id="i-moon" viewBox="0 0 20 20"><path d="M15.5 12.5A6.5 6.5 0 0 1 7.5 4.5a6.5 6.5 0 1 0 8 8z"/></symbol>
+    <symbol id="i-link" viewBox="0 0 20 20"><path d="M8.5 11.5l3-3M7 13l-1.5 1.5a2.83 2.83 0 0 1-4-4L3 9m10-2l1.5-1.5a2.83 2.83 0 1 1 4 4L17 11"/></symbol>
     <symbol id="i-github" viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></symbol>
   </svg>
 
   <div class="scroll-progress" aria-hidden="true"></div>
   <header class="topbar is-solid">
     <div class="topbar-inner">
-      <a class="brand" href="./index.html">
+      <a class="brand" href="./index.html" aria-label="rcmake home">
         <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="22" height="22">
         <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="22" height="22">
         <span>rcmake</span>
@@ -169,9 +177,14 @@
         <span>Run</span>
         <kbd id="run-kbd" class="kbd-hint">&#8984;&#8629;</kbd>
       </button>
-      <button id="reset-btn" class="ctrl-btn" type="button" data-test="reset-btn">
+      <button id="reset-btn" class="ctrl-btn" type="button" data-test="reset-btn" title="Restore original example files">
         <svg class="i" aria-hidden="true"><use href="#i-replay"/></svg>
         <span>Reset</span>
+      </button>
+      <button id="share-btn" class="ctrl-btn" type="button" data-test="share-btn" title="Copy shareable link">
+        <svg class="i copy-icon" aria-hidden="true"><use href="#i-link"/></svg>
+        <svg class="i check-icon" aria-hidden="true"><use href="#i-check"/></svg>
+        <span data-copy-label>Share</span>
       </button>
       <span id="mode-badge" class="mode-badge" data-test="mode-badge" aria-live="polite"><span id="mode-badge-text">loading</span></span>
     </div>
@@ -179,9 +192,9 @@
     <div class="panes" id="panes">
       <section class="pane pane-editor" id="pane-editor" aria-label="Source files">
         <div id="file-tabs" class="pane-tabs" role="tablist" aria-label="Files" data-test="file-tabs">
-          <button type="button" role="tab" aria-selected="true" data-file-tab="CMakeLists.txt"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>CMakeLists.txt</button>
+          <button type="button" role="tab" id="file-tab-0" aria-controls="editor-panel" aria-selected="true" data-file-tab="CMakeLists.txt"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>CMakeLists.txt</button>
         </div>
-        <div class="editor">
+        <div id="editor-panel" class="editor" role="tabpanel" aria-labelledby="file-tab-0">
           <pre id="editor-gutter" class="gutter" aria-hidden="true">1</pre>
           <div class="editor-wrap">
             <div id="editor-flash" class="editor-flash" aria-hidden="true"></div>
@@ -190,19 +203,20 @@
         </div>
         <div class="statusline">
           <span id="editor-cursor" data-test="editor-cursor">Ln 1, Col 1</span>
+          <span id="editor-hint" class="editor-hint" data-test="editor-hint"></span>
           <span id="dirty-indicator" data-test="dirty-indicator"></span>
         </div>
       </section>
 
-      <div id="split-handle" class="split-handle" role="separator" aria-orientation="vertical" aria-label="Resize editor and output panes" aria-valuemin="25" aria-valuemax="75" aria-valuenow="50" tabindex="0" data-test="split-handle"></div>
+      <div id="split-handle" class="split-handle" role="separator" aria-orientation="vertical" aria-label="Resize editor and output panes" aria-valuemin="25" aria-valuemax="75" aria-valuenow="50" tabindex="0" title="Drag to resize, double-click to reset" data-test="split-handle"></div>
 
       <section class="pane pane-output" id="pane-output" aria-label="Output">
         <div class="pane-tabs-bar">
           <div class="pane-tabs" role="tablist" aria-label="Output" id="output-tabs" data-test="output-tabs">
-            <button type="button" role="tab" data-inspector-tab="ninja" aria-selected="true"><span id="tab-file-name">build.ninja</span> <span id="tab-count-files" class="tab-count"></span></button>
-            <button type="button" role="tab" data-inspector-tab="targets" aria-selected="false">Targets <span id="tab-count-targets" class="tab-count"></span></button>
-            <button type="button" role="tab" data-inspector-tab="diagnostics" aria-selected="false">Diagnostics <span id="tab-count-diag" class="tab-count"></span></button>
-            <button type="button" role="tab" data-inspector-tab="explain" aria-selected="false">Explain</button>
+            <button type="button" role="tab" id="out-tab-ninja" aria-controls="inspector-body" data-inspector-tab="ninja" aria-selected="true"><span id="tab-file-name">build.ninja</span> <span id="tab-count-files" class="tab-count"></span></button>
+            <button type="button" role="tab" id="out-tab-targets" aria-controls="inspector-body" data-inspector-tab="targets" aria-selected="false">Targets <span id="tab-count-targets" class="tab-count"></span></button>
+            <button type="button" role="tab" id="out-tab-diagnostics" aria-controls="inspector-body" data-inspector-tab="diagnostics" aria-selected="false">Diagnostics <span id="tab-count-diag" class="tab-count"></span></button>
+            <button type="button" role="tab" id="out-tab-explain" aria-controls="inspector-body" data-inspector-tab="explain" aria-selected="false">Explain</button>
           </div>
           <div class="pane-tabs-actions" id="output-actions" hidden>
             <button id="copy-file-btn" class="ctrl-btn" type="button" hidden data-test="copy-file-btn">
@@ -213,13 +227,17 @@
           </div>
         </div>
         <div id="run-line" class="run-line" aria-hidden="true"><div class="run-line-bar"></div></div>
-        <div id="inspector-body" class="output" role="tabpanel" data-test="inspector-body"></div>
+        <div id="inspector-body" class="output" role="tabpanel" aria-labelledby="out-tab-ninja" data-test="inspector-body"></div>
         <div class="statusline">
           <span id="run-status" data-test="run-status"></span>
           <span id="run-summary" data-test="run-summary"></span>
         </div>
       </section>
     </div>
+    <footer class="bench-legal" aria-label="License and notices">
+      <span>MIT OR Apache-2.0. Bundles CMake 4.5.1 Modules/, Templates/, and Help/ under BSD-3-Clause. Not affiliated with Kitware; CMake is a trademark of Kitware, Inc.</span>
+      <span class="bench-legal-links"><a href="./index.html">Overview</a> · <a href="./dashboard.html">Compatibility</a> · <a href="https://github.com/dvgyl/rcmake">GitHub</a></span>
+    </footer>
   </main>
 
   <script type="module" src="./playground.js"></script>

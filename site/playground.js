@@ -6,7 +6,9 @@ import { PLAYGROUND_EXAMPLES, RcmakeWasmAdapter } from "./wasm-adapter.js";
 
 const BUNDLE_URL = "./wasm/rcmake_wasm.js";
 const SPLIT_KEY = "rcmake-split";
-const LINE_H = 21;
+const DEFAULT_LINE_H = 22;
+const ALL_BUILD_TYPES = ["Debug", "Release", "RelWithDebInfo", "MinSizeRel"];
+const MAX_SHARE_HASH_CHARS = 16000;
 const adapter = new RcmakeWasmAdapter();
 
 const BOILERPLATE_PREFIXES = [
@@ -35,6 +37,8 @@ const BOILERPLATE_EXACT = new Set([
   "CMAKE_INSTALL_SYSCONFDIR"
 ]);
 
+const draftsByExample = new Map();
+
 const state = {
   exampleId: "hello-cpp20",
   activeFile: "CMakeLists.txt",
@@ -47,11 +51,14 @@ const state = {
   activeGenFile: "build.ninja",
   lastResult: null,
   runtimeError: null,
+  explainError: null,
+  loadingWasm: true,
   explainSymbol: "",
   explainReport: null,
   showRawJson: false,
   showAllSymbols: false,
-  wrapOutput: false
+  wrapOutput: false,
+  editorFocused: false
 };
 
 const $ = (id) => document.getElementById(id);
@@ -65,15 +72,18 @@ const els = {
   runIcon: $("run-icon"),
   runKbd: $("run-kbd"),
   resetBtn: $("reset-btn"),
+  shareBtn: $("share-btn"),
   panes: $("panes"),
   paneEditor: $("pane-editor"),
   paneOutput: $("pane-output"),
   splitHandle: $("split-handle"),
   fileTabs: $("file-tabs"),
+  editorPanel: $("editor-panel"),
   gutter: $("editor-gutter"),
   flash: $("editor-flash"),
   textarea: $("editor-textarea"),
   cursor: $("editor-cursor"),
+  hint: $("editor-hint"),
   dirty: $("dirty-indicator"),
   outputTabs: $("output-tabs"),
   outputActions: $("output-actions"),
@@ -89,10 +99,104 @@ const els = {
 };
 
 let flashTimer = null;
+let lastFileTabsSig = "";
+let runSeq = 0;
+let shareHashMatchesCurrent = false;
+let loadPromise = null;
+
+function ensureWasmLoaded() {
+  if (adapter.mode === "wasm") return Promise.resolve({ mode: "wasm" });
+  if (!loadPromise) {
+    loadPromise = adapter.load(BUNDLE_URL).finally(() => { loadPromise = null; });
+  }
+  return loadPromise;
+}
+
+function getLineHeight() {
+  if (typeof getComputedStyle === "function" && els.textarea) {
+    const lh = parseFloat(getComputedStyle(els.textarea).lineHeight);
+    if (Number.isFinite(lh) && lh > 0) return lh;
+  }
+  return DEFAULT_LINE_H;
+}
+
+function nextPaint() {
+  if (typeof requestAnimationFrame !== "function") return Promise.resolve();
+  return new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+}
 
 function formatMs(ms) {
   if (typeof ms !== "number" || !Number.isFinite(ms)) return "";
   return ms < 10 ? `${ms.toFixed(1)} ms` : `${Math.round(ms)} ms`;
+}
+
+function isDirty() {
+  const base = PLAYGROUND_EXAMPLES[state.exampleId]?.files || {};
+  const keys = new Set([...Object.keys(base), ...Object.keys(state.files)]);
+  for (const p of keys) {
+    if ((state.files[p] ?? "") !== (base[p] ?? "")) return true;
+  }
+  return false;
+}
+
+function encodeSharePayload(payload) {
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function decodeSharePayload(encoded) {
+  const padded = encoded.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - (encoded.length % 4)) % 4);
+  const bin = atob(padded);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+  const parsed = JSON.parse(new TextDecoder().decode(bytes));
+  if (!parsed || typeof parsed !== "object" || !parsed.files || typeof parsed.files !== "object") return null;
+  const cleanFiles = {};
+  for (const [k, v] of Object.entries(parsed.files)) {
+    if (typeof k !== "string" || !k || k.includes("..") || k.startsWith("/") || k.includes("\\") || typeof v !== "string") return null;
+    cleanFiles[k] = v;
+  }
+  if (!Object.keys(cleanFiles).length) return null;
+  return { files: cleanFiles, activeFile: typeof parsed.activeFile === "string" && parsed.activeFile in cleanFiles ? parsed.activeFile : Object.keys(cleanFiles)[0] };
+}
+
+function buildShareUrl(includeCode = false) {
+  if (typeof window === "undefined") return "";
+  const url = new URL(window.location.href);
+  url.search = "";
+  url.hash = "";
+  const p = new URLSearchParams();
+  if (state.exampleId !== "hello-cpp20") p.set("example", state.exampleId);
+  const defaultGen = state.exampleId === "presets-v13" ? "Ninja Multi-Config" : "Ninja";
+  if (state.generator !== defaultGen) p.set("gen", state.generator);
+  if (state.buildType !== "Debug") p.set("config", state.buildType);
+  if (state.activeTab !== "ninja") p.set("tab", state.activeTab);
+  const exDefault = PLAYGROUND_EXAMPLES[state.exampleId]?.defaultSymbol || "";
+  if (state.explainSymbol && (state.activeTab === "explain" || state.explainSymbol !== exDefault)) {
+    p.set("symbol", state.explainSymbol);
+  }
+  const qs = p.toString();
+  if (qs) url.search = `?${qs}`;
+  if (includeCode && isDirty()) {
+    try {
+      const encoded = encodeSharePayload({ files: state.files, activeFile: state.activeFile });
+      if (encoded.length <= MAX_SHARE_HASH_CHARS) url.hash = `code=b:${encoded}`;
+    } catch (_) {}
+  }
+  return url.toString();
+}
+
+function syncUrlState() {
+  if (typeof window === "undefined" || typeof history === "undefined" || typeof history.replaceState !== "function") return;
+  try {
+    const next = buildShareUrl(false);
+    const keepHash = shareHashMatchesCurrent && window.location.hash.startsWith("#code=") && isDirty() ? window.location.hash : "";
+    const parsed = new URL(next);
+    const rel = `${parsed.pathname}${parsed.search}${keepHash}`;
+    history.replaceState(null, "", rel);
+  } catch (_) {}
 }
 
 function updateModeBadge(mode, durationMs = null) {
@@ -109,7 +213,11 @@ function updateModeBadge(mode, durationMs = null) {
       : "wasm error";
   if (els.modeBadgeText) els.modeBadgeText.textContent = label;
   else els.modeBadge.textContent = label;
-  if (wasm) els.modeBadge.title = `rcmake_wasm.wasm, engine ${adapter.engineCommit}`;
+  if (wasm) {
+    els.modeBadge.title = adapter.module?.ENGINE_COMMIT
+      ? `rcmake_wasm.wasm, engine ${adapter.module.ENGINE_COMMIT}`
+      : "rcmake_wasm.wasm (PureHost, wasm32-wasip1)";
+  }
 }
 
 function normalizePath(raw) {
@@ -180,16 +288,31 @@ function jumpTo(file, line, col = 1) {
   let offset = 0;
   for (let i = 0; i < clampedLine - 1; i += 1) offset += lines[i].length + 1;
   offset += Math.min(targetCol - 1, lines[clampedLine - 1].length);
+  const lineH = getLineHeight();
+  const padTop = parseFloat(getComputedStyle(els.textarea).paddingTop) || 12;
+  if (typeof window !== "undefined" && window.innerWidth <= 720 && els.paneEditor?.scrollIntoView) {
+    els.paneEditor.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "nearest" });
+  }
   els.textarea.focus();
   els.textarea.setSelectionRange(offset, offset);
-  els.textarea.scrollTop = Math.max(0, (clampedLine - 3) * LINE_H);
+  els.textarea.scrollTop = Math.max(0, (clampedLine - 3) * lineH);
   els.gutter.scrollTop = els.textarea.scrollTop;
   syncEditor();
   if (els.flash) {
-    els.flash.style.top = `${12 + (clampedLine - 1) * LINE_H - els.textarea.scrollTop}px`;
+    els.flash.style.height = `${lineH}px`;
+    els.flash.style.top = `${padTop + (clampedLine - 1) * lineH - els.textarea.scrollTop}px`;
     els.flash.classList.add("is-on");
     clearTimeout(flashTimer);
     requestAnimationFrame(() => { flashTimer = setTimeout(() => els.flash.classList.remove("is-on"), 40); });
+  }
+}
+
+function syncEditorHint() {
+  if (!els.hint) return;
+  if (state.editorFocused) {
+    els.hint.textContent = "Esc then Tab to leave editor";
+  } else {
+    els.hint.textContent = PLAYGROUND_EXAMPLES[state.exampleId]?.description || "";
   }
 }
 
@@ -200,44 +323,95 @@ function syncEditor() {
   els.gutter.scrollTop = els.textarea.scrollTop;
   const before = v.slice(0, els.textarea.selectionStart || 0).split("\n");
   els.cursor.textContent = `Ln ${before.length}, Col ${before[before.length - 1].length + 1}`;
-  const base = PLAYGROUND_EXAMPLES[state.exampleId]?.files || {};
-  const dirty = Object.entries(base).some(([p, t]) => (state.files[p] ?? "") !== t);
+  const dirty = isDirty();
   els.dirty.textContent = dirty ? "modified" : "";
   els.dirty.classList.toggle("is-dirty", dirty);
+  syncEditorHint();
 }
 
-function renderFileTabs() {
+function renderFileTabs(force = false) {
   const base = PLAYGROUND_EXAMPLES[state.exampleId]?.files || {};
-  els.fileTabs.innerHTML = Object.keys(state.files)
-    .map((n) => {
+  const names = Object.keys(state.files);
+  const sig = names.map((n) => `${n}:${n === state.activeFile ? 1 : 0}:${(state.files[n] ?? "") !== (base[n] ?? "") ? 1 : 0}`).join("|");
+  if (!force && sig === lastFileTabsSig) return;
+  lastFileTabsSig = sig;
+  const pill = els.fileTabs.querySelector(".seg-pill");
+  const tabsHtml = names
+    .map((n, idx) => {
+      const active = n === state.activeFile;
       const mod = (state.files[n] ?? "") !== (base[n] ?? "");
-      return `<button type="button" role="tab" aria-selected="${n === state.activeFile}" data-file-tab="${escapeHtml(n)}"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>${escapeHtml(n)}${mod ? '<span class="file-mod-dot" aria-label="modified"></span>' : ""}</button>`;
+      return `<button type="button" role="tab" id="file-tab-${idx}" aria-controls="editor-panel" aria-selected="${active}" tabindex="${active ? 0 : -1}" data-file-tab="${escapeHtml(n)}"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>${escapeHtml(n)}${mod ? '<span class="file-mod-dot" aria-hidden="true"></span><span class="visually-hidden"> (modified)</span>' : ""}</button>`;
     })
     .join("");
+  els.fileTabs.innerHTML = tabsHtml;
+  if (pill) els.fileTabs.prepend(pill);
+  const activeIdx = Math.max(0, names.indexOf(state.activeFile));
+  if (els.editorPanel) els.editorPanel.setAttribute("aria-labelledby", `file-tab-${activeIdx}`);
+}
+
+function availableBuildTypes() {
+  if (state.generator !== "Ninja Multi-Config") return ALL_BUILD_TYPES;
+  const presetsRaw = state.files["CMakePresets.json"];
+  if (presetsRaw) {
+    try {
+      const parsed = JSON.parse(presetsRaw);
+      const list = Array.isArray(parsed?.configurePresets) ? parsed.configurePresets : [];
+      for (const preset of list) {
+        const cfgTypes = preset?.cacheVariables?.CMAKE_CONFIGURATION_TYPES;
+        if (typeof cfgTypes === "string" && cfgTypes.trim()) {
+          const items = cfgTypes.split(";").map((s) => s.trim()).filter(Boolean);
+          if (items.length) return items;
+        }
+      }
+    } catch (_) {}
+  }
+  return ["Debug", "Release", "RelWithDebInfo"];
+}
+
+function syncConfigOptions() {
+  const allowed = availableBuildTypes();
+  Array.from(els.configSelect.options).forEach((opt) => {
+    opt.disabled = !allowed.includes(opt.value);
+  });
+  if (!allowed.includes(state.buildType)) {
+    state.buildType = allowed[0] || "Debug";
+    els.configSelect.value = state.buildType;
+  }
 }
 
 const syncGen = () => els.genGroup.querySelectorAll("[data-gen]").forEach((b) => b.setAttribute("aria-checked", String(b.dataset.gen === state.generator)));
 
-function loadExample(id) {
+function saveCurrentDraft() {
+  if (!state.exampleId || !Object.keys(state.files).length) return;
+  if (isDirty()) draftsByExample.set(state.exampleId, { files: { ...state.files }, activeFile: state.activeFile });
+  else draftsByExample.delete(state.exampleId);
+}
+
+function loadExample(id, { discardDraft = false } = {}) {
   const ex = PLAYGROUND_EXAMPLES[id] || PLAYGROUND_EXAMPLES["hello-cpp20"];
+  if (discardDraft) draftsByExample.delete(ex.id);
+  const draft = !discardDraft ? draftsByExample.get(ex.id) : null;
+  shareHashMatchesCurrent = false;
   state.exampleId = ex.id;
-  state.files = { ...ex.files };
-  state.activeFile = Object.keys(state.files)[0];
+  state.files = draft ? { ...draft.files } : { ...ex.files };
+  state.activeFile = draft && draft.activeFile in state.files ? draft.activeFile : Object.keys(state.files)[0];
   state.explainSymbol = ex.defaultSymbol || "";
   state.explainReport = null;
+  state.explainError = null;
   state.showAllSymbols = false;
   state.activeGenFile = "build.ninja";
   state.generator = ex.id === "presets-v13" ? "Ninja Multi-Config" : "Ninja";
   state.buildType = "Debug";
   els.configSelect.value = "Debug";
   syncGen();
+  syncConfigOptions();
   els.exampleSelect.value = ex.id;
   els.exampleSelect.title = ex.description || "";
   els.textarea.value = state.files[state.activeFile] ?? "";
   els.textarea.selectionStart = 0;
   els.textarea.selectionEnd = 0;
   els.textarea.scrollTop = 0;
-  renderFileTabs();
+  renderFileTabs(true);
   syncEditor();
 }
 
@@ -399,6 +573,9 @@ function renderExplainSources(sources) {
 }
 
 function renderExplainReport(rep) {
+  if (state.explainError) {
+    return `<div class="diag-row" data-diag-severity="error" data-test="explain-error"><span class="st-fail"><svg class="i" aria-hidden="true"><use href="#i-cross"/></svg><span class="visually-hidden">error</span></span><div class="diag-msg">${escapeHtml(state.explainError)}<span class="diag-cat">Explain query failed. The last configure output in the other tabs is still available.</span></div><div></div></div>`;
+  }
   if (!rep) return '<p class="dim">Pick a target or variable.</p>';
   if (state.showRawJson) return `<pre class="code-table" data-test="explain-raw-json">${escapeHtml(JSON.stringify(rep, null, 2))}</pre>`;
   const d = rep.details || {};
@@ -439,6 +616,11 @@ function renderExplainReport(rep) {
   }
 
   const cfg = d.configurations?.find((c) => c.name === state.buildType) || d.configurations?.[0];
+  const cfgSel = d.configuration_selection || {};
+  const availCfgs = Array.isArray(cfgSel.available) ? cfgSel.available.filter(Boolean) : [];
+  const unavailableSwitch = cfgSel.status === "unavailable" && availCfgs.length
+    ? `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">AVAILABLE</span><div class="ex-vals">${availCfgs.map((c) => `<button type="button" class="chip chip-btn" data-switch-config="${escapeHtml(c)}">${escapeHtml(c)}</button>`).join("")}</div></div></div>`
+    : "";
   const srcs = renderExplainSources(cfg?.sources?.length ? cfg.sources : d.sources);
   const entries = (cfg?.entries || []).map((e) => {
     const prop = e.kind || e.property || "";
@@ -454,7 +636,7 @@ function renderExplainReport(rep) {
     return `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">${escapeHtml(prop)}</span><div class="ex-vals">${chips(e.value)}${scopeChip}${locBtn(originLoc)}</div></div>${chain}</div>`;
   }).join("");
   const aliasLoc = d.alias_definition ? `<span class="chip">alias</span>${locBtn(d.alias_definition)}` : "";
-  return `<div class="explain-tree" data-test="explain-tree"><div class="ex-root"><svg class="i" aria-hidden="true"><use href="#i-target"/></svg><span class="target-name">${escapeHtml(d.target || rep.name)}</span><span class="chip is-ink">${escapeHtml(d.target_kind || "TARGET")}</span>${locBtn(d.definition)}${aliasLoc}</div><div class="ex-branch"><div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">CONFIGURATION</span><div class="ex-vals"><span class="chip is-ink">${escapeHtml(cfg?.name || state.buildType)}</span><span class="dim">${escapeHtml(d.configuration_selection?.status || "matched")}</span></div></div></div><div class="ex-branch">${srcs ? `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">SOURCES</span><div class="ex-vals">${srcs}</div></div></div>` : ""}${entries || '<div class="ex-entry"><span class="dim">No resolved compile or link entries.</span></div>'}</div></div></div>`;
+  return `<div class="explain-tree" data-test="explain-tree"><div class="ex-root"><svg class="i" aria-hidden="true"><use href="#i-target"/></svg><span class="target-name">${escapeHtml(d.target || rep.name)}</span><span class="chip is-ink">${escapeHtml(d.target_kind || "TARGET")}</span>${locBtn(d.definition)}${aliasLoc}</div><div class="ex-branch"><div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">CONFIGURATION</span><div class="ex-vals"><span class="chip is-ink">${escapeHtml(cfg?.name || state.buildType)}</span><span class="dim">${escapeHtml(cfgSel.status || "matched")}</span></div></div></div>${unavailableSwitch}<div class="ex-branch">${srcs ? `<div class="ex-entry"><div class="ex-entry-row"><span class="ex-prop">SOURCES</span><div class="ex-vals">${srcs}</div></div></div>` : ""}${entries || '<div class="ex-entry"><span class="dim">No resolved compile or link entries.</span></div>'}</div></div></div>`;
 }
 
 function renderExplainTab(res) {
@@ -473,6 +655,8 @@ function renderExplainTab(res) {
 
 async function explain(sym) {
   state.explainSymbol = sym;
+  state.explainError = null;
+  syncUrlState();
   if (adapter.mode !== "wasm") {
     state.explainReport = null;
     renderInspector();
@@ -481,27 +665,38 @@ async function explain(sym) {
   try {
     state.explainReport = await adapter.explain(sym, { config: state.buildType });
   } catch (err) {
-    state.runtimeError = err instanceof Error ? err.message : String(err);
+    state.explainError = err instanceof Error ? err.message : String(err);
     state.explainReport = null;
   }
   renderInspector();
 }
 
 function renderRuntimeError(message) {
-  return `<div class="diag-row" data-diag-severity="error" data-test="wasm-load-error"><span class="st-fail"><svg class="i" aria-hidden="true"><use href="#i-cross"/></svg><span class="visually-hidden">error</span></span><div class="diag-msg">${escapeHtml(message)}<span class="diag-cat">WebAssembly runtime unavailable. Serve the site over HTTP with WebAssembly enabled and retry.</span></div><div></div></div>`;
+  const isFileProto = typeof window !== "undefined" && window.location?.protocol === "file:";
+  const hint = adapter.mode !== "wasm"
+    ? (isFileProto
+      ? "Browsers block WebAssembly fetches over file://. Serve site/ over HTTP (for example: python3 -m http.server -d site)."
+      : "WebAssembly runtime unavailable. Serve the site over HTTP with WebAssembly enabled and retry.")
+    : "Configure execution failed inside the WebAssembly runtime.";
+  return `<div class="diag-row" data-diag-severity="error" data-test="wasm-load-error"><span class="st-fail"><svg class="i" aria-hidden="true"><use href="#i-cross"/></svg><span class="visually-hidden">error</span></span><div class="diag-msg">${escapeHtml(message)}<span class="diag-cat">${escapeHtml(hint)}</span></div><div><button type="button" class="ctrl-btn" id="retry-wasm-btn" data-test="retry-wasm-btn">Retry</button></div></div>`;
 }
 
 function renderInspector(fade = false) {
   const res = state.lastResult;
   els.outputTabs.querySelectorAll("[data-inspector-tab]").forEach((t) => t.setAttribute("aria-selected", String(t.dataset.inspectorTab === state.activeTab)));
+  els.body.setAttribute("aria-labelledby", `out-tab-${state.activeTab}`);
   const f = currentGenFile(res);
   const genFiles = orderedGenFiles(res);
   els.fileTabName.textContent = genFiles.includes("build.ninja") ? "build.ninja" : (f?.name || "build.ninja");
   if (els.fileCount) els.fileCount.textContent = genFiles.length > 1 ? String(genFiles.length) : "";
-  const showCopy = !state.runtimeError && ((state.activeTab === "ninja" && Boolean(f)) || (state.activeTab === "explain" && state.showRawJson && Boolean(state.explainReport)));
+  const diags = res?.diagnostics || [];
+  const showCopy = !state.runtimeError && !state.loadingWasm && (
+    (state.activeTab === "ninja" && Boolean(f))
+    || (state.activeTab === "explain" && Boolean(state.explainReport) && !state.explainError)
+    || (state.activeTab === "diagnostics" && diags.length > 0)
+  );
   els.copyBtn.hidden = !showCopy;
   if (els.outputActions) els.outputActions.hidden = !showCopy;
-  const diags = res?.diagnostics || [];
   const errCount = diags.filter((d) => d.severity === "error").length;
   els.diagCount.textContent = state.runtimeError ? "1" : res ? String(diags.length) : "";
   els.diagCount.classList.toggle("is-error", Boolean(state.runtimeError) || errCount > 0);
@@ -512,8 +707,13 @@ function renderInspector(fade = false) {
     els.body.classList.add("is-fading");
     requestAnimationFrame(() => els.body.classList.remove("is-fading"));
   }
+  if (state.loadingWasm) {
+    els.body.innerHTML = '<div class="loading-state" data-test="wasm-loading"><span class="dim">Loading WebAssembly runtime\u2026</span></div>';
+    return;
+  }
   if (state.runtimeError) {
     els.body.innerHTML = renderRuntimeError(state.runtimeError);
+    $("retry-wasm-btn")?.addEventListener("click", () => runConfigure());
     return;
   }
   els.body.innerHTML = (views[state.activeTab] || renderGenerated)(res);
@@ -539,6 +739,13 @@ function renderInspector(fade = false) {
     $("toggle-explain-json")?.addEventListener("click", () => { state.showRawJson = !state.showRawJson; renderInspector(); });
     $("toggle-all-syms")?.addEventListener("click", () => { state.showAllSymbols = !state.showAllSymbols; renderInspector(); });
     els.body.querySelectorAll("[data-explain-sym]").forEach((b) => b.addEventListener("click", () => explain(b.dataset.explainSym)));
+    els.body.querySelectorAll("[data-switch-config]").forEach((b) => b.addEventListener("click", () => {
+      const nextCfg = b.dataset.switchConfig;
+      if (!nextCfg) return;
+      state.buildType = nextCfg;
+      els.configSelect.value = nextCfg;
+      runConfigure();
+    }));
   }
 }
 
@@ -563,13 +770,21 @@ function setRunning(on) {
 }
 
 async function runConfigure() {
+  const seq = ++runSeq;
   state.files[state.activeFile] = els.textarea.value;
+  saveCurrentDraft();
+  syncConfigOptions();
   renderFileTabs();
   syncEditor();
+  syncUrlState();
   setRunning(true);
+  await nextPaint();
+  if (seq !== runSeq) return;
   try {
     if (adapter.mode !== "wasm") {
-      const retry = await adapter.load(BUNDLE_URL);
+      const retry = await ensureWasmLoaded();
+      if (seq !== runSeq) return;
+      state.loadingWasm = false;
       updateModeBadge(retry.mode);
       els.modeBadge.title = adapter.loadReason;
       if (retry.mode !== "wasm") {
@@ -577,7 +792,9 @@ async function runConfigure() {
       }
     }
     state.runtimeError = null;
+    state.explainError = null;
     const res = await adapter.configure(state.files, { exampleId: state.exampleId, generator: state.generator, buildType: state.buildType });
+    if (seq !== runSeq) return;
     state.lastResult = res;
     updateModeBadge(res.mode, res.durationMs);
 
@@ -599,15 +816,23 @@ async function runConfigure() {
       if (!(state.activeGenFile in (res.files || {}))) {
         state.activeGenFile = orderedGenFiles(res)[0] || "build.ninja";
       }
-      let report = state.explainSymbol ? await adapter.explain(state.explainSymbol, { config: state.buildType }) : null;
-      if (!report || report.kind === "not_found") {
+      const knownSyms = new Set([
+        ...(res.targets || []).map((t) => t.name),
+        ...(Array.isArray(res.explainSymbols) ? res.explainSymbols : [])
+      ]);
+      if (!state.explainSymbol || (knownSyms.size > 0 && !knownSyms.has(state.explainSymbol))) {
         const fallback = res.targets?.[0]?.name || curateExplainSymbols(res).quick[0] || res.explainSymbols?.[0] || "";
-        if (fallback && fallback !== state.explainSymbol) {
-          state.explainSymbol = fallback;
-          report = await adapter.explain(fallback, { config: state.buildType });
-        }
+        if (fallback) state.explainSymbol = fallback;
       }
-      state.explainReport = report;
+      try {
+        state.explainReport = state.explainSymbol
+          ? await adapter.explain(state.explainSymbol, { config: state.buildType })
+          : null;
+      } catch (exErr) {
+        state.explainError = exErr instanceof Error ? exErr.message : String(exErr);
+        state.explainReport = null;
+      }
+      if (seq !== runSeq) return;
       els.runStatus.textContent = `configured in ${formatMs(res.durationMs)}`;
       els.runStatus.classList.add("st-pass");
       els.runStatus.classList.remove("st-fail");
@@ -615,7 +840,9 @@ async function runConfigure() {
     const n = res.targets?.length ?? 0;
     els.runSummary.textContent = `${n} ${n === 1 ? "target" : "targets"} \u00b7 ${state.generator} \u00b7 ${state.buildType}`;
   } catch (err) {
+    if (seq !== runSeq) return;
     const message = err instanceof Error ? err.message : String(err);
+    state.loadingWasm = false;
     state.runtimeError = message;
     state.lastResult = null;
     state.explainReport = null;
@@ -626,7 +853,7 @@ async function runConfigure() {
     els.runStatus.classList.remove("st-pass");
     els.runSummary.textContent = "";
   } finally {
-    setRunning(false);
+    if (seq === runSeq) setRunning(false);
   }
   renderInspector(true);
 }
@@ -641,17 +868,30 @@ function initSplit() {
   };
   try { const s = Number(localStorage.getItem(SPLIT_KEY)); if (Number.isFinite(s) && s >= 25 && s <= 75) set(s); } catch (_) {}
   let drag = false;
-  els.splitHandle.addEventListener("pointerdown", (e) => { drag = true; els.splitHandle.setPointerCapture(e.pointerId); });
+  const endDrag = () => {
+    if (!drag) return;
+    drag = false;
+    document.body.classList.remove("is-resizing");
+  };
+  els.splitHandle.addEventListener("pointerdown", (e) => {
+    drag = true;
+    document.body.classList.add("is-resizing");
+    els.splitHandle.setPointerCapture(e.pointerId);
+  });
   els.splitHandle.addEventListener("pointermove", (e) => {
     if (!drag) return;
     const r = els.panes.getBoundingClientRect();
     if (r.width > 0) set(((e.clientX - r.left) / r.width) * 100);
   });
-  ["pointerup", "pointercancel"].forEach((ev) => els.splitHandle.addEventListener(ev, () => { drag = false; }));
+  ["pointerup", "pointercancel"].forEach((ev) => els.splitHandle.addEventListener(ev, endDrag));
+  els.splitHandle.addEventListener("dblclick", () => set(50));
   els.splitHandle.addEventListener("keydown", (e) => {
     const cur = Number(els.splitHandle.getAttribute("aria-valuenow")) || 50;
     if (e.key === "ArrowLeft") { e.preventDefault(); set(cur - 5); }
     else if (e.key === "ArrowRight") { e.preventDefault(); set(cur + 5); }
+    else if (e.key === "Home") { e.preventDefault(); set(25); }
+    else if (e.key === "End") { e.preventDefault(); set(75); }
+    else if (e.key === "0" || e.key === "Enter") { e.preventDefault(); set(50); }
   });
 }
 
@@ -664,7 +904,19 @@ async function init() {
   const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
   const reqExample = params.get("example");
   if (reqExample && reqExample in PLAYGROUND_EXAMPLES) state.exampleId = reqExample;
-  loadExample(state.exampleId);
+  loadExample(state.exampleId, { discardDraft: true });
+  const reqGen = params.get("gen");
+  if (reqGen === "Ninja" || reqGen === "Ninja Multi-Config") {
+    state.generator = reqGen;
+    syncGen();
+    syncConfigOptions();
+  }
+  const reqConfig = params.get("config");
+  if (reqConfig && ALL_BUILD_TYPES.includes(reqConfig)) {
+    state.buildType = reqConfig;
+    els.configSelect.value = reqConfig;
+    syncConfigOptions();
+  }
   const reqTab = params.get("tab");
   if (["ninja", "targets", "diagnostics", "explain"].includes(reqTab)) {
     state.activeTab = reqTab;
@@ -673,8 +925,32 @@ async function init() {
   const reqSymbol = params.get("symbol");
   if (reqSymbol) state.explainSymbol = reqSymbol.trim();
 
-  els.exampleSelect.addEventListener("change", () => { loadExample(els.exampleSelect.value); runConfigure(); });
-  initRovingGroup(els.genGroup, "[data-gen]", (b) => { state.generator = b.dataset.gen; syncGen(); runConfigure(); });
+  if (typeof window !== "undefined" && window.location.hash.startsWith("#code=b:")) {
+    try {
+      const decoded = decodeSharePayload(window.location.hash.slice(8));
+      if (decoded) {
+        state.files = decoded.files;
+        state.activeFile = decoded.activeFile;
+        shareHashMatchesCurrent = true;
+        els.textarea.value = state.files[state.activeFile] ?? "";
+        syncConfigOptions();
+        renderFileTabs(true);
+        syncEditor();
+      }
+    } catch (_) {}
+  }
+
+  els.exampleSelect.addEventListener("change", () => {
+    saveCurrentDraft();
+    loadExample(els.exampleSelect.value);
+    runConfigure();
+  });
+  initRovingGroup(els.genGroup, "[data-gen]", (b) => {
+    state.generator = b.dataset.gen;
+    syncGen();
+    syncConfigOptions();
+    runConfigure();
+  });
   els.configSelect.addEventListener("change", () => {
     state.buildType = els.configSelect.value;
     if (state.generator === "Ninja Multi-Config" && (state.activeGenFile === "build.ninja" || /^build-.*\.ninja$/.test(state.activeGenFile))) {
@@ -682,7 +958,17 @@ async function init() {
     }
     runConfigure();
   });
-  els.resetBtn.addEventListener("click", () => { loadExample(state.exampleId); runConfigure(); });
+  els.resetBtn.addEventListener("click", () => { loadExample(state.exampleId, { discardDraft: true }); runConfigure(); });
+  els.shareBtn?.addEventListener("click", () => {
+    state.files[state.activeFile] = els.textarea.value;
+    const shareUrl = buildShareUrl(true);
+    try {
+      const parsed = new URL(shareUrl);
+      shareHashMatchesCurrent = parsed.hash.startsWith("#code=");
+      history.replaceState(null, "", `${parsed.pathname}${parsed.search}${parsed.hash}`);
+    } catch (_) {}
+    copyWithFeedback(els.shareBtn, shareUrl, "Share");
+  });
   els.runBtn.addEventListener("click", runConfigure);
   initRovingGroup(els.fileTabs, "[data-file-tab]", (b) => {
     state.files[state.activeFile] = els.textarea.value;
@@ -695,17 +981,29 @@ async function init() {
     state.activeTab = b.dataset.inspectorTab;
     state.lastManualTab = state.activeTab;
     state.autoSwitchedToDiag = false;
+    syncUrlState();
     renderInspector(false);
   });
   document.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && e.target !== $("explain-input")) {
       e.preventDefault();
       runConfigure();
+    } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && els.panes?.contains(document.activeElement)) {
+      e.preventDefault();
+      runConfigure();
     }
   });
-  els.textarea.addEventListener("input", () => { state.files[state.activeFile] = els.textarea.value; renderFileTabs(); syncEditor(); });
+  els.textarea.addEventListener("input", () => {
+    shareHashMatchesCurrent = false;
+    state.files[state.activeFile] = els.textarea.value;
+    saveCurrentDraft();
+    renderFileTabs();
+    syncEditor();
+  });
+  els.textarea.addEventListener("focus", () => { state.editorFocused = true; syncEditorHint(); });
+  els.textarea.addEventListener("blur", () => { state.editorFocused = false; syncEditorHint(); });
   els.textarea.addEventListener("scroll", () => { els.gutter.scrollTop = els.textarea.scrollTop; });
-  ["click", "keyup"].forEach((ev) => els.textarea.addEventListener(ev, syncEditor));
+  ["click", "keyup", "select"].forEach((ev) => els.textarea.addEventListener(ev, syncEditor));
   els.textarea.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       e.preventDefault();
@@ -745,21 +1043,33 @@ async function init() {
           els.textarea.setSelectionRange(nextStart, Math.max(nextStart, end - drop));
         }
       }
+      shareHashMatchesCurrent = false;
       state.files[state.activeFile] = els.textarea.value;
+      saveCurrentDraft();
       renderFileTabs();
       syncEditor();
     }
   });
   els.copyBtn.addEventListener("click", () => {
-    const text = state.activeTab === "explain" && state.showRawJson && state.explainReport
-      ? JSON.stringify(state.explainReport, null, 2)
-      : currentGenFile(state.lastResult)?.text || "";
-    copyWithFeedback(els.copyBtn, text, "Copy");
+    let text = "";
+    if (state.activeTab === "explain" && state.explainReport) {
+      text = JSON.stringify(state.explainReport, null, 2);
+    } else if (state.activeTab === "diagnostics") {
+      text = (state.lastResult?.diagnostics || [])
+        .map((d) => `${d.severity || "info"}${d.file ? ` (${d.file}${d.line ? `:${d.line}` : ""})` : ""}: ${d.message || ""}`)
+        .join("\n");
+    } else {
+      text = currentGenFile(state.lastResult)?.text || "";
+    }
+    copyWithFeedback(els.copyBtn, text, "Copy", els.body);
   });
   initSplit();
 
+  state.loadingWasm = true;
   updateModeBadge("loading");
-  const info = await adapter.load(BUNDLE_URL);
+  renderInspector(false);
+  const info = await ensureWasmLoaded();
+  state.loadingWasm = false;
   updateModeBadge(info.mode);
   els.modeBadge.title = adapter.loadReason;
   if (info.mode !== "wasm") {

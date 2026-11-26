@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Page not found: rcmake</title>
+  <meta name="robots" content="noindex,follow">
+  <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f6f4f0" media="(prefers-color-scheme: light)">
+  <script>
+    (function () {
+      var base = document.createElement("base");
+      base.href = location.pathname.indexOf("/rcmake/") === 0 ? "/rcmake/" : "/";
+      document.head.appendChild(base);
+    })();
+  </script>
+  <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="stylesheet" href="./styles.css">
+  <script>
+    document.documentElement.classList.add("js");
+    try {
+      const saved = localStorage.getItem("rcmake-theme");
+      const fallback = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      document.documentElement.dataset.theme = saved === "light" || saved === "dark" ? saved : fallback;
+    } catch (_) {}
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <svg hidden class="icon-sprite" aria-hidden="true">
+    <symbol id="i-play" viewBox="0 0 20 20"><path d="M6.5 4.5v11l9-5.5z"/></symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 20 20"><path d="M4 10h12M11 5l5 5-5 5"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 20 20"><circle cx="10" cy="10" r="3.5"/><path d="M10 2.5v1.5M10 16v1.5M2.5 10H4M16 10h1.5M4.7 4.7l1 1M14.3 14.3l1 1M4.7 15.3l1-1M14.3 5.7l1-1"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 20 20"><path d="M15.5 12.5A6.5 6.5 0 0 1 7.5 4.5a6.5 6.5 0 1 0 8 8z"/></symbol>
+    <symbol id="i-github" viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></symbol>
+  </svg>
+
+  <header class="topbar is-solid">
+    <div class="topbar-inner">
+      <a class="brand" href="./index.html" aria-label="rcmake home">
+        <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="22" height="22">
+        <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="22" height="22">
+        <span>rcmake</span>
+      </a>
+      <nav class="nav" aria-label="Primary">
+        <a class="opt-overview" href="./index.html">Overview</a>
+        <a href="./playground.html">Playground</a>
+        <a href="./dashboard.html">Compatibility</a>
+      </nav>
+      <div class="topbar-actions">
+        <a class="icon-btn" href="https://github.com/dvgyl/rcmake" aria-label="GitHub"><svg class="i i-fill" aria-hidden="true"><use href="#i-github"/></svg></a>
+        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch to light theme" data-test="theme-toggle">
+          <span class="theme-knob" aria-hidden="true"></span>
+          <svg class="i theme-moon" aria-hidden="true"><use href="#i-moon"/></svg>
+          <svg class="i theme-sun" aria-hidden="true"><use href="#i-sun"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main-content" class="container narrow not-found">
+    <p class="eyebrow mono">404</p>
+    <h1>Page not found</h1>
+    <p class="muted">That page does not exist on the rcmake site. Jump back to the overview, try the browser playground, or view the compatibility report.</p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="./index.html">
+        <span>Back to overview</span>
+        <svg class="i" aria-hidden="true"><use href="#i-arrow-right"/></svg>
+      </a>
+      <a class="btn btn-soft" href="./playground.html">
+        <svg class="i" aria-hidden="true"><use href="#i-play"/></svg>
+        <span>Playground</span>
+      </a>
+      <a class="btn btn-quiet" href="./dashboard.html">
+        <span>Compatibility report</span>
+        <svg class="i" aria-hidden="true"><use href="#i-arrow-right"/></svg>
+      </a>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <a class="brand brand-sm" href="./index.html">
+        <img class="mark-dark" src="./assets/rcmake-mark-dark.svg" alt="" width="18" height="18">
+        <img class="mark-light" src="./assets/rcmake-mark.svg" alt="" width="18" height="18">
+        <span>rcmake</span>
+      </a>
+      <nav class="footer-nav" aria-label="Footer">
+        <a href="https://github.com/dvgyl/rcmake">GitHub</a>
+        <a href="https://github.com/dvgyl/rcmake/tree/main/docs">Docs</a>
+        <a href="./dashboard.html">Compatibility</a>
+        <a href="./playground.html">Playground</a>
+        <a href="./llms.txt">LLMs.txt</a>
+      </nav>
+    </div>
+    <div class="container footer-legal">
+      <span>MIT OR Apache-2.0. Bundles CMake 4.5.1 Modules/, Templates/, and Help/ under BSD-3-Clause.</span>
+      <span>rcmake is an independent project and is not affiliated with Kitware. CMake is a trademark of Kitware, Inc.</span>
+    </div>
+  </footer>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

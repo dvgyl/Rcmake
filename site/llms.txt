@@ -40,14 +40,14 @@
 - No legacy extra generators (`CodeBlocks`, `CodeLite`, `Eclipse CDT4`, `Kate`, `Sublime Text 2`), no `MinGW`/`NMake`/`MSYS`/`Borland`/`Watcom` Makefiles, no `Green Hills MULTI`, no `FASTBuild`, and no Visual Studio 14, 15, or 16.
 - No CPack native installers (`DEB`, `RPM`, `NSIS`, `WIX`, `productbuild`, `IFW`).
 - `try_compile` runs in-process rather than invoking Ninja, Make, MSBuild, or xcodebuild, so MSBuild-only and Xcode-only generator attributes do not affect probes.
-- `--version` prints `cmake version 4.5.1` on line 1 and `Rcmake 0.1.0` on line 2.
+- `--version` prints `cmake version 4.5.1` on line 1 and `rcmake 0.1.0` on line 2.
 - Partial or unverified languages: CUDA (one ecosystem fixture), HIP (rule wiring only), Swift (parsed, builds unverified).
 
 ## Site
 
 - [Overview](https://dvgyl.github.io/rcmake/): Install commands, CMake 4.5.1 comparison, pipeline diagram, generators, languages, and FAQ.
 - [Browser playground](https://dvgyl.github.io/rcmake/playground.html): WebAssembly workbench for configure, Ninja and Ninja Multi-Config generation, diagnostics, and `rcmake explain`.
-- [Compatibility report](https://dvgyl.github.io/rcmake/dashboard.html): Verification results across 3-OS `Tests/RunCMake`, 62 core suites, 56 policy suites, 10 large C++ projects, a 240-repository sealed holdout, 64 `vcpkg` shards, soundness gates, and benchmarks.
+- [Compatibility report](https://dvgyl.github.io/rcmake/dashboard.html): Verification results across 3-OS `Tests/RunCMake`, 62 core suites, 35 policy suites, 10 large C++ projects, a 240-repository sealed holdout, 64 `vcpkg` shards, soundness gates, and benchmarks.
 - [Compatibility JSON](https://dvgyl.github.io/rcmake/data/latest.json): Machine-readable snapshot backing the compatibility report.
 - [Full technical reference](https://dvgyl.github.io/rcmake/llms-full.txt): Extended technical reference with CLI flags, architecture, limits, and Q&A.
 
