@@ -48,7 +48,7 @@ def _write_vcxproj(path: Path, guid: str, config_type: str, extra_item_groups: s
 class VsCanonTests(unittest.TestCase):
     def test_ignores_item_definition_group_project_reference_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             src = root / "src"
             build = root / "build"
             src.mkdir()
@@ -101,7 +101,7 @@ class VsCanonTests(unittest.TestCase):
 
     def test_rejects_item_group_project_reference_without_include(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            build = Path(tmp)
+            build = Path(tmp).resolve()
             proj = build / "bad.vcxproj"
             _write_vcxproj(
                 proj,
