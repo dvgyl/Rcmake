@@ -121,11 +121,11 @@ function initRace(doc, motion) {
         const cmScale = isFaster ? "1" : String(Number(Math.min(1, Math.max(0.02, leafSpeedup)).toFixed(4)));
         const rcScale = isFaster ? String(Number(Math.min(1, Math.max(0.02, 1 / leafSpeedup)).toFixed(4))) : "1";
         const rcCls = isFaster ? "is-rcmake" : st === "fail" ? "is-fail" : "is-partial";
-        const spdTxt = leafSpeedup > 1 ? `${formatSpeed(leafSpeedup)}\u00d7 faster \u00b7 ${formatNumber(val)} ms p95` : leafSpeedup < 1 ? `${(1 / leafSpeedup).toFixed(2)}\u00d7 slower \u00b7 ${formatNumber(val)} ms p95` : `${formatNumber(val)} ms p95`;
+        const spdTxt = leafSpeedup > 1 ? `${formatSpeed(leafSpeedup)}\u00d7 faster across 5 C++ giants` : leafSpeedup < 1 ? `${(1 / leafSpeedup).toFixed(2)}\u00d7 slower across 5 C++ giants` : "1.00\u00d7 across 5 C++ giants";
         drawLines(isFaster ? "rcmake" : "cmake");
         cmBar.innerHTML = `<div class="bar-track"><div class="bar-fill is-cmake" style="--v:${cmScale};--bar-dur:800ms" data-scale="${cmScale}"></div></div><div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim" data-value>full reconfigure</span></div>`;
         rcBar.innerHTML = `<div class="bar-track"><div class="bar-fill ${rcCls}" style="--v:${rcScale};--bar-dur:${Math.max(160, Math.round(800 / Math.max(0.2, leafSpeedup)))}ms" data-scale="${rcScale}" data-test="race-fill-rcmake"></div></div><div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${escapeHtml(spdTxt)}</span></div>`;
-        caption.textContent = "rcmake re-evaluates only the edited CMakeLists.txt file and reuses unchanged subtrees.";
+        caption.textContent = `Geometric mean leaf-edit reconfigure speedup across five real C++ projects. Synthetic 64-directory p95 is ${formatNumber(val)} ms.`;
       } else {
         drawLines("rcmake");
         cmBar.innerHTML = '<div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim">full reconfigure</span></div>';
@@ -183,7 +183,7 @@ function renderSnapshot(el, data) {
     statTile({ label: "Fuzz inputs", value: fuzz.passed, detail: fails === 0 ? "0 panics" : fails === 1 ? "1 failure" : `${formatNumber(fails)} failures`, status: fuzzPre ? "partial" : fuzz.status, tag: fuzzPre ? "pre-freeze" : "", testId: "gauge-fuzz" }),
     statTile({ label: "WASI checks", value: wasi.passed, total: wasi.total ?? 6, status: wasiPre ? "partial" : wasi.status, tag: wasiPre ? "pre-freeze" : "", testId: "gauge-wasi" }),
     statTile({ label: "Core suites", value: core.suitesAt100, total: core.suitesTotal ?? 62, unit: isMeasured(core.suitesAt100) ? "" : "suites", detail: "at 100%", status: core.status, testId: "gauge-core" }),
-    statTile({ label: "Blind holdout", value: hold.reposPassed, total: hold.reposTotal ?? 240, unit: isMeasured(hold.reposPassed) ? "" : "repos", detail: "L2 build graph", status: hold.status, testId: "gauge-holdout" })
+    statTile({ label: "Blind holdout", value: hold.reposPassed, total: hold.reposTotal ?? 240, unit: isMeasured(hold.reposPassed) ? "" : "repos", detail: hold.levelPassRates?.L2?.eligible ? "L2 build graph" : "L1 strict parity", status: hold.status, testId: "gauge-holdout" })
   ].join("");
 }
 

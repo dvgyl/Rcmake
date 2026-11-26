@@ -28,7 +28,9 @@ export function escapeHtml(value) {
 }
 
 export function formatNumber(value) {
-  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString("en-US") : null;
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  if (Number.isInteger(value)) return value.toLocaleString("en-US");
+  return value.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 }
 
 export function formatPercent(value) {

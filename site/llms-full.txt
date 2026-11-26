@@ -277,11 +277,14 @@ These features are omitted or intentionally differ from CMake 4.5.1.
 
 ### Current verification status for 0.1.0
 
-Frozen `v0.1.0` scorecard numbers populate `site/data/latest.json` and `https://rcmake.github.io/rcmake/dashboard.html` from the release verification run. These pre-freeze baselines are already recorded.
+Frozen `v0.1.0` scorecard numbers populate `site/data/latest.json` and `https://rcmake.github.io/rcmake/dashboard.html` from frozen engine commit `8d9182957c82` measured on `2026-11-26`.
 
-- Cross-platform CI on `ubuntu-24.04`, `macos-15`, and `windows-2025` plus corpus smoke passed 6 of 6 jobs pre-freeze.
-- Seeded generative fuzzing ran 14,000,000 inputs across 14 targets with 0 failures on commit `d4356df` on `2026-11-25`.
-- WebAssembly and WASI checks for `wasm32-unknown-unknown` and `wasm32-wasip1` passed 6 of 6 checks on commit `c583dc2` on `2026-11-25`.
+- Cross-platform CI on `ubuntu-24.04`, `macos-15`, and `windows-2025` plus corpus smoke passed 6 of 6 jobs.
+- Upstream Linux `Tests/RunCMake` passed 99.35% (9,312 of 9,373 cases across 362 suites), with macOS and Windows full runs pending completion at the `v0.1.0` cutoff.
+- The independent 20-scenario black-box differential suite passed 20 of 20 scenarios (679 of 679 checks).
+- Seeded generative fuzzing ran 14,000,000 inputs across 14 targets with 0 failures, differential fuzzing passed 1,000 of 1,000 cases, probe-cache soundness passed 16 of 16 checks, mutation replay passed 20 of 20 edits, path swap passed with 0 differences, and WebAssembly and WASI checks passed 6 of 6 checks.
+- Sixteen completed `vcpkg` shards passed 319 of 332 scored CMake ports (96.08% across 656 inspected ports), with 48 shards remaining in the cloud queue at cutoff.
+- Five real-world C++ giant benchmarks (`duckdb`, `opencv`, `protobuf`, `qtbase`, and `llvm-project`) passed with geometric mean speedups of 1.02x cold, 1.41x warm probe-cache, and 1.21x leaf-edit reconfigure, alongside 5.80x warm probe-cache speedup on the synthetic 24-probe benchmark and 2.03x cold configure speedup on the synthetic 500-library benchmark.
 
 The benchmark scripts measure three configure scenarios.
 

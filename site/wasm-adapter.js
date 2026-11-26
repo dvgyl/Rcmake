@@ -54,7 +54,7 @@ target_compile_options(hello PRIVATE
 
   "library-export": {
     id: "library-export",
-    title: "Library + Export",
+    title: "Library and export",
     description: "STATIC library with PUBLIC HEADERS file set, ALIAS target, install export set, and consumer executable.",
     defaultSymbol: "demo_cli",
     files: {
@@ -191,7 +191,7 @@ endif()
 
   "policy-block": {
     id: "policy-block",
-    title: "Policy Scopes & Block",
+    title: "Policy scopes and block",
     description: "Lexical block(SCOPE_FOR VARIABLES POLICIES PROPAGATE ...) and CMake 4.5 policy isolation.",
     defaultSymbol: "EXPORTED_TOKEN",
     files: {

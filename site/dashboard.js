@@ -81,9 +81,14 @@ export function renderProvenance(data) {
   if ("knownParityGaps" in data && data.knownParityGaps !== null && data.knownParityGaps !== undefined) {
     if (Array.isArray(data.knownParityGaps)) {
       const cleaned = data.knownParityGaps.map((g) => String(g || "").trim()).filter(Boolean);
-      gapsHtml = cleaned.length
-        ? `<p class="provenance-gaps"><strong>Known parity gaps.</strong> ${escapeHtml(cleaned.join(", "))}</p>`
-        : '<p class="provenance-gaps"><strong>Known parity gaps.</strong> None recorded for this release.</p>';
+      if (cleaned.length > 1) {
+        const items = cleaned.map((g) => `<li>${escapeHtml(g)}</li>`).join("");
+        gapsHtml = `<div class="provenance-gaps"><strong>Known parity gaps.</strong><ul>${items}</ul></div>`;
+      } else if (cleaned.length === 1) {
+        gapsHtml = `<p class="provenance-gaps"><strong>Known parity gaps.</strong> ${escapeHtml(cleaned[0])}</p>`;
+      } else {
+        gapsHtml = '<p class="provenance-gaps"><strong>Known parity gaps.</strong> None recorded for this release.</p>';
+      }
     } else if (typeof data.knownParityGaps === "string" && data.knownParityGaps.trim()) {
       gapsHtml = `<p class="provenance-gaps"><strong>Known parity gaps.</strong> ${escapeHtml(data.knownParityGaps.trim())}</p>`;
     }
@@ -161,12 +166,12 @@ export function renderProjects(track) {
 }
 
 export function renderHoldout(track) {
-  const total = formatNumber(track?.reposTotal) || "240";
+  const sealedTotal = isMeasured(track?.reposTotal) && track.reposTotal < 240 ? 240 : (track?.reposTotal ?? 240);
   const measured = isMeasured(track?.reposPassed) && isMeasured(track?.reposTotal);
   const st = measured ? normalizeStatus(track.status) : "pending";
   const bannerSummary = measured
-    ? `${total} sealed repositories \u00b7 ${formatRatio(track.reposPassed, track.reposTotal)} passed${isMeasured(track.passRate) ? ` (${formatPercent(track.passRate)})` : ""}`
-    : `${total} sealed repositories \u00b7 aggregate counts only`;
+    ? `${formatNumber(sealedTotal)} sealed repositories (${formatNumber(track.reposTotal)} eligible) \u00b7 ${formatRatio(track.reposPassed, track.reposTotal)} passed${isMeasured(track.passRate) ? ` (${formatPercent(track.passRate)})` : ""}`
+    : `${formatNumber(sealedTotal)} sealed repositories \u00b7 aggregate counts only`;
 
   const aggregateBar = measured
     ? horizontalBar({

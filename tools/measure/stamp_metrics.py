@@ -316,7 +316,10 @@ def _format_known_gaps(raw: Any) -> str | None:
         cleaned = [str(item).strip() for item in raw if str(item).strip()]
         if not cleaned:
             return "none"
-        joined = "; ".join(cleaned)
+        if all(item.endswith(".") for item in cleaned):
+            joined = " ".join(cleaned)
+        else:
+            joined = "; ".join(cleaned)
         return None if PENDING_VALUE_RE.search(joined) else joined
     if isinstance(raw, str):
         cleaned = raw.strip()
