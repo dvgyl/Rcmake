@@ -381,6 +381,7 @@ fn conflicts<K: Ord, V: PartialEq>(map: &mut BTreeMap<K, V>, key: K, value: V) -
 
 /// Exact observations that have no stamp in the shared store format.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct JournalChecks(Vec<(Check, Digest)>);
 
 impl JournalChecks {
@@ -466,6 +467,11 @@ impl Journal {
             && self.checks.verify(host)
             && verify_inputs(host, &self.trace, self.memo.as_deref()) == VerifyOutcome::Hit)
             .then_some((&self.trace, &self.checks))
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn checks(&self) -> &JournalChecks {
+        &self.checks
     }
 }
 

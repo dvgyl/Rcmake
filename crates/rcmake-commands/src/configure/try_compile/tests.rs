@@ -574,3 +574,167 @@ fn try_compile_can_nest_three_projects_with_the_default_recursion_limit() -> Tes
     assert_eq!(result.exit_code, 0, "{}", host.stream_bytes(Stream::Stderr));
     Ok(())
 }
+
+#[cfg(all(feature = "native", target_os = "macos"))]
+mod platform_queries {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rcmake_host::{HostError, HostResult, RunRequest};
+    use rcmake_store::{InputStamp, Trace};
+
+    use super::super::initialize_probe;
+    use super::super::journal::{DependencyClosure, JournalHost, JournalMode, ProcessVerifier};
+    use super::{Host, Path, ProcessResult, PureHost, RunOutput, Stream, TestResult, interpreter};
+    use crate::configure::platform_queries::PlatformQueries;
+    use std::sync::Arc;
+
+    const MODULE: &str = r#"
+execute_process(COMMAND /usr/bin/sw_vers -productVersion
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}" OUTPUT_VARIABLE version)
+if(NOT version STREQUAL "15.0")
+    message(FATAL_ERROR "Unexpected platform query result: ${version}")
+endif()
+"#;
+
+    fn query_output(request: &RunRequest) -> Option<RunOutput> {
+        let [command] = request.pipeline.as_slice() else {
+            return None;
+        };
+        (command.program == "/usr/bin/sw_vers"
+            && command.args.len() == 1
+            && command
+                .args
+                .first()
+                .is_some_and(|arg| arg == "-productVersion"))
+        .then(|| RunOutput {
+            stdout: b"15.0".to_vec(),
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    }
+
+    fn host(launches: &Arc<AtomicUsize>) -> HostResult<Arc<PureHost>> {
+        let host = Arc::new(PureHost::default());
+        let tool = Path::new("/usr/bin/sw_vers");
+        host.seed_file(tool, b"fixture")?;
+        host.set_permissions(tool, 0o755)?;
+        host.seed_file(
+            Path::new("/work/cmake/Modules/Platform/Darwin-Initialize.cmake"),
+            MODULE.as_bytes(),
+        )?;
+        host.seed_file(
+            Path::new("/work/child/CMakeLists.txt"),
+            b"cmake_minimum_required(VERSION 4.5)\nproject(Child NONE)\ninclude(Platform/Darwin-Initialize)\n",
+        )?;
+        let launches = launches.clone();
+        host.set_command_handler(move |_, request, _| {
+            launches.fetch_add(1, Ordering::Relaxed);
+            query_output(request).ok_or_else(|| HostError::unsupported("Unexpected process."))
+        })?;
+        Ok(host)
+    }
+
+    #[test]
+    fn second_unjournaled_probe_launches_no_platform_queries() -> TestResult {
+        let launches = Arc::new(AtomicUsize::new(0));
+        let host = host(&launches)?;
+        let root = Path::new("/work");
+        host.seed_file(
+            &root.join("CMakeLists.txt"),
+            br#"
+cmake_minimum_required(VERSION 4.5)
+project(Parent NONE)
+try_compile(FIRST PROJECT Child SOURCE_DIR /work/child BINARY_DIR /work/first)
+try_compile(SECOND PROJECT Child SOURCE_DIR /work/child BINARY_DIR /work/second)
+if(NOT FIRST OR NOT SECOND)
+    message(FATAL_ERROR "Both probes must configure successfully.")
+endif()
+"#,
+        )?;
+        let mut parent = interpreter(host.clone(), root)?;
+        parent.add_session_data(Arc::new(PlatformQueries::default()));
+        let outcome = parent.run_configure(root, &root.join("build"), &[]);
+        assert_eq!(
+            outcome.exit_code,
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        assert_eq!(launches.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    struct PlatformVerifier(AtomicUsize);
+
+    impl ProcessVerifier for PlatformVerifier {
+        fn recorded_platform_query(&self, request: &RunRequest) -> Option<RunOutput> {
+            let output = query_output(request)?;
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Some(output)
+        }
+
+        fn preflight(&self, _: &RunRequest) -> Option<Trace> {
+            None
+        }
+
+        fn dependencies(
+            &self,
+            _: &RunRequest,
+            _: &RunOutput,
+            _: &[InputStamp],
+        ) -> Option<DependencyClosure> {
+            None
+        }
+    }
+
+    #[test]
+    fn journal_checks_match_with_and_without_the_parent_memo() -> TestResult {
+        let launches = Arc::new(AtomicUsize::new(0));
+        let host = host(&launches)?;
+        let root = Path::new("/work");
+        let source = root.join("child");
+        let scratch = root.join("scratch");
+        host.create_dir_all(&scratch)?;
+
+        let mut with_memo = interpreter(host.clone(), root)?;
+        with_memo.add_session_data(Arc::new(PlatformQueries::default()));
+        assert_eq!(
+            with_memo
+                .run_configure(&source, &root.join("seed"), &[])
+                .exit_code,
+            0
+        );
+        assert_eq!(launches.load(Ordering::Relaxed), 1);
+        let mut without_memo = interpreter(host.clone(), root)?;
+        let verifier = Arc::new(PlatformVerifier(AtomicUsize::new(0)));
+        let mut checks = Vec::new();
+        for parent in [&mut with_memo, &mut without_memo] {
+            let journal = Arc::new(JournalHost::from_shared(
+                host.clone(),
+                &scratch,
+                verifier.clone(),
+                JournalMode::Observe,
+            )?);
+            let mut child = interpreter(journal.clone(), root)?;
+            initialize_probe(&parent.cx(), &mut child, true);
+            let outcome = child.run_configure(&source, &scratch, &[]);
+            assert_eq!(
+                outcome.exit_code,
+                0,
+                "{}",
+                host.stream_bytes(Stream::Stderr)
+            );
+            drop(child);
+            let journal = Arc::try_unwrap(journal)
+                .map_err(|_| HostError::unsupported("The child retained the journal."))?
+                .finish();
+            let observed = journal.checks();
+            assert!(observed.encoded_size_bound() > 16);
+            checks.push(observed.clone());
+        }
+        assert_eq!(launches.load(Ordering::Relaxed), 1);
+        assert_eq!(verifier.0.load(Ordering::Relaxed), 2);
+        assert_eq!(checks.first(), checks.get(1));
+        Ok(())
+    }
+}

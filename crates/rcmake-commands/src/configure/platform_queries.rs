@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rcmake_base::BString;
-use rcmake_eval::{Cx, journal::ReplayReceipts};
+use rcmake_eval::{Cx, Interp, journal::ReplayReceipts};
 use rcmake_host::{
     FileKind, Follow, Host, HostResult, Input, Output, ProcessResult, RunOutput, RunRequest,
     Stream, path,
@@ -104,6 +104,18 @@ impl PlatformQueries {
                     .all(|file| is_missing(host, file))
         });
         Some(snapshot)
+    }
+}
+
+/// Share the configure memo with a child that has no process journal.
+pub(super) fn inherit(cx: &Cx<'_>, child: &mut Interp) {
+    if let Some(queries) = cx.session_data::<std::sync::Arc<PlatformQueries>>()
+        && !cx
+            .host()
+            .env_get(b"RCMAKE_NO_PLATFORM_QUERIES")
+            .is_some_and(|value| value == "1")
+    {
+        child.add_session_data(queries.clone());
     }
 }
 

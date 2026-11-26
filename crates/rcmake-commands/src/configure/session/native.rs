@@ -87,7 +87,7 @@ impl NativeSession {
 
     pub(super) fn attach(&self, interp: &mut Interp) {
         let replay = self.replay_enabled(interp);
-        if (self.probe.is_some() || replay) && cfg!(target_os = "macos") {
+        if (self.memo.is_some() || self.probe.is_some() || replay) && cfg!(target_os = "macos") {
             let queries = super::super::platform_queries::PlatformQueries::default();
             queries.prefetch(&self.host());
             interp.add_session_data(Arc::new(queries));
