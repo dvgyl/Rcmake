@@ -25,9 +25,30 @@ extern crate self as rcmake_lsp;
 #[cfg(all(any(unix, windows), feature = "eval", feature = "stdio"))]
 mod stdio_eval;
 
+/// Report a panic on stderr and exit with code 1 in an aborting stdio server.
+#[cfg(all(any(unix, windows), feature = "stdio", panic = "abort"))]
+pub fn install_stdio_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"CMake Internal Error (please report a bug)\n",
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            clippy::exit,
+            reason = "Preserve exit code 1 when a panic cannot unwind"
+        )]
+        std::process::exit(1);
+    }));
+}
+
 /// Run the evaluated language server over standard input and output.
 #[cfg(all(any(unix, windows), feature = "eval", feature = "stdio"))]
 pub fn run_stdio() -> std::process::ExitCode {
+    #[cfg(panic = "abort")]
+    install_stdio_panic_hook();
     stdio_eval::serve().unwrap_or(std::process::ExitCode::FAILURE)
 }
 

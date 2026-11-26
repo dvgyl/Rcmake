@@ -24,6 +24,8 @@ fn main() -> ExitCode {
     #[cfg(feature = "eval")]
     use stdio_eval::serve;
 
+    #[cfg(panic = "abort")]
+    rcmake_lsp::install_stdio_panic_hook();
     serve().unwrap_or(ExitCode::FAILURE)
 }
 

@@ -19,23 +19,35 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| !v.is_empty() && v != "0") {
             default_hook(info);
-            return;
+        } else {
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unexpected internal error");
+            let line = match info.location() {
+                Some(loc) => format!(
+                    "rcmake: internal error: {message} ({}:{})\n",
+                    loc.file(),
+                    loc.line()
+                ),
+                None => format!("rcmake: internal error: {message}\n"),
+            };
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
         }
-        let message = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("unexpected internal error");
-        let line = match info.location() {
-            Some(loc) => format!(
-                "rcmake: internal error: {message} ({}:{})\n",
-                loc.file(),
-                loc.line()
-            ),
-            None => format!("rcmake: internal error: {message}\n"),
-        };
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+        #[cfg(panic = "abort")]
+        {
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"CMake Internal Error (please report a bug)\n",
+            );
+            #[expect(
+                clippy::exit,
+                reason = "Preserve exit code 1 when a panic cannot unwind"
+            )]
+            std::process::exit(1);
+        }
     }));
 }
 
