@@ -89,6 +89,12 @@ class CaseRegistrationAndSelectionTests(unittest.TestCase):
             [
                 "ninja-present",
                 "ninja-swap",
+                "same-inode-header-rewrite",
+                "memo-tmp-alias-write",
+                "memo-directory-link-write",
+                "memo-directory-rename",
+                "memo-process-write",
+                "cxx-headers",
                 "flag-plugin",
                 "env-inert",
                 "run-env",
@@ -116,7 +122,7 @@ class CaseRegistrationAndSelectionTests(unittest.TestCase):
 
         all_names = [spec.name for spec in pce.ALL_CASES]
         self.assertEqual(len(all_names), len(set(all_names)))
-        self.assertEqual(len(pce.ALL_CASES), 33)
+        self.assertEqual(len(pce.ALL_CASES), 39)
         for spec in pce.ALL_CASES:
             self.assertIn(spec.gate, {"G3", "G4", "G3/G4"})
             self.assertIn(spec.group, {"baseline", "extended", "prelude"})
@@ -222,6 +228,25 @@ class CliAndReportFormattingTests(unittest.TestCase):
         ])
         self.assertEqual(code, 2)
         self.assertIn("does-not-exist", stderr)
+
+    def test_tmp_alias_case_skips_without_a_toolchain_on_linux_and_windows(self):
+        out_json = self.root / "skip.json"
+        out_md = self.root / "skip.md"
+        for platform in ("linux", "win32"):
+            with (
+                self.subTest(platform=platform),
+                mock.patch.object(pce.sys, "platform", platform),
+                mock.patch.object(pce.shutil, "which", return_value=None),
+            ):
+                code, _, stderr = self.run_cli([
+                    "--rcmake", "unavailable", "--oracle", "", "--cc", "",
+                    "--case", "memo-tmp-alias-write",
+                    "--out-json", str(out_json), "--out-md", str(out_md),
+                ])
+                self.assertEqual(code, 0, stderr)
+                report = json.loads(out_json.read_text(encoding="utf-8"))
+                self.assertEqual(report["cases"][0]["status"], "skipped")
+                self.assertIn("requires macOS", out_md.read_text(encoding="utf-8"))
 
     def test_main_writes_expected_json_and_markdown_for_default_and_failing_case(self):
         args = _make_args(self.root)

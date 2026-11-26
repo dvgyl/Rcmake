@@ -80,6 +80,27 @@ CACHE_SETTINGS = re.compile(
     r"|EXPORT_NO_PACKAGE_REGISTRY))):[^=]*=(.*)$", re.MULTILINE,
 )
 COMPILER_CACHES = {"ccache", "sccache"}
+CXX_HEADERS = "cxx-headers"
+CXX_CHECKS = (
+    ("CheckIncludeFile", "check_include_file", "H", (
+        "stdio.h", "stdlib.h", "string.h", "unistd.h", "pthread.h", "sys/types.h",
+        "sys/stat.h", "fcntl.h", "dlfcn.h", "stdint.h",
+    )),
+    ("CheckSymbolExists", "check_symbol_exists", "S", (
+        "fopen stdio.h", "strtod stdlib.h", "memcpy string.h", "getpid unistd.h",
+        "pthread_create pthread.h", "dlopen dlfcn.h",
+    )),
+    ("CheckCXXCompilerFlag", "check_cxx_compiler_flag", "F", (
+        "-Wall", "-Wextra", "-fno-rtti", "-fvisibility=hidden", "-Wshadow", "-Wconversion",
+    )),
+)
+CXX_CACHE_KEYS = tuple(f"HAVE_{kind}{index}" for _, _, kind, checks in CXX_CHECKS
+                       for index in range(len(checks)))
+CXX_TARGETS = tuple(f"t{index}" for index in range(40))
+CXX_PROBE_INPUTS = {
+    "include": b"CheckIncludeFile.c", "symbol": b"CheckSymbolExists.c", "flag": b"src.cxx",
+}
+CXX_COLD_CALLS = {"include": 10, "symbol": 6, "flag": 6}
 
 
 @dataclass
@@ -97,6 +118,7 @@ class Sample:
     control_executed: bool = False
     fetch_origins_hidden: bool | None = None
     toolchain: dict | None = None
+    cxx_outputs: tuple | None = None
 
 
 def benchmark_env(inherited):
@@ -205,6 +227,26 @@ def synthetic_project(source, directories, probes):
     (source / "CMakeLists.txt").write_text("\n".join(lines) + "\n")
 
 
+def cxx_headers_project(source):
+    """Create the fixed C and C++ workload with 22 checks and 41 targets."""
+    source.mkdir()
+    lines = ["cmake_minimum_required(VERSION 4.5)", "project(CxxBench LANGUAGES C CXX)"]
+    for module, command, kind, checks in CXX_CHECKS:
+        lines.append(f"include({module})")
+        lines.extend(f"{command}({check} HAVE_{kind}{index})"
+                     for index, check in enumerate(checks))
+    for index, name in enumerate(CXX_TARGETS):
+        (source / f"{name}.cpp").write_text(f"int {name}() {{ return {index}; }}\n")
+        lines.extend((f"add_library({name} STATIC {name}.cpp)",
+                      f"target_compile_features({name} PUBLIC cxx_std_17)"))
+        if index:
+            lines.append(f"target_link_libraries({name} PUBLIC {CXX_TARGETS[index - 1]})")
+    (source / "main.cpp").write_text("int main() { return 0; }\n")
+    lines.extend(("add_executable(app main.cpp)", f"target_link_libraries(app PRIVATE {CXX_TARGETS[-1]})",
+                  "install(TARGETS app)"))
+    (source / "CMakeLists.txt").write_text("\n".join(lines) + "\n")
+
+
 def select_projects(names, scratch, directories, probes):
     """Resolve project names beneath the corpus directory."""
     profiles = {}
@@ -213,10 +255,13 @@ def select_projects(names, scratch, directories, probes):
             profiles[project["name"]] = project.get("configure_args", [])
     projects = {}
     for name in names:
-        if name == "synthetic":
-            source = scratch / "synthetic"
+        if name in ("synthetic", CXX_HEADERS):
+            source = scratch / name
             if not source.exists():
-                synthetic_project(source, directories, probes)
+                if name == "synthetic":
+                    synthetic_project(source, directories, probes)
+                else:
+                    cxx_headers_project(source)
             projects[name] = (source, [])
             continue
         source = (CORPUS / name).resolve()
@@ -322,6 +367,35 @@ def compiler_inputs(log):
     return Counter(name for name in log.read_bytes().split(b"\0") if name) if log.is_file() else Counter()
 
 
+def cxx_headers_outputs(source, build):
+    """Read all probe cache values and verify the C++ targets in the File API reply."""
+    cache = (build / "CMakeCache.txt").read_text(errors="replace")
+    internal = dict(re.findall(r"^(\w+):INTERNAL=(.*)$", cache, re.MULTILINE))
+    missing = [key for key in CXX_CACHE_KEYS if key not in internal]
+    if missing:
+        raise ValueError(f"Missing internal cache entries {', '.join(missing)}.")
+    targets = tuple(sorted(target for leaf in discover_leaves(source, build)
+                           for target, language in leaf.targets if language == "cpp"))
+    if targets != tuple(sorted((*CXX_TARGETS, "app"))):
+        raise ValueError(f"Unexpected C++ targets in {build}. Found {targets}.")
+    return {key: internal[key] for key in CXX_CACHE_KEYS}, targets
+
+
+def cxx_probe_calls(inputs):
+    """Count checks by probe source name."""
+    return {kind: inputs[name] for kind, name in CXX_PROBE_INPUTS.items()}
+
+
+def check_cxx_outputs(sample, source, build):
+    """Record checked outputs or mark the sample as failed."""
+    if sample.error:
+        return
+    try:
+        sample.cxx_outputs = cxx_headers_outputs(source, build)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        sample.error = str(exc)
+
+
 def cache_hits(cold, warm):
     """Count cold probe compilations skipped in a fresh build with the same inputs."""
     return sum((cold - warm).values()) if not warm - cold else 0
@@ -341,7 +415,7 @@ def leaf_trace(trace, source, leaf, control):
 
 def configure_runs(binary, project, work, generator, env, timeout, *, synthetic, cases,
                    leaf_pair=None, unavailable=None, timed=True, replay_evidence=False,
-                   leaf_edit="inert"):
+                   leaf_edit="inert", cxx_headers=False):
     """Run the selected configure phases in one isolated trial."""
     original, configure_args = project
     source = copy_source(original, work)
@@ -407,29 +481,46 @@ def configure_runs(binary, project, work, generator, env, timeout, *, synthetic,
         if trace_args and phase in (COLD, INCREMENTAL_LEAF):
             trace.unlink(missing_ok=True)
             args = [*configure_args, *trace_args]
+        if cxx_headers and not build.exists():
+            query_codemodel(build)
         sample = configure_sample(binary, source, build, args, work, generator, env, timeout,
                                   timed=timed)
         if not sample.error and synthetic:
             cache = build / "CMakeCache.txt"
             if "BENCH_PROBE:INTERNAL=1" not in cache.read_text(errors="replace").splitlines():
                 sample.error = "The synthetic compiler probe result is missing."
+        if cxx_headers:
+            check_cxx_outputs(sample, source, build)
         if not sample.error and log and phase == COLD:
             cold_inputs = compiler_inputs(log)
+            if cxx_headers and cxx_probe_calls(cold_inputs) != CXX_COLD_CALLS:
+                sample.error = f"Unexpected cold compiler calls. Found {cxx_probe_calls(cold_inputs)}."
         if not sample.error and log and phase == WARM_PROBE:
             warm_inputs = compiler_inputs(log)
             if sample.toolchain == results[COLD].toolchain:
                 sample.probe_hits = cache_hits(cold_inputs, warm_inputs)
+            if cxx_headers:
+                skipped = cxx_probe_calls(cold_inputs - warm_inputs)
+                if not skipped["include"] or not skipped["symbol"]:
+                    sample.probe_hits = 0
+                if sample.cxx_outputs != results[COLD].cxx_outputs:
+                    sample.error = "The header probe results differ from the cold configure."
             if sample.probe_hits and not timed:
                 log.unlink(missing_ok=True)
                 shutil.rmtree(warm)
+                if cxx_headers:
+                    query_codemodel(warm)
                 control_env = with_store(env, work / "empty-store")
                 control_sample = configure_sample(
                     binary, source, warm, configure_args, work, generator,
                     control_env, timeout, timed=False,
                 )
+                if cxx_headers:
+                    check_cxx_outputs(control_sample, source, warm)
                 control_inputs = compiler_inputs(log)
                 if (control_sample.error or control_inputs != cold_inputs
-                        or control_sample.toolchain != sample.toolchain):
+                        or control_sample.toolchain != sample.toolchain
+                        or control_sample.cxx_outputs != sample.cxx_outputs):
                     sample.probe_hits = 0
         if not sample.error and (trace_args or replay_evidence) and phase == COLD:
             try:
@@ -530,7 +621,7 @@ def fetch_runs(binary, fixture, work, generator, env, timeout, *, offline, timed
 
 
 def preflight(binaries, project, cases, work, generator, env, timeout, *, synthetic,
-              leaf_edit="inert"):
+              leaf_edit="inert", cxx_headers=False):
     """Use untimed configure results to establish each scenario's prerequisites."""
     work.mkdir()
     unavailable = {}
@@ -545,8 +636,8 @@ def preflight(binaries, project, cases, work, generator, env, timeout, *, synthe
         lane.mkdir()
         sample = configure_runs(binaries["rcmake"], project, lane, generator, env, timeout,
                                 synthetic=synthetic, cases=(COLD, WARM_PROBE),
-                                timed=False)[WARM_PROBE]
-        if not sample.probe_hits:
+                                timed=False, cxx_headers=cxx_headers)[WARM_PROBE]
+        if sample.error or not sample.probe_hits:
             unavailable[WARM_PROBE] = sample.error or "No probe cache hits in the untimed configure."
     if INCREMENTAL_LEAF in cases:
         try:
@@ -648,7 +739,8 @@ def summarize(samples):
         "peak_rss_bytes": max(memory, default=None),
         "failures": sum(bool(sample.error) for sample in samples),
         "unavailable": sum(bool(sample.unavailable) for sample in samples),
-        "samples": [vars(sample) for sample in samples],
+        "samples": [{key: value for key, value in vars(sample).items() if key != "cxx_outputs"}
+                    for sample in samples],
     }
 
 
@@ -691,6 +783,8 @@ def scenario_gate(row):
     if case == WARM_PROBE:
         if not all(sample.get("probe_hits", 0) > 0 for sample in samples):
             return status(False, "A warm run did not skip any cold probe compilations.")
+        if row["project"] == CXX_HEADERS:
+            return status(row["speedup"] >= 1.5, "Target at least 1.5× versus fresh CMake for cxx-headers.")
         return status(row["speedup"] >= 5, "Target at least 5× versus fresh CMake. Stretch target 10×.")
     if case == INCREMENTAL_LEAF:
         oracle = row["oracle"]["samples"]
@@ -780,7 +874,8 @@ def main():
     parser.add_argument("--rcmake", type=Path, default=ROOT / "target/stage/bin/rcmake")
     parser.add_argument("--oracle", type=Path, default=os.environ.get("RCMAKE_ORACLE_CMAKE"))
     parser.add_argument("--projects", nargs="+", default=["synthetic"],
-                        help="Project names under conformance/corpus, or synthetic. Warm fetch uses its own fixture.")
+                        help="Project names under conformance/corpus, synthetic, or cxx-headers. "
+                             "Warm fetch uses its own fixture.")
     parser.add_argument("--runs", type=int, default=5, help="Runs per tool and case.")
     parser.add_argument("--quick", action="store_true", help="Use smaller fixtures and shorter timeouts.")
     parser.add_argument("--scenario", choices=(*SCENARIOS, "all"), action="append",
@@ -851,12 +946,13 @@ def main():
             workloads.append(("Utilities", inputs, UTILITIES, {}))
         for index, (name, project, cases, unavailable) in enumerate(workloads):
             leaf_pair = None
+            cxx_headers = name == CXX_HEADERS
             workload_env = fetch_env if WARM_FETCH in cases else env
             if cases != UTILITIES and not unavailable:
                 print(f"Checking prerequisites for {name}.", file=sys.stderr, flush=True)
                 leaf_pair, unavailable = preflight(
                     binaries, project, cases, scratch / f"preflight-{index}", generator, workload_env,
-                    timeout, synthetic=name == "synthetic", leaf_edit=args.leaf_edit,
+                    timeout, synthetic=name == "synthetic", leaf_edit=args.leaf_edit, cxx_headers=cxx_headers,
                 )
                 if WARM_FETCH in unavailable:
                     unavailable[COLD_FETCH] = unavailable[WARM_FETCH]
@@ -880,7 +976,7 @@ def main():
                         samples = configure_runs(binaries[tool], project, work, generator, env,
                                                  timeout, synthetic=name == "synthetic", cases=cases,
                                                  leaf_pair=leaf_pair, unavailable=unavailable,
-                                                 leaf_edit=args.leaf_edit)
+                                                 leaf_edit=args.leaf_edit, cxx_headers=cxx_headers)
                         if leaf_pair and not samples[INCREMENTAL_LEAF].error:
                             verify = work / "verify-leaf"
                             verify.mkdir()
@@ -898,6 +994,12 @@ def main():
                     for case, sample in samples.items():
                         by_tool[tool][case].append(sample)
                     shutil.rmtree(work)
+                if cxx_headers:
+                    for case in cases:
+                        candidate, oracle = (by_tool[tool][case][-1] for tool in TOOLS)
+                        if not (candidate.error or oracle.error or candidate.unavailable or oracle.unavailable):
+                            if candidate.cxx_outputs != oracle.cxx_outputs:
+                                candidate.error = "The header probe results or targets differ from CMake."
             for case in cases:
                 cold = cases[0] if case != cases[0] and cases != UTILITIES else None
                 row = result_row(name, case, by_tool, cold)
@@ -933,7 +1035,7 @@ def main():
                 "RCMAKE_CACHE_DIR": "private per trial", "RCMAKE_PROBE_CACHE_DIR": "private per trial",
                 "package_registry_flags": REGISTRY_FLAGS,
             },
-            "projects": {name: {"source": "synthetic" if name == "synthetic" else str(source),
+            "projects": {name: {"source": name if name in ("synthetic", CXX_HEADERS) else str(source),
                                 "configure_args": configure_args}
                          for name, (source, configure_args) in projects.items()},
         },

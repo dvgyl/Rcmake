@@ -14,7 +14,7 @@ from collections.abc import Callable
 from contextlib import ExitStack
 import ctypes
 from ctypes.util import find_library
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -68,6 +68,10 @@ DIGEST = re.compile(r"[0-9a-f]{64}")
 ENTRY_LIMIT = 16 * 1024 * 1024
 BLOB_LIMIT = 512 * 1024 * 1024
 ARTIFACT_LIMIT = 4 * 1024 * 1024
+
+
+class CasePrerequisite(Exception):
+    """Report a missing prerequisite for a case."""
 
 
 @dataclass(frozen=True)
@@ -269,14 +273,14 @@ def check_result(data: dict, expected: bool, count: int = 1) -> None:
 
 def configure(args, case: Fixture, name: str, env: dict, *, oracle: bool = False,
               no_cache: bool = False, generator: str | None = None,
-              cwd: Path | None = None) -> tuple[dict, int]:
+              cwd: Path | None = None, configure_args=()) -> tuple[dict, int]:
     """Configure and count actual compiler calls attributable to the probe."""
     build = case.root / name
     binary = args.oracle if oracle else args.rcmake
     selected_generator = generator or getattr(args, "generator", "Ninja")
     before = len(case.invocations())
-    result = run_command(command(binary, case, build, no_cache, generator=selected_generator),
-                         cwd or case.root, args.timeout, env)
+    cmd = command(binary, case, build, no_cache, generator=selected_generator)
+    result = run_command([*cmd, *configure_args], cwd or case.root, args.timeout, env)
     return output(result, case, build, args, env), len(case.invocations()) - before
 
 
@@ -905,7 +909,7 @@ def ninja_present(args, root: Path, row: dict) -> None:
 
 
 def resolve_cxx(args) -> str:
-    """Locate a POSIX C++ compiler for C++20 soundness traps."""
+    """Locate a POSIX C++ compiler for the C++ cases."""
     configured = getattr(args, "cxx", None)
     if configured:
         return str(executable(configured))
@@ -913,7 +917,7 @@ def resolve_cxx(args) -> str:
         found = shutil.which(candidate)
         if found:
             return str(executable(found))
-    raise ValueError("The ninja-swap case requires a POSIX C++ compiler on PATH or via --cxx.")
+    raise ValueError("Use a POSIX C++ compiler on PATH or specify it with --cxx.")
 
 
 def write_ninja_version_wrapper(staged: Path, real_ninja: Path, version: str) -> None:
@@ -2120,6 +2124,369 @@ message(STATUS "PreludeModuleWrite ${PRELUDE_MOD_FIRST}|${PRELUDE_MOD_SECOND}")
     compare(cached, reuse_off, compare_keys, "Prelude-module-write cached vs reuse-off parity")
 
 
+REWRITE_HEADER = b"#define PROBE_VALUE 0\n"
+REWRITE_SCRIPT = """\
+import os
+from pathlib import Path
+import sys
+
+header = Path(sys.argv[1])
+before = header.stat()
+with header.open("r+b") as stream:
+    stream.seek(len(b"#define PROBE_VALUE "))
+    stream.write(b"1")
+os.utime(header, ns=(before.st_atime_ns, before.st_mtime_ns))
+"""
+
+
+def check_header_rewrite(header: Path, before: os.stat_result) -> None:
+    """Check that the bytes changed and the file kept its identity and mtime."""
+    after = header.stat()
+    if (after.st_dev, after.st_ino, after.st_size) != (before.st_dev, before.st_ino, before.st_size):
+        raise ValueError("The header rewrite changed the file identity or size.")
+    if after.st_mtime_ns != before.st_mtime_ns or after.st_ctime_ns == before.st_ctime_ns:
+        raise CasePrerequisite("The filesystem must preserve mtime and report the changed ctime.")
+    if header.read_bytes() != REWRITE_HEADER.replace(b"0", b"1"):
+        raise ValueError("Expected a one-byte change in the header.")
+
+
+def same_inode_header_rewrite(args, root: Path, row: dict) -> None:
+    """Require a new compile after a one-byte header rewrite with restored mtime."""
+    lists = r"""cmake_minimum_required(VERSION 4.5)
+project(ProbeHeaderRewrite C)
+function(check_header index)
+  try_compile(result
+    SOURCE_FROM_CONTENT probe_1.c [=[
+#include <rewrite.h>
+#if PROBE_VALUE != 0
+#error The header changed.
+#endif
+int main(void) { return 1; }
+]=]
+    COMPILE_DEFINITIONS "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    OUTPUT_VARIABLE compile_output
+    COPY_FILE "${CMAKE_BINARY_DIR}/probe-${index}"
+    NO_CACHE)
+  set(result_${index} "${result}" PARENT_SCOPE)
+  set(output_${index} "${compile_output}" PARENT_SCOPE)
+endfunction()
+check_header(1)
+set(indices 1)
+if(REWRITE_IN_CONFIGURE)
+  execute_process(COMMAND [==[@PYTHON@]==] "${CMAKE_CURRENT_SOURCE_DIR}/../rewrite.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include/rewrite.h" COMMAND_ERROR_IS_FATAL ANY)
+  check_header(2)
+  list(APPEND indices 2)
+endif()
+set(results "")
+foreach(index IN LISTS indices)
+  file(WRITE "${CMAKE_BINARY_DIR}/probe-${index}.log" "${output_${index}}")
+  string(APPEND results "${result_${index}}\n")
+endforeach()
+file(WRITE "${CMAKE_BINARY_DIR}/probe-results.txt" "${results}")
+string(REPLACE "\n" " " display "${results}")
+message(STATUS "Probe results ${display}")
+""".replace("@PYTHON@", sys.executable)
+    case = _write_custom_fixture(root, args.compiler, lists, extra_files={
+        "include/rewrite.h": REWRITE_HEADER, "rewrite.py": REWRITE_SCRIPT.encode(),
+    })
+    header = root / "include/rewrite.h"
+    script = root / "rewrite.py"
+    store = root / "store"
+    env = environment(case, store)
+    calls = row["compiler_calls"] = {}
+    before = header.stat()
+    cold, calls["cold"] = configure(args, case, "cold", env)
+    check_result(cold, True)
+    require_calls(calls, "cold", 1)
+    if not args.smoke:
+        entries = audit_store_entries(store)
+        if len(entries) != 1 or next(iter(entries.values()))["artifact"] != cold["copies"][0]:
+            raise ValueError("Expected one cold entry with the copied executable.")
+        trace = next(iter(entries.values()))["trace"]
+        expected_digest = hashlib.sha256(REWRITE_HEADER).hexdigest()
+        if not any(Path(stamp["path"]).resolve() == header and stamp["digest"] == expected_digest
+                   for item in trace if (stamp := item.get("FileHash"))):
+            raise ValueError("The cold probe did not record a FileHash stamp for the header.")
+        warm, calls["warm"] = configure(args, case, "warm", env)
+        require_calls(calls, "warm", 0)
+        compare(warm, cold, cold.keys(), "Warm header probe")
+
+    pair_store = root / "pair-store"
+    if store.exists():
+        shutil.copytree(store, pair_store)
+    rewrite = run_command([sys.executable, script, header], root, args.timeout, env)
+    if rewrite["error"] or rewrite["returncode"]:
+        raise ValueError(f"Could not rewrite the header. {rewrite}")
+    check_header_rewrite(header, before)
+    changed, calls["changed"] = configure(args, case, "changed", env)
+    disabled, calls["cache_off"] = configure(args, case, "cache-off", env, no_cache=True)
+    oracle, calls["oracle"] = configure(args, case, "oracle", env, oracle=True)
+    for lane in ("changed", "cache_off", "oracle"):
+        require_calls(calls, lane, 1)
+    check_result(oracle, False)
+    compare(changed, oracle, (*PARITY_KEYS, "copies"), "Changed header CMake parity")
+    compare(changed, disabled, changed.keys(), "Changed header cache-off parity")
+
+    # Start the in-configure check with the same cold entries and store path.
+    if pair_store.exists():
+        store.rename(root / "changed-store")
+        pair_store.rename(store)
+    pair = replace(case, probes=2)
+    pairs = {}
+    for lane, flags in (("cached_pair", {}), ("cache_off_pair", {"no_cache": True}),
+                        ("oracle_pair", {"oracle": True})):
+        header.write_bytes(REWRITE_HEADER)
+        os.utime(header, ns=(before.st_atime_ns, before.st_mtime_ns))
+        original = header.stat()
+        if lane == "cached_pair" and not args.smoke:
+            if original.st_ctime_ns % 10**9 == 0:
+                raise CasePrerequisite("Digest memo admission requires subsecond ctime.")
+            # Let the initial header reach the minimum age for digest memo admission.
+            age = (time.time_ns() - original.st_ctime_ns) / 10**9
+            time.sleep(max(0, 2 - age))
+        pairs[lane], calls[lane] = configure(args, pair, lane, env, **flags,
+                                            configure_args=("-DREWRITE_IN_CONFIGURE=ON",))
+        check_header_rewrite(header, original)
+        compare(pairs[lane], {"result": b"TRUE\nFALSE\n"}, ("result",), lane)
+        if lane != "cached_pair" or not args.smoke:
+            require_calls(calls, lane, 1 if lane == "cached_pair" else 2)
+    compare(pairs["cached_pair"], pairs["oracle_pair"], PARITY_KEYS, "In-configure header CMake parity")
+    compare(pairs["cached_pair"], pairs["cache_off_pair"], pairs["cached_pair"].keys(),
+            "In-configure header cache-off parity")
+
+
+MEMO_ROOT_FACTS = r"""
+function(check_root path expected_value expected_entries)
+  file(READ "${path}/memo.h" header)
+  if(NOT header STREQUAL "#define MEMO_VALUE ${expected_value}\n")
+    message(FATAL_ERROR "Unexpected header at ${path}.")
+  endif()
+  file(GLOB entries RELATIVE "${path}" "${path}/*")
+  if(NOT entries STREQUAL expected_entries)
+    message(FATAL_ERROR "Unexpected entries at ${path}. Found ${entries}.")
+  endif()
+  if(expected_value EQUAL 0)
+    if(EXISTS "${path}/added.txt")
+      message(FATAL_ERROR "Expected the added file to be absent at ${path}.")
+    endif()
+  elseif(NOT EXISTS "${path}/added.txt")
+    message(FATAL_ERROR "Expected the added file at ${path}.")
+  endif()
+endfunction()
+"""
+
+
+def memo_path_variables(**paths: Path) -> str:
+    """Pass fixture paths with their original spelling to CMake."""
+    return "".join(f"set({name} [==[{path}]==])\n" for name, path in paths.items())
+
+
+def seed_memo_root(path: Path) -> None:
+    """Create a header and leave the added file absent."""
+    path.mkdir(parents=True)
+    (path / "memo.h").write_bytes(b"#define MEMO_VALUE 0\n")
+
+
+def memo_configures(args, root: Path, row: dict, prepare, checks: str, *, probes: int = 0) -> None:
+    """Run the same checks on isolated inputs with Rcmake and CMake."""
+    language = "C" if probes else "NONE"
+    calls = row["compiler_calls"] = {}
+    outcomes = {}
+    for lane in ("cached", "oracle"):
+        lane_root = root / lane
+        lists = (f"cmake_minimum_required(VERSION 4.5)\nproject(ProbeMemo {language})\n"
+                 + prepare(lane_root) + MEMO_ROOT_FACTS + checks)
+        case = _write_custom_fixture(lane_root, args.compiler, lists)
+        outcomes[lane], calls[lane] = configure_raw(
+            args, case, "build", environment(case, lane_root / "store"), oracle=lane == "oracle",
+        )
+        require_calls(calls, lane, probes)
+    compare(outcomes["cached"], outcomes["oracle"], ("stdout", "stderr"), "Memo CMake parity")
+
+
+MEMO_ALIAS_CHECKS = r"""
+function(check_alias expected)
+  try_compile(result SOURCE_FROM_CONTENT probe_alias.c [=[
+#include <memo.h>
+#if MEMO_VALUE != 1
+#error The header has its initial value.
+#endif
+int main(void) { return 0; }
+]=]
+    COMPILE_DEFINITIONS "-I${read_root}" NO_CACHE)
+  if(NOT result STREQUAL expected)
+    message(FATAL_ERROR "Unexpected probe result for ${read_root}. Found ${result}.")
+  endif()
+endfunction()
+check_alias(FALSE)
+check_root("${read_root}" 0 "memo.h")
+check_root("${write_root}" 0 "memo.h")
+file(WRITE "${write_root}/memo.h" "#define MEMO_VALUE 1\n")
+file(WRITE "${write_root}/added.txt" "")
+check_root("${read_root}" 1 "added.txt;memo.h")
+check_alias(TRUE)
+"""
+
+
+def memo_tmp_alias_write(args, root: Path, row: dict) -> None:
+    """Check writes in both directions between the macOS temporary path aliases."""
+    with tempfile.TemporaryDirectory(prefix="rcmake-memo-", dir="/tmp") as directory:
+        public = Path(directory)
+        private = Path("/private/tmp") / public.name
+        if not private.is_dir() or not public.samefile(private):
+            raise CasePrerequisite("The case requires matching /tmp and /private/tmp directories.")
+        for name, read, write in (("read_tmp", public, private), ("read_private_tmp", private, public)):
+            def prepare(lane_root):
+                suffix = Path(name) / lane_root.name
+                seed_memo_root(read / suffix)
+                return memo_path_variables(read_root=read / suffix, write_root=write / suffix)
+
+            memo_configures(args, root / name, row.setdefault(name, {}), prepare,
+                            MEMO_ALIAS_CHECKS, probes=2)
+
+
+def memo_directory_link_write(args, root: Path, row: dict) -> None:
+    """Write through a directory symlink after reading both spellings."""
+    def prepare(lane_root):
+        target, link = lane_root / "target", lane_root / "link"
+        seed_memo_root(target)
+        link.symlink_to(target, target_is_directory=True)
+        return memo_path_variables(read_root=target, write_root=link)
+
+    memo_configures(args, root, row, prepare, MEMO_ALIAS_CHECKS, probes=2)
+
+
+def memo_directory_rename(args, root: Path, row: dict) -> None:
+    """Check the renamed subtree and both parent listings in one configure."""
+    def prepare(lane_root):
+        old_parent, new_parent = lane_root / "old", lane_root / "new"
+        seed_memo_root(old_parent / "tree")
+        new_parent.mkdir()
+        (new_parent / "control").touch()
+        return memo_path_variables(old_parent=old_parent, new_parent=new_parent)
+
+    checks = r"""
+function(check_entries path expected)
+  file(GLOB entries RELATIVE "${path}" "${path}/*")
+  if(NOT entries STREQUAL expected)
+    message(FATAL_ERROR "Unexpected entries at ${path}. Found ${entries}.")
+  endif()
+endfunction()
+check_root("${old_parent}/tree" 0 "memo.h")
+check_entries("${old_parent}" "tree")
+check_entries("${new_parent}" "control")
+if(NOT IS_DIRECTORY "${old_parent}/tree" OR NOT EXISTS "${old_parent}/tree/memo.h")
+  message(FATAL_ERROR "Expected the source tree before the rename.")
+endif()
+if(EXISTS "${new_parent}/tree" OR EXISTS "${new_parent}/tree/memo.h")
+  message(FATAL_ERROR "Expected the rename destination to be absent.")
+endif()
+file(RENAME "${old_parent}/tree" "${new_parent}/tree")
+if(EXISTS "${old_parent}/tree" OR EXISTS "${old_parent}/tree/memo.h")
+  message(FATAL_ERROR "The old tree is still present.")
+endif()
+check_root("${new_parent}/tree" 0 "memo.h")
+check_entries("${old_parent}" "")
+check_entries("${new_parent}" "control;tree")
+"""
+    memo_configures(args, root, row, prepare, checks)
+
+
+def memo_process_write(args, root: Path, row: dict) -> None:
+    """Check facts for two roots after an unrestricted child process writes to both."""
+    def prepare(lane_root):
+        first, second = lane_root / "first", lane_root / "second"
+        seed_memo_root(first)
+        seed_memo_root(second)
+        return memo_path_variables(first=first, second=second)
+
+    checks = r"""
+check_root("${first}" 0 "memo.h")
+check_root("${second}" 0 "memo.h")
+@WRITE@
+check_root("${first}" 1 "added.txt;memo.h")
+check_root("${second}" 1 "added.txt;memo.h")
+"""
+    process_write = r"""
+execute_process(COMMAND [==[@PYTHON@]==] -c [=[
+from pathlib import Path
+import sys
+for root in map(Path, sys.argv[1:]):
+    (root / "memo.h").write_bytes(b"#define MEMO_VALUE 1\n")
+    (root / "added.txt").touch()
+]=] "${first}" "${second}" COMMAND_ERROR_IS_FATAL ANY)
+""".replace("@PYTHON@", sys.executable)
+    host_write = r"""
+foreach(root IN ITEMS "${first}" "${second}")
+  file(WRITE "${root}/memo.h" "#define MEMO_VALUE 1\n")
+  file(WRITE "${root}/added.txt" "")
+endforeach()
+"""
+    for name, write in (("process", process_write), ("host", host_write)):
+        memo_configures(args, root / name, row.setdefault(name, {}), prepare,
+                        checks.replace("@WRITE@", write))
+
+
+def cxx_headers(args, root: Path, row: dict) -> None:
+    """Check probe reuse and CMake parity for the header-heavy C and C++ project."""
+    if __package__:
+        from . import bench_configure as bench
+    else:
+        import bench_configure as bench
+
+    root.mkdir()
+    source = root / "source"
+    bench.cxx_headers_project(source)
+    backdate(*source.iterdir(), source)
+    store = root / "store"
+    env = bench.trial_env(bench.benchmark_env(clean_environment()), root)
+    env.update(CC=shlex.quote(args.compiler), CXX=shlex.quote(resolve_cxx(args)),
+               RCMAKE_PROBE_JOBS="1")
+    env = bench.observe_compilers(root, bench.with_store(env, store))
+    log = Path(env["RCMAKE_M6_PROBE_LOG"])
+    ninja = resolve_ninja(args)
+    calls = row["compiler_calls"] = {}
+    outputs = {}
+    settings = {}
+
+    def run_lane(name, *, oracle=False, no_cache=False):
+        build = root / name
+        bench.query_codemodel(build)
+        log.unlink(missing_ok=True)
+        flags = [f"-DCMAKE_MAKE_PROGRAM={ninja}"]
+        if no_cache:
+            flags.append("--no-probe-cache")
+        sample = bench.configure_sample(args.oracle if oracle else args.rcmake, source, build,
+                                        flags, root, "Ninja", env, args.timeout, timed=False)
+        bench.check_cxx_outputs(sample, source, build)
+        if sample.error:
+            raise ValueError(f"The {name} configure failed. {sample.error}")
+        calls[name] = bench.cxx_probe_calls(bench.compiler_inputs(log))
+        outputs[name] = sample.cxx_outputs
+        settings[name] = sample.toolchain
+        if name != "warm" and calls[name] != bench.CXX_COLD_CALLS:
+            raise ValueError(f"Unexpected compiler calls in the {name} lane. Found {calls[name]}.")
+
+    run_lane("cold")
+    if not args.smoke:
+        row["published"] = len(audit_store_entries(store))
+        if not row["published"]:
+            raise ValueError("The cold configure did not publish any probe entries.")
+        run_lane("warm")
+        hits = {kind: count - calls["warm"][kind] for kind, count in calls["cold"].items()}
+        row["probe_hits"] = hits
+        if hits["include"] < 1 or hits["symbol"] < 1 or min(hits.values()) < 0:
+            raise ValueError(f"Expected warm include and symbol probe hits. Found {hits}.")
+    run_lane("cache_off", no_cache=True)
+    run_lane("oracle", oracle=True)
+    for lane, result in outputs.items():
+        if result != outputs["oracle"]:
+            raise ValueError(f"The {lane} probe results or targets differ from CMake.")
+        if lane != "oracle" and settings[lane] != settings["cold"]:
+            raise ValueError(f"The {lane} toolchain settings differ from the cold configure.")
+
+
 def _stage_custom_cmake_root(source_root: Path, dest_root: Path) -> Path:
     """Copy vendored Modules/ and Templates/ into a mutable content-based CMAKE_ROOT."""
     dest_root.mkdir(parents=True, exist_ok=True)
@@ -2345,6 +2712,11 @@ class CaseSpec:
     group: str
     description: str
     runner: Callable | None = None
+    required_platform: str | None = None
+
+    def runs_on_host(self) -> bool:
+        """Report if the case can run on the current platform."""
+        return self.required_platform in (None, sys.platform)
 
 
 BASELINE_CASES: tuple[CaseSpec, ...] = (
@@ -2367,6 +2739,24 @@ EXTENDED_CASES: tuple[CaseSpec, ...] = (
     CaseSpec("ninja-swap", "G3", "extended",
              "Verify cache invalidation when the ninja executable content and version change.",
              ninja_swap),
+    CaseSpec("same-inode-header-rewrite", "G3", "extended",
+             "Recompile after a one-byte header rewrite that preserves the inode and mtime.",
+             same_inode_header_rewrite),
+    CaseSpec("memo-tmp-alias-write", "G3", "extended",
+             "Observe writes through the two macOS temporary directory paths.",
+             memo_tmp_alias_write, required_platform="darwin"),
+    CaseSpec("memo-directory-link-write", "G3", "extended",
+             "Observe writes through a directory symlink in the same configure.",
+             memo_directory_link_write),
+    CaseSpec("memo-directory-rename", "G3", "extended",
+             "Observe both parent directories and the subtree after a rename.",
+             memo_directory_rename),
+    CaseSpec("memo-process-write", "G3", "extended",
+             "Observe changes in two roots after an unrestricted process writes to them.",
+             memo_process_write),
+    CaseSpec("cxx-headers", "G3", "extended",
+             "Reuse header and symbol probes and compare the C and C++ project with CMake.",
+             cxx_headers),
     CaseSpec("flag-plugin", "G3", "extended",
              "Refuse to cache probes using plugin, linker, host-arch, or profile flags.",
              flag_plugin),
@@ -2496,14 +2886,6 @@ def format_case_list() -> str:
 
 def evaluate(args, root: Path, report: dict) -> None:
     """Check the fixture and run the selected cache cases."""
-    if sys.platform not in ("darwin", "linux"):
-        raise ValueError("This probe fixture requires macOS or Linux and a POSIX C compiler.")
-    version = run_command([args.oracle, "--version"], root, args.timeout, clean_environment())
-    if version["returncode"] or version["error"] or version["stdout"].splitlines()[:1] != ["cmake version 4.5.1"]:
-        raise ValueError(f"Expected the CMake 4.5.1 oracle. {version}")
-    candidate = run_command([args.rcmake, "--version"], root, args.timeout, clean_environment())
-    if candidate["returncode"] or candidate["error"] or "rcmake" not in candidate["stdout"].lower():
-        raise ValueError(f"Expected a staged Rcmake executable. {candidate}")
     selected = select_cases(
         smoke=args.smoke,
         cases=getattr(args, "case", None),
@@ -2512,10 +2894,22 @@ def evaluate(args, root: Path, report: dict) -> None:
         include_prelude=getattr(args, "include_prelude", False),
         all_cases=getattr(args, "all_cases", False),
     )
+    if any(spec.runs_on_host() for spec in selected):
+        if sys.platform not in ("darwin", "linux"):
+            raise ValueError("This probe fixture requires macOS or Linux and a POSIX C compiler.")
+        version = run_command([args.oracle, "--version"], root, args.timeout, clean_environment())
+        if version["returncode"] or version["error"] or version["stdout"].splitlines()[:1] != ["cmake version 4.5.1"]:
+            raise ValueError(f"Expected the CMake 4.5.1 oracle. {version}")
+        candidate = run_command([args.rcmake, "--version"], root, args.timeout, clean_environment())
+        if candidate["returncode"] or candidate["error"] or "rcmake" not in candidate["stdout"].lower():
+            raise ValueError(f"Expected a staged Rcmake executable. {candidate}")
     control_ready = True
     for spec in selected:
         row = {"case": spec.name, "gate": "Smoke" if args.smoke else spec.gate, "status": "passed"}
         report["cases"].append(row)
+        if not spec.runs_on_host():
+            row.update(status="skipped", reason="The case requires macOS.", passed=None)
+            continue
         if not control_ready:
             row.update(status="blocked", reason="The probe cache control failed.", passed=False)
             continue
@@ -2533,6 +2927,9 @@ def evaluate(args, root: Path, report: dict) -> None:
                 invalidation(args, root / spec.name, spec.name, row)
             else:
                 spec.runner(args, root / spec.name, row)
+        except CasePrerequisite as error:
+            row.update(status="skipped", reason=str(error), passed=None)
+            continue
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             row["status"] = "failed"
             row["error"] = str(error)
@@ -2579,7 +2976,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--oracle", default=os.environ.get("RCMAKE_ORACLE_CMAKE"))
     parser.add_argument("--cc", default=shutil.which("cc"))
     parser.add_argument("--cxx", default=None,
-                        help="Path to the POSIX C++ compiler for C++20 soundness traps.")
+                        help="Path to the POSIX C++ compiler for the C++ cases.")
     parser.add_argument("--ninja", default=None,
                         help="Path to the real ninja executable for Ninja-present lanes.")
     parser.add_argument("--generator", default="Ninja",
@@ -2615,10 +3012,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--rcmake, --out-json, and --out-md are required unless --list-cases is used.")
     if args.out_json.resolve() == args.out_md.resolve():
         parser.error("Use different paths for the JSON and Markdown reports.")
-    if args.timeout < 1 or not args.oracle or not args.cc:
-        parser.error("Set a positive timeout and specify or install the CMake oracle and C compiler.")
     try:
-        select_cases(
+        selected = select_cases(
             smoke=args.smoke,
             cases=args.case,
             extended=args.extended,
@@ -2628,6 +3023,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     except ValueError as error:
         parser.error(str(error))
+    needs_toolchain = any(spec.runs_on_host() for spec in selected)
+    if args.timeout < 1 or (needs_toolchain and (not args.oracle or not args.cc)):
+        parser.error("Set a positive timeout and specify or install the CMake oracle and C compiler.")
     report = {"mode": "smoke" if args.smoke else "gate", "seed": args.seed,
               "rcmake": args.rcmake, "oracle": args.oracle, "cases": []}
     if (not args.smoke and not args.case and not args.extended
@@ -2635,15 +3033,16 @@ def main(argv: list[str] | None = None) -> int:
         report["available_extended_cases"] = [spec.name for spec in EXTENDED_CASES]
         report["available_prelude_cases"] = [spec.name for spec in PRELUDE_CASES]
     try:
-        args.rcmake = executable(args.rcmake)
-        args.oracle = executable(args.oracle)
-        args.compiler = str(executable(args.cc))
+        if needs_toolchain:
+            args.rcmake = executable(args.rcmake)
+            args.oracle = executable(args.oracle)
+            args.compiler = str(executable(args.cc))
         with tempfile.TemporaryDirectory(prefix="rcmake-probes-") as directory:
             evaluate(args, Path(directory).resolve(), report)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report["error"] = str(error)
         print(error, file=sys.stderr)
-    report["passed"] = ("error" not in report and any(row["passed"] for row in report["cases"])
+    report["passed"] = ("error" not in report and bool(report["cases"])
                         and all(row["status"] in ("passed", "skipped") for row in report["cases"]))
     write_json(args.out_json, report)
     args.out_md.parent.mkdir(parents=True, exist_ok=True)
