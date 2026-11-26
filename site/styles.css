@@ -332,6 +332,17 @@ code, pre, kbd, .mono { font-family: var(--mono); font-variant-numeric: tabular-
   font: 500 var(--text-sm)/18px var(--mono); color: var(--ink-2);
 }
 .race-lane-head .lane-rcmake { color: var(--ink); }
+.race-lane-cmd {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  font: 500 var(--text-data)/18px var(--mono);
+  color: var(--ink);
+  overflow-x: auto;
+  white-space: pre;
+}
+.race-lane-cmd .term-out { color: var(--ink-3); }
 .race-lines {
   margin: 0; padding: 0; list-style: none;
   font: 400 var(--text-sm)/21px var(--mono); color: var(--ink-2);
@@ -427,6 +438,8 @@ code, pre, kbd, .mono { font-family: var(--mono); font-variant-numeric: tabular-
 .fuzz-num { font: 500 var(--text-heading)/28px var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.025em; color: var(--ink); white-space: nowrap; }
 .fuzz-bar { width: 100%; max-width: 112px; height: 2px; background: var(--s2); border-radius: 1px; overflow: hidden; }
 .fuzz-bar-fill { height: 100%; width: 100%; background: var(--pass); transform-origin: left center; transform: scaleX(1); transition: transform var(--dur-4) var(--ease-out); }
+.gauge-card[data-status="partial"] .fuzz-bar-fill { background: var(--partial); }
+.gauge-card[data-status="fail"] .fuzz-bar-fill { background: var(--fail); }
 .js [data-animate] .fuzz-bar-fill { transform: scaleX(0); }
 .js [data-animate].is-in .fuzz-bar-fill { transform: scaleX(1); }
 
@@ -454,9 +467,10 @@ code, pre, kbd, .mono { font-family: var(--mono); font-variant-numeric: tabular-
 
 /* Speed: flat hairline rows, no nested card boxes */
 .speed-panel { overflow: hidden; }
-.speed-group { display: grid; grid-template-columns: 232px minmax(0, 1fr); gap: 12px 24px; align-items: center; padding: 16px 24px; }
+.speed-group { display: grid; grid-template-columns: 264px minmax(0, 1fr); gap: 12px 24px; align-items: center; padding: 16px 24px; }
 .speed-group + .speed-group { border-top: 1px solid var(--line); }
-.speed-name { font: 500 var(--text-sm)/20px var(--sans); color: var(--ink); }
+.speed-name { display: flex; flex-direction: column; gap: 3px; font: 500 var(--text-sm)/20px var(--sans); color: var(--ink); }
+.speed-sub { font: 400 var(--text-data)/16px var(--mono); color: var(--ink-3); }
 .speed-lanes { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .speed-lane { display: grid; grid-template-columns: 96px minmax(0, 1fr) 128px; gap: 12px; align-items: center; }
 .speed-bin { font: 500 var(--text-data)/16px var(--mono); color: var(--ink-3); white-space: nowrap; }
@@ -488,14 +502,14 @@ code, pre, kbd, .mono { font-family: var(--mono); font-variant-numeric: tabular-
 .bench-table tbody tr.is-hidden { display: none; }
 .bench-table tbody tr.is-fading { opacity: 0; }
 .bench-table td.mono { font-size: var(--text-sm); }
-.cmp-col-bin { width: 230px; }
+.cmp-col-bin { width: 290px; }
 .cmp-group-note td { background: var(--bg); color: var(--ink-2); font: 400 var(--text-sm)/20px var(--sans); padding: 10px 16px; }
 .cmp-group-note td.mono { font: 500 var(--text-sm)/20px var(--mono); color: var(--ink); }
 [data-test="dash-giants-bench"] td:first-child { white-space: nowrap; }
 [data-test="dash-giants-summary"] td { border-top: 1px solid var(--line-strong); font-weight: 500; color: var(--ink); }
 .cmp-feat { display: inline-flex; align-items: center; gap: 8px; }
 .cmp-feat .i { color: var(--ink-2); }
-.cmp-cell { position: relative; font: 500 var(--text-sm)/18px var(--mono); white-space: nowrap; }
+.cmp-cell { position: relative; font: 500 var(--text-sm)/18px var(--mono); }
 .cmp-cell-diff { display: inline-flex; align-items: center; gap: 6px; font: 500 var(--text-data)/18px var(--mono); }
 .gen-stack { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 4px; }
 .os-cell { text-align: center; width: 76px; white-space: nowrap; }
@@ -715,6 +729,7 @@ code, pre, kbd, .mono { font-family: var(--mono); font-variant-numeric: tabular-
   transition: border-color var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out), background-color var(--dur-2) var(--ease-out);
 }
 .mode-badge.is-wasm { border-color: var(--pass); color: var(--pass); }
+.mode-badge.is-error { border-color: var(--fail); color: var(--fail); }
 .file-mod-dot {
   width: 6px; height: 6px; border-radius: 50%; background: var(--partial); flex-shrink: 0;
 }

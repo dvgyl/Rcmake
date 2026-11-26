@@ -8,7 +8,7 @@ export const PIPELINE_MODEL = {
     { id: "syntax", label: "syntax", colorVar: "var(--ch-r)", icon: "i-code", sentence: "Lexes and parses CMake language files.", crates: ["syntax"] },
     { id: "eval", label: "eval", colorVar: "var(--ch-r)", icon: "i-terminal", sentence: "Runs commands and tracks variables, policies, and generator expressions.", crates: ["eval", "commands", "expr", "genex", "model", "presets"] },
     { id: "resolve", label: "resolve", colorVar: "var(--ch-g)", icon: "i-target", sentence: "Builds the target graph, usage requirements, and link order.", crates: ["resolve", "build", "cxxmodules", "fortran", "cps"] },
-    { id: "gen", label: "gen", colorVar: "var(--ch-b)", icon: "i-graph", sentence: "Writes build.ninja, Makefiles, project.pbxproj, and .vcxproj files.", crates: ["gen-common", "gen-ninja", "gen-make", "gen-xcode", "gen-vs"] }
+    { id: "gen", label: "gen", colorVar: "var(--ch-b)", icon: "i-graph", sentence: "Writes build.ninja, Unix Makefiles, project.pbxproj, and .vcxproj files.", crates: ["gen-common", "gen-ninja", "gen-make", "gen-xcode", "gen-vs"] }
   ],
   outputs: ["build.ninja", "Makefile", "project.pbxproj", ".sln .vcxproj"],
   hosts: {

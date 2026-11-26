@@ -46,6 +46,7 @@ const state = {
   autoSwitchedToDiag: false,
   activeGenFile: "build.ninja",
   lastResult: null,
+  runtimeError: null,
   explainSymbol: "",
   explainReport: null,
   showRawJson: false,
@@ -97,11 +98,15 @@ function formatMs(ms) {
 function updateModeBadge(mode, durationMs = null) {
   const wasm = mode === "wasm";
   els.modeBadge.classList.toggle("is-wasm", wasm);
-  els.modeBadge.classList.toggle("is-preview", mode === "preview");
+  els.modeBadge.classList.toggle("is-error", mode === "error");
   const timing = wasm && typeof durationMs === "number" && Number.isFinite(durationMs)
     ? ` \u00b7 ${formatMs(durationMs)}`
     : "";
-  const label = mode === "loading" ? "loading" : wasm ? `wasm${timing}` : "preview";
+  const label = mode === "loading"
+    ? "loading"
+    : wasm
+      ? `wasm \u00b7 engine ${adapter.engineCommit}${timing}`
+      : "wasm error";
   if (els.modeBadgeText) els.modeBadgeText.textContent = label;
   else els.modeBadge.textContent = label;
 }
@@ -467,8 +472,22 @@ function renderExplainTab(res) {
 
 async function explain(sym) {
   state.explainSymbol = sym;
-  state.explainReport = await adapter.explain(sym, { config: state.buildType });
+  if (adapter.mode !== "wasm") {
+    state.explainReport = null;
+    renderInspector();
+    return;
+  }
+  try {
+    state.explainReport = await adapter.explain(sym, { config: state.buildType });
+  } catch (err) {
+    state.runtimeError = err instanceof Error ? err.message : String(err);
+    state.explainReport = null;
+  }
   renderInspector();
+}
+
+function renderRuntimeError(message) {
+  return `<div class="diag-row" data-diag-severity="error" data-test="wasm-load-error"><span class="st-fail"><svg class="i" aria-hidden="true"><use href="#i-cross"/></svg><span class="visually-hidden">error</span></span><div class="diag-msg">${escapeHtml(message)}<span class="diag-cat">WebAssembly runtime unavailable. Serve the site over HTTP with WebAssembly enabled and retry.</span></div><div></div></div>`;
 }
 
 function renderInspector(fade = false) {
@@ -478,19 +497,23 @@ function renderInspector(fade = false) {
   const genFiles = orderedGenFiles(res);
   els.fileTabName.textContent = genFiles.includes("build.ninja") ? "build.ninja" : (f?.name || "build.ninja");
   if (els.fileCount) els.fileCount.textContent = genFiles.length > 1 ? String(genFiles.length) : "";
-  const showCopy = (state.activeTab === "ninja" && Boolean(f)) || (state.activeTab === "explain" && state.showRawJson && Boolean(state.explainReport));
+  const showCopy = !state.runtimeError && ((state.activeTab === "ninja" && Boolean(f)) || (state.activeTab === "explain" && state.showRawJson && Boolean(state.explainReport)));
   els.copyBtn.hidden = !showCopy;
   if (els.outputActions) els.outputActions.hidden = !showCopy;
   const diags = res?.diagnostics || [];
   const errCount = diags.filter((d) => d.severity === "error").length;
-  els.diagCount.textContent = res ? String(diags.length) : "";
-  els.diagCount.classList.toggle("is-error", errCount > 0);
+  els.diagCount.textContent = state.runtimeError ? "1" : res ? String(diags.length) : "";
+  els.diagCount.classList.toggle("is-error", Boolean(state.runtimeError) || errCount > 0);
   els.targetCount.textContent = res ? String(res.targets?.length ?? 0) : "";
 
   const views = { diagnostics: renderDiagnostics, targets: renderTargets, ninja: renderGenerated, explain: renderExplainTab };
   if (fade && !prefersReducedMotion()) {
     els.body.classList.add("is-fading");
     requestAnimationFrame(() => els.body.classList.remove("is-fading"));
+  }
+  if (state.runtimeError) {
+    els.body.innerHTML = renderRuntimeError(state.runtimeError);
+    return;
   }
   els.body.innerHTML = (views[state.activeTab] || renderGenerated)(res);
   els.body.querySelectorAll("[data-jump-line]").forEach((b) => b.addEventListener("click", () => jumpTo(b.dataset.jumpFile, b.dataset.jumpLine, b.dataset.jumpCol)));
@@ -544,6 +567,15 @@ async function runConfigure() {
   syncEditor();
   setRunning(true);
   try {
+    if (adapter.mode !== "wasm") {
+      const retry = await adapter.load(BUNDLE_URL);
+      updateModeBadge(retry.mode);
+      els.modeBadge.title = adapter.loadReason;
+      if (retry.mode !== "wasm") {
+        throw new Error(adapter.loadReason);
+      }
+    }
+    state.runtimeError = null;
     const res = await adapter.configure(state.files, { exampleId: state.exampleId, generator: state.generator, buildType: state.buildType });
     state.lastResult = res;
     updateModeBadge(res.mode, res.durationMs);
@@ -575,15 +607,23 @@ async function runConfigure() {
         }
       }
       state.explainReport = report;
-      els.runStatus.textContent = res.mode === "wasm" ? `configured in ${formatMs(res.durationMs)}` : "precomputed output";
-      els.runStatus.classList.toggle("st-pass", res.mode === "wasm");
+      els.runStatus.textContent = `configured in ${formatMs(res.durationMs)}`;
+      els.runStatus.classList.add("st-pass");
       els.runStatus.classList.remove("st-fail");
     }
     const n = res.targets?.length ?? 0;
     els.runSummary.textContent = `${n} ${n === 1 ? "target" : "targets"} \u00b7 ${state.generator} \u00b7 ${state.buildType}`;
   } catch (err) {
-    els.runStatus.textContent = `error: ${err instanceof Error ? err.message : String(err)}`;
+    const message = err instanceof Error ? err.message : String(err);
+    state.runtimeError = message;
+    state.lastResult = null;
+    state.explainReport = null;
+    state.activeTab = "diagnostics";
+    updateModeBadge("error");
+    els.runStatus.textContent = message;
     els.runStatus.classList.add("st-fail");
+    els.runStatus.classList.remove("st-pass");
+    els.runSummary.textContent = "";
   } finally {
     setRunning(false);
   }
@@ -719,9 +759,17 @@ async function init() {
 
   updateModeBadge("loading");
   const info = await adapter.load(BUNDLE_URL);
-  const wasm = info.mode === "wasm";
   updateModeBadge(info.mode);
-  els.modeBadge.title = adapter.loadReason || (wasm ? info.url : `Preview mode (${info.reason || "bundle pending"})`);
+  els.modeBadge.title = adapter.loadReason;
+  if (info.mode !== "wasm") {
+    state.runtimeError = adapter.loadReason;
+    state.activeTab = "diagnostics";
+    els.runStatus.textContent = adapter.loadReason;
+    els.runStatus.classList.add("st-fail");
+    els.runSummary.textContent = "";
+    renderInspector(false);
+    return;
+  }
   await runConfigure();
 }
 

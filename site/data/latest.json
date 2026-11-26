@@ -5,28 +5,28 @@
   "commit": null,
   "rcmakeVersion": "0.1.0",
   "targetCmakeVersion": "4.5.1",
-  "statusNote": "[FINAL_METRIC] Verified soundness gates (fuzzing and WASI) are recorded. Remaining metrics populate automatically on the v0.1.0 release verification run.",
+  "statusNote": "Pre-freeze baseline results for seeded generative fuzzing and WASI are recorded with their source commit and date. All frozen release metrics populate on the v0.1.0 release verification run.",
   "tracks": {
     "coreConformance": {
-      "label": "Core-62 Conformance",
+      "label": "Core suites",
       "status": "pending",
       "suitesTotal": 62,
       "suitesAt100": null,
       "casesPassed": null,
       "casesTotal": null,
       "passRate": null,
-      "note": "[FINAL_METRIC] Unified Core-62 differential replay pending final frozen binary.",
+      "note": "Core suites differential replay pending v0.1.0 release verification run.",
       "highlights": [
-        { "suite": "CommandLine", "passed": null, "total": null, "status": "pending", "note": "[FINAL_METRIC]" },
-        { "suite": "CMakePresets", "passed": null, "total": null, "status": "pending", "note": "[FINAL_METRIC]" },
-        { "suite": "CTestCommandLine", "passed": null, "total": null, "status": "pending", "note": "[FINAL_METRIC]" },
-        { "suite": "CPack", "passed": null, "total": null, "status": "pending", "note": "[FINAL_METRIC]" },
-        { "suite": "CommandLineTar", "passed": null, "total": null, "status": "pending", "note": "[FINAL_METRIC]" },
-        { "suite": "File_Archive", "passed": null, "total": null, "status": "pending", "note": "[FINAL_METRIC]" },
-        { "suite": "Instrumentation", "passed": null, "total": null, "status": "pending", "note": "[FINAL_METRIC]" },
-        { "suite": "SarifOutput", "passed": null, "total": null, "status": "pending", "note": "[FINAL_METRIC]" },
-        { "suite": "cmake_language", "passed": null, "total": null, "status": "pending", "note": "[FINAL_METRIC]" },
-        { "suite": "GoogleTest", "passed": null, "total": null, "status": "pending", "note": "[FINAL_METRIC]" }
+        { "suite": "CommandLine", "passed": null, "total": null, "status": "pending" },
+        { "suite": "CMakePresets", "passed": null, "total": null, "status": "pending" },
+        { "suite": "CTestCommandLine", "passed": null, "total": null, "status": "pending" },
+        { "suite": "CPack", "passed": null, "total": null, "status": "pending" },
+        { "suite": "CommandLineTar", "passed": null, "total": null, "status": "pending" },
+        { "suite": "File_Archive", "passed": null, "total": null, "status": "pending" },
+        { "suite": "Instrumentation", "passed": null, "total": null, "status": "pending" },
+        { "suite": "SarifOutput", "passed": null, "total": null, "status": "pending" },
+        { "suite": "cmake_language", "passed": null, "total": null, "status": "pending" },
+        { "suite": "GoogleTest", "passed": null, "total": null, "status": "pending" }
       ]
     },
     "policies": {
@@ -39,12 +39,12 @@
       "casesPassed": null,
       "casesTotal": null,
       "passRate": null,
-      "note": "[FINAL_METRIC] Full CMP0066-CMP0226 policy suite replay pending v0.1.0 release verification run."
+      "note": "CMP0000-CMP0065 are always NEW in CMake 4.x. 56 upstream policy suites test the 161 active policies (CMP0066-CMP0226); run pending v0.1.0 release verification."
     },
     "runCmakeOs": {
-      "label": "Full OS-Applicable Tests/RunCMake",
+      "label": "Tests/RunCMake by OS",
       "status": "pending",
-      "note": "[FINAL_METRIC] Full 3-OS upstream Tests/RunCMake verification pending final frozen binary.",
+      "note": "Full 3-OS upstream Tests/RunCMake verification pending v0.1.0 release verification run.",
       "platforms": [
         {
           "id": "macos-arm64",
@@ -56,7 +56,7 @@
           "casesTotal": null,
           "passRate": null,
           "status": "pending",
-          "note": "[FINAL_METRIC] macOS arm64 full RunCMake suite run pending."
+          "note": "macOS arm64 RunCMake suite run pending v0.1.0 release verification."
         },
         {
           "id": "linux-x86_64",
@@ -68,7 +68,7 @@
           "casesTotal": null,
           "passRate": null,
           "status": "pending",
-          "note": "[FINAL_METRIC] Linux x86_64 full RunCMake suite run pending."
+          "note": "Linux x86_64 RunCMake suite run pending v0.1.0 release verification."
         },
         {
           "id": "windows-x86_64",
@@ -80,17 +80,17 @@
           "casesTotal": null,
           "passRate": null,
           "status": "pending",
-          "note": "[FINAL_METRIC] Windows x86_64 full RunCMake suite run pending."
+          "note": "Windows x86_64 RunCMake suite run pending v0.1.0 release verification."
         }
       ]
     },
     "bossFight": {
-      "label": "10 Boss-Fight Giants",
+      "label": "Large projects",
       "status": "pending",
       "projectsTotal": 10,
       "l1Passed": null,
       "l2Passed": null,
-      "note": "[FINAL_METRIC] L1 configure parity and L2 Ninja dry-run parity pending final frozen binary.",
+      "note": "L1 checks configure success and stderr parity with CMake 4.5.1. L2 checks CMakeCache.txt, Ninja build-graph dry-run, and File API parity for the listed targets. Pending v0.1.0 release verification run.",
       "projects": [
         {
           "name": "duckdb",
@@ -99,8 +99,7 @@
           "tier": "standard",
           "targets": ["duckdb", "shell"],
           "l1": "pending",
-          "l2": "pending",
-          "note": "[FINAL_METRIC]"
+          "l2": "pending"
         },
         {
           "name": "opencv",
@@ -109,8 +108,7 @@
           "tier": "standard",
           "targets": ["opencv_core", "opencv_imgproc", "opencv_imgcodecs"],
           "l1": "pending",
-          "l2": "pending",
-          "note": "[FINAL_METRIC]"
+          "l2": "pending"
         },
         {
           "name": "vtk",
@@ -119,8 +117,7 @@
           "tier": "large",
           "targets": ["CommonCore", "FiltersCore"],
           "l1": "pending",
-          "l2": "pending",
-          "note": "[FINAL_METRIC]"
+          "l2": "pending"
         },
         {
           "name": "qtbase",
@@ -129,8 +126,7 @@
           "tier": "large",
           "targets": ["Core", "Network"],
           "l1": "pending",
-          "l2": "pending",
-          "note": "[FINAL_METRIC]"
+          "l2": "pending"
         },
         {
           "name": "llvm-project",
@@ -139,8 +135,7 @@
           "tier": "large",
           "targets": ["clang"],
           "l1": "pending",
-          "l2": "pending",
-          "note": "[FINAL_METRIC]"
+          "l2": "pending"
         },
         {
           "name": "pytorch",
@@ -149,8 +144,7 @@
           "tier": "large",
           "targets": ["torch_cpu"],
           "l1": "pending",
-          "l2": "pending",
-          "note": "[FINAL_METRIC]"
+          "l2": "pending"
         },
         {
           "name": "kcoreaddons",
@@ -159,8 +153,7 @@
           "tier": "large",
           "targets": ["KF6CoreAddons"],
           "l1": "pending",
-          "l2": "pending",
-          "note": "[FINAL_METRIC]"
+          "l2": "pending"
         },
         {
           "name": "boost",
@@ -169,8 +162,7 @@
           "tier": "standard",
           "targets": ["boost_filesystem"],
           "l1": "pending",
-          "l2": "pending",
-          "note": "[FINAL_METRIC]"
+          "l2": "pending"
         },
         {
           "name": "rclcpp",
@@ -179,8 +171,7 @@
           "tier": "standard",
           "targets": ["rclcpp"],
           "l1": "pending",
-          "l2": "pending",
-          "note": "[FINAL_METRIC]"
+          "l2": "pending"
         },
         {
           "name": "blender",
@@ -189,20 +180,19 @@
           "tier": "large",
           "targets": ["blender"],
           "l1": "pending",
-          "l2": "pending",
-          "note": "[FINAL_METRIC]"
+          "l2": "pending"
         }
       ]
     },
     "unseenHoldout": {
-      "label": "Sealed 240-Repo Unseen Holdout",
+      "label": "Blind holdout (240 sealed repositories)",
       "sealed": true,
       "status": "pending",
       "reposTotal": 240,
       "reposPassed": null,
       "passRate": null,
       "policy": "Blind holdout corpus. Individual repository identities are never published; only aggregate pass rates and category counts are reported.",
-      "note": "[FINAL_METRIC] Aggregate pass rate and category breakdown pending final frozen binary.",
+      "note": "Aggregate pass rate and category breakdown pending v0.1.0 release verification run.",
       "categories": [
         { "category": "Core C/C++ Libraries", "reposTotal": null, "reposPassed": null, "passRate": null, "status": "pending" },
         { "category": "Networking, Crypto & IPC", "reposTotal": null, "reposPassed": null, "passRate": null, "status": "pending" },
@@ -213,7 +203,7 @@
       ]
     },
     "vcpkgMatrix": {
-      "label": "64-Shard vcpkg Ecosystem Matrix",
+      "label": "vcpkg ports (64 shards)",
       "status": "pending",
       "shardsTotal": 64,
       "shardsCompleted": 0,
@@ -221,162 +211,174 @@
       "portsTotal": null,
       "portsPassed": null,
       "passRate": null,
-      "note": "[FINAL_METRIC] 64-shard vcpkg registry matrix pending final frozen binary.",
+      "note": "64-shard vcpkg registry matrix pending v0.1.0 release verification run.",
       "shards": [
-        { "shard": 0, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 1, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 2, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 3, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 4, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 5, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 6, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 7, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 8, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 9, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 10, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 11, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 12, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 13, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 14, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 15, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 16, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 17, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 18, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 19, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 20, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 21, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 22, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 23, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 24, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 25, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 26, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 27, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 28, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 29, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 30, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 31, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 32, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 33, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 34, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 35, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 36, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 37, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 38, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 39, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 40, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 41, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 42, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 43, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 44, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 45, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 46, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 47, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 48, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 49, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 50, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 51, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 52, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 53, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 54, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 55, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 56, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 57, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 58, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 59, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 60, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 61, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 62, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" },
-        { "shard": 63, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null, "note": "[FINAL_METRIC]" }
+        { "shard": 0, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 1, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 2, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 3, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 4, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 5, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 6, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 7, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 8, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 9, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 10, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 11, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 12, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 13, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 14, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 15, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 16, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 17, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 18, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 19, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 20, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 21, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 22, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 23, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 24, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 25, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 26, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 27, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 28, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 29, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 30, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 31, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 32, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 33, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 34, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 35, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 36, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 37, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 38, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 39, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 40, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 41, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 42, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 43, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 44, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 45, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 46, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 47, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 48, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 49, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 50, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 51, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 52, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 53, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 54, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 55, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 56, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 57, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 58, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 59, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 60, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 61, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 62, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null },
+        { "shard": 63, "status": "pending", "portsTotal": null, "portsPassed": null, "portsFailed": null, "durationSeconds": null }
       ]
     },
     "benchmarksAndGates": {
-      "label": "Real-World Benchmarks & Soundness Gates",
+      "label": "Benchmarks and soundness gates",
       "benchmarks": {
         "warmProbeSpeedup": {
-          "label": "Warm-Probe Configure Speedup",
+          "label": "New tree, shared probe cache",
           "value": null,
           "unit": "x",
-          "baseline": "vs CMake 4.5.1 (persistent probe cache)",
+          "baseline": "vs CMake 4.5.1 new build tree (CMake has no cross-tree probe cache)",
           "status": "pending",
-          "note": "[FINAL_METRIC] Measured across real-world corpus on idle hardware."
+          "note": "Pending v0.1.0 release verification run."
         },
         "incrementalLeafP95Ms": {
-          "label": "Incremental Leaf Reconfigure (p95)",
+          "label": "Leaf edit reconfigure (p95)",
           "value": null,
           "unit": "ms",
           "baseline": "single-file change replay",
           "status": "pending",
-          "note": "[FINAL_METRIC] Measured p95 latency for incremental replay."
+          "note": "Pending v0.1.0 release verification run."
         },
         "coldConfigureSpeedup": {
-          "label": "Cold 500-Target Configure",
+          "label": "Cold 500-target configure (empty probe cache)",
           "value": null,
           "unit": "x",
-          "baseline": "vs CMake 4.5.1",
+          "baseline": "vs CMake 4.5.1, synthetic 500-library C project",
           "status": "pending",
-          "note": "[FINAL_METRIC] Measured cold configure speedup on final release binary."
+          "note": "Pending v0.1.0 release verification run."
         },
         "peakRssMiB": {
-          "label": "500-Target Peak RSS",
+          "label": "500-target peak RSS",
           "value": null,
           "unit": "MiB",
-          "baseline": "native release binary",
+          "baseline": "native release binary, cold configure",
           "status": "pending",
-          "note": "[FINAL_METRIC] Measured peak resident memory on final release binary."
+          "note": "Pending v0.1.0 release verification run."
         }
       },
       "gates": [
         {
           "id": "fuzz",
-          "label": "Adversarial fuzzing",
+          "label": "Seeded generative fuzzing (14 formats, 0 panics)",
           "status": "pass",
+          "preFreeze": true,
+          "commit": "d4356df",
+          "measuredAt": "2026-11-25",
           "passed": 14000000,
           "total": 14000000,
           "failures": 0,
-          "summary": "14 parser and format targets",
-          "detail": "Safe-Rust property and adversarial corpus across 14 parser and format surfaces with zero panics or crashes."
+          "summary": "Pre-freeze baseline (commit d4356df, 2026-11-25): 14 formats, 1M seeded inputs each, 0 panics",
+          "detail": "Seeded generative fuzzing (not coverage-guided) across 14 parser and format targets, 1,000,000 inputs each, with 0 panics, timeouts, or limit violations. Recorded pre-freeze at commit d4356df on 2026-11-25; frozen v0.1.0 re-run pending."
         },
         {
           "id": "wasi",
           "label": "WebAssembly and WASI gate",
           "status": "pass",
+          "preFreeze": true,
+          "commit": "c583dc2",
+          "measuredAt": "2026-11-25",
           "passed": 6,
           "total": 6,
           "failures": 0,
-          "summary": "wasm32 and WASI checks",
-          "detail": "Verified wasm32-unknown-unknown and wasm32-wasip1 dependency audits, compilation, and Wasmtime PureHost execution."
+          "summary": "Pre-freeze baseline (commit c583dc2, 2026-11-25): 6 wasm32 and WASI checks",
+          "detail": "Pre-freeze baseline verified wasm32-unknown-unknown and wasm32-wasip1 dependency audits, compilation, and Wasmtime PureHost execution at commit c583dc2 on 2026-11-25; frozen v0.1.0 re-run pending."
         },
         {
           "id": "probe-cache",
           "label": "Persistent probe cache",
           "status": "pending",
+          "commit": null,
+          "measuredAt": null,
           "passed": null,
           "total": 16,
           "failures": null,
           "summary": "16 invalidation checks",
-          "detail": "[FINAL_METRIC] Cross-project probe cache invalidation, compiler fingerprint, and negative-cache checks."
+          "detail": "Cross-project probe cache invalidation, compiler fingerprint, and negative-cache checks. Pending v0.1.0 release verification run."
         },
         {
           "id": "mutation-replay",
           "label": "Mutation replay soundness",
           "status": "pending",
+          "commit": null,
+          "measuredAt": null,
           "passed": null,
           "total": 20,
           "failures": null,
           "summary": "20 incremental edit checks",
-          "detail": "[FINAL_METRIC] Incremental graph mutation replay verified byte-equivalent to clean configures."
+          "detail": "Incremental graph mutation replay verified equivalent to clean configures. Pending v0.1.0 release verification run."
         },
         {
           "id": "blackbox",
           "label": "Black-box scenario suite",
           "status": "pending",
+          "commit": null,
+          "measuredAt": null,
           "passed": null,
           "total": 679,
           "scenariosPassed": null,
           "scenariosTotal": 20,
           "failures": null,
           "summary": "20 scenarios, 679 checks",
-          "detail": "[FINAL_METRIC] Independent drop-in CLI, multi-generator, install, ctest, and cpack scenarios."
+          "detail": "Independent drop-in CLI, multi-generator, install, ctest, and cpack scenarios. Pending v0.1.0 release verification run."
         }
       ]
     }

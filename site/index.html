@@ -113,12 +113,12 @@
                 </button>
               </div>
               <div class="term-body">
-                <pre class="term-panel" id="panel-install" role="tabpanel" aria-labelledby="tab-install"><span class="term-prompt">$ </span><span data-line>git clone https://github.com/dvgyl/rcmake</span>
-<span class="term-prompt">$ </span><span data-line>rcmake/scripts/install.sh</span></pre>
+                <pre class="term-panel" id="panel-install" role="tabpanel" aria-labelledby="tab-install"><span class="term-prompt">$ </span><span data-line>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash</span>
+<span class="term-out"># installs rcmake, rcmake-lsp, completions, and man page into ~/.local</span></pre>
                 <pre class="term-panel" id="panel-source" role="tabpanel" aria-labelledby="tab-source" hidden><span class="term-prompt">$ </span><span data-line>git clone https://github.com/dvgyl/rcmake</span>
 <span class="term-prompt">$ </span><span data-line>cd rcmake &amp;&amp; RCMAKE_STAGE_PROFILE=release scripts/stage.sh</span>
 <span class="term-prompt">$ </span><span data-line>./target/stage/bin/rcmake --version</span></pre>
-                <pre class="term-panel" id="panel-alias" role="tabpanel" aria-labelledby="tab-alias" hidden><span class="term-prompt">$ </span><span data-line>rcmake/scripts/install.sh --alias-cmake</span>
+                <pre class="term-panel" id="panel-alias" role="tabpanel" aria-labelledby="tab-alias" hidden><span class="term-prompt">$ </span><span data-line>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash -s -- --alias-cmake</span>
 <span class="term-prompt">$ </span><span data-line>export PATH="$HOME/.local/bin:$PATH"</span>
 <span class="term-out"># symlinks cmake, ctest, cpack -> rcmake; keep ~/.local/bin first on PATH</span></pre>
               </div>
@@ -127,25 +127,25 @@
         </div>
 
         <div class="hero-stage">
-          <figure class="race" id="race-widget" data-animate data-test="race-widget" aria-label="Same command, two binaries. Configure comparison between CMake 4.5.1 and rcmake.">
+          <figure class="race" id="race-widget" data-animate data-test="race-widget" aria-label="CMake 4.5.1 and rcmake on the same project. Configure comparison between CMake 4.5.1 and rcmake.">
             <div class="race-head">
-              <span class="race-title"><svg class="i" aria-hidden="true"><use href="#i-parity"/></svg>Same command, two binaries</span>
+              <span class="race-title"><svg class="i" aria-hidden="true"><use href="#i-parity"/></svg>CMake 4.5.1 and rcmake on the same project</span>
               <div class="seg" role="group" aria-label="Comparison modes" id="race-modes" data-test="race-modes">
-                <button type="button" aria-pressed="true" data-race-mode="warm">Warm configure</button>
+                <button type="button" aria-pressed="true" data-race-mode="warm">New tree, probe cache</button>
                 <button type="button" aria-pressed="false" data-race-mode="leaf">Leaf edit</button>
                 <button type="button" aria-pressed="false" data-race-mode="cold">Cold, 500 targets</button>
               </div>
             </div>
-            <div class="race-cmd" id="race-cmd" data-test="race-cmd"><span class="term-prompt">$ </span>cmake -S . -B build -G Ninja</div>
             <div class="race-lanes">
               <div class="race-lane" data-test="race-lane-cmake">
                 <div class="race-lane-head"><span>cmake 4.5.1</span><span class="dim" id="race-cmake-tag">reference</span></div>
+                <div class="race-lane-cmd" id="race-cmd-cmake" data-test="race-cmd-cmake"><span class="term-prompt">$ </span>cmake -S . -B build-2 -G Ninja</div>
                 <ol class="race-lines" id="race-lines-cmake">
                   <li style="--line-idx:0">-- The CXX compiler identification is AppleClang</li>
                   <li style="--line-idx:1">-- Detecting CXX compiler ABI info - done</li>
                   <li style="--line-idx:2">-- Configuring done</li>
                   <li style="--line-idx:3">-- Generating done</li>
-                  <li style="--line-idx:4">-- Build files have been written to: build</li>
+                  <li style="--line-idx:4">-- Build files have been written to: &lt;project&gt;/build-2</li>
                 </ol>
                 <div class="race-bar-wrap" id="race-bar-cmake" data-test="race-bar-cmake" data-status="pending">
                   <div class="bar-track is-pending" data-loop></div>
@@ -153,13 +153,14 @@
                 </div>
               </div>
               <div class="race-lane" data-test="race-lane-rcmake">
-                <div class="race-lane-head"><span class="lane-rcmake">rcmake</span><span class="dim" id="race-rcmake-tag">identical output</span></div>
+                <div class="race-lane-head"><span class="lane-rcmake">rcmake</span><span class="dim" id="race-rcmake-tag">same build files</span></div>
+                <div class="race-lane-cmd" id="race-cmd-rcmake" data-test="race-cmd-rcmake"><span class="term-prompt">$ </span>rcmake -S . -B build-2 -G Ninja</div>
                 <ol class="race-lines" id="race-lines-rcmake">
                   <li style="--line-idx:0">-- The CXX compiler identification is AppleClang</li>
                   <li style="--line-idx:1">-- Detecting CXX compiler ABI info - done</li>
                   <li style="--line-idx:2">-- Configuring done</li>
                   <li style="--line-idx:3">-- Generating done</li>
-                  <li style="--line-idx:4">-- Build files have been written to: build</li>
+                  <li style="--line-idx:4">-- Build files have been written to: &lt;project&gt;/build-2</li>
                 </ol>
                 <div class="race-bar-wrap" id="race-bar-rcmake" data-test="race-bar-rcmake" data-status="pending">
                   <div class="bar-track is-pending" data-loop></div>
@@ -168,7 +169,7 @@
               </div>
             </div>
             <div class="race-foot">
-              <span id="race-caption" data-test="race-caption">Timings appear after the v0.1.0 release verification run.</span>
+              <span id="race-caption" data-test="race-caption">New build tree: rcmake uses its shared probe cache; CMake 4.5.1 has no cross-tree cache. Timings appear after the v0.1.0 release verification run.</span>
               <button type="button" class="ctrl-btn" id="race-replay" aria-label="Replay comparison" data-test="race-replay">
                 <svg class="i" aria-hidden="true"><use href="#i-replay"/></svg>
                 <span>Replay</span>
@@ -251,8 +252,8 @@
               <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
             </tr>
             <tr class="cmp-row" data-group="same" style="--row-i:4">
-              <td>Policies <code data-policy-range>CMP0066-CMP0226</code></td>
-              <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
+              <td>Policies <code data-policy-range>CMP0066-CMP0226</code> <span class="muted">(<code>CMP0000-CMP0065</code> always NEW)</span></td>
+              <td class="cmp-cell" data-cmp-gate="policies"><span class="cmp-cell-diff st-pending"><svg class="i" aria-hidden="true"><use href="#i-pending"/></svg><span>implemented, release verification pending</span></span></td>
               <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
             </tr>
             <tr class="cmp-row" data-group="same" style="--row-i:5">
@@ -261,14 +262,14 @@
               <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
             </tr>
             <tr class="cmp-row" data-group="same" style="--row-i:6">
-              <td>Ninja, Makefiles, Xcode, and Visual Studio generators</td>
-              <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
+              <td>Ninja, Unix Makefiles, Xcode, and Visual Studio 2022/2026 generators</td>
+              <td class="cmp-cell" data-cmp-gate="generators"><span class="cmp-cell-diff st-pending"><svg class="i" aria-hidden="true"><use href="#i-pending"/></svg><span>implemented, release verification pending</span></span></td>
               <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
             </tr>
 
             <tr class="cmp-row" data-group="different" style="--row-i:7">
               <td><span class="cmp-feat"><svg class="i" aria-hidden="true"><use href="#i-forbid"/></svg>Written in</span></td>
-              <td class="cmp-cell">Rust, no <code>unsafe</code></td>
+              <td class="cmp-cell">Safe Rust (C codecs: zstd, liblzma)</td>
               <td class="cmp-cell muted">C++</td>
             </tr>
             <tr class="cmp-row" data-group="different" style="--row-i:8">
@@ -292,13 +293,13 @@
             </tr>
             <tr class="cmp-row" data-group="rcmake-only" style="--row-i:11">
               <td><span class="cmp-feat"><svg class="i" aria-hidden="true"><use href="#i-replay"/></svg>Reconfigure after a one-file edit</span></td>
-              <td class="cmp-cell">replays the change</td>
+              <td class="cmp-cell">re-runs the edited file, replays the rest</td>
               <td class="cmp-cell muted">full reconfigure</td>
             </tr>
             <tr class="cmp-row" data-group="rcmake-only" style="--row-i:12">
               <td><span class="cmp-feat"><svg class="i" aria-hidden="true"><use href="#i-tree"/></svg>Where a value came from</span></td>
               <td class="cmp-cell"><code>rcmake explain</code></td>
-              <td class="cmp-cell muted"><code>--trace</code> log</td>
+              <td class="cmp-cell muted"><code>--trace-format=json-v1</code>, File API backtraces</td>
             </tr>
             <tr class="cmp-row" data-group="rcmake-only" style="--row-i:13">
               <td><span class="cmp-feat" title="Audit environment, file, subprocess, and network inputs (warn or strict)"><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg><code>--hermetic</code></span></td>
@@ -341,6 +342,21 @@
               <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
               <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
             </tr>
+            <tr class="cmp-row" data-group="not-in-rcmake" style="--row-i:21">
+              <td><code>MinGW Makefiles</code>, <code>NMake Makefiles</code>, and <code>MSYS Makefiles</code></td>
+              <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
+              <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
+            </tr>
+            <tr class="cmp-row" data-group="not-in-rcmake" style="--row-i:22">
+              <td>Visual Studio 2015-2019 generators</td>
+              <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
+              <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
+            </tr>
+            <tr class="cmp-row" data-group="not-in-rcmake" style="--row-i:23">
+              <td>CPack <code>DEB</code>, <code>RPM</code>, <code>NSIS</code>, <code>WIX</code>, <code>productbuild</code>, and <code>IFW</code></td>
+              <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
+              <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
+            </tr>
           </tbody>
         </table>
       </div>
@@ -349,7 +365,7 @@
     <section class="container band" id="pipeline">
       <div class="band-head">
         <h2>Inside a configure run</h2>
-        <p class="band-lead">Select a stage to see its crates. All 35 crates forbid unsafe code.</p>
+        <p class="band-lead">Select a stage to see its crates. All 35 rcmake crates forbid unsafe code; two C codecs (zstd, liblzma) are statically linked.</p>
       </div>
       <div class="pipe-wrap" id="pipeline-widget" data-test="pipeline-widget" aria-describedby="pipeline-fallback">
         <div class="pipe-controls">
@@ -378,7 +394,7 @@
         <li>syntax: Lexes and parses CMake language files.</li>
         <li>eval: Runs commands and tracks variables, policies, and generator expressions.</li>
         <li>resolve: Builds the target graph, usage requirements, and link order.</li>
-        <li>gen: Writes build.ninja, Makefiles, project.pbxproj, and .vcxproj files.</li>
+        <li>gen: Writes build.ninja, Unix Makefiles, project.pbxproj, and .vcxproj files.</li>
         <li>Host: NativeHost reads disk, environment, processes, and clock. PureHost keeps files in memory for tests, editors, and wasm32.</li>
       </ol>
     </section>
@@ -456,8 +472,8 @@
           <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Apple frameworks and Mach-O RPATH"><span class="lang-badge">.m</span><span>Objective-C</span></button>
           <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Apple frameworks and Mach-O RPATH"><span class="lang-badge">.mm</span><span>Objective-C++</span></button>
           <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Scans .mod files and orders compilation by module"><span class="lang-badge">f90</span><span>Fortran</span></button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Target architectures, separable compilation, device linking"><span class="lang-badge">cu</span><span>CUDA</span></button>
-          <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Target architectures, separable compilation, device linking"><span class="lang-badge">hip</span><span>HIP</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-partial="true" data-lang-detail="One end-to-end fixture in the ecosystem workflow."><span class="lang-badge">cu</span><span>CUDA</span><svg class="i st-partial" aria-hidden="true"><use href="#i-differs"/></svg><span class="visually-hidden">partial</span></button>
+          <button type="button" class="lang-chip" aria-pressed="false" data-lang-partial="true" data-lang-detail="Rule wiring only, no toolchain test yet."><span class="lang-badge">hip</span><span>HIP</span><svg class="i st-partial" aria-hidden="true"><use href="#i-differs"/></svg><span class="visually-hidden">partial</span></button>
           <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Assembler languages"><span class="lang-badge">asm</span><span>ASM, MASM, NASM</span></button>
           <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="Windows resource files"><span class="lang-badge">rc</span><span>RC</span></button>
           <button type="button" class="lang-chip" aria-pressed="false" data-lang-detail="AUTOMOC, AUTOUIC, AUTORCC"><span class="lang-badge">moc</span><span>Qt</span></button>
@@ -478,7 +494,7 @@
           <span>CPS</span><span class="dim" aria-hidden="true">·</span>
           <span>SPDX SBOM</span><span class="dim" aria-hidden="true">·</span>
           <span>Instrumentation API</span><span class="dim" aria-hidden="true">·</span>
-          <span data-policy-range>CMP0066-CMP0226</span>
+          <span title="CMP0000-CMP0065 are always NEW in CMake 4.x. 56 upstream policy suites test CMP0066-CMP0226."><span data-policy-range>CMP0066-CMP0226</span> (CMP0000-CMP0065 always NEW)</span>
         </div>
       </div>
     </section>

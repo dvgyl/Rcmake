@@ -33,19 +33,21 @@ export function inlineBar(ratio, status) {
   return `<div class="bar-track inline-bar" data-status="${s}" aria-hidden="true"><div class="bar-fill ${cls}" style="--v:${v}"></div></div>`;
 }
 
-export function speedupBars({ label, value, unit = "x", status, testId } = {}) {
+export function speedupBars({ label, baseline = "", value, unit = "x", status, testId } = {}) {
   const lbl = safeText(label);
+  const sub = safeText(baseline);
+  const nameBlock = sub ? `<div class="speed-name"><span>${lbl}</span><span class="speed-sub">${sub}</span></div>` : `<div class="speed-name">${lbl}</div>`;
   const measured = isMeasured(value) && value > 0;
   const attrs = testId ? ` data-test="${safeText(testId)}"` : "";
   if (!measured) {
-    return `<figure class="speed-group" aria-label="${lbl}. Pending." data-status="pending"${attrs}><div class="speed-name">${lbl}</div><div class="speed-lanes"><div class="speed-lane"><span class="speed-bin">cmake 4.5.1</span><div class="bar-track is-pending" data-loop></div><span class="speed-val dim"><span data-value></span>pending</span></div><div class="speed-lane"><span class="speed-bin is-rcmake">rcmake</span><div class="bar-track is-pending" data-loop></div><span class="speed-val dim"><span data-value></span>pending</span></div></div></figure>`;
+    return `<figure class="speed-group" aria-label="${lbl}. Pending." data-status="pending"${attrs}>${nameBlock}<div class="speed-lanes"><div class="speed-lane"><span class="speed-bin">cmake 4.5.1</span><div class="bar-track is-pending" data-loop></div><span class="speed-val dim"><span data-value></span>pending</span></div><div class="speed-lane"><span class="speed-bin is-rcmake">rcmake</span><div class="bar-track is-pending" data-loop></div><span class="speed-val dim"><span data-value></span>pending</span></div></div></figure>`;
   }
   const st = normalizeStatus(status === "pending" ? "pass" : status);
   const scale = String(Number(Math.min(1, Math.max(0.02, 1 / value)).toFixed(4)));
   const isRatio = unit === "x";
   const u = isRatio ? "\u00d7" : safeText(unit) ? ` ${safeText(unit)}` : "";
   const spd = isRatio ? `${formatSpeed(value)}\u00d7 faster` : `${formatSpeed(value)}${u}`;
-  return `<figure class="speed-group" aria-label="${lbl}. CMake 4.5.1 is 1.00 times, rcmake is ${formatSpeed(value)} times faster." data-status="${st}"${attrs}><div class="speed-name">${lbl}</div><div class="speed-lanes"><div class="speed-lane"><span class="speed-bin">cmake 4.5.1</span><div class="bar-track"><div class="bar-fill is-cmake" style="--v:1" data-scale="1"></div></div><span class="speed-val dim" data-value>1.00${u}</span></div><div class="speed-lane"><span class="speed-bin is-rcmake">rcmake</span><div class="bar-track"><div class="bar-fill is-rcmake" style="--v:${scale}" data-scale="${scale}" data-test="speed-bar-rcmake"></div></div><span class="speed-val" data-value>${spd}</span></div></div></figure>`;
+  return `<figure class="speed-group" aria-label="${lbl}. CMake 4.5.1 is 1.00 times, rcmake is ${formatSpeed(value)} times faster." data-status="${st}"${attrs}>${nameBlock}<div class="speed-lanes"><div class="speed-lane"><span class="speed-bin">cmake 4.5.1</span><div class="bar-track"><div class="bar-fill is-cmake" style="--v:1" data-scale="1"></div></div><span class="speed-val dim" data-value>1.00${u}</span></div><div class="speed-lane"><span class="speed-bin is-rcmake">rcmake</span><div class="bar-track"><div class="bar-fill is-rcmake" style="--v:${scale}" data-scale="${scale}" data-test="speed-bar-rcmake"></div></div><span class="speed-val" data-value>${spd}</span></div></div></figure>`;
 }
 
 export function statRow({ label, value, unit = "", baseline = "", status, testId } = {}) {
@@ -88,7 +90,7 @@ export function arcPath(cx, cy, r, startDeg, endDeg) {
   return `M ${(x + rad * Math.cos(sR)).toFixed(2)} ${(y + rad * Math.sin(sR)).toFixed(2)} A ${rad.toFixed(2)} ${rad.toFixed(2)} 0 ${span > 180 ? 1 : 0} 1 ${(x + rad * Math.cos(eR)).toFixed(2)} ${(y + rad * Math.sin(eR)).toFixed(2)}`;
 }
 
-export function segmentRing({ passed, total, status, size = 88, stroke = 6, gapDeg = 1.25 } = {}) {
+export function segmentRing({ passed, total, status, size = 88, stroke = 6, gapDeg = 1.25, preFreeze = false } = {}) {
   const sz = isMeasured(size) && size > 16 ? Math.round(size) : 88;
   const sw = isMeasured(stroke) && stroke > 0 ? stroke : 6;
   const gap = isMeasured(gapDeg) && gapDeg >= 0 ? gapDeg : 1.25;
@@ -100,14 +102,14 @@ export function segmentRing({ passed, total, status, size = 88, stroke = 6, gapD
   const step = n > 0 ? 360 / n : 0;
   const arc = n > 0 ? Math.max(0.8, step - gap) : 0;
   const len = Number((r * ((arc * Math.PI) / 180)).toFixed(2));
-  const st = ok ? normalizeStatus(status) : "pending";
+  const st = ok ? (preFreeze ? "partial" : normalizeStatus(status)) : "pending";
   let paths = "";
   for (let i = 0; i < n; i += 1) {
     const start = i * step + gap / 2;
     const d = arcPath(c, c, r, start, start + arc);
     if (!ok) paths += `<path class="ring-seg is-pending" data-seg-status="pending" d="${d}"/>`;
     else {
-      const segSt = i < hit ? "pass" : st === "partial" ? "partial" : "fail";
+      const segSt = preFreeze ? "partial" : i < hit ? "pass" : st === "partial" ? "partial" : "fail";
       paths += `<path class="ring-seg is-${segSt}" data-seg-status="${segSt}" d="${d}" stroke-width="${sw}" stroke-dasharray="${len}" style="--len:${len};--seg-i:${i}"/>`;
     }
   }
@@ -160,26 +162,28 @@ export function waffleRowsHtml(platforms, { cell = 7, gap = 2, testPrefix = "waf
     const visual = ok
       ? waffle({ passed: p.suitesPassed, total: p.suitesTotal, cols: 53, rows: 7, status: st, cell, gap })
       : '<div class="bar-track waffle-pending-bar is-pending" data-loop data-status="pending" aria-hidden="true"></div>';
-    const footLeft = ok ? `${formatNumber(p.suitesPassed)} of ${formatNumber(p.suitesTotal)} suites pass` : `${formatNumber(p.suitesTotal)} OS-applicable suites`;
+    const footLeft = ok ? `${formatNumber(p.suitesPassed)} of ${formatNumber(p.suitesTotal)} suites pass` : `${formatNumber(p.suitesTotal)} RunCMake suites`;
     const footRight = ok ? "One square per suite." : "v0.1.0 release verification run";
     return `<figure class="waffle-row${ok ? "" : " is-pending-row"}" aria-label="${escapeHtml(aria)}" data-status="${st}" data-test="${escapeHtml(testPrefix)}-${escapeHtml(p.id)}"><div class="waffle-head"><div class="waffle-os"><span class="waffle-name">${escapeHtml(p.name)}</span><span class="waffle-tc">${escapeHtml(p.toolchain)}</span></div>${statusHtml(st)}</div>${visual}<div class="waffle-foot"><span>${escapeHtml(footLeft)}</span><span>${escapeHtml(footRight)}</span></div></figure>`;
   }).join("");
 }
 
-export function fuzzGaugeCard({ label, passed, failures, status, summary, testId } = {}) {
+export function fuzzGaugeCard({ label, passed, failures, status, summary, testId, preFreeze = false } = {}) {
   const ok = isMeasured(passed);
-  const st = ok ? normalizeStatus(status) : "pending";
+  const st = ok ? (preFreeze ? "partial" : normalizeStatus(status)) : "pending";
   const lbl = safeText(label);
-  const aria = ok ? `${lbl}. ${formatNumber(passed)} inputs, ${failures ?? 0} failures.` : `${lbl}. Pending.`;
-  return `<div class="gauge-card" data-status="${st}"${testId ? ` data-test="${safeText(testId)}"` : ""}><figure class="gauge-fig" aria-label="${aria}"><div class="fuzz-box">${ok ? `<span class="fuzz-num" data-fuzz-target="${passed}" data-value>${escapeHtml(formatNumber(passed))}</span><div class="fuzz-bar" aria-hidden="true"><div class="fuzz-bar-fill"></div></div><span class="gauge-sub">${escapeHtml(String(failures ?? 0))} failures</span>` : '<span class="fuzz-num dim"><span data-value></span>pending</span>'}</div><figcaption class="gauge-label">${lbl}</figcaption></figure>${summary ? `<div class="gate-summary">${safeText(summary)}</div>` : ""}</div>`;
+  const failCount = failures ?? 0;
+  const subText = failCount === 0 ? "0 panics" : `${failCount} failures`;
+  const aria = ok ? `${lbl}. ${formatNumber(passed)} inputs, ${subText}.${preFreeze ? " Pre-freeze baseline." : ""}` : `${lbl}. Pending.`;
+  return `<div class="gauge-card" data-status="${st}"${testId ? ` data-test="${safeText(testId)}"` : ""}><figure class="gauge-fig" aria-label="${aria}"><div class="fuzz-box">${ok ? `<span class="fuzz-num" data-fuzz-target="${passed}" data-value>${escapeHtml(formatNumber(passed))}</span><div class="fuzz-bar" aria-hidden="true"><div class="fuzz-bar-fill"></div></div><span class="gauge-sub">${escapeHtml(subText)}</span>` : '<span class="fuzz-num dim"><span data-value></span>pending</span>'}</div><figcaption class="gauge-label">${lbl}</figcaption></figure>${summary ? `<div class="gate-summary">${safeText(summary)}</div>` : ""}</div>`;
 }
 
-export function ringGaugeCard({ label, passed, total, status, summary, testId } = {}) {
+export function ringGaugeCard({ label, passed, total, status, summary, testId, preFreeze = false } = {}) {
   const ok = isMeasured(passed) && isMeasured(total) && total > 0;
-  const st = ok ? normalizeStatus(status) : "pending";
+  const st = ok ? (preFreeze ? "partial" : normalizeStatus(status)) : "pending";
   const lbl = safeText(label);
-  const aria = ok ? `${lbl}. ${passed} of ${total} pass.` : `${lbl}. Pending.`;
-  return `<div class="gauge-card" data-status="${st}"${testId ? ` data-test="${safeText(testId)}"` : ""}><figure class="gauge-fig" aria-label="${aria}">${segmentRing({ passed, total, status: st })}<figcaption class="gauge-label">${lbl}</figcaption></figure>${summary ? `<div class="gate-summary">${safeText(summary)}</div>` : ""}</div>`;
+  const aria = ok ? `${lbl}. ${passed} of ${total} pass.${preFreeze ? " Pre-freeze baseline." : ""}` : `${lbl}. Pending.`;
+  return `<div class="gauge-card" data-status="${st}"${testId ? ` data-test="${safeText(testId)}"` : ""}><figure class="gauge-fig" aria-label="${aria}">${segmentRing({ passed, total, status: st, preFreeze })}<figcaption class="gauge-label">${lbl}</figcaption></figure>${summary ? `<div class="gate-summary">${safeText(summary)}</div>` : ""}</div>`;
 }
 
 export function shardHeatmap(shards, { cols = 8 } = {}) {

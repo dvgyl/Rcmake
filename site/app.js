@@ -1,7 +1,6 @@
 /* rcmake shared site helpers. Plain ES module, importable in Node. MIT OR Apache-2.0. */
 
 const STATUSES = ["pass", "partial", "fail", "pending"];
-const PLACEHOLDER = /\[FINAL_METRIC\]\s*/g;
 const ICON_BY_STATUS = { pass: "i-check", partial: "i-differs", fail: "i-cross", pending: "i-pending" };
 
 export const TRACK_LABELS = Object.freeze({
@@ -44,13 +43,11 @@ export function formatRatio(passed, total) {
 }
 
 export function cleanNote(text) {
-  return String(text ?? "")
-    .replace(PLACEHOLDER, "")
-    .replace(/\bCore-62\b/g, "Core suites")
-    .replace(/\bBoss-Fight(\s+Giants)?\b/gi, "Large projects")
-    .replace(/\bUnseen Holdout\b/g, "Blind holdout")
-    .replace(/\bunseen holdout\b/gi, "blind holdout")
-    .trim();
+  return String(text ?? "").trim();
+}
+
+export function isPreFreezeGate(gate, data) {
+  return !data?.commit && Boolean(gate?.preFreeze);
 }
 
 export function normalizeStatus(status) {
@@ -147,6 +144,12 @@ export function overviewRows(data) {
   const osDone = plats.length > 0 && plats.every((p) => typeof p.passRate === "number");
   const warm = t.benchmarksAndGates?.benchmarks?.warmProbeSpeedup || {};
 
+  const fuzzPre = isPreFreezeGate(fuzz, data);
+  const wasiPre = isPreFreezeGate(wasi, data);
+  const fuzzTag = fuzzPre && fuzz.commit ? ` (${fuzz.commit})` : "";
+  const wasiTag = wasiPre && wasi.commit ? ` (${wasi.commit})` : "";
+  const fuzzUnit = fuzz.failures ? "fail" : "panics";
+
   return [
     { id: "core", check: "Core suites", result: formatRatio(core.suitesAt100, core.suitesTotal), scope: `- / ${formatNumber(core.suitesTotal) ?? "?"}`, ratio: ratioOf(core.suitesAt100, core.suitesTotal), status: normalizeStatus(core.status) },
     { id: "core", check: `Policies ${pol.activeRange || ""}`.trim(), result: formatRatio(pol.suitesPassed, pol.suitesTotal), scope: `- / ${formatNumber(pol.suitesTotal) ?? "?"}`, ratio: ratioOf(pol.suitesPassed, pol.suitesTotal), status: normalizeStatus(pol.status) },
@@ -155,14 +158,14 @@ export function overviewRows(data) {
     { id: "projects", check: "Large projects, L1 / L2", result: typeof boss.l1Passed === "number" && typeof boss.l2Passed === "number" ? `${boss.l1Passed} / ${boss.l2Passed} of ${boss.projectsTotal}` : null, scope: `- / ${formatNumber(boss.projectsTotal) ?? "?"}`, ratio: ratioOf(boss.l2Passed, boss.projectsTotal), status: normalizeStatus(boss.status) },
     { id: "holdout", check: "Blind holdout", result: formatRatio(hold.reposPassed, hold.reposTotal), scope: `- / ${formatNumber(hold.reposTotal) ?? "?"}`, ratio: ratioOf(hold.reposPassed, hold.reposTotal), status: normalizeStatus(hold.status) },
     { id: "vcpkg", check: "vcpkg ports", result: typeof vc.portsPassed === "number" && typeof vc.portsTotal === "number" ? `${formatRatio(vc.portsPassed, vc.portsTotal)} ports` : null, scope: `${formatNumber(vc.shardsCompleted) ?? "0"} / ${formatNumber(vc.shardsTotal) ?? "64"} shards`, ratio: typeof vc.passRate === "number" ? Math.max(0, Math.min(1, vc.passRate / 100)) : null, status: normalizeStatus(vc.status) },
-    { id: "gates", check: "Fuzzing", result: typeof fuzz.passed === "number" ? `${formatNumber(fuzz.passed)} inputs, ${fuzz.failures ?? 0} fail` : null, scope: "pending", ratio: ratioOf(fuzz.passed, fuzz.total), status: normalizeStatus(fuzz.status) },
-    { id: "gates", check: "WASI and wasm32", result: formatRatio(wasi.passed, wasi.total), scope: `- / ${formatNumber(wasi.total) ?? "?"}`, ratio: ratioOf(wasi.passed, wasi.total), status: normalizeStatus(wasi.status) },
-    { id: "speed", check: "Warm configure", result: typeof warm.value === "number" && Number.isFinite(warm.value) ? `${warm.value}${warm.unit === "x" ? "\u00d7" : ` ${warm.unit || ""}`}` : null, scope: "pending", ratio: typeof warm.value === "number" && warm.value > 0 ? Math.min(1, 1 / warm.value) : null, status: normalizeStatus(warm.status) }
+    { id: "gates", check: "Seeded generative fuzzing", result: typeof fuzz.passed === "number" ? `${formatNumber(fuzz.passed)} inputs, ${fuzz.failures ?? 0} ${fuzzUnit}${fuzzTag}` : null, scope: "pending", ratio: ratioOf(fuzz.passed, fuzz.total), status: fuzzPre ? "partial" : normalizeStatus(fuzz.status), statusText: fuzzPre ? "pre-freeze" : undefined },
+    { id: "gates", check: "WASI and wasm32", result: formatRatio(wasi.passed, wasi.total) ? `${formatRatio(wasi.passed, wasi.total)}${wasiTag}` : null, scope: `- / ${formatNumber(wasi.total) ?? "?"}`, ratio: ratioOf(wasi.passed, wasi.total), status: wasiPre ? "partial" : normalizeStatus(wasi.status), statusText: wasiPre ? "pre-freeze" : undefined },
+    { id: "speed", check: "New tree, shared probe cache", result: typeof warm.value === "number" && Number.isFinite(warm.value) ? `${warm.value}${warm.unit === "x" ? "\u00d7" : ` ${warm.unit || ""}`}` : null, scope: "pending", ratio: typeof warm.value === "number" && warm.value > 0 ? Math.min(1, 1 / warm.value) : null, status: normalizeStatus(warm.status) }
   ];
 }
 
 export function overviewRowsHtml(rows) {
-  return rows.map((r) => `<tr><td>${escapeHtml(r.check)}</td><td class="mono">${r.result ? escapeHtml(r.result) : `<span class="dim">${escapeHtml(r.scope)}</span>`}</td><td>${statusHtml(r.status)}</td></tr>`).join("");
+  return rows.map((r) => `<tr><td>${escapeHtml(r.check)}</td><td class="mono">${r.result ? escapeHtml(r.result) : `<span class="dim">${escapeHtml(r.scope)}</span>`}</td><td>${statusHtml(r.status, r.statusText)}</td></tr>`).join("");
 }
 
 export function snapshotMeta(data) {

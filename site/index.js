@@ -1,30 +1,55 @@
 /* rcmake home page controller. MIT OR Apache-2.0. */
 
-import { copyWithFeedback, escapeHtml, formatNumber, initRovingGroup, loadLatestData, normalizeStatus, statusHtml } from "./app.js";
+import { copyWithFeedback, escapeHtml, formatNumber, initRovingGroup, isPreFreezeGate, loadLatestData, normalizeStatus, statusHtml } from "./app.js";
 import { formatSpeed, fuzzGaugeCard, isMeasured, ringGaugeCard, speedupBars, statRow, waffleRowsHtml } from "./charts.js";
 import { animateCountUp, createMotionController, prefersReducedMotion } from "./motion.js";
 import { initPipeline } from "./pipeline.js";
 
 const RACE_MODES = {
-  warm: { cmd: '<span class="term-prompt">$ </span>cmake -S . -B build -G Ninja', key: "warmProbeSpeedup", kind: "ratio" },
-  leaf: { cmd: '<span class="term-out"># edit src/net/CMakeLists.txt</span>\n<span class="term-prompt">$ </span>cmake -S . -B build', key: "incrementalLeafP95Ms", kind: "leaf" },
-  cold: { cmd: '<span class="term-prompt">$ </span>rm -rf build &amp;&amp; cmake -S . -B build -G Ninja', key: "coldConfigureSpeedup", kind: "ratio" }
+  warm: {
+    cmakeCmd: '<span class="term-prompt">$ </span>cmake -S . -B build-2 -G Ninja',
+    rcmakeCmd: '<span class="term-prompt">$ </span>rcmake -S . -B build-2 -G Ninja',
+    lines: [
+      "-- The CXX compiler identification is AppleClang",
+      "-- Detecting CXX compiler ABI info - done",
+      "-- Configuring done",
+      "-- Generating done",
+      "-- Build files have been written to: <project>/build-2"
+    ],
+    pendingCaption: "New build tree: rcmake uses its shared probe cache; CMake 4.5.1 has no cross-tree cache. Timings appear after the v0.1.0 release verification run.",
+    measuredCaption: (baseline) => `New build tree: rcmake uses its shared probe cache; CMake 4.5.1 has no cross-tree cache (${baseline || "measured against CMake 4.5.1"}).`,
+    key: "warmProbeSpeedup",
+    kind: "ratio"
+  },
+  leaf: {
+    cmakeCmd: '<span class="term-out"># edit src/net/CMakeLists.txt</span>\n<span class="term-prompt">$ </span>cmake -S . -B build',
+    rcmakeCmd: '<span class="term-out"># edit src/net/CMakeLists.txt</span>\n<span class="term-prompt">$ </span>rcmake -S . -B build',
+    lines: [
+      "-- Configuring done",
+      "-- Generating done",
+      "-- Build files have been written to: <project>/build"
+    ],
+    pendingCaption: "Existing build tree after a single-file edit: rcmake re-runs the edited file and replays unchanged subtrees; CMake 4.5.1 reconfigures from scratch. Timings appear after the v0.1.0 release verification run.",
+    measuredCaption: (baseline) => `Existing build tree after a single-file edit (${baseline || "re-runs the edited file, replays the rest"}).`,
+    key: "incrementalLeafP95Ms",
+    kind: "leaf"
+  },
+  cold: {
+    cmakeCmd: '<span class="term-prompt">$ </span>rm -rf build &amp;&amp; cmake -S . -B build -G Ninja',
+    rcmakeCmd: '<span class="term-prompt">$ </span>rm -rf build &amp;&amp; rcmake -S . -B build -G Ninja',
+    lines: [
+      "-- The C compiler identification is AppleClang",
+      "-- Detecting C compiler ABI info - done",
+      "-- Configuring done",
+      "-- Generating done",
+      "-- Build files have been written to: <project>/build"
+    ],
+    pendingCaption: "New build tree with an empty probe cache (500 synthetic C targets). Timings appear after the v0.1.0 release verification run.",
+    measuredCaption: (baseline) => `New build tree with an empty probe cache (${baseline || "measured against CMake 4.5.1"}).`,
+    key: "coldConfigureSpeedup",
+    kind: "ratio"
+  }
 };
-
-const TRANSCRIPT_FULL = [
-  "-- The CXX compiler identification is AppleClang",
-  "-- Detecting CXX compiler ABI info - done",
-  "-- Configuring done",
-  "-- Generating done",
-  "-- Build files have been written to: build"
-];
-
-const TRANSCRIPT_LEAF = [
-  "-- Re-running configure after editing src/net/CMakeLists.txt",
-  "-- Configuring done",
-  "-- Generating done",
-  "-- Build files have been written to: build"
-];
 
 const DEFAULT_PLATFORMS = [
   { id: "macos-arm64", name: "macOS arm64", toolchain: "AppleClang + Ninja, Unix Makefiles, Xcode", suitesTotal: 371, suitesPassed: null, status: "pending" },
@@ -56,8 +81,9 @@ function initTerminal(doc) {
 
 function initRace(doc, motion) {
   const $ = (id) => doc.getElementById(id);
-  const [widget, modeTabs, cmdEl, cmLines, rcLines, cmBar, rcBar, caption, replayBtn] = [
-    $("race-widget"), $("race-modes"), $("race-cmd"), $("race-lines-cmake"), $("race-lines-rcmake"),
+  const [widget, modeTabs, cmCmdEl, rcCmdEl, cmLines, rcLines, cmBar, rcBar, caption, replayBtn] = [
+    $("race-widget"), $("race-modes"), $("race-cmd-cmake"), $("race-cmd-rcmake"),
+    $("race-lines-cmake"), $("race-lines-rcmake"),
     $("race-bar-cmake"), $("race-bar-rcmake"), $("race-caption"), $("race-replay")
   ];
   if (!widget) return { setData() {} };
@@ -66,7 +92,7 @@ function initRace(doc, motion) {
   let timer = null;
 
   const drawLines = (win) => {
-    const lines = mode === "leaf" ? TRANSCRIPT_LEAF : TRANSCRIPT_FULL;
+    const lines = RACE_MODES[mode].lines;
     const lastIdx = lines.length - 1;
     const mk = (w) => lines.map((l, i) => `<li style="--line-idx:${i}">${escapeHtml(l)}${w && i === lastIdx ? '<span class="race-cursor" aria-hidden="true"></span>' : ""}</li>`).join("");
     cmLines.innerHTML = mk(win === "cmake");
@@ -77,13 +103,14 @@ function initRace(doc, motion) {
     const cfg = RACE_MODES[mode];
     const m = bench?.[cfg.key];
     const val = m?.value;
-    cmdEl.innerHTML = cfg.cmd;
+    if (cmCmdEl) cmCmdEl.innerHTML = cfg.cmakeCmd;
+    if (rcCmdEl) rcCmdEl.innerHTML = cfg.rcmakeCmd;
     if (!isMeasured(val) || val <= 0) {
       drawLines(null);
       cmBar.dataset.status = rcBar.dataset.status = "pending";
       cmBar.innerHTML = '<div class="bar-track is-pending" data-loop></div><div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim"><span data-value></span>pending</span></div>';
       rcBar.innerHTML = '<div class="bar-track is-pending" data-loop></div><div class="race-bar-meta"><span class="muted">rcmake</span><span class="dim"><span data-value></span>pending</span></div>';
-      caption.textContent = "Timings appear after the v0.1.0 release verification run.";
+      caption.textContent = cfg.pendingCaption;
       motion.scan(widget);
       return;
     }
@@ -92,14 +119,14 @@ function initRace(doc, motion) {
       drawLines("rcmake");
       cmBar.innerHTML = '<div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim">full reconfigure</span></div>';
       rcBar.innerHTML = `<div class="bar-track"><div class="bar-fill is-rcmake" style="--v:1;--bar-dur:320ms" data-scale="1"></div></div><div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${escapeHtml(formatNumber(val))} ms p95</span></div>`;
-      caption.textContent = m.baseline ? `Single-file leaf edit (${m.baseline}).` : "Single-file leaf edit.";
+      caption.textContent = cfg.measuredCaption(m.baseline);
       return;
     }
     const scale = String(Number(Math.min(1, Math.max(0.02, 1 / val)).toFixed(4)));
     drawLines(val >= 1 ? "rcmake" : "cmake");
     cmBar.innerHTML = '<div class="bar-track"><div class="bar-fill is-cmake" style="--v:1;--bar-dur:800ms" data-scale="1"></div></div><div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim" data-value>1.00\u00d7</span></div>';
     rcBar.innerHTML = `<div class="bar-track"><div class="bar-fill is-rcmake" style="--v:${scale};--bar-dur:${Math.max(160, Math.round(800 / val))}ms" data-scale="${scale}" data-test="race-fill-rcmake"></div></div><div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${formatSpeed(val)}\u00d7 faster</span></div>`;
-    caption.textContent = m.baseline ? `Measured ${m.baseline}.` : "Measured against CMake 4.5.1.";
+    caption.textContent = cfg.measuredCaption(m.baseline);
   };
 
   const play = () => {
@@ -133,9 +160,13 @@ function renderGauges(el, data, motion) {
   const probe = g("probe-cache", { passed: null, total: 16, status: "pending" });
   const mut = g("mutation-replay", { passed: null, total: 20, status: "pending" });
 
+  const fuzzPre = isPreFreezeGate(fuzz, data);
+  const wasiPre = isPreFreezeGate(wasi, data);
+  const preTag = (row) => (row.commit ? `pre-freeze \u00b7 ${row.commit}` : "pre-freeze");
+
   el.innerHTML = [
-    fuzzGaugeCard({ label: "Fuzz inputs", passed: fuzz.passed, failures: fuzz.failures, status: fuzz.status, testId: "gauge-fuzz" }),
-    ringGaugeCard({ label: "WASI checks", passed: wasi.passed, total: wasi.total ?? 6, status: wasi.status, testId: "gauge-wasi" }),
+    fuzzGaugeCard({ label: "Seeded fuzz inputs", passed: fuzz.passed, failures: fuzz.failures, status: fuzzPre ? "partial" : fuzz.status, summary: fuzzPre ? preTag(fuzz) : "", preFreeze: fuzzPre, testId: "gauge-fuzz" }),
+    ringGaugeCard({ label: "WASI checks", passed: wasi.passed, total: wasi.total ?? 6, status: wasiPre ? "partial" : wasi.status, summary: wasiPre ? preTag(wasi) : "", preFreeze: wasiPre, testId: "gauge-wasi" }),
     ringGaugeCard({ label: "Black-box scenarios", passed: bb.scenariosPassed, total: bb.scenariosTotal ?? 20, status: bb.status, testId: "gauge-blackbox" }),
     ringGaugeCard({ label: "Core suites", passed: core.suitesAt100, total: core.suitesTotal ?? 62, status: core.status, testId: "gauge-core" }),
     ringGaugeCard({ label: "Probe cache checks", passed: probe.passed, total: probe.total ?? 16, status: probe.status, testId: "gauge-probe-cache" }),
@@ -166,7 +197,7 @@ function renderGiantsTable(giants) {
     const leaf = formatSpeed(p?.incrementalLeaf?.speedup) ? `${formatSpeed(p.incrementalLeaf.speedup)}\u00d7${leafP95}` : (leafP95 ? leafP95.slice(2, -1) : "-");
     return `<tr data-status="${st}"><td>${escapeHtml(p?.name || "")}</td><td>${escapeHtml(fmtRatio(p?.cold?.speedup))}</td><td>${escapeHtml(fmtRatio(p?.warmProbe?.speedup))}</td><td>${escapeHtml(leaf)}</td><td>${escapeHtml(fmtRss(p))}</td><td>${statusHtml(st)}</td></tr>`;
   }).join("");
-  return `<div style="border-top:1px solid var(--line);overflow-x:auto" data-test="home-giants-bench"><table class="runner-table"><thead><tr><th>Project</th><th>Cold</th><th>Warm probe</th><th>Leaf edit</th><th>Peak RSS</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  return `<div style="border-top:1px solid var(--line);overflow-x:auto" data-test="home-giants-bench"><table class="runner-table"><thead><tr><th>Project</th><th>Cold</th><th>New tree (probe cache)</th><th>Leaf edit</th><th>Peak RSS</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function renderSpeed(el, bench, motion, giants = null) {
@@ -175,7 +206,7 @@ function renderSpeed(el, bench, motion, giants = null) {
   const c = b.coldConfigureSpeedup || {};
   const l = b.incrementalLeafP95Ms || { baseline: "single-file change replay" };
   const r = b.peakRssMiB || { baseline: "native release binary" };
-  el.innerHTML = `${speedupBars({ label: "Warm configure", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, baseline: l.baseline, status: l.status, testId: "speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, baseline: r.baseline, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
+  el.innerHTML = `${speedupBars({ label: "New tree, shared probe cache", baseline: w.baseline || "vs CMake 4.5.1 new build tree", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", baseline: c.baseline || "empty probe cache, synthetic C project", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, baseline: l.baseline, status: l.status, testId: "speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, baseline: r.baseline, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
   motion.scan(el);
 }
 
@@ -220,6 +251,14 @@ async function init() {
     const data = await loadLatestData();
     const range = data?.tracks?.policies?.activeRange;
     if (range) document.querySelectorAll("[data-policy-range]").forEach((el) => { el.textContent = range; });
+    const syncCmpGate = (gateKey, trackStatus) => {
+      const cell = document.querySelector(`[data-cmp-gate="${gateKey}"]`);
+      if (!cell || normalizeStatus(trackStatus) !== "pass") return;
+      cell.classList.add("st-pass");
+      cell.innerHTML = '<svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span>';
+    };
+    syncCmpGate("policies", data?.tracks?.policies?.status);
+    syncCmpGate("generators", data?.tracks?.runCmakeOs?.status);
     waffles.innerHTML = waffleRowsHtml(data?.tracks?.runCmakeOs?.platforms || DEFAULT_PLATFORMS);
     renderGauges(gauges, data, motion);
     renderSpeed(speed, data?.tracks?.benchmarksAndGates?.benchmarks, motion, data?.tracks?.benchmarksAndGates?.giantsBenchmark || null);
