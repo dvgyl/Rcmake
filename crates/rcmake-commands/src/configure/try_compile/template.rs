@@ -656,6 +656,8 @@ impl FromJson for Templated {
 pub(crate) struct TemplateCapture<'a> {
     bindings: &'a PathBindings,
     matches: Vec<(Vec<u8>, Vec<Binding>)>,
+    /// Bytes that can start a value in `matches`. Other bytes stay literal.
+    starts: [bool; 256],
     object_directory: Option<Vec<u8>>,
 }
 
@@ -669,6 +671,18 @@ impl<'a> TemplateCapture<'a> {
         }
         let mut matches: Vec<_> = matches.into_iter().collect();
         matches.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
+        let mut starts = [false; 256];
+        for (value, _) in &matches {
+            match value.first() {
+                Some(&byte) => {
+                    if let Some(start) = starts.get_mut(usize::from(byte)) {
+                        *start = true;
+                    }
+                }
+                // An empty value matches at every byte.
+                None => starts = [true; 256],
+            }
+        }
         let object_directory = bindings
             .0
             .get(&Token::Target)
@@ -676,6 +690,7 @@ impl<'a> TemplateCapture<'a> {
         Self {
             bindings,
             matches,
+            starts,
             object_directory,
         }
     }
@@ -699,6 +714,11 @@ impl<'a> TemplateCapture<'a> {
         let mut literal = Vec::new();
         let mut rest = bytes;
         while let Some((&byte, tail)) = rest.split_first() {
+            if self.starts.get(usize::from(byte)) == Some(&false) {
+                literal.push(byte);
+                rest = tail;
+                continue;
+            }
             let offset = bytes.len() - rest.len();
             if let Some((value, tokens)) = self.matches.iter().find(|(value, tokens)| {
                 rest.starts_with(value)

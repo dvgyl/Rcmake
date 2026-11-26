@@ -281,15 +281,23 @@ impl PreparedProbe {
         if !compiler::admit_environment(&environment) {
             return None;
         }
-        let compiler = compiler::ProbeCompiler::select(
-            Arc::clone(&runtime.journal_host),
-            cx,
-            &runtime.compiler,
-            &name,
-            &runtime.cache.memo,
-            external.then(|| (file, Digest::hash(&contents))),
-            &dirs.binary,
-        )?;
+        let select = |cx: &mut Cx<'_>| {
+            compiler::ProbeCompiler::select(
+                Arc::clone(&runtime.journal_host),
+                cx,
+                &runtime.compiler,
+                &name,
+                &runtime.cache.memo,
+                external.then(|| (file, Digest::hash(&contents))),
+                &dirs.binary,
+            )
+        };
+        let compiler = if runtime.executable.get().is_none() {
+            // The first probe hashes the Rcmake executable while it selects the compiler.
+            crate::configure::concurrent::join(|| runtime.executable(), || select(cx)).1
+        } else {
+            select(cx)
+        }?;
         let cmake_root = path::to_native(&cx.var_or_empty(b"CMAKE_ROOT"));
 
         let source = path::to_native(&cx.var_or_empty(b"CMAKE_SOURCE_DIR"));

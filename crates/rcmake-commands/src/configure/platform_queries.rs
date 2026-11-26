@@ -89,7 +89,7 @@ impl PlatformQueries {
             return;
         };
         let digest = environment_fingerprint(env);
-        let mut pending: Vec<_> = memo
+        let pending: Vec<_> = memo
             .0
             .iter()
             .filter(|(query, _)| query.env != digest)
@@ -98,23 +98,45 @@ impl PlatformQueries {
                 ..observation.request.clone()
             })
             .collect();
-        // `xcrun` needs the developer directory sample for the same environment.
-        pending.sort_by_key(|request| {
+        let is_xcrun = |request: &RunRequest| {
             request
                 .pipeline
                 .first()
                 .is_some_and(|command| command.program.ends_with(b"xcrun"))
-        });
-        for request in pending {
-            let Some(key) = query(host, &request) else {
-                continue;
-            };
-            if memo.0.contains_key(&key) || !admits_xcrun(host, &memo, &key, &request) {
-                continue;
+        };
+        // `xcrun` needs the developer directory sample for the same environment,
+        // so it runs after the other queries are recorded.
+        for xcrun in [false, true] {
+            let mut ready: Vec<(Query, RunRequest)> = Vec::new();
+            for request in pending.iter().filter(|request| is_xcrun(request) == xcrun) {
+                let Some(key) = query(host, request) else {
+                    continue;
+                };
+                if memo.0.contains_key(&key)
+                    || ready.iter().any(|(started, _)| *started == key)
+                    || !admits_xcrun(host, &memo, &key, request)
+                {
+                    continue;
+                }
+                if file_digest(host, &key.program).is_ok() {
+                    ready.push((key, request.clone()));
+                }
             }
-            if file_digest(host, &key.program).is_ok() {
-                let launched = launch_observed(host, &key, &request);
-                let _ = record(host, &mut memo, key, &request, launched, |_| {});
+            // The queries in one group are independent, so they run at the same time.
+            let launches = crate::configure::concurrent::run_all(
+                ready
+                    .iter()
+                    .map(
+                        |(key, request)| -> crate::configure::concurrent::Job<'_, ObservedLaunch> {
+                            Box::new(move || launch_observed(host, key, request))
+                        },
+                    )
+                    .collect(),
+            );
+            for ((key, request), launched) in ready.into_iter().zip(launches) {
+                if let Some(launched) = launched {
+                    let _ = record(host, &mut memo, key, &request, launched, |_| {});
+                }
             }
         }
     }

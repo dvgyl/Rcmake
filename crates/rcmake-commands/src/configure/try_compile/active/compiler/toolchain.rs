@@ -7,11 +7,13 @@ use std::time::Duration;
 
 use rcmake_base::BString;
 use rcmake_host::{
-    CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunOutput, RunRequest, path,
+    CommandSpec, FileKind, Follow, Host, HostResult, Input, Output, ProcessResult, RunOutput,
+    RunRequest, path,
 };
 use rcmake_store::{Digest, InputStamp, Trace, TraceMemo};
 
 use super::wrapper::Wrapper;
+use crate::configure::concurrent::{self, Job};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum Family {
@@ -124,22 +126,31 @@ impl ToolchainEvidence {
         if host.system().sysname != "Darwin" {
             return None;
         }
-        let sdk = if sdk.is_absolute() {
-            host.canonicalize(sdk).ok()?
-        } else {
-            let output = query(
-                host,
-                Path::new("/usr/bin/xcrun"),
-                &["--show-sdk-path".into()],
-            )?;
-            host.canonicalize(&path::to_native(output.stdout.trim_ascii()))
-                .ok()?
+        let name: &[u8] = if cxx { b"clang++" } else { b"clang" };
+        let jobs: Vec<Job<'_, Option<PathBuf>>> = vec![
+            Box::new(|| {
+                if sdk.is_absolute() {
+                    return host.canonicalize(sdk).ok();
+                }
+                let output = query(
+                    host,
+                    Path::new("/usr/bin/xcrun"),
+                    &["--show-sdk-path".into()],
+                )?;
+                host.canonicalize(&path::to_native(output.stdout.trim_ascii()))
+                    .ok()
+            }),
+            Box::new(|| xcrun_find(host, name)),
+            Box::new(|| xcrun_find(host, b"ld")),
+        ];
+        let [Some(Some(sdk)), Some(Some(driver)), Some(Some(linker))] =
+            <[_; 3]>::try_from(concurrent::run_all(jobs)).ok()?
+        else {
+            return None;
         };
         if !vendor_sdk(&sdk) {
             return None;
         }
-        let driver = xcrun_find(host, if cxx { b"clang++" } else { b"clang" })?;
-        let linker = xcrun_find(host, b"ld")?;
         if !vendor_tools(&driver) || driver.parent() != linker.parent() {
             return None;
         }
@@ -155,16 +166,28 @@ impl ToolchainEvidence {
         {
             return None;
         }
-        self.stamp(host, &driver, false)?;
-        self.stamp(host, &linker, false)?;
-        self.stamp(host, Path::new("/usr/bin/xcrun"), false)?;
-        self.stamp(host, &sdk.join("SDKSettings.json"), false)?;
+        let settings = sdk.join("SDKSettings.json");
+        let files = [
+            driver.as_path(),
+            linker.as_path(),
+            Path::new("/usr/bin/xcrun"),
+            settings.as_path(),
+        ];
+        // Hash the compiler files while the compiler answers its queries.
+        let memo = Arc::clone(&self.memo);
+        let (digests, queries) = concurrent::join(
+            move || files.map(|file| digest(&memo, host, file)),
+            || ClangQueries::run(host, &driver),
+        );
+        for (file, digest) in files.into_iter().zip(digests?) {
+            self.record(host, file, false, digest)?;
+        }
         self.sealed.push(sdk.clone());
         self.sdk = Some(sdk);
         self.link_trace = true;
         self.sealed
             .push(driver.parent()?.parent()?.parent()?.to_path_buf());
-        self.clang_configuration(host, &driver, cxx)
+        self.clang_configuration(host, &driver, cxx, queries?)
     }
 
     fn clang(&mut self, host: &dyn Host, cxx: bool) -> Option<()> {
@@ -176,11 +199,22 @@ impl ToolchainEvidence {
         let linker = program_query(host, &driver, "ld")?;
         self.stamp(host, &linker, false)?;
         self.link_trace = linker_dependency_file(host, &linker);
-        self.clang_configuration(host, &driver, cxx)
+        let queries = ClangQueries::run(host, &driver)?;
+        self.clang_configuration(host, &driver, cxx, queries)
     }
 
-    fn clang_configuration(&mut self, host: &dyn Host, driver: &Path, cxx: bool) -> Option<()> {
-        let resource = query_path(host, driver, "-print-resource-dir")?;
+    fn clang_configuration(
+        &mut self,
+        host: &dyn Host,
+        driver: &Path,
+        cxx: bool,
+        queries: ClangQueries,
+    ) -> Option<()> {
+        let ClangQueries {
+            resource,
+            triple,
+            verbose,
+        } = queries;
         if !resource.is_absolute() {
             return None;
         }
@@ -188,7 +222,6 @@ impl ToolchainEvidence {
             "resource directory".into(),
             Digest::hash(&path::from_native(&resource)),
         ));
-        let triple = query(host, driver, &["-print-target-triple".into()])?;
         let triple = std::str::from_utf8(triple.stdout.trim_ascii()).ok()?;
         if triple.is_empty()
             || !triple
@@ -197,7 +230,6 @@ impl ToolchainEvidence {
         {
             return None;
         }
-        let verbose = query(host, driver, &["-v".into()])?;
         let mut directories = vec![
             driver.parent()?.to_path_buf(),
             self.driver.parent()?.to_path_buf(),
@@ -309,18 +341,18 @@ impl ToolchainEvidence {
     }
 
     fn stamp(&mut self, host: &dyn Host, path: &Path, optional: bool) -> Option<()> {
-        if !path.is_absolute() {
-            return None;
-        }
-        let binary = path.extension().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("dll")
-        });
-        let digest = if binary {
-            self.memo.tool_digest(host, path)
-        } else {
-            self.memo.file_digest(host, path)
-        };
-        let stamp = match digest {
+        let digest = digest(&self.memo, host, path);
+        self.record(host, path, optional, digest)
+    }
+
+    fn record(
+        &mut self,
+        host: &dyn Host,
+        path: &Path,
+        optional: bool,
+        digest: Option<HostResult<Digest>>,
+    ) -> Option<()> {
+        let stamp = match digest? {
             Ok(digest) => InputStamp::FileHash {
                 path: path.to_owned(),
                 digest,
@@ -342,6 +374,55 @@ impl ToolchainEvidence {
             self.tools.push(stamp);
         }
         Some(())
+    }
+}
+
+/// Hash one toolchain file. Return `None` for a relative path.
+fn digest(memo: &TraceMemo, host: &dyn Host, path: &Path) -> Option<HostResult<Digest>> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let binary = path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("dll")
+    });
+    Some(if binary {
+        memo.tool_digest(host, path)
+    } else {
+        memo.file_digest(host, path)
+    })
+}
+
+/// Outputs of the Clang driver queries that identify its configuration.
+struct ClangQueries {
+    resource: PathBuf,
+    triple: RunOutput,
+    verbose: RunOutput,
+}
+
+impl ClangQueries {
+    /// Run the independent driver queries at the same time.
+    fn run(host: &dyn Host, driver: &Path) -> Option<Self> {
+        let outputs = concurrent::run_all(
+            ["-print-resource-dir", "-print-target-triple", "-v"]
+                .into_iter()
+                .map(|flag| -> Job<'_, Option<RunOutput>> {
+                    Box::new(move || query(host, driver, &[flag.into()]))
+                })
+                .collect(),
+        );
+        let [
+            Some(Some(resource)),
+            Some(Some(triple)),
+            Some(Some(verbose)),
+        ] = <[_; 3]>::try_from(outputs).ok()?
+        else {
+            return None;
+        };
+        Some(Self {
+            resource: path::to_native(resource.stdout.trim_ascii()),
+            triple,
+            verbose,
+        })
     }
 }
 

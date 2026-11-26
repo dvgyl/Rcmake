@@ -10,6 +10,8 @@ use rcmake_eval::{CmdError, CmdFlags, Cx, IncludeOptions, Registry};
 mod build_command;
 #[cfg(all(feature = "native", any(unix, windows)))]
 mod build_tool_facts;
+#[cfg(all(feature = "native", any(unix, windows)))]
+mod concurrent;
 mod enable_language;
 mod generator_env;
 #[cfg(all(feature = "native", any(unix, windows)))]

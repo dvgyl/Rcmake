@@ -87,10 +87,18 @@ fn ninja_snapshot(
     let Ok(digest) = memo.file_digest(host, &program) else {
         return NinjaEvidence::Uncertified;
     };
+    let cwd = probe_cwd.to_path_buf();
     let verified = if let Some(facts) = cx.session_data::<Arc<BuildToolFacts>>() {
-        facts.sample_ninja(host, &program, digest, env, probe_cwd.to_path_buf())
+        facts.sample_screened_ninja(host, Some(memo), &program, digest, env, cwd)
     } else {
-        BuildToolFacts::default().sample_ninja(host, &program, digest, env, probe_cwd.to_path_buf())
+        BuildToolFacts::default().sample_screened_ninja(
+            host,
+            Some(memo),
+            &program,
+            digest,
+            env,
+            cwd,
+        )
     };
     match verified {
         Some(verified) => NinjaEvidence::Certified(Box::new(verified)),
@@ -277,21 +285,28 @@ impl CompilerEvidence {
             tools.remove(&key);
             session.searches.lock().ok()?.clear();
         }
-        let toolchain = if let Some(toolchain) = tools.get(&key) {
-            Arc::clone(toolchain)
+        let (toolchain, platform) = if let Some(toolchain) = tools.get(&key) {
+            (Arc::clone(toolchain), None)
         } else {
-            let toolchain = Arc::new(ToolchainEvidence::discover(
-                host.as_ref(),
-                family,
-                &program,
-                &sdk,
-                cxx,
-                Arc::clone(memo),
-            )?);
+            // Discovery and the platform samples are independent system queries.
+            let (toolchain, platform) = crate::configure::concurrent::join(
+                || {
+                    ToolchainEvidence::discover(
+                        host.as_ref(),
+                        family,
+                        &program,
+                        &sdk,
+                        cxx,
+                        Arc::clone(memo),
+                    )
+                },
+                || platform_snapshot(host.as_ref(), cx),
+            );
+            let toolchain = Arc::new(toolchain.flatten()?);
             if tools.len() < 32 {
                 tools.insert(key, Arc::clone(&toolchain));
             }
-            toolchain
+            (toolchain, Some(platform))
         };
         drop(tools);
         let mut archive = BTreeMap::new();
@@ -313,7 +328,7 @@ impl CompilerEvidence {
                 );
             }
         }
-        let platform = platform_snapshot(host.as_ref(), cx);
+        let platform = platform.unwrap_or_else(|| platform_snapshot(host.as_ref(), cx));
         let ninja = match ninja_snapshot(host.as_ref(), cx, memo, probe_cwd) {
             NinjaEvidence::NotRequired => None,
             NinjaEvidence::Certified(verified) => Some(*verified),

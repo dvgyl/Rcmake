@@ -7,9 +7,10 @@ use std::sync::{Mutex, PoisonError};
 use rcmake_base::BString;
 use rcmake_host::{Host, Input, Output, ProcessResult, ReadRange, RunOutput, RunRequest, path};
 use rcmake_resolve::query_ninja_cxx_dyndep;
-use rcmake_store::Digest;
+use rcmake_store::{Digest, TraceMemo};
 
 use super::enable_language::{ninja_version_supported, parse_ninja_version};
+#[cfg(test)]
 use super::try_compile::active::admit_environment;
 use super::try_compile::plan::{process_environment, process_environment_fingerprint};
 
@@ -134,12 +135,13 @@ impl BuildToolFacts {
             .cloned()
     }
 
+    #[cfg(test)]
     pub(super) fn sample_ninja(
         &self,
         host: &dyn Host,
         program: &Path,
         digest: Digest,
-        mut env: Vec<(BString, BString)>,
+        env: Vec<(BString, BString)>,
         cwd: PathBuf,
     ) -> Option<VerifiedNinja> {
         if !program.is_absolute() || !admit_environment(&env) {
@@ -149,6 +151,24 @@ impl BuildToolFacts {
         if !is_native_ninja(host, &canonical) {
             return None;
         }
+        self.sample_screened_ninja(host, None, program, digest, env, cwd)
+    }
+
+    /// Run `program --version` live in `cwd` and record the verified result.
+    ///
+    /// The caller must already require an absolute `program` that passes
+    /// [`is_native_ninja`] and an environment that passes `admit_environment`.
+    /// The binary digest after the run must equal `digest`. `memo` reuses the
+    /// digest only while the file metadata and change time are unchanged.
+    pub(super) fn sample_screened_ninja(
+        &self,
+        host: &dyn Host,
+        memo: Option<&TraceMemo>,
+        program: &Path,
+        digest: Digest,
+        mut env: Vec<(BString, BString)>,
+        cwd: PathBuf,
+    ) -> Option<VerifiedNinja> {
         process_environment(&mut env);
         let env_digest = process_environment_fingerprint(&env);
         if let Some(found) = self.get_verified_ninja(program, digest, env_digest, &cwd) {
@@ -175,7 +195,11 @@ impl BuildToolFacts {
         if !ninja_version_supported(&version) {
             return None;
         }
-        if rcmake_store::file_digest(host, program).ok()? != digest {
+        let after = memo.map_or_else(
+            || rcmake_store::file_digest(host, program),
+            |memo| memo.file_digest(host, program),
+        );
+        if after.ok()? != digest {
             return None;
         }
         Some(self.record_ninja(
