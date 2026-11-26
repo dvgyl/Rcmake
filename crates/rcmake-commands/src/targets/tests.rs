@@ -1147,6 +1147,9 @@ fn add_dependencies_deduplicates_across_large_batches_in_order() -> TestResult {
     let (_, mut interp) = configure(
         r#"
         add_library(app STATIC main.c)
+        foreach(i RANGE 1 37)
+          add_custom_target("dep_${i}")
+        endforeach()
         add_dependencies(app)
         foreach(i RANGE 1 20)
           add_dependencies(app "dep_${i}")
@@ -1212,6 +1215,10 @@ fn add_dependencies_rebuilds_index_after_in_place_target_mutation() -> TestResul
         br#"
         cmake_minimum_required(VERSION 4.5)
         add_library(app STATIC main.c)
+        foreach(i RANGE 1 36)
+          add_custom_target("dep_${i}")
+        endforeach()
+        add_custom_target(replaced_dep)
         foreach(i RANGE 1 35)
           add_dependencies(app "dep_${i}")
         endforeach()

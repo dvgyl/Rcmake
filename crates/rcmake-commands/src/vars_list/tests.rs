@@ -918,8 +918,8 @@ list(REMOVE_DUPLICATES dups)
     state.var("acc", expected_acc.as_bytes());
     state.var("outer", b"a;b");
     state.var("child_view", b"a;b;local_only");
-    state.var("watched", b"init;next");
     state.var("watch_log", b"READ_ACCESS:init;MODIFIED_ACCESS:init;next");
+    state.var("watched", b"init;next");
     state.var("rm", b"a;l");
     state.var("rm_at", b"x0;x1;x3");
     state.var("dups", b"b;a;c;d");

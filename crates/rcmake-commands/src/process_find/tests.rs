@@ -1998,7 +1998,7 @@ find_program(NEWLINE NAMES NewlineDict PATHS /work/apps NO_DEFAULT_PATH)
 
 #[test]
 fn find_path_finds_regular_file_named_dot_framework_under_framework_first() -> HostResult<()> {
-    let (host, mut interp) = setup();
+    let (host, mut interp) = setup_with(crate::register_all);
     host.seed_file(Path::new("/work/plain/plain.framework"), b"regular file")?;
     let script = r#"
 set(CMAKE_FIND_FRAMEWORK FIRST)
