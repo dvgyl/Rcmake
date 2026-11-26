@@ -231,7 +231,7 @@ jobs:
         name: Stage the Rcmake tools and data
         run: |
           timeout 10s chmod +x target/stage/bin/rcmake
-          for tool in cmake ctest cpack; do
+          for tool in cmake ctest cpack rcmake-lsp; do
             timeout 10s ln -sfn rcmake "target/stage/bin/$tool"
           done
           timeout 10s mkdir -p target/stage/share
@@ -1018,6 +1018,29 @@ jobs:
       - *checkout
       - *python
       - *runcmake_binary
+      - name: Install Visual Studio 2022 Build Tools
+        shell: pwsh
+        timeout-minutes: 25
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $search = @('-latest', '-products', '*', '-version', '[17.0,18.0)',
+                      '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+                      '-property', 'installationPath')
+          $instance = & $vswhere @search
+          if (-not $instance) {
+            $installer = Join-Path $env:RUNNER_TEMP 'vs_buildtools.exe'
+            Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vs_buildtools.exe' -OutFile $installer
+            $arguments = @('--quiet', '--wait', '--norestart', '--nocache',
+                           '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+                           '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+                           '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.26100')
+            $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+            if ($process.ExitCode -notin 0, 3010) { throw "Build Tools installer exited with $($process.ExitCode)." }
+            $instance = & $vswhere @search
+          }
+          if (-not $instance) { throw 'Visual Studio 2022 Build Tools are missing.' }
+          Join-Path $instance 'MSBuild\Current\Bin\amd64' |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -1064,22 +1087,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.99.1"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: conformance-lsp
-      - name: Build the evaluated language server
-        run: |
-          source env/env.sh
-          cargo build --locked -p rcmake-lsp --bin rcmake-lsp --features eval,stdio
       - name: Check CLI behavior and the language server
         run: |
           source env/env.sh
           mkdir -p conformance-report
           python3 conformance/cases/cli-ux/verify.py --rcmake target/stage/bin/rcmake \
-            --lsp target/debug/rcmake-lsp --oracle "$ECOSYSTEM_ORACLE" 2>&1 | tee conformance-report/cli-ux.log
+            --lsp target/stage/bin/rcmake-lsp --oracle "$ECOSYSTEM_ORACLE" 2>&1 | tee conformance-report/cli-ux.log
       - name: Run differential tests with the CMake oracle
         if: success() || failure()
         run: |
