@@ -121,7 +121,10 @@ impl Cx<'_> {
 
     /// Return `true` if the cache stays within `limits.max_cache_bytes` after an insert
     /// of `entry` as `name`. Otherwise report a fatal error and return `false`.
-    fn admit_cache_entry(&mut self, name: &[u8], entry: &CacheEntry) -> bool {
+    ///
+    /// A command that must check a cache write before other effects calls this method
+    /// first, then inserts the entry later.
+    pub fn admit_cache_entry(&mut self, name: &[u8], entry: &CacheEntry) -> bool {
         let limit = self.interp.config.limits.max_cache_bytes;
         if self.cache().bytes_after_insert(name, entry) <= limit {
             return true;

@@ -398,6 +398,28 @@ fn project_stops_before_normal_variables_when_the_cache_refuses() -> TestResult 
 }
 
 #[test]
+fn project_named_cmake_project_leaves_no_shadowing_normal_binding() -> TestResult {
+    let host = new_host();
+    let mut session = interp(&host, Vec::new());
+    configure(
+        &host,
+        &mut session,
+        "cmake_minimum_required(VERSION 4.5)\nproject(CMAKE_PROJECT VERSION 1.2 DESCRIPTION text LANGUAGES NONE)\n",
+        0,
+    )?;
+    let mut cx = session.cx();
+    for name in [
+        b"CMAKE_PROJECT_VERSION".as_slice(),
+        b"CMAKE_PROJECT_DESCRIPTION",
+    ] {
+        assert_eq!(cx.var_normal_only(name), None, "{}", BString::from(name));
+        assert!(cx.cache().get(name).is_some());
+    }
+    assert_eq!(cx.var(b"CMAKE_PROJECT_VERSION"), Some("1.2".into()));
+    Ok(())
+}
+
+#[test]
 fn find_package_stops_before_normal_variables_when_the_cache_refuses() -> TestResult {
     let host = new_host();
     let mut session = interp_with_cache_limit(&host, 64 * 1024);

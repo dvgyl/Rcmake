@@ -128,11 +128,12 @@ fn configure_project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         (b"_VERSION_PATCH", components.next().unwrap_or_default()),
         (b"_VERSION_TWEAK", components.next().unwrap_or_default()),
     ] {
+        // CMake writes the aliases first and then publishes the cache entry, which removes
+        // a normal binding with the same name (a project named `CMAKE_PROJECT`). The cache
+        // limit is checked before the first write.
         let var = field(b"CMAKE_PROJECT", key);
         if version.is_some() {
-            set_top_level(cx, &var, value, top_level)?;
-        } else if top_level && !cx.var_or_empty(&var).is_empty() {
-            cx.set_var(&var, BString::default());
+            admit_top_level(cx, &var, value, top_level)?;
         }
         for prefix in [b"PROJECT".as_slice(), name] {
             let var = field(prefix, key);
@@ -140,19 +141,21 @@ fn configure_project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 cx.set_var(&var, value.into());
             }
         }
+        if version.is_some() {
+            set_top_level(cx, &var, value, top_level)?;
+        } else if top_level && !cx.var_or_empty(&var).is_empty() {
+            cx.set_var(&var, BString::default());
+        }
     }
 
     for key in METADATA.into_iter().filter(|key| *key != "VERSION") {
         let value = metadata.get(key.as_bytes()).copied().unwrap_or_default();
         let suffix = format!("_{key}");
-        set_top_level(
-            cx,
-            &field(b"CMAKE_PROJECT", suffix.as_bytes()),
-            value,
-            top_level,
-        )?;
+        let var = field(b"CMAKE_PROJECT", suffix.as_bytes());
+        admit_top_level(cx, &var, value, top_level)?;
         cx.set_var(&field(b"PROJECT", suffix.as_bytes()), value.into());
         cx.set_var(&field(name, suffix.as_bytes()), value.into());
+        set_top_level(cx, &var, value, top_level)?;
     }
 
     if cx.running_deferred() {
@@ -330,16 +333,31 @@ fn set_top_level(
     Ok(())
 }
 
+/// Check that the cache entry of [`set_top_level`] fits the cache byte limit, before any
+/// related normal variable changes. Report a refusal and stop `project()`.
+fn admit_top_level(
+    cx: &mut Cx<'_>,
+    name: &[u8],
+    value: &[u8],
+    top_level: bool,
+) -> Result<(), CmdError> {
+    if (top_level || !cx.var_defined(name)) && !cx.admit_cache_entry(name, &static_entry(value)) {
+        return Err(CmdError::Reported);
+    }
+    Ok(())
+}
+
 /// Store a `STATIC` cache entry. Return `false` if the cache byte limit refused it.
 fn set_static(cx: &mut Cx<'_>, name: &[u8], value: &[u8]) -> bool {
-    cx.insert_cache_entry_unrecorded(
-        name.into(),
-        CacheEntry {
-            value: value.into(),
-            ty: CacheType::Static,
-            help: "Value Computed by CMake".into(),
-            advanced: false,
-            props: Default::default(),
-        },
-    )
+    cx.insert_cache_entry_unrecorded(name.into(), static_entry(value))
+}
+
+fn static_entry(value: &[u8]) -> CacheEntry {
+    CacheEntry {
+        value: value.into(),
+        ty: CacheType::Static,
+        help: "Value Computed by CMake".into(),
+        advanced: false,
+        props: Default::default(),
+    }
 }

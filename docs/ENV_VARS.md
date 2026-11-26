@@ -58,7 +58,6 @@ annotations or provenance and a step budget also disable replay. Both
 | `RCMAKE_CACHE_REMOTE_EXPORT_CAPTURED_OUTPUT` | Set to `1` to permit uploads that include captured probe output. Uploads also require `RCMAKE_CACHE_REMOTE_WRITE=1`. |
 | `RCMAKE_CACHE_REMOTE_EXPORT_TIMEOUT` | Set the upload time limit to a positive integer number of seconds. The remote client default is 300 seconds. Configure also limits the upload to its remaining remote budget, which starts at 3 seconds. |
 | `RCMAKE_CACHE_REMOTE_CURL` | Set the absolute path to a curl executable. The defaults are `/usr/bin/curl` and `C:/Windows/System32/curl.exe`. |
-| `RCMAKE_CACHE_REMOTE_PRIVATE_DIR` | Set the absolute directory for private transfer files. On Unix, authenticated transfers require this directory. Its group and other permission bits must be clear. On Windows, the client passes the private curl configuration through standard input. |
 | `RCMAKE_CACHE_REMOTE_AUTH` | Select `anonymous` (default), `bearer`, `header`, or `s3`. |
 | `RCMAKE_CACHE_REMOTE_TOKEN` | Supply the bearer token or the value of the custom HTTP header. |
 | `RCMAKE_CACHE_REMOTE_HEADER` | Supply the custom HTTP header name for `header` authentication. |

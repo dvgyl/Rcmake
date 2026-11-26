@@ -13,14 +13,13 @@ use std::{
 };
 
 use rcmake_base::BString;
+use rcmake_base::curl::{CurlConfig, CurlOption};
 use rcmake_host::{
     CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, WriteMode, path,
 };
 use rcmake_json::FromJson;
 
-use crate::{
-    Digest, Entry, InputStamp, NEXT_TEMP, PrivateDir, StagingFile, Store, frame, verify_private_dir,
-};
+use crate::{Digest, Entry, InputStamp, NEXT_TEMP, StagingFile, Store, frame};
 
 mod manifest;
 
@@ -29,7 +28,6 @@ pub use manifest::{CacheEntryKind, CacheManifest, ManifestEntry, export_blob, ex
 use manifest::{attach_blobs, decode_blob, decode_entry, read_frame, valid_record};
 
 const PROBE_BLOB_BYTES: usize = 16 * 1024 * 1024;
-const PRIVATE_DIR_SETTING: &str = "RCMAKE_CACHE_REMOTE_PRIVATE_DIR";
 const SESSION_BLOB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AUTH_BYTES: usize = 8 * 1024;
 const EXPORT_TIMEOUT_SETTING: &str = "RCMAKE_CACHE_REMOTE_EXPORT_TIMEOUT";
@@ -73,8 +71,6 @@ pub struct RemoteCacheConfig {
     pub auth: RemoteAuth,
     /// Trusted absolute curl executable. The default uses the system installation.
     pub curl_path: Option<PathBuf>,
-    /// Existing private directory for curl input on Unix.
-    pub private_dir: Option<PathBuf>,
     /// Permit publication of the complete probe capture and artifact bytes.
     pub export_captured_output: bool,
     /// Maximum cumulative time spent on remote cache work in one configure.
@@ -105,7 +101,6 @@ impl RemoteCacheConfig {
             access: RemoteAccess::ReadOnly,
             auth: RemoteAuth::Anonymous,
             curl_path: None,
-            private_dir: None,
             export_captured_output: false,
             session_timeout: Duration::from_secs(3),
             export_timeout: Duration::from_secs(300),
@@ -146,7 +141,6 @@ impl RemoteCacheConfig {
         }
         config.export_captured_output = enabled(b"RCMAKE_CACHE_REMOTE_EXPORT_CAPTURED_OUTPUT");
         config.curl_path = env(b"RCMAKE_CACHE_REMOTE_CURL").map(|s| path::to_native(&s));
-        config.private_dir = env(b"RCMAKE_CACHE_REMOTE_PRIVATE_DIR").map(|s| path::to_native(&s));
         config.auth = match env(b"RCMAKE_CACHE_REMOTE_AUTH")
             .unwrap_or_default()
             .as_slice()
@@ -226,19 +220,16 @@ pub struct RemoteStoreClient<'a> {
     blob_bytes: usize,
     failures: u32,
     diagnostic: Option<RemoteError>,
-    pipe_config: bool,
-    /// Identity of the private directory after it passed the privacy checks.
-    private_identity: Option<PrivateDir>,
 }
 impl<'a> RemoteStoreClient<'a> {
-    /// Create a client with bounded process capture and verify its HTTPS and directory settings.
-    pub fn new(host: &'a dyn Host, mut config: RemoteCacheConfig) -> Result<Self, RemoteError> {
+    /// Create a client with bounded process capture and verify its HTTPS and curl settings.
+    pub fn new(host: &'a dyn Host, config: RemoteCacheConfig) -> Result<Self, RemoteError> {
         let host_path = config
             .endpoint
             .split_once("://")
             .is_some_and(|(_, rest)| rest.contains('/'));
-        let needs_private_dir = host_path || !matches!(config.auth, RemoteAuth::Anonymous);
-        if (needs_private_dir || config.access == RemoteAccess::ReadWrite)
+        let sends_secrets = host_path || !matches!(config.auth, RemoteAuth::Anonymous);
+        if (sends_secrets || config.access == RemoteAccess::ReadWrite)
             && !config.endpoint.starts_with("https://")
         {
             return Err(RemoteError::Setting("RCMAKE_CACHE_REMOTE (HTTPS required)"));
@@ -259,25 +250,7 @@ impl<'a> RemoteStoreClient<'a> {
         if config.session_timeout.is_zero() {
             return Err(RemoteError::Setting("session_timeout"));
         }
-        let mut private_identity = None;
-        config.private_dir = if needs_private_dir && !windows {
-            let dir = resolve(
-                host,
-                config.private_dir.as_deref(),
-                PRIVATE_DIR_SETTING,
-                |_, m| m.mode & 0o077 == 0,
-            )?;
-            private_identity = Some(
-                verify_private_dir(host, &dir)
-                    .map_err(|_| RemoteError::Setting(PRIVATE_DIR_SETTING))?,
-            );
-            Some(dir)
-        } else {
-            None
-        };
         Ok(Self {
-            private_identity,
-            pipe_config: needs_private_dir && windows,
             host,
             curl,
             read_time_left: config.session_timeout,
@@ -287,19 +260,6 @@ impl<'a> RemoteStoreClient<'a> {
             failures: 0,
             diagnostic: None,
         })
-    }
-    /// Return whether the private directory is still the private directory that passed the
-    /// checks at client creation, with mode `0o700` or narrower.
-    fn private_dir_unchanged(&self) -> bool {
-        let (Some(dir), Some(identity)) =
-            (self.config.private_dir.as_deref(), self.private_identity)
-        else {
-            return false;
-        };
-        // One fresh sample gives both the identity and the mode.
-        identity
-            .recheck(self.host, dir)
-            .is_ok_and(|meta| meta.mode & 0o077 == 0)
     }
     /// Return whether the client has stopped sending requests for this configure.
     pub fn circuit_is_open(&self) -> bool {
@@ -467,30 +427,15 @@ impl<'a> RemoteStoreClient<'a> {
         if let Some((path, _)) = upload {
             args.extend(["--upload-file".into(), path::from_native(path)]);
         }
+        // The URL and all credentials go to curl on standard input, never on the argument
+        // list or in a file.
         let url = format!("{}/{suffix}", config.endpoint);
-        let scratch = config.private_dir.as_deref();
-        let path = scratch.map(|dir| temporary_path(self.host, dir));
-        let mut staged = None;
-        let stdin = if config.private_dir.is_some() || self.pipe_config {
-            let mut input = credentials(self.host, &config.auth, &mut args)?;
-            append_config(&mut input, b"url", &[url.as_bytes()]);
-            args.extend(["--config".into(), "-".into()]);
-            if let Some(path) = &path {
-                let error = RemoteError::Setting(PRIVATE_DIR_SETTING);
-                // Check the directory again just before credentials go into it.
-                if !self.private_dir_unchanged() {
-                    return Err(error);
-                }
-                staged = Some(stage(self.host, path, &input).map_err(|_| error)?);
-                Input::File(path.to_owned())
-            } else {
-                Input::Bytes(input)
-            }
-        } else {
-            args.extend(["--url".into(), url.into()]);
-            Input::Null
-        };
-        let _cleanup = staged;
+        let mut input = credentials(self.host, &config.auth, &mut args)?;
+        input
+            .push(CurlOption::Url, &[url.as_bytes()])
+            .map_err(|_| RemoteError::Setting("RCMAKE_CACHE_REMOTE"))?;
+        args.extend(["--config".into(), "-".into()]);
+        let stdin = Input::Bytes(input.into_bytes());
         let env = "SystemRoot HTTPS_PROXY https_proxy HTTP_PROXY http_proxy NO_PROXY no_proxy SSL_CERT_FILE CURL_CA_BUNDLE"
             .split_ascii_whitespace()
             .filter_map(|key| self.host.env_get(key.as_bytes()).map(|value| (key.into(), value)))
@@ -607,11 +552,13 @@ fn temporary_path(host: &dyn Host, dir: &Path) -> PathBuf {
     let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
     dir.join(format!("remote-{pid}-{}-{}-{serial}", now.secs, now.nanos))
 }
+/// Build the curl config for the credentials of `auth`. A header value with CR or LF is
+/// refused.
 fn credentials(
     host: &dyn Host,
     auth: &RemoteAuth,
     args: &mut Vec<BString>,
-) -> Result<Vec<u8>, RemoteError> {
+) -> Result<CurlConfig, RemoteError> {
     let secret = |key: &'static str| match host.env_get(key.as_bytes()) {
         Some(value)
             if !value.is_empty()
@@ -622,7 +569,7 @@ fn credentials(
         }
         _ => Err(RemoteError::Setting(key)),
     };
-    let mut config = Vec::new();
+    let mut config = CurlConfig::default();
     match auth {
         RemoteAuth::Anonymous => {}
         RemoteAuth::Bearer | RemoteAuth::Header(_) => {
@@ -639,7 +586,9 @@ fn credentials(
             } else {
                 b""
             };
-            append_config(&mut config, b"header", &[name, b": ", scheme, &token]);
+            config
+                .push_header(&[name, b": ", scheme, &token].concat())
+                .map_err(|_| RemoteError::Setting("RCMAKE_CACHE_REMOTE_TOKEN"))?;
         }
         RemoteAuth::S3(region) => {
             if region.is_empty()
@@ -655,58 +604,125 @@ fn credentials(
             if access.contains(&b':') {
                 return Err(RemoteError::Setting("AWS_ACCESS_KEY_ID"));
             }
-            append_config(&mut config, b"user", &[&access, b":", &password]);
+            config
+                .push(CurlOption::User, &[&access, b":", &password])
+                .map_err(|_| RemoteError::Setting("AWS_SECRET_ACCESS_KEY"))?;
             if host
                 .env_get(b"AWS_SESSION_TOKEN")
                 .is_some_and(|value| !value.is_empty())
             {
                 let token = secret("AWS_SESSION_TOKEN")?;
-                append_config(&mut config, b"header", &[b"x-amz-security-token: ", &token]);
+                config
+                    .push_header(&[b"x-amz-security-token: ".as_slice(), &token].concat())
+                    .map_err(|_| RemoteError::Setting("AWS_SESSION_TOKEN"))?;
             }
             args.extend(["--aws-sigv4".into(), format!("aws:amz:{region}:s3").into()]);
         }
     }
     Ok(config)
 }
-fn append_config(config: &mut Vec<u8>, option: &[u8], parts: &[&[u8]]) {
-    config.extend_from_slice(option);
-    config.extend_from_slice(b" = \"");
-    for &byte in parts.iter().flat_map(|part| part.iter()) {
-        if matches!(byte, b'\\' | b'"') {
-            config.push(b'\\');
-        }
-        config.push(byte);
-    }
-    config.extend_from_slice(b"\"\n");
+/// Curl runs that a test host recorded.
+#[cfg(test)]
+type Recorded = std::sync::Arc<std::sync::Mutex<Vec<RunRequest>>>;
+
+/// A host with a curl executable whose runs are recorded.
+#[cfg(test)]
+fn recording_client(
+    token: &[u8],
+) -> Result<(rcmake_host::PureHost, Recorded), Box<dyn std::error::Error>> {
+    let root = Path::new(if cfg!(windows) { "C:/" } else { "/" });
+    let curl = root.join("bin/curl");
+    let host = rcmake_host::PureHost::new(root.to_owned(), root.join("bin/rcmake"));
+    host.seed_file(&curl, b"")?;
+    host.set_permissions(&curl, 0o700)?;
+    host.env_set(b"RCMAKE_CACHE_REMOTE_TOKEN", Some(token));
+    let requests = Recorded::default();
+    let recorded = std::sync::Arc::clone(&requests);
+    host.set_command_handler(move |_, request, _| {
+        recorded
+            .lock()
+            .map_err(|_| rcmake_host::HostError::unsupported("The recorder is poisoned."))?
+            .push(request.clone());
+        Ok(rcmake_host::RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            stdout: b"404".to_vec(),
+            ..rcmake_host::RunOutput::default()
+        })
+    })?;
+    Ok((host, requests))
 }
 
 #[test]
-fn remote_private_dir_requires_the_same_owner() -> Result<(), Box<dyn std::error::Error>> {
-    let root = Path::new(if cfg!(windows) { "C:/" } else { "/" });
-    let curl = root.join("bin/curl");
-    let private = root.join("private");
-    let host = rcmake_host::PureHost::new(root.to_owned(), root.join("bin/rcmake"));
-    host.set_effective_uid(Some(1000))?;
-    host.seed_file(&curl, b"")?;
-    host.set_permissions(&curl, 0o700)?;
-    host.create_private_dir(&private)?;
-    let mut config = RemoteCacheConfig::new("https://cache.invalid")?;
-    config.auth = RemoteAuth::Bearer;
-    config.curl_path = Some(curl);
-    config.private_dir = Some(private.clone());
-    let client = RemoteStoreClient::new(&host, config.clone())?;
-    assert!(client.private_dir_unchanged());
-    // A directory that replaces the checked one must not receive credentials.
-    host.rename(&private, &root.join("private-old"))?;
-    host.create_private_dir(&private)?;
-    assert!(!client.private_dir_unchanged());
-
-    host.set_owner(&private, Some(1001))?;
-    assert_eq!(
-        RemoteStoreClient::new(&host, config).err(),
-        Some(RemoteError::Setting("RCMAKE_CACHE_REMOTE_PRIVATE_DIR"))
-    );
+fn remote_requests_send_the_url_and_credentials_on_standard_input()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (auth, header) in [
+        (RemoteAuth::Bearer, "Authorization: Bearer s3cret"),
+        (
+            RemoteAuth::Header("X-Cache-Key".into()),
+            "X-Cache-Key: s3cret",
+        ),
+    ] {
+        let (host, requests) = recording_client(b"s3cret")?;
+        let mut config = RemoteCacheConfig::new("https://cache.invalid/base")?;
+        config.auth = auth;
+        config.curl_path =
+            Some(Path::new(if cfg!(windows) { "C:/" } else { "/" }).join("bin/curl"));
+        let client = RemoteStoreClient::new(&host, config)?;
+        let deadline = host.monotonic() + Duration::from_secs(1);
+        let _ = client.request("probe/v1/key.entry", None, 1024, deadline);
+        let requests = requests.lock().unwrap();
+        let [request] = requests.as_slice() else {
+            panic!("Expected one curl run.");
+        };
+        let [command] = request.pipeline.as_slice() else {
+            panic!("Expected one command.");
+        };
+        assert_eq!(
+            command.args.first().map(AsRef::as_ref),
+            Some(b"--disable".as_slice())
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--config", "-"])
+        );
+        for arg in &command.args {
+            let text = String::from_utf8_lossy(arg);
+            assert!(
+                !text.contains("s3cret") && !text.contains("cache.invalid"),
+                "{text}"
+            );
+        }
+        let Input::Bytes(stdin) = &request.stdin else {
+            panic!("Expected the config on standard input.");
+        };
+        let stdin = String::from_utf8_lossy(stdin);
+        assert!(
+            stdin.contains(&format!("header = \"{header}\"\n")),
+            "{stdin}"
+        );
+        assert!(
+            stdin.contains("url = \"https://cache.invalid/base/probe/v1/key.entry\"\n"),
+            "{stdin}"
+        );
+    }
     Ok(())
+}
+
+#[test]
+fn remote_credentials_refuse_header_line_breaks() {
+    let host = rcmake_host::PureHost::default();
+    for token in [b"a\r\nX-Injected: 1".as_slice(), b"a\nb"] {
+        host.env_set(b"RCMAKE_CACHE_REMOTE_TOKEN", Some(token));
+        assert_eq!(
+            credentials(&host, &RemoteAuth::Bearer, &mut Vec::new()).err(),
+            Some(RemoteError::Setting("RCMAKE_CACHE_REMOTE_TOKEN"))
+        );
+    }
+    let mut config = CurlConfig::default();
+    assert!(config.push_header(b"Name: a\r\nb").is_err());
+    assert!(config.as_bytes().is_empty());
 }
 
 #[test]

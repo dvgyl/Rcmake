@@ -401,7 +401,7 @@ fn configure_nested_file_with_posix_preset_paths() -> TestResult {
 
 #[test]
 fn recursion_stops_at_the_wasm_ceiling_even_with_a_higher_override() -> TestResult {
-    let response = call(Value::object_from([
+    let request = Value::object_from([
         ("op", Value::string("configure")),
         (
             "files",
@@ -412,7 +412,14 @@ fn recursion_stops_at_the_wasm_ceiling_even_with_a_higher_override() -> TestResu
                 ),
             )]),
         ),
-    ]))?;
+    ]);
+    // On a native test host the API stack guard applies. Give it a known 8 MiB stack and
+    // a 4 MiB budget, so that debug frames (about 5.2 KB each on Windows) reach depth 200.
+    let response = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || rcmake_api::with_stack_budget(4 * 1024 * 1024, || call(request)))?
+        .join()
+        .map_err(|_| "The configure thread panicked.")??;
     assert_eq!(response.get("ok").and_then(Value::as_bool), Some(false));
     let text = diag_text(&response);
     assert!(

@@ -62,6 +62,9 @@ pub use result::{
     VariableWriteDetails,
 };
 
+/// Set a native stack budget around [`PreparedConfigure::evaluate`] or
+/// [`run_configure`] on a thread with a known larger stack.
+pub use rcmake_eval::stack_guard::with_budget as with_stack_budget;
 pub use rcmake_eval::{CacheDefine, CancelToken, LedgerLevel, Services, VarWrite, stack_guard};
 
 pub use variable_history::{VarLedgerSnapshot, VariableHistory};

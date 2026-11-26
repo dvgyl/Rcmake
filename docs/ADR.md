@@ -754,10 +754,11 @@ the test suite.
 **WebAssembly.** The WebAssembly build has no native store or Git mirror, and
 its virtual host has no other users.
 
-**Remote credentials.** `RCMAKE_CACHE_REMOTE_PRIVATE_DIR` is canonicalized and
-must pass the same checks and mode `& 0o077 == 0`. Just before the client
-writes a credentials file in it, one fresh metadata sample must show the same
-directory and the same private mode.
+**Remote credentials.** The remote cache client sends its URL, its
+authorization headers, and its credentials to curl in `curl --config -` text
+on standard input (`rcmake_base::curl::CurlConfig`). They are never on the
+argument list or in a file, so the client needs no private directory. A
+header value with a carriage return or a line feed is refused.
 
 **Hosts.** `Host::effective_uid`, `Host::create_private_dir`, `Host::metadata_fresh`, and
 `Host::canonicalize_fresh` have default implementations, so that a wrapper host
