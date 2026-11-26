@@ -72,32 +72,124 @@ export function initThemeToggle(doc = document) {
   const sync = () => {
     if (!btn) return;
     const dark = root.dataset.theme !== "light";
-    const lbl = btn.querySelector(".theme-label");
-    if (lbl) lbl.textContent = dark ? "Light" : "Dark";
-    else if (!btn.querySelector("svg")) btn.textContent = dark ? "Light" : "Dark";
     btn.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+    btn.setAttribute("aria-pressed", String(!dark));
   };
   sync();
   btn?.addEventListener("click", () => {
-    root.dataset.theme = root.dataset.theme === "light" ? "dark" : "light";
-    try { localStorage.setItem("rcmake-theme", root.dataset.theme); } catch (_) {}
-    sync();
+    const flip = () => {
+      root.dataset.theme = root.dataset.theme === "light" ? "dark" : "light";
+      try { localStorage.setItem("rcmake-theme", root.dataset.theme); } catch (_) {}
+      sync();
+    };
+    if (typeof doc.startViewTransition === "function" && !reducedMotion()) doc.startViewTransition(flip);
+    else flip();
   });
 }
 
+function reducedMotion() {
+  return typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
 export function initTopbarScroll(doc = document) {
-  const bar = doc.querySelector(".topbar.is-hero-bleed");
-  if (!bar || typeof window === "undefined") return;
-  const sync = () => bar.classList.toggle("is-scrolled", window.scrollY > 10);
+  const bar = doc.querySelector(".topbar");
+  const progress = doc.querySelector(".scroll-progress");
+  if (typeof window === "undefined" || (!bar && !progress)) return;
+  let queued = false;
+  const sync = () => {
+    queued = false;
+    const y = window.scrollY;
+    bar?.classList.toggle("is-scrolled", y > 8);
+    if (progress) {
+      const max = Math.max(1, doc.documentElement.scrollHeight - window.innerHeight);
+      progress.style.setProperty("--p", String(Math.min(1, Math.max(0, y / max))));
+    }
+  };
   sync();
-  window.addEventListener("scroll", sync, { passive: true });
+  window.addEventListener("scroll", () => { if (!queued) { queued = true; requestAnimationFrame(sync); } }, { passive: true });
+  window.addEventListener("resize", sync, { passive: true });
+}
+
+/* Scroll reveal. Elements with [data-reveal] glide in once. Children of [data-reveal-stagger] get a stagger index.
+   The hidden state applies only under html.reveal-on, which this function sets after the observer exists. */
+let revealIO = null;
+
+export function revealScan(scope = typeof document !== "undefined" ? document : null) {
+  if (!scope?.querySelectorAll) return;
+  const groups = Array.from(scope.querySelectorAll("[data-reveal-stagger]"));
+  if (scope.matches?.("[data-reveal-stagger]")) groups.push(scope);
+  groups.forEach((group) => {
+    Array.from(group.children).forEach((child, i) => {
+      if (!child.hasAttribute("data-reveal")) child.setAttribute("data-reveal", "");
+      child.style?.setProperty("--reveal-i", String(i));
+    });
+  });
+  scope.querySelectorAll("[data-reveal]:not(.is-revealed)").forEach((el) => {
+    if (revealIO) revealIO.observe(el);
+    else el.classList?.add("is-revealed");
+  });
+}
+
+export function initReveal(doc = document) {
+  if (typeof window === "undefined" || typeof IntersectionObserver === "undefined" || reducedMotion()) {
+    revealScan(doc);
+    return;
+  }
+  revealIO = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      e.target.classList.add("is-revealed");
+      revealIO.unobserve(e.target);
+    }
+  }, { rootMargin: "0px 0px -8% 0px", threshold: 0.08 });
+  revealScan(doc);
+  doc.documentElement.classList.add("reveal-on");
+  const showAll = () => doc.querySelectorAll("[data-reveal]").forEach((el) => el.classList.add("is-revealed"));
+  window.addEventListener("beforeprint", showAll);
+}
+
+/* Sliding pill behind the active option of every segmented control and tab bar. */
+const ACTIVE_ATTRS = ["aria-selected", "aria-checked", "aria-pressed"];
+
+export function initSegPill(group) {
+  if (!group || group.dataset.pill === "on" || typeof window === "undefined") return;
+  group.dataset.pill = "on";
+  const pill = group.ownerDocument.createElement("span");
+  pill.className = "seg-pill";
+  pill.setAttribute("aria-hidden", "true");
+  group.prepend(pill);
+  const place = () => {
+    if (pill.parentNode !== group) group.prepend(pill);
+    const active = Array.from(group.querySelectorAll("button")).find((b) => ACTIVE_ATTRS.some((a) => b.getAttribute(a) === "true"));
+    if (!active || !active.offsetWidth) { pill.style.opacity = "0"; return; }
+    pill.style.opacity = "1";
+    pill.style.width = `${active.offsetWidth}px`;
+    pill.style.height = `${active.offsetHeight}px`;
+    pill.style.transform = `translate(${active.offsetLeft}px, ${active.offsetTop}px)`;
+  };
+  place();
+  requestAnimationFrame(() => { place(); group.classList.add("pill-ready"); });
+  if (typeof MutationObserver !== "undefined") {
+    new MutationObserver(place).observe(group, { subtree: true, childList: true, attributes: true, attributeFilter: ACTIVE_ATTRS });
+  }
+  if (typeof ResizeObserver !== "undefined") new ResizeObserver(place).observe(group);
+  group.addEventListener("scroll", place, { passive: true });
+}
+
+export function initSegPills(doc = document) {
+  doc.querySelectorAll(".seg, .pane-tabs").forEach(initSegPill);
 }
 
 export async function copyWithFeedback(button, text, label = "Copy") {
   const node = button.querySelector("[data-copy-label]");
   const set = (v) => { if (node) node.textContent = v; else button.textContent = v; };
-  try { await navigator.clipboard.writeText(text); set("Copied"); } catch (_) { set("Select and copy"); }
-  setTimeout(() => set(label), 1500);
+  try {
+    await navigator.clipboard.writeText(text);
+    set("Copied");
+    button.classList.add("is-copied");
+  } catch (_) { set("Select and copy"); }
+  clearTimeout(button._copyTimer);
+  button._copyTimer = setTimeout(() => { set(label); button.classList.remove("is-copied"); }, 1600);
 }
 
 export function initRovingGroup(container, selector, onActivate) {
@@ -176,4 +268,6 @@ export function snapshotMeta(data) {
 if (typeof document !== "undefined") {
   initThemeToggle(document);
   initTopbarScroll(document);
+  initReveal(document);
+  initSegPills(document);
 }

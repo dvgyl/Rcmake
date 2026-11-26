@@ -1,8 +1,8 @@
 /* rcmake home page controller. MIT OR Apache-2.0. */
 
-import { copyWithFeedback, escapeHtml, formatNumber, initRovingGroup, isPreFreezeGate, loadLatestData, normalizeStatus, statusHtml } from "./app.js";
-import { formatSpeed, fuzzGaugeCard, isMeasured, ringGaugeCard, speedupBars, statRow, waffleRowsHtml } from "./charts.js";
-import { animateCountUp, createMotionController, prefersReducedMotion } from "./motion.js";
+import { copyWithFeedback, escapeHtml, formatNumber, initRovingGroup, isPreFreezeGate, loadLatestData, normalizeStatus, revealScan, statusHtml } from "./app.js";
+import { formatSpeed, isMeasured, osStripsHtml, speedupBars, statRow, statTile } from "./charts.js";
+import { createMotionController, prefersReducedMotion } from "./motion.js";
 import { initPipeline } from "./pipeline.js";
 
 const RACE_MODES = {
@@ -16,7 +16,7 @@ const RACE_MODES = {
       "-- Generating done",
       "-- Build files have been written to: <project>/build-2"
     ],
-    caption: "CMake 4.5.1 has no cross-tree probe cache.",
+    caption: "CMake has no cross-tree cache.",
     key: "warmProbeSpeedup",
     kind: "ratio"
   },
@@ -147,34 +147,23 @@ function initRace(doc, motion) {
   return { setData(d) { bench = d; widget.classList.contains("is-in") ? play() : render(); } };
 }
 
-function renderGauges(el, data, motion) {
+function renderSnapshot(el, data) {
   const gates = data?.tracks?.benchmarksAndGates?.gates || [];
   const g = (id, def) => gates.find((x) => x.id === id) || def;
   const fuzz = g("fuzz", { passed: null, failures: null, status: "pending" });
   const wasi = g("wasi", { passed: null, total: 6, status: "pending" });
-  const bb = g("blackbox", { scenariosPassed: null, scenariosTotal: 20, status: "pending" });
   const core = data?.tracks?.coreConformance || { suitesAt100: null, suitesTotal: 62, status: "pending" };
-  const probe = g("probe-cache", { passed: null, total: 16, status: "pending" });
-  const mut = g("mutation-replay", { passed: null, total: 20, status: "pending" });
-
+  const hold = data?.tracks?.unseenHoldout || { reposPassed: null, reposTotal: 240, status: "pending" };
   const fuzzPre = isPreFreezeGate(fuzz, data);
   const wasiPre = isPreFreezeGate(wasi, data);
-  const preTag = (row) => (row.commit ? `pre-freeze \u00b7 ${row.commit}` : "pre-freeze");
+  const fails = fuzz.failures ?? 0;
 
   el.innerHTML = [
-    fuzzGaugeCard({ label: "Seeded fuzz inputs", passed: fuzz.passed, failures: fuzz.failures, status: fuzzPre ? "partial" : fuzz.status, summary: fuzzPre ? preTag(fuzz) : "", preFreeze: fuzzPre, testId: "gauge-fuzz" }),
-    ringGaugeCard({ label: "WASI checks", passed: wasi.passed, total: wasi.total ?? 6, status: wasiPre ? "partial" : wasi.status, summary: wasiPre ? preTag(wasi) : "", preFreeze: wasiPre, testId: "gauge-wasi" }),
-    ringGaugeCard({ label: "Black-box scenarios", passed: bb.scenariosPassed, total: bb.scenariosTotal ?? 20, status: bb.status, testId: "gauge-blackbox" }),
-    ringGaugeCard({ label: "Core suites", passed: core.suitesAt100, total: core.suitesTotal ?? 62, status: core.status, testId: "gauge-core" }),
-    ringGaugeCard({ label: "Probe cache checks", passed: probe.passed, total: probe.total ?? 16, status: probe.status, testId: "gauge-probe-cache" }),
-    ringGaugeCard({ label: "Mutation replay checks", passed: mut.passed, total: mut.total ?? 20, status: mut.status, testId: "gauge-mutation-replay" })
+    statTile({ label: "Fuzz inputs", value: fuzz.passed, detail: fails === 0 ? "0 panics" : `${formatNumber(fails)} failures`, status: fuzzPre ? "partial" : fuzz.status, tag: fuzzPre ? "pre-freeze" : "", testId: "gauge-fuzz" }),
+    statTile({ label: "WASI checks", value: wasi.passed, total: wasi.total ?? 6, status: wasiPre ? "partial" : wasi.status, tag: wasiPre ? "pre-freeze" : "", testId: "gauge-wasi" }),
+    statTile({ label: "Core suites", value: core.suitesAt100, total: core.suitesTotal ?? 62, unit: isMeasured(core.suitesAt100) ? "" : "suites", detail: "fully passing", status: core.status, testId: "gauge-core" }),
+    statTile({ label: "Blind holdout", value: hold.reposPassed, total: hold.reposTotal ?? 240, unit: isMeasured(hold.reposPassed) ? "" : "repos", detail: "L2 parity", status: hold.status, testId: "gauge-holdout" })
   ].join("");
-
-  const fEl = el.querySelector("[data-fuzz-target]");
-  if (fEl && isMeasured(fuzz.passed)) {
-    const go = () => animateCountUp(fEl, fuzz.passed, { duration: 800 });
-    el.classList.contains("is-in") ? go() : motion.observeReveal(el, go);
-  }
 }
 
 function renderGiantsTable(giants) {
@@ -203,45 +192,80 @@ function renderSpeed(el, bench, motion, giants = null) {
   const c = b.coldConfigureSpeedup || {};
   const l = b.incrementalLeafP95Ms || {};
   const r = b.peakRssMiB || {};
-  el.innerHTML = `${speedupBars({ label: "New tree, shared probe cache", baseline: "CMake has no cross-tree cache", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, status: l.status, testId: "speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
+  el.innerHTML = `${speedupBars({ label: "New tree, shared probe cache", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, status: l.status, testId: "speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
   motion.scan(el);
 }
 
-function initCompareAndLangs(doc) {
+function initCompare(doc) {
   const filter = doc.getElementById("cmp-filter");
-  const rows = Array.from(doc.querySelectorAll("#cmp-body tr[data-group]"));
+  const panel = doc.getElementById("cmp-panel");
+  if (!filter || !panel) return;
   initRovingGroup(filter, "[data-cmp-group]", (btn) => {
     const grp = btn.dataset.cmpGroup;
     filter.querySelectorAll("[data-cmp-group]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.cmpGroup === grp)));
-    rows.forEach((row) => {
-      const show = grp === "all" || row.dataset.group === grp;
-      row.classList.toggle("is-hidden", !show);
-      if (show) { row.classList.add("is-fading"); requestAnimationFrame(() => row.classList.remove("is-fading")); }
+    if (panel.dataset.filter === grp) return;
+    panel.dataset.filter = grp;
+    if (prefersReducedMotion()) return;
+    panel.querySelectorAll("tbody tr").forEach((row, i) => {
+      row.classList.remove("row-in");
+      row.style.setProperty("--row-i", String(Math.min(i, 12)));
     });
+    void panel.offsetWidth;
+    panel.querySelectorAll("tbody tr").forEach((row) => row.classList.add("row-in"));
   });
+}
 
-  const detail = doc.getElementById("lang-detail");
-  const chips = Array.from(doc.querySelectorAll("#lang-grid .lang-chip"));
-  const show = (chip) => {
-    chips.forEach((c) => c.setAttribute("aria-pressed", String(c === chip)));
-    const text = chip.dataset.langDetail || "";
-    if (chip.dataset.langPartial === "true") {
-      detail.innerHTML = `<span class="st st-partial"><svg class="i" aria-hidden="true"><use href="#i-differs"/></svg><span class="visually-hidden">partial</span></span><span>${escapeHtml(text)}</span>`;
-    } else detail.textContent = text;
+function initFaq(doc) {
+  const items = Array.from(doc.querySelectorAll("#faq details.faq-item"));
+  const reduced = prefersReducedMotion();
+  items.forEach((item) => {
+    const summary = item.querySelector("summary");
+    const answer = item.querySelector(".faq-answer");
+    if (!summary || !answer) return;
+    if (item.open) item.classList.add("is-open");
+    summary.addEventListener("click", (e) => {
+      e.preventDefault();
+      if (!item.open) {
+        item.open = true;
+        requestAnimationFrame(() => requestAnimationFrame(() => item.classList.add("is-open")));
+        return;
+      }
+      item.classList.remove("is-open");
+      if (reduced) { item.open = false; return; }
+      const done = () => { if (!item.classList.contains("is-open")) item.open = false; };
+      answer.addEventListener("transitionend", done, { once: true });
+      setTimeout(done, 420);
+    });
+    item.addEventListener("toggle", () => { if (item.open) item.classList.add("is-open"); else item.classList.remove("is-open"); });
+  });
+}
+
+function initHeroDepth(doc) {
+  const glow = doc.querySelector(".hero-glow");
+  if (!glow || typeof window === "undefined" || prefersReducedMotion()) return;
+  let queued = false;
+  const apply = () => {
+    queued = false;
+    const y = Math.min(window.scrollY, 900);
+    glow.style.transform = `translate3d(0, ${(y * 0.18).toFixed(1)}px, 0)`;
+    glow.style.opacity = String(Math.max(0, 1 - y / 900));
   };
-  chips.forEach((c) => ["click", "mouseenter", "focus"].forEach((ev) => c.addEventListener(ev, () => show(c))));
+  window.addEventListener("scroll", () => { if (!queued) { queued = true; requestAnimationFrame(apply); } }, { passive: true });
 }
 
 async function init() {
   const motion = createMotionController(document);
   initTerminal(document);
   const race = initRace(document, motion);
-  initCompareAndLangs(document);
+  initCompare(document);
+  initFaq(document);
+  initHeroDepth(document);
   initPipeline(document.getElementById("pipeline-widget"), motion);
 
   const [waffles, gauges, speed, errEl] = ["waffle-panel", "gauge-grid", "speed-panel", "home-load-error"].map((id) => document.getElementById(id));
-  waffles.innerHTML = waffleRowsHtml(DEFAULT_PLATFORMS);
-  renderGauges(gauges, null, motion);
+  waffles.innerHTML = osStripsHtml(DEFAULT_PLATFORMS);
+  renderSnapshot(gauges, null);
+  revealScan(gauges);
   renderSpeed(speed, null, motion);
 
   try {
@@ -256,8 +280,9 @@ async function init() {
     };
     syncCmpGate("policies", data?.tracks?.policies?.status);
     syncCmpGate("generators", data?.tracks?.runCmakeOs?.status);
-    waffles.innerHTML = waffleRowsHtml(data?.tracks?.runCmakeOs?.platforms || DEFAULT_PLATFORMS);
-    renderGauges(gauges, data, motion);
+    waffles.innerHTML = osStripsHtml(data?.tracks?.runCmakeOs?.platforms || DEFAULT_PLATFORMS);
+    renderSnapshot(gauges, data);
+    revealScan(gauges);
     renderSpeed(speed, data?.tracks?.benchmarksAndGates?.benchmarks, motion, data?.tracks?.benchmarksAndGates?.giantsBenchmark || null);
     race.setData(data?.tracks?.benchmarksAndGates?.benchmarks || null);
     motion.scan(document);

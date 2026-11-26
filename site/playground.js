@@ -105,10 +105,11 @@ function updateModeBadge(mode, durationMs = null) {
   const label = mode === "loading"
     ? "loading"
     : wasm
-      ? `wasm \u00b7 engine ${adapter.engineCommit}${timing}`
+      ? `wasm${timing}`
       : "wasm error";
   if (els.modeBadgeText) els.modeBadgeText.textContent = label;
   else els.modeBadge.textContent = label;
+  if (wasm) els.modeBadge.title = `rcmake_wasm.wasm, engine ${adapter.engineCommit}`;
 }
 
 function normalizePath(raw) {
