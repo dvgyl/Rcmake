@@ -1084,6 +1084,11 @@ def check_benchmarks_giants(record: ReceiptRecord, findings: list[Finding]) -> N
         ))
 
 
+# bench_eval.py writes this note only when each cold run starts with an empty
+# probe store. Older reports measured a warm probe cache and must not count.
+COLD_ISOLATION_NOTE = "empty probe cache"
+
+
 def check_benchmarks_synthetic(record: ReceiptRecord, findings: list[Finding]) -> None:
     payload = record.payload
     rows = payload.get("results")
@@ -1101,7 +1106,9 @@ def check_benchmarks_synthetic(record: ReceiptRecord, findings: list[Finding]) -
             if row.get("name") == "configure 500 targets (cold)" or row.get("case") == "cold-500":
                 rcmake = row.get("rcmake") if isinstance(row.get("rcmake"), dict) else {}
                 rss = rcmake.get("peak_rss_mib", row.get("peak_rss_mib"))
-                if is_number(row.get("speedup")) and row["speedup"] > 0 and is_number(rss) and rss > 0:
+                isolated = COLD_ISOLATION_NOTE in str(row.get("notes") or "")
+                if (isolated and is_number(row.get("speedup")) and row["speedup"] > 0
+                        and is_number(rss) and rss > 0):
                     cold_ok = True
             if row.get("case") == "warm probe-cache configure":
                 if is_number(row.get("speedup")) and row["speedup"] > 0:
@@ -1122,7 +1129,7 @@ def check_benchmarks_synthetic(record: ReceiptRecord, findings: list[Finding]) -
             ))
         missing_cases = [
             name for name, present in (
-                ("cold 500-target configure + RSS", cold_ok),
+                ("cold 500-target configure (empty probe cache) + RSS", cold_ok),
                 ("warm probe-cache configure", warm_ok),
                 ("incremental-leaf p95", leaf_ok),
             ) if not present

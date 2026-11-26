@@ -101,6 +101,7 @@ def make_synthetic_results() -> tuple[list[dict], list[dict]]:
     cold_rows = [
         {
             "name": "configure 500 targets (cold)",
+            "notes": "new build tree, empty probe cache, includes compiler checks",
             "speedup": 2.15,
             "rcmake": {"ok": True, "failures": 0, "peak_rss_mib": 74.5},
             "oracle": {"ok": True, "failures": 0},

@@ -224,6 +224,7 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
                     {
                         "project": "synthetic",
                         "name": "configure 500 targets (cold)",
+                        "notes": "new build tree, empty probe cache, includes compiler checks",
                         "speedup": 2.15,
                         "rcmake": {"ok": True, "failures": 0, "peak_rss_mib": 74.5},
                         "oracle": {"ok": True, "failures": 0},
@@ -493,6 +494,17 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
             "wasi", "conan", "vcpkg", "benchmarks_giants",
         ):
             self.assertIn(f"{key} (failed)", stderr)
+
+    def test_rejects_cold_benchmark_without_empty_probe_cache(self):
+        payloads = self.build_valid_receipts()
+        cold = payloads["benchmarks_synthetic"]["results"][0]
+        cold["notes"] = "new build tree, includes compiler checks"
+        manifest = self.write_manifest(payloads)
+
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("benchmarks_synthetic (missing)", stderr)
+        self.assertIn("cold 500-target configure (empty probe cache)", stderr)
 
     def test_rejects_corrupt_wasm_bundle_and_dist_tarball_checksum_mismatch(self):
         payloads = self.build_valid_receipts()

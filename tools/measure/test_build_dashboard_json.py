@@ -18,7 +18,7 @@ class DashboardTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.output = self.root / "latest.json"
-        self.base = builder.read_json(builder.DATA / "latest.json")
+        self.base = builder.clean_draft_text(builder.read_json(builder.DATA / "latest.json"))
         self.schema = builder.read_json(builder.DATA / "dashboard.schema.json")
 
     def report(self, name, payload):
@@ -44,6 +44,20 @@ class DashboardTests(unittest.TestCase):
         expected = dict(self.base)
         expected.pop("generatedAt")
         self.assertEqual(result, expected)
+
+    def test_output_has_no_draft_labels(self):
+        self.base["tracks"]["bossFight"]["label"] = "10 Boss-Fight Giants"
+        self.base["statusNote"] = "[FINAL_METRIC] Gates are recorded."
+        self.base["tracks"]["benchmarksAndGates"]["benchmarks"]["warmProbeSpeedup"]["note"] = (
+            "[FINAL_METRIC] Measured across real-world corpus on idle hardware.")
+        result = self.build("--base", self.report("draft.json", self.base))
+        text = json.dumps(result)
+        self.assertNotIn("[FINAL_METRIC]", text)
+        self.assertNotIn("Boss-Fight", text)
+        self.assertNotIn("real-world corpus", text)
+        self.assertEqual(result["tracks"]["bossFight"]["label"], "Large projects")
+        self.assertEqual(result["statusNote"], "Gates are recorded.")
+        self.assertNotIn("note", result["tracks"]["benchmarksAndGates"]["benchmarks"]["warmProbeSpeedup"])
 
     def test_metadata_and_explicit_base_can_write_in_place(self):
         self.base["commit"] = "0000000"
@@ -214,14 +228,24 @@ class DashboardTests(unittest.TestCase):
         legacy = self.report("bench.json", {"results": [
             {"name": "configure 100 targets (cold)", "speedup": 7},
             {"name": "configure 500 targets (cold)", "speedup": 1.5,
+             "notes": "new build tree, empty probe cache, includes compiler checks",
              "rcmake": {"ok": True, "peak_rss_mib": 88.2}},
         ]})
         section = self.build("--bench", configure, "--bench", legacy)["tracks"]["benchmarksAndGates"]
         self.assertEqual({key: (row["value"], row["status"]) for key, row in section["benchmarks"].items()},
                          {"warmProbeSpeedup": (6, "fail"), "incrementalLeafP95Ms": (63, "pass"),
                           "coldConfigureSpeedup": (1.5, "pass"), "peakRssMiB": (88.2, "pass")})
+        self.assertTrue(section["benchmarks"]["warmProbeSpeedup"]["note"].startswith(
+            "Geometric mean across a, b."))
         partial = self.build("--bench", configure)["tracks"]["benchmarksAndGates"]["benchmarks"]
         self.assertEqual(partial["peakRssMiB"]["status"], "pending")
+        stale = self.report("stale.json", {"results": [
+            {"name": "configure 500 targets (cold)", "speedup": 9.0,
+             "notes": "new build tree, includes compiler checks",
+             "rcmake": {"ok": True, "peak_rss_mib": 88.2}},
+        ]})
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            builder.main(["--out", str(self.output), "--bench", stale])
 
     def test_large_projects_reads_summary_and_project_reports_without_double_counting(self):
         self.report("large-projects/reports/result.json", {"projects": [
@@ -268,6 +292,9 @@ class DashboardTests(unittest.TestCase):
         gate = self.gate(self.build("--fuzz-dir", str(self.root / "fuzz")), "fuzz")
         self.assertEqual((gate["status"], gate["passed"], gate["total"], gate["failures"]),
                          ("fail", 298, 300, 2))
+        self.assertTrue(gate["label"].startswith("Seeded generative fuzzing"), gate["label"])
+        self.assertEqual(gate["summary"], "300 inputs, 2 failures")
+        self.assertIn("not coverage-guided", gate["detail"])
 
     def test_vcpkg_aggregates_workflow_artifacts(self):
         def shard(index, ports, outcomes):

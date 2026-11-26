@@ -7,6 +7,8 @@ Use --projects synthetic zlib to include a local conformance/corpus/zlib
 checkout. Each run uses a private source copy and build directory.
 Use --scenario all to run all configure scenarios.
 Use --require-gates to enforce the acceptance thresholds.
+Use --leaf-edit compile-definition to make the leaf edit change the targets
+of the edited directory. The default edit sets an unused variable.
 """
 
 from __future__ import annotations
@@ -35,8 +37,10 @@ import tomllib
 
 try:
     from ._proc import kill_group
+    from .bench_eval import describe_hardware, host_hardware
 except ImportError:
     from _proc import kill_group
+    from bench_eval import describe_hardware, host_hardware
 from determinism import observe_compilers
 from mutation_eval import API, REPLAY_RESULT, discover_leaves, replay_leaves
 from oracle_prop_test import run_command
@@ -63,6 +67,13 @@ REGISTRY_FLAGS = (
     "-DCMAKE_EXPORT_NO_PACKAGE_REGISTRY=ON",
 )
 LEAF_MARKER = "RCMAKE_M6_BENCH_LEAF_EDIT"
+LEAF_EDITS = {
+    # Set a variable that nothing reads. The targets do not change.
+    "inert": f"\nset({LEAF_MARKER} 1)\n",
+    # Also add a compile definition. CMake applies it to every target in the
+    # directory, so the generated compile commands change.
+    "compile-definition": f"\nset({LEAF_MARKER} 1)\nadd_compile_definitions({LEAF_MARKER}=1)\n",
+}
 CACHE_SETTINGS = re.compile(
     r"^((?:CMAKE_\w+_(?:COMPILER(?:_ARG1|_LAUNCHER)?|FLAGS)|CMAKE_(?:MAKE_PROGRAM"
     r"|TOOLCHAIN_FILE|OSX_SYSROOT|SYSROOT|FIND_USE_(?:SYSTEM_)?PACKAGE_REGISTRY"
@@ -329,7 +340,8 @@ def leaf_trace(trace, source, leaf, control):
 
 
 def configure_runs(binary, project, work, generator, env, timeout, *, synthetic, cases,
-                   leaf_pair=None, unavailable=None, timed=True, replay_evidence=False):
+                   leaf_pair=None, unavailable=None, timed=True, replay_evidence=False,
+                   leaf_edit="inert"):
     """Run the selected configure phases in one isolated trial."""
     original, configure_args = project
     source = copy_source(original, work)
@@ -383,7 +395,7 @@ def configure_runs(binary, project, work, generator, env, timeout, *, synthetic,
                 if editable.resolve() != editable.absolute():
                     raise ValueError(f"Cannot edit a symlinked listfile at {leaf}.")
                 with editable.open("ab") as stream:
-                    stream.write(f"\nset({LEAF_MARKER} 1)\n".encode())
+                    stream.write(LEAF_EDITS[leaf_edit].encode())
             except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
                 results[phase] = Sample(error=f"Could not edit a configured leaf. {error}")
                 continue
@@ -517,7 +529,8 @@ def fetch_runs(binary, fixture, work, generator, env, timeout, *, offline, timed
     return {COLD_FETCH: cold, WARM_FETCH: warm}
 
 
-def preflight(binaries, project, cases, work, generator, env, timeout, *, synthetic):
+def preflight(binaries, project, cases, work, generator, env, timeout, *, synthetic,
+              leaf_edit="inert"):
     """Use untimed configure results to establish each scenario's prerequisites."""
     work.mkdir()
     unavailable = {}
@@ -544,7 +557,8 @@ def preflight(binaries, project, cases, work, generator, env, timeout, *, synthe
                 sample = configure_runs(binary, project, lane, generator, env, timeout,
                                         synthetic=synthetic, cases=(COLD, INCREMENTAL_LEAF),
                                         leaf_pair=leaf_pair, timed=False,
-                                        replay_evidence=tool == "rcmake")[INCREMENTAL_LEAF]
+                                        replay_evidence=tool == "rcmake",
+                                        leaf_edit=leaf_edit)[INCREMENTAL_LEAF]
                 if sample.error or not sample.edited_leaf_executed:
                     raise ValueError(sample.error or f"{tool} did not execute the leaf edit.")
                 if tool == "rcmake" and not sample.replayed_regions:
@@ -705,8 +719,11 @@ def markdown(report):
         f"Generator {meta['generator']}. Timeout {meta['timeout_seconds']:g} s per command.",
         f"Rcmake profile {meta['rcmake_profile']}. Load average {meta['load_average'][0]:.2f} "
         f"over one minute on {meta['cpus']} logical CPUs.",
+        f"Hardware: {describe_hardware(meta.get('hardware', {}))}.",
+        f"Leaf edit: {meta.get('leaf_edit', 'inert')}.",
         "",
         "Time columns show median and p95 in ms. "
+        "With fewer than 20 runs, p95 is the slowest run. "
         "RSS is the largest peak resident set size among successful runs, in MiB. "
         "Speedups divide the reference median by the Rcmake median.",
         "",
@@ -768,6 +785,9 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Use smaller fixtures and shorter timeouts.")
     parser.add_argument("--scenario", choices=(*SCENARIOS, "all"), action="append",
                         help="Run a configure scenario and its cold baseline. Repeat to select more than one.")
+    parser.add_argument("--leaf-edit", choices=tuple(LEAF_EDITS), default="inert",
+                        help="Leaf edit for incremental-leaf: inert (default) sets an unused variable; "
+                             "compile-definition also changes the directory's targets.")
     parser.add_argument("--require-gates", action="store_true",
                         help="Return an error if a selected scenario misses its acceptance target.")
     parser.add_argument("--timeout", type=float, help="Seconds per command. Default: 180, or 30 in quick mode.")
@@ -836,7 +856,7 @@ def main():
                 print(f"Checking prerequisites for {name}.", file=sys.stderr, flush=True)
                 leaf_pair, unavailable = preflight(
                     binaries, project, cases, scratch / f"preflight-{index}", generator, workload_env,
-                    timeout, synthetic=name == "synthetic",
+                    timeout, synthetic=name == "synthetic", leaf_edit=args.leaf_edit,
                 )
                 if WARM_FETCH in unavailable:
                     unavailable[COLD_FETCH] = unavailable[WARM_FETCH]
@@ -859,7 +879,8 @@ def main():
                     else:
                         samples = configure_runs(binaries[tool], project, work, generator, env,
                                                  timeout, synthetic=name == "synthetic", cases=cases,
-                                                 leaf_pair=leaf_pair, unavailable=unavailable)
+                                                 leaf_pair=leaf_pair, unavailable=unavailable,
+                                                 leaf_edit=args.leaf_edit)
                         if leaf_pair and not samples[INCREMENTAL_LEAF].error:
                             verify = work / "verify-leaf"
                             verify.mkdir()
@@ -867,6 +888,7 @@ def main():
                                 binaries[tool], project, verify, generator, env, timeout,
                                 synthetic=name == "synthetic", cases=(COLD, INCREMENTAL_LEAF),
                                 leaf_pair=leaf_pair, timed=False, replay_evidence=tool == "rcmake",
+                                leaf_edit=args.leaf_edit,
                             )[INCREMENTAL_LEAF]
                             leaf_sample = samples[INCREMENTAL_LEAF]
                             leaf_sample.error = evidence.error
@@ -888,6 +910,7 @@ def main():
             "runs": args.runs, "quick": args.quick, "timeout_seconds": timeout,
             "system": platform.system(), "os_release": platform.release(),
             "machine": platform.machine(), "cpus": os.cpu_count(), "load_average": load,
+            "hardware": host_hardware(), "leaf_edit": args.leaf_edit,
             "generator": generator, "synthetic_directories": directories,
             "synthetic_probes": probes,
             "scenarios": [name for name in SCENARIOS if name in selected],

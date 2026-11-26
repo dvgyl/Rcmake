@@ -205,6 +205,7 @@ class ReleasePipelineTests(unittest.TestCase):
         synthetic = self.directory("benchmarks_synthetic")
         cold = self.write_receipt(synthetic / "bench-eval.json", {"results": [{
             "name": "configure 500 targets (cold)", "speedup": 2.15,
+            "notes": "new build tree, empty probe cache, includes compiler checks",
             "rcmake": {"ok": True, "peak_rss_mib": 74.5}, "oracle": {"ok": True},
         }]})
         configure = self.write_receipt(synthetic / "bench-configure.json", {"results": [

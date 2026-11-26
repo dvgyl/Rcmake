@@ -7,6 +7,10 @@ leaf reconfigure, peak RSS, and optional generated Ninja build parity across
 DuckDB, OpenCV, Protobuf, Qt Base, and LLVM, plus optional vcpkg and Conan
 package-manager profiles.
 
+The default incremental leaf edit appends a comment line. Use
+--leaf-edit compile-definition to also append add_compile_definitions(), which
+changes the compile commands of every target in the edited directory.
+
 Example:
     python3 tools/measure/bench_giants.py --projects duckdb,opencv,protobuf,qtbase,llvm-project --runs 3
 """
@@ -36,8 +40,10 @@ import tomllib
 from typing import Any, Callable, Sequence
 
 if __package__:
+    from .bench_eval import describe_hardware, host_hardware
     from .oracle_prop_test import resolve_identity
 else:
+    from bench_eval import describe_hardware, host_hardware
     from oracle_prop_test import resolve_identity
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -68,6 +74,8 @@ REGISTRY_FLAGS = (
 )
 COMPILER_CACHES = frozenset({"ccache", "sccache"})
 TOUCH_PREFIX = "# rcmake-bench-giants-touch"
+LEAF_EDIT_DEFINITION = "RCMAKE_BENCH_GIANTS_LEAF_EDIT"
+LEAF_EDITS = ("comment", "compile-definition")
 
 PROBE_STATS_RE = re.compile(
     r"probe[\s_-]*cache[^0-9\n]*(\d+)\s*hits?[^0-9\n]*(\d+)\s*miss(?:es)?",
@@ -778,6 +786,7 @@ def build_reproducer_command(
     verify_build: bool = False,
     verify_build_mode: str = "both",
     profile_diagnostics: bool = False,
+    leaf_edit: str = "comment",
 ) -> str:
     """Build the clean one-command CLI reproducer without machine-local paths."""
     parts = [
@@ -798,6 +807,8 @@ def build_reproducer_command(
             parts.extend(["--verify-build-mode", verify_build_mode])
     if profile_diagnostics:
         parts.append("--profile-diagnostics")
+    if leaf_edit != "comment":
+        parts.extend(["--leaf-edit", leaf_edit])
     return " ".join(parts)
 
 
@@ -1048,8 +1059,12 @@ def prepare_package_manager_profile(
 
 
 @contextmanager
-def temporary_leaf_touch(leaf_path: Path, build_dir: Path, marker: str):
-    """Append one reversible comment line to leaf_path and advance mtime past build.ninja."""
+def temporary_leaf_touch(leaf_path: Path, build_dir: Path, marker: str, edit: str = "comment"):
+    """Append a reversible edit to leaf_path and advance mtime past build.ninja.
+
+    The `comment` edit appends one comment line. The `compile-definition` edit also
+    appends add_compile_definitions(), which changes the directory's targets.
+    """
     original_bytes = leaf_path.read_bytes()
     original_stat = leaf_path.stat()
     build_ninja = build_dir / "build.ninja"
@@ -1058,7 +1073,10 @@ def temporary_leaf_touch(leaf_path: Path, build_dir: Path, marker: str):
         floor_ns = max(floor_ns, build_ninja.stat().st_mtime_ns)
     new_mtime_ns = max(time.time_ns(), floor_ns + 1_000_000_000)
     try:
-        suffix = f"\n{TOUCH_PREFIX} {marker}\n".encode("utf-8")
+        text = f"\n{TOUCH_PREFIX} {marker}\n"
+        if edit == "compile-definition":
+            text += f"add_compile_definitions({LEAF_EDIT_DEFINITION}=1)\n"
+        suffix = text.encode("utf-8")
         leaf_path.write_bytes(original_bytes + suffix)
         os.utime(leaf_path, ns=(original_stat.st_atime_ns, new_mtime_ns))
         yield
@@ -1230,6 +1248,7 @@ def benchmark_project(
     profile_diagnostics: bool,
     keep_builds: bool,
     runner: CommandRunner = measure_command,
+    leaf_edit: str = "comment",
 ) -> dict[str, Any]:
     """Run cold, warm probe-cache, incremental leaf, and optional build verification for one project."""
     project_work = work_root / spec.name
@@ -1434,7 +1453,8 @@ def benchmark_project(
                         probe_cache_mode="readwrite",
                         extra=combined_extra_env,
                     )
-                    with temporary_leaf_touch(leaf_abs, build_dir, f"{spec.name}-{tool}-{trial}"):
+                    with temporary_leaf_touch(leaf_abs, build_dir, f"{spec.name}-{tool}-{trial}",
+                                              leaf_edit):
                         sample = run_configure_once(
                             binaries[tool],
                             source_root,
@@ -1650,6 +1670,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"Runs per phase: {meta['runs']}. Host: {meta['system']} {meta['machine']} "
         f"({meta['cpus']} CPUs). Generator: {meta['generator']}.",
+        f"Hardware: {describe_hardware(meta.get('hardware') or {})}. "
+        f"Leaf edit: {meta.get('leaf_edit', 'comment')}.",
         f"Reference CMake: `{meta['oracle_version']}`. Rcmake: `{meta['rcmake_version']}` "
         f"({meta['rcmake_profile']}).",
         "",
@@ -1661,7 +1683,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "## Configure speed and peak RSS",
         "",
-        "Times are median wall-clock milliseconds (incremental leaf shows Rcmake median / p95). "
+        "Times are median wall-clock milliseconds (incremental leaf shows Rcmake median / p95; "
+        "with fewer than 20 runs, p95 is the slowest run). "
         "Warm probe-cache compares a fresh build directory using a shared `RCMAKE_PROBE_CACHE` "
         "against a fresh CMake 4.5.1 build directory. Peak RSS is the maximum across cold and warm runs in MiB.",
         "",
@@ -1917,6 +1940,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="OUT",
         help="Write the structured JSON report to OUT.",
     )
+    parser.add_argument(
+        "--leaf-edit",
+        choices=LEAF_EDITS,
+        default="comment",
+        help="Incremental leaf edit: comment (default) or compile-definition, which changes targets.",
+    )
     parser.add_argument("--rcmake-sha", help="Commit SHA of the Rcmake binary.")
     parser.add_argument("--binary-sha256", help="Require this SHA-256 digest for the Rcmake binary.")
     parser.add_argument(
@@ -1981,6 +2010,7 @@ def main(
         verify_build=args.verify_build,
         verify_build_mode=args.verify_build_mode,
         profile_diagnostics=args.profile_diagnostics,
+        leaf_edit=args.leaf_edit,
     )
 
     rcmake_profile = next(
@@ -2023,6 +2053,7 @@ def main(
                 profile_diagnostics=args.profile_diagnostics,
                 keep_builds=args.keep_builds,
                 runner=runner,
+                leaf_edit=args.leaf_edit,
             )
             project_results.append(result)
     finally:
@@ -2045,6 +2076,8 @@ def main(
             "machine": platform.machine(),
             "cpus": os.cpu_count(),
             "load_average": load_avg,
+            "hardware": host_hardware(),
+            "leaf_edit": args.leaf_edit,
             "oracle_version": oracle_version,
             "rcmake_version": rcmake_version,
             "rcmake_profile": rcmake_profile,

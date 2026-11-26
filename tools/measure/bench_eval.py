@@ -18,9 +18,15 @@ Benchmark categories:
   ``copy_directory``).
 * ``project``: synthetic C projects with 100 and 500 targets, with transitive
   ``target_link_libraries``, ``install``, ``export``, and ``compile_commands.json``.
-  Each project runs a cold configure (new build tree) and a warm re-configure.
+  Each project runs a cold configure (new build tree, empty probe cache) and a
+  warm re-configure of the same build tree.
 * ``corpus``: optional (``--include-corpus``) cold configure of the pinned
   zlib, fmt, and nlohmann/json releases from ``conformance/corpus/manifest.toml``.
+
+Each tool has a private probe store under the scratch directory. The harness
+removes inherited ``RCMAKE_*`` settings (except ``RCMAKE_VENDORED_DATA_ROOT``),
+so the user's own probe cache and settings do not change the results. A cold
+configure empties the store before each run.
 
 Example:
 
@@ -56,6 +62,121 @@ ORACLE_VERSION = "4.5.1"
 ORACLE_RELATIVE = "env/oracle/cmake-4.5.1-macos-universal/CMake.app/Contents/bin/cmake"
 CORPUS_PROJECTS = ("zlib", "fmt", "nlohmann/json")
 MIB = 1024 * 1024
+GIB = 1024 * MIB
+KEPT_RCMAKE_VARIABLES = frozenset({"RCMAKE_VENDORED_DATA_ROOT"})
+PROBE_HITS_RES = (
+    re.compile(r"probe[\s_-]*cache[^0-9\n]*(\d+)\s*hits?", re.IGNORECASE),
+    re.compile(r"\bprobe_hits\s*[:=]\s*(\d+)\b", re.IGNORECASE),
+)
+
+
+def command_output(command: list[str], timeout: float = 10) -> str | None:
+    """Return the stripped standard output of a successful command, or None."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout,
+                                check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = result.stdout.strip()
+    return output if result.returncode == 0 and output else None
+
+
+def read_text(path: Path) -> str:
+    """Return the file text, or an empty string when the file cannot be read."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def host_hardware(system: str | None = None,
+                  command: Callable[[list[str]], str | None] = command_output,
+                  root: Path = Path("/")) -> dict:
+    """Describe the CPU model, total memory, OS version, and power source.
+
+    A value that the host does not report is None. On macOS the data comes from
+    `sysctl`, `sw_vers`, and `pmset`. On Linux it comes from `/proc/cpuinfo`,
+    `/proc/meminfo`, `/etc/os-release`, and `/sys/class/power_supply`.
+    """
+    system = system or platform.system()
+    info: dict = {"cpu_model": None, "memory_gib": None, "os_version": None,
+                  "power_source": None}
+    memory_bytes: int | None = None
+    if system == "Darwin":
+        info["cpu_model"] = command(["sysctl", "-n", "machdep.cpu.brand_string"])
+        memory = command(["sysctl", "-n", "hw.memsize"])
+        memory_bytes = int(memory) if memory and memory.isdigit() else None
+        name, version, build = (command(["sw_vers", flag]) for flag in
+                                ("-productName", "-productVersion", "-buildVersion"))
+        if version:
+            info["os_version"] = f"{name or 'macOS'} {version}" + (f" ({build})" if build else "")
+        source = re.search(r"drawing from '([^']+)'", command(["pmset", "-g", "batt"]) or "")
+        info["power_source"] = source.group(1) if source else None
+    elif system == "Linux":
+        cpuinfo = read_text(root / "proc/cpuinfo")
+        for key in ("model name", "Processor", "Hardware", "cpu model"):
+            match = re.search(rf"^{key}\s*:\s*(.+?)\s*$", cpuinfo, re.MULTILINE)
+            if match:
+                info["cpu_model"] = match.group(1)
+                break
+        match = re.search(r"^MemTotal:\s*(\d+)\s*kB", read_text(root / "proc/meminfo"), re.MULTILINE)
+        memory_bytes = int(match.group(1)) * 1024 if match else None
+        match = re.search(r'^PRETTY_NAME="?([^"\n]+)"?\s*$', read_text(root / "etc/os-release"),
+                          re.MULTILINE)
+        info["os_version"] = match.group(1) if match else None
+        supplies = root / "sys/class/power_supply"
+        mains = [read_text(supply / "online").strip()
+                 for supply in (sorted(supplies.iterdir()) if supplies.is_dir() else [])
+                 if read_text(supply / "type").strip() == "Mains"]
+        if mains:
+            info["power_source"] = "AC Power" if "1" in mains else "Battery Power"
+    if memory_bytes:
+        info["memory_gib"] = round(memory_bytes / GIB, 1)
+    return info
+
+
+def describe_hardware(info: dict) -> str:
+    """Render host_hardware() data as one line of text."""
+    memory = info.get("memory_gib")
+    parts = [
+        info.get("cpu_model") or "unknown CPU",
+        f"{memory:g} GiB RAM" if memory else "unknown RAM",
+        info.get("os_version") or "unknown OS version",
+        f"power: {info.get('power_source') or 'unknown'}",
+    ]
+    return ", ".join(parts)
+
+
+def isolated_env(inherited: dict[str, str]) -> dict[str, str]:
+    """Remove CMake and Rcmake settings that the user's shell can supply.
+
+    `RCMAKE_VENDORED_DATA_ROOT` stays, because a staged binary can need it to find
+    its bundled modules. Other `RCMAKE_*` settings, such as a probe cache directory,
+    would make the two tools see different conditions.
+    """
+    env = {key: value for key, value in inherited.items()
+           if not key.startswith(("CMAKE_", "CTEST_", "CPACK_"))
+           and (not key.startswith("RCMAKE_") or key in KEPT_RCMAKE_VARIABLES)
+           and key not in {"MAKEFLAGS", "PWD"}}
+    env["COPYFILE_DISABLE"] = "1"
+    return env
+
+
+def tool_env(base: dict[str, str], scratch: Path, probe_jobs: int | None = None) -> dict[str, str]:
+    """Give one tool a private probe store below its scratch directory."""
+    env = {**base, "RCMAKE_CACHE_DIR": str(scratch / "store")}
+    if probe_jobs is not None:
+        env["RCMAKE_PROBE_JOBS"] = str(probe_jobs)
+    return env
+
+
+def probe_hits(log_text: str) -> int | None:
+    """Return the probe cache hit count that a configure log reports, or None."""
+    for pattern in PROBE_HITS_RES:
+        match = pattern.search(log_text)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def checkout_roots() -> list[Path]:
@@ -239,6 +360,7 @@ class Bench:
     `command` returns the argument list and working directory for a tool.
     `setup` runs once per tool before the timed runs (not timed).
     `prepare` runs before each timed run (not timed).
+    `empty_probe_cache` makes a run fail when its log reports a probe cache hit.
     """
 
     name: str
@@ -247,6 +369,7 @@ class Bench:
     setup: Callable[[Context], None] | None = None
     prepare: Callable[[Context], None] | None = None
     notes: str = ""
+    empty_probe_cache: bool = False
 
 
 SCRIPTS: dict[str, str] = {
@@ -509,6 +632,7 @@ def project_benches(shared: Path, sizes: list[int]) -> list[Bench]:
 
         def cold_prepare(cx: Context, targets: int = targets) -> None:
             shutil.rmtree(cx.scratch / f"cold{targets}", ignore_errors=True)
+            shutil.rmtree(cx.scratch / "store", ignore_errors=True)
 
         def cold(cx: Context, targets: int = targets, source: Path = source) -> tuple[list[str], Path]:
             return configure_command(cx, source, cx.scratch / f"cold{targets}", []), cx.scratch
@@ -524,7 +648,8 @@ def project_benches(shared: Path, sizes: list[int]) -> list[Bench]:
 
         benches += [
             Bench(f"configure {targets} targets (cold)", "project", cold, prepare=cold_prepare,
-                  notes="new build tree, includes compiler checks"),
+                  notes="new build tree, empty probe cache, includes compiler checks",
+                  empty_probe_cache=True),
             Bench(f"configure {targets} targets (warm)", "project", warm, setup=warm_setup,
                   notes="re-configure an existing build tree"),
         ]
@@ -571,13 +696,16 @@ def corpus_benches(shared: Path) -> list[Bench]:
 
         def prepare(cx: Context, slug: str = slug) -> None:
             shutil.rmtree(cx.scratch / f"corpus-{slug}", ignore_errors=True)
+            shutil.rmtree(cx.scratch / "store", ignore_errors=True)
 
         def command(cx: Context, slug: str = slug, source: Path = source,
                     args: list[str] = args) -> tuple[list[str], Path]:
             return configure_command(cx, source, cx.scratch / f"corpus-{slug}", args), cx.scratch
 
         benches.append(Bench(f"corpus {name} {project.get('version', '')} (cold)", "corpus",
-                             command, prepare=prepare))
+                             command, prepare=prepare,
+                             notes="new build tree, empty probe cache, includes compiler checks",
+                             empty_probe_cache=True))
     return benches
 
 
@@ -623,6 +751,10 @@ def run_bench(bench: Bench, cx: Context, runs: int, warmup: int, timeout: float,
         if sample.error:
             result.error = sample.error
             return result
+        hits = probe_hits(read_text(log)) if bench.empty_probe_cache else None
+        if hits:
+            result.error = f"a cold run reported {hits} probe cache hits"
+            return result
         if index >= warmup:
             result.samples.append(sample)
     return result
@@ -655,7 +787,10 @@ def markdown_table(rows: list[dict], meta: dict) -> str:
         f"- Host: {meta['host']['system']} {meta['host']['machine']}, "
         f"{meta['host']['cpus']} CPUs; generator {meta['generator']}; "
         f"{meta['runs']} runs + {meta['warmup']} warm-up; RSS via {meta['rss_method']}",
-        "- Times are median (p95) in ms. Speedup = cmake median / rcmake median "
+        f"- Hardware: {describe_hardware(meta['host'])}",
+        f"- Rcmake probe jobs: {meta['probe_jobs'] or 'default (smaller of 4 and the CPU count)'}; "
+        "cold runs start with an empty probe store",
+        "- Times are median (p95) in ms. With fewer than 20 runs, p95 is the slowest run. Speedup = cmake median / rcmake median "
         "(above 1.0 means Rcmake is faster).",
         "",
         "| Benchmark | cmake 4.5.1 ms | rcmake ms | Speedup | cmake RSS MiB | rcmake RSS MiB |",
@@ -704,6 +839,8 @@ def main() -> int:
     parser.add_argument("--filter", help="run only benchmarks whose name matches this regex")
     parser.add_argument("--include-corpus", action="store_true",
                         help="also configure the pinned zlib, fmt, and nlohmann/json releases")
+    parser.add_argument("--probe-jobs", type=int,
+                        help="set RCMAKE_PROBE_JOBS for Rcmake (1 runs probes in series)")
     parser.add_argument("--rss-method", default="auto", choices=["auto", "time", "wait4"],
                         help="peak RSS source: /usr/bin/time or wait4 resource usage")
     parser.add_argument("--json", type=Path, help="write the results as JSON to this file")
@@ -712,6 +849,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.runs < 1 or args.warmup < 0:
         parser.error("--runs must be at least 1 and --warmup at least 0")
+    if args.probe_jobs is not None and args.probe_jobs < 1:
+        parser.error("--probe-jobs must be at least 1")
 
     rcmake = find_rcmake(args.rcmake)
     oracle = find_oracle(args.oracle)
@@ -723,9 +862,7 @@ def main() -> int:
         categories.add("corpus")
     pattern = re.compile(args.filter) if args.filter else None
 
-    env = {key: value for key, value in os.environ.items()
-           if not key.startswith(("CMAKE_", "CTEST_", "CPACK_")) and key not in {"MAKEFLAGS", "PWD"}}
-    env["COPYFILE_DISABLE"] = "1"
+    env = isolated_env(dict(os.environ))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
     scratch = Path(tempfile.mkdtemp(prefix="rcmake-bench-", dir="/tmp"))
@@ -749,7 +886,9 @@ def main() -> int:
         contexts = {}
         for name, binary in (("oracle", oracle), ("rcmake", rcmake)):
             (scratch / name).mkdir()
-            contexts[name] = Context(name, binary, scratch / name, generator, env)
+            jobs = args.probe_jobs if name == "rcmake" else None
+            contexts[name] = Context(name, binary, scratch / name, generator,
+                                     tool_env(env, scratch / name, jobs))
 
         rows = []
         for bench in benches:
@@ -776,7 +915,10 @@ def main() -> int:
             "generator": generator,
             "rss_method": method,
             "host": {"system": platform.system(), "release": platform.release(),
-                     "machine": platform.machine(), "cpus": os.cpu_count()},
+                     "machine": platform.machine(), "cpus": os.cpu_count(),
+                     **host_hardware()},
+            "probe_jobs": args.probe_jobs,
+            "probe_store": "private per tool; emptied before each cold run",
             "rcmake": {"path": str(rcmake), "version": tool_version(rcmake),
                        "profile": build_profile(rcmake, args.profile)},
             "oracle": {"path": str(oracle), "version": tool_version(oracle)},

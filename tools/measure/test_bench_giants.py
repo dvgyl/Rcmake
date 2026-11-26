@@ -109,6 +109,11 @@ class CatalogAndCliTests(unittest.TestCase):
             "python3 tools/measure/bench_giants.py --projects duckdb,vcpkg --runs 5 "
             "--package-manager vcpkg --verify-build --verify-build-mode dry-run --profile-diagnostics",
         )
+        self.assertEqual(
+            bg.build_reproducer_command(["duckdb"], 3, leaf_edit="compile-definition"),
+            "python3 tools/measure/bench_giants.py --projects duckdb --runs 3 "
+            "--leaf-edit compile-definition",
+        )
 
 
 class ParsingAndHelpersTests(unittest.TestCase):
@@ -224,6 +229,23 @@ class ParsingAndHelpersTests(unittest.TestCase):
 
             self.assertEqual(leaf.read_bytes(), original)
             self.assertEqual(leaf.stat().st_mtime_ns, before_stat.st_mtime_ns)
+
+    def test_compile_definition_leaf_edit_changes_targets_and_restores(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            leaf = root / "CMakeLists.txt"
+            build = root / "build"
+            build.mkdir()
+            original = b"add_library(demo STATIC demo.cpp)\n"
+            leaf.write_bytes(original)
+            with bg.temporary_leaf_touch(leaf, build, "trial-1", "compile-definition"):
+                edited = leaf.read_text(encoding="utf-8")
+                self.assertIn("trial-1", edited)
+                self.assertTrue(edited.endswith(
+                    f"add_compile_definitions({bg.LEAF_EDIT_DEFINITION}=1)\n"))
+            with bg.temporary_leaf_touch(leaf, build, "trial-2"):
+                self.assertNotIn(b"add_compile_definitions", leaf.read_bytes())
+            self.assertEqual(leaf.read_bytes(), original)
 
     def test_parse_ninja_dry_run_and_fast_compile_target_selection(self):
         cmake_out = "\n".join([

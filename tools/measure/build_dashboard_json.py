@@ -58,6 +58,19 @@ HOLDOUT_MIN_REPOS = 240
 HOLDOUT_MIN_PASS_RATE = 95.0
 SHA_HEX = re.compile(r"^[0-9a-fA-F]{7,40}$")
 SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
+COLD_ISOLATION_NOTE = "empty probe cache"
+DRAFT_TOKEN = "[FINAL_METRIC]"
+# Draft text from older snapshots. An empty replacement removes a note.
+FUZZ_LABEL = "Seeded generative fuzzing"
+FUZZ_DETAIL = ("Seeded generative inputs (not coverage-guided) for 14 parser and format targets. "
+               "Each counted input ran with no panic, timeout, or limit violation.")
+DRAFT_TEXT = {
+    "10 Boss-Fight Giants": "Large projects",
+    "Measured across real-world corpus on idle hardware.": "",
+    "Adversarial fuzzing": FUZZ_LABEL,
+    "Safe-Rust property and adversarial corpus across 14 parser and format surfaces "
+    "with zero panics or crashes.": FUZZ_DETAIL,
+}
 DIFF_FUZZ_STATUSES = frozenset({"pass", "fail", "oracle_error"})
 HOLDOUT_LEVELS = ("L1", "L2", "L3", "L4")
 HOLDOUT_FAILURE_CATEGORIES = frozenset({
@@ -198,6 +211,26 @@ def validate_sha256(value):
     if not SHA256_HEX.fullmatch(cleaned):
         raise ValueError("--binary-sha256 must be a 64-character hexadecimal SHA-256 digest.")
     return cleaned
+
+
+def clean_draft_text(node, key=None):
+    """Replace draft labels and remove draft tokens from a snapshot.
+
+    A base snapshot can hold placeholder text such as "[FINAL_METRIC]". The
+    published file must not show it. A note that becomes empty is removed.
+    """
+    if isinstance(node, dict):
+        cleaned = {name: clean_draft_text(value, name) for name, value in node.items()}
+        return {name: value for name, value in cleaned.items()
+                if not (name == "note" and value == "")}
+    if isinstance(node, list):
+        return [clean_draft_text(value, key) for value in node]
+    if isinstance(node, str):
+        text = node
+        if DRAFT_TOKEN in text:
+            text = " ".join(text.replace(DRAFT_TOKEN, " ").split())
+        return DRAFT_TEXT.get(text, text)
+    return node
 
 
 def reset_tracks_to_pending(snapshot):
@@ -439,14 +472,14 @@ def merge_runcmake(tracks, reports):
             highlight.pop("note", None)
 
 
-def gate(section, identifier, label, passed, total, status, detail, **metrics):
+def gate(section, identifier, label, passed, total, status, detail, summary=None, **metrics):
     rate(passed, total)
     row = next((row for row in section["gates"] if row["id"] == identifier), None)
     if row is None:
         row = {"id": identifier, "label": label}
         section["gates"].append(row)
     row.update(status=status, passed=passed, total=total, failures=total - passed,
-               summary=f"{passed:,} / {total:,} checks passed", detail=detail, **metrics)
+               summary=summary or f"{passed:,} / {total:,} checks passed", detail=detail, **metrics)
 
 
 def merge_independent(section, report):
@@ -548,9 +581,10 @@ def merge_benchmarks(metrics, paths, identity=(None, None, False)):
         else:
             speedup = None
         status = benchmark_status(selected, speedup)
+        projects = ", ".join(sorted({str(row["project"]) for row in selected}))
         record("warmProbeSpeedup", speedup, status,
-               "Geometric mean across reported corpus projects." if corpus
-               else "Geometric mean across reported synthetic runs.")
+               f"Geometric mean across {projects}. Both tools configure a new build tree. "
+               "Rcmake uses its shared probe cache. CMake 4.5.1 has no cache across build trees.")
 
     incremental = [row for row in rows if row.get("case") == "incremental-leaf"]
     if incremental:
@@ -561,12 +595,16 @@ def merge_benchmarks(metrics, paths, identity=(None, None, False)):
 
     for row in rows:
         if row.get("name") == "configure 500 targets (cold)":
+            if COLD_ISOLATION_NOTE not in str(row.get("notes") or ""):
+                raise ValueError("The cold 500-target row must come from a bench_eval.py run "
+                                 f"that records '{COLD_ISOLATION_NOTE}'.")
             speedup = row["speedup"]
             rss = row["rcmake"]["peak_rss_mib"]
             record("coldConfigureSpeedup", speedup, "pass" if speedup is not None else "fail",
-                   "Median cold configure time compared with CMake.")
+                   "Median cold configure of a synthetic C project with 500 static libraries. "
+                   "New build tree and empty probe cache for each run.")
             record("peakRssMiB", rss, "pass" if rss is not None and row["rcmake"]["ok"] else "fail",
-                   "Highest resident memory use during cold configure.")
+                   "Highest resident memory use during the synthetic 500-library cold configure.")
 
 
 def benchmark_status(rows, value):
@@ -732,8 +770,8 @@ def merge_fuzz(section, directory, identity=(None, None, False)):
         total += iterations
         failures += failed
     status = "fail" if failures else "pass" if total else "partial"
-    gate(section, "fuzz", "Adversarial Fuzzing", total - failures, total, status,
-         "Counts include all inputs in the supplied fuzz reports.")
+    gate(section, "fuzz", FUZZ_LABEL, total - failures, total, status, FUZZ_DETAIL,
+         summary=f"{total:,} inputs, {failures:,} failures")
 
 
 def differential_fuzz_paths(inputs):
@@ -1217,7 +1255,7 @@ def main(argv=None):
 
     try:
         schema = read_json(DATA / "dashboard.schema.json")
-        snapshot = read_json(args.base)
+        snapshot = clean_draft_text(read_json(args.base))
         validate(snapshot, schema, schema)
         identity = resolve_release_identity(snapshot, args)
         snapshot["generatedAt"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
