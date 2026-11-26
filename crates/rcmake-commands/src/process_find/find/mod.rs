@@ -7,7 +7,7 @@ use rcmake_model::CacheType;
 
 use super::cat;
 use super::search_paths::setting_enabled;
-use directories::{directories, normalize};
+use directories::{directories, join_normalized, normalize_owned};
 use options::Options;
 use search::Search;
 
@@ -186,7 +186,7 @@ fn normalize_existing(cx: &Cx<'_>, value: &BString) -> BString {
     if value.is_empty() {
         return value.clone();
     }
-    let absolute = normalize(&cx.host().initial_cwd().join(path::to_native(value)));
+    let absolute = normalize_owned(cx.host().initial_cwd().join(path::to_native(value)));
     if cx.host().metadata(&absolute, Follow::Yes).is_ok() {
         path::from_native_cmake(&absolute)
     } else {

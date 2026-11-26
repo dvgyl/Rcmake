@@ -1360,3 +1360,466 @@ find_path(FRAMEWORK NAMES Foo/Inner PATHS /work/frameworks NO_DEFAULT_PATH)
     );
     Ok(())
 }
+
+struct TestHostWrapper {
+    inner: Arc<PureHost>,
+    case_insensitive: bool,
+    read_dir_calls: std::sync::atomic::AtomicUsize,
+    system_calls: std::sync::atomic::AtomicUsize,
+    run_calls: std::sync::atomic::AtomicUsize,
+    trailing_slash_metadata: std::sync::atomic::AtomicUsize,
+}
+
+impl TestHostWrapper {
+    fn new(inner: Arc<PureHost>, case_insensitive: bool) -> Self {
+        Self {
+            inner,
+            case_insensitive,
+            read_dir_calls: std::sync::atomic::AtomicUsize::new(0),
+            system_calls: std::sync::atomic::AtomicUsize::new(0),
+            run_calls: std::sync::atomic::AtomicUsize::new(0),
+            trailing_slash_metadata: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn resolve_case(&self, p: &Path) -> std::path::PathBuf {
+        if !self.case_insensitive || self.inner.metadata(p, rcmake_host::Follow::No).is_ok() {
+            return p.to_path_buf();
+        }
+        if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+            let requested = rcmake_host::path::from_native(Path::new(name));
+            if let Ok(entries) = self.inner.read_dir(parent)
+                && let Some(actual) = entries
+                    .iter()
+                    .find(|entry| entry.name.as_slice().eq_ignore_ascii_case(&requested))
+            {
+                return parent.join(rcmake_host::path::to_native(&actual.name));
+            }
+        }
+        p.to_path_buf()
+    }
+}
+
+impl Host for TestHostWrapper {
+    fn metadata(&self, p: &Path, follow: rcmake_host::Follow) -> HostResult<rcmake_host::Metadata> {
+        let raw = p.as_os_str().as_encoded_bytes();
+        if raw.len() > 1 && raw.ends_with(b"/") {
+            self.trailing_slash_metadata
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let resolved = self.resolve_case(p);
+        self.inner.metadata(&resolved, follow)
+    }
+
+    fn metadata_fresh(
+        &self,
+        p: &Path,
+        follow: rcmake_host::Follow,
+    ) -> HostResult<rcmake_host::Metadata> {
+        self.metadata(p, follow)
+    }
+
+    fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
+        let resolved = self.resolve_case(p);
+        self.inner.read(&resolved, range)
+    }
+
+    fn write(&self, p: &Path, data: &[u8], mode: rcmake_host::WriteMode) -> HostResult<()> {
+        self.inner.write(p, data, mode)
+    }
+
+    fn read_dir(&self, p: &Path) -> HostResult<Vec<rcmake_host::DirEntry>> {
+        self.read_dir_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_dir(p)
+    }
+
+    fn create_dir_all(&self, p: &Path) -> HostResult<()> {
+        self.inner.create_dir_all(p)
+    }
+
+    fn remove_file(&self, p: &Path) -> HostResult<()> {
+        self.inner.remove_file(p)
+    }
+
+    fn remove_dir(&self, p: &Path) -> HostResult<()> {
+        self.inner.remove_dir(p)
+    }
+
+    fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
+        self.inner.remove_dir_all(p)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
+        self.inner.rename(from, to)
+    }
+
+    fn copy_file(&self, from: &Path, to: &Path, opts: rcmake_host::CopyOptions) -> HostResult<()> {
+        self.inner.copy_file(from, to, opts)
+    }
+
+    fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
+        self.inner.symlink(target, link)
+    }
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
+        self.inner.hard_link(src, dst)
+    }
+
+    fn read_link(&self, p: &Path) -> HostResult<std::path::PathBuf> {
+        self.inner.read_link(p)
+    }
+
+    fn canonicalize(&self, p: &Path) -> HostResult<std::path::PathBuf> {
+        self.inner.canonicalize(p)
+    }
+
+    fn canonicalize_fresh(&self, p: &Path) -> HostResult<std::path::PathBuf> {
+        self.inner.canonicalize_fresh(p)
+    }
+
+    fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
+        self.inner.set_permissions(p, mode)
+    }
+
+    fn set_times(
+        &self,
+        p: &Path,
+        atime: Option<rcmake_host::FileTime>,
+        mtime: Option<rcmake_host::FileTime>,
+    ) -> HostResult<()> {
+        self.inner.set_times(p, atime, mtime)
+    }
+
+    fn env_get(&self, key: &[u8]) -> Option<BString> {
+        self.inner.env_get(key)
+    }
+
+    fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
+        self.inner.env_set(key, value);
+    }
+
+    fn env_all(&self) -> Vec<(BString, BString)> {
+        self.inner.env_all()
+    }
+
+    fn run(
+        &self,
+        req: &rcmake_host::RunRequest,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        self.run_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.run(req, on_output)
+    }
+
+    fn write_out(&self, stream: Stream, bytes: &[u8]) {
+        self.inner.write_out(stream, bytes);
+    }
+
+    fn read_stdin(&self, limit: u64) -> HostResult<Vec<u8>> {
+        self.inner.read_stdin(limit)
+    }
+
+    fn is_terminal(&self, stream: Stream) -> bool {
+        self.inner.is_terminal(stream)
+    }
+
+    fn now(&self) -> rcmake_host::FileTime {
+        self.inner.now()
+    }
+
+    fn monotonic(&self) -> Duration {
+        self.inner.monotonic()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+
+    fn time_zone(&self) -> rcmake_host::TimeZone {
+        self.inner.time_zone()
+    }
+
+    fn current_exe(&self) -> HostResult<std::path::PathBuf> {
+        self.inner.current_exe()
+    }
+
+    fn initial_cwd(&self) -> std::path::PathBuf {
+        self.inner.initial_cwd()
+    }
+
+    fn system(&self) -> rcmake_host::SystemInfo {
+        self.system_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.system()
+    }
+}
+
+#[test]
+fn find_program_strict_hermetic_allows_exact_executable_without_parent_access() -> HostResult<()> {
+    use rcmake_eval::{HermeticMode, Services};
+    use rcmake_host::path;
+
+    let abs = |p: &str| -> std::path::PathBuf {
+        if cfg!(windows) {
+            format!("C:{p}").into()
+        } else {
+            p.into()
+        }
+    };
+    let source = abs("/project");
+    let build = abs("/build");
+    let external_dir = abs("/external");
+    let tool = external_dir.join("tool");
+    let cmake_exe = abs("/bin/cmake");
+
+    let inner = Arc::new(PureHost::new(source.clone(), cmake_exe.clone()));
+    inner.create_dir_all(&build)?;
+    inner.seed_file(&cmake_exe, b"")?;
+    inner.set_permissions(&cmake_exe, 0o755)?;
+    inner.seed_file(&tool, b"")?;
+    inner.set_permissions(&tool, 0o755)?;
+    inner.env_set(
+        b"RCMAKE_HERMETIC_ALLOW_PATHS",
+        Some(&path::from_native(&tool)),
+    );
+    let script = format!(
+        "cmake_minimum_required(VERSION 4.5)\nproject(Audit NONE)\nset(CMAKE_FIND_APPBUNDLE NEVER)\nfind_program(RESULT NAMES tool fallback PATHS \"{}\" NO_DEFAULT_PATH REQUIRED)\n",
+        path::from_native_cmake(&external_dir),
+    );
+    inner.seed_file(&source.join("CMakeLists.txt"), script.as_bytes())?;
+
+    let mut services = Services::default();
+    services.speed.hermetic = HermeticMode::Strict;
+    let runtime = crate::hermetic::HermeticRuntime::new(inner.clone(), &source, &build, &services)
+        .ok_or_else(|| HostError::unsupported("Cannot create hermetic runtime"))?;
+    let mut interp = Interp::new(
+        InterpConfig {
+            host: runtime.host(),
+            mode: RunMode::Configure,
+            cmake_root: source.join("data"),
+            cmake_command: cmake_exe,
+            cwd: source.clone(),
+            limits: Default::default(),
+            diag: Default::default(),
+            services: std::sync::Arc::new(services),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        crate::register_all,
+    );
+    runtime.install(&mut interp);
+    let outcome = interp.run_configure(&source, &build, &[]);
+    let diagnostics = inner.stream_bytes(Stream::Stderr);
+    assert_eq!(outcome.exit_code, 0, "{diagnostics}");
+    assert!(!runtime.denied(), "{diagnostics}");
+    assert_eq!(
+        var(&mut interp, b"RESULT"),
+        path::from_native_cmake(&tool),
+        "{diagnostics}"
+    );
+    Ok(())
+}
+
+#[test]
+fn find_darwin_hotpath_avoids_eager_read_dir_plutil_and_trailing_slashes() -> HostResult<()> {
+    use std::sync::atomic::Ordering;
+
+    let inner = Arc::new(PureHost::default());
+    let mut darwin = inner.system();
+    darwin.sysname = "Darwin".into();
+    inner.set_system(darwin)?;
+    inner.seed_file(Path::new("/work/bins/tool"), b"")?;
+    inner.set_permissions(Path::new("/work/bins/tool"), 0o755)?;
+    inner.seed_file(
+        Path::new("/work/apps/Editor.app/Contents/Info.plist"),
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>EditorBin</string>
+</dict>
+</plist>
+"#,
+    )?;
+    inner.seed_file(
+        Path::new("/work/apps/Editor.app/Contents/MacOS/EditorBin"),
+        b"",
+    )?;
+    inner.set_permissions(
+        Path::new("/work/apps/Editor.app/Contents/MacOS/EditorBin"),
+        0o755,
+    )?;
+    inner.seed_file(Path::new("/work/mylib/libdemo.a"), b"")?;
+
+    let host = Arc::new(TestHostWrapper::new(inner.clone(), false));
+    let mut interp = Interp::new(
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Script,
+            "/share/cmake",
+            "/bin/cmake",
+            "/work",
+        ),
+        crate::register_all,
+    );
+    let script = r#"
+find_program(TOOL NAMES missing1 missing2 tool PATHS /work/missing_dir /work/bins NO_DEFAULT_PATH)
+find_program(EDITOR NAMES Editor PATHS /work/apps NO_DEFAULT_PATH)
+set(CMAKE_FIND_LIBRARY_PREFIXES lib)
+set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+set(CMAKE_SIZEOF_VOID_P 8)
+set_property(GLOBAL PROPERTY FIND_LIBRARY_USE_LIB64_PATHS ON)
+find_library(DEMO NAMES missing demo PATHS /work/missing_lib /work/mylib NO_DEFAULT_PATH)
+"#;
+    host.read_dir_calls.store(0, Ordering::Relaxed);
+    host.run_calls.store(0, Ordering::Relaxed);
+    host.trailing_slash_metadata.store(0, Ordering::Relaxed);
+    host.system_calls.store(0, Ordering::Relaxed);
+    assert_eq!(run(&inner, &mut interp, script)?, 0);
+    assert_eq!(var(&mut interp, b"TOOL"), "/work/bins/tool");
+    assert_eq!(
+        var(&mut interp, b"EDITOR"),
+        "/work/apps/Editor.app/Contents/MacOS/EditorBin"
+    );
+    assert_eq!(var(&mut interp, b"DEMO"), "/work/mylib/libdemo.a");
+    assert_eq!(host.read_dir_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(host.run_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(host.trailing_slash_metadata.load(Ordering::Relaxed), 0);
+    assert_eq!(host.system_calls.load(Ordering::Relaxed), 3);
+    Ok(())
+}
+
+#[test]
+fn find_package_warns_on_module_name_case_mismatch() -> HostResult<()> {
+    let inner = Arc::new(PureHost::default());
+    inner.seed_file(
+        Path::new("/work/ModuleNameCaseMismatch/FindCaseModule.cmake"),
+        b"set(CASEMODULE_FOUND TRUE)\n",
+    )?;
+    inner.seed_file(
+        Path::new("/work/ModuleNameCaseMismatch.cmake"),
+        br#"list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/ModuleNameCaseMismatch")
+find_package(casemodule MODULE)
+if(NOT casemodule_FOUND)
+  message(FATAL_ERROR "FindCaseModule.cmake not included")
+endif()
+"#,
+    )?;
+    inner.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nproject(Case NONE)\ninclude(ModuleNameCaseMismatch.cmake)\n",
+    )?;
+
+    let host = Arc::new(TestHostWrapper::new(inner.clone(), true));
+    let mut interp = Interp::new(
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            "/share/cmake",
+            "/bin/cmake",
+            "/work",
+        ),
+        crate::register_all,
+    );
+    let outcome = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
+    let stderr = inner.stream_bytes(Stream::Stderr).to_string();
+    assert_eq!(outcome.exit_code, 0, "{stderr}");
+    assert_eq!(var(&mut interp, b"casemodule_FOUND"), "TRUE");
+    let expected = concat!(
+        "CMake Warning (author) at ModuleNameCaseMismatch.cmake:2 (find_package):\n",
+        "  The module name\n",
+        "\n",
+        "    Findcasemodule.cmake\n",
+        "\n",
+        "  does not match the case of the module file name on disk\n",
+        "\n",
+        "    /work/ModuleNameCaseMismatch/FindCaseModule.cmake\n",
+        "\n",
+        "  This may fail on case-sensitive file systems.  Use the module name\n",
+        "\n",
+        "    FindCaseModule.cmake\n",
+        "\n",
+        "  instead.\n",
+        "Call Stack (most recent call first):\n",
+        "  CMakeLists.txt:3 (include)\n",
+        "This warning is for project developers.  Use -Wno-author to suppress it.\n",
+    );
+    assert_eq!(stderr.trim_end(), expected.trim_end());
+
+    // Exact-case module lookup emits no warning.
+    let inner_exact = Arc::new(PureHost::default());
+    inner_exact.seed_file(
+        Path::new("/work/ModuleNameCaseMismatch/FindCaseModule.cmake"),
+        b"set(CASEMODULE_FOUND TRUE)\n",
+    )?;
+    let host_exact = Arc::new(TestHostWrapper::new(inner_exact.clone(), true));
+    let mut interp_exact = Interp::new(
+        InterpConfig::new(
+            host_exact,
+            RunMode::Script,
+            "/share/cmake",
+            "/bin/cmake",
+            "/work",
+        ),
+        crate::register_all,
+    );
+    assert_eq!(
+        run(
+            &inner_exact,
+            &mut interp_exact,
+            "set(CMAKE_MODULE_PATH /work/ModuleNameCaseMismatch)\nfind_package(CaseModule MODULE REQUIRED)\n",
+        )?,
+        0
+    );
+    assert!(inner_exact.stream_bytes(Stream::Stderr).is_empty());
+    Ok(())
+}
+
+#[test]
+fn find_package_prefers_bundled_module_when_called_from_cmake_modules() -> HostResult<()> {
+    let (host, mut interp) = setup_package();
+    host.seed_file(
+        Path::new("/work/cmake/FindZLIB.cmake"),
+        b"set(ZLIB_ORIGIN user)\nset(ZLIB_FOUND TRUE)\n",
+    )?;
+    host.seed_file(
+        Path::new("/share/cmake/Modules/FindZLIB.cmake"),
+        b"set(ZLIB_ORIGIN bundled)\nset(ZLIB_FOUND TRUE)\n",
+    )?;
+    host.seed_file(
+        Path::new("/share/cmake/Modules/FindPNG.cmake"),
+        b"find_package(ZLIB MODULE REQUIRED)\nset(PNG_FOUND TRUE)\n",
+    )?;
+    host.seed_file(
+        Path::new("/work/cmake/FindBoost.cmake"),
+        b"set(BOOST_ORIGIN user)\nset(Boost_FOUND TRUE)\n",
+    )?;
+    host.seed_file(
+        Path::new("/share/cmake/Modules/FindBoost.cmake"),
+        b"set(BOOST_ORIGIN bundled)\nset(Boost_FOUND TRUE)\n",
+    )?;
+    host.seed_file(
+        Path::new("/share/cmake/Modules/FindCaller.cmake"),
+        b"find_package(Boost MODULE QUIET)\nset(Caller_FOUND TRUE)\n",
+    )?;
+    let script = r#"
+set(CMAKE_MODULE_PATH /work/cmake)
+find_package(PNG MODULE REQUIRED)
+set(FROM_BUNDLED "${ZLIB_ORIGIN}")
+unset(ZLIB_FOUND)
+unset(ZLIB_ORIGIN)
+find_package(ZLIB MODULE REQUIRED)
+set(FROM_USER "${ZLIB_ORIGIN}")
+cmake_policy(SET CMP0167 NEW)
+find_package(Caller MODULE REQUIRED)
+"#;
+    let exit = run(&host, &mut interp, script)?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    assert_eq!(var(&mut interp, b"FROM_BUNDLED"), "bundled");
+    assert_eq!(var(&mut interp, b"FROM_USER"), "user");
+    assert_eq!(var(&mut interp, b"BOOST_ORIGIN"), "");
+    assert_eq!(var(&mut interp, b"Boost_FOUND"), "0");
+    Ok(())
+}

@@ -4,7 +4,10 @@ use rcmake_base::{BString, ByteSlice as _, truth};
 use rcmake_eval::{CmdError, Cx};
 use rcmake_host::{FileKind, Follow, Host, path};
 
-pub(super) fn rewrite(cx: &mut Cx<'_>, dirs: Vec<PathBuf>) -> Result<Vec<PathBuf>, CmdError> {
+pub(super) fn rewrite(
+    cx: &mut Cx<'_>,
+    dirs: Vec<PathBuf>,
+) -> Result<(Vec<PathBuf>, bool), CmdError> {
     let suffix = cx.var(b"CMAKE_FIND_LIBRARY_CUSTOM_LIB_SUFFIX").or_else(|| {
         let size = cx.var_or_empty(b"CMAKE_SIZEOF_VOID_P");
         let x32 = super::super::is_elf_x32(cx);
@@ -25,14 +28,14 @@ pub(super) fn rewrite(cx: &mut Cx<'_>, dirs: Vec<PathBuf>) -> Result<Vec<PathBuf
         .map(|(_, _, suffix)| suffix.into())
     });
     let Some(suffix) = suffix else {
-        return Ok(dirs);
+        return Ok((dirs, false));
     };
     let mut state = Rewrite {
         host: cx.host(),
         suffix: &suffix,
         remaining: cx.limits().max_value_bytes.min(16 * 1024 * 1024),
         depth: cx.limits().max_recursion.min(64),
-        paths: Vec::new(),
+        paths: Vec::with_capacity(dirs.len()),
     };
     for dir in dirs {
         let mut text = path::from_native_cmake(&dir);
@@ -41,7 +44,7 @@ pub(super) fn rewrite(cx: &mut Cx<'_>, dirs: Vec<PathBuf>) -> Result<Vec<PathBuf
         }
         state.visit(&text, 0, true, 0)?;
     }
-    Ok(state.paths)
+    Ok((state.paths, true))
 }
 
 struct Rewrite<'a> {
@@ -63,33 +66,38 @@ impl Rewrite<'_> {
         if depth > self.depth {
             return Err(error());
         }
+        let mut known_plain_dir = None;
         if !self.suffix.is_empty()
             && let Some(index) = dir.get(start..).and_then(|tail| tail.find(b"lib/"))
         {
             let split = start + index + 3;
             let (prefix, tail) = dir.split_at_checked(split).ok_or_else(error)?;
-            let plain = path::to_native(prefix);
+            let plain = super::normalize_owned(path::to_native(prefix));
             let prefix: BString = [prefix, self.suffix].concat().into();
-            let alternative = path::to_native(&prefix);
+            let alternative = super::normalize_owned(path::to_native(&prefix));
             let use_plain = self.is_dir(&plain);
+            if tail == b"/" {
+                known_plain_dir = Some(use_plain);
+            }
             if self.is_dir(&alternative) && !(use_plain && self.linked(&plain, &alternative)) {
                 let replaced = [&prefix, tail].concat();
                 self.visit(&replaced, prefix.len() + 1, true, depth + 1)?;
             }
-            if use_plain {
+            if use_plain && tail != b"/" {
                 self.visit(dir, split + 1, false, depth + 1)?;
             }
         }
         if fresh {
-            let plain = path::to_native(dir);
-            let use_plain = self.is_dir(&plain);
-            if !self.suffix.is_empty() {
-                let alternate = path::to_native(&[dir, self.suffix].concat());
-                if self.is_dir(&alternate) && !(use_plain && self.linked(&plain, &alternate)) {
-                    self.paths.push(alternate);
-                }
-            }
+            let plain = super::normalize_owned(path::to_native(dir));
+            let use_plain = known_plain_dir.unwrap_or_else(|| self.is_dir(&plain));
             if use_plain {
+                if !self.suffix.is_empty() {
+                    let alternate =
+                        super::normalize_owned(path::to_native(&[dir, self.suffix].concat()));
+                    if self.is_dir(&alternate) && !self.linked(&plain, &alternate) {
+                        self.paths.push(alternate);
+                    }
+                }
                 self.paths.push(plain);
             }
         }

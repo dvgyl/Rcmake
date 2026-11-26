@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use rcmake_base::BString;
@@ -119,19 +119,26 @@ pub(super) fn directories(
             matches!(kind, Kind::Program),
         )
     };
-    paths.extend(
-        expand(&options.hints)?
-            .iter()
-            .map(|dir| cx.resolve_path(dir)),
-    );
+    if !options.hints.is_empty() {
+        paths.extend(
+            expand(&options.hints)?
+                .iter()
+                .map(|dir| cx.resolve_path(dir)),
+        );
+    }
     if use_default(
         cx,
         options.no_defaults || options.no_system_env,
         b"CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH",
     ) {
-        for key in [variables.env, b"PATH"] {
+        paths.extend(
+            env_paths(cx, variables.env, BUILD_ENV_SEPARATOR)
+                .iter()
+                .map(|dir| cx.resolve_path(dir)),
+        );
+        if variables.env != b"PATH" {
             paths.extend(
-                env_paths(cx, key, BUILD_ENV_SEPARATOR)
+                env_paths(cx, b"PATH", BUILD_ENV_SEPARATOR)
                     .iter()
                     .map(|dir| cx.resolve_path(dir)),
             );
@@ -170,20 +177,33 @@ pub(super) fn directories(
             );
         }
     }
-    paths.extend(
-        expand(&options.paths)?
-            .iter()
-            .map(|dir| cx.resolve_path(dir)),
-    );
+    if !options.paths.is_empty() {
+        paths.extend(
+            expand(&options.paths)?
+                .iter()
+                .map(|dir| cx.resolve_path(dir)),
+        );
+    }
     Ok(with_suffixes(paths, &options.suffixes))
 }
 
 fn add_framework_dirs(cx: &Cx<'_>, paths: &mut Vec<PathBuf>, values: Vec<BString>) {
+    if values.is_empty() {
+        return;
+    }
+    let mut home: Option<Option<PathBuf>> = None;
+    paths.reserve(values.len());
     paths.extend(values.iter().map(|value| {
-        if let Some(relative) = value.strip_prefix(b"~/")
-            && let Some(home) = cx.host().env_get(b"HOME").filter(|home| !home.is_empty())
-        {
-            return cx.resolve_path(&home).join(path::to_native(relative));
+        if let Some(relative) = value.strip_prefix(b"~/") {
+            let resolved = home.get_or_insert_with(|| {
+                cx.host()
+                    .env_get(b"HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| cx.resolve_path(&home))
+            });
+            if let Some(home) = resolved {
+                return home.join(path::to_native(relative));
+            }
         }
         cx.resolve_path(value)
     }));
@@ -195,13 +215,24 @@ fn add_prefixes(
     prefixes: Vec<BString>,
     variables: &SearchVariables,
 ) {
+    if prefixes.is_empty() {
+        return;
+    }
     let architecture = cx.var_or_empty(b"CMAKE_LIBRARY_ARCHITECTURE");
+    let arch_native = (!architecture.is_empty()).then(|| path::to_native(&architecture));
+    paths.reserve(
+        prefixes
+            .len()
+            .saturating_mul(variables.prefix_subdirs.len() + 1),
+    );
     for prefix in prefixes {
         let prefix = cx.resolve_path(&prefix);
         for dir in variables.prefix_subdirs {
             let subdir = prefix.join(dir);
-            if !architecture.is_empty() && matches!(*dir, "include" | "lib") {
-                paths.push(subdir.join(path::to_native(&architecture)));
+            if let Some(arch) = &arch_native
+                && matches!(*dir, "include" | "lib")
+            {
+                paths.push(subdir.join(arch));
             }
             paths.push(subdir);
         }
@@ -215,24 +246,62 @@ fn with_suffixes(paths: Vec<PathBuf>, suffixes: &[BString]) -> Vec<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(|s| relative_suffix(s))
         .collect();
-    let mut seen = BTreeSet::new();
-    let mut dirs = Vec::new();
-    for dir in paths {
-        for suffix in &suffixes {
-            let path = normalize(&dir.join(suffix));
-            if seen.insert(path.clone()) {
-                dirs.push(path);
-            }
-        }
-        let path = normalize(&dir);
-        if seen.insert(path.clone()) {
+    let capacity = paths.len().saturating_mul(suffixes.len() + 1);
+    let mut seen = HashSet::with_capacity(capacity);
+    let mut dirs = Vec::with_capacity(capacity);
+    let mut push = |path: PathBuf| {
+        if !seen.contains(&path) {
+            seen.insert(path.clone());
             dirs.push(path);
+        }
+    };
+    if suffixes.is_empty() {
+        for dir in paths {
+            push(normalize_owned(dir));
+        }
+    } else {
+        for dir in paths {
+            for suffix in &suffixes {
+                push(join_normalized(&dir, suffix));
+            }
+            push(normalize_owned(dir));
         }
     }
     dirs
 }
 
-pub(super) fn normalize(input: &Path) -> PathBuf {
+#[cfg(not(windows))]
+fn is_clean(input: &Path) -> bool {
+    let bytes = input.as_os_str().as_encoded_bytes();
+    if bytes.is_empty() || bytes == b"/" {
+        return true;
+    }
+    if bytes.ends_with(b"/") {
+        return false;
+    }
+    let body = bytes.strip_prefix(b"/").unwrap_or(bytes);
+    body.split(|&byte| byte == b'/')
+        .all(|segment| !segment.is_empty() && segment != b"." && segment != b"..")
+}
+
+#[cfg(windows)]
+fn is_clean(_input: &Path) -> bool {
+    false
+}
+
+pub(super) fn normalize_owned(input: PathBuf) -> PathBuf {
+    if is_clean(&input) {
+        input
+    } else {
+        normalize(&input)
+    }
+}
+
+pub(super) fn join_normalized(dir: &Path, child: &Path) -> PathBuf {
+    normalize_owned(dir.join(child))
+}
+
+fn normalize(input: &Path) -> PathBuf {
     let mut path = PathBuf::new();
     for component in input.components() {
         match component {

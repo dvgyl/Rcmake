@@ -543,35 +543,45 @@ fn load_module(
         _ => None,
     };
     let root = cx.var_or_empty(b"CMAKE_ROOT");
-    let bundled = cx
-        .resolve_path(&cat(&[&root, b"/Modules"]))
-        .join(&native_name);
+    let modules_dir = cx.resolve_path(&cat(&[
+        root.strip_suffix(b"/").unwrap_or(&root),
+        b"/Modules",
+    ]));
+    let bundled = modules_dir.join(&native_name);
     let bundled = if is_file(cx, &bundled) {
         Some(bundled)
     } else {
         considered.push(bundled);
         None
     };
-    report.trace.module(
-        &filename,
-        &considered,
-        module.as_deref().or(bundled.as_deref()),
-    );
-    if module.is_none()
-        && let Some(bundled) = bundled
-    {
-        if let Some(policy) = policy {
-            match cx.policy(policy) {
-                PolicyStatus::New => return Ok(None),
-                PolicyStatus::Warn => cx.issue_policy_warning(policy, b"", b""),
-                PolicyStatus::Old => {}
-            }
+    let prefer_bundled = module.is_some() && bundled.is_some() && {
+        let mut prefix = path::from_native_cmake(&modules_dir);
+        if !prefix.ends_with(b"/") {
+            prefix.push(b'/');
         }
-        module = Some(bundled);
-    }
-    let Some(module) = module else {
+        cx.var_or_empty(b"CMAKE_CURRENT_LIST_FILE")
+            .starts_with(prefix.as_slice())
+    };
+    let (selected, system) = match (module, bundled) {
+        (Some(_), Some(bundled)) if prefer_bundled => (Some(bundled), true),
+        (Some(user), _) => (Some(user), false),
+        (None, Some(bundled)) => (Some(bundled), true),
+        (None, None) => (None, false),
+    };
+    report
+        .trace
+        .module(&filename, &considered, selected.as_deref());
+    let Some(module) = selected else {
         return Ok(None);
     };
+    if system && let Some(policy) = policy {
+        match cx.policy(policy) {
+            PolicyStatus::New => return Ok(None),
+            PolicyStatus::Warn => cx.issue_policy_warning(policy, b"", b""),
+            PolicyStatus::Old => {}
+        }
+    }
+    messages::warn_module_case_mismatch(cx, &filename, &module);
     let mut vars = Bindings::default();
     vars.add(cat(&[name, b"_FIND_MODULE"]), "1");
     let result = vars.scoped(cx, |cx| request.include_file(cx, &module));

@@ -1,6 +1,9 @@
+use std::path::Path;
+
 use rcmake_base::BString;
 use rcmake_diag::{Effect, MessageKind};
-use rcmake_eval::{CmdError, Cx};
+use rcmake_eval::{CmdError, Cx, HermeticMode, hermetic::HermeticContext};
+use rcmake_host::path;
 
 use super::config::ConfigSearch;
 use super::request::list_lines;
@@ -57,6 +60,45 @@ pub(super) fn warn_module_path(cx: &mut Cx<'_>, name: &[u8]) {
             b".cmake must either be part of this project itself, in this case adjust CMAKE_MODULE_PATH so that it points to the correct location inside its source tree.\nOr it must be installed by a package which has already been found via find_package().  In this case make sure that package has indeed been found and adjust CMAKE_MODULE_PATH to contain the location where that package has installed Find",
             name,
             b".cmake.  This must be a location provided by that package.  This error in general means that the buildsystem of this project is relying on a Find-module without ensuring that it is actually available.\n",
+        ]),
+    );
+}
+
+pub(super) fn warn_module_case_mismatch(cx: &mut Cx<'_>, requested: &[u8], module: &Path) {
+    if cx.services().speed.hermetic != HermeticMode::Off
+        || cx.session_data::<HermeticContext>().is_some()
+    {
+        return;
+    }
+    let Some(parent) = module.parent() else {
+        return;
+    };
+    let Ok(entries) = cx.host().read_dir(parent) else {
+        return;
+    };
+    if entries
+        .iter()
+        .any(|entry| entry.name.as_slice() == requested)
+    {
+        return;
+    }
+    let Some(actual) = entries
+        .iter()
+        .find(|entry| entry.name.as_slice().eq_ignore_ascii_case(requested))
+    else {
+        return;
+    };
+    let disk_path = path::from_native_cmake(&parent.join(path::to_native(&actual.name)));
+    crate::author_warning(
+        cx,
+        cat(&[
+            b"The module name\n  ",
+            requested,
+            b"\ndoes not match the case of the module file name on disk\n  ",
+            &disk_path,
+            b"\nThis may fail on case-sensitive file systems.  Use the module name\n  ",
+            &actual.name,
+            b"\ninstead.",
         ]),
     );
 }

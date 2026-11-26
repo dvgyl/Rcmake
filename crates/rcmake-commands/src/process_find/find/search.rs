@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -6,19 +6,19 @@ use std::time::Duration;
 
 use rcmake_base::{BString, ByteSlice, list};
 use rcmake_diag::{FrameKind, PolicyId, PolicyStatus};
-use rcmake_eval::{CmdError, Cx, FindEvent, RunMode};
+use rcmake_eval::{CmdError, Cx, FindEvent, HermeticMode, RunMode, hermetic::HermeticContext};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{
-    CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, path,
+    CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, ReadRange, RunRequest, path,
 };
 use rcmake_syntax::ArgKind;
 
-use super::super::cat;
+use super::super::RootMode;
 use super::super::search_paths::{cmake_paths, file_metadata};
-use super::{Kind, Options, normalize, use_default};
+use super::{Kind, Options, join_normalized, normalize_owned, use_default};
 
 struct IgnoredPaths {
-    directories: BTreeSet<PathBuf>,
+    directories: HashSet<PathBuf>,
     prefixes: Vec<PathBuf>,
 }
 
@@ -27,7 +27,7 @@ impl IgnoredPaths {
         let paths = |keys: [&'static [u8]; 2]| {
             keys.into_iter()
                 .flat_map(move |key| cmake_paths(cx, key))
-                .map(move |dir| normalize(&cx.resolve_path(&dir)))
+                .map(move |dir| normalize_owned(cx.resolve_path(&dir)))
         };
         Self {
             directories: paths([b"CMAKE_IGNORE_PATH", b"CMAKE_SYSTEM_IGNORE_PATH"]).collect(),
@@ -37,6 +37,10 @@ impl IgnoredPaths {
             ])
             .collect(),
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.directories.is_empty() && self.prefixes.is_empty()
     }
 
     fn ignores_directory(&self, path: &Path) -> bool {
@@ -51,6 +55,8 @@ impl IgnoredPaths {
 pub(super) struct Search<'a> {
     kind: Kind,
     options: &'a Options,
+    is_darwin: bool,
+    hermetic: bool,
     decoration: Option<LibraryNames>,
     ignored: IgnoredPaths,
     considered: Option<String>,
@@ -74,47 +80,53 @@ enum SearchPass {
 
 enum SearchDirectory {
     Unlisted,
+    Existing,
     Unknown,
     Missing,
     Listed {
-        names: Vec<BString>,
+        names: Option<HashSet<Box<[u8]>>>,
         frameworks: Vec<PathBuf>,
-        ascii: bool,
-        has_bundle: bool,
         has_framework: bool,
     },
 }
 
 impl SearchDirectory {
-    fn read(host: &dyn Host, root: &Path, frameworks: bool) -> Self {
+    fn read(host: &dyn Host, root: &Path, build_name_set: bool) -> Self {
         match host.read_dir(root) {
-            Ok(mut entries) => {
-                if frameworks {
-                    entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-                }
-                let mut ascii = true;
-                let mut has_bundle = false;
+            Ok(entries) => {
+                let mut framework_entries = Vec::new();
                 let mut has_framework = false;
-                let mut headers = Vec::new();
-                let names = entries
-                    .into_iter()
-                    .map(|mut entry| {
-                        ascii &= entry.name.is_ascii();
-                        if frameworks && entry.name.ends_with(b".framework") {
-                            headers.push(root.join(path::to_native(&entry.name)).join("Headers"));
+                let mut ascii = build_name_set && !cfg!(windows) && !unlisted_filesystem(root);
+                for entry in &entries {
+                    if entry.kind != FileKind::File {
+                        if entry.name.ends_with(b".framework") {
+                            framework_entries.push(entry.name.clone());
+                            has_framework = true;
+                        } else if ends_with_ignore_ascii_case(&entry.name, b".framework") {
+                            has_framework = true;
                         }
-                        entry.name.make_ascii_lowercase();
-                        has_bundle |= entry.name.ends_with(b".app");
-                        has_framework |= entry.name.ends_with(b".framework")
-                            || entry.name.ends_with(b".xcframework");
-                        entry.name
-                    })
+                    }
+                    if ascii && !entry.name.is_ascii() {
+                        ascii = false;
+                    }
+                }
+                framework_entries.sort_unstable();
+                let frameworks = framework_entries
+                    .into_iter()
+                    .map(|name| root.join(path::to_native(&name)).join("Headers"))
                     .collect();
+                let names = ascii.then(|| {
+                    let mut set = HashSet::with_capacity(entries.len());
+                    for entry in entries {
+                        let mut bytes: Vec<u8> = entry.name.into();
+                        bytes.make_ascii_lowercase();
+                        set.insert(bytes.into_boxed_slice());
+                    }
+                    set
+                });
                 Self::Listed {
                     names,
-                    frameworks: headers,
-                    ascii,
-                    has_bundle,
+                    frameworks,
                     has_framework,
                 }
             }
@@ -127,32 +139,51 @@ impl SearchDirectory {
         let Some(name) = candidate.strip_prefix(root).ok().and_then(single_component) else {
             return true;
         };
+        self.may_contain_leaf(name.as_encoded_bytes())
+    }
+
+    fn may_contain_leaf(&self, name: &[u8]) -> bool {
         match self {
             Self::Missing => false,
             // The filesystem can fold or normalize non-ASCII names. On Windows a short
             // DOS name can also resolve to a different name in the directory listing.
             Self::Listed {
                 names,
-                ascii: true,
-                has_bundle,
                 has_framework,
                 ..
-            } if !cfg!(windows) => {
-                let name = name.as_encoded_bytes();
+            } => {
+                if !*has_framework && ends_with_ignore_ascii_case(name, b".framework") {
+                    return false;
+                }
+                let Some(names) = names else {
+                    return true;
+                };
                 if !name.is_ascii() {
                     return true;
                 }
-                if (!has_bundle && name.ends_with(b".app"))
-                    || (!has_framework
-                        && (name.ends_with(b".framework") || name.ends_with(b".xcframework")))
-                {
-                    return false;
+                if name.iter().any(u8::is_ascii_uppercase) {
+                    names.contains(name.to_ascii_lowercase().as_slice())
+                } else {
+                    names.contains(name)
                 }
-                names.iter().any(|entry| entry.eq_ignore_ascii_case(name))
             }
             _ => true,
         }
     }
+}
+
+fn unlisted_filesystem(path: &Path) -> bool {
+    ["/proc", "/dev", "/sys", "/net"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+fn ends_with_ignore_ascii_case(haystack: &[u8], suffix: &[u8]) -> bool {
+    haystack
+        .len()
+        .checked_sub(suffix.len())
+        .and_then(|start| haystack.get(start..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
 fn single_component(path: &Path) -> Option<&std::ffi::OsStr> {
@@ -163,8 +194,36 @@ fn single_component(path: &Path) -> Option<&std::ffi::OsStr> {
     }
 }
 
+fn is_relative_descendant(name: &Path) -> bool {
+    let mut has_normal = false;
+    for component in name.components() {
+        match component {
+            Component::Normal(_) => has_normal = true,
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    has_normal
+}
+
 fn missing_directory(kind: ErrorKind) -> bool {
     matches!(kind, ErrorKind::NotFound | ErrorKind::NotADirectory)
+}
+
+fn hermetic_active(cx: &Cx<'_>) -> bool {
+    cx.services().speed.hermetic != HermeticMode::Off
+        || cx.session_data::<HermeticContext>().is_some()
+}
+
+fn has_find_roots(cx: &Cx<'_>) -> bool {
+    [
+        b"CMAKE_FIND_ROOT_PATH".as_slice(),
+        b"CMAKE_SYSROOT_COMPILE",
+        b"CMAKE_SYSROOT_LINK",
+        b"CMAKE_SYSROOT",
+    ]
+    .into_iter()
+    .any(|key| !cx.var_or_empty(key).is_empty())
 }
 
 #[derive(Clone, Copy)]
@@ -176,13 +235,13 @@ enum FrameworkOrder {
 }
 
 impl FrameworkOrder {
-    fn new(cx: &Cx<'_>) -> Self {
+    fn new(cx: &Cx<'_>, is_darwin: bool) -> Self {
         match cx.var_or_empty(b"CMAKE_FIND_FRAMEWORK").as_slice() {
             b"FIRST" => Self::First,
             b"LAST" => Self::Last,
             b"ONLY" => Self::Only,
             b"NEVER" => Self::Never,
-            _ if cx.host().system().sysname == b"Darwin" => Self::First,
+            _ if is_darwin => Self::First,
             _ => Self::Never,
         }
     }
@@ -201,6 +260,8 @@ impl FrameworkOrder {
 
 impl<'a> Search<'a> {
     pub(super) fn new(cx: &Cx<'_>, kind: Kind, options: &'a Options, var: &[u8]) -> Self {
+        let is_darwin = cx.host().system().sysname == b"Darwin";
+        let hermetic = hermetic_active(cx);
         let debug = cx.find_variable_debug(var)
             || cx
                 .var_normal_only(b"CMAKE_FIND_PACKAGE_NAME")
@@ -208,7 +269,9 @@ impl<'a> Search<'a> {
         Self {
             kind,
             options,
-            decoration: matches!(kind, Kind::Library).then(|| LibraryNames::new(cx)),
+            is_darwin,
+            hermetic,
+            decoration: matches!(kind, Kind::Library).then(|| LibraryNames::new(cx, is_darwin)),
             ignored: IgnoredPaths::new(cx),
             considered: debug.then(String::new),
             match_path: None,
@@ -223,18 +286,39 @@ impl<'a> Search<'a> {
         cx: &mut Cx<'_>,
         mut dirs: Vec<PathBuf>,
     ) -> Result<Option<PathBuf>, CmdError> {
-        dirs.retain(|dir| !self.ignored.ignores_directory(dir));
-        let mut dirs = self
+        if !self.ignored.is_empty() {
+            dirs.retain(|dir| !self.ignored.ignores_directory(dir));
+        }
+        let root_mode = self
             .options
             .root_mode
-            .resolve(cx, self.kind.root_mode_setting())
-            .reroot(cx, dirs);
-        if matches!(self.kind, Kind::Library) {
-            dirs = super::architecture::rewrite(cx, dirs)?;
+            .resolve(cx, self.kind.root_mode_setting());
+        let rerooted = !matches!(root_mode, RootMode::Never) && has_find_roots(cx);
+        let mut dirs = if rerooted {
+            root_mode.reroot(cx, dirs)
+        } else {
+            dirs
+        };
+        let arch_rewritten = if matches!(self.kind, Kind::Library) {
+            let (rewritten, changed) = super::architecture::rewrite(cx, dirs)?;
+            dirs = rewritten;
+            changed
+        } else {
+            false
+        };
+        if rerooted || arch_rewritten {
+            let mut seen = HashSet::with_capacity(dirs.len());
+            dirs.retain(|dir| {
+                if seen.contains(dir) {
+                    false
+                } else {
+                    seen.insert(dir.clone());
+                    true
+                }
+            });
         }
-        let mut seen = BTreeSet::new();
-        dirs.retain(|dir| seen.insert(dir.clone()));
         if let Some(event) = &mut self.event {
+            event.candidates.reserve(dirs.len());
             event
                 .candidates
                 .extend(dirs.iter().map(|dir| directory_path(dir)));
@@ -246,8 +330,10 @@ impl<'a> Search<'a> {
             .map(|name| path::to_native(name))
             .collect();
         let passes = match self.kind {
-            Kind::Library | Kind::File | Kind::Path => FrameworkOrder::new(cx).passes(),
-            Kind::Program if cx.host().system().sysname == b"Darwin" => {
+            Kind::Library | Kind::File | Kind::Path => {
+                FrameworkOrder::new(cx, self.is_darwin).passes()
+            }
+            Kind::Program if self.is_darwin => {
                 use SearchPass::{AppBundle, Regular};
                 match cx.var_or_empty(b"CMAKE_FIND_APPBUNDLE").as_slice() {
                     b"NEVER" => &[Regular][..],
@@ -258,9 +344,18 @@ impl<'a> Search<'a> {
             }
             _ => &[SearchPass::Regular],
         };
-        let mut directories = HashMap::new();
+        let mut directories = Vec::with_capacity(dirs.len());
+        directories.resize_with(dirs.len(), || {
+            if arch_rewritten {
+                SearchDirectory::Existing
+            } else {
+                SearchDirectory::Unlisted
+            }
+        });
         for &pass in passes {
-            if let Some(found) = self.scan(cx, &dirs, &names, pass, &mut directories)? {
+            if let Some(found) =
+                self.scan(cx, &dirs, &names, pass, passes.len(), &mut directories)?
+            {
                 return Ok(Some(found));
             }
         }
@@ -273,7 +368,8 @@ impl<'a> Search<'a> {
         dirs: &[PathBuf],
         names: &[PathBuf],
         pass: SearchPass,
-        directories: &mut HashMap<PathBuf, SearchDirectory>,
+        passes_len: usize,
+        directories: &mut [SearchDirectory],
     ) -> Result<Option<PathBuf>, CmdError> {
         let search = match pass {
             SearchPass::Regular => Self::in_directory,
@@ -283,63 +379,68 @@ impl<'a> Search<'a> {
             SearchPass::Framework => Self::framework,
             SearchPass::AppBundle => Self::app_bundle,
         };
-        let mut search = |this: &mut Self, cx: &mut Cx<'_>, dir: &Path, name: &Path| {
-            // A validator can change the filesystem before the next candidate.
-            let directory = if this.options.validator.is_some() || !dir.is_absolute() {
-                &SearchDirectory::Unknown
-            } else {
-                let directory = directories.entry(dir.to_owned()).or_insert_with(|| {
-                    if matches!(pass, SearchPass::Regular)
-                        && names.len() > 1
-                        && cx
-                            .host()
-                            .metadata(dir, Follow::Yes)
-                            .is_err_and(|error| missing_directory(error.kind))
-                    {
-                        SearchDirectory::Missing
-                    } else {
-                        SearchDirectory::Unlisted
-                    }
-                });
-                if matches!(directory, SearchDirectory::Unlisted)
-                    && !matches!(pass, SearchPass::Regular)
+        let precheck_dir = !self.hermetic
+            && self.options.validator.is_none()
+            && (names.len() > 1 || passes_len > 1 || matches!(self.kind, Kind::Library));
+        let list_frameworks =
+            matches!(pass, SearchPass::Framework) && matches!(self.kind, Kind::File | Kind::Path);
+        let build_name_set = list_frameworks && names.len() > 2 && passes_len > 1;
+        let unknown = SearchDirectory::Unknown;
+        let mut probe =
+            |this: &mut Self, cx: &mut Cx<'_>, dir_idx: Option<usize>, dir: &Path, name: &Path| {
+                // A validator can change the filesystem before the next candidate.
+                // Hermetic mode can permit an exact candidate without granting its parent directory.
+                let directory = if this.hermetic
+                    || this.options.validator.is_some()
+                    || !dir.is_absolute()
                 {
-                    *directory = SearchDirectory::read(
-                        cx.host(),
-                        dir,
-                        matches!(this.kind, Kind::File | Kind::Path),
-                    );
-                }
-                directory
+                    &unknown
+                } else if let Some(slot) = dir_idx.and_then(|idx| directories.get_mut(idx)) {
+                    if list_frameworks {
+                        if matches!(slot, SearchDirectory::Unlisted | SearchDirectory::Existing) {
+                            *slot = SearchDirectory::read(cx.host(), dir, build_name_set);
+                        }
+                    } else if precheck_dir && matches!(slot, SearchDirectory::Unlisted) {
+                        *slot = match cx.host().metadata(dir, Follow::Yes) {
+                            Ok(meta) if meta.kind == FileKind::Dir => SearchDirectory::Existing,
+                            Ok(_) => SearchDirectory::Missing,
+                            Err(error) if missing_directory(error.kind) => SearchDirectory::Missing,
+                            Err(_) => SearchDirectory::Unknown,
+                        };
+                    }
+                    &*slot
+                } else {
+                    &unknown
+                };
+                search(this, cx, dir, name, directory)
             };
-            search(this, cx, dir, name, directory)
-        };
         if self.options.names_per_dir
             && matches!(self.kind, Kind::Library | Kind::Program)
             && !matches!(pass, SearchPass::AppBundle)
         {
             for name in names.iter().filter(|name| name.is_absolute()) {
-                if let Some(found) = search(self, cx, Path::new(""), name)? {
+                if let Some(found) = probe(self, cx, None, Path::new(""), name)? {
                     return Ok(Some(found));
                 }
             }
-            for dir in dirs {
+            for (dir_idx, dir) in dirs.iter().enumerate() {
                 for name in names.iter().filter(|name| !name.is_absolute()) {
-                    if let Some(found) = search(self, cx, dir, name)? {
+                    if let Some(found) = probe(self, cx, Some(dir_idx), dir, name)? {
                         return Ok(Some(found));
                     }
                 }
             }
         } else {
             for name in names {
-                let search_dirs = if name.is_absolute() {
-                    &[PathBuf::new()][..]
-                } else {
-                    dirs
-                };
-                for dir in search_dirs {
-                    if let Some(found) = search(self, cx, dir, name)? {
+                if name.is_absolute() {
+                    if let Some(found) = probe(self, cx, None, Path::new(""), name)? {
                         return Ok(Some(found));
+                    }
+                } else {
+                    for (dir_idx, dir) in dirs.iter().enumerate() {
+                        if let Some(found) = probe(self, cx, Some(dir_idx), dir, name)? {
+                            return Ok(Some(found));
+                        }
                     }
                 }
             }
@@ -389,8 +490,8 @@ impl<'a> Search<'a> {
         let headers = match directory {
             SearchDirectory::Listed { frameworks, .. } => frameworks,
             SearchDirectory::Missing => return Ok(None),
-            SearchDirectory::Unknown | SearchDirectory::Unlisted => {
-                fallback = match SearchDirectory::read(cx.host(), root, true) {
+            SearchDirectory::Unknown | SearchDirectory::Unlisted | SearchDirectory::Existing => {
+                fallback = match SearchDirectory::read(cx.host(), root, false) {
                     SearchDirectory::Listed { frameworks, .. } => frameworks,
                     _ => return Ok(None),
                 };
@@ -418,14 +519,24 @@ impl<'a> Search<'a> {
         name: &Path,
         directory: &SearchDirectory,
     ) -> Result<Option<PathBuf>, CmdError> {
-        if name.is_absolute() {
+        if name.is_absolute()
+            || (matches!(directory, SearchDirectory::Missing) && is_relative_descendant(name))
+        {
             return Ok(None);
         }
-        let name = path::from_native(name);
+        let name_bytes = path::from_native(name);
+        let direct_child = single_component(name).is_some();
+        let mut buf = Vec::with_capacity(name_bytes.len() + b".xcframework".len());
         for extension in [b".xcframework".as_slice(), b".framework"] {
-            let path = normalize(&dir.join(path::to_native(&cat(&[&name, extension]))));
+            buf.clear();
+            buf.extend_from_slice(&name_bytes);
+            buf.extend_from_slice(extension);
+            if direct_child && !directory.may_contain_leaf(&buf) {
+                continue;
+            }
+            let path = join_normalized(dir, &path::to_native(&buf));
             if self.ignored.ignores_prefix(&path)
-                || !directory.may_contain(dir, &path)
+                || (!direct_child && !directory.may_contain(dir, &path))
                 || !cx
                     .host()
                     .metadata(&path, Follow::Yes)
@@ -433,7 +544,7 @@ impl<'a> Search<'a> {
             {
                 continue;
             }
-            let path = if cx.host().system().sysname == b"Darwin" {
+            let path = if self.is_darwin {
                 disk_spelling(cx, &path)
             } else {
                 path
@@ -453,13 +564,24 @@ impl<'a> Search<'a> {
         name: &Path,
         directory: &SearchDirectory,
     ) -> Result<Option<PathBuf>, CmdError> {
+        if matches!(directory, SearchDirectory::Missing) && is_relative_descendant(name) {
+            return Ok(None);
+        }
         let Some(stem) = name.file_name() else {
             return Ok(None);
         };
         let mut bundle_name = name.as_os_str().to_os_string();
         bundle_name.push(".app");
-        let bundle = dir.join(bundle_name);
+        let bundle = join_normalized(dir, Path::new(&bundle_name));
         if !directory.may_contain(dir, &bundle) {
+            return Ok(None);
+        }
+        if !self.hermetic
+            && !cx
+                .host()
+                .metadata(&bundle, Follow::Yes)
+                .is_ok_and(|meta| meta.kind == FileKind::Dir)
+        {
             return Ok(None);
         }
         let executable = bundle_executable(cx, &bundle, stem);
@@ -480,63 +602,139 @@ impl<'a> Search<'a> {
         if name.is_absolute() && !matches!(self.kind, Kind::Program) {
             return Ok(None);
         }
-        let direct = normalize(&dir.join(name));
-        let try_direct = self
-            .decoration
-            .as_ref()
-            .is_none_or(|library| library.has_suffix(name));
-        let alternatives = self
-            .decoration
-            .iter()
-            .flat_map(|library| library.paths(dir, name));
-        let windows_program = cfg!(windows) && matches!(self.kind, Kind::Program);
-        let programs = [".com", ".exe"]
-            .into_iter()
-            .filter(|suffix| {
-                windows_program
-                    && !name
-                        .as_os_str()
-                        .as_encoded_bytes()
-                        .ends_with(suffix.as_bytes())
-            })
-            .map(|suffix| {
-                let mut path = direct.as_os_str().to_os_string();
-                path.push(suffix);
-                PathBuf::from(path)
-            });
-        for path in programs
-            .chain(try_direct.then(|| direct.clone()))
-            .chain(alternatives)
-        {
-            if !directory.may_contain(dir, &path) {
-                continue;
+        let missing_descendant =
+            matches!(directory, SearchDirectory::Missing) && is_relative_descendant(name);
+        let try_direct = !missing_descendant
+            && self
+                .decoration
+                .as_ref()
+                .is_none_or(|library| library.has_suffix(name));
+        let windows_program =
+            !missing_descendant && cfg!(windows) && matches!(self.kind, Kind::Program);
+        let record_direct = self.considered.is_some()
+            || (self.event.is_some()
+                && (!matches!(self.kind, Kind::Library) || !self.ignored.prefixes.is_empty()));
+        let direct =
+            (try_direct || windows_program || record_direct).then(|| join_normalized(dir, name));
+
+        if !missing_descendant {
+            if windows_program && let Some(direct) = &direct {
+                let raw = name.as_os_str().as_encoded_bytes();
+                for suffix in [".com", ".exe"] {
+                    if !raw.ends_with(suffix.as_bytes()) {
+                        let mut candidate_path = direct.as_os_str().to_os_string();
+                        candidate_path.push(suffix);
+                        let candidate_path = PathBuf::from(candidate_path);
+                        if directory.may_contain(dir, &candidate_path)
+                            && let Some(found) = self.accept(cx, &candidate_path, dir)?
+                        {
+                            if self.considered.is_some() {
+                                self.match_path = Some(candidate_path);
+                            }
+                            return Ok(Some(found));
+                        }
+                    }
+                }
             }
-            if let Some(found) = self.accept(cx, &path, dir)? {
+            if try_direct
+                && let Some(direct) = &direct
+                && directory.may_contain(dir, direct)
+                && let Some(found) = self.accept(cx, direct, dir)?
+            {
                 if self.considered.is_some() {
-                    self.match_path = Some(path);
+                    self.match_path = Some(direct.clone());
+                }
+                return Ok(Some(found));
+            }
+            if let Some((matched, found)) = self.try_library_variants(cx, dir, name, directory)? {
+                if self.considered.is_some() {
+                    self.match_path = Some(matched);
                 }
                 return Ok(Some(found));
             }
         }
-        if let Some(event) = &mut self.event
-            && !self.ignored.ignores_prefix(&direct)
-        {
-            let attempt = if matches!(self.kind, Kind::Library) {
-                directory_path(dir)
-            } else {
-                path::from_native_cmake(&direct)
-            };
-            event.bytes = event.bytes.saturating_add(attempt.len() + 8);
-            if event.bytes <= 1024 * 1024 {
-                event.attempted.push(attempt);
+
+        let not_ignored = self.ignored.prefixes.is_empty()
+            || direct
+                .as_deref()
+                .is_none_or(|path| !self.ignored.ignores_prefix(path));
+        if not_ignored {
+            if let Some(event) = &mut self.event {
+                let attempt = if matches!(self.kind, Kind::Library) {
+                    directory_path(dir)
+                } else if let Some(direct) = &direct {
+                    path::from_native_cmake(direct)
+                } else {
+                    directory_path(dir)
+                };
+                event.bytes = event.bytes.saturating_add(attempt.len() + 8);
+                if event.bytes <= 1024 * 1024 {
+                    event.attempted.push(attempt);
+                }
+            }
+            if self.considered.is_some() {
+                let path = self.decoration.as_ref().map_or_else(
+                    || {
+                        direct
+                            .as_deref()
+                            .map_or_else(String::new, |p| path::from_native_cmake(p).to_string())
+                    },
+                    |library| library.pattern(dir, name),
+                );
+                self.record(&path);
             }
         }
-        if self.considered.is_some() && !self.ignored.ignores_prefix(&direct) {
-            let path = self.decoration.as_ref().map_or_else(
-                || path::from_native_cmake(&direct).to_string(),
-                |library| library.pattern(dir, name),
-            );
-            self.record(&path);
+        Ok(None)
+    }
+
+    fn try_library_variants(
+        &self,
+        cx: &mut Cx<'_>,
+        dir: &Path,
+        name: &Path,
+        directory: &SearchDirectory,
+    ) -> Result<Option<(PathBuf, PathBuf)>, CmdError> {
+        let Some(library) = &self.decoration else {
+            return Ok(None);
+        };
+        let Some(file) = name.file_name() else {
+            return Ok(None);
+        };
+        let file = path::from_native(Path::new(file));
+        let parent = name
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        let direct_child = parent.is_none();
+        let nested_dir = parent.map(|parent| join_normalized(dir, parent));
+        let base_dir = nested_dir.as_deref().unwrap_or(dir);
+        let mut filename = Vec::new();
+        for prefix in &library.prefixes {
+            for suffix in &library.suffixes {
+                filename.clear();
+                filename.extend_from_slice(prefix);
+                filename.extend_from_slice(&file);
+                filename.extend_from_slice(suffix);
+                let plain_leaf = direct_child
+                    && !cfg!(windows)
+                    && !filename.is_empty()
+                    && filename.as_slice() != b"."
+                    && filename.as_slice() != b".."
+                    && !filename.contains(&b'/');
+                if plain_leaf && !directory.may_contain_leaf(&filename) {
+                    continue;
+                }
+                let candidate_path = if plain_leaf {
+                    base_dir.join(path::to_native(&filename))
+                } else {
+                    join_normalized(base_dir, &path::to_native(&filename))
+                };
+                if !plain_leaf && !directory.may_contain(dir, &candidate_path) {
+                    continue;
+                }
+                if let Some(found) = self.accept(cx, &candidate_path, dir)? {
+                    return Ok(Some((candidate_path, found)));
+                }
+            }
         }
         Ok(None)
     }
@@ -622,10 +820,11 @@ impl<'a> Search<'a> {
             .strip_prefix("find_")
             .unwrap_or_default();
         let description = self.options.doc.clone().unwrap_or_else(|| self.kind.help());
+        let is_darwin = self.is_darwin;
         let order = |key: &[u8]| {
             let value = cx.var_or_empty(key);
             if value.is_empty() {
-                if cx.host().system().sysname == b"Darwin" {
+                if is_darwin {
                     "FIRST".into()
                 } else {
                     "NEVER".into()
@@ -700,9 +899,12 @@ impl<'a> Search<'a> {
         ] {
             let mode = cx.var_or_empty(key);
             let first = if label == "Framework" && matches!(self.kind, Kind::Library) {
-                matches!(FrameworkOrder::new(cx), FrameworkOrder::First)
+                matches!(
+                    FrameworkOrder::new(cx, self.is_darwin),
+                    FrameworkOrder::First
+                )
             } else {
-                mode == b"FIRST" || mode.is_empty() && cx.host().system().sysname == b"Darwin"
+                mode == b"FIRST" || mode.is_empty() && self.is_darwin
             };
             let item = if label == "Framework" {
                 "Frameworks"
@@ -802,9 +1004,9 @@ struct LibraryNames {
 }
 
 impl LibraryNames {
-    fn new(cx: &Cx<'_>) -> Self {
+    fn new(cx: &Cx<'_>, is_darwin: bool) -> Self {
         let prefixes = library_parts(cx, b"CMAKE_FIND_LIBRARY_PREFIXES", b"lib");
-        let defaults: &[u8] = if cx.host().system().sysname.as_slice() == b"Darwin" {
+        let defaults: &[u8] = if is_darwin {
             b".tbd;.dylib;.so;.a"
         } else {
             b".so;.a"
@@ -851,21 +1053,6 @@ impl LibraryNames {
             suffixes.join("|")
         )
     }
-
-    fn paths(&self, dir: &Path, name: &Path) -> impl Iterator<Item = PathBuf> {
-        let file = name
-            .file_name()
-            .map(|file| path::from_native(Path::new(file)));
-        let dir = dir.join(name.parent().unwrap_or_else(|| Path::new("")));
-        self.prefixes.iter().flat_map(move |prefix| {
-            let file = file.clone();
-            let dir = dir.clone();
-            self.suffixes.iter().filter_map(move |suffix| {
-                let filename = cat(&[prefix, file.as_ref()?, suffix]);
-                Some(normalize(&dir.join(path::to_native(&filename))))
-            })
-        })
-    }
 }
 
 fn regex_literal(value: &str) -> String {
@@ -892,7 +1079,69 @@ fn library_parts(cx: &Cx<'_>, var: &[u8], default: &[u8]) -> Vec<BString> {
     }
 }
 
+enum PlistExecutable<'a> {
+    Found(&'a [u8]),
+    Missing,
+    Fallback,
+}
+
+fn parse_xml_plist_executable(bytes: &[u8]) -> PlistExecutable<'_> {
+    const KEY: &[u8] = b"<key>CFBundleExecutable</key>";
+    const OPEN_STRING: &[u8] = b"<string>";
+    const CLOSE_STRING: &[u8] = b"</string>";
+
+    if bytes.starts_with(b"bplist")
+        || !bytes.contains_str(b"<plist")
+        || bytes.contains_str(b"<!--")
+        || bytes.contains_str(b"<![CDATA[")
+        || bytes.contains_str(b"<dict ")
+    {
+        return PlistExecutable::Fallback;
+    }
+    let Some(key_pos) = bytes.find(KEY) else {
+        return if bytes.contains_str(b"CFBundleExecutable") || bytes.contains_str(b"&#") {
+            PlistExecutable::Fallback
+        } else {
+            PlistExecutable::Missing
+        };
+    };
+    let Some((before, after_start)) = bytes.split_at_checked(key_pos) else {
+        return PlistExecutable::Fallback;
+    };
+    let Some(after_key) = after_start.strip_prefix(KEY) else {
+        return PlistExecutable::Fallback;
+    };
+    if after_key.contains_str(KEY) {
+        return PlistExecutable::Fallback;
+    }
+    let opens = before.find_iter(b"<dict>").count();
+    let closes = before.find_iter(b"</dict>").count();
+    if opens != closes.saturating_add(1) {
+        return PlistExecutable::Fallback;
+    }
+    let trimmed = after_key.trim_ascii_start();
+    let Some(after_open) = trimmed.strip_prefix(OPEN_STRING) else {
+        return PlistExecutable::Fallback;
+    };
+    let Some(end) = after_open.find(CLOSE_STRING) else {
+        return PlistExecutable::Fallback;
+    };
+    let Some(value) = after_open.get(..end) else {
+        return PlistExecutable::Fallback;
+    };
+    if value.is_empty()
+        || value
+            .iter()
+            .any(|&byte| matches!(byte, b'&' | b'<' | b'>' | 0))
+    {
+        return PlistExecutable::Fallback;
+    }
+    PlistExecutable::Found(value)
+}
+
 fn bundle_executable(cx: &Cx<'_>, bundle: &Path, stem: &std::ffi::OsStr) -> PathBuf {
+    const MAX_PLIST_BYTES: u64 = 256 * 1024;
+
     let contents = bundle.join("Contents");
     let plist = contents.join("Info.plist");
     let host = cx.host();
@@ -900,49 +1149,58 @@ fn bundle_executable(cx: &Cx<'_>, bundle: &Path, stem: &std::ffi::OsStr) -> Path
         .metadata(&plist, Follow::Yes)
         .is_ok_and(|info| info.kind == FileKind::File)
     {
-        let request = RunRequest {
-            pipeline: vec![CommandSpec {
-                program: "/usr/bin/plutil".into(),
-                args: vec![
-                    "-extract".into(),
-                    "CFBundleExecutable".into(),
-                    "raw".into(),
-                    "-o".into(),
-                    "-".into(),
-                    path::from_native(&plist),
-                ],
-            }],
-            cwd: cx.current_binary_dir(),
-            env: host.env_all(),
-            stdin: Input::Null,
-            stdout: Output::Capture,
-            stderr: Output::Null,
-            timeout: Some(Duration::from_secs(2)),
-            tee: false,
-        };
-        host.run(&request, &mut |_, _| {})
+        let parsed = host
+            .read(
+                &plist,
+                ReadRange::All {
+                    limit: MAX_PLIST_BYTES,
+                },
+            )
             .ok()
-            .filter(|run| run.results == [ProcessResult::Exited(0)])
-            .map(|run| path::to_native(run.stdout.strip_suffix(b"\n").unwrap_or(&run.stdout)))
-            .filter(|name| {
-                matches!(
-                    name.components().collect::<Vec<_>>().as_slice(),
-                    [Component::Normal(_)]
-                )
-            })
+            .and_then(|bytes| match parse_xml_plist_executable(&bytes) {
+                PlistExecutable::Found(value) => Some(Some(path::to_native(value))),
+                PlistExecutable::Missing => Some(None),
+                PlistExecutable::Fallback => None,
+            });
+        let raw = parsed.unwrap_or_else(|| {
+            let request = RunRequest {
+                pipeline: vec![CommandSpec {
+                    program: "/usr/bin/plutil".into(),
+                    args: vec![
+                        "-extract".into(),
+                        "CFBundleExecutable".into(),
+                        "raw".into(),
+                        "-o".into(),
+                        "-".into(),
+                        path::from_native(&plist),
+                    ],
+                }],
+                cwd: cx.current_binary_dir(),
+                env: host.env_all(),
+                stdin: Input::Null,
+                stdout: Output::Capture,
+                stderr: Output::Null,
+                timeout: Some(Duration::from_secs(2)),
+                tee: false,
+            };
+            host.run(&request, &mut |_, _| {})
+                .ok()
+                .filter(|run| run.results == [ProcessResult::Exited(0)])
+                .map(|run| path::to_native(run.stdout.strip_suffix(b"\n").unwrap_or(&run.stdout)))
+        });
+        raw.filter(|name| single_component(name).is_some())
     } else {
         None
     };
-    normalize(
-        &contents
-            .join("MacOS")
-            .join(executable.as_deref().unwrap_or_else(|| Path::new(stem))),
+    join_normalized(
+        &contents.join("MacOS"),
+        executable.as_deref().unwrap_or_else(|| Path::new(stem)),
     )
 }
 
 fn candidate(cx: &mut Cx<'_>, kind: Kind, path: &Path) -> bool {
     if matches!(kind, Kind::Path | Kind::File) {
-        return cx.host().metadata(path, rcmake_host::Follow::Yes).is_ok();
+        return cx.host().metadata(path, Follow::Yes).is_ok();
     }
     let Some(metadata) = file_metadata(cx, path) else {
         return false;
@@ -962,7 +1220,7 @@ fn candidate(cx: &mut Cx<'_>, kind: Kind, path: &Path) -> bool {
             .host()
             .read(
                 path,
-                rcmake_host::ReadRange::Slice {
+                ReadRange::Slice {
                     offset: 0,
                     len: Some(0),
                 },
