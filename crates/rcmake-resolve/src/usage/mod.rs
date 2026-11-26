@@ -117,7 +117,7 @@ impl MemoKey<'_> {
 
 type UsagePaths = Vec<Vec<crate::Hop>>;
 
-const MAX_WALK_DEPTH: usize = 128;
+const MAX_WALK_DEPTH: usize = 256;
 
 /// Evaluate usage requirements against one immutable project model.
 pub struct UsageResolver<'a> {
@@ -589,7 +589,9 @@ impl<'a> UsageResolver<'a> {
         name: &[u8],
         ctx: &EvalContext,
     ) -> Result<Arc<WalkValue>, ResolveError> {
-        self.walk_with(target, name, ctx, &mut HashSet::new())
+        let mut visited = HashMap::new();
+        let (value, _) = self.walk_with(target, name, ctx, &mut visited)?;
+        Ok(value)
     }
 
     fn walk_with(
@@ -597,8 +599,8 @@ impl<'a> UsageResolver<'a> {
         target: TargetId,
         name: &[u8],
         ctx: &EvalContext,
-        visited: &mut HashSet<(TargetId, bool)>,
-    ) -> Result<Arc<WalkValue>, ResolveError> {
+        visited: &mut HashMap<(TargetId, bool), usize>,
+    ) -> Result<(Arc<WalkValue>, usize), ResolveError> {
         // A link graph may contain a cycle. Stop this branch and avoid caching its
         // partial result. A generator expression that re-enters a property is an error.
         let in_cycle = self
@@ -607,13 +609,10 @@ impl<'a> UsageResolver<'a> {
             .any(|(id, prop)| *id == target && prop == name);
         if in_cycle {
             self.cycle_count += 1;
-            return Ok(Arc::default());
+            return Ok((Arc::default(), 0));
         }
-        // Link walks can have many paths through cycles. Cache only a complete
-        // query so a cached branch cannot bypass the query's visited set.
-        if ctx.traversal == UsageTraversal::Link && !visited.is_empty() {
-            return self.walk_once(target, name, ctx, visited).map(Arc::new);
-        }
+        let is_iface = name.starts_with(b"INTERFACE_");
+        let start_seq = visited.len();
         let mut key = MemoKey {
             target,
             property: Cow::Borrowed(name),
@@ -639,26 +638,51 @@ impl<'a> UsageResolver<'a> {
                 .as_ref()
                 .map(|value| Cow::Borrowed(value.0.as_slice())),
         };
+        let lookup_cached = |memo: &HashMap<MemoKey<'static>, Arc<WalkValue>>,
+                             key: &MemoKey<'_>,
+                             visited: &mut HashMap<(TargetId, bool), usize>|
+         -> Option<Arc<WalkValue>> {
+            let value = memo.get(key)?;
+            if ctx.traversal == UsageTraversal::Link && !visited.is_empty() {
+                if visited.contains_key(&(target, is_iface))
+                    || value
+                        .contributions
+                        .iter()
+                        .any(|(owner, _)| visited.contains_key(&(*owner, true)))
+                {
+                    return None;
+                }
+                let seq = visited.len();
+                visited.entry((target, is_iface)).or_insert(seq);
+                for (owner, _) in &value.contributions {
+                    let seq = visited.len();
+                    visited.entry((*owner, true)).or_insert(seq);
+                }
+            }
+            Some(Arc::clone(value))
+        };
         if self.source_reads.is_none()
-            && let Some(value) = self.memo.get(&key)
+            && let Some(value) = lookup_cached(&self.memo, &key, visited)
         {
-            return Ok(Arc::clone(value));
+            return Ok((value, usize::MAX));
         }
         key.head = ctx.head.and_then(|id| self.ids.get(id.0 as usize).copied());
         if self.source_reads.is_none()
-            && let Some(value) = self.memo.get(&key)
+            && let Some(value) = lookup_cached(&self.memo, &key, visited)
         {
-            return Ok(Arc::clone(value));
+            return Ok((value, usize::MAX));
         }
         let cycle_count = self.cycle_count;
-        let value = Arc::new(self.walk_once(target, name, ctx, visited)?);
-        if self.source_reads.is_none() && self.cycle_count == cycle_count {
+        let (walk_value, min_dep_seq) = self.walk_once(target, name, ctx, visited)?;
+        let value = Arc::new(walk_value);
+        let self_contained = ctx.traversal == UsageTraversal::Compile || min_dep_seq >= start_seq;
+        if self.source_reads.is_none() && self.cycle_count == cycle_count && self_contained {
             if !value.flags.head_sensitive {
                 key.head = None;
             }
             self.memo.insert(key.into_owned(), Arc::clone(&value));
         }
-        Ok(value)
+        Ok((value, min_dep_seq))
     }
 
     fn walk_once(
@@ -666,13 +690,16 @@ impl<'a> UsageResolver<'a> {
         target: TargetId,
         name: &[u8],
         ctx: &EvalContext,
-        visited: &mut HashSet<(TargetId, bool)>,
-    ) -> Result<WalkValue, ResolveError> {
+        visited: &mut HashMap<(TargetId, bool), usize>,
+    ) -> Result<(WalkValue, usize), ResolveError> {
         // A query on a direct property can reach the root's interface.
-        if !visited.insert((target, name.starts_with(b"INTERFACE_"))) {
+        let key = (target, name.starts_with(b"INTERFACE_"));
+        if let Some(&seq) = visited.get(&key) {
             self.cycle_count += usize::from(ctx.traversal == UsageTraversal::Compile);
-            return Ok(WalkValue::default());
+            return Ok((WalkValue::default(), seq));
         }
+        let seq = visited.len();
+        visited.insert(key, seq);
         self.with_property(target, name, |this| {
             this.walk_uncached(target, name, ctx, visited)
         })
@@ -683,8 +710,8 @@ impl<'a> UsageResolver<'a> {
         id: TargetId,
         name: &[u8],
         ctx: &EvalContext,
-        visited: &mut HashSet<(TargetId, bool)>,
-    ) -> Result<WalkValue, ResolveError> {
+        visited: &mut HashMap<(TargetId, bool), usize>,
+    ) -> Result<(WalkValue, usize), ResolveError> {
         let target = self.target(id)?;
         let mut own = UsageValue::default();
         if let Some(field) = UsageField::from_name(name) {
@@ -758,8 +785,19 @@ impl<'a> UsageResolver<'a> {
             result.contributions.push((id, own.entries.into()));
         }
         let mut seen = (ctx.traversal == UsageTraversal::Compile).then(HashSet::new);
+        let mut min_dep_seq = usize::MAX;
         for (dependency, edge) in links.iter().flat_map(|item| item.edges()) {
-            if ctx.traversal == UsageTraversal::Link && visited.contains(&(dependency, true)) {
+            if ctx.traversal == UsageTraversal::Link
+                && let Some(&dep_seq) = visited.get(&(dependency, true))
+            {
+                min_dep_seq = min_dep_seq.min(dep_seq);
+                if self
+                    .active
+                    .iter()
+                    .any(|(active_id, _)| *active_id == dependency)
+                {
+                    self.cycle_count += 1;
+                }
                 continue;
             }
             let previous_link_bt = if self.current_link_bt.is_none() {
@@ -772,7 +810,8 @@ impl<'a> UsageResolver<'a> {
             if restore_link_bt {
                 self.current_link_bt = previous_link_bt;
             }
-            let value = value?;
+            let (value, child_min_dep) = value?;
+            min_dep_seq = min_dep_seq.min(child_min_dep);
             result.flags = result.flags.union(value.flags);
             for (owner, entries) in &value.contributions {
                 if *owner == id || seen.as_mut().is_some_and(|seen| !seen.insert(*owner)) {
@@ -795,7 +834,7 @@ impl<'a> UsageResolver<'a> {
                 }
             }
         }
-        Ok(result)
+        Ok((result, min_dep_seq))
     }
 
     pub(crate) fn source_file_sets(

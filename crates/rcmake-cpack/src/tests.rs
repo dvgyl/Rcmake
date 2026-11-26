@@ -1078,7 +1078,11 @@ set(CPACK_DEBIAN_COMPRESSION_TYPE bzip2)
 fn rpm_runs_the_bundled_spec_and_rejects_a_failed_repeat() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    let host = memory_host();
+    let host = if cfg!(windows) {
+        Arc::new(PureHost::new("C:/work".into(), "C:/bin/cpack.exe".into()))
+    } else {
+        memory_host()
+    };
     let modules = seed_package_module(
         &host,
         "CPackRPM.cmake",

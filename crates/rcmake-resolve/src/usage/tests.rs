@@ -131,6 +131,46 @@ fn cmp0099_new_collects_cyclic_static_link_depends_in_first_visit_order() {
     assert_eq!(values(&result.entries), libraries.join(";"));
 }
 
+#[test]
+fn deep_500_target_link_chain_resolves_without_depth_error() {
+    let mut model = model("Linux");
+    let mut apps = Vec::new();
+    for idx in 0..500 {
+        let name = format!("lib{idx}");
+        let cur = add(&mut model, &name, TargetKind::StaticLibrary);
+        usage(
+            &mut model,
+            cur,
+            UsageField::InterfaceLinkDepends,
+            &format!("dep{idx}"),
+        );
+        if idx > 0 {
+            let prev_name = format!("lib{}", idx - 1);
+            let half_name = format!("$<LINK_ONLY:lib{}>", idx / 2);
+            link(&mut model, cur, true, &[&prev_name, &half_name]);
+        }
+        if idx % 10 == 9 {
+            let app = add(&mut model, &format!("app{idx}"), TargetKind::Executable);
+            link(&mut model, app, false, &[&name]);
+            apps.push((app, idx + 1));
+        }
+    }
+
+    let mut resolver = UsageResolver::new(&model);
+    for (app, expected) in apps {
+        let traversal = link_property_traversal(model.target(app).unwrap());
+        let result = resolver
+            .collect_property_with(
+                app,
+                b"LINK_DEPENDS",
+                &EvalContext::default(),
+                Some(traversal),
+            )
+            .unwrap();
+        assert_eq!(result.entries.len(), expected);
+    }
+}
+
 fn command_entry(value: &str, command: &str, line: u32) -> BT<BString> {
     BT::new(
         value.into(),
