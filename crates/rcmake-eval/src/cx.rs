@@ -185,9 +185,7 @@ impl Cx<'_> {
             self.interp.fatal = true;
             return;
         }
-        if let Some(observed) = &mut self.interp.replay.observations {
-            observed.vars.insert(name.into());
-        }
+        self.interp.note_replay_var_write(name);
         self.interp.define(name, value);
     }
 
@@ -228,9 +226,7 @@ impl Cx<'_> {
     /// Unset a normal variable in the current scope. Notifies variable watches
     /// (`REMOVED_ACCESS`).
     pub fn unset_var(&mut self, name: &[u8]) {
-        if let Some(observed) = &mut self.interp.replay.observations {
-            observed.vars.insert(name.into());
-        }
+        self.interp.note_replay_var_write(name);
         self.interp.undefine(name);
     }
 

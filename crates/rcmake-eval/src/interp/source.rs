@@ -7,8 +7,8 @@ use rcmake_syntax::ParseError;
 
 use super::BodyMode;
 use crate::code::{Code, LimitsKey, MAX_CACHE_FILE_BYTES, ParsedSource, SourceText};
+use crate::digest::JournalDigest;
 use crate::interp::IssueClass;
-use crate::journal::JournalDigest;
 use crate::util::{cat, collapse_full_path};
 use crate::{CmdError, CmdResult, Flow, IncludeOptions, Interp};
 

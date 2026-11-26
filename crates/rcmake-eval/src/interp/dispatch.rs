@@ -502,11 +502,7 @@ impl Interp {
             return self.invoke(lower, command, &[]);
         }
         let args = self.expand(&cmd.args)?;
-        if self.replay.observations.is_some()
-            && !crate::journal::valid_expansion(lower, &cmd.args, &args)
-        {
-            self.mark_replay_opaque();
-        }
+        self.note_replay_expansion(lower, &cmd.args, &args);
         if self
             .session_data::<crate::hermetic::HermeticContext>()
             .is_some_and(crate::hermetic::HermeticContext::denied)
@@ -712,12 +708,8 @@ impl Interp {
         end: usize,
         mode: BodyMode,
     ) -> CmdResult {
-        if mode == BodyMode::File
-            && !self.fatal
-            && !code.file.is_empty()
-            && let Some(paths) = &mut self.replay.executed_listfiles
-        {
-            paths.insert(rcmake_host::path::to_native(&code.file));
+        if mode == BodyMode::File && !self.fatal && !code.file.is_empty() {
+            self.note_replay_executed_listfile(&code.file);
         }
         let mut i = start;
         while i < end {
@@ -773,17 +765,9 @@ impl Interp {
             b"if" => self.exec_if(code, i),
             b"foreach" => {
                 let name = cmd.args.first().map(|arg| arg.text.as_slice());
-                let before = name
-                    .filter(|_| self.replay.observations.is_some())
-                    .and_then(|name| self.vars.lookup(name))
-                    .cloned();
+                let before = self.capture_replay_foreach_var(name);
                 let result = self.exec_foreach(code, i);
-                if let Some(name) = name
-                    && before.as_ref() != self.vars.lookup(name)
-                    && let Some(observed) = &mut self.replay.observations
-                {
-                    observed.vars.insert(name.into());
-                }
+                self.finish_replay_foreach_var(name, before);
                 result
             }
             b"while" => self.exec_while(code, i),

@@ -13,29 +13,7 @@ use super::codec::{
 };
 use super::frame::{EncodeError, EncodeJson, JsonSink};
 
-/// SHA-256 digest used by the configure journal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct JournalDigest([u8; 32]);
-
-impl JournalDigest {
-    /// Construct a digest from raw SHA-256 bytes.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Get the raw SHA-256 bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    /// Hash bytes with SHA-256.
-    #[must_use]
-    pub fn hash(bytes: &[u8]) -> Self {
-        Self(Sha256::digest(bytes).into())
-    }
-}
+pub use crate::digest::JournalDigest;
 
 pub(super) struct JournalHasher(Sha256);
 
@@ -54,7 +32,7 @@ impl JournalHasher {
     }
 
     pub(super) fn finish(self) -> JournalDigest {
-        JournalDigest(self.0.finalize().into())
+        JournalDigest::from_bytes(self.0.finalize().into())
     }
 }
 
@@ -448,7 +426,7 @@ pub fn policy_digest(status: PolicyStatus) -> JournalDigest {
 
 impl EncodeJson for JournalDigest {
     fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
-        sink.hex_digest(&self.0)
+        sink.hex_digest(self.as_bytes())
     }
 }
 
@@ -468,7 +446,7 @@ impl FromJson for JournalDigest {
         for (slot, &[high, low]) in raw.iter_mut().zip(pairs) {
             *slot = (nibble(high).ok_or_else(invalid)? << 4) | nibble(low).ok_or_else(invalid)?;
         }
-        Ok(Self(raw))
+        Ok(Self::from_bytes(raw))
     }
 }
 

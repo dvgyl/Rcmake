@@ -37,13 +37,17 @@ mod builtins;
 mod code;
 mod configure_log;
 mod cx;
+mod digest;
 mod env;
 mod file_lock;
 mod flow;
 pub mod hermetic;
 mod hooks;
 mod interp;
+#[cfg(feature = "replay")]
 pub mod journal;
+#[cfg(not(feature = "replay"))]
+mod journal;
 mod profiler;
 mod provenance;
 mod scope;
@@ -135,6 +139,7 @@ struct Builtin {
     func: BuiltinFn,
     flags: CmdFlags,
     raw: bool,
+    #[cfg(feature = "replay")]
     replay: bool,
 }
 
@@ -173,6 +178,7 @@ impl Registry {
                 func,
                 flags,
                 raw,
+                #[cfg(feature = "replay")]
                 replay: false,
             },
         );
@@ -496,6 +502,7 @@ pub struct Interp {
     exit_override: Option<i32>,
     frontend: Frontend,
     hooks: hooks::Hooks,
+    #[cfg(feature = "replay")]
     replay: journal::ReplayState,
     variable_access: BTreeMap<BString, std::sync::atomic::AtomicBool>,
     /// Command tracing configuration (`--trace*`).
@@ -607,6 +614,7 @@ impl Interp {
             exit_override: None,
             frontend: Frontend::default(),
             hooks: hooks::Hooks::default(),
+            #[cfg(feature = "replay")]
             replay: journal::ReplayState::default(),
             variable_access: BTreeMap::new(),
             trace: None,

@@ -11,6 +11,7 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::{Follow, Host, path};
 use rcmake_json::{FieldError, FromJson, Value, opt_or_else, req};
 use rcmake_model::DirId;
+use rcmake_syntax::{ArgKind, Argument};
 
 use super::codec;
 use super::frame::{EncodeError, EncodeJson, JsonSink, MAX_FRAME_BYTES, encoded_size};
@@ -120,6 +121,8 @@ struct ReplayPlan {
     digest: JournalDigest,
     tools: Vec<PathBuf>,
 }
+
+pub(crate) type ForeachSaved = Option<crate::Binding>;
 
 #[derive(Default)]
 pub(crate) struct ReplayState {
@@ -780,6 +783,70 @@ impl Interp {
     pub(crate) fn mark_replay_opaque(&mut self) {
         if let Some(observed) = &mut self.replay.observations {
             observed.opaque = true;
+        }
+    }
+
+    pub(crate) fn note_replay_var_write(&mut self, name: &[u8]) {
+        if let Some(observed) = &mut self.replay.observations {
+            observed.vars.insert(name.into());
+        }
+    }
+
+    pub(crate) fn note_replay_cache_write(&mut self, name: &[u8]) {
+        if let Some(observed) = &mut self.replay.observations {
+            observed.cache.insert(name.into());
+        }
+    }
+
+    pub(crate) fn note_replay_defer(&mut self, dir: DirId, command: &[u8], args: &[Argument]) {
+        if self.replay.observations.is_none() {
+            return;
+        }
+        if dir == DirId::ROOT
+            && command == b"target_link_libraries"
+            && matches!(args, [arg] if arg.kind == ArgKind::Bracket
+                && arg.text == super::leaf::REPLAY_LINK_CHECK)
+        {
+            let origin = PropertyOrigin::new(self.current_binary_dir(), &self.bt);
+            if let Some(observed) = &mut self.replay.observations {
+                observed.link_check = Some(origin);
+            }
+        } else {
+            self.mark_replay_opaque();
+        }
+    }
+
+    pub(crate) fn note_replay_expansion(
+        &mut self,
+        lower: &[u8],
+        raw_args: &[Argument],
+        args: &[ExpandedArg],
+    ) {
+        if self.replay.observations.is_some()
+            && !super::leaf::shape::valid_expansion(lower, raw_args, args)
+        {
+            self.mark_replay_opaque();
+        }
+    }
+
+    pub(crate) fn note_replay_executed_listfile(&mut self, file: &[u8]) {
+        if let Some(paths) = &mut self.replay.executed_listfiles {
+            paths.insert(path::to_native(file));
+        }
+    }
+
+    pub(crate) fn capture_replay_foreach_var(&self, name: Option<&[u8]>) -> ForeachSaved {
+        name.filter(|_| self.replay.observations.is_some())
+            .and_then(|name| self.vars.lookup(name))
+            .cloned()
+    }
+
+    pub(crate) fn finish_replay_foreach_var(&mut self, name: Option<&[u8]>, before: ForeachSaved) {
+        if let Some(name) = name
+            && before.as_ref() != self.vars.lookup(name)
+            && let Some(observed) = &mut self.replay.observations
+        {
+            observed.vars.insert(name.into());
         }
     }
 

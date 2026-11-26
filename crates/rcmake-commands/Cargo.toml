@@ -10,7 +10,7 @@ repository.workspace = true
 
 [features]
 default = ["native", "archive"]
-native = ["dep:rcmake-store", "dep:rcmake-fetch", "rcmake-fetch/native"]
+native = ["dep:rcmake-store", "dep:rcmake-fetch", "rcmake-fetch/native", "rcmake-eval/replay"]
 archive = ["dep:rcmake-archive"]
 
 [dependencies]

@@ -90,9 +90,7 @@ impl Cx<'_> {
 
     /// Insert a cache entry and record the write if history is enabled.
     pub fn insert_cache_entry(&mut self, name: BString, entry: CacheEntry) {
-        if let Some(observed) = &mut self.interp.replay.observations {
-            observed.cache.insert(name.clone());
-        }
+        self.interp.note_replay_cache_write(&name);
         self.interp
             .record_var_write(&name, crate::VarOp::CacheSet, Some(&entry.value));
         self.cache().insert(name, entry);
@@ -101,9 +99,7 @@ impl Cx<'_> {
     /// Remove an existing cache entry and record the write if history is enabled.
     pub fn remove_cache_entry(&mut self, name: &[u8]) {
         if self.cache().get(name).is_some() {
-            if let Some(observed) = &mut self.interp.replay.observations {
-                observed.cache.insert(name.into());
-            }
+            self.interp.note_replay_cache_write(name);
             self.interp
                 .record_var_write(name, crate::VarOp::CacheUnset, None);
             self.cache().remove(name);

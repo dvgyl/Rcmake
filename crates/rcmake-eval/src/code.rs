@@ -7,7 +7,7 @@ use rcmake_base::Limits;
 use rcmake_diag::{Diagnostic, SourceId, source::SourceKind};
 use rcmake_syntax::{CommandInvocation, ParseError};
 
-use crate::journal::JournalDigest;
+use crate::digest::JournalDigest;
 
 #[derive(Clone)]
 pub(crate) struct ParsedSource {

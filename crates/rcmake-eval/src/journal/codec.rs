@@ -30,8 +30,11 @@ pub(super) fn from_bytes_list(value: &Value) -> Result<Vec<Vec<u8>>, FieldError>
     from_list(value, from_bytes)
 }
 
+/// Name-and-value byte pairs stored in journal records.
+pub(super) type BytePairs = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Decode pairs written by [`super::frame::JsonSink::byte_pairs`].
-pub(super) fn from_byte_pairs(value: &Value) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FieldError> {
+pub(super) fn from_byte_pairs(value: &Value) -> Result<BytePairs, FieldError> {
     from_list(value, |item| {
         let (name, value) = from_pair(item)?;
         Ok((from_bytes(name)?, from_bytes(value)?))

@@ -79,7 +79,7 @@ rcmake-host = { path = "crates/rcmake-host" }
 rcmake-regex = { path = "crates/rcmake-regex" }
 rcmake-expr = { path = "crates/rcmake-expr" }
 rcmake-model = { path = "crates/rcmake-model" }
-rcmake-eval = { path = "crates/rcmake-eval" }
+rcmake-eval = { path = "crates/rcmake-eval", default-features = false }
 rcmake-presets = { path = "crates/rcmake-presets" }
 rcmake-archive = { path = "crates/rcmake-archive" }
 rcmake-commands = { path = "crates/rcmake-commands", default-features = false }

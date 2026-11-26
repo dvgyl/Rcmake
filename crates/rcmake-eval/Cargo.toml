@@ -8,6 +8,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["replay"]
+replay = []
+
 [dependencies]
 indexmap.workspace = true
 rcmake-base.workspace = true

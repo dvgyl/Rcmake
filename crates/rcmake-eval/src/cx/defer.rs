@@ -57,22 +57,8 @@ impl Cx<'_> {
         args: &[Argument],
     ) -> bool {
         let queued = self.interp.queue_deferred(dir, id, command, args);
-        if queued && self.interp.replay.observations.is_some() {
-            if dir == DirId::ROOT
-                && command == b"target_link_libraries"
-                && matches!(args, [arg] if arg.kind == rcmake_syntax::ArgKind::Bracket
-                    && arg.text == crate::journal::REPLAY_LINK_CHECK)
-            {
-                let origin = crate::journal::PropertyOrigin::new(
-                    self.current_binary_dir(),
-                    &self.backtrace(),
-                );
-                if let Some(observed) = &mut self.interp.replay.observations {
-                    observed.link_check = Some(origin);
-                }
-            } else {
-                self.interp.mark_replay_opaque();
-            }
+        if queued {
+            self.interp.note_replay_defer(dir, command, args);
         }
         queued
     }
