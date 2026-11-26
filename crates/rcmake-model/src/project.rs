@@ -306,6 +306,7 @@ impl ProjectModel {
             binary_dir,
             backtrace,
             usage: parent_dir.usage.clone(),
+            define_flags: parent_dir.define_flags.clone(),
             local_targets: parent_dir.local_targets.clone(),
             ..Directory::default()
         };

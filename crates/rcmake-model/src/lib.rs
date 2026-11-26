@@ -29,7 +29,7 @@ pub use provenance::{LanguageRegistry, PropEvent, PropLedger, PropOp, PropValueP
 mod target;
 
 pub use command::{CustomCommand, CustomCommandKind, TargetEvent};
-pub use directory::Directory;
+pub use directory::{Directory, SourceGroupDef};
 pub use export_dependency::{ExportDependencyMode, ExportDependencySetup};
 pub use generator::{
     GeneratorKind, GeneratorSpec, GeneratorSpecError, ParsedToolset, SpecField, ToolsetSupport,

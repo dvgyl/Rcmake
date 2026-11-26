@@ -1031,6 +1031,7 @@ impl Interp {
             }
             let usage = Usage::capture(&current.usage, &binary, dir)?;
             h.field(14, usage.digest().as_bytes());
+            h.field(30, &current.define_flags);
             for name in current.props.names() {
                 h.field(15, &name);
                 h.field(16, current.props.get(&name)?);

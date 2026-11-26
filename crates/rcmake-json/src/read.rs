@@ -295,7 +295,6 @@ fn decode_string(mut content: &[u8]) -> Result<BString, &'static str> {
                     _ => return Err("Bad escape sequence in string"),
                 }
             }
-            0..=0x1f => return Err("Unescaped control character in string."),
             _ => byte,
         };
         decoded.push(byte);

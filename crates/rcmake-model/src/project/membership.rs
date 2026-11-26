@@ -1,4 +1,4 @@
-use crate::{FileSetKind, ProjectModel, Target, TargetKind};
+use crate::{FileSetKind, ProjectModel, Target, TargetKind, UsageScope};
 
 impl ProjectModel {
     /// Return whether a native generator can emit this target.
@@ -13,7 +13,11 @@ impl ProjectModel {
                 !target.sources.is_empty()
                     || target.file_sets.iter().any(|&id| {
                         self.file_set(id).is_some_and(|set| {
-                            matches!(set.kind, FileSetKind::Headers | FileSetKind::CxxModules)
+                            set.scope != UsageScope::Interface
+                                && matches!(
+                                    set.kind,
+                                    FileSetKind::Headers | FileSetKind::CxxModules
+                                )
                         })
                     })
             }

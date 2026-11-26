@@ -99,8 +99,6 @@ fn rejects_invalid_json() {
         "[",
         "{",
         "\"open",
-        "\"a\tb\"",
-        "\"a\0b\"",
         r#""\q""#,
         r#""\uxxxx""#,
         r#""\u123""#,
@@ -893,4 +891,31 @@ fn to_json_and_from_json_round_trip_standard_and_custom_types() {
         tag: None,
         algo: "SHA512".into(),
     });
+}
+
+#[test]
+fn parse_accepts_raw_control_characters_in_strings_like_jsoncpp() {
+    let options = ReadOptions::default();
+    let with_lf = parse(
+        b"{\"Id\": \"forkfd\", \"Copyright\": \"line1\nline2\"}",
+        &options,
+    )
+    .expect("jsoncpp accepts raw LF in strings");
+    assert_eq!(
+        with_lf.as_object().and_then(|o| o.get(b"Id".as_slice())),
+        Some(&Value::string("forkfd"))
+    );
+    assert_eq!(
+        with_lf
+            .as_object()
+            .and_then(|o| o.get(b"Copyright".as_slice())),
+        Some(&Value::string("line1\nline2"))
+    );
+
+    let with_tab =
+        parse(b"{\"b\": \"tab\there\"}", &options).expect("jsoncpp accepts raw TAB in strings");
+    assert_eq!(
+        with_tab.as_object().and_then(|o| o.get(b"b".as_slice())),
+        Some(&Value::string("tab\there"))
+    );
 }
