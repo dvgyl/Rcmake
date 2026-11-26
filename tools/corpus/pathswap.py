@@ -169,7 +169,7 @@ def compare_runs(source: Path, stages: list[Stage], binary: Path, oracle: Path,
                          artifacts / "rcmake-exec.jsonl")
         files = compare(snapshot, project, artifacts / "diffs",
                         configured_outputs=configured_outputs,
-                        tools=(tool_paths(oracle.parent), tool_paths(shim)))
+                        tools=(tool_paths(oracle.parent), tool_paths(shim)), oracle_root=project)
         dry_runs = {}
         for stage, first, second in zip(stages, before["stages"], after["stages"]):
             if stage.ninja_dry_run and all(row.get("returncode") == 0 for row in (first, second)):

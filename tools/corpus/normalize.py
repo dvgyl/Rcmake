@@ -1254,8 +1254,10 @@ def compare_ide_build_trees(
     oracle_tools: dict[str, set[str]] | None = None,
     rcmake_tools: dict[str, set[str]] | None = None,
     required_queries: tuple[str, ...] = (),
+    oracle_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Compare compile_commands.json, File API replies, and config switches across build dirs."""
+    """Compare IDE data. Use oracle_root for paths recorded before a tree move."""
+    oracle_root = oracle_root if oracle_root is not None else oracle_tree
     oracle_dirs = _discover_ide_build_dirs(oracle_tree)
     rcmake_dirs = _discover_ide_build_dirs(rcmake_tree)
     all_dirs = sorted(oracle_dirs | rcmake_dirs)
@@ -1278,7 +1280,7 @@ def compare_ide_build_trees(
         if oracle_reply.is_dir() or rcmake_reply.is_dir():
             file_api_raw = compare_file_api_reply(
                 oracle_reply, rcmake_reply,
-                oracle_root=oracle_tree, rcmake_root=rcmake_tree,
+                oracle_root=oracle_root, rcmake_root=rcmake_tree,
                 oracle_tools=oracle_tools, rcmake_tools=rcmake_tools,
                 required_queries=required_queries,
             )
@@ -1302,14 +1304,14 @@ def compare_ide_build_trees(
                     oracle_cc = json.loads(oracle_cc_path.read_text(encoding="utf-8"))
                     rcmake_cc = json.loads(rcmake_cc_path.read_text(encoding="utf-8"))
                     norm_cc["oracle"] = normalize_compile_commands(
-                        oracle_cc, root=oracle_tree, tools=oracle_tools, cmake_root=oracle_cmake_root,
+                        oracle_cc, root=oracle_root, tools=oracle_tools, cmake_root=oracle_cmake_root,
                     )
                     norm_cc["rcmake"] = normalize_compile_commands(
                         rcmake_cc, root=rcmake_tree, tools=rcmake_tools, cmake_root=rcmake_cmake_root,
                     )
                     entry["compile_commands"] = diff_compile_commands(
                         oracle_cc, rcmake_cc,
-                        oracle_root=oracle_tree, rcmake_root=rcmake_tree,
+                        oracle_root=oracle_root, rcmake_root=rcmake_tree,
                         oracle_tools=oracle_tools, rcmake_tools=rcmake_tools,
                         oracle_cmake_root=oracle_cmake_root, rcmake_cmake_root=rcmake_cmake_root,
                     )
@@ -1435,7 +1437,8 @@ def compare_pair(
 
 
 def compare(oracle: Path, rcmake: Path, diff_dir: Path, *,
-            configured_outputs: tuple[str, ...] = (), tools: tuple[dict, dict] = ({}, {})) -> dict:
+            configured_outputs: tuple[str, ...] = (), tools: tuple[dict, dict] = ({}, {}),
+            oracle_root: Path | None = None) -> dict:
     """Return file class counts and write a unified diff for every difference."""
     trees = (oracle, rcmake)
     if any(Path(pattern).is_absolute() or ".." in Path(pattern).parts for pattern in configured_outputs):
@@ -1469,7 +1472,8 @@ def compare(oracle: Path, rcmake: Path, diff_dir: Path, *,
         classes.setdefault(file.file_class, dict.fromkeys(BUCKETS, 0))[status] += 1
         files.append(row)
     result: dict[str, Any] = {"classes": classes, "files": files, "rules": RULES}
-    ide = compare_ide_build_trees(oracle, rcmake, oracle_tools=tools[0], rcmake_tools=tools[1])
+    ide = compare_ide_build_trees(oracle, rcmake, oracle_tools=tools[0], rcmake_tools=tools[1],
+                                  oracle_root=oracle_root)
     if ide["build_dirs"]:
         result["ide"] = ide
     return result

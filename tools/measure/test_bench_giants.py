@@ -401,7 +401,9 @@ class BenchmarkFlowTests(unittest.TestCase):
 
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
-        with mock.patch.dict(os.environ, {"PATH": f"{ninja_fake.parent}:{os.environ.get('PATH', '')}"}):
+        abseil_prefix = self.root / "abseil"
+        with (mock.patch.dict(os.environ, {"PATH": f"{ninja_fake.parent}:{os.environ.get('PATH', '')}"}),
+              mock.patch.object(bg, "prepare_abseil", return_value=(abseil_prefix, None))):
             with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
                 rc = bg.main(
                     [
@@ -462,6 +464,16 @@ class BenchmarkFlowTests(unittest.TestCase):
         }
         self.assertEqual(len(cold_rcmake_stores), 6)
         self.assertNotIn(str(self.probe_dir), cold_rcmake_stores)
+
+        for project, source in (("duckdb", self.source_duckdb), ("protobuf", self.source_proto)):
+            trials = [call for call in calls if "-S" in call["argv"] and "-G" in call["argv"]
+                      and str(source) in call["argv"] and not any(
+                          arg.startswith("--profile=") for arg in call["argv"])]
+            for variable in ("HOME", "XDG_CACHE_HOME"):
+                self.assertEqual({Path(call["env"][variable]).parent.name for call in trials}, {project})
+                self.assertEqual(len({call["env"][variable] for call in trials}), 1)
+            if project == "protobuf":
+                self.assertTrue(all(f"-DCMAKE_PREFIX_PATH={abseil_prefix}" in call["argv"] for call in trials))
 
         # Verify no --profile flag was passed during timed warm or incremental runs.
         warm_fresh_rcmake_calls = [

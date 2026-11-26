@@ -108,7 +108,10 @@ TEST_ENVIRONMENT = (
 WINDOWS_ENVIRONMENT = (
     "SystemRoot", "SystemDrive", "ComSpec", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
     "ProgramData", "ProgramFiles", "ProgramFiles(x86)", "INCLUDE", "LIB", "LIBPATH",
+    "TEMP", "TMP", "WINDIR", "ALLUSERSPROFILE", "CommonProgramFiles", "CommonProgramFiles(x86)",
+    "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "HOMEDRIVE", "HOMEPATH",
     "VCINSTALLDIR", "VCToolsInstallDir", "VSINSTALLDIR", "VisualStudioVersion",
+    "VS160COMNTOOLS", "VS170COMNTOOLS", "VS180COMNTOOLS",
     "WindowsSdkDir", "WindowsSDKVersion", "DOTNET_ROOT", "WIX",
 )
 COMPLETE = "-- runcmake_eval: suite complete"
@@ -229,6 +232,13 @@ def companion(driver, name):
                                driver.with_name(name + EXE_SUFFIX)))
 
 
+def visual_studio_instance(env):
+    """Return the generator prefix and installation path for the active Visual Studio."""
+    major = env.get("VisualStudioVersion", "").partition(".")[0]
+    path = env.get("VSINSTALLDIR", "").rstrip("\\/")
+    return (f"Visual Studio {major} ", path) if major.isdecimal() and path else (None, None)
+
+
 def registration_generators(suites, driver, work, env, timeout):
     """Select the default generator and the dedicated platform generators."""
     host = platform.system()
@@ -242,6 +252,9 @@ def registration_generators(suites, driver, work, env, timeout):
                 entry["name"] for entry in capabilities["generators"]
                 if entry["name"].startswith("Visual Studio ")
             ]
+            preferred, _ = visual_studio_instance(env)
+            if preferred:
+                visual_studio.sort(key=lambda name: not name.startswith(preferred))
             generators.extend(visual_studio)
     else:
         if not generators or "Make" in suites:
@@ -270,19 +283,27 @@ def read_registrations(suites, driver, source, work, env, timeout, test_vars, us
         options.append("-DCMake_TEST_CPACK_WIX4=ON")
     if "CPack_WIX" in suites and all(shutil.which(tool) for tool in ("candle", "light")):
         options.append("-DCMake_TEST_CPACK_WIX3=ON")
+    preferred_vs, instance = visual_studio_instance(env)
     configured_vs = False
+    vs_errors = []
     for index, generator in enumerate(generators):
         visual_studio = generator.startswith("Visual Studio ")
         if visual_studio and configured_vs:
             continue
         build = work / f"g{index}"
+        generator_options = []
+        if preferred_vs and generator.startswith(preferred_vs):
+            generator_options.append(f"-DCMAKE_GENERATOR_INSTANCE={instance}")
         try:
             checked_run([
                 driver, "-S", source, "-B", build, "-G", generator, "-DBUILD_TESTING=ON",
-                "-DCMake_TEST_HOST_CMAKE=ON", "-DCMAKE_BUILD_TYPE=Debug", *options,
+                "-DCMake_TEST_HOST_CMAKE=ON", "-DCMAKE_BUILD_TYPE=Debug", *options, *generator_options,
                 *(f"-D{value}" for value in test_vars),
             ], work, env, timeout)
-        except ValueError:
+        except ValueError as error:
+            if visual_studio:
+                vs_errors.append(error)
+                continue
             if os.name == "nt" and index + 1 < len(generators):
                 continue
             raise
@@ -324,6 +345,8 @@ def read_registrations(suites, driver, source, work, env, timeout, test_vars, us
             ], work, env, timeout)
         if set(suites) <= registrations.keys():
             break
+    if vs_errors and not configured_vs:
+        raise vs_errors[0]
     return registrations
 
 

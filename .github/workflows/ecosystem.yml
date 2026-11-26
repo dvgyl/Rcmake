@@ -277,10 +277,21 @@ jobs:
           from tempfile import TemporaryDirectory
 
           started = time.monotonic()
-          root = Path(os.environ["RUNNER_TEMP"])
+          root = Path(os.environ["RUNNER_TEMP"]).resolve()
           vcpkg = root / "vcpkg"
           report = root / "vcpkg-report"
           report.mkdir()
+          proc_root = Path("/proc")
+          ancestors = {os.getpid()}
+          parent = os.getppid()
+          while parent and parent not in ancestors:
+              ancestors.add(parent)
+              try:
+                  status = (proc_root / str(parent) / "status").read_text()
+              except (FileNotFoundError, PermissionError, ProcessLookupError):
+                  break
+              parent = next((int(line.split()[1]) for line in status.splitlines()
+                             if line.startswith("PPid:")), 0)
           count = int(os.environ["SHARD_COUNT"] or "64")
           index = int(os.environ["SHARD_INDEX"])
           all_ports = sorted(path.name for path in (vcpkg / "ports").iterdir()
@@ -334,13 +345,44 @@ jobs:
                   if not cache.is_file() or not any(
                           (tree / file).is_file() for file in ("build.ninja", "Makefile")):
                       continue
-                  values = [line.removeprefix(marker) for line in
-                            cache.read_text(errors="replace").splitlines() if line.startswith(marker)]
+                  try:
+                      lines = cache.read_text(errors="replace").splitlines()
+                  except FileNotFoundError:
+                      continue
+                  values = [line.removeprefix(marker) for line in lines if line.startswith(marker)]
                   if len(values) != 1 or not Path(values[0]).is_absolute() or Path(values[0]).resolve() != expected:
                       identity_errors.append({"profile": tree.name, "commands": values})
                   else:
                       profiles.append(tree.name.removeprefix("x64-linux-"))
               return profiles, identity_errors
+
+          def stop_port_processes(work):
+              # Nested tools can start a new session and survive the group kill.
+              directory = os.fsencode(work)
+              for _ in range(3):
+                  stopped = False
+                  for process in proc_root.glob("[0-9]*"):
+                      pid = int(process.name)
+                      if pid in ancestors:
+                          continue
+                      try:
+                          cwd = os.fsencode(os.readlink(process / "cwd"))
+                      except (FileNotFoundError, PermissionError, ProcessLookupError):
+                          cwd = b""
+                      try:
+                          command = (process / "cmdline").read_bytes()
+                      except (FileNotFoundError, PermissionError, ProcessLookupError):
+                          command = b""
+                      if (cwd == directory or cwd.startswith(directory + b"/")
+                              or directory + b"/" in command or directory + b"\0" in command):
+                          try:
+                              os.kill(pid, signal.SIGKILL)
+                              stopped = True
+                          except (PermissionError, ProcessLookupError):
+                              pass
+                  if not stopped:
+                      break
+                  time.sleep(0.1)
 
           def configure(port, name, work, expected, env):
               buildtrees = work / "buildtrees"
@@ -351,9 +393,10 @@ jobs:
                   f"--x-buildtrees-root={buildtrees}", f"--x-install-root={work / 'installed'}",
                   f"--x-packages-root={work / 'packages'}",
               ]
-              with (report / f"{port}-{name}.log").open("w") as log:
-                  with subprocess.Popen(command, cwd=vcpkg, env=env, stdout=log,
-                                        stderr=subprocess.STDOUT, start_new_session=True) as proc:
+              try:
+                  with (report / f"{port}-{name}.log").open("w") as log:
+                      proc = subprocess.Popen(command, cwd=vcpkg, env=env, stdout=log,
+                                              stderr=subprocess.STDOUT, start_new_session=True)
                       try:
                           result = proc.wait(timeout=engine_timeout)
                       except subprocess.TimeoutExpired:
@@ -361,8 +404,13 @@ jobs:
                               os.killpg(proc.pid, signal.SIGKILL)
                           except ProcessLookupError:
                               pass
-                          proc.wait(timeout=kill_wait)
+                          try:
+                              proc.wait(timeout=kill_wait)
+                          except subprocess.TimeoutExpired:
+                              pass
                           result = 124
+              finally:
+                  stop_port_processes(work)
               profiles, identity_errors = observe(buildtrees / port, expected)
               return {"configure_profiles": profiles, "identity_errors": identity_errors, "install_exit": result}
 
@@ -381,10 +429,18 @@ jobs:
           scored = 0
           with (report / "results.jsonl").open("w", buffering=1) as rows:
               for port in ports:
-                  with TemporaryDirectory(prefix=f"vcpkg-{port}-", dir=root) as temporary:
-                      work = Path(temporary)
+                  temporary = TemporaryDirectory(prefix=f"vcpkg-{port}-", dir=root,
+                                                 ignore_cleanup_errors=True)
+                  work = Path(temporary.name)
+                  try:
                       left = configure(port, "oracle", work / "oracle", *engines["oracle"])
                       right = configure(port, "rcmake", work / "rcmake", *engines["rcmake"])
+                  finally:
+                      stop_port_processes(work)
+                      temporary.cleanup()
+                      if work.exists():
+                          time.sleep(0.1)
+                          shutil.rmtree(work, ignore_errors=True)
                   status = score(left, right)
                   scored += bool(left["configure_profiles"])
                   summary[status] += 1
@@ -761,9 +817,13 @@ jobs:
                          *pin["configure_args"]]
               if pin.get("use_ros_jazzy"):
                   command.append("-DPython3_EXECUTABLE=/usr/bin/python3")
-              if full and pin["name"] == "opencv":
-                  command += ["-DBUILD_LIST=core,imgproc,imgcodecs,ts",
-                              f"-DOPENCV_TEST_DATA_PATH={work / 'opencv-extra/testdata'}"]
+              if pin["name"] == "opencv":
+                  downloads = work / "opencv-downloads"
+                  downloads.mkdir(exist_ok=True)
+                  command.append(f"-DOPENCV_DOWNLOAD_PATH={downloads}")
+                  if full:
+                      command += ["-DBUILD_LIST=core,imgproc,imgcodecs,ts",
+                                  f"-DOPENCV_TEST_DATA_PATH={work / 'opencv-extra/testdata'}"]
               try:
                   with (report / f"{name}.stderr").open("w") as log:
                       subprocess.run(command, timeout=600, check=True, stderr=log)

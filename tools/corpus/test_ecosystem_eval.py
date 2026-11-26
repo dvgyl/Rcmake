@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import ecosystem_eval
 import normalize
+import pathswap
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -506,6 +507,28 @@ class EcosystemEvalTests(unittest.TestCase):
         self.assertEqual(entry_diff["directory_mismatch"], {
             "oracle": "<project>/build/debug", "rcmake": "<project>/build/release",
         })
+
+    def test_pathswap_uses_the_original_root_for_ide_paths(self) -> None:
+        oracle = self.root / "oracle" / "cmake"
+        shim = self.root / "shim"
+        stages = [pathswap.Stage("configure", ["cmake", "--preset", "debug"])]
+
+        def evaluate(bin_dir, source, project, stages, env, timeout, exec_log):
+            _build_ide_reply_tree(
+                project, "build/debug", config="Debug", hash_suffix="aaaaaaaaaaaaaaaaaaaa",
+                cmake_bin=str(bin_dir / "cmake"), cmake_root="/opt/cmake/share/cmake-4.5",
+            )
+            return {"stages": [{"status": "pass"}]}
+
+        with (patch.object(pathswap, "executable"),
+              patch.object(pathswap, "prepare_paths", return_value=(shim, {})),
+              patch.object(pathswap, "evaluate", side_effect=evaluate)):
+            result = pathswap.compare_runs(self.root, stages, shim / "rcmake", oracle,
+                                           self.root / "artifacts", 10)
+
+        build = result["files"]["ide"]["build_dirs"]["build/debug"]
+        self.assertEqual(build["compile_commands"]["status"], "pass", build["compile_commands"])
+        self.assertEqual(build["file_api"]["status"], "pass", build["file_api"])
 
     def test_compare_normalizes_file_api_replies_tool_paths_and_config_switch(self) -> None:
         oracle_tree = self.root / "oracle-proj"

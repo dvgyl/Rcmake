@@ -18,6 +18,8 @@ Example:
 from __future__ import annotations
 
 import argparse
+import hashlib
+from http.client import HTTPException
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -33,6 +35,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -41,9 +44,11 @@ from typing import Any, Callable, Sequence
 
 if __package__:
     from .bench_eval import describe_hardware, host_hardware
+    from .corpus_eval import download, extract
     from .oracle_prop_test import resolve_identity
 else:
     from bench_eval import describe_hardware, host_hardware
+    from corpus_eval import download, extract
     from oracle_prop_test import resolve_identity
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -112,6 +117,8 @@ class ProjectSpec:
     submodules: tuple[str, ...] = ()
     required_tools: tuple[str, ...] = ()
     local_fixture: Path | None = None
+    archive: tuple[str, str] | None = None
+    abseil: ProjectSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -240,32 +247,26 @@ def load_project_catalog(
                 required_tools=("pkg-config",) if name == "qtbase" else (),
             )
 
-    protobuf_version = "36.2"
-    protobuf_args = (
-        "-DCMAKE_CXX_STANDARD=17",
-        "-Dprotobuf_BUILD_TESTS=OFF",
-        "-Dprotobuf_BUILD_EXAMPLES=OFF",
-    )
     if corpus_manifest.is_file():
         with corpus_manifest.open("rb") as stream:
             corpus_data = tomllib.load(stream)
-        for entry in corpus_data.get("project", []):
-            if entry.get("name") == "protobuf":
-                protobuf_version = entry["version"]
-                protobuf_args = tuple(entry.get("configure_args", protobuf_args))
-                break
-
-    catalog["protobuf"] = ProjectSpec(
-        name="protobuf",
-        kind="giant",
-        repository="protocolbuffers/protobuf",
-        version=f"v{protobuf_version.lstrip('v')}",
-        commit=f"v{protobuf_version.lstrip('v')}",
-        source_subdir=".",
-        configure_args=protobuf_args,
-        l2_targets=("libprotobuf", "protoc"),
-        submodules=("third_party/abseil-cpp",),
-    )
+        pins = {entry["name"]: entry for entry in corpus_data.get("project", [])}
+        if "protobuf" in pins:
+            protobuf = pins["protobuf"]
+            abseil = pins["abseil-cpp"]
+            version = f"v{protobuf['version'].lstrip('v')}"
+            catalog["protobuf"] = ProjectSpec(
+                name="protobuf", kind="giant", repository="protocolbuffers/protobuf",
+                version=version, commit=version,
+                configure_args=tuple(protobuf["configure_args"]),
+                l2_targets=("libprotobuf", "protoc"),
+                archive=(protobuf["url"], protobuf["sha256"]),
+                abseil=ProjectSpec(
+                    name="abseil-cpp", kind="dependency", repository="abseil/abseil-cpp",
+                    version=abseil["version"], commit=abseil["version"],
+                    archive=(abseil["url"], abseil["sha256"]),
+                ),
+            )
 
     catalog["vcpkg"] = ProjectSpec(
         name="vcpkg",
@@ -366,7 +367,7 @@ def trial_env(
     probe_cache_mode: str = "readwrite",
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Build an isolated per-trial environment with optional persistent probe cache."""
+    """Set a private home and XDG cache, and select the probe cache for the trial."""
     home = work / "home"
     xdg_cache = work / "xdg-cache"
     home.mkdir(parents=True, exist_ok=True)
@@ -826,9 +827,7 @@ def find_executable(tool: str, env: dict[str, str]) -> Path | None:
 
 def platform_extra_configure_args(
     spec: ProjectSpec,
-    source_root: Path,
     work: Path,
-    env: dict[str, str],
 ) -> tuple[list[str], dict[str, str]]:
     """Return platform-specific configure arguments and environment additions."""
     args: list[str] = [*BASE_CMAKE_ARGS, *spec.configure_args, *REGISTRY_FLAGS]
@@ -846,11 +845,6 @@ def platform_extra_configure_args(
         ])
     elif spec.name == "llvm-project":
         args.append(f"-DPython3_EXECUTABLE={sys.executable}")
-    elif spec.name == "protobuf":
-        absl_dir = source_root / "third_party/abseil-cpp/CMakeLists.txt"
-        if absl_dir.is_file():
-            args = [arg for arg in args if not arg.startswith("-Dprotobuf_LOCAL_DEPENDENCIES_ONLY=")]
-            args.append("-Dprotobuf_ABSL_PROVIDER=module")
     elif spec.name == "qtbase" and platform.system() == "Darwin":
         homebrew = Path("/opt/homebrew/opt")
         ssl = homebrew / "openssl@3"
@@ -903,11 +897,33 @@ def ensure_source(
         return dest, None
 
     dest = cache_dir / "sources" / spec.name
+    if spec.archive:
+        url, digest = spec.archive
+        dest = dest.with_name(f"{spec.name}-{digest}")
     cmake_source = dest / spec.source_subdir
     if (cmake_source / "CMakeLists.txt").is_file():
         return cmake_source, None
     if no_fetch:
         return None, f"Cached checkout missing at {dest} and --no-fetch was set."
+
+    if spec.archive:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix=f".{spec.name}-", dir=dest.parent) as directory:
+                staging = Path(directory)
+                archive = staging / "source.tar.gz"
+                download(url, digest, archive)
+                source = extract(archive, staging / "extracted")
+                if not (source / spec.source_subdir / "CMakeLists.txt").is_file():
+                    return None, f"The {spec.name} archive does not contain {spec.source_subdir}/CMakeLists.txt."
+                try:
+                    source.rename(dest)
+                except OSError:
+                    if not (cmake_source / "CMakeLists.txt").is_file():
+                        raise
+        except (OSError, ValueError, HTTPException, tarfile.TarError) as error:
+            return None, f"Cannot prepare the {spec.name} release archive: {error}"
+        return cmake_source, None
 
     git_bin = find_executable("git", env)
     if git_bin is None:
@@ -960,6 +976,52 @@ def ensure_source(
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def prepare_abseil(spec, cache_dir, cmake, generator, env, timeout, no_fetch, runner):
+    """Install a pinned Abseil package for reuse by both Protobuf configurations."""
+    compiler_env = (
+        "PATH", "CC", "CXX", "CPPFLAGS", "CFLAGS", "CXXFLAGS", "LDFLAGS",
+        "SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET", "INCLUDE", "LIB", "LIBPATH",
+    )
+    args = [*BASE_CMAKE_ARGS, "-DCMAKE_CXX_STANDARD=17", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+            "-DBUILD_TESTING=OFF", "-DABSL_BUILD_TESTING=OFF", "-DABSL_ENABLE_INSTALL=ON",
+            "-DCMAKE_INSTALL_LIBDIR=lib"]
+    key = (spec.archive, str(cmake), generator, platform.machine(), args,
+           [env.get(name) for name in compiler_env])
+    digest = hashlib.sha256(json.dumps(key).encode()).hexdigest()
+    prefix = cache_dir / "pkg" / f"abseil-{spec.version}-{digest}"
+    config = Path("lib/cmake/absl/abslConfig.cmake")
+    if (prefix / config).is_file():
+        return prefix, None
+
+    source, error = ensure_source(spec, cache_dir, {}, env, no_fetch=no_fetch,
+                                  clone_timeout=timeout, runner=runner)
+    if error:
+        return None, error
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".abseil-", dir=prefix.parent) as directory:
+        work = Path(directory)
+        build = work / "build"
+        install = work / "install"
+        steps = (
+            [str(cmake), "-S", str(source), "-B", str(build), "-G", generator,
+             f"-DCMAKE_INSTALL_PREFIX={install}", *args],
+            [str(cmake), "--build", str(build), "--config", "Release", "--parallel", "2"],
+            [str(cmake), "--install", str(build), "--config", "Release"],
+        )
+        for argv in steps:
+            result = runner(argv, work, env, max(timeout, 600))
+            if not result.ok:
+                return None, f"Abseil {argv[1]} failed: {result.error}\n{result.stderr[-2000:]}"
+        if not (install / config).is_file():
+            return None, f"The Abseil install did not produce {config}."
+        try:
+            install.rename(prefix)
+        except OSError:
+            if not (prefix / config).is_file():
+                raise
+    return prefix, None
 
 
 def prepare_package_manager_profile(
@@ -1104,6 +1166,7 @@ def run_configure_once(
     if not is_reconfigure:
         cmd.extend(["-G", generator, *configure_args])
     cmd.extend(extra_flags)
+    cwd.mkdir(parents=True, exist_ok=True)
     measurement = runner(cmd, cwd, env, timeout)
     if not measurement.ok:
         return measurement
@@ -1301,13 +1364,20 @@ def benchmark_project(
     if pm_error:
         return unavailable_result(pm_error)
 
-    configure_args, platform_env = platform_extra_configure_args(spec, source_root, project_work, base_env)
+    configure_args, platform_env = platform_extra_configure_args(spec, project_work)
+    if spec.abseil:
+        abseil_prefix, error = prepare_abseil(spec.abseil, cache_dir, cmake_bin, generator, base_env,
+                                             timeout, no_fetch, runner)
+        if error:
+            return unavailable_result(error)
+        configure_args.append(f"-DCMAKE_PREFIX_PATH={abseil_prefix}")
     configure_args = [*configure_args, *pm_args]
     combined_extra_env = {**platform_env, **pm_env}
 
     try:
         cold_samples: dict[str, list[CommandMeasurement]] = {"cmake": [], "rcmake": []}
         cold_entries_written: list[int] = []
+        # Probe keys include HOME and XDG_CACHE_HOME. Keep both paths stable across trials.
         for trial in range(runs):
             order = ("rcmake", "cmake") if trial % 2 == 0 else ("cmake", "rcmake")
             for tool in order:
@@ -1316,7 +1386,7 @@ def benchmark_project(
                 cold_store = lane / "cold-store" if tool == "rcmake" else None
                 env = trial_env(
                     base_env,
-                    lane,
+                    project_work,
                     probe_cache_dir=cold_store,
                     probe_cache_mode="readwrite",
                     extra=combined_extra_env,
@@ -1342,7 +1412,7 @@ def benchmark_project(
         warmup_lane = project_work / "warm-prime"
         warmup_env = trial_env(
             base_env,
-            warmup_lane,
+            project_work,
             probe_cache_dir=shared_probe_cache,
             probe_cache_mode="readwrite",
             extra=combined_extra_env,
@@ -1373,7 +1443,7 @@ def benchmark_project(
                 entries_before = count_probe_entries(shared_probe_cache) if tool == "rcmake" else 0
                 env = trial_env(
                     base_env,
-                    lane,
+                    project_work,
                     probe_cache_dir=shared_probe_cache if tool == "rcmake" else None,
                     probe_cache_mode="readwrite",
                     extra=combined_extra_env,
@@ -1448,7 +1518,7 @@ def benchmark_project(
                         continue
                     env = trial_env(
                         base_env,
-                        build_dir.parent,
+                        project_work,
                         probe_cache_dir=shared_probe_cache if tool == "rcmake" else None,
                         probe_cache_mode="readwrite",
                         extra=combined_extra_env,
