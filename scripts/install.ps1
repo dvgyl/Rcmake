@@ -425,10 +425,39 @@ if ($Uninstall) {
         Stop-Install 'Use -Uninstall alone (optionally with -Prefix).'
     }
 
-    Assert-DirectoryAncestors -TargetPath $rcmakePath -PrefixRoot $prefixFull
-    Assert-DirectoryAncestors -TargetPath $dataDir -PrefixRoot $prefixFull
-    Assert-DirectoryAncestors -TargetPath $docDir -PrefixRoot $prefixFull
-    Assert-DirectoryAncestors -TargetPath $completionPath -PrefixRoot $prefixFull
+    $prefixItem = Get-ItemOrNull -Path $prefixFull
+    if ($null -ne $prefixItem -and ($prefixItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Stop-Install "$prefixFull is a symlink or reparse point. Remove it, then run the uninstaller again."
+    }
+
+    # Pre-flight validate all directory ancestors and manifest targets before removing any file.
+    Assert-DirectoryAncestors -TargetPath $rcmakePath -PrefixRoot $prefixFull -RejectReparseUnder $prefixFull
+    Assert-DirectoryAncestors -TargetPath $lspPath -PrefixRoot $prefixFull -RejectReparseUnder $prefixFull
+    Assert-DirectoryAncestors -TargetPath $dataDir -PrefixRoot $prefixFull -RejectReparseUnder $prefixFull
+    Assert-DirectoryAncestors -TargetPath $docDir -PrefixRoot $prefixFull -RejectReparseUnder $prefixFull
+    Assert-DirectoryAncestors -TargetPath $docManifestPath -PrefixRoot $prefixFull -RejectReparseUnder $prefixFull
+    Assert-DirectoryAncestors -TargetPath (Join-Path (Join-Path $docDir 'third_party') 'licences') -PrefixRoot $prefixFull -RejectReparseUnder $prefixFull
+    Assert-DirectoryAncestors -TargetPath $completionPath -PrefixRoot $prefixFull -RejectReparseUnder $prefixFull
+
+    $docItemCheck = Get-ItemOrNull -Path $docDir
+    if ($null -ne $docItemCheck -and ($docItemCheck.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Stop-Install "$docDir is a symlink or reparse point. Remove it, then run the uninstaller again."
+    }
+    $dataItemCheck = Get-ItemOrNull -Path $dataDir
+    if ($null -ne $dataItemCheck -and ($dataItemCheck.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Stop-Install "$dataDir is a symlink or reparse point. Remove it, then run the uninstaller again."
+    }
+    $manifestCheck = Get-ItemOrNull -Path $docManifestPath
+    if ($null -ne $manifestCheck -and -not $manifestCheck.PSIsContainer -and -not ($manifestCheck.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        $docDirFullPre = [IO.Path]::GetFullPath($docDir).TrimEnd('\', '/')
+        foreach ($relPosix in (Read-DocManifestEntries -ManifestPath $docManifestPath)) {
+            $relNative = ($relPosix -split '/') -join [IO.Path]::DirectorySeparatorChar
+            $targetDocPre = [IO.Path]::GetFullPath((Join-Path $docDir $relNative))
+            if ($targetDocPre.StartsWith($docDirFullPre + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+                Assert-DirectoryAncestors -TargetPath $targetDocPre -PrefixRoot $prefixFull -RejectReparseUnder $prefixFull
+            }
+        }
+    }
 
     $removed = @()
     $rcmakeHash = Get-FileSha256OrNull -Path $rcmakePath

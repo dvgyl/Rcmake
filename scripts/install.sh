@@ -132,22 +132,86 @@ check_no_symlink_ancestors() {
   done
 }
 
+check_under_real_prefix() {
+  local real_prefix="$1"
+  local target="$2"
+  local parent
+  parent="$(dirname "$target")"
+  [[ -d "$parent" ]] || return 0
+  local real_parent
+  real_parent="$(cd "$parent" 2>/dev/null && pwd -P)" || die "Could not resolve parent directory $parent."
+  if [[ "$real_parent" != "$real_prefix" && "$real_parent" != "$real_prefix/"* ]]; then
+    die "Refusing to modify path outside installation prefix ($target -> $real_parent)."
+  fi
+}
+
 if "$uninstall"; then
   if [[ "$mode" != release || "$alias_cmake" == true || "$force" == true ]]; then
     printf 'Use --uninstall with only an optional --prefix.\n' >&2
     exit 2
   fi
+  if [[ "$prefix" != "/" ]]; then
+    prefix="${prefix%/}"
+  fi
   if [[ -L "$prefix" ]]; then
     die "Refusing to uninstall through symbolic link prefix $prefix."
   fi
+  real_prefix=""
+  if [[ -d "$prefix" ]]; then
+    real_prefix="$(cd "$prefix" 2>/dev/null && pwd -P)" || die "Could not resolve prefix $prefix."
+  fi
+  # Recompute paths using normalized prefix (no trailing slash).
+  bin_dir="$prefix/bin"
+  data_dir="$prefix/share/cmake-4.5"
+  data_marker="$data_dir/.rcmake-managed"
+  doc_dir="$prefix/share/doc/rcmake"
+  doc_manifest="$doc_dir/.rcmake-manifest"
+  extra_share_files=(
+    "$prefix/share/man/man1/rcmake.1"
+    "$prefix/share/bash-completion/completions/rcmake"
+    "$prefix/share/zsh/site-functions/_rcmake"
+    "$prefix/share/fish/vendor_completions.d/rcmake.fish"
+    "$prefix/share/rcmake/completions/rcmake.ps1"
+  )
+  # Pre-flight validate EVERY directory ancestor and manifest target before deleting any file.
   check_no_symlink_ancestors "$prefix" "bin"
   check_no_symlink_ancestors "$prefix" "share"
+  check_no_symlink_ancestors "$prefix" "share/cmake-4.5"
   check_no_symlink_ancestors "$prefix" "share/doc"
+  check_no_symlink_ancestors "$prefix" "share/doc/rcmake"
+  check_no_symlink_ancestors "$prefix" "share/doc/rcmake/third_party"
+  check_no_symlink_ancestors "$prefix" "share/doc/rcmake/third_party/licences"
   check_no_symlink_ancestors "$prefix" "share/man/man1"
   check_no_symlink_ancestors "$prefix" "share/bash-completion/completions"
   check_no_symlink_ancestors "$prefix" "share/zsh/site-functions"
   check_no_symlink_ancestors "$prefix" "share/fish/vendor_completions.d"
   check_no_symlink_ancestors "$prefix" "share/rcmake/completions"
+  if [[ -n "$real_prefix" ]]; then
+    check_under_real_prefix "$real_prefix" "$bin_dir/rcmake"
+    check_under_real_prefix "$real_prefix" "$data_dir"
+    check_under_real_prefix "$real_prefix" "$doc_dir"
+    for extra in "${extra_share_files[@]}"; do
+      check_under_real_prefix "$real_prefix" "$extra"
+    done
+  fi
+  manifest_targets=()
+  if [[ -f "$doc_manifest" && ! -L "$doc_manifest" ]]; then
+    while IFS= read -r rel || [[ -n "$rel" ]]; do
+      [[ -z "$rel" ]] && continue
+      case "$rel" in
+        /*|..|../*|*/..|*/../*|.) continue ;;
+      esac
+      rel_dir="$(dirname "$rel")"
+      if [[ "$rel_dir" != "." ]]; then
+        check_no_symlink_ancestors "$doc_dir" "$rel_dir"
+      fi
+      target="$doc_dir/$rel"
+      if [[ -n "$real_prefix" ]]; then
+        check_under_real_prefix "$real_prefix" "$target"
+      fi
+      manifest_targets+=("$target")
+    done < "$doc_manifest"
+  fi
   removed=()
   for tool in "${tools[@]}"; do
     if is_rcmake_link "$bin_dir/$tool"; then
