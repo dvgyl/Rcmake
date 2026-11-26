@@ -5,7 +5,7 @@ pub use tree::{sdk_tree_listing_digest, tree_listing_digest};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -777,12 +777,71 @@ pub fn verify_trace(host: &dyn Host, trace: &[InputStamp]) -> VerifyOutcome {
 }
 
 fn verify_with(host: &dyn Host, trace: &[InputStamp], memo: Option<&TraceMemo>) -> VerifyOutcome {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let heavy = trace
+            .iter()
+            .filter(|input| {
+                matches!(
+                    input,
+                    InputStamp::TreeListing { .. }
+                        | InputStamp::FileHash { .. }
+                        | InputStamp::FileStat { .. }
+                )
+            })
+            .take(2)
+            .count();
+        if heavy >= 2 {
+            return verify_parallel(host, trace, memo);
+        }
+    }
     for (stamp, input) in trace.iter().enumerate() {
         if !matches_input(host, input, memo) {
             return VerifyOutcome::Miss(MissReason { stamp });
         }
     }
     VerifyOutcome::Hit
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verify_parallel(
+    host: &dyn Host,
+    trace: &[InputStamp],
+    memo: Option<&TraceMemo>,
+) -> VerifyOutcome {
+    let next = AtomicUsize::new(0);
+    let first_miss = AtomicUsize::new(usize::MAX);
+    let worker_count = trace.len().min(4);
+    let work = || loop {
+        let idx = next.fetch_add(1, Ordering::Relaxed);
+        if idx >= trace.len() || idx >= first_miss.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Some(input) = trace.get(idx)
+            && !matches_input(host, input, memo)
+        {
+            first_miss.fetch_min(idx, Ordering::Relaxed);
+            break;
+        }
+    };
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count.saturating_sub(1));
+        for _ in 1..worker_count {
+            if let Ok(handle) = std::thread::Builder::new().spawn_scoped(scope, work) {
+                handles.push(handle);
+            }
+        }
+        work();
+        for handle in handles {
+            let _ = handle.join();
+        }
+    });
+    let miss = first_miss.load(Ordering::Relaxed);
+    if miss == usize::MAX {
+        VerifyOutcome::Hit
+    } else {
+        VerifyOutcome::Miss(MissReason { stamp: miss })
+    }
 }
 
 fn matches_input(host: &dyn Host, input: &InputStamp, memo: Option<&TraceMemo>) -> bool {

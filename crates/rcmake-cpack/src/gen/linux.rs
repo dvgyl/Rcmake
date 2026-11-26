@@ -7,7 +7,7 @@ use rcmake_base::{
     BString, CMAKE_VERSION_MAJOR, CMAKE_VERSION_MINOR, CMAKE_VERSION_PATCH, version::Version,
 };
 use rcmake_eval::Interp;
-use rcmake_host::{FileKind, Follow, Host, path::from_native};
+use rcmake_host::{FileKind, Follow, Host, path::from_native_cmake};
 
 use crate::config::{CpackConfig, absolute, script, snapshot};
 use crate::stage::{component_dir, component_group, package_components};
@@ -81,7 +81,7 @@ impl Pass {
         let part_path = self
             .suffix
             .as_ref()
-            .map(|suffix| BString::from([b"/".as_slice(), &from_native(suffix)].concat()));
+            .map(|suffix| BString::from([b"/".as_slice(), &from_native_cmake(suffix)].concat()));
         let root = interp.cx().var_or_empty(b"CMAKE_ROOT");
         let script_path = absolute(&cx.host.initial_cwd(), &root).join(if generator == "DEB" {
             "Modules/Internal/CPack/CPackDeb.cmake"
@@ -92,14 +92,17 @@ impl Pass {
             (b"CMAKE_BINARY_DIR".as_slice(), None),
             (
                 b"_RCMAKE_CPACK_INTERNAL_MODULE",
-                Some(from_native(&script_path)),
+                Some(from_native_cmake(&script_path)),
             ),
             (b"_RCMAKE_CPACK_RPMBUILD_STATUS", None),
-            (b"CPACK_TEMPORARY_DIRECTORY", Some(from_native(&directory))),
+            (
+                b"CPACK_TEMPORARY_DIRECTORY",
+                Some(from_native_cmake(&directory)),
+            ),
             (b"CPACK_OUTPUT_FILE_NAME", Some(filename)),
             (
                 b"CPACK_TEMPORARY_PACKAGE_FILE_NAME",
-                Some(from_native(&proposed)),
+                Some(from_native_cmake(&proposed)),
             ),
             (component.as_bytes(), self.name.clone()),
             (part.as_bytes(), part_path),

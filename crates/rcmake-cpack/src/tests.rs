@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use rcmake_archive::{ExtractOptions, extract_archive, list_command_archive};
 use rcmake_base::hash::HashAlgo;
-use rcmake_host::path::from_native;
+use rcmake_host::path::{from_native, from_native_cmake};
 use rcmake_host::{
     CommandSpec, FileKind, Follow, Input, NativeHost, Output, ProcessResult, ReadRange, RunOutput,
     RunRequest, WriteMode,
@@ -989,7 +989,7 @@ fn seed_package_module(host: &PureHost, module: &str, script: &[u8]) -> BString 
     let dir = root.join("Modules/Internal/CPack");
     host.create_dir_all(&dir).unwrap();
     host.seed_file(&dir.join(module), script).unwrap();
-    from_native(&root)
+    from_native_cmake(&root)
 }
 
 #[test]
@@ -1108,7 +1108,7 @@ endif()
     let observed_fail = Arc::clone(&failing);
     let observed_builds = Arc::clone(&builds);
     let work = output.clone();
-    let rpmbuild = from_native(&tool);
+    let rpmbuild = from_native_cmake(&tool);
     host.set_command_handler(move |host, request, _| {
         let [command] = request.pipeline.as_slice() else {
             panic!("Unexpected process request")
@@ -1126,12 +1126,12 @@ endif()
                     [
                         BString::from("-bb"),
                         "--define".into(),
-                        format!("_topdir {}", from_native(&work)).into(),
+                        format!("_topdir {}", from_native_cmake(&work)).into(),
                         "--buildroot".into(),
                         "%_topdir/Sample-Package".into(),
                         "--target".into(),
                         "noarch".into(),
-                        from_native(&spec),
+                        from_native_cmake(&spec),
                     ]
                 );
                 assert_eq!(request.cwd, work.join("Sample-Package"));
@@ -1172,8 +1172,8 @@ set(CPACK_REMOVE_TOPLEVEL_DIRECTORY OFF)
 set(CPACK_OUTPUT_FILE_PREFIX dist)
 set(CPACK_POST_BUILD_SCRIPTS "{hook}")
 "#,
-        tool = from_native(&tool),
-        hook = from_native(&hook),
+        tool = from_native_cmake(&tool),
+        hook = from_native_cmake(&hook),
     );
     assert_eq!(
         generators::tests::invoke(host.clone(), "RPM", &options),

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use rcmake_archive::{ArchiveFormat, CreateOptions, TarCompression, create_archive};
 use rcmake_base::{BString, hash::HashAlgo, parse_source_date_epoch};
 use rcmake_eval::Interp;
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::{from_native, from_native_cmake, to_native};
 use rcmake_host::{CopyOptions, FileKind, Follow, Host, Stream, WriteMode};
 
 use super::ScratchDir;
@@ -250,7 +250,7 @@ fn build(
             host.read_chunks(&path, &mut |chunk| hasher.update(chunk))?;
             sums.extend_from_slice(hasher.finish_hex().as_bytes());
             sums.extend_from_slice(b"  ");
-            sums.extend_from_slice(&from_native(&relative));
+            sums.extend_from_slice(&from_native_cmake(&relative));
             sums.push(b'\n');
         }
     }

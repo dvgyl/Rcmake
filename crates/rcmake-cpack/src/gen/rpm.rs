@@ -105,7 +105,7 @@ impl PackageGenerator for Rpm {
                 if name.contains(&b':') {
                     HashAlgo::Md5.hex_digest(name).into()
                 } else {
-                    rcmake_host::path::from_native(&component_dir(name))
+                    rcmake_host::path::from_native_cmake(&component_dir(name))
                 }
             });
             let spec_only = combined && main_pass && index + 1 < passes.len();

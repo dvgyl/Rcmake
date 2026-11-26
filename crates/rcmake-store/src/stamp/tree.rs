@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rcmake_base::BString;
 
 use super::*;
 
@@ -115,11 +121,226 @@ impl SdkLink {
     }
 }
 
+enum SdkEntry {
+    File(BString),
+    Dir {
+        name: BString,
+        child: PathBuf,
+    },
+    SymlinkMissing {
+        name: BString,
+        target: PathBuf,
+        child: PathBuf,
+    },
+    SymlinkResolved {
+        name: BString,
+        target: PathBuf,
+        child: PathBuf,
+        resolved: PathBuf,
+        kind: FileKind,
+        observe: bool,
+    },
+}
+
+struct SdkDirSnapshot {
+    entry_count: usize,
+    entries: HostResult<Vec<SdkEntry>>,
+}
+
+fn read_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResult<SdkDirSnapshot> {
+    let mut entries = host.read_dir(directory)?;
+    let entry_count = entries.len();
+    entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    let mut parsed = Vec::with_capacity(entry_count);
+    for entry in entries {
+        let name = rcmake_host::path::to_native(&entry.name);
+        if !matches!(name.components().next(), Some(Component::Normal(_)))
+            || name.components().count() != 1
+        {
+            return Ok(SdkDirSnapshot {
+                entry_count,
+                entries: Err(HostError::unsupported(
+                    "Invalid SDK search directory entry.",
+                )),
+            });
+        }
+        let child = directory.join(name);
+        match entry.kind {
+            FileKind::File => parsed.push(SdkEntry::File(entry.name)),
+            FileKind::Dir => parsed.push(SdkEntry::Dir {
+                name: entry.name,
+                child,
+            }),
+            FileKind::Symlink => {
+                let target = match host.read_link(&child) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return Ok(SdkDirSnapshot {
+                            entry_count,
+                            entries: Err(error),
+                        });
+                    }
+                };
+                let kind = match host.metadata(&child, Follow::Yes) {
+                    Ok(stat) => stat.kind,
+                    Err(error) if error.kind == ErrorKind::NotFound => {
+                        parsed.push(SdkEntry::SymlinkMissing {
+                            name: entry.name,
+                            target,
+                            child,
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        return Ok(SdkDirSnapshot {
+                            entry_count,
+                            entries: Err(error),
+                        });
+                    }
+                };
+                let resolved = match host.canonicalize(&child) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        return Ok(SdkDirSnapshot {
+                            entry_count,
+                            entries: Err(error),
+                        });
+                    }
+                };
+                if !matches!(kind, FileKind::Dir | FileKind::File) {
+                    return Ok(SdkDirSnapshot {
+                        entry_count,
+                        entries: Err(HostError::unsupported("Unsupported SDK search entry.")),
+                    });
+                }
+                let observe = !resolved.starts_with(canonical)
+                    || !link_stays_in_tree(canonical, directory, &target);
+                parsed.push(SdkEntry::SymlinkResolved {
+                    name: entry.name,
+                    target,
+                    child,
+                    resolved,
+                    kind,
+                    observe,
+                });
+            }
+            FileKind::Other => {
+                return Ok(SdkDirSnapshot {
+                    entry_count,
+                    entries: Err(HostError::unsupported("Unsupported SDK search entry.")),
+                });
+            }
+        }
+    }
+    Ok(SdkDirSnapshot {
+        entry_count,
+        entries: Ok(parsed),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn prefetch_sdk_graph(
+    host: &dyn Host,
+    canonical: &Path,
+) -> HashMap<PathBuf, HostResult<SdkDirSnapshot>> {
+    let mut prefetched = HashMap::new();
+    let mut seen = BTreeSet::from([canonical.to_owned()]);
+    let mut frontier = vec![canonical.to_owned()];
+    let mut budget = 65_536_usize;
+
+    for _depth in 0..=32 {
+        if frontier.is_empty() {
+            break;
+        }
+        let wave: Vec<(PathBuf, HostResult<SdkDirSnapshot>)> = if frontier.len() <= 2 {
+            frontier
+                .iter()
+                .map(|dir| (dir.clone(), read_sdk_dir(host, canonical, dir)))
+                .collect()
+        } else {
+            let next = AtomicUsize::new(0);
+            let out = Mutex::new(Vec::with_capacity(frontier.len()));
+            let worker_count = frontier.len().min(6);
+            let work = || {
+                let mut local = Vec::new();
+                loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(dir) = frontier.get(idx) else {
+                        break;
+                    };
+                    local.push((dir.clone(), read_sdk_dir(host, canonical, dir)));
+                }
+                if let Ok(mut guard) = out.lock() {
+                    guard.extend(local);
+                }
+            };
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(worker_count.saturating_sub(1));
+                for _ in 1..worker_count {
+                    if let Ok(handle) = std::thread::Builder::new().spawn_scoped(scope, work) {
+                        handles.push(handle);
+                    }
+                }
+                work();
+                for handle in handles {
+                    let _ = handle.join();
+                }
+            });
+            out.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+
+        let mut next_frontier = Vec::new();
+        let mut exhausted = false;
+        for (dir, result) in wave {
+            if let Ok(snapshot) = &result {
+                if let Some(left) = budget.checked_sub(snapshot.entry_count) {
+                    budget = left;
+                    if let Ok(entries) = &snapshot.entries {
+                        for entry in entries {
+                            match entry {
+                                SdkEntry::Dir { child, .. } if seen.insert(child.clone()) => {
+                                    next_frontier.push(child.clone());
+                                }
+                                SdkEntry::SymlinkResolved {
+                                    resolved,
+                                    kind: FileKind::Dir,
+                                    ..
+                                } if seen.insert(resolved.clone()) => {
+                                    next_frontier.push(resolved.clone());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else {
+                    exhausted = true;
+                }
+            }
+            prefetched.insert(dir, result);
+        }
+        if exhausted {
+            break;
+        }
+        frontier = next_frontier;
+    }
+    prefetched
+}
+
+#[cfg(target_arch = "wasm32")]
+fn prefetch_sdk_graph(
+    _host: &dyn Host,
+    _canonical: &Path,
+) -> HashMap<PathBuf, HostResult<SdkDirSnapshot>> {
+    HashMap::new()
+}
+
 pub(super) fn sdk_graph(
     host: &dyn Host,
     canonical: &Path,
     mut observe_link: impl FnMut(PathBuf, Option<(PathBuf, FileKind)>),
 ) -> HostResult<Digest> {
+    let mut prefetched = prefetch_sdk_graph(host, canonical);
     let mut key = KeyHasher::new(Domain::BlobV1);
     key.field(0, b"sdk-tree-graph");
     key.field(1, canonical.as_os_str().as_encoded_bytes());
@@ -130,46 +351,43 @@ pub(super) fn sdk_graph(
         if !visited.insert(directory.clone()) {
             continue;
         }
-        let mut entries = host.read_dir(&directory)?;
+        let snapshot = match prefetched.remove(&directory) {
+            Some(result) => result?,
+            None => read_sdk_dir(host, canonical, &directory)?,
+        };
         remaining = remaining
-            .checked_sub(entries.len())
+            .checked_sub(snapshot.entry_count)
             .filter(|_| depth <= 32)
             .ok_or_else(|| HostError::unsupported("SDK search graph exceeds the listing limit."))?;
-        entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         key.field(3, directory.as_os_str().as_encoded_bytes());
-        for entry in entries {
-            let name = rcmake_host::path::to_native(&entry.name);
-            if !matches!(name.components().next(), Some(Component::Normal(_)))
-                || name.components().count() != 1
-            {
-                return Err(HostError::unsupported(
-                    "Invalid SDK search directory entry.",
-                ));
-            }
-            let child = directory.join(name);
-            match entry.kind {
-                FileKind::File => key.field(4, &entry.name),
-                FileKind::Dir => {
-                    key.field(5, &entry.name);
+        for entry in snapshot.entries? {
+            match entry {
+                SdkEntry::File(name) => key.field(4, &name),
+                SdkEntry::Dir { name, child } => {
+                    key.field(5, &name);
                     directories.push((child, depth + 1));
                 }
-                FileKind::Symlink => {
-                    key.field(6, &entry.name);
-                    let target = host.read_link(&child)?;
+                SdkEntry::SymlinkMissing {
+                    name,
+                    target,
+                    child,
+                } => {
+                    key.field(6, &name);
                     key.field(7, target.as_os_str().as_encoded_bytes());
-                    let kind = match host.metadata(&child, Follow::Yes) {
-                        Ok(stat) => stat.kind,
-                        Err(error) if error.kind == ErrorKind::NotFound => {
-                            key.field(8, b"missing");
-                            observe_link(child, None);
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let resolved = host.canonicalize(&child)?;
-                    if !resolved.starts_with(canonical)
-                        || !link_stays_in_tree(canonical, &directory, &target)
-                    {
+                    key.field(8, b"missing");
+                    observe_link(child, None);
+                }
+                SdkEntry::SymlinkResolved {
+                    name,
+                    target,
+                    child,
+                    resolved,
+                    kind,
+                    observe,
+                } => {
+                    key.field(6, &name);
+                    key.field(7, target.as_os_str().as_encoded_bytes());
+                    if observe {
                         observe_link(child, Some((resolved.clone(), kind)));
                     }
                     match kind {
@@ -181,9 +399,6 @@ pub(super) fn sdk_graph(
                         _ => return Err(HostError::unsupported("Unsupported SDK search entry.")),
                     }
                     key.field(9, resolved.as_os_str().as_encoded_bytes());
-                }
-                FileKind::Other => {
-                    return Err(HostError::unsupported("Unsupported SDK search entry."));
                 }
             }
         }

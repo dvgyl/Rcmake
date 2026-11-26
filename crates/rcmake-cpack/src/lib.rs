@@ -22,7 +22,7 @@ use std::sync::Arc;
 use rcmake_base::hash::HashAlgo;
 use rcmake_base::{BString, ByteSlice, list};
 use rcmake_eval::Interp;
-use rcmake_host::path::{from_native, to_native};
+use rcmake_host::path::{from_native, from_native_cmake, to_native};
 use rcmake_host::{CopyOptions, Host, HostResult, ReadRange, Stream, WriteMode};
 
 use crate::config::{CpackConfig, Environment, absolute, script, snapshot};
@@ -369,18 +369,18 @@ fn package(
         (b"CPACK_OUTPUT_FILE_PREFIX", &publish_dir),
         (b"CPACK_TEMPORARY_PACKAGE_FILE_NAME", &package_file),
     ] {
-        interp.cx().set_var(key, from_native(path));
+        interp.cx().set_var(key, from_native_cmake(path));
     }
     let output_file_name = package_file
         .file_name()
         .ok_or_else(|| error("No package file name"))?;
     interp.cx().set_var(
         b"CPACK_OUTPUT_FILE_NAME",
-        from_native(Path::new(output_file_name)),
+        from_native_cmake(Path::new(output_file_name)),
     );
     interp.cx().set_var(
         b"CPACK_OUTPUT_FILE_PATH",
-        from_native(&output.join(output_file_name)),
+        from_native_cmake(&output.join(output_file_name)),
     );
     log(
         host.as_ref(),
@@ -414,7 +414,7 @@ fn package(
     }
     interp.cx().set_var(
         b"CPACK_PACKAGE_FILES",
-        list::join(packages.iter().map(|path| from_native(path))),
+        list::join(packages.iter().map(|path| from_native_cmake(path))),
     );
     stage::run_hooks(
         host.as_ref(),
