@@ -236,12 +236,14 @@ fn offline(host: &dyn Host) -> bool {
 }
 
 #[cfg(all(feature = "native", any(unix, windows)))]
+#[allow(clippy::too_many_arguments)]
 fn run(
     host: &dyn Host,
     program: &'static str,
     args: Vec<BString>,
     cwd: &Path,
     env: Vec<(BString, BString)>,
+    input: Input,
     limit: usize,
     timeout: Option<Duration>,
 ) -> Result<RunOutput, FetchError> {
@@ -254,18 +256,21 @@ fn run(
         },
         cwd,
         env,
+        input,
         limit,
         timeout,
     )
 }
 
 #[cfg(all(feature = "native", any(unix, windows)))]
+#[allow(clippy::too_many_arguments)]
 fn run_command(
     host: &dyn Host,
     program: &'static str,
     command: CommandSpec,
     cwd: &Path,
     env: Vec<(BString, BString)>,
+    input: Input,
     limit: usize,
     timeout: Option<Duration>,
 ) -> Result<RunOutput, FetchError> {
@@ -274,7 +279,7 @@ fn run_command(
             pipeline: vec![command],
             cwd: cwd.to_owned(),
             env,
-            stdin: Input::Null,
+            stdin: input,
             stdout: Output::Capture,
             stderr: Output::Capture,
             timeout,

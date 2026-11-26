@@ -775,6 +775,266 @@ fn include_symlinks_share_file_identity_and_retain_the_first_path() {
 }
 
 #[test]
+fn inheritance_chain_stops_at_the_merge_budget() {
+    let host = PureHost::default();
+    let project = Path::new("/project");
+    host.create_dir_all(project).expect("create project");
+    let mut presets = Vec::with_capacity(300);
+    for i in 1..=300 {
+        let mut vars = Vec::with_capacity(10);
+        for j in 0..10 {
+            vars.push(format!("\"V_{i}_{j}\":\"val\""));
+        }
+        let inherits = if i == 1 {
+            String::new()
+        } else {
+            format!(",\"inherits\":\"p{:04}\"", i - 1)
+        };
+        presets.push(format!(
+            "{{\"name\":\"p{i:04}\"{inherits},\"cacheVariables\":{{{}}}}}",
+            vars.join(",")
+        ));
+    }
+    let doc = format!(
+        "{{\"version\":13,\"configurePresets\":[{}]}}",
+        presets.join(",")
+    );
+    host.write(
+        &project.join("CMakePresets.json"),
+        doc.as_bytes(),
+        WriteMode::Truncate,
+    )
+    .expect("write chain");
+    let error = graph::load_with_limits(
+        project,
+        &host,
+        None,
+        None,
+        graph::GraphLimits {
+            merge_bytes: 1 << 20,
+            ..graph::GraphLimits::default()
+        },
+    )
+    .expect_err("chain exceeds merge budget");
+    assert!(
+        error
+            .message
+            .contains("Preset inheritance is too large to resolve"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn realistic_large_preset_graph_loads() {
+    let host = PureHost::default();
+    let project = Path::new("/project");
+    host.create_dir_all(project).expect("create project");
+    let mut presets = Vec::with_capacity(500);
+    // 62 trees of depth 8 plus a short tail = 500 presets, each with 50 cacheVariables.
+    for i in 0..500 {
+        let mut vars = Vec::with_capacity(50);
+        for j in 0..50 {
+            vars.push(format!("\"K_{i}_{j}\":\"v\""));
+        }
+        let inherits = if i % 8 == 0 {
+            String::new()
+        } else {
+            format!(",\"inherits\":\"p{:04}\"", i - 1)
+        };
+        presets.push(format!(
+            "{{\"name\":\"p{i:04}\"{inherits},\"cacheVariables\":{{{}}}}}",
+            vars.join(",")
+        ));
+    }
+    let doc = format!(
+        "{{\"version\":13,\"configurePresets\":[{}]}}",
+        presets.join(",")
+    );
+    host.write(
+        &project.join("CMakePresets.json"),
+        doc.as_bytes(),
+        WriteMode::Truncate,
+    )
+    .expect("write realistic presets");
+    let loaded = load(project, &host).expect("realistic large preset graph should load");
+    assert_eq!(loaded.list_defined(PresetKind::Configure).count(), 500);
+}
+
+#[test]
+fn repeated_parent_overrides_stop_at_the_merge_budget() {
+    let host = PureHost::default();
+    let project = Path::new("/project");
+    host.create_dir_all(project).expect("create project");
+    let vars = (0..120)
+        .map(|i| format!("\"K{i:03}\":\"v\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut presets = vec![format!(
+        "{{\"name\":\"base\",\"hidden\":true,\"cacheVariables\":{{{vars}}}}}"
+    )];
+    // Every child overrides all keys from base and repeats base in inherits.
+    let parents = vec!["\"base\""; 40].join(",");
+    for i in 0..20 {
+        presets.push(format!(
+            "{{\"name\":\"c{i}\",\"inherits\":[{parents}],\"cacheVariables\":{{{vars}}}}}"
+        ));
+    }
+    let doc = format!(
+        "{{\"version\":13,\"configurePresets\":[{}]}}",
+        presets.join(",")
+    );
+    host.write(
+        &project.join("CMakePresets.json"),
+        doc.as_bytes(),
+        WriteMode::Truncate,
+    )
+    .expect("write repeated-override presets");
+    let error = graph::load_with_limits(
+        project,
+        &host,
+        None,
+        None,
+        graph::GraphLimits {
+            merge_bytes: 512 * 1024,
+            ..graph::GraphLimits::default()
+        },
+    )
+    .expect_err("repeated parent overrides must exceed merge budget");
+    assert!(
+        error
+            .message
+            .contains("Preset inheritance is too large to resolve"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn large_parent_json_values_are_charged_and_skipped_when_overridden() {
+    let host = PureHost::default();
+    let project = Path::new("/project");
+    host.create_dir_all(project).expect("create project");
+    let payload = "x".repeat(128 * 1024);
+
+    // 1. Value-amplification bomb: children inherit a large JSON value without overriding it.
+    //    Charging only key lengths (~166 B per copy) would miss this; value charging catches it.
+    let mut bomb = vec![format!(
+        "{{\"name\":\"base\",\"hidden\":true,\"cacheVariables\":{{\"BIG\":\"{payload}\"}}}}"
+    )];
+    for i in 0..10 {
+        bomb.push(format!(
+            "{{\"name\":\"c{i}\",\"inherits\":\"base\",\"cacheVariables\":{{\"OWN\":\"1\"}}}}"
+        ));
+    }
+    let bomb_doc = format!(
+        "{{\"version\":13,\"configurePresets\":[{}]}}",
+        bomb.join(",")
+    );
+    host.write(
+        &project.join("CMakePresets.json"),
+        bomb_doc.as_bytes(),
+        WriteMode::Truncate,
+    )
+    .expect("write value bomb presets");
+    let error = graph::load_with_limits(
+        project,
+        &host,
+        None,
+        None,
+        graph::GraphLimits {
+            merge_bytes: 512 * 1024,
+            ..graph::GraphLimits::default()
+        },
+    )
+    .expect_err("value amplification bomb must exceed merge budget");
+    assert!(
+        error
+            .message
+            .contains("Preset inheritance is too large to resolve"),
+        "{}",
+        error.message
+    );
+
+    // 2. When every child overrides the large key, the parent JSON value is not deep-copied
+    //    and fits easily within the same 512 KiB merge budget.
+    let mut overridden = vec![format!(
+        "{{\"name\":\"base\",\"hidden\":true,\"cacheVariables\":{{\"BIG\":\"{payload}\"}}}}"
+    )];
+    for i in 0..10 {
+        overridden.push(format!(
+            "{{\"name\":\"c{i}\",\"inherits\":[\"base\",\"base\"],\"cacheVariables\":{{\"BIG\":\"small\"}}}}"
+        ));
+    }
+    let overridden_doc = format!(
+        "{{\"version\":13,\"configurePresets\":[{}]}}",
+        overridden.join(",")
+    );
+    host.write(
+        &project.join("CMakePresets.json"),
+        overridden_doc.as_bytes(),
+        WriteMode::Truncate,
+    )
+    .expect("write overridden presets");
+    let loaded = graph::load_with_limits(
+        project,
+        &host,
+        None,
+        None,
+        graph::GraphLimits {
+            merge_bytes: 512 * 1024,
+            ..graph::GraphLimits::default()
+        },
+    )
+    .expect("overridden large parent values should not trigger uncharged deep copies");
+    assert_eq!(loaded.list_defined(PresetKind::Configure).count(), 10);
+}
+
+#[test]
+fn include_graph_stops_at_the_total_byte_cap() {
+    let host = PureHost::default();
+    let project = Path::new("/project");
+    host.create_dir_all(project).expect("create project");
+    host.write(
+        &project.join("CMakePresets.json"),
+        br#"{"version":13,"include":["a.json","b.json","c.json"]}"#,
+        WriteMode::Truncate,
+    )
+    .expect("write root");
+    let pad = "x".repeat(520);
+    for name in ["a", "b", "c"] {
+        let body = format!(
+            "{{\"version\":13,\"configurePresets\":[{{\"name\":\"{name}\",\"description\":\"{pad}\"}}]}}"
+        );
+        assert!(body.len() >= 580);
+        host.write(
+            &project.join(format!("{name}.json")),
+            body.as_bytes(),
+            WriteMode::Truncate,
+        )
+        .expect("write include");
+    }
+    let error = graph::load_with_limits(
+        project,
+        &host,
+        None,
+        None,
+        graph::GraphLimits {
+            total_bytes: 1024,
+            ..graph::GraphLimits::default()
+        },
+    )
+    .expect_err("includes exceed total byte cap");
+    assert!(
+        error
+            .message
+            .contains("Presets files exceed the 64 MiB total size limit"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
 fn reports_json_value_locations_in_included_files() {
     let host = PureHost::default();
     let project = Path::new("/project");

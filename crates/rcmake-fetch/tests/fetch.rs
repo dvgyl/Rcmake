@@ -964,3 +964,50 @@ fn legacy_lockfiles_load_and_remove_secrets_on_update() -> Result<(), Box<dyn st
     }
     Ok(())
 }
+
+#[test]
+fn archive_download_keeps_url_off_argv() -> Result<(), Box<dyn std::error::Error>> {
+    let host = host();
+    let store = Store::new(&host, config())?;
+    let cache = ArchiveCache::new(&host, &store);
+    let secret_url = "https://u:s3cret@example.invalid/archive.tar.gz";
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&calls);
+    host.set_command_handler(move |_, request, _| {
+        count.fetch_add(1, Ordering::Relaxed);
+        let [command] = request.pipeline.as_slice() else {
+            panic!("Expected one curl invocation.");
+        };
+        assert_eq!(
+            command.args.first().map(AsRef::as_ref),
+            Some(b"-q".as_slice())
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--config", "-"])
+        );
+        for arg in &command.args {
+            let text = String::from_utf8_lossy(arg);
+            assert!(!text.contains("s3cret"), "secret leaked in argv: {text}");
+            assert!(
+                !text.contains("example.invalid"),
+                "url leaked in argv: {text}"
+            );
+        }
+        assert_eq!(
+            request.stdin,
+            rcmake_host::Input::Bytes(format!("url = \"{secret_url}\"\n").into_bytes())
+        );
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            stdout: b"payload".to_vec(),
+            stderr: Vec::new(),
+        })
+    })?;
+    let result = cache.fetch(secret_url, None)?;
+    assert_eq!(result.bytes, b"payload");
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    Ok(())
+}

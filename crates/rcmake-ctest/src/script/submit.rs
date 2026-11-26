@@ -114,7 +114,11 @@ pub(super) fn ctest_submit(cx: &mut Cx<'_>, input: &[ExpandedArg]) -> CmdResult 
             if transport.log && !upload {
                 host.write_out(
                     Stream::Stdout,
-                    format!("Submit files\n   SubmitURL: {}\n", job.url).as_bytes(),
+                    format!(
+                        "Submit files\n   SubmitURL: {}\n",
+                        submit::redact_url(&job.url)
+                    )
+                    .as_bytes(),
                 );
             }
             submit::tls(

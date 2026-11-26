@@ -1,6 +1,11 @@
 use std::time::Duration;
 
-use rcmake_base::{BString, hash::HashAlgo, truth};
+use rcmake_base::{
+    BString,
+    curl::{CurlConfig, CurlOption},
+    hash::HashAlgo,
+    truth,
+};
 use rcmake_eval::{Cx, Flow};
 use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest, Stream, WriteMode, path};
 
@@ -14,7 +19,7 @@ struct Download<'a> {
     expected: Option<ExpectedHash>,
     ranges: Vec<(&'a [u8], Option<&'a [u8]>)>,
     flags: Vec<BString>,
-    input: BString,
+    config: CurlConfig,
     timeout: Option<Duration>,
     progress: bool,
     default_verify: bool,
@@ -116,9 +121,12 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     if download.log.is_some() {
         download.flags.push("--verbose".into());
     }
+    let compat_url = super::curl_compat_file_url(url);
     download
-        .flags
-        .extend(["--url".into(), super::curl_compat_file_url(url)]);
+        .config
+        .push(CurlOption::Url, &[compat_url.as_slice()])
+        .map_err(|failure| error(format!("DOWNLOAD error initializing curl: {failure}")))?;
+    download.flags.extend(["--config".into(), "-".into()]);
     let timeout = match (download.timeout, cx.limits().wall_budget) {
         (Some(timeout), Some(budget)) => Some(timeout.min(budget)),
         (timeout, budget) => timeout.or(budget),
@@ -133,11 +141,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                 }],
                 cwd,
                 env: cx.host().env_all(),
-                stdin: if download.input.is_empty() {
-                    Input::Null
-                } else {
-                    Input::Bytes(download.input.into())
-                },
+                stdin: Input::Bytes(download.config.into_bytes()),
                 stdout: Output::Null,
                 stderr: Output::Capture,
                 timeout,
@@ -278,8 +282,19 @@ impl<'a> Download<'a> {
                 b"HTTPHEADER" if value.starts_with(b"@") => {
                     return Err(error("DOWNLOAD HTTPHEADER cannot start with '@'."));
                 }
-                b"HTTPHEADER" => download.flags.extend(["--header".into(), value.into()]),
-                b"USERPWD" => download.input = credentials(value),
+                b"HTTPHEADER" => {
+                    download.config.push_header(value).map_err(|failure| {
+                        error(format!("DOWNLOAD error initializing curl: {failure}"))
+                    })?;
+                }
+                b"USERPWD" => {
+                    download
+                        .config
+                        .push(CurlOption::User, &[value])
+                        .map_err(|failure| {
+                            error(format!("DOWNLOAD error initializing curl: {failure}"))
+                        })?;
+                }
                 b"EXPECTED_MD5" => {
                     download.expected = Some(ExpectedHash {
                         algorithm: HashAlgo::Md5,
@@ -321,9 +336,6 @@ impl<'a> Download<'a> {
                 }
                 _ => {}
             }
-        }
-        if !download.input.is_empty() {
-            download.flags.extend(["--config".into(), "-".into()]);
         }
         download.default_verify = verify.is_none();
         if verify.is_some_and(|verify| !truth::is_on(&verify)) {
@@ -393,20 +405,6 @@ impl ExpectedHash {
     }
 }
 
-fn credentials(value: &[u8]) -> BString {
-    let mut config = BString::from("user = \"");
-    for &byte in value {
-        match byte {
-            b'\r' => config.extend_from_slice(b"\\r"),
-            b'\n' => config.extend_from_slice(b"\\n"),
-            b'"' | b'\\' => config.extend([b'\\', byte]),
-            _ => config.push(byte),
-        }
-    }
-    config.extend_from_slice(b"\"\n");
-    config
-}
-
 fn setting(cx: &mut Cx<'_>, name: &[u8]) -> Option<BString> {
     cx.var(name).or_else(|| cx.host().env_get(name))
 }
@@ -445,5 +443,118 @@ fn status_message(code: i32, stderr: &[u8], default_verify: bool) -> String {
         )
     } else {
         message.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{Input, ProcessResult, PureHost, RunOutput};
+
+    #[test]
+    fn download_keeps_secrets_off_argv() -> Result<(), Box<dyn std::error::Error>> {
+        let host = Arc::new(PureHost::default());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        host.set_command_handler(move |_, request, _| {
+            sink.lock()
+                .expect("lock capture")
+                .push((request.pipeline.clone(), request.stdin.clone()));
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        let script = Path::new("/work/test.cmake");
+        host.seed_file(
+            script,
+            br#"file(DOWNLOAD "https://u:s3cret@example.invalid/f" "/work/f"
+  HTTPHEADER "Authorization: Bearer t0ken"
+  USERPWD "a:pw"
+  STATUS st)"#,
+        )?;
+        let mut interp = Interp::new(
+            InterpConfig {
+                host: host.clone(),
+                mode: RunMode::Script,
+                cmake_root: "/cmake".into(),
+                cmake_command: "/cmake/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                services: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        assert_eq!(interp.run_script(script).exit_code, 0);
+        let calls = captured.lock().expect("lock capture");
+        assert_eq!(calls.len(), 1);
+        let (pipeline, stdin) = &calls[0];
+        let [command] = pipeline.as_slice() else {
+            panic!("Expected one curl invocation.");
+        };
+        assert_eq!(
+            command.args.first().map(AsRef::as_ref),
+            Some(b"--disable".as_slice())
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--config", "-"])
+        );
+        for arg in &command.args {
+            let text = String::from_utf8_lossy(arg);
+            for secret in ["s3cret", "t0ken", "a:pw"] {
+                assert!(!text.contains(secret), "secret leaked in argv: {text}");
+            }
+        }
+        assert_eq!(
+            stdin,
+            &Input::Bytes(
+                b"header = \"Authorization: Bearer t0ken\"\nuser = \"a:pw\"\nurl = \"https://u:s3cret@example.invalid/f\"\n"
+                    .as_slice()
+                    .into()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn download_rejects_crlf_in_httpheader() -> Result<(), Box<dyn std::error::Error>> {
+        let host = Arc::new(PureHost::default());
+        host.set_command_handler(|_, _, _| panic!("Rejected header must not run curl."))?;
+        let script = Path::new("/work/bad_header.cmake");
+        host.seed_file(
+            script,
+            b"file(DOWNLOAD \"https://example.invalid/f\" \"/work/f\" HTTPHEADER \"X-Test: a\r\nX-Evil: 1\")",
+        )?;
+        let mut interp = Interp::new(
+            InterpConfig {
+                host: host.clone(),
+                mode: RunMode::Script,
+                cmake_root: "/cmake".into(),
+                cmake_command: "/cmake/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                services: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        assert_eq!(interp.run_script(script).exit_code, 1);
+        let stderr = host.stream_bytes(rcmake_host::Stream::Stderr).to_string();
+        assert!(
+            stderr.contains("DOWNLOAD error initializing curl"),
+            "{stderr}"
+        );
+        Ok(())
     }
 }

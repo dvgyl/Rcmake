@@ -642,3 +642,35 @@ fn dashboard_start_reports_failed_checkout_on_stderr() -> Result<(), Box<dyn Err
     );
     Ok(())
 }
+
+#[test]
+fn ctest_submit_verbose_redacts_scheme_relative_and_invalid_submit_urls()
+-> Result<(), Box<dyn Error>> {
+    let host = Arc::new(PureHost::default());
+    host.create_dir_all(Path::new("/work/src"))?;
+    host.create_dir_all(Path::new("/work/build"))?;
+    host.seed_file(
+        Path::new("/work/dashboard.cmake"),
+        br#"
+        set(CTEST_SOURCE_DIRECTORY "/work/src")
+        set(CTEST_BINARY_DIRECTORY "/work/build")
+        ctest_start(Experimental)
+        ctest_submit(
+            SUBMIT_URL "//user:secret@cdash.example/submit.php?token=xyz"
+            RETURN_VALUE submit_rc
+        )
+        "#,
+    )?;
+    let _ = invoke(host.clone(), &["-V", "-S", "dashboard.cmake"]);
+    let stdout = host.stream_bytes(Stream::Stdout).to_string();
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stdout.contains("SubmitURL: <redacted-invalid-url>"),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    for secret in ["user:secret", "secret", "xyz", "cdash.example"] {
+        assert!(!stdout.contains(secret), "leaked in stdout: {stdout}");
+        assert!(!stderr.contains(secret), "leaked in stderr: {stderr}");
+    }
+    Ok(())
+}

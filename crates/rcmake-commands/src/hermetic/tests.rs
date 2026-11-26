@@ -286,6 +286,49 @@ fn strict_allows_bundled_missing_metadata_and_withholds_bundled_env() -> HostRes
     Ok(())
 }
 
+#[test]
+fn strict_denies_file_upload_through_interpreter() -> HostResult<()> {
+    let (inner, runtime) = setup(HermeticMode::Strict)?;
+    let source = absolute("/project");
+    let build = absolute("/build");
+    inner.symlink(&absolute("/bin/approved"), &absolute("/bin/curl"))?;
+    let launches = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&launches);
+    inner.set_command_handler(move |_, _, _| {
+        count.fetch_add(1, Ordering::Relaxed);
+        Ok(Default::default())
+    })?;
+    inner.seed_file(
+        &source.join("CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nproject(Audit NONE)\nfile(UPLOAD CMakeLists.txt https://example.org/input)\n",
+    )?;
+    let mut interp = Interp::new(
+        InterpConfig {
+            host: runtime.host(),
+            mode: RunMode::Configure,
+            cmake_root: source.join("data"),
+            cmake_command: absolute("/bin/approved"),
+            cwd: source.clone(),
+            limits: Default::default(),
+            diag: Default::default(),
+            services: Default::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        crate::register_all,
+    );
+    runtime.install(&mut interp);
+    let outcome = interp.run_configure(&source, &build, &[]);
+    let diagnostics = inner.stream_bytes(Stream::Stderr).to_string();
+    assert_eq!(outcome.exit_code, 1, "{diagnostics}");
+    assert!(runtime.denied(), "{diagnostics}");
+    assert_eq!(launches.load(Ordering::Relaxed), 0);
+    assert!(
+        diagnostics.contains("RCMAKE_HERMETIC_NETWORK"),
+        "{diagnostics}"
+    );
+    Ok(())
+}
 
 #[test]
 fn strict_denies_undeclared_read_and_unapproved_process_from_bundled_module() -> HostResult<()> {

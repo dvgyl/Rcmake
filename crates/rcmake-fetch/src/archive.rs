@@ -389,6 +389,10 @@ impl<'a> ArchiveCache<'a> {
     }
 
     pub(crate) fn download(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+        let mut config = rcmake_base::curl::CurlConfig::default();
+        config
+            .push(rcmake_base::curl::CurlOption::Url, &[url.as_bytes()])
+            .map_err(|error| invalid(format!("Invalid archive URL: {error}")))?;
         let result = run(
             self.host,
             "curl",
@@ -401,11 +405,12 @@ impl<'a> ArchiveCache<'a> {
                 "--globoff".into(),
                 "--max-filesize".into(),
                 self.byte_limit.to_string().into(),
-                "--url".into(),
-                url.into(),
+                "--config".into(),
+                "-".into(),
             ],
             &self.host.initial_cwd(),
             self.host.env_all(),
+            rcmake_host::Input::Bytes(config.into_bytes()),
             self.byte_limit,
             self.timeout,
         )?;

@@ -284,3 +284,167 @@ fn orders_by_cost_and_seed_without_changing_test_numbers() -> Result<(), CtestEr
     assert!(first.iter().position(|&id| id == 0) < first.iter().position(|&id| id == 2));
     Ok(())
 }
+
+fn planned_fixture_test(number: usize, name: String, prop: &str, fixture: &str) -> PlannedTest {
+    let mut properties = BTreeMap::new();
+    properties.insert(BString::from(prop), BString::from(fixture));
+    PlannedTest {
+        number,
+        test: Test {
+            name: name.into(),
+            command: rcmake_host::CommandSpec {
+                program: "run".into(),
+                args: Vec::new(),
+            },
+            directory: PathBuf::from("/work"),
+            properties,
+            timeout: crate::timeout::Settings::default(),
+        },
+        checks: OutputChecks {
+            pass: Vec::new(),
+            fail: Vec::new(),
+            skip: Vec::new(),
+        },
+        required_setups: Vec::new(),
+    }
+}
+
+#[test]
+fn fixture_edges_stop_at_the_budget() {
+    let mut tests = Vec::with_capacity(900);
+    let mut n = 1;
+    for i in 0..300 {
+        tests.push(planned_fixture_test(
+            n,
+            format!("setup_{i}"),
+            "FIXTURES_SETUP",
+            "f",
+        ));
+        n += 1;
+    }
+    for i in 0..300 {
+        tests.push(planned_fixture_test(
+            n,
+            format!("user_{i}"),
+            "FIXTURES_REQUIRED",
+            "f",
+        ));
+        n += 1;
+    }
+    for i in 0..300 {
+        tests.push(planned_fixture_test(
+            n,
+            format!("cleanup_{i}"),
+            "FIXTURES_CLEANUP",
+            "f",
+        ));
+        n += 1;
+    }
+    let error = match build_graph_with_budget(tests, 100_000) {
+        Ok(_) => panic!("270,000 fixture edges must exceed 100,000 budget"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "Test dependencies and fixtures need more than 100000 dependency edges."
+    );
+}
+
+#[test]
+fn depends_edges_stop_at_the_budget() {
+    let mut tests = Vec::with_capacity(400);
+    for i in 0..200 {
+        tests.push(planned_fixture_test(i + 1, "shared".into(), "LABELS", "a"));
+    }
+    for i in 0..200 {
+        tests.push(planned_fixture_test(
+            201 + i,
+            format!("dep_{i}"),
+            "DEPENDS",
+            "shared;shared",
+        ));
+    }
+    let error = match build_graph_with_budget(tests, 50_000) {
+        Ok(_) => panic!("80,000 DEPENDS edges must exceed 50,000 budget"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "Test dependencies and fixtures need more than 50000 dependency edges."
+    );
+}
+
+#[test]
+fn combined_fixture_and_depends_edges_share_the_budget() {
+    let mut tests = Vec::with_capacity(200);
+    let mut n = 1;
+    for i in 0..20 {
+        tests.push(planned_fixture_test(
+            n,
+            format!("setup_{i}"),
+            "FIXTURES_SETUP",
+            "f",
+        ));
+        n += 1;
+    }
+    for i in 0..20 {
+        tests.push(planned_fixture_test(
+            n,
+            format!("user_{i}"),
+            "FIXTURES_REQUIRED",
+            "f",
+        ));
+        n += 1;
+    }
+    for _ in 0..30 {
+        tests.push(planned_fixture_test(n, "dup".into(), "LABELS", "d"));
+        n += 1;
+    }
+    for i in 0..25 {
+        tests.push(planned_fixture_test(
+            n,
+            format!("dep_{i}"),
+            "DEPENDS",
+            "dup",
+        ));
+        n += 1;
+    }
+    // 20*20 = 400 fixture edges + 25*30 = 750 DEPENDS edges = 1150 > 1000.
+    let error = match build_graph_with_budget(tests, 1_000) {
+        Ok(_) => panic!("combined 1,150 edges must exceed 1,000 budget"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        "Test dependencies and fixtures need more than 1000 dependency edges."
+    );
+}
+
+#[test]
+fn large_realistic_fixture_plans() -> Result<(), CtestError> {
+    let mut tests = Vec::with_capacity(10_002);
+    tests.push(planned_fixture_test(
+        1,
+        "setup".into(),
+        "FIXTURES_SETUP",
+        "f",
+    ));
+    for i in 0..10_000 {
+        tests.push(planned_fixture_test(
+            i + 2,
+            format!("user_{i}"),
+            "FIXTURES_REQUIRED",
+            "f",
+        ));
+    }
+    tests.push(planned_fixture_test(
+        10_002,
+        "cleanup".into(),
+        "FIXTURES_CLEANUP",
+        "f",
+    ));
+    let plan = build_graph(tests)?;
+    assert_eq!(plan.tests.len(), 10_002);
+    assert_eq!(plan.prerequisites.last().copied(), Some(10_001));
+    Ok(())
+}

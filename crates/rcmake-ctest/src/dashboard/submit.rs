@@ -1,7 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rcmake_base::{BString, hash::HashAlgo, list, truth};
+use rcmake_base::{
+    BString,
+    curl::{CurlConfig, CurlOption},
+    hash::HashAlgo,
+    list, truth,
+};
 use rcmake_host::{
     CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, Stream, path,
 };
@@ -107,6 +112,7 @@ pub(crate) struct SubmitResult {
 
 pub(crate) struct Transport {
     pub flags: Vec<BString>,
+    config: CurlConfig,
     pub retries: u32,
     pub delay: Duration,
     pub log: bool,
@@ -142,6 +148,7 @@ impl Transport {
             .into_iter()
             .chain([seconds.to_string().into()])
             .collect(),
+            config: CurlConfig::default(),
             retries: 0,
             delay: Duration::ZERO,
             log,
@@ -154,13 +161,16 @@ impl Transport {
         if header.starts_with(b"@") {
             return Err("ctest_submit HTTPHEADER cannot start with '@'.".into());
         }
+        self.config
+            .push_header(header.as_slice())
+            .map_err(|error| format!("Invalid ctest_submit HTTPHEADER: {error}"))?;
         if self.verbose {
+            let display = redact_header(header.as_slice());
             host.write_out(
                 Stream::Stdout,
-                format!("Add HTTP Header: \"{header}\"\n").as_bytes(),
+                format!("Add HTTP Header: \"{display}\"\n").as_bytes(),
             );
         }
-        self.flags.extend(["--header".into(), header]);
         Ok(())
     }
 
@@ -183,7 +193,11 @@ impl Transport {
                 url
             }
         };
-        args.extend(["--url".into(), url.into()]);
+        let mut config = self.config.clone();
+        config
+            .push(CurlOption::Url, &[url.as_bytes()])
+            .map_err(|error| format!("Invalid ctest_submit URL: {error}"))?;
+        args.extend(["--config".into(), "-".into()]);
         host.run_bounded(
             &RunRequest {
                 pipeline: vec![CommandSpec {
@@ -192,7 +206,7 @@ impl Transport {
                 }],
                 cwd: dir.to_path_buf(),
                 env: host.env_all(),
-                stdin: Input::Null,
+                stdin: Input::Bytes(config.into_bytes()),
                 stdout: Output::Capture,
                 stderr: Output::Capture,
                 timeout: self.timeout,
@@ -319,10 +333,11 @@ pub(crate) fn submit(
         }
         destination.push_str(&format!("&MD5={md5}"));
         if transport.verbose {
+            let display_url = redact_url(&destination);
             host.write_out(
                 Stream::Stdout,
                 format!(
-                    "Upload file: {} to {destination} Size: {}\n",
+                    "Upload file: {} to {display_url} Size: {}\n",
                     file.display(),
                     host.metadata(&file, Follow::Yes)
                         .map_err(|error| error.to_string())?
@@ -504,6 +519,69 @@ fn http_url(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
+fn redact_header(header: &[u8]) -> String {
+    let text = String::from_utf8_lossy(header);
+    match text.split_once(':') {
+        Some((name, _)) => format!("{}: <redacted>", name.trim()),
+        None => "<redacted>".to_owned(),
+    }
+}
+
+pub(crate) fn redact_url(url: &str) -> String {
+    let bytes = url.as_bytes();
+    let valid_scheme = bytes
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"http://"))
+        || bytes
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"));
+    if !valid_scheme {
+        return "<redacted-invalid-url>".to_owned();
+    }
+    let (without_frag, frag) = match url.split_once('#') {
+        Some((before, after)) => (before, Some(after)),
+        None => (url, None),
+    };
+    let (base, query) = match without_frag.split_once('?') {
+        Some((before, after)) => (before, Some(after)),
+        None => (without_frag, None),
+    };
+    let mut out = if let Some((scheme, rest)) = base.split_once("://") {
+        let (authority, path_part) = match rest.split_once('/') {
+            Some((auth, path)) => (auth, Some(path)),
+            None => (rest, None),
+        };
+        if let Some((_, host_port)) = authority.rsplit_once('@') {
+            match path_part {
+                Some(path) => format!("{scheme}://<redacted>@{host_port}/{path}"),
+                None => format!("{scheme}://<redacted>@{host_port}"),
+            }
+        } else {
+            base.to_owned()
+        }
+    } else {
+        base.to_owned()
+    };
+    if let Some(query) = query {
+        out.push('?');
+        for (index, param) in query.split('&').enumerate() {
+            if index > 0 {
+                out.push('&');
+            }
+            if let Some((key, _)) = param.split_once('=') {
+                out.push_str(key);
+                out.push_str("=<redacted>");
+            } else if !param.is_empty() {
+                out.push_str("<redacted>");
+            }
+        }
+    }
+    if frag.is_some() {
+        out.push_str("#<redacted>");
+    }
+    out
+}
+
 fn encode(value: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut escaped = String::new();
@@ -528,13 +606,71 @@ mod tests {
         let mut transport = Transport::new(false, false, None, None);
         assert!(transport.header(&host, "@secret".into()).is_err());
         assert!(!transport.flags.iter().any(|flag| flag == "--header"));
+        assert!(transport.config.as_bytes().is_empty());
         transport.header(&host, "X-Example: value".into())?;
-        assert!(
-            transport
-                .flags
-                .windows(2)
-                .any(|pair| pair == ["--header", "X-Example: value"])
+        assert!(!transport.flags.iter().any(|flag| flag == "--header"));
+        assert_eq!(
+            transport.config.as_bytes(),
+            b"header = \"X-Example: value\"\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_submit_credentials_and_headers_off_argv() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = if cfg!(windows) { "C:/work" } else { "/work" };
+        let host = PureHost::new(dir.into(), dir.into());
+        let curl = Path::new(dir).join(format!("curl{}", std::env::consts::EXE_SUFFIX));
+        host.seed_file(&curl, b"")?;
+        host.set_permissions(&curl, 0o755)?;
+        host.env_set(b"PATH", Some(dir.as_bytes()));
+        let report = Path::new(dir).join("Testing/20261126-0000/Test.xml");
+        host.seed_file(&report, b"<Site/>")?;
+        host.seed_file(
+            &Path::new(dir).join("Testing/TAG"),
+            b"20261126-0000\nExperimental\nExperimental\n",
+        )?;
+        host.set_command_handler(|_, request, _| {
+            let args = &request
+                .pipeline
+                .first()
+                .ok_or_else(|| HostError::unsupported("Missing submission command"))?
+                .args;
+            assert!(args.windows(2).any(|pair| pair == ["--config", "-"]));
+            for arg in args {
+                let text = String::from_utf8_lossy(arg);
+                assert!(!text.contains("pw"), "password leaked in argv: {text}");
+                assert!(!text.contains("t0ken"), "token leaked in argv: {text}");
+            }
+            let Input::Bytes(stdin) = &request.stdin else {
+                panic!("Expected curl config bytes on stdin.");
+            };
+            let stdin = String::from_utf8_lossy(stdin);
+            assert!(stdin.contains("header = \"Authorization: Bearer t0ken\"\n"));
+            assert!(stdin.contains("url = \"https://u:pw@cdash.invalid/submit.php?project=P&"));
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        let mut transport = Transport::new(false, false, None, None);
+        transport.header(&host, "Authorization: Bearer t0ken".into())?;
+        let config = Configuration {
+            site: "site".into(),
+            build_name: "build".into(),
+            submit_url: "https://u:pw@cdash.invalid/submit.php?project=P".into(),
+            ..Configuration::default()
+        };
+        let tag = Tag::read(&host, Path::new(dir))?;
+        let job = Submission {
+            url: submission_url(&config),
+            config: &config,
+            parts: Some(vec!["Test".into()]),
+            files: Vec::new(),
+            subproject: None,
+        };
+        let outcome = submit(&host, Path::new(dir), &tag, &transport, &job)?;
+        assert_eq!(outcome.code, 0);
         Ok(())
     }
 
@@ -574,6 +710,150 @@ mod tests {
                 Path::new(dir),
                 Transfer::Post("@literal&key=value", "https://example.invalid/"),
             )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_crlf_headers_before_verbose_logging() {
+        let host = PureHost::default();
+        let mut transport = Transport::new(false, true, None, None);
+        for bad in [
+            "X-Test: a\r\nX-Evil: 1",
+            "Authorization: Bearer tok\nX-Evil: 1",
+            "Proxy-Authorization: Basic abc\rX-Evil: 1",
+        ] {
+            let err = transport
+                .header(&host, bad.into())
+                .expect_err("CRLF header must be rejected");
+            assert!(err.contains("Invalid ctest_submit HTTPHEADER"), "{err}");
+        }
+        assert!(transport.config.as_bytes().is_empty());
+        assert!(host.stream_bytes(Stream::Stdout).is_empty());
+    }
+
+    #[test]
+    fn verbose_redacts_sensitive_headers_and_url_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = if cfg!(windows) { "C:/work" } else { "/work" };
+        let host = PureHost::new(dir.into(), dir.into());
+        let curl = Path::new(dir).join(format!("curl{}", std::env::consts::EXE_SUFFIX));
+        host.seed_file(&curl, b"")?;
+        host.set_permissions(&curl, 0o755)?;
+        host.env_set(b"PATH", Some(dir.as_bytes()));
+        let report = Path::new(dir).join("Testing/20261126-0000/Test.xml");
+        host.seed_file(&report, b"<Site/>")?;
+        host.seed_file(
+            &Path::new(dir).join("Testing/TAG"),
+            b"20261126-0000\nExperimental\nExperimental\n",
+        )?;
+        host.set_command_handler(|_, request, _| {
+            let Input::Bytes(stdin) = &request.stdin else {
+                panic!("Expected curl config bytes on stdin.");
+            };
+            let stdin = String::from_utf8_lossy(stdin);
+            assert!(stdin.contains("header = \"Authorization: Bearer secret_tok\"\n"));
+            assert!(stdin.contains("header = \"X-Example: safe_value\"\n"));
+            assert!(stdin.contains(
+                "url = \"https://u:p4ss@cdash.invalid/submit.php?project=P&foo=secret_foo&%74oken=qtok&bare_secret&"
+            ));
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        let mut transport = Transport::new(false, true, None, None);
+        for header in [
+            "Authorization: Bearer secret_tok",
+            "Proxy-Authorization: Basic cHJveHk=",
+            "Cookie: sid=cookie_secret",
+            "X-Api-Key: key_secret",
+            "X-Custom-Token: custom_tok",
+            "X-Example: safe_value",
+            "NoColonSecret",
+        ] {
+            transport.header(&host, header.into())?;
+        }
+        let config = Configuration {
+            site: "site".into(),
+            build_name: "build".into(),
+            submit_url: "https://u:p4ss@cdash.invalid/submit.php?project=P&foo=secret_foo&%74oken=qtok&bare_secret"
+                .into(),
+            ..Configuration::default()
+        };
+        let tag = Tag::read(&host, Path::new(dir))?;
+        let job = Submission {
+            url: submission_url(&config),
+            config: &config,
+            parts: Some(vec!["Test".into()]),
+            files: Vec::new(),
+            subproject: None,
+        };
+        let outcome = submit(&host, Path::new(dir), &tag, &transport, &job)?;
+        assert_eq!(outcome.code, 0);
+        let stdout = host.stream_bytes(Stream::Stdout).to_string();
+        for secret in [
+            "secret_tok",
+            "cHJveHk=",
+            "cookie_secret",
+            "key_secret",
+            "custom_tok",
+            "safe_value",
+            "NoColonSecret",
+            "u:p4ss",
+            "p4ss",
+            "secret_foo",
+            "qtok",
+            "bare_secret",
+        ] {
+            assert!(
+                !stdout.contains(secret),
+                "secret leaked in verbose stdout: {stdout}"
+            );
+        }
+        assert!(
+            stdout.contains("Add HTTP Header: \"Authorization: <redacted>\""),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("Add HTTP Header: \"Proxy-Authorization: <redacted>\""),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("Add HTTP Header: \"Cookie: <redacted>\""),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("Add HTTP Header: \"X-Api-Key: <redacted>\""),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("Add HTTP Header: \"X-Custom-Token: <redacted>\""),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("Add HTTP Header: \"X-Example: <redacted>\""),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("Add HTTP Header: \"<redacted>\""),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("https://<redacted>@cdash.invalid/submit.php?project=<redacted>&foo=<redacted>&%74oken=<redacted>&<redacted>&"),
+            "{stdout}"
+        );
+        assert_eq!(
+            redact_url("https://user:pw@example.invalid/p?a=1&%74oken=xyz#frag_secret"),
+            "https://<redacted>@example.invalid/p?a=<redacted>&%74oken=<redacted>#<redacted>"
+        );
+        for invalid in [
+            "//user:secret@cdash.example/submit.php?token=xyz",
+            "user:secret@cdash.example/submit.php",
+            "ftp://user:secret@cdash.example/submit.php?token=xyz",
+            "not-a-url",
+        ] {
+            assert_eq!(redact_url(invalid), "<redacted-invalid-url>", "{invalid}");
         }
         Ok(())
     }

@@ -106,7 +106,7 @@ fn charges_duplicate_zip_records_before_selection() -> TestResult {
     host.seed_file(archive, &bytes)?;
     assert!(
         list_command_archive(&host, archive, names(&["missing"]), None)
-            .is_err_and(|error| error.message == "Archive exceeds the size limit")
+            .is_err_and(|error| error.message.starts_with("Archive exceeds the size limit"))
     );
     Ok(())
 }
@@ -334,4 +334,296 @@ fn seven_zip_bytes(packed: &[u8], header: &[u8]) -> Vec<u8> {
 
 fn open_seven_zip(bytes: &[u8]) -> Result<sevenz_rust2::Archive, ArchiveError> {
     seven_zip::open(&mut Cursor::new(bytes), bytes.len() as u64)
+}
+
+fn tar_gz_with_file(name: &str, payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = Builder::new(&mut tar_bytes);
+        let mut header = Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, payload)?;
+        builder.finish()?;
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&tar_bytes)?;
+    Ok(encoder.finish()?)
+}
+
+#[test]
+fn ratio_cap_stops_a_compression_bomb() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/archive.tar.gz");
+    let bomb = tar_gz_with_file("zeros.bin", &vec![0_u8; 8 * 1024 * 1024])?;
+    assert!(bomb.len() < 32 * 1024, "expected high compression ratio");
+    host.seed_file(archive, &bomb)?;
+    let options = extract_options();
+    let err = crate::extract::run_with_limits(
+        &host,
+        archive,
+        (&options).into(),
+        crate::extract::Listing::Shared,
+        1024 * 1024,
+        200,
+    )
+    .expect_err("compression bomb must be rejected");
+    assert!(
+        err.message.contains("Archive exceeds the size limit"),
+        "{}",
+        err.message
+    );
+    assert!(
+        err.message.contains("RCMAKE_EXTRACT_MAX_BYTES"),
+        "{}",
+        err.message
+    );
+    assert!(absent(&host, "/extract"));
+    Ok(())
+}
+
+#[test]
+fn ratio_cap_allows_normal_compression() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/normal.tar.gz");
+    let mut payload = vec![0_u8; 1024 * 1024];
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for byte in &mut payload {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        *byte = (state >> 56) as u8;
+    }
+    let packed = tar_gz_with_file("random.bin", &payload)?;
+    host.seed_file(archive, &packed)?;
+    let options = extract_options();
+    let names_out = crate::extract::run_with_limits(
+        &host,
+        archive,
+        (&options).into(),
+        crate::extract::Listing::Shared,
+        1024 * 1024,
+        200,
+    )?;
+    assert_eq!(names_out, names(&["random.bin"]));
+    assert_eq!(
+        host.metadata(Path::new("/extract/random.bin"), Follow::No)?
+            .len,
+        1024 * 1024
+    );
+    Ok(())
+}
+
+#[test]
+fn env_override_replaces_the_limit() -> TestResult {
+    let host = test_host();
+    let archive = Path::new("/override.tar.gz");
+    let bomb = tar_gz_with_file("zeros.bin", &vec![0_u8; 8 * 1024 * 1024])?;
+    host.seed_file(archive, &bomb)?;
+    host.env_set(b"RCMAKE_EXTRACT_MAX_BYTES", Some(b"16777216"));
+    let options = extract_options();
+    let names_out = crate::extract::run_with_limits(
+        &host,
+        archive,
+        (&options).into(),
+        crate::extract::Listing::Shared,
+        1024 * 1024,
+        200,
+    )?;
+    assert_eq!(names_out, names(&["zeros.bin"]));
+    assert_eq!(
+        host.metadata(Path::new("/extract/zeros.bin"), Follow::No)?
+            .len,
+        8 * 1024 * 1024
+    );
+    Ok(())
+}
+
+#[test]
+fn trailer_drain_reads_at_most_16_mib() -> TestResult {
+    use std::io::Read;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    struct TrailingZeros {
+        prefix: Vec<u8>,
+        pos: usize,
+        total_read: Arc<AtomicU64>,
+        fail_after: u64,
+    }
+
+    impl Read for TrailingZeros {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let so_far = self.total_read.load(Ordering::Relaxed);
+            if so_far >= self.fail_after {
+                return Err(std::io::Error::other("trailer drain exceeded 32 MiB"));
+            }
+            let n = if self.pos < self.prefix.len() {
+                let avail = (self.prefix.len() - self.pos).min(buf.len());
+                buf[..avail].copy_from_slice(&self.prefix[self.pos..self.pos + avail]);
+                self.pos += avail;
+                avail
+            } else {
+                buf.fill(0);
+                buf.len()
+            };
+            self.total_read.fetch_add(n as u64, Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    let mut builder = Builder::new(Vec::new());
+    add_test_tar_file(&mut builder, "hello.txt")?;
+    let tar_bytes = builder.into_inner()?;
+    let tar_len = tar_bytes.len() as u64;
+    let total_read = Arc::new(AtomicU64::new(0));
+    let reader = TrailingZeros {
+        prefix: tar_bytes,
+        pos: 0,
+        total_read: Arc::clone(&total_read),
+        fail_after: 32 * 1024 * 1024,
+    };
+    let host = test_host();
+    let err = crate::extract::scan_tar_for_test(&host, Path::new("/extract"), reader)
+        .expect_err("unbounded trailing zeros must be rejected");
+    assert!(
+        err.message.contains("Archive exceeds the size limit"),
+        "{}",
+        err.message
+    );
+    let read_bytes = total_read.load(Ordering::Relaxed);
+    assert!(
+        read_bytes <= tar_len + 16 * 1024 * 1024 + crate::extract::stage::BUFFER as u64,
+        "trailer drain read {read_bytes} bytes for {tar_len}-byte tar"
+    );
+    Ok(())
+}
+
+#[test]
+fn compressed_trailing_zeros_bomb_is_rejected() -> TestResult {
+    let mut builder = Builder::new(Vec::new());
+    add_test_tar_file(&mut builder, "hello.txt")?;
+    let mut tar_bytes = builder.into_inner()?;
+    tar_bytes.resize(tar_bytes.len() + 4 * 1024 * 1024, 0);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&tar_bytes)?;
+    let bomb = encoder.finish()?;
+
+    let host = test_host();
+    let archive = Path::new("/trailer_bomb.tar.gz");
+    host.seed_file(archive, &bomb)?;
+    let options = extract_options();
+    let err = crate::extract::run_with_limits(
+        &host,
+        archive,
+        (&options).into(),
+        crate::extract::Listing::Shared,
+        1024 * 1024,
+        200,
+    )
+    .expect_err("compressed trailing-zero bomb must be rejected");
+    assert!(
+        err.message.contains("Archive exceeds the size limit"),
+        "{}",
+        err.message
+    );
+    assert!(absent(&host, "/extract"));
+    Ok(())
+}
+
+#[test]
+fn corrupt_gzip_trailer_after_tar_eof_is_rejected() -> TestResult {
+    let mut packed = tar_gz_with_file("hello.txt", b"hello\n")?;
+    let last = packed.last_mut().ok_or("empty gzip archive")?;
+    *last ^= 0xff;
+
+    let host = test_host();
+    let archive = Path::new("/corrupt_trailer.tar.gz");
+    host.seed_file(archive, &packed)?;
+    let options = extract_options();
+    let err = crate::extract::run_with_limits(
+        &host,
+        archive,
+        (&options).into(),
+        crate::extract::Listing::Shared,
+        1024 * 1024,
+        200,
+    )
+    .expect_err("corrupt gzip trailer must be rejected");
+    assert!(!err.message.is_empty());
+    assert!(absent(&host, "/extract"));
+    Ok(())
+}
+
+#[test]
+fn header_only_tar_bomb_respects_stream_budget() -> TestResult {
+    let mut builder = Builder::new(Vec::new());
+    for i in 0..2500 {
+        let mut header = Header::new_ustar();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, format!("e{i}.txt"), &[][..])?;
+    }
+    let tar_bytes = builder.into_inner()?;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&tar_bytes)?;
+    let packed = encoder.finish()?;
+
+    let host = test_host();
+    let archive = Path::new("/headers_bomb.tar.gz");
+    host.seed_file(archive, &packed)?;
+    let options = extract_options();
+    let err = crate::extract::run_with_output_limit(
+        &host,
+        archive,
+        (&options).into(),
+        crate::extract::Listing::Shared,
+        256 * 1024,
+    )
+    .expect_err("header-only tar exceeding stream budget must be rejected");
+    assert!(
+        err.message.contains("Archive exceeds the size limit"),
+        "{}",
+        err.message
+    );
+    assert!(absent(&host, "/extract"));
+    Ok(())
+}
+
+#[test]
+fn grzip_external_filter_respects_output_limit() -> TestResult {
+    let host = test_host();
+    let bin_dir = Path::new("/bin");
+    let grzip = bin_dir.join(format!("grzip{}", std::env::consts::EXE_SUFFIX));
+    host.seed_file(&grzip, b"")?;
+    host.set_permissions(&grzip, 0o755)?;
+    host.env_set(b"PATH", Some(b"/bin"));
+    host.set_command_handler(|_, _, _| {
+        Ok(rcmake_host::RunOutput {
+            results: vec![rcmake_host::ProcessResult::Exited(0)],
+            stdout: vec![0_u8; 512 * 1024],
+            ..Default::default()
+        })
+    })?;
+    let archive = Path::new("/bomb.tar.grz");
+    host.seed_file(archive, b"GRZipII\0payload")?;
+    let options = extract_options();
+    let err = crate::extract::run_with_output_limit(
+        &host,
+        archive,
+        (&options).into(),
+        crate::extract::Listing::Shared,
+        256 * 1024,
+    )
+    .expect_err("grzip output exceeding limit must be rejected");
+    assert!(
+        err.message.contains("Archive exceeds the size limit"),
+        "{}",
+        err.message
+    );
+    Ok(())
 }

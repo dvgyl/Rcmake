@@ -768,6 +768,7 @@ impl<'a> GitMirror<'a> {
             },
             cwd,
             env,
+            rcmake_host::Input::Null,
             OUTPUT_LIMIT,
             self.remaining()?,
         )?

@@ -326,7 +326,44 @@ fn match_optional(pattern: Option<&Regex>, value: &[u8]) -> Result<bool, CtestEr
     pattern.map_or(Ok(false), |pattern| matches(pattern, value))
 }
 
-fn build_graph(mut tests: Vec<PlannedTest>) -> Plan {
+const MAX_DEPENDENCY_EDGES: usize = 16 * 1024 * 1024;
+
+fn edge_budget_error(budget: usize) -> CtestError {
+    CtestError::Schedule(format!(
+        "Test dependencies and fixtures need more than {budget} dependency edges."
+    ))
+}
+
+fn charge_edges(edges_left: &mut usize, count: usize, budget: usize) -> Result<(), CtestError> {
+    *edges_left = edges_left
+        .checked_sub(count)
+        .ok_or_else(|| edge_budget_error(budget))?;
+    Ok(())
+}
+
+fn charge_fixture_edges(
+    fixtures: &BTreeMap<BString, Fixture>,
+    edges_left: &mut usize,
+    budget: usize,
+) -> Result<(), CtestError> {
+    for f in fixtures.values() {
+        let (s, u, c) = (f.setups.len(), f.users.len(), f.cleanups.len());
+        let cleanup_targets = s.checked_add(u).ok_or_else(|| edge_budget_error(budget))?;
+        let cleanup_edges = c
+            .checked_mul(cleanup_targets)
+            .ok_or_else(|| edge_budget_error(budget))?;
+        charge_edges(edges_left, cleanup_edges, budget)?;
+        let setup_edges = u.checked_mul(s).ok_or_else(|| edge_budget_error(budget))?;
+        charge_edges(edges_left, setup_edges, budget)?;
+    }
+    Ok(())
+}
+
+fn build_graph(tests: Vec<PlannedTest>) -> Result<Plan, CtestError> {
+    build_graph_with_budget(tests, MAX_DEPENDENCY_EDGES)
+}
+
+fn build_graph_with_budget(mut tests: Vec<PlannedTest>, budget: usize) -> Result<Plan, CtestError> {
     let mut names = TestIndex::new();
     let mut fixtures = BTreeMap::<BString, Fixture>::new();
     for (id, test) in tests.iter().enumerate() {
@@ -343,6 +380,8 @@ fn build_graph(mut tests: Vec<PlannedTest>) -> Plan {
             fixtures.entry(name).or_default().cleanups.push(id);
         }
     }
+    let mut edges_left = budget;
+    charge_fixture_edges(&fixtures, &mut edges_left, budget)?;
 
     let mut cleanup_dependencies = vec![Vec::new(); tests.len()];
     for fixture in fixtures.values() {
@@ -361,7 +400,10 @@ fn build_graph(mut tests: Vec<PlannedTest>) -> Plan {
     let mut edges = Vec::with_capacity(tests.len());
     for (test, mut deps) in tests.iter_mut().zip(cleanup_dependencies) {
         for name in test.list(b"DEPENDS") {
-            deps.extend(names.get(&name).into_iter().flatten().copied());
+            if let Some(targets) = names.get(&name) {
+                charge_edges(&mut edges_left, targets.len(), budget)?;
+                deps.extend(targets.iter().copied());
+            }
         }
         let mut setups = Vec::new();
         if !truth::is_on(test.property(b"DISABLED")) {
@@ -379,7 +421,7 @@ fn build_graph(mut tests: Vec<PlannedTest>) -> Plan {
         test.required_setups = setups;
         edges.push(deps);
     }
-    Plan::new(tests, edges)
+    Ok(Plan::new(tests, edges))
 }
 
 pub(crate) fn plan(tests: Vec<Test>, options: &CtestOptions) -> Result<Plan, CtestError> {
@@ -456,7 +498,7 @@ fn finish_plan(
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(build_graph(tests))
+    build_graph(tests)
 }
 
 fn select_tests(

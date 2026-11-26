@@ -1818,15 +1818,13 @@ fn download_passes_netrc_file_only_when_netrc_is_enabled() -> TestResult {
             panic!("Expected one command.");
         };
         let args = &command.args;
-        let flag = if args
-            .iter()
-            .any(|arg| arg == "https://example.invalid/optional")
-        {
+        let stdin = match &request.stdin {
+            rcmake_host::Input::Bytes(bytes) => String::from_utf8_lossy(bytes),
+            _ => std::borrow::Cow::Borrowed(""),
+        };
+        let flag = if stdin.contains("https://example.invalid/optional") {
             Some("--netrc-optional")
-        } else if args
-            .iter()
-            .any(|arg| arg == "https://example.invalid/required")
-        {
+        } else if stdin.contains("https://example.invalid/required") {
             Some("--netrc")
         } else {
             None

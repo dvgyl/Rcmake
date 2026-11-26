@@ -1,5 +1,6 @@
 //! Load the file graph and merge preset inheritance.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,73 @@ const PROJECT: &str = "CMakePresets.json";
 const USER: &str = "CMakeUserPresets.json";
 const MAX_FILES: usize = 256;
 const MAX_PRESETS: usize = 4096;
+/// Estimated bytes for all fields that inheritance materializes.
+const MAX_MERGED_BYTES: usize = 512 * 1024 * 1024;
+const ENTRY_COST: usize = 160;
+const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GraphLimits {
+    pub(crate) merge_bytes: usize,
+    pub(crate) total_bytes: u64,
+}
+
+impl Default for GraphLimits {
+    fn default() -> Self {
+        Self {
+            merge_bytes: MAX_MERGED_BYTES,
+            total_bytes: MAX_TOTAL_BYTES,
+        }
+    }
+}
+
+struct MergeBudget {
+    left: usize,
+}
+
+impl MergeBudget {
+    fn charge_bytes(&mut self, bytes: usize) -> Result<(), PresetsError> {
+        self.left = self
+            .left
+            .checked_sub(bytes)
+            .ok_or_else(|| PresetsError::new("Preset inheritance is too large to resolve"))?;
+        Ok(())
+    }
+
+    fn charge(&mut self, key: &[u8]) -> Result<(), PresetsError> {
+        self.charge_bytes(ENTRY_COST.saturating_add(key.len().saturating_mul(2)))
+    }
+
+    fn charge_value(&mut self, value: &Value) -> Result<(), PresetsError> {
+        let mut stack = vec![value];
+        while let Some(current) = stack.pop() {
+            match current {
+                Value::Null | Value::Bool(_) | Value::Int(_) | Value::UInt(_) | Value::Real(_) => {
+                    self.charge_bytes(16)?;
+                }
+                Value::String(bytes) => {
+                    self.charge_bytes(24usize.saturating_add(bytes.len()))?;
+                }
+                Value::Array(items) => {
+                    self.charge_bytes(24usize.saturating_add(items.len().saturating_mul(24)))?;
+                    for item in items {
+                        stack.push(item);
+                    }
+                }
+                Value::Object(map) => {
+                    self.charge_bytes(
+                        24usize.saturating_add(map.len().saturating_mul(ENTRY_COST)),
+                    )?;
+                    for (key, member) in map {
+                        self.charge_bytes(key.len())?;
+                        stack.push(member);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Record {
@@ -177,6 +245,8 @@ struct FileGraph<'a> {
     reachable: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
     presets: Presets,
     count: usize,
+    bytes_left: Cell<u64>,
+    merge_budget: usize,
 }
 
 struct Document {
@@ -190,13 +260,23 @@ pub(crate) fn load(
     values: Option<&BTreeMap<PathBuf, Value>>,
     entry: Option<&Path>,
 ) -> Result<Presets, PresetsError> {
+    load_with_limits(source_dir, host, values, entry, GraphLimits::default())
+}
+
+pub(crate) fn load_with_limits(
+    source_dir: &Path,
+    host: &dyn Host,
+    values: Option<&BTreeMap<PathBuf, Value>>,
+    entry: Option<&Path>,
+    limits: GraphLimits,
+) -> Result<Presets, PresetsError> {
     let source_dir = if source_dir.is_absolute() {
         source_dir.to_path_buf()
     } else {
         host.initial_cwd().join(source_dir)
     };
     let source_dir = normalize(&source_dir);
-    load_graph(&source_dir, host, values, entry).map_err(|error| {
+    load_graph(&source_dir, host, values, entry, limits).map_err(|error| {
         if values.is_some() {
             error
         } else {
@@ -213,6 +293,7 @@ fn load_graph(
     host: &dyn Host,
     values: Option<&BTreeMap<PathBuf, Value>>,
     entry: Option<&Path>,
+    limits: GraphLimits,
 ) -> Result<Presets, PresetsError> {
     let mut graph = FileGraph {
         host,
@@ -231,6 +312,8 @@ fn load_graph(
             ..Presets::default()
         },
         count: 0,
+        bytes_left: Cell::new(limits.total_bytes),
+        merge_budget: limits.merge_bytes,
     };
     let project = graph.presets.source_dir.join(PROJECT);
     let user = graph.presets.source_dir.join(USER);
@@ -291,20 +374,29 @@ impl FileGraph<'_> {
                 path::from_native_cmake(path)
             )));
         }
+        let left = self.bytes_left.get();
+        let capped_by_total = left < schema::MAX_FILE_SIZE;
+        let limit = schema::MAX_FILE_SIZE.min(left);
         let bytes = self
             .host
-            .read(
-                path,
-                ReadRange::All {
-                    limit: schema::MAX_FILE_SIZE,
-                },
-            )
+            .read(path, ReadRange::All { limit })
             .map_err(|error| {
-                PresetsError::new(format!(
-                    "Could not read {}: {error}",
-                    path::from_native_cmake(path)
-                ))
+                if capped_by_total && error.kind == ErrorKind::FileTooLarge {
+                    PresetsError::new("Presets files exceed the 64 MiB total size limit")
+                } else {
+                    PresetsError::new(format!(
+                        "Could not read {}: {error}",
+                        path::from_native_cmake(path)
+                    ))
+                }
             })?;
+        let read_len = bytes.len() as u64;
+        if read_len > left {
+            return Err(PresetsError::new(
+                "Presets files exceed the 64 MiB total size limit",
+            ));
+        }
+        self.bytes_left.set(left - read_len);
         let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
         if bytes.is_empty() {
             return Err(PresetsError::new("A JSON document cannot be empty"));
@@ -450,6 +542,9 @@ impl FileGraph<'_> {
     }
 
     fn merge(&mut self) -> Result<(), PresetsError> {
+        let mut budget = MergeBudget {
+            left: self.merge_budget,
+        };
         for (kind, records) in &mut self.presets.records {
             let mut merger = Inheritance {
                 kind: *kind,
@@ -457,6 +552,7 @@ impl FileGraph<'_> {
                 reachable: &self.reachable,
                 merged: BTreeMap::new(),
                 visiting: BTreeSet::new(),
+                budget: &mut budget,
             };
             // CMake resolves inheritance in name order and lists presets in file order.
             let names: BTreeSet<_> = records.keys().cloned().collect();
@@ -480,6 +576,7 @@ struct Inheritance<'a> {
     reachable: &'a BTreeMap<PathBuf, BTreeSet<PathBuf>>,
     merged: BTreeMap<BString, Record>,
     visiting: BTreeSet<BString>,
+    budget: &'a mut MergeBudget,
 }
 
 impl Inheritance<'_> {
@@ -500,6 +597,7 @@ impl Inheritance<'_> {
             .cloned()
             .ok_or_else(|| PresetsError::new("Invalid Preset"))?;
         for parent in &record.inherits {
+            self.budget.charge(parent)?;
             let inherited = self.records.get(parent).ok_or_else(|| {
                 record.invalid(&format!("Could not find inherited preset \"{parent}\""))
             })?;
@@ -511,7 +609,7 @@ impl Inheritance<'_> {
             }
             self.merge(parent, depth + 1)?;
             if let Some(inherited) = self.merged.get(parent) {
-                merge_fields(&mut record.fields, &inherited.fields, "")?;
+                merge_fields(&mut record.fields, &inherited.fields, "", self.budget)?;
                 if record.condition.is_none()
                     && let Some(condition) = &inherited.condition
                     && !matches!(condition.0, Condition::Null)
@@ -526,54 +624,160 @@ impl Inheritance<'_> {
     }
 }
 
-fn merge_fields(child: &mut Fields, parent: &Fields, prefix: &str) -> Result<(), PresetsError> {
+fn alias_key(prefix: &str, key: &[u8]) -> Option<&'static [u8]> {
+    match (prefix, key) {
+        ("warnings" | "errors", b"dev") => Some(b"author"),
+        ("warnings" | "errors", b"author") => Some(b"dev"),
+        _ => None,
+    }
+}
+
+fn is_nested_key(prefix: &str, key: &[u8]) -> bool {
+    matches!(
+        (prefix, key),
+        (
+            "",
+            b"environment"
+                | b"cacheVariables"
+                | b"variables"
+                | b"architecture"
+                | b"toolset"
+                | b"warnings"
+                | b"errors"
+                | b"debug"
+                | b"trace"
+                | b"output"
+                | b"filter"
+                | b"execution"
+        ) | ("filter", b"include" | b"exclude")
+    )
+}
+
+fn is_empty_value(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value.is_empty(),
+        Value::Array(value) => value.is_empty(),
+        _ => false,
+    }
+}
+
+fn materialize_own(own: &Field, budget: &mut MergeBudget) -> Result<Fields, PresetsError> {
+    if let Some(members) = &own.members {
+        for key in members.keys() {
+            budget.charge(key)?;
+        }
+        return Ok(members.as_ref().clone());
+    }
+    for (key, value) in schema::object(own)? {
+        budget.charge(key)?;
+        budget.charge_value(value)?;
+    }
+    schema::fields(own)
+}
+
+fn merge_fields(
+    child: &mut Fields,
+    parent: &Fields,
+    prefix: &str,
+    budget: &mut MergeBudget,
+) -> Result<(), PresetsError> {
     for (key, value) in parent {
+        budget.charge(key)?;
         if key.as_slice() == b"$comment"
             && !matches!(prefix, "cacheVariables" | "environment" | "variables")
         {
             continue;
         }
-        let alias: Option<&[u8]> = match (prefix, key.as_slice()) {
-            ("warnings" | "errors", b"dev") => Some(b"author"),
-            ("warnings" | "errors", b"author") => Some(b"dev"),
-            _ => None,
-        };
-        if alias.is_some_and(|alias| child.contains_key(alias)) {
+        if alias_key(prefix, key.as_slice()).is_some_and(|alias| child.contains_key(alias)) {
             continue;
         }
         let Some(own) = child.get_mut(key) else {
             child.insert(key.clone(), value.clone());
             continue;
         };
-        let nested = matches!(
-            (prefix, key.as_slice()),
-            (
-                "",
-                b"environment"
-                    | b"cacheVariables"
-                    | b"variables"
-                    | b"architecture"
-                    | b"toolset"
-                    | b"warnings"
-                    | b"errors"
-                    | b"debug"
-                    | b"trace"
-                    | b"output"
-                    | b"filter"
-                    | b"execution"
-            ) | ("filter", b"include" | b"exclude")
-        );
         let is_map = matches!(prefix, "environment" | "cacheVariables" | "variables");
-        let empty = match own.value.as_ref() {
-            Value::String(value) => value.is_empty(),
-            Value::Array(value) => value.is_empty(),
-            _ => false,
-        };
-        if !is_map && empty && !matches!((prefix, key.as_slice()), ("execution", b"jobs")) {
+        if !is_map
+            && is_empty_value(own.value.as_ref())
+            && !matches!((prefix, key.as_slice()), ("execution", b"jobs"))
+        {
             *own = value.clone();
-        } else if nested {
-            let mut fields = schema::fields(own)?;
-            merge_fields(&mut fields, &schema::fields(value)?, &key.to_string())?;
+        } else if is_nested_key(prefix, key.as_slice()) {
+            let mut fields = materialize_own(own, budget)?;
+            let key_name = key.to_string();
+            if let Some(parent_members) = &value.members {
+                merge_fields(&mut fields, parent_members.as_ref(), &key_name, budget)?;
+            } else {
+                let parent_map = schema::object(value)?;
+                merge_object_fields(
+                    &mut fields,
+                    parent_map,
+                    &value.source,
+                    value.span(),
+                    &key_name,
+                    budget,
+                )?;
+            }
+            own.members = Some(Arc::new(fields));
+        }
+    }
+    Ok(())
+}
+
+fn merge_object_fields(
+    child: &mut Fields,
+    parent: &BTreeMap<BString, Value>,
+    source: &Arc<Origin>,
+    parent_span: Option<&Arc<Span>>,
+    prefix: &str,
+    budget: &mut MergeBudget,
+) -> Result<(), PresetsError> {
+    for (key, value) in parent {
+        budget.charge(key)?;
+        if key.as_slice() == b"$comment"
+            && !matches!(prefix, "cacheVariables" | "environment" | "variables")
+        {
+            continue;
+        }
+        if alias_key(prefix, key.as_slice()).is_some_and(|alias| child.contains_key(alias)) {
+            continue;
+        }
+        let Some(own) = child.get_mut(key) else {
+            budget.charge_value(value)?;
+            child.insert(
+                key.clone(),
+                Field::member(source, parent_span, key, value.clone()),
+            );
+            continue;
+        };
+        let is_map = matches!(prefix, "environment" | "cacheVariables" | "variables");
+        if !is_map
+            && is_empty_value(own.value.as_ref())
+            && !matches!((prefix, key.as_slice()), ("execution", b"jobs"))
+        {
+            budget.charge_value(value)?;
+            *own = Field::member(source, parent_span, key, value.clone());
+        } else if is_nested_key(prefix, key.as_slice()) {
+            let mut fields = materialize_own(own, budget)?;
+            let sub_span = parent_span.and_then(|span| span.member(key.as_slice()));
+            let Value::Object(sub_map) = value else {
+                return Err(if source.text.is_some() && matches!(value, Value::Null) {
+                    PresetsError::new("Expected an object")
+                } else {
+                    source.invalid(
+                        sub_span.as_ref().map(|span| span.start),
+                        "Expected an object",
+                    )
+                });
+            };
+            let key_name = key.to_string();
+            merge_object_fields(
+                &mut fields,
+                sub_map,
+                source,
+                sub_span.as_ref(),
+                &key_name,
+                budget,
+            )?;
             own.members = Some(Arc::new(fields));
         }
     }

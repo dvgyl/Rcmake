@@ -82,6 +82,7 @@ The `s3` mode uses `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
 | `RCMAKE_HERMETIC_ALLOW_ENV` | Set a semicolon-separated list of permitted environment variable names. |
 | `RCMAKE_HERMETIC_ALLOW_PATHS` | Set a semicolon-separated list of resolvable, permitted absolute paths. |
 | `RCMAKE_HERMETIC_ALLOW_PROGRAMS` | Set a semicolon-separated list of resolvable, permitted absolute executable paths. |
+| `RCMAKE_EXTRACT_MAX_BYTES` | Override the archive extraction output size limit in bytes (default: `200×` compressed archive size, clamped between 1 GiB and 64 GiB). Clamped to the 64 GiB hard ceiling. |
 
 `rcmake` reports invalid allowlist entries and ignores them.
 

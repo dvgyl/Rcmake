@@ -13,25 +13,36 @@ pub(super) fn decompress(
     host: &dyn Host,
     archive: &Path,
     name: &str,
+    limit: u64,
+    ratio_capped: bool,
 ) -> Result<Vec<u8>, ArchiveError> {
     let executable = path::executable_on_absolute_path(host, name)
         .ok_or_else(|| ArchiveError::new("Unrecognized archive format"))?;
-    let output = host.run_bounded(
-        &RunRequest {
-            pipeline: vec![CommandSpec {
-                program: path::from_native(&executable),
-                args: vec!["-d".into()],
-            }],
-            cwd: host.initial_cwd(),
-            env: host.env_all(),
-            stdin: Input::File(archive.to_path_buf()),
-            stdout: Output::Capture,
-            stderr: Output::Null,
-            timeout: Some(Duration::from_secs(30)),
-            tee: false,
-        },
-        usize::try_from(size_limit()).unwrap_or(usize::MAX),
-    )?;
+    let cap = limit.min(size_limit());
+    let output = host
+        .run_bounded(
+            &RunRequest {
+                pipeline: vec![CommandSpec {
+                    program: path::from_native(&executable),
+                    args: vec!["-d".into()],
+                }],
+                cwd: host.initial_cwd(),
+                env: host.env_all(),
+                stdin: Input::File(archive.to_path_buf()),
+                stdout: Output::Capture,
+                stderr: Output::Null,
+                timeout: Some(Duration::from_secs(30)),
+                tee: false,
+            },
+            usize::try_from(cap).unwrap_or(usize::MAX),
+        )
+        .map_err(|error| {
+            if error.os_message == "Process output exceeds the size limit" {
+                ArchiveError::new(crate::extract::size_limit_message(ratio_capped))
+            } else {
+                ArchiveError::from(error)
+            }
+        })?;
     match output.results.as_slice() {
         [ProcessResult::Exited(0)] => Ok(output.stdout),
         [ProcessResult::Exited(code)] => Err(ArchiveError::new(format!(

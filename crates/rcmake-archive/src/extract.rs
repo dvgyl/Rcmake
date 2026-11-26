@@ -36,21 +36,140 @@ impl<'a> Listing<'a> {
     }
 }
 
+const RATIO: u64 = 200;
+const FLOOR: u64 = 1024 * 1024 * 1024;
+const TRAILER_BYTES: u64 = 16 * 1024 * 1024;
+const MIN_TAR_OVERHEAD: u64 = 64 * 1024;
+
+pub(super) fn size_limit_message(ratio_capped: bool) -> &'static str {
+    if ratio_capped {
+        "Archive exceeds the size limit (set RCMAKE_EXTRACT_MAX_BYTES to override)"
+    } else {
+        "Archive exceeds the size limit"
+    }
+}
+
+struct StreamBudget<R> {
+    inner: R,
+    limit: u64,
+    read: u64,
+    ratio_capped: bool,
+}
+
+impl<R> StreamBudget<R> {
+    fn new(inner: R, limit: u64, ratio_capped: bool) -> Self {
+        Self {
+            inner,
+            limit,
+            read: 0,
+            ratio_capped,
+        }
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.read
+    }
+}
+
+impl<R: Read> Read for StreamBudget<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.limit.saturating_sub(self.read);
+        if remaining == 0 {
+            let mut probe = [0_u8; 1];
+            if self.inner.read(&mut probe)? == 0 {
+                return Ok(0);
+            }
+            return Err(io::Error::other(size_limit_message(self.ratio_capped)));
+        }
+        let max = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let n = match buf.get_mut(..max) {
+            Some(target) => self.inner.read(target)?,
+            None => self.inner.read(buf)?,
+        };
+        self.read = self.read.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
+fn output_limit(host: &dyn Host, archive_len: u64, floor: u64, ratio: u64) -> (u64, bool) {
+    if let Some(bytes) = host
+        .env_get(b"RCMAKE_EXTRACT_MAX_BYTES")
+        .and_then(|value| std::str::from_utf8(&value).ok()?.parse::<u64>().ok())
+    {
+        return (bytes.min(stage::MAX_BYTES), false);
+    }
+    let limit = archive_len
+        .saturating_mul(ratio)
+        .clamp(floor, stage::MAX_BYTES);
+    (limit, limit < stage::MAX_BYTES)
+}
+
 pub(super) fn run(
     host: &dyn Host,
     archive_path: &Path,
     request: ExtractRequest<'_>,
     listing: Listing<'_>,
 ) -> Result<Vec<BString>, ArchiveError> {
-    run_with_output_limit(host, archive_path, request, listing, stage::MAX_BYTES)
+    run_with_limits(host, archive_path, request, listing, FLOOR, RATIO)
 }
 
+pub(super) fn run_with_limits(
+    host: &dyn Host,
+    archive_path: &Path,
+    request: ExtractRequest<'_>,
+    listing: Listing<'_>,
+    floor: u64,
+    ratio: u64,
+) -> Result<Vec<BString>, ArchiveError> {
+    run_inner(host, archive_path, request, listing, |len| {
+        output_limit(host, len, floor, ratio)
+    })
+}
+
+#[cfg(test)]
 pub(super) fn run_with_output_limit(
     host: &dyn Host,
     archive_path: &Path,
     request: ExtractRequest<'_>,
     listing: Listing<'_>,
     limit: u64,
+) -> Result<Vec<BString>, ArchiveError> {
+    run_inner(host, archive_path, request, listing, |_| (limit, false))
+}
+
+#[cfg(test)]
+pub(super) fn scan_tar_for_test(
+    host: &dyn Host,
+    destination: &Path,
+    reader: impl Read,
+) -> Result<Vec<BString>, ArchiveError> {
+    let mut stage = Stage::new(host, destination);
+    let mut scan = Scan {
+        excludes: Patterns::new(&[])?,
+        patterns: Patterns::new(&[])?,
+        list_only: false,
+        listing: Listing::Shared,
+        touch: false,
+        confined_links: false,
+        names: Vec::new(),
+        count: 0,
+        bytes_left: stage::MAX_BYTES,
+        ratio_capped: false,
+        metadata_left: stage::METADATA_BYTES,
+    };
+    scan.tar_headers(reader, &mut stage)?;
+    Ok(scan.names)
+}
+
+fn run_inner(
+    host: &dyn Host,
+    archive_path: &Path,
+    request: ExtractRequest<'_>,
+    listing: Listing<'_>,
+    resolve_limit: impl FnOnce(u64) -> (u64, bool),
 ) -> Result<Vec<BString>, ArchiveError> {
     let options = request.options;
     absolute(archive_path)?;
@@ -75,6 +194,7 @@ pub(super) fn run_with_output_limit(
             archive_path.display()
         )));
     }
+    let (limit, ratio_capped) = resolve_limit(len);
     source.seek(SeekFrom::Start(0)).map_err(archive_error)?;
     let mut prefix = [0; 16];
     let prefix = prefix
@@ -93,6 +213,7 @@ pub(super) fn run_with_output_limit(
         names: Vec::new(),
         count: 0,
         bytes_left: limit,
+        ratio_capped,
         metadata_left: stage::METADATA_BYTES,
     };
     let entries = if prefix.starts_with(seven_zip::MAGIC) {
@@ -103,7 +224,13 @@ pub(super) fn run_with_output_limit(
     {
         scan.zip(&mut source, len, &host.time_zone(), &mut staged)?
     } else if let Some(program) = external_filter::detect(prefix) {
-        let bytes = external_filter::decompress(host, archive_path, program)?;
+        let bytes = external_filter::decompress(
+            host,
+            archive_path,
+            program,
+            scan.tar_stream_limit(),
+            scan.ratio_capped,
+        )?;
         scan.tar_headers(bytes.as_slice(), &mut staged)?
     } else {
         let input =
@@ -141,12 +268,23 @@ struct Scan<'a> {
     names: Vec<BString>,
     count: usize,
     bytes_left: u64,
+    ratio_capped: bool,
     metadata_left: usize,
 }
 
 type StagedEntry = (Entry, Option<Interval>);
 
 impl Scan<'_> {
+    fn size_limit_error(&self) -> ArchiveError {
+        ArchiveError::new(size_limit_message(self.ratio_capped))
+    }
+
+    fn tar_stream_limit(&self) -> u64 {
+        let overhead = (self.bytes_left / 8).clamp(MIN_TAR_OVERHEAD, TRAILER_BYTES);
+        self.bytes_left
+            .saturating_add(overhead)
+            .min(stage::MAX_BYTES)
+    }
     fn count_entry(&mut self, name_size: usize) -> Result<(), ArchiveError> {
         self.count += 1;
         if self.count > MAX_ENTRIES {
@@ -180,7 +318,7 @@ impl Scan<'_> {
         self.bytes_left = self
             .bytes_left
             .checked_sub(size)
-            .ok_or_else(|| ArchiveError::new("Archive exceeds the size limit"))?;
+            .ok_or_else(|| self.size_limit_error())?;
         Ok(())
     }
 
@@ -189,7 +327,8 @@ impl Scan<'_> {
         reader: impl Read,
         stage: &mut Stage<'_>,
     ) -> Result<Vec<StagedEntry>, ArchiveError> {
-        let mut archive = Archive::new(tar_budget::Reader::new(reader.take(stage::MAX_BYTES + 1)));
+        let stream = StreamBudget::new(reader, self.tar_stream_limit(), self.ratio_capped);
+        let mut archive = Archive::new(tar_budget::Reader::new(stream));
         let mut entries = Vec::new();
         for item in archive.entries().map_err(archive_error)? {
             let mut item = item.map_err(archive_error)?;
@@ -273,14 +412,20 @@ impl Scan<'_> {
                 payload,
             ));
         }
-        // Read past the tar end marker to check the compression trailer and size limit.
+        // Drain trailing padding and compression footers until EOF, bounded by both
+        // TRAILER_BYTES and the decoded-stream budget.
         let mut remaining = archive.into_inner().into_inner();
-        io::copy(&mut remaining, &mut io::sink()).map_err(archive_error)?;
-        if remaining.limit() == 0 {
-            return Err(ArchiveError::new("Archive exceeds the size limit"));
-        }
-        if stage::MAX_BYTES + 1 - remaining.limit() < 512 {
+        let consumed_before = remaining.bytes_read();
+        if consumed_before < 512 {
             return Err(ArchiveError::new("Invalid tar archive"));
+        }
+        let mut trailer = (&mut remaining).take(TRAILER_BYTES);
+        io::copy(&mut trailer, &mut io::sink()).map_err(archive_error)?;
+        if trailer.limit() == 0 {
+            let mut probe = [0_u8; 1];
+            if remaining.read(&mut probe).map_err(archive_error)? != 0 {
+                return Err(self.size_limit_error());
+            }
         }
         Ok(entries)
     }
@@ -394,7 +539,13 @@ impl Scan<'_> {
         zone: &jiff::tz::TimeZone,
         stage: &mut Stage<'_>,
     ) -> Result<Vec<StagedEntry>, ArchiveError> {
-        let archive = zip_codec::open(source, len, self.bytes_left)?;
+        let archive = zip_codec::open(source, len, self.bytes_left).map_err(|error| {
+            if self.ratio_capped && error.message == "Archive exceeds the size limit" {
+                self.size_limit_error()
+            } else {
+                error
+            }
+        })?;
         self.bytes_left = archive.bytes_left;
         self.reserve_metadata(archive.metadata_bytes())?;
         let mut entries = Vec::new();

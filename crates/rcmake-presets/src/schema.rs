@@ -57,6 +57,22 @@ impl Field {
         }
     }
 
+    pub(crate) fn member(
+        source: &Arc<Origin>,
+        parent_span: Option<&Arc<Span>>,
+        key: &BString,
+        value: Value,
+    ) -> Self {
+        let span = parent_span.and_then(|span| span.member(key.as_slice()));
+        let mut member = Self::new(source, value, span);
+        member.key = Some(key.clone());
+        member
+    }
+
+    pub(crate) fn span(&self) -> Option<&Arc<Span>> {
+        self.span.as_ref()
+    }
+
     pub(crate) fn invalid(&self, message: impl std::fmt::Display) -> PresetsError {
         if self.source.text.is_some() && matches!(self.value.as_ref(), Value::Null) {
             return PresetsError::new(message.to_string());
