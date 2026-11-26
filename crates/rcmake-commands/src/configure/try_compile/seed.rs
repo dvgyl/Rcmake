@@ -162,6 +162,28 @@ pub(super) fn enabled_languages(cx: &mut Cx<'_>) -> Vec<BString> {
     languages
 }
 
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub(super) fn enabled_languages_peek(cx: &Cx<'_>) -> Vec<BString> {
+    let mut languages = cx
+        .project_ref()
+        .global
+        .props
+        .get(b"ENABLED_LANGUAGES")
+        .map(|value| list::split(value, list::Empty::Drop))
+        .unwrap_or_default();
+    for &language in PROBE_LANGUAGES {
+        let compiler = format!("CMAKE_{language}_COMPILER");
+        if cx
+            .peek_var(compiler.as_bytes())
+            .is_some_and(|value| !value.is_empty())
+            && !languages.iter().any(|loaded| loaded == language)
+        {
+            languages.push(language.into());
+        }
+    }
+    languages
+}
+
 impl TryCompileSeed {
     pub(super) fn new(cx: &mut Cx<'_>, options: &Options<'_>, source_signature: bool) -> Self {
         let generator = cx.project().generator;
@@ -434,6 +456,42 @@ pub(super) fn language_properties(
                 .one(&key)
                 .map(BString::from)
                 .or_else(|| honor.then(|| cx.var_or_empty(&[b"CMAKE_", key.as_slice()].concat())));
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                properties.push((key.into(), value));
+            }
+        }
+    }
+    properties
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub(super) fn language_properties_peek(
+    cx: &Cx<'_>,
+    options: &Options<'_>,
+    languages: &[&[u8]],
+) -> Vec<(BString, BString)> {
+    let honor = cx.policy(CMP0067) == PolicyStatus::New
+        || STANDARD_OPTIONS.iter().any(|name| options.has(name));
+    let mut properties = Vec::new();
+    for &lang in languages {
+        for suffix in [
+            b"_STANDARD".as_slice(),
+            b"_STANDARD_REQUIRED",
+            b"_EXTENSIONS",
+        ] {
+            let lang = if lang == b"SYCL" && suffix != b"_EXTENSIONS" {
+                b"SYCL_CXX"
+            } else {
+                lang
+            };
+            let key = [lang, suffix].concat();
+            let value = options.one(&key).map(BString::from).or_else(|| {
+                honor.then(|| {
+                    cx.peek_var(&[b"CMAKE_", key.as_slice()].concat())
+                        .cloned()
+                        .unwrap_or_default()
+                })
+            });
             if let Some(value) = value.filter(|value| !value.is_empty()) {
                 properties.push((key.into(), value));
             }

@@ -75,6 +75,64 @@ impl Cx<'_> {
         Some((current, remaining))
     }
 
+    /// Read-only view of the innermost active `foreach()` loop, if any.
+    #[must_use]
+    pub fn foreach_lookahead(&self) -> Option<crate::ForeachLookahead<'_>> {
+        self.interp
+            .foreach_frames
+            .last()
+            .map(crate::ForeachLookahead::new)
+    }
+
+    /// Return whether the currently executing command is directly inside the innermost
+    /// active `foreach()` loop body (not inside a macro or included file called from it).
+    #[must_use]
+    pub fn cur_cmd_in_foreach(&self) -> bool {
+        let (Some((cmds, index)), Some(frame)) = (
+            self.interp.cur_cmd.as_ref(),
+            self.interp.foreach_frames.last(),
+        ) else {
+            return false;
+        };
+        frame.contains_command(cmds, *index)
+    }
+
+    /// Number of active variable scopes (directory, function, and `block()` scopes).
+    #[must_use]
+    pub fn var_scope_depth(&self) -> usize {
+        self.interp.vars.depth()
+    }
+
+    /// Look up a normal or cache variable without triggering watches, usage tracking,
+    /// or replay observations (for side-effect-free speculative lookahead).
+    #[must_use]
+    pub fn peek_var(&self, name: &[u8]) -> Option<&BString> {
+        self.interp.vars.get(name).or_else(|| {
+            self.interp
+                .project
+                .cache
+                .get(name)
+                .map(|entry| &entry.value)
+        })
+    }
+
+    /// Look up a cache entry without triggering watches, usage tracking, or replay
+    /// observations.
+    #[must_use]
+    pub fn peek_cache_var(&self, name: &[u8]) -> Option<&BString> {
+        self.interp
+            .project
+            .cache
+            .get(name)
+            .map(|entry| &entry.value)
+    }
+
+    /// Read-only access to [`ProjectModel`] (for side-effect-free speculative lookahead).
+    #[must_use]
+    pub fn project_ref(&self) -> &ProjectModel {
+        &self.interp.project
+    }
+
     /// Return whether tracing, profiling, or variable watches are active.
     #[must_use]
     pub fn observes_commands(&self) -> bool {

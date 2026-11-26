@@ -37,4 +37,21 @@ impl ProbeCompiler {
             verifier: Arc::new(compiler),
         })
     }
+
+    /// Select a compiler for a speculative probe without mutating foreground
+    /// variable-access tracking or session caches.
+    pub(in super::super) fn select_speculative(
+        host: Arc<dyn Host>,
+        cx: &Cx<'_>,
+        session: &SessionEvidence,
+        name: &[u8],
+        memo: &Arc<TraceMemo>,
+        reference: &CompilerEvidence,
+    ) -> Option<Self> {
+        let compiler = CompilerEvidence::new_speculative(host, cx, session, name, memo, reference)?;
+        Some(Self {
+            identity: compiler.identity(),
+            verifier: Arc::new(compiler),
+        })
+    }
 }

@@ -239,7 +239,6 @@ impl VarStack {
     }
 
     /// Number of active scopes.
-    #[cfg(test)]
     pub(crate) fn depth(&self) -> usize {
         self.scopes.len()
     }

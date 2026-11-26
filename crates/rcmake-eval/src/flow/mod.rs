@@ -4,6 +4,9 @@ mod conditional;
 mod foreach;
 mod scope;
 
+pub(crate) use foreach::ForeachFrame;
+pub use foreach::ForeachLookahead;
+
 #[cfg(test)]
 mod tests;
 

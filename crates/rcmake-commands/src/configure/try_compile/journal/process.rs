@@ -139,15 +139,21 @@ impl JournalHost<'_> {
                 .guard_effect(ImpureReason::UnverifiedProcess)
                 .map(|()| None);
         }
-        let Some(trace) = self
-            .verify_process
-            .as_deref()
-            .and_then(|verify| verify.preflight(request))
-        else {
+        let Some(verify) = self.verify_process.as_deref() else {
             return self
                 .guard_effect(ImpureReason::UnverifiedProcess)
                 .map(|()| None);
         };
+        let Some(trace) = verify.preflight(request) else {
+            return self
+                .guard_effect(ImpureReason::UnverifiedProcess)
+                .map(|()| None);
+        };
+        if self.mode == JournalMode::Speculate && !verify.confines_writes(request) {
+            return self
+                .guard_effect(ImpureReason::ExternalWrite)
+                .map(|()| None);
+        }
         // A pipeline needs separate evidence for every stage.
         if request.pipeline.len() != 1 {
             return self

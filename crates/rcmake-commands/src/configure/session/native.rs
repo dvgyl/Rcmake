@@ -66,7 +66,8 @@ impl NativeSession {
         let fetch = FetchRuntime::new(Arc::clone(&base), source, services);
         let probe = can_accelerate
             .then(|| {
-                ProbeRuntime::new(Arc::clone(&base), build, services, memo.clone()).map(Arc::new)
+                ProbeRuntime::new(Arc::clone(&base), source, build, services, memo.clone())
+                    .map(Arc::new)
             })
             .flatten();
         let snapshot = build

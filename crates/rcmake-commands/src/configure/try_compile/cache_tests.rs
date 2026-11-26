@@ -196,6 +196,10 @@ struct Compiler<'a> {
 }
 
 impl ProcessVerifier for Compiler<'_> {
+    fn confines_writes(&self, _request: &RunRequest) -> bool {
+        true
+    }
+
     fn preflight(&self, request: &RunRequest) -> Option<Trace> {
         (request == self.request).then(Vec::new)
     }

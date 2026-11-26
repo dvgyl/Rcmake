@@ -33,6 +33,7 @@ pub(in crate::configure) struct ProbeRuntime {
     store: StoreConfig,
     cache: ProbeCache,
     mode: ProbeCacheMode,
+    source: PathBuf,
     build: PathBuf,
     executable: OnceLock<Option<Digest>>,
     compiler: compiler::SessionEvidence,
@@ -69,6 +70,7 @@ impl Drop for ProbeRuntime {
 impl ProbeRuntime {
     pub(in crate::configure) fn new(
         host: Arc<dyn Host>,
+        source: &Path,
         build: &Path,
         services: &Services,
         generation: Option<Arc<rcmake_host::MemoHost<dyn Host>>>,
@@ -124,6 +126,7 @@ impl ProbeRuntime {
             store,
             cache,
             mode,
+            source: source.to_owned(),
             build: build.to_owned(),
             executable: OnceLock::new(),
             compiler: compiler::SessionEvidence::default(),
@@ -266,7 +269,7 @@ pub(super) fn native_ninja(host: &dyn Host, path: &Path) -> bool {
 pub(super) struct PreparedProbe {
     runtime: Arc<ProbeRuntime>,
     recipe: ProbeRecipe,
-    compiler: Arc<dyn super::journal::ProcessVerifier>,
+    compiler: Arc<compiler::CompilerEvidence>,
     verified: Option<ObservedOutcome>,
     /// Platform files whose contents the seed binds.
     bound: std::collections::BTreeSet<PathBuf>,
@@ -533,7 +536,7 @@ impl PreparedProbe {
         JournalHost::from_shared(
             Arc::clone(&self.runtime.journal_host),
             &dirs.binary,
-            Arc::clone(&self.compiler),
+            Arc::clone(&self.compiler) as Arc<dyn super::journal::ProcessVerifier>,
             super::journal::JournalMode::Observe,
         )
         .ok()
@@ -658,10 +661,62 @@ fn seed_digest(
     template: &TemplateCapture<'_>,
     host: &dyn Host,
 ) -> Option<(Digest, std::collections::BTreeSet<PathBuf>)> {
+    let command = cx.var_or_empty(b"CMAKE_COMMAND");
+    let platform = path::to_native(&cx.var_or_empty(b"CMAKE_PLATFORM_INFO_DIR"));
+    seed_digest_with(
+        cx,
+        &command,
+        &platform,
+        defines,
+        enabled_languages,
+        probe_languages,
+        template,
+        host,
+    )
+}
+
+fn seed_digest_peek(
+    cx: &Cx<'_>,
+    defines: &[rcmake_eval::CacheDefine],
+    enabled_languages: &[u8],
+    probe_languages: &[BString],
+    template: &TemplateCapture<'_>,
+    host: &dyn Host,
+) -> Option<(Digest, std::collections::BTreeSet<PathBuf>)> {
+    let command = cx
+        .peek_var(b"CMAKE_COMMAND")
+        .map_or(&[][..], |v| v.as_slice());
+    let platform = path::to_native(
+        cx.peek_var(b"CMAKE_PLATFORM_INFO_DIR")
+            .map_or(&[][..], |v| v.as_slice()),
+    );
+    seed_digest_with(
+        cx,
+        command,
+        &platform,
+        defines,
+        enabled_languages,
+        probe_languages,
+        template,
+        host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_digest_with(
+    cx: &Cx<'_>,
+    command: &[u8],
+    platform: &Path,
+    defines: &[rcmake_eval::CacheDefine],
+    enabled_languages: &[u8],
+    probe_languages: &[BString],
+    template: &TemplateCapture<'_>,
+    host: &dyn Host,
+) -> Option<(Digest, std::collections::BTreeSet<PathBuf>)> {
     let mut bound = std::collections::BTreeSet::new();
     let mut key = KeyHasher::new(Domain::ProbeV1);
     key.field(6, format!("{:?}", cx.limits()).as_bytes());
-    key.field(7, &cx.var_or_empty(b"CMAKE_COMMAND"));
+    key.field(7, command);
     for define in defines {
         key.field(8, &define.name);
         key.field(9, template.capture(&define.value)?.digest().as_bytes());
@@ -674,12 +729,11 @@ fn seed_digest(
         );
     }
     key.field(11, enabled_languages);
-    let platform = path::to_native(&cx.var_or_empty(b"CMAKE_PLATFORM_INFO_DIR"));
     if platform.is_absolute() {
-        if host.metadata(&platform, Follow::Yes).ok()?.kind != FileKind::Dir {
+        if host.metadata(platform, Follow::Yes).ok()?.kind != FileKind::Dir {
             return None;
         }
-        bound.insert(platform.clone());
+        bound.insert(platform.to_path_buf());
         let mut files = vec![BString::from("CMakeSystem.cmake")];
         for language in probe_languages {
             if !language.iter().all(u8::is_ascii_alphanumeric) {

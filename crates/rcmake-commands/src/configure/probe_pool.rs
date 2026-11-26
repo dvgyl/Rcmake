@@ -378,6 +378,14 @@ impl ProbeQueue {
         self.available && !self.shared.cancelled()
     }
 
+    pub(crate) fn has_capacity(&self) -> bool {
+        if !self.available() {
+            return false;
+        }
+        let state = self.shared.state();
+        !self.shared.cancelled() && state.pending.len() < MAX_QUEUE && state.bytes < MAX_QUEUE_BYTES
+    }
+
     /// Queue an owned execution plan and a snapshot of its complete child environment.
     ///
     /// Use the same plan to compute the key when the original call consumes

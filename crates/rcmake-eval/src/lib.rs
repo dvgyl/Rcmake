@@ -64,6 +64,7 @@ pub use configure_log::{FindEvent, TryBuildOutcome, TryCompileEvent, TryRunOutco
 pub use cx::Cx;
 pub use env::CxEnv;
 pub use file_lock::FileLockScope;
+pub use flow::ForeachLookahead;
 pub use hooks::{TraceConfig, TraceFormat, WatchAccess};
 pub use interp::StopReason;
 pub use profiler::{CommandProfiler, CommandSample, SampleKind};
@@ -523,6 +524,7 @@ pub struct Interp {
     /// The listfile command being executed (raw arguments for [`Cx::raw_args`]).
     cur_cmd: Option<(Arc<[CommandInvocation]>, usize)>,
     command_end: usize,
+    foreach_frames: Vec<flow::ForeachFrame>,
     session_data: services::SessionData,
     expanded_observer: Option<services::ExpandedObserver>,
     parse_cache: Option<Arc<SharedParseCache>>,
@@ -633,6 +635,7 @@ impl Interp {
             find_debug_packages: Vec::new(),
             cur_cmd: None,
             command_end: 0,
+            foreach_frames: Vec::new(),
             session_data: services::SessionData::default(),
             expanded_observer: None,
             parse_cache: None,

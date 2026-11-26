@@ -7,10 +7,199 @@ use rcmake_base::{
 };
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_expr::ExpandedArg;
+use rcmake_syntax::CommandInvocation;
 
 use super::BlockResult;
 use crate::util::{IntError, cat, stoi};
 use crate::{CmdError, CmdResult, Flow, Interp, code::Code};
+
+/// Remaining iteration values for an active `foreach()` loop, used for
+/// read-only speculative probe lookahead.
+#[derive(Debug)]
+enum ForeachRemaining {
+    Items {
+        items: Arc<Vec<BString>>,
+        next: usize,
+    },
+    Range {
+        current_value: i64,
+        next_value: i64,
+        step: i64,
+        remaining: u64,
+    },
+    Zip {
+        lists: Arc<Vec<Vec<BString>>>,
+        next: usize,
+        max: usize,
+    },
+}
+
+/// Active `foreach()` loop state exposed read-only via [`crate::Cx::foreach_lookahead`].
+#[derive(Debug)]
+pub(crate) struct ForeachFrame {
+    cmds: Arc<[CommandInvocation]>,
+    start: usize,
+    end: usize,
+    scope_depth: usize,
+    vars: Vec<BString>,
+    remaining: ForeachRemaining,
+}
+
+impl ForeachFrame {
+    pub(crate) fn contains_command(&self, cmds: &Arc<[CommandInvocation]>, index: usize) -> bool {
+        Arc::ptr_eq(&self.cmds, cmds) && (self.start..self.end).contains(&index)
+    }
+}
+
+/// Read-only view of the innermost active `foreach()` loop for speculative probe lookahead.
+#[derive(Clone, Copy, Debug)]
+pub struct ForeachLookahead<'a> {
+    frame: &'a ForeachFrame,
+}
+
+impl<'a> ForeachLookahead<'a> {
+    pub(crate) fn new(frame: &'a ForeachFrame) -> Self {
+        Self { frame }
+    }
+
+    /// Raw commands inside the loop body (`foreach` .. `endforeach`).
+    #[must_use]
+    pub fn body(&self) -> &'a [CommandInvocation] {
+        self.frame
+            .cmds
+            .get(self.frame.start..self.frame.end)
+            .unwrap_or_default()
+    }
+
+    /// Variable scope depth at which this `foreach()` loop executes.
+    #[must_use]
+    pub fn scope_depth(&self) -> usize {
+        self.frame.scope_depth
+    }
+
+    /// Loop variable names bound on each iteration.
+    #[must_use]
+    pub fn vars(&self) -> &'a [BString] {
+        &self.frame.vars
+    }
+
+    /// Count of remaining iterations strictly after the currently executing one.
+    #[must_use]
+    pub fn remaining_len(&self) -> usize {
+        match &self.frame.remaining {
+            ForeachRemaining::Items { items, next } => items.len().saturating_sub(*next),
+            ForeachRemaining::Range { remaining, .. } => {
+                usize::try_from(*remaining).unwrap_or(usize::MAX)
+            }
+            ForeachRemaining::Zip { next, max, .. } => max.saturating_sub(*next),
+        }
+    }
+
+    /// Visit the current iteration (`iter_index == 0`) followed by up to `limit` remaining
+    /// iterations without pre-cloning future bindings.
+    ///
+    /// Stops cleanly before visiting an iteration whose bindings would exceed `max_slots` total
+    /// visited variable slots or `max_bytes` total visited value bytes. Returns `false` if the
+    /// callback returned `ControlFlow::Break(false)` or if the current iteration itself could not
+    /// fit within the budget.
+    pub fn visit_iterations(
+        &self,
+        limit: usize,
+        max_slots: usize,
+        max_bytes: usize,
+        mut visit: impl FnMut(usize, &[Option<&[u8]>]) -> std::ops::ControlFlow<bool>,
+    ) -> bool {
+        let mut total_slots = 0usize;
+        let mut total_bytes = 0usize;
+        let mut emit =
+            |iter_index: usize, values: &[Option<&[u8]>]| -> std::ops::ControlFlow<bool> {
+                let next_slots = total_slots.saturating_add(values.len());
+                let iter_bytes = values.iter().fold(0usize, |acc, v| {
+                    acc.saturating_add(v.map_or(0, <[u8]>::len))
+                });
+                let next_bytes = total_bytes.saturating_add(iter_bytes);
+                if next_slots > max_slots || next_bytes > max_bytes {
+                    return std::ops::ControlFlow::Break(iter_index > 0);
+                }
+                total_slots = next_slots;
+                total_bytes = next_bytes;
+                visit(iter_index, values)
+            };
+
+        match &self.frame.remaining {
+            ForeachRemaining::Items { items, next } => {
+                let current = next.saturating_sub(1);
+                let cur_slice = [items.get(current).map(AsRef::<[u8]>::as_ref)];
+                if let std::ops::ControlFlow::Break(ok) = emit(0, &cur_slice) {
+                    return ok;
+                }
+                for (offset, item) in items
+                    .get(*next..)
+                    .unwrap_or_default()
+                    .iter()
+                    .take(limit)
+                    .enumerate()
+                {
+                    let slice = [Some(AsRef::<[u8]>::as_ref(item))];
+                    if let std::ops::ControlFlow::Break(ok) = emit(offset + 1, &slice) {
+                        return ok;
+                    }
+                }
+                true
+            }
+            ForeachRemaining::Range {
+                current_value,
+                next_value,
+                step,
+                remaining,
+            } => {
+                let cur_buf = current_value.to_string();
+                let cur_slice = [Some(cur_buf.as_bytes())];
+                if let std::ops::ControlFlow::Break(ok) = emit(0, &cur_slice) {
+                    return ok;
+                }
+                let count = usize::try_from(*remaining).unwrap_or(usize::MAX).min(limit);
+                let mut value = *next_value;
+                for offset in 0..count {
+                    let buf = value.to_string();
+                    let slice = [Some(buf.as_bytes())];
+                    if let std::ops::ControlFlow::Break(ok) = emit(offset + 1, &slice) {
+                        return ok;
+                    }
+                    value = value.saturating_add(*step);
+                }
+                true
+            }
+            ForeachRemaining::Zip { lists, next, max } => {
+                if lists.len() > max_slots {
+                    return false;
+                }
+                let current = next.saturating_sub(1);
+                let mut row: Vec<Option<&[u8]>> = Vec::with_capacity(lists.len());
+                row.extend(
+                    lists
+                        .iter()
+                        .map(|list| list.get(current).map(AsRef::<[u8]>::as_ref)),
+                );
+                if let std::ops::ControlFlow::Break(ok) = emit(0, &row) {
+                    return ok;
+                }
+                for (offset, index) in (*next..*max).take(limit).enumerate() {
+                    row.clear();
+                    row.extend(
+                        lists
+                            .iter()
+                            .map(|list| list.get(index).map(AsRef::<[u8]>::as_ref)),
+                    );
+                    if let std::ops::ControlFlow::Break(ok) = emit(offset + 1, &row) {
+                        return ok;
+                    }
+                }
+                true
+            }
+        }
+    }
+}
 
 /// Iteration plan computed by the `foreach()` command.
 enum ForeachPlan {
@@ -342,17 +531,46 @@ impl Interp {
             ForeachPlan::Nothing => return Ok(Flow::Normal),
             ForeachPlan::Items { var, items } => {
                 let saved = self.loop_var_saved(&var);
-                for item in items {
+                let items = Arc::new(items);
+                let pushed = start < end && items.len() > 1;
+                if pushed {
+                    self.foreach_frames.push(ForeachFrame {
+                        cmds: Arc::clone(&code.cmds),
+                        start,
+                        end,
+                        scope_depth: self.vars.depth(),
+                        vars: vec![var.clone()],
+                        remaining: ForeachRemaining::Items {
+                            items: Arc::clone(&items),
+                            next: 1,
+                        },
+                    });
+                }
+                let mut budget_stopped = false;
+                for (index, item) in items.iter().enumerate() {
                     if self.over_budget() || (start == end && !self.take_step()) {
-                        return Err(CmdError::Reported);
+                        budget_stopped = true;
+                        break;
                     }
-                    self.define(&var, item);
+                    if pushed
+                        && let Some(frame) = self.foreach_frames.last_mut()
+                        && let ForeachRemaining::Items { next, .. } = &mut frame.remaining
+                    {
+                        *next = index.saturating_add(1);
+                    }
+                    self.define(&var, item.clone());
                     let pass = self.loop_pass(code, start, end);
                     restore = pass.restore;
                     flow = pass.flow;
                     if pass.stop {
                         break;
                     }
+                }
+                if pushed {
+                    self.foreach_frames.pop();
+                }
+                if budget_stopped {
+                    return Err(CmdError::Reported);
                 }
                 if restore {
                     self.restore_loop_var(&var, saved);
@@ -365,19 +583,57 @@ impl Interp {
                 count,
             } => {
                 let saved = self.loop_var_saved(&var);
+                let pushed = start < end && count > 1;
+                if pushed {
+                    self.foreach_frames.push(ForeachFrame {
+                        cmds: Arc::clone(&code.cmds),
+                        start,
+                        end,
+                        scope_depth: self.vars.depth(),
+                        vars: vec![var.clone()],
+                        remaining: ForeachRemaining::Range {
+                            current_value: first,
+                            next_value: first.saturating_add(step),
+                            step,
+                            remaining: count.saturating_sub(1),
+                        },
+                    });
+                }
                 let mut value = first;
-                for _ in 0..count {
+                let mut budget_stopped = false;
+                for i in 0..count {
                     if self.over_budget() || (start == end && !self.take_step()) {
-                        return Err(CmdError::Reported);
+                        budget_stopped = true;
+                        break;
                     }
-                    self.define(&var, value.to_string().into());
+                    let current = value;
+                    self.define(&var, current.to_string().into());
                     value = value.saturating_add(step);
+                    if pushed
+                        && let Some(frame) = self.foreach_frames.last_mut()
+                        && let ForeachRemaining::Range {
+                            current_value,
+                            next_value,
+                            remaining,
+                            ..
+                        } = &mut frame.remaining
+                    {
+                        *current_value = current;
+                        *next_value = value;
+                        *remaining = count.saturating_sub(i.saturating_add(1));
+                    }
                     let pass = self.loop_pass(code, start, end);
                     restore = pass.restore;
                     flow = pass.flow;
                     if pass.stop {
                         break;
                     }
+                }
+                if pushed {
+                    self.foreach_frames.pop();
+                }
+                if budget_stopped {
+                    return Err(CmdError::Reported);
                 }
                 if restore {
                     self.restore_loop_var(&var, saved);
@@ -407,13 +663,35 @@ impl Interp {
                     .into_iter()
                     .map(|var| (var, self.loop_var_saved(var)))
                     .collect();
+                let lists = Arc::new(lists);
+                let pushed = start < end && max > 1;
+                if pushed {
+                    self.foreach_frames.push(ForeachFrame {
+                        cmds: Arc::clone(&code.cmds),
+                        start,
+                        end,
+                        scope_depth: self.vars.depth(),
+                        vars: vars.clone(),
+                        remaining: ForeachRemaining::Zip {
+                            lists: Arc::clone(&lists),
+                            next: 1,
+                            max,
+                        },
+                    });
+                }
                 let mut stopped = false;
                 for n in 0..max {
                     if self.over_budget() || (start == end && !self.take_step()) {
                         stopped = true;
                         break;
                     }
-                    for (var, list) in vars.iter().zip(&lists) {
+                    if pushed
+                        && let Some(frame) = self.foreach_frames.last_mut()
+                        && let ForeachRemaining::Zip { next, .. } = &mut frame.remaining
+                    {
+                        *next = n.saturating_add(1);
+                    }
+                    for (var, list) in vars.iter().zip(lists.iter()) {
                         match list.get(n) {
                             Some(v) => self.define(var, v.clone()),
                             None => self.undefine(var),
@@ -425,6 +703,9 @@ impl Interp {
                     if pass.stop {
                         break;
                     }
+                }
+                if pushed {
+                    self.foreach_frames.pop();
                 }
                 if stopped || !restore {
                     drop(saved);

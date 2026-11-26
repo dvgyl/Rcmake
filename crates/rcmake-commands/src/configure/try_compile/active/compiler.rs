@@ -43,6 +43,10 @@ pub(super) fn admit_source(name: &[u8], source: &[u8]) -> bool {
         && source_hazards(source)
 }
 
+pub(super) fn source_language(name: &[u8]) -> Option<bool> {
+    flags::source_language(name)
+}
+
 enum NinjaEvidence {
     /// Non-Ninja generator: no Ninja version verification applies.
     NotRequired,
@@ -375,6 +379,105 @@ impl CompilerEvidence {
         self.ninja.as_ref()
     }
 
+    pub(super) fn cxx(&self) -> bool {
+        self.cxx
+    }
+
+    pub(super) fn has_external_source(&self) -> bool {
+        self.external_source.is_some()
+    }
+
+    /// Return whether every process executed under this compiler evidence confines its writes
+    /// to private scratch space (rejecting wrappers that append external telemetry logs).
+    pub(super) fn confines_speculative_writes(&self) -> bool {
+        self.toolchain.telemetry.is_empty()
+    }
+
+    /// Build compiler evidence for a speculative candidate strictly from already-cached,
+    /// write-confined toolchain evidence without running compiler discovery or mutating
+    /// foreground variable access state, session tool/search memos, platform queries, or
+    /// Ninja verification state.
+    pub(super) fn new_speculative(
+        host: Arc<dyn Host>,
+        cx: &Cx<'_>,
+        session: &SessionEvidence,
+        name: &[u8],
+        memo: &Arc<TraceMemo>,
+        reference: &Self,
+    ) -> Option<Self> {
+        let cxx = flags::source_language(name)?;
+        let language: &[u8] = if cxx { b"CXX" } else { b"C" };
+        let peek_var = |var: &[u8]| cx.peek_var(var).map_or(&[][..], |value| value.as_slice());
+        let compiler_var = |suffix: &[u8]| {
+            let var = [b"CMAKE_", language, suffix].concat();
+            cx.peek_var(&var).cloned().unwrap_or_default()
+        };
+        if !compiler_var(b"_COMPILER_LAUNCHER").is_empty() {
+            return None;
+        }
+        let id = compiler_var(b"_COMPILER_ID");
+        let family = Family::from_id(&id)?;
+        if family == Family::Msvc && !msvc_dependency_version(&compiler_var(b"_COMPILER_VERSION")) {
+            return None;
+        }
+        let program = path::to_native(&compiler_var(b"_COMPILER"));
+        let sdk = path::to_native(peek_var(b"_CMAKE_OSX_SYSROOT_PATH"));
+        let sdk = if sdk.is_absolute() {
+            sdk
+        } else {
+            path::to_native(peek_var(b"CMAKE_OSX_SYSROOT"))
+        };
+        let key = (
+            program.clone(),
+            sdk.clone(),
+            id,
+            cxx,
+            process_environment_fingerprint(&host.env_all()),
+        );
+        // Require already-verified cached toolchain evidence; defer discovery to foreground.
+        let toolchain = {
+            let tools = session.tools.lock().ok()?;
+            tools.get(&key).and_then(|toolchain| {
+                (memo.verify(host.as_ref(), &toolchain.tools) == VerifyOutcome::Hit)
+                    .then(|| Arc::clone(toolchain))
+            })
+        }?;
+        if !toolchain.telemetry.is_empty() {
+            return None;
+        }
+        let mut archive = BTreeMap::new();
+        if peek_var(b"CMAKE_TRY_COMPILE_TARGET_TYPE") == b"STATIC_LIBRARY" {
+            for variable in [b"CMAKE_AR".as_slice(), b"CMAKE_RANLIB"] {
+                let file = path::to_native(peek_var(variable));
+                if file.as_os_str().is_empty() {
+                    continue;
+                }
+                if !file.is_absolute() {
+                    return None;
+                }
+                archive.insert(
+                    file.clone(),
+                    InputStamp::FileHash {
+                        digest: memo.file_digest(host.as_ref(), &file).ok()?,
+                        path: file,
+                    },
+                );
+            }
+        }
+        Some(Self {
+            host,
+            program,
+            memo: Arc::clone(memo),
+            toolchain,
+            archive,
+            searches: Arc::default(),
+            cxx,
+            external_source: None,
+            platform: reference.platform.clone(),
+            ninja: reference.ninja.clone(),
+        })
+    }
+
     pub(super) fn identity(&self) -> BTreeMap<BString, Digest> {
         let mut identity: BTreeMap<_, _> = self
             .toolchain
@@ -685,10 +788,11 @@ impl ProcessVerifier for CompilerEvidence {
     fn confines_writes(&self, request: &RunRequest) -> bool {
         // A compiler wrapper can write telemetry to an external path.
         self.toolchain.telemetry.is_empty()
-            && request
+            && (request
                 .pipeline
                 .first()
                 .is_some_and(|command| path::to_native(&command.program) == self.program)
+                || self.archive_inputs(request).is_some())
     }
 
     fn is_probe_compile(&self, request: &RunRequest) -> bool {

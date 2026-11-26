@@ -11,6 +11,8 @@ use rcmake_host::{Host, WriteMode, path};
 
 use super::args::{Options, Source};
 use super::seed::{enabled_languages, language_properties};
+#[cfg(all(feature = "native", any(unix, windows)))]
+use super::seed::{enabled_languages_peek, language_properties_peek};
 use super::{absolute, error_text, probe_error, split_byte};
 
 pub(super) fn write_project(
@@ -188,18 +190,20 @@ fn compile_flags(cx: &mut Cx<'_>, options: &Options<'_>) -> Vec<BString> {
 
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub(super) fn render_literal_probe(
-    cx: &mut Cx<'_>,
+    cx: &Cx<'_>,
     file: &Path,
     target: &str,
 ) -> Option<(BString, BString)> {
-    let enabled = enabled_languages(cx);
-    let language = source_language(cx, file, &enabled)?;
+    let enabled = enabled_languages_peek(cx);
+    let language = source_language_peek(cx, file, &enabled)?;
     let languages = vec![language];
     let options = Options::default();
-    let properties = language_properties(cx, &options, &languages);
+    let properties = language_properties_peek(cx, &options, &languages);
     let project = render_project(
         ProjectInputs {
-            archive: cx.var_or_empty(b"CMAKE_TRY_COMPILE_TARGET_TYPE") == "STATIC_LIBRARY",
+            archive: cx
+                .peek_var(b"CMAKE_TRY_COMPILE_TARGET_TYPE")
+                .is_some_and(|value| value == "STATIC_LIBRARY"),
             files: vec![path::from_native_cmake(file)],
             languages,
             compile_flags: Vec::new(),
@@ -246,7 +250,7 @@ fn source_copy_error(cx: &mut Cx<'_>, file: &[u8], error: &rcmake_host::HostErro
 /// Policies that the test project takes from the calling project. They can affect the
 /// toolchain file (`CMP0126`), language extensions (`CMP0128`), and the linker flags
 /// (`CMP0181`, `CMP0210`).
-fn outer_policies(cx: &mut Cx<'_>) -> [(u16, PolicyStatus); 4] {
+fn outer_policies(cx: &Cx<'_>) -> [(u16, PolicyStatus); 4] {
     [126, 128, 181, 210].map(|id| (id, cx.policy(PolicyId::new(id))))
 }
 
@@ -453,30 +457,52 @@ fn source_language<'a>(cx: &mut Cx<'_>, file: &Path, enabled: &'a [BString]) -> 
                     .iter()
                     .any(|item| item == extension);
             }
-            match *language {
-                b"C" => extension == b"c",
-                b"CXX" => matches!(
-                    extension,
-                    b"C" | b"cc"
-                        | b"cpp"
-                        | b"cxx"
-                        | b"c++"
-                        | b"CPP"
-                        | b"ixx"
-                        | b"cppm"
-                        | b"ccm"
-                        | b"cxxm"
-                        | b"c++m"
-                        | b"M"
-                        | b"m"
-                        | b"mm"
-                        | b"mpp"
-                ),
-                b"OBJC" => extension == b"m",
-                b"OBJCXX" => matches!(extension, b"M" | b"m" | b"mm"),
-                _ => false,
-            }
+            default_source_language(language, extension)
         })
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+fn source_language_peek<'a>(cx: &Cx<'_>, file: &Path, enabled: &'a [BString]) -> Option<&'a [u8]> {
+    let extension = file.extension()?.as_encoded_bytes();
+    enabled
+        .iter()
+        .rev()
+        .map(|language| language.as_slice())
+        .find(|language| {
+            let name = [b"CMAKE_".as_slice(), language, b"_SOURCE_FILE_EXTENSIONS"].concat();
+            if let Some(configured) = cx.peek_var(&name) {
+                return list::split(configured, list::Empty::Drop)
+                    .iter()
+                    .any(|item| item == extension);
+            }
+            default_source_language(language, extension)
+        })
+}
+
+fn default_source_language(language: &[u8], extension: &[u8]) -> bool {
+    match language {
+        b"C" => extension == b"c",
+        b"CXX" => matches!(
+            extension,
+            b"C" | b"cc"
+                | b"cpp"
+                | b"cxx"
+                | b"c++"
+                | b"CPP"
+                | b"ixx"
+                | b"cppm"
+                | b"ccm"
+                | b"cxxm"
+                | b"c++m"
+                | b"M"
+                | b"m"
+                | b"mm"
+                | b"mpp"
+        ),
+        b"OBJC" => extension == b"m",
+        b"OBJCXX" => matches!(extension, b"M" | b"m" | b"mm"),
+        _ => false,
+    }
 }
 
 fn escape_definition_list_item(value: &[u8]) -> BString {

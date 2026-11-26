@@ -43,6 +43,10 @@ fn claims_and_cleans_distinct_scratch_directories() -> HostResult<()> {
 struct TestCompiler;
 
 impl ProcessVerifier for TestCompiler {
+    fn confines_writes(&self, _request: &RunRequest) -> bool {
+        true
+    }
+
     fn preflight(&self, request: &RunRequest) -> Option<rcmake_store::Trace> {
         let [command] = request.pipeline.as_slice() else {
             return None;
