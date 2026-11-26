@@ -119,7 +119,7 @@ pub(crate) fn attach_profilers(
     let native = native.cloned();
     interp.set_command_profiler(Some(Arc::new(move |sample| {
         if let Some(legacy) = &legacy
-            && sample.kind != SampleKind::ListFile
+            && !matches!(sample.kind, SampleKind::ListFile | SampleKind::ProbePhase)
         {
             legacy.event(
                 sample.name,
@@ -142,6 +142,7 @@ pub(crate) fn attach_profilers(
                     SampleKind::Macro => ProfileKind::Macro,
                     SampleKind::ListFile => ProfileKind::ListFile,
                     SampleKind::Builtin => ProfileKind::Builtin,
+                    SampleKind::ProbePhase => ProfileKind::ProbePhase,
                 },
             });
         }
@@ -197,6 +198,8 @@ impl ProfilePhase {
 pub(crate) enum ProfileKind {
     /// A configuration or generation phase.
     Phase(ProfilePhase),
+    /// A phase of one configure probe.
+    ProbePhase,
     /// Evaluation of one list file.
     ListFile,
     /// A built-in command.
@@ -210,7 +213,7 @@ pub(crate) enum ProfileKind {
 impl ProfileKind {
     const fn category(self) -> &'static str {
         match self {
-            Self::Phase(_) => "phase",
+            Self::Phase(_) | Self::ProbePhase => "phase",
             Self::ListFile => "listfile",
             Self::Builtin => "builtin",
             Self::Function => "function",

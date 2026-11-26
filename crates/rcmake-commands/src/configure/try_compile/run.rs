@@ -12,6 +12,7 @@ mod apple;
 pub(super) mod cross;
 
 use super::args::Options;
+use super::child::ProbeProfile;
 use super::seed::toolchain_variable;
 use super::{TIMEOUT, absolute, set_result};
 
@@ -26,7 +27,9 @@ pub(super) fn build_child(
     target: Option<&[u8]>,
     source_signature: bool,
     generator_facts: Option<std::sync::Arc<dyn rcmake_resolve::GeneratorFacts>>,
+    profile: Option<&ProbeProfile>,
 ) -> Result<(BuildOutcome, Option<PathBuf>, BString), ChildError> {
+    let resolve_start = profile.map(ProbeProfile::now);
     let config = ConfigId(child.var_or_empty(b"CMAKE_BUILD_TYPE"));
     let mut model = child.project().clone();
     // Lowering reads toolchain variables from the directory model or cache.
@@ -74,9 +77,19 @@ pub(super) fn build_child(
         ..BuildOptions::default()
     };
     let header = build_log_header(child, directory, target, source_signature);
-    let outcome = rcmake_build::execute(&graph, child.host(), &options)
-        .map_err(|error| ChildError::Build(error.to_string()))?;
-    Ok((outcome, artifact, header))
+    if let (Some(profile), Some(start)) = (profile, resolve_start) {
+        profile.span(b"probe.resolve", start);
+    }
+    let build_start = profile.map(ProbeProfile::now);
+    let outcome = rcmake_build::execute(&graph, child.host(), &options);
+    if let (Some(profile), Some(start)) = (profile, build_start) {
+        profile.span(b"probe.build", start);
+    }
+    Ok((
+        outcome.map_err(|error| ChildError::Build(error.to_string()))?,
+        artifact,
+        header,
+    ))
 }
 
 fn build_log_header(

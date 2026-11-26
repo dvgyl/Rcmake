@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::Interp;
+use crate::{Cx, Interp};
 
 /// The kind of execution that produced a timing sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +18,8 @@ pub enum SampleKind {
     Macro,
     /// Listfile execution.
     ListFile,
+    /// A phase of the configure probe.
+    ProbePhase,
 }
 
 /// Timing and source information for completed execution.
@@ -40,6 +42,14 @@ pub struct CommandSample<'a> {
 
 /// Callback for a completed execution frame.
 pub type CommandProfiler = dyn Fn(&CommandSample<'_>) + Send + Sync;
+
+impl Cx<'_> {
+    /// Get the timing callback for the current interpreter.
+    #[must_use]
+    pub fn command_profiler(&self) -> Option<&Arc<CommandProfiler>> {
+        self.interp.command_profiler.as_ref()
+    }
+}
 
 impl Interp {
     /// Set the callback for completed command executions.

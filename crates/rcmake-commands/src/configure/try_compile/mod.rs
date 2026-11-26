@@ -11,6 +11,7 @@ use rcmake_host::{CopyOptions, Host, HostError, Input, Output, RunRequest, path}
 use rcmake_model::{CacheEntry, CacheType};
 
 use args::{Options, Signature, parse};
+pub(crate) use child::finish_probe_prelude;
 use child::{ChildBuild, ChildConfig};
 use log::log_probe;
 use project::write_project;

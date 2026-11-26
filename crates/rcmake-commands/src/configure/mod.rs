@@ -27,6 +27,7 @@ mod tests;
 mod try_compile;
 
 pub(crate) use enable_language::enable_languages;
+pub(crate) use try_compile::finish_probe_prelude;
 
 pub(crate) fn register(registry: &mut Registry) {
     let project_only = CmdFlags { scriptable: false };

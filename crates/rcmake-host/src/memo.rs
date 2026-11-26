@@ -74,6 +74,7 @@ pub struct MemoHost<H: Host + ?Sized> {
     hits: AtomicU64,
     misses: AtomicU64,
     invalidations: AtomicU64,
+    measure: bool,
 }
 
 impl<H: Host> MemoHost<H> {
@@ -88,12 +89,16 @@ impl<H: Host + ?Sized> MemoHost<H> {
     /// Wrap a shared host, including a shared trait object, with an empty cache.
     #[must_use]
     pub fn from_shared(base: Arc<H>) -> Self {
+        let measure = base
+            .env_get(b"RCMAKE_MEASURE_MEMO")
+            .is_some_and(|value| value == "1");
         Self {
             base,
             cache: RwLock::default(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             invalidations: AtomicU64::new(0),
+            measure,
         }
     }
 
@@ -237,6 +242,23 @@ impl<H: Host + ?Sized> MemoHost<H> {
             }
         }
         None
+    }
+}
+
+impl<H: Host + ?Sized> Drop for MemoHost<H> {
+    fn drop(&mut self) {
+        if self.measure {
+            let MemoStats {
+                hits,
+                misses,
+                invalidations,
+            } = self.stats();
+            self.base.write_out(
+                Stream::Stderr,
+                format!("RCMAKE_MEASURE_MEMO hits={hits} misses={misses} invalidations={invalidations}\n")
+                    .as_bytes(),
+            );
+        }
     }
 }
 

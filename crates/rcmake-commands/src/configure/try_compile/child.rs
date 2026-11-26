@@ -1,9 +1,13 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use rcmake_base::BString;
 use rcmake_build::BuildOutcome;
-use rcmake_eval::{Cx, Interp, InterpConfig, RunMode, Services, TraceConfig};
+use rcmake_eval::{
+    CommandProfiler, CommandSample, Cx, Interp, InterpConfig, RunMode, SampleKind, Services,
+    TraceConfig,
+};
 use rcmake_host::{Host, WriteMode, path};
 use rcmake_model::{DirId, GeneratorKind, GeneratorSpec, Target};
 
@@ -20,6 +24,7 @@ pub(super) struct ChildConfig {
     enabled_languages: BString,
     depth: u32,
     trace: Option<TraceConfig>,
+    profile: Option<Arc<CommandProfiler>>,
 }
 
 impl ChildConfig {
@@ -41,6 +46,7 @@ impl ChildConfig {
         };
         let depth = cx.recursion_depth();
         let trace = cx.trace_config().cloned();
+        let profile = cx.command_profiler().cloned();
         let project = cx.project();
         Self {
             config,
@@ -49,6 +55,7 @@ impl ChildConfig {
             enabled_languages: seed.enabled_languages,
             depth,
             trace,
+            profile,
         }
     }
 
@@ -99,11 +106,24 @@ impl ChildConfig {
         let mut failure = None;
         let mut max_start_depth = u32::MAX;
         let (built, stdout, diagnostics) = CapturingHost::capture(host, &dirs.binary, |host| {
+            let profile = self.profile.map(|record| {
+                let host: Arc<dyn Host> = host.clone();
+                Arc::new(ProbeProfile {
+                    host,
+                    depth: self.depth.saturating_add(1),
+                    record,
+                    prelude_end: OnceLock::new(),
+                })
+            });
+            let configure_start = profile.as_deref().map(ProbeProfile::now);
             let mut config = self.config;
             config.cwd = dirs.binary.clone();
             config.host = host.clone();
             let mut child = Interp::new(config, crate::register_all);
             initialize(&mut child);
+            if let Some(profile) = &profile {
+                child.add_session_data(profile.clone());
+            }
             child.set_project_injection(!source_signature);
             child.inherit_recursion_depth(self.depth);
             if let Some(mut trace) = self.trace {
@@ -143,6 +163,12 @@ impl ChildConfig {
                 )
                 .map_err(|error| ChildError::Build(error.to_string()))?;
             }
+            if let (Some(profile), Some(start)) = (&profile, configure_start) {
+                let end = profile.now();
+                let prelude_end = profile.prelude_end.get().copied().unwrap_or(end);
+                profile.record(b"probe.prelude", start, prelude_end);
+                profile.record(b"probe.body", prelude_end, end);
+            }
             if configure.exit_code != 0 {
                 recursion_exceeded = child.recursion_exceeded();
                 failure = Some("Failed to configure test project build system.");
@@ -161,6 +187,7 @@ impl ChildConfig {
                 target,
                 source_signature,
                 generator_facts,
+                profile.as_deref(),
             )
         });
         let (outcome, artifact, header) = match built {
@@ -202,6 +229,43 @@ impl ChildConfig {
             },
             recursion_exceeded,
         )
+    }
+}
+
+pub(crate) fn finish_probe_prelude(cx: &Cx<'_>) {
+    if cx.current_dir_id() == DirId::ROOT
+        && let Some(profile) = cx.session_data::<Arc<ProbeProfile>>()
+    {
+        profile.prelude_end.get_or_init(|| profile.now());
+    }
+}
+
+pub(super) struct ProbeProfile {
+    host: Arc<dyn Host>,
+    depth: u32,
+    record: Arc<CommandProfiler>,
+    prelude_end: OnceLock<Duration>,
+}
+
+impl ProbeProfile {
+    pub(super) fn now(&self) -> Duration {
+        self.host.monotonic()
+    }
+
+    fn record(&self, name: &[u8], start: Duration, end: Duration) {
+        (self.record)(&CommandSample {
+            name,
+            file: b"",
+            line: 0,
+            depth: self.depth,
+            start,
+            elapsed: end.saturating_sub(start),
+            kind: SampleKind::ProbePhase,
+        });
+    }
+
+    pub(super) fn span(&self, name: &[u8], start: Duration) {
+        self.record(name, start, self.now());
     }
 }
 

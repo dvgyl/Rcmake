@@ -18,6 +18,12 @@ const METADATA: [&str; 5] = [
 ];
 
 pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
+    let result = configure_project(cx, args);
+    crate::configure::finish_probe_prelude(cx);
+    result
+}
+
+fn configure_project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);
     let Some((name, tail)) = args.split_first() else {
         return Err(CmdError::status(
