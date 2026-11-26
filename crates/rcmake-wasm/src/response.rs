@@ -6,21 +6,21 @@ use rcmake_base::{list, truth};
 use rcmake_diag::{Diagnostic, Location, MessageKind, SourceMap};
 use rcmake_gen_common::{compile_commands, write_if_changed};
 use rcmake_host::{FileKind, Host, ReadRange, Stream, path, pure::IoEvent};
+use rcmake_json::{ToJson, Value};
 use rcmake_model::{DirId, GeneratorKind, Target, UsageField};
 use rcmake_resolve::ChainKind;
-use serde_json::{Value, json};
 
 use crate::{display_source, project::Evaluated, text};
 
 pub(super) fn failure(category: &str, message: &str) -> Value {
-    let diagnostics = vec![json!({
-        "severity": "error",
-        "category": category,
-        "file": "CMakeLists.txt",
-        "line": 1,
-        "column": 1,
-        "message": message,
-    })];
+    let diagnostics = vec![Value::object_from([
+        ("severity", Value::string("error")),
+        ("category", Value::string(category)),
+        ("file", Value::string("CMakeLists.txt")),
+        ("line", Value::UInt(1)),
+        ("column", Value::UInt(1)),
+        ("message", Value::string(message)),
+    ])];
     reply(
         false,
         diagnostics,
@@ -37,7 +37,13 @@ fn reply(
     files: BTreeMap<String, String>,
     symbols: BTreeSet<String>,
 ) -> Value {
-    json!({ "ok": ok, "diagnostics": diagnostics, "targets": targets, "files": files, "explainSymbols": symbols })
+    Value::object_from([
+        ("ok", Value::Bool(ok)),
+        ("diagnostics", Value::Array(diagnostics)),
+        ("targets", Value::Array(targets)),
+        ("files", files.to_json()),
+        ("explainSymbols", symbols.to_json()),
+    ])
 }
 
 pub(super) fn api_error(error: &ApiError, events: &[IoEvent]) -> Value {
@@ -65,10 +71,16 @@ pub(super) fn api_error(error: &ApiError, events: &[IoEvent]) -> Value {
                 .filter(|event| event.stream == Stream::Stderr)
                 .filter_map(|event| {
                     let message = text(&event.bytes);
-                    message.starts_with("CMake Error").then(|| json!({
-                    "severity": "error", "category": "GENERATE", "message": message.trim_end(),
-                    "file": "", "line": 0, "column": 0
-                }))
+                    message.starts_with("CMake Error").then(|| {
+                        Value::object_from([
+                            ("severity", Value::string("error")),
+                            ("category", Value::string("GENERATE")),
+                            ("message", Value::string(message.trim_end())),
+                            ("file", Value::string("")),
+                            ("line", Value::UInt(0)),
+                            ("column", Value::UInt(0)),
+                        ])
+                    })
                 }),
         );
     }
@@ -112,14 +124,20 @@ fn diagnostic(diagnostic: &Diagnostic, sources: Option<&SourceMap>) -> Value {
                 |site| (display_source(&site.path), site.line, 1),
             ),
         });
-    json!({
-        "severity": severity,
-        "category": diagnostic.category.map(|category| category.as_str()),
-        "file": file,
-        "line": line,
-        "column": column,
-        "message": text(&diagnostic.body),
-    })
+    Value::object_from([
+        ("severity", Value::string(severity)),
+        (
+            "category",
+            diagnostic
+                .category
+                .map(|category| category.as_str())
+                .to_json(),
+        ),
+        ("file", Value::string(file)),
+        ("line", line.to_json()),
+        ("column", column.to_json()),
+        ("message", Value::string(text(&diagnostic.body))),
+    ])
 }
 
 pub(super) fn configure(project: &Evaluated) -> Value {
@@ -133,15 +151,21 @@ pub(super) fn configure(project: &Evaluated) -> Value {
     let files = match generate(project) {
         Ok(files) => files,
         Err(message) => {
-            diagnostics.push(json!({
-                "severity": "error", "category": "GENERATE", "file": "", "line": 0, "column": 0,
-                "message": message,
-            }));
+            diagnostics.push(Value::object_from([
+                ("severity", Value::string("error")),
+                ("category", Value::string("GENERATE")),
+                ("file", Value::string("")),
+                ("line", Value::UInt(0)),
+                ("column", Value::UInt(0)),
+                ("message", Value::string(message)),
+            ]));
             BTreeMap::new()
         }
     };
     let ok = files.contains_key("build.ninja")
-        && !diagnostics.iter().any(|diag| diag["severity"] == "error");
+        && !diagnostics
+            .iter()
+            .any(|diag| diag.get("severity").and_then(Value::as_str) == Some("error"));
     let mut targets = Vec::new();
     let mut symbols = BTreeSet::new();
     let config = result.generation.as_ref().and_then(|generation| {
@@ -257,17 +281,41 @@ fn target_json(
         .flatten()
         .flat_map(|item| list_text(&item.text.value, false))
         .collect::<Vec<_>>();
-    json!({
-        "name": text(name),
-        "kind": kind,
-        "definedAt": site.map(|site| format!("{}:{}", display_source(&site.path), site.line)),
-        "sources": source_values,
-        "compileFeatures": usage(Field::CompileFeatures, Field::InterfaceCompileFeatures),
-        "compileDefinitions": usage(Field::CompileDefinitions, Field::InterfaceCompileDefinitions),
-        "compileOptions": usage(Field::CompileOptions, Field::InterfaceCompileOptions),
-        "includeDirectories": usage(Field::IncludeDirectories, Field::InterfaceIncludeDirectories),
-        "linkLibraries": links,
-    })
+    Value::object_from([
+        ("name", Value::string(text(name))),
+        ("kind", Value::string(kind)),
+        (
+            "definedAt",
+            site.map(|site| format!("{}:{}", display_source(&site.path), site.line))
+                .to_json(),
+        ),
+        ("sources", source_values.to_json()),
+        (
+            "compileFeatures",
+            usage(Field::CompileFeatures, Field::InterfaceCompileFeatures).to_json(),
+        ),
+        (
+            "compileDefinitions",
+            usage(
+                Field::CompileDefinitions,
+                Field::InterfaceCompileDefinitions,
+            )
+            .to_json(),
+        ),
+        (
+            "compileOptions",
+            usage(Field::CompileOptions, Field::InterfaceCompileOptions).to_json(),
+        ),
+        (
+            "includeDirectories",
+            usage(
+                Field::IncludeDirectories,
+                Field::InterfaceIncludeDirectories,
+            )
+            .to_json(),
+        ),
+        ("linkLibraries", links.to_json()),
+    ])
 }
 
 fn list_text(value: &[u8], source_relative: bool) -> impl Iterator<Item = String> {

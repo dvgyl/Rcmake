@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use rcmake_api::{ApiError, CacheDefine, ConfigureRequest, ConfigureResult, run_configure};
 use rcmake_host::{Host, PureHost, Stream, path};
+use rcmake_json::Value;
 use rcmake_model::{CacheType, GeneratorKind};
 use rcmake_presets::{EnvSnapshot, PresetKind, PresetSettings};
-use serde_json::Value;
 
 use crate::{response, strings};
 
@@ -34,7 +34,7 @@ pub(super) struct Evaluated {
 
 impl<'a> Project<'a> {
     pub(super) fn from_json(request: &'a Value) -> Result<Self, Value> {
-        let files = strings(&request["files"], "files")?;
+        let files = strings(request.get("files").unwrap_or(&Value::Null), "files")?;
         for file in files.keys() {
             if file.is_empty()
                 || file.bytes().any(|byte| matches!(byte, b'\\' | 0))
@@ -55,11 +55,15 @@ impl<'a> Project<'a> {
                 .map(|value| strings(value, "defines"))
                 .transpose()?
                 .unwrap_or_default(),
-            generator: request["generator"]
-                .as_str()
+            generator: request
+                .get("generator")
+                .and_then(Value::as_str)
                 .filter(|value| !value.is_empty()),
-            build_type: request["buildType"].as_str(),
-            preset: request["preset"].as_str().filter(|value| !value.is_empty()),
+            build_type: request.get("buildType").and_then(Value::as_str),
+            preset: request
+                .get("preset")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty()),
         })
     }
 

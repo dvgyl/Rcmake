@@ -5,10 +5,15 @@
 use std::io::{self, Read, Write};
 
 use rcmake_api::{ExplainQuery, ExplainReport, render_explain_json};
-use serde_json::Value;
+use rcmake_json::{ReadOptions, Value, parse, write_compact};
 
 mod project;
 mod response;
+
+const REQUEST_OPTIONS: ReadOptions = ReadOptions {
+    allow_comments: false,
+    dup_keys_last_wins: true,
+};
 
 fn main() -> io::Result<()> {
     let mut input = Vec::new();
@@ -17,20 +22,20 @@ fn main() -> io::Result<()> {
 }
 
 fn dispatch(input: &[u8]) -> Vec<u8> {
-    let request: Value = match serde_json::from_slice(input) {
+    let request = match parse(input, &REQUEST_OPTIONS) {
         Ok(request) => request,
         Err(error) => {
-            return response::failure("INPUT", &error.to_string())
-                .to_string()
-                .into_bytes();
+            return write_compact(&response::failure("INPUT", &error.to_string())).into();
         }
     };
     let field = |name| request.get(name).and_then(Value::as_str);
     let operation = field("op");
     if !matches!(operation, Some("configure" | "explain")) {
-        return response::failure("INPUT", "Specify the configure or explain operation.")
-            .to_string()
-            .into_bytes();
+        return write_compact(&response::failure(
+            "INPUT",
+            "Specify the configure or explain operation.",
+        ))
+        .into();
     }
     let project = project::Project::from_json(&request).and_then(|project| project.evaluate());
     if operation == Some("explain") {
@@ -49,7 +54,7 @@ fn dispatch(input: &[u8]) -> Vec<u8> {
         Ok(project) => response::configure(&project),
         Err(error) => error,
     };
-    output.to_string().into_bytes()
+    write_compact(&output).into()
 }
 
 fn strings(
@@ -67,9 +72,10 @@ fn strings(
         .ok_or_else(invalid)?
         .iter()
         .map(|(key, value)| {
+            let key = std::str::from_utf8(key.as_slice()).map_err(|_| invalid())?;
             value
                 .as_str()
-                .map(|value| (key.clone(), value.to_owned()))
+                .map(|value| (key.to_owned(), value.to_owned()))
                 .ok_or_else(invalid)
         })
         .collect()

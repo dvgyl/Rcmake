@@ -974,10 +974,10 @@ dependencies = [
  "rcmake-gen-common",
  "rcmake-gen-ninja",
  "rcmake-host",
+ "rcmake-json",
  "rcmake-model",
  "rcmake-presets",
  "rcmake-resolve",
- "serde_json",
 ]
 
 [[package]]

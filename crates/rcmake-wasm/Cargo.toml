@@ -15,10 +15,10 @@ rcmake-diag.workspace = true
 rcmake-gen-common.workspace = true
 rcmake-gen-ninja.workspace = true
 rcmake-host.workspace = true
+rcmake-json.workspace = true
 rcmake-model.workspace = true
 rcmake-presets.workspace = true
 rcmake-resolve.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true
