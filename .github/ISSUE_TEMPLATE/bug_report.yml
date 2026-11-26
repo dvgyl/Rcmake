@@ -7,7 +7,7 @@ body:
       value: |
         Do not report security problems here. Follow SECURITY.md to report them privately.
 
-        A short `CMakeLists.txt` and the output of both tools let a maintainer reproduce the problem.
+        Include a short `CMakeLists.txt` and the output from both tools so a maintainer can reproduce the problem.
   - type: textarea
     id: summary
     attributes:
@@ -19,7 +19,7 @@ body:
     id: version
     attributes:
       label: rcmake version
-      description: Paste the output of `rcmake --version`, or give the commit SHA of your build.
+      description: Paste the output of `rcmake --version`, or include the commit SHA of your build.
       render: text
     validations:
       required: true
@@ -28,11 +28,11 @@ body:
     attributes:
       label: Operating system
       options:
-        - macOS (Apple silicon)
-        - macOS (Intel)
-        - Linux (x86_64)
-        - Linux (aarch64)
-        - Windows (x86_64)
+        - macOS Apple silicon
+        - macOS Intel
+        - Linux x86_64
+        - Linux aarch64
+        - Windows x86_64
         - Other
     validations:
       required: true
@@ -42,9 +42,9 @@ body:
       label: How did you run it?
       description: The executable name selects the mode.
       options:
-        - As cmake, ctest, or cpack (compatibility mode)
-        - As rcmake (native mode)
-        - Through rcmake-lsp (editor)
+        - As cmake, ctest, or cpack in compatibility mode
+        - As rcmake in native mode
+        - Through rcmake-lsp in an editor
         - In the browser playground
     validations:
       required: true
@@ -57,7 +57,7 @@ body:
     id: reproducer
     attributes:
       label: Minimal CMakeLists.txt
-      description: The smallest project that shows the problem. Add other files if they are necessary.
+      description: Paste the smallest project that reproduces the problem. Add extra files if needed.
       render: cmake
     validations:
       required: true
@@ -65,7 +65,7 @@ body:
     id: command
     attributes:
       label: Command
-      description: The exact command that you ran.
+      description: Paste the exact command you ran.
       placeholder: cmake -S . -B build -G Ninja
       render: sh
     validations:
@@ -74,13 +74,13 @@ body:
     id: cmake-output
     attributes:
       label: CMake 4.5.1 output
-      description: The output and exit code of the same command with the official CMake 4.5.1 binary. Leave empty for a crash that does not depend on CMake behavior.
+      description: Paste the output and exit code from running the same command with official CMake 4.5.1. Leave this empty for a crash that does not depend on CMake behavior.
       render: text
   - type: textarea
     id: rcmake-output
     attributes:
       label: rcmake output
-      description: The output and exit code from rcmake.
+      description: Paste the output and exit code from rcmake.
       render: text
     validations:
       required: true

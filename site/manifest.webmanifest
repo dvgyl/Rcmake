@@ -1,7 +1,7 @@
 {
   "name": "rcmake",
   "short_name": "rcmake",
-  "description": "Drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, and cpack.",
+  "description": "Independent drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, cpack, and rcmake-lsp.",
   "start_url": "./",
   "scope": "./",
   "display": "browser",

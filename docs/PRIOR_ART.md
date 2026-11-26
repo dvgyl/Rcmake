@@ -1,6 +1,6 @@
 # Prior art and dependency licence log
 
-The crate versions and licence expressions come from the locked Cargo graph.
+The crate versions and licence expressions below come from the locked Cargo graph.
 
 ## Vendored third-party assets
 
@@ -17,7 +17,7 @@ The [third-party notices](../THIRD_PARTY_NOTICES.md#1-cmake-451-modules-template
 
 ## Direct third-party dependencies
 
-The licence expression lists the upstream terms. When the expression offers a choice, `rcmake` uses an option on the scanner's allowlist. The [third-party notices](../THIRD_PARTY_NOTICES.md) have the full licence texts.
+Each licence expression records the upstream terms. When an expression offers a choice, `rcmake` uses an option on the scanner's allowlist. The [third-party notices](../THIRD_PARTY_NOTICES.md) contain the full licence texts.
 
 | Crate | Locked version | SPDX licence | Purpose |
 | --- | --- | --- | --- |
@@ -25,7 +25,7 @@ The licence expression lists the upstream terms. When the expression offers a ch
 | `bzip2` | `0.6.1` | `MIT OR Apache-2.0` | Read and write bzip2 streams with the Rust `libbz2-rs-sys` backend. |
 | `flate2` | `1.1.11` | `MIT OR Apache-2.0` | Read and write gzip streams with the Rust `miniz_oxide` backend. |
 | `indexmap` | `2.14.2` | `Apache-2.0 OR MIT` | Keep map entries in insertion order. |
-| `jiff` | `0.2.46` | `Unlicense OR MIT` | Read the local time zone and format timestamps. Use the system zone database where available. |
+| `jiff` | `0.2.46` | `Unlicense OR MIT` | Read the local time zone and format timestamps, using the system zone database where available. |
 | `liblzma` | `0.4.9` | `MIT OR Apache-2.0` | Read and write xz streams with the bundled `liblzma` library. |
 | `md-5` | `0.10.6` | `MIT OR Apache-2.0` | Calculate MD5 hashes and generate stable Visual Studio identifiers. |
 | `memchr` | `2.8.3` | `Unlicense OR MIT` | Find bytes for list parsing and other byte operations. |
@@ -36,13 +36,13 @@ The licence expression lists the upstream terms. When the expression offers a ch
 | `sha2` | `0.10.9` | `MIT OR Apache-2.0` | Calculate SHA-2 hashes and generate stable Xcode identifiers. |
 | `sha3` | `0.10.9` | `MIT OR Apache-2.0` | Calculate SHA-3 hashes for CMake commands. |
 | `similar` | `2.7.0` | `Apache-2.0` | Show text differences when test harness output differs from CMake output. |
-| `tar` | `0.4.46` | `MIT OR Apache-2.0` | Read and write tar archives. The default extended-attribute feature is disabled. |
+| `tar` | `0.4.46` | `MIT OR Apache-2.0` | Read and write tar archives with the default extended-attribute feature disabled. |
 | `tempfile` | `3.27.0` | `MIT OR Apache-2.0` | Create isolated temporary directories for the test harness. |
 | `thiserror` | `2.0.21` | `MIT OR Apache-2.0` | Derive Rust error implementations for structured error types. |
 | `zip` | `2.6.1` | `MIT` | Read and write ZIP archives with the `flate2` Deflate backend. |
 | `zstd` | `0.14.4` | `BSD-3-Clause` | Read and write Zstandard streams with the bundled Zstandard library. |
 
-The archive feature selection removes `zopfli`, `bumpalo`, and `xattr` from the lockfile. The lockfile still lists `log` for optional Jiff features. The macOS ARM64 build does not use it. On AArch64 targets that use an ABI other than MSVC, `sha2` enables `sha2-asm` (version 0.6.4, `MIT OR Apache-2.0`). This backend uses the ARMv8 SHA-2 instructions when the processor supports them.
+The archive feature selection removes `zopfli`, `bumpalo`, and `xattr` from the lockfile. The lockfile still lists `log` for optional Jiff features, though the macOS ARM64 build does not use it. On AArch64 targets that use an ABI other than MSVC, `sha2` enables `sha2-asm` (version 0.6.4, `MIT OR Apache-2.0`), which uses ARMv8 SHA-2 instructions when the processor supports them.
 
 ## Archive codec dependencies
 
@@ -57,13 +57,13 @@ The archive feature selection removes `zopfli`, `bumpalo`, and `xattr` from the 
 
 ## Internal workspace dependencies
 
-The path dependencies in `[workspace.dependencies]` of the root `Cargo.toml` are `rcmake` crates. Each uses `MIT OR Apache-2.0`. The leaf crates `rcmake-cli`, `rcmake-harness`, `rcmake-fuzz`, and `rcmake-wasm` are workspace members but not dependencies, so this table omits them.
+The path dependencies in `[workspace.dependencies]` of the root `Cargo.toml` are `rcmake` crates, and each uses `MIT OR Apache-2.0`. The leaf crates `rcmake-cli`, `rcmake-harness`, `rcmake-fuzz`, and `rcmake-wasm` are workspace members rather than shared dependencies, so this table omits them.
 
 | Crate | Purpose |
 | --- | --- |
 | `rcmake-api` | Run configure in process and answer workspace, provenance, and `explain` queries. |
 | `rcmake-archive` | Create, list, and extract archives. |
-| `rcmake-base` | Provide shared primitives for strings, lists, versions, hashes, and resource limits. |
+| `rcmake-base` | Provide shared types and helpers for strings, lists, versions, hashes, and resource limits. |
 | `rcmake-build` | Run build graphs in process for compiler probes and build fallbacks. |
 | `rcmake-commands` | Implement built-in CMake commands. |
 | `rcmake-cpack` | Generate archives and macOS packages. |
@@ -99,9 +99,9 @@ The path dependencies in `[workspace.dependencies]` of the root `Cargo.toml` are
 | --- | --- | --- |
 | `winapi-util` | Unlicense or MIT | Read a file identity and the computer name through safe Windows APIs. |
 | `winreg` | MIT | Read the Windows release and build number from the registry. |
-| `process-wrap` | Apache-2.0 or MIT | Assign a suspended child to a Windows job object before it starts. Terminate the job when the process pipeline reaches its deadline. |
+| `process-wrap` | Apache-2.0 or MIT | Assign a suspended child to a Windows job object before it starts, and terminate the job when the process pipeline reaches its deadline. |
 | `sevenz-rust2` | Apache-2.0 | Read 7-Zip headers and encode or decode the standard compression methods. |
 | `ppmd-turbo` | Apache-2.0 | Encode and decode PPMd blocks within 7-Zip archives. |
-| `crc32fast` | MIT or Apache-2.0 | Calculate the CRC-32 checksums in 7-Zip PPMd archives. This crate was already in the dependency graph. |
+| `crc32fast` | MIT or Apache-2.0 | Calculate CRC-32 checksums in 7-Zip PPMd archives. Other archive crates already pull this crate into the graph. |
 
 See the [7-Zip format specification](https://github.com/ip7z/7zip/blob/main/DOC/7zFormat.txt) for the PPMd container headers.

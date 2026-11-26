@@ -425,6 +425,11 @@ if ($Uninstall) {
         Stop-Install 'Use -Uninstall alone (optionally with -Prefix).'
     }
 
+    Assert-DirectoryAncestors -TargetPath $rcmakePath -PrefixRoot $prefixFull
+    Assert-DirectoryAncestors -TargetPath $dataDir -PrefixRoot $prefixFull
+    Assert-DirectoryAncestors -TargetPath $docDir -PrefixRoot $prefixFull
+    Assert-DirectoryAncestors -TargetPath $completionPath -PrefixRoot $prefixFull
+
     $removed = @()
     $rcmakeHash = Get-FileSha256OrNull -Path $rcmakePath
     foreach ($tool in $tools) {
@@ -582,7 +587,7 @@ if ($AliasCmake) {
 }
 
 $target = 'x86_64-pc-windows-msvc'
-$releases = 'https://github.com/dvgyl/rcmake/releases'
+$releases = 'https://github.com/rcmake/rcmake/releases'
 $versionPattern = '^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$'
 
 if (-not $Archive -and $Version -ne 'latest') {
@@ -633,19 +638,13 @@ try {
             $tag = "v$cleanVersion"
             $archiveName = "rcmake-$cleanVersion-$target.zip"
             $archiveUrl = "$releases/download/$tag/$archiveName"
-            $sidecarUrl = "$archiveUrl.sha256"
             $sumsUrl = "$releases/download/$tag/SHA256SUMS.txt"
-            $checksumPath = Join-Path $downloadWork "$archiveName.sha256"
+            $checksumPath = Join-Path $downloadWork 'SHA256SUMS.txt'
             Write-Host "Download release checksums for $tag."
             try {
-                Invoke-Download -Uri $sidecarUrl -Destination $checksumPath
+                Invoke-Download -Uri $sumsUrl -Destination $checksumPath
             } catch {
-                $checksumPath = Join-Path $downloadWork 'SHA256SUMS.txt'
-                try {
-                    Invoke-Download -Uri $sumsUrl -Destination $checksumPath
-                } catch {
-                    Stop-Install "Could not download $sidecarUrl or $sumsUrl ($($_.Exception.Message)). If no release is published yet, clone the repository and build from source with scripts/stage.sh (or scripts/install.sh --from-source on Linux or macOS)."
-                }
+                Stop-Install "Could not download $sumsUrl ($($_.Exception.Message)). If no release is published yet, clone the repository and build from source with scripts/stage.sh (or scripts/install.sh --from-source on Linux or macOS)."
             }
         }
 

@@ -61,23 +61,23 @@ rcmake \- native Rust CMake 4.5.1 compatible build system driver
 .RI [ options ]
 .SH DESCRIPTION
 .B rcmake
-is a from-scratch replacement for CMake 4.5.1 written in safe Rust.
-A single multi-call binary implements
+is a native replacement for CMake 4.5.1 written from scratch in safe Rust.
+One multi-call binary provides
 .BR cmake ,
 .BR ctest ,
 .BR cpack ,
-and the Language Server Protocol (LSP) server (invoked via the
+and the Language Server Protocol server, which starts through the
 .B rcmake-lsp
-symlink or
-.BR "rcmake lsp" ),
-reading the same
+symlink or as
+.BR "rcmake lsp" .
+It reads the same
 .IR CMakeLists.txt ,
 presets, and
 .I CMakeCache.txt
-files as CMake 4.5.1 and writing compatible build trees.
+files as CMake 4.5.1 and writes compatible build trees.
 .SS Execution modes
-The executable selects its command-line surface from
-.BR argv[0] :
+The executable selects its command-line mode from
+.BR argv[0] .
 .TP
 .B Native mode (\fBrcmake\fP)
 Enables the persistent compiler probe cache, incremental configure replay,
@@ -88,28 +88,30 @@ and FetchContent lockfile enforcement.
 .TP
 .B Compatibility mode (\fBcmake\fP, \fBctest\fP, \fBcpack\fP)
 Matches CMake 4.5.1 command-line flags, diagnostic formatting, and exit codes.
-Native extension flags are rejected as unknown options in compatibility mode.
+Compatibility mode rejects native extension flags as unknown options.
 Setting
 .B RCMAKE_ORACLE_MODE=1
 forces compatibility mode even when invoked as
 .BR rcmake .
 .SH NATIVE EXTENSIONS
-These subcommands and flags are accepted only in native
+These subcommands and flags work only in native
 .B rcmake
-mode (rejected in compatibility mode).
+mode, and compatibility mode rejects them.
 Configure-only flags such as
 .BR \-\-profile ,
 .BR \-\-hermetic ,
 .BR \-\-fetch-lock ,
 and
 .B \-\-no-probe-cache
-apply during project configure, while
+apply during project configure.
+The
 .B \-\-diagnostics=cmake|rich
-(and default TTY rich errors) also apply in native
+flag and default terminal rich errors also apply in native
 .B rcmake \-P
-script mode; compatibility
+script mode.
+Compatibility
 .B cmake \-P
-always stays in CMake diagnostic format.
+always uses CMake diagnostic format.
 .SS Explain subcommand
 .TP
 .BI "rcmake explain " name
@@ -140,23 +142,25 @@ and
 .BR \-\-filter .
 .TP
 .BI \-\-config " cfg"
-Select a target build configuration (for example
+Select a target build configuration such as
 .B Debug
 or
-.BR Release ).
+.BR Release .
 Implies
 .BR \-\-target .
 .TP
 .BI \-\-filter " val"
-Select a matching target value or compiler flag (for example
-.BR \-O2
+Select a matching target value or compiler flag such as
+.B \-O2
 or
-.BR \-DFOO=1 ).
+.BR \-DFOO=1 .
 Implies
 .BR \-\-target .
 .TP
 .B \-\-json
-Emit one JSON report (`rcmake-explain-v1`) to standard output.
+Emit one JSON report in the
+.B rcmake-explain-v1
+format to standard output.
 .TP
 .B \-\-verbose
 Show full values and call stacks in terminal output.
@@ -178,7 +182,7 @@ argument.
 .BR \-\-diagnostics=cmake | rich
 Select diagnostic formatting.
 .B cmake
-matches upstream CMake 4.5.1 text.
+matches upstream CMake 4.5.1 text, while
 .B rich
 renders source excerpts, spans, and suggested fixes.
 When omitted in native mode,
@@ -187,7 +191,7 @@ checks
 .B RCMAKE_DIAGNOSTICS
 and otherwise selects
 .B rich
-when standard error is a terminal and
+when standard error goes to a terminal and
 .B cmake
 when standard error is redirected.
 Compatibility mode always uses
@@ -211,10 +215,10 @@ inside the build directory.
 Audit undeclared configure inputs including environment variables, files outside
 the source, build, and tool roots, subprocesses, and network access.
 .B warn
-(the default when no value is given) reports violations and continues.
+is the default when no value is given, reporting violations and continuing.
 .B strict
 rejects undeclared inputs with a non-zero exit status.
-Allowlists are configured via
+Configure allowlists with
 .BR RCMAKE_HERMETIC_ALLOW_ENV ,
 .BR RCMAKE_HERMETIC_ALLOW_PATHS ,
 and
@@ -225,7 +229,7 @@ Control FetchContent lockfile verification and pinned source reuse.
 .B off
 disables lockfile checks.
 .B auto
-(default) verifies against an existing lockfile when present.
+is the default and verifies against an existing lockfile when present.
 .B update
 records resolved archive and Git pins into the lockfile.
 .B frozen
@@ -248,7 +252,7 @@ Explicitly specify the source directory.
 Explicitly specify the build directory.
 .TP
 .BI \-C " initial-cache"
-Pre-load a script to populate the cache before configuring.
+Preload a script to populate the cache before configuring.
 .TP
 .BI \-D " var" "[:" type "]=" value
 Create or update a CMake cache entry.
@@ -263,11 +267,11 @@ Supported generators are
 .BR Ninja ,
 .BR "Ninja Multi-Config" ,
 .B Xcode
-(on macOS),
+on macOS,
 .B "Visual Studio 17 2022"
-(on Windows), and
+on Windows, and
 .B "Visual Studio 18 2026"
-(on Windows).
+on Windows.
 .TP
 .BI \-T " toolset-name"
 Specify the generator toolset where supported.
@@ -360,8 +364,8 @@ List cached variables, optionally including advanced entries, help strings,
 or regex filtering.
 .TP
 .BR \-N ", " \-P " " \fIfile\fP ", " \-E " " \fIcmd\fP ", " \-\-find-package ", " \-\-system-information " [" \fIfile\fP "], " \-\-print-config-dir
-View mode, script mode, cross-platform command mode, legacy find-package mode,
-system information dump, and user File API config directory lookup.
+Run view mode, script mode, cross-platform command mode, legacy find-package
+mode, system information dump, or user File API config directory lookup.
 .TP
 .BR \-h ", " \-H ", " \-\-help ", " \-\-version [ =json-v1 ] ", " \-\-help-*
 Print usage, version information, or bundled CMake 4.5.1 reference topics
@@ -383,15 +387,15 @@ Accepts
 .BR \-\-preset ,
 .BR \-\-presets-file ,
 .BR \-\-list-presets [ =defined ],
-.BR \-j / \-\-parallel
+.BR \-j ", " \-\-parallel
 .RI [ jobs ],
-.BR \-t / \-\-target
+.BR \-t ", " \-\-target
 .IR tgt ,
 .BR \-\-config
 .IR cfg ,
 .BR \-\-clean-first ,
 .BR \-\-resolve-package-references=on|only|off ,
-.BR \-v / \-\-verbose ,
+.BR \-v ", " \-\-verbose ,
 and
 .B \-\-
 followed by native build tool arguments.
@@ -405,16 +409,16 @@ Accepts
 .IR comp ,
 .BR \-\-default-directory-permissions
 .IR perm ,
-.BR \-j / \-\-parallel
+.BR \-j ", " \-\-parallel
 .IR jobs ,
 .BR \-\-prefix
 .IR dir ,
 .BR \-\-strip ,
 and
-.BR \-v / \-\-verbose .
+.BR \-v ", " \-\-verbose .
 .TP
 .B \-\-workflow
-Execute a workflow preset's configure, build, test, and package steps.
+Run a workflow preset's configure, build, test, and package steps.
 Accepts
 .BR \-\-preset ,
 .BR \-\-presets-file ,
@@ -423,13 +427,13 @@ and
 .BR \-\-fresh .
 .SH COMPANION TOOLS
 .SS ctest
-When invoked through a
+When started through a
 .B ctest
-link (compatibility mode) or as
+symlink in compatibility mode or as
 .BR "rcmake ctest" ,
-the binary runs CMake test suites with support for
-parallel scheduling, fixtures, resource specifications, labels, repeat modes,
-JUnit XML, dashboard submission, and
+the binary runs CMake test suites with parallel scheduling, fixtures,
+resource specifications, labels, repeat modes, JUnit XML, dashboard
+submission, and
 .B \-S
 scripts.
 Common options include
@@ -439,17 +443,17 @@ Common options include
 .IR cfg ,
 .BR \-R
 .I regex
-(include tests),
+to include tests,
 .BR \-E
 .I regex
-(exclude tests),
+to exclude tests,
 .BR \-L
 .I regex
-(include labels),
+to include labels,
 .BR \-LE
 .I regex
-(exclude labels),
-.BR \-j / \-\-parallel
+to exclude labels,
+.BR \-j ", " \-\-parallel
 .RI [ jobs ],
 .BR \-\-output-on-failure ,
 .BR \-\-output-junit
@@ -462,15 +466,15 @@ Common options include
 .IR mode:n ,
 .BR \-\-timeout
 .IR secs ,
-.BR \-N / \-\-show-only [ =human|json-v1|json-v1-raw ],
-.BR \-V / \-VV / \-Q ,
+.BR \-N ", " \-\-show-only [ =human|json-v1|json-v1-raw ],
+.BR \-V ", " \-VV ", " \-Q ,
 and
 .BR \-S
 .IR script .
 .SS cpack
-When invoked through a
+When started through a
 .B cpack
-link (compatibility mode) or as
+symlink in compatibility mode or as
 .BR "rcmake cpack" ,
 the binary packages build artifacts using
 .BR \-G
@@ -512,13 +516,13 @@ and
 .BR \-\-presets-file
 .IR file ,
 .BR \-\-list-presets ,
-.BR \-V / \-\-verbose ,
+.BR \-V ", " \-\-verbose ,
 .BR \-\-debug ,
 .BR \-\-trace ,
 and
 .BR \-\-trace-expand .
 .SS rcmake-lsp
-Invoked through the
+Started through the
 .B rcmake-lsp
 symlink or as
 .BR "rcmake lsp" ,
@@ -526,18 +530,20 @@ the same multi-call binary runs a Language Server Protocol server for
 .I CMakeLists.txt
 and
 .I *.cmake
-files communicating over standard input and standard output with JSON-RPC
+files over standard input and standard output using JSON-RPC
 .B Content-Length
-framing (accepting
+framing.
+It accepts
 .B \-\-help
 and
-.BR \-\-version ).
-It provides hover, completion, go to definition, document symbols, semantic
+.BR \-\-version ,
+and provides hover, completion, go to definition, document symbols, semantic
 tokens, diagnostics, quick fixes, and formatting.
 When built with the
 .B eval,stdio
-features (the default in release archives), hover evaluates variables, targets,
-and generator expressions in memory without spawning external processes.
+features, which release archives enable by default, hover evaluates variables,
+targets, and generator expressions in memory without spawning external
+processes.
 .SH ENVIRONMENT
 Command-line options take precedence over environment variables.
 Native speed and diagnostic variables apply only in native
@@ -557,9 +563,11 @@ Set to
 or
 .B rich
 in native mode.
-Unset defaults to
+When unset,
+.B rcmake
+defaults to
 .B rich
-on a TTY standard error and
+on a terminal standard error and
 .B cmake
 otherwise.
 .TP
@@ -575,11 +583,11 @@ forces ANSI color in rich mode and overrides
 Set the native configure profile output directory.
 .TP
 .B RCMAKE_EXEC_LOG
-Write JSON Lines invocation records (including
+Write JSON Lines invocation records containing the
 .B tool
 and effective
 .B persona
-fields) to this path.
+fields to this path.
 .TP
 .B RCMAKE_VENDORED_DATA_ROOT
 Override the directory containing bundled CMake 4.5.1
@@ -595,12 +603,13 @@ Override the shared storage root for the compiler probe cache and FetchContent
 cache.
 .TP
 .B RCMAKE_CACHE_MAX_SIZE
-Set the shared store size limit in bytes (default 2 GiB).
+Set the shared store size limit in bytes.
+The default is 2 GiB.
 .TP
 .B RCMAKE_PROBE_CACHE
 Select
 .B readwrite
-(default),
+as the default, or select
 .BR readonly ,
 .BR verify ,
 or
@@ -616,7 +625,8 @@ Override the probe storage root separately from
 .BR RCMAKE_CACHE_DIR .
 .TP
 .B RCMAKE_PROBE_JOBS
-Positive integer number of concurrent probe jobs (default min(4, CPUs)).
+Set a positive integer number of concurrent probe jobs.
+The default is the smaller of 4 and the logical CPU count.
 .TP
 .B RCMAKE_NO_INCREMENTAL
 Set to
@@ -629,28 +639,29 @@ Set to
 to disable remote probe cache access.
 .TP
 .BR RCMAKE_CACHE_REMOTE ", " RCMAKE_CACHE_REMOTE_AUTH ", " RCMAKE_CACHE_REMOTE_TOKEN ", " RCMAKE_CACHE_REMOTE_HEADER ", " RCMAKE_CACHE_REMOTE_WRITE
-Configure an optional HTTPS remote probe cache
-.RB ( anonymous ,
+Configure an optional HTTPS remote probe cache supporting
+.BR anonymous ,
 .BR bearer ,
 .BR header ,
 or
 .B s3
-authentication).
+authentication.
 .SS FetchContent lockfile and hermetic checks
 .TP
 .B RCMAKE_FETCH_LOCK
 Select
 .B auto
-(default),
+as the default, or select
 .BR off ,
 .BR update ,
 or
 .BR frozen .
 .TP
 .B RCMAKE_FETCH_LOCK_FILE
-Override the lockfile path (default
+Override the lockfile path.
+The default is
 .I rcmake-fetch.lock
-in the source directory).
+in the source directory.
 .TP
 .B RCMAKE_FETCH_OFFLINE
 Set to
@@ -663,19 +674,19 @@ Control parallel FetchContent prefetching and Git mirror cache limits.
 .B RCMAKE_HERMETIC
 Select
 .B off
-(default),
+as the default, or select
 .BR warn ,
 or
 .BR strict .
 .TP
 .BR RCMAKE_HERMETIC_ALLOW_ENV ", " RCMAKE_HERMETIC_ALLOW_PATHS ", " RCMAKE_HERMETIC_ALLOW_PROGRAMS
-Semicolon-separated allowlists of environment variable names, absolute
+Set semicolon-separated allowlists of environment variable names, absolute
 directory or file paths, and absolute executable paths permitted in hermetic
 mode.
 .SS Standard CMake and CTest variables
 .TP
 .BR CMAKE_GENERATOR ", " CMAKE_BUILD_PARALLEL_LEVEL ", " CMAKE_INSTALL_PARALLEL_LEVEL ", " CTEST_PARALLEL_LEVEL ", " CTEST_OUTPUT_ON_FAILURE
-Standard CMake and CTest defaults honored by
+Standard CMake and CTest variables honored by
 .BR rcmake ,
 .BR cmake ,
 and
@@ -686,19 +697,20 @@ and
 The command succeeded.
 For
 .BR "rcmake explain" ,
-the requested target or variable was found.
+.B rcmake
+found the requested target or variable.
 .TP
 .B 1
-Configure, generation, build, install, test, packaging, or
+Configure, generation, build, install, test, packaging, or an
 .B explain
-query failed (including not-found or ambiguous
+query failed, including missing or ambiguous
 .B explain
-names).
+names.
 .TP
 .B 2
-Invalid arguments to
+The caller passed invalid arguments to
 .B rcmake explain
-or an unavailable configured build directory.
+or pointed it at an unavailable configured build directory.
 .SH FILES
 .TP
 .I <prefix>/share/cmake-4.5/
@@ -712,7 +724,7 @@ Generated build-tree cache read by
 and incremental reconfigures.
 .TP
 .IR CMakePresets.json ", " CMakeUserPresets.json
-Project and user CMake Presets files (schema version 13).
+Project and user CMake Presets files using schema version 13.
 .TP
 .I rcmake-fetch.lock
 Default FetchContent lockfile in the project source directory.
@@ -734,10 +746,10 @@ or
 .IR ~/.cache/rcmake .
 On Windows the default is
 .IR %LOCALAPPDATA%\ercmake\ecache .
-Overridden by
-.BR RCMAKE_CACHE_DIR .
+.B RCMAKE_CACHE_DIR
+overrides this location.
 .SH EXAMPLES
-Configure and build a project with Ninja:
+Configure and build a project with Ninja.
 .PP
 .EX
 rcmake -S . -B build -G Ninja
@@ -748,26 +760,26 @@ Explain where target
 .B app
 gets its
 .B \-O2
-flag:
+flag.
 .PP
 .EX
 rcmake explain app -B build --filter -O2
 .EE
 .PP
-Profile a configure run and audit hermetic inputs:
+Profile a configure run and audit hermetic inputs.
 .PP
 .EX
 rcmake -S . -B build -G Ninja --profile=prof --hermetic=strict
 .EE
 .PP
-Update and then enforce a FetchContent lockfile:
+Update and then enforce a FetchContent lockfile.
 .PP
 .EX
 rcmake -S . -B build --fetch-lock=update
 rcmake -S . -B build --fetch-lock=frozen
 .EE
 .PP
-Run tests via the compatibility alias:
+Run tests through the compatibility alias.
 .PP
 .EX
 ctest --test-dir build --output-on-failure -j

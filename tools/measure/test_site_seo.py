@@ -13,8 +13,8 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
 SITE_DIR = ROOT / "site"
-SITE_ORIGIN = "https://dvgyl.github.io/rcmake/"
-REPO_URL = "https://github.com/dvgyl/rcmake"
+SITE_ORIGIN = "https://rcmake.github.io/rcmake/"
+REPO_URL = "https://github.com/rcmake/rcmake"
 
 SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 EM_DASH = "\u2014"
@@ -48,15 +48,15 @@ EXPECTED_SITEMAP = {
 
 EXPECTED_PAGES = {
     "index.html": {
-        "title": "rcmake: Drop-in CMake 4.5.1 Replacement in Safe Rust (cmake, ctest, cpack, LSP)",
+        "title": "rcmake, a drop-in CMake 4.5.1 replacement in safe Rust",
         "canonical": SITE_ORIGIN,
     },
     "playground.html": {
-        "title": "rcmake WebAssembly Playground: Run CMake 4.5.1 & Ninja in Your Browser",
+        "title": "rcmake WebAssembly playground for CMake 4.5.1 and Ninja",
         "canonical": f"{SITE_ORIGIN}playground.html",
     },
     "dashboard.html": {
-        "title": "rcmake Compatibility Report: CMake 4.5.1 Parity, RunCMake, vcpkg & Benchmarks",
+        "title": "rcmake compatibility report for CMake 4.5.1 parity and benchmarks",
         "canonical": f"{SITE_ORIGIN}dashboard.html",
     },
 }
@@ -321,7 +321,7 @@ class SiteSeoTests(unittest.TestCase):
                 "WebAssembly",
                 "MIT OR Apache-2.0",
                 "BSD-3-Clause",
-                "https://dvgyl.github.io/rcmake/",
+                "https://rcmake.github.io/rcmake/",
                 REPO_URL,
             ):
                 self.assertIn(required_fact, content, f"Missing required fact {required_fact!r} in {name}")

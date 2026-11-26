@@ -2,64 +2,64 @@
 
 > Independent drop-in reimplementation of CMake 4.5.1 in safe Rust. One binary runs as `cmake`, `ctest`, and `cpack`, reads existing `CMakeLists.txt` files, presets, and caches, and writes compatible build trees.
 
-`rcmake` (`0.1.0`) contains no copied or translated CMake C++ source. All 35 workspace crates enforce `#![forbid(unsafe_code)]`; some Rust dependencies (`rustix`, `memchr`) use `unsafe` internally, and the native binary statically links `zstd` 1.5.7 and `liblzma` 5.8. Rust and Python code is dual-licensed `MIT OR Apache-2.0`; bundled CMake 4.5.1 `Modules/`, `Templates/`, and `Help/` files stay under `BSD-3-Clause`. `rcmake` is not affiliated with Kitware. "CMake" is a trademark of Kitware, Inc.
+`rcmake` 0.1.0 contains no copied or translated CMake C++ source. All 35 workspace crates enforce `#![forbid(unsafe_code)]`. Some Rust dependencies such as `rustix` and `memchr` use `unsafe` internally, and the native binary statically links `zstd` 1.5.7 and `liblzma` 5.8. The Rust and Python source is dual-licensed under `MIT OR Apache-2.0`, while bundled CMake 4.5.1 `Modules/`, `Templates/`, and `Help/` files stay under `BSD-3-Clause`. `rcmake` is not affiliated with Kitware. CMake is a trademark of Kitware, Inc.
 
 ## CMake 4.5.1 parity
 
-- **CLI tools in one binary (`argv[0]` dispatch):** `cmake` (configure and generate, `-P` scripts, `-E` utilities, `--build`, `--install`, `--workflow`, `--find-package`, `--sarif-output`), `ctest` (parallel scheduling, fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML, `discover_tests()`, `-S` scripts), `cpack` (archive generators `TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z` and compression variants, Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop`), and the language server (`rcmake-lsp` symlink or `rcmake lsp`).
-- **Two execution modes:** Running as `cmake`, `ctest`, or `cpack` (or setting `RCMAKE_ORACLE_MODE=1`) selects CMake 4.5.1 compatibility mode. Running as `rcmake` selects native mode with the extensions below.
-- **Generators:** `Ninja` and `Ninja Multi-Config` (macOS, Linux, Windows), `Unix Makefiles` (macOS, Linux), `Xcode` (macOS), and `Visual Studio 17 2022` and `Visual Studio 18 2026` (Windows).
-- **Languages and tooling:** C (C90 to C23), C++ (including C++20 and C++23 named modules with Ninja `dyndep`), Objective-C, Objective-C++, Fortran (`.mod` dependency scanning), `ASM`/`ASM_MASM`/`ASM_NASM`, Windows `RC`, and Qt `AUTOMOC`/`AUTOUIC`/`AUTORCC`.
-- **CMake 4.5.1 interfaces:** Policies `CMP0000` to `CMP0226` (`CMP0000` to `CMP0065` always NEW; 161 active policies `CMP0066` to `CMP0226`), Presets schema v13, File API (`codemodel` v2.12, `cache` v2, `toolchains` v1, `cmakeFiles` v1, `configureLog` v1), Common Package Specification (CPS) 0.15.0, SPDX 3.0.1 SBOM, Instrumentation API v1, `cmake_diagnostic()` with SARIF 2.1.0 output, and `compile_commands.json`.
-- **Platforms:** Prebuilt releases target `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`. Intel macOS builds from source. `rcmake-api` also compiles for `wasm32-unknown-unknown` and `wasm32-wasip1`.
+- **CLI tools in one binary.** The executable inspects `argv[0]` to run as `cmake`, `ctest`, `cpack`, or `rcmake-lsp`. As `cmake`, it handles configure and generate, `-P` scripts, `-E` utilities, `--build`, `--install`, `--workflow`, `--find-package`, and `--sarif-output`. As `ctest`, it supports parallel scheduling, fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML, `discover_tests()`, and `-S` scripts. As `cpack`, it writes `TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `STGZ`, `ZIP`, `7Z`, compression variants, Linux `DEB` and `RPM`, `External`, and macOS `Bundle` and `DragNDrop` packages. You can also launch the language server via `rcmake lsp`.
+- **Two execution modes.** Running as `cmake`, `ctest`, or `cpack`, or setting `RCMAKE_ORACLE_MODE=1`, selects CMake 4.5.1 compatibility mode. Running as `rcmake` selects native mode and enables the extensions listed below.
+- **Generators.** Supports `Ninja` and `Ninja Multi-Config` on macOS, Linux, and Windows, `Unix Makefiles` on macOS and Linux, `Xcode` on macOS, and `Visual Studio 17 2022` and `Visual Studio 18 2026` on Windows.
+- **Languages and tooling.** Supports C from C90 to C23, C++ including C++20 and C++23 named modules with Ninja `dyndep`, Objective-C, Objective-C++, Fortran with `.mod` dependency scanning, `ASM`, `ASM_MASM`, `ASM_NASM`, Windows `RC`, and Qt `AUTOMOC`, `AUTOUIC`, and `AUTORCC`.
+- **CMake 4.5.1 interfaces.** Implements policies `CMP0000` to `CMP0226` with `CMP0000` to `CMP0065` always NEW and 161 active policies from `CMP0066` to `CMP0226`. Also implements Presets schema v13, File API including `codemodel` v2.12, `cache` v2, `toolchains` v1, `cmakeFiles` v1, and `configureLog` v1, Common Package Specification 0.15.0, SPDX 3.0.1 SBOM, Instrumentation API v1, `cmake_diagnostic()` with SARIF 2.1.0 output, and `compile_commands.json`.
+- **Platforms.** Prebuilt releases target `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`. Intel macOS builds from source. `rcmake-api` also compiles for `wasm32-unknown-unknown` and `wasm32-wasip1`.
 
-## Native extensions (`rcmake` mode)
+## Native extensions in rcmake mode
 
-- **Persistent compiler probe cache:** Reuses verified compiler check results across build directories and projects after validating recorded inputs by SHA-256 digest (`RCMAKE_PROBE_CACHE=readwrite|readonly|verify|off`, optional HTTPS/S3 remote cache).
-- **Parallel compiler probes:** Runs up to four compile probes concurrently by default (`RCMAKE_PROBE_JOBS`), speculating only on literal compile checks, never `try_run` or `execute_process`.
-- **Incremental configure replay:** Re-runs edited directory regions and replays unchanged subtrees when entry context and recorded inputs match. Disabled when a toolchain file (including `vcpkg`), configure preset, `-C`, or `PreLoad.cmake` is active.
-- **`rcmake explain <NAME>`:** Traces target build flags and transitive usage chains, or variable assignments, as terminal text or `--json` (`rcmake-explain-v1`).
-- **`--profile[=<dir>]`:** Writes `trace.json`, `stacks.folded`, and `flamegraph.html` for a configure run.
-- **`--diagnostics=rich`:** Renders source spans and annotations in a terminal.
-- **`--hermetic[=warn|strict]`:** Audits environment reads, file reads, subprocesses, and network access during configure.
-- **`--fetch-lock=off|auto|update|frozen`:** Pins FetchContent archives and Git commits in `rcmake-fetch.lock`.
-- **`rcmake-lsp` / `rcmake lsp`:** Language Server Protocol server built into the same multi-call binary (invoked via the `rcmake-lsp` symlink or `rcmake lsp`, supporting `--help` and `--version`) for `CMakeLists.txt` and `*.cmake` files over stdio (hover with evaluated values via `eval,stdio`, completion, go to definition, document symbols, semantic tokens, formatting).
-- **`rcmake-api` and WebAssembly playground:** In-process Rust configure and `explain` API backed by `rcmake_host::Host` (`NativeHost` and in-memory `PureHost`), running in the browser with no server.
+- **Persistent compiler probe cache.** Reuses verified compiler check results across build directories and projects after checking recorded input files by SHA-256 digest. Controlled through `RCMAKE_PROBE_CACHE=readwrite|readonly|verify|off`, with optional HTTPS and S3 remote cache support.
+- **Parallel compiler probes.** Runs up to four compile probes concurrently by default via `RCMAKE_PROBE_JOBS`, speculating only on literal compile checks and never on `try_run` or `execute_process`.
+- **Incremental configure replay.** Re-runs edited directory regions and replays unchanged subtrees when entry context and recorded inputs match. Replay turns off when a toolchain file such as `vcpkg`, a configure preset, `-C`, or `PreLoad.cmake` is active.
+- **Provenance queries with `rcmake explain <NAME>`.** Traces target build flags, transitive usage chains, and variable assignments as terminal text or `rcmake-explain-v1` JSON with `--json`.
+- **Configure profiling with `--profile`.** Writes `trace.json`, `stacks.folded`, and `flamegraph.html` for a configure run.
+- **Rich diagnostics with `--diagnostics=rich`.** Renders source spans and annotations in a terminal.
+- **Hermetic configure audit with `--hermetic`.** Audits environment reads, file reads, subprocesses, and network access during configure in warn or strict mode.
+- **FetchContent lockfiles with `--fetch-lock`.** Pins FetchContent archives and Git commits in `rcmake-fetch.lock`.
+- **Language server via `rcmake-lsp` or `rcmake lsp`.** Serves `CMakeLists.txt` and `*.cmake` files over stdio, accepting `--help` and `--version`. Provides hover with evaluated values when built with `eval` and `stdio`, completion, go to definition, document symbols, semantic tokens, and formatting.
+- **Embedded Rust API and WebAssembly playground.** `rcmake-api` exposes configure and `explain` over `rcmake_host::Host` using `NativeHost` or the in-memory `PureHost`, powering the browser playground with no server.
 
 ## Install
 
-- Linux and macOS: `curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash`
-- Linux and macOS with `cmake`, `ctest`, and `cpack` symlinks: `curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash -s -- --alias-cmake`
-- Windows PowerShell: `irm https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.ps1 | iex` (pass `-AliasCmake` when running a downloaded copy to write aliases)
-- From source (Rust 1.99.1 pinned in `rust-toolchain.toml`, plus Python 3): `git clone https://github.com/dvgyl/rcmake.git && cd rcmake && scripts/install.sh --from-source`
+- On Linux and macOS, run `curl -fsSL https://raw.githubusercontent.com/rcmake/rcmake/main/scripts/install.sh | bash`.
+- On Linux and macOS with `cmake`, `ctest`, and `cpack` symlinks, run `curl -fsSL https://raw.githubusercontent.com/rcmake/rcmake/main/scripts/install.sh | bash -s -- --alias-cmake`.
+- On Windows PowerShell, run `irm https://raw.githubusercontent.com/rcmake/rcmake/main/scripts/install.ps1 | iex`, or download the script and pass `-AliasCmake` to write aliases.
+- To build from source with Rust 1.99.1 from `rust-toolchain.toml` and Python 3, run `git clone https://github.com/rcmake/rcmake.git && cd rcmake && scripts/install.sh --from-source`.
 
 ## Intentional differences and limits
 
-- Reproducible `tar` and CPack archives always write uid 0 and gid 0.
-- No `cmake-gui`, no `ccmake`, and no `--debugger` (DAP).
-- No legacy extra generators (`CodeBlocks`, `CodeLite`, `Eclipse CDT4`, `Kate`, `Sublime Text 2`), no `MinGW`/`NMake`/`MSYS`/`Borland`/`Watcom` Makefiles, no `Green Hills MULTI`, no `FASTBuild`, and no Visual Studio 14, 15, or 16.
-- No CPack platform installers `NSIS`, `WIX`, `productbuild`, or `IFW` (archive generators, `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages are implemented).
-- `try_compile` runs in-process rather than invoking Ninja, Make, MSBuild, or xcodebuild, so MSBuild-only and Xcode-only generator attributes do not affect probes.
+- Reproducible `tar` and CPack archives always record uid 0 and gid 0.
+- Interactive front ends `cmake-gui` and `ccmake`, along with `--debugger` DAP support, are omitted because rcmake focuses on headless builds and LSP editor integration.
+- Legacy extra generators for `CodeBlocks`, `CodeLite`, `Eclipse CDT4`, `Kate`, and `Sublime Text 2` are omitted, along with `MinGW`, `NMake`, `MSYS`, `Borland`, and `Watcom` Makefiles, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16.
+- CPack platform installers `NSIS`, `WIX`, `productbuild`, and `IFW` are omitted, while archive generators, `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages are implemented.
+- `try_compile` runs in-process rather than spawning Ninja, Make, MSBuild, or xcodebuild, so MSBuild-only and Xcode-only generator attributes do not affect probes.
 - `--version` prints `cmake version 4.5.1` on line 1 and `rcmake 0.1.0` on line 2.
-- Partial or unverified languages: CUDA (one ecosystem fixture), HIP (rule wiring only), Swift (parsed, builds unverified).
+- CUDA has one ecosystem fixture, HIP has rule wiring only, and Swift targets are parsed with builds not yet verified.
 
 ## Site
 
-- [Overview](https://dvgyl.github.io/rcmake/): Install commands, CMake 4.5.1 comparison, pipeline diagram, generators, languages, and FAQ.
-- [Browser playground](https://dvgyl.github.io/rcmake/playground.html): WebAssembly workbench for configure, Ninja and Ninja Multi-Config generation, diagnostics, and `rcmake explain`.
-- [Compatibility report](https://dvgyl.github.io/rcmake/dashboard.html): Verification results across 3-OS `Tests/RunCMake`, 62 core suites, 35 policy suites, 10 large C++ projects, a 240-repository sealed holdout, 64 `vcpkg` shards, soundness gates, and benchmarks.
-- [Compatibility JSON](https://dvgyl.github.io/rcmake/data/latest.json): Machine-readable snapshot backing the compatibility report.
-- [Full technical reference](https://dvgyl.github.io/rcmake/llms-full.txt): Extended technical reference with CLI flags, architecture, limits, and Q&A.
+- [Overview](https://rcmake.github.io/rcmake/) covers install commands, the CMake 4.5.1 comparison, the configure pipeline, generators, languages, and common questions.
+- [Browser playground](https://rcmake.github.io/rcmake/playground.html) runs WebAssembly configure, Ninja and Ninja Multi-Config generation, diagnostics, and `rcmake explain` in the browser.
+- [Compatibility report](https://rcmake.github.io/rcmake/dashboard.html) tracks verification results across `Tests/RunCMake` on macOS, Linux, and Windows, 62 core suites, 35 policy suites, 10 large C++ projects, a 240-repository sealed holdout, 64 `vcpkg` shards, soundness gates, and benchmarks.
+- [Compatibility JSON](https://rcmake.github.io/rcmake/data/latest.json) holds the machine-readable snapshot behind the compatibility report.
+- [Full technical reference](https://rcmake.github.io/rcmake/llms-full.txt) documents CLI flags, architecture, limits, and common questions in full.
 
 ## Documentation
 
-- [README](https://github.com/dvgyl/rcmake/blob/main/README.md): Quick start, feature matrix, install options, troubleshooting, and local verification commands.
-- [FAQ](https://github.com/dvgyl/rcmake/blob/main/docs/FAQ.md): Answers on CMake 4.5.1 parity, generators, vcpkg and Conan, native extensions, install, and limits.
-- [Build write-up](https://github.com/dvgyl/rcmake/blob/main/docs/BUILD_WRITEUP.md): Differential testing methodology against CMake 4.5.1, bugs exposed by testing, limits, and reproduction commands.
-- [Architecture](https://github.com/dvgyl/rcmake/blob/main/docs/ARCHITECTURE.md): Execution pipeline, resolution layers, map of all 35 crates, and the `Host` trait.
-- [Architecture decision records](https://github.com/dvgyl/rcmake/blob/main/docs/ADR.md): 38 design records covering storage, generators, host isolation, and compatibility boundaries.
-- [Environment variables](https://github.com/dvgyl/rcmake/blob/main/docs/ENV_VARS.md): Reference for `RCMAKE_*` variables.
-- [Prior art and licences](https://github.com/dvgyl/rcmake/blob/main/docs/PRIOR_ART.md): Vendored assets, direct third-party dependencies, and archive codec licences.
-- [rcmake-api README](https://github.com/dvgyl/rcmake/blob/main/crates/rcmake-api/README.md): Embedding configure and `explain` in Rust programs and WebAssembly targets.
-- [rcmake-lsp README](https://github.com/dvgyl/rcmake/blob/main/crates/rcmake-lsp/README.md): Editor setup for VS Code, Neovim, Helix, Zed, Emacs, and CLion.
-- [GitHub repository](https://github.com/dvgyl/rcmake): Source code, releases, and parity bug report form.
+- [README](https://github.com/rcmake/rcmake/blob/main/README.md) provides a quick start, feature matrix, install options, troubleshooting, and local verification commands.
+- [FAQ](https://github.com/rcmake/rcmake/blob/main/docs/FAQ.md) answers questions on CMake 4.5.1 parity, generators, vcpkg and Conan, native extensions, installation, and limits.
+- [Build write-up](https://github.com/rcmake/rcmake/blob/main/docs/BUILD_WRITEUP.md) explains the differential testing methodology against CMake 4.5.1, bugs exposed by testing, limits, and reproduction commands.
+- [Architecture](https://github.com/rcmake/rcmake/blob/main/docs/ARCHITECTURE.md) maps the execution pipeline, resolution layers, all 35 crates, and the `Host` trait.
+- [Architecture decision records](https://github.com/rcmake/rcmake/blob/main/docs/ADR.md) collect 38 design records covering storage, generators, host isolation, and compatibility boundaries.
+- [Environment variables](https://github.com/rcmake/rcmake/blob/main/docs/ENV_VARS.md) lists all `RCMAKE_*` configuration variables.
+- [Prior art and licences](https://github.com/rcmake/rcmake/blob/main/docs/PRIOR_ART.md) tracks vendored assets, direct third-party dependencies, and archive codec licences.
+- [rcmake-api README](https://github.com/rcmake/rcmake/blob/main/crates/rcmake-api/README.md) explains how to embed configure and `explain` in Rust programs and WebAssembly targets.
+- [rcmake-lsp README](https://github.com/rcmake/rcmake/blob/main/crates/rcmake-lsp/README.md) covers editor setup for VS Code, Neovim, Helix, Zed, Emacs, and CLion.
+- [GitHub repository](https://github.com/rcmake/rcmake) hosts the source code, prebuilt releases, and parity bug report form.

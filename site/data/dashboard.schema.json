@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://dvgyl.github.io/rcmake/data/dashboard.schema.json",
+  "$id": "https://rcmake.github.io/rcmake/data/dashboard.schema.json",
   "title": "rcmake Nightly Compatibility Dashboard Snapshot",
   "description": "Schema for site/data/latest.json driving the rcmake landing proof strip and 7-track compatibility dashboard.",
   "type": "object",

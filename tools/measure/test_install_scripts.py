@@ -341,7 +341,7 @@ class InstallShTests(unittest.TestCase):
 
     def test_version_downloads_the_tagged_release(self) -> None:
         fake_bin, log = self.fake_release(["0.1.0", "0.2.0"])
-        releases = "https://github.com/dvgyl/rcmake/releases"
+        releases = "https://github.com/rcmake/rcmake/releases"
         for requested in ("v0.1.0", "0.1.0"):
             with self.subTest(version=requested):
                 log.unlink(missing_ok=True)
@@ -363,7 +363,7 @@ class InstallShTests(unittest.TestCase):
         res = self.run_install(path_entries=[str(fake_bin)])
         self.assertEqual(res.returncode, 0, res.stderr)
         urls = log.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(urls[0], "https://github.com/dvgyl/rcmake/releases/latest/download/SHA256SUMS.txt")
+        self.assertEqual(urls[0], "https://github.com/rcmake/rcmake/releases/latest/download/SHA256SUMS.txt")
         self.assertIn("/latest/download/rcmake-0.2.0-", urls[1])
 
     def test_version_argument_errors(self) -> None:
@@ -1119,7 +1119,7 @@ class InstallPs1Tests(unittest.TestCase):
 
         # Required download, verification, extraction, PATH, and uninstall behaviors.
         for needle in (
-            "https://github.com/dvgyl/rcmake/releases",
+            "https://github.com/rcmake/rcmake/releases",
             "x86_64-pc-windows-msvc",
             "Get-FileHash -Algorithm SHA256",
             "System.IO.Compression.FileSystem",

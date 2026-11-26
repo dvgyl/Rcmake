@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -100,6 +101,16 @@ def check_source(errors: list[str]) -> None:
     ):
         if not (ROOT / required).is_file():
             errors.append(f"Missing required file: {required}")
+
+    apache_licence = ROOT / "LICENSE-APACHE"
+    if apache_licence.is_file():
+        expected_apache_sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        actual_apache_sha256 = hashlib.sha256(apache_licence.read_bytes()).hexdigest()
+        if actual_apache_sha256 != expected_apache_sha256:
+            errors.append(
+                f"LICENSE-APACHE SHA-256 mismatch: expected official Apache 2.0 {expected_apache_sha256}, "
+                f"found {actual_apache_sha256}"
+            )
 
     licence = ROOT / CMAKE_LICENCE
     if licence.is_file():

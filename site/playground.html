@@ -3,28 +3,28 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>rcmake WebAssembly Playground: Run CMake 4.5.1 &amp; Ninja in Your Browser</title>
-  <meta name="description" content="Run CMake 4.5.1 configure, Ninja and Ninja Multi-Config generation, diagnostics, and rcmake explain directly in your browser via WebAssembly with no server.">
+  <title>rcmake WebAssembly playground for CMake 4.5.1 and Ninja</title>
+  <meta name="description" content="Configure CMake 4.5.1 projects, generate Ninja build files, inspect diagnostics, and run rcmake explain locally in your browser with WebAssembly.">
   <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f6f4f0" media="(prefers-color-scheme: light)">
-  <link rel="canonical" href="https://dvgyl.github.io/rcmake/playground.html">
-  <link rel="alternate" type="text/plain" title="LLMs.txt" href="https://dvgyl.github.io/rcmake/llms.txt">
+  <link rel="canonical" href="https://rcmake.github.io/rcmake/playground.html">
+  <link rel="alternate" type="text/plain" title="LLMs.txt" href="https://rcmake.github.io/rcmake/llms.txt">
   <link rel="manifest" href="./manifest.webmanifest">
   <meta property="og:site_name" content="rcmake">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="rcmake WebAssembly Playground: Run CMake 4.5.1 &amp; Ninja in Your Browser">
-  <meta property="og:description" content="Run CMake 4.5.1 configure, Ninja and Ninja Multi-Config generation, diagnostics, and rcmake explain directly in your browser via WebAssembly with no server.">
-  <meta property="og:url" content="https://dvgyl.github.io/rcmake/playground.html">
-  <meta property="og:image" content="https://dvgyl.github.io/rcmake/assets/og-card.png">
+  <meta property="og:title" content="rcmake WebAssembly playground for CMake 4.5.1 and Ninja">
+  <meta property="og:description" content="Configure CMake 4.5.1 projects, generate Ninja build files, inspect diagnostics, and run rcmake explain locally in your browser with WebAssembly.">
+  <meta property="og:url" content="https://rcmake.github.io/rcmake/playground.html">
+  <meta property="og:image" content="https://rcmake.github.io/rcmake/assets/og-card.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="rcmake: Drop-in CMake 4.5.1 in safe Rust. One binary runs as cmake, ctest, and cpack.">
+  <meta property="og:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, and cpack.">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="rcmake WebAssembly Playground: Run CMake 4.5.1 &amp; Ninja in Your Browser">
-  <meta name="twitter:description" content="Run CMake 4.5.1 configure, Ninja and Ninja Multi-Config generation, diagnostics, and rcmake explain directly in your browser via WebAssembly with no server.">
-  <meta name="twitter:image" content="https://dvgyl.github.io/rcmake/assets/og-card.png">
-  <meta name="twitter:image:alt" content="rcmake: Drop-in CMake 4.5.1 in safe Rust. One binary runs as cmake, ctest, and cpack.">
+  <meta name="twitter:title" content="rcmake WebAssembly playground for CMake 4.5.1 and Ninja">
+  <meta name="twitter:description" content="Configure CMake 4.5.1 projects, generate Ninja build files, inspect diagnostics, and run rcmake explain locally in your browser with WebAssembly.">
+  <meta name="twitter:image" content="https://rcmake.github.io/rcmake/assets/og-card.png">
+  <meta name="twitter:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, and cpack.">
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
   <link rel="stylesheet" href="./styles.css">
   <link rel="modulepreload" href="./playground.js">
@@ -36,12 +36,12 @@
       "@graph": [
         {
           "@type": "WebApplication",
-          "@id": "https://dvgyl.github.io/rcmake/playground.html#app",
-          "name": "rcmake WebAssembly Playground",
-          "url": "https://dvgyl.github.io/rcmake/playground.html",
-          "description": "Interactive browser workbench running the rcmake CMake 4.5.1 configure engine, Ninja and Ninja Multi-Config generation, diagnostics, and rcmake explain in WebAssembly on PureHost with no server.",
+          "@id": "https://rcmake.github.io/rcmake/playground.html#app",
+          "name": "rcmake WebAssembly playground",
+          "url": "https://rcmake.github.io/rcmake/playground.html",
+          "description": "Browser workbench that runs the rcmake CMake 4.5.1 configure engine, Ninja and Ninja Multi-Config generation, diagnostics, and rcmake explain locally in WebAssembly on PureHost with no server.",
           "applicationCategory": "DeveloperApplication",
-          "operatingSystem": "Any (WebAssembly-capable browser)",
+          "operatingSystem": "Any browser with WebAssembly support",
           "browserRequirements": "Requires JavaScript and WebAssembly",
           "softwareVersion": "0.1.0",
           "license": [
@@ -55,24 +55,24 @@
             "priceCurrency": "USD"
           },
           "isPartOf": {
-            "@id": "https://dvgyl.github.io/rcmake/#website"
+            "@id": "https://rcmake.github.io/rcmake/#website"
           }
         },
         {
           "@type": "BreadcrumbList",
-          "@id": "https://dvgyl.github.io/rcmake/playground.html#breadcrumb",
+          "@id": "https://rcmake.github.io/rcmake/playground.html#breadcrumb",
           "itemListElement": [
             {
               "@type": "ListItem",
               "position": 1,
               "name": "rcmake",
-              "item": "https://dvgyl.github.io/rcmake/"
+              "item": "https://rcmake.github.io/rcmake/"
             },
             {
               "@type": "ListItem",
               "position": 2,
               "name": "Playground",
-              "item": "https://dvgyl.github.io/rcmake/playground.html"
+              "item": "https://rcmake.github.io/rcmake/playground.html"
             }
           ]
         }
@@ -123,7 +123,7 @@
         <a href="./dashboard.html">Compatibility</a>
       </nav>
       <div class="topbar-actions">
-        <a class="icon-btn" href="https://github.com/dvgyl/rcmake" aria-label="GitHub"><svg class="i i-fill" aria-hidden="true"><use href="#i-github"/></svg></a>
+        <a class="icon-btn" href="https://github.com/rcmake/rcmake" aria-label="GitHub"><svg class="i i-fill" aria-hidden="true"><use href="#i-github"/></svg></a>
         <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch to light theme" data-test="theme-toggle">
           <span class="theme-knob" aria-hidden="true"></span>
           <svg class="i theme-moon" aria-hidden="true"><use href="#i-moon"/></svg>
@@ -137,7 +137,7 @@
     <h1 class="visually-hidden">rcmake playground</h1>
     <noscript>
       <div class="noscript-banner noscript-bench">
-        <strong>JavaScript and WebAssembly are required for the live playground.</strong> This page loads <code>rcmake_wasm.wasm</code> on <code>PureHost</code> to run CMake 4.5.1 configure, <code>Ninja</code> and <code>Ninja Multi-Config</code> generation, diagnostics, and <code>rcmake explain</code> locally in your browser with no server. Enable JavaScript to run it, or read the <a href="./index.html">overview</a>, <a href="./llms.txt">llms.txt</a>, or <a href="https://github.com/dvgyl/rcmake">GitHub repository</a>.
+        <strong>JavaScript and WebAssembly are required for the live playground.</strong> This page loads <code>rcmake_wasm.wasm</code> on <code>PureHost</code> to run CMake 4.5.1 configure, <code>Ninja</code> and <code>Ninja Multi-Config</code> generation, diagnostics, and <code>rcmake explain</code> locally in your browser with no server. Enable JavaScript to run it, or read the <a href="./index.html">overview</a>, <a href="./llms.txt">llms.txt</a>, or the <a href="https://github.com/rcmake/rcmake">GitHub repository</a>.
       </div>
     </noscript>
     <div class="toolbar">
@@ -217,8 +217,8 @@
       </section>
     </div>
     <footer class="bench-legal" aria-label="License and notices">
-      <span>MIT OR Apache-2.0. Bundles CMake 4.5.1 Modules/, Templates/, and Help/ under BSD-3-Clause. Not affiliated with Kitware; CMake is a trademark of Kitware, Inc.</span>
-      <span class="bench-legal-links"><a href="./index.html">Overview</a> · <a href="./dashboard.html">Compatibility</a> · <a href="https://github.com/dvgyl/rcmake">GitHub</a></span>
+      <span>MIT OR Apache-2.0. Bundles CMake 4.5.1 Modules/, Templates/, and Help/ under BSD-3-Clause. Not affiliated with Kitware. CMake is a trademark of Kitware, Inc.</span>
+      <span class="bench-legal-links"><a href="./index.html">Overview</a> · <a href="./dashboard.html">Compatibility</a> · <a href="https://github.com/rcmake/rcmake">GitHub</a></span>
     </footer>
   </main>
 

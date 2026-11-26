@@ -229,7 +229,7 @@ function updateModeBadge(mode, durationMs = null) {
   if (wasm) {
     els.modeBadge.title = adapter.module?.ENGINE_COMMIT
       ? `rcmake_wasm.wasm, engine ${adapter.module.ENGINE_COMMIT}`
-      : "rcmake_wasm.wasm (PureHost, wasm32-wasip1)";
+      : "rcmake_wasm.wasm using PureHost on wasm32-wasip1";
   }
 }
 
@@ -323,7 +323,7 @@ function jumpTo(file, line, col = 1) {
 function syncEditorHint() {
   if (!els.hint) return;
   if (state.editorFocused) {
-    els.hint.textContent = "Esc then Tab to leave editor";
+    els.hint.textContent = "Press Esc, then Tab, to leave the editor.";
   } else {
     els.hint.textContent = PLAYGROUND_EXAMPLES[state.exampleId]?.description || "";
   }
@@ -408,7 +408,7 @@ function syncConfigOptions() {
   const allowed = availableBuildTypes();
   Array.from(els.configSelect.options).forEach((opt) => {
     opt.disabled = !allowed.includes(opt.value);
-    opt.title = opt.disabled ? "Not listed in CMAKE_CONFIGURATION_TYPES for this generator or preset" : "";
+    opt.title = opt.disabled ? "Not listed in CMAKE_CONFIGURATION_TYPES for the selected generator or preset." : "";
   });
   if (!allowed.includes(state.buildType)) {
     state.buildType = allowed[0] || "Debug";
@@ -593,9 +593,9 @@ function renderExplainChain(chain) {
   if (!Array.isArray(chain) || !chain.length) return "";
   return chain.map((h) => {
     if (h.from !== undefined) {
-      return `<div class="ex-chain"><span>${escapeHtml(`${h.from} -> ${h.via || h.to}`)}</span>${h.edge ? `<span class="chip">${escapeHtml(h.edge)}</span>` : ""}${locBtn(h.location)}</div>`;
+      return `<div class="ex-chain"><span>${escapeHtml(`${h.from} to ${h.via || h.to}`)}</span>${h.edge ? `<span class="chip">${escapeHtml(h.edge)}</span>` : ""}${locBtn(h.location)}</div>`;
     }
-    const targetLabel = h.target ? `via ${h.target}` : `via target#${h.target_id}`;
+    const targetLabel = h.target ? `via ${h.target}` : `via target ${h.target_id}`;
     return `<div class="ex-chain"><span>${escapeHtml(targetLabel)}</span>${h.scope ? `<span class="chip">${escapeHtml(h.scope)}</span>` : ""}${locBtn(h.origin)}</div>`;
   }).join("");
 }
@@ -611,14 +611,14 @@ function renderExplainSources(sources) {
 
 function renderExplainReport(rep) {
   if (state.explainError) {
-    return `<div class="diag-row" data-diag-severity="error" data-test="explain-error"><span class="st-fail"><svg class="i" aria-hidden="true"><use href="#i-cross"/></svg><span class="visually-hidden">error</span></span><div class="diag-msg">${escapeHtml(state.explainError)}<span class="diag-cat">Explain query failed. The last configure output in the other tabs is still available.</span></div><div></div></div>`;
+    return `<div class="diag-row" data-diag-severity="error" data-test="explain-error"><span class="st-fail"><svg class="i" aria-hidden="true"><use href="#i-cross"/></svg><span class="visually-hidden">error</span></span><div class="diag-msg">${escapeHtml(state.explainError)}<span class="diag-cat">The explain query failed. Output from the last configure run is still available in the other tabs.</span></div><div></div></div>`;
   }
   if (!rep) return '<p class="dim">Pick a target or variable.</p>';
   if (state.showRawJson) return `<pre class="code-table" data-test="explain-raw-json">${escapeHtml(JSON.stringify(rep, null, 2))}</pre>`;
   const d = rep.details || {};
   if (rep.kind === "not_found") {
     const sugs = (d.suggestions || []).map((s) => `<button type="button" class="ctrl-btn" data-explain-sym="${escapeHtml(s.name)}">${escapeHtml(s.name)} <span class="dim">${escapeHtml(s.kind)}</span></button>`).join("");
-    return `<div class="explain-tree" data-test="explain-not-found"><div class="ex-root"><span class="st st-partial"><svg class="i" aria-hidden="true"><use href="#i-differs"/></svg><span>not found</span></span><span class="target-name">${escapeHtml(rep.name)}</span></div>${sugs ? `<div class="explain-syms">${sugs}</div>` : '<p class="dim">Symbol not found in the current configure graph. Pick a target or variable above.</p>'}</div>`;
+    return `<div class="explain-tree" data-test="explain-not-found"><div class="ex-root"><span class="st st-partial"><svg class="i" aria-hidden="true"><use href="#i-differs"/></svg><span>not found</span></span><span class="target-name">${escapeHtml(rep.name)}</span></div>${sugs ? `<div class="explain-syms">${sugs}</div>` : '<p class="dim">This symbol is not in the current configure graph. Pick a target or variable above.</p>'}</div>`;
   }
   if (rep.kind === "ambiguous") {
     const kinds = (d.kinds || []).map((k) => `<span class="chip is-ink">${escapeHtml(k)}</span>`).join("");
@@ -633,7 +633,7 @@ function renderExplainReport(rep) {
       ? [
           `cache ${d.cache.type || "STRING"}`,
           d.cache.help || "",
-          d.history ? `history: ${d.history}` : ""
+          d.history ? `history ${d.history}` : ""
         ].filter(Boolean)
       : [];
     const cacheMeta = metaParts.length
@@ -648,7 +648,7 @@ function renderExplainReport(rep) {
     }).join("");
     const timeline = writes
       ? `<ol class="var-timeline">${writes}</ol>`
-      : '<p class="dim ex-note">Set via cache or preset before script evaluation (no listfile writes).</p>';
+      : '<p class="dim ex-note">The cache or a preset set this variable before script evaluation, so no listfile wrote to it.</p>';
     return `<div class="explain-tree" data-test="explain-variable"><div class="ex-root"><span class="target-name">${escapeHtml(rep.name)}</span>${d.binding ? `<span class="chip is-ink">${escapeHtml(d.binding)}</span>` : ""}${chips(d.value)}${locBtn(rootLoc)}</div>${cacheMeta}${timeline}</div>`;
   }
 
@@ -684,7 +684,7 @@ function renderExplainTab(res) {
     .map((s) => `<button type="button" class="ctrl-btn sym-btn${s === state.explainSymbol ? " is-active" : ""}" data-explain-sym="${escapeHtml(s)}" aria-pressed="${s === state.explainSymbol}">${escapeHtml(s)}</button>`)
     .join("");
   const moreBtn = hiddenCount > 0
-    ? `<button id="toggle-all-syms" type="button" class="ctrl-btn sym-more-btn" data-test="toggle-all-syms">${state.showAllSymbols ? "Fewer symbols" : `+${hiddenCount} more symbols`}</button>`
+    ? `<button id="toggle-all-syms" type="button" class="ctrl-btn sym-more-btn" data-test="toggle-all-syms">${state.showAllSymbols ? "Show fewer symbols" : `Show ${hiddenCount} more symbols`}</button>`
     : "";
   const datalist = `<datalist id="explain-datalist">${all.map((s) => `<option value="${escapeHtml(s)}"></option>`).join("")}</datalist>`;
   return `<form id="explain-form" class="explain-bar"><input id="explain-input" class="search-input" type="text" list="explain-datalist" value="${escapeHtml(state.explainSymbol)}" placeholder="Target or variable" aria-label="Symbol to explain" data-test="explain-input">${datalist}<button class="ctrl-btn" type="submit" data-test="explain-submit">Explain</button><button id="toggle-explain-json" class="ctrl-btn" type="button" data-test="toggle-explain-json">${state.showRawJson ? "Structured" : "Raw JSON"}</button></form><div class="explain-syms" data-test="explain-symbols">${syms}${moreBtn}</div>${renderExplainReport(state.explainReport)}`;
@@ -712,9 +712,9 @@ function renderRuntimeError(message) {
   const isFileProto = typeof window !== "undefined" && window.location?.protocol === "file:";
   const hint = adapter.mode !== "wasm"
     ? (isFileProto
-      ? "Browsers block WebAssembly fetches over file://. Serve site/ over HTTP (for example: python3 -m http.server -d site)."
-      : "WebAssembly runtime unavailable. Serve the site over HTTP with WebAssembly enabled and retry.")
-    : "Configure execution failed inside the WebAssembly runtime.";
+      ? "Browsers block WebAssembly fetches over file://. Serve site/ over HTTP instead, for example by running python3 -m http.server -d site."
+      : "The WebAssembly runtime could not load. Serve the site over HTTP with WebAssembly enabled and try again.")
+    : "Configure failed inside the WebAssembly runtime.";
   return `<div class="diag-row" data-diag-severity="error" data-test="wasm-load-error"><span class="st-fail"><svg class="i" aria-hidden="true"><use href="#i-cross"/></svg><span class="visually-hidden">error</span></span><div class="diag-msg">${escapeHtml(message)}<span class="diag-cat">${escapeHtml(hint)}</span></div><div><button type="button" class="ctrl-btn" id="retry-wasm-btn" data-test="retry-wasm-btn">Retry</button></div></div>`;
 }
 
@@ -745,7 +745,7 @@ function renderInspector(fade = false) {
     requestAnimationFrame(() => els.body.classList.remove("is-fading"));
   }
   if (state.loadingWasm) {
-    els.body.innerHTML = '<div class="loading-state" data-test="wasm-loading"><span class="dim">Loading WebAssembly runtime\u2026</span></div>';
+    els.body.innerHTML = '<div class="loading-state" data-test="wasm-loading"><span class="dim">Loading the WebAssembly runtime.</span></div>';
     return;
   }
   if (state.runtimeError) {
@@ -842,7 +842,7 @@ async function runConfigure() {
         state.activeTab = "diagnostics";
         state.autoSwitchedToDiag = true;
       }
-      els.runStatus.textContent = `configure failed (${errCount || 1} ${errCount === 1 ? "error" : "errors"}) \u00b7 ${formatMs(res.durationMs)}`;
+      els.runStatus.textContent = `configure failed with ${errCount || 1} ${errCount === 1 ? "error" : "errors"} \u00b7 ${formatMs(res.durationMs)}`;
       els.runStatus.classList.add("st-fail");
       els.runStatus.classList.remove("st-pass");
     } else {
@@ -945,7 +945,7 @@ function initSplit() {
 async function init() {
   const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || navigator.userAgent || "") && !/iPhone|iPad|iPod/i.test(navigator.userAgent || "");
   if (els.runKbd) els.runKbd.textContent = isMac ? "\u2318\u21b5" : "Ctrl+Enter";
-  els.runBtn.title = isMac ? "Run configure (Cmd+Enter)" : "Run configure (Ctrl+Enter)";
+  els.runBtn.title = isMac ? "Run configure with Cmd+Enter" : "Run configure with Ctrl+Enter";
   els.exampleSelect.innerHTML = Object.values(PLAYGROUND_EXAMPLES).map((ex) => `<option value="${escapeHtml(ex.id)}">${escapeHtml(ex.title)}</option>`).join("");
 
   const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
@@ -1017,8 +1017,9 @@ async function init() {
       clearTimeout(els.shareBtn._copyTimer);
       els.shareBtn._copyTimer = setTimeout(() => setLabel("Share"), 2400);
       const limit = MAX_SHARE_HASH_CHARS.toLocaleString("en-US");
-      const actual = share.encodedLength ? `${share.encodedLength.toLocaleString("en-US")} / ${limit}` : `>${limit}`;
-      els.runStatus.textContent = `Share link exceeds ${limit}-char URL limit (${actual} encoded chars); edits were not copied.`;
+      els.runStatus.textContent = share.encodedLength
+        ? `Your edits encode to ${share.encodedLength.toLocaleString("en-US")} characters, which exceeds the ${limit} character URL limit, so the playground did not copy a share link.`
+        : `Your edits exceed the ${limit} character URL limit, so the playground did not copy a share link.`;
       els.runStatus.classList.add("st-fail");
       els.runStatus.classList.remove("st-pass");
       return;

@@ -16,7 +16,7 @@ const RACE_MODES = {
       "-- Generating done",
       "-- Build files have been written to: <project>/build-2"
     ],
-    caption: "CMake has no cross-tree cache.",
+    caption: "CMake does not share probe results across build trees, so it runs compiler probes again in every new build directory.",
     key: "warmProbeSpeedup",
     kind: "ratio"
   },
@@ -49,9 +49,9 @@ const RACE_MODES = {
 };
 
 const DEFAULT_PLATFORMS = [
-  { id: "macos-arm64", name: "macOS arm64", toolchain: "AppleClang + Ninja, Unix Makefiles, Xcode", suitesTotal: 371, suitesPassed: null, status: "pending" },
-  { id: "linux-x86_64", name: "Linux x86_64", toolchain: "GCC + Clang + Ninja, Unix Makefiles", suitesTotal: 362, suitesPassed: null, status: "pending" },
-  { id: "windows-x86_64", name: "Windows x86_64", toolchain: "MSVC + Ninja, Visual Studio 17 & 18", suitesTotal: 367, suitesPassed: null, status: "pending" }
+  { id: "macos-arm64", name: "macOS arm64", toolchain: "AppleClang with Ninja, Unix Makefiles, and Xcode", suitesTotal: 371, suitesPassed: null, status: "pending" },
+  { id: "linux-x86_64", name: "Linux x86_64", toolchain: "GCC and Clang with Ninja and Unix Makefiles", suitesTotal: 362, suitesPassed: null, status: "pending" },
+  { id: "windows-x86_64", name: "Windows x86_64", toolchain: "MSVC with Ninja, Visual Studio 17, and Visual Studio 18", suitesTotal: 367, suitesPassed: null, status: "pending" }
 ];
 
 function initTerminal(doc) {
@@ -125,12 +125,12 @@ function initRace(doc, motion) {
         drawLines(isFaster ? "rcmake" : "cmake");
         cmBar.innerHTML = `<div class="bar-track"><div class="bar-fill is-cmake" style="--v:${cmScale};--bar-dur:800ms" data-scale="${cmScale}"></div></div><div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim" data-value>full reconfigure</span></div>`;
         rcBar.innerHTML = `<div class="bar-track"><div class="bar-fill ${rcCls}" style="--v:${rcScale};--bar-dur:${Math.max(160, Math.round(800 / Math.max(0.2, leafSpeedup)))}ms" data-scale="${rcScale}" data-test="race-fill-rcmake"></div></div><div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${escapeHtml(spdTxt)}</span></div>`;
-        caption.textContent = "Incremental replay re-runs the edited file and replays unchanged subtrees.";
+        caption.textContent = "rcmake re-evaluates only the edited CMakeLists.txt file and reuses unchanged subtrees.";
       } else {
         drawLines("rcmake");
         cmBar.innerHTML = '<div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim">full reconfigure</span></div>';
         rcBar.innerHTML = `<div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${escapeHtml(formatNumber(val))} ms p95</span></div>`;
-        caption.textContent = m?.baseline || "Single-file change replay (p95 wall time).";
+        caption.textContent = m?.baseline || "p95 reconfigure time after editing one leaf CMakeLists.txt file.";
       }
       return;
     }
@@ -182,8 +182,8 @@ function renderSnapshot(el, data) {
   el.innerHTML = [
     statTile({ label: "Fuzz inputs", value: fuzz.passed, detail: fails === 0 ? "0 panics" : fails === 1 ? "1 failure" : `${formatNumber(fails)} failures`, status: fuzzPre ? "partial" : fuzz.status, tag: fuzzPre ? "pre-freeze" : "", testId: "gauge-fuzz" }),
     statTile({ label: "WASI checks", value: wasi.passed, total: wasi.total ?? 6, status: wasiPre ? "partial" : wasi.status, tag: wasiPre ? "pre-freeze" : "", testId: "gauge-wasi" }),
-    statTile({ label: "Core suites", value: core.suitesAt100, total: core.suitesTotal ?? 62, unit: isMeasured(core.suitesAt100) ? "" : "suites", detail: "fully passing", status: core.status, testId: "gauge-core" }),
-    statTile({ label: "Blind holdout", value: hold.reposPassed, total: hold.reposTotal ?? 240, unit: isMeasured(hold.reposPassed) ? "" : "repos", detail: "L2 parity", status: hold.status, testId: "gauge-holdout" })
+    statTile({ label: "Core suites", value: core.suitesAt100, total: core.suitesTotal ?? 62, unit: isMeasured(core.suitesAt100) ? "" : "suites", detail: "at 100%", status: core.status, testId: "gauge-core" }),
+    statTile({ label: "Blind holdout", value: hold.reposPassed, total: hold.reposTotal ?? 240, unit: isMeasured(hold.reposPassed) ? "" : "repos", detail: "L2 build graph", status: hold.status, testId: "gauge-holdout" })
   ].join("");
 }
 
@@ -208,7 +208,7 @@ function renderGiantsTable(giants) {
     const leaf = leafRatio ? `${leafRatio}${leafP95}` : (leafP95 ? leafP95.slice(2, -1) : "-");
     return `<tr data-status="${st}"><td>${escapeHtml(p?.name || "")}</td><td class="mono nowrap">${escapeHtml(fmtRatio(p?.cold?.speedup))}</td><td class="mono nowrap">${escapeHtml(fmtRatio(p?.warmProbe?.speedup))}</td><td class="mono nowrap">${escapeHtml(leaf)}</td><td class="mono nowrap">${escapeHtml(fmtRss(p))}</td><td>${statusHtml(st)}</td></tr>`;
   }).join("");
-  return `<div style="border-top:1px solid var(--line);overflow-x:auto" data-test="home-giants-bench"><table class="runner-table"><thead><tr><th>Project</th><th>Cold</th><th>New tree (probe cache)</th><th>Leaf edit</th><th>Peak RSS</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  return `<div style="border-top:1px solid var(--line);overflow-x:auto" data-test="home-giants-bench"><table class="runner-table"><thead><tr><th>Project</th><th>Cold</th><th>Warm probe</th><th>Leaf edit</th><th>Peak RSS</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function renderSpeed(el, bench, motion, giants = null) {
@@ -217,7 +217,7 @@ function renderSpeed(el, bench, motion, giants = null) {
   const c = b.coldConfigureSpeedup || {};
   const l = b.incrementalLeafP95Ms || {};
   const r = b.peakRssMiB || {};
-  el.innerHTML = `${speedupBars({ label: w.label || "New tree, shared probe cache", baseline: w.baseline || "", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: c.label || "Cold configure, 500 targets", baseline: c.baseline || "", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: l.label || "Leaf edit reconfigure, p95", baseline: l.baseline || "", value: l.value, unit: l.unit, status: l.status, testId: "speed-leaf" })}${statRow({ label: r.label || "Peak memory, 500 targets", baseline: r.baseline || "", value: r.value, unit: r.unit, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
+  el.innerHTML = `${speedupBars({ label: w.label || "New tree with shared probe cache", baseline: w.baseline || "", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: c.label || "Cold configure on 500 targets", baseline: c.baseline || "", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: l.label || "Leaf edit reconfigure p95", baseline: l.baseline || "", value: l.value, unit: l.unit, status: l.status, testId: "speed-leaf" })}${statRow({ label: r.label || "Peak memory on 500 targets", baseline: r.baseline || "", value: r.value, unit: r.unit, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
   motion.scan(el);
 }
 
@@ -328,7 +328,7 @@ async function init() {
     motion.scan(document);
   } catch (err) {
     console.error("Failed to render home dashboard snapshot:", err);
-    if (errEl) { errEl.textContent = "Could not render compatibility metrics."; errEl.hidden = false; }
+    if (errEl) { errEl.textContent = "Could not render the compatibility metrics."; errEl.hidden = false; }
   }
 }
 

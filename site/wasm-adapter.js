@@ -20,7 +20,7 @@
  * Licensed under MIT OR Apache-2.0.
  */
 
-export const WASM_ENGINE_COMMIT = "fcc8e48f";
+export const WASM_ENGINE_COMMIT = "8d918295";
 
 export const PLAYGROUND_EXAMPLES = {
   "hello-cpp20": {

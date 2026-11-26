@@ -4,18 +4,18 @@ import { escapeHtml, initRovingGroup } from "./app.js";
 
 export const PIPELINE_MODEL = {
   stages: [
-    { id: "syntax", label: "Syntax", tone: "r", sentence: "Lexes and parses CMake language files.", crates: ["syntax"] },
-    { id: "eval", label: "Eval", tone: "r", sentence: "Runs commands and tracks variables, policies, and generator expressions.", crates: ["eval", "commands", "expr", "genex", "model", "presets"] },
-    { id: "resolve", label: "Resolve", tone: "g", sentence: "Builds the target graph, usage requirements, and link order.", crates: ["resolve", "build", "cxxmodules", "fortran", "cps"] },
-    { id: "gen", label: "Generate", tone: "b", sentence: "Writes build.ninja, Unix Makefiles, project.pbxproj, and .vcxproj files.", crates: ["gen-common", "gen-ninja", "gen-make", "gen-xcode", "gen-vs"] }
+    { id: "syntax", label: "Syntax", tone: "r", sentence: "The syntax stage lexes and parses CMakeLists.txt and .cmake files into a syntax tree with source spans.", crates: ["syntax"] },
+    { id: "eval", label: "Eval", tone: "r", sentence: "The evaluator runs CMake commands and tracks variables, policies, presets, and generator expressions.", crates: ["eval", "commands", "expr", "genex", "model", "presets"] },
+    { id: "resolve", label: "Resolve", tone: "g", sentence: "The resolver builds the target graph, propagates usage requirements, and computes the final link order.", crates: ["resolve", "build", "cxxmodules", "fortran", "cps"] },
+    { id: "gen", label: "Generate", tone: "b", sentence: "The generators write build.ninja, Unix Makefiles, Xcode project.pbxproj files, and Visual Studio .vcxproj files.", crates: ["gen-common", "gen-ninja", "gen-make", "gen-xcode", "gen-vs"] }
   ],
   host: {
     id: "host",
     label: "Host",
-    sentence: "Every stage reads files, environment, and processes only through the Host trait.",
+    sentence: "Every stage accesses files, environment variables, processes, and the clock only through the Host trait.",
     impls: [
-      { label: "NativeHost", sentence: "Reads the real disk, environment, processes, and clock." },
-      { label: "PureHost", sentence: "Keeps files in memory for deterministic tests, editors, and wasm32." }
+      { label: "NativeHost", sentence: "NativeHost uses the local filesystem, environment variables, child processes, and the system clock." },
+      { label: "PureHost", sentence: "PureHost keeps all files and state in memory so tests, the language server, and the wasm32 build stay deterministic." }
     ],
     crates: ["host", "wasm"]
   }

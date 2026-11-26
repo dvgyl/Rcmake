@@ -1,8 +1,8 @@
-# rcmake crawler and AI-search indexing policy
-# Note: GitHub Pages project sites serve this file under /rcmake/robots.txt
-# rather than the origin root; submit sitemap.xml directly in search consoles.
-# LLM index: https://dvgyl.github.io/rcmake/llms.txt
-# Full LLM reference: https://dvgyl.github.io/rcmake/llms-full.txt
+# rcmake crawler and search indexing policy
+# GitHub Pages project sites serve this file under /rcmake/robots.txt
+# rather than the origin root, so submit sitemap.xml directly in search consoles.
+# LLM index at https://rcmake.github.io/rcmake/llms.txt
+# Full LLM reference at https://rcmake.github.io/rcmake/llms-full.txt
 
 User-agent: *
 Allow: /
@@ -43,4 +43,4 @@ Allow: /
 User-agent: Google-Extended
 Allow: /
 
-Sitemap: https://dvgyl.github.io/rcmake/sitemap.xml
+Sitemap: https://rcmake.github.io/rcmake/sitemap.xml

@@ -1,35 +1,35 @@
 # rcmake-api
 
-`rcmake-api` runs the `rcmake` configure engine inside your Rust program. You give it a project and a `Host`, and it returns the evaluated project model, the resolved targets, and diagnostics. You can then ask where a target got a flag or where a variable got its value. The `rcmake explain` command, the `rcmake-lsp` language server, and the browser playground all use this crate.
+`rcmake-api` runs the `rcmake` configure engine inside your Rust program. You pass it a project and a `Host`, and it returns the evaluated project model, resolved targets, and diagnostics. From that result, you can ask where a target got a flag or where a variable got its value. The `rcmake explain` command, the `rcmake-lsp` language server, and the browser playground all use this crate.
 
 ## Add the dependency
 
-The crates are not on crates.io. Use Git dependencies:
+These crates are not published on crates.io, so add them as Git dependencies in `Cargo.toml`.
 
 ```toml
 [dependencies]
-rcmake-api = { git = "https://github.com/dvgyl/rcmake" }
-rcmake-base = { git = "https://github.com/dvgyl/rcmake" }
-rcmake-host = { git = "https://github.com/dvgyl/rcmake" }
-rcmake-model = { git = "https://github.com/dvgyl/rcmake" }
+rcmake-api = { git = "https://github.com/rcmake/rcmake" }
+rcmake-base = { git = "https://github.com/rcmake/rcmake" }
+rcmake-host = { git = "https://github.com/rcmake/rcmake" }
+rcmake-model = { git = "https://github.com/rcmake/rcmake" }
 ```
 
-For WebAssembly targets, turn off the default features:
+For WebAssembly targets, turn off the default features.
 
 ```toml
-rcmake-api = { git = "https://github.com/dvgyl/rcmake", default-features = false }
+rcmake-api = { git = "https://github.com/rcmake/rcmake", default-features = false }
 ```
 
 | Feature | Default | Effect |
 | --- | --- | --- |
-| `native` | on | The persistent probe cache (`rcmake-store`) and the FetchContent cache and lockfiles (`rcmake-fetch`). |
-| `archive` | on | `file(ARCHIVE_CREATE)` and `file(ARCHIVE_EXTRACT)` through `rcmake-archive` and its native codec crates. |
+| `native` | on | Enables the persistent probe cache in `rcmake-store` and the FetchContent cache and lockfiles in `rcmake-fetch`. |
+| `archive` | on | Enables `file(ARCHIVE_CREATE)` and `file(ARCHIVE_EXTRACT)` through `rcmake-archive` and its native codec crates. |
 
-Without both features, the crate compiles for `wasm32-unknown-unknown` and `wasm32-wasip1`.
+With both features off, the crate compiles for `wasm32-unknown-unknown` and `wasm32-wasip1`.
 
 ## Configure a project in memory and explain a target
 
-This example uses `PureHost`, an in-memory file system. It needs no compiler and no disk access. The `seed_toolchain` function writes the files that a configured build tree normally has, so that `project()` does not run compiler checks. [`examples/wasm_smoke.rs`](examples/wasm_smoke.rs) is a complete, tested version of this flow.
+This example runs on `PureHost`, an in-memory file system that needs no compiler and no disk access. The `seed_toolchain` helper writes the files that a configured build tree normally holds, so `project()` skips compiler checks. See [`examples/wasm_smoke.rs`](examples/wasm_smoke.rs) for a complete, tested version of this flow.
 
 ```rust
 use std::{path::Path, sync::Arc};
@@ -114,11 +114,11 @@ fn seed_toolchain(host: &PureHost, root: &Path) -> rcmake_host::HostResult<()> {
 }
 ```
 
-For JSON output, use `render_explain_json(&report, None)` in place of `render_explain_terminal`. The JSON schema name is in `EXPLAIN_SCHEMA`.
+For JSON output, call `render_explain_json(&report, None)` instead of `render_explain_terminal`. The constant `EXPLAIN_SCHEMA` holds the JSON schema name.
 
 ## Explain a project on disk
 
-To read a real project, use `NativeHost` and the installed CMake modules. This setup is the same as the one that `rcmake explain` uses:
+To inspect a real project on disk, use `NativeHost` together with the installed CMake modules. The `rcmake explain` command uses the same setup.
 
 ```rust,no_run
 use std::sync::Arc;
@@ -143,19 +143,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`WriteMode::Overlay` keeps every configure write in memory, so the build directory does not change. `result.overlay_diff` lists the writes. `ProcessPolicy::Deny` blocks subprocesses such as compiler checks. When configure can continue, `result.completion` is `CompletionState::Partial` and lists the denied requests. When it cannot continue, `run_configure` returns `ApiError::DeniedProcess`. For a build directory that is already configured, pass its saved cache with `initial_cache`, as `rcmake explain` does, so that configure reuses the saved compiler results. To run compiler checks, use `ProcessPolicy::Allow` with `WriteMode::Direct`.
+`WriteMode::Overlay` keeps every configure write in memory, so the build directory on disk stays unchanged, and `result.overlay_diff` records those writes. `ProcessPolicy::Deny` blocks subprocesses such as compiler checks. If configure can finish without a blocked process, `result.completion` is `CompletionState::Partial` and lists the denied requests. If configure cannot continue, `run_configure` returns `ApiError::DeniedProcess`.
+
+When you inspect a build directory that is already configured, pass its saved cache through `initial_cache`, as `rcmake explain` does, so configure reuses the saved compiler results. If you want configure to run compiler checks instead, use `ProcessPolicy::Allow` with `WriteMode::Direct`.
 
 ## Main types
 
 | Item | Use |
 | --- | --- |
-| `ConfigureRequest` | Source, build, and CMake data directories, the `Host`, and the builder options: `generator`, `define`, `initial_cache`, `process_policy`, `write_mode`, `services`, `collect_index`, `cancel`, `step_budget`, and `limits`. |
-| `run_configure` | Runs configure and generation. Returns `ConfigureResult` or `ApiError`. |
-| `ConfigureResult` | `model`, `generation`, `diagnostics`, `completion`, `index`, `overlay_diff`, and the `explain`, `explain_filtered`, and `explain_in` queries. |
-| `ExplainQuery` | `Target(name)`, `Variable(name)`, or `Auto(name)`, which finds a target or a variable. |
-| `ExplainReport` | `Target`, `Variable`, `Ambiguous`, `NotFound`, or `InvalidDirectory`. |
-| `render_explain_terminal`, `render_explain_json` | Turn an `ExplainReport` into terminal text or JSON. |
-| `WorkspaceIndex` | Definitions, references, and completions for editors. Set `collect_index(true)` to build it. |
-| `CancelToken` | Stops a running configure from another thread. `run_configure` then returns `ApiError::Cancelled`. |
+| `ConfigureRequest` | Holds the source, build, and CMake data directories along with the `Host`. Builder methods set `generator`, `define`, `initial_cache`, `process_policy`, `write_mode`, `services`, `collect_index`, `cancel`, `step_budget`, and `limits`. |
+| `run_configure` | Runs configure and generation and returns `ConfigureResult` or `ApiError`. |
+| `ConfigureResult` | Holds `model`, `generation`, `diagnostics`, `completion`, `index`, and `overlay_diff`, plus the `explain`, `explain_filtered`, and `explain_in` query methods. |
+| `ExplainQuery` | Selects `Target(name)`, `Variable(name)`, or `Auto(name)`, where `Auto` matches either a target or a variable. |
+| `ExplainReport` | Reports `Target`, `Variable`, `Ambiguous`, `NotFound`, or `InvalidDirectory`. |
+| `render_explain_terminal`, `render_explain_json` | Format an `ExplainReport` as terminal text or JSON. |
+| `WorkspaceIndex` | Stores definitions, references, and completions for editors when you set `collect_index(true)`. |
+| `CancelToken` | Stops a running configure from another thread so `run_configure` returns `ApiError::Cancelled`. |
 
-Run `cargo doc -p rcmake-api --open` for the full API reference.
+Run `cargo doc -p rcmake-api --open` to read the full API reference.

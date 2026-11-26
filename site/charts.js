@@ -78,22 +78,22 @@ export function speedupBars({ label, baseline = "", value, unit = "x", status, t
   let rcScale = "1";
   let spd = `${formatSpeed(value)}${u}`;
   let rcCls = "is-rcmake";
-  let ariaText = `${lbl}. CMake 4.5.1 is 1.00 times, rcmake is ${formatSpeed(value)}${isRatio ? " times" : ` ${unit}`}.`;
+  let ariaText = `${lbl}. CMake 4.5.1 is the 1.00 times baseline, and rcmake is ${formatSpeed(value)}${isRatio ? " times" : ` ${unit}`}.`;
   if (isRatio) {
     if (value > 1) {
       rcScale = String(Number(Math.min(1, Math.max(0.02, 1 / value)).toFixed(4)));
       spd = `${formatSpeed(value)}\u00d7 faster`;
-      ariaText = `${lbl}. CMake 4.5.1 is 1.00 times, rcmake is ${formatSpeed(value)} times faster.`;
+      ariaText = `${lbl}. CMake 4.5.1 is the 1.00 times baseline, and rcmake is ${formatSpeed(value)} times faster.`;
     } else if (value < 1) {
       const slower = (1 / value).toFixed(2);
       cmScale = String(Number(Math.min(1, Math.max(0.02, value)).toFixed(4)));
       rcScale = "1";
       spd = `${slower}\u00d7 slower`;
       rcCls = st === "fail" ? "is-fail" : "is-partial";
-      ariaText = `${lbl}. CMake 4.5.1 is 1.00 times, rcmake is ${slower} times slower.`;
+      ariaText = `${lbl}. CMake 4.5.1 is the 1.00 times baseline, and rcmake is ${slower} times slower.`;
     } else {
       spd = "1.00\u00d7";
-      ariaText = `${lbl}. Parity with CMake 4.5.1 at 1.00 times.`;
+      ariaText = `${lbl}. rcmake matches CMake 4.5.1 at 1.00 times.`;
     }
   } else {
     rcScale = String(Number(Math.min(1, Math.max(0.02, 1 / value)).toFixed(4)));
@@ -111,7 +111,7 @@ export function statRow({ label, value, unit = "", baseline = "", status, testId
   const st = normalizeStatus(status === "pending" ? "pass" : status);
   const u = safeText(unit);
   const fmt = `${formatNumber(value)}${u ? ` ${u}` : ""}`;
-  return `<figure class="stat-card" aria-label="${lbl}. rcmake ${fmt}." data-status="${st}"${attrs}><div class="stat-num" data-value>${fmt}</div><figcaption class="stat-label">${lbl}</figcaption>${base ? `<div class="stat-base">${base}</div>` : ""}</figure>`;
+  return `<figure class="stat-card" aria-label="${lbl}. rcmake is ${fmt}." data-status="${st}"${attrs}><div class="stat-num" data-value>${fmt}</div><figcaption class="stat-label">${lbl}</figcaption>${base ? `<div class="stat-base">${base}</div>` : ""}</figure>`;
 }
 
 export function compactNumber(v) {
@@ -130,7 +130,15 @@ export function statTile({ label, value, total, unit = "", detail = "", status, 
     ? `${escapeHtml(compactNumber(value))}${isMeasured(total) ? `<span class="tile-total">/${escapeHtml(compactNumber(total))}</span>` : ""}${unit ? `<span class="tile-unit">${safeText(unit)}</span>` : ""}`
     : `<span class="tile-pending">${isMeasured(total) ? `${escapeHtml(formatNumber(total))}${unit ? ` ${safeText(unit)}` : ""}` : "pending"}</span>`;
   const foot = ok ? safeText(detail) : "pending";
-  const aria = ok ? `${lbl}. ${formatNumber(value)}${isMeasured(total) ? ` of ${formatNumber(total)}` : ""}${unit ? ` ${unit}` : ""}. ${detail}${tag ? ` ${tag}.` : ""}` : `${lbl}. Pending.`;
+  const ariaParts = [
+    `${lbl}.`,
+    ok
+      ? `${formatNumber(value)}${isMeasured(total) ? ` of ${formatNumber(total)}` : ""}${unit ? ` ${unit}` : ""}.`
+      : "Pending."
+  ];
+  if (ok && detail) ariaParts.push(`${String(detail).replace(/\.$/, "")}.`);
+  if (ok && tag) ariaParts.push(`${String(tag).replace(/\.$/, "")}.`);
+  const aria = ariaParts.join(" ");
   return `<figure class="tile" data-status="${st}" aria-label="${escapeHtml(aria)}"${attrs}><div class="tile-num" data-value>${main}</div><figcaption class="tile-label">${lbl}</figcaption><div class="tile-foot">${statusIcon(st)}<span>${foot}</span>${tag ? `<span class="tile-tag">${safeText(tag)}</span>` : ""}</div></figure>`;
 }
 
@@ -150,7 +158,7 @@ export function osStripsHtml(platforms, { testPrefix = "os-strip" } = {}) {
     const bar = pct === null
       ? '<div class="bar-track is-pending" data-loop aria-hidden="true"></div>'
       : `<div class="bar-track" aria-hidden="true"><div class="bar-fill ${st === "fail" ? "is-fail" : st === "partial" ? "is-partial" : "is-pass"}" style="--v:${Number(Math.max(0.01, pct / 100).toFixed(4))}"></div></div>`;
-    const aria = pct === null ? `${p.name}. ${p.suitesTotal} Tests/RunCMake suites, pending.` : `${p.name}. ${hasCount ? `${p.suitesPassed} of ${p.suitesTotal}` : formatPercent(pct)} Tests/RunCMake suites pass.`;
+    const aria = pct === null ? `${p.name}. ${p.suitesTotal} Tests/RunCMake suites pending.` : `${p.name}. ${hasCount ? `${p.suitesPassed} of ${p.suitesTotal}` : formatPercent(pct)} Tests/RunCMake suites pass.`;
     return `<figure class="os-strip" data-status="${st}" aria-label="${escapeHtml(aria)}" data-test="${escapeHtml(testPrefix)}-${escapeHtml(p.id)}"><div class="os-head"><span class="os-name">${escapeHtml(name)}<span class="os-arch">${escapeHtml(arch)}</span></span><span class="os-val">${value}${statusIcon(st)}</span></div>${bar}</figure>`;
   }).join("");
 }
@@ -260,7 +268,7 @@ export function waffleRowsHtml(platforms, { cell = 7, gap = 2, testPrefix = "waf
   return (platforms || []).map((p) => {
     const ok = isMeasured(p.suitesPassed);
     const st = ok ? normalizeStatus(p.status) : "pending";
-    const aria = ok ? `${p.name}. ${p.suitesPassed} of ${p.suitesTotal} Tests/RunCMake suites pass.` : `${p.name}. ${p.suitesTotal} Tests/RunCMake suites, pending.`;
+    const aria = ok ? `${p.name}. ${p.suitesPassed} of ${p.suitesTotal} Tests/RunCMake suites pass.` : `${p.name}. ${p.suitesTotal} Tests/RunCMake suites pending.`;
     const visual = ok
       ? waffle({ passed: p.suitesPassed, total: p.suitesTotal, cols: 53, rows: 7, status: st, cell, gap })
       : '<div class="bar-track waffle-pending-bar is-pending" data-loop data-status="pending" aria-hidden="true"></div>';
@@ -272,7 +280,7 @@ export function waffleRowsHtml(platforms, { cell = 7, gap = 2, testPrefix = "waf
         footParts.push(`${formatNumber(p.casesPassed)} / ${formatNumber(p.casesTotal)} cases`);
       }
       if (p.partial && isMeasured(p.completedSuites) && isMeasured(p.expectedSuites)) {
-        footParts.push(`partial: ${formatNumber(p.completedSuites)} / ${formatNumber(p.expectedSuites)} run`);
+        footParts.push(`partial run, ${formatNumber(p.completedSuites)} of ${formatNumber(p.expectedSuites)} suites completed`);
       }
     } else {
       footParts.push(`${formatNumber(p.suitesTotal)} RunCMake suites`);

@@ -6,7 +6,7 @@ const ICON_BY_STATUS = { pass: "i-check", partial: "i-differs", fail: "i-cross",
 export const TRACK_LABELS = Object.freeze({
   coreConformance: "Core suites",
   policies: "Policies",
-  runCmakeOs: "Tests/RunCMake by OS",
+  runCmakeOs: "Tests/RunCMake by operating system",
   bossFight: "Large projects",
   unseenHoldout: "Blind holdout",
   vcpkgMatrix: "vcpkg ports",
@@ -364,7 +364,7 @@ export function overviewRows(data) {
 
   const hasL3 = typeof boss.l3Passed === "number";
   const hasL4 = typeof boss.l4Passed === "number";
-  const bossCheck = hasL4 ? "Large projects, L1-L4" : hasL3 ? "Large projects, L1-L3" : "Large projects, L1 / L2";
+  const bossCheck = hasL4 ? "Large projects, L1 to L4" : hasL3 ? "Large projects, L1 to L3" : "Large projects, L1 and L2";
   let bossResult = null;
   if (typeof boss.l1Passed === "number" && typeof boss.l2Passed === "number") {
     const parts = [boss.l1Passed, boss.l2Passed];
@@ -379,7 +379,7 @@ export function overviewRows(data) {
   const rows = [
     { id: "core", check: "Core suites", result: formatRatio(core.suitesAt100, core.suitesTotal), scope: `- / ${formatNumber(core.suitesTotal) ?? "?"}`, ratio: ratioOf(core.suitesAt100, core.suitesTotal), status: normalizeStatus(core.status) },
     { id: "core", check: `Policies ${pol.activeRange || ""}`.trim(), result: formatRatio(pol.suitesPassed, pol.suitesTotal), scope: `- / ${formatNumber(pol.suitesTotal) ?? "?"}`, ratio: ratioOf(pol.suitesPassed, pol.suitesTotal), status: normalizeStatus(pol.status) },
-    { id: "runcmake", check: "Tests/RunCMake, 3 OS", result: osAny ? plats.map((p) => formatPercent(p.passRate) ?? "-").join(" / ") : null, scope: `${plats.map((p) => p.suitesTotal).join(" / ")} suites`, ratio: osAny ? measuredPlats.reduce((a, p) => a + p.passRate, 0) / (plats.length * 100) : null, status: normalizeStatus(rc.status) },
+    { id: "runcmake", check: "Tests/RunCMake across 3 operating systems", result: osAny ? plats.map((p) => formatPercent(p.passRate) ?? "-").join(" / ") : null, scope: `${plats.map((p) => p.suitesTotal).join(" / ")} suites`, ratio: osAny ? measuredPlats.reduce((a, p) => a + p.passRate, 0) / (plats.length * 100) : null, status: normalizeStatus(rc.status) },
     { id: "gates", check: "Black-box scenarios", result: formatRatio(bb.scenariosPassed, bb.scenariosTotal), scope: `- / ${formatNumber(bb.scenariosTotal) ?? "?"}`, ratio: ratioOf(bb.scenariosPassed, bb.scenariosTotal), status: normalizeStatus(bb.status) },
     { id: "projects", check: bossCheck, result: bossResult, scope: `- / ${formatNumber(boss.projectsTotal) ?? "?"}`, ratio: bossRatio, status: normalizeStatus(boss.status) },
     { id: "holdout", check: "Blind holdout", result: formatRatio(hold.reposPassed, hold.reposTotal), scope: `- / ${formatNumber(hold.reposTotal) ?? "?"}`, ratio: ratioOf(hold.reposPassed, hold.reposTotal), status: normalizeStatus(hold.status) },
@@ -407,8 +407,8 @@ export function overviewRows(data) {
   }
   rows.push(
     { id: "gates", check: "WASI and wasm32", result: formatRatio(wasi.passed, wasi.total) ? `${formatRatio(wasi.passed, wasi.total)}${wasiTag}` : null, scope: `- / ${formatNumber(wasi.total) ?? "?"}`, ratio: ratioOf(wasi.passed, wasi.total), status: wasiPre ? "partial" : normalizeStatus(wasi.status), statusText: wasiPre ? "pre-freeze" : undefined },
-    { id: "speed", check: "Cold configure, 500 targets", result: formatSpeedSummary(cold), scope: "pending", ratio: speedRowRatio(cold), status: normalizeStatus(cold.status) },
-    { id: "speed", check: "New tree, shared probe cache", result: formatSpeedSummary(warm), scope: "pending", ratio: speedRowRatio(warm), status: normalizeStatus(warm.status) }
+    { id: "speed", check: "Cold configure on 500 targets", result: formatSpeedSummary(cold), scope: "pending", ratio: speedRowRatio(cold), status: normalizeStatus(cold.status) },
+    { id: "speed", check: "New tree with shared probe cache", result: formatSpeedSummary(warm), scope: "pending", ratio: speedRowRatio(warm), status: normalizeStatus(warm.status) }
   );
   return rows;
 }

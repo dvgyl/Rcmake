@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
 # Ecosystem compatibility fixtures
 
-Run the fixtures with CMake 4.5.1 and a staged Rcmake executable.
+These fixtures compare a staged `rcmake` binary against CMake 4.5.1 across real build-tool workflows. Run the suite with `tools/corpus/ecosystem_eval.py`.
 
 ~~~sh
 source env/env.sh
@@ -12,24 +12,13 @@ python3 tools/corpus/ecosystem_eval.py \
   --out-md /tmp/rcmake-ecosystem.md
 ~~~
 
-The report records the PATH lookups, the version checks, the result of each
-command and the file comparison. Look next to the JSON report for the
-execution logs and unified diffs. The report shows
-`skipped_missing_tool` for scenarios that require a tool the harness could
-not find. The package manager and wheel scenarios can download dependencies.
+The report records `PATH` lookups, version checks, command results, and file comparisons. Execution logs and unified diffs sit next to the JSON report. If a scenario needs a tool that is not installed, the report marks it as `skipped_missing_tool`. The package manager and Python wheel scenarios can download dependencies over the network.
 
-Use `VCPKG_ROOT` to specify the vcpkg checkout if the executable is outside
-that checkout. Use `--rust-cmake-driver /path/to/driver` to run an existing
-driver that uses the Rust `cmake` crate. The harness starts the driver in a
-copy of `recursive-driver/sub`. The driver can use `cmake::Config::new(".")`
-with an output directory in the working directory. The harness uses the
-staged binary and does not build Rcmake.
+Set `VCPKG_ROOT` to your vcpkg checkout if the `vcpkg` executable lives outside that checkout. Pass `--rust-cmake-driver /path/to/driver` to run an existing driver built with the Rust `cmake` crate. The script starts that driver inside a copy of `recursive-driver/sub`, where the driver can call `cmake::Config::new(".")` and write its output inside the working directory. The runner uses the staged binary directly and does not build `rcmake`.
 
 ## Compare a project with its own commands
 
-Use `tools/corpus/pathswap.py` with `--stage`, `--oracle`, `--out-json`,
-`--source` and `--commands`. The commands file contains a JSON array. For
-example, use these commands for the recursive fixture.
+To compare a single project using custom commands, run `tools/corpus/pathswap.py` with `--stage`, `--oracle`, `--out-json`, `--source`, and `--commands`. The commands file holds a JSON array of stages, like this example for the recursive fixture.
 
 ~~~json
 [
@@ -43,16 +32,8 @@ example, use these commands for the recursive fixture.
 ]
 ~~~
 
-The harness passes each command string to `sh -c` as written. It starts each
-command in the project copy. Put shell commands that share shell state in the
-same stage. For example, put `cd build && ctest` in one stage.
+`pathswap.py` passes each string command to `sh -c` verbatim and starts each stage inside the project copy. Put shell commands that share shell state into the same stage, such as `cd build && ctest`.
 
-The `expect` field lists the tool personas that must appear in Rcmake's
-execution log for the stage. It defaults to `["cmake"]`. Use an empty list
-for commands that do not need to invoke a CMake tool. A stage that needs an
-execution record fails proof when the record is missing, even if the command
-returns zero.
+The `expect` field lists the tool names, such as `cmake`, `ctest`, or `cpack`, that must appear in the `rcmake` execution log for that stage. It defaults to `["cmake"]`. Pass an empty list for stages that do not invoke a CMake tool. If an expected execution record is missing, the stage fails the check even when the command exits with code 0.
 
-Use `--configured-output build/version.h` to include the generated header.
-Repeat the option to select more files by project-relative glob. The harness
-compares the known generated file classes automatically.
+Pass `--configured-output build/version.h` to compare a generated header, and repeat the flag to include more files by project-relative glob. `pathswap.py` compares known generated file classes automatically.

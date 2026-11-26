@@ -117,11 +117,37 @@ is_rcmake_link() {
   [[ -L "$1" && "$(readlink "$1")" == rcmake ]]
 }
 
+check_no_symlink_ancestors() {
+  local root="${1%/}"
+  local rel="$2"
+  local cur="$root"
+  local part
+  local IFS='/'
+  for part in $rel; do
+    [[ -z "$part" ]] && continue
+    cur="$cur/$part"
+    if [[ -L "$cur" ]]; then
+      die "Refusing to modify through symbolic link directory $cur."
+    fi
+  done
+}
+
 if "$uninstall"; then
   if [[ "$mode" != release || "$alias_cmake" == true || "$force" == true ]]; then
     printf 'Use --uninstall with only an optional --prefix.\n' >&2
     exit 2
   fi
+  if [[ -L "$prefix" ]]; then
+    die "Refusing to uninstall through symbolic link prefix $prefix."
+  fi
+  check_no_symlink_ancestors "$prefix" "bin"
+  check_no_symlink_ancestors "$prefix" "share"
+  check_no_symlink_ancestors "$prefix" "share/doc"
+  check_no_symlink_ancestors "$prefix" "share/man/man1"
+  check_no_symlink_ancestors "$prefix" "share/bash-completion/completions"
+  check_no_symlink_ancestors "$prefix" "share/zsh/site-functions"
+  check_no_symlink_ancestors "$prefix" "share/fish/vendor_completions.d"
+  check_no_symlink_ancestors "$prefix" "share/rcmake/completions"
   removed=()
   for tool in "${tools[@]}"; do
     if is_rcmake_link "$bin_dir/$tool"; then
@@ -260,7 +286,7 @@ case "$mode" in
       Darwin:arm64) target=aarch64-apple-darwin ;;
       *) die 'No release archive for this host. Use --from-source in a checkout on Linux or macOS.' ;;
     esac
-    releases=https://github.com/dvgyl/rcmake/releases
+    releases=https://github.com/rcmake/rcmake/releases
     suffix="-$target.tar.gz"
     if [[ -n "$version" ]]; then
       downloads="$releases/download/v$version"

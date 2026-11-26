@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-label="rcmake: Drop-in CMake 4.5.1 in safe Rust (cmake, ctest, cpack, rcmake-lsp)">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-label="rcmake, drop-in CMake 4.5.1 in safe Rust with cmake, ctest, cpack, and rcmake-lsp">
   <title>rcmake</title>
   <defs>
     <pattern id="bench-dots" width="16" height="16" patternUnits="userSpaceOnUse">
@@ -16,6 +16,6 @@
   <text x="398" y="306" fill="#ecebe6" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="43" font-weight="600" letter-spacing="-1">Drop-in CMake 4.5.1 in safe Rust</text>
   <text x="398" y="368" fill="#b4b3ac" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace" font-size="26" font-weight="500">cmake<tspan fill="#6a6b70"> · </tspan>ctest<tspan fill="#6a6b70"> · </tspan>cpack<tspan fill="#6a6b70"> · </tspan>rcmake-lsp</text>
   <line x1="96" y1="498" x2="1104" y2="498" stroke="#25272c" stroke-width="1.5"/>
-  <text x="96" y="562" fill="#c7c6bf" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace" font-size="26" font-weight="500">dvgyl.github.io/rcmake</text>
+  <text x="96" y="562" fill="#c7c6bf" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace" font-size="26" font-weight="500">rcmake.github.io/rcmake</text>
   <text x="1104" y="562" fill="#8f8e88" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace" font-size="26" text-anchor="end">MIT OR Apache-2.0</text>
 </svg>

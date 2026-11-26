@@ -1,37 +1,37 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
-    <loc>https://dvgyl.github.io/rcmake/</loc>
+    <loc>https://rcmake.github.io/rcmake/</loc>
     <lastmod>2026-11-26</lastmod>
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
   </url>
   <url>
-    <loc>https://dvgyl.github.io/rcmake/playground.html</loc>
+    <loc>https://rcmake.github.io/rcmake/playground.html</loc>
     <lastmod>2026-11-26</lastmod>
     <changefreq>weekly</changefreq>
     <priority>0.9</priority>
   </url>
   <url>
-    <loc>https://dvgyl.github.io/rcmake/dashboard.html</loc>
+    <loc>https://rcmake.github.io/rcmake/dashboard.html</loc>
     <lastmod>2026-11-26</lastmod>
     <changefreq>daily</changefreq>
     <priority>0.9</priority>
   </url>
   <url>
-    <loc>https://dvgyl.github.io/rcmake/llms.txt</loc>
+    <loc>https://rcmake.github.io/rcmake/llms.txt</loc>
     <lastmod>2026-11-26</lastmod>
     <changefreq>weekly</changefreq>
     <priority>0.8</priority>
   </url>
   <url>
-    <loc>https://dvgyl.github.io/rcmake/llms-full.txt</loc>
+    <loc>https://rcmake.github.io/rcmake/llms-full.txt</loc>
     <lastmod>2026-11-26</lastmod>
     <changefreq>weekly</changefreq>
     <priority>0.7</priority>
   </url>
   <url>
-    <loc>https://dvgyl.github.io/rcmake/data/latest.json</loc>
+    <loc>https://rcmake.github.io/rcmake/data/latest.json</loc>
     <lastmod>2026-11-26</lastmod>
     <changefreq>daily</changefreq>
     <priority>0.6</priority>
