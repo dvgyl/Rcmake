@@ -14,6 +14,39 @@ fn path(value: &str) -> PathBuf {
     }
 }
 
+#[test]
+fn native_runtime_shares_parsed_sources_with_all_speed_options_off() {
+    let source = path("/project");
+    let build = path("/build");
+    let executable = path("/tools/rcmake");
+    let host = Arc::new(PureHost::new(source.clone(), executable.clone()));
+    let runtime = ConfigureRuntime::new(host, &source, &build, &Services::default(), true);
+    assert!(runtime.native.is_none());
+    let mut interp = Interp::new(
+        InterpConfig::new(
+            runtime.host(),
+            RunMode::Configure,
+            source.join("data"),
+            executable,
+            source,
+        ),
+        crate::register_all,
+    );
+    runtime.attach(&mut interp);
+    let first = interp
+        .cx()
+        .parse_cache()
+        .cloned()
+        .expect("native parse cache");
+    runtime.attach(&mut interp);
+    assert!(
+        interp
+            .cx()
+            .parse_cache()
+            .is_some_and(|cache| Arc::ptr_eq(cache, &first))
+    );
+}
+
 fn configure(
     host: Arc<PureHost>,
     source: &Path,

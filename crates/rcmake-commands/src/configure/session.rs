@@ -17,6 +17,8 @@ pub struct ConfigureRuntime {
     hermetic: Option<HermeticRuntime>,
     #[cfg(all(feature = "native", any(unix, windows)))]
     native: Option<native::NativeSession>,
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    parse_cache: Option<Arc<rcmake_eval::SharedParseCache>>,
     evaluated: bool,
 }
 
@@ -35,7 +37,9 @@ impl ConfigureRuntime {
             .as_ref()
             .map_or_else(|| Arc::clone(&host), HermeticRuntime::host);
         #[cfg(all(feature = "native", any(unix, windows)))]
-        let native = if allow_persistent && host.supports_process_execution() {
+        let native_available = allow_persistent && host.supports_process_execution();
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let native = if native_available {
             native::NativeSession::new(host, Arc::clone(&evaluated_host), source, build, services)
         } else {
             None
@@ -53,6 +57,8 @@ impl ConfigureRuntime {
             hermetic,
             #[cfg(all(feature = "native", any(unix, windows)))]
             native,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            parse_cache: native_available.then(Arc::default),
             evaluated: false,
         }
     }
@@ -73,6 +79,10 @@ impl ConfigureRuntime {
         #[cfg(all(feature = "native", any(unix, windows)))]
         if self.hermetic.is_none() {
             interp.add_session_data(Arc::new(super::build_tool_facts::BuildToolFacts::default()));
+        }
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if let Some(cache) = &self.parse_cache {
+            interp.set_parse_cache(cache.clone());
         }
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(native) = &self.native {
