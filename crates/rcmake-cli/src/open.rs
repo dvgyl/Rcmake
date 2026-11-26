@@ -23,9 +23,8 @@ fn error(host: &dyn Host, message: &str) -> i32 {
 pub(crate) fn run(args: &[BString], persona: Persona, host: &dyn Host) -> i32 {
     let mut dir = None;
     if let Some((first, extra)) = args.split_first() {
-        if !first.is_empty() {
-            dir = Some(first.as_slice());
-        }
+        // An empty directory argument names the current directory, as in CMake.
+        dir = Some(first.as_slice());
         for arg in extra {
             host.write_out(
                 Stream::Stderr,
@@ -128,8 +127,26 @@ fn open_xcode(host: &dyn Host, dir: &Path, project_name: &[u8]) -> i32 {
     } else {
         return 1;
     };
-    launch(host, dir, "open", vec![path::from_native(&target)])
+    launch(
+        host,
+        dir,
+        "open",
+        vec![path::from_native(&target)],
+        host.env_all(),
+    )
 }
+
+/// The environment variable that gives the solution path to PowerShell.
+const OPEN_PATH_VARIABLE: &str = "RCMAKE_OPEN_PATH";
+
+/// The PowerShell command that opens the file in `RCMAKE_OPEN_PATH` with its
+/// associated application.
+///
+/// The path goes through the environment, not the command line, so no shell
+/// parses it: spaces, brackets, `&`, `^`, and quotes in the path stay literal
+/// data. Windows PowerShell 5.1 `Start-Process` has no `-LiteralPath`, so the
+/// command uses `Invoke-Item`.
+const OPEN_COMMAND: &str = "Invoke-Item -LiteralPath $env:RCMAKE_OPEN_PATH -ErrorAction Stop";
 
 fn open_visual_studio(host: &dyn Host, dir: &Path, project_name: &[u8]) -> i32 {
     if project_name.is_empty() {
@@ -144,36 +161,41 @@ fn open_visual_studio(host: &dyn Host, dir: &Path, project_name: &[u8]) -> i32 {
     } else {
         return 1;
     };
+    let mut env = host.env_all();
+    env.retain(|(name, _)| !name.eq_ignore_ascii_case(OPEN_PATH_VARIABLE.as_bytes()));
+    env.push((OPEN_PATH_VARIABLE.into(), path::from_native(&target)));
     launch(
         host,
         dir,
-        "cmd",
-        vec![
-            BString::from("/C"),
-            BString::from("start"),
-            BString::default(),
-            path::from_native(&target),
-        ],
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", OPEN_COMMAND]
+            .map(BString::from)
+            .into(),
+        env,
     )
 }
 
-fn launch(host: &dyn Host, cwd: &Path, program: &str, args: Vec<BString>) -> i32 {
+fn launch(
+    host: &dyn Host,
+    cwd: &Path,
+    program: &str,
+    args: Vec<BString>,
+    env: Vec<(BString, BString)>,
+) -> i32 {
     let request = RunRequest {
         pipeline: vec![CommandSpec {
             program: BString::from(program),
             args,
         }],
         cwd: cwd.to_path_buf(),
-        env: host.env_all(),
+        env,
         stdin: Input::Inherit,
         stdout: Output::Capture,
         stderr: Output::Capture,
         timeout: None,
         tee: true,
     };
-    match host.run(&request, &mut |stream, bytes| {
-        host.write_out(stream, bytes)
-    }) {
+    match host.run(&request, &mut |stream, bytes| host.write_out(stream, bytes)) {
         Ok(output) if output.results.first() == Some(&ProcessResult::Exited(0)) => 0,
         _ => 1,
     }
@@ -215,6 +237,15 @@ mod tests {
         assert_eq!(
             host.stream_bytes(Stream::Stderr),
             b"Unknown argument --extra\nUsage: cmake --open <dir>\n"
+        );
+
+        // An empty argument names the current directory.
+        let host = Arc::new(PureHost::default());
+        host.create_dir_all(Path::new("/work")).unwrap();
+        assert_eq!(invoke(&host, &["cmake", "--open", ""]), 1);
+        assert_eq!(
+            host.stream_bytes(Stream::Stderr),
+            b"Error: not a CMake build directory (missing CMakeCache.txt)\n"
         );
 
         let host = Arc::new(PureHost::default());
@@ -331,8 +362,14 @@ mod tests {
         assert_eq!(
             recorded.as_slice(),
             [
-                vec![BString::from("open"), BString::from("/work/build/Demo.xcodeproj")],
-                vec![BString::from("open"), BString::from("/work/build/Demo.xcworkspace")],
+                vec![
+                    BString::from("open"),
+                    BString::from("/work/build/Demo.xcodeproj")
+                ],
+                vec![
+                    BString::from("open"),
+                    BString::from("/work/build/Demo.xcworkspace")
+                ],
             ]
         );
     }
@@ -342,22 +379,30 @@ mod tests {
     fn open_launches_visual_studio_solution_and_prefers_slnx() {
         use std::sync::Mutex;
 
+        use rcmake_base::ByteSlice;
         use rcmake_host::{ProcessResult, RunOutput};
 
+        // Spaces, `&`, and `^` must reach the launcher as data, not as shell syntax.
         let host = Arc::new(PureHost::default());
         host.seed_file(
             Path::new("/work/build/CMakeCache.txt"),
-            b"CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022\nCMAKE_PROJECT_NAME:STATIC=Demo\n",
+            b"CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022\nCMAKE_PROJECT_NAME:STATIC=My & App^1\n",
         )
         .unwrap();
-        host.seed_file(Path::new("/work/build/Demo.sln"), b"")
+        host.seed_file(Path::new("/work/build/My & App^1.sln"), b"")
             .unwrap();
-        let seen = Arc::new(Mutex::new(Vec::<Vec<BString>>::new()));
+        type Launch = (Vec<BString>, Option<BString>);
+        let seen = Arc::new(Mutex::new(Vec::<Launch>::new()));
         let seen_clone = Arc::clone(&seen);
         host.set_command_handler(move |_, request, _| {
             let mut cmd = vec![request.pipeline[0].program.clone()];
             cmd.extend(request.pipeline[0].args.iter().cloned());
-            seen_clone.lock().unwrap().push(cmd);
+            let path = request
+                .env
+                .iter()
+                .find(|(name, _)| name == "RCMAKE_OPEN_PATH")
+                .map(|(_, value)| value.clone());
+            seen_clone.lock().unwrap().push((cmd, path));
             Ok(RunOutput {
                 results: vec![ProcessResult::Exited(0)],
                 stdout: Vec::new(),
@@ -367,14 +412,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(invoke(&host, &["cmake", "--open", "build"]), 0);
-        host.seed_file(Path::new("/work/build/Demo.slnx"), b"")
+        host.seed_file(Path::new("/work/build/My & App^1.slnx"), b"")
             .unwrap();
         assert_eq!(invoke(&host, &["cmake", "--open", "build"]), 0);
 
         let recorded = seen.lock().unwrap();
         assert_eq!(recorded.len(), 2);
-        assert_eq!(recorded[0][0], "cmd");
-        assert!(recorded[0][4].to_string().ends_with("Demo.sln"));
-        assert!(recorded[1][4].to_string().ends_with("Demo.slnx"));
+        for ((command, path), suffix) in recorded.iter().zip(["My & App^1.sln", "My & App^1.slnx"])
+        {
+            assert_eq!(
+                command.as_slice(),
+                [
+                    BString::from("powershell.exe"),
+                    BString::from("-NoProfile"),
+                    BString::from("-NonInteractive"),
+                    BString::from("-Command"),
+                    BString::from(super::OPEN_COMMAND),
+                ]
+            );
+            assert!(
+                command.iter().all(|arg| !arg.contains_str("App")),
+                "the path must not be on the command line: {command:?}"
+            );
+            let path = path.as_ref().map(ToString::to_string).unwrap_or_default();
+            assert!(path.ends_with(suffix), "{path}");
+        }
     }
 }

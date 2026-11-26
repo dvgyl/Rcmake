@@ -92,6 +92,64 @@ const NATIVE_FLAGS: &[&[u8]] = &[
     b"--no-probe-cache",
 ];
 
+/// Options that CMake 4.5.1 suggests for an unknown configure argument, in the
+/// order that `cmake::SetArgs` declares them. A Windows CMake also has
+/// `WINDOWS_SUGGESTIONS`.
+const COMPAT_SUGGESTIONS: &[&[u8]] = &[
+    b"-S",
+    b"-H",
+    b"-O",
+    b"-B",
+    b"--fresh",
+    b"-P",
+    b"-D",
+    b"-C",
+    b"-U",
+    b"-W",
+    b"-A",
+    b"-T",
+    b"--toolchain",
+    b"--install-prefix",
+    b"--check-build-system",
+    b"--check-stamp-file",
+    b"--check-stamp-list",
+    b"--regenerate-during-build",
+    b"--find-package",
+    b"--graphviz",
+    b"--debug-trycompile",
+    b"--debug-output",
+    b"--log-level",
+    b"--loglevel",
+    b"--log-context",
+    b"--project-file",
+    b"--debug-find",
+    b"--debug-find-pkg",
+    b"--debug-find-var",
+    b"--trace",
+    b"--trace-expand",
+    b"--trace-format",
+    b"--trace-source",
+    b"--trace-redirect",
+    b"--warn-uninitialized",
+    b"--warn-unused-vars",
+    b"--no-warn-unused-cli",
+    b"--check-system-vars",
+    b"--compile-no-warning-as-error",
+    b"--link-no-warning-as-error",
+    b"--debugger",
+    b"--debugger-pipe",
+    b"--debugger-dap-log",
+    b"--profiling-format",
+    b"--profiling-output",
+    b"--preset",
+    b"--presets-file",
+    b"--list-presets",
+];
+
+/// The configure options that only a Windows CMake has.
+const WINDOWS_SUGGESTIONS: &[&[u8]] = &[b"--vs-solution-file"];
+
+/// Long options that the Native persona suggests for an unknown argument.
 const LONG_OPTIONS: &[&[u8]] = &[
     b"--build",
     b"--install",
@@ -120,6 +178,7 @@ const LONG_OPTIONS: &[&[u8]] = &[
     b"--trace-source",
     b"--trace-redirect",
     b"--warn-uninitialized",
+    b"--warn-unused-vars",
     b"--no-warn-unused-cli",
     b"--check-system-vars",
     b"--debug-output",
@@ -204,12 +263,19 @@ fn parse_args(
         persona,
         ..Options::default()
     };
-    let mut first_extension = None;
-    let mut first_unknown = None;
+    // Any `-P` argument selects script mode. Only script mode stops option
+    // processing at `--`, so that the script can take arbitrary arguments.
+    let script_role = args.iter().any(|arg| arg.starts_with(b"-P"));
+    let mut configure_only_extension = None;
+    let mut last_unknown = None;
     let mut iter = args.iter().peekable();
     let mut profile_format = None;
     while let Some(raw) = iter.next() {
-        if raw.as_slice() == b"--" {
+        if script_role && raw.as_slice() == b"--" {
+            if opts.script.is_none() {
+                // CMake also stops here when `-P` comes after `--`: it runs nothing.
+                return Ok(None);
+            }
             break;
         }
         let mut arg = Argument::new(raw, &mut iter);
@@ -228,7 +294,9 @@ fn parse_args(
             && extensions::parse_native_extension_flag(arg.original, &mut opts.extensions)
                 .map_err(|error| error.to_string())?
         {
-            first_extension.get_or_insert(raw);
+            if !extensions::is_script_mode_extension(arg.flag) {
+                configure_only_extension.get_or_insert(arg.flag);
+            }
             if arg.original == b"--profile"
                 && let Some(next) = arg.rest.peek()
             {
@@ -249,17 +317,21 @@ fn parse_args(
         {
             continue;
         }
-        first_unknown.get_or_insert(raw);
+        // CMake reports the last unknown argument.
+        last_unknown = Some(raw);
     }
     if opts.script.is_none()
-        && let Some(flag) = first_unknown
+        && let Some(flag) = last_unknown
     {
         return Err(unknown_option(flag, persona));
     }
     if opts.script.is_some()
-        && let Some(flag) = first_extension
+        && let Some(flag) = configure_only_extension
     {
-        return Err(unknown_option(flag, Persona::Compat));
+        return Err(format!(
+            "{} allowed only when configuring a project",
+            String::from_utf8_lossy(flag)
+        ));
     }
     validate_script_mode(&opts, host)?;
     debug::validate_profile(host, &opts, profile_format)?;
@@ -444,38 +516,50 @@ pub(crate) fn take_value<'a, T: AsRef<[u8]> + ?Sized + 'a>(
         .map(AsRef::as_ref)
 }
 
+/// The first flag with the smallest edit distance to `arg`, as `cmFindClosestString` selects it.
+///
+/// The accepted distance grows with the length of `arg`: about one edit per five
+/// characters, from one to four edits. A flag equal to `arg` is never a suggestion,
+/// so that an error cannot suggest the argument that it rejects.
 fn closest_flag<'a>(arg: &[u8], flags: impl IntoIterator<Item = &'a [u8]>) -> Option<&'a [u8]> {
-    const MAX_DISTANCE: usize = 2;
+    let max_distance = (arg.len() / 5 + 1).clamp(1, 4);
     flags
         .into_iter()
-        .filter(|flag| arg.len().abs_diff(flag.len()) <= MAX_DISTANCE)
+        .filter(|&flag| flag != arg && arg.len().abs_diff(flag.len()) <= max_distance)
         .map(|flag| (flag, levenshtein(arg, flag)))
-        .filter(|&(_, distance)| distance <= MAX_DISTANCE)
+        .filter(|&(_, distance)| distance <= max_distance)
         .min_by_key(|&(_, distance)| distance)
         .map(|(flag, _)| flag)
 }
 
 fn unknown_option(arg: &[u8], persona: Persona) -> String {
     if persona == Persona::Compat {
-        return unknown_mode_option(arg, LONG_OPTIONS);
+        let windows: &[&[u8]] = if cfg!(windows) {
+            WINDOWS_SUGGESTIONS
+        } else {
+            &[]
+        };
+        return unknown_message(arg, arg, COMPAT_SUGGESTIONS.iter().chain(windows).copied());
     }
-    let probe = split_flag(arg, b'=').0;
-    let mut message = format!("Unknown argument {}", String::from_utf8_lossy(arg));
-    if let Some(flag) = closest_flag(
-        probe,
-        LONG_OPTIONS.iter().chain(NATIVE_FLAGS.iter()).copied(),
-    ) {
-        message.push_str(&format!(
-            ". Did you mean: {}?",
-            String::from_utf8_lossy(flag)
-        ));
-    }
-    message
+    unknown_message(
+        arg,
+        split_flag(arg, b'=').0,
+        LONG_OPTIONS.iter().chain(NATIVE_FLAGS).copied(),
+    )
 }
 
 pub(crate) fn unknown_mode_option(arg: &[u8], flags: &[&[u8]]) -> String {
+    unknown_message(arg, arg, flags.iter().copied())
+}
+
+/// `Unknown argument <arg>`, with the flag closest to `probe` as a suggestion.
+fn unknown_message<'a>(
+    arg: &[u8],
+    probe: &[u8],
+    flags: impl IntoIterator<Item = &'a [u8]>,
+) -> String {
     let mut message = format!("Unknown argument {}", String::from_utf8_lossy(arg));
-    if let Some(flag) = closest_flag(arg, flags.iter().copied()) {
+    if let Some(flag) = closest_flag(probe, flags) {
         message.push_str(&format!(
             ". Did you mean: {}?",
             String::from_utf8_lossy(flag)
@@ -607,13 +691,17 @@ fn format_config_output_path(dir: &str, platform: ConfigPlatform) -> String {
     }
 }
 
+/// The CMake config directory (`cmSystemTools::GetCMakeConfigDirectory`).
+///
+/// On macOS and other Unix hosts, a variable that is set wins even when its value
+/// is empty, and CMake does not remove a trailing slash.
 fn resolve_config_dir(host: &dyn Host, platform: ConfigPlatform) -> String {
-    let env_nonempty = |key: &[u8]| {
+    let env_set = |key: &[u8]| {
         host.env_get(key)
-            .filter(|value| !value.is_empty())
             .map(|value| String::from_utf8_lossy(&value).into_owned())
     };
-    if let Some(dir) = env_nonempty(b"CMAKE_CONFIG_DIR") {
+    let env_nonempty = |key: &[u8]| env_set(key).filter(|value| !value.is_empty());
+    if let Some(dir) = env_set(b"CMAKE_CONFIG_DIR") {
         return format_config_output_path(&dir, platform);
     }
     let dir = match platform {
@@ -621,7 +709,9 @@ fn resolve_config_dir(host: &dyn Host, platform: ConfigPlatform) -> String {
             if let Some(local) = env_nonempty(b"LOCALAPPDATA") {
                 let base = local.trim_end_matches(['\\', '/']);
                 format!("{base}\\CMake")
-            } else if let Some(profile) = env_nonempty(b"USERPROFILE").or_else(|| env_nonempty(b"HOME")) {
+            } else if let Some(profile) =
+                env_nonempty(b"USERPROFILE").or_else(|| env_nonempty(b"HOME"))
+            {
                 let base = profile.trim_end_matches(['\\', '/']);
                 format!("{base}\\AppData\\Local\\CMake")
             } else {
@@ -629,23 +719,19 @@ fn resolve_config_dir(host: &dyn Host, platform: ConfigPlatform) -> String {
             }
         }
         ConfigPlatform::Macos => {
-            if let Some(xdg) = env_nonempty(b"XDG_CONFIG_HOME") {
-                let base = xdg.trim_end_matches('/');
-                format!("{base}/CMake")
-            } else if let Some(home) = env_nonempty(b"HOME") {
-                let base = home.trim_end_matches('/');
-                format!("{base}/Library/Application Support/CMake")
+            if let Some(xdg) = env_set(b"XDG_CONFIG_HOME") {
+                format!("{xdg}/CMake")
+            } else if let Some(home) = env_set(b"HOME") {
+                format!("{home}/Library/Application Support/CMake")
             } else {
                 String::new()
             }
         }
         ConfigPlatform::Unix => {
-            if let Some(xdg) = env_nonempty(b"XDG_CONFIG_HOME") {
-                let base = xdg.trim_end_matches('/');
-                format!("{base}/cmake")
-            } else if let Some(home) = env_nonempty(b"HOME") {
-                let base = home.trim_end_matches('/');
-                format!("{base}/.config/cmake")
+            if let Some(xdg) = env_set(b"XDG_CONFIG_HOME") {
+                format!("{xdg}/cmake")
+            } else if let Some(home) = env_set(b"HOME") {
+                format!("{home}/.config/cmake")
             } else {
                 String::new()
             }
@@ -668,9 +754,34 @@ fn print_config_dir(host: &dyn Host) {
 
 #[cfg(test)]
 mod tests {
-    use rcmake_host::PureHost;
+    use rcmake_base::BString;
+    use rcmake_host::{Host, PureHost, Stream};
 
-    use super::{ConfigPlatform, Persona, resolve_config_dir, unknown_mode_option, unknown_option};
+    use super::{
+        ConfigPlatform, Options, ParseResult, Persona, parse, resolve_config_dir,
+        unknown_mode_option, unknown_option,
+    };
+
+    fn parse_with(persona: Persona, args: &[&str]) -> (PureHost, Result<Options, i32>) {
+        let host = PureHost::default();
+        let args: Vec<BString> = args.iter().copied().map(BString::from).collect();
+        let result = match parse(&args, persona, &host) {
+            ParseResult::Run(opts) => Ok(*opts),
+            ParseResult::Exit(code) => Err(code),
+        };
+        (host, result)
+    }
+
+    fn run_options(result: Result<Options, i32>) -> Options {
+        match result {
+            Ok(opts) => opts,
+            Err(code) => panic!("the parser exited with {code}"),
+        }
+    }
+
+    fn stderr(host: &PureHost) -> String {
+        String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned()
+    }
 
     #[test]
     fn unknown_option_suggests_the_first_closest_flag_within_two_edits() {
@@ -687,8 +798,174 @@ mod tests {
             "Unknown argument --xyz"
         );
         assert_eq!(
-            unknown_option(b"--opne", Persona::Compat),
+            unknown_option(b"--opne", Persona::Native),
             "Unknown argument --opne. Did you mean: --open?"
+        );
+    }
+
+    #[test]
+    fn compat_suggestions_use_the_cmake_candidates_and_distance_limit() {
+        for (argument, expected) in [
+            ("--opne", "Unknown argument --opne"),
+            ("--", "Unknown argument --. Did you mean: -S?"),
+            ("-X", "Unknown argument -X. Did you mean: -S?"),
+            ("--S", "Unknown argument --S. Did you mean: -S?"),
+            (
+                "--check-stamp-fil",
+                "Unknown argument --check-stamp-fil. Did you mean: --check-stamp-file?",
+            ),
+            ("--sarif-outpt", "Unknown argument --sarif-outpt"),
+            ("--help-comand", "Unknown argument --help-comand"),
+        ] {
+            assert_eq!(
+                unknown_option(argument.as_bytes(), Persona::Compat),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_option_never_suggests_the_rejected_flag() {
+        for persona in [Persona::Compat, Persona::Native] {
+            for flag in ["--build", "--install", "--version", "--workflow"] {
+                assert_eq!(
+                    unknown_option(flag.as_bytes(), persona),
+                    format!("Unknown argument {flag}")
+                );
+            }
+        }
+        assert_eq!(
+            unknown_mode_option(b"--ax", &[b"--ax", b"--bx"]),
+            "Unknown argument --ax. Did you mean: --bx?"
+        );
+    }
+
+    #[test]
+    fn double_dash_is_unknown_in_configure_mode() {
+        let (host, result) = parse_with(Persona::Compat, &["--", "-S", "."]);
+        assert_eq!(result.err(), Some(1));
+        assert_eq!(
+            stderr(&host),
+            "CMake Error: Unknown argument --. Did you mean: -S?\nCMake Error: Run 'cmake --help' for all supported options.\n"
+        );
+    }
+
+    #[test]
+    fn double_dash_ends_options_only_in_script_mode() {
+        let (host, result) = parse_with(Persona::Compat, &["-P", "x.cmake", "--", "-S", "--bad"]);
+        let opts = run_options(result);
+        assert!(opts.script.is_some());
+        assert!(stderr(&host).is_empty());
+
+        // `--` before `-P` stops processing before the script is known: nothing runs.
+        let (host, result) = parse_with(Persona::Compat, &["--", "-P", "x.cmake"]);
+        assert_eq!(result.err(), Some(0));
+        assert!(stderr(&host).is_empty());
+        assert!(host.stream_bytes(Stream::Stdout).is_empty());
+    }
+
+    #[test]
+    fn script_mode_accepts_diagnostics_and_rejects_configure_extensions() {
+        let (_, result) = parse_with(Persona::Native, &["--diagnostics=rich", "-P", "x.cmake"]);
+        let opts = run_options(result);
+        assert_eq!(
+            opts.extensions.diagnostics,
+            Some(crate::persona::DiagStyle::Rich)
+        );
+
+        for flag in [
+            "--profile=/tmp/p",
+            "--hermetic",
+            "--fetch-lock=frozen",
+            "--no-probe-cache",
+        ] {
+            let (host, result) = parse_with(Persona::Native, &[flag, "-P", "x.cmake"]);
+            assert_eq!(result.err(), Some(1), "{flag}");
+            let name = flag.split('=').next().unwrap_or(flag);
+            assert!(
+                stderr(&host).starts_with(&format!(
+                    "CMake Error: {name} allowed only when configuring a project\n"
+                )),
+                "{flag}: {}",
+                stderr(&host)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_argument_error_names_the_last_unknown_argument() {
+        let (host, result) = parse_with(Persona::Compat, &["--fooo", "--barr"]);
+        assert_eq!(result.err(), Some(1));
+        assert!(stderr(&host).starts_with("CMake Error: Unknown argument --barr\n"));
+    }
+
+    #[test]
+    fn deprecated_warning_options_match_cmake_text() {
+        let (host, result) = parse_with(
+            Persona::Compat,
+            &[
+                "--warn-uninitialized",
+                "--no-warn-unused-cli",
+                "--warn-unused-vars",
+                "--check-system-vars",
+                "-P",
+                "x.cmake",
+            ],
+        );
+        let opts = run_options(result);
+        assert!(opts.check_system_vars);
+        assert_eq!(
+            opts.warning_flags,
+            [
+                BString::from("-Wuninitialized"),
+                BString::from("-Wno-unused-cli")
+            ]
+        );
+        assert_eq!(
+            stderr(&host),
+            "The --warn-uninitialized option is deprecated.  Use -Wuninitialized instead.\nThe --no-warn-unused-cli option is deprecated.  Use -Wno-unused-cli instead.\n"
+        );
+        assert_eq!(
+            host.stream_bytes(Stream::Stdout),
+            BString::from(
+                "Also check system files when warning about unused and uninitialized variables.\n"
+            )
+        );
+    }
+
+    #[test]
+    fn trace_source_prints_the_cmake_banner() {
+        let (host, result) = parse_with(
+            Persona::Compat,
+            &["--trace-source=a.cmake", "-P", "x.cmake"],
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            host.stream_bytes(Stream::Stdout),
+            BString::from(
+                "Put cmake in trace mode, but output only lines of a specified file. Multiple options are allowed.\n"
+            )
+        );
+    }
+
+    #[test]
+    fn config_dir_keeps_set_but_empty_variables() {
+        let host = PureHost::default();
+        host.env_set(b"XDG_CONFIG_HOME", Some(b"/tmp/test"));
+        host.env_set(b"CMAKE_CONFIG_DIR", Some(b""));
+        assert_eq!(resolve_config_dir(&host, ConfigPlatform::Macos), "");
+
+        let host = PureHost::default();
+        host.env_set(b"HOME", Some(b"/Users/alice"));
+        host.env_set(b"XDG_CONFIG_HOME", Some(b""));
+        assert_eq!(resolve_config_dir(&host, ConfigPlatform::Macos), "/CMake");
+        assert_eq!(resolve_config_dir(&host, ConfigPlatform::Unix), "/cmake");
+
+        let host = PureHost::default();
+        host.env_set(b"XDG_CONFIG_HOME", Some(b"/xdg/"));
+        assert_eq!(
+            resolve_config_dir(&host, ConfigPlatform::Unix),
+            "/xdg//cmake"
         );
     }
 

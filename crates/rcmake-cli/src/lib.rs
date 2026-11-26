@@ -127,37 +127,35 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
 
 fn run_tool(argv: &[BString], tool: Tool, persona: persona::Persona, host: Arc<dyn Host>) -> i32 {
     let rest = argv.get(1..).unwrap_or(&[]);
+    if tool == Tool::Cmake {
+        // `cmake` reads `--version` anywhere before `--`, through `help::run`.
+        return run_cmake(argv, rest, persona, host);
+    }
+    // Reference topics come first, so that `ctest --version --help-command set`
+    // prints both. `ctest --launch` passes its arguments to the command.
+    if (tool == Tool::Cpack || rest.first().is_none_or(|first| first != "--launch"))
+        && let Some(code) = help::run(argv.first(), rest, tool, persona, host.as_ref())
+    {
+        return code;
+    }
     if let Some(first) = rest.first() {
-        let fb = first.as_slice();
         let output = rest.get(1).filter(|arg| !arg.starts_with(b"-"));
-        if fb == b"--version" || fb == b"-version" || fb == b"/V" || fb == b"/version" {
-            let banner = format!(
-                "{} version {CMAKE_VERSION_STR}\nrcmake {}\n",
-                tool.name(),
-                env!("CARGO_PKG_VERSION")
-            );
-            return write_version(host.as_ref(), output, banner.as_bytes());
-        }
-        if let Some(fmt) = fb
-            .strip_prefix(b"--version=")
-            .or_else(|| fb.strip_prefix(b"-version="))
-            .or_else(|| fb.strip_prefix(b"/V="))
-            .or_else(|| fb.strip_prefix(b"/version="))
-        {
-            return run_version_format(tool, fmt, host.as_ref(), output);
+        let json = match options::split_flag(first, b'=') {
+            (b"--version" | b"-version" | b"/V" | b"/version", None) => Some(false),
+            (b"--version" | b"-version" | b"/V" | b"/version", Some(b"json-v1")) => Some(true),
+            // Another format is an unknown argument for the tool parser.
+            _ => None,
+        };
+        if let Some(json) = json {
+            return write_version(host.as_ref(), output, &version_text(tool, json));
         }
     }
-
-    match tool {
-        Tool::Cmake => run_cmake(argv, rest, persona, host),
-        Tool::Ctest => {
-            presets::list_for_tool(host.as_ref(), rcmake_presets::PresetKind::Test, rest)
-                .unwrap_or_else(|| run_ctest(argv, rest, host))
-        }
-        Tool::Cpack => {
-            presets::list_for_tool(host.as_ref(), rcmake_presets::PresetKind::Package, rest)
-                .unwrap_or_else(|| rcmake_cpack::main(argv, host))
-        }
+    if tool == Tool::Ctest {
+        presets::list_for_tool(host.as_ref(), rcmake_presets::PresetKind::Test, rest)
+            .unwrap_or_else(|| run_ctest(argv, rest, host))
+    } else {
+        presets::list_for_tool(host.as_ref(), rcmake_presets::PresetKind::Package, rest)
+            .unwrap_or_else(|| rcmake_cpack::main(argv, host))
     }
 }
 
@@ -195,13 +193,15 @@ fn write_version(host: &dyn Host, output: Option<&BString>, contents: &[u8]) -> 
     0
 }
 
-fn run_version_format(tool: Tool, fmt: &[u8], host: &dyn Host, output: Option<&BString>) -> i32 {
-    if fmt != b"json-v1" {
-        emit_cli_error(
-            host,
-            format!("Invalid --version format: {}", String::from_utf8_lossy(fmt)),
-        );
-        return 1;
+/// The `--version` text of `tool`: the banner, or the `json-v1` document if `json`.
+pub(crate) fn version_text(tool: Tool, json: bool) -> Vec<u8> {
+    if !json {
+        return format!(
+            "{} version {CMAKE_VERSION_STR}\nrcmake {}\n",
+            tool.name(),
+            env!("CARGO_PKG_VERSION")
+        )
+        .into_bytes();
     }
     let mut prog_ver = BTreeMap::new();
     prog_ver.insert(
@@ -233,7 +233,7 @@ fn run_version_format(tool: Tool, fmt: &[u8], host: &dyn Host, output: Option<&B
 
     let mut text = rcmake_json::write_styled(&Value::Object(root), "  ");
     text.push(b'\n');
-    write_version(host, output, text.as_slice())
+    text.into()
 }
 
 fn run_cmake(
@@ -301,7 +301,7 @@ fn run_cmake(
         return build::run(argv, args, persona, host.as_ref());
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--install")]) {
-        return install::run(argv, args, host);
+        return install::run(argv, args, persona, host);
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--open")]) {
         return open::run(args, persona, host.as_ref());
@@ -310,7 +310,7 @@ fn run_cmake(
         return workflow::run(args, persona, host);
     }
 
-    if let Some(code) = help::run(argv.first(), rest, persona, host.as_ref()) {
+    if let Some(code) = help::run(argv.first(), rest, Tool::Cmake, persona, host.as_ref()) {
         return code;
     }
 
@@ -326,54 +326,7 @@ fn run_cmake(
         return find_package::run(argv, opts, host);
     }
     if let Some(script) = opts.script.take() {
-        let mut interp = new_interp(argv, &opts, RunMode::Script, Arc::clone(&host));
-        let profiler = opts
-            .profile_output
-            .as_ref()
-            .map(|_| Arc::new(profile::Recorder::new(host.as_ref())));
-        if let Some(profiler) = &profiler {
-            profiler.attach(&mut interp);
-        }
-        for edit in opts.cache_edits {
-            if let options::CacheEdit::Define(def) = edit {
-                cache::apply(
-                    interp.cx().cache(),
-                    cache::normalize_definition(host.as_ref(), def),
-                );
-            }
-        }
-        let state = configure::initialize_diagnostics(
-            host.as_ref(),
-            interp.cx().cache(),
-            &[],
-            &opts.warning_flags,
-            false,
-        );
-        *interp.cx().diag_state_mut() = state;
-        let start = host.now();
-        let outcome = interp.run_script(&script);
-        if let Some((profiler, path)) = profiler.as_ref().zip(opts.profile_output.as_deref())
-            && let Err(error) = profiler.write(host.as_ref(), path)
-        {
-            emit_cli_error(
-                host.as_ref(),
-                format!("Could not write profiling output: {error}"),
-            );
-            return 1;
-        }
-        if let Some(output) = opts.sarif.as_deref() {
-            let command = interp.cx().var_or_empty(b"CMAKE_COMMAND");
-            let invocation = sarif::Invocation {
-                command: &command,
-                start,
-                exit_code: outcome.exit_code,
-                directories: None,
-            };
-            if !sarif::write(host.as_ref(), output, &interp, Vec::new(), invocation) {
-                return 1;
-            }
-        }
-        return outcome.exit_code;
+        return run_script(argv, &mut opts, &script, host);
     }
     for (ignore_key, ignore) in [
         (
@@ -398,6 +351,109 @@ fn run_cmake(
         }
     }
     configure::run(argv, opts, host)
+}
+
+/// Run `cmake -P <script>` with the parsed command-line options.
+fn run_script(argv: &[BString], opts: &mut Options, script: &Path, host: Arc<dyn Host>) -> i32 {
+    let arguments = script_arguments(argv);
+    let mut interp = new_interp(&arguments, opts, RunMode::Script, Arc::clone(&host));
+    let style =
+        persona::resolve_diag_style(opts.persona, opts.extensions.diagnostics, host.as_ref());
+    if style == persona::DiagStyle::Rich {
+        interp.set_rich_diagnostics(configure::rich_options(host.as_ref()));
+    }
+    let profiler = opts
+        .profile_output
+        .as_ref()
+        .map(|_| Arc::new(profile::Recorder::new(host.as_ref())));
+    if let Some(profiler) = &profiler {
+        profiler.attach(&mut interp);
+    }
+    // Apply `-D` and `-U` in command-line order, as `cmake::SetCacheArgs` does.
+    for edit in std::mem::take(&mut opts.cache_edits) {
+        match edit {
+            options::CacheEdit::Define(def) => {
+                configure::warn_legacy_define(host.as_ref(), &def.name);
+                cache::apply(
+                    interp.cx().cache(),
+                    cache::normalize_definition(host.as_ref(), def),
+                );
+            }
+            options::CacheEdit::Remove(pattern) => {
+                configure::remove_cache_glob(interp.cx().cache(), &pattern);
+            }
+            options::CacheEdit::Preload(_) => {}
+        }
+    }
+    let state = configure::initialize_diagnostics(
+        host.as_ref(),
+        interp.cx().cache(),
+        &[],
+        &opts.warning_flags,
+        false,
+    );
+    *interp.cx().diag_state_mut() = state;
+    let start = host.now();
+    let outcome = interp.run_script(script);
+    if let Some((profiler, path)) = profiler.as_ref().zip(opts.profile_output.as_deref())
+        && let Err(error) = profiler.write(host.as_ref(), path)
+    {
+        emit_cli_error(
+            host.as_ref(),
+            format!("Could not write profiling output: {error}"),
+        );
+        return 1;
+    }
+    if let Some(output) = opts.sarif.as_deref() {
+        let command = interp.cx().var_or_empty(b"CMAKE_COMMAND");
+        let cwd = host.initial_cwd();
+        let invocation = sarif::Invocation {
+            arguments: argv,
+            command: &command,
+            start,
+            exit_code: outcome.exit_code,
+            directories: Some((&cwd, &cwd)),
+        };
+        if !sarif::write(host.as_ref(), output, &interp, Vec::new(), invocation) {
+            return 1;
+        }
+    }
+    outcome.exit_code
+}
+
+/// The arguments that a `-P` script sees as `CMAKE_ARGV<n>`, as `cmakemain` passes them.
+///
+/// The front end removes its own options (`-N`, `-L*`, `--sarif-output`, and so
+/// on) and splits an attached `-P<file>` into `-P` and `<file>`. If `--` follows
+/// `-P`, the script sees the original command line.
+fn script_arguments(argv: &[BString]) -> Vec<BString> {
+    let mut out = Vec::with_capacity(argv.len() + 1);
+    let mut script = false;
+    let mut args = argv.iter();
+    out.extend(args.next().cloned());
+    while let Some(arg) = args.next() {
+        let raw = arg.as_slice();
+        if script && raw == b"--" {
+            return argv.to_vec();
+        }
+        match raw {
+            b"-i" | b"--system-information" | b"-N" | b"-L" | b"-LA" | b"-LH" | b"-LAH" => {}
+            b"-LR" | b"-LRA" | b"-LRH" | b"-LRAH" | b"--sarif-output" => {
+                args.next();
+            }
+            _ if raw.starts_with(b"--sarif-output=") => {}
+            _ if raw.starts_with(b"-P") => {
+                script = true;
+                out.push("-P".into());
+                match raw.get(2..).filter(|path| !path.is_empty()) {
+                    Some(path) => out.push(path.into()),
+                    None => out.extend(args.next().cloned()),
+                }
+            }
+            _ => out.push(arg.clone()),
+        }
+    }
+    out
 }
 
 fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Host>) -> Interp {
@@ -769,6 +825,111 @@ mod tests {
             host.stream_bytes(Stream::Stdout),
             BString::from("-- hi Rcmake\n")
         );
+    }
+
+    fn invoke_script(script: &[u8], args: &[&str]) -> (i32, String, String) {
+        let host = crate::driver_tests::project_host();
+        host.seed_file(Path::new("/work/s.cmake"), script).unwrap();
+        let argv: Vec<_> = std::iter::once("cmake")
+            .chain(args.iter().copied())
+            .map(BString::from)
+            .collect();
+        let code = run(&argv, host.clone());
+        (
+            code,
+            host.stream_bytes(Stream::Stdout).to_string(),
+            host.stream_bytes(Stream::Stderr).to_string(),
+        )
+    }
+
+    #[test]
+    fn script_mode_applies_defines_and_removals_in_command_line_order() {
+        let script = b"message(STATUS \"A=${A} B=${B}\")\n";
+        let (code, stdout, _) = invoke_script(script, &["-DA=1", "-DB=2", "-UA", "-P", "s.cmake"]);
+        assert_eq!((code, stdout.as_str()), (0, "-- A= B=2\n"));
+        let (code, stdout, _) =
+            invoke_script(script, &["-DA=1", "-U", "*", "-DB=3", "-P", "s.cmake"]);
+        assert_eq!((code, stdout.as_str()), (0, "-- A= B=3\n"));
+    }
+
+    #[test]
+    fn script_arguments_split_attached_p_and_drop_front_end_options() {
+        let script = b"math(EXPR last \"${CMAKE_ARGC} - 1\")\nforeach(i RANGE 1 ${last})\n  message(STATUS \"${i}=[${CMAKE_ARGV${i}}]\")\nendforeach()\n";
+        let (code, stdout, _) = invoke_script(script, &["-Ps.cmake"]);
+        assert_eq!((code, stdout.as_str()), (0, "-- 1=[-P]\n-- 2=[s.cmake]\n"));
+        let (_, stdout, _) = invoke_script(script, &["-N", "-DX=1", "-Ps.cmake", "x"]);
+        assert_eq!(
+            stdout,
+            "-- 1=[-DX=1]\n-- 2=[-P]\n-- 3=[s.cmake]\n-- 4=[x]\n"
+        );
+        // After `--`, the script sees the original command line.
+        let (_, stdout, _) = invoke_script(script, &["-Ps.cmake", "--", "-Pfoo"]);
+        assert_eq!(stdout, "-- 1=[-Ps.cmake]\n-- 2=[--]\n-- 3=[-Pfoo]\n");
+    }
+
+    #[test]
+    fn script_mode_warning_flags_leave_deprecation_to_the_legacy_variables() {
+        let script = b"message(AUTHOR_WARNING \"aw1\")\nmessage(DEPRECATION \"dep1\")\n";
+        let (code, _, stderr) = invoke_script(script, &["-Wno-dev", "-P", "s.cmake"]);
+        assert_eq!(code, 0);
+        assert!(stderr.starts_with("The no-dev option is deprecated.  Use -Wno-author instead.\n"));
+        assert!(!stderr.contains("aw1"), "{stderr}");
+        assert!(stderr.contains("dep1"), "{stderr}");
+
+        let (code, _, stderr) = invoke_script(script, &["-Werror=deprecated", "-P", "s.cmake"]);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stderr.contains("CMake Warning (deprecated)"), "{stderr}");
+
+        let (code, _, stderr) = invoke_script(script, &["-Werror=dev", "-P", "s.cmake"]);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("CMake Error (author)"), "{stderr}");
+        assert!(stderr.contains("CMake Warning (deprecated)"), "{stderr}");
+
+        let (code, _, stderr) =
+            invoke_script(script, &["-DCMAKE_WARN_DEPRECATED=OFF", "-P", "s.cmake"]);
+        assert_eq!(code, 0);
+        assert!(stderr.starts_with(
+            "The CMAKE_WARN_DEPRECATED variable is deprecated.  Use -W[no-]deprecated instead.\n"
+        ));
+        assert!(stderr.contains("aw1"), "{stderr}");
+        assert!(!stderr.contains("dep1"), "{stderr}");
+    }
+
+    #[test]
+    fn script_mode_sarif_records_arguments_and_base_directories() {
+        let host = crate::driver_tests::project_host();
+        host.seed_file(Path::new("/work/s.cmake"), b"message(WARNING \"w\")\n")
+            .unwrap();
+        let argv = ["cmake", "--sarif-output=/work/out.sarif", "-P", "s.cmake"].map(BString::from);
+        assert_eq!(run(&argv, host.clone()), 0);
+        let sarif = host
+            .read(
+                Path::new("/work/out.sarif"),
+                rcmake_host::ReadRange::All { limit: 1 << 20 },
+            )
+            .unwrap();
+        let sarif = String::from_utf8_lossy(&sarif);
+        assert!(sarif.contains("\"arguments\""), "{sarif}");
+        assert!(
+            sarif.contains("\"--sarif-output=/work/out.sarif\""),
+            "{sarif}"
+        );
+        assert!(sarif.contains("\"originalUriBaseIds\""), "{sarif}");
+    }
+
+    #[test]
+    fn native_script_mode_accepts_rich_diagnostics() {
+        let host = crate::driver_tests::project_host();
+        host.seed_file(
+            Path::new("/work/s.cmake"),
+            b"message(FATAL_ERROR \"boom\")\n",
+        )
+        .unwrap();
+        let argv = ["rcmake", "--diagnostics=rich", "-P", "s.cmake"].map(BString::from);
+        assert_eq!(run(&argv, host.clone()), 1);
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(!stderr.contains("Unknown argument"), "{stderr}");
+        assert!(stderr.contains("error[CMake.FatalError]"), "{stderr}");
     }
 
     #[test]

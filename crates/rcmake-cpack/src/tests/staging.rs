@@ -646,3 +646,45 @@ set(CPACK_PACKAGING_INSTALL_PREFIX "/usr")
     );
     assert_eq!(file_names(&tree), ["opt/nested/file"]);
 }
+
+#[test]
+fn install_script_status_messages_print_only_in_verbose_mode() {
+    for (args, verbose) in [
+        (&[][..], false),
+        (&["--debug"][..], false),
+        (&["-V"][..], true),
+    ] {
+        let host = memory_host();
+        write(
+            host.as_ref(),
+            "/work/build/cmake_install.cmake",
+            b"message(STATUS \"custom-status\")\nmessage(\"plain-notice\")\n",
+        );
+        write(
+            host.as_ref(),
+            "/work/CPackConfig.cmake",
+            br#"
+set(CPACK_GENERATOR TAR)
+set(CPACK_PACKAGE_NAME demo)
+set(CPACK_PACKAGE_VERSION 1)
+set(CPACK_PACKAGE_FILE_NAME demo)
+set(CPACK_CMAKE_GENERATOR Ninja)
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;demo;ALL;/")
+"#,
+        );
+        assert_eq!(invoke(host.clone(), args), 0, "{}", stderr(&host));
+        let stdout = String::from_utf8_lossy(&host.stream_bytes(Stream::Stdout)).into_owned();
+        assert_eq!(
+            stdout.contains("custom-status"),
+            verbose,
+            "{args:?}: {stdout}"
+        );
+        assert_eq!(
+            stdout.contains("CPack Verbose: custom-status\n"),
+            verbose,
+            "{args:?}: {stdout}"
+        );
+        assert!(!stdout.contains("-- custom-status"), "{stdout}");
+        assert!(stderr(&host).contains("plain-notice\n"));
+    }
+}

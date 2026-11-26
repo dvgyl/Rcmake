@@ -539,3 +539,93 @@ fn passes_the_instrumented_command_exit_code_through() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn no_arguments_without_a_test_file_prints_the_short_usage() -> TestResult {
+    let host = Arc::new(PureHost::default());
+    host.create_dir_all(Path::new("/work"))?;
+    assert_eq!(invoke(&host, &[]), 1);
+    assert_eq!(
+        host.stream_bytes(Stream::Stdout),
+        BString::from("Usage\n\n  ctest [options]\n\n")
+    );
+    assert_eq!(
+        host.stream_bytes(Stream::Stderr),
+        BString::from(
+            "*********************************\nNo test configuration file found!\n*********************************\n"
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn show_only_json_hides_build_depends_and_gives_each_test_its_own_backtrace() -> TestResult {
+    let host = tree(
+        r#"
+add_test(one a)
+set_tests_properties(one PROPERTIES
+    _BACKTRACE_TRIPLES "/src/CMakeLists.txt;3;add_test;/src/CMakeLists.txt;0;"
+    _CMAKE_TEST_BUILD_DEPENDS "/work/a")
+add_test(two a)
+set_tests_properties(two PROPERTIES
+    _BACKTRACE_TRIPLES "/src/CMakeLists.txt;4;add_test;/src/CMakeLists.txt;0;")
+"#,
+    )?;
+    assert_eq!(invoke(&host, &["--show-only=json-v1"]), 0);
+    let stdout = host.stream_bytes(Stream::Stdout);
+    assert!(
+        !stdout
+            .windows(25)
+            .any(|w| w == b"_CMAKE_TEST_BUILD_DEPENDS")
+    );
+    let json = rcmake_json::parse(&stdout, &Default::default())?;
+    let field = |value: &Value, name: &str| match value {
+        Value::Object(map) => map.get(name.as_bytes()).cloned(),
+        _ => None,
+    };
+    let nodes = field(&json, "backtraceGraph").and_then(|graph| field(&graph, "nodes"));
+    let Some(Value::Array(nodes)) = nodes else {
+        return Err("missing backtrace nodes".into());
+    };
+    // Two tests, each with a root node and an `add_test` node.
+    assert_eq!(nodes.len(), 4);
+    let Some(Value::Array(tests)) = field(&json, "tests") else {
+        return Err("missing tests".into());
+    };
+    let backtraces: Vec<_> = tests.iter().map(|test| field(test, "backtrace")).collect();
+    assert_eq!(backtraces, [Some(Value::Int(1)), Some(Value::Int(3))]);
+    let root_of_second = nodes.get(3).and_then(|node| field(node, "parent"));
+    // The parser reads small integers as `Int`.
+    assert_eq!(root_of_second, Some(Value::Int(2)));
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[test]
+fn list_presets_hides_test_presets_with_an_unavailable_generator() -> TestResult {
+    let presets = br#"{"version": 6,
+ "configurePresets": [
+   {"name": "vs", "generator": "Visual Studio 17 2022", "binaryDir": "b"},
+   {"name": "ninja", "generator": "Ninja", "binaryDir": "c"}],
+ "testPresets": [
+   {"name": "tvs", "configurePreset": "vs"},
+   {"name": "tn", "configurePreset": "ninja"}]}"#;
+    let host = Arc::new(PureHost::default());
+    host.seed_file(Path::new("/work/CMakePresets.json"), presets)?;
+    assert_eq!(invoke(&host, &["--list-presets"]), 0);
+    assert_eq!(
+        host.stream_bytes(Stream::Stdout),
+        BString::from("Available test presets:\n\n  \"tn\"\n")
+    );
+
+    let host = Arc::new(PureHost::default());
+    host.seed_file(Path::new("/work/CMakePresets.json"), presets)?;
+    assert_eq!(invoke(&host, &["--list-presets=defined"]), 0);
+    assert_eq!(
+        host.stream_bytes(Stream::Stdout),
+        BString::from(
+            "Defined test presets:\n\n  \"tvs\"\n    Unavailable: configure preset \"vs\": generator \"Visual Studio 17 2022\" is not available\n\n  \"tn\"\n"
+        )
+    );
+    Ok(())
+}

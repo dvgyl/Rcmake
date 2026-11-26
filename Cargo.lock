@@ -650,6 +650,7 @@ dependencies = [
  "rcmake-host",
  "rcmake-instrument",
  "rcmake-json",
+ "rcmake-model",
  "rcmake-presets",
  "rcmake-regex",
  "thiserror",

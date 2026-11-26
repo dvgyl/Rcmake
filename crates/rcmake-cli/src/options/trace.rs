@@ -41,6 +41,10 @@ pub(super) fn parse(
         }
         b"--trace-source" => {
             let src = arg.required("No file specified for --trace-source")?;
+            out(
+                host,
+                "Put cmake in trace mode, but output only lines of a specified file. Multiple options are allowed.\n",
+            );
             let trace = opts.trace.get_or_insert_with(TraceConfig::default);
             trace.sources.push(src.into());
         }

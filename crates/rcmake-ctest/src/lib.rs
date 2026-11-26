@@ -185,7 +185,12 @@ pub fn main(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     }
 }
 
-const USAGE: &[u8] = include_bytes!("help.txt");
+/// The `ctest --help` text.
+pub const USAGE: &[u8] = include_bytes!("help.txt");
+
+/// The short usage that `ctest` prints without arguments when the directory has
+/// no `CTestTestfile.cmake`.
+const SHORT_USAGE: &[u8] = b"Usage\n\n  ctest [options]\n\n";
 
 fn dispatch(
     host: &Arc<dyn Host>,
@@ -294,8 +299,8 @@ fn run_cli_tests(
             .metadata(&dir.join("CTestTestfile.cmake"), Follow::Yes)
             .is_err()
     {
-        host.write_out(Stream::Stdout, USAGE);
         host.write_out(Stream::Stderr, b"*********************************\nNo test configuration file found!\n*********************************\n");
+        host.write_out(Stream::Stdout, SHORT_USAGE);
         return Ok(1);
     }
     if invocation.actions.iter().any(|action| action == "test")
@@ -325,12 +330,12 @@ fn run_cli_tests(
         Err(CtestError::Load(_)) => {
             let log = dir.join("Testing/Temporary/LastTest.log");
             let _ = junit::write_file(host.as_ref(), &log, b"");
-            reporting::failure_summary(host.as_ref(), dir);
+            reporting::failure_summary(host.as_ref(), dir, &invocation.options);
             Ok(8)
         }
         Err(error @ CtestError::Schedule(_)) => {
             host.write_out(Stream::Stderr, format!("{error}\n").as_bytes());
-            reporting::failure_summary(host.as_ref(), dir);
+            reporting::failure_summary(host.as_ref(), dir, &invocation.options);
             Ok(8)
         }
         Err(CtestError::TestList(file)) => {
@@ -445,6 +450,16 @@ fn unavailable_test_preset(
             unavailable_test_preset(presets, env, PresetKind::Configure, &configure)
     {
         return Some(format!("configure preset \"{configure}\": {reason}"));
+    }
+    // The same rule as `cmake --list-presets`: the host must be able to create
+    // the generator of a configure preset.
+    if kind == PresetKind::Configure
+        && let Some(generator) = resolved.generator.filter(|generator| {
+            !rcmake_model::GeneratorKind::from_name(generator)
+                .is_some_and(rcmake_model::GeneratorKind::host_available)
+        })
+    {
+        return Some(format!("generator \"{generator}\" is not available"));
     }
     None
 }

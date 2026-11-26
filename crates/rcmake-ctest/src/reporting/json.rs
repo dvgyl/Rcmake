@@ -35,11 +35,16 @@ struct BacktraceGraph {
 }
 
 impl BacktraceGraph {
+    /// Add the backtrace of one test and return the index of its innermost node.
+    ///
+    /// Files and commands are shared by all tests. Nodes are not: CTest builds a
+    /// new node chain for each test, so each test has its own root node.
     fn push(&mut self, triples: &[u8]) -> Option<Value> {
         let parts = rcmake_base::list::split(triples, rcmake_base::list::Empty::Keep);
         if !parts.len().is_multiple_of(3) {
             return None;
         }
+        self.node_ids.clear();
         for frame in parts.chunks(3) {
             if let Some(file) = frame.first().filter(|file| !file.is_empty()) {
                 self.file_ids.entry(file.clone()).or_insert_with(|| {
@@ -271,7 +276,9 @@ fn json_properties(test: &PlannedTest, raw: bool) -> Vec<Value> {
                     !JSON_PROPERTIES.contains(&key.as_slice())
                         && !matches!(
                             key.as_slice(),
-                            b"_BACKTRACE_TRIPLES" | b"TIMEOUT_AFTER_MATCH"
+                            b"_BACKTRACE_TRIPLES"
+                                | b"_CMAKE_TEST_BUILD_DEPENDS"
+                                | b"TIMEOUT_AFTER_MATCH"
                         )
                 })
                 .map(|(key, value)| {

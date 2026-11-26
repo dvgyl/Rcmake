@@ -17,6 +17,17 @@ pub(crate) enum Persona {
     Native,
 }
 
+impl Persona {
+    /// `usage` for this persona: the Native persona names `rcmake` in the
+    /// `Usage: cmake ...` line.
+    pub(crate) fn usage(self, usage: &str) -> std::borrow::Cow<'_, str> {
+        match (self, usage.strip_prefix("Usage: cmake ")) {
+            (Self::Native, Some(rest)) => format!("Usage: rcmake {rest}").into(),
+            _ => usage.into(),
+        }
+    }
+}
+
 /// Selects the format for human-readable diagnostics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum DiagStyle {
@@ -135,6 +146,16 @@ mod tests {
     use rcmake_host::PureHost;
 
     use super::*;
+
+    #[test]
+    fn native_usage_names_rcmake() {
+        let usage = "Usage: cmake --build <dir> [options]\nOptions:\n";
+        assert_eq!(
+            Persona::Native.usage(usage),
+            "Usage: rcmake --build <dir> [options]\nOptions:\n"
+        );
+        assert_eq!(Persona::Compat.usage(usage), usage);
+    }
 
     #[test]
     fn native_stem_obeys_platform_case_rules() {

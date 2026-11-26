@@ -117,9 +117,34 @@ impl<'a> Report<'a> {
         );
     }
 
-    pub(crate) fn announce_tests(&self) {
+    pub(crate) fn announce_tests(&self, plan: &Plan) {
+        if !self.options.verbose {
+            return;
+        }
+        self.write(format_args!("Constructing a list of tests\n"));
+        // CTest writes this line only after it reads a test file.
+        if plan.test_file_read {
+            self.write(format_args!("Done constructing a list of tests\n"));
+        }
+        self.write(format_args!("Updating test list for fixtures\n"));
+        for addition in &plan.fixture_additions {
+            self.write(format_args!(
+                "Added {} test {} required by fixture {}\n",
+                addition.role, addition.test, addition.fixture
+            ));
+        }
+        self.write(format_args!(
+            "Added {} tests to meet fixture requirements\n",
+            plan.fixture_additions.len()
+        ));
+    }
+
+    /// The verbose lines that CTest writes before it starts the tests of a run.
+    pub(crate) fn check_dependency_graph(&self) {
         if self.options.verbose {
-            self.write(format_args!("Constructing a list of tests\nDone constructing a list of tests\nUpdating test list for fixtures\n"));
+            self.write(format_args!(
+                "Checking test dependency graph...\nChecking test dependency graph end\n"
+            ));
         }
     }
 
@@ -140,6 +165,22 @@ impl<'a> Report<'a> {
     }
 
     pub(crate) fn project(&self, path: &Path) {
+        if self.options.verbose {
+            // `cmCTest::UpdateCTestConfiguration` prefers `CTestConfiguration.ini`.
+            let ini = path.join("CTestConfiguration.ini");
+            let config = if self.host.metadata(&ini, Follow::Yes).is_ok() {
+                ini
+            } else {
+                path.join("DartConfiguration.tcl")
+            };
+            self.write(format_args!(
+                "UpdateCTestConfiguration  from :{}\n",
+                config.display()
+            ));
+            if self.host.metadata(&config, Follow::Yes).is_ok() {
+                self.write(format_args!("Parse Config file:{}\n", config.display()));
+            }
+        }
         self.write(format_args!("Test project {}\n", path.display()));
     }
 
@@ -148,7 +189,7 @@ impl<'a> Report<'a> {
     }
 
     pub(crate) fn list(&self, plan: &Plan) {
-        self.announce_tests();
+        self.announce_tests(plan);
         for test in &plan.tests {
             let command = resolved_command(self.host, test, self.options);
             if command.is_none()
@@ -327,8 +368,10 @@ impl<'a> Report<'a> {
             width = self.number_width + 1,
         ));
         if !self.options.verbose && result.status.failed() && self.options.output_on_failure {
+            // CTest ends the output with a newline and then writes one more.
             self.emit(Stream::Stdout, &result.output);
             self.end_output_line(&result.output);
+            self.emit(Stream::Stdout, b"\n");
         }
     }
 
@@ -452,7 +495,10 @@ impl<'a> Report<'a> {
     }
 
     fn failure_summary(&self, dir: &Path) {
-        self.emit(Stream::Stderr, failure_message(dir).as_bytes());
+        self.emit(
+            Stream::Stderr,
+            failure_message(dir, self.options.output_on_failure).as_bytes(),
+        );
     }
 
     fn label_summary(&self, plan: &Plan, statuses: &[Option<Status>], names: &[u8]) {
@@ -561,15 +607,25 @@ fn environment_error(detail: &str) -> Option<String> {
     }
 }
 
-fn failure_message(dir: &Path) -> String {
+/// The CTest error summary after a failed run.
+///
+/// As in `cmCTest::Run`, the pointer to the log and the rerun hint appear only
+/// when CTest did not already print the output of the failed tests.
+fn failure_message(dir: &Path, output_on_failure: bool) -> String {
+    if output_on_failure {
+        return "Errors while running CTest\n".into();
+    }
     format!(
         "Errors while running CTest\nOutput from these tests are in: {}\nUse \"--rerun-failed --output-on-failure\" to re-run the failed cases verbosely.\n",
         dir.join("Testing/Temporary/LastTest.log").display()
     )
 }
 
-pub(crate) fn failure_summary(host: &dyn Host, dir: &Path) {
-    host.write_out(Stream::Stderr, failure_message(dir).as_bytes());
+pub(crate) fn failure_summary(host: &dyn Host, dir: &Path, options: &CtestOptions) {
+    host.write_out(
+        Stream::Stderr,
+        failure_message(dir, options.output_on_failure).as_bytes(),
+    );
 }
 
 fn status_text(status: Status) -> &'static str {

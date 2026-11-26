@@ -132,7 +132,7 @@ pub(crate) fn print_information(host: &dyn Host, options: &CPackOptions) -> bool
         );
         host.write_out(Stream::Stdout, text.as_bytes());
     } else if options.help {
-        host.write_out(Stream::Stdout, include_bytes!("help.txt"));
+        host.write_out(Stream::Stdout, crate::USAGE);
     } else {
         return false;
     }

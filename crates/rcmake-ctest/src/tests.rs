@@ -522,3 +522,36 @@ fn build_and_test_rejects_ctest_passthrough() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn failure_summary_omits_the_rerun_hint_after_printing_failed_output() -> TestResult {
+    for output_on_failure in [false, true] {
+        let host = host("add_test(fail bad)")?;
+        host.set_command_handler(|_, _, _| Ok(output(ProcessResult::Exited(1), b"fail-out", b"")))?;
+        let options = CtestOptions {
+            output_on_failure,
+            ..CtestOptions::default()
+        };
+        assert_eq!(run(host.clone(), &options)?.exit_code, 8);
+        let stdout = host.stream_bytes(Stream::Stdout).to_string();
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        if output_on_failure {
+            // The output, its line end, and one blank line come before the summary.
+            assert!(
+                stdout.contains(" sec\nfail-out\n\n\n0% tests passed"),
+                "{stdout}"
+            );
+            assert_eq!(stderr, "Errors while running CTest\n");
+        } else {
+            assert!(!stdout.contains("fail-out"), "{stdout}");
+            assert!(
+                stderr.starts_with("Errors while running CTest\nOutput from these tests are in: "),
+                "{stderr}"
+            );
+            assert!(stderr.ends_with(
+                "Use \"--rerun-failed --output-on-failure\" to re-run the failed cases verbosely.\n"
+            ));
+        }
+    }
+    Ok(())
+}

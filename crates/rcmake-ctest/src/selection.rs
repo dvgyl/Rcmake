@@ -55,6 +55,20 @@ pub(crate) struct Plan {
     pub(crate) prerequisites: Vec<usize>,
     /// Plan indices in scheduling priority order.
     pub(crate) schedule_order: Vec<usize>,
+    /// Setup and cleanup tests that fixtures added to the selection, in order.
+    pub(crate) fixture_additions: Vec<FixtureAddition>,
+    /// `true` if discovery read a `CTestTestfile.cmake` or `DartTestfile.txt`.
+    pub(crate) test_file_read: bool,
+}
+
+/// A test that the selection includes only because a selected test requires its fixture.
+pub(crate) struct FixtureAddition {
+    /// `"setup"` or `"cleanup"`.
+    pub(crate) role: &'static str,
+    /// Name of the added test.
+    pub(crate) test: BString,
+    /// Name of the required fixture.
+    pub(crate) fixture: BString,
 }
 
 impl Plan {
@@ -113,6 +127,8 @@ impl Plan {
             tests,
             dependents,
             prerequisites,
+            fixture_additions: Vec::new(),
+            test_file_read: false,
         }
     }
 }
@@ -272,11 +288,13 @@ impl FixtureFilters {
     }
 }
 
+/// Select the setup and cleanup tests of the fixtures that selected tests
+/// require, and return the tests that this adds.
 fn fixture_selection(
     tests: &[(usize, Test)],
     selected: &mut [bool],
     filters: &FixtureFilters,
-) -> Result<(), CtestError> {
+) -> Result<Vec<FixtureAddition>, CtestError> {
     let helpers = |property| {
         fixture_index(
             tests
@@ -293,6 +311,7 @@ fn fixture_selection(
         .filter_map(|(id, &selected)| selected.then_some(id))
         .collect();
     let mut visited = BTreeSet::new();
+    let mut additions = Vec::new();
     while let Some(id) = queue.pop_front() {
         let Some((_, test)) = tests.get(id) else {
             continue;
@@ -304,22 +323,31 @@ fn fixture_selection(
             if !visited.insert(name.clone()) || match_optional(filters.any.as_ref(), &name)? {
                 continue;
             }
-            for (helpers, excluded) in [(&setups, &filters.setup), (&cleanups, &filters.cleanup)] {
+            for (role, helpers, excluded) in [
+                ("setup", &setups, &filters.setup),
+                ("cleanup", &cleanups, &filters.cleanup),
+            ] {
                 if match_optional(excluded.as_ref(), &name)? {
                     continue;
                 }
                 for &helper in helpers.get(&name).into_iter().flatten() {
                     if let Some(chosen) = selected.get_mut(helper)
                         && !*chosen
+                        && let Some((_, added)) = tests.get(helper)
                     {
                         *chosen = true;
                         queue.push_back(helper);
+                        additions.push(FixtureAddition {
+                            role,
+                            test: added.name.clone(),
+                            fixture: name.clone(),
+                        });
                     }
                 }
             }
         }
     }
-    Ok(())
+    Ok(additions)
 }
 
 fn match_optional(pattern: Option<&Regex>, value: &[u8]) -> Result<bool, CtestError> {
@@ -484,7 +512,7 @@ fn finish_plan(
     mut selected: Vec<bool>,
     fixture_filters: &FixtureFilters,
 ) -> Result<Plan, CtestError> {
-    fixture_selection(&tests, &mut selected, fixture_filters)?;
+    let fixture_additions = fixture_selection(&tests, &mut selected, fixture_filters)?;
     let tests = tests
         .into_iter()
         .zip(selected)
@@ -498,7 +526,9 @@ fn finish_plan(
             })
         })
         .collect::<Result<_, _>>()?;
-    build_graph(tests)
+    let mut plan = build_graph(tests)?;
+    plan.fixture_additions = fixture_additions;
+    Ok(plan)
 }
 
 fn select_tests(

@@ -465,18 +465,19 @@ fn late_version_json_matches_cmake_version_schema() {
     let Some(rcmake_json::Value::Object(schema_ver)) = root.get(b"version".as_slice()) else {
         panic!("missing schema version");
     };
+    // The parser reads small integers as `Int`.
     assert_eq!(
         schema_ver.get(b"major".as_slice()),
-        Some(&rcmake_json::Value::UInt(1))
+        Some(&rcmake_json::Value::Int(1))
     );
     assert_eq!(
         schema_ver.get(b"minor".as_slice()),
-        Some(&rcmake_json::Value::UInt(0))
+        Some(&rcmake_json::Value::Int(0))
     );
 }
 
 #[test]
-fn list_presets_defined_reports_hidden_and_disabled_test_presets() {
+fn list_presets_defined_omits_hidden_and_reports_disabled_test_presets() {
     let host = std::sync::Arc::new(PureHost::default());
     host.seed_file(
         Path::new("/work/CMakePresets.json"),
@@ -499,9 +500,28 @@ fn list_presets_defined_reports_hidden_and_disabled_test_presets() {
     let out = String::from_utf8_lossy(&host.stream_bytes(rcmake_host::Stream::Stdout)).into_owned();
     assert!(out.starts_with("Defined test presets:\n\n"), "{out}");
     assert!(out.contains("\"visible\" - Visible\n"), "{out}");
-    assert!(out.contains("\"secret\"\n    Unavailable: hidden\n"), "{out}");
+    // As in CMake 4.5.1, a hidden preset is not listed.
+    assert!(!out.contains("\"secret\""), "{out}");
     assert!(
         out.contains("\"off\"\n    Unavailable: condition evaluated to false:"),
         "{out}"
     );
+}
+
+#[test]
+fn output_on_failure_environment_is_on_unless_the_value_is_off() -> Result<(), String> {
+    for (value, expected) in [
+        (None, false),
+        (Some("1"), true),
+        (Some("yes-please"), true),
+        (Some("0"), false),
+        (Some("OFF"), false),
+        (Some(""), false),
+    ] {
+        let host = PureHost::default();
+        host.env_set(b"CTEST_OUTPUT_ON_FAILURE", value.map(str::as_bytes));
+        let invocation = parse_args(&host, &["-N"])?;
+        assert_eq!(invocation.options.output_on_failure, expected, "{value:?}");
+    }
+    Ok(())
 }

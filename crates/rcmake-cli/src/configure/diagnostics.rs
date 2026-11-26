@@ -16,6 +16,14 @@ use crate::{apply_warning_flag, cache};
 
 const DIAG_INIT: &[u8] = b"CMAKE_DIAGNOSTIC_INIT";
 
+/// The initial diagnostic state for a run.
+///
+/// In configure mode (`configure`), the state starts from the cache, the preset
+/// and command-line `-W` flags change it, and the result goes back to the cache.
+/// In the other modes, as in `cmake::AlterDiagnostic`, the flags change the
+/// default state directly. They do not read or write cache entries, so
+/// `message(DEPRECATION)` without policy `CMP0218` still uses only the
+/// `CMAKE_WARN_DEPRECATED` and `CMAKE_ERROR_DEPRECATED` variables.
 pub(crate) fn initialize_diagnostics(
     host: &dyn Host,
     cache: &mut Cache,
@@ -24,9 +32,14 @@ pub(crate) fn initialize_diagnostics(
     configure: bool,
 ) -> DiagState {
     let mut state = DiagState::default();
-    if configure {
-        state.set(DiagCategory::UnusedCli, DiagAction::Warn, false);
+    if !configure {
+        for flag in preset.iter().chain(cli) {
+            warn_deprecated_dev_flag(host, flag);
+            apply_warning_flag(flag, &mut state);
+        }
+        return state;
     }
+    state.set(DiagCategory::UnusedCli, DiagAction::Warn, false);
     if let Some(entry) = cache.get(DIAG_INIT) {
         for part in rcmake_base::list::split(&entry.value, rcmake_base::list::Empty::Drop) {
             let Some(eq) = part.iter().position(|b| *b == b'=') else {
@@ -86,37 +99,24 @@ pub(crate) fn initialize_diagnostics(
     }
     let initial = state;
     for flag in preset.iter().chain(cli) {
-        if let Some(prefix) = flag
-            .strip_prefix(b"-W")
-            .and_then(|v| v.strip_suffix(b"dev"))
-            && matches!(prefix, b"" | b"no-" | b"error=" | b"no-error=")
-        {
-            let prefix = String::from_utf8_lossy(prefix);
-            host.write_out(
-                Stream::Stderr,
-                format!("The {prefix}dev option is deprecated.  Use -W{prefix}author instead.\n")
-                    .as_bytes(),
-            );
-        }
+        warn_deprecated_dev_flag(host, flag);
         apply_warning_flag(flag, &mut state);
     }
-    if configure {
-        let mut serialized = String::new();
-        for cat in DiagCategory::ALL {
-            if !serialized.is_empty() {
-                serialized.push(';');
-            }
-            serialized.push_str(cat.as_str());
-            serialized.push('=');
-            serialized.push_str(state.get(cat).as_str());
+    let mut serialized = String::new();
+    for cat in DiagCategory::ALL {
+        if !serialized.is_empty() {
+            serialized.push(';');
         }
-        cache::insert_internal(
-            cache,
-            DIAG_INIT,
-            serialized.into(),
-            "Set initial state for CMake diagnostics; used to persist state set by command-line options across invocations.",
-        );
+        serialized.push_str(cat.as_str());
+        serialized.push('=');
+        serialized.push_str(state.get(cat).as_str());
     }
+    cache::insert_internal(
+        cache,
+        DIAG_INIT,
+        serialized.into(),
+        "Set initial state for CMake diagnostics; used to persist state set by command-line options across invocations.",
+    );
     for (cat, vars) in [
         (
             DiagCategory::Author,
@@ -134,7 +134,7 @@ pub(crate) fn initialize_diagnostics(
         ),
     ] {
         let action = state.get(cat);
-        if (configure && cat == DiagCategory::Deprecated)
+        if cat == DiagCategory::Deprecated
             || initial.get(cat) != action
             || preset.iter().chain(cli).any(|f| {
                 f.ends_with(b"dev")
@@ -151,7 +151,7 @@ pub(crate) fn initialize_diagnostics(
                 cache::insert(
                     cache,
                     name,
-                    (if configure && cat == DiagCategory::Deprecated {
+                    (if cat == DiagCategory::Deprecated {
                         if value { "ON" } else { "OFF" }
                     } else if value {
                         "TRUE"
@@ -161,8 +161,7 @@ pub(crate) fn initialize_diagnostics(
                     .into(),
                     Some(CacheType::Internal),
                 );
-                if configure
-                    && let Some(option) = legacy_warning_option(name)
+                if let Some(option) = legacy_warning_option(name)
                     && let Some(entry) = cache.get_mut(name)
                 {
                     entry.help = format!("Deprecated.  Use {option} instead.").into();
@@ -173,6 +172,22 @@ pub(crate) fn initialize_diagnostics(
     state
 }
 
+/// Write the CMake notice for the deprecated `-W[no-][error=]dev` flag.
+fn warn_deprecated_dev_flag(host: &dyn Host, flag: &[u8]) {
+    if let Some(prefix) = flag
+        .strip_prefix(b"-W")
+        .and_then(|v| v.strip_suffix(b"dev"))
+        && matches!(prefix, b"" | b"no-" | b"error=" | b"no-error=")
+    {
+        let prefix = String::from_utf8_lossy(prefix);
+        host.write_out(
+            Stream::Stderr,
+            format!("The {prefix}dev option is deprecated.  Use -W{prefix}author instead.\n")
+                .as_bytes(),
+        );
+    }
+}
+
 fn legacy_warning_option(name: &[u8]) -> Option<&'static str> {
     match name {
         b"CMAKE_WARN_DEPRECATED" => Some("-W[no-]deprecated"),
@@ -181,7 +196,7 @@ fn legacy_warning_option(name: &[u8]) -> Option<&'static str> {
     }
 }
 
-pub(super) fn warn_legacy_define(host: &dyn Host, name: &[u8]) {
+pub(crate) fn warn_legacy_define(host: &dyn Host, name: &[u8]) {
     if let Some(option) = legacy_warning_option(name) {
         let variable = BString::from(name);
         host.write_out(

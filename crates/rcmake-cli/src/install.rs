@@ -166,14 +166,19 @@ fn permissions(value: &[u8]) -> Option<BString> {
     Some(entries.join(";").into())
 }
 
-pub(crate) fn run(argv: &[BString], args: &[BString], host: Arc<dyn Host>) -> i32 {
+pub(crate) fn run(
+    argv: &[BString],
+    args: &[BString],
+    persona: crate::persona::Persona,
+    host: Arc<dyn Host>,
+) -> i32 {
     let opts = match parse(args, host.as_ref()) {
         Ok(opts) => opts,
         Err(ParseError::Usage(message)) => {
             if !message.is_empty() {
                 host.write_out(Stream::Stderr, format!("{message}\n").as_bytes());
             }
-            host.write_out(Stream::Stderr, USAGE.as_bytes());
+            host.write_out(Stream::Stderr, persona.usage(USAGE).as_bytes());
             return 1;
         }
         Err(ParseError::Permissions) => {

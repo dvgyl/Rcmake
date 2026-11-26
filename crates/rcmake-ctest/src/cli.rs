@@ -740,7 +740,7 @@ impl Invocation {
         self.options.show_only = self.execution.show_only.is_some();
         self.options.stop_on_failure = self.execution.stop_on_failure.unwrap_or(false);
         self.options.output_on_failure = self.output.output_on_failure.unwrap_or(false)
-            || env(b"CTEST_OUTPUT_ON_FAILURE").is_some_and(|raw| truth::is_on(&raw));
+            || env(b"CTEST_OUTPUT_ON_FAILURE").is_some_and(|raw| !truth::is_off(&raw));
         self.options.quiet = self.output.quiet.unwrap_or(false);
         self.options.verbose = matches!(
             self.output.verbosity,

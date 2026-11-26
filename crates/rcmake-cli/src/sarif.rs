@@ -10,6 +10,8 @@ use rcmake_json::Value;
 use crate::object;
 
 pub(crate) struct Invocation<'a> {
+    /// The command line as given, with the executable name first.
+    pub arguments: &'a [BString],
     pub command: &'a [u8],
     pub start: FileTime,
     pub exit_code: i32,
@@ -68,6 +70,17 @@ pub(crate) fn write(
         run.insert(
             "invocations".into(),
             Value::Array(vec![object([
+                (
+                    "arguments",
+                    Value::Array(
+                        invocation
+                            .arguments
+                            .iter()
+                            .cloned()
+                            .map(Value::String)
+                            .collect(),
+                    ),
+                ),
                 ("endTimeUtc", Value::string(timestamp(host.now()))),
                 ("executableLocation", location),
                 (

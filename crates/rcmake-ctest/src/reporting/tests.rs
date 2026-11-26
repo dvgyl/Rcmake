@@ -74,6 +74,78 @@ fn lists_tests_and_filtered_labels_and_summarizes_processor_time() -> TestResult
     Ok(())
 }
 
+#[test]
+fn verbose_runs_print_the_configuration_fixture_and_graph_lines() -> TestResult {
+    let make_host = || -> rcmake_host::HostResult<Arc<PureHost>> {
+        let host = Arc::new(PureHost::default());
+        host.seed_file(
+            Path::new("/work/CTestTestfile.cmake"),
+            br#"
+            add_test(setup runner)
+            add_test(user runner)
+            set_tests_properties(setup PROPERTIES FIXTURES_SETUP fx)
+            set_tests_properties(user PROPERTIES FIXTURES_REQUIRED fx)
+        "#,
+        )?;
+        host.seed_file(Path::new("/work/runner"), b"")?;
+        host.set_command_handler(|_, _, _| {
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        Ok(host)
+    };
+    let host = make_host()?;
+    let args = ["-V".into(), "-R".into(), "^user$".into()];
+    assert_eq!(invoke(host.clone(), &args), 0);
+    let stdout = host.stream_bytes(Stream::Stdout).to_string();
+    assert!(
+        stdout.starts_with(
+            "UpdateCTestConfiguration  from :/work/DartConfiguration.tcl\n\
+             Test project /work\n\
+             Constructing a list of tests\n\
+             Done constructing a list of tests\n\
+             Updating test list for fixtures\n\
+             Added setup test setup required by fixture fx\n\
+             Added 1 tests to meet fixture requirements\n\
+             Checking test dependency graph...\n\
+             Checking test dependency graph end\n\
+             test 1\n"
+        ),
+        "{stdout}"
+    );
+
+    // `-N` lists the tests without the dependency graph lines. An existing
+    // configuration file also gets a "Parse Config file" line.
+    let host = make_host()?;
+    host.seed_file(Path::new("/work/DartConfiguration.tcl"), b"")?;
+    assert_eq!(invoke(host.clone(), &["-N".into(), "-V".into()]), 0);
+    let stdout = host.stream_bytes(Stream::Stdout).to_string();
+    assert!(
+        stdout.starts_with(
+            "UpdateCTestConfiguration  from :/work/DartConfiguration.tcl\n\
+             Parse Config file:/work/DartConfiguration.tcl\n\
+             Test project /work\n"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Added 0 tests to meet fixture requirements\n"));
+    assert!(!stdout.contains("Checking test dependency graph"));
+    assert!(stdout.contains("Done constructing a list of tests\n"));
+
+    // Without a test file, CTest does not write the "Done constructing" line.
+    let host = Arc::new(PureHost::default());
+    host.create_dir_all(Path::new("/work"))?;
+    invoke(host.clone(), &["-N".into(), "-V".into()]);
+    let stdout = host.stream_bytes(Stream::Stdout).to_string();
+    assert!(
+        stdout.contains("Constructing a list of tests\nUpdating test list for fixtures\n"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 struct Fixture<'a> {
     host: &'a dyn Host,

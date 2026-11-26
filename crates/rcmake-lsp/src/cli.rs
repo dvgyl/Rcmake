@@ -53,7 +53,7 @@ The server reads LSP messages on standard input and writes replies on standard o
   -h, --help     Print this help and exit.\n\
   -V, --version  Print the version and exit.\n\
 \n\
-Editor setup: https://github.com/dvgyl/Rcmake/blob/main/crates/rcmake-lsp/README.md\n"
+Editor setup: https://github.com/dvgyl/rcmake/blob/main/crates/rcmake-lsp/README.md\n"
     )
 }
 

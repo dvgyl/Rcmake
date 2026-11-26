@@ -750,7 +750,7 @@ fn native_profile_flag_obeys_script_argument_boundary() -> rcmake_host::HostResu
     assert!(
         host.stream_bytes(Stream::Stderr)
             .to_string()
-            .contains("Unknown argument --profile")
+            .contains("--profile allowed only when configuring a project")
     );
     assert_eq!(
         invoke(&host, &["rcmake", "-P", "args.cmake", "--profile"]),
@@ -1044,13 +1044,23 @@ fn native_subcommands_dispatch_ctest_and_cpack_and_respect_oracle_mode() {
         .as_bytes()
     );
 
+    // In oracle mode `ctest` is not a subcommand, so a CTest option is unknown.
     let host = Arc::new(PureHost::default());
     host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
-    assert_eq!(invoke(&host, &["rcmake", "ctest", "--version"]), 1);
+    assert_eq!(invoke(&host, &["rcmake", "ctest", "--show-only"]), 1);
     assert!(
         host.stream_bytes(Stream::Stderr)
             .to_string()
-            .contains("Unknown argument --version")
+            .contains("Unknown argument --show-only")
+    );
+
+    // As with `cmake ctest --version`, the `cmake` version banner prints.
+    let host = Arc::new(PureHost::default());
+    host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
+    assert_eq!(invoke(&host, &["rcmake", "ctest", "--version"]), 0);
+    assert!(
+        host.stream_bytes(Stream::Stdout)
+            .starts_with(b"cmake version 4.5.1\n")
     );
 }
 
@@ -1070,7 +1080,10 @@ fn native_help_uses_consistent_rcmake_branding_and_documents_subcommands() {
         "rcmake lsp [options]",
         "RCMAKE_ORACLE_MODE=1",
     ] {
-        assert!(native_help.contains(expected), "missing {expected} in:\n{native_help}");
+        assert!(
+            native_help.contains(expected),
+            "missing {expected} in:\n{native_help}"
+        );
     }
 
     let host = Arc::new(PureHost::default());
@@ -1091,7 +1104,8 @@ fn native_workflow_preserves_native_persona_during_configure() {
     {"name": "wf", "steps": [{"type": "configure", "name": "cfg"}]}
   ]
 }"#;
-    let lists = b"cmake_minimum_required(VERSION 4.5)\nproject(Flow NONE)\nmessage(FATAL_ERROR \"boom\")\n";
+    let lists =
+        b"cmake_minimum_required(VERSION 4.5)\nproject(Flow NONE)\nmessage(FATAL_ERROR \"boom\")\n";
 
     let host = project_host();
     host.env_set(b"RCMAKE_DIAGNOSTICS", Some(b"rich"));
@@ -1099,7 +1113,10 @@ fn native_workflow_preserves_native_persona_during_configure() {
         .unwrap();
     host.seed_file(Path::new("/work/CMakePresets.json"), presets)
         .unwrap();
-    assert_eq!(invoke(&host, &["rcmake", "--workflow", "--preset", "wf"]), 1);
+    assert_eq!(
+        invoke(&host, &["rcmake", "--workflow", "--preset", "wf"]),
+        1
+    );
     let native_err = host.stream_bytes(Stream::Stderr).to_string();
     assert!(
         native_err.contains("error[CMake.FatalError]"),
@@ -1141,14 +1158,27 @@ fn bare_profile_followed_by_non_project_path_suggests_equals_syntax() {
     assert_eq!(
         invoke(
             &host,
-            &["rcmake", "--profile", "out", "-S", ".", "-B", "build", "-G", "Ninja"]
+            &[
+                "rcmake",
+                "--profile",
+                "out",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-G",
+                "Ninja"
+            ]
         ),
         0,
         "{}",
         host.stream_bytes(Stream::Stderr)
     );
     let err = host.stream_bytes(Stream::Stderr).to_string();
-    assert!(err.contains("Ignoring extra path from command line"), "{err}");
+    assert!(
+        err.contains("Ignoring extra path from command line"),
+        "{err}"
+    );
     assert!(err.contains("--profile=<dir>"), "{err}");
 }
 

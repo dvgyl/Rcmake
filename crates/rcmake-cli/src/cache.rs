@@ -34,16 +34,19 @@ pub(crate) fn load(host: &dyn Host, dir: &Path) -> HostResult<Cache> {
         ));
     }
     let mut entries = Cache::default();
-    let mut advanced = Vec::new();
-    let mut strings = BTreeMap::new();
+    let mut properties = Vec::new();
     let mut help = BString::default();
     for (index, line) in data.split(|b| *b == b'\n').enumerate() {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // `cmCacheManager::LoadCache` joins the help lines without a separator,
+        // and `//\n` starts a new line of the help text.
         if let Some(comment) = line.strip_prefix(b"//") {
-            if !help.is_empty() {
-                help.push(b' ');
+            if let Some(rest) = comment.strip_prefix(b"\\n") {
+                help.push(b'\n');
+                help.extend_from_slice(rest);
+            } else {
+                help.extend_from_slice(comment);
             }
-            help.extend_from_slice(comment);
             continue;
         }
         let description = std::mem::take(&mut help);
@@ -60,31 +63,29 @@ pub(crate) fn load(host: &dyn Host, dir: &Path) -> HostResult<Cache> {
             }
             continue;
         };
-        if ty == CacheType::Internal {
-            if let Some(key) = name.strip_suffix(b"-ADVANCED") {
-                if rcmake_base::truth::is_on(value) {
-                    advanced.push(BString::from(key));
-                }
-                continue;
-            }
-            if let Some(key) = name.strip_suffix(b"-STRINGS") {
-                strings.insert(BString::from(key), BString::from(value));
-                continue;
-            }
+        if ty == CacheType::Internal
+            && let Some((key, property)) = [b"ADVANCED".as_slice(), b"MODIFIED", b"STRINGS"]
+                .into_iter()
+                .find_map(|property| {
+                    let key = name.strip_suffix(property)?.strip_suffix(b"-")?;
+                    Some((key, property))
+                })
+        {
+            properties.push((BString::from(key), property, BString::from(value)));
+            continue;
         }
         insert(&mut entries, name, value.into(), Some(ty));
         if let Some(entry) = entries.get_mut(name) {
             entry.help = description;
         }
     }
-    for name in advanced {
+    for (name, property, value) in properties {
         if let Some(entry) = entries.get_mut(&name) {
-            entry.advanced = true;
-        }
-    }
-    for (name, value) in strings {
-        if let Some(entry) = entries.get_mut(&name) {
-            entry.props.set("STRINGS".into(), value);
+            // The stored value keeps an explicit `ADVANCED=0` from `mark_as_advanced(CLEAR)`.
+            if property == b"ADVANCED" {
+                entry.advanced = rcmake_base::truth::is_on(&value);
+            }
+            entry.props.set(property.into(), value);
         }
     }
     Ok(entries)
@@ -310,66 +311,93 @@ pub(crate) fn insert_internal(cache: &mut Cache, name: &[u8], value: BString, he
     }
 }
 
+/// The fixed text at the top of `CMakeCache.txt` after the two location lines.
+const HEADER_TAIL: &str = "# You can edit this file to change values found and used by cmake.
+# If you do not want to change any of the values, simply exit the editor.
+# If you do want to change a value, simply edit, save, and exit the editor.
+# The syntax for the file is as follows:
+# KEY:TYPE=VALUE
+# KEY is the name of a variable in the cache.
+# TYPE is a hint to GUIs for the type of VALUE, DO NOT EDIT TYPE!.
+# VALUE is the current value for the KEY.
+
+########################
+# EXTERNAL cache entries
+########################
+
+";
+
+const INTERNAL_BANNER: &str = "
+########################
+# INTERNAL cache entries
+########################
+
+";
+
+/// Write `CMakeCache.txt` in `dir` with the `cmCacheManager::SaveCache` layout.
+///
+/// The file has a header, the sorted non-`INTERNAL` entries (each with its help
+/// text and a blank line), and then the internal section. The internal section
+/// has, for each sorted entry, its `ADVANCED`, `MODIFIED`, and `STRINGS`
+/// property entries, and then the entry itself if it is `INTERNAL`.
 pub(crate) fn save(host: &dyn Host, dir: &Path, cache: &Cache) -> HostResult<()> {
-    let mut data = BString::from("# This is the CMakeCache file.\n\n");
-    for (name, entry) in sorted(cache) {
-        if entry
-            .props
-            .get(rcmake_eval::Cx::CACHE_PLACEHOLDER)
-            .is_some()
-            || name.iter().any(|byte| matches!(byte, b'\n' | b'\r' | b'"'))
-        {
+    let entries: Vec<_> = sorted(cache)
+        .into_iter()
+        .filter(|(name, entry)| {
+            entry
+                .props
+                .get(rcmake_eval::Cx::CACHE_PLACEHOLDER)
+                .is_none()
+                && !name.iter().any(|byte| matches!(byte, b'\n' | b'\r' | b'"'))
+        })
+        .collect();
+    let mut data = BString::from("# This is the CMakeCache file.\n# For build in directory: ");
+    data.extend_from_slice(&cache_file_dir(dir));
+    data.extend_from_slice(b"\n# It was generated by CMake: ");
+    if let Some(command) = cache.get(b"CMAKE_COMMAND") {
+        data.extend_from_slice(&command.value);
+    }
+    data.push(b'\n');
+    data.extend_from_slice(HEADER_TAIL.as_bytes());
+    for (name, entry) in &entries {
+        if entry.ty == CacheType::Internal {
             continue;
         }
-        for line in entry
-            .help
-            .split(|b| *b == b'\n')
-            .filter(|line| !line.is_empty())
-        {
-            data.extend_from_slice(b"//");
-            data.extend_from_slice(line);
-            data.push(b'\n');
-        }
-        write_entry(&mut data, name, entry.ty, &entry.value);
-        if entry.value.contains(&b'\n') {
-            let warning = format!("Value of {name} contained a newline");
-            host.write_out(
-                Stream::Stderr,
-                format!("CMake Warning:\n  {warning}; truncating\n\n\n").as_bytes(),
-            );
-            data.extend_from_slice(
-                format!("# WARNING: {warning} and was\n#  truncated. Original value:\n").as_bytes(),
-            );
-            let mut lines = entry.value.split(|byte| *byte == b'\n');
-            if let Some(first) = lines.next().filter(|line| !line.is_empty()) {
-                data.extend_from_slice(b"# ");
-                data.extend_from_slice(first);
-                data.push(b'\n');
-            }
-            for line in lines {
-                data.extend_from_slice(b"# \\n");
-                data.extend_from_slice(line);
-                data.push(b'\n');
-            }
-        }
-        if entry.advanced {
-            write_entry(
-                &mut data,
-                &[name.as_slice(), b"-ADVANCED"].concat(),
-                CacheType::Internal,
-                b"1",
-            );
-        }
-        if let Some(strings) = entry.props.get(b"STRINGS") {
-            write_entry(
-                &mut data,
-                &[name.as_slice(), b"-STRINGS"].concat(),
-                CacheType::Internal,
-                strings,
-            );
-        }
+        write_help(&mut data, &entry.help);
+        write_value_entry(host, &mut data, name, entry.ty, &entry.value);
         data.push(b'\n');
     }
+    data.extend_from_slice(INTERNAL_BANNER.as_bytes());
+    for (name, entry) in &entries {
+        let advanced = advanced_value(entry);
+        for (property, value) in [
+            (b"ADVANCED".as_slice(), advanced),
+            (
+                b"MODIFIED",
+                entry.props.get(b"MODIFIED").map(|v| v.as_slice()),
+            ),
+            (
+                b"STRINGS",
+                entry.props.get(b"STRINGS").map(|v| v.as_slice()),
+            ),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            let property = String::from_utf8_lossy(property);
+            write_help(
+                &mut data,
+                format!("{property} property for variable: {name}").as_bytes(),
+            );
+            let key = [name.as_slice(), b"-", property.as_bytes()].concat();
+            write_value_entry(host, &mut data, &key, CacheType::Internal, value);
+        }
+        if entry.ty == CacheType::Internal {
+            write_help(&mut data, &entry.help);
+            write_value_entry(host, &mut data, name, entry.ty, &entry.value);
+        }
+    }
+    data.push(b'\n');
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let time = host.now();
     let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -385,6 +413,88 @@ pub(crate) fn save(host: &dyn Host, dir: &Path, cache: &Cache) -> HostResult<()>
         let _ = host.remove_file(&tmp);
     }
     result
+}
+
+/// The `ADVANCED` property value to write for `entry`.
+///
+/// A stored value that agrees with `entry.advanced` stays as it is, so an
+/// explicit `0` survives a save and a load. Otherwise the flag gives `1`, or `0`
+/// when a stored true value was cleared.
+fn advanced_value(entry: &CacheEntry) -> Option<&[u8]> {
+    let stored = entry.props.get(b"ADVANCED").map(|value| value.as_slice());
+    match (entry.advanced, stored) {
+        (advanced, Some(value)) if rcmake_base::truth::is_on(value) == advanced => Some(value),
+        (true, _) => Some(b"1"),
+        (false, Some(_)) => Some(b"0"),
+        (false, None) => None,
+    }
+}
+
+/// `CMAKE_CACHEFILE_DIR` for `dir`: forward slashes and a lowercase drive letter.
+fn cache_file_dir(dir: &Path) -> BString {
+    let mut text = rcmake_host::path::from_native_cmake(dir);
+    if text.get(1) == Some(&b':')
+        && let Some(drive) = text.first_mut()
+    {
+        drive.make_ascii_lowercase();
+    }
+    text
+}
+
+/// Write `help` as `//` comment lines, as `cmCacheManager::OutputHelpString` does.
+fn write_help(data: &mut BString, help: &[u8]) {
+    write_comment(data, b"//", help, true);
+}
+
+/// Write `text` as comment lines that start with `prefix`.
+///
+/// This is the rule of `cmCacheManager::OutputHelpString` and
+/// `OutputWarningComment`. A line ends at a newline, or, if `wrap`, at a space
+/// when the line has 60 bytes or more. That space starts the next line. A line
+/// that follows a newline starts with `\n` after the prefix. Empty text writes
+/// nothing.
+fn write_comment(data: &mut BString, prefix: &[u8], text: &[u8], wrap: bool) {
+    let mut start = 0;
+    for index in 1..=text.len() {
+        let next = text.get(index);
+        let wrap_here = wrap && index - start >= 60 && next == Some(&b' ');
+        if index == text.len() || next == Some(&b'\n') || wrap_here {
+            data.extend_from_slice(prefix);
+            let mut line = text.get(start..index).unwrap_or_default();
+            if let Some(rest) = line.strip_prefix(b"\n") {
+                data.extend_from_slice(b"\\n");
+                line = rest;
+            }
+            data.extend_from_slice(line);
+            data.push(b'\n');
+            start = index;
+        }
+    }
+}
+
+/// Write one entry and, for a value with a newline, the truncation warning
+/// (`cmCacheManager::OutputNewlineTruncationWarning`).
+fn write_value_entry(
+    host: &dyn Host,
+    data: &mut BString,
+    name: &[u8],
+    ty: CacheType,
+    value: &[u8],
+) {
+    write_entry(data, name, ty, value);
+    if !value.contains(&b'\n') {
+        return;
+    }
+    let name = BString::from(name);
+    host.write_out(
+        Stream::Stderr,
+        format!("CMake Warning:\n  Value of {name} contained a newline; truncating\n\n\n")
+            .as_bytes(),
+    );
+    let comment =
+        format!("WARNING: Value of {name} contained a newline and was truncated. Original value:");
+    write_comment(data, b"# ", comment.as_bytes(), true);
+    write_comment(data, b"# ", value, false);
 }
 
 fn write_entry(data: &mut BString, name: &[u8], ty: CacheType, value: &[u8]) {
@@ -422,7 +532,149 @@ mod tests {
     use rcmake_base::BString;
     use rcmake_host::{Host, PureHost};
 
-    use super::{parse_entry, typed_value};
+    use std::path::Path;
+
+    use rcmake_host::ReadRange;
+    use rcmake_model::{Cache, CacheEntry};
+
+    use super::{load, parse_entry, save, typed_value};
+
+    fn entry(ty: CacheType, value: &str, help: &str) -> CacheEntry {
+        CacheEntry {
+            value: value.into(),
+            ty,
+            help: help.into(),
+            advanced: false,
+            props: Default::default(),
+        }
+    }
+
+    #[test]
+    fn save_uses_the_cmake_cache_layout_and_load_reads_it_back() {
+        let mut cache = Cache::default();
+        let long = "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel and more words here.";
+        let mut choice = entry(CacheType::String, "v", long);
+        choice.props.set("STRINGS".into(), "a;b".into());
+        cache.insert("LONGHELP".into(), choice);
+        let mut multi = entry(CacheType::String, "v", "line one\nline two");
+        multi.advanced = true;
+        cache.insert("MULTI".into(), multi);
+        cache.insert("EMPTYHELP".into(), entry(CacheType::String, "v", ""));
+        cache.insert(
+            "CMAKE_COMMAND".into(),
+            entry(
+                CacheType::Internal,
+                "/bin/cmake",
+                "Path to CMake executable.",
+            ),
+        );
+        cache.insert(
+            "INT".into(),
+            entry(CacheType::Internal, "v", "internal help"),
+        );
+        let host = PureHost::default();
+        host.create_dir_all(Path::new("/b")).unwrap_or_default();
+        save(&host, Path::new("/b"), &cache).unwrap_or_else(|error| panic!("{error}"));
+        let text = host
+            .read(
+                Path::new("/b/CMakeCache.txt"),
+                ReadRange::All { limit: 1 << 20 },
+            )
+            .unwrap_or_default();
+        let expected = "# This is the CMakeCache file.
+# For build in directory: /b
+# It was generated by CMake: /bin/cmake
+# You can edit this file to change values found and used by cmake.
+# If you do not want to change any of the values, simply exit the editor.
+# If you do want to change a value, simply edit, save, and exit the editor.
+# The syntax for the file is as follows:
+# KEY:TYPE=VALUE
+# KEY is the name of a variable in the cache.
+# TYPE is a hint to GUIs for the type of VALUE, DO NOT EDIT TYPE!.
+# VALUE is the current value for the KEY.
+
+########################
+# EXTERNAL cache entries
+########################
+
+EMPTYHELP:STRING=v
+
+//Choose the type of build, options are: None Debug Release RelWithDebInfo
+// MinSizeRel and more words here.
+LONGHELP:STRING=v
+
+//line one
+//\\nline two
+MULTI:STRING=v
+
+
+########################
+# INTERNAL cache entries
+########################
+
+//Path to CMake executable.
+CMAKE_COMMAND:INTERNAL=/bin/cmake
+//internal help
+INT:INTERNAL=v
+//STRINGS property for variable: LONGHELP
+LONGHELP-STRINGS:INTERNAL=a;b
+//ADVANCED property for variable: MULTI
+MULTI-ADVANCED:INTERNAL=1
+
+";
+        assert_eq!(String::from_utf8_lossy(&text), expected);
+
+        let loaded = load(&host, Path::new("/b")).unwrap_or_default();
+        let help = |name: &str| {
+            loaded
+                .get(name.as_bytes())
+                .map(|entry| entry.help.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(help("LONGHELP"), BString::from(long));
+        assert_eq!(help("MULTI"), BString::from("line one\nline two"));
+        assert!(loaded.get(b"MULTI").is_some_and(|entry| entry.advanced));
+        assert_eq!(
+            loaded
+                .get(b"LONGHELP")
+                .and_then(|entry| entry.props.get(b"STRINGS").cloned()),
+            Some(BString::from("a;b"))
+        );
+        assert!(loaded.get(b"LONGHELP-STRINGS").is_none());
+    }
+
+    #[test]
+    fn explicit_advanced_zero_survives_save_and_load() {
+        let host = PureHost::default();
+        host.create_dir_all(Path::new("/b")).unwrap_or_default();
+        host.write(
+            Path::new("/b/CMakeCache.txt"),
+            b"V:STRING=x\nV-ADVANCED:INTERNAL=0\nW:STRING=y\nW-ADVANCED:INTERNAL=ON\n",
+            rcmake_host::WriteMode::Truncate,
+        )
+        .unwrap_or_default();
+        let cache = load(&host, Path::new("/b")).unwrap_or_default();
+        assert!(cache.get(b"V").is_some_and(|entry| !entry.advanced));
+        assert!(cache.get(b"W").is_some_and(|entry| entry.advanced));
+        save(&host, Path::new("/b"), &cache).unwrap_or_else(|error| panic!("{error}"));
+        let text = host
+            .read(
+                Path::new("/b/CMakeCache.txt"),
+                ReadRange::All { limit: 1 << 20 },
+            )
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&text);
+        assert!(text.contains("\nV-ADVANCED:INTERNAL=0\n"), "{text}");
+        assert!(text.contains("\nW-ADVANCED:INTERNAL=ON\n"), "{text}");
+        let reloaded = load(&host, Path::new("/b")).unwrap_or_default();
+        assert!(reloaded.get(b"V").is_some_and(|entry| !entry.advanced));
+        assert!(
+            reloaded
+                .get(b"V")
+                .and_then(|entry| entry.props.get(b"ADVANCED").cloned())
+                == Some(BString::from("0"))
+        );
+    }
 
     #[test]
     fn cache_records_use_the_command_line_entry_rules() {

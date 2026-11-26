@@ -82,12 +82,12 @@ enum Jobs {
     Count(u32),
 }
 
-fn usage(host: &dyn Host, message: &str) -> i32 {
+fn usage(host: &dyn Host, persona: crate::persona::Persona, message: &str) -> i32 {
     if !message.is_empty() {
         host.write_out(Stream::Stderr, message.as_bytes());
         host.write_out(Stream::Stderr, b"\n");
     }
-    host.write_out(Stream::Stderr, USAGE.as_bytes());
+    host.write_out(Stream::Stderr, persona.usage(USAGE).as_bytes());
     1
 }
 
@@ -315,7 +315,7 @@ pub(crate) fn run(
 ) -> i32 {
     let mut opts = match parse(host, args) {
         Ok(opts) => opts,
-        Err(message) => return usage(host, &message),
+        Err(message) => return usage(host, persona, &message),
     };
     if let Some(listing) = opts.list_presets {
         return presets::list(
@@ -332,7 +332,7 @@ pub(crate) fn run(
     {
         match parse_jobs(b"CMAKE_BUILD_PARALLEL_LEVEL", value, true) {
             Ok(jobs) => opts.jobs = Some(jobs),
-            Err(message) => return usage(host, &message),
+            Err(message) => return usage(host, persona, &message),
         }
     }
     if let Some(name) = &opts.preset {
@@ -358,13 +358,14 @@ pub(crate) fn run(
         }
     }
     let Some(dir) = opts.dir.as_deref() else {
-        return usage(host, "");
+        return usage(host, persona, "");
     };
     if opts.targets.iter().any(|target| target == b"clean")
         && opts.targets.iter().any(|target| target != b"clean")
     {
         return usage(
             host,
+            persona,
             "Error: Building 'clean' and other targets together is not supported.",
         );
     }

@@ -59,6 +59,12 @@ pub(crate) struct RcmakeExt {
     pub(crate) hermetic: Option<HermeticMode>,
 }
 
+/// `true` if the Native extension `flag` (without its value) also applies in `-P`
+/// script mode. The other extensions configure a project, so they need configure mode.
+pub(crate) fn is_script_mode_extension(flag: &[u8]) -> bool {
+    flag == b"--diagnostics"
+}
+
 /// Parse one Native extension flag without consuming another argument.
 ///
 /// Return `Ok(false)` if the flag belongs to another parser. Return an error if

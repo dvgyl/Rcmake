@@ -41,6 +41,101 @@ pub fn create(name: &[u8]) -> Option<Box<dyn PackageGenerator>> {
     }
 }
 
+/// The generators that CMake 4.5.1 registers on every platform, with their
+/// `cpack --help` descriptions (`cmCPackGeneratorFactory`).
+const COMMON_GENERATORS: &[(&str, &str)] = &[
+    ("7Z", "7-Zip file format with default compression algorithm"),
+    ("7Z_STORE", "7-Zip file format without compression"),
+    ("7Z_DEFLATE", "7-Zip file format with Deflate compression"),
+    ("7Z_BZ2", "7-Zip file format with BZip2 compression"),
+    ("7Z_LZMA", "7-Zip file format with LZMA compression"),
+    ("7Z_LZMA2", "7-Zip file format with LZMA2 compression"),
+    ("7Z_ZSTD", "7-Zip file format with Zstandard compression"),
+    ("7Z_PPMD", "7-Zip file format with PPMd compression"),
+    ("TBZ2", "Tar BZip2 compression"),
+    ("TGZ", "Tar GZip compression"),
+    ("TXZ", "Tar XZ compression"),
+    ("TZ", "Tar Compress compression"),
+    ("TZST", "Tar Zstandard compression"),
+    ("TAR", "Tar no compression"),
+    ("ZIP", "ZIP file format with default compression algorithm"),
+    ("ZIP_STORE", "ZIP file format without compression"),
+    ("ZIP_DEFLATE", "ZIP file format with Deflate compression"),
+    ("ZIP_BZ2", "ZIP file format with BZip2 compression"),
+    ("ZIP_LZMA", "ZIP file format with LZMA compression"),
+    ("ZIP_LZMA2", "ZIP file format with LZMA2 compression"),
+    ("ZIP_ZSTD", "ZIP file format with Zstandard compression"),
+    ("STGZ", "Self extracting Tar GZip compression"),
+    ("INNOSETUP", "Inno Setup packages"),
+    ("NSIS", "Null Soft Installer"),
+    ("NSIS64", "Null Soft Installer (64-bit)"),
+    ("IFW", "Qt Installer Framework"),
+    ("NuGet", "NuGet packages"),
+    ("APK", "Android APK packages"),
+    ("External", "CPack External packages"),
+];
+
+/// The generators that CMake 4.5.1 registers only on this platform. On macOS,
+/// CMake adds `DEB` and `RPM` only when it finds `dpkg` or `rpmbuild`, so the
+/// list leaves them out.
+const PLATFORM_GENERATORS: &[(&str, &str)] = if cfg!(target_os = "macos") {
+    &[
+        ("DragNDrop", "Mac OSX Drag And Drop"),
+        ("Bundle", "Mac OSX bundle"),
+        ("productbuild", "Mac OSX pkg"),
+    ]
+} else if cfg!(windows) {
+    &[
+        ("WIX", "MSI file format via WiX tools"),
+        ("DEB", "Debian packages"),
+    ]
+} else if cfg!(target_os = "linux") {
+    &[
+        ("DEB", "Debian packages"),
+        ("RPM", "RPM packages"),
+        ("AppImage", "AppImage packages"),
+    ]
+} else {
+    &[("DEB", "Debian packages"), ("RPM", "RPM packages")]
+};
+
+/// The `Generators` section that CPack prints after an unknown generator name.
+///
+/// The section lists the generators of CMake 4.5.1 on this platform, as the
+/// CMake error does, in byte order. The layout is the `cmDocumentationFormatter`
+/// layout: the name in a 29-column field after two spaces, then `= ` and the
+/// description, wrapped at 77 columns with a 33-column indent.
+#[must_use]
+pub fn documentation() -> String {
+    const NAME_WIDTH: usize = 29;
+    const INDENT: usize = NAME_WIDTH + 4;
+    const TEXT_WIDTH: usize = 77;
+    let mut generators: Vec<_> = COMMON_GENERATORS
+        .iter()
+        .chain(PLATFORM_GENERATORS)
+        .collect();
+    generators.sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let mut text = String::from("Generators\n");
+    for (name, description) in generators {
+        text.push_str(&format!("  {name:<width$}= ", width = NAME_WIDTH));
+        let mut width = INDENT;
+        for (index, word) in description.split(' ').enumerate() {
+            if index > 0 && width + 1 + word.len() > TEXT_WIDTH {
+                text.push('\n');
+                text.push_str(&" ".repeat(INDENT));
+                width = INDENT;
+            } else if index > 0 {
+                text.push(' ');
+                width += 1;
+            }
+            text.push_str(word);
+            width += word.len();
+        }
+        text.push('\n');
+    }
+    text
+}
+
 fn option<'a>(cx: &PackageContext<'a>, name: &[u8]) -> Option<&'a [u8]> {
     cx.vars
         .get(name)
@@ -155,6 +250,78 @@ pub(crate) mod tests {
     use rcmake_base::hash::HashAlgo;
     use rcmake_host::path::{from_native, to_native};
     use rcmake_host::{CommandSpec, Host, ProcessResult, ReadRange, RunOutput, WriteMode};
+
+    #[test]
+    fn documentation_lists_the_cmake_generators_in_cmake_layout() {
+        let text = super::documentation();
+        for kind in crate::archive_gen::ArchiveKind::ALL {
+            assert!(
+                text.contains(&format!("\n  {:<29}= ", kind.name())),
+                "{}",
+                kind.name()
+            );
+        }
+        assert!(text.starts_with(
+            "Generators\n  7Z                           = 7-Zip file format with default compression\n                                 algorithm\n  7Z_BZ2                       = 7-Zip file format with BZip2 compression\n"
+        ));
+    }
+
+    /// The full stderr of a bad `-G` on macOS, as CMake 4.5.1 writes it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unknown_generator_error_matches_the_macos_cmake_list() {
+        let host = package_host();
+        host.seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            b"set(CPACK_PACKAGE_NAME x)\nset(CPACK_PACKAGE_VERSION 1.0)\n",
+        )
+        .unwrap();
+        let argv = ["cpack", "-G", "BOGUS_GEN"].map(rcmake_base::BString::from);
+        assert_eq!(crate::main(&argv, host.clone()), 1);
+        let expected = "CPack Error: Could not create CPack generator: BOGUS_GEN
+
+Generators
+  7Z                           = 7-Zip file format with default compression
+                                 algorithm
+  7Z_BZ2                       = 7-Zip file format with BZip2 compression
+  7Z_DEFLATE                   = 7-Zip file format with Deflate compression
+  7Z_LZMA                      = 7-Zip file format with LZMA compression
+  7Z_LZMA2                     = 7-Zip file format with LZMA2 compression
+  7Z_PPMD                      = 7-Zip file format with PPMd compression
+  7Z_STORE                     = 7-Zip file format without compression
+  7Z_ZSTD                      = 7-Zip file format with Zstandard compression
+  APK                          = Android APK packages
+  Bundle                       = Mac OSX bundle
+  DragNDrop                    = Mac OSX Drag And Drop
+  External                     = CPack External packages
+  IFW                          = Qt Installer Framework
+  INNOSETUP                    = Inno Setup packages
+  NSIS                         = Null Soft Installer
+  NSIS64                       = Null Soft Installer (64-bit)
+  NuGet                        = NuGet packages
+  STGZ                         = Self extracting Tar GZip compression
+  TAR                          = Tar no compression
+  TBZ2                         = Tar BZip2 compression
+  TGZ                          = Tar GZip compression
+  TXZ                          = Tar XZ compression
+  TZ                           = Tar Compress compression
+  TZST                         = Tar Zstandard compression
+  ZIP                          = ZIP file format with default compression
+                                 algorithm
+  ZIP_BZ2                      = ZIP file format with BZip2 compression
+  ZIP_DEFLATE                  = ZIP file format with Deflate compression
+  ZIP_LZMA                     = ZIP file format with LZMA compression
+  ZIP_LZMA2                    = ZIP file format with LZMA2 compression
+  ZIP_STORE                    = ZIP file format without compression
+  ZIP_ZSTD                     = ZIP file format with Zstandard compression
+  productbuild                 = Mac OSX pkg
+
+";
+        assert_eq!(
+            String::from_utf8_lossy(&host.stream_bytes(rcmake_host::Stream::Stderr)),
+            expected
+        );
+    }
 
     pub(super) fn package_host() -> Arc<rcmake_host::PureHost> {
         let exe = if cfg!(windows) {

@@ -38,6 +38,7 @@ mod unused_cli;
 
 pub(crate) use diagnostics::{
     MapSourceLookup, RichGenerateHost, initialize_diagnostics, render_rich_cmake_diagnostic,
+    warn_legacy_define,
 };
 
 const HOME_DIR: &[u8] = b"CMAKE_HOME_DIRECTORY";
@@ -150,7 +151,11 @@ fn configure_project(
             if preloads.fatal {
                 return Err(Exit::Code(preloads.exit_code));
             }
-            session.check_source()?;
+            if let Err(exit) = session.check_source() {
+                // `cmake -L` lists the cache even when the configure step fails.
+                session.list_cache(&mut interp);
+                return Err(exit);
+            }
             if preloads.missing {
                 return Err(Exit::Code(1));
             }
@@ -258,7 +263,7 @@ impl<'a> ConfigureSession<'a> {
                 bin = Some(dir);
             }
         }
-        if !had_src && !had_bin && opts.preset.is_none() && opts.list_cache.is_none() {
+        if !had_src && !had_bin && opts.preset.is_none() {
             options::warn(
                 host.as_ref(),
                 "No source or binary directory provided.  Both will be assumed to be the\n  same as the current working directory, but note that this warning will\n  become a fatal error in future CMake releases.",
@@ -417,19 +422,10 @@ impl<'a> ConfigureSession<'a> {
         Ok((runtime, interp, has_cache))
     }
 
-    fn rich_options(&self) -> rcmake_diag::rich::RichOptions {
-        let host = self.host.as_ref();
-        rcmake_diag::rich::RichOptions {
-            color: resolve_rich_color(host, host.is_terminal(Stream::Stderr), DiagStyle::Rich),
-            terminal_width: rich_width(host),
-            ..rcmake_diag::rich::RichOptions::default()
-        }
-    }
-
     fn prepare_presentation(&self, interp: &mut Interp, style: DiagStyle) {
         self.profiling.attach(interp);
         if style == DiagStyle::Rich {
-            let rich = self.rich_options();
+            let rich = rich_options(self.host.as_ref());
             interp.add_session_data(rich);
             interp.set_rich_diagnostics(rich);
         }
@@ -451,13 +447,12 @@ impl<'a> ConfigureSession<'a> {
         } else {
             "Specify --help for usage, or press the help button on the CMake GUI."
         };
-        let profile_hint = if self.opts.extensions.bare_profile_arg.as_deref()
-            == Some(self.src.as_path())
-        {
-            "\nHint: pass a profile output directory with --profile=<dir>."
-        } else {
-            ""
-        };
+        let profile_hint =
+            if self.opts.extensions.bare_profile_arg.as_deref() == Some(self.src.as_path()) {
+                "\nHint: pass a profile output directory with --profile=<dir>."
+            } else {
+                ""
+            };
         Err(Exit::Message(format!(
             "The source directory \"{}\" {problem}.\n{hint}{profile_hint}",
             self.src.display()
@@ -724,6 +719,7 @@ impl<'a> ConfigureSession<'a> {
             .cloned()
             .unwrap_or_else(|| interp.cx().var_or_empty(b"CMAKE_COMMAND"));
         let invocation = crate::sarif::Invocation {
+            arguments: self.argv,
             command: &command,
             start,
             exit_code,
@@ -812,6 +808,19 @@ fn set_directory_vars(interp: &mut Interp, src: &Path, bin: &Path) {
     cx.set_var(b"CMAKE_CURRENT_BINARY_DIR", binary);
 }
 
+/// Remove the non-`STATIC` cache entries that the `-U` glob `pattern` matches.
+pub(crate) fn remove_cache_glob(cache: &mut Cache, pattern: &[u8]) {
+    let pattern = CacheGlob::new(pattern);
+    let names: Vec<_> = cache
+        .iter()
+        .filter(|(name, entry)| entry.ty != CacheType::Static && pattern.matches(name))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in &names {
+        cache.remove(name);
+    }
+}
+
 /// Remove the non-`STATIC` cache entries that `pattern` matches and return
 /// their names.
 fn remove_entries(
@@ -868,6 +877,15 @@ fn list_cache(host: &dyn Host, interp: &mut Interp, list: &options::ListCache) {
         }
     }
     host.write_out(Stream::Stdout, &out);
+}
+
+/// Rich diagnostic settings for standard error on `host`.
+pub(crate) fn rich_options(host: &dyn Host) -> rcmake_diag::rich::RichOptions {
+    rcmake_diag::rich::RichOptions {
+        color: resolve_rich_color(host, host.is_terminal(Stream::Stderr), DiagStyle::Rich),
+        terminal_width: rich_width(host),
+        ..rcmake_diag::rich::RichOptions::default()
+    }
 }
 
 pub(crate) fn is_file(host: &dyn Host, path: &Path) -> bool {

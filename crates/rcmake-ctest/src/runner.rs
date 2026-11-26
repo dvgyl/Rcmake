@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rcmake_base::BString;
-use rcmake_host::{FileTime, Host, Stream, path};
+use rcmake_host::{FileTime, Follow, Host, Stream, path};
 use rcmake_presets::ShowOnly;
 
 use crate::cli::Invocation;
@@ -208,7 +208,7 @@ impl TestRun<'_> {
                 test.command.args.extend_from_slice(args);
             }
         }
-        let plan = if self.full_selection {
+        let mut plan = if self.full_selection {
             match selection::plan_with(host, dir, tests, options, &invocation.selection) {
                 Err(error @ CtestError::TestList(_)) if dashboard => {
                     if !options.quiet {
@@ -224,6 +224,9 @@ impl TestRun<'_> {
         } else {
             selection::plan(tests, options)?
         };
+        plan.test_file_read = ["CTestTestfile.cmake", "DartTestfile.txt"]
+            .iter()
+            .any(|name| host.metadata(&dir.join(name), Follow::Yes).is_ok());
         Ok(plan)
     }
 
@@ -240,7 +243,7 @@ impl TestRun<'_> {
         let dir = &self.dir;
         let invocation = self.invocation;
         let options = &invocation.options;
-        report.announce_tests();
+        report.announce_tests(plan);
         let wall_clock_start = host.now();
         let write_dashboard = dashboard.enabled();
         let created;
@@ -267,6 +270,7 @@ impl TestRun<'_> {
         let custom = discovery::custom_commands(Arc::clone(self.host), dir)?;
         run_custom_commands(host, dir, custom.before, options.quiet)?;
         let _debug_environment = self.debug_environment(dashboard.is_some());
+        report.check_dependency_graph();
         let results = schedule::run(host, dir, invocation, plan, report, deadline, coverage_tool)?;
         let elapsed = host.monotonic().saturating_sub(started);
         report.summary(
@@ -469,7 +473,7 @@ impl TestRun<'_> {
                         file.display()
                     ).as_bytes(),
                 );
-            reporting::failure_summary(host, dir);
+            reporting::failure_summary(host, dir, &self.invocation.options);
             return Ok(true);
         }
         Ok(false)

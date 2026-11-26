@@ -108,7 +108,7 @@ pub(crate) fn run(args: &[BString], persona: crate::persona::Persona, host: Arc<
             if !message.is_empty() {
                 host.write_out(Stream::Stderr, format!("{message}\n").as_bytes());
             }
-            host.write_out(Stream::Stderr, USAGE.as_bytes());
+            host.write_out(Stream::Stderr, persona.usage(USAGE).as_bytes());
             return 1;
         }
     };

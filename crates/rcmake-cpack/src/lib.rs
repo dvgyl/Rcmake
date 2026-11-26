@@ -36,6 +36,9 @@ pub mod generators;
 pub mod source;
 pub mod stage;
 
+/// The `cpack --help` text.
+pub const USAGE: &[u8] = include_bytes!("help.txt");
+
 #[cfg(test)]
 mod tests;
 
@@ -233,8 +236,12 @@ fn run(host: &Arc<dyn Host>, cli: CPackOptions, argv0: Option<&BString>) -> Resu
         if base.get(b"CPACK_PACKAGE_NAME").is_none() {
             return Err(error("CPack project name not specified"));
         }
-        let generator = generators::create(&name)
-            .ok_or_else(|| error(format!("Could not create CPack generator: {name}")))?;
+        let generator = generators::create(&name).ok_or_else(|| {
+            error(format!(
+                "Could not create CPack generator: {name}\n\n{}",
+                generators::documentation()
+            ))
+        })?;
         interp.cx().set_var(b"CPACK_GENERATOR", name);
         if let Some(project) = base
             .get(b"CPACK_PROJECT_CONFIG_FILE")
