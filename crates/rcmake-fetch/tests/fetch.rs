@@ -106,6 +106,151 @@ fn rejects_malformed_duplicate_unsupported_and_oversized_lockfiles() {
 }
 
 #[test]
+fn lock_serialization_matches_byte_exact_golden_and_schema_rules()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(
+        LockFile::default().to_json()?,
+        b"{\n  \"entries\": {},\n  \"version\": 1\n}\n"
+    );
+
+    let empty_sha256 = rcmake_store::Digest::from_hex(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    )
+    .ok_or("Valid SHA-256 digest.")?;
+    let mut lock = LockFile::default();
+    lock.insert(
+        "Fmt",
+        LockEntry::Url(UrlEntry::from_digest(
+            vec![
+                "https://example.invalid/café/fmt-11.tar.gz".into(),
+                r"C:\SDK\fmt-11.tar.gz".into(),
+            ],
+            empty_sha256,
+            4096,
+        )),
+    )?;
+    lock.insert(
+        "alpha",
+        LockEntry::Git(GitEntry {
+            repository: "https://example.invalid/repo/水.git".into(),
+            tag: Some("v1.0.0".into()),
+            commit: "40626af88bd7df9a5fb80be7b25ac85b122d6c21".into(),
+        }),
+    )?;
+    lock.insert(
+        "pinned",
+        LockEntry::Git(GitEntry {
+            repository: "https://example.invalid/pinned.git".into(),
+            tag: None,
+            commit: PIN.into(),
+        }),
+    )?;
+
+    let expected = [
+        "{",
+        "  \"entries\": {",
+        "    \"alpha\": {",
+        "      \"commit\": \"40626af88bd7df9a5fb80be7b25ac85b122d6c21\",",
+        "      \"kind\": \"git\",",
+        "      \"repository\": \"https://example.invalid/repo/水.git\",",
+        "      \"tag\": \"v1.0.0\"",
+        "    },",
+        "    \"fmt\": {",
+        "      \"kind\": \"url\",",
+        "      \"sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",",
+        "      \"size\": 4096,",
+        "      \"urls\": [",
+        "        \"https://example.invalid/café/fmt-11.tar.gz\",",
+        "        \"C:\\\\SDK\\\\fmt-11.tar.gz\"",
+        "      ]",
+        "    },",
+        "    \"pinned\": {",
+        "      \"commit\": \"0123456789abcdef0123456789abcdef01234567\",",
+        "      \"kind\": \"git\",",
+        "      \"repository\": \"https://example.invalid/pinned.git\"",
+        "    }",
+        "  },",
+        "  \"version\": 1",
+        "}",
+        "",
+    ]
+    .join("\n");
+
+    let encoded = lock.to_json()?;
+    assert_eq!(std::str::from_utf8(&encoded)?, expected);
+    assert_eq!(LockFile::parse(&encoded)?, lock);
+
+    // Explicit default algorithm, explicit null tag, and unsorted keys normalize identically.
+    let explicit_defaults = format!(
+        r#"{{
+  "version": 1,
+  "entries": {{
+    "Pinned": {{
+      "repository": "https://example.invalid/pinned.git",
+      "tag": null,
+      "commit": "{PIN}",
+      "kind": "git"
+    }},
+    "FMT": {{
+      "urls": ["https://example.invalid/café/fmt-11.tar.gz", "C:\\SDK\\fmt-11.tar.gz"],
+      "algo": "SHA256",
+      "size": 4096,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "kind": "url"
+    }},
+    "Alpha": {{
+      "tag": "v1.0.0",
+      "commit": "40626af88bd7df9a5fb80be7b25ac85b122d6c21",
+      "kind": "git",
+      "repository": "https://example.invalid/repo/水.git"
+    }}
+  }}
+}}"#
+    );
+    let reparsed = LockFile::parse(explicit_defaults.as_bytes())?;
+    assert_eq!(reparsed, lock);
+    assert_eq!(std::str::from_utf8(&reparsed.to_json()?)?, expected);
+
+    // Reject schema violations: null/unsupported algo, unknown fields, bad kind, comments, bad UTF-8.
+    let valid_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    for bad in [
+        format!(
+            r#"{{"version":1,"entries":{{"x":{{"kind":"url","urls":["{URL}"],"sha256":"{valid_hex}","algo":null,"size":0}}}}}}"#
+        ),
+        format!(
+            r#"{{"version":1,"entries":{{"x":{{"kind":"url","urls":["{URL}"],"sha256":"{valid_hex}","algo":"SHA512","size":0}}}}}}"#
+        ),
+        format!(
+            r#"{{"version":1,"entries":{{"x":{{"kind":"url","urls":["{URL}"],"sha256":"{valid_hex}","size":0,"extra":1}}}}}}"#
+        ),
+        format!(
+            r#"{{"version":1,"entries":{{"x":{{"kind":"URL","urls":["{URL}"],"sha256":"{valid_hex}","size":0}}}}}}"#
+        ),
+        format!(
+            r#"{{"version":1,"entries":{{"x":{{"urls":["{URL}"],"sha256":"{valid_hex}","size":0}}}}}}"#
+        ),
+        format!(
+            r#"{{"version":1,"entries":{{"x":{{"kind":"git","kind":"git","repository":"{REPO}","commit":"{PIN}"}}}}}}"#
+        ),
+        format!(
+            r#"{{"version":1,"entries":{{"x":{{"kind":"url","urls":[{}],"sha256":"{valid_hex}","size":0}}}}}}"#,
+            vec![format!(r#""{URL}""#); 33].join(","),
+        ),
+        r#"{"version":1,"entries":{},"extra":1}"#.to_owned(),
+        r#"/* comment */ {"version":1,"entries":{}}"#.to_owned(),
+    ] {
+        assert!(LockFile::parse(bad.as_bytes()).is_err(), "{bad}");
+    }
+    let mut bad_utf8 =
+        br#"{"version":1,"entries":{"x":{"kind":"git","repository":"https://example.invalid/"#
+            .to_vec();
+    bad_utf8.push(0xff);
+    bad_utf8.extend_from_slice(format!(r#"","commit":"{PIN}"}}}}}}"#).as_bytes());
+    assert!(LockFile::parse(&bad_utf8).is_err());
+    Ok(())
+}
+
+#[test]
 fn lock_modes_apply_and_concurrent_updates_merge() -> Result<(), Box<dyn std::error::Error>> {
     let host = host();
     let source = work_root();

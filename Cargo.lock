@@ -711,9 +711,8 @@ version = "0.1.0"
 dependencies = [
  "rcmake-base",
  "rcmake-host",
+ "rcmake-json",
  "rcmake-store",
- "serde",
- "serde_json",
  "thiserror",
 ]
 

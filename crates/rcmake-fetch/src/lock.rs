@@ -1,7 +1,6 @@
 use std::{
     borrow::Cow,
     collections::BTreeMap,
-    fmt,
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
@@ -9,11 +8,11 @@ use std::{
 };
 
 use rcmake_host::{Host, ReadRange, path::to_native};
-use rcmake_store::Digest;
-use serde::{
-    Deserialize, Deserializer, Serialize,
-    de::{Error, MapAccess, Visitor},
+use rcmake_json::{
+    FieldError, FromJson, Object, ReadOptions, ToJson, Value, array_bounded, deny_unknown, object,
+    opt, opt_or_else, parse, req, req_value, write_pretty_utf8,
 };
+use rcmake_store::Digest;
 
 use crate::{
     ArchiveCache, ArchiveResult, ContentHash, FetchError, GitMirror, LockMode,
@@ -28,25 +27,23 @@ const FILE_NAME: &str = "rcmake-fetch.lock";
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
 const MAX_URLS: usize = 32;
+const LOCK_READ_OPTIONS: ReadOptions = ReadOptions {
+    allow_comments: false,
+    dup_keys_last_wins: false,
+};
 
 fn sha256_name() -> String {
     "SHA256".into()
 }
 
-fn is_sha256(name: &str) -> bool {
-    name == "SHA256"
-}
-
 /// A locked archive and its source URLs.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UrlEntry {
     /// Primary URL followed by fallback URLs in declaration order.
     pub urls: Vec<String>,
     /// SHA-256 content digest.
     pub sha256: Digest,
     /// Lockfile digest algorithm. Version 1 accepts only `SHA256`.
-    #[serde(default = "sha256_name", skip_serializing_if = "is_sha256")]
     pub algo: String,
     /// Size of the archive in bytes.
     pub size: u64,
@@ -67,16 +64,56 @@ impl UrlEntry {
             size,
         }
     }
+
+    fn to_object_entries(&self) -> Vec<(&'static str, Value)> {
+        let mut entries = vec![
+            ("urls", self.urls.to_json()),
+            ("sha256", Value::string(self.sha256.to_hex())),
+            ("size", self.size.to_json()),
+        ];
+        if self.algo != "SHA256" {
+            entries.push(("algo", self.algo.to_json()));
+        }
+        entries
+    }
+
+    fn from_object(obj: &Object, allowed: &[&str]) -> Result<Self, FieldError> {
+        deny_unknown(obj, allowed)?;
+        let urls =
+            array_bounded(req_value(obj, "urls")?, MAX_URLS).map_err(|err| err.in_field("urls"))?;
+        let hex =
+            rcmake_json::str(req_value(obj, "sha256")?).map_err(|err| err.in_field("sha256"))?;
+        let sha256 = Digest::from_hex(hex)
+            .ok_or_else(|| FieldError::invalid("Expected 64 hex digits.").in_field("sha256"))?;
+        let algo = opt_or_else(obj, "algo", sha256_name)?;
+        let size = req(obj, "size")?;
+        Ok(Self {
+            urls,
+            sha256,
+            algo,
+            size,
+        })
+    }
+}
+
+impl ToJson for UrlEntry {
+    fn to_json(&self) -> Value {
+        Value::object_from(self.to_object_entries())
+    }
+}
+
+impl FromJson for UrlEntry {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        Self::from_object(object(value)?, &["urls", "sha256", "algo", "size"])
+    }
 }
 
 /// A locked Git source.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitEntry {
     /// Git repository URL.
     pub repository: String,
     /// Tag, branch, or commit specified by the project.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
     /// Full 40-digit Git commit ID.
     pub commit: String,
@@ -98,16 +135,82 @@ impl GitEntry {
         }
         identity(left) == identity(right)
     }
+
+    fn to_object_entries(&self) -> Vec<(&'static str, Value)> {
+        let mut entries = vec![
+            ("repository", self.repository.to_json()),
+            ("commit", self.commit.to_json()),
+        ];
+        if let Some(tag) = &self.tag {
+            entries.push(("tag", tag.to_json()));
+        }
+        entries
+    }
+
+    fn from_object(obj: &Object, allowed: &[&str]) -> Result<Self, FieldError> {
+        deny_unknown(obj, allowed)?;
+        Ok(Self {
+            repository: req(obj, "repository")?,
+            tag: opt(obj, "tag")?,
+            commit: req(obj, "commit")?,
+        })
+    }
+}
+
+impl ToJson for GitEntry {
+    fn to_json(&self) -> Value {
+        Value::object_from(self.to_object_entries())
+    }
+}
+
+impl FromJson for GitEntry {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        Self::from_object(object(value)?, &["repository", "tag", "commit"])
+    }
 }
 
 /// A dependency in a version 1 lockfile.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LockEntry {
     /// Archive source.
     Url(UrlEntry),
     /// Git source.
     Git(GitEntry),
+}
+
+impl ToJson for LockEntry {
+    fn to_json(&self) -> Value {
+        let entries = match self {
+            Self::Url(entry) => {
+                let mut entries = entry.to_object_entries();
+                entries.push(("kind", Value::string("url")));
+                entries
+            }
+            Self::Git(entry) => {
+                let mut entries = entry.to_object_entries();
+                entries.push(("kind", Value::string("git")));
+                entries
+            }
+        };
+        Value::object_from(entries)
+    }
+}
+
+impl FromJson for LockEntry {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        let kind = rcmake_json::str(req_value(obj, "kind")?).map_err(|err| err.in_field("kind"))?;
+        match kind {
+            "url" => UrlEntry::from_object(obj, &["kind", "urls", "sha256", "algo", "size"])
+                .map(Self::Url),
+            "git" => {
+                GitEntry::from_object(obj, &["kind", "repository", "tag", "commit"]).map(Self::Git)
+            }
+            other => Err(
+                FieldError::invalid(format!("unknown lock entry kind '{other}'")).in_field("kind"),
+            ),
+        }
+    }
 }
 
 impl LockEntry {
@@ -342,11 +445,9 @@ fn valid_name(name: &str) -> bool {
 }
 
 /// Version 1 project lockfile. Dependency names are ASCII case-insensitive.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LockFile {
     version: u32,
-    #[serde(deserialize_with = "read_entries")]
     entries: BTreeMap<String, LockEntry>,
 }
 
@@ -359,20 +460,71 @@ impl Default for LockFile {
     }
 }
 
+impl ToJson for LockFile {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("version", self.version.to_json()),
+            ("entries", self.entries.to_json()),
+        ])
+    }
+}
+
+impl FromJson for LockFile {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["version", "entries"])?;
+        let version: u32 = req(obj, "version")?;
+        let entries_obj =
+            object(req_value(obj, "entries")?).map_err(|err| err.in_field("entries"))?;
+        if entries_obj.len() > MAX_ENTRIES {
+            return Err(
+                FieldError::invalid("Fetch lockfile exceeds the entry limit.").in_field("entries"),
+            );
+        }
+        let mut file = Self {
+            version,
+            entries: BTreeMap::new(),
+        };
+        for (raw_key, raw_entry) in entries_obj {
+            let raw_name = std::str::from_utf8(raw_key.as_slice()).map_err(|_| {
+                FieldError::invalid("Dependency name is not valid UTF-8.").in_field("entries")
+            })?;
+            let name = raw_name.to_ascii_lowercase();
+            if file.get(&name).is_some() {
+                return Err(
+                    FieldError::invalid("Duplicate fetch dependency name.").in_field("entries")
+                );
+            }
+            let mut entry = LockEntry::from_json(raw_entry)
+                .map_err(|err| err.in_field(raw_name).in_field("entries"))?;
+            entry.redact_legacy_identity();
+            file.insert(&name, entry).map_err(|err| {
+                FieldError::invalid(err.to_string())
+                    .in_field(raw_name)
+                    .in_field("entries")
+            })?;
+        }
+        Ok(file)
+    }
+}
+
 impl LockFile {
     /// Parse bounded, versioned JSON and reject unknown or duplicate fields.
     pub fn parse(bytes: &[u8]) -> Result<Self, FetchError> {
         if bytes.len() > MAX_BYTES {
             return Err(invalid("Fetch lockfile exceeds the size limit."));
         }
-        let file: Self = serde_json::from_slice(bytes).map_err(|error| {
+        if std::str::from_utf8(bytes).is_err() {
+            return Err(invalid("Invalid fetch lockfile: input is not valid UTF-8."));
+        }
+        let value = parse(bytes, &LOCK_READ_OPTIONS).map_err(|error| {
             invalid(format!(
-                "Invalid fetch lockfile at line {}, column {} ({:?}).",
-                error.line(),
-                error.column(),
-                error.classify(),
+                "Invalid fetch lockfile at line {}, column {} ({}).",
+                error.line, error.column, error.message,
             ))
         })?;
+        let file = Self::from_json(&value)
+            .map_err(|error| invalid(format!("Invalid fetch lockfile ({error}).")))?;
         if file.version != 1 {
             return Err(invalid("Unsupported fetch lockfile version."));
         }
@@ -381,8 +533,10 @@ impl LockFile {
 
     /// Serialize with sorted keys and a final line feed.
     pub fn to_json(&self) -> Result<Vec<u8>, FetchError> {
-        let result = serde_json::to_value(self).and_then(|value| serde_json::to_vec_pretty(&value));
-        let mut bytes = result.map_err(|error| invalid(error.to_string()))?;
+        let value = <Self as ToJson>::to_json(self);
+        let mut bytes: Vec<u8> = write_pretty_utf8(&value)
+            .map_err(|error| invalid(error.to_string()))?
+            .into();
         bytes.push(b'\n');
         if bytes.len() > MAX_BYTES {
             return Err(invalid("Fetch lockfile exceeds the size limit."));
@@ -407,36 +561,6 @@ impl LockFile {
         self.entries.insert(name, entry);
         Ok(())
     }
-}
-
-fn read_entries<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<BTreeMap<String, LockEntry>, D::Error> {
-    struct Entries;
-
-    impl<'de> Visitor<'de> for Entries {
-        type Value = BTreeMap<String, LockEntry>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a map of named fetch dependencies")
-        }
-
-        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-            let mut file = LockFile::default();
-            while let Some(name) = map.next_key::<String>()? {
-                let name = name.to_ascii_lowercase();
-                if file.get(&name).is_some() {
-                    return Err(M::Error::custom("Duplicate fetch dependency name."));
-                }
-                let mut entry: LockEntry = map.next_value()?;
-                entry.redact_legacy_identity();
-                file.insert(&name, entry).map_err(M::Error::custom)?;
-            }
-            Ok(file.entries)
-        }
-    }
-
-    deserializer.deserialize_map(Entries)
 }
 
 /// Lockfile state for one configure. Call [Self::commit] after a successful configure.

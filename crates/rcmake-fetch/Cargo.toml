@@ -10,16 +10,15 @@ repository.workspace = true
 
 [features]
 default = []
-native = ["dep:rcmake-store"]
+native = ["dep:rcmake-json", "dep:rcmake-store"]
 
 [dependencies]
 rcmake-base.workspace = true
 rcmake-host.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(any(unix, windows))'.dependencies]
+rcmake-json = { workspace = true, optional = true }
 rcmake-store = { workspace = true, optional = true }
 
 [lints]
