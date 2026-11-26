@@ -104,7 +104,7 @@ finished [Set up](#set-up).
    baseline from the oracle with
    `cargo run --bin rcmake-harness -- --suite <suite> --record`.
 
-## Clean-room rules
+## Independent implementation and licensing rules
 
 - Write all Rust code in `crates/` and `tools/` from scratch. Do not copy,
   translate, or adapt CMake C++ source code.

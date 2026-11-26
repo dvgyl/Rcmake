@@ -318,7 +318,7 @@
       "gates": [
         {
           "id": "fuzz",
-          "label": "Seeded generative fuzzing (14 formats, 0 panics)",
+          "label": "Seeded generative fuzzing (14 input formats)",
           "status": "pass",
           "preFreeze": true,
           "commit": "d4356df",
