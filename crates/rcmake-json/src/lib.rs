@@ -12,9 +12,14 @@ use std::collections::BTreeMap;
 use rcmake_base::BString;
 use thiserror::Error;
 
+pub mod codec;
 mod read;
 mod write;
 
+pub use codec::{
+    FieldError, FromJson, Object, ToJson, array, array_bounded, bool, bytes, deny_unknown, i64,
+    object, opt, opt_or_else, req, req_value, str, u64, usize,
+};
 pub use read::parse;
 pub use write::{write_compact, write_pretty_utf8, write_string, write_styled};
 
@@ -116,12 +121,36 @@ impl Value {
         }
     }
 
+    /// Return an integer that fits in an unsigned 64-bit value.
+    #[must_use]
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::UInt(value) => Some(*value),
+            Self::Int(value) => u64::try_from(*value).ok(),
+            _ => None,
+        }
+    }
+
     /// Return a Boolean value.
     #[must_use]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(value) => Some(*value),
             _ => None,
+        }
+    }
+
+    /// Return the human-readable JSON type name of this value.
+    #[must_use]
+    pub const fn type_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Bool(_) => "boolean",
+            Self::Int(_) | Self::UInt(_) => "integer",
+            Self::Real(_) => "number",
+            Self::String(_) => "string",
+            Self::Array(_) => "array",
+            Self::Object(_) => "object",
         }
     }
 }

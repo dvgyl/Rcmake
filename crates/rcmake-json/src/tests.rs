@@ -630,3 +630,267 @@ fn pretty_utf8_rejects_invalid_utf8_object_keys() {
         "JSON object key is not valid UTF-8"
     );
 }
+
+#[test]
+fn value_as_u64_and_type_names() {
+    assert_eq!(Value::Int(0).as_u64(), Some(0));
+    assert_eq!(Value::Int(i64::MAX).as_u64(), Some(i64::MAX as u64));
+    assert_eq!(Value::Int(-1).as_u64(), None);
+    assert_eq!(Value::Int(i64::MIN).as_u64(), None);
+    assert_eq!(Value::UInt(u64::MAX).as_u64(), Some(u64::MAX));
+    assert_eq!(Value::Real(1.0).as_u64(), None);
+    assert_eq!(Value::Null.type_name(), "null");
+    assert_eq!(Value::Bool(true).type_name(), "boolean");
+    assert_eq!(Value::Int(1).type_name(), "integer");
+    assert_eq!(Value::UInt(1).type_name(), "integer");
+    assert_eq!(Value::Real(1.0).type_name(), "number");
+    assert_eq!(Value::string("x").type_name(), "string");
+    assert_eq!(Value::Array(vec![]).type_name(), "array");
+    assert_eq!(Value::object().type_name(), "object");
+}
+
+#[test]
+fn extractors_cover_valid_range_and_type_errors() {
+    assert_eq!(codec::u64(&Value::Int(0)), Ok(0));
+    assert_eq!(codec::u64(&Value::UInt(u64::MAX)), Ok(u64::MAX));
+    assert_eq!(codec::u64(&Value::Int(-1)), Err(FieldError::range("u64")));
+    assert_eq!(
+        codec::u64(&Value::string("1")),
+        Err(FieldError::expected("u64", &Value::string("1")))
+    );
+
+    assert_eq!(codec::i64(&Value::Int(i64::MIN)), Ok(i64::MIN));
+    assert_eq!(codec::i64(&Value::UInt(i64::MAX as u64)), Ok(i64::MAX));
+    assert_eq!(
+        codec::i64(&Value::UInt(i64::MAX as u64 + 1)),
+        Err(FieldError::range("i64"))
+    );
+    assert_eq!(
+        codec::i64(&Value::Bool(false)),
+        Err(FieldError::expected("i64", &Value::Bool(false)))
+    );
+
+    assert_eq!(codec::usize(&Value::Int(42)), Ok(42));
+    assert_eq!(codec::usize(&Value::UInt(7)), Ok(7));
+    assert_eq!(
+        codec::usize(&Value::Int(-1)),
+        Err(FieldError::range("usize"))
+    );
+    assert_eq!(
+        codec::usize(&Value::Null),
+        Err(FieldError::expected("usize", &Value::Null))
+    );
+
+    assert_eq!(codec::bool(&Value::Bool(true)), Ok(true));
+    assert_eq!(
+        codec::bool(&Value::Int(1)),
+        Err(FieldError::expected("boolean", &Value::Int(1)))
+    );
+
+    assert_eq!(codec::str(&Value::string("é")), Ok("é"));
+    assert_eq!(
+        codec::str(&Value::string(b"\xff".as_slice())),
+        Err(FieldError::invalid("string is not valid UTF-8"))
+    );
+    assert_eq!(
+        codec::str(&Value::Null),
+        Err(FieldError::expected("string", &Value::Null))
+    );
+
+    assert_eq!(
+        codec::bytes(&Value::string(b"a\xff\0".as_slice())),
+        Ok(b"a\xff\0".as_slice())
+    );
+    assert_eq!(
+        codec::bytes(&Value::Int(0)),
+        Err(FieldError::expected("string", &Value::Int(0)))
+    );
+
+    let arr = Value::array_from([Value::Int(1), Value::Int(2)]);
+    assert_eq!(codec::array(&arr).map(<[Value]>::len), Ok(2));
+    assert_eq!(
+        codec::array(&Value::object()),
+        Err(FieldError::expected("array", &Value::object()))
+    );
+    assert_eq!(codec::array_bounded::<u32>(&arr, 2), Ok(vec![1, 2]));
+    assert!(matches!(
+        codec::array_bounded::<u32>(&arr, 1),
+        Err(FieldError::Invalid { .. })
+    ));
+
+    let obj = Value::object_from([("k", Value::Bool(true))]);
+    assert_eq!(codec::object(&obj).map(BTreeMap::len), Ok(1));
+    assert_eq!(
+        codec::object(&arr),
+        Err(FieldError::expected("object", &arr))
+    );
+}
+
+#[test]
+fn field_helpers_and_deny_unknown_enforce_schema() {
+    let val = Value::object_from([
+        ("count", Value::Int(3)),
+        ("note", Value::Null),
+        ("tag", Value::string("v1")),
+    ]);
+    let obj = codec::object(&val).expect("object");
+
+    assert_eq!(codec::req::<u32>(obj, "count"), Ok(3));
+    assert_eq!(
+        codec::req::<u32>(obj, "missing"),
+        Err(FieldError::missing("missing"))
+    );
+    assert_eq!(
+        codec::req::<u32>(obj, "tag"),
+        Err(FieldError::expected("u32", &Value::string("v1")).in_field("tag"))
+    );
+    assert_eq!(
+        codec::req::<u32>(obj, "tag").unwrap_err().to_string(),
+        "field 'tag': expected u32, found string"
+    );
+
+    assert_eq!(codec::opt::<String>(obj, "missing"), Ok(None));
+    assert_eq!(codec::opt::<String>(obj, "note"), Ok(None));
+    assert_eq!(codec::opt::<String>(obj, "tag"), Ok(Some("v1".into())));
+    assert!(matches!(
+        codec::opt::<u32>(obj, "tag"),
+        Err(FieldError::Field { ref field, .. }) if field == "tag"
+    ));
+
+    assert_eq!(
+        codec::opt_or_else(obj, "missing", || "SHA256".to_owned()),
+        Ok("SHA256".to_owned())
+    );
+    assert_eq!(
+        codec::opt_or_else(obj, "tag", || "default".to_owned()),
+        Ok("v1".to_owned())
+    );
+    assert_eq!(
+        codec::opt_or_else(obj, "note", || "default".to_owned()),
+        Err(FieldError::expected("string", &Value::Null).in_field("note"))
+    );
+
+    assert_eq!(codec::deny_unknown(obj, &["count", "note", "tag"]), Ok(()));
+    assert_eq!(
+        codec::deny_unknown(obj, &["count", "tag"]),
+        Err(FieldError::unknown("note"))
+    );
+
+    let non_utf8 = Value::object_from([(BString::from(b"bad\xff".as_slice()), Value::Null)]);
+    let non_utf8_obj = codec::object(&non_utf8).expect("object");
+    assert_eq!(
+        codec::deny_unknown(non_utf8_obj, &["ok"]),
+        Err(FieldError::unknown("bad\u{fffd}"))
+    );
+}
+
+#[test]
+fn to_json_and_from_json_round_trip_standard_and_custom_types() {
+    fn round_trip<T>(value: T)
+    where
+        T: ToJson + FromJson + PartialEq + std::fmt::Debug,
+    {
+        let encoded = value.to_json();
+        let decoded = T::from_json(&encoded).expect("round-trip decode");
+        assert_eq!(decoded, value);
+    }
+
+    round_trip(());
+    round_trip(true);
+    round_trip(false);
+    round_trip(u8::MAX);
+    round_trip(u16::MAX);
+    round_trip(u32::MAX);
+    round_trip(u64::MAX);
+    round_trip(42_usize);
+    round_trip(i8::MIN);
+    round_trip(i16::MIN);
+    round_trip(i32::MIN);
+    round_trip(i64::MIN);
+    round_trip(-99_isize);
+    round_trip(1.5_f64);
+    round_trip("hello café".to_owned());
+    round_trip(BString::from(b"raw\xffbytes".as_slice()));
+    round_trip(Box::new(123_u32));
+    round_trip(Some("present".to_owned()));
+    round_trip(Option::<String>::None);
+    round_trip(vec![1_u8, 2, 3, 255]);
+    round_trip([10_u8, 20, 30, 40]);
+    round_trip(std::collections::BTreeSet::from([
+        "a".to_owned(),
+        "b".to_owned(),
+    ]));
+    round_trip(BTreeMap::from([("k".to_owned(), 9_u64)]));
+    round_trip(BTreeMap::from([(BString::from(b"\xff".as_slice()), true)]));
+    round_trip(Value::object_from([("x", Value::Int(1))]));
+
+    assert_eq!("slice".to_json(), Value::string("slice"));
+    assert_eq!([1_u32, 2].as_slice().to_json(), vec![1_u32, 2].to_json());
+    assert_eq!(f64::from_json(&Value::Int(-4)), Ok(-4.0));
+    assert_eq!(f64::from_json(&Value::UInt(8)), Ok(8.0));
+    assert_eq!(
+        u8::from_json(&Value::UInt(256)),
+        Err(FieldError::range("u8"))
+    );
+    assert_eq!(
+        i8::from_json(&Value::Int(-129)),
+        Err(FieldError::range("i8"))
+    );
+    assert!(matches!(
+        <[u8; 3]>::from_json(&vec![1_u8, 2].to_json()),
+        Err(FieldError::Invalid { .. })
+    ));
+
+    let bad_map = Value::object_from([(BString::from(b"\xff".as_slice()), Value::Int(1))]);
+    assert_eq!(
+        BTreeMap::<String, i64>::from_json(&bad_map),
+        Err(FieldError::invalid("object key is not valid UTF-8"))
+    );
+
+    #[derive(Debug, PartialEq)]
+    struct Record {
+        name: String,
+        flag: bool,
+        tag: Option<String>,
+        algo: String,
+    }
+
+    impl ToJson for Record {
+        fn to_json(&self) -> Value {
+            let mut entries = vec![("name", self.name.to_json()), ("flag", self.flag.to_json())];
+            if let Some(tag) = &self.tag {
+                entries.push(("tag", tag.to_json()));
+            }
+            if self.algo != "SHA256" {
+                entries.push(("algo", self.algo.to_json()));
+            }
+            Value::object_from(entries)
+        }
+    }
+
+    impl FromJson for Record {
+        fn from_json(value: &Value) -> Result<Self, FieldError> {
+            let obj = object(value)?;
+            deny_unknown(obj, &["name", "flag", "tag", "algo"])?;
+            Ok(Self {
+                name: req(obj, "name")?,
+                flag: req(obj, "flag")?,
+                tag: opt(obj, "tag")?,
+                algo: opt_or_else(obj, "algo", || "SHA256".to_owned())?,
+            })
+        }
+    }
+
+    round_trip(Record {
+        name: "fmt".into(),
+        flag: true,
+        tag: Some("v11".into()),
+        algo: "SHA256".into(),
+    });
+    round_trip(Record {
+        name: "zlib".into(),
+        flag: false,
+        tag: None,
+        algo: "SHA512".into(),
+    });
+}
