@@ -232,7 +232,9 @@ def validate_ci_run(run: Run) -> str | None:
         return f"event is {run.event!r}, expected 'push' or 'workflow_dispatch'."
     if not run.jobs:
         return "run has no jobs."
-    missing_or_failed, duplicate_required, extra_failed, _ = verifier.ci_jobs_issues(list(run.jobs))
+    missing_or_failed, duplicate_required, extra_failed, _ = verifier.ci_jobs_issues(
+        list(run.jobs), require_head_sha=False,
+    )
     issues = [*missing_or_failed, *duplicate_required, *extra_failed]
     if issues:
         return f"all 6 distinct CI jobs must succeed ({'; '.join(issues)})."

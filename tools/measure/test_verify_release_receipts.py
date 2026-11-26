@@ -617,6 +617,24 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
             "workflow_runs": runs,
         }
 
+    def test_ci_jobs_requires_head_sha_in_every_job(self):
+        for fields in ({}, {"head_sha": ""}, {"head_sha": " "}, {"head_sha": 123},
+                       {"headSha": COMMIT_OK}):
+            with self.subTest(fields=fields):
+                payloads = self.build_valid_receipts()
+                ci_jobs = self.make_ci_jobs_payload()
+                ci_jobs["workflow_runs"].append({
+                    "name": "Extra CI job",
+                    "status": "completed",
+                    "conclusion": "success",
+                    **fields,
+                })
+                payloads["ci_jobs"] = ci_jobs
+                manifest = self.write_manifest(payloads)
+                code, _, stderr = self.run_cli("--manifest", str(manifest))
+                self.assertEqual(code, 1)
+                self.assertIn("Extra CI job (head_sha must be a non-empty string)", stderr)
+
     def test_ci_jobs_accepts_all_six_distinct_green_and_rejects_five_of_six(self):
         payloads = self.build_valid_receipts()
         manifest = self.write_manifest(payloads)

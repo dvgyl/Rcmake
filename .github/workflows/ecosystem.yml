@@ -148,7 +148,7 @@ jobs:
           candidates = [run for run in initial
                         if run["event"] in ("push", "workflow_dispatch") and run["head_sha"] == sha]
           for candidate in candidates:
-              if available(candidate["id"]):
+              if candidate["conclusion"] == "success" and available(candidate["id"]):
                   publish(candidate["id"])
                   raise SystemExit(0)
 
@@ -186,12 +186,13 @@ jobs:
               run = api(f"{repo}/actions/runs/{run_id}")
               if run["head_sha"] != sha:
                   raise SystemExit(f"::error::CI run {run_id} uses {run['head_sha']}. Expected {sha}.")
-              if available(run_id):
+              if run["status"] == "completed":
+                  if run["conclusion"] != "success":
+                      raise SystemExit(f"::error::CI run {run_id} concluded with {run['conclusion']}.")
+                  if not available(run_id):
+                      raise SystemExit(f"::error::CI run {run_id} did not publish {sorted(artifacts)}.")
                   publish(run_id)
                   break
-              if run["status"] == "completed":
-                  raise SystemExit(f"::error::CI run {run_id} concluded with {run['conclusion']} "
-                                   f"and did not publish {sorted(artifacts)}.")
               pause(30)
           PY
 
@@ -460,7 +461,8 @@ jobs:
               print(f"- Duration: {shard['duration_seconds']:.1f} seconds", file=output)
           if not scored:
               raise SystemExit("The shard did not score any CMake ports.")
-          raise SystemExit(bool(summary["configure-mismatch"] or summary["cmake-identity-mismatch"]))
+          if summary["pass"] != len(ports):
+              raise SystemExit("One or more ports did not pass the CMake configure comparison.")
           PY
       - uses: actions/upload-artifact@v6
         if: always()

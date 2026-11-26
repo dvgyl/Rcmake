@@ -31,9 +31,10 @@ Options:
                      <path>.sha256 if that file exists.
   -AliasCmake        Also create cmake.exe, ctest.exe, and cpack.exe aliases
                      from rcmake.exe (hardlink, falling back to copy).
-  -Force             Replace existing cmake.exe, ctest.exe, or cpack.exe files.
+  -Force             Allow replacement of unmarked share\cmake-4.5 data.
+                     With -AliasCmake, also replace existing aliases.
   -Uninstall         Remove rcmake.exe, rcmake-lsp.exe, rcmake-owned aliases,
-                     share\cmake-4.5, share\doc\rcmake, and
+                     managed share\cmake-4.5 data, share\doc\rcmake, and
                      share\rcmake\completions\rcmake.ps1 from Prefix.
   -Help              Show this help.
 
@@ -190,7 +191,10 @@ function Assert-ArchiveChecksum {
     $expected = @($entries | Where-Object { $_.Name -ceq $archiveName } | ForEach-Object { $_.Hash })
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $ArchivePath).Hash.ToLowerInvariant()
     if (@($expected).Count -ne 1 -or $expected[0] -cne $actual) {
-        Stop-Install "SHA-256 mismatch for $archiveName."
+        if ($archiveName -cmatch '^rcmake-(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?)-(?:x86_64|aarch64)-pc-windows-msvc\.zip$') {
+            Stop-Install "SHA-256 mismatch for release v$($Matches[1]), archive $archiveName."
+        }
+        Stop-Install "SHA-256 mismatch for archive $archiveName."
     }
     Write-Host "Verified the SHA-256 checksum of $archiveName."
 }
@@ -397,6 +401,7 @@ if ([string]::IsNullOrWhiteSpace($Prefix)) {
 $prefixFull = Resolve-FullPath -Path $Prefix
 $binDir = Join-Path $prefixFull 'bin'
 $dataDir = Join-Path (Join-Path $prefixFull 'share') 'cmake-4.5'
+$dataMarkerName = '.rcmake-managed'
 $docDir = Join-Path (Join-Path (Join-Path $prefixFull 'share') 'doc') 'rcmake'
 $docManifestPath = Join-Path $docDir '.rcmake-manifest'
 $completionDir = Join-Path (Join-Path (Join-Path $prefixFull 'share') 'rcmake') 'completions'
@@ -404,6 +409,16 @@ $completionPath = Join-Path $completionDir 'rcmake.ps1'
 $rcmakePath = Join-Path $binDir 'rcmake.exe'
 $lspPath = Join-Path $binDir 'rcmake-lsp.exe'
 $tools = @('cmake.exe', 'ctest.exe', 'cpack.exe')
+
+function Test-ManagedData {
+    param([Parameter(Mandatory)][string]$Path)
+    $data = Get-ItemOrNull -Path $Path
+    if ($null -eq $data -or -not $data.PSIsContainer -or ($data.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        return $false
+    }
+    $marker = Get-ItemOrNull -Path (Join-Path $Path $dataMarkerName)
+    return ($null -ne $marker -and -not $marker.PSIsContainer -and -not ($marker.Attributes -band [IO.FileAttributes]::ReparsePoint))
+}
 
 if ($Uninstall) {
     if ($Archive -or $AliasCmake -or $Force -or $PSBoundParameters.ContainsKey('Version')) {
@@ -430,7 +445,9 @@ if ($Uninstall) {
 
     if (Test-Path -LiteralPath $dataDir -PathType Container) {
         $cmakePath = Join-Path $binDir 'cmake.exe'
-        if ($null -ne (Get-ItemOrNull -Path $cmakePath)) {
+        if (-not (Test-ManagedData -Path $dataDir)) {
+            Write-Host "Kept $dataDir because it has no rcmake ownership marker."
+        } elseif ($null -ne (Get-ItemOrNull -Path $cmakePath)) {
             Write-Host "Kept $dataDir because $cmakePath is another CMake installation."
         } else {
             Remove-Item -LiteralPath $dataDir -Recurse -Force
@@ -681,6 +698,7 @@ try {
         }
     }
 
+    [IO.File]::WriteAllText((Join-Path $stagedData $dataMarkerName), "Managed by rcmake.`n")
     $null = & $stagedBin --version
     if ($LASTEXITCODE -ne 0) {
         Stop-Install "Staged rcmake.exe failed --version check (exit code $LASTEXITCODE)."
@@ -689,6 +707,9 @@ try {
     # Validate all destination paths and parent directories before modifying any installed file.
     Assert-DirectoryAncestors -TargetPath $rcmakePath -PrefixRoot $prefixFull
     Assert-DirectoryAncestors -TargetPath $dataDir -PrefixRoot $prefixFull
+    if (-not $Force -and $null -ne (Get-ItemOrNull -Path $dataDir) -and -not (Test-ManagedData -Path $dataDir)) {
+        Stop-Install "$dataDir has no rcmake ownership marker. Another CMake installation may own it. Use -Prefix <separate-dir> or -Force to replace the data."
+    }
     if ($hasCompletion) {
         Assert-DirectoryAncestors -TargetPath $completionPath -PrefixRoot $prefixFull
     }
@@ -916,3 +937,5 @@ if (-not $onPath) {
         }
     }
 }
+
+Write-Host 'Run rcmake --version to check the installation.'

@@ -371,19 +371,20 @@ def _collect_commits_from_ci(payload: Any) -> list[str]:
     commits: list[str] = []
     if isinstance(payload, dict):
         commits.extend(builder.report_identity_values(payload, builder.REPORT_SHA_KEYS))
-        runs = payload.get("workflow_runs")
+        runs = payload.get("workflow_runs", payload.get("jobs"))
     elif isinstance(payload, list):
         runs = payload
     else:
         runs = None
 
     if isinstance(runs, list):
-        for run in runs:
+        for index, run in enumerate(runs):
             if not isinstance(run, dict):
-                continue
-            head = run.get("head_sha", run.get("headSha"))
-            if isinstance(head, str) and head.strip():
-                commits.append(head.strip().lower())
+                raise ValueError(f"CI job at index {index} must be an object.")
+            head = run.get("head_sha")
+            if not isinstance(head, str) or not head.strip():
+                raise ValueError(f"CI job at index {index} must have a non-empty head_sha string.")
+            commits.append(head.strip().lower())
     return commits
 
 
@@ -397,7 +398,10 @@ def _inspect_json_file(path: Path, receipts_dir: Path, lane_key: str) -> FileChe
     if lane_key == "ci_jobs":
         if not isinstance(payload, (dict, list)):
             return FileCheck(rel, path, (), (), error="expected a JSON object or array")
-        commits = tuple(dict.fromkeys(_collect_commits_from_ci(payload)))
+        try:
+            commits = tuple(dict.fromkeys(_collect_commits_from_ci(payload)))
+        except ValueError as error:
+            return FileCheck(rel, path, (), (), error=str(error))
         binaries = (
             tuple(dict.fromkeys(builder.report_identity_values(payload, builder.REPORT_DIGEST_KEYS)))
             if isinstance(payload, dict)
@@ -836,6 +840,11 @@ def _stage_ci_jobs_for_builder(ci_path: Path, stage_dir: Path, expected_commit: 
     if isinstance(payload, list) or (isinstance(payload, dict) and "workflow_runs" in payload):
         return ci_path
     if isinstance(payload, dict):
+        if "jobs" in payload:
+            payload["workflow_runs"] = payload["jobs"]
+            staged = stage_dir / "ci-jobs-builder.json"
+            staged.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return staged
         passed = payload.get("passed")
         total = payload.get("total")
         if verifier.is_int(passed) and verifier.is_int(total) and 0 <= passed <= total:

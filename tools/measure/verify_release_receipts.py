@@ -1691,10 +1691,12 @@ def ci_jobs_issues(
     jobs: list[Any],
     *,
     expected_commit: str | None = None,
+    require_head_sha: bool = True,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
-    """Inspect CI job rows against REQUIRED_CI_JOBS.
+    """Check required jobs, duplicates, extra failures, and commit mismatches.
 
-    Returns (missing_or_failed, duplicate_required, extra_failed, commit_mismatches).
+    Receipt rows must have head_sha. A caller that checked the run's commit
+    can disable this requirement for raw job rows from GitHub CLI.
     """
     by_name: dict[str, list[tuple[str, str]]] = {}
     extra_failed: list[str] = []
@@ -1709,15 +1711,16 @@ def ci_jobs_issues(
         name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else ""
         status = str(row.get("status") or "").strip().lower()
         conclusion = str(row.get("conclusion") or "").strip().lower()
-        head_sha = row.get("head_sha", row.get("headSha"))
-        if expected_commit is not None and isinstance(head_sha, str) and head_sha.strip():
-            norm_head = head_sha.strip().lower()
-            if norm_head != expected_commit:
-                commit_mismatches.append(f"{name or f'job[{index}]'} ({norm_head})")
+        label = name or f"job[{index}]"
+        head_sha = row.get("head_sha")
+        if require_head_sha:
+            if not isinstance(head_sha, str) or not head_sha.strip():
+                extra_failed.append(f"{label} (head_sha must be a non-empty string)")
+            elif expected_commit is not None and head_sha.strip().lower() != expected_commit:
+                commit_mismatches.append(f"{label} ({head_sha.strip().lower()})")
         if name:
             by_name.setdefault(name, []).append((status, conclusion))
         if name not in required_set and (status != "completed" or conclusion != "success"):
-            label = name or f"job[{index}]"
             extra_failed.append(f"{label} ({status or 'unknown'}/{conclusion or 'unknown'})")
 
     missing_or_failed: list[str] = []
@@ -1814,7 +1817,7 @@ def check_ci_jobs(record: ReceiptRecord, findings: list[Finding]) -> None:
             kind="failed",
             expected=f"all {len(REQUIRED_CI_JOBS)} distinct CI jobs completed with conclusion 'success'",
             actual="; ".join(issues),
-            detail="CI receipt must show all 6 distinct CI and Corpus smoke matrix jobs green.",
+            detail="CI receipt must show all 6 distinct CI and Corpus smoke jobs green and record head_sha for every job.",
         ))
 
 

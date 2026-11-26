@@ -4,8 +4,8 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--version <v> | --from-source | --archive <path>] [--alias-cmake] [--force]
-       install.sh --uninstall
+Usage: install.sh [--version <v> | --from-source | --archive <path>] [--prefix <dir>] [--alias-cmake] [--force]
+       install.sh --uninstall [--prefix <dir>]
 
 Install rcmake and rcmake-lsp into $PREFIX/bin, the bundled CMake 4.5.1
 data into $PREFIX/share/cmake-4.5, licences and third-party notices into
@@ -19,10 +19,12 @@ Sources (select one, the default is the latest GitHub Release):
                      <path>.sha256 if that file exists.
 
 Options:
+  --prefix <dir>     Set the installation root (default: $PREFIX or $HOME/.local).
   --alias-cmake      Also create cmake, ctest, and cpack links to rcmake.
-  --force            Replace existing cmake, ctest, or cpack files.
+  --force            Allow replacement of unmarked share/cmake-4.5 data.
+                     With --alias-cmake, also replace existing aliases.
   --uninstall        Remove rcmake, rcmake-lsp, the links to rcmake,
-                     share/cmake-4.5, share/doc/rcmake, and the rcmake
+                     managed share/cmake-4.5 data, share/doc/rcmake, and the rcmake
                      completions and man page from $PREFIX.
   -h, --help         Show this help.
 
@@ -38,6 +40,7 @@ die() {
 mode=release
 archive=""
 version=""
+prefix="${PREFIX:-$HOME/.local}"
 alias_cmake=false
 force=false
 uninstall=false
@@ -68,6 +71,14 @@ while [[ $# -gt 0 ]]; do
       version="$2"
       shift
       ;;
+    --prefix)
+      if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+        printf '%s requires a path.\n' "$1" >&2
+        exit 2
+      fi
+      prefix="$2"
+      shift
+      ;;
     --alias-cmake) alias_cmake=true ;;
     --force) force=true ;;
     --uninstall) uninstall=true ;;
@@ -89,9 +100,9 @@ if [[ -n "$version" ]]; then
   version="${version#v}"
 fi
 
-prefix="${PREFIX:-$HOME/.local}"
 bin_dir="$prefix/bin"
 data_dir="$prefix/share/cmake-4.5"
+data_marker="$data_dir/.rcmake-managed"
 doc_dir="$prefix/share/doc/rcmake"
 tools=(cmake ctest cpack)
 extra_share_files=(
@@ -108,7 +119,7 @@ is_rcmake_link() {
 
 if "$uninstall"; then
   if [[ "$mode" != release || "$alias_cmake" == true || "$force" == true ]]; then
-    printf 'Use --uninstall alone.\n' >&2
+    printf 'Use --uninstall with only an optional --prefix.\n' >&2
     exit 2
   fi
   removed=()
@@ -127,7 +138,9 @@ if "$uninstall"; then
     removed+=("$bin_dir/rcmake-lsp")
   fi
   if [[ -d "$data_dir" ]]; then
-    if [[ -e "$bin_dir/cmake" ]] && ! is_rcmake_link "$bin_dir/cmake"; then
+    if [[ -L "$data_dir" || ! -f "$data_marker" || -L "$data_marker" ]]; then
+      printf 'Kept %s because it has no rcmake ownership marker.\n' "$data_dir"
+    elif [[ -e "$bin_dir/cmake" ]] && ! is_rcmake_link "$bin_dir/cmake"; then
       printf 'Kept %s because %s is another CMake installation.\n' "$data_dir" "$bin_dir/cmake"
     else
       rm -rf "$data_dir"
@@ -280,9 +293,12 @@ case "$mode" in
 esac
 
 python3 - "$archive" "$checksum" "$prefix" "$alias_cmake" "$force" <<'PY'
+from __future__ import annotations
+
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import subprocess
 import sys
@@ -293,6 +309,7 @@ archive, checksum, prefix, aliases, force = sys.argv[1:]
 archive, prefix = Path(archive), Path(prefix)
 tools = ("cmake", "ctest", "cpack")
 data_dir = Path("share/cmake-4.5")
+data_marker = Path(".rcmake-managed")
 doc_dir = Path("share/doc/rcmake")
 doc_files = (
     Path("LICENSE-APACHE"),
@@ -317,7 +334,13 @@ try:
         expected = [fields[0] for line in lines if len(fields := line.split(maxsplit=1)) == 2
                     and fields[1].lstrip("*") == archive.name]
         if expected != [hashlib.sha256(archive.read_bytes()).hexdigest()]:
-            raise ValueError(f"SHA-256 mismatch for {archive.name}.")
+            release = re.fullmatch(
+                r"rcmake-(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?)-"
+                r"(?:x86_64|aarch64)-(?:apple-darwin|unknown-linux-gnu)\.tar\.gz",
+                archive.name,
+            )
+            label = f"release v{release[1]}, archive {archive.name}" if release else f"archive {archive.name}"
+            raise ValueError(f"SHA-256 mismatch for {label}.")
         print(f"Verified the SHA-256 checksum of {archive.name}.")
 
     prefix.mkdir(parents=True, exist_ok=True)
@@ -406,6 +429,7 @@ try:
         for required in ("Modules/CMake.cmake", "Templates/CPackConfig.cmake.in"):
             if not (work / data_dir / required).is_file():
                 raise ValueError(f"Missing {required} in the archive.")
+        (work / data_dir / data_marker).write_text("Managed by rcmake.\n", encoding="ascii")
         subprocess.run([staged_bin, "--version"], check=True, stdout=subprocess.DEVNULL, timeout=30)
 
         staged_extras = [rel for rel in extra_share_files if (work / rel).is_file()]
@@ -446,6 +470,13 @@ try:
 
         check_ancestor_dirs(bin_dir / "rcmake")
         check_ancestor_dirs(installed_data)
+        marker = installed_data / data_marker
+        if os.path.lexists(installed_data) and force != "true":
+            if installed_data.is_symlink() or not marker.is_file() or marker.is_symlink():
+                raise ValueError(
+                    f"{installed_data} has no rcmake ownership marker. Another CMake installation may own it. "
+                    "Use --prefix <separate-dir> or --force to replace the data."
+                )
         for target_name, present in (("rcmake", True), ("rcmake-lsp", staged_lsp_is_link or staged_lsp_is_file)):
             if present:
                 target_path = bin_dir / target_name
@@ -630,3 +661,5 @@ elif "$alias_cmake"; then
     printf '\n%s comes before %s on PATH. Put %s first to use rcmake as cmake.\n' "$first" "$bin_dir/cmake" "$bin_dir"
   fi
 fi
+
+printf 'Run rcmake --version to check the installation.\n'

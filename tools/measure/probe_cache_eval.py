@@ -2945,9 +2945,21 @@ def render_markdown(report: dict) -> str:
     if report["mode"] == "smoke":
         lines.extend(("", "Smoke mode checks compiler success, compiler failure, output and copied executables.",
                       "G3 and G4 require gate mode."))
-    lines.extend(("", "| Gate | Case | Result |", "| --- | --- | --- |"))
+    lines.extend((
+        "",
+        "| Gate | Case | Result | Compiler calls before mutation | Compiler calls after mutation |",
+        "| --- | --- | --- | --- | --- |",
+    ))
+    before_runs = ("cold", "warm", "run1_project_b_cached")
+    after_runs = ("changed", "changed_inert", "changed_trap", "runner", "run2_project_b_cached")
     for row in report["cases"]:
-        lines.append(f"| {row['gate']} | {row['case']} | {row['status'].capitalize()} |")
+        calls = row.get("compiler_calls", {})
+        after = ", ".join(f"{run}: {calls[run]}" for run in after_runs if run in calls)
+        before = ", ".join(f"{run}: {calls[run]}" for run in before_runs if after and run in calls)
+        lines.append(
+            f"| {row['gate']} | {row['case']} | {row['status'].capitalize()} "
+            f"| {before or '—'} | {after or '—'} |"
+        )
     for row in report["cases"]:
         if "error" in row or "reason" in row:
             lines.extend(("", f"## {row['case']}", "", row.get("error", row.get("reason"))))

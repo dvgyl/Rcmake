@@ -562,6 +562,32 @@ class InstallShTests(unittest.TestCase):
             self.assertFalse(os.path.lexists(bin_dir / name))
         self.assertFalse(os.path.lexists(self.prefix / "share" / "cmake-4.5"))
 
+    def test_install_and_uninstall_protect_unmarked_data(self) -> None:
+        archive = _make_fake_archive(self.archives)
+        data = self.prefix / "share" / "cmake-4.5"
+        data.mkdir(parents=True)
+        sentinel = data / "foreign-sentinel"
+        sentinel.touch()
+
+        refused = self.run_install("--archive", str(archive))
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(str(data), refused.stderr)
+        self.assertIn("--prefix <separate-dir> or --force", refused.stderr)
+        self.assertFalse((self.prefix / "bin" / "rcmake").exists())
+
+        uninstall = self.run_install("--uninstall")
+        self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
+        self.assertTrue(sentinel.is_file())
+
+        forced = self.run_install("--archive", str(archive), "--force")
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+        self.assertTrue((data / ".rcmake-managed").is_file())
+        self.assertFalse(sentinel.exists())
+
+        uninstall = self.run_install("--uninstall")
+        self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
+        self.assertFalse(data.exists())
+
     def test_uninstall_preserves_share_data_when_foreign_cmake_exists(self) -> None:
         archive = _make_fake_archive(self.archives, archive_name="foreign-keep.tar.gz", lsp_mode="standalone")
         res = self.run_install("--archive", str(archive))

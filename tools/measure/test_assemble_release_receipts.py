@@ -722,6 +722,25 @@ class AssembleReleaseReceiptsTests(unittest.TestCase):
         self.assertIn(f"<!-- METRIC:release_commit -->`{head_sha[:12]}`<!-- /METRIC -->", self.readme.read_text(encoding="utf-8"))
         self.assertIn("<!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC -->", self.writeup.read_text(encoding="utf-8"))
 
+    def test_assemble_refuses_ci_jobs_without_head_sha(self) -> None:
+        self.populate_complete_directory_layout(self.receipts)
+        ci_path = self.receipts / "ci-jobs.json"
+        ci_payload = read_json(ci_path)
+        del ci_payload["workflow_runs"][0]["head_sha"]
+        write_json(ci_path, ci_payload)
+
+        result = self.run_script(
+            ASSEMBLER_SCRIPT,
+            "--receipts-dir", self.receipts,
+            "--commit", COMMIT,
+            "--out-json", self.out_json,
+            "--assemble",
+            "--allow-partial",
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ci-jobs.json: CI job at index 0 must have a non-empty head_sha string", result.stderr)
+        self.assertFalse(self.out_json.exists())
+
     def test_assemble_refuses_mixed_sha_and_mixed_binary_without_touching_outputs(self) -> None:
         self.populate_complete_directory_layout(self.receipts)
         original_readme = self.readme.read_bytes()
