@@ -14,6 +14,8 @@ assemble_release_receipts.py expects:
   large-projects/<name>/  artifacts large-projects-<name> (result.json)
   vcpkg/<index>/          artifacts vcpkg-shard-<index> (shard.json, results.jsonl)
   conan.json              artifact conan (when the run uploads one)
+  oracle-prop-test.json   artifact conformance (oracle-prop-test.json or oracle-prop.json)
+  cli-ux.json             artifact conformance (when the artifact contains it)
 
 Each JSON receipt gets release_commit set to --commit. With --binary-sha256,
 each receipt also gets binary_sha256. A receipt that records a different commit
@@ -76,6 +78,8 @@ class EcosystemLane:
     artifact_prefix: str | None = None
     member_files: tuple[str, ...] = ()
     required_member: str | None = None
+    # File names to look for in a shared artifact, in order. The lane is skipped when none exists.
+    sources: tuple[str, ...] = ()
 
     def artifacts(self, names: list[str]) -> list[str]:
         if self.artifact is not None:
@@ -106,6 +110,13 @@ ECOSYSTEM_LANES: tuple[EcosystemLane, ...] = (
         required_member="shard.json",
     ),
     EcosystemLane("conan", "conan.json", artifact="conan"),
+    EcosystemLane(
+        "differential_fuzz",
+        "oracle-prop-test.json",
+        artifact="conformance",
+        sources=("oracle-prop-test.json", "oracle-prop.json"),
+    ),
+    EcosystemLane("cli_ux", "cli-ux.json", artifact="conformance", sources=("cli-ux.json",)),
 )
 
 
@@ -320,15 +331,23 @@ def build_plan(
             names = lane.artifacts(eco_artifacts)
             if not names:
                 continue
-            label = names[0] if len(names) == 1 else f"{len(names)} {lane.artifact_prefix}* artifacts"
+            if lane.sources:
+                label = f"{names[0]}/{lane.target}"
+            elif len(names) == 1:
+                label = names[0]
+            else:
+                label = f"{len(names)} {lane.artifact_prefix}* artifacts"
             plan.append(planned(lane.lane_key, lane.target, f"Ecosystem run {eco_run.run_id}: {label}", tuple(names)))
     return plan
 
 
 def stage_lane(
     item: Planned, ci_run: Run | None, download_dir: Path, stage_dir: Path, commit: str, binary: str | None,
-) -> Path:
-    """Write the normalized receipt for one lane into stage_dir and return its path."""
+) -> Path | None:
+    """Write the normalized receipt for one lane into stage_dir and return its path.
+
+    Return None when a shared artifact does not contain the lane receipt.
+    """
     target = stage_dir / item.target
     if item.lane_key == "ci_jobs":
         assert ci_run is not None
@@ -338,7 +357,13 @@ def stage_lane(
     lane = next(lane for lane in ECOSYSTEM_LANES if lane.lane_key == item.lane_key)
     if lane.artifact is not None:
         artifact_dir = download_dir / lane.artifact
-        source = artifact_dir / lane.target
+        if lane.sources:
+            found = next((artifact_dir / name for name in lane.sources if (artifact_dir / name).is_file()), None)
+            if found is None:
+                return None
+            source = found
+        else:
+            source = artifact_dir / lane.target
         if not source.is_file():
             members = sorted(artifact_dir.rglob("*.json")) if artifact_dir.is_dir() else []
             if len(members) != 1:
@@ -463,14 +488,20 @@ def main(
                 stage_dir = Path(temp) / "stage"
                 download_dir.mkdir()
                 stage_dir.mkdir()
-                names = [name for item in todo for name in item.artifacts]
+                names = list(dict.fromkeys(name for item in todo for name in item.artifacts))
                 if names:
                     assert eco_run is not None
                     gh.download(eco_run.run_id, names, download_dir)
-                staged = [(item, stage_lane(item, ci_run, download_dir, stage_dir, commit, binary)) for item in todo]
+                staged: list[tuple[Planned, Path]] = []
+                for item in todo:
+                    path = stage_lane(item, ci_run, download_dir, stage_dir, commit, binary)
+                    if path is None:
+                        print(f"skip   {item.target} (artifact {', '.join(item.artifacts)} does not contain it)")
+                    else:
+                        staged.append((item, path))
                 for item, path in staged:
                     install_lane(item, path, receipts_dir)
-            print(f"Fetched {len(todo)} lane(s) into {receipts_dir}.")
+            print(f"Fetched {len(staged)} lane(s) into {receipts_dir}.")
     except FetchError as error:
         sys.stderr.write(f"fetch_ci_receipts: {error}\n")
         return 2

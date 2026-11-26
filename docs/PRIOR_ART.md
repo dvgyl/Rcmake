@@ -1,6 +1,6 @@
 # Prior art and dependency licence log
 
-This log records the licences and purpose of the vendored assets and direct workspace dependencies. The crate versions and licence expressions come from the locked Cargo graph.
+The crate versions and licence expressions come from the locked Cargo graph.
 
 ## Vendored third-party assets
 

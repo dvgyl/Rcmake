@@ -14,6 +14,7 @@ import unittest
 
 from tools.measure import assemble_release_receipts as assembler
 from tools.measure import build_dashboard_json as builder
+from tools.measure import cli_ux_receipt
 from tools.measure import fetch_ci_receipts as fetcher
 from tools.measure import verify_release_receipts as verifier
 from tools.measure.test_assemble_release_receipts import COMMIT, DIGEST, STALE, make_runcmake_payload
@@ -84,7 +85,30 @@ def ecosystem_artifacts(commit: str = COMMIT) -> dict[str, dict[str, str]]:
         }),
         "conan.md": "# Ecosystem PATH comparison\n",
     }
+    artifacts["conformance"] = conformance_artifact(commit)
     return artifacts
+
+
+def conformance_artifact(commit: str = COMMIT) -> dict[str, str]:
+    """Return the conformance artifact: oracle_prop_test.py and cli_ux_receipt.py reports plus logs."""
+    oracle = {
+        "binary_sha256": DIGEST, "rcmake_sha": commit, "release_commit": commit, "commit": commit,
+        "oracle_version": "4.5.1", "seed": 42, "total": 1000,
+        "counts": {"pass": 1000, "fail": 0, "oracle_error": 0}, "cases": [],
+    }
+    with TemporaryDirectory() as temp:
+        report = Path(temp) / "conformance-report"
+        report.mkdir()
+        polish = report / "cli-ux-polish.json"
+        polish.write_text(dumps({"checks": [{"id": "help", "passed": True}, {"id": "color", "passed": True}]}))
+        cli_ux = cli_ux_receipt.build_receipt(report / "cli-ux.json", 0, report / "cli-ux.log", polish)
+    cli_ux.update(release_commit=commit, binary_sha256=DIGEST)
+    return {
+        "oracle-prop-test.json": dumps(oracle),
+        "cli-ux.json": dumps(cli_ux),
+        "cli-ux-polish.json": dumps({"checks": []}),
+        "cli-ux.log": "PASS\n",
+    }
 
 
 class FakeGh:
@@ -124,6 +148,9 @@ class FakeGh:
                 path = dest / name / rel
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content, encoding="utf-8")
+
+
+FETCHED_LANES = ("ci_jobs", "runcmake_windows", "large_projects", "vcpkg", "conan", "differential_fuzz", "cli_ux")
 
 
 class FetchCiReceiptsTests(unittest.TestCase):
@@ -249,7 +276,7 @@ class FetchCiReceiptsTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
 
         lanes = self.scan()
-        for key in ("ci_jobs", "runcmake_windows", "large_projects", "vcpkg", "conan"):
+        for key in FETCHED_LANES:
             self.assertEqual(lanes[key].state, "present", lanes[key].detail)
         self.assertEqual(lanes["vcpkg"].member_count, 64)
         self.assertEqual(lanes["large_projects"].member_count, len(BOSS_PROJECTS))
@@ -267,6 +294,8 @@ class FetchCiReceiptsTests(unittest.TestCase):
             ("large_projects", "large-projects", verifier.check_large_projects),
             ("vcpkg", "vcpkg", verifier.check_vcpkg),
             ("conan", "conan.json", verifier.check_conan),
+            ("differential_fuzz", "oracle-prop-test.json", verifier.check_differential_fuzz),
+            ("cli_ux", "cli-ux.json", verifier.check_cli_ux),
         )
         for key, rel, check in checks:
             record = verifier.load_receipt_entry(key, "track", {"path": str(self.receipts / rel)}, self.receipts)
@@ -276,7 +305,7 @@ class FetchCiReceiptsTests(unittest.TestCase):
             self.assertEqual(findings, [], key)
 
         self.assertIn("Release receipt readiness", out)
-        for key in ("ci_jobs", "runcmake_windows", "large_projects", "vcpkg", "conan"):
+        for key in FETCHED_LANES:
             self.assertRegex(out, rf"\| `{key}` \| `[^`]+` \| `present` \|")
         self.assertIn("Missing required lanes:", out)
 
@@ -287,6 +316,65 @@ class FetchCiReceiptsTests(unittest.TestCase):
         code, _, err = self.fetch(FakeGh(artifacts=artifacts), "--binary-sha256", DIGEST)
         self.assertEqual(code, 0, err)
         self.assertEqual(self.scan()["runcmake_windows"].state, "present")
+
+    # Conformance artifact.
+
+    def test_conformance_artifact_is_downloaded_once_for_both_lanes(self) -> None:
+        gh = FakeGh()
+        code, out, err = self.fetch(gh, "--binary-sha256", DIGEST)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gh.downloads[0].count("conformance"), 1)
+        self.assertIn(f"write  oracle-prop-test.json <- Ecosystem run {ECO_RUN}: conformance/oracle-prop-test.json", out)
+        self.assertIn(f"write  cli-ux.json <- Ecosystem run {ECO_RUN}: conformance/cli-ux.json", out)
+        self.assertFalse(any(name.startswith("cli-ux-polish") or name.endswith(".log") for name in self.files()))
+
+    def test_legacy_conformance_artifact_fills_differential_fuzz_and_skips_cli_ux(self) -> None:
+        artifacts = ecosystem_artifacts()
+        conformance = artifacts["conformance"]
+        artifacts["conformance"] = {"oracle-prop.json": conformance["oracle-prop-test.json"], "cli-ux.log": "PASS\n"}
+        code, out, err = self.fetch(FakeGh(artifacts=artifacts), "--binary-sha256", DIGEST)
+        self.assertEqual(code, 0, err)
+        self.assertIn("skip   cli-ux.json (artifact conformance does not contain it)", out)
+        lanes = self.scan()
+        self.assertEqual(lanes["differential_fuzz"].state, "present", lanes["differential_fuzz"].detail)
+        self.assertEqual(lanes["cli_ux"].state, "missing")
+        self.assertTrue((self.receipts / "oracle-prop-test.json").is_file())
+        self.assertFalse((self.receipts / "oracle-prop.json").exists())
+
+    def test_run_without_conformance_artifact_leaves_both_lanes_missing(self) -> None:
+        artifacts = ecosystem_artifacts()
+        del artifacts["conformance"]
+        code, out, err = self.fetch(FakeGh(artifacts=artifacts), "--binary-sha256", DIGEST)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("cli-ux.json", out)
+        lanes = self.scan()
+        self.assertEqual(lanes["differential_fuzz"].state, "missing")
+        self.assertEqual(lanes["cli_ux"].state, "missing")
+
+    def test_conformance_report_with_other_commit_writes_nothing(self) -> None:
+        artifacts = ecosystem_artifacts()
+        payload = json.loads(artifacts["conformance"]["cli-ux.json"])
+        payload["release_commit"] = STALE
+        artifacts["conformance"]["cli-ux.json"] = dumps(payload)
+        code, _, err = self.fetch(FakeGh(artifacts=artifacts), "--binary-sha256", DIGEST)
+        self.assertEqual(code, 2)
+        self.assertIn("conformance/cli-ux.json: records commit", err)
+        self.assertEqual(self.files(), [])
+
+    def test_local_differential_fuzz_receipt_is_kept(self) -> None:
+        local = {"release_commit": COMMIT, "binary_sha256": DIGEST, "seed": 7, "total": 5,
+                 "counts": {"pass": 5, "fail": 0, "oracle_error": 0}}
+        self.receipts.mkdir()
+        (self.receipts / "differential-fuzz.json").write_text(dumps(local), encoding="utf-8")
+        before = (self.receipts / "differential-fuzz.json").read_bytes()
+        gh = FakeGh()
+        code, out, err = self.fetch(gh, "--binary-sha256", DIGEST)
+        self.assertEqual(code, 0, err)
+        self.assertIn("keep   differential-fuzz.json", out)
+        self.assertEqual((self.receipts / "differential-fuzz.json").read_bytes(), before)
+        self.assertFalse((self.receipts / "oracle-prop-test.json").exists())
+        self.assertIn("conformance", gh.downloads[0])
+        self.assertEqual(self.scan()["cli_ux"].state, "present")
 
     # --dry-run and --overwrite.
 
@@ -389,10 +477,36 @@ class EcosystemWorkflowParityTests(unittest.TestCase):
         for lane in fetcher.ECOSYSTEM_LANES:
             if lane.artifact is None:
                 continue
-            with self.subTest(artifact=lane.artifact):
+            with self.subTest(artifact=lane.artifact, target=lane.target):
                 self.assertIn(lane.artifact, self.uploads)
-                _, paths = self.uploads[lane.artifact]
-                self.assertIn(lane.target, [Path(path).name for path in paths])
+                job, paths = self.uploads[lane.artifact]
+                if lane.target in [Path(path).name for path in paths]:
+                    continue
+                # A directory upload must contain a file that the job writes with the receipt name.
+                written = [path for path in paths if f"{path}/{lane.target}" in self.jobs[job]]
+                self.assertEqual(len(written), 1, (lane.target, paths))
+                self.assertIn(lane.target, lane.sources)
+
+    def test_conformance_job_writes_both_receipts_with_their_tools(self) -> None:
+        job = self.jobs[self.uploads["conformance"][0]]
+        report = self.uploads["conformance"][1][0]
+        oracle = re.search(r"tools/measure/oracle_prop_test\.py(?:[^\n]*\\\n)*[^\n]*", job)
+        self.assertIsNotNone(oracle)
+        self.assertIn(f"--out {report}/oracle-prop-test.json", oracle.group(0))
+        self.assertIn('--rcmake-sha "$GITHUB_SHA"', oracle.group(0))
+
+        receipt = re.search(r"tools/measure/cli_ux_receipt\.py(?:[^\n]*\\\n)*[^\n]*", job)
+        self.assertIsNotNone(receipt)
+        command = receipt.group(0)
+        self.assertIn(f"--out {report}/cli-ux.json", command)
+        self.assertIn(f"--verify-log {report}/cli-ux.log", command)
+        self.assertIn('--commit "$GITHUB_SHA"', command)
+        self.assertIn("--binary target/stage/bin/rcmake", command)
+        polish = re.search(r"--polish-report (\S+)", command).group(1)
+        self.assertIn(f"verify_polish.py --rcmake target/stage/bin/rcmake", job)
+        self.assertIn(f"--out-json {polish}", job)
+        self.assertIn(f"| tee {report}/cli-ux.log || verify_status=$?", job)
+        self.assertIn("exit $(( verify_status || polish_status ))", job)
 
     def test_every_prefix_lane_is_uploaded_per_matrix_entry_with_its_members(self) -> None:
         for lane in fetcher.ECOSYSTEM_LANES:

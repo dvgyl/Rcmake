@@ -254,25 +254,14 @@ elif command == "determinism":
         "log": os.path.relpath(log, Path(out).parent),
     })
 elif command == "cli-ux":
+    from cli_ux_receipt import build_receipt  # noqa: E402
+
     out, verify_code, verify_log, polish_report = args
     try:
-        polish = json.loads(Path(polish_report).read_text(encoding="utf-8"))
-        polish_checks = polish["checks"]
-    except (OSError, ValueError, KeyError) as error:
-        fail(f"{polish_report}: cannot read the verify_polish.py report ({error})")
-    checks = [{"check": "verify.py", "status": "pass" if verify_code == "0" else "fail",
-               "log": os.path.relpath(verify_log, Path(out).parent)}]
-    checks += [{"check": f"verify_polish.py:{row['id']}", "status": "pass" if row["passed"] else "fail"}
-               for row in polish_checks]
-    passed = sum(row["status"] == "pass" for row in checks)
-    write(out, {
-        "status": "pass" if passed == len(checks) else "fail",
-        "passed": passed,
-        "total": len(checks),
-        "failures": len(checks) - passed,
-        "checks": checks,
-        "polish_report": os.path.relpath(polish_report, Path(out).parent),
-    })
+        payload = build_receipt(Path(out), int(verify_code), Path(verify_log), Path(polish_report))
+    except ValueError as error:
+        fail(str(error))
+    write(out, payload)
 else:
     fail(f"unknown helper command {command}")
 PY

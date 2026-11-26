@@ -1107,15 +1107,26 @@ jobs:
         run: |
           source env/env.sh
           mkdir -p conformance-report
+          verify_status=0
           python3 conformance/cases/cli-ux/verify.py --rcmake target/stage/bin/rcmake \
-            --lsp target/stage/bin/rcmake-lsp --oracle "$ECOSYSTEM_ORACLE" 2>&1 | tee conformance-report/cli-ux.log
+            --lsp target/stage/bin/rcmake-lsp --oracle "$ECOSYSTEM_ORACLE" 2>&1 \
+            | tee conformance-report/cli-ux.log || verify_status=$?
+          polish_status=0
+          python3 conformance/cases/cli-ux/verify_polish.py --rcmake target/stage/bin/rcmake \
+            --lsp target/stage/bin/rcmake-lsp --out-json conformance-report/cli-ux-polish.json || polish_status=$?
+          python3 tools/measure/cli_ux_receipt.py --out conformance-report/cli-ux.json \
+            --verify-exit "$verify_status" --verify-log conformance-report/cli-ux.log \
+            --polish-report conformance-report/cli-ux-polish.json \
+            --commit "$GITHUB_SHA" --binary target/stage/bin/rcmake
+          exit $(( verify_status || polish_status ))
       - name: Run differential tests with the CMake oracle
         if: success() || failure()
         run: |
           source env/env.sh
           mkdir -p conformance-report
           RCMAKE_ORACLE_CMAKE="$ECOSYSTEM_ORACLE" python3 tools/measure/oracle_prop_test.py \
-            --rcmake-bin target/stage/bin/rcmake --out conformance-report/oracle-prop.json
+            --rcmake-bin target/stage/bin/rcmake --rcmake-sha "$GITHUB_SHA" \
+            --out conformance-report/oracle-prop-test.json
       - uses: actions/upload-artifact@v6
         if: always()
         with:

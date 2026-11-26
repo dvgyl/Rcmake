@@ -22,8 +22,6 @@ mkdir -p ~/.zsh/completions && cp completions/_rcmake ~/.zsh/completions/_rcmake
 
 ## Fish
 
-Install into the user completions directory:
-
 ```fish
 mkdir -p ~/.config/fish/completions && cp completions/rcmake.fish ~/.config/fish/completions/rcmake.fish
 ```

@@ -53,8 +53,6 @@ rcmake -S . -B build --profile                # write a flame graph of the confi
 
 To try `rcmake` with no install, open the [browser playground](https://dvgyl.github.io/rcmake/playground.html). It runs the real configure engine, Ninja generation, and `rcmake explain` as WebAssembly.
 
-To make `rcmake` your `cmake`, `ctest`, and `cpack`, see [Use rcmake as a drop-in CMake](#use-rcmake-as-a-drop-in-cmake).
-
 ## Status
 
 `rcmake` is at version `0.1.0`. A script stamps the release scorecard below from the frozen release binary at commit <!-- METRIC:release_commit -->pending frozen release run<!-- /METRIC --> on <!-- METRIC:release_date -->pending frozen release run<!-- /METRIC -->. The [compatibility report](https://dvgyl.github.io/rcmake/dashboard.html) shows the same data.
@@ -131,7 +129,7 @@ Known gaps from the frozen release run: <!-- METRIC:known_parity_gaps -->pending
 
 ### Native `rcmake` extensions
 
-The extensions work only when the executable name is `rcmake`. See [Usage](#usage) for the two modes.
+The extensions work only when the executable name is `rcmake`.
 
 - **Persistent compiler probe cache.** Reuses verified compiler check results across build directories and projects. Before a reuse, `rcmake` checks the recorded host inputs. In CI and release builds, set `RCMAKE_PROBE_CACHE=verify` to compare each hit with a fresh probe.
 - **Parallel compiler probes.** By default, up to four probes run at the same time (`RCMAKE_PROBE_JOBS`). Speculative probes run only compile checks (`check_include_file`, `check_c_compiler_flag`, `check_cxx_compiler_flag`, `check_symbol_exists`, and `try_compile`), never `try_run` or `execute_process`. The real call uses a speculative result only when it computes the same probe key.
@@ -202,7 +200,7 @@ Invoke-WebRequest https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/in
 .\install.ps1 -AliasCmake
 ```
 
-If you prefer manual installation:
+To install manually:
 
 1. Download `rcmake-<version>-x86_64-pc-windows-msvc.zip` and `SHA256SUMS.txt` (or the `.sha256` file) from [GitHub Releases](https://github.com/dvgyl/rcmake/releases).
 2. Compare the checksum with the recorded value:
@@ -351,8 +349,6 @@ open "profile-out/$(cat profile-out/current)/flamegraph.html"
 - **Windows ZIP aliases.** The Windows ZIP archive contains `cmake.exe`, `ctest.exe`, and `cpack.exe` in `bin`. A manual install that puts this folder first on `PATH` hides another CMake installation without a prompt. On Linux and macOS, `install.sh` creates the aliases only with `--alias-cmake`.
 - **`CMAKE_STRIP` install guard.** `cmake --install --strip` writes a strip rule only when `CMAKE_STRIP` is not a CMake false value (`OFF`, `NOTFOUND`, `strip-NOTFOUND`). This avoids running a nonexistent `strip-NOTFOUND` binary.
 
-The [engineering write-up](docs/BUILD_WRITEUP.md) gives full details.
-
 ## Reproduce verification locally
 
 Download the pinned CMake 4.5.1 reference binary and stage a release build once:
@@ -420,7 +416,6 @@ docs/           FAQ, build write-up, architecture, ADRs, environment variables, 
 
 - [`docs/FAQ.md`](docs/FAQ.md): common questions on CMake 4.5.1 compatibility, generators, caching, native tools, installation, and limits
 - [`site/llms.txt`](site/llms.txt): machine-readable index for LLMs and developer Q&A (also hosted as [`llms.txt`](https://dvgyl.github.io/rcmake/llms.txt) and [`llms-full.txt`](https://dvgyl.github.io/rcmake/llms-full.txt))
-- [`docs/README.md`](docs/README.md): index of repository documentation
 - [`docs/BUILD_WRITEUP.md`](docs/BUILD_WRITEUP.md): differential testing against CMake 4.5.1, bugs that testing found, limits, and how to reproduce every claim
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): execution pipeline, the map of 35 crates, the `Host` trait, and verification layers
 - [`docs/ADR.md`](docs/ADR.md): 31 architecture decision records

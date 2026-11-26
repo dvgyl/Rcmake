@@ -1,6 +1,6 @@
 # Architectural Decision Records (ADR)
 
-This file records the main architecture and contract decisions for Rcmake. Each decision was checked against the pinned CMake 4.5.1 oracle.
+Each decision was checked against the pinned CMake 4.5.1 oracle.
 
 ---
 

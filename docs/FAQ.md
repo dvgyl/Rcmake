@@ -183,4 +183,4 @@ Run `scripts/install.sh --uninstall` with the same `PREFIX`. Uninstall keeps the
 
 Run your configure with `RCMAKE_ORACLE_MODE=1` or via the `cmake` alias to disable native extensions, then compare `CMakeCache.txt`, generated build files, or File API replies against CMake 4.5.1. To check probe cache soundness, set `RCMAKE_PROBE_CACHE=verify` or `RCMAKE_NO_PROBE_CACHE=1`.
 
-For verification results, documentation, and machine-readable references, see the [compatibility report](https://dvgyl.github.io/rcmake/dashboard.html), [BUILD_WRITEUP.md](BUILD_WRITEUP.md), [docs/README.md](README.md), [llms.txt](https://dvgyl.github.io/rcmake/llms.txt), and [llms-full.txt](https://dvgyl.github.io/rcmake/llms-full.txt). Report any difference from CMake 4.5.1 using the [parity bug form](https://github.com/dvgyl/rcmake/issues/new?template=bug_report.yml).
+The [compatibility report](https://dvgyl.github.io/rcmake/dashboard.html) shows the latest verification results. Report any difference from CMake 4.5.1 using the [parity bug form](https://github.com/dvgyl/rcmake/issues/new?template=bug_report.yml).
