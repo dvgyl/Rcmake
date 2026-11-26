@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use rcmake_host::{Host, HostError, HostResult, PureHost, WriteMode};
 
@@ -32,7 +33,7 @@ fn verification_memos_keep_no_answers() -> HostResult<()> {
     let first = memo.sdk_digest(base.as_ref(), &include)?;
     memo.file_digest(base.as_ref(), &file)?;
     memo.tool_digest(base.as_ref(), &file)?;
-    memo.prefetch_sdk_digest(base.as_ref(), &include);
+    memo.prefetch_sdk_digest(base.as_ref(), &include, &AtomicBool::new(false));
     let lock = || io(std::io::Error::other("lock"));
     assert!(memo.sdk.lock().map_err(|_| lock())?.is_empty());
     assert!(memo.files.lock().map_err(|_| lock())?.is_empty());
@@ -48,6 +49,7 @@ fn verification_memos_keep_no_answers() -> HostResult<()> {
 mod native {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use rcmake_host::{Follow, Host, HostResult, MemoHost, Metadata, NativeHost, WriteMode};
 
@@ -272,14 +274,35 @@ mod native {
         let same = sdk(native, &fixture.root.join("same"))?;
         let changed = sdk(native, &fixture.root.join("changed"))?;
         age();
-        fixture.memo.prefetch_sdk_digest(native, &same);
-        fixture.memo.prefetch_sdk_digest(native, &changed);
+        fixture
+            .memo
+            .prefetch_sdk_digest(native, &same, &AtomicBool::new(false));
+        fixture
+            .memo
+            .prefetch_sdk_digest(native, &changed, &AtomicBool::new(false));
         native.write(&changed.join("late.h"), b"l", WriteMode::CreateNew)?;
         let hits = fixture.memo.sdk_graph_hits();
         fixture.digest(&same)?;
         assert_eq!(fixture.memo.sdk_graph_hits(), hits + 1);
         fixture.digest(&changed)?;
         assert_eq!(fixture.memo.sdk_graph_hits(), hits + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_sdk_prefetches_keep_no_listing() -> HostResult<()> {
+        let fixture = Fixture::new(true)?;
+        let native = fixture.native.as_ref();
+        let include = sdk(native, &fixture.root.join("cancelled"))?;
+        age();
+        fixture
+            .memo
+            .prefetch_sdk_digest(native, &include, &AtomicBool::new(true));
+        let lock = || io(std::io::Error::other("lock"));
+        assert!(fixture.memo.sdk.lock().map_err(|_| lock())?.is_empty());
+        let hits = fixture.memo.sdk_graph_hits();
+        fixture.digest(&include)?;
+        assert_eq!(fixture.memo.sdk_graph_hits(), hits);
         Ok(())
     }
 }

@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rcmake_base::BString;
 
@@ -115,7 +115,7 @@ fn root_digest(
 }
 
 pub(super) fn sdk_graph_digest(host: &dyn Host, canonical: &Path) -> HostResult<Digest> {
-    sdk_graph(host, canonical, None, FOREGROUND_WORKERS, |_, _| {})
+    sdk_graph(host, canonical, None, FOREGROUND_WORKERS, None, |_, _| {})
 }
 
 /// The number of threads that list the SDK graph for a probe that waits.
@@ -438,14 +438,16 @@ fn prefetch_sdk_graph(
     canonical: &Path,
     stamp: bool,
     workers: usize,
+    cancel: Option<&AtomicBool>,
 ) -> HashMap<PathBuf, HostResult<SdkDirSnapshot>> {
+    let cancelled = || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed));
     let mut prefetched = HashMap::new();
     let mut seen = BTreeSet::from([canonical.to_owned()]);
     let mut frontier = vec![canonical.to_owned()];
     let mut budget = 65_536_usize;
 
     for _depth in 0..=32 {
-        if frontier.is_empty() {
+        if frontier.is_empty() || cancelled() {
             break;
         }
         let wave: Vec<(PathBuf, HostResult<SdkDirSnapshot>)> = if frontier.len() <= 2 {
@@ -459,7 +461,7 @@ fn prefetch_sdk_graph(
             let worker_count = frontier.len().min(workers.max(1));
             let work = || {
                 let mut local = Vec::new();
-                loop {
+                while !cancelled() {
                     let idx = next.fetch_add(1, Ordering::Relaxed);
                     let Some(dir) = frontier.get(idx) else {
                         break;
@@ -529,25 +531,28 @@ fn prefetch_sdk_graph(
     _canonical: &Path,
     _stamp: bool,
     _workers: usize,
+    _cancel: Option<&AtomicBool>,
 ) -> HashMap<PathBuf, HostResult<SdkDirSnapshot>> {
     HashMap::new()
 }
 
 /// Hash the SDK graph below `canonical`. With `stamps`, also stamp each visited directory.
 ///
-/// At most `workers` threads list directories at the same time.
+/// At most `workers` threads list directories at the same time. When `cancel`
+/// becomes `true`, stop the walk and return an error.
 pub(super) fn sdk_graph(
     host: &dyn Host,
     canonical: &Path,
     mut stamps: Option<&mut DirStamps>,
     workers: usize,
+    cancel: Option<&AtomicBool>,
     mut observe_link: impl FnMut(PathBuf, Option<(PathBuf, FileKind)>),
 ) -> HostResult<Digest> {
     let stamp = stamps.is_some();
     if let Some(stamps) = stamps.as_deref_mut() {
         stamps.complete = true;
     }
-    let mut prefetched = prefetch_sdk_graph(host, canonical, stamp, workers);
+    let mut prefetched = prefetch_sdk_graph(host, canonical, stamp, workers, cancel);
     let mut key = KeyHasher::new(Domain::BlobV1);
     key.field(0, b"sdk-tree-graph");
     key.field(1, canonical.as_os_str().as_encoded_bytes());
@@ -555,6 +560,11 @@ pub(super) fn sdk_graph(
     let mut visited = BTreeSet::new();
     let mut remaining = 65_536_usize;
     while let Some((directory, depth)) = directories.pop() {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err(HostError::unsupported(
+                "The SDK search listing was cancelled.",
+            ));
+        }
         if !visited.insert(directory.clone()) {
             continue;
         }

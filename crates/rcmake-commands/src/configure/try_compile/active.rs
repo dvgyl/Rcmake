@@ -823,7 +823,7 @@ fn prefetch_toolchain(
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        memo.prefetch_sdk_digest(live.as_ref(), &sdk.join(root));
+        memo.prefetch_sdk_digest(live.as_ref(), &sdk.join(root), cancel);
     }
     if !cancel.load(Ordering::Relaxed) {
         let _ = memo.file_digest(live.as_ref(), &sdk.join("SDKSettings.json"));
@@ -832,16 +832,11 @@ fn prefetch_toolchain(
 
 /// Return the probable paths of the Apple compiler driver and linker.
 ///
-/// Find the developer directory from `DEVELOPER_DIR`, then from the
-/// `xcode-select` link, then use the Command Line Tools. Run no process.
+/// Find the developer directory in the order that `xcode-select` uses. Use
+/// `DEVELOPER_DIR`, then the first `xcode-select` link, then Xcode in
+/// `/Applications` if it exists, then the Command Line Tools. Run no process.
 fn apple_tool_candidates(host: &dyn Host) -> Vec<PathBuf> {
-    let developer = host
-        .env_get(b"DEVELOPER_DIR")
-        .filter(|value| !value.is_empty())
-        .map(|value| path::to_native(&value))
-        .or_else(|| host.read_link(Path::new("/var/db/xcode_select_link")).ok())
-        .filter(|dir| dir.is_absolute())
-        .unwrap_or_else(|| PathBuf::from("/Library/Developer/CommandLineTools"));
+    let developer = apple_developer_dir(host);
     let toolchain = developer.join("Toolchains/XcodeDefault.xctoolchain/usr/bin");
     let tools = developer.join("usr/bin");
     let mut candidates = Vec::with_capacity(5);
@@ -858,4 +853,35 @@ fn apple_tool_candidates(host: &dyn Host) -> Vec<PathBuf> {
     }
     candidates.push(PathBuf::from("/usr/bin/xcrun"));
     candidates
+}
+
+/// Return the probable developer directory. See [`apple_tool_candidates`].
+fn apple_developer_dir(host: &dyn Host) -> PathBuf {
+    if let Some(dir) = host
+        .env_get(b"DEVELOPER_DIR")
+        .filter(|value| !value.is_empty())
+        .map(|value| path::to_native(&value))
+        .filter(|dir| dir.is_absolute())
+    {
+        return dir;
+    }
+    for link in [
+        "/var/select/developer_dir",
+        "/var/db/xcode_select_link",
+        "/usr/share/xcode-select/xcode_dir_link",
+    ] {
+        if let Ok(dir) = host.read_link(Path::new(link))
+            && dir.is_absolute()
+        {
+            return dir;
+        }
+    }
+    let xcode = PathBuf::from("/Applications/Xcode.app/Contents/Developer");
+    if host
+        .metadata(&xcode, Follow::Yes)
+        .is_ok_and(|stat| stat.kind == FileKind::Dir)
+    {
+        return xcode;
+    }
+    PathBuf::from("/Library/Developer/CommandLineTools")
 }

@@ -7,7 +7,7 @@ pub use tree::{sdk_tree_listing_digest, tree_listing_digest};
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -621,6 +621,7 @@ impl TraceMemo {
             &canonical,
             stamped.then_some(&mut stamps),
             tree::FOREGROUND_WORKERS,
+            None,
             |path, resolved| {
                 if links.len() >= 512 {
                     links_complete = false;
@@ -752,8 +753,9 @@ impl TraceMemo {
     /// Walk an SDK search directory before a probe needs it.
     ///
     /// Keep the listing only if fresh stamps can validate it later. Verification
-    /// mode and hosts without reliable directory stamps do nothing.
-    pub fn prefetch_sdk_digest(&self, host: &dyn Host, root: &Path) {
+    /// mode and hosts without reliable directory stamps do nothing. When
+    /// `cancel` becomes `true`, stop the walk soon and keep nothing.
+    pub fn prefetch_sdk_digest(&self, host: &dyn Host, root: &Path, cancel: &AtomicBool) {
         if self.verify || !stamps_reliable(host) {
             return;
         }
@@ -775,6 +777,7 @@ impl TraceMemo {
             &canonical,
             Some(&mut stamps),
             tree::BACKGROUND_WORKERS,
+            Some(cancel),
             |path, resolved| {
                 if links.len() >= 512 {
                     links_complete = false;

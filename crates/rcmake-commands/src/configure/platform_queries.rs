@@ -984,6 +984,7 @@ fn stamp_dir_and_plists(key: &mut KeyHasher, host: &dyn Host, dir: &Path) -> Opt
 
 fn stamp_xcode_selection(key: &mut KeyHasher, host: &dyn Host) -> Option<()> {
     for link in [
+        Path::new("/var/select/developer_dir"),
         Path::new("/var/db/xcode_select_link"),
         Path::new("/usr/share/xcode-select/xcode_dir_link"),
     ] {
