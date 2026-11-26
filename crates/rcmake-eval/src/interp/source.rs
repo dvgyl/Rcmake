@@ -1,14 +1,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rcmake_base::BString;
 use rcmake_diag::{Effect, Frame, FrameKind, Location, MessageKind, source::SourceKind};
 use rcmake_host::{FileKind, Follow, ReadRange};
 use rcmake_syntax::ParseError;
 
 use super::BodyMode;
-use crate::code::{Code, ParsedSource};
+use crate::code::{Code, LimitsKey, MAX_CACHE_FILE_BYTES, ParsedSource, SourceText};
 use crate::interp::IssueClass;
+use crate::journal::JournalDigest;
 use crate::util::{cat, collapse_full_path};
 use crate::{CmdError, CmdResult, Flow, IncludeOptions, Interp};
 
@@ -52,7 +52,6 @@ impl Interp {
             );
             return None;
         };
-        self.note_replay_source(abs, &data);
         self.parse_source(abs, &data, SourceKind::File)
     }
 
@@ -62,16 +61,43 @@ impl Interp {
         data: &[u8],
         kind: SourceKind,
     ) -> Option<Code> {
-        let text: Arc<[u8]> = Arc::from(data);
-        let id = self
-            .sources
-            .add(BString::from(path), kind, Arc::clone(&text))?;
+        let cache_key =
+            (self.parse_cache.is_some() && data.len() <= MAX_CACHE_FILE_BYTES).then(|| {
+                (
+                    JournalDigest::hash(data),
+                    LimitsKey::new(kind, &self.config.limits),
+                )
+            });
+        let hit = cache_key.and_then(|key| self.parse_cache.as_ref()?.get(key, data));
+        let digest = hit
+            .as_ref()
+            .map(|(text, _)| text.digest)
+            .or(cache_key.map(|(digest, _)| digest));
+        if kind == SourceKind::File {
+            self.note_replay_source(path, data, digest);
+        }
+        let text = hit
+            .as_ref()
+            .map_or_else(|| Arc::from(data), |(text, _)| text.bytes.clone());
+        let id = self.sources.add(path.into(), kind, text.clone())?;
         let file: Arc<[u8]> = Arc::from(path);
-        let ParsedSource { code, warnings } = match &mut self.parse_cache {
-            Some(cache) => cache.parse(text, id, kind, &self.config.limits),
-            None => ParsedSource::parse(data, id, kind, &self.config.limits),
+        let ParsedSource { code, warnings } = if let Some((_, parsed)) = hit {
+            parsed
+        } else {
+            let parsed = ParsedSource::parse(data, id, kind, &self.config.limits);
+            if let (Some(cache), Some((digest, limits))) = (&self.parse_cache, cache_key) {
+                cache.insert(
+                    limits,
+                    SourceText {
+                        bytes: text,
+                        digest,
+                    },
+                    parsed.clone(),
+                );
+            }
+            parsed
         };
-        for mut warning in warnings {
+        for mut warning in warnings.iter().cloned() {
             let line = match &warning.location {
                 Location::FileLine { line, .. } => *line,
                 _ => 0,

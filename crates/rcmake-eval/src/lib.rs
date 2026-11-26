@@ -510,7 +510,7 @@ pub struct Interp {
     command_end: usize,
     session_data: services::SessionData,
     expanded_observer: Option<services::ExpandedObserver>,
-    parse_cache: Option<code::ParseCache>,
+    parse_cache: Option<code::SharedParseCache>,
     /// `--trace-expand` is expanding the arguments of a traced command.
     trace_expanding: bool,
     /// Listfile of each file and function call scope (`LISTFILE_STACK`).
