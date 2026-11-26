@@ -150,9 +150,17 @@ if "$uninstall"; then
     printf 'Use --uninstall with only an optional --prefix.\n' >&2
     exit 2
   fi
-  if [[ "$prefix" != "/" ]]; then
-    prefix="${prefix%/}"
-  fi
+  while [[ "$prefix" != "/" ]]; do
+    if [[ "$prefix" == */ ]]; then
+      prefix="${prefix%/}"
+      [[ -z "$prefix" ]] && prefix="/"
+    elif [[ "$prefix" == */. ]]; then
+      prefix="${prefix%/.}"
+      [[ -z "$prefix" ]] && prefix="/"
+    else
+      break
+    fi
+  done
   if [[ -L "$prefix" ]]; then
     die "Refusing to uninstall through symbolic link prefix $prefix."
   fi
