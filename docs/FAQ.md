@@ -172,10 +172,10 @@ Run `scripts/install.sh --uninstall` with the same `PREFIX`. Uninstall keeps the
 - **No DAP debugger.** `cmake --debugger` is not supported.
 - **No legacy extra generators.** CodeBlocks, CodeLite, Eclipse CDT4, Kate, and Sublime Text 2 are omitted.
 - **No legacy or niche generators.** `NMake Makefiles`, `NMake Makefiles JOM`, `MSYS Makefiles`, `MinGW Makefiles`, `Borland Makefiles`, `Watcom WMake`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16 are not implemented.
-- **No CPack native installers.** `DEB`, `RPM`, `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
+- **CPack platform installers.** Archive generators, `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages are implemented. `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
 - **Reproducible archives.** `cmake -E tar` and CPack archive generators always write uid 0 and gid 0 instead of host user IDs.
 - **In-process `try_compile`.** Probes execute through `rcmake-build` rather than Ninja, Make, MSBuild, or xcodebuild. Build tool output lines in `OUTPUT_VARIABLE` differ, and MSBuild-only or Xcode-only settings (`CMAKE_GENERATOR_TOOLSET`, `CMAKE_XCODE_ATTRIBUTE_*`) do not apply to probes.
-- **`--version` line 2.** Line 1 prints `cmake version 4.5.1`. Line 2 prints `Rcmake 0.1.0` instead of the Kitware maintainer line.
+- **`--version` line 2.** Line 1 prints `cmake version 4.5.1`. Line 2 prints `rcmake 0.1.0` instead of the Kitware maintainer line.
 - **`CMAKE_STRIP` install guard.** `cmake --install --strip` writes a strip rule only when `CMAKE_STRIP` is not a CMake false value (`OFF`, `NOTFOUND`, `strip-NOTFOUND`).
 - **Partial language verification.** Swift toolchain builds are unverified, CUDA has one ecosystem fixture, and HIP has rule wiring only.
 

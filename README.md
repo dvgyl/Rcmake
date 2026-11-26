@@ -59,7 +59,7 @@ To try `rcmake` with no install, open the [browser playground](https://dvgyl.git
 
 | Check | Result |
 | --- | --- |
-| 3-OS CI (`ubuntu-24.04`, `macos-15`, `windows-2025`) and corpus smoke (6 jobs) | <!-- METRIC:ci_jobs -->pending frozen release run<!-- /METRIC --> (pre-freeze baseline: 6 of 6 green) |
+| 3-OS CI (`ubuntu-24.04`, `macos-15`, `windows-2025`) and corpus smoke (6 jobs) | <!-- METRIC:ci_jobs -->pending frozen release run<!-- /METRIC --> |
 | Upstream `Tests/RunCMake`, macOS arm64 (371 of 463 suites run) | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
 | Upstream `Tests/RunCMake`, Linux (362 of 463 suites run) | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
 | Upstream `Tests/RunCMake`, Windows (367 of 463 suites run) | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
@@ -73,8 +73,8 @@ To try `rcmake` with no install, open the [browser playground](https://dvgyl.git
 | Cold configure speedup over CMake 4.5.1 (synthetic C project with 500 static libraries, new build tree, empty probe cache, median of N runs) | <!-- METRIC:bench_cold_configure -->pending frozen release run<!-- /METRIC --> |
 | New build tree speedup over CMake 4.5.1 (`rcmake` with its shared probe cache, CMake with no cache, geometric mean across the listed projects) | <!-- METRIC:bench_warm_probe -->pending frozen release run<!-- /METRIC --> |
 | Leaf edit reconfigure (p95 wall time of N runs, which is the slowest run when N is below 20) | <!-- METRIC:bench_incremental_leaf_p95 -->pending frozen release run<!-- /METRIC --> |
-| Seeded generative fuzzing, not coverage-guided (14 targets, 1,000,000 inputs each) | <!-- METRIC:fuzz_failures -->pending frozen release run<!-- /METRIC --> (pre-freeze baseline: 14,000,000 inputs, 0 failures) |
-| WebAssembly and WASI checks (`wasm32-unknown-unknown` and `wasm32-wasip1`) | <!-- METRIC:wasm_smoke -->pending frozen release run<!-- /METRIC --> (pre-freeze baseline: 6 of 6 passed) |
+| Seeded generative fuzzing, not coverage-guided (14 targets, 1,000,000 inputs each) | <!-- METRIC:fuzz_failures -->pending frozen release run<!-- /METRIC --> |
+| WebAssembly and WASI checks (`wasm32-unknown-unknown` and `wasm32-wasip1`) | <!-- METRIC:wasm_smoke -->pending frozen release run<!-- /METRIC --> |
 
 L1 parity means that configure succeeds and writes the same standard error as CMake 4.5.1. L2 parity also compares `CMakeCache.txt`, the Ninja commands and graph edges, and the File API replies for the targets that `large_projects.toml` lists.
 
@@ -337,7 +337,7 @@ open "profile-out/$(cat profile-out/current)/flamegraph.html"
 - **No DAP debugger.** `cmake --debugger` prints `CMake was not built with support for --debugger`, and `cmake -E capabilities` omits `debugger`.
 - **No interactive front ends.** `cmake-gui` and `ccmake` are not implemented. `edit_cache` prints `No interactive CMake dialog available.`.
 - **No legacy extra generators.** CodeBlocks, CodeLite, Eclipse CDT4, Kate, and Sublime Text 2 are omitted (`extraGenerators` is empty).
-- **CPack native installers.** `DEB`, `RPM`, `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
+- **CPack platform installers.** Archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`), `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages are implemented. `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
 - **Legacy and niche generators.** `NMake Makefiles`, `NMake Makefiles JOM`, `MSYS Makefiles`, `MinGW Makefiles`, `Borland Makefiles`, `Watcom WMake`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16 are not implemented.
 - **Swift is unverified.** Basic Swift wiring exists in `rcmake-resolve`, but no test builds Swift code with a Swift toolchain yet.
 - **CUDA and HIP have little test coverage.** CUDA has one end-to-end fixture in the ecosystem lane. HIP has rule wiring only, and no test uses a HIP toolchain yet.

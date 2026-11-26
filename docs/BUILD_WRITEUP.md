@@ -217,31 +217,31 @@ In native mode, prefetch can start a FetchContent download before the script pop
 
 Metrics in the "Frozen release binary" column are stamped mechanically from one frozen-binary verification run; unreleased numbers are never estimated.
 
-| Area | Scope | Verified pre-freeze baseline | Frozen release binary |
-| --- | --- | --- | --- |
-| Release commit | Git SHA and date | Pre-freeze development builds (`2026-11-25`) | <!-- METRIC:release_commit -->pending frozen release run<!-- /METRIC --> (<!-- METRIC:release_date -->pending frozen release run<!-- /METRIC -->) |
-| 3-OS CI + corpus smoke | `ubuntu-24.04`, `macos-15`, `windows-2025` | 6 of 6 jobs green | <!-- METRIC:ci_jobs -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, macOS arm64 | 371 suites run (`all-macos`) | Pre-freeze run in progress | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Linux | 362 suites run (`linux`) | Pre-freeze run in progress | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Windows | 367 suites run (`windows`) | Pre-freeze run in progress | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
-| Upstream Core-62 conformance | 62 core suites (`core`) | Pre-freeze run in progress | <!-- METRIC:runcmake_core62 -->pending frozen release run<!-- /METRIC --> |
-| Upstream policies | 35 policy suites for the 161 policies `CMP0066` to `CMP0226` | Pre-freeze run in progress | <!-- METRIC:runcmake_policies -->pending frozen release run<!-- /METRIC --> |
-| Independent black-box suite | 20 scenarios, 679 checks | 20 scenarios, 679 checks implemented | <!-- METRIC:independent_scenarios -->pending frozen release run<!-- /METRIC --> |
-| Large C++ projects (L1) | 10 projects, configure stderr parity | Pinned tags, reduced option sets | <!-- METRIC:large_projects_l1 -->pending frozen release run<!-- /METRIC --> |
-| Large C++ projects (L2) | 10 projects, Ninja graph and File API parity for the listed targets | Pinned tags, reduced option sets | <!-- METRIC:large_projects_l2 -->pending frozen release run<!-- /METRIC --> |
-| Sealed unseen holdout | 240 repositories, L2 dry-run parity | Sealed (never opened during dev) | <!-- METRIC:unseen_holdout -->pending frozen release run<!-- /METRIC --> |
-| `vcpkg` ecosystem matrix | 64 shards on Linux | Workflow ready | <!-- METRIC:vcpkg_matrix -->pending frozen release run<!-- /METRIC --> |
-| Conan and ecosystem fixtures | `ecosystem_eval.py` | Workflow ready | <!-- METRIC:conan_ecosystem -->pending frozen release run<!-- /METRIC --> |
-| Silent `PATH` swap | `path_swap_eval.py` | Smoke green on CI | <!-- METRIC:path_swap_eval -->pending frozen release run<!-- /METRIC --> |
-| Probe-cache soundness | 16 baseline checks (12 invalidation triggers, cache control, concurrent configures, crash and corruption recovery) | Smoke green on CI | <!-- METRIC:probe_cache_soundness -->pending frozen release run<!-- /METRIC --> |
-| Mutation replay soundness | 20 seeded leaf edits, replay equivalence | Smoke green on CI | <!-- METRIC:mutation_replay_soundness -->pending frozen release run<!-- /METRIC --> |
-| Seeded generative fuzzing | 14 targets, 1,000,000 inputs each, not coverage-guided | 14,000,000 inputs, 0 failures | <!-- METRIC:fuzz_failures -->pending frozen release run<!-- /METRIC --> |
-| WebAssembly and WASI checks | `wasm32-unknown-unknown` and `wasm32-wasip1` | 6 of 6 checks passed | <!-- METRIC:wasm_smoke -->pending frozen release run<!-- /METRIC --> |
-| Cold configure | Synthetic C project with 500 static libraries, new build tree, empty probe cache, median of N runs, speedup over CMake 4.5.1 | Pending idle release run | <!-- METRIC:bench_cold_configure -->pending frozen release run<!-- /METRIC --> |
-| New build tree with shared probe cache | Geometric mean of median speedups over a CMake new build tree (CMake has no cache across build trees) | Pending idle release run | <!-- METRIC:bench_warm_probe -->pending frozen release run<!-- /METRIC --> |
-| Leaf edit reconfigure | p95 wall time of N runs (the slowest run when N is below 20) | Pending idle release run | <!-- METRIC:bench_incremental_leaf_p95 -->pending frozen release run<!-- /METRIC --> |
-| Peak memory (synthetic 500-library cold configure) | Resident set size (MiB) | Pending idle release run | <!-- METRIC:bench_peak_rss -->pending frozen release run<!-- /METRIC --> |
-| Release binary size | `rcmake` on macOS arm64 | Pending frozen release build | <!-- METRIC:binary_size_macos -->pending frozen release run<!-- /METRIC --> |
+| Area | Scope | Frozen release binary |
+| --- | --- | --- |
+| Release commit | Git SHA and date | <!-- METRIC:release_commit -->pending frozen release run<!-- /METRIC --> (<!-- METRIC:release_date -->pending frozen release run<!-- /METRIC -->) |
+| 3-OS CI + corpus smoke | `ubuntu-24.04`, `macos-15`, `windows-2025` | <!-- METRIC:ci_jobs -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, macOS arm64 | 371 suites run (`all-macos`) | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Linux | 362 suites run (`linux`) | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Windows | 367 suites run (`windows`) | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
+| Upstream Core-62 conformance | 62 core suites (`core`) | <!-- METRIC:runcmake_core62 -->pending frozen release run<!-- /METRIC --> |
+| Upstream policies | 35 policy suites for the 161 policies `CMP0066` to `CMP0226` | <!-- METRIC:runcmake_policies -->pending frozen release run<!-- /METRIC --> |
+| Independent black-box suite | 20 scenarios, 679 checks | <!-- METRIC:independent_scenarios -->pending frozen release run<!-- /METRIC --> |
+| Large C++ projects (L1) | 10 projects, configure stderr parity | <!-- METRIC:large_projects_l1 -->pending frozen release run<!-- /METRIC --> |
+| Large C++ projects (L2) | 10 projects, Ninja graph and File API parity for the listed targets | <!-- METRIC:large_projects_l2 -->pending frozen release run<!-- /METRIC --> |
+| Sealed unseen holdout | 240 repositories, L2 dry-run parity | <!-- METRIC:unseen_holdout -->pending frozen release run<!-- /METRIC --> |
+| `vcpkg` ecosystem matrix | 64 shards on Linux | <!-- METRIC:vcpkg_matrix -->pending frozen release run<!-- /METRIC --> |
+| Conan and ecosystem fixtures | `ecosystem_eval.py` | <!-- METRIC:conan_ecosystem -->pending frozen release run<!-- /METRIC --> |
+| Silent `PATH` swap | `path_swap_eval.py` | <!-- METRIC:path_swap_eval -->pending frozen release run<!-- /METRIC --> |
+| Probe-cache soundness | 16 baseline checks (12 invalidation triggers, cache control, concurrent configures, crash and corruption recovery) | <!-- METRIC:probe_cache_soundness -->pending frozen release run<!-- /METRIC --> |
+| Mutation replay soundness | 20 seeded leaf edits, replay equivalence | <!-- METRIC:mutation_replay_soundness -->pending frozen release run<!-- /METRIC --> |
+| Seeded generative fuzzing | 14 targets, 1,000,000 inputs each, not coverage-guided | <!-- METRIC:fuzz_failures -->pending frozen release run<!-- /METRIC --> |
+| WebAssembly and WASI checks | `wasm32-unknown-unknown` and `wasm32-wasip1` | <!-- METRIC:wasm_smoke -->pending frozen release run<!-- /METRIC --> |
+| Cold configure | Synthetic C project with 500 static libraries, new build tree, empty probe cache, median of N runs, speedup over CMake 4.5.1 | <!-- METRIC:bench_cold_configure -->pending frozen release run<!-- /METRIC --> |
+| New build tree with shared probe cache | Geometric mean of median speedups over a CMake new build tree (CMake has no cache across build trees) | <!-- METRIC:bench_warm_probe -->pending frozen release run<!-- /METRIC --> |
+| Leaf edit reconfigure | p95 wall time of N runs (the slowest run when N is below 20) | <!-- METRIC:bench_incremental_leaf_p95 -->pending frozen release run<!-- /METRIC --> |
+| Peak memory (synthetic 500-library cold configure) | Resident set size (MiB) | <!-- METRIC:bench_peak_rss -->pending frozen release run<!-- /METRIC --> |
+| Release binary size | `rcmake` on macOS arm64 | <!-- METRIC:binary_size_macos -->pending frozen release run<!-- /METRIC --> |
 
 Final known parity gaps from the frozen release run: <!-- METRIC:known_parity_gaps -->pending frozen release run<!-- /METRIC -->.
 
@@ -252,11 +252,11 @@ Each benchmark report records N, the generator, the configure flags, the host CP
 - **Interactive front ends.** There is no `cmake-gui` desktop application and no `ccmake` terminal interface. The `edit_cache` target prints `No interactive CMake dialog available.`, matching CMake when `ccmake` is absent.
 - **DAP debugger.** `cmake --debugger` fails with `CMake was not built with support for --debugger`, matching a CMake build compiled without debugger support. `cmake -E capabilities` omits the `debugger` key.
 - **Swift builds are unverified.** Basic Swift target properties and compile-rule exclusions exist in `rcmake-resolve`, but real Swift toolchain projects are not exercised in CI or in the differential suites. Treat Swift support as unverified until a differential Swift suite lands.
-- **CPack native installers.** `rcmake` supports the archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`, and their compression variants), `External`, and macOS `DragNDrop` and `Bundle`. It does not implement `DEB`, `RPM`, `NSIS`, `WIX`, `productbuild`, or `IFW`.
+- **CPack platform installers.** `rcmake` supports the archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`, and their compression variants), `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages. It does not implement `NSIS`, `WIX`, `productbuild`, or `IFW`.
 - **Legacy and niche generators.** Supported generators are `Ninja`, `Ninja Multi-Config`, `Unix Makefiles`, `Xcode`, `Visual Studio 17 2022`, and `Visual Studio 18 2026`. Legacy extra generators (`CodeBlocks`, `CodeLite`, `Eclipse CDT4`, `Kate`, `Sublime Text 2`) and older or platform-niche generators (`NMake Makefiles`, `NMake Makefiles JOM`, `MSYS Makefiles`, `MinGW Makefiles`, `Borland Makefiles`, `Watcom WMake`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16) are omitted.
 - **Reproducible `tar` ownership.** `cmake -E tar` and CPack archive generators intentionally write uid 0 and gid 0 instead of copying host user IDs.
 - **CUDA and HIP have little test coverage.** CUDA has one end-to-end fixture in the ecosystem lane. HIP has rule wiring only, and no test uses a HIP toolchain yet.
-- **`--version` text.** Line 1 is `cmake version 4.5.1`. Line 2 is `Rcmake 0.1.0` instead of the Kitware line, so the output never names Kitware as the maintainer.
+- **`--version` text.** Line 1 is `cmake version 4.5.1`. Line 2 is `rcmake 0.1.0` instead of the Kitware line, so the output never names Kitware as the maintainer.
 - **`try_compile` runs in-process.** Probes run through the `rcmake` executor, not through Ninja, Make, MSBuild, or xcodebuild. The result is the same. The build tool lines in `OUTPUT_VARIABLE` are different, although `rcmake` writes the same `Change Dir:` and `Run Build Command(s):` header (section 5.6). Generator settings that only MSBuild or Xcode read, such as `CMAKE_GENERATOR_TOOLSET` and `CMAKE_XCODE_ATTRIBUTE_*`, have no effect on probes.
 - **Replay limits.** Native-mode replay is off when a toolchain file, a configure preset, `-C`, or `PreLoad.cmake` is in use. This includes the `vcpkg` toolchain integration. [`ENV_VARS.md`](ENV_VARS.md#incremental-replay) lists all conditions.
 - **Large-project scope.** The 10 large projects use reduced option sets, and L2 compares only the listed targets (section 4).

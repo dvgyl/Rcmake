@@ -511,13 +511,13 @@ async function init(doc) {
     data = await loadLatestData();
   } catch (err) {
     console.error("Failed to load data/latest.json:", err);
-    root.classList.remove("is-loading");
+    root.classList?.remove("is-loading");
     root.innerHTML = '<p class="load-error">Could not load data/latest.json. Serve the site over HTTP.</p>';
     return;
   }
   try {
     doc.getElementById("report-meta").textContent = snapshotMeta(data);
-    root.classList.remove("is-loading");
+    root.classList?.remove("is-loading");
     root.innerHTML = renderReport(data);
     buildRail(doc, data);
     wireProjectFilter(doc);
@@ -529,7 +529,7 @@ async function init(doc) {
     if (fEl) motion.observeReveal(doc.getElementById("gates"), () => animateCountUp(fEl, Number(fEl.dataset.fuzzTarget), { duration: 800 }));
   } catch (err) {
     console.error("Failed to render compatibility report:", err);
-    root.classList.remove("is-loading");
+    root.classList?.remove("is-loading");
     root.innerHTML = '<p class="load-error">Could not render compatibility report from data/latest.json.</p>';
   }
 }
