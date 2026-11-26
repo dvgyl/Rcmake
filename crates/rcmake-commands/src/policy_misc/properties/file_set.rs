@@ -91,6 +91,18 @@ pub(super) fn set_file_set(
                 !matches!(update, Update::Set),
             )
         }
+        b"INCLUDE_DIRECTORIES" | b"COMPILE_OPTIONS" | b"COMPILE_DEFINITIONS"
+            if set.scope == UsageScope::Interface =>
+        {
+            Ok(())
+        }
+        b"INTERFACE_INCLUDE_DIRECTORIES"
+        | b"INTERFACE_COMPILE_OPTIONS"
+        | b"INTERFACE_COMPILE_DEFINITIONS"
+            if set.scope == UsageScope::Private =>
+        {
+            Ok(())
+        }
         b"LANGUAGE" => {
             if !matches!(update, Update::Set) {
                 return Err(crate::command_error(

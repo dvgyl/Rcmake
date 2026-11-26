@@ -20,7 +20,7 @@ impl ProbeCompiler {
     /// Select a compiler with verified toolchain evidence.
     pub(in super::super) fn select(
         host: Arc<dyn Host>,
-        cx: &Cx<'_>,
+        cx: &mut Cx<'_>,
         session: &SessionEvidence,
         name: &[u8],
         memo: &Arc<TraceMemo>,

@@ -89,10 +89,11 @@ impl Evaluator<'_> {
             );
             self.host.warning(body.into(), call.ctx);
         }
-        if let Some(configs) = call.ctx.current.and_then(|target| {
-            self.host
-                .imported_config_matches(target, call.ctx.head, &call.ctx.config)
-        }) {
+        if let Some(configs) = call
+            .ctx
+            .current
+            .and_then(|target| self.host.imported_config_matches_ctx(target, call.ctx))
+        {
             return Ok(boolean(configs.iter().any(|config| {
                 values
                     .iter()

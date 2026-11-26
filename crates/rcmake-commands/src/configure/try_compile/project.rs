@@ -281,8 +281,14 @@ fn render_project(inputs: ProjectInputs<'_>, options: &Options<'_>, target: &str
         code.push(b' ');
         code.extend_from_slice(lang);
     }
+    code.extend_from_slice(b")\n");
+    if options.one(b"__CMAKE_INTERNAL") == Some(b"ABI") {
+        // Erase include_directories() calls from a toolchain file so the ABI
+        // probe does not record them as implicit compiler include directories.
+        code.extend_from_slice(b"set_property(DIRECTORY PROPERTY INCLUDE_DIRECTORIES \"\")\n");
+    }
     code.extend_from_slice(
-        b")\ninclude_directories(${INCLUDE_DIRECTORIES})\nlink_directories(${LINK_DIRECTORIES})\n",
+        b"include_directories(${INCLUDE_DIRECTORIES})\nlink_directories(${LINK_DIRECTORIES})\n",
     );
     if languages.contains(&b"CUDA".as_slice()) {
         code.extend_from_slice(

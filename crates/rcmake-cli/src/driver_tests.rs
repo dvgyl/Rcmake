@@ -769,21 +769,38 @@ fn strict_hermetic_configure_exits_on_undeclared_read() -> rcmake_host::HostResu
     let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
     let host = Arc::new(PureHost::new(root.into(), root.join("rcmake")));
     let data = root.join("cmake-data");
+    let ninja = root.join("tools/ninja");
+    host.seed_file(&ninja, b"")?;
+    host.set_permissions(&ninja, 0o755)?;
+    let ninja_cmake = rcmake_host::path::from_native_cmake(&ninja);
+    let find_ninja = format!("set(CMAKE_MAKE_PROGRAM \"{ninja_cmake}\" CACHE FILEPATH \"\")\n");
     for (file, text) in [
         ("CMakeDetermineSystem.cmake", ""),
         ("CMakeSystemSpecificInitialize.cmake", ""),
         ("CMakeSystemSpecificInformation.cmake", ""),
-        (
-            "CMakeNinjaFindMake.cmake",
-            "set(CMAKE_MAKE_PROGRAM ninja CACHE FILEPATH \"\")\n",
-        ),
+        ("CMakeNinjaFindMake.cmake", find_ninja.as_str()),
     ] {
         host.seed_file(&data.join("Modules").join(file), text.as_bytes())?;
     }
     host.env_set(
+        b"RCMAKE_HERMETIC_ALLOW_PROGRAMS",
+        Some(&rcmake_host::path::from_native(&ninja)),
+    );
+    host.env_set(
         b"RCMAKE_VENDORED_DATA_ROOT",
         Some(data.to_string_lossy().as_bytes()),
     );
+    host.set_command_handler(|_, request, _| {
+        assert_eq!(
+            request.pipeline[0].args.as_slice(),
+            [BString::from("--version")]
+        );
+        Ok(rcmake_host::RunOutput {
+            results: vec![rcmake_host::ProcessResult::Exited(0)],
+            stdout: b"1.12.1\n".to_vec(),
+            stderr: Vec::new(),
+        })
+    })?;
     host.seed_file(&root.join("CMakeLists.txt"), b"cmake_minimum_required(VERSION 4.5)\nproject(Audit NONE)\nif(DEFINED ENV{RCMAKE_TEST_UNDECLARED})\nendif()\n")?;
     host.env_set(b"RCMAKE_TEST_UNDECLARED", Some(b"input"));
     assert_eq!(

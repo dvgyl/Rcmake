@@ -41,11 +41,53 @@ pub(super) struct Commands<'a> {
     pub(super) native_steps: IndexSet<usize>,
     pub(super) owners: IndexMap<usize, crate::CustomOutputOwners>,
     dependencies: Vec<IndexSet<TargetId>>,
+    command_steps: IndexMap<CommandId, usize>,
+    step_has_output: IndexSet<usize>,
 }
 
 /// Combine the errors of several commands into one error, in order.
 pub(crate) fn combine_errors(errors: Vec<ResolveError>) -> Result<(), ResolveError> {
     command_result((), errors)
+}
+
+/// Evaluate generator expressions in custom commands and custom targets before
+/// reporting missing target sources (`cmGlobalGenerator::TraceDependencies` vs
+/// `CheckTargetsForMissingSources`).
+pub(crate) fn validate_custom_commands(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+    resolved: &IndexMap<TargetId, ResolvedTarget>,
+    config: &ConfigId,
+) -> Result<(), ResolveError> {
+    let target_refs: IndexMap<TargetId, &ResolvedTarget> =
+        resolved.iter().map(|(&id, target)| (id, target)).collect();
+    let mut usage = UsageResolver::with_source_paths(model, paths);
+    let mut errors = Vec::new();
+    let commands = Commands {
+        model,
+        targets: &target_refs,
+        objects: ObjectPaths::new(target_refs.values().copied()),
+        config,
+        cross: None,
+        outputs: IndexMap::new(),
+        file_outputs: IndexMap::new(),
+        byproduct_owners: IndexMap::new(),
+        attachments: attachments::Attachments::default(),
+        command_dirs: Vec::new(),
+        inputs: Vec::new(),
+        codegen: IndexSet::new(),
+        native_steps: IndexSet::new(),
+        owners: IndexMap::new(),
+        dependencies: Vec::new(),
+        command_steps: IndexMap::new(),
+        step_has_output: IndexSet::new(),
+    };
+    for (id, command) in model.commands() {
+        if let Err(error) = commands.lower_command(id, command, &mut usage) {
+            errors.push(error);
+        }
+    }
+    combine_errors(errors)
 }
 
 fn command_result<T>(result: T, errors: Vec<ResolveError>) -> Result<T, ResolveError> {
@@ -94,6 +136,8 @@ impl<'a> Commands<'a> {
             native_steps: IndexSet::new(),
             owners: IndexMap::new(),
             dependencies: Vec::new(),
+            command_steps: IndexMap::new(),
+            step_has_output: IndexSet::new(),
         };
         let mut errors = Vec::new();
         for (id, command) in model
@@ -114,6 +158,10 @@ impl<'a> Commands<'a> {
                 .register(model, (id, command), usage.source_paths(), index)
             {
                 continue;
+            }
+            commands.command_steps.insert(id, index);
+            if !step.outputs.is_empty() || !step.byproducts.is_empty() {
+                commands.step_has_output.insert(index);
             }
             let shared_output = commands.shared_output(id);
             let key = format!(
@@ -583,6 +631,30 @@ impl<'a> Commands<'a> {
                             .map(|producer| (producer, false))
                     }));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attach custom commands traced across other configurations in multi-config
+    /// generators (`cmTargetTraceDependencies`): commands that still produce
+    /// outputs or byproducts in this configuration become build steps; commands
+    /// whose outputs and byproducts are both empty still propagate their target
+    /// utility dependencies.
+    pub(super) fn add_traced_commands(
+        &self,
+        traced: &IndexSet<CommandId>,
+        steps: &mut IndexSet<usize>,
+        dependencies: &mut IndexSet<TargetId>,
+    ) -> Result<(), ResolveError> {
+        for command_id in traced {
+            let Some(&step) = self.command_steps.get(command_id) else {
+                continue;
+            };
+            if self.step_has_output.contains(&step) {
+                self.add_producers([step], steps, dependencies)?;
+            } else {
+                dependencies.extend(self.dependencies.get(step).into_iter().flatten().copied());
             }
         }
         Ok(())

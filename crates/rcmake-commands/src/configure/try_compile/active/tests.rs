@@ -390,3 +390,182 @@ fn check_sdk_insertion(project: &str) -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn uncertified_ninja_wrapper_bypasses_warm_probe_cache_while_native_ninja_hits() -> TestResult {
+    use rcmake_model::GeneratorKind;
+
+    let root = Path::new("/work/probes");
+    let executable = root.join("bin/rcmake");
+    let inner = Arc::new(PureHost::new(root.into(), executable.clone()));
+    let lists = format!(
+        "set(CMAKE_MAKE_PROGRAM /bin/ninja CACHE FILEPATH \"\")\n\
+         {PROJECT}\
+         try_compile(OK SOURCE_FROM_CONTENT main.c [[int main(void) {{ return 0; }}]] NO_CACHE)\n"
+    );
+    inner.seed_file(&root.join("CMakeLists.txt"), lists.as_bytes())?;
+    for file in [
+        executable,
+        "/usr/bin/xcrun".into(),
+        "/usr/bin/cc".into(),
+        "/usr/bin/c++".into(),
+        Path::new(TOOLCHAIN).join("clang"),
+        Path::new(TOOLCHAIN).join("clang++"),
+        Path::new(TOOLCHAIN).join("ld"),
+        Path::new(SDK).join("SDKSettings.json"),
+        Path::new(SDK).join("usr/lib/libSystem.tbd"),
+    ] {
+        inner.seed_file(&file, b"fixture")?;
+    }
+    let ninja_path = Path::new("/bin/ninja");
+    // Seed a certified native ELF Ninja binary.
+    inner.seed_file(ninja_path, b"\x7fELF-ninja-v1")?;
+    inner.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(b"/work/probe-cache"));
+    inner.sleep(Duration::from_secs(4));
+
+    let compiler_runs = Arc::new(AtomicUsize::new(0));
+    let reject_child_ninja = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rejected_child_runs = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&compiler_runs);
+    let reject_child = Arc::clone(&reject_child_ninja);
+    let rejected_runs = Arc::clone(&rejected_child_runs);
+    inner.set_command_handler(move |host, request, _| {
+        let command = request
+            .pipeline
+            .first()
+            .ok_or_else(|| HostError::unsupported("Expected a process."))?;
+        if command.program == "/bin/ninja" {
+            assert_eq!(command.args.as_slice(), [BString::from("--version")]);
+            if reject_child.load(Ordering::Relaxed)
+                && request.cwd.to_string_lossy().contains("CMakeScratch")
+            {
+                rejected_runs.fetch_add(1, Ordering::Relaxed);
+                return Ok(RunOutput {
+                    stderr: b"wrapper rejected child cwd\n".to_vec(),
+                    results: vec![ProcessResult::Exited(1)],
+                    ..Default::default()
+                });
+            }
+            return Ok(success(b"1.12.1\n".to_vec()));
+        }
+        if command.program == "/usr/bin/xcrun" {
+            let tool = command
+                .args
+                .last()
+                .ok_or_else(|| HostError::unsupported("Expected a tool name."))?;
+            return Ok(success(format!("{TOOLCHAIN}/{tool}\n").into_bytes()));
+        }
+        if command.args.iter().any(|arg| arg == "-E") && command.args.iter().any(|arg| arg == "-v")
+        {
+            let mut output = success(Vec::new());
+            output.stderr = format!(
+                "#include <...> search starts here:\n {SDK}/usr/include\nEnd of search list.\n"
+            )
+            .into_bytes();
+            return Ok(output);
+        }
+        if command.program == format!("{TOOLCHAIN}/clang").as_str()
+            || command.program == format!("{TOOLCHAIN}/clang++").as_str()
+        {
+            let data = match command.args.as_slice() {
+                [flag] if flag == "-print-resource-dir" => b"/fixture/clang/resource\n".to_vec(),
+                [flag] if flag == "-print-target-triple" => b"arm64-apple-darwin\n".to_vec(),
+                [flag] if flag == "-v" => Vec::new(),
+                _ => return Err(HostError::unsupported("Unexpected compiler query.")),
+            };
+            return Ok(success(data));
+        }
+        if command.program != "/usr/bin/cc" {
+            return Err(HostError::unsupported(format!(
+                "Unexpected process: {}",
+                command.program
+            )));
+        }
+        count.fetch_add(1, Ordering::Relaxed);
+        let argument = |flag: &[u8]| {
+            command.args.windows(2).find_map(|pair| match pair {
+                [key, value] if key.as_slice() == flag => {
+                    Some(request.cwd.join(path::to_native(value)))
+                }
+                _ => None,
+            })
+        };
+        let out =
+            argument(b"-o").ok_or_else(|| HostError::unsupported("Expected a compiler output."))?;
+        host.seed_file(&out, b"test binary")?;
+        if let Some(deps) = argument(b"-MF") {
+            let source = command
+                .args
+                .iter()
+                .find(|arg| arg.ends_with(b".c"))
+                .ok_or_else(|| HostError::unsupported("Expected a source file."))?;
+            host.seed_file(&deps, format!("out.o: {source}\n").as_bytes())?;
+        }
+        if command.args.iter().any(|arg| arg == "-dependency_info") {
+            let deps = command
+                .args
+                .last()
+                .ok_or_else(|| HostError::unsupported("Expected linker evidence."))?;
+            let bytes = format!("\0fixture\0\u{10}{SDK}/usr/lib/libSystem.tbd\0");
+            host.seed_file(&request.cwd.join(path::to_native(deps)), bytes.as_bytes())?;
+        }
+        Ok(success(b"compiler output\n".to_vec()))
+    })?;
+
+    let system = rcmake_host::SystemInfo {
+        sysname: "Darwin".into(),
+        cpu_count: 4,
+        total_memory: 16 << 30,
+        ..inner.system()
+    };
+    let host = CapturingHost::for_test(inner.clone(), root, system);
+    let run_ninja_configure = |build: &str| -> TestResult<(i32, BString)> {
+        let mut services = Services::default();
+        services.speed.probe_cache = ProbeCacheMode::ReadWrite;
+        services.speed.probe_jobs = NonZeroUsize::new(1);
+        let mut runtime =
+            ConfigureRuntime::new(host.clone(), root, Path::new(build), &services, true);
+        let mut interp = interpreter(runtime.host(), root)?;
+        interp.cx().project().generator = Some(GeneratorKind::Ninja);
+        inner.sleep(Duration::from_secs(4));
+        let outcome = runtime.run(&mut interp, &[]);
+        runtime.finish(outcome.exit_code == 0);
+        Ok((outcome.exit_code, interp.cx().var_or_empty(b"OK")))
+    };
+
+    // 1. Cold run with certified native Ninja publishes a warm probe cache entry.
+    assert_eq!(
+        run_ninja_configure("/work/cold")?,
+        (0, BString::from("TRUE"))
+    );
+    let after_cold = compiler_runs.load(Ordering::Relaxed);
+    assert_eq!(after_cold, 2);
+
+    // 2. A different supported native Ninja binary (no scan rule) hits the warm cache.
+    inner.seed_file(ninja_path, b"\x7fELF-ninja-v2-different-digest")?;
+    assert_eq!(
+        run_ninja_configure("/work/warm-native")?,
+        (0, BString::from("TRUE"))
+    );
+    assert_eq!(compiler_runs.load(Ordering::Relaxed), after_cold);
+
+    // 3. Replacing Ninja with an uncertified shell wrapper MUST bypass warm cache lookup
+    //    and execute the child live in its own working directory.
+    inner.seed_file(ninja_path, b"#!/bin/sh\necho 1.12.1\n")?;
+    assert_eq!(
+        run_ninja_configure("/work/warm-wrapper-ok")?,
+        (0, BString::from("TRUE"))
+    );
+    let after_wrapper = compiler_runs.load(Ordering::Relaxed);
+    assert_eq!(after_wrapper, after_cold + 2);
+
+    // 4. A wrapper that accepts caller cwd but rejects child cwd must NOT return stale TRUE.
+    reject_child_ninja.store(true, Ordering::Relaxed);
+    assert_eq!(
+        run_ninja_configure("/work/warm-wrapper-reject")?,
+        (1, BString::from("FALSE"))
+    );
+    assert_eq!(rejected_child_runs.load(Ordering::Relaxed), 1);
+    assert_eq!(compiler_runs.load(Ordering::Relaxed), after_wrapper);
+    Ok(())
+}

@@ -444,6 +444,7 @@ fn rejects_per_configuration_source_properties() {
         ("COMPILE_OPTIONS", "$<$<CONFIG:Debug>:-Wall>"),
         ("COMPILE_DEFINITIONS", "$<$<CONFIG:Debug>:MYDEBUG>"),
         ("INCLUDE_DIRECTORIES", debug_include.as_str()),
+        ("INCLUDE_DIRECTORIES", "$<$<CONFIG:Debug>:MYDEBUG>"),
         ("COMPILE_DEFINITIONS", "$<IF:$<CONFIG:Debug>,SAME,SAME>"),
     ] {
         let mut model = model(source, out);
@@ -1047,4 +1048,314 @@ fn objc_targets_preserve_language_settings() {
         );
     }
     assert!(!project.contains("CLANG_CXX_LANGUAGE_STANDARD"));
+}
+
+#[test]
+fn swift_version_and_system_header_search_paths_filter_implicit_includes() {
+    let host = PureHost::default();
+    let source = Path::new("/source");
+    let build = Path::new("/build");
+    let mut model = model(source, build);
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "C;Swift".into());
+    define(&mut model, "CMAKE_Swift_LANGUAGE_VERSION", "5");
+    define(&mut model, "CMAKE_Swift_COMPILER", "/usr/bin/swiftc");
+    define(&mut model, "CMAKE_Swift_SOURCE_FILE_EXTENSIONS", "swift");
+    define(
+        &mut model,
+        "CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES",
+        "/sdk/usr/include;/usr/local/implicit",
+    );
+    define(&mut model, "_CMAKE_OSX_SYSROOT_PATH", "/sdk");
+
+    let app = add(&mut model, "app", TargetKind::Executable, Some("main.c"));
+    let target = model.target_mut(app).expect("app");
+    target
+        .sources
+        .push(BT::new("extra.swift".into(), Default::default()));
+    for path in ["/sdk/usr/include", "/usr/local/implicit", "/opt/sysinc"] {
+        target.usage.push(
+            rcmake_model::UsageField::IncludeDirectories,
+            BT::new(path.into(), Default::default()),
+        );
+        target.usage.push(
+            rcmake_model::UsageField::InterfaceSystemIncludeDirectories,
+            BT::new(path.into(), Default::default()),
+        );
+    }
+    for name in ["main.c", "extra.swift"] {
+        host.seed_file(&source.join(name), b"")
+            .expect("seed source");
+    }
+
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, build).expect("generate project");
+    let pbx = read(&host, &build.join("Demo.xcodeproj/project.pbxproj"));
+    assert!(pbx.contains("SWIFT_VERSION = 5;"), "{pbx}");
+    let app_settings = debug_settings(&pbx, "app");
+    assert!(
+        app_settings.contains("SYSTEM_HEADER_SEARCH_PATHS") && app_settings.contains("/opt/sysinc"),
+        "{app_settings}"
+    );
+    assert!(
+        app_settings.contains("SWIFT_SYSTEM_INCLUDE_PATHS"),
+        "{app_settings}"
+    );
+    assert!(!app_settings.contains("-isystem"), "{app_settings}");
+    assert!(!app_settings.contains("/sdk/usr/include"), "{app_settings}");
+    assert!(
+        !app_settings.contains("/usr/local/implicit"),
+        "{app_settings}"
+    );
+}
+
+#[test]
+fn optimization_flags_map_to_gcc_optimization_level_and_preserve_neighbors() {
+    let host = PureHost::default();
+    let source = Path::new("/source");
+    let build = Path::new("/build");
+    let mut model = model(source, build);
+    host.seed_file(&source.join("main.c"), b"")
+        .expect("seed source");
+    let app = add(&mut model, "app", TargetKind::Executable, Some("main.c"));
+    for flag in ["-DB", "-Ofast", "-DC"] {
+        model.target_mut(app).expect("app").usage.push(
+            rcmake_model::UsageField::CompileOptions,
+            BT::new(flag.into(), Default::default()),
+        );
+    }
+
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, build).expect("generate project");
+    let pbx = read(&host, &build.join("Demo.xcodeproj/project.pbxproj"));
+    let app_settings = debug_settings(&pbx, "app");
+    assert!(
+        app_settings.contains("GCC_OPTIMIZATION_LEVEL = fast;"),
+        "{app_settings}"
+    );
+    assert!(
+        app_settings.contains("OTHER_CFLAGS = (\"-DB -DC\",\"$(inherited)\");"),
+        "{app_settings}"
+    );
+}
+
+#[test]
+fn optimization_flags_leave_og_and_oz_in_other_flags_and_default_to_level_zero() {
+    let host = PureHost::default();
+    let source = Path::new("/source");
+    let build = Path::new("/build");
+    let mut model = model(source, build);
+    host.seed_file(&source.join("main.c"), b"")
+        .expect("seed source");
+    let app = add(&mut model, "app", TargetKind::Executable, Some("main.c"));
+    for flag in ["-Og", "-Oz"] {
+        model.target_mut(app).expect("app").usage.push(
+            rcmake_model::UsageField::CompileOptions,
+            BT::new(flag.into(), Default::default()),
+        );
+    }
+
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, build).expect("generate project");
+    let pbx = read(&host, &build.join("Demo.xcodeproj/project.pbxproj"));
+    let release_idx = pbx
+        .find("/* Release */ = {")
+        .and_then(|pos| pbx.get(pos..))
+        .expect("Release section");
+    let app_debug = debug_settings(&pbx, "app");
+    assert!(
+        app_debug.contains("GCC_OPTIMIZATION_LEVEL = 0;"),
+        "{app_debug}"
+    );
+    assert!(
+        app_debug.contains("OTHER_CFLAGS = (\"-Og -Oz\",\"$(inherited)\");"),
+        "{app_debug}"
+    );
+    assert!(
+        release_idx.contains("GCC_OPTIMIZATION_LEVEL = 0;"),
+        "{release_idx}"
+    );
+}
+
+#[test]
+fn swift_only_target_emits_swift_include_paths_and_preserves_empty_language_version() {
+    let host = PureHost::default();
+    let source = Path::new("/source");
+    let build = Path::new("/build");
+    let mut model = model(source, build);
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "Swift".into());
+    define(&mut model, "CMAKE_Swift_LANGUAGE_VERSION", "");
+    define(&mut model, "CMAKE_Swift_COMPILER", "/usr/bin/swiftc");
+    define(&mut model, "CMAKE_Swift_SOURCE_FILE_EXTENSIONS", "swift");
+    define(
+        &mut model,
+        "CMAKE_Swift_IMPLICIT_INCLUDE_DIRECTORIES",
+        "/opt/swift-implicit",
+    );
+    host.seed_file(&source.join("main.swift"), b"")
+        .expect("seed swift");
+    let app = add(
+        &mut model,
+        "app",
+        TargetKind::Executable,
+        Some("main.swift"),
+    );
+    let target = model.target_mut(app).expect("app");
+    for path in ["/opt/swift-inc", "/opt/swift-sys", "/opt/swift-implicit"] {
+        target.usage.push(
+            rcmake_model::UsageField::IncludeDirectories,
+            BT::new(path.into(), Default::default()),
+        );
+    }
+    target.usage.push(
+        rcmake_model::UsageField::InterfaceSystemIncludeDirectories,
+        BT::new("/opt/swift-sys".into(), Default::default()),
+    );
+
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, build).expect("generate project");
+    let pbx = read(&host, &build.join("Demo.xcodeproj/project.pbxproj"));
+    assert!(pbx.contains("SWIFT_VERSION = \"\";"), "{pbx}");
+    let app_settings = debug_settings(&pbx, "app");
+    assert!(
+        app_settings.contains("SWIFT_INCLUDE_PATHS") && app_settings.contains("/opt/swift-inc"),
+        "{app_settings}"
+    );
+    assert!(
+        app_settings.contains("SWIFT_SYSTEM_INCLUDE_PATHS")
+            && app_settings.contains("/opt/swift-sys"),
+        "{app_settings}"
+    );
+    assert!(
+        !app_settings.contains("/opt/swift-implicit"),
+        "{app_settings}"
+    );
+}
+
+#[test]
+fn mixed_c_cxx_swift_target_emits_swift_includes_even_with_per_language_flags() {
+    let host = PureHost::default();
+    let source = Path::new("/source");
+    let build = Path::new("/build");
+    let mut model = model(source, build);
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "C;CXX;Swift".into());
+    define(&mut model, "CMAKE_Swift_COMPILER", "/usr/bin/swiftc");
+    define(&mut model, "CMAKE_Swift_SOURCE_FILE_EXTENSIONS", "swift");
+    host.seed_file(&source.join("main.c"), b"").expect("seed c");
+    host.seed_file(&source.join("extra.cpp"), b"")
+        .expect("seed cpp");
+    host.seed_file(&source.join("app.swift"), b"")
+        .expect("seed swift");
+
+    // 1. Mixed C + CXX + Swift where C and CXX have different includes (triggers per_language_flags):
+    //    Swift must still receive SWIFT_INCLUDE_PATHS and SWIFT_SYSTEM_INCLUDE_PATHS from its own group.
+    let mixed_per_lang = add(
+        &mut model,
+        "mixed_per_lang",
+        TargetKind::Executable,
+        Some("main.c"),
+    );
+    {
+        let target = model.target_mut(mixed_per_lang).expect("mixed_per_lang");
+        target
+            .sources
+            .push(BT::new("extra.cpp".into(), Default::default()));
+        target
+            .sources
+            .push(BT::new("app.swift".into(), Default::default()));
+        for entry in [
+            "$<$<COMPILE_LANGUAGE:C>:/opt/c-only>",
+            "$<$<COMPILE_LANGUAGE:CXX>:/opt/cxx-only>",
+            "$<$<COMPILE_LANGUAGE:Swift>:/opt/swift-only>",
+            "$<$<COMPILE_LANGUAGE:Swift>:/opt/swift-sys-only>",
+        ] {
+            target.usage.push(
+                rcmake_model::UsageField::IncludeDirectories,
+                BT::new(entry.into(), Default::default()),
+            );
+        }
+        target.usage.push(
+            rcmake_model::UsageField::InterfaceSystemIncludeDirectories,
+            BT::new(
+                "$<$<COMPILE_LANGUAGE:Swift>:/opt/swift-sys-only>".into(),
+                Default::default(),
+            ),
+        );
+    }
+
+    // 2. Mixed C + Swift without per_language_flags: HEADER_SEARCH_PATHS gets C's includes
+    //    while SWIFT_INCLUDE_PATHS gets Swift's includes independently.
+    let mixed_shared = add(
+        &mut model,
+        "mixed_shared",
+        TargetKind::Executable,
+        Some("main.c"),
+    );
+    {
+        let target = model.target_mut(mixed_shared).expect("mixed_shared");
+        target
+            .sources
+            .push(BT::new("app.swift".into(), Default::default()));
+        for entry in [
+            "$<$<COMPILE_LANGUAGE:C>:/opt/c-inc>",
+            "$<$<COMPILE_LANGUAGE:Swift>:/opt/swift-inc>",
+        ] {
+            target.usage.push(
+                rcmake_model::UsageField::IncludeDirectories,
+                BT::new(entry.into(), Default::default()),
+            );
+        }
+    }
+
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, build).expect("generate project");
+    let pbx = read(&host, &build.join("Demo.xcodeproj/project.pbxproj"));
+
+    let per_lang_settings = debug_settings(&pbx, "mixed_per_lang");
+    let swift_inc_line = per_lang_settings
+        .lines()
+        .find(|line| line.contains("SWIFT_INCLUDE_PATHS"))
+        .unwrap_or_default();
+    assert!(
+        swift_inc_line.contains("/opt/swift-only")
+            && !swift_inc_line.contains("/opt/c-only")
+            && !swift_inc_line.contains("/opt/cxx-only"),
+        "{per_lang_settings}"
+    );
+    let swift_sys_line = per_lang_settings
+        .lines()
+        .find(|line| line.contains("SWIFT_SYSTEM_INCLUDE_PATHS"))
+        .unwrap_or_default();
+    assert!(
+        swift_sys_line.contains("/opt/swift-sys-only")
+            && !swift_sys_line.contains("/opt/c-only")
+            && !swift_sys_line.contains("/opt/cxx-only"),
+        "{per_lang_settings}"
+    );
+
+    let shared_settings = debug_settings(&pbx, "mixed_shared");
+    let header_line = shared_settings
+        .lines()
+        .find(|line| line.contains("HEADER_SEARCH_PATHS"))
+        .unwrap_or_default();
+    let shared_swift_line = shared_settings
+        .lines()
+        .find(|line| line.contains("SWIFT_INCLUDE_PATHS"))
+        .unwrap_or_default();
+    assert!(
+        header_line.contains("/opt/c-inc") && !header_line.contains("/opt/swift-inc"),
+        "{shared_settings}"
+    );
+    assert!(
+        shared_swift_line.contains("/opt/swift-inc") && !shared_swift_line.contains("/opt/c-inc"),
+        "{shared_settings}"
+    );
 }

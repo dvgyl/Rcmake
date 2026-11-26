@@ -587,7 +587,7 @@ fn deep_static_chain_preserves_usage_and_file_set_order() {
                 .source_file_sets(app, &ctx)
                 .unwrap()
                 .into_iter()
-                .map(|(id, _)| id)
+                .map(|(id, _, _)| id)
                 .collect::<Vec<_>>(),
             set_ids
         );

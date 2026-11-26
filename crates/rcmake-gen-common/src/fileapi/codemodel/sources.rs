@@ -494,40 +494,89 @@ impl CompileData {
                 flags.push(BT::new(base, Backtrace::default()));
             }
         }
+        let target_defines = group
+            .source_define_start
+            .unwrap_or(group.defines.len())
+            .min(group.defines.len());
+        let target_flags = group
+            .source_flag_start
+            .unwrap_or(group.flags.len())
+            .min(group.flags.len());
+        let target_includes = group.source_include_count.min(group.includes.len());
         for (field, entries) in [
             (
                 UsageField::CompileDefinitions,
-                group.defines.iter_mut().collect::<Vec<_>>(),
+                group
+                    .defines
+                    .get_mut(..target_defines)
+                    .unwrap_or_default()
+                    .iter_mut()
+                    .collect::<Vec<_>>(),
             ),
-            (UsageField::CompileOptions, group.flags.iter_mut().collect()),
+            (
+                UsageField::CompileOptions,
+                group
+                    .flags
+                    .get_mut(..target_flags)
+                    .unwrap_or_default()
+                    .iter_mut()
+                    .collect(),
+            ),
             (
                 UsageField::IncludeDirectories,
                 group
                     .includes
+                    .get_mut(target_includes..)
+                    .unwrap_or_default()
                     .iter_mut()
                     .map(|include| &mut include.path)
                     .collect(),
             ),
         ] {
-            let collected = usage.collect(target.id, field, &context).map_err(error)?;
-            let traces: BTreeMap<_, _> = collected
-                .entries
-                .into_iter()
-                .map(|entry| (entry.value, entry.backtrace))
-                .collect();
+            let inherited = usage
+                .codemodel_inherited_backtraces(target.id, field, &context)
+                .map_err(error)?;
             for entry in entries {
-                if let Some(trace) = traces.get(&entry.value) {
-                    entry.backtrace.clone_from(trace);
+                if let Some((_, link_bt)) = inherited.iter().find(|(original, _)| {
+                    original.value == entry.value
+                        && original.backtrace.frames().eq(entry.backtrace.frames())
+                }) {
+                    entry.backtrace.clone_from(link_bt);
                 }
             }
         }
-        flags.extend(group.flags.drain(..).map(|mut flag| {
-            flag.value = flag.value.strip_prefix(b"SHELL:").map_or_else(
-                || rcmake_resolve::lower::cmake_posix_quote(&flag.value),
+        let escape_flag = |flag: &BString| {
+            flag.strip_prefix(b"SHELL:").map_or_else(
+                || rcmake_resolve::lower::cmake_posix_quote(flag),
                 BString::from,
-            );
-            flag
-        }));
+            )
+        };
+        let option_groups: BTreeMap<usize, usize> = group
+            .source_option_groups
+            .iter()
+            .copied()
+            .filter(|&(start, len)| len > 0 && start >= target_flags)
+            .collect();
+        let all_flags = std::mem::take(&mut group.flags);
+        let mut index = 0;
+        while let Some(flag) = all_flags.get(index) {
+            if let Some(&len) = option_groups.get(&index)
+                && let Some(slice) = all_flags.get(index..index + len)
+            {
+                let mut combined = BString::default();
+                for (offset, item) in slice.iter().enumerate() {
+                    if offset > 0 {
+                        combined.push(b' ');
+                    }
+                    combined.extend_from_slice(&escape_flag(&item.value));
+                }
+                flags.push(BT::new(combined, flag.backtrace.clone()));
+                index += len;
+            } else {
+                flags.push(BT::new(escape_flag(&flag.value), flag.backtrace.clone()));
+                index += 1;
+            }
+        }
         if !pch.is_empty() {
             flags.push(BT::new(pch, Backtrace::default()));
         }

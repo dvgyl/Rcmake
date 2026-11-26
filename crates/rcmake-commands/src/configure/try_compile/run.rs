@@ -24,14 +24,27 @@ pub(super) enum ChildError {
 pub(super) fn build_child(
     child: &mut Cx<'_>,
     directory: &Path,
+    explicit_config: Option<&BString>,
     target: Option<&[u8]>,
     source_signature: bool,
     generator_facts: Option<std::sync::Arc<dyn rcmake_resolve::GeneratorFacts>>,
     profile: Option<&ProbeProfile>,
 ) -> Result<(BuildOutcome, Option<PathBuf>, BString), ChildError> {
     let resolve_start = profile.map(ProbeProfile::now);
-    let config = ConfigId(child.var_or_empty(b"CMAKE_BUILD_TYPE"));
     let mut model = child.project().clone();
+    let (header_config, build_configs) = match model.generator {
+        Some(GeneratorKind::NinjaMultiConfig) => {
+            ninja_multi_config_selection(child, explicit_config)?
+        }
+        Some(generator) if generator.multi_config() => {
+            let config = ConfigId(explicit_config.cloned().unwrap_or_else(|| "Debug".into()));
+            (config.clone(), vec![config])
+        }
+        _ => {
+            let config = ConfigId(child.var_or_empty(b"CMAKE_BUILD_TYPE"));
+            (config.clone(), vec![config])
+        }
+    };
     // Lowering reads toolchain variables from the directory model or cache.
     for name in child.variable_names() {
         if toolchain_variable(&name) || name == "CMAKE_COMMAND" {
@@ -39,62 +52,194 @@ pub(super) fn build_child(
             model.dir_mut(DirId::ROOT).props.set(name, value);
         }
     }
-    apple::resolve(child, &mut model, directory, &config).map_err(ChildError::Generate)?;
-    let configs = std::slice::from_ref(&config);
+    for config in &build_configs {
+        apple::resolve(child, &mut model, directory, config).map_err(ChildError::Generate)?;
+    }
     let resolved = match generator_facts {
-        Some(facts) => rcmake_resolve::resolve_with_facts(&model, child.host(), configs, facts),
-        None => rcmake_resolve::resolve(&model, child.host(), configs),
-    };
-    let graph = resolved
-        .map_err(|error| ChildError::Generate(error.to_string()))?
-        .graphs
-        .into_iter()
-        .next()
-        .ok_or_else(|| ChildError::Generate("The resolver returned no build graph.".into()))?;
-    let artifact = target
-        .and_then(|name| {
-            graph
-                .targets
-                .iter()
-                .find(|target| target.name.as_slice() == name)
-        })
-        .and_then(|target| {
-            target
-                .steps
-                .iter()
-                .rev()
-                .find_map(|&id| match graph.steps.get(id) {
-                    Some(BuildStep::Link { step, .. }) => {
-                        Some(directory.join(path::to_native(&step.output)))
-                    }
-                    _ => None,
+        Some(facts) => {
+            rcmake_resolve::resolve_with_facts(&model, child.host(), &build_configs, facts)
+        }
+        None => rcmake_resolve::resolve(&model, child.host(), &build_configs),
+    }
+    .map_err(|error| ChildError::Generate(error.to_string()))?;
+    if resolved.graphs.is_empty() {
+        return Err(ChildError::Generate(
+            "The resolver returned no build graph.".into(),
+        ));
+    }
+    let mut artifact = None;
+    for graph in &resolved.graphs {
+        if artifact.is_none() {
+            artifact = target
+                .and_then(|name| {
+                    graph
+                        .targets
+                        .iter()
+                        .find(|target| target.name.as_slice() == name)
                 })
-        });
+                .and_then(|target| {
+                    target
+                        .steps
+                        .iter()
+                        .rev()
+                        .find_map(|&id| match graph.steps.get(id) {
+                            Some(BuildStep::Link { step, .. }) => {
+                                Some(directory.join(path::to_native(&step.output)))
+                            }
+                            _ => None,
+                        })
+                });
+        }
+        for (relative, contents) in &graph.swift_output_file_maps {
+            let full = directory.join(path::to_native(relative));
+            if let Some(parent) = full.parent() {
+                child
+                    .host()
+                    .create_dir_all(parent)
+                    .map_err(|error| ChildError::Generate(error.to_string()))?;
+            }
+            child
+                .host()
+                .write(&full, contents.as_slice(), rcmake_host::WriteMode::Truncate)
+                .map_err(|error| ChildError::Generate(error.to_string()))?;
+        }
+    }
     let options = BuildOptions {
         build_dir: directory.to_path_buf(),
         targets: target.into_iter().map(BString::from).collect(),
         verbose: source_signature,
         ..BuildOptions::default()
     };
-    let header = build_log_header(child, directory, target, source_signature);
+    let header = build_log_header(child, directory, &header_config, target, source_signature);
     if let (Some(profile), Some(start)) = (profile, resolve_start) {
         profile.span(b"probe.resolve", start);
     }
     let build_start = profile.map(ProbeProfile::now);
-    let outcome = rcmake_build::execute(&graph, child.host(), &options);
+    let mut combined = BuildOutcome {
+        success: true,
+        exit_code: 0,
+        steps_run: 0,
+        output: BString::default(),
+    };
+    for graph in &resolved.graphs {
+        let outcome = rcmake_build::execute(graph, child.host(), &options)
+            .map_err(|error| ChildError::Build(error.to_string()))?;
+        combined.steps_run += outcome.steps_run;
+        combined.output.extend_from_slice(&outcome.output);
+        if !outcome.success {
+            combined.success = false;
+            combined.exit_code = outcome.exit_code;
+            break;
+        }
+    }
     if let (Some(profile), Some(start)) = (profile, build_start) {
         profile.span(b"probe.build", start);
     }
-    Ok((
-        outcome.map_err(|error| ChildError::Build(error.to_string()))?,
-        artifact,
-        header,
-    ))
+    Ok((combined, artifact, header))
+}
+
+/// Match CMake's `cmGlobalNinjaMultiGenerator::InspectConfigTypeVariables` and
+/// `rcmake-gen-ninja::multi::Selection::new` for child `try_compile` builds.
+///
+/// Returns `(header_config, build_configs)` where `header_config` is empty for an
+/// implicit default build (matching `ninja` on `build.ninja` without `-f`) and
+/// `build_configs` lists the effective target configuration(s) to lower and build.
+fn ninja_multi_config_selection(
+    child: &mut Cx<'_>,
+    explicit_config: Option<&BString>,
+) -> Result<(ConfigId, Vec<ConfigId>), ChildError> {
+    let raw_configs = list::split(
+        &child.var_or_empty(b"CMAKE_CONFIGURATION_TYPES"),
+        list::Empty::Drop,
+    );
+    let configs: Vec<ConfigId> = if raw_configs.is_empty() {
+        vec![ConfigId("Debug".into())]
+    } else {
+        raw_configs.into_iter().map(ConfigId).collect()
+    };
+    let Some(first) = configs.first() else {
+        return Err(ChildError::Generate(
+            "Ninja Multi-Config requires at least one configuration.".into(),
+        ));
+    };
+    let index = |name: &[u8]| configs.iter().position(|config| config.0 == name);
+    let default_build_type = child.var_or_empty(b"CMAKE_DEFAULT_BUILD_TYPE");
+    let default_name = if default_build_type.is_empty() {
+        &first.0
+    } else {
+        &default_build_type
+    };
+    let default_idx = index(default_name).ok_or_else(|| {
+        ChildError::Generate(format!(
+            "The configuration specified by CMAKE_DEFAULT_BUILD_TYPE ({default_name}) is not present in CMAKE_CONFIGURATION_TYPES"
+        ))
+    })?;
+    let sorted = |mut selection: Vec<usize>| {
+        selection.sort_unstable_by_key(|&i| configs.get(i).map(|config| &config.0));
+        selection
+    };
+    let all = sorted((0..configs.len()).collect());
+    let parse_subset = |value: &[u8],
+                        all_indices: &[usize],
+                        lookup: &dyn Fn(&[u8]) -> Option<usize>|
+     -> Option<Vec<usize>> {
+        let names = list::split(value, list::Empty::Drop);
+        if matches!(names.as_slice(), [name] if name == "all") {
+            return Some(all_indices.to_vec());
+        }
+        let mut selected = Vec::new();
+        for name in names {
+            let idx = lookup(&name)?;
+            if !selected.contains(&idx) {
+                selected.push(idx);
+            }
+        }
+        Some(selected)
+    };
+    let cross_setting = child.var_or_empty(b"CMAKE_CROSS_CONFIGS");
+    let cross = sorted(parse_subset(&cross_setting, &all, &index).ok_or_else(|| {
+        ChildError::Generate(
+            "CMAKE_CROSS_CONFIGS is not a subset of CMAKE_CONFIGURATION_TYPES".into(),
+        )
+    })?);
+    let defaults_setting = child.var_or_empty(b"CMAKE_DEFAULT_CONFIGS");
+    let defaults_name = if defaults_setting.is_empty() {
+        default_name
+    } else {
+        &defaults_setting
+    };
+    if defaults_name != default_name && (default_name.is_empty() || cross.is_empty()) {
+        return Err(ChildError::Generate(
+            "CMAKE_DEFAULT_CONFIGS cannot be used without CMAKE_DEFAULT_BUILD_TYPE or CMAKE_CROSS_CONFIGS".into(),
+        ));
+    }
+    let lookup_default =
+        |name: &[u8]| index(name).filter(|idx| *idx == default_idx || cross.contains(idx));
+    let defaults = sorted(
+        parse_subset(defaults_name, &cross, &lookup_default).ok_or_else(|| {
+            ChildError::Generate(
+                "CMAKE_DEFAULT_CONFIGS is not a subset of CMAKE_CROSS_CONFIGS".into(),
+            )
+        })?,
+    );
+    if let Some(explicit) = explicit_config {
+        let config = ConfigId(explicit.clone());
+        return Ok((config.clone(), vec![config]));
+    }
+    let selected: Vec<ConfigId> = defaults
+        .into_iter()
+        .filter_map(|idx| configs.get(idx).cloned())
+        .collect();
+    if selected.is_empty() {
+        return Ok((ConfigId(BString::default()), vec![first.clone()]));
+    }
+    Ok((ConfigId(BString::default()), selected))
 }
 
 fn build_log_header(
     child: &mut Cx<'_>,
     directory: &Path,
+    config: &ConfigId,
     target: Option<&[u8]>,
     source_signature: bool,
 ) -> BString {
@@ -130,11 +275,8 @@ fn build_log_header(
         ) {
             command.push("-v".into());
         }
-        if generator == Some(GeneratorKind::NinjaMultiConfig) {
-            let config = child.var_or_empty(b"CMAKE_BUILD_TYPE");
-            if !config.is_empty() {
-                command.extend(["-f".into(), format!("build-{config}.ninja").into()]);
-            }
+        if generator == Some(GeneratorKind::NinjaMultiConfig) && !config.0.is_empty() {
+            command.extend(["-f".into(), format!("build-{}.ninja", config.0).into()]);
         }
     }
     if let Some(target) = target {

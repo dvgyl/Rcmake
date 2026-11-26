@@ -178,7 +178,7 @@ pub(crate) fn validate_membership(
                 map_set_files(model, &mut usage, target, set, &context, report)?;
             }
             if has_interface_sources && target.kind.compiles_objects() {
-                for (_, set) in usage.source_file_sets(id, &context)? {
+                for (_, set, _) in usage.source_file_sets(id, &context)? {
                     if set.target != id {
                         map_set_files(model, &mut usage, target, set, &context, report)?;
                     }
@@ -203,6 +203,15 @@ pub(crate) fn validate_source_includes(
         let Some(raw) = properties(dir, &unit.source.value).get(b"INCLUDE_DIRECTORIES") else {
             continue;
         };
+        if usage.ide() == Some(crate::ide::IdeFlavor::Xcode)
+            && (raw
+                .as_slice()
+                .windows(9)
+                .any(|w| w == b"$<CONFIG>" || w == b"$<CONFIG:")
+                || raw.as_slice().windows(16).any(|w| w == b"$<CONFIGURATION>"))
+        {
+            continue;
+        }
         let context = EvalContext {
             config: resolved.config.clone(),
             language: Some(group.language.clone()),

@@ -257,12 +257,63 @@ fn rule_args(model: &ProjectModel, index: usize) -> Vec<&BString> {
         .collect()
 }
 
-/// The targets that an install step scans for runtime dependencies.
-enum Scanned {
-    /// The build dependencies of the targets of the rule.
-    Targets(BTreeSet<BString>),
-    /// The targets of a named runtime dependency set.
-    Set(BString),
+/// Collect build-system dependencies for `id`, walking `utility_deps` through
+/// imported or non-buildsystem targets (`cmGlobalGenerator::GetInstallPrepTargets`).
+fn target_build_deps(
+    graph: &Graph<'_>,
+    model: &ProjectModel,
+    id: rcmake_model::TargetId,
+    visited: &mut BTreeSet<rcmake_model::TargetId>,
+    out: &mut BTreeSet<BString>,
+) {
+    if !visited.insert(id) {
+        return;
+    }
+    let Some(target) = model.target(id) else {
+        return;
+    };
+    if target.is_imported() || !model.is_in_build_system(target) {
+        for dep in &target.utility_deps {
+            if let Some(dep_id) = model.find_target(target.dir, &dep.value) {
+                target_build_deps(graph, model, dep_id, visited, out);
+            }
+        }
+        return;
+    }
+    if let Some(node) = graph.target_dependency(&target.name) {
+        out.insert(node);
+    }
+}
+
+fn imported_runtime_artifact_targets<'a>(args: &[&'a BString]) -> Vec<&'a [u8]> {
+    const KEYWORDS: &[&[u8]] = &[
+        b"RUNTIME_DEPENDENCY_SET",
+        b"RUNTIME_DEPENDENCIES",
+        b"RUNTIME",
+        b"LIBRARY",
+        b"FRAMEWORK",
+        b"BUNDLE",
+        b"DESTINATION",
+        b"COMPONENT",
+        b"CONFIGURATIONS",
+        b"PERMISSIONS",
+        b"OPTIONAL",
+        b"EXCLUDE_FROM_ALL",
+        b"NAMELINK_COMPONENT",
+        b"NAMELINK_ONLY",
+        b"NAMELINK_SKIP",
+        b"PRE_INCLUDE_REGEXES",
+        b"PRE_EXCLUDE_REGEXES",
+        b"POST_INCLUDE_REGEXES",
+        b"POST_EXCLUDE_REGEXES",
+        b"DIRECTORIES",
+    ];
+    args.get(1..)
+        .unwrap_or_default()
+        .iter()
+        .map(|arg| arg.as_slice())
+        .take_while(|arg| !KEYWORDS.contains(arg))
+        .collect()
 }
 
 /// Make the components that install runtime dependencies build the targets
@@ -273,7 +324,36 @@ fn collect_runtime_dependency_inputs(
     targets: &mut Targets,
 ) {
     let mut sets = BTreeMap::<BString, BTreeSet<BString>>::new();
-    let mut requests = Vec::new();
+    let all = BString::from("install_prep/all");
+    let mut add_filtered_options =
+        |dir: DirId, options: &rcmake_model::InstallOptions, deps: &BTreeSet<BString>| {
+            if !options.configurations.is_empty()
+                && !options
+                    .configurations
+                    .iter()
+                    .any(|config| graph.input.config.matches(config))
+            {
+                return;
+            }
+            if !options.exclude_from_all && available(graph, &all) {
+                targets
+                    .entry(all.clone())
+                    .or_default()
+                    .extend(deps.iter().cloned());
+            }
+            let component = options
+                .component
+                .as_ref()
+                .or_else(|| {
+                    model
+                        .definition(dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
+                        .filter(|value| !value.is_empty())
+                })
+                .map_or(b"Unspecified".as_slice(), |value| value.as_slice());
+            if let Some(inputs) = add_component(graph, targets, component) {
+                inputs.extend(deps.iter().cloned());
+            }
+        };
     for (index, rule) in model.installs.iter().enumerate() {
         let args = rule_args(model, index);
         let named_set = |keyword: &[u8]| {
@@ -281,55 +361,160 @@ fn collect_runtime_dependency_inputs(
                 .find(|pair| pair.first().is_some_and(|key| key.as_slice() == keyword))
                 .and_then(|pair| pair.get(1).map(|value| (*value).clone()))
         };
-        let components = || {
-            let mut components = rule_components(model, index);
-            if components.is_empty() {
-                components.push(
-                    model
-                        .definition(rule.dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
-                        .filter(|value| !value.is_empty())
-                        .cloned()
-                        .unwrap_or_else(|| "Unspecified".into()),
-                );
-            }
-            components
-        };
         if let InstallKind::Targets {
             targets: installed, ..
         } = &rule.kind
         {
-            let deps: BTreeSet<_> = installed
-                .iter()
-                .filter_map(|id| model.target(*id))
-                .filter_map(|target| graph.target_dependency(&target.name))
-                .collect();
-            if args
-                .iter()
-                .any(|arg| arg.as_slice() == b"RUNTIME_DEPENDENCIES")
-            {
-                requests.push((components(), Scanned::Targets(deps.clone())));
+            let mut deps = BTreeSet::new();
+            let mut visited = BTreeSet::new();
+            for &id in installed {
+                target_build_deps(graph, model, id, &mut visited, &mut deps);
+            }
+            if !model.dir_excluded_from_all(rule.dir) {
+                for options in
+                    rcmake_resolve::lower::unnamed_runtime_dependency_groups(model, index)
+                {
+                    add_filtered_options(rule.dir, &options, &deps);
+                }
             }
             if let Some(set) = named_set(b"RUNTIME_DEPENDENCY_SET") {
                 sets.entry(set).or_default().extend(deps);
             }
         } else if args
             .first()
-            .is_some_and(|arg| arg.as_slice() == b"RUNTIME_DEPENDENCY_SET")
-            && let Some(set) = args.get(1)
+            .is_some_and(|arg| arg.as_slice() == b"IMPORTED_RUNTIME_ARTIFACTS")
         {
-            requests.push((components(), Scanned::Set((*set).clone())));
+            let mut deps = BTreeSet::new();
+            let mut visited = BTreeSet::new();
+            for name in imported_runtime_artifact_targets(&args) {
+                if let Some(id) = model.find_target(rule.dir, name) {
+                    target_build_deps(graph, model, id, &mut visited, &mut deps);
+                }
+            }
+            if let Some(set) = named_set(b"RUNTIME_DEPENDENCY_SET") {
+                sets.entry(set).or_default().extend(deps);
+            }
         }
     }
-    // A set can receive targets from rules after the rule that installs it.
-    for (components, request) in requests {
-        let deps = match request {
-            Scanned::Set(set) => sets.get(&set).cloned().unwrap_or_default(),
-            Scanned::Targets(deps) => deps,
+    for install in &model.runtime_dependency_installs {
+        if model.dir_excluded_from_all(install.dir) {
+            continue;
+        }
+        let Some(deps) = sets.get(&install.name) else {
+            continue;
         };
-        for component in components {
-            if let Some(inputs) = add_component(graph, targets, &component) {
-                inputs.extend(deps.iter().cloned());
+        for options in std::iter::once(&install.library).chain(install.framework.as_ref()) {
+            add_filtered_options(install.dir, options, deps);
+        }
+    }
+}
+
+/// Emit author warnings for install rules with build dependencies whose
+/// components cannot produce an `install_prep/` target (`cmGlobalGenerator::CheckInstallPrepTargets`).
+pub(crate) fn warn_install_prep_components(
+    graphs: &[&Graph<'_>],
+    model: Option<&ProjectModel>,
+    host: &dyn Host,
+) {
+    let Some(model) = model else { return };
+    if skip(Some(model), b"CMAKE_SKIP_INSTALL_PREP_TARGETS") || graphs.is_empty() {
+        return;
+    }
+    let root = model.dir(DirId::ROOT).source_dir.clone();
+    let mut warned_components = BTreeSet::<BString>::new();
+    let emit_warning = |dir: DirId, backtrace: &rcmake_diag::Backtrace, body: String| {
+        if model
+            .definition(dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+            .is_some_and(|value| truth::is_on(value))
+        {
+            return;
+        }
+        let diagnostic = rcmake_diag::Diagnostic {
+            annotations: None,
+            kind: rcmake_diag::MessageKind::AuthorWarning,
+            effect: rcmake_diag::Effect::None,
+            category: Some(rcmake_diag::DiagCategory::Author),
+            policy: None,
+            location: rcmake_diag::Location::Backtrace(backtrace.clone()),
+            body: body.into(),
+        };
+        let text = rcmake_diag::render(
+            &diagnostic,
+            &rcmake_diag::RenderOptions {
+                relative_base: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        host.write_out(rcmake_host::Stream::Stderr, &text);
+    };
+    let mut check_component =
+        |dir: DirId, backtrace: &rcmake_diag::Backtrace, component: &[u8], exclude: bool| {
+            if component == b"all" {
+                if exclude {
+                    emit_warning(
+                        dir,
+                        backtrace,
+                        "An install rule in the component named \"all\" uses EXCLUDE_FROM_ALL and \
+                         has build dependencies, but no install_prep/ target builds them: \
+                         install_prep/all omits EXCLUDE_FROM_ALL rules, and the \"all\" component \
+                         has no preparation target of its own.  Rename the component or remove \
+                         EXCLUDE_FROM_ALL."
+                            .to_owned(),
+                    );
+                }
+            } else if !install_component(component) && warned_components.insert(component.into()) {
+                emit_warning(
+                    dir,
+                    backtrace,
+                    format!(
+                        "The install component \"{}\" has build dependencies, but its name cannot \
+                         be used in a build target name with this generator.  No \"install_prep/\" \
+                         target will be generated for it.  Rename the component to build its \
+                         dependencies with an \"install_prep/\" target.",
+                        BString::from(component)
+                    ),
+                );
             }
+        };
+
+    for (index, rule) in model.installs.iter().enumerate() {
+        if model.dir_excluded_from_all(rule.dir) || rule.options.all_components {
+            continue;
+        }
+        let has_deps = match &rule.kind {
+            InstallKind::Targets { targets, .. } => targets.iter().any(|&id| {
+                let mut visited = BTreeSet::new();
+                let mut deps = BTreeSet::new();
+                for graph in graphs {
+                    target_build_deps(graph, model, id, &mut visited, &mut deps);
+                }
+                !deps.is_empty()
+            }),
+            _ => !rule.options.build_depends.is_empty(),
+        };
+        if !has_deps {
+            continue;
+        }
+        let mut components = rule_components(model, index);
+        if components.is_empty() {
+            components.push(
+                rule.options
+                    .component
+                    .clone()
+                    .or_else(|| {
+                        model
+                            .definition(rule.dir, b"CMAKE_INSTALL_DEFAULT_COMPONENT_NAME")
+                            .filter(|value| !value.is_empty())
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| "Unspecified".into()),
+            );
+        }
+        let args = rule_args(model, index);
+        let exclude = rule.options.exclude_from_all
+            || args.iter().any(|arg| arg.as_slice() == b"EXCLUDE_FROM_ALL");
+        for component in components {
+            check_component(rule.dir, &rule.backtrace, &component, exclude);
         }
     }
 }
@@ -627,5 +812,277 @@ mod tests {
         let components = rule_components(&model, 0);
         assert_eq!(components, ["Archive", "Headers", "Development"]);
         assert!(rule_components(&model, 1).is_empty());
+    }
+
+    #[test]
+    fn runtime_dependency_set_install_prep_filters_configurations_and_excluded_dirs() {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+
+        use rcmake_genex::ConfigId;
+        use rcmake_model::{
+            DirId, InstallKind, InstallOptions, InstallRule, RuntimeDependencyInstall, Target,
+            TargetKind, TargetOrigin,
+        };
+        use rcmake_resolve::{BuildGraph, GraphTarget};
+
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/build".into());
+        let app = Target::new(
+            "app".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        );
+        let app_id = model.add_target(app).unwrap_or_else(|e| panic!("{e}"));
+        // Install the runtime dependency set BEFORE the targets rule populates it.
+        model.installs.push(InstallRule {
+            dir: DirId::ROOT,
+            kind: InstallKind::Code(Default::default()),
+            options: InstallOptions {
+                component: Some("Runtime".into()),
+                configurations: vec!["Release".into()],
+                ..InstallOptions::default()
+            },
+            backtrace: Default::default(),
+        });
+        for (idx, arg) in [
+            "RUNTIME_DEPENDENCY_SET",
+            "deps",
+            "COMPONENT",
+            "Runtime",
+            "CONFIGURATIONS",
+            "Release",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            model
+                .global
+                .props
+                .set(format!("_RCMAKE_INSTALL_0_ARG{idx}").into(), arg.into());
+        }
+        model
+            .runtime_dependency_installs
+            .push(RuntimeDependencyInstall {
+                dir: DirId::ROOT,
+                position: 0,
+                name: "deps".into(),
+                backtrace: Default::default(),
+                library: InstallOptions {
+                    component: Some("Runtime".into()),
+                    configurations: vec!["Release".into()],
+                    ..InstallOptions::default()
+                },
+                framework: None,
+                filters: Default::default(),
+            });
+        model.installs.push(InstallRule {
+            dir: DirId::ROOT,
+            kind: InstallKind::Targets {
+                targets: vec![app_id],
+                export: None,
+            },
+            options: InstallOptions::default(),
+            backtrace: Default::default(),
+        });
+        for (idx, arg) in ["TARGETS", "app", "RUNTIME_DEPENDENCY_SET", "deps"]
+            .into_iter()
+            .enumerate()
+        {
+            model
+                .global
+                .props
+                .set(format!("_RCMAKE_INSTALL_1_ARG{idx}").into(), arg.into());
+        }
+
+        let make_targets = |config: &str, m: &ProjectModel| {
+            let input = BuildGraph {
+                config: ConfigId(config.into()),
+                targets: vec![GraphTarget {
+                    name: "app".into(),
+                    in_all: true,
+                    ..GraphTarget::default()
+                }],
+                ..BuildGraph::default()
+            };
+            let graph = super::Graph::new(&input, &BTreeMap::new(), Path::new("/build"), None)
+                .unwrap_or_else(|e| panic!("{e}"));
+            let mut targets = super::Targets::new();
+            super::collect_runtime_dependency_inputs(&graph, m, &mut targets);
+            targets
+        };
+
+        let debug_targets = make_targets("Debug", &model);
+        assert!(
+            !debug_targets
+                .get(b"install_prep/Runtime".as_slice())
+                .is_some_and(|deps| deps.contains(b"app".as_slice())),
+            "{debug_targets:?}"
+        );
+        let release_targets = make_targets("Release", &model);
+        assert!(
+            release_targets
+                .get(b"install_prep/Runtime".as_slice())
+                .is_some_and(|deps| deps.contains(b"app".as_slice())),
+            "{release_targets:?}"
+        );
+
+        let excluded_dir = model
+            .add_directory(
+                DirId::ROOT,
+                "/src/ex".into(),
+                "/build/ex".into(),
+                Default::default(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        model.dir_mut(excluded_dir).exclude_from_all = true;
+        if let Some(install) = model.runtime_dependency_installs.first_mut() {
+            install.dir = excluded_dir;
+        }
+        let excluded_targets = make_targets("Release", &model);
+        assert!(
+            !excluded_targets
+                .get(b"install_prep/Runtime".as_slice())
+                .is_some_and(|deps| deps.contains(b"app".as_slice())),
+            "{excluded_targets:?}"
+        );
+    }
+
+    #[test]
+    fn unnamed_runtime_dependencies_install_prep_respects_group_config_filters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+
+        use rcmake_genex::ConfigId;
+        use rcmake_model::{
+            DirId, InstallKind, InstallOptions, InstallRule, Target, TargetKind, TargetOrigin,
+        };
+        use rcmake_resolve::{BuildGraph, GraphTarget};
+
+        let run_case = |import_suffix: Option<&str>,
+                        config: &str|
+         -> Result<super::Targets, Box<dyn std::error::Error>> {
+            let mut model = ProjectModel::default();
+            model.set_root_dirs("/src".into(), "/build".into());
+            model
+                .dir_mut(DirId::ROOT)
+                .vars
+                .insert("CMAKE_SYSTEM_NAME".into(), "Linux".into());
+            model
+                .dir_mut(DirId::ROOT)
+                .vars
+                .insert("CMAKE_HOST_SYSTEM_NAME".into(), "Linux".into());
+            if let Some(suffix) = import_suffix {
+                model
+                    .dir_mut(DirId::ROOT)
+                    .vars
+                    .insert("CMAKE_IMPORT_LIBRARY_SUFFIX".into(), suffix.into());
+            }
+            let app = Target::new(
+                "app".into(),
+                TargetKind::Executable,
+                TargetOrigin::Normal,
+                DirId::ROOT,
+                Default::default(),
+                Default::default(),
+            );
+            let app_id = model.add_target(app)?;
+            model.installs.push(InstallRule {
+                dir: DirId::ROOT,
+                kind: InstallKind::Targets {
+                    targets: vec![app_id],
+                    export: None,
+                },
+                options: InstallOptions::default(),
+                backtrace: Default::default(),
+            });
+            for (idx, arg) in [
+                "TARGETS",
+                "app",
+                "RUNTIME_DEPENDENCIES",
+                "RUNTIME",
+                "COMPONENT",
+                "RtBin",
+                "CONFIGURATIONS",
+                "Debug",
+                "LIBRARY",
+                "COMPONENT",
+                "RtLib",
+                "CONFIGURATIONS",
+                "Release",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                model
+                    .global
+                    .props
+                    .set(format!("_RCMAKE_INSTALL_0_ARG{idx}").into(), arg.into());
+            }
+
+            let input = BuildGraph {
+                config: ConfigId(config.into()),
+                targets: vec![GraphTarget {
+                    name: "app".into(),
+                    in_all: true,
+                    ..GraphTarget::default()
+                }],
+                ..BuildGraph::default()
+            };
+            let graph = super::Graph::new(&input, &BTreeMap::new(), Path::new("/build"), None)?;
+            let mut targets = super::Targets::new();
+            super::collect_runtime_dependency_inputs(&graph, &model, &mut targets);
+            Ok(targets)
+        };
+
+        // Without CMAKE_IMPORT_LIBRARY_SUFFIX, selects LIBRARY (Release only, component RtLib).
+        let lib_debug = run_case(None, "Debug")?;
+        assert!(
+            !lib_debug
+                .get(b"install_prep/RtLib".as_slice())
+                .is_some_and(|deps| deps.contains(b"app".as_slice())),
+            "{lib_debug:?}"
+        );
+        let lib_release = run_case(None, "Release")?;
+        assert!(
+            lib_release
+                .get(b"install_prep/RtLib".as_slice())
+                .is_some_and(|deps| deps.contains(b"app".as_slice())),
+            "{lib_release:?}"
+        );
+        assert!(
+            !lib_release
+                .get(b"install_prep/RtBin".as_slice())
+                .is_some_and(|deps| deps.contains(b"app".as_slice())),
+            "{lib_release:?}"
+        );
+
+        // With non-empty CMAKE_IMPORT_LIBRARY_SUFFIX (even on non-Windows CMAKE_SYSTEM_NAME),
+        // selects RUNTIME (Debug only, component RtBin).
+        let dll_debug = run_case(Some(".dll.a"), "Debug")?;
+        assert!(
+            dll_debug
+                .get(b"install_prep/RtBin".as_slice())
+                .is_some_and(|deps| deps.contains(b"app".as_slice())),
+            "{dll_debug:?}"
+        );
+        let dll_release = run_case(Some(".dll.a"), "Release")?;
+        assert!(
+            !dll_release
+                .get(b"install_prep/RtBin".as_slice())
+                .is_some_and(|deps| deps.contains(b"app".as_slice())),
+            "{dll_release:?}"
+        );
+        assert!(
+            !dll_release
+                .get(b"install_prep/RtLib".as_slice())
+                .is_some_and(|deps| deps.contains(b"app".as_slice())),
+            "{dll_release:?}"
+        );
+        Ok(())
     }
 }

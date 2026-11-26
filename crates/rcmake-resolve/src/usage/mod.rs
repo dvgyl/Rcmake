@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, Limits, list, truth};
-use rcmake_diag::Frame;
+use rcmake_diag::{Backtrace, Frame};
 use rcmake_genex::{
     EvalContext, EvalFlags, GenexAst, GenexError, ParseCache, TargetHandle, UsageTraversal,
 };
@@ -41,6 +41,8 @@ pub use host::{ModelGenexHost, ObjectPaths};
 pub use link::{ResolvedLinkItem, ResolvedLinkKind, collect_link_items};
 
 use crate::ResolveError;
+
+pub(crate) type SourceFileSetEntry<'a> = (FileSetId, &'a FileSet, Option<Backtrace>);
 
 /// Memoization key of one transitive evaluation (ADR-006 item 4). `head` is only part
 /// of the key when the cached value is head-sensitive.
@@ -138,6 +140,8 @@ pub struct UsageResolver<'a> {
     /// interface paths only when it collects the usage requirements of a
     /// consumer, not when an expression reads the property.
     property_reads: usize,
+    /// Backtrace of the outermost link edge being traversed for policy warnings.
+    current_link_bt: Option<Backtrace>,
 }
 
 impl<'a> UsageResolver<'a> {
@@ -170,6 +174,7 @@ impl<'a> UsageResolver<'a> {
             compatible: compatible::Properties::default(),
             provenance: None,
             property_reads: 0,
+            current_link_bt: None,
             has_injections: model.targets().any(|(_, target)| {
                 target.props.get(link::DIRECT).is_some()
                     || target.props.get(link::EXCLUDE).is_some()
@@ -184,6 +189,55 @@ impl<'a> UsageResolver<'a> {
             codemodel_backtraces: true,
             ..Self::new(model)
         }
+    }
+
+    /// Return inherited target-usage `(original_entry, consumer_link_backtrace)` pairs
+    /// for File API codemodel backtrace attribution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target or its usage generator expressions are invalid.
+    pub fn codemodel_inherited_backtraces(
+        &mut self,
+        target: TargetId,
+        field: UsageField,
+        ctx: &EvalContext,
+    ) -> Result<Vec<(BT<BString>, Backtrace)>, ResolveError> {
+        let name = field.name().as_bytes();
+        let mut ctx = self.property_context(target, name, ctx)?;
+        if matches!(field, UsageField::LinkOptions | UsageField::LinkDirectories) {
+            ctx.traversal = link_options::traversal(self.target(target)?);
+        }
+        let result = self.walk(target, name, &ctx)?;
+        let mut pairs = Vec::new();
+        for (owner, entries) in &result.contributions {
+            if *owner == target {
+                continue;
+            }
+            let Some(edge) = result
+                .chains
+                .as_ref()
+                .and_then(|paths| paths.get(owner))
+                .and_then(|path| path.first())
+            else {
+                continue;
+            };
+            for entry in &**entries {
+                let value = if field == UsageField::CompileDefinitions {
+                    entry
+                        .value
+                        .strip_prefix(b"-D")
+                        .map_or_else(|| entry.value.clone(), BString::from)
+                } else {
+                    entry.value.clone()
+                };
+                pairs.push((
+                    BT::new(value, entry.backtrace.clone()),
+                    edge.link_bt.clone(),
+                ));
+            }
+        }
+        Ok(pairs)
     }
 
     pub(crate) fn with_source_paths(model: &'a ProjectModel, paths: &'a SourcePaths<'a>) -> Self {
@@ -215,6 +269,7 @@ impl<'a> UsageResolver<'a> {
             provenance: None,
             property_reads: 0,
             has_injections: self.has_injections,
+            current_link_bt: None,
         }
     }
 
@@ -637,14 +692,28 @@ impl<'a> UsageResolver<'a> {
         }
         let mut seen = HashSet::from([id]);
         for (dependency, edge) in links.iter().flat_map(|item| item.edges()) {
-            let value = self.walk(dependency, &dependency_name, ctx)?;
+            let previous_link_bt = if self.current_link_bt.is_none() {
+                self.current_link_bt.replace(edge.text.backtrace.clone())
+            } else {
+                None
+            };
+            let restore_link_bt = previous_link_bt.is_none() && self.current_link_bt.is_some();
+            let value = self.walk(dependency, &dependency_name, ctx);
+            if restore_link_bt {
+                self.current_link_bt = previous_link_bt;
+            }
+            let value = value?;
             result.flags = result.flags.union(value.flags);
             for (owner, entries) in &value.contributions {
                 if !seen.insert(*owner) {
                     continue;
                 }
                 result.contributions.push((*owner, Arc::clone(entries)));
-                if self.provenance.is_some() || self.debug_properties || self.codemodel_backtraces {
+                if self.provenance.is_some()
+                    || self.debug_properties
+                    || self.codemodel_backtraces
+                    || name == b"SOURCES"
+                {
                     let mut chain = vec![edge.hop(dependency)];
                     if let Some(path) = value.chains.as_ref().and_then(|chains| chains.get(owner)) {
                         chain.extend_from_slice(path);
@@ -663,7 +732,7 @@ impl<'a> UsageResolver<'a> {
         &mut self,
         target: TargetId,
         ctx: &EvalContext,
-    ) -> Result<Vec<(FileSetId, &'a FileSet)>, ResolveError> {
+    ) -> Result<Vec<SourceFileSetEntry<'a>>, ResolveError> {
         let mut ctx = context(target, ctx, UsageTraversal::Compile);
         ctx.head.get_or_insert(handle(target));
         let owners = self.walk(target, b"SOURCES", &ctx)?;
@@ -671,10 +740,24 @@ impl<'a> UsageResolver<'a> {
         Ok(owners
             .contributions
             .iter()
-            .filter_map(|(owner, _)| model.target(*owner))
-            .flat_map(|owner| owner.file_sets.iter())
-            .filter_map(|id| Some((*id, model.file_set(*id)?)))
-            .filter(|(_, set)| {
+            .filter_map(|(owner, _)| {
+                let link_bt = (*owner != target)
+                    .then(|| {
+                        owners
+                            .chains
+                            .as_ref()
+                            .and_then(|chains| chains.get(owner))
+                            .and_then(|chain| chain.first())
+                            .map(|hop| hop.link_bt.clone())
+                    })
+                    .flatten();
+                Some((model.target(*owner)?, link_bt))
+            })
+            .flat_map(|(owner, link_bt)| {
+                owner.file_sets.iter().map(move |id| (*id, link_bt.clone()))
+            })
+            .filter_map(|(id, link_bt)| Some((id, model.file_set(id)?, link_bt)))
+            .filter(|(_, set, _)| {
                 let own = set.target == target;
                 match set.kind {
                     FileSetKind::Headers => own,
@@ -691,6 +774,11 @@ impl<'a> UsageResolver<'a> {
     }
 
     /// Evaluate file set paths in the property owner and consumer contexts.
+    ///
+    /// For file-set `BASE_DIRS` and `SOURCES` entries, mirrors CMake's
+    /// `cmGeneratorFileSet::CompileFileEntries` and `EvaluateFileEntry` (two list
+    /// splits across generator-expression evaluation) without the extra list
+    /// serialization step that only target-source expansion performs.
     pub fn file_set_paths(
         &mut self,
         owner: TargetId,
@@ -699,23 +787,62 @@ impl<'a> UsageResolver<'a> {
         ctx: &EvalContext,
     ) -> Result<Vec<BT<BString>>, ResolveError> {
         let mut result = UsageValue::default();
+        let dir = self.target(owner)?.dir;
+        let is_file_set_entries = matches!(property, b"BASE_DIRS" | b"SOURCES");
         for entry in entries {
-            let dir = self.target(owner)?.dir;
-            let (value, _) = self.eval_entry(owner, dir, property, entry, ctx, false)?;
-            result
-                .entries
-                .extend(
-                    list::split(&value, list::Empty::Drop)
-                        .into_iter()
-                        .map(|value| {
-                            BT::new(
-                                self.usage_path(dir, property, value),
-                                entry.backtrace.clone(),
-                            )
-                        }),
-                );
+            if is_file_set_entries {
+                for raw in list::split(&entry.value, list::Empty::Drop) {
+                    let item = BT::new(raw, entry.backtrace.clone());
+                    let (value, _) = self.eval_entry(owner, dir, property, &item, ctx, false)?;
+                    for evaluated in list::split(&value, list::Empty::Drop) {
+                        result.entries.push(BT::new(
+                            self.usage_path(dir, property, evaluated),
+                            entry.backtrace.clone(),
+                        ));
+                    }
+                }
+            } else {
+                let (value, _) = self.eval_entry(owner, dir, property, entry, ctx, false)?;
+                result
+                    .entries
+                    .extend(
+                        list::split(&value, list::Empty::Drop)
+                            .into_iter()
+                            .map(|value| {
+                                BT::new(
+                                    self.usage_path(dir, property, value),
+                                    entry.backtrace.clone(),
+                                )
+                            }),
+                    );
+            }
         }
         Ok(result.entries)
+    }
+
+    /// Evaluate a file set's `SOURCES` entries at the target-source boundary.
+    ///
+    /// `PRIVATE`/`PUBLIC` file sets (and propagated `SOURCES` file sets) enter a
+    /// target's `SOURCES` through `FileSetPropertyEntry::Evaluate`
+    /// (`cmList::to_string` followed by target `SOURCES` list expansion).
+    /// `INTERFACE` `HEADERS` file sets are never added to `SOURCES`, so they
+    /// stay on the two-split `EvaluateFileEntry` path.
+    pub(crate) fn file_set_target_sources(
+        &mut self,
+        set: &rcmake_model::FileSet,
+        ctx: &EvalContext,
+    ) -> Result<Vec<BT<BString>>, ResolveError> {
+        let evaluated = self.file_set_paths(set.target, b"SOURCES", &set.files, ctx)?;
+        if set.kind == FileSetKind::Headers && set.scope == UsageScope::Interface {
+            return Ok(evaluated);
+        }
+        let mut out = Vec::with_capacity(evaluated.len());
+        for entry in evaluated {
+            for item in list::split(&entry.value, list::Empty::Drop) {
+                out.push(BT::new(item, entry.backtrace.clone()));
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn eval_source_compile_flags(

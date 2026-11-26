@@ -134,6 +134,27 @@ fn output_prefix(model: Option<&ProjectModel>, commands: &Commands) -> BString {
         .map_or_else(BString::default, |prefix| commands.path(prefix))
 }
 
+pub(crate) fn write_swift_output_maps(
+    graphs: &[&BuildGraph],
+    host: &dyn Host,
+    build_dir: &Path,
+) -> Result<(), GenError> {
+    for graph in graphs {
+        for (relative, contents) in &graph.swift_output_file_maps {
+            let full = build_dir.join(path::to_native(relative));
+            if let Some(parent) = full.parent() {
+                host.create_dir_all(parent)
+                    .map_err(|error| GenError::Write {
+                        path: path::from_native(parent),
+                        message: error.to_string().into(),
+                    })?;
+            }
+            write_if_changed(host, &full, contents.as_slice())?;
+        }
+    }
+    Ok(())
+}
+
 fn generate_single(
     result: &GenerationResult,
     host: &dyn Host,
@@ -159,6 +180,7 @@ fn generate_single(
     graph.set_command_settings(model, host);
     graph.set_clean_files(model, &result.metadata.clean_files)?;
     let prep = PrepTargets::new(&graph, result, model, host)?;
+    prep::warn_install_prep_components(&[&graph], model, host);
     let programs = Programs::new(result, host, build_dir, model, &commands);
     let uses_modules = modules::uses_modules(input);
     let module_flag = if uses_modules {
@@ -167,6 +189,7 @@ fn generate_single(
         BString::default()
     };
     prepare_directory(host, build_dir)?;
+    write_swift_output_maps(&[input], host, build_dir)?;
     graph.prepare_custom_scripts(host)?;
     let verify_globs = rcmake_gen_common::glob::write_verification(model, build_dir, host)?;
     let exports = model
@@ -309,7 +332,8 @@ fn write_rules(
     }
     response::emit_rules(&mut ninja);
     if !commands.windows() {
-        instrumented::emit_rules(&mut ninja, result);
+        let prefix = output_prefix(model, commands);
+        instrumented::emit_rules(&mut ninja, result, build_dir, !prefix.is_empty(), commands);
     }
     if let Some(prefix) = model
         .and_then(|model| model.definition(DirId::ROOT, b"CMAKE_CL_SHOWINCLUDES_PREFIX"))

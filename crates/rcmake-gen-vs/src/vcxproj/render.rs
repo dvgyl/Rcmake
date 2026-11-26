@@ -139,7 +139,7 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
             xml.text(
                 "IntDir",
                 &attrs,
-                &format!("{}\\", msbuild(&windows(&intermediate(project, name)))),
+                &format!("{}\\", msbuild(&windows(&config.int_dir))),
             );
             xml.text("TargetName", &attrs, &msbuild(&config.name));
             xml.text("TargetExt", &attrs, &msbuild(&config.extension));

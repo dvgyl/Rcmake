@@ -279,6 +279,22 @@ fn project_defaults(model: &ProjectModel, root: DirId, bin: &Path, config: &str)
     if config != "Debug" {
         settings.insert("SWIFT_COMPILATION_MODE".into(), "wholemodule".into());
     }
+    if model
+        .global
+        .props
+        .get(b"ENABLED_LANGUAGES")
+        .is_some_and(|langs| {
+            cmake_list::split(langs, cmake_list::Empty::Drop)
+                .iter()
+                .any(|lang| lang == b"Swift")
+        })
+    {
+        let swift_version = match model.definition(root, b"CMAKE_Swift_LANGUAGE_VERSION") {
+            Some(version) => text(version),
+            None => default_swift_version(model, root).into(),
+        };
+        settings.insert("SWIFT_VERSION".into(), swift_version.into());
+    }
     if let ParsedToolset::Xcode {
         toolset: Some(toolset),
         ..
@@ -287,6 +303,22 @@ fn project_defaults(model: &ProjectModel, root: DirId, bin: &Path, config: &str)
         settings.insert("GCC_VERSION".into(), text(toolset).into());
     }
     settings
+}
+
+fn default_swift_version(model: &ProjectModel, root: DirId) -> &'static str {
+    let Some(xcode) = model
+        .definition(root, b"XCODE_VERSION")
+        .filter(|value| !value.is_empty())
+    else {
+        return "4.0";
+    };
+    if rcmake_base::version::compare(xcode, b"10.2") != std::cmp::Ordering::Less {
+        "4.0"
+    } else if rcmake_base::version::compare(xcode, b"8.3") != std::cmp::Ordering::Less {
+        "3.0"
+    } else {
+        "2.3"
+    }
 }
 
 fn attribute(out: &mut Attrs, key: &[u8], value: &[u8], prefix: &str, config: &str) {
@@ -408,16 +440,7 @@ impl TargetSettings<'_> {
                 }
                 .into(),
             ),
-            (
-                "GCC_OPTIMIZATION_LEVEL",
-                match config {
-                    "Release" => "3",
-                    "RelWithDebInfo" => "2",
-                    "MinSizeRel" => "s",
-                    _ => "0",
-                }
-                .into(),
-            ),
+            ("GCC_OPTIMIZATION_LEVEL", "0".into()),
             (
                 "PRODUCT_NAME",
                 product

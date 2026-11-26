@@ -746,3 +746,233 @@ fn long_posix_link_or_archive(archive: bool) {
         .mtime;
     assert_eq!(before, after);
 }
+
+#[cfg(unix)]
+#[test]
+fn ninja_one_step_swift_mixed_target_has_clean_noop_second_build()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = Project::new();
+    let src = project.dir.join("src");
+    let build = project.dir.join("build");
+    project.host.create_dir_all(&src)?;
+    project.host.create_dir_all(&build)?;
+    project.host.write(
+        &src.join("main.swift"),
+        b"public func greet() {}\n",
+        WriteMode::Truncate,
+    )?;
+    project.host.write(
+        &src.join("helper.c"),
+        b"int helper(void) { return 42; }\n",
+        WriteMode::Truncate,
+    )?;
+    // Fake C compiler and one-step Swift driver that create every declared output
+    // (including objects mapped by -output-file-map).
+    let fake_cc = project.dir.join("fake-cc.sh");
+    project.host.write(
+        &fake_cc,
+        b"#!/bin/sh\nset -eu\nout=\"\"\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift 2; else shift; fi\ndone\nmkdir -p \"$(dirname \"$out\")\"\nprintf 'obj' > \"$out\"\n",
+        WriteMode::Truncate,
+    )?;
+    project.host.set_permissions(&fake_cc, 0o755)?;
+    let fake_swiftc = project.dir.join("fake-swiftc.sh");
+    project.host.write(
+        &fake_swiftc,
+        b"#!/bin/sh\nset -eu\nout=\"\"\nmod=\"\"\nmap=\"\"\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) out=\"$2\"; shift 2 ;;\n    -emit-module-path) mod=\"$2\"; shift 2 ;;\n    -output-file-map) map=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nmkdir -p \"$(dirname \"$out\")\"\nprintf 'lib' > \"$out\"\nif [ -n \"$mod\" ]; then mkdir -p \"$(dirname \"$mod\")\"; printf 'mod' > \"$mod\"; fi\nif [ -n \"$map\" ]; then\n  sed -n 's/.*\"object\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$map\" | while IFS= read -r obj; do\n    mkdir -p \"$(dirname \"$obj\")\"\n    printf 'swiftobj' > \"$obj\"\n  done\nfi\n",
+        WriteMode::Truncate,
+    )?;
+    project.host.set_permissions(&fake_swiftc, 0o755)?;
+
+    let mut model = ProjectModel::default();
+    model.generator = Some(GeneratorKind::Ninja);
+    model.set_root_dirs(path::from_native(&src), path::from_native(&build));
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "C;Swift".into());
+    let vars = &mut model.dir_mut(DirId::ROOT).vars;
+    vars.insert("CMAKE_SKIP_INSTALL_RULES".into(), "ON".into());
+    vars.insert("CMAKE_C_COMPILER".into(), path::from_native(&fake_cc));
+    vars.insert("CMAKE_C_SOURCE_FILE_EXTENSIONS".into(), "c".into());
+    vars.insert(
+        "CMAKE_C_COMPILE_OBJECT".into(),
+        "<CMAKE_C_COMPILER> -c <SOURCE> -o <OBJECT>".into(),
+    );
+    vars.insert(
+        "CMAKE_Swift_COMPILER".into(),
+        path::from_native(&fake_swiftc),
+    );
+    vars.insert("CMAKE_Swift_LINKER_PREFERENCE".into(), "50".into());
+    vars.insert("CMAKE_Swift_SOURCE_FILE_EXTENSIONS".into(), "swift".into());
+    vars.insert("CMAKE_Swift_COMPILE_OBJECT".into(), ":".into());
+    vars.insert(
+        "CMAKE_Swift_CREATE_SHARED_LIBRARY".into(),
+        "<CMAKE_Swift_COMPILER> -emit-library -o <TARGET> -emit-module-path <SWIFT_MODULE> <FLAGS> <SWIFT_SOURCES>".into(),
+    );
+    let mut lib = Target::new(
+        "mixed".into(),
+        TargetKind::SharedLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    lib.sources
+        .push(BT::new("main.swift".into(), Default::default()));
+    lib.sources
+        .push(BT::new("helper.c".into(), Default::default()));
+    model.add_target(lib)?;
+
+    let result = resolve(&model, &project.host, &[])?;
+    rcmake_gen_ninja::generate_single_config_with_model(&result, &project.host, &build, &model)?;
+    project
+        .host
+        .write(&build.join("cmake_install.cmake"), b"", WriteMode::Truncate)?;
+    let build_ninja = String::from_utf8(project.host.read(
+        &build.join("build.ninja"),
+        rcmake_host::ReadRange::All { limit: 1 << 20 },
+    )?)?;
+    assert!(
+        !build_ninja.contains(": COMPILE ") || !build_ninja.contains("main.swift.o: COMPILE"),
+        "{build_ninja}"
+    );
+    assert!(
+        project
+            .host
+            .metadata(
+                &build.join("CMakeFiles/mixed.dir/output-file-map.json"),
+                Follow::No
+            )
+            .is_ok()
+    );
+
+    project.run(&build, "ninja", &["-j", "1"]);
+    assert!(
+        project
+            .host
+            .metadata(&build.join("CMakeFiles/mixed.dir/main.swift.o"), Follow::No)
+            .is_ok()
+    );
+    assert!(
+        project
+            .host
+            .metadata(&build.join("mixed.swiftmodule"), Follow::No)
+            .is_ok()
+    );
+    assert_eq!(
+        project.run(&build, "ninja", &["-j", "1"]).stdout,
+        b"ninja: no work to do.\n"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn ninja_one_step_swift_exported_executable_uses_export_rule_and_is_noop_on_second_build()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = Project::new();
+    let src = project.dir.join("src");
+    let build = project.dir.join("build");
+    project.host.create_dir_all(&src)?;
+    project.host.create_dir_all(&build)?;
+    project.host.write(
+        &src.join("main.swift"),
+        b"public func entry() {}\n",
+        WriteMode::Truncate,
+    )?;
+    let fake_swiftc = project.dir.join("fake-swiftc.sh");
+    project.host.write(
+        &fake_swiftc,
+        b"#!/bin/sh\nset -eu\nout=\"\"\nmod=\"\"\nmap=\"\"\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) out=\"$2\"; shift 2 ;;\n    -emit-module-path) mod=\"$2\"; shift 2 ;;\n    -output-file-map) map=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nmkdir -p \"$(dirname \"$out\")\"\nprintf 'exe' > \"$out\"\nif [ -n \"$mod\" ]; then mkdir -p \"$(dirname \"$mod\")\"; printf 'mod' > \"$mod\"; fi\nif [ -n \"$map\" ]; then\n  sed -n 's/.*\"object\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$map\" | while IFS= read -r obj; do\n    mkdir -p \"$(dirname \"$obj\")\"\n    printf 'swiftobj' > \"$obj\"\n  done\nfi\n",
+        WriteMode::Truncate,
+    )?;
+    project.host.set_permissions(&fake_swiftc, 0o755)?;
+
+    let mut model = ProjectModel::default();
+    model.generator = Some(GeneratorKind::Ninja);
+    model.set_root_dirs(path::from_native(&src), path::from_native(&build));
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "Swift".into());
+    let vars = &mut model.dir_mut(DirId::ROOT).vars;
+    vars.insert("CMAKE_SKIP_INSTALL_RULES".into(), "ON".into());
+    vars.insert(
+        "CMAKE_Swift_COMPILER".into(),
+        path::from_native(&fake_swiftc),
+    );
+    vars.insert("CMAKE_Swift_SOURCE_FILE_EXTENSIONS".into(), "swift".into());
+    vars.insert("CMAKE_Swift_COMPILE_OBJECT".into(), ":".into());
+    vars.insert(
+        "CMAKE_Swift_LINK_EXECUTABLE".into(),
+        "<CMAKE_Swift_COMPILER> -emit-executable -o <TARGET> <FLAGS> <SWIFT_SOURCES>".into(),
+    );
+    vars.insert(
+        "CMAKE_Swift_LINK_EXECUTABLE_WITH_EXPORTS".into(),
+        "<CMAKE_Swift_COMPILER> -emit-executable -o <TARGET> <FLAGS> <SWIFT_SOURCES> -emit-module -emit-module-path <SWIFT_MODULE>".into(),
+    );
+    let mut exported = Target::new(
+        "exported_app".into(),
+        TargetKind::Executable,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    exported.props.set("ENABLE_EXPORTS".into(), "ON".into());
+    exported
+        .sources
+        .push(BT::new("main.swift".into(), Default::default()));
+    model.add_target(exported)?;
+
+    let mut plain = Target::new(
+        "plain_app".into(),
+        TargetKind::Executable,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    plain
+        .sources
+        .push(BT::new("main.swift".into(), Default::default()));
+    model.add_target(plain)?;
+
+    let result = resolve(&model, &project.host, &[])?;
+    rcmake_gen_ninja::generate_single_config_with_model(&result, &project.host, &build, &model)?;
+    project
+        .host
+        .write(&build.join("cmake_install.cmake"), b"", WriteMode::Truncate)?;
+
+    let build_ninja = String::from_utf8(project.host.read(
+        &build.join("build.ninja"),
+        rcmake_host::ReadRange::All { limit: 1 << 20 },
+    )?)?;
+    assert!(
+        build_ninja.contains("exported_app.swiftmodule"),
+        "{build_ninja}"
+    );
+    assert!(
+        !build_ninja.contains("plain_app.swiftmodule"),
+        "{build_ninja}"
+    );
+
+    project.run(&build, "ninja", &["-j", "1"]);
+    assert!(
+        project
+            .host
+            .metadata(&build.join("exported_app.swiftmodule"), Follow::No)
+            .is_ok()
+    );
+    assert!(
+        project
+            .host
+            .metadata(&build.join("plain_app.swiftmodule"), Follow::No)
+            .is_err()
+    );
+    assert_eq!(
+        project.run(&build, "ninja", &["-j", "1"]).stdout,
+        b"ninja: no work to do.\n"
+    );
+    Ok(())
+}

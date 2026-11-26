@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use rcmake_base::BString;
 use rcmake_gen_common::{GenError, export::ModuleExportJob};
 use rcmake_resolve::{BuildStep, DependInfo, progress};
@@ -6,7 +8,7 @@ use super::{Graph, StepNodes, is_library_symlink};
 use crate::response::{COMPILE_MSVC, Response};
 
 pub(super) struct EdgePlan {
-    pub(super) rule: &'static [u8],
+    pub(super) rule: Cow<'static, [u8]>,
     pub(super) inputs: Vec<BString>,
     pub(super) implicit_inputs: Vec<BString>,
     pub(super) order_only: Vec<BString>,
@@ -16,9 +18,13 @@ pub(super) struct EdgePlan {
 }
 
 impl EdgePlan {
-    fn new(rule: &'static [u8], inputs: Vec<BString>, nodes: &StepNodes<'_>) -> Self {
+    fn new(
+        rule: impl Into<Cow<'static, [u8]>>,
+        inputs: Vec<BString>,
+        nodes: &StepNodes<'_>,
+    ) -> Self {
         Self {
-            rule,
+            rule: rule.into(),
             inputs,
             implicit_inputs: Vec::new(),
             order_only: Vec::new(),
@@ -30,7 +36,7 @@ impl EdgePlan {
 
     pub(super) fn bind_command(&mut self, command: Vec<u8>, response: Option<Response>) {
         if let Some(response) = response {
-            self.rule = response.rule;
+            self.rule = Cow::Borrowed(response.rule);
             self.bind(b"COMMAND", response.command);
             self.bind(b"RSP_FILE", response.file);
             self.bind(b"RSP_ARGS", response.contents);
@@ -67,16 +73,38 @@ impl<'a> Graph<'a> {
                 let scan = self.resource_dependency_scan(object, source, invocation);
                 let msvc = scan.is_some() || self.msvc_deps(object, invocation);
                 let scanned = dyndep.is_some() || modmap.is_some();
-                let (rule, command) = if msvc {
-                    (COMPILE_MSVC, None)
+                let mut launched = None;
+                let (rule, command): (Cow<'static, [u8]>, Option<Vec<u8>>) = if msvc {
+                    (Cow::Borrowed(COMPILE_MSVC), None)
                 } else if self.commands.windows() {
                     (
-                        crate::instrumented::ordinary_rule(scanned, depfile.is_some()),
+                        Cow::Borrowed(crate::instrumented::ordinary_rule(
+                            scanned,
+                            depfile.is_some(),
+                        )),
                         None,
                     )
                 } else {
-                    crate::instrumented::compile(invocation, scanned, depfile.is_some())
+                    let (rule, command) =
+                        crate::instrumented::compile(invocation, scanned, depfile.is_some());
+                    if command.is_some() {
+                        (Cow::Borrowed(rule), command)
+                    } else if let Some(info) = crate::instrumented::launched(
+                        invocation,
+                        self.input.compile_launchers.get(object.as_slice()),
+                        &self.launcher_slots,
+                        scanned,
+                        depfile.is_some(),
+                    ) {
+                        let rule = info.rule.clone();
+                        let cmd = info.command.clone();
+                        launched = Some(info);
+                        (rule, Some(cmd))
+                    } else {
+                        (Cow::Borrowed(rule), None)
+                    }
                 };
+                let response_rule_name = rule.clone();
                 let mut plan = EdgePlan::new(
                     rule,
                     vec![self.node(compile_input.as_ref().unwrap_or(source))],
@@ -99,9 +127,22 @@ impl<'a> Graph<'a> {
                             self.command_line(std::slice::from_ref(invocation), false)
                         }
                     },
-                    |command| self.in_build_dir(&command).into(),
+                    |command| {
+                        if launched.is_some() {
+                            command
+                        } else {
+                            self.in_build_dir(&command).into()
+                        }
+                    },
                 );
-                let response = self.compile_response(rule, object, invocation, &command);
+                if let Some(info) = launched {
+                    plan.bind(b"LAUNCH_ARGS", info.launch_args);
+                    if let Some(launcher) = info.launcher {
+                        plan.bind(b"LAUNCHER", launcher);
+                    }
+                }
+                let response =
+                    self.compile_response(&response_rule_name, object, invocation, &command);
                 plan.bind_command(command, response);
                 if let Some(output) = nodes.outputs.first() {
                     plan.bind(

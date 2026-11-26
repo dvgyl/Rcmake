@@ -611,6 +611,54 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         Some(configurations)
     }
 
+    fn imported_config_matches_ctx(
+        &mut self,
+        target: TargetHandle,
+        ctx: &EvalContext,
+    ) -> Option<Vec<BString>> {
+        let model = self.resolver.model;
+        let target_id = self.id(target)?;
+        let imported = model.target(target_id)?;
+        if !imported.is_imported() {
+            return None;
+        }
+        let cps = super::artifacts::imported_from_cps(imported);
+        if let Some(paths) = self.resolver.source_paths() {
+            super::artifacts::warn_cmp0200(model, paths, imported, &ctx.config);
+            if !cps
+                && let Some(head_id) = ctx.head.and_then(|h| self.id(h))
+                && let Some(head_target) = model.target(head_id)
+            {
+                let policy = PolicyId::new(199);
+                if head_target.policies.policies.get(policy) == PolicyStatus::Warn
+                    && model
+                        .definition(head_target.dir, b"CMAKE_POLICY_WARNING_CMP0199")
+                        .is_some_and(|value| truth::is_on(value))
+                {
+                    let body = format!(
+                        "{}\nEvaluation of $<CONFIG> for imported target \"{}\", used by \"{}\", may match multiple configurations.",
+                        policy.warning_text(),
+                        imported.name,
+                        head_target.name
+                    );
+                    let site = self
+                        .resolver
+                        .current_link_bt
+                        .clone()
+                        .unwrap_or_else(|| ctx.site.backtrace.clone());
+                    paths.warn_once(
+                        model,
+                        MessageKind::AuthorWarning,
+                        Some(policy),
+                        Location::Backtrace(site),
+                        body.into(),
+                    );
+                }
+            }
+        }
+        self.imported_config_matches(target, ctx.head, &ctx.config)
+    }
+
     fn warning(&mut self, body: BString, ctx: &EvalContext) {
         let Some(paths) = self.resolver.source_paths() else {
             return;

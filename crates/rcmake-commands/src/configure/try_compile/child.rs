@@ -22,6 +22,7 @@ pub(super) struct ChildConfig {
     generator: Option<GeneratorKind>,
     generator_spec: GeneratorSpec,
     enabled_languages: BString,
+    explicit_config: Option<BString>,
     depth: u32,
     trace: Option<TraceConfig>,
     profile: Option<Arc<CommandProfiler>>,
@@ -54,6 +55,7 @@ impl ChildConfig {
             generator: project.generator,
             generator_spec: project.generator_spec.clone(),
             enabled_languages: seed.enabled_languages,
+            explicit_config: seed.explicit_config,
             depth,
             trace,
             profile,
@@ -189,6 +191,7 @@ impl ChildConfig {
             build_child(
                 &mut child.cx(),
                 &dirs.binary,
+                self.explicit_config.as_ref(),
                 target,
                 source_signature,
                 generator_facts,

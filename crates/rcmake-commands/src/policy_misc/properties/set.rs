@@ -1,5 +1,5 @@
 use rcmake_base::{BString, list, truth};
-use rcmake_diag::{Effect, MessageKind};
+use rcmake_diag::{Backtrace, Effect, Frame, FrameKind, MessageKind};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{AppendMode, CacheType, ModelError, PropOrigin, PropScope, TargetId};
@@ -320,7 +320,7 @@ pub(super) fn update_scoped(
     } else {
         value
     };
-    let backtrace = cx.backtrace();
+    let backtrace = property_backtrace(cx, scope);
     let origin = PropOrigin {
         dir: cx.current_dir_id(),
         backtrace: &backtrace,
@@ -354,6 +354,41 @@ pub(super) fn update_scoped(
         )),
         Err(other) => Err(CmdError::status(other.to_string())),
     }
+}
+
+fn property_backtrace(cx: &mut Cx<'_>, scope: &PropScope) -> Backtrace {
+    let current = cx.current_dir_id();
+    let owner = {
+        let project = cx.project();
+        match scope {
+            PropScope::Source { dir, .. } => Some(*dir),
+            PropScope::FileSet(id) => project
+                .file_set(*id)
+                .and_then(|set| project.target(set.target))
+                .map(|target| target.dir),
+            _ => None,
+        }
+    };
+    let Some(owner) = owner.filter(|&dir| dir != current) else {
+        return cx.backtrace();
+    };
+    let project = cx.project();
+    let mut cursor = current;
+    while let Some(parent) = project.dir(cursor).parent {
+        if parent == owner {
+            return project.dir(cursor).backtrace.clone();
+        }
+        cursor = parent;
+    }
+    let file = rcmake_host::path::from_native_cmake(
+        &rcmake_host::path::to_native(&project.dir(owner).source_dir).join("CMakeLists.txt"),
+    );
+    Backtrace::default().push(Frame {
+        file: file.as_slice().into(),
+        line: 0,
+        name: None,
+        kind: FrameKind::Command,
+    })
 }
 
 fn set_cache(

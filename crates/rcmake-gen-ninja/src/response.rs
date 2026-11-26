@@ -138,7 +138,7 @@ impl<'a> Graph<'a> {
 
     pub(super) fn compile_response(
         &self,
-        rule: &'static [u8],
+        rule: &[u8],
         object: &BString,
         invocation: &Invocation,
         ordinary: &[u8],

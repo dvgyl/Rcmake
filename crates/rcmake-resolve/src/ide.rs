@@ -268,8 +268,15 @@ pub(crate) fn object_directory(
             absolute_path(&config, &[b"Objects-normal/", arch].concat())
         }
         IdeFlavor::VisualStudio => {
-            let dir = absolute_path(binary, &[target.name.as_slice(), b".dir"].concat());
-            absolute_path(&dir, &config.0)
+            if lower::short_object_paths(model) {
+                let root = &model.dir(DirId::ROOT).binary_dir;
+                let support =
+                    absolute_path(root, &lower::artifacts::short_support_dir(model, target));
+                absolute_path(&support, &config.0)
+            } else {
+                let dir = absolute_path(binary, &[target.name.as_slice(), b".dir"].concat());
+                absolute_path(&dir, &config.0)
+            }
         }
     }
 }

@@ -1274,3 +1274,112 @@ fn policy_version_warns_for_old_defaults_in_order() -> TestResult {
     assert_var(&mut interp, "actual", Some("OLD"));
     Ok(())
 }
+
+#[test]
+fn scoped_source_writes_and_file_set_visibility_guards() -> TestResult {
+    let (host, mut interp) = context(RunMode::Configure);
+    host.seed_file(Path::new("/work/src/root.c"), b"")?;
+    host.seed_file(Path::new("/work/src/sub/child.c"), b"")?;
+    host.seed_file(
+        Path::new("/work/src/sub/CMakeLists.txt"),
+        br#"
+set_property(SOURCE /work/src/root.c DIRECTORY .. PROPERTY COMPILE_OPTIONS -DANCESTOR)
+set_property(SOURCE child.c PROPERTY COMPILE_OPTIONS -DLOCAL)
+"#,
+    )?;
+    configure(
+        &host,
+        &mut interp,
+        r#"
+project(P NONE)
+add_subdirectory(sub)
+set_property(SOURCE /work/src/sub/child.c DIRECTORY sub APPEND PROPERTY COMPILE_OPTIONS -DCOMPLETED)
+add_library(priv_lib STATIC root.c)
+target_sources(priv_lib PRIVATE FILE_SET pset TYPE SOURCES FILES root.c)
+add_library(iface_lib INTERFACE)
+target_sources(iface_lib INTERFACE FILE_SET iset TYPE SOURCES FILES root.c)
+"#,
+        0,
+    )?;
+
+    let root_entries = interp
+        .cx()
+        .project()
+        .dir(rcmake_model::DirId::ROOT)
+        .source_props
+        .get(b"/work/src/root.c".as_slice())
+        .ok_or("missing root.c")?
+        .tracked_entries(b"COMPILE_OPTIONS")
+        .ok_or("missing root tracked entries")?
+        .to_vec();
+    assert_eq!(root_entries.len(), 1);
+    let ancestor_frame = root_entries
+        .first()
+        .and_then(|entry| entry.backtrace.top())
+        .ok_or("missing ancestor frame")?;
+    assert_eq!(
+        ancestor_frame.name.as_deref(),
+        Some(b"add_subdirectory".as_slice())
+    );
+    assert_eq!(ancestor_frame.line, 3);
+
+    let sub_dir = interp
+        .cx()
+        .project()
+        .dirs()
+        .find(|(_, dir)| dir.source_dir.as_slice() == b"/work/src/sub")
+        .map(|(id, _)| id)
+        .ok_or("missing sub dir")?;
+    let child_entries = interp
+        .cx()
+        .project()
+        .dir(sub_dir)
+        .source_props
+        .get(b"/work/src/sub/child.c".as_slice())
+        .ok_or("missing child.c")?
+        .tracked_entries(b"COMPILE_OPTIONS")
+        .ok_or("missing child tracked entries")?
+        .to_vec();
+    assert_eq!(child_entries.len(), 2);
+    let local_frame = child_entries
+        .first()
+        .and_then(|entry| entry.backtrace.top())
+        .ok_or("missing local frame")?;
+    assert_eq!(
+        local_frame.name.as_deref(),
+        Some(b"set_property".as_slice())
+    );
+    assert_eq!(local_frame.line, 3);
+    let completed_frame = child_entries
+        .get(1)
+        .and_then(|entry| entry.backtrace.top())
+        .ok_or("missing completed frame")?;
+    assert_eq!(
+        completed_frame.file.as_ref(),
+        b"/work/src/sub/CMakeLists.txt"
+    );
+    assert_eq!(completed_frame.line, 0);
+    assert!(completed_frame.name.is_none());
+
+    let (host, mut interp) = context(RunMode::Configure);
+    host.seed_file(Path::new("/work/src/root.c"), b"")?;
+    configure(
+        &host,
+        &mut interp,
+        r#"
+        project(P NONE)
+        add_library(a STATIC root.c)
+        target_sources(a PRIVATE FILE_SET p TYPE SOURCES FILES root.c)
+        set_property(FILE_SET p TARGET a PROPERTY INTERFACE_COMPILE_OPTIONS -Wall)
+        get_property(p_iface FILE_SET p TARGET a PROPERTY INTERFACE_COMPILE_OPTIONS SET)
+        add_library(b INTERFACE)
+        target_sources(b INTERFACE FILE_SET i TYPE SOURCES FILES root.c)
+        set_property(FILE_SET i TARGET b PROPERTY INCLUDE_DIRECTORIES /inc)
+        get_property(i_priv FILE_SET i TARGET b PROPERTY INCLUDE_DIRECTORIES SET)
+        "#,
+        0,
+    )?;
+    assert_var(&mut interp, "p_iface", Some("0"));
+    assert_var(&mut interp, "i_priv", Some("0"));
+    Ok(())
+}

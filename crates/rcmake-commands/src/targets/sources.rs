@@ -87,10 +87,27 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 if scope != UsageScope::Interface {
                     let direct = value(different_dir);
                     if !direct.is_empty() {
-                        target.sources.push(BT::new(direct, bt.clone()));
+                        target.sources.push(BT::new(direct.clone(), bt.clone()));
+                        let target_dir_id = target.dir;
+                        for item in list::split(&direct, list::Empty::Drop) {
+                            if !item.windows(2).any(|w| w == b"$<")
+                                && Lexical::new(&item).absolute()
+                            {
+                                let normalized = Lexical::new(&item).normalize();
+                                cx.project()
+                                    .dir_mut(target_dir_id)
+                                    .source_props
+                                    .entry(normalized)
+                                    .or_default();
+                            }
+                        }
                     }
                 }
                 if scope != UsageScope::Private {
+                    let target = cx
+                        .project()
+                        .target_mut(id)
+                        .ok_or_else(|| model_error(ModelError::UnknownObject))?;
                     let interface = value(true);
                     if !interface.is_empty() {
                         target

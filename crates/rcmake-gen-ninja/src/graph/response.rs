@@ -17,9 +17,9 @@ impl LinkCommand {
         plan.bind(b"COMMAND", self.command.clone());
         plan.implicit_inputs.extend(self.files.iter().cloned());
         if let Some((file, contents)) = &self.native_response
-            && let Some(rule) = response_rule(plan.rule)
+            && let Some(rule) = response_rule(&plan.rule)
         {
-            plan.rule = rule;
+            plan.rule = std::borrow::Cow::Borrowed(rule);
             plan.bind(b"RSP_FILE", file.clone());
             plan.bind(b"RSP_ARGS", contents.clone());
         }

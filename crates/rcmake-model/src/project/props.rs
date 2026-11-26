@@ -120,7 +120,11 @@ impl ProjectModel {
                     .source_props
                     .entry(path.clone())
                     .or_default();
-                set_map(props, name, value);
+                if is_tracked_source_prop(name) {
+                    set_tracked_map(props, name, value, origin.backtrace);
+                } else {
+                    set_map(props, name, value);
+                }
                 Ok(())
             }
             PropScope::Test { dir, name: test } => {
@@ -137,7 +141,11 @@ impl ProjectModel {
             }
             PropScope::FileSet(id) => {
                 let file_set = self.file_set_mut(*id).ok_or(ModelError::UnknownObject)?;
-                set_map(&mut file_set.props, name, value);
+                if is_tracked_file_set_prop(name) {
+                    set_tracked_map(&mut file_set.props, name, value, origin.backtrace);
+                } else {
+                    set_map(&mut file_set.props, name, value);
+                }
                 Ok(())
             }
             PropScope::Install { file } => {
@@ -196,6 +204,26 @@ impl ProjectModel {
                 return Ok(());
             }
         }
+        match scope {
+            PropScope::Source { dir, path } if is_tracked_source_prop(name) => {
+                self.dir_mut(*dir)
+                    .source_props
+                    .entry(path.clone())
+                    .or_default()
+                    .append_tracked(name.into(), value, origin.backtrace.clone());
+                self.record_prop(scope, name, crate::PropOp::Append(mode), previous, origin);
+                return Ok(());
+            }
+            PropScope::FileSet(id) if is_tracked_file_set_prop(name) => {
+                let file_set = self.file_set_mut(*id).ok_or(ModelError::UnknownObject)?;
+                file_set
+                    .props
+                    .append_tracked(name.into(), value, origin.backtrace.clone());
+                self.record_prop(scope, name, crate::PropOp::Append(mode), previous, origin);
+                return Ok(());
+            }
+            _ => {}
+        }
         if (target_sources || mode == AppendMode::List)
             && self.append_entry(scope, name, value, origin)?
         {
@@ -249,6 +277,35 @@ impl ProjectModel {
             _ => return Ok(false),
         }
         Ok(true)
+    }
+}
+
+fn is_tracked_source_prop(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"COMPILE_OPTIONS" | b"COMPILE_DEFINITIONS" | b"INCLUDE_DIRECTORIES"
+    )
+}
+
+fn is_tracked_file_set_prop(name: &[u8]) -> bool {
+    is_tracked_source_prop(name)
+        || matches!(
+            name,
+            b"INTERFACE_COMPILE_OPTIONS"
+                | b"INTERFACE_COMPILE_DEFINITIONS"
+                | b"INTERFACE_INCLUDE_DIRECTORIES"
+        )
+}
+
+fn set_tracked_map(
+    props: &mut crate::PropertyMap,
+    name: &[u8],
+    value: Option<BString>,
+    bt: &Backtrace,
+) {
+    match value {
+        Some(value) => props.set_tracked(name.into(), value, bt.clone()),
+        None => props.unset(name),
     }
 }
 

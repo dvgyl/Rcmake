@@ -162,28 +162,10 @@ impl rcmake_resolve::GeneratorFacts for ProbeGeneratorFacts {
     }
 }
 
-fn native_ninja(host: &dyn Host, path: &Path) -> bool {
-    if !path.file_stem().is_some_and(|name| name == "ninja") {
-        return false;
-    }
-    host.read(
-        path,
-        ReadRange::Slice {
-            offset: 0,
-            len: Some(4),
-        },
-    )
-    .is_ok_and(|bytes| {
-        matches!(
-            bytes.as_slice(),
-            b"\x7fELF"
-                | [b'M', b'Z', ..]
-                | b"\xcf\xfa\xed\xfe"
-                | b"\xfe\xed\xfa\xcf"
-                | b"\xca\xfe\xba\xbe"
-                | b"\xca\xfe\xba\xbf"
-        )
-    })
+pub(in crate::configure) use compiler::admit_environment;
+
+pub(super) fn native_ninja(host: &dyn Host, path: &Path) -> bool {
+    crate::configure::build_tool_facts::is_native_ninja(host, path)
 }
 
 pub(super) struct PreparedProbe {

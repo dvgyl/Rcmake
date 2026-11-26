@@ -8,6 +8,7 @@ use rcmake_eval::Cx;
 use rcmake_host::{FileKind, Follow, Host, ProcessResult, ReadRange, RunOutput, RunRequest, path};
 use rcmake_store::{Digest, InputStamp, Trace, TraceMemo, VerifyOutcome};
 
+use crate::configure::build_tool_facts::{BuildToolFacts, VerifiedNinja};
 use crate::configure::platform_queries::{PlatformQueries, RecordedQueries};
 
 use super::super::journal::{DependencyClosure, ProcessVerifier, SearchObservation, depfile};
@@ -42,6 +43,55 @@ pub(super) fn admit_source(name: &[u8], source: &[u8]) -> bool {
         && source_hazards(source)
 }
 
+enum NinjaEvidence {
+    /// Non-Ninja generator: no Ninja version verification applies.
+    NotRequired,
+    /// `CMAKE_MAKE_PROGRAM` verified as a certified native Ninja >= 1.3 binary
+    /// under an admitted environment, eligible for probe caching and replay.
+    Certified(VerifiedNinja),
+    /// Uncertified (for example a script wrapper or non-admitted environment) or
+    /// invalid Ninja: bypass probe cache lookup and speculation, falling back to
+    /// live child execution.
+    Uncertified,
+}
+
+/// Verify the active Ninja executable and return replayable evidence only when it is a
+/// certified native binary under an admitted environment. Uncertified wrappers decline
+/// probe-cache lookup and speculation so the child executes live in its own directory.
+fn ninja_snapshot(host: &dyn Host, cx: &mut Cx<'_>, memo: &TraceMemo) -> NinjaEvidence {
+    if !matches!(
+        cx.project().generator,
+        Some(rcmake_model::GeneratorKind::Ninja | rcmake_model::GeneratorKind::NinjaMultiConfig)
+    ) {
+        return NinjaEvidence::NotRequired;
+    }
+    let program = path::to_native(&cx.var_or_empty(b"CMAKE_MAKE_PROGRAM"));
+    if !program.is_absolute() {
+        return NinjaEvidence::Uncertified;
+    }
+    let env = host.env_all();
+    let native = admit_environment(&env)
+        && host
+            .canonicalize(&program)
+            .ok()
+            .is_some_and(|canonical| super::native_ninja(host, &canonical));
+    if !native {
+        return NinjaEvidence::Uncertified;
+    }
+    let Ok(digest) = memo.file_digest(host, &program) else {
+        return NinjaEvidence::Uncertified;
+    };
+    let verified = if let Some(facts) = cx.session_data::<Arc<BuildToolFacts>>() {
+        facts.sample_ninja(host, &program, digest, env, cx.current_binary_dir())
+    } else {
+        BuildToolFacts::default().sample_ninja(host, &program, digest, env, cx.current_binary_dir())
+    };
+    match verified {
+        Some(verified) => NinjaEvidence::Certified(verified),
+        None => NinjaEvidence::Uncertified,
+    }
+}
+
 /// Copy the platform queries that a try-compile child can reuse.
 fn platform_snapshot(host: &dyn Host, cx: &Cx<'_>) -> RecordedQueries {
     let mut environment = host.env_all();
@@ -54,7 +104,7 @@ fn platform_snapshot(host: &dyn Host, cx: &Cx<'_>) -> RecordedQueries {
         .unwrap_or_default()
 }
 
-pub(super) fn admit_environment(environment: &[(BString, BString)]) -> bool {
+pub(in crate::configure) fn admit_environment(environment: &[(BString, BString)]) -> bool {
     !environment.iter().any(|(name, value)| {
         let name = name.to_ascii_uppercase();
         !value.is_empty()
@@ -175,12 +225,13 @@ pub(super) struct CompilerEvidence {
     cxx: bool,
     external_source: Option<(PathBuf, Digest)>,
     platform: RecordedQueries,
+    ninja: Option<VerifiedNinja>,
 }
 
 impl CompilerEvidence {
     pub(super) fn new(
         host: Arc<dyn Host>,
-        cx: &Cx<'_>,
+        cx: &mut Cx<'_>,
         session: &SessionEvidence,
         name: &[u8],
         memo: &Arc<TraceMemo>,
@@ -255,6 +306,11 @@ impl CompilerEvidence {
             }
         }
         let platform = platform_snapshot(host.as_ref(), cx);
+        let ninja = match ninja_snapshot(host.as_ref(), cx, memo) {
+            NinjaEvidence::NotRequired => None,
+            NinjaEvidence::Certified(verified) => Some(verified),
+            NinjaEvidence::Uncertified => return None,
+        };
         Some(Self {
             host,
             program,
@@ -265,6 +321,7 @@ impl CompilerEvidence {
             cxx,
             external_source,
             platform,
+            ninja,
         })
     }
 
@@ -494,7 +551,16 @@ fn msvc_environment_args(request: &RunRequest, args: &[BString]) -> Option<Vec<B
 
 impl ProcessVerifier for CompilerEvidence {
     fn recorded_platform_query(&self, request: &RunRequest) -> Option<RunOutput> {
-        self.platform.get(self.host.as_ref(), request)
+        if let Some(output) = self.platform.get(self.host.as_ref(), request) {
+            return Some(output);
+        }
+        if let Some(ninja) = &self.ninja
+            && admit_environment(&request.env)
+            && ninja.matches(request)
+        {
+            return Some(ninja.output.clone());
+        }
+        None
     }
 
     fn instrument(&self, request: &mut RunRequest) {

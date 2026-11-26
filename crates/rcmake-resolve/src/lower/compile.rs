@@ -21,6 +21,14 @@ use crate::{
     ArtifactSet, BuildStep, CompileGroup, CompileUnit, ResolveError, usage::UsageResolver,
 };
 
+/// Return whether `target` uses CMake's bundled one-step Swift compilation mode
+/// (`CMAKE_Swift_COMPILE_OBJECT` set to `:`), where Swift sources are compiled directly
+/// by the link step rather than through per-source compile commands.
+pub(super) fn is_one_step_swift(model: &ProjectModel, target: &Target) -> bool {
+    definition(model, target.dir, b"CMAKE_Swift_COMPILE_OBJECT")
+        .is_some_and(|value| value.trim_ascii() == b":")
+}
+
 pub(crate) fn language_flags(
     model: &ProjectModel,
     target: &Target,
@@ -301,6 +309,83 @@ fn linked_framework_includes(
     }))
 }
 
+pub(super) fn formatted_defines(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    group: &CompileGroup,
+) -> BString {
+    let boundary = group.source_define_start.unwrap_or(group.defines.len());
+    let (target_defines, source_defines) = group
+        .defines
+        .split_at_checked(boundary)
+        .unwrap_or((&group.defines, &[]));
+    let defines = [target_defines, source_defines]
+        .into_iter()
+        .flat_map(|definitions| {
+            let mut definitions: Vec<_> = definitions
+                .iter()
+                .map(|define| define.value.as_slice())
+                .collect();
+            definitions.sort_unstable();
+            definitions.dedup();
+            definitions
+        });
+    let intdir = (model.generator == Some(GeneratorKind::NinjaMultiConfig)).then(|| {
+        let value = [b"CMAKE_INTDIR=\"".as_slice(), &config.0, b"\""].concat();
+        compile_argument(model, target, b"-D", &value)
+    });
+    join_words(
+        intdir
+            .into_iter()
+            .chain(defines.map(|define| compile_argument(model, target, b"-D", define))),
+    )
+}
+
+pub(super) fn formatted_includes(
+    model: &ProjectModel,
+    target: &Target,
+    group: &CompileGroup,
+    extra_framework_dirs: &[(BString, bool)],
+) -> BString {
+    join_words([
+        includes(model, target, group),
+        linked_framework_includes(model, target, group, extra_framework_dirs),
+    ])
+}
+
+pub(super) fn swift_compile_flags(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    group: &CompileGroup,
+    required_standard: Option<&[u8]>,
+    position_independent: Option<bool>,
+    usage: &mut UsageResolver<'_>,
+) -> Result<Vec<BString>, ResolveError> {
+    let mut flags = compile_flags(
+        model,
+        target,
+        config,
+        group,
+        required_standard,
+        position_independent,
+        (None, Some(usage)),
+    )?;
+    flags.extend(
+        group
+            .flags
+            .iter()
+            .filter(|flag| !flag.value.is_empty())
+            .map(|flag| {
+                flag.value
+                    .strip_prefix(b"SHELL:")
+                    .map_or_else(|| quote(&flag.value), BString::from)
+            }),
+    );
+    Ok(flags)
+}
+
 pub(super) fn compile_arguments(
     model: &ProjectModel,
     target: &Target,
@@ -442,7 +527,7 @@ pub(super) fn compile(
     group: &CompileGroup,
     settings: Settings<'_>,
     usage: &mut UsageResolver<'_>,
-) -> Result<BuildStep, ResolveError> {
+) -> Result<(BuildStep, Option<BString>), ResolveError> {
     let language = group.language.as_slice();
     let source = join(&model.dir(target.dir).source_dir, &unit.source.value);
     let (mut flags, defines, includes) = compile_arguments_for_arch(
@@ -579,8 +664,9 @@ pub(super) fn compile(
         source: Some(&source),
         language: &group.language,
     };
+    let mut launcher_prefix = None;
     if let Some(invocation) = invocations.first_mut() {
-        *invocation = lint::launch(
+        let (launched, prefix) = lint::launch(
             model,
             target,
             &launch,
@@ -588,6 +674,8 @@ pub(super) fn compile(
             settings.skip_file_set_linting,
             usage,
         )?;
+        *invocation = launched;
+        launcher_prefix = prefix;
     }
     if let Some(prefix) = lint::rule_launcher(model, target, &launch, usage)? {
         let prefix = expand_rule(&prefix, lookup_paths);
@@ -626,16 +714,19 @@ pub(super) fn compile(
         }
         _ => Vec::new(),
     };
-    Ok(BuildStep::Compile {
-        byproducts,
-        compile_input: None,
-        object,
-        source,
-        invocation,
-        depfile: writes_depfile.then_some(depfile),
-        modmap,
-        dyndep: None,
-    })
+    Ok((
+        BuildStep::Compile {
+            byproducts,
+            compile_input: None,
+            object,
+            source,
+            invocation,
+            depfile: writes_depfile.then_some(depfile),
+            modmap,
+            dyndep: None,
+        },
+        launcher_prefix,
+    ))
 }
 
 fn has_placeholder(text: &[u8], key: &[u8]) -> bool {

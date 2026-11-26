@@ -203,7 +203,8 @@ pub(crate) fn resolve_target<'a>(
         let module = member.filter(|member| member.set.kind == FileSetKind::CxxModules);
         let header_only = source_props
             .get(b"HEADER_FILE_ONLY")
-            .is_some_and(|value| truth::is_on(value));
+            .is_some_and(|value| truth::is_on(value))
+            || paths.is_header_only(target.dir, &source.value);
         let language = if header_only {
             None
         } else {
@@ -302,9 +303,12 @@ pub(crate) fn resolve_target<'a>(
                 let mut facts = CompileGroup {
                     language,
                     flags,
+                    source_flag_start: None,
+                    source_option_groups: Vec::new(),
                     defines,
                     source_define_start: None,
                     includes,
+                    source_include_count: 0,
                     units: Vec::new(),
                 };
                 let base = ide_compile.as_ref().map(|ide| ide.settings(&facts));
@@ -471,7 +475,7 @@ pub(crate) fn collect_file_sets<'a>(
     let mut members = IndexMap::new();
     let mut ctx = ctx.clone();
     ctx.head = Some(usage::handle(id));
-    for (set_id, set) in usage.source_file_sets(id, &ctx)? {
+    for (set_id, set, link_bt) in usage.source_file_sets(id, &ctx)? {
         let is_module = set.kind == FileSetKind::CxxModules;
         has_modules |= is_module;
         let owner = model
@@ -486,7 +490,7 @@ pub(crate) fn collect_file_sets<'a>(
         if bases.is_empty() {
             bases.push(dir.source_dir.clone());
         }
-        for file in usage.file_set_paths(set.target, b"SOURCES", &set.files, &ctx)? {
+        for file in usage.file_set_target_sources(set, &ctx)? {
             let Some(value) = resolved_file_set_member(model, paths, dir, &file)? else {
                 continue;
             };
@@ -512,10 +516,15 @@ pub(crate) fn collect_file_sets<'a>(
                         .into(),
                     )),
                 };
+            let source_bt = if set.target != id {
+                link_bt.clone().unwrap_or_else(|| file.backtrace.clone())
+            } else {
+                file.backtrace.clone()
+            };
             let member = FileSetMember {
                 id: set_id,
                 set,
-                source: BT::new(value.clone(), file.backtrace.clone()),
+                source: BT::new(value.clone(), source_bt),
                 relative_directory,
             };
             match members.entry(value) {
@@ -562,30 +571,20 @@ fn export_symbol(target: &Target) -> Option<BString> {
     Some(symbol)
 }
 
+pub(crate) fn find_file_set_member(
+    paths: &SourcePaths<'_>,
+    dir: &rcmake_model::Directory,
+    file: &BT<BString>,
+) -> Option<BString> {
+    paths.find(dir, &file.value)
+}
+
 fn resolved_file_set_member(
     model: &ProjectModel,
     paths: &SourcePaths<'_>,
     dir: &rcmake_model::Directory,
     file: &BT<BString>,
 ) -> Result<Option<BString>, ResolveError> {
-    if file.value.windows(2).any(|pair| pair == b"\\;") {
-        if let Some(path) = paths.find(dir, &file.value) {
-            return Ok(Some(path));
-        }
-        // File set entries can carry escaping from more than one list expansion.
-        let mut name = BString::default();
-        for byte in file.value.iter().copied() {
-            if byte == b';' {
-                while name.last() == Some(&b'\\') {
-                    name.pop();
-                }
-            }
-            name.push(byte);
-        }
-        if let Some(path) = paths.find(dir, &name) {
-            return Ok(Some(path));
-        }
-    }
     paths.resolve_at(model, dir, file)
 }
 

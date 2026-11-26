@@ -45,7 +45,7 @@ pub fn lower(
         &mut UsageResolver::new(model),
         (&mut pch::IdeLowering::default(), None),
         &mut BTreeMap::new(),
-        None,
+        (None, None),
         None,
     )
 }
@@ -63,7 +63,10 @@ pub(crate) fn lower_with_inputs(
     usage: &mut UsageResolver<'_>,
     (ide, precompiled): (&mut pch::IdeLowering, Option<&pch::Plans>),
     compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
-    cross: Option<CrossConfiguration<'_>>,
+    (cross, traced_commands): (
+        Option<CrossConfiguration<'_>>,
+        Option<&IndexMap<TargetId, IndexSet<rcmake_model::CommandId>>>,
+    ),
     trace_host: Option<&dyn rcmake_host::Host>,
 ) -> Result<BuildGraph, ResolveError> {
     usage.runtime_install_targets = super::install::transitive::collect(model, usage, targets)?
@@ -131,6 +134,14 @@ pub(crate) fn lower_with_inputs(
             &mut graph.steps,
             &mut graph.custom_output_owners,
         )?;
+        if let Some(traced) = traced_commands.and_then(|map| map.get(&resolved.id)) {
+            commands.add_traced_commands(traced, &mut plan.steps, &mut plan.dependencies)?;
+            source_commands::record_owners(
+                &mut graph.custom_output_owners,
+                resolved.id,
+                &plan.steps,
+            );
+        }
         if let Some(order) = plan
             .inputs
             .and_then(|inputs| inputs.file_set_order.as_ref())
@@ -169,12 +180,12 @@ pub(crate) fn lower_with_inputs(
             (&lint, &framework_dirs),
             fortran.get(&resolved.id),
             usage,
-            &mut graph.steps,
+            (&mut graph.steps, &mut graph.compile_launchers),
             (compile_inputs, ide.pch.get_mut(&resolved.id)),
         )?;
         plan.add_link_and_target_commands(
             &artifacts,
-            objects,
+            (objects, &framework_dirs),
             &commands,
             usage,
             &resolved_targets,
@@ -479,7 +490,7 @@ impl<'a> TargetPlan<'a> {
     fn add_link_and_target_commands(
         &mut self,
         artifacts: &ArtifactSet,
-        mut objects: Vec<BString>,
+        (mut objects, framework_dirs): (Vec<BString>, &[(BString, bool)]),
         commands: &Commands<'_>,
         usage: &mut UsageResolver<'_>,
         resolved_targets: &IndexMap<TargetId, &ResolvedTarget>,
@@ -571,14 +582,14 @@ impl<'a> TargetPlan<'a> {
             {
                 objects.push(device.output.clone());
             }
-            let (link, install_name_dir) = link(
+            let lowered = link(
                 model,
                 target,
                 config,
                 &linker_artifacts,
                 step,
                 objects,
-                self.inputs.map(|inputs| &inputs.sources),
+                (resolved, self.inputs, framework_dirs),
                 position_independent,
                 languages,
                 usage,
@@ -591,27 +602,52 @@ impl<'a> TargetPlan<'a> {
                 }
                 error
             })?;
-            if !install_name_dir.is_empty()
-                && let BuildStep::Link { step, .. } = &link
-            {
-                graph
-                    .install_name_dirs
-                    .insert(step.output.clone(), install_name_dir);
+            let mut link = lowered.step;
+            if let BuildStep::Link { step, .. } = &link {
+                if !lowered.install_name_dir.is_empty() {
+                    graph
+                        .install_name_dirs
+                        .insert(step.output.clone(), lowered.install_name_dir);
+                }
+                if !lowered.extra_outputs.is_empty() {
+                    graph
+                        .link_extra_outputs
+                        .insert(step.output.clone(), lowered.extra_outputs);
+                }
             }
-            let mut link = link;
-            if let (
-                BuildStep::Link {
-                    inputs,
-                    implicit_inputs,
-                    ..
-                },
-                Some(target_inputs),
-            ) = (&mut link, self.inputs)
+            if let Some((path, content)) = lowered.swift_output_file_map {
+                graph.swift_output_file_maps.insert(path, content);
+            }
+            if let BuildStep::Link {
+                inputs,
+                implicit_inputs,
+                step,
+                ..
+            } = &mut link
             {
-                for dependency in &target_inputs.xcframework_inputs {
-                    let dependency = super::build_relative(model, dependency);
-                    if !inputs.contains(&dependency) && !implicit_inputs.contains(&dependency) {
-                        implicit_inputs.push(dependency);
+                if step.language == b"Swift" && super::compile::is_one_step_swift(model, target) {
+                    for unit in &resolved.compile_units {
+                        let is_swift = resolved
+                            .compile_groups
+                            .get(unit.group)
+                            .is_some_and(|group| group.language == b"Swift");
+                        if is_swift
+                            && let Some(extra) = self.source_file_inputs.get(&unit.source.value)
+                        {
+                            for dep in extra {
+                                if !inputs.contains(dep) && !implicit_inputs.contains(dep) {
+                                    implicit_inputs.push(dep.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(target_inputs) = self.inputs {
+                    for dependency in &target_inputs.xcframework_inputs {
+                        let dependency = super::build_relative(model, dependency);
+                        if !inputs.contains(&dependency) && !implicit_inputs.contains(&dependency) {
+                            implicit_inputs.push(dependency);
+                        }
                     }
                 }
             }
@@ -678,7 +714,7 @@ fn lint_settings(
         ..EvalContext::default()
     };
     let mut settings = IndexMap::new();
-    for (_, set) in usage.source_file_sets(target, &context)? {
+    for (_, set, _) in usage.source_file_sets(target, &context)? {
         let Some(value) = set.props.get(b"SKIP_LINTING").filter(|value| {
             !value.is_empty() && value.as_slice() != b"NOTFOUND" && !value.ends_with(b"-NOTFOUND")
         }) else {

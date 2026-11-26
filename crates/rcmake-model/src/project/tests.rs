@@ -477,3 +477,147 @@ fn direct_link_properties_keep_the_origin_of_each_write() {
             .is_none()
     );
 }
+
+#[test]
+fn source_and_file_set_tracked_properties_follow_all_write_modes() {
+    use rcmake_diag::{Frame, FrameKind};
+
+    let write = |line| {
+        Backtrace::default().push(Frame {
+            file: b"CMakeLists.txt".as_slice().into(),
+            line,
+            name: Some(b"set_property".as_slice().into()),
+            kind: FrameKind::Command,
+        })
+    };
+    let bt1 = write(10);
+    let bt2 = write(20);
+    let bt3 = write(30);
+
+    let mut model = ProjectModel::default();
+    let src_scope = PropScope::Source {
+        dir: DirId::ROOT,
+        path: "main.c".into(),
+    };
+    model
+        .set_prop(
+            &src_scope,
+            b"COMPILE_OPTIONS",
+            Some("-Wa;-Wb".into()),
+            origin(&bt1),
+        )
+        .unwrap();
+    model
+        .append_prop(
+            &src_scope,
+            b"COMPILE_OPTIONS",
+            b"-Wc",
+            AppendMode::List,
+            origin(&bt2),
+        )
+        .unwrap();
+    model
+        .append_prop(
+            &src_scope,
+            b"COMPILE_OPTIONS",
+            b"-Wd",
+            AppendMode::String,
+            origin(&bt3),
+        )
+        .unwrap();
+    assert_eq!(
+        model.get_prop(&src_scope, b"COMPILE_OPTIONS"),
+        Some("-Wa;-Wb;-Wc;-Wd".into())
+    );
+    let tracked = model
+        .dir(DirId::ROOT)
+        .source_props
+        .get(b"main.c".as_slice())
+        .unwrap()
+        .tracked_entries(b"COMPILE_OPTIONS")
+        .unwrap();
+    assert_eq!(
+        tracked
+            .iter()
+            .map(|entry| (entry.value.as_slice(), entry.backtrace.top().unwrap().line))
+            .collect::<Vec<_>>(),
+        vec![
+            (b"-Wa;-Wb".as_slice(), 10),
+            (b"-Wc".as_slice(), 20),
+            (b"-Wd".as_slice(), 30)
+        ]
+    );
+
+    model
+        .set_prop(&src_scope, b"COMPILE_OPTIONS", None, origin(&bt1))
+        .unwrap();
+    assert!(
+        model
+            .dir(DirId::ROOT)
+            .source_props
+            .get(b"main.c".as_slice())
+            .unwrap()
+            .tracked_entries(b"COMPILE_OPTIONS")
+            .is_none()
+    );
+
+    let lib = model
+        .add_target(target("lib", DirId::ROOT, TargetOrigin::Normal))
+        .unwrap();
+    let set = model
+        .add_file_set(FileSet {
+            target: lib,
+            name: "s".into(),
+            kind: crate::FileSetKind::Sources,
+            scope: crate::UsageScope::Public,
+            base_dirs: Vec::new(),
+            files: Vec::new(),
+            props: crate::PropertyMap::default(),
+        })
+        .unwrap();
+    let fs_scope = PropScope::FileSet(set);
+    model
+        .append_prop(
+            &fs_scope,
+            b"INTERFACE_COMPILE_DEFINITIONS",
+            b"FOO=1",
+            AppendMode::String,
+            origin(&bt1),
+        )
+        .unwrap();
+    model
+        .append_prop(
+            &fs_scope,
+            b"INTERFACE_COMPILE_DEFINITIONS",
+            b"BAR=2",
+            AppendMode::List,
+            origin(&bt2),
+        )
+        .unwrap();
+    let fs_tracked = model
+        .file_set(set)
+        .unwrap()
+        .props
+        .tracked_entries(b"INTERFACE_COMPILE_DEFINITIONS")
+        .unwrap();
+    assert_eq!(
+        fs_tracked
+            .iter()
+            .map(|entry| (entry.value.as_slice(), entry.backtrace.top().unwrap().line))
+            .collect::<Vec<_>>(),
+        vec![(b"FOO=1".as_slice(), 10), (b"BAR=2".as_slice(), 20)]
+    );
+    model
+        .file_set_mut(set)
+        .unwrap()
+        .props
+        .set("INTERFACE_COMPILE_DEFINITIONS".into(), "RAW".into());
+    assert!(
+        model
+            .file_set(set)
+            .unwrap()
+            .props
+            .tracked_entries(b"INTERFACE_COMPILE_DEFINITIONS")
+            .is_none()
+    );
+}

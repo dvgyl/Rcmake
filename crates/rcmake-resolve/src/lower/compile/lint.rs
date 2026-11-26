@@ -21,7 +21,7 @@ pub(super) fn launch(
     invocation: Invocation,
     skip_file_set_linting: Option<bool>,
     usage: &mut UsageResolver<'_>,
-) -> Result<Invocation, ResolveError> {
+) -> Result<(Invocation, Option<BString>), ResolveError> {
     let launchers = compile.tool_prefix(model, target, b"_COMPILER_LAUNCHER", usage)?;
     let args = if let Some(source) = compile.source
         && matches!(
@@ -39,6 +39,8 @@ pub(super) fn launch(
         Vec::new()
     };
     let co_compile = !args.is_empty();
+    let launcher_shell = (!co_compile && !launchers.is_empty())
+        .then(|| join_words(launchers.iter().map(|arg| quote(arg))));
     let mut prefix = Vec::new();
     if !co_compile {
         prefix.extend(launchers);
@@ -57,7 +59,7 @@ pub(super) fn launch(
         prefix.push("--".into());
     }
     if prefix.is_empty() {
-        return Ok(invocation);
+        return Ok((invocation, None));
     }
     let has_simple_argv =
         simple_args(&invocation.shell).is_some_and(|args| args == invocation.argv);
@@ -78,7 +80,7 @@ pub(super) fn launch(
     if let Some(prefix_shell) = prefix_shell {
         command.shell = join_words([prefix_shell, invocation.shell]);
     }
-    Ok(command)
+    Ok((command, launcher_shell))
 }
 
 pub(super) fn rule_launcher(

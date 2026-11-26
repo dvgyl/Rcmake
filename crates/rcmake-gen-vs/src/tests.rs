@@ -990,4 +990,77 @@ fn nested_solutions_build_only_local_targets_and_their_dependencies() {
     assert!(!reference.contains("Release|"));
 }
 
+#[test]
+fn short_intermediate_directory_strategy_uses_hashed_intdir() {
+    let host = PureHost::default();
+    let dir = if cfg!(windows) { "C:/out" } else { "/out" };
+    let src = if cfg!(windows) { "C:/src" } else { "/src" };
+    let bin = Path::new(dir);
+    host.seed_file(
+        &Path::new(src).join("main.cpp"),
+        b"int main() { return 0; }\n",
+    )
+    .expect("seed source");
+    let mut model = ProjectModel::default();
+    model.generator = Some(GeneratorKind::VisualStudio(VsVersion::Vs17));
+    model.set_root_dirs(src.into(), dir.into());
+    model.cache.insert(
+        "CMAKE_INTERMEDIATE_DIR_STRATEGY".into(),
+        CacheEntry {
+            value: "SHORT".into(),
+            ty: CacheType::String,
+            help: Default::default(),
+            advanced: false,
+            props: Default::default(),
+        },
+    );
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_CONFIGURATION_TYPES".into(), "Debug".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_BUILD_TYPE".into(), "Debug".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_CXX_COMPILER".into(), "cl.exe".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_CXX_SOURCE_FILE_EXTENSIONS".into(), "cpp".into());
+    model
+        .add_target(target("app", TargetKind::Executable, "main.cpp"))
+        .expect("app");
+    model
+        .add_target(target("util", TargetKind::Utility, ""))
+        .expect("util");
+    let result = rcmake_resolve::resolve_with_options(
+        &model,
+        &host,
+        &[],
+        &rcmake_resolve::ResolveOptions {
+            ide: Some(rcmake_resolve::ide::IdeFlavor::VisualStudio),
+            ..Default::default()
+        },
+    )
+    .expect("resolve");
+    generate(VsVersion::Vs17, &result, &model, &host, bin).expect("generate");
+    let vcxproj = contents(&host, bin, "app.vcxproj");
+    assert!(
+        vcxproj.contains("<IntDir Condition=\"'$(Configuration)|$(Platform)'=='Debug|x64'\">")
+            && vcxproj.contains(r"\.o\")
+            && !vcxproj.contains(r"app.dir\Debug\"),
+        "{vcxproj}"
+    );
+    let util_vcxproj = contents(&host, bin, "util.vcxproj");
+    assert!(
+        util_vcxproj.contains("<IntDir Condition=\"'$(Configuration)|$(Platform)'=='Debug|x64'\">")
+            && util_vcxproj.contains(r"\.o\")
+            && !util_vcxproj.contains(r"util.dir\Debug\"),
+        "{util_vcxproj}"
+    );
+}
+
 mod link;

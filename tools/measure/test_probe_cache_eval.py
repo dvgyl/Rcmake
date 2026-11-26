@@ -375,13 +375,13 @@ class NinjaHelpersAndSwapLogicTests(unittest.TestCase):
 
     def test_ninja_swap_enforces_platform_scan_rule_expectation(self):
         self.assertEqual(pce.ninja_swap_expected_calls(True), 1)
-        self.assertEqual(pce.ninja_swap_expected_calls(False), 0)
+        self.assertEqual(pce.ninja_swap_expected_calls(False), 1)
 
         for has_scan_rule, changed_calls, should_pass in (
             (True, 1, True),
             (True, 0, False),
-            (False, 0, True),
-            (False, 1, False),
+            (False, 1, True),
+            (False, 0, False),
         ):
             case_root = self.root / f"swap-{has_scan_rule}-{changed_calls}"
             args = _make_args(case_root)
@@ -410,7 +410,7 @@ class NinjaHelpersAndSwapLogicTests(unittest.TestCase):
                 if should_pass:
                     pce.ninja_swap(args, case_root, row)
                     self.assertEqual(row["has_scan_rule"], has_scan_rule)
-                    self.assertEqual(row["expected_changed_calls"], 1 if has_scan_rule else 0)
+                    self.assertEqual(row["expected_changed_calls"], 1)
                     self.assertEqual(row["ninja_version_after"], "1.10.0")
                 else:
                     with self.assertRaisesRegex(ValueError, "Wrong compiler call count in the changed lane"):

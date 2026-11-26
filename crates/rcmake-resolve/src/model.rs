@@ -358,12 +358,18 @@ pub struct CompileGroup {
     pub language: BString,
     /// Compile flag fragments in command-line order. The `SHELL:` prefix marks raw shell text.
     pub flags: Vec<BT<BString>>,
+    /// Index of the first source- or file-set-level compile flag, if present.
+    pub source_flag_start: Option<usize>,
+    /// Source- and file-set-level `COMPILE_OPTIONS` entry spans `(start, len)` inside `flags`.
+    pub source_option_groups: Vec<(usize, usize)>,
     /// Preprocessor definitions (`NAME` or `NAME=value`).
     pub defines: Vec<BT<BString>>,
     /// Index of the first source-level definition, if present.
     pub source_define_start: Option<usize>,
     /// Include directories in search order.
     pub includes: Vec<InterfaceInclude>,
+    /// Number of source- or file-set-level include directories prepended to `includes`.
+    pub source_include_count: usize,
     /// Indices into [`ResolvedTarget::compile_units`].
     pub units: Vec<usize>,
 }
@@ -788,6 +794,13 @@ pub struct BuildGraph {
     pub utility_steps: IndexSet<usize>,
     /// Generated precompiled header files and flags by target.
     pub pch_details: IndexMap<TargetId, PchDetails>,
+    /// Shell-escaped compiler launcher prefixes keyed by compile object path.
+    pub compile_launchers: IndexMap<BString, BString>,
+    /// Additional explicit outputs of a link edge (for example one-step Swift
+    /// object files and `.swiftmodule`), keyed by primary link output path.
+    pub link_extra_outputs: IndexMap<BString, Vec<BString>>,
+    /// Generated Swift `output-file-map.json` files (build-relative path to JSON text).
+    pub swift_output_file_maps: IndexMap<BString, BString>,
 }
 
 /// File set members that affect compile ordering under CMP0154.

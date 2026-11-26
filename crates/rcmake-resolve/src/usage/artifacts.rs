@@ -517,7 +517,13 @@ impl UsageResolver<'_> {
             import_file: path(ImportFile)?,
             pdb_file: path(PdbFile)?,
             object_dir: target
-                .filter(|target| target.kind.is_library() || target.kind == TargetKind::Executable)
+                .filter(|target| {
+                    target.kind.is_library()
+                        || target.kind == TargetKind::Executable
+                        || (self.ide == Some(IdeFlavor::VisualStudio)
+                            && target.kind == TargetKind::Utility
+                            && lower::short_object_paths(self.model))
+                })
                 .and_then(|_| self.object_directory(id, config))
                 .map(|path| lower::build_relative(self.model, &path)),
         };
@@ -631,13 +637,10 @@ impl UsageResolver<'_> {
             .and_then(|plan| plan.get(&id));
         let mut file_set_sources = Vec::new();
         let mut file_set_headers = IndexSet::new();
-        for (_, set) in resolver.source_file_sets(id, &ctx).ok()? {
+        for (_, set, _) in resolver.source_file_sets(id, &ctx).ok()? {
             let owner = self.model.target(set.target)?;
             let dir = self.model.dir(owner.dir);
-            for entry in resolver
-                .file_set_paths(set.target, b"SOURCES", &set.files, &ctx)
-                .ok()?
-            {
+            for entry in resolver.file_set_target_sources(set, &ctx).ok()? {
                 let source = self
                     .source_paths
                     .and_then(|paths| paths.find(dir, &entry.value))
@@ -922,48 +925,126 @@ fn imported_configs(value: &[u8]) -> Vec<BString> {
 }
 
 pub(super) fn selected_imported_config(target: &Target, config: &ConfigId) -> Option<BString> {
+    if advertised_imports(target) {
+        selected_imported_config_new(target, config)
+    } else {
+        selected_imported_config_old(target, config)
+    }
+}
+
+fn imported_location_exists(target: &Target, config: &[u8]) -> bool {
+    let base = match target.kind {
+        TargetKind::InterfaceLibrary => b"IMPORTED_LIBNAME".as_slice(),
+        TargetKind::ObjectLibrary => b"IMPORTED_OBJECTS".as_slice(),
+        _ => b"IMPORTED_LOCATION".as_slice(),
+    };
+    let allow_imp = target.kind == TargetKind::SharedLibrary
+        || (target.kind == TargetKind::Executable && on(target, b"ENABLE_EXPORTS"));
+    imported_for_config(target, base, config).is_some_and(|path| !path.is_empty())
+        || (allow_imp
+            && imported_for_config(target, b"IMPORTED_IMPLIB", config)
+                .is_some_and(|path| !path.is_empty()))
+}
+
+fn selected_imported_config_new(target: &Target, config: &ConfigId) -> Option<BString> {
     let consumer = imported_consumer_config(config);
     let mapping = imported_config_map(target, config).map(|value| imported_configs(value));
     let advertised = target
         .props
         .get(b"IMPORTED_CONFIGURATIONS")
         .map(|value| imported_configs(value));
-    let location = |config: &[u8]| {
-        [b"IMPORTED_LOCATION".as_slice(), b"IMPORTED_IMPLIB"]
-            .iter()
-            .any(|property| {
-                imported_for_config(target, property, config).is_some_and(|path| !path.is_empty())
-            })
-    };
     let interface = target.kind == TargetKind::InterfaceLibrary;
-    if advertised_imports(target) {
-        let usable = |config: &[u8]| interface || location(config) || location(b"");
-        return match (mapping, advertised) {
-            (Some(mapped), Some(advertised)) => mapped
-                .into_iter()
-                .find(|config| advertised.contains(config)),
-            (Some(mapped), None) => mapped.into_iter().find(|config| usable(config)),
-            (None, Some(advertised)) if advertised.contains(&consumer) => Some(consumer),
-            (None, Some(advertised)) => advertised.into_iter().next(),
-            (None, None) => usable(&consumer).then_some(consumer),
-        };
+    let usable = |cfg: &[u8]| {
+        interface || imported_location_exists(target, cfg) || imported_location_exists(target, b"")
+    };
+    match (mapping, advertised) {
+        (Some(mapped), Some(advertised)) => mapped.into_iter().find(|cfg| advertised.contains(cfg)),
+        (Some(mapped), None) => mapped.into_iter().find(|cfg| usable(cfg)),
+        (None, Some(advertised)) if advertised.contains(&consumer) => Some(consumer),
+        (None, Some(advertised)) => advertised.into_iter().next(),
+        (None, None) => usable(&consumer).then_some(consumer),
     }
+}
+
+fn selected_imported_config_old(target: &Target, config: &ConfigId) -> Option<BString> {
+    let consumer = imported_consumer_config(config);
+    let mapping = imported_config_map(target, config).map(|value| imported_configs(value));
+    let advertised = target
+        .props
+        .get(b"IMPORTED_CONFIGURATIONS")
+        .map(|value| imported_configs(value))
+        .unwrap_or_default();
+    let interface = target.kind == TargetKind::InterfaceLibrary;
     if let Some(mapped) = mapping {
         return mapped
             .into_iter()
-            .find(|config| location(config))
+            .find(|cfg| imported_location_exists(target, cfg))
             .or_else(|| interface.then_some(consumer));
     }
-    let advertised = advertised.unwrap_or_default();
-    if location(&consumer) {
+    if imported_location_exists(target, &consumer) {
         return Some(consumer);
     }
-    if location(b"") {
+    if imported_location_exists(target, b"") {
         return Some(BString::default());
     }
     advertised
         .iter()
-        .find(|config| location(config))
+        .find(|cfg| imported_location_exists(target, cfg))
         .cloned()
-        .or_else(|| interface.then(|| advertised.into_iter().next_back().unwrap_or(consumer)))
+        .or_else(|| interface.then(|| advertised.into_iter().next_back().unwrap_or_default()))
+}
+
+pub(crate) fn warn_cmp0200(
+    model: &rcmake_model::ProjectModel,
+    paths: &crate::sources::SourcePaths<'_>,
+    target: &Target,
+    config: &ConfigId,
+) {
+    if !target.is_imported() || imported_from_cps(target) {
+        return;
+    }
+    let policy = PolicyId::new(200);
+    if target.policies.policies.get(policy) != PolicyStatus::Warn
+        || !model
+            .definition(target.dir, b"CMAKE_POLICY_WARNING_CMP0200")
+            .is_some_and(|value| truth::is_on(value))
+    {
+        return;
+    }
+    let old_cfg = selected_imported_config_old(target, config);
+    let new_cfg = selected_imported_config_new(target, config);
+    let label = |cfg: &BString| {
+        if cfg.is_empty() {
+            "(none)".to_owned()
+        } else {
+            cfg.to_string()
+        }
+    };
+    let detail = match (&old_cfg, &new_cfg) {
+        (None, Some(new_c)) => format!(
+            "Configuration selection for imported target \"{}\" failed, but would select configuration \"{}\" under the NEW policy.",
+            target.name,
+            label(new_c)
+        ),
+        (Some(old_c), None) => format!(
+            "Configuration selection for imported target \"{}\" selected configuration \"{}\", but would fail under the NEW policy.",
+            target.name,
+            label(old_c)
+        ),
+        (Some(old_c), Some(new_c)) if old_c != new_c => format!(
+            "Configuration selection for imported target \"{}\" selected configuration \"{}\", but would select configuration \"{}\" under the NEW policy.",
+            target.name,
+            label(old_c),
+            label(new_c)
+        ),
+        _ => return,
+    };
+    let body = format!("{}\n{detail}", policy.warning_text());
+    paths.warn_once(
+        model,
+        rcmake_diag::MessageKind::AuthorWarning,
+        Some(policy),
+        crate::cxx_modules::generation_location(model, target),
+        body.into(),
+    );
 }

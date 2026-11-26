@@ -73,6 +73,12 @@ pub(crate) fn resolve_link(
         Vec::new()
     };
     let linked_targets = usage.link_targets(id, &ctx)?;
+    let compile_targets = usage.compile_targets(id, &ctx)?;
+    for dep_id in linked_targets.iter().chain(&compile_targets) {
+        if let Some(dep_target) = model.target(*dep_id).filter(|t| t.is_imported()) {
+            crate::usage::artifacts::warn_cmp0200(model, paths, dep_target, &ctx.config);
+        }
+    }
     let position_independent = usage.validate_compatible(id, &ctx, paths)?;
     let mut link = ResolvedLink {
         position_independent,
@@ -81,6 +87,7 @@ pub(crate) fn resolve_link(
             .iter()
             .filter_map(|dep| model.find_target(target.dir, &dep.value))
             .chain(linked_targets.iter().copied())
+            .chain(compile_targets.iter().copied())
             .chain(facts.dependencies.iter().copied())
             .chain(link_items(&items).filter_map(|item| paths.object_owner(&item.text.value)))
             .filter(|dep| *dep != id && resolved.contains_key(dep))

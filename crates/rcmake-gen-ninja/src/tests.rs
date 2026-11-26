@@ -1220,3 +1220,251 @@ fn ninja_test_depends_on_all_only_if_explicitly_enabled() {
         );
     }
 }
+
+#[test]
+fn compile_launcher_with_ctest_launch_splits_launcher_binding() {
+    use rcmake_model::ProjectModel;
+
+    let mut model = ProjectModel::default();
+    model.global.props.set(
+        "RULE_LAUNCH_COMPILE".into(),
+        "/usr/bin/ctest --launch".into(),
+    );
+    model
+        .dir_mut(rcmake_model::DirId::ROOT)
+        .vars
+        .insert("CMAKE_CTEST_COMMAND".into(), "/usr/bin/ctest".into());
+    let mut graph = BuildGraph {
+        steps: vec![BuildStep::Compile {
+            byproducts: Vec::new(),
+            compile_input: None,
+            object: "CMakeFiles/app.dir/main.c.o".into(),
+            source: "/work/src/main.c".into(),
+            invocation: Invocation {
+                shell: "\"/usr/bin/ctest\" --launch --target-name app -- env USED_LAUNCHER=1 cc -c /work/src/main.c -o CMakeFiles/app.dir/main.c.o".into(),
+                ..Invocation::default()
+            },
+            depfile: None,
+            modmap: None,
+            dyndep: None,
+        }],
+        targets: vec![GraphTarget {
+            name: "app".into(),
+            steps: vec![0],
+            in_all: true,
+            ..GraphTarget::default()
+        }],
+        ..BuildGraph::default()
+    };
+    graph.compile_launchers.insert(
+        "CMakeFiles/app.dir/main.c.o".into(),
+        "env USED_LAUNCHER=1".into(),
+    );
+    let result = GenerationResult {
+        graphs: vec![graph],
+        ..GenerationResult::default()
+    };
+    let host = PureHost::default();
+    super::generate_single_config_with_model(&result, &host, Path::new("/work/build"), &model)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let rules = read(&host, "CMakeFiles/rules.ninja");
+    let build = read(&host, "build.ninja");
+    assert!(
+        rules.contains("rule COMPILE_LAUNCHED\n")
+            && rules.contains("\"/usr/bin/ctest\" --launch $LAUNCH_ARGS -- $LAUNCHER $COMMAND"),
+        "{rules}"
+    );
+    assert!(
+        build.contains("  LAUNCHER = env USED_LAUNCHER=1\n")
+            && build.contains("  LAUNCH_ARGS = --target-name app\n"),
+        "{build}"
+    );
+}
+
+#[test]
+fn compile_launcher_preserves_distinct_programs_quoted_separator_and_prefix() {
+    use rcmake_model::ProjectModel;
+
+    let mut model = ProjectModel::default();
+    model
+        .dir_mut(rcmake_model::DirId::ROOT)
+        .vars
+        .insert("CMAKE_NINJA_OUTPUT_PATH_PREFIX".into(), "sub".into());
+    let mut graph = BuildGraph {
+        steps: vec![
+            BuildStep::Compile {
+                byproducts: Vec::new(),
+                compile_input: None,
+                object: "CMakeFiles/a.dir/a.c.o".into(),
+                source: "/work/src/a.c".into(),
+                invocation: Invocation {
+                    shell: "\"/usr/bin/ctest\" --launch --option \"foo -- bar\" -- env USED_LAUNCHER=1 cc -c /work/src/a.c -o CMakeFiles/a.dir/a.c.o".into(),
+                    ..Invocation::default()
+                },
+                depfile: None,
+                modmap: None,
+                dyndep: None,
+            },
+            BuildStep::Compile {
+                byproducts: Vec::new(),
+                compile_input: None,
+                object: "CMakeFiles/b.dir/b.c.o".into(),
+                source: "/work/src/b.c".into(),
+                invocation: Invocation {
+                    shell: "\"/opt/custom/launcher\" --launch --target-name b -- env USED_LAUNCHER=2 cc -c /work/src/b.c -o CMakeFiles/b.dir/b.c.o".into(),
+                    ..Invocation::default()
+                },
+                depfile: None,
+                modmap: None,
+                dyndep: None,
+            },
+        ],
+        targets: vec![
+            GraphTarget {
+                name: "a".into(),
+                steps: vec![0],
+                in_all: true,
+                ..GraphTarget::default()
+            },
+            GraphTarget {
+                name: "b".into(),
+                steps: vec![1],
+                in_all: true,
+                ..GraphTarget::default()
+            },
+        ],
+        ..BuildGraph::default()
+    };
+    graph.compile_launchers.insert(
+        "CMakeFiles/a.dir/a.c.o".into(),
+        "env USED_LAUNCHER=1".into(),
+    );
+    graph.compile_launchers.insert(
+        "CMakeFiles/b.dir/b.c.o".into(),
+        "env USED_LAUNCHER=2".into(),
+    );
+    let result = GenerationResult {
+        graphs: vec![graph],
+        ..GenerationResult::default()
+    };
+    let host = PureHost::default();
+    super::generate_single_config_with_model(&result, &host, Path::new("/work/build"), &model)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let rules = read(&host, "CMakeFiles/rules.ninja");
+    let build = read(&host, "build.ninja");
+    assert!(
+        rules.contains("rule COMPILE_LAUNCHED\n")
+            && rules.contains(
+                "cd -- /work/build && \"/usr/bin/ctest\" --launch $LAUNCH_ARGS -- $LAUNCHER $COMMAND"
+            ),
+        "{rules}"
+    );
+    assert!(
+        rules.contains("rule COMPILE_LAUNCHED_1\n")
+            && rules.contains(
+                "cd -- /work/build && \"/opt/custom/launcher\" --launch $LAUNCH_ARGS -- $LAUNCHER $COMMAND"
+            ),
+        "{rules}"
+    );
+    assert!(
+        build.contains("build sub/CMakeFiles/a.dir/a.c.o: COMPILE_LAUNCHED /work/src/a.c\n")
+            && build.contains("  LAUNCH_ARGS = --option \"foo -- bar\"\n")
+            && build.contains("  LAUNCHER = env USED_LAUNCHER=1\n"),
+        "{build}"
+    );
+    assert!(
+        build.contains("build sub/CMakeFiles/b.dir/b.c.o: COMPILE_LAUNCHED_1 /work/src/b.c\n")
+            && build.contains("  LAUNCH_ARGS = --target-name b\n")
+            && build.contains("  LAUNCHER = env USED_LAUNCHER=2\n"),
+        "{build}"
+    );
+}
+
+#[test]
+fn compile_launcher_preserves_shell_expansion_in_program_word() {
+    use rcmake_model::ProjectModel;
+
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/src".into(), "/work/build".into());
+    let step = |object: &str, source: &str, shell: &str| BuildStep::Compile {
+        object: object.into(),
+        byproducts: Vec::new(),
+        source: source.into(),
+        compile_input: None,
+        invocation: Invocation {
+            shell: shell.into(),
+            ..Invocation::default()
+        },
+        depfile: None,
+        modmap: None,
+        dyndep: None,
+    };
+    let graph = BuildGraph {
+        steps: vec![
+            step(
+                "CMakeFiles/a.dir/a.c.o",
+                "/work/src/a.c",
+                "$MY_LAUNCHER --launch --target a -- /usr/bin/cc -c a.c -o CMakeFiles/a.dir/a.c.o",
+            ),
+            step(
+                "CMakeFiles/b.dir/b.c.o",
+                "/work/src/b.c",
+                "~/bin/launcher --launch --target b -- /usr/bin/cc -c b.c -o CMakeFiles/b.dir/b.c.o",
+            ),
+            step(
+                "CMakeFiles/c.dir/c.c.o",
+                "/work/src/c.c",
+                "\"$QUOTED_VAR\" --launch --target c -- /usr/bin/cc -c c.c -o CMakeFiles/c.dir/c.c.o",
+            ),
+            step(
+                "CMakeFiles/d.dir/d.c.o",
+                "/work/src/d.c",
+                "/usr/bin/ctest --launch --target d -- /usr/bin/cc -c d.c -o CMakeFiles/d.dir/d.c.o",
+            ),
+        ],
+        targets: vec![GraphTarget {
+            name: "demo".into(),
+            steps: vec![0, 1, 2, 3],
+            in_all: true,
+            ..GraphTarget::default()
+        }],
+        ..BuildGraph::default()
+    };
+    let result = GenerationResult {
+        graphs: vec![graph],
+        ..GenerationResult::default()
+    };
+    let host = PureHost::default();
+    super::generate_single_config_with_model(&result, &host, Path::new("/work/build"), &model)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let rules = read(&host, "CMakeFiles/rules.ninja");
+    let build = read(&host, "build.ninja");
+    assert!(
+        rules.contains("rule COMPILE_LAUNCHED\n")
+            && rules.contains("\"/usr/bin/ctest\" --launch $LAUNCH_ARGS -- $LAUNCHER $COMMAND")
+            && !rules.contains("COMPILE_LAUNCHED_1")
+            && !rules.contains("MY_LAUNCHER")
+            && !rules.contains("~/bin/launcher")
+            && !rules.contains("QUOTED_VAR"),
+        "{rules}"
+    );
+    assert!(
+        build.contains("build CMakeFiles/a.dir/a.c.o: COMPILE /work/src/a.c\n")
+            && build.contains("  COMMAND = $$MY_LAUNCHER --launch --target a -- /usr/bin/cc"),
+        "{build}"
+    );
+    assert!(
+        build.contains("build CMakeFiles/b.dir/b.c.o: COMPILE /work/src/b.c\n")
+            && build.contains("  COMMAND = ~/bin/launcher --launch --target b -- /usr/bin/cc"),
+        "{build}"
+    );
+    assert!(
+        build.contains("build CMakeFiles/c.dir/c.c.o: COMPILE /work/src/c.c\n")
+            && build.contains("  COMMAND = \"$$QUOTED_VAR\" --launch --target c -- /usr/bin/cc"),
+        "{build}"
+    );
+    assert!(
+        build.contains("build CMakeFiles/d.dir/d.c.o: COMPILE_LAUNCHED /work/src/d.c\n"),
+        "{build}"
+    );
+}

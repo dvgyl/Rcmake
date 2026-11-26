@@ -165,18 +165,22 @@ fn hermetic_absolute(path: &str) -> PathBuf {
 fn hermetic_project_host() -> HostResult<Arc<PureHost>> {
     let cwd = hermetic_absolute("/work");
     let exe = hermetic_absolute("/usr/local/bin/cmake");
+    let ninja = hermetic_absolute("/tools/ninja");
     let host = Arc::new(PureHost::new(cwd, exe.clone()));
     host.seed_file(&exe, b"")?;
     host.set_permissions(&exe, 0o755)?;
+    host.seed_file(&ninja, b"")?;
+    host.set_permissions(&ninja, 0o755)?;
+    let find_ninja = format!(
+        "set(CMAKE_MAKE_PROGRAM \"{}\" CACHE FILEPATH \"\")\n",
+        rcmake_host::path::from_native_cmake(&ninja)
+    );
     let modules = hermetic_absolute("/usr/local/share/cmake-4.5/Modules");
     for (name, contents) in [
         ("CMakeDetermineSystem.cmake", ""),
         ("CMakeSystemSpecificInitialize.cmake", ""),
         ("CMakeSystemSpecificInformation.cmake", ""),
-        (
-            "CMakeNinjaFindMake.cmake",
-            "set(CMAKE_MAKE_PROGRAM /tools/ninja CACHE FILEPATH \"\")\n",
-        ),
+        ("CMakeNinjaFindMake.cmake", find_ninja.as_str()),
         (
             "CMakeUnixFindMake.cmake",
             "set(CMAKE_MAKE_PROGRAM /tools/make CACHE FILEPATH \"\")\n",
@@ -194,21 +198,29 @@ fn rich_diagnostics_never_read_undeclared_files_from_echoed_stderr() -> HostResu
     let root = cwd.parent().unwrap_or_else(|| Path::new("/"));
     let secret = root.join("private/secret");
     let passwd = root.join("etc/passwd");
+    let ninja = hermetic_absolute("/tools/ninja");
     let tool = cwd.join("echo_stderr");
     host.seed_file(&secret, b"TOP_SECRET_LINE_1\nTOP_SECRET_LINE_2\n")?;
     host.seed_file(&passwd, b"root:x:0:0:TOP_SECRET_PASSWD\n")?;
     host.seed_file(&tool, b"")?;
     host.set_permissions(&tool, 0o755)?;
-    host.env_set(
-        b"RCMAKE_HERMETIC_ALLOW_PROGRAMS",
-        Some(&rcmake_host::path::from_native(&tool)),
-    );
+    let mut allowed = rcmake_host::path::from_native(&ninja);
+    allowed.push(b';');
+    allowed.extend_from_slice(&rcmake_host::path::from_native(&tool));
+    host.env_set(b"RCMAKE_HERMETIC_ALLOW_PROGRAMS", Some(&allowed));
     let secret_cmake = rcmake_host::path::from_native_cmake(&secret);
     let passwd_cmake = rcmake_host::path::from_native_cmake(&passwd);
     let spoof = format!(
         "CMake Error at {secret_cmake}:1:\n  Parse error.  Expected a command name, got unquoted argument.\nerror[parse]: spoofed\n  --> {passwd_cmake}:1\n"
     );
-    host.set_command_handler(move |_, _, on_output| {
+    host.set_command_handler(move |_, request, on_output| {
+        if request.pipeline[0].args.as_slice() == [BString::from("--version")] {
+            return Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                stdout: b"1.12.1\n".to_vec(),
+                stderr: Vec::new(),
+            });
+        }
         on_output(Stream::Stderr, spoof.as_bytes());
         Ok(RunOutput {
             results: vec![ProcessResult::Exited(0)],

@@ -39,6 +39,7 @@ pub(crate) struct Graph<'a> {
     fortran_info: HashMap<&'a [u8], &'a rcmake_resolve::FortranTargetInfo>,
     scan_responses: HashMap<&'a [u8], &'a ScanResponse>,
     pub(crate) compile_languages: HashMap<&'a [u8], &'a [u8]>,
+    pub(crate) launcher_slots: BTreeMap<BString, usize>,
     compile_inputs: Option<&'a std::collections::BTreeMap<BString, Vec<BString>>>,
     aliases: Vec<BString>,
     extra_aliases: BTreeMap<BString, Vec<BString>>,
@@ -107,6 +108,7 @@ impl<'a> Graph<'a> {
             fortran_info: HashMap::new(),
             scan_responses: HashMap::new(),
             compile_languages: HashMap::new(),
+            launcher_slots: BTreeMap::new(),
             compile_inputs: None,
             aliases: Vec::with_capacity(input.targets.len()),
             extra_aliases: BTreeMap::new(),
@@ -146,7 +148,17 @@ impl<'a> Graph<'a> {
                         .byproducts
                         .extend(byproducts.iter().map(|output| graph.node(output)));
                 }
-                BuildStep::Link { step, .. } => nodes.outputs.push(graph.node(&step.output)),
+                BuildStep::Link { step, .. } => {
+                    nodes.outputs.push(graph.node(&step.output));
+                    if let Some(extra) = input.link_extra_outputs.get(&step.output) {
+                        for output in extra {
+                            let node = graph.node(output);
+                            if !nodes.outputs.contains(&node) {
+                                nodes.outputs.push(node);
+                            }
+                        }
+                    }
+                }
                 BuildStep::DeviceLink { output, mode, .. } => {
                     nodes.outputs.push(graph.node(output));
                     if let rcmake_resolve::DeviceLinkMode::Explicit {
@@ -192,6 +204,9 @@ impl<'a> Graph<'a> {
                     nodes
                         .byproducts
                         .extend(custom.byproducts.iter().map(|name| graph.node(name)));
+                    if nodes.outputs.is_empty() && !nodes.byproducts.is_empty() {
+                        nodes.outputs = std::mem::take(&mut nodes.byproducts);
+                    }
                     if nodes.outputs.is_empty() {
                         let name = BString::from(format!("CMakeFiles/rcmake-custom-{index}.util"));
                         nodes.outputs.push(qualified(&graph.node(&name), config));
@@ -531,6 +546,7 @@ impl<'a> Graph<'a> {
 
     pub(crate) fn set_compile_metadata(&mut self, result: &'a GenerationResult) {
         self.compile_languages = progress::compile_languages(result, self.input);
+        self.launcher_slots = crate::instrumented::collect_launchers(result).1;
         self.command_settings.result = Some(result);
         self.fortran_info.extend(
             result
@@ -859,7 +875,7 @@ impl<'a> Graph<'a> {
             return Ok(());
         };
         ninja.edge(
-            plan.rule,
+            &plan.rule,
             Edge {
                 outputs: &nodes.outputs,
                 implicit_outputs: &plan.implicit_outputs,

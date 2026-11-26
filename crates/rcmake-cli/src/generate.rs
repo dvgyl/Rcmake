@@ -847,6 +847,13 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
                 host.write_out(Stream::Stdout, hook);
             } else {
                 assert_eq!(command.program, "ninja");
+                if command.args.as_slice() == [BString::from("--version")] {
+                    return Ok(RunOutput {
+                        stdout: b"1.12.1\n".to_vec(),
+                        results: vec![ProcessResult::Exited(0)],
+                        ..RunOutput::default()
+                    });
+                }
                 if command.args.iter().any(|arg| arg == "interrupted") {
                     return Ok(RunOutput {
                         results: vec![ProcessResult::Signaled(2)],

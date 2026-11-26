@@ -51,7 +51,7 @@ pub(crate) use graph::lower_with_inputs;
 pub(crate) use install::lower_install_manifest_with_configs;
 pub use install::{
     collect_metadata, install_target_group_options, installs_unnamed_runtime_dependencies,
-    lower_install_manifest,
+    lower_install_manifest, unnamed_runtime_dependency_groups,
 };
 pub use launcher::instrumentation_launcher;
 pub use link::codemodel_link_flags;

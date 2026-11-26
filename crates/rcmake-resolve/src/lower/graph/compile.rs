@@ -15,7 +15,7 @@ impl TargetPlan<'_> {
         (lint, framework_dirs): (&IndexMap<BString, bool>, &[(BString, bool)]),
         fortran: Option<&fortran::FortranPlan>,
         usage: &mut UsageResolver<'_>,
-        graph_steps: &mut Vec<BuildStep>,
+        (graph_steps, compile_launchers): (&mut Vec<BuildStep>, &mut IndexMap<BString, BString>),
         (compile_inputs, ide_pch): (
             &mut BTreeMap<BString, Vec<BString>>,
             Option<&mut Vec<crate::ide::IdePch>>,
@@ -55,6 +55,11 @@ impl TargetPlan<'_> {
         let mut pch_languages = IndexSet::new();
         let mut pdb_copies = IndexMap::new();
         let mut ide_pch = ide_pch;
+        let one_step_swift = super::super::compile::is_one_step_swift(model, target)
+            && resolved
+                .link
+                .as_ref()
+                .is_some_and(|link| link.language == b"Swift");
 
         for unit in &resolved.compile_units {
             let Some(group) = resolved.compile_groups.get(unit.group) else {
@@ -67,6 +72,11 @@ impl TargetPlan<'_> {
                     .into(),
                 ));
             };
+            // In one-step Swift mode (`CMAKE_Swift_COMPILE_OBJECT == ":"`), Swift sources
+            // are compiled directly during the link step, which owns their `.o` outputs.
+            if one_step_swift && group.language == b"Swift" {
+                continue;
+            }
             let required_standard = self
                 .inputs
                 .and_then(|inputs| inputs.standard_requirements.get(&group.language).copied());
@@ -135,7 +145,7 @@ impl TargetPlan<'_> {
                                 .clone(),
                             ..CompileUnit::default()
                         };
-                        let step = compile(
+                        let (step, launcher) = compile(
                             model,
                             target,
                             config,
@@ -153,6 +163,9 @@ impl TargetPlan<'_> {
                             },
                             usage,
                         )?;
+                        if let Some(launcher) = launcher {
+                            compile_launchers.insert(unit.object.clone(), launcher);
+                        }
                         let mut requires = vec![plan.header.clone()];
                         for header in &plan.project_headers {
                             let path = command_path(model, &dir.binary_dir, header);
@@ -174,7 +187,7 @@ impl TargetPlan<'_> {
             let fortran_group = fortran
                 .filter(|_| group.language == "Fortran")
                 .map(|plan| plan.compile_group(model, target, unit, group));
-            let mut step = compile(
+            let (mut step, launcher) = compile(
                 model,
                 target,
                 config,
@@ -195,6 +208,9 @@ impl TargetPlan<'_> {
                 usage,
             )?;
             if let BuildStep::Compile { object, dyndep, .. } = &mut step {
+                if let Some(launcher) = launcher {
+                    compile_launchers.insert(object.clone(), launcher);
+                }
                 let mut requires = self
                     .source_file_inputs
                     .get(&unit.source.value)

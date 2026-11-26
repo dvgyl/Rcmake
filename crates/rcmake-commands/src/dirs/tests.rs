@@ -410,3 +410,48 @@ fn directory_usage_preserves_native_path_meaning_and_inherits_paths() -> TestRes
     }
     Ok(())
 }
+
+#[test]
+fn false_valued_names_stay_unmodified_only_for_include_directories() -> TestResult {
+    let root = if cfg!(windows) { "C:/work" } else { "/work" };
+    let source = Path::new(root).join("source");
+    let binary = Path::new(root).join("build");
+    let command = Path::new(root).join("bin/cmake");
+    let host = Arc::new(PureHost::new(source.clone(), command.clone()));
+    host.seed_file(
+        &source.join("CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nproject(FalseDir NONE)\ninclude_directories(OFF)\nlink_directories(OFF)\n",
+    )?;
+    let mut interp = Interp::new(
+        InterpConfig {
+            services: Default::default(),
+            host: host.clone(),
+            mode: RunMode::Configure,
+            cmake_root: Path::new(root).join("share/cmake"),
+            cmake_command: command,
+            cwd: source.clone(),
+            limits: Default::default(),
+            diag: Default::default(),
+            defines: Vec::new(),
+            script_args: Vec::new(),
+        },
+        crate::register_all,
+    );
+    assert_eq!(
+        interp.run_configure(&source, &binary, &[]).exit_code,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let mut cx = interp.cx();
+    let root_dir = cx.project().dir(DirId::ROOT);
+    assert_eq!(
+        root_dir.usage.joined(UsageField::IncludeDirectories),
+        Some("OFF".into())
+    );
+    assert_eq!(
+        root_dir.usage.joined(UsageField::LinkDirectories),
+        Some(format!("{root}/source/OFF").into())
+    );
+    Ok(())
+}

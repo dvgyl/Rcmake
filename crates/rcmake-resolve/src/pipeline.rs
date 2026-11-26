@@ -131,6 +131,8 @@ fn resolve_project(
     let model = autogen.as_ref().map_or(model, |plan| &plan.model);
     paths.index_source_records(model);
     paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
+    check_notfound_target_properties(model, &paths)?;
+    index_header_file_sets(model, &mut paths, &configs)?;
     let mut configured_targets = configs
         .iter()
         .map(|config| resolve_targets(model, &mut paths, config, options.provenance))
@@ -157,12 +159,17 @@ fn resolve_project(
             .iter()
             .flat_map(|config| config.targets.values()),
     )?;
-    validate_target_sources(model, &paths, &configured_targets)?;
+    validate_target_sources(model, &paths, &configs, &configured_targets)?;
     if paths.missing_sources() {
         return Err(ResolveError::Reported("Cannot find source file.".into()));
     }
     let plan = ConfigurationPlan {
         cross: CrossPlan::new(model, &configs)?,
+        traced_commands: if configs.len() > 1 {
+            trace_cross_config_commands(model, &configs, &configured_targets)?
+        } else {
+            IndexMap::new()
+        },
         link_languages: if configs.len() > 1 {
             link_languages(model, &configured_targets)
         } else {
@@ -333,9 +340,100 @@ struct ConfigOutput {
 
 struct ConfigurationPlan<'a> {
     cross: CrossPlan<'a>,
+    traced_commands: IndexMap<TargetId, IndexSet<rcmake_model::CommandId>>,
     trace_config: Option<&'a ConfigId>,
     link_languages: IndexMap<TargetId, BString>,
     verification: Option<&'a header_verify::Verification>,
+}
+
+fn trace_cross_config_commands(
+    model: &ProjectModel,
+    configs: &[ConfigId],
+    configured_targets: &[ConfigTargets],
+) -> Result<IndexMap<TargetId, IndexSet<rcmake_model::CommandId>>, ResolveError> {
+    if !model
+        .commands()
+        .any(|(_, command)| command.kind == CustomCommandKind::Output)
+    {
+        return Ok(IndexMap::new());
+    }
+    let mut usage = UsageResolver::new(model);
+    let mut traced: IndexMap<TargetId, IndexSet<rcmake_model::CommandId>> = IndexMap::new();
+    for (config, configured) in configs.iter().zip(configured_targets) {
+        let mut producers: IndexMap<BString, rcmake_model::CommandId> = IndexMap::new();
+        for (id, command) in model
+            .commands()
+            .filter(|(_, command)| command.kind == CustomCommandKind::Output)
+        {
+            let (outputs, byproducts) = lower::command_outputs(model, command, config, &mut usage)?;
+            for path in outputs.into_iter().chain(byproducts) {
+                producers
+                    .entry(lower::build_relative(model, &path))
+                    .or_insert(id);
+            }
+        }
+        if producers.is_empty() {
+            continue;
+        }
+        for (&target_id, inputs) in &configured.inputs {
+            let Some(target) = model.target(target_id) else {
+                continue;
+            };
+            let dir = model.dir(target.dir);
+            let mut matched = IndexSet::new();
+            for source in &inputs.sources {
+                for base in [&dir.source_dir, &dir.binary_dir] {
+                    let path =
+                        lower::build_relative(model, &crate::sources::absolute_path(base, source));
+                    if let Some(&cmd_id) = producers.get(&path) {
+                        matched.insert(cmd_id);
+                    }
+                }
+            }
+            for (_, command) in model
+                .commands()
+                .filter(|(_, command)| command.kind == CustomCommandKind::Utility(target_id))
+            {
+                let ctx = EvalContext {
+                    config: config.clone(),
+                    head: Some(handle(target_id)),
+                    current: Some(handle(target_id)),
+                    ..EvalContext::default()
+                };
+                let mut host = usage.host(command.dir);
+                host.current = Some(handle(target_id));
+                let cmd_dir = model.dir(command.dir);
+                for dep in &command.depends {
+                    let expanded = if dep.value.windows(2).any(|w| w == b"$<") {
+                        let Ok(ast) = rcmake_genex::parse(&dep.value) else {
+                            continue;
+                        };
+                        let Ok((val, _)) = rcmake_genex::evaluate(&ast, &ctx, &mut host) else {
+                            continue;
+                        };
+                        val
+                    } else {
+                        dep.value.clone()
+                    };
+                    for item in list::split(&expanded, list::Empty::Drop) {
+                        for base in [&cmd_dir.source_dir, &cmd_dir.binary_dir] {
+                            let path = lower::build_relative(
+                                model,
+                                &crate::sources::absolute_path(base, &item),
+                            );
+                            if let Some(&cmd_id) = producers.get(&path) {
+                                matched.insert(cmd_id);
+                            }
+                        }
+                    }
+                }
+            }
+            if !matched.is_empty() {
+                traced.entry(target_id).or_default().extend(matched);
+            }
+        }
+    }
+    Ok(traced)
 }
 
 #[derive(Default)]
@@ -368,6 +466,66 @@ fn report_target_error(
     }
     paths.host.write_out(rcmake_host::Stream::Stderr, &bytes);
     Ok(ResolveError::Reported(bytes.into()))
+}
+
+/// Collect effective build-side native `HEADERS` file-set members across all
+/// generated configurations. CMake marks the shared source record in the
+/// target's directory as `HEADER_FILE_ONLY`, which also suppresses compilation
+/// of that path in other targets and configurations in the same directory.
+fn index_header_file_sets(
+    model: &ProjectModel,
+    paths: &mut SourcePaths<'_>,
+    configs: &[ConfigId],
+) -> Result<(), ResolveError> {
+    let has_native_headers = model
+        .targets()
+        .filter(|(_, target)| !target.is_imported())
+        .flat_map(|(_, target)| target.file_sets.iter())
+        .filter_map(|&id| model.file_set(id))
+        .any(|set| {
+            set.kind == rcmake_model::FileSetKind::Headers
+                && set.scope != rcmake_model::UsageScope::Interface
+                && set.props.get(b"_RCMAKE_RULE").is_none()
+        });
+    if !has_native_headers {
+        return Ok(());
+    }
+    let mut discovered = Vec::new();
+    for config in configs {
+        paths.index_generated(model, config)?;
+        let mut usage = UsageResolver::with_source_paths(model, paths);
+        for (id, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
+            let dir = model.dir(target.dir);
+            let ctx = EvalContext {
+                config: config.clone(),
+                head: Some(handle(id)),
+                ..EvalContext::default()
+            };
+            for &set_id in &target.file_sets {
+                let Some(set) = model.file_set(set_id) else {
+                    continue;
+                };
+                if set.kind != rcmake_model::FileSetKind::Headers
+                    || set.scope == rcmake_model::UsageScope::Interface
+                    || set.props.get(b"_RCMAKE_RULE").is_some()
+                {
+                    continue;
+                }
+                let Ok(files) = usage.file_set_target_sources(set, &ctx) else {
+                    continue;
+                };
+                for file in files {
+                    if let Some(path) = crate::target::find_file_set_member(paths, dir, &file) {
+                        discovered.push((target.dir, path));
+                    }
+                }
+            }
+        }
+    }
+    for (dir, path) in discovered {
+        paths.mark_header_only(dir, path);
+    }
+    Ok(())
 }
 
 fn resolve_targets(
@@ -638,9 +796,90 @@ fn validate_languages(
     failure.map_or(Ok(()), Err)
 }
 
+fn check_notfound_target_properties(
+    model: &ProjectModel,
+    paths: &SourcePaths<'_>,
+) -> Result<(), ResolveError> {
+    let mut not_found: BTreeMap<BString, BString> = BTreeMap::new();
+    let record =
+        |not_found: &mut BTreeMap<BString, BString>, var: &[u8], suffix_parts: &[&[u8]]| {
+            let mut key = BString::from(var);
+            if model.cache.get(var).is_some_and(|entry| entry.advanced) {
+                key.extend_from_slice(b" (ADVANCED)");
+            }
+            let entry = not_found.entry(key).or_default();
+            for part in suffix_parts {
+                entry.extend_from_slice(part);
+            }
+        };
+    for (_, dir) in model.dirs() {
+        for &tid in &dir.targets {
+            let Some(target) = model.target(tid).filter(|target| {
+                !target.is_imported() && target.kind != rcmake_model::TargetKind::InterfaceLibrary
+            }) else {
+                continue;
+            };
+            if let Some(links) = &target.usage.link_libraries {
+                for item in links {
+                    if let Some(var) = item.text.value.strip_suffix(b"-NOTFOUND")
+                        && !var.is_empty()
+                    {
+                        record(
+                            &mut not_found,
+                            var,
+                            &[
+                                b"\n    linked by target \"",
+                                &target.name,
+                                b"\" in directory ",
+                                &dir.source_dir,
+                            ],
+                        );
+                    }
+                }
+            }
+            if let Some(inc_prop) = model.get_prop(
+                &rcmake_model::PropScope::Target(tid),
+                b"INCLUDE_DIRECTORIES",
+            ) {
+                let stripped = rcmake_genex::genex_strip(&inc_prop);
+                for inc in list::split(&stripped, list::Empty::Drop) {
+                    if let Some(var) = inc.strip_suffix(b"-NOTFOUND")
+                        && !var.is_empty()
+                    {
+                        record(
+                            &mut not_found,
+                            var,
+                            &[
+                                b"\n   used as include directory in directory ",
+                                &dir.source_dir,
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if not_found.is_empty() {
+        return Ok(());
+    }
+    let mut message = BString::from(
+        "CMake Error: The following variables are used in this project, but they are set to NOTFOUND.\n\
+         Please set them or make sure they are set and tested correctly in the CMake files:\n",
+    );
+    for (var, uses) in not_found {
+        message.extend_from_slice(&var);
+        message.extend_from_slice(&uses);
+        message.push(b'\n');
+    }
+    message.push(b'\n');
+    paths.host.write_out(Stream::Stderr, &message);
+    Err(ResolveError::Reported(message))
+}
+
 fn validate_target_sources(
     model: &ProjectModel,
     paths: &SourcePaths<'_>,
+    configs: &[ConfigId],
     configurations: &[ConfigTargets],
 ) -> Result<(), ResolveError> {
     let sourced: IndexSet<_> = configurations
@@ -653,11 +892,20 @@ fn validate_target_sources(
                 .chain(config.linked_object_sources.iter().copied())
         })
         .collect();
+    let missing_targets: Vec<_> = model
+        .targets()
+        .filter(|(id, target)| {
+            !target.is_imported() && !sourced.contains(id) && target.kind.compiles_objects()
+        })
+        .collect();
+    if missing_targets.is_empty() {
+        return Ok(());
+    }
+    if let (Some(config), Some(configured)) = (configs.first(), configurations.first()) {
+        lower::custom::validate_custom_commands(model, paths, &configured.targets, config)?;
+    }
     let mut failure = None;
-    for (id, target) in model.targets() {
-        if target.is_imported() || sourced.contains(&id) || !target.kind.compiles_objects() {
-            continue;
-        }
+    for (_, target) in missing_targets {
         let body = BString::from(format!("No SOURCES given to target: {}", target.name));
         paths.emit(
             model,
@@ -938,6 +1186,7 @@ fn resolve_config(
     let fortran = fortran::prepare(model, paths, &mut usage, &mut resolved, &inputs, &ctx)?;
     let mut resolved = resolved.into_values().collect::<Vec<_>>();
     let mut ide_lowering = lower::IdeLowering::default();
+    let traced = (!plan.traced_commands.is_empty()).then_some(&plan.traced_commands);
     let graph = lower::lower_with_inputs(
         model,
         &resolved,
@@ -947,7 +1196,7 @@ fn resolve_config(
         &mut usage,
         (&mut ide_lowering, Some(&precompiled)),
         compile_inputs,
-        plan.cross.native_for(config),
+        (plan.cross.native_for(config), traced),
         plan.trace_config
             .filter(|&first| first == config)
             .map(|_| paths.host),
@@ -964,7 +1213,7 @@ fn resolve_config(
             &mut usage,
             (&mut lower::IdeLowering::default(), Some(&precompiled)),
             &mut BTreeMap::new(),
-            Some(settings),
+            (Some(settings), traced),
             None,
         )?;
         cross_graphs.insert(key, graph);

@@ -308,7 +308,7 @@ fn include_directories(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .map(<[u8]>::trim_ascii)
             .filter(|v| !v.is_empty())
         {
-            let entry = BT::new(usage_path(cx, value), bt.clone());
+            let entry = BT::new(usage_path(cx, value, true), bt.clone());
             if system {
                 system_includes.push(entry.clone());
             }
@@ -363,7 +363,7 @@ fn link_directories(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let bt = cx.backtrace();
     let entries: Vec<_> = values(args)
         .filter(|arg| !arg.is_empty())
-        .map(|arg| BT::new(usage_path(cx, arg), bt.clone()))
+        .map(|arg| BT::new(usage_path(cx, arg, false), bt.clone()))
         .collect();
     let dir = cx.current_dir_id();
     insert_paths(
@@ -383,8 +383,8 @@ fn placement(args: &[ExpandedArg], default: bool) -> (bool, &[ExpandedArg]) {
     }
 }
 
-fn usage_path(cx: &Cx<'_>, value: &[u8]) -> BString {
-    if value.starts_with(b"$<") {
+fn usage_path(cx: &Cx<'_>, value: &[u8], preserve_false: bool) -> BString {
+    if value.starts_with(b"$<") || (preserve_false && rcmake_base::truth::is_off(value)) {
         return value.into();
     }
     let native = path::to_native(value);

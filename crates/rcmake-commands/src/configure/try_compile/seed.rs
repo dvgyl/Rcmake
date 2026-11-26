@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use rcmake_base::{BString, list, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{CacheDefine, Cx};
-use rcmake_model::CacheType;
+use rcmake_model::{CacheType, GeneratorKind};
 
 use super::args::{Options, STANDARD_OPTIONS};
 use super::split_byte;
@@ -52,6 +52,48 @@ pub(super) struct TryCompileSeed {
     pub(super) defines: Vec<CacheDefine>,
     pub(super) enabled_languages: BString,
     pub(super) probe_languages: Vec<BString>,
+    /// Caller's explicit `CMAKE_TRY_COMPILE_CONFIGURATION`, if set and non-empty.
+    pub(super) explicit_config: Option<BString>,
+    /// Effective caller configuration for caller-side `CMP0066` flags and imported-target lookup.
+    pub(super) caller_config: BString,
+}
+
+/// Return the caller's explicit `CMAKE_TRY_COMPILE_CONFIGURATION` if non-empty.
+pub(super) fn explicit_configuration(cx: &mut Cx<'_>) -> Option<BString> {
+    let explicit = cx.var_or_empty(b"CMAKE_TRY_COMPILE_CONFIGURATION");
+    (!explicit.is_empty()).then_some(explicit)
+}
+
+/// Choose the effective caller configuration for caller-side flag seeding (`CMP0066`) and
+/// imported-target property evaluation.
+///
+/// For multi-config generators, an explicit `CMAKE_TRY_COMPILE_CONFIGURATION` takes
+/// precedence over the caller's generator default (`Debug` for Xcode/Visual Studio, or
+/// `CMAKE_DEFAULT_BUILD_TYPE` / first `CMAKE_CONFIGURATION_TYPES` / `Debug` for Ninja
+/// Multi-Config). Single-config generators use an explicit `CMAKE_TRY_COMPILE_CONFIGURATION`
+/// if set, otherwise defer to `CMAKE_BUILD_TYPE`.
+pub(super) fn caller_effective_configuration(cx: &mut Cx<'_>) -> BString {
+    if let Some(explicit) = explicit_configuration(cx) {
+        return explicit;
+    }
+    match cx.project().generator {
+        Some(GeneratorKind::NinjaMultiConfig) => {
+            let default_type = cx.var_or_empty(b"CMAKE_DEFAULT_BUILD_TYPE");
+            if !default_type.is_empty() {
+                default_type
+            } else {
+                list::split(
+                    &cx.var_or_empty(b"CMAKE_CONFIGURATION_TYPES"),
+                    list::Empty::Drop,
+                )
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "Debug".into())
+            }
+        }
+        Some(generator) if generator.multi_config() => "Debug".into(),
+        _ => BString::default(),
+    }
 }
 
 pub(super) fn toolchain_variable(name: &[u8]) -> bool {
@@ -122,7 +164,10 @@ pub(super) fn enabled_languages(cx: &mut Cx<'_>) -> Vec<BString> {
 
 impl TryCompileSeed {
     pub(super) fn new(cx: &mut Cx<'_>, options: &Options<'_>, source_signature: bool) -> Self {
-        let config = cx.var_or_empty(b"CMAKE_TRY_COMPILE_CONFIGURATION");
+        let generator = cx.project().generator;
+        let multi_config = generator.is_some_and(GeneratorKind::multi_config);
+        let explicit_config = explicit_configuration(cx);
+        let caller_config = caller_effective_configuration(cx);
         let honor_link_flags = !source_signature || cx.policy(CMP0210) == PolicyStatus::New;
         let honor_config_flags = cx.policy(CMP0066) == PolicyStatus::New;
         if source_signature
@@ -137,10 +182,10 @@ impl TryCompileSeed {
         }
         let forward_platform = (source_signature || cx.policy(CMP0137) == PolicyStatus::New)
             && !cx.var_is_on(b"CMAKE_TRY_COMPILE_NO_PLATFORM_VARIABLES");
-        let selected_config = if config.is_empty() {
+        let selected_config = if caller_config.is_empty() {
             b"DEBUG".to_vec()
         } else {
-            config.to_ascii_uppercase()
+            caller_config.to_ascii_uppercase()
         };
         let mut defines = Vec::new();
         for name in cx
@@ -221,11 +266,17 @@ impl TryCompileSeed {
         {
             seed_var(cx, &mut defines, b"CMAKE_PROJECT_TOP_LEVEL_INCLUDES");
         }
-        if !config.is_empty() {
+        if source_signature && generator == Some(GeneratorKind::NinjaMultiConfig) {
+            seed_var(cx, &mut defines, b"CMAKE_CONFIGURATION_TYPES");
+            seed_var(cx, &mut defines, b"CMAKE_DEFAULT_BUILD_TYPE");
+            seed_var(cx, &mut defines, b"CMAKE_CROSS_CONFIGS");
+            seed_var(cx, &mut defines, b"CMAKE_DEFAULT_CONFIGS");
+        }
+        if !multi_config && let Some(explicit) = &explicit_config {
             defines.push(CacheDefine {
                 name: "CMAKE_BUILD_TYPE".into(),
                 ty: Some(CacheType::String),
-                value: config,
+                value: explicit.clone(),
             });
         }
         let mut flags = options.many(b"CMAKE_FLAGS").iter().copied();
@@ -251,6 +302,8 @@ impl TryCompileSeed {
             defines,
             enabled_languages: list::join(enabled_languages(cx)),
             probe_languages: Vec::new(),
+            explicit_config,
+            caller_config,
         }
     }
 }
@@ -273,7 +326,7 @@ pub(super) fn logged_variables(
 ) -> Vec<(BString, BString)> {
     let mut variables = BTreeMap::new();
     if let Some(languages) = languages {
-        let config = cx.var_or_empty(b"CMAKE_TRY_COMPILE_CONFIGURATION");
+        let config = caller_effective_configuration(cx);
         let config = if config.is_empty() {
             b"DEBUG".to_vec()
         } else {

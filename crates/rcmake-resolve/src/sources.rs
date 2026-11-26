@@ -67,16 +67,22 @@ impl SourceUsage {
             }
             Self::Includes => {
                 let mut seen = IndexSet::new();
-                group.includes = set_values
-                    .into_iter()
-                    .chain(source_values)
-                    .map(|path| InterfaceInclude {
-                        path,
-                        system: false,
-                    })
-                    .chain(std::mem::take(&mut group.includes))
-                    .filter(|entry| seen.insert(entry.path.value.clone()))
-                    .collect();
+                let mut includes = Vec::new();
+                for path in set_values.into_iter().chain(source_values) {
+                    if seen.insert(path.value.clone()) {
+                        includes.push(InterfaceInclude {
+                            path,
+                            system: false,
+                        });
+                    }
+                }
+                group.source_include_count = includes.len();
+                includes.extend(
+                    std::mem::take(&mut group.includes)
+                        .into_iter()
+                        .filter(|entry| seen.insert(entry.path.value.clone())),
+                );
+                group.includes = includes;
             }
         }
     }
@@ -112,23 +118,62 @@ pub(crate) fn apply_compile_properties(
 ) -> Result<(), ResolveError> {
     let mut ctx = ctx.clone();
     ctx.head = Some(usage::handle(target));
+    let flag_start = group.flags.len();
     if let Some(value) = source_props.get(b"COMPILE_FLAGS") {
-        let entry = BT::new(value.clone(), source.backtrace.clone());
+        let entry = BT::new(value.clone(), Backtrace::default());
         let flags = usage.eval_source_compile_flags(target, &entry, &ctx)?;
-        append_compile_flags(&mut group.flags, &flags, entry.backtrace);
+        append_compile_flags(&mut group.flags, &flags, Backtrace::default());
     }
     for field in SourceUsage::ALL {
         let name = field.property();
-        let mut source_values = match source_props.get(name) {
-            Some(value) => usage.file_set_paths(
-                target,
-                name,
-                &[BT::new(value.clone(), source.backtrace.clone())],
-                &ctx,
-            )?,
-            None => Vec::new(),
+        if matches!(field, SourceUsage::Options) {
+            for entry in source_props.tracked_entries(name) {
+                let items =
+                    usage.file_set_paths(target, name, std::slice::from_ref(&entry), &ctx)?;
+                if !items.is_empty() {
+                    let start = group.flags.len();
+                    group.flags.extend(items);
+                    group
+                        .source_option_groups
+                        .push((start, group.flags.len() - start));
+                }
+            }
+            if let Some(member) = member {
+                let owner = member.set.target;
+                let key = if owner == target {
+                    name.into()
+                } else {
+                    [b"INTERFACE_", name].concat()
+                };
+                for entry in property_entries(&member.set.props, &key) {
+                    let items =
+                        usage.file_set_paths(owner, &key, std::slice::from_ref(&entry), &ctx)?;
+                    if !items.is_empty() {
+                        let start = group.flags.len();
+                        group.flags.extend(items);
+                        group
+                            .source_option_groups
+                            .push((start, group.flags.len() - start));
+                    }
+                }
+            }
+            continue;
+        }
+        let source_entries = source_props.tracked_entries(name);
+        let mut source_values = if source_entries.is_empty() {
+            Vec::new()
+        } else {
+            usage.file_set_paths(target, name, &source_entries, &ctx)?
         };
+        let xcode_per_config_include = matches!(field, SourceUsage::Includes)
+            && usage.ide() == Some(crate::ide::IdeFlavor::Xcode)
+            && source_entries.iter().any(|entry| {
+                let v = entry.value.as_slice();
+                v.windows(9).any(|w| w == b"$<CONFIG>" || w == b"$<CONFIG:")
+                    || v.windows(16).any(|w| w == b"$<CONFIGURATION>")
+            });
         if matches!(field, SourceUsage::Includes)
+            && !xcode_per_config_include
             && let Some(include) = source_values
                 .iter()
                 .find(|entry| !crate::file_is_full_path(&entry.value))
@@ -159,7 +204,7 @@ pub(crate) fn apply_compile_properties(
             let configured = source_props
                 .get(&key)
                 .into_iter()
-                .map(|value| BT::new(value.clone(), source.backtrace.clone()))
+                .map(|value| BT::new(value.clone(), Backtrace::default()))
                 .collect::<Vec<_>>();
             source_values.extend(usage.file_set_paths(target, &key, &configured, &ctx)?);
         }
@@ -170,19 +215,19 @@ pub(crate) fn apply_compile_properties(
             } else {
                 [b"INTERFACE_", name].concat()
             };
-            match member.set.props.get(&key) {
-                Some(value) => usage.file_set_paths(
-                    owner,
-                    &key,
-                    &[BT::new(value.clone(), member.source.backtrace.clone())],
-                    &ctx,
-                )?,
-                None => Vec::new(),
+            let entries = property_entries(&member.set.props, &key);
+            if entries.is_empty() {
+                Vec::new()
+            } else {
+                usage.file_set_paths(owner, &key, &entries, &ctx)?
             }
         } else {
             Vec::new()
         };
         field.apply(group, source_values, set_values);
+    }
+    if group.flags.len() > flag_start {
+        group.source_flag_start = Some(flag_start);
     }
     Ok(())
 }
@@ -292,6 +337,7 @@ pub(crate) struct SourcePaths<'a> {
     absolute_sources: IndexMap<BString, IndexSet<BString>>,
     generated: IndexMap<BString, IndexSet<BString>>,
     objects: IndexMap<BString, TargetId>,
+    header_only: IndexMap<DirId, IndexSet<BString>>,
     pub(crate) unity: Option<crate::unity::UnityPlan>,
 }
 
@@ -312,8 +358,19 @@ impl<'a> SourcePaths<'a> {
             absolute_sources: IndexMap::new(),
             generated: IndexMap::new(),
             objects: IndexMap::new(),
+            header_only: IndexMap::new(),
             unity: None,
         }
+    }
+
+    pub(crate) fn mark_header_only(&mut self, dir: DirId, path: BString) {
+        self.header_only.entry(dir).or_default().insert(path);
+    }
+
+    pub(crate) fn is_header_only(&self, dir: DirId, path: &[u8]) -> bool {
+        self.header_only
+            .get(&dir)
+            .is_some_and(|paths| paths.contains(path))
     }
 
     pub(crate) fn index_source_records(&mut self, model: &ProjectModel) {
@@ -431,6 +488,32 @@ impl<'a> SourcePaths<'a> {
     pub(crate) fn find(&self, dir: &Directory, source: &[u8]) -> Option<BString> {
         let source_path = absolute_path(&dir.source_dir, source);
         let binary_path = absolute_path(&dir.binary_dir, source);
+        if let Some(ambiguous) =
+            self.find_ambiguous_generated(dir, source, &source_path, &binary_path)
+        {
+            return Some(ambiguous);
+        }
+        // In CMake's cmMakefile::SourceFileSearchIndex, an explicit full-path
+        // source file recorded before a same-named generated output in the build
+        // tree wins over the later generated output for relative lookups.
+        if !Lexical::new(source).absolute()
+            && source_path != binary_path
+            && !self.generated_in(dir, &source_path)
+            && let Some((src_idx, _, src_props)) = dir.source_props.get_full(&source_path)
+            && src_props
+                .get(b"\0rcmake-source-binary-alternative")
+                .is_none()
+            && dir
+                .source_props
+                .get_index_of(&binary_path)
+                .is_none_or(|bin_idx| src_idx < bin_idx)
+            && self
+                .host
+                .metadata(&to_native(&source_path), Follow::Yes)
+                .is_ok_and(|metadata| matches!(metadata.kind, FileKind::File | FileKind::Dir))
+        {
+            return Some(source_path);
+        }
         if self.generated_in(dir, &binary_path)
             || self.objects.contains_key(&binary_path)
             || generated_at_binary_alternative(dir, &source_path, &binary_path)
@@ -458,6 +541,61 @@ impl<'a> SourcePaths<'a> {
                 .metadata(&to_native(path), Follow::Yes)
                 .is_ok_and(|metadata| matches!(metadata.kind, FileKind::File | FileKind::Dir))
         })
+    }
+
+    /// Under CMP0187 OLD or CMP0115 OLD, an extensionless source name can match an
+    /// earlier-created generated file with a known extension (for example `z.h`
+    /// created before `OUTPUT z`) in `cmMakefile::GetSource` search order.
+    fn find_ambiguous_generated(
+        &self,
+        dir: &Directory,
+        source: &[u8],
+        source_path: &BString,
+        binary_path: &BString,
+    ) -> Option<BString> {
+        const KNOWN_EXTENSIONS: &[&[u8]] = &[
+            b"c", b"C", b"c++", b"cc", b"cpp", b"cxx", b"cu", b"mpp", b"m", b"M", b"mm", b"ixx",
+            b"cppm", b"ccm", b"cxxm", b"c++m", b"h", b"hh", b"h++", b"hm", b"hpp", b"hxx", b"in",
+            b"txx", b"f", b"F", b"for", b"f77", b"f90", b"f95", b"f03", b"hip", b"ispc",
+        ];
+        let no_ambiguous = dir.final_policies.is_some_and(|policies| {
+            policies.get(PolicyId::new(115)) == PolicyStatus::New
+                && policies.get(PolicyId::new(187)) == PolicyStatus::New
+        });
+        if no_ambiguous {
+            return None;
+        }
+        let file_name = Lexical::new(source).filename();
+        if let Some(dot) = file_name.iter().rposition(|&b| b == b'.')
+            && let Some(ext) = file_name.get(dot + 1..)
+            && KNOWN_EXTENSIONS.contains(&ext)
+        {
+            return None;
+        }
+        if self
+            .host
+            .metadata(&to_native(source_path), Follow::Yes)
+            .is_ok_and(|metadata| metadata.kind == FileKind::File)
+        {
+            return None;
+        }
+        for candidate in self.generated.keys() {
+            if !self.generated_in(dir, candidate) {
+                continue;
+            }
+            if candidate == binary_path || candidate == source_path {
+                return Some(candidate.clone());
+            }
+            for base in [binary_path, source_path] {
+                if let Some(rest) = candidate.strip_prefix(base.as_slice())
+                    && let Some(ext) = rest.strip_prefix(b".")
+                    && KNOWN_EXTENSIONS.contains(&ext)
+                {
+                    return Some(candidate.clone());
+                }
+            }
+        }
+        None
     }
 
     fn missing_identity(&self, dir: &Directory, source: &[u8]) -> (BString, BString) {
@@ -771,12 +909,12 @@ pub(crate) fn validate_object_sources(
     if invalid.is_empty() {
         return Ok(());
     }
-    for (_, set) in usage.source_file_sets(facts.id, ctx)? {
+    for (_, set, _) in usage.source_file_sets(facts.id, ctx)? {
         if set.kind == FileSetKind::Headers
             && let Some(owner) = model.target(set.target)
         {
             let owner_dir = model.dir(owner.dir);
-            for file in usage.file_set_paths(set.target, b"SOURCES", &set.files, ctx)? {
+            for file in usage.file_set_target_sources(set, ctx)? {
                 if let Some(path) = paths.find(owner_dir, &file.value) {
                     invalid.shift_remove(&path);
                 }
@@ -812,6 +950,24 @@ impl<'a> SourceProperties<'a> {
         self.path
             .and_then(|props| props.get(name))
             .or_else(|| self.relative.and_then(|props| props.get(name)))
+    }
+
+    pub(crate) fn tracked_entries(self, name: &[u8]) -> Vec<BT<BString>> {
+        let props = self
+            .path
+            .filter(|props| props.get(name).is_some())
+            .or_else(|| self.relative.filter(|props| props.get(name).is_some()));
+        props.map_or_else(Vec::new, |props| property_entries(props, name))
+    }
+}
+
+fn property_entries(props: &PropertyMap, name: &[u8]) -> Vec<BT<BString>> {
+    if let Some(entries) = props.tracked_entries(name) {
+        entries.to_vec()
+    } else if let Some(value) = props.get(name) {
+        vec![BT::new(value.clone(), Backtrace::default())]
+    } else {
+        Vec::new()
     }
 }
 

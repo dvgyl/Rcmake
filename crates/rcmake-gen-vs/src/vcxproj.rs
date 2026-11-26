@@ -119,6 +119,7 @@ struct Config {
     link_output_dirs: Vec<String>,
     events: [Vec<Rule>; 3],
     dir: String,
+    int_dir: String,
     name: String,
     extension: String,
     gui: bool,
@@ -205,6 +206,10 @@ impl Context<'_> {
                 })
             });
             self.output(&mut config, fact, link, name);
+            config.int_dir = fact
+                .and_then(|fact| fact.artifacts.object_dir.as_ref())
+                .map(|dir| absolute(&self.settings.bin, &string(dir)))
+                .unwrap_or_else(|| intermediate(self.project, name));
             if let Some(target) = target {
                 config.gui = target
                     .props
@@ -566,7 +571,11 @@ fn object_path(
         }
     }
     let id = guid::bare(&guid::for_name(model, &settings.bin, source));
-    join(&intermediate(project, config), &format!("{id}.obj"))
+    let dir = fact
+        .and_then(|fact| fact.artifacts.object_dir.as_ref())
+        .map(|dir| absolute(&settings.bin, &string(dir)))
+        .unwrap_or_else(|| intermediate(project, config));
+    join(&dir, &format!("{id}.obj"))
 }
 
 fn intermediate(project: &Project, config: &str) -> String {

@@ -306,6 +306,34 @@ impl<'a> UsageResolver<'a> {
         Ok(targets)
     }
 
+    pub(crate) fn compile_targets(
+        &mut self,
+        target: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<Vec<TargetId>, ResolveError> {
+        let mut ctx = context(target, ctx, UsageTraversal::Compile);
+        ctx.head.get_or_insert(handle(target));
+        let (direct, _) = self.usage_links(target, false, &ctx)?;
+        let mut seen = HashSet::new();
+        let mut targets: Vec<_> = direct
+            .iter()
+            .flat_map(|item| item.edge_targets())
+            .filter(|id| seen.insert(*id))
+            .collect();
+        let mut index = 0;
+        while let Some(&id) = targets.get(index) {
+            let (links, _) = self.usage_links(id, true, &ctx)?;
+            targets.extend(
+                links
+                    .iter()
+                    .flat_map(|item| item.edge_targets())
+                    .filter(|id| seen.insert(*id)),
+            );
+            index += 1;
+        }
+        Ok(targets)
+    }
+
     pub(super) fn compatibility_targets(
         &mut self,
         target: TargetId,

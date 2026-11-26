@@ -1184,4 +1184,186 @@ fn stderr(host: &PureHost) -> String {
     host.stream_bytes(Stream::Stderr).to_string()
 }
 
+#[test]
+fn ninja_version_validation_rejects_old_and_invalid_output_and_accepts_valid() -> TestResult {
+    use rcmake_host::{HostError, ProcessResult, RunOutput};
+    use rcmake_model::GeneratorKind;
+
+    let run_with_version = |response: Result<&'static str, &'static str>| -> Result<(i32, String), Box<dyn std::error::Error>> {
+        let host = new_host();
+        seed_modules(&host, &[])?;
+        host.seed_file(
+            &Path::new(ROOT).join("CMakeNinjaFindMake.cmake"),
+            b"set(CMAKE_MAKE_PROGRAM /bin/ninja CACHE FILEPATH \"\")\n",
+        )?;
+        host.set_command_handler(move |_, req, _| {
+            let [cmd] = req.pipeline.as_slice() else {
+                return Err(HostError::unsupported("unexpected pipeline"));
+            };
+            assert_eq!(cmd.program, "/bin/ninja");
+            assert_eq!(cmd.args.as_slice(), [BString::from("--version")]);
+            match response {
+                Ok(stdout) => Ok(RunOutput {
+                    stdout: stdout.as_bytes().to_vec(),
+                    results: vec![ProcessResult::Exited(0)],
+                    ..RunOutput::default()
+                }),
+                Err(msg) => Err(HostError::unsupported(msg)),
+            }
+        })?;
+        let mut session = interp(&host, Vec::new());
+        session.cx().project().generator = Some(GeneratorKind::Ninja);
+        host.seed_file(
+            Path::new("/work/src/CMakeLists.txt"),
+            b"cmake_minimum_required(VERSION 4.5)\nproject(NinjaVer NONE)\n",
+        )?;
+        let outcome = session.run_configure(Path::new("/work/src"), Path::new("/work/build"), &[]);
+        Ok((outcome.exit_code, stderr(&host)))
+    };
+
+    for valid in [
+        "1.12.1\n",
+        "1.3\n",
+        "1.11.1.git.kitware.jobserver-1\n",
+        "1.10.2.git\n",
+        "1.11.0.dyndep-1\n",
+        "1.12.0-rc1\n",
+    ] {
+        let (code, err) = run_with_version(Ok(valid))?;
+        assert_eq!(code, 0, "valid={valid:?} err={err}");
+    }
+
+    for (bad, detected) in [
+        ("1.2.0\n", "1.2.0"),
+        ("1.11.\n", "1.11."),
+        ("1.11.foo\n", "1.11.foo"),
+        ("1.11.1.\n", "1.11.1."),
+        ("1.11..1\n", "1.11..1"),
+        ("1.12.0-\n", "1.12.0-"),
+        ("1.11.1a\n", "1.11.1a"),
+        ("not-a-version\n", "not-a-version"),
+        ("", ""),
+    ] {
+        let (code, err) = run_with_version(Ok(bad))?;
+        assert_eq!(code, 1, "bad={bad:?}");
+        let normalized = err.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(&format!(
+                "The detected version of Ninja ({detected}) is less than the version of Ninja required by CMake (1.3)."
+            )),
+            "bad={bad:?} err={err}"
+        );
+    }
+
+    let (code, err) = run_with_version(Err("cannot run ninja"))?;
+    assert_eq!(code, 1, "err={err}");
+    let normalized = err.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized.contains("Running '/bin/ninja' '--version' failed with: cannot run ninja"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn ninja_wrapper_script_is_not_reused_across_directories_via_build_tool_facts() -> TestResult {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use rcmake_host::{HostError, ProcessResult, RunOutput};
+    use rcmake_model::GeneratorKind;
+
+    use crate::configure::build_tool_facts::BuildToolFacts;
+
+    let run_case = |binary_bytes: &[u8],
+                    extra_env: Option<(&[u8], &[u8])>|
+     -> Result<(usize, Vec<PathBuf>, bool), Box<dyn std::error::Error>> {
+        let host = new_host();
+        seed_modules(&host, &[])?;
+        let ninja_path = Path::new("/bin/ninja");
+        host.seed_file(ninja_path, binary_bytes)?;
+        if let Some((key, value)) = extra_env {
+            host.env_set(key, Some(value));
+        }
+        host.seed_file(
+            &Path::new(ROOT).join("CMakeNinjaFindMake.cmake"),
+            b"set(CMAKE_MAKE_PROGRAM /bin/ninja CACHE FILEPATH \"\")\n",
+        )?;
+        host.seed_file(
+            Path::new("/work/src/CMakeLists.txt"),
+            b"cmake_minimum_required(VERSION 4.5)\nproject(NinjaReuse NONE)\n",
+        )?;
+        let launches = Arc::new(AtomicUsize::new(0));
+        let seen_cwds = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let launches_clone = launches.clone();
+        let cwds_clone = seen_cwds.clone();
+        host.set_command_handler(move |_, req, _| {
+            launches_clone.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut guard) = cwds_clone.lock() {
+                guard.push(req.cwd.clone());
+            }
+            let [cmd] = req.pipeline.as_slice() else {
+                return Err(HostError::unsupported("unexpected pipeline"));
+            };
+            assert_eq!(cmd.program, "/bin/ninja");
+            assert_eq!(cmd.args.as_slice(), [BString::from("--version")]);
+            Ok(RunOutput {
+                stdout: b"1.12.1\n".to_vec(),
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        let facts = Arc::new(BuildToolFacts::default());
+        for build_dir in ["/work/build-a", "/work/build-b"] {
+            let mut session = interp(&host, Vec::new());
+            session.add_session_data(facts.clone());
+            session.cx().project().generator = Some(GeneratorKind::Ninja);
+            let outcome = session.run_configure(Path::new("/work/src"), Path::new(build_dir), &[]);
+            assert_eq!(outcome.exit_code, 0, "{}", stderr(&host));
+        }
+        let digest = rcmake_store::file_digest(host.as_ref(), ninja_path)?;
+        let sampled = facts
+            .sample_ninja(
+                host.as_ref(),
+                ninja_path,
+                digest,
+                host.env_all(),
+                PathBuf::from("/work/build-c"),
+            )
+            .is_some();
+        let cwds = seen_cwds.lock().map_err(|_| "lock poisoned")?.clone();
+        Ok((launches.load(Ordering::Relaxed), cwds, sampled))
+    };
+
+    // Shell wrapper must never be cached in BuildToolFacts: runs once per configure in its own cwd.
+    let (wrapper_launches, wrapper_cwds, wrapper_sampled) =
+        run_case(b"#!/bin/sh\necho 1.12.1\n", None)?;
+    assert_eq!(wrapper_launches, 2);
+    assert_eq!(
+        wrapper_cwds,
+        vec![
+            PathBuf::from("/work/build-a"),
+            PathBuf::from("/work/build-b")
+        ]
+    );
+    assert!(!wrapper_sampled);
+
+    // Native ELF binary under admitted env is cached and reused cleanly on the second configure.
+    let (native_launches, _, native_sampled) = run_case(b"\x7fELFninja-binary", None)?;
+    assert_eq!(native_launches, 1);
+    assert!(native_sampled);
+
+    // Native ELF binary under non-admitted env (LD_PRELOAD) must also stay off the cache path.
+    let (preload_launches, _, preload_sampled) = run_case(
+        b"\x7fELFninja-binary",
+        Some((b"LD_PRELOAD", b"/tmp/hook.so")),
+    )?;
+    assert_eq!(preload_launches, 2);
+    assert!(!preload_sampled);
+    Ok(())
+}
+
 mod project_install;

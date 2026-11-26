@@ -106,6 +106,8 @@ pub(super) fn generate_multi(
     }
 
     let graphs: Vec<_> = configs.iter().map(|(graph, _)| graph.input).collect();
+    let prep_graphs: Vec<_> = configs.iter().map(|(graph, _)| graph).collect();
+    crate::prep::warn_install_prep_components(&prep_graphs, model, host);
     let uses_modules = graphs.iter().any(|graph| modules::uses_modules(graph));
     let module_flag = if uses_modules {
         modules::modmap_flag(result, build_dir)?
@@ -113,6 +115,7 @@ pub(super) fn generate_multi(
         BString::default()
     };
     prepare_directory(host, build_dir)?;
+    crate::write_swift_output_maps(&graphs, host, build_dir)?;
     let verify_globs = rcmake_gen_common::glob::write_verification(model, build_dir, host)?;
     let exports = model
         .map(|model| write_module_exports(result, model, host, build_dir, true))

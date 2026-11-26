@@ -13,8 +13,8 @@ use super::policy_flags::Flags;
 use super::shell::{command as shell_command, direct, join_words, simple_args};
 use super::{definition, join};
 use crate::{
-    ArtifactSet, BuildStep, LinkFragmentRole, LinkKind, LinkStep, ResolveError,
-    usage::UsageResolver,
+    ArtifactSet, BuildStep, LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget,
+    sources::TargetInputs, usage::UsageResolver,
 };
 
 pub(super) mod driver;
@@ -107,6 +107,13 @@ pub fn codemodel_link_flags(
     Ok((flags, ipo))
 }
 
+pub(super) struct LoweredLink {
+    pub(super) step: BuildStep,
+    pub(super) install_name_dir: BString,
+    pub(super) extra_outputs: Vec<BString>,
+    pub(super) swift_output_file_map: Option<(BString, BString)>,
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "Link lowering uses configured artifacts, objects, and usage requirements."
@@ -118,11 +125,16 @@ pub(super) fn link(
     artifacts: &ArtifactSet,
     mut step: LinkStep,
     objects: Vec<BString>,
-    sources: Option<&IndexSet<BString>>,
+    (resolved, target_inputs, framework_dirs): (
+        &ResolvedTarget,
+        Option<&TargetInputs>,
+        &[(BString, bool)],
+    ),
     position_independent: Option<bool>,
     link_languages: &IndexSet<BString>,
     usage: &mut UsageResolver<'_>,
-) -> Result<(BuildStep, BString), ResolveError> {
+) -> Result<LoweredLink, ResolveError> {
+    let sources = target_inputs.map(|inputs| &inputs.sources);
     if step.output.is_empty()
         && let Some(file) = &artifacts.file
     {
@@ -153,7 +165,7 @@ pub(super) fn link(
         .is_some_and(rcmake_model::GeneratorKind::is_ninja)
         && !super::shell::windows_host(model, target.dir);
     let mut driver = language_flags(model, target, config, language);
-    let arch = if kind == LinkKind::StaticArchive {
+    let arch = if kind == LinkKind::StaticArchive && language != b"Swift" {
         Vec::new()
     } else {
         super::apple::arch::flags(model, target, config, language, None)?
@@ -167,8 +179,34 @@ pub(super) fn link(
         .concat()
         .into()
     });
-    driver.extend(arch);
-    let driver = join_words(driver);
+    let swift_group = (language == b"Swift")
+        .then(|| {
+            resolved
+                .compile_groups
+                .iter()
+                .find(|group| group.language == b"Swift")
+        })
+        .flatten();
+    let driver = if let Some(group) = swift_group {
+        let required_standard = target_inputs.and_then(|inputs| {
+            inputs
+                .standard_requirements
+                .get(b"Swift".as_slice())
+                .copied()
+        });
+        join_words(super::compile::swift_compile_flags(
+            model,
+            target,
+            config,
+            group,
+            required_standard,
+            position_independent,
+            usage,
+        )?)
+    } else {
+        driver.extend(arch);
+        join_words(driver)
+    };
     let option = |key: &[u8]| policy.option(key);
     let cmake = || {
         definition(model, target.dir, b"CMAKE_COMMAND").map_or_else(|| "cmake".into(), Clone::clone)
@@ -419,11 +457,159 @@ pub(super) fn link(
     let output_ext = Lexical::new(&step.output).stem_extension(true).1;
     let output_base = quote(step.output.strip_suffix(output_ext).unwrap_or(&step.output));
     let object_dir = super::object_dir(model, target, config);
+    let one_step_swift = language == b"Swift" && super::compile::is_one_step_swift(model, target);
+    let swift_defines = swift_group
+        .map(|group| super::compile::formatted_defines(model, target, config, group))
+        .unwrap_or_default();
+    let swift_includes = swift_group
+        .map(|group| super::compile::formatted_includes(model, target, group, framework_dirs))
+        .unwrap_or_default();
+    let mut extra_outputs = Vec::new();
+    let mut swift_output_file_map = None;
+    let mut driver = driver;
+    let swift_sources = (language == b"Swift").then(|| {
+        let source_dir = &model.dir(target.dir).source_dir;
+        let mut swift_unit_objects = IndexSet::new();
+        let mut emitted_objects = IndexSet::new();
+        let mut entries = Vec::new();
+        let mut map_entries = std::collections::BTreeMap::new();
+        for unit in &resolved.compile_units {
+            let is_swift = resolved
+                .compile_groups
+                .get(unit.group)
+                .is_some_and(|group| group.language == b"Swift");
+            if is_swift {
+                let source_path = join(source_dir, &unit.source.value);
+                swift_unit_objects.insert(unit.object.as_slice());
+                entries.push(source_path.clone());
+                if one_step_swift {
+                    let input_path = build_relative(model, &source_path);
+                    if !inputs.contains(&input_path) {
+                        inputs.push(input_path);
+                    }
+                    if !unit.object.is_empty() && !extra_outputs.contains(&unit.object) {
+                        extra_outputs.push(unit.object.clone());
+                    }
+                    if !unit.object.is_empty() {
+                        let (stem, _) = Lexical::new(&source_path).stem_extension(true);
+                        let partial_module = join(
+                            &object_dir,
+                            &[stem, b".swiftmodule~partial.swiftmodule"].concat(),
+                        );
+                        let mut per_source = std::collections::BTreeMap::new();
+                        per_source.insert(
+                            "dependencies".into(),
+                            rcmake_json::Value::string([unit.object.as_slice(), b".d"].concat()),
+                        );
+                        per_source.insert(
+                            "object".into(),
+                            rcmake_json::Value::string(unit.object.clone()),
+                        );
+                        per_source.insert(
+                            "swiftmodule".into(),
+                            rcmake_json::Value::string(partial_module),
+                        );
+                        per_source.insert(
+                            "swift-dependencies".into(),
+                            rcmake_json::Value::string(
+                                [unit.object.as_slice(), b".swiftdeps"].concat(),
+                            ),
+                        );
+                        map_entries.insert(source_path, rcmake_json::Value::Object(per_source));
+                    }
+                }
+            } else if emitted_objects.insert(unit.object.as_slice()) {
+                entries.push(unit.object.clone());
+            }
+        }
+        for object in &objects {
+            if !swift_unit_objects.contains(object.as_slice())
+                && emitted_objects.insert(object.as_slice())
+            {
+                entries.push(object.clone());
+            }
+        }
+        if one_step_swift && !map_entries.is_empty() {
+            let swift_deps = target
+                .props
+                .get(b"Swift_DEPENDENCIES_FILE")
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    join(
+                        &object_dir,
+                        &[target.name.as_slice(), b".swiftdeps"].concat(),
+                    )
+                });
+            let mut global = std::collections::BTreeMap::new();
+            global.insert(
+                "swift-dependencies".into(),
+                rcmake_json::Value::string(swift_deps),
+            );
+            let mut root = std::collections::BTreeMap::new();
+            root.insert(BString::default(), rcmake_json::Value::Object(global));
+            root.extend(map_entries);
+            let map_path = join(&object_dir, b"output-file-map.json");
+            let json = rcmake_json::write_styled(&rcmake_json::Value::Object(root), "  ");
+            driver = join_words([driver.clone(), "-output-file-map".into(), quote(&map_path)]);
+            swift_output_file_map = Some((map_path, json));
+        }
+        join_words(entries.iter().map(|path| quote(path)))
+    });
+    let swift_library_name = if language == b"Swift" {
+        Some(swift_library_base_name(
+            model, target, config, resolved, usage,
+        )?)
+    } else {
+        None
+    };
+    let swift_module_name = (language == b"Swift").then(|| swift_module_name(target));
+    let swift_module = if language == b"Swift" {
+        Some(swift_module_path(
+            model,
+            target,
+            config,
+            swift_module_name
+                .as_ref()
+                .map_or(target.name.as_slice(), |value| value.as_slice()),
+            usage,
+        )?)
+    } else {
+        None
+    };
+    let with_exports = kind == LinkKind::Executable
+        && target
+            .props
+            .get(b"ENABLE_EXPORTS")
+            .is_some_and(|value| truth::is_on(value));
+    let template = if with_exports {
+        option(b"LINK_EXECUTABLE_WITH_EXPORTS")
+            .filter(|v| !v.is_empty())
+            .or_else(|| option(kind.rule_variable()).filter(|v| !v.is_empty()))
+    } else {
+        option(kind.rule_variable()).filter(|v| !v.is_empty())
+    };
+    if one_step_swift
+        && let Some(module) = &swift_module
+        && template.is_some_and(|tpl| {
+            tpl.windows(b"<SWIFT_MODULE>".len())
+                .any(|window| window == b"<SWIFT_MODULE>")
+        })
+        && !extra_outputs.contains(module)
+    {
+        extra_outputs.push(module.clone());
+    }
     let lookup = |key: &[u8]| match key {
         b"CMAKE_LINKER" => linker.executable.as_ref().map(|path| quote(path)),
         b"TARGET" => Some(output.clone()),
         b"TARGET_BASE" => Some(output_base.clone()),
         b"OBJECT_DIR" | b"TARGET_SUPPORT_DIR" => Some(quote(&object_dir)),
+        b"DEFINES" if language == b"Swift" => Some(swift_defines.clone()),
+        b"INCLUDES" if language == b"Swift" => Some(swift_includes.clone()),
+        b"SWIFT_SOURCES" => swift_sources.clone(),
+        b"SWIFT_MODULE_NAME" => swift_module_name.as_ref().map(|v| quote(v)),
+        b"SWIFT_LIBRARY_NAME" => swift_library_name.as_ref().map(|v| quote(v)),
+        b"SWIFT_MODULE" => swift_module.as_ref().map(|v| quote(v)),
         b"MANIFESTS" => Some(manifests.clone()),
         b"TARGET_SONAME" => Some(soname.map_or_else(BString::default, quote)),
         b"SONAME_FLAG" => Some(soname_flag.clone()),
@@ -496,7 +682,6 @@ pub(super) fn link(
     ]
     .concat();
 
-    let template = option(kind.rule_variable()).filter(|v| !v.is_empty());
     let mut invocations = if kind == LinkKind::StaticArchive {
         archive_commands(
             &step.output,
@@ -645,15 +830,17 @@ pub(super) fn link(
     }
     before_link.append(&mut invocations);
     implicit_inputs.retain(|path| !inputs.contains(path));
-    Ok((
-        BuildStep::Link {
+    Ok(LoweredLink {
+        step: BuildStep::Link {
             implicit_inputs,
             inputs,
             step,
             invocations: before_link,
         },
         install_name_dir,
-    ))
+        extra_outputs,
+        swift_output_file_map,
+    })
 }
 
 #[expect(
@@ -800,4 +987,142 @@ fn linked_libraries(step: &LinkStep) -> Vec<BString> {
         .flat_map(|fragment| simple_args(&fragment.text.value).into_iter().flatten())
         .filter(|arg| library_file(arg))
         .collect()
+}
+
+fn swift_library_base_name(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    resolved: &ResolvedTarget,
+    usage: &mut UsageResolver<'_>,
+) -> Result<BString, ResolveError> {
+    if let Some(ide) = &resolved.ide
+        && !ide.naming.base_name.is_empty()
+    {
+        return Ok(ide.naming.base_name.clone());
+    }
+    let class = match target.kind {
+        rcmake_model::TargetKind::Executable => "RUNTIME",
+        rcmake_model::TargetKind::StaticLibrary => "ARCHIVE",
+        _ => "LIBRARY",
+    };
+    let config_upper = config.0.to_ascii_uppercase();
+    let raw_name = super::output_name_keys(class, &config_upper)
+        .into_iter()
+        .find_map(|key| {
+            target
+                .props
+                .get(key.as_slice())
+                .filter(|value| !value.is_empty())
+                .map(|value| (key, value))
+        });
+    let base = if let Some((key, value)) = raw_name {
+        if value.windows(2).any(|part| part == b"$<")
+            && let Some(id) = model.find_target(target.dir, &target.name)
+        {
+            let ctx = EvalContext {
+                config: config.clone(),
+                head: Some(crate::usage::handle(id)),
+                ..EvalContext::default()
+            };
+            usage.eval_ide_property(id, &key, value, &ctx)?
+        } else {
+            value.clone()
+        }
+    } else {
+        target.name.clone()
+    };
+    let postfix = if !config.0.is_empty() {
+        let postfix_key = [config_upper.as_slice(), b"_POSTFIX"].concat();
+        let value = if target.kind == rcmake_model::TargetKind::Executable {
+            target.props.get(&postfix_key)
+        } else {
+            super::target_property(model, target, &postfix_key)
+        };
+        value.map_or(b"".as_slice(), |value| value.as_slice())
+    } else {
+        b""
+    };
+    Ok([base.as_slice(), postfix].concat().into())
+}
+
+fn swift_module_name(target: &Target) -> BString {
+    if let Some(name) = target
+        .props
+        .get(b"Swift_MODULE_NAME")
+        .filter(|value| !value.is_empty())
+    {
+        return name.clone();
+    }
+    target
+        .name
+        .iter()
+        .map(|&byte| if byte == b'-' { b'_' } else { byte })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn swift_module_path(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    module_name: &[u8],
+    usage: &mut UsageResolver<'_>,
+) -> Result<BString, ResolveError> {
+    let mut filename = target
+        .props
+        .get(b"Swift_MODULE")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .unwrap_or_else(|| [module_name, b".swiftmodule"].concat().into());
+    if target.policies.policies.get(PolicyId::new(195)) == PolicyStatus::New
+        && let Some(triple) =
+            definition(model, target.dir, b"CMAKE_Swift_MODULE_TRIPLE").filter(|v| !v.is_empty())
+    {
+        filename = [
+            filename.as_slice(),
+            b"/",
+            triple.as_slice(),
+            b".swiftmodule",
+        ]
+        .concat()
+        .into();
+    }
+    let binary_dir = &model.dir(target.dir).binary_dir;
+    let mut append_config = true;
+    let mut dir = if let Some(raw) = target
+        .props
+        .get(b"Swift_MODULE_DIRECTORY")
+        .filter(|value| !value.is_empty())
+    {
+        let evaluated = if raw.windows(2).any(|part| part == b"$<")
+            && let Some(id) = model.find_target(target.dir, &target.name)
+        {
+            let ctx = EvalContext {
+                config: config.clone(),
+                head: Some(crate::usage::handle(id)),
+                ..EvalContext::default()
+            };
+            usage.eval_ide_property(id, b"Swift_MODULE_DIRECTORY", raw, &ctx)?
+        } else {
+            raw.clone()
+        };
+        append_config = evaluated == *raw;
+        if evaluated.is_empty() {
+            binary_dir.clone()
+        } else {
+            join(binary_dir, &evaluated)
+        }
+    } else {
+        binary_dir.clone()
+    };
+    if append_config
+        && model
+            .generator
+            .is_some_and(rcmake_model::GeneratorKind::multi_config)
+        && !config.0.is_empty()
+    {
+        dir = join(&dir, &config.0);
+    }
+    Ok(build_relative(model, &join(&dir, &filename)))
 }

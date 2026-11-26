@@ -286,6 +286,11 @@ fn initialize_probe(
                 capture.capture_inherited_stderr(bytes)
             }),
         ));
+        if let Some(facts) =
+            cx.session_data::<std::sync::Arc<super::build_tool_facts::BuildToolFacts>>()
+        {
+            child.add_session_data(facts.clone());
+        }
     }
     #[cfg(not(all(feature = "native", any(unix, windows))))]
     let _ = (journaled, capture);

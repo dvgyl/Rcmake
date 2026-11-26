@@ -86,9 +86,10 @@ pub(in crate::policy_misc) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdR
                 match entries.as_slice() {
                     [_, kind] if rcmake_model::FileSetKind::from_name(kind).is_some() || matches!(kind.as_slice(), b"SYCL" | b"SYCL_HEADERS") => None,
                     [_, _] => Some("specified file set type is erroneous.  The supported types are: HEADERS, SOURCES, SYCL, SYCL_HEADERS, CXX_MODULES.".into()),
-                    _ => Some("OUTPUT_FILE_SET property require a list of 2 elements:
-
-  \"name;type\"".into()),
+                    _ => Some(
+                        "OUTPUT_FILE_SET property require a list of 2 elements:\n  \"name;type\""
+                            .into(),
+                    ),
                 }
             }
             b"NAME"

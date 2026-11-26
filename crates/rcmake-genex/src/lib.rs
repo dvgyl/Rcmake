@@ -333,6 +333,16 @@ pub trait GenexHost {
         None
     }
 
+    /// Return the configurations that can match a CONFIG test on an imported target,
+    /// with full evaluation context for policy warnings.
+    fn imported_config_matches_ctx(
+        &mut self,
+        target: TargetHandle,
+        ctx: &EvalContext,
+    ) -> Option<Vec<BString>> {
+        self.imported_config_matches(target, ctx.head, &ctx.config)
+    }
+
     /// Return the policy state at target creation.
     fn target_policy(&self, target: TargetHandle, policy: &[u8]) -> Option<bool> {
         self.raw_property(target, policy)

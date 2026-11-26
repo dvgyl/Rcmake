@@ -28,6 +28,78 @@ use crate::policy_misc::properties::known_features;
 const CMP0132: PolicyId = PolicyId::new(132);
 const CMP0165: PolicyId = PolicyId::new(165);
 
+pub(super) const REQUIRED_NINJA_VERSION: &str = "1.3";
+
+/// Parse the version token from `ninja --version` output.
+///
+/// Accepts 2+ dot-separated unsigned numeric components (`major.minor[.patch[.tweak]]`),
+/// optionally followed by `-<non-empty>`, `+<non-empty>`, ` <non-empty>`, or (after at least
+/// `major.minor.patch`) a known Ninja dot-suffix (`.git...` or `.dyndep-<digits>`). Rejects
+/// trailing dots and malformed numeric components such as `1.11.` or `1.11.foo`.
+pub(super) fn parse_ninja_version(stdout: &[u8]) -> Option<BString> {
+    let trimmed = stdout.trim_ascii();
+    if trimmed.is_empty() || trimmed.contains(&b'\n') || trimmed.contains(&b'\r') {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut parts = 0usize;
+    loop {
+        let start = pos;
+        while trimmed.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        if pos == start {
+            return None;
+        }
+        parts += 1;
+        if trimmed.get(pos) == Some(&b'.') {
+            if trimmed.get(pos + 1).is_some_and(u8::is_ascii_digit) {
+                pos += 1;
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+    if parts < 2 {
+        return None;
+    }
+    let rest = trimmed.get(pos..).unwrap_or_default();
+    if !rest.is_empty() && !valid_ninja_version_suffix(rest, parts) {
+        return None;
+    }
+    Some(BString::from(trimmed))
+}
+
+fn valid_ninja_version_suffix(rest: &[u8], parts: usize) -> bool {
+    match rest.first() {
+        Some(b'-' | b'+' | b' ') => {
+            let tail = rest.get(1..).unwrap_or_default();
+            !tail.is_empty() && !tail.starts_with(b".")
+        }
+        Some(b'.') if parts >= 3 => {
+            if let Some(after) = rest.strip_prefix(b".git") {
+                after.is_empty()
+                    || (matches!(after.first(), Some(b'.' | b'-' | b'+'))
+                        && !after.ends_with(b".")
+                        && !after.windows(2).any(|w| w == b"..")
+                        && after.get(1..).is_some_and(|s| !s.is_empty()))
+            } else if let Some(digits) = rest.strip_prefix(b".dyndep-") {
+                !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Return whether a parsed Ninja version meets CMake's minimum requirement (`1.3`).
+pub(super) fn ninja_version_supported(version: &[u8]) -> bool {
+    rcmake_base::version::compare(version, REQUIRED_NINJA_VERSION.as_bytes())
+        != std::cmp::Ordering::Less
+}
+
 const ENABLED_LANGUAGES: &[u8] = b"ENABLED_LANGUAGES";
 const IN_TRY_COMPILE: &[u8] = b"IN_TRY_COMPILE";
 const PLATFORM_INFO_DIR: &[u8] = b"CMAKE_PLATFORM_INFO_DIR";
@@ -393,7 +465,113 @@ impl Bootstrap {
                 ),
             ));
         }
+        if matches!(
+            self.generator,
+            GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig
+        ) {
+            let program = cx.var_or_empty(b"CMAKE_MAKE_PROGRAM");
+            self.verify_ninja_program(cx, &program)?;
+        }
         Ok(())
+    }
+
+    /// `cmGlobalNinjaGenerator::FindMakeProgram`: verify that the selected Ninja
+    /// executable runs `--version` and meets the minimum required version.
+    fn verify_ninja_program(&self, cx: &mut Cx<'_>, program: &BString) -> Result<(), CmdError> {
+        if !cx.host().supports_process_execution() {
+            return Ok(());
+        }
+        let raw_env = cx.host().env_all();
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let (request_env, cached_key) = {
+            let native = path::to_native(program);
+            // Check session `BuildToolFacts` first so journaled `Observe`/`Speculate`
+            // children (which omit `BuildToolFacts`) go straight to `run_bounded` without
+            // reading the Ninja binary through `JournalHost`.
+            if let Some(facts) =
+                cx.session_data::<std::sync::Arc<super::build_tool_facts::BuildToolFacts>>()
+                && native.is_absolute()
+                && super::try_compile::active::admit_environment(&raw_env)
+                && cx
+                    .host()
+                    .canonicalize(&native)
+                    .ok()
+                    .is_some_and(|canonical| {
+                        super::build_tool_facts::is_native_ninja(cx.host(), &canonical)
+                    })
+                && let Ok(digest) = rcmake_store::file_digest(cx.host(), &native)
+            {
+                let mut normalized = raw_env;
+                super::try_compile::plan::process_environment(&mut normalized);
+                let env_digest =
+                    super::try_compile::plan::process_environment_fingerprint(&normalized);
+                if facts
+                    .get_verified_ninja(&native, digest, env_digest)
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                (normalized, Some((facts, native, digest, env_digest)))
+            } else {
+                (raw_env, None)
+            }
+        };
+        #[cfg(not(all(feature = "native", any(unix, windows))))]
+        let request_env = raw_env;
+        let request = rcmake_host::RunRequest {
+            pipeline: vec![rcmake_host::CommandSpec {
+                program: program.clone(),
+                args: vec!["--version".into()],
+            }],
+            cwd: cx.current_binary_dir(),
+            env: request_env,
+            stdin: rcmake_host::Input::Null,
+            stdout: rcmake_host::Output::Capture,
+            stderr: rcmake_host::Output::Capture,
+            timeout: Some(std::time::Duration::from_secs(5)),
+            tee: false,
+        };
+        let error = match cx.host().run_bounded(&request, 4096) {
+            Ok(output) if output.results == [rcmake_host::ProcessResult::Exited(0)] => {
+                let version = parse_ninja_version(&output.stdout);
+                if let Some(version) = version.filter(|version| ninja_version_supported(version)) {
+                    #[cfg(all(feature = "native", any(unix, windows)))]
+                    if let Some((facts, native, digest, env_digest)) = cached_key
+                        && rcmake_store::file_digest(cx.host(), &native).ok() == Some(digest)
+                    {
+                        facts.record_ninja(native, digest, env_digest, output, version);
+                    }
+                    #[cfg(not(all(feature = "native", any(unix, windows))))]
+                    let _ = version;
+                    return Ok(());
+                }
+                let detected = String::from_utf8_lossy(output.stdout.trim_ascii());
+                let body = format!(
+                    "The detected version of Ninja ({detected}) is less than the version of Ninja required by CMake ({REQUIRED_NINJA_VERSION})."
+                );
+                cx.issue(MessageKind::Error, Effect::Fatal, None, body.into());
+                return Err(CmdError::Reported);
+            }
+            Ok(output) => {
+                let text = String::from_utf8_lossy(&output.stderr);
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    format!("process exited with {:?}", output.results)
+                } else {
+                    trimmed.to_owned()
+                }
+            }
+            Err(err)
+                if err.kind == std::io::ErrorKind::Unsupported
+                    && err.os_message == "No command handler is registered" =>
+            {
+                return Ok(());
+            }
+            Err(err) => err.to_string(),
+        };
+        let body = format!("Running\n '{program}' '--version'\nfailed with:\n {error}");
+        cx.issue(MessageKind::Error, Effect::Fatal, None, body.into());
+        Err(CmdError::Reported)
     }
 
     /// First pass for one language: load the saved compiler file or determine the

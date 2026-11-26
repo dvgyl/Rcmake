@@ -915,3 +915,35 @@ pub fn install_target_group_options(
 pub fn installs_unnamed_runtime_dependencies(model: &ProjectModel, rule: usize) -> bool {
     recorded_args(model, rule).contains(&b"RUNTIME_DEPENDENCIES".as_slice())
 }
+
+/// Return the effective [`InstallOptions`] groups for an anonymous
+/// `install(TARGETS ... RUNTIME_DEPENDENCIES)` rule: `RUNTIME` when
+/// `CMAKE_IMPORT_LIBRARY_SUFFIX` is nonempty else `LIBRARY`, plus `FRAMEWORK`
+/// on host Darwin.
+#[must_use]
+pub fn unnamed_runtime_dependency_groups(
+    model: &ProjectModel,
+    index: usize,
+) -> Vec<InstallOptions> {
+    let Some(rule) = model.installs.get(index) else {
+        return Vec::new();
+    };
+    if !installs_unnamed_runtime_dependencies(model, index) {
+        return Vec::new();
+    }
+    let dll_platform = model
+        .definition(rule.dir, b"CMAKE_IMPORT_LIBRARY_SUFFIX")
+        .is_some_and(|value| !value.is_empty());
+    let host_darwin = model
+        .definition(rule.dir, b"CMAKE_HOST_SYSTEM_NAME")
+        .map_or(cfg!(target_os = "macos"), |value| value == b"Darwin");
+    let primary: &[u8] = if dll_platform { b"RUNTIME" } else { b"LIBRARY" };
+    let mut out = Vec::with_capacity(2);
+    if let Some(options) = install_target_group_options(model, index, primary) {
+        out.push(options);
+    }
+    if host_darwin && let Some(options) = install_target_group_options(model, index, b"FRAMEWORK") {
+        out.push(options);
+    }
+    out
+}

@@ -937,12 +937,14 @@ def write_ninja_version_wrapper(staged: Path, real_ninja: Path, version: str) ->
 def ninja_swap_expected_calls(has_scan_rule: bool) -> int:
     """Return expected compiler calls after swapping ninja for a C++20 probe.
 
-    Compilers with CMAKE_CXX_SCANDEP_SOURCE (Linux Clang, GCC 14+) consult
-    ninja --version and stamp the ninja executable, so swapping ninja must
-    invalidate the cache. Compilers without a scan rule (macOS AppleClang)
-    never consult ninja --version, so the warm entry stays valid.
+    write_ninja_version_wrapper replaces the staged native Ninja binary with an
+    uncertified shell wrapper script. Because Ninja configure bootstrap verifies
+    CMAKE_MAKE_PROGRAM --version in try_compile children as well as the parent,
+    an uncertified wrapper must bypass probe-cache lookup and compile live once
+    on every platform regardless of CMAKE_CXX_SCANDEP_SOURCE.
     """
-    return 1 if has_scan_rule else 0
+    _ = has_scan_rule
+    return 1
 
 
 def read_cache_entries(build: Path, names: tuple[str, ...]) -> dict[str, str | None]:

@@ -23,7 +23,7 @@ pub(in crate::lower) fn architectures(
     if architectures.is_empty()
         && matches!(
             language,
-            b"C" | b"CXX" | b"OBJC" | b"OBJCXX" | b"ASM" | b"SYCL"
+            b"C" | b"CXX" | b"OBJC" | b"OBJCXX" | b"ASM" | b"SYCL" | b"Swift"
         )
         && compiler_target(model, target, language).is_none()
         && let Some(default) = definition(model, target.dir, b"_CMAKE_APPLE_ARCHS_DEFAULT")
@@ -83,15 +83,42 @@ pub(in crate::lower) fn flags(
             flags.push(quote(arch));
         }
     }
-    if let Some((platform, suffix)) = triple
+    if language == b"Swift" && compiler_target.is_none() {
+        let swift_platform = match (system, variant) {
+            (b"iOS", Some(super::Variant::Simulator)) => {
+                Some((b"ios".as_slice(), b"-simulator".as_slice()))
+            }
+            (b"iOS", Some(super::Variant::Catalyst)) => {
+                Some((b"ios".as_slice(), b"-macabi".as_slice()))
+            }
+            (b"iOS", None) => Some((b"ios".as_slice(), b"".as_slice())),
+            (b"tvOS", Some(super::Variant::Simulator)) => {
+                Some((b"tvos".as_slice(), b"-simulator".as_slice()))
+            }
+            (b"tvOS", _) => Some((b"tvos".as_slice(), b"".as_slice())),
+            (b"watchOS", Some(super::Variant::Simulator)) => {
+                Some((b"watchos".as_slice(), b"-simulator".as_slice()))
+            }
+            (b"watchOS", _) => Some((b"watchos".as_slice(), b"".as_slice())),
+            (b"visionOS", Some(super::Variant::Simulator)) => {
+                Some((b"xros".as_slice(), b"-simulator".as_slice()))
+            }
+            (b"visionOS", _) => Some((b"xros".as_slice(), b"".as_slice())),
+            _ if !version.is_empty() => Some((b"macosx".as_slice(), b"".as_slice())),
+            _ => None,
+        };
+        if let Some((platform, suffix)) = swift_platform {
+            let arch = selected_arch(model, target, &architectures, filter_arch, system, variant);
+            flags.push("-target".into());
+            flags.push(quote(
+                &[arch, b"-apple-", platform, version, suffix].concat(),
+            ));
+        }
+    } else if let Some((platform, suffix)) = triple
         && compiler_target.is_none()
         && !version.is_empty()
     {
-        let arch = architectures
-            .iter()
-            .find(|arch| *arch == "arm64" && selected(arch))
-            .or_else(|| architectures.iter().find(|arch| selected(arch)))
-            .map_or(b"arm64".as_slice(), |arch| arch.as_slice());
+        let arch = selected_arch(model, target, &architectures, filter_arch, system, variant);
         flags.push(quote(
             &[b"--target=", arch, b"-apple-", platform, version, suffix].concat(),
         ));
@@ -135,7 +162,7 @@ pub(in crate::lower) fn flags(
             flags.push(quote(sdk));
         }
     }
-    if !version.is_empty() && triple.is_none() {
+    if !version.is_empty() && triple.is_none() && language != b"Swift" {
         let prefix: &[u8] = match (system, variant) {
             (b"iOS", Some(super::Variant::Simulator)) => b"-mios-simulator-version-min=",
             (b"iOS", _) => b"-miphoneos-version-min=",
@@ -148,6 +175,39 @@ pub(in crate::lower) fn flags(
         flags.push(quote(&[prefix, version].concat()));
     }
     Ok(flags)
+}
+
+fn selected_arch<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+    architectures: &'a [BString],
+    filter_arch: Option<&'a [u8]>,
+    system: &[u8],
+    variant: Option<super::Variant>,
+) -> &'a [u8] {
+    if let Some(arch) = filter_arch {
+        return arch;
+    }
+    if let Some(arch) = architectures.first() {
+        return arch.as_slice();
+    }
+    if let Some(processor) = definition(model, target.dir, b"CMAKE_SYSTEM_PROCESSOR")
+        .or_else(|| definition(model, target.dir, b"CMAKE_HOST_SYSTEM_PROCESSOR"))
+        .filter(|value| !value.is_empty())
+    {
+        return if processor == b"aarch64" {
+            b"arm64"
+        } else {
+            processor.as_slice()
+        };
+    }
+    if variant.is_none() && matches!(system, b"iOS" | b"tvOS" | b"watchOS" | b"visionOS") {
+        b"arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        b"x86_64"
+    } else {
+        b"arm64"
+    }
 }
 
 pub(crate) fn sdk_map(

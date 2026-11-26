@@ -65,7 +65,7 @@ pub(super) fn discover(
     }
     // `cmCoreTryCompile` evaluates the imported target properties for the
     // `CMAKE_TRY_COMPILE_CONFIGURATION` configuration, not for `CMAKE_FLAGS` values.
-    let config = ConfigId(cx.var_or_empty(b"CMAKE_TRY_COMPILE_CONFIGURATION"));
+    let config = ConfigId(seed.caller_config.clone());
     let kind = if !run && cx.var_or_empty(b"CMAKE_TRY_COMPILE_TARGET_TYPE") == b"STATIC_LIBRARY" {
         TargetKind::StaticLibrary
     } else {

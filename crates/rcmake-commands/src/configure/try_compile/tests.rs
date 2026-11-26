@@ -575,6 +575,607 @@ fn try_compile_can_nest_three_projects_with_the_default_recursion_limit() -> Tes
     Ok(())
 }
 
+#[test]
+fn multi_config_try_compile_honors_caller_config_and_xcode_debug_default() -> TestResult {
+    use std::sync::Mutex;
+
+    use rcmake_model::GeneratorKind;
+
+    let run_case = |generator: GeneratorKind,
+                    caller_config: Option<&str>,
+                    config_types: &str|
+     -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let host = Arc::new(PureHost::default());
+        let seen_cmds = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_clone = seen_cmds.clone();
+        host.seed_file(Path::new(&format!("{DRIVE}/work/probe-cc")), b"")?;
+        host.seed_file(
+            Path::new(&format!("{DRIVE}/work/child/main.c")),
+            b"int main(void) { return 0; }\n",
+        )?;
+        // Child explicitly sets CMAKE_BUILD_TYPE=MinSizeRel; multi-config try_compile must NOT
+        // let child CMAKE_BUILD_TYPE override caller configuration or Xcode Debug default.
+        host.seed_file(
+            Path::new(&format!("{DRIVE}/work/child/CMakeLists.txt")),
+            b"cmake_minimum_required(VERSION 4.5)\n\
+              set(CMAKE_BUILD_TYPE MinSizeRel)\n\
+              set(CMAKE_C_FLAGS_DEBUG \"-DFROM_DEBUG\")\n\
+              set(CMAKE_C_FLAGS_RELEASE \"-DFROM_RELEASE\")\n\
+              set(CMAKE_C_FLAGS_RELWITHDEBINFO \"-DFROM_RELWITHDEBINFO\")\n\
+              set(CMAKE_C_FLAGS_MINSIZEREL \"-DFROM_MINSIZEREL\")\n\
+              project(Child C)\n\
+              add_executable(app main.c)\n",
+        )?;
+        host.set_command_handler(move |fs, req, _| {
+            if let Some(cmd) = req.pipeline.first() {
+                let rendered = format!(
+                    "{} {}",
+                    cmd.program,
+                    cmd.args
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                if let Ok(mut guard) = seen_clone.lock() {
+                    guard.push(rendered);
+                }
+                if let Some(pos) = cmd.args.iter().position(|a| a == "-o")
+                    && let Some(out) = cmd.args.get(pos + 1)
+                {
+                    let target = req.cwd.join(rcmake_host::path::to_native(out));
+                    if let Some(parent) = target.parent() {
+                        let _ = fs.create_dir_all(parent);
+                    }
+                    let _ = fs.write(&target, b"artifact", WriteMode::Truncate);
+                }
+                if cmd.args.as_slice() == [rcmake_base::BString::from("--version")] {
+                    return Ok(RunOutput {
+                        stdout: b"1.12.1\n".to_vec(),
+                        results: vec![ProcessResult::Exited(0)],
+                        ..RunOutput::default()
+                    });
+                }
+            }
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        let root = PathBuf::from(format!("{DRIVE}/work"));
+        let mut script = format!(
+            "cmake_minimum_required(VERSION 4.5)\n\
+             set(CMAKE_CONFIGURATION_TYPES \"{config_types}\")\n\
+             set(CMAKE_C_COMPILER \"{DRIVE}/work/probe-cc\")\n\
+             set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\n\
+             set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> -c <SOURCE> -o <OBJECT> <FLAGS>\")\n\
+             set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> <OBJECTS> -o <TARGET>\")\n\
+             set(CMAKE_C_FLAGS_DEBUG \"-DFROM_DEBUG\")\n\
+             set(CMAKE_C_FLAGS_RELEASE \"-DFROM_RELEASE\")\n\
+             set(CMAKE_C_FLAGS_RELWITHDEBINFO \"-DFROM_RELWITHDEBINFO\")\n"
+        );
+        if let Some(cfg) = caller_config {
+            script.push_str(&format!("set(CMAKE_TRY_COMPILE_CONFIGURATION \"{cfg}\")\n"));
+        }
+        script.push_str(&format!(
+            "try_compile(OK PROJECT Child SOURCE_DIR \"{DRIVE}/work/child\" BINARY_DIR \"{DRIVE}/work/child-build\" TARGET app NO_LOG)\n\
+             if(NOT OK)\n  message(FATAL_ERROR \"probe failed\")\nendif()\n"
+        ));
+        host.seed_file(&root.join("CMakeLists.txt"), script.as_bytes())?;
+        let mut interp = interpreter(host.clone(), &root)?;
+        interp.cx().project().generator = Some(generator);
+        let outcome = interp.run_configure(&root, &root.join("build"), &[]);
+        assert_eq!(
+            outcome.exit_code,
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        let cmds = seen_cmds.lock().map_err(|_| "lock poisoned")?.clone();
+        Ok(cmds)
+    };
+
+    // 1. Xcode with unset CMAKE_TRY_COMPILE_CONFIGURATION defaults to Debug even when Release is
+    //    first in CMAKE_CONFIGURATION_TYPES and child sets CMAKE_BUILD_TYPE=MinSizeRel.
+    let xcode_default = run_case(GeneratorKind::Xcode, None, "Release;Debug")?;
+    assert!(
+        xcode_default.iter().any(|c| c.contains("-DFROM_DEBUG")),
+        "{xcode_default:?}"
+    );
+    assert!(
+        !xcode_default.iter().any(|c| c.contains("MinSizeRel")),
+        "{xcode_default:?}"
+    );
+
+    // 2. Xcode with explicit CMAKE_TRY_COMPILE_CONFIGURATION=RelWithDebInfo honors caller config
+    //    over child CMAKE_BUILD_TYPE=MinSizeRel.
+    let xcode_explicit = run_case(
+        GeneratorKind::Xcode,
+        Some("RelWithDebInfo"),
+        "Release;Debug",
+    )?;
+    assert!(
+        xcode_explicit
+            .iter()
+            .any(|c| c.contains("-DFROM_RELWITHDEBINFO")),
+        "{xcode_explicit:?}"
+    );
+    assert!(
+        !xcode_explicit.iter().any(|c| c.contains("MinSizeRel")),
+        "{xcode_explicit:?}"
+    );
+
+    // 3. NinjaMultiConfig PROJECT-signature probe with no explicit CMAKE_TRY_COMPILE_CONFIGURATION
+    //    resolves its implicit default from the configured child project (CMAKE_DEFAULT_BUILD_TYPE
+    //    or child's first CMAKE_CONFIGURATION_TYPES), not the caller's configuration list.
+    {
+        let run_child_ninja_multi =
+            |child_extra: &str| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+                let host = Arc::new(PureHost::default());
+                let seen_cmds = Arc::new(Mutex::new(Vec::<String>::new()));
+                let seen_clone = seen_cmds.clone();
+                host.seed_file(Path::new(&format!("{DRIVE}/work/probe-cc")), b"")?;
+                host.seed_file(
+                    Path::new(&format!("{DRIVE}/work/child/main.c")),
+                    b"int main(void) { return 0; }\n",
+                )?;
+                host.seed_file(
+                    Path::new(&format!("{DRIVE}/work/child/CMakeLists.txt")),
+                    format!(
+                        "cmake_minimum_required(VERSION 4.5)\n\
+                     {child_extra}\n\
+                     set(CMAKE_C_FLAGS_DEBUG \"-DFROM_DEBUG\")\n\
+                     set(CMAKE_C_FLAGS_RELEASE \"-DFROM_RELEASE\")\n\
+                     set(CMAKE_C_FLAGS_RELWITHDEBINFO \"-DFROM_RELWITHDEBINFO\")\n\
+                     set(CMAKE_C_FLAGS_MINSIZEREL \"-DFROM_MINSIZEREL\")\n\
+                     project(Child C)\n\
+                     add_executable(app main.c)\n"
+                    )
+                    .as_bytes(),
+                )?;
+                host.set_command_handler(move |fs, req, _| {
+                    if let Some(cmd) = req.pipeline.first() {
+                        let rendered = format!(
+                            "{} {}",
+                            cmd.program,
+                            cmd.args
+                                .iter()
+                                .map(|a| a.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        );
+                        if let Ok(mut guard) = seen_clone.lock() {
+                            guard.push(rendered);
+                        }
+                        if let Some(pos) = cmd.args.iter().position(|a| a == "-o")
+                            && let Some(out) = cmd.args.get(pos + 1)
+                        {
+                            let target = req.cwd.join(rcmake_host::path::to_native(out));
+                            if let Some(parent) = target.parent() {
+                                let _ = fs.create_dir_all(parent);
+                            }
+                            let _ = fs.write(&target, b"artifact", WriteMode::Truncate);
+                        }
+                        if cmd.args.as_slice() == [rcmake_base::BString::from("--version")] {
+                            return Ok(RunOutput {
+                                stdout: b"1.12.1\n".to_vec(),
+                                results: vec![ProcessResult::Exited(0)],
+                                ..RunOutput::default()
+                            });
+                        }
+                    }
+                    Ok(RunOutput {
+                        results: vec![ProcessResult::Exited(0)],
+                        ..RunOutput::default()
+                    })
+                })?;
+                let root = PathBuf::from(format!("{DRIVE}/work"));
+                host.seed_file(
+                &root.join("CMakeLists.txt"),
+                format!(
+                    "cmake_minimum_required(VERSION 4.5)\n\
+                     set(CMAKE_CONFIGURATION_TYPES \"Debug;MinSizeRel\")\n\
+                     set(CMAKE_DEFAULT_BUILD_TYPE \"Debug\")\n\
+                     set(CMAKE_C_COMPILER \"{DRIVE}/work/probe-cc\")\n\
+                     set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\n\
+                     set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> -c <SOURCE> -o <OBJECT> <FLAGS>\")\n\
+                     set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> <OBJECTS> -o <TARGET>\")\n\
+                     try_compile(OK PROJECT Child SOURCE_DIR \"{DRIVE}/work/child\" BINARY_DIR \"{DRIVE}/work/child-build\" TARGET app NO_LOG)\n\
+                     if(NOT OK)\n  message(FATAL_ERROR \"probe failed\")\nendif()\n"
+                )
+                .as_bytes(),
+            )?;
+                let mut interp = interpreter(host.clone(), &root)?;
+                interp.cx().project().generator = Some(GeneratorKind::NinjaMultiConfig);
+                let outcome = interp.run_configure(&root, &root.join("build"), &[]);
+                assert_eq!(
+                    outcome.exit_code,
+                    0,
+                    "{}",
+                    host.stream_bytes(Stream::Stderr)
+                );
+                let cmds = seen_cmds.lock().map_err(|_| "lock poisoned")?.clone();
+                Ok(cmds)
+            };
+
+        let child_default_type = run_child_ninja_multi(
+            "set(CMAKE_CONFIGURATION_TYPES \"Release;RelWithDebInfo\")\nset(CMAKE_DEFAULT_BUILD_TYPE \"RelWithDebInfo\")",
+        )?;
+        assert!(
+            child_default_type
+                .iter()
+                .any(|c| c.contains("-DFROM_RELWITHDEBINFO")),
+            "{child_default_type:?}"
+        );
+        assert!(
+            !child_default_type
+                .iter()
+                .any(|c| c.contains("-DFROM_DEBUG")),
+            "{child_default_type:?}"
+        );
+
+        let child_first_type =
+            run_child_ninja_multi("set(CMAKE_CONFIGURATION_TYPES \"Release;Debug\")")?;
+        assert!(
+            child_first_type
+                .iter()
+                .any(|c| c.contains("-DFROM_RELEASE")),
+            "{child_first_type:?}"
+        );
+        assert!(
+            !child_first_type.iter().any(|c| c.contains("-DFROM_DEBUG")),
+            "{child_first_type:?}"
+        );
+
+        // Child with CMAKE_DEFAULT_BUILD_TYPE=Debug, CMAKE_CROSS_CONFIGS=all, and
+        // CMAKE_DEFAULT_CONFIGS=Release builds Release (the default target config), not Debug.
+        let child_default_configs = run_child_ninja_multi(
+            "set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
+             set(CMAKE_DEFAULT_BUILD_TYPE \"Debug\")\n\
+             set(CMAKE_CROSS_CONFIGS \"all\")\n\
+             set(CMAKE_DEFAULT_CONFIGS \"Release\")",
+        )?;
+        assert!(
+            child_default_configs
+                .iter()
+                .any(|c| c.contains("-DFROM_RELEASE")),
+            "{child_default_configs:?}"
+        );
+        assert!(
+            !child_default_configs
+                .iter()
+                .any(|c| c.contains("-DFROM_DEBUG")),
+            "{child_default_configs:?}"
+        );
+
+        // Child with CMAKE_DEFAULT_CONFIGS=all builds every cross configuration.
+        let child_default_all = run_child_ninja_multi(
+            "set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
+             set(CMAKE_DEFAULT_BUILD_TYPE \"Debug\")\n\
+             set(CMAKE_CROSS_CONFIGS \"all\")\n\
+             set(CMAKE_DEFAULT_CONFIGS \"all\")",
+        )?;
+        assert!(
+            child_default_all.iter().any(|c| c.contains("-DFROM_DEBUG")),
+            "{child_default_all:?}"
+        );
+        assert!(
+            child_default_all
+                .iter()
+                .any(|c| c.contains("-DFROM_RELEASE")),
+            "{child_default_all:?}"
+        );
+
+        // Child whose CMAKE_DEFAULT_BUILD_TYPE is absent from CMAKE_CONFIGURATION_TYPES fails
+        // membership validation instead of lowering an absent configuration.
+        {
+            let host = Arc::new(PureHost::default());
+            host.seed_file(Path::new(&format!("{DRIVE}/work/probe-cc")), b"")?;
+            host.seed_file(
+                Path::new(&format!("{DRIVE}/work/child/main.c")),
+                b"int main(void) { return 0; }\n",
+            )?;
+            host.seed_file(
+                Path::new(&format!("{DRIVE}/work/child/CMakeLists.txt")),
+                b"cmake_minimum_required(VERSION 4.5)\n\
+                  set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
+                  set(CMAKE_DEFAULT_BUILD_TYPE \"RelWithDebInfo\")\n\
+                  project(Child C)\n\
+                  add_executable(app main.c)\n",
+            )?;
+            host.set_command_handler(move |_, req, _| {
+                if let Some(cmd) = req.pipeline.first()
+                    && cmd.args.as_slice() == [rcmake_base::BString::from("--version")]
+                {
+                    return Ok(RunOutput {
+                        stdout: b"1.12.1\n".to_vec(),
+                        results: vec![ProcessResult::Exited(0)],
+                        ..RunOutput::default()
+                    });
+                }
+                Ok(RunOutput {
+                    results: vec![ProcessResult::Exited(0)],
+                    ..RunOutput::default()
+                })
+            })?;
+            let root = PathBuf::from(format!("{DRIVE}/work"));
+            host.seed_file(
+                &root.join("CMakeLists.txt"),
+                format!(
+                    "cmake_minimum_required(VERSION 4.5)\n\
+                     set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
+                     set(CMAKE_MAKE_PROGRAM \"{DRIVE}/work/ninja\")\n\
+                     set(CMAKE_C_COMPILER \"{DRIVE}/work/probe-cc\")\n\
+                     set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\n\
+                     set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> -c <SOURCE> -o <OBJECT> <FLAGS>\")\n\
+                     set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> <OBJECTS> -o <TARGET>\")\n\
+                     try_compile(OK PROJECT Child SOURCE_DIR \"{DRIVE}/work/child\" BINARY_DIR \"{DRIVE}/work/child-build\" TARGET app OUTPUT_VARIABLE LOG NO_LOG)\n"
+                )
+                .as_bytes(),
+            )?;
+            let mut interp = interpreter(host.clone(), &root)?;
+            interp.cx().project().generator = Some(GeneratorKind::NinjaMultiConfig);
+            let outcome = interp.run_configure(&root, &root.join("build"), &[]);
+            assert_eq!(
+                outcome.exit_code,
+                1,
+                "{}",
+                host.stream_bytes(Stream::Stderr)
+            );
+            assert!(
+                host.stream_bytes(Stream::Stderr)
+                    .to_string()
+                    .contains("Failed to generate test project build system."),
+                "{}",
+                host.stream_bytes(Stream::Stderr)
+            );
+            assert_eq!(interp.cx().var_or_empty(b"OK"), "FALSE");
+            assert!(
+                interp
+                    .cx()
+                    .var_or_empty(b"LOG")
+                    .to_string()
+                    .contains("not present in CMAKE_CONFIGURATION_TYPES"),
+                "{}",
+                interp.cx().var_or_empty(b"LOG")
+            );
+        }
+    }
+
+    // 4. Source-file try_compile on Xcode honors CMAKE_TRY_COMPILE_CONFIGURATION for CMP0066 flags.
+    {
+        let host = Arc::new(PureHost::default());
+        let seen_cmds = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_clone = seen_cmds.clone();
+        host.seed_file(Path::new(&format!("{DRIVE}/work/probe-cc")), b"")?;
+        host.seed_file(
+            Path::new(&format!("{DRIVE}/work/src.c")),
+            b"int main(void) { return 0; }\n",
+        )?;
+        host.set_command_handler(move |fs, req, _| {
+            if let Some(cmd) = req.pipeline.first() {
+                let rendered = format!(
+                    "{} {}",
+                    cmd.program,
+                    cmd.args
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                if let Ok(mut guard) = seen_clone.lock() {
+                    guard.push(rendered);
+                }
+                if let Some(pos) = cmd.args.iter().position(|a| a == "-o")
+                    && let Some(out) = cmd.args.get(pos + 1)
+                {
+                    let target = req.cwd.join(rcmake_host::path::to_native(out));
+                    if let Some(parent) = target.parent() {
+                        let _ = fs.create_dir_all(parent);
+                    }
+                    let _ = fs.write(&target, b"artifact", WriteMode::Truncate);
+                }
+                if cmd.args.as_slice() == [rcmake_base::BString::from("--version")] {
+                    return Ok(RunOutput {
+                        stdout: b"1.12.1\n".to_vec(),
+                        results: vec![ProcessResult::Exited(0)],
+                        ..RunOutput::default()
+                    });
+                }
+            }
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        let root = PathBuf::from(format!("{DRIVE}/work"));
+        host.seed_file(
+            &root.join("CMakeLists.txt"),
+            format!(
+                "cmake_minimum_required(VERSION 4.5)\n\
+                 set(CMAKE_CONFIGURATION_TYPES \"Release;Debug\")\n\
+                 set(CMAKE_TRY_COMPILE_CONFIGURATION \"RelWithDebInfo\")\n\
+                 set(CMAKE_C_COMPILER \"{DRIVE}/work/probe-cc\")\n\
+                 set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\n\
+                 set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> -c <SOURCE> -o <OBJECT> <FLAGS>\")\n\
+                 set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> <OBJECTS> -o <TARGET>\")\n\
+                 set(CMAKE_C_FLAGS_DEBUG \"-DCALLER_DEBUG\")\n\
+                 set(CMAKE_C_FLAGS_RELWITHDEBINFO \"-DCALLER_RELWITHDEBINFO\")\n\
+                 try_compile(OK SOURCES \"{DRIVE}/work/src.c\" NO_LOG)\n\
+                 if(NOT OK)\n  message(FATAL_ERROR \"source probe failed\")\nendif()\n"
+            )
+            .as_bytes(),
+        )?;
+        let mut interp = interpreter(host.clone(), &root)?;
+        interp.cx().project().generator = Some(GeneratorKind::Xcode);
+        let outcome = interp.run_configure(&root, &root.join("build"), &[]);
+        assert_eq!(
+            outcome.exit_code,
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        let cmds = seen_cmds.lock().map_err(|_| "lock poisoned")?.clone();
+        assert!(
+            cmds.iter().any(|c| c.contains("-DCALLER_RELWITHDEBINFO")),
+            "{cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("-DCALLER_DEBUG")),
+            "{cmds:?}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn ninja_verified_query_keeps_observe_and_speculate_probes_pure() -> TestResult {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rcmake_host::{HostError, RunRequest};
+    use rcmake_model::GeneratorKind;
+    use rcmake_store::{InputStamp, Trace, file_digest};
+
+    use super::journal::{DependencyClosure, JournalHost, JournalMode, ProcessVerifier};
+    use crate::configure::build_tool_facts::{BuildToolFacts, VerifiedNinja};
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let host = Arc::new(PureHost::default());
+    let root = PathBuf::from(format!("{DRIVE}/work"));
+    let ninja_path = root.join("bin/ninja");
+    host.seed_file(&ninja_path, b"\x7fELFninja-fixture")?;
+    host.set_permissions(&ninja_path, 0o755)?;
+    host.seed_file(
+        &root.join("child/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nproject(Child NONE)\n",
+    )?;
+    // Seed shared modules on `host` before creating any JournalHost so module setup does not
+    // look like an external write from inside the journaled probe.
+    let _seed = interpreter(host.clone(), &root)?;
+    host.seed_file(
+        &root.join("cmake/Modules/CMakeDetermineSystem.cmake"),
+        b"set(CMAKE_SYSTEM_LOADED 1)\n",
+    )?;
+    let ninja_str = rcmake_host::path::from_native(&ninja_path);
+    let launches_clone = launches.clone();
+    host.set_command_handler(move |_, req, _| {
+        launches_clone.fetch_add(1, Ordering::Relaxed);
+        let [cmd] = req.pipeline.as_slice() else {
+            return Err(HostError::unsupported("unexpected pipeline"));
+        };
+        if cmd.program == ninja_str
+            && cmd.args.as_slice() == [rcmake_base::BString::from("--version")]
+        {
+            return Ok(RunOutput {
+                stdout: b"1.12.1\n".to_vec(),
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            });
+        }
+        Err(HostError::unsupported("unexpected command"))
+    })?;
+
+    let facts = BuildToolFacts::default();
+    let digest = file_digest(host.as_ref(), &ninja_path)?;
+    let verified = facts
+        .sample_ninja(
+            host.as_ref(),
+            &ninja_path,
+            digest,
+            host.env_all(),
+            root.clone(),
+        )
+        .ok_or("expected verified ninja")?;
+    assert_eq!(launches.load(Ordering::Relaxed), 1);
+
+    struct NinjaVerifier {
+        ninja: VerifiedNinja,
+        hits: AtomicUsize,
+    }
+    impl ProcessVerifier for NinjaVerifier {
+        fn recorded_platform_query(&self, request: &RunRequest) -> Option<RunOutput> {
+            self.ninja.matches(request).then(|| {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                self.ninja.output.clone()
+            })
+        }
+        fn preflight(&self, _: &RunRequest) -> Option<Trace> {
+            None
+        }
+        fn dependencies(
+            &self,
+            _: &RunRequest,
+            _: &RunOutput,
+            _: &[InputStamp],
+        ) -> Option<DependencyClosure> {
+            None
+        }
+    }
+
+    let verifier = Arc::new(NinjaVerifier {
+        ninja: verified,
+        hits: AtomicUsize::new(0),
+    });
+    for mode in [JournalMode::Observe, JournalMode::Speculate] {
+        let scratch = root.join(format!("scratch-{mode:?}"));
+        host.create_dir_all(&scratch)?;
+        let journal = Arc::new(JournalHost::from_shared(
+            host.clone(),
+            &scratch,
+            verifier.clone(),
+            mode,
+        )?);
+        let mut child = Interp::new(
+            InterpConfig {
+                services: Default::default(),
+                host: journal.clone(),
+                mode: RunMode::Configure,
+                cmake_root: root.join("cmake"),
+                cmake_command: root.join("cmake/bin/cmake"),
+                cwd: root.clone(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        {
+            let mut cx = child.cx();
+            cx.project().generator = Some(GeneratorKind::Ninja);
+            cx.set_var(b"CMAKE_SYSTEM", cx.host().system().sysname);
+            cx.set_var(
+                b"CMAKE_MAKE_PROGRAM",
+                rcmake_host::path::from_native(&ninja_path),
+            );
+        }
+        let outcome = child.run_configure(&root.join("child"), &scratch, &[]);
+        assert_eq!(
+            outcome.exit_code,
+            0,
+            "mode={mode:?}: {}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        drop(child);
+        let finished = Arc::try_unwrap(journal)
+            .map_err(|_| HostError::unsupported("journal still held"))?
+            .finish();
+        assert_eq!(finished.impure(), None, "mode={mode:?} marked impure");
+    }
+    assert_eq!(
+        verifier.hits.load(Ordering::Relaxed),
+        2,
+        "both Observe and Speculate probes must replay Ninja version via recorded_platform_query"
+    );
+    assert_eq!(
+        launches.load(Ordering::Relaxed),
+        1,
+        "child probes must reuse verified Ninja evidence without extra spawns"
+    );
+    Ok(())
+}
+
 #[cfg(all(feature = "native", target_os = "macos"))]
 mod platform_queries {
     use std::sync::atomic::{AtomicUsize, Ordering};
