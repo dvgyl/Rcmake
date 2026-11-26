@@ -630,6 +630,8 @@ fn speculative_ninja_workers_never_spawn_ninja_version_checks() -> TestResult {
 
     let ninja_cwds = Arc::new(std::sync::Mutex::new(Vec::<std::path::PathBuf>::new()));
     let ninja_cwds_clone = Arc::clone(&ninja_cwds);
+    let speculative_cc_runs = Arc::new(AtomicUsize::new(0));
+    let speculative_cc_clone = Arc::clone(&speculative_cc_runs);
     inner.set_command_handler(move |host, request, _| {
         let command = request
             .pipeline
@@ -673,6 +675,12 @@ fn speculative_ninja_workers_never_spawn_ninja_version_checks() -> TestResult {
                 "Unexpected process: {}",
                 command.program
             )));
+        }
+        if request.cwd.to_string_lossy().contains("Spec-") {
+            speculative_cc_clone.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Pause briefly on foreground Probe 1 so the worker executes Probe 2 in Spec-*.
+            std::thread::sleep(Duration::from_millis(25));
         }
         let argument = |flag: &[u8]| {
             command.args.windows(2).find_map(|pair| match pair {
@@ -725,6 +733,10 @@ fn speculative_ninja_workers_never_spawn_ninja_version_checks() -> TestResult {
     assert_eq!(interp.cx().var_or_empty(b"OK1"), "TRUE");
     assert_eq!(interp.cx().var_or_empty(b"OK2"), "TRUE");
 
+    assert!(
+        speculative_cc_runs.load(Ordering::Relaxed) >= 1,
+        "expected speculative worker to compile Probe 2 in a Spec-* directory"
+    );
     let cwds = ninja_cwds
         .lock()
         .map_err(|_| HostError::unsupported("lock poisoned"))?;

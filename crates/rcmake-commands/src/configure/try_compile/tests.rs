@@ -867,34 +867,55 @@ fn multi_config_try_compile_honors_caller_config_and_xcode_debug_default() -> Te
         );
 
         // Child with CMAKE_DEFAULT_BUILD_TYPE=Debug, CMAKE_CROSS_CONFIGS=all, and
-        // CMAKE_DEFAULT_CONFIGS=Release builds a child-defined Debug generator executable
-        // (`gen_tool`) BEFORE invoking it in the (Debug, Release) cross graph so
-        // $<COMMAND_CONFIG:$<CONFIG>> is Debug and $<OUTPUT_CONFIG:$<CONFIG>> is Release.
+        // CMAKE_DEFAULT_CONFIGS=Release builds two child-defined Debug generator executables
+        // (`gen_tool_a` and `gen_tool_b`) that share one generated input (`shared.c`) BEFORE
+        // invoking them in the (Debug, Release) cross graph, deduplicating the shared producer
+        // step so it executes exactly once across the entire probe build.
         {
             let host = Arc::new(PureHost::default());
             let seen_cmds = Arc::new(Mutex::new(Vec::<String>::new()));
             let seen_clone = seen_cmds.clone();
             host.seed_file(Path::new(&format!("{DRIVE}/work/probe-cc")), b"")?;
+            host.seed_file(Path::new(&format!("{DRIVE}/work/make-shared")), b"")?;
             host.seed_file(
-                Path::new(&format!("{DRIVE}/work/child/gen_tool.c")),
+                Path::new(&format!("{DRIVE}/work/child/gen_tool_a.c")),
+                b"int main(void) { return 0; }\n",
+            )?;
+            host.seed_file(
+                Path::new(&format!("{DRIVE}/work/child/gen_tool_b.c")),
                 b"int main(void) { return 0; }\n",
             )?;
             host.seed_file(
                 Path::new(&format!("{DRIVE}/work/child/CMakeLists.txt")),
-                b"cmake_minimum_required(VERSION 4.5)\n\
-                  set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
-                  set(CMAKE_DEFAULT_BUILD_TYPE \"Debug\")\n\
-                  set(CMAKE_CROSS_CONFIGS \"all\")\n\
-                  set(CMAKE_DEFAULT_CONFIGS \"Release\")\n\
-                  set(CMAKE_C_FLAGS_DEBUG \"-DFROM_DEBUG\")\n\
-                  set(CMAKE_C_FLAGS_RELEASE \"-DFROM_RELEASE\")\n\
-                  project(Child C)\n\
-                  add_executable(gen_tool gen_tool.c)\n\
-                  add_custom_command(\n\
-                    OUTPUT \"${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/gen.c\"\n\
-                    COMMAND gen_tool \"--cmd=$<COMMAND_CONFIG:$<CONFIG>>\" \"--out=$<OUTPUT_CONFIG:$<CONFIG>>\" \"${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/gen.c\"\n\
-                  )\n\
-                  add_executable(app \"${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/gen.c\")\n",
+                format!(
+                    "cmake_minimum_required(VERSION 4.5)\n\
+                     set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
+                     set(CMAKE_DEFAULT_BUILD_TYPE \"Debug\")\n\
+                     set(CMAKE_CROSS_CONFIGS \"all\")\n\
+                     set(CMAKE_DEFAULT_CONFIGS \"Release\")\n\
+                     set(CMAKE_C_FLAGS_DEBUG \"-DFROM_DEBUG\")\n\
+                     set(CMAKE_C_FLAGS_RELEASE \"-DFROM_RELEASE\")\n\
+                     project(Child C)\n\
+                     add_custom_command(\n\
+                       OUTPUT \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/shared.c\"\n\
+                       COMMAND \"{DRIVE}/work/make-shared\" \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/shared.c\"\n\
+                     )\n\
+                     add_library(shared_dep STATIC \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/shared.c\")\n\
+                     add_executable(gen_tool_a gen_tool_a.c)\n\
+                     target_link_libraries(gen_tool_a PRIVATE shared_dep)\n\
+                     add_executable(gen_tool_b gen_tool_b.c)\n\
+                     target_link_libraries(gen_tool_b PRIVATE shared_dep)\n\
+                     add_custom_command(\n\
+                       OUTPUT \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen_a.c\"\n\
+                       COMMAND gen_tool_a \"--cmd=$<COMMAND_CONFIG:$<CONFIG>>\" \"--out=$<OUTPUT_CONFIG:$<CONFIG>>\" \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen_a.c\"\n\
+                     )\n\
+                     add_custom_command(\n\
+                       OUTPUT \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen_b.c\"\n\
+                       COMMAND gen_tool_b \"--cmd=$<COMMAND_CONFIG:$<CONFIG>>\" \"--out=$<OUTPUT_CONFIG:$<CONFIG>>\" \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen_b.c\"\n\
+                     )\n\
+                     add_executable(app \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen_a.c\" \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen_b.c\")\n"
+                )
+                .as_bytes(),
             )?;
             host.set_command_handler(move |fs, req, _| {
                 if let Some(cmd) = req.pipeline.first() {
@@ -911,8 +932,24 @@ fn multi_config_try_compile_honors_caller_config_and_xcode_debug_default() -> Te
                         guard.push(rendered);
                     }
                     let program_str = cmd.program.to_string();
-                    if program_str.ends_with("gen_tool") || program_str.ends_with("gen_tool.exe") {
-                        // Fail if the cross-config executor invokes gen_tool before building it.
+                    if program_str.ends_with("make-shared")
+                        && let Some(out) = cmd.args.last()
+                    {
+                        let target = req.cwd.join(rcmake_host::path::to_native(out));
+                        if let Some(parent) = target.parent() {
+                            let _ = fs.create_dir_all(parent);
+                        }
+                        let _ = fs.write(
+                            &target,
+                            b"int shared_sym(void) { return 1; }\n",
+                            WriteMode::Truncate,
+                        );
+                    }
+                    if program_str.ends_with("gen_tool_a")
+                        || program_str.ends_with("gen_tool_a.exe")
+                        || program_str.ends_with("gen_tool_b")
+                        || program_str.ends_with("gen_tool_b.exe")
+                    {
                         let tool_path = req.cwd.join(rcmake_host::path::to_native(&cmd.program));
                         if fs.metadata(&tool_path, rcmake_host::Follow::Yes).is_err() {
                             return Ok(RunOutput {
@@ -930,11 +967,12 @@ fn multi_config_try_compile_honors_caller_config_and_xcode_debug_default() -> Te
                             if let Some(parent) = target.parent() {
                                 let _ = fs.create_dir_all(parent);
                             }
-                            let _ = fs.write(
-                                &target,
-                                b"int main(void) { return 0; }\n",
-                                WriteMode::Truncate,
-                            );
+                            let body = if program_str.contains("gen_tool_a") {
+                                b"int main(void) { return 0; }\n".as_slice()
+                            } else {
+                                b"int helper_b(void) { return 0; }\n".as_slice()
+                            };
+                            let _ = fs.write(&target, body, WriteMode::Truncate);
                         }
                     }
                     if let Some(pos) = cmd.args.iter().position(|a| a == "-o")
@@ -969,6 +1007,7 @@ fn multi_config_try_compile_honors_caller_config_and_xcode_debug_default() -> Te
                      set(CMAKE_C_COMPILER \"{DRIVE}/work/probe-cc\")\n\
                      set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\n\
                      set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> -c <SOURCE> -o <OBJECT> <FLAGS>\")\n\
+                     set(CMAKE_C_CREATE_STATIC_LIBRARY \"<CMAKE_C_COMPILER> -o <TARGET> <OBJECTS>\")\n\
                      set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> <OBJECTS> -o <TARGET>\")\n\
                      try_compile(OK PROJECT Child SOURCE_DIR \"{DRIVE}/work/child\" BINARY_DIR \"{DRIVE}/work/child-build\" TARGET app NO_LOG)\n\
                      if(NOT OK)\n  message(FATAL_ERROR \"cross-config probe failed\")\nendif()\n"
@@ -985,24 +1024,45 @@ fn multi_config_try_compile_honors_caller_config_and_xcode_debug_default() -> Te
                 host.stream_bytes(Stream::Stderr)
             );
             let cmds = seen_cmds.lock().map_err(|_| "lock poisoned")?.clone();
-            let build_gen_idx = cmds
+            let shared_runs = cmds.iter().filter(|c| c.contains("make-shared")).count();
+            assert_eq!(
+                shared_runs, 1,
+                "shared Debug producer step must run exactly once across both tools, got {cmds:?}"
+            );
+            let shared_idx = cmds.iter().position(|c| c.contains("make-shared"));
+            let build_gen_a = cmds
                 .iter()
-                .position(|c| c.contains("gen_tool.c") && c.contains("-DFROM_DEBUG"));
-            let run_gen_idx = cmds.iter().position(|c| {
-                c.contains("Debug/gen_tool")
+                .position(|c| c.contains("gen_tool_a.c") && c.contains("-DFROM_DEBUG"));
+            let build_gen_b = cmds
+                .iter()
+                .position(|c| c.contains("gen_tool_b.c") && c.contains("-DFROM_DEBUG"));
+            let run_gen_a = cmds.iter().position(|c| {
+                c.contains("Debug/gen_tool_a")
                     && c.contains("--cmd=Debug")
                     && c.contains("--out=Release")
             });
-            let build_app_idx = cmds
+            let run_gen_b = cmds.iter().position(|c| {
+                c.contains("Debug/gen_tool_b")
+                    && c.contains("--cmd=Debug")
+                    && c.contains("--out=Release")
+            });
+            let build_app = cmds
                 .iter()
-                .position(|c| c.contains("Release/gen.c") && c.contains("-DFROM_RELEASE"));
+                .position(|c| c.contains("Release/gen_a.c") && c.contains("-DFROM_RELEASE"));
             assert!(
-                build_gen_idx.is_some()
-                    && run_gen_idx.is_some()
-                    && build_app_idx.is_some()
-                    && build_gen_idx < run_gen_idx
-                    && run_gen_idx < build_app_idx,
-                "expected Debug gen_tool build -> Debug/gen_tool invocation -> Release app build, got {cmds:?}"
+                shared_idx.is_some()
+                    && build_gen_a.is_some()
+                    && build_gen_b.is_some()
+                    && run_gen_a.is_some()
+                    && run_gen_b.is_some()
+                    && build_app.is_some()
+                    && shared_idx < build_gen_a
+                    && shared_idx < build_gen_b
+                    && build_gen_a < run_gen_a
+                    && build_gen_b < run_gen_b
+                    && run_gen_a < build_app
+                    && run_gen_b < build_app,
+                "expected shared Debug producer once -> Debug tools -> Release custom commands -> Release app, got {cmds:?}"
             );
         }
 

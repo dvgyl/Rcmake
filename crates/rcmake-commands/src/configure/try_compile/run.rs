@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, list};
@@ -7,7 +7,7 @@ use rcmake_eval::Cx;
 use rcmake_genex::ConfigId;
 use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest, path};
 use rcmake_model::{DirId, GeneratorKind, ProjectModel};
-use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult};
+use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult, GraphTarget};
 
 mod apple;
 pub(super) mod cross;
@@ -123,6 +123,26 @@ pub(super) fn build_child(
         }
     }
     let requested: Vec<BString> = target.into_iter().map(BString::from).collect();
+    let (merged_graph, merged_targets) = merge_probe_graphs(
+        &model,
+        &resolved,
+        &plan.file_config,
+        &plan.build_configs,
+        &requested,
+    )?;
+    for (relative, contents) in &merged_graph.swift_output_file_maps {
+        let full = directory.join(path::to_native(relative));
+        if let Some(parent) = full.parent() {
+            child
+                .host()
+                .create_dir_all(parent)
+                .map_err(|error| ChildError::Generate(error.to_string()))?;
+        }
+        child
+            .host()
+            .write(&full, contents.as_slice(), rcmake_host::WriteMode::Truncate)
+            .map_err(|error| ChildError::Generate(error.to_string()))?;
+    }
     let header = build_log_header(
         child,
         directory,
@@ -134,30 +154,14 @@ pub(super) fn build_child(
         profile.span(b"probe.resolve", start);
     }
     let build_start = profile.map(ProbeProfile::now);
-    let mut combined = BuildOutcome {
-        success: true,
-        exit_code: 0,
-        steps_run: 0,
-        output: BString::default(),
+    let options = BuildOptions {
+        build_dir: directory.to_path_buf(),
+        targets: merged_targets,
+        verbose: source_signature,
+        ..BuildOptions::default()
     };
-    let mut state = CrossBuildState::default();
-    for target_cfg in &plan.build_configs {
-        execute_with_cross_deps(
-            child,
-            &model,
-            &resolved,
-            directory,
-            &plan.file_config,
-            target_cfg,
-            &requested,
-            source_signature,
-            &mut state,
-            &mut combined,
-        )?;
-        if !combined.success {
-            break;
-        }
-    }
+    let combined = rcmake_build::execute(&merged_graph, child.host(), &options)
+        .map_err(|error| ChildError::Build(error.to_string()))?;
     if let (Some(profile), Some(start)) = (profile, build_start) {
         profile.span(b"probe.build", start);
     }
@@ -185,179 +189,189 @@ fn select_graph<'a>(
     })
 }
 
-fn write_swift_maps(
-    child: &mut Cx<'_>,
-    directory: &Path,
-    graph: &BuildGraph,
-    swift_written: &mut HashSet<(ConfigId, ConfigId)>,
-    key: (ConfigId, ConfigId),
-) -> Result<(), ChildError> {
-    if !swift_written.insert(key) {
-        return Ok(());
-    }
-    for (relative, contents) in &graph.swift_output_file_maps {
-        let full = directory.join(path::to_native(relative));
-        if let Some(parent) = full.parent() {
-            child
-                .host()
-                .create_dir_all(parent)
-                .map_err(|error| ChildError::Generate(error.to_string()))?;
-        }
-        child
-            .host()
-            .write(&full, contents.as_slice(), rcmake_host::WriteMode::Truncate)
-            .map_err(|error| ChildError::Generate(error.to_string()))?;
-    }
-    Ok(())
-}
-
-/// Collect target dependencies in other configurations referenced by custom commands
-/// reachable from `requested` in `graph` (for example a file-configuration generator
-/// executable invoked by a cross-config custom command).
-fn reachable_cross_deps(
+/// Merge all reachable per-configuration and cross-configuration graphs into one unified
+/// [`BuildGraph`] so `rcmake_build::execute` schedules every target and deduplicates
+/// shared steps across all configurations in a single pass.
+fn merge_probe_graphs(
     model: &ProjectModel,
-    graph: &BuildGraph,
+    resolved: &GenerationResult,
+    file_config: &ConfigId,
+    build_configs: &[ConfigId],
     requested: &[BString],
-) -> Vec<(ConfigId, BString)> {
-    let mut roots = Vec::new();
-    if requested.is_empty() {
-        roots.extend(
+) -> Result<(BuildGraph, Vec<BString>), ChildError> {
+    struct Merger<'a> {
+        model: &'a ProjectModel,
+        resolved: &'a GenerationResult,
+        file_config: &'a ConfigId,
+        merged: BuildGraph,
+        target_map: HashMap<(ConfigId, usize), usize>,
+        step_map: HashMap<(ConfigId, usize), usize>,
+        shared_custom: HashMap<Vec<BString>, usize>,
+    }
+
+    impl<'a> Merger<'a> {
+        fn import_step(
+            &mut self,
+            cfg: &ConfigId,
+            graph: &BuildGraph,
+            orig_step: usize,
+        ) -> Result<usize, ChildError> {
+            let key = (cfg.clone(), orig_step);
+            if let Some(&existing) = self.step_map.get(&key) {
+                return Ok(existing);
+            }
+            let Some(step) = graph.steps.get(orig_step) else {
+                return Err(ChildError::Generate(format!(
+                    "Missing build step {orig_step} in configuration '{}'.",
+                    cfg.0
+                )));
+            };
+            if let BuildStep::Custom(custom) = step
+                && !custom.symbolic
+                && !custom.outputs.is_empty()
+                && let Some(&existing) = self.shared_custom.get(&custom.outputs)
+                && self.merged.steps.get(existing) == Some(step)
+            {
+                self.step_map.insert(key, existing);
+                return Ok(existing);
+            }
+            let merged_idx = self.merged.steps.len();
+            if let BuildStep::Custom(custom) = step
+                && !custom.symbolic
+                && !custom.outputs.is_empty()
+            {
+                self.shared_custom
+                    .entry(custom.outputs.clone())
+                    .or_insert(merged_idx);
+            }
+            self.merged.steps.push(step.clone());
+            self.step_map.insert(key, merged_idx);
+            Ok(merged_idx)
+        }
+
+        fn import_target(&mut self, cfg: &ConfigId, orig_idx: usize) -> Result<usize, ChildError> {
+            let key = (cfg.clone(), orig_idx);
+            if let Some(&existing) = self.target_map.get(&key) {
+                return Ok(existing);
+            }
+            let graph = select_graph(self.resolved, self.file_config, cfg)?;
+            let Some(orig_target) = graph.targets.get(orig_idx) else {
+                return Err(ChildError::Generate(format!(
+                    "Missing build target {orig_idx} in configuration '{}'.",
+                    cfg.0
+                )));
+            };
+            for (path, content) in &graph.swift_output_file_maps {
+                self.merged
+                    .swift_output_file_maps
+                    .entry(path.clone())
+                    .or_insert_with(|| content.clone());
+            }
+            let merged_idx = self.merged.targets.len();
+            self.target_map.insert(key, merged_idx);
+            let synthetic_name: BString =
+                format!("__rcmake_probe_{merged_idx}__{}", orig_target.name).into();
+            self.merged.targets.push(GraphTarget {
+                name: synthetic_name,
+                steps: Vec::new(),
+                depends: Vec::new(),
+                in_all: orig_target.in_all,
+            });
+
+            let orig_depends = orig_target.depends.clone();
+            let orig_steps = orig_target.steps.clone();
+            let mut merged_depends = Vec::with_capacity(orig_depends.len());
+            for dep_idx in orig_depends {
+                let merged_dep = self.import_target(cfg, dep_idx)?;
+                if !merged_depends.contains(&merged_dep) {
+                    merged_depends.push(merged_dep);
+                }
+            }
+
+            let mut merged_steps = Vec::with_capacity(orig_steps.len());
+            for orig_step in orig_steps {
+                let cross_deps = match graph.steps.get(orig_step) {
+                    Some(BuildStep::Custom(custom)) => custom
+                        .target_dependencies
+                        .iter()
+                        .filter(|(_, dep_cfg)| dep_cfg != cfg)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                for (dep_id, dep_cfg) in cross_deps {
+                    let dep_graph = select_graph(self.resolved, self.file_config, &dep_cfg)?;
+                    let dep_orig = dep_graph
+                        .target_ids
+                        .iter()
+                        .position(|id| *id == dep_id)
+                        .or_else(|| {
+                            self.model.target(dep_id).and_then(|t| {
+                                dep_graph.targets.iter().position(|gt| gt.name == t.name)
+                            })
+                        });
+                    if let Some(dep_orig) = dep_orig {
+                        let merged_dep = self.import_target(&dep_cfg, dep_orig)?;
+                        if !merged_depends.contains(&merged_dep) {
+                            merged_depends.push(merged_dep);
+                        }
+                    }
+                }
+                let merged_step = self.import_step(cfg, graph, orig_step)?;
+                merged_steps.push(merged_step);
+            }
+
+            if let Some(slot) = self.merged.targets.get_mut(merged_idx) {
+                slot.steps = merged_steps;
+                slot.depends = merged_depends;
+            }
+            Ok(merged_idx)
+        }
+    }
+
+    let mut merger = Merger {
+        model,
+        resolved,
+        file_config,
+        merged: BuildGraph {
+            config: file_config.clone(),
+            ..BuildGraph::default()
+        },
+        target_map: HashMap::new(),
+        step_map: HashMap::new(),
+        shared_custom: HashMap::new(),
+    };
+
+    let mut root_names = Vec::new();
+    for target_cfg in build_configs {
+        let graph = select_graph(resolved, file_config, target_cfg)?;
+        let root_indices: Vec<usize> = if requested.is_empty() {
             graph
                 .targets
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, target)| target.in_all.then_some(idx)),
-        );
-    } else {
-        for name in requested {
-            if let Some(idx) = graph.targets.iter().position(|t| &t.name == name) {
-                roots.push(idx);
+                .filter_map(|(idx, target)| target.in_all.then_some(idx))
+                .collect()
+        } else {
+            let mut indices = Vec::with_capacity(requested.len());
+            for name in requested {
+                let idx = graph
+                    .targets
+                    .iter()
+                    .position(|target| &target.name == name)
+                    .ok_or_else(|| ChildError::Build(format!("unknown target {name}")))?;
+                indices.push(idx);
             }
-        }
-    }
-    let mut seen = vec![false; graph.targets.len()];
-    let mut stack = roots;
-    let mut deps = Vec::new();
-    let mut seen_deps = HashSet::new();
-    while let Some(idx) = stack.pop() {
-        let Some(flag) = seen.get_mut(idx) else {
-            continue;
+            indices
         };
-        if *flag {
-            continue;
-        }
-        *flag = true;
-        let Some(target) = graph.targets.get(idx) else {
-            continue;
-        };
-        for &dep in &target.depends {
-            stack.push(dep);
-        }
-        for &step_idx in &target.steps {
-            if let Some(BuildStep::Custom(custom)) = graph.steps.get(step_idx) {
-                for (dep_id, dep_cfg) in &custom.target_dependencies {
-                    if *dep_cfg != graph.config
-                        && let Some(dep_name) = model.target(*dep_id).map(|t| t.name.clone())
-                        && seen_deps.insert((dep_cfg.clone(), dep_name.clone()))
-                    {
-                        deps.push((dep_cfg.clone(), dep_name));
-                    }
-                }
+        for orig_idx in root_indices {
+            let merged_idx = merger.import_target(target_cfg, orig_idx)?;
+            if let Some(target) = merger.merged.targets.get(merged_idx) {
+                root_names.push(target.name.clone());
             }
         }
     }
-    deps
-}
-
-#[derive(Default)]
-struct CrossBuildState {
-    visiting: HashSet<(ConfigId, Option<BString>)>,
-    built: HashSet<(ConfigId, BString)>,
-    swift_written: HashSet<(ConfigId, ConfigId)>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_with_cross_deps(
-    child: &mut Cx<'_>,
-    model: &ProjectModel,
-    resolved: &GenerationResult,
-    directory: &Path,
-    file_config: &ConfigId,
-    target_cfg: &ConfigId,
-    requested: &[BString],
-    source_signature: bool,
-    state: &mut CrossBuildState,
-    combined: &mut BuildOutcome,
-) -> Result<(), ChildError> {
-    let graph = select_graph(resolved, file_config, target_cfg)?;
-    write_swift_maps(
-        child,
-        directory,
-        graph,
-        &mut state.swift_written,
-        (file_config.clone(), target_cfg.clone()),
-    )?;
-    let visit_keys: Vec<_> = if requested.is_empty() {
-        vec![(target_cfg.clone(), None)]
-    } else {
-        requested
-            .iter()
-            .map(|name| (target_cfg.clone(), Some(name.clone())))
-            .collect()
-    };
-    for key in &visit_keys {
-        if !state.visiting.insert(key.clone()) {
-            return Err(ChildError::Build("dependency cycle".into()));
-        }
-    }
-    let cross_deps = reachable_cross_deps(model, graph, requested);
-    for (dep_cfg, dep_name) in cross_deps {
-        if state.built.contains(&(dep_cfg.clone(), dep_name.clone())) {
-            continue;
-        }
-        execute_with_cross_deps(
-            child,
-            model,
-            resolved,
-            directory,
-            file_config,
-            &dep_cfg,
-            std::slice::from_ref(&dep_name),
-            source_signature,
-            state,
-            combined,
-        )?;
-        if !combined.success {
-            for key in &visit_keys {
-                state.visiting.remove(key);
-            }
-            return Ok(());
-        }
-        state.built.insert((dep_cfg, dep_name));
-    }
-    let options = BuildOptions {
-        build_dir: directory.to_path_buf(),
-        targets: requested.to_vec(),
-        verbose: source_signature,
-        ..BuildOptions::default()
-    };
-    let outcome = rcmake_build::execute(graph, child.host(), &options)
-        .map_err(|error| ChildError::Build(error.to_string()))?;
-    for key in &visit_keys {
-        state.visiting.remove(key);
-    }
-    for name in requested {
-        if outcome.success {
-            state.built.insert((target_cfg.clone(), name.clone()));
-        }
-    }
-    combined.steps_run += outcome.steps_run;
-    combined.output.extend_from_slice(&outcome.output);
-    if !outcome.success {
-        combined.success = false;
-        combined.exit_code = outcome.exit_code;
-    }
-    Ok(())
+    Ok((merger.merged, root_names))
 }
 
 /// Match CMake's `cmGlobalNinjaMultiGenerator::InspectConfigTypeVariables` and
