@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import io
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -27,7 +29,8 @@ SCHEMA_PATH = ROOT / "site" / "data" / "dashboard.schema.json"
 
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 STALE = "fedcba9876543210fedcba9876543210fedcba98"
-DIGEST = sha256(b"mock frozen rcmake release binary").hexdigest()
+BINARY_BYTES = b"mock frozen rcmake release binary"
+DIGEST = sha256(BINARY_BYTES).hexdigest()
 STALE_DIGEST = "b" * 64
 
 
@@ -164,7 +167,11 @@ class AssembleReleaseReceiptsTests(unittest.TestCase):
 
     def populate_tarball(self, target_dir: Path) -> tuple[str, str, str]:
         archive = target_dir / "rcmake-0.1.0-aarch64-apple-darwin.tar.gz"
-        archive.write_bytes(b"mock frozen release archive")
+        with tarfile.open(archive, "w:gz") as tar:
+            info = tarfile.TarInfo(name="rcmake-0.1.0-aarch64-apple-darwin/bin/rcmake")
+            info.size = len(BINARY_BYTES)
+            info.mode = 0o755
+            tar.addfile(info, io.BytesIO(BINARY_BYTES))
         tarball_sha = sha256(archive.read_bytes()).hexdigest()
         sha_file = archive.with_suffix(".gz.sha256")
         sha_file.write_text(f"{tarball_sha}  {archive.name}\n", encoding="ascii")

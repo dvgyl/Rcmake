@@ -24,10 +24,12 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import sys
+import tarfile
 from typing import Any, Callable
+import zipfile
 
 if __package__:
     from . import build_dashboard_json as builder
@@ -134,9 +136,6 @@ DISCOVERY_CANDIDATES: dict[str, tuple[str, ...]] = {
     "cli_ux": ("cli-ux.json", "cli_ux.json"),
     "path_swap": ("path-swap.json", "path_swap.json", "path-swap-gate.json"),
     "dist": ("dist.json", "dist-tarball.json", "dist_tarball.json"),
-}
-
-OPTIONAL_DISCOVERY_CANDIDATES: dict[str, tuple[str, ...]] = {
     "ci_jobs": ("ci-jobs.json", "ci_jobs.json", "ci-status.json", "ci_status.json"),
 }
 
@@ -1479,18 +1478,100 @@ def check_path_swap(record: ReceiptRecord, findings: list[Finding]) -> None:
             ))
 
 
+ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".tar.xz", ".zip")
+
+
+def _is_packaged_rcmake_member(name: str) -> bool:
+    raw = name.replace("\\", "/")
+    if not raw or raw.startswith("/") or "\x00" in raw:
+        return False
+    parts = PurePosixPath(raw).parts
+    if ".." in parts:
+        return False
+    clean = tuple(part for part in parts if part not in ("", "."))
+    if len(clean) == 2:
+        return clean[0] == "bin" and clean[1] in ("rcmake", "rcmake.exe")
+    if len(clean) == 3:
+        return clean[1] == "bin" and clean[2] in ("rcmake", "rcmake.exe")
+    return False
+
+
+def hash_packaged_executable(archive_path: Path) -> tuple[str, str]:
+    """Streamingly hash bin/rcmake(.exe) inside a release archive without extracting it."""
+    name_lower = archive_path.name.lower()
+    if name_lower.endswith((".tar.gz", ".tgz")):
+        tar_mode = "r:gz"
+    elif name_lower.endswith(".tar.xz"):
+        tar_mode = "r:xz"
+    elif name_lower.endswith(".zip"):
+        tar_mode = None
+    else:
+        raise ValueError(f"Unsupported release archive extension: {archive_path.name}")
+
+    matches: list[tuple[str, str]] = []
+    if tar_mode is not None:
+        with tarfile.open(archive_path, tar_mode) as tar:
+            for member in tar:
+                if not _is_packaged_rcmake_member(member.name):
+                    continue
+                if not member.isfile():
+                    raise ValueError(f"Packaged executable {member.name!r} is not a regular file.")
+                stream = tar.extractfile(member)
+                if stream is None:
+                    raise ValueError(f"Could not read packaged executable {member.name!r}.")
+                digest = hashlib.sha256()
+                total = 0
+                with stream:
+                    for chunk in iter(lambda: stream.read(65536), b""):
+                        total += len(chunk)
+                        digest.update(chunk)
+                if total <= 0:
+                    raise ValueError(f"Packaged executable {member.name!r} is empty.")
+                matches.append((member.name, digest.hexdigest()))
+    else:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for info in zf.infolist():
+                if not _is_packaged_rcmake_member(info.filename):
+                    continue
+                if info.is_dir():
+                    raise ValueError(f"Packaged executable {info.filename!r} is a directory.")
+                unix_type = (info.external_attr >> 16) & 0o170000
+                if unix_type == 0o120000:
+                    raise ValueError(f"Packaged executable {info.filename!r} is a symlink.")
+                digest = hashlib.sha256()
+                total = 0
+                with zf.open(info, "r") as stream:
+                    for chunk in iter(lambda: stream.read(65536), b""):
+                        total += len(chunk)
+                        digest.update(chunk)
+                if total <= 0:
+                    raise ValueError(f"Packaged executable {info.filename!r} is empty.")
+                matches.append((info.filename, digest.hexdigest()))
+
+    if not matches:
+        raise ValueError(f"Archive {archive_path.name} does not contain bin/rcmake or bin/rcmake.exe.")
+    if len(matches) > 1:
+        names = ", ".join(item[0] for item in matches)
+        raise ValueError(f"Archive {archive_path.name} contains multiple packaged executables: {names}.")
+    return matches[0]
+
+
 def check_dist(record: ReceiptRecord, findings: list[Finding]) -> None:
     payload = record.payload
     tarball = payload.get("tarball")
     tarball_sha = normalize_sha256(payload.get("tarball_sha256", payload.get("tarballSha256")))
-    if not isinstance(tarball, str) or not tarball.endswith((".tar.gz", ".zip")):
+    expected_binary = (
+        normalize_sha256(record.file_binary_sha256)
+        or normalize_sha256(record.envelope_binary_sha256)
+    )
+    if not isinstance(tarball, str) or not tarball.endswith(ARCHIVE_SUFFIXES) or Path(tarball).name != tarball:
         findings.append(Finding(
             track=record.track,
             receipt=record.key,
             kind="invalid",
-            expected="tarball filename ending in .tar.gz or .zip",
+            expected="tarball filename ending in .tar.gz, .tgz, .tar.xz, or .zip",
             actual=str(tarball),
-            detail="dist.sh receipt must identify the packaged release archive.",
+            detail="dist.sh receipt must identify the packaged release archive filename.",
         ))
     if tarball_sha is None:
         findings.append(Finding(
@@ -1514,6 +1595,15 @@ def check_dist(record: ReceiptRecord, findings: list[Finding]) -> None:
         ))
     else:
         tarball_path = resolve_path(tarball_path_raw, record.base_dir)
+        if isinstance(tarball, str) and tarball.strip() and tarball_path.name != Path(tarball).name:
+            findings.append(Finding(
+                track=record.track,
+                receipt=record.key,
+                kind="mismatch",
+                expected=f"archive path basename == {Path(tarball).name}",
+                actual=tarball_path.name,
+                detail="dist.sh receipt tarball label disagrees with the referenced archive path basename.",
+            ))
         if not tarball_path.is_file():
             findings.append(Finding(
                 track=record.track,
@@ -1523,17 +1613,42 @@ def check_dist(record: ReceiptRecord, findings: list[Finding]) -> None:
                 actual="missing",
                 detail="Referenced dist.sh tarball does not exist on disk.",
             ))
-        elif tarball_sha is not None:
-            actual_sha = sha256_file(tarball_path)
-            if actual_sha != tarball_sha:
+        else:
+            if tarball_sha is not None:
+                actual_sha = sha256_file(tarball_path)
+                if actual_sha != tarball_sha:
+                    findings.append(Finding(
+                        track=record.track,
+                        receipt=record.key,
+                        kind="mismatch",
+                        expected=tarball_sha,
+                        actual=actual_sha,
+                        detail="dist.sh tarball SHA-256 on disk does not match receipt tarball_sha256.",
+                    ))
+            try:
+                member_name, packaged_sha = hash_packaged_executable(tarball_path)
+            except (tarfile.TarError, zipfile.BadZipFile, EOFError, OSError, ValueError) as error:
                 findings.append(Finding(
                     track=record.track,
                     receipt=record.key,
-                    kind="mismatch",
-                    expected=tarball_sha,
-                    actual=actual_sha,
-                    detail="dist.sh tarball SHA-256 on disk does not match receipt tarball_sha256.",
+                    kind="invalid",
+                    expected="valid release archive containing bin/rcmake or bin/rcmake.exe",
+                    actual=str(error),
+                    detail="Referenced release archive could not be verified as a valid archive with bin/rcmake.",
                 ))
+            else:
+                if expected_binary is not None and packaged_sha != expected_binary:
+                    findings.append(Finding(
+                        track=record.track,
+                        receipt=record.key,
+                        kind="mismatch",
+                        expected=expected_binary,
+                        actual=packaged_sha,
+                        detail=(
+                            f"Packaged executable {member_name} inside {tarball_path.name} "
+                            "does not match receipt binary_sha256."
+                        ),
+                    ))
 
     sha256_path_raw = payload.get("sha256_path", payload.get("checksum_path"))
     if not isinstance(sha256_path_raw, str) or not sha256_path_raw.strip():
@@ -1625,24 +1740,43 @@ def ci_jobs_issues(
 
 def check_ci_jobs(record: ReceiptRecord, findings: list[Finding]) -> None:
     payload = record.payload
-    run_conclusion = payload.get("run_conclusion")
-    if run_conclusion is not None and str(run_conclusion).strip().lower() != "success":
+    run_conclusion = payload.get("run_conclusion", payload.get("conclusion"))
+    if not isinstance(run_conclusion, str) or not run_conclusion.strip():
+        findings.append(Finding(
+            track=record.track,
+            receipt=record.key,
+            kind="missing",
+            expected="run_conclusion == 'success'",
+            actual=str(run_conclusion),
+            detail="CI receipt must record workflow run_conclusion ('success').",
+        ))
+    elif run_conclusion.strip().lower() != "success":
         findings.append(Finding(
             track=record.track,
             receipt=record.key,
             kind="failed",
             expected="run_conclusion == 'success'",
-            actual=str(run_conclusion),
+            actual=run_conclusion.strip(),
             detail="CI workflow run conclusion must be 'success'.",
         ))
+
     event = payload.get("event", payload.get("run_event"))
-    if event is not None and str(event).strip().lower() not in CI_ALLOWED_EVENTS:
+    if not isinstance(event, str) or not event.strip():
+        findings.append(Finding(
+            track=record.track,
+            receipt=record.key,
+            kind="missing",
+            expected="event in ('push', 'workflow_dispatch')",
+            actual=str(event),
+            detail="CI receipt must record the triggering workflow event ('push' or 'workflow_dispatch').",
+        ))
+    elif event.strip().lower() not in CI_ALLOWED_EVENTS:
         findings.append(Finding(
             track=record.track,
             receipt=record.key,
             kind="failed",
             expected="event in ('push', 'workflow_dispatch')",
-            actual=str(event),
+            actual=event.strip(),
             detail="CI receipt must come from a push or workflow_dispatch run so corpus smoke jobs run.",
         ))
 
@@ -1710,6 +1844,7 @@ REQUIRED_RECEIPTS: tuple[ReceiptSpec, ...] = (
     ReceiptSpec("cli_ux", "track6-ux-packaging", check_cli_ux),
     ReceiptSpec("path_swap", "track6-ux-packaging", check_path_swap),
     ReceiptSpec("dist", "track6-ux-packaging", check_dist),
+    ReceiptSpec("ci_jobs", "track6-ux-packaging", check_ci_jobs),
 )
 
 
@@ -1882,13 +2017,12 @@ def check_dashboard(
 
 def discover_receipts_in_dir(directory: Path) -> dict[str, Path]:
     found: dict[str, Path] = {}
-    for mapping in (DISCOVERY_CANDIDATES, OPTIONAL_DISCOVERY_CANDIDATES):
-        for key, candidates in mapping.items():
-            for name in candidates:
-                candidate = directory / name
-                if candidate.exists():
-                    found[key] = candidate
-                    break
+    for key, candidates in DISCOVERY_CANDIDATES.items():
+        for name in candidates:
+            candidate = directory / name
+            if candidate.exists():
+                found[key] = candidate
+                break
     return found
 
 
@@ -2084,15 +2218,14 @@ def _verify_receipt_entries(
         check_identity(record, expected_commit, expected_binary, findings)
         spec.validator(record, findings)
 
-    # Also validate identity (and 6-job CI rules for ci_jobs) on any extra optional receipts in the manifest.
+    # Also validate identity on any extra optional receipts in the manifest.
     required_keys = {spec.key for spec in REQUIRED_RECEIPTS}
     for extra_key in sorted(set(entries) - required_keys):
-        extra_track = "track6-ux-packaging" if extra_key == "ci_jobs" else "extra"
         try:
-            record = load_receipt_entry(extra_key, extra_track, entries[extra_key], base_dir)
+            record = load_receipt_entry(extra_key, "extra", entries[extra_key], base_dir)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             findings.append(Finding(
-                track=extra_track,
+                track="extra",
                 receipt=extra_key,
                 kind="invalid",
                 expected="valid JSON receipt",
@@ -2102,8 +2235,6 @@ def _verify_receipt_entries(
             continue
         checked.append(extra_key)
         check_identity(record, expected_commit, expected_binary, findings)
-        if extra_key == "ci_jobs":
-            check_ci_jobs(record, findings)
 
     return checked
 

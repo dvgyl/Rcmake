@@ -134,9 +134,38 @@ if "$uninstall"; then
       removed+=("$data_dir")
     fi
   fi
+  doc_manifest="$doc_dir/.rcmake-manifest"
+  if [[ -f "$doc_manifest" && ! -L "$doc_manifest" ]]; then
+    while IFS= read -r rel || [[ -n "$rel" ]]; do
+      [[ -z "$rel" ]] && continue
+      case "$rel" in
+        /*|..|../*|*/..|*/../*|.) continue ;;
+      esac
+      target="$doc_dir/$rel"
+      if [[ -f "$target" && ! -L "$target" ]]; then
+        rm -f "$target"
+        removed+=("$target")
+        parent="$(dirname "$target")"
+        while [[ "$parent" != "$doc_dir" && "$parent" == "$doc_dir/"* ]]; do
+          rmdir "$parent" 2>/dev/null || break
+          parent="$(dirname "$parent")"
+        done
+      fi
+    done < "$doc_manifest"
+    rm -f "$doc_manifest"
+  elif [[ -d "$doc_dir" && ! -L "$doc_dir" ]]; then
+    for notice in LICENSE-APACHE LICENSE-MIT THIRD_PARTY_NOTICES.md; do
+      target="$doc_dir/$notice"
+      if [[ -f "$target" && ! -L "$target" ]]; then
+        rm -f "$target"
+        removed+=("$target")
+      fi
+    done
+  fi
   if [[ -d "$doc_dir" && ! -L "$doc_dir" ]]; then
-    rm -rf "$doc_dir"
-    removed+=("$doc_dir")
+    rmdir "$doc_dir/third_party/licences" 2>/dev/null || true
+    rmdir "$doc_dir/third_party" 2>/dev/null || true
+    rmdir "$doc_dir" 2>/dev/null || true
     rmdir "$prefix/share/doc" 2>/dev/null || true
   fi
   for extra in "${extra_share_files[@]}"; do
@@ -381,76 +410,200 @@ try:
 
         staged_extras = [rel for rel in extra_share_files if (work / rel).is_file()]
         staged_doc = work / doc_dir
-        has_docs = staged_doc.is_dir() and any(path.is_file() for path in staged_doc.rglob("*"))
+        staged_doc_files = (
+            sorted(path.relative_to(staged_doc) for path in staged_doc.rglob("*") if path.is_file())
+            if staged_doc.is_dir()
+            else []
+        )
+        has_docs = bool(staged_doc_files)
         installed_doc = prefix / doc_dir
+        doc_manifest_rel = Path(".rcmake-manifest")
+        doc_manifest_path = installed_doc / doc_manifest_rel
         bin_dir = prefix / "bin"
-        bin_dir.mkdir(exist_ok=True)
+        installed_data = prefix / data_dir
+
+        def check_ancestor_dirs(target_path: Path, *, reject_symlinks_under: Path | None = None) -> None:
+            ancestors: list[Path] = []
+            cur = target_path.parent
+            while cur != prefix and cur != cur.parent:
+                ancestors.append(cur)
+                cur = cur.parent
+            for directory in reversed(ancestors):
+                if not os.path.lexists(directory):
+                    continue
+                if (
+                    reject_symlinks_under is not None
+                    and directory.is_relative_to(reject_symlinks_under)
+                    and directory.is_symlink()
+                ):
+                    raise ValueError(
+                        f"{directory} is a symlink. Remove it, then run the installer again."
+                    )
+                if not directory.is_dir():
+                    raise ValueError(
+                        f"{directory} exists and is not a directory. Remove it, then run the installer again."
+                    )
+
+        check_ancestor_dirs(bin_dir / "rcmake")
+        check_ancestor_dirs(installed_data)
         for target_name, present in (("rcmake", True), ("rcmake-lsp", staged_lsp_is_link or staged_lsp_is_file)):
             if present:
                 target_path = bin_dir / target_name
                 if target_path.is_dir() and not target_path.is_symlink():
                     raise ValueError(f"{target_path} is a directory. Remove it, then run the installer again.")
-        for rel in staged_extras:
-            target_path = prefix / rel
-            if target_path.is_dir() and not target_path.is_symlink():
-                raise ValueError(f"{target_path} is a directory. Remove it, then run the installer again.")
-        if has_docs and os.path.lexists(installed_doc) and (
-            installed_doc.is_symlink() or not installed_doc.is_dir()
-        ):
-            raise ValueError(f"{installed_doc} exists and is not a directory. Remove it, then run the installer again.")
-        installed_data = prefix / data_dir
-        installed_data.parent.mkdir(exist_ok=True)
-        backup = work / "previous-data"
-        if os.path.lexists(installed_data):
-            installed_data.replace(backup)
-        try:
-            (work / data_dir).replace(installed_data)
-            staged_bin.replace(bin_dir / "rcmake")
-        except OSError:
-            if installed_data.exists():
-                installed_data.replace(work / data_dir)
-            if os.path.lexists(backup):
-                backup.replace(installed_data)
-            raise
-        installed = [bin_dir / "rcmake"]
-        if staged_lsp_is_link:
-            staged_lsp.replace(bin_dir / "rcmake-lsp")
-            installed.append(f"{bin_dir / 'rcmake-lsp'} -> rcmake")
-        elif staged_lsp_is_file:
-            staged_lsp.replace(bin_dir / "rcmake-lsp")
-            installed.append(bin_dir / "rcmake-lsp")
-
         if aliases == "true":
             for tool in tools:
                 alias = bin_dir / tool
                 if not (alias.is_symlink() and os.readlink(alias) == "rcmake"):
                     if os.path.lexists(alias) and (force != "true" or (alias.is_dir() and not alias.is_symlink())):
                         raise ValueError(f"{alias} exists. Run again with --force to replace it.")
-                    new_alias = work / tool
-                    new_alias.symlink_to("rcmake")
-                    new_alias.replace(alias)
-                installed.append(f"{alias} -> rcmake")
-        installed.append(installed_data)
-        if has_docs:
-            installed_doc.parent.mkdir(parents=True, exist_ok=True)
-            backup_doc = work / "previous-doc"
-            if os.path.lexists(installed_doc):
-                installed_doc.replace(backup_doc)
-            try:
-                staged_doc.replace(installed_doc)
-            except OSError:
-                if os.path.lexists(backup_doc):
-                    backup_doc.replace(installed_doc)
-                raise
-            installed.append(installed_doc)
         for rel in staged_extras:
-            destination = prefix / rel
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            (work / rel).replace(destination)
-            installed.append(destination)
+            target_path = prefix / rel
+            check_ancestor_dirs(target_path)
+            if target_path.is_dir() and not target_path.is_symlink():
+                raise ValueError(f"{target_path} is a directory. Remove it, then run the installer again.")
+        if has_docs:
+            check_ancestor_dirs(doc_manifest_path, reject_symlinks_under=installed_doc)
+            if os.path.lexists(doc_manifest_path) and (
+                doc_manifest_path.is_dir() or doc_manifest_path.is_symlink()
+            ):
+                raise ValueError(
+                    f"{doc_manifest_path} is a directory or symlink. Remove it, then run the installer again."
+                )
+            for rel in staged_doc_files:
+                target_path = installed_doc / rel
+                check_ancestor_dirs(target_path, reject_symlinks_under=installed_doc)
+                if os.path.lexists(target_path) and (target_path.is_dir() or target_path.is_symlink()):
+                    raise ValueError(
+                        f"{target_path} is a directory or symlink. Remove it, then run the installer again."
+                    )
 
-        version = subprocess.run([bin_dir.resolve() / "rcmake", "--version"], check=True, timeout=30,
-                                 stdout=subprocess.PIPE, text=True).stdout.splitlines()
+        rollback_dir = work / "rollback"
+        rollback_dir.mkdir()
+        backups: list[tuple[Path, Path | None]] = []
+        created_dirs: list[Path] = []
+
+        def ensure_dir(directory: Path) -> None:
+            missing: list[Path] = []
+            cur = directory
+            while cur != prefix and cur != cur.parent and not cur.exists():
+                missing.append(cur)
+                cur = cur.parent
+            for path in reversed(missing):
+                path.mkdir()
+                created_dirs.append(path)
+
+        def record_and_backup(destination: Path) -> None:
+            if os.path.lexists(destination):
+                saved = rollback_dir / str(len(backups))
+                destination.replace(saved)
+                backups.append((destination, saved))
+            else:
+                backups.append((destination, None))
+
+        def read_doc_manifest(path: Path) -> list[Path]:
+            if not (path.is_file() and not path.is_symlink()):
+                return []
+            owned: list[Path] = []
+            for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                posix = PurePosixPath(line)
+                if posix.is_absolute() or ".." in posix.parts or "." in posix.parts or not posix.parts:
+                    continue
+                owned.append(Path(*posix.parts))
+            return owned
+
+        installed: list[object] = []
+        try:
+            ensure_dir(bin_dir)
+            ensure_dir(installed_data.parent)
+            record_and_backup(installed_data)
+            (work / data_dir).replace(installed_data)
+
+            record_and_backup(bin_dir / "rcmake")
+            staged_bin.replace(bin_dir / "rcmake")
+            installed.append(bin_dir / "rcmake")
+
+            if staged_lsp_is_link:
+                record_and_backup(bin_dir / "rcmake-lsp")
+                staged_lsp.replace(bin_dir / "rcmake-lsp")
+                installed.append(f"{bin_dir / 'rcmake-lsp'} -> rcmake")
+            elif staged_lsp_is_file:
+                record_and_backup(bin_dir / "rcmake-lsp")
+                staged_lsp.replace(bin_dir / "rcmake-lsp")
+                installed.append(bin_dir / "rcmake-lsp")
+
+            if aliases == "true":
+                for tool in tools:
+                    alias = bin_dir / tool
+                    if not (alias.is_symlink() and os.readlink(alias) == "rcmake"):
+                        record_and_backup(alias)
+                        new_alias = work / tool
+                        new_alias.symlink_to("rcmake")
+                        new_alias.replace(alias)
+                    installed.append(f"{alias} -> rcmake")
+            installed.append(installed_data)
+
+            if has_docs:
+                previously_owned = read_doc_manifest(doc_manifest_path)
+                new_doc_set = {rel.as_posix() for rel in staged_doc_files}
+                ensure_dir(installed_doc)
+                for rel in staged_doc_files:
+                    destination = installed_doc / rel
+                    ensure_dir(destination.parent)
+                    record_and_backup(destination)
+                    (staged_doc / rel).replace(destination)
+                    installed.append(destination)
+                for old_rel in previously_owned:
+                    if old_rel.as_posix() in new_doc_set:
+                        continue
+                    old_path = installed_doc / old_rel
+                    if old_path.is_file() and not old_path.is_symlink():
+                        record_and_backup(old_path)
+                        parent = old_path.parent
+                        while parent != installed_doc and parent.is_relative_to(installed_doc):
+                            try:
+                                parent.rmdir()
+                            except OSError:
+                                break
+                            parent = parent.parent
+                staged_manifest = work / "new-doc-manifest"
+                staged_manifest.write_text(
+                    "\n".join(sorted(new_doc_set)) + "\n",
+                    encoding="utf-8",
+                )
+                staged_manifest.chmod(0o644)
+                record_and_backup(doc_manifest_path)
+                staged_manifest.replace(doc_manifest_path)
+
+            for rel in staged_extras:
+                destination = prefix / rel
+                ensure_dir(destination.parent)
+                record_and_backup(destination)
+                (work / rel).replace(destination)
+                installed.append(destination)
+
+            version = subprocess.run([bin_dir.resolve() / "rcmake", "--version"], check=True, timeout=30,
+                                     stdout=subprocess.PIPE, text=True).stdout.splitlines()
+        except Exception:
+            for destination, saved in reversed(backups):
+                if os.path.lexists(destination):
+                    if destination.is_dir() and not destination.is_symlink():
+                        shutil.rmtree(destination)
+                    else:
+                        destination.unlink()
+                if saved is not None and os.path.lexists(saved):
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    saved.replace(destination)
+            for directory in reversed(created_dirs):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+            raise
+
         name = next((line for line in version if line.lower().startswith("rcmake ")), "rcmake")
         print(f"Installed {name.lower()} into {prefix}:")
         for item in installed:

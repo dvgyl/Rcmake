@@ -38,12 +38,15 @@ import tomllib
 try:
     from ._proc import kill_group
     from .bench_eval import describe_hardware, host_hardware
+    from .determinism import observe_compilers
+    from .mutation_eval import API, REPLAY_RESULT, discover_leaves, replay_leaves
+    from .oracle_prop_test import run_command
 except ImportError:
     from _proc import kill_group
     from bench_eval import describe_hardware, host_hardware
-from determinism import observe_compilers
-from mutation_eval import API, REPLAY_RESULT, discover_leaves, replay_leaves
-from oracle_prop_test import run_command
+    from determinism import observe_compilers
+    from mutation_eval import API, REPLAY_RESULT, discover_leaves, replay_leaves
+    from oracle_prop_test import run_command
 
 
 ROOT = Path(__file__).resolve().parents[2]

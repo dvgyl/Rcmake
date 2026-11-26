@@ -2964,6 +2964,8 @@ def render_markdown(report: dict) -> str:
             "Prelude and platform-query cases available via `--prelude`, `--include-prelude`, "
             f"`--all-cases`, or `--case`: {', '.join(available_prelude)}.",
         ))
+    if report.get("status") == "unavailable":
+        lines.extend(("", "Gate status: unavailable (no selected cases executed; all skipped)."))
     if "error" in report:
         lines.extend(("", report["error"]))
     return "\n".join(lines) + "\n"
@@ -3042,8 +3044,22 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report["error"] = str(error)
         print(error, file=sys.stderr)
-    report["passed"] = ("error" not in report and bool(report["cases"])
-                        and all(row["status"] in ("passed", "skipped") for row in report["cases"]))
+    cases = report["cases"]
+    executed_passed = sum(1 for row in cases if row["status"] == "passed")
+    has_failures = (
+        "error" in report
+        or not cases
+        or any(row["status"] not in ("passed", "skipped") for row in cases)
+    )
+    if has_failures:
+        report["status"] = "failed"
+        report["passed"] = False
+    elif executed_passed == 0:
+        report["status"] = "unavailable"
+        report["passed"] = False
+    else:
+        report["status"] = "passed"
+        report["passed"] = True
     write_json(args.out_json, report)
     args.out_md.parent.mkdir(parents=True, exist_ok=True)
     args.out_md.write_text(render_markdown(report), encoding="utf-8")

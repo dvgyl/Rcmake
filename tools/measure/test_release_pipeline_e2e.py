@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -169,7 +170,11 @@ class ReleasePipelineTests(unittest.TestCase):
         }, "--ci-status-json")
 
         archive = self.receipts / "rcmake-0.1.0-aarch64-apple-darwin.tar.gz"
-        archive.write_bytes(b"mock release archive")
+        with tarfile.open(archive, "w:gz") as tar:
+            info = tarfile.TarInfo(name="rcmake-0.1.0-aarch64-apple-darwin/bin/rcmake")
+            info.size = len(BINARY)
+            info.mode = 0o755
+            tar.addfile(info, io.BytesIO(BINARY))
         checksum = sha256(archive.read_bytes()).hexdigest()
         checksum_file = archive.with_suffix(".gz.sha256")
         checksum_file.write_text(f"{checksum}  {archive.name}\n", encoding="ascii")

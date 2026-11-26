@@ -11,8 +11,10 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tarfile
 from tempfile import TemporaryDirectory
 import unittest
+import zipfile
 
 from tools.measure import build_dashboard_json as builder
 from tools.measure import verify_release_receipts as verifier
@@ -20,8 +22,26 @@ from tools.measure import verify_release_receipts as verifier
 
 COMMIT_OK = "0123456789abcdef0123456789abcdef01234567"
 COMMIT_STALE = "fedcba9876543210fedcba9876543210fedcba98"
-BINARY_OK = "a" * 64
+BINARY_BYTES = b"#!/bin/sh\necho rcmake-0.1.0\n"
+BINARY_OK = hashlib.sha256(BINARY_BYTES).hexdigest()
 BINARY_STALE = "b" * 64
+
+
+def write_minimal_tarball(
+    archive_path: Path,
+    binary_bytes: bytes = BINARY_BYTES,
+    *,
+    top_dir: str = "rcmake-0.1.0-aarch64-apple-darwin",
+    member_rel: str | None = "bin/rcmake",
+) -> str:
+    """Write a real minimal .tar.gz archive containing bin/rcmake and return its SHA-256."""
+    with tarfile.open(archive_path, "w:gz") as tar:
+        if member_rel is not None:
+            info = tarfile.TarInfo(name=f"{top_dir}/{member_rel}")
+            info.size = len(binary_bytes)
+            info.mode = 0o755
+            tar.addfile(info, io.BytesIO(binary_bytes))
+    return hashlib.sha256(archive_path.read_bytes()).hexdigest()
 
 
 def make_runcmake_payload(
@@ -140,9 +160,7 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
         self.wasm_path.with_suffix(".js").write_text("export function configure() {}\n", encoding="utf-8")
 
         self.tarball_path = self.receipts_dir / "rcmake-0.1.0-aarch64-apple-darwin.tar.gz"
-        tarball_bytes = b"synthetic-release-tarball-payload"
-        self.tarball_path.write_bytes(tarball_bytes)
-        self.tarball_sha256 = hashlib.sha256(tarball_bytes).hexdigest()
+        self.tarball_sha256 = write_minimal_tarball(self.tarball_path, BINARY_BYTES)
         self.tarball_sha_file = self.receipts_dir / "rcmake-0.1.0-aarch64-apple-darwin.tar.gz.sha256"
         self.tarball_sha_file.write_text(
             f"{self.tarball_sha256}  {self.tarball_path.name}\n",
@@ -298,6 +316,7 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
                 "sha256_path": self.tarball_sha_file.name,
                 "binary_size_bytes": 15_728_640,
             },
+            "ci_jobs": self.make_ci_jobs_payload(commit=commit, binary=binary),
         }
 
     def write_manifest(self, receipts_payloads: dict[str, dict], **overrides) -> Path:
@@ -336,11 +355,11 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
             "--json-out", str(json_out),
         )
         self.assertEqual(code, 0, stderr)
-        self.assertIn("PASS: verified 18 release receipts", stdout)
+        self.assertIn("PASS: verified 19 release receipts", stdout)
         self.assertEqual(stderr, "")
         report = json.loads(json_out.read_text(encoding="utf-8"))
         self.assertTrue(report["ok"])
-        self.assertEqual(len(report["checked_receipts"]), 18)
+        self.assertEqual(len(report["checked_receipts"]), 19)
         self.assertEqual(report["findings"], [])
 
     def test_auto_discovery_receipts_dir_including_subdirectories(self):
@@ -394,7 +413,7 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
             "--wasm-bundle", str(self.wasm_path),
         )
         self.assertEqual(code, 0, stderr)
-        self.assertIn("PASS: verified 18 release receipts", stdout)
+        self.assertIn("PASS: verified 19 release receipts", stdout)
 
     def test_vcpkg_summary_uses_explicit_scored_counts(self):
         payloads = self.build_valid_receipts()
@@ -600,11 +619,46 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
 
     def test_ci_jobs_accepts_all_six_distinct_green_and_rejects_five_of_six(self):
         payloads = self.build_valid_receipts()
-        payloads["ci_jobs"] = self.make_ci_jobs_payload()
         manifest = self.write_manifest(payloads)
         code, stdout, stderr = self.run_cli("--manifest", str(manifest))
         self.assertEqual(code, 0, stderr)
         self.assertIn("PASS: verified 19 release receipts", stdout)
+
+        # Missing ci_jobs receipt must fail standalone verification in both manifest and receipts-dir modes.
+        no_ci = self.build_valid_receipts()
+        del no_ci["ci_jobs"]
+        manifest = self.write_manifest(no_ci)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("ci_jobs (missing)", stderr)
+
+        (self.receipts_dir / "ci-jobs.json").unlink(missing_ok=True)
+        code, _, stderr = self.run_cli(
+            "--receipts-dir", str(self.receipts_dir),
+            "--dashboard", str(self.dashboard_path),
+            "--wasm-bundle", str(self.wasm_path),
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("ci_jobs (missing)", stderr)
+
+        # Missing run event or missing run conclusion must fail even when all 6 job rows say success.
+        missing_event = self.make_ci_jobs_payload()
+        del missing_event["event"]
+        payloads["ci_jobs"] = missing_event
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("ci_jobs (missing)", stderr)
+        self.assertIn("event", stderr)
+
+        missing_conclusion = self.make_ci_jobs_payload()
+        del missing_conclusion["run_conclusion"]
+        payloads["ci_jobs"] = missing_conclusion
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("ci_jobs (missing)", stderr)
+        self.assertIn("run_conclusion", stderr)
 
         # 5/6 with one failed job is rejected.
         payloads["ci_jobs"] = self.make_ci_jobs_payload(failed_job="Corpus smoke on macos-15")
@@ -661,6 +715,98 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
         )
         self.assertEqual(code, 1)
         self.assertIn("CI on windows-2025 (completed/failure)", stderr)
+
+    def test_dist_rejects_plain_text_fake_archive_mismatched_basename_and_wrong_binary_digest(self):
+        # Plain-text fake archive with matching SHA-256 and sidecar must still be rejected.
+        fake_archive = self.receipts_dir / "rcmake-0.1.0-fake.tar.gz"
+        fake_archive.write_bytes(b"synthetic-release-tarball-payload")
+        fake_sha = hashlib.sha256(fake_archive.read_bytes()).hexdigest()
+        fake_sidecar = self.receipts_dir / "rcmake-0.1.0-fake.tar.gz.sha256"
+        fake_sidecar.write_text(f"{fake_sha}  {fake_archive.name}\n", encoding="ascii")
+
+        payloads = self.build_valid_receipts()
+        payloads["dist"].update(
+            tarball=fake_archive.name,
+            tarball_path=fake_archive.name,
+            tarball_sha256=fake_sha,
+            sha256_path=fake_sidecar.name,
+        )
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("dist (invalid)", stderr)
+
+        # Mismatched basename between receipt tarball label and referenced archive path is rejected.
+        other_archive = self.receipts_dir / "rcmake-0.1.0-other-target.tar.gz"
+        other_sha = write_minimal_tarball(other_archive, BINARY_BYTES)
+        other_sidecar = self.receipts_dir / "rcmake-0.1.0-other-target.tar.gz.sha256"
+        other_sidecar.write_text(f"{other_sha}  {self.tarball_path.name}\n", encoding="ascii")
+        payloads = self.build_valid_receipts()
+        payloads["dist"].update(
+            tarball=self.tarball_path.name,
+            tarball_path=other_archive.name,
+            tarball_sha256=other_sha,
+            sha256_path=other_sidecar.name,
+        )
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("dist (mismatch)", stderr)
+        self.assertIn("basename", stderr)
+
+        # Real tar.gz whose packaged bin/rcmake does not match binary_sha256 is rejected.
+        wrong_bin_archive = self.receipts_dir / "rcmake-0.1.0-wrong-bin.tar.gz"
+        wrong_bin_sha = write_minimal_tarball(wrong_bin_archive, b"#!/bin/sh\necho tampered\n")
+        wrong_bin_sidecar = self.receipts_dir / "rcmake-0.1.0-wrong-bin.tar.gz.sha256"
+        wrong_bin_sidecar.write_text(f"{wrong_bin_sha}  {wrong_bin_archive.name}\n", encoding="ascii")
+        payloads = self.build_valid_receipts()
+        payloads["dist"].update(
+            tarball=wrong_bin_archive.name,
+            tarball_path=wrong_bin_archive.name,
+            tarball_sha256=wrong_bin_sha,
+            sha256_path=wrong_bin_sidecar.name,
+        )
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("dist (mismatch)", stderr)
+        self.assertIn("Packaged executable", stderr)
+
+        # Real tar.gz missing bin/rcmake is rejected.
+        empty_archive = self.receipts_dir / "rcmake-0.1.0-no-bin.tar.gz"
+        empty_sha = write_minimal_tarball(empty_archive, BINARY_BYTES, member_rel="README.txt")
+        empty_sidecar = self.receipts_dir / "rcmake-0.1.0-no-bin.tar.gz.sha256"
+        empty_sidecar.write_text(f"{empty_sha}  {empty_archive.name}\n", encoding="ascii")
+        payloads = self.build_valid_receipts()
+        payloads["dist"].update(
+            tarball=empty_archive.name,
+            tarball_path=empty_archive.name,
+            tarball_sha256=empty_sha,
+            sha256_path=empty_sidecar.name,
+        )
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("dist (invalid)", stderr)
+        self.assertIn("does not contain bin/rcmake", stderr)
+
+        # Real .zip release archive containing bin/rcmake.exe passes.
+        zip_archive = self.receipts_dir / "rcmake-0.1.0-x86_64-pc-windows-msvc.zip"
+        with zipfile.ZipFile(zip_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("rcmake-0.1.0-x86_64-pc-windows-msvc/bin/rcmake.exe", BINARY_BYTES)
+        zip_sha = hashlib.sha256(zip_archive.read_bytes()).hexdigest()
+        zip_sidecar = self.receipts_dir / f"{zip_archive.name}.sha256"
+        zip_sidecar.write_text(f"{zip_sha}  {zip_archive.name}\n", encoding="ascii")
+        payloads = self.build_valid_receipts()
+        payloads["dist"].update(
+            tarball=zip_archive.name,
+            tarball_path=zip_archive.name,
+            tarball_sha256=zip_sha,
+            sha256_path=zip_sidecar.name,
+        )
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 0, stderr)
 
     def test_rejects_missing_or_empty_dist_archive_and_checksum_paths(self):
         # Removing both paths (even when files are absent) must fail instead of returning findings: [].

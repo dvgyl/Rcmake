@@ -294,6 +294,81 @@ function Expand-RcmakeArchive {
     }
 }
 
+function Get-SafeDocRelParts {
+    param([AllowNull()][string]$Line)
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return $null
+    }
+    $trimmed = $Line.Trim()
+    if ($trimmed.IndexOf([char]0) -ge 0 -or $trimmed.StartsWith('/') -or $trimmed.StartsWith('\') -or $trimmed -match '^[A-Za-z]:') {
+        return $null
+    }
+    $parts = @($trimmed -split '[\\/]')
+    if (@($parts).Count -eq 0) {
+        return $null
+    }
+    foreach ($part in $parts) {
+        if ([string]::IsNullOrEmpty($part) -or $part -eq '.' -or $part -eq '..' -or $part.IndexOf(':') -ge 0) {
+            return $null
+        }
+    }
+    return ,$parts
+}
+
+function Read-DocManifestEntries {
+    param([Parameter(Mandatory)][string]$ManifestPath)
+    $entries = @()
+    $item = Get-ItemOrNull -Path $ManifestPath
+    if ($null -eq $item -or $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        return ,$entries
+    }
+    foreach ($line in @(Get-Content -LiteralPath $ManifestPath -Encoding UTF8)) {
+        $parts = Get-SafeDocRelParts -Line $line
+        if ($null -ne $parts) {
+            $entries += ($parts -join '/')
+        }
+    }
+    return ,$entries
+}
+
+function Assert-DirectoryAncestors {
+    param(
+        [Parameter(Mandatory)][string]$TargetPath,
+        [Parameter(Mandatory)][string]$PrefixRoot,
+        [AllowNull()][string]$RejectReparseUnder = $null
+    )
+    $prefixNorm = [IO.Path]::GetFullPath($PrefixRoot).TrimEnd('\', '/')
+    $reparseNorm = if ($RejectReparseUnder) { [IO.Path]::GetFullPath($RejectReparseUnder).TrimEnd('\', '/') } else { $null }
+    $ancestors = @()
+    $cur = Split-Path -Parent $TargetPath
+    while ($cur) {
+        $curNorm = [IO.Path]::GetFullPath($cur).TrimEnd('\', '/')
+        if ($curNorm -ieq $prefixNorm) {
+            break
+        }
+        $ancestors += $curNorm
+        $next = Split-Path -Parent $curNorm
+        if (-not $next -or $next -ieq $curNorm) {
+            break
+        }
+        $cur = $next
+    }
+    [Array]::Reverse($ancestors)
+    foreach ($dirPath in $ancestors) {
+        $item = Get-ItemOrNull -Path $dirPath
+        if ($null -eq $item) {
+            continue
+        }
+        $isReparse = [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+        if ($reparseNorm -and ($dirPath -ieq $reparseNorm -or $dirPath.StartsWith($reparseNorm + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) -and $isReparse) {
+            Stop-Install "$dirPath is a symlink or reparse point. Remove it, then run the installer again."
+        }
+        if (-not $item.PSIsContainer) {
+            Stop-Install "$dirPath exists and is not a directory. Remove it, then run the installer again."
+        }
+    }
+}
+
 function Normalize-PathEntry {
     param([AllowNull()][string]$Entry)
     if ([string]::IsNullOrWhiteSpace($Entry)) {
@@ -323,6 +398,7 @@ $prefixFull = Resolve-FullPath -Path $Prefix
 $binDir = Join-Path $prefixFull 'bin'
 $dataDir = Join-Path (Join-Path $prefixFull 'share') 'cmake-4.5'
 $docDir = Join-Path (Join-Path (Join-Path $prefixFull 'share') 'doc') 'rcmake'
+$docManifestPath = Join-Path $docDir '.rcmake-manifest'
 $completionDir = Join-Path (Join-Path (Join-Path $prefixFull 'share') 'rcmake') 'completions'
 $completionPath = Join-Path $completionDir 'rcmake.ps1'
 $rcmakePath = Join-Path $binDir 'rcmake.exe'
@@ -364,11 +440,51 @@ if ($Uninstall) {
 
     $docItem = Get-ItemOrNull -Path $docDir
     if ($null -ne $docItem -and $docItem.PSIsContainer -and -not ($docItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        Remove-Item -LiteralPath $docDir -Recurse -Force
-        $removed += $docDir
-        $docParent = Split-Path -Parent $docDir
-        if ((Test-Path -LiteralPath $docParent -PathType Container) -and (@(Get-ChildItem -LiteralPath $docParent -Force).Count -eq 0)) {
-            Remove-Item -LiteralPath $docParent -Force
+        $manifestItem = Get-ItemOrNull -Path $docManifestPath
+        $docDirFull = [IO.Path]::GetFullPath($docDir).TrimEnd('\', '/')
+        if ($null -ne $manifestItem -and -not $manifestItem.PSIsContainer -and -not ($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            foreach ($relPosix in (Read-DocManifestEntries -ManifestPath $docManifestPath)) {
+                $relNative = ($relPosix -split '/') -join [IO.Path]::DirectorySeparatorChar
+                $targetDoc = [IO.Path]::GetFullPath((Join-Path $docDir $relNative))
+                if (-not $targetDoc.StartsWith($docDirFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+                    continue
+                }
+                $targetItem = Get-ItemOrNull -Path $targetDoc
+                if ($null -ne $targetItem -and -not $targetItem.PSIsContainer -and -not ($targetItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    Remove-Item -LiteralPath $targetDoc -Force
+                    $removed += $targetDoc
+                    $parent = Split-Path -Parent $targetDoc
+                    while ($parent -and ([IO.Path]::GetFullPath($parent).TrimEnd('\', '/') -ine $docDirFull)) {
+                        if ((Test-Path -LiteralPath $parent -PathType Container) -and (@(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0)) {
+                            Remove-Item -LiteralPath $parent -Force
+                            $parent = Split-Path -Parent $parent
+                        } else {
+                            break
+                        }
+                    }
+                }
+            }
+            Remove-Item -LiteralPath $docManifestPath -Force
+        } else {
+            foreach ($noticeName in @('LICENSE-APACHE', 'LICENSE-MIT', 'THIRD_PARTY_NOTICES.md')) {
+                $targetDoc = Join-Path $docDir $noticeName
+                $targetItem = Get-ItemOrNull -Path $targetDoc
+                if ($null -ne $targetItem -and -not $targetItem.PSIsContainer -and -not ($targetItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    Remove-Item -LiteralPath $targetDoc -Force
+                    $removed += $targetDoc
+                }
+            }
+        }
+        foreach ($dirToPrune in @(
+            (Join-Path (Join-Path $docDir 'third_party') 'licences'),
+            (Join-Path $docDir 'third_party'),
+            $docDir,
+            (Split-Path -Parent $docDir)
+        )) {
+            $pruneItem = Get-ItemOrNull -Path $dirToPrune
+            if ($null -ne $pruneItem -and $pruneItem.PSIsContainer -and -not ($pruneItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -and (@(Get-ChildItem -LiteralPath $dirToPrune -Force).Count -eq 0)) {
+                Remove-Item -LiteralPath $dirToPrune -Force
+            }
         }
     }
 
@@ -544,7 +660,19 @@ try {
     $stagedCompletion = Join-Path (Join-Path (Join-Path (Join-Path $stageWork 'share') 'rcmake') 'completions') 'rcmake.ps1'
     $hasCompletion = Test-Path -LiteralPath $stagedCompletion -PathType Leaf
     $stagedDoc = Join-Path (Join-Path (Join-Path $stageWork 'share') 'doc') 'rcmake'
-    $hasDocs = (Test-Path -LiteralPath $stagedDoc -PathType Container) -and (@(Get-ChildItem -LiteralPath $stagedDoc -File -Recurse -Force).Count -gt 0)
+    $stagedDocFiles = @()
+    if (Test-Path -LiteralPath $stagedDoc -PathType Container) {
+        $stagedDocPrefix = [IO.Path]::GetFullPath($stagedDoc).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        foreach ($docFile in @(Get-ChildItem -LiteralPath $stagedDoc -File -Recurse -Force | Sort-Object -Property FullName)) {
+            $relSub = $docFile.FullName.Substring($stagedDocPrefix.Length)
+            $stagedDocFiles += [pscustomobject]@{
+                Source = $docFile.FullName
+                RelNative = $relSub
+                RelPosix = $relSub.Replace('\', '/')
+            }
+        }
+    }
+    $hasDocs = @($stagedDocFiles).Count -gt 0
 
     $stagedData = Join-Path (Join-Path $stageWork 'share') 'cmake-4.5'
     foreach ($required in @('Modules\CMake.cmake', 'Templates\CPackConfig.cmake.in')) {
@@ -558,9 +686,12 @@ try {
         Stop-Install "Staged rcmake.exe failed --version check (exit code $LASTEXITCODE)."
     }
 
-    New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-    New-Item -ItemType Directory -Path (Split-Path -Parent $dataDir) -Force | Out-Null
-
+    # Validate all destination paths and parent directories before modifying any installed file.
+    Assert-DirectoryAncestors -TargetPath $rcmakePath -PrefixRoot $prefixFull
+    Assert-DirectoryAncestors -TargetPath $dataDir -PrefixRoot $prefixFull
+    if ($hasCompletion) {
+        Assert-DirectoryAncestors -TargetPath $completionPath -PrefixRoot $prefixFull
+    }
     foreach ($checkTarget in @(
         @{ Path = $rcmakePath; Present = $true },
         @{ Path = $lspPath; Present = $hasLsp },
@@ -574,69 +705,168 @@ try {
         }
     }
     if ($hasDocs) {
-        $existingDoc = Get-ItemOrNull -Path $docDir
-        if ($null -ne $existingDoc -and (-not $existingDoc.PSIsContainer -or ($existingDoc.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
-            Stop-Install "$docDir exists and is not a directory. Remove it, then run the installer again."
+        Assert-DirectoryAncestors -TargetPath $docManifestPath -PrefixRoot $prefixFull -RejectReparseUnder $docDir
+        $existingManifest = Get-ItemOrNull -Path $docManifestPath
+        if ($null -ne $existingManifest -and ($existingManifest.PSIsContainer -or ($existingManifest.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+            Stop-Install "$docManifestPath is a directory or symlink. Remove it, then run the installer again."
+        }
+        foreach ($docEntry in $stagedDocFiles) {
+            $destDoc = Join-Path $docDir $docEntry.RelNative
+            Assert-DirectoryAncestors -TargetPath $destDoc -PrefixRoot $prefixFull -RejectReparseUnder $docDir
+            $existingDocFile = Get-ItemOrNull -Path $destDoc
+            if ($null -ne $existingDocFile -and ($existingDocFile.PSIsContainer -or ($existingDocFile.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+                Stop-Install "$destDoc is a directory or symlink. Remove it, then run the installer again."
+            }
         }
     }
 
-    $backupData = Join-Path $stageWork 'previous-data'
-    $hadPreviousData = Test-Path -LiteralPath $dataDir
-    if ($hadPreviousData) {
-        Move-Item -LiteralPath $dataDir -Destination $backupData
-    }
-    try {
-        Move-Item -LiteralPath $stagedData -Destination $dataDir
-        Move-Item -LiteralPath $stagedBin -Destination $rcmakePath -Force
-    } catch {
-        if (Test-Path -LiteralPath $dataDir) {
-            Move-Item -LiteralPath $dataDir -Destination $stagedData
+    $rollbackDir = Join-Path $stageWork 'rollback'
+    New-Item -ItemType Directory -Path $rollbackDir -Force | Out-Null
+    $rollbackOps = New-Object System.Collections.ArrayList
+    $createdDirs = New-Object System.Collections.ArrayList
+
+    $ensureDir = {
+        param([string]$DirPath)
+        $prefixNorm = [IO.Path]::GetFullPath($prefixFull).TrimEnd('\', '/')
+        $missing = @()
+        $cur = [IO.Path]::GetFullPath($DirPath).TrimEnd('\', '/')
+        while ($cur -and ($cur -ine $prefixNorm) -and -not (Test-Path -LiteralPath $cur)) {
+            $missing += $cur
+            $next = Split-Path -Parent $cur
+            if (-not $next -or $next -ieq $cur) {
+                break
+            }
+            $cur = $next
         }
-        if ($hadPreviousData -and (Test-Path -LiteralPath $backupData)) {
-            Move-Item -LiteralPath $backupData -Destination $dataDir
+        [Array]::Reverse($missing)
+        foreach ($pathToCreate in $missing) {
+            New-Item -ItemType Directory -Path $pathToCreate -Force | Out-Null
+            [void]$createdDirs.Add($pathToCreate)
+        }
+    }
+
+    $backupDestination = {
+        param([string]$DestPath)
+        $existingItem = Get-ItemOrNull -Path $DestPath
+        if ($null -ne $existingItem) {
+            $savedPath = Join-Path $rollbackDir ([string]$rollbackOps.Count)
+            Move-Item -LiteralPath $DestPath -Destination $savedPath
+            [void]$rollbackOps.Add(@{ Dest = $DestPath; Backup = $savedPath })
+        } else {
+            [void]$rollbackOps.Add(@{ Dest = $DestPath; Backup = $null })
+        }
+    }
+
+    $installed = @()
+    $versionOutput = $null
+    try {
+        & $ensureDir $binDir
+        & $ensureDir (Split-Path -Parent $dataDir)
+
+        & $backupDestination $dataDir
+        Move-Item -LiteralPath $stagedData -Destination $dataDir
+
+        & $backupDestination $rcmakePath
+        Move-Item -LiteralPath $stagedBin -Destination $rcmakePath -Force
+        $installed += $rcmakePath
+
+        if ($hasLsp) {
+            & $backupDestination $lspPath
+            Move-Item -LiteralPath $stagedLsp -Destination $lspPath -Force
+            $installed += $lspPath
+        }
+
+        $aliasesToWrite = if ($AliasCmake) { $tools } else { $existingOwnedAliases }
+        foreach ($tool in $aliasesToWrite) {
+            $aliasPath = Join-Path $binDir $tool
+            & $backupDestination $aliasPath
+            $mode = Install-AliasExecutable -SourcePath $rcmakePath -AliasPath $aliasPath
+            $installed += "$aliasPath -> rcmake.exe ($mode)"
+        }
+        $installed += $dataDir
+
+        if ($hasDocs) {
+            $previouslyOwned = Read-DocManifestEntries -ManifestPath $docManifestPath
+            $newDocSet = @{}
+            foreach ($docEntry in $stagedDocFiles) {
+                $newDocSet[$docEntry.RelPosix] = $true
+            }
+            & $ensureDir $docDir
+            foreach ($docEntry in $stagedDocFiles) {
+                $destDoc = Join-Path $docDir $docEntry.RelNative
+                & $ensureDir (Split-Path -Parent $destDoc)
+                & $backupDestination $destDoc
+                Move-Item -LiteralPath $docEntry.Source -Destination $destDoc -Force
+                $installed += $destDoc
+            }
+            $docDirFull = [IO.Path]::GetFullPath($docDir).TrimEnd('\', '/')
+            foreach ($oldRelPosix in $previouslyOwned) {
+                if ($newDocSet.ContainsKey($oldRelPosix)) {
+                    continue
+                }
+                $oldRelNative = ($oldRelPosix -split '/') -join [IO.Path]::DirectorySeparatorChar
+                $oldDocPath = [IO.Path]::GetFullPath((Join-Path $docDir $oldRelNative))
+                if (-not $oldDocPath.StartsWith($docDirFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+                    continue
+                }
+                $oldItem = Get-ItemOrNull -Path $oldDocPath
+                if ($null -ne $oldItem -and -not $oldItem.PSIsContainer -and -not ($oldItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    & $backupDestination $oldDocPath
+                    $parent = Split-Path -Parent $oldDocPath
+                    while ($parent -and ([IO.Path]::GetFullPath($parent).TrimEnd('\', '/') -ine $docDirFull)) {
+                        if ((Test-Path -LiteralPath $parent -PathType Container) -and (@(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0)) {
+                            Remove-Item -LiteralPath $parent -Force
+                            $parent = Split-Path -Parent $parent
+                        } else {
+                            break
+                        }
+                    }
+                }
+            }
+            $stagedManifest = Join-Path $stageWork 'new-doc-manifest'
+            $manifestLines = @($newDocSet.Keys | Sort-Object)
+            [IO.File]::WriteAllText($stagedManifest, (($manifestLines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+            & $backupDestination $docManifestPath
+            Move-Item -LiteralPath $stagedManifest -Destination $docManifestPath -Force
+        }
+
+        if ($hasCompletion) {
+            & $ensureDir $completionDir
+            & $backupDestination $completionPath
+            Move-Item -LiteralPath $stagedCompletion -Destination $completionPath -Force
+            $installed += $completionPath
+        }
+
+        $versionOutput = & $rcmakePath --version
+        if ($LASTEXITCODE -ne 0) {
+            Stop-Install "Installed rcmake.exe failed --version check (exit code $LASTEXITCODE)."
+        }
+    } catch {
+        for ($i = $rollbackOps.Count - 1; $i -ge 0; $i--) {
+            $op = $rollbackOps[$i]
+            $curItem = Get-ItemOrNull -Path $op.Dest
+            if ($null -ne $curItem) {
+                if ($curItem.PSIsContainer -and -not ($curItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    Remove-Item -LiteralPath $op.Dest -Recurse -Force -ErrorAction SilentlyContinue
+                } else {
+                    Remove-Item -LiteralPath $op.Dest -Force -ErrorAction SilentlyContinue
+                }
+            }
+            if ($op.Backup -and (Test-Path -LiteralPath $op.Backup)) {
+                $restoreParent = Split-Path -Parent $op.Dest
+                if ($restoreParent -and -not (Test-Path -LiteralPath $restoreParent)) {
+                    New-Item -ItemType Directory -Path $restoreParent -Force -ErrorAction SilentlyContinue | Out-Null
+                }
+                Move-Item -LiteralPath $op.Backup -Destination $op.Dest -Force -ErrorAction SilentlyContinue
+            }
+        }
+        for ($i = $createdDirs.Count - 1; $i -ge 0; $i--) {
+            $dirPath = $createdDirs[$i]
+            if ((Test-Path -LiteralPath $dirPath -PathType Container) -and (@(Get-ChildItem -LiteralPath $dirPath -Force).Count -eq 0)) {
+                Remove-Item -LiteralPath $dirPath -Force -ErrorAction SilentlyContinue
+            }
         }
         throw
-    }
-
-    $installed = @($rcmakePath)
-    if ($hasLsp) {
-        Move-Item -LiteralPath $stagedLsp -Destination $lspPath -Force
-        $installed += $lspPath
-    }
-
-    $aliasesToWrite = if ($AliasCmake) { $tools } else { $existingOwnedAliases }
-    foreach ($tool in $aliasesToWrite) {
-        $aliasPath = Join-Path $binDir $tool
-        $mode = Install-AliasExecutable -SourcePath $rcmakePath -AliasPath $aliasPath
-        $installed += "$aliasPath -> rcmake.exe ($mode)"
-    }
-    $installed += $dataDir
-    if ($hasDocs) {
-        New-Item -ItemType Directory -Path (Split-Path -Parent $docDir) -Force | Out-Null
-        $backupDoc = Join-Path $stageWork 'previous-doc'
-        $hadPreviousDoc = Test-Path -LiteralPath $docDir
-        if ($hadPreviousDoc) {
-            Move-Item -LiteralPath $docDir -Destination $backupDoc
-        }
-        try {
-            Move-Item -LiteralPath $stagedDoc -Destination $docDir
-        } catch {
-            if ($hadPreviousDoc -and (Test-Path -LiteralPath $backupDoc)) {
-                Move-Item -LiteralPath $backupDoc -Destination $docDir
-            }
-            throw
-        }
-        $installed += $docDir
-    }
-    if ($hasCompletion) {
-        New-Item -ItemType Directory -Path $completionDir -Force | Out-Null
-        Move-Item -LiteralPath $stagedCompletion -Destination $completionPath -Force
-        $installed += $completionPath
-    }
-
-    $versionOutput = & $rcmakePath --version
-    if ($LASTEXITCODE -ne 0) {
-        Stop-Install "Installed rcmake.exe failed --version check (exit code $LASTEXITCODE)."
     }
     $displayName = 'rcmake'
     foreach ($line in @($versionOutput | ForEach-Object { $_.ToString() })) {

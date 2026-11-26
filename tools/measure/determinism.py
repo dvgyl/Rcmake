@@ -24,9 +24,14 @@ import subprocess
 import sys
 import tempfile
 
-from mutation_eval import API, QUERIES, diff_bytes
-from ninja_canon import ASSIGNMENT, MAX_INCLUDE_DEPTH, Normalizer, expand, statements, tokens
-from oracle_prop_test import executable
+try:
+    from .mutation_eval import API, QUERIES, diff_bytes
+    from .ninja_canon import ASSIGNMENT, MAX_INCLUDE_DEPTH, Normalizer, expand, statements, tokens
+    from .oracle_prop_test import executable
+except ImportError:
+    from mutation_eval import API, QUERIES, diff_bytes
+    from ninja_canon import ASSIGNMENT, MAX_INCLUDE_DEPTH, Normalizer, expand, statements, tokens
+    from oracle_prop_test import executable
 
 
 ROOT = Path(__file__).resolve().parents[2]

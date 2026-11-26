@@ -243,10 +243,107 @@ class CliAndReportFormattingTests(unittest.TestCase):
                     "--case", "memo-tmp-alias-write",
                     "--out-json", str(out_json), "--out-md", str(out_md),
                 ])
-                self.assertEqual(code, 0, stderr)
+                self.assertEqual(code, 1, stderr)
                 report = json.loads(out_json.read_text(encoding="utf-8"))
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["status"], "unavailable")
                 self.assertEqual(report["cases"][0]["status"], "skipped")
-                self.assertIn("requires macOS", out_md.read_text(encoding="utf-8"))
+                md_text = out_md.read_text(encoding="utf-8")
+                self.assertIn("requires macOS", md_text)
+                self.assertIn("unavailable", md_text.lower())
+
+    def test_all_skipped_prerequisite_gate_returns_unavailable_while_mixed_platform_skip_passes(self):
+        args = _make_args(self.root)
+        unavail_json = self.root / "prereq-skip.json"
+        unavail_md = self.root / "prereq-skip.md"
+
+        def raise_prereq(_args, _root, _row):
+            raise pce.CasePrerequisite("filesystem prerequisite unavailable")
+
+        def fake_version(cmd, *_a, **_kw):
+            if str(cmd[0]) == str(args.oracle):
+                return {"returncode": 0, "error": None, "stdout": "cmake version 4.5.1\n", "stderr": ""}
+            return {"returncode": 0, "error": None, "stdout": "cmake version 4.5.1\nrcmake 0.1.0\n", "stderr": ""}
+
+        prereq_spec = pce.CaseSpec(
+            "same-inode-header-rewrite", "G3", "extended", "forced prereq skip", raise_prereq,
+        )
+        with (
+            mock.patch.object(pce, "select_cases", return_value=[prereq_spec]),
+            mock.patch.object(pce, "run_command", side_effect=fake_version),
+        ):
+            code, _, stderr = self.run_cli([
+                "--rcmake", str(args.rcmake),
+                "--oracle", str(args.oracle),
+                "--cc", args.compiler,
+                "--case", "same-inode-header-rewrite",
+                "--out-json", str(unavail_json),
+                "--out-md", str(unavail_md),
+            ])
+        self.assertEqual(code, 1, stderr)
+        payload = json.loads(unavail_json.read_text(encoding="utf-8"))
+        self.assertFalse(payload["passed"])
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(payload["cases"][0]["status"], "skipped")
+        self.assertIn("filesystem prerequisite unavailable", payload["cases"][0]["reason"])
+        self.assertIn("unavailable", unavail_md.read_text(encoding="utf-8").lower())
+
+        # When at least one selected check passes alongside a platform skip, the gate still passes.
+        mixed_json = self.root / "mixed-skip.json"
+        mixed_md = self.root / "mixed-skip.md"
+
+        def pass_with_platform_skip(_args, _dir, report):
+            report["cases"].extend([
+                {"case": "cache-control", "gate": "G3/G4", "status": "passed", "passed": True},
+                {"case": "memo-tmp-alias-write", "gate": "G3/G4", "status": "skipped",
+                 "reason": "The case requires macOS.", "passed": None},
+            ])
+
+        with mock.patch.object(pce, "evaluate", side_effect=pass_with_platform_skip):
+            code, _, stderr = self.run_cli([
+                "--rcmake", str(args.rcmake),
+                "--oracle", str(args.oracle),
+                "--cc", args.compiler,
+                "--case", "cache-control,memo-tmp-alias-write",
+                "--out-json", str(mixed_json),
+                "--out-md", str(mixed_md),
+            ])
+        self.assertEqual(code, 0, stderr)
+        mixed = json.loads(mixed_json.read_text(encoding="utf-8"))
+        self.assertTrue(mixed["passed"])
+        self.assertEqual(mixed["status"], "passed")
+        self.assertEqual([row["status"] for row in mixed["cases"]], ["passed", "skipped"])
+
+    def test_module_mode_imports_bench_configure_and_determinism_without_sys_path_hack(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        result = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import tools.measure.probe_cache_eval as pce, tools.measure.bench_configure as bc; "
+                "assert hasattr(bc, 'observe_compilers') and hasattr(bc, 'cxx_headers_project') "
+                "and [s.name for s in pce.select_cases(cases=['cxx-headers'])] == ['cxx-headers']",
+            ],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        list_res = subprocess.run(
+            [sys.executable, "-m", "tools.measure.probe_cache_eval", "--list-cases"],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(list_res.returncode, 0, list_res.stderr)
+        self.assertIn("cxx-headers", list_res.stdout)
 
     def test_main_writes_expected_json_and_markdown_for_default_and_failing_case(self):
         args = _make_args(self.root)

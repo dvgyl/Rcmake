@@ -54,16 +54,24 @@ def _make_fake_archive(
     extra_marker: str = "v1",
     include_completions_and_man: bool = False,
     include_licences: bool = False,
+    extra_doc_files: dict[str, str] | None = None,
     include_module_helpers: bool = False,
+    fail_installed_version: bool = False,
     symlink_extra_path: str | None = None,
 ) -> Path:
     """Create a synthetic release .tar.gz archive and optional .sha256 sidecar."""
     top = f"rcmake-{version}-test"
     archive_path = dest_dir / (archive_name or f"{top}.tar.gz")
 
+    fail_check = (
+        '  case "$0" in *.rcmake-install-*) ;; *) echo "post-install boom" >&2; exit 1 ;; esac\n'
+        if fail_installed_version
+        else ""
+    )
     rcmake_script = (
         "#!/bin/sh\n"
         'if [ "$1" = "--version" ]; then\n'
+        f"{fail_check}"
         f'  printf "cmake version 4.5.1\\nrcmake {version}\\n"\n'
         "  exit 0\n"
         "fi\n"
@@ -130,6 +138,9 @@ def _make_fake_archive(
                     f"licence {relpath} {version} {extra_marker}\n".encode("utf-8"),
                     0o644,
                 )
+        if extra_doc_files:
+            for relpath, text in extra_doc_files.items():
+                add_bytes(tar, relpath, text.encode("utf-8"), 0o644)
         if include_module_helpers:
             for relpath in MODULE_EXEC_HELPERS:
                 add_bytes(
@@ -743,6 +754,131 @@ class InstallShTests(unittest.TestCase):
         self.assertFalse(os.path.lexists(doc_root))
         self.assertFalse(os.path.lexists(self.prefix / "share" / "doc"))
 
+    def test_doc_install_upgrade_and_uninstall_preserve_user_keep_files(self) -> None:
+        doc_root = self.prefix / "share" / "doc" / "rcmake"
+        user_keep = doc_root / "KEEP.txt"
+        nested_keep = doc_root / "third_party" / "licences" / "USER-NOTE.txt"
+        nested_keep.parent.mkdir(parents=True, exist_ok=True)
+        user_keep.write_text("user file at doc root\n", encoding="utf-8")
+        nested_keep.write_text("user file inside licences\n", encoding="utf-8")
+
+        v1 = _make_fake_archive(
+            self.archives,
+            version="0.1.0",
+            archive_name="rcmake-keep-v1.tar.gz",
+            lsp_mode="symlink",
+            extra_marker="v1",
+            include_licences=True,
+            extra_doc_files={"third_party/licences/old-crate-MIT.txt": "old crate v1\n"},
+        )
+        res = self.run_install("--archive", str(v1))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(user_keep.read_text(encoding="utf-8"), "user file at doc root\n")
+        self.assertEqual(nested_keep.read_text(encoding="utf-8"), "user file inside licences\n")
+        self.assertTrue((doc_root / "third_party" / "licences" / "old-crate-MIT.txt").is_file())
+
+        # Upgrade to v2 removes stale owned licence file while keeping both user files intact.
+        v2 = _make_fake_archive(
+            self.archives,
+            version="0.2.0",
+            archive_name="rcmake-keep-v2.tar.gz",
+            lsp_mode="symlink",
+            extra_marker="v2",
+            include_licences=True,
+        )
+        res = self.run_install("--archive", str(v2))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(user_keep.read_text(encoding="utf-8"), "user file at doc root\n")
+        self.assertEqual(nested_keep.read_text(encoding="utf-8"), "user file inside licences\n")
+        self.assertFalse((doc_root / "third_party" / "licences" / "old-crate-MIT.txt").exists())
+        for relpath in DOC_FILES:
+            self.assertIn("0.2.0 v2", (doc_root / relpath).read_text(encoding="utf-8"))
+
+        # Uninstall removes only rcmake-owned doc files and manifest; user files survive.
+        res = self.run_install("--uninstall")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        for relpath in DOC_FILES:
+            self.assertFalse(os.path.lexists(doc_root / relpath), relpath)
+        self.assertFalse(os.path.lexists(doc_root / ".rcmake-manifest"))
+        self.assertEqual(user_keep.read_text(encoding="utf-8"), "user file at doc root\n")
+        self.assertEqual(nested_keep.read_text(encoding="utf-8"), "user file inside licences\n")
+
+    def test_doc_parent_file_conflict_and_post_install_failure_preserve_previous_version(self) -> None:
+        v1 = _make_fake_archive(
+            self.archives,
+            version="0.1.0",
+            archive_name="rcmake-rollback-v1.tar.gz",
+            lsp_mode="standalone",
+            extra_marker="v1",
+            include_licences=False,
+        )
+        res = self.run_install("--archive", str(v1))
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        # Place a regular file at share/doc and attempt an upgrade to v2 with licences.
+        doc_parent_file = self.prefix / "share" / "doc"
+        doc_parent_file.write_text("blocking file\n", encoding="utf-8")
+        v2 = _make_fake_archive(
+            self.archives,
+            version="0.2.0",
+            archive_name="rcmake-rollback-v2.tar.gz",
+            lsp_mode="standalone",
+            extra_marker="v2",
+            include_licences=True,
+        )
+        res = self.run_install("--archive", str(v2))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("not a directory", res.stderr)
+        self.assertEqual(doc_parent_file.read_text(encoding="utf-8"), "blocking file\n")
+
+        # Binary, LSP, and CMake data must still be v0.1.0.
+        probe = subprocess.run(
+            [str(self.prefix / "bin" / "rcmake"), "--version"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertIn("rcmake 0.1.0", probe.stdout)
+        self.assertIn("0.1.0 v1", (self.prefix / "share" / "cmake-4.5" / "Modules" / "CMake.cmake").read_text())
+        self.assertIn("standalone-lsp 0.1.0 v1", (self.prefix / "bin" / "rcmake-lsp").read_text())
+
+        # Remove blocker, install clean v1 with licences + KEEP.txt, then fail post-install --version on v2.
+        doc_parent_file.unlink()
+        v1_docs = _make_fake_archive(
+            self.archives,
+            version="0.1.0",
+            archive_name="rcmake-rollback-v1-docs.tar.gz",
+            lsp_mode="standalone",
+            extra_marker="v1",
+            include_licences=True,
+        )
+        res = self.run_install("--archive", str(v1_docs))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        keep_file = self.prefix / "share" / "doc" / "rcmake" / "KEEP.txt"
+        keep_file.write_text("keep during rollback\n", encoding="utf-8")
+
+        v2_broken = _make_fake_archive(
+            self.archives,
+            version="0.2.0",
+            archive_name="rcmake-rollback-v2-broken.tar.gz",
+            lsp_mode="standalone",
+            extra_marker="v2",
+            include_licences=True,
+            fail_installed_version=True,
+        )
+        res = self.run_install("--archive", str(v2_broken))
+        self.assertNotEqual(res.returncode, 0)
+
+        # Full rollback restores v0.1.0 binary, LSP, data, and licences without losing KEEP.txt.
+        probe = subprocess.run(
+            [str(self.prefix / "bin" / "rcmake"), "--version"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertIn("rcmake 0.1.0", probe.stdout)
+        self.assertIn("0.1.0 v1", (self.prefix / "share" / "cmake-4.5" / "Modules" / "CMake.cmake").read_text())
+        self.assertIn("0.1.0 v1", (self.prefix / "share" / "doc" / "rcmake" / "LICENSE-MIT").read_text())
+        self.assertEqual(keep_file.read_text(encoding="utf-8"), "keep during rollback\n")
+
 
 class DistShTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -972,6 +1108,9 @@ class InstallPs1Tests(unittest.TestCase):
             "THIRD_PARTY_NOTICES.md",
             "third_party/licences",
             "'share', 'doc', 'rcmake'",
+            ".rcmake-manifest",
+            "Read-DocManifestEntries",
+            "Assert-DirectoryAncestors",
             "scripts/stage.sh",
             "--from-source",
             "Run again with -Force",
@@ -993,6 +1132,8 @@ class InstallPs1Tests(unittest.TestCase):
         # Stay compatible with Windows PowerShell 5.1 (.NET Framework).
         self.assertNotIn("GetRelativePath(", content)
         self.assertNotRegex(content, r"\[IO\.Path\]::GetFullPath\([^,)]+,")
+        # Never recursively wipe share\doc\rcmake during uninstall (preserve user files).
+        self.assertNotIn("Remove-Item -LiteralPath $docDir -Recurse", content)
 
     def test_pwsh_syntax_if_available(self) -> None:
         pwsh = shutil.which("pwsh")
