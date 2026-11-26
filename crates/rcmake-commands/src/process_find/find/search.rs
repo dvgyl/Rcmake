@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -7,7 +8,9 @@ use rcmake_base::{BString, ByteSlice, list};
 use rcmake_diag::{FrameKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, Cx, FindEvent, RunMode};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{CommandSpec, FileKind, Follow, Input, Output, ProcessResult, RunRequest, path};
+use rcmake_host::{
+    CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, path,
+};
 use rcmake_syntax::ArgKind;
 
 use super::super::cat;
@@ -67,6 +70,101 @@ enum SearchPass {
     Regular,
     Framework,
     AppBundle,
+}
+
+enum SearchDirectory {
+    Unlisted,
+    Unknown,
+    Missing,
+    Listed {
+        names: Vec<BString>,
+        frameworks: Vec<PathBuf>,
+        ascii: bool,
+        has_bundle: bool,
+        has_framework: bool,
+    },
+}
+
+impl SearchDirectory {
+    fn read(host: &dyn Host, root: &Path, frameworks: bool) -> Self {
+        match host.read_dir(root) {
+            Ok(mut entries) => {
+                if frameworks {
+                    entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+                }
+                let mut ascii = true;
+                let mut has_bundle = false;
+                let mut has_framework = false;
+                let mut headers = Vec::new();
+                let names = entries
+                    .into_iter()
+                    .map(|mut entry| {
+                        ascii &= entry.name.is_ascii();
+                        if frameworks && entry.name.ends_with(b".framework") {
+                            headers.push(root.join(path::to_native(&entry.name)).join("Headers"));
+                        }
+                        entry.name.make_ascii_lowercase();
+                        has_bundle |= entry.name.ends_with(b".app");
+                        has_framework |= entry.name.ends_with(b".framework")
+                            || entry.name.ends_with(b".xcframework");
+                        entry.name
+                    })
+                    .collect();
+                Self::Listed {
+                    names,
+                    frameworks: headers,
+                    ascii,
+                    has_bundle,
+                    has_framework,
+                }
+            }
+            Err(error) if missing_directory(error.kind) => Self::Missing,
+            Err(_) => Self::Unknown,
+        }
+    }
+
+    fn may_contain(&self, root: &Path, candidate: &Path) -> bool {
+        let Some(name) = candidate.strip_prefix(root).ok().and_then(single_component) else {
+            return true;
+        };
+        match self {
+            Self::Missing => false,
+            // The filesystem can fold or normalize non-ASCII names. On Windows a short
+            // DOS name can also resolve to a different name in the directory listing.
+            Self::Listed {
+                names,
+                ascii: true,
+                has_bundle,
+                has_framework,
+                ..
+            } if !cfg!(windows) => {
+                let name = name.as_encoded_bytes();
+                if !name.is_ascii() {
+                    return true;
+                }
+                if (!has_bundle && name.ends_with(b".app"))
+                    || (!has_framework
+                        && (name.ends_with(b".framework") || name.ends_with(b".xcframework")))
+                {
+                    return false;
+                }
+                names.iter().any(|entry| entry.eq_ignore_ascii_case(name))
+            }
+            _ => true,
+        }
+    }
+}
+
+fn single_component(path: &Path) -> Option<&std::ffi::OsStr> {
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) => Some(name),
+        _ => None,
+    }
+}
+
+fn missing_directory(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::NotFound | ErrorKind::NotADirectory)
 }
 
 #[derive(Clone, Copy)]
@@ -160,8 +258,9 @@ impl<'a> Search<'a> {
             }
             _ => &[SearchPass::Regular],
         };
+        let mut directories = HashMap::new();
         for &pass in passes {
-            if let Some(found) = self.scan(cx, &dirs, &names, pass)? {
+            if let Some(found) = self.scan(cx, &dirs, &names, pass, &mut directories)? {
                 return Ok(Some(found));
             }
         }
@@ -174,6 +273,7 @@ impl<'a> Search<'a> {
         dirs: &[PathBuf],
         names: &[PathBuf],
         pass: SearchPass,
+        directories: &mut HashMap<PathBuf, SearchDirectory>,
     ) -> Result<Option<PathBuf>, CmdError> {
         let search = match pass {
             SearchPass::Regular => Self::in_directory,
@@ -182,6 +282,37 @@ impl<'a> Search<'a> {
             }
             SearchPass::Framework => Self::framework,
             SearchPass::AppBundle => Self::app_bundle,
+        };
+        let mut search = |this: &mut Self, cx: &mut Cx<'_>, dir: &Path, name: &Path| {
+            // A validator can change the filesystem before the next candidate.
+            let directory = if this.options.validator.is_some() || !dir.is_absolute() {
+                &SearchDirectory::Unknown
+            } else {
+                let directory = directories.entry(dir.to_owned()).or_insert_with(|| {
+                    if matches!(pass, SearchPass::Regular)
+                        && names.len() > 1
+                        && cx
+                            .host()
+                            .metadata(dir, Follow::Yes)
+                            .is_err_and(|error| missing_directory(error.kind))
+                    {
+                        SearchDirectory::Missing
+                    } else {
+                        SearchDirectory::Unlisted
+                    }
+                });
+                if matches!(directory, SearchDirectory::Unlisted)
+                    && !matches!(pass, SearchPass::Regular)
+                {
+                    *directory = SearchDirectory::read(
+                        cx.host(),
+                        dir,
+                        matches!(this.kind, Kind::File | Kind::Path),
+                    );
+                }
+                directory
+            };
+            search(this, cx, dir, name, directory)
         };
         if self.options.names_per_dir
             && matches!(self.kind, Kind::Library | Kind::Program)
@@ -221,6 +352,7 @@ impl<'a> Search<'a> {
         cx: &mut Cx<'_>,
         root: &Path,
         name: &Path,
+        directory: &SearchDirectory,
     ) -> Result<Option<PathBuf>, CmdError> {
         if name.is_absolute() {
             return Ok(None);
@@ -236,6 +368,7 @@ impl<'a> Search<'a> {
                 &path
             };
             if !self.ignored.ignores_prefix(&path)
+                && directory.may_contain(root, &framework)
                 && candidate(cx, Kind::File, &path)
                 && self.validate(cx, found, false)?
             {
@@ -252,18 +385,24 @@ impl<'a> Search<'a> {
             }
         }
 
-        let mut entries = cx.host().read_dir(root).unwrap_or_default();
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        for entry in entries
-            .iter()
-            .filter(|entry| entry.name.ends_with(b".framework"))
-        {
-            let headers = root.join(path::to_native(&entry.name)).join("Headers");
+        let fallback;
+        let headers = match directory {
+            SearchDirectory::Listed { frameworks, .. } => frameworks,
+            SearchDirectory::Missing => return Ok(None),
+            SearchDirectory::Unknown | SearchDirectory::Unlisted => {
+                fallback = match SearchDirectory::read(cx.host(), root, true) {
+                    SearchDirectory::Listed { frameworks, .. } => frameworks,
+                    _ => return Ok(None),
+                };
+                &fallback
+            }
+        };
+        for headers in headers {
             let path = headers.join(name);
             if !self.ignored.ignores_prefix(&path) && candidate(cx, Kind::File, &path) {
                 self.match_path = Some(path.clone());
                 return Ok(Some(if matches!(self.kind, Kind::Path) {
-                    headers
+                    headers.clone()
                 } else {
                     path
                 }));
@@ -277,6 +416,7 @@ impl<'a> Search<'a> {
         cx: &mut Cx<'_>,
         dir: &Path,
         name: &Path,
+        directory: &SearchDirectory,
     ) -> Result<Option<PathBuf>, CmdError> {
         if name.is_absolute() {
             return Ok(None);
@@ -285,6 +425,7 @@ impl<'a> Search<'a> {
         for extension in [b".xcframework".as_slice(), b".framework"] {
             let path = normalize(&dir.join(path::to_native(&cat(&[&name, extension]))));
             if self.ignored.ignores_prefix(&path)
+                || !directory.may_contain(dir, &path)
                 || !cx
                     .host()
                     .metadata(&path, Follow::Yes)
@@ -310,6 +451,7 @@ impl<'a> Search<'a> {
         cx: &mut Cx<'_>,
         dir: &Path,
         name: &Path,
+        directory: &SearchDirectory,
     ) -> Result<Option<PathBuf>, CmdError> {
         let Some(stem) = name.file_name() else {
             return Ok(None);
@@ -317,6 +459,9 @@ impl<'a> Search<'a> {
         let mut bundle_name = name.as_os_str().to_os_string();
         bundle_name.push(".app");
         let bundle = dir.join(bundle_name);
+        if !directory.may_contain(dir, &bundle) {
+            return Ok(None);
+        }
         let executable = bundle_executable(cx, &bundle, stem);
         if !self.ignored.ignores_prefix(&executable) && file_metadata(cx, &executable).is_some() {
             self.match_path = Some(executable.clone());
@@ -330,6 +475,7 @@ impl<'a> Search<'a> {
         cx: &mut Cx<'_>,
         dir: &Path,
         name: &Path,
+        directory: &SearchDirectory,
     ) -> Result<Option<PathBuf>, CmdError> {
         if name.is_absolute() && !matches!(self.kind, Kind::Program) {
             return Ok(None);
@@ -362,6 +508,9 @@ impl<'a> Search<'a> {
             .chain(try_direct.then(|| direct.clone()))
             .chain(alternatives)
         {
+            if !directory.may_contain(dir, &path) {
+                continue;
+            }
             if let Some(found) = self.accept(cx, &path, dir)? {
                 if self.considered.is_some() {
                     self.match_path = Some(path);

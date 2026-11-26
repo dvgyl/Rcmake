@@ -391,10 +391,12 @@ fn pinned_git_mirror_reuses_local_commit() -> Result<(), Box<dyn std::error::Err
             Vec::new()
         } else if git.iter().any(|arg| arg == "--is-bare-repository") {
             b"true\n".to_vec()
-        } else if git.iter().any(|arg| arg == "--verify") {
-            PIN.as_bytes().to_vec()
         } else if git.iter().any(|arg| arg == "cat-file") {
-            b"tree\n".to_vec()
+            assert_eq!(
+                req.stdin,
+                rcmake_host::Input::Bytes(format!("{PIN}\n{PIN}^{{tree}}\n").into_bytes())
+            );
+            format!("{PIN} commit\n{PIN} tree\n").into_bytes()
         } else {
             Vec::new()
         };
@@ -543,7 +545,7 @@ fn curl_and_git_default_to_no_timeout_and_accept_a_caller_timeout()
                 .map(|(_, value)| value.as_slice())
         };
         let call = observed.fetch_add(1, Ordering::SeqCst);
-        let expected_timeout = if call == 0 || (2..7).contains(&call) {
+        let expected_timeout = if call == 0 || (2..6).contains(&call) {
             None
         } else {
             Some(timeout)
@@ -591,10 +593,10 @@ fn curl_and_git_default_to_no_timeout_and_accept_a_caller_timeout()
                 .any(|arg| arg == "--is-bare-repository")
             {
                 b"true\n".to_vec()
-            } else if invocation.args.iter().any(|arg| arg == "--verify") {
-                PIN.as_bytes().to_vec()
+            } else if invocation.args.iter().any(|arg| arg == "cat-file") {
+                format!("{PIN} commit\n{PIN} tree\n").into_bytes()
             } else {
-                b"tree\n".to_vec()
+                Vec::new()
             }
         };
         for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
@@ -619,7 +621,7 @@ fn curl_and_git_default_to_no_timeout_and_accept_a_caller_timeout()
     GitMirror::new(&host, &cache.join("custom"))?
         .with_timeout(timeout)
         .prefetch(REPO, PIN)?;
-    assert_eq!(calls.load(Ordering::SeqCst), 12);
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
     Ok(())
 }
 
@@ -1026,10 +1028,8 @@ fn simulated_git(host: &PureHost) -> Result<(), Box<dyn std::error::Error>> {
             Vec::new()
         } else if git.iter().any(|arg| arg == "--is-bare-repository") {
             b"true\n".to_vec()
-        } else if git.iter().any(|arg| arg == "--verify") {
-            PIN.as_bytes().to_vec()
         } else if git.iter().any(|arg| arg == "cat-file") {
-            b"tree\n".to_vec()
+            format!("{PIN} commit\n{PIN} tree\n").into_bytes()
         } else {
             Vec::new()
         };

@@ -5,7 +5,7 @@ use std::{
 };
 
 use rcmake_host::{
-    FileKind, Follow, Host, ReadRange,
+    FileKind, Follow, Host, Input, ReadRange,
     path::{from_native, to_native},
 };
 use rcmake_store::{
@@ -212,6 +212,25 @@ impl<'a> GitMirror<'a> {
             .collect::<Vec<_>>();
         self.with_mirror(&repository, pin.as_deref(), &config, cwd, |mirror| {
             self.staged_checkout(&source_dir, |stage| {
+                if let Some(commit) = &pin
+                    && !self.read_only
+                    && !clone.options.iter().any(|flag| flag == "--depth")
+                    && self.owns_full_objects(mirror)
+                {
+                    let mut args = clone.global.to_vec();
+                    args.extend([BString::from("clone"), "--no-hardlinks".into()]);
+                    args.extend_from_slice(clone.options);
+                    args.extend(["--".into(), from_native(mirror), from_native(stage)]);
+                    if self.git(cwd, args, true).is_ok()
+                        && self.owns_full_objects(&stage.join(".git"))
+                        && self
+                            .has_commit(stage, &stage.join(".git"), commit)
+                            .is_ok_and(|found| found)
+                    {
+                        return self.restore_remote(stage, clone.origin, &repository);
+                    }
+                    self.remove_stage(stage)?;
+                }
                 let mut args = clone.global.to_vec();
                 args.extend([BString::from("clone"), "--no-local".into()]);
                 args.extend_from_slice(clone.options);
@@ -232,6 +251,20 @@ impl<'a> GitMirror<'a> {
                 }
                 self.restore_remote(stage, clone.origin, &repository)
             })
+        })
+    }
+
+    fn owns_full_objects(&self, repository: &Path) -> bool {
+        [
+            "shallow",
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+        ]
+        .iter()
+        .all(|path| {
+            self.host
+                .metadata(&repository.join(path), Follow::No)
+                .is_err_and(|error| error.kind == ErrorKind::NotFound)
         })
     }
 
@@ -706,39 +739,34 @@ impl<'a> GitMirror<'a> {
     }
 
     fn has_commit(&self, cwd: &Path, mirror: &Path, commit: &str) -> Result<bool, FetchError> {
-        match self.mirror_git(
+        let tree = format!("{commit}^{{tree}}");
+        let output = match self.git_with_input(
             cwd,
-            mirror,
-            &[],
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{commit}^{{commit}}"),
+            vec![
+                "--git-dir".into(),
+                from_native(mirror),
+                "cat-file".into(),
+                "--batch-check=%(objectname) %(objecttype)".into(),
             ],
             true,
+            Input::Bytes(format!("{commit}\n{tree}\n").into_bytes()),
         ) {
-            Ok(output) if output.trim_ascii() == commit.as_bytes() => {
-                match self.mirror_git(
-                    cwd,
-                    mirror,
-                    &[],
-                    &["cat-file", "-t", &format!("{commit}^{{tree}}")],
-                    true,
-                ) {
-                    Ok(output) if output.trim_ascii() == b"tree" => Ok(true),
-                    Ok(_) => Err(FetchError::DamagedGitMirror),
-                    Err(FetchError::Process { status, .. })
-                        if status.starts_with("exit code 128") =>
-                    {
-                        Err(FetchError::DamagedGitMirror)
-                    }
-                    Err(error) => Err(error),
-                }
+            Ok(output) => output,
+            Err(FetchError::Process { status, .. }) if status.starts_with("exit code 128") => {
+                return Err(FetchError::DamagedGitMirror);
             }
-            Ok(_) => Ok(false),
-            Err(FetchError::Process { status, .. }) if status == "exit code 1" => Ok(false),
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
+        };
+        let mut lines = output.split(|byte| *byte == b'\n');
+        if lines.next() != Some(format!("{commit} commit").as_bytes()) {
+            return Ok(false);
+        }
+        if let Some(tree) = lines.next().and_then(|line| line.strip_suffix(b" tree"))
+            && std::str::from_utf8(tree).is_ok_and(is_commit)
+        {
+            Ok(true)
+        } else {
+            Err(FetchError::DamagedGitMirror)
         }
     }
 
@@ -757,6 +785,16 @@ impl<'a> GitMirror<'a> {
     }
 
     fn git(&self, cwd: &Path, args: Vec<BString>, local: bool) -> Result<Vec<u8>, FetchError> {
+        self.git_with_input(cwd, args, local, Input::Null)
+    }
+
+    fn git_with_input(
+        &self,
+        cwd: &Path,
+        args: Vec<BString>,
+        local: bool,
+        input: Input,
+    ) -> Result<Vec<u8>, FetchError> {
         let mut env = self.host.env_all();
         let windows = self.host.system().sysname == "Windows";
         env.retain(|(key, _)| {
@@ -799,7 +837,7 @@ impl<'a> GitMirror<'a> {
             },
             cwd,
             env,
-            rcmake_host::Input::Null,
+            input,
             OUTPUT_LIMIT,
             self.remaining()?,
         )?

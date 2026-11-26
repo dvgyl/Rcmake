@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,10 +38,27 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
     let mut budget = cx.limits().regex_steps;
     let mut bytes = 0_usize;
     let mut evaluated = false;
+    let mut expressions = Vec::<Expression<'_>>::new();
     let mut configure_depends = false;
+    macro_rules! flush_globs {
+        () => {
+            Glob::new(
+                cx,
+                &options,
+                &mut output,
+                &mut budget,
+                &mut bytes,
+                &expressions,
+                configure_depends,
+            )
+            .run(out)?;
+            expressions.clear();
+        };
+    }
     while let Some(input) = args.next() {
         match input {
             b"LIST_DIRECTORIES" => {
+                flush_globs!();
                 options.directories = match args.next() {
                     Some(value) if truth::is_on(value) => true,
                     Some(value) if truth::is_off(value) => false,
@@ -49,6 +66,7 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
                 };
             }
             b"RELATIVE" => {
+                flush_globs!();
                 let base = args.next().ok_or_else(|| {
                     error([command, b" requires a directory after the RELATIVE tag."].concat())
                 })?;
@@ -60,6 +78,7 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
                 options.relative = (!base.is_empty()).then(|| base.into());
             }
             b"FOLLOW_SYMLINKS" if recursive => {
+                flush_globs!();
                 if args.len() == 0 {
                     return Err(error(
                         "GLOB_RECURSE requires a glob expression after FOLLOW_SYMLINKS.",
@@ -68,12 +87,14 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
                 options.follow = true;
             }
             b"CONFIGURE_DEPENDS" if cx.mode() == RunMode::Script => {
+                flush_globs!();
                 return Err(crate::command_error(
                     cx,
                     "CONFIGURE_DEPENDS is invalid for script and find package modes.",
                 ));
             }
             b"CONFIGURE_DEPENDS" => {
+                flush_globs!();
                 if args.len() == 0 {
                     return Err(error(
                         [
@@ -93,29 +114,11 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
             }
             pattern => {
                 evaluated = true;
-                let mut matched = BTreeSet::new();
-                let mut glob = Glob {
-                    cx,
-                    options: &options,
-                    output: if configure_depends {
-                        &mut matched
-                    } else {
-                        &mut output
-                    },
-                    budget: &mut budget,
-                    bytes: &mut bytes,
-                    case_insensitive: cfg!(any(target_os = "macos", windows)),
-                    expression: pattern,
-                    links: Vec::new(),
-                };
-                glob.run()?;
-                if configure_depends {
-                    record(cx, out, pattern, &options, &matched)?;
-                    output.extend(matched);
-                }
+                expressions.push(Expression::new(cx, pattern)?);
             }
         }
     }
+    flush_globs!();
     set(cx, out, list::join(output))
 }
 
@@ -191,28 +194,25 @@ struct Options {
     relative: Option<BString>,
 }
 
-struct Glob<'a, 'cx> {
-    cx: &'a mut Cx<'cx>,
-    options: &'a Options,
-    output: &'a mut BTreeSet<BString>,
-    budget: &'a mut u64,
-    bytes: &'a mut usize,
-    case_insensitive: bool,
-    expression: &'a [u8],
-    links: Vec<FollowedLink>,
+const CASE_INSENSITIVE: bool = cfg!(any(target_os = "macos", windows));
+
+struct Expression<'a> {
+    text: &'a [u8],
+    root: PathBuf,
+    patterns: Vec<Arc<Regex>>,
 }
 
-struct FollowedLink {
-    parent: PathBuf,
-    target: PathBuf,
-}
-
-impl Glob<'_, '_> {
-    fn run(&mut self) -> Result<()> {
-        if self.expression.is_empty() {
-            return Ok(());
+impl<'a> Expression<'a> {
+    fn new(cx: &mut Cx<'_>, text: &'a [u8]) -> Result<Self> {
+        let mut glob = Self {
+            text,
+            root: PathBuf::new(),
+            patterns: Vec::new(),
+        };
+        if text.is_empty() {
+            return Ok(glob);
         }
-        let absolute = from_native_cmake(&self.cx.resolve_path(self.expression));
+        let absolute = from_native_cmake(&cx.resolve_path(text));
         let path = Lexical::new(&absolute);
         let components: Vec<_> = path.components().collect();
         let prefix = components
@@ -223,35 +223,121 @@ impl Glob<'_, '_> {
                     .any(|b| matches!(b, b'*' | b'?' | b'[' | b'\\'))
             })
             .count();
-        if prefix == components.len() && self.expression.ends_with(b"/") {
-            return Ok(());
+        if prefix == components.len() && text.ends_with(b"/") {
+            return Ok(glob);
         }
         let (literal, expression) =
             components.split_at(prefix.min(components.len().saturating_sub(1)));
-        let mut root = to_native(&path.root_path());
+        glob.root = to_native(&path.root_path());
         for &name in literal {
-            root.push(to_native(name));
+            glob.root.push(to_native(name));
         }
-        let mut patterns = Vec::new();
         for &component in expression {
-            let component = if self.case_insensitive {
+            let component = if CASE_INSENSITIVE {
                 component.to_ascii_lowercase()
             } else {
                 component.to_vec()
             };
-            patterns.push(
-                self.cx
-                    .regex(&rcmake_regex::glob::to_regex(&component))
+            glob.patterns.push(
+                cx.regex(&rcmake_regex::glob::to_regex(&component))
                     .map_err(|e| error(e.to_string()))?,
             );
         }
-        self.walk(&root, &patterns, 0)
+        Ok(glob)
+    }
+}
+
+struct Glob<'a, 'cx> {
+    cx: &'a mut Cx<'cx>,
+    options: &'a Options,
+    output: &'a mut BTreeSet<BString>,
+    budget: &'a mut u64,
+    bytes: &'a mut usize,
+    expressions: &'a [Expression<'a>],
+    results: Vec<GlobResult>,
+}
+
+struct GlobResult {
+    matched: Option<BTreeSet<BString>>,
+    warnings: Vec<BString>,
+    links: Vec<FollowedLink>,
+}
+
+#[derive(Clone, Copy)]
+struct Cursor<'a> {
+    expression: usize,
+    patterns: &'a [Arc<Regex>],
+    followed_link: bool,
+}
+
+#[derive(Clone)]
+struct FollowedLink {
+    parent: PathBuf,
+    target: PathBuf,
+}
+
+impl<'a, 'cx> Glob<'a, 'cx> {
+    fn new(
+        cx: &'a mut Cx<'cx>,
+        options: &'a Options,
+        output: &'a mut BTreeSet<BString>,
+        budget: &'a mut u64,
+        bytes: &'a mut usize,
+        expressions: &'a [Expression<'a>],
+        configure_depends: bool,
+    ) -> Self {
+        Self {
+            cx,
+            options,
+            output,
+            budget,
+            bytes,
+            expressions,
+            results: expressions
+                .iter()
+                .map(|_| GlobResult {
+                    matched: configure_depends.then(BTreeSet::new),
+                    warnings: Vec::new(),
+                    links: Vec::new(),
+                })
+                .collect(),
+        }
     }
 
-    fn walk(&mut self, path: &Path, patterns: &[Arc<Regex>], depth: u32) -> Result<()> {
-        let [pattern, rest @ ..] = patterns else {
+    fn run(mut self, variable: &[u8]) -> Result<()> {
+        let mut roots = BTreeMap::<&Path, Vec<Cursor<'_>>>::new();
+        for (index, expression) in self.expressions.iter().enumerate() {
+            if !expression.patterns.is_empty() {
+                roots.entry(&expression.root).or_default().push(Cursor {
+                    expression: index,
+                    patterns: &expression.patterns,
+                    followed_link: false,
+                });
+            }
+        }
+        let mut roots: Vec<_> = roots.into_iter().collect();
+        roots.sort_unstable_by_key(|(_, cursors)| cursors.first().map(|cursor| cursor.expression));
+        let result = roots
+            .into_iter()
+            .try_for_each(|(root, cursors)| self.walk(root, &cursors, 0));
+        for (expression, glob) in self.expressions.iter().zip(self.results) {
+            for message in glob.warnings {
+                warning(self.cx, message);
+            }
+            if result.is_ok()
+                && let Some(matched) = glob.matched
+            {
+                record(self.cx, variable, expression.text, self.options, &matched)?;
+                self.output.extend(matched);
+            }
+        }
+        result
+    }
+
+    fn walk(&mut self, path: &Path, cursors: &[Cursor<'_>], depth: u32) -> Result<()> {
+        if cursors.is_empty() {
             return Ok(());
-        };
+        }
         if depth > self.cx.limits().max_recursion.min(256) {
             return Err(error("GLOB exceeds the directory depth limit"));
         }
@@ -274,91 +360,124 @@ impl Glob<'_, '_> {
                 )));
             }
         };
-        for entry in entries {
+        let follow = self.options.follow || !self.options.recursive;
+        let inspect_links = follow || cursors.iter().any(|cursor| cursor.patterns.len() > 1);
+        let mut children = Vec::new();
+        for mut entry in entries {
             let child = path.join(to_native(&entry.name));
             let symlink = entry.kind == FileKind::Symlink;
-            let directory = entry.kind == FileKind::Dir
-                || (symlink
-                    && (self.options.follow || !self.options.recursive || !rest.is_empty())
-                    && self
-                        .cx
-                        .host()
-                        .metadata(&child, Follow::Yes)
-                        .is_ok_and(|meta| meta.kind == FileKind::Dir));
-            let name = if self.case_insensitive {
-                entry.name.to_ascii_lowercase()
-            } else {
-                entry.name.into()
-            };
-            let matches = pattern
-                .find_at(&name, 0, MatchOptions::default(), self.budget)
-                .map_err(|e| error(e.to_string()))?
-                .is_some();
-            if !rest.is_empty() {
-                if directory && matches {
-                    self.walk(&child, rest, depth + 1)?;
+            let link_directory = symlink
+                && inspect_links
+                && self
+                    .cx
+                    .host()
+                    .metadata(&child, Follow::Yes)
+                    .is_ok_and(|meta| meta.kind == FileKind::Dir);
+            if CASE_INSENSITIVE {
+                entry.name.make_ascii_lowercase();
+            }
+            let mut link = None;
+            for &cursor in cursors {
+                let [pattern, rest @ ..] = cursor.patterns else {
+                    continue;
+                };
+                let more = !rest.is_empty();
+                let directory = entry.kind == FileKind::Dir || link_directory && (follow || more);
+                let matches = pattern
+                    .find_at(&entry.name, 0, MatchOptions::default(), self.budget)
+                    .map_err(|e| error(e.to_string()))?
+                    .is_some();
+                if more {
+                    if directory && matches {
+                        children.push(Cursor {
+                            patterns: rest,
+                            followed_link: false,
+                            ..cursor
+                        });
+                    }
+                } else if self.options.recursive && directory {
+                    if symlink {
+                        let link = link.get_or_insert_with(|| self.link(path, &child));
+                        let Some(link) = link else {
+                            continue;
+                        };
+                        if self.link_cycle(cursor.expression, &child, link) {
+                            continue;
+                        }
+                    }
+                    if self.options.directories {
+                        self.insert(&child, cursor.expression)?;
+                    }
+                    children.push(Cursor {
+                        followed_link: symlink,
+                        ..cursor
+                    });
+                } else if matches && (self.options.directories || !directory) {
+                    self.insert(&child, cursor.expression)?;
                 }
-            } else if self.options.recursive && directory {
-                if symlink {
-                    self.follow_link(path, &child, patterns, depth + 1)?;
-                } else {
-                    self.walk_directory(&child, patterns, depth + 1)?;
+            }
+            for cursor in children.iter().filter(|cursor| cursor.followed_link) {
+                if let Some(Some(link)) = &link
+                    && let Some(result) = self.results.get_mut(cursor.expression)
+                {
+                    result.links.push(link.clone());
                 }
-            } else if matches && (self.options.directories || !directory) {
-                self.insert(&child)?;
+            }
+            if !children.is_empty() {
+                self.walk(&child, &children, depth + 1)?;
+                for cursor in children.drain(..).filter(|cursor| cursor.followed_link) {
+                    if let Some(result) = self.results.get_mut(cursor.expression) {
+                        result.links.pop();
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    fn walk_directory(&mut self, path: &Path, patterns: &[Arc<Regex>], depth: u32) -> Result<()> {
-        if self.options.directories {
-            self.insert(path)?;
-        }
-        self.walk(path, patterns, depth)
-    }
-
-    fn follow_link(
-        &mut self,
-        parent: &Path,
-        path: &Path,
-        patterns: &[Arc<Regex>],
-        depth: u32,
-    ) -> Result<()> {
+    fn link(&self, parent: &Path, path: &Path) -> Option<FollowedLink> {
         let host = self.cx.host();
-        let Ok(target) = host.canonicalize(path) else {
-            return Ok(());
-        };
+        let target = host.canonicalize(path).ok()?;
         let parent = host
             .canonicalize(parent)
             .unwrap_or_else(|_| parent.to_owned());
-        if let Some(cycle_start) = self.links.iter().position(|link| link.target == target) {
-            let mut message = BString::from(
-                [
-                    b"Cyclic recursion detected while globbing for '",
-                    self.expression,
-                    b"':",
-                ]
-                .concat(),
-            );
-            for link in self.links.iter().skip(cycle_start) {
-                message.extend_from_slice(b"\n");
-                message.extend_from_slice(&from_native_cmake(&link.parent));
-            }
-            if let Some(name) = path.file_name() {
-                message.extend_from_slice(b"\n");
-                message.extend_from_slice(&from_native_cmake(&parent.join(name)));
-            }
-            warning(self.cx, message);
-            return Ok(());
-        }
-        self.links.push(FollowedLink { parent, target });
-        let result = self.walk_directory(path, patterns, depth);
-        self.links.pop();
-        result
+        Some(FollowedLink { parent, target })
     }
 
-    fn insert(&mut self, path: &Path) -> Result<()> {
+    fn link_cycle(&mut self, index: usize, path: &Path, link: &FollowedLink) -> bool {
+        let (Some(glob), Some(expression)) =
+            (self.results.get_mut(index), self.expressions.get(index))
+        else {
+            return false;
+        };
+        let Some(start) = glob
+            .links
+            .iter()
+            .position(|previous| previous.target == link.target)
+        else {
+            return false;
+        };
+        let mut message = BString::from(
+            [
+                b"Cyclic recursion detected while globbing for '",
+                expression.text,
+                b"':",
+            ]
+            .concat(),
+        );
+        for previous in glob.links.iter().skip(start) {
+            message.extend_from_slice(b"\n");
+            message.extend_from_slice(&from_native_cmake(&previous.parent));
+        }
+        if let Some(name) = path.file_name() {
+            message.extend_from_slice(b"\n");
+            message.extend_from_slice(&from_native_cmake(&link.parent.join(name)));
+        }
+        glob.warnings.push(message);
+        true
+    }
+
+    fn insert(&mut self, path: &Path, index: usize) -> Result<()> {
         let full = from_native_cmake(path);
         let name = if let Some(base) = &self.options.relative {
             if Lexical::new(base).absolute() {
@@ -370,7 +489,12 @@ impl Glob<'_, '_> {
             full
         };
         let size = name.len();
-        if self.output.insert(name) {
+        let output = self
+            .results
+            .get_mut(index)
+            .and_then(|glob| glob.matched.as_mut())
+            .unwrap_or(self.output);
+        if output.insert(name) {
             *self.bytes = self.bytes.saturating_add(size + 1);
             if *self.bytes > self.cx.limits().max_value_bytes.saturating_add(1) {
                 return Err(error("GLOB exceeds the variable size limit"));

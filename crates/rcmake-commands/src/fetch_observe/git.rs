@@ -10,7 +10,8 @@ use rcmake_base::BString;
 use rcmake_eval::{CmdError, Cx, FetchLockMode};
 use rcmake_fetch::{GitClone, GitEntry, GitMirror, LockEntry};
 use rcmake_host::{
-    CommandSpec, Follow, Host, ProcessResult, RunOutput, RunRequest, path::to_native,
+    CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, ReadRange, RunOutput,
+    RunRequest, path::to_native,
 };
 
 use super::runtime::{
@@ -40,6 +41,7 @@ struct GitPlan {
     repository: String,
     tag: Option<String>,
     pin: Option<String>,
+    default_submodules: bool,
     mode: FetchLockMode,
     offline: bool,
 }
@@ -97,7 +99,7 @@ pub(crate) fn before_process(
     };
     let operation = git_operation(&command.args);
     if operation == b"submodule" && request.cwd == pop.source {
-        return plan.submodules(cx);
+        return plan.submodules(cx, request, command, script);
     }
     if script == Some(Script::GitUpdate) && request.cwd == pop.source {
         return plan.update(cx, request, command, operation);
@@ -200,7 +202,10 @@ impl GitPlan {
         };
         let pin = declaration.git_commit().map(str::to_ascii_lowercase);
         let DeclaredSource::Git {
-            repository, tag, ..
+            repository,
+            tag,
+            submodules,
+            ..
         } = declaration.source
         else {
             return Ok(None);
@@ -214,6 +219,7 @@ impl GitPlan {
             repository,
             tag,
             pin,
+            default_submodules: submodules.is_none(),
             mode,
             offline,
         };
@@ -464,18 +470,29 @@ impl GitPlan {
         self.tag.as_deref().unwrap_or("master")
     }
 
-    fn submodules(&self, cx: &mut Cx<'_>) -> Result<ProcessAction, CmdError> {
+    fn submodules(
+        &self,
+        cx: &mut Cx<'_>,
+        request: &RunRequest,
+        command: &CommandSpec,
+        script: Option<Script>,
+    ) -> Result<ProcessAction, CmdError> {
         let modules = self.population.source.join(".gitmodules");
-        if cx
+        let no_modules_file = cx
             .host()
             .metadata(&modules, Follow::No)
-            .is_err_and(|error| error.kind == ErrorKind::NotFound)
+            .is_err_and(|error| error.kind == ErrorKind::NotFound);
+        if no_modules_file && self.enforce() {
+            return Ok(success(Vec::new()));
+        }
+        if no_modules_file
+            && script == Some(Script::GitClone)
+            && self.default_submodules
+            && command.args == ["submodule", "update", "--recursive", "--init"]
+            && let Some(pin) = &self.pin
+            && no_gitlinks(cx.host(), request, command, pin)
         {
-            return Ok(if self.enforce() {
-                success(Vec::new())
-            } else {
-                ProcessAction::default()
-            });
+            return Ok(success(Vec::new()));
         }
         if self.enforce() {
             required(
@@ -484,7 +501,7 @@ impl GitPlan {
                 &self.population,
                 BlockReason::GitSubmodules,
             )?;
-        } else {
+        } else if !no_modules_file {
             self.check_network(cx, false)?;
         }
         Ok(ProcessAction::default())
@@ -500,6 +517,59 @@ impl GitPlan {
             source: self.population.source.clone(),
         })
     }
+}
+
+fn no_gitlinks(host: &dyn Host, request: &RunRequest, command: &CommandSpec, pin: &str) -> bool {
+    const REDIRECTS: &[&[u8]] = &[
+        b"GIT_DIR",
+        b"GIT_COMMON_DIR",
+        b"GIT_WORK_TREE",
+        b"GIT_INDEX_FILE",
+        b"GIT_CONFIG",
+        b"GIT_CONFIG_COUNT",
+        b"GIT_CONFIG_PARAMETERS",
+    ];
+    let git = request.cwd.join(".git");
+    if request
+        .env
+        .iter()
+        .any(|(key, _)| REDIRECTS.iter().any(|name| key.eq_ignore_ascii_case(name)))
+        || !host
+            .metadata(&git, Follow::No)
+            .is_ok_and(|meta| meta.kind == FileKind::Dir)
+        || !host
+            .metadata(&git.join("index"), Follow::No)
+            .is_ok_and(|meta| meta.kind == FileKind::File)
+        || !host
+            .read(&git.join("HEAD"), ReadRange::All { limit: 64 })
+            .is_ok_and(|head| head.trim_ascii_end() == pin.as_bytes())
+    {
+        return false;
+    }
+    let inspect = RunRequest {
+        pipeline: vec![CommandSpec {
+            program: command.program.clone(),
+            args: ["ls-files", "--stage", "-z"].map(BString::from).into(),
+        }],
+        stdin: Input::Null,
+        stdout: Output::Capture,
+        stderr: Output::Capture,
+        tee: false,
+        ..request.clone()
+    };
+    host.run_bounded(&inspect, 1024 * 1024).is_ok_and(|run| {
+        run.results == [ProcessResult::Exited(0)]
+            && run.stderr.is_empty()
+            && (run.stdout.is_empty()
+                || run.stdout.strip_suffix(b"\0").is_some_and(|entries| {
+                    entries.split(|&byte| byte == 0).all(|entry| {
+                        matches!(
+                            entry.split(|&byte| byte == b' ').next(),
+                            Some(b"100644" | b"100755" | b"120000")
+                        )
+                    })
+                }))
+    })
 }
 
 fn git_operation(mut args: &[BString]) -> &[u8] {
@@ -660,6 +730,51 @@ mod tests {
     use rcmake_host::{HostResult, PureHost};
 
     use super::*;
+
+    #[test]
+    fn index_inspection_rejects_gitlinks_and_failed_queries() -> HostResult<()> {
+        let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = PureHost::new(root.into(), root.join("rcmake"));
+        let pin = "0123456789012345678901234567890123456789";
+        host.seed_file(&root.join(".git/HEAD"), format!("{pin}\n").as_bytes())?;
+        host.seed_file(&root.join(".git/index"), b"index")?;
+        let command = CommandSpec {
+            program: "git".into(),
+            args: vec!["submodule".into(), "update".into()],
+        };
+        let request = RunRequest {
+            pipeline: vec![command.clone()],
+            cwd: root.into(),
+            env: Vec::new(),
+            stdin: Input::Null,
+            stdout: Output::Capture,
+            stderr: Output::Capture,
+            timeout: None,
+            tee: false,
+        };
+        for (mode, status, expected) in [
+            ("100644", 0, true),
+            ("160000", 0, false),
+            ("100644", 1, false),
+        ] {
+            host.set_command_handler(move |_, request, _| {
+                assert_eq!(
+                    request
+                        .pipeline
+                        .first()
+                        .map(|command| command.args.as_slice()),
+                    Some(["ls-files", "--stage", "-z"].map(BString::from).as_slice())
+                );
+                Ok(RunOutput {
+                    stdout: format!("{mode} {pin} 0\ttracked\nname\0").into_bytes(),
+                    results: vec![ProcessResult::Exited(status)],
+                    ..RunOutput::default()
+                })
+            })?;
+            assert_eq!(no_gitlinks(&host, &request, &command, pin), expected);
+        }
+        Ok(())
+    }
 
     #[test]
     fn matches_the_running_executable_through_a_path_alias() -> HostResult<()> {

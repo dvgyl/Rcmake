@@ -1139,7 +1139,7 @@ endif()
                     ]
                 );
                 assert_eq!(request.cwd, work.join("Sample-Package"));
-                assert_eq!(request.timeout, Some(Duration::from_secs(300)));
+                assert_eq!(request.timeout, None);
                 let content = BString::from(generators::tests::read(host, &spec));
                 assert!(content.contains_str(b"Name:"));
                 assert!(content.contains_str(b"Summary:"));

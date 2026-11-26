@@ -135,7 +135,7 @@ impl<'a> ScratchDir<'a> {
                 Ok(_) => {}
             }
         }
-        Err(error("Cannot create a temporary disk image directory"))
+        Err(error("Cannot create a temporary staging directory"))
     }
 }
 

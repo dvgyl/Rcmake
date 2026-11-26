@@ -259,18 +259,7 @@ fn register_cpack_commands(registry: &mut Registry) {
                     matches!(pair, [key, value] if key.value == "RESULT_VARIABLE"
                         && value.value == "CPACK_RPMBUILD_EXEC_RESULT")
                 });
-                let mut bounded = args.to_vec();
-                if !args.iter().any(|arg| arg.value == "TIMEOUT")
-                    && let Some(arg) = args.first()
-                {
-                    let mut keyword = arg.clone();
-                    keyword.value = "TIMEOUT".into();
-                    bounded.push(keyword);
-                    let mut limit = arg.clone();
-                    limit.value = "300".into();
-                    bounded.push(limit);
-                }
-                let result = builtin(cx, &bounded)?;
+                let result = builtin(cx, args)?;
                 if rpm_build {
                     let status = cx.var_or_empty(b"CPACK_RPMBUILD_EXEC_RESULT");
                     cx.set_parent_scope(b"_RCMAKE_CPACK_RPMBUILD_STATUS", Some(status));

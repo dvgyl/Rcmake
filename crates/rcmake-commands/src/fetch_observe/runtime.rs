@@ -11,7 +11,7 @@ use rcmake_diag::{Effect, Frame, MessageKind};
 use rcmake_eval::{CmdError, Cx, FetchLockMode, HermeticMode, Interp, Services};
 use rcmake_expr::ExpandedArg;
 use rcmake_fetch::{ContentHash, FetchError, FetchPool, LockSession, PrefetchSource, Ticket};
-use rcmake_host::{Host, ReadRange, path::to_native};
+use rcmake_host::{FileKind, Follow, Host, ReadRange, path::to_native};
 use rcmake_store::{Digest, StoreConfig, StoreMode};
 
 use super::frozen::Frozen;
@@ -911,9 +911,22 @@ fn default_transport(cx: &Cx<'_>, host: &dyn Host) -> bool {
         b"CMAKE_TLS_CAINFO",
         b"CMAKE_NETRC",
         b"CMAKE_NETRC_FILE",
-        b"GIT_CONFIG_GLOBAL",
         b"GIT_CONFIG_COUNT",
     ];
-    VARS.iter()
-        .all(|name| !cx.var_defined(name) && host.env_get(name).is_none())
+    let global = b"GIT_CONFIG_GLOBAL";
+    let windows = host.system().sysname == "Windows";
+    !cx.var_defined(global)
+        && host.env_get(global).is_none_or(|path| {
+            if windows {
+                path.eq_ignore_ascii_case(b"NUL")
+            } else {
+                path == b"/dev/null"
+                    && host
+                        .metadata(Path::new("/dev/null"), Follow::No)
+                        .is_ok_and(|metadata| metadata.kind == FileKind::Other)
+            }
+        })
+        && VARS
+            .iter()
+            .all(|name| !cx.var_defined(name) && host.env_get(name).is_none())
 }

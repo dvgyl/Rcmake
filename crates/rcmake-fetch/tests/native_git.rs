@@ -157,6 +157,30 @@ fn mirror_clones_updates_and_checks_out_old_pins() -> Result<(), Box<dyn std::er
     let source = root.join("pinned");
     mirrors.checkout(repository, &first, &source)?;
     assert_eq!(mirrors.head(&source)?, first);
+
+    let full_args = [
+        "clone".into(),
+        "--no-checkout".into(),
+        from_native(&upstream),
+        "full".into(),
+    ];
+    let full_clone = classify_git_clone(&full_args).ok_or("Invalid Git clone arguments.")?;
+    mirrors.clone_template(&full_clone, root, Some(&first))?;
+    let full = root.join("full");
+    assert_eq!(
+        git(&host, &full, &["remote", "get-url", "origin"])?,
+        repository
+    );
+    for path in ["shallow", "FETCH_HEAD", "objects/info/alternates"] {
+        assert!(
+            host.metadata(&full.join(".git").join(path), Follow::No)
+                .is_err()
+        );
+    }
+    let mirror = mirrors.prefetch(repository, &first)?;
+    host.remove_dir_all(&mirror)?;
+    mirrors.checkout_commit(&full, &first)?;
+    assert_eq!(mirrors.checkout_head(&full)?, first);
     Ok(())
 }
 
