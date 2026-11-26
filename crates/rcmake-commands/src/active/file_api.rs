@@ -77,8 +77,8 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if files.is_empty() {
         return Ok(Flow::Normal);
     }
-    // CMake keeps project queries in memory (`cmFileAPI::AddProjectQuery`). The File
-    // API writer answers them as shared queries without query files on disk.
+    // A project query lives in memory only. The File API writer answers it as a shared
+    // query without a query file on disk.
     let props = &mut cx.global().props;
     let mut queries = props
         .get(PROJECT_QUERIES)

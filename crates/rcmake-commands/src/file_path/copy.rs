@@ -279,7 +279,7 @@ pub(super) fn copy_entry(
             host.create_dir_all(target)
                 .map_err(|e| copy_error(command, "make directory", target, &e))?;
         }
-        // `cmFileCopier::InstallDirectory` reports a symlink to a directory as installed.
+        // file(INSTALL) reports a symlink to a directory as an installed directory.
         observe(
             target,
             true,
@@ -316,7 +316,7 @@ pub(super) fn copy_entry(
                     .as_ref()
                     .is_some_and(|entry| entry.kind == FileKind::Dir)
             {
-                // `cmFileCopier::InstallSymlink` reports the copy before it fails.
+                // file(INSTALL) reports the symlink copy before it fails.
                 observe(target, false, false);
                 return Err(error(format!(
                     "INSTALL cannot duplicate symlink\n  {}\nat\n  {}\nbecause: A directory already exists at that location",

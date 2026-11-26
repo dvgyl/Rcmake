@@ -84,7 +84,7 @@ fn add_test(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         ));
     }
     // A test with build dependencies gets a build target, so its name must be a valid
-    // target name (`cmGeneratorExpression::IsValidTargetName`).
+    // target name.
     if !test.build_depends.is_empty()
         && !name
             .iter()

@@ -169,7 +169,8 @@ fn configuration_maps(cx: &mut Cx<'_>) -> Vec<(BString, BString)> {
         .collect()
 }
 
-/// Apply one usage block in the order of `cmPackageInfoReader::SetTargetProperties`.
+/// Apply one CPS usage block to `target`. The property writes below keep the order that
+/// CMake 4.5.1 uses.
 fn apply_usage(
     target: &mut Target,
     package: &[u8],
@@ -248,7 +249,7 @@ fn apply_usage(
             target.props.set(cat(&[prop, &suffix]), value.clone());
         }
     }
-    // `MapLanguage(..., DisallowGlob)` drops `*` and unknown names without a warning.
+    // Link languages drop `*` and unknown names without a warning.
     for name in &usage.link_languages {
         if let Some(lang) = language(name, false) {
             target.props.append(
@@ -288,7 +289,7 @@ fn apply_usage(
     }
 }
 
-/// `AppendLanguageProperties`: add each list, and limit a language list to that language.
+/// Add each list. A list for one language applies only to that language.
 fn add_language_lists(
     target: &mut Target,
     field: UsageField,
@@ -316,8 +317,8 @@ fn add_language_lists(
 /// Definition values of one name by CMake language. `*` sorts before every language name.
 type LanguageValues<'a> = BTreeMap<&'static [u8], Option<&'a BString>>;
 
-/// `AddDefinitions`: order the definitions by name. When a language overrides a `*`
-/// definition, limit the `*` definition to the other languages.
+/// Add the definitions in name order. When a language overrides a `*` definition,
+/// the `*` definition applies only to the other languages.
 fn add_definitions(
     target: &mut Target,
     definitions: &BTreeMap<BString, BTreeMap<BString, Option<BString>>>,
@@ -370,7 +371,7 @@ fn add_definitions(
     }
 }
 
-/// `BuildDefinition`: `NAME=value`, or `NAME` without a value.
+/// Format one definition as `NAME=value`, or as `NAME` without a value.
 fn definition(key: &[u8], value: Option<&BString>) -> BString {
     value.map_or_else(|| key.into(), |value| cat(&[key, b"=", value]))
 }
@@ -399,7 +400,7 @@ fn reference(package: &[u8], entry: &[u8]) -> BString {
     }
 }
 
-/// `MapLanguage`: map a CPS language name to a CMake language name. Case is ignored.
+/// Map a CPS language name to a CMake language name. Case is ignored.
 /// CMake 4.5.1 maps `swift` to the lowercase name `swift`.
 fn language(name: &[u8], glob: bool) -> Option<&'static [u8]> {
     if glob && name == b"*" {
