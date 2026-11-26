@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_host::{Host, HostResult, ProcessResult, ReadRange, RunOutput, Stream};
+use rcmake_host::{Host, HostResult, ProcessResult, PureHost, ReadRange, RunOutput, Stream};
 
 #[test]
 fn project_loads_toolchain_after_host_and_policy_setup() -> HostResult<()> {
@@ -153,9 +154,42 @@ fn project_file_option_requires_one_value() {
     }
 }
 
+fn hermetic_absolute(path: &str) -> PathBuf {
+    if cfg!(windows) {
+        format!("C:{path}").into()
+    } else {
+        path.into()
+    }
+}
+
+fn hermetic_project_host() -> HostResult<Arc<PureHost>> {
+    let cwd = hermetic_absolute("/work");
+    let exe = hermetic_absolute("/usr/local/bin/cmake");
+    let host = Arc::new(PureHost::new(cwd, exe.clone()));
+    host.seed_file(&exe, b"")?;
+    host.set_permissions(&exe, 0o755)?;
+    let modules = hermetic_absolute("/usr/local/share/cmake-4.5/Modules");
+    for (name, contents) in [
+        ("CMakeDetermineSystem.cmake", ""),
+        ("CMakeSystemSpecificInitialize.cmake", ""),
+        ("CMakeSystemSpecificInformation.cmake", ""),
+        (
+            "CMakeNinjaFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM /tools/ninja CACHE FILEPATH \"\")\n",
+        ),
+        (
+            "CMakeUnixFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM /tools/make CACHE FILEPATH \"\")\n",
+        ),
+    ] {
+        host.seed_file(&modules.join(name), contents.as_bytes())?;
+    }
+    Ok(host)
+}
+
 #[test]
 fn rich_diagnostics_never_read_undeclared_files_from_echoed_stderr() -> HostResult<()> {
-    let host = crate::driver_tests::project_host();
+    let host = hermetic_project_host()?;
     let cwd = host.initial_cwd();
     let root = cwd.parent().unwrap_or_else(|| Path::new("/"));
     let secret = root.join("private/secret");
@@ -214,7 +248,7 @@ fn rich_diagnostics_never_read_undeclared_files_from_echoed_stderr() -> HostResu
 
 #[test]
 fn rich_diagnostics_render_parse_error_from_source_map_under_strict_hermetic() -> HostResult<()> {
-    let host = crate::driver_tests::project_host();
+    let host = hermetic_project_host()?;
     host.seed_file(
         &host.initial_cwd().join("CMakeLists.txt"),
         b"cmake_minimum_required(VERSION 4.5)\nif(TRUE\n",

@@ -597,11 +597,15 @@ fn header_only_tar_bomb_respects_stream_budget() -> TestResult {
 #[test]
 fn grzip_external_filter_respects_output_limit() -> TestResult {
     let host = test_host();
-    let bin_dir = Path::new("/bin");
+    let bin_dir = if cfg!(windows) {
+        Path::new("C:\\bin")
+    } else {
+        Path::new("/bin")
+    };
     let grzip = bin_dir.join(format!("grzip{}", std::env::consts::EXE_SUFFIX));
     host.seed_file(&grzip, b"")?;
     host.set_permissions(&grzip, 0o755)?;
-    host.env_set(b"PATH", Some(b"/bin"));
+    host.env_set(b"PATH", Some(&rcmake_host::path::from_native(bin_dir)));
     host.set_command_handler(|_, _, _| {
         Ok(rcmake_host::RunOutput {
             results: vec![rcmake_host::ProcessResult::Exited(0)],

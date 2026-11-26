@@ -406,7 +406,11 @@ fn new_interp_with_paths(
     argv: &[BString],
     services: rcmake_eval::Services,
 ) -> Interp {
-    let name = if cfg!(windows) { "cmake.exe" } else { "cmake" };
+    let name = if host.system().sysname == b"Windows" {
+        "cmake.exe"
+    } else {
+        "cmake"
+    };
     let alias = cmake_command.with_file_name(name);
     let cmake_command = if alias != cmake_command
         && host
