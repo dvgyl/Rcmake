@@ -29,7 +29,11 @@ binary="$target_dir/wasm32-wasip1/wasm-release/rcmake-wasm.wasm"
 artifact=site/wasm/rcmake_wasm.wasm
 if command -v wasm-opt >/dev/null 2>&1; then
     optimized="$target_dir/wasm32-wasip1/wasm-release/rcmake-wasm.opt.wasm"
-    wasm-opt -Oz --strip-debug "$binary" -o "$optimized"
+    wasm-opt -Oz --strip-debug \
+        --enable-bulk-memory --enable-bulk-memory-opt \
+        --enable-nontrapping-float-to-int --enable-sign-ext \
+        --enable-multivalue --enable-mutable-globals --enable-reference-types \
+        "$binary" -o "$optimized"
     binary="$optimized"
 fi
 raw_bytes=$(wc -c < "$binary")
