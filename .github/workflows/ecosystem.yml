@@ -989,7 +989,7 @@ jobs:
       - name: Install Linux build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc g++ clang ninja-build make binutils libzstd1 pkg-config rpm
+          sudo apt-get install -y gcc g++ clang ninja-build make binutils libzstd1 pkg-config rpm elfutils
           curl --fail --location --retry 3 --output "$RUNNER_TEMP/appimagetool" \
             https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
           curl --fail --location --retry 3 --output "$RUNNER_TEMP/appimage-runtime" \

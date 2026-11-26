@@ -118,7 +118,9 @@ COMPLETE = "-- runcmake_eval: suite complete"
 CASE_RESULT = re.compile(
     r"^-- (?P<passed>.+) - PASSED$"
     r"|^CMake Error at .*[/\\]RunCMake\.cmake:\d+ \(message\):\n"
-    r"  (?P<failed>.+) - FAILED:\n(?P<detail>(?:^[ \t].*\n|^\n)*)",
+    # CMake can wrap before the hyphen or before FAILED.
+    r"(?:[ \t]*\n)*  (?P<failed>\S[^\n]*?)(?: |\n  )-(?: |\n  )FAILED:\n"
+    r"(?P<detail>(?:^[ \t].*\n|^\n)*)",
     re.MULTILINE,
 )
 
@@ -269,11 +271,13 @@ def read_registrations(suites, driver, source, work, env, timeout, test_vars, us
     registrations = defaultdict(list)
     generators = registration_generators(suites, driver, work, env, timeout)
     inventory["registration_generators"] = generators
-    # These tests use the file system in the temporary workspace.
-    (work / "FilesystemCase").touch()
-    case_sensitive = int(not (work / "filesystemcase").exists())
+    # The case mismatch tests require case-insensitive lookup and case preservation.
+    probe = work / "FilesystemCase"
+    probe.touch()
+    filesystem_case = int((work / probe.name.lower()).exists()
+                          and any(entry.name == probe.name for entry in work.iterdir()))
     options = ["-DCMake_TEST_FindPython3=ON", "-DCMake_TEST_Qt5=OFF", "-DCMake_TEST_Qt6=OFF",
-               "-DCMake_TEST_NO_NETWORK=ON", f"-DCMake_TEST_FILESYSTEM_CASE={case_sensitive}"]
+               "-DCMake_TEST_NO_NETWORK=ON", f"-DCMake_TEST_FILESYSTEM_CASE={filesystem_case}"]
     if "Swift" not in suites:
         options.extend(("-DCMake_TEST_Swift=OFF", "-DCMAKE_Swift_COMPILER=NOTFOUND"))
     options.append("-DCMAKE_Fortran_COMPILER=NOTFOUND")
@@ -338,6 +342,9 @@ def read_registrations(suites, driver, source, work, env, timeout, test_vars, us
                     fixture = Path(value)
                     if fixture.parent.name in ("RunCMake", "Debug") and fixture.suffix in ("", ".exe"):
                         fixtures.add(fixture.stem)
+        if "pseudo_pvs" in fixtures:
+            # CMake searches for the converter in the analyzer's directory.
+            fixtures.add("pseudo_plog_converter")
         if fixtures:
             checked_run([
                 driver, "--build", build, "--config", "Debug", "--parallel", "2",
@@ -380,6 +387,9 @@ def run_registered_suite(registrations, driver, target, source, root, tools, wra
             if argument.startswith("-DRunCMake_BINARY_DIR="):
                 argument = argument.replace(entry.directory.as_posix(), build.as_posix(), 1)
             arguments.append(argument.replace(source.as_posix(), (root / "source").as_posix()))
+        if entry.script.parent.name == "MaxRecursionDepth":
+            # Keep the driver running when the suite lowers the environment limit for a child.
+            arguments.append("-DCMAKE_MAXIMUM_RECURSION_DEPTH=100")
         command = [
             driver, *arguments, f"-DEVAL_TEST_BINARY={target.as_posix()}",
             f"-DEVAL_TEST_CTEST={tools['ctest'].as_posix()}",
