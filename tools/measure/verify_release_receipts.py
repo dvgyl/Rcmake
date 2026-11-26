@@ -31,9 +31,11 @@ import sys
 from typing import Any, Callable
 
 if __package__:
-    from .build_dashboard_json import validate as validate_schema
+    from . import build_dashboard_json as builder
 else:
-    from build_dashboard_json import validate as validate_schema
+    import build_dashboard_json as builder
+
+validate_schema = builder.validate
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -54,8 +56,8 @@ RUNCMAKE_MIN_SUITES = {
 INDEPENDENT_MIN_SCENARIOS = 20
 LARGE_PROJECTS_MIN_COUNT = 10
 VCPKG_REQUIRED_SHARDS = 64
-UNSEEN_MIN_REPOS = 240
-UNSEEN_MIN_PASS_RATE = 95.0
+UNSEEN_MIN_REPOS = builder.HOLDOUT_MIN_REPOS
+UNSEEN_MIN_PASS_RATE = builder.HOLDOUT_MIN_PASS_RATE
 PROBE_CACHE_MIN_CHECKS = 16
 MUTATION_MIN_STEPS = 20
 FUZZ_MIN_ITERATIONS = 14_000_000
@@ -63,12 +65,13 @@ WASI_MIN_CHECKS = 6
 REQUIRED_CONAN_SCENARIOS = ("conan-consumer", "conan-source-build")
 
 HOLDOUT_FORBIDDEN_KEYS = frozenset({
-    "projects", "project", "repos", "repo", "repositories", "repository",
+    "projects", "project", "repos", "repo", "repositories", "repository", "name",
     "repo_name", "repo_names", "repository_name", "repository_names",
     "url", "urls", "git_url", "clone_url", "github",
 })
 HOLDOUT_LEAK_VALUE_RE = re.compile(
-    r"(?:https?://|git@|github\.com|gitlab\.com|bitbucket\.org|\.git(?:\b|/|$))",
+    r"(?:https?://|git@|github\.com|gitlab\.com|bitbucket\.org|\.git(?:\b|/|$)"
+    r"|(?<![\w./+-])[\w.-]+/[\w.-]+(?![\w./+-]))",
     re.IGNORECASE,
 )
 
@@ -103,6 +106,7 @@ DISCOVERY_CANDIDATES: dict[str, tuple[str, ...]] = {
         "benchmarks_synthetic.json",
         "bench-configure.json",
         "bench.json",
+        "benchmarks-synthetic",
     ),
     "probe_cache": ("probe-cache.json", "probe_cache.json", "probe-gate.json", "probe.json"),
     "mutation_replay": (
@@ -225,25 +229,11 @@ def read_json_object(path: Path) -> dict[str, Any]:
 
 def extract_identity_fields(mapping: dict[str, Any]) -> tuple[str | None, str | None]:
     """Read raw commit and binary_sha256 strings from top-level, receipt, or meta blocks."""
-    raw_commit = None
-    raw_binary = None
-    containers = [mapping]
-    for nested_key in ("receipt", "meta"):
-        nested = mapping.get(nested_key)
-        if isinstance(nested, dict):
-            containers.append(nested)
-    for container in containers:
-        if raw_commit is None:
-            for key in ("release_commit", "commit"):
-                if isinstance(container.get(key), str) and container[key].strip():
-                    raw_commit = container[key].strip().lower()
-                    break
-        if raw_binary is None:
-            for key in ("binary_sha256", "binarySha256"):
-                if isinstance(container.get(key), str) and container[key].strip():
-                    raw_binary = container[key].strip().lower()
-                    break
-    return raw_commit, raw_binary
+    commits = set(builder.report_identity_values(mapping, builder.REPORT_SHA_KEYS))
+    digests = set(builder.report_identity_values(mapping, builder.REPORT_DIGEST_KEYS))
+    if len(commits) > 1 or len(digests) > 1:
+        raise ValueError("Receipt contains conflicting release commit or binary SHA-256 fields.")
+    return next(iter(commits), None), next(iter(digests), None)
 
 
 def resolve_path(raw: str | Path, base_dir: Path) -> Path:
@@ -254,6 +244,16 @@ def resolve_path(raw: str | Path, base_dir: Path) -> Path:
 def load_directory_receipt(key: str, directory: Path) -> tuple[dict[str, Any], list[tuple[str, str | None, str | None]]]:
     """Aggregate multi-file receipt directories (large_projects, vcpkg, fuzz)."""
     member_identities: list[tuple[str, str | None, str | None]] = []
+
+    if key == "benchmarks_synthetic":
+        rows = []
+        for path in builder.report_paths(directory, "*.json"):
+            report = read_json_object(path)
+            member_identities.append((path.relative_to(directory).as_posix(), *extract_identity_fields(report)))
+            if not isinstance(report.get("results"), list):
+                raise ValueError(f"{path}: benchmark report must contain a results list.")
+            rows.extend(report["results"])
+        return {"results": rows}, member_identities
 
     if key == "fuzz":
         paths = sorted(p for p in directory.rglob("*.json") if not p.name.startswith("._"))
@@ -332,7 +332,10 @@ def load_directory_receipt(key: str, directory: Path) -> tuple[dict[str, Any], l
         for path in paths:
             report = read_json_object(path)
             member_identities.append((path.relative_to(directory).as_posix(), *extract_identity_fields(report)))
-            if isinstance(report.get("projects"), list):
+            if isinstance(report.get("projects"), dict):
+                for name, item in report["projects"].items():
+                    summaries[name] = {**item, "project": item.get("project", name)}
+            elif isinstance(report.get("projects"), list):
                 for item in report["projects"]:
                     if isinstance(item, dict) and isinstance(item.get("project"), str):
                         summaries[item["project"]] = item
@@ -698,12 +701,6 @@ def check_independent(record: ReceiptRecord, findings: list[Finding]) -> None:
         ))
 
 
-def _level_passes(value: Any) -> bool:
-    if isinstance(value, dict):
-        return bool(value) and all(v in {"equal", "pass"} for v in value.values())
-    return value in {"equal", "pass"}
-
-
 def check_large_projects(record: ReceiptRecord, findings: list[Finding]) -> None:
     payload = record.payload
     if isinstance(payload.get("projects"), list):
@@ -716,14 +713,19 @@ def check_large_projects(record: ReceiptRecord, findings: list[Finding]) -> None
             if not isinstance(row, dict):
                 continue
             name = str(row.get("project") or row.get("name") or "unknown")
-            errored = row.get("status") in {"fail", "oracle_error"} or bool(row.get("error"))
-            if not errored and _level_passes(row.get("l1")):
-                l1_passed += 1
-            if not errored and _level_passes(row.get("l2")):
-                l2_passed += 1
-            for extra_level in ("l3", "l4"):
-                if extra_level in row and row[extra_level] in {"fail", "different"}:
-                    extra_failures.append(f"{name}:{extra_level}")
+            errored = row.get("status") in {"fail", "oracle_error", "oracle-red", "error"} or bool(row.get("error"))
+            try:
+                l1 = builder.extract_large_project_level(row, "l1")
+                l2 = builder.extract_large_project_level(row, "l2")
+                l3 = builder.extract_large_project_level(row, "l3", lane_keys=("build",))
+                l4 = builder.extract_large_project_level(row, "l4", lane_keys=("test", "manifest_l4", "install"))
+            except ValueError:
+                extra_failures.append(f"{name}:invalid levels")
+                continue
+            l1_passed += not errored and l1 == "pass"
+            l2_passed += not errored and l2 == "pass"
+            extra_failures.extend(f"{name}:{level}" for level, status in (("l3", l3), ("l4", l4))
+                                  if status == "fail")
         if extra_failures:
             findings.append(Finding(
                 track=record.track,
@@ -884,6 +886,12 @@ def find_holdout_leaks(value: Any, path: str = "$") -> list[str]:
     if isinstance(value, dict):
         for key, item in value.items():
             child_path = f"{path}.{key}"
+            if HOLDOUT_LEAK_VALUE_RE.search(key) or (
+                path.endswith((".failure_categories", ".failureCategories"))
+                and key not in builder.HOLDOUT_FAILURE_CATEGORIES
+            ):
+                leaks.append(f"{path}.<redacted>")
+                continue
             if str(key).lower() in HOLDOUT_FORBIDDEN_KEYS:
                 leaks.append(child_path)
                 continue
@@ -924,14 +932,16 @@ def check_unseen_holdout(record: ReceiptRecord, findings: list[Finding]) -> None
         ))
 
     aggregate = payload.get("aggregate")
+    split = payload.get("holdout", payload)
     if isinstance(aggregate, dict):
         total = aggregate.get("reposTotal", aggregate.get("repos_total"))
         passed = aggregate.get("reposPassed", aggregate.get("repos_passed"))
-    elif isinstance(payload.get("holdout"), dict):
-        rates = payload["holdout"].get("pass_rates", {})
-        rung = rates.get("L2") or rates.get("L1") or {}
-        total = rung.get("eligible")
-        passed = rung.get("passed")
+    elif isinstance(split, dict) and "pass_rates" in split:
+        try:
+            counts, _ = builder.parse_holdout_pass_rates(split["pass_rates"])
+            total, passed = counts["reposTotal"], counts["reposPassed"]
+        except (KeyError, ValueError):
+            total = passed = None
     else:
         total = payload.get("reposTotal", payload.get("repos_total"))
         passed = payload.get("reposPassed", payload.get("repos_passed"))
@@ -969,7 +979,7 @@ def check_unseen_holdout(record: ReceiptRecord, findings: list[Finding]) -> None
 
 
 def _check_bench_row_health(row: dict[str, Any]) -> bool:
-    if row.get("status") in {"fail", "pending"}:
+    if row.get("status") in {"fail", "pending", "unavailable"}:
         return False
     gate = row.get("gate")
     if isinstance(gate, dict) and (gate.get("passed") is False or gate.get("status") in {"fail", "unavailable"}):
@@ -985,9 +995,37 @@ def _check_bench_row_health(row: dict[str, Any]) -> bool:
     return True
 
 
+def _giants_project_passes(row: dict[str, Any]) -> bool:
+    """Check the three phases emitted by bench_giants.py."""
+    if row.get("status") != "pass":
+        return False
+    for key in ("cold", "warm_probe", "incremental_leaf"):
+        phase = row.get(key)
+        if not isinstance(phase, dict):
+            return False
+        for tool in ("cmake", "rcmake"):
+            sample = phase.get(tool)
+            if not isinstance(sample, dict) or sample.get("failed") != 0:
+                return False
+            succeeded = sample.get("succeeded")
+            median = sample.get("median_ms")
+            if not is_int(succeeded) or succeeded < 1 or not is_number(median) or median <= 0:
+                return False
+        speedup = phase.get("speedup")
+        if not is_number(speedup) or speedup <= 0:
+            return False
+    p95 = row["incremental_leaf"]["rcmake"].get("p95_ms")
+    if not is_number(p95) or p95 <= 0:
+        return False
+    build = row.get("build_verify")
+    return build is None or (isinstance(build, dict) and build.get("status") == "pass")
+
+
 def check_benchmarks_giants(record: ReceiptRecord, findings: list[Finding]) -> None:
     payload = record.payload
-    rows = payload.get("results") if isinstance(payload.get("results"), list) else payload.get("projects")
+    legacy_rows = payload.get("results")
+    versioned_projects = not isinstance(legacy_rows, list) and payload.get("schema_version") == 1
+    rows = legacy_rows if isinstance(legacy_rows, list) else payload.get("projects")
     if not isinstance(rows, list) or not rows:
         findings.append(Finding(
             track=record.track,
@@ -1017,6 +1055,10 @@ def check_benchmarks_giants(record: ReceiptRecord, findings: list[Finding]) -> N
     failing = []
     for row in giant_rows:
         label = str(row.get("project") or row.get("name") or "unknown")
+        if versioned_projects:
+            if not _giants_project_passes(row):
+                failing.append(label)
+            continue
         has_metric = any(
             is_number(val) and val > 0
             for val in (
@@ -1615,7 +1657,16 @@ def check_dashboard(
             detail="Dashboard snapshot generatedAt timestamp is null or missing.",
         ))
 
-    if dash_binary is not None:
+    if dash_binary is None and expected_binary is not None:
+        findings.append(Finding(
+            track="identity",
+            receipt="dashboard",
+            kind="missing",
+            expected=expected_binary,
+            actual="missing",
+            detail="Dashboard snapshot is missing the frozen release binary digest.",
+        ))
+    elif dash_binary is not None:
         if not normalize_sha256(dash_binary):
             findings.append(Finding(
                 track="identity",

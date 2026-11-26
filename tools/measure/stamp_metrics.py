@@ -23,6 +23,7 @@ from typing import Any
 if __package__:
     from .build_dashboard_json import validate as validate_schema
     from .verify_release_receipts import (
+        check_identity,
         is_int,
         is_number,
         load_receipt_entry,
@@ -33,6 +34,7 @@ if __package__:
 else:
     from build_dashboard_json import validate as validate_schema
     from verify_release_receipts import (
+        check_identity,
         is_int,
         is_number,
         load_receipt_entry,
@@ -171,39 +173,12 @@ def _load_receipts_bundle(
                 errors.append(f"receipt '{key}' could not be loaded: {error}")
                 continue
             loaded[key] = record.payload
-            if record.member_identities:
-                for member_name, m_commit, m_binary in record.member_identities:
-                    if manifest_commit and m_commit and m_commit != manifest_commit:
-                        errors.append(
-                            f"receipt '{key}:{member_name}' commit {m_commit} != manifest {manifest_commit}"
-                        )
-                    if manifest_binary and m_binary and m_binary != manifest_binary:
-                        errors.append(
-                            f"receipt '{key}:{member_name}' binary_sha256 {m_binary} != manifest {manifest_binary}"
-                        )
-            else:
-                if record.envelope_commit and record.file_commit and record.envelope_commit != record.file_commit:
-                    errors.append(
-                        f"receipt '{key}' envelope commit {record.envelope_commit} != file commit {record.file_commit}"
-                    )
-                if (
-                    record.envelope_binary_sha256
-                    and record.file_binary_sha256
-                    and record.envelope_binary_sha256 != record.file_binary_sha256
-                ):
-                    errors.append(
-                        f"receipt '{key}' envelope binary_sha256 != file binary_sha256"
-                    )
-                eff_commit = record.file_commit or record.envelope_commit
-                eff_binary = record.file_binary_sha256 or record.envelope_binary_sha256
-                if manifest_commit and eff_commit and eff_commit != manifest_commit:
-                    errors.append(
-                        f"receipt '{key}' commit {eff_commit} != manifest {manifest_commit}"
-                    )
-                if manifest_binary and eff_binary and eff_binary != manifest_binary:
-                    errors.append(
-                        f"receipt '{key}' binary_sha256 {eff_binary} != manifest {manifest_binary}"
-                    )
+            findings = []
+            check_identity(record, manifest_commit, manifest_binary, findings)
+            errors.extend(
+                f"Receipt '{finding.receipt}' does not match the manifest. {finding.detail}"
+                for finding in findings
+            )
 
     return manifest, loaded, errors
 

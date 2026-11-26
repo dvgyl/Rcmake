@@ -35,6 +35,10 @@ import time
 import tomllib
 from typing import Any, Callable, Sequence
 
+if __package__:
+    from .oracle_prop_test import resolve_identity
+else:
+    from oracle_prop_test import resolve_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 LARGE_PROJECTS_MANIFEST = ROOT / "conformance/corpus/large_projects.toml"
@@ -1913,6 +1917,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="OUT",
         help="Write the structured JSON report to OUT.",
     )
+    parser.add_argument("--rcmake-sha", help="Commit SHA of the Rcmake binary.")
+    parser.add_argument("--binary-sha256", help="Require this SHA-256 digest for the Rcmake binary.")
     parser.add_argument(
         "--markdown",
         type=Path,
@@ -1953,6 +1959,7 @@ def main(
             raise ValueError(
                 f"Expected a native rcmake binary (named rcmake*), got {rcmake_bin.name}."
             )
+        identity = resolve_identity(rcmake_bin, args.rcmake_sha, args.binary_sha256)
         base_env = benchmark_env(dict(os.environ))
         oracle_version = read_tool_version(oracle_bin, base_env, timeout, runner=runner)
         if not args.allow_any_cmake and ORACLE_VERSION not in oracle_version:
@@ -2024,6 +2031,7 @@ def main(
 
     summary = summarize_report(project_results)
     report: dict[str, Any] = {
+        **identity,
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "reproducer": reproducer,

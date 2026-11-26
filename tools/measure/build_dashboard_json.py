@@ -10,7 +10,7 @@ bench_configure.py and bench_eval.py.
 
 Use a large_projects_local.py or ecosystem workflow result.json directory for
 --large-projects-dir (L1 configure, L2 dry-run, L3 build, and L4 test/install).
-Use a bench_giants.py JSON report for --giants-bench.
+Use a bench_giants.py JSON report for --giants-benchmark.
 Use downloaded 64-shard workflow artifacts with shard.json and results.jsonl
 for --vcpkg-dir.
 For --fuzz-dir, supply JSON files with iterations and failures per run.
@@ -19,7 +19,10 @@ oracle_prop_test.py JSON reports (or a directory of reports) with total, counts,
 and cases. For --unseen-holdout / --holdout, supply either unseen_eval.py JSON
 (holdout.pass_rates and holdout.failure_categories) or an aggregate/categories
 report. For --ci-status-json, use the output of gh run list --json
-status,conclusion or the Actions REST response.
+status,conclusion,headSha or the Actions REST response.
+
+For --strict-same-sha, each measurement report must record its release commit.
+If you set --binary-sha256, each measurement report must also record its digest.
 """
 
 import argparse
@@ -51,6 +54,8 @@ EXPECTED_OS_SUITES = {
     "windows-x86_64": 367,
 }
 RUNCMAKE_MIN_PASS_RATE = 99.0
+HOLDOUT_MIN_REPOS = 240
+HOLDOUT_MIN_PASS_RATE = 95.0
 SHA_HEX = re.compile(r"^[0-9a-fA-F]{7,40}$")
 SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
 DIFF_FUZZ_STATUSES = frozenset({"pass", "fail", "oracle_error"})
@@ -76,7 +81,9 @@ LARGE_PROJECT_STATES = {
     "skipped": "pending",
     "skip": "pending",
 }
-REPORT_SHA_KEYS = ("commit", "git_sha", "release_sha", "releaseSha", "rcmake_sha", "rcmake_commit")
+REPORT_SHA_KEYS = (
+    "release_commit", "commit", "git_sha", "release_sha", "releaseSha", "rcmake_sha", "rcmake_commit",
+)
 REPORT_DIGEST_KEYS = ("binary_sha256", "binarySha256", "rcmake_sha256", "rcmakeBinarySha256")
 JSON_TYPES = {
     "object": (dict,), "array": (list,), "string": (str,), "integer": (int,),
@@ -100,6 +107,8 @@ def validate(value, rule, root, field="$"):
         raise ValueError(f"{field} must match the schema constant.")
     if "enum" in rule and value not in rule["enum"]:
         raise ValueError(f"{field} must match a value in the schema.")
+    if isinstance(value, str) and "pattern" in rule and not re.search(rule["pattern"], value):
+        raise ValueError(f"{field} must match the schema pattern.")
     if type(value) in (int, float):
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError(f"{field} must be finite.")
@@ -110,8 +119,13 @@ def validate(value, rule, root, field="$"):
         for key in rule.get("required", []):
             if key not in value:
                 raise ValueError(f"{field}.{key} is required.")
-        if rule.get("additionalProperties") is False and value.keys() - properties.keys():
+        extra_properties = value.keys() - properties.keys()
+        additional_rule = rule.get("additionalProperties")
+        if additional_rule is False and extra_properties:
             raise ValueError(f"{field} contains fields outside the schema.")
+        if isinstance(additional_rule, dict):
+            for key in extra_properties:
+                validate(value[key], additional_rule, root, f"{field}.{key}")
         for key, property_rule in properties.items():
             if key in value:
                 validate(value[key], property_rule, root, f"{field}.{key}")
@@ -134,32 +148,41 @@ def sha_matches(left, right):
     return min(len(left), len(right)) >= 7 and (left.startswith(right) or right.startswith(left))
 
 
-def verify_report_identity(report, expected_sha, expected_digest, source):
-    if not isinstance(report, dict) or (expected_sha is None and expected_digest is None):
+def report_identity_values(report, keys):
+    if not isinstance(report, dict):
+        return []
+    containers = [report, report.get("receipt"), report.get("meta")]
+    return [
+        container[key].strip().lower()
+        for container in containers if isinstance(container, dict)
+        for key in keys
+        if isinstance(container.get(key), str) and container[key].strip()
+    ]
+
+
+def verify_report_identity(report, expected_sha, expected_digest, strict, source):
+    if expected_sha is None and expected_digest is None:
         return
-    containers = [report]
-    if isinstance(report.get("meta"), dict):
-        containers.append(report["meta"])
-    for container in containers:
-        if expected_sha is not None:
-            for key in REPORT_SHA_KEYS:
-                value = container.get(key)
-                if isinstance(value, str) and value.strip():
-                    if not sha_matches(value, expected_sha):
-                        raise ValueError(f"{source} reports commit {value!r}, expected {expected_sha!r}.")
-        if expected_digest is not None:
-            for key in REPORT_DIGEST_KEYS:
-                value = container.get(key)
-                if isinstance(value, str) and value.strip():
-                    if value.strip().lower() != expected_digest.lower():
-                        raise ValueError(
-                            f"{source} reports binary SHA-256 {value!r}, expected {expected_digest!r}."
-                        )
+    if expected_sha is not None:
+        commits = report_identity_values(report, REPORT_SHA_KEYS)
+        if strict and not commits:
+            raise ValueError(f"{source} is missing a release commit.")
+        for value in commits:
+            matches = value == expected_sha.lower() if strict else sha_matches(value, expected_sha)
+            if not matches:
+                raise ValueError(f"{source} reports commit {value!r}, expected {expected_sha!r}.")
+    if expected_digest is not None:
+        digests = report_identity_values(report, REPORT_DIGEST_KEYS)
+        if strict and not digests:
+            raise ValueError(f"{source} is missing a binary SHA-256 digest.")
+        for value in digests:
+            if value != expected_digest.lower():
+                raise ValueError(f"{source} reports binary SHA-256 {value!r}, expected {expected_digest!r}.")
 
 
-def read_report(path, identity=(None, None)):
+def read_report(path, identity=(None, None, False)):
     report = read_json(path)
-    verify_report_identity(report, identity[0], identity[1], str(path))
+    verify_report_identity(report, *identity, str(path))
     return report
 
 
@@ -181,6 +204,8 @@ def reset_tracks_to_pending(snapshot):
     pending_note = "Pending verification for this commit."
     snapshot.pop("binarySha256", None)
     snapshot.pop("releaseSha", None)
+    snapshot.pop("receipt", None)
+    snapshot.pop("knownParityGaps", None)
     snapshot["statusNote"] = "Verification metrics reset to pending for the updated commit."
     tracks = snapshot["tracks"]
 
@@ -236,6 +261,7 @@ def reset_tracks_to_pending(snapshot):
         if "scenariosPassed" in row:
             row["scenariosPassed"] = None
     bench_section.pop("giantsBenchmark", None)
+    bench_section.pop("realGiants", None)
     bench_section.pop("differentialFuzz", None)
 
 
@@ -258,9 +284,14 @@ def resolve_release_identity(snapshot, args):
 
     if args.strict_same_sha and not effective_sha:
         raise ValueError("--strict-same-sha requires --release-sha or --commit.")
+    if args.strict_same_sha:
+        validate_sha(effective_sha, "--strict-same-sha commit")
 
     sha_differs = requested_sha is not None and (
-        base_sha is None or not sha_matches(base_sha, requested_sha)
+        base_sha is None or (
+            base_sha.lower() != requested_sha.lower() if args.strict_same_sha
+            else not sha_matches(base_sha, requested_sha)
+        )
     )
     digest_differs = requested_digest is not None and (
         base_digest is not None and base_digest.lower() != requested_digest.lower()
@@ -286,7 +317,7 @@ def resolve_release_identity(snapshot, args):
     if requested_digest is not None:
         snapshot["binarySha256"] = requested_digest
 
-    return effective_sha, effective_digest
+    return effective_sha, effective_digest, args.strict_same_sha
 
 
 def count(value):
@@ -433,7 +464,7 @@ def merge_independent(section, report):
          scenariosPassed=results["pass"], scenariosTotal=len(scenarios))
 
 
-def merge_soundness(section, args, identity=(None, None)):
+def merge_soundness(section, args, identity=(None, None, False)):
     if args.independent:
         merge_independent(section, read_report(args.independent, identity))
     if args.probe_cache:
@@ -459,6 +490,15 @@ def merge_soundness(section, args, identity=(None, None)):
         passed = int(report["status"] == "pass")
         gate(section, "determinism", "Path-Swap Determinism", passed, 1,
              "pass" if passed else "fail", "Compares output from isolated runs at the same project path.")
+    if args.path_swap:
+        report = read_report(args.path_swap, identity)
+        comparisons = [report]
+        if isinstance(report.get("fixture"), dict):
+            comparisons.append(report["fixture"])
+        passed = int(all(row.get("status") == "pass" and row.get("differences") in (None, [])
+                         for row in comparisons))
+        gate(section, "path-swap", "Silent PATH Swap", passed, 1,
+             "pass" if passed else "fail", "Compares artifacts after a silent PATH swap.")
     if args.wasm:
         report = read_report(args.wasm, identity)
         checks = [row for row in report["checks"] if row["status"] != "planned"]
@@ -468,7 +508,31 @@ def merge_soundness(section, args, identity=(None, None)):
              "Checks WebAssembly dependencies, compilation, and WASI execution.")
 
 
-def merge_benchmarks(metrics, paths, identity=(None, None)):
+def merge_conan(section, report):
+    if isinstance(report.get("scenarios"), list):
+        states = Counter(row["status"] for row in report["scenarios"])
+        total = states.total() - states["skipped_missing_tool"]
+        passed = states["pass"]
+    else:
+        passed, total = count(report["passed"]), count(report["total"])
+    rate(passed, total)
+    status = "pass" if report["status"] == "pass" and 0 < passed == total else "fail"
+    gate(section, "conan-ecosystem", "Conan Ecosystem", passed, total, status,
+         "Counts include the ecosystem scenarios that ran.")
+
+
+def merge_dist(snapshot, report):
+    binary_size = count(report["binary_size_bytes"])
+    if not binary_size:
+        raise ValueError("The distribution report must record a positive binary size.")
+    snapshot.setdefault("receipt", {}).update(
+        commit=snapshot.get("commit"),
+        binarySha256=snapshot.get("binarySha256"),
+        binarySizeBytes=binary_size,
+    )
+
+
+def merge_benchmarks(metrics, paths, identity=(None, None, False)):
     rows = [row for path in paths for row in read_report(path, identity)["results"]]
 
     def record(key, value, status, note):
@@ -525,7 +589,7 @@ def optional_number(value, *, positive=False):
     return round(float(value), 2)
 
 
-def merge_giants_bench(section, path, identity=(None, None)):
+def merge_giants_bench(section, path, identity=(None, None, False)):
     report = read_report(path, identity)
     if report.get("schema_version") != 1:
         raise ValueError("Giants benchmark report must use schema_version 1.")
@@ -657,7 +721,7 @@ def report_paths(directory, pattern):
     return paths
 
 
-def merge_fuzz(section, directory, identity=(None, None)):
+def merge_fuzz(section, directory, identity=(None, None, False)):
     total = failures = 0
     for path in report_paths(directory, "*.json"):
         report = read_report(path, identity)
@@ -688,7 +752,7 @@ def differential_fuzz_paths(inputs):
     return paths
 
 
-def merge_differential_fuzz(section, inputs, identity=(None, None)):
+def merge_differential_fuzz(section, inputs, identity=(None, None, False)):
     total = passed = mismatches = oracle_errors = 0
     script_cases = configure_cases = 0
     saw_cases = False
@@ -871,7 +935,7 @@ def large_project_name(result):
     return name
 
 
-def merge_large_projects(track, directory, identity=(None, None)):
+def merge_large_projects(track, directory, identity=(None, None, False)):
     projects = {row["name"]: row for row in track["projects"]}
     # A local run stores the same project results in the summary and per-project files.
     summaries = {}
@@ -978,10 +1042,10 @@ def sanitize_holdout_failure_categories(raw_failures):
     return dict(sorted(cleaned.items()))
 
 
-def merge_holdout(track, path, identity=(None, None)):
+def merge_holdout(track, path, identity=(None, None, False)):
     # Publish only numeric metrics and fixed public labels so no repo names or URLs can leak.
+    report = read_report(path, identity)
     try:
-        report = read_report(path, identity)
         if not isinstance(report, dict):
             raise ValueError("The holdout report must be an object.")
         if "holdout" in report:
@@ -1033,10 +1097,13 @@ def merge_holdout(track, path, identity=(None, None)):
         else:
             track.pop("failureCategories", None)
 
+        if (aggregate["reposTotal"] >= HOLDOUT_MIN_REPOS
+                and 100 * aggregate["reposPassed"] >= HOLDOUT_MIN_PASS_RATE * aggregate["reposTotal"]):
+            aggregate["status"] = "pass"
+        if payload.get("status", report.get("status")) == "fail" or report.get("sealed") is False:
+            aggregate["status"] = "fail"
         track.update(aggregate, sealed=True, note="Repository counts from the blind holdout report.")
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
-        if "reports commit" in str(error) or "reports binary SHA-256" in str(error):
-            raise
         raise ValueError("The holdout report must contain valid aggregate and category counts.") from None
 
 
@@ -1051,7 +1118,7 @@ def shard_results(path):
     return counts
 
 
-def merge_vcpkg(track, directory, identity=(None, None)):
+def merge_vcpkg(track, directory, identity=(None, None, False)):
     shards = {row["shard"]: row for row in track["shards"]}
     seen = set()
     for path in report_paths(directory, "shard.json"):
@@ -1086,8 +1153,18 @@ def merge_vcpkg(track, directory, identity=(None, None)):
                  note="The rate uses the expected port count in the reported shards.")
 
 
-def merge_ci(snapshot, report):
+def merge_ci(snapshot, report, identity, source):
     runs = report["workflow_runs"] if isinstance(report, dict) else report
+    expected_sha, _, strict = identity
+    if expected_sha is not None:
+        commits = report_identity_values(report, REPORT_SHA_KEYS)
+        if commits:
+            verify_report_identity(report, expected_sha, None, strict, source)
+        for index, run in enumerate(runs):
+            head = run.get("head_sha", run.get("headSha"))
+            verify_report_identity(
+                {"commit": head}, expected_sha, None, strict and not commits, f"{source} run {index}",
+            )
     completed = [run for run in runs if run["status"] == "completed"]
     passed = sum(run["conclusion"] == "success" for run in completed)
     snapshot["statusNote"] = (f"CI reports {passed:,} of {len(completed):,} completed runs as successful. "
@@ -1117,23 +1194,22 @@ def main(argv=None):
     parser.add_argument("--commit", help="Commit SHA for the verified binary.")
     parser.add_argument("--release-sha", help="Exact Git commit SHA for the verified release binary.")
     parser.add_argument("--binary-sha256", help="SHA-256 hex digest of the verified release binary.")
-    parser.add_argument(
-        "--strict-same-sha",
-        action="store_true",
-        help="Require commit identity and reset stale base tracks instead of carrying them across commits.",
-    )
+    parser.add_argument("--strict-same-sha", action="store_true",
+                        help="Require matching receipt identity and reset stale base tracks.")
     parser.add_argument(
         "--allow-stale-base",
         action="store_true",
         help="Explicitly allow carrying untouched base tracks across commit changes.",
     )
     parser.add_argument("--version", help="Version of the verified Rcmake binary.")
+    parser.add_argument("--known-parity-gaps", nargs="*", help="Known parity gaps. Pass no values for zero gaps.")
     for name in (
         "runcmake-macos", "runcmake-linux", "runcmake-windows", "independent", "probe-cache",
-        "mutation", "determinism", "wasm", "large-projects-dir", "giants-bench",
-        "fuzz-dir", "vcpkg-dir", "ci-status-json",
+        "mutation", "determinism", "path-swap", "wasm", "large-projects-dir",
+        "fuzz-dir", "vcpkg-dir", "ci-status-json", "conan", "dist",
     ):
         parser.add_argument(f"--{name}", type=Path)
+    parser.add_argument("--giants-benchmark", "--giants-bench", dest="giants_bench", type=Path)
     parser.add_argument("--unseen-holdout", "--holdout", dest="unseen_holdout", type=Path)
     parser.add_argument("--differential-fuzz", type=Path, action="append", default=[])
     parser.add_argument("--bench", type=Path, action="append", default=[])
@@ -1147,6 +1223,8 @@ def main(argv=None):
         snapshot["generatedAt"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         if args.version is not None:
             snapshot["rcmakeVersion"] = args.version
+        if args.known_parity_gaps is not None:
+            snapshot["knownParityGaps"] = args.known_parity_gaps
         tracks = snapshot["tracks"]
         reports = {
             identifier: read_report(path, identity) for os_name, identifier in PLATFORMS.items()
@@ -1159,6 +1237,10 @@ def main(argv=None):
         if args.giants_bench:
             merge_giants_bench(section, args.giants_bench, identity)
         merge_soundness(section, args, identity)
+        if args.conan:
+            merge_conan(section, read_report(args.conan, identity))
+        if args.dist:
+            merge_dist(snapshot, read_report(args.dist, identity))
         if args.large_projects_dir:
             merge_large_projects(tracks["bossFight"], args.large_projects_dir, identity)
         if args.unseen_holdout:
@@ -1170,7 +1252,7 @@ def main(argv=None):
         if args.vcpkg_dir:
             merge_vcpkg(tracks["vcpkgMatrix"], args.vcpkg_dir, identity)
         if args.ci_status_json:
-            merge_ci(snapshot, read_json(args.ci_status_json))
+            merge_ci(snapshot, read_json(args.ci_status_json), identity, str(args.ci_status_json))
         validate(snapshot, schema, schema)
         write_snapshot(args.out, snapshot)
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as error:
