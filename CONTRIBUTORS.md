@@ -3,6 +3,9 @@
 rcmake is developed and maintained by:
 
 - **Dev D.** ([@dvgyl](https://github.com/dvgyl)): creator and maintainer
+- **Gemini** ([@gemini-code-assist](https://github.com/gemini-code-assist)): AI coding agent (Google)
+- **Claude** ([@claude](https://github.com/claude)): AI coding agent (Anthropic)
+- **Codex** ([@codex](https://github.com/codex)): AI coding agent (OpenAI)
 
 ## Upstream and third-party attributions
 
