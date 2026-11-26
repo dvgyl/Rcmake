@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rcmake_host::{FileKind, FileTime, HostResult, Metadata, path};
-use serde::Deserialize;
+use rcmake_json::{FieldError, FromJson, Value, deny_unknown, object, req, req_value};
 
 use crate::{CacheRead, Digest, Domain, LockedStore, Store};
 
@@ -27,9 +27,20 @@ struct CachedFile {
     stat: Metadata,
 }
 
-#[derive(Deserialize)]
 struct BlobReferences {
     blobs: Vec<Digest>,
+}
+
+impl FromJson for BlobReferences {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["trace", "blobs", "payload"])?;
+        req_value(obj, "trace")?;
+        req_value(obj, "payload")?;
+        Ok(Self {
+            blobs: req(obj, "blobs")?,
+        })
+    }
 }
 
 impl Store<'_> {

@@ -16,7 +16,7 @@ use rcmake_base::BString;
 use rcmake_host::{
     CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, WriteMode, path,
 };
-use serde::de::DeserializeOwned;
+use rcmake_json::FromJson;
 
 use crate::{Digest, Entry, InputStamp, NEXT_TEMP, StagingFile, Store, StoreMode, frame};
 
@@ -159,7 +159,7 @@ impl RemoteCacheConfig {
 }
 
 /// Read the local pin and validate its trace before requesting a missing remote blob.
-pub fn local_probe_pin<T: DeserializeOwned>(
+pub fn local_probe_pin<T: FromJson>(
     store: &Store<'_>,
     key: Digest,
 ) -> Result<Option<(ManifestEntry, Entry<T>)>, RemoteError> {
@@ -289,7 +289,7 @@ impl<'a> RemoteStoreClient<'a> {
     /// Read a probe pinned by a trusted manifest. An absent pin is a miss without I/O.
     /// Supply the verified local trace and check the payload and artifacts in `validate`.
     /// A read-only or verify store can reuse entries with local blobs.
-    pub fn get_probe<T: DeserializeOwned>(
+    pub fn get_probe<T: FromJson>(
         &mut self,
         store: &Store<'_>,
         key: Digest,

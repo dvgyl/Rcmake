@@ -78,8 +78,10 @@ fn digest_hex_and_domains() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(digest.to_hex(), hex);
     assert_eq!(Digest::from_hex(&hex.to_ascii_uppercase()), Some(digest));
     assert_eq!(Digest::from_hex("é"), None);
+    let encoded = write_compact(&digest.to_json());
+    assert_eq!(encoded.as_slice(), format!("\"{hex}\"").as_bytes());
     assert_eq!(
-        serde_json::from_str::<Digest>(&serde_json::to_string(&digest)?)?,
+        Digest::from_json(&parse(encoded.as_slice(), &STORE_READ_OPTIONS)?)?,
         digest
     );
     let keys = Domain::ALL.map(|domain| domain.key(b"abc"));
@@ -605,10 +607,15 @@ fn stat_stamps_check_same_inode_rewrites_and_reject_old_records() -> HostResult<
         verify_trace(&host, std::slice::from_ref(&stamp)),
         VerifyOutcome::Hit
     );
-    let old_record = serde_json::json!({
-        "FileStat": { "path": path, "stat": FastStat::from(&stat) },
-    });
-    let legacy = serde_json::from_value(old_record).map_err(|error| io_at(error.into(), &path))?;
+    let old_record = Value::object_from([(
+        "FileStat",
+        Value::object_from([
+            ("path", Value::string(path.to_string_lossy().as_ref())),
+            ("stat", FastStat::from(&stat).to_json()),
+        ]),
+    )]);
+    let legacy = InputStamp::from_json(&old_record)
+        .map_err(|error| io_at(io::Error::new(ErrorKind::InvalidData, error), &path))?;
     assert_eq!(
         verify_trace(&host, &[legacy]),
         VerifyOutcome::Miss(MissReason { stamp: 0 })
@@ -1112,5 +1119,234 @@ fn sdk_memo_rechecks_aliases_outside_the_search_directory() -> HostResult<()> {
     host.write(&headers.join("missing.h"), b"", WriteMode::CreateNew)?;
     assert_ne!(memo.sdk_digest(base.as_ref(), &include)?, second);
     assert_eq!(memo.sdk_graph_hits(), 1);
+    Ok(())
+}
+
+#[test]
+fn golden_record_and_manifest_json_encodings() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::remote::{CacheEntryKind, CacheManifest, ManifestEntry};
+
+    let d1 = Digest::from_bytes([0x11; 32]);
+    let d2 = Digest::from_bytes([0x22; 32]);
+    let d3 = Digest::from_bytes([0x33; 32]);
+    let record = Record {
+        schema: RECORD_SCHEMA_VERSION,
+        domain: Domain::ProbeV1,
+        key: d1,
+        entry: Entry {
+            trace: vec![
+                InputStamp::FileStat {
+                    path: PathBuf::from("/work/a.h"),
+                    stat: FastStat {
+                        len: 12,
+                        mtime_secs: 1_700_000_000,
+                        mtime_nanos: 500,
+                        mode: 0o644,
+                        dev: 7,
+                        ino: 99,
+                    },
+                    digest: Some(d2),
+                },
+                InputStamp::FileHash {
+                    path: PathBuf::from("/work/b.h"),
+                    digest: d2,
+                },
+                InputStamp::DirEntries {
+                    path: PathBuf::from("/work/inc"),
+                    digest: d3,
+                },
+                InputStamp::TreeListing {
+                    path: PathBuf::from("/work/ord"),
+                    digest: d2,
+                    policy: TreePolicy::Ordinary,
+                },
+                InputStamp::TreeListing {
+                    path: PathBuf::from("/work/sdk"),
+                    digest: d3,
+                    policy: TreePolicy::Sdk,
+                },
+                InputStamp::Missing {
+                    path: PathBuf::from("/work/absent.h"),
+                },
+                InputStamp::EnvVar {
+                    name: b"CC".to_vec(),
+                    digest: Some(d2),
+                },
+                InputStamp::EnvVar {
+                    name: b"CXX".to_vec(),
+                    digest: None,
+                },
+                InputStamp::NegativeLookup {
+                    root: PathBuf::from("/work/inc"),
+                    relative: PathBuf::from("sub/opt.h"),
+                    deepest: PathBuf::from("/work/inc"),
+                    listing: d3,
+                },
+            ],
+            blobs: vec![d2],
+            payload: "ok".to_owned(),
+        },
+    };
+    let expected_record = concat!(
+        r#"{"domain":"ProbeV1","entry":{"blobs":["#,
+        r#""2222222222222222222222222222222222222222222222222222222222222222"],"#,
+        r#""payload":"ok","trace":["#,
+        r#"{"FileStat":{"digest":"2222222222222222222222222222222222222222222222222222222222222222","#,
+        r#""path":"/work/a.h","stat":{"dev":7,"ino":99,"len":12,"mode":420,"mtime_nanos":500,"mtime_secs":1700000000}}},"#,
+        r#"{"FileHash":{"digest":"2222222222222222222222222222222222222222222222222222222222222222","path":"/work/b.h"}},"#,
+        r#"{"DirEntries":{"digest":"3333333333333333333333333333333333333333333333333333333333333333","path":"/work/inc"}},"#,
+        r#"{"TreeListing":{"digest":"2222222222222222222222222222222222222222222222222222222222222222","path":"/work/ord"}},"#,
+        r#"{"TreeListing":{"digest":"3333333333333333333333333333333333333333333333333333333333333333","path":"/work/sdk","policy":"Sdk"}},"#,
+        r#"{"Missing":{"path":"/work/absent.h"}},"#,
+        r#"{"EnvVar":{"digest":"2222222222222222222222222222222222222222222222222222222222222222","name":[67,67]}},"#,
+        r#"{"EnvVar":{"digest":null,"name":[67,88,88]}},"#,
+        r#"{"NegativeLookup":{"deepest":"/work/inc","listing":"3333333333333333333333333333333333333333333333333333333333333333","#,
+        r#""relative":"sub/opt.h","root":"/work/inc"}}]},"#,
+        r#""key":"1111111111111111111111111111111111111111111111111111111111111111","schema":2}"#,
+    );
+    let encoded_record = write_compact(&record.to_json());
+    assert_eq!(encoded_record.as_slice(), expected_record.as_bytes());
+    let parsed_record = parse(encoded_record.as_slice(), &STORE_READ_OPTIONS)?;
+    assert_eq!(Record::<Entry<String>>::from_json(&parsed_record)?, record);
+
+    let mut manifest = CacheManifest::default();
+    manifest.insert(ManifestEntry {
+        kind: CacheEntryKind::Probe,
+        key: d1,
+        frame_sha256: d3,
+        blobs: vec![d2],
+    })?;
+    let expected_manifest = concat!(
+        r#"{"entries":[{"blobs":["2222222222222222222222222222222222222222222222222222222222222222"],"#,
+        r#""frame_sha256":"3333333333333333333333333333333333333333333333333333333333333333","#,
+        r#""key":"1111111111111111111111111111111111111111111111111111111111111111","kind":"probe"}],"#,
+        "\"version\":1}\n",
+    );
+    let encoded_manifest = manifest.to_json()?;
+    assert_eq!(encoded_manifest.as_slice(), expected_manifest.as_bytes());
+    assert_eq!(CacheManifest::from_json(&encoded_manifest)?, manifest);
+    assert!(CacheManifest::from_json(br#"{"version":1,"entries":[],"extra":true}"#).is_err());
+    Ok(())
+}
+
+#[test]
+fn fast_stat_defaults_dev_ino_and_rejects_null_or_unknown() -> Result<(), Box<dyn std::error::Error>>
+{
+    let minimal = parse(
+        br#"{"len":42,"mtime_secs":100,"mtime_nanos":7,"mode":420}"#,
+        &STORE_READ_OPTIONS,
+    )?;
+    assert_eq!(
+        FastStat::from_json(&minimal)?,
+        FastStat {
+            len: 42,
+            mtime_secs: 100,
+            mtime_nanos: 7,
+            mode: 420,
+            dev: 0,
+            ino: 0,
+        }
+    );
+    let null_dev = parse(
+        br#"{"len":42,"mtime_secs":100,"mtime_nanos":7,"mode":420,"dev":null}"#,
+        &STORE_READ_OPTIONS,
+    )?;
+    assert!(FastStat::from_json(&null_dev).is_err());
+    let unknown = parse(
+        br#"{"len":42,"mtime_secs":100,"mtime_nanos":7,"mode":420,"extra":1}"#,
+        &STORE_READ_OPTIONS,
+    )?;
+    assert!(FastStat::from_json(&unknown).is_err());
+    Ok(())
+}
+
+#[test]
+fn old_record_schema_misses_cleanly_and_is_swept_by_gc() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::remote::{CacheEntryKind, export_entry};
+
+    let host = host();
+    let mut store = store(&host)?;
+    let domain = Domain::ProbeV1;
+    let blob = store.put_blob(b"legacy blob")?;
+    let missing_schema_key = domain.key(b"legacy v1 without schema");
+    let wrong_schema_key = domain.key(b"legacy v1 with schema 1");
+
+    let missing_schema_json = write_compact(&Value::object_from([
+        ("domain", domain.to_json()),
+        ("key", missing_schema_key.to_json()),
+        (
+            "entry",
+            Entry {
+                trace: Vec::new(),
+                blobs: vec![blob],
+                payload: "legacy".to_owned(),
+            }
+            .to_json(),
+        ),
+    ]));
+    let wrong_schema_json = write_compact(&Value::object_from([
+        ("schema", 1_u32.to_json()),
+        ("domain", domain.to_json()),
+        ("key", wrong_schema_key.to_json()),
+        (
+            "entry",
+            Entry {
+                trace: Vec::new(),
+                blobs: vec![blob],
+                payload: "legacy".to_owned(),
+            }
+            .to_json(),
+        ),
+    ]));
+
+    for (key, payload) in [
+        (missing_schema_key, missing_schema_json),
+        (wrong_schema_key, wrong_schema_json),
+    ] {
+        let path = store.entry_path(domain, key);
+        if let Some(parent) = path.parent() {
+            host.create_dir_all(parent)?;
+        }
+        let framed = frame::encode(ENTRY_MAGIC, payload.as_slice(), ENTRY_LIMIT)?;
+        host.write(&path, &framed, WriteMode::CreateNew)?;
+    }
+
+    store.config.mode = StoreMode::ReadOnly;
+    assert_eq!(store.get_entry::<String>(domain, missing_schema_key)?, None);
+    assert_eq!(store.get_entry::<String>(domain, wrong_schema_key)?, None);
+    assert!(export_entry(&store, CacheEntryKind::Probe, missing_schema_key).is_err());
+    assert!(export_entry(&store, CacheEntryKind::Probe, wrong_schema_key).is_err());
+
+    store.config.mode = StoreMode::ReadWrite;
+    host.sleep(store.config.blob_grace);
+    let report = store.gc()?;
+    assert_eq!(report.entries_removed, 2);
+    assert_eq!(report.blobs_removed, 1);
+    assert!(
+        store
+            .file_metadata(&store.entry_path(domain, missing_schema_key))?
+            .is_none()
+    );
+    assert!(
+        store
+            .file_metadata(&store.entry_path(domain, wrong_schema_key))?
+            .is_none()
+    );
+    assert!(store.file_metadata(&store.blob_path(blob))?.is_none());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_path_stamp_round_trips_losslessly() -> Result<(), Box<dyn std::error::Error>> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let stamp = InputStamp::Missing {
+        path: PathBuf::from(OsString::from_vec(b"/work/raw-\xff-path".to_vec())),
+    };
+    let encoded = write_compact(&stamp.to_json());
+    let parsed = parse(encoded.as_slice(), &STORE_READ_OPTIONS)?;
+    assert_eq!(InputStamp::from_json(&parsed)?, stamp);
     Ok(())
 }

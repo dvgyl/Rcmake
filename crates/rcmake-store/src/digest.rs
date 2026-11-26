@@ -1,11 +1,10 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use rcmake_json::{FieldError, FromJson, ToJson, Value};
 use sha2::{Digest as _, Sha256};
 
 /// A SHA-256 digest. Its serialized form is a lowercase hex string.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Digest([u8; 32]);
 
 impl Digest {
@@ -66,8 +65,21 @@ impl From<Digest> for String {
     }
 }
 
+impl ToJson for Digest {
+    fn to_json(&self) -> Value {
+        Value::string(self.to_hex())
+    }
+}
+
+impl FromJson for Digest {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let hex = rcmake_json::str(value)?;
+        Self::from_hex(hex).ok_or_else(|| FieldError::invalid("Expected 64 hex digits."))
+    }
+}
+
 /// A versioned namespace for a cache key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Domain {
     /// Compiler and platform probe results.
     ProbeV1,
@@ -77,6 +89,29 @@ pub enum Domain {
     ConfigureV1,
     /// Keys derived from blob identities.
     BlobV1,
+}
+
+impl ToJson for Domain {
+    fn to_json(&self) -> Value {
+        Value::string(match self {
+            Self::ProbeV1 => "ProbeV1",
+            Self::FetchV1 => "FetchV1",
+            Self::ConfigureV1 => "ConfigureV1",
+            Self::BlobV1 => "BlobV1",
+        })
+    }
+}
+
+impl FromJson for Domain {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        match rcmake_json::str(value)? {
+            "ProbeV1" => Ok(Self::ProbeV1),
+            "FetchV1" => Ok(Self::FetchV1),
+            "ConfigureV1" => Ok(Self::ConfigureV1),
+            "BlobV1" => Ok(Self::BlobV1),
+            other => Err(FieldError::invalid(format!("unknown domain '{other}'"))),
+        }
+    }
 }
 
 impl Domain {

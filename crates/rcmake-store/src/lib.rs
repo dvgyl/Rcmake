@@ -20,7 +20,10 @@ use rcmake_host::{
     FileKind, FileLockGuard, Follow, Host, HostError, HostResult, Metadata, ReadRange, WriteMode,
     path,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use rcmake_json::{
+    FieldError, FromJson, ReadOptions, ToJson, Value, deny_unknown, object, parse, req,
+    write_compact,
+};
 
 pub use digest::{Digest, Domain, KeyHasher};
 pub use gc::{GcReport, gc};
@@ -33,6 +36,11 @@ use frame::{BLOB_MAGIC, ENTRY_LIMIT, ENTRY_MAGIC};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 const PUBLISH_WAIT: Duration = Duration::from_millis(250);
+pub(crate) const RECORD_SCHEMA_VERSION: u32 = 2;
+pub(crate) const STORE_READ_OPTIONS: ReadOptions = ReadOptions {
+    allow_comments: false,
+    dup_keys_last_wins: false,
+};
 
 /// Controls access to the cache.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -127,7 +135,7 @@ impl StoreConfig {
 }
 
 /// A cached result and the inputs and blobs it needs.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Entry<T> {
     /// Inputs that must still match before reuse.
     pub trace: Trace,
@@ -137,11 +145,65 @@ pub struct Entry<T> {
     pub payload: T,
 }
 
-#[derive(Serialize, Deserialize)]
+impl<T: ToJson> ToJson for Entry<T> {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("trace", self.trace.to_json()),
+            ("blobs", self.blobs.to_json()),
+            ("payload", self.payload.to_json()),
+        ])
+    }
+}
+
+impl<T: FromJson> FromJson for Entry<T> {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["trace", "blobs", "payload"])?;
+        Ok(Self {
+            trace: req(obj, "trace")?,
+            blobs: req(obj, "blobs")?,
+            payload: req(obj, "payload")?,
+        })
+    }
+}
+
+#[cfg_attr(test, derive(Debug, Eq, PartialEq))]
 pub(crate) struct Record<T> {
+    pub(crate) schema: u32,
     pub(crate) domain: Domain,
     pub(crate) key: Digest,
     pub(crate) entry: T,
+}
+
+impl<T: ToJson> ToJson for Record<T> {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("schema", self.schema.to_json()),
+            ("domain", self.domain.to_json()),
+            ("key", self.key.to_json()),
+            ("entry", self.entry.to_json()),
+        ])
+    }
+}
+
+impl<T: FromJson> FromJson for Record<T> {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["schema", "domain", "key", "entry"])?;
+        let schema: u32 = req(obj, "schema")?;
+        if schema != RECORD_SCHEMA_VERSION {
+            return Err(
+                FieldError::invalid(format!("unsupported store record schema {schema}"))
+                    .in_field("schema"),
+            );
+        }
+        Ok(Self {
+            schema,
+            domain: req(obj, "domain")?,
+            key: req(obj, "key")?,
+            entry: req(obj, "entry")?,
+        })
+    }
 }
 
 /// A cache that uses a host for all file, time, and environment operations.
@@ -340,7 +402,7 @@ impl<'a> Store<'a> {
     ///
     /// An absent, stale, oversized, or invalid entry is a cache miss.
     /// A blob can be collected after a hit. Treat an absent blob as a miss.
-    pub fn get_entry<T: DeserializeOwned>(
+    pub fn get_entry<T: FromJson>(
         &self,
         domain: Domain,
         key: Digest,
@@ -352,7 +414,7 @@ impl<'a> Store<'a> {
     ///
     /// In verify mode, an oversized referenced blob causes a cache miss. In
     /// other modes, this method checks only whether each referenced blob exists.
-    pub fn get_entry_with_blob_limit<T: DeserializeOwned>(
+    pub fn get_entry_with_blob_limit<T: FromJson>(
         &self,
         domain: Domain,
         key: Digest,
@@ -365,7 +427,7 @@ impl<'a> Store<'a> {
     ///
     /// In verify mode, apply the byte limit to referenced blobs. Missing or
     /// stale entries are misses. The store can remove invalid data in read-write mode.
-    pub fn get_entry_with_diagnostics<T: DeserializeOwned>(
+    pub fn get_entry_with_diagnostics<T: FromJson>(
         &self,
         domain: Domain,
         key: Digest,
@@ -374,7 +436,7 @@ impl<'a> Store<'a> {
         self.lookup_entry(domain, key, blob_limit, true)
     }
 
-    fn lookup_entry<T: DeserializeOwned>(
+    fn lookup_entry<T: FromJson>(
         &self,
         domain: Domain,
         key: Digest,
@@ -482,7 +544,7 @@ impl<'a> Store<'a> {
         )
     }
 
-    fn read_entry<T: DeserializeOwned>(
+    fn read_entry<T: FromJson>(
         &self,
         domain: Domain,
         key: Digest,
@@ -496,7 +558,8 @@ impl<'a> Store<'a> {
             ENTRY_LIMIT,
             diagnose,
             |payload| {
-                let record = serde_json::from_slice::<Record<T>>(&payload).ok()?;
+                let value = parse(&payload, &STORE_READ_OPTIONS).ok()?;
+                let record = Record::<T>::from_json(&value).ok()?;
                 (record.domain == domain && record.key == key).then_some(record.entry)
             },
         )
@@ -891,15 +954,20 @@ fn blob_limit() -> usize {
     Limits::default().max_file_read as usize
 }
 
-fn entry_frame<T: Serialize>(
+fn entry_frame<T: ToJson>(
     domain: Domain,
     key: Digest,
     entry: &Entry<T>,
     path: &Path,
 ) -> HostResult<Vec<u8>> {
-    let json = serde_json::to_vec(&Record { domain, key, entry })
-        .map_err(|error| io_at(error.into(), path))?;
-    frame::encode(ENTRY_MAGIC, &json, ENTRY_LIMIT).map_err(|error| io_at(error, path))
+    let record = Record {
+        schema: RECORD_SCHEMA_VERSION,
+        domain,
+        key,
+        entry,
+    };
+    let json = write_compact(&record.to_json());
+    frame::encode(ENTRY_MAGIC, json.as_slice(), ENTRY_LIMIT).map_err(|error| io_at(error, path))
 }
 
 fn shard(directory: PathBuf, digest: Digest, extension: &str) -> PathBuf {

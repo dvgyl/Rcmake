@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::*;
-use serde::de::IgnoredAny;
 
 impl Store<'_> {
     /// Publish an entry. Keep the first valid entry for a key.
     ///
     /// All referenced blobs must already be present. Wait up to 250 milliseconds
     /// for the cache lock. Return the publication outcome if the store skips a write.
-    pub fn put_entry<T: Serialize>(
+    pub fn put_entry<T: ToJson>(
         &self,
         domain: Domain,
         key: Digest,
         entry: &Entry<T>,
     ) -> HostResult<PublishOutcome> {
-        self.publish_entry::<T, IgnoredAny>(domain, key, entry, |_, _| true, || true)
+        self.publish_entry::<T, Value>(domain, key, entry, |_, _| true, || true)
     }
 
     /// Publish an entry after checking both the previous and new evidence.
@@ -22,7 +21,7 @@ impl Store<'_> {
     /// The previous-entry check receives a read-only store. Both checks run
     /// under the publication lock. A failed new-entry check preserves the
     /// previous entry and returns [PublishOutcome::Stale].
-    pub fn put_entry_checked<T: Serialize + DeserializeOwned>(
+    pub fn put_entry_checked<T: ToJson + FromJson>(
         &self,
         domain: Domain,
         key: Digest,
@@ -33,7 +32,7 @@ impl Store<'_> {
         self.publish_entry(domain, key, entry, previous_valid, fresh_valid)
     }
 
-    fn publish_entry<T: Serialize, P: DeserializeOwned>(
+    fn publish_entry<T: ToJson, P: FromJson>(
         &self,
         domain: Domain,
         key: Digest,

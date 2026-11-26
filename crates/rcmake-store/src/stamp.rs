@@ -11,13 +11,16 @@ use std::time::Duration;
 
 use rcmake_base::Limits;
 use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, Metadata, ReadRange};
-use serde::{Deserialize, Serialize};
+use rcmake_json::{
+    FieldError, FromJson, Object, ToJson, Value, deny_unknown, object, opt, opt_or_else, req,
+    req_value,
+};
 use sha2::{Digest as _, Sha256};
 
 use crate::{Digest, Domain, KeyHasher};
 
 /// The metadata observed for a regular file.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FastStat {
     /// File size in bytes.
     pub len: u64,
@@ -28,11 +31,40 @@ pub struct FastStat {
     /// File permission bits.
     pub mode: u32,
     /// Device identifier.
-    #[serde(default)]
     pub dev: u64,
     /// File identifier on the device.
-    #[serde(default)]
     pub ino: u64,
+}
+
+impl ToJson for FastStat {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("len", self.len.to_json()),
+            ("mtime_secs", self.mtime_secs.to_json()),
+            ("mtime_nanos", self.mtime_nanos.to_json()),
+            ("mode", self.mode.to_json()),
+            ("dev", self.dev.to_json()),
+            ("ino", self.ino.to_json()),
+        ])
+    }
+}
+
+impl FromJson for FastStat {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(
+            obj,
+            &["len", "mtime_secs", "mtime_nanos", "mode", "dev", "ino"],
+        )?;
+        Ok(Self {
+            len: req(obj, "len")?,
+            mtime_secs: req(obj, "mtime_secs")?,
+            mtime_nanos: req(obj, "mtime_nanos")?,
+            mode: req(obj, "mode")?,
+            dev: opt_or_else(obj, "dev", u64::default)?,
+            ino: opt_or_else(obj, "ino", u64::default)?,
+        })
+    }
 }
 
 impl FastStat {
@@ -60,7 +92,7 @@ impl From<&Metadata> for FastStat {
 }
 
 /// Select how a search listing handles directory links.
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum TreePolicy {
     /// Reject directory links.
     #[default]
@@ -75,8 +107,29 @@ impl TreePolicy {
     }
 }
 
+impl ToJson for TreePolicy {
+    fn to_json(&self) -> Value {
+        Value::string(match self {
+            Self::Ordinary => "Ordinary",
+            Self::Sdk => "Sdk",
+        })
+    }
+}
+
+impl FromJson for TreePolicy {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        match rcmake_json::str(value)? {
+            "Ordinary" => Ok(Self::Ordinary),
+            "Sdk" => Ok(Self::Sdk),
+            other => Err(FieldError::invalid(format!(
+                "unknown tree policy '{other}'"
+            ))),
+        }
+    }
+}
+
 /// One input observed during a computation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputStamp {
     /// A file identified by its permission bits and content digest.
     FileStat {
@@ -85,7 +138,6 @@ pub enum InputStamp {
         /// Observed metadata.
         stat: FastStat,
         /// Observed content digest. Old records without a digest cannot be reused.
-        #[serde(default)]
         digest: Option<Digest>,
     },
     /// A file identified by SHA-256 of its contents.
@@ -109,7 +161,6 @@ pub enum InputStamp {
         /// Observed digest from the selected listing policy.
         digest: Digest,
         /// Select whether the listing follows SDK directory links.
-        #[serde(default, skip_serializing_if = "TreePolicy::is_ordinary")]
         policy: TreePolicy,
     },
     /// A path that did not exist.
@@ -135,6 +186,189 @@ pub enum InputStamp {
         /// Observed digest of that directory's immediate entries.
         listing: Digest,
     },
+}
+
+impl ToJson for InputStamp {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::FileStat { path, stat, digest } => Value::object_from([(
+                "FileStat",
+                Value::object_from([
+                    ("path", path_to_json(path)),
+                    ("stat", stat.to_json()),
+                    ("digest", digest.to_json()),
+                ]),
+            )]),
+            Self::FileHash { path, digest } => Value::object_from([(
+                "FileHash",
+                Value::object_from([("path", path_to_json(path)), ("digest", digest.to_json())]),
+            )]),
+            Self::DirEntries { path, digest } => Value::object_from([(
+                "DirEntries",
+                Value::object_from([("path", path_to_json(path)), ("digest", digest.to_json())]),
+            )]),
+            Self::TreeListing {
+                path,
+                digest,
+                policy,
+            } => {
+                let mut fields = vec![("path", path_to_json(path)), ("digest", digest.to_json())];
+                if !policy.is_ordinary() {
+                    fields.push(("policy", policy.to_json()));
+                }
+                Value::object_from([("TreeListing", Value::object_from(fields))])
+            }
+            Self::Missing { path } => Value::object_from([(
+                "Missing",
+                Value::object_from([("path", path_to_json(path))]),
+            )]),
+            Self::EnvVar { name, digest } => Value::object_from([(
+                "EnvVar",
+                Value::object_from([("name", name.to_json()), ("digest", digest.to_json())]),
+            )]),
+            Self::NegativeLookup {
+                root,
+                relative,
+                deepest,
+                listing,
+            } => Value::object_from([(
+                "NegativeLookup",
+                Value::object_from([
+                    ("root", path_to_json(root)),
+                    ("relative", path_to_json(relative)),
+                    ("deepest", path_to_json(deepest)),
+                    ("listing", listing.to_json()),
+                ]),
+            )]),
+        }
+    }
+}
+
+impl FromJson for InputStamp {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        let mut iter = obj.iter();
+        let Some((tag, payload)) = iter.next() else {
+            return Err(FieldError::invalid("expected input stamp variant"));
+        };
+        if iter.next().is_some() {
+            return Err(FieldError::invalid(
+                "expected single-key input stamp object",
+            ));
+        }
+        let tag = core::str::from_utf8(tag.as_slice())
+            .map_err(|_| FieldError::invalid("input stamp variant is not valid UTF-8"))?;
+        let fields = object(payload).map_err(|err| err.in_field(tag))?;
+        let decode = || -> Result<Self, FieldError> {
+            match tag {
+                "FileStat" => {
+                    deny_unknown(fields, &["path", "stat", "digest"])?;
+                    Ok(Self::FileStat {
+                        path: req_path(fields, "path")?,
+                        stat: req(fields, "stat")?,
+                        digest: opt(fields, "digest")?,
+                    })
+                }
+                "FileHash" => {
+                    deny_unknown(fields, &["path", "digest"])?;
+                    Ok(Self::FileHash {
+                        path: req_path(fields, "path")?,
+                        digest: req(fields, "digest")?,
+                    })
+                }
+                "DirEntries" => {
+                    deny_unknown(fields, &["path", "digest"])?;
+                    Ok(Self::DirEntries {
+                        path: req_path(fields, "path")?,
+                        digest: req(fields, "digest")?,
+                    })
+                }
+                "TreeListing" => {
+                    deny_unknown(fields, &["path", "digest", "policy"])?;
+                    Ok(Self::TreeListing {
+                        path: req_path(fields, "path")?,
+                        digest: req(fields, "digest")?,
+                        policy: opt_or_else(fields, "policy", TreePolicy::default)?,
+                    })
+                }
+                "Missing" => {
+                    deny_unknown(fields, &["path"])?;
+                    Ok(Self::Missing {
+                        path: req_path(fields, "path")?,
+                    })
+                }
+                "EnvVar" => {
+                    deny_unknown(fields, &["name", "digest"])?;
+                    Ok(Self::EnvVar {
+                        name: req(fields, "name")?,
+                        digest: req(fields, "digest")?,
+                    })
+                }
+                "NegativeLookup" => {
+                    deny_unknown(fields, &["root", "relative", "deepest", "listing"])?;
+                    Ok(Self::NegativeLookup {
+                        root: req_path(fields, "root")?,
+                        relative: req_path(fields, "relative")?,
+                        deepest: req_path(fields, "deepest")?,
+                        listing: req(fields, "listing")?,
+                    })
+                }
+                other => Err(FieldError::invalid(format!(
+                    "unknown input stamp '{other}'"
+                ))),
+            }
+        };
+        decode().map_err(|err| err.in_field(tag))
+    }
+}
+
+fn path_to_json(path: &Path) -> Value {
+    if let Some(text) = path.to_str() {
+        return Value::string(text);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Value::object_from([("unix_bytes", path.as_os_str().as_bytes().to_json())])
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        Value::object_from([("windows_wide", wide.to_json())])
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Value::string(path.to_string_lossy().as_ref())
+    }
+}
+
+fn path_from_json(value: &Value) -> Result<PathBuf, FieldError> {
+    match value {
+        Value::String(_) => rcmake_json::str(value).map(PathBuf::from),
+        #[cfg(unix)]
+        Value::Object(obj) => {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            deny_unknown(obj, &["unix_bytes"])?;
+            let bytes: Vec<u8> = req(obj, "unix_bytes")?;
+            Ok(PathBuf::from(OsString::from_vec(bytes)))
+        }
+        #[cfg(windows)]
+        Value::Object(obj) => {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            deny_unknown(obj, &["windows_wide"])?;
+            let wide: Vec<u16> = req(obj, "windows_wide")?;
+            Ok(PathBuf::from(OsString::from_wide(&wide)))
+        }
+        _ => Err(FieldError::expected("string", value)),
+    }
+}
+
+fn req_path(obj: &Object, key: &str) -> Result<PathBuf, FieldError> {
+    let value = req_value(obj, key)?;
+    path_from_json(value).map_err(|err| err.in_field(key))
 }
 
 impl InputStamp {

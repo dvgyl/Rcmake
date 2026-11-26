@@ -4,16 +4,19 @@
 
 #![forbid(unsafe_code)]
 
-use std::{fmt, io::ErrorKind, path::Path, time::Duration};
+use std::{io::ErrorKind, path::Path, time::Duration};
 
 use rcmake_host::ReadRange;
-use serde::{
-    Deserialize, Deserializer, Serialize,
-    de::{self, DeserializeOwned, IgnoredAny, SeqAccess, Visitor},
+use rcmake_json::{
+    FieldError, FromJson, ToJson, Value, array_bounded, deny_unknown, object, parse, req,
+    req_value, write_compact,
 };
 
 use super::{FRAME_BYTES, FrameResult, LOCAL_STORE, PROBE_BLOB_BYTES, RESPONSE_LIMIT, RemoteError};
-use crate::{Digest, Domain, Entry, InputStamp, Record, Store, StoreMode, blob_limit, frame};
+use crate::{
+    Digest, Domain, Entry, InputStamp, Record, STORE_READ_OPTIONS, Store, StoreMode, blob_limit,
+    frame,
+};
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
@@ -25,8 +28,7 @@ const INVALID_MANIFEST: RemoteError =
     RemoteError::Failure("Invalid cache manifest schema, version, entry limits, or keys.");
 
 /// Kind of keyed entry in a portable cache export.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CacheEntryKind {
     /// Compiler or platform probe.
     Probe,
@@ -41,9 +43,27 @@ impl CacheEntryKind {
         }
     }
 }
+impl ToJson for CacheEntryKind {
+    fn to_json(&self) -> Value {
+        Value::string(match self {
+            Self::Probe => "probe",
+            Self::Fetch => "fetch",
+        })
+    }
+}
+impl FromJson for CacheEntryKind {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        match rcmake_json::str(value)? {
+            "probe" => Ok(Self::Probe),
+            "fetch" => Ok(Self::Fetch),
+            other => Err(FieldError::invalid(format!(
+                "unknown cache entry kind '{other}'"
+            ))),
+        }
+    }
+}
 /// Content identities for one exported entry and its referenced blobs.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManifestEntry {
     /// Type of cache entry.
     pub kind: CacheEntryKind,
@@ -52,8 +72,31 @@ pub struct ManifestEntry {
     /// SHA-256 digest of the full exported frame.
     pub frame_sha256: Digest,
     /// Sorted SHA-256 identities of the referenced blobs.
-    #[serde(deserialize_with = "read_sequence::<_, _, MAX_BLOBS_PER_ENTRY>")]
     pub blobs: Vec<Digest>,
+}
+impl ToJson for ManifestEntry {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("kind", self.kind.to_json()),
+            ("key", self.key.to_json()),
+            ("frame_sha256", self.frame_sha256.to_json()),
+            ("blobs", self.blobs.to_json()),
+        ])
+    }
+}
+impl FromJson for ManifestEntry {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["kind", "key", "frame_sha256", "blobs"])?;
+        let blobs = array_bounded(req_value(obj, "blobs")?, MAX_BLOBS_PER_ENTRY)
+            .map_err(|err| err.in_field("blobs"))?;
+        Ok(Self {
+            kind: req(obj, "kind")?,
+            key: req(obj, "key")?,
+            frame_sha256: req(obj, "frame_sha256")?,
+            blobs,
+        })
+    }
 }
 impl ManifestEntry {
     pub(super) fn identity(&self) -> (CacheEntryKind, Digest) {
@@ -61,7 +104,7 @@ impl ManifestEntry {
     }
     /// Import a pinned entry. Supply the trace built from verified local inputs.
     /// Check the payload and artifact identities against the local plan in `validate`.
-    pub fn seed<T: DeserializeOwned>(
+    pub fn seed<T: FromJson>(
         &self,
         store: &Store<'_>,
         encoded: &[u8],
@@ -78,29 +121,6 @@ impl ManifestEntry {
         Ok(ready.then_some(entry))
     }
 }
-fn read_sequence<'de, D, T, const LIMIT: usize>(de: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct Bounded<T, const LIMIT: usize>(std::marker::PhantomData<T>);
-    impl<'de, T: Deserialize<'de>, const LIMIT: usize> Visitor<'de> for Bounded<T, LIMIT> {
-        type Value = Vec<T>;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "a sequence of up to {LIMIT} items")
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
-            let items = std::iter::from_fn(|| seq.next_element().transpose())
-                .take(LIMIT)
-                .collect::<Result<Vec<_>, _>>()?;
-            if items.len() == LIMIT && seq.next_element::<IgnoredAny>()?.is_some() {
-                return Err(de::Error::custom("Sequence limit exceeded."));
-            }
-            Ok(items)
-        }
-    }
-    de.deserialize_seq(Bounded::<T, LIMIT>(std::marker::PhantomData))
-}
 /// Versioned manifest for moving probe and fetch cache data between local stores.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CacheManifest {
@@ -109,20 +129,16 @@ pub struct CacheManifest {
 impl CacheManifest {
     /// Parse bounded JSON. Reject other versions and duplicate keys.
     pub fn from_json(json: &[u8]) -> Result<Self, RemoteError> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Manifest {
-            version: u32,
-            #[serde(deserialize_with = "read_sequence::<_, _, MAX_MANIFEST_ENTRIES>")]
-            entries: Vec<ManifestEntry>,
-        }
         if json.len() > MAX_MANIFEST_BYTES {
             return Err(RemoteError::Failure("Cache manifest JSON is too large."));
         }
-        let Manifest {
-            version,
-            mut entries,
-        } = serde_json::from_slice(json).map_err(|_| INVALID_MANIFEST)?;
+        let value = parse(json, &STORE_READ_OPTIONS).map_err(|_| INVALID_MANIFEST)?;
+        let obj = object(&value).map_err(|_| INVALID_MANIFEST)?;
+        deny_unknown(obj, &["version", "entries"]).map_err(|_| INVALID_MANIFEST)?;
+        let version: u32 = req(obj, "version").map_err(|_| INVALID_MANIFEST)?;
+        let raw_entries = req_value(obj, "entries").map_err(|_| INVALID_MANIFEST)?;
+        let mut entries: Vec<ManifestEntry> =
+            array_bounded(raw_entries, MAX_MANIFEST_ENTRIES).map_err(|_| INVALID_MANIFEST)?;
         entries.sort_unstable_by_key(ManifestEntry::identity);
         let count = entries.len();
         entries.dedup_by_key(|entry| entry.identity());
@@ -134,16 +150,11 @@ impl CacheManifest {
     }
     /// Encode deterministic JSON with a final line feed.
     pub fn to_json(&self) -> Result<Vec<u8>, RemoteError> {
-        #[derive(Serialize)]
-        struct Manifest<'a> {
-            version: u32,
-            entries: &'a [ManifestEntry],
-        }
-        let data = Manifest {
-            version: SCHEMA_VERSION,
-            entries: self.entries(),
-        };
-        let mut json = serde_json::to_vec(&data).map_err(|_| INVALID_MANIFEST)?;
+        let value = Value::object_from([
+            ("version", SCHEMA_VERSION.to_json()),
+            ("entries", self.entries().to_json()),
+        ]);
+        let mut json: Vec<u8> = write_compact(&value).into();
         json.push(b'\n');
         Ok(json)
     }
@@ -188,7 +199,7 @@ pub fn export_entry(
     let Some(encoded) = read_frame(store, &path, FRAME_BYTES)? else {
         return Ok(None);
     };
-    let entry = decode_entry::<IgnoredAny>(kind, key, &encoded, None)?;
+    let entry = decode_entry::<Value>(kind, key, &encoded, None)?;
     let manifest = ManifestEntry {
         kind,
         key,
@@ -213,7 +224,7 @@ fn sorted_blobs(mut blobs: Vec<Digest>) -> Vec<Digest> {
     blobs.dedup();
     blobs
 }
-pub(super) fn decode_entry<T: DeserializeOwned>(
+pub(super) fn decode_entry<T: FromJson>(
     kind: CacheEntryKind,
     key: Digest,
     encoded: &[u8],
@@ -229,7 +240,9 @@ pub(super) fn decode_entry<T: DeserializeOwned>(
     }
     let bytes = frame::decode(frame::ENTRY_MAGIC, encoded, frame::ENTRY_LIMIT)
         .ok_or(RemoteError::Failure("Invalid cache entry frame."))?;
-    let record: Record<Entry<T>> = serde_json::from_slice(&bytes)
+    let value = parse(&bytes, &STORE_READ_OPTIONS)
+        .map_err(|_| RemoteError::Failure("Invalid cache entry schema."))?;
+    let record: Record<Entry<T>> = Record::from_json(&value)
         .map_err(|_| RemoteError::Failure("Invalid cache entry schema."))?;
     let entry = record.entry;
     if record.domain != kind.domain() || record.key != key {
@@ -342,6 +355,6 @@ fn round_trips_manifest_and_rejects_excess_blob_digests() -> Result<(), Box<dyn 
     manifest.insert(pin.clone())?;
     assert_eq!(CacheManifest::from_json(&manifest.to_json()?)?, manifest);
     pin.blobs.resize(MAX_BLOBS_PER_ENTRY + 1, key);
-    assert!(serde_json::from_slice::<ManifestEntry>(&serde_json::to_vec(&pin)?).is_err());
+    assert!(ManifestEntry::from_json(&pin.to_json()).is_err());
     Ok(())
 }
