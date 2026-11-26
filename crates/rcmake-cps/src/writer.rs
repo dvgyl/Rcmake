@@ -103,7 +103,7 @@ fn string(out: &mut Object, key: &str, value: Option<&BString>) {
 }
 
 fn array(values: &[BString]) -> Value {
-    Value::Array(values.iter().cloned().map(Value::String).collect())
+    Value::array_from(values.iter().cloned().map(Value::String))
 }
 
 fn list(out: &mut Object, key: &str, values: &[BString]) {
@@ -113,11 +113,10 @@ fn list(out: &mut Object, key: &str, values: &[BString]) {
 }
 
 fn object<T>(values: &BTreeMap<BString, T>, convert: impl Fn(&T) -> Value) -> Value {
-    Value::Object(
+    Value::object_from(
         values
             .iter()
-            .map(|(name, value)| (name.clone(), convert(value)))
-            .collect(),
+            .map(|(name, value)| (name.clone(), convert(value))),
     )
 }
 

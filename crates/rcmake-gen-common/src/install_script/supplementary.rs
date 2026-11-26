@@ -29,9 +29,8 @@ use crate::{
     export::{
         cps, output_error,
         provenance::{author_warning, generation_error},
-        write_output,
     },
-    genex, quote, sbom,
+    genex, quote, sbom, write_output,
 };
 
 /// Write package information, SPDX documents, and CPack properties.

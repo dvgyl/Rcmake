@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_gen_common::{GenError, write_if_changed};
+use rcmake_gen_common::{GenError, write_output};
 use rcmake_host::{FileKind, Follow, Host, SystemInfo, path::from_native};
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, VsVersion};
 use rcmake_resolve::GenerationResult;
@@ -363,13 +363,7 @@ impl Settings {
 
 fn write(host: &dyn Host, path: &str, data: &[u8]) -> Result<(), GenError> {
     let path = rcmake_host::path::to_native(path.as_bytes());
-    if let Some(dir) = path.parent() {
-        host.create_dir_all(dir).map_err(|err| GenError::Write {
-            path: from_native(dir),
-            message: err.to_string().into(),
-        })?;
-    }
-    write_if_changed(host, &path, data)
+    write_output(host, &path, data)
 }
 
 fn string(bytes: &[u8]) -> String {

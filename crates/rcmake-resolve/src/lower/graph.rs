@@ -636,10 +636,7 @@ impl<'a> TargetPlan<'a> {
                     },
                 ));
             }
-            let symlink = if matches!(
-                model.generator,
-                Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
-            ) {
+            let symlink = if model.generator.is_some_and(GeneratorKind::is_ninja) {
                 separate_library_symlinks(&mut link, &mut after)
             } else {
                 None

@@ -434,7 +434,7 @@ fn add_bmi_fixture(
         ("modules/CXXModules.json", br#"{"modules":{"core":{"bmi":"modules/core.pcm"},"forwarded":{"bmi":"modules/forwarded.pcm"}}}"#),
         ("modules/core.pcm", b"BMI content"),
     ] {
-        crate::export::write_output(host, &build.join(name), contents)?;
+        crate::write_output(host, &build.join(name), contents)?;
     }
     Ok(())
 }
@@ -472,7 +472,7 @@ fn cmake_451_matches_package_install_outputs() -> TestResult {
         ("code.c", b"void demo(void) {}\n".as_slice()),
         ("headers/api/core.h", b"void demo(void);\n"),
     ] {
-        crate::export::write_output(&host, &source.join(name), contents)?;
+        crate::write_output(&host, &source.join(name), contents)?;
     }
     let run = |args: Vec<BString>| -> TestResult {
         let report = host.run(

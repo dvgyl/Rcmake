@@ -11,7 +11,7 @@ use rcmake_base::{
 use rcmake_host::{Host, path::to_native};
 use rcmake_resolve::{ExportPlan, ExportedTarget};
 
-use crate::{GenError, quote, quoted_content, write_error, write_if_changed};
+use crate::{GenError, quote, quoted_content, write_output};
 
 pub mod cps;
 mod generate;
@@ -713,14 +713,6 @@ pub(crate) fn output_error(path: &[u8], message: impl Into<BString>) -> GenError
         path: path.into(),
         message: message.into(),
     }
-}
-
-pub(crate) fn write_output(host: &dyn Host, path: &Path, content: &[u8]) -> Result<(), GenError> {
-    if let Some(parent) = path.parent() {
-        host.create_dir_all(parent)
-            .map_err(|error| write_error(parent, error))?;
-    }
-    write_if_changed(host, path, content)
 }
 
 #[cfg(test)]

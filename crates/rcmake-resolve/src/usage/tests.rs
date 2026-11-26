@@ -1,5 +1,5 @@
 use rcmake_diag::{Backtrace, FrameKind, PolicyId, PolicyMap, PolicyStatus};
-use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, GenexHost};
+use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, GenexHost, evaluate};
 use rcmake_model::{GeneratorKind, ImportedVisibility, LinkItem, TargetKind, TargetOrigin};
 
 use super::*;

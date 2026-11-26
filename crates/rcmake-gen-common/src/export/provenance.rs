@@ -110,7 +110,7 @@ pub(crate) fn exports(
                 });
             }
         }
-        exports.sort_by(|a, b| a.file.cmp(&b.file));
+        exports.sort_unstable_by(|a, b| a.file.cmp(&b.file));
     }
     Ok(exports)
 }

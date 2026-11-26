@@ -1,8 +1,7 @@
 //! Install actions and configure metadata.
 
-use std::convert::Infallible;
-
 use indexmap::{IndexMap, IndexSet};
+pub(super) use rcmake_base::shell::{cmake_quote, cmake_quoted_content};
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_diag::{
     Backtrace, DiagAction, DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId,
@@ -56,18 +55,16 @@ pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) 
         |_, _, _| {},
     )
     .unwrap_or_default();
-    match lower_install_rules(
+    lower_install_rules(
         model,
         targets,
         (&[], &edits, &runtime, None),
-        |_, _, _, value| Ok::<_, Infallible>(value.into()),
-        |dir, config, source| {
+        &mut |_, _, _, value| Ok(value.into()),
+        &mut |dir, config, source| {
             Ok(crate::sources::install_object_name(model, dir, source, config).unwrap_or_default())
         },
-    ) {
-        Ok(manifest) => manifest,
-        Err(never) => match never {},
-    }
+    )
+    .unwrap_or_default()
 }
 
 pub(crate) fn lower_install_manifest_with_configs(
@@ -105,7 +102,7 @@ pub(crate) fn lower_install_manifest_with_configs(
         model,
         targets,
         (configs, &edits, &runtime, Some(host)),
-        |dir, config, backtrace, value| {
+        &mut |dir, config, backtrace, value| {
             if !has_genex(value) {
                 return Ok(value.into());
             }
@@ -118,9 +115,9 @@ pub(crate) fn lower_install_manifest_with_configs(
                 ..EvalContext::default()
             };
             let (value, _) = evaluate(&parse(value)?, &context, &mut usage.host(dir))?;
-            Ok::<_, ResolveError>(value)
+            Ok(value)
         },
-        |dir, config, source| {
+        &mut |dir, config, source| {
             crate::sources::install_object_name(model, dir, source, config).map_err(|error| {
                 let ResolveError::Message(body) = error else {
                     return error;
@@ -183,10 +180,7 @@ impl InstallManifest {
         configs: &[ConfigId],
         host: &dyn Host,
     ) -> Result<(), ResolveError> {
-        if !matches!(
-            model.generator,
-            Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
-        ) {
+        if !model.generator.is_some_and(GeneratorKind::is_ninja) {
             return Ok(());
         }
         let category = DiagCategory::InstallAbsoluteDestination;
@@ -411,7 +405,12 @@ fn runtime_install_rules<'a>(
         })
 }
 
-fn lower_install_rules<E>(
+type EvaluateInstall<'a> =
+    dyn FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, ResolveError> + 'a;
+type InstallObjectName<'a> =
+    dyn FnMut(DirId, &ConfigId, &[u8]) -> Result<BString, ResolveError> + 'a;
+
+fn lower_install_rules(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
     (configs, edits, runtime, host): (
@@ -420,9 +419,9 @@ fn lower_install_rules<E>(
         &RuntimeTargets,
         Option<&dyn Host>,
     ),
-    mut eval: impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
-    mut object_name: impl FnMut(DirId, &ConfigId, &[u8]) -> Result<BString, E>,
-) -> Result<InstallManifest, E> {
+    eval: &mut EvaluateInstall<'_>,
+    object_name: &mut InstallObjectName<'_>,
+) -> Result<InstallManifest, ResolveError> {
     let mut manifest = InstallManifest::default();
     let mut strip = strip::Tools::new(host);
     let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
@@ -431,14 +430,7 @@ fn lower_install_rules<E>(
             InstallEntry::Rule(index, rule, export) => (index, rule, export),
             InstallEntry::RuntimeSet(set) => {
                 let first = manifest.actions.len();
-                runtime_set::lower(
-                    model,
-                    targets,
-                    configs,
-                    set,
-                    &mut eval,
-                    &mut manifest.actions,
-                )?;
+                runtime_set::lower(model, targets, configs, set, eval, &mut manifest.actions)?;
                 if first < manifest.actions.len() {
                     manifest
                         .directories
@@ -461,7 +453,7 @@ fn lower_install_rules<E>(
             }
         };
         let first = manifest.actions.len();
-        (|| -> Result<(), E> {
+        (|| -> Result<(), ResolveError> {
             let options = &rule.options;
             let recorded = recorded_args(model, index);
             let source = &model.dir(rule.dir).source_dir;
@@ -491,7 +483,7 @@ fn lower_install_rules<E>(
                         &recorded,
                         &mut manifest,
                         &make_action,
-                        (&mut eval, &mut object_name),
+                        (eval, object_name),
                     )?;
                     return Ok(());
                 }
@@ -504,7 +496,7 @@ fn lower_install_rules<E>(
                             rule,
                             name,
                             configs,
-                            &mut eval,
+                            eval,
                             |options, kind| {
                                 manifest.actions.push(make_action(options, b"", kind));
                             },
@@ -667,13 +659,13 @@ fn action(
     }
 }
 
-fn eval_destination<E>(
+fn eval_destination(
     options: &mut InstallOptions,
     dir: DirId,
     config: &ConfigId,
     rule: &InstallRule,
-    eval: &mut impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
-) -> Result<(), E> {
+    eval: &mut EvaluateInstall<'_>,
+) -> Result<(), ResolveError> {
     if let Some(destination) = &mut options.destination {
         *destination = eval(dir, config, &rule.backtrace, destination)?;
     }
@@ -728,21 +720,6 @@ fn add_bmi_include(
         action.kind = InstallActionKind::Code(body);
     }
     manifest.actions.push(action);
-}
-
-pub(super) fn cmake_quote(out: &mut BString, text: &[u8]) {
-    out.push(b'"');
-    cmake_quoted_content(out, text);
-    out.push(b'"');
-}
-
-pub(super) fn cmake_quoted_content(out: &mut BString, text: &[u8]) {
-    for &byte in text {
-        if matches!(byte, b'\\' | b'"' | b'$') {
-            out.push(b'\\');
-        }
-        out.push(byte);
-    }
 }
 
 fn file_action(

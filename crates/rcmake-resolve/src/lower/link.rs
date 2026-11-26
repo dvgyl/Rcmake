@@ -148,10 +148,10 @@ pub(super) fn link(
     } else {
         policy.ipo(config)
     };
-    let ninja_posix = matches!(
-        model.generator,
-        Some(rcmake_model::GeneratorKind::Ninja | rcmake_model::GeneratorKind::NinjaMultiConfig)
-    ) && !super::shell::windows_host(model, target.dir);
+    let ninja_posix = model
+        .generator
+        .is_some_and(rcmake_model::GeneratorKind::is_ninja)
+        && !super::shell::windows_host(model, target.dir);
     let mut driver = language_flags(model, target, config, language);
     let arch = if kind == LinkKind::StaticArchive {
         Vec::new()
@@ -515,12 +515,9 @@ pub(super) fn link(
     };
     if kind == LinkKind::StaticArchive
         && darwin
-        && matches!(
-            model.generator,
-            Some(
-                rcmake_model::GeneratorKind::Ninja | rcmake_model::GeneratorKind::NinjaMultiConfig
-            )
-        )
+        && model
+            .generator
+            .is_some_and(rcmake_model::GeneratorKind::is_ninja)
     {
         invocations.push(direct(
             vec![cmake(), "-E".into(), "touch".into(), step.output.clone()],

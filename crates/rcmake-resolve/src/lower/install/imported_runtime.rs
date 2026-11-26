@@ -5,20 +5,20 @@ use rcmake_genex::{ArtifactKind, ArtifactPart};
 use rcmake_model::{InstallKind, InstallOptions, TargetKind};
 
 use super::{
-    BString, Backtrace, ConfigId, DirId, InstallActionKind, InstallRule, Lexical, ProjectModel,
+    ConfigId, EvaluateInstall, InstallActionKind, InstallRule, Lexical, ProjectModel, ResolveError,
     UsageResolver, eval_destination, file_action, join, matches_config,
 };
 use crate::lower::{artifacts::is_dll_platform, framework::wrapper_root, is_darwin};
 use crate::usage::artifacts::{imported_for_config, imported_property};
 
-pub(super) fn lower<E>(
+pub(super) fn lower(
     model: &ProjectModel,
     rule: &InstallRule,
     name: &[u8],
     configs: &[ConfigId],
-    eval: &mut impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
+    eval: &mut EvaluateInstall<'_>,
     mut emit: impl FnMut(&InstallOptions, InstallActionKind),
-) -> Result<(), E> {
+) -> Result<(), ResolveError> {
     let Some(id) = model.find_target(rule.dir, name) else {
         return Ok(());
     };

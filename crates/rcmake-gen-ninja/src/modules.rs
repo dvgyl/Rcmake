@@ -13,7 +13,7 @@ use rcmake_host::{Host, path};
 use rcmake_model::{DirId, FileSetKind, ProjectModel, UsageScope};
 use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult, InstallActionKind, ResolvedTarget};
 
-use crate::{generation_error, source_directory};
+use crate::{generation_error, regenerate::source_directory};
 
 pub(crate) const RULES: &str = "
 rule CXX_SCAN

@@ -282,15 +282,6 @@ pub(crate) fn ipo_enabled(
     Flags::new(model, target, lang).ipo(config)
 }
 
-/// Give rich diagnostic consumers a corrective action for an empty architecture property.
-///
-/// Keep the CMP0104 message body available for compatibility output.
-pub(crate) fn architecture_hint(diagnostic: &Diagnostic) -> Option<&'static str> {
-    (diagnostic.policy == Some(PolicyId::new(104))).then_some(
-        "Set -DCMAKE_CUDA_ARCHITECTURES=75 to select architecture 75. Set CUDA_ARCHITECTURES to OFF if the project supplies its own architecture flags.",
-    )
-}
-
 fn nvidia_flag(arch: &CudaArch, phase: ArchPhase, ipo: bool) -> BString {
     let name = &arch.name;
     let mut result = BString::from(format!("--generate-code=arch=compute_{name},code=["));
@@ -395,20 +386,6 @@ fn diagnostic(
         policy,
         location: Location::Backtrace(target.backtrace.clone()),
         body,
-    }
-}
-
-/// Return the ordered CUDA standard rank. C++98 and C++03 share the first rank.
-pub(crate) fn standard_rank(standard: &[u8]) -> Option<usize> {
-    match standard {
-        b"98" | b"03" => Some(0),
-        b"11" => Some(1),
-        b"14" => Some(2),
-        b"17" => Some(3),
-        b"20" => Some(4),
-        b"23" => Some(5),
-        b"26" => Some(6),
-        _ => None,
     }
 }
 
@@ -574,7 +551,7 @@ mod tests {
                     diag.body
                         .ends_with(b"CUDA_ARCHITECTURES is empty for target \"app\".")
                 );
-                assert!(architecture_hint(diag).is_some_and(|hint| hint.contains("=75")));
+                assert_eq!(diag.policy, Some(PolicyId::new(104)));
             }
         }
         target
@@ -666,8 +643,6 @@ mod tests {
             .set("CUDA_SEPARABLE_COMPILATION".into(), "ON".into());
         target.props.set("CUDA_ARCHITECTURES".into(), "OFF".into());
         assert!(!ipo_enabled(&model, &target, &config, b"CUDA"));
-        assert!(standard_rank(b"98") < standard_rank(b"11"));
-        assert!(standard_rank(b"20") < standard_rank(b"23"));
         Ok(())
     }
 }

@@ -15,7 +15,6 @@ use rcmake_base::{
 use rcmake_fortran::{DependSource, FortranBuildTdi, FortranCompiler, FortranTdi, SourceForm};
 use rcmake_genex::ConfigId;
 use rcmake_host::{Host, path};
-use rcmake_json::{Value, write_styled};
 use rcmake_model::{BT, DirId, GeneratorKind, ProjectModel, Target, TargetId, TargetKind};
 
 use super::compile::compile_arguments;
@@ -25,6 +24,9 @@ use crate::model::{DependInfo, FortranTargetInfo};
 use crate::sources::{SourcePaths, TargetInputs};
 use crate::usage::{ResolvedLinkItem, ResolvedLinkKind};
 use crate::{BuildStep, CompileGroup, CompileUnit, Invocation, ResolveError, ResolvedTarget};
+
+mod depend_info;
+pub use depend_info::{fortran_depend_info_json, fortran_make_depend_info};
 
 /// Fortran inputs for one target and configuration.
 pub(crate) struct FortranPlan {
@@ -483,70 +485,6 @@ pub(crate) fn forwarded_object_libraries(
         .collect()
 }
 
-/// Write the scanner and collator settings for `FortranDependInfo.json`.
-pub fn fortran_depend_info_json(tdi: &FortranBuildTdi) -> BString {
-    let scan = &tdi.scan;
-    let strings =
-        |values: &[BString]| Value::Array(values.iter().cloned().map(Value::String).collect());
-    let formats = tdi
-        .source_formats
-        .iter()
-        .map(|(path, form)| (path.clone(), Value::string(form.property_value())))
-        .collect();
-    let fields = [
-        ("language", Value::string("Fortran")),
-        ("dir-top-bld", Value::string(scan.dir_top_bld.clone())),
-        ("dir-cur-bld", Value::string(scan.dir_cur_bld.clone())),
-        ("dir-top-src", Value::string(tdi.dir_top_src.clone())),
-        ("dir-cur-src", Value::string(tdi.dir_cur_src.clone())),
-        ("compiler-id", Value::string(scan.compiler_id.clone())),
-        ("submodule-sep", Value::string(scan.submodule_sep.clone())),
-        ("submodule-ext", Value::string(scan.submodule_ext.clone())),
-        (
-            "module-dir",
-            Value::string(scan.module_dir.clone().unwrap_or_default()),
-        ),
-        ("include-dirs", strings(&scan.include_dirs)),
-        ("linked-target-dirs", strings(&scan.linked_target_dirs)),
-        (
-            "forward-modules-from-target-dirs",
-            strings(&tdi.forward_modules_from_target_dirs),
-        ),
-        (
-            "building-intrinsic-modules",
-            Value::Bool(tdi.building_intrinsic_modules),
-        ),
-        ("_rcmake_source_formats", Value::Object(formats)),
-    ];
-    write_styled(
-        &Value::Object(
-            fields
-                .into_iter()
-                .map(|(key, value)| (key.into(), value))
-                .collect(),
-        ),
-        "  ",
-    )
-}
-
-/// Collect Fortran dependency data and scan settings for a Make target.
-///
-/// # Errors
-///
-/// Returns an error if the model is missing a target or compile group.
-pub fn fortran_make_depend_info<'a>(
-    model: &ProjectModel,
-    resolved: &ResolvedTarget,
-    linked: impl IntoIterator<Item = &'a ResolvedTarget>,
-    forwarded: &IndexSet<TargetId>,
-    target_order: &IndexSet<TargetId>,
-) -> Result<Option<DependInfo>, ResolveError> {
-    Ok(
-        FortranPlan::new(model, resolved, linked, forwarded, target_order)?
-            .map(|plan| DependInfo::Fortran(plan.tdi)),
-    )
-}
-
 fn ninja_prefix(model: &ProjectModel) -> BString {
     model
         .definition(DirId::ROOT, b"CMAKE_NINJA_OUTPUT_PATH_PREFIX")
@@ -817,27 +755,9 @@ fn windows_argument(word: &[u8]) -> BString {
     {
         return word.into();
     }
-    let mut quoted = BString::from("\"");
-    let mut slashes = 0;
-    for &byte in word {
-        if byte == b'\\' {
-            slashes += 1;
-            continue;
-        }
-        quoted.extend(std::iter::repeat_n(
-            b'\\',
-            if byte == b'"' {
-                2 * slashes + 1
-            } else {
-                slashes
-            },
-        ));
-        quoted.push(byte);
-        slashes = 0;
-    }
-    quoted.extend(std::iter::repeat_n(b'\\', 2 * slashes));
-    quoted.push(b'"');
-    quoted
+    let mut quoted = Vec::new();
+    rcmake_base::shell::windows_argument(word, &mut quoted, true);
+    quoted.into()
 }
 
 #[cfg(test)]

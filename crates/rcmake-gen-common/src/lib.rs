@@ -66,6 +66,19 @@ pub fn write_if_changed(host: &dyn Host, path: &Path, content: &[u8]) -> Result<
         .map_err(|err| write_error(path, err))
 }
 
+/// Create the parent directory and update the file when its contents change.
+///
+/// # Errors
+///
+/// Return the path and host error if either operation fails.
+pub fn write_output(host: &dyn Host, path: &Path, content: &[u8]) -> Result<(), GenError> {
+    if let Some(parent) = path.parent() {
+        host.create_dir_all(parent)
+            .map_err(|error| write_error(parent, error))?;
+    }
+    write_if_changed(host, path, content)
+}
+
 fn write_error(path: &Path, err: HostError) -> GenError {
     GenError::Write {
         path: from_native(path),
@@ -73,20 +86,7 @@ fn write_error(path: &Path, err: HostError) -> GenError {
     }
 }
 
-fn quote(out: &mut BString, value: &[u8]) {
-    out.push(b'"');
-    quoted_content(out, value);
-    out.push(b'"');
-}
-
-fn quoted_content(out: &mut BString, value: &[u8]) {
-    for &byte in value {
-        if matches!(byte, b'"' | b'\\' | b'$') {
-            out.push(b'\\');
-        }
-        out.push(byte);
-    }
-}
+use rcmake_base::shell::{cmake_quote as quote, cmake_quoted_content as quoted_content};
 
 fn configuration_pattern(configurations: &[BString]) -> BString {
     let mut pattern = BString::from("^(");

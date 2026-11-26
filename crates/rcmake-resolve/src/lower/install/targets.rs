@@ -9,10 +9,10 @@ use rcmake_model::{InstallKind, Target, TargetId, TargetKind};
 use super::super::compute_artifacts;
 use super::projection::{Projection, file_path};
 use super::{
-    BString, Backtrace, ConfigId, DirId, GeneratorKind, Group, InstallAction, InstallActionKind,
-    InstallManifest, InstallOptions, InstallRule, Lexical, ProjectModel, ResolvedTarget,
-    RuntimeEdits, action_configs, add_bmi_include, definition, eval_destination, file_action, join,
-    list, matches_config, target_options,
+    BString, Backtrace, ConfigId, DirId, EvaluateInstall, GeneratorKind, Group, InstallAction,
+    InstallActionKind, InstallManifest, InstallObjectName, InstallOptions, InstallRule, Lexical,
+    ProjectModel, ResolveError, ResolvedTarget, RuntimeEdits, action_configs, add_bmi_include,
+    definition, eval_destination, file_action, join, list, matches_config, target_options,
 };
 use crate::NamelinkMode;
 
@@ -111,7 +111,7 @@ type TargetSelection<'a> = (
     Option<&'a IndexMap<TargetId, IndexSet<ConfigId>>>,
 );
 
-pub(super) fn lower<E>(
+pub(super) fn lower(
     model: &ProjectModel,
     (index, rule): (usize, &InstallRule),
     (targets, configs, (ids, dependencies), edits, strip): (
@@ -124,11 +124,8 @@ pub(super) fn lower<E>(
     recorded: &[&[u8]],
     manifest: &mut InstallManifest,
     make_action: &impl Fn(&InstallOptions, &[u8], InstallActionKind) -> InstallAction,
-    (eval, object_name): (
-        &mut impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
-        &mut impl FnMut(DirId, &ConfigId, &[u8]) -> Result<BString, E>,
-    ),
-) -> Result<(), E> {
+    (eval, object_name): (&mut EvaluateInstall<'_>, &mut InstallObjectName<'_>),
+) -> Result<(), ResolveError> {
     let options = &rule.options;
     let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
     let source = &model.dir(rule.dir).source_dir;

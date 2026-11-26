@@ -6,7 +6,7 @@ use rcmake_base::BString;
 use rcmake_host::{Host, WriteMode, path::from_native};
 use rcmake_model::ProjectModel;
 
-use crate::{GenError, script_argument, write_if_changed};
+use crate::{GenError, script_argument, write_output};
 
 /// Path of the verification script, relative to the build directory.
 pub const SCRIPT: &str = "CMakeFiles/VerifyGlobs.cmake";
@@ -52,14 +52,7 @@ pub fn write_verification(
         );
     }
     let script = build.join(SCRIPT);
-    if let Some(parent) = script.parent() {
-        host.create_dir_all(parent)
-            .map_err(|error| GenError::Write {
-                path: from_native(parent),
-                message: error.to_string().into(),
-            })?;
-    }
-    write_if_changed(host, &script, &out)?;
+    write_output(host, &script, &out)?;
     let stamp = build.join(STAMP);
     if let Err(error) = host.write(&stamp, b"", WriteMode::CreateNew)
         && error.kind != std::io::ErrorKind::AlreadyExists

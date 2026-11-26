@@ -2,22 +2,10 @@
 
 pub(crate) mod apple;
 pub(crate) mod artifacts;
-#[allow(
-    dead_code,
-    reason = "The language activation wave uses this emitter or planner"
-)]
 pub(crate) mod autogen;
 mod compile;
-#[allow(
-    dead_code,
-    reason = "The language activation wave uses this emitter or planner"
-)]
 pub(crate) mod cuda;
 pub use cuda::ide_flags as cuda_ide_flags;
-#[allow(
-    dead_code,
-    reason = "The language activation wave uses this emitter or planner"
-)]
 pub(crate) mod fortran;
 pub use fortran::{fortran_depend_info_json, fortran_make_depend_info};
 pub(crate) mod custom;

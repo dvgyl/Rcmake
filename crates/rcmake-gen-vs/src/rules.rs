@@ -56,22 +56,9 @@ pub(crate) fn quote(arg: &str) -> String {
     {
         return arg.into();
     }
-    let mut out = String::from("\"");
-    let mut slashes = 0;
-    for ch in arg.chars() {
-        match ch {
-            '\\' => slashes += 1,
-            _ => {
-                let count = if ch == '"' { slashes * 2 + 1 } else { slashes };
-                out.extend(std::iter::repeat_n('\\', count));
-                out.push(ch);
-                slashes = 0;
-            }
-        }
-    }
-    out.extend(std::iter::repeat_n('\\', slashes * 2));
-    out.push('"');
-    out
+    let mut out = Vec::new();
+    rcmake_base::shell::windows_argument(arg.as_bytes(), &mut out, true);
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn batch_arg(arg: &str) -> String {

@@ -74,9 +74,6 @@ pub enum BuildError {
     /// A step index does not identify a graph step.
     #[error("invalid step index {0}")]
     InvalidStep(usize),
-    /// The executor does not support this step.
-    #[error("unsupported build step: {0}")]
-    UnsupportedStep(&'static str),
     /// The host could not perform a build operation.
     #[error(transparent)]
     Host(#[from] HostError),

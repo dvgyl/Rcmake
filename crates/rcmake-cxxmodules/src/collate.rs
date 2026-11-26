@@ -177,7 +177,7 @@ fn bmi_install_script(install: &crate::BmiInstallInfo, modules: &CxxModulesJson)
     if !Lexical::new(&install.destination).absolute() {
         script.extend_from_slice(b"${CMAKE_INSTALL_PREFIX}/");
     }
-    escape_cmake(&mut script, &install.destination);
+    rcmake_base::shell::cmake_quoted_content(&mut script, &install.destination);
     script.extend_from_slice(b"\" TYPE FILE");
     if install.optional {
         script.extend_from_slice(b" OPTIONAL");
@@ -219,20 +219,11 @@ fn bmi_install_script(install: &crate::BmiInstallInfo, modules: &CxxModulesJson)
     script.extend_from_slice(b" FILES");
     for module in files {
         script.extend_from_slice(b" \"");
-        escape_cmake(&mut script, &module.bmi);
+        rcmake_base::shell::cmake_quoted_content(&mut script, &module.bmi);
         script.push(b'"');
     }
     script.extend_from_slice(b")\n");
     script
-}
-
-fn escape_cmake(out: &mut BString, value: &[u8]) {
-    for &byte in value {
-        if matches!(byte, b'\\' | b'"' | b'$') {
-            out.push(b'\\');
-        }
-        out.push(byte);
-    }
 }
 
 type Providers<'a> = BTreeMap<&'a BString, &'a P1689Rule>;

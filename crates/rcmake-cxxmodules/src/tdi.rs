@@ -14,8 +14,13 @@ use crate::{
     ModuleVisibility, ModulesError, ScannedSourceInfo, TargetDependInfo,
 };
 
-trait Fields {
-    fn value(&self, key: &str) -> Option<&Value>;
+struct Fields<'a>(&'a Object);
+
+impl Fields<'_> {
+    fn value(&self, key: &str) -> Option<&Value> {
+        self.0.get(key.as_bytes())
+    }
+
     fn optional(&self, key: &str) -> Result<Option<BString>, ModulesError> {
         optional_string(self.value(key))
     }
@@ -30,19 +35,13 @@ trait Fields {
     }
 }
 
-impl Fields for Object {
-    fn value(&self, key: &str) -> Option<&Value> {
-        self.get(key.as_bytes())
-    }
-}
-
 /// Parse the target metadata used for collation.
 ///
 /// # Errors
 /// Returns an error for invalid JSON or invalid field types.
 pub fn read_tdi(input: &[u8]) -> Result<TargetDependInfo, ModulesError> {
     let document = parse_json(input)?;
-    let fields = object(&document)?;
+    let fields = Fields(object(&document)?);
     Ok(TargetDependInfo {
         compiler_id: fields.string("compiler-id")?,
         compiler_frontend_variant: fields.string("compiler-frontend-variant")?,
@@ -70,7 +69,7 @@ pub fn read_tdi(input: &[u8]) -> Result<TargetDependInfo, ModulesError> {
             })
         })?,
         sources: read_map(fields.value("sources"), |value| {
-            let fields = object(value)?;
+            let fields = Fields(object(value)?);
             Ok(ScannedSourceInfo {
                 source: fields.string("source")?,
                 language: fields.string("language")?,
@@ -97,16 +96,16 @@ fn read_map<T>(
 
 fn read_optional<T>(
     value: Option<&Value>,
-    read: impl FnOnce(&Object) -> Result<T, ModulesError>,
+    read: impl FnOnce(Fields<'_>) -> Result<T, ModulesError>,
 ) -> Result<Option<T>, ModulesError> {
     value
         .filter(|v| **v != Value::Null)
-        .map(|v| read(object(v)?))
+        .map(|v| read(Fields(object(v)?)))
         .transpose()
 }
 
 fn read_module_source(value: &Value) -> Result<ModuleSourceInfo, ModulesError> {
-    let fields = object(value)?;
+    let fields = Fields(object(value)?);
     let visibility = match fields.string("visibility")?.as_slice() {
         b"" | b"PRIVATE" => ModuleVisibility::Private,
         b"PUBLIC" => ModuleVisibility::Public,
@@ -129,7 +128,7 @@ fn read_module_source(value: &Value) -> Result<ModuleSourceInfo, ModulesError> {
 }
 
 fn read_export(value: &Value) -> Result<ModuleExportInfo, ModulesError> {
-    let fields = object(value)?;
+    let fields = Fields(object(value)?);
     Ok(ModuleExportInfo {
         export_name: fields.string("export-name")?,
         filesystem_export_name: fields.string("filesystem-export-name")?,
@@ -141,7 +140,7 @@ fn read_export(value: &Value) -> Result<ModuleExportInfo, ModulesError> {
     })
 }
 
-fn read_bmi_install(fields: &Object) -> Result<BmiInstallInfo, ModulesError> {
+fn read_bmi_install(fields: Fields<'_>) -> Result<BmiInstallInfo, ModulesError> {
     Ok(BmiInstallInfo {
         destination: fields.string("destination")?,
         component: fields.string("component")?,

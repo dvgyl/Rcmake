@@ -202,40 +202,6 @@ pub(crate) fn include_depend_make(
     Ok(())
 }
 
-/// Collect the files that the target's clean goal removes.
-///
-/// Pass the configured support directory, original objects and module paths
-/// discovered by the Fortran scanner. Include both compiler basename cases.
-pub(crate) fn clean_artifacts<'a>(
-    build_dir: &Path,
-    support_dir: &[u8],
-    objects: &[BString],
-    modules: impl IntoIterator<Item = &'a BString>,
-) -> BTreeSet<BString> {
-    let mut products = BTreeSet::new();
-    for module in modules {
-        let path = Lexical::new(module);
-        let (stem, extension) = path.stem_extension(true);
-        products.insert(build_path(module, build_dir));
-        let uppercase = [stem.to_ascii_uppercase().as_slice(), extension].concat();
-        products.insert(build_path(
-            &Lexical::new(path.parent()).append(&uppercase),
-            build_dir,
-        ));
-        let stamp = [path.filename(), b".stamp"].concat();
-        products.insert(build_path(
-            &Lexical::new(support_dir).append(&stamp),
-            build_dir,
-        ));
-    }
-    products.extend(
-        objects
-            .iter()
-            .map(|object| build_path(&[object.as_slice(), b".provides.build"].concat(), build_dir)),
-    );
-    products
-}
-
 /// Write the scan goal. Pass prerequisites that generate sources before the scan.
 ///
 /// Makefile2 must invoke this goal before invoking the target's build goal.

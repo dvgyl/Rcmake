@@ -7,12 +7,9 @@ use std::path::Path;
 use rcmake_gen_common::{
     GenError,
     ide::{UtilityKind, project_roots, utility_targets},
-    write_if_changed,
+    write_output,
 };
-use rcmake_host::{
-    Host,
-    path::{from_native, to_native},
-};
+use rcmake_host::{Host, path::to_native};
 use rcmake_model::{DirId, GeneratorKind, ProjectModel};
 use rcmake_resolve::GenerationResult;
 
@@ -110,12 +107,5 @@ pub(crate) fn file_name(name: &str) -> Result<&str, GenError> {
 }
 
 pub(crate) fn write_file(host: &dyn Host, path: &Path, data: &str) -> Result<(), GenError> {
-    if let Some(parent) = path.parent() {
-        host.create_dir_all(parent)
-            .map_err(|error| GenError::Write {
-                path: from_native(parent),
-                message: error.to_string().into(),
-            })?;
-    }
-    write_if_changed(host, path, data.as_bytes())
+    write_output(host, path, data.as_bytes())
 }

@@ -6,7 +6,7 @@ use rcmake_base::{BString, hash::HashAlgo, shell::quote};
 use rcmake_host::{Host, path};
 use rcmake_resolve::{Invocation, ResponseQuoting, ResponseRole, ResponseSpan};
 
-use crate::{GenError, write_if_changed};
+use crate::{GenError, write_output};
 
 /// Command-line limit before a generator switches to files or scripts.
 #[must_use]
@@ -33,14 +33,7 @@ impl File {
         let mut bytes = self.contents.clone();
         bytes.push(b'\n');
         let file = build.join(path::to_native(&self.path));
-        if let Some(parent) = file.parent() {
-            host.create_dir_all(parent)
-                .map_err(|error| GenError::Write {
-                    path: path::from_native(parent),
-                    message: error.to_string().into(),
-                })?;
-        }
-        write_if_changed(host, &file, &bytes)
+        write_output(host, &file, &bytes)
     }
 }
 
@@ -155,28 +148,4 @@ fn encode(arguments: &[BString], quoting: ResponseQuoting) -> BString {
     out.into()
 }
 
-/// Append one argument using Microsoft command-line quoting.
-pub fn windows_argument(word: &[u8], out: &mut Vec<u8>, force_quote: bool) {
-    if !force_quote && !word.is_empty() && !word.iter().any(|b| matches!(b, b' ' | b'\t' | b'"')) {
-        out.extend_from_slice(word);
-        return;
-    }
-    out.push(b'"');
-    let mut slashes = 0;
-    for &byte in word {
-        if byte == b'\\' {
-            slashes += 1;
-        } else {
-            let count = if byte == b'"' {
-                2 * slashes + 1
-            } else {
-                slashes
-            };
-            out.extend(std::iter::repeat_n(b'\\', count));
-            slashes = 0;
-            out.push(byte);
-        }
-    }
-    out.extend(std::iter::repeat_n(b'\\', 2 * slashes));
-    out.push(b'"');
-}
+pub use rcmake_base::shell::windows_argument;

@@ -210,10 +210,8 @@ impl<'a> Commands<'a> {
         let working_dir = eval
             .optional(&command.working_directory)?
             .map_or_else(|| binary.clone(), |dir| join(binary, &dir));
-        let ninja_posix = matches!(
-            self.model.generator,
-            Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
-        ) && !super::shell::windows_host(self.model, command.dir);
+        let ninja_posix = self.model.generator.is_some_and(GeneratorKind::is_ninja)
+            && !super::shell::windows_host(self.model, command.dir);
         let working_dir = (!working_dir.is_empty()
             && (ninja_posix || working_dir != self.model.dir(DirId::ROOT).binary_dir))
             .then_some(working_dir);
@@ -525,10 +523,7 @@ impl<'a> Commands<'a> {
                     existing.extend_from_slice(comment);
                 }
                 if event.is_some()
-                    && matches!(
-                        self.model.generator,
-                        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
-                    )
+                    && self.model.generator.is_some_and(GeneratorKind::is_ninja)
                     && !super::shell::windows_host(self.model, command.dir)
                     && let [first, rest @ ..] = step.invocations.as_slice()
                     && !rest.is_empty()
@@ -705,10 +700,7 @@ pub(super) fn ide_custom_step(
 /// a subdirectory, where the transformation changes the paths, or when
 /// `CMAKE_POLICY_WARNING_CMP0116` is on.
 pub(crate) fn warn_depfile_policy(model: &ProjectModel, host: &dyn rcmake_host::Host) {
-    if !matches!(
-        model.generator,
-        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
-    ) {
+    if !model.generator.is_some_and(GeneratorKind::is_ninja) {
         return;
     }
     let policy = PolicyId::new(116);
@@ -842,10 +834,8 @@ pub(super) fn attach_link_events(
     else {
         return link;
     };
-    if matches!(
-        model.generator,
-        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
-    ) && (before.comment.is_some() || after.comment.is_some())
+    if model.generator.is_some_and(GeneratorKind::is_ninja)
+        && (before.comment.is_some() || after.comment.is_some())
     {
         let link = BString::from(crate::progress::link_description(&step, &step.output));
         let description = [before.comment.as_ref(), Some(&link), after.comment.as_ref()]

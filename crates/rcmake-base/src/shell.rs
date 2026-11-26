@@ -33,13 +33,18 @@ pub fn quote_always(arg: &[u8]) -> BString {
 /// Append a double-quoted CMake argument. Escape backslashes, quotes, and dollar signs.
 pub fn cmake_quote(out: &mut Vec<u8>, bytes: &[u8]) {
     out.push(b'"');
+    cmake_quoted_content(out, bytes);
+    out.push(b'"');
+}
+
+/// Escape bytes for the inside of a double-quoted CMake argument.
+pub fn cmake_quoted_content(out: &mut Vec<u8>, bytes: &[u8]) {
     for &byte in bytes {
         if matches!(byte, b'\\' | b'"' | b'$') {
             out.push(b'\\');
         }
         out.push(byte);
     }
-    out.push(b'"');
 }
 
 /// Append one argument using Microsoft command-line quoting.

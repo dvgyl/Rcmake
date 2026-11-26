@@ -9,19 +9,19 @@ use rcmake_genex::{ArtifactKind, ArtifactPart};
 use rcmake_model::RuntimeDependencyInstall;
 
 use super::{
-    BString, Backtrace, ConfigId, DirId, InstallAction, InstallActionKind, InstallKind,
-    ProjectModel, ResolvedTarget, TargetId, TargetKind, UsageResolver, action,
+    BString, ConfigId, EvaluateInstall, InstallAction, InstallActionKind, InstallKind,
+    ProjectModel, ResolveError, ResolvedTarget, TargetId, TargetKind, UsageResolver, action,
     cmake_quoted_content, definition, matches_config, recorded_args,
 };
 
-pub(super) fn lower<E>(
+pub(super) fn lower(
     model: &ProjectModel,
     targets: &[ResolvedTarget],
     configs: &[ConfigId],
     set: &RuntimeDependencyInstall,
-    eval: &mut impl FnMut(DirId, &ConfigId, &Backtrace, &[u8]) -> Result<BString, E>,
+    eval: &mut EvaluateInstall<'_>,
     actions: &mut Vec<InstallAction>,
-) -> Result<(), E> {
+) -> Result<(), ResolveError> {
     let members = members(model, &set.name);
     let default = ConfigId::default();
     let multi = configs.len() > 1 || model.generator.is_some_and(|kind| kind.multi_config());

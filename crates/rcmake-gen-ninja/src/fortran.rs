@@ -13,9 +13,6 @@ use crate::commands::windows_argument;
 use crate::graph::Graph;
 use crate::syntax::{Edge, Ninja, shell_word};
 
-/// Minimum Ninja version that supports Fortran dyndep files.
-pub(crate) const REQUIRED_VERSION: &str = "1.10";
-
 pub(crate) fn uses_fortran(graph: &rcmake_resolve::BuildGraph) -> bool {
     graph
         .steps

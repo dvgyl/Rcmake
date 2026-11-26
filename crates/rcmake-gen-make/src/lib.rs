@@ -3,16 +3,8 @@
 #![forbid(unsafe_code)]
 
 mod build;
-#[allow(
-    dead_code,
-    reason = "The language activation wave uses this emitter or planner"
-)]
 mod cuda;
 mod directory_info;
-#[allow(
-    dead_code,
-    reason = "The language activation wave uses this emitter or planner"
-)]
 mod fortran;
 mod plan_step;
 mod prep;
@@ -30,7 +22,7 @@ use std::path::Path;
 
 use rcmake_base::{BString, ByteVec, shell::quote_always};
 use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_gen_common::{GenError, write_if_changed};
+use rcmake_gen_common::GenError;
 use rcmake_host::{Host, WriteMode, path};
 use rcmake_model::{DirId, ProjectModel};
 use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult};
@@ -439,14 +431,7 @@ fn write_makefile(
     contents: &[u8],
 ) -> Result<(), GenError> {
     let destination = directory.join(path::to_native(file));
-    if let Some(parent) = destination.parent() {
-        host.create_dir_all(parent)
-            .map_err(|error| GenError::Write {
-                path: path::from_native(parent),
-                message: error.to_string().into(),
-            })?;
-    }
-    write_if_changed(host, &destination, contents)
+    rcmake_gen_common::write_output(host, &destination, contents)
 }
 
 fn makefile() -> Vec<u8> {

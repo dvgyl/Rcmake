@@ -5,36 +5,32 @@
 mod build;
 mod clean;
 mod commands;
-#[allow(
-    dead_code,
-    reason = "The language activation wave uses this emitter or planner"
-)]
 mod cuda;
-#[allow(
-    dead_code,
-    reason = "The language activation wave uses this emitter or planner"
-)]
 mod fortran;
 mod graph;
 mod install;
 
-use install::{emit_config_utilities, emit_utilities};
+use install::emit_utilities;
 mod instrumented;
 mod modules;
 mod multi;
 mod prep;
+mod regenerate;
 mod response;
+use regenerate::{
+    cache_setting, configuration_setting, configure_command, emit_regeneration, read_cache,
+};
 mod syntax;
 
 pub use build::build_commands;
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rcmake_base::BString;
 use rcmake_gen_common::export::write_module_exports;
 use rcmake_gen_common::{GenError, write_if_changed};
-use rcmake_host::{FileKind, Follow, Host, ReadRange, path};
+use rcmake_host::{FileKind, Follow, Host, path};
 use rcmake_model::{DirId, ProjectModel};
 use rcmake_resolve::{ArtifactSet, BuildGraph, BuildStep, GenerationResult};
 
@@ -242,7 +238,7 @@ pub fn generate_multi_config(
     host: &dyn Host,
     build_dir: &Path,
 ) -> Result<(), GenError> {
-    generate_multi(result, host, build_dir, None, Commands::new(host))
+    multi::generate_multi(result, host, build_dir, None, Commands::new(host))
 }
 
 /// Write Ninja Multi-Config manifests with test preparation targets from the
@@ -257,236 +253,7 @@ pub fn generate_multi_config_with_model(
     build_dir: &Path,
     model: &ProjectModel,
 ) -> Result<(), GenError> {
-    generate_multi(result, host, build_dir, Some(model), Commands::new(host))
-}
-
-fn generate_multi(
-    result: &GenerationResult,
-    host: &dyn Host,
-    build_dir: &Path,
-    model: Option<&ProjectModel>,
-    commands: Commands,
-) -> Result<(), GenError> {
-    let prefix = output_prefix(model, &commands);
-    let mut configs = Vec::new();
-    let mut names = HashSet::new();
-    for config in &result.configs {
-        let name = config.0.as_slice();
-        if name.is_empty()
-            || name
-                .iter()
-                .any(|byte| matches!(byte, b'/' | b'\\' | b'\n' | b'\r' | 0))
-            || !names.insert(name)
-        {
-            return Err(generation_error(
-                build_dir,
-                "Invalid or duplicate Ninja configuration name.",
-            ));
-        }
-        let input = result
-            .graphs
-            .iter()
-            .find(|graph| graph.config == *config)
-            .ok_or_else(|| {
-                generation_error(build_dir, "A Ninja configuration has no build graph.")
-            })?;
-        let artifacts = config_artifacts(result, input);
-        let mut graph = Graph::with_prefix(
-            input,
-            &artifacts,
-            build_dir,
-            Some(name),
-            &prefix,
-            commands.clone(),
-        )?;
-        graph.add_aliases(&artifacts, model, result);
-        graph.resolve_custom_inputs(model, host);
-        graph.set_compile_metadata(result);
-        graph.set_command_settings(model, host);
-        graph.set_clean_files(model, &result.metadata.clean_files)?;
-        let prep = PrepTargets::new(&graph, result, model, host)?;
-        configs.push((graph, ConfigFiles::new(name, prep)));
-    }
-
-    prepare_directory(host, build_dir)?;
-    for (graph, _) in &mut configs {
-        graph.prepare_custom_scripts(host)?;
-    }
-    let selection = multi::Selection::new(&result.configs, build_dir, |name| {
-        model
-            .and_then(|model| model.definition(DirId::ROOT, name))
-            .cloned()
-            .or_else(|| configuration_setting(host, build_dir, name))
-    })?;
-    let (default, default_files) = configs
-        .get(selection.default)
-        .ok_or_else(|| generation_error(build_dir, "Missing default Ninja configuration."))?;
-    let cross: Vec<_> = selection
-        .cross
-        .iter()
-        .filter_map(|&index| configs.get(index).map(|(graph, _)| graph))
-        .collect();
-    let defaults: Vec<_> = selection
-        .defaults
-        .iter()
-        .filter_map(|&index| configs.get(index).map(|(graph, _)| graph))
-        .collect();
-    let mut manifests = vec![
-        default.node(b"build.ninja"),
-        default.node(RULES_PATH.as_bytes()),
-    ];
-    for (_, files) in &configs {
-        manifests.extend([
-            default.node(&files.entry),
-            default.node(&files.implementation),
-        ]);
-    }
-
-    let graphs: Vec<_> = configs.iter().map(|(graph, _)| graph.input).collect();
-    let uses_modules = graphs.iter().any(|graph| modules::uses_modules(graph));
-    let module_flag = if uses_modules {
-        modules::modmap_flag(result, build_dir)?
-    } else {
-        BString::default()
-    };
-    prepare_directory(host, build_dir)?;
-    let verify_globs = rcmake_gen_common::glob::write_verification(model, build_dir, host)?;
-    let exports = model
-        .map(|model| write_module_exports(result, model, host, build_dir, true))
-        .transpose()?
-        .unwrap_or_default();
-    manifests.extend(exports.iter().map(|job| default.node(&job.script)));
-    manifests.extend(
-        result
-            .metadata
-            .generated_files
-            .iter()
-            .map(|file| default.node(file)),
-    );
-    add_install_scripts(&mut manifests, default, result, model);
-    if uses_modules || graphs.iter().any(|graph| fortran::uses_fortran(graph)) {
-        manifests.extend(
-            modules::write_metadata(result, model, &graphs, host, build_dir, true)?
-                .iter()
-                .map(|file| default.node(file)),
-        );
-    }
-    write_rules(result, host, build_dir, uses_modules, model, &commands)?;
-    let programs = Programs::new(result, host, build_dir, model, &commands);
-    let rebuild = configure_command(result, build_dir, &programs.cmake, &commands, false);
-    let regenerate = configure_command(result, build_dir, &programs.cmake, &commands, true);
-    for (index, (graph, files)) in configs.iter().enumerate() {
-        let mut ninja = graph.manifest();
-        ninja.include(&graph.node(RULES_PATH.as_bytes()));
-        let mut emitted = HashSet::new();
-        let included = std::iter::once(index).chain(
-            selection
-                .cross
-                .iter()
-                .copied()
-                .filter(|&other| other != index),
-        );
-        let owners = graph::CustomOwners::new(
-            included
-                .clone()
-                .filter_map(|index| configs.get(index).map(|(graph, _)| graph)),
-        );
-        for (output_index, (output, files)) in included
-            .clone()
-            .filter_map(|selected| configs.get(selected).map(|config| (selected, config)))
-        {
-            let cross = (index != output_index)
-                .then(|| {
-                    result
-                        .cross_graphs
-                        .get(&(graph.input.config.clone(), output.input.config.clone()))
-                })
-                .flatten()
-                .map(|input| {
-                    let artifacts = config_artifacts(result, input);
-                    let mut variant = Graph::with_prefix(
-                        input,
-                        &artifacts,
-                        build_dir,
-                        output.config,
-                        &prefix,
-                        commands.clone(),
-                    )?;
-                    variant.add_aliases(&artifacts, model, result);
-                    variant.resolve_custom_inputs(model, host);
-                    variant.set_compile_metadata(result);
-                    variant.set_command_settings(model, host);
-                    variant.prepare_custom_scripts(host)?;
-                    Ok::<_, GenError>(variant)
-                })
-                .transpose()?;
-            let output_graph = cross.as_ref().unwrap_or(output);
-            let custom_inputs =
-                output_graph.inherited_custom_inputs(graph, &owners, !selection.cross.is_empty());
-            let graph = output_graph;
-            graph.emit_into(
-                &mut ninja,
-                &programs.cmake,
-                &module_flag,
-                &exports,
-                Some(&mut emitted),
-                &custom_inputs,
-            )?;
-            graph.emit_clean_inputs(&mut ninja);
-            files.prep.emit(&mut ninja, graph);
-            emit_config_utilities(&mut ninja, output, &programs, &rebuild);
-        }
-        if !cross.is_empty() {
-            files.prep.emit_all_aliases(&mut ninja, &cross);
-        }
-        multi::emit_clean(
-            &mut ninja,
-            graph,
-            &files.implementation,
-            &programs,
-            included.filter_map(|selected| configs.get(selected).map(|(graph, _)| graph)),
-            &cross,
-        );
-        if !cross.is_empty() {
-            graph.emit_aliases(&mut ninja, Some(b"all"), &cross, &emitted);
-        }
-        emit_regeneration(
-            &mut ninja,
-            graph,
-            &manifests,
-            result,
-            &regenerate,
-            verify_globs.then_some(programs.cmake.as_slice()),
-        );
-        write_if_changed(
-            host,
-            &build_dir.join(path::to_native(&files.implementation)),
-            &ninja.0,
-        )?;
-        write_entry(
-            host,
-            build_dir,
-            graph,
-            files,
-            &files.entry,
-            (&[graph], &[]),
-            &emitted,
-            (&programs, &rebuild),
-        )?;
-        if index == selection.default {
-            write_entry(
-                host,
-                build_dir,
-                default,
-                default_files,
-                b"build.ninja",
-                (&defaults, &cross),
-                &emitted,
-                (&programs, &rebuild),
-            )?;
-        }
-    }
-    Ok(())
+    multi::generate_multi(result, host, build_dir, Some(model), Commands::new(host))
 }
 
 fn config_artifacts<'a>(
@@ -499,62 +266,6 @@ fn config_artifacts<'a>(
         .filter(|target| target.config == input.config)
         .map(|target| (target.metadata.name.as_slice(), &target.artifacts))
         .collect()
-}
-
-struct ConfigFiles {
-    entry: BString,
-    implementation: BString,
-    prep: PrepTargets,
-}
-
-impl ConfigFiles {
-    fn new(config: &[u8], prep: PrepTargets) -> Self {
-        let entry = [b"build-", config, b".ninja"].concat().into();
-        let implementation = [b"CMakeFiles/impl-", config, b".ninja"].concat().into();
-        Self {
-            entry,
-            implementation,
-            prep,
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_entry(
-    host: &dyn Host,
-    build_dir: &Path,
-    graph: &Graph<'_>,
-    files: &ConfigFiles,
-    entry: &[u8],
-    (aliases, all): (&[&Graph<'_>], &[&Graph<'_>]),
-    emitted: &HashSet<BString>,
-    (programs, rebuild): (&Programs, &[u8]),
-) -> Result<(), GenError> {
-    let mut ninja = Ninja::default();
-    // The include path can contain a literal pipe.
-    ninja.0.extend_from_slice(b"ninja_pipe = |\n");
-    ninja.include(&graph.node(&files.implementation));
-    graph.emit_aliases(&mut ninja, None, aliases, emitted);
-    if !graph.has_target(&"clean".into()) {
-        let targets = aliases
-            .iter()
-            .map(|graph| qualified(&graph.node(b"clean"), graph.config))
-            .collect::<Vec<_>>();
-        ninja.phony(&graph.node(b"clean"), &targets);
-    }
-    files.prep.emit_aliases(&mut ninja, graph, aliases);
-    emit_utilities(
-        &mut ninja,
-        graph,
-        entry,
-        programs,
-        rebuild,
-        install::Scope::Entry { aliases, all },
-    );
-    if graph.prefix.is_empty() {
-        ninja.0.extend_from_slice(b"default all\n");
-    }
-    write_if_changed(host, &build_dir.join(path::to_native(entry)), &ninja.0)
 }
 
 fn prepare_directory(host: &dyn Host, build_dir: &Path) -> Result<(), GenError> {
@@ -689,134 +400,6 @@ fn add_install_scripts(
             outputs.push(script);
         }
     }
-}
-
-fn emit_regeneration(
-    ninja: &mut Ninja,
-    graph: &Graph<'_>,
-    outputs: &[BString],
-    result: &GenerationResult,
-    regenerate: &[u8],
-    verify: Option<&[u8]>,
-) {
-    let mut seen = HashSet::new();
-    let mut listfiles: Vec<_> = result
-        .metadata
-        .listfiles
-        .iter()
-        .map(|file| graph.node(file))
-        .filter(|file| !outputs.contains(file) && seen.insert(file.clone()))
-        .collect();
-
-    if let Some(cmake) = verify {
-        let script = graph.node(rcmake_gen_common::glob::SCRIPT.as_bytes());
-        let stamp = graph.node(rcmake_gen_common::glob::STAMP.as_bytes());
-        let force = graph.node(b"CMakeFiles/VerifyGlobs.force");
-        ninja.phony(&force, &[]);
-        ninja.edge(
-            b"VERIFY_GLOBS",
-            Edge {
-                outputs: std::slice::from_ref(&stamp),
-                implicit_inputs: &[script.clone(), force],
-                ..Edge::default()
-            },
-        );
-        let mut command = cmake.to_vec();
-        command.extend_from_slice(b" -P ");
-        graph.commands.word(&script, &mut command);
-        ninja.binding(b"COMMAND", &command);
-        listfiles.push(stamp);
-    }
-
-    ninja.edge(
-        b"RERUN_CMAKE",
-        Edge {
-            outputs,
-            implicit_inputs: &listfiles,
-            ..Edge::default()
-        },
-    );
-    ninja.binding(b"COMMAND", regenerate);
-
-    for listfile in &listfiles {
-        // Missing listfiles must trigger regeneration so CMake can check them.
-        if *listfile != graph.node(rcmake_gen_common::glob::STAMP.as_bytes())
-            && !graph.has_target(listfile)
-        {
-            ninja.phony(listfile, &[]);
-        }
-    }
-}
-
-fn source_directory(result: &GenerationResult, build_dir: &Path) -> PathBuf {
-    result
-        .metadata
-        .listfiles
-        .iter()
-        .map(|file| path::to_native(file))
-        .find(|file| {
-            file.file_name()
-                .is_some_and(|name| name == "CMakeLists.txt")
-        })
-        .and_then(|file| file.parent().map(Path::to_path_buf))
-        .or_else(|| {
-            result
-                .targets
-                .first()
-                .map(|target| path::to_native(&target.metadata.source_dir))
-        })
-        .map(|source| build_dir.join(source))
-        .unwrap_or_else(|| build_dir.to_path_buf())
-}
-
-fn configure_command(
-    result: &GenerationResult,
-    build_dir: &Path,
-    cmake: &[u8],
-    commands: &Commands,
-    rerun: bool,
-) -> Vec<u8> {
-    let source_dir = source_directory(result, build_dir);
-    let mut command = cmake.to_vec();
-    if rerun {
-        command.extend_from_slice(b" --regenerate-during-build");
-    }
-    let option = |prefix: &[u8], directory: &Path, command: &mut Vec<u8>| {
-        command.push(b' ');
-        let directory = path::from_native(directory);
-        if commands.windows() {
-            commands.word(&[prefix, &directory].concat(), command);
-        } else {
-            command.extend_from_slice(prefix);
-            commands.word(&directory, command);
-        }
-    };
-    option(b"-S", &source_dir, &mut command);
-    option(b"-B", build_dir, &mut command);
-    command
-}
-
-fn configuration_setting(host: &dyn Host, build_dir: &Path, name: &[u8]) -> Option<BString> {
-    host.env_get(name)
-        .or_else(|| cache_setting(&read_cache(host, build_dir)?, name))
-}
-
-fn read_cache(host: &dyn Host, build_dir: &Path) -> Option<Vec<u8>> {
-    host.read(
-        &build_dir.join("CMakeCache.txt"),
-        ReadRange::All {
-            limit: 16 * 1024 * 1024,
-        },
-    )
-    .ok()
-}
-
-fn cache_setting(cache: &[u8], name: &[u8]) -> Option<BString> {
-    cache.split(|&byte| byte == b'\n').find_map(|line| {
-        let entry = line.strip_prefix(name)?.strip_prefix(b":")?;
-        let value = entry.splitn(2, |&byte| byte == b'=').nth(1)?;
-        Some(BString::from(value.strip_suffix(b"\r").unwrap_or(value)))
-    })
 }
 
 struct Programs {

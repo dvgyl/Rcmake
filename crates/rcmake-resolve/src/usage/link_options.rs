@@ -237,7 +237,7 @@ pub(crate) fn warning_as_error_options(
         return Ok(vec!["DRIVER".into(), "LINKER".into()]);
     }
     let mut modes = list::split(value, list::Empty::Drop);
-    modes.sort();
+    modes.sort_unstable();
     modes.dedup();
     let invalid: Vec<_> = modes
         .iter()

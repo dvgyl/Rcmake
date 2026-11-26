@@ -8,7 +8,7 @@ use rcmake_resolve::{
     BuildGraph, BuildStep, CustomStep, GenerationResult, Invocation, LinkKind, LinkStep,
 };
 
-use crate::{commands::Commands, generate_multi, generate_single, tests::read};
+use crate::{commands::Commands, generate_single, multi::generate_multi, tests::read};
 
 fn windows() -> Commands {
     Commands::for_windows(br"C:\Windows\System32\cmd.exe")
