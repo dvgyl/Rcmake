@@ -285,9 +285,7 @@ impl ReplaySession {
                 },
             )
         });
-        Manifest::from_region(region, self.pending)
-            .encode_streaming()
-            .ok()
+        Manifest::from_region(region, self.pending).encode().ok()
     }
 }
 

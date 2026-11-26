@@ -443,3 +443,41 @@ fn snapshot_codec_rejects_truncation_and_bit_changes() -> Result<(), Box<dyn std
     assert!(ConfigureSnapshot::<Vec<u8>>::decode(&previous.encode()?).is_err());
     Ok(())
 }
+
+#[test]
+fn snapshot_encode_enforces_budget_and_utf8_on_public_models()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_, key, context) = fixture(RegionKind::Configure);
+    let region = RegionState::default().finish(key, context);
+
+    // 8 MiB of 255_u8 requires >16 MiB as a JSON array and hits the array lower bound immediately.
+    let oversized_8m = ConfigureSnapshot::new(region.clone(), vec![255_u8; 8 * 1024 * 1024])?;
+    assert_eq!(oversized_8m.encode(), Err(ReplayCodecError::Payload));
+
+    // 5 MiB of 255_u8 passes the 2*len+1 array lower bound (~10 MiB) and stops while streaming
+    // into the 16 MiB budget (~20 MiB encoded) without allocating a JSON Value tree.
+    let oversized_5m = ConfigureSnapshot::new(region.clone(), vec![255_u8; 5 * 1024 * 1024])?;
+    assert_eq!(oversized_5m.encode(), Err(ReplayCodecError::Payload));
+
+    // Invalid UTF-8 strings and object keys inside Value models still fail with Payload.
+    let bad_value_str =
+        ConfigureSnapshot::new(region.clone(), rcmake_json::Value::string(&b"bad-\xff"[..]))?;
+    assert_eq!(bad_value_str.encode(), Err(ReplayCodecError::Payload));
+
+    let bad_value_key = ConfigureSnapshot::new(
+        region.clone(),
+        rcmake_json::Value::object_from([(&b"bad-\xff"[..], rcmake_json::Value::Null)]),
+    )?;
+    assert_eq!(bad_value_key.encode(), Err(ReplayCodecError::Payload));
+
+    let valid_value = ConfigureSnapshot::new(
+        region,
+        rcmake_json::Value::object_from([("ok", rcmake_json::Value::string("valid-é-😀"))]),
+    )?;
+    let framed = valid_value.encode()?;
+    assert_eq!(
+        ConfigureSnapshot::<rcmake_json::Value>::decode(&framed)?,
+        valid_value
+    );
+    Ok(())
+}

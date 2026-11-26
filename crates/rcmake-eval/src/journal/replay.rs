@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::Path;
 
 use rcmake_host::{Host, path};
-use rcmake_json::{FieldError, FromJson, ReadOptions, ToJson, Value, parse, req};
+use rcmake_json::{FieldError, FromJson, ReadOptions, Value, parse, req};
 use rcmake_model::{AppendMode, DirId, ModelError, ProjectModel, PropOrigin, PropScope};
 
 use crate::Cx;
@@ -66,23 +66,21 @@ impl<M> ConfigureSnapshot<M> {
     }
 }
 
-impl<M> ConfigureSnapshot<M> {
-    fn encode_with(
-        &self,
-        encode_model: impl FnOnce(&mut JsonSink<'_>) -> Result<(), EncodeError>,
-    ) -> Result<Vec<u8>, ReplayCodecError> {
+impl<M: EncodeJson> ConfigureSnapshot<M> {
+    /// Encode this snapshot in a length-checked native-path frame.
+    ///
+    /// Streams the manifest directly within the 16 MiB payload budget without building an
+    /// intermediate JSON value tree. Returns [`ReplayCodecError::Payload`] if the encoded
+    /// payload exceeds the frame limit or contains a JSON string or object key with invalid
+    /// UTF-8 bytes (encode arbitrary bytes as numeric arrays, such as `Vec<u8>`).
+    pub fn encode(&self) -> Result<Vec<u8>, ReplayCodecError> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(FRAME_MAGIC);
         bytes.push(PATH_ENCODING);
         let length_field = bytes.len()..FRAME_HEADER;
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         write_with(&mut bytes, MAX_FRAME_BYTES, |sink| {
-            sink.object(|obj| {
-                obj.field("model", encode_model)?;
-                obj.field("region", |s| self.region.encode(s))?;
-                obj.field("replay_schema", |s| self.schema.encode(s))?;
-                obj.field("schema", |s| s.str(FRAME_SCHEMA))
-            })
+            <Self as EncodeJson>::encode(self, sink)
         })
         .ok_or(ReplayCodecError::Payload)?;
         let len = (bytes.len() - FRAME_HEADER) as u32;
@@ -93,26 +91,6 @@ impl<M> ConfigureSnapshot<M> {
         let checksum = JournalDigest::hash(&bytes);
         bytes.extend_from_slice(checksum.as_bytes());
         Ok(bytes)
-    }
-
-    /// Stream-encode this snapshot directly into a length-checked frame without building
-    /// an intermediate JSON value tree.
-    pub(super) fn encode_streaming(&self) -> Result<Vec<u8>, ReplayCodecError>
-    where
-        M: EncodeJson,
-    {
-        self.encode_with(|sink| self.model.encode(sink))
-    }
-}
-
-impl<M: ToJson> ConfigureSnapshot<M> {
-    /// Encode this snapshot in a length-checked native-path frame.
-    ///
-    /// Returns [`ReplayCodecError::Payload`] if the encoded payload exceeds the frame
-    /// limit or if `M::to_json` produces a JSON string or key with invalid UTF-8 bytes
-    /// (encode arbitrary bytes as numeric arrays, such as `Vec<u8>`).
-    pub fn encode(&self) -> Result<Vec<u8>, ReplayCodecError> {
-        self.encode_with(|sink| sink.value(&self.model.to_json()))
     }
 }
 

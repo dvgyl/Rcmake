@@ -601,9 +601,27 @@ class TrapsRunnerAndCliTests(unittest.TestCase):
         _write_valid_replay_record(source, build)
         me.require_replay_record(source, build)
 
+        class _FixedPath:
+            def __init__(self, logical: str, real: Path) -> None:
+                self._logical = logical
+                self._real = real
+
+            def __truediv__(self, other: str) -> Path:
+                return self._real / other
+
+            def __fspath__(self) -> str:
+                return self._logical
+
+            def __str__(self) -> str:
+                return self._logical
+
+        # Use fixed ASCII logical paths so the string-format fixture stays valid UTF-8 on every
+        # platform, even when the host temp directory contains non-ASCII Windows UTF-16LE bytes.
+        fixed_source = _FixedPath("/rcmake-test/src", source)
+        fixed_build = _FixedPath("/rcmake-test/build", build)
         raw_paths = [
             str(p).encode("utf-16-le", errors="surrogatepass") if os.name == "nt" else os.fsencode(p)
-            for p in (source, build)
+            for p in (fixed_source, fixed_build)
         ]
         encoded = [p.decode("utf-8") for p in raw_paths]
         payload = json.dumps({
@@ -619,8 +637,11 @@ class TrapsRunnerAndCliTests(unittest.TestCase):
         frame = header + payload
         frame += hashlib.sha256(frame).digest()
         (build / me.REPLAY_RECORD).write_bytes(frame)
-        me.require_replay_record(source, build)
+        me.require_replay_record(fixed_source, fixed_build)
+        self.assertEqual(me._decode_journal_bytes("caf\u00e9"), b"caf\xc3\xa9")
+        self.assertEqual(me._decode_journal_bytes([0xE9, 0x00]), b"\xe9\x00")
         self.assertIsNone(me._decode_journal_bytes([True]))
+        self.assertIsNone(me._decode_journal_bytes([256]))
 
 
 if __name__ == "__main__":

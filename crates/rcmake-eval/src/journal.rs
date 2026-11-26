@@ -25,6 +25,8 @@ pub(crate) use activate::ReplayState;
 #[cfg(feature = "replay")]
 pub use activate::ReplayHost;
 #[cfg(feature = "replay")]
+pub use frame::{EncodeError, EncodeJson, JsonSink, ObjectWriter};
+#[cfg(feature = "replay")]
 pub use receipts::ReplayReceipts;
 
 #[cfg(feature = "replay")]

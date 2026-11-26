@@ -310,7 +310,7 @@ fn invalid_late_effect_does_not_change_earlier_variables() -> TestResult {
     };
     let mut next = f.interp();
     next.config.limits.max_value_bytes = 8;
-    f.run(&mut next, Some(&bad.encode_streaming()?));
+    f.run(&mut next, Some(&bad.encode()?));
     assert_eq!(next.replay_hits(), 0);
     assert_eq!(next.cx().var(b"A"), Some("expected".into()));
     assert_eq!(next.cx().var(b"B"), Some("second".into()));

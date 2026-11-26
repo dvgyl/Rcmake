@@ -1,31 +1,38 @@
 //! Size limits and bounded compact JSON streaming for configure journal records.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use rcmake_base::BString;
 use rcmake_json::{Value, write_compact};
 
 /// Maximum JSON payload size for a configure snapshot.
 pub(super) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Reason bounded compact JSON encoding stopped before completing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum EncodeError {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum EncodeError {
     /// Output would exceed the remaining byte budget.
+    #[error("Encoded JSON exceeds the remaining byte budget.")]
     Budget,
     /// A JSON string or key contained invalid UTF-8 bytes.
+    #[error("JSON string or object key is not valid UTF-8.")]
     InvalidUtf8,
 }
 
 /// Stream compact JSON bytes directly while enforcing a hard byte budget.
 ///
-/// When `output` is `None`, only counts output bytes without heap allocation.
-pub(super) struct JsonSink<'a> {
+/// Encoding writes directly without building an intermediate JSON value tree. When measuring
+/// sizes without an output buffer, encoding allocates no output buffer, except for the small
+/// bounded UTF-16LE scratch buffer used for Windows paths and short formatting buffers for floats.
+pub struct JsonSink<'a> {
     output: Option<&'a mut Vec<u8>>,
     left: usize,
 }
 
-/// Encode a journal record directly as compact JSON under a hard byte budget.
-pub(super) trait EncodeJson {
+/// Encode a journal record or snapshot model directly as compact JSON under a hard byte budget.
+pub trait EncodeJson {
+    /// Stream this value into `sink` without exceeding its remaining byte budget.
     fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError>;
 }
 
@@ -71,7 +78,7 @@ pub(super) fn write_with(
 }
 
 /// Streaming compact JSON object writer. Fields must be written in strictly sorted key order.
-pub(super) struct ObjectWriter<'a, 'b> {
+pub struct ObjectWriter<'a, 'b> {
     sink: &'a mut JsonSink<'b>,
     count: usize,
     #[cfg(debug_assertions)]
@@ -79,7 +86,8 @@ pub(super) struct ObjectWriter<'a, 'b> {
 }
 
 impl ObjectWriter<'_, '_> {
-    pub(super) fn field(
+    /// Write one sorted object member using `value` to stream its JSON payload.
+    pub fn field(
         &mut self,
         key: &'static str,
         value: impl FnOnce(&mut JsonSink<'_>) -> Result<(), EncodeError>,
@@ -112,6 +120,30 @@ impl JsonSink<'_> {
         Ok(())
     }
 
+    fn check_array_min(&self, len: usize) -> Result<(), EncodeError> {
+        let min_len = if len == 0 {
+            2
+        } else {
+            len.saturating_mul(2).saturating_add(1)
+        };
+        if min_len > self.left {
+            return Err(EncodeError::Budget);
+        }
+        Ok(())
+    }
+
+    fn check_object_min(&self, len: usize) -> Result<(), EncodeError> {
+        let min_len = if len == 0 {
+            2
+        } else {
+            len.saturating_mul(5).saturating_add(1)
+        };
+        if min_len > self.left {
+            return Err(EncodeError::Budget);
+        }
+        Ok(())
+    }
+
     fn push_byte(&mut self, byte: u8) -> Result<(), EncodeError> {
         self.reserve(1)?;
         if let Some(output) = &mut self.output {
@@ -128,15 +160,18 @@ impl JsonSink<'_> {
         Ok(())
     }
 
-    pub(super) fn null(&mut self) -> Result<(), EncodeError> {
+    /// Encode JSON `null`.
+    pub fn null(&mut self) -> Result<(), EncodeError> {
         self.push_slice(b"null")
     }
 
-    pub(super) fn bool(&mut self, value: bool) -> Result<(), EncodeError> {
+    /// Encode a JSON boolean.
+    pub fn bool(&mut self, value: bool) -> Result<(), EncodeError> {
         self.push_slice(if value { b"true" } else { b"false" })
     }
 
-    pub(super) fn u64(&mut self, mut value: u64) -> Result<(), EncodeError> {
+    /// Encode an unsigned 64-bit integer.
+    pub fn u64(&mut self, mut value: u64) -> Result<(), EncodeError> {
         let mut buf = [0_u8; 20];
         let mut index = buf.len();
         loop {
@@ -152,14 +187,22 @@ impl JsonSink<'_> {
         self.push_slice(buf.get(index..).unwrap_or_default())
     }
 
-    pub(super) fn i64(&mut self, value: i64) -> Result<(), EncodeError> {
+    /// Encode a signed 64-bit integer.
+    pub fn i64(&mut self, value: i64) -> Result<(), EncodeError> {
         if value < 0 {
             self.push_byte(b'-')?;
         }
         self.u64(value.unsigned_abs())
     }
 
-    pub(super) fn str(&mut self, text: &str) -> Result<(), EncodeError> {
+    /// Encode a floating-point number using compact `jsoncpp` formatting.
+    pub fn f64(&mut self, value: f64) -> Result<(), EncodeError> {
+        let formatted = write_compact(&Value::Real(value));
+        self.push_slice(formatted.as_slice())
+    }
+
+    /// Encode a UTF-8 JSON string with `jsoncpp`-compatible escaping.
+    pub fn str(&mut self, text: &str) -> Result<(), EncodeError> {
         // Every UTF-8 byte encodes to at least one JSON byte, plus the surrounding quotes.
         if text.len().saturating_add(2) > self.left {
             return Err(EncodeError::Budget);
@@ -189,6 +232,14 @@ impl JsonSink<'_> {
             }
         }
         self.push_byte(b'"')
+    }
+
+    fn utf8_bytes(&mut self, raw: &[u8]) -> Result<(), EncodeError> {
+        if raw.len().saturating_add(2) > self.left {
+            return Err(EncodeError::Budget);
+        }
+        let text = core::str::from_utf8(raw).map_err(|_| EncodeError::InvalidUtf8)?;
+        self.str(text)
     }
 
     fn write_hex_escape(&mut self, point: u32) -> Result<(), EncodeError> {
@@ -278,7 +329,8 @@ impl JsonSink<'_> {
         Ok(())
     }
 
-    pub(super) fn object(
+    /// Encode a JSON object whose members are streamed in strictly sorted key order.
+    pub fn object(
         &mut self,
         write: impl FnOnce(&mut ObjectWriter<'_, '_>) -> Result<(), EncodeError>,
     ) -> Result<(), EncodeError> {
@@ -301,11 +353,13 @@ impl JsonSink<'_> {
         self.object(|obj| obj.field(name, write))
     }
 
-    pub(super) fn array<T>(
+    /// Encode a slice as a JSON array by streaming each element directly into this sink.
+    pub fn array<T>(
         &mut self,
         items: &[T],
         mut write: impl FnMut(&mut JsonSink<'_>, &T) -> Result<(), EncodeError>,
     ) -> Result<(), EncodeError> {
+        self.check_array_min(items.len())?;
         self.push_byte(b'[')?;
         for (index, item) in items.iter().enumerate() {
             if index != 0 {
@@ -316,7 +370,8 @@ impl JsonSink<'_> {
         self.push_byte(b']')
     }
 
-    pub(super) fn pair(
+    /// Encode a two-element JSON array.
+    pub fn pair(
         &mut self,
         first: impl FnOnce(&mut JsonSink<'_>) -> Result<(), EncodeError>,
         second: impl FnOnce(&mut JsonSink<'_>) -> Result<(), EncodeError>,
@@ -330,36 +385,16 @@ impl JsonSink<'_> {
 
     /// Encode an arbitrary [`Value`] compactly while enforcing the remaining budget and
     /// rejecting invalid UTF-8 strings or keys rather than corrupting them lossily.
-    pub(super) fn value(&mut self, value: &Value) -> Result<(), EncodeError> {
+    pub fn value(&mut self, value: &Value) -> Result<(), EncodeError> {
         match value {
             Value::Null => self.null(),
             Value::Bool(flag) => self.bool(*flag),
             Value::Int(number) => self.i64(*number),
             Value::UInt(number) => self.u64(*number),
-            Value::Real(_) => {
-                let formatted = write_compact(value);
-                self.push_slice(formatted.as_slice())
-            }
-            Value::String(text) => {
-                let text =
-                    core::str::from_utf8(text.as_slice()).map_err(|_| EncodeError::InvalidUtf8)?;
-                self.str(text)
-            }
+            Value::Real(number) => self.f64(*number),
+            Value::String(text) => self.utf8_bytes(text.as_slice()),
             Value::Array(items) => self.array(items, |sink, item| sink.value(item)),
-            Value::Object(members) => {
-                self.push_byte(b'{')?;
-                for (index, (key, member)) in members.iter().enumerate() {
-                    if index != 0 {
-                        self.push_byte(b',')?;
-                    }
-                    let key = core::str::from_utf8(key.as_slice())
-                        .map_err(|_| EncodeError::InvalidUtf8)?;
-                    self.str(key)?;
-                    self.push_byte(b':')?;
-                    self.value(member)?;
-                }
-                self.push_byte(b'}')
-            }
+            Value::Object(members) => members.encode(self),
         }
     }
 }
@@ -413,9 +448,39 @@ impl EncodeJson for usize {
     }
 }
 
+impl EncodeJson for i8 {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.i64(i64::from(*self))
+    }
+}
+
+impl EncodeJson for i16 {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.i64(i64::from(*self))
+    }
+}
+
+impl EncodeJson for i32 {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.i64(i64::from(*self))
+    }
+}
+
 impl EncodeJson for i64 {
     fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         sink.i64(*self)
+    }
+}
+
+impl EncodeJson for isize {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.i64(i64::try_from(*self).unwrap_or(if *self < 0 { i64::MIN } else { i64::MAX }))
+    }
+}
+
+impl EncodeJson for f64 {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.f64(*self)
     }
 }
 
@@ -431,7 +496,25 @@ impl EncodeJson for String {
     }
 }
 
+impl EncodeJson for BString {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.utf8_bytes(self.as_slice())
+    }
+}
+
+impl EncodeJson for Value {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.value(self)
+    }
+}
+
 impl<T: EncodeJson + ?Sized> EncodeJson for &T {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        (**self).encode(sink)
+    }
+}
+
+impl<T: EncodeJson + ?Sized> EncodeJson for Box<T> {
     fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         (**self).encode(sink)
     }
@@ -455,6 +538,58 @@ impl<T: EncodeJson> EncodeJson for [T] {
 impl<T: EncodeJson> EncodeJson for Vec<T> {
     fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         self.as_slice().encode(sink)
+    }
+}
+
+impl<T: EncodeJson, const N: usize> EncodeJson for [T; N] {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        self.as_slice().encode(sink)
+    }
+}
+
+impl<T: EncodeJson> EncodeJson for BTreeSet<T> {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.check_array_min(self.len())?;
+        sink.push_byte(b'[')?;
+        for (index, item) in self.iter().enumerate() {
+            if index != 0 {
+                sink.push_byte(b',')?;
+            }
+            item.encode(sink)?;
+        }
+        sink.push_byte(b']')
+    }
+}
+
+impl<T: EncodeJson> EncodeJson for BTreeMap<String, T> {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.check_object_min(self.len())?;
+        sink.push_byte(b'{')?;
+        for (index, (key, value)) in self.iter().enumerate() {
+            if index != 0 {
+                sink.push_byte(b',')?;
+            }
+            sink.str(key)?;
+            sink.push_byte(b':')?;
+            value.encode(sink)?;
+        }
+        sink.push_byte(b'}')
+    }
+}
+
+impl<T: EncodeJson> EncodeJson for BTreeMap<BString, T> {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.check_object_min(self.len())?;
+        sink.push_byte(b'{')?;
+        for (index, (key, value)) in self.iter().enumerate() {
+            if index != 0 {
+                sink.push_byte(b',')?;
+            }
+            sink.utf8_bytes(key.as_slice())?;
+            sink.push_byte(b':')?;
+            value.encode(sink)?;
+        }
+        sink.push_byte(b'}')
     }
 }
 
