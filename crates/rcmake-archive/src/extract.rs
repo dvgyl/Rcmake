@@ -865,7 +865,15 @@ impl<'a> Unpack<'a> {
                     payload.ok_or_else(|| ArchiveError::new("Missing staged archive entry"))?,
                     &path,
                 )?;
-                restore(host, &path, entry.mode, entry.mtime)?;
+                let mode = entry.mode.filter(|&mode| {
+                    cfg!(windows)
+                        || !host
+                            .metadata_fresh(&path, Follow::No)
+                            .is_ok_and(|metadata| {
+                                metadata.kind == FileKind::File && metadata.mode == mode & 0o777
+                            })
+                });
+                restore(host, &path, mode, entry.mtime)?;
                 if let Some(members) = &mut self.regular_members {
                     let metadata = host.metadata(&path, Follow::No)?;
                     members.insert(entry.path, (metadata.dev, metadata.ino));
@@ -932,7 +940,10 @@ impl<'a> Unpack<'a> {
         // Restore children first so a directory mode cannot prevent child writes.
         for (relative, &(mode, mtime)) in self.directories.iter().rev() {
             let path = self.checked_path(relative, false)?;
-            ensure_directory(self.host, &path, false)?;
+            let metadata = existing(self.host, &path)?
+                .filter(|metadata| metadata.kind == FileKind::Dir)
+                .ok_or_else(|| conflict(&path))?;
+            let mode = mode.filter(|&mode| metadata.mode != mode & 0o777);
             restore(self.host, &path, mode, mtime)?;
         }
         Ok(())
@@ -940,7 +951,7 @@ impl<'a> Unpack<'a> {
 }
 
 fn existing(host: &dyn Host, path: &Path) -> Result<Option<Metadata>, ArchiveError> {
-    match host.metadata(path, Follow::No) {
+    match host.metadata_fresh(path, Follow::No) {
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
