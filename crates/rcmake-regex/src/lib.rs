@@ -1,5 +1,5 @@
-//! Clean-room CMake 4.5.1 (KWSys / Henry-Spencer) byte regular expression engine
-//! and glob-to-regex converter (ADR-005).
+//! Clean-room CMake 4.5.1 byte regular expression engine and glob-to-regex
+//! converter (ADR-005).
 //!
 //! Key CMake 4.5.1 semantics:
 //! - Byte-oriented matching (`.` matches any single byte, including `\n`).
@@ -35,7 +35,7 @@ pub const MATCH_VAR_SLOTS: usize = 10;
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 #[error("{message}")]
 pub struct RegexError {
-    /// CMake / KWSys-compatible diagnostic text.
+    /// CMake 4.5.1-compatible diagnostic text.
     pub message: String,
 }
 

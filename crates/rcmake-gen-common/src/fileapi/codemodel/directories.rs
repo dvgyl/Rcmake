@@ -95,8 +95,8 @@ impl FileApi<'_, '_> {
             if has_install.get(id.index()) == Some(&true) {
                 reference.insert("hasInstallRule".into(), Bool(true));
             }
-            // `cmMakefile::GetDefinition("CMAKE_MINIMUM_REQUIRED_VERSION")` at the end of
-            // the directory: its final variable value, else the cache entry.
+            // Read `CMAKE_MINIMUM_REQUIRED_VERSION` at the end of the directory: final variable
+            // value first, then the cache entry.
             if let Some(minimum) = dir
                 .vars
                 .get(b"CMAKE_MINIMUM_REQUIRED_VERSION".as_slice())

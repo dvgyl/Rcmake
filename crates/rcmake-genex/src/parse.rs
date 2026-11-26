@@ -1,4 +1,4 @@
-//! Lexer and parser (`cmGeneratorExpressionLexer` and `cmGeneratorExpressionParser`).
+//! Lexer and parser for CMake 4.5.1 generator expressions (`$<...>`).
 
 use std::{collections::HashMap, sync::Arc};
 

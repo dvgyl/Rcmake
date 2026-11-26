@@ -1,11 +1,11 @@
-//! Configure-time helpers (`cmGeneratorExpression::Find`, `Preprocess`).
+//! Configure-time generator expression detection, stripping, and prefix rewriting.
 
 use rcmake_base::BString;
 
 use crate::parse::render;
 use crate::{GenexAst, GenexExpr, GenexNode};
 
-/// Which interface `strip` keeps (`cmGeneratorExpression::PreprocessContext`).
+/// Which interface (`BUILD_INTERFACE` or `INSTALL_INTERFACE`) [`strip`] keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PreprocessMode {
     /// Keep `$<BUILD_INTERFACE:...>` content, drop `$<INSTALL_INTERFACE:...>`.
@@ -14,7 +14,7 @@ pub enum PreprocessMode {
     Install,
 }
 
-/// Byte offset of the first `$<` in `input` (`cmGeneratorExpression::Find`).
+/// Byte offset of the first `$<` in `input`.
 #[must_use]
 pub fn find_genex(input: &[u8]) -> Option<usize> {
     input.windows(2).position(|w| w == b"$<")

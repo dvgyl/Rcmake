@@ -336,7 +336,7 @@ struct RecordedRoot {
     paths: Vec<PathBuf>,
 }
 
-/// Group the recorded components as `cmCPackArchiveGenerator` does. CPack reads each
+/// Group the recorded components according to `CPACK_COMPONENTS_GROUPING`. CPack reads each
 /// component from `<staging>/<component>` and adds its prefix to each recorded path.
 fn recorded_archives(
     cx: &PackageContext<'_>,

@@ -81,7 +81,7 @@ pub struct EvalSite {
     pub property: Option<BString>,
 }
 
-/// Evaluation context (`cmGeneratorExpressionContext`).
+/// Evaluation context for generator expressions.
 #[derive(Clone, Debug, Default)]
 pub struct EvalContext {
     /// Configuration being generated.
@@ -102,7 +102,7 @@ pub struct EvalContext {
     pub output_config: Option<ConfigId>,
     /// Usage walk kind for `$<TARGET_PROPERTY:...>` on `INTERFACE_*` properties.
     pub traversal: UsageTraversal,
-    /// Do not issue diagnostics (`cmGeneratorExpression::Quiet`).
+    /// Suppress diagnostics during evaluation.
     pub quiet: bool,
     /// Origin of the expression.
     pub site: EvalSite,
@@ -440,7 +440,7 @@ pub struct GenexExpr {
     pub params: Option<Vec<Vec<GenexNode>>>,
 }
 
-/// Evaluation failure (`cmGeneratorExpressionDAGChecker` and operator errors).
+/// Generator expression evaluation failure, including cycle and operator errors.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GenexError {
     /// Operator error with CMake's message text, for example `$<BOOL> expression

@@ -647,7 +647,7 @@ fn render_property(out: &mut BString, key: &[u8], value: &[u8], install: bool) {
     } else {
         start_property(out, key);
     }
-    // `cmExportFileGeneratorEscape` escapes every `$`, also in `$<...>`.
+    // Exported target properties escape every `$`, including `$<...>`.
     quote_export_content(out, value, install, false, true);
     out.extend_from_slice(b"\"\n");
 }

@@ -273,7 +273,7 @@ fn install_export_writes_relocatable_configuration_files() {
     assert!(main.contains("add_library(fmt::headers INTERFACE IMPORTED)"));
     assert!(main.contains("add_executable(fmt::tool IMPORTED)"));
     assert!(main.contains("${_IMPORT_PREFIX}/include;${_IMPORT_PREFIX}/include"));
-    // `cmExportFileGeneratorEscape` escapes every `$` of a generator expression.
+    // Exported target properties escape every `$` of a generator expression.
     assert!(main.contains(r"\$<\$<CONFIG:Release>:fmt::headers>"));
     assert!(main.contains("${CMAKE_CURRENT_LIST_DIR}/fmt-targets-*.cmake"));
     let no_config = read_text(&host, &out.join("fmt-targets-noconfig.cmake"));
