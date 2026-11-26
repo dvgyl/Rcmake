@@ -1,7 +1,6 @@
 use rcmake_base::{BString, list, shell::quote, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::ConfigId;
-use rcmake_host::{Host, Stream};
 use rcmake_model::{ProjectModel, Target, TargetKind};
 
 use super::{definition, target_property};
@@ -183,31 +182,25 @@ impl<'a> Flags<'a> {
     }
 }
 
-/// Report a `LINK_WHAT_YOU_USE` setting that CMake would apply.
-///
-/// CMake reads the property as a boolean and uses it only for executables,
-/// shared libraries, and module libraries. A value that is not true, such as
-/// `lwyu`, or another target kind gives no notice.
-pub(crate) fn warn_about_wrappers(model: &ProjectModel, host: &dyn Host) {
-    for (_, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
-        let linked = matches!(
-            target.kind,
-            TargetKind::Executable | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
-        );
-        if linked
-            && target
-                .props
-                .get(b"LINK_WHAT_YOU_USE")
-                .is_some_and(|value| truth::is_on(value))
-        {
-            host.write_out(
-                Stream::Stderr,
-                format!(
-                    "Rcmake Warning: target property LINK_WHAT_YOU_USE on target '{}' is not implemented yet\n",
-                    target.name,
-                )
-                .as_bytes(),
-            );
-        }
+/// Return the toolchain flag for an enabled unused-library check.
+pub(super) fn link_what_you_use<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+    language: &[u8],
+) -> Option<&'a BString> {
+    if !matches!(
+        target.kind,
+        TargetKind::Executable | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+    ) || !target
+        .props
+        .get(b"LINK_WHAT_YOU_USE")
+        .is_some_and(|value| truth::is_on(value))
+        || !model
+            .generator
+            .is_some_and(rcmake_model::GeneratorKind::is_make_or_ninja)
+    {
+        return None;
     }
+    let key = [b"CMAKE_".as_slice(), language, b"_LINK_WHAT_YOU_USE_FLAG"].concat();
+    definition(model, target.dir, &key).filter(|value| !value.is_empty())
 }

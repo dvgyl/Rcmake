@@ -399,6 +399,7 @@ impl<'a> ConfigureSession<'a> {
         interp.cx().project().generator = generator_kind;
         cache_setup::initialize_standard_cache(
             &mut interp.cx(),
+            host,
             generator,
             &generator_spec,
             &self.src,

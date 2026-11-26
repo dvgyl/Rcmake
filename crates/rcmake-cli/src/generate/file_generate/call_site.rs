@@ -1,5 +1,10 @@
 //! Generator expression host that reports the policies of a `file(GENERATE)` call.
 
+use rcmake_diag::{
+    DiagCategory, Diagnostic, Effect, Location, MessageKind, PolicyId, RenderOptions, render,
+};
+use rcmake_host::{Host, Stream};
+
 use rcmake_base::{BString, Limits};
 use rcmake_genex::{
     ArtifactKind, ArtifactPart, ConfigId, EvalContext, GenexError, GenexHost, InterfaceView,
@@ -13,6 +18,9 @@ use rcmake_genex::{
 pub(super) struct CallSitePolicies<'a> {
     pub(super) inner: &'a mut dyn GenexHost,
     pub(super) policies: &'a [(&'static [u8], bool)],
+    pub(super) host: &'a dyn Host,
+    pub(super) options: &'a RenderOptions,
+    pub(super) suppress_warnings: bool,
 }
 
 impl GenexHost for CallSitePolicies<'_> {
@@ -83,6 +91,38 @@ impl GenexHost for CallSitePolicies<'_> {
             .find(|(name, _)| *name == policy)
             .map(|(_, new)| *new)
             .or_else(|| self.inner.directory_policy(policy, ctx))
+    }
+
+    fn directory_policy_status(
+        &self,
+        policy: rcmake_diag::PolicyId,
+        ctx: &EvalContext,
+    ) -> Option<rcmake_diag::PolicyStatus> {
+        self.inner.directory_policy_status(policy, ctx)
+    }
+
+    fn policy_warning(&mut self, policy: PolicyId, detail: &[u8], ctx: &EvalContext) {
+        if self.suppress_warnings {
+            return;
+        }
+        let mut body: BString = policy.warning_text().into();
+        if !detail.is_empty() {
+            body.push(b'\n');
+            body.extend_from_slice(detail);
+        }
+        let text = render(
+            &Diagnostic {
+                annotations: None,
+                kind: MessageKind::AuthorWarning,
+                effect: Effect::None,
+                category: Some(DiagCategory::Policy),
+                policy: Some(policy),
+                location: Location::Backtrace(ctx.site.backtrace.clone()),
+                body,
+            },
+            self.options,
+        );
+        self.host.write_out(Stream::Stderr, &text);
     }
 
     fn raw_property(&self, target: TargetHandle, name: &[u8]) -> Option<BString> {

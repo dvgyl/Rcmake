@@ -85,7 +85,7 @@ impl PackageDiagnostic {
     }
 }
 
-struct Rejection {
+pub(super) struct Rejection {
     pub(super) reason: BString,
     pub(super) diagnostics: Vec<PackageDiagnostic>,
 }
@@ -110,7 +110,7 @@ impl Rejection {
 }
 
 impl Rejection {
-    fn fail(self, cx: &mut Cx<'_>) -> CmdError {
+    pub(super) fn fail(self, cx: &mut Cx<'_>) -> CmdError {
         for diagnostic in self.diagnostics {
             diagnostic.emit(cx);
         }

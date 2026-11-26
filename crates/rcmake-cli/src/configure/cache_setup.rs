@@ -84,6 +84,7 @@ fn is_cmake_script(name: &[u8]) -> bool {
 
 pub(super) fn initialize_standard_cache(
     cx: &mut Cx<'_>,
+    host: &dyn Host,
     generator: BString,
     spec: &GeneratorSpec,
     src: &Path,
@@ -166,6 +167,47 @@ pub(super) fn initialize_standard_cache(
     ] {
         let value = cx.var_or_empty(key);
         cache::insert_internal(cx.cache(), key, value, help);
+    }
+    initialize_cache_editor(cx, host);
+}
+
+fn initialize_cache_editor(cx: &mut Cx<'_>, host: &dyn Host) {
+    if !cx
+        .project()
+        .generator
+        .is_some_and(rcmake_model::GeneratorKind::is_make_or_ninja)
+        || cx.cache().contains(b"CMAKE_EDIT_COMMAND")
+    {
+        return;
+    }
+    // Detect companion tools during startup, outside the project input roots.
+    let executable = to_native(&cx.var_or_empty(b"CMAKE_COMMAND"));
+    let executable = host.canonicalize(&executable).unwrap_or(executable);
+    let Some(directory) = executable.parent() else {
+        return;
+    };
+    let names = if executable
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        ["ccmake.exe", "cmake-gui.exe"]
+    } else {
+        ["ccmake", "cmake-gui"]
+    };
+    if let Some(editor) = names
+        .into_iter()
+        .map(|name| directory.join(name))
+        .find(|file| {
+            host.metadata(file, Follow::Yes)
+                .is_ok_and(|metadata| metadata.kind == FileKind::File)
+        })
+    {
+        cache::insert_internal(
+            cx.cache(),
+            b"CMAKE_EDIT_COMMAND",
+            from_native_cmake(&editor),
+            "Path to cache edit program executable.",
+        );
     }
 }
 

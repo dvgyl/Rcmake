@@ -345,13 +345,52 @@ impl GenexHost for ModelGenexHost<'_, '_> {
     }
 
     fn directory_policy(&self, policy: &[u8], _ctx: &EvalContext) -> Option<bool> {
-        let policies = self
-            .resolver
-            .model
-            .dir(self.lookup_dir)
-            .final_policies
-            .as_ref()?;
-        Some(policies.get(PolicyId::parse(policy)?) == PolicyStatus::New)
+        self.directory_policy_status(PolicyId::parse(policy)?, _ctx)
+            .map(|status| status == PolicyStatus::New)
+    }
+
+    fn directory_policy_status(
+        &self,
+        policy: PolicyId,
+        _ctx: &EvalContext,
+    ) -> Option<PolicyStatus> {
+        Some(
+            self.resolver
+                .model
+                .dir(self.lookup_dir)
+                .final_policies
+                .as_ref()?
+                .get(policy),
+        )
+    }
+
+    fn policy_warning(&mut self, policy: PolicyId, detail: &[u8], ctx: &EvalContext) {
+        let Some(paths) = self.resolver.source_paths() else {
+            return;
+        };
+        let model = self.resolver.model;
+        if definition(model, self.lookup_dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+            .is_some_and(|value| truth::is_on(value))
+        {
+            return;
+        }
+        let mut body: BString = policy.warning_text().into();
+        if !detail.is_empty() {
+            body.push(b'\n');
+            body.extend_from_slice(detail);
+        }
+        if let Some(text) = paths.render_once(
+            model,
+            MessageKind::AuthorWarning,
+            Some(policy),
+            Location::Backtrace(ctx.site.backtrace.clone()),
+            body,
+        ) {
+            match &self.deferred_warnings {
+                Some(deferred) => deferred.borrow_mut().push(text),
+                None => paths.host.write_out(rcmake_host::Stream::Stderr, &text),
+            }
+        }
     }
 
     fn timestamp(&self, format: Option<&[u8]>, utc: bool) -> Option<BString> {

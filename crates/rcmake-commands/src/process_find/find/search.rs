@@ -318,7 +318,7 @@ impl<'a> Search<'a> {
         bundle_name.push(".app");
         let bundle = dir.join(bundle_name);
         let executable = bundle_executable(cx, &bundle, stem);
-        if !self.ignored.ignores_prefix(&executable) && candidate(cx, Kind::File, &executable) {
+        if !self.ignored.ignores_prefix(&executable) && file_metadata(cx, &executable).is_some() {
             self.match_path = Some(executable.clone());
             return Ok(Some(executable));
         }
@@ -792,6 +792,9 @@ fn bundle_executable(cx: &Cx<'_>, bundle: &Path, stem: &std::ffi::OsStr) -> Path
 }
 
 fn candidate(cx: &mut Cx<'_>, kind: Kind, path: &Path) -> bool {
+    if matches!(kind, Kind::Path | Kind::File) {
+        return cx.host().metadata(path, rcmake_host::Follow::Yes).is_ok();
+    }
     let Some(metadata) = file_metadata(cx, path) else {
         return false;
     };

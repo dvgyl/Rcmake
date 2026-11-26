@@ -269,7 +269,7 @@ pub(super) fn external_link_directories<'a>(
     model: &'a rcmake_model::ProjectModel,
     target: &'a rcmake_model::Target,
     libraries: &'a [BString],
-    implicit: &'a indexmap::IndexSet<BString>,
+    implicit: &'a super::link::rpath::ImplicitDirs<'a>,
 ) -> impl Iterator<Item = BString> + 'a {
     use rcmake_base::path_lex::Lexical;
     use rcmake_model::DirId;

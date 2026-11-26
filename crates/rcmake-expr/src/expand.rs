@@ -245,13 +245,13 @@ impl<'a> Scanner<'a, '_> {
             Mode::ListfileArgument | Mode::Template { file: true, .. }
         ) && let Some(path) = self.env.current_list_file().filter(|path| !path.is_empty())
         {
-            let mut body = b"Syntax error in cmake code at\n\n  ".to_vec();
+            let mut body = b"Syntax error in cmake code at\n  ".to_vec();
             body.extend_from_slice(&path);
             body.push(b':');
             body.extend_from_slice(self.line.to_string().as_bytes());
-            body.extend_from_slice(b"\n\nwhen parsing string\n\n  ");
+            body.extend_from_slice(b"\nwhen parsing string\n  ");
             body.extend_from_slice(self.source);
-            body.extend_from_slice(b"\n\n");
+            body.push(b'\n');
             body.extend_from_slice(&message);
             return error(body);
         }

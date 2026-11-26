@@ -23,7 +23,7 @@ pub(in crate::process_find) fn load(
     file: &Path,
     candidate: Candidate,
     request: &Request,
-) -> Result<CpsPackage, CmdError> {
+) -> Result<Result<CpsPackage, Rejection>, CmdError> {
     let active = cx.var_normal_only(ACTIVE);
     let files = active
         .iter()
@@ -190,10 +190,20 @@ pub(in crate::process_find) fn inspect(
 }
 
 impl Candidate {
-    fn load(self, cx: &mut Cx<'_>, file: &Path, request: &Request) -> Result<CpsPackage, CmdError> {
+    fn load(
+        self,
+        cx: &mut Cx<'_>,
+        file: &Path,
+        request: &Request,
+    ) -> Result<Result<CpsPackage, Rejection>, CmdError> {
         let mut root = self.root;
         if let Some((dependency, diagnostics)) = missing_dependency(cx, &root, request, true)? {
-            return Err(Rejection::dependency(&root, dependency, diagnostics, &[file]).fail(cx));
+            return Ok(Err(Rejection::dependency(
+                &root,
+                dependency,
+                diagnostics,
+                &[file],
+            )));
         }
         for appendix in self.appendices {
             let needed = appendix
@@ -205,19 +215,18 @@ impl Candidate {
                 missing_dependency(cx, &appendix.package, request, needed)?
             {
                 if needed {
-                    return Err(Rejection::dependency(
+                    return Ok(Err(Rejection::dependency(
                         &root,
                         dependency,
                         diagnostics,
                         &[&appendix.file, file],
-                    )
-                    .fail(cx));
+                    )));
                 }
                 continue;
             }
             merge(&mut root, &appendix).map_err(CmdError::status)?;
         }
-        Ok(root)
+        Ok(Ok(root))
     }
 }
 

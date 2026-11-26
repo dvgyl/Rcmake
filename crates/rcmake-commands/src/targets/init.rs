@@ -204,7 +204,9 @@ fn substitute_config(template: &str, config: &[u8]) -> BString {
 fn inherit_directory_usage(cx: &mut Cx<'_>, target: &mut Target) {
     let dir = cx.project().dir(target.dir);
     for field in UsageField::ALL {
+        // Generation adds the directory's compile definitions to the target's own definitions.
         if field.on_directory()
+            && field != UsageField::CompileDefinitions
             && let Some(entries) = dir.usage.fields.get(&field)
         {
             target.usage.fields.insert(field, entries.clone());

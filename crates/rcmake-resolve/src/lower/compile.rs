@@ -175,6 +175,9 @@ pub fn codemodel_compile_info(
 
 fn compile_argument(model: &ProjectModel, target: &Target, prefix: &[u8], value: &[u8]) -> BString {
     if super::shell::windows_host(model, target.dir) {
+        if prefix.ends_with(b" ") {
+            return [prefix, &quote(value)].concat().into();
+        }
         return quote(&[prefix, value].concat());
     }
     [prefix, &super::shell::cmake_posix_quote(value)]
@@ -331,21 +334,25 @@ pub(super) fn formatted_defines(
             definitions.dedup();
             definitions
         });
+    let define_key = [b"CMAKE_".as_slice(), &group.language, b"_DEFINE_FLAG"].concat();
+    let prefix = definition(model, target.dir, &define_key)
+        .filter(|flag| !flag.is_empty())
+        .map_or(b"-D".as_slice(), |flag| flag.as_slice());
     let intdir = (model.generator == Some(GeneratorKind::NinjaMultiConfig)).then(|| {
         let value = [b"CMAKE_INTDIR=\"".as_slice(), &config.0, b"\""].concat();
-        compile_argument(model, target, b"-D", &value)
+        compile_argument(model, target, prefix, &value)
     });
     let ninja_posix = model.generator.is_some_and(GeneratorKind::is_ninja)
         && !super::shell::windows_host(model, target.dir);
     join_words(intdir.into_iter().chain(defines.map(|define| {
         if ninja_posix && let Some(eq) = define.iter().position(|&byte| byte == b'=') {
             let (name, value) = define.split_at(eq + 1);
-            let prefix = compile_argument(model, target, b"-D", name);
+            let prefix = compile_argument(model, target, prefix, name);
             return [prefix.as_slice(), &super::shell::cmake_posix_quote(value)]
                 .concat()
                 .into();
         }
-        compile_argument(model, target, b"-D", define)
+        compile_argument(model, target, prefix, define)
     })))
 }
 

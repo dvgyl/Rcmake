@@ -1,6 +1,8 @@
 //! Runtime paths for link rules and installed executables and libraries.
 
-use std::collections::BTreeMap;
+use std::{cell::RefCell, collections::BTreeMap};
+
+use rcmake_host::{Host, path};
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
@@ -129,7 +131,12 @@ impl RuntimePaths {
         languages: &IndexSet<BString>,
         (libraries, usage): (&RuntimeLibraries, &mut UsageResolver<'_>),
     ) -> Result<Self, ResolveError> {
-        let implicit = implicit_directories(model, target, &step.language);
+        let implicit = implicit_directories(
+            model,
+            target,
+            &step.language,
+            usage.source_paths().map(|paths| paths.host),
+        );
         let mut paths = |installs, skip| {
             if on(model, target, b"CMAKE_SKIP_RPATH") || skip {
                 return Ok(IndexSet::new());
@@ -314,7 +321,12 @@ pub(super) fn runtime_libraries(
         link_language: Some(step.language.clone()),
         ..EvalContext::default()
     };
-    let implicit = implicit_directories(model, target, &step.language);
+    let implicit = implicit_directories(
+        model,
+        target,
+        &step.language,
+        usage.source_paths().map(|paths| paths.host),
+    );
     let dll = crate::lower::artifacts::is_dll_platform(model, target.dir);
     if !dll || runtime_setting(model, target, step, b"_FLAG").is_some() {
         result.user_dirs.extend(
@@ -516,11 +528,40 @@ fn rpath_link_flag<'a>(
         .map(|flag| flag.as_slice())
 }
 
-fn implicit_directories(
+pub(in crate::lower) struct ImplicitDirs<'a> {
+    host: Option<&'a dyn Host>,
+    paths: IndexSet<BString>,
+    canonical: IndexSet<BString>,
+    cache: RefCell<BTreeMap<BString, BString>>,
+}
+
+impl ImplicitDirs<'_> {
+    pub(in crate::lower) fn contains(&self, dir: &[u8]) -> bool {
+        let dir = super::super::without_trailing_slashes(dir);
+        self.paths.contains(dir)
+            || self.host.is_some_and(|host| {
+                let mut cache = self.cache.borrow_mut();
+                let real = cache
+                    .entry(dir.into())
+                    .or_insert_with(|| canonical_dir(host, dir));
+                self.canonical.contains(real.as_slice())
+            })
+    }
+}
+
+fn canonical_dir(host: &dyn Host, dir: &[u8]) -> BString {
+    host.canonicalize(&path::to_native(dir)).map_or_else(
+        |_| dir.into(),
+        |real| super::super::without_trailing_slashes(&path::from_native_cmake(&real)).into(),
+    )
+}
+
+fn implicit_directories<'a>(
     model: &ProjectModel,
     target: &Target,
     language: &[u8],
-) -> IndexSet<BString> {
+    host: Option<&'a dyn Host>,
+) -> ImplicitDirs<'a> {
     let platform = definition(
         model,
         target.dir,
@@ -535,11 +576,20 @@ fn implicit_directories(
     let multiarch = platform
         .iter()
         .filter_map(|dir| arch.map(|arch| join(dir, arch)));
-    multiarch
+    let paths: IndexSet<BString> = multiarch
         .chain(platform.iter().cloned())
         .chain(language)
         .map(|dir| super::super::without_trailing_slashes(&Lexical::new(&dir).normalize()).into())
-        .collect()
+        .collect();
+    let canonical = host.map_or_else(IndexSet::new, |host| {
+        paths.iter().map(|dir| canonical_dir(host, dir)).collect()
+    });
+    ImplicitDirs {
+        host,
+        paths,
+        canonical,
+        cache: RefCell::default(),
+    }
 }
 
 fn runtime_setting<'a>(
@@ -761,7 +811,7 @@ fn rpath_entries(
     libraries: &RuntimeLibraries,
     installs: bool,
     value: &[u8],
-    implicit: &IndexSet<BString>,
+    implicit: &ImplicitDirs<'_>,
 ) -> IndexSet<BString> {
     let mut paths: IndexSet<BString> = list::split(value, list::Empty::Drop).into_iter().collect();
     if !installs {
@@ -785,6 +835,11 @@ fn rpath_entries(
             {
                 return if relative == b"." {
                     "$ORIGIN".into()
+                } else if relative
+                    .split(|&byte| byte == b'/')
+                    .all(|part| part == b"..")
+                {
+                    [b"$ORIGIN/".as_slice(), &relative, b"/"].concat().into()
                 } else {
                     join(b"$ORIGIN", &relative)
                 };

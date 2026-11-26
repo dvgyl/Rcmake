@@ -114,7 +114,7 @@ impl<'a> Arguments<'a> {
                 "arguments"
             };
             let mut message = format!(
-                "{} given invalid {label}:\n",
+                "{} given invalid {label}:",
                 String::from_utf8_lossy(signature)
             );
             for (key, reason) in errors {

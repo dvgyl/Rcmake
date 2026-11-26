@@ -87,6 +87,8 @@ fn resolve_project(
     options: &ResolveOptions,
     collect_source_errors: bool,
 ) -> Result<GenerationResult, ResolveError> {
+    let includes = crate::usage::includes::finalize_current_dir_interfaces(model);
+    let model = includes.as_ref().unwrap_or(model);
     let output_sets = rule_output_sets::prepare(model)?;
     let model = output_sets.as_ref().unwrap_or(model);
     let rules = crate::target::instantiate_rules(model, host)?;
@@ -96,7 +98,6 @@ fn resolve_project(
     let model = strategies.as_ref().unwrap_or(model);
     intdir::warn_collisions(model, host);
     link_tags::validate(model, host)?;
-    lower::warn_about_wrappers(model, host);
     lower::custom::warn_depfile_policy(model, host);
     let configs = if configs.is_empty() {
         vec![ConfigId(

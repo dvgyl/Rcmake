@@ -13,7 +13,10 @@ pub(super) fn record(entry: &mut BTreeMap<BString, Value>, location: &Location) 
             let Some(top) = trace.top() else { return };
             let frames: Vec<_> = trace
                 .frames()
-                .filter(|frame| frame.line > 0 || frame.kind == FrameKind::Deferred)
+                .filter(|frame| {
+                    // The variable watch callback has no source line.
+                    (1..u32::MAX).contains(&frame.line) || frame.kind == FrameKind::Deferred
+                })
                 .map(|frame| Value::object_from([("location", frame_location(frame))]))
                 .collect();
             if !frames.is_empty() {

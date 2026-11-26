@@ -394,6 +394,7 @@ impl<'a> ConfigSearch<'a> {
         cx: &mut Cx<'_>,
         found_var: &[u8],
         matched: Option<ConfigMatch>,
+        dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
     ) -> Result<bool, CmdError> {
         let dir = cat(&[self.name, b"_DIR"]);
         let config = cat(&[self.name, b"_CONFIG"]);
@@ -452,8 +453,22 @@ impl<'a> ConfigSearch<'a> {
             if let Some(candidate) = found.cps {
                 cx.set_var(found_var, "1".into());
                 cx.set_var(&config, found.file.clone());
-                let package =
-                    cps_import::load(cx, &path::to_native(&found.file), *candidate, self.request)?;
+                let package = match cps_import::load(
+                    cx,
+                    &path::to_native(&found.file),
+                    *candidate,
+                    self.request,
+                )? {
+                    Ok(package) => package,
+                    Err(rejection) => {
+                        if let Some(diagnostics) = dependency {
+                            cx.set_var(found_var, "0".into());
+                            diagnostics.extend(rejection.diagnostics);
+                            return Ok(false);
+                        }
+                        return Err(rejection.fail(cx));
+                    }
+                };
                 cps_import::import(cx, &package, &found.file)?;
                 for (component, entry) in &package.components {
                     let supported = cps_import::target_kind(&entry.ty).is_some();

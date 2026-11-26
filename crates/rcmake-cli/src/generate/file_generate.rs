@@ -3,10 +3,7 @@ use std::collections::HashMap;
 use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
 
 use rcmake_base::{BString, truth};
-use rcmake_diag::{
-    Backtrace, Diagnostic, Effect, Frame, FrameKind, Location, MessageKind, PolicyStatus,
-    RenderOptions, format_paragraphs, render,
-};
+use rcmake_diag::{Backtrace, Frame, FrameKind, PolicyStatus, RenderOptions, format_paragraphs};
 use rcmake_gen_common::{
     GenError,
     export::{
@@ -135,6 +132,10 @@ fn generate(
     let timestamp = |format: Option<&[u8]>, utc| format_timestamp(host, format, utc);
     let mut condition_result: Option<BString> = None;
     let mut request_dir = None;
+    let diagnostic_options = RenderOptions {
+        relative_base: Some(root.clone()),
+        ..RenderOptions::default()
+    };
     let mut evaluate = |value: &[u8],
                         request: &FileGenerateRequest<'_>,
                         context: FileGenerateContext<'_>| {
@@ -165,6 +166,11 @@ fn generate(
         let mut genex_host = CallSitePolicies {
             inner: &mut genex_host,
             policies: &policies,
+            host,
+            options: &diagnostic_options,
+            suppress_warnings: model
+                .definition(*dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
+                .is_some_and(|value| truth::is_on(value)),
         };
         let ctx = EvalContext {
             config: ConfigId(context.configuration.into()),
@@ -259,62 +265,12 @@ fn generate(
 }
 
 fn expression_error(error: GenexError, backtrace: &Backtrace, root: &[u8]) -> GenError {
-    let message = if matches!(error, GenexError::Located(_)) && !backtrace.is_empty() {
-        rebase_expression_error(&error.to_string(), backtrace, root)
+    let message = error.at_call_site(backtrace, root).to_string();
+    if message.starts_with('\n') {
+        GenError::Invalid(message.into())
     } else {
-        error.at(backtrace, root).to_string().into()
-    };
-    if message.starts_with(b"\n") {
-        GenError::Invalid(message)
-    } else {
-        GenError::Invalid([b"\n".as_slice(), &message].concat().into())
+        GenError::Invalid(format!("\n{message}").into())
     }
-}
-
-fn rebase_expression_error(message: &str, backtrace: &Backtrace, root: &[u8]) -> BString {
-    // A nested property can report the location where its value was set.
-    // A file generation request reports the failure at its own call site.
-    let message = message.trim_start_matches('\n');
-    let mut result = BString::default();
-    let mut rest = Some(message);
-    while let Some(current) = rest {
-        let Some((_, body)) = current.split_once('\n') else {
-            return message.into();
-        };
-        let body = if let Some(offset) = body.find("\nCMake Error") {
-            let (block, trailing) = body.split_at(offset);
-            rest = trailing.strip_prefix('\n');
-            block
-        } else {
-            rest = None;
-            body
-        };
-        let body = body
-            .split_once("\nCall Stack (most recent call first):")
-            .map_or(body, |(body, _)| body);
-        let body = body
-            .trim_end()
-            .lines()
-            .map(|line| line.strip_prefix("  ").unwrap_or(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        result.extend_from_slice(&render(
-            &Diagnostic {
-                annotations: None,
-                kind: MessageKind::Error,
-                effect: Effect::SetError,
-                category: None,
-                policy: None,
-                location: Location::Backtrace(backtrace.clone()),
-                body: body.into(),
-            },
-            &RenderOptions {
-                relative_base: Some(root.into()),
-                ..Default::default()
-            },
-        ));
-    }
-    result
 }
 
 fn terminate_content(request: &FileGenerateRequest<'_>, mut content: BString) -> BString {

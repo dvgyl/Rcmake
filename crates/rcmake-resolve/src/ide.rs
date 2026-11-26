@@ -92,7 +92,7 @@ pub struct OutputNaming {
     pub soversion: Option<BString>,
 }
 
-pub use crate::lower::framework::{BundleKind, bundle_kind};
+pub use crate::lower::framework::{BundleKind, bundle_kind, platform_bundle_kind};
 
 /// The role of one file in an IDE project.
 #[derive(Clone, Debug, PartialEq, Eq)]

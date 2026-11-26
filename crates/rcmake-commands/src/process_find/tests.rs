@@ -1324,3 +1324,39 @@ endif()
     assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
     Ok(())
 }
+
+#[test]
+fn find_path_and_find_file_accept_directory_entries() -> HostResult<()> {
+    let (host, mut interp) = setup();
+    for directory in [
+        "/work/include/sub",
+        "/work/lib/libsub.so",
+        "/work/frameworks/Foo.framework/Headers/Inner",
+    ] {
+        host.create_dir_all(Path::new(directory))?;
+    }
+    for (name, value) in [
+        ("CMAKE_FIND_LIBRARY_PREFIXES", "lib"),
+        ("CMAKE_FIND_LIBRARY_SUFFIXES", ".so"),
+        ("CMAKE_FIND_FRAMEWORK", "FIRST"),
+    ] {
+        interp.cx().set_var(name.as_bytes(), value.into());
+    }
+    let script = r#"
+find_path(WITH_SLASH NAMES sub/ PATHS /work/include NO_DEFAULT_PATH)
+find_path(WITHOUT_SLASH NAMES sub PATHS /work/include NO_DEFAULT_PATH)
+find_file(DIRECTORY NAMES sub PATHS /work/include NO_DEFAULT_PATH)
+find_library(LIBRARY NAMES sub PATHS /work/lib NO_DEFAULT_PATH)
+find_path(FRAMEWORK NAMES Foo/Inner PATHS /work/frameworks NO_DEFAULT_PATH)
+"#;
+    assert_eq!(run(&host, &mut interp, script)?, 0);
+    assert_eq!(var(&mut interp, b"WITH_SLASH"), "/work/include");
+    assert_eq!(var(&mut interp, b"WITHOUT_SLASH"), "/work/include");
+    assert_eq!(var(&mut interp, b"DIRECTORY"), "/work/include/sub");
+    assert_eq!(var(&mut interp, b"LIBRARY"), "LIBRARY-NOTFOUND");
+    assert_eq!(
+        var(&mut interp, b"FRAMEWORK"),
+        "/work/frameworks/Foo.framework"
+    );
+    Ok(())
+}

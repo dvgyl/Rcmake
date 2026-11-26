@@ -11,9 +11,7 @@ use rcmake_base::{
 };
 use rcmake_host::{FileKind, ReadRange};
 
-use super::{
-    INPUTS, Parsed, Resolved, Result, Scan, apply_normalization, error, identity, native, warning,
-};
+use super::{INPUTS, Parsed, Resolved, Result, Scan, apply_normalization, error, identity, native};
 
 mod tool;
 
@@ -281,8 +279,10 @@ impl ElfScan {
                 continue;
             }
             if fallback {
-                warning(
-                    scan.cx,
+                scan.cx.issue(
+                    rcmake_diag::MessageKind::Warning,
+                    rcmake_diag::Effect::None,
+                    None,
                     [
                         b"Dependency ".as_slice(),
                         name,
@@ -290,7 +290,8 @@ impl ElfScan {
                         dir,
                         b"\nSee file(GET_RUNTIME_DEPENDENCIES) documentation for more information.",
                     ]
-                    .concat(),
+                    .concat()
+                    .into(),
                 );
                 return Ok(Some(path));
             }

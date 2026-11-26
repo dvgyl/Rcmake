@@ -511,6 +511,27 @@ fn top_level(
     }
     out.push(b'\n');
 
+    phony(&mut out, b"edit_cache", []);
+    out.push_str(b"\t$(SILENT)");
+    if let Some(model) = model
+        && let Some(editor) = model
+            .definition(DirId::ROOT, b"CMAKE_EDIT_COMMAND")
+            .filter(|editor| !editor.is_empty())
+    {
+        let root = model.dir(DirId::ROOT);
+        make_recipe_text(&mut out, &quote_always(editor))?;
+        for (option, dir) in [
+            (b" -S".as_slice(), &root.source_dir),
+            (b" -B", &root.binary_dir),
+        ] {
+            out.push_str(option);
+            make_recipe_text(&mut out, &quote_always(dir))?;
+        }
+        out.push(b'\n');
+    } else {
+        out.push_str(b"$(CMAKE_COMMAND) -E echo \"No interactive CMake dialog available.\"\n");
+    }
+
     let mut configure = b"$(CMAKE_COMMAND) -B .".to_vec();
     let listfiles = &result.metadata.listfiles;
     if let Some(source_dir) = listfiles.iter().find_map(|file| {

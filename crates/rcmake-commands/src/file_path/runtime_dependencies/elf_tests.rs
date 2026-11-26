@@ -303,13 +303,9 @@ fn system_order_machine_check_explicit_directories_and_environment() -> TestResu
         "/system1/arch.so;/explicit/fallback.so;/system2/order.so",
     );
     value(&mut interp, "missing", "environment.so");
-    assert_eq!(
-        host.stream_bytes(Stream::Stderr)
-            .to_string()
-            .matches("found in search directory")
-            .count(),
-        1
-    );
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert_eq!(stderr.matches("found in search directory").count(), 1);
+    assert!(stderr.contains("CMake Warning at "), "{stderr}");
     assert_ne!(
         run(
             &host,

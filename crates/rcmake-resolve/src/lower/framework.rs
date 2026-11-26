@@ -71,6 +71,15 @@ pub fn bundle_kind(target: &Target) -> BundleKind {
     }
 }
 
+/// Return the bundle layout that the target platform supports.
+pub fn platform_bundle_kind(model: &ProjectModel, target: &Target) -> BundleKind {
+    if super::is_darwin(model, target.dir) {
+        bundle_kind(target)
+    } else {
+        BundleKind::None
+    }
+}
+
 impl BundleKind {
     /// Return the bundle wrapper extension, without the leading dot.
     #[must_use]

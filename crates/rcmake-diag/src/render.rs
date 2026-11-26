@@ -2,7 +2,8 @@
 //!
 //! Empirically verified against pinned CMake 4.5.1:
 //! - Default line wrap width is **77 bytes** including the 2-space indent.
-//! - Blank lines keep their spacing. Lines that start with a space do not wrap.
+//! - Engine diagnostics use one blank line between paragraphs.
+//! - `message()` preserves explicit blank lines. Lines that start with a space do not wrap.
 //! - Prose uses one space between words and two after a word ending in a period.
 //! - Categorized developer warnings print `(author)`, `(deprecated)`, or `(policy)`
 //!   with the matching suppression footer followed by one blank line; other framed
@@ -137,7 +138,10 @@ pub fn render(diag: &Diagnostic, opts: &RenderOptions) -> BString {
 }
 
 fn format_diagnostic_body(diag: &Diagnostic, width: usize) -> BString {
-    format_paragraphs(diag.body.as_slice(), 2, width)
+    let from_message = matches!(&diag.location, Location::Backtrace(trace)
+        if trace.top().and_then(|frame| frame.name.as_deref())
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"message")));
+    format_body(&diag.body, 2, width, from_message)
 }
 
 /// Select the caller frames that `cmMessenger::PrintCallStack` prints. A frame
@@ -242,11 +246,18 @@ const fn is_error_kind(kind: MessageKind) -> bool {
 /// wrapping non-preformatted paragraphs to at most `width` bytes per line).
 #[must_use]
 pub fn format_paragraphs(text: &[u8], indent: usize, width: usize) -> BString {
+    format_body(text, indent, width, false)
+}
+
+fn format_body(text: &[u8], indent: usize, width: usize, preserve_blank_lines: bool) -> BString {
     let mut out = Vec::new();
     let mut previous_preformatted = false;
     for line in text.split_inclusive(|&byte| byte == b'\n') {
         let raw_line = line.strip_suffix(b"\n").unwrap_or(line);
         let has_newline = raw_line.len() != line.len();
+        if raw_line.is_empty() && !preserve_blank_lines {
+            continue;
+        }
         let preformatted = raw_line.starts_with(b" ");
         if !preformatted && previous_preformatted {
             out.push(b'\n');
@@ -405,10 +416,10 @@ mod tests {
     }
 
     #[test]
-    fn preserves_blank_lines_between_paragraphs() {
+    fn normalizes_blank_lines_between_engine_paragraphs() {
         assert_eq!(
             format_paragraphs(b"alpha\n\nbeta\n\n\ngamma", 2, 77),
-            "  alpha\n\n\n\n  beta\n\n\n\n\n\n  gamma\n"
+            "  alpha\n\n  beta\n\n  gamma\n"
         );
     }
 

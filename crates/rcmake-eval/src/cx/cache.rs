@@ -83,7 +83,18 @@ impl Cx<'_> {
                 advanced: false,
                 props: Default::default(),
             });
-        entry.value = value;
+        entry.value = if matches!(ty, CacheType::Path | CacheType::Filepath) {
+            let home = self.host().env_get(b"HOME");
+            list::join(
+                list::split(&value, list::Empty::Drop)
+                    .into_iter()
+                    .map(|path| {
+                        cache_path_slashes(&path, home.as_deref().map(|value| value.as_ref()))
+                    }),
+            )
+        } else {
+            value
+        };
         entry.ty = ty;
         entry.help = BString::from(help);
         entry.props.unset(Self::CACHE_PLACEHOLDER);
@@ -187,4 +198,32 @@ impl Cx<'_> {
     pub fn cache(&mut self) -> &mut Cache {
         &mut self.interp.project.cache
     }
+}
+
+fn cache_path_slashes(value: &[u8], home: Option<&[u8]>) -> BString {
+    let slash = |byte| matches!(byte, b'/' | b'\\');
+    let preserve_double = value.first().copied().is_some_and(slash)
+        && value.get(1).copied().is_some_and(slash)
+        && !value.get(2).copied().is_some_and(slash);
+    let mut path = BString::default();
+    for (index, &byte) in value.iter().enumerate() {
+        if !slash(byte) {
+            path.push(byte);
+        } else if !path.ends_with(b"/") || index == 1 && preserve_double {
+            path.push(b'/');
+        }
+    }
+    if let Some(home) = home
+        && (path == b"~" || path.starts_with(b"~/"))
+    {
+        path = [home, path.get(1..).unwrap_or_default()].concat().into();
+    }
+    if path.len() > 1
+        && path.ends_with(b"/")
+        && !path.ends_with(b"//")
+        && !(path.len() == 3 && path.get(1) == Some(&b':'))
+    {
+        path.pop();
+    }
+    path
 }

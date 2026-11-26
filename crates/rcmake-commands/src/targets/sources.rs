@@ -87,20 +87,8 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 if scope != UsageScope::Interface {
                     let direct = value(different_dir);
                     if !direct.is_empty() {
-                        target.sources.push(BT::new(direct.clone(), bt.clone()));
-                        let target_dir_id = target.dir;
-                        for item in list::split(&direct, list::Empty::Drop) {
-                            if !item.windows(2).any(|w| w == b"$<")
-                                && Lexical::new(&item).absolute()
-                            {
-                                let normalized = Lexical::new(&item).normalize();
-                                cx.project()
-                                    .dir_mut(target_dir_id)
-                                    .source_props
-                                    .entry(normalized)
-                                    .or_default();
-                            }
-                        }
+                        // Store the source list. Generation resolves the source locations.
+                        target.sources.push(BT::new(direct, bt.clone()));
                     }
                 }
                 if scope != UsageScope::Private {

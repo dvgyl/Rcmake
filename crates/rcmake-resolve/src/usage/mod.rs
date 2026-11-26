@@ -30,7 +30,7 @@ mod compatible;
 mod debug;
 mod entries;
 mod host;
-mod includes;
+pub(crate) mod includes;
 mod link;
 pub(crate) mod link_options;
 pub(crate) mod paths;

@@ -68,9 +68,15 @@ impl Evaluator<'_> {
                 };
                 if path.is_empty() {
                     self.flags.context_sensitive = true;
-                    return Ok(boolean(
-                        self.host.directory_policy(b"CMP0223", call.ctx) == Some(false),
-                    ));
+                    let policy = rcmake_diag::PolicyId::new(223);
+                    let status = self.host.directory_policy_status(policy, call.ctx);
+                    if status == Some(rcmake_diag::PolicyStatus::Warn) {
+                        self.host.policy_warning(policy, b"", call.ctx);
+                    }
+                    return Ok(boolean(matches!(
+                        status,
+                        Some(rcmake_diag::PolicyStatus::Old | rcmake_diag::PolicyStatus::Warn)
+                    )));
                 }
                 return Ok(boolean(if option {
                     Lexical::new(&lexical.normalize())

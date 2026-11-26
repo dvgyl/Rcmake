@@ -1,18 +1,27 @@
 //! `compile_commands.json` (`CMAKE_EXPORT_COMPILE_COMMANDS`).
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use rcmake_base::{BString, path_lex::Lexical, shell::quote};
 use rcmake_host::{Host, path::from_native};
 use rcmake_json::{Value, write_styled};
-use rcmake_model::GeneratorKind;
+use rcmake_model::{GeneratorKind, TargetId};
 use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult};
 
 use crate::{GenError, write_if_changed};
 
 /// Render `compile_commands.json` for one build graph.
 pub fn render(graph: &BuildGraph, build_dir: &[u8]) -> Result<BString, GenError> {
-    render_with_directories(std::iter::once(graph), build_dir, &HashMap::new(), false)
+    render_with_directories(
+        std::iter::once(graph),
+        build_dir,
+        &HashMap::new(),
+        false,
+        None,
+    )
 }
 
 /// Render `compile_commands.json` with the selected generator's path conventions.
@@ -25,11 +34,48 @@ pub fn render_for_generator(
     build_dir: &[u8],
     generator: GeneratorKind,
 ) -> Result<BString, GenError> {
+    render_selected(result, graph, build_dir, generator, None)
+}
+
+/// Render the compile database with commands from the selected targets.
+/// With no selection, include every compile step.
+pub fn render_selected(
+    result: &GenerationResult,
+    graph: &BuildGraph,
+    build_dir: &[u8],
+    generator: GeneratorKind,
+    selection: Option<&HashSet<TargetId>>,
+) -> Result<BString, GenError> {
+    let objects = selection.map(|selection| {
+        result
+            .targets
+            .iter()
+            .filter(|target| selection.contains(&target.id))
+            .flat_map(|target| {
+                target
+                    .compile_units
+                    .iter()
+                    .map(|unit| unit.object.as_slice())
+            })
+            .collect()
+    });
     if generator == GeneratorKind::NinjaMultiConfig {
-        return render_with_directories(&result.graphs, build_dir, &HashMap::new(), true);
+        return render_with_directories(
+            &result.graphs,
+            build_dir,
+            &HashMap::new(),
+            true,
+            objects.as_ref(),
+        );
     }
     if generator != GeneratorKind::UnixMakefiles {
-        return render_with_directories(std::iter::once(graph), build_dir, &HashMap::new(), true);
+        return render_with_directories(
+            std::iter::once(graph),
+            build_dir,
+            &HashMap::new(),
+            true,
+            objects.as_ref(),
+        );
     }
 
     let directories = result
@@ -45,7 +91,13 @@ pub fn render_for_generator(
             })
         })
         .collect();
-    render_with_directories(std::iter::once(graph), build_dir, &directories, false)
+    render_with_directories(
+        std::iter::once(graph),
+        build_dir,
+        &directories,
+        false,
+        objects.as_ref(),
+    )
 }
 
 fn render_with_directories<'a>(
@@ -53,6 +105,7 @@ fn render_with_directories<'a>(
     build_dir: &[u8],
     directories: &HashMap<&[u8], &[u8]>,
     ninja_style: bool,
+    objects: Option<&HashSet<&[u8]>>,
 ) -> Result<BString, GenError> {
     let mut out = BString::from("[");
     let mut separator = b"\n".as_slice();
@@ -66,6 +119,9 @@ fn render_with_directories<'a>(
         else {
             continue;
         };
+        if objects.is_some_and(|objects| !objects.contains(object.as_slice())) {
+            continue;
+        }
         let shell = compiler_shell(&invocation.shell);
         out.extend_from_slice(separator);
         separator = b",\n";

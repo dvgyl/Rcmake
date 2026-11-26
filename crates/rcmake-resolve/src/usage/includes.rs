@@ -167,3 +167,49 @@ impl UsageResolver<'_> {
         Ok(includes.into_iter().map(|(include, _)| include).collect())
     }
 }
+
+pub(crate) fn finalize_current_dir_interfaces(
+    model: &rcmake_model::ProjectModel,
+) -> Option<rcmake_model::ProjectModel> {
+    use rcmake_model::TargetKind;
+
+    let mut targets = model
+        .targets()
+        .filter(|(_, target)| {
+            !target.is_imported()
+                && (matches!(
+                    target.kind,
+                    TargetKind::SharedLibrary
+                        | TargetKind::StaticLibrary
+                        | TargetKind::ModuleLibrary
+                        | TargetKind::InterfaceLibrary
+                ) || target.kind == TargetKind::Executable
+                    && target
+                        .props
+                        .get(b"ENABLE_EXPORTS")
+                        .is_some_and(|value| truth::is_on(value)))
+                && definition(model, target.dir, b"CMAKE_INCLUDE_CURRENT_DIR_IN_INTERFACE")
+                    .is_some_and(|value| truth::is_on(value))
+        })
+        .peekable();
+    targets.peek()?;
+    let mut result = model.clone();
+    for (id, target) in targets {
+        let dir = model.dir(target.dir);
+        let includes = [
+            b"$<BUILD_INTERFACE:".as_slice(),
+            &dir.binary_dir,
+            b";",
+            &dir.source_dir,
+            b">",
+        ]
+        .concat();
+        if let Some(target) = result.target_mut(id) {
+            target.usage.push(
+                UsageField::InterfaceIncludeDirectories,
+                BT::new(includes.into(), Default::default()),
+            );
+        }
+    }
+    Some(result)
+}

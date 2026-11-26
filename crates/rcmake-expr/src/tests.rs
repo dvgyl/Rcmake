@@ -368,8 +368,8 @@ fn listfile_expansion_errors_include_the_source_and_argument() {
     assert!(out.is_empty());
     assert_eq!(
         error.message,
-        "Syntax error in cmake code at\n\n  /work/check.cmake:3\n\n\
-         when parsing string\n\n  a\n\\z\n\nInvalid character escape '\\z'."
+        "Syntax error in cmake code at\n  /work/check.cmake:3\n\
+         when parsing string\n  a\n\\z\nInvalid character escape '\\z'."
     );
 }
 

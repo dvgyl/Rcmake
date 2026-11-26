@@ -416,7 +416,16 @@ fn search(
                 .selected(found.file.clone(), found.mode(), found.version.clone());
         }
         let config_file = matched.as_ref().map(|found| found.file.clone());
-        let found = config.load(cx, found_var, matched)?;
+        let diagnostic_count = dependency
+            .as_ref()
+            .map_or(0, |diagnostics| diagnostics.len());
+        let found = config.load(cx, found_var, matched, dependency.as_deref_mut())?;
+        if dependency
+            .as_ref()
+            .is_some_and(|diagnostics| diagnostics.len() > diagnostic_count)
+        {
+            return Ok(false);
+        }
         if !found
             && try_module
             && prefer_config

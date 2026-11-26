@@ -357,6 +357,10 @@ pub(super) fn link(
         flags.extend(policy.pie_link(position_independent));
         flags.extend(policy.link(ipo));
     }
+    let lwyu = super::policy_flags::link_what_you_use(model, target, language);
+    if let Some(flag) = lwyu {
+        flags.push(wrapper.argument(flag)?);
+    }
     let depfile = ninja_link_depfile(model, target, config, kind, language);
     if let Some((path, depfile_flags)) = &depfile {
         flags.extend(wrapper.depfile_flags(depfile_flags, path)?);
@@ -457,7 +461,9 @@ pub(super) fn link(
             }
         })
     });
-    let install_name_dir = if darwin && soname.is_some() {
+    let has_install_name = definition(model, target.dir, b"CMAKE_PLATFORM_HAS_INSTALLNAME")
+        .map_or(darwin, |value| truth::is_on(value));
+    let install_name_dir = if has_install_name && soname.is_some() {
         install_name_prefix(model, target, artifacts, config, None)?
     } else {
         BString::default()
@@ -802,6 +808,21 @@ pub(super) fn link(
         if let Some((original, response)) = annotated {
             response::rebase(invocation, &original, response);
         }
+    }
+    if lwyu.is_some()
+        && let Some(check) = definition(model, target.dir, b"CMAKE_LINK_WHAT_YOU_USE_CHECK")
+            .filter(|check| !check.is_empty())
+    {
+        invocations.push(direct(
+            vec![
+                cmake(),
+                "-E".into(),
+                "__run_co_compile".into(),
+                [b"--lwyu=".as_slice(), check].concat().into(),
+                [b"--source=".as_slice(), &step.output].concat().into(),
+            ],
+            None,
+        ));
     }
     if kind == LinkKind::SharedLibrary
         && let (Some(file), Some(soname), Some(linker)) = (

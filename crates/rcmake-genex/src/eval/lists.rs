@@ -57,11 +57,27 @@ impl Evaluator<'_> {
                 let [value, input] = self.fixed(call)?;
                 // CMP0085: the OLD behavior never finds an empty item. The NEW
                 // behavior keeps empty items, so an empty list has one item.
-                if self.host.directory_policy(b"CMP0085", call.ctx) == Some(false) {
-                    return Ok(boolean(
-                        !value.is_empty()
-                            && list::split(&input, list::Empty::Keep).contains(&value),
-                    ));
+                let policy = rcmake_diag::PolicyId::new(85);
+                let status = self.host.directory_policy_status(policy, call.ctx);
+                if matches!(
+                    status,
+                    Some(rcmake_diag::PolicyStatus::Old | rcmake_diag::PolicyStatus::Warn)
+                ) {
+                    self.flags.context_sensitive = true;
+                    let items = list::split(&input, list::Empty::Drop);
+                    if status == Some(rcmake_diag::PolicyStatus::Warn)
+                        && value.is_empty()
+                        && (input.is_empty() || items != list::split(&input, list::Empty::Keep))
+                    {
+                        let detail = [
+                            b"Search Item:\n  \"\"\nList:\n  \"".as_slice(),
+                            &input,
+                            b"\"\n",
+                        ]
+                        .concat();
+                        self.host.policy_warning(policy, &detail, call.ctx);
+                    }
+                    return Ok(boolean(items.contains(&value)));
                 }
                 let found = if input.is_empty() {
                     value.is_empty()

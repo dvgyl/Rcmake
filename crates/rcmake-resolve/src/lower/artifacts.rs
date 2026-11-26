@@ -20,6 +20,26 @@ pub(crate) fn is_dll_platform(model: &ProjectModel, dir: DirId) -> bool {
     )
 }
 
+fn imported_linker_file(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+) -> Option<BString> {
+    let property = |name| {
+        crate::usage::artifacts::imported_property(target, name, config).map(|(file, _)| file)
+    };
+    let file = property(b"IMPORTED_LOCATION");
+    let import = property(b"IMPORTED_IMPLIB");
+    if is_dll_platform(model, target.dir)
+        || is_darwin(model, target.dir)
+            && import.as_ref().is_some_and(|path| path.ends_with(b".tbd"))
+    {
+        import.or(file)
+    } else {
+        file.or(import)
+    }
+}
+
 pub(crate) fn is_msvc(model: &ProjectModel, dir: DirId, language: &[u8]) -> bool {
     [b"_COMPILER_ID".as_slice(), b"_COMPILER_FRONTEND_VARIANT"]
         .into_iter()
@@ -178,7 +198,7 @@ pub fn compute_artifacts(model: &ProjectModel, target: &Target, config: &ConfigI
         let file = imported_property(target, b"IMPORTED_LOCATION", config).cloned();
         let import_file = imported_property(target, b"IMPORTED_IMPLIB", config).cloned();
         return ArtifactSet {
-            linker_file: import_file.clone().or_else(|| file.clone()),
+            linker_file: imported_linker_file(model, target, config),
             file,
             import_file,
             ..ArtifactSet::default()

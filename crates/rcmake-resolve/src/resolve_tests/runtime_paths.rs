@@ -634,3 +634,80 @@ fn private_raw_shared_library_does_not_add_consumer_runtime_paths() -> TestResul
     assert!(!app.contains("/opt/x/lib"), "{app}");
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn elf_runtime_paths_filter_implicit_symlinks_and_keep_origin_ancestor_slash() -> TestResult {
+    let (mut model, host) = fixture("Linux")?;
+    for (name, value) in [
+        ("CMAKE_EXECUTABLE_FORMAT", "ELF"),
+        ("CMAKE_EXECUTABLE_RUNTIME_C_FLAG", "-Wl,-rpath,"),
+        ("CMAKE_EXECUTABLE_RUNTIME_C_FLAG_SEP", ":"),
+        ("CMAKE_C_IMPLICIT_LINK_DIRECTORIES", "/work/build/lib"),
+    ] {
+        model.global.props.set(name.into(), value.into());
+    }
+    host.create_dir_all(Path::new("/work/build/lib"))?;
+    host.symlink(Path::new("lib"), Path::new("/work/build/libLink"))?;
+    host.symlink(Path::new("lib"), Path::new("/work/build/libAlways"))?;
+
+    let mut implicit = target("implicit", TargetKind::SharedLibrary, &["lib.c"]);
+    implicit
+        .props
+        .set("LIBRARY_OUTPUT_DIRECTORY".into(), "libLink".into());
+    model.add_target(implicit)?;
+    model.add_target(target("driver", TargetKind::SharedLibrary, &["lib.c"]))?;
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    app.usage.link_libraries = Some(vec![link_item("implicit"), link_item("driver")]);
+    for (name, value) in [
+        ("RUNTIME_OUTPUT_DIRECTORY", "bin"),
+        ("BUILD_RPATH", "/work/build/libAlways"),
+        ("BUILD_RPATH_USE_ORIGIN", "ON"),
+    ] {
+        app.props.set(name.into(), value.into());
+    }
+    model.add_target(app)?;
+
+    let result = resolve(&model, &host, &[])?;
+    let link = recipe(&result, b"app")?;
+    assert!(link.contains("/work/build/libAlways:$ORIGIN/../"), "{link}");
+    assert!(!link.contains("$ORIGIN/../libLink"), "{link}");
+    Ok(())
+}
+
+#[test]
+fn link_what_you_use_adds_the_flag_and_check_for_ninja_and_make() -> TestResult {
+    for generator in [GeneratorKind::Ninja, GeneratorKind::UnixMakefiles] {
+        let (mut model, host) = fixture("Linux")?;
+        model.generator = Some(generator);
+        for (name, value) in [
+            ("CMAKE_C_LINK_WHAT_YOU_USE_FLAG", "-Wl,--no-as-needed"),
+            ("CMAKE_LINK_WHAT_YOU_USE_CHECK", "ldd;-u;-r"),
+        ] {
+            model.global.props.set(name.into(), value.into());
+        }
+        let mut app = target("app", TargetKind::Executable, &["main.c"]);
+        app.props.set("LINK_WHAT_YOU_USE".into(), "ON".into());
+        model.add_target(app)?;
+        let result = resolve(&model, &host, &[])?;
+        let link = recipe(&result, b"app")?;
+        assert!(link.contains("-Wl,--no-as-needed"), "{link}");
+        let check = result
+            .graphs
+            .iter()
+            .flat_map(|graph| &graph.steps)
+            .find_map(|step| {
+                if let BuildStep::Link { invocations, .. } = step {
+                    invocations.iter().find(|invocation| {
+                        invocation.argv.iter().any(|arg| arg == "__run_co_compile")
+                    })
+                } else {
+                    None
+                }
+            })
+            .ok_or("Missing unused-library check.")?;
+        assert!(check.argv.iter().any(|arg| arg == "--lwyu=ldd;-u;-r"));
+        assert!(check.argv.iter().any(|arg| arg == "--source=app"));
+    }
+    Ok(())
+}

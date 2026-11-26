@@ -259,6 +259,31 @@ pub trait GenexHost {
         None
     }
 
+    /// Return the full policy status for a compatibility check.
+    fn directory_policy_status(
+        &self,
+        policy: rcmake_diag::PolicyId,
+        ctx: &EvalContext,
+    ) -> Option<rcmake_diag::PolicyStatus> {
+        self.directory_policy(policy.to_string().as_bytes(), ctx)
+            .map(|new| {
+                if new {
+                    rcmake_diag::PolicyStatus::New
+                } else {
+                    rcmake_diag::PolicyStatus::Old
+                }
+            })
+    }
+
+    /// Report a policy warning at the expression's call site.
+    fn policy_warning(
+        &mut self,
+        _policy: rcmake_diag::PolicyId,
+        _detail: &[u8],
+        _ctx: &EvalContext,
+    ) {
+    }
+
     /// Raw (unevaluated) value of a non-transitive property.
     fn raw_property(&self, target: TargetHandle, name: &[u8]) -> Option<BString>;
 
@@ -591,6 +616,19 @@ impl GenexError {
             return self;
         }
         self.with_site(backtrace, source_root)
+    }
+
+    /// Report the error at the expression's call site.
+    #[must_use]
+    pub fn at_call_site(self, backtrace: &Backtrace, source_root: &[u8]) -> Self {
+        match self {
+            Self::Located(mut diagnostic) if !backtrace.is_empty() => {
+                diagnostic.frames = directory_frames(backtrace);
+                diagnostic.source_root = source_root.into();
+                Self::Located(diagnostic)
+            }
+            error => error.at(backtrace, source_root),
+        }
     }
 
     /// Format a diagnostic that has no source location.

@@ -581,15 +581,35 @@ fn write_common(
         common::write_if_changed(host, &log_path, &content)?;
     }
 
-    let export_commands = interp.cx().var_is_on(b"CMAKE_EXPORT_COMPILE_COMMANDS");
-    if export_commands
+    let export_commands: std::collections::HashSet<_> = interp
+        .cx()
+        .project()
+        .targets()
+        .filter_map(|(id, target)| {
+            target
+                .props
+                .get(b"EXPORT_COMPILE_COMMANDS")
+                .is_some_and(|value| rcmake_base::truth::is_on(value))
+                .then_some(id)
+        })
+        .collect();
+    if result
+        .targets
+        .iter()
+        .any(|target| export_commands.contains(&target.id) && !target.compile_units.is_empty())
         && !generator.is_ide()
         && let Some(graph) = result.graphs.first()
     {
         write(
             host,
             &bin.join("compile_commands.json"),
-            common::compile_commands::render_for_generator(result, graph, &binary_dir, generator),
+            common::compile_commands::render_selected(
+                result,
+                graph,
+                &binary_dir,
+                generator,
+                Some(&export_commands),
+            ),
         )?;
     }
     let testing = interp.cx().var_is_on(b"CMAKE_TESTING_ENABLED");

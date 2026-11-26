@@ -222,9 +222,9 @@ fn invalid_arguments(missing: BTreeSet<&[u8]>, targets: BTreeSet<&[u8]>) -> CmdE
         );
     }
     let mut body = BString::from(if errors.len() == 1 {
-        "given invalid argument:\n"
+        "given invalid argument:"
     } else {
-        "given invalid arguments:\n"
+        "given invalid arguments:"
     });
     for (key, messages) in errors {
         for message in messages {

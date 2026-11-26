@@ -569,7 +569,11 @@ fn append_link_item(
                 ));
                 return;
             }
-            let path = if let Some(target) = resolved.get(id) {
+            let path = if let Some(imported) =
+                model.target(*id).filter(|target| target.is_imported())
+            {
+                lower::compute_artifacts(model, imported, config).linker_file
+            } else if let Some(target) = resolved.get(id) {
                 target
                     .artifacts
                     .import_file

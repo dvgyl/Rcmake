@@ -393,9 +393,10 @@ impl FileApi<'_, '_> {
 
         let artifacts = &target.artifacts;
         let framework = raw.is_some_and(|raw| {
-            raw.props
-                .get(b"FRAMEWORK")
-                .is_some_and(|value| is_on(value))
+            matches!(
+                rcmake_resolve::ide::platform_bundle_kind(self.model, raw),
+                rcmake_resolve::ide::BundleKind::Framework { .. }
+            )
         });
         let main = if framework
             || metadata.kind == TargetKind::SharedLibrary
