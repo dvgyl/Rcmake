@@ -1,4 +1,5 @@
 use rcmake_diag::PolicyMap;
+use rcmake_genex::GenexError;
 use rcmake_host::Stream;
 use rcmake_model::GeneratorKind;
 
@@ -219,5 +220,166 @@ fn parallel_cross_target_once_only_diagnostics_deduplicate_deterministically() -
         .find("unique_missing.c")
         .ok_or("missing unique_missing.c diagnostic")?;
     assert!(first < second, "{parallel_stderr}");
+    Ok(())
+}
+
+/// Build a linear chain `lib0 <- lib1 <- ... <- lib{len-1}` in the given
+/// declaration order and check that parallel resolution matches serial.
+fn assert_deep_chain_resolves(len: usize, reverse: bool) -> TestResult {
+    let mut model = project();
+    model.generator = Some(GeneratorKind::Ninja);
+    let mut files = Vec::new();
+    let mut order: Vec<usize> = (0..len).collect();
+    if reverse {
+        order.reverse();
+    }
+    for i in order {
+        let source = format!("lib{i}.c");
+        files.push(format!("/src/{source}"));
+        let mut raw = target(&format!("lib{i}"), TargetKind::StaticLibrary, &[&source]);
+        raw.usage.push(
+            UsageField::InterfaceIncludeDirectories,
+            entry(&format!("/src/include{i}")),
+        );
+        raw.usage.push(
+            UsageField::InterfaceCompileDefinitions,
+            entry(&format!("LIB{i}")),
+        );
+        if i > 0 {
+            let links = vec![link_item(&format!("lib{}", i - 1))];
+            raw.usage.interface_link_libraries = Some(links.clone());
+            raw.usage.link_libraries = Some(links);
+        }
+        model.add_target(raw)?;
+    }
+    let make_host = || -> Result<PureHost, Box<dyn std::error::Error>> {
+        let host = PureHost::default();
+        for file in &files {
+            host.seed_file(Path::new(file), b"int f(void) { return 0; }\n")?;
+        }
+        Ok(host)
+    };
+    let serial_host = make_host()?;
+    let parallel_host = make_host()?;
+    let configs = [ConfigId("Release".into())];
+    let options = ResolveOptions::default();
+    let serial =
+        crate::pipeline::resolve_with_workers(&model, &serial_host, &configs, &options, true, 1)?;
+    let parallel =
+        crate::pipeline::resolve_with_workers(&model, &parallel_host, &configs, &options, true, 4)?;
+    assert_eq!(serial.compile_inputs, parallel.compile_inputs);
+    assert_eq!(
+        format!("{:?}", serial.targets),
+        format!("{:?}", parallel.targets)
+    );
+    let top = format!("{:?}", parallel.targets);
+    assert!(
+        top.contains("/src/include0"),
+        "lib0 usage must reach the chain"
+    );
+    assert_eq!(
+        serial_host.stream_bytes(Stream::Stderr),
+        parallel_host.stream_bytes(Stream::Stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn parallel_resolution_handles_500_target_chain_in_forward_order() -> TestResult {
+    assert_deep_chain_resolves(500, false)
+}
+
+#[test]
+fn parallel_resolution_handles_500_target_chain_in_reverse_order() -> TestResult {
+    assert_deep_chain_resolves(500, true)
+}
+
+#[test]
+fn parallel_resolution_still_rejects_deep_target_property_nesting() -> TestResult {
+    // Each nested property read uses more stack than a default test thread has
+    // for 256 levels, so run the check on a thread with a large stack.
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(|| deep_target_property_nesting().map_err(|error| error.to_string()))?
+        .join()
+        .map_err(|_| "nesting check panicked")??;
+    Ok(())
+}
+
+fn deep_target_property_nesting() -> TestResult {
+    let mut model = project();
+    model.generator = Some(GeneratorKind::Ninja);
+    let mut consumer = target("consumer", TargetKind::StaticLibrary, &["consumer.c"]);
+    consumer.usage.link_libraries = Some(vec![link_item("nest0")]);
+    model.add_target(consumer)?;
+    for i in 0..400usize {
+        let mut raw = target(&format!("nest{i}"), TargetKind::InterfaceLibrary, &[]);
+        raw.usage.push(
+            UsageField::InterfaceCompileDefinitions,
+            entry(&format!(
+                "$<TARGET_PROPERTY:nest{},INTERFACE_COMPILE_DEFINITIONS>",
+                i + 1
+            )),
+        );
+        model.add_target(raw)?;
+    }
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/consumer.c"), b"int f(void) { return 0; }\n")?;
+    let configs = [ConfigId("Release".into())];
+    let result = crate::pipeline::resolve_with_workers(
+        &model,
+        &host,
+        &configs,
+        &ResolveOptions::default(),
+        true,
+        4,
+    );
+    let error = format!("{:?}", result.err());
+    assert!(
+        error.contains("generator expression nesting is too deep")
+            || error.contains(&format!("{:?}", GenexError::TooDeep)),
+        "expected a nesting error, got {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn parallel_resolution_keeps_link_cycle_handling() -> TestResult {
+    let mut model = project();
+    model.generator = Some(GeneratorKind::Ninja);
+    let mut files = Vec::new();
+    for i in 0..40usize {
+        let source = format!("cyc{i}.c");
+        files.push(format!("/src/{source}"));
+        let mut raw = target(&format!("cyc{i}"), TargetKind::StaticLibrary, &[&source]);
+        raw.usage.push(
+            UsageField::InterfaceIncludeDirectories,
+            entry(&format!("/src/cyc_include{i}")),
+        );
+        let links = vec![link_item(&format!("cyc{}", (i + 1) % 40))];
+        raw.usage.interface_link_libraries = Some(links.clone());
+        raw.usage.link_libraries = Some(links);
+        model.add_target(raw)?;
+    }
+    let make_host = || -> Result<PureHost, Box<dyn std::error::Error>> {
+        let host = PureHost::default();
+        for file in &files {
+            host.seed_file(Path::new(file), b"int f(void) { return 0; }\n")?;
+        }
+        Ok(host)
+    };
+    let serial_host = make_host()?;
+    let parallel_host = make_host()?;
+    let configs = [ConfigId("Release".into())];
+    let options = ResolveOptions::default();
+    let serial =
+        crate::pipeline::resolve_with_workers(&model, &serial_host, &configs, &options, true, 1)?;
+    let parallel =
+        crate::pipeline::resolve_with_workers(&model, &parallel_host, &configs, &options, true, 4)?;
+    assert_eq!(serial.compile_inputs, parallel.compile_inputs);
+    assert_eq!(
+        format!("{:?}", serial.targets),
+        format!("{:?}", parallel.targets)
+    );
     Ok(())
 }

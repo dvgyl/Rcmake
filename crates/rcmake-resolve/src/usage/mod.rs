@@ -694,31 +694,17 @@ impl<'a> UsageResolver<'a> {
         name: &[u8],
         ctx: &EvalContext,
     ) -> Result<Arc<WalkValue>, ResolveError> {
+        if self.active.is_empty() && self.property_reads == 0 && self.source_reads.is_none() {
+            self.warm_dependencies(target, name, ctx)?;
+        }
         let mut visited = HashMap::new();
         let (value, _) = self.walk_with(target, name, ctx, &mut visited)?;
         Ok(value)
     }
 
-    fn walk_with(
-        &mut self,
-        target: TargetId,
-        name: &[u8],
-        ctx: &EvalContext,
-        visited: &mut HashMap<(TargetId, bool), usize>,
-    ) -> Result<(Arc<WalkValue>, usize), ResolveError> {
-        // A link graph may contain a cycle. Stop this branch and avoid caching its
-        // partial result. A generator expression that re-enters a property is an error.
-        let in_cycle = self
-            .active
-            .iter()
-            .any(|(id, prop)| *id == target && prop == name);
-        if in_cycle {
-            self.cycle_count += 1;
-            return Ok((Arc::default(), 0));
-        }
-        let is_iface = name.starts_with(b"INTERFACE_");
-        let start_seq = visited.len();
-        let mut key = MemoKey {
+    /// Build the memo key of one walk with no head.
+    fn memo_key<'k>(&self, target: TargetId, name: &'k [u8], ctx: &'k EvalContext) -> MemoKey<'k> {
+        MemoKey {
             target,
             property: Cow::Borrowed(name),
             config: Cow::Borrowed(&ctx.config.0),
@@ -742,7 +728,117 @@ impl<'a> UsageResolver<'a> {
                 .output_config
                 .as_ref()
                 .map(|value| Cow::Borrowed(value.0.as_slice())),
+        }
+    }
+
+    fn is_memoized(&self, target: TargetId, name: &[u8], ctx: &EvalContext) -> bool {
+        let mut key = self.memo_key(target, name, ctx);
+        if self.memo.contains_key(&key) {
+            return true;
+        }
+        key.head = ctx.head.and_then(|id| self.ids.get(id.0 as usize).copied());
+        key.head.is_some() && self.memo.contains_key(&key)
+    }
+
+    /// Targets that a walk of `name` on `target` visits next.
+    fn edge_targets(
+        &mut self,
+        target: TargetId,
+        name: &[u8],
+        ctx: &EvalContext,
+    ) -> Result<Vec<TargetId>, ResolveError> {
+        let (links, _) = self.usage_links(target, name.starts_with(b"INTERFACE_"), ctx)?;
+        Ok(links.iter().flat_map(|item| item.edge_targets()).collect())
+    }
+
+    /// Memoize the interface walks of a deep dependency chain bottom-up.
+    ///
+    /// A walk recurses once per link hop. The memo keeps the recursion shallow
+    /// only when the dependencies were walked first, and this depends on the
+    /// declaration order and on how the targets are split between workers.
+    /// This pass finds the dependencies that are not in the memo with an
+    /// iterative depth-first search. When the longest chain of such
+    /// dependencies is deep, it walks them in post-order, so that each walk
+    /// finds the walks of its dependencies in the memo. Shallow graphs keep
+    /// their usual evaluation order. A cycle or an expression that prevents
+    /// memoization keeps the walk deep, and the real walk then reports
+    /// [`GenexError::TooDeep`] as before.
+    fn warm_dependencies(
+        &mut self,
+        target: TargetId,
+        name: &[u8],
+        ctx: &EvalContext,
+    ) -> Result<(), ResolveError> {
+        const WARM_DEPTH: usize = MAX_WALK_DEPTH / 8;
+        let dependency_name = if name.starts_with(b"INTERFACE_") {
+            Cow::Borrowed(name)
+        } else {
+            interface_property_name(name)
         };
+        // Depth of each finished node; `None` marks a node on the search path.
+        let mut depth: HashMap<TargetId, Option<usize>> = HashMap::from([(target, None)]);
+        let mut order = Vec::new();
+        let mut stack = vec![(target, self.edge_targets(target, name, ctx)?, 0usize)];
+        while let Some((node, edges, next)) = stack.last_mut() {
+            let Some(&dependency) = edges.get(*next) else {
+                let node = *node;
+                let deepest = edges
+                    .iter()
+                    .filter_map(|child| depth.get(child).copied().flatten())
+                    .max()
+                    .unwrap_or(0);
+                stack.pop();
+                depth.insert(node, Some(deepest + 1));
+                if node != target {
+                    order.push(node);
+                }
+                continue;
+            };
+            *next += 1;
+            if depth.contains_key(&dependency)
+                || self.is_memoized(dependency, &dependency_name, ctx)
+            {
+                continue;
+            }
+            depth.insert(dependency, None);
+            let edges = self.edge_targets(dependency, &dependency_name, ctx)?;
+            stack.push((dependency, edges, 0));
+        }
+        if depth.get(&target).copied().flatten().unwrap_or(0) < WARM_DEPTH {
+            return Ok(());
+        }
+        for dependency in order {
+            let mut visited = HashMap::new();
+            if self
+                .walk_with(dependency, &dependency_name, ctx, &mut visited)
+                .is_err()
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn walk_with(
+        &mut self,
+        target: TargetId,
+        name: &[u8],
+        ctx: &EvalContext,
+        visited: &mut HashMap<(TargetId, bool), usize>,
+    ) -> Result<(Arc<WalkValue>, usize), ResolveError> {
+        // A link graph may contain a cycle. Stop this branch and avoid caching its
+        // partial result. A generator expression that re-enters a property is an error.
+        let in_cycle = self
+            .active
+            .iter()
+            .any(|(id, prop)| *id == target && prop == name);
+        if in_cycle {
+            self.cycle_count += 1;
+            return Ok((Arc::default(), 0));
+        }
+        let is_iface = name.starts_with(b"INTERFACE_");
+        let start_seq = visited.len();
+        let mut key = self.memo_key(target, name, ctx);
         let lookup_cached = |memo: &HashMap<MemoKey<'static>, Arc<WalkValue>>,
                              key: &MemoKey<'_>,
                              visited: &mut HashMap<(TargetId, bool), usize>|
