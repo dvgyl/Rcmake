@@ -157,5 +157,13 @@ pub struct JsonError {
     pub message: String,
 }
 
+/// Error returned when serializing UTF-8 JSON fails.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum WriteError {
+    /// An object key contains invalid UTF-8 bytes.
+    #[error("JSON object key is not valid UTF-8")]
+    InvalidUtf8Key,
+}
+
 #[cfg(test)]
 mod tests;

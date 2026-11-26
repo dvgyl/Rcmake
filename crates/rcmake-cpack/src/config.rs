@@ -212,7 +212,7 @@ pub(crate) fn cmake_executable(host: &dyn Host) -> Result<PathBuf, CpackError> {
     Ok(bin.join(if cfg!(windows) { "cmake.exe" } else { "cmake" }))
 }
 
-fn interpreter(
+pub(crate) fn interpreter(
     host: &Arc<dyn Host>,
     cwd: &Path,
     options: &CPackOptions,

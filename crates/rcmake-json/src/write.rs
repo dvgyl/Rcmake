@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, io::Write};
 
 use rcmake_base::BString;
 
-use crate::Value;
+use crate::{Value, WriteError};
 
 const ARRAY_MARGIN: usize = 74;
 
@@ -22,15 +22,29 @@ pub fn write_styled(v: &Value, indent: &str) -> BString {
     write(v, indent.as_bytes())
 }
 
-/// Serialize a JSON value with two-space indentation, `": "` separators, sorted object keys,
-/// and raw UTF-8 strings, matching `serde_json::to_string_pretty`.
+/// Serialize a JSON value with two-space indentation, `": "` separators, bytewise-sorted
+/// object keys, and raw UTF-8 text.
 ///
-/// Empty arrays and objects serialize as `[]` and `{}`. The result ends at the last JSON token.
-#[must_use]
-pub fn write_pretty_utf8(v: &Value) -> BString {
+/// Indentation, `[]` and `{}` empty containers, string escaping, raw UTF-8 output, integers,
+/// integral floats (such as `1.0` and `-0.0`), non-finite floats (`null`), and
+/// scientific-notation cutoffs (`1e-5` fixed, `1e-6` and `1e+16` exponential) match
+/// `serde_json::to_string_pretty`. General finite floats use Rust's shortest round-trip decimal
+/// formatter (`{:e}`), so halfway decimal tie-breaking can differ in the final digit from
+/// `serde_json` while round-tripping to the same `f64`. The result ends at the last JSON token
+/// without a trailing newline.
+///
+/// Valid UTF-8 string values pass through literally with JSON control, quote, and backslash
+/// escapes; invalid UTF-8 byte sequences in string values are lossily replaced with `U+FFFD`.
+/// Object keys must be valid UTF-8 so distinct raw-byte keys can never collapse into duplicate
+/// JSON keys.
+///
+/// # Errors
+///
+/// Returns [`WriteError::InvalidUtf8Key`] if any object key in `v` is not valid UTF-8.
+pub fn write_pretty_utf8(v: &Value) -> Result<BString, WriteError> {
     let mut writer = PrettyWriter { out: Vec::new() };
-    writer.value(v, 0);
-    BString::from(writer.out)
+    writer.value(v, 0)?;
+    Ok(BString::from(writer.out))
 }
 
 fn write(value: &Value, indent: &[u8]) -> BString {
@@ -253,7 +267,7 @@ struct PrettyWriter {
 }
 
 impl PrettyWriter {
-    fn value(&mut self, value: &Value, depth: usize) {
+    fn value(&mut self, value: &Value, depth: usize) -> Result<(), WriteError> {
         match value {
             Value::Null => self.out.extend_from_slice(b"null"),
             Value::Bool(true) => self.out.extend_from_slice(b"true"),
@@ -267,38 +281,47 @@ impl PrettyWriter {
             Value::Real(n) => write_pretty_real(*n, &mut self.out),
             Value::String(s) => write_string_utf8(&mut self.out, s.as_slice()),
             Value::Array(items) if items.is_empty() => self.out.extend_from_slice(b"[]"),
-            Value::Array(items) => self.array(items, depth),
+            Value::Array(items) => self.array(items, depth)?,
             Value::Object(members) if members.is_empty() => self.out.extend_from_slice(b"{}"),
-            Value::Object(members) => self.object(members, depth),
+            Value::Object(members) => self.object(members, depth)?,
         }
+        Ok(())
     }
 
-    fn array(&mut self, items: &[Value], depth: usize) {
+    fn array(&mut self, items: &[Value], depth: usize) -> Result<(), WriteError> {
         self.out.push(b'[');
         for (index, item) in items.iter().enumerate() {
             if index != 0 {
                 self.out.push(b',');
             }
             self.newline(depth + 1);
-            self.value(item, depth + 1);
+            self.value(item, depth + 1)?;
         }
         self.newline(depth);
         self.out.push(b']');
+        Ok(())
     }
 
-    fn object(&mut self, members: &BTreeMap<BString, Value>, depth: usize) {
+    fn object(
+        &mut self,
+        members: &BTreeMap<BString, Value>,
+        depth: usize,
+    ) -> Result<(), WriteError> {
         self.out.push(b'{');
         for (index, (key, value)) in members.iter().enumerate() {
+            let key =
+                core::str::from_utf8(key.as_slice()).map_err(|_| WriteError::InvalidUtf8Key)?;
             if index != 0 {
                 self.out.push(b',');
             }
             self.newline(depth + 1);
-            write_string_utf8(&mut self.out, key.as_slice());
+            write_str_utf8(&mut self.out, key);
             self.out.extend_from_slice(b": ");
-            self.value(value, depth + 1);
+            self.value(value, depth + 1)?;
         }
         self.newline(depth);
         self.out.push(b'}');
+        Ok(())
     }
 
     fn newline(&mut self, depth: usize) {
@@ -324,7 +347,7 @@ fn write_pretty_real(number: f64, out: &mut Vec<u8>) {
     };
     let decimal_pos = exponent + 1;
     if !(-4..=16).contains(&decimal_pos) {
-        out.extend_from_slice(scientific.as_bytes());
+        let _ = write!(out, "{signed_mantissa}e{exponent:+}");
         return;
     }
     let mantissa = if let Some(rest) = signed_mantissa.strip_prefix('-') {
@@ -354,25 +377,35 @@ fn write_pretty_real(number: f64, out: &mut Vec<u8>) {
     }
 }
 
+fn write_str_utf8(out: &mut Vec<u8>, text: &str) {
+    out.push(b'"');
+    write_utf8_escaped(out, text);
+    out.push(b'"');
+}
+
 fn write_string_utf8(out: &mut Vec<u8>, bytes: &[u8]) {
     out.push(b'"');
     for chunk in bytes.utf8_chunks() {
-        for &byte in chunk.valid().as_bytes() {
-            match byte {
-                b'"' => out.extend_from_slice(b"\\\""),
-                b'\\' => out.extend_from_slice(b"\\\\"),
-                0x08 => out.extend_from_slice(b"\\b"),
-                0x0c => out.extend_from_slice(b"\\f"),
-                b'\n' => out.extend_from_slice(b"\\n"),
-                b'\r' => out.extend_from_slice(b"\\r"),
-                b'\t' => out.extend_from_slice(b"\\t"),
-                0x00..=0x1f => write_hex(u32::from(byte), out),
-                _ => out.push(byte),
-            }
-        }
+        write_utf8_escaped(out, chunk.valid());
         if !chunk.invalid().is_empty() {
             out.extend_from_slice("\u{fffd}".as_bytes());
         }
     }
     out.push(b'"');
+}
+
+fn write_utf8_escaped(out: &mut Vec<u8>, text: &str) {
+    for &byte in text.as_bytes() {
+        match byte {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x00..=0x1f => write_hex(u32::from(byte), out),
+            _ => out.push(byte),
+        }
+    }
 }

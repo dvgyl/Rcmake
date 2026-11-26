@@ -328,13 +328,17 @@ fn appends_string_with_jsoncpp_escapes() {
     assert_eq!(out, b"prefix \"\\\"\\\\\\u0000\\n\x7f\\u00e9\"");
 }
 
+fn pretty_utf8(value: &Value) -> BString {
+    write_pretty_utf8(value).expect("valid UTF-8 object keys")
+}
+
 #[test]
 fn pretty_utf8_matches_serde_json_lockfile_golden() {
     let empty_lock =
         Value::object_from([("version", Value::UInt(1)), ("entries", Value::object())]);
     let expected_empty = "{\n  \"entries\": {},\n  \"version\": 1\n}";
     assert_eq!(
-        write_pretty_utf8(&empty_lock).as_slice(),
+        pretty_utf8(&empty_lock).as_slice(),
         expected_empty.as_bytes()
     );
 
@@ -425,7 +429,7 @@ fn pretty_utf8_matches_serde_json_lockfile_golden() {
     ]
     .join("\n");
 
-    let pretty = write_pretty_utf8(&lock);
+    let pretty = pretty_utf8(&lock);
     assert_eq!(pretty.as_slice(), expected.as_bytes());
 
     let strict = ReadOptions {
@@ -433,7 +437,7 @@ fn pretty_utf8_matches_serde_json_lockfile_golden() {
         dup_keys_last_wins: true,
     };
     let parsed = parse(pretty.as_slice(), &strict).expect("valid strict JSON");
-    assert_eq!(write_pretty_utf8(&parsed), pretty);
+    assert_eq!(pretty_utf8(&parsed), pretty);
 }
 
 #[test]
@@ -448,7 +452,7 @@ fn pretty_utf8_escapes_control_chars_and_preserves_utf8() {
             _ => format!(r#""\u{byte:04x}""#),
         };
         assert_eq!(
-            write_pretty_utf8(&Value::string([byte].as_slice())).as_slice(),
+            pretty_utf8(&Value::string([byte].as_slice())).as_slice(),
             expected.as_bytes(),
             "control byte 0x{byte:02x}"
         );
@@ -462,24 +466,24 @@ fn pretty_utf8_escapes_control_chars_and_preserves_utf8() {
         ("raw", Value::string(b"a\xffb".as_slice())),
     ]);
     let expected = "{\n  \"clé\": \"\\\"\\\\/\\b\\f\\n\\r\\t\\u0000\\u000b\\u001f\x7fé水😃\",\n  \"raw\": \"a\u{fffd}b\"\n}";
-    assert_eq!(write_pretty_utf8(&value).as_slice(), expected.as_bytes());
+    assert_eq!(pretty_utf8(&value).as_slice(), expected.as_bytes());
 }
 
 #[test]
 fn pretty_utf8_formats_containers_and_numbers() {
-    assert_eq!(write_pretty_utf8(&Value::Null).as_slice(), b"null");
-    assert_eq!(write_pretty_utf8(&Value::Bool(true)).as_slice(), b"true");
-    assert_eq!(write_pretty_utf8(&Value::Bool(false)).as_slice(), b"false");
+    assert_eq!(pretty_utf8(&Value::Null).as_slice(), b"null");
+    assert_eq!(pretty_utf8(&Value::Bool(true)).as_slice(), b"true");
+    assert_eq!(pretty_utf8(&Value::Bool(false)).as_slice(), b"false");
     assert_eq!(
-        write_pretty_utf8(&Value::Int(i64::MIN)).as_slice(),
+        pretty_utf8(&Value::Int(i64::MIN)).as_slice(),
         b"-9223372036854775808"
     );
     assert_eq!(
-        write_pretty_utf8(&Value::UInt(u64::MAX)).as_slice(),
+        pretty_utf8(&Value::UInt(u64::MAX)).as_slice(),
         b"18446744073709551615"
     );
-    assert_eq!(write_pretty_utf8(&Value::Array(vec![])).as_slice(), b"[]");
-    assert_eq!(write_pretty_utf8(&Value::object()).as_slice(), b"{}");
+    assert_eq!(pretty_utf8(&Value::Array(vec![])).as_slice(), b"[]");
+    assert_eq!(pretty_utf8(&Value::object()).as_slice(), b"{}");
 
     let nested = Value::array_from([
         Value::array_from([Value::Int(1), Value::Int(2)]),
@@ -511,10 +515,7 @@ fn pretty_utf8_formats_containers_and_numbers() {
         "]",
     ]
     .join("\n");
-    assert_eq!(
-        write_pretty_utf8(&nested).as_slice(),
-        expected_nested.as_bytes()
-    );
+    assert_eq!(pretty_utf8(&nested).as_slice(), expected_nested.as_bytes());
 
     let reals = Value::array_from([
         Value::Real(0.0),
@@ -542,15 +543,90 @@ fn pretty_utf8_formats_containers_and_numbers() {
         "  0.00001,",
         "  1e-6,",
         "  1000000000000000.0,",
-        "  1e16,",
+        "  1e+16,",
         "  null,",
         "  null,",
         "  null",
         "]",
     ]
     .join("\n");
+    assert_eq!(pretty_utf8(&reals).as_slice(), expected_reals.as_bytes());
+}
+
+#[test]
+fn pretty_utf8_formats_real_exponent_boundaries() {
+    let strict = ReadOptions {
+        allow_comments: false,
+        dup_keys_last_wins: false,
+    };
+    for (number, expected) in [
+        (0.0_f64, "0.0"),
+        (-0.0, "-0.0"),
+        (1.0, "1.0"),
+        (-1.0, "-1.0"),
+        (1e-4, "0.0001"),
+        (1e-5, "0.00001"),
+        (-1e-5, "-0.00001"),
+        (1e-6, "1e-6"),
+        (1.5e-6, "1.5e-6"),
+        (1e15, "1000000000000000.0"),
+        (1e16, "1e+16"),
+        (-1e16, "-1e+16"),
+        (1.5e20, "1.5e+20"),
+    ] {
+        let rendered = pretty_utf8(&Value::Real(number));
+        assert_eq!(rendered.as_slice(), expected.as_bytes(), "{number:?}");
+        let Value::Real(roundtrip) =
+            parse(rendered.as_slice(), &strict).expect("valid JSON number")
+        else {
+            panic!("expected real value for {number:?}");
+        };
+        assert_eq!(roundtrip.to_bits(), number.to_bits(), "{number:?}");
+    }
+
+    let halfway = 112_171_935_477_118.125_f64;
+    let rendered = pretty_utf8(&Value::Real(halfway));
+    let Value::Real(roundtrip) =
+        parse(rendered.as_slice(), &strict).expect("valid JSON halfway float")
+    else {
+        panic!("expected real value for halfway float");
+    };
+    assert_eq!(roundtrip.to_bits(), halfway.to_bits());
+}
+
+#[test]
+fn pretty_utf8_rejects_invalid_utf8_object_keys() {
+    let distinct_invalid = Value::object_from([
+        (BString::from(b"\xfe".as_slice()), Value::Int(1)),
+        (BString::from(b"\xff".as_slice()), Value::Int(2)),
+    ]);
     assert_eq!(
-        write_pretty_utf8(&reals).as_slice(),
-        expected_reals.as_bytes()
+        write_pretty_utf8(&distinct_invalid),
+        Err(WriteError::InvalidUtf8Key)
+    );
+
+    let collides_with_replacement = Value::object_from([
+        (BString::from("\u{fffd}"), Value::Int(1)),
+        (BString::from(b"\xff".as_slice()), Value::Int(2)),
+    ]);
+    assert_eq!(
+        write_pretty_utf8(&collides_with_replacement),
+        Err(WriteError::InvalidUtf8Key)
+    );
+
+    let nested_invalid = Value::object_from([(
+        "items",
+        Value::array_from([Value::object_from([(
+            BString::from(b"bad\x80key".as_slice()),
+            Value::Bool(true),
+        )])]),
+    )]);
+    assert_eq!(
+        write_pretty_utf8(&nested_invalid),
+        Err(WriteError::InvalidUtf8Key)
+    );
+    assert_eq!(
+        WriteError::InvalidUtf8Key.to_string(),
+        "JSON object key is not valid UTF-8"
     );
 }
