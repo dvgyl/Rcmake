@@ -934,6 +934,7 @@ dependencies = [
  "rcmake-host",
  "rcmake-json",
  "sha2",
+ "tempfile",
  "zstd",
 ]
 

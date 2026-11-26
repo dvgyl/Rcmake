@@ -16,7 +16,7 @@ sha1.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 
-[target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
+[target.'cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(target_env = "msvc")))'.dependencies]
 sha2 = { workspace = true, features = ["asm"] }
 
 [lints]

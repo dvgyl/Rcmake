@@ -68,6 +68,8 @@ impl PlatformQueries {
             ("xcrun", &["--show-sdk-path"], Output::Capture),
             ("sw_vers", &["-productVersion"], Output::Inherit),
             ("brew", &["--prefix"], Output::Inherit),
+            ("/usr/bin/uname", &["-r"], Output::Null),
+            ("/usr/bin/uname", &["-m"], Output::Null),
         ] {
             let request = RunRequest {
                 pipeline: vec![CommandSpec {

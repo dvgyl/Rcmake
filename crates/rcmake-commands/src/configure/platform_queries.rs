@@ -771,6 +771,14 @@ fn query(host: &dyn Host, request: &RunRequest) -> Option<Query> {
             Some("/usr/bin/xcrun")
         }
         ("brew", [flag]) if flag == "--prefix" => None,
+        // Apple `uname` reads `UNAME_<field>` and `UNAME_<FIELD>` overrides, also
+        // with empty values, so any such variable prevents the query.
+        ("uname", [flag])
+            if matches!(flag.as_slice(), b"-s" | b"-r" | b"-m")
+                && !has_uname_override(&request.env) =>
+        {
+            Some("/usr/bin/uname")
+        }
         _ => return None,
     };
     let fixed = fixed.map(Path::new);
@@ -811,6 +819,14 @@ fn query(host: &dyn Host, request: &RunRequest) -> Option<Query> {
         env: environment_fingerprint(&request.env),
         stderr,
         missing_programs,
+    })
+}
+
+/// Return `true` if the environment has a variable that can change `uname` output.
+pub(super) fn has_uname_override(env: &[(BString, BString)]) -> bool {
+    env.iter().any(|(name, _)| {
+        name.get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"UNAME_"))
     })
 }
 
@@ -1005,6 +1021,10 @@ fn stamp_input_state(
     let system_version_plist = Path::new("/System/Library/CoreServices/SystemVersion.plist");
     if program == Path::new("/usr/sbin/sysctl") {
         stamp_file_or_missing(key, host, system_version_plist)?;
+        return Some(());
+    }
+    if program == Path::new("/usr/bin/uname") {
+        // The kernel fields above are the complete input of an admitted query.
         return Some(());
     }
     if program == Path::new("/usr/bin/sw_vers") {

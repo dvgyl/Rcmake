@@ -335,6 +335,15 @@ pub trait Host: Send + Sync {
         self.metadata(p, follow)
     }
 
+    /// Return `true` if each change to the names in a directory sets the
+    /// modification and change times of that directory, as POSIX requires.
+    ///
+    /// Callers can then compare fresh directory metadata to detect changes to
+    /// a listing. The default returns `false`. A wrapper host need not forward it.
+    fn directory_times_track_names(&self) -> bool {
+        false
+    }
+
     /// Read bytes from an absolute file path.
     fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>>;
 
@@ -514,6 +523,18 @@ pub trait Host: Send + Sync {
     /// This query does not run a command. The default returns `true`.
     fn supports_process_execution(&self) -> bool {
         true
+    }
+
+    /// Open a regular file for reads, and return fresh metadata of the open file.
+    ///
+    /// The metadata describes the opened object, so a later change of the path
+    /// cannot change it. A host that cannot bind metadata to the handle returns
+    /// `None` for the metadata. The default does that.
+    fn open_read_with_metadata(
+        &self,
+        path: &Path,
+    ) -> HostResult<(Box<dyn ReadSeek + '_>, Option<Metadata>)> {
+        Ok((self.open_read(path)?, None))
     }
 
     /// Open a regular file for bounded streaming reads.

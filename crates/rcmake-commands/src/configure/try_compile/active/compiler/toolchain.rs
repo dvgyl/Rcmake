@@ -10,7 +10,7 @@ use rcmake_host::{
     CommandSpec, FileKind, Follow, Host, HostResult, Input, Output, ProcessResult, RunOutput,
     RunRequest, path,
 };
-use rcmake_store::{Digest, InputStamp, Trace, TraceMemo};
+use rcmake_store::{Digest, InputStamp, Trace, TraceMemo, VerifyOutcome};
 
 use super::wrapper::Wrapper;
 use crate::configure::concurrent::{self, Job};
@@ -46,6 +46,13 @@ pub(super) struct ToolchainEvidence {
     pub(super) link_trace: bool,
     pub(super) identities: Vec<(BString, Digest)>,
     memo: Arc<TraceMemo>,
+    apple_queries: Option<AppleQueries>,
+}
+
+struct AppleQueries {
+    driver: PathBuf,
+    linker: PathBuf,
+    clang: Arc<ClangQueries>,
 }
 
 impl ToolchainEvidence {
@@ -56,6 +63,7 @@ impl ToolchainEvidence {
         sdk: &Path,
         cxx: bool,
         memo: Arc<TraceMemo>,
+        previous: Option<&Self>,
     ) -> Option<Self> {
         if !program.is_absolute() {
             return None;
@@ -71,6 +79,7 @@ impl ToolchainEvidence {
             link_trace: false,
             identities: Vec::new(),
             memo,
+            apple_queries: None,
         };
         for depth in 0..=2 {
             let driver = evidence.driver.clone();
@@ -114,7 +123,7 @@ impl ToolchainEvidence {
         }
 
         match family {
-            Family::AppleClang => evidence.apple(host, sdk, cxx)?,
+            Family::AppleClang => evidence.apple(host, sdk, cxx, previous)?,
             Family::Clang => evidence.clang(host, cxx)?,
             Family::Gnu => evidence.gnu(host, cxx)?,
             Family::Msvc => evidence.msvc(host)?,
@@ -122,7 +131,13 @@ impl ToolchainEvidence {
         Some(evidence)
     }
 
-    fn apple(&mut self, host: &dyn Host, sdk: &Path, cxx: bool) -> Option<()> {
+    fn apple(
+        &mut self,
+        host: &dyn Host,
+        sdk: &Path,
+        cxx: bool,
+        previous: Option<&Self>,
+    ) -> Option<()> {
         if host.system().sysname != "Darwin" {
             return None;
         }
@@ -177,7 +192,21 @@ impl ToolchainEvidence {
         let memo = Arc::clone(&self.memo);
         let (digests, queries) = concurrent::join(
             move || files.map(|file| digest(&memo, host, file)),
-            || ClangQueries::run(host, &driver),
+            || {
+                // Both discovery calls query the canonical driver. Check the old
+                // inputs before reusing its answers. Stamp the C++ configuration
+                // candidates separately below.
+                if let Some(previous) = previous
+                    && previous.sdk.as_ref() == Some(&sdk)
+                    && let Some(queries) = &previous.apple_queries
+                    && queries.driver == driver
+                    && queries.linker == linker
+                    && self.memo.verify(host, &previous.tools) == VerifyOutcome::Hit
+                {
+                    return Some(Arc::clone(&queries.clang));
+                }
+                ClangQueries::run(host, &driver).map(Arc::new)
+            },
         );
         for (file, digest) in files.into_iter().zip(digests?) {
             self.record(host, file, false, digest)?;
@@ -187,7 +216,14 @@ impl ToolchainEvidence {
         self.link_trace = true;
         self.sealed
             .push(driver.parent()?.parent()?.parent()?.to_path_buf());
-        self.clang_configuration(host, &driver, cxx, queries?)
+        let clang = queries?;
+        self.clang_configuration(host, &driver, cxx, &clang)?;
+        self.apple_queries = Some(AppleQueries {
+            driver,
+            linker,
+            clang,
+        });
+        Some(())
     }
 
     fn clang(&mut self, host: &dyn Host, cxx: bool) -> Option<()> {
@@ -200,7 +236,7 @@ impl ToolchainEvidence {
         self.stamp(host, &linker, false)?;
         self.link_trace = linker_dependency_file(host, &linker);
         let queries = ClangQueries::run(host, &driver)?;
-        self.clang_configuration(host, &driver, cxx, queries)
+        self.clang_configuration(host, &driver, cxx, &queries)
     }
 
     fn clang_configuration(
@@ -208,7 +244,7 @@ impl ToolchainEvidence {
         host: &dyn Host,
         driver: &Path,
         cxx: bool,
-        queries: ClangQueries,
+        queries: &ClangQueries,
     ) -> Option<()> {
         let ClangQueries {
             resource,
@@ -220,7 +256,7 @@ impl ToolchainEvidence {
         }
         self.identities.push((
             "resource directory".into(),
-            Digest::hash(&path::from_native(&resource)),
+            Digest::hash(&path::from_native(resource)),
         ));
         let triple = std::str::from_utf8(triple.stdout.trim_ascii()).ok()?;
         if triple.is_empty()
@@ -277,10 +313,12 @@ impl ToolchainEvidence {
                 .push((flag.into(), Digest::hash(result.stdout.trim_ascii())));
         }
         let frontend = if cxx { "cc1plus" } else { "cc1" };
-        for name in [frontend, "as", "collect2", "ld"] {
+        for name in [frontend, "as", "collect2"] {
             self.stamp(host, &program_query(host, &driver, name)?, false)?;
         }
-        self.link_trace = linker_dependency_file(host, &program_query(host, &driver, "ld")?);
+        let linker = program_query(host, &driver, "ld")?;
+        self.stamp(host, &linker, false)?;
+        self.link_trace = linker_dependency_file(host, &linker);
         let libgcc = query_path(host, &driver, "-print-libgcc-file-name")?;
         self.stamp(host, &libgcc, false)?;
         let specs = query_path(host, &driver, "-print-file-name=specs")?;
@@ -607,6 +645,7 @@ mod tests {
                 Path::new(""),
                 false,
                 Arc::default(),
+                None,
             )
             .ok_or_else(|| HostError::unsupported("Expected toolchain evidence."))
         };

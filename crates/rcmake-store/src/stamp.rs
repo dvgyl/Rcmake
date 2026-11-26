@@ -1,16 +1,18 @@
+#[cfg(test)]
+mod sdk_tests;
 mod tree;
 
 pub use tree::{sdk_tree_listing_digest, tree_listing_digest};
 
 use std::collections::BTreeMap;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rcmake_base::Limits;
-use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, Metadata, ReadRange};
+use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, Metadata};
 use rcmake_json::{
     FieldError, FromJson, Object, ToJson, Value, deny_unknown, object, opt, opt_or_else, req,
     req_value,
@@ -388,7 +390,7 @@ impl InputStamp {
         path: PathBuf,
         timestamp_resolution: Duration,
     ) -> HostResult<Self> {
-        let metadata = host.metadata(&path, Follow::Yes)?;
+        let metadata = host.metadata_fresh(&path, Follow::Yes)?;
         let digest = hash_file(host, &path, &metadata)?;
         if crate::gc::older_than(host.now(), metadata.mtime, timestamp_resolution) {
             Ok(Self::FileStat {
@@ -426,15 +428,21 @@ pub struct MissReason {
 /// Return an error if the file exceeds the read limit or its metadata changes
 /// during the read.
 pub fn file_digest(host: &dyn Host, path: &Path) -> HostResult<Digest> {
-    let before = host.metadata(path, Follow::Yes)?;
+    let before = host.metadata_fresh(path, Follow::Yes)?;
     hash_file(host, path, &before)
 }
 
 /// Reuse file digests within one session while file identity and metadata match.
+///
+/// Nothing in this memo persists after the session.
 #[derive(Default)]
 pub struct TraceMemo {
     files: Mutex<BTreeMap<(FastStat, rcmake_host::FileTime), Digest>>,
     generation_host: Option<Arc<rcmake_host::MemoHost<dyn Host>>>,
+    /// An uncached host for directory walks that collect stamps.
+    live: Option<Arc<dyn Host>>,
+    /// Calculate every answer again, for independent verification.
+    verify: bool,
     tools: Mutex<BTreeMap<PathBuf, (u64, FastStat, Digest)>>,
     sdk: Mutex<BTreeMap<PathBuf, Arc<SdkListing>>>,
     ordinary: Mutex<BTreeMap<PathBuf, OrdinaryListing>>,
@@ -444,9 +452,19 @@ pub struct TraceMemo {
 
 struct SdkListing {
     digest: Digest,
-    generation: u64,
+    /// The configure generation of the listing, or `None` for a listing that
+    /// only fresh stamps can validate.
+    generation: Option<u64>,
     links: Vec<tree::SdkLink>,
     target_generations: BTreeMap<PathBuf, u64>,
+    /// Fresh stamps of every visited directory, if all of them are usable.
+    dirs: Vec<tree::DirStamp>,
+}
+
+impl SdkListing {
+    fn stat_revalidatable(&self) -> bool {
+        !self.dirs.is_empty()
+    }
 }
 
 struct OrdinaryListing {
@@ -461,7 +479,20 @@ impl TraceMemo {
     #[must_use]
     pub fn with_generation(host: Arc<rcmake_host::MemoHost<dyn Host>>) -> Self {
         Self {
+            live: Some(Arc::clone(host.base())),
             generation_host: Some(host),
+            ..Self::default()
+        }
+    }
+
+    /// Calculate every digest and listing again with fresh reads through `live`.
+    ///
+    /// Use this memo for independent verification. It keeps no answer.
+    #[must_use]
+    pub fn verifying(live: Arc<dyn Host>) -> Self {
+        Self {
+            live: Some(live),
+            verify: true,
             ..Self::default()
         }
     }
@@ -488,6 +519,9 @@ impl TraceMemo {
     /// and configure generation agree. A rewrite outside the configure host
     /// that preserves both identity and timestamps can require a new session.
     pub fn tool_digest(&self, host: &dyn Host, path: &Path) -> HostResult<Digest> {
+        if self.verify {
+            return file_digest(host, path);
+        }
         let metadata = host.metadata(path, Follow::Yes)?;
         if metadata.ctime.is_some() {
             return self.file_digest(host, path);
@@ -537,74 +571,230 @@ impl TraceMemo {
     }
 
     fn sdk_digest_inner(&self, host: &dyn Host, root: &Path) -> HostResult<Digest> {
-        let canonical = host.canonicalize(root)?;
-        let Some(generation) = self.generation(&canonical) else {
+        if self.verify {
+            let host = self.live.as_deref().unwrap_or(host);
+            let canonical = host.canonicalize_fresh(root)?;
             let graph = tree::sdk_graph_digest(host, &canonical)?;
-            return tree::sdk_root_digest(host, root, graph);
-        };
+            return tree::sdk_root_digest_fresh(host, root, graph);
+        }
+        let canonical = host.canonicalize(root)?;
+        let generation = self.generation(&canonical);
         let cached = self
             .sdk
             .lock()
             .ok()
             .and_then(|sdk| sdk.get(&canonical).cloned());
-        if let Some(listing) = cached.filter(|listing| {
-            listing.generation == generation && self.sdk_links_match(host, listing)
-        }) {
-            let digest = tree::sdk_root_digest(host, root, listing.digest)?;
-            if self.generation(&canonical) == Some(generation)
-                && self.sdk_targets_unchanged(&listing)
+        if let Some(listing) = &cached {
+            // Fast path 1: no change since the listing.
+            if let Some(generation) = generation
+                && listing.generation == Some(generation)
+                && self.sdk_links_match(host, listing)
+            {
+                let digest = tree::sdk_root_digest(host, root, listing.digest)?;
+                if self.generation(&canonical) == Some(generation)
+                    && self.sdk_targets_unchanged(listing)
+                {
+                    self.sdk_graph_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(digest);
+                }
+                return Err(HostError::unsupported(
+                    "The host changed during the SDK listing.",
+                ));
+            }
+            // Fast path 2: fresh stamps of every directory and link still match.
+            if listing.stat_revalidatable()
+                && let Some(digest) = self.revalidate(host, root, &canonical, listing, generation)
             {
                 self.sdk_graph_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(digest);
             }
-            return Err(HostError::unsupported(
-                "The host changed during the SDK listing.",
-            ));
         }
 
+        let stamped = stamps_reliable(host);
+        let mut stamps = tree::DirStamps::default();
         let mut links = Vec::new();
         let mut target_generations = BTreeMap::new();
-        let mut reusable = true;
-        let graph = tree::sdk_graph(host, &canonical, |path, resolved| {
-            if links.len() >= 512 {
-                reusable = false;
-                return;
-            }
-            if let Some((target, _)) = &resolved {
-                if let Some(generation) = self.generation(target) {
-                    target_generations
-                        .entry(target.clone())
-                        .or_insert(generation);
-                } else {
-                    reusable = false;
+        let mut links_complete = true;
+        let mut targets_complete = generation.is_some();
+        let graph = tree::sdk_graph(
+            host,
+            &canonical,
+            stamped.then_some(&mut stamps),
+            |path, resolved| {
+                if links.len() >= 512 {
+                    links_complete = false;
+                    return;
                 }
+                if let Some((target, _)) = &resolved {
+                    if let Some(generation) = generation.and_then(|_| self.generation(target)) {
+                        target_generations
+                            .entry(target.clone())
+                            .or_insert(generation);
+                    } else {
+                        targets_complete = false;
+                    }
+                }
+                links.push(tree::SdkLink { path, resolved });
+            },
+        )?;
+        let dirs = usable_stamps(host, stamps, links_complete);
+        let digest = tree::sdk_root_digest(host, root, graph)?;
+        let generation = match generation {
+            Some(generation) => {
+                if self.generation(&canonical) != Some(generation) {
+                    return Err(HostError::unsupported(
+                        "The host changed during the SDK listing.",
+                    ));
+                }
+                let listing = SdkListing {
+                    digest: graph,
+                    generation: Some(generation),
+                    links,
+                    target_generations,
+                    dirs,
+                };
+                if links_complete && !self.sdk_links_match(host, &listing) {
+                    return Err(HostError::unsupported(
+                        "The host changed during the SDK listing.",
+                    ));
+                }
+                self.store_sdk(canonical, listing, links_complete && targets_complete);
+                return Ok(digest);
             }
-            links.push(tree::SdkLink { path, resolved });
-        })?;
-        let listing = SdkListing {
-            digest: graph,
-            generation,
-            links,
-            target_generations,
+            None => None,
         };
-        let digest = tree::sdk_root_digest(host, root, listing.digest)?;
-        if self.generation(&canonical) != Some(generation) {
-            return Err(HostError::unsupported(
-                "The host changed during the SDK listing.",
-            ));
+        // Without a stable generation, only fresh stamps can validate the listing.
+        self.store_sdk(
+            canonical,
+            SdkListing {
+                digest: graph,
+                generation,
+                links,
+                target_generations,
+                dirs,
+            },
+            false,
+        );
+        Ok(digest)
+    }
+
+    /// Keep a listing that a generation or fresh stamps can validate.
+    fn store_sdk(&self, canonical: PathBuf, mut listing: SdkListing, generation_valid: bool) {
+        if !generation_valid {
+            listing.generation = None;
         }
-        if reusable && !self.sdk_links_match(host, &listing) {
-            return Err(HostError::unsupported(
-                "The host changed during the SDK listing.",
-            ));
-        }
-        if reusable
+        if (listing.generation.is_some() || listing.stat_revalidatable())
             && let Ok(mut sdk) = self.sdk.lock()
             && (sdk.len() < 128 || sdk.contains_key(&canonical))
         {
             sdk.insert(canonical, Arc::new(listing));
         }
-        Ok(digest)
+    }
+
+    /// Check a stamped listing with fresh queries. Return the root digest on a match.
+    ///
+    /// Every stamped directory is immutable to this user, so a process of this
+    /// configure cannot change it. A fresh stamp check detects other changes.
+    fn revalidate(
+        &self,
+        host: &dyn Host,
+        root: &Path,
+        canonical: &Path,
+        listing: &SdkListing,
+        generation: Option<u64>,
+    ) -> Option<Digest> {
+        if !stamps_reliable(host) {
+            return None;
+        }
+        // Sample every generation before the checks, so that a change during
+        // the checks prevents a refresh.
+        let targets = || {
+            listing
+                .links
+                .iter()
+                .filter_map(|link| link.resolved.as_ref())
+                .map(|(target, _)| Some((target.clone(), self.generation(target)?)))
+                .collect::<Option<BTreeMap<_, _>>>()
+        };
+        let before = generation.and_then(|generation| Some((generation, targets()?)));
+        // Bind the requested spelling to the same canonical root again.
+        if host.canonicalize_fresh(root).ok()? != canonical
+            || !tree::stamps_match(host, &listing.dirs, &listing.links)
+        {
+            return None;
+        }
+        let digest = tree::sdk_root_digest_fresh(host, root, listing.digest).ok()?;
+        if host.canonicalize_fresh(root).ok()? != canonical {
+            return None;
+        }
+        // The checks ran within one stable generation. Fast path 1 can use the
+        // listing until the next change.
+        if let Some((generation, target_generations)) = before
+            && self.generation(canonical) == Some(generation)
+            && targets().as_ref() == Some(&target_generations)
+        {
+            self.store_sdk(
+                canonical.to_owned(),
+                SdkListing {
+                    digest: listing.digest,
+                    generation: Some(generation),
+                    links: listing.links.clone(),
+                    target_generations,
+                    dirs: listing.dirs.clone(),
+                },
+                true,
+            );
+        }
+        Some(digest)
+    }
+
+    /// Walk an SDK search directory before a probe needs it.
+    ///
+    /// Keep the listing only if fresh stamps can validate it later. Verification
+    /// mode and hosts without reliable directory stamps do nothing.
+    pub fn prefetch_sdk_digest(&self, host: &dyn Host, root: &Path) {
+        if self.verify || !stamps_reliable(host) {
+            return;
+        }
+        let Ok(canonical) = host.canonicalize_fresh(root) else {
+            return;
+        };
+        if self
+            .sdk
+            .lock()
+            .map_or(true, |sdk| sdk.contains_key(&canonical))
+        {
+            return;
+        }
+        let mut stamps = tree::DirStamps::default();
+        let mut links = Vec::new();
+        let mut links_complete = true;
+        let Ok(graph) = tree::sdk_graph(host, &canonical, Some(&mut stamps), |path, resolved| {
+            if links.len() >= 512 {
+                links_complete = false;
+            } else {
+                links.push(tree::SdkLink { path, resolved });
+            }
+        }) else {
+            return;
+        };
+        let dirs = usable_stamps(host, stamps, links_complete);
+        if dirs.is_empty() {
+            return;
+        }
+        if let Ok(mut sdk) = self.sdk.lock()
+            && sdk.len() < 128
+        {
+            sdk.entry(canonical).or_insert_with(|| {
+                Arc::new(SdkListing {
+                    digest: graph,
+                    generation: None,
+                    links,
+                    target_generations: BTreeMap::new(),
+                    dirs,
+                })
+            });
+        }
     }
 
     fn sdk_links_match(&self, host: &dyn Host, listing: &SdkListing) -> bool {
@@ -620,6 +810,9 @@ impl TraceMemo {
 
     /// Hash a search tree. Reuse the listing while its generation stays stable.
     pub fn tree_digest(&self, host: &dyn Host, root: &Path) -> HostResult<Digest> {
+        if self.verify {
+            return tree_listing_digest(self.live.as_deref().unwrap_or(host), root);
+        }
         let canonical = host.canonicalize(root)?;
         let Some(generation) = self.generation(&canonical) else {
             return tree_listing_digest(host, root);
@@ -664,8 +857,8 @@ impl TraceMemo {
 
     /// Read the current metadata, then return or calculate the file digest.
     pub fn file_digest(&self, host: &dyn Host, path: &Path) -> HostResult<Digest> {
-        let metadata = host.metadata(path, Follow::Yes)?;
-        if metadata.kind != FileKind::File || metadata.ino == 0 {
+        let metadata = host.metadata_fresh(path, Follow::Yes)?;
+        if self.verify || metadata.kind != FileKind::File || metadata.ino == 0 {
             return hash_file(host, path, &metadata);
         }
         let Some(ctime) = metadata.ctime else {
@@ -678,9 +871,14 @@ impl TraceMemo {
             }
             return hash_file(host, path, &metadata);
         };
-        // Keep files with recent or second-resolution change times out of the memo.
+        // Keep files with recent or second-resolution change times out of the
+        // memo. Also keep out files that a process of this user can change,
+        // because equal metadata does not prove equal bytes.
         let now = host.now();
-        if ctime.nanos == 0 || ctime.secs >= now.secs.saturating_sub(1) {
+        if ctime.nanos == 0
+            || ctime.secs >= now.secs.saturating_sub(1)
+            || !immutable(&metadata, host.effective_uid())
+        {
             return hash_file(host, path, &metadata);
         }
         let stat = (FastStat::from(&metadata), ctime);
@@ -689,8 +887,10 @@ impl TraceMemo {
         {
             return Ok(digest);
         }
-        let digest = hash_file(host, path, &metadata)?;
-        if let Ok(mut files) = self.files.lock()
+        let (digest, bound) = hash_bound_file(host, path, &metadata)?;
+        // Keep only a digest of the object that the metadata describes.
+        if bound
+            && let Ok(mut files) = self.files.lock()
             && files.len() < 32_768
         {
             files.insert(stat, digest);
@@ -705,6 +905,12 @@ impl TraceMemo {
 }
 
 fn hash_file(host: &dyn Host, path: &Path, before: &Metadata) -> HostResult<Digest> {
+    hash_bound_file(host, path, before).map(|(digest, _)| digest)
+}
+
+/// Hash a file. Also return `true` if the host bound the metadata to the open
+/// file, so that the digest is known to describe the object of `before`.
+fn hash_bound_file(host: &dyn Host, path: &Path, before: &Metadata) -> HostResult<(Digest, bool)> {
     if before.kind != FileKind::File {
         return Err(HostError::unsupported("Expected a regular file."));
     }
@@ -718,25 +924,39 @@ fn hash_file(host: &dyn Host, path: &Path, before: &Metadata) -> HostResult<Dige
         ));
     }
     let mut hash = Sha256::new();
-    let mut offset = 0;
-    loop {
-        const CHUNK: u64 = 256 * 1024;
-        // Request one extra byte at EOF to detect growth.
-        let len = CHUNK.min(before.len - offset + 1);
-        let bytes = host.read(
+    // Read through one handle. Read at most one extra byte to detect growth.
+    let (reader, opened) = host.open_read_with_metadata(path)?;
+    let bound = opened.is_some();
+    if let Some(opened) = opened
+        && (opened.kind != FileKind::File
+            || opened.ctime != before.ctime
+            || FastStat::from(&opened) != FastStat::from(before))
+    {
+        return Err(crate::io_at(
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                "Trace file changed before the read.",
+            ),
             path,
-            ReadRange::Slice {
-                offset,
-                len: Some(len),
-            },
-        )?;
-        offset += bytes.len() as u64;
-        hash.update(&bytes);
-        if offset > before.len || bytes.len() as u64 != len {
-            break;
+        ));
+    }
+    let mut reader = reader.take(before.len + 1);
+    let mut buffer = vec![0; reader.limit().min(1024 * 1024) as usize];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(len) => {
+                let bytes = buffer.get(..len).ok_or_else(|| {
+                    crate::io_at(std::io::Error::other("Invalid trace read length."), path)
+                })?;
+                hash.update(bytes);
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(crate::io_at(error, path)),
         }
     }
-    let after = host.metadata(path, Follow::Yes)?;
+    let offset = before.len + 1 - reader.limit();
+    let after = host.metadata_fresh(path, Follow::Yes)?;
     if offset != before.len
         || after.kind != FileKind::File
         || before.ctime != after.ctime
@@ -750,7 +970,7 @@ fn hash_file(host: &dyn Host, path: &Path, before: &Metadata) -> HostResult<Dige
             path,
         ));
     }
-    Ok(Digest::from_bytes(hash.finalize().into()))
+    Ok((Digest::from_bytes(hash.finalize().into()), bound))
 }
 
 /// Hash the sorted byte names and kinds of a directory's immediate entries.
@@ -850,7 +1070,7 @@ fn matches_input(host: &dyn Host, input: &InputStamp, memo: Option<&TraceMemo>) 
             let Some(digest) = digest else {
                 return false;
             };
-            let Ok(current) = host.metadata(path, Follow::Yes) else {
+            let Ok(current) = host.metadata_fresh(path, Follow::Yes) else {
                 return false;
             };
             current.mode == stat.mode && hash_file(host, path, &current).as_ref() == Ok(digest)
@@ -927,6 +1147,45 @@ fn matches_input(host: &dyn Host, input: &InputStamp, memo: Option<&TraceMemo>) 
 pub(crate) fn missing(host: &dyn Host, path: &Path) -> bool {
     path.is_absolute()
         && host
-            .metadata(path, Follow::No)
+            .metadata_fresh(path, Follow::No)
             .is_err_and(|error| error.kind == ErrorKind::NotFound)
+}
+
+/// Return `true` if no process of the current user can change the object.
+///
+/// The object must have an owner that is not the effective user, no group or
+/// other write permission, and the effective user must not be the superuser.
+/// Access control lists are outside this check.
+pub(crate) fn immutable(metadata: &Metadata, effective_uid: Option<u32>) -> bool {
+    effective_uid.is_some_and(|uid| uid != 0)
+        && metadata
+            .owner
+            .is_some_and(|owner| Some(owner) != effective_uid)
+        && metadata.mode & 0o022 == 0
+}
+
+/// Return `true` if fresh directory stamps on `host` can detect listing changes.
+fn stamps_reliable(host: &dyn Host) -> bool {
+    !cfg!(target_arch = "wasm32") && host.directory_times_track_names()
+}
+
+/// Return the stamps if a later fresh check of them can validate the listing.
+///
+/// An empty, incomplete, or truncated walk, or any unusable stamp, gives no stamps.
+fn usable_stamps(
+    host: &dyn Host,
+    stamps: tree::DirStamps,
+    links_complete: bool,
+) -> Vec<tree::DirStamp> {
+    let now = host.now();
+    let uid = host.effective_uid();
+    if links_complete
+        && stamps.complete
+        && !stamps.dirs.is_empty()
+        && stamps.dirs.iter().all(|stamp| stamp.usable(now, uid))
+    {
+        stamps.dirs
+    } else {
+        Vec::new()
+    }
 }

@@ -17,7 +17,11 @@ pub(super) fn verify(
 ) -> Option<(JournalDigest, RunOutput)> {
     let arm_capability = query.program == Path::new("/usr/sbin/sysctl");
     let product = query.program == Path::new("/usr/bin/sw_vers");
-    if !arm_capability && !product {
+    let uname = query.program == Path::new("/usr/bin/uname");
+    if !arm_capability && !product && !uname {
+        return None;
+    }
+    if uname && super::has_uname_override(&request.env) {
         return None;
     }
     let system = host.system();
@@ -50,6 +54,19 @@ pub(super) fn verify(
             [flag, property] if flag == "-n" && property == "hw.optional.arm64" => b"1\n".to_vec(),
             _ => return None,
         }
+    } else if uname {
+        // The kernel fields of the running system. A receipt is used only after
+        // an equal live result, so an unexpected child context cannot match.
+        // `-m` stays live, because a translated child can report another machine.
+        let field = match query.args.as_slice() {
+            [flag] if flag == "-s" => &system.sysname,
+            [flag] if flag == "-r" => &system.release,
+            _ => return None,
+        };
+        if field.is_empty() || field.contains(&b'\n') {
+            return None;
+        }
+        [field.as_slice(), b"\n"].concat()
     } else if product
         && matches!(query.args.as_slice(), [flag] if flag == "-productVersion")
         && request
@@ -107,6 +124,90 @@ fn product_version(plist: &[u8]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn uname_receipts_equal_live_output_and_refuse_overrides()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rcmake_host::{CommandSpec, Input, NativeHost, Output};
+
+        let host = NativeHost::new()?;
+        let program = Path::new("/usr/bin/uname");
+        let executable = file_digest(&host, program)?;
+        let machine = RunRequest {
+            pipeline: vec![CommandSpec {
+                program: "/usr/bin/uname".into(),
+                args: vec!["-m".into()],
+            }],
+            cwd: "/".into(),
+            env: Vec::new(),
+            stdin: Input::Inherit,
+            stdout: Output::Capture,
+            stderr: Output::Null,
+            timeout: None,
+            tee: false,
+        };
+        let key = super::super::query(&host, &machine).ok_or("uname -m is not admitted")?;
+        assert!(verify(&host, &key, executable, program, &machine).is_none());
+        for flag in ["-s", "-r"] {
+            let request = |env: Vec<(rcmake_base::BString, rcmake_base::BString)>| RunRequest {
+                pipeline: vec![CommandSpec {
+                    program: "/usr/bin/uname".into(),
+                    args: vec![flag.into()],
+                }],
+                cwd: "/".into(),
+                env,
+                stdin: Input::Inherit,
+                stdout: Output::Capture,
+                stderr: Output::Null,
+                timeout: None,
+                tee: false,
+            };
+            let plain = request(Vec::new());
+            let key = super::super::query(&host, &plain).ok_or("uname is not admitted")?;
+            let (_, receipt) =
+                verify(&host, &key, executable, program, &plain).ok_or("no uname receipt")?;
+            let live = host.run_bounded(&plain, 4096)?;
+            assert_eq!(receipt.stdout, live.stdout, "{flag}");
+            assert_eq!(receipt.results, live.results, "{flag}");
+            for name in [
+                "UNAME_r",
+                "UNAME_RELEASE",
+                "UNAME_m",
+                "UNAME_MACHINE",
+                "UNAME_s",
+            ] {
+                let overridden = request(vec![(name.into(), rcmake_base::BString::default())]);
+                assert!(super::super::query(&host, &overridden).is_none(), "{name}");
+                assert!(verify(&host, &key, executable, program, &overridden).is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uname_overrides_refuse_every_spelling_and_empty_values() {
+        for name in [
+            "UNAME_r",
+            "UNAME_RELEASE",
+            "UNAME_m",
+            "UNAME_MACHINE",
+            "uname_s",
+            "UNAME_",
+        ] {
+            for value in ["", "wave2"] {
+                assert!(
+                    super::super::has_uname_override(&[(name.into(), value.into())]),
+                    "{name}={value}"
+                );
+            }
+        }
+        assert!(!super::super::has_uname_override(&[
+            ("PATH".into(), "/usr/bin".into()),
+            ("UNAMEX".into(), "1".into()),
+            ("XUNAME_r".into(), "1".into()),
+        ]));
+    }
 
     #[test]
     fn product_version_requires_an_unambiguous_numeric_value() {

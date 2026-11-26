@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use rcmake_base::BString;
@@ -7,7 +8,7 @@ use rcmake_build::BuildOutcome;
 use rcmake_diag::{Effect, MessageKind};
 use rcmake_eval::{Cx, LedgerLevel, ProbeCacheMode, Services};
 use rcmake_host::{FileKind, Follow, Host, ReadRange, path};
-use rcmake_store::{Digest, Domain, KeyHasher, StoreConfig, StoreMode, file_digest};
+use rcmake_store::{Digest, Domain, KeyHasher, StoreConfig, StoreMode, TraceMemo};
 
 use crate::configure::build_tool_facts::BuildToolFacts;
 
@@ -38,6 +39,31 @@ pub(in crate::configure) struct ProbeRuntime {
     intervals: Option<Arc<CompileIntervals>>,
     purity_log: Option<PathBuf>,
     remote: Option<remote::RemoteProbe>,
+    /// The background toolchain prefetch, once it starts.
+    prefetch: OnceLock<Prefetch>,
+}
+
+/// A background toolchain prefetch and its cancel flag.
+struct Prefetch {
+    cancel: Arc<AtomicBool>,
+    worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Drop for ProbeRuntime {
+    fn drop(&mut self) {
+        // Stop the prefetch at its next step, then wait for its bounded current step.
+        if let Some(prefetch) = self.prefetch.get() {
+            prefetch.cancel.store(true, Ordering::Relaxed);
+            if let Some(worker) = prefetch
+                .worker
+                .lock()
+                .ok()
+                .and_then(|mut worker| worker.take())
+            {
+                let _ = worker.join();
+            }
+        }
+    }
 }
 
 impl ProbeRuntime {
@@ -84,8 +110,11 @@ impl ProbeRuntime {
         let journal_host = generation
             .as_ref()
             .map_or_else(|| host.clone(), |memo| memo.clone() as Arc<dyn Host>);
-        if let Some(host) = generation {
-            cache.memo = Arc::new(rcmake_store::TraceMemo::with_generation(host));
+        if mode == ProbeCacheMode::Verify {
+            // Verification checks every input again with fresh reads.
+            cache.memo = Arc::new(TraceMemo::verifying(Arc::clone(&host)));
+        } else if let Some(host) = generation {
+            cache.memo = Arc::new(TraceMemo::with_generation(host));
         }
         Some(Self {
             host,
@@ -99,13 +128,57 @@ impl ProbeRuntime {
             executable: OnceLock::new(),
             compiler: compiler::SessionEvidence::default(),
             remote,
+            prefetch: OnceLock::new(),
         })
     }
 
+    /// Return the session memo for file digests and search listings.
+    pub(in crate::configure) fn trace_memo(&self) -> &Arc<TraceMemo> {
+        &self.cache.memo
+    }
+
+    /// Start background work that warms the session memo for a C-family compiler.
+    ///
+    /// The work overlaps compiler identification. It hashes the Rcmake executable
+    /// and, on Darwin, the SDK settings file, and it walks the SDK search
+    /// directories of the admitted system root. It runs no process. Every
+    /// result stays a candidate that the memo checks again with fresh queries
+    /// before use. The work runs only once per session, never in verification
+    /// mode, and only on a host with reliable directory stamps.
+    pub(in crate::configure) fn prefetch_toolchain(&self, sysroot: Option<PathBuf>) {
+        if self.mode == ProbeCacheMode::Verify || !self.host.directory_times_track_names() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let prefetch = Prefetch {
+            cancel: Arc::clone(&cancel),
+            worker: std::sync::Mutex::new(None),
+        };
+        if self.prefetch.set(prefetch).is_err() {
+            return;
+        }
+        let live = Arc::clone(&self.host);
+        let memo = Arc::clone(&self.cache.memo);
+        // A failure to start the thread only removes the speedup.
+        let worker = std::thread::Builder::new()
+            .name("rcmake-toolchain-prefetch".into())
+            .spawn(move || prefetch_toolchain(&live, &memo, sysroot, &cancel));
+        if let (Ok(worker), Some(prefetch)) = (worker, self.prefetch.get())
+            && let Ok(mut slot) = prefetch.worker.lock()
+        {
+            *slot = Some(worker);
+        }
+    }
+
     fn executable(&self) -> Option<Digest> {
+        if self.mode == ProbeCacheMode::Verify {
+            // Verification hashes the executable again for each use.
+            let exe = self.host.current_exe().ok()?;
+            return rcmake_store::file_digest(self.host.as_ref(), &exe).ok();
+        }
         *self.executable.get_or_init(|| {
             let exe = self.host.current_exe().ok()?;
-            file_digest(self.host.as_ref(), &exe).ok()
+            self.cache.memo.file_digest(self.host.as_ref(), &exe).ok()
         })
     }
 }
@@ -451,7 +524,10 @@ impl PreparedProbe {
     }
 
     pub(super) fn journal(&self, dirs: &ProbeDirs) -> Option<Arc<JournalHost<'static>>> {
-        if self.runtime.mode == ProbeCacheMode::Off {
+        // A read-only store publishes nothing, so only a purity log needs the journal.
+        if self.runtime.mode == ProbeCacheMode::Off
+            || (self.runtime.mode == ProbeCacheMode::ReadOnly && self.runtime.purity_log.is_none())
+        {
             return None;
         }
         JournalHost::from_shared(
@@ -657,3 +733,34 @@ fn read_artifact(host: &dyn Host, dirs: &ProbeDirs, file: &Path) -> Option<Artif
 
 #[cfg(all(test, unix))]
 mod tests;
+
+/// Warm `memo` with digests and SDK listings that a C-family probe needs.
+fn prefetch_toolchain(
+    live: &Arc<dyn Host>,
+    memo: &TraceMemo,
+    sysroot: Option<PathBuf>,
+    cancel: &AtomicBool,
+) {
+    if let Ok(exe) = live.current_exe() {
+        let _ = memo.file_digest(live.as_ref(), &exe);
+    }
+    if live.system().sysname != "Darwin" {
+        return;
+    }
+    let Some(sdk) = sysroot.filter(|sdk| sdk.is_absolute()) else {
+        return;
+    };
+    for root in [
+        "usr/include",
+        "System/Library/Frameworks",
+        "System/Library/SubFrameworks",
+    ] {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        memo.prefetch_sdk_digest(live.as_ref(), &sdk.join(root));
+    }
+    if !cancel.load(Ordering::Relaxed) {
+        let _ = memo.file_digest(live.as_ref(), &sdk.join("SDKSettings.json"));
+    }
+}

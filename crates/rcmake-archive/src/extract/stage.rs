@@ -82,24 +82,31 @@ impl<'a> Stage<'a> {
     }
 
     pub(super) fn publish(&mut self, interval: Interval, dest: &Path) -> Result<(), ArchiveError> {
-        let mut contents;
-        let input: &mut dyn Read = match &mut self.storage {
+        match &mut self.storage {
             Storage::Memory(bytes) => {
-                let start = interval.offset as usize;
-                let end = start + interval.len as usize;
-                contents = bytes
+                let start = usize::try_from(interval.offset).map_err(archive_error)?;
+                let end = usize::try_from(interval.len)
+                    .ok()
+                    .and_then(|len| start.checked_add(len))
+                    .ok_or_else(|| ArchiveError::new("Invalid staged archive entry"))?;
+                let contents = bytes
                     .get(start..end)
                     .ok_or_else(|| ArchiveError::new("Invalid staged archive entry"))?;
-                &mut contents
+                // Write the staged bytes directly. This does not copy them again.
+                self.host
+                    .write(dest, contents, rcmake_host::WriteMode::CreateNew)?;
             }
             Storage::File(file) => {
                 file.seek(SeekFrom::Start(interval.offset))
                     .map_err(archive_error)?;
-                file
+                self.host.write_from(
+                    dest,
+                    rcmake_host::WriteMode::CreateNew,
+                    file,
+                    interval.len,
+                )?;
             }
-        };
-        self.host
-            .write_from(dest, rcmake_host::WriteMode::CreateNew, input, interval.len)?;
+        }
         Ok(())
     }
 }

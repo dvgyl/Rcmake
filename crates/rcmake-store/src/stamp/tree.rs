@@ -87,17 +87,160 @@ pub fn sdk_tree_listing_digest(host: &dyn Host, root: &Path) -> HostResult<Diges
 }
 
 pub(super) fn sdk_root_digest(host: &dyn Host, root: &Path, graph: Digest) -> HostResult<Digest> {
+    root_digest(host.metadata(root, Follow::No)?, host, root, graph)
+}
+
+/// Like [`sdk_root_digest`], but read the root metadata without a cache.
+pub(super) fn sdk_root_digest_fresh(
+    host: &dyn Host,
+    root: &Path,
+    graph: Digest,
+) -> HostResult<Digest> {
+    root_digest(host.metadata_fresh(root, Follow::No)?, host, root, graph)
+}
+
+fn root_digest(
+    metadata: Metadata,
+    host: &dyn Host,
+    root: &Path,
+    graph: Digest,
+) -> HostResult<Digest> {
     let mut key = KeyHasher::new(Domain::BlobV1);
     key.field(0, b"sdk-tree-root");
     key.field(1, graph.as_bytes());
-    if host.metadata(root, Follow::No)?.kind == FileKind::Symlink {
+    if metadata.kind == FileKind::Symlink {
         key.field(2, host.read_link(root)?.as_os_str().as_encoded_bytes());
     }
     Ok(key.finish())
 }
 
 pub(super) fn sdk_graph_digest(host: &dyn Host, canonical: &Path) -> HostResult<Digest> {
-    sdk_graph(host, canonical, |_, _| {})
+    sdk_graph(host, canonical, None, |_, _| {})
+}
+
+/// The maximum number of directory stamps in one SDK listing.
+pub(super) const MAX_DIR_STAMPS: usize = 8192;
+
+/// The fresh metadata of one visited canonical SDK directory.
+///
+/// The walk reads the stamp before it reads the entries. Thus a change after the
+/// stamp, or during the listing, gives a different stamp on the next check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DirStamp {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    mtime: rcmake_host::FileTime,
+    ctime: Option<rcmake_host::FileTime>,
+    mode: u32,
+    owner: Option<u32>,
+}
+
+impl DirStamp {
+    fn capture(host: &dyn Host, path: &Path) -> Option<Self> {
+        let metadata = host.metadata_fresh(path, Follow::No).ok()?;
+        (metadata.kind == FileKind::Dir).then(|| Self {
+            path: path.to_owned(),
+            dev: metadata.dev,
+            ino: metadata.ino,
+            mtime: metadata.mtime,
+            ctime: metadata.ctime,
+            mode: metadata.mode,
+            owner: metadata.owner,
+        })
+    }
+
+    /// Return `true` if a later change to the directory must give a different stamp.
+    ///
+    /// A zero inode, a missing change time, a whole-second change time, or a
+    /// change time within one second of `now` gives `false`. A directory that a
+    /// process of this user can change also gives `false`.
+    pub(super) fn usable(&self, now: rcmake_host::FileTime, effective_uid: Option<u32>) -> bool {
+        self.ino != 0
+            && super::immutable(
+                &Metadata {
+                    kind: FileKind::Dir,
+                    len: 0,
+                    mode: self.mode,
+                    mtime: self.mtime,
+                    ctime: self.ctime,
+                    atime: self.mtime,
+                    dev: self.dev,
+                    ino: self.ino,
+                    nlink: 0,
+                    owner: self.owner,
+                },
+                effective_uid,
+            )
+            && self
+                .ctime
+                .is_some_and(|ctime| ctime.nanos != 0 && ctime.secs < now.secs.saturating_sub(1))
+    }
+
+    fn matches(&self, host: &dyn Host) -> bool {
+        host.metadata_fresh(&self.path, Follow::No)
+            .is_ok_and(|metadata| {
+                metadata.kind == FileKind::Dir
+                    && metadata.dev == self.dev
+                    && metadata.ino == self.ino
+                    && metadata.mtime == self.mtime
+                    && metadata.ctime == self.ctime
+                    && metadata.mode == self.mode
+                    && metadata.owner == self.owner
+            })
+    }
+}
+
+/// The directory stamps that one walk collects.
+#[derive(Default)]
+pub(super) struct DirStamps {
+    pub(super) dirs: Vec<DirStamp>,
+    /// `false` if the walk could not stamp a visited directory.
+    pub(super) complete: bool,
+}
+
+/// Check all stamps and observed links with fresh queries.
+pub(super) fn stamps_match(host: &dyn Host, dirs: &[DirStamp], links: &[SdkLink]) -> bool {
+    let check = |index: usize| match index.checked_sub(dirs.len()) {
+        None => dirs.get(index).is_some_and(|stamp| stamp.matches(host)),
+        Some(link) => links.get(link).is_some_and(|link| link.matches_fresh(host)),
+    };
+    let total = dirs.len() + links.len();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let next = AtomicUsize::new(0);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let work = || {
+            while !failed.load(Ordering::Relaxed) {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= total {
+                    break;
+                }
+                if !check(index) {
+                    failed.store(true, Ordering::Relaxed);
+                }
+            }
+        };
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(3);
+            for _ in 1..total.min(4) {
+                if let Ok(handle) = std::thread::Builder::new().spawn_scoped(scope, work) {
+                    handles.push(handle);
+                }
+            }
+            work();
+            for handle in handles {
+                if handle.join().is_err() {
+                    failed.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        !failed.load(Ordering::Relaxed)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        (0..total).all(check)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +250,20 @@ pub(super) struct SdkLink {
 }
 
 impl SdkLink {
+    /// Like [`SdkLink::matches`], but resolve the link without a cache.
+    fn matches_fresh(&self, host: &dyn Host) -> bool {
+        match &self.resolved {
+            Some((target, kind)) => {
+                host.metadata_fresh(&self.path, Follow::Yes)
+                    .is_ok_and(|stat| stat.kind == *kind)
+                    && host.canonicalize_fresh(&self.path).as_ref() == Ok(target)
+            }
+            None => host
+                .metadata_fresh(&self.path, Follow::Yes)
+                .is_err_and(|error| error.kind == ErrorKind::NotFound),
+        }
+    }
+
     pub(super) fn matches(&self, host: &dyn Host) -> bool {
         match &self.resolved {
             Some((target, kind)) => {
@@ -145,9 +302,24 @@ enum SdkEntry {
 struct SdkDirSnapshot {
     entry_count: usize,
     entries: HostResult<Vec<SdkEntry>>,
+    stamp: Option<DirStamp>,
 }
 
-fn read_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResult<SdkDirSnapshot> {
+fn read_sdk_dir(
+    host: &dyn Host,
+    canonical: &Path,
+    directory: &Path,
+    stamp: bool,
+) -> HostResult<SdkDirSnapshot> {
+    // Stamp the directory before the listing, so that the stamp is never newer
+    // than the entries.
+    let stamp = stamp.then(|| DirStamp::capture(host, directory)).flatten();
+    let mut snapshot = list_sdk_dir(host, canonical, directory)?;
+    snapshot.stamp = stamp;
+    Ok(snapshot)
+}
+
+fn list_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResult<SdkDirSnapshot> {
     let mut entries = host.read_dir(directory)?;
     let entry_count = entries.len();
     entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
@@ -162,6 +334,7 @@ fn read_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResu
                 entries: Err(HostError::unsupported(
                     "Invalid SDK search directory entry.",
                 )),
+                stamp: None,
             });
         }
         let child = directory.join(name);
@@ -178,6 +351,7 @@ fn read_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResu
                         return Ok(SdkDirSnapshot {
                             entry_count,
                             entries: Err(error),
+                            stamp: None,
                         });
                     }
                 };
@@ -195,6 +369,7 @@ fn read_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResu
                         return Ok(SdkDirSnapshot {
                             entry_count,
                             entries: Err(error),
+                            stamp: None,
                         });
                     }
                 };
@@ -204,6 +379,7 @@ fn read_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResu
                         return Ok(SdkDirSnapshot {
                             entry_count,
                             entries: Err(error),
+                            stamp: None,
                         });
                     }
                 };
@@ -211,10 +387,17 @@ fn read_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResu
                     return Ok(SdkDirSnapshot {
                         entry_count,
                         entries: Err(HostError::unsupported("Unsupported SDK search entry.")),
+                        stamp: None,
                     });
                 }
+                // Recheck a link whose target is absolute or has dot
+                // components. Its resolution can pass outside the tree and
+                // return, so the directory stamps do not cover it.
                 let observe = !resolved.starts_with(canonical)
-                    || !link_stays_in_tree(canonical, directory, &target);
+                    || !link_stays_in_tree(canonical, directory, &target)
+                    || target
+                        .components()
+                        .any(|component| !matches!(component, Component::Normal(_)));
                 parsed.push(SdkEntry::SymlinkResolved {
                     name: entry.name,
                     target,
@@ -228,6 +411,7 @@ fn read_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResu
                 return Ok(SdkDirSnapshot {
                     entry_count,
                     entries: Err(HostError::unsupported("Unsupported SDK search entry.")),
+                    stamp: None,
                 });
             }
         }
@@ -235,6 +419,7 @@ fn read_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResu
     Ok(SdkDirSnapshot {
         entry_count,
         entries: Ok(parsed),
+        stamp: None,
     })
 }
 
@@ -242,6 +427,7 @@ fn read_sdk_dir(host: &dyn Host, canonical: &Path, directory: &Path) -> HostResu
 fn prefetch_sdk_graph(
     host: &dyn Host,
     canonical: &Path,
+    stamp: bool,
 ) -> HashMap<PathBuf, HostResult<SdkDirSnapshot>> {
     let mut prefetched = HashMap::new();
     let mut seen = BTreeSet::from([canonical.to_owned()]);
@@ -255,7 +441,7 @@ fn prefetch_sdk_graph(
         let wave: Vec<(PathBuf, HostResult<SdkDirSnapshot>)> = if frontier.len() <= 2 {
             frontier
                 .iter()
-                .map(|dir| (dir.clone(), read_sdk_dir(host, canonical, dir)))
+                .map(|dir| (dir.clone(), read_sdk_dir(host, canonical, dir, stamp)))
                 .collect()
         } else {
             let next = AtomicUsize::new(0);
@@ -268,7 +454,7 @@ fn prefetch_sdk_graph(
                     let Some(dir) = frontier.get(idx) else {
                         break;
                     };
-                    local.push((dir.clone(), read_sdk_dir(host, canonical, dir)));
+                    local.push((dir.clone(), read_sdk_dir(host, canonical, dir, stamp)));
                 }
                 if let Ok(mut guard) = out.lock() {
                     guard.extend(local);
@@ -331,16 +517,23 @@ fn prefetch_sdk_graph(
 fn prefetch_sdk_graph(
     _host: &dyn Host,
     _canonical: &Path,
+    _stamp: bool,
 ) -> HashMap<PathBuf, HostResult<SdkDirSnapshot>> {
     HashMap::new()
 }
 
+/// Hash the SDK graph below `canonical`. With `stamps`, also stamp each visited directory.
 pub(super) fn sdk_graph(
     host: &dyn Host,
     canonical: &Path,
+    mut stamps: Option<&mut DirStamps>,
     mut observe_link: impl FnMut(PathBuf, Option<(PathBuf, FileKind)>),
 ) -> HostResult<Digest> {
-    let mut prefetched = prefetch_sdk_graph(host, canonical);
+    let stamp = stamps.is_some();
+    if let Some(stamps) = stamps.as_deref_mut() {
+        stamps.complete = true;
+    }
+    let mut prefetched = prefetch_sdk_graph(host, canonical, stamp);
     let mut key = KeyHasher::new(Domain::BlobV1);
     key.field(0, b"sdk-tree-graph");
     key.field(1, canonical.as_os_str().as_encoded_bytes());
@@ -353,8 +546,14 @@ pub(super) fn sdk_graph(
         }
         let snapshot = match prefetched.remove(&directory) {
             Some(result) => result?,
-            None => read_sdk_dir(host, canonical, &directory)?,
+            None => read_sdk_dir(host, canonical, &directory, stamp)?,
         };
+        if let Some(stamps) = stamps.as_deref_mut() {
+            match snapshot.stamp {
+                Some(stamp) if stamps.dirs.len() < MAX_DIR_STAMPS => stamps.dirs.push(stamp),
+                _ => stamps.complete = false,
+            }
+        }
         remaining = remaining
             .checked_sub(snapshot.entry_count)
             .filter(|_| depth <= 32)

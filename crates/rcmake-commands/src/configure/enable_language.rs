@@ -335,6 +335,8 @@ impl Bootstrap {
         }
 
         self.determine_system(cx)?;
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        self.prefetch_toolchain(cx, &languages);
 
         let mut states = Vec::with_capacity(languages.len());
         for name in languages {
@@ -477,12 +479,46 @@ impl Bootstrap {
 
     /// `cmGlobalNinjaGenerator::FindMakeProgram`: verify that the selected Ninja
     /// executable runs `--version` and meets the minimum required version.
+    /// Warm the probe memo in the background while the compilers are identified.
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn prefetch_toolchain(&self, cx: &mut Cx<'_>, languages: &[BString]) {
+        if self.in_try_compile
+            || !languages
+                .iter()
+                .any(|lang| matches!(lang.as_slice(), b"C" | b"CXX" | b"OBJC" | b"OBJCXX"))
+        {
+            return;
+        }
+        let sysroot = [b"_CMAKE_OSX_SYSROOT_PATH".as_slice(), b"CMAKE_OSX_SYSROOT"]
+            .into_iter()
+            .map(|name| path::to_native(&cx.var_or_empty(name)))
+            .find(|path| path.is_absolute());
+        if let Some(runtime) =
+            cx.session_data::<std::sync::Arc<super::try_compile::active::ProbeRuntime>>()
+        {
+            runtime.prefetch_toolchain(sysroot);
+        }
+    }
+
     fn verify_ninja_program(&self, cx: &mut Cx<'_>, program: &BString) -> Result<(), CmdError> {
         if !cx.host().supports_process_execution() {
             return Ok(());
         }
         let cwd = cx.current_binary_dir();
         let raw_env = cx.host().env_all();
+        // The session memo checks fresh metadata on every use. Verification
+        // mode uses a memo that hashes every time.
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let memo = cx
+            .session_data::<std::sync::Arc<super::try_compile::active::ProbeRuntime>>()
+            .map(|runtime| std::sync::Arc::clone(runtime.trace_memo()));
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let program_digest = |host: &dyn rcmake_host::Host, path: &std::path::Path| {
+            memo.as_ref().map_or_else(
+                || rcmake_store::file_digest(host, path),
+                |memo| memo.file_digest(host, path),
+            )
+        };
         #[cfg(all(feature = "native", any(unix, windows)))]
         let (request_env, cached_key) = {
             let native = path::to_native(program);
@@ -500,7 +536,7 @@ impl Bootstrap {
                     .is_some_and(|canonical| {
                         super::build_tool_facts::is_native_ninja(cx.host(), &canonical)
                     })
-                && let Ok(digest) = rcmake_store::file_digest(cx.host(), &native)
+                && let Ok(digest) = program_digest(cx.host(), &native)
             {
                 let mut normalized = raw_env;
                 super::try_compile::plan::process_environment(&mut normalized);
@@ -538,7 +574,7 @@ impl Bootstrap {
                 if let Some(version) = version.filter(|version| ninja_version_supported(version)) {
                     #[cfg(all(feature = "native", any(unix, windows)))]
                     if let Some((facts, native, digest, env_digest)) = cached_key
-                        && rcmake_store::file_digest(cx.host(), &native).ok() == Some(digest)
+                        && program_digest(cx.host(), &native).ok() == Some(digest)
                     {
                         facts.record_ninja(native, digest, env_digest, cwd, output, version);
                     }

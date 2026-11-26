@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod scope;
+
 use core::time::Duration;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
@@ -14,6 +16,7 @@ use crate::{
     CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, GracefulTimeout, Host, HostError,
     HostResult, Metadata, RunOutput, RunRequest, Stream, WriteMode,
 };
+use scope::{Affected, Dirs, ScopeState};
 
 /// Counts of cache operations since the adapter was created.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -35,6 +38,12 @@ struct Queries {
     no_follow: Option<HostResult<Metadata>>,
     entries: Option<HostResult<Vec<DirEntry>>>,
     canonical: Option<HostResult<PathBuf>>,
+    /// The number of filled slots, which the cache entry count includes.
+    count: usize,
+    /// The bytes that the slots charge to the cache byte count.
+    bytes: usize,
+    /// The objects that the queries of this path depend on.
+    scope: ScopeState,
 }
 
 const MAX_DIRECTORY_NAMES: usize = 4096;
@@ -45,6 +54,10 @@ struct DirFacts {
     folded: HashSet<Box<[u8]>>,
     max_name_len: usize,
     missing: HostError,
+    /// The bytes that these facts charge to the directory byte count.
+    bytes: usize,
+    /// The objects that the listing of this directory depends on.
+    scope: ScopeState,
 }
 
 impl DirFacts {
@@ -100,10 +113,140 @@ struct Cache {
     bytes: usize,
     generation: u64,
     active_changes: usize,
-    tracked: BTreeMap<PathBuf, u64>,
+    tracked: BTreeMap<PathBuf, Tracked>,
     directory_facts: BTreeMap<OsString, DirFacts>,
     directory_misses: BTreeMap<OsString, u8>,
     directory_bytes: usize,
+    /// Directory identity chains for path-scoped invalidation.
+    dirs: Dirs,
+    /// The number of changes that started, which identifies each change.
+    started: u64,
+}
+
+/// Cached state that a change takes out of the cache while it runs without the lock.
+#[derive(Default)]
+struct Taken {
+    paths: BTreeMap<OsString, Queries>,
+    entries: usize,
+    bytes: usize,
+    tracked: BTreeMap<PathBuf, Tracked>,
+    directory_facts: BTreeMap<OsString, DirFacts>,
+    directory_bytes: usize,
+    dirs: Dirs,
+}
+
+/// The generation of one tracked canonical path.
+struct Tracked {
+    revision: u64,
+    /// The objects that the path and its subtree depend on.
+    scope: ScopeState,
+}
+
+/// The possible effect of one host operation.
+#[derive(Clone, Copy)]
+enum Effect<'a> {
+    /// The operation can change any path.
+    Global,
+    /// The operation changes only these names and the objects that they name.
+    /// Queries that depend on none of these objects stay in the cache.
+    Names(&'a [&'a Path]),
+    /// A process can write below these paths. All queries leave the cache,
+    /// and only overlapping tracked paths get a new generation.
+    Process(&'a [&'a Path]),
+}
+
+impl Cache {
+    /// Move the cached state out of the cache. Clear the listing miss counters.
+    fn take(&mut self) -> Taken {
+        self.directory_misses.clear();
+        Taken {
+            paths: std::mem::take(&mut self.paths),
+            entries: std::mem::take(&mut self.entries),
+            bytes: std::mem::take(&mut self.bytes),
+            tracked: std::mem::take(&mut self.tracked),
+            directory_facts: std::mem::take(&mut self.directory_facts),
+            directory_bytes: std::mem::take(&mut self.directory_bytes),
+            dirs: std::mem::take(&mut self.dirs),
+        }
+    }
+
+    /// Merge state back into the cache. Other changes can have merged state too.
+    fn restore(&mut self, taken: Taken) {
+        for (path, queries) in taken.paths {
+            if let std::collections::btree_map::Entry::Vacant(slot) = self.paths.entry(path) {
+                self.entries += queries.count;
+                self.bytes += queries.bytes;
+                slot.insert(queries);
+            }
+        }
+        for (path, facts) in taken.directory_facts {
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                self.directory_facts.entry(path)
+            {
+                self.directory_bytes += facts.bytes;
+                slot.insert(facts);
+            }
+        }
+        for (path, tracked) in taken.tracked {
+            match self.tracked.entry(path) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(tracked);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let current = slot.get_mut();
+                    current.revision = current.revision.max(tracked.revision);
+                    current.scope = ScopeState::Pending;
+                }
+            }
+        }
+        self.dirs.merge(taken.dirs);
+    }
+}
+
+impl Taken {
+    /// Remove every query and directory fact.
+    fn clear_queries(&mut self) {
+        self.paths.clear();
+        self.directory_facts.clear();
+        self.dirs.clear();
+        self.entries = 0;
+        self.bytes = 0;
+        self.directory_bytes = 0;
+    }
+
+    /// Remove only the queries that can depend on an affected object.
+    fn retain_unaffected<H: Host + ?Sized>(&mut self, base: &H, affected: &Affected) {
+        let Self {
+            paths,
+            entries,
+            bytes,
+            directory_facts,
+            directory_bytes,
+            dirs,
+            ..
+        } = self;
+        paths.retain(|path, queries| {
+            let keep = queries
+                .scope
+                .survives(dirs, base, Path::new(path), affected, false);
+            if !keep {
+                *entries -= queries.count;
+                *bytes -= queries.bytes;
+            }
+            keep
+        });
+        directory_facts.retain(|path, facts| {
+            let keep = facts
+                .scope
+                .survives(dirs, base, Path::new(path), affected, false);
+            if !keep {
+                *directory_bytes -= facts.bytes;
+            }
+            keep
+        });
+        // Remove the chains last, because the scopes above can read them.
+        dirs.retain_unaffected(affected);
+    }
 }
 
 fn path_bytes(path: &Path) -> usize {
@@ -121,7 +264,10 @@ fn listing_bytes(entries: &[DirEntry]) -> usize {
 /// Caches metadata, directory listings, and canonical paths for one configure.
 ///
 /// The cache stores successes and not-found results within fixed entry and byte
-/// limits. Filesystem changes, file locks, and process calls clear all queries.
+/// limits. A filesystem change through this adapter removes the queries that
+/// depend on a changed object. The device and inode of each object identify it,
+/// so aliases of one object compare equal. Recursive removal, file locks,
+/// process calls, and objects without an identity clear all queries.
 /// Queries bypass the cache while these calls are active.
 ///
 /// Use a new adapter when the base can change through another handle.
@@ -160,6 +306,12 @@ impl<H: Host + ?Sized> MemoHost<H> {
         }
     }
 
+    /// Return the host that this adapter wraps. Queries through it bypass the cache.
+    #[must_use]
+    pub fn base(&self) -> &Arc<H> {
+        &self.base
+    }
+
     /// Return the current cache counters.
     #[must_use]
     pub fn stats(&self) -> MemoStats {
@@ -182,20 +334,26 @@ impl<H: Host + ?Sized> MemoHost<H> {
         if cache.active_changes != 0 {
             return None;
         }
-        if let Some(&generation) = cache.tracked.get(path) {
-            return Some(generation);
+        if let Some(tracked) = cache.tracked.get(path) {
+            return Some(tracked.revision);
         }
         if cache.tracked.len() >= 2048 {
             return None;
         }
         let generation = cache.generation;
-        cache.tracked.insert(path.to_owned(), generation);
+        cache.tracked.insert(
+            path.to_owned(),
+            Tracked {
+                revision: generation,
+                scope: ScopeState::Pending,
+            },
+        );
         Some(generation)
     }
 
     /// Invalidate queries after changes made through another host handle.
     pub fn clear(&self) {
-        drop(self.begin_change());
+        drop(self.begin_change(Effect::Global));
     }
 
     fn read_cache(&self) -> RwLockReadGuard<'_, Cache> {
@@ -274,7 +432,7 @@ impl<H: Host + ?Sized> MemoHost<H> {
             cache.directory_bytes += bytes;
             cache
                 .directory_facts
-                .insert(claim.parent.into_os_string(), facts);
+                .insert(claim.parent.into_os_string(), DirFacts { bytes, ..facts });
         }
     }
 
@@ -322,6 +480,8 @@ impl<H: Host + ?Sized> MemoHost<H> {
                 folded,
                 max_name_len,
                 missing,
+                bytes: 0,
+                scope: ScopeState::Pending,
             },
             bytes,
         ))
@@ -339,16 +499,20 @@ impl<H: Host + ?Sized> MemoHost<H> {
         let negative = listing_negatives.then(|| negative_leaf(p)).flatten();
         let generation = {
             let cache = self.read_cache();
-            if let Some((parent, name)) = negative
-                && let Some(facts) = cache.directory_facts.get(parent.as_os_str())
-                && facts.absent(name)
-            {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Err(facts.missing(p));
-            }
-            if let Some(entry) = cache.paths.get(p.as_os_str()).and_then(|q| get(q).as_ref()) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return entry.clone();
+            // A change can be in progress on another thread. Use no cached
+            // answer until it completes.
+            if cache.active_changes == 0 {
+                if let Some((parent, name)) = negative
+                    && let Some(facts) = cache.directory_facts.get(parent.as_os_str())
+                    && facts.absent(name)
+                {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Err(facts.missing(p));
+                }
+                if let Some(entry) = cache.paths.get(p.as_os_str()).and_then(|q| get(q).as_ref()) {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return entry.clone();
+                }
             }
             (cache.active_changes == 0 && cache.entries < MAX_CACHE_ENTRIES)
                 .then_some(cache.generation)
@@ -370,7 +534,8 @@ impl<H: Host + ?Sized> MemoHost<H> {
         let bytes = value_bytes
             .saturating_add(path_bytes(p))
             .saturating_add(size_of::<(OsString, Queries)>());
-        let mut cache = self.write_cache();
+        let mut guard = self.write_cache();
+        let cache = &mut *guard;
         let mut claim = None;
         if cache.generation == generation
             && cache.active_changes == 0
@@ -378,54 +543,100 @@ impl<H: Host + ?Sized> MemoHost<H> {
             && bytes <= MAX_CACHE_BYTES - cache.bytes
         {
             if let (Some((parent, _)), Err(error)) = (negative, &result) {
-                claim = self.claim_directory_listing(&mut cache, parent, p, error);
+                claim = self.claim_directory_listing(cache, parent, p, error);
             }
             let queries = cache.paths.entry(p.as_os_str().to_owned()).or_default();
-            let slot = slot(queries);
-            if slot.is_none() {
-                *slot = Some(result.clone());
+            let filled = slot(queries);
+            if filled.is_none() {
+                *filled = Some(result.clone());
+                queries.count += 1;
+                queries.bytes += bytes;
                 cache.entries += 1;
                 cache.bytes += bytes;
             }
         }
         // List the directory without the guard, so that other readers can proceed.
-        drop(cache);
+        drop(guard);
         if let Some(claim) = claim {
             self.publish_directory_facts(generation, claim);
         }
         result
     }
 
-    fn begin_change(&self) -> ActiveChange<'_, H> {
-        self.begin_change_for(&[])
+    fn begin_change_for(&self, paths: &[&Path]) -> ActiveChange<'_, H> {
+        self.begin_change(Effect::Names(paths))
     }
 
-    fn begin_change_for(&self, paths: &[&Path]) -> ActiveChange<'_, H> {
-        let mut cache = self.write_cache();
-        cache.generation = cache.generation.wrapping_add(1);
-        let generation = cache.generation;
-        if !cache.tracked.is_empty() {
-            let canonical: Option<Vec<_>> =
-                paths.iter().map(|path| self.change_path(path)).collect();
-            for (root, revision) in &mut cache.tracked {
+    /// Start a change. Queries bypass the cache until the change ends.
+    ///
+    /// The change takes the cached state out of the cache, so that it can query
+    /// the base without the lock. It merges the unaffected state back only if no
+    /// other change started meanwhile. Overlapping changes invalidate everything.
+    fn begin_change(&self, effect: Effect<'_>) -> ActiveChange<'_, H> {
+        let (ticket, generation, overlap, mut taken) = {
+            let mut cache = self.write_cache();
+            cache.generation = cache.generation.wrapping_add(1);
+            cache.started = cache.started.wrapping_add(1);
+            let overlap = cache.active_changes != 0;
+            cache.active_changes += 1;
+            (cache.started, cache.generation, overlap, cache.take())
+        };
+        let paths: &[&Path] = match effect {
+            Effect::Global => &[],
+            Effect::Names(paths) | Effect::Process(paths) => paths,
+        };
+        let base = self.base.as_ref();
+        // Find the affected objects before the change. Unknown identities
+        // give `None`, which removes every query.
+        let affected = match effect {
+            _ if overlap || paths.is_empty() => None,
+            Effect::Global => None,
+            Effect::Process(_) if taken.tracked.is_empty() => None,
+            Effect::Names(_) | Effect::Process(_) => paths
+                .iter()
+                .map(|path| taken.dirs.affected(base, path))
+                .collect::<Option<Vec<_>>>()
+                .map(Affected::merge),
+        };
+        if !taken.tracked.is_empty() {
+            let canonical: Option<Vec<_>> = if affected.is_some() {
+                paths.iter().map(|path| self.change_path(path)).collect()
+            } else {
+                None
+            };
+            let Taken { tracked, dirs, .. } = &mut taken;
+            for (root, entry) in tracked.iter_mut() {
                 let overlaps = |path: &Path| path.starts_with(root) || root.starts_with(path);
-                if paths.is_empty()
-                    || paths.iter().any(|path| overlaps(path))
-                    || canonical
-                        .as_ref()
-                        .is_none_or(|paths| paths.iter().any(|path| overlaps(path)))
-                {
-                    *revision = generation;
+                let changed = affected.as_ref().is_none_or(|affected| {
+                    paths.iter().any(|path| overlaps(path))
+                        || canonical
+                            .as_ref()
+                            .is_none_or(|paths| paths.iter().any(|path| overlaps(path)))
+                        || !entry.scope.survives(dirs, base, root, affected, true)
+                });
+                if changed {
+                    entry.revision = generation;
+                    entry.scope = ScopeState::Pending;
                 }
             }
         }
-        cache.active_changes += 1;
-        cache.paths.clear();
-        cache.directory_facts.clear();
-        cache.directory_misses.clear();
-        cache.directory_bytes = 0;
-        cache.entries = 0;
-        cache.bytes = 0;
+        match (effect, &affected) {
+            (Effect::Names(_), Some(affected)) => taken.retain_unaffected(base, affected),
+            _ => taken.clear_queries(),
+        }
+        let mut cache = self.write_cache();
+        if cache.started != ticket {
+            // Another change started while this one held the state. Keep no
+            // query, and give every tracked path a new generation.
+            taken.clear_queries();
+            let generation = cache.generation;
+            for entry in taken.tracked.values_mut() {
+                entry.revision = generation;
+                entry.scope = ScopeState::Pending;
+            }
+        }
+        cache.restore(taken);
+        drop(cache);
         ActiveChange { host: self }
     }
 
@@ -514,6 +725,17 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         self.base.metadata_fresh(p, follow)
     }
 
+    fn open_read_with_metadata(
+        &self,
+        p: &Path,
+    ) -> HostResult<(Box<dyn crate::ReadSeek + '_>, Option<Metadata>)> {
+        self.base.open_read_with_metadata(p)
+    }
+
+    fn directory_times_track_names(&self) -> bool {
+        self.base.directory_times_track_names()
+    }
+
     fn canonicalize_fresh(&self, p: &Path) -> HostResult<PathBuf> {
         self.base.canonicalize_fresh(p)
     }
@@ -534,7 +756,8 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     }
 
     fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
-        let _change = self.begin_change_for(&[p]);
+        // Removal of a subtree changes the link counts of hard links outside it.
+        let _change = self.begin_change(Effect::Process(&[p]));
         self.base.remove_dir_all(p)
     }
 
@@ -553,7 +776,8 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         path: &Path,
         timeout: Option<Duration>,
     ) -> HostResult<Box<dyn FileLockGuard>> {
-        let _change = self.begin_change_for(&[path]);
+        // Another process can change any file before it releases the lock.
+        let _change = self.begin_change(Effect::Global);
         self.base.lock_file(path, timeout)
     }
 
@@ -568,7 +792,8 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
-        let _change = self.begin_change_for(&[dst]);
+        // A new link changes the link count of the source object.
+        let _change = self.begin_change_for(&[src, dst]);
         self.base.hard_link(src, dst)
     }
 
@@ -613,7 +838,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         req: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        let _change = self.begin_change();
+        let _change = self.begin_change(Effect::Global);
         self.base.run(req, on_output)
     }
 
@@ -623,12 +848,8 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         scope: crate::WriteScope<'_>,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        let paths = if scope.0.iter().all(|path| path.is_absolute()) {
-            scope.0
-        } else {
-            &[]
-        };
-        let _change = self.begin_change_for(paths);
+        // A declared scope does not prove where links and hard links lead.
+        let _change = self.begin_change(Effect::Global);
         self.base.run_confined(req, scope, on_output)
     }
 
@@ -638,12 +859,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         limit: usize,
         scope: crate::WriteScope<'_>,
     ) -> HostResult<RunOutput> {
-        let paths = if scope.0.iter().all(|path| path.is_absolute()) {
-            scope.0
-        } else {
-            &[]
-        };
-        let _change = self.begin_change_for(paths);
+        let _change = self.begin_change(Effect::Global);
         self.base.run_bounded_confined(req, limit, scope)
     }
 
@@ -653,7 +869,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         timeout: GracefulTimeout,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        let _change = self.begin_change();
+        let _change = self.begin_change(Effect::Global);
         self.base.run_with_timeout_signal(req, timeout, on_output)
     }
 
@@ -675,12 +891,12 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         hard_limit: Option<Duration>,
         update: &mut crate::DeadlineUpdate<'_>,
     ) -> HostResult<crate::ControlledOutput> {
-        let _change = self.begin_change();
+        let _change = self.begin_change(Effect::Global);
         self.base.run_controlled(req, graceful, hard_limit, update)
     }
 
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
-        let _change = self.begin_change();
+        let _change = self.begin_change(Effect::Global);
         self.base.run_bounded(req, limit)
     }
 
@@ -1045,9 +1261,10 @@ mod tests {
         host.create_dir_all(&work.join("dir"))?;
         host.write(&path, b"new", WriteMode::Truncate)?;
         assert_eq!(host.read_dir(work)?.len(), 2);
+        // Changes to other names leave the sibling answer in the cache.
         let before = host.stats();
-        host.metadata(&sibling, Follow::Yes)?;
-        assert_eq!(host.stats().misses, before.misses + 1);
+        assert_eq!(host.metadata(&sibling, Follow::Yes)?.len, 4);
+        assert_eq!(host.stats().hits, before.hits + 1);
 
         let link = work.join("link");
         let hard = work.join("hard");
@@ -1190,6 +1407,333 @@ mod tests {
         gate.release();
         lister.join().unwrap();
         assert!(memo.metadata(&dir.join("late"), Follow::No).is_ok());
+        Ok(())
+    }
+
+    /// Compare every cached answer for `paths` with a fresh base query.
+    #[cfg(unix)]
+    fn assert_matches_base<H: Host>(memo: &MemoHost<H>, base: &H, paths: &[PathBuf]) {
+        // Reads can change the access time, so compare everything else.
+        fn stat(result: HostResult<Metadata>) -> Result<Metadata, ErrorKind> {
+            result
+                .map(|metadata| Metadata {
+                    atime: FileTime::default(),
+                    ..metadata
+                })
+                .map_err(|error| error.kind)
+        }
+        fn listing(
+            result: HostResult<Vec<DirEntry>>,
+        ) -> Result<Vec<(BString, FileKind)>, ErrorKind> {
+            result
+                .map(|entries| {
+                    let mut names: Vec<_> = entries.into_iter().map(|e| (e.name, e.kind)).collect();
+                    names.sort_by(|left, right| left.0.cmp(&right.0));
+                    names
+                })
+                .map_err(|error| error.kind)
+        }
+        for path in paths {
+            for follow in [Follow::Yes, Follow::No] {
+                assert_eq!(
+                    stat(memo.metadata(path, follow)),
+                    stat(base.metadata(path, follow)),
+                    "{} {follow:?}",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                listing(memo.read_dir(path)),
+                listing(base.read_dir(path)),
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                memo.canonicalize(path).map_err(|error| error.kind),
+                base.canonicalize(path).map_err(|error| error.kind),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    /// Return the cache charges recounted from the retained records.
+    fn recount<H: Host + ?Sized>(memo: &MemoHost<H>) -> (usize, usize, usize) {
+        let cache = memo.read_cache();
+        let entries = cache.paths.values().map(|queries| queries.count).sum();
+        let bytes = cache.paths.values().map(|queries| queries.bytes).sum();
+        let directory = cache
+            .directory_facts
+            .values()
+            .map(|facts| facts.bytes)
+            .sum();
+        assert_eq!(
+            (cache.entries, cache.bytes, cache.directory_bytes),
+            (entries, bytes, directory)
+        );
+        (entries, bytes, directory)
+    }
+
+    #[cfg(unix)]
+    fn native_fixture() -> HostResult<(tempfile::TempDir, Arc<crate::NativeHost>, PathBuf)> {
+        let temp = tempfile::tempdir().map_err(|error| HostError::from_io(error, None))?;
+        let base = Arc::new(crate::NativeHost::new()?);
+        let root = base.canonicalize(temp.path())?;
+        Ok((temp, base, root))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writes_through_a_directory_link_alias_invalidate_the_other_spelling() -> HostResult<()> {
+        let (_temp, base, root) = native_fixture()?;
+        let real = root.join("private/tmp");
+        base.create_dir_all(&real)?;
+        base.write(&real.join("file"), b"a", WriteMode::CreateNew)?;
+        // `tmp` points to `private/tmp`, as `/tmp` does on macOS.
+        let alias = root.join("tmp");
+        base.symlink(Path::new("private/tmp"), &alias)?;
+        let memo = MemoHost::from_shared(Arc::clone(&base));
+        let paths = [
+            alias.join("file"),
+            real.join("file"),
+            alias.clone(),
+            real.clone(),
+            alias.join("new"),
+            real.join("new"),
+        ];
+        assert_matches_base(&memo, &base, &paths);
+        memo.write(&alias.join("file"), b"longer", WriteMode::Truncate)?;
+        assert_matches_base(&memo, &base, &paths);
+        memo.write(&real.join("new"), b"n", WriteMode::CreateNew)?;
+        assert_matches_base(&memo, &base, &paths);
+        memo.remove_file(&alias.join("new"))?;
+        assert_matches_base(&memo, &base, &paths);
+        recount(&memo);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn writes_through_tmp_invalidate_private_tmp() -> HostResult<()> {
+        let base = Arc::new(crate::NativeHost::new()?);
+        let temp = tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .map_err(|error| HostError::from_io(error, None))?;
+        let name = temp.path().file_name().ok_or_else(fixture_error)?;
+        let tmp = Path::new("/tmp").join(name);
+        let private = Path::new("/private/tmp").join(name);
+        base.write(&tmp.join("file"), b"a", WriteMode::CreateNew)?;
+        let memo = MemoHost::from_shared(Arc::clone(&base));
+        let paths = [
+            tmp.join("file"),
+            private.join("file"),
+            tmp.clone(),
+            private.clone(),
+        ];
+        assert_matches_base(&memo, &base, &paths);
+        memo.write(&tmp.join("file"), b"changed", WriteMode::Truncate)?;
+        assert_matches_base(&memo, &base, &paths);
+        memo.write(&private.join("other"), b"o", WriteMode::CreateNew)?;
+        assert_matches_base(&memo, &base, &paths);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hard_link_changes_invalidate_every_name_of_the_object() -> HostResult<()> {
+        let (_temp, base, root) = native_fixture()?;
+        let (one, two) = (root.join("one"), root.join("two"));
+        base.create_dir_all(&one)?;
+        base.create_dir_all(&two)?;
+        let a = one.join("a");
+        let b = two.join("b");
+        let c = two.join("c");
+        base.write(&a, b"data", WriteMode::CreateNew)?;
+        base.hard_link(&a, &b)?;
+        let memo = MemoHost::from_shared(Arc::clone(&base));
+        let paths = [a.clone(), b.clone(), c.clone()];
+        assert_matches_base(&memo, &base, &paths);
+        memo.write(&a, b"longer data", WriteMode::Truncate)?;
+        assert_matches_base(&memo, &base, &paths);
+        memo.set_permissions(&a, 0o600)?;
+        assert_matches_base(&memo, &base, &paths);
+        // A new link and an unlink change the link count of the other names.
+        memo.hard_link(&a, &c)?;
+        assert_matches_base(&memo, &base, &paths);
+        memo.remove_file(&b)?;
+        assert_matches_base(&memo, &base, &paths);
+        recount(&memo);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn renames_and_link_targets_invalidate_dependent_resolutions() -> HostResult<()> {
+        let (_temp, base, root) = native_fixture()?;
+        let (from, to, other) = (root.join("from"), root.join("to"), root.join("other"));
+        base.create_dir_all(&from.join("sub"))?;
+        base.create_dir_all(&to.join("old"))?;
+        base.create_dir_all(&other)?;
+        base.write(&from.join("sub/file"), b"from", WriteMode::CreateNew)?;
+        base.write(&to.join("old/file"), b"to", WriteMode::CreateNew)?;
+        // A link elsewhere points into the renamed subtree.
+        let link = other.join("link");
+        base.symlink(&from.join("sub"), &link)?;
+        // A dangling link becomes valid when its target appears.
+        let dangling = other.join("dangling");
+        base.symlink(&root.join("later/file"), &dangling)?;
+        let memo = MemoHost::from_shared(Arc::clone(&base));
+        let paths = [
+            from.clone(),
+            from.join("sub"),
+            from.join("sub/file"),
+            to.clone(),
+            to.join("sub/file"),
+            to.join("old/file"),
+            link.clone(),
+            link.join("file"),
+            dangling.clone(),
+            root.join("later"),
+            root.join("later/file"),
+            other.clone(),
+        ];
+        assert_matches_base(&memo, &base, &paths);
+        memo.remove_dir_all(&to)?;
+        assert_matches_base(&memo, &base, &paths);
+        memo.rename(&from, &to)?;
+        assert_matches_base(&memo, &base, &paths);
+        memo.create_dir_all(&root.join("later"))?;
+        assert_matches_base(&memo, &base, &paths);
+        memo.write(&root.join("later/file"), b"later", WriteMode::CreateNew)?;
+        assert_matches_base(&memo, &base, &paths);
+        // Replace the link with a link to a different target.
+        memo.remove_file(&link)?;
+        memo.symlink(&to.join("sub"), &link)?;
+        assert_matches_base(&memo, &base, &paths);
+        recount(&memo);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn names_created_through_an_alias_expire_negative_facts() -> HostResult<()> {
+        let (_temp, base, root) = native_fixture()?;
+        let real = root.join("real");
+        base.create_dir_all(&real)?;
+        let alias = root.join("alias");
+        base.symlink(&real, &alias)?;
+        let memo = MemoHost::from_shared(Arc::clone(&base));
+        for n in 0..LIST_AFTER_MISSES {
+            assert!(
+                memo.metadata(&real.join(format!("missing{n}")), Follow::No)
+                    .is_err()
+            );
+        }
+        assert!(
+            memo.read_cache()
+                .directory_facts
+                .contains_key(real.as_os_str())
+        );
+        let created = real.join("created");
+        assert!(memo.metadata(&created, Follow::No).is_err());
+        memo.write(&alias.join("created"), b"c", WriteMode::CreateNew)?;
+        assert_eq!(memo.metadata(&created, Follow::No)?.len, 1);
+        assert_matches_base(&memo, &base, &[real.clone(), created]);
+        recount(&memo);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scoped_writes_keep_unrelated_answers_and_exact_charges() -> HostResult<()> {
+        let (_temp, base, root) = native_fixture()?;
+        let (tools, scratch) = (root.join("tools"), root.join("scratch"));
+        base.create_dir_all(&tools)?;
+        base.create_dir_all(&scratch)?;
+        let tool = tools.join("cc");
+        base.write(&tool, b"tool", WriteMode::CreateNew)?;
+        let memo = MemoHost::from_shared(Arc::clone(&base));
+        for round in 0..4 {
+            memo.metadata(&tool, Follow::Yes)?;
+            memo.canonicalize(&tool)?;
+            memo.read_dir(&tools)?;
+            let file = scratch.join(format!("probe{round}"));
+            assert!(memo.metadata(&file, Follow::No).is_err());
+            let before = memo.stats();
+            memo.write(&file, b"x", WriteMode::CreateNew)?;
+            // The write leaves the tool answers in the cache.
+            memo.metadata(&tool, Follow::Yes)?;
+            memo.canonicalize(&tool)?;
+            memo.read_dir(&tools)?;
+            assert_eq!(memo.stats().hits, before.hits + 3);
+            assert_eq!(memo.metadata(&file, Follow::No)?.len, 1);
+            recount(&memo);
+        }
+        // A process call still clears every answer.
+        drop(memo.begin_change(Effect::Global));
+        assert_eq!(recount(&memo), (0, 0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn queries_bypass_retained_answers_while_a_change_is_active() -> HostResult<()> {
+        let base = PureHost::default();
+        let kept = Path::new("/work/kept");
+        base.seed_file(kept, b"kept")?;
+        base.seed_file(Path::new("/scratch/file"), b"s")?;
+        let memo = MemoHost::new(base);
+        memo.metadata(kept, Follow::Yes)?;
+        let first = memo.begin_change_for(&[Path::new("/scratch/file")]);
+        let second = memo.begin_change_for(&[Path::new("/scratch/other")]);
+        let before = memo.stats();
+        memo.metadata(kept, Follow::Yes)?;
+        assert_eq!(memo.stats().hits, before.hits);
+        drop(first);
+        memo.metadata(kept, Follow::Yes)?;
+        assert_eq!(memo.stats().hits, before.hits);
+        drop(second);
+        // The changes overlapped, so the answer left the cache.
+        assert_eq!(memo.metadata(kept, Follow::Yes)?.len, 4);
+        assert_eq!(memo.stats().hits, before.hits);
+        memo.metadata(kept, Follow::Yes)?;
+        assert_eq!(memo.stats().hits, before.hits + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn deep_writes_through_a_mount_alias_change_tracked_generations() -> HostResult<()> {
+        let base = ProbeHost::default();
+        base.base
+            .seed_file(Path::new("/work/sub/deep/old.h"), b"o")?;
+        let host = MemoHost::new(base);
+        let before = host.stable_generation_for(Path::new("/work"));
+        let other = host.stable_generation_for(Path::new("/other"));
+        // `/mount` reaches the same objects as `/work`, without a link.
+        host.write(
+            Path::new("/mount/sub/deep/new.h"),
+            b"n",
+            WriteMode::CreateNew,
+        )?;
+        assert_ne!(host.stable_generation_for(Path::new("/work")), before);
+        assert_eq!(host.stable_generation_for(Path::new("/other")), other);
+        Ok(())
+    }
+
+    #[test]
+    fn overlapping_changes_keep_no_answer() -> HostResult<()> {
+        let base = PureHost::default();
+        let kept = Path::new("/work/kept");
+        base.seed_file(kept, b"kept")?;
+        let memo = MemoHost::new(base);
+        memo.metadata(kept, Follow::Yes)?;
+        let first = memo.begin_change_for(&[Path::new("/scratch/one")]);
+        // The first change retains the unrelated answer.
+        assert_eq!(recount(&memo).0, 1);
+        let second = memo.begin_change_for(&[Path::new("/scratch/two")]);
+        // A change during another change removes every answer.
+        assert_eq!(recount(&memo), (0, 0, 0));
+        drop(first);
+        drop(second);
         Ok(())
     }
 

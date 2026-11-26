@@ -27,7 +27,12 @@ pub(super) fn metadata(p: &Path, follow: Follow) -> HostResult<Metadata> {
         },
         p,
     )?;
-    Ok(Metadata {
+    Ok(from_std(&m))
+}
+
+/// Convert standard metadata, for example of an open file.
+pub(super) fn from_std(m: &fs::Metadata) -> Metadata {
+    Metadata {
         kind: file_kind(m.file_type()),
         len: m.len(),
         mode: m.mode() & 0o7777,
@@ -50,7 +55,7 @@ pub(super) fn metadata(p: &Path, follow: Follow) -> HostResult<Metadata> {
         ino: m.ino(),
         nlink: m.nlink(),
         owner: Some(m.uid()),
-    })
+    }
 }
 
 pub(super) fn open_input(path: &Path) -> io::Result<File> {

@@ -168,9 +168,32 @@ fn rename_noreplace_with_link(from: &Path, to: &Path) -> HostResult<()> {
 }
 
 impl Host for NativeHost {
+    fn directory_times_track_names(&self) -> bool {
+        cfg!(unix)
+    }
+
     fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
         HostError::require_absolute(p)?;
         platform::metadata(p, follow)
+    }
+
+    fn open_read_with_metadata(
+        &self,
+        p: &Path,
+    ) -> HostResult<(Box<dyn crate::ReadSeek + '_>, Option<Metadata>)> {
+        HostError::require_absolute(p)?;
+        let file = io_at(platform::open_input(p), p)?;
+        let opened = io_at(file.metadata(), p)?;
+        if !opened.is_file() {
+            return Err(HostError::unsupported(
+                "Streaming reads require a regular file.",
+            ));
+        }
+        #[cfg(unix)]
+        let metadata = Some(platform::from_std(&opened));
+        #[cfg(not(unix))]
+        let metadata = None;
+        Ok((Box::new(file), metadata))
     }
 
     fn open_read(&self, p: &Path) -> HostResult<Box<dyn crate::ReadSeek + '_>> {

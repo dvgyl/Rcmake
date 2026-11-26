@@ -288,6 +288,14 @@ impl CompilerEvidence {
         let (toolchain, platform) = if let Some(toolchain) = tools.get(&key) {
             (Arc::clone(toolchain), None)
         } else {
+            let previous = (family == Family::AppleClang)
+                .then(|| {
+                    tools.iter().find_map(|(other, evidence)| {
+                        (other.2 == key.2 && other.3 != cxx && other.4 == key.4)
+                            .then_some(evidence.as_ref())
+                    })
+                })
+                .flatten();
             // Discovery and the platform samples are independent system queries.
             let (toolchain, platform) = crate::configure::concurrent::join(
                 || {
@@ -298,6 +306,7 @@ impl CompilerEvidence {
                         &sdk,
                         cxx,
                         Arc::clone(memo),
+                        previous,
                     )
                 },
                 || platform_snapshot(host.as_ref(), cx),

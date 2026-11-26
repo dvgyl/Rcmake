@@ -149,7 +149,8 @@ pub(crate) fn copy_exact(
     output: &mut dyn Write,
     mut len: u64,
 ) -> io::Result<()> {
-    let mut buffer = vec![0; BUFFER];
+    // Do not allocate more than the copy needs.
+    let mut buffer = vec![0; len.min(BUFFER as u64) as usize];
     while len != 0 {
         let count = len.min(buffer.len() as u64) as usize;
         let chunk = buffer
