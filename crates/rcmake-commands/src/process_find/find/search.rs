@@ -15,7 +15,7 @@ use rcmake_syntax::ArgKind;
 
 use super::super::RootMode;
 use super::super::search_paths::{cmake_paths, file_metadata};
-use super::{Kind, Options, join_normalized, normalize_owned, use_default};
+use super::{Kind, Options, join_normalized, join_preserving_parent, normalize_owned, use_default};
 
 struct IgnoredPaths {
     directories: HashSet<PathBuf>,
@@ -116,7 +116,7 @@ impl SearchDirectory {
                     .map(|name| root.join(path::to_native(&name)).join("Headers"))
                     .collect();
                 let names = ascii.then(|| {
-                    let mut set = HashSet::with_capacity(entries.len());
+                    let mut set = HashSet::with_capacity(entries.len().min(4096));
                     for entry in entries {
                         let mut bytes: Vec<u8> = entry.name.into();
                         bytes.make_ascii_lowercase();
@@ -142,19 +142,33 @@ impl SearchDirectory {
         self.may_contain_leaf(name.as_encoded_bytes())
     }
 
+    fn may_contain_framework(&self, root: &Path, candidate: &Path) -> bool {
+        let Some(name) = candidate.strip_prefix(root).ok().and_then(single_component) else {
+            return true;
+        };
+        self.may_contain_framework_leaf(name.as_encoded_bytes())
+    }
+
+    fn may_contain_framework_leaf(&self, name: &[u8]) -> bool {
+        if matches!(
+            self,
+            Self::Listed {
+                has_framework: false,
+                ..
+            }
+        ) && ends_with_ignore_ascii_case(name, b".framework")
+        {
+            return false;
+        }
+        self.may_contain_leaf(name)
+    }
+
     fn may_contain_leaf(&self, name: &[u8]) -> bool {
         match self {
             Self::Missing => false,
             // The filesystem can fold or normalize non-ASCII names. On Windows a short
             // DOS name can also resolve to a different name in the directory listing.
-            Self::Listed {
-                names,
-                has_framework,
-                ..
-            } => {
-                if !*has_framework && ends_with_ignore_ascii_case(name, b".framework") {
-                    return false;
-                }
+            Self::Listed { names, .. } => {
                 let Some(names) = names else {
                     return true;
                 };
@@ -307,7 +321,7 @@ impl<'a> Search<'a> {
             false
         };
         if rerooted || arch_rewritten {
-            let mut seen = HashSet::with_capacity(dirs.len());
+            let mut seen = HashSet::with_capacity(dirs.len().min(4096));
             dirs.retain(|dir| {
                 if seen.contains(dir) {
                     false
@@ -379,6 +393,7 @@ impl<'a> Search<'a> {
             SearchPass::Framework => Self::framework,
             SearchPass::AppBundle => Self::app_bundle,
         };
+        let speculative = passes_len > 1;
         let precheck_dir = !self.hermetic
             && self.options.validator.is_none()
             && (names.len() > 1 || passes_len > 1 || matches!(self.kind, Kind::Library));
@@ -412,7 +427,7 @@ impl<'a> Search<'a> {
                 } else {
                     &unknown
                 };
-                search(this, cx, dir, name, directory)
+                search(this, cx, dir, name, directory, speculative)
             };
         if self.options.names_per_dir
             && matches!(self.kind, Kind::Library | Kind::Program)
@@ -454,6 +469,7 @@ impl<'a> Search<'a> {
         root: &Path,
         name: &Path,
         directory: &SearchDirectory,
+        speculative: bool,
     ) -> Result<Option<PathBuf>, CmdError> {
         if name.is_absolute() {
             return Ok(None);
@@ -468,8 +484,12 @@ impl<'a> Search<'a> {
             } else {
                 &path
             };
-            if !self.ignored.ignores_prefix(&path)
-                && directory.may_contain(root, &framework)
+            let allowed_probe = !(speculative
+                && self.hermetic
+                && !crate::hermetic::should_probe_speculative_path(cx, &path));
+            if allowed_probe
+                && !self.ignored.ignores_prefix(&path)
+                && directory.may_contain_framework(root, &framework)
                 && candidate(cx, Kind::File, &path)
                 && self.validate(cx, found, false)?
             {
@@ -491,6 +511,12 @@ impl<'a> Search<'a> {
             SearchDirectory::Listed { frameworks, .. } => frameworks,
             SearchDirectory::Missing => return Ok(None),
             SearchDirectory::Unknown | SearchDirectory::Unlisted | SearchDirectory::Existing => {
+                if speculative
+                    && self.hermetic
+                    && !crate::hermetic::should_probe_speculative_path(cx, root)
+                {
+                    return Ok(None);
+                }
                 fallback = match SearchDirectory::read(cx.host(), root, false) {
                     SearchDirectory::Listed { frameworks, .. } => frameworks,
                     _ => return Ok(None),
@@ -500,6 +526,12 @@ impl<'a> Search<'a> {
         };
         for headers in headers {
             let path = headers.join(name);
+            if speculative
+                && self.hermetic
+                && !crate::hermetic::should_probe_speculative_path(cx, &path)
+            {
+                continue;
+            }
             if !self.ignored.ignores_prefix(&path) && candidate(cx, Kind::File, &path) {
                 self.match_path = Some(path.clone());
                 return Ok(Some(if matches!(self.kind, Kind::Path) {
@@ -518,6 +550,7 @@ impl<'a> Search<'a> {
         dir: &Path,
         name: &Path,
         directory: &SearchDirectory,
+        speculative: bool,
     ) -> Result<Option<PathBuf>, CmdError> {
         if name.is_absolute()
             || (matches!(directory, SearchDirectory::Missing) && is_relative_descendant(name))
@@ -531,12 +564,15 @@ impl<'a> Search<'a> {
             buf.clear();
             buf.extend_from_slice(&name_bytes);
             buf.extend_from_slice(extension);
-            if direct_child && !directory.may_contain_leaf(&buf) {
+            if direct_child && !directory.may_contain_framework_leaf(&buf) {
                 continue;
             }
-            let path = join_normalized(dir, &path::to_native(&buf));
+            let path = join_preserving_parent(dir, &path::to_native(&buf));
             if self.ignored.ignores_prefix(&path)
-                || (!direct_child && !directory.may_contain(dir, &path))
+                || (!direct_child && !directory.may_contain_framework(dir, &path))
+                || (speculative
+                    && self.hermetic
+                    && !crate::hermetic::should_probe_speculative_path(cx, &path))
                 || !cx
                     .host()
                     .metadata(&path, Follow::Yes)
@@ -563,6 +599,7 @@ impl<'a> Search<'a> {
         dir: &Path,
         name: &Path,
         directory: &SearchDirectory,
+        speculative: bool,
     ) -> Result<Option<PathBuf>, CmdError> {
         if matches!(directory, SearchDirectory::Missing) && is_relative_descendant(name) {
             return Ok(None);
@@ -572,22 +609,52 @@ impl<'a> Search<'a> {
         };
         let mut bundle_name = name.as_os_str().to_os_string();
         bundle_name.push(".app");
-        let bundle = join_normalized(dir, Path::new(&bundle_name));
-        if !directory.may_contain(dir, &bundle) {
+        let raw_bundle = join_preserving_parent(dir, Path::new(&bundle_name));
+        if !directory.may_contain(dir, &raw_bundle) {
             return Ok(None);
         }
-        if !self.hermetic
+        let probe_bundle =
+            !self.hermetic || crate::hermetic::should_probe_speculative_path(cx, &raw_bundle);
+        if probe_bundle
             && !cx
                 .host()
-                .metadata(&bundle, Follow::Yes)
+                .metadata(&raw_bundle, Follow::Yes)
                 .is_ok_and(|meta| meta.kind == FileKind::Dir)
         {
             return Ok(None);
         }
-        let executable = bundle_executable(cx, &bundle, stem);
-        if !self.ignored.ignores_prefix(&executable) && file_metadata(cx, &executable).is_some() {
-            self.match_path = Some(executable.clone());
-            return Ok(Some(executable));
+        let raw_executable = bundle_executable(cx, &raw_bundle, stem, self.hermetic);
+        if speculative
+            && self.hermetic
+            && !crate::hermetic::should_probe_speculative_path(cx, &raw_executable)
+        {
+            return Ok(None);
+        }
+        if !self.ignored.ignores_prefix(&raw_executable)
+            && file_metadata(cx, &raw_executable).is_some()
+        {
+            let found = if raw_bundle
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+            {
+                let normalized = normalize_owned(raw_executable.clone());
+                let can_probe_normalized = !self.hermetic
+                    || crate::hermetic::should_probe_speculative_path(cx, &normalized);
+                if can_probe_normalized
+                    && cx
+                        .host()
+                        .canonicalize(&raw_executable)
+                        .is_ok_and(|raw| cx.host().canonicalize(&normalized).as_ref() == Ok(&raw))
+                {
+                    normalized
+                } else {
+                    raw_executable
+                }
+            } else {
+                normalize_owned(raw_executable)
+            };
+            self.match_path = Some(found.clone());
+            return Ok(Some(found));
         }
         Ok(None)
     }
@@ -598,6 +665,7 @@ impl<'a> Search<'a> {
         dir: &Path,
         name: &Path,
         directory: &SearchDirectory,
+        _speculative: bool,
     ) -> Result<Option<PathBuf>, CmdError> {
         if name.is_absolute() && !matches!(self.kind, Kind::Program) {
             return Ok(None);
@@ -614,8 +682,13 @@ impl<'a> Search<'a> {
         let record_direct = self.considered.is_some()
             || (self.event.is_some()
                 && (!matches!(self.kind, Kind::Library) || !self.ignored.prefixes.is_empty()));
-        let direct =
-            (try_direct || windows_program || record_direct).then(|| join_normalized(dir, name));
+        let direct = (try_direct || windows_program || record_direct).then(|| {
+            if matches!(self.kind, Kind::Path | Kind::File) {
+                join_preserving_parent(dir, name)
+            } else {
+                join_normalized(dir, name)
+            }
+        });
 
         if !missing_descendant {
             if windows_program && let Some(direct) = &direct {
@@ -1079,75 +1152,388 @@ fn library_parts(cx: &Cx<'_>, var: &[u8], default: &[u8]) -> Vec<BString> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum PlistExecutable<'a> {
     Found(&'a [u8]),
     Missing,
     Fallback,
 }
 
-fn parse_xml_plist_executable(bytes: &[u8]) -> PlistExecutable<'_> {
-    const KEY: &[u8] = b"<key>CFBundleExecutable</key>";
-    const OPEN_STRING: &[u8] = b"<string>";
-    const CLOSE_STRING: &[u8] = b"</string>";
-
-    if bytes.starts_with(b"bplist")
-        || !bytes.contains_str(b"<plist")
-        || bytes.contains_str(b"<!--")
-        || bytes.contains_str(b"<![CDATA[")
-        || bytes.contains_str(b"<dict ")
-    {
-        return PlistExecutable::Fallback;
-    }
-    let Some(key_pos) = bytes.find(KEY) else {
-        return if bytes.contains_str(b"CFBundleExecutable") || bytes.contains_str(b"&#") {
-            PlistExecutable::Fallback
-        } else {
-            PlistExecutable::Missing
-        };
-    };
-    let Some((before, after_start)) = bytes.split_at_checked(key_pos) else {
-        return PlistExecutable::Fallback;
-    };
-    let Some(after_key) = after_start.strip_prefix(KEY) else {
-        return PlistExecutable::Fallback;
-    };
-    if after_key.contains_str(KEY) {
-        return PlistExecutable::Fallback;
-    }
-    let opens = before.find_iter(b"<dict>").count();
-    let closes = before.find_iter(b"</dict>").count();
-    if opens != closes.saturating_add(1) {
-        return PlistExecutable::Fallback;
-    }
-    let trimmed = after_key.trim_ascii_start();
-    let Some(after_open) = trimmed.strip_prefix(OPEN_STRING) else {
-        return PlistExecutable::Fallback;
-    };
-    let Some(end) = after_open.find(CLOSE_STRING) else {
-        return PlistExecutable::Fallback;
-    };
-    let Some(value) = after_open.get(..end) else {
-        return PlistExecutable::Fallback;
-    };
-    if value.is_empty()
-        || value
-            .iter()
-            .any(|&byte| matches!(byte, b'&' | b'<' | b'>' | 0))
-    {
-        return PlistExecutable::Fallback;
-    }
-    PlistExecutable::Found(value)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XmlTagKind {
+    Open,
+    Close,
+    SelfClosing,
 }
 
-fn bundle_executable(cx: &Cx<'_>, bundle: &Path, stem: &std::ffi::OsStr) -> PathBuf {
+struct XmlTag<'a> {
+    name: &'a str,
+    kind: XmlTagKind,
+}
+
+enum PlistContainer {
+    Dict { expect_key: bool },
+    Array,
+}
+
+fn is_xml_ws(byte: &u8) -> bool {
+    matches!(*byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn trim_xml_ws(text: &str) -> &str {
+    text.trim_start_matches([' ', '\t', '\r', '\n'])
+}
+
+fn is_xml_name_byte(byte: &u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b':')
+}
+
+fn validate_xml_decl(mut rest: &str) -> bool {
+    let mut saw_version = false;
+    let mut saw_encoding = false;
+    let mut saw_standalone = false;
+    loop {
+        rest = trim_xml_ws(rest);
+        if rest.is_empty() {
+            return saw_version;
+        }
+        let name_len = rest
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphabetic())
+            .count();
+        let Some((name, after_name)) = rest.split_at_checked(name_len) else {
+            return false;
+        };
+        if name.is_empty() {
+            return false;
+        }
+        let after_name = trim_xml_ws(after_name);
+        let Some(after_eq) = after_name.strip_prefix('=') else {
+            return false;
+        };
+        let after_eq = trim_xml_ws(after_eq);
+        let (quote, after_quote) = if let Some(tail) = after_eq.strip_prefix('"') {
+            ('"', tail)
+        } else if let Some(tail) = after_eq.strip_prefix('\'') {
+            ('\'', tail)
+        } else {
+            return false;
+        };
+        let Some((value, after_value)) = after_quote.split_once(quote) else {
+            return false;
+        };
+        match name {
+            "version" if !saw_version && !value.is_empty() => saw_version = true,
+            "encoding" if !saw_encoding => {
+                if !value.eq_ignore_ascii_case("UTF-8") {
+                    return false;
+                }
+                saw_encoding = true;
+            }
+            "standalone" if !saw_standalone && matches!(value, "yes" | "no") => {
+                saw_standalone = true;
+            }
+            _ => return false,
+        }
+        if !after_value.is_empty() && !after_value.as_bytes().first().is_some_and(is_xml_ws) {
+            return false;
+        }
+        rest = after_value;
+    }
+}
+
+fn parse_xml_tag(input: &str) -> Option<(XmlTag<'_>, &str)> {
+    let body = input.strip_prefix('<')?;
+    if body.starts_with('!') || body.starts_with('?') {
+        return None;
+    }
+    if let Some(close_body) = body.strip_prefix('/') {
+        let name_len = close_body.bytes().take_while(is_xml_name_byte).count();
+        if name_len == 0 {
+            return None;
+        }
+        let (name, after_name) = close_body.split_at_checked(name_len)?;
+        let after_ws = trim_xml_ws(after_name);
+        let rest = after_ws.strip_prefix('>')?;
+        return Some((
+            XmlTag {
+                name,
+                kind: XmlTagKind::Close,
+            },
+            rest,
+        ));
+    }
+    let name_len = body.bytes().take_while(is_xml_name_byte).count();
+    if name_len == 0 {
+        return None;
+    }
+    let (name, after_name) = body.split_at_checked(name_len)?;
+    if !after_name
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| *byte == b'>' || *byte == b'/' || is_xml_ws(byte))
+    {
+        return None;
+    }
+    let bytes = after_name.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        if let Some(active) = quote {
+            if byte == b'<' {
+                return None;
+            }
+            if byte == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' => {
+                quote = Some(byte);
+                index += 1;
+            }
+            b'<' => return None,
+            b'>' => {
+                let rest = after_name.get(index + 1..)?;
+                return Some((
+                    XmlTag {
+                        name,
+                        kind: XmlTagKind::Open,
+                    },
+                    rest,
+                ));
+            }
+            b'/' => {
+                if bytes.get(index + 1) == Some(&b'>') {
+                    let rest = after_name.get(index + 2..)?;
+                    return Some((
+                        XmlTag {
+                            name,
+                            kind: XmlTagKind::SelfClosing,
+                        },
+                        rest,
+                    ));
+                }
+                return None;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn split_until_lt(input: &str) -> Option<(&str, &str)> {
+    let pos = input.find('<')?;
+    input.split_at_checked(pos)
+}
+
+fn parse_xml_plist_executable(bytes: &[u8]) -> PlistExecutable<'_> {
+    const MAX_NESTING: usize = 64;
+
+    if bytes.starts_with(b"bplist")
+        || bytes.starts_with(b"\xFE\xFF")
+        || bytes.starts_with(b"\xFF\xFE")
+    {
+        return PlistExecutable::Fallback;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return PlistExecutable::Fallback;
+    };
+    let mut rest = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if rest.starts_with("<?") {
+        let Some(after_xml) = rest.strip_prefix("<?xml") else {
+            return PlistExecutable::Fallback;
+        };
+        if !after_xml.as_bytes().first().is_some_and(is_xml_ws) {
+            return PlistExecutable::Fallback;
+        }
+        let Some((decl, after_decl)) = after_xml.split_once("?>") else {
+            return PlistExecutable::Fallback;
+        };
+        if !validate_xml_decl(decl) {
+            return PlistExecutable::Fallback;
+        }
+        rest = after_decl;
+    }
+    rest = trim_xml_ws(rest);
+    if let Some(after_doctype) = rest.strip_prefix("<!DOCTYPE") {
+        if !after_doctype.as_bytes().first().is_some_and(is_xml_ws) {
+            return PlistExecutable::Fallback;
+        }
+        let Some((inside, after_gt)) = after_doctype.split_once('>') else {
+            return PlistExecutable::Fallback;
+        };
+        if inside.contains('[') || inside.contains('<') {
+            return PlistExecutable::Fallback;
+        }
+        rest = trim_xml_ws(after_gt);
+    }
+    let Some((plist_open, after_plist)) = parse_xml_tag(rest) else {
+        return PlistExecutable::Fallback;
+    };
+    if plist_open.name != "plist" || plist_open.kind != XmlTagKind::Open {
+        return PlistExecutable::Fallback;
+    }
+    rest = trim_xml_ws(after_plist);
+    let Some((root_tag, after_root)) = parse_xml_tag(rest) else {
+        return PlistExecutable::Fallback;
+    };
+    if root_tag.name != "dict" {
+        return PlistExecutable::Fallback;
+    }
+    rest = after_root;
+    let mut found: Option<&str> = None;
+    if root_tag.kind == XmlTagKind::Open {
+        let mut stack = vec![PlistContainer::Dict { expect_key: true }];
+        let mut capture_next = false;
+        while !stack.is_empty() {
+            rest = trim_xml_ws(rest);
+            let Some((tag, after_tag)) = parse_xml_tag(rest) else {
+                return PlistExecutable::Fallback;
+            };
+            rest = after_tag;
+            match tag.kind {
+                XmlTagKind::Close => match (stack.pop(), tag.name) {
+                    (Some(PlistContainer::Dict { expect_key: true }), "dict")
+                    | (Some(PlistContainer::Array), "array") => {}
+                    _ => return PlistExecutable::Fallback,
+                },
+                XmlTagKind::Open | XmlTagKind::SelfClosing => {
+                    if tag.name == "key" {
+                        if tag.kind != XmlTagKind::Open {
+                            return PlistExecutable::Fallback;
+                        }
+                        let Some(PlistContainer::Dict { expect_key }) = stack.last_mut() else {
+                            return PlistExecutable::Fallback;
+                        };
+                        if !*expect_key {
+                            return PlistExecutable::Fallback;
+                        }
+                        *expect_key = false;
+                        let Some((key_text, after_text)) = split_until_lt(rest) else {
+                            return PlistExecutable::Fallback;
+                        };
+                        let Some((close, after_close)) = parse_xml_tag(after_text) else {
+                            return PlistExecutable::Fallback;
+                        };
+                        if close.kind != XmlTagKind::Close || close.name != "key" {
+                            return PlistExecutable::Fallback;
+                        }
+                        rest = after_close;
+                        if key_text.contains('&') {
+                            return PlistExecutable::Fallback;
+                        }
+                        if stack.len() == 1 && key_text == "CFBundleExecutable" {
+                            if found.is_some() {
+                                return PlistExecutable::Fallback;
+                            }
+                            capture_next = true;
+                        }
+                        continue;
+                    }
+                    if let Some(PlistContainer::Dict { expect_key }) = stack.last_mut() {
+                        if *expect_key {
+                            return PlistExecutable::Fallback;
+                        }
+                        *expect_key = true;
+                    }
+                    if capture_next {
+                        capture_next = false;
+                        if tag.name != "string" || tag.kind != XmlTagKind::Open {
+                            return PlistExecutable::Fallback;
+                        }
+                        let Some((value, after_text)) = split_until_lt(rest) else {
+                            return PlistExecutable::Fallback;
+                        };
+                        let Some((close, after_close)) = parse_xml_tag(after_text) else {
+                            return PlistExecutable::Fallback;
+                        };
+                        if close.kind != XmlTagKind::Close || close.name != "string" {
+                            return PlistExecutable::Fallback;
+                        }
+                        rest = after_close;
+                        if value.is_empty()
+                            || value
+                                .bytes()
+                                .any(|byte| matches!(byte, b'&' | b'<' | b'>' | 0))
+                        {
+                            return PlistExecutable::Fallback;
+                        }
+                        found = Some(value);
+                        continue;
+                    }
+                    match (tag.name, tag.kind) {
+                        ("dict", XmlTagKind::Open) => {
+                            if stack.len() >= MAX_NESTING {
+                                return PlistExecutable::Fallback;
+                            }
+                            stack.push(PlistContainer::Dict { expect_key: true });
+                        }
+                        ("array", XmlTagKind::Open) => {
+                            if stack.len() >= MAX_NESTING {
+                                return PlistExecutable::Fallback;
+                            }
+                            stack.push(PlistContainer::Array);
+                        }
+                        (
+                            "dict" | "array" | "true" | "false" | "string" | "integer" | "real"
+                            | "date" | "data",
+                            XmlTagKind::SelfClosing,
+                        ) => {}
+                        ("string" | "integer" | "real" | "date" | "data", XmlTagKind::Open) => {
+                            let Some((_, after_text)) = split_until_lt(rest) else {
+                                return PlistExecutable::Fallback;
+                            };
+                            let Some((close, after_close)) = parse_xml_tag(after_text) else {
+                                return PlistExecutable::Fallback;
+                            };
+                            if close.kind != XmlTagKind::Close || close.name != tag.name {
+                                return PlistExecutable::Fallback;
+                            }
+                            rest = after_close;
+                        }
+                        _ => return PlistExecutable::Fallback,
+                    }
+                }
+            }
+        }
+    } else if root_tag.kind != XmlTagKind::SelfClosing {
+        return PlistExecutable::Fallback;
+    }
+    rest = trim_xml_ws(rest);
+    let Some((plist_close, trailing)) = parse_xml_tag(rest) else {
+        return PlistExecutable::Fallback;
+    };
+    if plist_close.name != "plist"
+        || plist_close.kind != XmlTagKind::Close
+        || !trim_xml_ws(trailing).is_empty()
+    {
+        return PlistExecutable::Fallback;
+    }
+    match found {
+        Some(value) => PlistExecutable::Found(value.as_bytes()),
+        None => PlistExecutable::Missing,
+    }
+}
+
+fn bundle_executable(
+    cx: &Cx<'_>,
+    bundle: &Path,
+    stem: &std::ffi::OsStr,
+    hermetic: bool,
+) -> PathBuf {
     const MAX_PLIST_BYTES: u64 = 256 * 1024;
 
     let contents = bundle.join("Contents");
     let plist = contents.join("Info.plist");
     let host = cx.host();
-    let executable = if host
-        .metadata(&plist, Follow::Yes)
-        .is_ok_and(|info| info.kind == FileKind::File)
+    let probe_plist = !hermetic || crate::hermetic::should_probe_speculative_path(cx, &plist);
+    let executable = if probe_plist
+        && host
+            .metadata(&plist, Follow::Yes)
+            .is_ok_and(|info| info.kind == FileKind::File)
     {
         let parsed = host
             .read(
@@ -1192,7 +1578,7 @@ fn bundle_executable(cx: &Cx<'_>, bundle: &Path, stem: &std::ffi::OsStr) -> Path
     } else {
         None
     };
-    join_normalized(
+    join_preserving_parent(
         &contents.join("MacOS"),
         executable.as_deref().unwrap_or_else(|| Path::new(stem)),
     )
@@ -1244,4 +1630,125 @@ fn directory_path(dir: &Path) -> BString {
         path.push(b'/');
     }
     path
+}
+
+#[cfg(test)]
+mod plist_tests {
+    use super::{PlistExecutable, parse_xml_plist_executable};
+
+    #[test]
+    fn accepts_verified_utf8_top_level_key_and_ignores_nested_dicts() {
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright &amp; Co</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleExecutable</key>
+      <string>NestedBin</string>
+    </dict>
+  </array>
+  <key>CFBundleExecutable</key>
+  <string>café</string>
+</dict>
+</plist>
+"#
+        .as_bytes();
+        assert_eq!(
+            parse_xml_plist_executable(plist),
+            PlistExecutable::Found("café".as_bytes())
+        );
+
+        let no_decl = br#"<plist version="1.0"><dict><key>CFBundleExecutable</key><string>Tool</string></dict></plist>"#;
+        assert_eq!(
+            parse_xml_plist_executable(no_decl),
+            PlistExecutable::Found(b"Tool")
+        );
+    }
+
+    #[test]
+    fn falls_back_on_iso_8859_1_encoding_and_invalid_utf8() {
+        let latin1_bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n\
+<plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>caf\xe9</string></dict></plist>";
+        assert_eq!(
+            parse_xml_plist_executable(latin1_bytes),
+            PlistExecutable::Fallback
+        );
+
+        let latin1_ascii = br#"<?xml version="1.0" encoding="ISO-8859-1"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>AsciiTool</string></dict></plist>"#;
+        assert_eq!(
+            parse_xml_plist_executable(latin1_ascii),
+            PlistExecutable::Fallback
+        );
+    }
+
+    #[test]
+    fn rejects_array_nested_key_and_newline_nested_dict() {
+        let in_array = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Items</key>
+  <array>
+    <key>CFBundleExecutable</key>
+    <string>WrongFromArray</string>
+  </array>
+</dict>
+</plist>"#;
+        assert_eq!(
+            parse_xml_plist_executable(in_array),
+            PlistExecutable::Fallback
+        );
+
+        let in_newline_array = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Items</key>
+  <array
+  >
+    <key>CFBundleExecutable</key>
+    <string>WrongFromNewlineArray</string>
+  </array>
+</dict>
+</plist>"#;
+        assert_eq!(
+            parse_xml_plist_executable(in_newline_array),
+            PlistExecutable::Fallback
+        );
+
+        let in_newline_dict = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Nested</key>
+  <dict
+  >
+    <key>CFBundleExecutable</key>
+    <string>WrongFromNewlineDict</string>
+  </dict>
+</dict>
+</plist>"#;
+        assert_eq!(
+            parse_xml_plist_executable(in_newline_dict),
+            PlistExecutable::Missing
+        );
+    }
+
+    #[test]
+    fn falls_back_on_comments_cdata_entities_and_duplicates() {
+        for sample in [
+            br#"<plist version="1.0"><!-- comment --><dict><key>CFBundleExecutable</key><string>A</string></dict></plist>"#.as_slice(),
+            br#"<plist version="1.0"><dict><key>CFBundleExecutable</key><string><![CDATA[A]]></string></dict></plist>"#,
+            br#"<plist version="1.0"><dict><key>CFBundleExecutable</key><string>A&amp;B</string></dict></plist>"#,
+            br#"<plist version="1.0"><dict><key>CFBundle&#69;xecutable</key><string>A</string></dict></plist>"#,
+            br#"<plist version="1.0"><dict><key>CFBundleExecutable</key><string>A</string><key>CFBundleExecutable</key><string>B</string></dict></plist>"#,
+        ] {
+            assert_eq!(
+                parse_xml_plist_executable(sample),
+                PlistExecutable::Fallback
+            );
+        }
+    }
 }

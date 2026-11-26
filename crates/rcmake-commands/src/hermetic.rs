@@ -652,6 +652,33 @@ pub(crate) fn audits_reads(cx: &Cx<'_>) -> bool {
     cx.session_data::<Arc<HermeticHost>>().is_some()
 }
 
+pub(crate) fn should_probe_speculative_path(cx: &Cx<'_>, path: &Path) -> bool {
+    let Some(host) = cx.session_data::<Arc<HermeticHost>>() else {
+        return true;
+    };
+    if !path.is_absolute() {
+        return true;
+    }
+    let fetch_cache = host.context.fetch_cache();
+    let allowed = {
+        let state = host.state();
+        state
+            .auditor
+            .allows_read_path(host.inner.as_ref(), path, fetch_cache.as_deref())
+    };
+    if allowed {
+        return true;
+    }
+    match host.mode {
+        HermeticMode::Off => true,
+        HermeticMode::Strict => false,
+        HermeticMode::Warn => !host
+            .inner
+            .metadata(path, Follow::No)
+            .is_err_and(|error| error.kind == std::io::ErrorKind::NotFound),
+    }
+}
+
 pub(crate) fn inherit(cx: &Cx<'_>, interp: &mut Interp) {
     if let Some(host) = cx.session_data::<Arc<HermeticHost>>() {
         interp.add_session_data(host.context.clone());

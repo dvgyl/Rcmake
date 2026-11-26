@@ -187,12 +187,14 @@ pub(super) fn directories(
     Ok(with_suffixes(paths, &options.suffixes))
 }
 
+const MAX_PREALLOC: usize = 4096;
+
 fn add_framework_dirs(cx: &Cx<'_>, paths: &mut Vec<PathBuf>, values: Vec<BString>) {
     if values.is_empty() {
         return;
     }
     let mut home: Option<Option<PathBuf>> = None;
-    paths.reserve(values.len());
+    paths.reserve(values.len().min(MAX_PREALLOC));
     paths.extend(values.iter().map(|value| {
         if let Some(relative) = value.strip_prefix(b"~/") {
             let resolved = home.get_or_insert_with(|| {
@@ -223,7 +225,8 @@ fn add_prefixes(
     paths.reserve(
         prefixes
             .len()
-            .saturating_mul(variables.prefix_subdirs.len() + 1),
+            .saturating_mul(variables.prefix_subdirs.len() + 1)
+            .min(MAX_PREALLOC),
     );
     for prefix in prefixes {
         let prefix = cx.resolve_path(&prefix);
@@ -246,7 +249,10 @@ fn with_suffixes(paths: Vec<PathBuf>, suffixes: &[BString]) -> Vec<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(|s| relative_suffix(s))
         .collect();
-    let capacity = paths.len().saturating_mul(suffixes.len() + 1);
+    let capacity = paths
+        .len()
+        .saturating_mul(suffixes.len() + 1)
+        .min(MAX_PREALLOC);
     let mut seen = HashSet::with_capacity(capacity);
     let mut dirs = Vec::with_capacity(capacity);
     let mut push = |path: PathBuf| {
@@ -268,6 +274,46 @@ fn with_suffixes(paths: Vec<PathBuf>, suffixes: &[BString]) -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+pub(super) fn strip_trailing_slashes(path: &[u8]) -> &[u8] {
+    let mut trimmed = path;
+    while trimmed.len() > 1 {
+        let is_sep =
+            trimmed.last() == Some(&b'/') || (cfg!(windows) && trimmed.last() == Some(&b'\\'));
+        if !is_sep {
+            break;
+        }
+        if trimmed.len() == 3
+            && trimmed.first().is_some_and(u8::is_ascii_alphabetic)
+            && trimmed.get(1) == Some(&b':')
+        {
+            break;
+        }
+        if cfg!(windows) && (trimmed == b"//" || trimmed == br"\\") {
+            break;
+        }
+        let Some(next) = trimmed.get(..trimmed.len() - 1) else {
+            break;
+        };
+        trimmed = next;
+    }
+    trimmed
+}
+
+pub(super) fn join_preserving_parent(dir: &Path, child: &Path) -> PathBuf {
+    let joined = dir.join(child);
+    let raw = joined.as_os_str().as_encoded_bytes();
+    if raw.len() <= 1 || !matches!(raw.last(), Some(b'/' | b'\\')) {
+        return joined;
+    }
+    let bytes = path::from_native(&joined);
+    let trimmed = strip_trailing_slashes(&bytes);
+    if trimmed.len() == bytes.len() {
+        joined
+    } else {
+        path::to_native(trimmed)
+    }
 }
 
 #[cfg(not(windows))]

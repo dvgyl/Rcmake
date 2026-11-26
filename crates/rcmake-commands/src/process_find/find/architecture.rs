@@ -35,7 +35,7 @@ pub(super) fn rewrite(
         suffix: &suffix,
         remaining: cx.limits().max_value_bytes.min(16 * 1024 * 1024),
         depth: cx.limits().max_recursion.min(64),
-        paths: Vec::with_capacity(dirs.len()),
+        paths: Vec::with_capacity(dirs.len().min(4096)),
     };
     for dir in dirs {
         let mut text = path::from_native_cmake(&dir);
@@ -45,6 +45,10 @@ pub(super) fn rewrite(
         state.visit(&text, 0, true, 0)?;
     }
     Ok((state.paths, true))
+}
+
+fn probe_dir(bytes: &[u8]) -> PathBuf {
+    path::to_native(super::strip_trailing_slashes(bytes))
 }
 
 struct Rewrite<'a> {
@@ -72,9 +76,9 @@ impl Rewrite<'_> {
         {
             let split = start + index + 3;
             let (prefix, tail) = dir.split_at_checked(split).ok_or_else(error)?;
-            let plain = super::normalize_owned(path::to_native(prefix));
+            let plain = probe_dir(prefix);
             let prefix: BString = [prefix, self.suffix].concat().into();
-            let alternative = super::normalize_owned(path::to_native(&prefix));
+            let alternative = probe_dir(&prefix);
             let use_plain = self.is_dir(&plain);
             if tail == b"/" {
                 known_plain_dir = Some(use_plain);
@@ -88,20 +92,38 @@ impl Rewrite<'_> {
             }
         }
         if fresh {
-            let plain = super::normalize_owned(path::to_native(dir));
+            let plain = probe_dir(dir);
             let use_plain = known_plain_dir.unwrap_or_else(|| self.is_dir(&plain));
             if use_plain {
                 if !self.suffix.is_empty() {
-                    let alternate =
-                        super::normalize_owned(path::to_native(&[dir, self.suffix].concat()));
+                    let alternate_bytes = [dir, self.suffix].concat();
+                    let alternate = probe_dir(&alternate_bytes);
                     if self.is_dir(&alternate) && !self.linked(&plain, &alternate) {
-                        self.paths.push(alternate);
+                        let resolved = self.finalize_dir(alternate);
+                        self.paths.push(resolved);
                     }
                 }
-                self.paths.push(plain);
+                let resolved = self.finalize_dir(plain);
+                self.paths.push(resolved);
             }
         }
         Ok(())
+    }
+
+    fn finalize_dir(&self, probe: PathBuf) -> PathBuf {
+        let normalized = super::normalize_owned(probe.clone());
+        if normalized == probe {
+            return normalized;
+        }
+        if self
+            .host
+            .canonicalize(&probe)
+            .is_ok_and(|raw| self.host.canonicalize(&normalized).as_ref() == Ok(&raw))
+        {
+            normalized
+        } else {
+            probe
+        }
     }
 
     fn is_dir(&self, path: &Path) -> bool {

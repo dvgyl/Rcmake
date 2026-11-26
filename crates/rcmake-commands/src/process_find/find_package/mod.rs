@@ -1,4 +1,4 @@
-use rcmake_base::{BString, list};
+use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, LogLevel};
 use rcmake_expr::ExpandedArg;
@@ -542,11 +542,17 @@ fn load_module(
         b"CABLE" => Some(PolicyId::new(191)),
         _ => None,
     };
-    let root = cx.var_or_empty(b"CMAKE_ROOT");
-    let modules_dir = cx.resolve_path(&cat(&[
-        root.strip_suffix(b"/").unwrap_or(&root),
-        b"/Modules",
-    ]));
+    let sysname = cx.host().system().sysname;
+    let is_windows = sysname.as_slice() == b"Windows" || cfg!(windows);
+    let case_insensitive = matches!(sysname.as_slice(), b"Darwin" | b"Windows");
+    let root = normalize_cmake_path(&cx.var_or_empty(b"CMAKE_ROOT"), is_windows);
+    let modules_cmake = cat(&[root.strip_suffix(b"/").unwrap_or(&root), b"/Modules"]);
+    let modules_dir = if is_windows && !cfg!(windows) && Lexical::windows(&modules_cmake).absolute()
+    {
+        path::to_native(&modules_cmake)
+    } else {
+        cx.resolve_path(&modules_cmake)
+    };
     let bundled = modules_dir.join(&native_name);
     let bundled = if is_file(cx, &bundled) {
         Some(bundled)
@@ -554,14 +560,14 @@ fn load_module(
         considered.push(bundled);
         None
     };
-    let prefer_bundled = module.is_some() && bundled.is_some() && {
-        let mut prefix = path::from_native_cmake(&modules_dir);
-        if !prefix.ends_with(b"/") {
-            prefix.push(b'/');
-        }
-        cx.var_or_empty(b"CMAKE_CURRENT_LIST_FILE")
-            .starts_with(prefix.as_slice())
-    };
+    let prefer_bundled = module.is_some()
+        && bundled.is_some()
+        && is_strict_subpath(
+            &cx.var_or_empty(b"CMAKE_CURRENT_LIST_FILE"),
+            &path::from_native_cmake(&modules_dir),
+            is_windows,
+            case_insensitive,
+        );
     let (selected, system) = match (module, bundled) {
         (Some(_), Some(bundled)) if prefer_bundled => (Some(bundled), true),
         (Some(user), _) => (Some(user), false),
@@ -574,6 +580,7 @@ fn load_module(
     let Some(module) = selected else {
         return Ok(None);
     };
+    messages::warn_module_case_mismatch(cx, &filename, &module);
     if system && let Some(policy) = policy {
         match cx.policy(policy) {
             PolicyStatus::New => return Ok(None),
@@ -581,7 +588,6 @@ fn load_module(
             PolicyStatus::Old => {}
         }
     }
-    messages::warn_module_case_mismatch(cx, &filename, &module);
     let mut vars = Bindings::default();
     vars.add(cat(&[name, b"_FIND_MODULE"]), "1");
     let result = vars.scoped(cx, |cx| request.include_file(cx, &module));
@@ -614,4 +620,105 @@ fn load_module(
         report.trace.module_not_found(found_var);
     }
     Ok(Some(found))
+}
+
+fn normalize_cmake_path(raw: &[u8], windows: bool) -> BString {
+    if raw.is_empty() {
+        return BString::default();
+    }
+    if windows {
+        let converted: BString = raw
+            .iter()
+            .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+            .collect::<Vec<u8>>()
+            .into();
+        Lexical::windows(&converted).normalize()
+    } else {
+        Lexical::new(raw).normalize()
+    }
+}
+
+fn is_strict_subpath(caller: &[u8], dir: &[u8], windows: bool, case_insensitive: bool) -> bool {
+    if caller.is_empty() || dir.is_empty() {
+        return false;
+    }
+    let caller_norm = normalize_cmake_path(caller, windows);
+    let dir_norm = normalize_cmake_path(dir, windows);
+    let caller_lex = if windows {
+        Lexical::windows(&caller_norm)
+    } else {
+        Lexical::new(&caller_norm)
+    };
+    let dir_lex = if windows {
+        Lexical::windows(&dir_norm)
+    } else {
+        Lexical::new(&dir_norm)
+    };
+    let eq = |a: &[u8], b: &[u8]| a == b || (case_insensitive && a.eq_ignore_ascii_case(b));
+    if !eq(caller_lex.root_name(), dir_lex.root_name())
+        || caller_lex.root_directory() != dir_lex.root_directory()
+    {
+        return false;
+    }
+    let mut caller_parts = caller_lex.components();
+    for dir_part in dir_lex.components() {
+        let Some(caller_part) = caller_parts.next() else {
+            return false;
+        };
+        if !eq(caller_part, dir_part) {
+            return false;
+        }
+    }
+    caller_parts.next().is_some()
+}
+
+#[cfg(test)]
+mod bundled_caller_tests {
+    use super::is_strict_subpath;
+
+    #[test]
+    fn normalizes_separators_case_and_directory_boundaries() {
+        assert!(is_strict_subpath(
+            b"/share/cmake/mOdUlEs/FindCaller.cmake",
+            b"/share/cmake/Modules",
+            false,
+            true,
+        ));
+        assert!(!is_strict_subpath(
+            b"/share/cmake/mOdUlEs/FindCaller.cmake",
+            b"/share/cmake/Modules",
+            false,
+            false,
+        ));
+        assert!(!is_strict_subpath(
+            b"/share/cmake/ModulesExtra/FindCaller.cmake",
+            b"/share/cmake/Modules",
+            false,
+            true,
+        ));
+        assert!(!is_strict_subpath(
+            b"/share/cmake/Modules",
+            b"/share/cmake/Modules",
+            false,
+            true,
+        ));
+        assert!(is_strict_subpath(
+            b"/share/cmake//sub/../mOdUlEs/./Internal/FindCaller.cmake",
+            b"/share/cmake/Modules/",
+            false,
+            true,
+        ));
+        assert!(is_strict_subpath(
+            br"c:\share\cmake\mOdUlEs\FindCaller.cmake",
+            b"C:/share/cmake/Modules",
+            true,
+            true,
+        ));
+        assert!(!is_strict_subpath(
+            br"c:\share\cmake\ModulesExtra\FindCaller.cmake",
+            br"C:\share\cmake\Modules\",
+            true,
+            true,
+        ));
+    }
 }

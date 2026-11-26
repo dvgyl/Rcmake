@@ -3,7 +3,7 @@ use std::path::Path;
 use rcmake_base::BString;
 use rcmake_diag::{Effect, MessageKind};
 use rcmake_eval::{CmdError, Cx, HermeticMode, hermetic::HermeticContext};
-use rcmake_host::path;
+use rcmake_host::{FileKind, Follow, path};
 
 use super::config::ConfigSearch;
 use super::request::list_lines;
@@ -70,10 +70,15 @@ pub(super) fn warn_module_case_mismatch(cx: &mut Cx<'_>, requested: &[u8], modul
     {
         return;
     }
+    let sysname = cx.host().system().sysname;
+    if !matches!(sysname.as_slice(), b"Darwin" | b"Windows") {
+        return;
+    }
     let Some(parent) = module.parent() else {
         return;
     };
-    let Ok(entries) = cx.host().read_dir(parent) else {
+    let host = cx.host();
+    let Ok(entries) = host.read_dir(parent) else {
         return;
     };
     if entries
@@ -82,13 +87,34 @@ pub(super) fn warn_module_case_mismatch(cx: &mut Cx<'_>, requested: &[u8], modul
     {
         return;
     }
-    let Some(actual) = entries
+    let actual_name = entries
         .iter()
         .find(|entry| entry.name.as_slice().eq_ignore_ascii_case(requested))
-    else {
+        .map(|entry| entry.name.clone())
+        .or_else(|| {
+            let target = host.metadata(module, Follow::No).ok()?;
+            if target.ino != 0
+                && entries.len() <= 256
+                && let Some(found) = entries.iter().find(|entry| {
+                    host.metadata(&parent.join(path::to_native(&entry.name)), Follow::No)
+                        .is_ok_and(|meta| meta.ino == target.ino && meta.dev == target.dev)
+                })
+            {
+                return Some(found.name.clone());
+            }
+            if sysname.as_slice() == b"Windows" && target.kind != FileKind::Symlink {
+                let canonical = host.canonicalize(module).ok()?;
+                let name = path::from_native(Path::new(canonical.file_name()?));
+                if name.as_slice() != requested {
+                    return Some(name);
+                }
+            }
+            None
+        });
+    let Some(actual_name) = actual_name else {
         return;
     };
-    let disk_path = path::from_native_cmake(&parent.join(path::to_native(&actual.name)));
+    let disk_path = path::from_native_cmake(&parent.join(path::to_native(&actual_name)));
     crate::author_warning(
         cx,
         cat(&[
@@ -97,7 +123,7 @@ pub(super) fn warn_module_case_mismatch(cx: &mut Cx<'_>, requested: &[u8], modul
             b"\ndoes not match the case of the module file name on disk\n  ",
             &disk_path,
             b"\nThis may fail on case-sensitive file systems.  Use the module name\n  ",
-            &actual.name,
+            &actual_name,
             b"\ninstead.",
         ]),
     );

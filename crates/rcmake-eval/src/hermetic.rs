@@ -718,6 +718,21 @@ impl HermeticAuditor {
         )
     }
 
+    /// Return whether `path` is permitted for reading without recording a violation.
+    #[must_use]
+    pub fn allows_read_path(
+        &self,
+        host: &dyn Host,
+        path: &Path,
+        fetch_cache: Option<&Path>,
+    ) -> bool {
+        self.mode == HermeticMode::Off
+            || self
+                .policy
+                .resolve_allowed_path(host, path, fetch_cache)
+                .is_some()
+    }
+
     /// Check an absolute path, including symlink traversal and parent components.
     ///
     /// The caller must enforce containment at open time if the filesystem can

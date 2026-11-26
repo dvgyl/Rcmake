@@ -1386,17 +1386,29 @@ impl TestHostWrapper {
         if !self.case_insensitive || self.inner.metadata(p, rcmake_host::Follow::No).is_ok() {
             return p.to_path_buf();
         }
-        if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
-            let requested = rcmake_host::path::from_native(Path::new(name));
-            if let Ok(entries) = self.inner.read_dir(parent)
+        let mut current = std::path::PathBuf::new();
+        for component in p.components() {
+            let std::path::Component::Normal(part) = component else {
+                current.push(component);
+                continue;
+            };
+            let exact = current.join(part);
+            if self.inner.metadata(&exact, rcmake_host::Follow::No).is_ok() {
+                current = exact;
+                continue;
+            }
+            let requested = rcmake_host::path::from_native(Path::new(part));
+            if let Ok(entries) = self.inner.read_dir(&current)
                 && let Some(actual) = entries
                     .iter()
                     .find(|entry| entry.name.as_slice().eq_ignore_ascii_case(&requested))
             {
-                return parent.join(rcmake_host::path::to_native(&actual.name));
+                current.push(rcmake_host::path::to_native(&actual.name));
+            } else {
+                current = exact;
             }
         }
-        p.to_path_buf()
+        current
     }
 }
 
@@ -1431,7 +1443,8 @@ impl Host for TestHostWrapper {
     fn read_dir(&self, p: &Path) -> HostResult<Vec<rcmake_host::DirEntry>> {
         self.read_dir_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.read_dir(p)
+        let resolved = self.resolve_case(p);
+        self.inner.read_dir(&resolved)
     }
 
     fn create_dir_all(&self, p: &Path) -> HostResult<()> {
@@ -1574,7 +1587,68 @@ fn find_program_strict_hermetic_allows_exact_executable_without_parent_access() 
     let tool = external_dir.join("tool");
     let cmake_exe = abs("/bin/cmake");
 
+    for bundle_setting in [
+        "",
+        "set(CMAKE_FIND_APPBUNDLE FIRST)\n",
+        "set(CMAKE_FIND_APPBUNDLE LAST)\n",
+        "set(CMAKE_FIND_APPBUNDLE NEVER)\n",
+    ] {
+        let inner = Arc::new(PureHost::new(source.clone(), cmake_exe.clone()));
+        let mut darwin = inner.system();
+        darwin.sysname = "Darwin".into();
+        inner.set_system(darwin)?;
+        inner.create_dir_all(&build)?;
+        inner.seed_file(&cmake_exe, b"")?;
+        inner.set_permissions(&cmake_exe, 0o755)?;
+        inner.seed_file(&tool, b"")?;
+        inner.set_permissions(&tool, 0o755)?;
+        inner.env_set(
+            b"RCMAKE_HERMETIC_ALLOW_PATHS",
+            Some(&path::from_native(&tool)),
+        );
+        let script = format!(
+            "cmake_minimum_required(VERSION 4.5)\nproject(Audit NONE)\n{bundle_setting}find_program(RESULT NAMES tool fallback PATHS \"{}\" NO_DEFAULT_PATH REQUIRED)\n",
+            path::from_native_cmake(&external_dir),
+        );
+        inner.seed_file(&source.join("CMakeLists.txt"), script.as_bytes())?;
+
+        let mut services = Services::default();
+        services.speed.hermetic = HermeticMode::Strict;
+        let runtime =
+            crate::hermetic::HermeticRuntime::new(inner.clone(), &source, &build, &services)
+                .ok_or_else(|| HostError::unsupported("Cannot create hermetic runtime"))?;
+        let mut interp = Interp::new(
+            InterpConfig {
+                host: runtime.host(),
+                mode: RunMode::Configure,
+                cmake_root: source.join("data"),
+                cmake_command: cmake_exe.clone(),
+                cwd: source.clone(),
+                limits: Default::default(),
+                diag: Default::default(),
+                services: std::sync::Arc::new(services),
+                defines: Vec::new(),
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        runtime.install(&mut interp);
+        let outcome = interp.run_configure(&source, &build, &[]);
+        let diagnostics = inner.stream_bytes(Stream::Stderr);
+        assert_eq!(outcome.exit_code, 0, "{bundle_setting}{diagnostics}");
+        assert!(!runtime.denied(), "{bundle_setting}{diagnostics}");
+        assert_eq!(
+            var(&mut interp, b"RESULT"),
+            path::from_native_cmake(&tool),
+            "{bundle_setting}{diagnostics}"
+        );
+    }
+
+    // Explicit ONLY bundle search against an unapproved bundle path still records a strict denial.
     let inner = Arc::new(PureHost::new(source.clone(), cmake_exe.clone()));
+    let mut darwin = inner.system();
+    darwin.sysname = "Darwin".into();
+    inner.set_system(darwin)?;
     inner.create_dir_all(&build)?;
     inner.seed_file(&cmake_exe, b"")?;
     inner.set_permissions(&cmake_exe, 0o755)?;
@@ -1585,11 +1659,10 @@ fn find_program_strict_hermetic_allows_exact_executable_without_parent_access() 
         Some(&path::from_native(&tool)),
     );
     let script = format!(
-        "cmake_minimum_required(VERSION 4.5)\nproject(Audit NONE)\nset(CMAKE_FIND_APPBUNDLE NEVER)\nfind_program(RESULT NAMES tool fallback PATHS \"{}\" NO_DEFAULT_PATH REQUIRED)\n",
+        "cmake_minimum_required(VERSION 4.5)\nproject(Audit NONE)\nset(CMAKE_FIND_APPBUNDLE ONLY)\nfind_program(RESULT NAMES tool PATHS \"{}\" NO_DEFAULT_PATH)\n",
         path::from_native_cmake(&external_dir),
     );
     inner.seed_file(&source.join("CMakeLists.txt"), script.as_bytes())?;
-
     let mut services = Services::default();
     services.speed.hermetic = HermeticMode::Strict;
     let runtime = crate::hermetic::HermeticRuntime::new(inner.clone(), &source, &build, &services)
@@ -1611,14 +1684,8 @@ fn find_program_strict_hermetic_allows_exact_executable_without_parent_access() 
     );
     runtime.install(&mut interp);
     let outcome = interp.run_configure(&source, &build, &[]);
-    let diagnostics = inner.stream_bytes(Stream::Stderr);
-    assert_eq!(outcome.exit_code, 0, "{diagnostics}");
-    assert!(!runtime.denied(), "{diagnostics}");
-    assert_eq!(
-        var(&mut interp, b"RESULT"),
-        path::from_native_cmake(&tool),
-        "{diagnostics}"
-    );
+    assert_eq!(outcome.exit_code, 1);
+    assert!(runtime.denied());
     Ok(())
 }
 
@@ -1694,6 +1761,9 @@ find_library(DEMO NAMES missing demo PATHS /work/missing_lib /work/mylib NO_DEFA
 #[test]
 fn find_package_warns_on_module_name_case_mismatch() -> HostResult<()> {
     let inner = Arc::new(PureHost::default());
+    let mut darwin = inner.system();
+    darwin.sysname = "Darwin".into();
+    inner.set_system(darwin.clone())?;
     inner.seed_file(
         Path::new("/work/ModuleNameCaseMismatch/FindCaseModule.cmake"),
         b"set(CASEMODULE_FOUND TRUE)\n",
@@ -1726,7 +1796,7 @@ endif()
     let outcome = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
     let stderr = inner.stream_bytes(Stream::Stderr).to_string();
     assert_eq!(outcome.exit_code, 0, "{stderr}");
-    assert_eq!(var(&mut interp, b"casemodule_FOUND"), "TRUE");
+    assert_eq!(var(&mut interp, b"casemodule_FOUND"), "1");
     let expected = concat!(
         "CMake Warning (author) at ModuleNameCaseMismatch.cmake:2 (find_package):\n",
         "  The module name\n",
@@ -1750,6 +1820,7 @@ endif()
 
     // Exact-case module lookup emits no warning.
     let inner_exact = Arc::new(PureHost::default());
+    inner_exact.set_system(darwin)?;
     inner_exact.seed_file(
         Path::new("/work/ModuleNameCaseMismatch/FindCaseModule.cmake"),
         b"set(CASEMODULE_FOUND TRUE)\n",
@@ -1821,5 +1892,382 @@ find_package(Caller MODULE REQUIRED)
     assert_eq!(var(&mut interp, b"FROM_USER"), "user");
     assert_eq!(var(&mut interp, b"BOOST_ORIGIN"), "");
     assert_eq!(var(&mut interp, b"Boost_FOUND"), "0");
+    Ok(())
+}
+
+#[test]
+fn find_program_darwin_plist_handles_iso8859_and_nested_keys() -> HostResult<()> {
+    use std::sync::atomic::Ordering;
+
+    let inner = Arc::new(PureHost::default());
+    let mut darwin = inner.system();
+    darwin.sysname = "Darwin".into();
+    inner.set_system(darwin)?;
+
+    // 1. ISO-8859-1 plist must fall back to plutil and resolve UTF-8 "café".
+    inner.seed_file(
+        Path::new("/work/apps/Cafe.app/Contents/Info.plist"),
+        b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n\
+<plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>caf\xe9</string></dict></plist>",
+    )?;
+    inner.seed_file(Path::new("/work/apps/Cafe.app/Contents/MacOS/café"), b"")?;
+    inner.set_permissions(Path::new("/work/apps/Cafe.app/Contents/MacOS/café"), 0o755)?;
+
+    // 2. <key> inside <array> must fall back and not select WrongBin.
+    inner.seed_file(
+        Path::new("/work/apps/ArrayKey.app/Contents/Info.plist"),
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Items</key><array><key>CFBundleExecutable</key><string>WrongBin</string></array></dict></plist>"#,
+    )?;
+    for exe in ["WrongBin", "ArrayKey"] {
+        let p = Path::new("/work/apps/ArrayKey.app/Contents/MacOS").join(exe);
+        inner.seed_file(&p, b"")?;
+        inner.set_permissions(&p, 0o755)?;
+    }
+
+    // 3. <key> inside nested <dict\n> must not be treated as a top-level key.
+    inner.seed_file(
+        Path::new("/work/apps/NewlineDict.app/Contents/Info.plist"),
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Nested</key><dict
+><key>CFBundleExecutable</key><string>WrongBin</string></dict></dict></plist>"#,
+    )?;
+    for exe in ["WrongBin", "NewlineDict"] {
+        let p = Path::new("/work/apps/NewlineDict.app/Contents/MacOS").join(exe);
+        inner.seed_file(&p, b"")?;
+        inner.set_permissions(&p, 0o755)?;
+    }
+
+    inner.set_command_handler(|_, req, _| {
+        let plist_arg = req
+            .pipeline
+            .first()
+            .and_then(|stage| stage.args.last())
+            .map(|arg| arg.to_str_lossy().into_owned())
+            .unwrap_or_default();
+        if plist_arg.ends_with("Cafe.app/Contents/Info.plist") {
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                stdout: "café\n".as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        } else {
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(1)],
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    })?;
+
+    let host = Arc::new(TestHostWrapper::new(inner.clone(), false));
+    let mut interp = Interp::new(
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Script,
+            "/share/cmake",
+            "/bin/cmake",
+            "/work",
+        ),
+        crate::register_all,
+    );
+    let script = r#"
+set(CMAKE_FIND_APPBUNDLE ONLY)
+find_program(CAFE NAMES Cafe PATHS /work/apps NO_DEFAULT_PATH)
+find_program(ARR NAMES ArrayKey PATHS /work/apps NO_DEFAULT_PATH)
+find_program(NEWLINE NAMES NewlineDict PATHS /work/apps NO_DEFAULT_PATH)
+"#;
+    host.run_calls.store(0, Ordering::Relaxed);
+    assert_eq!(run(&inner, &mut interp, script)?, 0);
+    assert_eq!(
+        var(&mut interp, b"CAFE"),
+        "/work/apps/Cafe.app/Contents/MacOS/café"
+    );
+    assert_eq!(
+        var(&mut interp, b"ARR"),
+        "/work/apps/ArrayKey.app/Contents/MacOS/ArrayKey"
+    );
+    assert_eq!(
+        var(&mut interp, b"NEWLINE"),
+        "/work/apps/NewlineDict.app/Contents/MacOS/NewlineDict"
+    );
+    // Only Cafe (ISO-8859-1) and ArrayKey (invalid <key> inside <array>) invoke plutil; NewlineDict stays on fast path.
+    assert_eq!(host.run_calls.load(Ordering::Relaxed), 2);
+    Ok(())
+}
+
+#[test]
+fn find_path_finds_regular_file_named_dot_framework_under_framework_first() -> HostResult<()> {
+    let (host, mut interp) = setup();
+    host.seed_file(Path::new("/work/plain/plain.framework"), b"regular file")?;
+    let script = r#"
+set(CMAKE_FIND_FRAMEWORK FIRST)
+find_path(ONE NAMES plain.framework PATHS /work/plain NO_DEFAULT_PATH)
+find_path(MANY NAMES missing1.h missing2.h plain.framework PATHS /work/plain NO_DEFAULT_PATH)
+"#;
+    assert_eq!(run(&host, &mut interp, script)?, 0);
+    assert_eq!(var(&mut interp, b"ONE"), "/work/plain");
+    assert_eq!(var(&mut interp, b"MANY"), "/work/plain");
+    Ok(())
+}
+
+#[test]
+fn find_package_prefers_bundled_module_when_caller_has_mixed_case_modules_dir() -> HostResult<()> {
+    let inner = Arc::new(PureHost::default());
+    let mut darwin = inner.system();
+    darwin.sysname = "Darwin".into();
+    inner.set_system(darwin)?;
+    inner.seed_file(
+        Path::new("/work/cmake/FindBoost.cmake"),
+        b"set(BOOST_ORIGIN user)\nset(Boost_FOUND TRUE)\n",
+    )?;
+    inner.seed_file(
+        Path::new("/share/cmake/Modules/FindBoost.cmake"),
+        b"set(BOOST_ORIGIN bundled)\nset(Boost_FOUND TRUE)\n",
+    )?;
+    inner.seed_file(
+        Path::new("/share/cmake/Modules/FindCaller.cmake"),
+        b"find_package(Boost MODULE QUIET)\n",
+    )?;
+    inner.seed_file(
+        Path::new("/share/cmake/ModulesExtra/FindOutside.cmake"),
+        b"find_package(Boost MODULE QUIET)\n",
+    )?;
+
+    let host = Arc::new(TestHostWrapper::new(inner.clone(), true));
+    let mut interp = Interp::new(
+        InterpConfig::new(host, RunMode::Script, "/share/cmake", "/bin/cmake", "/work"),
+        crate::register_all,
+    );
+    let script = r#"
+set(CMAKE_MODULE_PATH /work/cmake)
+cmake_policy(SET CMP0167 NEW)
+include("/share/cmake/mOdUlEs/FindCaller.cmake")
+set(MIXED_ORIGIN "${BOOST_ORIGIN}")
+set(MIXED_FOUND "${Boost_FOUND}")
+unset(BOOST_ORIGIN)
+unset(Boost_FOUND)
+include("/share/cmake/ModulesExtra/FindOutside.cmake")
+set(EXTRA_ORIGIN "${BOOST_ORIGIN}")
+set(EXTRA_FOUND "${Boost_FOUND}")
+"#;
+    let exit = run(&inner, &mut interp, script)?;
+    assert_eq!(exit, 0, "{}", inner.stream_bytes(Stream::Stderr));
+    assert_eq!(var(&mut interp, b"MIXED_ORIGIN"), "");
+    assert_eq!(var(&mut interp, b"MIXED_FOUND"), "0");
+    assert_eq!(var(&mut interp, b"EXTRA_ORIGIN"), "user");
+    assert_eq!(var(&mut interp, b"EXTRA_FOUND"), "TRUE");
+    Ok(())
+}
+
+#[test]
+fn find_directories_caps_preallocation_for_repeated_paths_and_suffixes() -> HostResult<()> {
+    let (host, mut interp) = setup();
+    host.seed_file(Path::new("/work/repeated/sub/header.h"), b"")?;
+    let repeated_dirs = vec!["/work/repeated"; 200].join(" ");
+    let repeated_suffixes = vec!["sub"; 200].join(" ");
+    let script = format!(
+        "find_file(FOUND NAMES header.h PATHS {repeated_dirs} PATH_SUFFIXES {repeated_suffixes} NO_DEFAULT_PATH)\n"
+    );
+    assert_eq!(run(&host, &mut interp, &script)?, 0);
+    assert_eq!(var(&mut interp, b"FOUND"), "/work/repeated/sub/header.h");
+    Ok(())
+}
+
+#[test]
+fn find_package_case_warning_gates_by_host_and_runs_before_policy() -> HostResult<()> {
+    // 1. Linux must not emit the macOS/Windows case-mismatch warning even on a case-insensitive FS.
+    let inner_linux = Arc::new(PureHost::default());
+    let mut linux = inner_linux.system();
+    linux.sysname = "Linux".into();
+    inner_linux.set_system(linux)?;
+    inner_linux.seed_file(
+        Path::new("/work/mods/FindCaseModule.cmake"),
+        b"set(CASEMODULE_FOUND TRUE)\n",
+    )?;
+    let host_linux = Arc::new(TestHostWrapper::new(inner_linux.clone(), true));
+    let mut interp_linux = Interp::new(
+        InterpConfig::new(
+            host_linux,
+            RunMode::Script,
+            "/share/cmake",
+            "/bin/cmake",
+            "/work",
+        ),
+        crate::register_all,
+    );
+    assert_eq!(
+        run(
+            &inner_linux,
+            &mut interp_linux,
+            "set(CMAKE_MODULE_PATH /work/mods)\nfind_package(casemodule MODULE REQUIRED)\n",
+        )?,
+        0
+    );
+    assert!(
+        inner_linux.stream_bytes(Stream::Stderr).is_empty(),
+        "{}",
+        inner_linux.stream_bytes(Stream::Stderr)
+    );
+
+    // 2. Windows emits the case-mismatch warning.
+    let inner_win = Arc::new(PureHost::default());
+    let mut win = inner_win.system();
+    win.sysname = "Windows".into();
+    inner_win.set_system(win)?;
+    inner_win.seed_file(
+        Path::new("/work/mods/FindCaseModule.cmake"),
+        b"set(CASEMODULE_FOUND TRUE)\n",
+    )?;
+    let host_win = Arc::new(TestHostWrapper::new(inner_win.clone(), true));
+    let mut interp_win = Interp::new(
+        InterpConfig::new(
+            host_win,
+            RunMode::Script,
+            "/share/cmake",
+            "/bin/cmake",
+            "/work",
+        ),
+        crate::register_all,
+    );
+    assert_eq!(
+        run(
+            &inner_win,
+            &mut interp_win,
+            "set(CMAKE_MODULE_PATH /work/mods)\nfind_package(casemodule MODULE REQUIRED)\n",
+        )?,
+        0
+    );
+    assert!(
+        inner_win
+            .stream_bytes(Stream::Stderr)
+            .to_str_lossy()
+            .contains("does not match the case of the module file name on disk")
+    );
+
+    // 3. On Darwin, spelling check runs BEFORE CMP0167 NEW suppresses a bundled module.
+    let inner_policy = Arc::new(PureHost::default());
+    let mut darwin = inner_policy.system();
+    darwin.sysname = "Darwin".into();
+    inner_policy.set_system(darwin)?;
+    inner_policy.seed_file(
+        Path::new("/share/cmake/Modules/FindBOOST.cmake"),
+        b"set(Boost_FOUND TRUE)\n",
+    )?;
+    let host_policy = Arc::new(TestHostWrapper::new(inner_policy.clone(), true));
+    let mut interp_policy = Interp::new(
+        InterpConfig::new(
+            host_policy,
+            RunMode::Script,
+            "/share/cmake",
+            "/bin/cmake",
+            "/work",
+        ),
+        crate::register_all,
+    );
+    assert_eq!(
+        run(
+            &inner_policy,
+            &mut interp_policy,
+            "cmake_policy(SET CMP0167 NEW)\nfind_package(Boost MODULE QUIET)\n",
+        )?,
+        0
+    );
+    assert_eq!(var(&mut interp_policy, b"Boost_FOUND"), "0");
+    let stderr = inner_policy.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains("FindBoost.cmake") && stderr.contains("FindBOOST.cmake"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn find_library_custom_suffix_parent_traversal_requires_existing_parent() -> HostResult<()> {
+    let (host, mut interp) = setup_with(crate::register_all);
+    host.create_dir_all(Path::new("/work/missing/lib"))?;
+    host.seed_file(Path::new("/work/missing/special/libdemo.a"), b"")?;
+    host.create_dir_all(Path::new("/work/present/lib"))?;
+    host.create_dir_all(Path::new("/work/present/lib64"))?;
+    host.seed_file(Path::new("/work/present/special/libdemo.a"), b"")?;
+
+    let script = r#"
+set(CMAKE_FIND_LIBRARY_PREFIXES lib)
+set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
+set(CMAKE_FIND_LIBRARY_CUSTOM_LIB_SUFFIX "64/../special")
+find_library(MISSING NAMES demo PATHS /work/missing/lib NO_DEFAULT_PATH)
+find_library(PRESENT NAMES demo PATHS /work/present/lib NO_DEFAULT_PATH)
+"#;
+    assert_eq!(run(&host, &mut interp, script)?, 0);
+    assert_eq!(var(&mut interp, b"MISSING"), "MISSING-NOTFOUND");
+    assert_eq!(
+        var(&mut interp, b"PRESENT"),
+        "/work/present/special/libdemo.a"
+    );
+    Ok(())
+}
+
+#[test]
+fn find_preserves_parent_traversal_for_symlinks_missing_parents_and_logs() -> HostResult<()> {
+    let host = Arc::new(PureHost::default());
+    let mut darwin = host.system();
+    darwin.sysname = "Darwin".into();
+    host.set_system(darwin)?;
+    host.seed_file(Path::new("/work/inc/header.h"), b"")?;
+    host.create_dir_all(Path::new("/work/other/sub"))?;
+    host.seed_file(Path::new("/work/other/only.h"), b"")?;
+    host.symlink(Path::new("/work/other/sub"), Path::new("/work/inc/linked"))?;
+    host.create_dir_all(Path::new("/work/apps/real"))?;
+    host.seed_file(Path::new("/work/apps/Demo.app/Contents/MacOS/Demo"), b"")?;
+    host.set_permissions(Path::new("/work/apps/Demo.app/Contents/MacOS/Demo"), 0o755)?;
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        br#"cmake_minimum_required(VERSION 4.5)
+project(ParentTraversal NONE)
+set(CMAKE_FIND_DEBUG_MODE TRUE)
+find_path(P_ABSENT NAMES absent/../header.h PATHS /work/inc NO_DEFAULT_PATH)
+find_file(F_ABSENT NAMES absent/../header.h PATHS /work/inc NO_DEFAULT_PATH)
+find_path(P_LINKED NAMES linked/../only.h PATHS /work/inc NO_DEFAULT_PATH)
+find_file(F_LINKED NAMES linked/../only.h PATHS /work/inc NO_DEFAULT_PATH)
+set(CMAKE_FIND_APPBUNDLE ONLY)
+find_program(A_ABSENT NAMES absent/../Demo PATHS /work/apps NO_DEFAULT_PATH)
+find_program(A_REAL NAMES real/../Demo PATHS /work/apps NO_DEFAULT_PATH)
+"#,
+    )?;
+    let mut interp = Interp::new(
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            "/share/cmake",
+            "/bin/cmake",
+            "/work",
+        ),
+        crate::register_all,
+    );
+    let outcome = interp.run_configure(Path::new("/work"), Path::new("/work/build"), &[]);
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert_eq!(outcome.exit_code, 0, "{stderr}");
+    assert_eq!(var(&mut interp, b"P_ABSENT"), "P_ABSENT-NOTFOUND");
+    assert_eq!(var(&mut interp, b"F_ABSENT"), "F_ABSENT-NOTFOUND");
+    assert_eq!(var(&mut interp, b"P_LINKED"), "/work/inc");
+    assert_eq!(var(&mut interp, b"F_LINKED"), "/work/inc/linked/../only.h");
+    assert_eq!(var(&mut interp, b"A_ABSENT"), "A_ABSENT-NOTFOUND");
+    assert_eq!(
+        var(&mut interp, b"A_REAL"),
+        "/work/apps/Demo.app/Contents/MacOS/Demo"
+    );
+    assert!(
+        stderr.contains("/work/inc/absent/../header.h"),
+        "debug log must preserve parent traversal: {stderr}"
+    );
+    let configure_log = String::from_utf8_lossy(&host.read(
+        Path::new("/work/build/CMakeFiles/CMakeConfigureLog.yaml"),
+        ReadRange::All { limit: 256 * 1024 },
+    )?)
+    .into_owned();
+    assert!(
+        configure_log.contains("/work/inc/absent/../header.h"),
+        "configure log must preserve parent traversal: {configure_log}"
+    );
     Ok(())
 }

@@ -7,7 +7,9 @@ use rcmake_model::CacheType;
 
 use super::cat;
 use super::search_paths::setting_enabled;
-use directories::{directories, join_normalized, normalize_owned};
+use directories::{
+    directories, join_normalized, join_preserving_parent, normalize_owned, strip_trailing_slashes,
+};
 use options::Options;
 use search::Search;
 
