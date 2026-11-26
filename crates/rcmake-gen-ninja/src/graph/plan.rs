@@ -275,7 +275,7 @@ impl<'a> Graph<'a> {
                 if let Some(prepared) = self.prepared_link(nodes) {
                     prepared.bind(&mut plan);
                 } else {
-                    let command = self.command_line(invocations, false);
+                    let command = self.link_command_line(invocations, false);
                     let response = self.link_response(step, inputs, invocations, &command);
                     plan.bind_command(command, response);
                 }
@@ -337,7 +337,17 @@ impl<'a> Graph<'a> {
                     .first()
                     .and_then(|output| self.custom_scripts.get(output));
                 let command = script.map_or_else(
-                    || self.command_line(&custom.invocations, true),
+                    || {
+                        if rule == b"CMAKE_SYMLINK_LIBRARY" {
+                            self.commands.symlink_line(
+                                &custom.invocations,
+                                &rcmake_host::path::from_native(self.build_dir),
+                                !self.prefix.is_empty(),
+                            )
+                        } else {
+                            self.command_line(&custom.invocations, true)
+                        }
+                    },
                     |script| {
                         let mut argument = b"\"".to_vec();
                         argument.extend_from_slice(script);

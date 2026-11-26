@@ -50,7 +50,7 @@ impl Graph<'_> {
                 }
                 _ => continue,
             };
-            let ordinary = self.command_line(invocations, custom);
+            let ordinary = self.link_command_line(invocations, custom);
             let dir = self.target_dir_for_output(raw);
             if !self.use_response(dir, &ordinary) {
                 continue;
@@ -79,7 +79,7 @@ impl Graph<'_> {
                     files.append(&mut inputs);
                 }
             }
-            let mut command = self.command_line(&revised, custom);
+            let mut command = self.link_command_line(&revised, custom);
             let mut implicit = Vec::new();
             let mut scripted = false;
             if self.command_exceeds_budget(&command) {

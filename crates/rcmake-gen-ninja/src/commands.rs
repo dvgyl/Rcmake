@@ -219,6 +219,30 @@ impl Commands {
         }
     }
 
+    pub(crate) fn link_line(
+        &self,
+        invocations: &[Invocation],
+        build_dir: &[u8],
+        prefix: bool,
+    ) -> Vec<u8> {
+        if self.windows() {
+            return self.line(invocations, false, build_dir, prefix);
+        }
+        posix_link_line(invocations, build_dir, prefix)
+    }
+
+    pub(crate) fn symlink_line(
+        &self,
+        invocations: &[Invocation],
+        build_dir: &[u8],
+        prefix: bool,
+    ) -> Vec<u8> {
+        if self.windows() {
+            return self.line(invocations, true, build_dir, prefix);
+        }
+        posix_commands(invocations, build_dir, prefix, true)
+    }
+
     pub(crate) fn custom_script(
         &self,
         invocations: &[Invocation],
@@ -482,6 +506,52 @@ fn shell_argument(word: &[u8], out: &mut Vec<u8>, batch: bool, called: bool) {
 pub(crate) use rcmake_gen_common::link_response::windows_argument;
 
 fn posix_custom_line(invocations: &[Invocation], build_dir: &[u8], prefix: bool) -> Vec<u8> {
+    posix_commands(invocations, build_dir, prefix, false)
+}
+
+fn posix_link_line(invocations: &[Invocation], build_dir: &[u8], prefix: bool) -> Vec<u8> {
+    // The linker uses the root build directory. Each target event carries its own directory.
+    let first = invocations
+        .iter()
+        .position(|cmd| cmd.working_dir.is_none())
+        .unwrap_or(invocations.len());
+    let last = invocations
+        .iter()
+        .rposition(|cmd| cmd.working_dir.is_none())
+        .map_or(first, |index| index + 1);
+    let (before, rest) = invocations.split_at(first);
+    let (link, after) = rest.split_at(last - first);
+    let mut line = Vec::new();
+    if before.is_empty() && !prefix {
+        line.push(b':');
+    } else {
+        if !before.is_empty() {
+            line.extend(posix_commands(before, build_dir, prefix, true));
+            line.extend_from_slice(b" && ");
+        }
+        line.extend_from_slice(b"cd ");
+        line.extend_from_slice(&cmake_posix_quote(build_dir));
+    }
+    for invocation in link.iter().filter(|cmd| cmd.shell != b":") {
+        line.extend_from_slice(b" && ");
+        let command = std::slice::from_ref(invocation);
+        line.extend(if invocation.working_dir.is_none() {
+            posix_line(command)
+        } else {
+            posix_commands(command, build_dir, false, true)
+        });
+    }
+    line.extend_from_slice(b" && ");
+    line.extend(posix_commands(after, build_dir, false, true));
+    line
+}
+
+fn posix_commands(
+    invocations: &[Invocation],
+    build_dir: &[u8],
+    prefix: bool,
+    reset_directory: bool,
+) -> Vec<u8> {
     let mut result = Vec::new();
     let mut current = (!prefix).then_some(build_dir);
     for (index, invocation) in invocations.iter().enumerate() {
@@ -492,7 +562,9 @@ fn posix_custom_line(invocations: &[Invocation], build_dir: &[u8], prefix: bool)
             .working_dir
             .as_deref()
             .map_or(build_dir, |dir| dir.as_ref());
-        if current != Some(directory) || (index == 0 && invocation.working_dir.is_some()) {
+        if current != Some(directory)
+            || ((index == 0 || reset_directory) && invocation.working_dir.is_some())
+        {
             result.extend_from_slice(b"cd ");
             result.extend_from_slice(&cmake_posix_quote(directory));
             result.extend_from_slice(b" && ");
@@ -561,6 +633,41 @@ fn posix_line(invocations: &[Invocation]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_lines_keep_target_events_and_restore_the_link_directory() {
+        let command = |shell: &str, dir: Option<&str>| Invocation {
+            shell: shell.into(),
+            working_dir: dir.map(BString::from),
+            ..Invocation::default()
+        };
+        let commands = Commands::default();
+        let line = commands.link_line(
+            &[
+                command("echo before && echo next", Some("/tmp")),
+                command("echo again", Some("/tmp")),
+                command("cc main.o -o main  lib.a", None),
+                command("echo after", Some("/work/build")),
+            ],
+            b"/work/build",
+            false,
+        );
+        assert_eq!(line, b"cd /tmp && echo before && echo next && cd /tmp && echo again && cd /work/build && cc main.o -o main  lib.a && cd /work/build && echo after");
+        let line = commands.link_line(
+            &[
+                command("cmake -E rm -f libcore.a", None),
+                command("ar qc libcore.a  core.o", None),
+                command("ranlib libcore.a", None),
+                command(":", None),
+            ],
+            b"/work/build",
+            false,
+        );
+        assert_eq!(
+            line,
+            b": && cmake -E rm -f libcore.a && ar qc libcore.a  core.o && ranlib libcore.a && :"
+        );
+    }
 
     #[test]
     fn custom_commands_share_one_working_directory_change() {

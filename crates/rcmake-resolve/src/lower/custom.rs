@@ -524,6 +524,26 @@ impl<'a> Commands<'a> {
                     existing.extend_from_slice(b"; ");
                     existing.extend_from_slice(comment);
                 }
+                if event.is_some()
+                    && matches!(
+                        self.model.generator,
+                        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+                    )
+                    && !super::shell::windows_host(self.model, command.dir)
+                    && let [first, rest @ ..] = step.invocations.as_slice()
+                    && !rest.is_empty()
+                    && rest.iter().all(|cmd| cmd.working_dir == first.working_dir)
+                {
+                    let shell = step
+                        .invocations
+                        .iter()
+                        .map(|cmd| cmd.shell.as_slice())
+                        .collect::<Vec<_>>()
+                        .join(b" && ".as_slice());
+                    let mut invocation = super::shell::command(shell.into());
+                    invocation.working_dir.clone_from(&first.working_dir);
+                    step.invocations = vec![invocation];
+                }
                 merge(&mut recipe, step);
             }
         }

@@ -148,12 +148,26 @@ pub(super) fn link(
     } else {
         policy.ipo(config)
     };
+    let ninja_posix = matches!(
+        model.generator,
+        Some(rcmake_model::GeneratorKind::Ninja | rcmake_model::GeneratorKind::NinjaMultiConfig)
+    ) && !super::shell::windows_host(model, target.dir);
     let mut driver = language_flags(model, target, config, language);
-    if kind != LinkKind::StaticArchive {
-        driver.extend(super::apple::arch::flags(
-            model, target, config, language, None,
-        )?);
-    }
+    let arch = if kind == LinkKind::StaticArchive {
+        Vec::new()
+    } else {
+        super::apple::arch::flags(model, target, config, language, None)?
+    };
+    let language_compile_flags = (ninja_posix && kind != LinkKind::Executable).then(|| {
+        [
+            join_words(driver.iter().cloned()).as_slice(),
+            b" ",
+            join_words(arch.iter().cloned()).as_slice(),
+        ]
+        .concat()
+        .into()
+    });
+    driver.extend(arch);
     let driver = join_words(driver);
     let option = |key: &[u8]| policy.option(key);
     let cmake = || {
@@ -350,6 +364,7 @@ pub(super) fn link(
         runtime,
         link_languages,
         usage,
+        ninja_posix,
     )?;
     let mut implicit_inputs = Vec::new();
     if kind != LinkKind::StaticArchive
@@ -437,7 +452,10 @@ pub(super) fn link(
                 .unwrap_or(b"0")
                 .into(),
         ),
-        b"FLAGS" | b"LANGUAGE_COMPILE_FLAGS" => Some(driver.clone()),
+        b"FLAGS" => Some(driver.clone()),
+        b"LANGUAGE_COMPILE_FLAGS" => {
+            Some(language_compile_flags.as_ref().unwrap_or(&driver).clone())
+        }
         b"LINK_FLAGS" => Some(flags.clone()),
         b"LINK_LIBRARIES" => Some(libraries.clone()),
         key if key == shared_flags_key => Some(
@@ -656,6 +674,7 @@ fn link_libraries(
     runtime_args: Vec<BString>,
     link_languages: &IndexSet<BString>,
     usage: &mut UsageResolver<'_>,
+    ninja_posix: bool,
 ) -> Result<BString, ResolveError> {
     if step.kind == LinkKind::StaticArchive {
         return Ok(BString::default());
@@ -668,7 +687,11 @@ fn link_libraries(
     let named = frameworks::named_framework_files(model, target, config, step, &libraries);
     libraries.extend(named);
     let runtime = rpath::runtime_libraries(model, target, config, step, &libraries, usage)?;
-    let rpaths = rpath::link_flags(model, target, config, step, usage, &runtime, link_languages)?;
+    let mut rpaths =
+        rpath::link_flags(model, target, config, step, usage, &runtime, link_languages)?;
+    if ninja_posix && rpaths.len() > 1 {
+        rpaths = vec![join_words(rpaths)];
+    }
     inputs.extend(libraries);
     inputs.extend(runtime.link_stubs.iter().cloned());
     let (mut arguments, mut rpaths) = if darwin {
@@ -676,7 +699,20 @@ fn link_libraries(
     } else {
         (rpaths, None)
     };
+    let mut framework_paths = Vec::new();
+    let mut library_paths = Vec::new();
     for fragment in link_fragments {
+        if ninja_posix {
+            let paths = match fragment.role {
+                LinkFragmentRole::LibraryPath => Some(&mut library_paths),
+                LinkFragmentRole::FrameworkPath => Some(&mut framework_paths),
+                _ => None,
+            };
+            if let Some(paths) = paths {
+                paths.push(wrapper.argument(&fragment.text.value)?);
+                continue;
+            }
+        }
         if darwin && fragment.role == LinkFragmentRole::Libraries {
             arguments.extend(rpaths.take().into_iter().flatten());
         }
@@ -692,7 +728,25 @@ fn link_libraries(
     ) {
         arguments.push(wrapper.driver_flags(standard));
     }
-    Ok(join_words(arguments))
+    if !ninja_posix {
+        return Ok(join_words(arguments));
+    }
+    let frameworks = join_words(framework_paths);
+    let directories = library_paths.join(b"   ".as_slice());
+    let libraries = arguments
+        .iter()
+        .filter(|arg| !arg.is_empty())
+        .map(|argument| argument.as_slice())
+        .collect::<Vec<_>>()
+        .join(b"  ".as_slice());
+    let mut line = frameworks;
+    if !line.is_empty() && !directories.is_empty() {
+        line.extend_from_slice(b"  ");
+    }
+    line.extend_from_slice(&directories);
+    line.push(b' ');
+    line.extend_from_slice(&libraries);
+    Ok(line)
 }
 
 fn darwin_versions(model: &ProjectModel, target: &Target, language: &[u8]) -> Vec<BString> {

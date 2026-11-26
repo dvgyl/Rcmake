@@ -52,7 +52,7 @@ pub(super) fn expand(
             return lookup(key);
         };
         let value = lookup(name)?;
-        if value.is_empty() {
+        if value.iter().all(u8::is_ascii_whitespace) {
             return Some(value);
         }
         Some([*begin, b" ", value.as_slice(), b" ", *end].concat().into())

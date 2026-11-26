@@ -414,7 +414,7 @@ fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std
             manifest,
             concat!(
                 "build libdemo.so.1 | libdemo.so libdemo.lib: LINK_SHARED_LIBRARY\n",
-                "  COMMAND = :\n",
+                "  COMMAND = : && :\n",
                 "  DESC = Linking C shared library libdemo.so.1\n",
                 "build check | /work/build/check: phony libdemo.so\n",
                 "build libdemo.so$:Debug: phony libdemo.so.1 libdemo.so libdemo.lib\n",

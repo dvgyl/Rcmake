@@ -325,6 +325,21 @@ impl<'a> Graph<'a> {
         )
     }
 
+    fn link_command_line(
+        &self,
+        invocations: &[rcmake_resolve::Invocation],
+        custom: bool,
+    ) -> Vec<u8> {
+        if custom {
+            return self.command_line(invocations, true);
+        }
+        self.commands.link_line(
+            invocations,
+            &path::from_native(self.build_dir),
+            !self.prefix.is_empty(),
+        )
+    }
+
     pub(crate) fn has_target(&self, name: &BString) -> bool {
         self.names.contains_key(name) || self.producers.contains_key(name)
     }
