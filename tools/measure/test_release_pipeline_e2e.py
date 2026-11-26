@@ -90,7 +90,7 @@ class ReleasePipelineTests(unittest.TestCase):
         return path
 
     def make_receipts(self):
-        policy_suites = [f"CMP{i:04d}" for i in range(66, 120)] + ["CMP0226"]
+        policy_suites = [f"CMP{i:04d}" for i in range(66, 99)] + ["CMP0223"]
         common = list(dict.fromkeys([*SUITE_GROUPS["all"], *policy_suites]))
         for os_name, total in (("macos", 371), ("linux", 362), ("windows", 367)):
             suites = common + [f"MockSuite{i:03d}" for i in range(total - len(common))]
@@ -250,7 +250,7 @@ class ReleasePipelineTests(unittest.TestCase):
 
         tracks = snapshot["tracks"]
         self.assertEqual(tracks["coreConformance"]["suitesAt100"], 62)
-        self.assertEqual(tracks["policies"]["suitesPassed"], 56)
+        self.assertEqual(tracks["policies"]["suitesPassed"], 35)
         self.assertEqual([row["suitesPassed"] for row in tracks["runCmakeOs"]["platforms"]],
                          [371, 362, 367])
         self.assertEqual(tracks["vcpkgMatrix"]["shardsPassed"], 64)

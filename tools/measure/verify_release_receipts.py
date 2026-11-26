@@ -20,7 +20,6 @@ completeness and pass thresholds across all required tracks:
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
@@ -292,24 +291,17 @@ def load_directory_receipt(key: str, directory: Path) -> tuple[dict[str, Any], l
         for path in paths:
             report = read_json_object(path)
             member_identities.append((path.relative_to(directory).as_posix(), *extract_identity_fields(report)))
-            outcomes: Counter[str] = Counter()
-            results_file = path.with_name("results.jsonl")
-            if results_file.is_file():
-                for line in results_file.read_text(encoding="utf-8").splitlines():
-                    if line.strip():
-                        outcomes[json.loads(line)["status"]] += 1
-            total = report.get("expected_ports")
-            passed = outcomes["pass"]
-            failed = outcomes["configure-mismatch"] + outcomes["cmake-identity-mismatch"]
-            recorded = sum(outcomes.values())
-            if not is_int(total) or total < 0:
-                raise ValueError(f"{path}: expected_ports must be a nonnegative integer.")
-            status = "partial" if (recorded == 0 or recorded < total) else ("pass" if passed == total else "fail")
+            expected = report.get("expected_ports")
+            status, passed, failed, skipped = builder.score_vcpkg_shard(
+                path.with_name("results.jsonl"), expected,
+            )
             shards.append({
                 "shard": report.get("shard_index"),
                 "shard_count": report.get("shard_count"),
                 "status": status,
-                "ports_total": total,
+                "ports_total": passed + failed,
+                "ports_expected": expected,
+                "ports_skipped": skipped,
                 "ports_passed": passed,
                 "ports_failed": failed,
             })
@@ -318,6 +310,8 @@ def load_directory_receipt(key: str, directory: Path) -> tuple[dict[str, Any], l
             "shards_completed": sum(s["status"] in {"pass", "fail"} for s in shards),
             "shards_passed": sum(s["status"] == "pass" for s in shards),
             "ports_total": sum(s["ports_total"] for s in shards),
+            "ports_expected": sum(s["ports_expected"] for s in shards),
+            "ports_skipped": sum(s["ports_skipped"] for s in shards),
             "ports_passed": sum(s["ports_passed"] for s in shards),
             "ports_failed": sum(s["ports_failed"] for s in shards),
             "shards": shards,
@@ -761,14 +755,36 @@ def check_large_projects(record: ReceiptRecord, findings: list[Finding]) -> None
         ))
 
 
+def vcpkg_port_issue(payload: dict[str, Any]) -> str | None:
+    ports_total = payload.get("ports_total", payload.get("portsTotal"))
+    ports_scored = payload.get("ports_scored", payload.get("portsScored", ports_total))
+    ports_expected = payload.get("ports_expected", payload.get("portsExpected", ports_total))
+    ports_skipped = payload.get("ports_skipped", payload.get("portsSkipped"))
+    ports_passed = payload.get("ports_passed", payload.get("portsPassed"))
+    ports_failed = payload.get("ports_failed", payload.get("portsFailed", 0))
+    if (
+        not is_int(ports_total)
+        or not is_int(ports_scored)
+        or not is_int(ports_expected)
+        or not 0 < ports_scored <= ports_total <= ports_expected
+        or (ports_skipped is not None
+            and (not is_int(ports_skipped) or ports_scored + ports_skipped != ports_expected))
+        or not is_int(ports_passed)
+        or not is_int(ports_failed)
+        or ports_failed != 0
+        or ports_passed != ports_scored
+    ):
+        return (f"passed={ports_passed}, scored={ports_scored}, failed={ports_failed}, "
+                f"skipped={ports_skipped}, expected={ports_expected}")
+    return None
+
+
 def check_vcpkg(record: ReceiptRecord, findings: list[Finding]) -> None:
     payload = record.payload
     shards_total = payload.get("shards_total", payload.get("shardsTotal"))
     shards_completed = payload.get("shards_completed", payload.get("shardsCompleted"))
     shards_passed = payload.get("shards_passed", payload.get("shardsPassed"))
-    ports_total = payload.get("ports_total", payload.get("portsTotal"))
-    ports_passed = payload.get("ports_passed", payload.get("portsPassed"))
-    ports_failed = payload.get("ports_failed", payload.get("portsFailed", 0))
+    port_issue = vcpkg_port_issue(payload)
 
     if isinstance(payload.get("shards"), list):
         shard_rows = payload["shards"]
@@ -792,8 +808,16 @@ def check_vcpkg(record: ReceiptRecord, findings: list[Finding]) -> None:
             shards_total = len(shard_rows)
         if shards_completed is None:
             shards_completed = sum(1 for row in shard_rows if isinstance(row, dict) and row.get("status") in {"pass", "fail"})
-        if shards_passed is None:
+        if shards_passed is None or any(
+            "status" in row and row["status"] != "pass" for row in shard_rows if isinstance(row, dict)
+        ):
             shards_passed = sum(1 for row in shard_rows if isinstance(row, dict) and row.get("status") == "pass")
+        if port_issue is None:
+            for row in shard_rows:
+                if isinstance(row, dict) and ("ports_total" in row or "portsTotal" in row):
+                    if issue := vcpkg_port_issue(row):
+                        port_issue = f"shard {row.get('shard')}: {issue}"
+                        break
 
     if (
         shards_total != VCPKG_REQUIRED_SHARDS
@@ -809,20 +833,13 @@ def check_vcpkg(record: ReceiptRecord, findings: list[Finding]) -> None:
             detail="vcpkg ecosystem matrix requires full 64-shard coverage.",
         ))
 
-    if (
-        not is_int(ports_total)
-        or ports_total <= 0
-        or not is_int(ports_passed)
-        or not is_int(ports_failed)
-        or ports_failed != 0
-        or ports_passed != ports_total
-    ):
+    if port_issue is not None:
         findings.append(Finding(
             track=record.track,
             receipt=record.key,
             kind="failed",
-            expected="ports_total > 0, ports_passed == ports_total, ports_failed == 0",
-            actual=f"passed={ports_passed}, total={ports_total}, failed={ports_failed}",
+            expected="All expected ports recorded, at least one scored port, and all scored ports passed",
+            actual=port_issue,
             detail="vcpkg matrix reported missing or failing port comparisons.",
         ))
 

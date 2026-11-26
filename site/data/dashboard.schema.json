@@ -248,6 +248,8 @@
             "shardsPassed": { "type": ["integer", "null"], "minimum": 0, "maximum": 64 },
             "portsTotal": { "type": ["integer", "null"], "minimum": 0 },
             "portsPassed": { "type": ["integer", "null"], "minimum": 0 },
+            "portsInspected": { "type": "integer", "minimum": 0 },
+            "portsExpected": { "type": "integer", "minimum": 0 },
             "passRate": { "$ref": "#/$defs/rate" },
             "note": { "type": "string" },
             "shards": {
@@ -263,6 +265,8 @@
                   "portsTotal": { "type": ["integer", "null"], "minimum": 0 },
                   "portsPassed": { "type": ["integer", "null"], "minimum": 0 },
                   "portsFailed": { "type": ["integer", "null"], "minimum": 0 },
+                  "portsInspected": { "type": "integer", "minimum": 0 },
+                  "portsExpected": { "type": "integer", "minimum": 0 },
                   "durationSeconds": { "type": ["number", "null"], "minimum": 0 },
                   "note": { "type": "string" }
                 }

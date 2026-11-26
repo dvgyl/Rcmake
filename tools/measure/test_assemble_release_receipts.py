@@ -41,7 +41,7 @@ def write_json(path: Path, payload: dict) -> Path:
 
 
 def make_runcmake_payload(total_suites: int, commit: str = COMMIT, binary: str = DIGEST) -> dict:
-    policy_suites = [f"CMP{i:04d}" for i in range(66, 120)] + ["CMP0226"]
+    policy_suites = [f"CMP{i:04d}" for i in range(66, 99)] + ["CMP0223"]
     common = list(dict.fromkeys([*SUITE_GROUPS["all"], *policy_suites]))
     suites = common + [f"MockSuite{i:03d}" for i in range(total_suites - len(common))]
     return {
@@ -215,7 +215,9 @@ class AssembleReleaseReceiptsTests(unittest.TestCase):
                     "duration_seconds": 12.5,
                 },
             )
-            rows = (json.dumps({"port": f"port-{index}-{p}", "status": "pass"}) for p in range(40))
+            statuses = ["pass"] * 38 + ["oracle-blocked-before-configure", "no-observed-cmake-configure"]
+            rows = (json.dumps({"port": f"port-{index}-{p}", "status": status})
+                    for p, status in enumerate(statuses))
             shard_path.with_name("results.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
         write_json(
@@ -511,6 +513,9 @@ class AssembleReleaseReceiptsTests(unittest.TestCase):
 
     def test_full_assemble_and_stamp_docs_on_19_receipt_directory(self) -> None:
         self.populate_complete_directory_layout(self.receipts)
+        write_json(self.receipts / "binary-size.json", {
+            "release_commit": COMMIT, "binary_sha256": DIGEST, "binary_size_bytes": 15_728_640,
+        })
 
         res = self.run_script(
             ASSEMBLER_SCRIPT,
@@ -538,8 +543,17 @@ class AssembleReleaseReceiptsTests(unittest.TestCase):
         self.assertEqual(snapshot["commit"], COMMIT)
         self.assertEqual(snapshot["binarySha256"], DIGEST)
         self.assertEqual(snapshot["tracks"]["coreConformance"]["suitesAt100"], 62)
-        self.assertEqual(snapshot["tracks"]["policies"]["suitesPassed"], 56)
-        self.assertEqual(snapshot["tracks"]["vcpkgMatrix"]["shardsPassed"], 64)
+        policies = snapshot["tracks"]["policies"]
+        self.assertEqual((policies["suitesPassed"], policies["suitesTotal"], policies["status"]),
+                         (35, 35, "pass"))
+        vcpkg = snapshot["tracks"]["vcpkgMatrix"]
+        self.assertEqual((vcpkg["shardsPassed"], vcpkg["passRate"], vcpkg["status"]), (64, 100, "pass"))
+        self.assertEqual((vcpkg["portsPassed"], vcpkg["portsTotal"], vcpkg["portsInspected"]),
+                         (2432, 2432, 2560))
+        self.assertIn("2,432 / 2,432 scored CMake ports", self.writeup.read_text(encoding="utf-8"))
+        self.assertIn("2,560 ports inspected", self.writeup.read_text(encoding="utf-8"))
+        self.assertEqual(read_json(self.manifest_out)["receipts"]["dist"]["path"],
+                         str((self.receipts / "dist.json").resolve()))
         self.assertEqual(snapshot["tracks"]["bossFight"]["l1Passed"], 10)
         self.assertEqual(snapshot["tracks"]["unseenHoldout"]["status"], "pass")
 
@@ -579,8 +593,28 @@ class AssembleReleaseReceiptsTests(unittest.TestCase):
                 resolved_keys.add(marker.key)
         self.assertEqual(resolved_keys, stamper.EXPECTED_KEYS)
 
+    def test_distribution_rejects_a_disagreeing_size_receipt(self) -> None:
+        distribution = {"release_commit": COMMIT, "binary_sha256": DIGEST, "binary_size_bytes": 123}
+        write_json(self.receipts / "dist.json", distribution)
+        for key, value, state in (
+            ("binary_size_bytes", 124, "invalid"),
+            ("release_commit", STALE, "sha-mismatch"),
+            ("binary_sha256", STALE_DIGEST, "binary-mismatch"),
+        ):
+            with self.subTest(key=key):
+                write_json(self.receipts / "binary-size.json", {**distribution, key: value})
+                scan = assembler.scan_receipts_dir(self.receipts, COMMIT)
+                dist = next(lane for lane in scan.lanes if lane.spec.key == "dist")
+                self.assertEqual(dist.state, state)
+                self.assertTrue(any("binary-size.json" in item and key in item for item in dist.offenders))
+
     def test_full_assemble_with_flat_short_aliases_and_inferred_binary_sha256(self) -> None:
         self.populate_flat_alias_layout(self.receipts)
+        summary_path = self.receipts / "vcpkg.json"
+        summary = read_json(summary_path)
+        summary.update(ports_scored=2559, ports_passed=2559, ports_skipped=1)
+        summary["shards"][0].update(ports_scored=39, ports_passed=39, ports_skipped=1)
+        write_json(summary_path, summary)
 
         res = self.run_script(
             ASSEMBLER_SCRIPT,
@@ -600,6 +634,9 @@ class AssembleReleaseReceiptsTests(unittest.TestCase):
         snapshot = read_json(self.out_json)
         self.assertEqual(snapshot["commit"], COMMIT)
         self.assertEqual(snapshot["binarySha256"], DIGEST)
+        vcpkg = snapshot["tracks"]["vcpkgMatrix"]
+        self.assertEqual((vcpkg["portsPassed"], vcpkg["portsTotal"], vcpkg["portsInspected"]),
+                         (2559, 2559, 2560))
         gate_ids = {row["id"] for row in snapshot["tracks"]["benchmarksAndGates"]["gates"]}
         self.assertIn("determinism", gate_ids)
         self.assertIn("path-swap", gate_ids)

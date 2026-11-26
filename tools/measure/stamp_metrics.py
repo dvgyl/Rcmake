@@ -557,10 +557,12 @@ def extract_metrics(
         and is_int(vcpkg.get("shardsCompleted"))
         and is_int(vcpkg.get("shardsTotal"))
     ):
+        inspected = vcpkg.get("portsInspected")
+        inspected_note = f". {inspected:,} ports inspected" if is_int(inspected) else ""
         record(
             "vcpkg_matrix",
-            f"{vcpkg['passRate']:.2f}% ({vcpkg['portsPassed']:,} / {vcpkg['portsTotal']:,} ports "
-            f"across {vcpkg['shardsCompleted']:,} / {vcpkg['shardsTotal']:,} shards)",
+            f"{vcpkg['passRate']:.2f}% ({vcpkg['portsPassed']:,} / {vcpkg['portsTotal']:,} scored CMake ports "
+            f"across {vcpkg['shardsCompleted']:,} / {vcpkg['shardsTotal']:,} shards){inspected_note}",
             "",
         )
     else:

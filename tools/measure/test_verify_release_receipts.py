@@ -59,7 +59,7 @@ def make_full_dashboard(commit: str = COMMIT_OK, binary: str = BINARY_OK) -> dic
         status="pass", suitesTotal=62, suitesAt100=62, casesPassed=1240, casesTotal=1240, passRate=100.0
     )
     tracks["policies"].update(
-        status="pass", suitesTotal=56, suitesPassed=56, casesPassed=560, casesTotal=560, passRate=100.0
+        status="pass", suitesTotal=35, suitesPassed=35, casesPassed=350, casesTotal=350, passRate=100.0
     )
     tracks["runCmakeOs"]["status"] = "pass"
     for plat, count in zip(tracks["runCmakeOs"]["platforms"], (371, 362, 367)):
@@ -363,11 +363,13 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
                     "binary_sha256": BINARY_OK,
                     "shard_index": idx,
                     "shard_count": 64,
-                    "expected_ports": 2,
+                    "expected_ports": 3,
                 },
             )
             (shard_dir / "results.jsonl").write_text(
-                '{"status": "pass", "port": "a"}\n{"status": "pass", "port": "b"}\n',
+                '{"status": "pass", "port": "a"}\n'
+                '{"status": "oracle-blocked-before-configure", "port": "b"}\n'
+                '{"status": "no-observed-cmake-configure", "port": "c"}\n',
                 encoding="utf-8",
             )
         # Multi-file large-projects directory
@@ -390,6 +392,28 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, stderr)
         self.assertIn("PASS: verified 18 release receipts", stdout)
+
+    def test_vcpkg_summary_uses_explicit_scored_counts(self):
+        payloads = self.build_valid_receipts()
+        vcpkg = payloads["vcpkg"]
+        vcpkg.update(ports_scored=2496, ports_passed=2496, ports_skipped=64)
+        for shard in vcpkg["shards"]:
+            shard.update(ports_scored=39, ports_passed=39, ports_skipped=1)
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 0, stderr)
+
+        vcpkg["shards"][0]["status"] = "fail"
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("vcpkg (failed)", stderr)
+
+        vcpkg["shards"][0].update(status="pass", ports_scored=0, ports_passed=0, ports_skipped=40)
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("shard 0: passed=0, scored=0", stderr)
 
     def test_rejects_stale_commit_and_mixed_binary_sha256(self):
         payloads = self.build_valid_receipts()

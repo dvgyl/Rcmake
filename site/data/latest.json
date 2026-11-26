@@ -34,12 +34,12 @@
       "status": "pending",
       "baselineAlwaysNew": "CMP0000-CMP0065",
       "activeRange": "CMP0066-CMP0226",
-      "suitesTotal": 56,
+      "suitesTotal": 35,
       "suitesPassed": null,
       "casesPassed": null,
       "casesTotal": null,
       "passRate": null,
-      "note": "CMP0000-CMP0065 are always NEW in CMake 4.x. 56 upstream policy suites test the 161 active policies (CMP0066-CMP0226); run pending v0.1.0 release verification."
+      "note": "The CMake 4.5.1 OS profiles include 35 distinct RunCMake policy suites in this range. Release verification is pending."
     },
     "runCmakeOs": {
       "label": "Tests/RunCMake by OS",
@@ -203,7 +203,7 @@
       ]
     },
     "vcpkgMatrix": {
-      "label": "vcpkg ports (64 shards)",
+      "label": "vcpkg CMake port comparisons (64 shards)",
       "status": "pending",
       "shardsTotal": 64,
       "shardsCompleted": 0,

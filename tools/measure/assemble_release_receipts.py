@@ -37,6 +37,7 @@ DEFAULT_SCHEMA = ROOT / "site" / "data" / "dashboard.schema.json"
 DEFAULT_WASM_BUNDLE = ROOT / "site" / "wasm" / "rcmake_wasm.wasm"
 DEFAULT_README = ROOT / "README.md"
 DEFAULT_WRITEUP = ROOT / "docs" / "BUILD_WRITEUP.md"
+DIST_SIZE_ALIASES = ("binary-size.json", "binary_size.json")
 
 
 @dataclass(frozen=True)
@@ -225,7 +226,7 @@ LANES: tuple[LaneSpec, ...] = (
         track="track6-ux-packaging",
         required=True,
         canonical_name="dist.json",
-        candidates=("dist.json", "dist-tarball.json", "dist_tarball.json", "binary-size.json", "binary_size.json"),
+        candidates=("dist.json", "dist-tarball.json", "dist_tarball.json", *DIST_SIZE_ALIASES),
         builder_flag="--dist",
     ),
     LaneSpec(
@@ -267,6 +268,7 @@ class FileCheck:
     binaries: tuple[str, ...]
     error: str | None = None
     is_json_object: bool = True
+    binary_size_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -408,7 +410,9 @@ def _inspect_json_file(path: Path, receipts_dir: Path, lane_key: str) -> FileChe
 
     commits = tuple(dict.fromkeys(builder.report_identity_values(payload, builder.REPORT_SHA_KEYS)))
     binaries = tuple(dict.fromkeys(builder.report_identity_values(payload, builder.REPORT_DIGEST_KEYS)))
-    return FileCheck(rel, path, commits, binaries, is_json_object=True)
+    size = payload.get("binary_size_bytes") if lane_key == "dist" else None
+    size = size if verifier.is_int(size) and size > 0 else None
+    return FileCheck(rel, path, commits, binaries, binary_size_bytes=size)
 
 
 def _member_files_for_directory(directory: Path, pattern: str) -> list[Path]:
@@ -426,6 +430,11 @@ def _discover_lane_paths(receipts_dir: Path, spec: LaneSpec) -> tuple[list[Path]
             matches.append(candidate)
 
     companions: list[Path] = []
+    if spec.key == "dist" and len(matches) == 2 and all(path.is_file() for path in matches):
+        size_files = [path for path in matches if path.name in DIST_SIZE_ALIASES]
+        if len(size_files) == 1:
+            companions = size_files
+            matches.remove(size_files[0])
     if len(matches) == 1 and matches[0].is_file() and spec.companion_candidates:
         for name in spec.companion_candidates:
             candidate = receipts_dir / name
@@ -599,21 +608,28 @@ def scan_receipts_dir(
                 states_seen.add("binary-mismatch")
                 joined = ", ".join(item.binaries)
                 lane_offenders.append(f"{item.rel_path}: conflicting binary_sha256 values [{joined}]")
-            elif norm_binary is not None:
-                if not item.binaries:
-                    states_seen.add("missing-binary-sha256")
-                    lane_offenders.append(
-                        f"{item.rel_path}: missing binary_sha256 (expected {norm_binary})"
-                    )
-                elif item.binaries[0] != norm_binary:
-                    states_seen.add("binary-mismatch")
-                    lane_offenders.append(
-                        f"{item.rel_path}: binary_sha256 {item.binaries[0]!r} != expected {norm_binary!r}"
-                    )
+            elif not item.binaries and (norm_binary is not None or (spec.key == "dist" and companions)):
+                states_seen.add("missing-binary-sha256")
+                lane_offenders.append(f"{item.rel_path}: missing binary_sha256")
+            elif norm_binary is not None and item.binaries[0] != norm_binary:
+                states_seen.add("binary-mismatch")
+                lane_offenders.append(
+                    f"{item.rel_path}: binary_sha256 {item.binaries[0]!r} != expected {norm_binary!r}"
+                )
             elif mixed_binaries and item.binaries:
                 states_seen.add("binary-mismatch")
                 lane_offenders.append(
                     f"{item.rel_path}: mixed binary_sha256 {item.binaries[0]!r} across receipts"
+                )
+
+        if spec.key == "dist" and companions and all(item.error is None for item in checks):
+            distribution, size_receipt = checks
+            if (distribution.binary_size_bytes is None
+                    or distribution.binary_size_bytes != size_receipt.binary_size_bytes):
+                states_seen.add("invalid")
+                lane_offenders.append(
+                    f"{size_receipt.rel_path} and {distribution.rel_path} must record "
+                    "the same positive binary_size_bytes."
                 )
 
         unique_commits = tuple(dict.fromkeys(lane_commits))
@@ -775,12 +791,15 @@ def _stage_vcpkg_summary(summary_path: Path, stage_dir: Path) -> Path:
         index = row.get("shard_index", row.get("shard"))
         shard_count = row.get("shard_count", row.get("shardCount", default_shard_count))
         ports_total = row.get("ports_total", row.get("portsTotal", 0))
+        ports_scored = row.get("ports_scored", row.get("portsScored", ports_total))
+        ports_expected = row.get("ports_expected", row.get("portsExpected", ports_total))
+        ports_skipped = row.get("ports_skipped", row.get("portsSkipped", ports_expected - ports_scored))
         ports_passed = row.get("ports_passed", row.get("portsPassed", 0))
         ports_failed = row.get("ports_failed", row.get("portsFailed", 0))
         duration = row.get("duration_seconds", row.get("durationSeconds", 0.0))
         status = row.get("status", "pass")
-        if status == "fail" and ports_failed == 0 and ports_passed < ports_total:
-            ports_failed = ports_total - ports_passed
+        if status == "fail" and ports_failed == 0 and ports_passed < ports_scored:
+            ports_failed = ports_scored - ports_passed
 
         shard_dir = vcpkg_stage / str(index)
         shard_dir.mkdir(parents=True, exist_ok=True)
@@ -788,7 +807,7 @@ def _stage_vcpkg_summary(summary_path: Path, stage_dir: Path) -> Path:
             **ident,
             "shard_index": index,
             "shard_count": shard_count,
-            "expected_ports": ports_total,
+            "expected_ports": ports_expected,
             "duration_seconds": duration,
         }
         (shard_dir / "shard.json").write_text(json.dumps(shard_payload) + "\n", encoding="utf-8")
@@ -799,6 +818,10 @@ def _stage_vcpkg_summary(summary_path: Path, stage_dir: Path) -> Path:
         lines.extend(
             json.dumps({"port": f"failed-{index}-{fail_idx}", "status": "configure-mismatch"})
             for fail_idx in range(int(ports_failed))
+        )
+        lines.extend(
+            json.dumps({"port": f"skipped-{index}-{skip_idx}", "status": "no-observed-cmake-configure"})
+            for skip_idx in range(builder.count(ports_skipped))
         )
         (shard_dir / "results.jsonl").write_text(
             ("\n".join(lines) + "\n") if lines else "",

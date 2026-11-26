@@ -53,6 +53,8 @@ EXPECTED_OS_SUITES = {
     "linux-x86_64": 362,
     "windows-x86_64": 367,
 }
+# Distinct CMP0066+ suites in the union of the CMake 4.5.1 OS profiles.
+EXPECTED_POLICY_SUITES = 35
 RUNCMAKE_MIN_PASS_RATE = 99.0
 HOLDOUT_MIN_REPOS = 240
 HOLDOUT_MIN_PASS_RATE = 95.0
@@ -250,8 +252,8 @@ def reset_tracks_to_pending(snapshot):
         highlight.pop("note", None)
 
     policies = tracks["policies"]
-    policies.update(status="pending", suitesPassed=None, casesPassed=None, casesTotal=None,
-                    passRate=None, note=pending_note)
+    policies.update(status="pending", suitesTotal=EXPECTED_POLICY_SUITES, suitesPassed=None,
+                    casesPassed=None, casesTotal=None, passRate=None, note=pending_note)
 
     run_cmake = tracks["runCmakeOs"]
     run_cmake.update(status="pending", note=pending_note)
@@ -285,6 +287,9 @@ def reset_tracks_to_pending(snapshot):
     for shard in vcpkg["shards"]:
         shard.update(status="pending", portsTotal=None, portsPassed=None, portsFailed=None,
                      durationSeconds=None, note=pending_note)
+    for row in (vcpkg, *vcpkg["shards"]):
+        row.pop("portsInspected", None)
+        row.pop("portsExpected", None)
 
     bench_section = tracks["benchmarksAndGates"]
     for metric in bench_section["benchmarks"].values():
@@ -453,12 +458,13 @@ def merge_runcmake(tracks, reports):
         row for name, row in suites.items()
         if re.fullmatch(r"CMP[0-9]{4}", name) and int(name[3:]) >= 66
     ]
-    for section, rows, pass_key in (
-        (core, core_rows, "suitesAt100"), (policies, policy_rows, "suitesPassed"),
+    for section, rows, minimum, pass_key in (
+        (core, core_rows, core["suitesTotal"], "suitesAt100"),
+        (policies, policy_rows, EXPECTED_POLICY_SUITES, "suitesPassed"),
     ):
         if rows:
             statuses = [row[2] for row in rows]
-            expected = max(section["suitesTotal"], len(rows))
+            expected = max(minimum, len(rows))
             if len(rows) < expected:
                 statuses.append("pending")
             status = combined_status(statuses)
@@ -1145,15 +1151,28 @@ def merge_holdout(track, path, identity=(None, None, False)):
         raise ValueError("The holdout report must contain valid aggregate and category counts.") from None
 
 
-def shard_results(path):
-    if not path.is_file():
-        return Counter()
-    counts = Counter()
-    with path.open(encoding="utf-8") as stream:
-        for line in stream:
-            if line.strip():
-                counts[json.loads(line)["status"]] += 1
-    return counts
+def score_vcpkg_shard(path, expected):
+    """Return the shard status and the passed, failed, and skipped port counts."""
+    expected = count(expected)
+    passed = failed = skipped = 0
+    if path.is_file():
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                status = row.get("status") if isinstance(row, dict) else None
+                if status == "pass":
+                    passed += 1
+                elif status in ("no-observed-cmake-configure", "oracle-blocked-before-configure"):
+                    skipped += 1
+                else:
+                    failed += 1
+    if expected == 0 or passed + failed + skipped != expected:
+        status = "partial"
+    else:
+        status = "pass" if passed > 0 and failed == 0 else "fail"
+    return status, passed, failed, skipped
 
 
 def merge_vcpkg(track, directory, identity=(None, None, False)):
@@ -1165,30 +1184,34 @@ def merge_vcpkg(track, directory, identity=(None, None, False)):
         if count(report["shard_count"]) != track["shardsTotal"] or index not in shards or index in seen:
             raise ValueError("Each vcpkg report must identify a distinct shard in the 64-shard matrix.")
         seen.add(index)
-        total = count(report["expected_ports"])
-        outcomes = shard_results(path.with_name("results.jsonl"))
-        passed = outcomes["pass"]
-        failed = outcomes["configure-mismatch"] + outcomes["cmake-identity-mismatch"]
-        recorded = outcomes.total()
-        rate(recorded, total)
-        if not recorded or recorded < total:
-            status = "partial"
-        else:
-            status = "pass" if passed == total else "fail"
-        shards[index].update(status=status, portsTotal=total, portsPassed=passed, portsFailed=failed,
+        expected = report["expected_ports"]
+        status, passed, failed, skipped = score_vcpkg_shard(path.with_name("results.jsonl"), expected)
+        scored = passed + failed
+        inspected = scored + skipped
+        shards[index].update(status=status, portsTotal=scored, portsPassed=passed, portsFailed=failed,
+                             portsInspected=inspected, portsExpected=expected,
                              durationSeconds=report.get("duration_seconds"),
-                             note=f"{recorded:,} / {total:,} expected port results recorded.")
+                             note=f"{scored:,} scored CMake ports. "
+                                  f"{inspected:,} / {expected:,} expected ports inspected.")
 
     reported = [row for row in shards.values() if row["status"] != "pending"]
-    total = sum(row["portsTotal"] for row in reported)
+    scored = sum(row["portsTotal"] for row in reported)
     passed = sum(row["portsPassed"] for row in reported)
     statuses = [row["status"] for row in shards.values()]
     status = "fail" if any(row.get("portsFailed") for row in reported) else combined_status(statuses)
+    note = f"The pass rate uses {scored:,} scored CMake ports."
+    if all("portsInspected" in row and "portsExpected" in row for row in reported):
+        inspected = sum(row["portsInspected"] for row in reported)
+        expected = sum(row["portsExpected"] for row in reported)
+        track.update(portsInspected=inspected, portsExpected=expected)
+        note += f" {inspected:,} / {expected:,} expected ports inspected in the reported shards."
+    else:
+        track.pop("portsInspected", None)
+        track.pop("portsExpected", None)
     track.update(shardsCompleted=sum(row["status"] in {"pass", "fail"} for row in reported),
                  shardsPassed=sum(row["status"] == "pass" for row in reported),
-                 portsTotal=total, portsPassed=passed, passRate=rate(passed, total),
-                 status=status,
-                 note="The rate uses the expected port count in the reported shards.")
+                 portsTotal=scored, portsPassed=passed, passRate=rate(passed, scored),
+                 status=status, note=note)
 
 
 def merge_ci(snapshot, report, identity, source):

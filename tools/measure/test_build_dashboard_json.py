@@ -114,6 +114,25 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(tracks["coreConformance"]["status"], "partial")
         self.assertEqual(tracks["policies"], self.base["tracks"]["policies"])
 
+    def test_policy_rollup_uses_the_active_suite_count(self):
+        self.base["tracks"]["policies"]["suitesTotal"] = 56
+        base = self.report("old-base.json", self.base)
+        passing = {"passed": 1, "total": 1}
+        policy_suites = {f"CMP{i:04d}": passing for i in range(66, 101)}
+        suites = {"CMP0065": {"passed": 0, "total": 1}, **policy_suites}
+        macos = self.report("macos.json", {"suites": suites})
+        linux = self.report("linux.json", {"suites": {"CMP0066": passing}})
+        for removed, status, passed_count in ((None, "pass", 35), ("CMP0100", "partial", 34)):
+            with self.subTest(status=status):
+                if removed:
+                    del suites[removed]
+                    self.report("macos.json", {"suites": suites})
+                policies = self.build("--base", base, "--runcmake-macos", macos,
+                                      "--runcmake-linux", linux)["tracks"]["policies"]
+                self.assertEqual((policies["suitesPassed"], policies["suitesTotal"], policies["status"]),
+                                 (passed_count, 35, status))
+                self.assertEqual(policies["passRate"], 100.0)
+
     def test_runcmake_os_coverage_minimums_and_pass_rate_gate(self):
         def make_suites(total_suites, fail_count=0, case_total=10, driver_error=False):
             suites = {}
@@ -306,17 +325,24 @@ class DashboardTests(unittest.TestCase):
             Path(path).with_name("results.jsonl").write_text("\n".join(rows), encoding="utf-8")
 
         shard(2, 2, ["pass", "configure-mismatch"])
-        shard(3, 2, ["pass", "pass"])
+        shard(3, 3, ["pass", "oracle-blocked-before-configure", "no-observed-cmake-configure"])
         shard(4, 2, ["cmake-identity-mismatch"])
         shard(5, 1, ["oracle-blocked-before-configure"])
+        shard(6, 1, ["unexpected"])
+        shard(7, 1, [{"invalid": "status"}])
+        shard(8, 1, ["pass", "pass"])
+        shard(9, 0, [])
         track = self.build("--vcpkg-dir", str(self.root / "vcpkg"))["tracks"]["vcpkgMatrix"]
         self.assertEqual((track["shardsCompleted"], track["shardsPassed"], track["passRate"]),
-                         (3, 1, 42.86))
-        self.assertEqual(track["portsTotal"], 7)
-        self.assertEqual([row["status"] for row in track["shards"][:6]],
-                         ["pending", "pending", "fail", "pass", "partial", "fail"])
-        self.assertEqual(track["shards"][2]["portsFailed"], 1)
-        self.assertEqual(track["shards"][4]["portsFailed"], 1)
+                         (5, 1, 50.0))
+        self.assertEqual((track["portsTotal"], track["portsInspected"], track["portsExpected"]),
+                         (8, 11, 11))
+        shards = track["shards"]
+        self.assertEqual([row["status"] for row in shards[2:10]],
+                         ["fail", "pass", "partial", "fail", "fail", "fail", "partial", "partial"])
+        self.assertEqual([shards[i]["portsFailed"] for i in (2, 4, 6, 7)], [1, 1, 1, 1])
+        self.assertEqual((shards[3]["portsPassed"], shards[3]["portsTotal"], shards[3]["portsInspected"]),
+                         (1, 1, 3))
 
     def test_ci_status_reports_update_the_snapshot_note(self):
         runs = [
