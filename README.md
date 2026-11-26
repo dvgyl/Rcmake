@@ -118,7 +118,7 @@ Known gaps from the frozen release run: <!-- METRIC:known_parity_gaps -->pending
 
 ### CMake 4.5.1 interfaces
 
-- Policies `CMP0000` to `CMP0226` (OLD behavior is removed for `CMP0000` to `CMP0065`, as in CMake 4.x). `CMP0066` to `CMP0226` are the 161 policies that a project can still set to OLD. The 56 upstream `RunCMake` policy suites test policies in this range, and other suites test more policies indirectly.
+- Policies `CMP0000` to `CMP0226` (OLD behavior is removed for `CMP0000` to `CMP0065`, as in CMake 4.x). `CMP0066` to `CMP0226` are the 161 policies that a project can still set to OLD. The 35 upstream `RunCMake` policy suites test policies in this range, and other suites test more policies indirectly.
 - CMake Presets, schema version 13
 - File API: `codemodel` v2.12, `cache` v2, `toolchains` v1, `cmakeFiles` v1, and `configureLog` v1
 - Common Package Specification (CPS) 0.15.0, read and write

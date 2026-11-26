@@ -10,7 +10,7 @@ The goal is drop-in compatibility. A project should configure, build, install, t
 
 CMake has no formal language specification. Its observable behavior is the specification, defined by 227 policies (`CMP0000` to `CMP0226`), subtle `if()` auto-dereference rules, `CMakeCache.txt` serialization details, Ninja quoting rules, and the upstream `Tests/RunCMake` suite. Real build trees depend on those details. A partial "CMake-like" reimplementation breaks as soon as a project inspects `CMakeCache.txt`, parses `try_compile` output with a regular expression, or checks File API JSON replies.
 
-`CMP0000` to `CMP0065` are always NEW in CMake 4.x. `CMP0066` to `CMP0226` are the 161 policies that a project can still set to OLD. The 56 upstream `RunCMake` policy suites test policies in this range, and other suites test more policies indirectly.
+`CMP0000` to `CMP0065` are always NEW in CMake 4.x. `CMP0066` to `CMP0226` are the 161 policies that a project can still set to OLD. The 35 upstream `RunCMake` policy suites test policies in this range, and other suites test more policies indirectly.
 
 Pinning one version, CMake 4.5.1, gives every design question a single test answer. When behavior is unclear, we run CMake 4.5.1 and `rcmake` side by side on a small probe and compare their outputs. A fixed target version keeps that answer stable.
 
@@ -225,7 +225,7 @@ Metrics in the "Frozen release binary" column are stamped mechanically from one 
 | Upstream `Tests/RunCMake`, Linux | 362 suites run (`linux`) | Pre-freeze run in progress | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
 | Upstream `Tests/RunCMake`, Windows | 367 suites run (`windows`) | Pre-freeze run in progress | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
 | Upstream Core-62 conformance | 62 core suites (`core`) | Pre-freeze run in progress | <!-- METRIC:runcmake_core62 -->pending frozen release run<!-- /METRIC --> |
-| Upstream policies | 56 policy suites for the 161 policies `CMP0066` to `CMP0226` | Pre-freeze run in progress | <!-- METRIC:runcmake_policies -->pending frozen release run<!-- /METRIC --> |
+| Upstream policies | 35 policy suites for the 161 policies `CMP0066` to `CMP0226` | Pre-freeze run in progress | <!-- METRIC:runcmake_policies -->pending frozen release run<!-- /METRIC --> |
 | Independent black-box suite | 20 scenarios, 679 checks | 20 scenarios, 679 checks implemented | <!-- METRIC:independent_scenarios -->pending frozen release run<!-- /METRIC --> |
 | Large C++ projects (L1) | 10 projects, configure stderr parity | Pinned tags, reduced option sets | <!-- METRIC:large_projects_l1 -->pending frozen release run<!-- /METRIC --> |
 | Large C++ projects (L2) | 10 projects, Ninja graph and File API parity for the listed targets | Pinned tags, reduced option sets | <!-- METRIC:large_projects_l2 -->pending frozen release run<!-- /METRIC --> |
