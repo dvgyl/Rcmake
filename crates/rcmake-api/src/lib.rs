@@ -25,6 +25,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 mod config;
 mod explain;
 mod explain_entries;

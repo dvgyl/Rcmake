@@ -120,7 +120,7 @@ For JSON output, use `render_explain_json(&report, None)` in place of `render_ex
 
 To read a real project, use `NativeHost` and the installed CMake modules. This setup is the same as the one that `rcmake explain` uses:
 
-```rust
+```rust,no_run
 use std::sync::Arc;
 
 use rcmake_api::{ConfigureRequest, ExplainQuery, LedgerLevel, ProcessPolicy, Services, WriteMode, run_configure};
