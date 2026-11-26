@@ -170,6 +170,8 @@ fn damaged_mirror_repairs_online_and_can_be_used_as_an_immutable_snapshot()
         time.secs, time.nanos
     ));
     host.create_dir_all(&root)?;
+    // The mirror resolves its cache root without links (`/tmp` is a link on macOS).
+    let root = host.canonicalize(&root)?;
     let scratch = Scratch { host: &host, root };
     let root = scratch.root.as_path();
     let cache = root.join("cache");

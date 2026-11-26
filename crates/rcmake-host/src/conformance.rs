@@ -30,6 +30,7 @@ fn check_fs(host: &dyn Host, root: &Path) -> HostResult<()> {
     check_files(host, &root)?;
     check_links(host, &root)?;
     check_directories(host, &root)?;
+    check_private_dir(host, &root)?;
     check_rename_noreplace(host, &root)?;
     check_file_locks(host, &root)?;
     check_relative_paths(host, &root);
@@ -238,6 +239,34 @@ fn check_links(host: &dyn Host, root: &Path) -> HostResult<()> {
     host.remove_file(&cycle_b)?;
     host.remove_file(&file)?;
     Ok(())
+}
+
+fn check_private_dir(host: &dyn Host, root: &Path) -> HostResult<()> {
+    let dir = root.join("private");
+    host.create_private_dir(&dir)?;
+    let meta = host.metadata(&dir, Follow::No)?;
+    assert_eq!(meta.kind, FileKind::Dir);
+    if host.system().sysname != "Windows" {
+        assert_eq!(
+            meta.mode & 0o077,
+            0,
+            "private directory mode {:o}",
+            meta.mode
+        );
+    }
+    if let (Some(owner), Some(uid)) = (meta.owner, host.effective_uid()) {
+        assert_eq!(owner, uid);
+    }
+    assert_kind(host.create_private_dir(&dir), ErrorKind::AlreadyExists);
+    assert_kind(
+        host.create_private_dir(&root.join("missing-parent").join("child")),
+        ErrorKind::NotFound,
+    );
+    assert!(
+        host.metadata(&root.join("missing-parent"), Follow::No)
+            .is_err()
+    );
+    host.remove_dir(&dir)
 }
 
 fn check_directories(host: &dyn Host, root: &Path) -> HostResult<()> {

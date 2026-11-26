@@ -298,6 +298,11 @@ impl Host for NativeHost {
         io_at(fs::create_dir_all(clean), p)
     }
 
+    fn create_private_dir(&self, p: &Path) -> HostResult<()> {
+        HostError::require_absolute(p)?;
+        io_at(platform::create_private_dir(p), p)
+    }
+
     fn remove_file(&self, p: &Path) -> HostResult<()> {
         HostError::require_absolute(p)?;
         // macOS reports EPERM when unlinking a directory.
@@ -651,6 +656,10 @@ impl Host for NativeHost {
             .unwrap_or(1);
         system.pid = std::process::id();
         system
+    }
+
+    fn effective_uid(&self) -> Option<u32> {
+        platform::effective_uid()
     }
 }
 

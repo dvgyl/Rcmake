@@ -7,29 +7,13 @@ use super::*;
 impl Host for JournalHost<'_> {
     fn metadata(&self, path: &Path, follow: Follow) -> HostResult<Metadata> {
         let result = self.inner.metadata(path, follow);
-        if !self.unobserved_read(path) {
-            match &result {
-                Ok(meta) if is_absolute(path) && meta.kind != FileKind::Other => {
-                    let mut state = self.state();
-                    state.check(
-                        Check::Metadata(path.to_owned(), follow == Follow::Yes),
-                        metadata_digest(meta),
-                    );
-                }
-                Err(error)
-                    if follow == Follow::Yes
-                        && is_absolute(path)
-                        && error.kind == ErrorKind::NotFound =>
-                {
-                    self.state().check(
-                        Check::FollowMissing(path.to_owned()),
-                        Digest::hash(b"missing"),
-                    );
-                }
-                Err(error) => self.record_error(path, error),
-                _ => self.mark_impure(ImpureReason::UnverifiableInput),
-            }
-        }
+        self.observe_metadata(path, follow, &result);
+        result
+    }
+
+    fn metadata_fresh(&self, path: &Path, follow: Follow) -> HostResult<Metadata> {
+        let result = self.inner.metadata_fresh(path, follow);
+        self.observe_metadata(path, follow, &result);
         result
     }
 
@@ -127,6 +111,11 @@ impl Host for JournalHost<'_> {
         self.inner.create_dir_all(path)
     }
 
+    fn create_private_dir(&self, path: &Path) -> HostResult<()> {
+        self.guard_write(path)?;
+        self.inner.create_private_dir(path)
+    }
+
     fn remove_file(&self, path: &Path) -> HostResult<()> {
         self.guard_write(path)?;
         self.inner.remove_file(path)
@@ -208,16 +197,13 @@ impl Host for JournalHost<'_> {
 
     fn canonicalize(&self, path: &Path) -> HostResult<PathBuf> {
         let result = self.inner.canonicalize(path);
-        if !self.unobserved_read(path) {
-            match &result {
-                Ok(target) if is_absolute(path) => {
-                    self.state()
-                        .check(Check::Canonical(path.to_owned()), path_digest(target));
-                }
-                Err(error) => self.record_error(path, error),
-                _ => self.mark_impure(ImpureReason::UnverifiableInput),
-            }
-        }
+        self.observe_canonical(path, &result);
+        result
+    }
+
+    fn canonicalize_fresh(&self, path: &Path) -> HostResult<PathBuf> {
+        let result = self.inner.canonicalize_fresh(path);
+        self.observe_canonical(path, &result);
         result
     }
 
@@ -474,6 +460,10 @@ impl Host for JournalHost<'_> {
         self.state().check(Check::System, system_digest(&system));
         system
     }
+
+    fn effective_uid(&self) -> Option<u32> {
+        self.inner.effective_uid()
+    }
 }
 
 pub(super) enum SharedOrBorrowed<'a, T: ?Sized> {
@@ -527,6 +517,49 @@ impl JournalHost<'_> {
             output: state.output,
             impure: state.impure,
             impurities: state.impurities,
+        }
+    }
+}
+
+impl JournalHost<'_> {
+    /// Record a metadata result in the journal, as [`Host::metadata`] does.
+    fn observe_metadata(&self, path: &Path, follow: Follow, result: &HostResult<Metadata>) {
+        if !self.unobserved_read(path) {
+            match result {
+                Ok(meta) if is_absolute(path) && meta.kind != FileKind::Other => {
+                    let mut state = self.state();
+                    state.check(
+                        Check::Metadata(path.to_owned(), follow == Follow::Yes),
+                        metadata_digest(meta),
+                    );
+                }
+                Err(error)
+                    if follow == Follow::Yes
+                        && is_absolute(path)
+                        && error.kind == ErrorKind::NotFound =>
+                {
+                    self.state().check(
+                        Check::FollowMissing(path.to_owned()),
+                        Digest::hash(b"missing"),
+                    );
+                }
+                Err(error) => self.record_error(path, error),
+                _ => self.mark_impure(ImpureReason::UnverifiableInput),
+            }
+        }
+    }
+
+    /// Record a canonicalization result in the journal, as [`Host::canonicalize`] does.
+    fn observe_canonical(&self, path: &Path, result: &HostResult<PathBuf>) {
+        if !self.unobserved_read(path) {
+            match result {
+                Ok(target) if is_absolute(path) => {
+                    self.state()
+                        .check(Check::Canonical(path.to_owned()), path_digest(target));
+                }
+                Err(error) => self.record_error(path, error),
+                _ => self.mark_impure(ImpureReason::UnverifiableInput),
+            }
         }
     }
 }

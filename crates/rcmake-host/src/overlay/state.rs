@@ -294,6 +294,7 @@ impl<H: Host + ?Sized> State<H> {
                 dev: u64::MAX,
                 ino: self.next_ino,
                 nlink: if kind == FileKind::Dir { 2 } else { 1 },
+                owner: self.base.effective_uid(),
             },
             backing: None,
             target: None,

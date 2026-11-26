@@ -7,12 +7,14 @@ mod digest;
 mod entry_publish;
 mod frame;
 mod gc;
+mod private_dir;
 pub mod remote;
 mod stamp;
 
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use rcmake_base::Limits;
@@ -27,6 +29,7 @@ use rcmake_json::{
 
 pub use digest::{Digest, Domain, KeyHasher};
 pub use gc::{GcReport, gc};
+pub use private_dir::{PrivateDir, canonical_path, ensure_private_dir, verify_private_dir};
 pub use stamp::{
     FastStat, InputStamp, MissReason, Trace, TraceMemo, TreePolicy, VerifyOutcome,
     directory_digest, file_digest, path_from_json, path_to_json, sdk_tree_listing_digest,
@@ -213,6 +216,8 @@ pub struct Store<'a> {
     config: StoreConfig,
     memo: Option<&'a TraceMemo>,
     rename_fallback: AtomicBool,
+    /// Identity of the root after it passed the privacy checks. Each use checks it again.
+    root_dir: Mutex<Option<PrivateDir>>,
     #[cfg(test)]
     test_hook: Option<&'a TestHook<'a>>,
 }
@@ -241,15 +246,22 @@ type TestHook<'a> = dyn Fn(TestEvent, &Path) + Send + Sync + 'a;
 
 impl<'a> Store<'a> {
     /// Open a store. Directories are created on the first write.
-    pub fn new(host: &'a dyn Host, config: StoreConfig) -> HostResult<Self> {
-        if config.mode != StoreMode::Off && !config.root.is_absolute() {
-            return Err(HostError::not_absolute(config.root));
+    ///
+    /// The root is resolved once to a path without symbolic links ([`canonical_path`]).
+    /// All later checks and operations use that path, and [`Store::root`] returns it.
+    pub fn new(host: &'a dyn Host, mut config: StoreConfig) -> HostResult<Self> {
+        if config.mode != StoreMode::Off {
+            if !config.root.is_absolute() {
+                return Err(HostError::not_absolute(config.root));
+            }
+            config.root = canonical_path(host, &config.root);
         }
         Ok(Self {
             host,
             config,
             memo: None,
             rename_fallback: AtomicBool::new(false),
+            root_dir: Mutex::new(None),
             #[cfg(test)]
             test_hook: None,
         })
@@ -338,7 +350,7 @@ impl<'a> Store<'a> {
 
     /// Read a verified blob. Missing or invalid data is a cache miss.
     pub fn get_blob(&self, digest: Digest) -> HostResult<Option<Vec<u8>>> {
-        if self.config.mode == StoreMode::Off {
+        if !self.readable()? {
             return Ok(None);
         }
         let path = self.blob_path(digest);
@@ -352,7 +364,7 @@ impl<'a> Store<'a> {
     /// A blob that exceeds the limit is a cache miss. When the limit is lower
     /// than the store limit, leave invalid or oversized files in the cache.
     pub fn get_blob_with_limit(&self, digest: Digest, limit: usize) -> HostResult<Option<Vec<u8>>> {
-        if self.config.mode == StoreMode::Off {
+        if !self.readable()? {
             return Ok(None);
         }
         if limit >= blob_limit() {
@@ -374,7 +386,7 @@ impl<'a> Store<'a> {
         digest: Digest,
         limit: usize,
     ) -> HostResult<Option<Vec<u8>>> {
-        if self.config.mode == StoreMode::Off {
+        if !self.readable()? {
             return Ok(None);
         }
         let path = self.blob_path(digest);
@@ -444,7 +456,7 @@ impl<'a> Store<'a> {
         blob_limit: usize,
         diagnose: bool,
     ) -> HostResult<Option<Entry<T>>> {
-        if self.config.mode == StoreMode::Off {
+        if !self.readable()? {
             return Ok(None);
         }
         let path = self.entry_path(domain, key);
@@ -505,7 +517,7 @@ impl<'a> Store<'a> {
     }
 
     fn lock_cache(&self, timeout: Duration) -> HostResult<LockedStore<'_, 'a>> {
-        self.ensure_dir(&self.config.root)?;
+        self.ensure_root()?;
         Ok(LockedStore {
             store: self,
             _lock: self.host.lock_file(&self.gc_lock_path()?, Some(timeout))?,
@@ -531,6 +543,58 @@ impl<'a> Store<'a> {
 
     fn writable(&self) -> bool {
         self.config.mode == StoreMode::ReadWrite
+    }
+
+    fn admitted_root(&self) -> Option<PrivateDir> {
+        *self.root_dir.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn admit_root(&self, dir: PrivateDir) {
+        *self.root_dir.lock().unwrap_or_else(PoisonError::into_inner) = Some(dir);
+    }
+
+    /// Check that only the current user can change or replace the existing cache root.
+    ///
+    /// The first check covers the root and all its ancestors. Each later check reads the
+    /// root metadata again and requires the same directory. Return a `NotFound` error if
+    /// the root does not exist.
+    fn trust_root(&self) -> HostResult<()> {
+        let root = &self.config.root;
+        match self.admitted_root() {
+            Some(dir) => dir.recheck(self.host, root).map(|_| ()),
+            None => {
+                self.admit_root(verify_private_dir(self.host, root)?);
+                Ok(())
+            }
+        }
+    }
+
+    /// Return whether reads can use the cache. A missing root is a cache miss.
+    ///
+    /// A refused root returns its permission error, so that the caller can report it.
+    /// Callers that treat errors as misses never read data from a refused root.
+    fn readable(&self) -> HostResult<bool> {
+        if self.config.mode == StoreMode::Off {
+            return Ok(false);
+        }
+        match self.trust_root() {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Create a missing cache root that only the current user can use, then check it.
+    ///
+    /// The existing ancestry is checked before any directory is created. An existing root
+    /// keeps its mode. A root that other users can change or replace is refused.
+    fn ensure_root(&self) -> HostResult<()> {
+        match self.trust_root() {
+            Err(error) if error.kind == ErrorKind::NotFound => {}
+            result => return result,
+        }
+        self.admit_root(ensure_private_dir(self.host, &self.config.root)?);
+        Ok(())
     }
 
     fn blob_path(&self, digest: Digest) -> PathBuf {

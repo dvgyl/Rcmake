@@ -43,6 +43,11 @@ impl GitMirror<'_> {
             .env_get(b"RCMAKE_FETCH_GIT_MAX_SIZE")
             .and_then(|value| std::str::from_utf8(&value).ok()?.parse().ok())
             .unwrap_or(DEFAULT_MAX_BYTES);
+        match self.admit_cache_root(false) {
+            Ok(()) => {}
+            Err(error) if error.kind == ErrorKind::NotFound => return Ok(GitGcReport::default()),
+            Err(error) => return Err(error.into()),
+        }
         let listing = match self.host.read_dir(&self.root) {
             Ok(listing) => listing,
             Err(error) if error.kind == ErrorKind::NotFound => return Ok(GitGcReport::default()),

@@ -17,7 +17,7 @@ use rcmake_fetch::{
     ArchiveCache, ContentHash, FetchError, FetchPool, GitEntry, GitMirror, LockEntry, LockFile,
     LockMode, LockSession, PrefetchSource, UrlEntry,
 };
-use rcmake_host::{Host, ProcessResult, PureHost, ReadRange, RunOutput};
+use rcmake_host::{Follow, Host, ProcessResult, PureHost, ReadRange, RunOutput};
 use rcmake_store::{PublishOutcome, Store, StoreConfig};
 
 const URL: &str = "https://example.invalid/archive";
@@ -1009,5 +1009,77 @@ fn archive_download_keeps_url_off_argv() -> Result<(), Box<dyn std::error::Error
     let result = cache.fetch(secret_url, None)?;
     assert_eq!(result.bytes, b"payload");
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+fn simulated_git(host: &PureHost) -> Result<(), Box<dyn std::error::Error>> {
+    host.set_command_handler(move |host, req, _| {
+        let Some(invocation) = req.pipeline.first() else {
+            panic!("Missing Git command.");
+        };
+        let git = &invocation.args;
+        let stdout = if git.first().is_some_and(|arg| arg == "clone") {
+            let Some(destination) = git.last().and_then(|arg| std::str::from_utf8(arg).ok()) else {
+                panic!("Missing UTF-8 Git destination.");
+            };
+            seed_bare(host, &PathBuf::from(destination))?;
+            Vec::new()
+        } else if git.iter().any(|arg| arg == "--is-bare-repository") {
+            b"true\n".to_vec()
+        } else if git.iter().any(|arg| arg == "--verify") {
+            PIN.as_bytes().to_vec()
+        } else if git.iter().any(|arg| arg == "cat-file") {
+            b"tree\n".to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            stdout,
+            ..RunOutput::default()
+        })
+    })?;
+    Ok(())
+}
+
+#[test]
+fn git_mirror_creates_a_fresh_cache_root_with_mode_0700() -> Result<(), Box<dyn std::error::Error>>
+{
+    let host = host();
+    host.set_effective_uid(Some(1000))?;
+    simulated_git(&host)?;
+    GitMirror::new(&host, &cache_root())?.prefetch(REPO, PIN)?;
+    let meta = host.metadata(&cache_root(), Follow::No)?;
+    assert_eq!((meta.mode, meta.owner), (0o700, Some(1000)));
+    Ok(())
+}
+
+#[test]
+fn git_mirror_refuses_a_cache_root_that_other_users_can_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = host();
+    host.create_dir_all(&cache_root())?;
+    host.set_permissions(&cache_root(), 0o777)?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    host.set_command_handler(move |_, _, _| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            ..RunOutput::default()
+        })
+    })?;
+    let error = GitMirror::new(&host, &cache_root())?
+        .prefetch(REPO, PIN)
+        .err();
+    assert!(
+        format!("{error:?}").contains("writable by group or others"),
+        "{error:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        host.metadata(&cache_root().join("git"), Follow::No)
+            .is_err()
+    );
     Ok(())
 }

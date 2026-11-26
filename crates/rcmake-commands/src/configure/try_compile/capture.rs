@@ -138,6 +138,7 @@ macro_rules! forward_host {
 impl Host for CapturingHost {
     forward_host!(read_dir(p: &Path) -> HostResult<Vec<DirEntry>>);
     forward_host!(create_dir_all(p: &Path) -> HostResult<()>);
+    forward_host!(create_private_dir(p: &Path) -> HostResult<()>);
     forward_host!(remove_file(p: &Path) -> HostResult<()>);
     forward_host!(remove_dir(p: &Path) -> HostResult<()>);
     forward_host!(remove_dir_all(p: &Path) -> HostResult<()>);
@@ -147,8 +148,10 @@ impl Host for CapturingHost {
     forward_host!(hard_link(src: &Path, dst: &Path) -> HostResult<()>);
     forward_host!(read_link(p: &Path) -> HostResult<PathBuf>);
     forward_host!(canonicalize(p: &Path) -> HostResult<PathBuf>);
+    forward_host!(canonicalize_fresh(p: &Path) -> HostResult<PathBuf>);
 
     forward_host!(metadata(p: &Path, follow: Follow) -> HostResult<Metadata>);
+    forward_host!(metadata_fresh(p: &Path, follow: Follow) -> HostResult<Metadata>);
     forward_host!(read(p: &Path, range: ReadRange) -> HostResult<Vec<u8>>);
     forward_host!(read_chunks(p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()>);
     forward_host!(
@@ -312,6 +315,7 @@ impl Host for CapturingHost {
     forward_host!(sleep(duration: Duration) -> ());
     forward_host!(time_zone() -> jiff::tz::TimeZone);
     forward_host!(current_exe() -> HostResult<PathBuf>);
+    forward_host!(effective_uid() -> Option<u32>);
 
     fn initial_cwd(&self) -> PathBuf {
         self.cwd.clone()

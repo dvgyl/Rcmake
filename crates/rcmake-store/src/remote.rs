@@ -18,7 +18,9 @@ use rcmake_host::{
 };
 use rcmake_json::FromJson;
 
-use crate::{Digest, Entry, InputStamp, NEXT_TEMP, StagingFile, Store, StoreMode, frame};
+use crate::{
+    Digest, Entry, InputStamp, NEXT_TEMP, PrivateDir, StagingFile, Store, frame, verify_private_dir,
+};
 
 mod manifest;
 
@@ -27,6 +29,7 @@ pub use manifest::{CacheEntryKind, CacheManifest, ManifestEntry, export_blob, ex
 use manifest::{attach_blobs, decode_blob, decode_entry, read_frame, valid_record};
 
 const PROBE_BLOB_BYTES: usize = 16 * 1024 * 1024;
+const PRIVATE_DIR_SETTING: &str = "RCMAKE_CACHE_REMOTE_PRIVATE_DIR";
 const SESSION_BLOB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AUTH_BYTES: usize = 8 * 1024;
 const EXPORT_TIMEOUT_SETTING: &str = "RCMAKE_CACHE_REMOTE_EXPORT_TIMEOUT";
@@ -176,14 +179,14 @@ fn resolve(
     host: &dyn Host,
     path: Option<&Path>,
     setting: &'static str,
-    check: impl FnOnce(&rcmake_host::Metadata) -> bool,
+    check: impl FnOnce(&Path, &rcmake_host::Metadata) -> bool,
 ) -> Result<PathBuf, RemoteError> {
     let invalid = RemoteError::Setting(setting);
     let path = path.filter(|p| p.is_absolute()).ok_or(invalid)?;
     let path = host.canonicalize(path).map_err(|_| invalid)?;
-    host.metadata(&path, Follow::No)
+    host.metadata_fresh(&path, Follow::No)
         .ok()
-        .filter(check)
+        .filter(|meta| check(&path, meta))
         .map(|_| path)
         .ok_or(invalid)
 }
@@ -224,6 +227,8 @@ pub struct RemoteStoreClient<'a> {
     failures: u32,
     diagnostic: Option<RemoteError>,
     pipe_config: bool,
+    /// Identity of the private directory after it passed the privacy checks.
+    private_identity: Option<PrivateDir>,
 }
 impl<'a> RemoteStoreClient<'a> {
     /// Create a client with bounded process capture and verify its HTTPS and directory settings.
@@ -248,23 +253,30 @@ impl<'a> RemoteStoreClient<'a> {
             "/usr/bin/curl"
         };
         let curl = config.curl_path.as_deref().or(Some(Path::new(default)));
-        let curl = resolve(host, curl, "RCMAKE_CACHE_REMOTE_CURL", |m| {
+        let curl = resolve(host, curl, "RCMAKE_CACHE_REMOTE_CURL", |_, m| {
             m.kind == FileKind::File && (windows || m.mode & 0o111 != 0)
         })?;
         if config.session_timeout.is_zero() {
             return Err(RemoteError::Setting("session_timeout"));
         }
+        let mut private_identity = None;
         config.private_dir = if needs_private_dir && !windows {
-            Some(resolve(
+            let dir = resolve(
                 host,
                 config.private_dir.as_deref(),
-                "RCMAKE_CACHE_REMOTE_PRIVATE_DIR",
-                |m| m.kind == FileKind::Dir && m.mode & 0o077 == 0,
-            )?)
+                PRIVATE_DIR_SETTING,
+                |_, m| m.mode & 0o077 == 0,
+            )?;
+            private_identity = Some(
+                verify_private_dir(host, &dir)
+                    .map_err(|_| RemoteError::Setting(PRIVATE_DIR_SETTING))?,
+            );
+            Some(dir)
         } else {
             None
         };
         Ok(Self {
+            private_identity,
             pipe_config: needs_private_dir && windows,
             host,
             curl,
@@ -275,6 +287,19 @@ impl<'a> RemoteStoreClient<'a> {
             failures: 0,
             diagnostic: None,
         })
+    }
+    /// Return whether the private directory is still the private directory that passed the
+    /// checks at client creation, with mode `0o700` or narrower.
+    fn private_dir_unchanged(&self) -> bool {
+        let (Some(dir), Some(identity)) =
+            (self.config.private_dir.as_deref(), self.private_identity)
+        else {
+            return false;
+        };
+        // One fresh sample gives both the identity and the mode.
+        identity
+            .recheck(self.host, dir)
+            .is_ok_and(|meta| meta.mode & 0o077 == 0)
     }
     /// Return whether the client has stopped sending requests for this configure.
     pub fn circuit_is_open(&self) -> bool {
@@ -302,7 +327,7 @@ impl<'a> RemoteStoreClient<'a> {
         else {
             return Ok(None);
         };
-        if store.config.mode == StoreMode::Off {
+        if !store.readable().unwrap_or(false) {
             return Ok(None);
         }
         self.attempt(false, |client, deadline| {
@@ -451,7 +476,11 @@ impl<'a> RemoteStoreClient<'a> {
             append_config(&mut input, b"url", &[url.as_bytes()]);
             args.extend(["--config".into(), "-".into()]);
             if let Some(path) = &path {
-                let error = RemoteError::Setting("RCMAKE_CACHE_REMOTE_PRIVATE_DIR");
+                let error = RemoteError::Setting(PRIVATE_DIR_SETTING);
+                // Check the directory again just before credentials go into it.
+                if !self.private_dir_unchanged() {
+                    return Err(error);
+                }
                 staged = Some(stage(self.host, path, &input).map_err(|_| error)?);
                 Input::File(path.to_owned())
             } else {
@@ -649,6 +678,35 @@ fn append_config(config: &mut Vec<u8>, option: &[u8], parts: &[&[u8]]) {
         config.push(byte);
     }
     config.extend_from_slice(b"\"\n");
+}
+
+#[test]
+fn remote_private_dir_requires_the_same_owner() -> Result<(), Box<dyn std::error::Error>> {
+    let root = Path::new(if cfg!(windows) { "C:/" } else { "/" });
+    let curl = root.join("bin/curl");
+    let private = root.join("private");
+    let host = rcmake_host::PureHost::new(root.to_owned(), root.join("bin/rcmake"));
+    host.set_effective_uid(Some(1000))?;
+    host.seed_file(&curl, b"")?;
+    host.set_permissions(&curl, 0o700)?;
+    host.create_private_dir(&private)?;
+    let mut config = RemoteCacheConfig::new("https://cache.invalid")?;
+    config.auth = RemoteAuth::Bearer;
+    config.curl_path = Some(curl);
+    config.private_dir = Some(private.clone());
+    let client = RemoteStoreClient::new(&host, config.clone())?;
+    assert!(client.private_dir_unchanged());
+    // A directory that replaces the checked one must not receive credentials.
+    host.rename(&private, &root.join("private-old"))?;
+    host.create_private_dir(&private)?;
+    assert!(!client.private_dir_unchanged());
+
+    host.set_owner(&private, Some(1001))?;
+    assert_eq!(
+        RemoteStoreClient::new(&host, config).err(),
+        Some(RemoteError::Setting("RCMAKE_CACHE_REMOTE_PRIVATE_DIR"))
+    );
+    Ok(())
 }
 
 #[test]

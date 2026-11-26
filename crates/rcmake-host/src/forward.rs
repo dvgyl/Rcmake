@@ -14,12 +14,14 @@ macro_rules! forward_host {
     };
     (@ $base:ident, fs) => {
         $crate::forward_host!(@method $base, metadata(p: &::std::path::Path, follow: $crate::Follow) -> $crate::HostResult<$crate::Metadata>);
+        $crate::forward_host!(@method $base, metadata_fresh(p: &::std::path::Path, follow: $crate::Follow) -> $crate::HostResult<$crate::Metadata>);
         $crate::forward_host!(@ $base, read);
         $crate::forward_host!(@ $base, read_with_origin);
         $crate::forward_host!(@ $base, read_chunks);
         $crate::forward_host!(@method $base, write(p: &::std::path::Path, data: &[u8], mode: $crate::WriteMode) -> $crate::HostResult<()>);
         $crate::forward_host!(@method $base, read_dir(p: &::std::path::Path) -> $crate::HostResult<Vec<$crate::DirEntry>>);
         $crate::forward_host!(@method $base, create_dir_all(p: &::std::path::Path) -> $crate::HostResult<()>);
+        $crate::forward_host!(@method $base, create_private_dir(p: &::std::path::Path) -> $crate::HostResult<()>);
         $crate::forward_host!(@method $base, remove_file(p: &::std::path::Path) -> $crate::HostResult<()>);
         $crate::forward_host!(@method $base, remove_dir(p: &::std::path::Path) -> $crate::HostResult<()>);
         $crate::forward_host!(@method $base, remove_dir_all(p: &::std::path::Path) -> $crate::HostResult<()>);
@@ -33,6 +35,7 @@ macro_rules! forward_host {
         $crate::forward_host!(@method $base, hard_link(src: &::std::path::Path, dst: &::std::path::Path) -> $crate::HostResult<()>);
         $crate::forward_host!(@ $base, read_link);
         $crate::forward_host!(@method $base, canonicalize(p: &::std::path::Path) -> $crate::HostResult<::std::path::PathBuf>);
+        $crate::forward_host!(@method $base, canonicalize_fresh(p: &::std::path::Path) -> $crate::HostResult<::std::path::PathBuf>);
         $crate::forward_host!(@method $base, set_permissions(p: &::std::path::Path, mode: u32) -> $crate::HostResult<()>);
         $crate::forward_host!(@method $base, set_times(p: &::std::path::Path,
             atime: Option<$crate::FileTime>,
@@ -98,6 +101,7 @@ macro_rules! forward_host {
         $crate::forward_host!(@method $base, current_exe() -> $crate::HostResult<::std::path::PathBuf>);
         $crate::forward_host!(@method $base, initial_cwd() -> ::std::path::PathBuf);
         $crate::forward_host!(@method $base, system() -> $crate::SystemInfo);
+        $crate::forward_host!(@method $base, effective_uid() -> Option<u32>);
     };
     (@ $base:ident, read) => {
         $crate::forward_host!(@method $base, read(p: &::std::path::Path, range: $crate::ReadRange) -> $crate::HostResult<Vec<u8>>);

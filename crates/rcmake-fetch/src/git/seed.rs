@@ -27,6 +27,7 @@ impl GitMirror<'_> {
             .ok_or_else(|| invalid("Git checkout has no parent."))?;
         let repository = repository_at(repository, cwd)?;
         let commit = check_commit(commit)?;
+        self.admit_cache_root(true)?;
         self.host.create_dir_all(&self.root)?;
         let mirror = self.root.join(format!("{}.git", Digest::hash(&repository)));
         let _guard = self

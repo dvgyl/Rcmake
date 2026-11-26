@@ -8,7 +8,9 @@ use rcmake_host::{
     FileKind, Follow, Host, ReadRange,
     path::{from_native, to_native},
 };
-use rcmake_store::{Digest, Domain, KeyHasher};
+use rcmake_store::{
+    Digest, Domain, KeyHasher, canonical_path, ensure_private_dir, verify_private_dir,
+};
 
 use rcmake_base::BString;
 
@@ -38,6 +40,8 @@ fn check_commit(value: &str) -> Result<String, FetchError> {
 /// Shared bare Git mirrors with one file lock per repository.
 pub struct GitMirror<'a> {
     host: &'a dyn Host,
+    /// The shared cache root. It must pass the private directory checks of the store.
+    cache_root: PathBuf,
     root: PathBuf,
     timeout: Option<Duration>,
     deadline: Option<Duration>,
@@ -52,9 +56,12 @@ impl<'a> GitMirror<'a> {
         if !cache_root.is_absolute() {
             return Err(invalid("Git cache root must be absolute."));
         }
+        // Resolve the root once, so that later operations do not depend on a link.
+        let cache_root = canonical_path(host, cache_root);
         Ok(Self {
             host,
             root: cache_root.join("git"),
+            cache_root,
             timeout: None,
             deadline: None,
             read_only: offline(host)
@@ -91,6 +98,22 @@ impl<'a> GitMirror<'a> {
     pub fn read_only_cache(mut self) -> Self {
         self.read_only = true;
         self
+    }
+
+    /// Check the shared cache root before Git uses it, with the policy of the store.
+    ///
+    /// A mutable mirror creates a missing root with mode `0o700`. A read finds no root as
+    /// a `NotFound` error. An immutable snapshot from [`Self::read_only_cache`] is the
+    /// caller's responsibility and is not checked.
+    pub(crate) fn admit_cache_root(&self, create: bool) -> Result<(), rcmake_host::HostError> {
+        if self.read_only {
+            return Ok(());
+        }
+        if create {
+            ensure_private_dir(self.host, &self.cache_root).map(|_| ())
+        } else {
+            verify_private_dir(self.host, &self.cache_root).map(|_| ())
+        }
     }
 
     pub(crate) fn with_deadline(mut self, deadline: Duration) -> Self {
@@ -364,11 +387,19 @@ impl<'a> GitMirror<'a> {
     ) -> Result<T, FetchError> {
         let offline = self.offline_only || self.read_only || offline(self.host);
         if !offline {
+            self.admit_cache_root(true)?;
             self.host.create_dir_all(&self.root)?;
         } else if pin.is_none() {
             return Err(invalid("Offline Git fetch requires a full commit pin."));
-        } else if self.mirror_kind(mirror)?.is_none() {
-            return Err(offline_git_miss());
+        } else {
+            match self.admit_cache_root(false) {
+                Ok(()) => {}
+                Err(error) if error.kind == ErrorKind::NotFound => return Err(offline_git_miss()),
+                Err(error) => return Err(error.into()),
+            }
+            if self.mirror_kind(mirror)?.is_none() {
+                return Err(offline_git_miss());
+            }
         }
         let stamp_path = mirror.with_added_extension("refresh");
         let before = self.refresh_stamp(&stamp_path);

@@ -49,6 +49,7 @@ pub(super) fn metadata(p: &Path, follow: Follow) -> HostResult<Metadata> {
         dev: m.dev(),
         ino: m.ino(),
         nlink: m.nlink(),
+        owner: Some(m.uid()),
     })
 }
 
@@ -113,6 +114,16 @@ pub(super) fn set_times(
         flags,
     )
     .map_err(Into::into)
+}
+
+pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    // The umask can only remove mode bits, so the new directory is never wider than `0o700`.
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+pub(super) fn effective_uid() -> Option<u32> {
+    Some(rustix::process::geteuid().as_raw())
 }
 
 pub(super) fn system() -> SystemInfo {

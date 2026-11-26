@@ -135,6 +135,8 @@ pub struct Metadata {
     pub ino: u64,
     /// Hard-link count.
     pub nlink: u64,
+    /// User ID of the owner, or `None` if the host has no POSIX user IDs.
+    pub owner: Option<u32>,
 }
 
 /// One entry returned by [`Host::read_dir`].
@@ -317,6 +319,14 @@ pub trait Host: Send + Sync {
     /// Query filesystem metadata (following or not following symlinks).
     fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata>;
 
+    /// Read metadata like [`Host::metadata`], but never from a cache.
+    ///
+    /// Security checks use this method, so that an earlier result cannot hide a later
+    /// change. A host that caches metadata must override it. A wrapper host must forward it.
+    fn metadata_fresh(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
+        self.metadata(p, follow)
+    }
+
     /// Read bytes from an absolute file path.
     fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>>;
 
@@ -356,6 +366,27 @@ pub trait Host: Send + Sync {
 
     /// Recursively create directory `p` and missing parents.
     fn create_dir_all(&self, p: &Path) -> HostResult<()>;
+
+    /// Create the one directory `p` so that only the current user can use it.
+    ///
+    /// On POSIX hosts the directory has mode `0o700` or less. The call fails with
+    /// [`ErrorKind::AlreadyExists`](std::io::ErrorKind::AlreadyExists) if `p` exists.
+    ///
+    /// The default implementation creates the directory with [`Host::create_dir_all`] and then
+    /// sets mode `0o700` with [`Host::set_permissions`]. A host that can create the directory
+    /// with the final mode in one step must override this method. A wrapper host must forward it.
+    fn create_private_dir(&self, p: &Path) -> HostResult<()> {
+        match self.metadata(p, Follow::No) {
+            Ok(_) => return Err(error::SyntheticError::AlreadyExists.at(Some(p))),
+            Err(error) if error.kind == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(parent) = p.parent() {
+            self.metadata(parent, Follow::Yes)?;
+        }
+        self.create_dir_all(p)?;
+        self.set_permissions(p, 0o700)
+    }
 
     /// Remove a regular file or symlink.
     fn remove_file(&self, p: &Path) -> HostResult<()>;
@@ -419,6 +450,14 @@ pub trait Host: Send + Sync {
 
     /// Resolve all symlinks and `.`/`..` components to a canonical absolute path.
     fn canonicalize(&self, p: &Path) -> HostResult<PathBuf>;
+
+    /// Resolve a path like [`Host::canonicalize`], but never from a cache.
+    ///
+    /// Security checks use this method. A host that caches results must override it. A
+    /// wrapper host must forward it.
+    fn canonicalize_fresh(&self, p: &Path) -> HostResult<PathBuf> {
+        self.canonicalize(p)
+    }
 
     /// Set POSIX permission bits on `p`.
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()>;
@@ -620,6 +659,14 @@ pub trait Host: Send + Sync {
 
     /// Static host OS and hardware identity.
     fn system(&self) -> SystemInfo;
+
+    /// Effective user ID of this process, or `None` if the host has no POSIX user IDs.
+    ///
+    /// A wrapper host must forward this method. With the default `None`, a POSIX host
+    /// refuses private cache directories, because their owners cannot be checked.
+    fn effective_uid(&self) -> Option<u32> {
+        None
+    }
 }
 
 fn validate_run(req: &RunRequest, require_absolute: fn(&Path) -> HostResult<()>) -> HostResult<()> {

@@ -479,6 +479,14 @@ impl Host for ReportHost {
         self.base.create_dir_all(p)
     }
 
+    fn create_private_dir(&self, p: &Path) -> HostResult<()> {
+        self.base.create_private_dir(p)
+    }
+
+    fn metadata_fresh(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
+        self.base.metadata_fresh(p, follow)
+    }
+
     fn remove_file(&self, p: &Path) -> HostResult<()> {
         self.base.remove_file(p)
     }
@@ -521,6 +529,10 @@ impl Host for ReportHost {
 
     fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
         self.base.canonicalize(p)
+    }
+
+    fn canonicalize_fresh(&self, p: &Path) -> HostResult<PathBuf> {
+        self.base.canonicalize_fresh(p)
     }
 
     fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
@@ -675,6 +687,10 @@ impl Host for ReportHost {
 
     fn system(&self) -> SystemInfo {
         self.base.system()
+    }
+
+    fn effective_uid(&self) -> Option<u32> {
+        self.base.effective_uid()
     }
 }
 

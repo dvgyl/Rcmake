@@ -36,6 +36,7 @@ impl Data {
 struct Inode {
     data: Data,
     mode: u32,
+    owner: Option<u32>,
     links: u64,
     atime: FileTime,
     mtime: FileTime,
@@ -181,6 +182,9 @@ pub(super) struct FileSystem {
     next_ino: u64,
     pub(super) now: FileTime,
     pub(super) monotonic: Duration,
+    /// Simulated effective user ID. New entries are owned by this user. The default is root
+    /// (`Some(0)`), so the virtual tree passes ownership checks.
+    pub(super) effective_uid: Option<u32>,
 }
 
 impl FileSystem {
@@ -194,6 +198,7 @@ impl FileSystem {
                 nanos: 0,
             },
             monotonic: Duration::ZERO,
+            effective_uid: Some(0),
         };
         fs.insert(VirtualPath::at_root("/".into()), Data::Dir);
         let _ = fs.create_dir_all(cwd);
@@ -226,6 +231,7 @@ impl FileSystem {
             ino,
             Inode {
                 mode: data.default_mode(),
+                owner: self.effective_uid,
                 data,
                 links: 1,
                 atime: self.now,
@@ -386,6 +392,7 @@ impl FileSystem {
             dev: 1,
             ino,
             nlink,
+            owner: inode.owner,
         })
     }
 
@@ -493,6 +500,16 @@ impl FileSystem {
             return Err(SyntheticError::AlreadyExists.at(Some(path)));
         }
         result.map(|_| ())
+    }
+
+    pub(super) fn create_private_dir(&mut self, path: &Path) -> HostResult<()> {
+        let resolved = self.resolve(path, Follow::No, Missing::Leaf)?;
+        if self.paths.contains_key(&resolved) {
+            return Err(SyntheticError::AlreadyExists.at(Some(path)));
+        }
+        let ino = self.insert(resolved, Data::Dir);
+        self.inode_mut(ino, path)?.mode = 0o700;
+        Ok(())
     }
 
     pub(super) fn remove_file(&mut self, path: &Path) -> HostResult<()> {
@@ -660,6 +677,12 @@ impl FileSystem {
 
     pub(super) fn canonical_key(&mut self, path: &Path) -> HostResult<VirtualPath> {
         self.resolve(path, Follow::Yes, Missing::Reject)
+    }
+
+    pub(super) fn set_owner(&mut self, path: &Path, owner: Option<u32>) -> HostResult<()> {
+        let (_, ino) = self.existing(path, Follow::No)?;
+        self.inode_mut(ino, path)?.owner = owner;
+        Ok(())
     }
 
     pub(super) fn set_permissions(&mut self, path: &Path, mode: u32) -> HostResult<()> {

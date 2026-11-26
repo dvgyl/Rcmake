@@ -43,6 +43,7 @@ struct PureState {
     handler: Option<Arc<CommandHandler>>,
     registry_view: Option<RegistryView>,
     registry: BTreeMap<RegistryKey, BString>,
+    system: SystemInfo,
 }
 
 /// Table of the files that [`PureHost::lock_file`] holds locks on.
@@ -111,6 +112,7 @@ impl PureHost {
                 handler: None,
                 registry_view: None,
                 registry: BTreeMap::new(),
+                system: default_system(),
             }),
             locks: Arc::default(),
         }
@@ -167,6 +169,25 @@ impl PureHost {
     /// Create any missing parent directories, then write the file.
     pub fn seed_file(&self, path: &Path, bytes: &[u8]) -> HostResult<()> {
         self.lock()?.fs.seed_file(path, bytes)
+    }
+
+    /// Set the simulated effective user ID. Entries created later are owned by this user.
+    ///
+    /// The default is root (`Some(0)`). `None` simulates a host with no POSIX user IDs.
+    pub fn set_effective_uid(&self, uid: Option<u32>) -> HostResult<()> {
+        self.lock()?.fs.effective_uid = uid;
+        Ok(())
+    }
+
+    /// Set the owner of the entry at `path` without following a final symlink.
+    pub fn set_owner(&self, path: &Path, owner: Option<u32>) -> HostResult<()> {
+        self.lock()?.fs.set_owner(path, owner)
+    }
+
+    /// Replace the operating system identity that [`Host::system`] returns.
+    pub fn set_system(&self, system: SystemInfo) -> HostResult<()> {
+        self.lock()?.system = system;
+        Ok(())
     }
 
     /// Return a snapshot of all recorded stdio events in order.
@@ -237,6 +258,10 @@ impl Host for PureHost {
 
     fn create_dir_all(&self, p: &Path) -> HostResult<()> {
         self.lock()?.fs.create_dir_all(p)
+    }
+
+    fn create_private_dir(&self, p: &Path) -> HostResult<()> {
+        self.lock()?.fs.create_private_dir(p)
     }
 
     fn remove_file(&self, p: &Path) -> HostResult<()> {
@@ -467,16 +492,30 @@ impl Host for PureHost {
     }
 
     fn system(&self) -> SystemInfo {
-        SystemInfo {
-            sysname: BString::from("PureOS"),
-            release: BString::from("1.0.0"),
-            version: BString::from("PureHost"),
-            machine: BString::from("arm64"),
-            hostname: BString::from("purehost"),
-            cpu_count: 4,
-            total_memory: 0,
-            pid: 1000,
-        }
+        self.state
+            .lock()
+            .map(|state| state.system.clone())
+            .unwrap_or_else(|_| default_system())
+    }
+
+    fn effective_uid(&self) -> Option<u32> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.fs.effective_uid)
+    }
+}
+
+fn default_system() -> SystemInfo {
+    SystemInfo {
+        sysname: BString::from("PureOS"),
+        release: BString::from("1.0.0"),
+        version: BString::from("PureHost"),
+        machine: BString::from("arm64"),
+        hostname: BString::from("purehost"),
+        cpu_count: 4,
+        total_memory: 0,
+        pid: 1000,
     }
 }
 

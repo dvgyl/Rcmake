@@ -81,6 +81,7 @@ pub(super) fn metadata(path: &Path, follow: Follow) -> HostResult<Metadata> {
         dev: info.volume_serial_number(),
         ino: info.file_index(),
         nlink: info.number_of_links(),
+        owner: None,
     })
 }
 
@@ -217,6 +218,15 @@ pub(super) fn rename_noreplace(from: &Path, to: &Path) -> HostResult<()> {
         Err(err) => return Err(HostError::from_io(err, Some(to.to_path_buf()))),
     }
     io_at(fs::rename(from, to), to)
+}
+
+pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
+    // The per-user ACL of the parent (for example `%LOCALAPPDATA%`) controls access.
+    fs::DirBuilder::new().create(path)
+}
+
+pub(super) fn effective_uid() -> Option<u32> {
+    None
 }
 
 pub(super) fn system() -> SystemInfo {

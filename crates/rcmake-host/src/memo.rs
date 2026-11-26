@@ -466,6 +466,19 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         self.base.create_dir_all(p)
     }
 
+    fn metadata_fresh(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
+        self.base.metadata_fresh(p, follow)
+    }
+
+    fn canonicalize_fresh(&self, p: &Path) -> HostResult<PathBuf> {
+        self.base.canonicalize_fresh(p)
+    }
+
+    fn create_private_dir(&self, p: &Path) -> HostResult<()> {
+        let _change = self.begin_change_for(&[p]);
+        self.base.create_private_dir(p)
+    }
+
     fn remove_file(&self, p: &Path) -> HostResult<()> {
         let _change = self.begin_change_for(&[p]);
         self.base.remove_file(p)

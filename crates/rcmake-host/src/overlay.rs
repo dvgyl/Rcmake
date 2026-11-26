@@ -583,6 +583,23 @@ impl<H: Host + ?Sized> Host for OverlayHost<H> {
         Ok(())
     }
 
+    fn create_private_dir(&self, p: &Path) -> HostResult<()> {
+        let mut state = self.write_state()?;
+        let dest = state.destination(p, Follow::No)?;
+        if dest.entry.node.is_some() {
+            return Err(SyntheticError::AlreadyExists.at(Some(p)));
+        }
+        let now = state.tick();
+        let mut edit = Edit::default();
+        edit.touch_parent(&state, &dest, now);
+        let mut node = state.new_node(FileKind::Dir, now);
+        node.stat.mode = 0o700;
+        edit.store(dest, node);
+        state.check(&edit, 0, p)?;
+        state.commit(edit);
+        Ok(())
+    }
+
     fn remove_file(&self, p: &Path) -> HostResult<()> {
         self.remove_entry(p, None)
     }

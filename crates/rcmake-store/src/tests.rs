@@ -1367,3 +1367,282 @@ fn non_utf8_path_stamp_round_trips_losslessly() -> Result<(), Box<dyn std::error
     assert_eq!(InputStamp::from_json(&parsed)?, stamp);
     Ok(())
 }
+
+fn private_root_host(uid: u32) -> HostResult<PureHost> {
+    let host = host();
+    host.set_effective_uid(Some(uid))?;
+    Ok(host)
+}
+
+fn seed_root(host: &PureHost, mode: u32, owner: u32) -> HostResult<PathBuf> {
+    let root = host.initial_cwd().join("cache");
+    host.create_dir_all(&root)?;
+    host.set_permissions(&root, mode)?;
+    host.set_owner(&root, Some(owner))?;
+    Ok(root)
+}
+
+fn assert_refused(result: HostResult<Digest>, reason: &str) {
+    let error = result.err();
+    assert!(
+        error
+            .as_ref()
+            .is_some_and(|error| error.kind == ErrorKind::PermissionDenied
+                && error.os_message.contains(reason)),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn creates_a_missing_root_with_mode_0700() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let store = store(&host)?;
+    store.put_blob(b"payload")?;
+    let meta = host.metadata(store.root(), Follow::No)?;
+    assert_eq!((meta.mode, meta.owner), (0o700, Some(1000)));
+    Ok(())
+}
+
+#[test]
+fn refuses_a_root_owned_by_another_user() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let root = seed_root(&host, 0o700, 1000)?;
+    let digest = store(&host)?.put_blob(b"payload")?;
+    let before = host.read_dir(&root)?;
+
+    host.set_owner(&root, Some(1001))?;
+    let store = store(&host)?;
+    assert_refused(store.put_blob(b"other"), "owned by another user");
+    assert!(
+        store
+            .get_blob(digest)
+            .is_err_and(|error| error.kind == ErrorKind::PermissionDenied)
+    );
+    assert!(
+        store
+            .gc()
+            .is_err_and(|error| error.kind == ErrorKind::PermissionDenied)
+    );
+    assert_eq!(host.read_dir(&root)?, before);
+    Ok(())
+}
+
+#[test]
+fn refuses_a_group_writable_root() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    seed_root(&host, 0o775, 1000)?;
+    assert_refused(store(&host)?.put_blob(b"payload"), "chmod 700");
+    Ok(())
+}
+
+#[test]
+fn accepts_an_existing_root_that_only_the_owner_can_write() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let root = seed_root(&host, 0o755, 1000)?;
+    store(&host)?.put_blob(b"payload")?;
+    assert_eq!(host.metadata(&root, Follow::No)?.mode, 0o755);
+    Ok(())
+}
+
+#[test]
+fn refuses_a_root_under_a_non_sticky_world_writable_parent() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let root = seed_root(&host, 0o700, 1000)?;
+    let parent = host.initial_cwd();
+    host.set_permissions(&parent, 0o777)?;
+    assert_refused(store(&host)?.put_blob(b"payload"), "sticky bit");
+    assert!(host.read_dir(&root)?.is_empty());
+
+    host.set_permissions(&parent, 0o1777)?;
+    store(&host)?.put_blob(b"payload")?;
+    Ok(())
+}
+
+#[test]
+fn skips_mode_and_owner_checks_inside_the_windows_profile() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let mut system = host.system();
+    system.sysname = "Windows".into();
+    host.set_system(system)?;
+    let profile = path::from_native(&host.initial_cwd());
+    host.env_set(b"LOCALAPPDATA", Some(&profile));
+    seed_root(&host, 0o777, 1001)?;
+    store(&host)?.put_blob(b"payload")?;
+    Ok(())
+}
+
+#[test]
+fn refuses_a_windows_root_outside_the_user_profile() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let mut system = host.system();
+    system.sysname = "Windows".into();
+    host.set_system(system)?;
+    host.env_set(b"LOCALAPPDATA", Some(b"/profile"));
+    seed_root(&host, 0o700, 1000)?;
+    assert_refused(
+        store(&host)?.put_blob(b"payload"),
+        "inside the user profile",
+    );
+    Ok(())
+}
+
+fn windows_host() -> HostResult<(PureHost, PathBuf)> {
+    let host = private_root_host(1000)?;
+    let mut system = host.system();
+    system.sysname = "Windows".into();
+    host.set_system(system)?;
+    let profile = host.initial_cwd().join("profile");
+    host.create_dir_all(&profile)?;
+    host.env_set(b"LOCALAPPDATA", Some(&path::from_native(&profile)));
+    Ok((host, profile))
+}
+
+#[test]
+fn refuses_a_windows_root_with_a_parent_component() -> HostResult<()> {
+    let (host, profile) = windows_host()?;
+    let root = profile.join("..").join("profile").join("cache");
+    assert_refused(
+        store_at(&host, root)?.put_blob(b"payload"),
+        "`..` component",
+    );
+    Ok(())
+}
+
+#[test]
+fn refuses_a_windows_root_that_a_junction_moves_outside_the_profile() -> HostResult<()> {
+    let (host, profile) = windows_host()?;
+    let outside = host.initial_cwd().join("outside");
+    host.create_dir_all(&outside)?;
+    host.symlink(&outside, &profile.join("escape"))?;
+    let root = profile.join("escape").join("cache");
+    assert_refused(
+        store_at(&host, root)?.put_blob(b"payload"),
+        "does not resolve to a path inside the user profile",
+    );
+    assert!(host.metadata(&outside.join("cache"), Follow::No).is_err());
+    Ok(())
+}
+
+fn store_at(host: &PureHost, root: PathBuf) -> HostResult<Store<'_>> {
+    Store::new(host, StoreConfig::new(root))
+}
+
+#[test]
+fn refuses_a_new_root_under_a_group_writable_parent_before_creating_it() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let parent = host.initial_cwd().join("shared");
+    host.create_dir_all(&parent)?;
+    host.set_permissions(&parent, 0o775)?;
+    let root = parent.join("cache");
+    assert_refused(
+        store_at(&host, root.clone())?.put_blob(b"payload"),
+        "sticky bit",
+    );
+    assert!(host.metadata(&root, Follow::No).is_err());
+    Ok(())
+}
+
+#[test]
+fn refuses_a_root_under_a_sticky_parent_of_another_user() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let parent = host.initial_cwd().join("their-tmp");
+    host.create_dir_all(&parent)?;
+    host.set_permissions(&parent, 0o1777)?;
+    host.set_owner(&parent, Some(1001))?;
+    let root = parent.join("cache");
+    assert_refused(
+        store_at(&host, root.clone())?.put_blob(b"payload"),
+        "owned by another user, who can replace it",
+    );
+    assert!(host.metadata(&root, Follow::No).is_err());
+    Ok(())
+}
+
+#[test]
+fn refuses_a_root_below_an_unsafe_higher_ancestor() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let high = host.initial_cwd().join("high");
+    let low = high.join("a").join("b");
+    host.create_dir_all(&low)?;
+    host.set_permissions(&high, 0o777)?;
+    let root = low.join("cache");
+    assert_refused(
+        store_at(&host, root.clone())?.put_blob(b"payload"),
+        "sticky bit",
+    );
+    assert!(host.metadata(&root, Follow::No).is_err());
+    Ok(())
+}
+
+#[test]
+fn refuses_a_root_that_is_replaced_after_its_first_check() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let store = store(&host)?;
+    let digest = store.put_blob(b"payload")?;
+    assert_eq!(store.get_blob(digest)?, Some(b"payload".to_vec()));
+
+    let root = store.root().to_owned();
+    host.rename(&root, &root.with_extension("old"))?;
+    host.create_private_dir(&root)?;
+    assert!(
+        store
+            .get_blob(digest)
+            .is_err_and(|error| error.kind == ErrorKind::PermissionDenied
+                && error.os_message.contains("replaced"))
+    );
+    assert_refused(store.put_blob(b"other"), "replaced");
+    Ok(())
+}
+
+#[test]
+fn accepts_a_root_directly_under_a_sticky_system_temporary_directory() -> HostResult<()> {
+    let host = host();
+    let tmp = host.initial_cwd().join("tmp");
+    host.create_dir_all(&tmp)?;
+    host.set_permissions(&tmp, 0o1777)?;
+    host.set_effective_uid(Some(1000))?;
+    let root = tmp.join("rcmake-cache");
+    store_at(&host, root.clone())?.put_blob(b"payload")?;
+    let meta = host.metadata(&root, Follow::No)?;
+    assert_eq!((meta.mode, meta.owner), (0o700, Some(1000)));
+    Ok(())
+}
+
+#[test]
+fn checks_the_target_of_a_linked_ancestor() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    let work = host.initial_cwd();
+    host.create_dir_all(&work.join("real"))?;
+    host.symlink(&work.join("real"), &work.join("link"))?;
+    let linked = store_at(&host, work.join("link").join("cache"))?;
+    assert_eq!(linked.root(), work.join("real").join("cache"));
+    linked.put_blob(b"payload")?;
+
+    host.create_dir_all(&work.join("open"))?;
+    host.set_permissions(&work.join("open"), 0o777)?;
+    host.symlink(&work.join("open"), &work.join("open-link"))?;
+    assert_refused(
+        store_at(&host, work.join("open-link").join("cache"))?.put_blob(b"payload"),
+        "sticky bit",
+    );
+    Ok(())
+}
+
+#[test]
+fn refuses_a_root_when_the_host_cannot_report_the_user() -> HostResult<()> {
+    let host = host();
+    host.set_effective_uid(None)?;
+    assert_refused(
+        store(&host)?.put_blob(b"payload"),
+        "cannot report the current user",
+    );
+    Ok(())
+}
+
+#[test]
+fn refuses_a_root_that_is_not_a_directory() -> HostResult<()> {
+    let host = private_root_host(1000)?;
+    host.seed_file(&host.initial_cwd().join("cache"), b"")?;
+    assert_refused(store(&host)?.put_blob(b"payload"), "not a directory");
+    Ok(())
+}

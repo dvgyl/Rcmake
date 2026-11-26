@@ -32,6 +32,16 @@ impl Host for HermeticHost {
         self.inner.metadata(path, follow)
     }
 
+    fn metadata_fresh(&self, path: &Path, follow: Follow) -> HostResult<Metadata> {
+        let checked = self.guard_path(path)?;
+        let path = if follow == Follow::Yes {
+            checked.as_ref()
+        } else {
+            path
+        };
+        self.inner.metadata_fresh(path, follow)
+    }
+
     fn read(&self, path: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
         self.inner.read(&self.guard_path(path)?, range)
     }
@@ -56,6 +66,10 @@ impl Host for HermeticHost {
 
     fn create_dir_all(&self, path: &Path) -> HostResult<()> {
         self.inner.create_dir_all(path)
+    }
+
+    fn create_private_dir(&self, path: &Path) -> HostResult<()> {
+        self.inner.create_private_dir(path)
     }
 
     fn remove_file(&self, path: &Path) -> HostResult<()> {
@@ -108,6 +122,10 @@ impl Host for HermeticHost {
 
     fn canonicalize(&self, path: &Path) -> HostResult<PathBuf> {
         self.inner.canonicalize(&self.guard_path(path)?)
+    }
+
+    fn canonicalize_fresh(&self, path: &Path) -> HostResult<PathBuf> {
+        self.inner.canonicalize_fresh(&self.guard_path(path)?)
     }
 
     fn set_permissions(&self, path: &Path, mode: u32) -> HostResult<()> {
@@ -275,6 +293,10 @@ impl Host for HermeticHost {
 
     fn system(&self) -> SystemInfo {
         self.inner.system()
+    }
+
+    fn effective_uid(&self) -> Option<u32> {
+        self.inner.effective_uid()
     }
 }
 

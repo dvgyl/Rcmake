@@ -672,3 +672,103 @@ Consequences:
 - A stack overflow or an out-of-memory error aborts with both strategies.
 
 Sources: [workspace profiles](../Cargo.toml), [CLI entry point](../crates/rcmake-cli/src/main.rs), [LSP entry point](../crates/rcmake-lsp/src/main.rs), [probe pool](../crates/rcmake-commands/src/configure/probe_pool.rs), [platform query prefetch](../crates/rcmake-commands/src/configure/platform_queries/prefetch.rs), [fetch pool](../crates/rcmake-fetch/src/pool.rs), [ctest scheduler](../crates/rcmake-ctest/src/schedule.rs), [install workers](../crates/rcmake-cli/src/install/parallel.rs), and [native file locks](../crates/rcmake-host/src/native.rs).
+
+## ADR-035: Private local cache root
+
+- **Status:** Accepted
+
+The local store and the Git mirror reuse data that they read from the cache
+root. If another user can write in that root, or can replace the root or a
+directory above it, that user can plant cache entries that change a configure
+result. So both accept a root only if no other user can change or replace it.
+
+**Path resolution.** `Store::new` and `GitMirror::new` resolve the configured
+root once (`canonical_path`): the deepest existing ancestor is canonicalized
+from fresh data (`Host::canonicalize_fresh`, which bypasses the `MemoHost`
+cache), and the missing components are added again. On POSIX hosts the result
+has no symbolic links. On Windows it has no junctions or other reparse points,
+and the `\\?\` prefix is removed. All checks and all later file operations use
+that resolved path, and `Store::root` returns it.
+
+**POSIX checks.** Every check reads fresh metadata (`Host::metadata_fresh`), so
+a metadata cache such as `MemoHost` cannot hide a change. The checks walk the
+resolved path from `/` down:
+
+- Each component above the root must be a real directory, not a symbolic link,
+  owned by root or by the effective user. A component that the group or other
+  users can write must have the sticky bit. So a root directly below a
+  root-owned `/tmp` (mode `1777`) passes, and a root below a sticky directory of
+  another user does not.
+- The root is a real directory that the effective user owns. The group and
+  other users cannot write it (mode `& 0o022` is zero). Mode `0755` passes.
+- A lookup error on any component refuses the root. A POSIX host that cannot
+  report the effective user or an owner refuses the root.
+
+**Creation.** A missing root is created by the same walk from `/`. Each
+missing component is created with `Host::create_private_dir`, so it starts at
+mode `0700` or narrower (the umask can only remove bits). Each component,
+also one that another process created first (`AlreadyExists`), is checked
+before anything is created below it. An existing root keeps its mode.
+
+**Later checks.** The first check binds the root to its device and inode
+numbers. Before each later read or write, the store reads one fresh metadata
+sample of the root. It requires the same directory, the same owner, and no
+write access for other users. The components above the root passed the walk,
+so only root or the effective user can rename or replace them. A removed root
+is created again with the full walk.
+
+**Refusal.** Reads and writes in a refused root return a permission error that
+names the problem and the fix, for example `chmod 700 <root>`. No data is read
+from a refused root. The probe cache treats the error as a miss, and fetch
+reports it as a cache warning. The store does not change the mode of an
+existing directory. A refused cache makes configure slower but not wrong.
+
+**Git mirror.** A mutable mirror creates or checks its shared root with the
+same walk. An offline mirror checks an existing root, and a missing root is an
+offline miss. An immutable snapshot from `GitMirror::read_only_cache` is not
+checked. Its caller must make sure that no process can change it.
+
+**Windows.** The host reports no owner and no access control list (ACL), and
+a new directory inherits the ACL of its parent. So the store accepts a root
+only if it resolves inside the user profile:
+
+- The root path must not contain `.` or `..`.
+- The resolved root and each resolved profile directory (`%LOCALAPPDATA%`,
+  `%USERPROFILE%`) come from fresh canonicalization, which follows junctions
+  and other reparse points. The resolved root must be inside a resolved
+  profile directory.
+- The root must be its own resolved path, so the path that passed the check is
+  the path that the operations use.
+- During creation, each component must still resolve to itself before the next
+  component is created below it, so a junction that appears is refused.
+
+This policy assumes the default profile ACL, which admits only the user,
+administrators, and the system. The host cannot read ACLs, so it cannot detect
+a profile subtree whose ACL gives write access to other users. Do not point
+`RCMAKE_CACHE_DIR` at such a subtree. A root outside the profile, for example a
+continuous integration (CI) workspace on another drive, is refused. Native
+cache tests on Windows must use a directory inside the profile. The Windows
+tests run on a simulated host, so native Windows behavior is not verified by
+the test suite.
+
+**WebAssembly.** The WebAssembly build has no native store or Git mirror, and
+its virtual host has no other users.
+
+**Remote credentials.** `RCMAKE_CACHE_REMOTE_PRIVATE_DIR` is canonicalized and
+must pass the same checks and mode `& 0o077 == 0`. Just before the client
+writes a credentials file in it, one fresh metadata sample must show the same
+directory and the same private mode.
+
+**Hosts.** `Host::effective_uid`, `Host::create_private_dir`, `Host::metadata_fresh`, and
+`Host::canonicalize_fresh` have default implementations, so that a wrapper host
+outside `rcmake-host` still compiles. All wrapper hosts in the workspace
+forward them. `MemoHost` reads fresh metadata and fresh canonical paths from
+its base. `OverlayHost` is
+a snapshot of its base for one evaluation, so its own metadata is current for
+that evaluation. With the default `effective_uid` (`None`), a POSIX host
+refuses every private root.
+
+Frame footers stay plain SHA-256 values with no key. When no other user can
+write in or replace the root, a key gives no more protection.
+
+Sources: [private directory checks](../crates/rcmake-store/src/private_dir.rs), [store](../crates/rcmake-store/src/lib.rs), [Git mirror](../crates/rcmake-fetch/src/git.rs), [host trait](../crates/rcmake-host/src/lib.rs), and [memo host](../crates/rcmake-host/src/memo.rs).

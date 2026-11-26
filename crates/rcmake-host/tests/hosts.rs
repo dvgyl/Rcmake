@@ -66,6 +66,51 @@ fn pure_conformance() {
     conformance::run_all(&PureHost::default(), Path::new("/work/conformance"));
 }
 
+#[test]
+fn pure_host_gives_new_entries_to_the_effective_user() -> rcmake_host::HostResult<()> {
+    let host = PureHost::default();
+    assert_eq!(host.effective_uid(), Some(0));
+    host.create_dir_all(Path::new("/system"))?;
+    assert_eq!(
+        host.metadata(Path::new("/system"), Follow::No)?.owner,
+        Some(0)
+    );
+
+    host.set_effective_uid(Some(1000))?;
+    assert_eq!(host.effective_uid(), Some(1000));
+    host.create_private_dir(Path::new("/mine"))?;
+    let mine = host.metadata(Path::new("/mine"), Follow::No)?;
+    assert_eq!((mine.mode, mine.owner), (0o700, Some(1000)));
+
+    host.set_owner(Path::new("/mine"), Some(1001))?;
+    assert_eq!(
+        host.metadata(Path::new("/mine"), Follow::No)?.owner,
+        Some(1001)
+    );
+    Ok(())
+}
+
+#[test]
+fn pure_host_private_dir_does_not_follow_a_final_symlink() -> rcmake_host::HostResult<()> {
+    let host = PureHost::default();
+    host.create_dir_all(Path::new("/target"))?;
+    host.symlink(Path::new("/target"), Path::new("/link"))?;
+    let result = host.create_private_dir(Path::new("/link"));
+    assert!(result.is_err_and(|error| error.kind == std::io::ErrorKind::AlreadyExists));
+    assert_eq!(host.metadata(Path::new("/target"), Follow::No)?.mode, 0o755);
+    Ok(())
+}
+
+#[test]
+fn pure_host_reports_a_replaced_system() -> rcmake_host::HostResult<()> {
+    let host = PureHost::default();
+    let mut system = host.system();
+    system.sysname = BString::from("Windows");
+    host.set_system(system.clone())?;
+    assert_eq!(host.system(), system);
+    Ok(())
+}
+
 #[cfg(unix)]
 fn shell(command: &str) -> CommandSpec {
     CommandSpec {
@@ -425,6 +470,20 @@ fn pure_host_keeps_virtual_roots_and_resolves_cross_root_links() -> rcmake_host:
     );
     host.create_dir_all(Path::new("C:/work/empty"))?;
     host.remove_dir(Path::new(r"C:\work\empty\"))?;
+    Ok(())
+}
+
+#[test]
+fn memo_host_fresh_metadata_bypasses_the_cache() -> rcmake_host::HostResult<()> {
+    let base = std::sync::Arc::new(PureHost::default());
+    let dir = Path::new("/work/dir");
+    base.create_dir_all(dir)?;
+    let memo = rcmake_host::MemoHost::from_shared(std::sync::Arc::clone(&base));
+    assert_eq!(memo.metadata(dir, Follow::No)?.mode, 0o755);
+    // A change through another handle is invisible to the cache, but not to a fresh read.
+    base.set_permissions(dir, 0o777)?;
+    assert_eq!(memo.metadata(dir, Follow::No)?.mode, 0o755);
+    assert_eq!(memo.metadata_fresh(dir, Follow::No)?.mode, 0o777);
     Ok(())
 }
 
