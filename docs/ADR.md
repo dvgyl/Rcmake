@@ -594,7 +594,6 @@ bounded probe identifies the configured program as the Apple `strip` tool.
 
 Sources: [Strip action](../crates/rcmake-resolve/src/lower/install/strip.rs) and [install script rendering](../crates/rcmake-gen-common/src/install_script/strip.rs).
 
-
 ## ADR-032: Probe compiler write scope
 
 - **Status:** Accepted
@@ -606,3 +605,70 @@ invalidates any tracked root that overlaps a write path.
 If the probe host cannot certify the write scope, the memo host invalidates all
 tracked roots. This includes compiler wrappers that write telemetry outside
 the probe directory.
+
+## ADR-033: Direct dependencies without an earlier record
+
+- **Status:** Accepted
+
+`docs/PRIOR_ART.md` lists six direct dependencies that no earlier ADR names.
+Each licence is on the ADR-001 allowlist, or offers an allowlisted option.
+ADR-017 records the Windows host and 7-Zip design that uses four of them.
+
+| Crate | Version | Licence | Used by | Decision |
+| --- | --- | --- | --- | --- |
+| `crc32fast` | `1.5.5` | `MIT OR Apache-2.0` | `rcmake-archive` | Calculate CRC-32 checksums for ZIP entries and 7-Zip PPMd data. `flate2`, `zip`, and `sevenz-rust2` already pull in this crate, so it adds no new code to the graph. |
+| `process-wrap` | `10.0.2` | `Apache-2.0 OR MIT` | `rcmake-host`, Windows only | Assign each child process to a job object while the child is suspended, and end the job at the pipeline deadline. Only the `std` and `job-object` features are enabled. |
+| `similar` | `2.7.0` | `Apache-2.0` | `rcmake-harness` only | Show line differences when harness output differs from the oracle output. The release binaries do not contain this crate. |
+| `tempfile` | `3.27.0` | `MIT OR Apache-2.0` | `rcmake-host` (Unix and Windows), `rcmake-harness` | Create anonymous scratch files and unique temporary directories with safe permissions. The harness uses it for isolated sandboxes. |
+| `winapi-util` | `0.1.11` | `Unlicense OR MIT` | `rcmake-host`, Windows only | Read file identities and the computer name through safe wrappers. rcmake uses the MIT option. |
+| `winreg` | `0.56.0` | `MIT` | `rcmake-host`, Windows only | Read the Windows release and build number from the registry. Default features are disabled. |
+
+The Windows crates stay in `[target.'cfg(windows)'.dependencies]`. They give
+safe wrappers for Win32 calls, so `unsafe_code = "forbid"` stays in effect in
+all rcmake crates. `THIRD_PARTY_NOTICES.md` attributes all six crates.
+
+Sources: [host manifest](../crates/rcmake-host/Cargo.toml), [archive manifest](../crates/rcmake-archive/Cargo.toml), [harness manifest](../crates/rcmake-harness/Cargo.toml), and [prior art](PRIOR_ART.md).
+
+## ADR-034: Release builds abort on panic
+
+- **Status:** Accepted. This record applies from the change that sets
+  `panic = "abort"` in `[profile.release]` and adds the abort hooks below.
+
+Release builds unwind on panic today. With abort, the release `rcmake` binary
+has no unwind tables or landing pads and is 3.29 MiB (18.8 %) smaller. No
+production path needs unwinding
+for correct output: AGENTS.md forbids panics on reachable input paths, and
+each `catch_unwind` or `join` error path guards only against internal bugs.
+
+Set `panic = "abort"` in `[profile.release]`. `[profile.release-dev]` and
+`[profile.size-probe]` inherit it, and `[profile.wasm-release]` already uses
+it. `[profile.dev]` and `[profile.fuzz]` keep `panic = "unwind"`. Cargo
+always builds test targets with unwinding, so tests that check recovery after
+a panic still run.
+
+Keep the panic hook of `rcmake`. It writes `rcmake: internal error: <message>
+(<file>:<line>)` and keeps the `RUST_BACKTRACE` behavior. When
+`cfg(panic = "abort")` is set, the hook then writes `CMake Internal Error
+(please report a bug)` and exits with code 1, the same code as the unwind
+path. Install the same hook in `rcmake-lsp`, so that a panic does not end
+with a bare `SIGABRT` (exit code 134) and no message. Keep the `catch_unwind`
+code. It compiles with both strategies and protects tests and embedders that
+unwind.
+
+Consequences:
+
+- A bug in a worker thread now ends the whole run with an internal error.
+  Before, these sites recovered quietly: the configure probe pool, the
+  platform query prefetch, the fetch prefetch pool, the install workers, and
+  the ctest scheduler. After a worker bug, ctest stops without a summary or
+  XML report. The editor restarts `rcmake-lsp` after its evaluation thread
+  panics.
+- File locks are OS locks (`std::fs::File::lock` and `try_lock`). The OS
+  releases them when the process ends, so an abort cannot leave a stale lock
+  that blocks the next run.
+- The next run removes probe scratch directories. Store staging files, cpack
+  scratch directories, and running child processes can stay after an abort,
+  as they do after `SIGKILL`.
+- A stack overflow or an out-of-memory error aborts with both strategies.
+
+Sources: [workspace profiles](../Cargo.toml), [CLI entry point](../crates/rcmake-cli/src/main.rs), [LSP entry point](../crates/rcmake-lsp/src/main.rs), [probe pool](../crates/rcmake-commands/src/configure/probe_pool.rs), [platform query prefetch](../crates/rcmake-commands/src/configure/platform_queries/prefetch.rs), [fetch pool](../crates/rcmake-fetch/src/pool.rs), [ctest scheduler](../crates/rcmake-ctest/src/schedule.rs), [install workers](../crates/rcmake-cli/src/install/parallel.rs), and [native file locks](../crates/rcmake-host/src/native.rs).

@@ -4344,3 +4344,12 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
 <!-- END GENERATED CARGO NOTICES -->
+
+### Test harness crates
+
+The release binaries do not contain these crates. Only the `rcmake-harness`
+differential test tool uses them, so the generated list above omits them.
+
+| Crate | Version | SPDX licence | Repository | Authors | Licence and notice files |
+| --- | --- | --- | --- | --- | --- |
+| `similar` | `2.7.0` | `Apache-2.0` | <https://github.com/mitsuhiko/similar> | Armin Ronacher &lt;armin.ronacher@active-4.com&gt;, Pierre-Étienne Meunier &lt;pe@pijul.org&gt;, Brandon Williams &lt;bwilliams.eng@gmail.com&gt; | `LICENSE`: Apache License 2.0, the same licence as [`LICENSE-APACHE`](LICENSE-APACHE). The crate has no `NOTICE` file. |
