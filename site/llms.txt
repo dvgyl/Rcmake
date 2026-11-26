@@ -54,6 +54,7 @@
 ## Documentation
 
 - [README](https://github.com/dvgyl/rcmake/blob/main/README.md): Quick start, feature matrix, install options, troubleshooting, and local verification commands.
+- [FAQ](https://github.com/dvgyl/rcmake/blob/main/docs/FAQ.md): Developer Q&A on drop-in CMake 4.5.1 compatibility, generators, vcpkg and Conan, probe caching, incremental replay, explain, hermetic mode, fetch lockfiles, LSP, WebAssembly, installation, and limits.
 - [Build Write-Up](https://github.com/dvgyl/rcmake/blob/main/docs/BUILD_WRITEUP.md): Differential testing methodology against CMake 4.5.1, bugs exposed by testing, limits, and one-command reproduction table.
 - [Architecture](https://github.com/dvgyl/rcmake/blob/main/docs/ARCHITECTURE.md): Execution pipeline, resolution layers, map of all 35 crates, and the `Host` trait.
 - [Architecture Decision Records](https://github.com/dvgyl/rcmake/blob/main/docs/ADR.md): 31 design records covering storage, generators, host isolation, and compatibility boundaries.

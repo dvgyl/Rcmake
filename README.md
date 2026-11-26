@@ -10,17 +10,19 @@
   <a href="https://dvgyl.github.io/rcmake/">Website</a> ·
   <a href="https://dvgyl.github.io/rcmake/playground.html">Playground</a> ·
   <a href="https://dvgyl.github.io/rcmake/dashboard.html">Compatibility</a> ·
+  <a href="docs/FAQ.md">FAQ</a> ·
   <a href="docs/BUILD_WRITEUP.md">Build write-up</a> ·
-  <a href="docs/ARCHITECTURE.md">Architecture</a>
+  <a href="docs/ARCHITECTURE.md">Architecture</a> ·
+  <a href="https://dvgyl.github.io/rcmake/llms.txt">LLMs.txt</a>
 </p>
 
 # rcmake
 
-`rcmake` is an independent reimplementation of CMake 4.5.1 in Rust. No CMake C++ source is copied or translated. One binary provides `cmake`, `ctest`, and `cpack`. It reads the same `CMakeLists.txt` files, presets, and cache files as CMake 4.5.1 and writes compatible build trees.
+`rcmake` is an independent reimplementation of CMake 4.5.1 in Rust. No CMake C++ source is copied or translated. One binary provides `cmake`, `ctest`, and `cpack`. It reads existing `CMakeLists.txt` files, presets, and caches, writes compatible `Ninja`, `Unix Makefiles`, `Xcode`, and `Visual Studio` build trees, and works with `vcpkg` and Conan.
+
+A second binary, `rcmake-lsp`, is a language server (LSP) for CMake files. The `rcmake-api` crate compiles to WebAssembly.
 
 All 35 `rcmake` crates have `#![forbid(unsafe_code)]`. Some dependencies, such as `rustix` and `memchr`, use `unsafe`. The binary also statically links two C codecs: zstd 1.5.7 and liblzma 5.8.
-
-A second binary, `rcmake-lsp`, is a language server for CMake files.
 
 `rcmake` is not affiliated with Kitware. "CMake" is a trademark of Kitware, Inc.
 
@@ -334,8 +336,6 @@ open "profile-out/$(cat profile-out/current)/flamegraph.html"
 
 ## Intentional differences and limits
 
-Compatibility mode tracks CMake 4.5.1 closely. These differences and scope limits are intentional:
-
 - **Reproducible `tar` archives.** `cmake -E tar` and CPack archive generators write uid 0 and gid 0 instead of copying host user IDs.
 - **No DAP debugger.** `cmake --debugger` prints `CMake was not built with support for --debugger`, and `cmake -E capabilities` omits `debugger`.
 - **No interactive front ends.** `cmake-gui` and `ccmake` are not implemented. `edit_cache` prints `No interactive CMake dialog available.`.
@@ -412,14 +412,15 @@ env/            Shell environment for local builds and the CMake 4.5.1 oracle (e
 assets/         Vector brand assets
 site/           Static website, browser playground, and compatibility dashboard
 third_party/    Licence texts for bundled third-party code
-docs/           Build write-up, architecture, ADRs, environment variables, prior art
+docs/           FAQ, build write-up, architecture, ADRs, environment variables, prior art
 .github/        CI workflows, issue forms, and the pull request template
 ```
 
 ## Documentation
 
-[`docs/README.md`](docs/README.md) tells you which document answers which question.
-
+- [`docs/FAQ.md`](docs/FAQ.md): common questions on CMake 4.5.1 compatibility, generators, caching, native tools, installation, and limits
+- [`site/llms.txt`](site/llms.txt): machine-readable index for LLMs and developer Q&A (also hosted as [`llms.txt`](https://dvgyl.github.io/rcmake/llms.txt) and [`llms-full.txt`](https://dvgyl.github.io/rcmake/llms-full.txt))
+- [`docs/README.md`](docs/README.md): index of repository documentation
 - [`docs/BUILD_WRITEUP.md`](docs/BUILD_WRITEUP.md): differential testing against CMake 4.5.1, bugs that testing found, limits, and how to reproduce every claim
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): execution pipeline, the map of 35 crates, the `Host` trait, and verification layers
 - [`docs/ADR.md`](docs/ADR.md): 31 architecture decision records

@@ -1,9 +1,10 @@
 # rcmake documentation
 
-Use this table to find the document that answers your question. To install and use `rcmake`, start with the [main README](../README.md).
-
 | Question | Document |
 | --- | --- |
+| How do I install and use `rcmake`? | [README.md](../README.md) |
+| What are the common questions about compatibility, caching, native tools, and limits? | [FAQ.md](FAQ.md) |
+| Where are the concise and full machine-readable references for LLMs? | [site/llms.txt](../site/llms.txt), [llms.txt](https://dvgyl.github.io/rcmake/llms.txt), and [llms-full.txt](https://dvgyl.github.io/rcmake/llms-full.txt) |
 | How was `rcmake` built and tested, and how can I reproduce each claim? | [BUILD_WRITEUP.md](BUILD_WRITEUP.md) |
 | How does a configure run flow through the 35 crates? | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Why was a design decision made? | [ADR.md](ADR.md) (31 architecture decision records) |
