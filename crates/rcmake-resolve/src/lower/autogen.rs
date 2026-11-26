@@ -590,8 +590,8 @@ mod tests {
         let host = PureHost::new("/".into(), "/cmake".into());
         let plan = fixture_with(&host, GeneratorKind::Ninja, "8", None, |model, id, _| {
             let vars = &mut model.dir_mut(DirId::ROOT).vars;
-            vars.shift_remove(b"Qt6Core_VERSION_MAJOR".as_slice());
-            vars.shift_remove(b"Qt6Core_VERSION_MINOR".as_slice());
+            vars.remove(b"Qt6Core_VERSION_MAJOR".as_slice());
+            vars.remove(b"Qt6Core_VERSION_MINOR".as_slice());
             let props = &mut model
                 .target_mut(id)
                 .ok_or("Expected the sample target.")?

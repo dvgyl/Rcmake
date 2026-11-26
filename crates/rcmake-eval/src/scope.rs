@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use rcmake_base::BString;
 use rcmake_diag::PolicyStatus;
-use rcmake_model::DirId;
+use rcmake_model::{Binding, DirId, VarLayer, VarSnapshot};
 
 pub(crate) const RECURSION_LIMIT: &[u8] = b"CMAKE_MAXIMUM_RECURSION_DEPTH";
 
@@ -34,23 +34,11 @@ impl RecursionBinding {
     }
 }
 
-/// One binding in a variable scope.
-///
-/// An [`Binding::Unset`] entry shadows bindings in outer scopes. A name that has no entry
-/// in a scope is looked up in the next outer scope.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Binding {
-    /// The variable is defined with this value (the value can be empty).
-    Set(BString),
-    /// The variable is explicitly undefined in this scope.
-    Unset,
-}
-
 #[derive(Debug)]
 struct Scope {
     id: u64,
     directory: Option<DirId>,
-    bindings: BTreeMap<BString, Binding>,
+    bindings: VarLayer,
     parent_policy: Option<(usize, PolicyStatus)>,
     recursion_limit: RecursionBinding,
 }
@@ -78,7 +66,7 @@ impl Default for VarStack {
             scopes: vec![Scope {
                 id: 0,
                 directory: Some(DirId::ROOT),
-                bindings: BTreeMap::new(),
+                bindings: VarLayer::default(),
                 parent_policy: None,
                 recursion_limit: RecursionBinding::Inherit,
             }],
@@ -111,10 +99,11 @@ impl VarStack {
 
     /// Find the innermost binding for `name`.
     pub(crate) fn lookup(&self, name: &[u8]) -> Option<&Binding> {
+        let shard = VarLayer::shard_index(name);
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.bindings.get(name))
+            .find_map(|scope| scope.bindings.get_at(name, shard))
     }
 
     /// Value of the innermost normal binding, if it is [`Binding::Set`].
@@ -129,12 +118,13 @@ impl VarStack {
     }
 
     pub(crate) fn get_from(&self, name: &[u8], parent: bool) -> Option<&BString> {
+        let shard = VarLayer::shard_index(name);
         let binding = self
             .scopes
             .iter()
             .rev()
             .skip(usize::from(parent))
-            .find_map(|scope| scope.bindings.get(name));
+            .find_map(|scope| scope.bindings.get_at(name, shard));
         match binding {
             Some(Binding::Set(v)) => Some(v),
             Some(Binding::Unset) | None => None,
@@ -157,11 +147,7 @@ impl VarStack {
                 top.record_recursion_binding(&binding);
                 self.recursion_limit = top.recursion_limit.configured();
             }
-            if let Some(current) = top.bindings.get_mut(name) {
-                *current = binding;
-            } else {
-                top.bindings.insert(BString::from(name), binding);
-            }
+            top.bindings.set(name, binding);
         }
     }
 
@@ -178,7 +164,7 @@ impl VarStack {
         self.scopes.push(Scope {
             id: self.next_id,
             directory,
-            bindings: BTreeMap::new(),
+            bindings: VarLayer::default(),
             parent_policy,
             recursion_limit: RecursionBinding::Inherit,
         });
@@ -213,7 +199,7 @@ impl VarStack {
         if !matches!(capture.recursion_limit, RecursionBinding::Inherit) {
             self.update_recursion_limit();
         }
-        let mut bindings = capture.bindings;
+        let mut bindings: BTreeMap<_, _> = capture.bindings.into_bindings().collect();
         bindings.retain(|name, binding| {
             let value = match binding {
                 Binding::Set(value) => Some(&*value),
@@ -268,16 +254,20 @@ impl VarStack {
             if name == RECURSION_LIMIT {
                 parent.record_recursion_binding(&binding);
             }
-            parent.bindings.insert(BString::from(name), binding);
+            parent.bindings.set(name, binding);
         }
         true
+    }
+
+    pub(crate) fn snapshot(&self) -> VarSnapshot {
+        VarSnapshot::from_layers(self.scopes.iter().map(|scope| scope.bindings.clone()))
     }
 
     /// All names with a [`Binding::Set`] value visible from the innermost scope, sorted.
     pub(crate) fn visible_names(&self) -> Vec<BString> {
         let mut seen: BTreeMap<&BString, bool> = BTreeMap::new();
         for scope in self.scopes.iter().rev() {
-            for (name, binding) in &scope.bindings {
+            for (name, binding) in scope.bindings.iter() {
                 seen.entry(name)
                     .or_insert(matches!(binding, Binding::Set(_)));
             }
@@ -341,11 +331,12 @@ mod tests {
         stack.unset(b"unset");
         assert!(stack.propagate_capture());
 
+        let same_shard = VarLayer::shard_index(b"same");
         assert!(
             !stack
                 .scopes
                 .last()
-                .is_some_and(|scope| scope.bindings.contains_key(b"same".as_slice()))
+                .is_some_and(|scope| scope.bindings.get_at(b"same", same_shard).is_some())
         );
         stack.pop();
         assert_eq!(stack.lookup(b"unset"), Some(&Binding::Unset));

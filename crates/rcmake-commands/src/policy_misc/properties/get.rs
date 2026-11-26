@@ -75,7 +75,7 @@ pub(in crate::policy_misc) fn get_directory(cx: &mut Cx<'_>, args: &[ExpandedArg
             .project()
             .dir(dir)
             .vars
-            .get(*name)
+            .get(name)
             .cloned()
             .or_else(|| cx.cache().get(name).map(|entry| entry.value.clone())),
         [b""] => {

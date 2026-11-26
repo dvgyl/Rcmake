@@ -503,14 +503,7 @@ impl Interp {
     /// compiler rules, flags, and platform variables.
     fn snapshot_dir_vars(&mut self, id: DirId) {
         self.warn_install_order(id);
-        let names = self.vars.visible_names();
-        let mut snap = indexmap::IndexMap::with_capacity(names.len());
-        for name in names {
-            if let Some(val) = self.vars.get(&name) {
-                snap.insert(name, val.clone());
-            }
-        }
-        self.project.dir_mut(id).vars = snap;
+        self.project.dir_mut(id).vars = self.vars.snapshot();
     }
 
     fn warn_install_order(&mut self, id: DirId) {

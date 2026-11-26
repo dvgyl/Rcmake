@@ -20,6 +20,7 @@ mod glob;
 mod ids;
 mod install;
 mod property_print;
+mod vars;
 pub use property_print::PropertyPrint;
 mod project;
 mod props;
@@ -48,6 +49,7 @@ pub use target::{
     FileSet, FileSetKind, ImportedVisibility, LinkItem, Target, TargetBinding, TargetKind,
     TargetOrigin, TargetPolicySnapshot, UsageField, UsageProps, UsageScope,
 };
+pub use vars::{Binding, VarLayer, VarSnapshot};
 
 /// Cache entry type matching `CMakeCache.txt` (`<NAME>:<TYPE>=<VALUE>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

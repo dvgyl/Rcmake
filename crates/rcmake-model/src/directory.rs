@@ -51,5 +51,5 @@ pub struct Directory {
     pub discoveries: Vec<TestId>,
     /// Final visible normal variable snapshot captured when this directory finishes
     /// configuring (used by generate-time resolution and lowering).
-    pub vars: IndexMap<BString, BString>,
+    pub vars: crate::VarSnapshot,
 }

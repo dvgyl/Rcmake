@@ -94,8 +94,8 @@ impl Cx<'_> {
             *self.interp.policies.top_mut() = policies;
         }
         let result = self.with_variable_scope(|cx| {
-            for (key, value) in definitions {
-                cx.interp.vars.set(&key, value);
+            for (key, value) in definitions.iter() {
+                cx.interp.vars.set(key, value.clone());
             }
             run(cx)
         });

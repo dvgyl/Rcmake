@@ -63,7 +63,7 @@ pub use hooks::{TraceConfig, TraceFormat, WatchAccess};
 pub use interp::StopReason;
 pub use profiler::{CommandProfiler, CommandSample, SampleKind};
 pub use provenance::{ValuePreview, VarEvent, VarLedger, VarOp, VarWrite};
-pub use scope::Binding;
+pub use rcmake_model::Binding;
 pub use services::{
     CancelToken, FetchLockMode, HermeticMode, LedgerLevel, ProbeCacheMode, Services, Site,
     SpeedOptions,

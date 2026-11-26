@@ -479,7 +479,7 @@ pub fn xcode_project_attributes(
     const PREFIX: &[u8] = b"CMAKE_XCODE_ATTRIBUTE_";
     let mut definitions = IndexMap::new();
     definitions.extend(model.cache.iter().map(|(key, entry)| (key, &entry.value)));
-    definitions.extend(&model.dir(dir).vars);
+    definitions.extend(model.dir(dir).vars.iter());
     let mut selected = IndexMap::new();
     for (key, value) in definitions {
         let Some(name) = key.strip_prefix(PREFIX) else {
