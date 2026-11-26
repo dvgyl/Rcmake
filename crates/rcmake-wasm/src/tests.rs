@@ -309,6 +309,43 @@ fn reject_comments_and_non_utf8_and_keep_last_duplicate_key() -> TestResult {
 }
 
 #[test]
+fn reject_non_utf8_in_every_string_field() -> TestResult {
+    for (op, field) in [
+        ("configure", "buildType"),
+        ("configure", "generator"),
+        ("configure", "preset"),
+        ("explain", "symbol"),
+        ("explain", "config"),
+    ] {
+        let mut input = format!(r#"{{"op":"{op}","files":{{}},"{field}":"bad-"#).into_bytes();
+        let position = input.len();
+        input.extend_from_slice(b"\xff\"}");
+        let response = call_raw(&input)?;
+        assert_eq!(
+            response.get("ok").and_then(Value::as_bool),
+            Some(false),
+            "{field}"
+        );
+        let diagnostic = response
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .ok_or("Diagnostic is missing.")?;
+        assert_eq!(
+            diagnostic.get("category").and_then(Value::as_str),
+            Some("INPUT"),
+            "{field}"
+        );
+        assert_eq!(
+            diagnostic.get("message").and_then(Value::as_str),
+            Some(format!("The request is not valid UTF-8 at byte {position}.").as_str()),
+            "{field}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn configure_nested_file_with_posix_preset_paths() -> TestResult {
     let response = call(Value::object_from([
         ("op", Value::string("configure")),

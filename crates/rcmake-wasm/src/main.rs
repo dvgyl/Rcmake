@@ -22,6 +22,14 @@ fn main() -> io::Result<()> {
 }
 
 fn dispatch(input: &[u8]) -> Vec<u8> {
+    // String fields that are not UTF-8 would otherwise read as absent.
+    if let Err(error) = std::str::from_utf8(input) {
+        let message = format!(
+            "The request is not valid UTF-8 at byte {}.",
+            error.valid_up_to()
+        );
+        return write_compact(&response::failure("INPUT", &message)).into();
+    }
     let request = match parse(input, &REQUEST_OPTIONS) {
         Ok(request) => request,
         Err(error) => {
