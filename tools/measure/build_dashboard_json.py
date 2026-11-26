@@ -296,6 +296,8 @@ def reset_tracks_to_pending(snapshot):
         metric.update(value=None, status="pending", note=pending_note)
     for row in bench_section["gates"]:
         row.update(status="pending", passed=None, failures=None, summary=pending_note)
+        for key in ("preFreeze", "commit", "measuredAt"):
+            row.pop(key, None)
         if "scenariosPassed" in row:
             row["scenariosPassed"] = None
     bench_section.pop("giantsBenchmark", None)
@@ -484,6 +486,8 @@ def gate(section, identifier, label, passed, total, status, detail, summary=None
     if row is None:
         row = {"id": identifier, "label": label}
         section["gates"].append(row)
+    for key in ("preFreeze", "commit", "measuredAt"):
+        row.pop(key, None)
     row.update(status=status, passed=passed, total=total, failures=total - passed,
                summary=summary or f"{passed:,} / {total:,} checks passed", detail=detail, **metrics)
 
@@ -1021,6 +1025,11 @@ def merge_large_projects(track, directory, identity=(None, None, False)):
 
     l3_reported = any(project.get("l3", "pending") != "pending" for project in projects.values())
     l4_reported = any(project.get("l4", "pending") != "pending" for project in projects.values())
+    checked_levels = ["l1", "l2"]
+    if l3_reported:
+        checked_levels.append("l3")
+    if l4_reported:
+        checked_levels.append("l4")
     track.update(
         projectsTotal=len(projects),
         l1Passed=sum(project["l1"] == "pass" for project in projects.values()),
@@ -1030,7 +1039,7 @@ def merge_large_projects(track, directory, identity=(None, None, False)):
         status=combined_status(
             project.get(level, "pending")
             for project in projects.values()
-            for level in ("l1", "l2", "l3", "l4")
+            for level in checked_levels
         ),
         note="L1 compares configure output. L2 compares Ninja dry-run commands. L3 builds targets. L4 runs tests and install checks.",
     )

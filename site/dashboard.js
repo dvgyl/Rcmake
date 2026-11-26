@@ -1,6 +1,6 @@
 /* rcmake compatibility report controller. MIT OR Apache-2.0. */
 
-import { cleanNote, escapeHtml, formatBytes, formatNumber, formatPercent, formatRatio, initRovingGroup, initSegPills, isPreFreezeGate, loadLatestData, normalizeStatus, overviewRows, revealScan, snapshotMeta, statusHtml } from "./app.js";
+import { cleanNote, escapeHtml, formatBytes, formatNumber, formatPercent, formatRatio, initRovingGroup, initSegPills, isPreFreezeGate, loadLatestData, normalizeStatus, overviewRows, revealScan, revealVisible, snapshotMeta, statusHtml } from "./app.js";
 import { formatSpeed, fuzzGaugeCard, horizontalBar, inlineBar, isMeasured, normalizeGiants, ringGaugeCard, segmentRing, shardHeatmap, speedupBars, statRow, statusIcon, waffleRowsHtml } from "./charts.js";
 import { animateCountUp, createMotionController } from "./motion.js";
 
@@ -146,8 +146,8 @@ export function projectRowHtml(p, { showL3 = false, showL4 = false } = {}) {
   const targets = Array.isArray(p.targets) ? p.targets : [];
   const chips = targets.map((t) => `<span class="chip is-ink">${escapeHtml(t)}</span>`).join("");
   const note = cleanNote(p.note);
-  const extraCells = `${showL3 ? `<td>${statusHtml(l3)}</td>` : ""}${showL4 ? `<td>${statusHtml(l4)}</td>` : ""}`;
-  return `<tr data-name="${escapeHtml(`${p.name} ${p.repository}`.toLowerCase())}" data-tier="${escapeHtml(p.tier)}" data-l1="${l1}" data-l2="${l2}" data-l3="${l3}" data-l4="${l4}"><td><span>${escapeHtml(p.name)}</span><span class="proj-repo">${escapeHtml(p.repository)}</span>${note ? `<span class="proj-repo">${escapeHtml(note)}</span>` : ""}</td><td class="mono nowrap">${escapeHtml(p.version)}</td><td><button type="button" class="targets-toggle" aria-expanded="false" data-targets-toggle><span>${targets.length} ${targets.length === 1 ? "target" : "targets"}</span></button><div class="targets-list" hidden>${chips}</div></td><td>${statusHtml(l1)}</td><td>${statusHtml(l2)}</td>${extraCells}</tr>`;
+  const extraCells = `${showL3 ? `<td class="proj-cell-level" data-label="L3 build">${statusHtml(l3)}</td>` : ""}${showL4 ? `<td class="proj-cell-level" data-label="L4 test/install">${statusHtml(l4)}</td>` : ""}`;
+  return `<tr data-name="${escapeHtml(`${p.name} ${p.repository}`.toLowerCase())}" data-tier="${escapeHtml(p.tier)}" data-l1="${l1}" data-l2="${l2}" data-l3="${l3}" data-l4="${l4}"><td class="proj-cell-name"><span>${escapeHtml(p.name)}</span><span class="proj-repo">${escapeHtml(p.repository)}</span>${note ? `<span class="proj-repo">${escapeHtml(note)}</span>` : ""}</td><td class="mono nowrap proj-cell-ver" data-label="Version">${escapeHtml(p.version)}</td><td class="proj-cell-targets" data-label="Targets"><button type="button" class="targets-toggle" aria-expanded="false" data-targets-toggle><span>${targets.length} ${targets.length === 1 ? "target" : "targets"}</span></button><div class="targets-list" hidden>${chips}</div></td><td class="proj-cell-level" data-label="L1 configure">${statusHtml(l1)}</td><td class="proj-cell-level" data-label="L2 build graph">${statusHtml(l2)}</td>${extraCells}</tr>`;
 }
 
 export function renderProjects(track) {
@@ -157,7 +157,7 @@ export function renderProjects(track) {
   const colCount = 5 + (showL3 ? 1 : 0) + (showL4 ? 1 : 0);
   const rows = list.map((p) => projectRowHtml(p, { showL3, showL4 })).join("");
   const extraHead = `${showL3 ? '<th title="Listed targets compile and link cleanly">L3 build</th>' : ""}${showL4 ? '<th title="Tests and install manifest checks pass">L4 test/install</th>' : ""}`;
-  return `<section id="projects" class="report-section" data-reveal data-test="section-projects"><h2>Large projects</h2><div class="filter-bar"><div class="seg" role="group" aria-label="Filter by tier" id="proj-tier" data-test="proj-tier"><button type="button" aria-pressed="true" data-tier-val="all">All</button><button type="button" aria-pressed="false" data-tier-val="standard">Standard</button><button type="button" aria-pressed="false" data-tier-val="large">Large</button></div><div class="seg" role="group" aria-label="Filter by status" id="proj-status" data-test="proj-status"><button type="button" aria-pressed="true" data-status-val="all">All</button><button type="button" aria-pressed="false" data-status-val="l1">L1 pass</button><button type="button" aria-pressed="false" data-status-val="l2">L2 pass</button><button type="button" aria-pressed="false" data-status-val="fail">Fail</button><button type="button" aria-pressed="false" data-status-val="pending">Pending</button></div><input id="proj-search" class="search-input" type="search" placeholder="Filter projects" aria-label="Filter projects" data-test="proj-search"></div><div class="table-panel"><table class="bench-table" id="proj-table" data-test="proj-table"><thead><tr><th>Project</th><th>Version</th><th>Targets</th><th title="Configure output and stderr match CMake 4.5.1">L1 configure</th><th title="Cache, Ninja graph, and File API match CMake 4.5.1">L2 build graph</th>${extraHead}</tr></thead><tbody>${rows}<tr id="proj-empty" hidden><td colspan="${colCount}" class="dim">No projects match.</td></tr></tbody></table></div>${sectionNote(track?.note)}</section>`;
+  return `<section id="projects" class="report-section" data-reveal data-test="section-projects"><h2>Large projects</h2><div class="filter-bar"><div class="seg" role="group" aria-label="Filter by tier" id="proj-tier" data-test="proj-tier"><button type="button" aria-pressed="true" data-tier-val="all">All</button><button type="button" aria-pressed="false" data-tier-val="standard">Standard</button><button type="button" aria-pressed="false" data-tier-val="large">Large</button></div><div class="seg" role="group" aria-label="Filter by status" id="proj-status" data-test="proj-status"><button type="button" aria-pressed="true" data-status-val="all">All</button><button type="button" aria-pressed="false" data-status-val="l1">L1 pass</button><button type="button" aria-pressed="false" data-status-val="l2">L2 pass</button><button type="button" aria-pressed="false" data-status-val="fail">Fail</button><button type="button" aria-pressed="false" data-status-val="pending">Pending</button></div><input id="proj-search" class="search-input" type="search" placeholder="Filter projects" aria-label="Filter projects" data-test="proj-search"></div><div class="table-panel"><table class="bench-table" id="proj-table" data-test="proj-table" data-show-l3="${showL3}" data-show-l4="${showL4}"><thead><tr><th>Project</th><th>Version</th><th>Targets</th><th title="Configure output and stderr match CMake 4.5.1">L1 configure</th><th title="Cache, Ninja graph, and File API match CMake 4.5.1">L2 build graph</th>${extraHead}</tr></thead><tbody>${rows}<tr id="proj-empty" hidden><td colspan="${colCount}" class="dim">No projects match.</td></tr></tbody></table></div>${sectionNote(track?.note)}</section>`;
 }
 
 export function renderHoldout(track) {
@@ -167,6 +167,20 @@ export function renderHoldout(track) {
   const bannerSummary = measured
     ? `${total} sealed repositories \u00b7 ${formatRatio(track.reposPassed, track.reposTotal)} passed${isMeasured(track.passRate) ? ` (${formatPercent(track.passRate)})` : ""}`
     : `${total} sealed repositories \u00b7 aggregate counts only`;
+
+  const aggregateBar = measured
+    ? horizontalBar({
+      label: "Aggregate pass rate",
+      passed: track.reposPassed,
+      total: track.reposTotal,
+      rate: track.passRate,
+      status: st,
+      detail: isMeasured(track.passRate)
+        ? `${formatPercent(track.passRate)} (${formatRatio(track.reposPassed, track.reposTotal)} repositories)`
+        : "",
+      testId: "holdout-aggregate"
+    })
+    : "";
 
   const levelRates = track?.levelPassRates && typeof track.levelPassRates === "object" ? track.levelPassRates : null;
   const levelKeys = levelRates ? ["L1", "L2", "L3", "L4"].filter((k) => levelRates[k] && typeof levelRates[k] === "object") : [];
@@ -189,7 +203,7 @@ export function renderHoldout(track) {
 
   const cats = Array.isArray(track?.categories) ? track.categories : [];
   const catsMeasured = cats.some((c) => isMeasured(c?.reposPassed));
-  const showCats = catsMeasured || !levelBars;
+  const showCats = catsMeasured || (!measured && !levelBars);
   const catBars = showCats
     ? cats.map((c, i) => horizontalBar({ label: c.category, passed: c.reposPassed, total: c.reposTotal, rate: c.passRate, status: c.status, testId: `holdout-cat-${i}` })).join("")
     : "";
@@ -201,7 +215,7 @@ export function renderHoldout(track) {
     : "";
 
   const note = [cleanNote(track?.policy), cleanNote(track?.note)].filter(Boolean).join(" ");
-  return `<section id="holdout" class="report-section" data-animate data-reveal data-test="section-holdout"><h2>Blind holdout</h2><figure class="panel" aria-label="Blind holdout aggregate results"><div class="holdout-banner"><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg><span>${escapeHtml(bannerSummary)}</span>${measured ? statusHtml(st) : ""}</div><div class="rate-bars" style="margin-bottom:0">${levelBars}${catBars}</div>${failHtml}</figure>${sectionNote(note)}</section>`;
+  return `<section id="holdout" class="report-section" data-animate data-reveal data-test="section-holdout"><h2>Blind holdout</h2><figure class="panel" aria-label="Blind holdout aggregate results"><div class="holdout-banner"><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg><span>${escapeHtml(bannerSummary)}</span>${measured ? statusHtml(st) : ""}</div><div class="rate-bars" style="margin-bottom:0">${aggregateBar}${levelBars}${catBars}</div>${failHtml}</figure>${sectionNote(note)}</section>`;
 }
 
 export function shardDetail(shard) {
@@ -246,13 +260,14 @@ function formatRatioLabel(speedup) {
   return speedup < 1 ? `${(1 / speedup).toFixed(2)}\u00d7 slower` : `${formatSpeed(speedup)}\u00d7`;
 }
 
-function formatGiantsPhase(phase, extra = null) {
+function formatGiantsPhaseHtml(phase, extra = null) {
   const sp = formatRatioLabel(phase?.speedup);
   const ms = isMeasured(phase?.rcmakeMedianMs) ? `${formatNumber(phase.rcmakeMedianMs)} ms` : null;
   const detail = extra || ms;
-  if (sp && detail) return `${sp} (${detail})`;
-  if (sp) return sp;
-  return detail || "-";
+  if (sp && detail) return `<span class="giants-primary">${escapeHtml(sp)}</span><span class="giants-sub">${escapeHtml(detail)}</span>`;
+  if (sp) return `<span class="giants-primary">${escapeHtml(sp)}</span>`;
+  if (detail) return `<span class="giants-primary">${escapeHtml(detail)}</span>`;
+  return '<span class="dim">-</span>';
 }
 
 function phaseTooltip(phase) {
@@ -293,30 +308,39 @@ export function renderGiantsBench(giants) {
     if (hasBuildVerify) {
       const bv = p?.buildVerify;
       if (bv && typeof bv === "object") {
-        const bvText = bv.target ? `${bv.status}${bv.dryRunStepCountMatch ? " \u00b7 steps match" : ""}` : bv.status;
-        bvCell = `<td title="${escapeHtml(bv.target || "")}">${statusHtml(bv.status, bvText)}</td>`;
+        const bvTip = [bv.target || "", bv.dryRunStepCountMatch ? "dry-run step counts match" : ""].filter(Boolean).join(" \u00b7 ");
+        bvCell = `<td${bvTip ? ` title="${escapeHtml(bvTip)}"` : ""}>${statusHtml(bv.status)}</td>`;
       } else {
         bvCell = '<td class="dim">-</td>';
       }
     }
-    return `<tr data-status="${st}"><td><span>${escapeHtml(p?.name || "")}</span>${sub ? `<span class="proj-repo">${escapeHtml(sub)}</span>` : ""}</td><td class="mono nowrap"${coldTip ? ` title="${escapeHtml(coldTip)}"` : ""}>${escapeHtml(formatGiantsPhase(p?.cold))}</td><td class="mono nowrap"${warmTip ? ` title="${escapeHtml(warmTip)}"` : ""}>${escapeHtml(formatGiantsPhase(p?.warmProbe))}</td><td class="mono nowrap"${leafTip ? ` title="${escapeHtml(leafTip)}"` : ""}>${escapeHtml(formatGiantsPhase(p?.incrementalLeaf, leafExtra))}</td><td class="mono nowrap">${escapeHtml(formatRssPair(rcRss, cmRss))}</td>${bvCell}<td>${statusHtml(st)}</td></tr>`;
+    return `<tr data-status="${st}"><td class="giants-cell-name"><span>${escapeHtml(p?.name || "")}</span>${sub ? `<span class="proj-repo">${escapeHtml(sub)}</span>` : ""}</td><td class="mono" data-label="Cold"${coldTip ? ` title="${escapeHtml(coldTip)}"` : ""}>${formatGiantsPhaseHtml(p?.cold)}</td><td class="mono" data-label="Warm probe"${warmTip ? ` title="${escapeHtml(warmTip)}"` : ""}>${formatGiantsPhaseHtml(p?.warmProbe)}</td><td class="mono" data-label="Leaf edit"${leafTip ? ` title="${escapeHtml(leafTip)}"` : ""}>${formatGiantsPhaseHtml(p?.incrementalLeaf, leafExtra)}</td><td class="mono nowrap" data-label="Peak RSS" title="Peak RSS (rcmake / CMake)">${escapeHtml(formatRssPair(rcRss, cmRss))}</td>${bvCell ? bvCell.replace("<td", '<td data-label="Build verify"') : ""}<td data-label="Status">${statusHtml(st)}</td></tr>`;
   }).join("");
   const s = giants.summary;
   let summaryRow = "";
   if (s && (isMeasured(s.coldSpeedupGeomean) || isMeasured(s.warmProbeSpeedupGeomean) || isMeasured(s.incrementalLeafSpeedupGeomean))) {
     const st = normalizeStatus(giants.status);
-    const fmtG = (v) => formatRatioLabel(v) || "-";
-    const incP95 = isMeasured(s.incrementalLeafMaxP95Ms) ? ` (${formatNumber(s.incrementalLeafMaxP95Ms)} ms max p95)` : "";
+    const fmtG = (v) => {
+      const lbl = formatRatioLabel(v);
+      return lbl ? `<span class="giants-primary">${escapeHtml(lbl)}</span>` : '<span class="dim">-</span>';
+    };
     const incRatio = formatRatioLabel(s.incrementalLeafSpeedupGeomean);
-    const incTxt = incRatio ? `${incRatio}${incP95}` : (incP95 ? incP95.slice(2, -1) : "-");
+    const incP95 = isMeasured(s.incrementalLeafMaxP95Ms) ? `${formatNumber(s.incrementalLeafMaxP95Ms)} ms max p95` : null;
+    const incHtml = incRatio && incP95
+      ? `<span class="giants-primary">${escapeHtml(incRatio)}</span><span class="giants-sub">${escapeHtml(incP95)}</span>`
+      : incRatio
+        ? `<span class="giants-primary">${escapeHtml(incRatio)}</span>`
+        : incP95
+          ? `<span class="giants-primary">${escapeHtml(incP95)}</span>`
+          : '<span class="dim">-</span>';
     const scope = isMeasured(s.projectsPassed) && isMeasured(s.projectsTotal) ? `${formatNumber(s.projectsPassed)} / ${formatNumber(s.projectsTotal)} passed` : "";
     const metaSub = scope ? `${scope} \u00b7 geomean / max` : "geomean / max";
-    summaryRow = `<tr class="cmp-group-note" data-status="${st}" data-test="dash-giants-summary"><td><span>Summary</span><span class="proj-repo">${escapeHtml(metaSub)}</span></td><td class="mono nowrap">${escapeHtml(fmtG(s.coldSpeedupGeomean))}</td><td class="mono nowrap">${escapeHtml(fmtG(s.warmProbeSpeedupGeomean))}</td><td class="mono nowrap">${escapeHtml(incTxt)}</td><td class="mono nowrap">${escapeHtml(formatRssPair(s.rcmakeMaxPeakRssMiB, s.cmakeMaxPeakRssMiB))}</td>${hasBuildVerify ? '<td class="dim">-</td>' : ""}<td>${statusHtml(st)}</td></tr>`;
+    summaryRow = `<tr class="cmp-group-note" data-status="${st}" data-test="dash-giants-summary"><td class="giants-cell-name"><span>Summary</span><span class="proj-repo">${escapeHtml(metaSub)}</span></td><td class="mono" data-label="Cold">${fmtG(s.coldSpeedupGeomean)}</td><td class="mono" data-label="Warm probe">${fmtG(s.warmProbeSpeedupGeomean)}</td><td class="mono" data-label="Leaf edit">${incHtml}</td><td class="mono nowrap" data-label="Peak RSS" title="Max Peak RSS (rcmake / CMake)">${escapeHtml(formatRssPair(s.rcmakeMaxPeakRssMiB, s.cmakeMaxPeakRssMiB))}</td>${hasBuildVerify ? '<td class="dim" data-label="Build verify">-</td>' : ""}<td data-label="Status">${statusHtml(st)}</td></tr>`;
   }
   const footParts = [];
   if (isMeasured(giants.runs)) footParts.push(`Median of ${formatNumber(giants.runs)} runs per project.`);
   if (giants.reproducer) footParts.push(`Reproduce: ${giants.reproducer}`);
-  return `<div class="table-panel" style="margin-top:16px" data-test="dash-giants-bench"><table class="bench-table"><thead><tr><th>Real-world project</th><th>Cold</th><th>New tree (probe cache)</th><th>Incremental leaf</th><th>Peak RSS (rcmake / CMake)</th>${hasBuildVerify ? "<th>Build verify</th>" : ""}<th>Status</th></tr></thead><tbody>${rows}${summaryRow}</tbody></table></div>${sectionNote(footParts.join(" "))}`;
+  return `<div class="table-panel" style="margin-top:16px" data-test="dash-giants-bench"><table class="bench-table"><thead><tr><th>Project</th><th>Cold</th><th title="New build tree with shared probe cache">Warm probe</th><th title="Incremental reconfigure after leaf edit">Leaf edit</th><th title="Peak RSS (rcmake / CMake)">Peak RSS</th>${hasBuildVerify ? "<th>Build verify</th>" : ""}<th>Status</th></tr></thead><tbody>${rows}${summaryRow}</tbody></table></div>${sectionNote(footParts.join(" "))}`;
 }
 
 export function renderDifferentialFuzz(diff) {
@@ -428,12 +452,18 @@ function wireProjectFilter(doc) {
   const [tierEl, statEl, search, empty, table] = ["proj-tier", "proj-status", "proj-search", "proj-empty", "proj-table"].map((id) => doc.getElementById(id));
   if (!table) return;
   const rows = Array.from(table.querySelectorAll("tbody tr[data-tier]"));
-  const qs = String(window.location?.hash || "").startsWith("#projects?") ? new URLSearchParams(window.location.hash.slice(10)) : new URLSearchParams();
-  const state = {
-    tier: ["all", "standard", "large"].includes(qs.get("tier")) ? qs.get("tier") : "all",
-    status: ["all", "l1", "l2", "fail", "pending"].includes(qs.get("status")) ? qs.get("status") : "all",
-    q: qs.get("q") || ""
+  const showL3 = table.dataset?.showL3 === "true";
+  const showL4 = table.dataset?.showL4 === "true";
+  const readHashState = () => {
+    const rawHash = typeof window !== "undefined" ? String(window.location?.hash || "") : "";
+    const qs = rawHash.startsWith("#projects?") ? new URLSearchParams(rawHash.slice(10)) : new URLSearchParams();
+    return {
+      tier: ["all", "standard", "large"].includes(qs.get("tier")) ? qs.get("tier") : "all",
+      status: ["all", "l1", "l2", "fail", "pending"].includes(qs.get("status")) ? qs.get("status") : "all",
+      q: qs.get("q") || ""
+    };
   };
+  const state = readHashState();
   if (search) search.value = state.q;
 
   const apply = (writeHash = false) => {
@@ -442,12 +472,13 @@ function wireProjectFilter(doc) {
     const q = state.q.trim().toLowerCase();
     let shown = 0;
     rows.forEach((row) => {
+      const activeLevels = [row.dataset.l1, row.dataset.l2, ...(showL3 ? [row.dataset.l3] : []), ...(showL4 ? [row.dataset.l4] : [])];
       const hasFail = [row.dataset.l1, row.dataset.l2, row.dataset.l3, row.dataset.l4].includes("fail");
       const statusOk = state.status === "all"
         || (state.status === "l1" && row.dataset.l1 === "pass")
         || (state.status === "l2" && row.dataset.l2 === "pass")
         || (state.status === "fail" && hasFail)
-        || (state.status === "pending" && (row.dataset.l1 === "pending" || row.dataset.l2 === "pending"));
+        || (state.status === "pending" && activeLevels.includes("pending"));
       const ok = (state.tier === "all" || row.dataset.tier === state.tier) && statusOk && (!q || row.dataset.name.includes(q));
       row.classList.toggle("is-hidden", !ok);
       if (ok) shown += 1;
@@ -471,6 +502,17 @@ function wireProjectFilter(doc) {
     if (btn.nextElementSibling) btn.nextElementSibling.hidden = open;
   }));
   apply(false);
+  if (typeof window !== "undefined") {
+    window.addEventListener("hashchange", () => {
+      if (!String(window.location?.hash || "").startsWith("#projects")) return;
+      const next = readHashState();
+      state.tier = next.tier;
+      state.status = next.status;
+      state.q = next.q;
+      if (search) search.value = state.q;
+      apply(false);
+    });
+  }
 }
 
 function wireShards(doc, shards) {
@@ -502,6 +544,21 @@ function wireShards(doc, shards) {
   });
 }
 
+function scrollToHash(doc) {
+  if (typeof window === "undefined" || typeof doc?.getElementById !== "function") return;
+  const raw = String(window.location?.hash || "");
+  if (!raw || raw.length < 2) return;
+  const rawId = raw.slice(1).split("?")[0];
+  if (!rawId) return;
+  let id = rawId;
+  try { id = decodeURIComponent(rawId); } catch (_) {}
+  const target = doc.getElementById(id);
+  if (!target) return;
+  target.scrollIntoView?.({ behavior: "instant", block: "start" });
+  if (target.hasAttribute?.("data-reveal")) target.classList?.add("is-revealed");
+  revealVisible(doc);
+}
+
 async function init(doc) {
   const root = doc.getElementById("report");
   if (!root) return;
@@ -527,6 +584,10 @@ async function init(doc) {
     motion.scan(root);
     const fEl = root.querySelector("[data-fuzz-target]");
     if (fEl) motion.observeReveal(doc.getElementById("gates"), () => animateCountUp(fEl, Number(fEl.dataset.fuzzTarget), { duration: 800 }));
+    scrollToHash(doc);
+    if (typeof window !== "undefined") {
+      window.addEventListener("hashchange", () => scrollToHash(doc));
+    }
   } catch (err) {
     console.error("Failed to render compatibility report:", err);
     root.classList?.remove("is-loading");

@@ -409,7 +409,7 @@ const data = new Proxy(snapshot, {
 });
 const elements = new Map(
   ["report", "report-meta", "report-note", "waffle-panel", "gauge-grid", "speed-panel", "home-load-error"]
-    .map(id => [id, { querySelector: () => null, querySelectorAll: () => [] }])
+    .map(id => [id, { classList: { remove() {}, add() {}, toggle() {} }, querySelector: () => null, querySelectorAll: () => [] }])
 );
 globalThis.document = {
   documentElement: { dataset: {} },

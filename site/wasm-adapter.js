@@ -5,12 +5,12 @@
  *     `./wasm/rcmake_wasm.wasm` with a minimal in-browser WASI shim (stdin, stdout,
  *     stderr, clocks, and random bytes; no host filesystem access).
  *   - Default export `init(wasmUrl?)` compiles `./wasm/rcmake_wasm.wasm`.
- *   - Named export `configure_json(requestJson: string): string` sends a JSON request
+ *   - Named export `configure_json(requestJson: string): Promise<string>` sends a JSON request
  *     with `"op": "configure"` on WASI stdin to the PureHost configure engine:
  *       { files: Record<string, string>, generator: string, buildType: string, preset?: string, defines?: Record<string, string> }
  *     and reads JSON from stdout:
  *       { ok: boolean, durationMs?: number, diagnostics: Array<Diagnostic>, targets: Array<Target>, files: Record<string, string>, explainSymbols?: Array<string> }
- *   - Named export `explain_json(requestJson: string): string` sends `"op": "explain"` on stdin:
+ *   - Named export `explain_json(requestJson: string): Promise<string>` sends `"op": "explain"` on stdin:
  *       { files: Record<string, string>, symbol: string, generator: string, buildType: string, config?: string }
  *     and returns an `rcmake-explain-v1` JSON object matching `crates/rcmake-api/src/explain_json.rs`.
  *
@@ -20,7 +20,7 @@
  * Licensed under MIT OR Apache-2.0.
  */
 
-export const WASM_ENGINE_COMMIT = "ced2709";
+export const WASM_ENGINE_COMMIT = "fcc8e48f";
 
 export const PLAYGROUND_EXAMPLES = {
   "hello-cpp20": {
@@ -287,7 +287,7 @@ export class RcmakeWasmAdapter {
     const exampleId = options.exampleId || "hello-cpp20";
 
     const started = performance.now();
-    const raw = this.module.configure_json(
+    const raw = await this.module.configure_json(
       JSON.stringify({
         files,
         generator,
@@ -345,7 +345,7 @@ export class RcmakeWasmAdapter {
       };
     }
 
-    const raw = this.module.explain_json(
+    const raw = await this.module.explain_json(
       JSON.stringify({
         files: this._lastContext.files,
         symbol: trimmed,

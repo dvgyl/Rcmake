@@ -381,6 +381,10 @@ class DashboardTests(unittest.TestCase):
         self.base["tracks"]["unseenHoldout"]["categories"][0]["repo"] = "private"
         with self.assertRaises(ValueError):
             builder.validate(self.base, self.schema, self.schema)
+        self.base["tracks"]["unseenHoldout"]["categories"][0].pop("repo")
+        self.base["tracks"]["unseenHoldout"]["failureCategories"] = {"private-org/secret": 1}
+        with self.assertRaises(ValueError):
+            builder.validate(self.base, self.schema, self.schema)
 
     def test_giants_bench_ingests_per_giant_speedups_rss_and_build_verify(self):
         reproducer = (
@@ -720,6 +724,47 @@ class DashboardTests(unittest.TestCase):
                           all_track["l3Passed"], all_track["l4Passed"]),
                          (10, 10, 10, 10))
 
+        # Parity-only run (L1+L2 pass, L3+L4 not_requested) sets bossFight status to pass, not partial.
+        parity_ten = self.root / "lp-parity"
+        self.report("lp-parity/result.json", {
+            "projects": [
+                {
+                    "project": row["name"],
+                    "l1": "pass",
+                    "l2": "pass",
+                    "lanes": {
+                        "oracle": {"build": "not_requested", "test": "not_requested", "manifest_l4": "not_requested"},
+                        "rcmake": {"build": "not_requested", "test": "not_requested", "manifest_l4": "not_requested"},
+                    },
+                }
+                for row in self.base["tracks"]["bossFight"]["projects"]
+            ]
+        })
+        parity_track = self.build("--large-projects-dir", str(parity_ten))["tracks"]["bossFight"]
+        self.assertEqual(parity_track["status"], "pass")
+        self.assertEqual((parity_track["l1Passed"], parity_track["l2Passed"],
+                          parity_track["l3Passed"], parity_track["l4Passed"]),
+                         (10, 10, None, None))
+
+        # Partially reported L3 across the 10 projects yields status partial (with l3Passed populated).
+        partial_l3 = self.root / "lp-partial-l3"
+        self.report("lp-partial-l3/result.json", {
+            "projects": [
+                {
+                    "project": row["name"],
+                    "l1": "pass",
+                    "l2": "pass",
+                    **({"l3": "pass"} if idx == 0 else {}),
+                }
+                for idx, row in enumerate(self.base["tracks"]["bossFight"]["projects"])
+            ]
+        })
+        partial_l3_track = self.build("--large-projects-dir", str(partial_l3))["tracks"]["bossFight"]
+        self.assertEqual(partial_l3_track["status"], "partial")
+        self.assertEqual((partial_l3_track["l1Passed"], partial_l3_track["l2Passed"],
+                          partial_l3_track["l3Passed"], partial_l3_track["l4Passed"]),
+                         (10, 10, 1, None))
+
     def test_same_sha_integrity_guard_resets_stale_tracks_and_validates_digests(self):
         digest_a = "a" * 64
         digest_b = "b" * 64
@@ -742,11 +787,27 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(first["releaseSha"], "1234567abcdef")
         self.assertEqual(first["binarySha256"], digest_a)
         self.assertEqual(first["tracks"]["benchmarksAndGates"]["differentialFuzz"]["status"], "pass")
-        # Stale fuzz and wasi passes from the commit=null base must be reset to pending.
-        self.assertEqual(self.gate(first, "fuzz")["status"], "pending")
-        self.assertIsNone(self.gate(first, "fuzz")["passed"])
-        self.assertEqual(self.gate(first, "wasi")["status"], "pending")
-        self.assertIsNone(self.gate(first, "wasi")["passed"])
+        # Stale fuzz and wasi passes from the commit=null base must be reset to pending without stale preFreeze metadata.
+        fuzz_gate = self.gate(first, "fuzz")
+        wasi_gate = self.gate(first, "wasi")
+        self.assertEqual(fuzz_gate["status"], "pending")
+        self.assertIsNone(fuzz_gate["passed"])
+        self.assertEqual(wasi_gate["status"], "pending")
+        self.assertIsNone(wasi_gate["passed"])
+        for row in (fuzz_gate, wasi_gate):
+            for stale_key in ("preFreeze", "commit", "measuredAt"):
+                self.assertNotIn(stale_key, row)
+
+        # Updating a pre-freeze gate directly via gate() also clears stale preFreeze/commit/measuredAt keys.
+        direct_wasm = self.report("direct-wasm.json", {
+            "status": "pass",
+            "checks": [{"status": "pass"}],
+        })
+        direct = self.build("--wasm", direct_wasm)
+        direct_wasi = self.gate(direct, "wasi")
+        self.assertEqual(direct_wasi["status"], "pass")
+        for stale_key in ("preFreeze", "commit", "measuredAt"):
+            self.assertNotIn(stale_key, direct_wasi)
 
         # Subsequent merge on the exact same SHA + binary digest preserves verified tracks.
         first_path = self.report("first-snap.json", first)

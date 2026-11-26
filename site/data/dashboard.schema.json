@@ -23,6 +23,11 @@
       "type": ["string", "null"],
       "description": "Short or full Git commit SHA for the verified binary."
     },
+    "releaseSha": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-fA-F]{7,40}$",
+      "description": "Optional exact frozen release Git commit SHA recorded when --release-sha is supplied."
+    },
     "binarySha256": {
       "type": ["string", "null"],
       "pattern": "^[0-9a-f]{64}$",
@@ -141,6 +146,9 @@
                   "toolchain": { "type": "string" },
                   "suitesTotal": { "type": "integer", "minimum": 1 },
                   "suitesPassed": { "type": ["integer", "null"], "minimum": 0 },
+                  "expectedSuites": { "type": "integer", "minimum": 1 },
+                  "completedSuites": { "type": "integer", "minimum": 0 },
+                  "partial": { "type": "boolean" },
                   "casesPassed": { "type": ["integer", "null"], "minimum": 0 },
                   "casesTotal": { "type": ["integer", "null"], "minimum": 0 },
                   "passRate": { "$ref": "#/$defs/rate" },
@@ -210,6 +218,37 @@
             "passRate": { "$ref": "#/$defs/rate" },
             "policy": { "type": "string" },
             "note": { "type": "string" },
+            "levelPassRates": {
+              "type": "object",
+              "description": "Optional per-level (L1-L4) aggregate pass rates from unseen_eval.py.",
+              "additionalProperties": false,
+              "properties": {
+                "L1": { "$ref": "#/$defs/holdoutLevelRate" },
+                "L2": { "$ref": "#/$defs/holdoutLevelRate" },
+                "L3": { "$ref": "#/$defs/holdoutLevelRate" },
+                "L4": { "$ref": "#/$defs/holdoutLevelRate" }
+              }
+            },
+            "failureCategories": {
+              "type": "object",
+              "description": "Optional sanitized failure category counts from unseen_eval.py (fixed public buckets only).",
+              "additionalProperties": false,
+              "properties": {
+                "build": { "type": "integer", "minimum": 0 },
+                "configure": { "type": "integer", "minimum": 0 },
+                "crash": { "type": "integer", "minimum": 0 },
+                "evaluation": { "type": "integer", "minimum": 0 },
+                "find-module": { "type": "integer", "minimum": 0 },
+                "generator": { "type": "integer", "minimum": 0 },
+                "genex": { "type": "integer", "minimum": 0 },
+                "oracle-red": { "type": "integer", "minimum": 0 },
+                "other": { "type": "integer", "minimum": 0 },
+                "policy": { "type": "integer", "minimum": 0 },
+                "source": { "type": "integer", "minimum": 0 },
+                "timeout": { "type": "integer", "minimum": 0 },
+                "unknown-command": { "type": "integer", "minimum": 0 }
+              }
+            },
             "categories": {
               "type": "array",
               "items": {
@@ -352,6 +391,16 @@
     "sha256": {
       "type": ["string", "null"],
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "holdoutLevelRate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "eligible", "passRate"],
+      "properties": {
+        "passed": { "type": "integer", "minimum": 0 },
+        "eligible": { "type": "integer", "minimum": 0 },
+        "passRate": { "$ref": "#/$defs/rate" }
+      }
     },
     "releaseReceipt": {
       "type": "object",

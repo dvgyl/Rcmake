@@ -127,8 +127,10 @@ if (process.argv.includes("--browser")) {
     const adapterSource = await readFile(new URL("wasm-adapter.js", site), "utf8");
     const runtimeSource = await readFile(new URL("wasm/rcmake_wasm.js", site), "utf8");
     const wasmBytes = await readFile(wasm);
-    const asyncRuntimeSource = runtimeSource.replace("function run(", "async function run(")
-      .replace("new WebAssembly.Instance(", "await WebAssembly.instantiate(");
+    const asyncRuntimeSource = runtimeSource.includes("async function run(")
+      ? runtimeSource
+      : runtimeSource.replace("function run(", "async function run(")
+        .replace("new WebAssembly.Instance(", "await WebAssembly.instantiate(");
     await page.route("http://rcmake.test/**", async (route) => {
       const pathname = new URL(route.request().url()).pathname;
       const asset = {
@@ -165,7 +167,7 @@ if (process.argv.includes("--browser")) {
       };
     }, cases);
     assert.deepEqual(errors, []);
-    console.log(`Chromium ${browser.version()} passed synchronous WASM exports through the adapter with zero console or page errors.`);
+    console.log(`Chromium ${browser.version()} passed asynchronous WASM exports through the adapter with zero console or page errors.`);
     console.log(`Chromium cases passed ${passed.streaming.join(", ")}.`);
     console.log(`Chromium alternate media type passed ${passed.fallback.join(", ")}.`);
     console.log(`Chromium asynchronous instantiation passed ${passed.async.join(", ")}.`);

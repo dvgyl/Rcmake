@@ -151,6 +151,20 @@ export function revealScan(scope = typeof document !== "undefined" ? document : 
   });
 }
 
+export function revealVisible(doc = typeof document !== "undefined" ? document : null) {
+  if (!doc?.querySelectorAll || typeof window === "undefined") return;
+  const vh = window.innerHeight || doc.documentElement?.clientHeight || 0;
+  if (!vh) return;
+  doc.querySelectorAll("[data-reveal]:not(.is-revealed)").forEach((el) => {
+    if (typeof el.getBoundingClientRect !== "function") return;
+    const rect = el.getBoundingClientRect();
+    if (rect.bottom > 0 && rect.top < vh) {
+      el.classList?.add("is-revealed");
+      revealIO?.unobserve(el);
+    }
+  });
+}
+
 export function initReveal(doc = document) {
   if (typeof window === "undefined" || typeof IntersectionObserver === "undefined" || reducedMotion()) {
     revealScan(doc);
@@ -162,9 +176,15 @@ export function initReveal(doc = document) {
       e.target.classList.add("is-revealed");
       revealIO.unobserve(e.target);
     }
-  }, { rootMargin: "0px 0px -8% 0px", threshold: 0.08 });
+  }, { rootMargin: "0px 0px 0px 0px", threshold: 0.01 });
   revealScan(doc);
   doc.documentElement.classList.add("reveal-on");
+  revealVisible(doc);
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => revealVisible(doc));
+  window.addEventListener("hashchange", () => {
+    revealVisible(doc);
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => revealVisible(doc));
+  });
   const showAll = () => doc.querySelectorAll("[data-reveal]").forEach((el) => el.classList.add("is-revealed"));
   window.addEventListener("beforeprint", showAll);
 }
@@ -338,13 +358,16 @@ export function overviewRows(data) {
     if (hasL4) parts.push(boss.l4Passed);
     bossResult = `${parts.join(" / ")} of ${boss.projectsTotal}`;
   }
+  const bossCounts = [boss.l1Passed, boss.l2Passed, ...(hasL3 ? [boss.l3Passed] : []), ...(hasL4 ? [boss.l4Passed] : [])]
+    .filter((n) => typeof n === "number" && Number.isFinite(n));
+  const bossRatio = bossCounts.length ? ratioOf(Math.min(...bossCounts), boss.projectsTotal) : null;
 
   const rows = [
     { id: "core", check: "Core suites", result: formatRatio(core.suitesAt100, core.suitesTotal), scope: `- / ${formatNumber(core.suitesTotal) ?? "?"}`, ratio: ratioOf(core.suitesAt100, core.suitesTotal), status: normalizeStatus(core.status) },
     { id: "core", check: `Policies ${pol.activeRange || ""}`.trim(), result: formatRatio(pol.suitesPassed, pol.suitesTotal), scope: `- / ${formatNumber(pol.suitesTotal) ?? "?"}`, ratio: ratioOf(pol.suitesPassed, pol.suitesTotal), status: normalizeStatus(pol.status) },
     { id: "runcmake", check: "Tests/RunCMake, 3 OS", result: osAny ? plats.map((p) => formatPercent(p.passRate) ?? "-").join(" / ") : null, scope: `${plats.map((p) => p.suitesTotal).join(" / ")} suites`, ratio: osAny ? measuredPlats.reduce((a, p) => a + p.passRate, 0) / (plats.length * 100) : null, status: normalizeStatus(rc.status) },
     { id: "gates", check: "Black-box scenarios", result: formatRatio(bb.scenariosPassed, bb.scenariosTotal), scope: `- / ${formatNumber(bb.scenariosTotal) ?? "?"}`, ratio: ratioOf(bb.scenariosPassed, bb.scenariosTotal), status: normalizeStatus(bb.status) },
-    { id: "projects", check: bossCheck, result: bossResult, scope: `- / ${formatNumber(boss.projectsTotal) ?? "?"}`, ratio: ratioOf(boss.l2Passed, boss.projectsTotal), status: normalizeStatus(boss.status) },
+    { id: "projects", check: bossCheck, result: bossResult, scope: `- / ${formatNumber(boss.projectsTotal) ?? "?"}`, ratio: bossRatio, status: normalizeStatus(boss.status) },
     { id: "holdout", check: "Blind holdout", result: formatRatio(hold.reposPassed, hold.reposTotal), scope: `- / ${formatNumber(hold.reposTotal) ?? "?"}`, ratio: ratioOf(hold.reposPassed, hold.reposTotal), status: normalizeStatus(hold.status) },
     { id: "vcpkg", check: "vcpkg ports", result: typeof vc.portsPassed === "number" && typeof vc.portsTotal === "number" ? `${formatRatio(vc.portsPassed, vc.portsTotal)} ports` : null, scope: `${formatNumber(vc.shardsCompleted) ?? "0"} / ${formatNumber(vc.shardsTotal) ?? "64"} shards`, ratio: typeof vc.passRate === "number" ? Math.max(0, Math.min(1, vc.passRate / 100)) : null, status: normalizeStatus(vc.status) }
   ];

@@ -124,7 +124,7 @@
               "name": "What is intentionally different or not implemented in rcmake?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "rcmake omits interactive front ends (cmake-gui and ccmake), the --debugger DAP server, legacy extra generators (CodeBlocks, CodeLite, Eclipse CDT4, Kate, Sublime Text 2), older Makefile and Visual Studio 14 to 16 generators, and CPack native installers (DEB, RPM, NSIS, WIX, productbuild, IFW). Its tar and CPack archive writers always record uid 0 and gid 0 for reproducibility, try_compile runs in-process, and Swift builds plus full CUDA and HIP toolchain runs are not yet verified."
+                "text": "rcmake omits interactive front ends (cmake-gui and ccmake), the --debugger DAP server, legacy extra generators (CodeBlocks, CodeLite, Eclipse CDT4, Kate, Sublime Text 2), older Makefile and Visual Studio 14 to 16 generators, and CPack platform installers NSIS, WIX, productbuild, and IFW (archive generators, External, macOS DragNDrop and Bundle, and Linux DEB and RPM packages are implemented). Its tar and CPack archive writers always record uid 0 and gid 0 for reproducibility, try_compile runs in-process, and Swift builds plus full CUDA and HIP toolchain runs are not yet verified."
               }
             },
             {
@@ -377,6 +377,11 @@
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
+              <tr data-group="same">
+                <td>CPack archive, <code>External</code>, macOS <code>DragNDrop</code>/<code>Bundle</code>, and Linux <code>DEB</code>/<code>RPM</code> generators</td>
+                <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
+                <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
+              </tr>
               <tr data-group="same" data-hl>
                 <td>Ninja, Unix Makefiles, Xcode, and Visual Studio 2022/2026 generators</td>
                 <td class="cmp-cell" data-cmp-gate="generators"><span class="cmp-cell-diff st-pending"><svg class="i" aria-hidden="true"><use href="#i-pending"/></svg><span>verification pending</span></span></td>
@@ -463,7 +468,7 @@
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
               <tr data-group="not-in-rcmake" data-hl>
-                <td>CPack <code>DEB</code>, <code>RPM</code>, <code>NSIS</code>, <code>WIX</code>, <code>productbuild</code>, and <code>IFW</code></td>
+                <td>CPack <code>NSIS</code>, <code>WIX</code>, <code>productbuild</code>, and <code>IFW</code></td>
                 <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
@@ -558,7 +563,7 @@
         </details>
         <details class="faq-item">
           <summary>What is intentionally different or not implemented in rcmake?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p><code>rcmake</code> omits interactive front ends (<code>cmake-gui</code> and <code>ccmake</code>), the <code>--debugger</code> DAP server, legacy extra generators (CodeBlocks, CodeLite, Eclipse CDT4, Kate, Sublime Text 2), older Makefile and Visual Studio 14 to 16 generators, and CPack native installers (<code>DEB</code>, <code>RPM</code>, <code>NSIS</code>, <code>WIX</code>, <code>productbuild</code>, <code>IFW</code>). Its <code>tar</code> and CPack archive writers always record uid 0 and gid 0 for reproducibility, <code>try_compile</code> runs in-process, and Swift builds plus full CUDA and HIP toolchain runs are not yet verified.</p></div></div>
+          <div class="faq-answer"><div class="faq-inner"><p><code>rcmake</code> omits interactive front ends (<code>cmake-gui</code> and <code>ccmake</code>), the <code>--debugger</code> DAP server, legacy extra generators (CodeBlocks, CodeLite, Eclipse CDT4, Kate, Sublime Text 2), older Makefile and Visual Studio 14 to 16 generators, and CPack platform installers <code>NSIS</code>, <code>WIX</code>, <code>productbuild</code>, and <code>IFW</code> (archive generators, <code>External</code>, macOS <code>DragNDrop</code> and <code>Bundle</code>, and Linux <code>DEB</code> and <code>RPM</code> packages are implemented). Its <code>tar</code> and CPack archive writers always record uid 0 and gid 0 for reproducibility, <code>try_compile</code> runs in-process, and Swift builds plus full CUDA and HIP toolchain runs are not yet verified.</p></div></div>
         </details>
         <details class="faq-item">
           <summary>Does rcmake contain any unsafe Rust or copied CMake C++ code?</summary>

@@ -6,7 +6,7 @@
 
 ## CMake 4.5.1 parity
 
-- **CLI tools in one binary (`argv[0]` dispatch):** `cmake` (configure and generate, `-P` scripts, `-E` utilities, `--build`, `--install`, `--workflow`, `--find-package`, `--sarif-output`), `ctest` (parallel scheduling, fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML, `discover_tests()`, `-S` scripts), and `cpack` (archive generators `TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z` and compression variants, `External`, macOS `DragNDrop` and `Bundle`).
+- **CLI tools in one binary (`argv[0]` dispatch):** `cmake` (configure and generate, `-P` scripts, `-E` utilities, `--build`, `--install`, `--workflow`, `--find-package`, `--sarif-output`), `ctest` (parallel scheduling, fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML, `discover_tests()`, `-S` scripts), and `cpack` (archive generators `TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z` and compression variants, `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages).
 - **Two execution modes:** Running as `cmake`, `ctest`, or `cpack` (or setting `RCMAKE_ORACLE_MODE=1`) selects CMake 4.5.1 compatibility mode. Running as `rcmake` selects native mode with the extensions below.
 - **Generators:** `Ninja` and `Ninja Multi-Config` (macOS, Linux, Windows), `Unix Makefiles` (macOS, Linux), `Xcode` (macOS), and `Visual Studio 17 2022` and `Visual Studio 18 2026` (Windows).
 - **Languages and tooling:** C (C90 to C23), C++ (including C++20 and C++23 named modules with Ninja `dyndep`), Objective-C, Objective-C++, Fortran (`.mod` dependency scanning), `ASM`/`ASM_MASM`/`ASM_NASM`, Windows `RC`, and Qt `AUTOMOC`/`AUTOUIC`/`AUTORCC`.
@@ -38,7 +38,7 @@
 - Reproducible `tar` and CPack archives always write uid 0 and gid 0.
 - No `cmake-gui`, no `ccmake`, and no `--debugger` (DAP).
 - No legacy extra generators (`CodeBlocks`, `CodeLite`, `Eclipse CDT4`, `Kate`, `Sublime Text 2`), no `MinGW`/`NMake`/`MSYS`/`Borland`/`Watcom` Makefiles, no `Green Hills MULTI`, no `FASTBuild`, and no Visual Studio 14, 15, or 16.
-- No CPack native installers (`DEB`, `RPM`, `NSIS`, `WIX`, `productbuild`, `IFW`).
+- No CPack platform installers `NSIS`, `WIX`, `productbuild`, or `IFW` (archive generators, `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages are implemented).
 - `try_compile` runs in-process rather than invoking Ninja, Make, MSBuild, or xcodebuild, so MSBuild-only and Xcode-only generator attributes do not affect probes.
 - `--version` prints `cmake version 4.5.1` on line 1 and `rcmake 0.1.0` on line 2.
 - Partial or unverified languages: CUDA (one ecosystem fixture), HIP (rule wiring only), Swift (parsed, builds unverified).
@@ -57,7 +57,7 @@
 - [FAQ](https://github.com/dvgyl/rcmake/blob/main/docs/FAQ.md): Answers on CMake 4.5.1 parity, generators, vcpkg and Conan, native extensions, install, and limits.
 - [Build write-up](https://github.com/dvgyl/rcmake/blob/main/docs/BUILD_WRITEUP.md): Differential testing methodology against CMake 4.5.1, bugs exposed by testing, limits, and reproduction commands.
 - [Architecture](https://github.com/dvgyl/rcmake/blob/main/docs/ARCHITECTURE.md): Execution pipeline, resolution layers, map of all 35 crates, and the `Host` trait.
-- [Architecture decision records](https://github.com/dvgyl/rcmake/blob/main/docs/ADR.md): 31 design records covering storage, generators, host isolation, and compatibility boundaries.
+- [Architecture decision records](https://github.com/dvgyl/rcmake/blob/main/docs/ADR.md): 38 design records covering storage, generators, host isolation, and compatibility boundaries.
 - [Environment variables](https://github.com/dvgyl/rcmake/blob/main/docs/ENV_VARS.md): Reference for `RCMAKE_*` variables.
 - [Prior art and licences](https://github.com/dvgyl/rcmake/blob/main/docs/PRIOR_ART.md): Vendored assets, direct third-party dependencies, and archive codec licences.
 - [rcmake-api README](https://github.com/dvgyl/rcmake/blob/main/crates/rcmake-api/README.md): Embedding configure and `explain` in Rust programs and WebAssembly targets.

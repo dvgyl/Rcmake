@@ -51,7 +51,7 @@ const RIGHTS_POLL = 1n << 27n;
 
 // The command receives stdin, stdout, and stderr. It uses PureHost for files,
 // the environment, and process operations.
-function run(op, requestJson) {
+async function run(op, requestJson) {
   if (!compiledModule) {
     throw new Error("Initialize the rcmake runtime before sending a request.");
   }
@@ -177,14 +177,14 @@ function run(op, requestJson) {
         ready += 1;
       }
       writeU32(written, ready);
-      // The synchronous exports cannot wait for future events.
+      // WASI poll_oneoff cannot wait for future events in this shim.
       return ready === 0 ? AGAIN : SUCCESS;
     },
     sched_yield: () => SUCCESS,
     fd_seek: () => NOTSUP,
   };
 
-  instance = new WebAssembly.Instance(compiledModule, { wasi_snapshot_preview1: wasi });
+  instance = await WebAssembly.instantiate(compiledModule, { wasi_snapshot_preview1: wasi });
   try {
     instance.exports._start();
   } catch (error) {

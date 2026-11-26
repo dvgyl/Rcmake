@@ -37,7 +37,7 @@ GitHub repository: https://github.com/dvgyl/rcmake
 
 - `cmake`: Configure and generate, `-P` script mode, `-E` command-line utilities (`tar`, hash commands, `cmake_ninja_dyndep`, Fortran and Qt drivers, capabilities), `--build`, `--install`, `--workflow`, `--find-package`, `--preset`, and `--sarif-output`.
 - `ctest`: `CTestTestfile.cmake` evaluation, parallel test scheduling, test fixtures, resource specifications, labels, repeat modes, JUnit and dashboard XML output, `discover_tests()`, and `-S` scripts.
-- `cpack`: `CPackConfig.cmake` evaluation, install staging, archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`, and `ZIP_*` and `7Z_*` compression variants), `External`, and macOS `DragNDrop` and `Bundle`.
+- `cpack`: `CPackConfig.cmake` evaluation, install staging, archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`, and `ZIP_*` and `7Z_*` compression variants), `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages.
 
 ### Build system generators
 
@@ -251,7 +251,7 @@ Omitted features and intentional differences from CMake 4.5.1:
 2. **No interactive front ends:** `cmake-gui` and `ccmake` are not implemented (`edit_cache` prints `No interactive CMake dialog available.`).
 3. **No DAP debugger:** `cmake --debugger` prints `CMake was not built with support for --debugger`, and `cmake -E capabilities` omits `debugger`.
 4. **No legacy extra generators:** CodeBlocks, CodeLite, Eclipse CDT4, Kate, and Sublime Text 2 are omitted (`extraGenerators` is empty).
-5. **No CPack native installers:** `DEB`, `RPM`, `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
+5. **CPack platform installers:** Archive generators (`TGZ`, `TXZ`, `TZST`, `TBZ2`, `TZ`, `TAR`, `ZIP`, `7Z`), `External`, macOS `DragNDrop` and `Bundle`, and Linux `DEB` and `RPM` packages are implemented. `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
 6. **Legacy and niche generators omitted:** `NMake Makefiles`, `NMake Makefiles JOM`, `MSYS Makefiles`, `MinGW Makefiles`, `Borland Makefiles`, `Watcom WMake`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16 are not implemented.
 7. **`try_compile` runs in-process:** Probes execute via `rcmake-build` rather than Ninja, Make, MSBuild, or xcodebuild. `rcmake` emits the same `Change Dir:` and `Run Build Command(s):` header in `OUTPUT_VARIABLE`, while inner build-tool output lines differ and MSBuild-only or Xcode-only attributes (`CMAKE_GENERATOR_TOOLSET`, `CMAKE_XCODE_ATTRIBUTE_*`) do not apply to probes.
 8. **`--version` output:** Line 1 is `cmake version 4.5.1`; line 2 is `rcmake 0.1.0` instead of the Kitware maintainer line.

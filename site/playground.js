@@ -162,8 +162,8 @@ function decodeSharePayload(encoded) {
   return { files: cleanFiles, activeFile: typeof parsed.activeFile === "string" && parsed.activeFile in cleanFiles ? parsed.activeFile : Object.keys(cleanFiles)[0] };
 }
 
-function buildShareUrl(includeCode = false) {
-  if (typeof window === "undefined") return "";
+function buildShareResult(includeCode = false) {
+  if (typeof window === "undefined") return { url: "", codeTooLarge: false, encodedLength: 0 };
   const url = new URL(window.location.href);
   url.search = "";
   url.hash = "";
@@ -179,13 +179,26 @@ function buildShareUrl(includeCode = false) {
   }
   const qs = p.toString();
   if (qs) url.search = `?${qs}`;
+  let codeTooLarge = false;
+  let encodedLength = 0;
   if (includeCode && isDirty()) {
     try {
       const encoded = encodeSharePayload({ files: state.files, activeFile: state.activeFile });
-      if (encoded.length <= MAX_SHARE_HASH_CHARS) url.hash = `code=b:${encoded}`;
-    } catch (_) {}
+      encodedLength = encoded.length;
+      if (encoded.length <= MAX_SHARE_HASH_CHARS) {
+        url.hash = `code=b:${encoded}`;
+      } else {
+        codeTooLarge = true;
+      }
+    } catch (_) {
+      codeTooLarge = true;
+    }
   }
-  return url.toString();
+  return { url: url.toString(), codeTooLarge, encodedLength };
+}
+
+function buildShareUrl(includeCode = false) {
+  return buildShareResult(includeCode).url;
 }
 
 function syncUrlState() {
@@ -335,18 +348,41 @@ function renderFileTabs(force = false) {
   const sig = names.map((n) => `${n}:${n === state.activeFile ? 1 : 0}:${(state.files[n] ?? "") !== (base[n] ?? "") ? 1 : 0}`).join("|");
   if (!force && sig === lastFileTabsSig) return;
   lastFileTabsSig = sig;
-  const pill = els.fileTabs.querySelector(".seg-pill");
-  const tabsHtml = names
-    .map((n, idx) => {
+  const activeEl = typeof document !== "undefined" ? document.activeElement : null;
+  const restoreFocusFile = activeEl && els.fileTabs.contains(activeEl) ? (activeEl.dataset?.fileTab || state.activeFile) : null;
+  const existing = Array.from(els.fileTabs.querySelectorAll("[data-file-tab]"));
+  const sameNames = !force && existing.length === names.length && existing.every((b, idx) => b.dataset.fileTab === names[idx]);
+  if (sameNames) {
+    existing.forEach((btn, idx) => {
+      const n = names[idx];
       const active = n === state.activeFile;
       const mod = (state.files[n] ?? "") !== (base[n] ?? "");
-      return `<button type="button" role="tab" id="file-tab-${idx}" aria-controls="editor-panel" aria-selected="${active}" tabindex="${active ? 0 : -1}" data-file-tab="${escapeHtml(n)}"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>${escapeHtml(n)}${mod ? '<span class="file-mod-dot" aria-hidden="true"></span><span class="visually-hidden"> (modified)</span>' : ""}</button>`;
-    })
-    .join("");
-  els.fileTabs.innerHTML = tabsHtml;
-  if (pill) els.fileTabs.prepend(pill);
+      btn.id = `file-tab-${idx}`;
+      btn.setAttribute("aria-selected", String(active));
+      btn.tabIndex = active ? 0 : -1;
+      const hadDot = Boolean(btn.querySelector(".file-mod-dot"));
+      if (hadDot !== mod) {
+        btn.innerHTML = `<svg class="i" aria-hidden="true"><use href="#i-file"/></svg>${escapeHtml(n)}${mod ? '<span class="file-mod-dot" aria-hidden="true"></span><span class="visually-hidden"> (modified)</span>' : ""}`;
+      }
+    });
+  } else {
+    const pill = els.fileTabs.querySelector(".seg-pill");
+    const tabsHtml = names
+      .map((n, idx) => {
+        const active = n === state.activeFile;
+        const mod = (state.files[n] ?? "") !== (base[n] ?? "");
+        return `<button type="button" role="tab" id="file-tab-${idx}" aria-controls="editor-panel" aria-selected="${active}" tabindex="${active ? 0 : -1}" data-file-tab="${escapeHtml(n)}"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg>${escapeHtml(n)}${mod ? '<span class="file-mod-dot" aria-hidden="true"></span><span class="visually-hidden"> (modified)</span>' : ""}</button>`;
+      })
+      .join("");
+    els.fileTabs.innerHTML = tabsHtml;
+    if (pill) els.fileTabs.prepend(pill);
+  }
   const activeIdx = Math.max(0, names.indexOf(state.activeFile));
   if (els.editorPanel) els.editorPanel.setAttribute("aria-labelledby", `file-tab-${activeIdx}`);
+  if (restoreFocusFile) {
+    const nextFocus = Array.from(els.fileTabs.querySelectorAll("[data-file-tab]")).find((b) => b.dataset.fileTab === restoreFocusFile);
+    if (nextFocus && document.activeElement !== nextFocus) nextFocus.focus();
+  }
 }
 
 function availableBuildTypes() {
@@ -372,6 +408,7 @@ function syncConfigOptions() {
   const allowed = availableBuildTypes();
   Array.from(els.configSelect.options).forEach((opt) => {
     opt.disabled = !allowed.includes(opt.value);
+    opt.title = opt.disabled ? "Not listed in CMAKE_CONFIGURATION_TYPES for this generator or preset" : "";
   });
   if (!allowed.includes(state.buildType)) {
     state.buildType = allowed[0] || "Debug";
@@ -961,13 +998,27 @@ async function init() {
   els.resetBtn.addEventListener("click", () => { loadExample(state.exampleId, { discardDraft: true }); runConfigure(); });
   els.shareBtn?.addEventListener("click", () => {
     state.files[state.activeFile] = els.textarea.value;
-    const shareUrl = buildShareUrl(true);
+    const share = buildShareResult(true);
+    if (share.codeTooLarge) {
+      const labelNode = els.shareBtn.querySelector("[data-copy-label]");
+      const setLabel = (v) => { if (labelNode) labelNode.textContent = v; else els.shareBtn.textContent = v; };
+      setLabel("Too large");
+      els.shareBtn.classList.remove("is-copied");
+      clearTimeout(els.shareBtn._copyTimer);
+      els.shareBtn._copyTimer = setTimeout(() => setLabel("Share"), 2400);
+      const limit = MAX_SHARE_HASH_CHARS.toLocaleString("en-US");
+      const actual = share.encodedLength ? `${share.encodedLength.toLocaleString("en-US")} / ${limit}` : `>${limit}`;
+      els.runStatus.textContent = `Share link exceeds ${limit}-char URL limit (${actual} encoded chars); edits were not copied.`;
+      els.runStatus.classList.add("st-fail");
+      els.runStatus.classList.remove("st-pass");
+      return;
+    }
     try {
-      const parsed = new URL(shareUrl);
+      const parsed = new URL(share.url);
       shareHashMatchesCurrent = parsed.hash.startsWith("#code=");
       history.replaceState(null, "", `${parsed.pathname}${parsed.search}${parsed.hash}`);
     } catch (_) {}
-    copyWithFeedback(els.shareBtn, shareUrl, "Share");
+    copyWithFeedback(els.shareBtn, share.url, "Share");
   });
   els.runBtn.addEventListener("click", runConfigure);
   initRovingGroup(els.fileTabs, "[data-file-tab]", (b) => {
@@ -996,6 +1047,7 @@ async function init() {
   els.textarea.addEventListener("input", () => {
     shareHashMatchesCurrent = false;
     state.files[state.activeFile] = els.textarea.value;
+    if (state.activeFile === "CMakePresets.json") syncConfigOptions();
     saveCurrentDraft();
     renderFileTabs();
     syncEditor();
