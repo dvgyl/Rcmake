@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use core::time::Duration;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{
-    CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, GracefulTimeout, Host, HostResult,
-    Metadata, RunOutput, RunRequest, Stream, WriteMode,
+    CopyOptions, DirEntry, FileLockGuard, FileTime, Follow, GracefulTimeout, Host, HostError,
+    HostResult, Metadata, RunOutput, RunRequest, Stream, WriteMode,
 };
 
 /// Counts of cache operations since the adapter was created.
@@ -37,6 +37,46 @@ struct Queries {
     canonical: Option<HostResult<PathBuf>>,
 }
 
+const MAX_DIRECTORY_NAMES: usize = 4096;
+const MAX_DIRECTORY_BYTES: usize = 1024 * 1024;
+const LIST_AFTER_MISSES: u8 = 8;
+
+struct DirFacts {
+    folded: HashSet<Box<[u8]>>,
+    max_name_len: usize,
+    missing: HostError,
+}
+
+impl DirFacts {
+    fn absent(&self, name: &[u8]) -> bool {
+        name.len() <= self.max_name_len
+            && if name.iter().any(u8::is_ascii_uppercase) {
+                !self.folded.contains(name.to_ascii_lowercase().as_slice())
+            } else {
+                !self.folded.contains(name)
+            }
+    }
+
+    fn missing(&self, path: &Path) -> HostError {
+        HostError {
+            path: Some(path.to_owned()),
+            ..self.missing.clone()
+        }
+    }
+}
+
+fn negative_leaf(path: &Path) -> Option<(&Path, &[u8])> {
+    if !cfg!(unix) || !path.is_absolute() {
+        return None;
+    }
+    let raw = path.as_os_str().as_encoded_bytes();
+    if raw.len() >= 1024 || raw.ends_with(b"/") || raw.ends_with(b"/.") || raw.ends_with(b"/..") {
+        return None;
+    }
+    let name = path.file_name()?.as_encoded_bytes();
+    (name.is_ascii() && !name.contains(&0)).then_some((path.parent()?, name))
+}
+
 #[derive(Default)]
 struct Cache {
     // Keep exact spelling. A trailing separator can change the result.
@@ -46,6 +86,9 @@ struct Cache {
     generation: u64,
     active_changes: usize,
     tracked: BTreeMap<PathBuf, u64>,
+    directory_facts: BTreeMap<OsString, DirFacts>,
+    directory_misses: BTreeMap<OsString, u8>,
+    directory_bytes: usize,
 }
 
 fn path_bytes(path: &Path) -> usize {
@@ -152,6 +195,100 @@ impl<H: Host + ?Sized> MemoHost<H> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn record_directory_miss(
+        &self,
+        cache: &mut Cache,
+        parent: &Path,
+        path: &Path,
+        error: &HostError,
+    ) {
+        if error.kind != ErrorKind::NotFound
+            || cache.directory_facts.contains_key(parent.as_os_str())
+            || cache.directory_bytes >= MAX_DIRECTORY_BYTES
+        {
+            return;
+        }
+        let expected = crate::error::SyntheticError::NotFound.at(Some(path));
+        if *error != expected {
+            return;
+        }
+        if cache.directory_misses.len() >= MAX_CACHE_ENTRIES {
+            return;
+        }
+        let count = cache
+            .directory_misses
+            .entry(parent.as_os_str().to_owned())
+            .or_default();
+        *count = count.saturating_add(1);
+        if *count != LIST_AFTER_MISSES {
+            return;
+        }
+        let Some((facts, bytes)) = self.directory_facts(cache, parent, expected) else {
+            return;
+        };
+        if bytes <= MAX_DIRECTORY_BYTES - cache.directory_bytes {
+            cache.directory_bytes += bytes;
+            cache
+                .directory_facts
+                .insert(parent.as_os_str().to_owned(), facts);
+        }
+    }
+
+    fn directory_facts(
+        &self,
+        cache: &Cache,
+        parent: &Path,
+        mut missing: HostError,
+    ) -> Option<(DirFacts, usize)> {
+        let resolved = self.base.canonicalize(parent).ok()?;
+        // These filesystems can expose names that are absent from a listing.
+        if ["/proc", "/dev", "/sys"]
+            .iter()
+            .any(|prefix| resolved.starts_with(prefix))
+        {
+            return None;
+        }
+        let listing;
+        let entries = if let Some(cached) = cache
+            .paths
+            .get(parent.as_os_str())
+            .and_then(|q| q.entries.as_ref())
+        {
+            cached.as_ref().ok()?
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            listing = self.base.read_dir(parent).ok()?;
+            &listing
+        };
+        if entries.len() > MAX_DIRECTORY_NAMES || entries.iter().any(|entry| !entry.name.is_ascii())
+        {
+            return None;
+        }
+        let bytes = listing_bytes(entries)
+            .saturating_add(path_bytes(parent))
+            .saturating_add(size_of::<DirFacts>());
+        // Use an observed length or the minimum filename length that POSIX supports.
+        let max_name_len = entries
+            .iter()
+            .map(|entry| entry.name.len())
+            .max()
+            .unwrap_or(14)
+            .max(14);
+        let folded = entries
+            .iter()
+            .map(|entry| entry.name.to_ascii_lowercase().into_boxed_slice())
+            .collect();
+        missing.path = None;
+        Some((
+            DirFacts {
+                folded,
+                max_name_len,
+                missing,
+            },
+            bytes,
+        ))
+    }
+
     fn lookup<T: Clone>(
         &self,
         p: &Path,
@@ -159,9 +296,18 @@ impl<H: Host + ?Sized> MemoHost<H> {
         slot: impl FnOnce(&mut Queries) -> &mut Option<HostResult<T>>,
         retained_bytes: impl FnOnce(&T) -> usize,
         query: impl FnOnce() -> HostResult<T>,
+        listing_negatives: bool,
     ) -> HostResult<T> {
+        let negative = listing_negatives.then(|| negative_leaf(p)).flatten();
         let generation = {
             let cache = self.read_cache();
+            if let Some((parent, name)) = negative
+                && let Some(facts) = cache.directory_facts.get(parent.as_os_str())
+                && facts.absent(name)
+            {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Err(facts.missing(p));
+            }
             if let Some(entry) = cache.paths.get(p.as_os_str()).and_then(|q| get(q).as_ref()) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return entry.clone();
@@ -192,6 +338,9 @@ impl<H: Host + ?Sized> MemoHost<H> {
             && cache.entries < MAX_CACHE_ENTRIES
             && bytes <= MAX_CACHE_BYTES - cache.bytes
         {
+            if let (Some((parent, _)), Err(error)) = (negative, &result) {
+                self.record_directory_miss(&mut cache, parent, p, error);
+            }
             let queries = cache.paths.entry(p.as_os_str().to_owned()).or_default();
             let slot = slot(queries);
             if slot.is_none() {
@@ -228,6 +377,9 @@ impl<H: Host + ?Sized> MemoHost<H> {
         }
         cache.active_changes += 1;
         cache.paths.clear();
+        cache.directory_facts.clear();
+        cache.directory_misses.clear();
+        cache.directory_bytes = 0;
         cache.entries = 0;
         cache.bytes = 0;
         ActiveChange { host: self }
@@ -289,6 +441,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
             },
             |_| 0,
             || self.base.metadata(p, follow),
+            true,
         )
     }
 
@@ -304,6 +457,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
             |queries| &mut queries.entries,
             |entries| listing_bytes(entries),
             || self.base.read_dir(p),
+            false,
         )
     }
 
@@ -368,6 +522,7 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
             |queries| &mut queries.canonical,
             |path| path_bytes(path),
             || self.base.canonicalize(p),
+            true,
         )
     }
 
@@ -702,7 +857,7 @@ mod tests {
         assert_eq!(host.read_cache().entries, 0);
         assert_eq!(host.stats().misses, 2);
         for id in 0..=MAX_CACHE_ENTRIES {
-            let p = Path::new("/work").join(id.to_string());
+            let p = Path::new("/work").join(format!("é{id}"));
             assert!(host.metadata(&p, Follow::No).is_err());
         }
         assert_eq!(host.read_cache().entries, MAX_CACHE_ENTRIES);
@@ -858,5 +1013,48 @@ mod tests {
         assert_eq!(host.metadata(file, Follow::Yes)?.len, 6);
         assert_eq!(host.stats().invalidations, 3);
         Ok(())
+    }
+    #[test]
+    #[cfg(unix)]
+    fn directory_negatives_match_native_enoent_and_expire_on_create() -> HostResult<()> {
+        let base = Arc::new(crate::NativeHost::new()?);
+        let temp = tempfile::tempdir().map_err(|error| HostError::from_io(error, None))?;
+        let root = base.canonicalize(temp.path())?;
+        let present = root.join("KIND");
+        base.write(&present, b"exists", WriteMode::CreateNew)?;
+        let memo = MemoHost::from_shared(base.clone());
+        for n in 0..LIST_AFTER_MISSES {
+            let path = root.join(format!("missing{n}"));
+            assert_eq!(
+                memo.metadata(&path, Follow::No),
+                base.metadata(&path, Follow::No)
+            );
+        }
+        let missing = root.join("libsample");
+        let before = memo.stats();
+        assert_eq!(
+            memo.metadata(&missing, Follow::Yes),
+            base.metadata(&missing, Follow::Yes)
+        );
+        assert_eq!(
+            memo.metadata(&missing, Follow::No),
+            base.metadata(&missing, Follow::No)
+        );
+        assert_eq!(memo.canonicalize(&missing), base.canonicalize(&missing));
+        assert_eq!(memo.stats().hits, before.hits + 3);
+        assert_eq!(
+            memo.metadata(&root.join("kind"), Follow::Yes),
+            base.metadata(&root.join("kind"), Follow::Yes)
+        );
+        assert_eq!(memo.metadata(&present, Follow::No)?.len, 6);
+        memo.write(&missing, b"found", WriteMode::CreateNew)?;
+        assert_eq!(memo.metadata(&missing, Follow::Yes)?.len, 5);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn directory_negatives_are_disabled_on_windows() {
+        assert!(negative_leaf(Path::new("C:\\work\\missing")).is_none());
     }
 }
