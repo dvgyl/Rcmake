@@ -282,22 +282,37 @@ fn preset_source(host: &dyn Host, dir: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| dir.to_path_buf())
 }
 
-fn resolve_preset(host: &dyn Host, opts: &Options, name: &[u8]) -> Result<ResolvedPreset, i32> {
+fn resolve_preset(
+    host: &dyn Host,
+    persona: crate::persona::Persona,
+    opts: &Options,
+    name: &[u8],
+) -> Result<ResolvedPreset, i32> {
     let custom = opts.presets_file.as_deref();
     if opts.dir.is_none() {
-        return presets::resolve_for_mode(host, PresetKind::Build, name, custom);
+        return presets::resolve_for_mode(host, persona, PresetKind::Build, name, custom);
     }
     let source = preset_source(host, opts.dir.as_deref());
     let presets = presets::load(host, &source, custom)?;
+    let env = EnvSnapshot::from_host(host);
     presets
-        .resolve(PresetKind::Build, name, &EnvSnapshot::from_host(host))
+        .resolve(PresetKind::Build, name, &env)
         .map_err(|error| {
+            let missing = error.message.starts_with("No such ");
             crate::emit_cli_error(host, error.message);
+            if missing {
+                presets::suggest_preset(host, persona, &presets, &env, PresetKind::Build, name);
+            }
             1
         })
 }
 
-pub(crate) fn run(argv: &[BString], args: &[BString], host: &dyn Host) -> i32 {
+pub(crate) fn run(
+    argv: &[BString],
+    args: &[BString],
+    persona: crate::persona::Persona,
+    host: &dyn Host,
+) -> i32 {
     let mut opts = match parse(host, args) {
         Ok(opts) => opts,
         Err(message) => return usage(host, &message),
@@ -321,7 +336,7 @@ pub(crate) fn run(argv: &[BString], args: &[BString], host: &dyn Host) -> i32 {
         }
     }
     if let Some(name) = &opts.preset {
-        let preset = match resolve_preset(host, &opts, name) {
+        let preset = match resolve_preset(host, persona, &opts, name) {
             Ok(preset) => preset,
             Err(code) => return code,
         };

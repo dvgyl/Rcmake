@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rcmake_base::{BString, list};
 use rcmake_diag::{Diagnostic, Effect, Location, MessageKind, SourceMap};
 use rcmake_eval::{
-    BuiltinFn, CmdError, IncludeOptions, Interp, InterpConfig, Registry, RunMode, StopReason,
+    BuiltinFn, CmdError, Cx, IncludeOptions, Interp, InterpConfig, Registry, RunMode, StopReason,
 };
 use rcmake_genex::ConfigId;
-use rcmake_host::{FileKind, Follow, Host, path};
+use rcmake_host::{FileKind, Follow, Host, no_process::NoProcessHost, path};
 use rcmake_model::{
     Cache, CacheEntry, CacheType, DirId, GeneratorKind, GeneratorSpec, ProjectModel,
 };
@@ -135,10 +135,20 @@ impl PreparedConfigure {
             services,
         };
         let mut interp = Interp::new(config.clone(), register);
+        let denial_tracker = prepared.denial_adapter().map(|adapter| {
+            let tracker = Arc::new(ProcessDenialTracker::new(adapter));
+            interp.add_session_data(Arc::clone(&tracker));
+            tracker
+        });
         runtime.attach(&mut interp);
         seed_cache(&mut interp, prepared);
-        let (preload_diagnostics, preload_sources) =
-            run_preloads(runtime, &mut interp, prepared, &config)?;
+        let (preload_diagnostics, preload_sources) = run_preloads(
+            runtime,
+            &mut interp,
+            prepared,
+            &config,
+            denial_tracker.as_ref(),
+        )?;
         initialize(&mut interp, prepared, generator);
         set_directory_vars(&mut interp, prepared);
         if let Some(toolchain) = toolchain_file(&mut interp, prepared, host.as_ref()) {
@@ -153,6 +163,10 @@ impl PreparedConfigure {
         } else {
             runtime.run(&mut interp, &[]).exit_code
         };
+        if let Some(tracker) = denial_tracker {
+            let (module_denials, project_sites) = tracker.take();
+            prepared.record_denial_attribution(module_denials, project_sites);
+        }
         let stop = interp.stop_reason();
         let mut sources = if prepared.wants_index() || prepared.services.collect_annotations {
             interp.take_diagnostic_sources()
@@ -263,7 +277,79 @@ fn partial(cancelled: bool) -> CompletionState {
         denied_processes: Vec::new(),
         omitted_denials: 0,
         omitted_denial_bytes: 0,
+        module_denials: 0,
+        project_denial_sites: Vec::new(),
         cancelled,
+    }
+}
+
+#[derive(Default)]
+struct TrackedDenials {
+    confirmed_cached_denials: usize,
+    project_sites: Vec<(BString, u32)>,
+}
+
+struct ProcessDenialTracker {
+    adapter: Arc<NoProcessHost<dyn Host>>,
+    state: Mutex<TrackedDenials>,
+}
+
+impl ProcessDenialTracker {
+    fn new(adapter: Arc<NoProcessHost<dyn Host>>) -> Self {
+        Self {
+            adapter,
+            state: Mutex::default(),
+        }
+    }
+
+    fn total_denied(&self) -> usize {
+        self.adapter.total_denied()
+    }
+
+    fn record_command_denial(
+        &self,
+        file: &[u8],
+        line: u32,
+        count: usize,
+        confirmed_cached_reuse: bool,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if confirmed_cached_reuse {
+            state.confirmed_cached_denials = state.confirmed_cached_denials.saturating_add(count);
+        } else if !file.is_empty() && state.project_sites.len() < 128 {
+            state.project_sites.push((BString::from(file), line));
+        }
+    }
+
+    fn take(&self) -> (usize, Vec<(BString, u32)>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let confirmed = state.confirmed_cached_denials;
+        let sites = std::mem::take(&mut state.project_sites);
+        (confirmed, sites)
+    }
+}
+
+fn record_denied_command(
+    cx: &Cx<'_>,
+    tracker: Option<&Arc<ProcessDenialTracker>>,
+    before: Option<usize>,
+) {
+    if let (Some(tracker), Some(before)) = (tracker, before) {
+        let added = tracker.total_denied().saturating_sub(before);
+        if added > 0
+            && let Some(top) = cx.backtrace().top()
+        {
+            tracker.record_command_denial(&top.file, top.line, added, false);
+        }
     }
 }
 
@@ -376,6 +462,153 @@ fn register(registry: &mut Registry) {
             flags,
         );
     }
+    static EXECUTE_PROCESS: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((command, flags)) = registry.get(b"execute_process") {
+        EXECUTE_PROCESS.get_or_init(|| command);
+        registry.add(
+            "execute_process",
+            |cx, args| {
+                let tracker = cx.session_data::<Arc<ProcessDenialTracker>>().cloned();
+                let before = tracker.as_ref().map(|t| t.total_denied());
+                let result = EXECUTE_PROCESS.get().ok_or(CmdError::Reported)?(cx, args);
+                record_denied_command(cx, tracker.as_ref(), before);
+                result
+            },
+            flags,
+        );
+    }
+    static EXEC_PROGRAM: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((command, flags)) = registry.get(b"exec_program") {
+        EXEC_PROGRAM.get_or_init(|| command);
+        registry.add(
+            "exec_program",
+            |cx, args| {
+                let tracker = cx.session_data::<Arc<ProcessDenialTracker>>().cloned();
+                let before = tracker.as_ref().map(|t| t.total_denied());
+                let result = EXEC_PROGRAM.get().ok_or(CmdError::Reported)?(cx, args);
+                record_denied_command(cx, tracker.as_ref(), before);
+                result
+            },
+            flags,
+        );
+    }
+    static TRY_COMPILE: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((command, flags)) = registry.get(b"try_compile") {
+        TRY_COMPILE.get_or_init(|| command);
+        registry.add(
+            "try_compile",
+            |cx, args| {
+                let tracker = cx.session_data::<Arc<ProcessDenialTracker>>().cloned();
+                let before = tracker.as_ref().map(|t| t.total_denied());
+                let result = TRY_COMPILE.get().ok_or(CmdError::Reported)?(cx, args);
+                record_denied_command(cx, tracker.as_ref(), before);
+                result
+            },
+            flags,
+        );
+    }
+    static TRY_RUN: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((command, flags)) = registry.get(b"try_run") {
+        TRY_RUN.get_or_init(|| command);
+        registry.add(
+            "try_run",
+            |cx, args| {
+                let tracker = cx.session_data::<Arc<ProcessDenialTracker>>().cloned();
+                let before = tracker.as_ref().map(|t| t.total_denied());
+                let result = TRY_RUN.get().ok_or(CmdError::Reported)?(cx, args);
+                record_denied_command(cx, tracker.as_ref(), before);
+                result
+            },
+            flags,
+        );
+    }
+    static FILE_CMD: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((command, flags)) = registry.get(b"file") {
+        FILE_CMD.get_or_init(|| command);
+        registry.add(
+            "file",
+            |cx, args| {
+                let tracker = cx.session_data::<Arc<ProcessDenialTracker>>().cloned();
+                let before = tracker.as_ref().map(|t| t.total_denied());
+                let result = FILE_CMD.get().ok_or(CmdError::Reported)?(cx, args);
+                record_denied_command(cx, tracker.as_ref(), before);
+                result
+            },
+            flags,
+        );
+    }
+    static SET: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((command, flags)) = registry.get(b"set") {
+        SET.get_or_init(|| command);
+        registry.add(
+            "set",
+            |cx, args| {
+                let existing = cache_declare_name(args.iter().map(|arg| arg.value.as_slice()))
+                    .and_then(|name| {
+                        cx.cache()
+                            .get(name)
+                            .filter(|entry| entry.ty != CacheType::Uninitialized)
+                            .map(|_| BString::from(name))
+                    });
+                let result = SET.get().ok_or(CmdError::Reported)?(cx, args);
+                if result.is_ok()
+                    && let Some(name) = existing
+                {
+                    cx.record_cache_declare(&name);
+                }
+                result
+            },
+            flags,
+        );
+    }
+    static OPTION_CMD: OnceLock<BuiltinFn> = OnceLock::new();
+    if let Some((command, flags)) = registry.get(b"option") {
+        OPTION_CMD.get_or_init(|| command);
+        registry.add(
+            "option",
+            |cx, args| {
+                let existing = args.first().and_then(|name| {
+                    cx.cache()
+                        .get(&name.value)
+                        .filter(|entry| entry.ty != CacheType::Uninitialized)
+                        .map(|_| name.value.clone())
+                });
+                let result = OPTION_CMD.get().ok_or(CmdError::Reported)?(cx, args);
+                if result.is_ok()
+                    && let Some(name) = existing
+                {
+                    cx.record_cache_declare(&name);
+                }
+                result
+            },
+            flags,
+        );
+    }
+}
+
+fn cache_declare_name<'a>(
+    args: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
+) -> Option<&'a [u8]> {
+    let mut iter = args.clone();
+    let first = iter.next()?;
+    if let Some(inner) = first
+        .strip_prefix(b"CACHE{")
+        .and_then(|rest| rest.strip_suffix(b"}"))
+    {
+        let has_force = iter
+            .take_while(|arg| *arg != b"VALUE")
+            .any(|arg| arg == b"FORCE");
+        return (!has_force).then_some(inner);
+    }
+    let len = args.len();
+    if len < 4 || args.clone().last().is_some_and(|arg| arg == b"FORCE") {
+        return None;
+    }
+    let cache_pos = len.checked_sub(3)?;
+    args.into_iter()
+        .nth(cache_pos)
+        .filter(|arg| *arg == b"CACHE")
+        .map(|_| first)
 }
 
 fn seed_cache(interp: &mut Interp, prepared: &PreparedConfigure) {
@@ -427,6 +660,7 @@ fn run_preloads(
     interp: &mut Interp,
     prepared: &PreparedConfigure,
     config: &InterpConfig,
+    denial_tracker: Option<&Arc<ProcessDenialTracker>>,
 ) -> Result<(Vec<Diagnostic>, SourceMap), ApiError> {
     let mut diagnostics = Vec::new();
     let mut sources = SourceMap::default();
@@ -438,6 +672,9 @@ fn run_preloads(
             continue;
         }
         let mut preload = Interp::new(config.clone(), register);
+        if let Some(tracker) = denial_tracker {
+            preload.add_session_data(Arc::clone(tracker));
+        }
         runtime.attach(&mut preload);
         set_directory_vars(&mut preload, prepared);
         *preload.cx().cache() = std::mem::take(interp.cx().cache());

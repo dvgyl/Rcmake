@@ -105,20 +105,55 @@ fn read(host: &dyn Host, src: &Path, custom: Option<&Path>) -> Result<Presets, S
     })
 }
 
+pub(crate) fn suggest_preset(
+    host: &dyn Host,
+    persona: crate::persona::Persona,
+    presets: &Presets,
+    env: &EnvSnapshot,
+    kind: PresetKind,
+    name: &[u8],
+) {
+    if persona != crate::persona::Persona::Native {
+        return;
+    }
+    let available: Vec<&[u8]> = presets
+        .list_defined(kind)
+        .filter(|preset| unavailable(presets, env, kind, &preset.name).is_none())
+        .map(|preset| preset.name.as_slice())
+        .collect();
+    if let Some((best, _)) = rcmake_diag::suggest::suggest_candidates_in(
+        rcmake_diag::suggest::Namespace::Query,
+        name,
+        available,
+    )
+    .into_iter()
+    .next()
+    {
+        host.write_out(
+            Stream::Stderr,
+            format!("Did you mean \"{best}\"?\n").as_bytes(),
+        );
+    }
+}
+
 pub(crate) fn resolve_for_mode(
     host: &dyn Host,
+    persona: crate::persona::Persona,
     kind: PresetKind,
     name: &[u8],
     custom: Option<&Path>,
 ) -> Result<ResolvedPreset, i32> {
     let cwd = host.initial_cwd();
     let presets = load(host, &cwd, custom)?;
-    presets
-        .resolve(kind, name, &EnvSnapshot::from_host(host))
-        .map_err(|err| {
-            emit_cli_error(host, err.message);
-            1
-        })
+    let env = EnvSnapshot::from_host(host);
+    presets.resolve(kind, name, &env).map_err(|err| {
+        let missing = err.message.starts_with("No such ");
+        emit_cli_error(host, err.message);
+        if missing {
+            suggest_preset(host, persona, &presets, &env, kind, name);
+        }
+        1
+    })
 }
 
 pub(crate) fn list(host: &dyn Host, src: &Path, custom: Option<&Path>, listing: Listing) -> i32 {
@@ -384,6 +419,16 @@ pub(crate) fn apply(host: &dyn Host, src: &Path, opts: &mut Options) -> Result<A
             };
             if let Some(reason) = reason {
                 emit_cli_error(host, format!("{reason} in {}: \"{name}\"", src.display()));
+                if reason == "No such configure preset" {
+                    suggest_preset(
+                        host,
+                        opts.persona,
+                        &presets,
+                        &env,
+                        PresetKind::Configure,
+                        name,
+                    );
+                }
                 print_list(
                     host,
                     &presets,

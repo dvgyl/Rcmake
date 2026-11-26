@@ -11,25 +11,36 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use rcmake_host::{CommandSpec, Host, HostResult, Input, Output, RunOutput, RunRequest};
+use rcmake_host::{CommandSpec, Host, Input, Output, RunRequest};
+use rcmake_store::Digest;
 
-use super::{PlatformQueries, Query, launch, query};
+use super::{ObservedLaunch, PlatformQueries, Query, launch_observed, query};
 
-type Started = (Query, JoinHandle<HostResult<RunOutput>>);
+type Started = (Query, JoinHandle<ObservedLaunch>);
 
 /// Queries that started before the platform modules reached them.
 #[derive(Default)]
 pub(super) struct Prefetched(Mutex<Vec<Started>>);
 
 impl Prefetched {
-    /// Wait for a started query with the same key.
-    pub(super) fn take(&self, key: &Query) -> Option<HostResult<RunOutput>> {
+    /// Wait for a started query with the same key and matching executable digest.
+    pub(super) fn take(&self, key: &Query, expected_program: Digest) -> Option<ObservedLaunch> {
         let handle = {
             let mut pending = self.0.lock().ok()?;
             let index = pending.iter().position(|(started, _)| started == key)?;
             pending.swap_remove(index).1
         };
-        handle.join().ok()
+        handle
+            .join()
+            .ok()
+            .filter(|observed| observed.program_digest == Some(expected_program))
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn push_completed(&self, key: Query, observed: ObservedLaunch) {
+        if let Ok(mut pending) = self.0.lock() {
+            pending.push((key, std::thread::spawn(move || observed)));
+        }
     }
 }
 
@@ -78,7 +89,7 @@ impl PlatformQueries {
             let started = key.clone();
             if let Ok(handle) = std::thread::Builder::new()
                 .name("rcmake-platform-query".into())
-                .spawn(move || launch(worker.as_ref(), &started, &request))
+                .spawn(move || launch_observed(worker.as_ref(), &started, &request))
             {
                 pending.push((key, handle));
             }

@@ -49,9 +49,24 @@ impl Interp {
         line: u32,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        let audit = self
+            .session_data::<crate::hermetic::HermeticContext>()
+            .cloned();
+        let _audit_site = audit.as_ref().zip(bt.top()).map(|(audit, frame)| {
+            audit.enter(crate::hermetic::HermeticSite::new(
+                &rcmake_host::path::to_native(&frame.file),
+                line,
+            ))
+        });
         let saved = core::mem::replace(&mut self.bt, bt);
         let saved_line = core::mem::replace(&mut self.cur_line, line);
         let r = f(self);
+        if audit
+            .as_ref()
+            .is_some_and(crate::hermetic::HermeticContext::denied)
+        {
+            self.fatal = true;
+        }
         self.cur_line = saved_line;
         self.bt = saved;
         r

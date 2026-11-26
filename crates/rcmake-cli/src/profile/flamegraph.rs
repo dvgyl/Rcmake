@@ -10,6 +10,14 @@ use super::{Coverage, ProfileKind, Site, Span};
 
 const MAX_HTML_FRAMES: usize = 32_768;
 
+/// Factual summary metadata embedded in `flamegraph.html`.
+pub(super) struct HtmlSummary {
+    pub(super) project: Option<String>,
+    pub(super) wall: Duration,
+    pub(super) commands: u64,
+    pub(super) top_self: Vec<(String, Duration, u64)>,
+}
+
 /// Aggregated call paths with wall-clock coverage at the root.
 pub(super) struct Graph<'a> {
     nodes: Vec<Node<'a>>,
@@ -158,7 +166,7 @@ impl<'a> Graph<'a> {
             loop {
                 // Use a zero-weight row so folded-stack readers can parse the whole file.
                 let note = format!(
-                    "[Rcmake omitted {dropped_samples} samples and {omitted} folded paths] 0\n"
+                    "[rcmake omitted {dropped_samples} samples and {omitted} folded paths] 0\n"
                 );
                 if note.len() > limit {
                     break;
@@ -178,7 +186,12 @@ impl<'a> Graph<'a> {
     /// Write a self-contained HTML report within the byte and frame budgets.
     ///
     /// Return the output and the number of graph frames omitted by either budget.
-    pub(super) fn html(&self, limit: usize, dropped_samples: usize) -> (String, usize) {
+    pub(super) fn html(
+        &self,
+        limit: usize,
+        dropped_samples: usize,
+        summary: Option<&HtmlSummary>,
+    ) -> (String, usize) {
         let frames = self.nodes.len().saturating_sub(1);
         let footer =
             |omitted| format!("],\"omitted\":{omitted},\"dropped\":{dropped_samples}}}</script>\n");
@@ -189,14 +202,37 @@ impl<'a> Graph<'a> {
         };
         let _ = write!(
             out,
-            "{{\"coverage\":{},\"childrenTime\":{},\"overlap\":{},\"frames\":[",
+            "{{\"coverage\":{},\"childrenTime\":{},\"overlap\":{},",
             root.coverage.elapsed.as_nanos(),
             root.children_time.as_nanos(),
             self.overlapping_siblings
         );
+        if let Some(summary) = summary {
+            out.push_str("\"summary\":{\"project\":");
+            match &summary.project {
+                Some(project) => write_script_string(&mut out, project),
+                None => out.push_str("null"),
+            }
+            let _ = write!(
+                out,
+                ",\"wall\":{},\"commands\":{},\"topSelf\":[",
+                summary.wall.as_nanos(),
+                summary.commands,
+            );
+            for (idx, (label, self_time, calls)) in summary.top_self.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                out.push('[');
+                write_script_string(&mut out, label);
+                let _ = write!(out, ",{},{}]", self_time.as_nanos(), calls);
+            }
+            out.push_str("]},");
+        }
+        out.push_str("\"frames\":[");
         if out.len().saturating_add(suffix_bytes) > limit {
             let page = format!(
-                "<!doctype html><meta charset=utf-8><title>Rcmake profile</title>\n<p>The HTML size limit omitted {frames} graph frames. Recording omitted {dropped_samples} samples.</p>\n"
+                "<!doctype html><meta charset=utf-8><title>rcmake profile</title>\n<p>The HTML size limit omitted {frames} graph frames. Recording omitted {dropped_samples} samples.</p>\n"
             );
             return (
                 if page.len() <= limit {
@@ -330,97 +366,131 @@ fn write_script_string(out: &mut String, text: &str) {
 
 const HTML_START: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rcmake profile</title>
+<title>rcmake profile</title>
 <style>
 :root {
   color-scheme: light;
-  --page: #fff; --panel: #f4f7fa; --text: #172635; --subtle: #43566a; --line: #637489;
-  --accent: #0056a6; --bar: #bbd8ef; --dim: #e4e8ee;
-  font: 15px system-ui, sans-serif;
+  --page: #fff; --panel: #f4f7fa; --text: #172635; --subtle: #43566a; --line: #c7d1dc;
+  --accent: #0056a6; --bar: #bbd8ef; --dim: #e4e8ee; --dim-text: #5b6d80; --frame-text: #151e28;
+  --bar-phase: #a4dcb9; --bar-listfile: #d2c8f0; --bar-macro: #f3c198; --bar-function: #efd797;
+  font: 14px/1.4 system-ui, -apple-system, sans-serif;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]) {
     color-scheme: dark;
-    --page: #111820; --panel: #1c2834; --text: #e7eef8; --subtle: #bdc9d7; --line: #899bad;
-    --accent: #8fd1ff; --bar: #aecfe8; --dim: #d3dce6;
+    --page: #111820; --panel: #1a2430; --text: #e7eef8; --subtle: #9fb1c4; --line: #344456;
+    --accent: #8fd1ff; --bar: #2f4a63; --dim: #24303d; --dim-text: #8fa0b3; --frame-text: #e7eef8;
+    --bar-phase: #2f5e45; --bar-listfile: #4a3f73; --bar-macro: #6e4a2c; --bar-function: #6b5a2a;
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --page: #111820; --panel: #1c2834; --text: #e7eef8; --subtle: #bdc9d7; --line: #899bad;
-  --accent: #8fd1ff; --bar: #aecfe8; --dim: #d3dce6;
+  --page: #111820; --panel: #1a2430; --text: #e7eef8; --subtle: #9fb1c4; --line: #344456;
+  --accent: #8fd1ff; --bar: #2f4a63; --dim: #24303d; --dim-text: #8fa0b3; --frame-text: #e7eef8;
+  --bar-phase: #2f5e45; --bar-listfile: #4a3f73; --bar-macro: #6e4a2c; --bar-function: #6b5a2a;
 }
 body { margin: 0; color: var(--text); background: var(--page); }
-main { max-width: 1280px; margin: 0 auto; padding: clamp(12px, 3vw, 24px); }
-header, .controls, #breadcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-header { justify-content: space-between; }
-h1 { font-size: 1.6rem; margin: 0; }
-h2 { font-size: 1rem; margin: 0 0 6px; }
-.controls { margin: 12px 0 8px; }
-input, button, select { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 5px 8px; }
+main { max-width: 1280px; margin: 0 auto; padding: clamp(12px, 2.5vw, 22px); }
+header, .controls, #breadcrumbs, #legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+header { justify-content: space-between; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.title-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; }
+h1 { font-size: 1.35rem; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 0.92rem; font-weight: 600; margin: 0 0 8px; }
+#summary { margin: 0; color: var(--subtle); font-variant-numeric: tabular-nums; }
+#legend { list-style: none; padding: 0; margin: 10px 0 8px; gap: 6px 14px; font-size: 0.85rem; color: var(--subtle); }
+#legend li { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; border: 1px solid color-mix(in srgb, var(--line) 60%, transparent); }
+.swatch.phase { background: var(--bar-phase); }
+.swatch.listfile { background: var(--bar-listfile); }
+.swatch.builtin { background: var(--bar); }
+.swatch.function { background: var(--bar-function); }
+.swatch.macro { background: var(--bar-macro); }
+.controls { margin: 8px 0; }
+input, button, select { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 4px 8px; }
 input { width: min(16rem, 50vw); }
-button:disabled { opacity: .65; }
+button:disabled { opacity: .55; }
 button:not(:disabled), select { cursor: pointer; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-#breadcrumbs { margin: 8px 0; }
+#breadcrumbs { margin: 0; font-size: 0.9rem; }
 #breadcrumbs button { max-width: min(14rem, 70vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #breadcrumbs span, #details-path { overflow-wrap: anywhere; }
-.hint, #matches, #render-status { color: var(--subtle); }
-.hint { margin: 8px 0 12px; }
-.banner { padding: 8px 12px; border: 1px solid var(--line); border-radius: 5px; }
-#graph-wrap { overflow: auto; max-height: min(52vh, 450px); border: 1px solid var(--line); border-radius: 5px; }
+.status, #matches, #render-status { color: var(--subtle); font-size: 0.88rem; }
+.status { margin: 6px 0; }
+.banner { padding: 8px 12px; border: 1px solid var(--line); border-radius: 5px; margin: 10px 0; }
+#graph-wrap { overflow: auto; max-height: min(68vh, 640px); border: 1px solid var(--line); border-radius: 6px; background: var(--page); }
 #graph { display: block; width: 100%; }
 #graph:focus-visible { outline-offset: -2px; }
 .frame { cursor: pointer; }
 .frame rect { fill: var(--bar); }
-.phase rect { fill: #a4dcb9; }
-.listfile rect { fill: #d2c8f0; }
-.macro rect { fill: #f3c198; }
-.function rect { fill: #efd797; }
+.phase rect { fill: var(--bar-phase); }
+.listfile rect { fill: var(--bar-listfile); }
+.macro rect { fill: var(--bar-macro); }
+.function rect { fill: var(--bar-function); }
 .frame[data-search="dim"] rect { fill: var(--dim); }
 .frame[data-search="match"] rect { fill: #ffd66e; }
-.frame.active rect { stroke: #123c63; stroke-width: 2px; }
-.frame text { fill: #151e28; font: 12px system-ui, sans-serif; pointer-events: none; }
-#details { margin: 12px 0 0; padding: 12px; background: var(--panel); border-radius: 5px; }
-#details-path { margin: 0; }
+.frame.active rect { stroke: var(--accent); stroke-width: 2px; }
+.frame text { fill: var(--frame-text); font: 12px system-ui, -apple-system, sans-serif; pointer-events: none; }
+.frame[data-search="dim"] text { fill: var(--dim-text); }
+.frame[data-search="match"] text { fill: #151e28; }
+.panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; margin-top: 12px; }
+#details, #top-costs { padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+#details-path { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86rem; }
 dl { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 10px 0 0; }
-dt { color: var(--subtle); }
-dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; }
+dt { color: var(--subtle); font-size: 0.82rem; }
+dd { margin: 1px 0 0; font-variant-numeric: tabular-nums; font-weight: 500; }
+#top-self { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+#top-self th, #top-self td { padding: 4px 6px; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); text-align: left; }
+#top-self th:not(:first-child), #top-self td:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+#top-self td:first-child { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+#top-self tbody tr:last-child td { border-bottom: 0; }
 </style></head><body><main>
-<header><h1>Rcmake profile</h1><label>Theme <select id="theme">
+<header>
+<div class="title-row"><h1>rcmake profile</h1><p id="summary"></p></div>
+<label>Theme <select id="theme">
 <option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option>
-</select></label></header>
+</select></label>
+</header>
 <noscript><p>Enable JavaScript to view the graph.</p></noscript>
 <p id="omissions" class="banner" hidden></p>
 <p id="empty" hidden></p>
 <section id="profile" hidden>
+<ul id="legend" aria-label="Frame types">
+<li><span class="swatch phase"></span>Phase</li>
+<li><span class="swatch listfile"></span>List file</li>
+<li><span class="swatch builtin"></span>Built-in command</li>
+<li><span class="swatch function"></span>Function</li>
+<li><span class="swatch macro"></span>Macro</li>
+</ul>
 <div class="controls">
 <label>Search <input type="search" id="search" aria-keyshortcuts="/"></label>
-<button type="button" id="next" disabled>Next match</button>
+<button type="button" id="next" disabled>Next</button>
 <output id="matches" aria-live="polite"></output>
-</div>
-<div class="controls">
-<button type="button" id="up" disabled>Zoom out one level</button>
-<button type="button" id="reset" disabled>Reset zoom</button>
+<button type="button" id="up" disabled>Zoom out</button>
+<button type="button" id="reset" disabled>Reset</button>
 <nav id="breadcrumbs" aria-label="Zoom path"></nav>
 </div>
-<p class="hint" id="hint">Select a bar to zoom. Use the arrow keys to select a frame, Enter to zoom, and Esc to reset zoom. Press / to search all frames.</p>
-<p class="hint" id="overlap" hidden>Some frames overlap in time. The graph scales bars to fit within the parent bar. The detail panel shows measured times and percentages.</p>
+<p class="status" id="overlap" hidden>Overlapping frames scaled to parent width.</p>
 <div id="graph-wrap">
-<svg id="graph" tabindex="0" role="tree" aria-label="Profile flamegraph" aria-describedby="hint"></svg>
+<svg id="graph" tabindex="0" role="tree" aria-label="Profile flamegraph"></svg>
 </div>
-<p id="render-status" class="hint" hidden></p>
+<p id="render-status" class="status" hidden></p>
+<div class="panels">
 <section id="details" aria-labelledby="details-title">
 <h2 id="details-title">Selected frame</h2><p id="details-path"></p>
 <dl>
-<div><dt>Inclusive time</dt><dd id="inclusive"></dd></div>
-<div><dt>Self time</dt><dd id="self-time"></dd></div>
+<div><dt>Inclusive</dt><dd id="inclusive"></dd></div>
+<div><dt>Self</dt><dd id="self-time"></dd></div>
 <div><dt>Calls</dt><dd id="calls"></dd></div>
-<div><dt>Share of profile wall time</dt><dd id="root-percent"></dd></div>
-<div><dt>Share of zoomed frame time</dt><dd id="zoom-percent"></dd></div>
+<div><dt>% wall</dt><dd id="root-percent"></dd></div>
+<div><dt>% view</dt><dd id="zoom-percent"></dd></div>
 </dl>
-<p class="hint">Inclusive time combines overlapping call intervals. Self time adds each call's time outside its children.</p>
-</section></section>
+</section>
+<section id="top-costs" aria-labelledby="top-costs-title" hidden>
+<h2 id="top-costs-title">Top self time</h2>
+<table id="top-self"><thead><tr><th>Frame</th><th>Self time</th><th>Calls</th></tr></thead><tbody></tbody></table>
+</section>
+</div>
+</section>
 <script type="application/json" id="profile-data">"#;
 
 const HTML_END: &str = "</main></body></html>\n";
@@ -434,7 +504,39 @@ const SCRIPT: &str = r#"<script>
     else document.documentElement.dataset.theme = theme.value;
   });
 
-  const {coverage, childrenTime, overlap, frames, omitted, dropped} = JSON.parse(byId('profile-data').textContent);
+  function duration(ns) {
+    if (ns >= 1e9) return `${(ns / 1e9).toFixed(3)} s`;
+    if (ns >= 1e6) return `${(ns / 1e6).toFixed(3)} ms`;
+    if (ns >= 1e3) return `${(ns / 1e3).toFixed(3)} µs`;
+    return `${ns} ns`;
+  }
+
+  const data = JSON.parse(byId('profile-data').textContent);
+  const {coverage, childrenTime, overlap, frames, omitted, dropped, summary} = data;
+  if (summary) {
+    const parts = [];
+    if (summary.project) parts.push(summary.project);
+    parts.push(`${duration(summary.wall)} wall time`);
+    parts.push(`${summary.commands} commands`);
+    byId('summary').textContent = parts.join(' · ');
+    if (Array.isArray(summary.topSelf) && summary.topSelf.length) {
+      const tbody = byId('top-self').querySelector('tbody');
+      for (const [label, selfNs, count] of summary.topSelf) {
+        const tr = document.createElement('tr');
+        const tdLabel = document.createElement('td');
+        tdLabel.textContent = label;
+        const tdTime = document.createElement('td');
+        tdTime.textContent = duration(selfNs);
+        const tdCalls = document.createElement('td');
+        tdCalls.textContent = String(count);
+        tr.append(tdLabel, tdTime, tdCalls);
+        tbody.append(tr);
+      }
+      byId('top-costs').hidden = false;
+    }
+  } else if (coverage) {
+    byId('summary').textContent = `${duration(coverage)} wall time`;
+  }
   if (omitted || dropped) {
     const notes = [];
     if (dropped) notes.push(`Recording omitted ${dropped} samples.`);
@@ -522,15 +624,8 @@ const SCRIPT: &str = r#"<script>
       }
     }
     const height = Math.max(1, rows.length * ROW);
-    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-    svg.setAttribute('height', height);
-  }
-
-  function duration(ns) {
-    if (ns >= 1e9) return `${(ns / 1e9).toFixed(3)} s`;
-    if (ns >= 1e6) return `${(ns / 1e6).toFixed(3)} ms`;
-    if (ns >= 1e3) return `${(ns / 1e3).toFixed(3)} µs`;
-    return `${ns} ns`;
+    svg.setAttribute('viewBox', `-1 -1 ${width + 2} ${height + 2}`);
+    svg.setAttribute('height', height + 2);
   }
 
   function percent(time, total) {
@@ -571,17 +666,20 @@ const SCRIPT: &str = r#"<script>
     if (width >= 28) {
       const label = svgElement('svg', {width, height: ROW - 2, overflow: 'hidden'});
       const text = svgElement('text', {x: 5, y: 15});
-      const capacity = Math.floor((width - 10) / 8);
-      // Read only the ends of long labels. Keep the suffix of the basename visible.
-      const prefix = node.short.slice(0, capacity * 2 + 1);
-      const chars = Array.from(prefix);
-      if (chars.length <= capacity && prefix.length === node.short.length) {
-        text.textContent = prefix;
-      } else {
-        const head = Math.floor((capacity - 1) / 2);
-        const tail = capacity - head - 1;
-        const suffix = Array.from(node.short.slice(-tail * 2)).slice(-tail);
-        text.textContent = chars.slice(0, head).join('') + '…' + suffix.join('');
+      const capacity = Math.floor((width - 10) / 6.5);
+      if (capacity >= 2) {
+        const prefix = node.short.slice(0, capacity * 2 + 1);
+        const chars = Array.from(prefix);
+        if (chars.length <= capacity && prefix.length === node.short.length) {
+          text.textContent = prefix;
+        } else if (node.kind === 'listfile') {
+          const head = Math.floor((capacity - 1) / 2);
+          const tail = capacity - head - 1;
+          const suffix = Array.from(node.short.slice(-tail * 2)).slice(-tail);
+          text.textContent = chars.slice(0, head).join('') + '…' + suffix.join('');
+        } else {
+          text.textContent = chars.slice(0, capacity - 1).join('') + '…';
+        }
       }
       label.append(text);
       group.append(label);
@@ -837,7 +935,7 @@ mod tests {
         assert_eq!(omitted, 0);
 
         let (folded, omitted) = graph.folded(78, 2);
-        assert!(folded.starts_with("[Rcmake omitted 2 samples and 1 folded paths] 0\nroot 70\n"));
+        assert!(folded.starts_with("[rcmake omitted 2 samples and 1 folded paths] 0\nroot 70\n"));
         assert!(folded.len() <= 78);
         assert_eq!(omitted, 1);
     }
@@ -846,7 +944,7 @@ mod tests {
     fn encodes_script_terminators_and_control_characters_as_json_text() {
         let spans = [span(b"</script><img src=x>\"\x00'&\xff", 0, 80, 80, None)];
         let graph = Graph::from_spans(&spans, Duration::from_micros(80));
-        let (html, omitted) = graph.html(100_000, 0);
+        let (html, omitted) = graph.html(100_000, 0, None);
         assert_eq!(omitted, 0);
         assert_eq!(html.matches("</script>").count(), 2);
         assert!(html.contains(r#"\u003c/script\u003e\u003cimg src=x\u003e\"\u0000'\u0026�"#));

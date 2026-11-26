@@ -90,6 +90,7 @@ macro_rules! forward_host {
         $crate::forward_host!(@method $base, write_out(stream: $crate::Stream, bytes: &[u8]));
         $crate::forward_host!(@method $base, read_stdin(limit: u64) -> $crate::HostResult<Vec<u8>>);
         $crate::forward_host!(@method $base, is_terminal(stream: $crate::Stream) -> bool);
+        $crate::forward_host!(@method $base, terminal_width(stream: $crate::Stream) -> Option<usize>);
         $crate::forward_host!(@method $base, now() -> $crate::FileTime);
         $crate::forward_host!(@method $base, monotonic() -> ::core::time::Duration);
         $crate::forward_host!(@method $base, sleep(duration: ::core::time::Duration));

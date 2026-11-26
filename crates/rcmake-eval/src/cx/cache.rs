@@ -96,6 +96,20 @@ impl Cx<'_> {
         self.cache().insert(name, entry);
     }
 
+    /// Record a `set(... CACHE ...)` or `option(...)` declaration that kept an existing value.
+    pub fn record_cache_declare(&mut self, name: &[u8]) {
+        let value = self
+            .interp
+            .project
+            .cache
+            .get(name)
+            .map(|entry| entry.value.clone());
+        if let Some(value) = value {
+            self.interp
+                .record_var_write(name, crate::VarOp::CacheDeclare, Some(&value));
+        }
+    }
+
     /// Remove an existing cache entry and record the write if history is enabled.
     pub fn remove_cache_entry(&mut self, name: &[u8]) {
         if self.cache().get(name).is_some() {

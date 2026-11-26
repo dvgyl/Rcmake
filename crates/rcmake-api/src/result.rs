@@ -27,6 +27,10 @@ pub enum CompletionState {
         omitted_denials: usize,
         /// Total request bytes in the evicted records.
         omitted_denial_bytes: usize,
+        /// Number of denied subprocess requests confirmed to have reused a cached probe result.
+        module_denials: usize,
+        /// Call sites of denied subprocess requests attributed to project code.
+        project_denial_sites: Vec<(BString, u32)>,
         /// Whether the evaluator stopped because the caller cancelled it.
         cancelled: bool,
     },
@@ -183,9 +187,16 @@ pub(crate) fn infer_cache_location(
     })?;
     let event = ledger
         .history(name)
-        .rfind(|event| matches!(event.op, VarOp::CacheSet | VarOp::CacheUnset))?;
+        .rfind(|event| matches!(event.op, VarOp::CacheSet | VarOp::CacheUnset))
+        .or_else(|| {
+            ledger
+                .history(name)
+                .rfind(|event| event.op == VarOp::CacheDeclare)
+        })?;
     let preview = event.new_value.as_ref()?;
-    (event.op == VarOp::CacheSet && preview.len == value.len() && preview.prefix == value)
+    (matches!(event.op, VarOp::CacheSet | VarOp::CacheDeclare)
+        && preview.len == value.len()
+        && preview.prefix == value)
         .then(|| SourceLocation::from_backtrace(&event.backtrace))
         .flatten()
 }

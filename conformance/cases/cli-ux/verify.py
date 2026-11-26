@@ -57,7 +57,8 @@ def check_cli(native, oracle, source, root, env):
         ("cmake", "native"), *((name, "compat") for name in aliases)
     ], records
     assert b"rcmake explain" in run(native, "--help").stdout
-    assert b"Rcmake extensions" not in run(aliases["cmake"], "--help").stdout
+    assert b"rcmake extensions" in run(native, "--help").stdout
+    assert b"rcmake extensions" not in run(aliases["cmake"], "--help").stdout
 
     preload = root / "external-cache.cmake"
     preload.write_text("message(FATAL_ERROR [[Do not evaluate this file]])\n", encoding="utf-8")
@@ -90,7 +91,7 @@ def check_cli(native, oracle, source, root, env):
     )
     partial = run(native, "explain", "Demo::component", "-B", done, "--target", "--json")
     def denials(result):
-        count = re.search(rb"Rcmake denied ([0-9]+) subprocess", result.stderr)
+        count = re.search(rb"denied ([0-9]+) subprocess", result.stderr)
         return int(count.group(1)) if count else 0
 
     assert denials(partial) == denials(explained_target) + 1, partial

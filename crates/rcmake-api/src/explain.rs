@@ -9,7 +9,7 @@ use rcmake_diag::{
 use rcmake_eval::{ValuePreview, VarOp};
 use rcmake_model::{
     BT, CacheType, DirId, PropEvent, PropScope, Target, TargetBinding, TargetId, TargetKind,
-    UsageScope,
+    UsageField, UsageScope,
 };
 use rcmake_resolve::{ChainKind, LinkFragmentRole};
 
@@ -117,6 +117,14 @@ pub struct ExplainTarget {
 }
 
 impl ExplainTarget {
+    /// Return whether `name` matches one of this target's resolved configurations (ASCII case-insensitive).
+    #[must_use]
+    pub fn has_configuration(&self, name: &[u8]) -> bool {
+        self.configurations
+            .iter()
+            .any(|config| name.eq_ignore_ascii_case(&config.name))
+    }
+
     pub(crate) fn configurations_for(
         &self,
         requested: Option<&[u8]>,
@@ -240,9 +248,76 @@ impl ExplainEntry {
     }
 
     fn matches_filter(&self, filter: &[u8]) -> bool {
-        self.value.as_slice() == filter
+        if self.value.as_slice() == filter
             || self.spelling.as_ref().map(|value| value.as_slice()) == Some(filter)
+        {
+            return true;
+        }
+        if !self.is_flag_string() {
+            return false;
+        }
+        flag_tokens(&self.value)
+            .into_iter()
+            .any(|token| token.as_slice() == filter)
+            || self.spelling.as_ref().is_some_and(|spelling| {
+                flag_tokens(spelling)
+                    .into_iter()
+                    .any(|token| token.as_slice() == filter)
+            })
     }
+
+    fn is_flag_string(&self) -> bool {
+        matches!(
+            self.kind,
+            ChainKind::Usage(UsageField::CompileOptions | UsageField::LinkOptions)
+        ) || self
+            .input
+            .as_ref()
+            .is_some_and(|input| is_cmake_flags_var(&input.name))
+    }
+}
+
+fn is_cmake_flags_var(name: &[u8]) -> bool {
+    name.starts_with(b"CMAKE_")
+        && (name.ends_with(b"_FLAGS") || name.windows(7).any(|part| part == b"_FLAGS_"))
+}
+
+fn flag_tokens(input: &[u8]) -> Vec<BString> {
+    let mut tokens = Vec::new();
+    let mut current = Vec::new();
+    let mut in_token = false;
+    let mut in_quotes = false;
+    let mut i = 0;
+    while let Some(&byte) = input.get(i) {
+        i += 1;
+        if in_quotes {
+            match byte {
+                b'"' => in_quotes = false,
+                b'\\' if matches!(input.get(i), Some(b'"' | b'\\')) => {
+                    if let Some(&escaped) = input.get(i) {
+                        current.push(escaped);
+                        i += 1;
+                    }
+                }
+                _ => current.push(byte),
+            }
+        } else if byte == b'"' {
+            in_quotes = true;
+            in_token = true;
+        } else if byte.is_ascii_whitespace() {
+            if in_token {
+                tokens.push(BString::from(core::mem::take(&mut current)));
+                in_token = false;
+            }
+        } else {
+            current.push(byte);
+            in_token = true;
+        }
+    }
+    if in_token {
+        tokens.push(BString::from(current));
+    }
+    tokens
 }
 
 /// One link hop in a provenance chain.
@@ -417,12 +492,14 @@ impl ConfigureResult {
             .iter()
             .flat_map(|ledger| ledger.history(name))
             .any(|event| {
-                matches!(event.op, VarOp::CacheSet | VarOp::CacheUnset)
-                    || self
-                        .facts
-                        .variable_writes
-                        .get(&event.seq)
-                        .is_some_and(|details| details.binding_dir == Some(dir))
+                matches!(
+                    event.op,
+                    VarOp::CacheSet | VarOp::CacheDeclare | VarOp::CacheUnset
+                ) || self
+                    .facts
+                    .variable_writes
+                    .get(&event.seq)
+                    .is_some_and(|details| details.binding_dir == Some(dir))
             })
     }
 
@@ -458,11 +535,30 @@ impl ConfigureResult {
                     .insert(ExplainItemKind::Variable);
             }
         }
+        let mut ordered: Vec<BString> =
+            suggest_candidates_in(Namespace::Query, name, names.keys().copied())
+                .into_iter()
+                .map(|(candidate, _)| candidate)
+                .collect();
+        if name.len() >= 3 && ordered.len() < 3 {
+            for &candidate in names.keys() {
+                if ordered.len() >= 3 {
+                    break;
+                }
+                if candidate.starts_with(name)
+                    && !ordered
+                        .iter()
+                        .any(|existing| existing.as_slice() == candidate)
+                {
+                    ordered.push(BString::from(candidate));
+                }
+            }
+        }
         let mut suggestions = Vec::new();
-        for (name, _) in suggest_candidates_in(Namespace::Name, name, names.keys().copied()) {
-            if let Some(kinds) = names.get(name.as_slice()) {
+        for candidate in ordered {
+            if let Some(kinds) = names.get(candidate.as_slice()) {
                 suggestions.extend(kinds.iter().map(|&kind| ExplainSuggestion {
-                    name: name.clone(),
+                    name: candidate.clone(),
                     kind,
                 }));
             }
@@ -516,7 +612,10 @@ impl ConfigureResult {
                         .filter(|path| !path.is_empty()),
                     binding_directory,
                     in_queried_scope: binding_directory == Some(dir)
-                        && !matches!(event.op, VarOp::CacheSet | VarOp::CacheUnset),
+                        && !matches!(
+                            event.op,
+                            VarOp::CacheSet | VarOp::CacheDeclare | VarOp::CacheUnset
+                        ),
                     scope_depth: event.scope_depth,
                     scope_id: event.scope_id,
                     previous: match details.map(|details| &details.previous) {

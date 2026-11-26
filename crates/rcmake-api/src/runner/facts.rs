@@ -207,7 +207,9 @@ fn executed_binding(
     location.range?;
     let cached = matches!(
         event.op,
-        rcmake_eval::VarOp::CacheSet | rcmake_eval::VarOp::CacheUnset
+        rcmake_eval::VarOp::CacheSet
+            | rcmake_eval::VarOp::CacheDeclare
+            | rcmake_eval::VarOp::CacheUnset
     );
     let definition = match &event.new_value {
         Some(value) if value.len == value.prefix.len() => Some(VariableDefinition {
@@ -262,6 +264,20 @@ fn observe_binding(
             } else {
                 facts.cache_force.remove(name);
             }
+        }
+        VarOp::CacheDeclare
+            if model
+                .cache()
+                .get(name)
+                .is_some_and(|entry| matches(&entry.value)) =>
+        {
+            facts
+                .cache_sites
+                .entry(name.clone())
+                .or_insert_with(|| location.clone());
+            let (_, command) = command_at(parsed, location, Some(b"set"));
+            let force = command.and_then(cache_force).unwrap_or(false);
+            facts.cache_force.entry(name.clone()).or_insert(force);
         }
         VarOp::Set | VarOp::ParentScope | VarOp::Unset => {
             let Some(dir) = event.binding_dir else { return };

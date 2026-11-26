@@ -101,7 +101,7 @@ fn error(host: &dyn Host, message: &str) {
 }
 
 /// Run the workflow and return the exit code of the first step that fails.
-pub(crate) fn run(args: &[BString], host: Arc<dyn Host>) -> i32 {
+pub(crate) fn run(args: &[BString], persona: crate::persona::Persona, host: Arc<dyn Host>) -> i32 {
     let options = match Options::parse(args, host.as_ref()) {
         Ok(options) => options,
         Err(message) => {
@@ -133,6 +133,14 @@ pub(crate) fn run(args: &[BString], host: Arc<dyn Host>) -> i32 {
             host.as_ref(),
             &format!("No such workflow preset in {}: \"{name}\"", cwd.display()),
         );
+        presets::suggest_preset(
+            host.as_ref(),
+            persona,
+            &presets,
+            &env,
+            PresetKind::Workflow,
+            name,
+        );
         presets::print_list(
             host.as_ref(),
             &presets,
@@ -163,7 +171,7 @@ pub(crate) fn run(args: &[BString], host: Arc<dyn Host>) -> i32 {
             )
             .as_bytes(),
         );
-        exit = run_step(step, &options, &host, &env);
+        exit = run_step(step, &options, persona, &host, &env);
         if exit != 0 {
             error(
                 host.as_ref(),
@@ -223,6 +231,7 @@ fn validate(
 fn run_step(
     step: &WorkflowStep,
     options: &Options,
+    persona: crate::persona::Persona,
     host: &Arc<dyn Host>,
     env: &EnvSnapshot,
 ) -> i32 {
@@ -248,7 +257,7 @@ fn run_step(
             argv.push("cmake".into());
             argv.push("--build".into());
             argv.extend(args.iter().cloned());
-            crate::build::run(&argv, &args, host.as_ref())
+            crate::build::run(&argv, &args, persona, host.as_ref())
         }
         PresetKind::Test => {
             args.insert(0, "ctest".into());

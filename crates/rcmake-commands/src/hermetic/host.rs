@@ -17,6 +17,12 @@ use super::{HermeticHost, InputKind, require_allowed, transfer};
 
 impl Host for HermeticHost {
     fn metadata(&self, path: &Path, follow: Follow) -> HostResult<Metadata> {
+        if self.is_current_site_bundled()
+            && let Err(error) = self.inner.metadata(path, Follow::No)
+            && error.kind == std::io::ErrorKind::NotFound
+        {
+            return Err(error);
+        }
         let checked = self.guard_path(path)?;
         let path = if follow == Follow::Yes {
             checked.as_ref()
@@ -39,6 +45,12 @@ impl Host for HermeticHost {
     }
 
     fn read_dir(&self, path: &Path) -> HostResult<Vec<DirEntry>> {
+        if self.is_current_site_bundled()
+            && let Err(error) = self.inner.metadata(path, Follow::No)
+            && error.kind == std::io::ErrorKind::NotFound
+        {
+            return Err(error);
+        }
         self.inner.read_dir(&self.guard_path(path)?)
     }
 
@@ -121,8 +133,7 @@ impl Host for HermeticHost {
     }
 
     fn env_get(&self, key: &[u8]) -> Option<BString> {
-        let site = self.context.site();
-        if self.audit(|audit| audit.check_env(&site, key)) != AuditDecision::Allow {
+        if self.audit(|audit, site| audit.check_env(site, key)) != AuditDecision::Allow {
             return None;
         }
         self.state().inputs.env(key);
@@ -161,8 +172,7 @@ impl Host for HermeticHost {
         name: Option<&[u8]>,
         view: rcmake_host::RegistryView,
     ) -> HostResult<Option<BString>> {
-        let site = self.context.site();
-        let decision = self.audit(|audit| audit.check_registry(&site));
+        let decision = self.audit(|audit, site| audit.check_registry(site));
         require_allowed(decision, ViolationKind::RegistryRead)?;
         self.inner.registry_value(root, subkey, name, view)
     }
@@ -235,6 +245,10 @@ impl Host for HermeticHost {
         self.inner.is_terminal(stream)
     }
 
+    fn terminal_width(&self, stream: Stream) -> Option<usize> {
+        self.inner.terminal_width(stream)
+    }
+
     fn now(&self) -> FileTime {
         self.inner.now()
     }
@@ -304,12 +318,12 @@ impl HermeticHost {
                 &request.cwd,
                 &request.env,
             )?;
-            let decision =
-                self.audit(|audit| audit.check_process(self.inner.as_ref(), &site, &executable));
+            let decision = self
+                .audit(|audit, site| audit.check_process(self.inner.as_ref(), site, &executable));
             require_allowed(decision, ViolationKind::UnapprovedProcess)?;
-            if decision == AuditDecision::Allow {
+            if decision == AuditDecision::Allow || decision == AuditDecision::Warn {
                 self.state().inputs.path(InputKind::Program, &executable);
-                if self.mode == HermeticMode::Strict {
+                if self.mode == HermeticMode::Strict && executable.is_absolute() {
                     stage.program = path::from_native(&executable);
                 }
             }

@@ -662,12 +662,59 @@ fn help_shows_extensions_only_for_native_persona() {
         let host = Arc::new(PureHost::default());
         assert_eq!(invoke(&host, &[name, "--help"]), 0);
         let output = host.stream_bytes(Stream::Stdout);
-        let heading = b"Rcmake extensions";
+        let heading = b"rcmake extensions";
         assert_eq!(
             output.windows(heading.len()).any(|line| line == heading),
             native
         );
+        let usage = if native {
+            b"  rcmake [options]".as_slice()
+        } else {
+            b"  cmake [options]".as_slice()
+        };
+        assert!(output.windows(usage.len()).any(|line| line == usage));
     }
+}
+
+#[test]
+fn usage_errors_and_preset_typos_follow_persona() -> rcmake_host::HostResult<()> {
+    let host = Arc::new(PureHost::default());
+    assert_eq!(invoke(&host, &["rcmake", "--bogus"]), 1);
+    let native_err = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(native_err.contains("'rcmake --help'"), "{native_err}");
+    assert!(!native_err.contains("'cmake --help'"), "{native_err}");
+
+    let host = Arc::new(PureHost::default());
+    assert_eq!(invoke(&host, &["cmake", "--bogus"]), 1);
+    let compat_err = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(compat_err.contains("'cmake --help'"), "{compat_err}");
+    assert!(!compat_err.contains("'rcmake --help'"), "{compat_err}");
+
+    let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+    let presets = br#"{
+  "version": 3,
+  "configurePresets": [
+    {"name": "dev", "generator": "Ninja", "binaryDir": "build/dev"}
+  ]
+}"#;
+    for (argv0, expect_suggestion) in [("rcmake", true), ("cmake", false)] {
+        let host = Arc::new(PureHost::new(root.into(), root.join(argv0)));
+        let data = root.join("cmake-data");
+        host.seed_file(&data.join("Modules/CMakeDetermineSystem.cmake"), b"")?;
+        host.env_set(
+            b"RCMAKE_VENDORED_DATA_ROOT",
+            Some(data.to_string_lossy().as_bytes()),
+        );
+        host.seed_file(&root.join("CMakePresets.json"), presets)?;
+        assert_eq!(invoke(&host, &[argv0, "--preset", "devv"]), 1);
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert_eq!(
+            stderr.contains("Did you mean \"dev\"?"),
+            expect_suggestion,
+            "{argv0}: {stderr}"
+        );
+    }
+    Ok(())
 }
 
 #[test]

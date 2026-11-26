@@ -389,3 +389,50 @@ fn resolves_v13_presets_and_applies_cli_overrides() -> Result<(), String> {
     );
     Ok(())
 }
+
+#[test]
+fn help_lists_required_options_and_every_long_flag_is_accepted_by_parser() {
+    let host = std::sync::Arc::new(PureHost::default());
+    let argv = [BString::from("ctest"), BString::from("--help")];
+    assert_eq!(crate::main(&argv, host.clone()), 0);
+    let help =
+        String::from_utf8_lossy(&host.stream_bytes(rcmake_host::Stream::Stdout)).into_owned();
+    for required in [
+        "--tests-regex",
+        "--output-on-failure",
+        "--test-dir",
+        "--preset",
+        "-R",
+        "-E",
+        "-L",
+        "-j",
+        "--rerun-failed",
+    ] {
+        assert!(help.contains(required), "missing {required} in:\n{help}");
+    }
+    let mut long_flags = std::collections::BTreeSet::new();
+    for line in help.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('-') {
+            continue;
+        }
+        let lhs = trimmed.split('=').next().unwrap_or(trimmed);
+        for part in lhs.split(',') {
+            let token = part.split_whitespace().next().unwrap_or_default();
+            let flag = token.split(['=', '[']).next().unwrap_or_default().trim();
+            if flag.starts_with("--") && flag.len() > 2 {
+                long_flags.insert(flag.to_owned());
+            }
+        }
+    }
+    assert!(!long_flags.is_empty());
+    for flag in long_flags {
+        let result = parse_args(host.as_ref(), &[flag.as_str(), "dummy"]);
+        if let Err(err) = result {
+            assert!(
+                !err.contains("Unknown argument"),
+                "documented flag {flag} rejected as unknown: {err}"
+            );
+        }
+    }
+}

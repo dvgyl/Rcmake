@@ -1,6 +1,6 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jiff::tz::TimeZone;
@@ -341,6 +341,7 @@ impl ConfigureRequest {
             base: Arc::clone(&self.host),
             overlay,
             denied,
+            denial_attribution: Arc::new(Mutex::new((0, Vec::new()))),
             collect_index: self.collect_index,
         })
     }
@@ -372,10 +373,35 @@ pub struct PreparedConfigure {
     base: Arc<dyn Host>,
     overlay: Option<Arc<OverlayHost<dyn Host>>>,
     denied: Option<Arc<NoProcessHost<dyn Host>>>,
+    denial_attribution: DenialAttribution,
     collect_index: bool,
 }
 
+type DenialAttribution = Arc<Mutex<(usize, Vec<(BString, u32)>)>>;
+
 impl PreparedConfigure {
+    pub(crate) fn denial_adapter(&self) -> Option<Arc<NoProcessHost<dyn Host>>> {
+        self.denied.clone()
+    }
+
+    pub(crate) fn record_denial_attribution(
+        &self,
+        module_denials: usize,
+        project_sites: Vec<(BString, u32)>,
+    ) {
+        let mut guard = self
+            .denial_attribution
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.0 = guard.0.saturating_add(module_denials);
+        for site in project_sites {
+            if guard.1.len() >= 128 {
+                break;
+            }
+            guard.1.push(site);
+        }
+    }
+
     pub(crate) fn allows_persistence(&self) -> bool {
         cfg!(feature = "native") && self.overlay.is_none() && self.denied.is_none()
     }
@@ -445,12 +471,20 @@ impl PreparedConfigure {
     pub fn finish(self, mut result: ConfigureResult) -> ConfigureResult {
         if let Some(adapter) = self.denied {
             let log = adapter.take_denied();
+            let (recorded_module, recorded_sites) = std::mem::take(
+                &mut *self
+                    .denial_attribution
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
             if !log.commands.is_empty() || log.omitted_entries != 0 {
                 if matches!(result.completion, CompletionState::Complete) {
                     result.completion = CompletionState::Partial {
                         denied_processes: Vec::new(),
                         omitted_denials: 0,
                         omitted_denial_bytes: 0,
+                        module_denials: 0,
+                        project_denial_sites: Vec::new(),
                         cancelled: false,
                     };
                 }
@@ -458,12 +492,17 @@ impl PreparedConfigure {
                     denied_processes,
                     omitted_denials,
                     omitted_denial_bytes,
+                    module_denials,
+                    project_denial_sites,
                     ..
                 } = &mut result.completion
                 {
                     denied_processes.extend(log.commands);
                     *omitted_denials = omitted_denials.saturating_add(log.omitted_entries);
                     *omitted_denial_bytes = omitted_denial_bytes.saturating_add(log.omitted_bytes);
+                    let total = denied_processes.len().saturating_add(*omitted_denials);
+                    *module_denials = module_denials.saturating_add(recorded_module).min(total);
+                    project_denial_sites.extend(recorded_sites);
                 }
             }
         }
@@ -755,6 +794,10 @@ where
 
     fn is_terminal(&self, stream: Stream) -> bool {
         self.base.is_terminal(stream)
+    }
+
+    fn terminal_width(&self, stream: Stream) -> Option<usize> {
+        self.base.terminal_width(stream)
     }
 
     fn now(&self) -> FileTime {

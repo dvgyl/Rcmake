@@ -48,7 +48,7 @@ def _make_fake_archive(
     rcmake_script = (
         "#!/bin/sh\n"
         'if [ "$1" = "--version" ]; then\n'
-        f'  printf "cmake version 4.5.1\\nRcmake {version}\\n"\n'
+        f'  printf "cmake version 4.5.1\\nrcmake {version}\\n"\n'
         "  exit 0\n"
         "fi\n"
         f'printf "rcmake-fake {version} {extra_marker}\\n"\n'
@@ -427,7 +427,7 @@ class InstallShTests(unittest.TestCase):
                     timeout=15,
                 )
                 self.assertEqual(probe.returncode, 0, probe.stderr)
-                self.assertIn("Rcmake 0.1.0", probe.stdout)
+                self.assertIn("rcmake 0.1.0", probe.stdout)
 
                 # Uninstall removes both rcmake and the symlink rcmake-lsp cleanly.
                 res = self.run_install("--uninstall")

@@ -47,6 +47,8 @@ pub enum VarOp {
     Unset,
     /// Set a cache entry.
     CacheSet,
+    /// Declare an existing cache entry without replacing its cached value.
+    CacheDeclare,
     /// Remove a cache entry.
     CacheUnset,
     /// Set or unset a normal variable in the parent scope.

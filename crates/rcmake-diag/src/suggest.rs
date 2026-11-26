@@ -18,13 +18,15 @@ pub enum Namespace {
     Keyword,
     /// Other case-sensitive names, such as variables or targets.
     Name,
+    /// User-typed query names (such as `rcmake explain` or preset names). Case-sensitive.
+    Query,
 }
 
 impl Namespace {
     fn distance_limit(self, length: usize) -> usize {
         match (self, length) {
             (_, 0..=2) | (Self::Keyword | Self::Name, 3) => 0,
-            (Self::Command, 8..) => 2,
+            (Self::Command | Self::Query, 8..) => 2,
             _ => 1,
         }
     }
@@ -32,14 +34,14 @@ impl Namespace {
     fn eq(self, left: u8, right: u8) -> bool {
         match self {
             Self::Command => left.eq_ignore_ascii_case(&right),
-            Self::Keyword | Self::Name => left == right,
+            Self::Keyword | Self::Name | Self::Query => left == right,
         }
     }
 
     fn same_name(self, left: &[u8], right: &[u8]) -> bool {
         match self {
             Self::Command => left.eq_ignore_ascii_case(right),
-            Self::Keyword | Self::Name => left == right,
+            Self::Keyword | Self::Name | Self::Query => left == right,
         }
     }
 }
@@ -267,6 +269,20 @@ mod tests {
         assert_eq!(
             best_match(b"add_exectble", ["add_executable"]),
             Some(("add_executable".into(), Confidence::MaybeIncorrect)),
+        );
+    }
+
+    #[test]
+    fn query_namespace_allows_one_edit_on_three_byte_names() {
+        assert_eq!(
+            best_match_in(Namespace::Query, b"apq", ["app", "lib"]),
+            Some(("app".into(), Confidence::MachineApplicable)),
+        );
+        assert!(best_match_in(Namespace::Name, b"apq", ["app", "lib"]).is_none());
+        assert!(best_match_in(Namespace::Query, b"APQ", ["app"]).is_none());
+        assert_eq!(
+            best_match_in(Namespace::Query, b"my_target_xx", ["my_target_ab"]),
+            Some(("my_target_ab".into(), Confidence::MaybeIncorrect)),
         );
     }
 }

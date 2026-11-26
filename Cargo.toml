@@ -57,7 +57,7 @@ jiff = { version = "0.2", default-features = false, features = ["std"] }
 liblzma = { version = "0.4", default-features = false, features = ["static"] }
 md-5 = "0.10"
 memchr = "2"
-rustix = { version = "1", features = ["fs", "process", "system"] }
+rustix = { version = "1", features = ["fs", "process", "system", "termios"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"

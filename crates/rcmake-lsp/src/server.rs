@@ -357,7 +357,7 @@ impl<'a> Server<'a> {
                             return None;
                         }
                         return Some(vec![show_warning(format!(
-                            "Rcmake supports up to {MAX_DOCUMENTS} open files. Close other files, then reopen this file."
+                            "rcmake supports up to {MAX_DOCUMENTS} open files. Close other files, then reopen this file."
                         ))]);
                     }
                     _ => {}
@@ -449,7 +449,7 @@ impl<'a> Server<'a> {
         let mut messages = vec![self.publish(uri)];
         if !matches!(previous, Some(OpenDocument::Desynced(_))) {
             messages.push(show_warning(format!(
-                "Rcmake lost synchronization with {uri}. {}",
+                "rcmake lost synchronization with {uri}. {}",
                 failure.recovery()
             )));
         }

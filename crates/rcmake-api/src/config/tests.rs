@@ -69,7 +69,7 @@ fn captures_overlay_writes_and_process_denials() -> Result<(), ApiError> {
     assert!(host.metadata(&output, Follow::No).is_err());
     let result = prepared.finish(ConfigureResult::default());
     assert!(matches!(result.completion, CompletionState::Partial {
-        denied_processes, cancelled: false, omitted_denials: 0, omitted_denial_bytes: 0
+        denied_processes, cancelled: false, omitted_denials: 0, omitted_denial_bytes: 0, ..
     } if denied_processes.len() == 1));
     assert_eq!(
         result

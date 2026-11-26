@@ -97,9 +97,16 @@ pub fn render_explain_terminal(
             ),
         ),
         ExplainReport::NotFound { name, suggestions } => {
-            out.row(0, &format!("No match for {}.", text(name)));
+            out.row(0, &format!("No target or variable named {}.", quoted(name)));
             if !suggestions.is_empty() {
-                out.row(2, "Similar names");
+                let list = suggestions
+                    .iter()
+                    .map(|suggestion| {
+                        format!("{} ({})", text(&suggestion.name), suggestion.kind.as_str())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.row(2, &format!("Did you mean: {list}?"));
                 for suggestion in suggestions {
                     let flag = match suggestion.kind {
                         crate::ExplainItemKind::Target => "--target",
@@ -139,7 +146,6 @@ impl Renderer<'_> {
             self.location(4, target.alias_definition.as_ref());
         }
         self.trace(2, &target.definition);
-        self.provisional(target.provisional);
         if !target.configurations.is_empty() {
             let available = target
                 .configurations
@@ -208,39 +214,41 @@ impl Renderer<'_> {
                 self.trace(6, &source.backtrace);
             }
         }
-        let mut properties = target.properties_for(self.options.config).peekable();
-        if properties.peek().is_some() {
-            self.row(2, "Property history (writes at configure time)");
-        }
-        for property in properties {
-            self.row(
-                4,
-                &format!("{}  {}", text(&property.target), text(&property.name)),
-            );
-            if property.configurations.len() > 1 {
-                let names = property
-                    .configurations
-                    .iter()
-                    .map(|name| config_name(name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                self.row(6, &format!("Shared by {names}"));
+        if self.options.verbose {
+            let mut properties = target.properties_for(self.options.config).peekable();
+            if properties.peek().is_some() {
+                self.row(2, "Property history (writes at configure time)");
             }
-            if property.dropped_writes != 0 {
+            for property in properties {
                 self.row(
-                    6,
-                    &format!("{} earlier writes discarded", property.dropped_writes),
+                    4,
+                    &format!("{}  {}", text(&property.target), text(&property.name)),
                 );
+                if property.configurations.len() > 1 {
+                    let names = property
+                        .configurations
+                        .iter()
+                        .map(|name| config_name(name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.row(6, &format!("Shared by {names}"));
+                }
+                if property.dropped_writes != 0 {
+                    self.row(
+                        6,
+                        &format!("{} earlier writes discarded", property.dropped_writes),
+                    );
+                }
+                for event in &property.writes {
+                    self.row(6, prop_op(event.op));
+                    self.trace(8, &event.origin);
+                }
             }
-            for event in &property.writes {
-                self.row(6, &format!("#{} {}", event.seq, prop_op(event.op)));
-                self.trace(8, &event.origin);
+            match target.property_history_incomplete {
+                Some(false) => {}
+                Some(true) => self.warning("The session discarded some property writes."),
+                None => self.row(2, "Property history is unavailable."),
             }
-        }
-        match target.property_history_incomplete {
-            Some(false) => {}
-            Some(true) => self.warning("The session discarded some property writes."),
-            None => self.row(2, "Property history is unavailable."),
         }
     }
 
@@ -255,9 +263,19 @@ impl Renderer<'_> {
             );
             return;
         };
-        let value = text(entry.spelling.as_ref().unwrap_or(&entry.value));
+        let raw_value = entry.spelling.as_ref().unwrap_or(&entry.value);
+        let value = if raw_value.as_slice() == filter {
+            text(raw_value)
+        } else {
+            format!("{} (in {})", text(filter), quoted(raw_value))
+        };
         let origin = entry.origin.top().map_or_else(
-            || usage_label(entry.kind).to_owned(),
+            || {
+                entry.input.as_ref().map_or_else(
+                    || usage_label(entry.kind).to_owned(),
+                    |input| text(&input.name),
+                )
+            },
             |frame| {
                 let command = frame
                     .name
@@ -307,15 +325,23 @@ impl Renderer<'_> {
             && !chain.is_empty()
         {
             let hops: Vec<_> = chain.iter().map(hop_name).collect();
-            let mut path = text(target);
-            for (hop, name) in chain.iter().zip(&hops) {
-                let _ = write!(path, " -> {} {name}", usage_scope(hop.via));
-            }
-            self.row(6, &path);
+            let hop_indent = if chain.len() > 1 {
+                let mut path = text(target);
+                for (hop, name) in chain.iter().zip(&hops) {
+                    let _ = write!(path, " -> {} {name}", usage_scope(hop.via));
+                }
+                self.row(6, &path);
+                8
+            } else {
+                6
+            };
             let mut from = text(target);
             for (hop, to) in chain.iter().zip(hops) {
-                self.row(8, &format!("{from} -> {} {to}", usage_scope(hop.via)));
-                self.trace(10, &hop.origin);
+                self.row(
+                    hop_indent,
+                    &format!("{from} -> {} {to}", usage_scope(hop.via)),
+                );
+                self.trace(hop_indent + 2, &hop.origin);
                 from = to;
             }
         }
@@ -325,7 +351,6 @@ impl Renderer<'_> {
     fn variable(&mut self, variable: &ExplainVariable) {
         let name = text(&variable.name);
         self.styled_row(0, &name, 1, None);
-        self.provisional(variable.provisional);
         let label = match (variable.normal_binding, &variable.cache) {
             (true, Some(_)) => "Effective value (normal variable shadows cache)",
             (true, None) => "Effective value (normal variable)",
@@ -351,8 +376,7 @@ impl Renderer<'_> {
         if let Some(cache) = &variable.cache {
             let force = match cache.force {
                 Some(true) => "  FORCE",
-                Some(false) => "",
-                None => "  [FORCE status unavailable]",
+                Some(false) | None => "",
             };
             self.row(2, &format!("Cache entry {}{force}", cache.kind.as_str()));
             self.full_value(4, &cache.value);
@@ -382,7 +406,14 @@ impl Renderer<'_> {
                 self.row(2, "The recording policy excluded this variable.")
             }
             VariableHistory::Complete if variable.writes.is_empty() => {
-                self.row(2, "No writes recorded for this variable.")
+                if variable.cache.is_some() {
+                    self.row(
+                        2,
+                        "Origin  CMakeCache.txt (a -D option, a preset, or an earlier configure set it)",
+                    );
+                } else {
+                    self.row(2, "No writes recorded for this variable.");
+                }
             }
             VariableHistory::Complete => {}
             VariableHistory::Truncated => self.warning("Variable history reached its limit."),
@@ -396,6 +427,28 @@ impl Renderer<'_> {
     }
 
     fn variable_write(&mut self, event: &ExplainWrite) {
+        if event.operation == VarOp::CacheDeclare {
+            let site = event.origin.top().map_or_else(
+                || String::from("<unknown>"),
+                |frame| self.display_site(&frame.file, frame.line),
+            );
+            let decl = event
+                .origin
+                .top()
+                .and_then(|frame| frame.name.as_deref())
+                .map_or("set CACHE", |name| {
+                    if name.eq_ignore_ascii_case(b"option") {
+                        "option"
+                    } else {
+                        "set CACHE"
+                    }
+                });
+            self.row(
+                4,
+                &format!("Declared at {site} ({decl}); kept the cached value"),
+            );
+            return;
+        }
         let command = event.command.as_ref().map_or_else(
             || {
                 event
@@ -407,18 +460,20 @@ impl Renderer<'_> {
             |command| text(command),
         );
         let scope = match event.operation {
-            VarOp::CacheSet | VarOp::CacheUnset => "cache",
+            VarOp::CacheSet | VarOp::CacheDeclare | VarOp::CacheUnset => "cache",
             _ if event.in_queried_scope => "queried directory binding",
             _ if event.binding_directory.is_some() => "other directory binding",
             _ => "local or unknown binding",
         };
-        self.row(
-            4,
-            &format!(
+        let heading = if self.options.verbose {
+            format!(
                 "#{} {command} ({scope}, scope depth {})",
                 event.sequence, event.scope_depth
-            ),
-        );
+            )
+        } else {
+            format!("{command} ({scope})")
+        };
+        self.row(4, &heading);
         if let Some(dir) = &event.directory_path {
             self.row(6, &format!("Ran in {}", self.display_path(dir)));
         }
@@ -476,17 +531,9 @@ impl Renderer<'_> {
         self.styled_row(2, &format!("Warning  {message}"), 33, None);
     }
 
-    fn provisional(&mut self, provisional: bool) {
-        if provisional {
-            self.styled_row(2, "Partial configure", 33, None);
-        }
-    }
-
     fn location(&mut self, indent: usize, location: Option<&SourceLocation>) {
         if let Some(location) = location {
             self.path_line(indent, "At", &location.path, location.line, None);
-        } else {
-            self.row(indent, "Source location unavailable.");
         }
     }
 
@@ -499,7 +546,9 @@ impl Renderer<'_> {
             for frame in frames {
                 self.trace_frame(indent, "Called from", frame);
             }
-        } else if let Some(frame) = frames.find(|frame| self.is_project_frame(frame)) {
+        } else if let Some(frame) =
+            frames.find(|frame| frame.line != 0 && self.is_project_frame(frame))
+        {
             self.trace_frame(indent, "Called from", frame);
         }
     }
@@ -694,9 +743,23 @@ fn usage_label(kind: ChainKind) -> &'static str {
         ChainKind::Usage(UsageField::CompileDefinitions) => "Compile definition",
         ChainKind::Usage(UsageField::IncludeDirectories) => "Include directory",
         ChainKind::Usage(UsageField::CompileOptions) => "Compile option",
+        ChainKind::Usage(UsageField::CompileFeatures) => "Compile feature",
         ChainKind::Usage(UsageField::LinkOptions) => "Link option",
+        ChainKind::Usage(UsageField::LinkDirectories) => "Link directory",
+        ChainKind::Usage(UsageField::PrecompileHeaders) => "Precompile header",
+        ChainKind::Usage(UsageField::InterfaceIncludeDirectories) => "Interface include directory",
+        ChainKind::Usage(UsageField::InterfaceSystemIncludeDirectories) => {
+            "Interface system include directory"
+        }
+        ChainKind::Usage(UsageField::InterfaceCompileDefinitions) => "Interface compile definition",
+        ChainKind::Usage(UsageField::InterfaceCompileOptions) => "Interface compile option",
+        ChainKind::Usage(UsageField::InterfaceCompileFeatures) => "Interface compile feature",
+        ChainKind::Usage(UsageField::InterfaceLinkOptions) => "Interface link option",
+        ChainKind::Usage(UsageField::InterfaceLinkDirectories) => "Interface link directory",
+        ChainKind::Usage(UsageField::InterfaceLinkDepends) => "Interface link dependency",
+        ChainKind::Usage(UsageField::InterfacePrecompileHeaders) => "Interface precompile header",
+        ChainKind::Usage(UsageField::InterfaceSources) => "Interface source",
         ChainKind::LinkItem => "Link library",
-        ChainKind::Usage(field) => field.name(),
     }
 }
 
@@ -713,6 +776,7 @@ pub(crate) fn var_op(op: VarOp) -> &'static str {
         VarOp::Set => "set",
         VarOp::Unset => "unset",
         VarOp::CacheSet => "cache_set",
+        VarOp::CacheDeclare => "cache_declare",
         VarOp::CacheUnset => "cache_unset",
         VarOp::ParentScope => "parent_scope",
     }

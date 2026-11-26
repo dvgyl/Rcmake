@@ -49,7 +49,8 @@ Exit status
   0  Found the item. A target selection can be empty.
      Check the configuration and entry lists in JSON or the selection message
      in terminal output.
-  1  The query failed, found no item, or matched both a target and a variable.
+  1  The query failed, found no item, matched both a target and a variable,
+     or named an unavailable configuration.
   2  Invalid arguments or an unavailable configured build directory.
 ";
 
@@ -130,22 +131,47 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
     if let CompletionState::Partial {
         denied_processes,
         omitted_denials,
+        module_denials,
+        project_denial_sites,
         cancelled,
         ..
     } = &result.completion
     {
         let count = denied_processes.len().saturating_add(*omitted_denials);
-        let reason = if *cancelled {
-            "Configure was cancelled.".to_owned()
-        } else if count != 0 {
-            format!("Rcmake denied {count} subprocess requests.")
+        let unconfirmed = count.saturating_sub(*module_denials);
+        if *cancelled {
+            host.write_out(
+                Stream::Stderr,
+                b"Partial configure. Configure was cancelled.\n",
+            );
+        } else if unconfirmed > 0 {
+            let source_root = &result.model.dir(rcmake_model::DirId::ROOT).source_dir;
+            let sites = format_denial_sites(source_root, project_denial_sites);
+            let plural = if unconfirmed == 1 { "" } else { "s" };
+            let message = if sites.is_empty() {
+                format!(
+                    "Partial configure. rcmake denied {unconfirmed} subprocess request{plural}. Values that depend on them are provisional.\n"
+                )
+            } else {
+                format!(
+                    "Partial configure. rcmake denied {unconfirmed} subprocess request{plural} ({sites}). Values that depend on them are provisional.\n"
+                )
+            };
+            host.write_out(Stream::Stderr, message.as_bytes());
+        } else if count > 0 {
+            if options.verbose {
+                let plural = if count == 1 { "" } else { "s" };
+                let message = format!(
+                    "note: {count} cached CMake probe{plural} were skipped; their values come from CMakeCache.txt.\n"
+                );
+                host.write_out(Stream::Stderr, message.as_bytes());
+            }
         } else {
-            "Configure stopped before it completed.".to_owned()
-        };
-        host.write_out(
-            Stream::Stderr,
-            format!("Partial configure. {reason}\n").as_bytes(),
-        );
+            host.write_out(
+                Stream::Stderr,
+                b"Partial configure. Configure stopped before it completed.\n",
+            );
+        }
     }
     let report = result.explain_filtered(&query, options.filter.clone());
     write_report(host.as_ref(), &options, &report)
@@ -185,7 +211,7 @@ fn request(
         .ok_or_else(missing)?;
     let kind = GeneratorKind::from_name(&generator.value).ok_or_else(|| {
         format!(
-            "Rcmake does not support the cached generator {}.",
+            "rcmake does not support the cached generator {}.",
             generator.value
         )
     })?;
@@ -237,11 +263,75 @@ fn write_report(host: &dyn Host, options: &Options, report: &ExplainReport) -> i
         host.write_out(Stream::Stdout, rendered.as_bytes());
     }
     match report {
-        ExplainReport::Target(_) | ExplainReport::Variable(_) => 0,
+        ExplainReport::Target(target) => {
+            if let Some(requested) = config
+                && !target.has_configuration(requested)
+            {
+                if !options.json {
+                    let requested = String::from_utf8_lossy(requested);
+                    let note = match target.configurations.as_slice() {
+                        [only] if !only.name.is_empty() => format!(
+                            "This build directory is configured for {} only. Reconfigure with -DCMAKE_BUILD_TYPE={requested}, or use a multi-config generator.\n",
+                            only.name
+                        ),
+                        [_] => format!(
+                            "This build directory is configured for (default) only. Reconfigure with -DCMAKE_BUILD_TYPE={requested}, or use a multi-config generator.\n"
+                        ),
+                        [] => format!(
+                            "Configuration {requested} is unavailable because no configurations were resolved.\n"
+                        ),
+                        many => {
+                            let names = many
+                                .iter()
+                                .map(|cfg| {
+                                    if cfg.name.is_empty() {
+                                        "(default)".to_owned()
+                                    } else {
+                                        cfg.name.to_string()
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!("Configuration {requested} is not one of: {names}.\n")
+                        }
+                    };
+                    host.write_out(Stream::Stderr, note.as_bytes());
+                }
+                return 1;
+            }
+            0
+        }
+        ExplainReport::Variable(_) => 0,
         ExplainReport::Ambiguous { .. }
         | ExplainReport::NotFound { .. }
         | ExplainReport::InvalidDirectory { .. } => 1,
     }
+}
+
+fn format_denial_sites(source_root: &[u8], sites: &[(BString, u32)]) -> String {
+    use rcmake_base::path_lex::Lexical;
+    let root = (!source_root.is_empty()).then(|| Lexical::new(source_root).normalize());
+    let mut rendered = Vec::new();
+    for (file, line) in sites {
+        let normalized = Lexical::new(file).normalize();
+        let display = root
+            .as_ref()
+            .and_then(|root| Lexical::new(&normalized).relative(Lexical::new(root)))
+            .filter(|rel| rel != ".." && !rel.starts_with(b"../"))
+            .unwrap_or(normalized);
+        let site = if *line != 0 {
+            format!("{}:{line}", String::from_utf8_lossy(&display))
+        } else {
+            String::from_utf8_lossy(&display).into_owned()
+        };
+        if !rendered.contains(&site) {
+            rendered.push(site);
+            if rendered.len() == 3 {
+                break;
+            }
+        }
+    }
+    rendered.join(", ")
 }
 
 fn render_options<'a>(host: &dyn Host, options: &'a Options) -> ExplainRenderOptions<'a> {
@@ -553,6 +643,10 @@ impl Host for ReportHost {
 
     fn is_terminal(&self, _stream: Stream) -> bool {
         self.base.is_terminal(Stream::Stderr)
+    }
+
+    fn terminal_width(&self, _stream: Stream) -> Option<usize> {
+        self.base.terminal_width(Stream::Stderr)
     }
 
     fn now(&self) -> FileTime {
@@ -873,5 +967,89 @@ execute_process(COMMAND skipped RESULT_VARIABLE status)
             base.stream_bytes(Stream::Stderr),
             b"configure message\nconfigure diagnostic\n"
         );
+    }
+
+    #[test]
+    fn unavailable_config_on_single_config_build_returns_one() {
+        let report = ExplainReport::Target(Box::new(rcmake_api::ExplainTarget {
+            name: "app".into(),
+            target: "app".into(),
+            kind: rcmake_model::TargetKind::Executable,
+            definition: rcmake_diag::Backtrace::default(),
+            alias_definition: None,
+            sources: Vec::new(),
+            roots: rcmake_api::ExplainRoots::default(),
+            filter: None,
+            configurations: vec![rcmake_api::ExplainConfig {
+                name: "Release".into(),
+                ..rcmake_api::ExplainConfig::default()
+            }],
+            properties: Vec::new(),
+            property_history_incomplete: Some(false),
+            provisional: false,
+        }));
+        let host = PureHost::default();
+        let options = Options {
+            config: Some("Debug".into()),
+            ..Options::default()
+        };
+        assert_eq!(write_report(&host, &options, &report), 1);
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(stderr.contains("configured for Release only"), "{stderr}");
+        assert!(stderr.contains("-DCMAKE_BUILD_TYPE=Debug"), "{stderr}");
+    }
+
+    #[test]
+    fn explain_keeps_partial_notice_for_unconfirmed_try_compile_and_project_denials()
+    -> Result<(), String> {
+        let root = Path::new(if cfg!(windows) { "C:/" } else { "/" });
+        let host = Arc::new(PureHost::new(root.to_owned(), root.join("bin/rcmake")));
+        let source = root.join("src");
+        let lists = concat!(
+            "cmake_minimum_required(VERSION 4.5)\n",
+            "project(ExplainPartial LANGUAGES NONE)\n",
+            "try_compile(HAVE_FOO \"${CMAKE_BINARY_DIR}/tc\" \"${CMAKE_SOURCE_DIR}/probe.c\")\n",
+            "add_library(app INTERFACE)\n",
+        );
+        let determine_system = concat!(
+            "execute_process(COMMAND uname -m RESULT_VARIABLE uname_rc)\n",
+            "set(CMAKE_SYSTEM_NAME PureOS)\n",
+            "set(CMAKE_SYSTEM PureOS)\n",
+            "set(CMAKE_SYSTEM_LOADED 1)\n",
+            "set(CMAKE_SYSTEM_SPECIFIC_INITIALIZE_LOADED 1)\n",
+            "set(CMAKE_SYSTEM_SPECIFIC_INFORMATION_LOADED 1)\n",
+            "file(WRITE \"${CMAKE_PLATFORM_INFO_DIR}/CMakeSystem.cmake\" \"set(CMAKE_SYSTEM PureOS)\\n\")\n",
+        );
+        for (path, text) in [
+            ("src/CMakeLists.txt", lists.as_bytes()),
+            ("src/probe.c", b"int main(void) { return 0; }\n".as_slice()),
+            (
+                "data/Modules/CMakeDetermineSystem.cmake",
+                determine_system.as_bytes(),
+            ),
+        ] {
+            host.seed_file(&root.join(path), text)
+                .map_err(|error| error.to_string())?;
+        }
+        let source_cmake = path::from_native_cmake(&source);
+        let cache = format!(
+            "CMAKE_HOME_DIRECTORY:INTERNAL={source_cmake}\n\
+             CMAKE_GENERATOR:INTERNAL=Unix Makefiles\n\
+             CMAKE_MAKE_PROGRAM:FILEPATH=/usr/bin/make\n\
+             CMAKE_PLATFORM_INFO_INITIALIZED:INTERNAL=1\n\
+             HAVE_FOO:INTERNAL=TRUE\n"
+        );
+        host.seed_file(&root.join("out/CMakeCache.txt"), cache.as_bytes())
+            .map_err(|error| error.to_string())?;
+        host.env_set(b"RCMAKE_VENDORED_DATA_ROOT", Some(b"data"));
+        let shared: Arc<dyn Host> = host.clone();
+        assert_eq!(
+            run(None, &["app".into(), "-B".into(), "out".into()], shared),
+            0
+        );
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(stderr.contains("Partial configure."), "{stderr}");
+        assert!(stderr.contains("denied 2 subprocess requests"), "{stderr}");
+        Ok(())
     }
 }

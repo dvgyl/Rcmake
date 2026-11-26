@@ -80,6 +80,9 @@ impl Interp {
             .as_ref()
             .map_or_else(|| Arc::from(data), |(text, _)| text.bytes.clone());
         let id = self.sources.add(path.into(), kind, text.clone())?;
+        if let Some(shared) = self.session_data::<crate::hermetic::HermeticSources>() {
+            shared.add(path.into(), kind, Arc::clone(&text));
+        }
         let file: Arc<[u8]> = Arc::from(path);
         let ParsedSource { code, warnings } = if let Some((_, parsed)) = hit {
             parsed

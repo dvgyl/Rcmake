@@ -94,7 +94,7 @@ impl SourceFile {
 }
 
 /// Arena storing all parsed listfiles for a session.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct SourceMap {
     files: Vec<SourceFile>,
     latest_files: BTreeMap<BString, SourceId>,
@@ -135,6 +135,12 @@ impl SourceMap {
     pub fn get(&self, id: SourceId) -> Option<&SourceFile> {
         let idx = usize::try_from(id.0.get().checked_sub(1)?).ok()?;
         self.files.get(idx)
+    }
+
+    /// Return all registered source files in insertion order.
+    #[must_use]
+    pub fn files(&self) -> &[SourceFile] {
+        &self.files
     }
 }
 

@@ -82,6 +82,16 @@ pub(crate) enum ParseResult {
 
 const USAGE: &str = "Usage\n\n  cmake [options] <path-to-source>\n  cmake [options] <path-to-existing-build>\n  cmake [options] -S <path-to-source> -B <path-to-build>\n\nSpecify a source directory to (re-)generate a build system for it in the\ncurrent working directory.  Specify an existing build directory to\nre-generate its build system.\n\nRun 'cmake --help' for more information.\n\n";
 
+const NATIVE_USAGE: &str = "Usage\n\n  rcmake [options] <path-to-source>\n  rcmake [options] <path-to-existing-build>\n  rcmake [options] -S <path-to-source> -B <path-to-build>\n\nSpecify a source directory to (re-)generate a build system for it in the\ncurrent working directory.  Specify an existing build directory to\nre-generate its build system.\n\nRun 'rcmake --help' for more information.\n\n";
+
+const NATIVE_FLAGS: &[&[u8]] = &[
+    b"--hermetic",
+    b"--profile",
+    b"--diagnostics",
+    b"--fetch-lock",
+    b"--no-probe-cache",
+];
+
 const LONG_OPTIONS: &[&[u8]] = &[
     b"--build",
     b"--install",
@@ -126,13 +136,20 @@ const LONG_OPTIONS: &[&[u8]] = &[
 
 pub(crate) fn parse(args: &[BString], persona: Persona, host: &dyn Host) -> ParseResult {
     if args.is_empty() {
-        out(host, USAGE);
+        out(
+            host,
+            if persona == Persona::Native {
+                NATIVE_USAGE
+            } else {
+                USAGE
+            },
+        );
         return ParseResult::Exit(0);
     }
     match parse_args(args, persona, host) {
         Ok(Some(opts)) => ParseResult::Run(Box::new(opts)),
         Ok(None) => ParseResult::Exit(0),
-        Err(body) => ParseResult::Exit(cli_usage_error(host, &body)),
+        Err(body) => ParseResult::Exit(cli_usage_error(host, persona, &body)),
     }
 }
 
@@ -228,12 +245,12 @@ fn parse_args(
     if opts.script.is_none()
         && let Some(flag) = first_unknown
     {
-        return Err(unknown_option(flag));
+        return Err(unknown_option(flag, persona));
     }
     if opts.script.is_some()
         && let Some(flag) = first_extension
     {
-        return Err(unknown_option(flag));
+        return Err(unknown_option(flag, Persona::Compat));
     }
     validate_script_mode(&opts, host)?;
     debug::validate_profile(host, &opts, profile_format)?;
@@ -393,11 +410,13 @@ fn validate_script_mode(opts: &Options, host: &dyn Host) -> Result<(), String> {
     Ok(())
 }
 
-fn cli_usage_error_only(host: &dyn Host) -> String {
-    host.write_out(
-        Stream::Stderr,
-        b"CMake Error: Run 'cmake --help' for all supported options.\n",
-    );
+fn cli_usage_error_only(host: &dyn Host, persona: Persona) -> String {
+    let message = if persona == Persona::Native {
+        b"CMake Error: Run 'rcmake --help' for all supported options.\n".as_slice()
+    } else {
+        b"CMake Error: Run 'cmake --help' for all supported options.\n".as_slice()
+    };
+    host.write_out(Stream::Stderr, message);
     String::new()
 }
 
@@ -416,20 +435,27 @@ pub(crate) fn take_value<'a, T: AsRef<[u8]> + ?Sized + 'a>(
         .map(AsRef::as_ref)
 }
 
-fn unknown_option(arg: &[u8]) -> String {
-    unknown_mode_option(arg, LONG_OPTIONS)
-}
-
-pub(crate) fn unknown_mode_option(arg: &[u8], flags: &[&[u8]]) -> String {
+fn closest_flag<'a>(arg: &[u8], flags: impl IntoIterator<Item = &'a [u8]>) -> Option<&'a [u8]> {
     const MAX_DISTANCE: usize = 2;
-    let mut message = format!("Unknown argument {}", String::from_utf8_lossy(arg));
-    if let Some((flag, _)) = flags
-        .iter()
+    flags
+        .into_iter()
         .filter(|flag| arg.len().abs_diff(flag.len()) <= MAX_DISTANCE)
-        .map(|flag| (*flag, levenshtein(arg, flag)))
+        .map(|flag| (flag, levenshtein(arg, flag)))
         .filter(|&(_, distance)| distance <= MAX_DISTANCE)
         .min_by_key(|&(_, distance)| distance)
-    {
+        .map(|(flag, _)| flag)
+}
+
+fn unknown_option(arg: &[u8], persona: Persona) -> String {
+    if persona == Persona::Compat {
+        return unknown_mode_option(arg, LONG_OPTIONS);
+    }
+    let probe = split_flag(arg, b'=').0;
+    let mut message = format!("Unknown argument {}", String::from_utf8_lossy(arg));
+    if let Some(flag) = closest_flag(
+        probe,
+        LONG_OPTIONS.iter().chain(NATIVE_FLAGS.iter()).copied(),
+    ) {
         message.push_str(&format!(
             ". Did you mean: {}?",
             String::from_utf8_lossy(flag)
@@ -438,10 +464,21 @@ pub(crate) fn unknown_mode_option(arg: &[u8], flags: &[&[u8]]) -> String {
     message
 }
 
-pub(crate) fn cli_usage_error(host: &dyn Host, body: &str) -> i32 {
+pub(crate) fn unknown_mode_option(arg: &[u8], flags: &[&[u8]]) -> String {
+    let mut message = format!("Unknown argument {}", String::from_utf8_lossy(arg));
+    if let Some(flag) = closest_flag(arg, flags.iter().copied()) {
+        message.push_str(&format!(
+            ". Did you mean: {}?",
+            String::from_utf8_lossy(flag)
+        ));
+    }
+    message
+}
+
+pub(crate) fn cli_usage_error(host: &dyn Host, persona: Persona, body: &str) -> i32 {
     if !body.is_empty() {
         crate::emit_cli_error(host, body);
-        cli_usage_error_only(host);
+        cli_usage_error_only(host, persona);
     }
     1
 }
@@ -572,7 +609,7 @@ fn print_config_dir(host: &dyn Host) {
 
 #[cfg(test)]
 mod tests {
-    use super::unknown_mode_option;
+    use super::{Persona, unknown_mode_option, unknown_option};
 
     #[test]
     fn unknown_option_suggests_the_first_closest_flag_within_two_edits() {
@@ -587,6 +624,22 @@ mod tests {
         assert_eq!(
             unknown_mode_option(b"--xyz", &[b"--cat", b"--bar"]),
             "Unknown argument --xyz"
+        );
+    }
+
+    #[test]
+    fn native_unknown_option_suggests_native_extensions_and_compat_does_not() {
+        assert_eq!(
+            unknown_option(b"--hermtic", Persona::Native),
+            "Unknown argument --hermtic. Did you mean: --hermetic?"
+        );
+        assert_eq!(
+            unknown_option(b"--hermtic=strict", Persona::Native),
+            "Unknown argument --hermtic=strict. Did you mean: --hermetic?"
+        );
+        assert_eq!(
+            unknown_option(b"--hermtic", Persona::Compat),
+            "Unknown argument --hermtic"
         );
     }
 }

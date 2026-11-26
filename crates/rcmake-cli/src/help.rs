@@ -140,7 +140,13 @@ pub(crate) fn run(
     for (request, output) in requests {
         if matches!(request, Request::Usage) {
             separate(host, &mut stdout);
-            host.write_out(Stream::Stdout, COMPAT_USAGE);
+            if persona == crate::persona::Persona::Native {
+                let native = String::from_utf8_lossy(COMPAT_USAGE)
+                    .replace("  cmake [options]", "  rcmake [options]");
+                host.write_out(Stream::Stdout, native.as_bytes());
+            } else {
+                host.write_out(Stream::Stdout, COMPAT_USAGE);
+            }
             options::print_help_generators(host);
             host.write_out(Stream::Stdout, b"\n");
             if persona == crate::persona::Persona::Native {

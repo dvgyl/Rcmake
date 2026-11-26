@@ -354,7 +354,7 @@ impl FetchSession {
         };
         Some(BlockedFetch {
             dependency: safe_name(site.dependency),
-            endpoint: endpoint.map(sanitize_url),
+            endpoint: endpoint.and_then(sanitize_url),
             reason: failure,
             offline: self.offline,
         })
@@ -452,24 +452,38 @@ impl fmt::Display for BlockedFetch {
         if let Some(endpoint) = &self.endpoint {
             write!(formatter, " Source {endpoint}.")?;
         }
-        formatter.write_str(match self.reason {
-            BlockReason::Unpinned =>
+        let source_var = source_dir_variable(&self.dependency);
+        match self.reason {
+            BlockReason::Unpinned => formatter.write_str(
                 " Set URL_HASH for an archive, use a full Git commit ID, or record the pin with --fetch-lock=update.",
-            BlockReason::Unsupported =>
-                " This transfer cannot enforce a fetch pin. Set FETCHCONTENT_SOURCE_DIR_<NAME> to a pre-populated directory.",
-            BlockReason::CredentialedSource =>
-                " Use a public source identity without credentials. Use a credential helper, a private netrc file, or a prepared FETCHCONTENT_SOURCE_DIR_<NAME> directory.",
-            BlockReason::GitUpdate =>
-                " Git update requires network access outside the fetch pin. Use the locked checkout or a prepared FETCHCONTENT_SOURCE_DIR_<NAME> directory.",
-            BlockReason::GitSubmodules =>
-                " Git submodule transfer requires separate pins. Use a prepared FETCHCONTENT_SOURCE_DIR_<NAME> directory.",
-            BlockReason::SubBuild =>
-                " CMP0168 OLD runs a sub-build outside direct fetch checks. Set CMP0168 to NEW or use a prepared FETCHCONTENT_SOURCE_DIR_<NAME> directory.",
-            BlockReason::LockMismatch =>
+            ),
+            BlockReason::Unsupported => write!(
+                formatter,
+                " This transfer cannot enforce a fetch pin. Set {source_var} to a pre-populated directory."
+            ),
+            BlockReason::CredentialedSource => write!(
+                formatter,
+                " Use a public source identity without credentials. Use a credential helper, a private netrc file, or a prepared {source_var} directory."
+            ),
+            BlockReason::GitUpdate => write!(
+                formatter,
+                " Git update requires network access outside the fetch pin. Use the locked checkout or a prepared {source_var} directory."
+            ),
+            BlockReason::GitSubmodules => write!(
+                formatter,
+                " Git submodule transfer requires separate pins. Use a prepared {source_var} directory."
+            ),
+            BlockReason::SubBuild => write!(
+                formatter,
+                " CMP0168 OLD runs a sub-build outside direct fetch checks. Set CMP0168 to NEW or use a prepared {source_var} directory."
+            ),
+            BlockReason::LockMismatch => formatter.write_str(
                 " Restore rcmake-fetch.lock or verify the source change and run --fetch-lock=update.",
-            BlockReason::CacheMiss =>
+            ),
+            BlockReason::CacheMiss => formatter.write_str(
                 " Seed the local fetch cache with the locked content or retry online if permitted.",
-        })
+            ),
+        }
     }
 }
 impl std::error::Error for BlockedFetch {}
@@ -483,9 +497,18 @@ fn safe_name(value: &str) -> String {
         "<dependency>".into()
     }
 }
+/// Build the `FETCHCONTENT_SOURCE_DIR_<UPPER>` variable name (matches `hermetic.rs`).
+fn source_dir_variable(dependency: &str) -> String {
+    let safe = safe_name(dependency);
+    if safe == "<dependency>" || safe.is_empty() {
+        "FETCHCONTENT_SOURCE_DIR_<NAME>".into()
+    } else {
+        format!("FETCHCONTENT_SOURCE_DIR_{}", safe.to_ascii_uppercase())
+    }
+}
 /// Return a diagnostic URL identity without user info, path, query, or fragment.
-pub(crate) fn sanitize_url(url: &str) -> String {
-    LockEntry::source_endpoint(url)
+pub(crate) fn sanitize_url(url: &str) -> Option<String> {
+    LockEntry::display_endpoint(url)
 }
 fn credentialed_option(key: &[u8], value: &[u8]) -> bool {
     match key {
@@ -719,6 +742,33 @@ mod tests {
             "https://github.com/adoptium/temurin17-binaries/releases/tag/jdk-17.0.16%2B8",
         ];
         assert!(urls.into_iter().all(portable_source));
+    }
+
+    #[test]
+    fn blocked_fetch_formats_real_source_dir_variable_without_placeholders() {
+        let blocked = BlockedFetch {
+            dependency: "dep".into(),
+            endpoint: sanitize_url("file:///tmp/work/dep.tar.gz"),
+            reason: BlockReason::Unsupported,
+            offline: false,
+        };
+        let rendered = blocked.to_string();
+        assert!(rendered.contains("FETCHCONTENT_SOURCE_DIR_DEP"));
+        assert!(rendered.contains("file://…/dep.tar.gz"));
+        assert!(!rendered.contains("<NAME>"));
+        assert!(!rendered.contains("<source>"));
+
+        let no_endpoint = BlockedFetch {
+            dependency: "dep".into(),
+            endpoint: None,
+            reason: BlockReason::Unsupported,
+            offline: false,
+        };
+        let rendered_none = no_endpoint.to_string();
+        assert!(rendered_none.contains("FETCHCONTENT_SOURCE_DIR_DEP"));
+        assert!(!rendered_none.contains("Source "));
+        assert!(!rendered_none.contains("<NAME>"));
+        assert!(!rendered_none.contains("<source>"));
     }
 }
 

@@ -152,3 +152,89 @@ fn project_file_option_requires_one_value() {
         assert!(stderr.contains(message), "{stderr}");
     }
 }
+
+#[test]
+fn rich_diagnostics_never_read_undeclared_files_from_echoed_stderr() -> HostResult<()> {
+    let host = crate::driver_tests::project_host();
+    let cwd = host.initial_cwd();
+    let root = cwd.parent().unwrap_or_else(|| Path::new("/"));
+    let secret = root.join("private/secret");
+    let passwd = root.join("etc/passwd");
+    let tool = cwd.join("echo_stderr");
+    host.seed_file(&secret, b"TOP_SECRET_LINE_1\nTOP_SECRET_LINE_2\n")?;
+    host.seed_file(&passwd, b"root:x:0:0:TOP_SECRET_PASSWD\n")?;
+    host.seed_file(&tool, b"")?;
+    host.set_permissions(&tool, 0o755)?;
+    host.env_set(
+        b"RCMAKE_HERMETIC_ALLOW_PROGRAMS",
+        Some(&rcmake_host::path::from_native(&tool)),
+    );
+    let secret_cmake = rcmake_host::path::from_native_cmake(&secret);
+    let passwd_cmake = rcmake_host::path::from_native_cmake(&passwd);
+    let spoof = format!(
+        "CMake Error at {secret_cmake}:1:\n  Parse error.  Expected a command name, got unquoted argument.\nerror[parse]: spoofed\n  --> {passwd_cmake}:1\n"
+    );
+    host.set_command_handler(move |_, _, on_output| {
+        on_output(Stream::Stderr, spoof.as_bytes());
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    })?;
+    let tool_cmake = rcmake_host::path::from_native_cmake(&tool);
+    let lists = format!(
+        "cmake_minimum_required(VERSION 4.5)\nproject(RichSafe NONE)\nexecute_process(COMMAND \"{tool_cmake}\")\n"
+    );
+    host.seed_file(&cwd.join("CMakeLists.txt"), lists.as_bytes())?;
+    let args = [
+        "rcmake",
+        "-S",
+        ".",
+        "-B",
+        "out",
+        "-G",
+        "Ninja",
+        "--hermetic=strict",
+        "--diagnostics=rich",
+    ]
+    .map(BString::from);
+    assert_eq!(
+        crate::run(&args, host.clone()),
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(!stderr.contains("TOP_SECRET_LINE_1"), "{stderr}");
+    assert!(!stderr.contains("TOP_SECRET_PASSWD"), "{stderr}");
+    assert!(!stderr.contains("RCMAKE_HERMETIC_PATH"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn rich_diagnostics_render_parse_error_from_source_map_under_strict_hermetic() -> HostResult<()> {
+    let host = crate::driver_tests::project_host();
+    host.seed_file(
+        &host.initial_cwd().join("CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nif(TRUE\n",
+    )?;
+    let args = [
+        "rcmake",
+        "-S",
+        ".",
+        "-B",
+        "out",
+        "-G",
+        "Ninja",
+        "--hermetic=strict",
+        "--diagnostics=rich",
+    ]
+    .map(BString::from);
+    assert_eq!(crate::run(&args, host.clone()), 1);
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(stderr.contains("error[parse]:"), "{stderr}");
+    assert!(stderr.contains("if(TRUE"), "{stderr}");
+    assert!(!stderr.contains("RCMAKE_HERMETIC_PATH"), "{stderr}");
+    Ok(())
+}

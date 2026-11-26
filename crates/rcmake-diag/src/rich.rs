@@ -8,10 +8,10 @@ use std::ops::Range;
 
 use rcmake_base::{BString, ByteSlice as _};
 
-use crate::annotate::{Annotations, Label, SourceSpan};
+use crate::annotate::{Annotations, Confidence, Edit, Fix, Label, SourceSpan};
 use crate::{
-    DiagCategory, Diagnostic, Frame, FrameKind, Location, MessageKind, SourceFile, SourceId,
-    SourceMap,
+    DiagCategory, Diagnostic, Effect, Frame, FrameKind, Location, MessageKind, SourceFile,
+    SourceId, SourceMap,
 };
 
 mod cells;
@@ -80,14 +80,14 @@ pub fn render_rich(
     lookup: &dyn SourceLookup,
     opts: RichOptions,
 ) -> BString {
-    let (severity, color, default_rule) = match diag.kind {
-        MessageKind::Error | MessageKind::InternalError => ("error", 31, "CMake.FatalError"),
-        MessageKind::Warning => ("warning", 33, "CMake.Warning"),
-        MessageKind::AuthorWarning => ("warning", 33, "CMake.Author"),
-        MessageKind::AuthorError => ("error", 31, "CMake.Author"),
-        MessageKind::DeprecationWarning => ("warning", 33, "CMake.Deprecated"),
-        MessageKind::DeprecationError => ("error", 31, "CMake.Deprecated"),
-        MessageKind::Log => ("note", 36, "CMake.Note"),
+    let (severity, color) = match diag.kind {
+        MessageKind::Error | MessageKind::InternalError => ("error", 31),
+        MessageKind::Warning => ("warning", 33),
+        MessageKind::AuthorWarning => ("warning", 33),
+        MessageKind::AuthorError => ("error", 31),
+        MessageKind::DeprecationWarning => ("warning", 33),
+        MessageKind::DeprecationError => ("error", 31),
+        MessageKind::Log => ("note", 36),
     };
     let mut renderer = Renderer {
         out: String::new(),
@@ -117,27 +117,44 @@ pub fn render_rich(
     }
 
     let fallback = Site::from_location(&diag.location);
-    let rule = diag
-        .category
-        .map_or(default_rule, |category| category.sarif_rule_id());
+    let rule = rich_code(diag);
+    let has_specific_code = matches!(
+        rule,
+        "parse" | "unknown-command" | "policy-version" | "missing-target" | "send-error"
+    );
     let header = match diag.policy {
         Some(policy) => format!("{severity}[{rule} {policy}]:"),
-        None if diag.category.is_some() || fallback.is_some() || !groups.is_empty() => {
+        None if diag.category.is_some()
+            || has_specific_code
+            || fallback.is_some()
+            || !groups.is_empty() =>
+        {
             format!("{severity}[{rule}]:")
         }
         None => format!("{severity}:"),
     };
     let body = diag.body.to_str_lossy();
     let mut lines = body.lines().peekable();
-    let headline = lines.next_if(|line| !line.is_empty() && !line.starts_with([' ', '\t']));
+    let headline = collect_headline(&mut lines);
+    let policy_help = if rule == "policy-version" {
+        let anchor = primary.and_then(|id| {
+            groups.get(&id).and_then(|(file, group_labels)| {
+                group_labels
+                    .iter()
+                    .find(|label| label.primary)
+                    .or_else(|| group_labels.first())
+                    .map(|label| (id, *file, label.span.start as usize))
+            })
+        });
+        let fix = build_policy_version_fix(anchor);
+        // Replace upstream VERSION_ADVICE paragraph with structured help and note.
+        while lines.next().is_some() {}
+        Some(fix)
+    } else {
+        None
+    };
     renderer.paint(color, &header);
-    renderer.wrap(
-        headline.unwrap_or_default(),
-        header.len(),
-        "  ",
-        true,
-        false,
-    );
+    renderer.wrap(&headline, header.len(), "  ", true, false);
 
     let has_location = fallback.is_some() || !groups.is_empty();
     if let Some((file, labels)) = primary.and_then(|id| groups.remove(&id)) {
@@ -145,11 +162,11 @@ pub fn render_rich(
         if site.is_none()
             && let Some(fallback) = fallback.filter(|site| site.name.is_some())
         {
-            renderer.fallback(fallback, lookup);
+            renderer.fallback(fallback, lookup, diag.body.as_slice());
         }
         renderer.snippet(file, &labels, site.and_then(|site| site.name));
     } else if let Some(site) = fallback {
-        renderer.fallback(site, lookup);
+        renderer.fallback(site, lookup, diag.body.as_slice());
     }
     for (file, labels) in groups.into_values() {
         renderer.snippet(file, &labels, None);
@@ -170,9 +187,176 @@ pub fn render_rich(
             renderer.footer("note", note.as_slice());
         }
     }
+    if let Some(fix) = &policy_help {
+        renderer.fix(fix, lookup);
+        renderer.footer(
+            "note",
+            b"or pass -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to configure without changes",
+        );
+    }
     renderer.callers(&diag.location, lookup);
     renderer.suppression(diag);
+    renderer.out.push('\n');
     BString::from(renderer.out.into_bytes())
+}
+
+fn rich_code(diag: &Diagnostic) -> &'static str {
+    if let Some(category) = diag.category {
+        return category.sarif_rule_id();
+    }
+    let body = diag.body.as_slice();
+    if body.starts_with(b"Parse error.") || body.starts_with(b"Syntax Error in cmake code") {
+        return "parse";
+    }
+    if body.starts_with(b"Unknown CMake command \"") {
+        return "unknown-command";
+    }
+    if body.starts_with(b"Compatibility with CMake < ")
+        && body.find(b"has been removed from CMake.").is_some()
+    {
+        return "policy-version";
+    }
+    if body.find(b"but the target was not found.").is_some() {
+        return "missing-target";
+    }
+    if diag.kind == MessageKind::Error
+        && diag.effect == Effect::SetError
+        && matches!(
+            &diag.location,
+            Location::Backtrace(trace)
+                if trace
+                    .top()
+                    .and_then(|frame| frame.name.as_deref())
+                    .is_some_and(|name| name.eq_ignore_ascii_case(b"message"))
+        )
+    {
+        return "send-error";
+    }
+    match diag.kind {
+        MessageKind::Error | MessageKind::InternalError => match diag.effect {
+            Effect::SetError => "CMake.Error",
+            _ => "CMake.FatalError",
+        },
+        MessageKind::Warning => "CMake.Warning",
+        MessageKind::AuthorWarning | MessageKind::AuthorError => "CMake.Author",
+        MessageKind::DeprecationWarning | MessageKind::DeprecationError => "CMake.Deprecated",
+        MessageKind::Log => "CMake.Note",
+    }
+}
+
+fn collect_headline<'a>(lines: &mut std::iter::Peekable<std::str::Lines<'a>>) -> String {
+    let Some(first) = lines.next_if(|line| !line.is_empty() && !line.starts_with([' ', '\t']))
+    else {
+        return String::new();
+    };
+    let mut headline = first.to_owned();
+    let mut quotes = first.bytes().filter(|&b| b == b'"').count();
+    let mut joined = 0;
+    while quotes % 2 == 1 && joined < 16 {
+        let Some(next) = lines.next() else {
+            break;
+        };
+        joined += 1;
+        quotes += next.bytes().filter(|&b| b == b'"').count();
+        if !next.is_empty() && !next.starts_with('"') {
+            headline.push(' ');
+        }
+        headline.push_str(next);
+    }
+    headline
+}
+
+fn build_policy_version_fix(anchor: Option<(SourceId, &SourceFile, usize)>) -> Fix {
+    let max_ver = format!(
+        "{}.{}",
+        rcmake_base::CMAKE_VERSION_MAJOR,
+        rcmake_base::CMAKE_VERSION_MINOR
+    );
+    let range = format!("3.5...{max_ver}");
+    if let Some((source, file, start)) = anchor
+        && let Some((arg_start, arg_end)) = find_version_argument_span(&file.text, start)
+        && let (Ok(start_u32), Ok(end_u32)) = (u32::try_from(arg_start), u32::try_from(arg_end))
+    {
+        return Fix {
+            message: "use a version range".into(),
+            edits: vec![Edit {
+                span: SourceSpan {
+                    source,
+                    start: start_u32,
+                    end: end_u32,
+                },
+                replacement: range.into(),
+            }],
+            confidence: Confidence::MachineApplicable,
+        };
+    }
+    Fix {
+        message: format!("use a version range (for example {range})").into(),
+        edits: Vec::new(),
+        confidence: Confidence::MachineApplicable,
+    }
+}
+
+fn find_version_argument_span(text: &[u8], start: usize) -> Option<(usize, usize)> {
+    let slice = text.get(start..)?;
+    let open = slice.iter().position(|&b| b == b'(')?;
+    let mut pos = start + open + 1;
+    let limit = text.len().min(pos + 512);
+    let mut saw_version = false;
+    while pos < limit {
+        while pos < limit && text.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        let &byte = text.get(pos)?;
+        if byte == b')' {
+            break;
+        }
+        if byte == b'#' {
+            while pos < limit && text.get(pos) != Some(&b'\n') {
+                pos += 1;
+            }
+            continue;
+        }
+        let (tok_start, tok_end, next_pos) = if byte == b'"' {
+            let content_start = pos + 1;
+            let mut end = content_start;
+            while end < limit {
+                match text.get(end) {
+                    Some(b'\\') => end += 2,
+                    Some(b'"') => break,
+                    Some(_) => end += 1,
+                    None => break,
+                }
+            }
+            if text.get(end) != Some(&b'"') {
+                return None;
+            }
+            (content_start, end, end + 1)
+        } else {
+            let token_start = pos;
+            let mut end = pos;
+            while end < limit
+                && text
+                    .get(end)
+                    .is_some_and(|&b| !b.is_ascii_whitespace() && !matches!(b, b')' | b'#' | b'"'))
+            {
+                end += 1;
+            }
+            (token_start, end, end)
+        };
+        let token = text.get(tok_start..tok_end)?;
+        if saw_version {
+            if !token.is_empty() && token.iter().all(|b| b.is_ascii_digit() || *b == b'.') {
+                return Some((tok_start, tok_end));
+            }
+            return None;
+        }
+        if token.eq_ignore_ascii_case(b"VERSION") {
+            saw_version = true;
+        }
+        pos = next_pos;
+    }
+    None
 }
 
 #[derive(Clone, Copy)]
@@ -294,6 +478,11 @@ impl Renderer {
     }
 
     fn location(&mut self, indent: usize, site: Site<'_>, column: usize) {
+        let indent = if self.opts.unicode {
+            indent + 1
+        } else {
+            indent
+        };
         let arrow = self.arrow();
         let _ = write!(self.out, "{:indent$}{arrow} ", "");
         self.site(site, column);
@@ -592,40 +781,121 @@ impl Renderer {
         }
     }
 
-    fn fallback(&mut self, site: Site<'_>, lookup: &dyn SourceLookup) {
+    fn fallback(&mut self, site: Site<'_>, lookup: &dyn SourceLookup, body: &[u8]) {
         if !site.deferred
-            && let Some(name) = site.name.filter(|name| !name.is_empty())
-            && let Some(file) = lookup.source_by_path(site.path)
-            && let Ok(index) = usize::try_from(site.line.saturating_sub(1))
             && site.line != 0
-            && let Some(raw) = file.text.split_inclusive(|&byte| byte == b'\n').nth(index)
+            && let Some(file) = lookup.source_by_path(site.path)
         {
-            let text = raw
-                .strip_suffix(b"\n")
-                .map_or(raw, |line| line.strip_suffix(b"\r").unwrap_or(line));
-            let start = text
-                .iter()
-                .take_while(|byte| byte.is_ascii_whitespace())
-                .count();
-            let end = start.saturating_add(name.len());
-            if text
-                .get(start..end)
-                .is_some_and(|command| command.eq_ignore_ascii_case(name))
-                && text
-                    .get(end)
-                    .is_none_or(|&byte| byte.is_ascii_whitespace() || byte == b'(')
+            let file_lines: Vec<&[u8]> = file
+                .text
+                .split_inclusive(|&byte| byte == b'\n')
+                .map(|raw| {
+                    raw.strip_suffix(b"\n")
+                        .map_or(raw, |line| line.strip_suffix(b"\r").unwrap_or(line))
+                })
+                .collect();
+
+            if body.starts_with(b"Parse error.")
+                && body.find(b"unterminated string").is_some()
+                && let Some((line_num, text, quote_pos)) =
+                    find_unclosed_quote(&file_lines, site.line)
             {
-                let number_width = site.line.to_string().len();
+                let mut quote_site = site;
+                quote_site.line = line_num;
+                let number_width = line_num.to_string().len();
                 let mark = Mark {
-                    bytes: start..end,
+                    bytes: quote_pos..text.len().max(quote_pos + 1),
                     primary: true,
-                    message: b"",
+                    message: b"the string that starts here has no closing quote",
                 };
-                self.location(number_width, site, editor_column(text, start));
+                self.location(number_width, quote_site, editor_column(text, quote_pos));
                 self.gap(number_width);
-                self.marked_line(number_width, site.line, text, &[mark]);
+                self.marked_line(number_width, line_num, text, &[mark]);
                 self.gap(number_width);
                 return;
+            }
+
+            let target_line = usize::try_from(site.line.saturating_sub(1))
+                .ok()
+                .and_then(|idx| file_lines.get(idx).copied().map(|text| (site.line, text)))
+                .or_else(|| {
+                    body.starts_with(b"Parse error.")
+                        .then(|| {
+                            file_lines
+                                .iter()
+                                .enumerate()
+                                .rev()
+                                .find(|(_, line)| !line.is_empty())
+                                .and_then(|(idx, line)| {
+                                    u32::try_from(idx + 1).ok().map(|n| (n, *line))
+                                })
+                        })
+                        .flatten()
+                });
+
+            if let Some((line_num, text)) = target_line {
+                let start = text
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_whitespace())
+                    .count();
+                if let Some(name) = site.name.filter(|name| !name.is_empty()) {
+                    let end = start.saturating_add(name.len());
+                    if text
+                        .get(start..end)
+                        .is_some_and(|command| command.eq_ignore_ascii_case(name))
+                        && text
+                            .get(end)
+                            .is_none_or(|&byte| byte.is_ascii_whitespace() || byte == b'(')
+                    {
+                        let number_width = line_num.to_string().len();
+                        let mark = Mark {
+                            bytes: start..end,
+                            primary: true,
+                            message: b"",
+                        };
+                        self.location(number_width, site, editor_column(text, start));
+                        self.gap(number_width);
+                        self.marked_line(number_width, line_num, text, &[mark]);
+                        self.gap(number_width);
+                        return;
+                    }
+                } else {
+                    let ident_len = if text
+                        .get(start)
+                        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+                    {
+                        text.get(start..)
+                            .unwrap_or_default()
+                            .iter()
+                            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                            .count()
+                    } else {
+                        0
+                    };
+                    let end = start.saturating_add(ident_len);
+                    let label = if body.starts_with(b"Parse error.")
+                        && body
+                            .find(b"Function missing ending \")\".  End of file reached.")
+                            .is_some()
+                    {
+                        b"this command has no closing \")\"".as_slice()
+                    } else {
+                        b""
+                    };
+                    let mut render_site = site;
+                    render_site.line = line_num;
+                    let number_width = line_num.to_string().len();
+                    let mark = Mark {
+                        bytes: start..end,
+                        primary: true,
+                        message: label,
+                    };
+                    self.location(number_width, render_site, editor_column(text, start));
+                    self.gap(number_width);
+                    self.marked_line(number_width, line_num, text, &[mark]);
+                    self.gap(number_width);
+                    return;
+                }
             }
         }
         self.location(1, site, 0);
@@ -664,6 +934,37 @@ impl Renderer {
             }
         }
     }
+}
+
+fn find_unclosed_quote<'a>(lines: &[&'a [u8]], site_line: u32) -> Option<(u32, &'a [u8], usize)> {
+    let max_idx = usize::try_from(site_line)
+        .ok()
+        .unwrap_or(lines.len())
+        .min(lines.len());
+    for idx in (0..max_idx).rev() {
+        let line = *lines.get(idx)?;
+        let mut open = None;
+        let mut pos = 0;
+        while pos < line.len() {
+            match line.get(pos) {
+                Some(b'#') if open.is_none() => break,
+                Some(b'\\') if open.is_some() => pos += 2,
+                Some(b'"') => {
+                    if open.is_some() {
+                        open = None;
+                    } else {
+                        open = Some(pos);
+                    }
+                    pos += 1;
+                }
+                _ => pos += 1,
+            }
+        }
+        if let Some(quote_pos) = open {
+            return u32::try_from(idx + 1).ok().map(|n| (n, line, quote_pos));
+        }
+    }
+    None
 }
 
 fn clamped_range(file: &SourceFile, span: SourceSpan) -> Range<usize> {

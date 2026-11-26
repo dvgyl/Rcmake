@@ -131,7 +131,7 @@ fn run_tool(argv: &[BString], tool: Tool, persona: persona::Persona, host: Arc<d
         let output = rest.get(1).filter(|arg| !arg.starts_with(b"-"));
         if fb == b"--version" || fb == b"-version" || fb == b"/V" || fb == b"/version" {
             let banner = format!(
-                "{} version {CMAKE_VERSION_STR}\nRcmake {}\n",
+                "{} version {CMAKE_VERSION_STR}\nrcmake {}\n",
                 tool.name(),
                 env!("CARGO_PKG_VERSION")
             );
@@ -285,13 +285,13 @@ fn run_cmake(
     }
 
     if let Some(args) = rest.strip_prefix(&[BString::from("--build")]) {
-        return build::run(argv, args, host.as_ref());
+        return build::run(argv, args, persona, host.as_ref());
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--install")]) {
         return install::run(argv, args, host);
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--workflow")]) {
-        return workflow::run(args, host);
+        return workflow::run(args, persona, host);
     }
 
     if let Some(code) = help::run(argv.first(), rest, persona, host.as_ref()) {
@@ -714,7 +714,7 @@ mod tests {
         );
         assert_eq!(code, 0);
         let out = host.stream_bytes(Stream::Stdout);
-        assert_eq!(out, b"cmake version 4.5.1\nRcmake 0.1.0\n");
+        assert_eq!(out, b"cmake version 4.5.1\nrcmake 0.1.0\n");
     }
 
     #[test]

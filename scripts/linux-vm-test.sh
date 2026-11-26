@@ -297,7 +297,7 @@ linux_runcmake() (
   fi
   trap 'rm -f "$output"' EXIT
   version="$(timeout --kill-after=5s 10s "$bin/cmake" --version)" || exit $?
-  if [[ "$version" != *Rcmake* ]]; then
+  if [[ "$version" != *[Rr]cmake* ]]; then
     printf 'Expected an Rcmake executable at %s.\n' "$bin/cmake" >&2
     exit 1
   fi

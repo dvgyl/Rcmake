@@ -96,7 +96,7 @@ fn omitted_event(pid: u32, dropped_samples: usize, omitted: usize) -> Vec<u8> {
                 ("trace_byte_limit", Value::UInt(omitted as u64)),
             ]),
         ),
-        ("name", Value::string("Rcmake profile samples omitted")),
+        ("name", Value::string("rcmake profile samples omitted")),
         ("ph", Value::string("M")),
         ("pid", Value::UInt(u64::from(pid))),
         ("tid", Value::UInt(0)),

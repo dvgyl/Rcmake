@@ -145,8 +145,17 @@ fn joins_resolved_entries_to_their_exact_config_and_ordinal()
     assert!(rendered.contains("-DLOCAL=1  [direct]"));
     assert!(rendered.contains("Requested configuration debug matched."));
     assert!(rendered.lines().all(|line| line.len() <= 96));
-    assert!(rendered.contains("INTERFACE_COMPILE_DEFINITIONS"));
+    assert!(!rendered.contains("INTERFACE_COMPILE_DEFINITIONS"));
     assert!(!rendered.contains("FOO=2"));
+    let verbose = render_explain_terminal(
+        &report,
+        ExplainRenderOptions {
+            config: Some(b"debug"),
+            verbose: true,
+            ..ExplainRenderOptions::default()
+        },
+    );
+    assert!(verbose.contains("INTERFACE_COMPILE_DEFINITIONS"));
     let json = render_explain_json(&report, Some(b"Release"));
     assert!(json.to_string().contains("\"chain\":null"));
     assert!(!json.to_string().contains("FOO=1"));
@@ -253,7 +262,19 @@ fn handles_ambiguity_and_truncated_variable_history() -> Result<(), Box<dyn std:
     else {
         return Err("unexpected report".into());
     };
-    assert!(suggestions.is_empty());
+    assert_eq!(
+        suggestions,
+        [
+            ExplainSuggestion {
+                name: "item".into(),
+                kind: ExplainItemKind::Target
+            },
+            ExplainSuggestion {
+                name: "item".into(),
+                kind: ExplainItemKind::Variable
+            },
+        ]
+    );
     let report = result.explain(&ExplainQuery::Variable("item".into()));
     let terminal = render_explain_terminal(&report, ExplainRenderOptions::default());
     assert!(terminal.contains("\"old\" -> \"new\""));

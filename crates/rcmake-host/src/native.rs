@@ -597,6 +597,23 @@ impl Host for NativeHost {
         }
     }
 
+    fn terminal_width(&self, stream: Stream) -> Option<usize> {
+        #[cfg(unix)]
+        {
+            let size = match stream {
+                Stream::Stdout => rustix::termios::tcgetwinsize(std::io::stdout()).ok(),
+                Stream::Stderr => rustix::termios::tcgetwinsize(std::io::stderr()).ok(),
+            }?;
+            let cols = usize::from(size.ws_col);
+            (cols > 0).then_some(cols)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = stream;
+            None
+        }
+    }
+
     fn now(&self) -> FileTime {
         match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => FileTime {

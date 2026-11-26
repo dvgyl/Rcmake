@@ -934,10 +934,18 @@ def run_all_checks(rcmake: Path, lsp: Path | None) -> dict[str, Any]:
             "add_executable(hello main.cpp helper.c)\n",
             encoding="utf-8",
         )
+        strict_env = dict(env)
+        if generator == "Ninja":
+            ninja_bin = shutil.which("ninja", path=env.get("PATH"))
+            oracle_dir = os.environ.get("RCMAKE_ORACLE_DIR")
+            if ninja_bin and oracle_dir:
+                ninja_resolved = Path(ninja_bin).resolve()
+                if ninja_resolved.is_relative_to(Path(oracle_dir).resolve()):
+                    strict_env["RCMAKE_HERMETIC_ALLOW_PROGRAMS"] = str(ninja_resolved)
         strict_cap = _run_cmd(
             [rcmake, "-S", herm_clean_src, "-B", root / "herm_clean_build", "-G", generator, "--hermetic=strict"],
             cwd=root,
-            env=env,
+            env=strict_env,
         )
 
         herm_warn_src = root / "herm_warn"

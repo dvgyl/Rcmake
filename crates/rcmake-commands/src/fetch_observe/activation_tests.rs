@@ -234,6 +234,11 @@ fn updates_the_lock_and_populates_an_offline_archive() -> TestResult {
         "{}",
         host.stream_bytes(Stream::Stderr)
     );
+    let update_stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        update_stderr.contains("wrote"),
+        "expected update stderr to report lockfile write, got: {update_stderr:?}"
+    );
     let lock = host.read(
         &absolute("project/rcmake-fetch.lock"),
         ReadRange::All { limit: 8192 },

@@ -39,7 +39,7 @@ pub use error::ArchiveContext;
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub use git::{GitGcReport, GitMirror};
 #[cfg(all(feature = "native", any(unix, windows)))]
-pub use lock::{GitEntry, LockEntry, LockFile, LockSession, UrlEntry};
+pub use lock::{CommitReport, GitEntry, LockEntry, LockFile, LockSession, UrlEntry};
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub use pool::{FetchPool, PrefetchSource, Ticket};
 

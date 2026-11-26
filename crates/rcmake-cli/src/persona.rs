@@ -98,6 +98,21 @@ pub(crate) fn resolve_rich_color(host: &dyn Host, stderr_is_tty: bool, style: Di
             || (stderr_is_tty && host.env_get(b"NO_COLOR").is_none()))
 }
 
+/// Resolve the terminal column width for rich diagnostics.
+pub(crate) fn rich_width(host: &dyn Host) -> usize {
+    if let Some(cols) = host
+        .env_get(b"COLUMNS")
+        .and_then(|value| std::str::from_utf8(&value).ok().map(str::to_owned))
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .filter(|&cols| (20..=4096).contains(&cols))
+    {
+        return cols;
+    }
+    host.terminal_width(Stream::Stderr)
+        .filter(|&cols| (20..=4096).contains(&cols))
+        .unwrap_or(100)
+}
+
 /// Set the resolved diagnostic style in the host environment for CLI-owned children.
 /// Call this before the host captures the child environment.
 pub(crate) fn stick_diag_style(host: &dyn Host, style: DiagStyle) {
@@ -182,5 +197,19 @@ mod tests {
             resolve_diag_style(Persona::Native, None, &host),
             DiagStyle::Rich
         );
+    }
+
+    #[test]
+    fn rich_width_prefers_valid_columns_and_falls_back_to_default() {
+        let host = PureHost::default();
+        assert_eq!(rich_width(&host), 100);
+        host.env_set(b"COLUMNS", Some(b"120"));
+        assert_eq!(rich_width(&host), 120);
+        host.env_set(b"COLUMNS", Some(b"10"));
+        assert_eq!(rich_width(&host), 100);
+        host.env_set(b"COLUMNS", Some(b"not-a-number"));
+        assert_eq!(rich_width(&host), 100);
+        host.env_set(b"COLUMNS", Some(b"200"));
+        assert_eq!(rich_width(&host), 200);
     }
 }

@@ -46,6 +46,9 @@ class OutputParityTests(unittest.TestCase):
              "100% tests passed out of 1\nTotal Test time (real) =   0.01 sec\n"),
             ("build", f"cmake version {ORACLE_VERSION}\n\n"
              "CMake suite maintained and supported by Kitware (kitware.com/cmake).\n",
+             f"cmake version {ORACLE_VERSION}\nrcmake 0.1.0\n"),
+            ("build-legacy", f"cmake version {ORACLE_VERSION}\n\n"
+             "CMake suite maintained and supported by Kitware (kitware.com/cmake).\n",
              f"cmake version {ORACLE_VERSION}\nRcmake 0.1.0\n"),
         ):
             with self.subTest(stage=stage):

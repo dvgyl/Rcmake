@@ -18,6 +18,8 @@ pub struct ConfigureRuntime {
     #[cfg(all(feature = "native", any(unix, windows)))]
     native: Option<native::NativeSession>,
     #[cfg(all(feature = "native", any(unix, windows)))]
+    cached_platform_queries: Option<Arc<super::platform_queries::PlatformQueries>>,
+    #[cfg(all(feature = "native", any(unix, windows)))]
     parse_cache: Option<Arc<rcmake_eval::SharedParseCache>>,
     evaluated: bool,
 }
@@ -36,6 +38,19 @@ impl ConfigureRuntime {
         let evaluated_host = hermetic
             .as_ref()
             .map_or_else(|| Arc::clone(&host), HermeticRuntime::host);
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let cached_platform_queries = (cfg!(target_os = "macos")
+            && !host.supports_process_execution()
+            && services.speed.hermetic == rcmake_eval::HermeticMode::Off)
+            .then(|| {
+                super::platform_queries::PlatformQueries::load_read_only(
+                    host.as_ref(),
+                    build,
+                    &build.join("CMakeFiles/rcmake/platform-queries.v1.json"),
+                )
+                .map(Arc::new)
+            })
+            .flatten();
         #[cfg(all(feature = "native", any(unix, windows)))]
         let native_available = allow_persistent && host.supports_process_execution();
         #[cfg(all(feature = "native", any(unix, windows)))]
@@ -57,6 +72,8 @@ impl ConfigureRuntime {
             hermetic,
             #[cfg(all(feature = "native", any(unix, windows)))]
             native,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            cached_platform_queries,
             #[cfg(all(feature = "native", any(unix, windows)))]
             parse_cache: native_available.then(Arc::default),
             evaluated: false,
@@ -87,6 +104,10 @@ impl ConfigureRuntime {
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(native) = &self.native {
             native.attach(interp);
+        }
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if let Some(queries) = &self.cached_platform_queries {
+            interp.add_session_data(Arc::clone(queries));
         }
     }
 

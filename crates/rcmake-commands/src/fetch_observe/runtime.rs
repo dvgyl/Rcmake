@@ -90,6 +90,7 @@ struct State {
     pending: Option<(PathBuf, Script, CallSite)>,
     pool: Option<FetchPool>,
     tickets: std::collections::HashMap<PrefetchSource, Ticket>,
+    populated: BTreeMap<String, Option<&'static str>>,
 }
 
 pub(crate) struct FetchRuntime(Arc<Runtime>);
@@ -99,6 +100,7 @@ pub(super) struct Runtime {
     pub(super) config: StoreConfig,
     pub(super) lock: Mutex<Option<Result<LockSession<'static>, FetchError>>>,
     services: Services,
+    mode: FetchLockMode,
     offline: bool,
     frozen: bool,
     state: Mutex<State>,
@@ -125,6 +127,7 @@ impl FetchRuntime {
             config,
             lock: Mutex::new(Some(lock)),
             services: services.clone(),
+            mode: declarations.mode,
             offline: declarations.offline,
             frozen: declarations.mode == FetchLockMode::Frozen,
             state: Mutex::default(),
@@ -138,11 +141,39 @@ impl FetchRuntime {
     }
 
     pub(crate) fn finish(self, complete: bool) -> Result<(), FetchError> {
-        let pool = self.0.state().pool.take();
+        let (pool, populated) = {
+            let mut state = self.0.state();
+            (state.pool.take(), std::mem::take(&mut state.populated))
+        };
         drop(pool);
         let lock = lock_mutex(&self.0.lock).take();
         if complete && let Some(Ok(lock)) = lock {
-            lock.commit()?;
+            let report = lock.commit()?;
+            if self.0.mode == FetchLockMode::Update {
+                let count = report.pinned.len();
+                let path = report.path.display();
+                let summary = if report.written {
+                    format!("-- rcmake: wrote {path} ({count} pinned)\n")
+                } else {
+                    format!("-- rcmake: {path} not changed ({count} pinned)\n")
+                };
+                self.0
+                    .host
+                    .write_out(rcmake_host::Stream::Stderr, summary.as_bytes());
+                let pinned: std::collections::BTreeSet<&str> =
+                    report.pinned.iter().map(String::as_str).collect();
+                for (dep, reason) in populated {
+                    if !pinned.contains(dep.as_str()) {
+                        let reason = reason.unwrap_or("transfer cannot record a content hash");
+                        let line = format!(
+                            "-- rcmake: {dep} not pinned ({reason}); --fetch-lock=frozen will reject it.\n"
+                        );
+                        self.0
+                            .host
+                            .write_out(rcmake_host::Stream::Stderr, line.as_bytes());
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -519,6 +550,25 @@ impl Runtime {
                 *repository = effective.clone();
             }
             fetch.declarations.insert(name, declaration);
+        }
+        if self.mode == FetchLockMode::Update {
+            let reason = match fetch.get(&dependency) {
+                Some(decl) if !decl.supported() => Some("transfer cannot record a content hash"),
+                Some(decl) => match &decl.source {
+                    DeclaredSource::Archive { urls, hash: None }
+                        if urls.iter().any(|url| url.starts_with("file://")) =>
+                    {
+                        Some("file:// URL has no URL_HASH")
+                    }
+                    DeclaredSource::Git { .. } if decl.git_commit().is_none() => {
+                        Some("Git reference is not a full commit ID")
+                    }
+                    DeclaredSource::Other => Some("transfer cannot record a content hash"),
+                    _ => Some("transfer cannot record a content hash"),
+                },
+                None => Some("transfer cannot record a content hash"),
+            };
+            state.populated.entry(dependency.clone()).or_insert(reason);
         }
         // Keep the same key that the transfer will obtain from the backtrace.
         state.active.retain(|active| active.site.depth < depth);

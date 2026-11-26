@@ -82,7 +82,7 @@ for variable in ("RCMAKE_VENDORED_DATA_ROOT", "DESTDIR", "CMAKE_INSTALL_MODE"):
 _, cmake, _, cpack = tools
 for tool, expected in zip(tools, ("cmake", "cmake", "ctest", "cpack")):
     version = subprocess.check_output([tool, "--version"], env=env, text=True, timeout=15)
-    if not version.startswith(f"{expected} version ") or "Rcmake" not in version:
+    if not version.startswith(f"{expected} version ") or "rcmake" not in version.lower():
         sys.exit(f"Unexpected version output from {tool.name}. Found {version}")
     print(version, end="", flush=True)
 subprocess.run([cmake, "--help-command", "install"], env=env, check=True, timeout=15,

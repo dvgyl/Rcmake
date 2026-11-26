@@ -321,7 +321,7 @@ jobs:
                   raise SystemExit(f"PATH selected an unexpected CMake executable for {name}: {tool}")
               version = subprocess.check_output([tool, "--version"], env=env, timeout=10).splitlines()
               if version[:1] != [b"cmake version 4.5.1"] or (name == "rcmake") != any(
-                      b"Rcmake" in line for line in version):
+                      b"rcmake" in line.lower() for line in version):
                   raise SystemExit(f"Incorrect CMake executable for {name}.")
               engines[name] = (expected, env)
 

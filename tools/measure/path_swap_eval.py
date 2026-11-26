@@ -52,7 +52,7 @@ OUTPUT_STAGES = ("configure", "build", "test", "package")
 VERSION_FOOTER = re.compile(
     rf"^((?:cmake|ctest|cpack) version {re.escape(ORACLE_VERSION)}\n)"
     r"(?:\nCMake suite maintained and supported by Kitware \(kitware\.com/cmake\)\."
-    r"|Rcmake \d+\.\d+\.\d+(?:[-+][\w.+-]+)?)\n",
+    r"|[Rr]cmake \d+\.\d+\.\d+(?:[-+][\w.+-]+)?)\n",
     re.MULTILINE,
 )
 CONFIGURE_TIME = re.compile(r"^(-- (?:Configuring|Generating) done) \(\d+(?:\.\d+)?s\)$", re.MULTILINE)
@@ -161,7 +161,7 @@ def version_line(name: str, output: str, candidate: bool | None) -> str:
     banner = f"{name} version {ORACLE_VERSION}"
     if lines[:1] != [banner]:
         raise ValueError(f"Expected {banner}. Output was {output!r}.")
-    rcmake = any(line.startswith("Rcmake ") and line[7:].strip() for line in lines[1:])
+    rcmake = any(line.lower().startswith("rcmake ") and line[7:].strip() for line in lines[1:])
     if candidate is not None and rcmake != candidate:
         expected = "Rcmake" if candidate else "upstream CMake"
         raise ValueError(f"Expected {expected} for {name}. Output was {output!r}.")

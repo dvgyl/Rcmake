@@ -367,7 +367,7 @@ impl ArchivePlan {
                 None,
                 format!(
                     "The archive at {} differs from the fetch lock entry.",
-                    sanitize_url(&self.url),
+                    sanitize_url(&self.url).unwrap_or_else(|| "<source>".into()),
                 )
                 .into(),
             );

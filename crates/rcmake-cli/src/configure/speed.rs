@@ -117,7 +117,7 @@ fn env_mode<T>(
         return default;
     };
     parse(&value).unwrap_or_else(|| {
-        let message = format!("Rcmake Warning: Unrecognized value for {key}.\n");
+        let message = format!("rcmake warning: Unrecognized value for {key}.\n");
         host.write_out(rcmake_host::Stream::Stderr, message.as_bytes());
         invalid
     })

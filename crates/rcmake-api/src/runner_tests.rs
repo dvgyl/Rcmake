@@ -337,3 +337,138 @@ fn fatal_denial_in_preload_returns_one_process_request() -> Result<(), ApiError>
     assert_eq!(host.env_get(b"RAN_PROCESS"), None);
     Ok(())
 }
+
+#[test]
+fn module_denials_require_confirmed_cached_probes() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Uncached bundled module execute_process outside bootstrap is NOT suppressed.
+    let script = format!("{PROJECT}\ninclude(CustomProbe)\n");
+    let (host, request) = fixture(&script)?;
+    host.seed_file(
+        &host.initial_cwd().join("cmake/Modules/CustomProbe.cmake"),
+        b"execute_process(COMMAND probe_tool RESULT_VARIABLE probe_rc)\n",
+    )?;
+    let result = run_configure(request.process_policy(ProcessPolicy::Deny))?;
+    match &result.completion {
+        CompletionState::Partial {
+            denied_processes,
+            module_denials,
+            project_denial_sites,
+            ..
+        } => {
+            assert_eq!(denied_processes.len(), 1);
+            assert_eq!(*module_denials, 0);
+            assert_eq!(project_denial_sites.len(), 1);
+        }
+        other => return Err(format!("Expected partial completion, got {other:?}").into()),
+    }
+
+    // 2. Unconfirmed execute_process denials inside project() (including bundled modules)
+    //    are NOT suppressed even when CMAKE_PLATFORM_INFO_INITIALIZED is in initial_cache.
+    let hook_script = concat!(
+        "cmake_minimum_required(VERSION 4.5)\n",
+        "set(CMAKE_PROJECT_INCLUDE \"${CMAKE_CURRENT_SOURCE_DIR}/hook.cmake\")\n",
+        "project(demo LANGUAGES NONE)\n",
+    );
+    let (host, request) = fixture(hook_script)?;
+    let cwd = host.initial_cwd();
+    host.seed_file(
+        &cwd.join("src/hook.cmake"),
+        b"execute_process(COMMAND user_hook RESULT_VARIABLE hook_rc)\n",
+    )?;
+    host.seed_file(
+        &cwd.join("cmake/Modules/CMakeDetermineSystem.cmake"),
+        concat!(
+            "execute_process(COMMAND uname -m RESULT_VARIABLE uname_rc)\n",
+            "set(CMAKE_SYSTEM_NAME PureOS)\n",
+            "set(CMAKE_SYSTEM PureOS)\n",
+            "set(CMAKE_SYSTEM_LOADED 1)\n",
+            "set(CMAKE_SYSTEM_SPECIFIC_INITIALIZE_LOADED 1)\n",
+            "set(CMAKE_SYSTEM_SPECIFIC_INFORMATION_LOADED 1)\n",
+            "file(WRITE \"${CMAKE_PLATFORM_INFO_DIR}/CMakeSystem.cmake\" \"set(CMAKE_SYSTEM PureOS)\\n\")\n",
+        )
+        .as_bytes(),
+    )?;
+    host.seed_file(
+        &cwd.join("cmake/Modules/CMakeUnixFindMake.cmake"),
+        b"set(CMAKE_MAKE_PROGRAM /usr/bin/make CACHE FILEPATH make)\n",
+    )?;
+    let mut cache = Cache::default();
+    cache.insert(
+        "CMAKE_PLATFORM_INFO_INITIALIZED".into(),
+        CacheEntry {
+            value: "1".into(),
+            ty: CacheType::Internal,
+            help: BString::default(),
+            advanced: false,
+            props: Default::default(),
+        },
+    );
+    let result = run_configure(
+        request
+            .initial_cache(cache)
+            .process_policy(ProcessPolicy::Deny),
+    )?;
+    match &result.completion {
+        CompletionState::Partial {
+            denied_processes,
+            module_denials,
+            project_denial_sites,
+            ..
+        } => {
+            assert_eq!(denied_processes.len(), 2);
+            assert_eq!(*module_denials, 0);
+            assert_eq!(project_denial_sites.len(), 2);
+        }
+        other => return Err(format!("Expected partial completion, got {other:?}").into()),
+    }
+
+    // 3. A denied try_compile is NOT suppressed even when its result variable existed in
+    //    initial_cache, because the denial path overwrites the variable with FALSE instead
+    //    of reusing a cached probe result.
+    let tc_script = concat!(
+        "cmake_minimum_required(VERSION 4.5)\n",
+        "project(TryCompileDenied LANGUAGES NONE)\n",
+        "try_compile(HAVE_PREEXISTING \"${CMAKE_BINARY_DIR}/tc\" \"${CMAKE_SOURCE_DIR}/probe.c\")\n",
+    );
+    let (host, request) = fixture(tc_script)?;
+    let cwd = host.initial_cwd();
+    host.seed_file(&cwd.join("src/probe.c"), b"int main(void) { return 0; }\n")?;
+    let mut cache = Cache::default();
+    cache.insert(
+        "HAVE_PREEXISTING".into(),
+        CacheEntry {
+            value: "TRUE".into(),
+            ty: CacheType::Internal,
+            help: BString::default(),
+            advanced: false,
+            props: Default::default(),
+        },
+    );
+    let result = run_configure(
+        request
+            .initial_cache(cache)
+            .process_policy(ProcessPolicy::Deny),
+    )?;
+    assert_eq!(
+        result
+            .model
+            .cache()
+            .get(b"HAVE_PREEXISTING")
+            .map(|entry| entry.value.as_slice()),
+        Some(b"FALSE".as_slice())
+    );
+    match &result.completion {
+        CompletionState::Partial {
+            denied_processes,
+            module_denials,
+            project_denial_sites,
+            ..
+        } => {
+            assert_eq!(denied_processes.len(), 1);
+            assert_eq!(*module_denials, 0);
+            assert_eq!(project_denial_sites.len(), 1);
+        }
+        other => return Err(format!("Expected partial completion, got {other:?}").into()),
+    }
+    Ok(())
+}

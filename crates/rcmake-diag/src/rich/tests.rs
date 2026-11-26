@@ -56,6 +56,7 @@ fn tabs_crlf_and_invalid_utf8_align_markers() -> Result<(), &'static str> {
             "2 | ok\n",
             "  | -- second line\n",
             "  |\n",
+            "\n",
         )
         .as_bytes(),
     );
@@ -216,7 +217,7 @@ fn color_and_gutters_are_independent_and_controls_are_safe() -> Result<(), &'sta
     let plain = render_rich(&diag, Some(&annotations), &map, RichOptions::default());
     let plain = plain.to_str_lossy();
     assert!(plain.starts_with("warning[CMake.Policy]: Unknown command.\n"));
-    assert!(plain.contains(" ╭─▶ input:1:1\n"));
+    assert!(plain.contains("  ╭─▶ input:1:1\n"));
     assert!(plain.contains("1 │ �[0m\n"));
     assert!(!plain.contains('\x1b'));
     let colored = render_rich(
@@ -326,8 +327,129 @@ fn locationless_body_keeps_preformatted_lines() {
     let result = render_rich(&diag, None, &SourceMap::default(), ascii());
     assert_eq!(
         result.as_slice(),
-        b"error: First line.\n  Use /a/two  spaces.cmake.\n\n  \tkeep   spacing\n\n    link_libraries(previous_lib)\n  More detail.\n",
+        b"error: First line.\n  Use /a/two  spaces.cmake.\n\n  \tkeep   spacing\n\n    link_libraries(previous_lib)\n  More detail.\n\n",
     );
+}
+
+#[test]
+fn fallback_without_command_name_renders_parse_snippets_and_clean_unterminated_strings()
+-> Result<(), &'static str> {
+    let mut map = SourceMap::default();
+    let source = add(
+        &mut map,
+        "CMakeLists.txt",
+        b"cmake_minimum_required(VERSION 4.5)\nproject(P LANGUAGES NONE)\nif(TRUE\n",
+    )?;
+    let lookup = Lookup {
+        map,
+        source,
+        show_bundled: false,
+    };
+    let mut diag = diagnostic(Location::FileLine {
+        file: Arc::from(b"CMakeLists.txt".as_slice()),
+        line: 3,
+    });
+    diag.body = "Parse error.  Function missing ending \")\".  End of file reached.".into();
+    let rendered = render_rich(&diag, None, &lookup, RichOptions::default());
+    let text = rendered.to_str_lossy();
+    assert!(text.starts_with("error[parse]: Parse error."));
+    assert!(text.contains("  ╭─▶ CMakeLists.txt:3:1\n"));
+    assert!(text.contains("3 │ if(TRUE\n"));
+    assert!(text.contains("this command has no closing \")\""));
+
+    let mut map2 = SourceMap::default();
+    let source2 = add(
+        &mut map2,
+        "CMakeLists.txt",
+        b"cmake_minimum_required(VERSION 4.5)\nmessage(STATUS \"hello)\n",
+    )?;
+    let lookup2 = Lookup {
+        map: map2,
+        source: source2,
+        show_bundled: false,
+    };
+    let mut diag2 = diagnostic(Location::FileLine {
+        file: Arc::from(b"CMakeLists.txt".as_slice()),
+        line: 3,
+    });
+    diag2.body =
+        "Parse error.  Function missing ending \")\".  Instead found unterminated string with text \"hello)\n\"."
+            .into();
+    let rendered2 = render_rich(&diag2, None, &lookup2, RichOptions::default());
+    let text2 = rendered2.to_str_lossy();
+    assert!(text2.starts_with("error[parse]: "));
+    assert!(!text2.lines().any(|line| line.trim() == "\"."));
+    assert!(text2.contains("2 │ message(STATUS \"hello)\n"));
+    assert!(text2.contains("the string that starts here has no closing quote"));
+    Ok(())
+}
+
+#[test]
+fn rich_codes_classify_send_error_policy_version_unknown_command_and_missing_target()
+-> Result<(), &'static str> {
+    let mut send = diagnostic(Location::Backtrace(Backtrace::default().push(Frame {
+        file: Arc::from(b"CMakeLists.txt".as_slice()),
+        line: 3,
+        name: Some(Arc::from(b"message".as_slice())),
+        kind: FrameKind::Command,
+    })));
+    send.effect = Effect::SetError;
+    send.body = "non-fatal send error".into();
+    let send_rendered = render_rich(&send, None, &SourceMap::default(), ascii());
+    let send_text = send_rendered.to_str_lossy();
+    assert!(send_text.starts_with("error[send-error]: non-fatal send error"));
+    assert!(!send_text.contains("CMake.FatalError"));
+
+    let mut generic_set_err = diagnostic(Location::FileLine {
+        file: Arc::from(b"CMakeLists.txt".as_slice()),
+        line: 1,
+    });
+    generic_set_err.effect = Effect::SetError;
+    generic_set_err.body = "other non-fatal".into();
+    assert!(
+        render_rich(&generic_set_err, None, &SourceMap::default(), ascii())
+            .to_str_lossy()
+            .starts_with("error[CMake.Error]:")
+    );
+
+    let mut unknown = diagnostic(Location::None);
+    unknown.body = "Unknown CMake command \"add_executabel\".".into();
+    assert!(
+        render_rich(&unknown, None, &SourceMap::default(), ascii())
+            .to_str_lossy()
+            .starts_with("error[unknown-command]:")
+    );
+
+    let mut missing = diagnostic(Location::None);
+    missing.body = "Target \"app\" links to:\n\n  fmt::fmt\n\nbut the target was not found.".into();
+    assert!(
+        render_rich(&missing, None, &SourceMap::default(), ascii())
+            .to_str_lossy()
+            .starts_with("error[missing-target]:")
+    );
+
+    let mut map = SourceMap::default();
+    let source = add(
+        &mut map,
+        "CMakeLists.txt",
+        b"cmake_minimum_required(VERSION 3.1)\n",
+    )?;
+    let annotations = Annotations::primary(span(source, 0, 22), "");
+    let mut policy = diagnostic(Location::Backtrace(Backtrace::default().push(Frame {
+        file: Arc::from(b"CMakeLists.txt".as_slice()),
+        line: 1,
+        name: Some(Arc::from(b"cmake_minimum_required".as_slice())),
+        kind: FrameKind::Command,
+    })));
+    policy.body = "Compatibility with CMake < 3.5 has been removed from CMake.\n\nUpdate the VERSION argument <min> value.".into();
+    let policy_rendered = render_rich(&policy, Some(&annotations), &map, ascii());
+    let policy_text = policy_rendered.to_str_lossy();
+    assert!(policy_text.starts_with("error[policy-version]:"));
+    assert!(policy_text.contains("  = help: use a version range\n"));
+    assert!(policy_text.contains("    + cmake_minimum_required(VERSION 3.5..."));
+    assert!(policy_text.contains("-DCMAKE_POLICY_VERSION_MINIMUM=3.5"));
+    assert!(!policy_text.contains("Update the VERSION argument"));
+    Ok(())
 }
 
 #[test]

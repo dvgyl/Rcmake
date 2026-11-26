@@ -574,6 +574,8 @@ impl SnapshotProvider {
             denied_processes,
             omitted_denials: 0,
             omitted_denial_bytes: 0,
+            module_denials: 0,
+            project_denial_sites: Vec::new(),
             cancelled: false,
         };
         let reads = Arc::new(Mutex::new(InputReads::default()));

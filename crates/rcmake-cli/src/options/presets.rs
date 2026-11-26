@@ -23,7 +23,7 @@ pub(super) fn parse(
         b"--list-presets" => {
             let mode = arg.value();
             if let Some(value) = mode.filter(|value| value.starts_with(b"-")) {
-                return Err(unknown_option(value));
+                return Err(unknown_option(value, opts.persona));
             }
             if mode == Some(b"") {
                 crate::emit_cli_error(host, "Invalid value used with --list-presets");

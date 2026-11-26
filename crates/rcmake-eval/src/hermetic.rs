@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt::{self, Write as _},
+    fmt,
     io::ErrorKind,
     path::{Component, Path, PathBuf},
 };
@@ -19,7 +19,7 @@ use crate::services::HermeticMode;
 
 mod context;
 
-pub use context::{HermeticContext, HermeticSiteGuard};
+pub use context::{HermeticContext, HermeticSiteGuard, HermeticSources};
 
 const BASE_ENV: &[&[u8]] = &[
     b"PATH",
@@ -38,7 +38,8 @@ const BASE_ENV: &[&[u8]] = &[
     b"RCMAKE_FETCH_OFFLINE",
     b"RCMAKE_FETCH_GIT_READ_ONLY",
 ];
-const DEFAULT_RECORD_LIMIT: usize = 256;
+const USER_RECORD_LIMIT: usize = 256;
+const BUNDLED_RECORD_LIMIT: usize = 64;
 const MAX_DISPLAY_CHARS: usize = 256;
 
 /// Allowed inputs to one configure. The caller supplies roots and exact executable paths.
@@ -48,6 +49,8 @@ pub struct HermeticPolicy {
     case_insensitive_env: bool,
     case_insensitive_roots: bool,
     roots: BTreeSet<PathBuf>,
+    exact_paths: BTreeSet<PathBuf>,
+    bundled_roots: BTreeSet<PathBuf>,
     programs: BTreeSet<PathBuf>,
     warnings: Vec<String>,
 }
@@ -67,6 +70,8 @@ impl HermeticPolicy {
             case_insensitive_env: system.sysname == "Windows",
             case_insensitive_roots: matches!(system.sysname.as_slice(), b"Darwin" | b"Windows"),
             roots: BTreeSet::new(),
+            exact_paths: BTreeSet::new(),
+            bundled_roots: BTreeSet::new(),
             programs: BTreeSet::new(),
             warnings: Vec::new(),
         };
@@ -133,7 +138,58 @@ impl HermeticPolicy {
         true
     }
 
-    /// Allow one existing, absolute executable path. The caller resolves tool names first.
+    /// Allow reads of one exact absolute path, such as a sibling entry point.
+    pub fn allow_exact_path(&mut self, host: &dyn Host, path: &Path) -> bool {
+        let Some(resolved) = resolve_path(host, path) else {
+            return false;
+        };
+        self.exact_paths.insert(resolved);
+        true
+    }
+
+    /// Mark one directory root as belonging to bundled CMake modules or templates.
+    pub fn allow_bundled_root(&mut self, host: &dyn Host, root: &Path) -> bool {
+        if !root.is_absolute() {
+            return false;
+        }
+        let cleaned = clean_path(root);
+        let mut added = self.bundled_roots.insert(cleaned);
+        if let Some(resolved) = resolve_path(host, root) {
+            added |= self.bundled_roots.insert(clean_path(&resolved));
+        }
+        added || !self.bundled_roots.is_empty()
+    }
+
+    /// Replace the set of bundled CMake module and template roots.
+    pub fn set_bundled_roots<'a>(
+        &mut self,
+        host: &dyn Host,
+        roots: impl IntoIterator<Item = &'a Path>,
+    ) {
+        self.bundled_roots.clear();
+        for root in roots {
+            self.allow_bundled_root(host, root);
+        }
+    }
+
+    /// Return whether `site` originates inside one of the bundled module or template roots.
+    #[must_use]
+    pub fn is_bundled_site(&self, site: &HermeticSite) -> bool {
+        if self.bundled_roots.is_empty() || !site.file().is_absolute() {
+            return false;
+        }
+        let cleaned = clean_path(site.file());
+        let file = windows_path_spelling(&cleaned);
+        self.bundled_roots.iter().any(|root| {
+            let root = windows_path_spelling(root);
+            path_has_prefix(file.as_ref(), root.as_ref(), self.case_insensitive_roots)
+        })
+    }
+
+    /// Allow one explicitly approved, existing, absolute executable path.
+    ///
+    /// Use [Self::allow_program_in_roots] for automatic host toolchain discovery so
+    /// symlinks cannot escape verified system directories.
     pub fn allow_program(&mut self, host: &dyn Host, program: &Path) -> bool {
         if !program.is_absolute()
             || !host.metadata(program, Follow::Yes).is_ok_and(|metadata| {
@@ -147,6 +203,50 @@ impl HermeticPolicy {
             return false;
         };
         self.programs.insert(path);
+        true
+    }
+
+    /// Allow one existing, absolute executable path only when its canonical target
+    /// is a regular executable file inside one of `trusted_roots`.
+    pub fn allow_program_in_roots<'a>(
+        &mut self,
+        host: &dyn Host,
+        program: &Path,
+        trusted_roots: impl IntoIterator<Item = &'a Path>,
+    ) -> bool {
+        if !program.is_absolute() {
+            return false;
+        }
+        let Ok(canonical) = host.canonicalize(program) else {
+            return false;
+        };
+        if !host.metadata(&canonical, Follow::No).is_ok_and(|metadata| {
+            metadata.kind == FileKind::File
+                && (self.case_insensitive_env || metadata.mode & 0o111 != 0)
+        }) {
+            return false;
+        }
+        let canon_spelled = windows_path_spelling(&canonical);
+        let in_trusted_root = trusted_roots.into_iter().any(|root| {
+            if !root.is_absolute() {
+                return false;
+            }
+            let Ok(resolved_root) = host.canonicalize(root) else {
+                return false;
+            };
+            if !host
+                .metadata(&resolved_root, Follow::No)
+                .is_ok_and(|metadata| metadata.kind == FileKind::Dir)
+            {
+                return false;
+            }
+            let root_spelled = windows_path_spelling(&resolved_root);
+            canon_spelled.as_ref().starts_with(root_spelled.as_ref())
+        });
+        if !in_trusted_root {
+            return false;
+        }
+        self.programs.insert(canonical);
         true
     }
 
@@ -187,6 +287,8 @@ impl HermeticPolicy {
                     || (self.case_insensitive_roots && same_root(host, &path, &root))
             };
             self.roots.iter().any(|root| contains(root))
+                || self.programs.contains(path)
+                || self.exact_paths.contains(path)
                 || fetch_cache
                     .and_then(|root| resolve_path(host, root))
                     .is_some_and(|root| contains(&root))
@@ -238,6 +340,43 @@ fn same_root(host: &dyn Host, path: &Path, root: &Path) -> bool {
         && allowed.kind == FileKind::Dir
         && actual.ino != 0
         && (actual.dev, actual.ino) == (allowed.dev, allowed.ino)
+}
+
+fn clean_path(path: &Path) -> PathBuf {
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                cleaned.pop();
+            }
+            other => cleaned.push(other),
+        }
+    }
+    cleaned
+}
+
+fn path_has_prefix(path: &Path, root: &Path, case_insensitive: bool) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    if !case_insensitive {
+        return false;
+    }
+    let mut path_components = path.components();
+    for root_part in root.components() {
+        let Some(path_part) = path_components.next() else {
+            return false;
+        };
+        if !path_part
+            .as_os_str()
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(root_part.as_os_str().as_encoded_bytes())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn valid_env_name(name: &[u8]) -> bool {
@@ -302,6 +441,15 @@ impl SourceLocation {
         }
     }
 
+    /// Location for input reads performed during startup before any listfile command runs.
+    #[must_use]
+    pub fn startup() -> Self {
+        Self {
+            file: PathBuf::from("<rcmake startup>"),
+            line: 0,
+        }
+    }
+
     /// Return the original source path.
     pub fn file(&self) -> &Path {
         &self.file
@@ -318,7 +466,10 @@ impl fmt::Display for SourceLocation {
         for ch in self.file.to_string_lossy().chars() {
             write_display_char(formatter, ch)?;
         }
-        write!(formatter, ":{}", self.line)
+        if self.line != 0 {
+            write!(formatter, ":{}", self.line)?;
+        }
+        Ok(())
     }
 }
 
@@ -349,7 +500,8 @@ impl ViolationKind {
         }
     }
 
-    const fn description(self) -> &'static str {
+    /// Return the human-readable description for this kind of violation.
+    pub const fn description(self) -> &'static str {
         match self {
             Self::UndeclaredEnvRead => "Read of an undeclared environment variable",
             Self::RegistryRead => "Read of the Windows registry",
@@ -369,6 +521,10 @@ pub struct HermeticViolation {
     pub site: HermeticSite,
     /// Input name, path, or remote host with credentials removed.
     pub value: String,
+    /// Number of times this `(kind, identity)` violation occurred.
+    pub occurrences: usize,
+    /// Whether every observed occurrence came from a bundled CMake module.
+    pub bundled: bool,
     hint: String,
 }
 
@@ -398,6 +554,8 @@ impl fmt::Display for HermeticViolation {
 pub enum AuditDecision {
     /// Continue without a violation.
     Allow,
+    /// Continue and withhold the external value without recording a violation.
+    Withhold,
     /// Continue and apply the warning-mode input rules.
     Warn,
     /// Reject the input or operation.
@@ -420,23 +578,21 @@ pub struct AuditSummary {
     pub recorded: usize,
     /// Number of observations omitted after the limit. This can include repeats.
     pub omitted: usize,
+    /// Number of retained records attributed to user project code.
+    pub user: usize,
+    /// Number of retained records attributed to bundled CMake modules.
+    pub bundled: usize,
+    /// Number of user observations omitted after the user record limit.
+    pub omitted_user: usize,
+    /// Number of bundled observations omitted after the bundled record limit.
+    pub omitted_bundled: usize,
     /// Combined rule for distinct, valid environment names in retained records.
     pub allow_env: Option<String>,
 }
 
 impl fmt::Display for AuditSummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.omitted != 0 {
-            write!(
-                formatter,
-                "Additional hermetic violations omitted: {}.",
-                self.omitted
-            )?;
-        }
         if let Some(names) = &self.allow_env {
-            if self.omitted != 0 {
-                formatter.write_char('\n')?;
-            }
             write!(formatter, "RCMAKE_HERMETIC_ALLOW_ENV={names}")?;
         }
         Ok(())
@@ -455,28 +611,39 @@ enum InputIdentity {
 pub struct HermeticAuditor {
     mode: HermeticMode,
     policy: HermeticPolicy,
-    records: BTreeMap<(HermeticSite, ViolationKind, InputIdentity), HermeticViolation>,
+    records: BTreeMap<(ViolationKind, InputIdentity), HermeticViolation>,
+    site_bundled_cache: BTreeMap<PathBuf, bool>,
     reported_omissions: bool,
-    record_limit: usize,
-    omitted: usize,
+    user_limit: usize,
+    bundled_limit: usize,
+    user_records: usize,
+    bundled_records: usize,
+    omitted_user: usize,
+    omitted_bundled: usize,
 }
 
 impl HermeticAuditor {
-    /// Start an audit with the default limit of 256 diagnostic records.
+    /// Start an audit with the default limits of 256 user and 64 bundled records.
     pub fn new(mode: HermeticMode, policy: HermeticPolicy) -> Self {
         Self {
             mode,
             policy,
             records: BTreeMap::new(),
+            site_bundled_cache: BTreeMap::new(),
             reported_omissions: false,
-            record_limit: DEFAULT_RECORD_LIMIT,
-            omitted: 0,
+            user_limit: USER_RECORD_LIMIT,
+            bundled_limit: BUNDLED_RECORD_LIMIT,
+            user_records: 0,
+            bundled_records: 0,
+            omitted_user: 0,
+            omitted_bundled: 0,
         }
     }
 
     /// Use a lower record limit. A zero limit still enforces decisions.
     pub fn with_record_limit(mut self, limit: usize) -> Self {
-        self.record_limit = limit.min(DEFAULT_RECORD_LIMIT);
+        self.user_limit = limit.min(USER_RECORD_LIMIT);
+        self.bundled_limit = limit.min(BUNDLED_RECORD_LIMIT);
         self
     }
 
@@ -485,14 +652,33 @@ impl HermeticAuditor {
         self.policy.allow_root(host, path)
     }
 
+    /// Mark a directory root as belonging to bundled CMake modules or templates.
+    pub fn allow_bundled_root(&mut self, host: &dyn Host, path: &Path) -> bool {
+        self.site_bundled_cache.clear();
+        self.policy.allow_bundled_root(host, path)
+    }
+
+    /// Return whether `site` originates inside one of the bundled module or template roots.
+    pub fn is_bundled_site(&mut self, site: &HermeticSite) -> bool {
+        if let Some(&cached) = self.site_bundled_cache.get(site.file()) {
+            return cached;
+        }
+        let bundled = self.policy.is_bundled_site(site);
+        self.site_bundled_cache
+            .insert(site.file().to_owned(), bundled);
+        bundled
+    }
+
     /// Record a registry read as an external input.
     pub fn check_registry(&mut self, site: &HermeticSite) -> AuditOutcome<'_> {
+        let bundled = self.is_bundled_site(site);
         self.record(
             site,
             ViolationKind::RegistryRead,
             InputIdentity::Registry,
             "Windows registry".into(),
             "Pass the path as a configure input.".into(),
+            bundled,
         )
     }
 
@@ -500,6 +686,12 @@ impl HermeticAuditor {
     pub fn check_env(&mut self, site: &HermeticSite, name: &[u8]) -> AuditOutcome<'_> {
         if self.mode == HermeticMode::Off || self.policy.allows_env(name) {
             return allowed();
+        }
+        if self.is_bundled_site(site) {
+            return AuditOutcome {
+                decision: AuditDecision::Withhold,
+                diagnostic: None,
+            };
         }
         let (value, hint) = if valid_env_name(name) {
             let name = String::from_utf8_lossy(name);
@@ -522,6 +714,7 @@ impl HermeticAuditor {
             InputIdentity::Env(self.policy.env_key(name)),
             value,
             hint,
+            false,
         )
     }
 
@@ -556,6 +749,7 @@ impl HermeticAuditor {
         if let Some(path) = self.policy.resolve_allowed_path(host, path, fetch_cache) {
             return (allowed(), Some(path));
         }
+        let bundled = self.is_bundled_site(site);
         let directory = path.parent().filter(|parent| parent.is_absolute());
         let directory = directory.map_or_else(|| "<DIR>".into(), |dir| dir.to_string_lossy());
         let directory = if directory
@@ -566,12 +760,26 @@ impl HermeticAuditor {
         } else {
             &directory
         };
+        let is_executable = path.is_absolute()
+            && host.metadata(path, Follow::Yes).is_ok_and(|meta| {
+                meta.kind == FileKind::File
+                    && (self.policy.case_insensitive_env || meta.mode & 0o111 != 0)
+            });
+        let hint = if is_executable {
+            format!(
+                "Allow this tool with RCMAKE_HERMETIC_ALLOW_PROGRAMS={} or set RCMAKE_HERMETIC_ALLOW_PATHS={directory}.",
+                display_input_path(path)
+            )
+        } else {
+            format!("Declare the input root or set RCMAKE_HERMETIC_ALLOW_PATHS={directory}.")
+        };
         let outcome = self.record(
             site,
             ViolationKind::OutOfTreePathRead,
             InputIdentity::Path(path.into()),
             display_input_path(path),
-            format!("Declare the input root or set RCMAKE_HERMETIC_ALLOW_PATHS={directory}."),
+            hint,
+            bundled,
         );
         (outcome, None)
     }
@@ -631,6 +839,7 @@ impl HermeticAuditor {
             InputIdentity::Remote(target.into(), dependency.map(str::to_owned)),
             display_remote(target),
             hint,
+            false,
         )
     }
 
@@ -644,17 +853,24 @@ impl HermeticAuditor {
         if self.mode == HermeticMode::Off || self.policy.allows_program(host, program) {
             return allowed();
         }
+        let bundled = self.is_bundled_site(site);
         let identity = if program.is_absolute() {
             display_text(&program.to_string_lossy())
         } else {
             "<unresolved executable>".into()
+        };
+        let hint = if program.is_absolute() {
+            format!("Allow this tool with RCMAKE_HERMETIC_ALLOW_PROGRAMS={identity}.")
+        } else {
+            "Set RCMAKE_HERMETIC_ALLOW_PROGRAMS to the absolute executable path.".into()
         };
         self.record(
             site,
             ViolationKind::UnapprovedProcess,
             InputIdentity::Path(program.into()),
             identity,
-            "Set RCMAKE_HERMETIC_ALLOW_PROGRAMS to the absolute executable path.".into(),
+            hint,
+            bundled,
         )
     }
 
@@ -672,24 +888,38 @@ impl HermeticAuditor {
         self.mode == HermeticMode::Off || self.policy.allows_env(name)
     }
 
-    /// Return retained diagnostic records in a stable order.
+    /// Return retained diagnostic records in a stable order: user records first, then bundled.
     pub fn records(&self) -> impl ExactSizeIterator<Item = &HermeticViolation> {
-        self.records.values()
+        let mut ordered: Vec<&HermeticViolation> = self.records.values().collect();
+        ordered.sort_by(|left, right| {
+            left.bundled
+                .cmp(&right.bundled)
+                .then_with(|| left.site.file().cmp(right.site.file()))
+                .then_with(|| left.site.line().cmp(&right.site.line()))
+                .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| left.value.cmp(&right.value))
+        });
+        ordered.into_iter()
     }
 
     /// Return the counts and a combined rule for multiple environment names.
     pub fn summary(&self) -> AuditSummary {
         let names: BTreeSet<_> = self
             .records
-            .keys()
-            .filter_map(|(_, _, identity)| match identity {
+            .iter()
+            .filter(|(_, record)| !record.bundled)
+            .filter_map(|((_, identity), _)| match identity {
                 InputIdentity::Env(name) if valid_env_name(name) => std::str::from_utf8(name).ok(),
                 _ => None,
             })
             .collect();
         AuditSummary {
             recorded: self.records.len(),
-            omitted: self.omitted,
+            omitted: self.omitted_user.saturating_add(self.omitted_bundled),
+            user: self.user_records,
+            bundled: self.bundled_records,
+            omitted_user: self.omitted_user,
+            omitted_bundled: self.omitted_bundled,
             allow_env: (names.len() > 1).then(|| names.into_iter().collect::<Vec<_>>().join(";")),
         }
     }
@@ -711,24 +941,55 @@ impl HermeticAuditor {
         identity: InputIdentity,
         value: String,
         hint: String,
+        bundled: bool,
     ) -> AuditOutcome<'_> {
         let decision = match self.mode {
             HermeticMode::Off => return allowed(),
             HermeticMode::Warn => AuditDecision::Warn,
             HermeticMode::Strict => AuditDecision::Deny,
         };
-        let full = self.records.len() >= self.record_limit;
-        let diagnostic = match self.records.entry((site.clone(), kind, identity)) {
-            std::collections::btree_map::Entry::Occupied(_) => None,
-            std::collections::btree_map::Entry::Vacant(_) if full => {
-                self.omitted = self.omitted.saturating_add(1);
+        let user_full = self.user_records >= self.user_limit;
+        let bundled_full = self.bundled_records >= self.bundled_limit;
+        let diagnostic = match self.records.entry((kind, identity)) {
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                let record = slot.get_mut();
+                record.occurrences = record.occurrences.saturating_add(1);
+                if record.bundled && !bundled {
+                    if user_full {
+                        self.omitted_user = self.omitted_user.saturating_add(1);
+                        None
+                    } else {
+                        record.site = site.clone();
+                        record.bundled = false;
+                        record.hint = hint;
+                        self.bundled_records = self.bundled_records.saturating_sub(1);
+                        self.user_records = self.user_records.saturating_add(1);
+                        Some(&*slot.into_mut())
+                    }
+                } else {
+                    None
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(_) if bundled && bundled_full => {
+                self.omitted_bundled = self.omitted_bundled.saturating_add(1);
+                None
+            }
+            std::collections::btree_map::Entry::Vacant(_) if !bundled && user_full => {
+                self.omitted_user = self.omitted_user.saturating_add(1);
                 None
             }
             std::collections::btree_map::Entry::Vacant(slot) => {
+                if bundled {
+                    self.bundled_records = self.bundled_records.saturating_add(1);
+                } else {
+                    self.user_records = self.user_records.saturating_add(1);
+                }
                 Some(&*slot.insert(HermeticViolation {
                     kind,
                     site: site.clone(),
                     value,
+                    occurrences: 1,
+                    bundled,
                     hint,
                 }))
             }

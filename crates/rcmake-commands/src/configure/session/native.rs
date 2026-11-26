@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use rcmake_base::BString;
 use rcmake_eval::journal::{ConfigureSnapshot, ReplayHost, ReplayReceipts};
@@ -22,6 +22,8 @@ pub(super) struct NativeSession {
     services: Services,
     fetch: Option<FetchRuntime>,
     probe: Option<Arc<ProbeRuntime>>,
+    platform_queries: OnceLock<Arc<super::super::platform_queries::PlatformQueries>>,
+    build: PathBuf,
     snapshot: PathBuf,
     pending: Option<Vec<u8>>,
     report: Option<BString>,
@@ -71,6 +73,8 @@ impl NativeSession {
             services: services.clone(),
             fetch,
             probe,
+            platform_queries: OnceLock::new(),
+            build: build.to_owned(),
             snapshot,
             pending: None,
             report: None,
@@ -88,9 +92,12 @@ impl NativeSession {
     pub(super) fn attach(&self, interp: &mut Interp) {
         let replay = self.replay_enabled(interp);
         if (self.memo.is_some() || self.probe.is_some() || replay) && cfg!(target_os = "macos") {
-            let queries = super::super::platform_queries::PlatformQueries::default();
-            queries.prefetch(&self.host());
-            interp.add_session_data(Arc::new(queries));
+            let queries = self.platform_queries.get_or_init(|| {
+                let queries = Arc::new(super::super::platform_queries::PlatformQueries::default());
+                queries.prefetch(&self.host());
+                queries
+            });
+            interp.add_session_data(Arc::clone(queries));
             if replay {
                 interp.add_session_data(Arc::new(ReplayReceipts::default()));
             }
@@ -186,11 +193,23 @@ impl NativeSession {
             fetch.finish(complete)?;
         }
         if complete && let Some(bytes) = self.pending {
-            publish(self.base.as_ref(), &self.snapshot, &bytes);
+            publish(self.base.as_ref(), &self.build, &self.snapshot, &bytes);
+        }
+        if complete
+            && let Some(queries) = self.platform_queries.get()
+            && let Some(bytes) = queries.render_persisted()
+        {
+            publish(
+                self.base.as_ref(),
+                &self.build,
+                &self.snapshot.with_file_name("platform-queries.v1.json"),
+                &bytes,
+            );
         }
         if complete && let Some(report) = self.report {
             publish(
                 self.base.as_ref(),
+                &self.build,
                 &self.snapshot.with_file_name("replay-result.v1.json"),
                 &report,
             );
@@ -217,16 +236,18 @@ fn replay_report(interp: &Interp) -> BString {
     ])))
 }
 
-fn publish(host: &dyn Host, file: &Path, bytes: &[u8]) {
+fn publish(host: &dyn Host, build_root: &Path, file: &Path, bytes: &[u8]) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let Some(dir) = file.parent() else { return };
-    if host.create_dir_all(dir).is_err() {
+    let Some(target) =
+        super::super::platform_queries::verified_cache_path(host, build_root, file, true)
+    else {
         return;
-    }
+    };
+    let Some(dir) = target.parent() else { return };
     let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
     let staged = dir.join(format!(".configure-{}-{suffix:x}", host.system().pid));
     if host.write(&staged, bytes, WriteMode::CreateNew).is_ok()
-        && (host.set_permissions(&staged, 0o600).is_err() || host.rename(&staged, file).is_err())
+        && (host.set_permissions(&staged, 0o600).is_err() || host.rename(&staged, &target).is_err())
     {
         let _ = host.remove_file(&staged);
     }

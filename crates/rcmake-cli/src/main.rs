@@ -66,13 +66,24 @@ fn main() -> ExitCode {
     let mut args = std::env::args_os();
     let program = args.next();
     let first = args.next();
-    if program.as_deref().is_some_and(|path| {
-        stem_is(path, "rcmake-lsp")
-            || (first.as_deref() == Some(OsStr::new("lsp"))
-                && stem_is(path, "rcmake")
-                && std::env::var_os("RCMAKE_ORACLE_MODE").as_deref() != Some(OsStr::new("1")))
-    }) {
-        return rcmake_lsp::run_stdio();
+    if let Some(path) = program.as_deref() {
+        if stem_is(path, "rcmake-lsp") {
+            let lsp_args: Vec<_> = first
+                .into_iter()
+                .chain(args)
+                .map(|a| rcmake_host::path::from_native(Path::new(&a)))
+                .collect();
+            return rcmake_lsp::run_stdio_with_args("rcmake-lsp", &lsp_args);
+        }
+        if first.as_deref() == Some(OsStr::new("lsp"))
+            && stem_is(path, "rcmake")
+            && std::env::var_os("RCMAKE_ORACLE_MODE").as_deref() != Some(OsStr::new("1"))
+        {
+            let lsp_args: Vec<_> = args
+                .map(|a| rcmake_host::path::from_native(Path::new(&a)))
+                .collect();
+            return rcmake_lsp::run_stdio_with_args("rcmake lsp", &lsp_args);
+        }
     }
     let argv: Vec<_> = program
         .into_iter()

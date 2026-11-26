@@ -63,10 +63,12 @@ pub(super) fn run(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
     if found {
         0
     } else {
-        emit_cli_error(
-            host.as_ref(),
-            "Run 'cmake --help' for all supported options.",
-        );
+        let usage_hint = if opts.persona == crate::persona::Persona::Native {
+            "Run 'rcmake --help' for all supported options."
+        } else {
+            "Run 'cmake --help' for all supported options."
+        };
+        emit_cli_error(host.as_ref(), usage_hint);
         1
     }
 }

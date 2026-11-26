@@ -6,6 +6,7 @@
 mod analysis;
 pub use rcmake_diag::annotate;
 mod catalog;
+pub mod cli;
 #[cfg(feature = "eval")]
 pub mod eval_provider;
 mod expression;
@@ -47,7 +48,33 @@ pub fn install_stdio_panic_hook() {
 /// Run the evaluated language server over standard input and output.
 #[cfg(all(any(unix, windows), feature = "eval", feature = "stdio"))]
 pub fn run_stdio() -> std::process::ExitCode {
-    stdio_eval::serve().unwrap_or(std::process::ExitCode::FAILURE)
+    run_stdio_with_args("rcmake-lsp", &[] as &[&[u8]])
+}
+
+/// Handle command-line startup flags, then run the evaluated language server over stdio.
+#[cfg(all(any(unix, windows), feature = "eval", feature = "stdio"))]
+pub fn run_stdio_with_args(program: &str, args: &[impl AsRef<[u8]>]) -> std::process::ExitCode {
+    use std::io::{IsTerminal as _, Write as _};
+
+    match cli::startup(program, args) {
+        cli::Startup::Exit { stdout, code } => {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(stdout.as_bytes());
+            let _ = out.flush();
+            std::process::ExitCode::from(code)
+        }
+        cli::Startup::Serve => {
+            if std::io::stdin().is_terminal() {
+                let mut err = std::io::stderr().lock();
+                let _ = writeln!(
+                    err,
+                    "{program}: waiting for LSP messages on standard input. Run {program} --help for usage."
+                );
+                let _ = err.flush();
+            }
+            stdio_eval::serve().unwrap_or(std::process::ExitCode::FAILURE)
+        }
+    }
 }
 
 #[cfg(all(any(unix, windows), feature = "eval", feature = "stdio"))]

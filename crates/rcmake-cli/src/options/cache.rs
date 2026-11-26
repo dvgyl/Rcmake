@@ -47,7 +47,7 @@ pub(super) fn parse(
             let raw = arg.value().ok_or("-D must be followed with VAR=VALUE.")?;
             let Some(def) = parse_define(raw) else {
                 host.write_out(Stream::Stderr, format!("CMake Error: Parse error in command line argument: {}\n Should be: VAR:type=value\n\n", String::from_utf8_lossy(raw)).as_bytes());
-                return Err(cli_usage_error_only(host));
+                return Err(cli_usage_error_only(host, opts.persona));
             };
             // `PATH` and `FILEPATH` values are normalized when the edit runs,
             // after the preset environment is active.

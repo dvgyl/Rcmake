@@ -2477,7 +2477,7 @@ def evaluate(args, root: Path, report: dict) -> None:
     if version["returncode"] or version["error"] or version["stdout"].splitlines()[:1] != ["cmake version 4.5.1"]:
         raise ValueError(f"Expected the CMake 4.5.1 oracle. {version}")
     candidate = run_command([args.rcmake, "--version"], root, args.timeout, clean_environment())
-    if candidate["returncode"] or candidate["error"] or "Rcmake" not in candidate["stdout"]:
+    if candidate["returncode"] or candidate["error"] or "rcmake" not in candidate["stdout"].lower():
         raise ValueError(f"Expected a staged Rcmake executable. {candidate}")
     selected = select_cases(
         smoke=args.smoke,

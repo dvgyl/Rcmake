@@ -465,9 +465,11 @@ impl ProfileRecorder {
         let mut spans = state.spans.clone().into_sorted_vec();
         let coverage = resolve_spans(&mut spans);
         let dropped = state.dropped_spans;
+        let modules = modules_roots(host);
+        let summary = terminal::html_summary(&state, &spans, wall, &modules);
         host.write_out(
             Stream::Stderr,
-            terminal::render(&state, &spans, wall, coverage).as_bytes(),
+            terminal::render(&state, &spans, wall, coverage, &modules).as_bytes(),
         );
         drop(state);
 
@@ -478,7 +480,7 @@ impl ProfileRecorder {
         let (trace, trace_omitted) =
             trace::render(&spans, host.system().pid, self.trace_limit, dropped);
         let (folded, folded_omitted) = graph.folded(FOLDED_BYTES, dropped);
-        let (html, html_omitted) = graph.html(HTML_BYTES, dropped);
+        let (html, html_omitted) = graph.html(HTML_BYTES, dropped, Some(&summary));
         let _lock = host.lock_file(
             &directory.join(".rcmake-profile.lock"),
             Some(Duration::from_secs(10)),
@@ -507,13 +509,43 @@ impl ProfileRecorder {
         current.check_destination()?;
         current.publish()?;
         staged.path.clear();
+        for (name, bytes) in [
+            ("trace.json", trace.as_slice()),
+            ("stacks.folded", folded.as_bytes()),
+            ("flamegraph.html", html.as_bytes()),
+        ] {
+            let latest = Artifact::stage(host, &directory, name, bytes)?;
+            latest.check_destination()?;
+            latest.publish()?;
+        }
         let message = format!(
-            "Profile files: {}\n",
-            terminal::display_path(&run_directory)
+            "Profile: {}\nRun files: {}\n",
+            terminal::display_path(&directory.join("flamegraph.html")),
+            terminal::display_path(&run_directory),
         );
         host.write_out(Stream::Stderr, message.as_bytes());
         Ok(())
     }
+}
+
+fn modules_roots(host: &dyn Host) -> Vec<BString> {
+    let Some(root) = rcmake_host::discover_cmake_root(host, None).1 else {
+        return Vec::new();
+    };
+    let raw = root.join("Modules");
+    let mut roots = vec![
+        rcmake_base::path_lex::Lexical::new(&rcmake_host::path::from_native_cmake(&raw))
+            .normalize(),
+    ];
+    if let Ok(canon) = host.canonicalize(&raw) {
+        let canon =
+            rcmake_base::path_lex::Lexical::new(&rcmake_host::path::from_native_cmake(&canon))
+                .normalize();
+        if !roots.contains(&canon) {
+            roots.push(canon);
+        }
+    }
+    roots
 }
 
 struct StagedRun<'a> {
@@ -858,17 +890,16 @@ mod tests {
         let wall = Duration::from_secs(4);
         first.record_phase(ProfilePhase::Eval, Duration::ZERO, wall);
         second.record_phase(ProfilePhase::Eval, Duration::ZERO, wall);
-        let a = host.initial_cwd().join("first");
-        let b = host.initial_cwd().join("second");
-        first.write(&host, &a, wall)?;
-        second.write(&host, &b, wall)?;
-        let a = pinned_run(&host, &a)?;
-        let b = pinned_run(&host, &b)?;
+        let a_dir = host.initial_cwd().join("first");
+        let b_dir = host.initial_cwd().join("second");
+        first.write(&host, &a_dir, wall)?;
+        second.write(&host, &b_dir, wall)?;
+        let a = pinned_run(&host, &a_dir)?;
+        let b = pinned_run(&host, &b_dir)?;
         for name in ["trace.json", "stacks.folded", "flamegraph.html"] {
-            assert_eq!(
-                host.read(&a.join(name), RANGE)?,
-                host.read(&b.join(name), RANGE)?
-            );
+            let a_bytes = host.read(&a.join(name), RANGE)?;
+            assert_eq!(a_bytes, host.read(&b.join(name), RANGE)?);
+            assert_eq!(a_bytes, host.read(&a_dir.join(name), RANGE)?);
         }
         let trace = host.read(&a.join("trace.json"), RANGE)?;
         assert!(
@@ -882,6 +913,8 @@ mod tests {
         assert!(stderr.contains("4.00 s"));
         assert!(stderr.contains("src/<test>.cmake"));
         assert!(stderr.contains("<macro>"));
+        assert!(stderr.contains("Profile: "));
+        assert!(stderr.contains("Run files: "));
         Ok(())
     }
 

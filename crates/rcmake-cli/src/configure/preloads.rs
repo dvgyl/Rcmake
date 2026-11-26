@@ -120,12 +120,13 @@ impl ConfigureSession<'_> {
     ) {
         let (command, root) =
             rcmake_host::discover_cmake_root(self.host.as_ref(), self.argv.first());
+        let cmake_root = root.unwrap_or_default();
         let mut interp = new_interp_with_paths(
             &self.opts,
             RunMode::Configure,
             runtime.host(),
             command,
-            root.unwrap_or_default(),
+            cmake_root,
             self.argv,
             Services::default(),
         );

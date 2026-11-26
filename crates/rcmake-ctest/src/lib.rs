@@ -181,7 +181,7 @@ pub fn main(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     }
 }
 
-const USAGE: &[u8] = b"Usage\n\n  ctest [options]\n\n";
+const USAGE: &[u8] = include_bytes!("help.txt");
 
 fn dispatch(
     host: &Arc<dyn Host>,
@@ -220,7 +220,7 @@ fn dispatch(
                 )
             } else {
                 format!(
-                    "ctest version {}\nRcmake {}\n",
+                    "ctest version {}\nrcmake {}\n",
                     rcmake_base::CMAKE_VERSION_STR,
                     env!("CARGO_PKG_VERSION")
                 )

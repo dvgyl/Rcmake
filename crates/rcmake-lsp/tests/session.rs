@@ -294,7 +294,7 @@ fn rejected(mut messages: Vec<RpcMessage>, recovery: &str) -> Value {
     assert_eq!(
         get(&params, "message"),
         &Value::string(format!(
-            "Rcmake lost synchronization with {URI}. {recovery}"
+            "rcmake lost synchronization with {URI}. {recovery}"
         )),
     );
     published(messages)

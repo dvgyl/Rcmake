@@ -31,7 +31,7 @@ def _fake_executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
 
 
 def _make_args(root: Path, **overrides) -> types.SimpleNamespace:
-    rcmake = _fake_executable(root / "bin/rcmake", "#!/bin/sh\necho 'cmake version 4.5.1'\necho 'Rcmake 0.1.0'\n")
+    rcmake = _fake_executable(root / "bin/rcmake", "#!/bin/sh\necho 'cmake version 4.5.1'\necho 'rcmake 0.1.0'\n")
     oracle = _fake_executable(root / "bin/cmake", "#!/bin/sh\necho 'cmake version 4.5.1'\n")
     compiler = _fake_executable(root / "bin/cc")
     cxx = _fake_executable(root / "bin/c++")

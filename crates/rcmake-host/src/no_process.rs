@@ -171,6 +171,20 @@ impl<H: Host + ?Sized> NoProcessHost<H> {
         !state.log.commands.is_empty() || state.log.omitted_entries != 0
     }
 
+    /// Return the total number of denied subprocess requests observed so far.
+    #[must_use]
+    pub fn total_denied(&self) -> usize {
+        let state = self
+            .denied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .log
+            .commands
+            .len()
+            .saturating_add(state.log.omitted_entries)
+    }
+
     /// Transfer the records and eviction counts to the caller and clear the log.
     #[must_use]
     pub fn take_denied(&self) -> DeniedLog {

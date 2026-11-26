@@ -114,16 +114,40 @@ fn generate(
         },
     };
     configure_rules(interp)?;
+    let rich = interp.diag_engine().rich_options();
+    let rich_sources = rich.map(|_| interp.diagnostic_sources().clone());
+    let cmake_root = interp.cx().cmake_root().to_path_buf();
+    let source_dir = path::to_native(
+        &interp
+            .cx()
+            .project()
+            .dir(rcmake_model::DirId::ROOT)
+            .source_dir,
+    );
+    let rich_host = rich.zip(rich_sources.as_ref()).map(|(opts, sources)| {
+        crate::configure::RichGenerateHost::new(
+            host,
+            sources,
+            source_dir.clone(),
+            cmake_root.clone(),
+            opts,
+        )
+    });
+    let resolve_host: &dyn Host = match &rich_host {
+        Some(wrapped) => wrapped,
+        None => host,
+    };
     let resolved = {
         let mut cx = interp.cx();
         let model = cx.project();
         let key = b"_RCMAKE_INSTRUMENTATION_QUERIES";
         if queries.is_empty() || !model.global.instrumentation.is_empty() {
-            rcmake_resolve::resolve_with_options(model, host, &configs, &options)
+            rcmake_resolve::resolve_with_options(model, resolve_host, &configs, &options)
         } else {
             let previous = model.global.props.get(key).cloned();
             model.global.props.set(key.as_slice().into(), "1".into());
-            let resolved = rcmake_resolve::resolve_with_options(model, host, &configs, &options);
+            let resolved =
+                rcmake_resolve::resolve_with_options(model, resolve_host, &configs, &options);
             if let Some(previous) = previous {
                 model.global.props.set(key.as_slice().into(), previous);
             } else {
@@ -137,7 +161,7 @@ fn generate(
         Err(rcmake_resolve::ResolveError::Reported(_)) => return Err(Failure::Reported),
         Err(err) => {
             if matches!(err, rcmake_resolve::ResolveError::Genex(_)) {
-                file_generate::report_errors(interp.cx().project(), &configs, host);
+                file_generate::report_errors(interp.cx().project(), &configs, resolve_host);
             }
             let message = err
                 .with_export_linker_language(interp.cx().project())
@@ -147,6 +171,34 @@ fn generate(
                 Some(name) => format!("CMake can not determine linker language for target: {name}"),
                 None => message,
             };
+            if let (Some(opts), Some(sources)) = (rich, rich_sources.as_ref()) {
+                if let Some(rendered) = crate::configure::render_rich_cmake_diagnostic(
+                    message.as_bytes(),
+                    sources,
+                    &source_dir,
+                    &cmake_root,
+                    opts,
+                ) {
+                    host.write_out(Stream::Stderr, &rendered);
+                    return Err(Failure::Reported);
+                }
+                let diag = Diagnostic {
+                    kind: MessageKind::Error,
+                    effect: Effect::Fatal,
+                    category: None,
+                    policy: None,
+                    location: Location::None,
+                    body: message.into(),
+                    annotations: None,
+                };
+                let lookup =
+                    crate::configure::MapSourceLookup::new(sources, &source_dir, &cmake_root);
+                host.write_out(
+                    Stream::Stderr,
+                    &rcmake_diag::rich::render_rich(&diag, None, &lookup, opts),
+                );
+                return Err(Failure::Reported);
+            }
             return Err(message.into());
         }
     };
@@ -172,7 +224,7 @@ fn generate(
             }
         }
     }
-    let deferred = checks::report(interp.cx().project(), &result, kind, host);
+    let deferred = checks::report(interp.cx().project(), &result, kind, resolve_host);
     if !queries.is_empty() && !kind.is_ide() {
         instrument::wrap_custom_commands(&mut result, interp.cx().project(), host, bin);
     }

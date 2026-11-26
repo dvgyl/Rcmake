@@ -1,11 +1,12 @@
 
-Rcmake extensions
+rcmake extensions
   rcmake explain <name> [-B <build>] [--target|--var]
                  [--config <name>] [--filter <value>] [--json]
                  [--verbose] [--color=auto|always|never]
   --diagnostics=cmake|rich     Select the diagnostic format.
-  --profile[=<dir>]            Write a profile to <dir>. The default is
-                               rcmake-profile in the build directory.
+  --profile[=<dir>]            Write flamegraph.html, trace.json, and
+                               stacks.folded in <dir>, and keep each run in
+                               <dir>/run-*. Default: rcmake-profile in build.
   --no-probe-cache             Disable the probe cache for this configure.
   --fetch-lock=off|auto|update|frozen
                                Select the fetch lock mode.

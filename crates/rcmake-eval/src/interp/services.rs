@@ -68,11 +68,16 @@ impl Interp {
             return;
         };
         let old_value = match op {
-            VarOp::CacheSet | VarOp::CacheUnset => self.project.cache.get(name).map(|e| &e.value),
+            VarOp::CacheSet | VarOp::CacheDeclare | VarOp::CacheUnset => {
+                self.project.cache.get(name).map(|e| &e.value)
+            }
             _ => self.vars.get_from(name, parent),
         };
         self.write_seq = self.write_seq.saturating_add(1);
-        let binding_dir = if matches!(op, VarOp::CacheSet | VarOp::CacheUnset) {
+        let binding_dir = if matches!(
+            op,
+            VarOp::CacheSet | VarOp::CacheDeclare | VarOp::CacheUnset
+        ) {
             None
         } else {
             directory

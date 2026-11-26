@@ -260,18 +260,34 @@ impl LockEntry {
             })
     }
 
-    /// Return the scheme and host for diagnostics, or a placeholder if the host is invalid.
-    pub fn source_endpoint(source: &str) -> String {
-        let (scheme, authority, _) = source_parts(source);
+    /// Return a safe scheme/host or local file basename for diagnostics, or `None` if unavailable.
+    pub fn display_endpoint(source: &str) -> Option<String> {
+        let (scheme, authority, path) = source_parts(source);
+        if scheme == "file" {
+            let clean = path.split(['?', '#']).next().unwrap_or(path);
+            let base = clean.rsplit(['/', '\\']).find(|part| !part.is_empty())?;
+            if base
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+            {
+                return Some(format!("file://…/{base}"));
+            }
+            return None;
+        }
         let host = authority.rsplit('@').next().unwrap_or_default();
         if matches!(scheme, "https" | "http" | "ftp" | "ftps" | "ssh" | "git")
             && valid_host(host)
             && !host.split(':').any(token_segment)
         {
-            format!("{scheme}://{host}")
+            Some(format!("{scheme}://{host}"))
         } else {
-            "<source>".into()
+            None
         }
+    }
+
+    /// Return the scheme and host for diagnostics, or a placeholder if the host is invalid.
+    pub fn source_endpoint(source: &str) -> String {
+        Self::display_endpoint(source).unwrap_or_else(|| "<source>".into())
     }
 
     fn redact_legacy_identity(&mut self) {
@@ -561,6 +577,17 @@ impl LockFile {
         self.entries.insert(name, entry);
         Ok(())
     }
+}
+
+/// Outcome of committing recorded updates from a [`LockSession`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitReport {
+    /// Lockfile path evaluated by this session.
+    pub path: PathBuf,
+    /// Whether the lockfile on disk was created or updated.
+    pub written: bool,
+    /// Lowercase dependency names recorded by this session.
+    pub pinned: Vec<String>,
 }
 
 /// Lockfile state for one configure. Call [Self::commit] after a successful configure.
@@ -882,10 +909,15 @@ impl<'a> LockSession<'a> {
     }
 
     /// Publish recorded entries atomically and preserve other concurrent updates.
-    pub fn commit(self) -> Result<(), FetchError> {
+    pub fn commit(self) -> Result<CommitReport, FetchError> {
         if self.mode != LockMode::Update || self.updates.entries.is_empty() {
-            return Ok(());
+            return Ok(CommitReport {
+                path: self.path,
+                written: false,
+                pinned: Vec::new(),
+            });
         }
+        let pinned: Vec<String> = self.updates.entries.keys().cloned().collect();
         let lock = self.path.with_added_extension("guard");
         let host = self.host.host();
         let write_error = |cause| FetchError::LockWrite {
@@ -915,7 +947,11 @@ impl<'a> LockSession<'a> {
             let bytes = current.to_json().map_err(write_error)?;
             atomic_write(host, &self.path, &bytes).map_err(write_error)?;
         }
-        Ok(())
+        Ok(CommitReport {
+            path: self.path,
+            written: changed,
+            pinned,
+        })
     }
 }
 
@@ -1100,5 +1136,22 @@ mod tests {
             matches!(result, Err(FetchError::Lock { detail, .. }) if !detail.contains("private"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn display_endpoint_formats_file_basenames_and_strips_credentials() {
+        assert_eq!(
+            LockEntry::display_endpoint("file:///tmp/sandbox/dep.tar.gz"),
+            Some("file://…/dep.tar.gz".into())
+        );
+        assert_eq!(
+            LockEntry::display_endpoint("https://u:p@example.org/x/y.tar.gz"),
+            Some("https://example.org".into())
+        );
+        assert_eq!(
+            LockEntry::display_endpoint("file:///tmp/bad space.tgz"),
+            None
+        );
+        assert_eq!(LockEntry::display_endpoint("/plain/local/path"), None);
     }
 }

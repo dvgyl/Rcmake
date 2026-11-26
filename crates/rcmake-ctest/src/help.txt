@@ -1,0 +1,89 @@
+Usage
+
+  ctest [options]
+
+Options
+  --preset <preset>, --preset=<preset>
+                               = Read arguments from a test preset.
+  --list-presets[=defined]     = List the available test presets.
+  --presets-file <file>        = Read presets from this file.
+  --test-dir <dir>             = Run the tests in this build directory.
+  -C <cfg>, --build-config <cfg>
+                               = Select the configuration to test.
+  -j [<jobs>], --parallel [<jobs>]
+                               = Run tests in parallel.
+  --test-load <level>          = Do not start tests above this CPU load.
+  -R <regex>, --tests-regex <regex>
+                               = Run tests that match the regular expression.
+  -E <regex>, --exclude-regex <regex>
+                               = Skip tests that match the regular expression.
+  -L <regex>, --label-regex <regex>
+                               = Run tests with labels that match.
+  -LE <regex>, --label-exclude <regex>
+                               = Skip tests with labels that match.
+  -FA <regex>, --fixture-exclude-any <regex>
+                               = Do not add fixture tests that match.
+  -FS <regex>, --fixture-exclude-setup <regex>
+                               = Do not add setup tests that match.
+  -FC <regex>, --fixture-exclude-cleanup <regex>
+                               = Do not add cleanup tests that match.
+  -I [Start,End,Stride,test#,...], --tests-information <spec>
+                               = Run tests by number.
+  -U, --union                  = Run the union of -I and -R.
+  --tests-from-file <file>     = Run the tests listed in a file.
+  --exclude-from-file <file>   = Skip the tests listed in a file.
+  --rerun-failed               = Run only the tests that failed last time.
+  --out-of-date                = Run only tests with changed inputs.
+  -N, --show-only[=human|json-v1|json-v1-raw]
+                               = List tests without running them.
+  --no-tests=<error|ignore>    = Select the result when no test runs.
+  --output-on-failure          = Print the output of failed tests.
+  -V, --verbose                = Print test output.
+  -VV, --extra-verbose         = Print more test output.
+  -Q, --quiet                  = Print nothing.
+  --progress                   = Print progress on one line.
+  -O <file>, --output-log <file>
+                               = Write the output to a log file.
+  --output-junit <file>        = Write test results in JUnit XML format.
+  --print-labels               = List all test labels.
+  -W <width>, --max-width <width>
+                               = Set the width of test names in the output.
+  --test-output-size-passed <size>
+                               = Limit the output of passed tests.
+  --test-output-size-failed <size>
+                               = Limit the output of failed tests.
+  --test-output-truncation <mode>
+                               = Select tail, middle, or head truncation.
+  --no-label-summary           = Do not print the label summary.
+  --no-subproject-summary      = Do not print the subproject summary.
+  --no-compress-output         = Do not compress test output.
+  --debug                      = Print CTest debug output.
+  --timeout <seconds>          = Set the default test timeout.
+  --stop-time <time>           = Stop tests at this time of day.
+  --stop-on-failure            = Stop after the first failure.
+  --repeat <mode>:<n>          = Repeat tests: until-fail, until-pass, or after-timeout.
+  --schedule-random            = Run tests in random order.
+  --schedule-random-seed <seed>
+                               = Set the seed for random order.
+  -F                           = Enable failover.
+  --resource-spec-file <file>  = Read the resource specification.
+  --interactive-debug-mode <0|1>
+                               = Select interactive debug mode.
+  --overwrite <name>=<value>   = Override a CTest configuration setting.
+  -D <var>=<value>             = Set a CTest script variable.
+  -- <args>...                 = Pass the arguments to each test.
+  -M <model>, --test-model <model>
+                               = Select the dashboard model.
+  -T <action>, --test-action <action>
+                               = Run a dashboard action.
+  -D <mode>, --dashboard <mode>
+                               = Run a dashboard mode.
+  -S <script>, --script <script>
+                               = Run a CTest script.
+  -SP <script>, --script-new-process <script>
+                               = Run a CTest script in a new process.
+  --build-and-test <src> <bin> = Configure, build, and test a project.
+  --collect-instrumentation <dir>
+                               = Run the instrumentation callbacks.
+  --version                    = Print the version and exit.
+  --help                       = Print this help and exit.

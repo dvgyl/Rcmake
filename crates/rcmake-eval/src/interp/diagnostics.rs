@@ -64,6 +64,12 @@ impl Interp {
         self.engine.set_rich_options(options);
     }
 
+    /// Borrow the source map that contains parsed listfiles for this session.
+    #[must_use]
+    pub fn diagnostic_sources(&self) -> &SourceMap {
+        &self.sources
+    }
+
     /// Take the source map that contains the retained diagnostic labels.
     pub fn take_diagnostic_sources(&mut self) -> SourceMap {
         std::mem::take(&mut self.sources)
@@ -392,6 +398,12 @@ struct DiagnosticSources<'a> {
 impl SourceLookup for DiagnosticSources<'_> {
     fn source(&self, id: SourceId) -> Option<&SourceFile> {
         self.sources.get(id)
+    }
+
+    fn source_by_path(&self, path: &[u8]) -> Option<&SourceFile> {
+        self.sources
+            .latest_file(path)
+            .and_then(|id| self.sources.get(id))
     }
 
     fn is_bundled_module(&self, path: &[u8]) -> bool {

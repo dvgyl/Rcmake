@@ -7,9 +7,10 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
-use rcmake_base::path_lex::Lexical;
+use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_host::path::to_native;
 
+use super::flamegraph::HtmlSummary;
 use super::{Coverage, ProfileKind, ProfilePhase, Site, Span, State};
 
 const TOP_COUNT: usize = 10;
@@ -110,15 +111,102 @@ impl<'a> Summary<'a> {
     }
 }
 
+/// Collect top-level facts and top self-time frames for the HTML flamegraph report.
+pub(super) fn html_summary(
+    state: &State,
+    spans: &[Span],
+    wall: Duration,
+    modules: &[BString],
+) -> HtmlSummary {
+    let summary = build_summary(state, spans);
+    let root = source_root(spans);
+    let project = root.as_ref().and_then(|path| {
+        path.rsplit(|&byte| matches!(byte, b'/' | b'\\'))
+            .find(|part| !part.is_empty())
+            .map(display)
+    });
+    let root_slice = root.as_ref().map(|path| path.as_slice());
+    let mut rows: Vec<(String, Duration, u64)> = Vec::new();
+    for (file, stats) in &summary.files {
+        if stats.measured && !stats.self_time.is_zero() {
+            rows.push((
+                display_source_path(file, root_slice, modules),
+                stats.self_time,
+                stats.calls as u64,
+            ));
+        }
+    }
+    for (site, stats) in &summary.commands {
+        if stats.measured && !stats.self_time.is_zero() {
+            let mut label = display(&site.name);
+            if !site.file.is_empty() {
+                let _ = write!(
+                    label,
+                    " ({}:{})",
+                    display_source_path(&site.file, root_slice, modules),
+                    site.line
+                );
+            }
+            rows.push((label, stats.self_time, stats.calls as u64));
+        }
+    }
+    rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.truncate(5);
+    HtmlSummary {
+        project,
+        wall,
+        commands: state.command_count as u64,
+        top_self: rows,
+    }
+}
+
+fn build_summary<'a>(state: &'a State, spans: &'a [Span]) -> Summary<'a> {
+    let mut summary = Summary::default();
+    for (site, &count) in &state.sites {
+        for row in summary.rows(site) {
+            row.calls = row.calls.saturating_add(count);
+        }
+    }
+    for span in spans {
+        if let Some((site, _)) = state.sites.get_key_value(&span.site) {
+            for row in summary.rows(site) {
+                row.add_span(span);
+            }
+        }
+    }
+    summary
+}
+
 /// Format inclusive wall time, self time, and call counts for measured operations.
-pub(super) fn render(state: &State, spans: &[Span], wall: Duration, total: Duration) -> String {
+pub(super) fn render(
+    state: &State,
+    spans: &[Span],
+    wall: Duration,
+    total: Duration,
+    modules: &[BString],
+) -> String {
+    let summary = build_summary(state, spans);
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Rcmake profile: {} invocation wall time, {} commands",
+        "rcmake profile: {} invocation wall time, {} commands",
         duration(wall),
         state.command_count,
     );
+    if let Some((label, stats)) = top_cost(&summary) {
+        let pct = if total.is_zero() {
+            0.0
+        } else {
+            100.0 * stats.inclusive.elapsed.as_secs_f64() / total.as_secs_f64()
+        };
+        let _ = writeln!(
+            out,
+            "Most time: {label} ({} calls, {}, {:.1}%).",
+            stats.calls,
+            duration(stats.inclusive.elapsed),
+            pct,
+        );
+    }
     if state.dropped_spans > 0 {
         let _ = writeln!(
             out,
@@ -142,33 +230,29 @@ pub(super) fn render(state: &State, spans: &[Span], wall: Duration, total: Durat
     }
     let _ = writeln!(
         out,
-        "% of total uses {} of recorded wall time. Self time is summed across calls.",
+        "% of total uses {} of recorded wall time.",
         duration(total)
     );
 
-    let mut summary = Summary::default();
-    for (site, &count) in &state.sites {
-        for row in summary.rows(site) {
-            row.calls = row.calls.saturating_add(count);
+    let measured_phases: Vec<_> = ProfilePhase::ALL
+        .into_iter()
+        .filter_map(|phase| {
+            summary
+                .phases
+                .get(&phase)
+                .filter(|stats| stats.measured)
+                .map(|stats| (phase, stats))
+        })
+        .collect();
+    if !measured_phases.is_empty() {
+        heading(&mut out, "Phase", "Phases");
+        for (phase, stats) in measured_phases {
+            row(&mut out, total, phase.name(), Some(stats));
         }
-    }
-    for span in spans {
-        if let Some((site, _)) = state.sites.get_key_value(&span.site) {
-            for row in summary.rows(site) {
-                row.add_span(span);
-            }
-        }
-    }
-
-    heading(&mut out, "Phase", "Phases can overlap");
-    for phase in ProfilePhase::ALL {
-        let name = phase.name();
-        let stats = summary.phases.get(&phase);
-        row(&mut out, total, name, stats);
     }
 
     if !summary.categories.is_empty() {
-        heading(&mut out, "Category", "Command categories can overlap");
+        heading(&mut out, "Category", "Categories");
         for (&category, stats) in &summary.categories {
             row(&mut out, total, category.name(), Some(stats));
         }
@@ -176,12 +260,12 @@ pub(super) fn render(state: &State, spans: &[Span], wall: Duration, total: Durat
     let root = source_root(spans);
     let root = root.as_ref().map(|path| path.as_slice());
     if !summary.files.is_empty() {
-        heading(&mut out, "List file", "Top list files by self time");
+        heading(&mut out, "List file", "Top list files (self time)");
         for (file, stats) in top(summary.files, |stats| stats.self_time) {
             row(
                 &mut out,
                 total,
-                &display_source_path(file, root),
+                &display_source_path(file, root, modules),
                 Some(&stats),
             );
         }
@@ -190,7 +274,7 @@ pub(super) fn render(state: &State, spans: &[Span], wall: Duration, total: Durat
         heading(
             &mut out,
             "Command and source",
-            "Top command call sites by inclusive time",
+            "Top commands (inclusive time)",
         );
         for (site, stats) in top(summary.commands, |stats| stats.inclusive.elapsed) {
             let mut label = format!("{:<8}  {}", site.kind.category(), display(&site.name));
@@ -198,7 +282,7 @@ pub(super) fn render(state: &State, spans: &[Span], wall: Duration, total: Durat
                 let _ = write!(
                     label,
                     "  {}:{}",
-                    display_source_path(&site.file, root),
+                    display_source_path(&site.file, root, modules),
                     site.line
                 );
             }
@@ -206,6 +290,33 @@ pub(super) fn render(state: &State, spans: &[Span], wall: Duration, total: Durat
         }
     }
     out
+}
+
+fn top_cost<'a>(summary: &'a Summary<'a>) -> Option<(String, &'a Timing)> {
+    if let Some((&category, stats)) = summary
+        .categories
+        .iter()
+        .filter(|(_, stats)| stats.measured)
+        .max_by(|(a_cat, a), (b_cat, b)| {
+            a.inclusive
+                .elapsed
+                .cmp(&b.inclusive.elapsed)
+                .then_with(|| b_cat.cmp(a_cat))
+        })
+    {
+        return Some((category.name().to_owned(), stats));
+    }
+    summary
+        .commands
+        .iter()
+        .filter(|(_, stats)| stats.measured)
+        .max_by(|(a_site, a), (b_site, b)| {
+            a.inclusive
+                .elapsed
+                .cmp(&b.inclusive.elapsed)
+                .then_with(|| b_site.cmp(a_site))
+        })
+        .map(|(site, stats)| (display(&site.name), stats))
 }
 
 fn source_root(spans: &[Span]) -> Option<rcmake_base::BString> {
@@ -230,13 +341,24 @@ fn source_root(spans: &[Span]) -> Option<rcmake_base::BString> {
         .map(|root| Lexical::new(&root).normalize())
 }
 
-fn display_source_path(file: &[u8], root: Option<&[u8]>) -> String {
+fn display_source_path(file: &[u8], root: Option<&[u8]>, modules: &[BString]) -> String {
     let file = rcmake_base::path_lex::cmake_style(file);
     let file = Lexical::new(&file).normalize();
-    let relative = root
+    if let Some(relative) = root
         .and_then(|root| Lexical::new(&file).relative(Lexical::new(root)))
-        .filter(|path| path != ".." && !path.starts_with(b"../"));
-    display(relative.as_ref().unwrap_or(&file))
+        .filter(|path| path != ".." && !path.starts_with(b"../"))
+    {
+        return display(&relative);
+    }
+    for module_root in modules {
+        if let Some(relative) = Lexical::new(&file)
+            .relative(Lexical::new(module_root))
+            .filter(|path| !path.is_empty() && path != ".." && !path.starts_with(b"../"))
+        {
+            return format!("<Modules>/{}", display(&relative));
+        }
+    }
+    display(&file)
 }
 
 fn heading(out: &mut String, name: &str, title: &str) {
@@ -327,12 +449,12 @@ mod tests {
     use crate::profile::{ProfileRecorder, ProfileSample, resolve_spans};
 
     #[test]
-    fn reports_subsecond_operations_and_unmeasured_phases() -> Result<(), &'static str> {
+    fn reports_subsecond_operations_and_omits_unmeasured_phases() -> Result<(), &'static str> {
         let recorder = ProfileRecorder::new();
         for name in [b"z\x1b".as_slice(), b"a\n", b"check_project_setting"] {
             recorder.record(ProfileSample {
                 name,
-                file: b"test.cmake",
+                file: b"/opt/cmake/Modules/FindFoo.cmake",
                 line: 10,
                 depth: 0,
                 start: Duration::ZERO,
@@ -340,18 +462,24 @@ mod tests {
                 kind: ProfileKind::Macro,
             });
         }
+        recorder.record_phase(
+            ProfilePhase::Eval,
+            Duration::ZERO,
+            Duration::from_micros(4200),
+        );
         let state = recorder
             .state
             .lock()
             .map_err(|_| "Cannot read the profile samples.")?;
         let mut spans = state.spans.clone().into_sorted_vec();
         let coverage = resolve_spans(&mut spans);
-        let report = render(&state, &spans, Duration::from_secs(2), coverage);
-        assert!(
-            report
-                .lines()
-                .any(|line| line.contains('—') && line.ends_with("eval"))
-        );
+        let modules = vec![BString::from("/opt/cmake/Modules")];
+        let report = render(&state, &spans, Duration::from_secs(2), coverage, &modules);
+        assert!(report.starts_with("rcmake profile: 2.00 s invocation wall time, 3 commands\n"));
+        assert!(report.contains("Most time: check_* (1 calls, 4.2 ms, 100.0%)."));
+        assert!(report.lines().any(|line| line.ends_with("  eval")));
+        assert!(!report.lines().any(|line| line.ends_with("  parse")));
+        assert!(!report.contains('—'));
         assert!(report.contains("4.2 ms of recorded wall time"));
         assert!(report.contains("100.0%"));
         assert!(
@@ -359,10 +487,9 @@ mod tests {
                 .lines()
                 .any(|line| { line.ends_with("  check_*") && line.contains("4.2 ms") })
         );
-        assert!(report.contains("Command categories can overlap"));
         assert!(!report.contains("cacheable"));
-        assert!(report.contains("macro     a\u{fffd}  test.cmake:10"));
-        assert!(report.contains("macro     z\u{fffd}  test.cmake:10"));
+        assert!(report.contains("macro     a\u{fffd}  <Modules>/FindFoo.cmake:10"));
+        assert!(report.contains("macro     z\u{fffd}  <Modules>/FindFoo.cmake:10"));
         assert!(report.find("a\u{fffd}") < report.find("z\u{fffd}"));
         assert!(!report.contains('\x1b'));
         Ok(())

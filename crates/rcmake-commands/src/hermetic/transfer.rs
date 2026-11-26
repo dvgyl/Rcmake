@@ -130,7 +130,7 @@ fn check_url(
         return host.guard_path(&path).map(|_| ());
     }
     let pinned = pinned && file_url.is_none();
-    let decision = host.audit(|audit| match dependency {
+    let decision = host.audit_at(site, |audit| match dependency {
         Some(name) => audit.check_fetch_network(site, url, pinned, name),
         None => audit.check_network(site, url, pinned),
     });

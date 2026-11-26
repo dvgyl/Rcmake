@@ -48,27 +48,59 @@ impl Observations {
         build: &Path,
         modules: Option<&Path>,
     ) -> Self {
-        let mut roots = Vec::new();
+        let mut obs = Self {
+            roots: Vec::new(),
+            inputs: BTreeSet::new(),
+            truncated: false,
+        };
         for (label, root) in [
             ("{source}", Some(source)),
             ("{build}", Some(build)),
             ("{modules}", modules),
         ] {
             if let Some(root) = root {
-                roots.push((label, root.to_owned()));
-                if let Ok(canonical) = host.canonicalize(root)
-                    && canonical != root
-                {
-                    roots.push((label, canonical));
-                }
+                obs.add_root(host, label, root);
             }
         }
-        roots.sort_by_key(|(_, root)| std::cmp::Reverse(root.components().count()));
-        Self {
-            roots,
-            inputs: BTreeSet::new(),
-            truncated: false,
+        if let Some(modules) = modules {
+            obs.add_module_children(host, modules);
         }
+        obs
+    }
+
+    pub(super) fn add_module_root(&mut self, host: &dyn Host, root: &Path) {
+        self.add_root(host, "{modules}", root);
+        self.add_module_children(host, root);
+    }
+
+    fn add_module_children(&mut self, host: &dyn Host, modules: &Path) {
+        for (label, child) in [
+            ("{modules}/Modules", "Modules"),
+            ("{modules}/Templates", "Templates"),
+        ] {
+            let dir = modules.join(child);
+            if let Ok(canonical) = host.canonicalize(&dir)
+                && canonical != dir
+            {
+                self.add_root(host, label, &canonical);
+            }
+        }
+    }
+
+    fn add_root(&mut self, host: &dyn Host, label: &'static str, root: &Path) {
+        let mut push_unique = |path: PathBuf| {
+            if !self.roots.iter().any(|(l, r)| *l == label && *r == path) {
+                self.roots.push((label, path));
+            }
+        };
+        push_unique(root.to_owned());
+        if let Ok(canonical) = host.canonicalize(root)
+            && canonical != root
+        {
+            push_unique(canonical);
+        }
+        self.roots
+            .sort_by_key(|(_, root)| std::cmp::Reverse(root.components().count()));
     }
 
     pub(super) fn env(&mut self, key: &[u8]) {

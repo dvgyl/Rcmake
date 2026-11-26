@@ -3,8 +3,12 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use rcmake_base::BString;
+use rcmake_diag::SourceMap;
+use rcmake_diag::source::SourceKind;
 
 use super::HermeticSite;
 
@@ -55,6 +59,14 @@ impl HermeticContext {
         .unwrap_or_else(|| self.0.default_site.clone())
     }
 
+    /// Return the innermost active site matching `pred`, if any.
+    pub fn find_site(&self, mut pred: impl FnMut(&HermeticSite) -> bool) -> Option<HermeticSite> {
+        self.find_scope(|scope| match scope {
+            Scope::Site(site) if pred(site) => Some(site.clone()),
+            _ => None,
+        })
+    }
+
     /// Allow internal fetch operations to access a cache root on this thread.
     pub fn enter_fetch_cache(&self, path: PathBuf) -> HermeticSiteGuard {
         self.enter_scope(Scope::FetchCache(path))
@@ -74,7 +86,7 @@ impl HermeticContext {
         HermeticSiteGuard { scope }
     }
 
-    fn find_scope<T>(&self, get: impl Fn(&Scope) -> Option<T>) -> Option<T> {
+    fn find_scope<T>(&self, mut get: impl FnMut(&Scope) -> Option<T>) -> Option<T> {
         SCOPES.with_borrow(|scopes| {
             scopes
                 .iter()
@@ -105,5 +117,32 @@ impl Drop for HermeticSiteGuard {
                 scopes.remove(index);
             }
         });
+    }
+}
+
+/// In-memory parsed source map shared between the evaluator and the hermetic
+/// diagnostic renderer. Never performs disk reads.
+#[derive(Clone, Default)]
+pub struct HermeticSources(Arc<Mutex<SourceMap>>);
+
+impl HermeticSources {
+    /// Record one parsed source buffer without copying its bytes.
+    pub fn add(&self, path: BString, kind: SourceKind, text: Arc<[u8]>) {
+        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = map.add(path, kind, text);
+    }
+
+    /// Seed this shared map from an existing [`SourceMap`].
+    pub fn extend_from(&self, sources: &SourceMap) {
+        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for file in sources.files() {
+            let _ = map.add(file.path.clone(), file.kind, Arc::clone(&file.text));
+        }
+    }
+
+    /// Access the in-memory [`SourceMap`] under its lock.
+    pub fn with_map<R>(&self, f: impl FnOnce(&SourceMap) -> R) -> R {
+        let map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&map)
     }
 }

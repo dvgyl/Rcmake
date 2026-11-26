@@ -595,6 +595,11 @@ pub trait Host: Send + Sync {
     /// Return `true` if `stream` is attached to an interactive terminal.
     fn is_terminal(&self, stream: Stream) -> bool;
 
+    /// Return the column width of `stream` when attached to a terminal.
+    fn terminal_width(&self, _stream: Stream) -> Option<usize> {
+        None
+    }
+
     /// Current wall-clock timestamp.
     fn now(&self) -> FileTime;
 

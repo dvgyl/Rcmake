@@ -14,7 +14,7 @@ use rcmake_model::{Cache, CacheType, GeneratorKind};
 
 use crate::options::{self, DirectoryArg, Options};
 use crate::persona::{
-    DiagStyle, Persona, resolve_diag_style, resolve_rich_color, stick_diag_style,
+    DiagStyle, Persona, resolve_diag_style, resolve_rich_color, rich_width, stick_diag_style,
 };
 use crate::profile::ProfilePhase;
 use crate::{cache, emit_cli_error, new_interp_with_paths, presets};
@@ -36,7 +36,9 @@ use preloads::Preloads;
 use profiling::Profilers;
 mod unused_cli;
 
-pub(crate) use diagnostics::initialize_diagnostics;
+pub(crate) use diagnostics::{
+    MapSourceLookup, RichGenerateHost, initialize_diagnostics, render_rich_cmake_diagnostic,
+};
 
 const HOME_DIR: &[u8] = b"CMAKE_HOME_DIRECTORY";
 const GENERATOR: &[u8] = b"CMAKE_GENERATOR";
@@ -368,6 +370,7 @@ impl<'a> ConfigureSession<'a> {
         }
         // Rich formatting annotates live diagnostics during emission. Replay keeps its
         // normal eligibility checks for regions that issue diagnostics.
+        let hermetic_active = speed.hermetic != rcmake_eval::HermeticMode::Off;
         let services = Services {
             speed,
             ..Services::default()
@@ -389,6 +392,9 @@ impl<'a> ConfigureSession<'a> {
             services,
         );
         self.prepare_presentation(&mut interp, style);
+        if hermetic_active {
+            runtime.attach(&mut interp);
+        }
         *interp.cx().cache() = saved;
         interp.cx().project().generator = generator_kind;
         cache_setup::initialize_standard_cache(
@@ -406,14 +412,21 @@ impl<'a> ConfigureSession<'a> {
         Ok((runtime, interp, has_cache))
     }
 
+    fn rich_options(&self) -> rcmake_diag::rich::RichOptions {
+        let host = self.host.as_ref();
+        rcmake_diag::rich::RichOptions {
+            color: resolve_rich_color(host, host.is_terminal(Stream::Stderr), DiagStyle::Rich),
+            terminal_width: rich_width(host),
+            ..rcmake_diag::rich::RichOptions::default()
+        }
+    }
+
     fn prepare_presentation(&self, interp: &mut Interp, style: DiagStyle) {
         self.profiling.attach(interp);
         if style == DiagStyle::Rich {
-            let host = self.host.as_ref();
-            interp.set_rich_diagnostics(rcmake_diag::rich::RichOptions {
-                color: resolve_rich_color(host, host.is_terminal(Stream::Stderr), DiagStyle::Rich),
-                ..rcmake_diag::rich::RichOptions::default()
-            });
+            let rich = self.rich_options();
+            interp.add_session_data(rich);
+            interp.set_rich_diagnostics(rich);
         }
     }
 
@@ -428,8 +441,13 @@ impl<'a> ConfigureSession<'a> {
         } else {
             "does not exist".into()
         };
+        let hint = if self.opts.persona == crate::persona::Persona::Native {
+            "Specify --help for usage."
+        } else {
+            "Specify --help for usage, or press the help button on the CMake GUI."
+        };
         Err(Exit::Message(format!(
-            "The source directory \"{}\" {problem}.\nSpecify --help for usage, or press the help button on the CMake GUI.",
+            "The source directory \"{}\" {problem}.\n{hint}",
             self.src.display()
         )))
     }

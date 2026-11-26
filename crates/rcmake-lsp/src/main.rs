@@ -21,12 +21,44 @@ mod stdio_eval;
 
 #[cfg(any(unix, windows))]
 fn main() -> ExitCode {
+    use std::io::IsTerminal as _;
     #[cfg(feature = "eval")]
     use stdio_eval::serve;
 
     #[cfg(panic = "abort")]
     rcmake_lsp::install_stdio_panic_hook();
-    serve().unwrap_or(ExitCode::FAILURE)
+
+    let args: Vec<Vec<u8>> = std::env::args_os().skip(1).map(os_arg_bytes).collect();
+    match rcmake_lsp::cli::startup("rcmake-lsp", &args) {
+        rcmake_lsp::cli::Startup::Exit { stdout, code } => {
+            let mut out = io::stdout().lock();
+            let _ = out.write_all(stdout.as_bytes());
+            let _ = out.flush();
+            ExitCode::from(code)
+        }
+        rcmake_lsp::cli::Startup::Serve => {
+            if io::stdin().is_terminal() {
+                let mut err = io::stderr().lock();
+                let _ = writeln!(
+                    err,
+                    "rcmake-lsp: waiting for LSP messages on standard input. Run rcmake-lsp --help for usage."
+                );
+                let _ = err.flush();
+            }
+            serve().unwrap_or(ExitCode::FAILURE)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn os_arg_bytes(arg: std::ffi::OsString) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    arg.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn os_arg_bytes(arg: std::ffi::OsString) -> Vec<u8> {
+    arg.to_string_lossy().into_owned().into_bytes()
 }
 
 #[cfg(all(any(unix, windows), not(feature = "eval")))]
