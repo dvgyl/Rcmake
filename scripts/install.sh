@@ -85,12 +85,14 @@ if "$uninstall"; then
       removed+=("$bin_dir/$tool")
     fi
   done
-  for name in rcmake rcmake-lsp; do
-    if [[ -f "$bin_dir/$name" || -L "$bin_dir/$name" ]]; then
-      rm -f "$bin_dir/$name"
-      removed+=("$bin_dir/$name")
-    fi
-  done
+  if [[ -f "$bin_dir/rcmake" || -L "$bin_dir/rcmake" ]]; then
+    rm -f "$bin_dir/rcmake"
+    removed+=("$bin_dir/rcmake")
+  fi
+  if [[ -f "$bin_dir/rcmake-lsp" && ! -L "$bin_dir/rcmake-lsp" ]] || is_rcmake_link "$bin_dir/rcmake-lsp"; then
+    rm -f "$bin_dir/rcmake-lsp"
+    removed+=("$bin_dir/rcmake-lsp")
+  fi
   if [[ -d "$data_dir" ]]; then
     if [[ -e "$bin_dir/cmake" ]] && ! is_rcmake_link "$bin_dir/cmake"; then
       printf 'Kept %s because %s is another CMake installation.\n' "$data_dir" "$bin_dir/cmake"
@@ -202,7 +204,9 @@ archive, checksum, prefix, aliases, force = sys.argv[1:]
 archive, prefix = Path(archive), Path(prefix)
 tools = ("cmake", "ctest", "cpack")
 data_dir = Path("share/cmake-4.5")
-binaries = (Path("bin/rcmake"), Path("bin/rcmake-lsp"))
+rcmake_rel = Path("bin/rcmake")
+lsp_rel = Path("bin/rcmake-lsp")
+binaries = (rcmake_rel, lsp_rel)
 
 try:
     if checksum:
@@ -227,7 +231,28 @@ try:
                 if path.parts[0] != top:
                     raise ValueError("The archive must have one top-level directory.")
                 relative = Path(*path.parts[1:])
-                if relative in binaries or relative.is_relative_to(data_dir):
+                if relative in binaries:
+                    output = work / relative
+                    if member.isfile():
+                        output.parent.mkdir(parents=True, exist_ok=True)
+                        with tar.extractfile(member) as source, output.open("xb") as destination:
+                            shutil.copyfileobj(source, destination)
+                        output.chmod(0o755 if member.mode & 0o111 else 0o644)
+                    elif relative == lsp_rel and member.issym():
+                        link = PurePosixPath(member.linkname)
+                        if (
+                            not member.linkname
+                            or member.linkname.endswith("/")
+                            or link.is_absolute()
+                            or ".." in link.parts
+                            or link.parts != ("rcmake",)
+                        ):
+                            raise ValueError(f"Invalid symlink target {member.linkname!r} for {member.name!r}.")
+                        output.parent.mkdir(parents=True, exist_ok=True)
+                        output.symlink_to("rcmake")
+                    else:
+                        raise ValueError(f"Invalid archive entry {member.name!r}.")
+                elif relative.is_relative_to(data_dir):
                     output = work / relative
                     if member.isdir():
                         output.mkdir(parents=True, exist_ok=True)
@@ -239,12 +264,14 @@ try:
                     else:
                         raise ValueError(f"Invalid archive entry {member.name!r}.")
 
-        staged_bin = work / "bin/rcmake"
-        if not staged_bin.is_file():
+        staged_bin = work / rcmake_rel
+        if staged_bin.is_symlink() or not staged_bin.is_file():
             raise ValueError("Missing bin/rcmake in the archive.")
         staged_bin.chmod(0o755)
-        staged_lsp = work / "bin/rcmake-lsp"
-        if staged_lsp.is_file():
+        staged_lsp = work / lsp_rel
+        staged_lsp_is_link = staged_lsp.is_symlink()
+        staged_lsp_is_file = staged_lsp.is_file() and not staged_lsp_is_link
+        if staged_lsp_is_file:
             staged_lsp.chmod(0o755)
         for required in ("Modules/CMake.cmake", "Templates/CPackConfig.cmake.in"):
             if not (work / data_dir / required).is_file():
@@ -253,6 +280,11 @@ try:
 
         bin_dir = prefix / "bin"
         bin_dir.mkdir(exist_ok=True)
+        for target_name, present in (("rcmake", True), ("rcmake-lsp", staged_lsp_is_link or staged_lsp_is_file)):
+            if present:
+                target_path = bin_dir / target_name
+                if target_path.is_dir() and not target_path.is_symlink():
+                    raise ValueError(f"{target_path} is a directory. Remove it, then run the installer again.")
         installed_data = prefix / data_dir
         installed_data.parent.mkdir(exist_ok=True)
         backup = work / "previous-data"
@@ -268,7 +300,10 @@ try:
                 backup.replace(installed_data)
             raise
         installed = [bin_dir / "rcmake"]
-        if staged_lsp.is_file():
+        if staged_lsp_is_link:
+            staged_lsp.replace(bin_dir / "rcmake-lsp")
+            installed.append(f"{bin_dir / 'rcmake-lsp'} -> rcmake")
+        elif staged_lsp_is_file:
             staged_lsp.replace(bin_dir / "rcmake-lsp")
             installed.append(bin_dir / "rcmake-lsp")
 

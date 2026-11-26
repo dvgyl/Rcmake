@@ -165,8 +165,23 @@ At the end, the script lists the installed paths. If the `bin` directory is not 
 
 ### Windows
 
-1. Download `rcmake-<version>-x86_64-pc-windows-msvc.zip` and its `.sha256` file from [GitHub Releases](https://github.com/dvgyl/rcmake/releases).
-2. Compare the checksum with the value in the `.sha256` file:
+`scripts/install.ps1` downloads the latest `x86_64-pc-windows-msvc` release, checks its SHA-256 checksum, and installs `bin\rcmake.exe`, `bin\rcmake-lsp.exe`, and `share\cmake-4.5` into `%LOCALAPPDATA%\rcmake` (or `-Prefix <dir>`). It runs on Windows PowerShell 5.1 and PowerShell 7+:
+
+```powershell
+irm https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.ps1 | iex
+```
+
+To pass options such as `-AliasCmake`, `-Prefix`, `-Archive`, `-Version`, `-Force`, or `-Uninstall`, download the script and run it directly:
+
+```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.ps1 -OutFile install.ps1
+.\install.ps1 -AliasCmake
+```
+
+If you prefer manual installation:
+
+1. Download `rcmake-<version>-x86_64-pc-windows-msvc.zip` and `SHA256SUMS.txt` (or the `.sha256` file) from [GitHub Releases](https://github.com/dvgyl/rcmake/releases).
+2. Compare the checksum with the recorded value:
 
    ```powershell
    Get-FileHash .\rcmake-<version>-x86_64-pc-windows-msvc.zip -Algorithm SHA256
@@ -182,7 +197,7 @@ At the end, the script lists the installed paths. If the `bin` directory is not 
 
 4. Open a new terminal and run `rcmake --version`.
 
-The `bin` folder also contains `cmake.exe`, `ctest.exe`, `cpack.exe`, and `rcmake-lsp.exe`. Because the folder is first on `PATH`, `cmake` runs `rcmake`. Keep the `bin` folder next to `share\cmake-4.5`, because `rcmake` finds the bundled CMake modules there.
+The extracted `bin` folder also contains `cmake.exe`, `ctest.exe`, `cpack.exe`, and `rcmake-lsp.exe`. Because the folder is first on `PATH`, `cmake` runs `rcmake`. Keep the `bin` folder next to `share\cmake-4.5`, because `rcmake` finds the bundled CMake modules there.
 
 ### Build from source
 
