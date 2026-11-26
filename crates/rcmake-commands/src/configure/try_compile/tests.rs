@@ -867,32 +867,34 @@ fn multi_config_try_compile_honors_caller_config_and_xcode_debug_default() -> Te
         );
 
         // Child with CMAKE_DEFAULT_BUILD_TYPE=Debug, CMAKE_CROSS_CONFIGS=all, and
-        // CMAKE_DEFAULT_CONFIGS=Release executes the (Debug, Release) cross graph so a custom
-        // command evaluates $<COMMAND_CONFIG:...> in Debug and $<OUTPUT_CONFIG:...> in Release.
+        // CMAKE_DEFAULT_CONFIGS=Release builds a child-defined Debug generator executable
+        // (`gen_tool`) BEFORE invoking it in the (Debug, Release) cross graph so
+        // $<COMMAND_CONFIG:$<CONFIG>> is Debug and $<OUTPUT_CONFIG:$<CONFIG>> is Release.
         {
             let host = Arc::new(PureHost::default());
             let seen_cmds = Arc::new(Mutex::new(Vec::<String>::new()));
             let seen_clone = seen_cmds.clone();
             host.seed_file(Path::new(&format!("{DRIVE}/work/probe-cc")), b"")?;
-            host.seed_file(Path::new(&format!("{DRIVE}/work/gen-tool")), b"")?;
+            host.seed_file(
+                Path::new(&format!("{DRIVE}/work/child/gen_tool.c")),
+                b"int main(void) { return 0; }\n",
+            )?;
             host.seed_file(
                 Path::new(&format!("{DRIVE}/work/child/CMakeLists.txt")),
-                format!(
-                    "cmake_minimum_required(VERSION 4.5)\n\
-                     set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
-                     set(CMAKE_DEFAULT_BUILD_TYPE \"Debug\")\n\
-                     set(CMAKE_CROSS_CONFIGS \"all\")\n\
-                     set(CMAKE_DEFAULT_CONFIGS \"Release\")\n\
-                     set(CMAKE_C_FLAGS_DEBUG \"-DFROM_DEBUG\")\n\
-                     set(CMAKE_C_FLAGS_RELEASE \"-DFROM_RELEASE\")\n\
-                     project(Child C)\n\
-                     add_custom_command(\n\
-                       OUTPUT \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen.c\"\n\
-                       COMMAND \"{DRIVE}/work/gen-tool\" \"--cmd=$<COMMAND_CONFIG:$<CONFIG>>\" \"--out=$<OUTPUT_CONFIG:$<CONFIG>>\" \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen.c\"\n\
-                     )\n\
-                     add_executable(app \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen.c\")\n"
-                )
-                .as_bytes(),
+                b"cmake_minimum_required(VERSION 4.5)\n\
+                  set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
+                  set(CMAKE_DEFAULT_BUILD_TYPE \"Debug\")\n\
+                  set(CMAKE_CROSS_CONFIGS \"all\")\n\
+                  set(CMAKE_DEFAULT_CONFIGS \"Release\")\n\
+                  set(CMAKE_C_FLAGS_DEBUG \"-DFROM_DEBUG\")\n\
+                  set(CMAKE_C_FLAGS_RELEASE \"-DFROM_RELEASE\")\n\
+                  project(Child C)\n\
+                  add_executable(gen_tool gen_tool.c)\n\
+                  add_custom_command(\n\
+                    OUTPUT \"${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/gen.c\"\n\
+                    COMMAND gen_tool \"--cmd=$<COMMAND_CONFIG:$<CONFIG>>\" \"--out=$<OUTPUT_CONFIG:$<CONFIG>>\" \"${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/gen.c\"\n\
+                  )\n\
+                  add_executable(app \"${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/gen.c\")\n",
             )?;
             host.set_command_handler(move |fs, req, _| {
                 if let Some(cmd) = req.pipeline.first() {
@@ -908,18 +910,32 @@ fn multi_config_try_compile_honors_caller_config_and_xcode_debug_default() -> Te
                     if let Ok(mut guard) = seen_clone.lock() {
                         guard.push(rendered);
                     }
-                    if cmd.program.to_string().ends_with("gen-tool")
-                        && let Some(out) = cmd.args.last()
-                    {
-                        let target = req.cwd.join(rcmake_host::path::to_native(out));
-                        if let Some(parent) = target.parent() {
-                            let _ = fs.create_dir_all(parent);
+                    let program_str = cmd.program.to_string();
+                    if program_str.ends_with("gen_tool") || program_str.ends_with("gen_tool.exe") {
+                        // Fail if the cross-config executor invokes gen_tool before building it.
+                        let tool_path = req.cwd.join(rcmake_host::path::to_native(&cmd.program));
+                        if fs.metadata(&tool_path, rcmake_host::Follow::Yes).is_err() {
+                            return Ok(RunOutput {
+                                stderr: format!(
+                                    "missing generator tool: {}\n",
+                                    tool_path.display()
+                                )
+                                .into_bytes(),
+                                results: vec![ProcessResult::Exited(127)],
+                                ..RunOutput::default()
+                            });
                         }
-                        let _ = fs.write(
-                            &target,
-                            b"int main(void) { return 0; }\n",
-                            WriteMode::Truncate,
-                        );
+                        if let Some(out) = cmd.args.last() {
+                            let target = req.cwd.join(rcmake_host::path::to_native(out));
+                            if let Some(parent) = target.parent() {
+                                let _ = fs.create_dir_all(parent);
+                            }
+                            let _ = fs.write(
+                                &target,
+                                b"int main(void) { return 0; }\n",
+                                WriteMode::Truncate,
+                            );
+                        }
                     }
                     if let Some(pos) = cmd.args.iter().position(|a| a == "-o")
                         && let Some(out) = cmd.args.get(pos + 1)
@@ -969,17 +985,25 @@ fn multi_config_try_compile_honors_caller_config_and_xcode_debug_default() -> Te
                 host.stream_bytes(Stream::Stderr)
             );
             let cmds = seen_cmds.lock().map_err(|_| "lock poisoned")?.clone();
-            assert!(
-                cmds.iter().any(|c| c.contains("gen-tool")
+            let build_gen_idx = cmds
+                .iter()
+                .position(|c| c.contains("gen_tool.c") && c.contains("-DFROM_DEBUG"));
+            let run_gen_idx = cmds.iter().position(|c| {
+                c.contains("Debug/gen_tool")
                     && c.contains("--cmd=Debug")
-                    && c.contains("--out=Release")),
-                "expected cross-config custom command with COMMAND_CONFIG=Debug and OUTPUT_CONFIG=Release, got {cmds:?}"
-            );
+                    && c.contains("--out=Release")
+            });
+            let build_app_idx = cmds
+                .iter()
+                .position(|c| c.contains("Release/gen.c") && c.contains("-DFROM_RELEASE"));
             assert!(
-                cmds.iter().any(|c| c.contains("-DFROM_RELEASE")),
-                "{cmds:?}"
+                build_gen_idx.is_some()
+                    && run_gen_idx.is_some()
+                    && build_app_idx.is_some()
+                    && build_gen_idx < run_gen_idx
+                    && run_gen_idx < build_app_idx,
+                "expected Debug gen_tool build -> Debug/gen_tool invocation -> Release app build, got {cmds:?}"
             );
-            assert!(!cmds.iter().any(|c| c.contains("-DFROM_DEBUG")), "{cmds:?}");
         }
 
         // Explicit CMAKE_TRY_COMPILE_CONFIGURATION absent from child CMAKE_CONFIGURATION_TYPES

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, list};
@@ -5,8 +6,8 @@ use rcmake_build::{BuildOptions, BuildOutcome};
 use rcmake_eval::Cx;
 use rcmake_genex::ConfigId;
 use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunRequest, path};
-use rcmake_model::{DirId, GeneratorKind};
-use rcmake_resolve::BuildStep;
+use rcmake_model::{DirId, GeneratorKind, ProjectModel};
+use rcmake_resolve::{BuildGraph, BuildStep, GenerationResult};
 
 mod apple;
 pub(super) mod cross;
@@ -95,21 +96,7 @@ pub(super) fn build_child(
     }
     let mut graphs_to_run = Vec::with_capacity(plan.build_configs.len());
     for target_cfg in &plan.build_configs {
-        let graph = if *target_cfg != plan.file_config {
-            resolved
-                .cross_graphs
-                .get(&(plan.file_config.clone(), target_cfg.clone()))
-                .or_else(|| resolved.graphs.iter().find(|g| g.config == *target_cfg))
-        } else {
-            resolved.graphs.iter().find(|g| g.config == *target_cfg)
-        };
-        let Some(graph) = graph else {
-            return Err(ChildError::Generate(format!(
-                "The resolver returned no build graph for configuration '{}'.",
-                target_cfg.0
-            )));
-        };
-        graphs_to_run.push(graph);
+        graphs_to_run.push(select_graph(&resolved, &plan.file_config, target_cfg)?);
     }
     let mut artifact = None;
     for graph in &graphs_to_run {
@@ -134,26 +121,8 @@ pub(super) fn build_child(
                         })
                 });
         }
-        for (relative, contents) in &graph.swift_output_file_maps {
-            let full = directory.join(path::to_native(relative));
-            if let Some(parent) = full.parent() {
-                child
-                    .host()
-                    .create_dir_all(parent)
-                    .map_err(|error| ChildError::Generate(error.to_string()))?;
-            }
-            child
-                .host()
-                .write(&full, contents.as_slice(), rcmake_host::WriteMode::Truncate)
-                .map_err(|error| ChildError::Generate(error.to_string()))?;
-        }
     }
-    let options = BuildOptions {
-        build_dir: directory.to_path_buf(),
-        targets: target.into_iter().map(BString::from).collect(),
-        verbose: source_signature,
-        ..BuildOptions::default()
-    };
+    let requested: Vec<BString> = target.into_iter().map(BString::from).collect();
     let header = build_log_header(
         child,
         directory,
@@ -171,14 +140,21 @@ pub(super) fn build_child(
         steps_run: 0,
         output: BString::default(),
     };
-    for graph in &graphs_to_run {
-        let outcome = rcmake_build::execute(graph, child.host(), &options)
-            .map_err(|error| ChildError::Build(error.to_string()))?;
-        combined.steps_run += outcome.steps_run;
-        combined.output.extend_from_slice(&outcome.output);
-        if !outcome.success {
-            combined.success = false;
-            combined.exit_code = outcome.exit_code;
+    let mut state = CrossBuildState::default();
+    for target_cfg in &plan.build_configs {
+        execute_with_cross_deps(
+            child,
+            &model,
+            &resolved,
+            directory,
+            &plan.file_config,
+            target_cfg,
+            &requested,
+            source_signature,
+            &mut state,
+            &mut combined,
+        )?;
+        if !combined.success {
             break;
         }
     }
@@ -186,6 +162,202 @@ pub(super) fn build_child(
         profile.span(b"probe.build", start);
     }
     Ok((combined, artifact, header))
+}
+
+fn select_graph<'a>(
+    resolved: &'a GenerationResult,
+    file_config: &ConfigId,
+    target_cfg: &ConfigId,
+) -> Result<&'a BuildGraph, ChildError> {
+    let graph = if target_cfg != file_config {
+        resolved
+            .cross_graphs
+            .get(&(file_config.clone(), target_cfg.clone()))
+            .or_else(|| resolved.graphs.iter().find(|g| g.config == *target_cfg))
+    } else {
+        resolved.graphs.iter().find(|g| g.config == *target_cfg)
+    };
+    graph.ok_or_else(|| {
+        ChildError::Generate(format!(
+            "The resolver returned no build graph for configuration '{}'.",
+            target_cfg.0
+        ))
+    })
+}
+
+fn write_swift_maps(
+    child: &mut Cx<'_>,
+    directory: &Path,
+    graph: &BuildGraph,
+    swift_written: &mut HashSet<(ConfigId, ConfigId)>,
+    key: (ConfigId, ConfigId),
+) -> Result<(), ChildError> {
+    if !swift_written.insert(key) {
+        return Ok(());
+    }
+    for (relative, contents) in &graph.swift_output_file_maps {
+        let full = directory.join(path::to_native(relative));
+        if let Some(parent) = full.parent() {
+            child
+                .host()
+                .create_dir_all(parent)
+                .map_err(|error| ChildError::Generate(error.to_string()))?;
+        }
+        child
+            .host()
+            .write(&full, contents.as_slice(), rcmake_host::WriteMode::Truncate)
+            .map_err(|error| ChildError::Generate(error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Collect target dependencies in other configurations referenced by custom commands
+/// reachable from `requested` in `graph` (for example a file-configuration generator
+/// executable invoked by a cross-config custom command).
+fn reachable_cross_deps(
+    model: &ProjectModel,
+    graph: &BuildGraph,
+    requested: &[BString],
+) -> Vec<(ConfigId, BString)> {
+    let mut roots = Vec::new();
+    if requested.is_empty() {
+        roots.extend(
+            graph
+                .targets
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, target)| target.in_all.then_some(idx)),
+        );
+    } else {
+        for name in requested {
+            if let Some(idx) = graph.targets.iter().position(|t| &t.name == name) {
+                roots.push(idx);
+            }
+        }
+    }
+    let mut seen = vec![false; graph.targets.len()];
+    let mut stack = roots;
+    let mut deps = Vec::new();
+    let mut seen_deps = HashSet::new();
+    while let Some(idx) = stack.pop() {
+        let Some(flag) = seen.get_mut(idx) else {
+            continue;
+        };
+        if *flag {
+            continue;
+        }
+        *flag = true;
+        let Some(target) = graph.targets.get(idx) else {
+            continue;
+        };
+        for &dep in &target.depends {
+            stack.push(dep);
+        }
+        for &step_idx in &target.steps {
+            if let Some(BuildStep::Custom(custom)) = graph.steps.get(step_idx) {
+                for (dep_id, dep_cfg) in &custom.target_dependencies {
+                    if *dep_cfg != graph.config
+                        && let Some(dep_name) = model.target(*dep_id).map(|t| t.name.clone())
+                        && seen_deps.insert((dep_cfg.clone(), dep_name.clone()))
+                    {
+                        deps.push((dep_cfg.clone(), dep_name));
+                    }
+                }
+            }
+        }
+    }
+    deps
+}
+
+#[derive(Default)]
+struct CrossBuildState {
+    visiting: HashSet<(ConfigId, Option<BString>)>,
+    built: HashSet<(ConfigId, BString)>,
+    swift_written: HashSet<(ConfigId, ConfigId)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_with_cross_deps(
+    child: &mut Cx<'_>,
+    model: &ProjectModel,
+    resolved: &GenerationResult,
+    directory: &Path,
+    file_config: &ConfigId,
+    target_cfg: &ConfigId,
+    requested: &[BString],
+    source_signature: bool,
+    state: &mut CrossBuildState,
+    combined: &mut BuildOutcome,
+) -> Result<(), ChildError> {
+    let graph = select_graph(resolved, file_config, target_cfg)?;
+    write_swift_maps(
+        child,
+        directory,
+        graph,
+        &mut state.swift_written,
+        (file_config.clone(), target_cfg.clone()),
+    )?;
+    let visit_keys: Vec<_> = if requested.is_empty() {
+        vec![(target_cfg.clone(), None)]
+    } else {
+        requested
+            .iter()
+            .map(|name| (target_cfg.clone(), Some(name.clone())))
+            .collect()
+    };
+    for key in &visit_keys {
+        if !state.visiting.insert(key.clone()) {
+            return Err(ChildError::Build("dependency cycle".into()));
+        }
+    }
+    let cross_deps = reachable_cross_deps(model, graph, requested);
+    for (dep_cfg, dep_name) in cross_deps {
+        if state.built.contains(&(dep_cfg.clone(), dep_name.clone())) {
+            continue;
+        }
+        execute_with_cross_deps(
+            child,
+            model,
+            resolved,
+            directory,
+            file_config,
+            &dep_cfg,
+            std::slice::from_ref(&dep_name),
+            source_signature,
+            state,
+            combined,
+        )?;
+        if !combined.success {
+            for key in &visit_keys {
+                state.visiting.remove(key);
+            }
+            return Ok(());
+        }
+        state.built.insert((dep_cfg, dep_name));
+    }
+    let options = BuildOptions {
+        build_dir: directory.to_path_buf(),
+        targets: requested.to_vec(),
+        verbose: source_signature,
+        ..BuildOptions::default()
+    };
+    let outcome = rcmake_build::execute(graph, child.host(), &options)
+        .map_err(|error| ChildError::Build(error.to_string()))?;
+    for key in &visit_keys {
+        state.visiting.remove(key);
+    }
+    for name in requested {
+        if outcome.success {
+            state.built.insert((target_cfg.clone(), name.clone()));
+        }
+    }
+    combined.steps_run += outcome.steps_run;
+    combined.output.extend_from_slice(&outcome.output);
+    if !outcome.success {
+        combined.success = false;
+        combined.exit_code = outcome.exit_code;
+    }
+    Ok(())
 }
 
 /// Match CMake's `cmGlobalNinjaMultiGenerator::InspectConfigTypeVariables` and

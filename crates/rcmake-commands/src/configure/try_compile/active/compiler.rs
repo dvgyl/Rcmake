@@ -333,47 +333,22 @@ impl CompilerEvidence {
         })
     }
 
-    /// Re-verify Ninja live in `scratch` for a speculative worker and confirm its digest
-    /// and version match the recipe identity before replaying inside that directory.
-    pub(super) fn reverify_ninja_in(
-        &self,
-        scratch: &Path,
-        env: &[(BString, BString)],
-        facts: Option<&BuildToolFacts>,
-    ) -> Option<Self> {
-        let Some(expected) = &self.ninja else {
-            return Some(self.clone());
-        };
-        let digest = self
-            .memo
-            .file_digest(self.host.as_ref(), &expected.program)
-            .ok()?;
-        if digest != expected.digest {
-            return None;
-        }
-        let fresh = if let Some(facts) = facts {
-            facts.sample_ninja(
-                self.host.as_ref(),
-                &expected.program,
-                digest,
-                env.to_vec(),
-                scratch.to_path_buf(),
-            )?
-        } else {
-            BuildToolFacts::default().sample_ninja(
-                self.host.as_ref(),
-                &expected.program,
-                digest,
-                env.to_vec(),
-                scratch.to_path_buf(),
-            )?
-        };
-        if fresh.digest != expected.digest || fresh.version != expected.version {
-            return None;
-        }
+    /// Rebind the already-observed foreground Ninja evidence to `scratch` for a
+    /// speculative worker without spawning Ninja before or during speculation.
+    ///
+    /// A speculative result stays in memory until the main thread actually reaches the
+    /// probe, verifies Ninja live in the real child scratch directory, and matches both
+    /// binary digest and version against the speculative recipe key.
+    pub(super) fn rebind_ninja_for_speculation(&self, scratch: &Path) -> Self {
         let mut updated = self.clone();
-        updated.ninja = Some(fresh);
-        Some(updated)
+        if let Some(ninja) = &mut updated.ninja {
+            ninja.cwd = scratch.to_path_buf();
+        }
+        updated
+    }
+
+    pub(super) fn verified_ninja(&self) -> Option<&VerifiedNinja> {
+        self.ninja.as_ref()
     }
 
     pub(super) fn identity(&self) -> BTreeMap<BString, Digest> {

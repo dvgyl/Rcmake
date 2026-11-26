@@ -115,6 +115,8 @@ pub(super) struct ProbeGeneratorFacts {
     pub(super) facts: Arc<BuildToolFacts>,
     pub(super) journal: Option<Arc<JournalHost<'static>>>,
     pub(super) memo: Arc<rcmake_store::TraceMemo>,
+    pub(super) speculative: bool,
+    pub(super) preverified_ninja: Option<crate::configure::build_tool_facts::VerifiedNinja>,
 }
 
 impl rcmake_resolve::GeneratorFacts for ProbeGeneratorFacts {
@@ -122,7 +124,15 @@ impl rcmake_resolve::GeneratorFacts for ProbeGeneratorFacts {
         use rcmake_resolve::query_ninja_cxx_dyndep;
 
         let program = path::to_native(&request.pipeline.first()?.program);
-        let fallback = || query_ninja_cxx_dyndep(host, request);
+        let fallback = || {
+            if self.speculative {
+                if let Some(journal) = &self.journal {
+                    journal.reject_generator_fact();
+                }
+                return None;
+            }
+            query_ninja_cxx_dyndep(host, request)
+        };
         if !program.is_absolute() || !compiler::admit_environment(&request.env) {
             return fallback();
         }
@@ -146,13 +156,25 @@ impl rcmake_resolve::GeneratorFacts for ProbeGeneratorFacts {
         }
         let mut request = request.clone();
         super::plan::process_environment(&mut request.env);
-        let result = self.facts.ninja_cxx_dyndep(
-            self.real.as_ref(),
-            &request,
-            program,
-            digest,
-            process_environment_fingerprint(&request.env),
-        );
+        let env_digest = process_environment_fingerprint(&request.env);
+        if self.speculative {
+            let result = self
+                .preverified_ninja
+                .as_ref()
+                .filter(|ninja| {
+                    ninja.program == program && ninja.digest == digest && ninja.env == env_digest
+                })
+                .map(crate::configure::build_tool_facts::VerifiedNinja::supports_cxx_dyndep);
+            if let Some(journal) = &self.journal
+                && result.is_none()
+            {
+                journal.reject_generator_fact();
+            }
+            return result;
+        }
+        let result =
+            self.facts
+                .ninja_cxx_dyndep(self.real.as_ref(), &request, program, digest, env_digest);
         if let Some(journal) = &self.journal
             && result.is_none()
         {

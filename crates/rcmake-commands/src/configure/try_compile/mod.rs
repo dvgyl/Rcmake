@@ -393,6 +393,8 @@ fn build_probe(
                 memo: cached_probe
                     .as_ref()
                     .map_or_else(Default::default, active::PreparedProbe::trace_memo),
+                speculative: false,
+                preverified_ninja: None,
             }) as std::sync::Arc<dyn rcmake_resolve::GeneratorFacts>
         });
     #[cfg(not(all(feature = "native", any(unix, windows))))]

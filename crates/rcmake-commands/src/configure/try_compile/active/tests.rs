@@ -594,3 +594,145 @@ fn uncertified_ninja_wrapper_bypasses_warm_probe_cache_while_native_ninja_hits()
     assert_eq!(compiler_runs.load(Ordering::Relaxed), after_wrapper);
     Ok(())
 }
+
+#[test]
+fn speculative_ninja_workers_never_spawn_ninja_version_checks() -> TestResult {
+    use rcmake_model::GeneratorKind;
+
+    let root = Path::new("/work/probes");
+    let executable = root.join("bin/rcmake");
+    let inner = Arc::new(PureHost::new(root.into(), executable.clone()));
+    // Two back-to-back probes so Probe 1 queues Probe 2 into the speculative worker pool,
+    // plus a third probe after a failing guard that is never reached by the evaluator.
+    let lists = format!(
+        "set(CMAKE_MAKE_PROGRAM /bin/ninja CACHE FILEPATH \"\")\n\
+         {PROJECT}\
+         try_compile(OK1 SOURCE_FROM_CONTENT a.c [[int main(void) {{ return 0; }}]] NO_CACHE)\n\
+         try_compile(OK2 SOURCE_FROM_CONTENT b.c [[int main(void) {{ return 1; }}]] NO_CACHE)\n"
+    );
+    inner.seed_file(&root.join("CMakeLists.txt"), lists.as_bytes())?;
+    for file in [
+        executable,
+        "/usr/bin/xcrun".into(),
+        "/usr/bin/cc".into(),
+        "/usr/bin/c++".into(),
+        Path::new(TOOLCHAIN).join("clang"),
+        Path::new(TOOLCHAIN).join("clang++"),
+        Path::new(TOOLCHAIN).join("ld"),
+        Path::new(SDK).join("SDKSettings.json"),
+        Path::new(SDK).join("usr/lib/libSystem.tbd"),
+    ] {
+        inner.seed_file(&file, b"fixture")?;
+    }
+    inner.seed_file(Path::new("/bin/ninja"), b"\x7fELF-ninja-spec-test")?;
+    inner.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(b"/work/probe-cache-spec"));
+    inner.sleep(Duration::from_secs(4));
+
+    let ninja_cwds = Arc::new(std::sync::Mutex::new(Vec::<std::path::PathBuf>::new()));
+    let ninja_cwds_clone = Arc::clone(&ninja_cwds);
+    inner.set_command_handler(move |host, request, _| {
+        let command = request
+            .pipeline
+            .first()
+            .ok_or_else(|| HostError::unsupported("Expected a process."))?;
+        if command.program == "/bin/ninja" {
+            if let Ok(mut guard) = ninja_cwds_clone.lock() {
+                guard.push(request.cwd.clone());
+            }
+            return Ok(success(b"1.12.1\n".to_vec()));
+        }
+        if command.program == "/usr/bin/xcrun" {
+            let tool = command
+                .args
+                .last()
+                .ok_or_else(|| HostError::unsupported("Expected a tool name."))?;
+            return Ok(success(format!("{TOOLCHAIN}/{tool}\n").into_bytes()));
+        }
+        if command.args.iter().any(|arg| arg == "-E") && command.args.iter().any(|arg| arg == "-v")
+        {
+            let mut output = success(Vec::new());
+            output.stderr = format!(
+                "#include <...> search starts here:\n {SDK}/usr/include\nEnd of search list.\n"
+            )
+            .into_bytes();
+            return Ok(output);
+        }
+        if command.program == format!("{TOOLCHAIN}/clang").as_str()
+            || command.program == format!("{TOOLCHAIN}/clang++").as_str()
+        {
+            let data = match command.args.as_slice() {
+                [flag] if flag == "-print-resource-dir" => b"/fixture/clang/resource\n".to_vec(),
+                [flag] if flag == "-print-target-triple" => b"arm64-apple-darwin\n".to_vec(),
+                [flag] if flag == "-v" => Vec::new(),
+                _ => return Err(HostError::unsupported("Unexpected compiler query.")),
+            };
+            return Ok(success(data));
+        }
+        if command.program != "/usr/bin/cc" {
+            return Err(HostError::unsupported(format!(
+                "Unexpected process: {}",
+                command.program
+            )));
+        }
+        let argument = |flag: &[u8]| {
+            command.args.windows(2).find_map(|pair| match pair {
+                [key, value] if key.as_slice() == flag => {
+                    Some(request.cwd.join(path::to_native(value)))
+                }
+                _ => None,
+            })
+        };
+        let out =
+            argument(b"-o").ok_or_else(|| HostError::unsupported("Expected a compiler output."))?;
+        host.seed_file(&out, b"test binary")?;
+        if let Some(deps) = argument(b"-MF") {
+            let source = command
+                .args
+                .iter()
+                .find(|arg| arg.ends_with(b".c"))
+                .ok_or_else(|| HostError::unsupported("Expected a source file."))?;
+            host.seed_file(&deps, format!("out.o: {source}\n").as_bytes())?;
+        }
+        if command.args.iter().any(|arg| arg == "-dependency_info") {
+            let deps = command
+                .args
+                .last()
+                .ok_or_else(|| HostError::unsupported("Expected linker evidence."))?;
+            let bytes = format!("\0fixture\0\u{10}{SDK}/usr/lib/libSystem.tbd\0");
+            host.seed_file(&request.cwd.join(path::to_native(deps)), bytes.as_bytes())?;
+        }
+        Ok(success(b"compiler output\n".to_vec()))
+    })?;
+
+    let system = rcmake_host::SystemInfo {
+        sysname: "Darwin".into(),
+        cpu_count: 4,
+        total_memory: 16 << 30,
+        ..inner.system()
+    };
+    let host = CapturingHost::for_test(inner.clone(), root, system);
+    let mut services = Services::default();
+    services.speed.probe_cache = ProbeCacheMode::ReadWrite;
+    services.speed.probe_jobs = NonZeroUsize::new(2);
+    let mut runtime =
+        ConfigureRuntime::new(host, root, Path::new("/work/spec-build"), &services, true);
+    let mut interp = interpreter(runtime.host(), root)?;
+    interp.cx().project().generator = Some(GeneratorKind::Ninja);
+    inner.sleep(Duration::from_secs(4));
+    let outcome = runtime.run(&mut interp, &[]);
+    runtime.finish(outcome.exit_code == 0);
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(interp.cx().var_or_empty(b"OK1"), "TRUE");
+    assert_eq!(interp.cx().var_or_empty(b"OK2"), "TRUE");
+
+    let cwds = ninja_cwds
+        .lock()
+        .map_err(|_| HostError::unsupported("lock poisoned"))?;
+    assert!(
+        !cwds
+            .iter()
+            .any(|dir| dir.to_string_lossy().contains("Spec-")),
+        "speculative workers must never execute ninja --version in Spec-* scratch dirs: {cwds:?}"
+    );
+    Ok(())
+}

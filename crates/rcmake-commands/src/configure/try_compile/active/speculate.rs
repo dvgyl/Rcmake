@@ -222,11 +222,9 @@ impl SpeculativeExecution {
             budget.deadline.saturating_duration_since(speculative_now()),
             budget.shutdown.clone(),
         );
-        let compiler = Arc::new(
-            self.compiler
-                .reverify_ninja_in(scratch, &environment, self.facts.as_deref())
-                .ok_or_else(fail)?,
-        ) as Arc<dyn ProcessVerifier>;
+        let preverified_ninja = self.compiler.verified_ninja().cloned();
+        let compiler = Arc::new(self.compiler.rebind_ninja_for_speculation(scratch))
+            as Arc<dyn ProcessVerifier>;
         let journal = Arc::new(
             JournalHost::from_shared(self.host.clone(), scratch, compiler, JournalMode::Speculate)?
                 .with_trace_memo(self.memo.clone())
@@ -269,6 +267,8 @@ impl SpeculativeExecution {
                         facts,
                         journal: Some(journal.clone()),
                         memo: self.memo,
+                        speculative: true,
+                        preverified_ninja,
                     }) as Arc<dyn rcmake_resolve::GeneratorFacts>
                 }),
             },
