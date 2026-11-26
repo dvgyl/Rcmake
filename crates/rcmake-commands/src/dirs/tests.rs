@@ -486,3 +486,64 @@ fn add_subdirectory_rejects_duplicate_binary_directory() -> TestResult {
     assert!(stderr.contains("/c"), "{stderr}");
     Ok(())
 }
+
+#[test]
+fn add_subdirectory_sees_root_binary_dir_replaced_in_place() -> TestResult {
+    let root = PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
+    let source = root.join("src");
+    let build = root.join("build");
+    let replaced = root.join("replaced_build");
+    let command = root.join("bin/cmake");
+    let host = Arc::new(PureHost::new(source.clone(), command.clone()));
+    let build_cmake = rcmake_host::path::from_native_cmake(&build);
+    let replaced_cmake = rcmake_host::path::from_native_cmake(&replaced);
+    let script = format!(
+        concat!(
+            "cmake_minimum_required(VERSION 4.5)\n",
+            "project(p NONE)\n",
+            "add_subdirectory(a sub_a)\n",
+            "test_replace_root_bin(\"{replaced}\")\n",
+            "add_subdirectory(b \"{old_build}\")\n",
+            "add_subdirectory(c \"{replaced}\")\n",
+        ),
+        old_build = build_cmake,
+        replaced = replaced_cmake,
+    );
+    host.seed_file(&source.join("CMakeLists.txt"), script.as_bytes())?;
+    for sub in ["a", "b", "c"] {
+        host.seed_file(&source.join(sub).join("CMakeLists.txt"), b"")?;
+    }
+    let mut interp = Interp::new(
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            root.join("share/cmake-4.5"),
+            command,
+            source.clone(),
+        ),
+        |registry| {
+            crate::register_all(registry);
+            registry.add(
+                "test_replace_root_bin",
+                |cx, args| {
+                    let src = cx.project().dir(DirId::ROOT).source_dir.clone();
+                    cx.project().set_root_dirs(src, args[0].value.clone());
+                    Ok(rcmake_eval::Flow::Normal)
+                },
+                rcmake_eval::CmdFlags { scriptable: false },
+            );
+        },
+    );
+    let outcome = interp.run_configure(&source, &build, &[]);
+    assert_ne!(outcome.exit_code, 0);
+    let stderr = host.stream_bytes(Stream::Stderr).to_string();
+    assert!(
+        stderr.contains("is already used to build a source directory"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("replaced_build"), "{stderr}");
+    assert!(stderr.contains("/c"), "{stderr}");
+    assert!(!stderr.contains("/b"), "{stderr}");
+    assert_eq!(interp.cx().project().dirs().count(), 3);
+    Ok(())
+}

@@ -19,6 +19,16 @@ enum Keyword<'a> {
     Multi(Vec<Cow<'a, [u8]>>),
 }
 
+impl Keyword<'_> {
+    const fn group_order(&self) -> u8 {
+        match self {
+            Self::Option(_) => 0,
+            Self::One { .. } => 1,
+            Self::Multi(_) => 2,
+        }
+    }
+}
+
 enum InputMode<'a> {
     Regular(&'a [ExpandedArg]),
     Caller(Vec<BString>),
@@ -197,7 +207,15 @@ pub(super) fn parse<'a>(cx: &mut Cx<'_>, args: &'a [ExpandedArg]) -> CmdResult {
     var_buf.push(b'_');
     let base_len = var_buf.len();
 
-    for (keyword, parsed) in keywords {
+    let mut outputs: Vec<_> = keywords.into_iter().collect();
+    outputs.sort_unstable_by(|(a_name, a_kind), (b_name, b_kind)| {
+        a_kind
+            .group_order()
+            .cmp(&b_kind.group_order())
+            .then_with(|| a_name.as_ref().cmp(b_name.as_ref()))
+    });
+
+    for (keyword, parsed) in outputs {
         var_buf.truncate(base_len);
         var_buf.extend_from_slice(&keyword);
         let value = match parsed {

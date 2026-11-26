@@ -1174,3 +1174,73 @@ fn add_dependencies_deduplicates_across_large_batches_in_order() -> TestResult {
     assert_eq!(actual, expected);
     Ok(())
 }
+
+#[test]
+fn add_dependencies_rebuilds_index_after_in_place_target_mutation() -> TestResult {
+    let cwd = Path::new("/work");
+    let source = cwd.join("src");
+    let exe = Path::new("/bin/cmake");
+    let host = Arc::new(PureHost::new(cwd.into(), exe.into()));
+    let mut interp = Interp::new(
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            "/share/cmake-4.5",
+            exe,
+            cwd,
+        ),
+        |registry| {
+            crate::register_all(registry);
+            registry.add(
+                "test_replace_first_dep",
+                |cx, args| {
+                    let dir = cx.current_dir_id();
+                    if let Some(id) = cx.project().find_target(dir, super::bytes(&args[0]))
+                        && let Some(target) = cx.project().target_mut(id)
+                        && let Some(first) = target.utility_deps.first_mut()
+                    {
+                        first.value = args[1].value.clone();
+                    }
+                    Ok(rcmake_eval::Flow::Normal)
+                },
+                rcmake_eval::CmdFlags { scriptable: false },
+            );
+        },
+    );
+    host.seed_file(
+        &source.join("CMakeLists.txt"),
+        br#"
+        cmake_minimum_required(VERSION 4.5)
+        add_library(app STATIC main.c)
+        foreach(i RANGE 1 35)
+          add_dependencies(app "dep_${i}")
+        endforeach()
+        test_replace_first_dep(app replaced_dep)
+        add_dependencies(app replaced_dep dep_1 dep_36)
+        "#,
+    )?;
+    let outcome = interp.run_configure(&source, &cwd.join("build"), &[]);
+    assert_eq!(
+        outcome.exit_code,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let mut cx = interp.cx();
+    let model = cx.project();
+    let id = model
+        .find_target(DirId::ROOT, b"app")
+        .ok_or("missing app target")?;
+    let target = model.target(id).ok_or("missing app target")?;
+    let actual: Vec<String> = target
+        .utility_deps
+        .iter()
+        .map(|entry| entry.value.to_string())
+        .collect();
+    let mut expected = vec!["replaced_dep".to_owned()];
+    expected.extend((2..=35).map(|i| format!("dep_{i}")));
+    expected.push("dep_1".to_owned());
+    expected.push("dep_36".to_owned());
+    assert_eq!(actual, expected);
+    Ok(())
+}

@@ -309,21 +309,22 @@ fn write_configured(
         if temp == dest {
             continue;
         }
-        match host.write(&temp, content, WriteMode::CreateNew) {
+        match host.write(&temp, b"", WriteMode::CreateNew) {
             Ok(()) => {
-                let result = host
-                    .set_permissions(&temp, mode)
-                    .and_then(|()| host.rename(&temp, dest));
+                let result = if content.is_empty() {
+                    Ok(())
+                } else {
+                    host.write(&temp, content, WriteMode::Truncate)
+                }
+                .and_then(|()| host.set_permissions(&temp, mode))
+                .and_then(|()| host.rename(&temp, dest));
                 if result.is_err() {
                     let _ = host.remove_file(&temp);
                 }
                 return result.map_err(file_error);
             }
             Err(error) if error.kind == ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                let _ = host.remove_file(&temp);
-                return Err(file_error(error));
-            }
+            Err(error) => return Err(file_error(error)),
         }
     }
     Err(CmdError::status(

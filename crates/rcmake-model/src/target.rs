@@ -441,6 +441,7 @@ pub struct Target {
     pub utility_deps: Vec<BT<BString>>,
     /// `PRE_BUILD`, `PRE_LINK`, and `POST_BUILD` custom commands.
     pub event_commands: Vec<CommandId>,
+    pub(crate) mutation_epoch: u64,
 }
 
 impl Target {
@@ -470,6 +471,7 @@ impl Target {
             file_sets: Vec::new(),
             utility_deps: Vec::new(),
             event_commands: Vec::new(),
+            mutation_epoch: 0,
         }
     }
 

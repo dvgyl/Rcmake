@@ -2,7 +2,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use rcmake_base::{BString, list, path_lex::Lexical};
@@ -99,44 +98,6 @@ fn subdirs(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
-#[derive(Default)]
-struct BinaryDirIndex {
-    synced_dirs: usize,
-    binary_dirs: HashSet<BString>,
-}
-
-fn binary_dir_in_use(cx: &mut Cx<'_>, bin_bytes: &[u8]) -> bool {
-    let dir_count = cx.project().dirs().count();
-    let synced = cx
-        .session_data::<BinaryDirIndex>()
-        .map_or(0, |index| index.synced_dirs);
-    if synced != dir_count {
-        let start = if synced < dir_count { synced } else { 0 };
-        let added: Vec<BString> = cx
-            .project()
-            .dirs()
-            .skip(start)
-            .map(|(_, entry)| entry.binary_dir.clone())
-            .collect();
-        if let Some(index) = cx.session_data_mut_or_init::<BinaryDirIndex>() {
-            if start == 0 {
-                index.binary_dirs.clear();
-            }
-            for dir in added {
-                index.binary_dirs.insert(dir);
-            }
-            index.synced_dirs = dir_count;
-            return index.binary_dirs.contains(bin_bytes);
-        }
-    }
-    if let Some(index) = cx.session_data::<BinaryDirIndex>() {
-        return index.binary_dirs.contains(bin_bytes);
-    }
-    cx.project()
-        .dirs()
-        .any(|(_, entry)| entry.binary_dir == bin_bytes)
-}
-
 fn run_subdirectory(
     cx: &mut Cx<'_>,
     source: &[u8],
@@ -179,7 +140,11 @@ fn run_subdirectory(
         }
     };
     let bin_bytes = path::from_native_cmake(&bin);
-    if binary_dir_in_use(cx, &bin_bytes) {
+    if cx
+        .project()
+        .dirs()
+        .any(|(_, entry)| entry.binary_dir == bin_bytes)
+    {
         let source_bytes = path::from_native_cmake(&src);
         return Err(crate::command_error(
             cx,

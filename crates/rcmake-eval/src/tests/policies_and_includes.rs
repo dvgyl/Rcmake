@@ -265,6 +265,7 @@ mod case_mismatch_tests {
     /// directory entry names from `read_dir`.
     struct CaseInsensitiveHost {
         base: Arc<PureHost>,
+        equivalences: Vec<(rcmake_base::BString, rcmake_base::BString)>,
     }
 
     impl CaseInsensitiveHost {
@@ -276,10 +277,24 @@ mod case_mismatch_tests {
                 && let Ok(entries) = self.base.read_dir(parent)
             {
                 let requested = name.as_encoded_bytes();
-                if let Some(entry) = entries
-                    .into_iter()
-                    .find(|entry| entry.name.eq_ignore_ascii_case(requested))
-                {
+                let req_lower = std::str::from_utf8(requested).ok().map(str::to_lowercase);
+                if let Some(entry) = entries.into_iter().find(|entry| {
+                    if self
+                        .equivalences
+                        .iter()
+                        .any(|(req, disk)| req.as_slice() == requested && disk == &entry.name)
+                    {
+                        return true;
+                    }
+                    if entry.name.eq_ignore_ascii_case(requested) {
+                        return true;
+                    }
+                    req_lower.as_ref().is_some_and(|lower| {
+                        std::str::from_utf8(entry.name.as_slice())
+                            .ok()
+                            .is_some_and(|text| text.to_lowercase() == *lower)
+                    })
+                }) {
                     return parent.join(rcmake_host::path::to_native(&entry.name));
                 }
             }
@@ -341,7 +356,10 @@ mod case_mismatch_tests {
             base.seed_file(&PathBuf::from(path), text.as_bytes())
                 .expect("seed file");
         }
-        let host = Arc::new(CaseInsensitiveHost { base: base.clone() });
+        let host = Arc::new(CaseInsensitiveHost {
+            base: base.clone(),
+            equivalences: Vec::new(),
+        });
         let config =
             InterpConfig::new(host, RunMode::Script, ROOT, "/usr/local/bin/cmake", "/work");
         let mut interp = Interp::new(config, register_test);
@@ -384,6 +402,110 @@ mod case_mismatch_tests {
         assert_eq!(
             warnings,
             vec![expected_user.to_owned(), expected_std.to_owned()]
+        );
+    }
+
+    #[test]
+    fn include_warns_after_case_rename_for_unicode_and_preserves_symlink_name() {
+        fn register_with_rename(reg: &mut crate::Registry) {
+            register_test(reg);
+            reg.add(
+                "test_rename",
+                |cx, args| {
+                    let from = rcmake_host::path::to_native(&args[0].value);
+                    let to = rcmake_host::path::to_native(&args[1].value);
+                    cx.host().rename(&from, &to).expect("rename");
+                    Ok(crate::Flow::Normal)
+                },
+                crate::CmdFlags { scriptable: true },
+            );
+        }
+
+        let base = Arc::new(PureHost::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/usr/local/bin/cmake"),
+        ));
+        let nfd_disk = "E\u{0301}nfd.cmake";
+        for (path, text) in [
+            (
+                "/work/main.cmake".to_owned(),
+                concat!(
+                    "set(CMAKE_MODULE_PATH /work/mods)\n",
+                    "include(Exact)\n",
+                    "test_rename(/work/mods/Exact.cmake /work/mods/EXACT.cmake)\n",
+                    "include(Exact)\n",
+                    "include(éclair)\n",
+                    "include(énfd)\n",
+                    "include(LinkMod)\n",
+                    "include(linkmod)\n",
+                    "include(beta)\n",
+                ),
+            ),
+            ("/work/mods/Exact.cmake".to_owned(), "message(exact)\n"),
+            ("/work/mods/Éclair.cmake".to_owned(), "message(eclair)\n"),
+            (format!("/work/mods/{nfd_disk}"), "message(nfd)\n"),
+            ("/work/other/RealTarget.cmake".to_owned(), "message(link)\n"),
+            ("/work/mods/Alpha.cmake".to_owned(), "message(hardlink)\n"),
+        ] {
+            base.seed_file(&PathBuf::from(path), text.as_bytes())
+                .expect("seed file");
+        }
+        base.symlink(
+            Path::new("/work/other/RealTarget.cmake"),
+            Path::new("/work/mods/LinkMod.cmake"),
+        )
+        .expect("symlink");
+        base.hard_link(
+            Path::new("/work/mods/Alpha.cmake"),
+            Path::new("/work/mods/Beta.cmake"),
+        )
+        .expect("hard link");
+
+        let host = Arc::new(CaseInsensitiveHost {
+            base: base.clone(),
+            equivalences: vec![("énfd.cmake".into(), nfd_disk.into())],
+        });
+        let config =
+            InterpConfig::new(host, RunMode::Script, ROOT, "/usr/local/bin/cmake", "/work");
+        let mut interp = Interp::new(config, register_with_rename);
+        interp.frontend = TEST_FRONTEND;
+        let outcome = interp.run_script(&PathBuf::from("main.cmake"));
+        let stderr = String::from_utf8_lossy(&base.stream_bytes(Stream::Stderr)).into_owned();
+        assert_eq!(outcome.exit_code, 0, "{stderr}");
+
+        let expected = |requested: &str, actual: &str| {
+            format!(
+                concat!(
+                    "The module name\n",
+                    "  {req}\n",
+                    "does not match the case of the module file name on disk\n",
+                    "  /work/mods/{act}\n",
+                    "This may fail on case-sensitive file systems.  Use the module name\n",
+                    "  {act}\n",
+                    "instead.",
+                ),
+                req = requested,
+                act = actual,
+            )
+        };
+        let warnings: Vec<_> = interp
+            .diag_engine()
+            .diagnostics()
+            .iter()
+            .filter(|d| {
+                d.kind == MessageKind::AuthorWarning && d.category == Some(DiagCategory::Author)
+            })
+            .map(|d| d.body.to_string())
+            .collect();
+        assert_eq!(
+            warnings,
+            vec![
+                expected("Exact.cmake", "EXACT.cmake"),
+                expected("éclair.cmake", "Éclair.cmake"),
+                expected("énfd.cmake", nfd_disk),
+                expected("linkmod.cmake", "LinkMod.cmake"),
+                expected("beta.cmake", "Beta.cmake"),
+            ]
         );
     }
 }

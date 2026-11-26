@@ -215,36 +215,18 @@ impl Interp {
             return;
         }
         let dir = crate::util::filename_path(abs);
-        if self
-            .module_dir_names
-            .get(&dir)
-            .is_some_and(|names| names.contains(requested))
-        {
-            return;
-        }
         let native_dir = rcmake_host::path::to_native(&dir);
         let Ok(entries) = self.config.host.read_dir(&native_dir) else {
             return;
         };
-        let mut exact_hit = false;
-        let mut mismatched: Option<BString> = None;
-        let mut names = std::collections::HashSet::with_capacity_and_hasher(
-            entries.len(),
-            crate::util::FxBuildHasher,
-        );
-        for entry in entries {
-            if entry.name.as_slice() == requested {
-                exact_hit = true;
-            } else if mismatched.is_none() && entry.name.eq_ignore_ascii_case(requested) {
-                mismatched = Some(entry.name.clone());
-            }
-            names.insert(entry.name);
-        }
-        self.module_dir_names.insert(dir.clone(), names);
-        if exact_hit {
+        if entries
+            .iter()
+            .any(|entry| entry.name.as_slice() == requested)
+        {
             return;
         }
-        let Some(actual) = mismatched else {
+        let Some(actual) = self.resolve_module_disk_name(abs, &native_dir, requested, entries)
+        else {
             return;
         };
         let on_disk = if dir.ends_with(b"/") {
@@ -268,6 +250,53 @@ impl Interp {
             body,
             true,
         );
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    fn resolve_module_disk_name(
+        &self,
+        abs: &[u8],
+        native_dir: &std::path::Path,
+        requested: &[u8],
+        mut entries: Vec<rcmake_host::DirEntry>,
+    ) -> Option<BString> {
+        let host = self.config.host.as_ref();
+        let req = host
+            .metadata(&rcmake_host::path::to_native(abs), rcmake_host::Follow::No)
+            .ok()?;
+        let same_entry = |entry: &rcmake_host::DirEntry| -> bool {
+            let path = native_dir.join(rcmake_host::path::to_native(&entry.name));
+            host.metadata(&path, rcmake_host::Follow::No)
+                .is_ok_and(|meta| {
+                    meta.kind == req.kind && meta.dev == req.dev && meta.ino == req.ino
+                })
+        };
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let requested_lower = std::str::from_utf8(requested).ok().map(str::to_lowercase);
+        let case_matches = |name: &[u8]| -> bool {
+            if name.eq_ignore_ascii_case(requested) {
+                return true;
+            }
+            let Some(req_lower) = &requested_lower else {
+                return false;
+            };
+            std::str::from_utf8(name)
+                .ok()
+                .is_some_and(|text| text.to_lowercase() == *req_lower)
+        };
+        for entry in &entries {
+            if case_matches(&entry.name) && same_entry(entry) {
+                return Some(entry.name.clone());
+            }
+        }
+        if req.ino != 0 || req.dev != 0 {
+            for entry in &entries {
+                if (entry.kind == req.kind || entry.kind == FileKind::Other) && same_entry(entry) {
+                    return Some(entry.name.clone());
+                }
+            }
+        }
+        None
     }
 }
 

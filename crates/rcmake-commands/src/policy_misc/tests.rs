@@ -1465,3 +1465,121 @@ fn parse_arguments_handles_duplicates_sorted_missing_and_many_argv() -> TestResu
     );
     Ok(())
 }
+
+#[test]
+fn parse_arguments_writes_variables_sorted_by_group_and_name() -> TestResult {
+    let (host, mut interp) = context(RunMode::Script);
+    run(
+        &host,
+        &mut interp,
+        r#"
+        cmake_minimum_required(VERSION 4.5)
+        set(watch_order "")
+        function(record_watch var access value)
+          list(APPEND watch_order "${var}:${access}")
+          set(watch_order "${watch_order}" PARENT_SCOPE)
+        endfunction()
+        foreach(name
+            p_A p_Z p_B p_Y p_C p_X
+            p_UNPARSED_ARGUMENTS p_KEYWORDS_MISSING_VALUES)
+          variable_watch(${name} record_watch)
+        endforeach()
+        cmake_parse_arguments(p "Z;A" "Y;B" "X;C" Z Y val X m1 m2)
+        "#,
+        0,
+    )?;
+    assert_var(
+        &mut interp,
+        "watch_order",
+        Some(concat!(
+            "p_A:MODIFIED_ACCESS;p_Z:MODIFIED_ACCESS;",
+            "p_B:REMOVED_ACCESS;p_Y:MODIFIED_ACCESS;",
+            "p_C:REMOVED_ACCESS;p_X:MODIFIED_ACCESS;",
+            "p_UNPARSED_ARGUMENTS:REMOVED_ACCESS;",
+            "p_KEYWORDS_MISSING_VALUES:REMOVED_ACCESS",
+        )),
+    );
+    Ok(())
+}
+
+#[test]
+fn configure_file_only_removes_temp_after_createnew_reservation_succeeds() -> TestResult {
+    struct FailingTempWriteHost {
+        base: Arc<PureHost>,
+        fail_mode: rcmake_host::WriteMode,
+        removed: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    impl Host for FailingTempWriteHost {
+        rcmake_host::forward_host!(base, env, process, services);
+
+        fn write(
+            &self,
+            p: &Path,
+            data: &[u8],
+            mode: rcmake_host::WriteMode,
+        ) -> rcmake_host::HostResult<()> {
+            if mode == self.fail_mode
+                && p.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".rcmake-configure-"))
+            {
+                return Err(rcmake_host::HostError::from_io(
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    Some(p.to_path_buf()),
+                ));
+            }
+            self.base.write(p, data, mode)
+        }
+
+        fn remove_file(&self, p: &Path) -> rcmake_host::HostResult<()> {
+            self.removed.lock().unwrap().push(p.to_path_buf());
+            self.base.remove_file(p)
+        }
+
+        rcmake_host::forward_host!(@method base, metadata(p: &Path, follow: Follow) -> rcmake_host::HostResult<rcmake_host::Metadata>);
+        rcmake_host::forward_host!(@method base, read(p: &Path, range: ReadRange) -> rcmake_host::HostResult<Vec<u8>>);
+        rcmake_host::forward_host!(@method base, read_dir(p: &Path) -> rcmake_host::HostResult<Vec<rcmake_host::DirEntry>>);
+        rcmake_host::forward_host!(@method base, create_dir_all(p: &Path) -> rcmake_host::HostResult<()>);
+        rcmake_host::forward_host!(@method base, remove_dir(p: &Path) -> rcmake_host::HostResult<()>);
+        rcmake_host::forward_host!(@method base, remove_dir_all(p: &Path) -> rcmake_host::HostResult<()>);
+        rcmake_host::forward_host!(@method base, rename(from: &Path, to: &Path) -> rcmake_host::HostResult<()>);
+        rcmake_host::forward_host!(@method base, copy_file(from: &Path, to: &Path, opts: rcmake_host::CopyOptions) -> rcmake_host::HostResult<()>);
+        rcmake_host::forward_host!(@method base, symlink(target: &Path, link: &Path) -> rcmake_host::HostResult<()>);
+        rcmake_host::forward_host!(@method base, hard_link(src: &Path, dst: &Path) -> rcmake_host::HostResult<()>);
+        rcmake_host::forward_host!(@method base, read_link(p: &Path) -> rcmake_host::HostResult<PathBuf>);
+        rcmake_host::forward_host!(@method base, canonicalize(p: &Path) -> rcmake_host::HostResult<PathBuf>);
+        rcmake_host::forward_host!(@method base, set_permissions(p: &Path, mode: u32) -> rcmake_host::HostResult<()>);
+        rcmake_host::forward_host!(@method base, set_times(p: &Path, atime: Option<rcmake_host::FileTime>, mtime: Option<rcmake_host::FileTime>) -> rcmake_host::HostResult<()>);
+    }
+
+    for (fail_mode, expected_removals) in [
+        (rcmake_host::WriteMode::CreateNew, 0_usize),
+        (rcmake_host::WriteMode::Truncate, 1_usize),
+    ] {
+        let cwd = PathBuf::from("/work");
+        let exe = PathBuf::from("/bin/cmake");
+        let base = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
+        base.seed_file(Path::new("/work/in"), b"configured body")?;
+        base.seed_file(Path::new("/work/check.cmake"), b"configure_file(in out)")?;
+        let host = Arc::new(FailingTempWriteHost {
+            base: base.clone(),
+            fail_mode,
+            removed: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut interp = Interp::new(
+            InterpConfig::new(host.clone(), RunMode::Script, "/share/cmake-4.5", exe, cwd),
+            crate::register_all,
+        );
+        let outcome = interp.run_script(Path::new("/work/check.cmake"));
+        assert_eq!(outcome.exit_code, 1);
+        assert_eq!(host.removed.lock().unwrap().len(), expected_removals);
+        let leftovers = base
+            .read_dir(Path::new("/work"))?
+            .into_iter()
+            .filter(|entry| entry.name.starts_with(b".rcmake-configure-"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+    Ok(())
+}

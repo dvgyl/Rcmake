@@ -25,7 +25,6 @@ impl Cx<'_> {
     /// Clone the session host for a child evaluator.
     #[must_use]
     pub fn host_arc(&self) -> Arc<dyn Host> {
-        self.interp.invalidate_recursion_limit();
         Arc::clone(&self.interp.config.host)
     }
 
@@ -155,7 +154,6 @@ impl Cx<'_> {
     /// Access the [`Host`].
     #[must_use]
     pub fn host(&self) -> &dyn Host {
-        self.interp.invalidate_recursion_limit();
         self.interp.config.host.as_ref()
     }
 
@@ -395,7 +393,6 @@ impl Cx<'_> {
 
     /// Mutable access to [`ProjectModel`].
     pub fn project(&mut self) -> &mut ProjectModel {
-        self.interp.invalidate_recursion_limit();
         &mut self.interp.project
     }
 

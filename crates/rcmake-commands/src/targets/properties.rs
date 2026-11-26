@@ -375,7 +375,7 @@ fn visible(scope: UsageScope, interface: bool) -> bool {
 
 #[derive(Default)]
 struct UtilityDepIndex {
-    by_target: HashMap<TargetId, (usize, HashSet<BString>)>,
+    by_target: HashMap<TargetId, (u64, usize, HashSet<BString>)>,
 }
 
 pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -398,12 +398,18 @@ pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
         return Ok(Flow::Normal);
     }
     let bt = cx.backtrace();
-    let existing_len = cx
-        .project()
-        .target(id)
-        .ok_or_else(|| model_error(ModelError::UnknownObject))?
-        .utility_deps
-        .len();
+    let (existing_len, epoch) = {
+        let model = cx.project();
+        let len = model
+            .target(id)
+            .ok_or_else(|| model_error(ModelError::UnknownObject))?
+            .utility_deps
+            .len();
+        let epoch = model
+            .target_mutation_epoch(id)
+            .ok_or_else(|| model_error(ModelError::UnknownObject))?;
+        (len, epoch)
+    };
     if existing_len.saturating_add(deps.len()) < 32 {
         let target = cx
             .project()
@@ -426,7 +432,7 @@ pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
     let needs_seed = cx
         .session_data::<UtilityDepIndex>()
         .and_then(|index| index.by_target.get(&id))
-        .is_none_or(|(len, _)| *len != existing_len);
+        .is_none_or(|(cached_epoch, len, _)| *cached_epoch != epoch || *len != existing_len);
     let seed = if needs_seed {
         let existing = &cx
             .project()
@@ -445,9 +451,9 @@ pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
     let mut to_add = Vec::new();
     if let Some(index) = cx.session_data_mut_or_init::<UtilityDepIndex>() {
         if let Some(set) = seed {
-            index.by_target.insert(id, (existing_len, set));
+            index.by_target.insert(id, (epoch, existing_len, set));
         }
-        if let Some((cached_len, set)) = index.by_target.get_mut(&id) {
+        if let Some((_, cached_len, set)) = index.by_target.get_mut(&id) {
             for dep in deps {
                 if !set.contains(&dep.value) {
                     set.insert(dep.value.clone());
@@ -458,13 +464,9 @@ pub(super) fn add_dependencies(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResu
         }
     }
     if !to_add.is_empty() {
-        let target = cx
-            .project()
-            .target_mut(id)
-            .ok_or_else(|| model_error(ModelError::UnknownObject))?;
-        for dep in to_add {
-            target.utility_deps.push(BT::new(dep, bt.clone()));
-        }
+        cx.project()
+            .push_utility_deps(id, to_add.into_iter().map(|dep| BT::new(dep, bt.clone())))
+            .map_err(model_error)?;
     }
     Ok(Flow::Normal)
 }

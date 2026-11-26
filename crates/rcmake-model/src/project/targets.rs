@@ -20,7 +20,38 @@ impl ProjectModel {
 
     /// Mutable target `id`.
     pub fn target_mut(&mut self, id: TargetId) -> Option<&mut Target> {
-        self.targets.get_mut(id.index())
+        let target = self.targets.get_mut(id.index())?;
+        target.mutation_epoch = target.mutation_epoch.wrapping_add(1);
+        Some(target)
+    }
+
+    /// Monotonic counter incremented each time [`Self::target_mut`] grants mutable access
+    /// to target `id`.
+    #[must_use]
+    pub fn target_mutation_epoch(&self, id: TargetId) -> Option<u64> {
+        self.targets
+            .get(id.index())
+            .map(|target| target.mutation_epoch)
+    }
+
+    /// Append utility dependencies to target `id` without incrementing
+    /// [`Self::target_mutation_epoch`], for callers maintaining an index over
+    /// [`Target::utility_deps`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::UnknownObject`] if `id` does not refer to a target in this model.
+    pub fn push_utility_deps(
+        &mut self,
+        id: TargetId,
+        deps: impl IntoIterator<Item = crate::BT<BString>>,
+    ) -> Result<(), ModelError> {
+        let target = self
+            .targets
+            .get_mut(id.index())
+            .ok_or(ModelError::UnknownObject)?;
+        target.utility_deps.extend(deps);
+        Ok(())
     }
 
     /// All targets in creation order.

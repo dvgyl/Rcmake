@@ -152,18 +152,14 @@ impl SharedParseCache {
     }
 
     pub(crate) fn get(&self, key: ParseKey, data: &[u8]) -> Option<(SourceText, ParsedSource)> {
-        let (text, parsed) = {
-            let table = self.table.read().ok()?;
-            let entry = table.entries.get(&key)?;
-            let tick = self.clock.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-            entry.last_use.store(tick, Ordering::Relaxed);
-            (entry.text.clone(), entry.parsed.clone())
-        };
-        if std::ptr::eq(text.bytes.as_ref(), data) || text.bytes.as_ref() == data {
-            Some((text, parsed))
-        } else {
-            None
+        let table = self.table.read().ok()?;
+        let entry = table.entries.get(&key)?;
+        if !std::ptr::eq(entry.text.bytes.as_ref(), data) && entry.text.bytes.as_ref() != data {
+            return None;
         }
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        entry.last_use.fetch_max(tick, Ordering::Relaxed);
+        Some((entry.text.clone(), entry.parsed.clone()))
     }
 
     pub(crate) fn insert(&self, key: ParseKey, text: SourceText, parsed: ParsedSource) {
@@ -434,6 +430,52 @@ mod parse_cache_tests {
         assert!(parse(&cache, b"set(V extra)\n", kind, &limits).is_some());
         assert!(get(b"set(V 0)\n").is_some());
         assert!(get(b"set(V 1)\n").is_none());
+    }
+
+    #[test]
+    fn cache_collision_does_not_refresh_lru_and_fetch_max_preserves_newer_tick() {
+        let cache = SharedParseCache::default();
+        let kind = SourceKind::File;
+        let limits = Limits::default();
+        let key_of = |text: &[u8]| SharedParseCache::key(text, LimitsKey::new(kind, &limits));
+        for value in 0..MAX_ENTRIES {
+            assert!(
+                parse(
+                    &cache,
+                    format!("set(V {value})\n").as_bytes(),
+                    kind,
+                    &limits
+                )
+                .is_some()
+            );
+        }
+        let key0 = key_of(b"set(V 0)\n");
+        assert!(cache.get(key0, b"set(V wrong)\n").is_none());
+        assert!(parse(&cache, b"set(V extra)\n", kind, &limits).is_some());
+        assert!(cache.get(key0, b"set(V 0)\n").is_none());
+
+        let key1 = key_of(b"set(V 1)\n");
+        let future_tick = cache.clock.load(Ordering::Relaxed) + 100;
+        {
+            let table = cache.table.read().expect("read table");
+            table
+                .entries
+                .get(&key1)
+                .expect("entry 1")
+                .last_use
+                .store(future_tick, Ordering::Relaxed);
+        }
+        assert!(cache.get(key1, b"set(V 1)\n").is_some());
+        let table = cache.table.read().expect("read table");
+        assert_eq!(
+            table
+                .entries
+                .get(&key1)
+                .expect("entry 1")
+                .last_use
+                .load(Ordering::Relaxed),
+            future_tick
+        );
     }
 
     #[test]

@@ -226,41 +226,6 @@ impl Interp {
             .min(self.config.limits.max_recursion_ceiling)
     }
 
-    /// Active recursion limit during synchronous execution, caching the cache/env fallback
-    /// until any command accesses `Cx::host`, `Cx::cache`, `Cx::project`, or execution exits.
-    pub(crate) fn active_recursion_limit(&self) -> u32 {
-        use crate::scope::RECURSION_LIMIT;
-        use std::sync::atomic::Ordering;
-        if self.tracks_recursion_limit {
-            self.record_variable_access(RECURSION_LIMIT);
-        }
-        if let Some(normal) = self.vars.recursion_limit() {
-            return normal
-                .unwrap_or(self.config.limits.max_recursion)
-                .min(HARD_RECURSION_CEILING)
-                .min(self.config.limits.max_recursion_ceiling);
-        }
-        let cached = self.fallback_recursion_limit.load(Ordering::Relaxed);
-        if let Some(limit) = cached.checked_sub(1).and_then(|v| u32::try_from(v).ok()) {
-            return limit;
-        }
-        let configured = if let Some(entry) = self.project.cache.get(RECURSION_LIMIT) {
-            self.parse_recursion_fallback(&entry.value)
-        } else {
-            self.config
-                .host
-                .env_get(RECURSION_LIMIT)
-                .and_then(|value| self.parse_recursion_fallback(&value))
-        }
-        .unwrap_or(self.config.limits.max_recursion);
-        let clamped = configured
-            .min(HARD_RECURSION_CEILING)
-            .min(self.config.limits.max_recursion_ceiling);
-        self.fallback_recursion_limit
-            .store(u64::from(clamped) + 1, Ordering::Relaxed);
-        clamped
-    }
-
     fn parse_recursion_fallback(&self, value: &[u8]) -> Option<u32> {
         let value = value.trim_ascii_start();
         let parse = || crate::scope::parse_recursion_limit(value);
@@ -349,7 +314,7 @@ impl Interp {
         let saved_line = core::mem::replace(&mut self.cur_line, line);
         let saved_failed = core::mem::replace(&mut self.cmd_failed, false);
 
-        let limit = self.active_recursion_limit();
+        let limit = self.recursion_limit();
         self.note_recursion_limit(limit);
         let audit = self.hermetic.clone();
         let _audit_site = audit.as_ref().map(|audit| {
@@ -849,20 +814,6 @@ impl Interp {
         if mode == BodyMode::File && !self.fatal && !code.file.is_empty() {
             self.note_replay_executed_listfile(&code.file);
         }
-        let result = self.run_code_inner(code, start, end, mode);
-        if mode == BodyMode::File && self.depth == 0 {
-            self.invalidate_recursion_limit();
-        }
-        result
-    }
-
-    fn run_code_inner(
-        &mut self,
-        code: &Code,
-        start: usize,
-        end: usize,
-        mode: BodyMode,
-    ) -> CmdResult {
         let mut i = start;
         while i < end {
             if self.fatal || self.over_budget() {

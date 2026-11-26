@@ -108,7 +108,7 @@ impl Interp {
         if start >= end {
             return Ok(Flow::Normal);
         }
-        let limit = self.active_recursion_limit();
+        let limit = self.recursion_limit();
         if self.block_depth >= limit || crate::stack_guard::exhausted() {
             self.fatal_here(
                 format!("Maximum nesting depth of {limit} exceeded by structured blocks.").into(),

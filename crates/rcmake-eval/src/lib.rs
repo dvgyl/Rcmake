@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
@@ -506,9 +506,6 @@ pub struct Interp {
     /// active calls hold. They count against `limits.max_live_variable_bytes`.
     temp_bytes: usize,
     recursion_fallback: Mutex<(BString, Option<u32>)>,
-    /// Cached cache/env fallback for `CMAKE_MAXIMUM_RECURSION_DEPTH` during active execution
-    /// (`0` = uncached, `limit + 1` = cached `limit`). Invalidated on any cache/host access.
-    fallback_recursion_limit: AtomicU64,
     recursion_exceeded: bool,
     inherited_recursion: Option<(u32, u32)>,
     check_system_vars: bool,
@@ -568,12 +565,6 @@ pub struct Interp {
     cmake_modules_prefix: BString,
     /// Pooled expanded argument vectors reused across hot command/condition dispatches.
     arg_bufs: Vec<Vec<ExpandedArg>>,
-    #[cfg(any(target_os = "macos", windows))]
-    module_dir_names: std::collections::HashMap<
-        BString,
-        std::collections::HashSet<BString, util::FxBuildHasher>,
-        util::FxBuildHasher,
-    >,
     /// `--trace-expand` is expanding the arguments of a traced command.
     trace_expanding: bool,
     /// Listfile of each file and function call scope (`LISTFILE_STACK`).
@@ -669,7 +660,6 @@ impl Interp {
             block_depth: 0,
             temp_bytes: 0,
             recursion_fallback: Mutex::default(),
-            fallback_recursion_limit: AtomicU64::new(0),
             recursion_exceeded: false,
             inherited_recursion: None,
             check_system_vars: false,
@@ -711,8 +701,6 @@ impl Interp {
             parse_cache: Some(Arc::default()),
             cmake_modules_prefix,
             arg_bufs: Vec::new(),
-            #[cfg(any(target_os = "macos", windows))]
-            module_dir_names: std::collections::HashMap::with_hasher(util::FxBuildHasher),
             trace_expanding: false,
             listfiles: Vec::new(),
             file_locks: Vec::new(),
@@ -722,13 +710,8 @@ impl Interp {
         interp
     }
 
-    pub(crate) fn invalidate_recursion_limit(&self) {
-        self.fallback_recursion_limit.store(0, Ordering::Relaxed);
-    }
-
     /// Execution context for embedding code (CLI setup, presets, tests).
     pub fn cx(&mut self) -> Cx<'_> {
-        self.invalidate_recursion_limit();
         Cx { interp: self }
     }
 

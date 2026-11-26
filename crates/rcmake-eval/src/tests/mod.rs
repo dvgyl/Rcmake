@@ -657,6 +657,42 @@ fn cached_recursion_limit_invalidates_on_env_and_cache_changes_during_execution(
 }
 
 #[test]
+fn external_host_env_change_updates_recursion_limit_for_block_body() {
+    use rcmake_host::Host;
+
+    let host = Arc::new(PureHost::new(
+        PathBuf::from("/work"),
+        PathBuf::from("/usr/local/bin/cmake"),
+    ));
+    let script = concat!("if(TRUE)\n", "  message(reached)\n", "endif()\n",);
+    host.seed_file(&PathBuf::from("/work/main.cmake"), script.as_bytes())
+        .expect("seed");
+    let config = InterpConfig::new(
+        host.clone(),
+        RunMode::Script,
+        ROOT,
+        "/usr/local/bin/cmake",
+        "/work",
+    );
+    let mut interp = Interp::new(config, register_test);
+    interp.frontend = TEST_FRONTEND;
+    let profiler_host = Arc::clone(&host);
+    interp.set_command_profiler(Some(Arc::new(move |sample| {
+        if sample.name == b"if" {
+            profiler_host.env_set(crate::scope::RECURSION_LIMIT, Some(b"0"));
+        }
+    })));
+    let outcome = interp.run_script(&PathBuf::from("main.cmake"));
+    let stderr = String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned();
+    assert_eq!(outcome.exit_code, 1, "{stderr}");
+    assert!(
+        stderr.contains("Maximum nesting depth of 0 exceeded by structured blocks."),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("reached"), "{stderr}");
+}
+
+#[test]
 fn with_registry_shares_one_registry_across_interpreters() {
     let registry = Interp::build_registry(register_test);
     for (name, expected) in [("first", "one"), ("second", "two")] {

@@ -196,7 +196,6 @@ impl Cx<'_> {
 
     /// Mutable access to the [`Cache`].
     pub fn cache(&mut self) -> &mut Cache {
-        self.interp.invalidate_recursion_limit();
         &mut self.interp.project.cache
     }
 }
