@@ -34,10 +34,6 @@ impl Interp {
         self.file_kind(abs).is_some()
     }
 
-    pub(crate) fn is_dir(&self, abs: &[u8]) -> bool {
-        self.file_kind(abs) == Some(FileKind::Dir)
-    }
-
     /// Read and parse a listfile. Reports read and parse errors. Returns `None` when the
     /// file is missing, is a directory, or does not parse.
     pub(crate) fn parse_file(&mut self, abs: &[u8]) -> Option<Code> {

@@ -132,7 +132,7 @@ pub struct CmdFlags {
 }
 
 /// Registry of built-in commands indexed by ASCII-lowercased name.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Registry {
     builtins: IndexMap<BString, Builtin, util::FxBuildHasher>,
     guards: Vec<(BString, BuiltinGuard)>,

@@ -274,7 +274,7 @@ impl Cx<'_> {
         };
         let mut existing = raw.unwrap_or_default();
         let has_value = !existing.is_empty();
-        existing.reserve(joined.saturating_sub(existing.len()));
+        existing.reserve(joined.saturating_sub(existing_len));
         for (i, item) in items.iter().enumerate() {
             if has_value || i != 0 {
                 existing.push(b';');

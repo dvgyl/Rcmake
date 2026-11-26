@@ -120,9 +120,7 @@ fn a_confirmed_input_is_restored_only_for_the_same_executable() -> TestResult {
     f.script("CMakeLists.txt", b"check()\n")?;
     let configured = || {
         let mut interp = f.interp();
-        interp
-            .registry
-            .add("check", check, CmdFlags { scriptable: true });
+        Arc::make_mut(&mut interp.registry).add("check", check, CmdFlags { scriptable: true });
         interp.add_session_data(Arc::new(ReplayReceipts::default()));
         interp
     };
@@ -323,9 +321,7 @@ fn opaque_commands_and_observed_sessions_stay_live() -> TestResult {
     f.script("CMakeLists.txt", b"set(A cold)\n")?;
     let bytes = f.run(&mut f.interp(), None).ok_or("Missing root record.")?;
     let mut replaced = f.interp();
-    replaced
-        .registry
-        .add("set", set, CmdFlags { scriptable: true });
+    Arc::make_mut(&mut replaced.registry).add("set", set, CmdFlags { scriptable: true });
     assert!(f.run(&mut replaced, Some(&bytes)).is_none());
     assert_eq!(replaced.replay_hits(), 0);
     let mut profiled = f.interp();

@@ -118,7 +118,7 @@ pub(super) fn list(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         }
         (b"SUBLIST", [begin, length, out]) => {
             let raw = cx.var(name);
-            let raw_bytes = raw.as_deref().unwrap_or_default();
+            let raw_bytes = raw.as_deref().map_or(&[][..], Vec::as_slice);
             let value = sublist(cx, raw_bytes, bytes(begin), bytes(length))?;
             cx.set_var(bytes(out), value);
         }
