@@ -1,6 +1,6 @@
 //! Script-level tests through the public command registry.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use rcmake_base::BString;
@@ -18,16 +18,14 @@ impl Script {
         let host = Arc::new(PureHost::default());
         let interp = Interp::new(
             InterpConfig {
-                services: Default::default(),
-                host: host.clone(),
-                mode: RunMode::Script,
-                cmake_root: PathBuf::from("/opt/cmake/share/cmake-4.5"),
-                cmake_command: PathBuf::from("/usr/local/bin/cmake"),
-                cwd: PathBuf::from("/work"),
-                limits: Default::default(),
-                diag: Default::default(),
                 defines,
-                script_args: Vec::new(),
+                ..InterpConfig::new(
+                    host.clone(),
+                    RunMode::Script,
+                    "/opt/cmake/share/cmake-4.5",
+                    "/usr/local/bin/cmake",
+                    "/work",
+                )
             },
             crate::register_all,
         );

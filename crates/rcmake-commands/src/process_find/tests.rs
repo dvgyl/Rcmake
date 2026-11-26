@@ -22,18 +22,13 @@ fn setup() -> (Arc<PureHost>, Interp) {
 fn setup_with(register: fn(&mut rcmake_eval::Registry)) -> (Arc<PureHost>, Interp) {
     let host = Arc::new(PureHost::default());
     let interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode: RunMode::Script,
-            cmake_root: "/share/cmake".into(),
-            cmake_command: "/bin/cmake".into(),
-            cwd: "/work".into(),
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Script,
+            "/share/cmake",
+            "/bin/cmake",
+            "/work",
+        ),
         register,
     );
     (host, interp)
@@ -802,18 +797,7 @@ fn setup_package() -> (Arc<PureHost>, Interp) {
 
 fn package_interp(host: Arc<PureHost>, mode: RunMode) -> Interp {
     Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host,
-            mode,
-            cmake_root: "/share/cmake".into(),
-            cmake_command: "/bin/cmake".into(),
-            cwd: "/work".into(),
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(host, mode, "/share/cmake", "/bin/cmake", "/work"),
         crate::register_all,
     )
 }

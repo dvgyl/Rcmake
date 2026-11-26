@@ -8,7 +8,7 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
 
 use super::super::search_paths::setting_enabled;
-use super::super::{RootMode, text};
+use super::super::{RootMode, cat};
 
 #[derive(Default)]
 pub(in crate::process_find) struct Request {
@@ -84,7 +84,7 @@ impl Request {
                         ));
                     };
                     if !super::super::registry_path::valid_view(view) {
-                        return Err(CmdError::status(text(&[
+                        return Err(CmdError::status(cat(&[
                             b"given invalid value for REGISTRY_VIEW: ",
                             view,
                         ])));
@@ -131,7 +131,7 @@ impl Request {
         }
         if request.module && !request.config_options.is_empty() {
             let options = list_lines(request.config_options.iter());
-            return Err(CmdError::status(text(&[
+            return Err(CmdError::status(cat(&[
                 b"given options exclusive to Module mode:\n  MODULE\nand options exclusive to Config mode:",
                 &options,
                 b"The options are incompatible.",
@@ -146,7 +146,7 @@ impl Request {
             (!mandatory && required.contains(name)).then_some(name)
         }));
         if !overlap.is_empty() {
-            return Err(CmdError::status(text(&[
+            return Err(CmdError::status(cat(&[
                 b"called with components that are both required and optional:",
                 &overlap,
             ])));
@@ -187,14 +187,14 @@ impl Request {
             self.required = true;
             self.required_by = Some("CMAKE_FIND_REQUIRED".into());
         }
-        let package_setting = text(&[b"CMAKE_REQUIRE_FIND_PACKAGE_", name]);
+        let package_setting = cat(&[b"CMAKE_REQUIRE_FIND_PACKAGE_", name]);
         if cx.var_is_on(&package_setting) {
             if self.required {
                 cx.issue(
                     MessageKind::Warning,
                     Effect::None,
                     None,
-                    text(&[
+                    cat(&[
                         b"for module ",
                         name,
                         b" already called with REQUIRED, thus ",
@@ -217,7 +217,7 @@ impl Request {
                 let filename = path::to_native(value);
                 if filename.file_name() != Some(filename.as_os_str()) || !value.ends_with(b".cmake")
                 {
-                    return Err(CmdError::status(text(&[
+                    return Err(CmdError::status(cat(&[
                         b"given CONFIGS option followed by invalid file name \"", value,
                         b"\".  The names given must be file names without a path and with a \".cmake\" extension.",
                     ])));
@@ -257,10 +257,10 @@ impl Request {
     pub(super) fn log_paths(&self, cx: &Cx<'_>) -> Vec<(&'static [u8], bool)> {
         let enabled = |source: &'static [u8]| {
             !self.disabled_sources.contains(source)
-                && setting_enabled(cx, &text(&[b"CMAKE_FIND_USE_", source]))
+                && setting_enabled(cx, &cat(&[b"CMAKE_FIND_USE_", source]))
         };
         let registry = |source: &'static [u8], legacy| {
-            let key = text(&[b"CMAKE_FIND_USE_", source]);
+            let key = cat(&[b"CMAKE_FIND_USE_", source]);
             enabled(source) && (cx.var_defined(&key) || !cx.var_is_on(legacy))
         };
         vec![
@@ -296,7 +296,7 @@ impl Request {
     pub(super) fn use_source(&self, cx: &Cx<'_>, source: &[u8]) -> bool {
         !self.no_defaults
             && !self.disabled_sources.contains(source)
-            && setting_enabled(cx, &text(&[b"CMAKE_FIND_USE_", source]))
+            && setting_enabled(cx, &cat(&[b"CMAKE_FIND_USE_", source]))
     }
 
     pub(super) fn include_file(&self, cx: &mut Cx<'_>, path: &Path) -> CmdResult {
@@ -337,7 +337,7 @@ fn search_source(key: &[u8]) -> Option<&'static [u8]> {
 }
 
 fn invalid_argument(value: &[u8]) -> CmdError {
-    CmdError::status(text(&[b"called with invalid argument \"", value, b"\""]))
+    CmdError::status(cat(&[b"called with invalid argument \"", value, b"\""]))
 }
 
 pub(super) fn list_lines<'a>(values: impl IntoIterator<Item = &'a BString>) -> BString {
@@ -394,16 +394,16 @@ impl VersionRequest {
 
     pub(super) fn bindings(&self, prefix: &[u8], vars: &mut Bindings) {
         version_bindings(prefix, &self.min, vars);
-        vars.add(text(&[prefix, b"_COMPLETE"]), self.full.clone());
+        vars.add(cat(&[prefix, b"_COMPLETE"]), self.full.clone());
         if let Some(max) = &self.max {
-            vars.add(text(&[prefix, b"_RANGE"]), self.full.clone());
-            vars.add(text(&[prefix, b"_RANGE_MIN"]), "INCLUDE");
+            vars.add(cat(&[prefix, b"_RANGE"]), self.full.clone());
+            vars.add(cat(&[prefix, b"_RANGE_MIN"]), "INCLUDE");
             vars.add(
-                text(&[prefix, b"_RANGE_MAX"]),
+                cat(&[prefix, b"_RANGE_MAX"]),
                 if self.exclusive { "EXCLUDE" } else { "INCLUDE" },
             );
-            version_bindings(&text(&[prefix, b"_MIN"]), &self.min, vars);
-            version_bindings(&text(&[prefix, b"_MAX"]), max, vars);
+            version_bindings(&cat(&[prefix, b"_MIN"]), &self.min, vars);
+            version_bindings(&cat(&[prefix, b"_MAX"]), max, vars);
         }
     }
 }
@@ -424,9 +424,9 @@ pub(in crate::process_find) fn version_bindings(prefix: &[u8], value: &[u8], var
             .and_then(|item| std::str::from_utf8(item).ok())
             .and_then(|item| item.parse::<u32>().ok());
         count += usize::from(parsed.is_some());
-        vars.add(text(&[prefix, label]), parsed.unwrap_or(0).to_string());
+        vars.add(cat(&[prefix, label]), parsed.unwrap_or(0).to_string());
     }
-    vars.add(text(&[prefix, b"_COUNT"]), count.to_string());
+    vars.add(cat(&[prefix, b"_COUNT"]), count.to_string());
 }
 
 #[derive(Default)]

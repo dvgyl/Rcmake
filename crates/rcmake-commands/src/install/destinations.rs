@@ -1,7 +1,7 @@
 //! Configure-time checks of `install()` destinations.
 
 use rcmake_base::{BString, path_lex::Lexical, truth};
-use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::Cx;
 use rcmake_model::TargetId;
 
@@ -66,15 +66,12 @@ pub(super) fn drop_headers_without_destination<'a>(
                 .map(|target| target.name.clone())
                 .unwrap_or_default();
             let key_text = String::from_utf8_lossy(key);
-            cx.issue(
-                MessageKind::AuthorWarning,
-                Effect::None,
-                Some(DiagCategory::Author),
+            crate::author_warning(
+                cx,
                 format!(
                     "Target {} has {key_text} files but no {key_text} DESTINATION.",
                     String::from_utf8_lossy(&name)
-                )
-                .into(),
+                ),
             );
             *value = BString::default();
         }

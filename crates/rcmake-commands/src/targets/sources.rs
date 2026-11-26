@@ -7,7 +7,9 @@ use rcmake_model::{
     UsageField, UsageScope,
 };
 
-use super::{absolute, bytes, model_error, properties, scope, source_dir, usage, usage_target};
+use super::{
+    bytes, join_source_dir, model_error, properties, scope, source_dir, usage, usage_target,
+};
 
 pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let Some((name, mut rest)) = args.split_first() else {
@@ -76,7 +78,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 let value = |convert| {
                     list::join(items().map(|item| {
                         if convert && status == PolicyStatus::New && relative_source(item) {
-                            absolute(item, &dir)
+                            join_source_dir(item, &dir)
                         } else {
                             BString::from(item)
                         }
@@ -301,7 +303,7 @@ fn parse_file_set<'a>(
                     .iter()
                     .map(bytes)
                     .filter(|value| !value.is_empty())
-                    .map(|value| BT::new(absolute(value, dir), bt.clone()));
+                    .map(|value| BT::new(join_source_dir(value, dir), bt.clone()));
                 if bytes(key) == b"BASE_DIRS" {
                     result.bases.extend(entries);
                 } else {
@@ -451,7 +453,7 @@ fn literal_paths<'a>(
     entries
         .filter(|entry| !contains_genex(&entry.value))
         .flat_map(|entry| list::split(&entry.value, list::Empty::Drop))
-        .map(move |path| absolute(&path, dir))
+        .map(move |path| join_source_dir(&path, dir))
 }
 
 fn path_key(path: &[u8]) -> BString {

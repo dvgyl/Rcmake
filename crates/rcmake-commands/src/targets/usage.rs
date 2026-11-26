@@ -4,7 +4,7 @@ use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, ModelError, Target, TargetKind, UsageField, UsageScope};
 
-use super::{absolute, bytes, model_error, scope, source_dir, usage_target};
+use super::{bytes, join_source_dir, model_error, scope, source_dir, usage_target};
 
 use UsageField as Field;
 
@@ -184,7 +184,7 @@ fn add(cx: &mut Cx<'_>, args: &[ExpandedArg], own: Field, interface: Field) -> C
         let value = list::join(items.iter().map(|arg| {
             let value = bytes(arg);
             if paths {
-                absolute(value, &dir)
+                join_source_dir(value, &dir)
             } else if own == Field::CompileDefinitions {
                 value.strip_prefix(b"-D").unwrap_or(value).into()
             } else {

@@ -52,7 +52,7 @@ impl SearchTrace {
     }
 
     pub(super) fn module(&mut self, name: &[u8], paths: &[PathBuf], found: Option<&Path>) {
-        let heading = super::text(&[
+        let heading = super::cat(&[
             b"find_package considered the following paths for ",
             name,
             b":",
@@ -68,7 +68,7 @@ impl SearchTrace {
 
     pub(super) fn module_not_found(&mut self, found_var: &[u8]) {
         if let Some(body) = &mut self.body {
-            body.extend_from_slice(&super::text(&[
+            body.extend_from_slice(&super::cat(&[
                 b"The module is considered not found due to ",
                 found_var,
                 b" being FALSE.",
@@ -79,7 +79,7 @@ impl SearchTrace {
     pub(super) fn config(&mut self, name: &[u8], found: Option<&[u8]>, direct: bool) {
         if let Some(body) = &mut self.body {
             if !direct {
-                body.extend_from_slice(&super::text(&[
+                body.extend_from_slice(&super::cat(&[
                     b"find_package considered the following locations for ",
                     name,
                     b"'s Config module:\n",

@@ -1,5 +1,5 @@
 use rcmake_base::BString;
-use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::Cx;
 
 use super::{Result, fail, keyword};
@@ -42,12 +42,7 @@ pub(super) fn normalize<'a>(cx: &mut Cx<'_>, args: &[&'a [u8]]) -> Result<Vec<&'
         match cx.policy(CMP0208) {
             PolicyStatus::New => return Err(fail(message)),
             PolicyStatus::Warn => {
-                cx.issue(
-                    MessageKind::AuthorWarning,
-                    Effect::None,
-                    Some(DiagCategory::Author),
-                    BString::from(format!("export {message}")),
-                );
+                crate::author_warning(cx, BString::from(format!("export {message}")));
                 cx.issue_policy_warning(CMP0208, b"", b"");
             }
             PolicyStatus::Old => {}

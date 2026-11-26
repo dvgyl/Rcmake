@@ -2,10 +2,9 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use rcmake_base::{BString, ByteSlice};
-use rcmake_diag::{DiagCategory, Effect, MessageKind};
-use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
+use rcmake_eval::{CmdError, CmdResult, Cx, CxEnv, Flow};
 use rcmake_expr::{
-    ExpandEnv, ExpandedArg,
+    ExpandedArg,
     configure::{ConfigureOptions, configure},
 };
 use rcmake_host::{FileKind, Follow, ReadRange, WriteMode, path};
@@ -182,12 +181,7 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
             &options.unknown,
             "\n",
         );
-        cx.issue(
-            MessageKind::AuthorWarning,
-            Effect::None,
-            Some(DiagCategory::Author),
-            body,
-        );
+        crate::author_warning(cx, body);
         if cx.fatal_occurred() {
             return Err(CmdError::Reported);
         }
@@ -238,7 +232,12 @@ pub(crate) fn configure_file(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult
     let content = if options.copy {
         input
     } else {
-        configure(&input, &mut TemplateEnv(cx), options.expand)
+        let mut env = CxEnv {
+            cx: &mut *cx,
+            line: None,
+            warn_missing: true,
+        };
+        configure(&input, &mut env, options.expand)
             .map_err(|error| CmdError::status(error.message))?
             .into()
     };
@@ -313,30 +312,6 @@ fn write_configured(cx: &Cx<'_>, dest: &Path, content: &[u8], mode: u32) -> Resu
 
 fn file_error(error: rcmake_host::HostError) -> CmdError {
     CmdError::status(format!("Problem configuring file: {error}"))
-}
-
-struct TemplateEnv<'a, 'b>(&'a mut Cx<'b>);
-
-impl ExpandEnv for TemplateEnv<'_, '_> {
-    fn var(&mut self, name: &[u8]) -> Option<BString> {
-        self.0.var(name)
-    }
-
-    fn cache_var(&mut self, name: &[u8]) -> Option<BString> {
-        self.0.cache().get(name).map(|entry| entry.value.clone())
-    }
-
-    fn env_var(&mut self, name: &[u8]) -> Option<BString> {
-        self.0.host().env_get(name)
-    }
-
-    fn missing_reference(&mut self, name: &[u8]) {
-        self.0.warn_uninitialized(name);
-    }
-
-    fn current_line(&self) -> u32 {
-        self.0.current_line()
-    }
 }
 
 pub(super) fn filename_component(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {

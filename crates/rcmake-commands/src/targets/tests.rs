@@ -2,12 +2,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_diag::{DiagOptions, PolicyId, PolicyStatus};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{Interp, InterpConfig, RunMode};
 use rcmake_host::{PureHost, Stream};
 use rcmake_model::{DirId, FileSetKind, PropScope, TargetOrigin, UsageField, UsageScope};
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+use crate::test_support::TestResult;
 
 fn configure(
     script: &str,
@@ -19,18 +19,13 @@ fn configure(
     let exe = Path::new("/bin/cmake");
     let host = Arc::new(PureHost::new(cwd.into(), exe.into()));
     let mut interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode: RunMode::Configure,
-            cmake_root: "/share/cmake-4.5".into(),
-            cmake_command: exe.into(),
-            cwd: cwd.into(),
-            limits: Default::default(),
-            diag: DiagOptions::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            "/share/cmake-4.5",
+            exe,
+            cwd,
+        ),
         |registry| {
             crate::register_all(registry);
             registry.add(

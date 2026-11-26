@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rcmake_base::{BString, ByteSlice, list};
-use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 
@@ -19,7 +19,7 @@ pub(super) fn parse(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         [b"PARSE_ARGV", index, prefix, options, one, multi] => {
             let index = unsigned(index)
                 .ok_or_else(|| quoted("PARSE_ARGV index '", index, "' is not an unsigned integer"))
-                .map_err(|message| fatal(cx, message))?;
+                .map_err(|message| crate::command_error(cx, message))?;
             (
                 *prefix,
                 [*options, *one, *multi],
@@ -28,9 +28,9 @@ pub(super) fn parse(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             )
         }
         [b"PARSE_ARGV", ..] => {
-            return Err(fatal(
+            return Err(crate::command_error(
                 cx,
-                "PARSE_ARGV must be called with exactly 6 arguments.".into(),
+                "PARSE_ARGV must be called with exactly 6 arguments.",
             ));
         }
         [b"PARSE_ARGN", prefix, options, one, multi] => (
@@ -40,9 +40,9 @@ pub(super) fn parse(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             true,
         ),
         [b"PARSE_ARGN", ..] => {
-            return Err(fatal(
+            return Err(crate::command_error(
                 cx,
-                "PARSE_ARGN must be called with exactly 5 arguments.".into(),
+                "PARSE_ARGN must be called with exactly 5 arguments.",
             ));
         }
         [prefix, options, one, multi, tail @ ..] => {
@@ -126,17 +126,15 @@ pub(super) fn parse(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     Some(BString::default())
                 } else {
                     if preserve && seen && policy == PolicyStatus::Warn {
-                        cx.issue(
-                            MessageKind::AuthorWarning,
-                            Effect::None,
-                            Some(DiagCategory::Author),
+                        crate::author_warning(
+                            cx,
                             [
                                 b"The ".as_slice(),
                                 keyword.as_slice(),
                                 b" keyword was followed by an empty string or no value at all.  Policy CMP0174 is not set, so cmake_parse_arguments() will unset the ",
                                 var.as_slice(),
                                 b" variable rather than setting it to an empty string.",
-                            ].concat().into(),
+                            ].concat(),
                         );
                     }
                     None
@@ -167,7 +165,7 @@ fn caller_args(cx: &mut Cx<'_>, index: Option<u32>) -> Result<Vec<BString>, CmdE
     let count = |cx: &mut Cx<'_>, name: &str| {
         let raw = cx.var_or_empty(name.as_bytes());
         unsigned(&raw).ok_or_else(|| {
-            fatal(
+            crate::command_error(
                 cx,
                 quoted(
                     &format!("{mode} called with {name}='"),
@@ -189,9 +187,9 @@ fn caller_args(cx: &mut Cx<'_>, index: Option<u32>) -> Result<Vec<BString>, CmdE
     let mut size = 0_usize;
     for i in start..end {
         let name = format!("ARGV{i}");
-        let value = cx
-            .var(name.as_bytes())
-            .ok_or_else(|| fatal(cx, format!("{mode} called with {name} not set").into()))?;
+        let value = cx.var(name.as_bytes()).ok_or_else(|| {
+            crate::command_error(cx, format!("{mode} called with {name} not set"))
+        })?;
         size = size.saturating_add(value.len()).saturating_add(1);
         if size > cx.limits().max_value_bytes {
             return Err(CmdError::status(
@@ -234,9 +232,4 @@ fn set_result(cx: &mut Cx<'_>, name: &[u8], value: Option<BString>) {
     } else {
         cx.unset_var(name);
     }
-}
-
-fn fatal(cx: &mut Cx<'_>, body: BString) -> CmdError {
-    cx.issue(MessageKind::Error, Effect::Fatal, None, body);
-    CmdError::Reported
 }

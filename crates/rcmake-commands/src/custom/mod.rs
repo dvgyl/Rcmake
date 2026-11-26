@@ -15,6 +15,8 @@ use rcmake_model::{
 use rcmake_resolve::usage::UsageResolver;
 use rcmake_syntax::{ArgKind, Argument};
 
+use crate::util::model_error;
+
 mod rule;
 #[cfg(test)]
 mod tests;
@@ -885,8 +887,4 @@ pub(crate) fn bind_source(directory: &mut Directory, old: &BString, new: &BStrin
         props.unset(SOURCE_BINARY_ALTERNATIVE);
         sources.shift_insert(position, new.clone(), props);
     }
-}
-
-fn model_error(error: ModelError) -> CmdError {
-    CmdError::status(error.to_string())
 }

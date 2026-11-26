@@ -1,12 +1,12 @@
 use rcmake_base::{BString, list};
-use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, LogLevel};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{Stream, path};
 use rcmake_syntax::ArgKind;
 
 use super::search_paths::{cmake_paths, is_file};
-use super::{cps_import, diagnostic, text};
+use super::{cat, cps_import};
 use config::ConfigSearch;
 use log::{Mode, Reason, SearchLog, SearchReport};
 use messages::report_missing;
@@ -72,7 +72,7 @@ fn find_package_with_options(
             cx.unset_var(b"PACKAGE_PREFIX_DIR");
         }
     }
-    if unwind && (result.is_err() || !cx.var_is_on(&text(&[name, b"_FOUND"]))) {
+    if unwind && (result.is_err() || !cx.var_is_on(&cat(&[name, b"_FOUND"]))) {
         cx.unwind_package();
     }
     result
@@ -85,7 +85,7 @@ fn find_requested_package(
     mut request: Request,
     dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
 ) -> CmdResult {
-    let find = |suffix| text(&[name, b"_FIND_", suffix]);
+    let find = |suffix| cat(&[name, b"_FIND_", suffix]);
     if cx.var_is_on(&find(b"MODULE")) {
         if request.version.is_none() && cx.var_defined(&find(b"VERSION")) {
             request.version = Some(VersionRequest::parse(
@@ -97,7 +97,7 @@ fn find_requested_package(
             request.components = cmake_paths(cx, &find(b"COMPONENTS"))
                 .into_iter()
                 .map(|component| {
-                    let required = cx.var_is_on(&text(&[name, b"_FIND_REQUIRED_", &component]));
+                    let required = cx.var_is_on(&cat(&[name, b"_FIND_REQUIRED_", &component]));
                     (component, required)
                 })
                 .collect();
@@ -111,12 +111,7 @@ fn find_requested_package(
                 ));
             }
             None => {
-                cx.issue(
-                    MessageKind::AuthorWarning,
-                    Effect::None,
-                    Some(DiagCategory::Author),
-                    "Ignoring EXACT since no version is requested.".into(),
-                );
+                crate::author_warning(cx, "Ignoring EXACT since no version is requested.");
                 request.exact = false;
             }
             Some(_) => {}
@@ -124,18 +119,18 @@ fn find_requested_package(
     }
     request.apply_requiredness(cx, name);
 
-    let found_var = text(&[name, b"_FOUND"]);
+    let found_var = cat(&[name, b"_FOUND"]);
     let mut log = SearchLog::new(cx, name, &found_var, &request);
     let outer_roots = cmake_paths(cx, PACKAGE_ROOT_SPELLINGS);
-    let disable = text(&[b"CMAKE_DISABLE_FIND_PACKAGE_", name]);
+    let disable = cat(&[b"CMAKE_DISABLE_FIND_PACKAGE_", name]);
     if cx.var_is_on(&disable) {
-        let require = text(&[b"CMAKE_REQUIRE_FIND_PACKAGE_", name]);
+        let require = cat(&[b"CMAKE_REQUIRE_FIND_PACKAGE_", name]);
         if cx.var_is_on(&require) {
             cx.issue(
                 MessageKind::Error,
                 Effect::SetError,
                 None,
-                text(&[
+                cat(&[
                     b"find_package for module ",
                     name,
                     b" was made REQUIRED with ",
@@ -150,7 +145,7 @@ fn find_requested_package(
                 MessageKind::Error,
                 Effect::SetError,
                 None,
-                text(&[
+                cat(&[
                     b"find_package for module ",
                     name,
                     b" called with REQUIRED, but\n",
@@ -178,7 +173,7 @@ fn find_requested_package(
             log.emit(cx, name, &request, &outer_roots);
             return Err(error);
         }
-        let path = text(&[b"dependency_provider::", &provider]);
+        let path = cat(&[b"dependency_provider::", &provider]);
         if cx.var_is_on(&found_var) {
             log.selected(path, Mode::Provider, BString::default());
             log.emit(cx, name, &request, &outer_roots);
@@ -215,10 +210,7 @@ fn find_requested_package(
         list::join(request.components.iter().map(|(name, _)| name)),
     );
     for (component, required) in &request.components {
-        vars.add(
-            text(&[name, b"_FIND_REQUIRED_", component]),
-            flag(*required),
-        );
+        vars.add(cat(&[name, b"_FIND_REQUIRED_", component]), flag(*required));
     }
     if let Some(version) = &request.version {
         version.bindings(&find(b"VERSION"), &mut vars);
@@ -272,7 +264,7 @@ fn finish(
     found: bool,
 ) -> CmdResult {
     record_result(cx, name, request, found);
-    let version = cx.var(&text(&[name, b"_VERSION"]));
+    let version = cx.var(&cat(&[name, b"_VERSION"]));
     let global = request.global || cx.var_is_on(b"CMAKE_FIND_PACKAGE_TARGETS_GLOBAL");
     let dir = cx.current_dir_id();
     let project = cx.project();
@@ -314,11 +306,11 @@ fn finish(
 fn record_result(cx: &mut Cx<'_>, name: &[u8], request: &Request, found: bool) {
     let properties = &mut cx.global().props;
     properties.set(
-        text(&[b"_CMAKE_", name, b"_QUIET"]),
+        cat(&[b"_CMAKE_", name, b"_QUIET"]),
         if request.quiet { "TRUE" } else { "FALSE" }.into(),
     );
     properties.set(
-        text(&[b"_CMAKE_", name, b"_TRANSITIVE_DEPENDENCY"]),
+        cat(&[b"_CMAKE_", name, b"_TRANSITIVE_DEPENDENCY"]),
         "False".into(),
     );
     let version = request
@@ -328,12 +320,12 @@ fn record_result(cx: &mut Cx<'_>, name: &[u8], request: &Request, found: bool) {
             if version.full.windows(3).any(|part| part == b"...") {
                 version.full.clone()
             } else {
-                text(&[if request.exact { b"== " } else { b">= " }, &version.full])
+                cat(&[if request.exact { b"== " } else { b">= " }, &version.full])
             }
         });
-    properties.set(text(&[b"_CMAKE_", name, b"_REQUIRED_VERSION"]), version);
+    properties.set(cat(&[b"_CMAKE_", name, b"_REQUIRED_VERSION"]), version);
     if request.required {
-        properties.set(text(&[b"_CMAKE_", name, b"_TYPE"]), "REQUIRED".into());
+        properties.set(cat(&[b"_CMAKE_", name, b"_TYPE"]), "REQUIRED".into());
     }
     for (property, include) in [
         (b"PACKAGES_FOUND".as_slice(), found),
@@ -369,7 +361,7 @@ fn search(
         request.names.iter().map(|name| name.as_slice()).collect()
     };
     for package in lookup_names {
-        let key = text(&[
+        let key = cat(&[
             b"_FetchContent_",
             &package.to_ascii_lowercase(),
             b"_override_find_package",
@@ -390,8 +382,8 @@ fn search(
             )?;
         }
         if let Some(directory) = redirects_directory(cx) {
-            let lower = text(&[&package.to_ascii_lowercase(), b"-config.cmake"]);
-            let mixed = text(&[package, b"Config.cmake"]);
+            let lower = cat(&[&package.to_ascii_lowercase(), b"-config.cmake"]);
+            let mixed = cat(&[package, b"Config.cmake"]);
             if [lower, mixed]
                 .iter()
                 .any(|file| is_file(cx, &directory.join(path::to_native(file))))
@@ -438,11 +430,11 @@ fn search(
                 let targets = request
                     .components
                     .iter()
-                    .map(|(component, _)| text(&[name, b"::", component]))
+                    .map(|(component, _)| cat(&[name, b"::", component]))
                     .filter(|target| cx.project().find_target(dir, target).is_none())
                     .collect::<Vec<_>>();
                 if !targets.is_empty() {
-                    diagnostics.push(cps_import::PackageDiagnostic::new(text(&[
+                    diagnostics.push(cps_import::PackageDiagnostic::new(cat(&[
                         b"Found package configuration file:\n  ",
                         &file,
                         b"\nbut the following required targets were not found: ",
@@ -453,8 +445,8 @@ fn search(
                 }
             }
             if !found {
-                let reason = cx.var_or_empty(&text(&[name, b"_NOT_FOUND_MESSAGE"]));
-                let message = text(&[
+                let reason = cx.var_or_empty(&cat(&[name, b"_NOT_FOUND_MESSAGE"]));
+                let message = cat(&[
                     b"Found package configuration file:\n  ",
                     &file,
                     b"\nbut it set ",
@@ -482,7 +474,7 @@ fn search(
     }
 
     let message = if request.module && !redirected {
-        text(&[b"No \"Find", name, b".cmake\" found in CMAKE_MODULE_PATH."])
+        cat(&[b"No \"Find", name, b".cmake\" found in CMAKE_MODULE_PATH."])
     } else {
         config.missing_message(try_module)
     };
@@ -490,7 +482,7 @@ fn search(
         if !request.quiet && cx.log_level() >= LogLevel::Status {
             cx.host().write_out(
                 Stream::Stdout,
-                &text(&[
+                &cat(&[
                     b"-- Could NOT find ",
                     name,
                     b" (missing: ",
@@ -518,7 +510,7 @@ fn load_module(
     request: &Request,
     report: &mut SearchReport,
 ) -> Result<Option<bool>, CmdError> {
-    let filename = text(&[b"Find", name, b".cmake"]);
+    let filename = cat(&[b"Find", name, b".cmake"]);
     let native_name = path::to_native(&filename);
     let mut considered = Vec::new();
     let mut module = None;
@@ -543,7 +535,7 @@ fn load_module(
     };
     let root = cx.var_or_empty(b"CMAKE_ROOT");
     let bundled = cx
-        .resolve_path(&text(&[&root, b"/Modules"]))
+        .resolve_path(&cat(&[&root, b"/Modules"]))
         .join(&native_name);
     let bundled = if is_file(cx, &bundled) {
         Some(bundled)
@@ -572,7 +564,7 @@ fn load_module(
         return Ok(None);
     };
     let mut vars = Bindings::default();
-    vars.add(text(&[name, b"_FIND_MODULE"]), "1");
+    vars.add(cat(&[name, b"_FIND_MODULE"]), "1");
     let result = vars.scoped(cx, |cx| request.include_file(cx, &module));
     let defined = cx.var_defined(found_var);
     if defined && !cx.var_is_on(found_var) {
@@ -580,13 +572,13 @@ fn load_module(
             || path::from_native_cmake(&module),
             Mode::Module,
             Reason::NotFound,
-            cx.var_or_empty(&text(&[name, b"_NOT_FOUND_MESSAGE"])),
+            cx.var_or_empty(&cat(&[name, b"_NOT_FOUND_MESSAGE"])),
         );
     } else {
         report.log.selected(
             path::from_native_cmake(&module),
             Mode::Module,
-            cx.var_or_empty(&text(&[name, b"_VERSION"])),
+            cx.var_or_empty(&cat(&[name, b"_VERSION"])),
         );
     }
     result?;
@@ -594,7 +586,7 @@ fn load_module(
         return Err(CmdError::Reported);
     }
     if !defined {
-        let uppercase = text(&[&name.to_ascii_uppercase(), b"_FOUND"]);
+        let uppercase = cat(&[&name.to_ascii_uppercase(), b"_FOUND"]);
         let found = cx.var_is_on(&uppercase);
         cx.set_var(found_var, flag(found).into());
     }

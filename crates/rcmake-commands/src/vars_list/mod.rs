@@ -2,9 +2,9 @@
 
 #![forbid(unsafe_code)]
 
-use rcmake_base::BString;
 use rcmake_eval::{CmdFlags, Registry};
-use rcmake_expr::ExpandedArg;
+
+use crate::util::{bytes, cat};
 
 mod callbacks;
 mod lists;
@@ -24,12 +24,4 @@ pub(crate) fn register(registry: &mut Registry) {
     registry.add("mark_as_advanced", variables::mark_as_advanced, script);
     registry.add("separate_arguments", separate::separate_arguments, script);
     registry.add("list", lists::list, script);
-}
-
-fn bytes(arg: &ExpandedArg) -> &[u8] {
-    arg.value.as_slice()
-}
-
-fn cat(parts: &[&[u8]]) -> BString {
-    BString::from(parts.concat())
 }

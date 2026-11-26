@@ -247,12 +247,8 @@ impl StringList {
         if self.count != 0 {
             self.value.push(b';');
         }
-        for &byte in line {
-            if byte == b';' {
-                self.value.push(b'\\');
-            }
-            self.value.push(byte);
-        }
+        self.value
+            .extend_from_slice(&rcmake_base::list::escape_item(line));
         self.count += 1;
         Ok(opts.count != 0 && self.count >= opts.count)
     }

@@ -12,7 +12,7 @@ use super::super::search_paths::{is_file, relative_suffix, resolved_lexical_path
 use super::log::{Mode, Reason, SearchReport};
 use super::paths::{paths_from_vars, redirects_directory};
 use super::request::include_package_file;
-use super::{Bindings, Request, flag, text, version_bindings};
+use super::{Bindings, Request, cat, flag, version_bindings};
 
 pub(super) struct ConfigSearch<'a> {
     pub(super) name: &'a [u8],
@@ -63,9 +63,9 @@ impl<'a> ConfigSearch<'a> {
                     }
                 }
                 descriptions.extend([
-                    (text(&[name, b"Config.cmake"]), Mode::Config),
+                    (cat(&[name, b"Config.cmake"]), Mode::Config),
                     (
-                        text(&[&name.to_ascii_lowercase(), b"-config.cmake"]),
+                        cat(&[&name.to_ascii_lowercase(), b"-config.cmake"]),
                         Mode::Config,
                     ),
                 ]);
@@ -105,8 +105,8 @@ impl<'a> ConfigSearch<'a> {
     pub(super) fn redirect(&mut self, cx: &Cx<'_>, dir: &Path) -> bool {
         let exists = self.names.iter().any(|name| {
             [
-                text(&[name, b"Config.cmake"]),
-                text(&[&name.to_ascii_lowercase(), b"-config.cmake"]),
+                cat(&[name, b"Config.cmake"]),
+                cat(&[&name.to_ascii_lowercase(), b"-config.cmake"]),
             ]
             .iter()
             .any(|file| is_file(cx, &dir.join(path::to_native(file))))
@@ -123,7 +123,7 @@ impl<'a> ConfigSearch<'a> {
         package_roots: &[BString],
         report: &mut SearchReport,
     ) -> Result<Option<ConfigMatch>, CmdError> {
-        let dir = cx.var_or_empty(&text(&[self.name, b"_DIR"]));
+        let dir = cx.var_or_empty(&cat(&[self.name, b"_DIR"]));
         let preferred = self
             .redirect
             .clone()
@@ -204,7 +204,7 @@ impl<'a> ConfigSearch<'a> {
                         .map(|(root, suffix)| root.join(suffix));
                     if ignored.contains(&dir) {
                         report.log.candidate(
-                            || text(&[&path::from_native_cmake(&dir), b"/"]),
+                            || cat(&[&path::from_native_cmake(&dir), b"/"]),
                             if cps { Mode::Cps } else { Mode::Config },
                             Reason::Ignored,
                             BString::default(),
@@ -351,7 +351,7 @@ impl<'a> ConfigSearch<'a> {
                 }
                 Ok(package) => {
                     reason = Reason::Ignored;
-                    Err(text(&[
+                    Err(cat(&[
                         b"The file describes the package \"",
                         &package.name,
                         b"\", which is not the requested package.",
@@ -395,9 +395,9 @@ impl<'a> ConfigSearch<'a> {
         found_var: &[u8],
         matched: Option<ConfigMatch>,
     ) -> Result<bool, CmdError> {
-        let dir = text(&[self.name, b"_DIR"]);
-        let config = text(&[self.name, b"_CONFIG"]);
-        let message = text(&[self.name, b"_NOT_FOUND_MESSAGE"]);
+        let dir = cat(&[self.name, b"_DIR"]);
+        let config = cat(&[self.name, b"_CONFIG"]);
+        let message = cat(&[self.name, b"_NOT_FOUND_MESSAGE"]);
         let value = matched
             .as_ref()
             .and_then(|found| {
@@ -405,14 +405,14 @@ impl<'a> ConfigSearch<'a> {
                     .parent()
                     .map(path::from_native_cmake)
             })
-            .unwrap_or_else(|| text(&[&dir, b"-NOTFOUND"]));
+            .unwrap_or_else(|| cat(&[&dir, b"-NOTFOUND"]));
         let current = cx.cache().get(&dir).cloned();
         cx.cache().insert(
             dir.clone(),
             CacheEntry {
                 value: value.clone(),
                 ty: CacheType::Path,
-                help: text(&[
+                help: cat(&[
                     b"The directory containing a CMake configuration file for ",
                     self.name,
                     b".",
@@ -427,12 +427,12 @@ impl<'a> ConfigSearch<'a> {
 
         if let Some(found) = matched {
             let mut vars = Bindings::default();
-            let prefix = text(&[self.name, b"_VERSION"]);
+            let prefix = cat(&[self.name, b"_VERSION"]);
             for suffix in [b"".as_slice(), b"_MAJOR", b"_MINOR", b"_PATCH", b"_TWEAK"] {
-                cx.unset_var(&text(&[&prefix, suffix]));
+                cx.unset_var(&cat(&[&prefix, suffix]));
             }
             if found.version.is_empty() {
-                cx.set_var(&text(&[&prefix, b"_COUNT"]), "0".into());
+                cx.set_var(&cat(&[&prefix, b"_COUNT"]), "0".into());
             } else {
                 if let Some(package) = &found.cps {
                     cps_import::version_bindings(&package.root, &prefix, &mut vars);
@@ -454,13 +454,13 @@ impl<'a> ConfigSearch<'a> {
                 for (component, entry) in &package.components {
                     let supported = cps_import::target_kind(&entry.ty).is_some();
                     cx.set_var(
-                        &text(&[self.name, b"_", component, b"_FOUND"]),
+                        &cat(&[self.name, b"_", component, b"_FOUND"]),
                         flag(supported).into(),
                     );
                 }
                 for (component, _) in &self.request.components {
                     if !package.components.contains_key(component) {
-                        cx.set_var(&text(&[self.name, b"_", component, b"_FOUND"]), "0".into());
+                        cx.set_var(&cat(&[self.name, b"_", component, b"_FOUND"]), "0".into());
                     }
                 }
             } else {
@@ -487,16 +487,16 @@ impl<'a> ConfigSearch<'a> {
                 .any(|(path, _, reason)| path.ends_with(b".cps") && reason.is_some())
             {
                 for (component, _) in &self.request.components {
-                    cx.set_var(&text(&[self.name, b"_", component, b"_FOUND"]), "0".into());
+                    cx.set_var(&cat(&[self.name, b"_", component, b"_FOUND"]), "0".into());
                 }
             }
         }
         cx.set_var(
-            &text(&[self.name, b"_CONSIDERED_CONFIGS"]),
+            &cat(&[self.name, b"_CONSIDERED_CONFIGS"]),
             list::join(self.considered.iter().map(|(path, _, _)| path)),
         );
         cx.set_var(
-            &text(&[self.name, b"_CONSIDERED_VERSIONS"]),
+            &cat(&[self.name, b"_CONSIDERED_VERSIONS"]),
             list::join(self.considered.iter().map(|(_, version, _)| version)),
         );
         Ok(cx.var_is_on(found_var))
@@ -518,7 +518,7 @@ fn check_version(
     let stem = config_path.strip_suffix(b".cmake").unwrap_or(&config_path);
     let version_file = [b"-version.cmake".as_slice(), b"Version.cmake"]
         .into_iter()
-        .map(|suffix| path::to_native(&text(&[stem, suffix])))
+        .map(|suffix| path::to_native(&cat(&[stem, suffix])))
         .find(|file| is_file(cx, file));
     let Some(version_file) = version_file else {
         return Ok(VersionCheck {

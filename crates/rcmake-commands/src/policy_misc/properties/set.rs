@@ -348,15 +348,10 @@ pub(super) fn update_scoped(
             }
             Ok(())
         }
-        Err(ModelError::ReadOnly) => {
-            cx.issue(
-                MessageKind::Error,
-                Effect::Fatal,
-                None,
-                quoted("", name, " property is read-only\n"),
-            );
-            Err(CmdError::Reported)
-        }
+        Err(ModelError::ReadOnly) => Err(crate::command_error(
+            cx,
+            quoted("", name, " property is read-only\n"),
+        )),
         Err(other) => Err(CmdError::status(other.to_string())),
     }
 }

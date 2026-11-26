@@ -1,12 +1,9 @@
 use rcmake_base::BString;
 use rcmake_eval::{
-    Cx, Flow,
+    Cx, CxEnv, Flow,
     args::{KeywordParser, Slot},
 };
-use rcmake_expr::{
-    ExpandEnv,
-    configure::{ConfigureOptions, configure},
-};
+use rcmake_expr::configure::{ConfigureOptions, configure};
 use rcmake_host::{ReadRange, WriteMode};
 
 use super::{Result, error, file::binary_destination};
@@ -99,8 +96,13 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     let limit = cx.limits().max_value_bytes;
     let mut configured = BString::default();
     for line in request.content.split_inclusive(|&byte| byte == b'\n') {
-        let expanded = configure(line, &mut TemplateEnv(cx), request.options)
-            .map_err(|failure| error(failure.message))?;
+        let mut env = CxEnv {
+            cx: &mut *cx,
+            line: None,
+            warn_missing: false,
+        };
+        let expanded =
+            configure(line, &mut env, request.options).map_err(|failure| error(failure.message))?;
         let expanded = expanded.strip_suffix(b"\n").unwrap_or(&expanded);
         let newline = request.newline.unwrap_or_else(|| {
             if line.ends_with(b"\n") {
@@ -136,24 +138,4 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
             .map_err(|failure| error(failure.to_string()))?;
     }
     Ok(Flow::Normal)
-}
-
-struct TemplateEnv<'a, 'b>(&'a mut Cx<'b>);
-
-impl ExpandEnv for TemplateEnv<'_, '_> {
-    fn var(&mut self, name: &[u8]) -> Option<BString> {
-        self.0.var(name)
-    }
-
-    fn cache_var(&mut self, name: &[u8]) -> Option<BString> {
-        self.0.cache().get(name).map(|entry| entry.value.clone())
-    }
-
-    fn env_var(&mut self, name: &[u8]) -> Option<BString> {
-        self.0.host().env_get(name)
-    }
-
-    fn current_line(&self) -> u32 {
-        self.0.current_line()
-    }
 }

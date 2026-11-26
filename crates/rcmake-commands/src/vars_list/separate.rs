@@ -91,27 +91,20 @@ pub(super) fn separate_arguments(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdRe
             .and_then(|token| find_program(cx, &token))
             .map_or_else(BString::default, |program| {
                 if separate {
-                    list::join(std::iter::once(program).chain(args).map(escape_semicolons))
+                    list::join(
+                        std::iter::once(program)
+                            .chain(args)
+                            .map(|arg| list::escape_item(&arg)),
+                    )
                 } else {
                     list::join([program.as_slice(), args.rest()])
                 }
             })
     } else {
-        list::join(args.map(escape_semicolons))
+        list::join(args.map(|arg| list::escape_item(&arg)))
     };
     cx.set_var(name, result);
     Ok(Flow::Normal)
-}
-
-fn escape_semicolons(arg: BString) -> BString {
-    let mut escaped = Vec::with_capacity(arg.len());
-    for &byte in arg.iter() {
-        if byte == b';' {
-            escaped.push(b'\\');
-        }
-        escaped.push(byte);
-    }
-    escaped.into()
 }
 
 pub(crate) fn find_program(cx: &Cx<'_>, token: &[u8]) -> Option<BString> {

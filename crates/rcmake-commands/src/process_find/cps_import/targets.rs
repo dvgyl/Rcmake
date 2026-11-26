@@ -8,7 +8,7 @@ use rcmake_model::{
     BT, GeneratorKind, ImportedVisibility, LinkItem, Target, TargetKind, TargetOrigin, UsageField,
 };
 
-use super::{PackageDiagnostic, text};
+use super::{PackageDiagnostic, cat};
 
 const SOURCE: &[u8] = b"_RCMAKE_CPS_SOURCE";
 
@@ -54,7 +54,7 @@ pub(in crate::process_find) fn import(
         let Some(kind) = target_kind(&component.ty) else {
             continue;
         };
-        let mut target = new_target(text(&[&package.name, b"::", component_name]), kind);
+        let mut target = new_target(cat(&[&package.name, b"::", component_name]), kind);
         if let Some(license) = component
             .license
             .as_ref()
@@ -108,7 +108,7 @@ pub(in crate::process_find) fn import(
             target.props.set("SPDX_LICENSE".into(), license.clone());
         }
         for component in &package.default_components {
-            add_link(&mut target, text(&[&package.name, b"::", component]));
+            add_link(&mut target, cat(&[&package.name, b"::", component]));
         }
         targets.push(target);
     }
@@ -162,8 +162,8 @@ fn configuration_maps(cx: &mut Cx<'_>) -> Vec<(BString, BString)> {
         .into_iter()
         .filter(|config| !config.is_empty())
         .filter_map(|config| {
-            let property = text(&[b"MAP_IMPORTED_CONFIG_", &config.to_ascii_uppercase()]);
-            let value = cx.var(&text(&[b"CMAKE_", &property]))?;
+            let property = cat(&[b"MAP_IMPORTED_CONFIG_", &config.to_ascii_uppercase()]);
+            let value = cx.var(&cat(&[b"CMAKE_", &property]))?;
             Some((property, value))
         })
         .collect()
@@ -180,15 +180,15 @@ fn apply_usage(
     let suffix = if config.is_empty() {
         BString::default()
     } else {
-        text(&[b"_", &config.to_ascii_uppercase()])
+        cat(&[b"_", &config.to_ascii_uppercase()])
     };
     for feature in &usage.compile_features {
         let standard = match feature.as_slice() {
             [b'c' | b'C', a, b] if a.is_ascii_digit() && b.is_ascii_digit() => {
-                Some(text(&[b"c_std_", &[*a, *b]]))
+                Some(cat(&[b"c_std_", &[*a, *b]]))
             }
             [b'c' | b'C', b'+', b'+', a, b] if a.is_ascii_digit() && b.is_ascii_digit() => {
-                Some(text(&[b"cxx_std_", &[*a, *b]]))
+                Some(cat(&[b"cxx_std_", &[*a, *b]]))
             }
             _ => None,
         };
@@ -245,7 +245,7 @@ fn apply_usage(
         (b"IMPORTED_SONAME", &usage.link_name),
     ] {
         if let Some(value) = value {
-            target.props.set(text(&[prop, &suffix]), value.clone());
+            target.props.set(cat(&[prop, &suffix]), value.clone());
         }
     }
     // `MapLanguage(..., DisallowGlob)` drops `*` and unknown names without a warning.
@@ -267,14 +267,14 @@ fn apply_usage(
             let link = if scope.is_empty() {
                 name
             } else {
-                text(&[b"$<", scope, b":", &name, b">"])
+                cat(&[b"$<", scope, b":", &name, b">"])
             };
             add_link(target, condition(link, b"CONFIG", config));
         }
     }
     if !usage.dyld_requires.is_empty() {
         target.props.set(
-            text(&[b"IMPORTED_LINK_DEPENDENT_LIBRARIES", &suffix]),
+            cat(&[b"IMPORTED_LINK_DEPENDENT_LIBRARIES", &suffix]),
             list::join(
                 usage
                     .dyld_requires
@@ -352,7 +352,7 @@ fn add_definitions(
                 .filter(|lang| *lang != b"*".as_slice())
                 .collect();
             let excluded = excluded.join(b",".as_slice());
-            let value = text(&[
+            let value = cat(&[
                 b"$<$<NOT:$<COMPILE_LANGUAGE:",
                 &excluded,
                 b">>:",
@@ -372,11 +372,11 @@ fn add_definitions(
 
 /// `BuildDefinition`: `NAME=value`, or `NAME` without a value.
 fn definition(key: &[u8], value: Option<&BString>) -> BString {
-    value.map_or_else(|| key.into(), |value| text(&[key, b"=", value]))
+    value.map_or_else(|| key.into(), |value| cat(&[key, b"=", value]))
 }
 
 fn unknown_language(name: &[u8], key: &[u8], target: &[u8]) -> BString {
-    text(&[
+    cat(&[
         b"ignoring unknown language \"",
         name,
         b"\" in ",
@@ -393,7 +393,7 @@ fn reference(package: &[u8], entry: &[u8]) -> BString {
         } else {
             dependency
         };
-        text(&[dependency, b"::", component])
+        cat(&[dependency, b"::", component])
     } else {
         entry.into()
     }
@@ -424,7 +424,7 @@ fn condition(entry: BString, key: &[u8], value: &[u8]) -> BString {
     if value.is_empty() {
         entry
     } else {
-        text(&[b"$<$<", key, b":", value, b">:", &entry, b">"])
+        cat(&[b"$<$<", key, b":", value, b">:", &entry, b">"])
     }
 }
 

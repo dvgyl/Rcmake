@@ -1,5 +1,5 @@
-use rcmake_base::{BString, truth};
-use rcmake_diag::{DiagCategory, Effect, MessageKind};
+use rcmake_base::{BString, list, truth};
+use rcmake_diag::{Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path::{from_native_cmake, to_native};
@@ -46,7 +46,7 @@ pub(super) fn fltk(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             &[&fluid, b"-c", b"-h", &header, b"-o", &source, &input],
             None,
         )?;
-        append(&mut sources, &source);
+        list::push(&mut sources, &source);
     }
     let var = [target.value.as_slice(), b"_FLTK_UI_SRCS"].concat();
     cx.set_var(&var, sources);
@@ -70,10 +70,8 @@ pub(super) fn fltk(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
 fn check_fltk_target(cx: &mut Cx<'_>, target: &[u8]) {
     if !has_fltk_target(cx, target) {
         let source = from_native_cmake(&cx.current_source_dir());
-        cx.issue(
-            MessageKind::AuthorWarning,
-            Effect::None,
-            Some(DiagCategory::Author),
+        crate::author_warning(
+            cx,
             [
                 b"FLTK_WRAP_UI was called with a target that was never created: ".as_slice(),
                 target,
@@ -81,8 +79,7 @@ fn check_fltk_target(cx: &mut Cx<'_>, target: &[u8]) {
                 &source,
                 b".  This FLTK_WRAP_UI call will be ignored.",
             ]
-            .concat()
-            .into(),
+            .concat(),
         );
     }
 }
@@ -135,7 +132,7 @@ pub(super) fn qt_cpp(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 )
                 .map_err(|error| CmdError::Status(error.to_string().into()))?;
         }
-        append(&mut sources, &generated);
+        list::push(&mut sources, &generated);
     }
     cx.set_var(&out.value, sources);
     Ok(Flow::Normal)
@@ -181,9 +178,9 @@ pub(super) fn qt_ui(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             &[&moc, b"-o", &moc_cpp, &header],
             None,
         )?;
-        append(&mut headers, &header);
-        append(&mut sources, &cpp);
-        append(&mut sources, &moc_cpp);
+        list::push(&mut headers, &header);
+        list::push(&mut sources, &cpp);
+        list::push(&mut sources, &moc_cpp);
     }
     cx.set_var(&sources_var.value, sources);
     cx.set_var(&headers_var.value, headers);
@@ -251,13 +248,6 @@ fn file_stem(path: &[u8], last_extension: bool) -> &[u8] {
 fn output(cx: &Cx<'_>, prefix: &[u8], base: &[u8], suffix: &[u8]) -> BString {
     let name = [prefix, base, suffix].concat();
     from_native_cmake(&cx.current_binary_dir().join(to_native(&name)))
-}
-
-fn append(list: &mut BString, value: &[u8]) {
-    if !list.is_empty() {
-        list.push(b';');
-    }
-    list.extend_from_slice(value);
 }
 
 fn add_rule(

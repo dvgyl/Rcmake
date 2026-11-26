@@ -2,14 +2,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use rcmake_base::{BString, list};
-use rcmake_diag::{DiagCategory, Effect, MessageKind};
 use rcmake_eval::args::{KeywordParser, Parsed, Slot};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{CommandSpec, Input, Output, ProcessResult, RunOutput, RunRequest, Stream};
 use rcmake_host::{HostError, path};
 
-use super::{diagnostic, environment, text};
+use super::{cat, environment};
 
 const TIMEOUT_MESSAGE: &str = "Process terminated due to timeout";
 
@@ -216,14 +215,14 @@ fn parse(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> Result<Parsed, CmdError> {
         .keyword("ENVIRONMENT_MODIFICATION", Slot::Multi)
         .parse(args);
     if let Some(arg) = parsed.unparsed().first() {
-        return Err(CmdError::Status(text(&[
+        return Err(CmdError::Status(cat(&[
             b"given unknown argument \"",
             arg,
             b"\".",
         ])));
     }
     if let Some(error) = parsed.report_error_text() {
-        return Err(diagnostic(cx, error));
+        return Err(crate::command_error(cx, error));
     }
     if !parsed.seen("COMMAND") {
         return Err(CmdError::Status("called with no COMMAND argument.".into()));
@@ -266,11 +265,9 @@ fn check_encoding(cx: &mut Cx<'_>, parsed: &Parsed) {
             b"NONE" | b"AUTO" | b"ANSI" | b"OEM" | b"UTF8" | b"UTF-8"
         )
     {
-        cx.issue(
-            MessageKind::AuthorWarning,
-            Effect::None,
-            Some(DiagCategory::Author),
-            text(&[
+        crate::author_warning(
+            cx,
+            cat(&[
                 b"ENCODING option given unknown value \"",
                 encoding,
                 b"\".  Ignoring.",
@@ -291,19 +288,19 @@ fn echo_option(cx: &mut Cx<'_>, parsed: &Parsed) -> Result<Option<Stream>, CmdEr
         b"NONE" | b"" => Ok(None),
         invalid => {
             let message = if explicit.is_some() {
-                text(&[
+                cat(&[
                     b" called with '",
                     invalid,
                     b"' expected STDERR|STDOUT|NONE for COMMAND_ECHO.",
                 ])
             } else {
-                text(&[
+                cat(&[
                     b" CMAKE_EXECUTE_PROCESS_COMMAND_ECHO set to '",
                     invalid,
                     b"' expected STDERR|STDOUT|NONE",
                 ])
             };
-            Err(diagnostic(cx, message))
+            Err(crate::command_error(cx, message))
         }
     }
 }
@@ -328,7 +325,7 @@ fn fatal_option(cx: &mut Cx<'_>, parsed: &Parsed) -> Result<Fatal, CmdError> {
         _ if explicit.is_some() => Err(CmdError::Status(
             "COMMAND_ERROR_IS_FATAL option can be ANY, LAST or NONE".into(),
         )),
-        invalid => Err(CmdError::Status(text(&[
+        invalid => Err(CmdError::Status(cat(&[
             b"Using CMAKE_EXECUTE_PROCESS_COMMAND_ERROR_IS_FATAL with invalid value \"",
             invalid,
             b"\".  This variable can be ANY, LAST or NONE",
@@ -503,7 +500,7 @@ fn fatal_error(fatal: Fatal, results: &[ProcessResult], messages: &[BString]) ->
         Fatal::Last => match results.last()? {
             ProcessResult::Exited(0) => None,
             ProcessResult::Exited(_) => Some("last command failed".into()),
-            _ => Some(text(&[b"Abnormal exit: ", messages.last()?])),
+            _ => Some(cat(&[b"Abnormal exit: ", messages.last()?])),
         },
         Fatal::Any => {
             let mut failures = Vec::new();
@@ -513,7 +510,7 @@ fn fatal_error(fatal: Fatal, results: &[ProcessResult], messages: &[BString]) ->
                     ProcessResult::Exited(_) => b"Child return code: ",
                     _ => b"Abnormal exit with child return code: ",
                 };
-                failures.push(text(&[
+                failures.push(cat(&[
                     b"  ",
                     (index + 1).to_string().as_bytes(),
                     b": \"",

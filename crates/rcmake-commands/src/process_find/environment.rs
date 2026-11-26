@@ -4,7 +4,7 @@ use rcmake_base::BString;
 use rcmake_eval::args::Parsed;
 use rcmake_host::Host;
 
-use super::text;
+use super::cat;
 
 pub(super) fn child_environment(
     host: &dyn Host,
@@ -62,8 +62,8 @@ pub(super) fn child_environment(
 
 fn extend(previous: Option<&BString>, value: &[u8], separator: &[u8], prepend: bool) -> BString {
     match previous.filter(|previous| !previous.is_empty()) {
-        Some(previous) if prepend => text(&[value, separator, previous]),
-        Some(previous) => text(&[previous, separator, value]),
+        Some(previous) if prepend => cat(&[value, separator, previous]),
+        Some(previous) => cat(&[previous, separator, value]),
         None => value.into(),
     }
 }
@@ -74,5 +74,5 @@ fn split(value: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
 }
 
 fn error(message: &[u8], argument: &[u8]) -> BString {
-    text(&[b"Error: ", message, argument])
+    cat(&[b"Error: ", message, argument])
 }

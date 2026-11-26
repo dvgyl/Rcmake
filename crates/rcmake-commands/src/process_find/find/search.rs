@@ -10,8 +10,8 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::{CommandSpec, FileKind, Follow, Input, Output, ProcessResult, RunRequest, path};
 use rcmake_syntax::ArgKind;
 
+use super::super::cat;
 use super::super::search_paths::{cmake_paths, file_metadata};
-use super::super::text;
 use super::{Kind, Options, normalize, use_default};
 
 struct IgnoredPaths {
@@ -283,7 +283,7 @@ impl<'a> Search<'a> {
         }
         let name = path::from_native(name);
         for extension in [b".xcframework".as_slice(), b".framework"] {
-            let path = normalize(&dir.join(path::to_native(&text(&[&name, extension]))));
+            let path = normalize(&dir.join(path::to_native(&cat(&[&name, extension]))));
             if self.ignored.ignores_prefix(&path)
                 || !cx
                     .host()
@@ -712,7 +712,7 @@ impl LibraryNames {
             let file = file.clone();
             let dir = dir.clone();
             self.suffixes.iter().filter_map(move |suffix| {
-                let filename = text(&[prefix, file.as_ref()?, suffix]);
+                let filename = cat(&[prefix, file.as_ref()?, suffix]);
                 Some(normalize(&dir.join(path::to_native(&filename))))
             })
         })

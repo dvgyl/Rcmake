@@ -23,10 +23,13 @@ pub use policy_misc::introspection::print_deferred_properties;
 mod process_find;
 mod string_math;
 mod targets;
+mod util;
 mod vars_list;
 
 #[cfg(test)]
 mod registry_tests;
+#[cfg(test)]
+mod test_support;
 
 /// Register all implemented built-in CMake 4.5.1 script commands into `registry`.
 pub fn register_all(registry: &mut Registry) {
@@ -59,6 +62,15 @@ fn command_error(
         message.into(),
     );
     rcmake_eval::CmdError::Reported
+}
+
+fn author_warning(cx: &mut rcmake_eval::Cx<'_>, message: impl Into<rcmake_base::BString>) {
+    cx.issue(
+        rcmake_diag::MessageKind::AuthorWarning,
+        rcmake_diag::Effect::None,
+        Some(rcmake_diag::DiagCategory::Author),
+        message.into(),
+    );
 }
 
 fn exit_with_error(

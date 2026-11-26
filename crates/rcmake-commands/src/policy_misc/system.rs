@@ -120,10 +120,7 @@ pub(super) fn query(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 .get(cx, &host, key)
                 .ok_or_else(|| CmdError::status(quoted("does not recognize <key> ", key, "")))?
         };
-        if !result.is_empty() {
-            result.push(b';');
-        }
-        result.extend_from_slice(&item);
+        rcmake_base::list::push(&mut result, &item);
     }
     cx.set_var(out, result);
     Ok(Flow::Normal)

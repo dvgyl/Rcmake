@@ -1,5 +1,4 @@
 use rcmake_base::ByteSlice;
-use rcmake_diag::{DiagCategory, Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdResult, Cx};
 use rcmake_expr::ExpandedArg;
 
@@ -67,7 +66,7 @@ fn expression(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     })?;
     if !parser.warnings.is_empty() {
         parser.warnings.push('\n');
-        warn(cx, parser.warnings);
+        crate::author_warning(cx, parser.warnings);
     }
     set(
         cx,
@@ -109,21 +108,12 @@ fn adjust(cx: &mut Cx<'_>, mode: &[u8], args: &[&[u8]]) -> CmdResult {
     };
     let (value, overflow) = n.overflowing_add(delta);
     if overflow {
-        warn(
+        crate::author_warning(
             cx,
             format!("signed integer overflow while {action}:\n  {n}"),
         );
     }
     set(cx, out, value.to_string())
-}
-
-fn warn(cx: &mut Cx<'_>, detail: String) {
-    cx.issue(
-        MessageKind::AuthorWarning,
-        Effect::None,
-        Some(DiagCategory::Author),
-        detail.into(),
-    );
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use rcmake_base::ByteSlice as _;
 use rcmake_host::path;
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+use crate::test_support::TestResult;
 const ROOT: &str = "/work/prefix/lib/cps/Foo";
 const FOO: &str = r#"
 {
@@ -30,18 +30,7 @@ const FOO: &str = r#"
 
 fn interpreter(host: Arc<dyn Host>, cwd: &Path) -> Interp {
     Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host,
-            mode: RunMode::Configure,
-            cmake_root: "/cmake".into(),
-            cmake_command: "/cmake/bin/cmake".into(),
-            cwd: cwd.into(),
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(host, RunMode::Configure, "/cmake", "/cmake/bin/cmake", cwd),
         crate::register_all,
     )
 }

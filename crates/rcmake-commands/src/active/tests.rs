@@ -6,25 +6,14 @@ use rcmake_eval::{Interp, InterpConfig, RunMode};
 use rcmake_host::{Host, PureHost, ReadRange, Stream};
 use rcmake_model::{DirId, GeneratorKind, VsVersion};
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+use crate::test_support::TestResult;
 
 fn context(mode: RunMode) -> (Arc<PureHost>, Interp) {
     let cwd = PathBuf::from("/work");
     let exe = PathBuf::from("/bin/cmake");
     let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
     let interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode,
-            cmake_root: "/share/cmake-4.5".into(),
-            cmake_command: exe,
-            cwd,
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(host.clone(), mode, "/share/cmake-4.5", exe, cwd),
         crate::register_all,
     );
     (host, interp)

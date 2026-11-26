@@ -255,11 +255,14 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
                 "\" which is greater than this version of CMake.  This is not allowed because the greater version may have new policies not known to this CMake.  You may need a newer CMake version to build this project.",
             )
         };
-        return Err(fatal(cx, body));
+        return Err(crate::command_error(cx, body));
     }
 
     if !required && minimum_version < Version::from_tuple(2, 4, 0) {
-        return Err(fatal(cx, "Compatibility with CMake < 2.4 is not supported by CMake >= 3.0.  For compatibility with older versions please use any CMake 2.8.x release or lower.".into()));
+        return Err(crate::command_error(
+            cx,
+            "Compatibility with CMake < 2.4 is not supported by CMake >= 3.0.  For compatibility with older versions please use any CMake 2.8.x release or lower.",
+        ));
     }
     let mut effective = if let Some(max) = maximum {
         let version =
@@ -313,7 +316,7 @@ fn apply_version(cx: &mut Cx<'_>, raw: &[u8], required: bool) -> CmdResult {
             b"NEW" => PolicyStatus::New,
             b"OLD" => PolicyStatus::Old,
             _ => {
-                return Err(fatal(
+                return Err(crate::command_error(
                     cx,
                     quoted(
                         &format!("{name} has value \""),
@@ -375,12 +378,7 @@ fn policy_error(cx: &mut Cx<'_>, error: PolicyError) -> CmdError {
         }
         PolicyError::UnknownPolicy(_) => error.to_string(),
     };
-    fatal(cx, message.into())
-}
-
-fn fatal(cx: &mut Cx<'_>, message: BString) -> CmdError {
-    cx.issue(MessageKind::Error, Effect::Fatal, None, message);
-    CmdError::Reported
+    crate::command_error(cx, message)
 }
 
 pub(super) fn diagnostic(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {

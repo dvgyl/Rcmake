@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use rcmake_base::{BString, ByteSlice as _};
 
-use super::text;
+use super::cat;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Strictness {
@@ -181,7 +181,7 @@ pub(super) fn requirements(mut input: &[u8]) -> impl Iterator<Item = (&[u8], BSt
             let version = take_until(&mut input, |byte| {
                 byte.is_ascii_whitespace() || byte == b','
             });
-            text(&[operator, version])
+            cat(&[operator, version])
         };
         Some((name, constraint))
     })

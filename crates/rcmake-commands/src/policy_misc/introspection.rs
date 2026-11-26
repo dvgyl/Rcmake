@@ -215,7 +215,7 @@ pub(super) fn properties(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
     if !options.unknown.is_empty() {
         return Err(CmdError::status(quoted(
             "Unknown keywords: \"",
-            &join_words(&options.unknown),
+            &options.unknown.join(&b' '),
             "\"",
         )));
     }
@@ -584,13 +584,10 @@ impl<'a> Options<'a> {
             }
             let scope = SCOPES.iter().any(|(name, _)| *name == key);
             if values.is_empty() && !scope && (single.contains(&key) || multi.contains(&key)) {
-                cx.issue(
-                    MessageKind::Error,
-                    Effect::Fatal,
-                    None,
+                return Err(crate::command_error(
+                    cx,
                     quoted("Error after keyword \"", key, "\": missing required value"),
-                );
-                return Err(CmdError::Reported);
+                ));
             }
             if let Some((_, previous)) = options.entries.iter_mut().find(|(name, _)| *name == key) {
                 if single.contains(&key) {
@@ -634,10 +631,6 @@ impl<'a> Options<'a> {
         message.extend_from_slice(suffix.as_bytes());
         Err(CmdError::status(message))
     }
-}
-
-fn join_words(words: &[&[u8]]) -> BString {
-    words.join(&b' ').into()
 }
 
 fn check_mode(options: &Options<'_>, op: &str, legacy: &str) -> Result<(), CmdError> {

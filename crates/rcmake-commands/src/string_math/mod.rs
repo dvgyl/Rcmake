@@ -285,10 +285,10 @@ fn drop_empty_elements(input: Vec<u8>) -> Vec<u8> {
             b']' => depth -= 1,
             b';' if depth == 0 && previous != Some(b'\\') => {
                 if start < index {
-                    if !result.is_empty() {
-                        result.push(b';');
-                    }
-                    result.extend_from_slice(input.get(start..index).unwrap_or_default());
+                    rcmake_base::list::push(
+                        &mut result,
+                        input.get(start..index).unwrap_or_default(),
+                    );
                 }
                 start = index + 1;
             }
@@ -297,10 +297,7 @@ fn drop_empty_elements(input: Vec<u8>) -> Vec<u8> {
         previous = Some(byte);
     }
     if start < input.len() {
-        if !result.is_empty() {
-            result.push(b';');
-        }
-        result.extend_from_slice(input.get(start..).unwrap_or_default());
+        rcmake_base::list::push(&mut result, input.get(start..).unwrap_or_default());
     }
     result
 }

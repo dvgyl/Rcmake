@@ -68,13 +68,10 @@ pub(super) fn run(cx: &mut Cx<'_>, recursive: bool, args: &[&[u8]]) -> Result {
                 options.follow = true;
             }
             b"CONFIGURE_DEPENDS" if cx.mode() == RunMode::Script => {
-                cx.issue(
-                    rcmake_diag::MessageKind::Error,
-                    rcmake_diag::Effect::Fatal,
-                    None,
-                    "CONFIGURE_DEPENDS is invalid for script and find package modes.".into(),
-                );
-                return Err(rcmake_eval::CmdError::Reported);
+                return Err(crate::command_error(
+                    cx,
+                    "CONFIGURE_DEPENDS is invalid for script and find package modes.",
+                ));
             }
             b"CONFIGURE_DEPENDS" => {
                 if args.len() == 0 {

@@ -3,8 +3,7 @@ use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{Follow, path};
-use rcmake_model::{DirId, PropScope, TargetKind};
-use rcmake_resolve::usage::UsageResolver;
+use rcmake_model::{DirId, PropScope};
 
 use super::computed::{boolean, directory_value, global_value, source_value};
 use super::file_set::{file_set_id, file_set_selection, file_set_target, file_set_value};
@@ -14,48 +13,7 @@ use super::scope::{
     test_names,
 };
 use super::{is_inherited, model_value, quoted, values};
-
-fn target_location(
-    cx: &mut Cx<'_>,
-    id: rcmake_model::TargetId,
-    property: &[u8],
-) -> Option<Option<BString>> {
-    let model = cx.project();
-    let target = model.target(id)?;
-    let config = UsageResolver::location_property_config(target.kind, property)?;
-    let name = target.name.clone();
-    if !target.is_imported() {
-        cx.issue(
-            MessageKind::Error,
-            Effect::SetError,
-            None,
-            format!("The LOCATION property may not be read from target \"{name}\".  Use the target name directly with add_custom_command, or use the generator expression $<TARGET_FILE>, as appropriate.\n").into(),
-        );
-        return Some(None);
-    }
-    if let Some(location) = UsageResolver::new(model).imported_runtime_location(target, &config) {
-        return Some(Some(location));
-    }
-    let policy = PolicyId::new(111);
-    let status = target.policies.policies.get(policy);
-    let property = if target.kind == TargetKind::SharedLibrary {
-        "IMPORTED_LOCATION or IMPORTED_IMPLIB"
-    } else {
-        "IMPORTED_LOCATION"
-    };
-    let config = if config.0.is_empty() {
-        String::new()
-    } else {
-        format!(" configuration \"{}\"", config.0)
-    };
-    let message = format!("{property} not set for imported target \"{name}\"{config}.");
-    match status {
-        PolicyStatus::New => cx.issue(MessageKind::Error, Effect::SetError, None, message.into()),
-        PolicyStatus::Warn => cx.issue_policy_warning(policy, b"", message.as_bytes()),
-        PolicyStatus::Old => {}
-    }
-    Some(Some(format!("{name}-NOTFOUND").into()))
-}
+use crate::targets::target_location;
 
 pub(in crate::policy_misc) fn get_directory(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let args = values(args);

@@ -5,8 +5,8 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::{Follow, path};
 use rcmake_model::CacheType;
 
+use super::cat;
 use super::search_paths::setting_enabled;
-use super::{diagnostic, text};
 use directories::{directories, normalize};
 use options::Options;
 use search::Search;
@@ -136,7 +136,7 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
     search.log_event(cx, var, found.as_deref(), existing.is_some());
     let mut value = found
         .as_deref()
-        .map_or_else(|| text(&[var, b"-NOTFOUND"]), path::from_native_cmake);
+        .map_or_else(|| cat(&[var, b"-NOTFOUND"]), path::from_native_cmake);
     if found.is_some() && options.no_cache && matches!(kind, Kind::Path) && !value.ends_with(b"/") {
         value.push(b'/');
     }
@@ -167,9 +167,9 @@ fn find(cx: &mut Cx<'_>, args: &[ExpandedArg], kind: Kind) -> CmdResult {
             names.extend_from_slice(if index == 0 { b" " } else { b", " });
             names.extend_from_slice(name);
         }
-        return Err(diagnostic(
+        return Err(crate::command_error(
             cx,
-            text(&[
+            cat(&[
                 b"Could not find ",
                 var,
                 b" using the following ",

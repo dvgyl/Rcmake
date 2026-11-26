@@ -7,7 +7,7 @@ use rcmake_eval::{CacheDefine, Interp, InterpConfig, LogLevel, RunMode};
 use rcmake_host::{Follow, Host, PureHost, ReadRange, Stream};
 use rcmake_model::{CacheEntry, CacheType, GeneratorKind};
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+use crate::test_support::TestResult;
 
 fn context(mode: RunMode) -> (Arc<PureHost>, Interp) {
     let cwd = PathBuf::from("/work");

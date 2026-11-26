@@ -12,7 +12,7 @@ use super::super::search_paths::{
     system_prefixes,
 };
 use super::config::ConfigSearch;
-use super::{text, trace::SearchTrace};
+use super::{cat, trace::SearchTrace};
 
 const FRAMEWORK_VARS_HEADING: &[u8] =
     b"CMAKE_FRAMEWORK_PATH and CMAKE_APPBUNDLE_PATH variables [CMAKE_FIND_USE_CMAKE_PATH].";
@@ -56,10 +56,10 @@ impl ConfigSearch<'_> {
             ]);
         }
         if request.use_source(cx, b"CMAKE_ENVIRONMENT_PATH") {
-            let dir = text(&[self.name, b"_DIR"]);
+            let dir = cat(&[self.name, b"_DIR"]);
             groups.push(vec![
                 (
-                    text(&[
+                    cat(&[
                         b"Env variable ",
                         &dir,
                         b" [CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH].",
@@ -400,8 +400,8 @@ pub(super) fn redirects_directory(cx: &Cx<'_>) -> Option<PathBuf> {
 
 pub(super) fn package_roots(cx: &mut Cx<'_>, name: &[u8]) -> Vec<BString> {
     let mut roots = Vec::new();
-    let preserved = text(&[name, b"_ROOT"]);
-    let uppercase = text(&[&name.to_ascii_uppercase(), b"_ROOT"]);
+    let preserved = cat(&[name, b"_ROOT"]);
+    let uppercase = cat(&[&name.to_ascii_uppercase(), b"_ROOT"]);
     let policy = PolicyId::new(74);
     let values = |cx: &Cx<'_>, key: &[u8]| {
         [
@@ -472,7 +472,7 @@ fn warn_ignored_root(
     values: [Option<BString>; 2],
     explanation: &[u8],
 ) {
-    let warned = text(&[
+    let warned = cat(&[
         b"_RCMAKE_FIND_PACKAGE_WARNED_",
         policy.to_string().as_bytes(),
         b"_",
@@ -487,7 +487,7 @@ fn warn_ignored_root(
         .zip(values)
     {
         if let Some(value) = value {
-            body.extend_from_slice(&text(&[
+            body.extend_from_slice(&cat(&[
                 source,
                 b" variable ",
                 key,

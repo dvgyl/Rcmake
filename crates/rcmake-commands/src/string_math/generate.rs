@@ -1,12 +1,9 @@
 use std::{fmt::Write as _, sync::Mutex};
 
 use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
-use rcmake_base::{BString, ByteSlice, hash::HashAlgo};
-use rcmake_eval::{CmdError, CmdResult, Cx};
-use rcmake_expr::{
-    ExpandEnv,
-    configure::{ConfigureOptions, configure as expand_template},
-};
+use rcmake_base::{ByteSlice, hash::HashAlgo};
+use rcmake_eval::{CmdError, CmdResult, Cx, CxEnv};
+use rcmake_expr::configure::{ConfigureOptions, configure as expand_template};
 
 use super::{append, check_size, decimal_prefix, set};
 
@@ -32,33 +29,6 @@ pub(super) fn ascii(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
         result.push(value);
     }
     set(cx, out, result)
-}
-
-struct TemplateEnv<'a, 'b> {
-    cx: &'a mut Cx<'b>,
-    line: u32,
-}
-
-impl ExpandEnv for TemplateEnv<'_, '_> {
-    fn var(&mut self, name: &[u8]) -> Option<BString> {
-        self.cx.var(name)
-    }
-
-    fn cache_var(&mut self, name: &[u8]) -> Option<BString> {
-        self.cx.cache().get(name).map(|entry| entry.value.clone())
-    }
-
-    fn env_var(&mut self, name: &[u8]) -> Option<BString> {
-        self.cx.host().env_get(name)
-    }
-
-    fn missing_reference(&mut self, name: &[u8]) {
-        self.cx.warn_uninitialized(name);
-    }
-
-    fn current_line(&self) -> u32 {
-        self.line
-    }
 }
 
 pub(super) fn configure(cx: &mut Cx<'_>, args: &[&[u8]]) -> CmdResult {
@@ -93,9 +63,10 @@ pub(crate) fn configure_text(
 ) -> Result<Vec<u8>, CmdError> {
     let mut result = Vec::new();
     // The shared file expander emits a newline and removes a final CR from each line.
-    let mut env = TemplateEnv {
-        line: cx.current_line(),
+    let mut env = CxEnv {
+        line: Some(cx.current_line()),
         cx,
+        warn_missing: true,
     };
     for line in input.split_inclusive(|&byte| byte == b'\n') {
         let body = line.strip_suffix(b"\n").unwrap_or(line);
@@ -112,7 +83,7 @@ pub(crate) fn configure_text(
             &mut result,
             line.get(trimmed.len()..).unwrap_or_default(),
         )?;
-        env.line = env.line.saturating_add(1);
+        env.line = env.line.map(|line| line.saturating_add(1));
     }
     Ok(result)
 }

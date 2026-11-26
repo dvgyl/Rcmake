@@ -4,7 +4,8 @@
 
 use rcmake_base::BString;
 use rcmake_eval::{CmdFlags, Registry};
-use rcmake_expr::ExpandedArg;
+
+use crate::util::values;
 
 mod arguments;
 pub(crate) mod experimental;
@@ -55,10 +56,6 @@ pub(crate) fn register(registry: &mut Registry) {
     registry.add("variable_watch", system::variable_watch, script);
     registry.add("define_property", properties::define, project_only);
     registry.add("project", project::project, project_only);
-}
-
-fn values(args: &[ExpandedArg]) -> Vec<&[u8]> {
-    args.iter().map(|arg| arg.value.as_slice()).collect()
 }
 
 fn quoted(before: &str, value: &[u8], after: &str) -> BString {

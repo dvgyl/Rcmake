@@ -13,8 +13,8 @@ use rcmake_host::{FileKind, Follow, ReadRange, Stream, path};
 use rcmake_json::{ReadOptions, Value};
 use rcmake_syntax::ArgKind;
 
+use super::cat;
 use super::find_package::{self, Bindings, Request};
-use super::text;
 
 pub(super) use targets::{import, target_kind};
 
@@ -275,7 +275,7 @@ pub(super) fn version_bindings(package: &CpsPackage, prefix: &[u8], vars: &mut B
             .next()
             .unwrap_or_default();
         let count = core.split(|byte| *byte == b'.').count();
-        vars.add(text(&[prefix, b"_COUNT"]), count.to_string());
+        vars.add(cat(&[prefix, b"_COUNT"]), count.to_string());
     } else {
         find_package::version_bindings(prefix, b"", vars);
         vars.add(prefix.into(), actual.clone());
@@ -339,7 +339,7 @@ fn find_dependency(
     request: &Request,
     needed: bool,
 ) -> Result<Option<Vec<PackageDiagnostic>>, CmdError> {
-    let found = text(&[name, b"_FOUND"]);
+    let found = cat(&[name, b"_FOUND"]);
     cx.unset_var(&found);
     let mut args = vec![name.into()];
     args.extend(requirement.version.iter().cloned());
@@ -363,7 +363,7 @@ fn find_dependency(
 }
 
 fn dependency_error(package: &CpsPackage, dependency: &[u8]) -> BString {
-    text(&[
+    cat(&[
         b"find_package could not find ",
         dependency,
         b", required by ",

@@ -2,7 +2,7 @@ use rcmake_base::{BString, list};
 use rcmake_eval::{Cx, RunMode};
 
 use super::super::search_paths::{cmake_paths, host_env_paths};
-use super::super::{RootMode, text};
+use super::super::{RootMode, cat};
 use super::{Request, config::ConfigSearch, trace::SearchTrace};
 
 const ROOT_COUNTS: &[u8] = b"\0RCMAKE_FIND_PACKAGE_ROOT_COUNTS";
@@ -86,7 +86,7 @@ impl SearchLog {
             None
         } else {
             cx.cache()
-                .get(&text(&[name, b"_DIR"]))
+                .get(&cat(&[name, b"_DIR"]))
                 .map(|entry| entry.value != b"NOTFOUND" && !entry.value.ends_with(b"-NOTFOUND"))
         };
         let previous = if cache == Some(true) || !request.config_options.is_empty() {
@@ -205,7 +205,7 @@ impl SearchLog {
                     (
                         component.as_slice(),
                         *required,
-                        cx.var_is_on(&text(&[name, b"_", component, b"_FOUND"])),
+                        cx.var_is_on(&cat(&[name, b"_", component, b"_FOUND"])),
                     )
                 }));
             event.configs.extend(
@@ -287,7 +287,7 @@ impl SearchLog {
                 b"CMAKE_FRAMEWORK_PATH",
                 b"PATH",
             ] {
-                event.context_list(&text(&[b"ENV{", key, b"}"]), host_env_paths(cx, key));
+                event.context_list(&cat(&[b"ENV{", key, b"}"]), host_env_paths(cx, key));
             }
             for key in [b"CMAKE_INSTALL_PREFIX".as_slice(), b"CMAKE_STAGING_PREFIX"] {
                 if let Some(value) = cx.var(key) {
@@ -331,7 +331,7 @@ pub(super) fn bind_root_count(cx: &Cx<'_>, vars: &mut super::Bindings, count: us
         let state = cx.var_or_empty(ROOT_COUNTS);
         vars.add(
             ROOT_COUNTS.into(),
-            text(&[count.to_string().as_bytes(), b";", &state]),
+            cat(&[count.to_string().as_bytes(), b";", &state]),
         );
     }
 }

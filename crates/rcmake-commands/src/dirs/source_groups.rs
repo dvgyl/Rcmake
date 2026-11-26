@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_diag::{DiagCategory, Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{Stream, path::from_native};
@@ -117,7 +116,7 @@ fn parse<'a>(cx: &mut Cx<'_>, args: &'a [ExpandedArg]) -> Result<Options<'a>, Cm
                 missing.insert(key);
             }
             for _ in arguments {
-                warn(
+                crate::author_warning(
                     cx,
                     format!(
                         "keyword \"{}\" will be ignored in this context.",
@@ -235,15 +234,6 @@ fn invalid_arguments(missing: BTreeSet<&[u8]>, targets: BTreeSet<&[u8]>) -> CmdE
     CmdError::status(body)
 }
 
-fn warn(cx: &mut Cx<'_>, message: String) {
-    cx.issue(
-        MessageKind::AuthorWarning,
-        Effect::None,
-        Some(DiagCategory::Author),
-        message.into(),
-    );
-}
-
 fn assign_file_sets(cx: &mut Cx<'_>, dir: DirId, group: &BString, targets: FileSets<'_>) {
     for (name, sets) in targets {
         let model = cx.project();
@@ -258,7 +248,7 @@ fn assign_file_sets(cx: &mut Cx<'_>, dir: DirId, group: &BString, targets: FileS
         });
         let name = BString::from(name);
         let Some(target) = target else {
-            warn(
+            crate::author_warning(
                 cx,
                 format!("TARGET \"{name}\" is not defined in this directory.  It will be ignored."),
             );
@@ -272,7 +262,7 @@ fn assign_file_sets(cx: &mut Cx<'_>, dir: DirId, group: &BString, targets: FileS
                 found.props.set(FILE_SET_GROUP.into(), group.clone());
             } else {
                 let set = BString::from(set);
-                warn(
+                crate::author_warning(
                     cx,
                     format!(
                         "FILE_SET \"{set}\" is not known for TARGET \"{name}\".  It will ignored."
@@ -372,8 +362,8 @@ fn full_path(cx: &Cx<'_>, base: &[u8], value: &[u8]) -> BString {
         None
     };
     let path = match home {
-        Some(home) => absolute(&home, value.strip_prefix(b"~/").unwrap_or_default()),
-        None => absolute(base, &value),
+        Some(home) => Lexical::absolute_from(&home, value.strip_prefix(b"~/").unwrap_or_default()),
+        None => Lexical::absolute_from(base, &value),
     };
     let lexical = Lexical::new(&path);
     if lexical.relative_part().is_empty() {
@@ -389,10 +379,6 @@ fn group_path(path: &[u8]) -> BString {
         .collect::<Vec<_>>()
         .join(&b'\\')
         .into()
-}
-
-fn absolute(base: &[u8], value: &[u8]) -> BString {
-    Lexical::new(&Lexical::new(base).append(value)).normalize()
 }
 
 fn target_paths(model: &ProjectModel, id: TargetId) -> BTreeSet<BString> {
@@ -412,7 +398,7 @@ fn target_paths(model: &ProjectModel, id: TargetId) -> BTreeSet<BString> {
         )
         .flat_map(|entry| list::split(&entry.value, list::Empty::Drop))
         .filter(|source| !source.windows(2).any(|pair| pair == b"$<"))
-        .map(|source| absolute(base, &source))
+        .map(|source| Lexical::absolute_from(base, &source))
         .collect()
 }
 

@@ -6,7 +6,7 @@ use rcmake_host::{PureHost, Stream};
 
 use super::*;
 
-type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+use crate::test_support::TestResult;
 
 fn configure(
     code: &str,
@@ -22,18 +22,13 @@ fn configure_in(
 ) -> std::result::Result<(Arc<PureHost>, Interp), Box<dyn std::error::Error>> {
     let host = Arc::new(PureHost::new(work.to_path_buf(), work.join("cmake")));
     let mut interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode: RunMode::Configure,
-            cmake_root: work.join("data"),
-            cmake_command: work.join("cmake"),
-            cwd: work.to_path_buf(),
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            work.join("data"),
+            work.join("cmake"),
+            work.to_path_buf(),
+        ),
         crate::register_all,
     );
     for name in ["core", "api"] {

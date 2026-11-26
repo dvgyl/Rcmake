@@ -11,8 +11,10 @@ use rcmake_diag::{
 };
 use rcmake_eval::{CmdError, CmdFlags, CmdResult, Cx, Flow, Registry};
 use rcmake_expr::ExpandedArg;
-use rcmake_model::{DirId, ModelError, TargetBinding, TargetId, TargetKind, UsageScope};
+use rcmake_model::{DirId, TargetBinding, TargetId, TargetKind, UsageScope};
 use rcmake_syntax::{ArgKind, Argument};
+
+use crate::util::{bytes, model_error};
 
 mod create;
 mod init;
@@ -24,6 +26,7 @@ mod usage;
 
 pub(crate) use create::schedule_generated_name_validation;
 pub(crate) use init::initialize;
+pub(crate) use properties::target_location;
 pub(crate) use sources::{find_file_set, replace_file_set_paths, require_sycl, scope_name};
 
 #[cfg(test)]
@@ -55,17 +58,9 @@ pub(crate) fn register(registry: &mut Registry) {
     crate::compat::project_command!(registry, "target_precompile_headers", precompile::add);
 }
 
-fn bytes(arg: &ExpandedArg) -> &[u8] {
-    arg.value.as_slice()
-}
-
 fn reported(cx: &mut Cx<'_>, message: impl Into<BString>) -> CmdError {
     cx.issue(MessageKind::Error, Effect::SetError, None, message.into());
     CmdError::Reported
-}
-
-fn model_error(error: ModelError) -> CmdError {
-    CmdError::status(error.to_string())
 }
 
 fn scope(value: &[u8]) -> Option<UsageScope> {
@@ -82,7 +77,7 @@ fn source_dir(cx: &mut Cx<'_>) -> BString {
     cx.project().dir(dir).source_dir.clone()
 }
 
-fn absolute(path: &[u8], dir: &[u8]) -> BString {
+fn join_source_dir(path: &[u8], dir: &[u8]) -> BString {
     if path.starts_with(b"$<") || !Lexical::new(path).root_directory().is_empty() {
         return path.into();
     }
@@ -133,12 +128,9 @@ fn add_library(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         );
         match cx.policy(PolicyId::new(164)) {
             PolicyStatus::New => return Err(crate::command_error(cx, body)),
-            PolicyStatus::Warn => cx.issue(
-                MessageKind::AuthorWarning,
-                Effect::None,
-                Some(rcmake_diag::DiagCategory::Author),
-                format!("{body} Building a STATIC library instead. This may lead to problems.")
-                    .into(),
+            PolicyStatus::Warn => crate::author_warning(
+                cx,
+                format!("{body} Building a STATIC library instead. This may lead to problems."),
             ),
             PolicyStatus::Old => {}
         }

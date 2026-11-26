@@ -5,7 +5,7 @@ use rcmake_eval::{Interp, InterpConfig, RunMode};
 use rcmake_host::{PureHost, Stream};
 use rcmake_model::{DirId, UsageField};
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+use crate::test_support::TestResult;
 
 #[test]
 fn subdirectory_commands_share_the_model_with_property_commands() -> TestResult {
@@ -61,18 +61,13 @@ fn subdirectory_commands_share_the_model_with_property_commands() -> TestResult 
         "#,
     )?;
     let mut interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode: RunMode::Configure,
-            cmake_root: "/share/cmake-4.5".into(),
-            cmake_command: command,
-            cwd: source.clone(),
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            "/share/cmake-4.5",
+            command,
+            source.clone(),
+        ),
         crate::register_all,
     );
     let outcome = interp.run_configure(&source, &binary, &[]);
@@ -136,18 +131,13 @@ fn source_group_model(
     let host = Arc::new(PureHost::new(src.clone(), command.clone()));
     host.seed_file(&src.join("CMakeLists.txt"), source)?;
     let mut interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode: RunMode::Configure,
-            cmake_root: "/share/cmake-4.5".into(),
-            cmake_command: command,
-            cwd: src.clone(),
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            "/share/cmake-4.5",
+            command,
+            src.clone(),
+        ),
         crate::register_all,
     );
     let outcome = interp.run_configure(&src, &bin, &[]);
@@ -267,18 +257,13 @@ fn configure_tree(
         host.seed_file(&source.join(name), content.as_bytes())?;
     }
     let mut interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode: RunMode::Configure,
-            cmake_root: root.join("share/cmake-4.5"),
-            cmake_command: command,
-            cwd: source.clone(),
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            root.join("share/cmake-4.5"),
+            command,
+            source.clone(),
+        ),
         crate::register_all,
     );
     if let Some(name) = list_file {
@@ -391,18 +376,13 @@ fn directory_usage_preserves_native_path_meaning_and_inherits_paths() -> TestRes
     host.seed_file(&source.join("CMakeLists.txt"), script.as_bytes())?;
     host.seed_file(&source.join("child/CMakeLists.txt"), b"")?;
     let mut interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode: RunMode::Configure,
-            cmake_root: Path::new(root).join("share/cmake"),
-            cmake_command: command,
-            cwd: source.clone(),
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Configure,
+            Path::new(root).join("share/cmake"),
+            command,
+            source.clone(),
+        ),
         crate::register_all,
     );
     assert_eq!(

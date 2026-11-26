@@ -4,10 +4,10 @@
 
 use std::path::{Component, PathBuf};
 
-use rcmake_base::BString;
-use rcmake_diag::{Effect, MessageKind};
-use rcmake_eval::{CmdError, CmdFlags, Cx, Registry};
+use rcmake_eval::{CmdFlags, Cx, Registry};
 use search_paths::{cmake_paths, resolved_lexical_path};
+
+use crate::util::cat;
 
 mod cps_import;
 mod environment;
@@ -30,15 +30,6 @@ pub(crate) fn register(registry: &mut Registry) {
     registry.add("find_library", find::find_library, flags);
     registry.add("find_package", find_package::find_package, flags);
     registry.add("cmake_pkg_config", pkg_config::run, flags);
-}
-
-fn diagnostic(cx: &mut Cx<'_>, text: BString) -> CmdError {
-    cx.issue(MessageKind::Error, Effect::Fatal, None, text);
-    CmdError::Reported
-}
-
-fn text(parts: &[&[u8]]) -> BString {
-    BString::from(parts.concat())
 }
 
 #[derive(Clone, Copy, Default)]

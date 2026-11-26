@@ -3,7 +3,7 @@ use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_model::{BT, ModelError, TargetKind, UsageField, UsageScope};
 
-use super::{absolute, bytes, model_error, scope, source_dir, usage, usage_target};
+use super::{bytes, join_source_dir, model_error, scope, source_dir, usage, usage_target};
 
 pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let [name, first, rest @ ..] = args else {
@@ -54,7 +54,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                 if header.starts_with(b"<") || header.starts_with(b"\"") {
                     header.into()
                 } else {
-                    absolute(header, &dir)
+                    join_source_dir(header, &dir)
                 }
             }));
             if scope != UsageScope::Interface {

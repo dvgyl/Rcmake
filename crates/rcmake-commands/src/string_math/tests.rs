@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rcmake_base::{ByteSlice, Limits, hash::HashAlgo};
+use rcmake_base::{ByteSlice, hash::HashAlgo};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::{Interp, InterpConfig, RunMode};
 use rcmake_host::{Host, PureHost, Stream};
@@ -16,18 +16,13 @@ fn setup(script: &str) -> (Interp, Arc<PureHost>) {
             .is_ok()
     );
     let interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode: RunMode::Script,
-            cmake_root: PathBuf::from("/share/cmake"),
-            cmake_command: PathBuf::from("/bin/cmake"),
-            cwd: PathBuf::from("/work"),
-            limits: Limits::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Script,
+            PathBuf::from("/share/cmake"),
+            PathBuf::from("/bin/cmake"),
+            PathBuf::from("/work"),
+        ),
         crate::register_all,
     );
     (interp, host)

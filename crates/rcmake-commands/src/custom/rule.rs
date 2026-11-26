@@ -130,13 +130,7 @@ impl RuleError {
         match self {
             Self::Status(message) => CmdError::status(message),
             Self::Fatal(message) => {
-                cx.issue(
-                    MessageKind::Error,
-                    Effect::Fatal,
-                    None,
-                    [b"add_custom_rule ", message.as_slice()].concat().into(),
-                );
-                CmdError::Reported
+                crate::command_error(cx, [b"add_custom_rule ", message.as_slice()].concat())
             }
         }
     }

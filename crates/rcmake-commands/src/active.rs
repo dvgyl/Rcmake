@@ -1,5 +1,6 @@
 use rcmake_eval::{BuiltinFn, CmdFlags, Registry};
-use rcmake_expr::ExpandedArg;
+
+use crate::util::values;
 
 mod cache;
 mod directories;
@@ -27,8 +28,4 @@ pub(crate) fn register(registry: &mut Registry) {
         registry.add(name, command, CmdFlags { scriptable: false });
     }
     registry.add("load_cache", cache::load, CmdFlags { scriptable: true });
-}
-
-fn values(args: &[ExpandedArg]) -> Vec<&[u8]> {
-    args.iter().map(|arg| arg.value.as_slice()).collect()
 }

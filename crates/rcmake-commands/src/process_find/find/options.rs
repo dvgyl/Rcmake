@@ -3,7 +3,7 @@ use rcmake_eval::{CmdError, Cx, UserCommandKind};
 use rcmake_expr::ExpandedArg;
 
 use super::super::search_paths::{BUILD_ENV_SEPARATOR, split_env};
-use super::super::{RootMode, text};
+use super::super::{RootMode, cat};
 
 #[derive(Default)]
 pub(super) struct Options {
@@ -61,7 +61,7 @@ impl Options {
                 b"REGISTRY_VIEW" => {
                     let view = option_value(&mut args, "REGISTRY_VIEW")?;
                     if !super::super::registry_path::valid_view(view) {
-                        return Err(CmdError::status(text(&[
+                        return Err(CmdError::status(cat(&[
                             b"given invalid value for REGISTRY_VIEW: ",
                             view,
                         ])));
@@ -71,14 +71,14 @@ impl Options {
                 b"VALIDATOR" => {
                     let name = option_value(&mut args, "VALIDATOR")?;
                     if !cx.command_exists(name) {
-                        return Err(CmdError::status(text(&[
+                        return Err(CmdError::status(cat(&[
                             b"command specified for VALIDATOR is undefined: ",
                             name,
                             b".",
                         ])));
                     }
                     if cx.user_command_kind(name) != Some(UserCommandKind::Function) {
-                        return Err(CmdError::status(text(&[
+                        return Err(CmdError::status(cat(&[
                             b"command specified for VALIDATOR is not a function: ",
                             name,
                             b".",
@@ -129,7 +129,7 @@ fn option_value<'a>(
     keyword: &str,
 ) -> Result<&'a [u8], CmdError> {
     args.next().map(|arg| arg.value.as_slice()).ok_or_else(|| {
-        CmdError::status(text(&[
+        CmdError::status(cat(&[
             b"missing required argument for ",
             keyword.as_bytes(),
         ]))

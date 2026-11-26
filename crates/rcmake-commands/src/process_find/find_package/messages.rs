@@ -1,10 +1,10 @@
 use rcmake_base::BString;
-use rcmake_diag::{DiagCategory, Effect, MessageKind};
+use rcmake_diag::{Effect, MessageKind};
 use rcmake_eval::{CmdError, Cx};
 
 use super::config::ConfigSearch;
 use super::request::list_lines;
-use super::{Request, diagnostic, text};
+use super::{Request, cat};
 
 pub(super) fn report_missing(
     cx: &mut Cx<'_>,
@@ -13,14 +13,14 @@ pub(super) fn report_missing(
 ) -> Result<(), CmdError> {
     if request.required {
         if let Some(setting) = &request.required_by {
-            message = text(&[
+            message = cat(&[
                 message.trim_ascii_end(),
                 b"\nThis package is considered required because the ",
                 setting,
                 b" variable has been enabled.\n",
             ]);
         }
-        return Err(diagnostic(cx, message));
+        return Err(crate::command_error(cx, message));
     }
     if !request.quiet && !request.optional {
         cx.issue(MessageKind::Warning, Effect::None, None, message);
@@ -30,11 +30,9 @@ pub(super) fn report_missing(
 
 pub(super) fn warn_config_fallback(cx: &mut Cx<'_>, name: &[u8]) {
     let lower = name.to_ascii_lowercase();
-    cx.issue(
-        MessageKind::AuthorWarning,
-        Effect::None,
-        Some(DiagCategory::Author),
-        text(&[
+    crate::author_warning(
+        cx,
+        cat(&[
             b"find_package called without either MODULE or CONFIG option and no Find",
             name,
             b".cmake module is in CMAKE_MODULE_PATH.  Add MODULE to exclusively request Module mode and fail if Find",
@@ -51,11 +49,9 @@ pub(super) fn warn_config_fallback(cx: &mut Cx<'_>, name: &[u8]) {
 }
 
 pub(super) fn warn_module_path(cx: &mut Cx<'_>, name: &[u8]) {
-    cx.issue(
-        MessageKind::AuthorWarning,
-        Effect::None,
-        Some(DiagCategory::Author),
-        text(&[
+    crate::author_warning(
+        cx,
+        cat(&[
             b"Find",
             name,
             b".cmake must either be part of this project itself, in this case adjust CMAKE_MODULE_PATH so that it points to the correct location inside its source tree.\nOr it must be installed by a package which has already been found via find_package().  In this case make sure that package has indeed been found and adjust CMAKE_MODULE_PATH to contain the location where that package has installed Find",
@@ -69,7 +65,7 @@ impl ConfigSearch<'_> {
     pub(super) fn missing_message(&self, tried_module: bool) -> BString {
         let name = self.name;
         let preface = if tried_module && self.considered.is_empty() {
-            text(&[
+            cat(&[
                 b"By not providing \"Find", name,
                 b".cmake\" in CMAKE_MODULE_PATH this project has asked CMake to find a package configuration file provided by \"",
                 name, b"\", but CMake did not find one.\n",
@@ -89,7 +85,7 @@ impl ConfigSearch<'_> {
                 } else {
                     b"is compatible with requested version "
                 };
-                text(&[b" that ", kind, b"\"", &v.full, b"\""])
+                cat(&[b" that ", kind, b"\"", &v.full, b"\""])
             });
         if !self.considered.is_empty() {
             let requested: &[u8] = if requested.is_empty()
@@ -106,7 +102,7 @@ impl ConfigSearch<'_> {
                 .considered
                 .iter()
                 .map(|(file, version, reason)| {
-                    let mut entry = text(&[file, b", version: ", version]);
+                    let mut entry = cat(&[file, b", version: ", version]);
                     if let Some(reason) = reason {
                         entry.extend_from_slice(b"\n    ");
                         entry.extend_from_slice(reason);
@@ -114,7 +110,7 @@ impl ConfigSearch<'_> {
                     entry
                 })
                 .collect();
-            return text(&[
+            return cat(&[
                 &preface,
                 b"Could not find a configuration file for package \"",
                 name,
@@ -131,9 +127,9 @@ impl ConfigSearch<'_> {
             .version
             .as_ref()
             .map_or_else(BString::default, |v| {
-                text(&[b" (requested version ", &v.full, b")"])
+                cat(&[b" (requested version ", &v.full, b")"])
             });
-        text(&[
+        cat(&[
             &preface,
             b"Could not find a package configuration file provided by \"",
             name,

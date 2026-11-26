@@ -11,18 +11,13 @@ fn file_rpath_edits_macho_through_the_host() -> std::result::Result<(), Box<dyn 
 {
     let host = Arc::new(PureHost::default());
     let mut interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode: RunMode::Script,
-            cmake_root: "/cmake".into(),
-            cmake_command: "/cmake/bin/cmake".into(),
-            cwd: "/work".into(),
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(
+            host.clone(),
+            RunMode::Script,
+            "/cmake",
+            "/cmake/bin/cmake",
+            "/work",
+        ),
         super::super::register,
     );
     host.seed_file(

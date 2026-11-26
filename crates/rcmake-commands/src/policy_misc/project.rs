@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use rcmake_base::{BString, version};
-use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::path;
@@ -37,7 +37,7 @@ fn configure_project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     };
     let top_level = cx.current_dir_id() == DirId::ROOT;
     if name == &b"LANGUAGES".as_slice() || is_metadata(name) {
-        author_warning(
+        crate::author_warning(
             cx,
             quoted(
                 "project() called with '",
@@ -47,7 +47,10 @@ fn configure_project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         );
     }
     if top_level && !cx.var_defined(b"CMAKE_MINIMUM_REQUIRED_VERSION") {
-        author_warning(cx, "cmake_minimum_required() should be called prior to this top-level project() call. Please see the cmake-commands(7) manual for usage documentation of both commands.".into());
+        crate::author_warning(
+            cx,
+            "cmake_minimum_required() should be called prior to this top-level project() call. Please see the cmake-commands(7) manual for usage documentation of both commands.",
+        );
     }
     crate::configure::project_include_hook(cx, b"CMAKE_PROJECT_INCLUDE_BEFORE")?;
     crate::configure::project_include_hook(
@@ -273,15 +276,6 @@ fn is_metadata(arg: &[u8]) -> bool {
 
 fn warn(cx: &mut Cx<'_>, body: BString) {
     cx.issue(MessageKind::Warning, Effect::None, None, body);
-}
-
-fn author_warning(cx: &mut Cx<'_>, body: BString) {
-    cx.issue(
-        MessageKind::AuthorWarning,
-        Effect::None,
-        Some(DiagCategory::Author),
-        body,
-    );
 }
 
 fn normalize_version(version: &[u8]) -> Vec<u8> {

@@ -3,7 +3,6 @@
 #![forbid(unsafe_code)]
 
 use rcmake_base::BString;
-use rcmake_diag::{DiagCategory, Effect, MessageKind};
 use rcmake_eval::{CmdError, CmdFlags, Cx, Flow, Registry};
 
 #[cfg(feature = "archive")]
@@ -45,12 +44,7 @@ fn error(message: impl Into<BString>) -> CmdError {
 }
 
 fn warning(cx: &mut Cx<'_>, message: impl Into<BString>) {
-    cx.issue(
-        MessageKind::AuthorWarning,
-        Effect::None,
-        Some(DiagCategory::Author),
-        message.into(),
-    );
+    crate::author_warning(cx, message);
 }
 
 fn arg<'a>(args: &mut impl Iterator<Item = &'a [u8]>, option: &[u8]) -> Result<&'a [u8]> {

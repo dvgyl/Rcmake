@@ -10,7 +10,7 @@ use rcmake_model::{DirId, PropScope, TargetKind};
 
 use super::*;
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+use crate::test_support::TestResult;
 
 struct Fixture {
     host: Arc<PureHost>,
@@ -25,18 +25,13 @@ impl Fixture {
         let exe = cwd.join("cmake");
         let host = Arc::new(PureHost::new(cwd.clone(), exe.clone()));
         let interp = Interp::new(
-            InterpConfig {
-                services: Default::default(),
-                host: host.clone(),
-                mode: RunMode::Configure,
-                cmake_root: cwd.join("share/cmake-4.5"),
-                cmake_command: exe,
-                cwd: cwd.clone(),
-                limits: Default::default(),
-                diag: Default::default(),
-                defines: Vec::new(),
-                script_args: Vec::new(),
-            },
+            InterpConfig::new(
+                host.clone(),
+                RunMode::Configure,
+                cwd.join("share/cmake-4.5"),
+                exe,
+                cwd.clone(),
+            ),
             crate::register_all,
         );
         Self {

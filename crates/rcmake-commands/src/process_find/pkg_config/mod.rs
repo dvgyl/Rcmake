@@ -17,7 +17,7 @@ use crate::vars_list::separate::Arguments;
 
 use self::options::{Mode, Request, Settings};
 use self::pc::{InvalidFile, Package, matches_version, requirements, version_part};
-use super::text;
+use super::cat;
 
 mod options;
 mod pc;
@@ -45,7 +45,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             bindings,
             targets: IndexMap::new(),
         };
-        let found_var = text(&[b"PKGCONFIG_", req.package, b"_FOUND"]);
+        let found_var = cat(&[b"PKGCONFIG_", req.package, b"_FOUND"]);
         let root = match graph.resolve(cx, req.package, req.version, req.flag(b"EXACT"), b"", 0) {
             Ok(root) => root,
             Err(message) => {
@@ -103,7 +103,7 @@ fn load(
     let path = find_file(cx, settings, name).ok_or_else(|| {
         let mut message = BString::from(format!("Could not find pkg-config: '{show}'"));
         if !required_by.is_empty() {
-            message.extend_from_slice(&text(&[b" required by: '", required_by, b"'"]));
+            message.extend_from_slice(&cat(&[b" required by: '", required_by, b"'"]));
         }
         message
     })?;
@@ -156,7 +156,7 @@ fn quote_path(path: &[u8]) -> BString {
     if !path.iter().any(u8::is_ascii_whitespace) {
         return path.into();
     }
-    text(&[b"\"", path, b"\""])
+    cat(&[b"\"", path, b"\""])
 }
 
 fn find_file(cx: &Cx<'_>, settings: &Settings, name: &[u8]) -> Option<PathBuf> {
@@ -178,7 +178,7 @@ fn find_file(cx: &Cx<'_>, settings: &Settings, name: &[u8]) -> Option<PathBuf> {
         &[b"-uninstalled.pc", b".pc"]
     };
     for suffix in suffixes {
-        let filename = path::to_native(&text(&[name, suffix]));
+        let filename = path::to_native(&cat(&[name, suffix]));
         for dir in &settings.search {
             let candidate = cx.resolve_path(dir).join(&filename);
             if is_file(&candidate) {
@@ -221,7 +221,7 @@ fn check_version_value(
     } else {
         requested
     };
-    let mut error = text(&[
+    let mut error = cat(&[
         b"Package '",
         name,
         b"' version '",
@@ -233,13 +233,13 @@ fn check_version_value(
         b"'",
     ]);
     if !required_by.is_empty() {
-        error.extend_from_slice(&text(&[b" of '", required_by, b"'"]));
+        error.extend_from_slice(&cat(&[b" of '", required_by, b"'"]));
     }
     Err(error)
 }
 
 fn extract(cx: &mut Cx<'_>, package: &Package, settings: &Settings) {
-    let mut set = |key: &[u8], value| cx.set_var(&text(&[b"CMAKE_PKG_CONFIG_", key]), value);
+    let mut set = |key: &[u8], value| cx.set_var(&cat(&[b"CMAKE_PKG_CONFIG_", key]), value);
     for (key, field) in [
         (b"NAME".as_slice(), b"Name".as_slice()),
         (b"DESCRIPTION", b"Description"),
@@ -270,7 +270,7 @@ fn extract(cx: &mut Cx<'_>, package: &Package, settings: &Settings) {
             (b"LIBNAMES", list::join(libs.libraries)),
             (b"LINK_OPTIONS", list::join(libs.options)),
         ] {
-            set(&text(&[key, suffix]), value);
+            set(&cat(&[key, suffix]), value);
         }
     }
 }
@@ -309,14 +309,14 @@ impl Flags {
         };
         let words = fields
             .iter()
-            .flat_map(|field| Arguments::new(package.field(&text(&[field, suffix])), false));
+            .flat_map(|field| Arguments::new(package.field(&cat(&[field, suffix])), false));
         for mut flag in words {
             if let Some(dir) = flag.strip_prefix(prefix) {
-                let rooted = text(&[&settings.sysroot, dir]);
+                let rooted = cat(&[&settings.sysroot, dir]);
                 if filtered.contains(&rooted) {
                     continue;
                 }
-                flag = text(&[prefix, &rooted]);
+                flag = cat(&[prefix, &rooted]);
                 flags.directories.push(flag.clone());
             } else if matches!(kind, FlagKind::Link) && flag.starts_with(b"-l") {
                 flags.libraries.push(flag.clone());
@@ -350,9 +350,9 @@ impl Graph<'_, '_> {
             return Err("pkg-config dependency recursion limit exceeded.".into());
         }
         let target_name = if self.prefix.is_empty() {
-            text(&[b"@foreign_pkgcfg::", package])
+            cat(&[b"@foreign_pkgcfg::", package])
         } else {
-            text(&[b"@foreign_pkgcfg::", self.prefix, b"_", package])
+            cat(&[b"@foreign_pkgcfg::", self.prefix, b"_", package])
         };
         let dir = cx.current_dir_id();
         let project = cx.project();
@@ -397,7 +397,7 @@ impl Graph<'_, '_> {
     }
 
     fn add_import(&mut self, cx: &mut Cx<'_>, name: &[u8], root: &[u8]) -> Result<(), CmdError> {
-        let name = text(&[b"PkgConfig::", name]);
+        let name = cat(&[b"PkgConfig::", name]);
         let dir = cx.current_dir_id();
         let project = cx.project();
         if project.find_target(dir, &name).is_some() {

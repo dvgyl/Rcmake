@@ -7,7 +7,7 @@ use rcmake_host::{FileKind, Follow, Host, PureHost, ReadRange, Stream};
 
 const DRIVE: &str = if cfg!(windows) { "C:" } else { "" };
 
-type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+use crate::test_support::TestResult;
 
 fn interpreter() -> (Arc<PureHost>, Interp) {
     interpreter_with_mode(RunMode::Script)
@@ -25,18 +25,7 @@ fn interpreter_with_mode(mode: RunMode) -> (Arc<PureHost>, Interp) {
 fn interpreter_in(mode: RunMode, cwd: &str) -> (Arc<PureHost>, Interp) {
     let host = Arc::new(PureHost::new(cwd.into(), "/cmake/bin/cmake".into()));
     let interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: host.clone(),
-            mode,
-            cmake_root: "/cmake".into(),
-            cmake_command: "/cmake/bin/cmake".into(),
-            cwd: cwd.into(),
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(host.clone(), mode, "/cmake", "/cmake/bin/cmake", cwd),
         register,
     );
     (host, interp)
@@ -1285,7 +1274,7 @@ fn read_macho_reads_system_and_compiler_binaries_on_macos() -> TestResult {
         );
         Ok(result.stdout)
     };
-    type TestResultBytes = std::result::Result<Vec<u8>, Box<dyn std::error::Error>>;
+    type TestResultBytes = TestResult<Vec<u8>>;
     let temp = run(
         "mktemp".into(),
         vec!["-d".into(), "/tmp/rcmake-macho.XXXXXXXX".into()],
@@ -1328,18 +1317,13 @@ file(READ_MACHO "{}" ARCHITECTURES arm)
     );
     native.write(&input, code.as_bytes(), rcmake_host::WriteMode::Truncate)?;
     let mut interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: native,
-            mode: RunMode::Script,
-            cmake_root: folder.clone(),
-            cmake_command: folder.join("cmake"),
-            cwd: folder,
-            limits: Default::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+        InterpConfig::new(
+            native,
+            RunMode::Script,
+            folder.clone(),
+            folder.join("cmake"),
+            folder,
+        ),
         register,
     );
     assert_eq!(interp.run_script(&input).exit_code, 0);
@@ -1745,18 +1729,13 @@ fn scoped_locks_are_released_before_the_next_lock_command() -> TestResult {
     ] {
         let host = Arc::new(PureHost::default());
         let mut interp = Interp::new(
-            InterpConfig {
-                services: Default::default(),
-                host: host.clone(),
-                mode: RunMode::Script,
-                cmake_root: "/cmake".into(),
-                cmake_command: "/cmake/bin/cmake".into(),
-                cwd: "/work".into(),
-                limits: Default::default(),
-                diag: Default::default(),
-                defines: Vec::new(),
-                script_args: Vec::new(),
-            },
+            InterpConfig::new(
+                host.clone(),
+                RunMode::Script,
+                "/cmake",
+                "/cmake/bin/cmake",
+                "/work",
+            ),
             crate::register_all,
         );
         let main = Path::new("/work/main.cmake");

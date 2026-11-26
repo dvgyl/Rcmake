@@ -1,5 +1,5 @@
 use rcmake_base::{BString, list, truth};
-use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_eval::args::{KeywordParser, Slot};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
@@ -25,10 +25,8 @@ pub(super) fn set(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             .get(4..name.len().saturating_sub(1))
             .unwrap_or_default();
         if let [_, extra, ..] = rest {
-            cx.issue(
-                MessageKind::AuthorWarning,
-                Effect::None,
-                Some(DiagCategory::Author),
+            crate::author_warning(
+                cx,
                 cat(&[
                     b"Only the first value argument is used when setting an environment variable.  Argument '",
                     bytes(extra),
@@ -91,10 +89,8 @@ fn set_normal_or_cache(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Re
         }
     };
     let ty = cache_type(ty).unwrap_or_else(|| {
-        cx.issue(
-            MessageKind::AuthorWarning,
-            Effect::None,
-            Some(DiagCategory::Author),
+        crate::author_warning(
+            cx,
             cat(&[b"implicitly converting '", ty, b"' to 'STRING' type."]),
         );
         CacheType::String
@@ -137,13 +133,7 @@ fn set_cache_keywords(cx: &mut Cx<'_>, name: &[u8], args: &[ExpandedArg]) -> Res
         ]));
     }
     if !errors.is_empty() {
-        cx.issue(
-            MessageKind::Error,
-            Effect::Fatal,
-            None,
-            BString::from(errors),
-        );
-        return Err(CmdError::Reported);
+        return Err(crate::command_error(cx, errors));
     }
     if !parsed.unparsed().is_empty() {
         let unsupported = parsed.unparsed().join(b";".as_slice());

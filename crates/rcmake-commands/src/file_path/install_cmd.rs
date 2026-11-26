@@ -173,10 +173,7 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
                 if !directory {
                     let relative = path.strip_prefix(&destination).unwrap_or(path);
                     let entry = from_native_cmake(&unstaged.join(relative));
-                    if !manifest.is_empty() {
-                        manifest.push(b';');
-                    }
-                    manifest.extend_from_slice(&entry);
+                    rcmake_base::list::push(&mut manifest, &entry);
                 }
             },
         )

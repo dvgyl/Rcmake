@@ -4,7 +4,7 @@ use rcmake_base::{BString, list, truth};
 use rcmake_eval::{CmdError, Cx};
 use rcmake_expr::ExpandedArg;
 
-use super::{pc::Strictness, text};
+use super::{cat, pc::Strictness};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
@@ -262,7 +262,7 @@ impl Config<'_, '_, '_> {
         if let Some(values) = self.req.values(key) {
             return values.iter().copied().map(BString::from).collect();
         }
-        let var = text(&[b"CMAKE_PKG_CONFIG_", var]);
+        let var = cat(&[b"CMAKE_PKG_CONFIG_", var]);
         if let Some(value) = self.cx.var(&var) {
             return list::split(&value, list::Empty::Drop);
         }
@@ -295,14 +295,14 @@ impl Config<'_, '_, '_> {
             return Some(value.into());
         }
         for var in vars {
-            if let Some(value) = self.cx.var(&text(&[b"CMAKE_PKG_CONFIG_", var])) {
+            if let Some(value) = self.cx.var(&cat(&[b"CMAKE_PKG_CONFIG_", var])) {
                 return Some(value);
             }
         }
         let value = self.env(env)?;
         if let Some(var) = vars.first() {
             self.cx
-                .set_var(&text(&[b"CMAKE_PKG_CONFIG_", var]), value.clone());
+                .set_var(&cat(&[b"CMAKE_PKG_CONFIG_", var]), value.clone());
         }
         Some(value)
     }
@@ -311,7 +311,7 @@ impl Config<'_, '_, '_> {
         if let Some(value) = self.req.value(key) {
             return truth::is_on(value);
         }
-        let var = text(&[b"CMAKE_PKG_CONFIG_", var]);
+        let var = cat(&[b"CMAKE_PKG_CONFIG_", var]);
         if let Some(value) = self.cx.var(&var) {
             return truth::is_on(&value);
         }

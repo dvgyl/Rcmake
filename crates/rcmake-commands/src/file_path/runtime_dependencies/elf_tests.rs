@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 use rcmake_eval::{Interp, InterpConfig, RunMode};
 use rcmake_host::{Host, ProcessResult, PureHost, RunOutput, Stream};
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+use crate::test_support::TestResult;
 
 fn native(path: &str) -> PathBuf {
     PathBuf::from(if cfg!(windows) {

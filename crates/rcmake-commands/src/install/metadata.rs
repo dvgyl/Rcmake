@@ -381,7 +381,7 @@ pub(super) fn install(
         Ok(InstallKind::PackageInfo(Box::new(spec)))
     } else {
         let spec = sbom(cx, &args)?;
-        let path = sbom_destination(&lib, &spec.name);
+        let path = BString::from([lib.as_slice(), b"/sbom/", spec.name.as_slice()].concat());
         *options = args.install_options(cx, path)?;
         let path = options.destination.as_ref();
         if cx.project().installs.iter().any(|rule| {
@@ -395,10 +395,6 @@ pub(super) fn install(
         }
         Ok(InstallKind::Sbom(Box::new(spec)))
     }
-}
-
-fn sbom_destination(lib: &[u8], name: &[u8]) -> BString {
-    [lib, b"/sbom/", name].concat().into()
 }
 
 fn duplicate_sbom(name: &[u8]) -> rcmake_eval::CmdError {

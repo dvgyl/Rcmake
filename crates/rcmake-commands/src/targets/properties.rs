@@ -191,7 +191,7 @@ pub(super) fn get(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     Ok(Flow::Normal)
 }
 
-fn target_location(
+pub(crate) fn target_location(
     cx: &mut Cx<'_>,
     id: rcmake_model::TargetId,
     property: &[u8],
