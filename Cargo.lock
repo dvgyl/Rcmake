@@ -611,7 +611,6 @@ dependencies = [
  "rcmake-resolve",
  "rcmake-store",
  "rcmake-syntax",
- "serde",
 ]
 
 [[package]]
@@ -932,8 +931,7 @@ version = "0.1.0"
 dependencies = [
  "rcmake-base",
  "rcmake-host",
- "serde",
- "serde_json",
+ "rcmake-json",
  "sha2",
  "zstd",
 ]

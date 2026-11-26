@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::io::{self, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -6,12 +5,13 @@ use std::time::Duration;
 use rcmake_base::Limits;
 use rcmake_diag::PolicyStatus;
 use rcmake_host::{FileKind, Follow, Host, HostError, HostResult, Metadata, ReadRange};
-use rcmake_json::{FieldError, FromJson, Object, ToJson, Value, opt, req};
+use rcmake_json::{FieldError, FromJson, Object, Value, opt, req};
 use sha2::{Digest as _, Sha256};
 
 use super::codec::{
-    self, decode_variant, field, fields, unknown_variant, variant, variant_data, variant_fields,
+    self, decode_variant, field, fields, unknown_variant, variant_data, variant_fields,
 };
+use super::frame::{EncodeError, EncodeJson, JsonSink};
 
 /// SHA-256 digest used by the configure journal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -446,13 +446,9 @@ pub fn policy_digest(status: PolicyStatus) -> JournalDigest {
     })
 }
 
-impl ToJson for JournalDigest {
-    fn to_json(&self) -> Value {
-        let mut hex = String::with_capacity(64);
-        for byte in self.0 {
-            let _ = write!(hex, "{byte:02x}");
-        }
-        Value::string(hex)
+impl EncodeJson for JournalDigest {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.hex_digest(&self.0)
     }
 }
 
@@ -486,17 +482,17 @@ const FILE_STAT_FIELDS: &[&str] = &[
     "ino",
 ];
 
-impl ToJson for JournalFileStat {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("kind", self.kind.to_json()),
-            ("len", self.len.to_json()),
-            ("mtime_secs", self.mtime_secs.to_json()),
-            ("mtime_nanos", self.mtime_nanos.to_json()),
-            ("mode", self.mode.to_json()),
-            ("dev", self.dev.to_json()),
-            ("ino", self.ino.to_json()),
-        ])
+impl EncodeJson for JournalFileStat {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("dev", |s| self.dev.encode(s))?;
+            obj.field("ino", |s| self.ino.encode(s))?;
+            obj.field("kind", |s| self.kind.encode(s))?;
+            obj.field("len", |s| self.len.encode(s))?;
+            obj.field("mode", |s| self.mode.encode(s))?;
+            obj.field("mtime_nanos", |s| self.mtime_nanos.encode(s))?;
+            obj.field("mtime_secs", |s| self.mtime_secs.encode(s))
+        })
     }
 }
 
@@ -515,62 +511,70 @@ impl FromJson for JournalFileStat {
     }
 }
 
-impl ToJson for JournalStamp {
-    fn to_json(&self) -> Value {
-        let (name, members) = match self {
-            Self::FileStat { path, stat, digest } => (
-                "FileStat",
-                vec![
-                    ("path", codec::path(path)),
-                    ("stat", stat.to_json()),
-                    ("digest", digest.to_json()),
-                ],
-            ),
-            Self::FileHash { path, digest } => (
-                "FileHash",
-                vec![("path", codec::path(path)), ("digest", digest.to_json())],
-            ),
-            Self::DirEntries { path, digest } => (
-                "DirEntries",
-                vec![("path", codec::path(path)), ("digest", digest.to_json())],
-            ),
-            Self::Missing { path } => ("Missing", vec![("path", codec::path(path))]),
-            Self::Link { path, target } => (
-                "Link",
-                vec![("path", codec::path(path)), ("target", codec::path(target))],
-            ),
-            Self::Canonical { path, target } => (
-                "Canonical",
-                vec![("path", codec::path(path)), ("target", codec::path(target))],
-            ),
-            Self::Metadata { path, follow, stat } => (
-                "Metadata",
-                vec![
-                    ("path", codec::path(path)),
-                    ("follow", follow.to_json()),
-                    ("stat", stat.to_json()),
-                ],
-            ),
-            Self::EnvVar { name, digest } => (
-                "EnvVar",
-                vec![("name", codec::bytes(name)), ("digest", digest.to_json())],
-            ),
+impl EncodeJson for JournalStamp {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        match self {
+            Self::FileStat { path, stat, digest } => sink.variant("FileStat", |s| {
+                s.object(|obj| {
+                    obj.field("digest", |s| digest.encode(s))?;
+                    obj.field("path", |s| s.path(path))?;
+                    obj.field("stat", |s| stat.encode(s))
+                })
+            }),
+            Self::FileHash { path, digest } => sink.variant("FileHash", |s| {
+                s.object(|obj| {
+                    obj.field("digest", |s| digest.encode(s))?;
+                    obj.field("path", |s| s.path(path))
+                })
+            }),
+            Self::DirEntries { path, digest } => sink.variant("DirEntries", |s| {
+                s.object(|obj| {
+                    obj.field("digest", |s| digest.encode(s))?;
+                    obj.field("path", |s| s.path(path))
+                })
+            }),
+            Self::Missing { path } => sink.variant("Missing", |s| {
+                s.object(|obj| obj.field("path", |s| s.path(path)))
+            }),
+            Self::Link { path, target } => sink.variant("Link", |s| {
+                s.object(|obj| {
+                    obj.field("path", |s| s.path(path))?;
+                    obj.field("target", |s| s.path(target))
+                })
+            }),
+            Self::Canonical { path, target } => sink.variant("Canonical", |s| {
+                s.object(|obj| {
+                    obj.field("path", |s| s.path(path))?;
+                    obj.field("target", |s| s.path(target))
+                })
+            }),
+            Self::Metadata { path, follow, stat } => sink.variant("Metadata", |s| {
+                s.object(|obj| {
+                    obj.field("follow", |s| follow.encode(s))?;
+                    obj.field("path", |s| s.path(path))?;
+                    obj.field("stat", |s| stat.encode(s))
+                })
+            }),
+            Self::EnvVar { name, digest } => sink.variant("EnvVar", |s| {
+                s.object(|obj| {
+                    obj.field("digest", |s| digest.encode(s))?;
+                    obj.field("name", |s| s.bytes(name))
+                })
+            }),
             Self::NegativeLookup {
                 root,
                 relative,
                 deepest,
                 listing,
-            } => (
-                "NegativeLookup",
-                vec![
-                    ("root", codec::path(root)),
-                    ("relative", codec::path(relative)),
-                    ("deepest", codec::path(deepest)),
-                    ("listing", listing.to_json()),
-                ],
-            ),
-        };
-        variant(name, Value::object_from(members))
+            } => sink.variant("NegativeLookup", |s| {
+                s.object(|obj| {
+                    obj.field("deepest", |s| s.path(deepest))?;
+                    obj.field("listing", |s| listing.encode(s))?;
+                    obj.field("relative", |s| s.path(relative))?;
+                    obj.field("root", |s| s.path(root))
+                })
+            }),
+        }
     }
 }
 
@@ -649,9 +653,9 @@ impl FromJson for JournalStamp {
     }
 }
 
-impl ToJson for VariableScope {
-    fn to_json(&self) -> Value {
-        Value::string(match self {
+impl EncodeJson for VariableScope {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.str(match self {
             Self::Current => "Current",
             Self::Parent => "Parent",
         })
@@ -668,12 +672,12 @@ impl FromJson for VariableScope {
     }
 }
 
-impl ToJson for TargetKey {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("binary_dir", codec::path(&self.binary_dir)),
-            ("name", codec::bytes(&self.name)),
-        ])
+impl EncodeJson for TargetKey {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("binary_dir", |s| s.path(&self.binary_dir))?;
+            obj.field("name", |s| s.bytes(&self.name))
+        })
     }
 }
 
@@ -687,12 +691,12 @@ impl FromJson for TargetKey {
     }
 }
 
-impl ToJson for PropertyOwner {
-    fn to_json(&self) -> Value {
+impl EncodeJson for PropertyOwner {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         match self {
-            Self::Global => Value::string("Global"),
-            Self::Directory(path) => variant("Directory", codec::path(path)),
-            Self::Target(target) => variant("Target", target.to_json()),
+            Self::Global => sink.str("Global"),
+            Self::Directory(path) => sink.variant("Directory", |s| s.path(path)),
+            Self::Target(target) => sink.variant("Target", |s| target.encode(s)),
         }
     }
 }
@@ -708,12 +712,12 @@ impl FromJson for PropertyOwner {
     }
 }
 
-impl ToJson for PropertyKey {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("owner", self.owner.to_json()),
-            ("name", codec::bytes(&self.name)),
-        ])
+impl EncodeJson for PropertyKey {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("name", |s| s.bytes(&self.name))?;
+            obj.field("owner", |s| self.owner.encode(s))
+        })
     }
 }
 
@@ -727,20 +731,22 @@ impl FromJson for PropertyKey {
     }
 }
 
-impl ToJson for StateKey {
-    fn to_json(&self) -> Value {
+impl EncodeJson for StateKey {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         match self {
-            Self::Variable { scope, name } => variant(
-                "Variable",
-                Value::object_from([("scope", scope.to_json()), ("name", codec::bytes(name))]),
-            ),
-            Self::EffectiveVariable(name) => variant("EffectiveVariable", codec::bytes(name)),
-            Self::Cache(name) => variant("Cache", codec::bytes(name)),
-            Self::Property(key) => variant("Property", key.to_json()),
-            Self::Policy(id) => variant("Policy", id.to_json()),
-            Self::Target(target) => variant("Target", target.to_json()),
-            Self::Command(name) => variant("Command", codec::bytes(name)),
-            Self::Probe(key) => variant("Probe", key.to_json()),
+            Self::Variable { scope, name } => sink.variant("Variable", |s| {
+                s.object(|obj| {
+                    obj.field("name", |s| s.bytes(name))?;
+                    obj.field("scope", |s| scope.encode(s))
+                })
+            }),
+            Self::EffectiveVariable(name) => sink.variant("EffectiveVariable", |s| s.bytes(name)),
+            Self::Cache(name) => sink.variant("Cache", |s| s.bytes(name)),
+            Self::Property(key) => sink.variant("Property", |s| key.encode(s)),
+            Self::Policy(id) => sink.variant("Policy", |s| id.encode(s)),
+            Self::Target(target) => sink.variant("Target", |s| target.encode(s)),
+            Self::Command(name) => sink.variant("Command", |s| s.bytes(name)),
+            Self::Probe(key) => sink.variant("Probe", |s| key.encode(s)),
         }
     }
 }
@@ -770,14 +776,16 @@ impl FromJson for StateKey {
     }
 }
 
-impl ToJson for JournalInput {
-    fn to_json(&self) -> Value {
+impl EncodeJson for JournalInput {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         match self {
-            Self::Host(stamp) => variant("Host", stamp.to_json()),
-            Self::State { key, value } => variant(
-                "State",
-                Value::object_from([("key", key.to_json()), ("value", value.to_json())]),
-            ),
+            Self::Host(stamp) => sink.variant("Host", |s| stamp.encode(s)),
+            Self::State { key, value } => sink.variant("State", |s| {
+                s.object(|obj| {
+                    obj.field("key", |s| key.encode(s))?;
+                    obj.field("value", |s| value.encode(s))
+                })
+            }),
         }
     }
 }

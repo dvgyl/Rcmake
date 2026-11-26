@@ -9,7 +9,7 @@ use rcmake_model::{AppendMode, DirId, ModelError, ProjectModel, PropOrigin, Prop
 use crate::Cx;
 
 use super::codec::fields;
-use super::frame::{MAX_FRAME_BYTES, encoded_size, write_json};
+use super::frame::{EncodeError, EncodeJson, JsonSink, MAX_FRAME_BYTES, encoded_size, write_with};
 use super::region::{
     EntryContext, JournalEffect, MAX_EFFECTS, MAX_INPUTS, OpaqueOperation, PropertyEdit, RegionKey,
     RegionKind, RegionPayload, RegionRecord,
@@ -66,15 +66,25 @@ impl<M> ConfigureSnapshot<M> {
     }
 }
 
-impl<M: ToJson> ConfigureSnapshot<M> {
-    /// Encode this snapshot in a length-checked native-path frame.
-    pub fn encode(&self) -> Result<Vec<u8>, ReplayCodecError> {
+impl<M> ConfigureSnapshot<M> {
+    fn encode_with(
+        &self,
+        encode_model: impl FnOnce(&mut JsonSink<'_>) -> Result<(), EncodeError>,
+    ) -> Result<Vec<u8>, ReplayCodecError> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(FRAME_MAGIC);
         bytes.push(PATH_ENCODING);
         let length_field = bytes.len()..FRAME_HEADER;
         bytes.extend_from_slice(&0_u32.to_le_bytes());
-        write_json(self, &mut bytes, MAX_FRAME_BYTES).ok_or(ReplayCodecError::Payload)?;
+        write_with(&mut bytes, MAX_FRAME_BYTES, |sink| {
+            sink.object(|obj| {
+                obj.field("model", encode_model)?;
+                obj.field("region", |s| self.region.encode(s))?;
+                obj.field("replay_schema", |s| self.schema.encode(s))?;
+                obj.field("schema", |s| s.str(FRAME_SCHEMA))
+            })
+        })
+        .ok_or(ReplayCodecError::Payload)?;
         let len = (bytes.len() - FRAME_HEADER) as u32;
         bytes
             .get_mut(length_field)
@@ -83,6 +93,26 @@ impl<M: ToJson> ConfigureSnapshot<M> {
         let checksum = JournalDigest::hash(&bytes);
         bytes.extend_from_slice(checksum.as_bytes());
         Ok(bytes)
+    }
+
+    /// Stream-encode this snapshot directly into a length-checked frame without building
+    /// an intermediate JSON value tree.
+    pub(super) fn encode_streaming(&self) -> Result<Vec<u8>, ReplayCodecError>
+    where
+        M: EncodeJson,
+    {
+        self.encode_with(|sink| self.model.encode(sink))
+    }
+}
+
+impl<M: ToJson> ConfigureSnapshot<M> {
+    /// Encode this snapshot in a length-checked native-path frame.
+    ///
+    /// Returns [`ReplayCodecError::Payload`] if the encoded payload exceeds the frame
+    /// limit or if `M::to_json` produces a JSON string or key with invalid UTF-8 bytes
+    /// (encode arbitrary bytes as numeric arrays, such as `Vec<u8>`).
+    pub fn encode(&self) -> Result<Vec<u8>, ReplayCodecError> {
+        self.encode_with(|sink| sink.value(&self.model.to_json()))
     }
 }
 
@@ -122,14 +152,14 @@ impl<M: FromJson> ConfigureSnapshot<M> {
     }
 }
 
-impl<M: ToJson> ToJson for ConfigureSnapshot<M> {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("schema", Value::string(FRAME_SCHEMA)),
-            ("replay_schema", self.schema.to_json()),
-            ("region", self.region.to_json()),
-            ("model", self.model.to_json()),
-        ])
+impl<M: EncodeJson> EncodeJson for ConfigureSnapshot<M> {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("model", |s| self.model.encode(s))?;
+            obj.field("region", |s| self.region.encode(s))?;
+            obj.field("replay_schema", |s| self.schema.encode(s))?;
+            obj.field("schema", |s| s.str(FRAME_SCHEMA))
+        })
     }
 }
 

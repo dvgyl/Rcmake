@@ -76,9 +76,9 @@ impl From<&Options> for InstallOptions {
     }
 }
 
-impl ToJson for Installs {
-    fn to_json(&self) -> Json {
-        Json::object_from([("rules", self.rules.to_json())])
+impl EncodeJson for Installs {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| obj.field("rules", |s| self.rules.encode(s)))
     }
 }
 
@@ -91,15 +91,15 @@ impl FromJson for Installs {
     }
 }
 
-impl ToJson for Rule {
-    fn to_json(&self) -> Json {
-        Json::object_from([
-            ("targets", codec::bytes_list(&self.targets)),
-            ("export", codec::opt_bytes(self.export.as_deref())),
-            ("origin", self.origin.to_json()),
-            ("options", self.options.to_json()),
-            ("properties", self.properties.to_json()),
-        ])
+impl EncodeJson for Rule {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("export", |s| s.opt_bytes(self.export.as_deref()))?;
+            obj.field("options", |s| self.options.encode(s))?;
+            obj.field("origin", |s| self.origin.encode(s))?;
+            obj.field("properties", |s| self.properties.encode(s))?;
+            obj.field("targets", |s| s.bytes_list(&self.targets))
+        })
     }
 }
 
@@ -119,13 +119,13 @@ impl FromJson for Rule {
     }
 }
 
-impl ToJson for Property {
-    fn to_json(&self) -> Json {
-        Json::object_from([
-            ("field", codec::bytes(&self.field)),
-            ("target", codec::opt_bytes(self.target.as_deref())),
-            ("value", codec::bytes(&self.value)),
-        ])
+impl EncodeJson for Property {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("field", |s| s.bytes(&self.field))?;
+            obj.field("target", |s| s.opt_bytes(self.target.as_deref()))?;
+            obj.field("value", |s| s.bytes(&self.value))
+        })
     }
 }
 
@@ -154,27 +154,25 @@ const OPTION_FIELDS: &[&str] = &[
     "export_package_dependencies",
 ];
 
-impl ToJson for Options {
-    fn to_json(&self) -> Json {
-        Json::object_from([
-            ("destination", codec::opt_bytes(self.destination.as_deref())),
-            ("component", codec::opt_bytes(self.component.as_deref())),
-            ("permissions", codec::bytes_list(&self.permissions)),
-            ("configurations", codec::bytes_list(&self.configurations)),
-            ("optional", self.optional.to_json()),
-            ("exclude_from_all", self.exclude_from_all.to_json()),
-            ("rename", codec::opt_bytes(self.rename.as_deref())),
-            (
-                "includes_destination",
-                codec::bytes_list(&self.includes_destination),
-            ),
-            ("build_depends", codec::bytes_list(&self.build_depends)),
-            ("all_components", self.all_components.to_json()),
-            (
-                "export_package_dependencies",
-                self.export_package_dependencies.to_json(),
-            ),
-        ])
+impl EncodeJson for Options {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("all_components", |s| self.all_components.encode(s))?;
+            obj.field("build_depends", |s| s.bytes_list(&self.build_depends))?;
+            obj.field("component", |s| s.opt_bytes(self.component.as_deref()))?;
+            obj.field("configurations", |s| s.bytes_list(&self.configurations))?;
+            obj.field("destination", |s| s.opt_bytes(self.destination.as_deref()))?;
+            obj.field("exclude_from_all", |s| self.exclude_from_all.encode(s))?;
+            obj.field("export_package_dependencies", |s| {
+                self.export_package_dependencies.encode(s)
+            })?;
+            obj.field("includes_destination", |s| {
+                s.bytes_list(&self.includes_destination)
+            })?;
+            obj.field("optional", |s| self.optional.encode(s))?;
+            obj.field("permissions", |s| s.bytes_list(&self.permissions))?;
+            obj.field("rename", |s| s.opt_bytes(self.rename.as_deref()))
+        })
     }
 }
 

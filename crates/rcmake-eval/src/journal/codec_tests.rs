@@ -1,18 +1,20 @@
 use std::error::Error;
 use std::path::PathBuf;
 
+use rcmake_base::BString;
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_host::PureHost;
-use rcmake_json::{FromJson, ToJson, Value};
+use rcmake_json::{FromJson, Value};
 use rcmake_model::{CacheEntry, CacheType, PropertyMap};
 
-use super::{bytes, from_bytes, from_path, path, round_trip};
+use super::{from_bytes, from_path, round_trip};
+use crate::journal::frame::{EncodeJson, MAX_FRAME_BYTES, encoded_size, write_json, write_with};
 use crate::journal::region::RegionPayload;
 use crate::journal::{
     CacheValue, ConfigureSnapshot, EntryContext, JournalDigest, JournalEffect, JournalFileStat,
     JournalInput, JournalStamp, OpaqueOperation, OpaqueReason, PropertyEdit, PropertyKey,
-    PropertyOrigin, PropertyOwner, RegionKey, RegionKind, RegionRecord, RegionState, StateKey,
-    TargetKey, VariableScope,
+    PropertyOrigin, PropertyOwner, RegionKey, RegionKind, RegionRecord, RegionState,
+    ReplayCodecError, StateKey, TargetKey, VariableScope,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -99,9 +101,39 @@ fn context() -> EntryContext {
     }
 }
 
-fn same<T: ToJson + FromJson + PartialEq + std::fmt::Debug>(value: T) -> TestResult {
+fn same<T: EncodeJson + FromJson + PartialEq + std::fmt::Debug>(value: T) -> TestResult {
     assert_eq!(round_trip(&value)?, value);
     Ok(())
+}
+
+fn encode_value(value: &impl EncodeJson) -> Result<Value, Box<dyn Error>> {
+    let mut text = Vec::new();
+    write_json(value, &mut text, MAX_FRAME_BYTES).ok_or("encode failed")?;
+    let options = rcmake_json::ReadOptions {
+        allow_comments: false,
+        dup_keys_last_wins: false,
+    };
+    Ok(rcmake_json::parse(&text, &options)?)
+}
+
+fn encode_bytes_value(raw: &[u8]) -> Result<Value, Box<dyn Error>> {
+    let mut text = Vec::new();
+    write_with(&mut text, MAX_FRAME_BYTES, |sink| sink.bytes(raw)).ok_or("encode failed")?;
+    let options = rcmake_json::ReadOptions {
+        allow_comments: false,
+        dup_keys_last_wins: false,
+    };
+    Ok(rcmake_json::parse(&text, &options)?)
+}
+
+fn encode_path_value(path: &std::path::Path) -> Result<Value, Box<dyn Error>> {
+    let mut text = Vec::new();
+    write_with(&mut text, MAX_FRAME_BYTES, |sink| sink.path(path)).ok_or("encode failed")?;
+    let options = rcmake_json::ReadOptions {
+        allow_comments: false,
+        dup_keys_last_wins: false,
+    };
+    Ok(rcmake_json::parse(&text, &options)?)
 }
 
 #[test]
@@ -115,14 +147,12 @@ fn bytes_keep_every_byte() -> TestResult {
         b"ok\xc3",
     ];
     for sample in samples {
-        let encoded = bytes(sample);
+        let encoded = encode_bytes_value(sample)?;
         assert_eq!(
             matches!(encoded, Value::String(_)),
             core::str::from_utf8(sample).is_ok()
         );
-        let text = rcmake_json::write_compact(&encoded);
-        let options = rcmake_json::ReadOptions::default();
-        assert_eq!(from_bytes(&rcmake_json::parse(&text, &options)?)?, sample);
+        assert_eq!(from_bytes(&encoded)?, sample);
     }
     assert!(from_bytes(&Value::Array(vec![Value::UInt(256)])).is_err());
     assert!(from_bytes(&Value::Bool(true)).is_err());
@@ -132,15 +162,16 @@ fn bytes_keep_every_byte() -> TestResult {
 #[test]
 fn paths_keep_native_bytes() -> TestResult {
     for sample in [root().join("a b/é.cmake"), PathBuf::new()] {
-        assert_eq!(from_path(&path(&sample))?, sample);
+        assert_eq!(from_path(&encode_path_value(&sample)?)?, sample);
     }
     #[cfg(unix)]
     {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
         let raw = root().join(OsStr::from_bytes(b"raw-\xff-dir"));
-        assert!(matches!(path(&raw), Value::Array(_)));
-        assert_eq!(from_path(&path(&raw))?, raw);
+        let encoded = encode_path_value(&raw)?;
+        assert!(matches!(encoded, Value::Array(_)));
+        assert_eq!(from_path(&encoded)?, raw);
     }
     Ok(())
 }
@@ -148,7 +179,7 @@ fn paths_keep_native_bytes() -> TestResult {
 #[test]
 fn digest_uses_lowercase_hex() -> TestResult {
     let value = digest(b"abc");
-    let encoded = value.to_json();
+    let encoded = encode_value(&value)?;
     assert_eq!(
         encoded.as_str(),
         Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
@@ -392,8 +423,8 @@ fn snapshot_round_trips_with_unit_model() -> TestResult {
 }
 
 #[test]
-fn decoders_reject_unknown_fields_and_variants() {
-    let mut key = region_key(RegionKind::Configure).to_json();
+fn decoders_reject_unknown_fields_and_variants() -> TestResult {
+    let mut key = encode_value(&region_key(RegionKind::Configure))?;
     if let Value::Object(members) = &mut key {
         members.insert("extra".into(), Value::Null);
     }
@@ -409,6 +440,60 @@ fn decoders_reject_unknown_fields_and_variants() {
     );
     assert!(VariableScope::from_json(&Value::string("current")).is_err());
     assert!(OpaqueReason::from_json(&Value::UInt(0)).is_err());
+    Ok(())
+}
+
+#[test]
+fn oversized_invalid_utf8_and_escaped_payloads_stop_at_budget() {
+    let mut state = RegionState::default();
+    let effect_8m = JournalEffect::SetVar {
+        scope: VariableScope::Current,
+        name: b"BIG".to_vec(),
+        value: Some(vec![0xff; 8 * 1024 * 1024]),
+    };
+    assert_eq!(encoded_size(&effect_8m, MAX_FRAME_BYTES), None);
+    let mut out = b"prefix".to_vec();
+    assert_eq!(write_json(&effect_8m, &mut out, MAX_FRAME_BYTES), None);
+    assert_eq!(out, b"prefix");
+    state.record_effect(effect_8m);
+    assert!(matches!(
+        state,
+        RegionState::Opaque(OpaqueOperation {
+            reason: OpaqueReason::LimitExceeded,
+            ..
+        })
+    ));
+
+    // 5 MiB of 0xff passes the 2*len+1 lower bound (10 MiB < 16 MiB) but expands to ~20 MiB.
+    let effect_5m = JournalEffect::SetVar {
+        scope: VariableScope::Current,
+        name: b"MID".to_vec(),
+        value: Some(vec![0xff; 5 * 1024 * 1024]),
+    };
+    assert_eq!(encoded_size(&effect_5m, MAX_FRAME_BYTES), None);
+    assert_eq!(write_json(&effect_5m, &mut out, MAX_FRAME_BYTES), None);
+    assert_eq!(out, b"prefix");
+
+    // 3 MiB of NUL bytes is valid UTF-8, but each byte escapes to 6 bytes (\u0000 = 18 MiB).
+    let effect_nul = JournalEffect::SetVar {
+        scope: VariableScope::Current,
+        name: b"NUL".to_vec(),
+        value: Some(vec![0x00; 3 * 1024 * 1024]),
+    };
+    assert_eq!(encoded_size(&effect_nul, MAX_FRAME_BYTES), None);
+    assert_eq!(write_json(&effect_nul, &mut out, MAX_FRAME_BYTES), None);
+    assert_eq!(out, b"prefix");
+}
+
+#[test]
+fn snapshot_rejects_lossy_invalid_utf8_generic_model_string() -> TestResult {
+    let region = RegionState::default().finish(region_key(RegionKind::Configure), context());
+    let invalid = ConfigureSnapshot::new(region.clone(), BString::from(&b"bad-\xff"[..]))?;
+    assert_eq!(invalid.encode(), Err(ReplayCodecError::Payload));
+    let valid = ConfigureSnapshot::new(region, BString::from("valid-é-😀"))?;
+    let framed = valid.encode()?;
+    assert_eq!(ConfigureSnapshot::<BString>::decode(&framed)?, valid);
+    Ok(())
 }
 
 #[test]

@@ -9,11 +9,11 @@ use std::sync::Arc;
 use rcmake_base::BString;
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{Follow, Host, path};
-use rcmake_json::{FieldError, FromJson, ToJson, Value, opt_or_else, req};
+use rcmake_json::{FieldError, FromJson, Value, opt_or_else, req};
 use rcmake_model::DirId;
 
 use super::codec;
-use super::frame::{MAX_FRAME_BYTES, encoded_size};
+use super::frame::{EncodeError, EncodeJson, JsonSink, MAX_FRAME_BYTES, encoded_size};
 use super::leaf::{LocalState, Usage, Writes};
 use super::receipts::ReplayReceipts;
 use super::region::RegionPayload;
@@ -60,24 +60,19 @@ struct Regions {
     receipts: Vec<JournalDigest>,
 }
 
-impl ToJson for Regions {
-    fn to_json(&self) -> Value {
-        let mut members = vec![
-            ("root", self.root.to_json()),
-            (
-                "nested",
-                codec::list(&self.nested, |(record, state)| {
-                    codec::pair(record.to_json(), state.to_json())
-                }),
-            ),
-        ];
-        if !self.variable_inputs.is_empty() {
-            members.push(("variable_inputs", self.variable_inputs.to_json()));
-        }
-        if !self.receipts.is_empty() {
-            members.push(("receipts", self.receipts.to_json()));
-        }
-        Value::object_from(members)
+impl EncodeJson for Regions {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("nested", |s| self.nested.encode(s))?;
+            if !self.receipts.is_empty() {
+                obj.field("receipts", |s| self.receipts.encode(s))?;
+            }
+            obj.field("root", |s| self.root.encode(s))?;
+            if !self.variable_inputs.is_empty() {
+                obj.field("variable_inputs", |s| self.variable_inputs.encode(s))?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -213,7 +208,7 @@ impl ReplaySession {
     }
 
     fn keep(&mut self, record: RegionRecord, state: LocalState) {
-        let Some(size) = encoded_size(&[record.to_json(), state.to_json()], self.bytes_left) else {
+        let Some(size) = encoded_size(&(&record, &state), self.bytes_left) else {
             return;
         };
         if record.key.kind == RegionKind::Configure {
@@ -287,7 +282,9 @@ impl ReplaySession {
                 },
             )
         });
-        Manifest::from_region(region, self.pending).encode().ok()
+        Manifest::from_region(region, self.pending)
+            .encode_streaming()
+            .ok()
     }
 }
 

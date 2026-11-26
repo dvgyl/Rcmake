@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rcmake_base::{BString, list};
 use rcmake_diag::{PolicyId, PolicyMap, PolicyStatus};
-use rcmake_json::{FieldError, FromJson, ToJson, Value as Json, req};
+use rcmake_json::{FieldError, FromJson, Value as Json, req};
 use rcmake_model::{
     BT, DirId, LinkItem, PropertyMap, Target, TargetBinding, TargetKind, TargetOrigin, TestEntry,
     UsageField, UsageProps, UsageScope,
@@ -13,6 +13,7 @@ use rcmake_model::{
 use rcmake_syntax::{ArgKind, Argument};
 
 use super::codec;
+use super::frame::{EncodeError, EncodeJson, JsonSink};
 use super::trace::JournalHasher;
 use super::{JournalDigest, JournalEffect, PropertyOrigin, VariableScope};
 use crate::{Interp, Registry, code::Code};
@@ -889,24 +890,18 @@ fn restore_values(values: &[Value], bin: &Path) -> Option<Vec<BT<BString>>> {
         .collect()
 }
 
-impl ToJson for LocalState {
-    fn to_json(&self) -> Json {
-        let variable_inputs = self
-            .variable_inputs
-            .as_ref()
-            .map_or(Json::Null, |(index, digest)| {
-                codec::pair(index.to_json(), digest.to_json())
-            });
-        Json::object_from([
-            ("variable_inputs", variable_inputs),
-            ("targets", self.targets.to_json()),
-            ("aliases", codec::byte_pairs(&self.aliases)),
-            ("tests", self.tests.to_json()),
-            ("installs", self.installs.to_json()),
-            ("link_check", self.link_check.to_json()),
-            ("directory_usage", self.directory_usage.to_json()),
-            ("used_cli", codec::bytes_list(&self.used_cli)),
-        ])
+impl EncodeJson for LocalState {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("aliases", |s| s.byte_pairs(&self.aliases))?;
+            obj.field("directory_usage", |s| self.directory_usage.encode(s))?;
+            obj.field("installs", |s| self.installs.encode(s))?;
+            obj.field("link_check", |s| self.link_check.encode(s))?;
+            obj.field("targets", |s| self.targets.encode(s))?;
+            obj.field("tests", |s| self.tests.encode(s))?;
+            obj.field("used_cli", |s| s.bytes_list(&self.used_cli))?;
+            obj.field("variable_inputs", |s| self.variable_inputs.encode(s))
+        })
     }
 }
 
@@ -959,21 +954,22 @@ const TEST_FIELDS: &[&str] = &[
     "build_depends",
 ];
 
-impl ToJson for TestRecord {
-    fn to_json(&self) -> Json {
-        Json::object_from([
-            ("name", codec::bytes(&self.name)),
-            ("origin", self.origin.to_json()),
-            ("command", codec::bytes_list(&self.command)),
-            ("configurations", codec::bytes_list(&self.configurations)),
-            (
-                "working_directory",
-                codec::opt_bytes(self.working_directory.as_deref()),
-            ),
-            ("command_expand_lists", self.command_expand_lists.to_json()),
-            ("old_style", self.old_style.to_json()),
-            ("build_depends", self.build_depends.to_json()),
-        ])
+impl EncodeJson for TestRecord {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("build_depends", |s| self.build_depends.encode(s))?;
+            obj.field("command", |s| s.bytes_list(&self.command))?;
+            obj.field("command_expand_lists", |s| {
+                self.command_expand_lists.encode(s)
+            })?;
+            obj.field("configurations", |s| s.bytes_list(&self.configurations))?;
+            obj.field("name", |s| s.bytes(&self.name))?;
+            obj.field("old_style", |s| self.old_style.encode(s))?;
+            obj.field("origin", |s| self.origin.encode(s))?;
+            obj.field("working_directory", |s| {
+                s.opt_bytes(self.working_directory.as_deref())
+            })
+        })
     }
 }
 
@@ -993,15 +989,15 @@ impl FromJson for TestRecord {
     }
 }
 
-impl ToJson for TargetRecord {
-    fn to_json(&self) -> Json {
-        Json::object_from([
-            ("name", codec::bytes(&self.name)),
-            ("origin", self.origin.to_json()),
-            ("props", codec::byte_pairs(&self.props)),
-            ("usage", self.usage.to_json()),
-            ("sources", self.sources.to_json()),
-        ])
+impl EncodeJson for TargetRecord {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("name", |s| s.bytes(&self.name))?;
+            obj.field("origin", |s| self.origin.encode(s))?;
+            obj.field("props", |s| s.byte_pairs(&self.props))?;
+            obj.field("sources", |s| self.sources.encode(s))?;
+            obj.field("usage", |s| self.usage.encode(s))
+        })
     }
 }
 
@@ -1018,18 +1014,13 @@ impl FromJson for TargetRecord {
     }
 }
 
-impl ToJson for Usage {
-    fn to_json(&self) -> Json {
-        Json::object_from([
-            (
-                "fields",
-                codec::list(&self.fields, |(name, values)| {
-                    codec::pair(name.to_json(), values.to_json())
-                }),
-            ),
-            ("links", self.links.to_json()),
-            ("interface_links", self.interface_links.to_json()),
-        ])
+impl EncodeJson for Usage {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("fields", |s| self.fields.encode(s))?;
+            obj.field("interface_links", |s| self.interface_links.encode(s))?;
+            obj.field("links", |s| self.links.encode(s))
+        })
     }
 }
 
@@ -1050,9 +1041,9 @@ impl FromJson for Usage {
     }
 }
 
-impl ToJson for Link {
-    fn to_json(&self) -> Json {
-        codec::pair(self.0.to_json(), self.1.to_json())
+impl EncodeJson for Link {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.pair(|s| self.0.encode(s), |s| self.1.encode(s))
     }
 }
 
@@ -1066,9 +1057,9 @@ impl FromJson for Link {
     }
 }
 
-impl ToJson for Value {
-    fn to_json(&self) -> Json {
-        codec::pair(codec::bytes(&self.0), self.1.to_json())
+impl EncodeJson for Value {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.pair(|s| s.bytes(&self.0), |s| self.1.encode(s))
     }
 }
 

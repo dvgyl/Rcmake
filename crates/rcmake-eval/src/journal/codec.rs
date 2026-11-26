@@ -1,24 +1,14 @@
-//! JSON helpers for configure journal records.
+//! JSON decode helpers for configure journal records.
 //!
 //! Byte strings use a JSON string when they are valid UTF-8 and an array of
 //! byte values otherwise, so every byte survives a round trip. Native paths use
 //! the platform byte form: UTF-16LE units on Windows and raw bytes elsewhere.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use rcmake_base::BString;
 use rcmake_json::{FieldError, FromJson, Object, Value, array, deny_unknown, object, req_value};
 
-/// Encode raw bytes without loss.
-pub(super) fn bytes(raw: &[u8]) -> Value {
-    if core::str::from_utf8(raw).is_ok() {
-        Value::String(BString::from(raw))
-    } else {
-        Value::array_from(raw.iter().map(|byte| Value::UInt(u64::from(*byte))))
-    }
-}
-
-/// Decode bytes written by [`bytes`].
+/// Decode bytes written by [`super::frame::JsonSink::bytes`].
 pub(super) fn from_bytes(value: &Value) -> Result<Vec<u8>, FieldError> {
     match value {
         Value::String(text) => Ok(text.to_vec()),
@@ -27,12 +17,7 @@ pub(super) fn from_bytes(value: &Value) -> Result<Vec<u8>, FieldError> {
     }
 }
 
-/// Encode optional raw bytes as `null` or [`bytes`].
-pub(super) fn opt_bytes(raw: Option<&[u8]>) -> Value {
-    raw.map_or(Value::Null, bytes)
-}
-
-/// Decode optional raw bytes written by [`opt_bytes`].
+/// Decode optional raw bytes written by [`super::frame::JsonSink::opt_bytes`].
 pub(super) fn from_opt_bytes(value: &Value) -> Result<Option<Vec<u8>>, FieldError> {
     match value {
         Value::Null => Ok(None),
@@ -40,22 +25,12 @@ pub(super) fn from_opt_bytes(value: &Value) -> Result<Option<Vec<u8>>, FieldErro
     }
 }
 
-/// Encode a list of byte strings.
-pub(super) fn bytes_list(items: &[Vec<u8>]) -> Value {
-    Value::array_from(items.iter().map(Vec::as_slice).map(bytes))
-}
-
-/// Decode a list written by [`bytes_list`].
+/// Decode a list written by [`super::frame::JsonSink::bytes_list`].
 pub(super) fn from_bytes_list(value: &Value) -> Result<Vec<Vec<u8>>, FieldError> {
     from_list(value, from_bytes)
 }
 
-/// Encode name and value pairs as two-element arrays.
-pub(super) fn byte_pairs(items: &[(Vec<u8>, Vec<u8>)]) -> Value {
-    list(items, |(name, value)| pair(bytes(name), bytes(value)))
-}
-
-/// Decode pairs written by [`byte_pairs`].
+/// Decode pairs written by [`super::frame::JsonSink::byte_pairs`].
 pub(super) fn from_byte_pairs(value: &Value) -> Result<Vec<(Vec<u8>, Vec<u8>)>, FieldError> {
     from_list(value, |item| {
         let (name, value) = from_pair(item)?;
@@ -63,25 +38,7 @@ pub(super) fn from_byte_pairs(value: &Value) -> Result<Vec<(Vec<u8>, Vec<u8>)>, 
     })
 }
 
-/// Encode a native path in the platform byte form.
-pub(super) fn path(path: &Path) -> Value {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        let raw: Vec<u8> = path
-            .as_os_str()
-            .encode_wide()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        bytes(&raw)
-    }
-    #[cfg(not(windows))]
-    {
-        bytes(path.as_os_str().as_encoded_bytes())
-    }
-}
-
-/// Decode a native path written by [`path`].
+/// Decode a native path written by [`super::frame::JsonSink::path`].
 pub(super) fn from_path(value: &Value) -> Result<PathBuf, FieldError> {
     let raw = from_bytes(value)?;
     #[cfg(windows)]
@@ -109,11 +66,6 @@ pub(super) fn from_path(value: &Value) -> Result<PathBuf, FieldError> {
     }
 }
 
-/// Encode each item with `encode` into a JSON array.
-pub(super) fn list<T>(items: &[T], encode: impl Fn(&T) -> Value) -> Value {
-    Value::array_from(items.iter().map(encode))
-}
-
 /// Decode each element of a JSON array with `decode`.
 pub(super) fn from_list<T>(
     value: &Value,
@@ -122,12 +74,7 @@ pub(super) fn from_list<T>(
     array(value)?.iter().map(decode).collect()
 }
 
-/// Encode two values as a two-element array.
-pub(super) fn pair(first: Value, second: Value) -> Value {
-    Value::Array(vec![first, second])
-}
-
-/// Split a two-element array written by [`pair`].
+/// Split a two-element array written by [`super::frame::JsonSink::pair`].
 pub(super) fn from_pair(value: &Value) -> Result<(&Value, &Value), FieldError> {
     match array(value)? {
         [first, second] => Ok((first, second)),
@@ -154,12 +101,7 @@ pub(super) fn fields<'a>(value: &'a Value, allowed: &[&str]) -> Result<&'a Objec
     Ok(obj)
 }
 
-/// Encode an enum variant that has data as a single-member object.
-pub(super) fn variant(name: &str, data: Value) -> Value {
-    Value::object_from([(name, data)])
-}
-
-/// Decode an enum variant written as a string (no data) or by [`variant`].
+/// Decode an enum variant written as a string (no data) or single-member object.
 ///
 /// `decode` gets the variant name and its data. Errors name the variant.
 pub(super) fn decode_variant<T>(
@@ -206,19 +148,25 @@ pub(super) fn unknown_variant(name: impl AsRef<[u8]>) -> FieldError {
     ))
 }
 
-/// Encode `value` as compact JSON text, decode the text, and require that the
-/// decoded value encodes to the same text.
+/// Encode `value` as compact JSON text, verify `encoded_size`, decode the text,
+/// and require that the decoded value encodes to the same text.
 #[cfg(test)]
-pub(super) fn round_trip<T: rcmake_json::ToJson + FromJson>(
+pub(super) fn round_trip<T: super::frame::EncodeJson + FromJson>(
     value: &T,
 ) -> Result<T, Box<dyn std::error::Error>> {
+    use super::frame::{MAX_FRAME_BYTES, encoded_size, write_json};
+
     let options = rcmake_json::ReadOptions {
         allow_comments: false,
         dup_keys_last_wins: false,
     };
-    let text = rcmake_json::write_compact(&value.to_json());
+    let mut text = Vec::new();
+    write_json(value, &mut text, MAX_FRAME_BYTES).ok_or("encode failed")?;
+    assert_eq!(encoded_size(value, MAX_FRAME_BYTES), Some(text.len()));
     let decoded = T::from_json(&rcmake_json::parse(&text, &options)?)?;
-    assert_eq!(rcmake_json::write_compact(&decoded.to_json()), text);
+    let mut reencoded = Vec::new();
+    write_json(&decoded, &mut reencoded, MAX_FRAME_BYTES).ok_or("re-encode failed")?;
+    assert_eq!(reencoded, text);
     Ok(decoded)
 }
 

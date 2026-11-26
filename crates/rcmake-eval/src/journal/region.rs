@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use rcmake_diag::{Backtrace, Frame, FrameKind};
-use rcmake_json::{FieldError, FromJson, Object, ToJson, Value, req};
+use rcmake_json::{FieldError, FromJson, Object, Value, req};
 use rcmake_model::{CacheEntry, CacheType, PropertyMap};
 
 use super::codec::{
-    self, decode_variant, field, fields, unknown_variant, variant, variant_data, variant_fields,
+    self, decode_variant, field, fields, unknown_variant, variant_data, variant_fields,
 };
-use super::frame::{MAX_FRAME_BYTES, encoded_size};
+use super::frame::{EncodeError, EncodeJson, JsonSink, MAX_FRAME_BYTES, encoded_size};
 use super::trace::{
     JournalDigest, JournalHasher, JournalInput, PropertyKey, PropertyOwner, StateKey, VariableScope,
 };
@@ -396,7 +396,7 @@ impl Journal {
         self.effects.push(effect);
         Ok(())
     }
-    fn account(&mut self, value: &impl ToJson) -> Result<(), OpaqueReason> {
+    fn account(&mut self, value: &impl EncodeJson) -> Result<(), OpaqueReason> {
         // Reserve room for the manifest and for commas between records.
         let remaining = MAX_FRAME_BYTES
             .saturating_sub(self.bytes)
@@ -496,18 +496,17 @@ impl RegionRecord {
     }
 }
 
-impl ToJson for RegionKind {
-    fn to_json(&self) -> Value {
+impl EncodeJson for RegionKind {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         match self {
-            Self::Configure => Value::string("Configure"),
-            Self::Subdirectory => Value::string("Subdirectory"),
-            Self::Include { file } => {
-                variant("Include", Value::object_from([("file", codec::path(file))]))
-            }
-            Self::Bootstrap { language } => variant(
-                "Bootstrap",
-                Value::object_from([("language", codec::bytes(language))]),
-            ),
+            Self::Configure => sink.str("Configure"),
+            Self::Subdirectory => sink.str("Subdirectory"),
+            Self::Include { file } => sink.variant("Include", |s| {
+                s.object(|obj| obj.field("file", |s| s.path(file)))
+            }),
+            Self::Bootstrap { language } => sink.variant("Bootstrap", |s| {
+                s.object(|obj| obj.field("language", |s| s.bytes(language)))
+            }),
         }
     }
 }
@@ -536,13 +535,13 @@ impl FromJson for RegionKind {
     }
 }
 
-impl ToJson for RegionKey {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("binary_dir", codec::path(&self.binary_dir)),
-            ("source_dir", codec::path(&self.source_dir)),
-            ("kind", self.kind.to_json()),
-        ])
+impl EncodeJson for RegionKey {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("binary_dir", |s| s.path(&self.binary_dir))?;
+            obj.field("kind", |s| self.kind.encode(s))?;
+            obj.field("source_dir", |s| s.path(&self.source_dir))
+        })
     }
 }
 
@@ -557,15 +556,15 @@ impl FromJson for RegionKey {
     }
 }
 
-impl ToJson for EntryContext {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("rcmake", self.rcmake.to_json()),
-            ("policies", self.policies.to_json()),
-            ("diag", self.diag.to_json()),
-            ("log_level", self.log_level.to_json()),
-            ("flags", self.flags.to_json()),
-        ])
+impl EncodeJson for EntryContext {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("diag", |s| self.diag.encode(s))?;
+            obj.field("flags", |s| self.flags.encode(s))?;
+            obj.field("log_level", |s| self.log_level.encode(s))?;
+            obj.field("policies", |s| self.policies.encode(s))?;
+            obj.field("rcmake", |s| self.rcmake.encode(s))
+        })
     }
 }
 
@@ -582,9 +581,9 @@ impl FromJson for EntryContext {
     }
 }
 
-impl ToJson for OpaqueReason {
-    fn to_json(&self) -> Value {
-        Value::string(match self {
+impl EncodeJson for OpaqueReason {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.str(match self {
             Self::UnclassifiedCommand => "UnclassifiedCommand",
             Self::ExecuteProcess => "ExecuteProcess",
             Self::RandomOrTimestamp => "RandomOrTimestamp",
@@ -607,14 +606,14 @@ impl FromJson for OpaqueReason {
     }
 }
 
-impl ToJson for OpaqueOperation {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("reason", self.reason.to_json()),
-            ("command", codec::opt_bytes(self.command.as_deref())),
-            ("file", codec::path(&self.file)),
-            ("line", self.line.to_json()),
-        ])
+impl EncodeJson for OpaqueOperation {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("command", |s| s.opt_bytes(self.command.as_deref()))?;
+            obj.field("file", |s| s.path(&self.file))?;
+            obj.field("line", |s| self.line.encode(s))?;
+            obj.field("reason", |s| self.reason.encode(s))
+        })
     }
 }
 
@@ -630,15 +629,15 @@ impl FromJson for OpaqueOperation {
     }
 }
 
-impl ToJson for CacheValue {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("value", codec::bytes(&self.value)),
-            ("ty", self.ty.to_json()),
-            ("help", codec::bytes(&self.help)),
-            ("advanced", self.advanced.to_json()),
-            ("props", codec::byte_pairs(&self.props)),
-        ])
+impl EncodeJson for CacheValue {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("advanced", |s| self.advanced.encode(s))?;
+            obj.field("help", |s| s.bytes(&self.help))?;
+            obj.field("props", |s| s.byte_pairs(&self.props))?;
+            obj.field("ty", |s| self.ty.encode(s))?;
+            obj.field("value", |s| s.bytes(&self.value))
+        })
     }
 }
 
@@ -655,12 +654,12 @@ impl FromJson for CacheValue {
     }
 }
 
-impl ToJson for PropertyOrigin {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("binary_dir", codec::path(&self.binary_dir)),
-            ("frames", self.frames.to_json()),
-        ])
+impl EncodeJson for PropertyOrigin {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("binary_dir", |s| s.path(&self.binary_dir))?;
+            obj.field("frames", |s| self.frames.encode(s))
+        })
     }
 }
 
@@ -674,14 +673,14 @@ impl FromJson for PropertyOrigin {
     }
 }
 
-impl ToJson for RecordedFrame {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("file", codec::bytes(&self.file)),
-            ("line", self.line.to_json()),
-            ("name", codec::opt_bytes(self.name.as_deref())),
-            ("kind", Value::string(self.kind.name())),
-        ])
+impl EncodeJson for RecordedFrame {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("file", |s| s.bytes(&self.file))?;
+            obj.field("kind", |s| s.str(self.kind.name()))?;
+            obj.field("line", |s| self.line.encode(s))?;
+            obj.field("name", |s| s.opt_bytes(self.name.as_deref()))
+        })
     }
 }
 
@@ -703,12 +702,12 @@ impl FromJson for RecordedFrame {
     }
 }
 
-impl ToJson for PropertyEdit {
-    fn to_json(&self) -> Value {
+impl EncodeJson for PropertyEdit {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         match self {
-            Self::Set(value) => variant("Set", codec::opt_bytes(value.as_deref())),
-            Self::AppendList(value) => variant("AppendList", codec::bytes(value)),
-            Self::AppendString(value) => variant("AppendString", codec::bytes(value)),
+            Self::Set(value) => sink.variant("Set", |s| s.opt_bytes(value.as_deref())),
+            Self::AppendList(value) => sink.variant("AppendList", |s| s.bytes(value)),
+            Self::AppendString(value) => sink.variant("AppendString", |s| s.bytes(value)),
         }
     }
 }
@@ -727,29 +726,29 @@ impl FromJson for PropertyEdit {
     }
 }
 
-impl ToJson for JournalEffect {
-    fn to_json(&self) -> Value {
+impl EncodeJson for JournalEffect {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         match self {
-            Self::SetVar { scope, name, value } => variant(
-                "SetVar",
-                Value::object_from([
-                    ("scope", scope.to_json()),
-                    ("name", codec::bytes(name)),
-                    ("value", codec::opt_bytes(value.as_deref())),
-                ]),
-            ),
-            Self::SetCache { name, entry } => variant(
-                "SetCache",
-                Value::object_from([("name", codec::bytes(name)), ("entry", entry.to_json())]),
-            ),
-            Self::Property { key, edit, origin } => variant(
-                "Property",
-                Value::object_from([
-                    ("key", key.to_json()),
-                    ("edit", edit.to_json()),
-                    ("origin", origin.to_json()),
-                ]),
-            ),
+            Self::SetVar { scope, name, value } => sink.variant("SetVar", |s| {
+                s.object(|obj| {
+                    obj.field("name", |s| s.bytes(name))?;
+                    obj.field("scope", |s| scope.encode(s))?;
+                    obj.field("value", |s| s.opt_bytes(value.as_deref()))
+                })
+            }),
+            Self::SetCache { name, entry } => sink.variant("SetCache", |s| {
+                s.object(|obj| {
+                    obj.field("entry", |s| entry.encode(s))?;
+                    obj.field("name", |s| s.bytes(name))
+                })
+            }),
+            Self::Property { key, edit, origin } => sink.variant("Property", |s| {
+                s.object(|obj| {
+                    obj.field("edit", |s| edit.encode(s))?;
+                    obj.field("key", |s| key.encode(s))?;
+                    obj.field("origin", |s| origin.encode(s))
+                })
+            }),
         }
     }
 }
@@ -789,14 +788,16 @@ impl FromJson for JournalEffect {
     }
 }
 
-impl ToJson for RegionPayload {
-    fn to_json(&self) -> Value {
+impl EncodeJson for RegionPayload {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         match self {
-            Self::Complete { inputs, effects } => variant(
-                "Complete",
-                Value::object_from([("inputs", inputs.to_json()), ("effects", effects.to_json())]),
-            ),
-            Self::Opaque(operation) => variant("Opaque", operation.to_json()),
+            Self::Complete { inputs, effects } => sink.variant("Complete", |s| {
+                s.object(|obj| {
+                    obj.field("effects", |s| effects.encode(s))?;
+                    obj.field("inputs", |s| inputs.encode(s))
+                })
+            }),
+            Self::Opaque(operation) => sink.variant("Opaque", |s| operation.encode(s)),
         }
     }
 }
@@ -817,13 +818,13 @@ impl FromJson for RegionPayload {
     }
 }
 
-impl ToJson for RegionRecord {
-    fn to_json(&self) -> Value {
-        Value::object_from([
-            ("key", self.key.to_json()),
-            ("context", self.context.to_json()),
-            ("payload", self.payload.to_json()),
-        ])
+impl EncodeJson for RegionRecord {
+    fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        sink.object(|obj| {
+            obj.field("context", |s| self.context.encode(s))?;
+            obj.field("key", |s| self.key.encode(s))?;
+            obj.field("payload", |s| self.payload.encode(s))
+        })
     }
 }
 
