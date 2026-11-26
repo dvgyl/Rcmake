@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use rcmake_genex::{EvalContext, UsageTraversal};
-use rcmake_model::{BT, TargetId, UsageField};
+use rcmake_model::{BT, ProjectModel, TargetId, UsageField};
 
 use super::{
     InterfaceInclude, ResolveError, UsageResolver, UsageValue, context, definition, entry_origin,
@@ -168,12 +168,12 @@ impl UsageResolver<'_> {
     }
 }
 
-pub(crate) fn finalize_current_dir_interfaces(
-    model: &rcmake_model::ProjectModel,
-) -> Option<rcmake_model::ProjectModel> {
+pub(crate) fn pending_current_dir_interfaces(
+    model: &ProjectModel,
+) -> impl Iterator<Item = (TargetId, BT<rcmake_base::BString>)> + '_ {
     use rcmake_model::TargetKind;
 
-    let mut targets = model
+    model
         .targets()
         .filter(|(_, target)| {
             !target.is_imported()
@@ -191,25 +191,40 @@ pub(crate) fn finalize_current_dir_interfaces(
                 && definition(model, target.dir, b"CMAKE_INCLUDE_CURRENT_DIR_IN_INTERFACE")
                     .is_some_and(|value| truth::is_on(value))
         })
-        .peekable();
-    targets.peek()?;
-    let mut result = model.clone();
-    for (id, target) in targets {
-        let dir = model.dir(target.dir);
-        let includes = [
-            b"$<BUILD_INTERFACE:".as_slice(),
-            &dir.binary_dir,
-            b";",
-            &dir.source_dir,
-            b">",
-        ]
-        .concat();
-        if let Some(target) = result.target_mut(id) {
-            target.usage.push(
-                UsageField::InterfaceIncludeDirectories,
-                BT::new(includes.into(), Default::default()),
-            );
+        .filter_map(|(id, target)| {
+            let dir = model.dir(target.dir);
+            let includes = [
+                b"$<BUILD_INTERFACE:".as_slice(),
+                &dir.binary_dir,
+                b";",
+                &dir.source_dir,
+                b">",
+            ]
+            .concat();
+            let entry = BT::new(includes.into(), Default::default());
+            let entries = target
+                .usage
+                .entries(UsageField::InterfaceIncludeDirectories);
+            (!entries.contains(&entry)).then_some((id, entry))
+        })
+}
+
+pub(crate) fn append_current_dir_interfaces(
+    model: &mut ProjectModel,
+    entries: impl IntoIterator<Item = (TargetId, BT<rcmake_base::BString>)>,
+) {
+    for (id, entry) in entries {
+        if let Some(target) = model.target_mut(id) {
+            target
+                .usage
+                .push(UsageField::InterfaceIncludeDirectories, entry);
         }
     }
-    Some(result)
+}
+
+/// Add the current build and source directories to eligible target interfaces.
+/// Call this after configuration and before evaluating generation expressions.
+pub fn finalize_current_dir_interfaces(model: &mut ProjectModel) {
+    let entries: Vec<_> = pending_current_dir_interfaces(model).collect();
+    append_current_dir_interfaces(model, entries);
 }

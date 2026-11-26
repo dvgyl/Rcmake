@@ -39,6 +39,7 @@ pub use install_manifest::{
 };
 pub use model::*;
 pub use pipeline::{resolve, resolve_with_facts, resolve_with_options, validate_codegen_name};
+pub use usage::includes::finalize_current_dir_interfaces;
 
 /// Return `true` when CMake treats `path` as a full path (`cmSystemTools::FileIsFullPath`).
 ///

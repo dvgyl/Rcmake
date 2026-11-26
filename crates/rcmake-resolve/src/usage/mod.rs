@@ -41,6 +41,7 @@ mod wrappers;
 
 pub use host::{ModelGenexHost, ObjectPaths};
 pub use link::{ResolvedLinkItem, ResolvedLinkKind, collect_link_items};
+pub(crate) use link_options::traversal as link_property_traversal;
 
 use crate::ResolveError;
 
@@ -588,6 +589,16 @@ impl<'a> UsageResolver<'a> {
         name: &[u8],
         ctx: &EvalContext,
     ) -> Result<Arc<WalkValue>, ResolveError> {
+        self.walk_with(target, name, ctx, &mut HashSet::new())
+    }
+
+    fn walk_with(
+        &mut self,
+        target: TargetId,
+        name: &[u8],
+        ctx: &EvalContext,
+        visited: &mut HashSet<(TargetId, bool)>,
+    ) -> Result<Arc<WalkValue>, ResolveError> {
         // A link graph may contain a cycle. Stop this branch and avoid caching its
         // partial result. A generator expression that re-enters a property is an error.
         let in_cycle = self
@@ -597,6 +608,11 @@ impl<'a> UsageResolver<'a> {
         if in_cycle {
             self.cycle_count += 1;
             return Ok(Arc::default());
+        }
+        // Link walks can have many paths through cycles. Cache only a complete
+        // query so a cached branch cannot bypass the query's visited set.
+        if ctx.traversal == UsageTraversal::Link && !visited.is_empty() {
+            return self.walk_once(target, name, ctx, visited).map(Arc::new);
         }
         let mut key = MemoKey {
             target,
@@ -635,9 +651,7 @@ impl<'a> UsageResolver<'a> {
             return Ok(Arc::clone(value));
         }
         let cycle_count = self.cycle_count;
-        let value = Arc::new(
-            self.with_property(target, name, |this| this.walk_uncached(target, name, ctx))?,
-        );
+        let value = Arc::new(self.walk_once(target, name, ctx, visited)?);
         if self.source_reads.is_none() && self.cycle_count == cycle_count {
             if !value.flags.head_sensitive {
                 key.head = None;
@@ -647,11 +661,29 @@ impl<'a> UsageResolver<'a> {
         Ok(value)
     }
 
+    fn walk_once(
+        &mut self,
+        target: TargetId,
+        name: &[u8],
+        ctx: &EvalContext,
+        visited: &mut HashSet<(TargetId, bool)>,
+    ) -> Result<WalkValue, ResolveError> {
+        // A query on a direct property can reach the root's interface.
+        if !visited.insert((target, name.starts_with(b"INTERFACE_"))) {
+            self.cycle_count += usize::from(ctx.traversal == UsageTraversal::Compile);
+            return Ok(WalkValue::default());
+        }
+        self.with_property(target, name, |this| {
+            this.walk_uncached(target, name, ctx, visited)
+        })
+    }
+
     fn walk_uncached(
         &mut self,
         id: TargetId,
         name: &[u8],
         ctx: &EvalContext,
+        visited: &mut HashSet<(TargetId, bool)>,
     ) -> Result<WalkValue, ResolveError> {
         let target = self.target(id)?;
         let mut own = UsageValue::default();
@@ -725,22 +757,25 @@ impl<'a> UsageResolver<'a> {
         {
             result.contributions.push((id, own.entries.into()));
         }
-        let mut seen = HashSet::from([id]);
+        let mut seen = (ctx.traversal == UsageTraversal::Compile).then(HashSet::new);
         for (dependency, edge) in links.iter().flat_map(|item| item.edges()) {
+            if ctx.traversal == UsageTraversal::Link && visited.contains(&(dependency, true)) {
+                continue;
+            }
             let previous_link_bt = if self.current_link_bt.is_none() {
                 self.current_link_bt.replace(edge.text.backtrace.clone())
             } else {
                 None
             };
             let restore_link_bt = previous_link_bt.is_none() && self.current_link_bt.is_some();
-            let value = self.walk(dependency, &dependency_name, ctx);
+            let value = self.walk_with(dependency, &dependency_name, ctx, visited);
             if restore_link_bt {
                 self.current_link_bt = previous_link_bt;
             }
             let value = value?;
             result.flags = result.flags.union(value.flags);
             for (owner, entries) in &value.contributions {
-                if !seen.insert(*owner) {
+                if *owner == id || seen.as_mut().is_some_and(|seen| !seen.insert(*owner)) {
                     continue;
                 }
                 result.contributions.push((*owner, Arc::clone(entries)));

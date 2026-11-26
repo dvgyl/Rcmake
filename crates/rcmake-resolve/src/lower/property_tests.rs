@@ -4,7 +4,7 @@ use rcmake_base::BString;
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_host::{Host, PureHost, ReadRange};
 use rcmake_model::{
-    BT, DirId, GeneratorKind, ProjectModel, Target, TargetKind, TargetOrigin, UsageField,
+    BT, DirId, GeneratorKind, LinkItem, ProjectModel, Target, TargetKind, TargetOrigin, UsageField,
 };
 
 use crate::{BuildStep, Invocation, resolve};
@@ -42,6 +42,58 @@ fn target(name: &str, kind: TargetKind, source: &str) -> Target {
 
 fn has(invocation: &Invocation, word: &str) -> bool {
     invocation.argv.iter().any(|arg| arg == word)
+}
+
+#[test]
+fn link_depends_follows_private_static_dependencies_only_with_cmp0099_new() -> TestResult {
+    let host = PureHost::default();
+    host.seed_file(Path::new("/project/main.c"), b"")?;
+    for policy in [None, Some(PolicyStatus::Old), Some(PolicyStatus::New)] {
+        let mut model = model("Linux", &[("CMAKE_C_COMPILER", "cc")]);
+        let mut app = target("app", TargetKind::Executable, "main.c");
+        if let Some(policy) = policy {
+            app.policies.policies.set(PolicyId::new(99), policy)?;
+        }
+        app.props.set("LINK_DEPENDS".into(), "own.ld".into());
+        let link = |name: &str| LinkItem {
+            text: BT::new(name.into(), Default::default()),
+            lookup_dir: DirId::ROOT,
+            scope: None,
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
+        };
+        app.usage.link_libraries = Some(vec![link("wrapper")]);
+        model.add_target(app)?;
+        let mut wrapper = target("wrapper", TargetKind::StaticLibrary, "main.c");
+        wrapper.usage.link_libraries = Some(vec![link("private")]);
+        wrapper.usage.interface_link_libraries = Some(vec![link("$<LINK_ONLY:private>")]);
+        model.add_target(wrapper)?;
+        let mut private = target("private", TargetKind::StaticLibrary, "main.c");
+        private.usage.push(
+            UsageField::InterfaceLinkDepends,
+            BT::new("private.ld".into(), Default::default()),
+        );
+        model.add_target(private)?;
+        let result = resolve(&model, &host, &[])?;
+        let inputs = result.graphs[0]
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                BuildStep::Link {
+                    step,
+                    implicit_inputs,
+                    ..
+                } if step.output == "app" => Some(implicit_inputs),
+                _ => None,
+            })
+            .ok_or("Missing app link step")?;
+        assert!(inputs.iter().any(|input| input == "/project/own.ld"));
+        assert_eq!(
+            inputs.iter().any(|input| input == "/project/private.ld"),
+            policy == Some(PolicyStatus::New),
+        );
+    }
+    Ok(())
 }
 
 #[test]

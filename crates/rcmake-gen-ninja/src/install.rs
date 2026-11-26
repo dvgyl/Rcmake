@@ -220,32 +220,22 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
             test.extend_from_slice(b" -C ");
             graph.commands.word(config, &mut test);
         }
-        let binary_dir = if directory.is_empty() {
-            root.clone()
-        } else {
-            [root.as_slice(), b"/", &directory].concat().into()
-        };
-        let edit_cache = if let (Some(editor), Some(source)) = (
-            &programs.edit_cache,
-            programs.directory_sources.get(binary_dir.as_slice()),
-        ) {
-            let mut command = editor.clone();
-            for (option, dir) in [
-                (b" -S".as_slice(), source.as_slice()),
-                (b" -B", &binary_dir),
-            ] {
-                command.extend_from_slice(option);
-                graph.commands.word(dir, &mut command);
-            }
-            command
-        } else {
-            let mut command = programs.cmake.clone();
-            command.extend_from_slice(b" -E echo ");
-            graph
-                .commands
-                .word(b"No interactive CMake dialog available.", &mut command);
-            command
-        };
+        let edit_cache =
+            if let (Some(editor), Some(source)) = (&programs.edit_cache, &programs.source_dir) {
+                let mut command = editor.clone();
+                for (option, dir) in [(b" -S".as_slice(), source.as_slice()), (b" -B", &root)] {
+                    command.extend_from_slice(option);
+                    graph.commands.word(dir, &mut command);
+                }
+                command
+            } else {
+                let mut command = programs.cmake.clone();
+                command.extend_from_slice(b" -E echo ");
+                graph
+                    .commands
+                    .word(b"No interactive CMake dialog available.", &mut command);
+                command
+            };
 
         let all = BString::from(name("all"));
         for (utility, command, enabled, per_config) in [

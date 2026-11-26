@@ -448,7 +448,7 @@ struct Programs {
     parallel_install: bool,
     directories: Vec<BString>,
     edit_cache: Option<Vec<u8>>,
-    directory_sources: std::collections::HashMap<BString, BString>,
+    source_dir: Option<BString>,
     install_directories: Vec<BString>,
 }
 
@@ -545,11 +545,7 @@ impl Programs {
                 .collect(),
             edit_cache: setting(definition(b"CMAKE_EDIT_COMMAND"), b"CMAKE_EDIT_COMMAND")
                 .map(|editor| program(Some(editor), b"")),
-            directory_sources: model
-                .into_iter()
-                .flat_map(|model| model.dirs())
-                .map(|(_, dir)| (commands.path(&dir.binary_dir), dir.source_dir.clone()))
-                .collect(),
+            source_dir: model.map(|model| model.dir(DirId::ROOT).source_dir.clone()),
             install_directories: model
                 .into_iter()
                 .flat_map(|model| model.dirs())

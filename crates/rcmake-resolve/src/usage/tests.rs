@@ -93,6 +93,44 @@ fn link_line(items: &[ResolvedLinkItem]) -> BString {
     list::join(items.iter().map(|entry| &entry.text.value))
 }
 
+#[test]
+fn cmp0099_new_collects_cyclic_static_link_depends_in_first_visit_order() {
+    let mut model = model("Linux");
+    let app = add(&mut model, "app", TargetKind::Executable);
+    model
+        .target_mut(app)
+        .unwrap()
+        .policies
+        .policies
+        .set(PolicyId::new(99), PolicyStatus::New)
+        .unwrap();
+    let libraries: Vec<_> = (0..16).map(|index| format!("lib{index}")).collect();
+    link(&mut model, app, false, &[&libraries[0]]);
+    for name in &libraries {
+        let library = add(&mut model, name, TargetKind::StaticLibrary);
+        usage(&mut model, library, UsageField::InterfaceLinkDepends, name);
+        let dependencies: Vec<_> = libraries
+            .iter()
+            .filter(|dependency| *dependency != name)
+            .map(|dependency| format!("$<LINK_ONLY:{dependency}>"))
+            .collect();
+        let dependencies: Vec<_> = dependencies.iter().map(String::as_str).collect();
+        link(&mut model, library, true, &dependencies);
+    }
+
+    let traversal = link_property_traversal(model.target(app).unwrap());
+    let mut resolver = UsageResolver::new(&model);
+    let result = resolver
+        .collect_property_with(
+            app,
+            b"LINK_DEPENDS",
+            &EvalContext::default(),
+            Some(traversal),
+        )
+        .unwrap();
+    assert_eq!(values(&result.entries), libraries.join(";"));
+}
+
 fn command_entry(value: &str, command: &str, line: u32) -> BT<BString> {
     BT::new(
         value.into(),

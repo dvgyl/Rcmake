@@ -87,7 +87,15 @@ fn resolve_project(
     options: &ResolveOptions,
     collect_source_errors: bool,
 ) -> Result<GenerationResult, ResolveError> {
-    let includes = crate::usage::includes::finalize_current_dir_interfaces(model);
+    // Direct callers can supply a model before finalization.
+    let mut entries = crate::usage::includes::pending_current_dir_interfaces(model).peekable();
+    let includes = if entries.peek().is_some() {
+        let mut finalized = model.clone();
+        crate::usage::includes::append_current_dir_interfaces(&mut finalized, entries);
+        Some(finalized)
+    } else {
+        None
+    };
     let model = includes.as_ref().unwrap_or(model);
     let output_sets = rule_output_sets::prepare(model)?;
     let model = output_sets.as_ref().unwrap_or(model);

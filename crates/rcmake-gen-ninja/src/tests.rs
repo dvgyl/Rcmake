@@ -25,6 +25,34 @@ pub(super) fn read_in(host: &PureHost, dir: &Path, file: &str) -> String {
 }
 
 #[test]
+fn subdirectory_edit_cache_uses_top_level_paths() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::{DirId, ProjectModel};
+
+    let host = PureHost::default();
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/src".into(), "/work/build".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_EDIT_COMMAND".into(), "/tools/ccmake".into());
+    model.add_directory(
+        DirId::ROOT,
+        "/work/src/sub".into(),
+        "/work/build/sub".into(),
+        Default::default(),
+    )?;
+    let result = GenerationResult {
+        graphs: vec![BuildGraph::default()],
+        ..Default::default()
+    };
+    super::generate_single_config_with_model(&result, &host, Path::new("/work/build"), &model)?;
+    let manifest = read(&host, "build.ninja");
+    assert!(manifest.contains("build sub/edit_cache: phony"));
+    assert!(manifest.contains("cd -- sub && /tools/ccmake -S/work/src -B/work/build"));
+    Ok(())
+}
+
+#[test]
 fn single_config_writes_rules_edges_and_utilities() {
     let host = PureHost::default();
     host.env_set(b"CMAKE_JOB_POOLS", Some(b"slow=3;unused=4"));

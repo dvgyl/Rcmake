@@ -46,50 +46,30 @@ pub fn render_selected(
     generator: GeneratorKind,
     selection: Option<&HashSet<TargetId>>,
 ) -> Result<BString, GenError> {
+    let graphs = if generator == GeneratorKind::NinjaMultiConfig {
+        result.graphs.as_slice()
+    } else {
+        std::slice::from_ref(graph)
+    };
     let objects = selection.map(|selection| {
-        result
-            .targets
+        graphs
             .iter()
-            .filter(|target| selection.contains(&target.id))
-            .flat_map(|target| {
-                target
-                    .compile_units
-                    .iter()
-                    .map(|unit| unit.object.as_slice())
-            })
+            .flat_map(owned_compile_objects)
+            .filter_map(|(id, object)| selection.contains(&id).then_some(object))
             .collect()
     });
-    if generator == GeneratorKind::NinjaMultiConfig {
-        return render_with_directories(
-            &result.graphs,
-            build_dir,
-            &HashMap::new(),
-            true,
-            objects.as_ref(),
-        );
-    }
     if generator != GeneratorKind::UnixMakefiles {
-        return render_with_directories(
-            std::iter::once(graph),
-            build_dir,
-            &HashMap::new(),
-            true,
-            objects.as_ref(),
-        );
+        return render_with_directories(graphs, build_dir, &HashMap::new(), true, objects.as_ref());
     }
 
-    let directories = result
+    let target_dirs: HashMap<_, _> = result
         .targets
         .iter()
         .filter(|target| graph.config.matches(&target.config.0))
-        .flat_map(|target| {
-            target.compile_units.iter().map(|unit| {
-                (
-                    unit.object.as_slice(),
-                    target.metadata.binary_dir.as_slice(),
-                )
-            })
-        })
+        .map(|target| (target.id, target.metadata.binary_dir.as_slice()))
+        .collect();
+    let directories = owned_compile_objects(graph)
+        .filter_map(|(id, object)| Some((object, *target_dirs.get(&id)?)))
         .collect();
     render_with_directories(
         std::iter::once(graph),
@@ -98,6 +78,21 @@ pub fn render_selected(
         false,
         objects.as_ref(),
     )
+}
+
+fn owned_compile_objects(graph: &BuildGraph) -> impl Iterator<Item = (TargetId, &[u8])> {
+    graph
+        .target_ids
+        .iter()
+        .zip(&graph.targets)
+        .flat_map(move |(&id, target)| {
+            target.steps.iter().filter_map(move |&index| {
+                let BuildStep::Compile { object, .. } = graph.steps.get(index)? else {
+                    return None;
+                };
+                Some((id, object.as_slice()))
+            })
+        })
 }
 
 fn render_with_directories<'a>(

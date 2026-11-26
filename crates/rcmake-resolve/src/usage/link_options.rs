@@ -88,7 +88,7 @@ impl UsageResolver<'_> {
     }
 }
 
-pub(super) fn traversal(target: &Target) -> UsageTraversal {
+pub(crate) fn traversal(target: &Target) -> UsageTraversal {
     if target.policies.policies.get(PolicyId::new(99)) == PolicyStatus::New {
         UsageTraversal::Link
     } else {

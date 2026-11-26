@@ -14,7 +14,8 @@ use super::shell::{command as shell_command, direct, join_words, simple_args};
 use super::{definition, join};
 use crate::{
     ArtifactSet, BuildStep, LinkFragmentRole, LinkKind, LinkStep, ResolveError, ResolvedTarget,
-    sources::TargetInputs, usage::UsageResolver,
+    sources::TargetInputs,
+    usage::{UsageResolver, link_property_traversal},
 };
 
 pub(super) mod driver;
@@ -425,11 +426,15 @@ pub(super) fn link(
         let context = EvalContext {
             config: config.clone(),
             link_language: Some(step.language.clone()),
-            traversal: UsageTraversal::Link,
             ..EvalContext::default()
         };
         for entry in usage
-            .collect_property(id, b"LINK_DEPENDS", &context)?
+            .collect_property_with(
+                id,
+                b"LINK_DEPENDS",
+                &context,
+                Some(link_property_traversal(target)),
+            )?
             .entries
         {
             let path = join(&model.dir(target.dir).source_dir, &entry.value);

@@ -366,6 +366,8 @@ pub(in crate::native) fn run_pipeline(
     let mut time_limit = req.timeout;
     let mut timeout_signal = None;
     let mut graceful_exit = false;
+    let initial_pause = Duration::from_micros(100);
+    let mut pause = initial_pause;
     loop {
         let done = io_at_process(pipeline.collect_status())?;
         let read = io_at_process(pump_output(
@@ -405,6 +407,7 @@ pub(in crate::native) fn run_pipeline(
                 pipeline.signal(timeout.signal);
                 timeout_signal = Some(timeout.signal);
                 time_limit = Some(start.elapsed().saturating_add(timeout.grace));
+                pause = initial_pause;
                 continue;
             }
             if done
@@ -420,9 +423,11 @@ pub(in crate::native) fn run_pipeline(
         }
         let wrote = io_at_process(pump_input(&mut feed))?;
         if !read && !wrote {
-            let pause = Duration::from_millis(2);
             let remaining = limit.map_or(pause, |timeout| timeout.saturating_sub(start.elapsed()));
             std::thread::sleep(pause.min(remaining));
+            pause = (pause * 2).min(Duration::from_millis(2));
+        } else {
+            pause = initial_pause;
         }
     }
     output.results = std::mem::take(&mut pipeline.stages)

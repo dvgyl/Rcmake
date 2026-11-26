@@ -114,6 +114,7 @@ fn generate(
         },
     };
     configure_rules(interp)?;
+    rcmake_resolve::finalize_current_dir_interfaces(interp.cx().project());
     let rich = interp.diag_engine().rich_options();
     let rich_sources = rich.map(|_| interp.diagnostic_sources().clone());
     let cmake_root = interp.cx().cmake_root().to_path_buf();
@@ -741,6 +742,36 @@ mod tests {
     use rcmake_host::{Follow, HostError, ProcessResult, ReadRange, RunOutput, Stream};
 
     use super::*;
+
+    #[test]
+    fn file_generate_reads_the_current_directory_interface_includes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = crate::driver_tests::project_host();
+        host.seed_file(
+            Path::new("/work/CMakeLists.txt"),
+            br#"cmake_minimum_required(VERSION 4.5)
+project(example LANGUAGES NONE)
+set(CMAKE_INCLUDE_CURRENT_DIR_IN_INTERFACE ON)
+add_library(lib INTERFACE)
+file(GENERATE OUTPUT includes.txt CONTENT "$<TARGET_PROPERTY:lib,INTERFACE_INCLUDE_DIRECTORIES>")
+"#,
+        )?;
+        let argv = ["cmake", "-S", ".", "-B", "out", "-G", "Ninja"].map(BString::from);
+        assert_eq!(
+            crate::run(&argv, host.clone()),
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        assert_eq!(
+            host.read(
+                Path::new("/work/out/includes.txt"),
+                ReadRange::All { limit: 1024 }
+            )?,
+            b"/work/out;/work"
+        );
+        Ok(())
+    }
 
     #[test]
     fn configure_and_build_collect_instrumentation() -> Result<(), Box<dyn std::error::Error>> {
