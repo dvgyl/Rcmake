@@ -257,6 +257,92 @@ class InstallShTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def fake_release(self, versions: list[str]) -> tuple[Path, Path]:
+        """Serve release files through a fake curl that logs each URL."""
+        host = {
+            ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
+            ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
+            ("Linux", "arm64"): "aarch64-unknown-linux-gnu",
+            ("Darwin", "arm64"): "aarch64-apple-darwin",
+        }.get((os.uname().sysname, os.uname().machine))
+        if host is None:
+            self.skipTest("No release archive for this host.")
+        served = self.root / "served"
+        served.mkdir()
+        sums = []
+        for version in versions:
+            name = f"rcmake-{version}-{host}.tar.gz"
+            archive = _make_fake_archive(served, version=version, archive_name=name, sidecar="missing")
+            sums.append(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {name}")
+        (served / "SHA256SUMS.txt").write_text("\n".join(sums) + "\n", encoding="ascii")
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir()
+        log = self.root / "curl.log"
+        curl = fake_bin / "curl"
+        curl.write_text(
+            "#!/bin/sh\n"
+            'url=""; out=""\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            '    -o) out="$2"; shift ;;\n'
+            '    https://*) url="$1" ;;\n'
+            "  esac\n"
+            "  shift\n"
+            "done\n"
+            f'printf "%s\\n" "$url" >> "{log}"\n'
+            f'cp "{served}/$(basename "$url")" "$out" 2>/dev/null || exit 22\n',
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        return fake_bin, log
+
+    def test_version_downloads_the_tagged_release(self) -> None:
+        fake_bin, log = self.fake_release(["0.1.0", "0.2.0"])
+        releases = "https://github.com/dvgyl/rcmake/releases"
+        for requested in ("v0.1.0", "0.1.0"):
+            with self.subTest(version=requested):
+                log.unlink(missing_ok=True)
+                res = self.run_install("--version", requested, path_entries=[str(fake_bin)])
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn("Download the checksums of release v0.1.0.", res.stdout)
+                self.assertIn("Installed rcmake 0.1.0", res.stdout)
+                urls = log.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(urls[0], f"{releases}/download/v0.1.0/SHA256SUMS.txt")
+                self.assertRegex(urls[1], rf"^{re.escape(releases)}/download/v0\.1\.0/rcmake-0\.1\.0-[^/]+\.tar\.gz$")
+
+        log.unlink()
+        res = self.run_install("--version", "0.3.0", path_entries=[str(fake_bin)])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Release v0.3.0 has no archive for ", res.stderr)
+
+    def test_latest_release_uses_the_latest_download_url(self) -> None:
+        fake_bin, log = self.fake_release(["0.2.0"])
+        res = self.run_install(path_entries=[str(fake_bin)])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        urls = log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(urls[0], "https://github.com/dvgyl/rcmake/releases/latest/download/SHA256SUMS.txt")
+        self.assertIn("/latest/download/rcmake-0.2.0-", urls[1])
+
+    def test_version_argument_errors(self) -> None:
+        archive = _make_fake_archive(self.archives)
+        for args, message in (
+            (["--version"], "--version requires a version."),
+            (["--version", "--force"], "--version requires a version."),
+            (["--version", "latest"], "Invalid version latest."),
+            (["--version", "1.2"], "Invalid version 1.2."),
+            (["--version", "0.1.0", "--archive", str(archive)], "Use --version only to download a release."),
+            (["--archive", str(archive), "--version", "0.1.0"], "Use --version only to download a release."),
+            (["--from-source", "--version", "0.1.0"], "Use --version only to download a release."),
+            (["--uninstall", "--version", "0.1.0"], "Use --version only to download a release."),
+        ):
+            with self.subTest(args=args):
+                res = self.run_install(*args)
+                self.assertEqual(res.returncode, 2, res.stdout)
+                self.assertIn(message, res.stderr)
+        self.assertFalse(self.prefix.exists())
+        help_text = self.run_install("--help").stdout
+        self.assertIn("--version <v>", help_text)
+
     def test_standalone_lsp_install_reinstall_and_uninstall(self) -> None:
         v1 = _make_fake_archive(self.archives, version="0.1.0", lsp_mode="standalone", extra_marker="v1")
         res = self.run_install("--archive", str(v1))

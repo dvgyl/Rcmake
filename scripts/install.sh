@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--from-source | --archive <path>] [--alias-cmake] [--force]
+Usage: install.sh [--version <v> | --from-source | --archive <path>] [--alias-cmake] [--force]
        install.sh --uninstall
 
 Install rcmake and rcmake-lsp into $PREFIX/bin, the bundled CMake 4.5.1
@@ -12,6 +12,7 @@ data into $PREFIX/share/cmake-4.5, and any bundled shell completions and
 man page under $PREFIX/share. The default PREFIX is $HOME/.local.
 
 Sources (select one, the default is the latest GitHub Release):
+  --version <v>      Download GitHub Release <v>, for example v0.1.0 or 0.1.0.
   --from-source      Build a release archive from this checkout (needs Cargo).
   --archive <path>   Install a local .tar.gz archive. The script checks
                      <path>.sha256 if that file exists.
@@ -35,6 +36,7 @@ die() {
 
 mode=release
 archive=""
+version=""
 alias_cmake=false
 force=false
 uninstall=false
@@ -57,6 +59,14 @@ while [[ $# -gt 0 ]]; do
         mode=source
       fi
       ;;
+    --version)
+      if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+        printf '%s requires a version.\n' "$1" >&2
+        exit 2
+      fi
+      version="$2"
+      shift
+      ;;
     --alias-cmake) alias_cmake=true ;;
     --force) force=true ;;
     --uninstall) uninstall=true ;;
@@ -65,6 +75,18 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if [[ -n "$version" ]]; then
+  if [[ "$mode" != release || "$uninstall" == true ]]; then
+    printf 'Use --version only to download a release.\n' >&2
+    exit 2
+  fi
+  if [[ ! "${version#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$ ]]; then
+    printf 'Invalid version %s. Use a release version such as v0.1.0.\n' "$version" >&2
+    exit 2
+  fi
+  version="${version#v}"
+fi
 
 prefix="${PREFIX:-$HOME/.local}"
 bin_dir="$prefix/bin"
@@ -190,22 +212,34 @@ case "$mode" in
       *) die 'No release archive for this host. Use --from-source in a checkout on Linux or macOS.' ;;
     esac
     releases=https://github.com/dvgyl/rcmake/releases
-    checksum="$work/SHA256SUMS.txt"
-    printf 'Download the latest release checksums.\n'
-    if ! curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 \
-      "$releases/latest/download/SHA256SUMS.txt" -o "$checksum"; then
-      die "Could not download $releases/latest/download/SHA256SUMS.txt. If no release exists yet, clone the repository and run scripts/install.sh --from-source."
+    suffix="-$target.tar.gz"
+    if [[ -n "$version" ]]; then
+      downloads="$releases/download/v$version"
+      expected="rcmake-$version$suffix"
+      printf 'Download the checksums of release v%s.\n' "$version"
+    else
+      downloads="$releases/latest/download"
+      expected=""
+      printf 'Download the latest release checksums.\n'
     fi
-    name="$(awk -v suffix="-$target.tar.gz" '
-      substr($2, length($2) - length(suffix) + 1) == suffix { print $2 }
+    checksum="$work/SHA256SUMS.txt"
+    if ! curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 \
+      "$downloads/SHA256SUMS.txt" -o "$checksum"; then
+      die "Could not download $downloads/SHA256SUMS.txt. Check the version, or clone the repository and run scripts/install.sh --from-source."
+    fi
+    name="$(awk -v suffix="$suffix" -v expected="$expected" '
+      substr($2, length($2) - length(suffix) + 1) == suffix && (expected == "" || $2 == expected) { print $2 }
     ' "$checksum")"
     if [[ ! "$name" =~ ^rcmake-[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?-${target}\.tar\.gz$ ]]; then
+      if [[ -n "$version" ]]; then
+        die "Release v$version has no archive for $target."
+      fi
       die "No unique release archive for $target."
     fi
     archive="$work/$name"
     printf 'Download %s.\n' "$name"
     curl -fSL --retry 3 --connect-timeout 20 --max-time 600 --progress-bar \
-      "$releases/latest/download/$name" -o "$archive"
+      "$downloads/$name" -o "$archive"
     ;;
 esac
 

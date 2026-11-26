@@ -186,6 +186,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - *checkout
       - *python
@@ -219,6 +221,14 @@ jobs:
             printf '%s\n' "$checksum" | diff -u "$archive.sha256" - >&2
             printf '%s\n' "$checksum"
           done | LC_ALL=C sort -k2 > SHA256SUMS.txt
+      # Users check a download with: gh attestation verify <file> --repo dvgyl/rcmake
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v6
         with:
           name: release
