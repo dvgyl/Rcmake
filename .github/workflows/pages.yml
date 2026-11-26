@@ -53,6 +53,7 @@ jobs:
           validate(latest, schema, schema)
           print(f"Validated site assets: wasm={len(wasm)} bytes, schemaVersion={latest['schemaVersion']}")
           PY
+          python3 -m unittest tools/measure/test_site_seo.py
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site

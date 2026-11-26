@@ -3,18 +3,87 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Compatibility · rcmake</title>
-  <meta name="description" content="rcmake compared with CMake 4.5.1 across Tests/RunCMake on three operating systems, large projects, a blind holdout, vcpkg ports, and speed.">
+  <title>rcmake Compatibility Report: CMake 4.5.1 Parity, RunCMake, vcpkg &amp; Benchmarks</title>
+  <meta name="description" content="Differential parity results comparing rcmake against CMake 4.5.1 across 3-OS Tests/RunCMake, 10 large C++ projects, 64 vcpkg shards, 240 unseen repos, and speed.">
+  <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1">
+  <meta name="theme-color" content="#0a0b0d" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#faf9f6" media="(prefers-color-scheme: light)">
   <link rel="canonical" href="https://dvgyl.github.io/rcmake/dashboard.html">
-  <meta property="og:title" content="Compatibility · rcmake">
-  <meta property="og:description" content="rcmake compared with CMake 4.5.1 across Tests/RunCMake on three operating systems, large projects, a blind holdout, vcpkg ports, and speed.">
+  <link rel="alternate" type="text/plain" title="LLMs.txt" href="https://dvgyl.github.io/rcmake/llms.txt">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <meta property="og:site_name" content="rcmake">
   <meta property="og:type" content="website">
+  <meta property="og:title" content="rcmake Compatibility Report: CMake 4.5.1 Parity, RunCMake, vcpkg &amp; Benchmarks">
+  <meta property="og:description" content="Differential parity results comparing rcmake against CMake 4.5.1 across 3-OS Tests/RunCMake, 10 large C++ projects, 64 vcpkg shards, 240 unseen repos, and speed.">
   <meta property="og:url" content="https://dvgyl.github.io/rcmake/dashboard.html">
   <meta property="og:image" content="https://dvgyl.github.io/rcmake/assets/og-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="rcmake: Drop-in CMake 4.5.1 in safe Rust. One binary runs as cmake, ctest, and cpack.">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="rcmake Compatibility Report: CMake 4.5.1 Parity, RunCMake, vcpkg &amp; Benchmarks">
+  <meta name="twitter:description" content="Differential parity results comparing rcmake against CMake 4.5.1 across 3-OS Tests/RunCMake, 10 large C++ projects, 64 vcpkg shards, 240 unseen repos, and speed.">
   <meta name="twitter:image" content="https://dvgyl.github.io/rcmake/assets/og-card.png">
+  <meta name="twitter:image:alt" content="rcmake: Drop-in CMake 4.5.1 in safe Rust. One binary runs as cmake, ctest, and cpack.">
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
   <link rel="stylesheet" href="./styles.css">
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "Dataset",
+          "@id": "https://dvgyl.github.io/rcmake/dashboard.html#dataset",
+          "name": "rcmake CMake 4.5.1 Compatibility and Benchmark Report",
+          "description": "Machine-readable differential compatibility, soundness, and benchmark dataset comparing rcmake 0.1.0 with CMake 4.5.1 across Tests/RunCMake on macOS, Linux, and Windows, 62 core suites, 56 policy suites, 10 large C++ projects, a 240-repository blind holdout, 64 vcpkg shards, seeded generative fuzzing, and WebAssembly/WASI checks.",
+          "url": "https://dvgyl.github.io/rcmake/dashboard.html",
+          "version": "0.1.0",
+          "license": "https://spdx.org/licenses/MIT.html",
+          "isAccessibleForFree": true,
+          "creator": {
+            "@type": "Organization",
+            "name": "rcmake",
+            "url": "https://github.com/dvgyl/rcmake"
+          },
+          "distribution": [
+            {
+              "@type": "DataDownload",
+              "encodingFormat": "application/json",
+              "contentUrl": "https://dvgyl.github.io/rcmake/data/latest.json"
+            }
+          ],
+          "variableMeasured": [
+            "Tests/RunCMake pass rate on macOS arm64 (371 suites), Linux x86_64 (362 suites), and Windows x86_64 (367 suites)",
+            "Core conformance suites (62 suites)",
+            "CMake policies CMP0066-CMP0226 (56 suites)",
+            "Large C++ project L1 configure and L2 Ninja build-graph and File API parity (10 projects)",
+            "Sealed unseen holdout aggregate L2 parity (240 repositories)",
+            "vcpkg port matrix (64 shards)",
+            "Configure wall time and peak RSS compared with CMake 4.5.1",
+            "Seeded generative fuzzing (14 targets) and WebAssembly/WASI checks"
+          ]
+        },
+        {
+          "@type": "BreadcrumbList",
+          "@id": "https://dvgyl.github.io/rcmake/dashboard.html#breadcrumb",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "rcmake",
+              "item": "https://dvgyl.github.io/rcmake/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "Compatibility Report",
+              "item": "https://dvgyl.github.io/rcmake/dashboard.html"
+            }
+          ]
+        }
+      ]
+    }
+  </script>
   <script>
     document.documentElement.classList.add("js");
     try {
@@ -91,6 +160,11 @@
           <p class="report-note" id="report-note"></p>
         </header>
         <nav class="rail-mobile" id="report-rail-mobile" aria-label="Report sections"></nav>
+        <noscript>
+          <div class="noscript-banner">
+            <strong>JavaScript is required to render the interactive charts.</strong> This report tracks <code>rcmake</code> 0.1.0 against CMake 4.5.1 across upstream <code>Tests/RunCMake</code> (371 macOS arm64, 362 Linux x86_64, and 367 Windows x86_64 suites), 62 core suites, 56 policy suites covering <code>CMP0066-CMP0226</code>, 20 independent black-box scenarios (679 checks), 10 large C++ projects (L1 configure and L2 Ninja/File API parity), a 240-repository blind holdout, 64 <code>vcpkg</code> shards, seeded generative fuzzing (14 formats), WebAssembly/WASI checks, probe-cache and mutation-replay soundness gates, and configure speed benchmarks. Inspect the raw dataset in <a href="./data/latest.json">data/latest.json</a> or read <a href="./llms.txt">llms.txt</a>.
+          </div>
+        </noscript>
         <div id="report" data-test="report-body" style="min-height: 1200px;"></div>
       </div>
     </div>
@@ -107,6 +181,7 @@
         <a href="https://github.com/dvgyl/rcmake/tree/main/docs">Docs</a>
         <a href="./index.html">Overview</a>
         <a href="./playground.html">Playground</a>
+        <a href="./llms.txt">LLMs.txt</a>
       </nav>
     </div>
   </footer>
