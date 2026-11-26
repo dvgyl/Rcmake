@@ -54,6 +54,7 @@ mod util;
 #[cfg(test)]
 mod tests;
 
+pub use code::SharedParseCache;
 pub use configure_log::{FindEvent, TryBuildOutcome, TryCompileEvent, TryRunOutcome};
 pub use cx::Cx;
 pub use env::CxEnv;
@@ -510,7 +511,7 @@ pub struct Interp {
     command_end: usize,
     session_data: services::SessionData,
     expanded_observer: Option<services::ExpandedObserver>,
-    parse_cache: Option<code::SharedParseCache>,
+    parse_cache: Option<Arc<SharedParseCache>>,
     /// `--trace-expand` is expanding the arguments of a traced command.
     trace_expanding: bool,
     /// Listfile of each file and function call scope (`LISTFILE_STACK`).

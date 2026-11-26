@@ -487,3 +487,35 @@ fn run_big_stack(main: &'static str) -> Out {
         .join()
         .expect("join")
 }
+
+#[test]
+fn child_interpreters_reuse_the_same_parsed_modules() {
+    use rcmake_diag::source::SourceKind;
+
+    let cache = Arc::new(crate::SharedParseCache::default());
+    let modules: Vec<_> = (0..23).map(|n| format!("set(V{n} value)\n")).collect();
+    let parse_modules = |interp: &mut Interp, child: usize| {
+        modules
+            .iter()
+            .enumerate()
+            .map(|(i, data)| {
+                let path = format!("/work/child{child}/module{i}.cmake");
+                interp
+                    .parse_source(path.as_bytes(), data.as_bytes(), SourceKind::File)
+                    .expect("valid module")
+            })
+            .collect::<Vec<_>>()
+    };
+    let (mut parent, _) = new_interp(&[], RunMode::Configure);
+    parent.set_parse_cache(cache.clone());
+    let original = parse_modules(&mut parent, 0);
+    for n in 1..=80 {
+        let (mut child, _) = new_interp(&[], RunMode::Configure);
+        child.set_parse_cache(cache.clone());
+        let repeated = parse_modules(&mut child, n);
+        for (original, repeated) in original.iter().zip(&repeated) {
+            assert!(Arc::ptr_eq(&original.cmds, &repeated.cmds));
+            assert_ne!(original.file, repeated.file);
+        }
+    }
+}

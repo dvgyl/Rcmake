@@ -116,9 +116,7 @@ impl NativeSession {
         if let Some(probe) = &self.probe {
             interp.add_session_data(Arc::clone(probe));
         }
-        if !interp.has_command_observers() {
-            interp.enable_parse_cache();
-        }
+        interp.set_parse_cache(Arc::default());
         let outcome = if let Some(probe) = self.probe.clone() {
             let services = self.services.clone();
             probe.evaluate(interp, &services, |interp| {

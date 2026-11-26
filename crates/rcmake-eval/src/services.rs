@@ -12,7 +12,7 @@ use rcmake_base::BString;
 use rcmake_diag::SourceId;
 use rcmake_expr::ExpandedArg;
 
-use crate::{Cx, Interp};
+use crate::{Cx, Interp, SharedParseCache};
 
 pub(crate) struct ExpandedObserver {
     pub(crate) names: &'static [&'static [u8]],
@@ -47,10 +47,23 @@ impl Interp {
         self.parse_cache.get_or_insert_with(Default::default);
     }
 
+    /// Share parsed listfiles with other interpreters in this configure session.
+    pub fn set_parse_cache(&mut self, cache: Arc<SharedParseCache>) {
+        self.parse_cache = Some(cache);
+    }
+
     /// Return whether tracing or command profiling is active.
     #[must_use]
     pub fn has_command_observers(&self) -> bool {
         self.trace.is_some() || self.command_profiler.is_some()
+    }
+}
+
+impl Cx<'_> {
+    /// Get the cache for parsed listfiles in this configure session.
+    #[must_use]
+    pub fn parse_cache(&self) -> Option<&Arc<SharedParseCache>> {
+        self.interp.parse_cache.as_ref()
     }
 }
 

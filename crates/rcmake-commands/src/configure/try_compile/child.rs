@@ -25,6 +25,7 @@ pub(super) struct ChildConfig {
     depth: u32,
     trace: Option<TraceConfig>,
     profile: Option<Arc<CommandProfiler>>,
+    parse_cache: Option<Arc<rcmake_eval::SharedParseCache>>,
 }
 
 impl ChildConfig {
@@ -56,6 +57,7 @@ impl ChildConfig {
             depth,
             trace,
             profile,
+            parse_cache: cx.parse_cache().cloned(),
         }
     }
 
@@ -121,6 +123,9 @@ impl ChildConfig {
             config.host = host.clone();
             let mut child = Interp::new(config, crate::register_all);
             initialize(&mut child);
+            if let Some(cache) = self.parse_cache {
+                child.set_parse_cache(cache);
+            }
             if let Some(profile) = &profile {
                 child.add_session_data(profile.clone());
             }

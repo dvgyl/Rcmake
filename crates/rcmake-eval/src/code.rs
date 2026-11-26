@@ -59,7 +59,7 @@ type ParseKey = (JournalDigest, LimitsKey);
 
 /// A bounded cache of parsed listfiles. Each result is independent of its path.
 #[derive(Default)]
-pub(crate) struct SharedParseCache(Mutex<ParseTable>);
+pub struct SharedParseCache(Mutex<ParseTable>);
 
 #[derive(Default)]
 struct ParseTable {
