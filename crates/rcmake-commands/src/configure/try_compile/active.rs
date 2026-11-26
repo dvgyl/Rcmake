@@ -149,15 +149,12 @@ impl rcmake_resolve::GeneratorFacts for ProbeGeneratorFacts {
         let result = self.facts.ninja_cxx_dyndep(
             self.real.as_ref(),
             &request,
-            program.clone(),
+            program,
             digest,
             process_environment_fingerprint(&request.env),
         );
         if let Some(journal) = &self.journal
-            && (result.is_none()
-                || journal
-                    .record_generator_dependency(&program, digest)
-                    .is_err())
+            && result.is_none()
         {
             journal.reject_generator_fact();
         }
@@ -281,7 +278,7 @@ impl PreparedProbe {
             return None;
         }
         let compiler = compiler::ProbeCompiler::select(
-            Arc::clone(&runtime.host),
+            Arc::clone(&runtime.journal_host),
             cx,
             &runtime.compiler,
             &name,

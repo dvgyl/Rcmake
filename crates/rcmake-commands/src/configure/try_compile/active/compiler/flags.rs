@@ -273,6 +273,7 @@ fn codegen_flag(flag: &[u8]) -> bool {
         || !name.iter().all(codegen_byte)
         || parts.next().is_some_and(|value| {
             value.is_empty()
+                || value.starts_with(b"-")
                 || value
                     .split(|&byte| byte == b'+')
                     .any(|part| part == b"native")
@@ -288,11 +289,14 @@ fn codegen_flag(flag: &[u8]) -> bool {
         b"auto-profile",
         b"build-session",
         b"cas",
+        b"compare-debug",
         b"config",
         b"coverage",
         b"crash-diagnostics",
+        b"cs-profile",
         b"debug",
         b"dependency",
+        b"depscan",
         b"diagnostics-",
         b"dump",
         b"embed-bitcode",
@@ -304,6 +308,7 @@ fn codegen_flag(flag: &[u8]) -> bool {
         b"lto",
         b"load",
         b"macro-prefix-map",
+        b"memory-profile",
         b"module",
         b"objc",
         b"offload",
@@ -321,10 +326,13 @@ fn codegen_flag(flag: &[u8]) -> bool {
         b"save-",
         b"split-dwarf",
         b"suite",
+        b"sycl",
         b"system-",
+        b"temporal-profile",
+        b"test-coverage",
         b"thinlto",
         b"unwindlib",
-        b"use-ld",
+        b"use-",
         b"xray",
     ];
     !matches!(
@@ -387,6 +395,17 @@ mod codegen_tests {
             "-fprofile-arcs",
             "-fsanitize=address",
             "-fcodegen-data-use=data",
+            "-fvisibility=-hidden",
+            "-fcompare-debug",
+            "-fcompare-debug=-fdump-tree-all",
+            "-fuse-lipo",
+            "-fuse-linker-plugin",
+            "-fsycl",
+            "-fdepscan",
+            "-fcs-profile-generate",
+            "-fmemory-profile",
+            "-ftemporal-profile",
+            "-ftest-coverage",
         ] {
             assert!(!pure_flag(flag.as_bytes()), "{flag}");
         }

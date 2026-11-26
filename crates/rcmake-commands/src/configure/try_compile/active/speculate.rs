@@ -146,7 +146,7 @@ impl PreparedProbe {
                 continue;
             };
             let Some(compiler) = compiler::ProbeCompiler::select(
-                Arc::clone(&self.runtime.host),
+                Arc::clone(&self.runtime.journal_host),
                 cx,
                 &self.runtime.compiler,
                 &name,
