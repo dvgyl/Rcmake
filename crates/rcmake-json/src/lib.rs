@@ -16,7 +16,7 @@ mod read;
 mod write;
 
 pub use read::parse;
-pub use write::{write_compact, write_string, write_styled};
+pub use write::{write_compact, write_pretty_utf8, write_string, write_styled};
 
 /// A JSON value following `jsoncpp`'s type distinctions (including signed vs unsigned
 /// integers and sorted object keys).

@@ -22,6 +22,17 @@ pub fn write_styled(v: &Value, indent: &str) -> BString {
     write(v, indent.as_bytes())
 }
 
+/// Serialize a JSON value with two-space indentation, `": "` separators, sorted object keys,
+/// and raw UTF-8 strings, matching `serde_json::to_string_pretty`.
+///
+/// Empty arrays and objects serialize as `[]` and `{}`. The result ends at the last JSON token.
+#[must_use]
+pub fn write_pretty_utf8(v: &Value) -> BString {
+    let mut writer = PrettyWriter { out: Vec::new() };
+    writer.value(v, 0);
+    BString::from(writer.out)
+}
+
 fn write(value: &Value, indent: &[u8]) -> BString {
     let mut writer = Writer {
         out: Vec::new(),
@@ -235,4 +246,133 @@ fn read_utf8_point(first: u8, bytes: &mut &[u8]) -> u32 {
     } else {
         point
     }
+}
+
+struct PrettyWriter {
+    out: Vec<u8>,
+}
+
+impl PrettyWriter {
+    fn value(&mut self, value: &Value, depth: usize) {
+        match value {
+            Value::Null => self.out.extend_from_slice(b"null"),
+            Value::Bool(true) => self.out.extend_from_slice(b"true"),
+            Value::Bool(false) => self.out.extend_from_slice(b"false"),
+            Value::Int(n) => {
+                let _ = write!(self.out, "{n}");
+            }
+            Value::UInt(n) => {
+                let _ = write!(self.out, "{n}");
+            }
+            Value::Real(n) => write_pretty_real(*n, &mut self.out),
+            Value::String(s) => write_string_utf8(&mut self.out, s.as_slice()),
+            Value::Array(items) if items.is_empty() => self.out.extend_from_slice(b"[]"),
+            Value::Array(items) => self.array(items, depth),
+            Value::Object(members) if members.is_empty() => self.out.extend_from_slice(b"{}"),
+            Value::Object(members) => self.object(members, depth),
+        }
+    }
+
+    fn array(&mut self, items: &[Value], depth: usize) {
+        self.out.push(b'[');
+        for (index, item) in items.iter().enumerate() {
+            if index != 0 {
+                self.out.push(b',');
+            }
+            self.newline(depth + 1);
+            self.value(item, depth + 1);
+        }
+        self.newline(depth);
+        self.out.push(b']');
+    }
+
+    fn object(&mut self, members: &BTreeMap<BString, Value>, depth: usize) {
+        self.out.push(b'{');
+        for (index, (key, value)) in members.iter().enumerate() {
+            if index != 0 {
+                self.out.push(b',');
+            }
+            self.newline(depth + 1);
+            write_string_utf8(&mut self.out, key.as_slice());
+            self.out.extend_from_slice(b": ");
+            self.value(value, depth + 1);
+        }
+        self.newline(depth);
+        self.out.push(b'}');
+    }
+
+    fn newline(&mut self, depth: usize) {
+        self.out.push(b'\n');
+        self.out
+            .resize(self.out.len() + depth.saturating_mul(2), b' ');
+    }
+}
+
+fn write_pretty_real(number: f64, out: &mut Vec<u8>) {
+    if !number.is_finite() {
+        out.extend_from_slice(b"null");
+        return;
+    }
+    let scientific = format!("{number:e}");
+    let Some((signed_mantissa, exponent)) = scientific.rsplit_once('e') else {
+        out.extend_from_slice(scientific.as_bytes());
+        return;
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        out.extend_from_slice(scientific.as_bytes());
+        return;
+    };
+    let decimal_pos = exponent + 1;
+    if !(-4..=16).contains(&decimal_pos) {
+        out.extend_from_slice(scientific.as_bytes());
+        return;
+    }
+    let mantissa = if let Some(rest) = signed_mantissa.strip_prefix('-') {
+        out.push(b'-');
+        rest
+    } else {
+        signed_mantissa
+    };
+    let digits: Vec<u8> = mantissa.bytes().filter(|&b| b != b'.').collect();
+    if decimal_pos <= 0 {
+        out.extend_from_slice(b"0.");
+        out.resize(out.len() + decimal_pos.unsigned_abs() as usize, b'0');
+        out.extend_from_slice(&digits);
+    } else {
+        let whole = decimal_pos as usize;
+        if let Some((head, tail)) = digits.split_at_checked(whole)
+            && !tail.is_empty()
+        {
+            out.extend_from_slice(head);
+            out.push(b'.');
+            out.extend_from_slice(tail);
+        } else {
+            out.extend_from_slice(&digits);
+            out.resize(out.len() + whole.saturating_sub(digits.len()), b'0');
+            out.extend_from_slice(b".0");
+        }
+    }
+}
+
+fn write_string_utf8(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(b'"');
+    for chunk in bytes.utf8_chunks() {
+        for &byte in chunk.valid().as_bytes() {
+            match byte {
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                0x08 => out.extend_from_slice(b"\\b"),
+                0x0c => out.extend_from_slice(b"\\f"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                0x00..=0x1f => write_hex(u32::from(byte), out),
+                _ => out.push(byte),
+            }
+        }
+        if !chunk.invalid().is_empty() {
+            out.extend_from_slice("\u{fffd}".as_bytes());
+        }
+    }
+    out.push(b'"');
 }

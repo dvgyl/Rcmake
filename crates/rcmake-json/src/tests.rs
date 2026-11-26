@@ -327,3 +327,230 @@ fn appends_string_with_jsoncpp_escapes() {
     crate::write_string(&mut out, b"\"\\\0\n\x7f\xc3\xa9");
     assert_eq!(out, b"prefix \"\\\"\\\\\\u0000\\n\x7f\\u00e9\"");
 }
+
+#[test]
+fn pretty_utf8_matches_serde_json_lockfile_golden() {
+    let empty_lock =
+        Value::object_from([("version", Value::UInt(1)), ("entries", Value::object())]);
+    let expected_empty = "{\n  \"entries\": {},\n  \"version\": 1\n}";
+    assert_eq!(
+        write_pretty_utf8(&empty_lock).as_slice(),
+        expected_empty.as_bytes()
+    );
+
+    let lock = Value::object_from([
+        ("version", Value::UInt(1)),
+        (
+            "entries",
+            Value::object_from([
+                (
+                    "fmt",
+                    Value::object_from([
+                        ("kind", Value::string("url")),
+                        (
+                            "urls",
+                            Value::array_from([
+                                Value::string("https://example.invalid/café/fmt-11.tar.gz"),
+                                Value::string(r"C:\SDK\fmt-11.tar.gz"),
+                            ]),
+                        ),
+                        (
+                            "sha256",
+                            Value::string(
+                                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                            ),
+                        ),
+                        ("size", Value::UInt(4096)),
+                    ]),
+                ),
+                (
+                    "alpha",
+                    Value::object_from([
+                        ("kind", Value::string("git")),
+                        (
+                            "repository",
+                            Value::string("https://example.invalid/repo/水.git"),
+                        ),
+                        ("tag", Value::string("v1.0.0")),
+                        (
+                            "commit",
+                            Value::string("40626af88bd7df9a5fb80be7b25ac85b122d6c21"),
+                        ),
+                    ]),
+                ),
+                (
+                    "pinned",
+                    Value::object_from([
+                        ("kind", Value::string("git")),
+                        (
+                            "repository",
+                            Value::string("https://example.invalid/pinned.git"),
+                        ),
+                        (
+                            "commit",
+                            Value::string("0123456789abcdef0123456789abcdef01234567"),
+                        ),
+                    ]),
+                ),
+            ]),
+        ),
+    ]);
+
+    let expected = [
+        "{",
+        "  \"entries\": {",
+        "    \"alpha\": {",
+        "      \"commit\": \"40626af88bd7df9a5fb80be7b25ac85b122d6c21\",",
+        "      \"kind\": \"git\",",
+        "      \"repository\": \"https://example.invalid/repo/水.git\",",
+        "      \"tag\": \"v1.0.0\"",
+        "    },",
+        "    \"fmt\": {",
+        "      \"kind\": \"url\",",
+        "      \"sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",",
+        "      \"size\": 4096,",
+        "      \"urls\": [",
+        "        \"https://example.invalid/café/fmt-11.tar.gz\",",
+        "        \"C:\\\\SDK\\\\fmt-11.tar.gz\"",
+        "      ]",
+        "    },",
+        "    \"pinned\": {",
+        "      \"commit\": \"0123456789abcdef0123456789abcdef01234567\",",
+        "      \"kind\": \"git\",",
+        "      \"repository\": \"https://example.invalid/pinned.git\"",
+        "    }",
+        "  },",
+        "  \"version\": 1",
+        "}",
+    ]
+    .join("\n");
+
+    let pretty = write_pretty_utf8(&lock);
+    assert_eq!(pretty.as_slice(), expected.as_bytes());
+
+    let strict = ReadOptions {
+        allow_comments: false,
+        dup_keys_last_wins: true,
+    };
+    let parsed = parse(pretty.as_slice(), &strict).expect("valid strict JSON");
+    assert_eq!(write_pretty_utf8(&parsed), pretty);
+}
+
+#[test]
+fn pretty_utf8_escapes_control_chars_and_preserves_utf8() {
+    for byte in 0x00_u8..=0x1f {
+        let expected = match byte {
+            0x08 => r#""\b""#.to_owned(),
+            0x09 => r#""\t""#.to_owned(),
+            0x0a => r#""\n""#.to_owned(),
+            0x0c => r#""\f""#.to_owned(),
+            0x0d => r#""\r""#.to_owned(),
+            _ => format!(r#""\u{byte:04x}""#),
+        };
+        assert_eq!(
+            write_pretty_utf8(&Value::string([byte].as_slice())).as_slice(),
+            expected.as_bytes(),
+            "control byte 0x{byte:02x}"
+        );
+    }
+
+    let value = Value::object_from([
+        (
+            "clé",
+            Value::string("\"\\/\x08\x0c\n\r\t\x00\x0b\x1f\x7fé水😃"),
+        ),
+        ("raw", Value::string(b"a\xffb".as_slice())),
+    ]);
+    let expected = "{\n  \"clé\": \"\\\"\\\\/\\b\\f\\n\\r\\t\\u0000\\u000b\\u001f\x7fé水😃\",\n  \"raw\": \"a\u{fffd}b\"\n}";
+    assert_eq!(write_pretty_utf8(&value).as_slice(), expected.as_bytes());
+}
+
+#[test]
+fn pretty_utf8_formats_containers_and_numbers() {
+    assert_eq!(write_pretty_utf8(&Value::Null).as_slice(), b"null");
+    assert_eq!(write_pretty_utf8(&Value::Bool(true)).as_slice(), b"true");
+    assert_eq!(write_pretty_utf8(&Value::Bool(false)).as_slice(), b"false");
+    assert_eq!(
+        write_pretty_utf8(&Value::Int(i64::MIN)).as_slice(),
+        b"-9223372036854775808"
+    );
+    assert_eq!(
+        write_pretty_utf8(&Value::UInt(u64::MAX)).as_slice(),
+        b"18446744073709551615"
+    );
+    assert_eq!(write_pretty_utf8(&Value::Array(vec![])).as_slice(), b"[]");
+    assert_eq!(write_pretty_utf8(&Value::object()).as_slice(), b"{}");
+
+    let nested = Value::array_from([
+        Value::array_from([Value::Int(1), Value::Int(2)]),
+        Value::Array(vec![]),
+        Value::array_from([Value::object()]),
+        Value::array_from([Value::object_from([
+            ("empty_arr", Value::Array(vec![])),
+            ("empty_obj", Value::object()),
+            ("num", Value::Int(1)),
+        ])]),
+    ]);
+    let expected_nested = [
+        "[",
+        "  [",
+        "    1,",
+        "    2",
+        "  ],",
+        "  [],",
+        "  [",
+        "    {}",
+        "  ],",
+        "  [",
+        "    {",
+        "      \"empty_arr\": [],",
+        "      \"empty_obj\": {},",
+        "      \"num\": 1",
+        "    }",
+        "  ]",
+        "]",
+    ]
+    .join("\n");
+    assert_eq!(
+        write_pretty_utf8(&nested).as_slice(),
+        expected_nested.as_bytes()
+    );
+
+    let reals = Value::array_from([
+        Value::Real(0.0),
+        Value::Real(-0.0),
+        Value::Real(1.0),
+        Value::Real(0.1),
+        Value::Real(12.5),
+        Value::Real(100.0),
+        Value::Real(1e-5),
+        Value::Real(1e-6),
+        Value::Real(1e15),
+        Value::Real(1e16),
+        Value::Real(f64::NAN),
+        Value::Real(f64::INFINITY),
+        Value::Real(f64::NEG_INFINITY),
+    ]);
+    let expected_reals = [
+        "[",
+        "  0.0,",
+        "  -0.0,",
+        "  1.0,",
+        "  0.1,",
+        "  12.5,",
+        "  100.0,",
+        "  0.00001,",
+        "  1e-6,",
+        "  1000000000000000.0,",
+        "  1e16,",
+        "  null,",
+        "  null,",
+        "  null",
+        "]",
+    ]
+    .join("\n");
+    assert_eq!(
+        write_pretty_utf8(&reals).as_slice(),
+        expected_reals.as_bytes()
+    );
+}
