@@ -88,7 +88,7 @@ The "Depends on" column lists only workspace crates. All crates except
 | Crate | Responsibility | Depends on |
 | --- | --- | --- |
 | `rcmake-syntax` | Lexer and parser for CMake listfiles. Keeps the raw bytes, argument kinds, and spans. Checks block nesting before execution. | `base`, `diag` |
-| `rcmake-regex` | Clean-room byte regular expression engine with the CMake (KWSys) dialect, `CMAKE_MATCH_<n>`, and a glob converter | `base` |
+| `rcmake-regex` | Independent byte regular expression engine with the CMake (KWSys) dialect, `CMAKE_MATCH_<n>`, and a glob converter | `base` |
 | `rcmake-expr` | Variable expansion (`${}`, `$ENV{}`, `$CACHE{}`), escape decoding, the `if()` and `while()` condition evaluator, and the `configure_file` expander | `base`, `diag`, `host`, `regex`, `syntax` |
 | `rcmake-genex` | Generator expression parser, evaluator, `GenexHost` trait, and preprocess helpers such as `string(GENEX_STRIP)` | `base`, `diag`, `regex` |
 
@@ -106,7 +106,7 @@ The "Depends on" column lists only workspace crates. All crates except
 | Crate | Responsibility | Depends on |
 | --- | --- | --- |
 | `rcmake-resolve` | Per-configuration target resolution, transitive usage requirements, link lines, IDE facts, and lowering to `BuildGraph`. Includes CUDA, Fortran, Qt `AUTOGEN`, precompiled header, unity build, and install runtime path rules. | `base`, `cxxmodules`, `diag`, `fortran`, `genex`, `host`, `json`, `model` |
-| `rcmake-build` | In-process executor for a `BuildGraph`. Runs `try_compile()` and the `cmake --build` fallback without a generator. | `base`, `cxxmodules`, `diag`, `host`, `resolve` |
+| `rcmake-build` | In-process executor for a `BuildGraph`. Runs `try_compile()` and the `cmake --build` fallback without a generator. Probes do not run Ninja, Make, MSBuild, or xcodebuild, so MSBuild-only and Xcode-only settings have no effect on them. | `base`, `cxxmodules`, `diag`, `host`, `resolve` |
 | `rcmake-cxxmodules` | C++20 named modules: P1689r5 dependency files, `CXXDependInfo.json`, `CXXModules.json`, Ninja `dyndep` files, and compiler module maps | `base`, `json` |
 | `rcmake-fortran` | Fortran source scanning and module dependency collation, with no I/O | `base` |
 
@@ -236,10 +236,10 @@ same numbers.
 | --- | --- | --- |
 | 1. Unit and integration tests | `cargo test --workspace` on `PureHost` and `NativeHost` | All tests pass on Linux, macOS, and Windows |
 | 2. Recorded CLI and script cases | `cmake -P`, `cmake -E`, CLI flags, `configure_file`, diagnostics, SARIF, presets | Byte-for-byte stdout, stderr, generated files, and exit code after path normalization |
-| 3. Upstream `Tests/RunCMake` | The CMake 4.5.1 conformance suite: scripts, policies, diagnostics, targets, generator expressions, presets, File API | Same pass or fail result and same diagnostic matches |
+| 3. Upstream `Tests/RunCMake` | The CMake 4.5.1 conformance suite: scripts, policies, diagnostics, targets, generator expressions, presets, File API. `runcmake_eval.py` lists the excluded suites and the reason for each. | Same pass or fail result and same diagnostic matches |
 | 4. Independent black-box suite | Small C, C++, Objective-C++, Fortran, and presets projects that both tools build, install, test, and package | All explicit checks pass for both tools, and normalized observations match |
-| 5. Large C++ projects | 10 unmodified open-source projects | L1: configure succeeds with the same stderr. L2: the same `CMakeCache.txt`, Ninja commands, graph edges, and File API replies. |
-| 6. Fuzzing and ecosystem lanes | 14 fuzz targets, `vcpkg`, Conan, and Qt 6 | No panics or resource exhaustion, and package-manager builds match |
+| 5. Large C++ projects | 10 open-source projects at pinned tags, with the reduced option sets in `large_projects.toml` | L1: configure succeeds with the same stderr. L2: the same `CMakeCache.txt`, Ninja commands, graph edges, and File API replies for the listed targets. |
+| 6. Fuzzing and ecosystem lanes | Seeded generative fuzzing (not coverage-guided) of 14 targets, `vcpkg`, Conan, and Qt 6 | No panics or resource exhaustion, and package-manager builds match |
 | 7. Sealed unseen holdout | 240 repositories that no one opened during development | L2 parity on the frozen release binary |
 
 For IDE generators, `rcmake` compares canonical forms, not raw bytes. CMake
@@ -255,9 +255,10 @@ MSBuild to build. `tools/measure/pbxproj_canon.py` and
 | `tools/measure/runcmake_eval.py` | Layer 3. Runs upstream `Tests/RunCMake` suites with the staged binary. |
 | `tools/measure/independent_verify.py` | Layer 4. Black-box scenarios that build small C, C++, Objective-C++, Fortran, and presets projects with both tools. |
 | `tools/measure/corpus_eval.py`, `tools/corpus/` | Layers 5 and 7. Real projects from `conformance/corpus/`, with PATH replacement and Ninja command comparison. |
-| `tools/measure/bench_eval.py` | Median and p95 wall time and peak memory for `rcmake` and the oracle. |
+| `tools/measure/bench_eval.py` | Median and p95 wall time and peak memory for `rcmake` and the oracle. Each tool has a private probe store, and a cold run starts with an empty store. |
+| `tools/measure/bench_configure.py`, `tools/measure/bench_giants.py` | New build tree with a shared probe cache, leaf edit reconfigure, and large-project configure times. Each report records the host hardware. |
 | `tools/measure/determinism.py` | Checks that two build directories get the same generated files. |
-| `rcmake-fuzz` | Layer 6. Random and adversarial input with a time budget for each case. Each failure can be replayed from its seed. |
+| `rcmake-fuzz` | Layer 6. Seeded generative input (not coverage-guided) with a time budget for each case. Input *i* uses seed + *i*, so each failure can be replayed from its seed. |
 
 ### Unit tests
 

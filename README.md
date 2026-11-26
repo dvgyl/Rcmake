@@ -16,7 +16,9 @@
 
 # rcmake
 
-`rcmake` is a clean-room replacement for CMake 4.5.1, written in safe Rust (`#![forbid(unsafe_code)]`, 35 crates). One binary provides `cmake`, `ctest`, and `cpack`. It reads the same `CMakeLists.txt` files, presets, and cache files as CMake 4.5.1 and writes compatible build trees.
+`rcmake` is an independent reimplementation of CMake 4.5.1 in Rust. No CMake C++ source is copied or translated. One binary provides `cmake`, `ctest`, and `cpack`. It reads the same `CMakeLists.txt` files, presets, and cache files as CMake 4.5.1 and writes compatible build trees.
+
+All 35 `rcmake` crates have `#![forbid(unsafe_code)]`. Some dependencies, such as `rustix` and `memchr`, use `unsafe`. The binary also statically links two C codecs: zstd 1.5.7 and liblzma 5.8.
 
 A second binary, `rcmake-lsp`, is a language server for CMake files.
 
@@ -58,9 +60,9 @@ To make `rcmake` your `cmake`, `ctest`, and `cpack`, see [Use rcmake as a drop-i
 | Check | Result |
 | --- | --- |
 | 3-OS CI (`ubuntu-24.04`, `macos-15`, `windows-2025`) and corpus smoke (6 jobs) | <!-- METRIC:ci_jobs -->pending frozen release run<!-- /METRIC --> (pre-freeze baseline: 6 of 6 green) |
-| Upstream `Tests/RunCMake`, macOS arm64 (371 suites) | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Linux (362 suites) | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Windows (367 suites) | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, macOS arm64 (371 of 463 suites run) | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Linux (362 of 463 suites run) | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Windows (367 of 463 suites run) | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
 | Independent black-box differential suite (20 scenarios, 679 checks) | <!-- METRIC:independent_scenarios -->pending frozen release run<!-- /METRIC --> |
 | Large C++ projects, L1 configure parity (10 projects) | <!-- METRIC:large_projects_l1 -->pending frozen release run<!-- /METRIC --> |
 | Large C++ projects, L2 Ninja build-graph and File API parity (10 projects) | <!-- METRIC:large_projects_l2 -->pending frozen release run<!-- /METRIC --> |
@@ -68,13 +70,23 @@ To make `rcmake` your `cmake`, `ctest`, and `cpack`, see [Use rcmake as a drop-i
 | Conan and ecosystem fixtures | <!-- METRIC:conan_ecosystem -->pending frozen release run<!-- /METRIC --> |
 | Silent `PATH` swap verification | <!-- METRIC:path_swap_eval -->pending frozen release run<!-- /METRIC --> |
 | Sealed unseen holdout (240 repositories, L2 dry-run parity) | <!-- METRIC:unseen_holdout -->pending frozen release run<!-- /METRIC --> |
-| Cold 500-target configure speedup over CMake 4.5.1 | <!-- METRIC:bench_cold_configure -->pending frozen release run<!-- /METRIC --> |
-| Warm probe-cache configure speedup over CMake 4.5.1 | <!-- METRIC:bench_warm_probe -->pending frozen release run<!-- /METRIC --> |
-| Incremental leaf reconfigure (p95 wall time) | <!-- METRIC:bench_incremental_leaf_p95 -->pending frozen release run<!-- /METRIC --> |
-| Adversarial fuzzing (14 targets, 1,000,000 inputs each) | <!-- METRIC:fuzz_failures -->pending frozen release run<!-- /METRIC --> (pre-freeze baseline: 14,000,000 inputs, 0 failures) |
+| Cold configure speedup over CMake 4.5.1 (synthetic C project with 500 static libraries, new build tree, empty probe cache, median of N runs) | <!-- METRIC:bench_cold_configure -->pending frozen release run<!-- /METRIC --> |
+| New build tree speedup over CMake 4.5.1 (`rcmake` with its shared probe cache, CMake with no cache, geometric mean across the listed projects) | <!-- METRIC:bench_warm_probe -->pending frozen release run<!-- /METRIC --> |
+| Leaf edit reconfigure (p95 wall time of N runs, which is the slowest run when N is below 20) | <!-- METRIC:bench_incremental_leaf_p95 -->pending frozen release run<!-- /METRIC --> |
+| Seeded generative fuzzing, not coverage-guided (14 targets, 1,000,000 inputs each) | <!-- METRIC:fuzz_failures -->pending frozen release run<!-- /METRIC --> (pre-freeze baseline: 14,000,000 inputs, 0 failures) |
 | WebAssembly and WASI checks (`wasm32-unknown-unknown` and `wasm32-wasip1`) | <!-- METRIC:wasm_smoke -->pending frozen release run<!-- /METRIC --> (pre-freeze baseline: 6 of 6 passed) |
 
-L1 parity means that configure succeeds and writes the same standard error as CMake 4.5.1. L2 parity also compares `CMakeCache.txt`, the Ninja commands and graph edges, and the File API replies.
+L1 parity means that configure succeeds and writes the same standard error as CMake 4.5.1. L2 parity also compares `CMakeCache.txt`, the Ninja commands and graph edges, and the File API replies for the targets that `large_projects.toml` lists.
+
+The RunCMake counts are the suites that run on each OS. `tools/measure/runcmake_eval.py` lists each excluded suite and its reason in `LINUX_ONLY`, `WINDOWS_ONLY`, `POSIX_ONLY`, and `EXTERNAL_SUITES`. Some exclusions come from the test setup, not from the OS. Examples are `CUDA_architectures`, `Swift`, `Autogen_2` to `Autogen_7`, and `FindOpenSSL`. The runs also set `CMake_TEST_Qt5=OFF`, `CMake_TEST_Qt6=OFF`, and `CMAKE_Fortran_COMPILER=NOTFOUND`. Fortran and Qt get their tests from the independent suite, `qtbase`, `kcoreaddons`, and the ecosystem lane.
+
+How the benchmarks are measured:
+
+- The cold row comes from `tools/measure/bench_eval.py`. Each run starts with a new build tree and an empty private probe store. The harness removes inherited `RCMAKE_*` settings.
+- By default, `rcmake` runs up to four probes at the same time (`RCMAKE_PROBE_JOBS`). CMake runs them one at a time. `bench_eval.py --probe-jobs 1` measures `rcmake` with serial probes.
+- The new build tree row comes from `tools/measure/bench_configure.py` and `tools/measure/bench_giants.py`. CMake has no cache across build trees. A CMake rerun in the same build tree also skips its checks, so the `bench_eval.py` report also gives same-tree rerun times.
+- The default leaf edit does not change any target. `--leaf-edit compile-definition` adds a compile definition to the edited directory.
+- Each report records N, the generator, the host CPU, memory, OS version, and power source. The operating system keeps its file cache across runs.
 
 Known gaps from the frozen release run: <!-- METRIC:known_parity_gaps -->pending frozen release run<!-- /METRIC -->. Report any other difference from CMake 4.5.1 with the [parity bug form](https://github.com/dvgyl/rcmake/issues/new?template=bug_report.yml).
 
@@ -98,7 +110,7 @@ Known gaps from the frozen release run: <!-- METRIC:known_parity_gaps -->pending
 - C and C++, including C++20 and C++23 named modules with Ninja `dyndep`
 - Objective-C and Objective-C++
 - Assembly: `ASM`, `ASM_MASM`, and `ASM_NASM`
-- CUDA and HIP
+- CUDA (one end-to-end fixture in the ecosystem lane) and HIP (rule wiring only, no toolchain test yet)
 - Fortran, with module dependency scanning
 - Windows resource files (`RC`)
 - Qt `AUTOMOC`, `AUTOUIC`, and `AUTORCC`
@@ -106,7 +118,7 @@ Known gaps from the frozen release run: <!-- METRIC:known_parity_gaps -->pending
 
 ### CMake 4.5.1 interfaces
 
-- Policies `CMP0000` to `CMP0226` (OLD behavior is removed for `CMP0000` to `CMP0065`, as in CMake 4.x)
+- Policies `CMP0000` to `CMP0226` (OLD behavior is removed for `CMP0000` to `CMP0065`, as in CMake 4.x). `CMP0066` to `CMP0226` are the 161 policies that a project can still set to OLD. The 56 upstream `RunCMake` policy suites test policies in this range, and other suites test more policies indirectly.
 - CMake Presets, schema version 13
 - File API: `codemodel` v2.12, `cache` v2, `toolchains` v1, `cmakeFiles` v1, and `configureLog` v1
 - Common Package Specification (CPS) 0.15.0, read and write
@@ -119,13 +131,14 @@ Known gaps from the frozen release run: <!-- METRIC:known_parity_gaps -->pending
 
 The extensions work only when the executable name is `rcmake`. See [Usage](#usage) for the two modes.
 
-- **Persistent compiler probe cache.** Reuses verified compiler check results across build directories and projects. Before a reuse, `rcmake` checks the recorded host inputs.
-- **Incremental configure replay.** Replays unchanged directory subtrees from the previous configure after it verifies their inputs.
+- **Persistent compiler probe cache.** Reuses verified compiler check results across build directories and projects. Before a reuse, `rcmake` checks the recorded host inputs. In CI and release builds, set `RCMAKE_PROBE_CACHE=verify` to compare each hit with a fresh probe.
+- **Parallel compiler probes.** By default, up to four probes run at the same time (`RCMAKE_PROBE_JOBS`). Speculative probes run only compile checks (`check_include_file`, `check_c_compiler_flag`, `check_cxx_compiler_flag`, `check_symbol_exists`, and `try_compile`), never `try_run` or `execute_process`. The real call uses a speculative result only when it computes the same probe key.
+- **Incremental configure replay.** Replays unchanged directory subtrees from the previous configure. A region replays only when its entry context and its recorded inputs match. Its recorded variable, cache, and property changes are applied again in the original order. Replay is off when a toolchain file, a configure preset, `-C`, or `PreLoad.cmake` is in use. This includes the `vcpkg` toolchain integration.
 - **`rcmake explain <NAME>`.** Shows where a target gets its build flags or where a variable gets its value, as terminal text or `--json`.
 - **`--profile[=<dir>]`.** Writes `trace.json`, `stacks.folded`, and `flamegraph.html` for a configure run. The default `<dir>` is `rcmake-profile` in the build directory.
 - **`--diagnostics=rich`.** Shows source spans and annotations in a terminal.
 - **`--hermetic[=warn|strict]`.** Audits environment reads, file reads, subprocesses, and network access during configure.
-- **`--fetch-lock=off|auto|update|frozen`.** Controls FetchContent lockfile verification and pinned reuse.
+- **`--fetch-lock=off|auto|update|frozen`.** Controls FetchContent lockfile verification and pinned reuse. Prefetch can start a FetchContent download before the script populates it. It does this only for a `FetchContent_Declare()` that already ran, with an archive hash or a full Git commit ID. Compatibility mode never prefetches.
 - **In-process and WebAssembly API.** [`rcmake-api`](crates/rcmake-api/README.md) runs configure inside your program. It compiles for `wasm32-unknown-unknown` and `wasm32-wasip1`.
 
 [`docs/ENV_VARS.md`](docs/ENV_VARS.md) lists all environment variables.
@@ -141,7 +154,9 @@ GitHub Releases has archives for these targets:
 - `aarch64-unknown-linux-gnu`
 - `x86_64-pc-windows-msvc`
 
-`scripts/install.sh` downloads the latest release and verifies its SHA-256 checksum. It installs `bin/rcmake`, `bin/rcmake-lsp`, `share/cmake-4.5`, and the bundled shell completions and `rcmake(1)` man page into `$HOME/.local`, or into `$PREFIX` if you set it. The script needs `bash`, `python3`, and `curl`.
+There is no `x86_64-apple-darwin` archive. On an Intel Mac, use `--from-source`.
+
+`scripts/install.sh` downloads the latest release, or the release that `--version` selects. It checks the SHA-256 sum from the same release to find damaged downloads. It installs `bin/rcmake`, `bin/rcmake-lsp`, `share/cmake-4.5`, and the bundled shell completions and `rcmake(1)` man page into `$HOME/.local`, or into `$PREFIX` if you set it. The script needs `bash`, `python3`, and `curl`.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash
@@ -155,6 +170,7 @@ curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.s
 
 | Option | Effect |
 | --- | --- |
+| `--version <v>` | Download release `<v>`, for example `v0.1.0` or `0.1.0`, instead of the latest release. |
 | `--from-source` | Build a release archive from the checkout. This needs a clone and the Rust toolchain. |
 | `--archive <path>` | Install a local `.tar.gz` archive. The script checks `<path>.sha256` when that file exists and prints a warning when it does not. |
 | `--alias-cmake` | Also create `cmake`, `ctest`, and `cpack` links to `rcmake`. If one of these files exists and is not a link to `rcmake`, the script stops before it changes anything. |
@@ -163,9 +179,15 @@ curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.s
 
 At the end, the script lists the installed paths. If the `bin` directory is not on `PATH`, it prints the `export PATH=...` line to add to your shell profile.
 
+The SHA-256 sum cannot show who made an archive. The release workflow also records build provenance for each archive and for `SHA256SUMS.txt`. To check that a downloaded file came from this repository's release workflow, run:
+
+```sh
+gh attestation verify rcmake-<version>-<target>.tar.gz --repo dvgyl/rcmake
+```
+
 ### Windows
 
-`scripts/install.ps1` downloads the latest `x86_64-pc-windows-msvc` release, checks its SHA-256 checksum, and installs `bin\rcmake.exe`, `bin\rcmake-lsp.exe`, and `share\cmake-4.5` into `%LOCALAPPDATA%\rcmake` (or `-Prefix <dir>`). It runs on Windows PowerShell 5.1 and PowerShell 7+:
+`scripts/install.ps1` downloads the latest `x86_64-pc-windows-msvc` release, checks the SHA-256 sum from the same release to find damaged downloads, and installs `bin\rcmake.exe`, `bin\rcmake-lsp.exe`, and `share\cmake-4.5` into `%LOCALAPPDATA%\rcmake` (or `-Prefix <dir>`). It runs on Windows PowerShell 5.1 and PowerShell 7+:
 
 ```powershell
 irm https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.ps1 | iex
@@ -197,7 +219,7 @@ If you prefer manual installation:
 
 4. Open a new terminal and run `rcmake --version`.
 
-The extracted `bin` folder also contains `cmake.exe`, `ctest.exe`, `cpack.exe`, and `rcmake-lsp.exe`. Because the folder is first on `PATH`, `cmake` runs `rcmake`. Keep the `bin` folder next to `share\cmake-4.5`, because `rcmake` finds the bundled CMake modules there.
+The extracted `bin` folder also contains `cmake.exe`, `ctest.exe`, `cpack.exe`, and `rcmake-lsp.exe`. Because the folder is first on `PATH`, `cmake` runs `rcmake`, and any other CMake installation is hidden. `install.ps1` writes these aliases only with `-AliasCmake`, or when it updates aliases that it wrote before. Keep the `bin` folder next to `share\cmake-4.5`, because `rcmake` finds the bundled CMake modules there.
 
 ### Build from source
 
@@ -267,7 +289,7 @@ The binary selects its mode from the name that starts it (`argv[0]`):
 
 | Executable name | Mode |
 | --- | --- |
-| `cmake`, `ctest`, `cpack` | Compatibility mode. Output, diagnostics, and exit codes match CMake 4.5.1. |
+| `cmake`, `ctest`, `cpack` | Compatibility mode. Output, diagnostics, and exit codes match CMake 4.5.1, except for the [intentional differences](#intentional-differences-and-limits). |
 | `rcmake` | Native mode. Adds the probe cache, incremental replay, `explain`, `--profile`, `--hermetic`, `--fetch-lock`, and rich diagnostics. |
 
 Set `RCMAKE_ORACLE_MODE=1` to force compatibility mode when you run `rcmake`.
@@ -321,6 +343,12 @@ Compatibility mode tracks CMake 4.5.1 closely. These differences and scope limit
 - **CPack native installers.** `DEB`, `RPM`, `NSIS`, `WIX`, `productbuild`, and `IFW` are not implemented.
 - **Legacy and niche generators.** `NMake Makefiles`, `NMake Makefiles JOM`, `MSYS Makefiles`, `MinGW Makefiles`, `Borland Makefiles`, `Watcom WMake`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14, 15, and 16 are not implemented.
 - **Swift is unverified.** Basic Swift wiring exists in `rcmake-resolve`, but no test builds Swift code with a Swift toolchain yet.
+- **CUDA and HIP have little test coverage.** CUDA has one end-to-end fixture in the ecosystem lane. HIP has rule wiring only, and no test uses a HIP toolchain yet.
+- **`--version` text.** Line 1 is `cmake version 4.5.1`. Line 2 is `Rcmake 0.1.0` instead of the Kitware line, so the output never names Kitware as the maintainer.
+- **`try_compile` runs in-process.** Probes run through the `rcmake` executor, not through Ninja, Make, MSBuild, or xcodebuild. The result is the same. The build tool lines in `OUTPUT_VARIABLE` are different. Generator settings that only MSBuild or Xcode read, such as `CMAKE_GENERATOR_TOOLSET` and `CMAKE_XCODE_ATTRIBUTE_*`, have no effect on probes.
+- **Replay limits.** Native-mode replay is off when a toolchain file, a configure preset, `-C`, or `PreLoad.cmake` is in use. This includes the `vcpkg` toolchain integration. [`docs/ENV_VARS.md`](docs/ENV_VARS.md#incremental-replay) lists all conditions.
+- **Large-project scope.** The 10 large projects use unmodified sources at pinned tags, but each one uses a reduced option set from `conformance/corpus/large_projects.toml`. For example, OpenCV builds 3 modules with CUDA off, and LLVM builds only `clang` for the host target. L2 compares only the listed targets.
+- **Windows ZIP aliases.** The Windows ZIP archive contains `cmake.exe`, `ctest.exe`, and `cpack.exe` in `bin`. A manual install that puts this folder first on `PATH` hides another CMake installation without a prompt. On Linux and macOS, `install.sh` creates the aliases only with `--alias-cmake`.
 - **`CMAKE_STRIP` install guard.** `cmake --install --strip` writes a strip rule only when `CMAKE_STRIP` is not a CMake false value (`OFF`, `NOTFOUND`, `strip-NOTFOUND`). This avoids running a nonexistent `strip-NOTFOUND` binary.
 
 The [engineering write-up](docs/BUILD_WRITEUP.md) gives full details.
@@ -351,14 +379,15 @@ python3 tools/measure/independent_verify.py --stage target/stage --json independ
 # Silent PATH swap check
 python3 tools/measure/path_swap_eval.py --rcmake-bin target/stage/bin/rcmake --out path-swap.json
 
-# Cold, warm probe-cache, and incremental leaf-edit benchmarks
+# Cold configure (empty probe cache), same-tree rerun, and peak memory
 python3 tools/measure/bench_eval.py --include-corpus --json bench.json --markdown bench.md
+# New build tree with shared probe cache, and leaf edit (add --leaf-edit compile-definition to change targets)
 python3 tools/measure/bench_configure.py --rcmake target/stage/bin/rcmake --oracle "$RCMAKE_ORACLE_CMAKE" --scenario all --json bench-configure.json --markdown bench-configure.md
 
 # WebAssembly and WASI smoke checks
 python3 tools/measure/wasm_smoke.py --require-wasi --json wasm-smoke.json
 
-# Safe-Rust adversarial fuzzing (one of 14 targets)
+# Seeded generative fuzzing, not coverage-guided (one of 14 targets)
 cargo run --release --bin rcmake-fuzz -- syntax --iterations 1000000
 
 # Upstream CMake release and policy tracking
@@ -395,13 +424,13 @@ docs/           Build write-up, architecture, ADRs, environment variables, prior
 - [`crates/rcmake-api/README.md`](crates/rcmake-api/README.md): embed configure and `explain` in a Rust program
 - [`crates/rcmake-lsp/README.md`](crates/rcmake-lsp/README.md): language server and editor setup
 - [`completions/README.md`](completions/README.md) and [`docs/man/rcmake.1`](docs/man/rcmake.1): shell completions (Bash, Zsh, Fish, PowerShell) and the `rcmake(1)` man page
-- [`CONTRIBUTING.md`](CONTRIBUTING.md): first contribution, clean-room rules, engineering standards, and checks
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): first contribution, implementation rules, engineering standards, and checks
 - [`CONTRIBUTORS.md`](CONTRIBUTORS.md): maintainers and attributions
 - [`SECURITY.md`](SECURITY.md): vulnerability reporting
 
 ## Licence
 
-The Rust code in `crates/` and tooling in `tools/` are dual-licensed under either:
+The Rust code in `crates/` and tooling in `tools/` are dual-licensed under either of the licences below. The exception is the CMake-derived files that [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) §1 lists, which stay under `BSD-3-Clause`.
 
 - Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
 - MIT License ([`LICENSE-MIT`](LICENSE-MIT))
