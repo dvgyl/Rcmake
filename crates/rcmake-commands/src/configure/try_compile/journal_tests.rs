@@ -172,6 +172,7 @@ fn journal_checks_json_round_trips_all_variants() -> Result<(), Box<dyn std::err
         (Check::WorkingDirectory, digest),
         (Check::System, digest),
         (Check::Request(3), digest),
+        (Check::Chunks(PathBuf::from("/work/é/😀.h")), digest),
     ]);
     let encoded = write_compact(&checks.to_json());
     let parsed = parse(
@@ -189,5 +190,32 @@ fn journal_checks_json_round_trips_all_variants() -> Result<(), Box<dyn std::err
         ])]))
         .is_err()
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_checks_round_trip_non_utf8_unix_path() -> Result<(), Box<dyn std::error::Error>> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    use rcmake_json::{ReadOptions, parse, write_compact};
+
+    let raw = PathBuf::from(OsString::from_vec(b"/work/raw-\xff-header.h".to_vec()));
+    let checks = JournalChecks(vec![(Check::Chunks(raw), Digest::from_bytes([0xaa; 32]))]);
+    let encoded = write_compact(&checks.to_json());
+    assert!(
+        encoded.windows(10).any(|chunk| chunk == b"unix_bytes"),
+        "expected unix_bytes encoding in {}",
+        String::from_utf8_lossy(encoded.as_slice())
+    );
+    let parsed = parse(
+        encoded.as_slice(),
+        &ReadOptions {
+            allow_comments: false,
+            dup_keys_last_wins: false,
+        },
+    )?;
+    assert_eq!(JournalChecks::from_json(&parsed)?, checks);
     Ok(())
 }

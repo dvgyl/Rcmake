@@ -322,7 +322,10 @@ impl FromJson for InputStamp {
     }
 }
 
-fn path_to_json(path: &Path) -> Value {
+/// Encode a native filesystem path as a JSON [`Value`], preserving non-UTF-8
+/// Unix byte sequences and unpaired Windows UTF-16 surrogates without loss.
+#[must_use]
+pub fn path_to_json(path: &Path) -> Value {
     if let Some(text) = path.to_str() {
         return Value::string(text);
     }
@@ -343,7 +346,13 @@ fn path_to_json(path: &Path) -> Value {
     }
 }
 
-fn path_from_json(value: &Value) -> Result<PathBuf, FieldError> {
+/// Decode a native filesystem path previously encoded by [`path_to_json`].
+///
+/// # Errors
+///
+/// Returns a [`FieldError`] if `value` is neither a valid UTF-8 JSON string nor
+/// a platform-native non-UTF-8 path object for the current target.
+pub fn path_from_json(value: &Value) -> Result<PathBuf, FieldError> {
     match value {
         Value::String(_) => rcmake_json::str(value).map(PathBuf::from),
         #[cfg(unix)]

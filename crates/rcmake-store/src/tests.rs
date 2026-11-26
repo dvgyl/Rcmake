@@ -1336,6 +1336,23 @@ fn old_record_schema_misses_cleanly_and_is_swept_by_gc() -> Result<(), Box<dyn s
     Ok(())
 }
 
+#[test]
+fn non_ascii_and_surrogate_pair_utf8_path_stamp_round_trips()
+-> Result<(), Box<dyn std::error::Error>> {
+    let stamp = InputStamp::Missing {
+        path: PathBuf::from("/work/é/😀.h"),
+    };
+    let encoded = write_compact(&stamp.to_json());
+    assert!(
+        encoded.windows(12).any(|chunk| chunk == br"\ud83d\ude00"),
+        "expected surrogate-pair escape in compact JSON: {}",
+        String::from_utf8_lossy(encoded.as_slice())
+    );
+    let parsed = parse(encoded.as_slice(), &STORE_READ_OPTIONS)?;
+    assert_eq!(InputStamp::from_json(&parsed)?, stamp);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn non_utf8_path_stamp_round_trips_losslessly() -> Result<(), Box<dyn std::error::Error>> {

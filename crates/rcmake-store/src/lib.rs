@@ -29,7 +29,8 @@ pub use digest::{Digest, Domain, KeyHasher};
 pub use gc::{GcReport, gc};
 pub use stamp::{
     FastStat, InputStamp, MissReason, Trace, TraceMemo, TreePolicy, VerifyOutcome,
-    directory_digest, file_digest, sdk_tree_listing_digest, tree_listing_digest, verify_trace,
+    directory_digest, file_digest, path_from_json, path_to_json, sdk_tree_listing_digest,
+    tree_listing_digest, verify_trace,
 };
 
 use frame::{BLOB_MAGIC, ENTRY_LIMIT, ENTRY_MAGIC};

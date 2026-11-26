@@ -20,7 +20,7 @@ use rcmake_host::{
 use rcmake_json::{FieldError, FromJson, ToJson, Value, deny_unknown, object, req};
 use rcmake_store::{
     Digest, Domain, InputStamp, KeyHasher, Trace, TraceMemo, TreePolicy, VerifyOutcome,
-    directory_digest, file_digest, verify_trace,
+    directory_digest, file_digest, path_from_json, path_to_json, verify_trace,
 };
 
 use super::plan::{process_environment_fingerprint, request_digest};
@@ -344,50 +344,6 @@ fn array_pair(value: &Value) -> Result<&[Value; 2], FieldError> {
     items.try_into().map_err(|_| {
         FieldError::invalid(format!("expected 2-element array, found {}", items.len()))
     })
-}
-
-fn path_to_json(path: &Path) -> Value {
-    if let Some(text) = path.to_str() {
-        return Value::string(text);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        Value::object_from([("unix_bytes", path.as_os_str().as_bytes().to_json())])
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        Value::object_from([("windows_wide", wide.to_json())])
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Value::string(path.to_string_lossy().as_ref())
-    }
-}
-
-fn path_from_json(value: &Value) -> Result<PathBuf, FieldError> {
-    match value {
-        Value::String(_) => rcmake_json::str(value).map(PathBuf::from),
-        #[cfg(unix)]
-        Value::Object(obj) => {
-            use std::ffi::OsString;
-            use std::os::unix::ffi::OsStringExt;
-            deny_unknown(obj, &["unix_bytes"])?;
-            let bytes: Vec<u8> = req(obj, "unix_bytes")?;
-            Ok(PathBuf::from(OsString::from_vec(bytes)))
-        }
-        #[cfg(windows)]
-        Value::Object(obj) => {
-            use std::ffi::OsString;
-            use std::os::windows::ffi::OsStringExt;
-            deny_unknown(obj, &["windows_wide"])?;
-            let wide: Vec<u16> = req(obj, "windows_wide")?;
-            Ok(PathBuf::from(OsString::from_wide(&wide)))
-        }
-        _ => Err(FieldError::expected("string", value)),
-    }
 }
 
 impl Check {
