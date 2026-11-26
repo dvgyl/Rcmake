@@ -47,8 +47,6 @@ pub fn install_stdio_panic_hook() {
 /// Run the evaluated language server over standard input and output.
 #[cfg(all(any(unix, windows), feature = "eval", feature = "stdio"))]
 pub fn run_stdio() -> std::process::ExitCode {
-    #[cfg(panic = "abort")]
-    install_stdio_panic_hook();
     stdio_eval::serve().unwrap_or(std::process::ExitCode::FAILURE)
 }
 

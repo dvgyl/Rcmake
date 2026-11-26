@@ -62,6 +62,7 @@ fn stem_is(path: &OsStr, expected: &str) -> bool {
 }
 
 fn main() -> ExitCode {
+    install_panic_hook();
     let mut args = std::env::args_os();
     let program = args.next();
     let first = args.next();
@@ -73,7 +74,6 @@ fn main() -> ExitCode {
     }) {
         return rcmake_lsp::run_stdio();
     }
-    install_panic_hook();
     let argv: Vec<_> = program
         .into_iter()
         .chain(first)
