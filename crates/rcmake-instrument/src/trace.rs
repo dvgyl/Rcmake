@@ -6,10 +6,9 @@ use std::path::Path;
 
 use rcmake_base::BString;
 use rcmake_host::path;
-use rcmake_json::{Value, write_styled};
+use rcmake_json::Value;
 
-use crate::snippet::{SnippetDetails, snippet_value};
-use crate::{InstrumentError, Object, Snippet, invalid};
+use crate::{InstrumentError, invalid};
 
 struct Event {
     start: u64,
@@ -69,19 +68,16 @@ impl Event {
     }
 
     fn json(self, thread: u64) -> Value {
-        Value::Object(Object::from([
-            ("name".into(), Value::String(self.name)),
-            ("cat".into(), Value::String(self.role)),
-            ("ph".into(), Value::string("X")),
-            ("ts".into(), Value::UInt(self.start.saturating_mul(1000))),
-            (
-                "dur".into(),
-                Value::UInt(self.duration.saturating_mul(1000)),
-            ),
-            ("pid".into(), Value::UInt(0)),
-            ("tid".into(), Value::UInt(thread)),
-            ("args".into(), self.args),
-        ]))
+        Value::object_from([
+            ("name", Value::String(self.name)),
+            ("cat", Value::String(self.role)),
+            ("ph", Value::string("X")),
+            ("ts", Value::UInt(self.start.saturating_mul(1000))),
+            ("dur", Value::UInt(self.duration.saturating_mul(1000))),
+            ("pid", Value::UInt(0)),
+            ("tid", Value::UInt(thread)),
+            ("args", self.args),
+        ])
     }
 }
 
@@ -123,20 +119,4 @@ pub(crate) fn trace_value(
         })
         .collect();
     Ok(Value::Array(events))
-}
-
-/// Return the trace JSON for `snippets`.
-///
-/// # Errors
-///
-/// Returns an error if a snippet cannot form a trace event.
-pub fn write_trace(snippets: &[Snippet]) -> Result<BString, InstrumentError> {
-    let snippets = snippets.iter().map(|snippet| {
-        snippet_value(
-            snippet,
-            &SnippetDetails::default(),
-            vec![Value::UInt(0); snippet.outputs.len()],
-        )
-    });
-    Ok(write_styled(&trace_value(snippets)?, "\t"))
 }

@@ -127,12 +127,7 @@ mod tests {
         let host = PureHost::new(cwd.clone(), cwd.join("cmake"));
         let module = cwd.join("EXAMPLE.mod");
         let stamp = cwd.join("stamps/example.mod.stamp");
-        let cx = ToolCtx {
-            host: &host,
-            cwd: &cwd,
-            exe_display: b"cmake",
-            capabilities: &|| rcmake_json::Value::Null,
-        };
+        let cx = ToolCtx::for_test(&host, &cwd);
         let args = ["example", "stamps/example.mod.stamp", "GNU"].map(BString::from);
         host.seed_file(&module, b"Old timestamp\nModule interface\n")?;
         assert_eq!(run(&args, &cx), 0);

@@ -121,15 +121,15 @@ impl<'a> Reader<'a> {
     }
 
     fn unsigned(&self, key: &str, required: bool) -> Result<Option<u32>> {
-        let value = match self.fields.get(key.as_bytes()) {
-            Some(Value::Int(value)) => u32::try_from(*value).ok(),
-            Some(Value::UInt(value)) => u32::try_from(*value).ok(),
-            None | Some(Value::Null) if !required => return Ok(None),
-            _ => None,
-        };
-        value
-            .map(Some)
-            .ok_or_else(|| invalid(key, "an unsigned integer"))
+        match self.fields.get(key.as_bytes()) {
+            None | Some(Value::Null) if !required => Ok(None),
+            Some(value) => value
+                .as_i64()
+                .and_then(|value| u32::try_from(value).ok())
+                .map(Some)
+                .ok_or_else(|| invalid(key, "an unsigned integer")),
+            None => Err(invalid(key, "an unsigned integer")),
+        }
     }
 
     fn values(&self, key: &[u8], required: bool) -> Result<&[Value]> {
@@ -223,10 +223,10 @@ fn invalid(field: &str, expected: &str) -> String {
 }
 
 fn array<'a>(value: &'a Value, field: &str) -> Result<&'a [Value]> {
-    match value {
-        Value::Array(values) if values.len() <= ITEM_LIMIT => Ok(values),
-        _ => Err(invalid(field, "an array within the item limit")),
-    }
+    value
+        .as_array()
+        .filter(|values| values.len() <= ITEM_LIMIT)
+        .ok_or_else(|| invalid(field, "an array within the item limit"))
 }
 
 fn strings(values: &[Value], field: &str) -> Result<Vec<BString>> {
@@ -234,20 +234,20 @@ fn strings(values: &[Value], field: &str) -> Result<Vec<BString>> {
 }
 
 fn string(value: &Value, field: &str) -> Result<BString> {
-    match value {
-        Value::String(value) => string_value(value, field),
-        _ => Err(invalid(field, "a string")),
-    }
+    value
+        .as_bytes()
+        .ok_or_else(|| invalid(field, "a string"))
+        .and_then(|bytes| string_value(bytes, field))
 }
 
-fn string_value(value: &BString, field: &str) -> Result<BString> {
+fn string_value(value: &[u8], field: &str) -> Result<BString> {
     if value.contains(&0) || value.len() > 128 * 1024 {
         return Err(invalid(
             field,
             "a string within the size limit and without null bytes",
         ));
     }
-    Ok(value.clone())
+    Ok(value.into())
 }
 
 fn validate_path(field: &str, value: &[u8]) -> Result<()> {

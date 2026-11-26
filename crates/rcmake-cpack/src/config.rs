@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use rcmake_base::list::{self, Empty};
-use rcmake_base::{BString, Limits, truth};
+use rcmake_base::{BString, truth};
 use rcmake_eval::{
     BuiltinFn, Flow, IncludeOptions, Interp, InterpConfig, Registry, RunMode, TraceConfig,
 };
@@ -212,7 +212,7 @@ pub(crate) fn cmake_executable(host: &dyn Host) -> Result<PathBuf, CpackError> {
     Ok(bin.join(if cfg!(windows) { "cmake.exe" } else { "cmake" }))
 }
 
-pub(crate) fn interpreter(
+fn interpreter(
     host: &Arc<dyn Host>,
     cwd: &Path,
     options: &CPackOptions,
@@ -221,18 +221,13 @@ pub(crate) fn interpreter(
     let cmake_command = cmake_executable(host.as_ref())?;
     let (_, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), argv0);
     let mut interp = Interp::new(
-        InterpConfig {
-            services: Default::default(),
-            host: Arc::clone(host),
-            mode: RunMode::Script,
-            cmake_root: cmake_root.unwrap_or_default(),
+        InterpConfig::new(
+            Arc::clone(host),
+            RunMode::Script,
+            cmake_root.unwrap_or_default(),
             cmake_command,
-            cwd: cwd.to_owned(),
-            limits: Limits::default(),
-            diag: Default::default(),
-            defines: Vec::new(),
-            script_args: Vec::new(),
-        },
+            cwd.to_owned(),
+        ),
         register_cpack_commands,
     );
     if options.trace || options.trace_expand {

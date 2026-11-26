@@ -557,12 +557,7 @@ mod tests {
     fn tar_selects_compression_from_flags() -> Result<(), Box<dyn std::error::Error>> {
         let cwd = Path::new("/work");
         let host = PureHost::new(cwd.to_owned(), "/bin/cmake".into());
-        let cx = ToolCtx {
-            host: &host,
-            cwd,
-            exe_display: b"cmake",
-            capabilities: &|| rcmake_json::Value::Null,
-        };
+        let cx = ToolCtx::for_test(&host, cwd);
         let input = cwd.join("input");
         let archive = cwd.join("archive");
         for (flags, options, magic) in [
@@ -642,12 +637,7 @@ mod tests {
         let cwd = to_native(if cfg!(windows) { b"C:/work" } else { b"/work" });
         let host = PureHost::new(cwd.clone(), cwd.join("cmake"));
         host.seed_file(&cwd.join("input"), b"contents")?;
-        let cx = ToolCtx {
-            host: &host,
-            cwd: &cwd,
-            exe_display: b"cmake",
-            capabilities: &|| rcmake_json::Value::Null,
-        };
+        let cx = ToolCtx::for_test(&host, &cwd);
         let args = ["tar", "cf", "archive"]
             .into_iter()
             .chain(options.iter().copied())

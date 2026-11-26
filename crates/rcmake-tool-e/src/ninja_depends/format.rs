@@ -96,7 +96,7 @@ pub(super) fn write_ddi(
     let requires = required
         .into_iter()
         .filter(|name| !provided.contains_key(name))
-        .map(|name| record([("logical-name", Value::string(name))]))
+        .map(|name| Value::object_from([("logical-name", Value::string(name))]))
         .collect();
     let provides = provided
         .into_iter()
@@ -116,14 +116,14 @@ pub(super) fn write_ddi(
             Value::Object(fields)
         })
         .collect();
-    let rule = record([
+    let rule = Value::object_from([
         ("outputs", Value::Array(Vec::new())),
         ("primary-output", Value::string(request.obj)),
         ("provides", Value::Array(provides)),
         ("requires", Value::Array(requires)),
     ]);
     Ok(rcmake_json::write_styled(
-        &record([
+        &Value::object_from([
             ("revision", Value::UInt(0)),
             ("rules", Value::Array(vec![rule])),
             ("version", Value::UInt(0)),
@@ -258,31 +258,22 @@ pub(crate) fn relative_to_top(path: &[u8], top: &[u8]) -> BString {
         .into()
 }
 
-fn record<const N: usize>(fields: [(&str, Value); N]) -> Value {
-    Value::Object(
-        fields
-            .into_iter()
-            .map(|(key, value)| (key.into(), value))
-            .collect(),
-    )
-}
-
 fn parse(input: &[u8]) -> Result<Value, BString> {
     rcmake_json::parse(input, &ReadOptions::default()).map_err(|error| error.to_string().into())
 }
 
 fn object(value: &Value) -> Result<&Object, BString> {
-    match value {
-        Value::Object(object) => Ok(object),
-        _ => Err("Expected a JSON object.".into()),
-    }
+    value
+        .as_object()
+        .ok_or_else(|| "Expected a JSON object.".into())
 }
 
 fn array<'a>(object: &'a Object, key: &[u8]) -> Result<&'a [Value], BString> {
     match object.get(key) {
-        Some(Value::Array(array)) => Ok(array),
         None | Some(Value::Null) => Ok(&[]),
-        _ => Err(format!("Expected an array for {:?}.", BString::from(key)).into()),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| format!("Expected an array for {:?}.", BString::from(key)).into()),
     }
 }
 
@@ -300,8 +291,7 @@ fn required_field<'a>(object: &'a Object, key: &[u8]) -> Result<&'a [u8], BStrin
 }
 
 fn string(value: &Value) -> Result<&[u8], BString> {
-    match value {
-        Value::String(value) => Ok(value),
-        _ => Err("Expected a JSON string.".into()),
-    }
+    value
+        .as_bytes()
+        .ok_or_else(|| "Expected a JSON string.".into())
 }

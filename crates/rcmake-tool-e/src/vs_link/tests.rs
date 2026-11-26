@@ -6,12 +6,7 @@ use rcmake_host::{Host, PureHost, RunOutput};
 use super::*;
 
 fn command(host: &PureHost, name: &[u8], args: &[&str]) -> i32 {
-    let ctx = ToolCtx {
-        host,
-        cwd: Path::new("/work"),
-        exe_display: b"cmake",
-        capabilities: &|| rcmake_json::Value::Null,
-    };
+    let ctx = ToolCtx::for_test(host, Path::new("/work"));
     run(
         name,
         &args.iter().copied().map(BString::from).collect::<Vec<_>>(),

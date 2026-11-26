@@ -399,12 +399,7 @@ mod tests {
             br#"{"version":1,"rules":[{"primary-output":"a a.o","provides":[{"logical-name":"A"}]}]}"#,
         )?;
         host.seed_file(&cwd.join("scan.rsp"), b"\"a a.ddi\"\n")?;
-        let cx = ToolCtx {
-            host: &host,
-            cwd: &cwd,
-            exe_display: b"cmake",
-            capabilities: &|| rcmake_json::Value::Null,
-        };
+        let cx = ToolCtx::for_test(&host, &cwd);
         let args = [
             "--tdi=tdi.json",
             "--lang=CXX",

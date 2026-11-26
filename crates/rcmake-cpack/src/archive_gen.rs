@@ -325,9 +325,9 @@ struct ComponentArchive {
 }
 
 enum ArchiveSource {
-    // Component roots relative to the staging directory, scanned when packaging.
+    /// Component roots relative to the staging directory, scanned when packaging.
     Live(Vec<PathBuf>),
-    // Recorded archive paths below each component directory.
+    /// Recorded archive paths below each component directory.
     Recorded(Vec<RecordedRoot>),
 }
 
@@ -336,8 +336,8 @@ struct RecordedRoot {
     paths: Vec<PathBuf>,
 }
 
-// Group the recorded components as `cmCPackArchiveGenerator` does. CPack reads each
-// component from `<staging>/<component>` and adds its prefix to each recorded path.
+/// Group the recorded components as `cmCPackArchiveGenerator` does. CPack reads each
+/// component from `<staging>/<component>` and adds its prefix to each recorded path.
 fn recorded_archives(
     cx: &PackageContext<'_>,
     cfg: &CpackConfig,
@@ -395,8 +395,8 @@ fn recorded_archives(
         .collect())
 }
 
-// CPack adds the top-level directory and an absolute packaging prefix without its
-// leading slash.
+/// CPack adds the top-level directory and an absolute packaging prefix without its
+/// leading slash.
 fn recorded_prefix(cx: &PackageContext<'_>, cfg: &CpackConfig) -> Result<PathBuf, CpackError> {
     let mut prefix = if cfg.on(b"CPACK_COMPONENT_INCLUDE_TOPLEVEL_DIRECTORY") {
         safe_name(cx.file_name)?
@@ -548,16 +548,16 @@ fn write_component_archive(
         options,
         header,
     } = *output;
-    let mut roots = roots.iter().map(|root| cx.staging_dir.join(root));
-    let first = roots
-        .next()
-        .ok_or_else(|| error("CPack component group is empty"))?;
+    let Some((first, rest)) = roots.split_first() else {
+        return Err(error("CPack component group is empty"));
+    };
+    let first = cx.staging_dir.join(first);
     let component_inputs = |root: &Path| {
         component_root(cx, root)?;
         children(cx.host, &root.join(prefix))
             .map(|files| files.into_iter().map(|file| prefix.join(file)))
     };
-    if roots.len() == 0 {
+    if rest.is_empty() {
         let inputs = component_inputs(&first)?.collect::<Vec<_>>();
         return write_archive(cx, path, &first, &inputs, options, header);
     }
@@ -565,7 +565,8 @@ fn write_component_archive(
     let result: Result<(), CpackError> = (|| {
         let mut seen = BTreeSet::new();
         let mut inputs = Vec::new();
-        for root in std::iter::once(first).chain(roots) {
+        for root in std::iter::once(first).chain(rest.iter().map(|root| cx.staging_dir.join(root)))
+        {
             inputs.extend(component_inputs(&root)?.filter(|file| seen.insert(file.clone())));
             crate::source::merge_component(cx.host, &root, &merged)?;
         }
@@ -577,7 +578,7 @@ fn write_component_archive(
     Ok(())
 }
 
-// Archive only the paths that the component installs recorded, with their current data.
+/// Archive only the paths that the component installs recorded, with their current data.
 fn write_recorded_archive(
     cx: &PackageContext<'_>,
     output: &ArchiveOutput<'_>,
@@ -625,8 +626,8 @@ fn write_recorded_archive(
     Ok(())
 }
 
-// Check that each recorded path exists below real directories. Returns whether every
-// child of each recorded directory is also recorded.
+/// Check that each recorded path exists below real directories. Returns whether every
+/// child of each recorded directory is also recorded.
 fn check_recorded(
     host: &dyn Host,
     root: &Path,
@@ -661,8 +662,8 @@ fn check_recorded(
     Ok(complete)
 }
 
-// List the recorded paths without a recorded ancestor in recorded order. The archive
-// adds each recorded directory with its recorded children.
+/// List the recorded paths without a recorded ancestor in recorded order. The archive
+/// adds each recorded directory with its recorded children.
 fn top_members<'a>(
     members: &BTreeSet<PathBuf>,
     ordered: impl Iterator<Item = &'a PathBuf>,

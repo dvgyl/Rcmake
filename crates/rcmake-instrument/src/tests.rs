@@ -57,6 +57,23 @@ fn text_list(values: &[&str]) -> Value {
     crate::strings(values.iter().copied())
 }
 
+fn run_instrumented(
+    host: &dyn Host,
+    build: &Path,
+    role: crate::SnippetRole,
+    command: &[BString],
+) -> Result<i32, InstrumentError> {
+    let mut argv = vec![
+        BString::from("--command-type"),
+        role.as_str().into(),
+        "--build-dir".into(),
+        path::from_native(build),
+        "--".into(),
+    ];
+    argv.extend_from_slice(command);
+    launcher::run_launcher(host, &argv)
+}
+
 #[test]
 fn query_versions_and_keywords() {
     for hook in Hook::ALL {
@@ -220,7 +237,7 @@ fn manual_index_preserves_data_covered_by_an_existing_index() {
     snippet::write_content(&host, build, b"updated", &[], &[], false)
         .expect("write changed content");
     let run = || {
-        launcher::run_instrumented(&host, build, crate::SnippetRole::Custom, &["work".into()])
+        run_instrumented(&host, build, crate::SnippetRole::Custom, &["work".into()])
             .expect("record command");
     };
     host.set_command_handler(|_, _, _| {
@@ -452,7 +469,7 @@ fn launcher_copies_invalid_json_trace_bytes() -> Result<(), InstrumentError> {
     })?;
     let command = ["cc", "-ftime-trace=main.trace.json"].map(BString::from);
     assert_eq!(
-        launcher::run_instrumented(&host, build, crate::SnippetRole::Compile, &command)?,
+        run_instrumented(&host, build, crate::SnippetRole::Compile, &command)?,
         0
     );
     let value = read_json(&host, &only_file(&host, &data))?;
@@ -487,7 +504,7 @@ fn launcher_keeps_exit_code_when_instrumentation_writes_fail() -> Result<(), Ins
     })?;
     let command = ["cc", "-ftime-trace=main.json"].map(BString::from);
     assert_eq!(
-        launcher::run_instrumented(&host, build, crate::SnippetRole::Compile, &command)?,
+        run_instrumented(&host, build, crate::SnippetRole::Compile, &command)?,
         0
     );
     assert!(
@@ -501,7 +518,7 @@ fn launcher_keeps_exit_code_when_instrumentation_writes_fail() -> Result<(), Ins
     host.remove_dir_all(&data)?;
     host.seed_file(&data, b"blocks the snippet directory")?;
     assert_eq!(
-        launcher::run_instrumented(&host, build, crate::SnippetRole::Test, &command)?,
+        run_instrumented(&host, build, crate::SnippetRole::Test, &command)?,
         0
     );
     assert!(
@@ -524,7 +541,7 @@ fn interrupted_command_records_signal() {
     .expect("install handler");
     let build = Path::new("/build");
     assert_eq!(
-        launcher::run_instrumented(
+        run_instrumented(
             &host,
             build,
             crate::SnippetRole::CMakeBuild,
@@ -581,7 +598,7 @@ fn simultaneous_hooks_do_not_index_the_same_snippet() {
     })
     .expect("install handler");
 
-    launcher::run_instrumented(&host, build, crate::SnippetRole::Custom, &["work".into()])
+    run_instrumented(&host, build, crate::SnippetRole::Custom, &["work".into()])
         .expect("write snippet");
     thread::scope(|scope| {
         let pre = scope.spawn(|| hooks::run_hook(&host, build, Hook::PreBuild));

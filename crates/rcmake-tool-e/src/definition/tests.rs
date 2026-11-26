@@ -35,12 +35,7 @@ fn object() -> Vec<u8> {
 fn merges_coff_and_explicit_exports_without_nm() {
     let host = PureHost::default();
     let cwd = Path::new("/work");
-    let ctx = ToolCtx {
-        host: &host,
-        cwd,
-        exe_display: b"cmake",
-        capabilities: &|| rcmake_json::Value::Null,
-    };
+    let ctx = ToolCtx::for_test(&host, cwd);
     host.seed_file(&cwd.join("objects.rsp"), b"my object.obj\nexplicit.DEF\n")
         .unwrap();
     host.seed_file(&cwd.join("my object.obj"), &object())
@@ -68,12 +63,7 @@ fn merges_coff_and_explicit_exports_without_nm() {
 fn sends_only_non_coff_objects_to_nm() -> rcmake_host::HostResult<()> {
     let host = PureHost::default();
     let cwd = Path::new("/work");
-    let ctx = ToolCtx {
-        host: &host,
-        cwd,
-        exe_display: b"cmake",
-        capabilities: &|| rcmake_json::Value::Null,
-    };
+    let ctx = ToolCtx::for_test(&host, cwd);
     host.seed_file(&cwd.join("objects.rsp"), b"native.obj\nbitcode.obj\n")?;
     host.seed_file(&cwd.join("native.obj"), &object())?;
     host.seed_file(&cwd.join("bitcode.obj"), b"BC\xc0\xde")?;

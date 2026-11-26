@@ -3,31 +3,14 @@
 use std::collections::BTreeSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use rcmake_eval::Interp;
 use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_host::{CopyOptions, FileKind, Follow, Host, ReadRange};
 
-use crate::config::{CpackConfig, absolute, interpreter};
+use crate::config::{CpackConfig, absolute};
 use crate::stage::{clear_output_file, ensure_dir, relative_install_path, uses_destdir};
 use crate::{CpackError, error};
-
-/// Copy the configured source directories and apply `CPACK_SOURCE_IGNORE_FILES`.
-///
-/// # Errors
-///
-/// Returns an error if a directory pair, regular expression, or file operation fails.
-pub fn stage_sources(
-    host: &Arc<dyn Host>,
-    config: &CpackConfig,
-    staging_dir: &Path,
-) -> Result<(), CpackError> {
-    let cwd = host.initial_cwd();
-    let mut interp = interpreter(host, &cwd, &Default::default(), None)?;
-    host.create_dir_all(staging_dir)?;
-    copy_directories(host.as_ref(), config, &cwd, staging_dir, &mut interp)
-}
 
 pub(crate) fn copy_directories(
     host: &dyn Host,

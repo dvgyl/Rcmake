@@ -123,6 +123,15 @@ fn inspect(input: &[u8], expected: Option<(BinFormat, usize, &[u8])>, over_limit
 
 fn elf_image(wide: bool, big: bool, sections: bool, count: usize, name: &[u8]) -> Vec<u8> {
     const BASE: usize = 0x400000;
+    const ET_DYN: usize = 3;
+    const EV_CURRENT: usize = 1;
+    const SHT_STRTAB: usize = 3;
+    const SHT_DYNAMIC: usize = 6;
+    const PT_LOAD: usize = 1;
+    const PT_DYNAMIC: usize = 2;
+    const DT_NEEDED: usize = 1;
+    const DT_STRTAB: usize = 5;
+    const DT_STRSZ: usize = 10;
 
     let (header, word, header_size_at) = if wide { (64, 8, 52) } else { (52, 4, 40) };
     let (rows, row_size) = match (sections, wide) {
@@ -147,8 +156,8 @@ fn elf_image(wide: bool, big: bool, sections: bool, count: usize, name: &[u8]) -
     );
     let number =
         |image: &mut [u8], offset, value, width| put_number(image, offset, value, width, big);
-    number(&mut image, 16, 3, 2); // Shared object.
-    number(&mut image, 20, 1, 4); // ELF version.
+    number(&mut image, 16, ET_DYN, 2);
+    number(&mut image, 20, EV_CURRENT, 4);
     number(&mut image, header_size_at, header, 2);
     if sections {
         number(&mut image, if wide { 40 } else { 32 }, header, word);
@@ -161,7 +170,7 @@ fn elf_image(wide: bool, big: bool, sections: bool, count: usize, name: &[u8]) -
         } else {
             (12, 16, 20, 24, 36)
         };
-        number(&mut image, dynamic_row + 4, 6, 4); // SHT_DYNAMIC.
+        number(&mut image, dynamic_row + 4, SHT_DYNAMIC, 4);
         number(&mut image, dynamic_row + file_at, dynamic, word);
         number(&mut image, dynamic_row + address_at, BASE + dynamic, word);
         let dynamic_size = strings - dynamic;
@@ -169,7 +178,7 @@ fn elf_image(wide: bool, big: bool, sections: bool, count: usize, name: &[u8]) -
         number(&mut image, dynamic_row + size_at + word, dynamic_size, word);
         number(&mut image, dynamic_row + link_at, 2, 4);
         number(&mut image, dynamic_row + entry_at, 2 * word, word);
-        number(&mut image, string_row + 4, 3, 4); // SHT_STRTAB.
+        number(&mut image, string_row + 4, SHT_STRTAB, 4);
         number(&mut image, string_row + address_at, BASE + strings, word);
         number(&mut image, string_row + file_at, strings, word);
         number(&mut image, string_row + size_at, strings_size, word);
@@ -178,21 +187,21 @@ fn elf_image(wide: bool, big: bool, sections: bool, count: usize, name: &[u8]) -
         number(&mut image, header_size_at + 2, row_size, 2);
         number(&mut image, header_size_at + 4, rows, 2);
         let (file_at, address_at, size_at) = if wide { (8, 16, 32) } else { (4, 8, 16) };
-        number(&mut image, header, 1, 4); // PT_LOAD.
+        number(&mut image, header, PT_LOAD, 4);
         number(&mut image, header + address_at, BASE, word);
         number(&mut image, header + size_at, size, word);
         number(&mut image, header + size_at + word, size, word);
         let dynamic_row = header + row_size;
-        number(&mut image, dynamic_row, 2, 4); // PT_DYNAMIC.
+        number(&mut image, dynamic_row, PT_DYNAMIC, 4);
         number(&mut image, dynamic_row + file_at, dynamic, word);
         number(&mut image, dynamic_row + address_at, BASE + dynamic, word);
         let dynamic_size = strings - dynamic;
         number(&mut image, dynamic_row + size_at, dynamic_size, word);
         number(&mut image, dynamic_row + size_at + word, dynamic_size, word);
     }
-    let tags = [(5, BASE + strings), (10, strings_size)]
+    let tags = [(DT_STRTAB, BASE + strings), (DT_STRSZ, strings_size)]
         .into_iter()
-        .chain(std::iter::repeat_n((1, 1), count));
+        .chain(std::iter::repeat_n((DT_NEEDED, 1), count));
     for (index, (tag, value)) in tags.enumerate() {
         let offset = dynamic + index * 2 * word;
         number(&mut image, offset, tag, word);

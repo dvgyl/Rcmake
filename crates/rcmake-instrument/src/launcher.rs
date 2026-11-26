@@ -341,23 +341,6 @@ fn run(
     Ok(code)
 }
 
-/// Run a command in `build_dir` and return its exit code.
-///
-/// Report trace and snippet write errors to stderr.
-///
-/// # Errors
-///
-/// Returns an error if command setup or execution fails before an exit code is available.
-pub fn run_instrumented(
-    host: &dyn Host,
-    build_dir: &Path,
-    role: SnippetRole,
-    command: &[BString],
-) -> Result<i32, InstrumentError> {
-    let build = absolute(host, build_dir);
-    run(host, &build, &build, role, command, Metadata::default())
-}
-
 /// Run an install script with its configuration and record its process result.
 ///
 /// # Errors

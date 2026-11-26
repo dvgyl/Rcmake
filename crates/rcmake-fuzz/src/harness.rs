@@ -1,5 +1,4 @@
-//! Run one fuzz input with isolation: own thread, 8 MiB stack, panic catch, and a
-//! wall-clock budget.
+//! Run each fuzz input on an isolated 8 MiB thread with panic capture and a wall-clock budget.
 
 use std::panic::{UnwindSafe, catch_unwind};
 use std::sync::mpsc;

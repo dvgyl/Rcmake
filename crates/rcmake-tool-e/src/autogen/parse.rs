@@ -35,7 +35,7 @@ pub(super) fn scan(
             let candidate = horizontal(line.strip_prefix(b"{").unwrap_or(line));
             let length = candidate
                 .iter()
-                .take_while(|&&byte| identifier_byte(byte))
+                .take_while(|&&byte| byte.is_ascii_alphanumeric() || byte == b'_')
                 .count();
             if let Some(name) = candidate.get(..length).filter(|_| length < candidate.len())
                 && let Some(&index) = names.get(name)
@@ -184,8 +184,4 @@ fn horizontal(line: &[u8]) -> &[u8] {
         .take_while(|&&byte| matches!(byte, b' ' | b'\t'))
         .count();
     line.get(count..).unwrap_or_default()
-}
-
-fn identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }

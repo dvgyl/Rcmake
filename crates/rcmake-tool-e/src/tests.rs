@@ -25,10 +25,8 @@ impl Fixture {
         run(
             &args,
             &ToolCtx {
-                cwd: &self.cwd,
-                host: &self.host,
                 exe_display: b"test-cmake",
-                capabilities: &|| Value::Null,
+                ..ToolCtx::for_test(&self.host, &self.cwd)
             },
         )
     }
@@ -880,12 +878,7 @@ fn echo_color_updates_make_progress_and_formats_messages() -> HostResult<()> {
     assert_eq!(f.read("build/CMakeFiles/Progress/count.txt")?, b"2\n");
     assert_eq!(f.run(&["cmake_progress_start", "build/CMakeFiles", "0"]), 0);
     assert!(!is_dir(
-        &ToolCtx {
-            host: &f.host,
-            cwd: &f.cwd,
-            exe_display: b"cmake",
-            capabilities: &|| Value::Null,
-        },
+        &ToolCtx::for_test(&f.host, &f.cwd),
         &f.cwd.join("build/CMakeFiles/Progress")
     ));
     Ok(())

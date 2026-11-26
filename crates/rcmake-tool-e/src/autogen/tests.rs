@@ -10,7 +10,7 @@ use rcmake_host::{
     CommandSpec, Follow, Host, HostError, HostResult, ProcessResult, PureHost, RunOutput,
     RunRequest, Stream, path::to_native,
 };
-use rcmake_json::{ReadOptions, Value, parse, write_compact};
+use rcmake_json::{ReadOptions, parse, write_compact};
 
 use super::{DATA_LIMIT, ToolCtx, read, run, run_rcc};
 
@@ -100,12 +100,10 @@ fn seed_info(host: &PureHost, path: &str, kind: &str, extra: &str) -> TestResult
 }
 
 fn context(host: &PureHost) -> ToolCtx<'_> {
-    ToolCtx {
+    ToolCtx::for_test(
         host,
-        cwd: Path::new(if cfg!(windows) { "C:/build" } else { "/build" }),
-        exe_display: b"cmake",
-        capabilities: &Value::object,
-    }
+        Path::new(if cfg!(windows) { "C:/build" } else { "/build" }),
+    )
 }
 
 fn contents(host: &PureHost, file: &str) -> Result<Vec<u8>, String> {

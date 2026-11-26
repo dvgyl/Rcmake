@@ -44,6 +44,23 @@ pub struct ToolCtx<'a> {
     pub capabilities: &'a dyn Fn() -> Value,
 }
 
+#[cfg(test)]
+fn null_capabilities() -> Value {
+    Value::Null
+}
+
+#[cfg(test)]
+impl<'a> ToolCtx<'a> {
+    pub(crate) fn for_test(host: &'a dyn Host, cwd: &'a Path) -> Self {
+        Self {
+            host,
+            cwd,
+            exe_display: b"cmake",
+            capabilities: &null_capabilities,
+        }
+    }
+}
+
 /// Run a `cmake -E` command and return its exit code.
 #[must_use]
 pub fn run(args: &[BString], cx: &ToolCtx<'_>) -> i32 {

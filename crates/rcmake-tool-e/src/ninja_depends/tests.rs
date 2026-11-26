@@ -9,12 +9,7 @@ fn scans_free_form_f_sources_and_rewrites_identical_outputs()
 -> Result<(), Box<dyn std::error::Error>> {
     let cwd = PathBuf::from(if cfg!(windows) { "C:/out" } else { "/out" });
     let host = PureHost::new(cwd.clone(), cwd.join("cmake"));
-    let cx = ToolCtx {
-        host: &host,
-        cwd: &cwd,
-        exe_display: b"cmake",
-        capabilities: &|| rcmake_json::Value::Null,
-    };
+    let cx = ToolCtx::for_test(&host, &cwd);
     host.seed_file(
         &cwd.join("tdi.json"),
         br#"{"_rcmake_source_formats":{"original.f":"FREE"}}"#,
@@ -56,12 +51,7 @@ fn scans_free_form_f_sources_and_rewrites_identical_outputs()
 fn scans_fortran_and_resolves_linked_module_dyndep() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = PathBuf::from(if cfg!(windows) { "C:/out" } else { "/out" });
     let host = PureHost::new(cwd.clone(), cwd.join("cmake"));
-    let cx = ToolCtx {
-        host: &host,
-        cwd: &cwd,
-        exe_display: b"cmake",
-        capabilities: &|| rcmake_json::Value::Null,
-    };
+    let cx = ToolCtx::for_test(&host, &cwd);
     let root = from_native_cmake(&cwd);
     let metadata = |module: &str, linked: &str| {
         format!(

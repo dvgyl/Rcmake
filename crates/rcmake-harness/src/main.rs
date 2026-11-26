@@ -1,4 +1,4 @@
-//! Compare staged Rcmake tools with the CMake 4.5.1 oracle or a recorded baseline.
+//! Compare staged Rcmake tools with the CMake 4.5.1 reference binary or a recorded baseline.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
