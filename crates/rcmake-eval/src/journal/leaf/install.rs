@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use rcmake_model::{ExportSet, InstallKind, InstallOptions, InstallRule, ProjectModel};
-use serde::{Deserialize, Serialize};
 
 use super::*;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub(super) struct Installs {
     rules: Vec<Rule>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct Rule {
     targets: Vec<Vec<u8>>,
     export: Option<Vec<u8>>,
@@ -19,14 +18,14 @@ struct Rule {
     properties: Vec<Property>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct Property {
     field: Vec<u8>,
     target: Option<Vec<u8>>,
     value: Vec<u8>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct Options {
     destination: Option<Vec<u8>>,
     component: Option<Vec<u8>>,
@@ -74,6 +73,129 @@ impl From<&Options> for InstallOptions {
             all_components: source.all_components,
             export_package_dependencies: source.export_package_dependencies,
         }
+    }
+}
+
+impl ToJson for Installs {
+    fn to_json(&self) -> Json {
+        Json::object_from([("rules", self.rules.to_json())])
+    }
+}
+
+impl FromJson for Installs {
+    fn from_json(value: &Json) -> Result<Self, FieldError> {
+        let obj = codec::fields(value, &["rules"])?;
+        Ok(Self {
+            rules: req(obj, "rules")?,
+        })
+    }
+}
+
+impl ToJson for Rule {
+    fn to_json(&self) -> Json {
+        Json::object_from([
+            ("targets", codec::bytes_list(&self.targets)),
+            ("export", codec::opt_bytes(self.export.as_deref())),
+            ("origin", self.origin.to_json()),
+            ("options", self.options.to_json()),
+            ("properties", self.properties.to_json()),
+        ])
+    }
+}
+
+impl FromJson for Rule {
+    fn from_json(value: &Json) -> Result<Self, FieldError> {
+        let obj = codec::fields(
+            value,
+            &["targets", "export", "origin", "options", "properties"],
+        )?;
+        Ok(Self {
+            targets: codec::field(obj, "targets", codec::from_bytes_list)?,
+            export: codec::field(obj, "export", codec::from_opt_bytes)?,
+            origin: req(obj, "origin")?,
+            options: req(obj, "options")?,
+            properties: req(obj, "properties")?,
+        })
+    }
+}
+
+impl ToJson for Property {
+    fn to_json(&self) -> Json {
+        Json::object_from([
+            ("field", codec::bytes(&self.field)),
+            ("target", codec::opt_bytes(self.target.as_deref())),
+            ("value", codec::bytes(&self.value)),
+        ])
+    }
+}
+
+impl FromJson for Property {
+    fn from_json(value: &Json) -> Result<Self, FieldError> {
+        let obj = codec::fields(value, &["field", "target", "value"])?;
+        Ok(Self {
+            field: codec::field(obj, "field", codec::from_bytes)?,
+            target: codec::field(obj, "target", codec::from_opt_bytes)?,
+            value: codec::field(obj, "value", codec::from_bytes)?,
+        })
+    }
+}
+
+const OPTION_FIELDS: &[&str] = &[
+    "destination",
+    "component",
+    "permissions",
+    "configurations",
+    "optional",
+    "exclude_from_all",
+    "rename",
+    "includes_destination",
+    "build_depends",
+    "all_components",
+    "export_package_dependencies",
+];
+
+impl ToJson for Options {
+    fn to_json(&self) -> Json {
+        Json::object_from([
+            ("destination", codec::opt_bytes(self.destination.as_deref())),
+            ("component", codec::opt_bytes(self.component.as_deref())),
+            ("permissions", codec::bytes_list(&self.permissions)),
+            ("configurations", codec::bytes_list(&self.configurations)),
+            ("optional", self.optional.to_json()),
+            ("exclude_from_all", self.exclude_from_all.to_json()),
+            ("rename", codec::opt_bytes(self.rename.as_deref())),
+            (
+                "includes_destination",
+                codec::bytes_list(&self.includes_destination),
+            ),
+            ("build_depends", codec::bytes_list(&self.build_depends)),
+            ("all_components", self.all_components.to_json()),
+            (
+                "export_package_dependencies",
+                self.export_package_dependencies.to_json(),
+            ),
+        ])
+    }
+}
+
+impl FromJson for Options {
+    fn from_json(value: &Json) -> Result<Self, FieldError> {
+        let obj = codec::fields(value, OPTION_FIELDS)?;
+        let list = |key: &str| codec::field(obj, key, codec::from_bytes_list);
+        let text = |key: &str| codec::field(obj, key, codec::from_opt_bytes);
+        Ok(Self {
+            destination: text("destination")?,
+            component: text("component")?,
+            permissions: list("permissions")?,
+            configurations: list("configurations")?,
+            optional: req(obj, "optional")?,
+            exclude_from_all: req(obj, "exclude_from_all")?,
+            rename: text("rename")?,
+            includes_destination: list("includes_destination")?,
+            build_depends: list("build_depends")?,
+            all_components: req(obj, "all_components")?,
+            export_package_dependencies: req(obj, "export_package_dependencies")?,
+        })
     }
 }
 
@@ -314,5 +436,72 @@ impl RestoredRule {
                 .props
                 .set(name.as_slice().into(), value.as_slice().into());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_diag::{Backtrace, Frame, FrameKind};
+
+    use super::*;
+    use crate::journal::codec::round_trip;
+
+    fn options(destination: Option<Vec<u8>>) -> Options {
+        Options {
+            destination,
+            component: Some(b"Runtime".to_vec()),
+            permissions: vec![b"OWNER_READ".to_vec(), b"OWNER_WRITE".to_vec()],
+            configurations: vec![b"Release".to_vec()],
+            optional: true,
+            exclude_from_all: false,
+            rename: None,
+            includes_destination: vec![b"include".to_vec()],
+            build_depends: Vec::new(),
+            all_components: false,
+            export_package_dependencies: true,
+        }
+    }
+
+    #[test]
+    fn install_records_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let bin = if cfg!(windows) {
+            "C:/work/build"
+        } else {
+            "/work/build"
+        };
+        let backtrace = Backtrace::default().push(Frame {
+            file: b"/work/CMakeLists.txt".as_slice().into(),
+            line: 12,
+            name: Some(b"install".as_slice().into()),
+            kind: FrameKind::Command,
+        });
+        let rule = |export, destination| Rule {
+            targets: vec![b"lib".to_vec(), b"\xff".to_vec()],
+            export,
+            origin: PropertyOrigin::new(bin.into(), &backtrace),
+            options: options(destination),
+            properties: vec![
+                Property {
+                    field: b"FILE".to_vec(),
+                    target: Some(b"lib".to_vec()),
+                    value: b"lib.a".to_vec(),
+                },
+                Property {
+                    field: b"\xfeRAW".to_vec(),
+                    target: None,
+                    value: Vec::new(),
+                },
+            ],
+        };
+        round_trip(&options(None))?;
+        round_trip(&rule(None, None))?;
+        round_trip(&Installs {
+            rules: vec![
+                rule(Some(b"Targets".to_vec()), Some(b"lib".to_vec())),
+                rule(None, None),
+            ],
+        })?;
+        round_trip(&Installs { rules: Vec::new() })?;
+        Ok(())
     }
 }

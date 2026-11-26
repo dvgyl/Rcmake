@@ -5,10 +5,10 @@
 mod activate;
 pub(crate) use activate::ReplayState;
 pub(crate) use leaf::REPLAY_LINK_CHECK;
+mod codec;
 mod frame;
 mod leaf;
 pub(crate) use leaf::shape::valid_expansion;
-mod path_bytes;
 mod receipts;
 mod region;
 mod replay;

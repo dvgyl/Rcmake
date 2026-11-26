@@ -3,11 +3,12 @@ use std::fmt;
 use std::path::Path;
 
 use rcmake_host::{Host, path};
+use rcmake_json::{FieldError, FromJson, ReadOptions, ToJson, Value, parse, req};
 use rcmake_model::{AppendMode, DirId, ModelError, ProjectModel, PropOrigin, PropScope};
-use serde::{Deserialize, Serialize};
 
 use crate::Cx;
 
+use super::codec::fields;
 use super::frame::{MAX_FRAME_BYTES, encoded_size, write_json};
 use super::region::{
     EntryContext, JournalEffect, MAX_EFFECTS, MAX_INPUTS, OpaqueOperation, PropertyEdit, RegionKey,
@@ -20,26 +21,24 @@ use super::trace::{
 /// Versioned manifest of a successful whole configure.
 ///
 /// The caller supplies a portable model snapshot that uses stable identifiers.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigureSnapshot<M = ()> {
-    #[serde(rename = "schema")]
-    frame_schema: FrameSchema,
-    #[serde(rename = "replay_schema")]
     pub(super) schema: String,
     pub(super) region: RegionRecord,
     pub(super) model: M,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-enum FrameSchema {
-    #[serde(rename = "configure.v1")]
-    V1,
-}
+/// Version of the frame encoding. It also names the manifest file.
+const FRAME_SCHEMA: &str = "configure.v1";
+
+const READ_OPTIONS: ReadOptions = ReadOptions {
+    allow_comments: false,
+    dup_keys_last_wins: false,
+};
 
 impl<M> ConfigureSnapshot<M> {
     /// Version of the replay records. The frame encoding and its file name still use version 1.
-    pub const SCHEMA: &'static str = "configure.v3";
+    pub const SCHEMA: &'static str = "configure.v4";
 
     /// File name for the manifest under `CMakeFiles/rcmake`.
     pub const FILE_NAME: &'static str = "configure.v1.bin";
@@ -60,7 +59,6 @@ impl<M> ConfigureSnapshot<M> {
 
     pub(super) fn from_region(region: RegionRecord, model: M) -> Self {
         Self {
-            frame_schema: FrameSchema::V1,
             schema: Self::SCHEMA.into(),
             region,
             model,
@@ -68,7 +66,7 @@ impl<M> ConfigureSnapshot<M> {
     }
 }
 
-impl<M: Serialize> ConfigureSnapshot<M> {
+impl<M: ToJson> ConfigureSnapshot<M> {
     /// Encode this snapshot in a length-checked native-path frame.
     pub fn encode(&self) -> Result<Vec<u8>, ReplayCodecError> {
         let mut bytes = Vec::new();
@@ -76,7 +74,7 @@ impl<M: Serialize> ConfigureSnapshot<M> {
         bytes.push(PATH_ENCODING);
         let length_field = bytes.len()..FRAME_HEADER;
         bytes.extend_from_slice(&0_u32.to_le_bytes());
-        write_json(self, &mut bytes, MAX_FRAME_BYTES).map_err(|_| ReplayCodecError::Payload)?;
+        write_json(self, &mut bytes, MAX_FRAME_BYTES).ok_or(ReplayCodecError::Payload)?;
         let len = (bytes.len() - FRAME_HEADER) as u32;
         bytes
             .get_mut(length_field)
@@ -88,7 +86,7 @@ impl<M: Serialize> ConfigureSnapshot<M> {
     }
 }
 
-impl<M: serde::de::DeserializeOwned> ConfigureSnapshot<M> {
+impl<M: FromJson> ConfigureSnapshot<M> {
     /// Decode a snapshot after checking the frame version, platform, and size.
     ///
     /// Limit host reads to the size returned by `frame_limit` before calling this method.
@@ -113,12 +111,39 @@ impl<M: serde::de::DeserializeOwned> ConfigureSnapshot<M> {
         if payload.len() > MAX_FRAME_BYTES || u32::from_le_bytes(*len) as usize != payload.len() {
             return Err(ReplayCodecError::Frame);
         }
-        let snapshot: Self =
-            serde_json::from_slice(payload).map_err(|_| ReplayCodecError::Payload)?;
+        let snapshot = parse(payload, &READ_OPTIONS)
+            .ok()
+            .and_then(|value| Self::from_json(&value).ok())
+            .ok_or(ReplayCodecError::Payload)?;
         if snapshot.schema != Self::SCHEMA {
             return Err(ReplayCodecError::Frame);
         }
         Ok(snapshot)
+    }
+}
+
+impl<M: ToJson> ToJson for ConfigureSnapshot<M> {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("schema", Value::string(FRAME_SCHEMA)),
+            ("replay_schema", self.schema.to_json()),
+            ("region", self.region.to_json()),
+            ("model", self.model.to_json()),
+        ])
+    }
+}
+
+impl<M: FromJson> FromJson for ConfigureSnapshot<M> {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = fields(value, &["schema", "replay_schema", "region", "model"])?;
+        if req::<String>(obj, "schema")? != FRAME_SCHEMA {
+            return Err(FieldError::invalid("unknown frame schema").in_field("schema"));
+        }
+        Ok(Self {
+            schema: req(obj, "replay_schema")?,
+            region: req(obj, "region")?,
+            model: req(obj, "model")?,
+        })
     }
 }
 

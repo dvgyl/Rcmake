@@ -687,8 +687,6 @@ dependencies = [
  "rcmake-model",
  "rcmake-regex",
  "rcmake-syntax",
- "serde",
- "serde_json",
  "sha2",
  "thiserror",
 ]

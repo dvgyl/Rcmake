@@ -2,11 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use rcmake_diag::{Backtrace, Frame, FrameKind};
+use rcmake_json::{FieldError, FromJson, Object, ToJson, Value, req};
 use rcmake_model::{CacheEntry, CacheType, PropertyMap};
-use serde::{Deserialize, Serialize};
 
+use super::codec::{
+    self, decode_variant, field, fields, unknown_variant, variant, variant_data, variant_fields,
+};
 use super::frame::{MAX_FRAME_BYTES, encoded_size};
-use super::path_bytes;
 use super::trace::{
     JournalDigest, JournalHasher, JournalInput, PropertyKey, PropertyOwner, StateKey, VariableScope,
 };
@@ -15,7 +17,7 @@ pub(super) const MAX_INPUTS: usize = 50_000;
 pub(super) const MAX_EFFECTS: usize = 200_000;
 
 /// An evaluation unit that can have its own journal.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegionKind {
     /// Whole configure.
     Configure,
@@ -24,7 +26,6 @@ pub enum RegionKind {
     /// A listfile included by a bootstrap script or by project code.
     Include {
         /// Absolute path to the included file.
-        #[serde(with = "path_bytes")]
         file: PathBuf,
     },
     /// Cold initialization of one enabled language.
@@ -35,20 +36,18 @@ pub enum RegionKind {
 }
 
 /// Stable identity of a region across configure runs.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegionKey {
     /// Absolute binary directory of the region.
-    #[serde(with = "path_bytes")]
     pub binary_dir: PathBuf,
     /// Absolute source directory of the region.
-    #[serde(with = "path_bytes")]
     pub source_dir: PathBuf,
     /// Kind of evaluation performed in the region.
     pub kind: RegionKind,
 }
 
 /// Context that must match before the region's inputs are checked.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntryContext {
     /// Content identity of the Rcmake executable and its build options.
     pub rcmake: JournalDigest,
@@ -63,7 +62,7 @@ pub struct EntryContext {
 }
 
 /// Reason a region must be evaluated again.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OpaqueReason {
     /// The evaluator has no replay classification for the operation.
     #[default]
@@ -79,21 +78,20 @@ pub enum OpaqueReason {
 }
 
 /// First command that prevented replay.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpaqueOperation {
     /// Reason the operation cannot replay.
     pub reason: OpaqueReason,
     /// Command name, when known.
     pub command: Option<Vec<u8>>,
     /// Source file, when known.
-    #[serde(with = "path_bytes")]
     pub file: PathBuf,
     /// One-based source line. Zero means unknown.
     pub line: u32,
 }
 
 /// Byte-preserving snapshot of a CMake cache entry.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheValue {
     value: Vec<u8>,
     ty: String,
@@ -155,15 +153,14 @@ impl CacheValue {
 }
 
 /// Recorded call stack stored with a property mutation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyOrigin {
     /// Absolute binary directory of the caller.
-    #[serde(with = "path_bytes")]
     pub binary_dir: PathBuf,
     frames: Vec<RecordedFrame>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RecordedFrame {
     file: Vec<u8>,
     line: u32,
@@ -171,11 +168,21 @@ struct RecordedFrame {
     kind: RecordedFrameKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecordedFrameKind {
     Command,
     Deferred,
     ModuleInclude,
+}
+
+impl RecordedFrameKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Command => "Command",
+            Self::Deferred => "Deferred",
+            Self::ModuleInclude => "ModuleInclude",
+        }
+    }
 }
 
 impl PropertyOrigin {
@@ -202,6 +209,21 @@ impl PropertyOrigin {
         self.frames.len()
     }
 
+    /// Hash the caller directory and every frame field.
+    pub(super) fn digest(&self) -> JournalDigest {
+        let mut hasher = JournalHasher::new(b"property-origin");
+        hasher.field(1, self.binary_dir.as_os_str().as_encoded_bytes());
+        for frame in &self.frames {
+            hasher.field(2, &frame.file);
+            hasher.field(3, &frame.line.to_le_bytes());
+            if let Some(name) = &frame.name {
+                hasher.field(4, name);
+            }
+            hasher.field(5, frame.kind.name().as_bytes());
+        }
+        hasher.finish()
+    }
+
     /// Reconstruct the call stack for the project model's property mutation API.
     #[must_use]
     pub fn backtrace(&self) -> Backtrace {
@@ -224,7 +246,7 @@ impl PropertyOrigin {
 }
 
 /// Mutation made to a property.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PropertyEdit {
     /// Set a value, or unset the property for `None`.
     Set(Option<Vec<u8>>),
@@ -235,7 +257,7 @@ pub enum PropertyEdit {
 }
 
 /// One observable effect in execution order.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JournalEffect {
     /// Set or unset a normal variable in the current or parent scope.
     SetVar {
@@ -374,7 +396,7 @@ impl Journal {
         self.effects.push(effect);
         Ok(())
     }
-    fn account(&mut self, value: &impl Serialize) -> Result<(), OpaqueReason> {
+    fn account(&mut self, value: &impl ToJson) -> Result<(), OpaqueReason> {
         // Reserve room for the manifest and for commas between records.
         let remaining = MAX_FRAME_BYTES
             .saturating_sub(self.bytes)
@@ -449,7 +471,7 @@ impl RegionState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum RegionPayload {
     Complete {
         inputs: Vec<JournalInput>,
@@ -459,7 +481,7 @@ pub(super) enum RegionPayload {
 }
 
 /// Recorded region keyed by its binary directory, source directory, and kind.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegionRecord {
     pub(super) key: RegionKey,
     pub(super) context: EntryContext,
@@ -471,5 +493,347 @@ impl RegionRecord {
     #[must_use]
     pub fn key(&self) -> &RegionKey {
         &self.key
+    }
+}
+
+impl ToJson for RegionKind {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Configure => Value::string("Configure"),
+            Self::Subdirectory => Value::string("Subdirectory"),
+            Self::Include { file } => {
+                variant("Include", Value::object_from([("file", codec::path(file))]))
+            }
+            Self::Bootstrap { language } => variant(
+                "Bootstrap",
+                Value::object_from([("language", codec::bytes(language))]),
+            ),
+        }
+    }
+}
+
+impl FromJson for RegionKind {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        decode_variant(value, |name, data| match (name, data) {
+            ("Configure", None) => Ok(Self::Configure),
+            ("Subdirectory", None) => Ok(Self::Subdirectory),
+            ("Include", _) => Ok(Self::Include {
+                file: field(
+                    variant_fields(name, data, &["file"])?,
+                    "file",
+                    codec::from_path,
+                )?,
+            }),
+            ("Bootstrap", _) => Ok(Self::Bootstrap {
+                language: field(
+                    variant_fields(name, data, &["language"])?,
+                    "language",
+                    codec::from_bytes,
+                )?,
+            }),
+            _ => Err(unknown_variant(name)),
+        })
+    }
+}
+
+impl ToJson for RegionKey {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("binary_dir", codec::path(&self.binary_dir)),
+            ("source_dir", codec::path(&self.source_dir)),
+            ("kind", self.kind.to_json()),
+        ])
+    }
+}
+
+impl FromJson for RegionKey {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = fields(value, &["binary_dir", "source_dir", "kind"])?;
+        Ok(Self {
+            binary_dir: field(obj, "binary_dir", codec::from_path)?,
+            source_dir: field(obj, "source_dir", codec::from_path)?,
+            kind: req(obj, "kind")?,
+        })
+    }
+}
+
+impl ToJson for EntryContext {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("rcmake", self.rcmake.to_json()),
+            ("policies", self.policies.to_json()),
+            ("diag", self.diag.to_json()),
+            ("log_level", self.log_level.to_json()),
+            ("flags", self.flags.to_json()),
+        ])
+    }
+}
+
+impl FromJson for EntryContext {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = fields(value, &["rcmake", "policies", "diag", "log_level", "flags"])?;
+        Ok(Self {
+            rcmake: req(obj, "rcmake")?,
+            policies: req(obj, "policies")?,
+            diag: req(obj, "diag")?,
+            log_level: req(obj, "log_level")?,
+            flags: req(obj, "flags")?,
+        })
+    }
+}
+
+impl ToJson for OpaqueReason {
+    fn to_json(&self) -> Value {
+        Value::string(match self {
+            Self::UnclassifiedCommand => "UnclassifiedCommand",
+            Self::ExecuteProcess => "ExecuteProcess",
+            Self::RandomOrTimestamp => "RandomOrTimestamp",
+            Self::ExternalMutation => "ExternalMutation",
+            Self::LimitExceeded => "LimitExceeded",
+        })
+    }
+}
+
+impl FromJson for OpaqueReason {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        match rcmake_json::str(value)? {
+            "UnclassifiedCommand" => Ok(Self::UnclassifiedCommand),
+            "ExecuteProcess" => Ok(Self::ExecuteProcess),
+            "RandomOrTimestamp" => Ok(Self::RandomOrTimestamp),
+            "ExternalMutation" => Ok(Self::ExternalMutation),
+            "LimitExceeded" => Ok(Self::LimitExceeded),
+            name => Err(unknown_variant(name)),
+        }
+    }
+}
+
+impl ToJson for OpaqueOperation {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("reason", self.reason.to_json()),
+            ("command", codec::opt_bytes(self.command.as_deref())),
+            ("file", codec::path(&self.file)),
+            ("line", self.line.to_json()),
+        ])
+    }
+}
+
+impl FromJson for OpaqueOperation {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = fields(value, &["reason", "command", "file", "line"])?;
+        Ok(Self {
+            reason: req(obj, "reason")?,
+            command: field(obj, "command", codec::from_opt_bytes)?,
+            file: field(obj, "file", codec::from_path)?,
+            line: req(obj, "line")?,
+        })
+    }
+}
+
+impl ToJson for CacheValue {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("value", codec::bytes(&self.value)),
+            ("ty", self.ty.to_json()),
+            ("help", codec::bytes(&self.help)),
+            ("advanced", self.advanced.to_json()),
+            ("props", codec::byte_pairs(&self.props)),
+        ])
+    }
+}
+
+impl FromJson for CacheValue {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = fields(value, &["value", "ty", "help", "advanced", "props"])?;
+        Ok(Self {
+            value: field(obj, "value", codec::from_bytes)?,
+            ty: req(obj, "ty")?,
+            help: field(obj, "help", codec::from_bytes)?,
+            advanced: req(obj, "advanced")?,
+            props: field(obj, "props", codec::from_byte_pairs)?,
+        })
+    }
+}
+
+impl ToJson for PropertyOrigin {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("binary_dir", codec::path(&self.binary_dir)),
+            ("frames", self.frames.to_json()),
+        ])
+    }
+}
+
+impl FromJson for PropertyOrigin {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = fields(value, &["binary_dir", "frames"])?;
+        Ok(Self {
+            binary_dir: field(obj, "binary_dir", codec::from_path)?,
+            frames: req(obj, "frames")?,
+        })
+    }
+}
+
+impl ToJson for RecordedFrame {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("file", codec::bytes(&self.file)),
+            ("line", self.line.to_json()),
+            ("name", codec::opt_bytes(self.name.as_deref())),
+            ("kind", Value::string(self.kind.name())),
+        ])
+    }
+}
+
+impl FromJson for RecordedFrame {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = fields(value, &["file", "line", "name", "kind"])?;
+        let kind = field(obj, "kind", |kind| match rcmake_json::str(kind)? {
+            "Command" => Ok(RecordedFrameKind::Command),
+            "Deferred" => Ok(RecordedFrameKind::Deferred),
+            "ModuleInclude" => Ok(RecordedFrameKind::ModuleInclude),
+            name => Err(unknown_variant(name)),
+        })?;
+        Ok(Self {
+            file: field(obj, "file", codec::from_bytes)?,
+            line: req(obj, "line")?,
+            name: field(obj, "name", codec::from_opt_bytes)?,
+            kind,
+        })
+    }
+}
+
+impl ToJson for PropertyEdit {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Set(value) => variant("Set", codec::opt_bytes(value.as_deref())),
+            Self::AppendList(value) => variant("AppendList", codec::bytes(value)),
+            Self::AppendString(value) => variant("AppendString", codec::bytes(value)),
+        }
+    }
+}
+
+impl FromJson for PropertyEdit {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        decode_variant(value, |name, data| {
+            let data = variant_data(name, data)?;
+            match name {
+                "Set" => codec::from_opt_bytes(data).map(Self::Set),
+                "AppendList" => codec::from_bytes(data).map(Self::AppendList),
+                "AppendString" => codec::from_bytes(data).map(Self::AppendString),
+                _ => Err(unknown_variant(name)),
+            }
+        })
+    }
+}
+
+impl ToJson for JournalEffect {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::SetVar { scope, name, value } => variant(
+                "SetVar",
+                Value::object_from([
+                    ("scope", scope.to_json()),
+                    ("name", codec::bytes(name)),
+                    ("value", codec::opt_bytes(value.as_deref())),
+                ]),
+            ),
+            Self::SetCache { name, entry } => variant(
+                "SetCache",
+                Value::object_from([("name", codec::bytes(name)), ("entry", entry.to_json())]),
+            ),
+            Self::Property { key, edit, origin } => variant(
+                "Property",
+                Value::object_from([
+                    ("key", key.to_json()),
+                    ("edit", edit.to_json()),
+                    ("origin", origin.to_json()),
+                ]),
+            ),
+        }
+    }
+}
+
+impl FromJson for JournalEffect {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        decode_variant(value, |name, data| {
+            let members = |allowed: &[&str]| variant_fields(name, data, allowed);
+            let name_of = |obj: &Object| field(obj, "name", codec::from_bytes);
+            match name {
+                "SetVar" => {
+                    let obj = members(&["scope", "name", "value"])?;
+                    Ok(Self::SetVar {
+                        scope: req(obj, "scope")?,
+                        name: name_of(obj)?,
+                        value: field(obj, "value", codec::from_opt_bytes)?,
+                    })
+                }
+                "SetCache" => {
+                    let obj = members(&["name", "entry"])?;
+                    Ok(Self::SetCache {
+                        name: name_of(obj)?,
+                        entry: req(obj, "entry")?,
+                    })
+                }
+                "Property" => {
+                    let obj = members(&["key", "edit", "origin"])?;
+                    Ok(Self::Property {
+                        key: req(obj, "key")?,
+                        edit: req(obj, "edit")?,
+                        origin: req(obj, "origin")?,
+                    })
+                }
+                _ => Err(unknown_variant(name)),
+            }
+        })
+    }
+}
+
+impl ToJson for RegionPayload {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Complete { inputs, effects } => variant(
+                "Complete",
+                Value::object_from([("inputs", inputs.to_json()), ("effects", effects.to_json())]),
+            ),
+            Self::Opaque(operation) => variant("Opaque", operation.to_json()),
+        }
+    }
+}
+
+impl FromJson for RegionPayload {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        decode_variant(value, |name, data| match name {
+            "Complete" => {
+                let obj = variant_fields(name, data, &["inputs", "effects"])?;
+                Ok(Self::Complete {
+                    inputs: req(obj, "inputs")?,
+                    effects: req(obj, "effects")?,
+                })
+            }
+            "Opaque" => OpaqueOperation::from_json(variant_data(name, data)?).map(Self::Opaque),
+            _ => Err(unknown_variant(name)),
+        })
+    }
+}
+
+impl ToJson for RegionRecord {
+    fn to_json(&self) -> Value {
+        Value::object_from([
+            ("key", self.key.to_json()),
+            ("context", self.context.to_json()),
+            ("payload", self.payload.to_json()),
+        ])
+    }
+}
+
+impl FromJson for RegionRecord {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = fields(value, &["key", "context", "payload"])?;
+        Ok(Self {
+            key: req(obj, "key")?,
+            context: req(obj, "context")?,
+            payload: req(obj, "payload")?,
+        })
     }
 }

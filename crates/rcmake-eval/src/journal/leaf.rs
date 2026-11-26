@@ -5,16 +5,20 @@ use std::path::Path;
 
 use rcmake_base::{BString, list};
 use rcmake_diag::{PolicyId, PolicyMap, PolicyStatus};
+use rcmake_json::{FieldError, FromJson, ToJson, Value as Json, req};
 use rcmake_model::{
     BT, DirId, LinkItem, PropertyMap, Target, TargetBinding, TargetKind, TargetOrigin, TestEntry,
     UsageField, UsageProps, UsageScope,
 };
 use rcmake_syntax::{ArgKind, Argument};
-use serde::{Deserialize, Serialize};
 
-use super::{JournalEffect, PropertyOrigin, VariableScope};
+use super::codec;
+use super::trace::JournalHasher;
+use super::{JournalDigest, JournalEffect, PropertyOrigin, VariableScope};
 use crate::{Interp, Registry, code::Code};
 
+#[cfg(test)]
+mod codec_tests;
 mod install;
 pub(crate) mod shape;
 
@@ -357,10 +361,9 @@ fn plain_target(name: &[u8]) -> bool {
         )
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub(super) struct LocalState {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) variable_inputs: Option<(usize, super::JournalDigest)>,
+    pub(super) variable_inputs: Option<(usize, JournalDigest)>,
     targets: Vec<TargetRecord>,
     aliases: Vec<(Vec<u8>, Vec<u8>)>,
     tests: Vec<TestRecord>,
@@ -595,7 +598,7 @@ impl LocalState {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct TestRecord {
     name: Vec<u8>,
     origin: PropertyOrigin,
@@ -657,7 +660,7 @@ impl TestRecord {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct TargetRecord {
     name: Vec<u8>,
     origin: PropertyOrigin,
@@ -729,7 +732,7 @@ impl TargetRecord {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub(super) struct Usage {
     fields: Vec<(String, Vec<Value>)>,
     links: Option<Vec<Link>>,
@@ -747,6 +750,27 @@ impl Usage {
             links: capture_links(usage.link_libraries.as_deref(), path, dir)?,
             interface_links: capture_links(usage.interface_link_libraries.as_deref(), path, dir)?,
         })
+    }
+
+    /// Hash every usage field, link, and origin.
+    pub(super) fn digest(&self) -> JournalDigest {
+        let mut hasher = JournalHasher::new(b"usage");
+        for (name, values) in &self.fields {
+            hasher.field(1, name.as_bytes());
+            for value in values {
+                value.hash(&mut hasher);
+            }
+        }
+        for (tag, links) in [(4, &self.links), (5, &self.interface_links)] {
+            if let Some(links) = links {
+                hasher.field(tag, b"");
+                for Link(value, scope) in links {
+                    value.hash(&mut hasher);
+                    hasher.field(6, scope.as_slice());
+                }
+            }
+        }
+        hasher.finish()
     }
 
     fn restore(&self, path: &Path, dir: DirId) -> Option<UsageProps> {
@@ -769,7 +793,7 @@ impl Usage {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct Link(Value, Option<u8>);
 
 fn capture_links(items: Option<&[LinkItem]>, bin: &Path, dir: DirId) -> Option<Option<Vec<Link>>> {
@@ -829,8 +853,15 @@ fn restore_links(items: Option<&[Link]>, bin: &Path, dir: DirId) -> Option<Optio
         .map(Some)
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct Value(Vec<u8>, PropertyOrigin);
+
+impl Value {
+    fn hash(&self, hasher: &mut JournalHasher) {
+        hasher.field(2, &self.0);
+        hasher.field(3, self.1.digest().as_bytes());
+    }
+}
 
 fn capture_values(values: &[BT<BString>], path: &Path) -> Vec<Value> {
     values
@@ -856,4 +887,197 @@ fn restore_values(values: &[Value], bin: &Path) -> Option<Vec<BT<BString>>> {
                 .then(|| BT::new(value.0.as_slice().into(), value.1.backtrace()))
         })
         .collect()
+}
+
+impl ToJson for LocalState {
+    fn to_json(&self) -> Json {
+        let variable_inputs = self
+            .variable_inputs
+            .as_ref()
+            .map_or(Json::Null, |(index, digest)| {
+                codec::pair(index.to_json(), digest.to_json())
+            });
+        Json::object_from([
+            ("variable_inputs", variable_inputs),
+            ("targets", self.targets.to_json()),
+            ("aliases", codec::byte_pairs(&self.aliases)),
+            ("tests", self.tests.to_json()),
+            ("installs", self.installs.to_json()),
+            ("link_check", self.link_check.to_json()),
+            ("directory_usage", self.directory_usage.to_json()),
+            ("used_cli", codec::bytes_list(&self.used_cli)),
+        ])
+    }
+}
+
+impl FromJson for LocalState {
+    fn from_json(value: &Json) -> Result<Self, FieldError> {
+        let obj = codec::fields(
+            value,
+            &[
+                "variable_inputs",
+                "targets",
+                "aliases",
+                "tests",
+                "installs",
+                "link_check",
+                "directory_usage",
+                "used_cli",
+            ],
+        )?;
+        let variable_inputs = codec::field(obj, "variable_inputs", |value| match value {
+            Json::Null => Ok(None),
+            _ => {
+                let (index, digest) = codec::from_pair(value)?;
+                Ok(Some((
+                    usize::from_json(index)?,
+                    JournalDigest::from_json(digest)?,
+                )))
+            }
+        })?;
+        Ok(Self {
+            variable_inputs,
+            targets: req(obj, "targets")?,
+            aliases: codec::field(obj, "aliases", codec::from_byte_pairs)?,
+            tests: req(obj, "tests")?,
+            installs: req(obj, "installs")?,
+            link_check: req(obj, "link_check")?,
+            directory_usage: req(obj, "directory_usage")?,
+            used_cli: codec::field(obj, "used_cli", codec::from_bytes_list)?,
+        })
+    }
+}
+
+const TEST_FIELDS: &[&str] = &[
+    "name",
+    "origin",
+    "command",
+    "configurations",
+    "working_directory",
+    "command_expand_lists",
+    "old_style",
+    "build_depends",
+];
+
+impl ToJson for TestRecord {
+    fn to_json(&self) -> Json {
+        Json::object_from([
+            ("name", codec::bytes(&self.name)),
+            ("origin", self.origin.to_json()),
+            ("command", codec::bytes_list(&self.command)),
+            ("configurations", codec::bytes_list(&self.configurations)),
+            (
+                "working_directory",
+                codec::opt_bytes(self.working_directory.as_deref()),
+            ),
+            ("command_expand_lists", self.command_expand_lists.to_json()),
+            ("old_style", self.old_style.to_json()),
+            ("build_depends", self.build_depends.to_json()),
+        ])
+    }
+}
+
+impl FromJson for TestRecord {
+    fn from_json(value: &Json) -> Result<Self, FieldError> {
+        let obj = codec::fields(value, TEST_FIELDS)?;
+        Ok(Self {
+            name: codec::field(obj, "name", codec::from_bytes)?,
+            origin: req(obj, "origin")?,
+            command: codec::field(obj, "command", codec::from_bytes_list)?,
+            configurations: codec::field(obj, "configurations", codec::from_bytes_list)?,
+            working_directory: codec::field(obj, "working_directory", codec::from_opt_bytes)?,
+            command_expand_lists: req(obj, "command_expand_lists")?,
+            old_style: req(obj, "old_style")?,
+            build_depends: req(obj, "build_depends")?,
+        })
+    }
+}
+
+impl ToJson for TargetRecord {
+    fn to_json(&self) -> Json {
+        Json::object_from([
+            ("name", codec::bytes(&self.name)),
+            ("origin", self.origin.to_json()),
+            ("props", codec::byte_pairs(&self.props)),
+            ("usage", self.usage.to_json()),
+            ("sources", self.sources.to_json()),
+        ])
+    }
+}
+
+impl FromJson for TargetRecord {
+    fn from_json(value: &Json) -> Result<Self, FieldError> {
+        let obj = codec::fields(value, &["name", "origin", "props", "usage", "sources"])?;
+        Ok(Self {
+            name: codec::field(obj, "name", codec::from_bytes)?,
+            origin: req(obj, "origin")?,
+            props: codec::field(obj, "props", codec::from_byte_pairs)?,
+            usage: req(obj, "usage")?,
+            sources: req(obj, "sources")?,
+        })
+    }
+}
+
+impl ToJson for Usage {
+    fn to_json(&self) -> Json {
+        Json::object_from([
+            (
+                "fields",
+                codec::list(&self.fields, |(name, values)| {
+                    codec::pair(name.to_json(), values.to_json())
+                }),
+            ),
+            ("links", self.links.to_json()),
+            ("interface_links", self.interface_links.to_json()),
+        ])
+    }
+}
+
+impl FromJson for Usage {
+    fn from_json(value: &Json) -> Result<Self, FieldError> {
+        let obj = codec::fields(value, &["fields", "links", "interface_links"])?;
+        let fields = codec::field(obj, "fields", |fields| {
+            codec::from_list(fields, |item| {
+                let (name, values) = codec::from_pair(item)?;
+                Ok((String::from_json(name)?, Vec::<Value>::from_json(values)?))
+            })
+        })?;
+        Ok(Self {
+            fields,
+            links: req(obj, "links")?,
+            interface_links: req(obj, "interface_links")?,
+        })
+    }
+}
+
+impl ToJson for Link {
+    fn to_json(&self) -> Json {
+        codec::pair(self.0.to_json(), self.1.to_json())
+    }
+}
+
+impl FromJson for Link {
+    fn from_json(value: &Json) -> Result<Self, FieldError> {
+        let (text, scope) = codec::from_pair(value)?;
+        Ok(Self(
+            Value::from_json(text)?,
+            Option::<u8>::from_json(scope)?,
+        ))
+    }
+}
+
+impl ToJson for Value {
+    fn to_json(&self) -> Json {
+        codec::pair(codec::bytes(&self.0), self.1.to_json())
+    }
+}
+
+impl FromJson for Value {
+    fn from_json(value: &Json) -> Result<Self, FieldError> {
+        let (text, origin) = codec::from_pair(value)?;
+        Ok(Self(
+            codec::from_bytes(text)?,
+            PropertyOrigin::from_json(origin)?,
+        ))
+    }
 }
