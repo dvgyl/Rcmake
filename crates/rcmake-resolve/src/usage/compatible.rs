@@ -94,12 +94,25 @@ impl Comparison {
 #[derive(Default)]
 pub(super) struct Properties {
     names: OnceCell<HashSet<BString>>,
-    implied: HashMap<(TargetId, ConfigId), HashSet<BString>>,
+    pub(super) implied: HashMap<(TargetId, ConfigId), HashSet<BString>>,
 }
 
 type Requirements = BTreeMap<BString, BTreeSet<Kind>>;
 
 impl Properties {
+    pub(super) fn with_implied(implied: HashMap<(TargetId, ConfigId), HashSet<BString>>) -> Self {
+        Self {
+            names: OnceCell::new(),
+            implied,
+        }
+    }
+
+    pub(super) fn has_declarations(target: &Target) -> bool {
+        Kind::ALL
+            .into_iter()
+            .any(|kind| target.props.get(kind.declaration().as_bytes()).is_some())
+    }
+
     fn contains(&self, model: &ProjectModel, name: &[u8]) -> bool {
         self.names
             .get_or_init(|| {
@@ -136,7 +149,11 @@ impl UsageResolver<'_> {
             value: raw.unwrap_or_default(),
             flags: EvalFlags::default(),
         };
-        if name != PIC && (builtin::contains(name) || !self.compatible.contains(self.model, name)) {
+        if name != PIC
+            && (!self.has_compatible_decls
+                || builtin::contains(name)
+                || !self.compatible.contains(self.model, name))
+        {
             return Ok(raw_view(raw));
         }
         if let Some(property) = &ctx.site.property
@@ -218,6 +235,13 @@ impl UsageResolver<'_> {
         if target.kind == TargetKind::InterfaceLibrary {
             return Ok(None);
         }
+        if !self.has_compatible_decls && !self.has_interface_pic && !self.debug_properties {
+            let own = target.props.get(PIC);
+            let implied = self.compatible.implied(id, &ctx.config, PIC);
+            return Ok(own
+                .map(|value| truth::is_on(value))
+                .or_else(|| implied.then_some(false)));
+        }
         let deps = self.compatibility_targets(id, ctx)?;
         let mut rules = self.declared_rules(target, &deps, paths)?;
         rules.entry(PIC.into()).or_default().insert(Kind::Bool);
@@ -277,7 +301,7 @@ impl UsageResolver<'_> {
         paths: &SourcePaths<'_>,
     ) -> Result<(), ResolveError> {
         let target = self.target(id)?;
-        if target.kind == TargetKind::InterfaceLibrary {
+        if target.kind == TargetKind::InterfaceLibrary || !self.has_compatible_decls {
             return Ok(());
         }
         // The link language is not known yet. A failure to find the

@@ -1,9 +1,9 @@
 use rcmake_base::BString;
 use rcmake_model::{GeneratorKind, TargetEvent};
 
-use crate::{BuildGraph, BuildStep, CustomStep, ResolveError, usage::UsageResolver};
+use crate::{BuildStep, CustomStep, ResolveError, usage::UsageResolver};
 
-use super::{Commands, TargetPlan, command_path, push};
+use super::{Commands, GraphSink, TargetPlan, command_path};
 use crate::lower::custom::remove_own_outputs;
 
 impl TargetPlan<'_> {
@@ -11,7 +11,7 @@ impl TargetPlan<'_> {
         &mut self,
         commands: &Commands<'_>,
         usage: &mut UsageResolver<'_>,
-        graph: &mut BuildGraph,
+        sink: &mut GraphSink<'_>,
     ) -> Result<(), ResolveError> {
         let multi = self.model.generator == Some(GeneratorKind::NinjaMultiConfig);
         let events @ [pre_build, post_build] =
@@ -40,11 +40,11 @@ impl TargetPlan<'_> {
                 after
                     .outputs
                     .insert(0, command_path(self.model, dir, &path));
-                self.add_utility_recipe(commands, graph, std::mem::take(&mut utility));
+                self.add_utility_recipe(commands, sink, std::mem::take(&mut utility));
                 utility = after;
             }
         }
-        self.add_utility_recipe(commands, graph, utility);
+        self.add_utility_recipe(commands, sink, utility);
         Ok(())
     }
 
@@ -67,7 +67,7 @@ impl TargetPlan<'_> {
     fn add_utility_recipe(
         &mut self,
         commands: &Commands<'_>,
-        graph: &mut BuildGraph,
+        sink: &mut GraphSink<'_>,
         mut recipe: CustomStep,
     ) {
         if recipe == CustomStep::default() {
@@ -78,8 +78,8 @@ impl TargetPlan<'_> {
             .depends
             .retain(|dep| dep != &self.target.name || commands.producer(dep).is_some());
         self.dependencies.shift_remove(&self.resolved.id);
-        let index = push(&mut graph.steps, BuildStep::Custom(recipe));
+        let index = sink.push(BuildStep::Custom(recipe));
         self.steps.insert(index);
-        graph.utility_steps.insert(index);
+        sink.utility_steps.insert(index);
     }
 }

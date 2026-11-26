@@ -462,7 +462,7 @@ impl<'a> XcodeConfigFiles<'a> {
         config: &[u8],
     ) -> Result<Self, ResolveError> {
         let mut paths = SourcePaths::new(host);
-        paths.ide = Some(IdeFlavor::Xcode);
+        paths.set_ide(Some(IdeFlavor::Xcode));
         paths.index_generated(model, &ConfigId(config.into()))?;
         Ok(Self(paths))
     }

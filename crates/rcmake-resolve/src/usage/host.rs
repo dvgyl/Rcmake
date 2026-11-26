@@ -401,7 +401,7 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         ) {
             match &self.deferred_warnings {
                 Some(deferred) => deferred.borrow_mut().push(text),
-                None => paths.host.write_out(rcmake_host::Stream::Stderr, &text),
+                None => paths.emit_rendered_warning_once(text),
             }
         }
     }
@@ -727,7 +727,7 @@ impl GenexHost for ModelGenexHost<'_, '_> {
         };
         match &self.deferred_warnings {
             Some(deferred) => deferred.borrow_mut().push(text),
-            None => paths.host.write_out(rcmake_host::Stream::Stderr, &text),
+            None => paths.emit_rendered_warning_once(text),
         }
     }
 
@@ -742,7 +742,7 @@ impl ModelGenexHost<'_, '_> {
     pub(crate) fn write_warnings(&self, texts: impl IntoIterator<Item = BString>) {
         if let Some(paths) = self.resolver.source_paths() {
             for text in texts {
-                paths.host.write_out(rcmake_host::Stream::Stderr, &text);
+                paths.emit_rendered_warning_once(text);
             }
         }
     }

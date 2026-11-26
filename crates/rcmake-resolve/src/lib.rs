@@ -19,6 +19,7 @@ mod exports;
 pub mod file_sets;
 mod install_manifest;
 mod model;
+mod parallel;
 mod pipeline;
 mod resolve_link;
 mod scoped_usage_host;

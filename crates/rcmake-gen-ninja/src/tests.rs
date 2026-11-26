@@ -1557,3 +1557,228 @@ fn link_depfile_survives_response_file_selection() -> Result<(), Box<dyn std::er
     }
     Ok(())
 }
+
+#[test]
+fn parallel_emit_matches_serial_across_80_targets() -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+
+    let mut steps = Vec::new();
+    let mut targets = Vec::new();
+    for i in 0..80usize {
+        let obj_a = BString::from(format!("obj/t_{i:02}_a.o"));
+        let obj_b = BString::from(format!("obj/t_{i:02}_b.o"));
+        let lib = BString::from(format!("libt_{i:02}.a"));
+        let step_a = steps.len();
+        steps.push(BuildStep::Compile {
+            byproducts: Vec::new(),
+            compile_input: None,
+            object: obj_a.clone(),
+            source: format!("/work/src/t_{i:02}_a.c").into(),
+            invocation: Invocation {
+                shell: format!("cc -c /work/src/t_{i:02}_a.c -o {obj_a}").into(),
+                ..Invocation::default()
+            },
+            depfile: Some(format!("obj/t_{i:02}_a.d").into()),
+            modmap: None,
+            dyndep: None,
+        });
+        let step_b = steps.len();
+        steps.push(BuildStep::Compile {
+            byproducts: Vec::new(),
+            compile_input: None,
+            object: obj_b.clone(),
+            source: format!("/work/src/t_{i:02}_b.c").into(),
+            invocation: Invocation {
+                shell: format!("cc -c /work/src/t_{i:02}_b.c -o {obj_b}").into(),
+                ..Invocation::default()
+            },
+            depfile: Some(format!("obj/t_{i:02}_b.d").into()),
+            modmap: None,
+            dyndep: None,
+        });
+        let link_idx = steps.len();
+        steps.push(BuildStep::Link {
+            implicit_inputs: Vec::new(),
+            inputs: vec![obj_a, obj_b],
+            step: LinkStep {
+                kind: LinkKind::StaticArchive,
+                language: "C".into(),
+                fragments: Vec::new(),
+                output: lib,
+            },
+            invocations: vec![Invocation {
+                shell: format!("ar qc libt_{i:02}.a obj/t_{i:02}_a.o obj/t_{i:02}_b.o").into(),
+                ..Invocation::default()
+            }],
+        });
+        targets.push(GraphTarget {
+            name: format!("t_{i:02}").into(),
+            steps: vec![step_a, step_b, link_idx],
+            depends: if i > 0 { vec![i - 1] } else { Vec::new() },
+            in_all: true,
+        });
+    }
+    let build_graph = BuildGraph {
+        steps,
+        targets,
+        ..BuildGraph::default()
+    };
+    let artifacts = BTreeMap::new();
+    let graph = Graph::new(&build_graph, &artifacts, Path::new("/work/build"), None)?;
+    let custom_inputs = BTreeMap::new();
+
+    let mut serial = graph.manifest();
+    graph.emit_into_with_workers(
+        &mut serial,
+        b"cmake",
+        b"",
+        &[],
+        None,
+        &custom_inputs,
+        Some(1),
+    )?;
+    let mut parallel = graph.manifest();
+    graph.emit_into_with_workers(
+        &mut parallel,
+        b"cmake",
+        b"",
+        &[],
+        None,
+        &custom_inputs,
+        Some(4),
+    )?;
+
+    assert_eq!(serial.0, parallel.0);
+    Ok(())
+}
+
+#[test]
+fn parallel_emit_with_shared_outputs_byproducts_and_aliases_is_deterministic()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::{BTreeMap, HashSet};
+
+    let mut steps = Vec::new();
+    let mut targets = Vec::new();
+    let mut artifact_sets = Vec::new();
+    for i in 0..70usize {
+        if i == 10 {
+            let idx = steps.len();
+            steps.push(BuildStep::Custom(CustomStep {
+                outputs: vec!["gen_10.c".into()],
+                byproducts: vec!["shared_custom_byproduct.h".into()],
+                invocations: vec![Invocation {
+                    shell: "echo gen".into(),
+                    ..Invocation::default()
+                }],
+                ..CustomStep::default()
+            }));
+            targets.push(GraphTarget {
+                name: format!("t_{i:02}").into(),
+                steps: vec![idx],
+                depends: Vec::new(),
+                in_all: true,
+            });
+            continue;
+        }
+        let obj = BString::from(format!("obj/t_{i:02}.o"));
+        let lib = BString::from(format!("libt_{i:02}.so.1.0"));
+        let compile_idx = steps.len();
+        steps.push(BuildStep::Compile {
+            byproducts: Vec::new(),
+            compile_input: None,
+            object: obj.clone(),
+            source: format!("/work/src/t_{i:02}.c").into(),
+            invocation: Invocation {
+                shell: format!("cc -c /work/src/t_{i:02}.c -o {obj}").into(),
+                ..Invocation::default()
+            },
+            depfile: None,
+            modmap: None,
+            dyndep: None,
+        });
+        let link_idx = steps.len();
+        steps.push(BuildStep::Link {
+            implicit_inputs: Vec::new(),
+            inputs: vec![obj],
+            step: LinkStep {
+                kind: LinkKind::SharedLibrary,
+                language: "C".into(),
+                fragments: Vec::new(),
+                output: lib.clone(),
+            },
+            invocations: vec![Invocation {
+                shell: format!("cc -shared -o {lib} obj/t_{i:02}.o").into(),
+                ..Invocation::default()
+            }],
+        });
+        if i == 20 {
+            artifact_sets.push((
+                BString::from(format!("t_{i:02}")),
+                ArtifactSet {
+                    file: Some(lib),
+                    soname_file: Some("libt_20.so.1".into()),
+                    linker_file: Some("libt_20.so".into()),
+                    ..ArtifactSet::default()
+                },
+            ));
+        }
+        targets.push(GraphTarget {
+            name: format!("t_{i:02}").into(),
+            steps: vec![compile_idx, link_idx],
+            depends: Vec::new(),
+            in_all: true,
+        });
+    }
+    let build_graph = BuildGraph {
+        steps,
+        targets,
+        ..BuildGraph::default()
+    };
+    let artifacts: BTreeMap<&[u8], &ArtifactSet> = artifact_sets
+        .iter()
+        .map(|(name, set)| (name.as_slice(), set))
+        .collect();
+    let graph = Graph::new(&build_graph, &artifacts, Path::new("/work/build"), None)?;
+    let custom_inputs = BTreeMap::new();
+
+    let pre_emitted: HashSet<BString> = [
+        BString::from("obj/t_03.o"),
+        BString::from("shared_custom_byproduct.h"),
+        BString::from("libt_20.so.1"),
+        BString::from("t_30"),
+    ]
+    .into_iter()
+    .collect();
+    let mut emitted_serial = pre_emitted.clone();
+    let mut emitted_parallel = pre_emitted;
+
+    let mut serial = graph.manifest();
+    graph.emit_into_with_workers(
+        &mut serial,
+        b"cmake",
+        b"",
+        &[],
+        Some(&mut emitted_serial),
+        &custom_inputs,
+        Some(1),
+    )?;
+    let mut parallel = graph.manifest();
+    graph.emit_into_with_workers(
+        &mut parallel,
+        b"cmake",
+        b"",
+        &[],
+        Some(&mut emitted_parallel),
+        &custom_inputs,
+        Some(4),
+    )?;
+
+    assert_eq!(serial.0, parallel.0);
+    assert_eq!(emitted_serial, emitted_parallel);
+    let text = String::from_utf8(parallel.0)?;
+    assert!(!text.contains("build obj/t_03.o:"));
+    assert!(!text.contains("build gen_10.c"));
+    assert!(text.contains("build libt_20.so.1.0 | libt_20.so:"));
+    assert!(!text.contains("build t_30: phony"));
+    Ok(())
+}

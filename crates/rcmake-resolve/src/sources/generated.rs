@@ -82,15 +82,19 @@ impl SourcePaths<'_> {
                 let output = result?.0;
                 if !output.is_empty() {
                     let path = absolute_path(base, &output);
-                    self.generated
-                        .entry(path.clone())
-                        .or_default()
-                        .insert(dir.binary_dir.clone());
-                    if !reads.is_empty() {
-                        self.output_source_reads
-                            .entry(path)
+                    if let Some(index) = self.index_mut() {
+                        index
+                            .generated
+                            .entry(path.clone())
                             .or_default()
-                            .extend(reads);
+                            .insert(dir.binary_dir.clone());
+                        if !reads.is_empty() {
+                            index
+                                .output_source_reads
+                                .entry(path)
+                                .or_default()
+                                .extend(reads);
+                        }
                     }
                 }
             }

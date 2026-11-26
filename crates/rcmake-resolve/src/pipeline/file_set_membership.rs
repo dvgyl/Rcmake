@@ -66,15 +66,7 @@ impl Membership {
                 PolicyStatus::Old => break,
                 PolicyStatus::Warn => {
                     let occurrence = warnings.entry(body.clone()).or_default();
-                    if paths.first_file_set_warning(target, &body, *occurrence) {
-                        crate::pipeline::policy_warning(
-                            model,
-                            paths.host,
-                            policy,
-                            target,
-                            &body.to_string(),
-                        );
-                    }
+                    paths.emit_file_set_warning(model, policy, target, &body, *occurrence);
                     *occurrence += 1;
                 }
                 PolicyStatus::New => {

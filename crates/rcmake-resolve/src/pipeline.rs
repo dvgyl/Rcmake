@@ -16,10 +16,10 @@ use crate::{
     cxx_modules::{generation_location, module_error, stdlib},
     exports::resolve_exports,
     ide, lower,
-    resolve_link::{attach_links, resolve_link},
+    resolve_link::{ResolvedLink, attach_links, resolve_link},
     sources::{
-        SourcePaths, TargetInputs, assign_file_set_source_groups, generation_source_location,
-        validate_object_sources,
+        BufferedHost, DiagBuffer, DiagEvent, SourcePaths, TargetInputs,
+        assign_file_set_source_groups, generation_source_location, validate_object_sources,
     },
     target::resolve_target,
     unity,
@@ -49,7 +49,14 @@ pub fn resolve(
     host: &dyn Host,
     configs: &[ConfigId],
 ) -> Result<GenerationResult, ResolveError> {
-    resolve_project(model, host, configs, &ResolveOptions::default(), false)
+    resolve_project(
+        model,
+        host,
+        configs,
+        &ResolveOptions::default(),
+        false,
+        None,
+    )
 }
 
 /// Resolve with a capability source. Return the first missing source as an error.
@@ -63,7 +70,7 @@ pub fn resolve_with_facts(
         generator_facts: Some(facts),
         ..Default::default()
     };
-    resolve_project(model, host, configs, &options, false)
+    resolve_project(model, host, configs, &options, false, None)
 }
 
 /// Resolve and lower the project in configuration order, with `options`.
@@ -77,7 +84,26 @@ pub fn resolve_with_options(
     configs: &[ConfigId],
     options: &ResolveOptions,
 ) -> Result<GenerationResult, ResolveError> {
-    resolve_project(model, host, configs, options, true)
+    resolve_project(model, host, configs, options, true, None)
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_with_workers(
+    model: &ProjectModel,
+    host: &dyn Host,
+    configs: &[ConfigId],
+    options: &ResolveOptions,
+    collect_source_errors: bool,
+    workers: usize,
+) -> Result<GenerationResult, ResolveError> {
+    resolve_project(
+        model,
+        host,
+        configs,
+        options,
+        collect_source_errors,
+        Some(workers),
+    )
 }
 
 fn resolve_project(
@@ -86,6 +112,7 @@ fn resolve_project(
     configs: &[ConfigId],
     options: &ResolveOptions,
     collect_source_errors: bool,
+    workers_override: Option<usize>,
 ) -> Result<GenerationResult, ResolveError> {
     // Direct callers can supply a model before finalization.
     let mut entries = crate::usage::includes::pending_current_dir_interfaces(model).peekable();
@@ -129,9 +156,9 @@ fn resolve_project(
     }
     crate::InstallManifest::validate_bmi_destinations(model, &configs, host)?;
     let mut paths = SourcePaths::new(host);
-    paths.ide = options.ide;
-    paths.generator_facts = options.generator_facts.as_deref();
-    paths.collect_source_errors = collect_source_errors;
+    paths.set_ide(options.ide);
+    paths.set_generator_facts(options.generator_facts.as_deref());
+    paths.set_collect_source_errors(collect_source_errors);
     for (dir, _) in model.dirs().filter(|(id, _)| lower::is_darwin(model, *id)) {
         lower::apple::arch::sdk_map(model, dir)?;
     }
@@ -139,12 +166,21 @@ fn resolve_project(
     let autogen = autogen::prepare(model, &mut paths, &configs)?;
     let model = autogen.as_ref().map_or(model, |plan| &plan.model);
     paths.index_source_records(model);
-    paths.unity = Some(unity::prepare(model, host, &mut paths, &configs)?);
+    let unity = unity::prepare(model, host, &mut paths, &configs)?;
+    paths.set_unity(Some(unity));
     check_notfound_target_properties(model, &paths)?;
     index_header_file_sets(model, &mut paths, &configs)?;
     let mut configured_targets = configs
         .iter()
-        .map(|config| resolve_targets(model, &mut paths, config, options.provenance))
+        .map(|config| {
+            resolve_targets(
+                model,
+                &mut paths,
+                config,
+                options.provenance,
+                workers_override,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let prepared = header_verify::prepare(model, &paths, &configs, &configured_targets)?;
     let model = if let Some(prepared) = &prepared {
@@ -218,6 +254,7 @@ fn resolve_project(
             &mut compile_inputs,
             &mut xcode_sources,
             &plan,
+            workers_override,
         )?;
         provenance.extend(output.provenance.unwrap_or_default());
         runtime_languages.extend(
@@ -545,58 +582,233 @@ fn index_header_file_sets(
     Ok(())
 }
 
+enum TargetResolveOutcome {
+    Ok(Box<(ResolvedTarget, TargetInputs)>),
+    ResolveErr(ResolveError),
+    ObjectSourcesErr(ResolveError),
+}
+
+struct TargetResolveWork {
+    id: TargetId,
+    dir: DirId,
+    diag_events: Vec<DiagEvent>,
+    provenance: Option<Provenance>,
+    outcome: TargetResolveOutcome,
+}
+
+/// Return `true` when target resolution may invoke the Ninja C++20 dyndep
+/// capability query or a caller-supplied [`GeneratorFacts`](crate::GeneratorFacts)
+/// callback. Running serially in those cases preserves exact capability-query
+/// attribution and avoids speculative probes past an earlier failing target.
+fn may_probe_ninja_cxx_dyndep(model: &ProjectModel, paths: &SourcePaths<'_>) -> bool {
+    if !matches!(
+        model.generator,
+        Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+    ) || paths.ninja_cxx_dyndep.get().is_some()
+    {
+        return false;
+    }
+    if paths.generator_facts.is_some() {
+        return true;
+    }
+    let supports_modules = |value: &[u8]| matches!(value, b"20" | b"23" | b"26");
+    let has_cxx20_feature = |entries: &[rcmake_model::BT<BString>]| {
+        entries.iter().any(|entry| {
+            entry
+                .value
+                .windows(10)
+                .any(|part| matches!(part, b"cxx_std_20" | b"cxx_std_23" | b"cxx_std_26"))
+                || entry.value.windows(2).any(|part| part == b"$<")
+        })
+    };
+    let mut has_cxx20 = false;
+    let mut has_scan_trigger = false;
+    for (_, target) in model.targets() {
+        if target.file_sets.iter().any(|&id| {
+            model
+                .file_set(id)
+                .is_some_and(|set| set.kind == rcmake_model::FileSetKind::CxxModules)
+        }) {
+            return true;
+        }
+        has_cxx20 |= has_cxx20_feature(
+            target
+                .usage
+                .entries(rcmake_model::UsageField::CompileFeatures),
+        ) || has_cxx20_feature(
+            target
+                .usage
+                .entries(rcmake_model::UsageField::InterfaceCompileFeatures),
+        );
+        if target.is_imported() {
+            continue;
+        }
+        has_cxx20 |= target
+            .props
+            .get(b"CXX_STANDARD")
+            .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_STANDARD"))
+            .is_some_and(|value| supports_modules(value));
+        has_scan_trigger |= lower::definition(model, target.dir, b"CMAKE_CXX_SCANDEP_SOURCE")
+            .is_some()
+            || target
+                .props
+                .get(b"CXX_SCAN_FOR_MODULES")
+                .or_else(|| lower::definition(model, target.dir, b"CMAKE_CXX_SCAN_FOR_MODULES"))
+                .is_some_and(|value| truth::is_on(value))
+            || model.dir(target.dir).source_props.values().any(|props| {
+                props
+                    .get(b"CXX_SCAN_FOR_MODULES")
+                    .is_some_and(|value| truth::is_on(value))
+            });
+    }
+    has_cxx20 && has_scan_trigger
+}
+
 fn resolve_targets(
     model: &ProjectModel,
     paths: &mut SourcePaths<'_>,
     config: &ConfigId,
     provenance: bool,
+    workers_override: Option<usize>,
 ) -> Result<ConfigTargets, ResolveError> {
     paths.index_generated(model, config)?;
     validate_file_sets(model, paths, config)?;
     paths.index_objects(model, config);
-    let mut usage = UsageResolver::with_source_paths(model, paths);
-    usage.provenance = provenance.then(Provenance::default);
+    let non_imported: Vec<(TargetId, &Target)> = model
+        .targets()
+        .filter(|(_, target)| !target.is_imported())
+        .collect();
+    let workers = if may_probe_ninja_cxx_dyndep(model, paths) {
+        1
+    } else {
+        workers_override.unwrap_or_else(|| {
+            crate::parallel::worker_count(
+                non_imported.len(),
+                crate::parallel::TARGET_PARALLEL_THRESHOLD,
+                crate::parallel::MAX_WORKERS,
+            )
+        })
+    };
     let ctx = EvalContext {
         config: config.clone(),
         ..EvalContext::default()
     };
     let mut configured = ConfigTargets::default();
+    let mut usage = UsageResolver::with_source_paths(model, paths);
+    usage.provenance = provenance.then(Provenance::default);
     // CMake reports the evaluation errors of each target and then fails.
     let mut failed = None;
-    for (id, target) in model.targets().filter(|(_, target)| !target.is_imported()) {
-        let resolved = usage
-            .validate_compatible_declarations(id, &ctx, paths)
-            .and_then(|()| resolve_target(model, paths, &mut usage, id, target, &ctx));
-        let (mut facts, target_inputs) = match resolved {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                failed = Some(report_target_error(paths, error)?);
-                continue;
+    if workers <= 1 || non_imported.len() <= 1 {
+        for (id, target) in non_imported {
+            let resolved = usage
+                .validate_compatible_declarations(id, &ctx, paths)
+                .and_then(|()| resolve_target(model, paths, &mut usage, id, target, &ctx));
+            let (mut facts, target_inputs) = match resolved {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    failed = Some(report_target_error(paths, error)?);
+                    continue;
+                }
+            };
+            validate_object_sources(
+                model,
+                paths,
+                &mut usage,
+                target,
+                &facts,
+                &target_inputs,
+                &ctx,
+            )?;
+            assign_file_set_source_groups(model, target, &mut facts);
+            for source in &target_inputs.sources {
+                if paths
+                    .output_source_reads
+                    .get(source)
+                    .is_some_and(|reads| reads.contains(&id))
+                {
+                    configured
+                        .file_generate_cycles
+                        .insert((target.dir, source.clone()));
+                }
             }
-        };
-        validate_object_sources(
-            model,
-            paths,
-            &mut usage,
-            target,
-            &facts,
-            &target_inputs,
-            &ctx,
-        )?;
-        assign_file_set_source_groups(model, target, &mut facts);
-        for source in &target_inputs.sources {
-            if paths
-                .output_source_reads
-                .get(source)
-                .is_some_and(|reads| reads.contains(&id))
-            {
-                configured
-                    .file_generate_cycles
-                    .insert((target.dir, source.clone()));
-            }
+            configured.targets.insert(id, facts);
+            configured.inputs.insert(id, target_inputs);
         }
-        configured.targets.insert(id, facts);
-        configured.inputs.insert(id, target_inputs);
+    } else {
+        let template = usage.worker_template();
+        let shared_index = paths.shared_index();
+        let host = paths.host;
+        let chunks = crate::parallel::map_chunks(&non_imported, workers, |chunk| {
+            let events = DiagBuffer::new();
+            let buffered = BufferedHost::new(host, &events);
+            let worker_paths = SourcePaths::for_worker(&buffered, shared_index, &events);
+            let mut worker_usage = template.build(Some(&worker_paths), provenance);
+            let mut outputs = Vec::with_capacity(chunk.len());
+            for &(id, target) in chunk {
+                worker_paths.reset_local_dedup();
+                let outcome = match worker_usage
+                    .validate_compatible_declarations(id, &ctx, &worker_paths)
+                    .and_then(|()| {
+                        resolve_target(model, &worker_paths, &mut worker_usage, id, target, &ctx)
+                    }) {
+                    Ok((mut facts, target_inputs)) => {
+                        match validate_object_sources(
+                            model,
+                            &worker_paths,
+                            &mut worker_usage,
+                            target,
+                            &facts,
+                            &target_inputs,
+                            &ctx,
+                        ) {
+                            Ok(()) => {
+                                assign_file_set_source_groups(model, target, &mut facts);
+                                TargetResolveOutcome::Ok(Box::new((facts, target_inputs)))
+                            }
+                            Err(error) => TargetResolveOutcome::ObjectSourcesErr(error),
+                        }
+                    }
+                    Err(error) => TargetResolveOutcome::ResolveErr(error),
+                };
+                let diag_events = events.take_events();
+                let target_provenance = worker_usage.provenance.as_mut().map(std::mem::take);
+                outputs.push(TargetResolveWork {
+                    id,
+                    dir: target.dir,
+                    diag_events,
+                    provenance: target_provenance,
+                    outcome,
+                });
+            }
+            outputs
+        });
+        for work in chunks.into_iter().flatten() {
+            paths.replay_events(work.diag_events);
+            if let (Some(dest), Some(src)) = (&mut usage.provenance, work.provenance) {
+                dest.extend(src);
+            }
+            let (facts, target_inputs) = match work.outcome {
+                TargetResolveOutcome::Ok(boxed) => *boxed,
+                TargetResolveOutcome::ResolveErr(error) => {
+                    failed = Some(report_target_error(paths, error)?);
+                    continue;
+                }
+                TargetResolveOutcome::ObjectSourcesErr(error) => return Err(error),
+            };
+            for source in &target_inputs.sources {
+                if paths
+                    .output_source_reads
+                    .get(source)
+                    .is_some_and(|reads| reads.contains(&work.id))
+                {
+                    configured
+                        .file_generate_cycles
+                        .insert((work.dir, source.clone()));
+                }
+            }
+            configured.targets.insert(work.id, facts);
+            configured.inputs.insert(work.id, target_inputs);
+        }
     }
     if let Some(error) = failed {
         return Err(error);
@@ -733,18 +945,17 @@ pub fn validate_codegen_name(model: &ProjectModel, host: &dyn Host) -> Result<()
     }
 }
 
-pub(crate) fn policy_warning(
+pub(crate) fn render_policy_warning(
     model: &ProjectModel,
-    host: &dyn Host,
     policy: PolicyId,
     target: &rcmake_model::Target,
     message: &str,
-) {
+) -> Option<BString> {
     if model
         .definition(target.dir, b"CMAKE_SUPPRESS_DEVELOPER_WARNINGS")
         .is_some_and(|value| truth::is_on(value))
     {
-        return;
+        return None;
     }
     let summary = match policy {
         id if id == PolicyId::new(171) => "'codegen' is a reserved target name.".into(),
@@ -774,16 +985,25 @@ pub(crate) fn policy_warning(
         },
         body: format!("Policy {policy} is not set: {summary}  Run \"cmake --help-policy {policy}\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\n{message}").into(),
     };
-    host.write_out(
-        Stream::Stderr,
-        &render(
-            &warning,
-            &RenderOptions {
-                relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
-                ..RenderOptions::default()
-            },
-        ),
-    );
+    Some(render(
+        &warning,
+        &RenderOptions {
+            relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+            ..RenderOptions::default()
+        },
+    ))
+}
+
+pub(crate) fn policy_warning(
+    model: &ProjectModel,
+    host: &dyn Host,
+    policy: PolicyId,
+    target: &rcmake_model::Target,
+    message: &str,
+) {
+    if let Some(rendered) = render_policy_warning(model, policy, target, message) {
+        host.write_out(Stream::Stderr, &rendered);
+    }
 }
 
 fn enabled_languages(model: &ProjectModel) -> Vec<BString> {
@@ -1112,6 +1332,103 @@ fn validate_link_items(
     failure.map_or(Ok(()), Err)
 }
 
+struct TargetLinkWork {
+    id: TargetId,
+    diag_events: Vec<DiagEvent>,
+    provenance: Option<Provenance>,
+    result: Result<ResolvedLink, ResolveError>,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Config resolution threads shared model, paths, plan, and worker controls."
+)]
+fn resolve_links(
+    model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
+    paths: &SourcePaths<'_>,
+    resolved: &IndexMap<TargetId, ResolvedTarget>,
+    ctx: &EvalContext,
+    precompiled: &lower::PchPlans,
+    plan: &ConfigurationPlan<'_>,
+    workers_override: Option<usize>,
+) -> Result<Vec<(TargetId, ResolvedLink)>, ResolveError> {
+    let non_imported: Vec<(TargetId, &Target)> = model
+        .targets()
+        .filter(|(_, target)| !target.is_imported())
+        .collect();
+    let workers = workers_override.unwrap_or_else(|| {
+        crate::parallel::worker_count(
+            non_imported.len(),
+            crate::parallel::TARGET_PARALLEL_THRESHOLD,
+            crate::parallel::MAX_WORKERS,
+        )
+    });
+    if workers <= 1 || non_imported.len() <= 1 {
+        return non_imported
+            .into_iter()
+            .map(|(id, target)| {
+                let ctx = EvalContext {
+                    link_language: plan.link_languages.get(&id).cloned(),
+                    ..ctx.clone()
+                };
+                resolve_link(model, usage, paths, resolved, id, target, &ctx, precompiled)
+                    .map(|link| (id, link))
+            })
+            .collect();
+    }
+    let record_provenance = usage.provenance.is_some();
+    let template = usage.worker_template();
+    let shared_index = paths.shared_index();
+    let host = paths.host;
+    let chunks = crate::parallel::map_chunks(&non_imported, workers, |chunk| {
+        let events = DiagBuffer::new();
+        let buffered = BufferedHost::new(host, &events);
+        let worker_paths = SourcePaths::for_worker(&buffered, shared_index, &events);
+        let mut worker_usage = template.build(Some(&worker_paths), record_provenance);
+        let mut outputs = Vec::with_capacity(chunk.len());
+        for &(id, target) in chunk {
+            worker_paths.reset_local_dedup();
+            let target_ctx = EvalContext {
+                link_language: plan.link_languages.get(&id).cloned(),
+                ..ctx.clone()
+            };
+            let result = resolve_link(
+                model,
+                &mut worker_usage,
+                &worker_paths,
+                resolved,
+                id,
+                target,
+                &target_ctx,
+                precompiled,
+            );
+            let diag_events = events.take_events();
+            let target_provenance = worker_usage.provenance.as_mut().map(std::mem::take);
+            outputs.push(TargetLinkWork {
+                id,
+                diag_events,
+                provenance: target_provenance,
+                result,
+            });
+        }
+        outputs
+    });
+    let mut links = Vec::with_capacity(non_imported.len());
+    for work in chunks.into_iter().flatten() {
+        paths.replay_events(work.diag_events);
+        if let (Some(dest), Some(src)) = (&mut usage.provenance, work.provenance) {
+            dest.extend(src);
+        }
+        links.push((work.id, work.result?));
+    }
+    Ok(links)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Config resolution coordinates target resolution, link resolution, and lowering."
+)]
 fn resolve_config(
     model: &ProjectModel,
     paths: &SourcePaths<'_>,
@@ -1120,6 +1437,7 @@ fn resolve_config(
     compile_inputs: &mut BTreeMap<BString, Vec<BString>>,
     xcode_sources: &mut IndexMap<TargetId, (ConfigId, Vec<BString>)>,
     plan: &ConfigurationPlan<'_>,
+    workers_override: Option<usize>,
 ) -> Result<ConfigOutput, ResolveError> {
     let ConfigTargets {
         targets: mut resolved,
@@ -1160,27 +1478,16 @@ fn resolve_config(
         &mut usage,
     )?;
     precompiled.register_objects(model, config, &mut usage);
-    let links = model
-        .targets()
-        .filter(|(_, target)| !target.is_imported())
-        .map(|(id, target)| {
-            let ctx = EvalContext {
-                link_language: plan.link_languages.get(&id).cloned(),
-                ..ctx.clone()
-            };
-            resolve_link(
-                model,
-                &mut usage,
-                paths,
-                &resolved,
-                id,
-                target,
-                &ctx,
-                &precompiled,
-            )
-            .map(|link| (id, link))
-        })
-        .collect::<Result<Vec<_>, _>>();
+    let links = resolve_links(
+        model,
+        &mut usage,
+        paths,
+        &resolved,
+        &ctx,
+        &precompiled,
+        plan,
+        workers_override,
+    );
     let links = match links {
         Err(error) if paths.ide == Some(ide::IdeFlavor::Xcode) => {
             // A configuration with no sources can also have no link language.
@@ -1215,7 +1522,7 @@ fn resolve_config(
     let mut resolved = resolved.into_values().collect::<Vec<_>>();
     let mut ide_lowering = lower::IdeLowering::default();
     let traced = (!plan.traced_commands.is_empty()).then_some(&plan.traced_commands);
-    let graph = lower::lower_with_inputs(
+    let graph = lower::lower_with_inputs_workers(
         model,
         &resolved,
         config,
@@ -1228,11 +1535,12 @@ fn resolve_config(
         plan.trace_config
             .filter(|&first| first == config)
             .map(|_| paths.host),
+        workers_override,
     )?;
     let mut cross_graphs = IndexMap::new();
     for settings in plan.cross.commands_for(config) {
         let key = (settings.command.clone(), config.clone());
-        let graph = lower::lower_with_inputs(
+        let graph = lower::lower_with_inputs_workers(
             model,
             &resolved,
             config,
@@ -1243,6 +1551,7 @@ fn resolve_config(
             &mut BTreeMap::new(),
             (Some(settings), traced),
             None,
+            workers_override,
         )?;
         cross_graphs.insert(key, graph);
     }

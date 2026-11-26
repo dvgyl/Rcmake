@@ -1,6 +1,8 @@
 //! Source paths and their build-time producers.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
+use std::ops::Deref;
+use std::sync::{Mutex, OnceLock};
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
@@ -101,6 +103,9 @@ pub(crate) fn has_source_compile_properties(
     props: SourceProperties<'_>,
     config: &ConfigId,
 ) -> bool {
+    if props.is_empty() {
+        return false;
+    }
     props.get(b"COMPILE_FLAGS").is_some()
         || (!config.0.is_empty() && props.get(&config_definition_property(config)).is_some())
         || SourceUsage::ALL
@@ -322,52 +327,289 @@ pub(crate) struct TargetInputs {
     pub(crate) file_set_order: Option<crate::FileSetOrder>,
 }
 
-pub(crate) struct SourcePaths<'a> {
-    pub(crate) host: &'a dyn Host,
+pub(crate) enum DiagEvent {
+    WriteOut(Stream, Vec<u8>),
+    ExtensionWarning {
+        key: (BString, BString),
+        bytes: BString,
+    },
+    Missing {
+        key: (BString, BString),
+        bytes: BString,
+    },
+    WarningOnce(BString),
+    FileSetWarning {
+        key: (DirId, BString, BString, usize),
+        bytes: BString,
+    },
+}
+
+#[derive(Default)]
+pub(crate) struct DiagBuffer(Mutex<Vec<DiagEvent>>);
+
+impl DiagBuffer {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&self, event: DiagEvent) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+
+    pub(crate) fn take_events(&self) -> Vec<DiagEvent> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+/// Host adapter that forwards all read-only operations and buffers `write_out`
+/// calls into a per-target [`DiagBuffer`] so parallel workers never interleave stderr.
+pub(crate) struct BufferedHost<'a> {
+    inner: &'a dyn Host,
+    events: &'a DiagBuffer,
+}
+
+impl<'a> BufferedHost<'a> {
+    pub(crate) fn new(inner: &'a dyn Host, events: &'a DiagBuffer) -> Self {
+        Self { inner, events }
+    }
+}
+
+impl Host for BufferedHost<'_> {
+    rcmake_host::forward_host!(inner, fs, env, process);
+
+    fn registry_host_view(&self) -> Option<rcmake_host::RegistryView> {
+        self.inner.registry_host_view()
+    }
+
+    fn registry_value(
+        &self,
+        root: rcmake_host::RegistryRoot,
+        subkey: &[u8],
+        name: Option<&[u8]>,
+        view: rcmake_host::RegistryView,
+    ) -> rcmake_host::HostResult<Option<BString>> {
+        self.inner.registry_value(root, subkey, name, view)
+    }
+
+    fn write_out(&self, stream: Stream, bytes: &[u8]) {
+        self.events
+            .push(DiagEvent::WriteOut(stream, bytes.to_vec()));
+    }
+
+    fn read_stdin(&self, limit: u64) -> rcmake_host::HostResult<Vec<u8>> {
+        self.inner.read_stdin(limit)
+    }
+
+    fn is_terminal(&self, stream: Stream) -> bool {
+        self.inner.is_terminal(stream)
+    }
+
+    fn terminal_width(&self, stream: Stream) -> Option<usize> {
+        self.inner.terminal_width(stream)
+    }
+
+    fn now(&self) -> rcmake_host::FileTime {
+        self.inner.now()
+    }
+
+    fn monotonic(&self) -> core::time::Duration {
+        self.inner.monotonic()
+    }
+
+    fn sleep(&self, duration: core::time::Duration) {
+        self.inner.sleep(duration);
+    }
+
+    fn time_zone(&self) -> rcmake_host::TimeZone {
+        self.inner.time_zone()
+    }
+
+    fn current_exe(&self) -> rcmake_host::HostResult<std::path::PathBuf> {
+        self.inner.current_exe()
+    }
+
+    fn initial_cwd(&self) -> std::path::PathBuf {
+        self.inner.initial_cwd()
+    }
+
+    fn system(&self) -> rcmake_host::SystemInfo {
+        self.inner.system()
+    }
+
+    fn effective_uid(&self) -> Option<u32> {
+        self.inner.effective_uid()
+    }
+}
+
+/// Read-only pre-indexed source and target facts shared across parallel workers.
+pub(crate) struct SourceIndex<'a> {
     pub(crate) xcframeworks: crate::xcframework::Plists,
     pub(crate) ide: Option<crate::ide::IdeFlavor>,
     pub(crate) collect_source_errors: bool,
-    pub(crate) ninja_cxx_dyndep: OnceCell<Option<bool>>,
+    pub(crate) ninja_cxx_dyndep: OnceLock<Option<bool>>,
     pub(crate) generator_facts: Option<&'a dyn crate::GeneratorFacts>,
-    extension_warnings: RefCell<IndexSet<(BString, BString)>>,
-    missing: RefCell<IndexSet<(BString, BString)>>,
-    /// Rendered generation warnings, so that a repeated evaluation warns once.
-    warnings: RefCell<IndexSet<BString>>,
-    file_set_warnings: RefCell<IndexSet<(DirId, BString, BString, usize)>>,
     root_source_dir: Option<BString>,
     absolute_sources: IndexMap<BString, IndexSet<BString>>,
-    generated: IndexMap<BString, IndexSet<BString>>,
+    pub(super) generated: IndexMap<BString, IndexSet<BString>>,
     pub(crate) output_source_reads: IndexMap<BString, IndexSet<TargetId>>,
     objects: IndexMap<BString, TargetId>,
     header_only: IndexMap<DirId, IndexSet<BString>>,
     pub(crate) unity: Option<crate::unity::UnityPlan>,
 }
 
+enum SourceIndexStorage<'a> {
+    Owned(Box<SourceIndex<'a>>),
+    Shared(&'a SourceIndex<'a>),
+}
+
+pub(crate) struct SourcePaths<'a> {
+    pub(crate) host: &'a dyn Host,
+    index: SourceIndexStorage<'a>,
+    extension_warnings: RefCell<IndexSet<(BString, BString)>>,
+    missing: RefCell<IndexSet<(BString, BString)>>,
+    /// Rendered generation warnings, so that a repeated evaluation warns once.
+    warnings: RefCell<IndexSet<BString>>,
+    file_set_warnings: RefCell<IndexSet<(DirId, BString, BString, usize)>>,
+    buffered_events: Option<&'a DiagBuffer>,
+}
+
+impl<'a> Deref for SourcePaths<'a> {
+    type Target = SourceIndex<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.index {
+            SourceIndexStorage::Owned(index) => index,
+            SourceIndexStorage::Shared(index) => index,
+        }
+    }
+}
+
 impl<'a> SourcePaths<'a> {
     pub(crate) fn new(host: &'a dyn Host) -> Self {
         Self {
             host,
-            xcframeworks: crate::xcframework::Plists::default(),
-            ide: None,
-            collect_source_errors: true,
-            ninja_cxx_dyndep: OnceCell::new(),
-            generator_facts: None,
+            index: SourceIndexStorage::Owned(Box::new(SourceIndex {
+                xcframeworks: crate::xcframework::Plists::default(),
+                ide: None,
+                collect_source_errors: true,
+                ninja_cxx_dyndep: OnceLock::new(),
+                generator_facts: None,
+                root_source_dir: None,
+                absolute_sources: IndexMap::new(),
+                generated: IndexMap::new(),
+                output_source_reads: IndexMap::new(),
+                objects: IndexMap::new(),
+                header_only: IndexMap::new(),
+                unity: None,
+            })),
             extension_warnings: RefCell::default(),
             missing: RefCell::default(),
             warnings: RefCell::default(),
             file_set_warnings: RefCell::default(),
-            root_source_dir: None,
-            absolute_sources: IndexMap::new(),
-            generated: IndexMap::new(),
-            output_source_reads: IndexMap::new(),
-            objects: IndexMap::new(),
-            header_only: IndexMap::new(),
-            unity: None,
+            buffered_events: None,
+        }
+    }
+
+    pub(crate) fn shared_index(&self) -> &SourceIndex<'a> {
+        self
+    }
+
+    pub(crate) fn for_worker<'w>(
+        host: &'w dyn Host,
+        index: &'w SourceIndex<'w>,
+        events: &'w DiagBuffer,
+    ) -> SourcePaths<'w> {
+        SourcePaths {
+            host,
+            index: SourceIndexStorage::Shared(index),
+            extension_warnings: RefCell::default(),
+            missing: RefCell::default(),
+            warnings: RefCell::default(),
+            file_set_warnings: RefCell::default(),
+            buffered_events: Some(events),
+        }
+    }
+
+    pub(crate) fn reset_local_dedup(&self) {
+        self.extension_warnings.borrow_mut().clear();
+        self.missing.borrow_mut().clear();
+        self.warnings.borrow_mut().clear();
+        self.file_set_warnings.borrow_mut().clear();
+    }
+
+    pub(crate) fn replay_events(&self, events: Vec<DiagEvent>) {
+        for event in events {
+            match event {
+                DiagEvent::WriteOut(stream, bytes) => {
+                    self.host.write_out(stream, &bytes);
+                }
+                DiagEvent::ExtensionWarning { key, bytes } => {
+                    if self.extension_warnings.borrow_mut().insert(key) {
+                        self.host.write_out(Stream::Stderr, &bytes);
+                    }
+                }
+                DiagEvent::Missing { key, bytes } => {
+                    if self.missing.borrow_mut().insert(key) {
+                        self.host.write_out(Stream::Stderr, &bytes);
+                    }
+                }
+                DiagEvent::WarningOnce(text) => {
+                    if self.warnings.borrow_mut().insert(text.clone()) {
+                        self.host.write_out(Stream::Stderr, &text);
+                    }
+                }
+                DiagEvent::FileSetWarning { key, bytes } => {
+                    if self.file_set_warnings.borrow_mut().insert(key) {
+                        self.host.write_out(Stream::Stderr, &bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn index_mut(&mut self) -> Option<&mut SourceIndex<'a>> {
+        match &mut self.index {
+            SourceIndexStorage::Owned(index) => Some(index),
+            SourceIndexStorage::Shared(_) => None,
+        }
+    }
+
+    pub(crate) fn set_ide(&mut self, ide: Option<crate::ide::IdeFlavor>) {
+        if let Some(index) = self.index_mut() {
+            index.ide = ide;
+        }
+    }
+
+    pub(crate) fn set_generator_facts(&mut self, facts: Option<&'a dyn crate::GeneratorFacts>) {
+        if let Some(index) = self.index_mut() {
+            index.generator_facts = facts;
+        }
+    }
+
+    pub(crate) fn set_collect_source_errors(&mut self, collect: bool) {
+        if let Some(index) = self.index_mut() {
+            index.collect_source_errors = collect;
+        }
+    }
+
+    pub(crate) fn set_unity(&mut self, unity: Option<crate::unity::UnityPlan>) {
+        if let Some(index) = self.index_mut() {
+            index.unity = unity;
         }
     }
 
     pub(crate) fn mark_header_only(&mut self, dir: DirId, path: BString) {
-        self.header_only.entry(dir).or_default().insert(path);
+        if let Some(index) = self.index_mut() {
+            index.header_only.entry(dir).or_default().insert(path);
+        }
     }
 
     pub(crate) fn is_header_only(&self, dir: DirId, path: &[u8]) -> bool {
@@ -377,9 +619,12 @@ impl<'a> SourcePaths<'a> {
     }
 
     pub(crate) fn index_source_records(&mut self, model: &ProjectModel) {
-        self.root_source_dir = Some(model.dir(DirId::ROOT).source_dir.clone());
+        let Some(index) = self.index_mut() else {
+            return;
+        };
+        index.root_source_dir = Some(model.dir(DirId::ROOT).source_dir.clone());
         for (_, target) in model.targets() {
-            let paths = self
+            let paths = index
                 .absolute_sources
                 .entry(model.dir(target.dir).binary_dir.clone())
                 .or_default();
@@ -401,8 +646,10 @@ impl<'a> SourcePaths<'a> {
         model: &ProjectModel,
         config: &ConfigId,
     ) -> Result<(), ResolveError> {
-        self.generated.clear();
-        self.output_source_reads.clear();
+        if let Some(index) = self.index_mut() {
+            index.generated.clear();
+            index.output_source_reads.clear();
+        }
         let mut usage = UsageResolver::new(model).with_ide(self.ide);
         let mut errors = Vec::new();
         for (_, command) in model.commands() {
@@ -416,20 +663,26 @@ impl<'a> SourcePaths<'a> {
                 }
             };
             let dir = model.dir(command.dir);
-            for path in outputs.into_iter().chain(byproducts) {
-                self.generated
-                    .entry(path)
-                    .or_default()
-                    .insert(dir.binary_dir.clone());
+            if let Some(index) = self.index_mut() {
+                for path in outputs.into_iter().chain(byproducts) {
+                    index
+                        .generated
+                        .entry(path)
+                        .or_default()
+                        .insert(dir.binary_dir.clone());
+                }
             }
         }
         crate::lower::custom::combine_errors(errors)?;
-        for (_, dir) in model.dirs() {
-            for path in &dir.generated_sources {
-                self.generated
-                    .entry(path.clone())
-                    .or_default()
-                    .insert(dir.binary_dir.clone());
+        if let Some(index) = self.index_mut() {
+            for (_, dir) in model.dirs() {
+                for path in &dir.generated_sources {
+                    index
+                        .generated
+                        .entry(path.clone())
+                        .or_default()
+                        .insert(dir.binary_dir.clone());
+                }
             }
         }
         self.index_file_generations(model, config, &mut usage)?;
@@ -437,21 +690,28 @@ impl<'a> SourcePaths<'a> {
     }
 
     pub(crate) fn index_objects(&mut self, model: &ProjectModel, config: &ConfigId) {
-        self.objects.clear();
-        let usage = UsageResolver::with_source_paths(model, self);
-        self.objects = model
-            .targets()
-            .filter(|(_, target)| {
-                target.kind.compiles_objects()
-                    && (!target.is_imported() || target.kind == TargetKind::ObjectLibrary)
-            })
-            .filter_map(|(id, _)| Some((id, usage.target_objects(id, config, None)?)))
-            .flat_map(|(id, objects)| {
-                list::split(&objects, list::Empty::Drop)
-                    .into_iter()
-                    .map(move |path| (Lexical::new(&path).normalize(), id))
-            })
-            .collect();
+        if let Some(index) = self.index_mut() {
+            index.objects.clear();
+        }
+        let objects = {
+            let usage = UsageResolver::with_source_paths(model, self);
+            model
+                .targets()
+                .filter(|(_, target)| {
+                    target.kind.compiles_objects()
+                        && (!target.is_imported() || target.kind == TargetKind::ObjectLibrary)
+                })
+                .filter_map(|(id, _)| Some((id, usage.target_objects(id, config, None)?)))
+                .flat_map(|(id, objects)| {
+                    list::split(&objects, list::Empty::Drop)
+                        .into_iter()
+                        .map(move |path| (Lexical::new(&path).normalize(), id))
+                })
+                .collect()
+        };
+        if let Some(index) = self.index_mut() {
+            index.objects = objects;
+        }
     }
 
     pub(crate) fn object_owner(&self, path: &[u8]) -> Option<TargetId> {
@@ -674,11 +934,12 @@ impl<'a> SourcePaths<'a> {
                             .metadata(&to_native(&candidate), Follow::Yes)
                             .is_ok_and(|metadata| metadata.kind == FileKind::File)
                     {
+                        let warning_key = (dir.binary_dir.clone(), identity);
                         if status == PolicyStatus::Warn
                             && self
                                 .extension_warnings
                                 .borrow_mut()
-                                .insert((dir.binary_dir.clone(), identity))
+                                .insert(warning_key.clone())
                         {
                             let warning = Diagnostic { annotations: None,
                                 kind: MessageKind::AuthorWarning,
@@ -688,18 +949,21 @@ impl<'a> SourcePaths<'a> {
                                 location: generation_source_location(Location::Backtrace(source.backtrace.clone())),
                                 body: format!("Policy CMP0115 is not set: Source file extensions must be explicit.  Run \"cmake --help-policy CMP0115\" for policy details.  Use the cmake_policy command to set the policy and suppress this warning.\nFile:\n  {candidate}").into(),
                             };
-                            self.host.write_out(
-                                Stream::Stderr,
-                                &render(
-                                    &warning,
-                                    &RenderOptions {
-                                        relative_base: Some(
-                                            model.dir(DirId::ROOT).source_dir.clone(),
-                                        ),
-                                        ..RenderOptions::default()
-                                    },
-                                ),
+                            let rendered = render(
+                                &warning,
+                                &RenderOptions {
+                                    relative_base: Some(model.dir(DirId::ROOT).source_dir.clone()),
+                                    ..RenderOptions::default()
+                                },
                             );
+                            if let Some(events) = self.buffered_events {
+                                events.push(DiagEvent::ExtensionWarning {
+                                    key: warning_key,
+                                    bytes: rendered,
+                                });
+                            } else {
+                                self.host.write_out(Stream::Stderr, &rendered);
+                            }
                         }
                         return Ok(Some(candidate));
                     }
@@ -719,11 +983,8 @@ impl<'a> SourcePaths<'a> {
         if !self.collect_source_errors {
             return Err(ResolveError::Message(body));
         }
-        if self
-            .missing
-            .borrow_mut()
-            .insert((dir.binary_dir.clone(), identity))
-        {
+        let missing_key = (dir.binary_dir.clone(), identity);
+        if self.missing.borrow_mut().insert(missing_key.clone()) {
             let frames: Vec<_> = source
                 .backtrace
                 .frames()
@@ -735,23 +996,49 @@ impl<'a> SourcePaths<'a> {
                 .fold(Backtrace::default(), |trace, frame| {
                     trace.push(frame.clone())
                 });
-            self.emit(model, MessageKind::Error, Location::Backtrace(trace), body);
+            let rendered = render_diagnostic(
+                Some(model.dir(DirId::ROOT).source_dir.clone()),
+                MessageKind::Error,
+                Location::Backtrace(trace),
+                body,
+            );
+            if let Some(events) = self.buffered_events {
+                events.push(DiagEvent::Missing {
+                    key: missing_key,
+                    bytes: rendered,
+                });
+            } else {
+                self.host.write_out(Stream::Stderr, &rendered);
+            }
         }
         Ok(None)
     }
 
-    pub(crate) fn first_file_set_warning(
+    pub(crate) fn emit_file_set_warning(
         &self,
+        model: &ProjectModel,
+        policy: PolicyId,
         target: &rcmake_model::Target,
         body: &BString,
         occurrence: usize,
-    ) -> bool {
-        self.file_set_warnings.borrow_mut().insert((
-            target.dir,
-            target.name.clone(),
-            body.clone(),
-            occurrence,
-        ))
+    ) {
+        let key = (target.dir, target.name.clone(), body.clone(), occurrence);
+        if !self.file_set_warnings.borrow_mut().insert(key.clone()) {
+            return;
+        }
+        let Some(rendered) =
+            crate::pipeline::render_policy_warning(model, policy, target, &body.to_string())
+        else {
+            return;
+        };
+        if let Some(events) = self.buffered_events {
+            events.push(DiagEvent::FileSetWarning {
+                key,
+                bytes: rendered,
+            });
+        } else {
+            self.host.write_out(Stream::Stderr, &rendered);
+        }
     }
 
     pub(crate) fn emit(
@@ -779,6 +1066,14 @@ impl<'a> SourcePaths<'a> {
         body: BString,
     ) {
         if let Some(text) = self.render_once(model, kind, policy, location, body) {
+            self.emit_rendered_warning_once(text);
+        }
+    }
+
+    pub(crate) fn emit_rendered_warning_once(&self, text: BString) {
+        if let Some(events) = self.buffered_events {
+            events.push(DiagEvent::WarningOnce(text));
+        } else {
             self.host.write_out(Stream::Stderr, &text);
         }
     }
@@ -819,22 +1114,8 @@ impl<'a> SourcePaths<'a> {
         location: Location,
         body: BString,
     ) {
-        let options = RenderOptions {
-            relative_base,
-            ..RenderOptions::default()
-        };
-        let location = generation_source_location(location);
-        let diagnostic = Diagnostic {
-            annotations: None,
-            kind,
-            effect: Effect::None,
-            category: None,
-            policy: None,
-            location,
-            body,
-        };
-        self.host
-            .write_out(Stream::Stderr, &render(&diagnostic, &options));
+        let rendered = render_diagnostic(relative_base, kind, location, body);
+        self.host.write_out(Stream::Stderr, &rendered);
     }
 
     pub(crate) fn target_error(
@@ -950,6 +1231,10 @@ pub(crate) struct SourceProperties<'a> {
 }
 
 impl<'a> SourceProperties<'a> {
+    pub(crate) fn is_empty(self) -> bool {
+        self.path.is_none() && self.relative.is_none()
+    }
+
     pub(crate) fn get(self, name: &[u8]) -> Option<&'a BString> {
         self.path
             .and_then(|props| props.get(name))
@@ -1078,6 +1363,28 @@ fn object_property(
         )
         .into(),
     ))
+}
+
+fn render_diagnostic(
+    relative_base: Option<BString>,
+    kind: MessageKind,
+    location: Location,
+    body: BString,
+) -> BString {
+    let options = RenderOptions {
+        relative_base,
+        ..RenderOptions::default()
+    };
+    let diagnostic = Diagnostic {
+        annotations: None,
+        kind,
+        effect: Effect::None,
+        category: None,
+        policy: None,
+        location: generation_source_location(location),
+        body,
+    };
+    render(&diagnostic, &options)
 }
 
 pub(crate) fn generation_source_location(location: Location) -> Location {

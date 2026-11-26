@@ -2,6 +2,7 @@ mod app_bundle;
 mod excluded_export;
 mod generation_rules;
 mod languages;
+mod parallel_determinism;
 mod parity;
 mod runtime_paths;
 mod wave7b;

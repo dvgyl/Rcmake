@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_diag::{Location, MessageKind};
@@ -18,8 +18,9 @@ use crate::{
 };
 
 #[derive(Default)]
-pub(crate) struct Plists(RefCell<HashMap<BString, Vec<Entry>>>);
+pub(crate) struct Plists(Mutex<HashMap<BString, Vec<Entry>>>);
 
+#[derive(Clone)]
 struct Entry {
     system: &'static [u8],
     variant: Option<Variant>,
@@ -55,10 +56,15 @@ impl Plists {
             );
             ResolveError::Reported(body)
         };
-        let mut cache = self.0.borrow_mut();
-        let entries = match cache.entry(root.clone()) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
+        let cached = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .cloned();
+        let entries = match cached {
+            Some(entries) => entries,
+            None => {
                 let value = read_plist(paths.host, &plist)
                     .ok_or_else(|| error(format!("Unable to parse plist file:\n  {plist}")))?;
                 let invalid = || error(format!("Invalid xcframework .plist file:\n  {plist}"));
@@ -80,13 +86,16 @@ impl Plists {
                 else {
                     return Err(invalid());
                 };
-                entry.insert(
-                    libraries
-                        .iter()
-                        .map(parse_entry)
-                        .collect::<Option<Vec<_>>>()
-                        .ok_or_else(invalid)?,
-                )
+                let parsed = libraries
+                    .iter()
+                    .map(parse_entry)
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(invalid)?;
+                let mut guard = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.entry(root.clone()).or_insert(parsed).clone()
             }
         };
         let system = apple::system(model, target.dir);

@@ -138,6 +138,9 @@ pub struct UsageResolver<'a> {
     active: Vec<(TargetId, BString)>,
     cycle_count: usize,
     has_injections: bool,
+    has_system_interface_includes: bool,
+    has_compatible_decls: bool,
+    has_interface_pic: bool,
     compatible: compatible::Properties,
     pub(crate) provenance: Option<provenance::Provenance>,
     pub(crate) runtime_install_targets: IndexSet<TargetId>,
@@ -149,10 +152,91 @@ pub struct UsageResolver<'a> {
     current_link_bt: Option<Backtrace>,
 }
 
+/// Thread-safe snapshot of immutable per-model metadata used to instantiate
+/// per-worker [`UsageResolver`] sessions without rescanning the project model.
+pub(crate) struct WorkerUsageTemplate<'a> {
+    model: &'a ProjectModel,
+    ide: Option<crate::ide::IdeFlavor>,
+    pch_objects: IndexMap<(TargetId, rcmake_genex::ConfigId), Vec<BString>>,
+    runtime_install_targets: IndexSet<TargetId>,
+    traced_sources: Option<&'a IndexMap<TargetId, IndexSet<BString>>>,
+    ids: Arc<[TargetId]>,
+    debug_configs: Vec<BString>,
+    debug_properties: bool,
+    has_injections: bool,
+    has_system_interface_includes: bool,
+    has_compatible_decls: bool,
+    has_interface_pic: bool,
+    compatible_implied: HashMap<(TargetId, rcmake_genex::ConfigId), HashSet<BString>>,
+}
+
+impl<'a> WorkerUsageTemplate<'a> {
+    pub(crate) fn build<'w>(
+        &'w self,
+        source_paths: Option<&'w SourcePaths<'w>>,
+        provenance: bool,
+    ) -> UsageResolver<'w> {
+        UsageResolver {
+            model: self.model,
+            ide: self.ide,
+            pch_objects: self.pch_objects.clone(),
+            artifact_properties: Vec::new(),
+            source_paths,
+            source_reads: None,
+            traced_sources: self.traced_sources,
+            ids: Arc::clone(&self.ids),
+            parsed: ParseCache::default(),
+            memo: HashMap::new(),
+            link_memo: HashMap::new(),
+            debug_configs: self.debug_configs.clone(),
+            debug_properties: self.debug_properties,
+            codemodel_backtraces: false,
+            active: Vec::new(),
+            cycle_count: 0,
+            has_injections: self.has_injections,
+            has_system_interface_includes: self.has_system_interface_includes,
+            has_compatible_decls: self.has_compatible_decls,
+            has_interface_pic: self.has_interface_pic,
+            compatible: compatible::Properties::with_implied(self.compatible_implied.clone()),
+            provenance: provenance.then(provenance::Provenance::default),
+            runtime_install_targets: self.runtime_install_targets.clone(),
+            property_reads: 0,
+            current_link_bt: None,
+        }
+    }
+}
+
 impl<'a> UsageResolver<'a> {
     /// Start a resolution session. Reuse it across targets and configurations.
     #[must_use]
     pub fn new(model: &'a ProjectModel) -> Self {
+        let mut ids = Vec::new();
+        let mut has_injections = false;
+        let mut has_system_interface_includes = false;
+        let mut has_compatible_decls = false;
+        let mut has_interface_pic = false;
+        for (id, target) in model.targets() {
+            ids.push(id);
+            has_injections |= target.props.get(link::DIRECT).is_some()
+                || target.props.get(link::EXCLUDE).is_some();
+            has_system_interface_includes |= !target
+                .usage
+                .entries(UsageField::InterfaceSystemIncludeDirectories)
+                .is_empty()
+                || (!target
+                    .usage
+                    .entries(UsageField::InterfaceIncludeDirectories)
+                    .is_empty()
+                    && target
+                        .props
+                        .get(b"SYSTEM")
+                        .map_or(target.is_imported(), |value| truth::is_on(value)));
+            has_compatible_decls |= compatible::Properties::has_declarations(target);
+            has_interface_pic |= target
+                .props
+                .get(b"INTERFACE_POSITION_INDEPENDENT_CODE")
+                .is_some();
+        }
         Self {
             model,
             ide: crate::ide::IdeFlavor::from_model(model),
@@ -162,7 +246,7 @@ impl<'a> UsageResolver<'a> {
             source_paths: None,
             source_reads: None,
             traced_sources: None,
-            ids: model.targets().map(|(id, _)| id).collect(),
+            ids: ids.into(),
             parsed: ParseCache::default(),
             memo: HashMap::new(),
             link_memo: HashMap::new(),
@@ -182,10 +266,28 @@ impl<'a> UsageResolver<'a> {
             provenance: None,
             property_reads: 0,
             current_link_bt: None,
-            has_injections: model.targets().any(|(_, target)| {
-                target.props.get(link::DIRECT).is_some()
-                    || target.props.get(link::EXCLUDE).is_some()
-            }),
+            has_injections,
+            has_system_interface_includes,
+            has_compatible_decls,
+            has_interface_pic,
+        }
+    }
+
+    pub(crate) fn worker_template(&self) -> WorkerUsageTemplate<'a> {
+        WorkerUsageTemplate {
+            model: self.model,
+            ide: self.ide,
+            pch_objects: self.pch_objects.clone(),
+            runtime_install_targets: self.runtime_install_targets.clone(),
+            traced_sources: self.traced_sources,
+            ids: Arc::clone(&self.ids),
+            debug_configs: self.debug_configs.clone(),
+            debug_properties: self.debug_properties,
+            has_injections: self.has_injections,
+            has_system_interface_includes: self.has_system_interface_includes,
+            has_compatible_decls: self.has_compatible_decls,
+            has_interface_pic: self.has_interface_pic,
+            compatible_implied: self.compatible.implied.clone(),
         }
     }
 
@@ -288,6 +390,9 @@ impl<'a> UsageResolver<'a> {
             provenance: None,
             property_reads: 0,
             has_injections: self.has_injections,
+            has_system_interface_includes: self.has_system_interface_includes,
+            has_compatible_decls: self.has_compatible_decls,
+            has_interface_pic: self.has_interface_pic,
             current_link_bt: None,
         }
     }
@@ -772,7 +877,7 @@ impl<'a> UsageResolver<'a> {
         let dependency_name = if interface {
             Cow::Borrowed(name)
         } else {
-            Cow::Owned([b"INTERFACE_", name].concat())
+            interface_property_name(name)
         };
         let (links, flags) = self.usage_links(id, interface, ctx)?;
         let mut result = WalkValue {
@@ -1019,6 +1124,21 @@ fn context(target: TargetId, ctx: &EvalContext, traversal: UsageTraversal) -> Ev
 
 pub(crate) fn handle(id: TargetId) -> TargetHandle {
     TargetHandle(id.index() as u32)
+}
+
+fn interface_property_name(name: &[u8]) -> Cow<'static, [u8]> {
+    match name {
+        b"INCLUDE_DIRECTORIES" => Cow::Borrowed(b"INTERFACE_INCLUDE_DIRECTORIES"),
+        b"COMPILE_DEFINITIONS" => Cow::Borrowed(b"INTERFACE_COMPILE_DEFINITIONS"),
+        b"COMPILE_OPTIONS" => Cow::Borrowed(b"INTERFACE_COMPILE_OPTIONS"),
+        b"COMPILE_FEATURES" => Cow::Borrowed(b"INTERFACE_COMPILE_FEATURES"),
+        b"LINK_OPTIONS" => Cow::Borrowed(b"INTERFACE_LINK_OPTIONS"),
+        b"LINK_DIRECTORIES" => Cow::Borrowed(b"INTERFACE_LINK_DIRECTORIES"),
+        b"LINK_DEPENDS" => Cow::Borrowed(b"INTERFACE_LINK_DEPENDS"),
+        b"SOURCES" => Cow::Borrowed(b"INTERFACE_SOURCES"),
+        b"PRECOMPILE_HEADERS" => Cow::Borrowed(b"INTERFACE_PRECOMPILE_HEADERS"),
+        _ => Cow::Owned([b"INTERFACE_", name].concat()),
+    }
 }
 
 fn interface_base(name: &[u8]) -> &[u8] {

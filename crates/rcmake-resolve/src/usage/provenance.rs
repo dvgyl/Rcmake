@@ -42,7 +42,36 @@ impl Provenance {
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
-        self.entries.extend(other.entries);
-        self.chains.extend(other.chains);
+        if other.entries.is_empty() && other.chains.is_empty() {
+            return;
+        }
+        let mut bases = IndexMap::new();
+        for (key, count) in other.ordinals {
+            let slot = self.ordinals.entry(key.clone()).or_default();
+            let base = *slot;
+            *slot = base.saturating_add(count);
+            if base != 0 {
+                bases.insert(key, base);
+            }
+        }
+        if bases.is_empty() {
+            self.entries.extend(other.entries);
+            self.chains.extend(other.chains);
+        } else {
+            for mut entry in other.entries {
+                let lookup = (entry.key.target, entry.key.config.clone(), entry.key.kind);
+                if let Some(&base) = bases.get(&lookup) {
+                    entry.key.ordinal = entry.key.ordinal.saturating_add(base);
+                }
+                self.entries.push(entry);
+            }
+            for (mut key, hops) in other.chains {
+                let lookup = (key.target, key.config.clone(), key.kind);
+                if let Some(&base) = bases.get(&lookup) {
+                    key.ordinal = key.ordinal.saturating_add(base);
+                }
+                self.chains.insert(key, hops);
+            }
+        }
     }
 }

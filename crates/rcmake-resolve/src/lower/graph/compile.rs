@@ -15,7 +15,11 @@ impl TargetPlan<'_> {
         (lint, framework_dirs): (&IndexMap<BString, bool>, &[(BString, bool)]),
         fortran: Option<&fortran::FortranPlan>,
         usage: &mut UsageResolver<'_>,
-        (graph_steps, compile_launchers): (&mut Vec<BuildStep>, &mut IndexMap<BString, BString>),
+        (graph_steps, step_offset, compile_launchers): (
+            &mut Vec<BuildStep>,
+            usize,
+            &mut IndexMap<BString, BString>,
+        ),
         (compile_inputs, ide_pch): (
             &mut BTreeMap<BString, Vec<BString>>,
             Option<&mut Vec<crate::ide::IdePch>>,
@@ -39,7 +43,8 @@ impl TargetPlan<'_> {
             cxx_standard,
             position_independent,
         )? {
-            self.steps.insert(push(graph_steps, step));
+            self.steps
+                .insert(push_offset(graph_steps, step_offset, step));
         }
         if let Some(plan) = fortran {
             for step in plan.scan_steps(
@@ -49,7 +54,8 @@ impl TargetPlan<'_> {
                 position_independent,
                 usage.source_paths().map(|paths| paths.host),
             )? {
-                self.steps.insert(push(graph_steps, step));
+                self.steps
+                    .insert(push_offset(graph_steps, step_offset, step));
             }
         }
         let mut pch_languages = IndexSet::new();
@@ -102,8 +108,11 @@ impl TargetPlan<'_> {
                                 false,
                             ));
                         } else {
-                            self.steps
-                                .insert(push(graph_steps, BuildStep::Custom(step.clone())));
+                            self.steps.insert(push_offset(
+                                graph_steps,
+                                step_offset,
+                                BuildStep::Custom(step.clone()),
+                            ));
                         }
                     }
                     if let Some(headers) = &mut ide_pch
@@ -180,7 +189,8 @@ impl TargetPlan<'_> {
                         if let Some(object) = &plan.companion_object {
                             objects.push(object.clone());
                         }
-                        self.steps.insert(push(graph_steps, step));
+                        self.steps
+                            .insert(push_offset(graph_steps, step_offset, step));
                     }
                 }
             }
@@ -244,7 +254,8 @@ impl TargetPlan<'_> {
             if let Some(plan) = fortran {
                 plan.bind_compile(&mut step);
             }
-            self.steps.insert(push(graph_steps, step));
+            self.steps
+                .insert(push_offset(graph_steps, step_offset, step));
         }
         Ok(objects
             .into_iter()

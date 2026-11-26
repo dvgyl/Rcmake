@@ -81,43 +81,56 @@ impl UsageResolver<'_> {
             )?;
         }
 
-        let (links, _) = self.usage_links(target, false, &ctx)?;
-        let mut todo: Vec<_> = links.iter().flat_map(|item| item.edge_targets()).collect();
-        let mut visited = HashSet::new();
-        while let Some(id) = todo.pop() {
-            if !visited.insert(id) {
-                continue;
+        if self.has_system_interface_includes {
+            let (links, _) = self.usage_links(target, false, &ctx)?;
+            let mut todo: Vec<_> = links.iter().flat_map(|item| item.edge_targets()).collect();
+            let mut visited = HashSet::new();
+            while let Some(id) = todo.pop() {
+                if !visited.insert(id) {
+                    continue;
+                }
+                let dependency = self.target(id)?;
+                let default_system = dependency
+                    .props
+                    .get(b"SYSTEM")
+                    .map_or(dependency.is_imported(), |value| truth::is_on(value));
+                let sys_entries = dependency.usage.entries(InterfaceSystemIncludeDirectories);
+                if !sys_entries.is_empty() {
+                    self.eval_entries(
+                        id,
+                        InterfaceSystemIncludeDirectories.name().as_bytes(),
+                        sys_entries,
+                        &ctx,
+                        &mut system,
+                    )?;
+                }
+                if default_system && !(dependency.is_imported() && no_imported_system) {
+                    let iface_entries = dependency.usage.entries(InterfaceIncludeDirectories);
+                    if !iface_entries.is_empty() {
+                        self.eval_entries(
+                            id,
+                            InterfaceIncludeDirectories.name().as_bytes(),
+                            iface_entries,
+                            &ctx,
+                            &mut system,
+                        )?;
+                    }
+                }
+                let (links, _) = self.usage_links(id, true, &ctx)?;
+                todo.extend(links.iter().flat_map(|item| item.edge_targets()));
             }
-            let dependency = self.target(id)?;
-            let default_system = dependency
-                .props
-                .get(b"SYSTEM")
-                .map_or(dependency.is_imported(), |value| truth::is_on(value));
-            self.eval_entries(
-                id,
-                InterfaceSystemIncludeDirectories.name().as_bytes(),
-                dependency.usage.entries(InterfaceSystemIncludeDirectories),
-                &ctx,
-                &mut system,
-            )?;
-            if default_system && !(dependency.is_imported() && no_imported_system) {
-                self.eval_entries(
-                    id,
-                    InterfaceIncludeDirectories.name().as_bytes(),
-                    dependency.usage.entries(InterfaceIncludeDirectories),
-                    &ctx,
-                    &mut system,
-                )?;
-            }
-            let (links, _) = self.usage_links(id, true, &ctx)?;
-            todo.extend(links.iter().flat_map(|item| item.edge_targets()));
         }
 
-        let system: HashSet<_> = system
-            .entries
-            .iter()
-            .map(|entry| without_trailing_slashes(&entry.value))
-            .collect();
+        let has_system = !system.entries.is_empty();
+        let system: HashSet<_> = if has_system {
+            system
+                .entries
+                .iter()
+                .map(|entry| without_trailing_slashes(&entry.value))
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let directory = self.model.dir(owner.dir);
         let current_dirs = definition(self.model, owner.dir, b"CMAKE_INCLUDE_CURRENT_DIR")
             .filter(|value| truth::is_on(value))
@@ -144,14 +157,16 @@ impl UsageResolver<'_> {
             .map(|(path, hops)| {
                 (
                     InterfaceInclude {
-                        system: system.contains(path.value.as_slice()),
+                        system: has_system && system.contains(path.value.as_slice()),
                         path,
                     },
                     hops,
                 )
             })
             .collect();
-        includes.sort_by_key(|(include, _)| include.system);
+        if has_system {
+            includes.sort_by_key(|(include, _)| include.system);
+        }
         if record && let Some(provenance) = self.provenance.as_mut() {
             for (include, hops) in &includes {
                 provenance.record(

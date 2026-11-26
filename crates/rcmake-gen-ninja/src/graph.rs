@@ -24,6 +24,88 @@ mod order;
 mod plan;
 mod response;
 
+const PARALLEL_STEP_THRESHOLD: usize = 64;
+const PARALLEL_TARGET_THRESHOLD: usize = 64;
+const MAX_RENDER_WORKERS: usize = 4;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn render_worker_count(item_count: usize, threshold: usize, max_workers: usize) -> usize {
+    if item_count < threshold || max_workers <= 1 {
+        return 1;
+    }
+    let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    available.min(max_workers).min(item_count).max(1)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn render_worker_count(_item_count: usize, _threshold: usize, _max_workers: usize) -> usize {
+    1
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn map_render_chunks<T, R, F>(items: &[T], workers: usize, process: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&[T]) -> R + Sync,
+{
+    let effective = workers.min(items.len());
+    let chunk_size = items.len().div_ceil(effective);
+    let chunks: Vec<&[T]> = items.chunks(chunk_size).collect();
+    let slots: Vec<std::sync::Mutex<Option<R>>> =
+        std::iter::repeat_with(|| std::sync::Mutex::new(None))
+            .take(chunks.len())
+            .collect();
+    let process_ref = &process;
+    if let (Some((&first_chunk, rest_chunks)), Some((first_slot, rest_slots))) =
+        (chunks.split_first(), slots.split_first())
+    {
+        std::thread::scope(|scope| {
+            for (&chunk, slot) in rest_chunks.iter().zip(rest_slots.iter()) {
+                if std::thread::Builder::new()
+                    .spawn_scoped(scope, move || {
+                        *slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(process_ref(chunk));
+                    })
+                    .is_err()
+                {
+                    *slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(process_ref(chunk));
+                }
+            }
+            *first_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(process_ref(first_chunk));
+        });
+    }
+    slots
+        .into_iter()
+        .filter_map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+        .collect()
+}
+
+enum PlannedStepNodes<'s, 'a> {
+    Borrowed(&'s StepNodes<'a>),
+    Owned(StepNodes<'a>),
+}
+
+impl<'a> PlannedStepNodes<'_, 'a> {
+    fn as_ref(&self) -> &StepNodes<'a> {
+        match self {
+            Self::Borrowed(nodes) => nodes,
+            Self::Owned(nodes) => nodes,
+        }
+    }
+}
+
 pub(crate) struct Graph<'a> {
     pub(crate) input: &'a BuildGraph,
     pub(crate) build_dir: &'a Path,
@@ -592,9 +674,32 @@ impl<'a> Graph<'a> {
         cmake: &[u8],
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
-        mut emitted: Option<&mut HashSet<BString>>,
+        emitted: Option<&mut HashSet<BString>>,
         custom_inputs: &BTreeMap<usize, Vec<BString>>,
     ) -> Result<(), GenError> {
+        self.emit_into_with_workers(
+            ninja,
+            cmake,
+            modmap_flag,
+            exports,
+            emitted,
+            custom_inputs,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_into_with_workers(
+        &self,
+        ninja: &mut Ninja,
+        cmake: &[u8],
+        modmap_flag: &[u8],
+        exports: &[ModuleExportJob],
+        mut emitted: Option<&mut HashSet<BString>>,
+        custom_inputs: &BTreeMap<usize, Vec<BString>>,
+        workers_override: Option<usize>,
+    ) -> Result<(), GenError> {
+        let mut planned_steps = Vec::with_capacity(self.input.steps.len());
         for (index, (step, nodes)) in self.input.steps.iter().zip(&self.steps).enumerate() {
             if self.input.native_custom_steps.contains(&index) {
                 continue;
@@ -611,37 +716,87 @@ impl<'a> Graph<'a> {
                     let mut unique = nodes.clone();
                     unique.byproducts.retain(|node| !emitted.contains(node));
                     emitted.extend(unique.outputs.iter().chain(&unique.byproducts).cloned());
+                    planned_steps.push((index, step, PlannedStepNodes::Owned(unique)));
+                    continue;
+                }
+                emitted.extend(nodes.outputs.iter().chain(&nodes.byproducts).cloned());
+            }
+            planned_steps.push((index, step, PlannedStepNodes::Borrowed(nodes)));
+        }
+
+        let step_workers = workers_override.unwrap_or_else(|| {
+            render_worker_count(
+                planned_steps.len(),
+                PARALLEL_STEP_THRESHOLD,
+                MAX_RENDER_WORKERS,
+            )
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        if step_workers > 1 && planned_steps.len() > 1 {
+            let rendered = map_render_chunks(&planned_steps, step_workers, |chunk| {
+                let mut local = Ninja(Vec::with_capacity(chunk.len().saturating_mul(256)));
+                for &(index, step, ref nodes) in chunk {
                     self.emit_step(
-                        ninja,
+                        &mut local,
                         step,
-                        &unique,
+                        nodes.as_ref(),
                         cmake,
                         modmap_flag,
                         exports,
                         custom_inputs.get(&index),
                     )?;
-                    continue;
                 }
-                emitted.extend(nodes.outputs.iter().chain(&nodes.byproducts).cloned());
+                Ok::<Ninja, GenError>(local)
+            });
+            for slot in rendered {
+                let local = slot?;
+                ninja.0.extend_from_slice(&local.0);
             }
-            self.emit_step(
-                ninja,
-                step,
-                nodes,
-                cmake,
-                modmap_flag,
-                exports,
-                custom_inputs.get(&index),
-            )?;
+        } else {
+            for &(index, step, ref nodes) in &planned_steps {
+                self.emit_step(
+                    ninja,
+                    step,
+                    nodes.as_ref(),
+                    cmake,
+                    modmap_flag,
+                    exports,
+                    custom_inputs.get(&index),
+                )?;
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = step_workers;
+            for &(index, step, ref nodes) in &planned_steps {
+                self.emit_step(
+                    ninja,
+                    step,
+                    nodes.as_ref(),
+                    cmake,
+                    modmap_flag,
+                    exports,
+                    custom_inputs.get(&index),
+                )?;
+            }
         }
 
         let mut all = Vec::new();
+        let mut phony_targets = Vec::new();
         for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
             if !self.producers.contains_key(alias)
                 && emitted
                     .as_mut()
                     .is_none_or(|nodes| nodes.insert(alias.clone()))
             {
+                phony_targets.push((target, alias));
+            }
+            if target.in_all {
+                all.push(alias.clone());
+            }
+        }
+        let emit_phony_target =
+            |out: &mut Ninja, target: &rcmake_resolve::GraphTarget, alias: &BString| {
                 let utilities = &self.input.utility_steps;
                 let utility_first = |index: &&usize| utilities.contains(*index);
                 let inputs: Vec<_> = target
@@ -659,10 +814,37 @@ impl<'a> Graph<'a> {
                             .filter_map(|&index| self.aliases.get(index).cloned()),
                     )
                     .collect();
-                ninja.phony(alias, &unique(inputs));
+                out.phony(alias, &unique_vec(inputs));
+            };
+        let target_workers = workers_override.unwrap_or_else(|| {
+            render_worker_count(
+                phony_targets.len(),
+                PARALLEL_TARGET_THRESHOLD,
+                MAX_RENDER_WORKERS,
+            )
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        if target_workers > 1 && phony_targets.len() > 1 {
+            let rendered = map_render_chunks(&phony_targets, target_workers, |chunk| {
+                let mut local = Ninja(Vec::with_capacity(chunk.len().saturating_mul(128)));
+                for &(target, alias) in chunk {
+                    emit_phony_target(&mut local, target, alias);
+                }
+                local
+            });
+            for local in rendered {
+                ninja.0.extend_from_slice(&local.0);
             }
-            if target.in_all {
-                all.push(alias.clone());
+        } else {
+            for &(target, alias) in &phony_targets {
+                emit_phony_target(ninja, target, alias);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = target_workers;
+            for &(target, alias) in &phony_targets {
+                emit_phony_target(ninja, target, alias);
             }
         }
         let all_alias = qualified(&self.node(b"all"), self.config);
@@ -783,12 +965,12 @@ impl<'a> Graph<'a> {
             }
             _ => Some(self.plan_step(step, nodes, cmake, modmap_flag, exports)?),
         };
-        let inputs = plan
-            .as_mut()
-            .map_or_else(Vec::new, |plan| unique(std::mem::take(&mut plan.inputs)));
+        let inputs = plan.as_mut().map_or_else(Vec::new, |plan| {
+            unique_vec(std::mem::take(&mut plan.inputs))
+        });
         let implicit = plan.as_mut().map_or_else(
-            || unique(language_inputs),
-            |plan| unique(std::mem::take(&mut plan.implicit_inputs)),
+            || unique_vec(language_inputs),
+            |plan| unique_vec(std::mem::take(&mut plan.implicit_inputs)),
         );
         let dyndep = plan.as_ref().and_then(|plan| plan.dyndep.as_ref());
         let planned = plan
@@ -915,8 +1097,11 @@ pub(crate) fn qualified(name: &BString, config: Option<&[u8]>) -> BString {
     }
 }
 
-fn unique(nodes: impl IntoIterator<Item = BString>) -> Vec<BString> {
-    let mut seen = HashSet::new();
+fn unique_vec(nodes: Vec<BString>) -> Vec<BString> {
+    if nodes.len() <= 1 {
+        return nodes;
+    }
+    let mut seen = HashSet::with_capacity(nodes.len());
     nodes
         .into_iter()
         .filter(|node| seen.insert(node.clone()))

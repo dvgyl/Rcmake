@@ -47,7 +47,7 @@ pub use compile::codemodel_compile_info;
 pub(crate) use compile::{language_flags, msvc::debug_options as msvc_debug_options};
 pub(crate) use custom::{checked_command_outputs, command_outputs};
 pub use graph::lower;
-pub(crate) use graph::lower_with_inputs;
+pub(crate) use graph::lower_with_inputs_workers;
 pub(crate) use install::lower_install_manifest_with_configs;
 pub use install::{
     collect_metadata, install_target_group_options, installs_unnamed_runtime_dependencies,

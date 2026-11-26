@@ -989,4 +989,30 @@ cmake_instrumentation(API_VERSION 1 DATA_VERSION 1.2
         );
         Ok(())
     }
+
+    #[test]
+    fn write_common_failure_preserves_existing_build_ninja_sentinel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = crate::driver_tests::project_host();
+        let sentinel = b"# SENTINEL build.ninja MUST SURVIVE\n";
+        host.seed_file(Path::new("/work/out/build.ninja"), sentinel)?;
+        host.seed_file(
+            Path::new("/work/CMakeLists.txt"),
+            br#"cmake_minimum_required(VERSION 4.5)
+project(example LANGUAGES NONE)
+file(GENERATE OUTPUT conflict.txt CONTENT "first")
+file(GENERATE OUTPUT conflict.txt CONTENT "second")
+"#,
+        )?;
+        let argv = ["cmake", "-S", ".", "-B", "out", "-G", "Ninja"].map(BString::from);
+        assert_ne!(crate::run(&argv, host.clone()), 0);
+        assert_eq!(
+            host.read(
+                Path::new("/work/out/build.ninja"),
+                ReadRange::All { limit: 1024 }
+            )?,
+            sentinel
+        );
+        Ok(())
+    }
 }

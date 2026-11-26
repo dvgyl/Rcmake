@@ -335,8 +335,9 @@ pub(crate) fn resolve_target<'a>(
                 (group, facts)
             }
         };
-        if let Err(error) =
-            sources::install_object_name(model, target.dir, &source.value, &ctx.config)
+        if source_props.get(b"INSTALL_OBJECT_NAME").is_some()
+            && let Err(error) =
+                sources::install_object_name(model, target.dir, &source.value, &ctx.config)
         {
             return Err(match error {
                 ResolveError::Message(body) => {
@@ -352,7 +353,10 @@ pub(crate) fn resolve_target<'a>(
             });
         }
         facts.units.push(resolved.compile_units.len());
-        if flavor.is_none() && !lower::short_object_paths(model) {
+        if flavor.is_none()
+            && !lower::short_object_paths(model)
+            && source_props.get(b"OBJECT_NAME").is_some()
+        {
             crate::sources::custom_object_name(model, target.dir, &source.value).map_err(
                 |error| match error {
                     ResolveError::Message(body) => {
