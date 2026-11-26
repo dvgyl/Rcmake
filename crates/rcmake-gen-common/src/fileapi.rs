@@ -611,20 +611,72 @@ fn paths(source: &[u8], build: &[u8]) -> Value {
 }
 
 fn is_under(path: &[u8], root: &[u8]) -> bool {
-    !root.is_empty() && to_native(path).starts_with(to_native(root))
+    if root.is_empty() {
+        return false;
+    }
+    if let Some(matched) = fast_strip_prefix(path, root) {
+        return matched.is_some();
+    }
+    to_native(path).starts_with(to_native(root))
 }
 
 fn relative(path: &[u8], root: &[u8]) -> BString {
-    if !root.is_empty()
-        && let Ok(suffix) = to_native(path).strip_prefix(to_native(root))
-    {
-        return if suffix.as_os_str().is_empty() {
-            ".".into()
-        } else {
-            from_native_cmake(suffix)
-        };
+    if !root.is_empty() {
+        if let Some(matched) = fast_strip_prefix(path, root) {
+            return match matched {
+                Some(b"") => ".".into(),
+                Some(rest) => rest.into(),
+                None => path.into(),
+            };
+        }
+        if let Ok(suffix) = to_native(path).strip_prefix(to_native(root)) {
+            return if suffix.as_os_str().is_empty() {
+                ".".into()
+            } else {
+                from_native_cmake(suffix)
+            };
+        }
     }
     path.into()
+}
+
+/// Fast lexical prefix check matching `to_native(path).strip_prefix(to_native(root))`
+/// without `PathBuf` allocations for normalized forward-slash paths.
+///
+/// Returns `None` when either path needs native `Path` normalization (backslashes,
+/// repeated slashes, `.` components, or Windows drive roots).
+fn fast_strip_prefix<'a>(path: &'a [u8], root: &[u8]) -> Option<Option<&'a [u8]>> {
+    fn needs_native(bytes: &[u8]) -> bool {
+        bytes.contains(&b'\\')
+            || bytes.windows(2).any(|w| w == b"//")
+            || bytes.windows(2).any(|w| w == b"/.")
+            || bytes.starts_with(b"./")
+            || bytes == b"."
+    }
+    if needs_native(path) || needs_native(root) {
+        return None;
+    }
+    if root.ends_with(b":/") {
+        return None;
+    }
+    let trimmed = if root.len() > 1 {
+        root.strip_suffix(b"/").unwrap_or(root)
+    } else {
+        root
+    };
+    if trimmed == b"/" {
+        return Some(path.strip_prefix(b"/"));
+    }
+    let Some(rest) = path.strip_prefix(trimmed) else {
+        return Some(None);
+    };
+    if rest.is_empty() {
+        Some(Some(b""))
+    } else if let Some(after) = rest.strip_prefix(b"/") {
+        Some(Some(after))
+    } else {
+        Some(None)
+    }
 }
 
 fn members<const N: usize>(fields: [(&str, Value); N]) -> Members {

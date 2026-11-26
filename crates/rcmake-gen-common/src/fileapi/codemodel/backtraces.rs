@@ -52,7 +52,7 @@ impl<'a> Backtraces<'a> {
             let command = frame
                 .name
                 .as_deref()
-                .map(|name| intern(&mut self.commands, &mut self.command_indexes, name.into()));
+                .map(|name| intern_slice(&mut self.commands, &mut self.command_indexes, name));
             if parent.is_none() && frame.line != 0 {
                 parent = Some(self.node(BacktraceNode {
                     file,
@@ -117,9 +117,26 @@ fn intern(
     indexes: &mut BTreeMap<BString, usize>,
     value: BString,
 ) -> usize {
-    *indexes.entry(value.clone()).or_insert_with(|| {
-        let index = values.len();
-        values.push(value);
-        index
-    })
+    if let Some(&index) = indexes.get(&value) {
+        return index;
+    }
+    let index = values.len();
+    values.push(value.clone());
+    indexes.insert(value, index);
+    index
+}
+
+fn intern_slice(
+    values: &mut Vec<BString>,
+    indexes: &mut BTreeMap<BString, usize>,
+    value: &[u8],
+) -> usize {
+    if let Some(&index) = indexes.get(value) {
+        return index;
+    }
+    let index = values.len();
+    let owned = BString::from(value);
+    values.push(owned.clone());
+    indexes.insert(owned, index);
+    index
 }

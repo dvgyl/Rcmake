@@ -4,15 +4,16 @@ use rcmake_base::BString;
 use rcmake_gen_common::GenError;
 use rcmake_resolve::{BuildStep, CustomStep, GenerationResult};
 
-use super::{Step, build_path};
+use super::{Step, build_path_with_prefix};
 
 pub(super) fn plan_step<'a>(
     action: &'a BuildStep,
     step_index: usize,
     result: &GenerationResult,
     build_dir: &Path,
+    build_prefix: &[u8],
 ) -> Result<Step<'a>, GenError> {
-    let make_path = |value: &BString| build_path(value, build_dir);
+    let make_path = |value: &BString| build_path_with_prefix(value, build_dir, build_prefix);
     let step = match action {
         BuildStep::Compile {
             object,
@@ -81,7 +82,7 @@ pub(super) fn plan_step<'a>(
             always: custom.outputs.is_empty() || custom.symbolic,
             progress: None,
             jobserver_aware: result.metadata.jobserver_steps.contains(&step_index),
-            default_comment: default_comment(custom, build_dir),
+            default_comment: default_comment(custom, build_dir, build_prefix),
         },
         BuildStep::DeviceLink { output, inputs, .. } => Step {
             action,
@@ -107,7 +108,11 @@ pub(super) fn plan_step<'a>(
 
 /// Build the comment of a custom command that has outputs and no `COMMENT`,
 /// as CMake does: `Generating <output>, <output>`.
-pub(super) fn default_comment(custom: &CustomStep, build_dir: &Path) -> Option<BString> {
+pub(super) fn default_comment(
+    custom: &CustomStep,
+    build_dir: &Path,
+    build_prefix: &[u8],
+) -> Option<BString> {
     if custom.comment.is_some() || custom.symbolic || custom.outputs.is_empty() {
         return None;
     }
@@ -116,7 +121,7 @@ pub(super) fn default_comment(custom: &CustomStep, build_dir: &Path) -> Option<B
         if index > 0 {
             comment.extend_from_slice(b", ");
         }
-        comment.extend_from_slice(&build_path(output, build_dir));
+        comment.extend_from_slice(&build_path_with_prefix(output, build_dir, build_prefix));
     }
     Some(comment)
 }

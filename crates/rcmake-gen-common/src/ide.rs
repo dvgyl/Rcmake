@@ -1,6 +1,8 @@
 //! Shared helpers of the IDE generators (Xcode and Visual Studio), and the pure
 //! description of `cmake --build` that every generator crate plans (ADR-014, ADR-015).
 
+use std::collections::HashMap;
+
 use indexmap::IndexSet;
 use rcmake_base::{BString, truth};
 use rcmake_host::{FileKind, Follow, Host, path::to_native};
@@ -139,6 +141,25 @@ pub fn project_roots(kind: GeneratorKind, model: &ProjectModel) -> Vec<IdeProjec
     out
 }
 
+/// Index each target's dependencies from the first configuration of `result`.
+///
+/// Build this once and pass it to [`targets_for_root_indexed`] when querying multiple
+/// project roots.
+#[must_use]
+pub fn first_config_dependencies(result: &GenerationResult) -> HashMap<TargetId, Vec<TargetId>> {
+    let first = result.configs.first();
+    let mut deps_by_target: HashMap<TargetId, Vec<TargetId>> = HashMap::new();
+    for target in &result.targets {
+        if Some(&target.config) == first && !target.dependencies.is_empty() {
+            deps_by_target
+                .entry(target.id)
+                .or_default()
+                .extend_from_slice(&target.dependencies);
+        }
+    }
+    deps_by_target
+}
+
 /// The targets of the IDE project at directory `root`: the targets defined in `root`
 /// and its subdirectories, then the targets that they depend on (transitive closure).
 ///
@@ -149,6 +170,17 @@ pub fn targets_for_root(
     result: &GenerationResult,
     root: DirId,
 ) -> Vec<TargetId> {
+    let deps_by_target = first_config_dependencies(result);
+    targets_for_root_indexed(model, &deps_by_target, root)
+}
+
+/// Indexed variant of [`targets_for_root`] for callers querying multiple project roots.
+#[must_use]
+pub fn targets_for_root_indexed(
+    model: &ProjectModel,
+    deps_by_target: &HashMap<TargetId, Vec<TargetId>>,
+    root: DirId,
+) -> Vec<TargetId> {
     let mut out = IndexSet::new();
     let mut pending = Vec::new();
     for (id, target) in model.targets() {
@@ -157,14 +189,11 @@ pub fn targets_for_root(
             pending.push(id);
         }
     }
-    let first = result.configs.first();
     while let Some(id) = pending.pop() {
-        let dependencies = result
-            .targets
-            .iter()
-            .filter(|target| target.id == id && Some(&target.config) == first)
-            .flat_map(|target| target.dependencies.iter().copied());
-        for dependency in dependencies {
+        let Some(dependencies) = deps_by_target.get(&id) else {
+            continue;
+        };
+        for &dependency in dependencies {
             let local = model
                 .target(dependency)
                 .is_some_and(|target| !target.is_imported());

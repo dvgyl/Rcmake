@@ -7,11 +7,11 @@ use std::{
 };
 
 use rcmake_gen_common::{GenError, ide::UtilityKind};
-use rcmake_model::{CustomCommandKind, ProjectModel, TargetEvent};
 use rcmake_resolve::{BuildStep, ResolvedTarget, ide::IdeCustomPhase};
 
 use crate::{
     object::{self, Isa, Objects, Reference, Value, attrs, list},
+    project::XcodeIndices,
     rerun, text,
 };
 
@@ -211,19 +211,16 @@ impl Custom {
     pub(crate) fn collect<'a>(
         &mut self,
         target: &ResolvedTarget,
-        model: &ProjectModel,
+        indices: &XcodeIndices<'_>,
         bin: &Path,
         steps: impl Iterator<Item = (usize, &'a BuildStep)>,
     ) {
+        let Some(ide) = target.ide.as_deref().filter(|ide| !ide.custom.is_empty()) else {
+            return;
+        };
         let config = text(&target.config.0);
         let build_dir = bin.join(text(&target.metadata.binary_dir));
         let build_dir = build_dir.to_string_lossy();
-        // The graph starts with the output rules in model order.
-        let output_rules: Vec<_> = model
-            .commands()
-            .filter(|(_, command)| command.kind == CustomCommandKind::Output)
-            .map(|(_, command)| command.verbatim)
-            .collect();
         let mut legacy_outputs = BTreeSet::new();
         let depfiles: BTreeMap<_, _> = steps
             .filter_map(|(index, step)| {
@@ -231,89 +228,75 @@ impl Custom {
                     return None;
                 };
                 let output = bin.join(text(step.outputs.first()?));
-                if output_rules.get(index) == Some(&false) {
+                if indices.output_rule_verbatim.get(index) == Some(&false) {
                     legacy_outputs.insert(output.clone());
                 }
                 let depfile = bin.join(text(step.depfile.as_ref()?));
                 Some((output, depfile.to_string_lossy().into_owned()))
             })
             .collect();
-        let mut legacy_events = model
-            .commands()
-            .filter_map(|(_, command)| {
-                let phase = match command.kind {
-                    CustomCommandKind::Utility(id) if id == target.id => IdeCustomPhase::Rule,
-                    CustomCommandKind::TargetEvent { target: id, event } if id == target.id => {
-                        match event {
-                            TargetEvent::PreBuild => IdeCustomPhase::PreBuild,
-                            TargetEvent::PreLink => IdeCustomPhase::PreLink,
-                            TargetEvent::PostBuild => IdeCustomPhase::PostBuild,
-                        }
-                    }
-                    _ => return None,
-                };
-                Some((phase, !command.verbatim))
-            })
-            .collect::<Vec<_>>();
-        if let Some(ide) = target.ide.as_deref() {
-            for step in &ide.custom {
-                let legacy = if step.phase != IdeCustomPhase::Rule || step.always_run {
-                    legacy_events
-                        .iter()
-                        .position(|(phase, _)| *phase == step.phase)
-                        .is_some_and(|index| legacy_events.remove(index).1)
-                } else {
-                    step.outputs
-                        .first()
-                        .is_some_and(|output| legacy_outputs.contains(&bin.join(text(output))))
-                };
-                let phase = match step.phase {
-                    IdeCustomPhase::Rule => &mut self.rules,
-                    IdeCustomPhase::PreBuild => &mut self.pre,
-                    IdeCustomPhase::PreLink => &mut self.link,
-                    IdeCustomPhase::PostBuild => &mut self.post,
-                };
-                let cwd = if step.working_dir.is_empty() {
-                    build_dir.clone().into_owned()
-                } else {
-                    text(&step.working_dir)
-                };
-                if phase.lines.is_empty() {
-                    phase.comment = step.comment.as_ref().map(|comment| text(comment));
-                }
-                phase.push(
-                    &config,
-                    &cwd,
-                    step.commands
-                        .iter()
-                        .filter(|argv| !argv.is_empty())
-                        .map(|argv| {
-                            argv.iter()
-                                .enumerate()
-                                .map(|(index, arg)| {
-                                    let arg = text(arg);
-                                    if legacy && index != 0 {
-                                        quote_legacy_argument(&arg)
-                                    } else {
-                                        quote_command(&arg)
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        }),
-                );
-                phase.paths(bin, &config, &step.depends, &step.outputs, &step.byproducts);
-                for output in &step.outputs {
-                    if let Some(depfile) = depfiles.get(&bin.join(text(output))) {
-                        phase
-                            .depfiles
-                            .entry(config.clone())
-                            .or_default()
-                            .insert(depfile.clone());
-                    }
-                }
-                phase.always |= step.always_run && !step.commands.is_empty();
+        let mut legacy_events = indices
+            .target_events
+            .get(&target.id)
+            .cloned()
+            .unwrap_or_default();
+        for step in &ide.custom {
+            let legacy = if step.phase != IdeCustomPhase::Rule || step.always_run {
+                legacy_events
+                    .iter()
+                    .position(|(phase, _)| *phase == step.phase)
+                    .is_some_and(|index| legacy_events.remove(index).1)
+            } else {
+                step.outputs
+                    .first()
+                    .is_some_and(|output| legacy_outputs.contains(&bin.join(text(output))))
+            };
+            let phase = match step.phase {
+                IdeCustomPhase::Rule => &mut self.rules,
+                IdeCustomPhase::PreBuild => &mut self.pre,
+                IdeCustomPhase::PreLink => &mut self.link,
+                IdeCustomPhase::PostBuild => &mut self.post,
+            };
+            let cwd = if step.working_dir.is_empty() {
+                build_dir.clone().into_owned()
+            } else {
+                text(&step.working_dir)
+            };
+            if phase.lines.is_empty() {
+                phase.comment = step.comment.as_ref().map(|comment| text(comment));
             }
+            phase.push(
+                &config,
+                &cwd,
+                step.commands
+                    .iter()
+                    .filter(|argv| !argv.is_empty())
+                    .map(|argv| {
+                        argv.iter()
+                            .enumerate()
+                            .map(|(index, arg)| {
+                                let arg = text(arg);
+                                if legacy && index != 0 {
+                                    quote_legacy_argument(&arg)
+                                } else {
+                                    quote_command(&arg)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }),
+            );
+            phase.paths(bin, &config, &step.depends, &step.outputs, &step.byproducts);
+            for output in &step.outputs {
+                if let Some(depfile) = depfiles.get(&bin.join(text(output))) {
+                    phase
+                        .depfiles
+                        .entry(config.clone())
+                        .or_default()
+                        .insert(depfile.clone());
+                }
+            }
+            phase.always |= step.always_run && !step.commands.is_empty();
         }
     }
 }

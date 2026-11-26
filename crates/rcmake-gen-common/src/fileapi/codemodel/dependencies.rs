@@ -33,6 +33,7 @@ pub(super) fn write(
             .get(&id)
             .map(|entry| Value::string(entry.id.as_str()))
     };
+    let dep_backtraces = super::targets::dependency_backtraces(model, raw);
     let mut dependencies: BTreeMap<_, _> = target
         .dependencies
         .iter()
@@ -43,7 +44,7 @@ pub(super) fn write(
                 .map(|entry| {
                     (
                         entry.id.as_str(),
-                        super::targets::dependency_backtrace(model, Some(raw), id).cloned(),
+                        dep_backtraces.get(&id).map(|trace| (*trace).clone()),
                     )
                 })
         })

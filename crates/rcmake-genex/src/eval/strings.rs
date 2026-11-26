@@ -1,4 +1,4 @@
-use rcmake_base::{BString, hash::HashAlgo, list_ops};
+use rcmake_base::{BString, ByteSlice, hash::HashAlgo, list_ops};
 use rcmake_regex::{MatchOptions, Regex, expand_replacement};
 
 use super::{Call, Evaluator, Value, operations::operation_arity};
@@ -180,7 +180,7 @@ impl Evaluator<'_> {
         }
         let mut out = BString::default();
         let mut rest = value;
-        while let Some(index) = rest.windows(needle.len()).position(|part| part == needle) {
+        while let Some(index) = rest.find(needle) {
             let (before, after) = rest.split_at(index);
             self.append(&mut out, before)?;
             self.append(&mut out, replacement)?;
@@ -521,9 +521,9 @@ fn find(value: &[u8], needle: &[u8], reverse: bool) -> BString {
     let index = if needle.is_empty() {
         Some(if reverse { value.len() } else { 0 })
     } else if reverse {
-        value.windows(needle.len()).rposition(|part| part == needle)
+        value.rfind(needle)
     } else {
-        value.windows(needle.len()).position(|part| part == needle)
+        value.find(needle)
     };
     index.map_or_else(|| "-1".into(), |n| n.to_string().into())
 }

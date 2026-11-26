@@ -1,6 +1,6 @@
 //! MSBuild properties for documented MSVC flags.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{cuda::OptionText, msbuild_value, rules::quote, windows, xml::Writer};
 
@@ -8,6 +8,7 @@ use crate::{cuda::OptionText, msbuild_value, rules::quote, windows, xml::Writer}
 pub(crate) struct Settings {
     values: BTreeMap<&'static str, String>,
     lists: BTreeMap<&'static str, Vec<String>>,
+    list_seen: Option<HashMap<&'static str, HashSet<String>>>,
     options: Vec<String>,
     condition_banner: bool,
 }
@@ -26,12 +27,21 @@ impl Settings {
     }
 
     pub(crate) fn list(&mut self, key: &'static str, value: impl Into<String>) {
-        self.lists.entry(key).or_default().push(value.into());
+        let value = value.into();
+        if let Some(seen) = self.list_seen.as_mut().and_then(|map| map.get_mut(key)) {
+            seen.insert(value.clone());
+        }
+        self.lists.entry(key).or_default().push(value);
     }
 
     pub(crate) fn list_unique(&mut self, key: &'static str, value: String) {
         let values = self.lists.entry(key).or_default();
-        if !values.contains(&value) {
+        let seen = self
+            .list_seen
+            .get_or_insert_with(HashMap::new)
+            .entry(key)
+            .or_insert_with(|| values.iter().cloned().collect());
+        if seen.insert(value.clone()) {
             values.push(value);
         }
     }
@@ -43,6 +53,9 @@ impl Settings {
     pub(crate) fn append(&mut self, other: Self) {
         self.values.extend(other.values);
         for (key, values) in other.lists {
+            if let Some(seen) = self.list_seen.as_mut().and_then(|map| map.get_mut(key)) {
+                seen.extend(values.iter().cloned());
+            }
             self.lists.entry(key).or_default().extend(values);
         }
         self.options.extend(other.options);

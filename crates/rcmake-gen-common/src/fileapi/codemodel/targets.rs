@@ -1,6 +1,6 @@
 //! Write target replies and assign their indexes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rcmake_base::{
     hash::HashAlgo,
@@ -19,15 +19,15 @@ use rcmake_resolve::{
 
 use crate::{
     GenError,
-    ide::{UtilityKind, project_roots, targets_for_root, utility_targets},
+    ide::{UtilityKind, project_roots, targets_for_root_indexed, utility_targets},
 };
 
 use super::super::{
     Bool, FileApi, Kind, Members, Object, Value, array, cache_value, members, object, relative,
 };
 use super::{
-    backtraces::Backtraces, file_prefix, includes::interface_includes, indices, number,
-    optional_array, projects::Project,
+    ConfigIndices, ProjectIndices, backtraces::Backtraces, file_prefix,
+    includes::interface_includes, indices, number, optional_array, projects::Project,
 };
 
 pub(super) struct TargetRef<'a> {
@@ -204,6 +204,7 @@ pub(super) fn abstract_targets(
 }
 
 impl FileApi<'_, '_> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn add_utility_targets(
         &mut self,
         config: &[u8],
@@ -212,6 +213,7 @@ impl FileApi<'_, '_> {
         dir_targets: &mut [TargetIndexes],
         projects: &mut [Project],
         target_refs: &mut Vec<Value>,
+        project_indices: &ProjectIndices<'_>,
     ) -> Result<(), GenError> {
         if let Some(kind) = self.generator().filter(|kind| kind.is_ide()) {
             let utilities = utility_targets(kind, self.model, self.writer.host);
@@ -231,14 +233,18 @@ impl FileApi<'_, '_> {
                 };
                 let dir = self.model.dir(root.dir);
                 let build = relative(&dir.binary_dir, self.build);
-                let dependencies = targets_for_root(self.model, self.result, root.dir)
-                    .into_iter()
-                    .filter_map(|id| identities.get(&id))
-                    .filter(|target| {
-                        !target.abstract_target && !target.target.metadata.exclude_from_all
-                    })
-                    .map(|target| object([("id", Value::string(target.id.as_str()))]))
-                    .collect::<Vec<_>>();
+                let dependencies = targets_for_root_indexed(
+                    self.model,
+                    &project_indices.first_config_deps,
+                    root.dir,
+                )
+                .into_iter()
+                .filter_map(|id| identities.get(&id))
+                .filter(|target| {
+                    !target.abstract_target && !target.target.metadata.exclude_from_all
+                })
+                .map(|target| object([("id", Value::string(target.id.as_str()))]))
+                .collect::<Vec<_>>();
                 for utility in utilities.iter().filter(|utility| {
                     matches!(utility.kind, UtilityKind::AllBuild | UtilityKind::ZeroCheck)
                 }) {
@@ -303,12 +309,14 @@ impl FileApi<'_, '_> {
         config: &[u8],
         ids: &[TargetId],
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
+        config_indices: &ConfigIndices<'_>,
     ) -> Result<Vec<Value>, GenError> {
         let mut usage = UsageResolver::for_codemodel(self.model);
         ids.iter()
             .filter_map(|id| targets.get(id))
             .map(|reference| {
-                let mut value = self.target_object(config, reference, targets, &mut usage)?;
+                let mut value =
+                    self.target_object(reference, targets, &mut usage, config_indices)?;
                 if let Some(target) = self.model.target(reference.target.id) {
                     let includes =
                         interface_includes(self.model, &mut usage, reference.target, target)?;
@@ -331,10 +339,10 @@ impl FileApi<'_, '_> {
 
     fn target_object(
         &self,
-        config: &[u8],
         reference: &TargetRef<'_>,
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
         usage: &mut UsageResolver<'_>,
+        config_indices: &ConfigIndices<'_>,
     ) -> Result<Members, GenError> {
         let target = reference.target;
         let metadata = &target.metadata;
@@ -440,12 +448,12 @@ impl FileApi<'_, '_> {
         .map(|file| object([("path", Value::string(file))]));
         optional_array(&mut body, "artifacts", artifact_paths);
 
-        let destinations = self
-            .result
-            .install
-            .target_installers
+        let destinations = config_indices
+            .installers_by_target
+            .get(&target.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
             .iter()
-            .filter(|installer| installer.target == target.id && installer.config.matches(config))
             .filter_map(|installer| {
                 let rule = self.model.installs.get(installer.rule)?;
                 let mut destination =
@@ -604,7 +612,15 @@ impl FileApi<'_, '_> {
                 }),
             );
         }
-        self.write_target_sources(target, raw, targets, &mut body, &mut graph, usage)?;
+        self.write_target_sources(
+            target,
+            raw,
+            targets,
+            &mut body,
+            &mut graph,
+            usage,
+            config_indices,
+        )?;
         body.insert("backtraceGraph".into(), graph.into_json());
         Ok(body)
     }
@@ -615,24 +631,24 @@ fn target_id(name: &rcmake_base::BString, dir: &[u8]) -> String {
     format!("{name}::@{:.20}", hash)
 }
 
-pub(super) fn dependency_backtrace<'a>(
+pub(super) fn dependency_backtraces<'a>(
     model: &ProjectModel,
-    raw: Option<&'a Target>,
-    id: TargetId,
-) -> Option<&'a Backtrace> {
-    let raw = raw?;
-    raw.utility_deps
-        .iter()
-        .find(|item| model.find_target(raw.dir, &item.value) == Some(id))
-        .map(|item| &item.backtrace)
-        .or_else(|| {
-            raw.usage
-                .link_libraries
-                .as_deref()?
-                .iter()
-                .find(|item| model.find_target(item.lookup_dir, &item.text.value) == Some(id))
-                .map(|item| &item.text.backtrace)
-        })
+    raw: &'a Target,
+) -> HashMap<TargetId, &'a Backtrace> {
+    let mut map = HashMap::new();
+    for item in &raw.utility_deps {
+        if let Some(id) = model.find_target(raw.dir, &item.value) {
+            map.entry(id).or_insert(&item.backtrace);
+        }
+    }
+    if let Some(links) = raw.usage.link_libraries.as_deref() {
+        for item in links {
+            if let Some(id) = model.find_target(item.lookup_dir, &item.text.value) {
+                map.entry(id).or_insert(&item.text.backtrace);
+            }
+        }
+    }
+    map
 }
 
 fn file_name(path: &[u8]) -> &[u8] {

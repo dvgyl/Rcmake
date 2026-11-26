@@ -2,12 +2,13 @@
 
 use std::{collections::btree_map::Entry, sync::Arc};
 
-use rcmake_base::path_lex::Lexical;
+use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_diag::{Diagnostic, Effect, Location, MessageKind, RenderOptions, render};
 use rcmake_gen_common::GenError;
+use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_host::path::{from_native_cmake, to_native};
-use rcmake_model::DirId;
-use rcmake_resolve::ide::XcodeConfigFiles;
+use rcmake_model::{DirId, GeneratorKind};
+use rcmake_resolve::{ide::XcodeConfigFiles, usage::UsageResolver};
 
 use crate::{
     object::{Attrs, Reference, Value},
@@ -25,18 +26,22 @@ impl Project<'_> {
     ) -> Result<Vec<(Attrs, Option<Reference>)>, GenError> {
         const CONFIG_REFERENCE: &str = "\0xcconfig";
         let xcconfig = self.model.definition(dir, b"CMAKE_XCODE_XCCONFIG");
-        let with_config_reference = xcconfig
-            .filter(|value| value.windows(2).any(|token| token == b"$<"))
-            .map(|value| {
-                // Evaluate the configuration file with the same context as project attributes.
-                let mut model = self.model.clone();
-                model.dir_mut(dir).vars.insert(
-                    format!("CMAKE_XCODE_ATTRIBUTE_{CONFIG_REFERENCE}").into(),
-                    value.clone(),
-                );
-                model
-            });
+        let xcconfig_genex = xcconfig.filter(|value| rcmake_genex::find_genex(value).is_some());
+        let direct_eval = self.model.generator == Some(GeneratorKind::Xcode);
+        let with_config_reference = xcconfig_genex.filter(|_| !direct_eval).map(|value| {
+            // When callers invoke the Xcode generator directly without setting
+            // `model.generator = Some(GeneratorKind::Xcode)`, route through
+            // `xcode_project_attributes` so the evaluation context stays Xcode.
+            let mut model = self.model.clone();
+            model.dir_mut(dir).vars.insert(
+                format!("CMAKE_XCODE_ATTRIBUTE_{CONFIG_REFERENCE}").into(),
+                value.clone(),
+            );
+            model
+        });
         let model = with_config_reference.as_ref().unwrap_or(self.model);
+        let mut xcconfig_ast = None;
+        let mut usage = None;
         let mut configurations = Vec::new();
         for config in self.configs.clone() {
             let mut attrs = settings::project(model, dir, self.bin, &config)?;
@@ -45,6 +50,26 @@ impl Project<'_> {
                     Some(Value::Text(path) | Value::QuotedText(path)) => Some(path),
                     _ => None,
                 }
+            } else if let Some(expr) = xcconfig_genex {
+                let ast = match &xcconfig_ast {
+                    Some(ast) => ast,
+                    None => {
+                        let parsed = rcmake_genex::parse(expr).map_err(|error| {
+                            GenError::Invalid(error.without_location().to_string().into())
+                        })?;
+                        xcconfig_ast.insert(parsed)
+                    }
+                };
+                let resolver = usage.get_or_insert_with(|| UsageResolver::new(self.model));
+                let ctx = EvalContext {
+                    config: ConfigId(BString::from(config.as_bytes())),
+                    ..EvalContext::default()
+                };
+                let (value, _) = rcmake_genex::evaluate(ast, &ctx, &mut resolver.host(dir))
+                    .map_err(|error| {
+                        GenError::Invalid(error.without_location().to_string().into())
+                    })?;
+                Some(text(&value))
             } else {
                 xcconfig.map(|value| text(value))
             };

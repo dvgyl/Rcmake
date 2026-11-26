@@ -26,6 +26,107 @@ pub(super) fn assign(targets: &mut [Target<'_>]) {
     }
 }
 
+/// Cap the dense reachability bitset at 2 MiB (`4096 * 64 * 8` bytes).
+const MAX_BITSET_TARGETS: usize = 4096;
+
+pub(super) fn counts_all(targets: &[Target<'_>]) -> Vec<usize> {
+    counts_all_with_limit(targets, MAX_BITSET_TARGETS)
+}
+
+fn counts_all_with_limit(targets: &[Target<'_>], max_bitset_targets: usize) -> Vec<usize> {
+    let n = targets.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n > max_bitset_targets {
+        return (0..n).map(|index| count(targets, [index])).collect();
+    }
+    let own: Vec<usize> = targets
+        .iter()
+        .map(|target| {
+            target
+                .rules
+                .iter()
+                .filter(|step| step.progress.is_some())
+                .count()
+        })
+        .collect();
+    let words = n.div_ceil(64);
+    let mut reach = vec![0_u64; n * words];
+    for i in 0..n {
+        if let Some(word) = reach.get_mut(i * words + (i / 64)) {
+            *word |= 1_u64 << (i % 64);
+        }
+    }
+    let mut state = vec![0_u8; n];
+    let mut order = Vec::with_capacity(n);
+    let mut stack = Vec::new();
+    for start in 0..n {
+        if state.get(start).copied() != Some(0) {
+            continue;
+        }
+        stack.push((start, false));
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                if let Some(slot) = state.get_mut(node) {
+                    *slot = 2;
+                }
+                order.push(node);
+                continue;
+            }
+            if state.get(node).copied() != Some(0) {
+                continue;
+            }
+            if let Some(slot) = state.get_mut(node) {
+                *slot = 1;
+            }
+            stack.push((node, true));
+            if let Some(target) = targets.get(node) {
+                for &dep in &target.dependencies {
+                    if state.get(dep).copied() == Some(0) {
+                        stack.push((dep, false));
+                    }
+                }
+            }
+        }
+    }
+    for &node in &order {
+        let Some(target) = targets.get(node) else {
+            continue;
+        };
+        for &dep in &target.dependencies {
+            if dep >= n || dep == node {
+                continue;
+            }
+            let src_base = dep * words;
+            let dst_base = node * words;
+            for w in 0..words {
+                let bits = reach.get(src_base + w).copied().unwrap_or(0);
+                if let Some(dst) = reach.get_mut(dst_base + w) {
+                    *dst |= bits;
+                }
+            }
+        }
+    }
+    let mut totals = vec![0_usize; n];
+    for i in 0..n {
+        let mut total = 0_usize;
+        let base = i * words;
+        for w in 0..words {
+            let mut bits = reach.get(base + w).copied().unwrap_or(0);
+            while bits != 0 {
+                let tz = bits.trailing_zeros() as usize;
+                total += own.get(w * 64 + tz).copied().unwrap_or(0);
+                bits &= bits - 1;
+            }
+        }
+        if let Some(slot) = totals.get_mut(i) {
+            *slot = total;
+        }
+    }
+    totals
+}
+
 pub(super) fn count(targets: &[Target<'_>], roots: impl IntoIterator<Item = usize>) -> usize {
     let mut pending: Vec<_> = roots.into_iter().collect();
     let mut seen = HashSet::new();
@@ -97,4 +198,66 @@ fn arguments(out: &mut Vec<u8>, message: &[u8]) -> Result<(), GenError> {
     }
     out.push(b'\n');
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use rcmake_base::BString;
+    use rcmake_resolve::BuildStep;
+
+    use super::*;
+    use crate::Step;
+
+    fn make_step(action: &BuildStep, progress: Option<usize>) -> Step<'_> {
+        Step {
+            action,
+            goal: BString::default(),
+            outputs: Vec::new(),
+            symbolic_outputs: Vec::new(),
+            revised_invocations: None,
+            inputs: Vec::new(),
+            depfile: None,
+            always: false,
+            progress,
+            jobserver_aware: false,
+            default_comment: None,
+        }
+    }
+
+    #[test]
+    fn counts_all_matches_single_root_count_on_dag() {
+        let dummy = BuildStep::Custom(rcmake_resolve::CustomStep::default());
+        let make_target = |name: &'static [u8], deps: &[usize], reported: usize| Target {
+            name,
+            file: BString::default(),
+            goal: BString::default(),
+            clean_goal: BString::default(),
+            dependencies: deps.iter().copied().collect::<BTreeSet<_>>(),
+            rules: (0..reported)
+                .map(|i| make_step(&dummy, Some(i + 1)))
+                .chain(std::iter::once(make_step(&dummy, None)))
+                .collect(),
+            products: Vec::new(),
+            fortran: None,
+        };
+        // Diamond + chain + disconnected target:
+        // 0 -> [1, 2], 1 -> [3], 2 -> [3], 3 -> [], 4 -> [0], 5 -> []
+        let targets = vec![
+            make_target(b"t0", &[1, 2], 2),
+            make_target(b"t1", &[3], 3),
+            make_target(b"t2", &[3], 5),
+            make_target(b"t3", &[], 7),
+            make_target(b"t4", &[0], 11),
+            make_target(b"t5", &[], 13),
+        ];
+        let all = counts_all(&targets);
+        let fallback = counts_all_with_limit(&targets, 2);
+        let expected: Vec<usize> = (0..targets.len()).map(|i| count(&targets, [i])).collect();
+        assert_eq!(all, expected);
+        assert_eq!(fallback, expected);
+        assert_eq!(all, vec![17, 10, 12, 7, 28, 13]);
+        assert!(counts_all(&[]).is_empty());
+    }
 }

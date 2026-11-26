@@ -1,6 +1,6 @@
 //! Export C++ module file sets and write their per-configuration import files.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use rcmake_base::{BString, hash::HashAlgo, list, path_lex::Lexical};
@@ -55,7 +55,8 @@ pub fn write_module_exports(
 ) -> Result<Vec<ModuleExportJob>, GenError> {
     let mut jobs = Vec::new();
     let mut install = InstallManifest::default();
-    let mut usage = UsageResolver::new(model);
+    let mut usage: Option<UsageResolver<'_>> = None;
+    let mut graph_indices: Option<ModuleGraphIndices<'_>> = None;
     for (index, plan) in result.exports.iter().enumerate() {
         let Some(directory) = plan
             .cxx_modules_directory
@@ -64,6 +65,8 @@ pub fn write_module_exports(
         else {
             continue;
         };
+        let usage = usage.get_or_insert_with(|| UsageResolver::new(model));
+        let indices = graph_indices.get_or_insert_with(|| ModuleGraphIndices::new(result));
         let directory = safe_directory(directory, plan)?;
         let members = module_export_members(model, plan);
         let action = result.install.actions.iter().find(
@@ -141,55 +144,29 @@ pub fn write_module_exports(
                     &target_name,
                     set,
                     config_files.values().map(|(config, _)| *config),
-                    &mut usage,
+                    usage,
                 )?;
                 for (config, sources) in files {
-                    let Some(graph) = result.graphs.iter().find(|graph| graph.config == *config)
-                    else {
-                        continue;
-                    };
-                    let Some((dyndep, scans, bmi_destination)) =
-                        graph.steps.iter().find_map(|step| match step {
-                            BuildStep::Collate {
-                                target: name,
-                                dd,
-                                ddis,
-                                depend_info,
-                                ..
-                            } if name == &target.name => {
-                                let rcmake_resolve::DependInfo::Cxx(info) = depend_info.as_ref()
-                                else {
-                                    return None;
-                                };
-                                Some((
-                                    dd,
-                                    ddis,
-                                    info.bmi_installation
-                                        .as_ref()
-                                        .map(|install| install.destination.as_slice())
-                                        .filter(|destination| !destination.is_empty()),
-                                ))
-                            }
-                            _ => None,
-                        })
+                    let Some(&(dyndep, scans, bmi_destination)) = indices
+                        .collate
+                        .get(&(config.0.as_slice(), target.name.as_slice()))
                     else {
                         continue;
                     };
                     let scans_for_config = scans_by_config
                         .entry(&config.0)
                         .or_insert_with(|| (config, dyndep, Vec::new(), bmi_destination));
-                    scans_for_config
-                        .2
-                        .extend(graph.steps.iter().filter_map(|step| {
-                            match step {
-                                BuildStep::Scan { source, ddi, .. } if scans.contains(ddi) => {
-                                    sources
-                                        .get(source)
-                                        .map(|path| (bin.join(to_native(ddi)), path.clone()))
-                                }
-                                _ => None,
+                    if let Some(config_scans) = indices.scans_by_config.get(config.0.as_slice()) {
+                        for ddi in scans {
+                            if let Some(&source) = config_scans.get(ddi.as_slice())
+                                && let Some(path) = sources.get(source)
+                            {
+                                scans_for_config
+                                    .2
+                                    .push((bin.join(to_native(ddi)), path.clone()));
                             }
-                        }));
+                        }
+                    }
                 }
             }
             for (config, dyndep, scans, bmi_destination) in scans_by_config.into_values() {
@@ -257,6 +234,57 @@ pub fn write_module_exports(
     }
     write_module_install(host, bin, &install)?;
     Ok(jobs)
+}
+
+type CollateEntry<'a> = (&'a BString, &'a [BString], Option<&'a [u8]>);
+type ScanMap<'a> = HashMap<&'a [u8], &'a BString>;
+
+struct ModuleGraphIndices<'a> {
+    collate: HashMap<(&'a [u8], &'a [u8]), CollateEntry<'a>>,
+    scans_by_config: HashMap<&'a [u8], ScanMap<'a>>,
+}
+
+impl<'a> ModuleGraphIndices<'a> {
+    fn new(result: &'a GenerationResult) -> Self {
+        let mut collate = HashMap::new();
+        let mut scans_by_config: HashMap<&'a [u8], ScanMap<'a>> = HashMap::new();
+        for graph in &result.graphs {
+            let cfg = graph.config.0.as_slice();
+            let config_scans = scans_by_config.entry(cfg).or_default();
+            for step in &graph.steps {
+                match step {
+                    BuildStep::Collate {
+                        target,
+                        dd,
+                        ddis,
+                        depend_info,
+                        ..
+                    } => {
+                        if let rcmake_resolve::DependInfo::Cxx(info) = depend_info.as_ref() {
+                            let bmi_dest = info
+                                .bmi_installation
+                                .as_ref()
+                                .map(|install| install.destination.as_slice())
+                                .filter(|destination| !destination.is_empty());
+                            collate.entry((cfg, target.as_slice())).or_insert((
+                                dd,
+                                ddis.as_slice(),
+                                bmi_dest,
+                            ));
+                        }
+                    }
+                    BuildStep::Scan { source, ddi, .. } => {
+                        config_scans.entry(ddi.as_slice()).or_insert(source);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self {
+            collate,
+            scans_by_config,
+        }
+    }
 }
 
 struct ModuleExportIndex<'a> {

@@ -1,6 +1,8 @@
 //! Configure-time generator expression detection, stripping, and prefix rewriting.
 
-use rcmake_base::BString;
+use std::borrow::Cow;
+
+use rcmake_base::{BString, ByteSlice};
 
 use crate::parse::render;
 use crate::{GenexAst, GenexExpr, GenexNode};
@@ -17,7 +19,7 @@ pub enum PreprocessMode {
 /// Byte offset of the first `$<` in `input`.
 #[must_use]
 pub fn find_genex(input: &[u8]) -> Option<usize> {
-    input.windows(2).position(|w| w == b"$<")
+    input.find(b"$<")
 }
 
 /// Remove every complete `$<...>` expression from `input`, without parsing operators
@@ -70,13 +72,16 @@ pub fn strip(ast: &GenexAst, mode: PreprocessMode) -> GenexAst {
 }
 
 fn strip_nodes(nodes: &[GenexNode], mode: PreprocessMode) -> Vec<GenexNode> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(nodes.len());
     for node in nodes {
         match node {
             GenexNode::Text(_) => out.push(node.clone()),
             GenexNode::Expr(expr) => {
-                let name = render(&expr.identifier);
-                let keep = match (name.as_slice(), mode) {
+                let name: Cow<'_, [u8]> = match expr.identifier.as_slice() {
+                    [GenexNode::Text(text)] => Cow::Borrowed(text.as_slice()),
+                    _ => Cow::Owned(render(&expr.identifier).into()),
+                };
+                let keep = match (name.as_ref(), mode) {
                     (b"BUILD_INTERFACE", PreprocessMode::Build)
                     | (b"INSTALL_INTERFACE", PreprocessMode::Install) => Some(true),
                     (b"BUILD_INTERFACE", PreprocessMode::Install)
@@ -117,9 +122,14 @@ fn strip_nodes(nodes: &[GenexNode], mode: PreprocessMode) -> Vec<GenexNode> {
 #[must_use]
 pub fn rewrite_install_prefix(input: &[u8], replacement: &[u8]) -> BString {
     const NEEDLE: &[u8] = b"$<INSTALL_PREFIX>";
+    let Some(first) = input.find(NEEDLE) else {
+        return input.into();
+    };
     let mut out = Vec::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(pos) = rest.windows(NEEDLE.len()).position(|w| w == NEEDLE) {
+    out.extend_from_slice(input.get(..first).unwrap_or_default());
+    out.extend_from_slice(replacement);
+    let mut rest = input.get(first + NEEDLE.len()..).unwrap_or_default();
+    while let Some(pos) = rest.find(NEEDLE) {
         out.extend_from_slice(rest.get(..pos).unwrap_or_default());
         out.extend_from_slice(replacement);
         rest = rest.get(pos + NEEDLE.len()..).unwrap_or_default();
@@ -151,6 +161,25 @@ mod tests {
         assert_eq!(
             rewrite_install_prefix(b"$<INSTALL_PREFIX>/include", b"${_IMPORT_PREFIX}"),
             "${_IMPORT_PREFIX}/include"
+        );
+    }
+
+    #[test]
+    fn strip_preserves_nested_interface_inside_kept_wrapper() {
+        let nested_install = parse(b"$<BUILD_INTERFACE:$<INSTALL_INTERFACE:inner>outer>").unwrap();
+        assert_eq!(
+            render(&strip(&nested_install, PreprocessMode::Build).nodes),
+            "$<INSTALL_INTERFACE:inner>outer"
+        );
+        let nested_build = parse(b"$<INSTALL_INTERFACE:$<BUILD_INTERFACE:inner>outer>").unwrap();
+        assert_eq!(
+            render(&strip(&nested_build, PreprocessMode::Install).nodes),
+            "$<BUILD_INTERFACE:inner>outer"
+        );
+        let dropped_wrapper = parse(b"$<INSTALL_INTERFACE:$<BUILD_INTERFACE:inner>outer>").unwrap();
+        assert_eq!(
+            render(&strip(&dropped_wrapper, PreprocessMode::Build).nodes),
+            ""
         );
     }
 }

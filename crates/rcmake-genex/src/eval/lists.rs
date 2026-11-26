@@ -64,10 +64,10 @@ impl Evaluator<'_> {
                     Some(rcmake_diag::PolicyStatus::Old | rcmake_diag::PolicyStatus::Warn)
                 ) {
                     self.flags.context_sensitive = true;
-                    let items = list::split(&input, list::Empty::Drop);
                     if status == Some(rcmake_diag::PolicyStatus::Warn)
                         && value.is_empty()
-                        && (input.is_empty() || items != list::split(&input, list::Empty::Keep))
+                        && (input.is_empty()
+                            || list::iter(&input, list::Empty::Keep).any(|item| item.is_empty()))
                     {
                         let detail = [
                             b"Search Item:\n  \"\"\nList:\n  \"".as_slice(),
@@ -77,18 +77,21 @@ impl Evaluator<'_> {
                         .concat();
                         self.host.policy_warning(policy, &detail, call.ctx);
                     }
-                    return Ok(boolean(items.contains(&value)));
+                    let found = list::iter(&input, list::Empty::Drop)
+                        .any(|item| item.as_ref() == value.as_slice());
+                    return Ok(boolean(found));
                 }
                 let found = if input.is_empty() {
                     value.is_empty()
                 } else {
-                    list::split(&input, list::Empty::Keep).contains(&value)
+                    list::iter(&input, list::Empty::Keep)
+                        .any(|item| item.as_ref() == value.as_slice())
                 };
                 return Ok(boolean(found));
             }
             b"JOIN" => {
                 let [input, glue] = self.fixed(call)?;
-                return self.join(list::split(&input, list::Empty::Drop), &glue);
+                return self.join(list::iter(&input, list::Empty::Drop), &glue);
             }
             b"REMOVE_DUPLICATES" => {
                 let [input] = self.fixed(call)?;
@@ -111,8 +114,7 @@ impl Evaluator<'_> {
                 args.bodies.push((args.values.len(), nodes));
                 args.values.push(BString::default());
             } else {
-                args.values
-                    .extend(self.expanded_parameter(nodes, call.ctx)?);
+                self.expand_parameter_into(nodes, call.ctx, &mut args.values)?;
             }
         }
         let [op, input, rest @ ..] = args.values.as_slice() else {
@@ -217,13 +219,17 @@ impl Evaluator<'_> {
         self.join(items, b";")
     }
 
-    pub(super) fn join(&self, items: impl IntoIterator<Item = BString>, separator: &[u8]) -> Value {
+    pub(super) fn join<T: AsRef<[u8]>>(
+        &self,
+        items: impl IntoIterator<Item = T>,
+        separator: &[u8],
+    ) -> Value {
         let mut out = BString::default();
         for (index, item) in items.into_iter().enumerate() {
             if index != 0 {
                 self.append(&mut out, separator)?;
             }
-            self.append(&mut out, &item)?;
+            self.append(&mut out, item.as_ref())?;
         }
         Ok(out)
     }

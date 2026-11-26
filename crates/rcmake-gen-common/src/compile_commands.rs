@@ -1,11 +1,12 @@
 //! `compile_commands.json` (`CMAKE_EXPORT_COMPILE_COMMANDS`).
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::Path,
 };
 
-use rcmake_base::{BString, path_lex::Lexical, shell::quote};
+use rcmake_base::{BString, ByteSlice, path_lex::Lexical, shell::quote};
 use rcmake_host::{Host, path::from_native};
 use rcmake_json::{Value, write_styled};
 use rcmake_model::{GeneratorKind, TargetId};
@@ -102,7 +103,8 @@ fn render_with_directories<'a>(
     ninja_style: bool,
     objects: Option<&HashSet<&[u8]>>,
 ) -> Result<BString, GenError> {
-    let mut out = BString::from("[");
+    let mut out = BString::from(Vec::with_capacity(64 * 1024));
+    out.push(b'[');
     let mut separator = b"\n".as_slice();
     for step in graphs.into_iter().flat_map(|graph| &graph.steps) {
         let BuildStep::Compile {
@@ -171,6 +173,9 @@ fn render_with_directories<'a>(
 }
 
 fn compiler_shell(shell: &[u8]) -> &[u8] {
+    if shell.find(b"__run_co_compile").is_none() {
+        return shell;
+    }
     let mut rest = shell;
     let mut previous = b"".as_slice();
     let mut helper = false;
@@ -188,8 +193,11 @@ fn compiler_shell(shell: &[u8]) -> &[u8] {
     shell
 }
 
-fn compile_command(shell: &[u8], object_paths: Option<(&[u8], &[u8])>) -> BString {
-    let mut command = BString::default();
+fn compile_command<'a>(shell: &'a [u8], object_paths: Option<(&[u8], &[u8])>) -> Cow<'a, [u8]> {
+    if object_paths.is_none() && shell.find(b"-M").is_none() {
+        return Cow::Borrowed(shell);
+    }
+    let mut command = Vec::with_capacity(shell.len());
     let mut rest = shell;
     let mut skip_value = false;
     let mut removed_depfile_flags = false;
@@ -214,9 +222,9 @@ fn compile_command(shell: &[u8], object_paths: Option<(&[u8], &[u8])>) -> BStrin
         }
     }
     if removed_depfile_flags {
-        command.as_slice().trim_ascii_end().into()
+        Cow::Owned(command.as_slice().trim_ascii_end().to_vec())
     } else {
-        command
+        Cow::Owned(command)
     }
 }
 
@@ -256,23 +264,51 @@ pub fn write_compile_commands(
 fn json_string(out: &mut BString, value: &[u8]) {
     out.push(b'"');
     for chunk in value.utf8_chunks() {
-        for part in chunk
-            .valid()
-            .as_bytes()
-            .chunk_by(|a, b| a.is_ascii() == b.is_ascii())
-        {
-            if part.is_ascii() {
-                json_escaped_content(out, part);
-            } else {
-                // CMake's compile database stores UTF-8 directly.
-                out.extend_from_slice(part);
-            }
-        }
+        // CMake's compile database stores valid UTF-8 directly and escapes JSON control,
+        // quote, and backslash bytes.
+        json_escaped_valid(out, chunk.valid().as_bytes());
         if !chunk.invalid().is_empty() {
             json_escaped_content(out, chunk.invalid());
         }
     }
     out.push(b'"');
+}
+
+fn json_escaped_valid(out: &mut BString, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut start = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        let escape: Option<&[u8]> = match byte {
+            b'"' => Some(b"\\\""),
+            b'\\' => Some(b"\\\\"),
+            0x08 => Some(b"\\b"),
+            0x0c => Some(b"\\f"),
+            b'\n' => Some(b"\\n"),
+            b'\r' => Some(b"\\r"),
+            b'\t' => Some(b"\\t"),
+            0x00..=0x1f => {
+                if start < i {
+                    out.extend_from_slice(bytes.get(start..i).unwrap_or_default());
+                }
+                let hi = HEX.get((byte >> 4) as usize).copied().unwrap_or(b'0');
+                let lo = HEX.get((byte & 0x0f) as usize).copied().unwrap_or(b'0');
+                out.extend_from_slice(&[b'\\', b'u', b'0', b'0', hi, lo]);
+                start = i + 1;
+                continue;
+            }
+            _ => None,
+        };
+        if let Some(esc) = escape {
+            if start < i {
+                out.extend_from_slice(bytes.get(start..i).unwrap_or_default());
+            }
+            out.extend_from_slice(esc);
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        out.extend_from_slice(bytes.get(start..).unwrap_or_default());
+    }
 }
 
 fn json_escaped_content(out: &mut BString, value: &[u8]) {
@@ -393,5 +429,33 @@ mod tests {
                 r#""command": "cc '-DVARIABLE=-MD -MF' -o 'obj file.o' -c 'source file.c'""#
             ));
         }
+    }
+
+    #[test]
+    fn json_string_matches_json_writer_and_preserves_utf8() {
+        let mut all_ascii = Vec::with_capacity(128);
+        for byte in 0..=127_u8 {
+            all_ascii.push(byte);
+        }
+        let mut actual = BString::default();
+        json_string(&mut actual, &all_ascii);
+        assert_eq!(
+            actual,
+            write_styled(&Value::string(all_ascii.as_slice()), "  ")
+        );
+
+        let mut utf8 = BString::default();
+        json_string(&mut utf8, "a\"b\\c\n\t\x01café".as_bytes());
+        assert_eq!(utf8, r#""a\"b\\c\n\t\u0001café""#.as_bytes());
+
+        let mut invalid = BString::default();
+        json_string(&mut invalid, &[b'a', 0xff, b'b']);
+        let expected = format!(
+            "\"a{}b\"",
+            write_styled(&Value::string([0xff_u8]), "  ")
+                .to_string()
+                .trim_matches('"')
+        );
+        assert_eq!(invalid.to_string(), expected);
     }
 }

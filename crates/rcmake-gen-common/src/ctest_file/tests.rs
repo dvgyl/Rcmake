@@ -125,7 +125,7 @@ fn resolves_imported_executables_and_aliases_in_commands_and_properties() {
         r#"add_test("alias" "/opt/python/bin/python3.13" "PY=/opt/python/bin/python3.13" "python3.13" "Python3::Interpreter")"#
     ));
     assert!(script.contains(
-        r#"set_tests_properties("alias" PROPERTIES  "ENVIRONMENT" "PY=/opt/python/bin/python3.13;ALIAS=/opt/python/bin/python3.13" "ENVIRONMENT_MODIFICATION" "PATH=path_list_prepend:/opt/python/bin" "WORKING_DIRECTORY" "/opt/python/bin""#
+        r#"set_tests_properties("alias" PROPERTIES  ENVIRONMENT "PY=/opt/python/bin/python3.13;ALIAS=/opt/python/bin/python3.13" ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:/opt/python/bin" WORKING_DIRECTORY "/opt/python/bin""#
     ));
 }
 
@@ -171,13 +171,103 @@ fn resolves_imported_locations_and_properties_per_configuration() {
     for (name, directory) in cases {
         let mut condition = BString::default();
         configuration_condition(&mut condition, &[name.into()]);
-        assert!(script.contains(&format!(
-            "{condition}  \
+        assert!(
+            script.contains(&format!(
+                "{condition}  \
              add_test(\"configured\" \"/opt/{directory}/python\")\n  \
-             set_tests_properties(\"configured\" PROPERTIES  \"WORKING_DIRECTORY\" \"/opt/{directory}\""
-        )), "{script}");
+             set_tests_properties(\"configured\" PROPERTIES  WORKING_DIRECTORY \"/opt/{directory}\""
+            )),
+            "{script}"
+        );
     }
     assert!(script.contains("else()\n  add_test(\"configured\" NOT_AVAILABLE)\nendif()\n"));
+}
+
+#[test]
+fn ctest_context_reuses_indices_and_leaves_property_names_unquoted() {
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/src".into(), "/build".into());
+    let empty_child = model
+        .add_directory(
+            DirId::ROOT,
+            "/src/empty".into(),
+            "/build/empty".into(),
+            Default::default(),
+        )
+        .unwrap();
+    let dir_a = model
+        .add_directory(
+            DirId::ROOT,
+            "/src/a".into(),
+            "/build/a".into(),
+            Default::default(),
+        )
+        .unwrap();
+    let dir_b = model
+        .add_directory(
+            DirId::ROOT,
+            "/src/b".into(),
+            "/build/b".into(),
+            Default::default(),
+        )
+        .unwrap();
+    for (dir, path) in [(dir_a, "/opt/a/tool"), (dir_b, "/opt/b/tool")] {
+        let id = model
+            .add_target(Target::new(
+                "tool".into(),
+                TargetKind::Executable,
+                TargetOrigin::Imported(ImportedVisibility::Local),
+                dir,
+                Default::default(),
+                Default::default(),
+            ))
+            .unwrap();
+        model
+            .target_mut(id)
+            .unwrap()
+            .props
+            .set("IMPORTED_LOCATION".into(), path.into());
+        let mut entry = test_entry("unit", ["tool", "$<TARGET_FILE:tool>"]);
+        entry.dir = dir;
+        entry.props.set("LABELS".into(), "fast;smoke".into());
+        entry.props.set("TIMEOUT".into(), "30".into());
+        entry.working_directory = Some("$<TARGET_FILE_DIR:tool>".into());
+        model.add_test(entry).unwrap();
+    }
+
+    let result = GenerationResult {
+        configs: vec![ConfigId("Debug".into())],
+        ..Default::default()
+    };
+    let mut ctx = CtestContext::new(&model, Some(&result));
+    let empty_script = ctx.render(empty_child, None).unwrap().to_string();
+    assert!(!empty_script.contains("add_test("));
+    let script_a = ctx.render(dir_a, None).unwrap().to_string();
+    assert!(
+        script_a.contains(r#"add_test("unit" "/opt/a/tool" "/opt/a/tool")"#),
+        "{script_a}"
+    );
+    assert!(
+        script_a.contains(
+            r#"set_tests_properties("unit" PROPERTIES  LABELS "fast;smoke" TIMEOUT "30" WORKING_DIRECTORY "/opt/a""#
+        ),
+        "{script_a}"
+    );
+    assert!(!script_a.contains(r#""LABELS""#));
+    assert!(!script_a.contains(r#""TIMEOUT""#));
+    assert!(!script_a.contains(r#""WORKING_DIRECTORY""#));
+
+    let script_b = ctx.render(dir_b, None).unwrap().to_string();
+    assert!(
+        script_b.contains(r#"add_test("unit" "/opt/b/tool" "/opt/b/tool")"#),
+        "{script_b}"
+    );
+    assert!(
+        script_b.contains(
+            r#"set_tests_properties("unit" PROPERTIES  LABELS "fast;smoke" TIMEOUT "30" WORKING_DIRECTORY "/opt/b""#
+        ),
+        "{script_b}"
+    );
 }
 
 fn add_executable(

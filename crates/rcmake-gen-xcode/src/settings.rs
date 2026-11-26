@@ -1,7 +1,7 @@
 //! Project and target build settings for each configuration.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -12,13 +12,16 @@ use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_host::path::from_native_cmake;
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, TargetKind};
 use rcmake_resolve::{
-    GenerationResult, ResolvedTarget,
+    ResolvedTarget,
     ide::{BundleKind, IdeCompileSettings, IdeFacts, IdeLinkItem},
 };
 
 use crate::{
     object::{Attrs, Value, attrs, list},
-    project::link::{PhaseLink, apple_feature_flag, library_basename, object_input},
+    project::{
+        XcodeIndices,
+        link::{PhaseLink, apple_feature_flag, library_basename, object_input},
+    },
     text,
 };
 
@@ -111,7 +114,7 @@ impl Product {
             dir = target_temp_dir(bin, &raw.name);
         } else if let Some(resolved_dir) = target
             .and_then(|target| target.artifacts.file.as_ref())
-            .filter(|path| !path.windows(2).any(|pair| pair == b"$<"))
+            .filter(|path| rcmake_genex::find_genex(path).is_none())
             .and_then(|path| {
                 rcmake_host::path::to_native(path)
                     .parent()
@@ -352,7 +355,7 @@ fn attribute_value(value: &[u8]) -> Value {
 
 pub(crate) struct TargetSettings<'a> {
     pub(crate) model: &'a ProjectModel,
-    pub(crate) result: &'a GenerationResult,
+    pub(crate) indices: &'a XcodeIndices<'a>,
     pub(crate) bin: &'a Path,
     pub(crate) config: &'a str,
     pub(crate) raw: &'a Target,
@@ -521,7 +524,7 @@ impl TargetSettings<'_> {
     fn add_link_settings(&self, settings: &mut Attrs, product: &Product, ide: Option<&IdeFacts>) {
         let Self {
             model,
-            result,
+            indices,
             bin,
             config,
             raw,
@@ -529,16 +532,16 @@ impl TargetSettings<'_> {
             ..
         } = *self;
         let mut ldflags = Vec::new();
-        let mut libraries = Vec::new();
+        let mut libraries = UniqueList::default();
         if let Some(ide) = ide {
             let use_config_directory =
                 raw.policies.policies.get(PolicyId::new(142)) != PolicyStatus::New;
             for directory in &ide.link_directories {
                 let directory = text(directory);
                 if use_config_directory {
-                    libraries.push(format!("{}/{CONFIG_DIR}", directory.trim_end_matches('/')));
+                    libraries.push_raw(format!("{}/{CONFIG_DIR}", directory.trim_end_matches('/')));
                 }
-                libraries.push(directory);
+                libraries.push_raw(directory);
             }
             if raw.kind != TargetKind::StaticLibrary {
                 ldflags.extend(
@@ -557,9 +560,7 @@ impl TargetSettings<'_> {
                 match item {
                     IdeLinkItem::Target(id) => {
                         if let Some(dep) = model.target(*id) {
-                            let resolved = result.targets.iter().find(|target| {
-                                target.id == *id && target.config.0.as_slice() == config.as_bytes()
-                            });
+                            let resolved = indices.resolved.get(&(*id, config.as_bytes())).copied();
                             if dep.is_imported() {
                                 if let Some(resolved) = target {
                                     let artifacts = rcmake_resolve::lower::compute_artifacts(
@@ -667,9 +668,10 @@ impl TargetSettings<'_> {
         }
         if raw.kind != TargetKind::StaticLibrary {
             for dir in self.phase_search_paths(false) {
-                unique(&mut libraries, dir);
+                libraries.push_unique(dir);
             }
         }
+        let libraries = libraries.into_vec();
         if !libraries.is_empty() {
             settings.insert("LIBRARY_SEARCH_PATHS".into(), inherited_paths(libraries));
         }
@@ -807,9 +809,30 @@ fn framework_search_path(path: &[u8]) -> Option<String> {
     }
 }
 
-fn unique(values: &mut Vec<String>, value: String) {
-    if !values.contains(&value) {
-        values.push(value);
+#[derive(Default)]
+struct UniqueList {
+    items: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl UniqueList {
+    fn push_raw(&mut self, value: String) {
+        self.seen.insert(value.clone());
+        self.items.push(value);
+    }
+
+    fn push_unique(&mut self, value: String) {
+        if self.seen.insert(value.clone()) {
+            self.items.push(value);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.items
     }
 }
 

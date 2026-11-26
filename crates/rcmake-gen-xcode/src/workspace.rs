@@ -11,15 +11,30 @@ pub(crate) const XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
 pub(crate) const PLIST: &str = "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n";
 
 pub(crate) fn escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-        .replace('\n', "&#10;")
-        .replace('\r', "&#13;")
-        .replace('\t', "&#9;")
+    let mut out = String::with_capacity(value.len());
+    let mut start = 0;
+    for (i, ch) in value.char_indices() {
+        let repl = match ch {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&apos;",
+            '\n' => "&#10;",
+            '\r' => "&#13;",
+            '\t' => "&#9;",
+            _ => continue,
+        };
+        if start < i {
+            out.push_str(value.get(start..i).unwrap_or_default());
+        }
+        out.push_str(repl);
+        start = i + ch.len_utf8();
+    }
+    if start < value.len() {
+        out.push_str(value.get(start..).unwrap_or_default());
+    }
+    out
 }
 
 pub(crate) fn write(host: &dyn Host, project: &Path) -> Result<(), GenError> {

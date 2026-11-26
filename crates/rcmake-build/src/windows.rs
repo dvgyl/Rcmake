@@ -1,5 +1,6 @@
 //! Run Windows build commands and prepare their side output paths.
 
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rcmake_base::{BString, ByteSlice, shell::quote};
 use rcmake_host::{CommandSpec, Host, HostError, WriteMode, path};
 use rcmake_resolve::Invocation;
+
+use crate::create_dir_cached;
 
 mod batch;
 
@@ -26,6 +29,7 @@ pub(super) fn prepare_outputs(
     host: &dyn Host,
     cwd: &Path,
     args: &[BString],
+    created_dirs: &mut HashSet<PathBuf>,
 ) -> Result<(), HostError> {
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -51,9 +55,9 @@ pub(super) fn prepare_outputs(
         }
         let path = absolute(cwd, value);
         if value.ends_with(b"/") || value.ends_with(b"\\") {
-            host.create_dir_all(&path)?;
+            create_dir_cached(host, &path, created_dirs)?;
         } else if let Some(parent) = path.parent() {
-            host.create_dir_all(parent)?;
+            create_dir_cached(host, parent, created_dirs)?;
         }
     }
     Ok(())
@@ -62,7 +66,9 @@ pub(super) fn prepare_outputs(
 pub(super) fn shell_command(
     host: &dyn Host,
     cwd: &Path,
+    base_env: &[(BString, BString)],
     command: BatchRule<'_>,
+    created_dirs: &mut HashSet<PathBuf>,
 ) -> Result<(CommandSpec, PathBuf), HostError> {
     // cmd.exe uses its own parser for /C. Put the script in a file so that the
     // native process adapter only needs to pass simple arguments.
@@ -80,16 +86,15 @@ pub(super) fn shell_command(
         }
         BatchRule::Lowered(rule) => {
             contents.extend(batch::render(rule, |args| {
-                prepare_outputs(host, cwd, args)
+                prepare_outputs(host, cwd, args, created_dirs)
             })?);
         }
     }
     contents.extend_from_slice(b"\r\n");
-    let program = host
-        .env_all()
-        .into_iter()
+    let program = base_env
+        .iter()
         .find_map(|(name, value)| {
-            (name.eq_ignore_ascii_case(b"COMSPEC") && !value.is_empty()).then_some(value)
+            (name.eq_ignore_ascii_case(b"COMSPEC") && !value.is_empty()).then(|| value.clone())
         })
         .unwrap_or_else(|| "cmd.exe".into());
     for _ in 0..64 {

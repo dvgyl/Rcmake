@@ -1,12 +1,12 @@
 //! Source and compile group entries in a target reply.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use indexmap::IndexMap;
 use rcmake_base::{BString, list, path_lex::Lexical, truth::is_on};
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_genex::EvalContext;
-use rcmake_model::{BT, CustomCommandKind, Target, TargetId, TargetKind, UsageField};
+use rcmake_model::{BT, Target, TargetId, TargetKind, UsageField};
 use rcmake_resolve::{
     BuildStep, CompileGroup, InterfaceInclude, ResolvedTarget,
     lower::{
@@ -19,6 +19,7 @@ use crate::GenError;
 
 use super::super::{Bool, FileApi, Members, Object, Value, array, members, relative};
 use super::{
+    ConfigIndices,
     backtraces::Backtraces,
     file_sets::{FileSets, interface_sources},
     number, optional_array,
@@ -34,6 +35,7 @@ struct Source {
 }
 
 impl FileApi<'_, '_> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn write_target_sources(
         &self,
         target: &ResolvedTarget,
@@ -42,12 +44,9 @@ impl FileApi<'_, '_> {
         body: &mut Members,
         graph: &mut Backtraces<'_>,
         usage: &mut UsageResolver<'_>,
+        config_indices: &ConfigIndices<'_>,
     ) -> Result<(), GenError> {
-        let build_graph = self
-            .result
-            .graphs
-            .iter()
-            .find(|graph| graph.config == target.config);
+        let build_graph = config_indices.build_graph;
         let file_sets = FileSets::collect(self.model, target, raw, self.source, usage)?;
         optional_array(body, "fileSets", file_sets.entries.iter().cloned());
         let pch = build_graph.and_then(|graph| graph.pch_details.get(&target.id));
@@ -105,7 +104,7 @@ impl FileApi<'_, '_> {
                         }
                         continue;
                     }
-                    if source.windows(2).any(|pair| pair == b"$<") {
+                    if rcmake_genex::find_genex(&source).is_some() {
                         continue;
                     }
                     let path = Lexical::new(&source_dir.append(&source)).normalize();
@@ -201,12 +200,11 @@ impl FileApi<'_, '_> {
             }
         }
 
-        if let Some(build_graph) = build_graph {
-            for (&index, owner) in &build_graph.custom_output_owners {
-                if !owner.targets.contains(&target.id) {
-                    continue;
-                }
-                if let Some(command) = self.model.command(owner.command)
+        if let Some(build_graph) = build_graph
+            && let Some(owned_outputs) = config_indices.custom_outputs_by_target.get(&target.id)
+        {
+            for &(index, command_id) in owned_outputs {
+                if let Some(command) = self.model.command(command_id)
                     && command.main_dependency.is_none()
                     && let Some(BuildStep::Custom(step)) = build_graph.steps.get(index)
                     && let Some(output) = step.outputs.first()
@@ -220,10 +218,7 @@ impl FileApi<'_, '_> {
             }
         }
         if target.metadata.kind == TargetKind::Utility
-            && self
-                .model
-                .commands()
-                .any(|(_, command)| command.kind == CustomCommandKind::Utility(target.id))
+            && config_indices.project.utility_commands.contains(&target.id)
         {
             let relative: BString = [b"CMakeFiles/".as_slice(), &target.metadata.name]
                 .concat()
@@ -533,14 +528,29 @@ impl CompileData {
                     .collect(),
             ),
         ] {
+            if entries.is_empty() {
+                continue;
+            }
             let inherited = usage
                 .codemodel_inherited_backtraces(target.id, field, &context)
                 .map_err(error)?;
+            if inherited.is_empty() {
+                continue;
+            }
+            let mut by_value: HashMap<&[u8], Vec<(&Backtrace, &Backtrace)>> =
+                HashMap::with_capacity(inherited.len());
+            for (original, link_bt) in &inherited {
+                by_value
+                    .entry(original.value.as_slice())
+                    .or_default()
+                    .push((&original.backtrace, link_bt));
+            }
             for entry in entries {
-                if let Some((_, link_bt)) = inherited.iter().find(|(original, _)| {
-                    original.value == entry.value
-                        && original.backtrace.frames().eq(entry.backtrace.frames())
-                }) {
+                if let Some(candidates) = by_value.get(entry.value.as_slice())
+                    && let Some(&(_, link_bt)) = candidates
+                        .iter()
+                        .find(|(orig_bt, _)| orig_bt.frames().eq(entry.backtrace.frames()))
+                {
                     entry.backtrace.clone_from(link_bt);
                 }
             }

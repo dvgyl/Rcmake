@@ -1,8 +1,8 @@
 //! Source references, groups, and build files.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
+    collections::{BTreeMap, BTreeSet, HashSet},
+    path::{Path, PathBuf},
 };
 
 use rcmake_gen_common::GenError;
@@ -31,12 +31,12 @@ impl Project<'_> {
     ) -> Result<(Group, BuildFiles), GenError> {
         let mut tree = Group::default();
         let mut files = BuildFiles::default();
+        let source_dir = to_native(&self.model.dir(DirId::ROOT).source_dir);
         for file in sources {
             let path = Path::new(&file.path);
-            let source_dir = to_native(&self.model.dir(DirId::ROOT).source_dir);
             let role = if let Ok(relative) = path.strip_prefix(self.bin) {
                 format!("bin:{}", relative.display())
-            } else if let Ok(relative) = path.strip_prefix(source_dir) {
+            } else if let Ok(relative) = path.strip_prefix(&source_dir) {
                 format!("src:{}", relative.display())
             } else {
                 format!("abs:{}", path.display())
@@ -212,6 +212,21 @@ pub(super) fn source_files<'a>(
     per_language_flags: bool,
 ) -> Result<Vec<Source<'a>>, GenError> {
     let dir = model.dir(raw.dir);
+    let source_dir = to_native(&dir.source_dir);
+    let binary_dir = to_native(&dir.binary_dir);
+    let header_set = |key: &[u8]| -> HashSet<PathBuf> {
+        raw.props
+            .get(key)
+            .map(|value| {
+                settings::strings(value)
+                    .into_iter()
+                    .map(|name| source_dir.join(name))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let public_headers = header_set(b"PUBLIC_HEADER");
+    let private_headers = header_set(b"PRIVATE_HEADER");
     let mut files = Vec::new();
     let mut seen = BTreeSet::new();
     let prefix = settings::compile::prefix_header(target);
@@ -233,24 +248,20 @@ pub(super) fn source_files<'a>(
         {
             kind = IdeSourceKind::Resource;
         }
-        let visibility = [
-            (b"PUBLIC_HEADER".as_slice(), "Public"),
-            (b"PRIVATE_HEADER", "Private"),
-        ]
-        .into_iter()
-        .find_map(|(key, visibility)| {
-            let names = settings::strings(raw.props.get(key)?);
-            names
-                .iter()
-                .any(|name| Path::new(&path) == to_native(&dir.source_dir).join(name))
-                .then_some(visibility)
-        });
+        let path_ref = Path::new(&path);
+        let visibility = if public_headers.contains(path_ref) {
+            Some("Public")
+        } else if private_headers.contains(path_ref) {
+            Some("Private")
+        } else {
+            None
+        };
         if matches!(kind, IdeSourceKind::Compile { .. }) {
-            let relative_props = Path::new(&path)
-                .strip_prefix(to_native(&dir.binary_dir))
+            let relative_props = path_ref
+                .strip_prefix(&binary_dir)
                 .ok()
                 .and_then(|relative| {
-                    let path = to_native(&dir.source_dir).join(relative);
+                    let path = source_dir.join(relative);
                     dir.source_props.get(path.to_str()?.as_bytes())
                 });
             for name in SOURCE_COMPILE_PROPERTIES {
@@ -321,7 +332,7 @@ pub(super) fn source_files<'a>(
             )?;
         }
     }
-    let listfile = to_native(&dir.source_dir).join("CMakeLists.txt");
+    let listfile = source_dir.join("CMakeLists.txt");
     add(
         listfile.to_string_lossy().into_owned(),
         IdeSourceKind::ListFile,

@@ -1,6 +1,6 @@
 //! Common Package Specification files for package information exports.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rcmake_base::{BString, ByteSlice, list, path_lex::Lexical};
 use rcmake_cps::{
@@ -136,6 +136,12 @@ pub(crate) fn render_for_tree(
         spec,
         mode,
     };
+    let mut targets_by_id_config: HashMap<(TargetId, &[u8]), &ResolvedTarget> = HashMap::new();
+    for facts in &result.targets {
+        targets_by_id_config
+            .entry((facts.id, facts.config.0.as_slice()))
+            .or_insert(facts);
+    }
     for &id in &set.targets {
         let target = model
             .target(id)
@@ -170,10 +176,9 @@ pub(crate) fn render_for_tree(
         let mut by_config = BTreeMap::new();
         let mut sets_by_config = Vec::new();
         for config in &configs {
-            let facts = result
-                .targets
-                .iter()
-                .find(|facts| facts.id == id && facts.config == *config);
+            let facts = targets_by_id_config
+                .get(&(id, config.0.as_slice()))
+                .copied();
             let mut config_usage = CpsUsage::default();
             if let Some(facts) = facts {
                 config_usage = artifact_usage(model, result, facts, install.is_some(), prefix);

@@ -3,7 +3,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::Path,
+};
 
 use rcmake_base::{BString, path_lex::Lexical, shell::quote_always};
 use rcmake_gen_common::GenError;
@@ -333,17 +336,17 @@ impl<'a> TargetDepend<'a> {
         let support = Lexical::new(Lexical::new(&self.target.depend_info).parent());
         let depend_make = support.append(b"depend.make");
         include_depend_make(out, &depend_make, &target.goal, cmake)?;
+        let produced: HashSet<&[u8]> = target
+            .rules
+            .iter()
+            .flat_map(|step| step.outputs.iter().map(|output| output.as_slice()))
+            .collect();
         let generated = tdi
             .scan
             .sources
             .iter()
             .map(|source| build_path(&source.source, build_dir))
-            .filter(|source| {
-                target
-                    .rules
-                    .iter()
-                    .any(|step| step.outputs.contains(source))
-            })
+            .filter(|source| produced.contains(source.as_slice()))
             .collect::<Vec<_>>();
         emit_depend(
             out,

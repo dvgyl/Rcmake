@@ -1,17 +1,19 @@
 //! MSBuild C++ project output.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rcmake_base::{path_lex::Lexical, truth};
 use rcmake_gen_common::ide::UtilityKind;
 use rcmake_model::{ProjectModel, Target, TargetKind};
 use rcmake_resolve::{
-    BuildStep, GenerationResult, LinkStep, ResolvedTarget,
+    BuildStep, LinkStep, ResolvedTarget,
     ide::{IdeCompileSettings, IdeCustomPhase, IdeSourceKind},
+    usage::UsageResolver,
 };
 
 use crate::{
     GenError, Project, Settings, absolute, flags_table, guid, join, msbuild, msbuild_value,
+    plan::VsIndices,
     rules::{self, Command, Rule},
     string, windows,
 };
@@ -30,7 +32,7 @@ pub(crate) struct Context<'a> {
     pub(crate) projects: &'a [Project],
     pub(crate) settings: &'a Settings,
     pub(crate) facts: Option<&'a BTreeMap<String, &'a ResolvedTarget>>,
-    pub(crate) result: &'a GenerationResult,
+    pub(crate) indices: &'a VsIndices<'a>,
     pub(crate) model: &'a ProjectModel,
     pub(crate) inputs: &'a [String],
 }
@@ -170,34 +172,30 @@ const DEBUGGER_PROPERTIES: [(&[u8], &str); 4] = [
     ),
 ];
 
-impl Context<'_> {
-    pub(crate) fn plan(&self) -> Result<Plan, GenError> {
+impl<'a> Context<'a> {
+    pub(crate) fn plan(&self, usage: &mut Option<UsageResolver<'a>>) -> Result<Plan, GenError> {
         let mut plan = Plan::default();
         let target = self.project.target.and_then(|id| self.model.target(id));
         for name in &self.settings.configs {
             let mut config = Config::default();
             let fact = self.facts.and_then(|facts| facts.get(name)).copied();
-            let graph = self
-                .result
-                .graphs
-                .iter()
-                .find(|graph| graph.config.0.as_slice() == name.as_bytes());
+            let compile_units = build_compile_units(fact);
+            let graph = self.indices.graph_by_config.get(name.as_bytes()).copied();
             let steps = graph
-                .into_iter()
-                .flat_map(|graph| {
-                    graph
-                        .targets
-                        .iter()
-                        .find(|target| target.name.as_slice() == self.project.name.as_bytes())
-                        .into_iter()
-                        .flat_map(|target| {
-                            target
-                                .steps
-                                .iter()
-                                .filter_map(|&index| graph.steps.get(index))
-                        })
+                .and_then(|graph| {
+                    let target = self
+                        .indices
+                        .graph_target
+                        .get(&(name.as_bytes(), self.project.name.as_bytes()))?;
+                    Some(
+                        target
+                            .steps
+                            .iter()
+                            .filter_map(|&index| graph.steps.get(index))
+                            .collect::<Vec<_>>(),
+                    )
                 })
-                .collect::<Vec<_>>();
+                .unwrap_or_default();
 
             let link = fact.and_then(|fact| fact.link.as_ref()).or_else(|| {
                 steps.iter().find_map(|step| match step {
@@ -280,7 +278,7 @@ impl Context<'_> {
                         .iter()
                         .any(|value| value.as_slice() == name.as_bytes());
                     if kind == Kind::Compile {
-                        item.object = self.object_path(&path, name, fact);
+                        item.object = self.object_path(&path, name, fact, compile_units.as_ref());
                         let base = (!use_common)
                             .then(|| {
                                 ide.compile.iter().find(|settings| {
@@ -310,7 +308,7 @@ impl Context<'_> {
                             visual_studio_compile(settings, &self.settings.toolset)
                         });
                     } else if kind.compiles() {
-                        item.object = self.object_path(&path, name, fact);
+                        item.object = self.object_path(&path, name, fact, compile_units.as_ref());
                         item.tool_compile.clone_from(&source.compile);
                     }
                 }
@@ -343,10 +341,17 @@ impl Context<'_> {
                     }
                 }
             } else {
-                self.fallback(&mut plan, &mut config, fact, &steps, link, name);
+                self.fallback(
+                    &mut plan,
+                    &mut config,
+                    (fact, compile_units.as_ref()),
+                    &steps,
+                    link,
+                    name,
+                );
             }
             self.windows_link(&plan, &mut config, fact, name);
-            self.toolchain_settings(&plan, &mut config, fact, name)?;
+            self.toolchain_settings(&plan, &mut config, fact, name, usage)?;
             let property = |key: &[u8]| {
                 fact.and_then(|fact| fact.ide.as_ref())
                     .and_then(|ide| ide.attributes.get(key))
@@ -455,7 +460,13 @@ impl Context<'_> {
         absolute(&self.project.source, value)
     }
 
-    fn object_path(&self, source: &str, config: &str, fact: Option<&ResolvedTarget>) -> String {
+    fn object_path(
+        &self,
+        source: &str,
+        config: &str,
+        fact: Option<&ResolvedTarget>,
+        compile_units: Option<&HashMap<&[u8], &[u8]>>,
+    ) -> String {
         object_path(
             self.project,
             self.settings,
@@ -463,6 +474,7 @@ impl Context<'_> {
             source,
             config,
             fact,
+            compile_units,
         )
     }
 
@@ -552,6 +564,21 @@ impl Context<'_> {
     }
 }
 
+pub(super) type CompileUnits<'a> = HashMap<&'a [u8], &'a [u8]>;
+
+pub(super) fn build_compile_units(fact: Option<&ResolvedTarget>) -> Option<CompileUnits<'_>> {
+    let units = &fact?.compile_units;
+    if units.is_empty() {
+        return None;
+    }
+    let mut map = HashMap::with_capacity(units.len());
+    for unit in units {
+        map.entry(unit.source.value.as_slice())
+            .or_insert(unit.object.as_slice());
+    }
+    Some(map)
+}
+
 fn object_path(
     project: &Project,
     settings: &Settings,
@@ -559,13 +586,10 @@ fn object_path(
     source: &str,
     config: &str,
     fact: Option<&ResolvedTarget>,
+    compile_units: Option<&HashMap<&[u8], &[u8]>>,
 ) -> String {
-    if let Some(unit) = fact.and_then(|fact| {
-        fact.compile_units
-            .iter()
-            .find(|unit| unit.source.value.as_slice() == source.as_bytes())
-    }) {
-        let file = absolute(&settings.bin, &string(&unit.object));
+    if let Some(&object) = compile_units.and_then(|units| units.get(source.as_bytes())) {
+        let file = absolute(&settings.bin, &string(object));
         if file.to_ascii_lowercase().ends_with(".obj") {
             return file;
         }

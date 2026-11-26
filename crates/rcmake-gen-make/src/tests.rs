@@ -154,7 +154,7 @@ fn custom_commands_without_a_comment_report_their_outputs() {
         ..CustomStep::default()
     };
     assert_eq!(
-        plan_step::default_comment(&step, Path::new(build)),
+        plan_step::default_comment(&step, Path::new(build), build.as_bytes()),
         Some("Generating out/a.h, b.h".into())
     );
     let commented = CustomStep {
@@ -162,7 +162,7 @@ fn custom_commands_without_a_comment_report_their_outputs() {
         ..step.clone()
     };
     assert_eq!(
-        plan_step::default_comment(&commented, Path::new(build)),
+        plan_step::default_comment(&commented, Path::new(build), build.as_bytes()),
         None
     );
     let symbolic = CustomStep {
@@ -170,7 +170,7 @@ fn custom_commands_without_a_comment_report_their_outputs() {
         ..step
     };
     assert_eq!(
-        plan_step::default_comment(&symbolic, Path::new(build)),
+        plan_step::default_comment(&symbolic, Path::new(build), build.as_bytes()),
         None
     );
 }

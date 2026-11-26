@@ -22,8 +22,13 @@ pub(super) struct CudaConfig {
     dependencies: Vec<String>,
 }
 
-impl Context<'_> {
-    pub(crate) fn write_tool_imports(&self, host: &dyn Host, plan: &Plan) -> Result<(), GenError> {
+impl<'a> Context<'a> {
+    pub(crate) fn write_tool_imports(
+        &self,
+        host: &dyn Host,
+        plan: &Plan,
+        nasm_props_template: &mut Option<String>,
+    ) -> Result<(), GenError> {
         if plan.configs.values().any(|config| config.cuda.is_some())
             && self.settings.cuda_version.is_none()
         {
@@ -34,18 +39,27 @@ impl Context<'_> {
         if !plan.items.values().any(|item| item.kind == Kind::Nasm) {
             return Ok(());
         }
-        let templates = self.settings.nasm_templates.as_ref().ok_or_else(|| {
-            GenError::Invalid("Cannot find the Visual Studio NASM templates.".into())
-        })?;
-        let path = join(templates, "nasm.props.in");
-        let source = host
-            .read(
-                &to_native(path.as_bytes()),
-                ReadRange::All { limit: 64 * 1024 },
-            )
-            .map_err(|error| GenError::Invalid(format!("Cannot read {path}. {error}").into()))?;
-        let source = std::str::from_utf8(&source)
-            .map_err(|error| GenError::Invalid(format!("Cannot read {path}. {error}").into()))?;
+        let source = match nasm_props_template {
+            Some(cached) => cached.as_str(),
+            None => {
+                let templates = self.settings.nasm_templates.as_ref().ok_or_else(|| {
+                    GenError::Invalid("Cannot find the Visual Studio NASM templates.".into())
+                })?;
+                let path = join(templates, "nasm.props.in");
+                let bytes = host
+                    .read(
+                        &to_native(path.as_bytes()),
+                        ReadRange::All { limit: 64 * 1024 },
+                    )
+                    .map_err(|error| {
+                        GenError::Invalid(format!("Cannot read {path}. {error}").into())
+                    })?;
+                let text = String::from_utf8(bytes).map_err(|error| {
+                    GenError::Invalid(format!("Cannot read {path}. {error}").into())
+                })?;
+                nasm_props_template.insert(text).as_str()
+            }
+        };
         let compiler = self
             .definition(b"CMAKE_ASM_NASM_COMPILER")
             .map_or_else(|| "nasm".into(), |value| string(value));
@@ -115,42 +129,45 @@ impl Context<'_> {
         config: &mut Config,
         fact: Option<&ResolvedTarget>,
         name: &str,
+        usage: &mut Option<UsageResolver<'a>>,
     ) -> Result<(), GenError> {
         let Some(id) = self.project.target else {
             return Ok(());
         };
-        let mut usage = UsageResolver::new(self.model);
-        if self
+        let check_msvc_runtime = self
             .definition(b"CMAKE_MSVC_RUNTIME_LIBRARY_DEFAULT")
-            .is_some_and(|value| !value.is_empty())
-        {
-            for language in ["C", "CXX"] {
-                let compiled = plan.items.values().any(|item| {
-                    item.kind == Kind::Compile
-                        && item
-                            .configs
-                            .get(name)
-                            .is_some_and(|source| source.language == language && !source.excluded)
-                });
-                if compiled {
-                    usage
-                        .validate_msvc_runtime(id, name.as_bytes(), language.as_bytes())
-                        .map_err(gen_error)?;
+            .is_some_and(|value| !value.is_empty());
+        let mut compiled_c = false;
+        let mut compiled_cxx = false;
+        let mut own_cuda = false;
+        for item in plan.items.values() {
+            if item.kind == Kind::Compile && check_msvc_runtime {
+                if let Some(source) = item.configs.get(name).filter(|source| !source.excluded) {
+                    if source.language == "C" {
+                        compiled_c = true;
+                    } else if source.language == "CXX" {
+                        compiled_cxx = true;
+                    }
                 }
-            }
-        }
-        let own_cuda = plan.items.values().any(|item| {
-            item.kind == Kind::Cuda
+            } else if item.kind == Kind::Cuda
                 && item
                     .configs
                     .get(name)
                     .is_some_and(|source| !source.excluded)
-        });
-        let mut property = |key, default| {
-            usage
-                .target_toolchain_property(id, name.as_bytes(), b"CUDA", key, default)
-                .map_err(gen_error)
-        };
+            {
+                own_cuda = true;
+            }
+        }
+        if check_msvc_runtime {
+            for (compiled, language) in [(compiled_c, b"C".as_slice()), (compiled_cxx, b"CXX")] {
+                if compiled {
+                    usage
+                        .get_or_insert_with(|| UsageResolver::new(self.model))
+                        .validate_msvc_runtime(id, name.as_bytes(), language)
+                        .map_err(gen_error)?;
+                }
+            }
+        }
         let mut dependencies = Vec::new();
         for item in fact
             .and_then(|fact| fact.ide.as_deref())
@@ -183,6 +200,12 @@ impl Context<'_> {
         if !own_cuda && dependencies.is_empty() {
             return Ok(());
         }
+        let resolver = usage.get_or_insert_with(|| UsageResolver::new(self.model));
+        let mut property = |key, default| {
+            resolver
+                .target_toolchain_property(id, name.as_bytes(), b"CUDA", key, default)
+                .map_err(gen_error)
+        };
         let separable = own_cuda
             && property(b"CUDA_SEPARABLE_COMPILATION", None)?
                 .is_some_and(|value| truth::is_on(&value));

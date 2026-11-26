@@ -266,8 +266,10 @@ pub(crate) fn render(ctx: &Context<'_>, plan: &Plan) -> String {
                 ("BeforeTargets", "Link"),
             ],
         );
-        for (name, config) in &plan.configs {
-            if !config.link_output_dirs.is_empty() {
+        for name in &settings.configs {
+            if let Some(config) = plan.configs.get(name)
+                && !config.link_output_dirs.is_empty()
+            {
                 let dirs = config.link_output_dirs.join(";");
                 xml.empty(
                     "MakeDir",

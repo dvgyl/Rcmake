@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -97,6 +97,9 @@ pub fn execute(
     if !order.is_empty() {
         let build_dir = host.initial_cwd().join(&options.build_dir);
         host.create_dir_all(&build_dir)?;
+        let mut created_dirs = HashSet::new();
+        created_dirs.insert(build_dir.clone());
+        let base_env = host.env_all();
         let windows = host.system().sysname.eq_ignore_ascii_case(b"Windows");
         let scan_objects: BTreeMap<_, _> = order
             .iter()
@@ -123,14 +126,14 @@ pub fn execute(
                 && let rcmake_resolve::DependInfo::Fortran(info) = depend_info.as_ref()
             {
                 let data = rcmake_resolve::lower::fortran_depend_info_json(info);
-                write_module_file(host, &build_dir, tdi, &data)?;
+                write_module_file(host, &build_dir, tdi, &data, &mut created_dirs)?;
             }
         }
         let mut module_order: BTreeMap<_, VecDeque<_>> = BTreeMap::new();
         for step in order {
             let step = match step {
                 BuildStep::Collate { ddis, dd, .. } => {
-                    let scans = collate_modules(host, &build_dir, step)?;
+                    let scans = collate_modules(host, &build_dir, step, &mut created_dirs)?;
                     let compiles = compile_steps.remove(dd).unwrap_or_default();
                     if compiles.len() != ddis.len() {
                         return Err(module_error("Module scans and compile steps do not match."));
@@ -160,7 +163,7 @@ pub fn execute(
             let (outputs, invocations): (&[BString], &[Invocation]) = match step {
                 BuildStep::Custom(step) => {
                     for byproduct in &step.byproducts {
-                        create_output_parent(host, &build_dir, byproduct)?;
+                        create_output_parent(host, &build_dir, byproduct, &mut created_dirs)?;
                     }
                     (&step.outputs, &step.invocations)
                 }
@@ -172,10 +175,10 @@ pub fn execute(
                     ..
                 } => {
                     if let Some(depfile) = depfile {
-                        create_output_parent(host, &build_dir, depfile)?;
+                        create_output_parent(host, &build_dir, depfile, &mut created_dirs)?;
                     }
                     for byproduct in byproducts {
-                        create_output_parent(host, &build_dir, byproduct)?;
+                        create_output_parent(host, &build_dir, byproduct, &mut created_dirs)?;
                     }
                     (
                         std::slice::from_ref(object),
@@ -190,10 +193,10 @@ pub fn execute(
                     ..
                 } => {
                     if let Some(depfile) = depfile {
-                        create_output_parent(host, &build_dir, depfile)?;
+                        create_output_parent(host, &build_dir, depfile, &mut created_dirs)?;
                     }
                     if let Some(preprocessed) = preprocessed {
-                        create_output_parent(host, &build_dir, preprocessed)?;
+                        create_output_parent(host, &build_dir, preprocessed, &mut created_dirs)?;
                     }
                     (std::slice::from_ref(ddi), std::slice::from_ref(invocation))
                 }
@@ -213,7 +216,7 @@ pub fn execute(
                                 .map(|cubin| &cubin.output)
                                 .chain([fatbin_header, register_header])
                             {
-                                create_output_parent(host, &build_dir, file)?;
+                                create_output_parent(host, &build_dir, file, &mut created_dirs)?;
                             }
                             cubins
                                 .iter()
@@ -232,21 +235,27 @@ pub fn execute(
                 } => (std::slice::from_ref(&step.output), invocations),
             };
             for file in outputs {
-                create_output_parent(host, &build_dir, file)?;
+                create_output_parent(host, &build_dir, file, &mut created_dirs)?;
             }
             steps_run += 1;
             for invocation in invocations {
-                exit_code = run(
+                exit_code = run_with_env(
                     host,
                     &build_dir,
+                    &base_env,
                     invocation,
                     windows,
                     options.verbose,
                     &mut output,
+                    &mut created_dirs,
                 )?;
                 if exit_code != 0 {
                     break;
                 }
+            }
+            if !invocations.is_empty() {
+                // External commands may remove directories created by earlier steps.
+                created_dirs.clear();
             }
             if exit_code != 0 {
                 break;
@@ -269,6 +278,7 @@ fn collate_modules(
     host: &dyn Host,
     build_dir: &Path,
     step: &BuildStep,
+    created_dirs: &mut HashSet<PathBuf>,
 ) -> Result<Vec<P1689File>, BuildError> {
     let BuildStep::Collate {
         ddis,
@@ -302,7 +312,7 @@ fn collate_modules(
     let module_dir = Lexical::new(dd).parent();
     info.dir_top_bld = path::from_native(build_dir);
     info.module_dir = Lexical::new(&info.dir_top_bld).append(module_dir);
-    write_module_file(host, build_dir, tdi, &write_tdi(&info)?)?;
+    write_module_file(host, build_dir, tdi, &write_tdi(&info)?, created_dirs)?;
     let input = CollationInput {
         linked: info
             .linked_target_dirs
@@ -337,7 +347,7 @@ fn collate_modules(
         return Err(module_error(message));
     }
     for (file, contents) in output.modmaps {
-        write_module_file(host, build_dir, &file, &contents)?;
+        write_module_file(host, build_dir, &file, &contents, created_dirs)?;
     }
     let modules = Lexical::new(module_dir).append(b"CXXModules.json");
     write_module_file(
@@ -345,8 +355,9 @@ fn collate_modules(
         build_dir,
         &modules,
         &write_modules_json(&output.modules)?,
+        created_dirs,
     )?;
-    write_module_file(host, build_dir, dd, &output.dyndep)?;
+    write_module_file(host, build_dir, dd, &output.dyndep, created_dirs)?;
     Ok(input.ddis)
 }
 
@@ -355,8 +366,9 @@ fn write_module_file(
     build_dir: &Path,
     file: &[u8],
     contents: &[u8],
+    created_dirs: &mut HashSet<PathBuf>,
 ) -> Result<(), HostError> {
-    create_output_parent(host, build_dir, file)?;
+    create_output_parent(host, build_dir, file, created_dirs)?;
     host.write(
         &build_dir.join(path::to_native(file)),
         contents,
@@ -482,13 +494,31 @@ fn ordered_steps<'a>(
     Ok(order)
 }
 
-fn create_output_parent(host: &dyn Host, build_dir: &Path, file: &[u8]) -> Result<(), HostError> {
-    if let Some(parent) = build_dir.join(path::to_native(file)).parent() {
-        host.create_dir_all(parent)?;
+fn create_dir_cached(
+    host: &dyn Host,
+    dir: &Path,
+    created_dirs: &mut HashSet<PathBuf>,
+) -> Result<(), HostError> {
+    if !created_dirs.contains(dir) {
+        host.create_dir_all(dir)?;
+        created_dirs.insert(dir.to_path_buf());
     }
     Ok(())
 }
 
+fn create_output_parent(
+    host: &dyn Host,
+    build_dir: &Path,
+    file: &[u8],
+    created_dirs: &mut HashSet<PathBuf>,
+) -> Result<(), HostError> {
+    if let Some(parent) = build_dir.join(path::to_native(file)).parent() {
+        create_dir_cached(host, parent, created_dirs)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn run(
     host: &dyn Host,
     build_dir: &Path,
@@ -496,6 +526,31 @@ fn run(
     windows: bool,
     verbose: bool,
     output: &mut Vec<u8>,
+) -> Result<i32, HostError> {
+    let base_env = host.env_all();
+    let mut created_dirs = HashSet::new();
+    run_with_env(
+        host,
+        build_dir,
+        &base_env,
+        invocation,
+        windows,
+        verbose,
+        output,
+        &mut created_dirs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_env(
+    host: &dyn Host,
+    build_dir: &Path,
+    base_env: &[(BString, BString)],
+    invocation: &Invocation,
+    windows: bool,
+    verbose: bool,
+    output: &mut Vec<u8>,
+    created_dirs: &mut HashSet<PathBuf>,
 ) -> Result<i32, HostError> {
     let cwd = invocation.working_dir.as_ref().map_or_else(
         || build_dir.to_path_buf(),
@@ -510,7 +565,7 @@ fn run(
     let mut script = None;
     let batch = windows.then(|| windows::batch_rule(invocation)).flatten();
     let (program, args) = if let Some((launcher, shell)) = batch {
-        let (command, file) = windows::shell_command(host, &cwd, shell)?;
+        let (command, file) = windows::shell_command(host, &cwd, base_env, shell, created_dirs)?;
         script = Some(file);
         if let Some((program, args)) = launcher.split_first() {
             let mut args = args.to_vec();
@@ -522,7 +577,7 @@ fn run(
         }
     } else if let Some((program, args)) = invocation.argv.split_first() {
         if windows {
-            windows::prepare_outputs(host, &cwd, args)?;
+            windows::prepare_outputs(host, &cwd, args, created_dirs)?;
         }
         (program.clone(), args.to_vec())
     } else {
@@ -566,7 +621,7 @@ fn run(
         &RunRequest {
             pipeline: vec![CommandSpec { program, args }],
             cwd,
-            env: host.env_all(),
+            env: base_env.to_vec(),
             stdin: Input::Null,
             stdout: Output::Capture,
             stderr: Output::SharedWithStdout,

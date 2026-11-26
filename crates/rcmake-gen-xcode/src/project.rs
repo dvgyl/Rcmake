@@ -7,7 +7,7 @@ mod sources;
 mod targets;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -15,12 +15,19 @@ use rcmake_base::truth;
 use rcmake_gen_common::{
     GenError,
     ide::{
-        IdeProject, UtilityKind, UtilityTarget, project_roots, targets_for_root, utility_targets,
+        IdeProject, UtilityKind, UtilityTarget, first_config_dependencies, project_roots,
+        targets_for_root_indexed, utility_targets,
     },
 };
 use rcmake_host::{Host, path::to_native};
-use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetId, TargetKind};
-use rcmake_resolve::{GenerationResult, ResolvedTarget, ide::XcodeConfigFiles};
+use rcmake_model::{
+    CustomCommandKind, DirId, GeneratorKind, ProjectModel, Target, TargetEvent, TargetId,
+    TargetKind,
+};
+use rcmake_resolve::{
+    BuildGraph, GenerationResult, GraphTarget, ResolvedTarget,
+    ide::{IdeCustomPhase, XcodeConfigFiles},
+};
 
 use crate::{
     file_name, ids,
@@ -29,6 +36,93 @@ use crate::{
 };
 
 use sources::Group;
+
+pub(crate) struct XcodeIndices<'a> {
+    pub(crate) resolved: HashMap<(TargetId, &'a [u8]), &'a ResolvedTarget>,
+    pub(crate) first_config_deps: HashMap<TargetId, Vec<TargetId>>,
+    pub(crate) graph_by_config: HashMap<&'a [u8], &'a BuildGraph>,
+    pub(crate) graph_target: HashMap<(&'a [u8], &'a [u8]), &'a GraphTarget>,
+    pub(crate) first_graph_in_all: HashMap<&'a [u8], bool>,
+    pub(crate) objlib_objects: HashMap<(&'a [u8], &'a [u8]), Vec<TargetId>>,
+    pub(crate) output_rule_verbatim: Vec<bool>,
+    pub(crate) target_events: HashMap<TargetId, Vec<(IdeCustomPhase, bool)>>,
+}
+
+impl<'a> XcodeIndices<'a> {
+    pub(crate) fn new(model: &'a ProjectModel, result: &'a GenerationResult) -> Self {
+        let mut resolved = HashMap::with_capacity(result.targets.len());
+        let mut objlib_objects: HashMap<(&'a [u8], &'a [u8]), Vec<TargetId>> = HashMap::new();
+        for target in &result.targets {
+            resolved.insert((target.id, target.config.0.as_slice()), target);
+            if target.metadata.kind == TargetKind::ObjectLibrary {
+                for unit in &target.compile_units {
+                    objlib_objects
+                        .entry((target.config.0.as_slice(), unit.object.as_slice()))
+                        .or_default()
+                        .push(target.id);
+                }
+            }
+        }
+        let first_config_deps = first_config_dependencies(result);
+        let mut graph_by_config: HashMap<&'a [u8], &'a BuildGraph> =
+            HashMap::with_capacity(result.graphs.len());
+        let mut graph_target: HashMap<(&'a [u8], &'a [u8]), &'a GraphTarget> = HashMap::new();
+        for graph in &result.graphs {
+            let cfg = graph.config.0.as_slice();
+            if let std::collections::hash_map::Entry::Vacant(entry) = graph_by_config.entry(cfg) {
+                entry.insert(graph);
+                for item in &graph.targets {
+                    graph_target
+                        .entry((cfg, item.name.as_slice()))
+                        .or_insert(item);
+                }
+            }
+        }
+        let mut first_graph_in_all = HashMap::new();
+        if let Some(first_graph) = result.graphs.first() {
+            first_graph_in_all.reserve(first_graph.targets.len());
+            for item in &first_graph.targets {
+                first_graph_in_all
+                    .entry(item.name.as_slice())
+                    .or_insert(item.in_all);
+            }
+        }
+        let mut output_rule_verbatim = Vec::new();
+        let mut target_events: HashMap<TargetId, Vec<(IdeCustomPhase, bool)>> = HashMap::new();
+        for (_, command) in model.commands() {
+            match command.kind {
+                CustomCommandKind::Output => output_rule_verbatim.push(command.verbatim),
+                CustomCommandKind::Utility(id) => {
+                    target_events
+                        .entry(id)
+                        .or_default()
+                        .push((IdeCustomPhase::Rule, !command.verbatim));
+                }
+                CustomCommandKind::TargetEvent { target: id, event } => {
+                    let phase = match event {
+                        TargetEvent::PreBuild => IdeCustomPhase::PreBuild,
+                        TargetEvent::PreLink => IdeCustomPhase::PreLink,
+                        TargetEvent::PostBuild => IdeCustomPhase::PostBuild,
+                    };
+                    target_events
+                        .entry(id)
+                        .or_default()
+                        .push((phase, !command.verbatim));
+                }
+            }
+        }
+        Self {
+            resolved,
+            first_config_deps,
+            graph_by_config,
+            graph_target,
+            first_graph_in_all,
+            objlib_objects,
+            output_rule_verbatim,
+            target_events,
+        }
+    }
+}
 
 struct Project<'a> {
     result: &'a GenerationResult,
@@ -40,7 +134,7 @@ struct Project<'a> {
     default_config: String,
     upgrade: String,
     objects: Objects,
-    resolved: BTreeMap<(TargetId, String), &'a ResolvedTarget>,
+    indices: &'a XcodeIndices<'a>,
     config_sources: BTreeMap<String, XcodeConfigFiles<'a>>,
 }
 
@@ -135,10 +229,10 @@ pub(crate) fn generate(
     result: &GenerationResult,
     model: &ProjectModel,
     host: &dyn Host,
-    bin: &Path,
-    out: &Path,
+    (bin, out): (&Path, &Path),
     root: &IdeProject,
     utilities: &[UtilityTarget],
+    indices: &XcodeIndices<'_>,
 ) -> Result<(), GenError> {
     let name = text(&root.name);
     let path = out.join(format!("{}.xcodeproj", file_name(&name)?));
@@ -192,12 +286,8 @@ pub(crate) fn generate(
         default_config,
         upgrade,
         objects: Objects::default(),
+        indices,
         config_sources: BTreeMap::new(),
-        resolved: result
-            .targets
-            .iter()
-            .map(|t| ((t.id, text(&t.config.0)), t))
-            .collect(),
     };
     project.write(root, &name, out, utilities)
 }
@@ -220,12 +310,16 @@ impl Project<'_> {
         let mut targets = Vec::new();
         let mut products = Vec::new();
         let first_config = self.configs.first().cloned().unwrap_or_default();
-        for id in targets_for_root(self.model, self.result, root.dir) {
+        for id in targets_for_root_indexed(self.model, &self.indices.first_config_deps, root.dir) {
             if let Some(raw) = self.model.target(id)
                 && let Some(isa) = target_type(self.model, raw)
             {
                 let reference = self.reserve_target(isa, &text(&raw.name))?;
-                let facts = self.resolved.get(&(id, first_config.clone())).copied();
+                let facts = self
+                    .indices
+                    .resolved
+                    .get(&(id, first_config.as_bytes()))
+                    .copied();
                 let product =
                     settings::Product::new(self.model, raw, facts, &first_config, self.bin);
                 let product_ref = if matches!(isa, Isa::PBXNativeTarget) {
@@ -251,6 +345,11 @@ impl Project<'_> {
                 });
             }
         }
+        let target_by_id: HashMap<TargetId, usize> = targets
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id, index))
+            .collect();
         let mut utility_refs = Vec::new();
         for utility in utilities {
             utility_refs.push((
@@ -270,7 +369,7 @@ impl Project<'_> {
         let mut tree = Group::default();
         let project_settings = self.project_settings(root.dir, &key, &mut tree)?;
         for target in &targets {
-            let group = self.target(target, &targets, &project_ref, zero)?;
+            let group = self.target(target, &targets, &target_by_id, &project_ref, zero)?;
             let folder = target
                 .raw
                 .props
@@ -445,12 +544,10 @@ impl Project<'_> {
     }
 
     fn in_all(&self, target: &TargetEntry<'_>) -> bool {
-        if let Some(in_all) = self
-            .result
-            .graphs
-            .first()
-            .and_then(|g| g.targets.iter().find(|t| t.name == target.raw.name))
-            .map(|t| t.in_all)
+        if let Some(&in_all) = self
+            .indices
+            .first_graph_in_all
+            .get(target.raw.name.as_slice())
         {
             return in_all;
         }

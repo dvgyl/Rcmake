@@ -1,4 +1,4 @@
-use std::{cell::Cell, cmp::Ordering};
+use std::{borrow::Cow, cell::Cell, cmp::Ordering};
 
 use rcmake_base::{BString, Limits, list, path_lex::Lexical, truth, version};
 
@@ -27,6 +27,18 @@ pub fn evaluate(
     ctx: &EvalContext,
     host: &mut dyn GenexHost,
 ) -> Result<(BString, EvalFlags), GenexError> {
+    match ast.nodes.as_slice() {
+        [] => return Ok((BString::default(), EvalFlags::default())),
+        [GenexNode::Text(text)] => {
+            if text.len() > host.limits().max_value_bytes {
+                return Err(Evaluator::limit_error(
+                    "Generator expression exceeds the value size limit.",
+                ));
+            }
+            return Ok((text.clone(), EvalFlags::default()));
+        }
+        _ => {}
+    }
     let _root = targets::DAGChecker::root(ctx);
     let mut evaluator = Evaluator::new(host);
     let value = evaluator.nodes(&ast.nodes, ctx)?;
@@ -41,6 +53,18 @@ pub fn evaluate_with_target_lookups(
     host: &mut dyn GenexHost,
     seen: &mut Vec<(BString, TargetHandle)>,
 ) -> Result<(BString, EvalFlags), GenexError> {
+    match ast.nodes.as_slice() {
+        [] => return Ok((BString::default(), EvalFlags::default())),
+        [GenexNode::Text(text)] => {
+            if text.len() > host.limits().max_value_bytes {
+                return Err(Evaluator::limit_error(
+                    "Generator expression exceeds the value size limit.",
+                ));
+            }
+            return Ok((text.clone(), EvalFlags::default()));
+        }
+        _ => {}
+    }
     let _root = targets::DAGChecker::root(ctx);
     let mut evaluator = Evaluator::new(host);
     evaluator.lookups = Some(seen);
@@ -62,6 +86,18 @@ pub fn evaluate_diagnostics(
     ctx: &EvalContext,
     host: &mut dyn GenexHost,
 ) -> Result<(BString, EvalFlags), Vec<GenexError>> {
+    match ast.nodes.as_slice() {
+        [] => return Ok((BString::default(), EvalFlags::default())),
+        [GenexNode::Text(text)] => {
+            if text.len() > host.limits().max_value_bytes {
+                return Err(vec![Evaluator::limit_error(
+                    "Generator expression exceeds the value size limit.",
+                )]);
+            }
+            return Ok((text.clone(), EvalFlags::default()));
+        }
+        _ => {}
+    }
     let _root = targets::DAGChecker::root(ctx);
     let mut evaluator = Evaluator::new(host);
     let mut output = BString::default();
@@ -216,11 +252,33 @@ impl<'a> Evaluator<'a> {
     }
 
     fn nodes(&mut self, nodes: &[GenexNode], ctx: &EvalContext) -> Value {
-        let mut result = BString::default();
-        for node in nodes {
-            self.append_node(&mut result, node, ctx)?;
+        match nodes {
+            [] => Ok(BString::default()),
+            [GenexNode::Text(text)] => {
+                if text.len() > self.limits.max_value_bytes {
+                    return Err(Self::limit_error(
+                        "Generator expression exceeds the value size limit.",
+                    ));
+                }
+                Ok(text.clone())
+            }
+            [GenexNode::Expr(expr)] => {
+                let value = self.expression(expr, ctx)?;
+                if value.len() > self.limits.max_value_bytes {
+                    return Err(Self::limit_error(
+                        "Generator expression exceeds the value size limit.",
+                    ));
+                }
+                Ok(value)
+            }
+            _ => {
+                let mut result = BString::default();
+                for node in nodes {
+                    self.append_node(&mut result, node, ctx)?;
+                }
+                Ok(result)
+            }
         }
-        Ok(result)
     }
 
     fn append_node(
@@ -249,22 +307,32 @@ impl<'a> Evaluator<'a> {
     }
 
     fn dispatch(&mut self, expr: &GenexExpr, ctx: &EvalContext) -> Value {
-        let name = self.nodes(&expr.identifier, ctx)?;
+        let name: Cow<'_, [u8]> = match expr.identifier.as_slice() {
+            [GenexNode::Text(text)] => {
+                if text.len() > self.limits.max_value_bytes {
+                    return Err(Self::limit_error(
+                        "Generator expression value exceeds size limit.",
+                    ));
+                }
+                Cow::Borrowed(text.as_slice())
+            }
+            _ => Cow::Owned(self.nodes(&expr.identifier, ctx)?.into()),
+        };
         let call = Call {
-            name: &name,
+            name: name.as_ref(),
             expr,
             ctx,
         };
-        match name.as_slice() {
+        match name.as_ref() {
             b"0" | b"1" => {
                 if call.params() == 0 {
-                    return Err(if name == "0" {
+                    return Err(if name.as_ref() == b"0" {
                         call.error("$<0> expression requires a parameter.")
                     } else {
                         call.arity(1)
                     });
                 }
-                if name == "1" {
+                if name.as_ref() == b"1" {
                     self.content(call)
                 } else {
                     Ok(BString::default())
@@ -274,7 +342,7 @@ impl<'a> Evaluator<'a> {
             b"AND" | b"OR" => self.boolean_operation(call),
             b"BOOL" | b"NOT" => {
                 let [value] = self.fixed(call)?;
-                if name == "BOOL" {
+                if name.as_ref() == b"BOOL" {
                     Ok(boolean(!truth::is_off(&value)))
                 } else {
                     match value.as_slice() {
@@ -300,7 +368,7 @@ impl<'a> Evaluator<'a> {
             | b"PATH_EQUAL" => self.compare(call),
             b"ANGLE-R" | b"COMMA" | b"SEMICOLON" | b"QUOTE" => {
                 let [] = self.fixed(call)?;
-                Ok(match name.as_slice() {
+                Ok(match name.as_ref() {
                     b"ANGLE-R" => ">",
                     b"COMMA" => ",",
                     b"SEMICOLON" => ";",
@@ -310,7 +378,7 @@ impl<'a> Evaluator<'a> {
             }
             b"LOWER_CASE" | b"UPPER_CASE" | b"MAKE_C_IDENTIFIER" => {
                 let value = self.content(call)?;
-                Ok(strings::convert(&name, &value))
+                Ok(strings::convert(name.as_ref(), &value))
             }
             b"STRING" => self.string(call),
             b"LIST" | b"IN_LIST" | b"JOIN" | b"REMOVE_DUPLICATES" | b"FILTER" => self.list(call),
@@ -318,17 +386,19 @@ impl<'a> Evaluator<'a> {
             b"ARGS" => self.argument_list(call),
             b"_0" | b"_1" => {
                 let [] = self.fixed(call)?;
-                let index = usize::from(name == "_1");
+                let index = usize::from(name.as_ref() == b"_1");
                 let Some(binding) = self.bindings.last().filter(|binding| !binding.is_empty())
                 else {
                     return Err(call.error(format!(
-                        "$<{name}> may only be used inside the body of a binding operation."
+                        "$<{}> may only be used inside the body of a binding operation.",
+                        BString::from(name.as_ref())
                     )));
                 };
                 binding.get(index).cloned().ok_or_else(|| {
                     let count = binding.len();
                     call.error(format!(
-                        "$<{name}> is out of range for the current binding operation, which binds only {count} operand(s) (maximum $<_{}>).",
+                        "$<{}> is out of range for the current binding operation, which binds only {count} operand(s) (maximum $<_{}>).",
+                        BString::from(name.as_ref()),
                         count - 1
                     ))
                 })
@@ -353,7 +423,7 @@ impl<'a> Evaluator<'a> {
             | b"HOST_LINK"
             | b"DEVICE_LINK" => self.interface(call),
             b"LINK_LIBRARY" | b"LINK_GROUP" => self.link_feature(call),
-            _ if context::compiler_operator(&name) => self.compiler(call),
+            _ if context::compiler_operator(name.as_ref()) => self.compiler(call),
             b"SOURCE_PROPERTY" => self.source_property(call),
             b"RULE_PROPERTY" => self.rule_property(call),
             b"SOURCE_EXISTS"
@@ -378,17 +448,28 @@ impl<'a> Evaluator<'a> {
         self.nodes(nodes, call.ctx)
     }
 
-    fn expanded_parameter(
+    fn expand_parameter_into(
         &mut self,
         nodes: &[GenexNode],
         ctx: &EvalContext,
-    ) -> Result<Vec<BString>, GenexError> {
+        out: &mut Vec<BString>,
+    ) -> Result<(), GenexError> {
         let value = self.nodes(nodes, ctx)?;
         self.charge(value.len().max(1))?;
-        self.expand_argument(value)
+        self.expand_argument_into(value, out)
     }
 
     fn expand_argument(&mut self, value: BString) -> Result<Vec<BString>, GenexError> {
+        let mut out = Vec::with_capacity(1);
+        self.expand_argument_into(value, &mut out)?;
+        Ok(out)
+    }
+
+    fn expand_argument_into(
+        &mut self,
+        value: BString,
+        out: &mut Vec<BString>,
+    ) -> Result<(), GenexError> {
         if let Some(args) = value
             .strip_prefix(b"<ARGS>")
             .and_then(|v| v.strip_suffix(b"</ARGS>"))
@@ -400,15 +481,17 @@ impl<'a> Evaluator<'a> {
                     .count()
                     .saturating_mul(std::mem::size_of::<BString>()),
             )?;
-            return Ok(parts.map(BString::from).collect());
+            out.extend(parts.map(BString::from));
+        } else {
+            out.push(value);
         }
-        Ok(vec![value])
+        Ok(())
     }
 
     fn arguments(&mut self, call: Call<'_>) -> Result<Vec<BString>, GenexError> {
-        let mut values = Vec::new();
+        let mut values = Vec::with_capacity(call.params());
         for nodes in call.expr.params.iter().flatten() {
-            values.extend(self.expanded_parameter(nodes, call.ctx)?);
+            self.expand_parameter_into(nodes, call.ctx, &mut values)?;
         }
         // Check the property read before it can enter the usage resolver.
         if call.name == b"TARGET_PROPERTY" {
@@ -418,6 +501,9 @@ impl<'a> Evaluator<'a> {
     }
 
     fn fixed<const N: usize>(&mut self, call: Call<'_>) -> Result<[BString; N], GenexError> {
+        if N == 0 && call.params() == 0 {
+            return Vec::new().try_into().map_err(|_| call.arity(0));
+        }
         let mut values = self.arguments(call)?;
         if call.params() != N {
             return Err(call.arity(N));
@@ -427,10 +513,32 @@ impl<'a> Evaluator<'a> {
     }
 
     fn content(&mut self, call: Call<'_>) -> Value {
-        self.arbitrary_content(call, 0)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| call.arity(1))
+        if call.params() == 0 {
+            return Err(call.arity(1));
+        }
+        let out = if call.params() == 1 {
+            self.parameter(call, 0)?
+        } else {
+            let mut out = BString::default();
+            for index in 0..call.params() {
+                if index != 0 {
+                    self.append(&mut out, b",")?;
+                }
+                let value = self.parameter(call, index)?;
+                self.append(&mut out, &value)?;
+            }
+            out
+        };
+        if let Some(args) = out
+            .strip_prefix(b"<ARGS>")
+            .and_then(|v| v.strip_suffix(b"</ARGS>"))
+        {
+            let first = args.split(|&byte| byte == b',').next().unwrap_or_default();
+            let count = args.iter().filter(|&&b| b == b',').count() + 1;
+            self.charge(count.saturating_mul(std::mem::size_of::<BString>()))?;
+            return Ok(BString::from(first));
+        }
+        Ok(out)
     }
 
     fn arbitrary_content(
@@ -478,11 +586,17 @@ impl<'a> Evaluator<'a> {
 
     fn conditional(&mut self, call: Call<'_>) -> Value {
         // Select branches before expanding argument lists.
-        let mut raw = Vec::<BString>::new();
+        let mut raw = Vec::<BString>::with_capacity(call.params());
+        let mut has_args = false;
         for (index, nodes) in call.expr.params.iter().flatten().enumerate() {
             let skip = index.checked_sub(1).is_some_and(|branch| {
+                let skip_if = match branch {
+                    0 => b"0".as_slice(),
+                    1 => b"1".as_slice(),
+                    _ => return false,
+                };
                 raw.first()
-                    .is_some_and(|condition| condition.as_slice() == branch.to_string().as_bytes())
+                    .is_some_and(|condition| condition.as_slice() == skip_if)
             });
             let value = if skip {
                 BString::default()
@@ -490,15 +604,23 @@ impl<'a> Evaluator<'a> {
                 self.nodes(nodes, call.ctx)?
             };
             self.charge(value.len().max(1))?;
+            if value.starts_with(b"<ARGS>") && value.ends_with(b"</ARGS>") {
+                has_args = true;
+            }
             raw.push(value);
         }
         if raw.len() != 3 {
             return Err(call.arity(3));
         }
-        let mut values = Vec::new();
-        for value in raw {
-            values.extend(self.expand_argument(value)?);
-        }
+        let values = if has_args {
+            let mut expanded = Vec::with_capacity(3);
+            for value in raw {
+                self.expand_argument_into(value, &mut expanded)?;
+            }
+            expanded
+        } else {
+            raw
+        };
         let mut values = values.into_iter();
         let branch = match values.next().as_ref().map(|value| value.as_slice()) {
             Some(b"1") => 0,
@@ -520,7 +642,7 @@ impl<'a> Evaluator<'a> {
                 BString::from(call.name)
             )));
         }
-        let mut raw = Vec::new();
+        let mut raw = Vec::with_capacity(call.params());
         for nodes in call.expr.params.iter().flatten() {
             let value = self.nodes(nodes, call.ctx)?;
             self.charge(value.len().max(1))?;
@@ -530,12 +652,27 @@ impl<'a> Evaluator<'a> {
                 break;
             }
         }
+        let mut expanded = Vec::new();
         for parameter in raw {
-            for value in self.expand_argument(parameter)? {
-                if value == decisive {
+            if parameter.starts_with(b"<ARGS>") && parameter.ends_with(b"</ARGS>") {
+                expanded.clear();
+                self.expand_argument_into(parameter, &mut expanded)?;
+                for value in expanded.drain(..) {
+                    if value == decisive {
+                        return Ok(decisive);
+                    }
+                    if !matches!(value.as_slice(), b"0" | b"1") {
+                        return Err(call.error(format!(
+                            "Parameters to $<{}> must resolve to either '0' or '1'.",
+                            BString::from(call.name)
+                        )));
+                    }
+                }
+            } else {
+                if parameter == decisive {
                     return Ok(decisive);
                 }
-                if !matches!(value.as_slice(), b"0" | b"1") {
+                if !matches!(parameter.as_slice(), b"0" | b"1") {
                     return Err(call.error(format!(
                         "Parameters to $<{}> must resolve to either '0' or '1'.",
                         BString::from(call.name)
@@ -588,10 +725,10 @@ fn integer(value: &[u8]) -> Option<i64> {
     let text = std::str::from_utf8(value)
         .ok()?
         .trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let (sign, digits) = if let Some(rest) = text.strip_prefix('-') {
-        ("-", rest)
+    let (negative, digits) = if let Some(rest) = text.strip_prefix('-') {
+        (true, rest)
     } else {
-        ("", text.strip_prefix('+').unwrap_or(text))
+        (false, text.strip_prefix('+').unwrap_or(text))
     };
     let (radix, digits) = if let Some(rest) = digits
         .strip_prefix("0x")
@@ -606,7 +743,16 @@ fn integer(value: &[u8]) -> Option<i64> {
     if digits.starts_with(['+', '-']) {
         return None;
     }
-    i64::from_str_radix(&format!("{sign}{digits}"), radix).ok()
+    let mag = u64::from_str_radix(digits, radix).ok()?;
+    if negative {
+        if mag == (i64::MAX as u64) + 1 {
+            Some(i64::MIN)
+        } else {
+            i64::try_from(mag).ok().map(|v| -v)
+        }
+    } else {
+        i64::try_from(mag).ok()
+    }
 }
 
 fn unknown(call: Call<'_>) -> GenexError {

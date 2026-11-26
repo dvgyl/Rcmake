@@ -1,6 +1,6 @@
 //! SPDX 3.0.1 JSON-LD software bill of materials.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use rcmake_base::{BString, list};
 use rcmake_genex::{
@@ -157,6 +157,15 @@ pub(crate) fn render_for_tree(
         );
     }
     let mut usage = UsageResolver::new(model);
+    let mut link_languages: HashMap<TargetId, &BString> = HashMap::new();
+    for facts in &result.targets {
+        if facts.config.matches(config)
+            && let Some(link) = &facts.link
+        {
+            link_languages.entry(facts.id).or_insert(&link.language);
+        }
+    }
+    let sbom_owners = build_sbom_owners(model, mode);
     let mut visited = BTreeSet::new();
     let mut dependencies_seen = BTreeSet::new();
     let mut identities = BTreeMap::new();
@@ -184,9 +193,11 @@ pub(crate) fn render_for_tree(
             continue;
         }
 
-        let links = target_links(model, result, &mut usage, id, target, config, mode)?;
+        let links = target_links(model, &link_languages, &mut usage, id, target, config, mode)?;
         let mut dependencies = Vec::new();
         let mut shared = Vec::new();
+        let mut seen_deps = HashSet::new();
+        let mut seen_shared = HashSet::new();
         for (lookup, link) in links {
             if let Some(dependency) = model.find_target(lookup, &link) {
                 if dependency == id {
@@ -197,6 +208,7 @@ pub(crate) fn render_for_tree(
                         let identity = dependency_identity(
                             model,
                             result,
+                            &sbom_owners,
                             dependency,
                             dependency_target,
                             target,
@@ -225,14 +237,15 @@ pub(crate) fn render_for_tree(
                     if dependency_target.kind == TargetKind::UnknownLibrary {
                         continue;
                     }
-                    let package = text(urn(&identity.name, "Package"));
-                    let group = if dependency_target.kind == TargetKind::SharedLibrary {
-                        &mut shared
+                    let package_urn = urn(&identity.name, "Package");
+                    let (group, seen_group) = if dependency_target.kind == TargetKind::SharedLibrary
+                    {
+                        (&mut shared, &mut seen_shared)
                     } else {
-                        &mut dependencies
+                        (&mut dependencies, &mut seen_deps)
                     };
-                    if !group.contains(&package) {
-                        group.push(package);
+                    if seen_group.insert(package_urn.clone()) {
+                        group.push(text(package_urn));
                     }
                 }
             } else if !link.starts_with(b"-") && dependencies_seen.insert(link.clone()) {
@@ -312,7 +325,7 @@ pub(crate) fn render_for_tree(
 
 fn target_links(
     model: &ProjectModel,
-    result: &GenerationResult,
+    link_languages: &HashMap<TargetId, &BString>,
     usage: &mut UsageResolver<'_>,
     id: TargetId,
     target: &Target,
@@ -325,12 +338,7 @@ fn target_links(
         head: Some(handle),
         current: Some(handle),
         traversal: UsageTraversal::Link,
-        link_language: result
-            .targets
-            .iter()
-            .find(|facts| facts.id == id && facts.config.matches(config))
-            .and_then(|facts| facts.link.as_ref())
-            .map(|link| link.language.clone()),
+        link_language: link_languages.get(&id).map(|language| (*language).clone()),
         ..EvalContext::default()
     };
     let mut links = Vec::new();
@@ -446,9 +454,41 @@ impl Identity {
     }
 }
 
+fn build_sbom_owners(model: &ProjectModel, mode: PreprocessMode) -> HashMap<TargetId, &BString> {
+    let mut owners = HashMap::new();
+    let specs: Box<dyn Iterator<Item = &SbomSpec>> = if mode == PreprocessMode::Install {
+        Box::new(model.installs.iter().filter_map(|rule| match &rule.kind {
+            InstallKind::Sbom(spec) => Some(spec.as_ref()),
+            _ => None,
+        }))
+    } else {
+        Box::new(
+            model
+                .build_exports
+                .iter()
+                .filter_map(|rule| match &rule.kind {
+                    ExportKind::Sbom(spec) => Some(spec),
+                    _ => None,
+                }),
+        )
+    };
+    for spec in specs {
+        for set_name in &spec.exports {
+            if let Some(set) = model.exports.get(set_name) {
+                for &target_id in &set.targets {
+                    owners.entry(target_id).or_insert(&spec.name);
+                }
+            }
+        }
+    }
+    owners
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dependency_identity(
     model: &ProjectModel,
     result: &GenerationResult,
+    sbom_owners: &HashMap<TargetId, &BString>,
     id: TargetId,
     target: &Target,
     consumer: &Target,
@@ -508,31 +548,8 @@ fn dependency_identity(
             ..Identity::local(target)
         });
     }
-    let sboms: Box<dyn Iterator<Item = &SbomSpec>> = if mode == PreprocessMode::Install {
-        Box::new(model.installs.iter().filter_map(|rule| match &rule.kind {
-            InstallKind::Sbom(spec) => Some(spec.as_ref()),
-            _ => None,
-        }))
-    } else {
-        Box::new(
-            model
-                .build_exports
-                .iter()
-                .filter_map(|rule| match &rule.kind {
-                    ExportKind::Sbom(spec) => Some(spec),
-                    _ => None,
-                }),
-        )
-    };
-    for spec in sboms {
-        if spec.exports.iter().any(|set| {
-            model
-                .exports
-                .get(set)
-                .is_some_and(|set| set.targets.contains(&id))
-        }) {
-            return Ok(Identity::external(&spec.name, &component(target, b"")));
-        }
+    if let Some(&spec_name) = sbom_owners.get(&id) {
+        return Ok(Identity::external(spec_name, &component(target, b"")));
     }
     Ok(Identity::local(target))
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -80,6 +80,7 @@ pub fn write_supplementary_outputs(
             ExportKind::CMake => {}
         }
     }
+    let mut usage: Option<UsageResolver<'_>> = None;
     for (index, rule) in model.installs.iter().enumerate() {
         if dir_excluded_from_all(model, rule.dir) {
             continue;
@@ -137,7 +138,9 @@ pub fn write_supplementary_outputs(
                     now,
                 )?;
             }
-            InstallKind::Targets { .. } => outputs.file_sets(model, result, index, rule)?,
+            InstallKind::Targets { .. } => {
+                outputs.file_sets(model, result, index, rule, &mut usage)?;
+            }
             _ => {}
         }
     }
@@ -386,17 +389,17 @@ impl Outputs {
         self.manifest.actions.push(action);
     }
 
-    fn file_sets(
+    fn file_sets<'a>(
         &mut self,
-        model: &ProjectModel,
+        model: &'a ProjectModel,
         result: &GenerationResult,
         index: usize,
         rule: &InstallRule,
+        usage: &mut Option<UsageResolver<'a>>,
     ) -> Result<(), GenError> {
         let InstallKind::Targets { targets, .. } = &rule.kind else {
             return Ok(());
         };
-        let mut usage = UsageResolver::new(model);
         let default = model
             .definition(rule.dir, b"CMAKE_INSTALL_INCLUDEDIR")
             .map_or(b"include".as_slice(), |value| value.as_slice());
@@ -411,6 +414,7 @@ impl Outputs {
                 let Some(options) = options_for_set(model, index, &set.name) else {
                     continue;
                 };
+                let usage = usage.get_or_insert_with(|| UsageResolver::new(model));
                 let mut configurations = Vec::new();
                 for config in cps::configurations(result)
                     .filter(|config| cps::matches_configuration(config, &options.configurations))
@@ -420,7 +424,7 @@ impl Outputs {
                         ..EvalContext::default()
                     };
                     let destination = genex(
-                        &mut usage,
+                        usage,
                         rule.dir,
                         &ctx,
                         options
@@ -430,7 +434,7 @@ impl Outputs {
                         None,
                     )?;
                     let mut destinations = BTreeMap::<BString, Vec<BString>>::new();
-                    for (path, relative) in set_files(model, &mut usage, target, set, &config)?
+                    for (path, relative) in set_files(model, usage, target, set, &config)?
                         .into_values()
                         .flatten()
                     {
@@ -468,6 +472,8 @@ impl Outputs {
     }
 
     fn bmis(&mut self, result: &GenerationResult, bin: &Path) {
+        type BmiRuleMap<'a> = HashMap<(&'a [u8], &'a [u8]), &'a rcmake_resolve::BmiInstall>;
+        let mut bmi_rules: Option<BmiRuleMap<'_>> = None;
         for graph in &result.graphs {
             for step in &graph.steps {
                 let BuildStep::Collate {
@@ -483,14 +489,22 @@ impl Outputs {
                 if !matches!(depend_info.as_ref(), rcmake_resolve::DependInfo::Cxx(_)) {
                     continue;
                 }
-                let Some(rule) = result
-                    .targets
-                    .iter()
-                    .find(|facts| facts.config == graph.config && facts.metadata.name == *target)
-                    .and_then(|facts| facts.cxx_modules.as_ref())
-                    .and_then(|modules| modules.bmi_install.as_ref())
-                    .filter(|rule| !rule.destination.is_empty())
-                else {
+                let rules = bmi_rules.get_or_insert_with(|| {
+                    let mut map = HashMap::new();
+                    for facts in &result.targets {
+                        if let Some(rule) = facts
+                            .cxx_modules
+                            .as_ref()
+                            .and_then(|modules| modules.bmi_install.as_ref())
+                            .filter(|rule| !rule.destination.is_empty())
+                        {
+                            map.entry((facts.config.0.as_slice(), facts.metadata.name.as_slice()))
+                                .or_insert(rule);
+                        }
+                    }
+                    map
+                });
+                let Some(&rule) = rules.get(&(graph.config.0.as_slice(), target.as_slice())) else {
                     continue;
                 };
                 let table = bin.join(to_native(dd)).with_file_name("CXXModules.json");

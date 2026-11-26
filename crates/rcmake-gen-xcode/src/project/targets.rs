@@ -1,11 +1,11 @@
 //! Target settings, dependencies, and build phases.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::text;
 use rcmake_base::truth;
 use rcmake_gen_common::GenError;
-use rcmake_model::DirId;
+use rcmake_model::{DirId, TargetId};
 use rcmake_resolve::ide::IdeCustomPhase;
 
 use crate::{
@@ -26,6 +26,7 @@ impl Project<'_> {
         &mut self,
         target: &TargetEntry<'_>,
         all: &[TargetEntry<'_>],
+        target_by_id: &HashMap<TargetId, usize>,
         project: &Reference,
         zero: Option<&Reference>,
     ) -> Result<Reference, GenError> {
@@ -48,10 +49,10 @@ impl Project<'_> {
         let per_language_flags = self
             .configs
             .iter()
-            .filter_map(|config| self.resolved.get(&(*id, config.clone())))
+            .filter_map(|config| self.indices.resolved.get(&(*id, config.as_bytes())))
             .any(|target| crate::settings::compile::needs_per_language_flags(target));
         let first = self.configs.first().cloned().unwrap_or_default();
-        let first_target = self.resolved.get(&(*id, first.clone())).copied();
+        let first_target = self.indices.resolved.get(&(*id, first.as_bytes())).copied();
         let plist = if native {
             self.info_plist(raw, name, product, first_target)?
         } else {
@@ -70,8 +71,9 @@ impl Project<'_> {
                     .keys()
                     .filter(|root| {
                         self.configs.iter().all(|config| {
-                            self.resolved
-                                .get(&(*id, config.clone()))
+                            self.indices
+                                .resolved
+                                .get(&(*id, config.as_bytes()))
                                 .is_some_and(|facts| {
                                     xcframework_phase_allowed(facts, root, self.bin)
                                 })
@@ -83,16 +85,19 @@ impl Project<'_> {
         let phase_links = self.phase_links(target, phase_mode, &xcframeworks);
         for config in self.configs.clone() {
             let config = &config;
-            let facts = self.resolved.get(&(*id, config.clone())).copied();
+            let facts = self
+                .indices
+                .resolved
+                .get(&(*id, config.as_bytes()))
+                .copied();
             let configured_product = Product::new(self.model, raw, facts, config, self.bin);
             custom.post.version_links(config, &configured_product)?;
-            let graph = self
-                .result
-                .graphs
-                .iter()
-                .find(|g| g.config.0.as_slice() == config.as_bytes());
-            let graph_target =
-                graph.and_then(|graph| graph.targets.iter().find(|item| item.name == raw.name));
+            let graph = self.indices.graph_by_config.get(config.as_bytes()).copied();
+            let graph_target = self
+                .indices
+                .graph_target
+                .get(&(config.as_bytes(), raw.name.as_slice()))
+                .copied();
             if let Some(facts) = facts {
                 if let Some(error) = facts
                     .ide
@@ -108,7 +113,7 @@ impl Project<'_> {
                     .filter_map(|&index| {
                         graph.and_then(|graph| graph.steps.get(index).map(|step| (index, step)))
                     });
-                custom.collect(facts, self.model, self.bin, steps);
+                custom.collect(facts, self.indices, self.bin, steps);
                 let items = source_files(self.model, raw, facts, per_language_flags)
                     .map_err(|error| self.source_error(raw.dir, error))?;
                 if let Some(original) = &sources {
@@ -132,7 +137,7 @@ impl Project<'_> {
             let settings = if native {
                 TargetSettings {
                     model: self.model,
-                    result: self.result,
+                    indices: self.indices,
                     bin: self.bin,
                     config,
                     raw,
@@ -167,13 +172,19 @@ impl Project<'_> {
                 dependencies.insert(binding);
             }
         }
+        let mut dep_indices: Vec<usize> = dependencies
+            .iter()
+            .filter(|dep_id| **dep_id != *id)
+            .filter_map(|dep_id| target_by_id.get(dep_id).copied())
+            .collect();
+        dep_indices.sort_unstable();
         let dependencies = self.dependencies(
             &key,
             project,
             zero.into_iter().chain(
-                all.iter()
-                    .filter(|dep| dep.id != *id && dependencies.contains(&dep.id))
-                    .map(|dep| &dep.reference),
+                dep_indices
+                    .into_iter()
+                    .filter_map(|index| all.get(index).map(|dep| &dep.reference)),
             ),
         )?;
         let has_xcconfig = target_settings.iter().any(|(_, file)| file.is_some());
@@ -298,7 +309,7 @@ impl Project<'_> {
                 )?);
             }
             build_phases.extend(
-                self.embeds(&key, *id, raw, all)
+                self.embeds(&key, *id, raw, all, target_by_id)
                     .map_err(|error| self.source_error(raw.dir, error))?,
             );
         }
@@ -357,8 +368,9 @@ impl Project<'_> {
             let mut owners = std::collections::BTreeMap::new();
             for entry in targets {
                 if let Some(ide) = self
+                    .indices
                     .resolved
-                    .get(&(entry.id, config.clone()))
+                    .get(&(entry.id, config.as_bytes()))
                     .and_then(|target| target.ide.as_deref())
                 {
                     for command in &ide.custom {

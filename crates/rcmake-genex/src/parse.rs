@@ -2,9 +2,9 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use rcmake_base::BString;
+use rcmake_base::{BString, ByteSlice};
 
-use crate::{GenexAst, GenexError, GenexExpr, GenexNode, MAX_NESTING};
+use crate::{GenexAst, GenexError, GenexExpr, GenexNode, MAX_NESTING, find_genex};
 
 /// Reuse parsed generator expressions within a resolution session.
 #[derive(Default)]
@@ -16,9 +16,17 @@ pub struct ParseCache {
 impl ParseCache {
     /// Return the parsed expression. Keep successful parses of common sizes.
     pub fn parse(&mut self, input: &[u8]) -> Result<Arc<GenexAst>, GenexError> {
-        const MAX_ENTRIES: usize = 4_096;
-        const MAX_KEY_BYTES: usize = 1024 * 1024;
+        const MAX_ENTRIES: usize = 32_768;
+        const MAX_KEY_BYTES: usize = 8 * 1024 * 1024;
 
+        if find_genex(input).is_none() {
+            let nodes = if input.is_empty() {
+                Vec::new()
+            } else {
+                vec![GenexNode::Text(input.into())]
+            };
+            return Ok(Arc::new(GenexAst { nodes }));
+        }
         if let Some(ast) = self.entries.get(input) {
             return Ok(Arc::clone(ast));
         }
@@ -38,36 +46,6 @@ enum Token<'a> {
     Colon,
     Comma,
     Text(&'a [u8]),
-}
-
-fn lex(input: &[u8]) -> Vec<Token<'_>> {
-    let mut tokens = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while let Some(&byte) = input.get(i) {
-        let token = match byte {
-            b'$' if input.get(i + 1) == Some(&b'<') => Some((Token::Begin, 2)),
-            b'>' => Some((Token::End, 1)),
-            b':' => Some((Token::Colon, 1)),
-            b',' => Some((Token::Comma, 1)),
-            _ => None,
-        };
-        match token {
-            Some((token, len)) => {
-                if start < i {
-                    tokens.push(Token::Text(input.get(start..i).unwrap_or_default()));
-                }
-                tokens.push(token);
-                i += len;
-                start = i;
-            }
-            None => i += 1,
-        }
-    }
-    if start < input.len() {
-        tokens.push(Token::Text(input.get(start..).unwrap_or_default()));
-    }
-    tokens
 }
 
 fn token_text(token: Token<'_>) -> &[u8] {
@@ -98,26 +76,44 @@ fn extend_nodes(nodes: &mut Vec<GenexNode>, more: Vec<GenexNode>) {
 }
 
 struct Parser<'a> {
-    tokens: Vec<Token<'a>>,
+    input: &'a [u8],
     pos: usize,
     depth: usize,
 }
 
-impl Parser<'_> {
-    fn peek(&self) -> Option<Token<'_>> {
-        self.tokens.get(self.pos).copied()
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<(Token<'a>, usize)> {
+        let rest = self.input.get(self.pos..)?;
+        let &first = rest.first()?;
+        match first {
+            b'$' if rest.get(1) == Some(&b'<') => Some((Token::Begin, 2)),
+            b'>' => Some((Token::End, 1)),
+            b':' => Some((Token::Colon, 1)),
+            b',' => Some((Token::Comma, 1)),
+            _ => {
+                let mut i = 1;
+                while let Some(&byte) = rest.get(i) {
+                    match byte {
+                        b'$' if rest.get(i + 1) == Some(&b'<') => break,
+                        b'>' | b':' | b',' => break,
+                        _ => i += 1,
+                    }
+                }
+                Some((Token::Text(rest.get(..i).unwrap_or_default()), i))
+            }
+        }
     }
 
     /// One content item: an expression after `$<`, or the current token as text.
     fn content(&mut self, out: &mut Vec<GenexNode>) -> Result<(), GenexError> {
         match self.peek() {
-            Some(Token::Begin) => {
-                self.pos += 1;
+            Some((Token::Begin, len)) => {
+                self.pos += len;
                 self.expression(out)
             }
-            Some(token) => {
+            Some((token, len)) => {
                 push_text(out, token_text(token));
-                self.pos += 1;
+                self.pos += len;
                 Ok(())
             }
             None => Ok(()),
@@ -131,27 +127,27 @@ impl Parser<'_> {
             return Err(GenexError::TooDeep);
         }
         let mut identifier = Vec::new();
-        while let Some(token) = self.peek() {
+        while let Some((token, len)) = self.peek() {
             match token {
                 Token::End | Token::Colon => break,
                 Token::Comma => {
                     push_text(&mut identifier, b",");
-                    self.pos += 1;
+                    self.pos += len;
                 }
                 _ => self.content(&mut identifier)?,
             }
         }
         let result = match self.peek() {
-            Some(Token::End) => {
-                self.pos += 1;
+            Some((Token::End, len)) => {
+                self.pos += len;
                 out.push(GenexNode::Expr(GenexExpr {
                     identifier,
                     params: None,
                 }));
                 Ok(())
             }
-            Some(Token::Colon) => {
-                self.pos += 1;
+            Some((Token::Colon, len)) => {
+                self.pos += len;
                 self.parameters(identifier, out)
             }
             _ => {
@@ -170,10 +166,10 @@ impl Parser<'_> {
         out: &mut Vec<GenexNode>,
     ) -> Result<(), GenexError> {
         let mut params: Vec<Vec<GenexNode>> = vec![Vec::new()];
-        while let Some(token) = self.peek() {
+        while let Some((token, len)) = self.peek() {
             match token {
                 Token::End => {
-                    self.pos += 1;
+                    self.pos += len;
                     out.push(GenexNode::Expr(GenexExpr {
                         identifier,
                         params: Some(params),
@@ -182,13 +178,11 @@ impl Parser<'_> {
                 }
                 Token::Comma => {
                     params.push(Vec::new());
-                    self.pos += 1;
+                    self.pos += len;
                 }
                 _ => {
-                    let mut current = Vec::new();
-                    self.content(&mut current)?;
                     if let Some(last) = params.last_mut() {
-                        extend_nodes(last, current);
+                        self.content(last)?;
                     }
                 }
             }
@@ -214,14 +208,40 @@ impl Parser<'_> {
 /// expression is kept as text. Returns [`GenexError::TooDeep`] when nesting exceeds
 /// [`MAX_NESTING`].
 pub fn parse(input: &[u8]) -> Result<GenexAst, GenexError> {
+    let Some(first) = find_genex(input) else {
+        let nodes = if input.is_empty() {
+            Vec::new()
+        } else {
+            vec![GenexNode::Text(input.into())]
+        };
+        return Ok(GenexAst { nodes });
+    };
     let mut parser = Parser {
-        tokens: lex(input),
-        pos: 0,
+        input,
+        pos: first,
         depth: 0,
     };
     let mut nodes = Vec::new();
-    while parser.peek().is_some() {
-        parser.content(&mut nodes)?;
+    if first > 0 {
+        nodes.push(GenexNode::Text(
+            input.get(..first).unwrap_or_default().into(),
+        ));
+    }
+    while let Some(rest) = parser.input.get(parser.pos..) {
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(next) = rest.find(b"$<") {
+            if next > 0 {
+                push_text(&mut nodes, rest.get(..next).unwrap_or_default());
+                parser.pos += next;
+            }
+            parser.pos += 2;
+            parser.expression(&mut nodes)?;
+        } else {
+            push_text(&mut nodes, rest);
+            break;
+        }
     }
     Ok(GenexAst { nodes })
 }
@@ -282,6 +302,20 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert_ne!(first, other);
         assert_eq!(*second, parse(text)?);
+        Ok(())
+    }
+
+    #[test]
+    fn plain_text_bypasses_parse_cache() -> Result<(), GenexError> {
+        let mut cache = ParseCache::default();
+        let plain = cache.parse(b"/usr/include:foo,bar>baz")?;
+        assert!(plain.is_plain());
+        assert_eq!(render(&plain.nodes), "/usr/include:foo,bar>baz");
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.key_bytes, 0);
+        let empty = cache.parse(b"")?;
+        assert!(empty.nodes.is_empty());
+        assert!(cache.entries.is_empty());
         Ok(())
     }
 

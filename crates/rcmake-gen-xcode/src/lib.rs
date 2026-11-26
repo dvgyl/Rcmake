@@ -55,13 +55,14 @@ pub fn generate(
     }
     let utilities = utility_targets(GeneratorKind::Xcode, model, host);
     let projects = project_roots(GeneratorKind::Xcode, model);
+    let indices = project::XcodeIndices::new(model, result);
     for root in &projects {
         let dir = if root.dir == DirId::ROOT {
             bin.to_owned()
         } else {
             to_native(&model.dir(root.dir).binary_dir)
         };
-        project::generate(result, model, host, bin, &dir, root, &utilities)?;
+        project::generate(result, model, host, (bin, &dir), root, &utilities, &indices)?;
     }
     if utilities
         .iter()

@@ -128,6 +128,11 @@ pub(super) fn resolve_argument<'a>(
     root: &[u8],
     lookup: &impl Fn(&[u8]) -> Option<(&'a Target, Option<BString>)>,
 ) -> Result<BString, GenError> {
+    if value.len() <= rcmake_base::Limits::default().max_value_bytes
+        && rcmake_genex::find_genex(value).is_none()
+    {
+        return Ok(value.into());
+    }
     let result = parse(value).and_then(|mut ast| {
         use_resolved_artifacts(&mut ast.nodes, lookup);
         evaluate(&ast, context, &mut usage.host(dir)).map(|(value, _)| value)

@@ -1,17 +1,20 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use rcmake_base::truth;
 use rcmake_gen_common::{
     GenError, glob,
     ide::{
-        IdeProject, UtilityKind, UtilityTarget, project_roots, rerun_inputs, targets_for_root,
-        utility_targets,
+        IdeProject, UtilityKind, UtilityTarget, first_config_dependencies, project_roots,
+        rerun_inputs, targets_for_root_indexed, utility_targets,
     },
 };
 use rcmake_host::Host;
-use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target, TargetId, TargetKind, VsVersion};
-use rcmake_resolve::{GenerationResult, ResolvedTarget, ide::IdeLinkItem};
+use rcmake_model::{
+    CommandId, CustomCommand, CustomCommandKind, DirId, GeneratorKind, ProjectModel, Target,
+    TargetId, TargetKind, VsVersion,
+};
+use rcmake_resolve::{BuildGraph, GenerationResult, GraphTarget, ResolvedTarget, ide::IdeLinkItem};
 
 use crate::{Settings, absolute, folder, guid, join, string};
 
@@ -19,10 +22,79 @@ type ResolvedProjects<'a> = BTreeMap<TargetId, BTreeMap<String, &'a ResolvedTarg
 type TargetIndices = BTreeMap<TargetId, usize>;
 type ScopedTargets = BTreeMap<DirId, BTreeSet<usize>>;
 
+pub(crate) struct VsIndices<'a> {
+    pub(crate) resolved_by_id: HashMap<(TargetId, &'a [u8]), &'a ResolvedTarget>,
+    pub(crate) project_by_target: HashMap<TargetId, usize>,
+    pub(crate) graph_by_config: HashMap<&'a [u8], &'a BuildGraph>,
+    pub(crate) graph_target: HashMap<(&'a [u8], &'a [u8]), &'a GraphTarget>,
+    pub(crate) target_commands: HashMap<TargetId, Vec<(CommandId, &'a CustomCommand)>>,
+    pub(crate) output_commands_by_dir: HashMap<DirId, Vec<(CommandId, &'a CustomCommand)>>,
+}
+
+impl<'a> VsIndices<'a> {
+    fn new(model: &'a ProjectModel, result: &'a GenerationResult, projects: &[Project]) -> Self {
+        let mut resolved_by_id = HashMap::with_capacity(result.targets.len());
+        for target in &result.targets {
+            resolved_by_id
+                .entry((target.id, target.config.0.as_slice()))
+                .or_insert(target);
+        }
+        let mut project_by_target = HashMap::with_capacity(projects.len());
+        for (index, project) in projects.iter().enumerate() {
+            if let Some(id) = project.target {
+                project_by_target.entry(id).or_insert(index);
+            }
+        }
+        let mut graph_by_config = HashMap::with_capacity(result.graphs.len());
+        let mut graph_target = HashMap::new();
+        for graph in &result.graphs {
+            let cfg = graph.config.0.as_slice();
+            if let std::collections::hash_map::Entry::Vacant(entry) = graph_by_config.entry(cfg) {
+                entry.insert(graph);
+                for item in &graph.targets {
+                    graph_target
+                        .entry((cfg, item.name.as_slice()))
+                        .or_insert(item);
+                }
+            }
+        }
+        let mut target_commands: HashMap<TargetId, Vec<(CommandId, &'a CustomCommand)>> =
+            HashMap::new();
+        let mut output_commands_by_dir: HashMap<DirId, Vec<(CommandId, &'a CustomCommand)>> =
+            HashMap::new();
+        for (index, command) in model.commands() {
+            match command.kind {
+                CustomCommandKind::TargetEvent { target: id, .. }
+                | CustomCommandKind::Utility(id) => {
+                    target_commands
+                        .entry(id)
+                        .or_default()
+                        .push((index, command));
+                }
+                CustomCommandKind::Output => {
+                    output_commands_by_dir
+                        .entry(command.dir)
+                        .or_default()
+                        .push((index, command));
+                }
+            }
+        }
+        Self {
+            resolved_by_id,
+            project_by_target,
+            graph_by_config,
+            graph_target,
+            target_commands,
+            output_commands_by_dir,
+        }
+    }
+}
+
 pub(super) struct SolutionPlan<'a> {
     pub(super) settings: Settings,
     pub(super) projects: Vec<Project>,
     pub(super) resolved: ResolvedProjects<'a>,
+    pub(super) indices: VsIndices<'a>,
     pub(super) inputs: Vec<String>,
     pub(super) solutions: Vec<Solution>,
     pub(super) regenerate: bool,
@@ -86,7 +158,7 @@ struct UtilityProjects {
 pub(super) fn plan<'a>(
     version: VsVersion,
     result: &'a GenerationResult,
-    model: &ProjectModel,
+    model: &'a ProjectModel,
     host: &dyn Host,
     bin: &Path,
 ) -> Result<SolutionPlan<'a>, GenError> {
@@ -123,10 +195,11 @@ pub(super) fn plan<'a>(
         utility_targets(kind, model, host),
         use_folders,
     )?;
+    let first_config_deps = first_config_dependencies(result);
     let scoped_targets: ScopedTargets = roots
         .iter()
         .map(|root| {
-            let members = targets_for_root(model, result, root.dir)
+            let members = targets_for_root_indexed(model, &first_config_deps, root.dir)
                 .into_iter()
                 .filter_map(|id| indices.get(&id).copied())
                 .collect::<BTreeSet<_>>();
@@ -160,10 +233,12 @@ pub(super) fn plan<'a>(
             )
         })
         .collect::<Result<_, _>>()?;
+    let vs_indices = VsIndices::new(model, result, &projects);
     Ok(SolutionPlan {
         settings,
         projects,
         resolved,
+        indices: vs_indices,
         inputs,
         solutions,
         regenerate,
@@ -325,6 +400,17 @@ fn target_dependencies(
     result: &GenerationResult,
     resolved: &ResolvedProjects<'_>,
 ) -> BTreeMap<TargetId, BTreeSet<TargetId>> {
+    let graph_targets: Vec<HashMap<&[u8], &GraphTarget>> = result
+        .graphs
+        .iter()
+        .map(|graph| {
+            let mut map = HashMap::with_capacity(graph.targets.len());
+            for entry in &graph.targets {
+                map.entry(entry.name.as_slice()).or_insert(entry);
+            }
+            map
+        })
+        .collect();
     let mut dependencies = BTreeMap::<TargetId, BTreeSet<TargetId>>::new();
     for (id, target) in model.targets() {
         let deps = dependencies.entry(id).or_default();
@@ -352,8 +438,8 @@ fn target_dependencies(
                     }),
             );
         }
-        for graph in &result.graphs {
-            if let Some(entry) = graph.targets.iter().find(|entry| entry.name == target.name) {
+        for (graph, targets) in result.graphs.iter().zip(&graph_targets) {
+            if let Some(entry) = targets.get(target.name.as_slice()) {
                 deps.extend(
                     entry
                         .depends

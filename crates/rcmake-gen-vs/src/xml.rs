@@ -13,8 +13,13 @@ impl Writer {
     #[must_use]
     pub fn new(bom: bool, encoding: &str) -> Self {
         let mark = if bom { "\u{feff}" } else { "" };
+        let mut output = String::with_capacity(4096);
+        let _ = write!(
+            output,
+            "{mark}<?xml version=\"1.0\" encoding=\"{encoding}\"?>\r\n"
+        );
         Self {
-            output: format!("{mark}<?xml version=\"1.0\" encoding=\"{encoding}\"?>\r\n"),
+            output,
             elements: Vec::new(),
         }
     }
@@ -75,24 +80,31 @@ impl Writer {
 }
 
 pub(crate) fn escape(output: &mut String, value: &str, attribute: bool) {
-    for ch in value.chars() {
-        match ch {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '"' if attribute => output.push_str("&quot;"),
-            '\r' => output.push_str("&#xD;"),
-            '\n' => output.push_str("&#xA;"),
-            '\t' if attribute => output.push_str("&#x9;"),
+    let mut start = 0;
+    for (i, ch) in value.char_indices() {
+        let replacement = match ch {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' if attribute => "&quot;",
+            '\r' => "&#xD;",
+            '\n' => "&#xA;",
+            '\t' if attribute => "&#x9;",
             '\u{0}'..='\u{8}'
             | '\u{b}'..='\u{c}'
             | '\u{e}'..='\u{1f}'
             | '\u{fffe}'
-            | '\u{ffff}' => {
-                output.push('\u{fffd}');
-            }
-            _ => output.push(ch),
+            | '\u{ffff}' => "\u{fffd}",
+            _ => continue,
+        };
+        if start < i {
+            output.push_str(value.get(start..i).unwrap_or_default());
         }
+        output.push_str(replacement);
+        start = i + ch.len_utf8();
+    }
+    if start < value.len() {
+        output.push_str(value.get(start..).unwrap_or_default());
     }
 }
 

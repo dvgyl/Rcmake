@@ -17,10 +17,10 @@ use recipe::{make_recipe_text, shell_invocation, write_step};
 pub use build::build_commands;
 use plan_step::plan_step;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
 
-use rcmake_base::{BString, ByteVec, shell::quote_always};
+use rcmake_base::{BString, ByteSlice, ByteVec, shell::quote_always};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_gen_common::GenError;
 use rcmake_host::{Host, WriteMode, path};
@@ -185,6 +185,31 @@ fn invalid_graph(message: impl Into<BString>) -> GenError {
 }
 
 fn build_path(value: &[u8], build_dir: &Path) -> BString {
+    let build_prefix = path::from_native(build_dir);
+    build_path_with_prefix(value, build_dir, &build_prefix)
+}
+
+fn build_path_with_prefix(value: &[u8], build_dir: &Path, build_prefix: &[u8]) -> BString {
+    fn needs_native(bytes: &[u8]) -> bool {
+        bytes.is_empty()
+            || bytes.contains(&b'\\')
+            || bytes.starts_with(b".")
+            || bytes.ends_with(b"/")
+            || bytes.find(b"//").is_some()
+            || bytes.find(b"/.").is_some()
+    }
+    if !needs_native(value) && !needs_native(build_prefix) && !build_prefix.ends_with(b":/") {
+        if value == build_prefix {
+            return BString::default();
+        }
+        if let Some(rest) = value
+            .strip_prefix(build_prefix)
+            .and_then(|rest| rest.strip_prefix(b"/"))
+        {
+            return rest.into();
+        }
+        return value.into();
+    }
     let path = path::to_native(value);
     let path = path.strip_prefix(build_dir).unwrap_or(&path);
     let path: std::path::PathBuf = path.components().collect();
@@ -245,6 +270,7 @@ fn plan_targets<'a>(
         .filter(|target| target.config == graph.config)
         .map(|target| (target.metadata.name.as_slice(), &target.artifacts))
         .collect();
+    let build_prefix = path::from_native(build_dir);
     let mut owners = BTreeMap::new();
     let mut producers = BTreeMap::new();
     let mut symbolic = BTreeSet::new();
@@ -284,11 +310,12 @@ fn plan_targets<'a>(
                     continue;
                 }
             }
-            let mut step = plan_step(action, step_index, result, build_dir)?;
+            let mut step = plan_step(action, step_index, result, build_dir, &build_prefix)?;
             if matches!(action, BuildStep::Link { .. })
                 && let Some(artifacts) = artifacts.get(target.name)
             {
-                let make_path = |value: &BString| build_path(value, build_dir);
+                let make_path =
+                    |value: &BString| build_path_with_prefix(value, build_dir, &build_prefix);
                 step.outputs.extend(
                     [&artifacts.linker_file, &artifacts.soname_file]
                         .into_iter()
@@ -303,7 +330,7 @@ fn plan_targets<'a>(
                 );
             }
 
-            let mut seen = BTreeSet::new();
+            let mut seen = HashSet::with_capacity(step.outputs.len());
             step.outputs.retain(|output| seen.insert(output.clone()));
             for output in &step.outputs {
                 if !repeated && producers.insert(output.clone(), index).is_some() {
@@ -334,17 +361,16 @@ fn plan_targets<'a>(
         })
         .collect();
     for (index, target) in targets.iter_mut().enumerate() {
-        let own_outputs: BTreeSet<_> = target
+        let own_outputs: HashSet<BString> = target
             .rules
             .iter()
             .flat_map(|rule| rule.outputs.iter().cloned())
             .collect();
         for step in &mut target.rules {
+            let is_custom = matches!(step.action, BuildStep::Custom(_));
             let mut inputs = BTreeSet::new();
-            for input in &step.inputs {
-                let file = if matches!(step.action, BuildStep::Custom(_))
-                    && let Some(&dependency) = names.get(input.as_slice())
-                {
+            for input in std::mem::take(&mut step.inputs) {
+                let file = if is_custom && let Some(&dependency) = names.get(input.as_slice()) {
                     if dependency != index {
                         target.dependencies.insert(dependency);
                     }
@@ -352,15 +378,17 @@ fn plan_targets<'a>(
                         continue;
                     };
                     output.clone()
+                } else if is_custom {
+                    build_path_with_prefix(&input, build_dir, &build_prefix)
                 } else {
-                    build_path(input, build_dir)
+                    input
                 };
                 if let Some(owner) = producers.get(&file)
                     && *owner != index
                     && !own_outputs.contains(&file)
                 {
                     target.dependencies.insert(*owner);
-                    if symbolic.contains(&file) && !own_outputs.contains(&file) {
+                    if symbolic.contains(&file) {
                         inputs.insert(BString::from(FORCE));
                         continue;
                     }
@@ -376,15 +404,18 @@ fn plan_targets<'a>(
 
 fn has_dependency(graph: &BuildGraph, target: usize, dependency: usize) -> bool {
     let mut pending = vec![target];
-    let mut visited = BTreeSet::new();
+    let mut visited = vec![false; graph.targets.len()];
     while let Some(index) = pending.pop() {
         if index == dependency {
             return true;
         }
-        if visited.insert(index)
-            && let Some(target) = graph.targets.get(index)
+        if let Some(slot) = visited.get_mut(index)
+            && !*slot
         {
-            pending.extend(&target.depends);
+            *slot = true;
+            if let Some(target) = graph.targets.get(index) {
+                pending.extend(&target.depends);
+            }
         }
     }
     false
@@ -596,6 +627,7 @@ fn top_level(
         make_recipe_text(&mut out, &quote_always(&[b"... ", name].concat()))?;
         out.push(b'\n');
     }
+    let progress_counts = report_progress.then(|| progress::counts_all(targets));
     for (index, target) in targets.iter().enumerate() {
         phony(
             &mut out,
@@ -605,7 +637,9 @@ fn top_level(
         progress::build(
             &mut out,
             &target.goal,
-            report_progress.then(|| progress::count(targets, [index])),
+            progress_counts
+                .as_ref()
+                .and_then(|counts| counts.get(index).copied()),
         );
     }
     for name in prep.keys() {

@@ -1,5 +1,7 @@
 //! Project settings when the resolver has no IDE data.
 
+use std::collections::HashSet;
+
 use rcmake_base::list;
 use rcmake_model::{CustomCommand, CustomCommandKind, TargetEvent, UsageField};
 use rcmake_resolve::{CustomStep, Invocation, LinkFragmentRole};
@@ -12,7 +14,7 @@ impl Context<'_> {
         &self,
         plan: &mut Plan,
         config: &mut Config,
-        fact: Option<&ResolvedTarget>,
+        (fact, compile_units): (Option<&ResolvedTarget>, Option<&CompileUnits<'_>>),
         steps: &[&BuildStep],
         link: Option<&LinkStep>,
         name: &str,
@@ -73,7 +75,7 @@ impl Context<'_> {
                 if !kind.compiles() {
                     continue;
                 }
-                item.object = self.object_path(&path, name, Some(fact));
+                item.object = self.object_path(&path, name, Some(fact), compile_units);
                 if kind == Kind::Compile
                     && let Some(group) = group
                 {
@@ -103,7 +105,7 @@ impl Context<'_> {
                     item.object = if object.to_ascii_lowercase().ends_with(".obj") {
                         absolute(&self.settings.bin, &object)
                     } else {
-                        self.object_path(&path, name, fact)
+                        self.object_path(&path, name, fact, compile_units)
                     };
                     if kind != Kind::Compile {
                         continue;
@@ -152,7 +154,7 @@ impl Context<'_> {
                 if !kind.compiles() || !has_compile_facts {
                     let item = plan.source(path.clone(), kind, "", name);
                     if kind.compiles() {
-                        item.object = self.object_path(&path, name, fact);
+                        item.object = self.object_path(&path, name, fact, compile_units);
                     }
                     if kind == Kind::Compile {
                         item.language = source_language(&path).into();
@@ -186,9 +188,11 @@ impl Context<'_> {
         }
 
         config.link = self.fallback_link(target, link, name);
-        let mut produced = Vec::new();
+        let mut produced = HashSet::new();
+        let mut has_custom_step = false;
         for (index, step) in steps.iter().enumerate() {
             if let BuildStep::Custom(step) = step {
+                has_custom_step = true;
                 produced.extend(
                     step.outputs
                         .iter()
@@ -201,60 +205,73 @@ impl Context<'_> {
                 self.custom(plan, name, index, None, rule);
             }
         }
-        for (index, command) in self.model.commands() {
-            match command.kind {
-                CustomCommandKind::TargetEvent { target: id, event }
-                    if Some(id) == self.project.target =>
+        if let Some(target_id) = self.project.target
+            && let Some(commands) = self.indices.target_commands.get(&target_id)
+        {
+            for &(index, command) in commands {
+                match command.kind {
+                    CustomCommandKind::TargetEvent { event, .. } => {
+                        let rule = self.model_rule(command, name);
+                        let event = match event {
+                            TargetEvent::PreBuild => 0,
+                            TargetEvent::PreLink => 1,
+                            TargetEvent::PostBuild => 2,
+                        };
+                        if !rule.commands.is_empty()
+                            && let Some(events) = config.events.get_mut(event)
+                        {
+                            events.push(rule);
+                        }
+                    }
+                    CustomCommandKind::Utility(_) if produced.is_empty() && !has_custom_step => {
+                        self.custom(
+                            plan,
+                            name,
+                            steps.len() + index.index(),
+                            None,
+                            self.model_rule(command, name),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(commands) = self.indices.output_commands_by_dir.get(&target.dir) {
+            let mut config_item_paths: HashSet<String> = plan
+                .items
+                .values()
+                .filter(|item| item.configs.contains_key(name))
+                .map(|item| item.path.clone())
+                .collect();
+            let compiled_paths: HashSet<String> = plan
+                .items
+                .values()
+                .filter(|item| item.kind.compiles())
+                .map(|item| item.path.clone())
+                .collect();
+            for &(index, command) in commands {
+                let rule = self.model_rule(command, name);
+                if rule
+                    .outputs
+                    .iter()
+                    .any(|path| config_item_paths.contains(path.as_str()))
+                    && !rule
+                        .outputs
+                        .iter()
+                        .any(|path| produced.contains(path.as_str()))
                 {
-                    let rule = self.model_rule(command, name);
-                    let event = match event {
-                        TargetEvent::PreBuild => 0,
-                        TargetEvent::PreLink => 1,
-                        TargetEvent::PostBuild => 2,
-                    };
+                    let main = command
+                        .main_dependency
+                        .as_ref()
+                        .map(|path| self.source_path(&string(path)))
+                        .filter(|path| !compiled_paths.contains(path.as_str()));
                     if !rule.commands.is_empty()
-                        && let Some(events) = config.events.get_mut(event)
+                        && let Some(ref main_path) = main
                     {
-                        events.push(rule);
+                        config_item_paths.insert(main_path.clone());
                     }
+                    self.custom(plan, name, steps.len() + index.index(), main, rule);
                 }
-                CustomCommandKind::Utility(id)
-                    if Some(id) == self.project.target
-                        && produced.is_empty()
-                        && !steps
-                            .iter()
-                            .any(|step| matches!(step, BuildStep::Custom(_))) =>
-                {
-                    self.custom(
-                        plan,
-                        name,
-                        steps.len() + index.index(),
-                        None,
-                        self.model_rule(command, name),
-                    );
-                }
-                CustomCommandKind::Output if command.dir == target.dir => {
-                    let rule = self.model_rule(command, name);
-                    if rule.outputs.iter().any(|path| {
-                        plan.items
-                            .values()
-                            .any(|item| item.path == *path && item.configs.contains_key(name))
-                    }) && !rule.outputs.iter().any(|path| produced.contains(path))
-                    {
-                        let main = command
-                            .main_dependency
-                            .as_ref()
-                            .map(|path| self.source_path(&string(path)));
-                        let main = main.filter(|path| {
-                            !plan
-                                .items
-                                .values()
-                                .any(|item| item.kind.compiles() && item.path == *path)
-                        });
-                        self.custom(plan, name, steps.len() + index.index(), main, rule);
-                    }
-                }
-                _ => {}
             }
         }
     }

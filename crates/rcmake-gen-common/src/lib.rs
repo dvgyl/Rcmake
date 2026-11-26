@@ -153,6 +153,11 @@ fn genex(
     value: &[u8],
     mode: Option<PreprocessMode>,
 ) -> Result<BString, GenError> {
+    if value.len() <= rcmake_base::Limits::default().max_value_bytes
+        && rcmake_genex::find_genex(value).is_none()
+    {
+        return Ok(value.into());
+    }
     let mut evaluate = || -> Result<BString, rcmake_genex::GenexError> {
         let ast = rcmake_genex::parse(value)?;
         let ast = match mode {

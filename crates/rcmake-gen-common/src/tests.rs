@@ -337,7 +337,7 @@ fn ctest_file_keeps_test_arguments_properties_backtraces_and_children() {
     assert!(root.contains(
         "  add_test(\"a test;name\" \"/work/test_tool\" \"\" \"a;b\" [==[\n\n${literal}]=]]==])"
     ));
-    assert!(root.contains(r#"  set_tests_properties("a test;name" PROPERTIES  "LABELS" "one;two" "TIMEOUT" "10" "WORKING_DIRECTORY" "/work/test dir" _BACKTRACE_TRIPLES "/src/CMakeLists.txt;9;add_test;/src/CMakeLists.txt;0;")"#));
+    assert!(root.contains(r#"  set_tests_properties("a test;name" PROPERTIES  LABELS "one;two" TIMEOUT "10" WORKING_DIRECTORY "/work/test dir" _BACKTRACE_TRIPLES "/src/CMakeLists.txt;9;add_test;/src/CMakeLists.txt;0;")"#));
     assert!(root.ends_with("endif()\nsubdirs(\"inner/child\")\nsubdirs(\"/external\")\n"));
     assert!(!root.contains("child-only"));
     let child_output = read(&host, Path::new("/work/inner/child/CTestTestfile.cmake"));

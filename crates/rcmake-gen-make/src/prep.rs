@@ -13,7 +13,7 @@ use rcmake_resolve::{
     usage::UsageResolver,
 };
 
-use crate::{Target, build_path, invalid_graph};
+use crate::{Target, build_path_with_prefix, invalid_graph};
 
 type Dependencies = BTreeSet<BString>;
 pub(crate) type Targets = BTreeMap<BString, Dependencies>;
@@ -22,6 +22,7 @@ struct Owners<'a> {
     names: BTreeMap<&'a [u8], &'a BString>,
     files: BTreeMap<&'a [u8], &'a BString>,
     build_dir: &'a Path,
+    build_prefix: BString,
 }
 
 impl<'a> Owners<'a> {
@@ -42,12 +43,13 @@ impl<'a> Owners<'a> {
                 })
                 .collect(),
             build_dir,
+            build_prefix: path::from_native(build_dir),
         }
     }
 
     fn file(&self, file: &[u8]) -> Option<BString> {
         self.files
-            .get(build_path(file, self.build_dir).as_slice())
+            .get(build_path_with_prefix(file, self.build_dir, &self.build_prefix).as_slice())
             .map(|goal| (*goal).clone())
     }
 
@@ -141,20 +143,21 @@ fn collect_install(
     if !owners.available(b"install_prep/all") {
         return;
     }
-    let filtered = model
-        .installs
-        .iter()
-        .any(|rule| rule.options.exclude_from_all)
-        .then(|| {
-            let mut model = model.clone();
-            for rule in &mut model.installs {
-                if rule.options.exclude_from_all {
-                    // Keep the rule indices that export sets reference.
-                    rule.kind = InstallKind::Code(BString::default());
-                }
+    let needs_refilter = !model.runtime_dependency_installs.is_empty()
+        && model
+            .installs
+            .iter()
+            .any(|rule| rule.options.exclude_from_all);
+    let filtered = needs_refilter.then(|| {
+        let mut model = model.clone();
+        for rule in &mut model.installs {
+            if rule.options.exclude_from_all {
+                // Keep the rule indices that export sets reference.
+                rule.kind = InstallKind::Code(BString::default());
             }
-            lower_install_manifest(&model, &result.targets)
-        });
+        }
+        lower_install_manifest(&model, &result.targets)
+    });
     let manifest = filtered.as_ref().unwrap_or(&result.install);
     prep.entry("install_prep/all".into()).or_default().extend(
         manifest
@@ -196,12 +199,23 @@ fn collect_tests(
         config: graph.config.clone(),
         ..EvalContext::default()
     };
-    let mut usage = UsageResolver::new(model);
+    let mut usage: Option<UsageResolver<'_>> = None;
     for (dir, directory) in model.dirs() {
+        let dir_build_depends = directory.props.get(b"CMAKE_TEST_BUILD_DEPENDS");
+        let mut tests = model.dir_tests(dir).peekable();
+        if tests.peek().is_none() && dir_build_depends.is_none() {
+            continue;
+        }
         let binary = path::to_native(&directory.binary_dir);
         let source = path::to_native(&directory.source_dir);
-        let mut host = usage.host(dir);
-        let mut expand = |value: &[u8]| {
+        let mut expand = |value: &[u8]| -> Result<BString, GenError> {
+            if value.len() <= rcmake_base::Limits::default().max_value_bytes
+                && rcmake_genex::find_genex(value).is_none()
+            {
+                return Ok(BString::from(value));
+            }
+            let resolver = usage.get_or_insert_with(|| UsageResolver::new(model));
+            let mut host = resolver.host(dir);
             parse(value)
                 .and_then(|expression| evaluate(&expression, &ctx, &mut host))
                 .map(|(value, _)| value)
@@ -221,18 +235,15 @@ fn collect_tests(
         };
         let mut directory_deps = Dependencies::new();
         let mut has_directory_inputs = false;
-        for (_, test) in model.dir_tests(dir) {
+        for (_, test) in tests {
             let goal = name(b"test_prep/", &test.name);
             if !test.is_discovery() && (!valid_segment(&test.name) || !owners.available(&goal)) {
                 continue;
             }
             let mut deps = Dependencies::new();
             for (index, arg) in test.command.iter().enumerate() {
-                let value = if test.old_style {
-                    arg.clone()
-                } else {
-                    expand(arg)?
-                };
+                let has_genex = !test.old_style && rcmake_genex::find_genex(arg).is_some();
+                let value = if has_genex { expand(arg)? } else { arg.clone() };
                 if index == 0
                     && let Some(target) = model
                         .find_target(dir, &value)
@@ -242,10 +253,7 @@ fn collect_tests(
                 {
                     deps.insert(goal);
                 }
-                if !test.old_style
-                    && arg.windows(2).any(|pair| pair == b"$<")
-                    && let Some(goal) = dependency(&value)
-                {
+                if has_genex && let Some(goal) = dependency(&value) {
                     deps.insert(goal);
                 }
             }
@@ -260,7 +268,7 @@ fn collect_tests(
                 prep.entry(goal).or_default().extend(deps);
             }
         }
-        if let Some(inputs) = directory.props.get(b"CMAKE_TEST_BUILD_DEPENDS") {
+        if let Some(inputs) = dir_build_depends {
             let inputs = list::split(&expand(inputs)?, list::Empty::Drop);
             has_directory_inputs |= !inputs.is_empty();
             directory_deps.extend(inputs.iter().filter_map(|input| dependency(input)));

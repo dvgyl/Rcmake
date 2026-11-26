@@ -108,16 +108,15 @@ impl Evaluator<'_> {
                 .host
                 .raw_property(target, b"IMPORTED")
                 .is_some_and(|v| truth::is_on(&v))
+            && let Some(mapped) =
+                with_upper_prefixed_key(b"MAP_IMPORTED_CONFIG_", &call.ctx.config.0, |key| {
+                    self.host.raw_property(target, key)
+                })
         {
-            let mut key = b"MAP_IMPORTED_CONFIG_".to_vec();
-            key.extend_from_slice(&call.ctx.config.0.to_ascii_uppercase());
-            if let Some(mapped) = self.host.raw_property(target, &key) {
-                return Ok(boolean(
-                    list::split(&mapped, list::Empty::Keep)
-                        .iter()
-                        .any(|cfg| values.iter().any(|v| cfg.eq_ignore_ascii_case(v))),
-                ));
-            }
+            return Ok(boolean(
+                list::iter(&mapped, list::Empty::Keep)
+                    .any(|cfg| values.iter().any(|v| cfg.eq_ignore_ascii_case(v))),
+            ));
         }
         Ok(boolean(false))
     }
@@ -145,9 +144,8 @@ impl Evaluator<'_> {
                 BString::from(call.name)
             )));
         }
-        let mut key = b"CMAKE_".to_vec();
-        key.extend_from_slice(call.name);
-        let value = self.host.definition(&key).unwrap_or_default();
+        let value = with_prefixed_key(b"CMAKE_", call.name, b"", |key| self.host.definition(key))
+            .unwrap_or_default();
         if !is_version {
             return compiler_id(call, value, &arguments);
         }
@@ -231,10 +229,11 @@ impl Evaluator<'_> {
         if wanted != lang {
             return Ok(boolean(false));
         }
-        let mut key = b"CMAKE_".to_vec();
-        key.extend_from_slice(lang);
-        key.extend_from_slice(b"_COMPILER_ID");
-        compiler_id(call, self.host.definition(&key).unwrap_or_default(), ids)
+        let value = with_prefixed_key(b"CMAKE_", lang, b"_COMPILER_ID", |key| {
+            self.host.definition(key)
+        })
+        .unwrap_or_default();
+        compiler_id(call, value, ids)
     }
 
     fn compile_features(&mut self, call: Call<'_>) -> Value {
@@ -257,9 +256,14 @@ impl Evaluator<'_> {
         let mut available = true;
         for feature in args {
             let Some(lang) = LANGUAGES.iter().copied().find(|lang| {
-                feature
-                    .strip_prefix(lang.to_ascii_lowercase().as_slice())
-                    .is_some_and(|suffix| suffix.starts_with(b"_"))
+                feature.len() > lang.len()
+                    && feature.get(..lang.len()).is_some_and(|prefix| {
+                        prefix
+                            .iter()
+                            .zip(lang.iter())
+                            .all(|(&f, &l)| f == l.to_ascii_lowercase())
+                    })
+                    && feature.get(lang.len()) == Some(&b'_')
             }) else {
                 return Err(call.error(format!("specified unknown feature \"{feature}\"")));
             };
@@ -269,11 +273,12 @@ impl Evaluator<'_> {
                     BString::from(lang)
                 )));
             }
-            let mut key = b"CMAKE_".to_vec();
-            key.extend_from_slice(lang);
-            key.extend_from_slice(b"_COMPILE_FEATURES");
-            let features = self.host.definition(&key).unwrap_or_default();
-            available &= list::split(&features, list::Empty::Drop).contains(&feature);
+            let features = with_prefixed_key(b"CMAKE_", lang, b"_COMPILE_FEATURES", |key| {
+                self.host.definition(key)
+            })
+            .unwrap_or_default();
+            available &= list::iter(&features, list::Empty::Drop)
+                .any(|item| item.as_ref() == feature.as_slice());
         }
         Ok(boolean(available))
     }
@@ -381,21 +386,20 @@ impl Evaluator<'_> {
     fn usage_only(&mut self, call: Call<'_>) -> Value {
         self.flags.context_sensitive = true;
         let [value] = self.fixed(call)?;
-        let property = DAGChecker::root_property();
+        let property = DAGChecker::with_root_property(|property| {
+            property.map(|prop| (is_link_libraries_property(prop), prop == b"LINK_LIBRARIES"))
+        });
         if property.is_none() && !self.in_target_expression {
             return Err(call.error(format!(
                 "$<{}:...> may only be used for linking",
                 BString::from(call.name)
             )));
         }
-        let property = property
-            .as_ref()
-            .map_or(b"".as_slice(), |property| property.as_slice());
-        let compile_usage =
-            call.ctx.traversal == UsageTraversal::Compile && is_link_libraries_property(property);
+        let (is_link_libs, is_direct_link_libs) = property.unwrap_or((false, false));
+        let compile_usage = call.ctx.traversal == UsageTraversal::Compile && is_link_libs;
         let include = if call.name == b"COMPILE_ONLY" {
             compile_usage
-        } else if property == b"LINK_LIBRARIES" {
+        } else if is_direct_link_libs {
             !compile_usage
                 || call
                     .ctx
@@ -459,9 +463,7 @@ enum EvaluationRole {
 
 impl EvaluationRole {
     fn active() -> Self {
-        DAGChecker::root_property()
-            .as_ref()
-            .map_or(Self::Other, |property| Self::for_property(property))
+        DAGChecker::with_root_property(|property| property.map_or(Self::Other, Self::for_property))
     }
 
     fn for_property(property: &[u8]) -> Self {
@@ -537,4 +539,56 @@ fn valid_id(value: &[u8]) -> bool {
     value
         .iter()
         .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+fn with_prefixed_key<R>(
+    prefix: &[u8],
+    middle: &[u8],
+    suffix: &[u8],
+    f: impl FnOnce(&[u8]) -> R,
+) -> R {
+    let total = prefix.len() + middle.len() + suffix.len();
+    let mut buf = [0_u8; 96];
+    if let Some(slot) = buf.get_mut(..total) {
+        let p = prefix.len();
+        let pm = p + middle.len();
+        if let Some(dst) = slot.get_mut(..p) {
+            dst.copy_from_slice(prefix);
+        }
+        if let Some(dst) = slot.get_mut(p..pm) {
+            dst.copy_from_slice(middle);
+        }
+        if let Some(dst) = slot.get_mut(pm..total) {
+            dst.copy_from_slice(suffix);
+        }
+        f(slot)
+    } else {
+        let mut key = Vec::with_capacity(total);
+        key.extend_from_slice(prefix);
+        key.extend_from_slice(middle);
+        key.extend_from_slice(suffix);
+        f(&key)
+    }
+}
+
+fn with_upper_prefixed_key<R>(prefix: &[u8], tail: &[u8], f: impl FnOnce(&[u8]) -> R) -> R {
+    let total = prefix.len() + tail.len();
+    let mut buf = [0_u8; 96];
+    if let Some(slot) = buf.get_mut(..total) {
+        let p = prefix.len();
+        if let Some(dst) = slot.get_mut(..p) {
+            dst.copy_from_slice(prefix);
+        }
+        if let Some(dst) = slot.get_mut(p..total) {
+            for (d, &b) in dst.iter_mut().zip(tail.iter()) {
+                *d = b.to_ascii_uppercase();
+            }
+        }
+        f(slot)
+    } else {
+        let mut key = Vec::with_capacity(total);
+        key.extend_from_slice(prefix);
+        key.extend(tail.iter().map(u8::to_ascii_uppercase));
+        f(&key)
+    }
 }

@@ -5,14 +5,14 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_gen_common::{GenError, write_output};
 use rcmake_host::{FileKind, Follow, Host, SystemInfo, path::from_native};
 use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, VsVersion};
-use rcmake_resolve::GenerationResult;
+use rcmake_resolve::{GenerationResult, usage::UsageResolver};
 
 use plan::Project;
 
@@ -86,10 +86,8 @@ pub fn generate_with_restore_requirements(
     bin: &Path,
 ) -> Result<Vec<String>, GenError> {
     let plan = plan::plan(version, result, model, host, bin)?;
-    // The `ZERO_CHECK` pre-build event runs the glob verification script.
-    // Write it before the projects so that the first build finds it.
-    let verify_globs =
-        plan.regenerate && rcmake_gen_common::glob::write_verification(Some(model), bin, host)?;
+    let mut usage: Option<UsageResolver<'_>> = None;
+    let mut nasm_props_template: Option<String> = None;
     for project in &plan.projects {
         let facts = project.target.and_then(|id| plan.resolved.get(&id));
         let context = vcxproj::Context {
@@ -97,18 +95,14 @@ pub fn generate_with_restore_requirements(
             projects: &plan.projects,
             settings: &plan.settings,
             facts,
-            result,
+            indices: &plan.indices,
             model,
             inputs: &plan.inputs,
         };
-        write_project(host, &context)?;
+        write_project(host, &context, &mut usage, &mut nasm_props_template)?;
     }
     if plan.regenerate {
-        let mut list = format!("{}\n", plan.inputs.join("\n"));
-        if verify_globs {
-            list.push_str(&join(&plan.settings.bin, rcmake_gen_common::glob::STAMP));
-            list.push('\n');
-        }
+        let list = format!("{}\n", plan.inputs.join("\n"));
         write(
             host,
             &join(&plan.settings.bin, "CMakeFiles/generate.stamp.depend"),
@@ -152,30 +146,35 @@ pub(crate) fn has_package_references(target: &Target) -> bool {
 /// Names of the projects whose target, or any transitive project dependency of
 /// it, has package references.
 fn restore_requirements(projects: &[Project], model: &ProjectModel) -> Vec<String> {
-    let mut required: Vec<bool> = projects
-        .iter()
-        .map(|project| {
-            project
-                .target
-                .and_then(|id| model.target(id))
-                .is_some_and(has_package_references)
-        })
-        .collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (index, project) in projects.iter().enumerate() {
-            if required.get(index).copied().unwrap_or(false) {
-                continue;
-            }
-            if project
-                .dependencies
-                .iter()
-                .any(|&dep| required.get(dep).copied().unwrap_or(false))
-                && let Some(slot) = required.get_mut(index)
-            {
+    let mut required = vec![false; projects.len()];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); projects.len()];
+    let mut pending = Vec::new();
+    for (index, project) in projects.iter().enumerate() {
+        if project
+            .target
+            .and_then(|id| model.target(id))
+            .is_some_and(has_package_references)
+        {
+            if let Some(slot) = required.get_mut(index) {
                 *slot = true;
-                changed = true;
+            }
+            pending.push(index);
+        }
+        for &dep in &project.dependencies {
+            if let Some(parents) = dependents.get_mut(dep) {
+                parents.push(index);
+            }
+        }
+    }
+    while let Some(node) = pending.pop() {
+        if let Some(parents) = dependents.get(node) {
+            for &parent in parents {
+                if let Some(slot) = required.get_mut(parent)
+                    && !*slot
+                {
+                    *slot = true;
+                    pending.push(parent);
+                }
             }
         }
     }
@@ -187,9 +186,14 @@ fn restore_requirements(projects: &[Project], model: &ProjectModel) -> Vec<Strin
         .collect()
 }
 
-fn write_project(host: &dyn Host, context: &vcxproj::Context<'_>) -> Result<(), GenError> {
-    let plan = context.plan()?;
-    context.write_tool_imports(host, &plan)?;
+fn write_project<'a>(
+    host: &dyn Host,
+    context: &vcxproj::Context<'a>,
+    usage: &mut Option<UsageResolver<'a>>,
+    nasm_props_template: &mut Option<String>,
+) -> Result<(), GenError> {
+    let plan = context.plan(usage)?;
+    context.write_tool_imports(host, &plan, nasm_props_template)?;
     for item in plan.items.values().filter(|item| item.synthetic) {
         write(host, &item.path, b"# MSBuild custom command\r\n")?;
     }
@@ -227,17 +231,25 @@ impl Settings {
             .or_else(|| var(b"CMAKE_VS_PLATFORM_NAME"))
             .map_or_else(|| default_platform(&system).into(), |value| string(value));
         let mut configs = Vec::new();
+        let mut seen_raw: HashSet<&[u8]> = HashSet::new();
         let mut seen = BTreeSet::new();
         for value in result
             .configs
             .iter()
-            .map(|config| &config.0)
-            .chain(result.graphs.iter().map(|graph| &graph.config.0))
-            .chain(result.targets.iter().map(|target| &target.config.0))
+            .map(|config| config.0.as_slice())
+            .chain(result.graphs.iter().map(|graph| graph.config.0.as_slice()))
+            .chain(
+                result
+                    .targets
+                    .iter()
+                    .map(|target| target.config.0.as_slice()),
+            )
         {
-            let value = string(value);
-            if !value.is_empty() && seen.insert(value.to_ascii_lowercase()) {
-                configs.push(value);
+            if !value.is_empty() && seen_raw.insert(value) {
+                let value = string(value);
+                if seen.insert(value.to_ascii_lowercase()) {
+                    configs.push(value);
+                }
             }
         }
         if configs.is_empty() {

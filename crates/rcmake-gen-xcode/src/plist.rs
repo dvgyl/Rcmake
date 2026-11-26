@@ -1,6 +1,6 @@
 //! OpenStep property-list output for Xcode projects.
 
-use std::fmt::Write as _;
+use std::{borrow::Cow, fmt::Write as _};
 
 use crate::object::{Attrs, Isa, Objects, Reference, Value};
 
@@ -31,10 +31,17 @@ fn quoted_string(out: &mut String, value: &str) {
 fn reference(out: &mut String, reference: &Reference) {
     out.push_str(&reference.id);
     if !reference.comment.is_empty() {
-        let comment = reference
-            .comment
-            .replace("*/", "* /")
-            .replace(['\n', '\r'], " ");
+        let comment: Cow<'_, str> =
+            if reference.comment.contains("*/") || reference.comment.contains(['\n', '\r']) {
+                Cow::Owned(
+                    reference
+                        .comment
+                        .replace("*/", "* /")
+                        .replace(['\n', '\r'], " "),
+                )
+            } else {
+                Cow::Borrowed(&reference.comment)
+            };
         let _ = write!(out, " /* {comment} */");
     }
 }
@@ -106,7 +113,8 @@ fn fields(out: &mut String, items: &Attrs, level: usize, compact: bool, inline_l
 }
 
 pub(crate) fn encode(objects: &Objects, root: &Reference) -> String {
-    let mut out = String::from(
+    let mut out = String::with_capacity(objects.entries.len().saturating_mul(160) + 256);
+    out.push_str(
         "// !$*UTF8*$!\n{\n\tarchiveVersion = 1;\n\tclasses = {\n\t};\n\tobjectVersion = 46;\n\tobjects = {\n",
     );
     let mut section = None;

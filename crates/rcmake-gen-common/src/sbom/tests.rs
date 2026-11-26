@@ -20,9 +20,10 @@ fn evaluates_private_static_dependencies_in_sbom_link_properties()
     let id = model.add_target(library)?;
     let library = model.target(id).ok_or("The library is missing.")?;
     let mut usage = UsageResolver::new(&model);
+    let link_languages = HashMap::new();
     let links = target_links(
         &model,
-        &GenerationResult::default(),
+        &link_languages,
         &mut usage,
         id,
         library,

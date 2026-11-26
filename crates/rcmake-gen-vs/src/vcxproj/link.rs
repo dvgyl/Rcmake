@@ -6,8 +6,8 @@ use rcmake_resolve::{
 };
 
 use super::{
-    Command, Config, Context, Kind, Plan, Rule, absolute, flags_table, ide_flags, join, msbuild,
-    msbuild_value, object_path, source_kind, string, windows,
+    Command, Config, Context, Kind, Plan, Rule, absolute, build_compile_units, flags_table,
+    ide_flags, join, msbuild, msbuild_value, object_path, source_kind, string, windows,
 };
 
 impl Context<'_> {
@@ -94,15 +94,13 @@ impl Context<'_> {
     }
 
     fn definition_command(&self, fact: &ResolvedTarget) -> Option<&rcmake_resolve::Invocation> {
-        let graph = self
-            .result
-            .graphs
-            .iter()
-            .find(|graph| graph.config == fact.config)?;
-        let target = graph
-            .targets
-            .iter()
-            .find(|target| target.name == fact.metadata.name)?;
+        let cfg = fact.config.0.as_slice();
+        let graph = self.indices.graph_by_config.get(cfg).copied()?;
+        let target = self
+            .indices
+            .graph_target
+            .get(&(cfg, fact.metadata.name.as_slice()))
+            .copied()?;
         target
             .steps
             .iter()
@@ -194,10 +192,10 @@ impl Context<'_> {
             return None;
         }
         let resolved = self
-            .result
-            .targets
-            .iter()
-            .find(|fact| fact.id == id && fact.config.0.as_slice() == config.as_bytes());
+            .indices
+            .resolved_by_id
+            .get(&(id, config.as_bytes()))
+            .copied();
         if let Some(file) = resolved.and_then(|fact| {
             fact.artifacts.import_file.as_ref().or_else(|| {
                 if target.kind == TargetKind::SharedLibrary {
@@ -234,9 +232,10 @@ impl Context<'_> {
                 .map(|file| windows(&string(file)));
         }
         let project = self
-            .projects
-            .iter()
-            .find(|project| project.target == Some(id))?;
+            .indices
+            .project_by_target
+            .get(&id)
+            .and_then(|&index| self.projects.get(index))?;
         Some(windows(&join(
             &join(&project.dir, config),
             &format!("{}.lib", project.name),
@@ -244,16 +243,21 @@ impl Context<'_> {
     }
 
     pub(super) fn target_objects(&self, id: TargetId, config: &str) -> Vec<String> {
-        let Some(project) = self.projects.iter().find(|project| {
-            project.target == Some(id) && project.kind == TargetKind::ObjectLibrary
-        }) else {
+        let Some(project) = self
+            .indices
+            .project_by_target
+            .get(&id)
+            .and_then(|&index| self.projects.get(index))
+            .filter(|project| project.kind == TargetKind::ObjectLibrary)
+        else {
             return Vec::new();
         };
         let fact = self
-            .result
-            .targets
-            .iter()
-            .find(|fact| fact.id == id && fact.config.0.as_slice() == config.as_bytes());
+            .indices
+            .resolved_by_id
+            .get(&(id, config.as_bytes()))
+            .copied();
+        let compile_units = build_compile_units(fact);
         let ide = fact.and_then(|fact| fact.ide.as_deref());
         let sources: Vec<_> = if let Some(ide) = ide {
             ide.sources
@@ -273,15 +277,12 @@ impl Context<'_> {
                 .iter()
                 .map(|unit| string(&unit.source.value))
                 .collect()
-        } else if let Some(graph) = self
-            .result
-            .graphs
-            .iter()
-            .find(|graph| graph.config.0.as_slice() == config.as_bytes())
-            && let Some(entry) = graph
-                .targets
-                .iter()
-                .find(|entry| entry.name.as_slice() == project.name.as_bytes())
+        } else if let Some(graph) = self.indices.graph_by_config.get(config.as_bytes()).copied()
+            && let Some(entry) = self
+                .indices
+                .graph_target
+                .get(&(config.as_bytes(), project.name.as_bytes()))
+                .copied()
         {
             return entry
                 .steps
@@ -296,7 +297,15 @@ impl Context<'_> {
                         let path = if object.to_ascii_lowercase().ends_with(".obj") {
                             absolute(&self.settings.bin, &object)
                         } else {
-                            object_path(project, self.settings, self.model, &source, config, fact)
+                            object_path(
+                                project,
+                                self.settings,
+                                self.model,
+                                &source,
+                                config,
+                                fact,
+                                compile_units.as_ref(),
+                            )
                         };
                         Some(windows(&path))
                     }
@@ -324,6 +333,7 @@ impl Context<'_> {
                     &source,
                     config,
                     fact,
+                    compile_units.as_ref(),
                 ))
             })
             .chain(

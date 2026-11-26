@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::{cell::RefCell, collections::HashSet};
 
 use rcmake_base::{BString, list, path_lex::Lexical, truth};
 
@@ -17,16 +17,14 @@ struct PropertyFrame {
     kind: FrameKind,
     key: BString,
     expression: Option<BString>,
-    parent: Option<Rc<Self>>,
-    depth: usize,
 }
 
 thread_local! {
     // A host callback can call evaluate again. Keep its active property chain.
-    static ACTIVE: RefCell<Option<Rc<PropertyFrame>>> = const { RefCell::new(None) };
+    static ACTIVE: RefCell<Vec<PropertyFrame>> = const { RefCell::new(Vec::new()) };
 }
 
-pub(super) struct DAGChecker(Option<Rc<PropertyFrame>>);
+pub(super) struct DAGChecker;
 
 pub(super) enum DAGEntry {
     Entered(DAGChecker),
@@ -39,22 +37,20 @@ impl DAGChecker {
         let target = ctx.current.or(ctx.head);
         let property = ctx.site.property.as_ref()?;
         ACTIVE.with(|active| {
-            let parent = active.borrow().clone();
-            if parent
-                .as_ref()
+            let mut stack = active.borrow_mut();
+            if stack
+                .last()
                 .is_some_and(|frame| frame.kind != FrameKind::RuntimeDlls)
             {
                 return None;
             }
-            active.replace(Some(Rc::new(PropertyFrame {
+            stack.push(PropertyFrame {
                 target,
                 kind: FrameKind::Property,
                 key: property.clone(),
                 expression: None,
-                depth: parent.as_ref().map_or(1, |frame| frame.depth + 1),
-                parent: parent.clone(),
-            })));
-            Some(Self(parent))
+            });
+            Some(Self)
         })
     }
 
@@ -90,10 +86,9 @@ impl DAGChecker {
         limit: u32,
     ) -> Result<DAGEntry, GenexError> {
         ACTIVE.with(|active| {
-            let parent = active.borrow().clone();
-            let mut frame = parent.as_deref();
+            let mut stack = active.borrow_mut();
             let mut direct = true;
-            while let Some(entry) = frame {
+            for entry in stack.iter().rev() {
                 if entry.target == target && entry.kind == kind && entry.key == key {
                     return Ok(if direct {
                         DAGEntry::SelfReference
@@ -102,49 +97,40 @@ impl DAGChecker {
                     });
                 }
                 direct = false;
-                frame = entry.parent.as_deref();
             }
-            let depth = parent.as_ref().map_or(1, |entry| entry.depth + 1);
+            let depth = stack.len() + 1;
             if depth > limit as usize {
                 return Err(GenexError::TooDeep);
             }
-            active.replace(Some(Rc::new(PropertyFrame {
+            stack.push(PropertyFrame {
                 target,
                 kind,
                 key: key.into(),
                 expression,
-                depth,
-                parent: parent.clone(),
-            })));
-            Ok(DAGEntry::Entered(Self(parent)))
+            });
+            Ok(DAGEntry::Entered(Self))
         })
     }
 
-    pub(super) fn root_property() -> Option<BString> {
+    pub(super) fn with_root_property<R>(f: impl FnOnce(Option<&[u8]>) -> R) -> R {
         ACTIVE.with(|active| {
-            let active = active.borrow();
-            let mut frame = active.as_deref();
-            let mut property = None;
-            while let Some(entry) = frame {
-                if entry.kind == FrameKind::Property {
-                    property = Some(&entry.key);
-                }
-                frame = entry.parent.as_deref();
-            }
-            property.cloned()
+            let stack = active.borrow();
+            let property = stack
+                .iter()
+                .find(|entry| entry.kind == FrameKind::Property)
+                .map(|entry| entry.key.as_slice());
+            f(property)
         })
     }
 
     pub(super) fn loop_steps(expression: &BString) -> Vec<BString> {
         ACTIVE.with(|active| {
-            let active = active.borrow();
-            let mut frame = active.as_deref();
-            let mut steps = Vec::new();
-            while let Some(entry) = frame {
-                steps.push(entry.expression.as_ref().unwrap_or(expression).clone());
-                frame = entry.parent.as_deref();
-            }
-            steps
+            active
+                .borrow()
+                .iter()
+                .rev()
+                .map(|entry| entry.expression.as_ref().unwrap_or(expression).clone())
+                .collect()
         })
     }
 }
@@ -152,7 +138,7 @@ impl DAGChecker {
 impl Drop for DAGChecker {
     fn drop(&mut self) {
         ACTIVE.with(|active| {
-            active.replace(self.0.take());
+            active.borrow_mut().pop();
         });
     }
 }
@@ -327,14 +313,14 @@ impl Evaluator<'_> {
         let Some((kind, part)) = artifact_operator(call.name) else {
             return Err(unknown(call));
         };
-        let operator = BString::from(call.name);
         let args = self.arguments(call)?;
         let (name, postfix) = match (part, args.as_slice()) {
             (_, [name]) => (name, None),
             (ArtifactPart::BaseName, [name, postfix]) => (name, Some(postfix)),
             (ArtifactPart::BaseName, []) => {
                 return Err(call.error(format!(
-                    "$<{operator}> expression requires at least one parameter."
+                    "$<{}> expression requires at least one parameter.",
+                    BString::from(call.name)
                 )));
             }
             (ArtifactPart::BaseName, _) => {
@@ -349,8 +335,7 @@ impl Evaluator<'_> {
         self.record_lookup(name, target);
         let target_type = self.host.raw_property(target, b"TYPE");
         let target_type = target_type.as_ref().map(|kind| kind.as_slice());
-        let diagnostic_operator = artifact_diagnostic_operator(call.name, kind, part);
-        self.validate_artifact(call, name, target, target_type, kind, &diagnostic_operator)?;
+        self.validate_artifact(call, name, target, target_type, kind, part)?;
 
         if kind == ArtifactKind::LinkerLibraryFile
             && target_type != Some(b"STATIC_LIBRARY")
@@ -412,11 +397,13 @@ impl Evaluator<'_> {
             | ArtifactKind::LinkerImportFile
             | ArtifactKind::SonameImportFile => Ok(BString::default()),
             ArtifactKind::PdbFile => Err(call.error(format!(
-                "{diagnostic_operator} is not supported by the target linker."
+                "{} is not supported by the target linker.",
+                artifact_diagnostic_operator(call.name, kind, part)
             ))),
-            ArtifactKind::BundleDir | ArtifactKind::BundleContentDir => {
-                Err(call.error(format!("{operator} is allowed only for Bundle targets.")))
-            }
+            ArtifactKind::BundleDir | ArtifactKind::BundleContentDir => Err(call.error(format!(
+                "{} is allowed only for Bundle targets.",
+                BString::from(call.name)
+            ))),
             _ if self.target_option(target, b"IMPORTED") => {
                 if self.host.target_policy(target, b"CMP0111") != Some(true) {
                     return Ok(format!("{name}-NOTFOUND").into());
@@ -439,7 +426,8 @@ impl Evaluator<'_> {
                 })
             }
             _ => Err(call.error(format!(
-                "Target \"{name}\" has no artifact for $<{operator}>."
+                "Target \"{name}\" has no artifact for $<{}>.",
+                BString::from(call.name)
             ))),
         }
     }
@@ -451,7 +439,7 @@ impl Evaluator<'_> {
         target: TargetHandle,
         target_type: Option<&[u8]>,
         kind: ArtifactKind,
-        operator: &BString,
+        part: ArtifactPart,
     ) -> Result<(), GenexError> {
         use ArtifactKind::*;
         if target_type.is_some_and(|kind| {
@@ -523,6 +511,7 @@ impl Evaluator<'_> {
             }
             _ => return Ok(()),
         };
+        let operator = artifact_diagnostic_operator(call.name, kind, part);
         Err(call.error(format!("{operator} {message}")))
     }
 

@@ -13,9 +13,11 @@ use rcmake_host::{
     path::{from_native, to_native},
 };
 use rcmake_model::{
-    BT, DirId, DiscoverySpec, ProjectModel, Target, TargetKind, TestEntry, TestKind,
+    BT, DirId, DiscoverySpec, ProjectModel, Target, TargetId, TargetKind, TestEntry, TestKind,
 };
-use rcmake_resolve::{GenerationResult, lower::compute_artifacts, usage::UsageResolver};
+use rcmake_resolve::{
+    GenerationResult, ResolvedTarget, lower::compute_artifacts, usage::UsageResolver,
+};
 
 use crate::{
     GenError, configuration_pattern, quote, script_argument as test_argument, write_if_changed,
@@ -54,236 +56,285 @@ pub fn render_resolved_with_host(
     render_file(model, dir, Some(result), Some(host))
 }
 
+/// Shared state for rendering `CTestTestfile.cmake` across all directories of one project.
+///
+/// Lazily constructs and reuses the target lookup map and [`UsageResolver`] so directories
+/// without tests or generator-expression includes avoid rebuilding project-wide indices.
+pub struct CtestContext<'a> {
+    model: &'a ProjectModel,
+    result: Option<&'a GenerationResult>,
+    targets: Option<HashMap<(&'a [u8], TargetId), &'a ResolvedTarget>>,
+    usage: Option<UsageResolver<'a>>,
+}
+
+impl<'a> CtestContext<'a> {
+    /// Prepare shared rendering state for `model` and an optional resolved `result`.
+    #[must_use]
+    pub fn new(model: &'a ProjectModel, result: Option<&'a GenerationResult>) -> Self {
+        Self {
+            model,
+            result,
+            targets: None,
+            usage: None,
+        }
+    }
+
+    /// Render `CTestTestfile.cmake` for `dir`, reusing shared target and usage state.
+    pub fn render(&mut self, dir: DirId, host: Option<&dyn Host>) -> Result<BString, GenError> {
+        if dir == DirId::ROOT
+            && let Some(host) = host
+        {
+            warn_fixture_defaults(self.model, host);
+        }
+        self.render_inner(dir, host)
+    }
+
+    fn render_inner(&mut self, dir: DirId, host: Option<&dyn Host>) -> Result<BString, GenError> {
+        let model = self.model;
+        let result = self.result;
+        let multi_config = model.generator.is_some_and(|kind| kind.multi_config());
+        let dir_id = dir;
+        let dir = model.dir(dir_id);
+        let mut out = BString::from("# CMake generated Testfile for \n");
+        comment(&mut out, b"# Source directory: ", &dir.source_dir);
+        comment(&mut out, b"# Build directory: ", &dir.binary_dir);
+        out.extend_from_slice(
+            b"# \n# This file includes the relevant testing commands required for \n\
+              # testing this directory and lists subdirectories to be tested as well.\n",
+        );
+        let configs = result.map_or(&[] as &[ConfigId], |result| result.configs.as_slice());
+        let multi_config = multi_config || configs.len() > 1;
+        render_includes(
+            &mut out,
+            model,
+            dir_id,
+            &mut self.usage,
+            configs,
+            multi_config,
+        )?;
+        for (_, test) in model.dir_tests(dir_id) {
+            let policy = PolicyId::new(110);
+            let quoting = dir
+                .final_policies
+                .map_or(PolicyStatus::New, |policies| policies.get(policy));
+            let name = |out: &mut BString| {
+                if quoting == PolicyStatus::New {
+                    test_argument(out, &test.name);
+                } else {
+                    out.extend_from_slice(&test.name);
+                }
+            };
+            if quoting == PolicyStatus::Warn
+                && let Some(host) = host
+                && test
+                    .name
+                    .iter()
+                    .any(|byte| b"$[] #;\t\n\"\\".contains(byte))
+            {
+                warn_policy(
+                    model,
+                    host,
+                    policy,
+                    Location::FileLine {
+                        file: Lexical::new(&dir.source_dir)
+                            .append(b"CMakeLists.txt")
+                            .as_slice()
+                            .into(),
+                        line: 0,
+                    },
+                    "",
+                    &format!(
+                        "The following name given to add_test() is invalid if CMP0110 is not set or set to OLD:\n  `{}´\n",
+                        test.name
+                    ),
+                );
+            }
+            let Some(result) = result.filter(|r| !test.old_style && !r.configs.is_empty()) else {
+                render_guarded_test(&mut out, test, name);
+                continue;
+            };
+            let targets = self.targets.get_or_insert_with(|| {
+                result
+                    .targets
+                    .iter()
+                    .map(|target| ((target.config.0.as_slice(), target.id), target))
+                    .collect()
+            });
+            let usage = self.usage.get_or_insert_with(|| UsageResolver::new(model));
+            let mut guarded = false;
+            for config in &result.configs {
+                if multi_config
+                    && !test.configurations.is_empty()
+                    && !test.configurations.iter().any(|name| config.matches(name))
+                {
+                    continue;
+                }
+                let lookup = |name: &[u8]| {
+                    let id = model.find_target(test.dir, name)?;
+                    let target = model.target(id)?;
+                    let file = targets
+                        .get(&(config.0.as_slice(), id))
+                        .and_then(|resolved| resolved.artifacts.file.clone())
+                        .or_else(|| compute_artifacts(model, target, config).file)
+                        .or_else(|| {
+                            if target.is_imported() && target.kind == TargetKind::Executable {
+                                target.props.get(b"LOCATION").cloned()
+                            } else {
+                                None
+                            }
+                        });
+                    Some((target, file))
+                };
+                let context = EvalContext {
+                    config: config.clone(),
+                    site: EvalSite {
+                        backtrace: test.backtrace.clone(),
+                        property: None,
+                    },
+                    ..EvalContext::default()
+                };
+                let mut evaluate = |value: &[u8]| {
+                    resolve_argument(
+                        value,
+                        &context,
+                        usage,
+                        test.dir,
+                        &model.dir(DirId::ROOT).source_dir,
+                        &lookup,
+                    )
+                };
+                let mut resolved = resolve_test(test, &mut evaluate)?;
+                let program = resolved.command.first().cloned();
+                resolve_test_program(model, &mut resolved, lookup, &mut evaluate, host)?;
+                if let TestKind::Discover(spec) = &mut resolved.kind {
+                    resolve_discovery(spec, &mut evaluate)?;
+                }
+                let mut dependencies = BTreeSet::new();
+                if let Some((target, Some(file))) = program.as_ref().and_then(|name| lookup(name))
+                    && target.kind == TargetKind::Executable
+                    && !target.is_imported()
+                {
+                    dependencies.insert(file);
+                }
+                for argument in &test.command {
+                    let mut remaining = argument.as_slice();
+                    while let Some((_, suffix)) = remaining.split_once_str(b"$<TARGET_FILE:")
+                        && let Some((name, tail)) = suffix.split_once_str(b">")
+                    {
+                        if let Some((target, Some(file))) = lookup(name)
+                            && !target.is_imported()
+                            && resolved
+                                .command
+                                .iter()
+                                .any(|argument| argument.contains_str(&file))
+                        {
+                            dependencies.insert(file);
+                        }
+                        remaining = tail;
+                    }
+                }
+                for entry in &test.build_depends {
+                    for value in list::split(&evaluate(&entry.value)?, list::Empty::Drop) {
+                        if let Some((target, file)) = lookup(&value) {
+                            if !target.is_imported() {
+                                dependencies.extend(file);
+                                if target.kind == TargetKind::ObjectLibrary
+                                    && let Some(id) = model.find_target(test.dir, &value)
+                                    && let Some(entry) = targets.get(&(config.0.as_slice(), id))
+                                {
+                                    let root = Lexical::new(&model.dir(DirId::ROOT).binary_dir);
+                                    dependencies.extend(
+                                        entry
+                                            .compile_units
+                                            .iter()
+                                            .map(|unit| root.append(&unit.object)),
+                                    );
+                                }
+                            }
+                        } else {
+                            let source = Lexical::new(&dir.source_dir).append(&value);
+                            let file = if host.is_some_and(|host| {
+                                host.metadata(&to_native(&source), rcmake_host::Follow::Yes)
+                                    .is_ok()
+                            }) {
+                                source
+                            } else {
+                                Lexical::new(&dir.binary_dir).append(&value)
+                            };
+                            dependencies.insert(Lexical::new(&file).normalize());
+                        }
+                    }
+                }
+                resolved.build_depends = dependencies
+                    .into_iter()
+                    .map(|value| BT::new(value, test.backtrace.clone()))
+                    .collect();
+                if !resolved.is_discovery()
+                    && resolved.props.get(b"_CMAKE_TEST_BUILD_DEPENDS").is_none()
+                {
+                    resolved
+                        .props
+                        .set("_CMAKE_TEST_BUILD_DEPENDS".into(), BString::default());
+                }
+                if multi_config {
+                    out.extend_from_slice(if guarded { b"elseif" } else { b"if" });
+                    configuration_condition(&mut out, std::slice::from_ref(&config.0));
+                    guarded = true;
+                    render_test(&mut out, &resolved, b"  ", name);
+                } else {
+                    render_guarded_test(&mut out, &resolved, name);
+                }
+            }
+            if guarded {
+                if test.configurations.is_empty() && !test.is_discovery() {
+                    out.extend_from_slice(b"else()\n  add_test(");
+                    name(&mut out);
+                    out.extend_from_slice(b" NOT_AVAILABLE)\n");
+                }
+                out.extend_from_slice(b"endif()\n");
+            }
+        }
+        let binary_dir = to_native(&dir.binary_dir);
+        for &child in &dir.children {
+            let path = to_native(&model.dir(child).binary_dir);
+            let path = path.strip_prefix(&binary_dir).unwrap_or(&path);
+            out.extend_from_slice(b"subdirs(");
+            test_argument(
+                &mut out,
+                &rcmake_base::path_lex::cmake_style(&from_native(path)),
+            );
+            out.extend_from_slice(b")\n");
+        }
+        let labels = list::join(
+            dir.props
+                .get(b"LABELS")
+                .into_iter()
+                .chain(model.definition(dir_id, b"CMAKE_DIRECTORY_LABELS"))
+                .filter(|labels| !labels.is_empty()),
+        );
+        if !labels.is_empty() {
+            out.extend_from_slice(b"set_directory_properties(PROPERTIES LABELS ");
+            test_argument(&mut out, &labels);
+            out.extend_from_slice(b")\n");
+        }
+        Ok(out)
+    }
+}
+
 fn render_file(
     model: &ProjectModel,
     dir: DirId,
     result: Option<&GenerationResult>,
     host: Option<&dyn Host>,
 ) -> Result<BString, GenError> {
-    let targets: HashMap<_, _> = result
-        .into_iter()
-        .flat_map(|result| &result.targets)
-        .map(|target| ((target.config.0.as_slice(), target.id), target))
-        .collect();
-    let multi_config = model.generator.is_some_and(|kind| kind.multi_config());
-    let dir_id = dir;
-    let dir = model.dir(dir_id);
-    let mut out = BString::from("# CMake generated Testfile for \n");
-    comment(&mut out, b"# Source directory: ", &dir.source_dir);
-    comment(&mut out, b"# Build directory: ", &dir.binary_dir);
-    out.extend_from_slice(
-        b"# \n# This file includes the relevant testing commands required for \n\
-          # testing this directory and lists subdirectories to be tested as well.\n",
-    );
-    let mut usage = UsageResolver::new(model);
-    let configs = result.map_or(&[] as &[ConfigId], |result| result.configs.as_slice());
-    let multi_config = multi_config || configs.len() > 1;
-    render_includes(&mut out, model, dir_id, &mut usage, configs, multi_config)?;
-    for (_, test) in model.dir_tests(dir_id) {
-        let policy = PolicyId::new(110);
-        let quoting = dir
-            .final_policies
-            .map_or(PolicyStatus::New, |policies| policies.get(policy));
-        let name = |out: &mut BString| {
-            if quoting == PolicyStatus::New {
-                test_argument(out, &test.name);
-            } else {
-                out.extend_from_slice(&test.name);
-            }
-        };
-        if quoting == PolicyStatus::Warn
-            && let Some(host) = host
-            && test
-                .name
-                .iter()
-                .any(|byte| b"$[] #;\t\n\"\\".contains(byte))
-        {
-            warn_policy(
-                model,
-                host,
-                policy,
-                Location::FileLine {
-                    file: Lexical::new(&dir.source_dir)
-                        .append(b"CMakeLists.txt")
-                        .as_slice()
-                        .into(),
-                    line: 0,
-                },
-                "",
-                &format!(
-                    "The following name given to add_test() is invalid if CMP0110 is not set or set to OLD:\n  `{}´\n",
-                    test.name
-                ),
-            );
-        }
-        let Some(result) = result.filter(|r| !test.old_style && !r.configs.is_empty()) else {
-            render_guarded_test(&mut out, test, name);
-            continue;
-        };
-        let mut guarded = false;
-        for config in &result.configs {
-            if multi_config
-                && !test.configurations.is_empty()
-                && !test.configurations.iter().any(|name| config.matches(name))
-            {
-                continue;
-            }
-            let lookup = |name: &[u8]| {
-                let id = model.find_target(test.dir, name)?;
-                let target = model.target(id)?;
-                let file = targets
-                    .get(&(config.0.as_slice(), id))
-                    .and_then(|resolved| resolved.artifacts.file.clone())
-                    .or_else(|| compute_artifacts(model, target, config).file)
-                    .or_else(|| {
-                        if target.is_imported() && target.kind == TargetKind::Executable {
-                            target.props.get(b"LOCATION").cloned()
-                        } else {
-                            None
-                        }
-                    });
-                Some((target, file))
-            };
-            let context = EvalContext {
-                config: config.clone(),
-                site: EvalSite {
-                    backtrace: test.backtrace.clone(),
-                    property: None,
-                },
-                ..EvalContext::default()
-            };
-            let mut evaluate = |value: &[u8]| {
-                resolve_argument(
-                    value,
-                    &context,
-                    &mut usage,
-                    test.dir,
-                    &model.dir(DirId::ROOT).source_dir,
-                    &lookup,
-                )
-            };
-            let mut resolved = resolve_test(test, &mut evaluate)?;
-            let program = resolved.command.first().cloned();
-            resolve_test_program(model, &mut resolved, lookup, &mut evaluate, host)?;
-            if let TestKind::Discover(spec) = &mut resolved.kind {
-                resolve_discovery(spec, &mut evaluate)?;
-            }
-            let mut dependencies = BTreeSet::new();
-            if let Some((target, Some(file))) = program.as_ref().and_then(|name| lookup(name))
-                && target.kind == TargetKind::Executable
-                && !target.is_imported()
-            {
-                dependencies.insert(file);
-            }
-            for argument in &test.command {
-                let mut remaining = argument.as_slice();
-                while let Some((_, suffix)) = remaining.split_once_str(b"$<TARGET_FILE:")
-                    && let Some((name, tail)) = suffix.split_once_str(b">")
-                {
-                    if let Some((target, Some(file))) = lookup(name)
-                        && !target.is_imported()
-                        && resolved
-                            .command
-                            .iter()
-                            .any(|argument| argument.contains_str(&file))
-                    {
-                        dependencies.insert(file);
-                    }
-                    remaining = tail;
-                }
-            }
-            for entry in &test.build_depends {
-                for value in list::split(&evaluate(&entry.value)?, list::Empty::Drop) {
-                    if let Some((target, file)) = lookup(&value) {
-                        if !target.is_imported() {
-                            dependencies.extend(file);
-                            if target.kind == TargetKind::ObjectLibrary
-                                && let Some(id) = model.find_target(test.dir, &value)
-                                && let Some(entry) = targets.get(&(config.0.as_slice(), id))
-                            {
-                                let root = Lexical::new(&model.dir(DirId::ROOT).binary_dir);
-                                dependencies.extend(
-                                    entry
-                                        .compile_units
-                                        .iter()
-                                        .map(|unit| root.append(&unit.object)),
-                                );
-                            }
-                        }
-                    } else {
-                        let source = Lexical::new(&dir.source_dir).append(&value);
-                        let file = if host.is_some_and(|host| {
-                            host.metadata(&to_native(&source), rcmake_host::Follow::Yes)
-                                .is_ok()
-                        }) {
-                            source
-                        } else {
-                            Lexical::new(&dir.binary_dir).append(&value)
-                        };
-                        dependencies.insert(Lexical::new(&file).normalize());
-                    }
-                }
-            }
-            resolved.build_depends = dependencies
-                .into_iter()
-                .map(|value| BT::new(value, test.backtrace.clone()))
-                .collect();
-            if !resolved.is_discovery()
-                && resolved.props.get(b"_CMAKE_TEST_BUILD_DEPENDS").is_none()
-            {
-                resolved
-                    .props
-                    .set("_CMAKE_TEST_BUILD_DEPENDS".into(), BString::default());
-            }
-            if multi_config {
-                out.extend_from_slice(if guarded { b"elseif" } else { b"if" });
-                configuration_condition(&mut out, std::slice::from_ref(&config.0));
-                guarded = true;
-                render_test(&mut out, &resolved, b"  ", name);
-            } else {
-                render_guarded_test(&mut out, &resolved, name);
-            }
-        }
-        if guarded {
-            if test.configurations.is_empty() && !test.is_discovery() {
-                out.extend_from_slice(b"else()\n  add_test(");
-                name(&mut out);
-                out.extend_from_slice(b" NOT_AVAILABLE)\n");
-            }
-            out.extend_from_slice(b"endif()\n");
-        }
-    }
-    let binary_dir = to_native(&dir.binary_dir);
-    for &child in &dir.children {
-        let path = to_native(&model.dir(child).binary_dir);
-        let path = path.strip_prefix(&binary_dir).unwrap_or(&path);
-        out.extend_from_slice(b"subdirs(");
-        test_argument(
-            &mut out,
-            &rcmake_base::path_lex::cmake_style(&from_native(path)),
-        );
-        out.extend_from_slice(b")\n");
-    }
-    let labels = list::join(
-        dir.props
-            .get(b"LABELS")
-            .into_iter()
-            .chain(model.definition(dir_id, b"CMAKE_DIRECTORY_LABELS"))
-            .filter(|labels| !labels.is_empty()),
-    );
-    if !labels.is_empty() {
-        out.extend_from_slice(b"set_directory_properties(PROPERTIES LABELS ");
-        test_argument(&mut out, &labels);
-        out.extend_from_slice(b")\n");
-    }
-    Ok(out)
+    CtestContext::new(model, result).render_inner(dir, host)
 }
 
-fn render_includes(
+fn render_includes<'a>(
     out: &mut BString,
-    model: &ProjectModel,
+    model: &'a ProjectModel,
     dir: DirId,
-    usage: &mut UsageResolver<'_>,
+    usage: &mut Option<UsageResolver<'a>>,
     configs: &[ConfigId],
     multi_config: bool,
 ) -> Result<(), GenError> {
@@ -323,6 +374,7 @@ fn render_includes(
         } else {
             configs
         };
+        let resolver = usage.get_or_insert_with(|| UsageResolver::new(model));
         let values = configs
             .iter()
             .map(|config| {
@@ -332,7 +384,7 @@ fn render_includes(
                         config: config.clone(),
                         ..EvalContext::default()
                     },
-                    usage,
+                    resolver,
                     dir,
                     &model.dir(DirId::ROOT).source_dir,
                     &|_| None,
@@ -530,7 +582,7 @@ fn render_test(out: &mut BString, test: &TestEntry, indent: &[u8], name: impl Fn
         let value = test.props.get(&name).or(test.working_directory.as_ref());
         if let Some(value) = value {
             out.push(b' ');
-            test_argument(out, &name);
+            out.extend_from_slice(&name);
             out.push(b' ');
             test_argument(out, value);
         }

@@ -1,8 +1,8 @@
 //! Select libraries for the Xcode Frameworks build phase.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
+    collections::{BTreeMap, BTreeSet, HashSet},
+    path::{Path, PathBuf},
 };
 
 use rcmake_base::{BString, shell::quote};
@@ -86,7 +86,12 @@ impl Project<'_> {
         {
             return Vec::new();
         }
-        let facts = |config: &String| self.resolved.get(&(target.id, config.clone())).copied();
+        let facts = |config: &String| {
+            self.indices
+                .resolved
+                .get(&(target.id, config.as_bytes()))
+                .copied()
+        };
         let Some(config) = self.configs.first() else {
             return Vec::new();
         };
@@ -134,7 +139,10 @@ impl Project<'_> {
                             Product::new(
                                 self.model,
                                 producer,
-                                self.resolved.get(&(*id, config.clone())).copied(),
+                                self.indices
+                                    .resolved
+                                    .get(&(*id, config.as_bytes()))
+                                    .copied(),
                                 config,
                                 self.bin,
                             )
@@ -182,7 +190,7 @@ impl Project<'_> {
                     // the linker file of the bundle root.
                     let libraries: Vec<&BString> = match item {
                         IdeLinkItem::Target(id) => {
-                            let producer = self.resolved.get(&(*id, config.clone()))?;
+                            let producer = self.indices.resolved.get(&(*id, config.as_bytes()))?;
                             let artifacts = &producer.artifacts;
                             artifacts
                                 .linker_file
@@ -389,10 +397,11 @@ impl TargetSettings<'_> {
         if producer.is_imported() {
             return None;
         }
-        let resolved =
-            self.result.targets.iter().find(|target| {
-                target.id == id && target.config.0.as_slice() == self.config.as_bytes()
-            });
+        let resolved = self
+            .indices
+            .resolved
+            .get(&(id, self.config.as_bytes()))
+            .copied();
         Some(Product::new(
             self.model,
             producer,
@@ -468,51 +477,75 @@ impl TargetSettings<'_> {
         )
     }
 
-    pub(crate) fn link_objects(&self) -> impl Iterator<Item = String> {
-        let inputs = self
-            .result
-            .graphs
+    pub(crate) fn link_objects(&self) -> Vec<String> {
+        let Some(target) = self.target else {
+            return Vec::new();
+        };
+        let Some(graph) = self
+            .indices
+            .graph_by_config
+            .get(self.config.as_bytes())
+            .copied()
+        else {
+            return Vec::new();
+        };
+        let Some(entry) = self
+            .indices
+            .graph_target
+            .get(&(self.config.as_bytes(), self.raw.name.as_slice()))
+            .copied()
+        else {
+            return Vec::new();
+        };
+        let Some(inputs) = entry
+            .steps
             .iter()
-            .find(|graph| graph.config.0.as_slice() == self.config.as_bytes())
-            .and_then(|graph| {
-                let entry = graph
-                    .targets
-                    .iter()
-                    .find(|entry| entry.name == self.raw.name)?;
-                entry
-                    .steps
-                    .iter()
-                    .filter_map(|index| graph.steps.get(*index))
-                    .find_map(|step| {
-                        if let BuildStep::Link { inputs, .. } = step {
-                            Some(inputs)
-                        } else {
-                            None
-                        }
-                    })
-            });
-        inputs.into_iter().flatten().filter_map(move |input| {
-            let target = self.target?;
-            let path = self.bin.join(text(input));
-            if target.ide.as_ref().is_some_and(|ide| {
-                ide.sources.iter().any(|file| {
-                    file.kind == IdeSourceKind::Object
-                        && (file.path == *input || path == Path::new(&text(&file.path)))
-                })
-            }) {
-                return None;
+            .filter_map(|index| graph.steps.get(*index))
+            .find_map(|step| {
+                if let BuildStep::Link { inputs, .. } = step {
+                    Some(inputs)
+                } else {
+                    None
+                }
+            })
+        else {
+            return Vec::new();
+        };
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        let dep_set: HashSet<rcmake_model::TargetId> =
+            target.dependencies.iter().copied().collect();
+        let mut ide_object_raw: HashSet<&[u8]> = HashSet::new();
+        let mut ide_object_paths: HashSet<PathBuf> = HashSet::new();
+        if let Some(ide) = target.ide.as_deref() {
+            for file in &ide.sources {
+                if file.kind == IdeSourceKind::Object {
+                    ide_object_raw.insert(file.path.as_slice());
+                    ide_object_paths.insert(PathBuf::from(text(&file.path)));
+                }
             }
-            self.result
-                .targets
-                .iter()
-                .any(|dep| {
-                    dep.metadata.kind == TargetKind::ObjectLibrary
-                        && dep.config == target.config
-                        && target.dependencies.contains(&dep.id)
-                        && dep.compile_units.iter().any(|unit| unit.object == *input)
-                })
-                .then(|| object_input(&path.to_string_lossy(), self.config))
-        })
+        }
+        let config_bytes = target.config.0.as_slice();
+        let mut out = Vec::new();
+        for input in inputs {
+            if ide_object_raw.contains(input.as_slice()) {
+                continue;
+            }
+            let path = self.bin.join(text(input));
+            if ide_object_paths.contains(&path) {
+                continue;
+            }
+            if self
+                .indices
+                .objlib_objects
+                .get(&(config_bytes, input.as_slice()))
+                .is_some_and(|owners| owners.iter().any(|id| dep_set.contains(id)))
+            {
+                out.push(object_input(&path.to_string_lossy(), self.config));
+            }
+        }
+        out
     }
 }
 

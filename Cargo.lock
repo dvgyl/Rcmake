@@ -804,6 +804,7 @@ dependencies = [
  "rcmake-base",
  "rcmake-diag",
  "rcmake-gen-common",
+ "rcmake-genex",
  "rcmake-host",
  "rcmake-model",
  "rcmake-resolve",

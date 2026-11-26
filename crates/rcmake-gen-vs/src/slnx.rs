@@ -1,5 +1,7 @@
 //! Visual Studio 18 XML solutions.
 
+use std::collections::BTreeMap;
+
 use crate::{CPP_TYPE, Project, Settings, guid, plan::Solution, relative, windows, xml::Writer};
 
 pub(crate) fn render(solution: &Solution, settings: &Settings, projects: &[Project]) -> String {
@@ -13,14 +15,25 @@ pub(crate) fn render(solution: &Solution, settings: &Settings, projects: &[Proje
     xml.end();
     let mut members: Vec<_> = solution.members(projects).collect();
     members.sort_by(|a, b| a.name.cmp(&b.name));
-    for project in members.iter().filter(|project| project.folder.is_empty()) {
-        write_project(&mut xml, solution, settings, projects, project);
+    let mut by_folder: BTreeMap<&str, Vec<&Project>> = BTreeMap::new();
+    for project in members {
+        by_folder
+            .entry(project.folder.as_str())
+            .or_default()
+            .push(project);
+    }
+    if let Some(root_projects) = by_folder.get("") {
+        for project in root_projects {
+            write_project(&mut xml, solution, settings, projects, project);
+        }
     }
     for folder in solution.folders.keys() {
         let name = format!("/{folder}/");
         xml.start("Folder", &[("Name", &name)]);
-        for project in members.iter().filter(|project| project.folder == *folder) {
-            write_project(&mut xml, solution, settings, projects, project);
+        if let Some(folder_projects) = by_folder.get(folder.as_str()) {
+            for project in folder_projects {
+                write_project(&mut xml, solution, settings, projects, project);
+            }
         }
         xml.end();
     }

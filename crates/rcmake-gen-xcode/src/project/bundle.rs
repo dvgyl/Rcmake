@@ -1,6 +1,9 @@
 //! Bundle metadata and files to embed in a product.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
 use rcmake_base::path_lex::Lexical;
 use rcmake_gen_common::GenError;
@@ -109,6 +112,7 @@ impl Project<'_> {
         id: TargetId,
         raw: &Target,
         targets: &[TargetEntry<'_>],
+        target_by_id: &HashMap<TargetId, usize>,
     ) -> Result<Vec<Reference>, GenError> {
         let mut phases = Vec::new();
         for (kind, destination, label) in [
@@ -124,7 +128,7 @@ impl Project<'_> {
             };
             let property_value = |ide: &IdeFacts| ide.attributes.get(property.as_bytes()).cloned();
             let mut values = self.configs.iter().filter_map(|config| {
-                let target = self.resolved.get(&(id, config.clone()))?;
+                let target = self.indices.resolved.get(&(id, config.as_bytes()))?;
                 target.ide.as_deref().map(property_value)
             });
             let items = values.next().flatten().unwrap_or_default();
@@ -151,7 +155,7 @@ impl Project<'_> {
                 let product = self
                     .model
                     .find_target(raw.dir, item.as_bytes())
-                    .and_then(|id| targets.iter().find(|target| target.id == id))
+                    .and_then(|id| target_by_id.get(&id).and_then(|&idx| targets.get(idx)))
                     .and_then(|target| target.product_ref.as_ref());
                 let file = match product {
                     Some(product) => product.clone(),

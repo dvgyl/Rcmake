@@ -1063,4 +1063,92 @@ fn short_intermediate_directory_strategy_uses_hashed_intdir() {
     );
 }
 
+#[test]
+fn generate_stamp_depend_lists_glob_stamp_once() {
+    let host = PureHost::default();
+    let bin = Path::new("/out");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/src".into(), "/out".into());
+    model.glob_checks.insert(
+        rcmake_model::GlobKey {
+            expression: "/src/*.cpp".into(),
+            recursive: false,
+            directories: false,
+            follow: false,
+            relative: None,
+        },
+        rcmake_model::GlobCheck {
+            files: "/src/main.cpp".into(),
+            calls: vec![rcmake_model::GlobCall {
+                variable: "SOURCES".into(),
+                backtrace: Default::default(),
+            }],
+        },
+    );
+    model
+        .add_target(target("app", TargetKind::Executable, "main.cpp"))
+        .expect("app");
+
+    generate(
+        VsVersion::Vs17,
+        &GenerationResult::default(),
+        &model,
+        &host,
+        bin,
+    )
+    .expect("generate");
+
+    let depend = contents(&host, bin, "CMakeFiles/generate.stamp.depend");
+    let stamp_count = depend
+        .lines()
+        .filter(|line| line.ends_with(rcmake_gen_common::glob::STAMP))
+        .count();
+    assert_eq!(stamp_count, 1, "{depend}");
+}
+
+#[test]
+fn make_dir_preserves_configuration_order() {
+    let host = PureHost::default();
+    let bin = Path::new("/out");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/src".into(), "/out".into());
+    model.dir_mut(DirId::ROOT).vars.insert(
+        "CMAKE_CONFIGURATION_TYPES".into(),
+        "Debug;Release;MinSizeRel;RelWithDebInfo".into(),
+    );
+    let mut app = target("app", TargetKind::Executable, "main.cpp");
+    app.props.set(
+        "LINK_FLAGS".into(),
+        r#"/PDB:"$(IntDir)symbols/app.pdb""#.into(),
+    );
+    model.add_target(app).expect("app");
+
+    generate(
+        VsVersion::Vs17,
+        &GenerationResult::default(),
+        &model,
+        &host,
+        bin,
+    )
+    .expect("generate");
+
+    let vcxproj = contents(&host, bin, "app.vcxproj");
+    let (_, section) = vcxproj
+        .split_once("Name=\"RcmakePrepareLinkDirectories\"")
+        .expect("link directory target");
+    let (target_xml, _) = section.split_once("</Target>").expect("target end");
+    let positions: Vec<_> = ["Debug", "Release", "MinSizeRel", "RelWithDebInfo"]
+        .iter()
+        .map(|cfg| {
+            target_xml
+                .find(&format!("'$(Configuration)|$(Platform)'=='{cfg}|x64'"))
+                .unwrap_or_else(|| panic!("missing {cfg} in:\n{target_xml}"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "expected MakeDir order Debug < Release < MinSizeRel < RelWithDebInfo, got {positions:?}\n{target_xml}"
+    );
+}
+
 mod link;

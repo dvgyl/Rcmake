@@ -12,6 +12,7 @@ use super::super::{
     Bool, FileApi, Kind, Object, Value, array, cache_value, members, object, relative,
 };
 use super::{
+    ConfigIndices,
     backtraces::Backtraces,
     file_prefix, indices, installers, number, other_installers, relative_or_root,
     targets::{TargetIndexes, TargetRef},
@@ -39,6 +40,7 @@ impl<'a> InstallRules<'a> {
 }
 
 impl FileApi<'_, '_> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn directory_references(
         &mut self,
         config: &[u8],
@@ -47,6 +49,7 @@ impl FileApi<'_, '_> {
         directory_targets: &[TargetIndexes],
         rules_by_dir: &RulesByDir<'_>,
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
+        config_indices: &ConfigIndices<'_>,
     ) -> Result<Vec<Value>, GenError> {
         let mut has_install = vec![false; directories.len()];
         for (id, dir) in directories.iter().rev() {
@@ -54,11 +57,10 @@ impl FileApi<'_, '_> {
                 continue;
             };
             *has_rule |= rules_by_dir.contains_key(id)
-                || self
-                    .model
-                    .runtime_dependency_installs
-                    .iter()
-                    .any(|rule| rule.dir == *id);
+                || config_indices
+                    .project
+                    .runtime_installs_by_dir
+                    .contains_key(id);
             if *has_rule
                 && let Some(parent) = dir.parent.and_then(|id| has_install.get_mut(id.index()))
             {
@@ -73,8 +75,9 @@ impl FileApi<'_, '_> {
         {
             let source = relative_or_root(&dir.source_dir, self.source);
             let build = relative_or_root(&dir.binary_dir, self.build);
-            let directory_rules = rules_by_dir.get(id).map_or(&[][..], Vec::as_slice);
-            let directory = self.directory_object(*id, dir, config, directory_rules, targets)?;
+            let directory_rules = rules_by_dir.get(id).map(Vec::as_slice).unwrap_or_default();
+            let directory =
+                self.directory_object(*id, dir, config, directory_rules, targets, config_indices)?;
             let prefix = file_prefix("directory", &build, config);
             let file = self.writer.hashed(&prefix, &directory)?;
             let mut reference = members([
@@ -121,17 +124,21 @@ impl FileApi<'_, '_> {
         config: &[u8],
         rules: &[(usize, &InstallRule)],
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
+        config_indices: &ConfigIndices<'_>,
     ) -> Result<Value, GenError> {
         let mut graph = Backtraces::new(self.source);
         let rows = other_installers::Rows {
             api: self,
             config: ConfigId(config.into()),
         };
-        let mut named = self
-            .model
-            .runtime_dependency_installs
+        let mut named = config_indices
+            .project
+            .runtime_installs_by_dir
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
             .iter()
-            .filter(|rule| rule.dir == id)
+            .copied()
             .peekable();
         let mut installers = Vec::new();
         for &(index, rule) in rules {
@@ -157,17 +164,12 @@ impl FileApi<'_, '_> {
                     else {
                         continue;
                     };
-                    let projected = self
-                        .result
-                        .install
-                        .target_installers
+                    let projected = config_indices
+                        .installers_by_rule_target
+                        .get(&(index, *id))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
                         .iter()
-                        .filter(|installer| {
-                            installer.rule == index
-                                && installer.target == *id
-                                && installer.config.matches(config)
-                                && !installer.paths.is_empty()
-                        })
                         .map(|installer| installers::target(installer, reference, self.build));
                     other_installers::append(
                         &mut installers,

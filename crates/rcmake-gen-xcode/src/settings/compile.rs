@@ -11,11 +11,12 @@ impl TargetSettings<'_> {
             settings.insert("GCC_PREFIX_HEADER".into(), text(&pch.header).into());
             settings.insert("GCC_PRECOMPILE_PREFIX_HEADER".into(), "YES".into());
         }
-        let mut headers = Vec::new();
-        let mut sys_headers = Vec::new();
-        let mut frameworks = Vec::new();
-        let mut sys_frameworks = Vec::new();
-        let mut defines = vec![format!("CMAKE_INTDIR=\"{CONFIG_DIR}\"")];
+        let mut headers = UniqueList::default();
+        let mut sys_headers = UniqueList::default();
+        let mut frameworks = UniqueList::default();
+        let mut sys_frameworks = UniqueList::default();
+        let mut defines = UniqueList::default();
+        defines.push_unique(format!("CMAKE_INTDIR=\"{CONFIG_DIR}\""));
         if let Some(group) = ide.filter(|_| !self.per_language_flags).and_then(|ide| {
             ide.compile
                 .iter()
@@ -23,7 +24,7 @@ impl TargetSettings<'_> {
         }) {
             let implicit = implicit_includes(self.model, self.raw.dir, &group.language);
             for define in &group.defines {
-                unique(&mut defines, text(&define.value));
+                defines.push_unique(text(&define.value));
             }
             for include in &group.includes {
                 if is_implicit_include(&include.path, &implicit) {
@@ -35,13 +36,13 @@ impl TargetSettings<'_> {
                     (false, true) => &mut frameworks,
                     (true, true) => &mut sys_frameworks,
                 };
-                unique(paths, text(&include.path));
+                paths.push_unique(text(&include.path));
             }
         }
         // Collect Swift include paths directly from the Swift compile group even when
         // C-family languages use per-language flag settings (which have no Swift family).
-        let mut swift_headers = Vec::new();
-        let mut swift_sys_headers = Vec::new();
+        let mut swift_headers = UniqueList::default();
+        let mut swift_sys_headers = UniqueList::default();
         if let Some(swift_group) = self
             .target
             .and_then(|target| compile_group(target, b"Swift"))
@@ -60,7 +61,7 @@ impl TargetSettings<'_> {
                     (false, true) => &mut frameworks,
                     (true, true) => &mut sys_frameworks,
                 };
-                unique(paths, text(&include.path));
+                paths.push_unique(text(&include.path));
             }
         }
         let mut opt_level = None;
@@ -100,23 +101,24 @@ impl TargetSettings<'_> {
                 if let IdeLinkItem::File(path) | IdeLinkItem::Framework(path) = item
                     && let Some(parent) = framework_search_path(path)
                 {
-                    unique(&mut frameworks, parent);
+                    frameworks.push_unique(parent);
                 }
                 if let IdeLinkItem::Target(id) = item
                     && let Some(product) = self.linked_product(*id)
                     && matches!(product.bundle, BundleKind::Framework { .. })
                 {
-                    unique(&mut frameworks, product.dir);
+                    frameworks.push_unique(product.dir);
                 }
             }
         }
         for dir in self.phase_search_paths(true) {
-            unique(&mut frameworks, dir);
+            frameworks.push_unique(dir);
         }
         settings.insert(
             "GCC_PREPROCESSOR_DEFINITIONS".into(),
             inherited_values(
                 defines
+                    .into_vec()
                     .into_iter()
                     .map(|value| xcode_flag(&value))
                     .collect(),
@@ -137,16 +139,19 @@ impl TargetSettings<'_> {
             ("SYSTEM_FRAMEWORK_SEARCH_PATHS", sys_frameworks),
         ] {
             if !values.is_empty() {
-                settings.insert(key.into(), inherited_paths(values));
+                settings.insert(key.into(), inherited_paths(values.into_vec()));
             }
         }
         if has_swift && !swift_headers.is_empty() {
-            settings.insert("SWIFT_INCLUDE_PATHS".into(), inherited_paths(swift_headers));
+            settings.insert(
+                "SWIFT_INCLUDE_PATHS".into(),
+                inherited_paths(swift_headers.into_vec()),
+            );
         }
         if has_swift && !swift_sys_headers.is_empty() {
             settings.insert(
                 "SWIFT_SYSTEM_INCLUDE_PATHS".into(),
-                inherited_paths(swift_sys_headers),
+                inherited_paths(swift_sys_headers.into_vec()),
             );
         }
     }
