@@ -857,6 +857,7 @@ fn swift_ios_static_library_receives_sdk_and_target_triple() -> TestResult {
     let vars = &mut model.dir_mut(DirId::ROOT).vars;
     vars.insert("CMAKE_SYSTEM_NAME".into(), "iOS".into());
     vars.insert("APPLE".into(), "1".into());
+    vars.insert("CMAKE_OSX_ARCHITECTURES".into(), "arm64".into());
     vars.insert(
         "CMAKE_OSX_SYSROOT".into(),
         "/sdks/iPhoneSimulator.sdk".into(),

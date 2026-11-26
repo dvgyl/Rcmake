@@ -1283,14 +1283,20 @@ fn ninja_wrapper_script_is_not_reused_across_directories_via_build_tool_facts() 
      -> Result<(usize, Vec<PathBuf>, bool), Box<dyn std::error::Error>> {
         let host = new_host();
         seed_modules(&host, &[])?;
-        let ninja_path = Path::new("/bin/ninja");
+        let ninja_path_str = if cfg!(windows) {
+            "C:/bin/ninja"
+        } else {
+            "/bin/ninja"
+        };
+        let ninja_path = Path::new(ninja_path_str);
         host.seed_file(ninja_path, binary_bytes)?;
         if let Some((key, value)) = extra_env {
             host.env_set(key, Some(value));
         }
         host.seed_file(
             &Path::new(ROOT).join("CMakeNinjaFindMake.cmake"),
-            b"set(CMAKE_MAKE_PROGRAM /bin/ninja CACHE FILEPATH \"\")\n",
+            format!("set(CMAKE_MAKE_PROGRAM \"{ninja_path_str}\" CACHE FILEPATH \"\")\n")
+                .as_bytes(),
         )?;
         host.seed_file(
             Path::new("/work/src/CMakeLists.txt"),
@@ -1308,7 +1314,7 @@ fn ninja_wrapper_script_is_not_reused_across_directories_via_build_tool_facts() 
             let [cmd] = req.pipeline.as_slice() else {
                 return Err(HostError::unsupported("unexpected pipeline"));
             };
-            assert_eq!(cmd.program, "/bin/ninja");
+            assert_eq!(cmd.program, ninja_path_str);
             assert_eq!(cmd.args.as_slice(), [BString::from("--version")]);
             Ok(RunOutput {
                 stdout: b"1.12.1\n".to_vec(),
