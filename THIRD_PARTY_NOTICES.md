@@ -77,24 +77,23 @@ The table links to the licence and notice files included in each crate.
 | `getrandom` | `0.4.3` | `MIT OR Apache-2.0` | <https://github.com/rust-random/getrandom> | The Rand Project Developers | [`LICENSE-APACHE`](#crate-notice-27), [`LICENSE-MIT`](#crate-notice-28) |
 | `hashbrown` | `0.17.2` | `MIT OR Apache-2.0` | <https://github.com/rust-lang/hashbrown> | — | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-29) |
 | `indexmap` | `2.14.2` | `Apache-2.0 OR MIT` | <https://github.com/indexmap-rs/indexmap> | — | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-30) |
-| `itoa` | `1.0.19` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/itoa> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
-| `jiff` | `0.2.46` | `Unlicense OR MIT` | <https://github.com/BurntSushi/jiff> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-32), [`LICENSE-MIT`](#crate-notice-33), [`UNLICENSE`](#crate-notice-34) |
-| `jiff-core` | `0.1.8` | `Unlicense OR MIT` | <https://github.com/BurntSushi/jiff> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-32), [`LICENSE-MIT`](#crate-notice-33), [`UNLICENSE`](#crate-notice-34) |
-| `jiff-static` | `0.2.46` | `Unlicense OR MIT` | <https://github.com/BurntSushi/jiff> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-32), [`LICENSE-MIT`](#crate-notice-33), [`UNLICENSE`](#crate-notice-34) |
-| `jiff-tzdb` | `0.1.9` | `Unlicense OR MIT` | <https://github.com/BurntSushi/jiff> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-32), [`LICENSE-MIT`](#crate-notice-33), [`UNLICENSE`](#crate-notice-34) |
-| `jiff-tzdb-platform` | `0.1.3` | `Unlicense OR MIT` | <https://github.com/BurntSushi/jiff> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-32), [`LICENSE-MIT`](#crate-notice-33), [`UNLICENSE`](#crate-notice-34) |
+| `jiff` | `0.2.46` | `Unlicense OR MIT` | <https://github.com/BurntSushi/jiff> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-32), [`UNLICENSE`](#crate-notice-33) |
+| `jiff-core` | `0.1.8` | `Unlicense OR MIT` | <https://github.com/BurntSushi/jiff> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-32), [`UNLICENSE`](#crate-notice-33) |
+| `jiff-static` | `0.2.46` | `Unlicense OR MIT` | <https://github.com/BurntSushi/jiff> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-32), [`UNLICENSE`](#crate-notice-33) |
+| `jiff-tzdb` | `0.1.9` | `Unlicense OR MIT` | <https://github.com/BurntSushi/jiff> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-32), [`UNLICENSE`](#crate-notice-33) |
+| `jiff-tzdb-platform` | `0.1.3` | `Unlicense OR MIT` | <https://github.com/BurntSushi/jiff> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-32), [`UNLICENSE`](#crate-notice-33) |
 | `jobserver` | `0.1.35` | `MIT OR Apache-2.0` | <https://github.com/rust-lang/jobserver-rs> | Alex Crichton &lt;alex@alexcrichton.com&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
 | `js-sys` | `0.3.107` | `MIT OR Apache-2.0` | <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys> | The wasm-bindgen Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
-| `keccak` | `0.1.6` | `Apache-2.0 OR MIT` | <https://github.com/RustCrypto/sponges/tree/master/keccak> | RustCrypto Developers | [`LICENSE-APACHE`](#crate-notice-7), [`LICENSE-MIT`](#crate-notice-35) |
-| `libbz2-rs-sys` | `0.2.7` | `bzip2-1.0.6` | <https://github.com/trifectatechfoundation/libbzip2-rs> | — | [`LICENSE`](#crate-notice-36) |
-| `libc` | `0.2.191` | `MIT OR Apache-2.0` | <https://github.com/rust-lang/libc> | — | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-37) |
+| `keccak` | `0.1.6` | `Apache-2.0 OR MIT` | <https://github.com/RustCrypto/sponges/tree/master/keccak> | RustCrypto Developers | [`LICENSE-APACHE`](#crate-notice-7), [`LICENSE-MIT`](#crate-notice-34) |
+| `libbz2-rs-sys` | `0.2.7` | `bzip2-1.0.6` | <https://github.com/trifectatechfoundation/libbzip2-rs> | — | [`LICENSE`](#crate-notice-35) |
+| `libc` | `0.2.191` | `MIT OR Apache-2.0` | <https://github.com/rust-lang/libc> | — | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-37) |
 | `liblzma` | `0.4.9` | `MIT OR Apache-2.0` | <https://github.com/portable-network-archive/liblzma-rs> | Alex Crichton &lt;alex@alexcrichton.com&gt;, Portable-Network-Archive Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-38) |
 | `liblzma-sys` | `0.4.9` | `MIT OR Apache-2.0` | <https://github.com/portable-network-archive/liblzma-rs> | Alex Crichton &lt;alex@alexcrichton.com&gt;, Portable-Network-Archive Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-38) |
 | `linux-raw-sys` | `0.12.1` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | <https://github.com/sunfishcode/linux-raw-sys> | Dan Gohman &lt;dev@sunfishcode.online&gt; | [`COPYRIGHT`](#crate-notice-39), [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-Apache-2.0_WITH_LLVM-exception`](#crate-notice-40), [`LICENSE-MIT`](#crate-notice-3) |
 | `log` | `0.4.35` | `MIT OR Apache-2.0` | <https://github.com/rust-lang/log> | The Rust Project Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-6) |
 | `lzma-rust2` | `0.25.0` | `Apache-2.0` | <https://github.com/hasenbanck/lzma-rust2/> | — | [`LICENSE`](#crate-notice-41) |
 | `md-5` | `0.10.6` | `MIT OR Apache-2.0` | <https://github.com/RustCrypto/hashes> | RustCrypto Developers | [`LICENSE-APACHE`](#crate-notice-7), [`LICENSE-MIT`](#crate-notice-42) |
-| `memchr` | `2.8.3` | `Unlicense OR MIT` | <https://github.com/BurntSushi/memchr> | Andrew Gallant &lt;jamslam@gmail.com&gt;, bluss | [`COPYING`](#crate-notice-32), [`LICENSE-MIT`](#crate-notice-33), [`UNLICENSE`](#crate-notice-34) |
+| `memchr` | `2.8.3` | `Unlicense OR MIT` | <https://github.com/BurntSushi/memchr> | Andrew Gallant &lt;jamslam@gmail.com&gt;, bluss | [`COPYING`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-32), [`UNLICENSE`](#crate-notice-33) |
 | `miniz_oxide` | `0.9.1` | `MIT OR Zlib OR Apache-2.0` | <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide> | Frommi &lt;daniil.liferenko@gmail.com&gt;, oyvindln &lt;oyvindln@users.noreply.github.com&gt;, Rich Geldreich richgel99@gmail.com | [`LICENSE`](#crate-notice-43), [`LICENSE-APACHE.md`](#crate-notice-44), [`LICENSE-MIT.md`](#crate-notice-45), [`LICENSE-ZLIB.md`](#crate-notice-46) |
 | `nix` | `0.31.4` | `MIT` | <https://github.com/nix-rust/nix> | — | [`LICENSE`](#crate-notice-47) |
 | `once_cell` | `1.21.4` | `MIT OR Apache-2.0` | <https://github.com/matklad/once_cell> | Aleksey Kladov &lt;aleksey.kladov@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-3) |
@@ -103,16 +102,14 @@ The table links to the licence and notice files included in each crate.
 | `portable-atomic` | `1.15.0` | `Apache-2.0 OR MIT` | <https://github.com/taiki-e/portable-atomic> | — | [`LICENSE-APACHE`](#crate-notice-44), [`LICENSE-MIT`](#crate-notice-3) |
 | `portable-atomic-util` | `0.2.8` | `Apache-2.0 OR MIT` | <https://github.com/taiki-e/portable-atomic-util> | — | [`LICENSE-APACHE`](#crate-notice-44), [`LICENSE-MIT`](#crate-notice-3) |
 | `ppmd-turbo` | `0.2.2` | `Apache-2.0` | <https://github.com/scryer-media/ppmd-turbo> | NZB Man | [`LICENSE`](#crate-notice-41) |
-| `proc-macro2` | `1.0.107` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/proc-macro2> | David Tolnay &lt;dtolnay@gmail.com&gt;, Alex Crichton &lt;alex@alexcrichton.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
-| `process-wrap` | `10.0.2` | `Apache-2.0 OR MIT` | <https://github.com/watchexec/process-wrap> | Félix Saparelli &lt;felix@passcod.name&gt; | [`COPYRIGHT`](#crate-notice-48), [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
-| `quote` | `1.0.47` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/quote> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
+| `proc-macro2` | `1.0.107` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/proc-macro2> | David Tolnay &lt;dtolnay@gmail.com&gt;, Alex Crichton &lt;alex@alexcrichton.com&gt; | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3) |
+| `process-wrap` | `10.0.2` | `Apache-2.0 OR MIT` | <https://github.com/watchexec/process-wrap> | Félix Saparelli &lt;felix@passcod.name&gt; | [`COPYRIGHT`](#crate-notice-48), [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3) |
+| `quote` | `1.0.47` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/quote> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3) |
 | `r-efi` | `6.0.0` | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | <https://github.com/r-efi/r-efi> | — | [`AUTHORS`](#crate-notice-49) |
 | `rustix` | `1.1.6` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | <https://github.com/bytecodealliance/rustix> | Dan Gohman &lt;dev@sunfishcode.online&gt;, Jakub Konka &lt;kubkon@jakubkonka.com&gt; | [`COPYRIGHT`](#crate-notice-50), [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-Apache-2.0_WITH_LLVM-exception`](#crate-notice-40), [`LICENSE-MIT`](#crate-notice-3) |
-| `rustversion` | `1.0.23` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/rustversion> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
-| `serde` | `1.0.229` | `MIT OR Apache-2.0` | <https://github.com/serde-rs/serde> | Erick Tryzelaar &lt;erick.tryzelaar@gmail.com&gt;, David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
-| `serde_core` | `1.0.229` | `MIT OR Apache-2.0` | <https://github.com/serde-rs/serde> | Erick Tryzelaar &lt;erick.tryzelaar@gmail.com&gt;, David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
-| `serde_derive` | `1.0.229` | `MIT OR Apache-2.0` | <https://github.com/serde-rs/serde> | Erick Tryzelaar &lt;erick.tryzelaar@gmail.com&gt;, David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
-| `serde_json` | `1.0.154` | `MIT OR Apache-2.0` | <https://github.com/serde-rs/json> | — | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
+| `rustversion` | `1.0.23` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/rustversion> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3) |
+| `serde_core` | `1.0.229` | `MIT OR Apache-2.0` | <https://github.com/serde-rs/serde> | Erick Tryzelaar &lt;erick.tryzelaar@gmail.com&gt;, David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3) |
+| `serde_derive` | `1.0.229` | `MIT OR Apache-2.0` | <https://github.com/serde-rs/serde> | Erick Tryzelaar &lt;erick.tryzelaar@gmail.com&gt;, David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3) |
 | `sevenz-rust2` | `0.25.0` | `Apache-2.0` | <https://github.com/hasenbanck/sevenz-rust> | — | [`LICENSE`](#crate-notice-41) |
 | `sha1` | `0.10.7` | `MIT OR Apache-2.0` | <https://github.com/RustCrypto/hashes> | RustCrypto Developers | [`LICENSE-APACHE`](#crate-notice-7), [`LICENSE-MIT`](#crate-notice-42) |
 | `sha2` | `0.10.9` | `MIT OR Apache-2.0` | <https://github.com/RustCrypto/hashes> | RustCrypto Developers | [`LICENSE-APACHE`](#crate-notice-7), [`LICENSE-MIT`](#crate-notice-42) |
@@ -121,20 +118,20 @@ The table links to the licence and notice files included in each crate.
 | `shlex` | `2.0.1` | `MIT OR Apache-2.0` | <https://github.com/comex/rust-shlex> | comex &lt;comexk@gmail.com&gt;, Fenhl &lt;fenhl@fenhl.net&gt;, Adrian Taylor &lt;adetaylor@chromium.org&gt;, Alex Touchet &lt;alextouchet@outlook.com&gt;, Daniel Parks &lt;dp+git@oxidized.org&gt;, Garrett Berg &lt;googberg@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-53), [`LICENSE-MIT`](#crate-notice-54) |
 | `simd-adler32` | `0.3.10` | `MIT` | <https://github.com/mcountryman/simd-adler32> | Marvin Countryman &lt;me@maar.vin&gt; | [`LICENSE.md`](#crate-notice-55) |
 | `slab` | `0.4.12` | `MIT` | <https://github.com/tokio-rs/slab> | Carl Lerche &lt;me@carllerche.com&gt; | [`LICENSE`](#crate-notice-56) |
-| `syn` | `2.0.119` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/syn> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
-| `syn` | `3.0.10` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/syn> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
+| `syn` | `2.0.119` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/syn> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3) |
+| `syn` | `3.0.10` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/syn> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3) |
 | `tar` | `0.4.46` | `MIT OR Apache-2.0` | <https://github.com/composefs/tar-rs> | Alex Crichton &lt;alex@alexcrichton.com&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-57) |
 | `tempfile` | `3.27.0` | `MIT OR Apache-2.0` | <https://github.com/Stebalien/tempfile> | Steven Allen &lt;steven@stebalien.com&gt;, The Rust Project Developers, Ashley Mannix &lt;ashleymannix@live.com.au&gt;, Jason White &lt;me@jasonwhite.io&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-58) |
-| `thiserror` | `2.0.21` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/thiserror> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
-| `thiserror-impl` | `2.0.21` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/thiserror> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3) |
+| `thiserror` | `2.0.21` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/thiserror> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3) |
+| `thiserror-impl` | `2.0.21` | `MIT OR Apache-2.0` | <https://github.com/dtolnay/thiserror> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3) |
 | `typenum` | `1.20.1` | `MIT OR Apache-2.0` | <https://github.com/paholg/typenum> | — | [`LICENSE`](#crate-notice-59), [`LICENSE-APACHE`](#crate-notice-60), [`LICENSE-MIT`](#crate-notice-61) |
-| `unicode-ident` | `1.0.27` | `(MIT OR Apache-2.0) AND Unicode-3.0` | <https://github.com/dtolnay/unicode-ident> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-3), [`LICENSE-UNICODE`](#crate-notice-62) |
+| `unicode-ident` | `1.0.27` | `(MIT OR Apache-2.0) AND Unicode-3.0` | <https://github.com/dtolnay/unicode-ident> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-APACHE`](#crate-notice-36), [`LICENSE-MIT`](#crate-notice-3), [`LICENSE-UNICODE`](#crate-notice-62) |
 | `version_check` | `0.9.5` | `MIT OR Apache-2.0` | <https://github.com/SergioBenitez/version_check> | Sergio Benitez &lt;sb@sergio.bz&gt; | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-63) |
 | `wasm-bindgen` | `0.2.130` | `MIT OR Apache-2.0` | <https://github.com/wasm-bindgen/wasm-bindgen> | The wasm-bindgen Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
 | `wasm-bindgen-macro` | `0.2.130` | `MIT OR Apache-2.0` | <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro> | The wasm-bindgen Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
 | `wasm-bindgen-macro-support` | `0.2.130` | `MIT OR Apache-2.0` | <https://github.com/wasm-bindgen/wasm-bindgen/tree/main/crates/macro-support> | The wasm-bindgen Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
 | `wasm-bindgen-shared` | `0.2.130` | `MIT OR Apache-2.0` | <https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared> | The wasm-bindgen Developers | [`LICENSE-APACHE`](#crate-notice-4), [`LICENSE-MIT`](#crate-notice-13) |
-| `winapi-util` | `0.1.11` | `Unlicense OR MIT` | <https://github.com/BurntSushi/winapi-util> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-32), [`LICENSE-MIT`](#crate-notice-64), [`UNLICENSE`](#crate-notice-34) |
+| `winapi-util` | `0.1.11` | `Unlicense OR MIT` | <https://github.com/BurntSushi/winapi-util> | Andrew Gallant &lt;jamslam@gmail.com&gt; | [`COPYING`](#crate-notice-31), [`LICENSE-MIT`](#crate-notice-64), [`UNLICENSE`](#crate-notice-33) |
 | `windows` | `0.62.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
 | `windows-collections` | `0.3.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
 | `windows-core` | `0.62.2` | `MIT OR Apache-2.0` | <https://github.com/microsoft/windows-rs> | — | [`license-apache-2.0`](#crate-notice-65), [`license-mit`](#crate-notice-66) |
@@ -150,7 +147,6 @@ The table links to the licence and notice files included in each crate.
 | `winreg` | `0.56.0` | `MIT` | <https://github.com/gentoo90/winreg-rs> | Igor Shaula &lt;gentoo90@gmail.com&gt; | [`LICENSE`](#crate-notice-67) |
 | `zip` | `2.6.1` | `MIT` | <https://github.com/zip-rs/zip2.git> | Mathijs van de Nes &lt;git@mathijs.vd-nes.nl&gt;, Marli Frost &lt;marli@frost.red&gt;, Ryan Levick &lt;ryan.levick@gmail.com&gt;, Chris Hennick &lt;hennickc@amazon.com&gt; | [`LICENSE`](#crate-notice-68) |
 | `zlib-rs` | `0.6.8` | `Zlib` | <https://github.com/trifectatechfoundation/zlib-rs> | — | [`LICENSE`](#crate-notice-69) |
-| `zmij` | `1.0.23` | `MIT` | <https://github.com/dtolnay/zmij> | David Tolnay &lt;dtolnay@gmail.com&gt; | [`LICENSE-MIT`](#crate-notice-3) |
 | `zstd` | `0.14.4` | `BSD-3-Clause` | <https://github.com/gyscos/zstd-rs> | Alexandre Bury &lt;alexandre.bury@gmail.com&gt; | [`LICENSE`](#crate-notice-70) |
 | `zstd-safe` | `8.3.0` | `BSD-3-Clause` | <https://github.com/gyscos/zstd-rs> | Alexandre Bury &lt;alexandre.bury@gmail.com&gt; | [`LICENSE`](#crate-notice-70) |
 | `zstd-sys` | `2.1.3+zstd.1.5.7` | `BSD-3-Clause AND BSD-2-Clause` | <https://github.com/gyscos/zstd-rs> | Alexandre Bury &lt;alexandre.bury@gmail.com&gt; | [`LICENSE`](#crate-notice-70), [`LICENSE.BSD-2-Clause`](#crate-notice-71), [`LICENSE.BSD-3-Clause`](#crate-notice-72) |
@@ -2063,6 +2059,151 @@ DEALINGS IN THE SOFTWARE.
 #### Crate notice 31
 
 ```text
+This project is dual-licensed under the Unlicense and MIT licenses.
+
+You may use this code under the terms of either license.
+```
+
+#### Crate notice 32
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Andrew Gallant
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+#### Crate notice 33
+
+```text
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org/>
+```
+
+#### Crate notice 34
+
+```text
+Copyright (c) 2018-2022 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+#### Crate notice 35
+
+```text
+--------------------------------------------------------------------------
+
+The original program, "bzip2", the associated library "libbzip2", and all
+documentation, are
+
+Copyright (C) 1996-2021 Julian R Seward.
+Copyright (C) 2019-2020 Federico Mena Quintero
+Copyright (C) 2021 Micah Snyder
+
+This Rust translation, "libbzip2-rs" is a derived work based on "bzip2" and
+"libbzip2", and is Copyright (C) 2024-2025 Trifecta Tech Foundation and contributors
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+2. The origin of this software must not be misrepresented; you must
+   not claim that you wrote the original software.  If you use this
+   software in a product, an acknowledgment in the product
+   documentation would be appreciated but is not required.
+
+3. Altered source versions must be plainly marked as such, and must
+   not be misrepresented as being the original software.
+
+4. The name of the author may not be used to endorse or promote
+   products derived from this software without specific prior written
+   permission.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS
+OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Julian Seward, jseward@acm.org
+bzip2/libbzip2 version 1.1.0 of 6 September 2010
+
+--------------------------------------------------------------------------
+```
+
+#### Crate notice 36
+
+```text
                               Apache License
                         Version 2.0, January 2004
                      http://www.apache.org/licenses/
@@ -2239,151 +2380,6 @@ TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
    of your accepting any such warranty or additional liability.
 
 END OF TERMS AND CONDITIONS
-```
-
-#### Crate notice 32
-
-```text
-This project is dual-licensed under the Unlicense and MIT licenses.
-
-You may use this code under the terms of either license.
-```
-
-#### Crate notice 33
-
-```text
-The MIT License (MIT)
-
-Copyright (c) 2015 Andrew Gallant
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-```
-
-#### Crate notice 34
-
-```text
-This is free and unencumbered software released into the public domain.
-
-Anyone is free to copy, modify, publish, use, compile, sell, or
-distribute this software, either in source code form or as a compiled
-binary, for any purpose, commercial or non-commercial, and by any
-means.
-
-In jurisdictions that recognize copyright laws, the author or authors
-of this software dedicate any and all copyright interest in the
-software to the public domain. We make this dedication for the benefit
-of the public at large and to the detriment of our heirs and
-successors. We intend this dedication to be an overt act of
-relinquishment in perpetuity of all present and future rights to this
-software under copyright law.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
-OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
-ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
-OTHER DEALINGS IN THE SOFTWARE.
-
-For more information, please refer to <http://unlicense.org/>
-```
-
-#### Crate notice 35
-
-```text
-Copyright (c) 2018-2022 RustCrypto Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-```
-
-#### Crate notice 36
-
-```text
---------------------------------------------------------------------------
-
-The original program, "bzip2", the associated library "libbzip2", and all
-documentation, are
-
-Copyright (C) 1996-2021 Julian R Seward.
-Copyright (C) 2019-2020 Federico Mena Quintero
-Copyright (C) 2021 Micah Snyder
-
-This Rust translation, "libbzip2-rs" is a derived work based on "bzip2" and
-"libbzip2", and is Copyright (C) 2024-2025 Trifecta Tech Foundation and contributors
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions
-are met:
-
-1. Redistributions of source code must retain the above copyright
-   notice, this list of conditions and the following disclaimer.
-
-2. The origin of this software must not be misrepresented; you must
-   not claim that you wrote the original software.  If you use this
-   software in a product, an acknowledgment in the product
-   documentation would be appreciated but is not required.
-
-3. Altered source versions must be plainly marked as such, and must
-   not be misrepresented as being the original software.
-
-4. The name of the author may not be used to endorse or promote
-   products derived from this software without specific prior written
-   permission.
-
-THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS
-OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
-DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
-GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
-WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
-NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-Julian Seward, jseward@acm.org
-bzip2/libbzip2 version 1.1.0 of 6 September 2010
-
---------------------------------------------------------------------------
 ```
 
 #### Crate notice 37
