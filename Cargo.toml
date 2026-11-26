@@ -158,9 +158,6 @@ opt-level = "z"
 [profile.release.package.ppmd-turbo]
 opt-level = "z"
 
-[profile.release.package.rcmake-archive]
-opt-level = "s"
-
 [profile.release.package.rcmake-cpack]
 opt-level = "z"
 
@@ -169,9 +166,6 @@ opt-level = "s"
 
 [profile.release.package.rcmake-ctest]
 opt-level = "z"
-
-[profile.release.package.rcmake-fetch]
-opt-level = "s"
 
 [profile.release.package.rcmake-gen-vs]
 opt-level = "s"
@@ -188,32 +182,14 @@ opt-level = "z"
 [profile.release.package.rcmake-presets]
 opt-level = "s"
 
-[profile.release.package.rcmake-store]
-opt-level = "s"
-
 [profile.release.package.rcmake-tool-e]
 opt-level = "z"
 
 [profile.release.package.sevenz-rust2]
 opt-level = "z"
 
-[profile.release.package.tar]
-opt-level = "z"
-
 [profile.release.package.zip]
 opt-level = "z"
-
-[profile.release.package.zlib-rs]
-opt-level = "z"
-
-[profile.release.package.zstd-sys]
-opt-level = "z"
-
-[profile.release.package.rcmake-commands]
-opt-level = "s"
-
-[profile.release.package.rcmake-gen-common]
-opt-level = "s"
 
 [profile.size-probe]
 inherits = "release"
@@ -248,10 +224,4 @@ opt-level = "z"
 opt-level = "z"
 
 [profile.wasm-release.package.rcmake-presets]
-opt-level = "z"
-
-[profile.wasm-release.package.rcmake-commands]
-opt-level = "z"
-
-[profile.wasm-release.package.rcmake-gen-common]
 opt-level = "z"
