@@ -17,9 +17,10 @@ use super::try_compile::plan::{process_environment, process_environment_fingerpr
 /// `"ninja"` with ELF, Mach-O, or PE executable magic) rather than a shell or script
 /// wrapper.
 ///
-/// This certifies file format and canonical filename to exclude interpreted wrappers
-/// whose `--version` output may depend on working directory or external files; it does
-/// not inspect arbitrary compiled binaries that impersonate the same name and magic.
+/// Format screening keeps script wrappers off the probe-cache path. Soundness against
+/// compiled binaries is enforced by running `--version` live in the exact target working
+/// directory (`cwd`) and binding the binary digest and version in probe identity and
+/// preflight stamps rather than replaying caller-directory observations into child dirs.
 pub(super) fn is_native_ninja(host: &dyn Host, path: &Path) -> bool {
     if !path.file_stem().is_some_and(|name| name == "ninja") {
         return false;
@@ -47,7 +48,9 @@ pub(super) fn is_native_ninja(host: &dyn Host, path: &Path) -> bool {
 #[derive(Clone)]
 pub(super) struct VerifiedNinja {
     pub(super) program: PathBuf,
+    pub(super) digest: Digest,
     pub(super) env: Digest,
+    pub(super) cwd: PathBuf,
     pub(super) output: RunOutput,
     pub(super) version: BString,
 }
@@ -59,6 +62,7 @@ impl VerifiedNinja {
         };
         if path::to_native(&command.program) != self.program
             || command.args.as_slice() != [BString::from("--version")]
+            || request.cwd != self.cwd
             || request.stdin != Input::Null
             || request.stdout != Output::Capture
             || request.stderr != Output::Capture
@@ -76,10 +80,12 @@ impl VerifiedNinja {
     }
 }
 
+type NinjaKey = (PathBuf, Digest, Digest, PathBuf);
+
 #[derive(Default)]
 pub(super) struct BuildToolFacts {
-    ninja: Mutex<BTreeMap<(PathBuf, Digest, Digest), Option<bool>>>,
-    verified_ninja: Mutex<BTreeMap<(PathBuf, Digest, Digest), VerifiedNinja>>,
+    ninja: Mutex<BTreeMap<NinjaKey, Option<bool>>>,
+    verified_ninja: Mutex<BTreeMap<NinjaKey, VerifiedNinja>>,
 }
 
 impl BuildToolFacts {
@@ -88,26 +94,27 @@ impl BuildToolFacts {
         program: PathBuf,
         digest: Digest,
         env: Digest,
+        cwd: PathBuf,
         output: RunOutput,
         version: BString,
     ) -> VerifiedNinja {
         let entry = VerifiedNinja {
             program: program.clone(),
+            digest,
             env,
+            cwd: cwd.clone(),
             output,
             version,
         };
+        let key = (program, digest, env, cwd);
         let mut ninja = self.ninja.lock().unwrap_or_else(PoisonError::into_inner);
-        ninja.insert(
-            (program.clone(), digest, env),
-            Some(entry.supports_cxx_dyndep()),
-        );
+        ninja.insert(key.clone(), Some(entry.supports_cxx_dyndep()));
         drop(ninja);
         let mut verified = self
             .verified_ninja
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        verified.insert((program, digest, env), entry.clone());
+        verified.insert(key, entry.clone());
         entry
     }
 
@@ -116,12 +123,15 @@ impl BuildToolFacts {
         program: &Path,
         digest: Digest,
         env: Digest,
+        cwd: &Path,
     ) -> Option<VerifiedNinja> {
         let verified = self
             .verified_ninja
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        verified.get(&(program.to_path_buf(), digest, env)).cloned()
+        verified
+            .get(&(program.to_path_buf(), digest, env, cwd.to_path_buf()))
+            .cloned()
     }
 
     pub(super) fn sample_ninja(
@@ -141,7 +151,7 @@ impl BuildToolFacts {
         }
         process_environment(&mut env);
         let env_digest = process_environment_fingerprint(&env);
-        if let Some(found) = self.get_verified_ninja(program, digest, env_digest) {
+        if let Some(found) = self.get_verified_ninja(program, digest, env_digest, &cwd) {
             return Some(found);
         }
         let request = RunRequest {
@@ -149,7 +159,7 @@ impl BuildToolFacts {
                 program: path::from_native(program),
                 args: vec!["--version".into()],
             }],
-            cwd,
+            cwd: cwd.clone(),
             env,
             stdin: Input::Null,
             stdout: Output::Capture,
@@ -168,7 +178,14 @@ impl BuildToolFacts {
         if rcmake_store::file_digest(host, program).ok()? != digest {
             return None;
         }
-        Some(self.record_ninja(program.to_path_buf(), digest, env_digest, output, version))
+        Some(self.record_ninja(
+            program.to_path_buf(),
+            digest,
+            env_digest,
+            cwd,
+            output,
+            version,
+        ))
     }
 
     pub(super) fn ninja_cxx_dyndep(
@@ -179,12 +196,13 @@ impl BuildToolFacts {
         binary: Digest,
         environment: Digest,
     ) -> Option<bool> {
-        if let Some(verified) = self.get_verified_ninja(&program, binary, environment) {
+        if let Some(verified) = self.get_verified_ninja(&program, binary, environment, &request.cwd)
+        {
             return Some(verified.supports_cxx_dyndep());
         }
         let mut ninja = self.ninja.lock().unwrap_or_else(PoisonError::into_inner);
         *ninja
-            .entry((program, binary, environment))
+            .entry((program, binary, environment, request.cwd.clone()))
             .or_insert_with(|| query_ninja_cxx_dyndep(host, request))
     }
 }

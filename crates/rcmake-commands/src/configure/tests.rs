@@ -1317,7 +1317,9 @@ fn ninja_wrapper_script_is_not_reused_across_directories_via_build_tool_facts() 
             })
         })?;
         let facts = Arc::new(BuildToolFacts::default());
-        for build_dir in ["/work/build-a", "/work/build-b"] {
+        // Same working directory reuses cached verification; a different working directory
+        // must execute `--version` live in its own cwd rather than replaying caller-dir output.
+        for build_dir in ["/work/build-a", "/work/build-a", "/work/build-b"] {
             let mut session = interp(&host, Vec::new());
             session.add_session_data(facts.clone());
             session.cx().project().generator = Some(GeneratorKind::Ninja);
@@ -1331,7 +1333,7 @@ fn ninja_wrapper_script_is_not_reused_across_directories_via_build_tool_facts() 
                 ninja_path,
                 digest,
                 host.env_all(),
-                PathBuf::from("/work/build-c"),
+                PathBuf::from("/work/build-a"),
             )
             .is_some();
         let cwds = seen_cwds.lock().map_err(|_| "lock poisoned")?.clone();
@@ -1341,19 +1343,27 @@ fn ninja_wrapper_script_is_not_reused_across_directories_via_build_tool_facts() 
     // Shell wrapper must never be cached in BuildToolFacts: runs once per configure in its own cwd.
     let (wrapper_launches, wrapper_cwds, wrapper_sampled) =
         run_case(b"#!/bin/sh\necho 1.12.1\n", None)?;
-    assert_eq!(wrapper_launches, 2);
+    assert_eq!(wrapper_launches, 3);
     assert_eq!(
         wrapper_cwds,
         vec![
             PathBuf::from("/work/build-a"),
-            PathBuf::from("/work/build-b")
+            PathBuf::from("/work/build-a"),
+            PathBuf::from("/work/build-b"),
         ]
     );
     assert!(!wrapper_sampled);
 
-    // Native ELF binary under admitted env is cached and reused cleanly on the second configure.
-    let (native_launches, _, native_sampled) = run_case(b"\x7fELFninja-binary", None)?;
-    assert_eq!(native_launches, 1);
+    // Native ELF binary under admitted env reuses only within the same cwd (build-a once, build-b once).
+    let (native_launches, native_cwds, native_sampled) = run_case(b"\x7fELFninja-binary", None)?;
+    assert_eq!(native_launches, 2);
+    assert_eq!(
+        native_cwds,
+        vec![
+            PathBuf::from("/work/build-a"),
+            PathBuf::from("/work/build-b"),
+        ]
+    );
     assert!(native_sampled);
 
     // Native ELF binary under non-admitted env (LD_PRELOAD) must also stay off the cache path.
@@ -1361,7 +1371,7 @@ fn ninja_wrapper_script_is_not_reused_across_directories_via_build_tool_facts() 
         b"\x7fELFninja-binary",
         Some((b"LD_PRELOAD", b"/tmp/hook.so")),
     )?;
-    assert_eq!(preload_launches, 2);
+    assert_eq!(preload_launches, 3);
     assert!(!preload_sampled);
     Ok(())
 }

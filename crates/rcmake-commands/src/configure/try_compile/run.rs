@@ -21,6 +21,13 @@ pub(super) enum ChildError {
     Build(String),
 }
 
+struct ChildConfigPlan {
+    header_config: ConfigId,
+    resolve_configs: Vec<ConfigId>,
+    file_config: ConfigId,
+    build_configs: Vec<ConfigId>,
+}
+
 pub(super) fn build_child(
     child: &mut Cx<'_>,
     directory: &Path,
@@ -32,34 +39,53 @@ pub(super) fn build_child(
 ) -> Result<(BuildOutcome, Option<PathBuf>, BString), ChildError> {
     let resolve_start = profile.map(ProbeProfile::now);
     let mut model = child.project().clone();
-    let (header_config, build_configs) = match model.generator {
+    let plan = match model.generator {
         Some(GeneratorKind::NinjaMultiConfig) => {
             ninja_multi_config_selection(child, explicit_config)?
         }
         Some(generator) if generator.multi_config() => {
             let config = ConfigId(explicit_config.cloned().unwrap_or_else(|| "Debug".into()));
-            (config.clone(), vec![config])
+            ChildConfigPlan {
+                header_config: config.clone(),
+                resolve_configs: vec![config.clone()],
+                file_config: config.clone(),
+                build_configs: vec![config],
+            }
         }
         _ => {
             let config = ConfigId(child.var_or_empty(b"CMAKE_BUILD_TYPE"));
-            (config.clone(), vec![config])
+            ChildConfigPlan {
+                header_config: config.clone(),
+                resolve_configs: vec![config.clone()],
+                file_config: config.clone(),
+                build_configs: vec![config],
+            }
         }
     };
-    // Lowering reads toolchain variables from the directory model or cache.
+    // Lowering reads toolchain and multi-config variables from the directory model or cache.
     for name in child.variable_names() {
-        if toolchain_variable(&name) || name == "CMAKE_COMMAND" {
+        if toolchain_variable(&name)
+            || matches!(
+                name.as_slice(),
+                b"CMAKE_COMMAND"
+                    | b"CMAKE_CONFIGURATION_TYPES"
+                    | b"CMAKE_CROSS_CONFIGS"
+                    | b"CMAKE_DEFAULT_BUILD_TYPE"
+                    | b"CMAKE_DEFAULT_CONFIGS"
+            )
+        {
             let value = child.var_or_empty(&name);
             model.dir_mut(DirId::ROOT).props.set(name, value);
         }
     }
-    for config in &build_configs {
+    for config in &plan.resolve_configs {
         apple::resolve(child, &mut model, directory, config).map_err(ChildError::Generate)?;
     }
     let resolved = match generator_facts {
         Some(facts) => {
-            rcmake_resolve::resolve_with_facts(&model, child.host(), &build_configs, facts)
+            rcmake_resolve::resolve_with_facts(&model, child.host(), &plan.resolve_configs, facts)
         }
-        None => rcmake_resolve::resolve(&model, child.host(), &build_configs),
+        None => rcmake_resolve::resolve(&model, child.host(), &plan.resolve_configs),
     }
     .map_err(|error| ChildError::Generate(error.to_string()))?;
     if resolved.graphs.is_empty() {
@@ -67,8 +93,26 @@ pub(super) fn build_child(
             "The resolver returned no build graph.".into(),
         ));
     }
+    let mut graphs_to_run = Vec::with_capacity(plan.build_configs.len());
+    for target_cfg in &plan.build_configs {
+        let graph = if *target_cfg != plan.file_config {
+            resolved
+                .cross_graphs
+                .get(&(plan.file_config.clone(), target_cfg.clone()))
+                .or_else(|| resolved.graphs.iter().find(|g| g.config == *target_cfg))
+        } else {
+            resolved.graphs.iter().find(|g| g.config == *target_cfg)
+        };
+        let Some(graph) = graph else {
+            return Err(ChildError::Generate(format!(
+                "The resolver returned no build graph for configuration '{}'.",
+                target_cfg.0
+            )));
+        };
+        graphs_to_run.push(graph);
+    }
     let mut artifact = None;
-    for graph in &resolved.graphs {
+    for graph in &graphs_to_run {
         if artifact.is_none() {
             artifact = target
                 .and_then(|name| {
@@ -110,7 +154,13 @@ pub(super) fn build_child(
         verbose: source_signature,
         ..BuildOptions::default()
     };
-    let header = build_log_header(child, directory, &header_config, target, source_signature);
+    let header = build_log_header(
+        child,
+        directory,
+        &plan.header_config,
+        target,
+        source_signature,
+    );
     if let (Some(profile), Some(start)) = (profile, resolve_start) {
         profile.span(b"probe.resolve", start);
     }
@@ -121,7 +171,7 @@ pub(super) fn build_child(
         steps_run: 0,
         output: BString::default(),
     };
-    for graph in &resolved.graphs {
+    for graph in &graphs_to_run {
         let outcome = rcmake_build::execute(graph, child.host(), &options)
             .map_err(|error| ChildError::Build(error.to_string()))?;
         combined.steps_run += outcome.steps_run;
@@ -141,13 +191,14 @@ pub(super) fn build_child(
 /// Match CMake's `cmGlobalNinjaMultiGenerator::InspectConfigTypeVariables` and
 /// `rcmake-gen-ninja::multi::Selection::new` for child `try_compile` builds.
 ///
-/// Returns `(header_config, build_configs)` where `header_config` is empty for an
-/// implicit default build (matching `ninja` on `build.ninja` without `-f`) and
-/// `build_configs` lists the effective target configuration(s) to lower and build.
+/// Returns the child's header config (empty for an implicit default `build.ninja`),
+/// all child configurations to resolve (enabling cross-config graph lowering), the
+/// default file configuration (`COMMAND_CONFIG`), and the effective target
+/// configuration(s) to build (`OUTPUT_CONFIG`).
 fn ninja_multi_config_selection(
     child: &mut Cx<'_>,
     explicit_config: Option<&BString>,
-) -> Result<(ConfigId, Vec<ConfigId>), ChildError> {
+) -> Result<ChildConfigPlan, ChildError> {
     let raw_configs = list::split(
         &child.var_or_empty(b"CMAKE_CONFIGURATION_TYPES"),
         list::Empty::Drop,
@@ -174,6 +225,10 @@ fn ninja_multi_config_selection(
             "The configuration specified by CMAKE_DEFAULT_BUILD_TYPE ({default_name}) is not present in CMAKE_CONFIGURATION_TYPES"
         ))
     })?;
+    let file_config = configs
+        .get(default_idx)
+        .cloned()
+        .unwrap_or_else(|| first.clone());
     let sorted = |mut selection: Vec<usize>| {
         selection.sort_unstable_by_key(|&i| configs.get(i).map(|config| &config.0));
         selection
@@ -223,17 +278,34 @@ fn ninja_multi_config_selection(
         })?,
     );
     if let Some(explicit) = explicit_config {
+        if index(explicit).is_none() {
+            return Err(ChildError::Generate(format!(
+                "The configuration specified for the build ({explicit}) is not present in CMAKE_CONFIGURATION_TYPES"
+            )));
+        }
         let config = ConfigId(explicit.clone());
-        return Ok((config.clone(), vec![config]));
+        return Ok(ChildConfigPlan {
+            header_config: config.clone(),
+            resolve_configs: configs,
+            file_config: config.clone(),
+            build_configs: vec![config],
+        });
     }
     let selected: Vec<ConfigId> = defaults
         .into_iter()
         .filter_map(|idx| configs.get(idx).cloned())
         .collect();
-    if selected.is_empty() {
-        return Ok((ConfigId(BString::default()), vec![first.clone()]));
-    }
-    Ok((ConfigId(BString::default()), selected))
+    let build_configs = if selected.is_empty() {
+        vec![file_config.clone()]
+    } else {
+        selected
+    };
+    Ok(ChildConfigPlan {
+        header_config: ConfigId(BString::default()),
+        resolve_configs: configs,
+        file_config,
+        build_configs,
+    })
 }
 
 fn build_log_header(

@@ -154,6 +154,7 @@ impl PreparedProbe {
                 &name,
                 &self.runtime.cache.memo,
                 None,
+                directory,
             ) else {
                 continue;
             };
@@ -199,7 +200,7 @@ impl PreparedProbe {
 
 struct SpeculativeExecution {
     host: Arc<dyn Host>,
-    compiler: Arc<dyn ProcessVerifier>,
+    compiler: Arc<compiler::CompilerEvidence>,
     memo: Arc<rcmake_store::TraceMemo>,
     target: BString,
     child: ChildConfig,
@@ -221,22 +222,17 @@ impl SpeculativeExecution {
             budget.deadline.saturating_duration_since(speculative_now()),
             budget.shutdown.clone(),
         );
+        let compiler = Arc::new(
+            self.compiler
+                .reverify_ninja_in(scratch, &environment, self.facts.as_deref())
+                .ok_or_else(fail)?,
+        ) as Arc<dyn ProcessVerifier>;
         let journal = Arc::new(
-            JournalHost::from_shared(
-                self.host.clone(),
-                scratch,
-                self.compiler,
-                JournalMode::Speculate,
-            )?
-            .with_trace_memo(self.memo.clone())
-            .with_bound_inputs(self.bound)
-            .with_compile_intervals(self.intervals)
-            .with_speculation(
-                environment,
-                budget.cancel,
-                budget.shutdown,
-                budget.deadline,
-            ),
+            JournalHost::from_shared(self.host.clone(), scratch, compiler, JournalMode::Speculate)?
+                .with_trace_memo(self.memo.clone())
+                .with_bound_inputs(self.bound)
+                .with_compile_intervals(self.intervals)
+                .with_speculation(environment, budget.cancel, budget.shutdown, budget.deadline),
         );
         for (name, template) in &recipe.files {
             let file = path::to_native(name);

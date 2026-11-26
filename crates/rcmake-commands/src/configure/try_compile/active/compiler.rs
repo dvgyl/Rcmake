@@ -48,17 +48,23 @@ enum NinjaEvidence {
     NotRequired,
     /// `CMAKE_MAKE_PROGRAM` verified as a certified native Ninja >= 1.3 binary
     /// under an admitted environment, eligible for probe caching and replay.
-    Certified(VerifiedNinja),
+    Certified(Box<VerifiedNinja>),
     /// Uncertified (for example a script wrapper or non-admitted environment) or
     /// invalid Ninja: bypass probe cache lookup and speculation, falling back to
     /// live child execution.
     Uncertified,
 }
 
-/// Verify the active Ninja executable and return replayable evidence only when it is a
-/// certified native binary under an admitted environment. Uncertified wrappers decline
-/// probe-cache lookup and speculation so the child executes live in its own directory.
-fn ninja_snapshot(host: &dyn Host, cx: &mut Cx<'_>, memo: &TraceMemo) -> NinjaEvidence {
+/// Verify the active Ninja executable live in `probe_cwd` and return replayable evidence
+/// only when it is a native binary under an admitted environment. Uncertified wrappers or
+/// binaries that fail in `probe_cwd` decline probe-cache lookup and speculation so the
+/// child executes live in its own directory.
+fn ninja_snapshot(
+    host: &dyn Host,
+    cx: &mut Cx<'_>,
+    memo: &TraceMemo,
+    probe_cwd: &Path,
+) -> NinjaEvidence {
     if !matches!(
         cx.project().generator,
         Some(rcmake_model::GeneratorKind::Ninja | rcmake_model::GeneratorKind::NinjaMultiConfig)
@@ -82,12 +88,12 @@ fn ninja_snapshot(host: &dyn Host, cx: &mut Cx<'_>, memo: &TraceMemo) -> NinjaEv
         return NinjaEvidence::Uncertified;
     };
     let verified = if let Some(facts) = cx.session_data::<Arc<BuildToolFacts>>() {
-        facts.sample_ninja(host, &program, digest, env, cx.current_binary_dir())
+        facts.sample_ninja(host, &program, digest, env, probe_cwd.to_path_buf())
     } else {
-        BuildToolFacts::default().sample_ninja(host, &program, digest, env, cx.current_binary_dir())
+        BuildToolFacts::default().sample_ninja(host, &program, digest, env, probe_cwd.to_path_buf())
     };
     match verified {
-        Some(verified) => NinjaEvidence::Certified(verified),
+        Some(verified) => NinjaEvidence::Certified(Box::new(verified)),
         None => NinjaEvidence::Uncertified,
     }
 }
@@ -215,6 +221,7 @@ pub(super) struct SessionEvidence {
     searches: Arc<SearchMemo>,
 }
 
+#[derive(Clone)]
 pub(super) struct CompilerEvidence {
     host: Arc<dyn Host>,
     program: PathBuf,
@@ -236,6 +243,7 @@ impl CompilerEvidence {
         name: &[u8],
         memo: &Arc<TraceMemo>,
         external_source: Option<(PathBuf, Digest)>,
+        probe_cwd: &Path,
     ) -> Option<Self> {
         let cxx = flags::source_language(name)?;
         let language: &[u8] = if cxx { b"CXX" } else { b"C" };
@@ -306,9 +314,9 @@ impl CompilerEvidence {
             }
         }
         let platform = platform_snapshot(host.as_ref(), cx);
-        let ninja = match ninja_snapshot(host.as_ref(), cx, memo) {
+        let ninja = match ninja_snapshot(host.as_ref(), cx, memo, probe_cwd) {
             NinjaEvidence::NotRequired => None,
-            NinjaEvidence::Certified(verified) => Some(verified),
+            NinjaEvidence::Certified(verified) => Some(*verified),
             NinjaEvidence::Uncertified => return None,
         };
         Some(Self {
@@ -323,6 +331,49 @@ impl CompilerEvidence {
             platform,
             ninja,
         })
+    }
+
+    /// Re-verify Ninja live in `scratch` for a speculative worker and confirm its digest
+    /// and version match the recipe identity before replaying inside that directory.
+    pub(super) fn reverify_ninja_in(
+        &self,
+        scratch: &Path,
+        env: &[(BString, BString)],
+        facts: Option<&BuildToolFacts>,
+    ) -> Option<Self> {
+        let Some(expected) = &self.ninja else {
+            return Some(self.clone());
+        };
+        let digest = self
+            .memo
+            .file_digest(self.host.as_ref(), &expected.program)
+            .ok()?;
+        if digest != expected.digest {
+            return None;
+        }
+        let fresh = if let Some(facts) = facts {
+            facts.sample_ninja(
+                self.host.as_ref(),
+                &expected.program,
+                digest,
+                env.to_vec(),
+                scratch.to_path_buf(),
+            )?
+        } else {
+            BuildToolFacts::default().sample_ninja(
+                self.host.as_ref(),
+                &expected.program,
+                digest,
+                env.to_vec(),
+                scratch.to_path_buf(),
+            )?
+        };
+        if fresh.digest != expected.digest || fresh.version != expected.version {
+            return None;
+        }
+        let mut updated = self.clone();
+        updated.ninja = Some(fresh);
+        Some(updated)
     }
 
     pub(super) fn identity(&self) -> BTreeMap<BString, Digest> {
@@ -343,6 +394,10 @@ impl CompilerEvidence {
             .chain(self.toolchain.identities.iter().cloned())
             .collect();
         identity.insert("platform-queries".into(), self.platform.identity());
+        if let Some(ninja) = &self.ninja {
+            identity.insert(path::from_native(&ninja.program), ninja.digest);
+            identity.insert("ninja-version".into(), Digest::hash(&ninja.version));
+        }
         if let Some((file, digest)) = &self.external_source {
             identity.insert(path::from_native(file), *digest);
         }
@@ -602,6 +657,12 @@ impl ProcessVerifier for CompilerEvidence {
     fn preflight(&self, request: &RunRequest) -> Option<Trace> {
         let mut tools = self.toolchain.tools.clone();
         tools.extend(self.platform.stamps());
+        if let Some(ninja) = &self.ninja {
+            tools.push(InputStamp::FileHash {
+                path: ninja.program.clone(),
+                digest: ninja.digest,
+            });
+        }
         if let Some((path, digest)) = &self.external_source {
             tools.push(InputStamp::FileHash {
                 path: path.clone(),

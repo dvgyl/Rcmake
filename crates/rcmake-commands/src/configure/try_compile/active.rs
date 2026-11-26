@@ -266,6 +266,7 @@ impl PreparedProbe {
             &name,
             &runtime.cache.memo,
             external.then(|| (file, Digest::hash(&contents))),
+            &dirs.binary,
         )?;
         let cmake_root = path::to_native(&cx.var_or_empty(b"CMAKE_ROOT"));
 

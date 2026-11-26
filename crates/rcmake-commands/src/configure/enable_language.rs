@@ -481,6 +481,7 @@ impl Bootstrap {
         if !cx.host().supports_process_execution() {
             return Ok(());
         }
+        let cwd = cx.current_binary_dir();
         let raw_env = cx.host().env_all();
         #[cfg(all(feature = "native", any(unix, windows)))]
         let (request_env, cached_key) = {
@@ -506,7 +507,7 @@ impl Bootstrap {
                 let env_digest =
                     super::try_compile::plan::process_environment_fingerprint(&normalized);
                 if facts
-                    .get_verified_ninja(&native, digest, env_digest)
+                    .get_verified_ninja(&native, digest, env_digest, &cwd)
                     .is_some()
                 {
                     return Ok(());
@@ -523,7 +524,7 @@ impl Bootstrap {
                 program: program.clone(),
                 args: vec!["--version".into()],
             }],
-            cwd: cx.current_binary_dir(),
+            cwd: cwd.clone(),
             env: request_env,
             stdin: rcmake_host::Input::Null,
             stdout: rcmake_host::Output::Capture,
@@ -539,7 +540,7 @@ impl Bootstrap {
                     if let Some((facts, native, digest, env_digest)) = cached_key
                         && rcmake_store::file_digest(cx.host(), &native).ok() == Some(digest)
                     {
-                        facts.record_ninja(native, digest, env_digest, output, version);
+                        facts.record_ninja(native, digest, env_digest, cwd, output, version);
                     }
                     #[cfg(not(all(feature = "native", any(unix, windows))))]
                     let _ = version;

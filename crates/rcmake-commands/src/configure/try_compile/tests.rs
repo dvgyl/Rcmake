@@ -866,6 +866,190 @@ fn multi_config_try_compile_honors_caller_config_and_xcode_debug_default() -> Te
             "{child_default_all:?}"
         );
 
+        // Child with CMAKE_DEFAULT_BUILD_TYPE=Debug, CMAKE_CROSS_CONFIGS=all, and
+        // CMAKE_DEFAULT_CONFIGS=Release executes the (Debug, Release) cross graph so a custom
+        // command evaluates $<COMMAND_CONFIG:...> in Debug and $<OUTPUT_CONFIG:...> in Release.
+        {
+            let host = Arc::new(PureHost::default());
+            let seen_cmds = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen_clone = seen_cmds.clone();
+            host.seed_file(Path::new(&format!("{DRIVE}/work/probe-cc")), b"")?;
+            host.seed_file(Path::new(&format!("{DRIVE}/work/gen-tool")), b"")?;
+            host.seed_file(
+                Path::new(&format!("{DRIVE}/work/child/CMakeLists.txt")),
+                format!(
+                    "cmake_minimum_required(VERSION 4.5)\n\
+                     set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
+                     set(CMAKE_DEFAULT_BUILD_TYPE \"Debug\")\n\
+                     set(CMAKE_CROSS_CONFIGS \"all\")\n\
+                     set(CMAKE_DEFAULT_CONFIGS \"Release\")\n\
+                     set(CMAKE_C_FLAGS_DEBUG \"-DFROM_DEBUG\")\n\
+                     set(CMAKE_C_FLAGS_RELEASE \"-DFROM_RELEASE\")\n\
+                     project(Child C)\n\
+                     add_custom_command(\n\
+                       OUTPUT \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen.c\"\n\
+                       COMMAND \"{DRIVE}/work/gen-tool\" \"--cmd=$<COMMAND_CONFIG:$<CONFIG>>\" \"--out=$<OUTPUT_CONFIG:$<CONFIG>>\" \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen.c\"\n\
+                     )\n\
+                     add_executable(app \"${{CMAKE_CURRENT_BINARY_DIR}}/$<CONFIG>/gen.c\")\n"
+                )
+                .as_bytes(),
+            )?;
+            host.set_command_handler(move |fs, req, _| {
+                if let Some(cmd) = req.pipeline.first() {
+                    let rendered = format!(
+                        "{} {}",
+                        cmd.program,
+                        cmd.args
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    if let Ok(mut guard) = seen_clone.lock() {
+                        guard.push(rendered);
+                    }
+                    if cmd.program.to_string().ends_with("gen-tool")
+                        && let Some(out) = cmd.args.last()
+                    {
+                        let target = req.cwd.join(rcmake_host::path::to_native(out));
+                        if let Some(parent) = target.parent() {
+                            let _ = fs.create_dir_all(parent);
+                        }
+                        let _ = fs.write(
+                            &target,
+                            b"int main(void) { return 0; }\n",
+                            WriteMode::Truncate,
+                        );
+                    }
+                    if let Some(pos) = cmd.args.iter().position(|a| a == "-o")
+                        && let Some(out) = cmd.args.get(pos + 1)
+                    {
+                        let target = req.cwd.join(rcmake_host::path::to_native(out));
+                        if let Some(parent) = target.parent() {
+                            let _ = fs.create_dir_all(parent);
+                        }
+                        let _ = fs.write(&target, b"artifact", WriteMode::Truncate);
+                    }
+                    if cmd.args.as_slice() == [rcmake_base::BString::from("--version")] {
+                        return Ok(RunOutput {
+                            stdout: b"1.12.1\n".to_vec(),
+                            results: vec![ProcessResult::Exited(0)],
+                            ..RunOutput::default()
+                        });
+                    }
+                }
+                Ok(RunOutput {
+                    results: vec![ProcessResult::Exited(0)],
+                    ..RunOutput::default()
+                })
+            })?;
+            let root = PathBuf::from(format!("{DRIVE}/work"));
+            host.seed_file(
+                &root.join("CMakeLists.txt"),
+                format!(
+                    "cmake_minimum_required(VERSION 4.5)\n\
+                     set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
+                     set(CMAKE_MAKE_PROGRAM \"{DRIVE}/work/ninja\")\n\
+                     set(CMAKE_C_COMPILER \"{DRIVE}/work/probe-cc\")\n\
+                     set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\n\
+                     set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> -c <SOURCE> -o <OBJECT> <FLAGS>\")\n\
+                     set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> <OBJECTS> -o <TARGET>\")\n\
+                     try_compile(OK PROJECT Child SOURCE_DIR \"{DRIVE}/work/child\" BINARY_DIR \"{DRIVE}/work/child-build\" TARGET app NO_LOG)\n\
+                     if(NOT OK)\n  message(FATAL_ERROR \"cross-config probe failed\")\nendif()\n"
+                )
+                .as_bytes(),
+            )?;
+            let mut interp = interpreter(host.clone(), &root)?;
+            interp.cx().project().generator = Some(GeneratorKind::NinjaMultiConfig);
+            let outcome = interp.run_configure(&root, &root.join("build"), &[]);
+            assert_eq!(
+                outcome.exit_code,
+                0,
+                "{}",
+                host.stream_bytes(Stream::Stderr)
+            );
+            let cmds = seen_cmds.lock().map_err(|_| "lock poisoned")?.clone();
+            assert!(
+                cmds.iter().any(|c| c.contains("gen-tool")
+                    && c.contains("--cmd=Debug")
+                    && c.contains("--out=Release")),
+                "expected cross-config custom command with COMMAND_CONFIG=Debug and OUTPUT_CONFIG=Release, got {cmds:?}"
+            );
+            assert!(
+                cmds.iter().any(|c| c.contains("-DFROM_RELEASE")),
+                "{cmds:?}"
+            );
+            assert!(!cmds.iter().any(|c| c.contains("-DFROM_DEBUG")), "{cmds:?}");
+        }
+
+        // Explicit CMAKE_TRY_COMPILE_CONFIGURATION absent from child CMAKE_CONFIGURATION_TYPES
+        // fails membership validation instead of lowering an unconfigured build file.
+        {
+            let host = Arc::new(PureHost::default());
+            host.seed_file(Path::new(&format!("{DRIVE}/work/probe-cc")), b"")?;
+            host.seed_file(
+                Path::new(&format!("{DRIVE}/work/child/main.c")),
+                b"int main(void) { return 0; }\n",
+            )?;
+            host.seed_file(
+                Path::new(&format!("{DRIVE}/work/child/CMakeLists.txt")),
+                b"cmake_minimum_required(VERSION 4.5)\n\
+                  set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
+                  project(Child C)\n\
+                  add_executable(app main.c)\n",
+            )?;
+            host.set_command_handler(move |_, req, _| {
+                if let Some(cmd) = req.pipeline.first()
+                    && cmd.args.as_slice() == [rcmake_base::BString::from("--version")]
+                {
+                    return Ok(RunOutput {
+                        stdout: b"1.12.1\n".to_vec(),
+                        results: vec![ProcessResult::Exited(0)],
+                        ..RunOutput::default()
+                    });
+                }
+                Ok(RunOutput {
+                    results: vec![ProcessResult::Exited(0)],
+                    ..RunOutput::default()
+                })
+            })?;
+            let root = PathBuf::from(format!("{DRIVE}/work"));
+            host.seed_file(
+                &root.join("CMakeLists.txt"),
+                format!(
+                    "cmake_minimum_required(VERSION 4.5)\n\
+                     set(CMAKE_CONFIGURATION_TYPES \"Debug;Release\")\n\
+                     set(CMAKE_TRY_COMPILE_CONFIGURATION \"NonExistent\")\n\
+                     set(CMAKE_MAKE_PROGRAM \"{DRIVE}/work/ninja\")\n\
+                     set(CMAKE_C_COMPILER \"{DRIVE}/work/probe-cc\")\n\
+                     set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\n\
+                     set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> -c <SOURCE> -o <OBJECT> <FLAGS>\")\n\
+                     set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> <OBJECTS> -o <TARGET>\")\n\
+                     try_compile(OK PROJECT Child SOURCE_DIR \"{DRIVE}/work/child\" BINARY_DIR \"{DRIVE}/work/child-build\" TARGET app OUTPUT_VARIABLE LOG NO_LOG)\n"
+                )
+                .as_bytes(),
+            )?;
+            let mut interp = interpreter(host.clone(), &root)?;
+            interp.cx().project().generator = Some(GeneratorKind::NinjaMultiConfig);
+            let outcome = interp.run_configure(&root, &root.join("build"), &[]);
+            assert_eq!(
+                outcome.exit_code,
+                1,
+                "{}",
+                host.stream_bytes(Stream::Stderr)
+            );
+            assert_eq!(interp.cx().var_or_empty(b"OK"), "FALSE");
+            assert!(
+                interp
+                    .cx()
+                    .var_or_empty(b"LOG")
+                    .to_string()
+                    .contains("not present in CMAKE_CONFIGURATION_TYPES"),
+                "{}",
+                interp.cx().var_or_empty(b"LOG")
+            );
+        }
+
         // Child whose CMAKE_DEFAULT_BUILD_TYPE is absent from CMAKE_CONFIGURATION_TYPES fails
         // membership validation instead of lowering an absent configuration.
         {
@@ -1058,13 +1242,14 @@ fn ninja_verified_query_keeps_observe_and_speculate_probes_pure() -> TestResult 
         b"set(CMAKE_SYSTEM_LOADED 1)\n",
     )?;
     let ninja_str = rcmake_host::path::from_native(&ninja_path);
+    let ninja_for_handler = ninja_str.clone();
     let launches_clone = launches.clone();
     host.set_command_handler(move |_, req, _| {
         launches_clone.fetch_add(1, Ordering::Relaxed);
         let [cmd] = req.pipeline.as_slice() else {
             return Err(HostError::unsupported("unexpected pipeline"));
         };
-        if cmd.program == ninja_str
+        if cmd.program == ninja_for_handler
             && cmd.args.as_slice() == [rcmake_base::BString::from("--version")]
         {
             return Ok(RunOutput {
@@ -1078,7 +1263,8 @@ fn ninja_verified_query_keeps_observe_and_speculate_probes_pure() -> TestResult 
 
     let facts = BuildToolFacts::default();
     let digest = file_digest(host.as_ref(), &ninja_path)?;
-    let verified = facts
+    // A caller-dir observation must NOT match a child scratch directory.
+    let caller_verified = facts
         .sample_ninja(
             host.as_ref(),
             &ninja_path,
@@ -1086,7 +1272,7 @@ fn ninja_verified_query_keeps_observe_and_speculate_probes_pure() -> TestResult 
             host.env_all(),
             root.clone(),
         )
-        .ok_or("expected verified ninja")?;
+        .ok_or("expected caller verified ninja")?;
     assert_eq!(launches.load(Ordering::Relaxed), 1);
 
     struct NinjaVerifier {
@@ -1113,13 +1299,39 @@ fn ninja_verified_query_keeps_observe_and_speculate_probes_pure() -> TestResult 
         }
     }
 
-    let verifier = Arc::new(NinjaVerifier {
-        ninja: verified,
-        hits: AtomicUsize::new(0),
-    });
+    let mut total_hits = 0usize;
     for mode in [JournalMode::Observe, JournalMode::Speculate] {
         let scratch = root.join(format!("scratch-{mode:?}"));
         host.create_dir_all(&scratch)?;
+        assert!(
+            !caller_verified.matches(&RunRequest {
+                pipeline: vec![rcmake_host::CommandSpec {
+                    program: ninja_str.clone(),
+                    args: vec!["--version".into()],
+                }],
+                cwd: scratch.clone(),
+                env: host.env_all(),
+                stdin: rcmake_host::Input::Null,
+                stdout: rcmake_host::Output::Capture,
+                stderr: rcmake_host::Output::Capture,
+                timeout: Some(std::time::Duration::from_secs(5)),
+                tee: false,
+            }),
+            "caller-dir VerifiedNinja must not replay into a different scratch directory"
+        );
+        let verified = facts
+            .sample_ninja(
+                host.as_ref(),
+                &ninja_path,
+                digest,
+                host.env_all(),
+                scratch.clone(),
+            )
+            .ok_or("expected scratch verified ninja")?;
+        let verifier = Arc::new(NinjaVerifier {
+            ninja: verified,
+            hits: AtomicUsize::new(0),
+        });
         let journal = Arc::new(JournalHost::from_shared(
             host.clone(),
             &scratch,
@@ -1162,16 +1374,16 @@ fn ninja_verified_query_keeps_observe_and_speculate_probes_pure() -> TestResult 
             .map_err(|_| HostError::unsupported("journal still held"))?
             .finish();
         assert_eq!(finished.impure(), None, "mode={mode:?} marked impure");
+        total_hits += verifier.hits.load(Ordering::Relaxed);
     }
     assert_eq!(
-        verifier.hits.load(Ordering::Relaxed),
-        2,
-        "both Observe and Speculate probes must replay Ninja version via recorded_platform_query"
+        total_hits, 2,
+        "both Observe and Speculate probes must replay their scratch-live Ninja observation via recorded_platform_query"
     );
     assert_eq!(
         launches.load(Ordering::Relaxed),
-        1,
-        "child probes must reuse verified Ninja evidence without extra spawns"
+        3,
+        "one live verification per distinct directory (caller + Observe scratch + Speculate scratch)"
     );
     Ok(())
 }

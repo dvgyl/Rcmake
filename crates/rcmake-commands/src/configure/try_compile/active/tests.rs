@@ -533,7 +533,7 @@ fn uncertified_ninja_wrapper_bypasses_warm_probe_cache_while_native_ninja_hits()
         Ok((outcome.exit_code, interp.cx().var_or_empty(b"OK")))
     };
 
-    // 1. Cold run with certified native Ninja publishes a warm probe cache entry.
+    // 1. Cold run with native ELF Ninja v1 publishes a warm probe cache entry.
     assert_eq!(
         run_ninja_configure("/work/cold")?,
         (0, BString::from("TRUE"))
@@ -541,31 +541,56 @@ fn uncertified_ninja_wrapper_bypasses_warm_probe_cache_while_native_ninja_hits()
     let after_cold = compiler_runs.load(Ordering::Relaxed);
     assert_eq!(after_cold, 2);
 
-    // 2. A different supported native Ninja binary (no scan rule) hits the warm cache.
-    inner.seed_file(ninja_path, b"\x7fELF-ninja-v2-different-digest")?;
+    // 2. Same native ELF Ninja v1 binary hits the warm cache (zero compiler calls) after
+    //    verifying `--version` live in the child scratch directory.
     assert_eq!(
-        run_ninja_configure("/work/warm-native")?,
+        run_ninja_configure("/work/warm-same-native")?,
         (0, BString::from("TRUE"))
     );
     assert_eq!(compiler_runs.load(Ordering::Relaxed), after_cold);
 
-    // 3. Replacing Ninja with an uncertified shell wrapper MUST bypass warm cache lookup
+    // 3. Replacing Ninja with a DIFFERENT native ELF binary (such as a compiled wrapper) MUST
+    //    invalidate warm probe reuse because the Ninja digest is bound in probe identity.
+    inner.seed_file(ninja_path, b"\x7fELF-compiled-wrapper-v2")?;
+    assert_eq!(
+        run_ninja_configure("/work/warm-compiled-wrapper-ok")?,
+        (0, BString::from("TRUE"))
+    );
+    let after_compiled_ok = compiler_runs.load(Ordering::Relaxed);
+    assert_eq!(after_compiled_ok, after_cold + 2);
+
+    // 4. A compiled ELF wrapper that accepts caller cwd but rejects child CMakeScratch cwd
+    //    MUST fail live in the child directory and must NOT return a stale cached TRUE.
+    reject_child_ninja.store(true, Ordering::Relaxed);
+    assert_eq!(
+        run_ninja_configure("/work/warm-compiled-wrapper-reject")?,
+        (1, BString::from("FALSE"))
+    );
+    assert!(rejected_child_runs.load(Ordering::Relaxed) >= 1);
+    assert_eq!(compiler_runs.load(Ordering::Relaxed), after_compiled_ok);
+
+    // 5. Replacing Ninja with an uncertified shell script wrapper MUST bypass warm cache lookup
     //    and execute the child live in its own working directory.
+    reject_child_ninja.store(false, Ordering::Relaxed);
     inner.seed_file(ninja_path, b"#!/bin/sh\necho 1.12.1\n")?;
     assert_eq!(
         run_ninja_configure("/work/warm-wrapper-ok")?,
         (0, BString::from("TRUE"))
     );
     let after_wrapper = compiler_runs.load(Ordering::Relaxed);
-    assert_eq!(after_wrapper, after_cold + 2);
+    assert_eq!(after_wrapper, after_compiled_ok + 2);
 
-    // 4. A wrapper that accepts caller cwd but rejects child cwd must NOT return stale TRUE.
+    // 6. A shell wrapper that accepts caller cwd but rejects child cwd must NOT return stale TRUE.
+    let rejected_before_shell = rejected_child_runs.load(Ordering::Relaxed);
     reject_child_ninja.store(true, Ordering::Relaxed);
     assert_eq!(
         run_ninja_configure("/work/warm-wrapper-reject")?,
         (1, BString::from("FALSE"))
     );
-    assert_eq!(rejected_child_runs.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        rejected_child_runs.load(Ordering::Relaxed),
+        rejected_before_shell + 1
+    );
     assert_eq!(compiler_runs.load(Ordering::Relaxed), after_wrapper);
     Ok(())
 }
