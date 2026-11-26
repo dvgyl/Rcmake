@@ -7,6 +7,7 @@ mod cache;
 mod configure;
 #[cfg(test)]
 mod ctest;
+mod debugger;
 mod exec_log;
 mod explain_cmd;
 mod find_package;
@@ -406,6 +407,11 @@ fn run_script(argv: &[BString], opts: &mut Options, script: &Path, host: Arc<dyn
         false,
     );
     *interp.cx().diag_state_mut() = state;
+    let active_debugger = match debugger::start_if_enabled(Arc::clone(&host), opts) {
+        Ok(session) => session,
+        Err(code) => return code,
+    };
+    debugger::attach(active_debugger.as_ref(), &mut interp);
     let start = host.now();
     let outcome = interp.run_script(script);
     if let Some((profiler, path)) = profiler.as_ref().zip(opts.profile_output.as_deref())
@@ -415,6 +421,7 @@ fn run_script(argv: &[BString], opts: &mut Options, script: &Path, host: Arc<dyn
             host.as_ref(),
             format!("Could not write profiling output: {error}"),
         );
+        debugger::finish(active_debugger, 1);
         return 1;
     }
     if let Some(output) = opts.sarif.as_deref() {
@@ -428,9 +435,11 @@ fn run_script(argv: &[BString], opts: &mut Options, script: &Path, host: Arc<dyn
             directories: Some((&cwd, &cwd)),
         };
         if !sarif::write(host.as_ref(), output, &interp, Vec::new(), invocation) {
+            debugger::finish(active_debugger, 1);
             return 1;
         }
     }
+    debugger::finish(active_debugger, outcome.exit_code);
     outcome.exit_code
 }
 
@@ -626,7 +635,10 @@ fn build_capabilities_json() -> Value {
     version.insert(BString::from("suffix"), Value::string(""));
 
     let mut root = BTreeMap::new();
-    root.insert(BString::from("debugger"), Value::Bool(false));
+    root.insert(
+        BString::from("debugger"),
+        Value::Bool(debugger::capabilities_supported()),
+    );
     let requests = [
         ("codemodel", 2, 12),
         ("configureLog", 1, 0),

@@ -132,11 +132,21 @@ fn configure_project(
 ) -> Result<(), Exit> {
     let start = host.monotonic();
     let (mut session, mut saved) = ConfigureSession::resolve(argv, opts, host)?;
+    let mut active_debugger: Option<crate::debugger::Session> = None;
     for attempt in 0..=1 {
         let selection = restart::selection(&saved);
         let (mut runtime, mut interp, has_cache) =
-            session.initialize(saved, cmake_command.clone(), cmake_root.clone())?;
+            match session.initialize(saved, cmake_command.clone(), cmake_root.clone()) {
+                Ok(initialized) => initialized,
+                Err(exit) => {
+                    crate::debugger::finish(active_debugger, 1);
+                    return Err(exit);
+                }
+            };
         interp.add_session_data(Arc::clone(&selection));
+        if active_debugger.is_some() {
+            crate::debugger::attach(active_debugger.as_ref(), &mut interp);
+        }
         let configure_start = session.host.monotonic();
         let time = session.host.now();
         let mut preloads = session.apply_cache_edits(&runtime, &mut interp);
@@ -160,6 +170,14 @@ fn configure_project(
             if preloads.missing {
                 return Err(Exit::Code(1));
             }
+            if active_debugger.is_none() {
+                active_debugger =
+                    crate::debugger::start_if_enabled(Arc::clone(&session.host), &session.opts)
+                        .map_err(Exit::Code)?;
+                if active_debugger.is_some() {
+                    crate::debugger::attach(active_debugger.as_ref(), &mut interp);
+                }
+            }
             let configured = session.configure(
                 &mut runtime,
                 &mut interp,
@@ -174,11 +192,18 @@ fn configure_project(
         if !changes.is_empty() && !runtime.denied() {
             let _ = runtime.finish(false);
             if attempt != 0 {
+                crate::debugger::finish(active_debugger, 1);
                 return Err(Exit::Message(
                     "The platform selection changed again during configure.".into(),
                 ));
             }
-            saved = restart::reset(&session, &mut interp, changes)?;
+            saved = match restart::reset(&session, &mut interp, changes) {
+                Ok(saved) => saved,
+                Err(exit) => {
+                    crate::debugger::finish(active_debugger, 1);
+                    return Err(exit);
+                }
+            };
             continue;
         }
         let finish = runtime.finish(outcome.is_ok() && !session.opts.view);
@@ -200,9 +225,18 @@ fn configure_project(
             Err(Exit::Message(_)) => 1,
         };
         let profile = session.profiling.write(session.host.as_ref(), start);
-        session.write_sarif(&mut interp, results, time, code)?;
-        profile?;
-        return outcome;
+        let sarif = session.write_sarif(&mut interp, results, time, code);
+        let final_outcome = match (sarif, profile) {
+            (Err(err), _) | (_, Err(err)) => Err(err),
+            (Ok(()), Ok(())) => outcome,
+        };
+        let final_code = match &final_outcome {
+            Ok(()) => 0,
+            Err(Exit::Code(code)) => *code,
+            Err(Exit::Message(_)) => 1,
+        };
+        crate::debugger::finish(active_debugger, final_code);
+        return final_outcome;
     }
     Err(Exit::Code(1))
 }
