@@ -7,6 +7,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 from typing import Any
 import unittest
@@ -19,6 +20,7 @@ from tools.measure.test_assemble_release_receipts import COMMIT, DIGEST, STALE, 
 
 
 ROOT = Path(__file__).resolve().parents[2]
+ECOSYSTEM_YML = ROOT / ".github" / "workflows" / "ecosystem.yml"
 CI_RUN = 101
 ECO_RUN = 202
 UPSTREAM_PIN = "1111111111111111111111111111111111111111"
@@ -72,6 +74,16 @@ def ecosystem_artifacts(commit: str = COMMIT) -> dict[str, dict[str, str]]:
             "results.jsonl": "".join(json.dumps({"port": f"p{index}-{n}", "status": "pass"}) + "\n" for n in range(3)),
             "zlib-oracle.log": "log\n",
         }
+    # The conan job uploads the ecosystem_eval.py report and its Markdown summary.
+    scenarios = [{"name": name, "status": "pass"} for name in verifier.REQUIRED_CONAN_SCENARIOS]
+    artifacts["conan"] = {
+        "conan.json": dumps({
+            "schema_version": 1, "status": "pass",
+            "summary": {"total": 2, "executed": 2, "passed": 2, "failed": 0, "errors": 0, "skipped": 0},
+            "scenarios": scenarios, "receipts": {},
+        }),
+        "conan.md": "# Ecosystem PATH comparison\n",
+    }
     return artifacts
 
 
@@ -237,13 +249,13 @@ class FetchCiReceiptsTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
 
         lanes = self.scan()
-        for key in ("ci_jobs", "runcmake_windows", "large_projects", "vcpkg"):
+        for key in ("ci_jobs", "runcmake_windows", "large_projects", "vcpkg", "conan"):
             self.assertEqual(lanes[key].state, "present", lanes[key].detail)
         self.assertEqual(lanes["vcpkg"].member_count, 64)
         self.assertEqual(lanes["large_projects"].member_count, len(BOSS_PROJECTS))
         self.assertEqual(lanes["runcmake_linux"].state, "missing")
         self.assertNotIn("runcmake-linux", gh.downloads[0])
-        self.assertFalse(any(name.endswith(".log") for name in self.files()))
+        self.assertFalse(any(name.endswith((".log", ".md")) for name in self.files()))
 
         first = json.loads((self.receipts / "large-projects" / BOSS_PROJECTS[0] / "result.json").read_text())
         self.assertEqual(first["project_commit"], UPSTREAM_PIN)
@@ -254,6 +266,7 @@ class FetchCiReceiptsTests(unittest.TestCase):
             ("runcmake_windows", "runcmake-windows.json", verifier.check_runcmake),
             ("large_projects", "large-projects", verifier.check_large_projects),
             ("vcpkg", "vcpkg", verifier.check_vcpkg),
+            ("conan", "conan.json", verifier.check_conan),
         )
         for key, rel, check in checks:
             record = verifier.load_receipt_entry(key, "track", {"path": str(self.receipts / rel)}, self.receipts)
@@ -263,7 +276,7 @@ class FetchCiReceiptsTests(unittest.TestCase):
             self.assertEqual(findings, [], key)
 
         self.assertIn("Release receipt readiness", out)
-        for key in ("ci_jobs", "runcmake_windows", "large_projects", "vcpkg"):
+        for key in ("ci_jobs", "runcmake_windows", "large_projects", "vcpkg", "conan"):
             self.assertRegex(out, rf"\| `{key}` \| `[^`]+` \| `present` \|")
         self.assertIn("Missing required lanes:", out)
 
@@ -322,6 +335,83 @@ class FetchCiReceiptsTests(unittest.TestCase):
         self.assertEqual(lanes["runcmake_windows"].state, "present")
         self.assertNotIn("local", json.loads((self.receipts / "runcmake-windows.json").read_text()))
         self.assertFalse(any(name.startswith(".fetch-ci-receipts-") for name in self.files()))
+
+
+def workflow_jobs(text: str) -> dict[str, str]:
+    """Split ecosystem.yml into the text of each job under jobs:."""
+    body = text.split("\njobs:\n", 1)[1]
+    parts = re.split(r"^  ([A-Za-z0-9_-]+):\n", body, flags=re.M)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def workflow_uploads(job: str) -> list[tuple[str, list[str]]]:
+    """Return (name, paths) for each actions/upload-artifact step in one job."""
+    env = dict(re.findall(r"^      ([A-Z_]+): (\S+)$", job, flags=re.M))
+    uploads = []
+    lines = job.splitlines()
+    for index, line in enumerate(lines):
+        if "actions/upload-artifact@" not in line:
+            continue
+        indent = len(line) - len(line.lstrip())
+        step: list[str] = []
+        for following in lines[index + 1:]:
+            if following.strip() and len(following) - len(following.lstrip()) <= indent:
+                break
+            step.append(following.strip())
+        name = next(row.split(":", 1)[1].strip() for row in step if row.startswith("name:"))
+        start = next(i for i, row in enumerate(step) if row.startswith("path:"))
+        value = step[start].split(":", 1)[1].strip()
+        paths = [value] if value != "|" else [
+            row for row in step[start + 1:] if row and not re.match(r"^[a-z-]+:", row)
+        ]
+        resolved = [
+            re.sub(r"\$\{\{ env\.([A-Z_]+) \}\}", lambda match: env[match.group(1)], path) for path in paths
+        ]
+        uploads.append((name, resolved))
+    return uploads
+
+
+class EcosystemWorkflowParityTests(unittest.TestCase):
+    """Check that ecosystem.yml uploads every artifact that fetch_ci_receipts.py reads."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.jobs = workflow_jobs(ECOSYSTEM_YML.read_text(encoding="utf-8"))
+        cls.uploads = {
+            name: (job, paths) for job, text in cls.jobs.items() for name, paths in workflow_uploads(text)
+        }
+
+    def test_upload_parser_finds_known_steps(self) -> None:
+        self.assertEqual(self.uploads["conformance"], ("conformance", ["conformance-report"]))
+        self.assertEqual(self.uploads["runcmake-macos-full"], ("runcmake-macos", ["runcmake-macos.json"]))
+
+    def test_every_single_artifact_lane_is_uploaded_with_its_receipt_file(self) -> None:
+        for lane in fetcher.ECOSYSTEM_LANES:
+            if lane.artifact is None:
+                continue
+            with self.subTest(artifact=lane.artifact):
+                self.assertIn(lane.artifact, self.uploads)
+                _, paths = self.uploads[lane.artifact]
+                self.assertIn(lane.target, [Path(path).name for path in paths])
+
+    def test_every_prefix_lane_is_uploaded_per_matrix_entry_with_its_members(self) -> None:
+        for lane in fetcher.ECOSYSTEM_LANES:
+            if lane.artifact_prefix is None:
+                continue
+            with self.subTest(prefix=lane.artifact_prefix):
+                matches = [name for name in self.uploads if name.startswith(lane.artifact_prefix + "${{ matrix.")]
+                self.assertEqual(len(matches), 1, matches)
+                job, paths = self.uploads[matches[0]]
+                self.assertEqual(len(paths), 1)
+                for member in lane.member_files:
+                    self.assertIn(f'/ "{member}")', self.jobs[job])
+
+    def test_conan_job_writes_the_required_scenarios_to_the_uploaded_receipt(self) -> None:
+        job = self.jobs[self.uploads["conan"][0]]
+        self.assertIn("tools/corpus/ecosystem_eval.py", job)
+        self.assertIn("--scenario " + ",".join(verifier.REQUIRED_CONAN_SCENARIOS), job)
+        receipt = next(path for path in self.uploads["conan"][1] if path.endswith("/conan.json"))
+        self.assertIn(f'--out-json "{receipt.replace("${{ runner.temp }}", "$RUNNER_TEMP")}"', job)
 
 
 if __name__ == "__main__":

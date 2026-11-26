@@ -418,7 +418,7 @@ jobs:
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'conan'
     needs: prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 50
     steps:
       - *checkout
       - *python
@@ -523,6 +523,22 @@ jobs:
           print(results, flush=True)
           raise SystemExit(results != {"oracle": "42\n", "rcmake": "42\n"})
           PY
+      - name: Write the Conan ecosystem receipt
+        run: |
+          source env/env.sh
+          timeout 1500s python3 tools/corpus/ecosystem_eval.py \
+            --stage target/stage/bin/rcmake --oracle "$ECOSYSTEM_ORACLE" \
+            --scenario conan-consumer,conan-source-build \
+            --out-json "$RUNNER_TEMP/conan-report/conan.json" \
+            --out-md "$RUNNER_TEMP/conan-report/conan.md"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: conan
+          path: |
+            ${{ runner.temp }}/conan-report/conan.json
+            ${{ runner.temp }}/conan-report/conan.md
+          if-no-files-found: error
 
   large-projects:
     name: Large-project parity / ${{ matrix.project }}
