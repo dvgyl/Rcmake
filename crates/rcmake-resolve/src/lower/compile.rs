@@ -335,11 +335,18 @@ pub(super) fn formatted_defines(
         let value = [b"CMAKE_INTDIR=\"".as_slice(), &config.0, b"\""].concat();
         compile_argument(model, target, b"-D", &value)
     });
-    join_words(
-        intdir
-            .into_iter()
-            .chain(defines.map(|define| compile_argument(model, target, b"-D", define))),
-    )
+    let ninja_posix = model.generator.is_some_and(GeneratorKind::is_ninja)
+        && !super::shell::windows_host(model, target.dir);
+    join_words(intdir.into_iter().chain(defines.map(|define| {
+        if ninja_posix && let Some(eq) = define.iter().position(|&byte| byte == b'=') {
+            let (name, value) = define.split_at(eq + 1);
+            let prefix = compile_argument(model, target, b"-D", name);
+            return [prefix.as_slice(), &super::shell::cmake_posix_quote(value)]
+                .concat()
+                .into();
+        }
+        compile_argument(model, target, b"-D", define)
+    })))
 }
 
 pub(super) fn formatted_includes(
@@ -442,31 +449,7 @@ fn compile_arguments_for_arch(
                     .map_or_else(|| quote(&flag.value), BString::from)
             }),
     );
-    let boundary = group.source_define_start.unwrap_or(group.defines.len());
-    let (target_defines, source_defines) = group
-        .defines
-        .split_at_checked(boundary)
-        .unwrap_or((&group.defines, &[]));
-    let defines = [target_defines, source_defines]
-        .into_iter()
-        .flat_map(|definitions| {
-            let mut definitions: Vec<_> = definitions
-                .iter()
-                .map(|define| define.value.as_slice())
-                .collect();
-            definitions.sort_unstable();
-            definitions.dedup();
-            definitions
-        });
-    let intdir = (model.generator == Some(GeneratorKind::NinjaMultiConfig)).then(|| {
-        let value = [b"CMAKE_INTDIR=\"".as_slice(), &config.0, b"\""].concat();
-        compile_argument(model, target, b"-D", &value)
-    });
-    let defines = join_words(
-        intdir
-            .into_iter()
-            .chain(defines.map(|define| compile_argument(model, target, b"-D", define))),
-    );
+    let defines = formatted_defines(model, target, config, group);
     let includes = includes(model, target, group);
     let explicit_language = model
         .dir(target.dir)
@@ -652,7 +635,11 @@ pub(super) fn compile(
     }
     let flags = join_words(flags);
     let mut invocations = rule_invocations(model, target.dir, template_text, |key| match key {
-        b"FLAGS" => Some(flags.clone()),
+        b"FLAGS" => Some(if model.generator.is_some_and(GeneratorKind::is_ninja) {
+            flags.trim_ascii().into()
+        } else {
+            flags.clone()
+        }),
         b"DEFINES" => Some(defines.clone()),
         b"INCLUDES" => Some(includes.clone()),
         _ => lookup_paths(key),

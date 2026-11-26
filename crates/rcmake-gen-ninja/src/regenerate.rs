@@ -45,7 +45,10 @@ pub(super) fn emit_regeneration(
         );
         let mut command = cmake.to_vec();
         command.extend_from_slice(b" -P ");
-        graph.commands.word(&script, &mut command);
+        let script_path = graph.build_dir.join(rcmake_gen_common::glob::SCRIPT);
+        graph
+            .commands
+            .word(&path::from_native(&script_path), &mut command);
         ninja.binding(b"COMMAND", &command);
         listfiles.push(stamp);
     }

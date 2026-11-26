@@ -1115,3 +1115,29 @@ fn rule_file_sets_have_their_own_target_properties() -> TestResult {
     assert!(target.props.get(b"SOURCE_SET_shared").is_none());
     Ok(())
 }
+
+#[test]
+fn cmp0073_records_only_legacy_link_dependencies() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+        cmake_policy(SET CMP0073 OLD)
+        add_library(app STATIC main.c)
+        add_library(headers INTERFACE)
+        add_library(namespace::headers ALIAS headers)
+        add_library(objects OBJECT objects.c)
+        add_library(namespace::external STATIC IMPORTED)
+        set_property(TARGET namespace::external PROPERTY IMPORTED_LOCATION /work/external.a)
+        add_library(namespace::imported_headers INTERFACE IMPORTED)
+        target_link_libraries(app PRIVATE namespace::headers objects namespace::external
+                              namespace::imported_headers "$<1:generated>" m m)
+        "#,
+        &[],
+        0,
+    )?;
+    var(
+        &mut interp,
+        "app_LIB_DEPENDS",
+        "general;namespace::external;general;m;general;m;",
+    );
+    Ok(())
+}

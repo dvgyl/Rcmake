@@ -1475,3 +1475,90 @@ fn compile_excludes_normalized_implicit_include_paths() -> TestResult {
     assert!(!invocation.argv.contains(&"-I/toolchain/include".into()));
     Ok(())
 }
+
+#[test]
+fn ninja_linker_depfile_uses_the_configured_wrapper_and_support_directory() -> TestResult {
+    use rcmake_model::GeneratorKind::{Ninja, NinjaMultiConfig};
+
+    for (system, generator, wrapper, sep, disabled, expected) in [
+        ("Linux", Ninja, "-Wl,", ",", "", true),
+        ("Darwin", NinjaMultiConfig, "-Xlinker; ", "", "", true),
+        ("Linux", Ninja, "-Wl,", ",", "global", false),
+        ("Linux", Ninja, "-Wl,", ",", "language", false),
+        ("Linux", Ninja, "-Wl,", ",", "shared", false),
+    ] {
+        let config = ConfigId("Debug".into());
+        let mut model = fixture(system);
+        model.generator = Some(generator);
+        var(&mut model, "CMAKE_HOST_SYSTEM_NAME", system);
+        var(&mut model, "CMAKE_C_COMPILER", "cc");
+        var(&mut model, "CMAKE_C_LINKER_WRAPPER_FLAG", wrapper);
+        var(&mut model, "CMAKE_C_LINKER_WRAPPER_FLAG_SEP", sep);
+        var(
+            &mut model,
+            "CMAKE_C_LINKER_DEPFILE_FLAGS",
+            "LINKER:--dependency-file=<DEP_FILE>",
+        );
+        var(&mut model, "CMAKE_C_LINKER_DEPFILE_FORMAT", "gcc");
+        var(
+            &mut model,
+            "CMAKE_C_LINK_DEPENDS_USE_LINKER",
+            if disabled == "language" { "OFF" } else { "ON" },
+        );
+        if disabled == "global" {
+            var(&mut model, "CMAKE_LINK_DEPENDS_USE_LINKER", "OFF");
+        }
+        let mut raw = raw_target("app", TargetKind::Executable);
+        if disabled == "shared" {
+            raw.props.set("LINK_DEPENDS_NO_SHARED".into(), "ON".into());
+        }
+        let target = resolve_target(&mut model, raw, &config, &["main.c"])?;
+        let graph = lower(&model, &[target], &config)?;
+        let Some(BuildStep::Link {
+            step, invocations, ..
+        }) = graph.steps.last()
+        else {
+            return Err("Expected a link step.".into());
+        };
+        let path = if generator == Ninja {
+            "CMakeFiles/app.dir/link.d"
+        } else {
+            "CMakeFiles/app.dir/Debug/link.d"
+        };
+        assert_eq!(
+            graph.link_depfiles.get(&step.output),
+            expected.then(|| path.into()).as_ref()
+        );
+        let flag = format!("--dependency-file={path}");
+        let args = &invocations[0].argv;
+        if expected && generator == NinjaMultiConfig {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-Xlinker" && pair[1] == flag.as_str())
+            );
+        } else {
+            assert_eq!(
+                args.iter().any(|arg| arg == format!("-Wl,{flag}").as_str()),
+                expected
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn ninja_compile_definitions_quote_the_value() {
+    let config = ConfigId("Debug".into());
+    let mut model = fixture("Linux");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    var(&mut model, "CMAKE_HOST_SYSTEM_NAME", "Linux");
+    let target = raw_target("app", TargetKind::Executable);
+    let group = CompileGroup {
+        defines: vec![bt("WORDS=long long"), bt("EMPTY="), bt("PLAIN")],
+        ..Default::default()
+    };
+    assert_eq!(
+        super::compile::formatted_defines(&model, &target, &config, &group),
+        r#"-DEMPTY="" -DPLAIN -DWORDS="long long""#,
+    );
+}

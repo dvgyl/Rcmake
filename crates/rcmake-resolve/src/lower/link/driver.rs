@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use indexmap::IndexSet;
-use rcmake_base::{BString, ByteSlice, shell::quote, truth};
+use rcmake_base::{BString, ByteSlice, list, shell::quote, truth};
 use rcmake_genex::ConfigId;
 use rcmake_host::{ReadRange, WriteMode, path};
 use rcmake_model::{DirId, ProjectModel, Target, TargetKind};
@@ -58,6 +58,29 @@ impl<'a> LinkerDriver<'a> {
             })
             .collect::<Result<Vec<_>, _>>()
             .map(join_words)
+    }
+
+    pub(super) fn depfile_flags(
+        &self,
+        flags: &[u8],
+        path: &[u8],
+    ) -> Result<Vec<BString>, ResolveError> {
+        list::split(flags, list::Empty::Drop)
+            .into_iter()
+            .map(|flag| {
+                let args = if flag.starts_with(b"LINKER:") {
+                    self.wrapper.expand(&flag)?
+                } else if self.windows {
+                    windows_arguments(&flag)
+                } else {
+                    simple_args(&flag).unwrap_or_else(|| vec![flag])
+                };
+                Ok(join_words(
+                    args.iter()
+                        .map(|arg| quote(&arg.replace(b"<DEP_FILE>", path))),
+                ))
+            })
+            .collect()
     }
 
     pub(super) fn argument(&self, argument: &[u8]) -> Result<BString, ResolveError> {

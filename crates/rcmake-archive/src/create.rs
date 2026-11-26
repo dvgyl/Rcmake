@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use rcmake_base::BString;
@@ -289,6 +289,7 @@ fn is_apple_double(
 }
 
 enum Writer {
+    Raw { encoder: Encoder, written: bool },
     Tar(TarWriter),
     SevenZip(Box<seven_zip::Writer>),
     Zip(zip_codec::writer::Writer),
@@ -300,6 +301,7 @@ impl Writer {
         let level = options.compression_level;
         let (gnu, filter) = match options.format {
             Tar => (false, None),
+            Raw(filter) => (false, filter),
             TarGz => (false, Some(TarCompression::Gzip)),
             TarBz2 => (false, Some(TarCompression::Bzip2)),
             TarXz => (false, Some(TarCompression::Xz)),
@@ -349,6 +351,12 @@ impl Writer {
             )));
         }
         let encoder = Encoder::new(filter, level, threads)?;
+        if matches!(options.format, Raw(_)) {
+            return Ok(Self::Raw {
+                encoder,
+                written: false,
+            });
+        }
         Ok(Self::Tar(TarWriter {
             builder: Box::new(Builder::new(encoder)),
             gnu,
@@ -366,6 +374,21 @@ impl Writer {
         zone: &jiff::tz::TimeZone,
     ) -> Result<(), ArchiveError> {
         match self {
+            Self::Raw { encoder, written } => {
+                if *written {
+                    return Err(ArchiveError::new(
+                        "archive_write_header: Raw format only supports one entry per archive",
+                    ));
+                }
+                if metadata.kind != FileKind::File {
+                    return Err(ArchiveError::new(
+                        "archive_write_header: Raw format only supports filetype AE_IFREG",
+                    ));
+                }
+                encoder.write_all(contents).map_err(archive_error)?;
+                *written = true;
+                Ok(())
+            }
             Self::Tar(writer) => {
                 let kind = match (metadata.kind, link_name) {
                     (_, Some(_)) => EntryType::Link,
@@ -388,6 +411,7 @@ impl Writer {
 
     fn finish(self) -> Result<Vec<u8>, ArchiveError> {
         match self {
+            Self::Raw { encoder, .. } => encoder.finish().map_err(archive_error),
             Self::Tar(writer) => writer
                 .builder
                 .into_inner()

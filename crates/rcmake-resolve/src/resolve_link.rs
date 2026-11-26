@@ -696,15 +696,10 @@ fn append_library_path(
         ));
     } else {
         let windows = lower::artifacts::is_dll_platform(model, dir);
-        let darwin_ninja = lower::is_darwin(model, dir)
-            && matches!(
-                model.generator,
-                Some(
-                    rcmake_model::GeneratorKind::Ninja
-                        | rcmake_model::GeneratorKind::NinjaMultiConfig
-                )
-            );
-        let mut path = if windows || darwin_ninja {
+        let ninja = model
+            .generator
+            .is_some_and(rcmake_model::GeneratorKind::is_ninja);
+        let mut path = if windows || ninja {
             lower::build_relative(model, path)
         } else {
             path.into()

@@ -66,6 +66,12 @@ rule LINK_MODULE_LIBRARY
   command = $COMMAND
   description = $DESC
 
+rule LINK_DEPFILE
+  command = $COMMAND
+  description = $DESC
+  depfile = $DEP_FILE
+  deps = gcc
+
 rule STATIC_ARCHIVE
   command = $COMMAND
   description = $DESC

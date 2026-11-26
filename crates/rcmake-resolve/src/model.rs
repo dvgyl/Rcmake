@@ -784,6 +784,8 @@ pub struct BuildGraph {
     pub install_name_dirs: IndexMap<BString, BString>,
     /// Ninja progress descriptions for link edges with custom commands.
     pub link_descriptions: IndexMap<BString, BString>,
+    /// Ninja linker depfile paths keyed by primary link output path.
+    pub link_depfiles: IndexMap<BString, BString>,
     /// Custom rule indices that use the native configuration in a cross-config graph.
     pub native_custom_steps: IndexSet<usize>,
     /// Output command ownership indexed by graph step.

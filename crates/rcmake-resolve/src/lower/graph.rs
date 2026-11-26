@@ -604,6 +604,9 @@ impl<'a> TargetPlan<'a> {
             })?;
             let mut link = lowered.step;
             if let BuildStep::Link { step, .. } = &link {
+                if let Some(depfile) = lowered.depfile {
+                    graph.link_depfiles.insert(step.output.clone(), depfile);
+                }
                 if !lowered.install_name_dir.is_empty() {
                     graph
                         .install_name_dirs

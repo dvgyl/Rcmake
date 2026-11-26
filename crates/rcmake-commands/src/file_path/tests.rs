@@ -1980,3 +1980,51 @@ fn file_install_drops_a_trailing_dot_from_the_destination() -> TestResult {
     assert!(!stdout.contains("/./"), "{stdout}");
     Ok(())
 }
+
+#[test]
+#[cfg(feature = "archive")]
+fn raw_archive_create_validates_encoding_and_entries() -> TestResult {
+    for (extra, paths, diagnostic) in [
+        ("COMPRESSION Zstd", "one", None),
+        ("COMPRESSION None", "one", None),
+        (r#"ENCODING """#, "one", None),
+        (
+            "ENCODING UTF-8",
+            "one",
+            Some("Undefined option: `raw:hdrcharset=UTF-8'"),
+        ),
+        (
+            "",
+            "one two",
+            Some("Raw format only supports one entry per archive"),
+        ),
+        (
+            "",
+            "dir",
+            Some("Raw format only supports filetype AE_IFREG"),
+        ),
+    ] {
+        let (host, mut interp) = interpreter();
+        let base = host.initial_cwd();
+        host.seed_file(&base.join("one"), b"one")?;
+        host.seed_file(&base.join("two"), b"two")?;
+        host.create_dir_all(&base.join("dir"))?;
+        let code = format!("file(ARCHIVE_CREATE OUTPUT out PATHS {paths} FORMAT raw {extra})");
+        if let Some(diagnostic) = diagnostic {
+            let probe = base.join("test.cmake");
+            host.seed_file(&probe, code.as_bytes())?;
+            assert_ne!(interp.run_script(&probe).exit_code, 0);
+            let stderr = host.stream_bytes(Stream::Stderr);
+            assert!(stderr.to_string().contains(diagnostic), "{stderr}");
+        } else {
+            script(&host, &mut interp, &code)?;
+            let bytes = host.read(&base.join("out"), ReadRange::All { limit: 1024 })?;
+            if extra == "COMPRESSION Zstd" {
+                assert!(bytes.starts_with(b"\x28\xb5\x2f\xfd"));
+            } else {
+                assert_eq!(bytes, b"one");
+            }
+        }
+    }
+    Ok(())
+}

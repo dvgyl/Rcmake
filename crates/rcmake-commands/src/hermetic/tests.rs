@@ -1159,3 +1159,31 @@ fn strict_darwin_rejects_symlink_into_case_only_lookalike_directory() -> HostRes
     assert!(runtime.denied());
     Ok(())
 }
+
+#[test]
+#[cfg(not(windows))]
+fn strict_linux_allows_usr_metadata_and_denies_unlisted_children() -> HostResult<()> {
+    let source = absolute("/project");
+    let build = absolute("/build");
+    let usr = absolute("/usr");
+    let child = usr.join("outside.txt");
+    let host = Arc::new(PureHost::new(source.clone(), absolute("/stage/cmake")));
+    let mut system = host.system();
+    system.sysname = "Linux".into();
+    host.set_system(system)?;
+    host.create_dir_all(&source)?;
+    host.create_dir_all(&build)?;
+    host.seed_file(&child, b"outside")?;
+
+    let mut services = Services::default();
+    services.speed.hermetic = HermeticMode::Strict;
+    let runtime = HermeticRuntime::new(host, &source, &build, &services)
+        .ok_or_else(|| HostError::unsupported("Cannot create the audit runtime."))?;
+    let guarded = runtime.host();
+    assert_eq!(guarded.metadata(&usr, Follow::Yes)?.kind, FileKind::Dir);
+    assert_eq!(
+        guarded.metadata(&child, Follow::Yes).unwrap_err().kind,
+        ErrorKind::PermissionDenied
+    );
+    Ok(())
+}

@@ -1468,3 +1468,64 @@ fn compile_launcher_preserves_shell_expansion_in_program_word() {
         "{build}"
     );
 }
+
+#[test]
+fn link_depfile_survives_response_file_selection() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = Path::new("/work/build");
+    let depfile = "CMakeFiles/app.dir/link.d";
+    let flag = format!("-Wl,--dependency-file={depfile}");
+    let result = GenerationResult {
+        graphs: vec![BuildGraph {
+            steps: vec![BuildStep::Link {
+                inputs: vec!["app.o".into()],
+                implicit_inputs: Vec::new(),
+                step: LinkStep {
+                    kind: LinkKind::Executable,
+                    language: "C".into(),
+                    fragments: Vec::new(),
+                    output: "app".into(),
+                },
+                invocations: vec![Invocation {
+                    argv: vec![
+                        "cc".into(),
+                        flag.clone().into(),
+                        "app.o".into(),
+                        "-o".into(),
+                        "app".into(),
+                    ],
+                    shell: format!("cc {flag} app.o -o app").into(),
+                    ..Invocation::default()
+                }],
+            }],
+            targets: vec![GraphTarget {
+                name: "app".into(),
+                steps: vec![0],
+                in_all: true,
+                ..GraphTarget::default()
+            }],
+            link_depfiles: [("app".into(), depfile.into())].into(),
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    for (force, rule) in [(false, "LINK_DEPFILE"), (true, "LINK_DEPFILE_RSP")] {
+        let host = PureHost::default();
+        if force {
+            host.env_set(b"CMAKE_NINJA_FORCE_RESPONSE_FILE", Some(b"1"));
+        }
+        generate_single_config(&result, &host, dir)?;
+        let build = read(&host, "build.ninja");
+        assert!(build.contains(&format!("build app: {rule} app.o")));
+        assert!(build.contains(&format!("  DEP_FILE = {depfile}\n")));
+        assert!(build.contains(&flag));
+        let rules = read(&host, "CMakeFiles/rules.ninja");
+        let rule = rules
+            .split_once(&format!("\nrule {rule}\n"))
+            .ok_or("Missing link rule")?
+            .1;
+        let rule = rule.split("\n\n").next().ok_or("Empty link rule")?;
+        assert!(rule.contains("depfile = $DEP_FILE\n  deps = gcc"));
+        assert_eq!(rule.contains("rspfile = $RSP_FILE"), force);
+    }
+    Ok(())
+}

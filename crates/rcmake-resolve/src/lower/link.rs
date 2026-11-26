@@ -110,6 +110,7 @@ pub fn codemodel_link_flags(
 pub(super) struct LoweredLink {
     pub(super) step: BuildStep,
     pub(super) install_name_dir: BString,
+    pub(super) depfile: Option<BString>,
     pub(super) extra_outputs: Vec<BString>,
     pub(super) swift_output_file_map: Option<(BString, BString)>,
 }
@@ -172,7 +173,7 @@ pub(super) fn link(
     };
     let language_compile_flags = (ninja_posix && kind != LinkKind::Executable).then(|| {
         [
-            join_words(driver.iter().cloned()).as_slice(),
+            join_words(driver.iter().cloned()).trim_ascii_start(),
             b" ",
             join_words(arch.iter().cloned()).as_slice(),
         ]
@@ -206,6 +207,11 @@ pub(super) fn link(
     } else {
         driver.extend(arch);
         join_words(driver)
+    };
+    let driver = if ninja_posix {
+        BString::from(driver.trim_ascii())
+    } else {
+        driver
     };
     let option = |key: &[u8]| policy.option(key);
     let cmake = || {
@@ -350,6 +356,10 @@ pub(super) fn link(
         }
         flags.extend(policy.pie_link(position_independent));
         flags.extend(policy.link(ipo));
+    }
+    let depfile = ninja_link_depfile(model, target, config, kind, language);
+    if let Some((path, depfile_flags)) = &depfile {
+        flags.extend(wrapper.depfile_flags(depfile_flags, path)?);
     }
     if kind == LinkKind::SharedLibrary && darwin {
         flags.extend(darwin_versions(model, target, language));
@@ -838,9 +848,41 @@ pub(super) fn link(
             invocations: before_link,
         },
         install_name_dir,
+        depfile: depfile.map(|(path, _)| path),
         extra_outputs,
         swift_output_file_map,
     })
+}
+
+fn ninja_link_depfile<'a>(
+    model: &'a ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    kind: LinkKind,
+    language: &[u8],
+) -> Option<(BString, &'a BString)> {
+    let language_setting =
+        |suffix: &[u8]| definition(model, target.dir, &[b"CMAKE_", language, suffix].concat());
+    if !model
+        .generator
+        .is_some_and(rcmake_model::GeneratorKind::is_ninja)
+        || kind == LinkKind::StaticArchive
+        || target
+            .props
+            .get(b"LINK_DEPENDS_NO_SHARED")
+            .is_some_and(|value| truth::is_on(value))
+        || definition(model, target.dir, b"CMAKE_LINK_DEPENDS_USE_LINKER")
+            .is_some_and(|value| !truth::is_on(value))
+        || !language_setting(b"_LINK_DEPENDS_USE_LINKER").is_some_and(|value| truth::is_on(value))
+        || !language_setting(b"_LINKER_DEPFILE_FORMAT").is_some_and(|value| value == b"gcc")
+    {
+        return None;
+    }
+    let flags = language_setting(b"_LINKER_DEPFILE_FLAGS").filter(|value| !value.is_empty())?;
+    Some((
+        join(&super::object_dir(model, target, config), b"link.d"),
+        flags,
+    ))
 }
 
 #[expect(

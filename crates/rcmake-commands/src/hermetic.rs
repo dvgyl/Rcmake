@@ -440,6 +440,7 @@ fn allow_host_toolchain(policy: &mut HermeticPolicy, host: &dyn Host, sysname: &
         for exact in [
             "/etc/debian_version",
             "/etc/arch-release",
+            "/usr",
             "/usr/lib",
             "/usr/lib64",
             "/usr/include",

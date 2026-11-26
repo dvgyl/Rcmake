@@ -741,3 +741,39 @@ fn zip_ppmd_reports_the_cmake_diagnostic() {
     );
     assert!(result.is_err_and(|error| error.message == "PPMd is not supported for zip"));
 }
+
+#[test]
+fn raw_archive_writes_only_the_file_data_through_each_filter() -> TestResult {
+    use std::io::Read;
+
+    let host = PureHost::default();
+    let base = host.initial_cwd();
+    let output = base.join("out");
+    let payload = b"raw contents\0\xff";
+    host.seed_file(&base.join("input"), payload)?;
+    for filter in [
+        None,
+        Some(TarCompression::Zstd),
+        Some(TarCompression::Gzip),
+        Some(TarCompression::Xz),
+        Some(TarCompression::Bzip2),
+    ] {
+        create_archive(
+            &host,
+            &output,
+            &base,
+            &["input".into()],
+            &create_options(ArchiveFormat::Raw(filter)),
+        )?;
+        let encoded = host.read(&output, ReadRange::All { limit: 1024 })?;
+        assert_eq!(crate::codec::detect(&encoded), filter);
+        if let Some(filter) = filter {
+            let mut decoded = Vec::new();
+            crate::codec::decoder(filter, encoded.as_slice())?.read_to_end(&mut decoded)?;
+            assert_eq!(decoded, payload);
+        } else {
+            assert_eq!(encoded, payload);
+        }
+    }
+    Ok(())
+}

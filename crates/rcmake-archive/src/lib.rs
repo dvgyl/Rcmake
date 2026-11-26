@@ -56,6 +56,8 @@ pub enum ArchiveFormat {
     GnuTarGz,
     /// GNU tar with the specified compression filter.
     GnuTarCompressed(TarCompression),
+    /// One regular file with optional compression and no archive headers.
+    Raw(Option<TarCompression>),
     /// 7-Zip archive with the selected compression method and thread count.
     SevenZip {
         /// Compression method for file entries.
@@ -105,7 +107,7 @@ pub enum ZipCompression {
     Zstd,
 }
 
-/// Compression filter for a tar archive.
+/// Compression filter for tar archives and raw file data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TarCompression {
     /// Gzip.

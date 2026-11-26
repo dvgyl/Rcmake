@@ -310,15 +310,20 @@ impl<'a> Graph<'a> {
                 invocations,
             } => {
                 let path_inputs = inputs.iter().map(|input| self.node(input)).collect();
-                let mut plan = EdgePlan::new(step.kind.ninja_rule(), path_inputs, nodes);
+                let depfile = self.input.link_depfiles.get(&step.output);
+                let rule = depfile.map_or_else(|| step.kind.ninja_rule(), |_| b"LINK_DEPFILE");
+                let mut plan = EdgePlan::new(rule, path_inputs, nodes);
                 plan.implicit_inputs
                     .extend(implicit_inputs.iter().map(|input| self.node(input)));
                 if let Some(prepared) = self.prepared_link(nodes) {
                     prepared.bind(&mut plan);
                 } else {
                     let command = self.link_command_line(invocations, false);
-                    let response = self.link_response(step, inputs, invocations, &command);
+                    let response = self.link_response(rule, step, inputs, invocations, &command);
                     plan.bind_command(command, response);
+                }
+                if let Some(depfile) = depfile {
+                    plan.bind(b"DEP_FILE", self.node(depfile));
                 }
                 if let Some(pool) = self.pools.get(&step.output) {
                     plan.bind(b"pool", pool.clone());
@@ -404,7 +409,11 @@ impl<'a> Graph<'a> {
                 if let Some(script) = script {
                     plan.implicit_inputs.push(script.clone());
                 }
-                if let Some(depfile) = &custom.depfile {
+                let link_depfile = custom
+                    .outputs
+                    .first()
+                    .and_then(|output| self.input.link_depfiles.get(output));
+                if let Some(depfile) = custom.depfile.as_ref().or(link_depfile) {
                     let depfile = self.node(depfile);
                     // Ninja removes the depfile when it records dependencies in its database.
                     let persistent =

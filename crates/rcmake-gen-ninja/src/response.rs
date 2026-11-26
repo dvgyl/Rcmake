@@ -186,6 +186,7 @@ impl<'a> Graph<'a> {
 
     pub(super) fn link_response(
         &self,
+        rule: &[u8],
         step: &LinkStep,
         inputs: &[BString],
         invocations: &[Invocation],
@@ -241,14 +242,7 @@ impl<'a> Graph<'a> {
                     .count();
                 Some((index, start..start + count, wrapped))
             })?;
-        self.response(
-            step.kind.ninja_rule(),
-            &step.output,
-            invocations,
-            index_and_args,
-            flag,
-            msvc,
-        )
+        self.response(rule, &step.output, invocations, index_and_args, flag, msvc)
     }
 
     fn response(
@@ -488,6 +482,11 @@ const RESPONSE_RULES: &[Rule] = &[
     (b"LINK_EXECUTABLE", b"LINK_EXECUTABLE_RSP", b""),
     (b"LINK_SHARED_LIBRARY", b"LINK_SHARED_LIBRARY_RSP", b""),
     (b"LINK_MODULE_LIBRARY", b"LINK_MODULE_LIBRARY_RSP", b""),
+    (
+        b"LINK_DEPFILE",
+        b"LINK_DEPFILE_RSP",
+        b"  depfile = $DEP_FILE\n  deps = gcc\n",
+    ),
     (b"STATIC_ARCHIVE", b"STATIC_ARCHIVE_RSP", b""),
 ];
 

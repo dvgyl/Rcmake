@@ -157,7 +157,21 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         let value = text.as_slice();
         let qualifier = qualifier.take().unwrap_or(Qualifier::General);
         has_item = true;
-        if legacy_cache && scope != UsageScope::Interface && !contains_genex(value) {
+        let linked_target = model
+            .find_target(dir, value)
+            .and_then(|id| model.target(id));
+        if legacy_cache
+            && scope != UsageScope::Interface
+            && !value.is_empty()
+            && value != target.name
+            && !contains_genex(value)
+            && linked_target.is_none_or(|linked| {
+                !matches!(
+                    linked.kind,
+                    TargetKind::InterfaceLibrary | TargetKind::ObjectLibrary
+                )
+            })
+        {
             legacy_dependencies.extend_from_slice(qualifier.name().as_bytes());
             legacy_dependencies.push(b';');
             legacy_dependencies.extend_from_slice(value);
@@ -191,9 +205,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             lookup_dir: dir,
         };
         if scope != UsageScope::Interface {
-            if let Some(linked) = model
-                .find_target(dir, value)
-                .and_then(|id| model.target(id))
+            if let Some(linked) = linked_target
                 && linked.is_global()
                 && !linkable(linked)
             {
@@ -206,10 +218,7 @@ pub(super) fn add(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
                     ),
                 ));
             }
-            let stable_target = model
-                .find_target(dir, value)
-                .and_then(|id| model.target(id))
-                .is_some_and(|target| !target.is_imported());
+            let stable_target = linked_target.is_some_and(|target| !target.is_imported());
             let text = if qualifier != Qualifier::General && stable_target {
                 [b"$<TARGET_NAME:", value, b">"].concat().into()
             } else {
