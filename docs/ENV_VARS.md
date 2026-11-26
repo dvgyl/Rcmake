@@ -33,8 +33,7 @@ warning for each invalid setting.
 
 ### Incremental replay
 
-In native mode, project configure can replay eligible regions from a prior configure.
-These inputs and options disable replay for the invocation.
+These inputs and options disable native-mode configure replay:
 
 - A configure preset or an explicit `-C` preload script.
 - A `PreLoad.cmake` file in the source or build directory.

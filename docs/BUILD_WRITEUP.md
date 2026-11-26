@@ -4,10 +4,6 @@
 
 The goal is drop-in compatibility. A project should configure, build, install, test, and package with `rcmake` first on `PATH` and produce the same outputs as CMake 4.5.1.
 
-This write-up covers the architecture, how a human owner and three coding agents divided the work over three calendar days, the differential oracle method, hard bugs that testing exposed, limitations, and one command to reproduce every claim locally.
-
-All numbers that depend on the final frozen release binary stay inside machine-readable metric markers until one frozen-binary verification run stamps them. We never estimate unreleased numbers. Immutable architectural counts and verified pre-freeze soundness baselines are labeled explicitly.
-
 ## 1. Motivation, scope, and implementation rules
 
 ### Why target one exact release
@@ -106,8 +102,6 @@ A human did not read most of this code line by line. Cross-model review, the dif
 
 ### How work was divided across models
 
-We assigned distinct roles across models:
-
 - **Gemini 4 Neon** acted as coordinator and systems planner: owning shared contracts (`Cargo.toml`, `rcmake-base`, `rcmake-syntax`, `rcmake-diag`, `rcmake-model` public types, and ADRs), triaging differential failures into disjoint crate slices, auditing diffs against the architecture, and authoring documentation and frontend tooling.
 - **Opus 5.5** handled deep architectural planning, tricky semantic subsystems, and high-stakes code reviews on large resolution and caching changes.
 - **GPT 6.2 Sol** executed the majority of parallel crate implementations, parity sweeps across CMake commands and generators, measurement scripts, and routine diff reviews.
@@ -123,7 +117,7 @@ We assigned distinct roles across models:
 
 ## 4. The differential oracle method
 
-No single test suite catches every class of incompatibility. We stacked seven verification layers against the pinned CMake 4.5.1 oracle binary:
+Seven verification layers run against the pinned CMake 4.5.1 oracle binary:
 
 | Layer | Suite | Scope | What it catches |
 | --- | --- | --- | --- |
@@ -164,8 +158,6 @@ Differential comparison needs narrow normalizers for machine paths, timestamps, 
 - `Boost.Locale` is excluded on both engines in `large_projects.toml` because Boost 1.88 fails `source_group(TREE)` prefix validation on CMake 4.5.1 as well.
 
 ## 5. Hard bugs differential testing exposed
-
-Every bug below comes from verified commits on `HEAD`.
 
 ### 5.1 Listfile replay deduplication (`200ed8c`)
 
@@ -212,8 +204,6 @@ In native mode, prefetch can start a FetchContent download before the script pop
 
 ### 5.6 Large-project and archive parity edge cases (`c4e32bb`, `8f5188f`, `2043177`)
 
-Running unmodified large C++ projects exposed rules that documentation never spells out:
-
 - **`qtbase` `try_compile` header (`c4e32bb`).** `QtSeparateDebugInfo.cmake` extracts a binary path from `try_compile` `OUTPUT_VARIABLE` using `string(REGEX REPLACE ".+###(.+)###.+" "\\1" ...)`. Because `rcmake` ran `try_compile` in-process and returned only raw tool output (`###<path>###\n`), nothing preceded `###` and the `.+` failed to match. CMake prepends `Change Dir: '<bindir>'` and `Run Build Command(s): ...` before the tool output. Emitting the same header fixed Qt and any other project parsing `OUTPUT_VARIABLE`.
 - **ROS 2 `rclcpp` re-inclusion guard (`c4e32bb`).** `ament_cmake_coreConfig.cmake` checks `if(_ament_cmake_core_CONFIG_INCLUDED)` and sets `<Pkg>_FOUND` to `FALSE` if `<Pkg>_FOUND` is undefined. `rcmake` unconditionally unset `<Pkg>_FOUND` before reading a package config file, breaking every second `find_package()`. CMake unsets `<Pkg>_FOUND` only when it is already defined and evaluates to false.
 - **PyTorch ONNX export-set creation (`c4e32bb`).** `third_party/onnx/CMakeLists.txt` calls `install(EXPORT ONNXTargets ...)` before any `install(TARGETS ... EXPORT ONNXTargets)`. CMake's `GetExportSets()[name]` uses C++ `std::map::operator[]`, which silently inserts an empty export set on first lookup, whereas `export(EXPORT)` stays strict. Creating export sets on `install(EXPORT)`, `EXPORT_ANDROID_MK`, `PACKAGE_INFO`, and `SBOM` while keeping `export(EXPORT)` strict matched CMake.
@@ -224,7 +214,7 @@ Running unmodified large C++ projects exposed rules that documentation never spe
 
 ### Frozen release scorecard
 
-Every metric in the "Frozen release binary" column is stamped mechanically from one final release-binary verification run.
+Metrics in the "Frozen release binary" column are stamped mechanically from one frozen-binary verification run; unreleased numbers are never estimated.
 
 | Area | Scope | Verified pre-freeze baseline | Frozen release binary |
 | --- | --- | --- | --- |
@@ -258,8 +248,6 @@ Each benchmark report records N, the generator, the configure flags, the host CP
 
 ### What `rcmake` does not support
 
-These items are deliberate scope boundaries or unverified areas. Use CMake 4.5.1 when a build requires any of them:
-
 - **Interactive front ends.** There is no `cmake-gui` desktop application and no `ccmake` terminal interface. The `edit_cache` target prints `No interactive CMake dialog available.`, matching CMake when `ccmake` is absent.
 - **DAP debugger.** `cmake --debugger` fails with `CMake was not built with support for --debugger`, matching a CMake build compiled without debugger support. `cmake -E capabilities` omits the `debugger` key.
 - **Swift builds are unverified.** Basic Swift target properties and compile-rule exclusions exist in `rcmake-resolve`, but real Swift toolchain projects are not exercised in CI or in the differential suites. Treat Swift support as unverified until a differential Swift suite lands.
@@ -283,8 +271,6 @@ scripts/fetch-oracle.sh
 eval "$(scripts/fetch-oracle.sh --print-env)"
 RCMAKE_STAGE_PROFILE=release scripts/stage.sh
 ```
-
-Then run any verification check directly:
 
 | Claim | Single command |
 | --- | --- |

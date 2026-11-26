@@ -1,9 +1,6 @@
 # Architecture
 
-`rcmake` follows the execution model of CMake 4.5.1. The work goes through four
-stages: command line, configure, generate, and build, test, or package. The
-workspace has 35 crates. Each crate has one responsibility, and the crate graph
-has no cycles.
+`rcmake` is organized into 35 acyclic crates matching the four-stage execution model of CMake 4.5.1.
 
 ## Execution pipeline
 
@@ -55,8 +52,6 @@ The `rcmake-wasm` crate uses `rcmake-api` on `PureHost` to run the browser
 playground.
 
 ## Resolution layers
-
-The generate stage uses three data layers. Each layer has one owner crate.
 
 | Layer | Owner | Contents |
 | --- | --- | --- |
@@ -170,8 +165,6 @@ bans the direct calls. Only `rcmake-host`, the `rcmake-cli` entry point, and
 | `NativeHost` | The real operating system. Uses `rustix` on Unix and job objects on Windows for process groups and timeouts. |
 | `PureHost` | An in-memory file system with symlinks, virtual timestamps, scripted subprocesses, and an ordered output log. Unit tests and the WebAssembly build use it. |
 
-These rules apply to all `Host` calls:
-
 - `Host` is `Send + Sync`, so threads can share one `Arc<dyn Host>`.
 - All paths are absolute. The engine never uses or changes the process
   working directory.
@@ -228,9 +221,7 @@ and related variables. Only `rcmake-harness`, `tools/`, and the
 differential tests read these variables. The `rcmake` binary never runs the
 oracle. The licence scanner checks this rule.
 
-`rcmake` is checked in seven layers. The
-[build write-up](BUILD_WRITEUP.md#4-the-differential-oracle-method) uses the
-same numbers.
+Layer numbers match [BUILD_WRITEUP.md](BUILD_WRITEUP.md#4-the-differential-oracle-method).
 
 | Layer | Scope | Pass criterion |
 | --- | --- | --- |

@@ -1,8 +1,6 @@
 # Contributing to rcmake
 
-Thank you for your interest in rcmake. This guide gives the rules and checks
-for every change. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) describes the
-crate structure and the data flow.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the crate structure and data flow.
 
 ## Goal of the project
 
@@ -37,8 +35,7 @@ source the file.
 
 ## First contribution in 2 minutes
 
-This path takes you from a clone to a pull request. It assumes that you
-finished [Set up](#set-up).
+Requires [Set up](#set-up).
 
 1. Build `rcmake` and stage it with the bundled CMake modules:
 
@@ -174,7 +171,7 @@ Every public item needs a doc comment. The workspace sets
 
 ## Quality gates
 
-Run these checks before you open a pull request. All of them must pass.
+Run before opening a pull request:
 
 ```sh
 source env/env.sh
@@ -205,7 +202,7 @@ The licence scanner checks these rules:
 
 ## Add tests
 
-Every change in behavior needs a test. Choose the test type from this table:
+Every change in behavior needs a test.
 
 | Change | Test |
 | --- | --- |

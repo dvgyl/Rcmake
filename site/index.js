@@ -16,8 +16,7 @@ const RACE_MODES = {
       "-- Generating done",
       "-- Build files have been written to: <project>/build-2"
     ],
-    pendingCaption: "New build tree: rcmake uses its shared probe cache; CMake 4.5.1 has no cross-tree cache. Timings appear after the v0.1.0 release verification run.",
-    measuredCaption: (baseline) => `New build tree: rcmake uses its shared probe cache; CMake 4.5.1 has no cross-tree cache (${baseline || "measured against CMake 4.5.1"}).`,
+    caption: "CMake 4.5.1 has no cross-tree probe cache.",
     key: "warmProbeSpeedup",
     kind: "ratio"
   },
@@ -29,8 +28,7 @@ const RACE_MODES = {
       "-- Generating done",
       "-- Build files have been written to: <project>/build"
     ],
-    pendingCaption: "Existing build tree after a single-file edit: rcmake re-runs the edited file and replays unchanged subtrees; CMake 4.5.1 reconfigures from scratch. Timings appear after the v0.1.0 release verification run.",
-    measuredCaption: (baseline) => `Existing build tree after a single-file edit (${baseline || "re-runs the edited file, replays the rest"}).`,
+    caption: "",
     key: "incrementalLeafP95Ms",
     kind: "leaf"
   },
@@ -44,8 +42,7 @@ const RACE_MODES = {
       "-- Generating done",
       "-- Build files have been written to: <project>/build"
     ],
-    pendingCaption: "New build tree with an empty probe cache (500 synthetic C targets). Timings appear after the v0.1.0 release verification run.",
-    measuredCaption: (baseline) => `New build tree with an empty probe cache (${baseline || "measured against CMake 4.5.1"}).`,
+    caption: "",
     key: "coldConfigureSpeedup",
     kind: "ratio"
   }
@@ -110,7 +107,7 @@ function initRace(doc, motion) {
       cmBar.dataset.status = rcBar.dataset.status = "pending";
       cmBar.innerHTML = '<div class="bar-track is-pending" data-loop></div><div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim"><span data-value></span>pending</span></div>';
       rcBar.innerHTML = '<div class="bar-track is-pending" data-loop></div><div class="race-bar-meta"><span class="muted">rcmake</span><span class="dim"><span data-value></span>pending</span></div>';
-      caption.textContent = cfg.pendingCaption;
+      caption.textContent = cfg.caption;
       motion.scan(widget);
       return;
     }
@@ -119,14 +116,14 @@ function initRace(doc, motion) {
       drawLines("rcmake");
       cmBar.innerHTML = '<div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim">full reconfigure</span></div>';
       rcBar.innerHTML = `<div class="bar-track"><div class="bar-fill is-rcmake" style="--v:1;--bar-dur:320ms" data-scale="1"></div></div><div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${escapeHtml(formatNumber(val))} ms p95</span></div>`;
-      caption.textContent = cfg.measuredCaption(m.baseline);
+      caption.textContent = cfg.caption;
       return;
     }
     const scale = String(Number(Math.min(1, Math.max(0.02, 1 / val)).toFixed(4)));
     drawLines(val >= 1 ? "rcmake" : "cmake");
     cmBar.innerHTML = '<div class="bar-track"><div class="bar-fill is-cmake" style="--v:1;--bar-dur:800ms" data-scale="1"></div></div><div class="race-bar-meta"><span class="dim">cmake 4.5.1</span><span class="dim" data-value>1.00\u00d7</span></div>';
     rcBar.innerHTML = `<div class="bar-track"><div class="bar-fill is-rcmake" style="--v:${scale};--bar-dur:${Math.max(160, Math.round(800 / val))}ms" data-scale="${scale}" data-test="race-fill-rcmake"></div></div><div class="race-bar-meta"><span class="muted">rcmake</span><span data-value>${formatSpeed(val)}\u00d7 faster</span></div>`;
-    caption.textContent = cfg.measuredCaption(m.baseline);
+    caption.textContent = cfg.caption;
   };
 
   const play = () => {
@@ -204,9 +201,9 @@ function renderSpeed(el, bench, motion, giants = null) {
   const b = bench || {};
   const w = b.warmProbeSpeedup || {};
   const c = b.coldConfigureSpeedup || {};
-  const l = b.incrementalLeafP95Ms || { baseline: "single-file change replay" };
-  const r = b.peakRssMiB || { baseline: "native release binary" };
-  el.innerHTML = `${speedupBars({ label: "New tree, shared probe cache", baseline: w.baseline || "vs CMake 4.5.1 new build tree", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", baseline: c.baseline || "empty probe cache, synthetic C project", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, baseline: l.baseline, status: l.status, testId: "speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, baseline: r.baseline, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
+  const l = b.incrementalLeafP95Ms || {};
+  const r = b.peakRssMiB || {};
+  el.innerHTML = `${speedupBars({ label: "New tree, shared probe cache", baseline: "CMake has no cross-tree cache", value: w.value, unit: w.unit, status: w.status, testId: "speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", value: c.value, unit: c.unit, status: c.status, testId: "speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, status: l.status, testId: "speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, status: r.status, testId: "speed-rss" })}</div>${renderGiantsTable(giants)}`;
   motion.scan(el);
 }
 

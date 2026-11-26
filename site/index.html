@@ -243,14 +243,12 @@
                 </button>
               </div>
               <div class="term-body">
-                <pre class="term-panel" id="panel-install" role="tabpanel" aria-labelledby="tab-install"><span class="term-prompt">$ </span><span data-line>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash</span>
-<span class="term-out"># installs rcmake, rcmake-lsp, completions, and man page into ~/.local</span></pre>
+                <pre class="term-panel" id="panel-install" role="tabpanel" aria-labelledby="tab-install"><span class="term-prompt">$ </span><span data-line>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash</span></pre>
                 <pre class="term-panel" id="panel-source" role="tabpanel" aria-labelledby="tab-source" hidden><span class="term-prompt">$ </span><span data-line>git clone https://github.com/dvgyl/rcmake</span>
 <span class="term-prompt">$ </span><span data-line>cd rcmake &amp;&amp; RCMAKE_STAGE_PROFILE=release scripts/stage.sh</span>
 <span class="term-prompt">$ </span><span data-line>./target/stage/bin/rcmake --version</span></pre>
                 <pre class="term-panel" id="panel-alias" role="tabpanel" aria-labelledby="tab-alias" hidden><span class="term-prompt">$ </span><span data-line>curl -fsSL https://raw.githubusercontent.com/dvgyl/rcmake/main/scripts/install.sh | bash -s -- --alias-cmake</span>
-<span class="term-prompt">$ </span><span data-line>export PATH="$HOME/.local/bin:$PATH"</span>
-<span class="term-out"># symlinks cmake, ctest, cpack -> rcmake; keep ~/.local/bin first on PATH</span></pre>
+<span class="term-prompt">$ </span><span data-line>export PATH="$HOME/.local/bin:$PATH"</span></pre>
               </div>
             </div>
           </div>
@@ -268,7 +266,7 @@
             </div>
             <div class="race-lanes">
               <div class="race-lane" data-test="race-lane-cmake">
-                <div class="race-lane-head"><span>cmake 4.5.1</span><span class="dim" id="race-cmake-tag">reference</span></div>
+                <div class="race-lane-head"><span>cmake 4.5.1</span></div>
                 <div class="race-lane-cmd" id="race-cmd-cmake" data-test="race-cmd-cmake"><span class="term-prompt">$ </span>cmake -S . -B build-2 -G Ninja</div>
                 <ol class="race-lines" id="race-lines-cmake">
                   <li style="--line-idx:0">-- The CXX compiler identification is AppleClang</li>
@@ -283,7 +281,7 @@
                 </div>
               </div>
               <div class="race-lane" data-test="race-lane-rcmake">
-                <div class="race-lane-head"><span class="lane-rcmake">rcmake</span><span class="dim" id="race-rcmake-tag">same build files</span></div>
+                <div class="race-lane-head"><span class="lane-rcmake">rcmake</span></div>
                 <div class="race-lane-cmd" id="race-cmd-rcmake" data-test="race-cmd-rcmake"><span class="term-prompt">$ </span>rcmake -S . -B build-2 -G Ninja</div>
                 <ol class="race-lines" id="race-lines-rcmake">
                   <li style="--line-idx:0">-- The CXX compiler identification is AppleClang</li>
@@ -299,7 +297,7 @@
               </div>
             </div>
             <div class="race-foot">
-              <span id="race-caption" data-test="race-caption">New build tree: rcmake uses its shared probe cache; CMake 4.5.1 has no cross-tree cache. Timings appear after the v0.1.0 release verification run.</span>
+              <span id="race-caption" data-test="race-caption">CMake 4.5.1 has no cross-tree probe cache.</span>
               <button type="button" class="ctrl-btn" id="race-replay" aria-label="Replay comparison" data-test="race-replay">
                 <svg class="i" aria-hidden="true"><use href="#i-replay"/></svg>
                 <span>Replay</span>
@@ -322,7 +320,6 @@
     <section class="container band band-first" id="checked">
       <div class="band-head">
         <h2>Checked against CMake 4.5.1</h2>
-        <p class="band-lead">Each result compares rcmake output with the CMake 4.5.1 binary.</p>
       </div>
       <div class="instrument-grid">
         <div class="panel waffle-panel" id="waffle-panel" data-animate data-test="runcmake-waffles">
@@ -343,7 +340,6 @@
     <section class="container band" id="speed">
       <div class="band-head">
         <h2>Speed</h2>
-        <p class="band-lead">Each bar shows configure time relative to CMake 4.5.1. Shorter is faster.</p>
       </div>
       <div class="panel speed-panel" id="speed-panel" data-animate data-test="speed-chart" style="min-height: 254px;"></div>
     </section>
@@ -391,7 +387,7 @@
             </tr>
             <tr class="cmp-row" data-group="same" style="--row-i:4">
               <td>Policies <code data-policy-range>CMP0066-CMP0226</code> <span class="muted">(<code>CMP0000-CMP0065</code> always NEW)</span></td>
-              <td class="cmp-cell" data-cmp-gate="policies"><span class="cmp-cell-diff st-pending"><svg class="i" aria-hidden="true"><use href="#i-pending"/></svg><span>implemented, release verification pending</span></span></td>
+              <td class="cmp-cell" data-cmp-gate="policies"><span class="cmp-cell-diff st-pending"><svg class="i" aria-hidden="true"><use href="#i-pending"/></svg><span>verification pending</span></span></td>
               <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
             </tr>
             <tr class="cmp-row" data-group="same" style="--row-i:5">
@@ -401,7 +397,7 @@
             </tr>
             <tr class="cmp-row" data-group="same" style="--row-i:6">
               <td>Ninja, Unix Makefiles, Xcode, and Visual Studio 2022/2026 generators</td>
-              <td class="cmp-cell" data-cmp-gate="generators"><span class="cmp-cell-diff st-pending"><svg class="i" aria-hidden="true"><use href="#i-pending"/></svg><span>implemented, release verification pending</span></span></td>
+              <td class="cmp-cell" data-cmp-gate="generators"><span class="cmp-cell-diff st-pending"><svg class="i" aria-hidden="true"><use href="#i-pending"/></svg><span>verification pending</span></span></td>
               <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
             </tr>
 
@@ -422,7 +418,7 @@
             </tr>
 
             <tr class="cmp-group-note" data-group="rcmake-only">
-              <td colspan="3">These options work when the binary runs as <code>rcmake</code>. As <code>cmake</code>, it follows CMake 4.5.1.</td>
+              <td colspan="3">Active when invoked as <code>rcmake</code>.</td>
             </tr>
             <tr class="cmp-row" data-group="rcmake-only" style="--row-i:10">
               <td><span class="cmp-feat"><svg class="i" aria-hidden="true"><use href="#i-cache"/></svg>Probe cache</span></td>
@@ -503,7 +499,6 @@
     <section class="container band" id="pipeline">
       <div class="band-head">
         <h2>Inside a configure run</h2>
-        <p class="band-lead">Select a stage to see its crates. All 35 rcmake crates forbid unsafe code; two C codecs (zstd, liblzma) are statically linked.</p>
       </div>
       <div class="pipe-wrap" id="pipeline-widget" data-test="pipeline-widget" aria-describedby="pipeline-fallback">
         <div class="pipe-controls">
@@ -632,14 +627,13 @@
           <span>CPS</span><span class="dim" aria-hidden="true">·</span>
           <span>SPDX SBOM</span><span class="dim" aria-hidden="true">·</span>
           <span>Instrumentation API</span><span class="dim" aria-hidden="true">·</span>
-          <span title="CMP0000-CMP0065 are always NEW in CMake 4.x. 56 upstream policy suites test CMP0066-CMP0226."><span data-policy-range>CMP0066-CMP0226</span> (CMP0000-CMP0065 always NEW)</span>
+          <span title="CMP0000-CMP0065 are always NEW in CMake 4.x. 56 upstream policy suites test CMP0066-CMP0226.">Policies <span data-policy-range>CMP0066-CMP0226</span></span>
         </div>
       </div>
     </section>
     <section class="container band" id="faq">
       <div class="band-head">
         <h2>Common questions</h2>
-        <p class="band-lead">Compatibility scope, caching behavior, installation, and limits.</p>
       </div>
       <div class="panel faq-list" data-test="faq-list">
         <details class="faq-item">

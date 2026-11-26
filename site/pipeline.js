@@ -13,7 +13,7 @@ export const PIPELINE_MODEL = {
   outputs: ["build.ninja", "Makefile", "project.pbxproj", ".sln .vcxproj"],
   hosts: {
     native: { label: "NativeHost", sentence: "NativeHost reads the real disk, environment, processes, and clock.", chips: ["disk", "env", "processes", "clock"], crates: ["host"] },
-    pure: { label: "PureHost", sentence: "PureHost keeps files in memory and gives the same result every run. Tests, editors, and the wasm32 playground use it.", chips: ["in-memory files", "tests", "editors", "wasm32"], crates: ["host", "wasm"] }
+    pure: { label: "PureHost", sentence: "PureHost keeps files in memory for deterministic tests, editors, and wasm32.", chips: ["in-memory files", "tests", "editors", "wasm32"], crates: ["host", "wasm"] }
   },
   crateGroups: [
     { name: "Base", crates: ["base", "json", "diag", "host", "regex", "archive"] },

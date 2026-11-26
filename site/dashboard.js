@@ -1,8 +1,16 @@
 /* rcmake compatibility report controller. MIT OR Apache-2.0. */
 
-import { cleanNote, escapeHtml, formatNumber, formatPercent, formatRatio, initRovingGroup, isPreFreezeGate, loadLatestData, normalizeStatus, overviewRows, snapshotMeta, statusHtml } from "./app.js";
+import { escapeHtml, formatNumber, formatPercent, formatRatio, initRovingGroup, isPreFreezeGate, loadLatestData, normalizeStatus, overviewRows, snapshotMeta, statusHtml } from "./app.js";
 import { formatSpeed, fuzzGaugeCard, horizontalBar, inlineBar, isMeasured, ringGaugeCard, segmentRing, shardHeatmap, speedupBars, statRow, statusIcon, waffleRowsHtml } from "./charts.js";
 import { animateCountUp, createMotionController } from "./motion.js";
+
+const GATE_LABELS = Object.freeze({
+  fuzz: "Seeded fuzzing",
+  wasi: "WASI and wasm32",
+  "probe-cache": "Probe cache",
+  "mutation-replay": "Mutation replay",
+  blackbox: "Black-box scenarios"
+});
 
 export function renderSummary(data) {
   const body = overviewRows(data).map((r) => `<tr data-status="${r.status}"><td><a href="#${escapeHtml(r.id)}">${escapeHtml(r.check)}</a></td><td>${r.result ? `<span data-value>${escapeHtml(r.result)}</span>` : `<span class="dim"><span data-value></span>${escapeHtml(r.scope)}</span>`}</td><td class="inline-bar-cell">${inlineBar(r.ratio, r.status)}</td><td>${statusHtml(r.status, r.statusText)}</td></tr>`).join("");
@@ -21,7 +29,7 @@ export function renderCore(core, policies) {
   const ok = isMeasured(policies?.suitesPassed);
   const st = ok ? normalizeStatus(policies.status) : "pending";
   const aria = ok ? `Policies ${policies.activeRange}. ${policies.suitesPassed} of ${policies.suitesTotal} suites pass.` : `Policies ${policies?.activeRange || ""}. ${policies?.suitesTotal ?? 56} suites, pending.`;
-  return `<section id="core" class="report-section" data-animate data-test="section-core"><h2>Core suites and policies</h2><div class="core-grid"><figure class="panel rate-bars" aria-label="Selected core suites" style="margin-bottom:0">${bars}</figure><figure class="panel policy-card" aria-label="${escapeHtml(aria)}" data-status="${st}" data-test="policy-ring">${segmentRing({ passed: policies?.suitesPassed, total: policies?.suitesTotal ?? 56, status: st, size: 112, stroke: 7 })}<div class="gauge-label">Policies ${escapeHtml(policies?.activeRange || "")}</div><div class="policy-meta">Always NEW: ${escapeHtml(policies?.baselineAlwaysNew || "CMP0000-CMP0065")}. 56 RunCMake suites test the 161 active policies.</div></figure></div></section>`;
+  return `<section id="core" class="report-section" data-animate data-test="section-core"><h2>Core suites and policies</h2><div class="core-grid"><figure class="panel rate-bars" aria-label="Selected core suites" style="margin-bottom:0">${bars}</figure><figure class="panel policy-card" aria-label="${escapeHtml(aria)}" data-status="${st}" data-test="policy-ring">${segmentRing({ passed: policies?.suitesPassed, total: policies?.suitesTotal ?? 56, status: st, size: 112, stroke: 7 })}<div class="gauge-label">Policies ${escapeHtml(policies?.activeRange || "")}</div><div class="policy-meta">${escapeHtml(policies?.baselineAlwaysNew || "CMP0000-CMP0065")} always NEW</div></figure></div></section>`;
 }
 
 export function projectRowHtml(p) {
@@ -33,13 +41,13 @@ export function projectRowHtml(p) {
 
 export function renderProjects(track) {
   const rows = (track?.projects || []).map(projectRowHtml).join("");
-  return `<section id="projects" class="report-section" data-test="section-projects"><h2>Large projects</h2><p class="section-lead">L1 checks configure success and stderr parity with CMake 4.5.1. L2 checks CMakeCache.txt, Ninja build-graph dry-run, and File API parity for the listed targets.</p><div class="filter-bar"><div class="seg" role="group" aria-label="Filter by tier" id="proj-tier" data-test="proj-tier"><button type="button" aria-pressed="true" data-tier-val="all">All</button><button type="button" aria-pressed="false" data-tier-val="standard">Standard</button><button type="button" aria-pressed="false" data-tier-val="large">Large</button></div><div class="seg" role="group" aria-label="Filter by status" id="proj-status" data-test="proj-status"><button type="button" aria-pressed="true" data-status-val="all">All</button><button type="button" aria-pressed="false" data-status-val="l1">L1 pass</button><button type="button" aria-pressed="false" data-status-val="l2">L2 pass</button><button type="button" aria-pressed="false" data-status-val="pending">Pending</button></div><input id="proj-search" class="search-input" type="search" placeholder="Filter projects" aria-label="Filter projects" data-test="proj-search"></div><div class="table-panel"><table class="bench-table" id="proj-table" data-test="proj-table"><thead><tr><th>Project</th><th>Version</th><th>Targets</th><th>L1</th><th>L2</th></tr></thead><tbody>${rows}<tr id="proj-empty" hidden><td colspan="5" class="dim">No projects match.</td></tr></tbody></table></div></section>`;
+  return `<section id="projects" class="report-section" data-test="section-projects"><h2>Large projects</h2><p class="section-lead">L1: configure and stderr \u00b7 L2: cache, Ninja graph, and File API</p><div class="filter-bar"><div class="seg" role="group" aria-label="Filter by tier" id="proj-tier" data-test="proj-tier"><button type="button" aria-pressed="true" data-tier-val="all">All</button><button type="button" aria-pressed="false" data-tier-val="standard">Standard</button><button type="button" aria-pressed="false" data-tier-val="large">Large</button></div><div class="seg" role="group" aria-label="Filter by status" id="proj-status" data-test="proj-status"><button type="button" aria-pressed="true" data-status-val="all">All</button><button type="button" aria-pressed="false" data-status-val="l1">L1 pass</button><button type="button" aria-pressed="false" data-status-val="l2">L2 pass</button><button type="button" aria-pressed="false" data-status-val="pending">Pending</button></div><input id="proj-search" class="search-input" type="search" placeholder="Filter projects" aria-label="Filter projects" data-test="proj-search"></div><div class="table-panel"><table class="bench-table" id="proj-table" data-test="proj-table"><thead><tr><th>Project</th><th>Version</th><th>Targets</th><th>L1</th><th>L2</th></tr></thead><tbody>${rows}<tr id="proj-empty" hidden><td colspan="5" class="dim">No projects match.</td></tr></tbody></table></div></section>`;
 }
 
 export function renderHoldout(track) {
   const total = formatNumber(track?.reposTotal) || "240";
   const bars = (track?.categories || []).map((c, i) => horizontalBar({ label: c.category, passed: c.reposPassed, total: c.reposTotal, rate: c.passRate, status: c.status, testId: `holdout-cat-${i}` })).join("");
-  return `<section id="holdout" class="report-section" data-animate data-test="section-holdout"><h2>Blind holdout</h2><figure class="panel" aria-label="Blind holdout category results"><div class="holdout-banner"><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg><span>${escapeHtml(total)} sealed repositories. Only category totals are published.</span></div><div class="rate-bars" style="margin-bottom:0">${bars}</div></figure></section>`;
+  return `<section id="holdout" class="report-section" data-animate data-test="section-holdout"><h2>Blind holdout</h2><figure class="panel" aria-label="Blind holdout category results"><div class="holdout-banner"><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg><span>${escapeHtml(total)} sealed repositories \u00b7 category totals only</span></div><div class="rate-bars" style="margin-bottom:0">${bars}</div></figure></section>`;
 }
 
 export function shardDetail(shard) {
@@ -55,7 +63,8 @@ export function renderVcpkg(track) {
   const counts = { pass: 0, partial: 0, fail: 0, pending: 0 };
   shards.forEach((s) => { counts[normalizeStatus(s.status)] += 1; });
   const legend = `pass ${counts.pass} \u00b7 partial ${counts.partial} \u00b7 fail ${counts.fail} \u00b7 pending ${counts.pending}`;
-  return `<section id="vcpkg" class="report-section" data-animate data-test="section-vcpkg"><h2>vcpkg ports</h2><figure class="panel vcpkg-wrap" aria-label="${escapeHtml(`vcpkg ports across ${shards.length} shards. ${legend}.`)}"><div class="heatmap-area"><div class="heatmap-grid" id="vcpkg-grid" role="group" aria-label="vcpkg shards" data-test="vcpkg-heatmap">${shardHeatmap(shards, { cols: 8 })}</div><div class="hm-detail" id="shard-detail" data-test="shard-detail" aria-live="polite">Select a shard to inspect its counts.</div></div><div class="hm-legend" data-test="vcpkg-legend">${escapeHtml(legend)}</div></figure></section>`;
+  const initialDetail = shards.length ? escapeHtml(shardDetail(shards[0])) : "";
+  return `<section id="vcpkg" class="report-section" data-animate data-test="section-vcpkg"><h2>vcpkg ports</h2><figure class="panel vcpkg-wrap" aria-label="${escapeHtml(`vcpkg ports across ${shards.length} shards. ${legend}.`)}"><div class="heatmap-area"><div class="heatmap-grid" id="vcpkg-grid" role="group" aria-label="vcpkg shards" data-test="vcpkg-heatmap">${shardHeatmap(shards, { cols: 8 })}</div><div class="hm-detail" id="shard-detail" data-test="shard-detail" aria-live="polite">${initialDetail}</div></div><div class="hm-legend" data-test="vcpkg-legend">${escapeHtml(legend)}</div></figure></section>`;
 }
 
 function maxProjectRss(project, key) {
@@ -98,7 +107,7 @@ export function renderGiantsBench(giants) {
     const incP95 = isMeasured(s.incrementalLeafMaxP95Ms) ? ` (${formatNumber(s.incrementalLeafMaxP95Ms)} ms max p95)` : "";
     const incTxt = formatSpeed(s.incrementalLeafSpeedupGeomean) ? `${formatSpeed(s.incrementalLeafSpeedupGeomean)}\u00d7${incP95}` : (incP95 ? incP95.slice(2, -1) : "-");
     const scope = isMeasured(s.projectsPassed) && isMeasured(s.projectsTotal) ? `${formatNumber(s.projectsPassed)} / ${formatNumber(s.projectsTotal)} passed` : "";
-    const metaSub = scope ? `${scope} \u00b7 geomean speedup, max p95 & RSS` : "geomean speedup, max p95 & RSS";
+    const metaSub = scope ? `${scope} \u00b7 geomean / max` : "geomean / max";
     summaryRow = `<tr class="cmp-group-note" data-status="${st}" data-test="dash-giants-summary"><td><span>Summary</span><span class="proj-repo">${escapeHtml(metaSub)}</span></td><td class="mono nowrap">${escapeHtml(fmtG(s.coldSpeedupGeomean))}</td><td class="mono nowrap">${escapeHtml(fmtG(s.warmProbeSpeedupGeomean))}</td><td class="mono nowrap">${escapeHtml(incTxt)}</td><td class="mono nowrap">${escapeHtml(formatRssPair(s.rcmakeMaxPeakRssMiB, s.cmakeMaxPeakRssMiB))}</td><td>${statusHtml(st)}</td></tr>`;
   }
   return `<div class="table-panel" style="margin-top:16px" data-test="dash-giants-bench"><table class="bench-table"><thead><tr><th>Real-world project</th><th>Cold</th><th>New tree (probe cache)</th><th>Incremental leaf</th><th>Peak RSS (rcmake / CMake)</th><th>Status</th></tr></thead><tbody>${rows}${summaryRow}</tbody></table></div>`;
@@ -118,17 +127,18 @@ export function renderDifferentialFuzz(diff) {
 export function renderSpeed(benchTrack) {
   const b = benchTrack?.benchmarks || {};
   const [w, c, l, r] = [b.warmProbeSpeedup || {}, b.coldConfigureSpeedup || {}, b.incrementalLeafP95Ms || {}, b.peakRssMiB || {}];
-  return `<section id="speed" class="report-section" data-animate data-test="section-speed"><h2>Speed and memory</h2><div class="panel speed-panel">${speedupBars({ label: "New tree, shared probe cache", baseline: w.baseline || "vs CMake 4.5.1 new build tree", value: w.value, unit: w.unit, status: w.status, testId: "dash-speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", baseline: c.baseline || "empty probe cache, synthetic C project", value: c.value, unit: c.unit, status: c.status, testId: "dash-speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, baseline: l.baseline, status: l.status, testId: "dash-speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, baseline: r.baseline, status: r.status, testId: "dash-speed-rss" })}</div></div>${renderGiantsBench(benchTrack?.giantsBenchmark)}</section>`;
+  return `<section id="speed" class="report-section" data-animate data-test="section-speed"><h2>Speed and memory</h2><div class="panel speed-panel">${speedupBars({ label: "New tree, shared probe cache", baseline: "CMake has no cross-tree cache", value: w.value, unit: w.unit, status: w.status, testId: "dash-speed-warm" })}${speedupBars({ label: "Cold configure, 500 targets", value: c.value, unit: c.unit, status: c.status, testId: "dash-speed-cold" })}<div class="speed-stats">${statRow({ label: "Leaf edit reconfigure, p95", value: l.value, unit: l.unit, status: l.status, testId: "dash-speed-leaf" })}${statRow({ label: "Peak memory, 500 targets", value: r.value, unit: r.unit, status: r.status, testId: "dash-speed-rss" })}</div></div>${renderGiantsBench(benchTrack?.giantsBenchmark)}</section>`;
 }
 
 export function renderBenchmarks(benchTrack, data = null) {
   const cards = (benchTrack?.gates || []).map((g) => {
     const preFreeze = isPreFreezeGate(g, data);
     const st = preFreeze ? "partial" : g.status;
-    const summary = cleanNote(g.summary);
-    if (g.id === "fuzz") return fuzzGaugeCard({ label: g.label, passed: g.passed, failures: g.failures, status: st, summary, preFreeze, testId: "dash-gate-fuzz" });
+    const label = GATE_LABELS[g.id] || g.label;
+    const summary = preFreeze ? (g.commit ? `pre-freeze \u00b7 ${g.commit}` : "pre-freeze") : "";
+    if (g.id === "fuzz") return fuzzGaugeCard({ label, passed: g.passed, failures: g.failures, status: st, summary, preFreeze, testId: "dash-gate-fuzz" });
     return ringGaugeCard({
-      label: g.label,
+      label,
       passed: g.id === "blackbox" ? g.scenariosPassed : g.passed,
       total: g.id === "blackbox" ? g.scenariosTotal : g.total,
       status: st,
@@ -260,9 +270,6 @@ async function init(doc) {
   try {
     const data = await loadLatestData();
     doc.getElementById("report-meta").textContent = snapshotMeta(data);
-    const noteText = cleanNote(data.statusNote);
-    const hasPending = overviewRows(data).some((r) => r.status === "pending");
-    doc.getElementById("report-note").textContent = noteText || (hasPending ? "Pending values populate after the v0.1.0 release verification run." : "");
     root.innerHTML = renderReport(data);
     buildRail(doc, data);
     wireProjectFilter(doc);

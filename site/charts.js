@@ -163,8 +163,7 @@ export function waffleRowsHtml(platforms, { cell = 7, gap = 2, testPrefix = "waf
       ? waffle({ passed: p.suitesPassed, total: p.suitesTotal, cols: 53, rows: 7, status: st, cell, gap })
       : '<div class="bar-track waffle-pending-bar is-pending" data-loop data-status="pending" aria-hidden="true"></div>';
     const footLeft = ok ? `${formatNumber(p.suitesPassed)} of ${formatNumber(p.suitesTotal)} suites pass` : `${formatNumber(p.suitesTotal)} RunCMake suites`;
-    const footRight = ok ? "One square per suite." : "v0.1.0 release verification run";
-    return `<figure class="waffle-row${ok ? "" : " is-pending-row"}" aria-label="${escapeHtml(aria)}" data-status="${st}" data-test="${escapeHtml(testPrefix)}-${escapeHtml(p.id)}"><div class="waffle-head"><div class="waffle-os"><span class="waffle-name">${escapeHtml(p.name)}</span><span class="waffle-tc">${escapeHtml(p.toolchain)}</span></div>${statusHtml(st)}</div>${visual}<div class="waffle-foot"><span>${escapeHtml(footLeft)}</span><span>${escapeHtml(footRight)}</span></div></figure>`;
+    return `<figure class="waffle-row${ok ? "" : " is-pending-row"}" aria-label="${escapeHtml(aria)}" data-status="${st}" data-test="${escapeHtml(testPrefix)}-${escapeHtml(p.id)}"><div class="waffle-head"><div class="waffle-os"><span class="waffle-name">${escapeHtml(p.name)}</span><span class="waffle-tc">${escapeHtml(p.toolchain)}</span></div>${statusHtml(st)}</div>${visual}<div class="waffle-foot"><span>${escapeHtml(footLeft)}</span></div></figure>`;
   }).join("");
 }
 
