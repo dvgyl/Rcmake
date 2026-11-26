@@ -620,6 +620,7 @@ impl TraceMemo {
             host,
             &canonical,
             stamped.then_some(&mut stamps),
+            tree::FOREGROUND_WORKERS,
             |path, resolved| {
                 if links.len() >= 512 {
                     links_complete = false;
@@ -769,13 +770,20 @@ impl TraceMemo {
         let mut stamps = tree::DirStamps::default();
         let mut links = Vec::new();
         let mut links_complete = true;
-        let Ok(graph) = tree::sdk_graph(host, &canonical, Some(&mut stamps), |path, resolved| {
-            if links.len() >= 512 {
-                links_complete = false;
-            } else {
-                links.push(tree::SdkLink { path, resolved });
-            }
-        }) else {
+        let walk = tree::sdk_graph(
+            host,
+            &canonical,
+            Some(&mut stamps),
+            tree::BACKGROUND_WORKERS,
+            |path, resolved| {
+                if links.len() >= 512 {
+                    links_complete = false;
+                } else {
+                    links.push(tree::SdkLink { path, resolved });
+                }
+            },
+        );
+        let Ok(graph) = walk else {
             return;
         };
         let dirs = usable_stamps(host, stamps, links_complete);
@@ -896,6 +904,23 @@ impl TraceMemo {
             files.insert(stat, digest);
         }
         Ok(digest)
+    }
+
+    /// Hash a file before a probe needs it, but only if the memo can keep the digest.
+    ///
+    /// Skip a file that a process of this user can change, because the memo
+    /// never reuses its digest. The memo checks a kept digest again with fresh
+    /// identity and metadata before each use.
+    pub fn prefetch_file_digest(&self, host: &dyn Host, path: &Path) {
+        if self.verify {
+            return;
+        }
+        if host
+            .metadata_fresh(path, Follow::Yes)
+            .is_ok_and(|metadata| immutable(&metadata, host.effective_uid()))
+        {
+            let _ = self.file_digest(host, path);
+        }
     }
 
     /// Verify current inputs and share file digests across checks in this session.

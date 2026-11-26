@@ -795,11 +795,22 @@ fn prefetch_toolchain(
     sysroot: Option<PathBuf>,
     cancel: &AtomicBool,
 ) {
+    // The memo keeps a digest only for a file that this user cannot change.
+    // A build of Rcmake that this user owns is hashed again on each use.
     if let Ok(exe) = live.current_exe() {
-        let _ = memo.file_digest(live.as_ref(), &exe);
+        memo.prefetch_file_digest(live.as_ref(), &exe);
     }
     if live.system().sysname != "Darwin" {
         return;
+    }
+    // Hash the probable Apple driver and linker before the ABI probe needs
+    // them. A wrong guess only wastes background work, because the probe
+    // checks each digest again with fresh identity and metadata.
+    for file in apple_tool_candidates(live.as_ref()) {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        memo.prefetch_file_digest(live.as_ref(), &file);
     }
     let Some(sdk) = sysroot.filter(|sdk| sdk.is_absolute()) else {
         return;
@@ -817,4 +828,34 @@ fn prefetch_toolchain(
     if !cancel.load(Ordering::Relaxed) {
         let _ = memo.file_digest(live.as_ref(), &sdk.join("SDKSettings.json"));
     }
+}
+
+/// Return the probable paths of the Apple compiler driver and linker.
+///
+/// Find the developer directory from `DEVELOPER_DIR`, then from the
+/// `xcode-select` link, then use the Command Line Tools. Run no process.
+fn apple_tool_candidates(host: &dyn Host) -> Vec<PathBuf> {
+    let developer = host
+        .env_get(b"DEVELOPER_DIR")
+        .filter(|value| !value.is_empty())
+        .map(|value| path::to_native(&value))
+        .or_else(|| host.read_link(Path::new("/var/db/xcode_select_link")).ok())
+        .filter(|dir| dir.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/Library/Developer/CommandLineTools"));
+    let toolchain = developer.join("Toolchains/XcodeDefault.xctoolchain/usr/bin");
+    let tools = developer.join("usr/bin");
+    let mut candidates = Vec::with_capacity(5);
+    for dir in [toolchain, tools] {
+        for name in ["clang", "ld"] {
+            let file = dir.join(name);
+            if host
+                .metadata(&file, Follow::Yes)
+                .is_ok_and(|stat| stat.kind == FileKind::File)
+            {
+                candidates.push(file);
+            }
+        }
+    }
+    candidates.push(PathBuf::from("/usr/bin/xcrun"));
+    candidates
 }

@@ -88,10 +88,13 @@ impl PlatformQueries {
                 continue;
             };
             let worker = Arc::clone(host);
+            let digests = self.3.clone();
             let started = key.clone();
             if let Ok(handle) = std::thread::Builder::new()
                 .name("rcmake-platform-query".into())
-                .spawn(move || launch_observed(worker.as_ref(), &started, &request))
+                .spawn(move || {
+                    launch_observed(digests.as_deref(), worker.as_ref(), &started, &request)
+                })
             {
                 pending.push((key, handle));
             }

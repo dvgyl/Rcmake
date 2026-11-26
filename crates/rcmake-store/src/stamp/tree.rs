@@ -115,8 +115,17 @@ fn root_digest(
 }
 
 pub(super) fn sdk_graph_digest(host: &dyn Host, canonical: &Path) -> HostResult<Digest> {
-    sdk_graph(host, canonical, None, |_, _| {})
+    sdk_graph(host, canonical, None, FOREGROUND_WORKERS, |_, _| {})
 }
+
+/// The number of threads that list the SDK graph for a probe that waits.
+pub(super) const FOREGROUND_WORKERS: usize = 6;
+
+/// The number of threads that list the SDK graph in the background.
+///
+/// A small number keeps cores free for the compiler-identification compile,
+/// which runs at the same time and also reads the SDK.
+pub(super) const BACKGROUND_WORKERS: usize = 2;
 
 /// The maximum number of directory stamps in one SDK listing.
 pub(super) const MAX_DIR_STAMPS: usize = 8192;
@@ -428,6 +437,7 @@ fn prefetch_sdk_graph(
     host: &dyn Host,
     canonical: &Path,
     stamp: bool,
+    workers: usize,
 ) -> HashMap<PathBuf, HostResult<SdkDirSnapshot>> {
     let mut prefetched = HashMap::new();
     let mut seen = BTreeSet::from([canonical.to_owned()]);
@@ -446,7 +456,7 @@ fn prefetch_sdk_graph(
         } else {
             let next = AtomicUsize::new(0);
             let out = Mutex::new(Vec::with_capacity(frontier.len()));
-            let worker_count = frontier.len().min(6);
+            let worker_count = frontier.len().min(workers.max(1));
             let work = || {
                 let mut local = Vec::new();
                 loop {
@@ -518,22 +528,26 @@ fn prefetch_sdk_graph(
     _host: &dyn Host,
     _canonical: &Path,
     _stamp: bool,
+    _workers: usize,
 ) -> HashMap<PathBuf, HostResult<SdkDirSnapshot>> {
     HashMap::new()
 }
 
 /// Hash the SDK graph below `canonical`. With `stamps`, also stamp each visited directory.
+///
+/// At most `workers` threads list directories at the same time.
 pub(super) fn sdk_graph(
     host: &dyn Host,
     canonical: &Path,
     mut stamps: Option<&mut DirStamps>,
+    workers: usize,
     mut observe_link: impl FnMut(PathBuf, Option<(PathBuf, FileKind)>),
 ) -> HostResult<Digest> {
     let stamp = stamps.is_some();
     if let Some(stamps) = stamps.as_deref_mut() {
         stamps.complete = true;
     }
-    let mut prefetched = prefetch_sdk_graph(host, canonical, stamp);
+    let mut prefetched = prefetch_sdk_graph(host, canonical, stamp, workers);
     let mut key = KeyHasher::new(Domain::BlobV1);
     key.field(0, b"sdk-tree-graph");
     key.field(1, canonical.as_os_str().as_encoded_bytes());

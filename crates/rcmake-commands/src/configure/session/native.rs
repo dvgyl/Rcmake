@@ -105,7 +105,13 @@ impl NativeSession {
             && !platform_queries_disabled(self.base.as_ref())
         {
             let queries = self.platform_queries.get_or_init(|| {
-                let queries = Arc::new(super::super::platform_queries::PlatformQueries::default());
+                let memo = self
+                    .probe
+                    .as_ref()
+                    .map(|probe| Arc::clone(probe.trace_memo()));
+                let queries = Arc::new(super::super::platform_queries::PlatformQueries::with_memo(
+                    memo,
+                ));
                 queries.prefetch(&self.host());
                 queries
             });

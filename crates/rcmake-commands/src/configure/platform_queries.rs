@@ -13,7 +13,7 @@ use rcmake_host::{
     RunRequest, Stream, path,
 };
 use rcmake_json::{ReadOptions, Value, parse, write_compact};
-use rcmake_store::{Digest, Domain, InputStamp, KeyHasher, file_digest};
+use rcmake_store::{Digest, Domain, InputStamp, KeyHasher, TraceMemo, file_digest};
 
 use super::try_compile::plan::{environment_fingerprint, process_environment};
 
@@ -75,9 +75,37 @@ pub(super) struct PlatformQueries(
     Mutex<RecordedQueries>,
     prefetch::Prefetched,
     Option<Vec<PersistedEntry>>,
+    /// The session memo for program digests. Try-compile children share it.
+    Option<std::sync::Arc<TraceMemo>>,
 );
 
+/// Hash a query program. Use the session memo if one is attached.
+///
+/// The memo reuses a digest only for a file that no process of this user can
+/// change, and only while its fresh identity and metadata agree. In
+/// verification mode, the memo calculates each digest again.
+fn program_digest(memo: Option<&TraceMemo>, host: &dyn Host, program: &Path) -> HostResult<Digest> {
+    match memo {
+        Some(memo) => memo.file_digest(host, program),
+        None => file_digest(host, program),
+    }
+}
+
 impl PlatformQueries {
+    /// Make an empty set of queries that hashes programs through `memo`.
+    pub(in crate::configure) fn with_memo(memo: Option<std::sync::Arc<TraceMemo>>) -> Self {
+        Self(
+            Mutex::default(),
+            prefetch::Prefetched::default(),
+            None,
+            memo,
+        )
+    }
+
+    fn memo(&self) -> Option<&TraceMemo> {
+        self.3.as_deref()
+    }
+
     /// Sample each recorded query again in the environment of a try-compile
     /// child.
     ///
@@ -85,6 +113,7 @@ impl PlatformQueries {
     /// modules run. For example, it restores `LC_ALL` as an empty value, and
     /// policy `CMP0132` OLD exports `CC`. The child sees that environment.
     pub(super) fn refresh(&self, host: &dyn Host, env: &[(BString, BString)]) {
+        let digests = self.memo();
         let Ok(mut memo) = self.0.lock() else {
             return;
         };
@@ -118,7 +147,7 @@ impl PlatformQueries {
                 {
                     continue;
                 }
-                if file_digest(host, &key.program).is_ok() {
+                if program_digest(digests, host, &key.program).is_ok() {
                     ready.push((key, request.clone()));
                 }
             }
@@ -128,14 +157,14 @@ impl PlatformQueries {
                     .iter()
                     .map(
                         |(key, request)| -> crate::configure::concurrent::Job<'_, ObservedLaunch> {
-                            Box::new(move || launch_observed(host, key, request))
+                            Box::new(move || launch_observed(digests, host, key, request))
                         },
                     )
                     .collect(),
             );
             for ((key, request), launched) in ready.into_iter().zip(launches) {
                 if let Some(launched) = launched {
-                    let _ = record(host, &mut memo, key, &request, launched, |_| {});
+                    let _ = record(digests, host, &mut memo, key, &request, launched, |_| {});
                 }
             }
         }
@@ -298,6 +327,7 @@ impl PlatformQueries {
                 Mutex::default(),
                 prefetch::Prefetched::default(),
                 Some(entries),
+                None,
             )
         })
     }
@@ -415,7 +445,8 @@ pub(crate) fn run(cx: &Cx<'_>, request: &RunRequest) -> Option<HostResult<RunOut
     {
         return None;
     }
-    let executable = file_digest(host, &key.program).ok()?;
+    let digests = memo_queries.memo();
+    let executable = program_digest(digests, host, &key.program).ok()?;
     let mut memo = memo_queries.0.lock().ok()?;
     if !admits_xcrun(host, &memo, &key, request) {
         return None;
@@ -505,7 +536,7 @@ pub(crate) fn run(cx: &Cx<'_>, request: &RunRequest) -> Option<HostResult<RunOut
         }
         return Some(Ok(result.clone()));
     }
-    let launched = take_or_launch(host, &memo_queries.1, &key, executable, request);
+    let launched = take_or_launch(digests, host, &memo_queries.1, &key, executable, request);
     let matches_receipt_executable = launched.program_digest == Some(executable);
     if let Ok(result) = &launched.output
         && request.stderr == Output::Inherit
@@ -513,14 +544,22 @@ pub(crate) fn run(cx: &Cx<'_>, request: &RunRequest) -> Option<HostResult<RunOut
     {
         write_inherited_stderr(cx, &result.stderr);
     }
-    Some(record(host, &mut memo, key, request, launched, |result| {
-        if matches_receipt_executable
-            && let Some((receipts, digest, expected)) = &receipt
-            && result == expected
-        {
-            receipts.record(*digest);
-        }
-    }))
+    Some(record(
+        digests,
+        host,
+        &mut memo,
+        key,
+        request,
+        launched,
+        |result| {
+            if matches_receipt_executable
+                && let Some((receipts, digest, expected)) = &receipt
+                && result == expected
+            {
+                receipts.record(*digest);
+            }
+        },
+    ))
 }
 
 /// Admit `xcrun` only with a standard SDK and developer directory.
@@ -545,6 +584,7 @@ fn admits_xcrun(
 }
 
 fn take_or_launch(
+    digests: Option<&TraceMemo>,
     host: &dyn Host,
     prefetched: &prefetch::Prefetched,
     key: &Query,
@@ -553,22 +593,27 @@ fn take_or_launch(
 ) -> ObservedLaunch {
     prefetched
         .take(key, current_program_digest)
-        .unwrap_or_else(|| launch_observed(host, key, request))
+        .unwrap_or_else(|| launch_observed(digests, host, key, request))
 }
 
 /// Run an admitted query with captured output and no input, capturing its
 /// executable digest and live platform-state digest strictly around the
 /// process execution.
-fn launch_observed(host: &dyn Host, key: &Query, request: &RunRequest) -> ObservedLaunch {
-    let program_before = file_digest(host, &key.program).ok();
+fn launch_observed(
+    digests: Option<&TraceMemo>,
+    host: &dyn Host,
+    key: &Query,
+    request: &RunRequest,
+) -> ObservedLaunch {
+    let program_before = program_digest(digests, host, &key.program).ok();
     let before = compute_input_state_digest(host, &key.program, &key.args, &request.env);
     let output = launch(host, key, request);
-    let program_after = file_digest(host, &key.program).ok();
+    let program_after = program_digest(digests, host, &key.program).ok();
     let (program_digest, state_digest) = match (program_before, program_after) {
         (Some(a), Some(b)) if a == b => {
             let state_digest = match &output {
                 Ok(result) => finalize_state_digest(host, key, request, before, result)
-                    .filter(|_| file_digest(host, &key.program).ok() == Some(a)),
+                    .filter(|_| program_digest(digests, host, &key.program).ok() == Some(a)),
                 Err(_) => None,
             };
             (Some(a), state_digest)
@@ -618,6 +663,7 @@ fn launch(host: &dyn Host, key: &Query, request: &RunRequest) -> HostResult<RunO
 
 /// Record a successful query result with bounded output.
 fn record(
+    digests: Option<&TraceMemo>,
     host: &dyn Host,
     memo: &mut RecordedQueries,
     key: Query,
@@ -627,16 +673,16 @@ fn record(
 ) -> HostResult<RunOutput> {
     let ObservedLaunch {
         output,
-        program_digest,
+        program_digest: launched_digest,
         state_digest,
     } = launched;
     let inherited_error = request.stderr == Output::Inherit;
-    if let (Ok(result), Some(executable)) = (&output, program_digest)
+    if let (Ok(result), Some(executable)) = (&output, launched_digest)
         && result.results.as_slice() == [ProcessResult::Exited(0)]
         && result.stdout.len().saturating_add(result.stderr.len()) <= 64 * 1024
         && (!inherited_error || result.stderr.is_empty())
         && memo.0.len() < 64
-        && file_digest(host, &key.program) == Ok(executable)
+        && program_digest(digests, host, &key.program) == Ok(executable)
     {
         on_record(result);
         memo.0.insert(
@@ -1736,12 +1782,13 @@ mod tests {
         let xs_req = make_req("/usr/bin/xcode-select", vec!["-print-path".into()]);
         let xs_key = query(host.as_ref(), &xs_req)
             .ok_or_else(|| rcmake_host::HostError::unsupported("Expected xcode-select query."))?;
-        let unstable = launch_observed(host.as_ref(), &xs_key, &xs_req);
+        let unstable = launch_observed(None, host.as_ref(), &xs_key, &xs_req);
         assert!(unstable.state_digest.is_none());
 
         let unstable_queries = PlatformQueries::default();
         if let Ok(mut memo) = unstable_queries.0.lock() {
             let _ = record(
+                None,
                 host.as_ref(),
                 &mut memo,
                 xs_key.clone(),
@@ -1764,9 +1811,9 @@ mod tests {
         let sw_key = query(host.as_ref(), &sw_req)
             .ok_or_else(|| rcmake_host::HostError::unsupported("Expected sw_vers query."))?;
 
-        let xs_obs = launch_observed(host.as_ref(), &xs_key, &xs_req);
-        let xcrun_obs = launch_observed(host.as_ref(), &xcrun_key, &xcrun_req);
-        let sw_obs = launch_observed(host.as_ref(), &sw_key, &sw_req);
+        let xs_obs = launch_observed(None, host.as_ref(), &xs_key, &xs_req);
+        let xcrun_obs = launch_observed(None, host.as_ref(), &xcrun_key, &xcrun_req);
+        let sw_obs = launch_observed(None, host.as_ref(), &sw_key, &sw_req);
         let expected_xs_digest = xs_obs
             .state_digest
             .ok_or_else(|| rcmake_host::HostError::unsupported("Expected xcode-select digest."))?;
@@ -1775,8 +1822,17 @@ mod tests {
 
         let stable_queries = PlatformQueries::default();
         if let Ok(mut memo) = stable_queries.0.lock() {
-            let _ = record(host.as_ref(), &mut memo, xs_key, &xs_req, xs_obs, |_| {})?;
             let _ = record(
+                None,
+                host.as_ref(),
+                &mut memo,
+                xs_key,
+                &xs_req,
+                xs_obs,
+                |_| {},
+            )?;
+            let _ = record(
+                None,
                 host.as_ref(),
                 &mut memo,
                 xcrun_key,
@@ -1784,7 +1840,15 @@ mod tests {
                 xcrun_obs,
                 |_| {},
             )?;
-            let _ = record(host.as_ref(), &mut memo, sw_key, &sw_req, sw_obs, |_| {})?;
+            let _ = record(
+                None,
+                host.as_ref(),
+                &mut memo,
+                sw_key,
+                &sw_req,
+                sw_obs,
+                |_| {},
+            )?;
         }
 
         // Mutate Xcode selection state AFTER observation, BEFORE session finish.
@@ -1942,11 +2006,11 @@ mod tests {
         };
         let ios_key = query(&host, &ios_req)
             .ok_or_else(|| rcmake_host::HostError::unsupported("Expected iphoneos xcrun query."))?;
-        let ios_obs = launch_observed(&host, &ios_key, &ios_req);
+        let ios_obs = launch_observed(None, &host, &ios_key, &ios_req);
         assert!(ios_obs.state_digest.is_none());
         let queries = PlatformQueries::default();
         if let Ok(mut memo) = queries.0.lock() {
-            let _ = record(&host, &mut memo, ios_key, &ios_req, ios_obs, |_| {})?;
+            let _ = record(None, &host, &mut memo, ios_key, &ios_req, ios_obs, |_| {})?;
         }
         assert!(queries.render_persisted().is_none());
 
@@ -1985,6 +2049,23 @@ mod tests {
                 rcmake_host::HostError::unsupported("Expected updated custom SDK digest.")
             })?;
         assert_ne!(custom_v1, custom_v2);
+        Ok(())
+    }
+
+    #[test]
+    fn memo_program_digest_follows_a_changed_program() -> HostResult<()> {
+        let host = PureHost::default();
+        let program = Path::new("/opt/tools/bin/query");
+        host.seed_file(program, b"query-v1")?;
+        host.set_permissions(program, 0o755)?;
+        let memo = TraceMemo::default();
+        let first = program_digest(Some(&memo), &host, program)?;
+        assert_eq!(first, file_digest(&host, program)?);
+        host.seed_file(program, b"query-v2")?;
+        host.set_permissions(program, 0o755)?;
+        let second = program_digest(Some(&memo), &host, program)?;
+        assert_ne!(first, second);
+        assert_eq!(second, file_digest(&host, program)?);
         Ok(())
     }
 
@@ -2058,6 +2139,7 @@ mod tests {
         let dyn_host: Arc<dyn Host> = host.clone();
         matching_queries.prefetch(&dyn_host);
         let reused = take_or_launch(
+            None,
             host.as_ref(),
             &matching_queries.1,
             &brew_key,
@@ -2074,7 +2156,7 @@ mod tests {
 
         // 2. When executable changes between prefetch completion and consumer pickup,
         // the stale prefetched result is discarded and replaced by a fresh launch.
-        let prefetched_v1 = launch_observed(host.as_ref(), &brew_key, &brew_req);
+        let prefetched_v1 = launch_observed(None, host.as_ref(), &brew_key, &brew_req);
         assert_eq!(prefetched_v1.program_digest, Some(digest_v1));
         assert!(prefetched_v1.state_digest.is_some());
         assert_eq!(runs.load(Ordering::SeqCst), 2);
@@ -2091,6 +2173,7 @@ mod tests {
         assert_ne!(digest_v1, digest_v2);
 
         let fresh = take_or_launch(
+            None,
             host.as_ref(),
             &stale_queries.1,
             &brew_key,
@@ -2102,6 +2185,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 3);
         let recorded = if let Ok(mut memo) = stale_queries.0.lock() {
             record(
+                None,
                 host.as_ref(),
                 &mut memo,
                 brew_key.clone(),
@@ -2118,12 +2202,13 @@ mod tests {
         // 3. Executable mutation during launch clears program_digest and state_digest
         // and prevents recording or persisting the observation.
         mutate_mid_flight.store(true, Ordering::SeqCst);
-        let mid_flight = launch_observed(host.as_ref(), &brew_key, &brew_req);
+        let mid_flight = launch_observed(None, host.as_ref(), &brew_key, &brew_req);
         assert!(mid_flight.program_digest.is_none());
         assert!(mid_flight.state_digest.is_none());
         let unstable_queries = PlatformQueries::default();
         if let Ok(mut memo) = unstable_queries.0.lock() {
             let _ = record(
+                None,
                 host.as_ref(),
                 &mut memo,
                 brew_key,
