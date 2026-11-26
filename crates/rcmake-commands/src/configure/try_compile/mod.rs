@@ -269,14 +269,26 @@ fn process_denial(host: &dyn Host) -> Option<BString> {
     Some("The host does not support the test build.".into())
 }
 
-fn initialize_probe(cx: &Cx<'_>, child: &mut rcmake_eval::Interp, journaled: bool) {
+fn initialize_probe(
+    cx: &Cx<'_>,
+    child: &mut rcmake_eval::Interp,
+    journaled: bool,
+    capture: &std::sync::Arc<capture::CapturingHost>,
+) {
     crate::hermetic::inherit(cx, child);
     #[cfg(all(feature = "native", any(unix, windows)))]
     if !journaled {
         super::platform_queries::inherit(cx, child);
+        // Inherited standard error of a platform query belongs to the probe output.
+        let capture = std::sync::Arc::clone(capture);
+        child.add_session_data(std::sync::Arc::new(
+            super::platform_queries::ChildStderr::new(move |bytes| {
+                capture.capture_inherited_stderr(bytes)
+            }),
+        ));
     }
     #[cfg(not(all(feature = "native", any(unix, windows))))]
-    let _ = journaled;
+    let _ = (journaled, capture);
 }
 
 fn build_probe(
@@ -399,7 +411,7 @@ fn build_probe(
             source_signature,
             generator_facts,
         },
-        |child| initialize_probe(cx, child, journaled),
+        |child, capture| initialize_probe(cx, child, journaled, capture),
     );
     cx.note_nested_recursion_limit(result.max_start_depth);
     if recursion_exceeded {

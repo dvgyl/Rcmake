@@ -65,6 +65,21 @@ impl DirFacts {
     }
 }
 
+/// A directory listing that a miss claimed under the write guard.
+struct ListingClaim {
+    parent: PathBuf,
+    /// A cached successful listing of the parent, copied under the guard.
+    cached: Option<Vec<DirEntry>>,
+    missing: HostError,
+}
+
+/// Return `true` for a filesystem that can expose names that are absent from a listing.
+fn unlisted_filesystem(path: &Path) -> bool {
+    ["/proc", "/dev", "/sys", "/net"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
 fn negative_leaf(path: &Path) -> Option<(&Path, &[u8])> {
     if !cfg!(unix) || !path.is_absolute() {
         return None;
@@ -195,25 +210,29 @@ impl<H: Host + ?Sized> MemoHost<H> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn record_directory_miss(
+    /// Count a native not-found miss under the write guard. On the eighth miss in a
+    /// directory, claim the listing and copy a cached listing result.
+    ///
+    /// The caller runs the claim after it drops the guard.
+    fn claim_directory_listing(
         &self,
         cache: &mut Cache,
         parent: &Path,
         path: &Path,
         error: &HostError,
-    ) {
+    ) -> Option<ListingClaim> {
         if error.kind != ErrorKind::NotFound
             || cache.directory_facts.contains_key(parent.as_os_str())
             || cache.directory_bytes >= MAX_DIRECTORY_BYTES
         {
-            return;
+            return None;
         }
         let expected = crate::error::SyntheticError::NotFound.at(Some(path));
         if *error != expected {
-            return;
+            return None;
         }
         if cache.directory_misses.len() >= MAX_CACHE_ENTRIES {
-            return;
+            return None;
         }
         let count = cache
             .directory_misses
@@ -221,45 +240,64 @@ impl<H: Host + ?Sized> MemoHost<H> {
             .or_default();
         *count = count.saturating_add(1);
         if *count != LIST_AFTER_MISSES {
-            return;
+            return None;
         }
-        let Some((facts, bytes)) = self.directory_facts(cache, parent, expected) else {
+        let cached = match cache
+            .paths
+            .get(parent.as_os_str())
+            .and_then(|q| q.entries.as_ref())
+        {
+            Some(Ok(entries)) => Some(entries.clone()),
+            Some(Err(_)) => return None,
+            None => None,
+        };
+        Some(ListingClaim {
+            parent: parent.to_owned(),
+            cached,
+            missing: expected,
+        })
+    }
+
+    /// Build the directory facts of a claim without a lock, then publish them only if no
+    /// change happened since `generation` and the facts still fit.
+    fn publish_directory_facts(&self, generation: u64, claim: ListingClaim) {
+        let Some((facts, bytes)) = self.directory_facts(&claim.parent, claim.cached, claim.missing)
+        else {
             return;
         };
-        if bytes <= MAX_DIRECTORY_BYTES - cache.directory_bytes {
+        let mut cache = self.write_cache();
+        if cache.generation == generation
+            && cache.active_changes == 0
+            && !cache.directory_facts.contains_key(claim.parent.as_os_str())
+            && bytes <= MAX_DIRECTORY_BYTES.saturating_sub(cache.directory_bytes)
+        {
             cache.directory_bytes += bytes;
             cache
                 .directory_facts
-                .insert(parent.as_os_str().to_owned(), facts);
+                .insert(claim.parent.into_os_string(), facts);
         }
     }
 
     fn directory_facts(
         &self,
-        cache: &Cache,
         parent: &Path,
+        cached: Option<Vec<DirEntry>>,
         mut missing: HostError,
     ) -> Option<(DirFacts, usize)> {
-        let resolved = self.base.canonicalize(parent).ok()?;
-        // These filesystems can expose names that are absent from a listing.
-        if ["/proc", "/dev", "/sys"]
-            .iter()
-            .any(|prefix| resolved.starts_with(prefix))
-        {
+        if unlisted_filesystem(parent) {
             return None;
         }
-        let listing;
-        let entries = if let Some(cached) = cache
-            .paths
-            .get(parent.as_os_str())
-            .and_then(|q| q.entries.as_ref())
-        {
-            cached.as_ref().ok()?
+        let resolved = self.base.canonicalize(parent).ok()?;
+        if unlisted_filesystem(&resolved) {
+            return None;
+        }
+        let entries = if let Some(cached) = cached {
+            cached
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
-            listing = self.base.read_dir(parent).ok()?;
-            &listing
+            self.base.read_dir(parent).ok()?
         };
+        let entries = &entries;
         if entries.len() > MAX_DIRECTORY_NAMES || entries.iter().any(|entry| !entry.name.is_ascii())
         {
             return None;
@@ -333,13 +371,14 @@ impl<H: Host + ?Sized> MemoHost<H> {
             .saturating_add(path_bytes(p))
             .saturating_add(size_of::<(OsString, Queries)>());
         let mut cache = self.write_cache();
+        let mut claim = None;
         if cache.generation == generation
             && cache.active_changes == 0
             && cache.entries < MAX_CACHE_ENTRIES
             && bytes <= MAX_CACHE_BYTES - cache.bytes
         {
             if let (Some((parent, _)), Err(error)) = (negative, &result) {
-                self.record_directory_miss(&mut cache, parent, p, error);
+                claim = self.claim_directory_listing(&mut cache, parent, p, error);
             }
             let queries = cache.paths.entry(p.as_os_str().to_owned()).or_default();
             let slot = slot(queries);
@@ -348,6 +387,11 @@ impl<H: Host + ?Sized> MemoHost<H> {
                 cache.entries += 1;
                 cache.bytes += bytes;
             }
+        }
+        // List the directory without the guard, so that other readers can proceed.
+        drop(cache);
+        if let Some(claim) = claim {
+            self.publish_directory_facts(generation, claim);
         }
         result
     }
@@ -671,6 +715,38 @@ mod tests {
         base: PureHost,
         metadata_error: Mutex<Option<ErrorKind>>,
         observer: Mutex<Option<Observer>>,
+        listing_gate: Mutex<Option<Arc<Gate>>>,
+    }
+
+    /// Pause a directory listing until the test releases it.
+    #[derive(Default)]
+    struct Gate {
+        /// Whether a listing entered the gate, and whether the test released it.
+        state: Mutex<(bool, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl Gate {
+        fn pass(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn wait_until_entered(&self) {
+            let mut state = self.state.lock().unwrap();
+            while !state.0 {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.changed.notify_all();
+        }
     }
 
     fn fixture_error() -> HostError {
@@ -725,6 +801,14 @@ mod tests {
         }
 
         fn read_dir(&self, p: &Path) -> HostResult<Vec<DirEntry>> {
+            let gate = self
+                .listing_gate
+                .lock()
+                .map_err(|_| fixture_error())?
+                .clone();
+            if let Some(gate) = gate {
+                gate.pass();
+            }
             if p == Path::new("/large") {
                 return Ok(vec![DirEntry {
                     name: vec![b'x'; MAX_CACHE_BYTES].into(),
@@ -1063,6 +1147,55 @@ mod tests {
         memo.write(&missing, b"found", WriteMode::CreateNew)?;
         assert_eq!(memo.metadata(&missing, Follow::Yes)?.len, 5);
         Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_listing_runs_without_the_lock_and_cannot_publish_stale_facts() -> HostResult<()> {
+        use std::sync::mpsc;
+        let dir = Path::new("/work/dir");
+        let base = Arc::new(ProbeHost::default());
+        base.base.seed_file(&dir.join("present"), b"x")?;
+        let gate = Arc::new(Gate::default());
+        *base.listing_gate.lock().map_err(|_| fixture_error())? = Some(Arc::clone(&gate));
+        let memo = Arc::new(MemoHost::from_shared(base));
+
+        // The eighth miss in the directory starts a listing, which the gate pauses.
+        let lister = {
+            let memo = Arc::clone(&memo);
+            std::thread::spawn(move || {
+                for n in 0..LIST_AFTER_MISSES {
+                    let _ = memo.metadata(&dir.join(format!("missing{n}")), Follow::No);
+                }
+            })
+        };
+        gate.wait_until_entered();
+
+        // Another reader proceeds while the listing is paused.
+        let (sent, received) = mpsc::channel();
+        let reader = {
+            let memo = Arc::clone(&memo);
+            std::thread::spawn(move || {
+                let _ = sent.send(memo.metadata(&dir.join("present"), Follow::No).is_ok());
+            })
+        };
+        assert_eq!(received.recv_timeout(Duration::from_secs(5)), Ok(true));
+        reader.join().unwrap();
+
+        // A file created during the listing must not be hidden by the stale listing.
+        memo.write(&dir.join("late"), b"y", WriteMode::CreateNew)?;
+        gate.release();
+        lister.join().unwrap();
+        assert!(memo.metadata(&dir.join("late"), Follow::No).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn listings_skip_filesystems_with_hidden_names() {
+        for path in ["/proc/1", "/dev/fd", "/sys/kernel", "/net/server/share"] {
+            assert!(unlisted_filesystem(Path::new(path)), "{path}");
+        }
+        assert!(!unlisted_filesystem(Path::new("/network/share")));
     }
 
     #[test]

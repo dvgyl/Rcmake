@@ -614,6 +614,14 @@ endif()
     }
 
     fn host(launches: &Arc<AtomicUsize>) -> HostResult<Arc<PureHost>> {
+        host_with_stderr(launches, b"")
+    }
+
+    /// A host whose platform query also writes `stderr` to its standard error.
+    fn host_with_stderr(
+        launches: &Arc<AtomicUsize>,
+        stderr: &'static [u8],
+    ) -> HostResult<Arc<PureHost>> {
         let host = Arc::new(PureHost::default());
         let tool = Path::new("/usr/bin/sw_vers");
         host.seed_file(tool, b"fixture")?;
@@ -629,9 +637,62 @@ endif()
         let launches = launches.clone();
         host.set_command_handler(move |_, request, _| {
             launches.fetch_add(1, Ordering::Relaxed);
-            query_output(request).ok_or_else(|| HostError::unsupported("Unexpected process."))
+            let mut output = query_output(request)
+                .ok_or_else(|| HostError::unsupported("Unexpected process."))?;
+            output.stderr = stderr.to_vec();
+            Ok(output)
         })?;
         Ok(host)
+    }
+
+    const NOTE: &str = "sw_vers note\n";
+
+    #[test]
+    fn inherited_query_stderr_in_a_probe_goes_to_the_probe_output() -> TestResult {
+        let launches = Arc::new(AtomicUsize::new(0));
+        let host = host_with_stderr(&launches, NOTE.as_bytes())?;
+        let root = Path::new("/work");
+        host.seed_file(
+            &root.join("CMakeLists.txt"),
+            br#"
+cmake_minimum_required(VERSION 4.5)
+project(Parent NONE)
+try_compile(FIRST PROJECT Child SOURCE_DIR /work/child BINARY_DIR /work/first OUTPUT_VARIABLE out)
+file(WRITE /work/probe-output.txt "${out}")
+"#,
+        )?;
+        let mut parent = interpreter(host.clone(), root)?;
+        parent.add_session_data(Arc::new(PlatformQueries::default()));
+        let outcome = parent.run_configure(root, &root.join("build"), &[]);
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert_eq!(outcome.exit_code, 0, "{stderr}");
+        assert_eq!(launches.load(Ordering::Relaxed), 1);
+        let output = host.read(
+            Path::new("/work/probe-output.txt"),
+            rcmake_host::ReadRange::All { limit: 1 << 20 },
+        )?;
+        let output = String::from_utf8_lossy(&output);
+        assert_eq!(output.matches(NOTE).count(), 1, "{output}");
+        assert!(!stderr.contains(NOTE), "{stderr}");
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_query_stderr_at_top_level_goes_to_standard_error() -> TestResult {
+        let launches = Arc::new(AtomicUsize::new(0));
+        let host = host_with_stderr(&launches, NOTE.as_bytes())?;
+        let root = Path::new("/work");
+        host.seed_file(
+            &root.join("CMakeLists.txt"),
+            b"cmake_minimum_required(VERSION 4.5)\nproject(Parent NONE)\ninclude(Platform/Darwin-Initialize)\n",
+        )?;
+        let mut parent = interpreter(host.clone(), root)?;
+        parent.add_session_data(Arc::new(PlatformQueries::default()));
+        let outcome = parent.run_configure(root, &root.join("build"), &[]);
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert_eq!(outcome.exit_code, 0, "{stderr}");
+        assert_eq!(stderr.matches(NOTE).count(), 1, "{stderr}");
+        Ok(())
     }
 
     #[test]
@@ -716,7 +777,10 @@ endif()
                 JournalMode::Observe,
             )?);
             let mut child = interpreter(journal.clone(), root)?;
-            initialize_probe(&parent.cx(), &mut child, true);
+            let cx = parent.cx();
+            super::super::capture::CapturingHost::capture(journal.clone(), &scratch, |capture| {
+                initialize_probe(&cx, &mut child, true, &capture);
+            });
             let outcome = child.run_configure(&source, &scratch, &[]);
             assert_eq!(
                 outcome.exit_code,

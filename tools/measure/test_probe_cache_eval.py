@@ -505,7 +505,7 @@ class ExtendedTrapBehaviorTests(unittest.TestCase):
             def fake_configure(_args, _case, name, env, *, oracle=False, cwd=None, **_kw):
                 seen_envs[name] = dict(env)
                 seen_cwds[name] = cwd
-                if oracle or name == "cold":
+                if oracle or name in ("cold", "runner"):
                     return sample, 1
                 return sample, warm_calls
 
@@ -518,19 +518,23 @@ class ExtendedTrapBehaviorTests(unittest.TestCase):
                     self.assertNotEqual(seen_cwds["cold"], seen_cwds["warm"])
                     for var in row["mutated_vars"]:
                         self.assertNotEqual(seen_envs["cold"][var], seen_envs["warm"][var], var)
+                    self.assertNotIn("RUNNER_NAME", row["mutated_vars"])
+                    self.assertEqual(seen_envs["cold"]["RUNNER_NAME"], seen_envs["warm"]["RUNNER_NAME"])
+                    self.assertNotEqual(seen_envs["warm"]["RUNNER_NAME"], seen_envs["runner"]["RUNNER_NAME"])
+                    self.assertEqual(seen_envs["runner"], seen_envs["oracle-runner"])
                 else:
                     with self.assertRaisesRegex(ValueError, "Wrong compiler call count in the warm lane"):
                         pce.env_inert(args, case_root, row)
 
-    def test_run_env_requires_cached_build_and_fresh_runtime_env(self):
+    def test_run_env_compiles_fresh_and_publishes_no_entry(self):
         published = {self.root / "r.entry": pce.PublishedProbe("c" * 64, ("d" * 64, 0o755))}
 
         for entries, warm_calls, stale_inert, stale_trap, error_pattern in (
-            (published, 0, False, False, None),
-            ({}, 0, False, False, "Expected one published entry"),
-            (published, 1, False, False, "Wrong compiler call count in the warm lane"),
-            (published, 0, True, False, "stale GITHUB_RUN_ID"),
-            (published, 0, False, True, "stale RCMAKE_TRAP"),
+            ({}, 1, False, False, None),
+            (published, 1, False, False, "Expected no published try_run entries"),
+            ({}, 0, False, False, "Wrong compiler call count in the warm lane"),
+            ({}, 1, True, False, "stale GITHUB_RUN_ID"),
+            ({}, 1, False, True, "stale RCMAKE_TRAP"),
         ):
             case_root = self.root / f"re-{len(entries)}-{warm_calls}-{stale_inert}-{stale_trap}"
             args = _make_args(case_root)
@@ -558,20 +562,22 @@ class ExtendedTrapBehaviorTests(unittest.TestCase):
             ):
                 if error_pattern is None:
                     pce.run_env(args, case_root, row)
-                    self.assertEqual(row["published"], 1)
+                    self.assertEqual(row["published"], 0)
+                    self.assertEqual(row["compiler_calls"]["warm"], 1)
                 else:
                     with self.assertRaisesRegex(ValueError, error_pattern):
                         pce.run_env(args, case_root, row)
 
-    def test_run_file_requires_build_hit_and_observes_modified_file(self):
+    def test_run_file_compiles_fresh_and_observes_modified_file(self):
         published = {self.root / "f.entry": pce.PublishedProbe("1" * 64, ("2" * 64, 0o755))}
 
-        for changed_calls, stale_file, error_pattern in (
-            (0, False, None),
-            (1, False, "Wrong compiler call count in the changed lane"),
-            (0, True, "stale file output"),
+        for entries, changed_calls, stale_file, error_pattern in (
+            ({}, 1, False, None),
+            (published, 1, False, "Expected no published try_run entries"),
+            ({}, 0, False, "Wrong compiler call count in the changed lane"),
+            ({}, 1, True, "stale file output"),
         ):
-            case_root = self.root / f"rf-{changed_calls}-{stale_file}"
+            case_root = self.root / f"rf-{len(entries)}-{changed_calls}-{stale_file}"
             args = _make_args(case_root)
             row = {}
 
@@ -590,7 +596,7 @@ class ExtendedTrapBehaviorTests(unittest.TestCase):
 
             with (
                 mock.patch.object(pce, "configure_raw", side_effect=fake_raw),
-                mock.patch.object(pce, "audit_store", return_value=published),
+                mock.patch.object(pce, "audit_store", return_value=entries),
             ):
                 if error_pattern is None:
                     pce.run_file(args, case_root, row)

@@ -339,6 +339,29 @@ pub(in crate::configure) fn verified_cache_path(
     }
 }
 
+/// Destination of the inherited standard error of a query in a try-compile child.
+///
+/// A child process of a probe writes its inherited standard error into the probe output,
+/// not into the diagnostics of the parent configure.
+pub(in crate::configure) struct ChildStderr(Box<StderrSink>);
+
+type StderrSink = dyn Fn(&[u8]) + Send + Sync;
+
+impl ChildStderr {
+    pub(in crate::configure) fn new(sink: impl Fn(&[u8]) + Send + Sync + 'static) -> Self {
+        Self(Box::new(sink))
+    }
+}
+
+/// Write the inherited standard error of a launched query: into the child sink in a
+/// try-compile child, else to the standard error of the host.
+fn write_inherited_stderr(cx: &Cx<'_>, bytes: &[u8]) {
+    match cx.session_data::<std::sync::Arc<ChildStderr>>() {
+        Some(sink) => (sink.0)(bytes),
+        None => cx.host().write_out(Stream::Stderr, bytes),
+    }
+}
+
 /// Share the configure memo with a child that has no process journal.
 pub(super) fn inherit(cx: &Cx<'_>, child: &mut Interp) {
     if let Some(queries) = cx.session_data::<std::sync::Arc<PlatformQueries>>()
@@ -466,7 +489,7 @@ pub(crate) fn run(cx: &Cx<'_>, request: &RunRequest) -> Option<HostResult<RunOut
         && request.stderr == Output::Inherit
         && !result.stderr.is_empty()
     {
-        host.write_out(Stream::Stderr, &result.stderr);
+        write_inherited_stderr(cx, &result.stderr);
     }
     Some(record(host, &mut memo, key, request, launched, |result| {
         if matches_receipt_executable

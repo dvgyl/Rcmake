@@ -169,9 +169,18 @@ impl VarSnapshot {
     }
 
     /// Return whether the view contains no visible variables.
+    ///
+    /// Scan the layers from the innermost to the outermost without allocation. A set
+    /// binding makes the view nonempty if it is the visible binding for its name. An
+    /// inner unset binding can hide every outer binding, so the scan can visit each
+    /// binding once.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.iter().next().is_none()
+        !self.layers.iter().rev().any(|layer| {
+            layer.iter().any(|(name, binding)| {
+                matches!(binding, Binding::Set(_)) && self.get(name).is_some()
+            })
+        })
     }
 }
 
@@ -194,6 +203,32 @@ impl Eq for VarSnapshot {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layer(bindings: &[(&str, Option<&str>)]) -> VarLayer {
+        let mut layer = VarLayer::default();
+        for &(name, value) in bindings {
+            let binding = value.map_or(Binding::Unset, |value| Binding::Set(value.into()));
+            layer.set(name.as_bytes(), binding);
+        }
+        layer
+    }
+
+    #[test]
+    fn is_empty_matches_the_visible_bindings() {
+        assert!(VarSnapshot::default().is_empty());
+        assert!(VarSnapshot::from_layers([VarLayer::default(), VarLayer::default()]).is_empty());
+
+        let hidden = VarSnapshot::from_layers([layer(&[("a", Some("1"))]), layer(&[("a", None)])]);
+        assert!(hidden.is_empty());
+        assert_eq!(hidden.len(), 0);
+
+        let mixed = VarSnapshot::from_layers([
+            layer(&[("a", Some("1")), ("b", Some("2"))]),
+            layer(&[("a", None)]),
+        ]);
+        assert!(!mixed.is_empty());
+        assert_eq!(mixed.len(), 1);
+    }
 
     #[test]
     fn snapshot_keeps_previous_bindings_after_scope_writes() {

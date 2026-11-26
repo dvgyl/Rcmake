@@ -119,3 +119,48 @@ fn configure_publishes_only_after_completion() -> HostResult<()> {
     assert_eq!(hits, 1);
     Ok(())
 }
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn platform_query_opt_out_installs_no_query_state() {
+    use rcmake_eval::journal::ReplayReceipts;
+
+    use crate::configure::platform_queries::PlatformQueries;
+
+    let attach = |opt_out: Option<&[u8]>| {
+        let source = path("/project");
+        let build = path("/build");
+        let executable = path("/tools/rcmake");
+        let host = Arc::new(PureHost::new(source.clone(), executable.clone()));
+        host.env_set(b"RCMAKE_NO_PLATFORM_QUERIES", opt_out);
+        let mut services = Services::default();
+        services.speed.incremental = true;
+        let runtime = ConfigureRuntime::new(host, &source, &build, &services, true);
+        let mut interp = Interp::new(
+            InterpConfig::new(
+                runtime.host(),
+                RunMode::Configure,
+                source.join("data"),
+                executable,
+                source,
+            ),
+            crate::register_all,
+        );
+        runtime.attach(&mut interp);
+        let cx = interp.cx();
+        (
+            cx.session_data::<Arc<PlatformQueries>>().is_some(),
+            cx.session_data::<Arc<ReplayReceipts>>().is_some(),
+        )
+    };
+    assert_eq!(attach(Some(b"1")), (false, false));
+    #[cfg(target_os = "macos")]
+    assert!(attach(None).0, "the default installs the query memo");
+    // Only the exact value `1` turns the queries off.
+    assert_eq!(attach(Some(b"yes")), attach(None));
+    assert!(super::native::platform_queries_disabled(&{
+        let host = PureHost::default();
+        host.env_set(b"RCMAKE_NO_PLATFORM_QUERIES", Some(b"1"));
+        host
+    }));
+}

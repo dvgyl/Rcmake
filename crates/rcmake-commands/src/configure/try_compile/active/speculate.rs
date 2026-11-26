@@ -120,6 +120,8 @@ impl PreparedProbe {
         };
         let environment = self.runtime.host.env_all();
         let template = super::TemplateCapture::new(&self.recipe.bindings);
+        // `self.recipe` does not change in this loop, so hash it at most once.
+        let mut current_key = None;
         for (name, content) in candidates {
             let Some((project, language)) = super::super::project::render_literal_probe(
                 cx,
@@ -159,7 +161,8 @@ impl PreparedProbe {
             recipe.files = [(BString::from("CMakeLists.txt"), project), (name, source)].into();
             recipe.tools = compiler.identity;
             recipe.seed = seed;
-            if compute_probe_key(&recipe) == compute_probe_key(&self.recipe) {
+            let current = *current_key.get_or_insert_with(|| compute_probe_key(&self.recipe));
+            if compute_probe_key(&recipe) == current {
                 continue;
             }
             let host = Arc::clone(&self.runtime.journal_host);
@@ -273,7 +276,7 @@ impl SpeculativeExecution {
                     }) as Arc<dyn rcmake_resolve::GeneratorFacts>
                 }),
             },
-            |_| {},
+            |_, _| {},
         );
         let outcome = read_speculative(&result, journal.as_ref(), &dirs);
         let journal = Arc::try_unwrap(journal).map_err(|_| fail())?.finish();

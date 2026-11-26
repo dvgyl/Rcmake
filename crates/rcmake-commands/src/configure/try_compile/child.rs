@@ -95,7 +95,7 @@ impl ChildConfig {
         host: Arc<dyn Host>,
         dirs: &ProbeDirs,
         build: ChildBuild<'_>,
-        initialize: impl FnOnce(&mut Interp),
+        initialize: impl FnOnce(&mut Interp, &Arc<CapturingHost>),
     ) -> (ProbeResult, bool) {
         let ChildBuild {
             target,
@@ -122,7 +122,7 @@ impl ChildConfig {
             config.cwd = dirs.binary.clone();
             config.host = host.clone();
             let mut child = Interp::new(config, crate::register_all);
-            initialize(&mut child);
+            initialize(&mut child, &host);
             if let Some(cache) = self.parse_cache {
                 child.set_parse_cache(cache);
             }

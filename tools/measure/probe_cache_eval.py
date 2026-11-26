@@ -1202,10 +1202,11 @@ def env_inert(args, root: Path, row: dict) -> None:
         "TERM_SESSION_ID": "rcmake-session-b",
         "GITHUB_RUN_ID": "2002",
         "CI_JOB_ID": "job-b",
-        "RUNNER_NAME": "runner-b",
+        # The runner name stays in the probe key: configure inputs can read it.
+        "RUNNER_NAME": "runner-a",
     }
     row["mutated_vars"] = ["PWD", "OLDPWD", "SHLVL", "TERM_SESSION_ID",
-                           "GITHUB_RUN_ID", "CI_JOB_ID", "RUNNER_NAME"]
+                           "GITHUB_RUN_ID", "CI_JOB_ID"]
     calls = row["compiler_calls"] = {}
 
     cold, calls["cold"] = configure(args, case, "cold", env_cold, cwd=cwd_a)
@@ -1226,6 +1227,15 @@ def env_inert(args, root: Path, row: dict) -> None:
     if audit_store(store) != entries:
         raise ValueError("The inert-env warm lane changed the seeded probe entries.")
 
+    # A changed runner name is a different probe key: compile again, like CMake.
+    env_runner = {**env_warm, "RUNNER_NAME": "runner-c"}
+    runner, calls["runner"] = configure(args, case, "runner", env_runner, cwd=cwd_b)
+    require_calls(calls, "runner", 1)
+    oracle_runner, calls["oracle_runner"] = configure(
+        args, case, "oracle-runner", env_runner, oracle=True, cwd=cwd_b)
+    require_calls(calls, "oracle_runner", 1)
+    compare(runner, oracle_runner, PARITY_KEYS, "Changed-runner CMake parity")
+
 
 def _read_try_run_outputs(data: dict) -> dict:
     """Validate and attach try_run compile/run outputs for parity assertions."""
@@ -1241,8 +1251,20 @@ def _read_try_run_outputs(data: dict) -> dict:
     return data
 
 
+def require_no_entries(store: Path, lane: str) -> None:
+    """Require an empty store: a relocated try_run binary is never cached (H0.8)."""
+    entries = audit_store(store)
+    if entries:
+        raise ValueError(f"Expected no published try_run entries after the {lane} lane. Found {len(entries)}.")
+
+
 def run_env(args, root: Path, row: dict) -> None:
-    """Require try_run build caching while observing changed runtime environment variables."""
+    """Compile and run try_run fresh in each build directory with changed runtime environment variables.
+
+    H0.8 found that relocating a Mach-O binary changes a code-signature observation
+    that uses argv[0], so rcmake publishes no try_run entry and compiles once in every
+    fresh build directory.
+    """
     lists = """\
 cmake_minimum_required(VERSION 4.5)
 project(ProbeRunEnv C)
@@ -1280,18 +1302,17 @@ message(STATUS "TryRun compile=${compile_result} exit=${run_result}")
     if args.smoke:
         return
 
-    entries = audit_store(store)
-    row["published"] = len(entries)
-    if len(entries) != 1:
-        raise ValueError(f"Expected one published entry for the try_run build. Found {len(entries)}.")
+    row["published"] = len(audit_store(store))
+    require_no_entries(store, "cold")
 
     warm, calls["warm"] = run_lane("warm", "alpha", "101")
-    require_calls(calls, "warm", 0)
+    require_calls(calls, "warm", 1)
     compare(warm, cold, keys, "Run-env warm configure")
-    if audit_store(store) != entries:
-        raise ValueError("The run-env warm lane changed the seeded probe entries.")
+    require_no_entries(store, "warm")
 
     changed_inert, calls["changed_inert"] = run_lane("changed-inert", "alpha", "202")
+    require_calls(calls, "changed_inert", 1)
+    require_no_entries(store, "changed-inert")
     oracle_inert, calls["oracle_inert"] = run_lane("oracle-inert", "alpha", "202", oracle=True)
     require_calls(calls, "oracle_inert", 1)
     if changed_inert["run_output"] != b"trap=alpha;run=202\n":
@@ -1299,6 +1320,8 @@ message(STATUS "TryRun compile=${compile_result} exit=${run_result}")
     compare(changed_inert, oracle_inert, keys, "Run-env inert-var CMake parity")
 
     changed_trap, calls["changed_trap"] = run_lane("changed-trap", "beta", "202")
+    require_calls(calls, "changed_trap", 1)
+    require_no_entries(store, "changed-trap")
     oracle_changed, calls["oracle_changed"] = run_lane("oracle-changed", "beta", "202", oracle=True)
     require_calls(calls, "oracle_changed", 1)
     if changed_trap["run_output"] != b"trap=beta;run=202\n":
@@ -1307,7 +1330,10 @@ message(STATUS "TryRun compile=${compile_result} exit=${run_result}")
 
 
 def run_file(args, root: Path, row: dict) -> None:
-    """Require try_run build cache hit while observing a modified runtime input file."""
+    """Compile and run try_run fresh in each build directory with a modified runtime input file.
+
+    As in run_env, rcmake publishes no relocated try_run entry (H0.8).
+    """
     lists = """\
 cmake_minimum_required(VERSION 4.5)
 project(ProbeRunFile C)
@@ -1345,21 +1371,18 @@ message(STATUS "TryRun compile=${compile_result} exit=${run_result}")
     if args.smoke:
         return
 
-    entries = audit_store(store)
-    row["published"] = len(entries)
-    if len(entries) != 1:
-        raise ValueError(f"Expected one published entry for the try_run build. Found {len(entries)}.")
+    row["published"] = len(audit_store(store))
+    require_no_entries(store, "cold")
 
     (root / "data.txt").write_bytes(b"runtime-after\n")
     changed, calls["changed"] = run_lane("changed")
-    require_calls(calls, "changed", 0)
+    require_calls(calls, "changed", 1)
+    require_no_entries(store, "changed")
     if changed["run_output"] != b"runtime-after\n":
         raise ValueError(f"try_run returned stale file output: {changed['run_output']!r}.")
     oracle_after, calls["oracle_after"] = run_lane("oracle-after", oracle=True)
     require_calls(calls, "oracle_after", 1)
     compare(changed, oracle_after, keys, "Run-file changed CMake parity")
-    if audit_store(store) != entries:
-        raise ValueError("The run-file warm lane changed the seeded probe entries.")
 
 
 def runahead_effects(args, root: Path, row: dict) -> None:
@@ -2346,13 +2369,13 @@ EXTENDED_CASES: tuple[CaseSpec, ...] = (
              "Refuse to cache probes using plugin, linker, host-arch, or profile flags.",
              flag_plugin),
     CaseSpec("env-inert", "G3", "extended",
-             "Hit the probe cache across mutated proven-inert shell and CI environment variables.",
+             "Hit the probe cache across mutated proven-inert shell and CI variables; a new RUNNER_NAME compiles again.",
              env_inert),
     CaseSpec("run-env", "G3", "extended",
-             "Cache try_run compilation while observing changed runtime environment variables.",
+             "Compile and run try_run fresh in each build directory with changed runtime environment variables.",
              run_env),
     CaseSpec("run-file", "G3", "extended",
-             "Cache try_run compilation while observing a modified runtime input file.",
+             "Compile and run try_run fresh in each build directory with a modified runtime input file.",
              run_file),
     CaseSpec("runahead-effects", "G4", "extended",
              "Preserve single in-order file(WRITE), message(STATUS), and set(CACHE) under RCMAKE_PROBE_JOBS=8.",

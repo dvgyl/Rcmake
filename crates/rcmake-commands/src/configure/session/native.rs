@@ -30,6 +30,12 @@ pub(super) struct NativeSession {
     measure: bool,
 }
 
+/// Return `true` if `RCMAKE_NO_PLATFORM_QUERIES` is exactly `1` in the host environment.
+pub(super) fn platform_queries_disabled(host: &dyn Host) -> bool {
+    host.env_get(b"RCMAKE_NO_PLATFORM_QUERIES")
+        .is_some_and(|value| value == "1")
+}
+
 impl NativeSession {
     pub(super) fn new(
         base: Arc<dyn Host>,
@@ -91,7 +97,12 @@ impl NativeSession {
 
     pub(super) fn attach(&self, interp: &mut Interp) {
         let replay = self.replay_enabled(interp);
-        if (self.memo.is_some() || self.probe.is_some() || replay) && cfg!(target_os = "macos") {
+        // The opt-out is checked on the base host before any query state, prefetch
+        // thread, or receipt exists.
+        if (self.memo.is_some() || self.probe.is_some() || replay)
+            && cfg!(target_os = "macos")
+            && !platform_queries_disabled(self.base.as_ref())
+        {
             let queries = self.platform_queries.get_or_init(|| {
                 let queries = Arc::new(super::super::platform_queries::PlatformQueries::default());
                 queries.prefetch(&self.host());

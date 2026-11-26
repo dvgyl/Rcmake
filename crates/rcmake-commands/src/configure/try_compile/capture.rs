@@ -59,6 +59,12 @@ impl CapturingHost {
         (outcome, take(&host.output), take(&host.diagnostics))
     }
 
+    /// Keep the inherited standard error of a child process for the test result only.
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    pub(super) fn capture_inherited_stderr(&self, bytes: &[u8]) {
+        self.capture_process_output(bytes);
+    }
+
     /// Keep process output for the test result only.
     fn capture_process_output(&self, bytes: &[u8]) {
         self.output
