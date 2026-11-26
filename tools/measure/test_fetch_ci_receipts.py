@@ -35,14 +35,19 @@ def dumps(payload: Any) -> str:
     return json.dumps(payload, indent=2) + "\n"
 
 
-def ci_jobs() -> list[dict[str, Any]]:
-    jobs = [
-        {"databaseId": 900 + i, "name": f"CI on {os_name}", "status": "completed", "conclusion": "success",
-         "url": f"https://example.invalid/job/{900 + i}"}
-        for i, os_name in enumerate(("ubuntu-24.04", "macos-15", "windows-2025"))
-    ]
-    jobs.append({"databaseId": 950, "name": "Corpus smoke on macos-15", "status": "completed",
-                 "conclusion": "failure", "url": "https://example.invalid/job/950"})
+def ci_jobs(failed_job: str | None = None, omit_job: str | None = None) -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    for index, name in enumerate(verifier.REQUIRED_CI_JOBS):
+        if name == omit_job:
+            continue
+        conclusion = "failure" if name == failed_job else "success"
+        jobs.append({
+            "databaseId": 900 + index,
+            "name": name,
+            "status": "completed",
+            "conclusion": conclusion,
+            "url": f"https://example.invalid/job/{900 + index}",
+        })
     return jobs
 
 
@@ -116,14 +121,17 @@ class FakeGh:
 
     def __init__(self, ci_head: str = COMMIT, eco_head: str = COMMIT, artifacts: dict | None = None) -> None:
         self.runs = {
-            CI_RUN: {"databaseId": CI_RUN, "headSha": ci_head, "status": "completed", "conclusion": "failure",
-                     "url": "https://example.invalid/run/101", "workflowName": "CI", "jobs": ci_jobs()},
+            CI_RUN: {"databaseId": CI_RUN, "headSha": ci_head, "status": "completed", "conclusion": "success",
+                     "event": "push", "url": "https://example.invalid/run/101", "workflowName": "CI", "jobs": ci_jobs()},
             ECO_RUN: {"databaseId": ECO_RUN, "headSha": eco_head, "status": "completed", "conclusion": "success",
-                      "url": "https://example.invalid/run/202", "workflowName": "Ecosystem parity", "jobs": []},
+                      "event": "workflow_dispatch", "url": "https://example.invalid/run/202",
+                      "workflowName": "Ecosystem parity", "jobs": []},
         }
         self.listed = {
-            "ci.yml": [{"databaseId": CI_RUN, "headSha": ci_head, "status": "completed"}],
-            "ecosystem.yml": [{"databaseId": ECO_RUN, "headSha": eco_head, "status": "completed"}],
+            "ci.yml": [{"databaseId": CI_RUN, "headSha": ci_head, "status": "completed",
+                        "conclusion": "success", "event": "push"}],
+            "ecosystem.yml": [{"databaseId": ECO_RUN, "headSha": eco_head, "status": "completed",
+                               "conclusion": "success", "event": "workflow_dispatch"}],
         }
         self.artifacts = ecosystem_artifacts() if artifacts is None else artifacts
         self.list_calls: list[tuple[str, str]] = []
@@ -260,13 +268,68 @@ class FetchCiReceiptsTests(unittest.TestCase):
             ])
         self.assertEqual(builder_code, 0, builder_err.getvalue())
         snapshot = json.loads(out_json.read_text(encoding="utf-8"))
-        self.assertIn("CI reports 3 of 4 completed runs as successful", snapshot["statusNote"])
+        self.assertIn("CI reports 6 of 6 completed runs as successful", snapshot["statusNote"])
 
-        record = verifier.load_receipt_entry("ci_jobs", "extra", {"path": str(ci_path)}, self.receipts)
+        record = verifier.load_receipt_entry("ci_jobs", "track6-ux-packaging", {"path": str(ci_path)}, self.receipts)
         findings: list[verifier.Finding] = []
         verifier.check_identity(record, COMMIT, DIGEST, findings)
+        verifier.check_ci_jobs(record, findings)
         self.assertEqual(findings, [])
         self.assertEqual(self.scan()["ci_jobs"].state, "present")
+
+    def test_auto_discovery_filters_ci_runs_for_green_push_or_dispatch_with_six_jobs(self) -> None:
+        gh = FakeGh()
+        gh.runs[102] = {
+            "databaseId": 102, "headSha": COMMIT, "status": "completed", "conclusion": "failure",
+            "event": "push", "url": "https://example.invalid/run/102", "workflowName": "CI",
+            "jobs": ci_jobs(failed_job="Corpus smoke on macos-15"),
+        }
+        gh.runs[103] = {
+            "databaseId": 103, "headSha": COMMIT, "status": "completed", "conclusion": "success",
+            "event": "pull_request", "url": "https://example.invalid/run/103", "workflowName": "CI",
+            "jobs": ci_jobs()[:3],
+        }
+        gh.runs[104] = {
+            "databaseId": 104, "headSha": COMMIT, "status": "completed", "conclusion": "success",
+            "event": "push", "url": "https://example.invalid/run/104", "workflowName": "CI",
+            "jobs": ci_jobs(omit_job="Corpus smoke on windows-2025"),
+        }
+        gh.runs[105] = {
+            "databaseId": 105, "headSha": COMMIT, "status": "completed", "conclusion": "success",
+            "event": "workflow_dispatch", "url": "https://example.invalid/run/105", "workflowName": "CI",
+            "jobs": ci_jobs(),
+        }
+        gh.listed["ci.yml"] = [
+            {"databaseId": 102, "headSha": COMMIT, "status": "completed", "conclusion": "failure", "event": "push"},
+            {"databaseId": 103, "headSha": COMMIT, "status": "completed", "conclusion": "success", "event": "pull_request"},
+            {"databaseId": 104, "headSha": COMMIT, "status": "completed", "conclusion": "success", "event": "push"},
+            {"databaseId": 105, "headSha": COMMIT, "status": "completed", "conclusion": "success", "event": "workflow_dispatch"},
+        ]
+        code, out, err = self.fetch(gh, "--binary-sha256", DIGEST)
+        self.assertEqual(code, 0, err)
+        self.assertIn("CI: run 105 (success)", out)
+        ci = json.loads((self.receipts / "ci-jobs.json").read_text(encoding="utf-8"))
+        self.assertEqual(ci["run_id"], 105)
+        self.assertEqual(ci["event"], "workflow_dispatch")
+        self.assertEqual(len(ci["workflow_runs"]), 6)
+
+    def test_explicit_ci_run_rejects_partial_failed_or_pr_runs(self) -> None:
+        cases = (
+            ("failed_run", {"conclusion": "failure", "event": "push", "jobs": ci_jobs(failed_job="Corpus smoke on macos-15")},
+             "conclusion is 'failure'"),
+            ("pull_request_run", {"conclusion": "success", "event": "pull_request", "jobs": ci_jobs()},
+             "event is 'pull_request'"),
+            ("five_of_six_jobs", {"conclusion": "success", "event": "push", "jobs": ci_jobs(omit_job="Corpus smoke on windows-2025")},
+             "Corpus smoke on windows-2025 (missing)"),
+        )
+        for label, overrides, expected in cases:
+            with self.subTest(label=label):
+                gh = FakeGh()
+                gh.runs[CI_RUN].update(overrides)
+                code, _, err = self.fetch(gh, "--ci-run-id", str(CI_RUN))
+                self.assertEqual(code, 2)
+                self.assertIn(expected, err)
+                self.assertEqual(self.files(), [])
 
     # Ecosystem artifact mapping.
 

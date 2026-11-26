@@ -15,6 +15,7 @@ import unittest
 from tools.measure import assemble_release_receipts as assembler
 from tools.measure import build_dashboard_json as builder
 from tools.measure import stamp_metrics as stamper
+from tools.measure import verify_release_receipts as verifier
 from tools.measure.runcmake_eval import SUITE_GROUPS
 
 
@@ -292,7 +293,15 @@ class AssembleReleaseReceiptsTests(unittest.TestCase):
         write_json(target_dir / "path-swap.json", {**ident, "status": "pass", "differences": []})
         write_json(
             target_dir / "ci-jobs.json",
-            {**ident, "workflow_runs": [{"status": "completed", "conclusion": "success", "head_sha": commit}] * 6},
+            {
+                **ident,
+                "event": "push",
+                "run_conclusion": "success",
+                "workflow_runs": [
+                    {"name": name, "status": "completed", "conclusion": "success", "head_sha": commit}
+                    for name in verifier.REQUIRED_CI_JOBS
+                ],
+            },
         )
         tarball_name, tarball_sha, sha_name = self.populate_tarball(target_dir)
         write_json(
@@ -428,7 +437,18 @@ class AssembleReleaseReceiptsTests(unittest.TestCase):
         )
         write_json(target_dir / "cli-ux.json", {**ident, "status": "pass", "passed": 10, "total": 10})
         write_json(target_dir / "path-swap.json", {**ident, "status": "pass", "differences": []})
-        write_json(target_dir / "ci-jobs.json", {**ident, "passed": 6, "total": 6})
+        write_json(
+            target_dir / "ci-status.json",
+            {
+                **ident,
+                "event": "workflow_dispatch",
+                "run_conclusion": "success",
+                "workflow_runs": [
+                    {"name": name, "status": "completed", "conclusion": "success", "head_sha": commit}
+                    for name in verifier.REQUIRED_CI_JOBS
+                ],
+            },
+        )
         tarball_name, tarball_sha, sha_name = self.populate_tarball(target_dir)
         write_json(
             target_dir / "binary-size.json",

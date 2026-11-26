@@ -17,6 +17,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
+DIST_SH = ROOT / "scripts" / "dist.sh"
 INSTALL_SH = ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 EXTRA_SHARE_FILES = (
@@ -25,6 +26,19 @@ EXTRA_SHARE_FILES = (
     "share/zsh/site-functions/_rcmake",
     "share/fish/vendor_completions.d/rcmake.fish",
     "share/rcmake/completions/rcmake.ps1",
+)
+DOC_FILES = (
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "THIRD_PARTY_NOTICES.md",
+    "third_party/licences/CMake-BSD-3-Clause.txt",
+    "third_party/licences/zstd-BSD-3-Clause.txt",
+)
+MODULE_EXEC_HELPERS = (
+    "share/cmake-4.5/Modules/Compiler/XL-Fortran/cpp",
+    "share/cmake-4.5/Modules/SquishRunTestCase.sh",
+    "share/cmake-4.5/Modules/Squish4RunTestCase.sh",
+    "share/cmake-4.5/Modules/Platform/AIX/ExportImportList",
 )
 
 
@@ -39,6 +53,8 @@ def _make_fake_archive(
     sidecar: str = "valid",
     extra_marker: str = "v1",
     include_completions_and_man: bool = False,
+    include_licences: bool = False,
+    include_module_helpers: bool = False,
     symlink_extra_path: str | None = None,
 ) -> Path:
     """Create a synthetic release .tar.gz archive and optional .sha256 sidecar."""
@@ -105,6 +121,22 @@ def _make_fake_archive(
                     relpath,
                     f"# fake {relpath} {version} {extra_marker}\n".encode("utf-8"),
                     0o644,
+                )
+        if include_licences:
+            for relpath in DOC_FILES:
+                add_bytes(
+                    tar,
+                    relpath,
+                    f"licence {relpath} {version} {extra_marker}\n".encode("utf-8"),
+                    0o644,
+                )
+        if include_module_helpers:
+            for relpath in MODULE_EXEC_HELPERS:
+                add_bytes(
+                    tar,
+                    relpath,
+                    f"#!/bin/sh\necho {relpath} {version}\n".encode("utf-8"),
+                    0o755,
                 )
         if symlink_extra_path is not None:
             add_symlink(tar, symlink_extra_path, "/etc/passwd")
@@ -648,6 +680,249 @@ class InstallShTests(unittest.TestCase):
         self.assertTrue(custom_rcmake_note.is_file())
         self.assertEqual(custom_rcmake_note.read_text(encoding="utf-8"), "keep me\n")
 
+    def test_install_preserves_module_exec_bits_and_installs_uninstalls_licences(self) -> None:
+        v1 = _make_fake_archive(
+            self.archives,
+            version="0.1.0",
+            archive_name="rcmake-licences-v1.tar.gz",
+            lsp_mode="symlink",
+            extra_marker="v1",
+            include_licences=True,
+            include_module_helpers=True,
+        )
+        res = self.run_install("--archive", str(v1))
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        # Executable helper scripts under share/cmake-4.5/Modules keep 0o755; regular modules stay 0o644.
+        regular_module = self.prefix / "share" / "cmake-4.5" / "Modules" / "CMake.cmake"
+        self.assertEqual(stat.S_IMODE(regular_module.stat().st_mode), 0o644)
+        for relpath in MODULE_EXEC_HELPERS:
+            helper = self.prefix / relpath
+            self.assertTrue(helper.is_file(), relpath)
+            self.assertEqual(stat.S_IMODE(helper.stat().st_mode), 0o755, relpath)
+
+        # Licences and third_party/licences are installed under share/doc/rcmake/.
+        doc_root = self.prefix / "share" / "doc" / "rcmake"
+        self.assertIn(str(doc_root), res.stdout)
+        for relpath in DOC_FILES:
+            installed = doc_root / relpath
+            self.assertTrue(installed.is_file() and not installed.is_symlink(), relpath)
+            self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o644, relpath)
+            self.assertIn(f"{relpath} 0.1.0 v1", installed.read_text(encoding="utf-8"))
+
+        # Reinstall refreshes licences cleanly.
+        v2 = _make_fake_archive(
+            self.archives,
+            version="0.2.0",
+            archive_name="rcmake-licences-v2.tar.gz",
+            lsp_mode="symlink",
+            extra_marker="v2",
+            include_licences=True,
+            include_module_helpers=True,
+        )
+        res = self.run_install("--archive", str(v2))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        for relpath in DOC_FILES:
+            self.assertIn(f"{relpath} 0.2.0 v2", (doc_root / relpath).read_text(encoding="utf-8"))
+
+        # Symlink in a licence entry is rejected.
+        bad = _make_fake_archive(
+            self.archives,
+            archive_name="bad-licence-symlink.tar.gz",
+            lsp_mode="symlink",
+            symlink_extra_path="LICENSE-MIT",
+        )
+        res = self.run_install("--archive", str(bad))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Invalid archive entry", res.stderr)
+
+        # Uninstall removes share/doc/rcmake and prunes empty share/doc.
+        res = self.run_install("--uninstall")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn(str(doc_root), res.stdout)
+        self.assertFalse(os.path.lexists(doc_root))
+        self.assertFalse(os.path.lexists(self.prefix / "share" / "doc"))
+
+
+class DistShTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def _build_extracted_package(self, *, helper_mode: int = 0o755, include_licences: bool = True) -> Path:
+        pkg = self.root / "pkg"
+        bin_dir = pkg / "bin"
+        bin_dir.mkdir(parents=True)
+        rcmake = bin_dir / "rcmake"
+        rcmake.write_bytes(b"#!/bin/sh\necho rcmake\n")
+        rcmake.chmod(0o755)
+        for alias in ("cmake", "ctest", "cpack", "rcmake-lsp"):
+            (bin_dir / alias).symlink_to("rcmake")
+        for relpath in EXTRA_SHARE_FILES:
+            dest = pkg / relpath
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text("stub\n", encoding="utf-8")
+        if include_licences:
+            for relpath in DOC_FILES:
+                dest = pkg / relpath
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text("licence\n", encoding="utf-8")
+        for relpath in MODULE_EXEC_HELPERS:
+            dest = pkg / relpath
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            dest.chmod(helper_mode)
+        return pkg
+
+    def test_dist_sh_syntax_help_and_verify_extracted_exec_bits_and_licences(self) -> None:
+        syntax = subprocess.run(["/bin/bash", "-n", str(DIST_SH)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+        help_res = subprocess.run(["/bin/bash", str(DIST_SH), "--help"], capture_output=True, text=True, timeout=15)
+        self.assertEqual(help_res.returncode, 0, help_res.stderr)
+        self.assertIn("--write-receipt", help_res.stdout)
+
+        # Pick a non-native Unix target so verify_extracted checks layout, exec bits, licences, and paths without running binaries.
+        cross_target = "x86_64-unknown-linux-gnu" if os.uname().sysname == "Darwin" else "aarch64-apple-darwin"
+
+        good_pkg = self._build_extracted_package(helper_mode=0o755, include_licences=True)
+        ok_res = subprocess.run(
+            ["/bin/bash", str(DIST_SH), "--verify-extracted", str(good_pkg), cross_target],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(ok_res.returncode, 0, ok_res.stderr)
+
+        # Non-executable Modules/ helper script must fail verify_extracted.
+        cpp = good_pkg / "share/cmake-4.5/Modules/Compiler/XL-Fortran/cpp"
+        cpp.chmod(0o644)
+        bad_mode_res = subprocess.run(
+            ["/bin/bash", str(DIST_SH), "--verify-extracted", str(good_pkg), cross_target],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertNotEqual(bad_mode_res.returncode, 0)
+        self.assertIn("Expected executable permissions", bad_mode_res.stderr)
+        cpp.chmod(0o755)
+
+        # Missing licence file must fail verify_extracted.
+        (good_pkg / "THIRD_PARTY_NOTICES.md").unlink()
+        missing_notice_res = subprocess.run(
+            ["/bin/bash", str(DIST_SH), "--verify-extracted", str(good_pkg), cross_target],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertNotEqual(missing_notice_res.returncode, 0)
+        self.assertIn("Missing THIRD_PARTY_NOTICES.md", missing_notice_res.stderr)
+
+    def test_dist_sh_tar_normalization_and_receipt_writer_blocks(self) -> None:
+        from tools.measure import verify_release_receipts as verifier
+
+        script = DIST_SH.read_text(encoding="utf-8")
+        tar_match = re.search(r"<<'PY'\n(.*?)\nPY\n", script, re.DOTALL)
+        receipt_match = re.search(r"<<'PYRECEIPT'\n(.*?)\nPYRECEIPT\n", script, re.DOTALL)
+        self.assertIsNotNone(tar_match)
+        self.assertIsNotNone(receipt_match)
+        assert tar_match is not None and receipt_match is not None
+
+        # Run dist.sh's actual tar-packing block against a tiny fake repo tree (zero Cargo).
+        fake_root = self.root / "repo"
+        fake_bin = self.root / "target-release"
+        work = self.root / "work"
+        out_dir = self.root / "dist-out"
+        for d in (fake_root, fake_bin, work, out_dir):
+            d.mkdir(parents=True)
+
+        fake_exe = fake_bin / "rcmake"
+        fake_exe.write_bytes(b"#!/bin/sh\necho fake-rcmake-binary\n")
+        fake_exe.chmod(0o755)
+        (fake_root / "modules/cmake-4.5/Modules").mkdir(parents=True)
+        (fake_root / "modules/cmake-4.5/Modules/CMake.cmake").write_text("# regular\n", encoding="utf-8")
+        (fake_root / "modules/cmake-4.5/Modules/CMake.cmake").chmod(0o644)
+        for relpath in MODULE_EXEC_HELPERS:
+            src = fake_root / "modules/cmake-4.5" / Path(relpath).relative_to("share/cmake-4.5")
+            src.parent.mkdir(parents=True, exist_ok=True)
+            src.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            src.chmod(0o755)
+        for source_rel in (
+            "docs/man/rcmake.1",
+            "completions/rcmake.bash",
+            "completions/_rcmake",
+            "completions/rcmake.fish",
+            "completions/rcmake.ps1",
+            "LICENSE-MIT",
+            "LICENSE-APACHE",
+            "THIRD_PARTY_NOTICES.md",
+            "third_party/licences/CMake-BSD-3-Clause.txt",
+        ):
+            dest = fake_root / source_rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(f"stub {source_rel}\n", encoding="utf-8")
+
+        pkg_name = "rcmake-0.1.0-x86_64-unknown-linux-gnu"
+        tar_res = subprocess.run(
+            [sys.executable, "-", str(fake_root), str(work), pkg_name, str(fake_bin)],
+            input=tar_match.group(1),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(tar_res.returncode, 0, tar_res.stderr)
+
+        archive = work / f"{pkg_name}.tar.gz"
+        sidecar = work / f"{pkg_name}.tar.gz.sha256"
+        self.assertTrue(archive.is_file() and sidecar.is_file())
+        with tarfile.open(archive, "r:gz") as tar:
+            modes = {member.name: member.mode for member in tar.getmembers()}
+        self.assertEqual(modes[f"{pkg_name}/bin/rcmake"], 0o755)
+        self.assertEqual(modes[f"{pkg_name}/share/cmake-4.5/Modules/CMake.cmake"], 0o644)
+        for relpath in MODULE_EXEC_HELPERS:
+            self.assertEqual(modes[f"{pkg_name}/{relpath}"], 0o755, relpath)
+
+        # Extract and run dist.sh's actual PYRECEIPT block; verify receipt passes verify_release_receipts.
+        extracted = work / "extracted"
+        extracted.mkdir()
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(extracted)
+        final_archive = out_dir / archive.name
+        final_sidecar = out_dir / sidecar.name
+        shutil.move(str(archive), str(final_archive))
+        shutil.move(str(sidecar), str(final_sidecar))
+        receipt_path = out_dir / "dist.json"
+        commit = "0123456789abcdef0123456789abcdef01234567"
+        receipt_res = subprocess.run(
+            [
+                sys.executable, "-",
+                str(receipt_path), str(final_archive), str(final_sidecar),
+                str(extracted / pkg_name / "bin/rcmake"), commit, "0.1.0", "x86_64-unknown-linux-gnu",
+            ],
+            input=receipt_match.group(1),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(receipt_res.returncode, 0, receipt_res.stderr)
+
+        import json
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        expected_bin_sha = hashlib.sha256(fake_exe.read_bytes()).hexdigest()
+        self.assertEqual(receipt["release_commit"], commit)
+        self.assertEqual(receipt["tarball"], final_archive.name)
+        self.assertEqual(receipt["tarball_path"], final_archive.name)
+        self.assertEqual(receipt["sha256_path"], final_sidecar.name)
+        self.assertEqual(receipt["binary_size_bytes"], fake_exe.stat().st_size)
+        self.assertEqual(receipt["binary_sha256"], expected_bin_sha)
+
+        record = verifier.load_receipt_entry("dist", "track6-ux-packaging", receipt_path, out_dir)
+        findings: list[verifier.Finding] = []
+        verifier.check_identity(record, commit, expected_bin_sha, findings)
+        verifier.check_dist(record, findings)
+        self.assertEqual(findings, [])
+
 
 class InstallPs1Tests(unittest.TestCase):
     def test_spdx_flags_structure_and_safety(self) -> None:
@@ -692,6 +967,11 @@ class InstallPs1Tests(unittest.TestCase):
             "bin/rcmake-lsp.exe",
             "share/cmake-4.5",
             "share/rcmake/completions/rcmake.ps1",
+            "LICENSE-APACHE",
+            "LICENSE-MIT",
+            "THIRD_PARTY_NOTICES.md",
+            "third_party/licences",
+            "'share', 'doc', 'rcmake'",
             "scripts/stage.sh",
             "--from-source",
             "Run again with -Force",

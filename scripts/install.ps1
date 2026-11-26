@@ -19,7 +19,8 @@ Usage: install.ps1 [-Version <version>] [-Prefix <dir>] [-Archive <path>] [-Alia
        install.ps1 -Uninstall [-Prefix <dir>]
 
 Install rcmake.exe and rcmake-lsp.exe into <Prefix>\bin, the bundled CMake 4.5.1
-data into <Prefix>\share\cmake-4.5, and the PowerShell completion script into
+data into <Prefix>\share\cmake-4.5, licences and third-party notices into
+<Prefix>\share\doc\rcmake, and the PowerShell completion script into
 <Prefix>\share\rcmake\completions\rcmake.ps1 when present in the archive.
 The default Prefix is %LOCALAPPDATA%\rcmake.
 
@@ -32,8 +33,8 @@ Options:
                      from rcmake.exe (hardlink, falling back to copy).
   -Force             Replace existing cmake.exe, ctest.exe, or cpack.exe files.
   -Uninstall         Remove rcmake.exe, rcmake-lsp.exe, rcmake-owned aliases,
-                     share\cmake-4.5, and share\rcmake\completions\rcmake.ps1
-                     from Prefix.
+                     share\cmake-4.5, share\doc\rcmake, and
+                     share\rcmake\completions\rcmake.ps1 from Prefix.
   -Help              Show this help.
 
 Requirements: Windows PowerShell 5.1 or PowerShell 7+.
@@ -249,14 +250,17 @@ function Expand-RcmakeArchive {
             $isBinary = ($relPosix -ceq 'bin/rcmake.exe') -or ($relPosix -ceq 'bin/rcmake-lsp.exe')
             $isData = ($relPosix -ceq 'share/cmake-4.5') -or $relPosix.StartsWith('share/cmake-4.5/', [StringComparison]::Ordinal)
             $isCompletion = ($relPosix -ceq 'share/rcmake/completions/rcmake.ps1')
-            if (-not ($isBinary -or $isData -or $isCompletion)) {
+            $isDocFile = ($relPosix -ceq 'LICENSE-APACHE') -or ($relPosix -ceq 'LICENSE-MIT') -or ($relPosix -ceq 'THIRD_PARTY_NOTICES.md')
+            $isLicenceDir = ($relPosix -ceq 'third_party/licences') -or $relPosix.StartsWith('third_party/licences/', [StringComparison]::Ordinal)
+            if (-not ($isBinary -or $isData -or $isCompletion -or $isDocFile -or $isLicenceDir)) {
                 continue
             }
-            if (($isBinary -or $isCompletion) -and $isDir) {
+            if (($isBinary -or $isCompletion -or $isDocFile) -and $isDir) {
                 Stop-Install "Invalid archive entry '$rawName'."
             }
 
-            $relNative = $relParts -join [IO.Path]::DirectorySeparatorChar
+            $destParts = if ($isDocFile -or $isLicenceDir) { @('share', 'doc', 'rcmake') + $relParts } else { $relParts }
+            $relNative = $destParts -join [IO.Path]::DirectorySeparatorChar
             $destPath = [IO.Path]::GetFullPath((Join-Path $StageDir $relNative))
             if (-not $destPath.StartsWith($fullStage, [StringComparison]::OrdinalIgnoreCase)) {
                 Stop-Install "Invalid archive path '$rawName'."
@@ -318,6 +322,7 @@ if ([string]::IsNullOrWhiteSpace($Prefix)) {
 $prefixFull = Resolve-FullPath -Path $Prefix
 $binDir = Join-Path $prefixFull 'bin'
 $dataDir = Join-Path (Join-Path $prefixFull 'share') 'cmake-4.5'
+$docDir = Join-Path (Join-Path (Join-Path $prefixFull 'share') 'doc') 'rcmake'
 $completionDir = Join-Path (Join-Path (Join-Path $prefixFull 'share') 'rcmake') 'completions'
 $completionPath = Join-Path $completionDir 'rcmake.ps1'
 $rcmakePath = Join-Path $binDir 'rcmake.exe'
@@ -354,6 +359,16 @@ if ($Uninstall) {
         } else {
             Remove-Item -LiteralPath $dataDir -Recurse -Force
             $removed += $dataDir
+        }
+    }
+
+    $docItem = Get-ItemOrNull -Path $docDir
+    if ($null -ne $docItem -and $docItem.PSIsContainer -and -not ($docItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Remove-Item -LiteralPath $docDir -Recurse -Force
+        $removed += $docDir
+        $docParent = Split-Path -Parent $docDir
+        if ((Test-Path -LiteralPath $docParent -PathType Container) -and (@(Get-ChildItem -LiteralPath $docParent -Force).Count -eq 0)) {
+            Remove-Item -LiteralPath $docParent -Force
         }
     }
 
@@ -528,6 +543,8 @@ try {
     $hasLsp = Test-Path -LiteralPath $stagedLsp -PathType Leaf
     $stagedCompletion = Join-Path (Join-Path (Join-Path (Join-Path $stageWork 'share') 'rcmake') 'completions') 'rcmake.ps1'
     $hasCompletion = Test-Path -LiteralPath $stagedCompletion -PathType Leaf
+    $stagedDoc = Join-Path (Join-Path (Join-Path $stageWork 'share') 'doc') 'rcmake'
+    $hasDocs = (Test-Path -LiteralPath $stagedDoc -PathType Container) -and (@(Get-ChildItem -LiteralPath $stagedDoc -File -Recurse -Force).Count -gt 0)
 
     $stagedData = Join-Path (Join-Path $stageWork 'share') 'cmake-4.5'
     foreach ($required in @('Modules\CMake.cmake', 'Templates\CPackConfig.cmake.in')) {
@@ -554,6 +571,12 @@ try {
             if ($null -ne $existing -and $existing.PSIsContainer -and -not ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
                 Stop-Install "$($checkTarget.Path) is a directory. Remove it, then run the installer again."
             }
+        }
+    }
+    if ($hasDocs) {
+        $existingDoc = Get-ItemOrNull -Path $docDir
+        if ($null -ne $existingDoc -and (-not $existingDoc.PSIsContainer -or ($existingDoc.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+            Stop-Install "$docDir exists and is not a directory. Remove it, then run the installer again."
         }
     }
 
@@ -588,6 +611,23 @@ try {
         $installed += "$aliasPath -> rcmake.exe ($mode)"
     }
     $installed += $dataDir
+    if ($hasDocs) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $docDir) -Force | Out-Null
+        $backupDoc = Join-Path $stageWork 'previous-doc'
+        $hadPreviousDoc = Test-Path -LiteralPath $docDir
+        if ($hadPreviousDoc) {
+            Move-Item -LiteralPath $docDir -Destination $backupDoc
+        }
+        try {
+            Move-Item -LiteralPath $stagedDoc -Destination $docDir
+        } catch {
+            if ($hadPreviousDoc -and (Test-Path -LiteralPath $backupDoc)) {
+                Move-Item -LiteralPath $backupDoc -Destination $docDir
+            }
+            throw
+        }
+        $installed += $docDir
+    }
     if ($hasCompletion) {
         New-Item -ItemType Directory -Path $completionDir -Force | Out-Null
         Move-Item -LiteralPath $stagedCompletion -Destination $completionPath -Force

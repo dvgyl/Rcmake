@@ -8,6 +8,9 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
+import shutil
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -565,6 +568,178 @@ class VerifyReleaseReceiptsTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("dashboard (missing)", stderr)
         self.assertIn("commit is null or missing", stderr)
+
+    def make_ci_jobs_payload(
+        self,
+        *,
+        commit: str = COMMIT_OK,
+        binary: str = BINARY_OK,
+        failed_job: str | None = None,
+        omit_job: str | None = None,
+        event: str = "push",
+        run_conclusion: str = "success",
+    ) -> dict:
+        runs = []
+        for name in verifier.REQUIRED_CI_JOBS:
+            if name == omit_job:
+                continue
+            runs.append({
+                "name": name,
+                "status": "completed",
+                "conclusion": "failure" if name == failed_job else "success",
+                "head_sha": commit,
+            })
+        return {
+            "release_commit": commit,
+            "binary_sha256": binary,
+            "workflow": "CI",
+            "event": event,
+            "run_conclusion": run_conclusion,
+            "workflow_runs": runs,
+        }
+
+    def test_ci_jobs_accepts_all_six_distinct_green_and_rejects_five_of_six(self):
+        payloads = self.build_valid_receipts()
+        payloads["ci_jobs"] = self.make_ci_jobs_payload()
+        manifest = self.write_manifest(payloads)
+        code, stdout, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("PASS: verified 19 release receipts", stdout)
+
+        # 5/6 with one failed job is rejected.
+        payloads["ci_jobs"] = self.make_ci_jobs_payload(failed_job="Corpus smoke on macos-15")
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("ci_jobs (failed)", stderr)
+        self.assertIn("Corpus smoke on macos-15 (completed/failure)", stderr)
+
+        # 5/6 with one omitted job is rejected.
+        payloads["ci_jobs"] = self.make_ci_jobs_payload(omit_job="Corpus smoke on windows-2025")
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("Corpus smoke on windows-2025 (missing)", stderr)
+
+        # Duplicate job substituting for a missing required job is rejected.
+        dup_payload = self.make_ci_jobs_payload(omit_job="Corpus smoke on windows-2025")
+        dup_payload["workflow_runs"].append({
+            "name": "CI on ubuntu-24.04",
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": COMMIT_OK,
+        })
+        payloads["ci_jobs"] = dup_payload
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("CI on ubuntu-24.04 (2 entries)", stderr)
+        self.assertIn("Corpus smoke on windows-2025 (missing)", stderr)
+
+        # pull_request event and summary-only payloads are rejected.
+        payloads["ci_jobs"] = self.make_ci_jobs_payload(event="pull_request")
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("pull_request", stderr)
+
+        payloads["ci_jobs"] = {"release_commit": COMMIT_OK, "binary_sha256": BINARY_OK, "passed": 6, "total": 6}
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("ci_jobs (invalid)", stderr)
+
+        # --receipts-dir auto-discovers ci-jobs.json and enforces the same 6-job gate.
+        self.write_json(
+            self.receipts_dir / "ci-jobs.json",
+            self.make_ci_jobs_payload(failed_job="CI on windows-2025"),
+        )
+        code, _, stderr = self.run_cli(
+            "--receipts-dir", str(self.receipts_dir),
+            "--dashboard", str(self.dashboard_path),
+            "--wasm-bundle", str(self.wasm_path),
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("CI on windows-2025 (completed/failure)", stderr)
+
+    def test_rejects_missing_or_empty_dist_archive_and_checksum_paths(self):
+        # Removing both paths (even when files are absent) must fail instead of returning findings: [].
+        payloads = self.build_valid_receipts()
+        payloads["dist"].pop("tarball_path")
+        payloads["dist"].pop("sha256_path")
+        manifest = self.write_manifest(payloads)
+        json_out = self.root / "missing-dist-paths.json"
+        code, _, stderr = self.run_cli("--manifest", str(manifest), "--json-out", str(json_out))
+        self.assertEqual(code, 1)
+        report = json.loads(json_out.read_text(encoding="utf-8"))
+        dist_findings = [row for row in report["findings"] if row["receipt"] == "dist"]
+        self.assertEqual(len(dist_findings), 2, stderr)
+        self.assertTrue(all(row["kind"] == "missing" for row in dist_findings))
+
+        # Blank paths are also rejected.
+        payloads["dist"]["tarball_path"] = "   "
+        payloads["dist"]["sha256_path"] = ""
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 1)
+        self.assertIn("dist (missing)", stderr)
+
+        # archive_path and checksum_path aliases are accepted when valid.
+        payloads = self.build_valid_receipts()
+        payloads["dist"]["archive_path"] = payloads["dist"].pop("tarball_path")
+        payloads["dist"]["checksum_path"] = payloads["dist"].pop("sha256_path")
+        manifest = self.write_manifest(payloads)
+        code, _, stderr = self.run_cli("--manifest", str(manifest))
+        self.assertEqual(code, 0, stderr)
+
+    def test_pages_workflow_checks_every_js_file_individually_with_node_check(self):
+        pages_yml = (verifier.ROOT / ".github" / "workflows" / "pages.yml").read_text(encoding="utf-8")
+        # Must not pass multiple JS paths or a glob to one node --check call (Node only validates the first argument).
+        self.assertNotRegex(pages_yml, r"node[ \t]+--check[ \t]+(?:--[^\s]+[ \t]+)*(?![-<])\S+[ \t]+(?![-<])\S+")
+        self.assertNotRegex(pages_yml, r"node[ \t]+--check[ \t]+[^\n]*\*")
+        match = re.search(
+            r'for\s+(\w+)\s+in\s+([^;]+);\s*do\s+node\s+--check(?:\s+--input-type=module\s*<\s*|\s+)"?\$\1"?(?:\s*;|\s*\n)\s*done',
+            pages_yml,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match, "pages.yml must loop over JS files and invoke node --check per file.")
+        assert match is not None
+        loop_targets = match.group(2).split()
+        expanded: set[Path] = set()
+        for pattern in loop_targets:
+            expanded.update(verifier.ROOT.glob(pattern))
+        all_site_js = set((verifier.ROOT / "site").rglob("*.js"))
+        self.assertEqual(expanded, all_site_js, "pages.yml node --check loop must cover every site/**/*.js file.")
+
+        if shutil.which("node"):
+            for js_file in sorted(all_site_js):
+                res = subprocess.run(
+                    ["node", "--check", "--input-type=module"],
+                    input=js_file.read_text(encoding="utf-8"),
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                self.assertEqual(res.returncode, 0, f"node --check failed on {js_file}: {res.stderr}")
+
+            # Confirm a syntax error in a second ESM file fails the per-file loop (unlike multi-arg node --check).
+            good_js = self.root / "a-good.js"
+            bad_js = self.root / "b-bad.js"
+            good_js.write_text("export const ok = 1;\n", encoding="utf-8")
+            bad_js.write_text("export const broken = (\n", encoding="utf-8")
+            loop_res = subprocess.run(
+                [
+                    "bash", "-euo", "pipefail", "-c",
+                    'for f in "$@"; do node --check --input-type=module < "$f"; done',
+                    "_", str(good_js), str(bad_js),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(loop_res.returncode, 0, "Per-file node --check loop must fail on a broken second file.")
 
 
 if __name__ == "__main__":

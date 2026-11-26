@@ -13,7 +13,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from tools.measure import bench_giants, build_dashboard_json, stamp_metrics
+from tools.measure import bench_giants, build_dashboard_json, stamp_metrics, verify_release_receipts
 from tools.measure.runcmake_eval import SUITE_GROUPS
 
 
@@ -160,7 +160,12 @@ class ReleasePipelineTests(unittest.TestCase):
         self.report("cli_ux", {"status": "pass", "passed": 12, "total": 12})
         self.report("path_swap", {"status": "pass", "differences": []}, "--path-swap")
         self.report("ci_jobs", {
-            "workflow_runs": [{"status": "completed", "conclusion": "success", "head_sha": COMMIT}] * 6,
+            "event": "push",
+            "run_conclusion": "success",
+            "workflow_runs": [
+                {"name": name, "status": "completed", "conclusion": "success", "head_sha": COMMIT}
+                for name in verify_release_receipts.REQUIRED_CI_JOBS
+            ],
         }, "--ci-status-json")
 
         archive = self.receipts / "rcmake-0.1.0-aarch64-apple-darwin.tar.gz"

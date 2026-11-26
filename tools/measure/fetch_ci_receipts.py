@@ -40,16 +40,19 @@ from typing import Any, Callable
 if __package__:
     from . import assemble_release_receipts as assembler
     from . import build_dashboard_json as builder
+    from . import verify_release_receipts as verifier
 else:
     import assemble_release_receipts as assembler
     import build_dashboard_json as builder
+    import verify_release_receipts as verifier
 
 
 TOOLS_DIR = Path(__file__).resolve().parent
 ROOT = TOOLS_DIR.parents[1]
 ASSEMBLER_SCRIPT = TOOLS_DIR / "assemble_release_receipts.py"
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-RUN_VIEW_FIELDS = "databaseId,headSha,status,conclusion,url,workflowName,jobs"
+RUN_LIST_FIELDS = "databaseId,headSha,status,conclusion,event,url"
+RUN_VIEW_FIELDS = "databaseId,headSha,status,conclusion,event,url,workflowName,jobs"
 LANE_SPECS = {lane.key: lane for lane in assembler.LANES}
 
 
@@ -128,6 +131,7 @@ class Run:
     conclusion: str
     url: str
     jobs: tuple[dict[str, Any], ...]
+    event: str = ""
 
 
 @dataclass(frozen=True)
@@ -170,7 +174,7 @@ class GhCli:
     def list_runs(self, workflow: Workflow, commit: str) -> list[dict[str, Any]]:
         out = self._call([
             "gh", "run", "list", "--repo", self.repo, "--workflow", workflow.file, "--commit", commit,
-            "--status", "completed", "--limit", "20", "--json", "databaseId,headSha,status,conclusion,url",
+            "--status", "completed", "--limit", "20", "--json", RUN_LIST_FIELDS,
         ])
         return json.loads(out or "[]")
 
@@ -218,45 +222,84 @@ def _require_head_sha(workflow: Workflow, run_id: Any, head_sha: Any, commit: st
         )
 
 
+def validate_ci_run(run: Run) -> str | None:
+    """Return an error message if a CI run is not a green push/dispatch run with all 6 distinct jobs passing."""
+    if run.status.strip().lower() != "completed":
+        return f"status is {run.status!r}, not 'completed'."
+    if run.conclusion.strip().lower() != "success":
+        return f"conclusion is {run.conclusion!r}, not 'success'."
+    if run.event.strip().lower() not in verifier.CI_ALLOWED_EVENTS:
+        return f"event is {run.event!r}, expected 'push' or 'workflow_dispatch'."
+    if not run.jobs:
+        return "run has no jobs."
+    missing_or_failed, duplicate_required, extra_failed, _ = verifier.ci_jobs_issues(list(run.jobs))
+    issues = [*missing_or_failed, *duplicate_required, *extra_failed]
+    if issues:
+        return f"all 6 distinct CI jobs must succeed ({'; '.join(issues)})."
+    return None
+
+
+def _build_run(workflow: Workflow, run_id: int, view: dict[str, Any], commit: str) -> Run:
+    _require_head_sha(workflow, run_id, view.get("headSha"), commit)
+    if view.get("workflowName") not in (None, workflow.name):
+        raise FetchError(
+            f"Refusing run {run_id}: it is a {view.get('workflowName')!r} run, not {workflow.name!r}."
+        )
+    if str(view.get("status") or "").strip().lower() != "completed":
+        raise FetchError(f"Refusing {workflow.label} run {run_id}: status is {view.get('status')!r}, not 'completed'.")
+    return Run(
+        workflow=workflow,
+        run_id=int(view.get("databaseId", run_id)),
+        status=str(view["status"]),
+        conclusion=str(view.get("conclusion") or ""),
+        url=str(view.get("url") or ""),
+        jobs=tuple(view.get("jobs") or ()),
+        event=str(view.get("event") or ""),
+    )
+
+
 def resolve_run(gh: Any, workflow: Workflow, run_id: int | None, commit: str) -> Run | None:
     """Find the run to fetch and check that it ran on --commit."""
     if run_id is None:
         listed = gh.list_runs(workflow, commit)
         for row in listed:
             _require_head_sha(workflow, row.get("databaseId"), row.get("headSha"), commit)
-        completed = [row for row in listed if row.get("status") == "completed"]
+        completed = [row for row in listed if str(row.get("status") or "").strip().lower() == "completed"]
         if not completed:
+            return None
+        if workflow == CI:
+            candidates = [
+                row for row in completed
+                if str(row.get("conclusion") or "").strip().lower() == "success"
+                and str(row.get("event") or "").strip().lower() in verifier.CI_ALLOWED_EVENTS
+            ]
+            for row in candidates:
+                candidate_id = int(row["databaseId"])
+                run = _build_run(workflow, candidate_id, gh.view_run(candidate_id), commit)
+                if validate_ci_run(run) is None:
+                    return run
             return None
         run_id = int(completed[0]["databaseId"])
 
-    view = gh.view_run(run_id)
-    _require_head_sha(workflow, run_id, view.get("headSha"), commit)
-    if view.get("workflowName") not in (None, workflow.name):
-        raise FetchError(
-            f"Refusing run {run_id}: it is a {view.get('workflowName')!r} run, not {workflow.name!r}."
-        )
-    if view.get("status") != "completed":
-        raise FetchError(f"Refusing {workflow.label} run {run_id}: status is {view.get('status')!r}, not 'completed'.")
-    return Run(
-        workflow=workflow,
-        run_id=int(view.get("databaseId", run_id)),
-        status=view["status"],
-        conclusion=str(view.get("conclusion") or ""),
-        url=str(view.get("url") or ""),
-        jobs=tuple(view.get("jobs") or ()),
-    )
+    run = _build_run(workflow, run_id, gh.view_run(run_id), commit)
+    if workflow == CI:
+        reason = validate_ci_run(run)
+        if reason is not None:
+            raise FetchError(f"Refusing CI run {run.run_id}: {reason}")
+    return run
 
 
 def build_ci_jobs(run: Run, commit: str, binary: str | None) -> dict[str, Any]:
     """Convert CI run jobs into the workflow_runs receipt that build_dashboard_json.py reads."""
-    if not run.jobs:
-        raise FetchError(f"CI run {run.run_id} has no jobs.")
-    receipt = {
+    reason = validate_ci_run(run)
+    if reason is not None:
+        raise FetchError(f"CI run {run.run_id}: {reason}")
+    receipt: dict[str, Any] = {
         "release_commit": commit,
         "workflow": run.workflow.name,
         "run_id": run.run_id,
         "run_url": run.url,
-        "run_conclusion": run.conclusion,
+        "run_conclusion": run.conclusion.strip().lower(),
         "workflow_runs": [
             {
                 "name": job.get("name"),
@@ -269,6 +312,8 @@ def build_ci_jobs(run: Run, commit: str, binary: str | None) -> dict[str, Any]:
             for job in run.jobs
         ],
     }
+    if run.event:
+        receipt["event"] = run.event.strip().lower()
     if binary is not None:
         receipt["binary_sha256"] = binary
     return receipt
@@ -418,6 +463,11 @@ def run_status(receipts_dir: Path, commit: str) -> int:
 
 def describe_run(run: Run | None, workflow: Workflow) -> str:
     if run is None:
+        if workflow == CI:
+            return (
+                f"{workflow.label}: no completed successful push/workflow_dispatch {workflow.file} "
+                "run with all 6 required jobs green for this commit; skipping its lanes."
+            )
         return f"{workflow.label}: no completed {workflow.file} run for this commit; skipping its lanes."
     return f"{workflow.label}: run {run.run_id} ({run.conclusion or run.status}) {run.url}"
 

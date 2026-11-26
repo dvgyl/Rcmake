@@ -31,7 +31,9 @@ jobs:
       - uses: actions/configure-pages@v5
       - name: Validate site assets
         run: |
-          node --check site/*.js site/wasm/rcmake_wasm.js
+          for f in site/*.js site/wasm/rcmake_wasm.js; do
+            node --check --input-type=module < "$f"
+          done
           test -s site/wasm/rcmake_wasm.wasm
           python3 - <<'PY'
           import json

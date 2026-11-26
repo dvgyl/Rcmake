@@ -62,6 +62,15 @@ MUTATION_MIN_STEPS = 20
 FUZZ_MIN_ITERATIONS = 14_000_000
 WASI_MIN_CHECKS = 6
 REQUIRED_CONAN_SCENARIOS = ("conan-consumer", "conan-source-build")
+REQUIRED_CI_JOBS: tuple[str, ...] = (
+    "CI on ubuntu-24.04",
+    "CI on macos-15",
+    "CI on windows-2025",
+    "Corpus smoke on ubuntu-24.04",
+    "Corpus smoke on macos-15",
+    "Corpus smoke on windows-2025",
+)
+CI_ALLOWED_EVENTS = frozenset({"push", "workflow_dispatch"})
 
 HOLDOUT_FORBIDDEN_KEYS = frozenset({
     "projects", "project", "repos", "repo", "repositories", "repository", "name",
@@ -125,6 +134,10 @@ DISCOVERY_CANDIDATES: dict[str, tuple[str, ...]] = {
     "cli_ux": ("cli-ux.json", "cli_ux.json"),
     "path_swap": ("path-swap.json", "path_swap.json", "path-swap-gate.json"),
     "dist": ("dist.json", "dist-tarball.json", "dist_tarball.json"),
+}
+
+OPTIONAL_DISCOVERY_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "ci_jobs": ("ci-jobs.json", "ci_jobs.json", "ci-status.json", "ci_status.json"),
 }
 
 
@@ -1488,10 +1501,18 @@ def check_dist(record: ReceiptRecord, findings: list[Finding]) -> None:
             actual=str(payload.get("tarball_sha256")),
             detail="dist.sh receipt must record a valid 64-character SHA-256 digest.",
         ))
-        return
 
-    tarball_path_raw = payload.get("tarball_path")
-    if isinstance(tarball_path_raw, str) and tarball_path_raw.strip():
+    tarball_path_raw = payload.get("tarball_path", payload.get("archive_path"))
+    if not isinstance(tarball_path_raw, str) or not tarball_path_raw.strip():
+        findings.append(Finding(
+            track=record.track,
+            receipt=record.key,
+            kind="missing",
+            expected="non-empty tarball_path (or archive_path) to the packaged release archive",
+            actual=str(tarball_path_raw),
+            detail="dist.sh receipt must supply a path to the packaged release archive.",
+        ))
+    else:
         tarball_path = resolve_path(tarball_path_raw, record.base_dir)
         if not tarball_path.is_file():
             findings.append(Finding(
@@ -1502,7 +1523,7 @@ def check_dist(record: ReceiptRecord, findings: list[Finding]) -> None:
                 actual="missing",
                 detail="Referenced dist.sh tarball does not exist on disk.",
             ))
-        else:
+        elif tarball_sha is not None:
             actual_sha = sha256_file(tarball_path)
             if actual_sha != tarball_sha:
                 findings.append(Finding(
@@ -1514,8 +1535,17 @@ def check_dist(record: ReceiptRecord, findings: list[Finding]) -> None:
                     detail="dist.sh tarball SHA-256 on disk does not match receipt tarball_sha256.",
                 ))
 
-    sha256_path_raw = payload.get("sha256_path")
-    if isinstance(sha256_path_raw, str) and sha256_path_raw.strip():
+    sha256_path_raw = payload.get("sha256_path", payload.get("checksum_path"))
+    if not isinstance(sha256_path_raw, str) or not sha256_path_raw.strip():
+        findings.append(Finding(
+            track=record.track,
+            receipt=record.key,
+            kind="missing",
+            expected="non-empty sha256_path (or checksum_path) to the .sha256 checksum file",
+            actual=str(sha256_path_raw),
+            detail="dist.sh receipt must supply a path to the .sha256 checksum sidecar.",
+        ))
+    else:
         sha_path = resolve_path(sha256_path_raw, record.base_dir)
         if not sha_path.is_file():
             findings.append(Finding(
@@ -1526,7 +1556,7 @@ def check_dist(record: ReceiptRecord, findings: list[Finding]) -> None:
                 actual="missing",
                 detail="Referenced dist.sh .sha256 checksum file does not exist.",
             ))
-        else:
+        elif tarball_sha is not None:
             line = sha_path.read_text(encoding="ascii", errors="replace").strip()
             parts = line.split()
             if len(parts) != 2 or parts[0].lower() != tarball_sha or (
@@ -1540,6 +1570,118 @@ def check_dist(record: ReceiptRecord, findings: list[Finding]) -> None:
                     actual=line or "<empty>",
                     detail="dist.sh .sha256 file does not match receipt tarball_sha256 and filename.",
                 ))
+
+
+def ci_jobs_issues(
+    jobs: list[Any],
+    *,
+    expected_commit: str | None = None,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Inspect CI job rows against REQUIRED_CI_JOBS.
+
+    Returns (missing_or_failed, duplicate_required, extra_failed, commit_mismatches).
+    """
+    by_name: dict[str, list[tuple[str, str]]] = {}
+    extra_failed: list[str] = []
+    commit_mismatches: list[str] = []
+    required_set = set(REQUIRED_CI_JOBS)
+
+    for index, row in enumerate(jobs):
+        if not isinstance(row, dict):
+            extra_failed.append(f"job[{index}] (non-object)")
+            continue
+        raw_name = row.get("name")
+        name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else ""
+        status = str(row.get("status") or "").strip().lower()
+        conclusion = str(row.get("conclusion") or "").strip().lower()
+        head_sha = row.get("head_sha", row.get("headSha"))
+        if expected_commit is not None and isinstance(head_sha, str) and head_sha.strip():
+            norm_head = head_sha.strip().lower()
+            if norm_head != expected_commit:
+                commit_mismatches.append(f"{name or f'job[{index}]'} ({norm_head})")
+        if name:
+            by_name.setdefault(name, []).append((status, conclusion))
+        if name not in required_set and (status != "completed" or conclusion != "success"):
+            label = name or f"job[{index}]"
+            extra_failed.append(f"{label} ({status or 'unknown'}/{conclusion or 'unknown'})")
+
+    missing_or_failed: list[str] = []
+    duplicate_required: list[str] = []
+    for required_name in REQUIRED_CI_JOBS:
+        matches = by_name.get(required_name, [])
+        if not matches:
+            missing_or_failed.append(f"{required_name} (missing)")
+        elif len(matches) > 1:
+            duplicate_required.append(f"{required_name} ({len(matches)} entries)")
+            if not all(m_status == "completed" and m_conc == "success" for m_status, m_conc in matches):
+                missing_or_failed.append(f"{required_name} (not all completed/success)")
+        else:
+            m_status, m_conc = matches[0]
+            if m_status != "completed" or m_conc != "success":
+                missing_or_failed.append(f"{required_name} ({m_status or 'unknown'}/{m_conc or 'unknown'})")
+
+    return missing_or_failed, duplicate_required, extra_failed, commit_mismatches
+
+
+def check_ci_jobs(record: ReceiptRecord, findings: list[Finding]) -> None:
+    payload = record.payload
+    run_conclusion = payload.get("run_conclusion")
+    if run_conclusion is not None and str(run_conclusion).strip().lower() != "success":
+        findings.append(Finding(
+            track=record.track,
+            receipt=record.key,
+            kind="failed",
+            expected="run_conclusion == 'success'",
+            actual=str(run_conclusion),
+            detail="CI workflow run conclusion must be 'success'.",
+        ))
+    event = payload.get("event", payload.get("run_event"))
+    if event is not None and str(event).strip().lower() not in CI_ALLOWED_EVENTS:
+        findings.append(Finding(
+            track=record.track,
+            receipt=record.key,
+            kind="failed",
+            expected="event in ('push', 'workflow_dispatch')",
+            actual=str(event),
+            detail="CI receipt must come from a push or workflow_dispatch run so corpus smoke jobs run.",
+        ))
+
+    runs = payload.get("workflow_runs") if "workflow_runs" in payload else payload.get("jobs")
+    if not isinstance(runs, list) or not runs:
+        findings.append(Finding(
+            track=record.track,
+            receipt=record.key,
+            kind="invalid",
+            expected="workflow_runs list containing all 6 distinct required CI jobs",
+            actual=type(runs).__name__ if runs is not None else "missing",
+            detail="CI receipt must list individual CI workflow jobs in workflow_runs.",
+        ))
+        return
+
+    expected_commit = normalize_commit(record.file_commit) or normalize_commit(record.envelope_commit)
+    missing_or_failed, duplicate_required, extra_failed, commit_mismatches = ci_jobs_issues(
+        runs,
+        expected_commit=expected_commit,
+    )
+    if commit_mismatches:
+        findings.append(Finding(
+            track=record.track,
+            receipt=record.key,
+            kind="stale",
+            expected=expected_commit or "matching release_commit",
+            actual=", ".join(commit_mismatches),
+            detail="One or more CI job entries record a commit different from release_commit.",
+        ))
+    issues = [*missing_or_failed, *duplicate_required, *extra_failed]
+    if issues:
+        findings.append(Finding(
+            track=record.track,
+            receipt=record.key,
+            kind="failed",
+            expected=f"all {len(REQUIRED_CI_JOBS)} distinct CI jobs completed with conclusion 'success'",
+            actual="; ".join(issues),
+            detail="CI receipt must show all 6 distinct CI and Corpus smoke matrix jobs green.",
+        ))
 
 
 @dataclass(frozen=True)
@@ -1740,12 +1882,13 @@ def check_dashboard(
 
 def discover_receipts_in_dir(directory: Path) -> dict[str, Path]:
     found: dict[str, Path] = {}
-    for key, candidates in DISCOVERY_CANDIDATES.items():
-        for name in candidates:
-            candidate = directory / name
-            if candidate.exists():
-                found[key] = candidate
-                break
+    for mapping in (DISCOVERY_CANDIDATES, OPTIONAL_DISCOVERY_CANDIDATES):
+        for key, candidates in mapping.items():
+            for name in candidates:
+                candidate = directory / name
+                if candidate.exists():
+                    found[key] = candidate
+                    break
     return found
 
 
@@ -1941,14 +2084,15 @@ def _verify_receipt_entries(
         check_identity(record, expected_commit, expected_binary, findings)
         spec.validator(record, findings)
 
-    # Also validate identity on any extra optional receipts (such as ci_jobs) in the manifest.
+    # Also validate identity (and 6-job CI rules for ci_jobs) on any extra optional receipts in the manifest.
     required_keys = {spec.key for spec in REQUIRED_RECEIPTS}
     for extra_key in sorted(set(entries) - required_keys):
+        extra_track = "track6-ux-packaging" if extra_key == "ci_jobs" else "extra"
         try:
-            record = load_receipt_entry(extra_key, "extra", entries[extra_key], base_dir)
+            record = load_receipt_entry(extra_key, extra_track, entries[extra_key], base_dir)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             findings.append(Finding(
-                track="extra",
+                track=extra_track,
                 receipt=extra_key,
                 kind="invalid",
                 expected="valid JSON receipt",
@@ -1958,6 +2102,8 @@ def _verify_receipt_entries(
             continue
         checked.append(extra_key)
         check_identity(record, expected_commit, expected_binary, findings)
+        if extra_key == "ci_jobs":
+            check_ci_jobs(record, findings)
 
     return checked
 

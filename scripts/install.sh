@@ -8,8 +8,9 @@ Usage: install.sh [--version <v> | --from-source | --archive <path>] [--alias-cm
        install.sh --uninstall
 
 Install rcmake and rcmake-lsp into $PREFIX/bin, the bundled CMake 4.5.1
-data into $PREFIX/share/cmake-4.5, and any bundled shell completions and
-man page under $PREFIX/share. The default PREFIX is $HOME/.local.
+data into $PREFIX/share/cmake-4.5, licences and third-party notices into
+$PREFIX/share/doc/rcmake, and any bundled shell completions and man page
+under $PREFIX/share. The default PREFIX is $HOME/.local.
 
 Sources (select one, the default is the latest GitHub Release):
   --version <v>      Download GitHub Release <v>, for example v0.1.0 or 0.1.0.
@@ -21,8 +22,8 @@ Options:
   --alias-cmake      Also create cmake, ctest, and cpack links to rcmake.
   --force            Replace existing cmake, ctest, or cpack files.
   --uninstall        Remove rcmake, rcmake-lsp, the links to rcmake,
-                     share/cmake-4.5, and the rcmake completions and man
-                     page from $PREFIX.
+                     share/cmake-4.5, share/doc/rcmake, and the rcmake
+                     completions and man page from $PREFIX.
   -h, --help         Show this help.
 
 Requirements: bash, python3, and curl (for release downloads).
@@ -91,6 +92,7 @@ fi
 prefix="${PREFIX:-$HOME/.local}"
 bin_dir="$prefix/bin"
 data_dir="$prefix/share/cmake-4.5"
+doc_dir="$prefix/share/doc/rcmake"
 tools=(cmake ctest cpack)
 extra_share_files=(
   "$prefix/share/man/man1/rcmake.1"
@@ -131,6 +133,11 @@ if "$uninstall"; then
       rm -rf "$data_dir"
       removed+=("$data_dir")
     fi
+  fi
+  if [[ -d "$doc_dir" && ! -L "$doc_dir" ]]; then
+    rm -rf "$doc_dir"
+    removed+=("$doc_dir")
+    rmdir "$prefix/share/doc" 2>/dev/null || true
   fi
   for extra in "${extra_share_files[@]}"; do
     if [[ -f "$extra" && ! -L "$extra" ]]; then
@@ -257,6 +264,13 @@ archive, checksum, prefix, aliases, force = sys.argv[1:]
 archive, prefix = Path(archive), Path(prefix)
 tools = ("cmake", "ctest", "cpack")
 data_dir = Path("share/cmake-4.5")
+doc_dir = Path("share/doc/rcmake")
+doc_files = (
+    Path("LICENSE-APACHE"),
+    Path("LICENSE-MIT"),
+    Path("THIRD_PARTY_NOTICES.md"),
+)
+licences_dir = Path("third_party/licences")
 rcmake_rel = Path("bin/rcmake")
 lsp_rel = Path("bin/rcmake-lsp")
 binaries = (rcmake_rel, lsp_rel)
@@ -331,6 +345,25 @@ try:
                     with tar.extractfile(member) as source, output.open("xb") as destination:
                         shutil.copyfileobj(source, destination)
                     output.chmod(0o644)
+                elif relative in doc_files:
+                    if not member.isfile():
+                        raise ValueError(f"Invalid archive entry {member.name!r}.")
+                    output = work / doc_dir / relative
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    with tar.extractfile(member) as source, output.open("xb") as destination:
+                        shutil.copyfileobj(source, destination)
+                    output.chmod(0o644)
+                elif relative.is_relative_to(licences_dir):
+                    output = work / doc_dir / relative
+                    if member.isdir():
+                        output.mkdir(parents=True, exist_ok=True)
+                    elif member.isfile():
+                        output.parent.mkdir(parents=True, exist_ok=True)
+                        with tar.extractfile(member) as source, output.open("xb") as destination:
+                            shutil.copyfileobj(source, destination)
+                        output.chmod(0o644)
+                    else:
+                        raise ValueError(f"Invalid archive entry {member.name!r}.")
 
         staged_bin = work / rcmake_rel
         if staged_bin.is_symlink() or not staged_bin.is_file():
@@ -347,6 +380,9 @@ try:
         subprocess.run([staged_bin, "--version"], check=True, stdout=subprocess.DEVNULL, timeout=30)
 
         staged_extras = [rel for rel in extra_share_files if (work / rel).is_file()]
+        staged_doc = work / doc_dir
+        has_docs = staged_doc.is_dir() and any(path.is_file() for path in staged_doc.rglob("*"))
+        installed_doc = prefix / doc_dir
         bin_dir = prefix / "bin"
         bin_dir.mkdir(exist_ok=True)
         for target_name, present in (("rcmake", True), ("rcmake-lsp", staged_lsp_is_link or staged_lsp_is_file)):
@@ -358,6 +394,10 @@ try:
             target_path = prefix / rel
             if target_path.is_dir() and not target_path.is_symlink():
                 raise ValueError(f"{target_path} is a directory. Remove it, then run the installer again.")
+        if has_docs and os.path.lexists(installed_doc) and (
+            installed_doc.is_symlink() or not installed_doc.is_dir()
+        ):
+            raise ValueError(f"{installed_doc} exists and is not a directory. Remove it, then run the installer again.")
         installed_data = prefix / data_dir
         installed_data.parent.mkdir(exist_ok=True)
         backup = work / "previous-data"
@@ -391,6 +431,18 @@ try:
                     new_alias.replace(alias)
                 installed.append(f"{alias} -> rcmake")
         installed.append(installed_data)
+        if has_docs:
+            installed_doc.parent.mkdir(parents=True, exist_ok=True)
+            backup_doc = work / "previous-doc"
+            if os.path.lexists(installed_doc):
+                installed_doc.replace(backup_doc)
+            try:
+                staged_doc.replace(installed_doc)
+            except OSError:
+                if os.path.lexists(backup_doc):
+                    backup_doc.replace(installed_doc)
+                raise
+            installed.append(installed_doc)
         for rel in staged_extras:
             destination = prefix / rel
             destination.parent.mkdir(parents=True, exist_ok=True)

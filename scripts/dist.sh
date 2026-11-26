@@ -27,6 +27,16 @@ executables = [*tools, lsp]
 if set(bin_dir.iterdir()) != set(executables) or not all(tool.is_file() for tool in executables):
     sys.exit("Expected the four CLI entry points and rcmake-lsp in the extracted package.")
 
+for notice in (
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD_PARTY_NOTICES.md",
+    "third_party/licences/CMake-BSD-3-Clause.txt",
+):
+    notice_path = package / notice
+    if notice_path.is_symlink() or not notice_path.is_file():
+        sys.exit(f"Missing {notice} in the extracted package.")
+
 if not windows:
     for extra in (
         "share/man/man1/rcmake.1",
@@ -38,6 +48,17 @@ if not windows:
         extra_path = package / extra
         if extra_path.is_symlink() or not extra_path.is_file():
             sys.exit(f"Missing {extra} in the extracted package.")
+    for helper in (
+        "share/cmake-4.5/Modules/Compiler/XL-Fortran/cpp",
+        "share/cmake-4.5/Modules/SquishRunTestCase.sh",
+        "share/cmake-4.5/Modules/Squish4RunTestCase.sh",
+        "share/cmake-4.5/Modules/Platform/AIX/ExportImportList",
+    ):
+        helper_path = package / helper
+        if helper_path.is_symlink() or not helper_path.is_file():
+            sys.exit(f"Missing {helper} in the extracted package.")
+        if not (helper_path.stat().st_mode & 0o111):
+            sys.exit(f"Expected executable permissions on {helper} in the extracted package.")
 
 paths = set()
 for entry in roots:
@@ -152,27 +173,47 @@ root_logical="$(cd "$(dirname "$0")/.." && pwd -L)"
 root="$(cd "$root_logical" && pwd -P)"
 out_dir="$root/dist"
 target=""
+receipt_path=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --target|--out-dir)
+    --target|--out-dir|--write-receipt)
       if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
         printf '%s requires a value.\n' "$1" >&2
         exit 2
       fi
-      if [[ "$1" == --target ]]; then target="$2"; else out_dir="$2"; fi
+      case "$1" in
+        --target) target="$2" ;;
+        --out-dir) out_dir="$2" ;;
+        --write-receipt) receipt_path="$2" ;;
+      esac
       shift 2
       ;;
     -h|--help)
-      printf 'Usage: %s [--target <triple>] [--out-dir <dir>]\n' "$0"
+      printf 'Usage: %s [--target <triple>] [--out-dir <dir>] [--write-receipt <path>]\n' "$0"
       exit 0
       ;;
     *) printf 'Unknown option %s.\n' "$1" >&2; exit 2 ;;
   esac
 done
 
+if [[ -n "$receipt_path" ]]; then
+  case "$receipt_path" in
+    /*) ;;
+    *) receipt_path="$(pwd)/$receipt_path" ;;
+  esac
+fi
+
 mkdir -p "$out_dir"
 out_dir="$(cd "$out_dir" && pwd -P)"
 cd "$root"
+commit=""
+if [[ -n "$receipt_path" ]]; then
+  commit="$(git -C "$root" rev-parse --verify HEAD 2>/dev/null | tr 'A-F' 'a-f')"
+  if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'Could not resolve git HEAD commit for --write-receipt.\n' >&2
+    exit 1
+  fi
+fi
 # shellcheck disable=SC1091
 source "$root/env/env.sh"
 if [[ -z "$target" ]]; then
@@ -274,7 +315,7 @@ def normalize(member):
     member.uname = member.gname = ""
     if member.issym():
         member.mode = 0o777
-    elif member.isdir() or member.name == f"{name}/bin/rcmake":
+    elif member.isdir() or member.name == f"{name}/bin/rcmake" or (member.mode & 0o111):
         member.mode = 0o755
     else:
         member.mode = 0o644
@@ -295,4 +336,57 @@ verify_extracted "$work/extracted/$name" "$target" "home=$HOME" \
   "repository=$root_logical" "repository=$root" "repository=${GITHUB_WORKSPACE:-$root}" \
   "target directory=$target_dir_logical" "Cargo home=$cargo_dir" "Rustup home=$rustup_dir"
 mv -f "$work/$name.tar.gz" "$work/$name.tar.gz.sha256" "$out_dir/"
+if [[ -n "$receipt_path" ]]; then
+  python3 - "$receipt_path" "$out_dir/$name.tar.gz" "$out_dir/$name.tar.gz.sha256" \
+    "$work/extracted/$name/bin/rcmake" "$commit" "$version" "$target" <<'PYRECEIPT'
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+receipt_path, archive_path, checksum_path, extracted_bin, commit, version, target = sys.argv[1:]
+receipt = Path(receipt_path)
+archive = Path(archive_path).resolve(strict=True)
+checksum = Path(checksum_path).resolve(strict=True)
+binary = Path(extracted_bin).resolve(strict=True)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+receipt.parent.mkdir(parents=True, exist_ok=True)
+receipt_dir = receipt.parent.resolve()
+rel_archive = archive.name if archive.parent == receipt_dir else str(archive)
+rel_checksum = checksum.name if checksum.parent == receipt_dir else str(checksum)
+payload = {
+    "release_commit": commit,
+    "version": version,
+    "target": target,
+    "tarball": archive.name,
+    "tarball_path": rel_archive,
+    "tarball_sha256": sha256_file(archive),
+    "sha256_path": rel_checksum,
+    "binary_size_bytes": binary.stat().st_size,
+    "binary_sha256": sha256_file(binary),
+}
+temp_name = None
+try:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=receipt.parent, delete=False) as stream:
+        temp_name = stream.name
+        stream.write(json.dumps(payload, indent=2) + "\n")
+    os.chmod(temp_name, 0o644)
+    os.replace(temp_name, receipt)
+    temp_name = None
+finally:
+    if temp_name is not None:
+        Path(temp_name).unlink(missing_ok=True)
+PYRECEIPT
+fi
 printf '%s\n' "$out_dir/$name.tar.gz"
