@@ -883,3 +883,67 @@ directory properties. Cache entries that come from the command line, from the
 the raw cache API without the check. File-read limits bound that input.
 
 Sources: [limits](../crates/rcmake-base/src/limits.rs), [list budget](../crates/rcmake-base/src/list.rs), [argument expansion](../crates/rcmake-expr/src/expand.rs), [command dispatch](../crates/rcmake-eval/src/interp/dispatch.rs), [foreach](../crates/rcmake-eval/src/flow/foreach.rs), [variable stack](../crates/rcmake-eval/src/scope.rs), [function and macro calls](../crates/rcmake-eval/src/interp/calls.rs), [cache](../crates/rcmake-model/src/lib.rs), and [cache properties](../crates/rcmake-commands/src/policy_misc/properties/set.rs).
+
+## ADR-037: Native stack guard
+
+- **Status:** Accepted
+
+`CMAKE_MAXIMUM_RECURSION_DEPTH` can be set up to the hard ceiling of 20,000
+levels. A 64 MiB worker stack gives only 3.3 KB for each of those levels.
+One level of `cmake_language(EVAL CODE)` recursion uses about 13.8 KB in debug
+builds and 5.4 KB in release builds. A nested `try_compile` interpreter
+inherits the depth of its caller, but its own frames also use the same native
+stack. So a script with a high limit could overflow the stack and end the
+process with a signal.
+
+`rcmake_eval::stack_guard` estimates the stack use with safe Rust. It takes the
+address of a local variable and compares it with the address at the start of a
+budget. It compares integer addresses only. Rust does not promise an exact
+frame layout, so the result is an estimate. `stack_guard::with_budget` sets a
+budget for a closure. Budgets nest only lexically: an inner budget is never
+larger than what remains of the outer one, and the outer budget comes back
+when the closure returns or unwinds. The budget belongs to the thread, so all
+interpreters on the thread share it.
+
+Two counters limit recursion, and both use the guard:
+
+- **Command depth.** Each command call checks the configured depth limit
+  first, so `Maximum recursion depth of <n> exceeded` does not change. Then it
+  checks the guard, which reports `Maximum recursion depth exceeded: the native
+  stack is full at depth <n>.`
+- **Structured block nesting.** A block body (`if`, `foreach`, `while`,
+  `block`, and the other structured commands) runs after the command frame of
+  its opener returns, so command depth does not count it. Block nesting has
+  its own counter with the same limit and the same guard, and reports
+  `Maximum nesting depth of <n> exceeded by structured blocks.`
+
+| Thread | Stack | Budget |
+| --- | --- | --- |
+| `rcmake` worker | 64 MiB | 56 MiB |
+| Speculative probe worker | 16 MiB | 12 MiB |
+| LSP evaluation | 32 MiB | 24 MiB |
+| API caller thread without a budget | caller's (2 MiB Rust default) | 1 MiB |
+
+The API case has a precondition: the caller's thread must have at least 2 MiB
+of free stack. A caller with a known larger stack can set a larger budget
+with `with_budget`. If the `rcmake` worker thread cannot start, `rcmake`
+reports an internal error and exits with code 1. The main thread has an
+unknown stack size, so it never runs the evaluator.
+
+The space above each budget is kept for native recursion between the checks:
+variable and condition expressions (depth 256), `math` (depth 256), generator
+expression parsing (depth 256) and evaluation (depth 128), and JSON and
+syntax parsing. These reserves are estimates. Only the recursion paths in
+`docs/ARCHITECTURE.md` are measured.
+
+On `wasm32` targets a stack address does not measure the call stack, so the
+guard is compiled out: `with_budget` only runs its closure, and the guard never
+reports a full stack. The WebAssembly entry point sets the recursion limit and
+its ceiling to 200 levels, and `CMAKE_MAXIMUM_RECURSION_DEPTH` cannot raise it
+(`Limits::max_recursion_ceiling`). The same ceiling limits structured block
+nesting.
+
+`HARD_RECURSION_CEILING` stays at 20,000, because it also limits heap use
+for each level, for example backtrace frames.
+
+Sources: [stack guard](../crates/rcmake-eval/src/stack_guard.rs), [command dispatch](../crates/rcmake-eval/src/interp/dispatch.rs), [block bodies](../crates/rcmake-eval/src/flow/mod.rs), [CLI entry point](../crates/rcmake-cli/src/main.rs), [probe pool](../crates/rcmake-commands/src/configure/probe_pool.rs), [API runner](../crates/rcmake-api/src/runner.rs), [WebAssembly entry point](../crates/rcmake-wasm/src/project.rs), and [LSP evaluation thread](../crates/rcmake-lsp/src/stdio_eval.rs).

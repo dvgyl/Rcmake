@@ -10,6 +10,9 @@ use rcmake_presets::{EnvSnapshot, PresetKind, PresetSettings};
 
 use crate::{response, strings};
 
+/// Recursion depth limit and ceiling for WebAssembly configures.
+pub(crate) const WASM_MAX_RECURSION: u32 = 200;
+
 mod toolchain;
 
 pub(super) const SOURCE: &str = if cfg!(windows) { "C:/src" } else { "/src" };
@@ -168,8 +171,16 @@ impl<'a> Project<'a> {
         let cmake_root = virtual_path(CMAKE_ROOT);
         toolchain::seed(&host, &build, &cmake_root).map_err(host_error)?;
 
+        // WebAssembly has a small call stack and no native stack guard, so recursion stops
+        // at a low fixed depth that no script can raise.
+        let limits = rcmake_base::Limits {
+            max_recursion: WASM_MAX_RECURSION,
+            max_recursion_ceiling: WASM_MAX_RECURSION,
+            ..rcmake_base::Limits::default()
+        };
         let mut request = ConfigureRequest::new(source, &build, cmake_root, host.clone())
             .generator(generator)
+            .limits(limits)
             .step_budget(100_000)
             .collect_index(true)
             .define(CacheDefine {

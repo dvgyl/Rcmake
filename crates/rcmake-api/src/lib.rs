@@ -62,6 +62,6 @@ pub use result::{
     VariableWriteDetails,
 };
 
-pub use rcmake_eval::{CacheDefine, CancelToken, LedgerLevel, Services, VarWrite};
+pub use rcmake_eval::{CacheDefine, CancelToken, LedgerLevel, Services, VarWrite, stack_guard};
 
 pub use variable_history::{VarLedgerSnapshot, VariableHistory};

@@ -210,6 +210,42 @@ inputs, and the overlay host that the language server uses for unsaved files.
 8. **Bundled modules.** `CMAKE_ROOT` is `share/cmake-4.5` next to the binary.
    `project()` and `enable_language()` run the bundled CMake 4.5.1 modules.
    `rcmake` does not hard-code compiler flags or platform tables in Rust.
+9. **Recursion limit.** `CMAKE_MAXIMUM_RECURSION_DEPTH` (default 1000) stops
+   deep script recursion with `Maximum recursion depth of <n> exceeded`. CMake
+   crashes far above that depth. Structured block nesting (`if`, `foreach`,
+   `while`, `block`) has its own counter with the same limit. On a native thread
+   with a stack budget, `rcmake` also stops the measured recursion paths below
+   before the native stack overflows (ADR-037).
+
+## Native stack use
+
+The command depth counter does not measure native stack use, so
+`rcmake_eval::stack_guard` estimates it. Each command call compares the
+address of a local variable with the address at the start of the thread's
+budget. The `rcmake` worker thread has a 64 MiB stack and a 56 MiB budget.
+A speculative probe worker has a 16 MiB stack and a 12 MiB budget. The LSP
+evaluation thread has a 32 MiB stack and a 24 MiB budget. An API call on a
+thread without a budget gets a 1 MiB budget, so the caller's thread must have
+at least 2 MiB of free stack. If the `rcmake` worker thread cannot start,
+`rcmake` exits with an internal error. On `wasm32` targets the guard is
+compiled out, and the WebAssembly entry point limits command recursion and
+block nesting to 200 levels instead.
+
+Measured stack bytes for each level of script recursion
+(`stack_bytes_per_level` in `rcmake-eval`, macOS arm64):
+
+| Recursion path | Debug | Release |
+| --- | --- | --- |
+| `function()` | 8,055 | 2,726 |
+| `macro()` | 7,719 | 2,726 |
+| `cmake_language(EVAL CODE)` | 13,786 | 5,416 |
+
+At the default limit of 1000 levels, the worst measured release path needs
+about 5.4 MB, much less than the 56 MiB worker budget. The guard stops these
+measured paths before the stack overflows on a thread with a budget. Other
+native recursion between command frames (expression, generator expression,
+`math`, JSON, and syntax parsing) has its own depth limits, and the space
+above each budget is an estimate for it.
 
 ## Verification
 

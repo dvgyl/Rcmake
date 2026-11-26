@@ -37,6 +37,10 @@ const MAX_JOBS: usize = 32;
 const MAX_RESULT_BYTES: u64 = 4 * 1024 * 1024;
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 const GIB: u64 = 1024 * 1024 * 1024;
+/// Stack of a speculative probe worker. It runs child interpreters like the main worker.
+const PROBE_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+/// Stack kept free below the guard budget for native recursion between command frames.
+const PROBE_STACK_RESERVE_BYTES: usize = 4 * 1024 * 1024;
 static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn physical_memory(host: &dyn Host) -> u64 {
@@ -296,7 +300,14 @@ impl ProbePool {
                 let shared = Arc::clone(&pool.shared);
                 if thread::Builder::new()
                     .name("rcmake-probe".to_owned())
-                    .spawn_scoped(scope, move || worker(context, &shared))
+                    .stack_size(PROBE_WORKER_STACK_BYTES)
+                    .spawn_scoped(scope, move || {
+                        // A worker runs child interpreters, so it needs a stack budget.
+                        rcmake_eval::stack_guard::with_budget(
+                            PROBE_WORKER_STACK_BYTES - PROBE_STACK_RESERVE_BYTES,
+                            || worker(context, &shared),
+                        )
+                    })
                     .is_err()
                 {
                     pool.shared

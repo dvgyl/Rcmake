@@ -398,3 +398,29 @@ fn configure_nested_file_with_posix_preset_paths() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn recursion_stops_at_the_wasm_ceiling_even_with_a_higher_override() -> TestResult {
+    let response = call(Value::object_from([
+        ("op", Value::string("configure")),
+        (
+            "files",
+            Value::object_from([(
+                "CMakeLists.txt",
+                Value::string(
+                    "cmake_minimum_required(VERSION 4.5)\nset(CMAKE_MAXIMUM_RECURSION_DEPTH 5000)\nfunction(f)\n  f()\nendfunction()\nf()\n",
+                ),
+            )]),
+        ),
+    ]))?;
+    assert_eq!(response.get("ok").and_then(Value::as_bool), Some(false));
+    let text = diag_text(&response);
+    assert!(
+        text.contains(&format!(
+            "Maximum recursion depth of {} exceeded",
+            crate::project::WASM_MAX_RECURSION
+        )),
+        "{text}"
+    );
+    Ok(())
+}

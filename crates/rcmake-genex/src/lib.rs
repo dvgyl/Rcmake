@@ -19,7 +19,10 @@ pub use parse::{ParseCache, parse, render};
 pub use preprocess::{PreprocessMode, find_genex, genex_strip, rewrite_install_prefix, strip};
 
 /// Maximum nesting depth of `$<...>` that [`parse`] accepts.
-pub const MAX_NESTING: usize = 1000;
+///
+/// The parser recurses once for each level between the stack guard checks of the
+/// evaluator, so the limit matches the 256-level limit of variable expansion.
+pub const MAX_NESTING: usize = 256;
 
 /// A build configuration name (`$<CONFIG>`). The empty name means "no configuration".
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

@@ -13,6 +13,9 @@ use rcmake_host::{Host, NativeHost, Stream};
 /// Generous worker stack (64 MiB) so deep CMake script recursion (1,000+ frames even in
 /// debug builds) never overflows macOS's 8 MiB main thread stack.
 const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// Stack kept free for native recursion that the command guard does not see (genex,
+/// `math`, JSON, and syntax parsing).
+const STACK_RESERVE_BYTES: usize = 8 * 1024 * 1024;
 
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
@@ -105,18 +108,20 @@ fn main() -> ExitCode {
     let spawned = std::thread::Builder::new()
         .name("rcmake-main".to_owned())
         .stack_size(WORKER_STACK_BYTES)
-        .spawn(move || rcmake_cli::run(&argv, host));
+        .spawn(move || {
+            rcmake_eval::stack_guard::with_budget(WORKER_STACK_BYTES - STACK_RESERVE_BYTES, || {
+                rcmake_cli::run(&argv, host)
+            })
+        });
 
+    // The main thread has an unknown stack size, so it never runs the evaluator.
     let result = match spawned {
         Ok(handle) => handle.join(),
-        Err(_) => {
-            let fallback = Arc::clone(&host_for_panic);
-            let argv_fallback: Vec<_> = std::env::args_os()
-                .map(|a| rcmake_host::path::from_native(Path::new(&a)))
-                .collect();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                rcmake_cli::run(&argv_fallback, fallback)
-            }))
+        Err(error) => {
+            let message =
+                format!("CMake Internal Error: failed to start the worker thread: {error}\n");
+            host_for_panic.write_out(Stream::Stderr, message.as_bytes());
+            return ExitCode::from(1);
         }
     };
 

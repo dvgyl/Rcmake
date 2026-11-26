@@ -38,33 +38,35 @@ impl Worker {
             .name("rcmake-lsp-eval".to_owned())
             .stack_size(32 * 1024 * 1024)
             .spawn(move || {
-                loop {
-                    match work.recv_timeout(DISK_POLL_INTERVAL) {
-                        Ok(()) => {}
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            evaluator.snapshots().check_disk_inputs();
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
+                rcmake_api::stack_guard::with_budget(24 * 1024 * 1024, || {
                     loop {
-                        match work.recv_timeout(EDIT_DEBOUNCE) {
-                            Ok(()) => continue,
-                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        match work.recv_timeout(DISK_POLL_INTERVAL) {
+                            Ok(()) => {}
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                evaluator.snapshots().check_disk_inputs();
+                            }
                             Err(mpsc::RecvTimeoutError::Disconnected) => return,
                         }
+                        loop {
+                            match work.recv_timeout(EDIT_DEBOUNCE) {
+                                Ok(()) => continue,
+                                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                            }
+                        }
+                        let result = evaluator.snapshots().refresh_once();
+                        if matches!(
+                            result,
+                            Ok(RefreshStatus::Busy | RefreshStatus::UpToDate)
+                                | Err(rcmake_api::ApiError::Cancelled)
+                        ) {
+                            continue;
+                        }
+                        if events.send(Event::SnapshotReady).is_err() {
+                            break;
+                        }
                     }
-                    let result = evaluator.snapshots().refresh_once();
-                    if matches!(
-                        result,
-                        Ok(RefreshStatus::Busy | RefreshStatus::UpToDate)
-                            | Err(rcmake_api::ApiError::Cancelled)
-                    ) {
-                        continue;
-                    }
-                    if events.send(Event::SnapshotReady).is_err() {
-                        break;
-                    }
-                }
+                })
             })?;
         Ok(Self { provider, refresh })
     }

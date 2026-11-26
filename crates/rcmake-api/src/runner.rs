@@ -22,6 +22,11 @@ use crate::{
     ResolvedEntry, SourceLocation, VarLedgerSnapshot,
 };
 
+/// Stack budget for an evaluation on a caller thread without a budget. It fits in the
+/// 2 MiB default stack of a Rust thread and leaves room for native recursion. The
+/// caller must make sure that its thread has at least this much free stack.
+const API_STACK_BUDGET: usize = 1024 * 1024;
+
 mod facts;
 use facts::{SourceReads, evaluation_facts, merge_diagnostics};
 
@@ -48,11 +53,26 @@ impl PreparedConfigure {
     ///
     /// Call [Self::finish] to attach the host observations and build the index.
     ///
+    /// On a native target, the calling thread must have at least 2 MiB of free stack
+    /// (the default for a Rust thread). Without a budget from
+    /// `rcmake_eval::stack_guard::with_budget`, the evaluation uses a 1 MiB stack budget.
+    /// A caller with a larger known stack can set a larger budget around this call.
+    ///
     /// # Errors
     ///
     /// Return an error if the host, evaluator, or resolver fails before a usable
     /// result is available.
     pub fn evaluate(&self) -> Result<ConfigureResult, ApiError> {
+        // The stack of an embedder thread is unknown. Without a budget from the caller,
+        // use a budget that fits the smallest default thread stack.
+        if rcmake_eval::stack_guard::is_active() {
+            self.evaluate_with_budget()
+        } else {
+            rcmake_eval::stack_guard::with_budget(API_STACK_BUDGET, || self.evaluate_with_budget())
+        }
+    }
+
+    fn evaluate_with_budget(&self) -> Result<ConfigureResult, ApiError> {
         let prepared = self;
         let host = prepared.host();
         let generator = select_generator(prepared, host.as_ref())?;
