@@ -963,3 +963,199 @@ pub(crate) fn finish_vs_sources(targets: &mut [ResolvedTarget]) {
         }
     }
 }
+
+/// The source groups that every directory starts with, in creation order
+/// (`cmMakefile::cmMakefile`).
+#[must_use]
+pub fn default_source_groups() -> Vec<rcmake_model::SourceGroupDef> {
+    const DEFAULTS: [(&[u8], &[u8]); 8] = [
+        (b"", b"^.*$"),
+        (
+            b"Source Files",
+            b"\\.(C|F|M|c|c\\+\\+|cc|cpp|mpp|cxx|ixx|cppm|ccm|cxxm|c\\+\\+m|cu|f|f90|for|fpp|ftn|m|mm|rc|def|r|odl|idl|hpj|bat)$",
+        ),
+        (b"Header Files", b"\\.(h|hh|h\\+\\+|hm|hpp|hxx|in|txx|inl)$"),
+        (b"Precompile Header File", b"cmake_pch(_[^.]+)?\\.(h|hxx)$"),
+        (b"CMake Rules", b"\\.rule$"),
+        (b"Resources", b"\\.(pdf|plist|png|jpeg|jpg|storyboard|xcassets)$"),
+        (b"Object Files", b"\\.(lo|o|obj)$"),
+        (b"Object Libraries", b"^MATCH_NO_SOURCES$"),
+    ];
+    DEFAULTS
+        .iter()
+        .map(|(name, regex)| rcmake_model::SourceGroupDef {
+            name: (*name).into(),
+            regex: Some((*regex).into()),
+            ..rcmake_model::SourceGroupDef::default()
+        })
+        .collect()
+}
+
+/// Return the full name (`a\b`) of the source group of `path`
+/// (`cmSourceGroup::FindSourceGroup`). The search goes through the groups of
+/// `dir` in reverse creation order: first for a group that lists the file, then
+/// for a group whose regular expression matches. A directory without
+/// `source_group()` calls uses [`default_source_groups`]. `matches(pattern, path)`
+/// evaluates a CMake regular expression.
+pub fn find_source_group(
+    dir: &rcmake_model::Directory,
+    path: &[u8],
+    matches: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+) -> BString {
+    let defaults;
+    let groups = if dir.source_groups.is_empty() {
+        defaults = default_source_groups();
+        &defaults
+    } else {
+        &dir.source_groups
+    };
+    groups
+        .iter()
+        .rev()
+        .find_map(|group| search_group(group, Order::Pre, &mut |group| group.files.contains(path)))
+        .or_else(|| {
+            groups.iter().rev().find_map(|group| {
+                search_group(group, Order::Post, &mut |group| {
+                    group
+                        .regex
+                        .as_ref()
+                        .is_some_and(|pattern| matches(pattern, path))
+                })
+            })
+        })
+        .or_else(|| groups.first().map(|group| group.name.clone()))
+        .unwrap_or_default()
+}
+
+/// When [`search_group`] tests a group relative to its children.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Order {
+    /// The group, then its children (`cmSourceGroup::MatchChildrenFiles`).
+    Pre,
+    /// The children, then the group (`cmSourceGroup::MatchChildrenRegex`).
+    Post,
+}
+
+/// Return the full name (`a\b`) of the first group in the tree of `root` that
+/// `test` accepts. The walk uses an explicit stack, so the nesting depth of
+/// the groups does not use the call stack. The name is built only for the
+/// group that matches.
+fn search_group(
+    root: &rcmake_model::SourceGroupDef,
+    order: Order,
+    test: &mut dyn FnMut(&rcmake_model::SourceGroupDef) -> bool,
+) -> Option<BString> {
+    // Each frame is a group and the position of its next child.
+    let mut frames = vec![(root, 0usize)];
+    if order == Order::Pre && test(root) {
+        return Some(full_name(&frames));
+    }
+    while let Some(&mut (group, ref mut next)) = frames.last_mut() {
+        if let Some(child) = group.children.get(*next) {
+            *next += 1;
+            frames.push((child, 0));
+            if order == Order::Pre && test(child) {
+                return Some(full_name(&frames));
+            }
+            continue;
+        }
+        if order == Order::Post && test(group) {
+            return Some(full_name(&frames));
+        }
+        frames.pop();
+    }
+    None
+}
+
+/// Join the names of the groups on the walk stack with `\`. An empty prefix
+/// adds no separator.
+fn full_name(frames: &[(&rcmake_model::SourceGroupDef, usize)]) -> BString {
+    let mut name = Vec::new();
+    for (group, _) in frames {
+        if !name.is_empty() {
+            name.push(b'\\');
+        }
+        name.extend_from_slice(&group.name);
+    }
+    name.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_model::{Directory, SourceGroupDef};
+
+    use super::find_source_group;
+
+    fn group(name: &str, regex: Option<&str>, files: &[&str]) -> SourceGroupDef {
+        SourceGroupDef {
+            name: name.into(),
+            regex: regex.map(Into::into),
+            files: files.iter().map(|file| (*file).into()).collect(),
+            children: Vec::new(),
+        }
+    }
+
+    fn regex(pattern: &[u8], path: &[u8]) -> bool {
+        pattern
+            .strip_prefix(b"*")
+            .is_some_and(|suffix| path.ends_with(suffix))
+    }
+
+    /// Drop a group tree without recursion.
+    fn dismantle(groups: Vec<SourceGroupDef>) {
+        let mut pending = groups;
+        while let Some(mut group) = pending.pop() {
+            pending.append(&mut group.children);
+        }
+    }
+
+    #[test]
+    fn explicit_files_win_over_regex_and_children_regex_win_over_parent() {
+        let mut parent = group("p", Some("*.c"), &[]);
+        parent.children.push(group("c", Some("*.c"), &[]));
+        parent.children.push(group("other", Some("*.c"), &[]));
+        let mut listed = group("listed", None, &[]);
+        listed.children.push(group("x", None, &["/s/a.c"]));
+        let dir = Directory {
+            source_groups: vec![group("", Some("*"), &[]), listed, parent],
+            ..Directory::default()
+        };
+        let mut matches = regex;
+        // The explicit file wins, even though the later group matches by regex.
+        assert_eq!(
+            find_source_group(&dir, b"/s/a.c", &mut matches),
+            "listed\\x"
+        );
+        // The first child regex wins over its parent and later siblings.
+        assert_eq!(find_source_group(&dir, b"/s/b.c", &mut matches), "p\\c");
+        // The first group is the fallback.
+        assert_eq!(find_source_group(&dir, b"/s/b.h", &mut matches), "");
+    }
+
+    #[test]
+    fn very_deep_group_tree_is_searched_without_recursion() {
+        const DEPTH: usize = 100_000;
+        let mut deep = group("g", Some("*.c"), &["/s/leaf.c"]);
+        for _ in 1..DEPTH {
+            let mut parent = group("g", None, &[]);
+            parent.children.push(deep);
+            deep = parent;
+        }
+        let mut dir = Directory {
+            source_groups: vec![group("", None, &[]), deep],
+            ..Directory::default()
+        };
+        let expected = vec!["g"; DEPTH].join("\\");
+        let mut matches = regex;
+        assert_eq!(
+            find_source_group(&dir, b"/s/leaf.c", &mut matches),
+            expected.as_str()
+        );
+        assert_eq!(
+            find_source_group(&dir, b"/s/other.c", &mut matches),
+            expected.as_str()
+        );
+        assert_eq!(find_source_group(&dir, b"/s/other.h", &mut matches), "");
+        dismantle(std::mem::take(&mut dir.source_groups));
+    }
+}

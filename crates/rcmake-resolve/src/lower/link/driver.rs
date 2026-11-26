@@ -266,7 +266,7 @@ pub(super) fn archive_commands(
     objects: &[BString],
     cmake: BString,
     policy: &Flags<'_>,
-    (ipo, msvc): (bool, bool),
+    (ipo, msvc, ninja): (bool, bool, bool),
     template: Option<&BString>,
     expand: impl Fn(&[u8], &[BString]) -> Vec<Invocation>,
 ) -> Vec<Invocation> {
@@ -296,10 +296,16 @@ pub(super) fn archive_commands(
             b"<CMAKE_AR> qc <TARGET> <LINK_FLAGS> <OBJECTS>".as_slice(),
             |v| v.as_slice(),
         );
-        let append = archive(b"ARCHIVE_APPEND").map_or(
-            b"<CMAKE_AR> q <TARGET> <LINK_FLAGS> <OBJECTS>".as_slice(),
-            |v| v.as_slice(),
-        );
+        // The Ninja generator never splits an archive: it runs the create rule once
+        // (`cmNinjaNormalTargetGenerator`). The Makefile generator appends batches.
+        let append = if ninja {
+            b"".as_slice()
+        } else {
+            archive(b"ARCHIVE_APPEND").map_or(
+                b"<CMAKE_AR> q <TARGET> <LINK_FLAGS> <OBJECTS>".as_slice(),
+                |v| v.as_slice(),
+            )
+        };
         let finish = archive(b"ARCHIVE_FINISH")
             .map_or(b"<CMAKE_RANLIB> <TARGET>".as_slice(), |v| v.as_slice());
         commands.extend(archive_invocations(expand, create, append, finish, objects));

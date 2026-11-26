@@ -136,6 +136,7 @@ impl UsageResolver<'_> {
                 edges.extend(inferred);
             }
         }
+        let dependent_only = self.add_shared_dependencies(&mut graph, &ctx)?;
         let overrides = self.link_feature_overrides(target, owner, &ctx)?;
         let features =
             graph.apply_features(self.model, owner, &ctx, &overrides, paths, &mut original)?;
@@ -159,6 +160,22 @@ impl UsageResolver<'_> {
                 .is_some_and(|value| truth::is_on(value))
                 || definition(model, owner.dir, b"CMAKE_LINK_DEPENDS_DEBUG_MODE")
                     .is_some_and(|value| truth::is_on(value))
+        });
+        // A shared library that appears only as a dependency of another shared
+        // library constrains the order (`LinkEntry::SharedDep`). It stays on the
+        // link line only in the `Link` mode. The other modes use only its
+        // directory, which the runtime path lowering computes.
+        let mode = crate::lower::shared_dependency_mode(
+            model,
+            owner.dir,
+            ctx.link_language
+                .as_ref()
+                .map(|language| language.as_slice()),
+        );
+        ordered.retain(|item| {
+            !dependent_only.contains(&item.key())
+                || (mode == crate::lower::SharedDependencyMode::Link
+                    && crate::lower::links_shared_dependency(model, item))
         });
         if let Some(paths) = debug {
             print_link_order(paths, model, owner, "link dependency ordering", &ordered);
@@ -189,6 +206,112 @@ impl UsageResolver<'_> {
             }
         }
         Ok(ordered)
+    }
+
+    /// Add the private shared library dependencies of each linked target
+    /// (`cmComputeLinkDepends::FollowSharedDeps` and `HandleSharedDependency`).
+    /// Each dependency must follow the library that lists it. Return the keys of
+    /// the entries that only these dependencies added.
+    fn add_shared_dependencies(
+        &mut self,
+        graph: &mut LinkGraph,
+        ctx: &EvalContext,
+    ) -> Result<HashSet<LinkKey>, ResolveError> {
+        let mut followed = HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        for index in 0..graph.nodes.len() {
+            if let Some((item, _)) = graph.node(index)
+                && let ResolvedLinkKind::Library(id) = item.kind
+                && followed.insert(index)
+            {
+                for dependency in self.shared_dependencies(id, ctx)? {
+                    queue.push_back((index, dependency));
+                }
+            }
+        }
+        let mut dependent_only = HashSet::new();
+        let mut budget = Limits::default().max_value_bytes / 64;
+        while let Some((depender, dependency)) = queue.pop_front() {
+            budget = budget.checked_sub(1).ok_or_else(|| {
+                ResolveError::Message("The link dependency graph exceeds the size limit.".into())
+            })?;
+            let key = dependency.key();
+            let new = !graph.nodes.contains_key(&key);
+            let index = graph.insert(&dependency);
+            if new {
+                dependent_only.insert(key);
+            }
+            if let Some((_, (_, edges))) = graph.nodes.get_index_mut(depender) {
+                edges.insert(index);
+            }
+            if let ResolvedLinkKind::Library(id) = dependency.kind
+                && followed.insert(index)
+            {
+                let (interface, _) = self.usage_links(id, true, ctx)?;
+                for item in interface.iter() {
+                    queue.push_back((index, Arc::clone(item)));
+                }
+                for item in self.shared_dependencies(id, ctx)? {
+                    queue.push_back((index, item));
+                }
+            }
+        }
+        Ok(dependent_only)
+    }
+
+    /// The runtime dependencies of a library on shared libraries that are not in
+    /// its link interface (`cmLinkInterface::SharedDeps`).
+    fn shared_dependencies(
+        &mut self,
+        id: TargetId,
+        ctx: &EvalContext,
+    ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
+        let target = self.target(id)?;
+        if target.is_imported() {
+            let Some((names, _)) = super::super::artifacts::imported_property(
+                target,
+                b"IMPORTED_LINK_DEPENDENT_LIBRARIES",
+                &ctx.config,
+            ) else {
+                return Ok(Vec::new());
+            };
+            let dir = target.dir;
+            return Ok(list::split(&names, list::Empty::Drop)
+                .into_iter()
+                .filter_map(|name| {
+                    let dependency = self.model.find_target(dir, &name)?;
+                    Some(Arc::new(ResolvedLinkItem {
+                        text: rcmake_model::BT::new(name, rcmake_diag::Backtrace::default()),
+                        kind: ResolvedLinkKind::Library(dependency),
+                        feature: None,
+                        direct: false,
+                        scope: rcmake_model::UsageScope::Private,
+                        injected_by: None,
+                    }))
+                })
+                .collect());
+        }
+        if matches!(
+            target.kind,
+            TargetKind::StaticLibrary | TargetKind::InterfaceLibrary | TargetKind::ObjectLibrary
+        ) {
+            return Ok(Vec::new());
+        }
+        let mut own = ctx.clone();
+        own.head = Some(super::handle(id));
+        let (interface, _) = self.usage_links(id, true, ctx)?;
+        let mut emitted: HashSet<_> = interface.iter().map(|item| item.key()).collect();
+        let (implementation, _) = self.usage_links(id, false, &own)?;
+        Ok(implementation
+            .iter()
+            .filter(|item| emitted.insert(item.key()))
+            .filter(|item| {
+                matches!(item.kind, ResolvedLinkKind::Library(dependency)
+                    if self.model.target(dependency)
+                        .is_some_and(|target| target.kind == TargetKind::SharedLibrary))
+            })
+            .cloned()
+            .collect())
     }
 
     fn link_feature_overrides(

@@ -1,10 +1,11 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use rcmake_base::BString;
 use rcmake_gen_common::{GenError, export::ModuleExportJob};
-use rcmake_resolve::{BuildStep, DependInfo, progress};
+use rcmake_resolve::{BuildStep, DependInfo, LinkFragmentRole, LinkKind, progress};
 
-use super::{Graph, StepNodes, is_library_symlink};
+use super::{Graph, StepNodes, is_executable_symlink, is_library_symlink};
 use crate::response::{COMPILE_MSVC, Response};
 
 pub(super) struct EdgePlan {
@@ -53,6 +54,7 @@ impl EdgePlan {
 impl<'a> Graph<'a> {
     pub(super) fn plan_step(
         &self,
+        step_index: usize,
         step: &BuildStep,
         nodes: &StepNodes<'_>,
         cmake: &[u8],
@@ -309,12 +311,54 @@ impl<'a> Graph<'a> {
                 step,
                 invocations,
             } => {
-                let path_inputs = inputs.iter().map(|input| self.node(input)).collect();
+                let invocations = self
+                    .exe_symlinks
+                    .get(&step_index)
+                    .and_then(|sym| invocations.get(..sym.split_at))
+                    .unwrap_or(invocations.as_slice());
+                let mut explicit_inputs = Vec::new();
+                let mut lib_implicit = Vec::new();
+                if step.kind == LinkKind::StaticArchive {
+                    explicit_inputs.extend(inputs.iter().map(|input| self.node(input)));
+                } else {
+                    for input in inputs {
+                        let node = self.node(input);
+                        if self.is_link_library_input(&node, step) {
+                            lib_implicit.push(node);
+                        } else {
+                            explicit_inputs.push(node);
+                        }
+                    }
+                }
                 let depfile = self.input.link_depfiles.get(&step.output);
                 let rule = depfile.map_or_else(|| step.kind.ninja_rule(), |_| b"LINK_DEPFILE");
-                let mut plan = EdgePlan::new(rule, path_inputs, nodes);
+                let mut plan = EdgePlan::new(rule, explicit_inputs, nodes);
+                plan.implicit_inputs.extend(lib_implicit);
                 plan.implicit_inputs
                     .extend(implicit_inputs.iter().map(|input| self.node(input)));
+                if step.kind != LinkKind::StaticArchive {
+                    let mut seen: Option<HashSet<BString>> = None;
+                    for frag in &step.fragments {
+                        if frag.role != LinkFragmentRole::Libraries {
+                            continue;
+                        }
+                        let token = frag.text.value.as_slice();
+                        if !token.is_empty()
+                            && !token.starts_with(b"-")
+                            && !token.ends_with(b"/")
+                            && !token.ends_with(b".framework")
+                            && self.commands.absolute(token)
+                        {
+                            let seen = seen.get_or_insert_with(|| {
+                                plan.implicit_inputs.iter().cloned().collect()
+                            });
+                            let node = self.node(token);
+                            if seen.insert(node.clone()) {
+                                plan.implicit_inputs.push(node);
+                            }
+                        }
+                    }
+                }
                 if let Some(prepared) = self.prepared_link(nodes) {
                     prepared.bind(&mut plan);
                 } else {
@@ -343,6 +387,9 @@ impl<'a> Graph<'a> {
                 plan
             }
             BuildStep::Custom(custom) => {
+                let lib_symlink = is_library_symlink(custom);
+                let exe_symlink = is_executable_symlink(custom);
+                let is_symlink = lib_symlink || exe_symlink;
                 let resolved = custom
                     .depends
                     .iter()
@@ -350,12 +397,17 @@ impl<'a> Graph<'a> {
                     .collect::<Vec<_>>();
                 // CMake also lists the absolute path of each file in the build tree,
                 // so a depfile that names the absolute path finds this edge.
-                let aliases = custom
-                    .outputs
-                    .iter()
-                    .chain(&custom.byproducts)
-                    .filter_map(|name| self.absolute_alias(&self.node(name)))
-                    .collect::<Vec<_>>();
+                // Symlink rules list explicit outputs only.
+                let aliases = if is_symlink {
+                    Vec::new()
+                } else {
+                    nodes
+                        .outputs
+                        .iter()
+                        .chain(&nodes.byproducts)
+                        .filter_map(|node| self.absolute_alias(node))
+                        .collect::<Vec<_>>()
+                };
                 if custom.invocations.is_empty() {
                     let inputs = resolved.into_iter().map(|input| input.node).collect();
                     let mut plan = EdgePlan::new(b"phony", inputs, nodes);
@@ -366,13 +418,18 @@ impl<'a> Graph<'a> {
                 let (targets, files): (Vec<_>, Vec<_>) =
                     resolved.into_iter().partition(|input| input.target_only);
                 let inputs = files.into_iter().map(|input| input.node).collect();
-                let rule = if is_library_symlink(custom) {
+                let rule = if lib_symlink {
                     b"CMAKE_SYMLINK_LIBRARY".as_slice()
+                } else if exe_symlink {
+                    b"CMAKE_SYMLINK_EXECUTABLE".as_slice()
                 } else {
                     b"CUSTOM_COMMAND"
                 };
                 let mut plan = EdgePlan::new(rule, inputs, nodes);
-                let symbolic = custom.symbolic || !custom.symbolic_outputs.is_empty();
+                let symbolic = custom.symbolic
+                    || !custom.symbolic_outputs.is_empty()
+                    || self.input.utility_steps.contains(&step_index)
+                    || custom.outputs.is_empty();
                 if rule == b"CUSTOM_COMMAND" && (!symbolic || !custom.byproducts.is_empty()) {
                     plan.bind(b"restat", b"1".as_slice());
                 }
@@ -384,8 +441,15 @@ impl<'a> Graph<'a> {
                     .and_then(|output| self.custom_scripts.get(output));
                 let command = script.map_or_else(
                     || {
-                        if rule == b"CMAKE_SYMLINK_LIBRARY" {
-                            self.commands.symlink_line(
+                        if lib_symlink {
+                            self.commands.symlink_library_line(
+                                &custom.invocations,
+                                nodes.outputs.len(),
+                                &rcmake_host::path::from_native(self.build_dir),
+                                !self.prefix.is_empty(),
+                            )
+                        } else if exe_symlink {
+                            self.commands.symlink_executable_line(
                                 &custom.invocations,
                                 &rcmake_host::path::from_native(self.build_dir),
                                 !self.prefix.is_empty(),
@@ -423,25 +487,45 @@ impl<'a> Graph<'a> {
                         plan.bind(b"deps", b"gcc".as_slice());
                     }
                 }
-                let description = custom
-                    .outputs
-                    .first()
-                    .and_then(|output| self.input.link_descriptions.get(output))
-                    .cloned()
-                    .or_else(|| custom.comment.clone())
-                    .unwrap_or_else(|| {
-                        if custom.outputs.is_empty() {
-                            return "Running custom command".into();
+                let description = if lib_symlink {
+                    let mut desc = BString::from("Creating library symlink ");
+                    for (index, output) in nodes.outputs.iter().enumerate() {
+                        if index > 0 {
+                            desc.push(b' ');
                         }
-                        let mut description = BString::from("Generating ");
-                        for (index, output) in custom.outputs.iter().enumerate() {
-                            if index > 0 {
-                                description.extend_from_slice(b", ");
+                        desc.extend_from_slice(output);
+                    }
+                    desc
+                } else if exe_symlink {
+                    let mut desc = BString::from("Creating executable symlink ");
+                    for (index, output) in nodes.outputs.iter().enumerate() {
+                        if index > 0 {
+                            desc.push(b' ');
+                        }
+                        desc.extend_from_slice(output);
+                    }
+                    desc
+                } else {
+                    custom
+                        .outputs
+                        .first()
+                        .and_then(|output| self.input.link_descriptions.get(output))
+                        .cloned()
+                        .or_else(|| custom.comment.clone())
+                        .unwrap_or_else(|| {
+                            if custom.outputs.is_empty() {
+                                return "Running custom command".into();
                             }
-                            description.extend_from_slice(output);
-                        }
-                        description
-                    });
+                            let mut description = BString::from("Generating ");
+                            for (index, output) in custom.outputs.iter().enumerate() {
+                                if index > 0 {
+                                    description.extend_from_slice(b", ");
+                                }
+                                description.extend_from_slice(output);
+                            }
+                            description
+                        })
+                };
                 plan.bind(b"DESC", description);
                 if custom.uses_terminal {
                     plan.bind(b"pool", b"console".as_slice());

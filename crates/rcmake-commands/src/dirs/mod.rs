@@ -216,14 +216,6 @@ fn definition(arg: &[u8]) -> Option<&[u8]> {
     .then_some(value)
 }
 
-fn definition_usage(arg: &[u8]) -> (UsageField, &[u8]) {
-    match definition(arg) {
-        Some(def) => (UsageField::CompileDefinitions, def),
-        // Keep legacy flags separate from the COMPILE_OPTIONS property.
-        None => (UsageField::InterfaceCompileOptions, arg),
-    }
-}
-
 fn add_definitions(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     non_target(
         cx,
@@ -231,37 +223,81 @@ fn add_definitions(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     );
     let bt = cx.backtrace();
     let dir = cx.current_dir_id();
-    let usage = &mut cx.project().dir_mut(dir).usage;
-    for arg in values(args) {
-        let (field, value) = definition_usage(arg);
-        usage.push(field, BT::new(value.into(), bt.clone()));
+    let directory = cx.project().dir_mut(dir);
+    for arg in values(args).filter(|arg| !arg.is_empty()) {
+        match definition(arg) {
+            Some(value) => directory.usage.push(
+                UsageField::CompileDefinitions,
+                BT::new(value.into(), bt.clone()),
+            ),
+            None => add_define_flag(&mut directory.define_flags, arg),
+        }
     }
     Ok(Flow::Normal)
 }
 
 fn remove_definitions(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let dir = cx.current_dir_id();
-    let usage = &mut cx.project().dir_mut(dir).usage;
-    for arg in values(args) {
-        let (field, value) = definition_usage(arg);
-        if let Some(entries) = usage.fields.get_mut(&field) {
-            if field == UsageField::CompileDefinitions {
-                for entry in entries
-                    .iter_mut()
-                    .filter(|entry| entry.value.contains(&b';'))
-                {
-                    let mut definitions = list::split(&entry.value, list::Empty::Keep);
-                    let count = definitions.len();
-                    definitions.retain(|definition| definition != value);
-                    if definitions.len() != count {
-                        entry.value = list::join(definitions);
-                    }
+    let directory = cx.project().dir_mut(dir);
+    for arg in values(args).filter(|arg| !arg.is_empty()) {
+        let Some(value) = definition(arg) else {
+            remove_define_flag(&mut directory.define_flags, arg);
+            continue;
+        };
+        if let Some(entries) = directory
+            .usage
+            .fields
+            .get_mut(&UsageField::CompileDefinitions)
+        {
+            for entry in entries
+                .iter_mut()
+                .filter(|entry| entry.value.contains(&b';'))
+            {
+                let mut definitions = list::split(&entry.value, list::Empty::Keep);
+                let count = definitions.len();
+                definitions.retain(|definition| definition != value);
+                if definitions.len() != count {
+                    entry.value = list::join(definitions);
                 }
             }
             entries.retain(|entry| !entry.value.is_empty() && entry.value != value);
         }
     }
     Ok(Flow::Normal)
+}
+
+/// Append a flag that is not a definition (`s_AddDefineFlag`): one leading space, and
+/// `\n` and `\r` become spaces.
+fn add_define_flag(flags: &mut BString, flag: &[u8]) {
+    flags.push(b' ');
+    flags.extend(flag.iter().map(|&byte| {
+        if matches!(byte, b'\n' | b'\r') {
+            b' '
+        } else {
+            byte
+        }
+    }));
+}
+
+/// Remove each instance of `flag` that has whitespace or a string end on both sides
+/// (`s_RemoveDefineFlag`).
+fn remove_define_flag(flags: &mut BString, flag: &[u8]) {
+    let mut position = 0;
+    while let Some(offset) = flags
+        .get(position..)
+        .and_then(|rest| rest.windows(flag.len()).position(|window| window == flag))
+    {
+        let start = position + offset;
+        let end = start + flag.len();
+        let left = start == 0 || flags.get(start - 1).is_some_and(u8::is_ascii_whitespace);
+        let right = flags.get(end).is_none_or(u8::is_ascii_whitespace);
+        if left && right {
+            flags.drain(start..end);
+            position = start;
+        } else {
+            position = start + 1;
+        }
+    }
 }
 
 fn add_compile_definitions(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {

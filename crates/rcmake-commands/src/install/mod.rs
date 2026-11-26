@@ -130,7 +130,12 @@ fn common(
 ) -> Result<bool> {
     match key {
         b"DESTINATION" => {
-            let path = destination(cx, value(args, key)?);
+            let raw = value(args, key)?;
+            let path = if signature == b"DIRECTORY" {
+                normalized_destination(cx, raw)
+            } else {
+                destination(cx, raw)
+            };
             options.destination = (signature != b"TARGETS" || !path.is_empty()).then_some(path);
         }
         b"COMPONENT" => options.component = Some(value(args, key)?.into()),
@@ -156,7 +161,30 @@ fn common(
     Ok(true)
 }
 
+/// Parse an argument-group `DESTINATION` (`cmInstallCommandArguments::Finalize`).
 fn destination(cx: &Cx<'_>, path: &[u8]) -> BString {
+    convert_to_unix_slashes(&normalized_destination(cx, path))
+}
+
+/// `cmSystemTools::ConvertToUnixSlashes` without home expansion: use `/` separators,
+/// merge doubled separators after a leading `//`, and remove one trailing `/`.
+fn convert_to_unix_slashes(path: &[u8]) -> BString {
+    let mut out = BString::default();
+    for (index, &byte) in path.iter().enumerate() {
+        let byte = if byte == b'\\' { b'/' } else { byte };
+        if byte == b'/' && index > 1 && out.last() == Some(&b'/') {
+            continue;
+        }
+        out.push(byte);
+    }
+    let drive_root = out.len() == 3 && out.get(1) == Some(&b':');
+    if out.len() > 1 && out.last() == Some(&b'/') && !drive_root {
+        out.pop();
+    }
+    out
+}
+
+fn normalized_destination(cx: &Cx<'_>, path: &[u8]) -> BString {
     if path.is_empty() || cx.policy(PolicyId::new(177)) != PolicyStatus::New {
         path.into()
     } else if path.windows(2).any(|window| window == b"$<") {

@@ -238,8 +238,17 @@ pub fn compute_artifacts(model: &ProjectModel, target: &Target, config: &ConfigI
         .flatten();
     let configured_dir = config_dir
         .or_else(|| target_property(model, target, output_dir.as_bytes()))
-        .or_else(|| legacy_library_output_directory(model, target));
-    let mut dir = configured_dir.map_or_else(|| dir.clone(), |output| join(dir, output));
+        .or_else(|| legacy_output_path(model, target));
+    let mut dir = configured_dir.map_or_else(
+        || dir.clone(),
+        |output| {
+            if output.windows(2).any(|part| part == b"$<") {
+                join(dir, output)
+            } else {
+                super::collapse(dir, output)
+            }
+        },
+    );
     if config_dir.is_none()
         && multi_config(model)
         && configured_dir.is_none_or(|p| !p.windows(2).any(|part| part == b"$<"))
@@ -320,17 +329,20 @@ pub fn compute_artifacts(model: &ProjectModel, target: &Target, config: &ConfigI
     artifacts
 }
 
-pub(crate) fn legacy_library_output_directory<'a>(
+/// Return the legacy output path variable for the target kind
+/// (`EXECUTABLE_OUTPUT_PATH` or `LIBRARY_OUTPUT_PATH`, `cmGeneratorTarget::ComputeOutputDir`).
+pub(crate) fn legacy_output_path<'a>(
     model: &'a ProjectModel,
     target: &Target,
 ) -> Option<&'a BString> {
-    matches!(
-        target.kind,
-        TargetKind::StaticLibrary | TargetKind::SharedLibrary | TargetKind::ModuleLibrary
-    )
-    .then(|| definition(model, target.dir, b"LIBRARY_OUTPUT_PATH"))
-    .flatten()
-    .filter(|path| !path.is_empty())
+    let variable: &[u8] = match target.kind {
+        TargetKind::Executable => b"EXECUTABLE_OUTPUT_PATH",
+        TargetKind::StaticLibrary | TargetKind::SharedLibrary | TargetKind::ModuleLibrary => {
+            b"LIBRARY_OUTPUT_PATH"
+        }
+        _ => return None,
+    };
+    definition(model, target.dir, variable).filter(|path| !path.is_empty())
 }
 
 fn multi_config(model: &ProjectModel) -> bool {
@@ -489,6 +501,35 @@ pub fn object_path(
 ) -> BString {
     let name = object_name(model, target, source, short_object_paths(model), None);
     join(&object_dir(model, target, config), &name)
+}
+
+/// Return the object file path that the File API codemodel reports for an
+/// object library (`cmGeneratorTarget::GetObjectDirectory` joined with the
+/// object name). `object` is the object path of a compile unit.
+///
+/// The single-configuration Ninja generator makes the object directory
+/// `<support dir>/./`, because its intermediate directory is `.`
+/// (`cmGlobalNinjaGenerator::ComputeTargetObjectDirectory`). The codemodel
+/// keeps that `./`, for example `CMakeFiles/ob.dir/./c.c.o`. The build file
+/// uses the collapsed path, which is the path of the compile unit. The other
+/// generators report the object path unchanged.
+#[must_use]
+pub fn file_api_object_path(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    object: &[u8],
+) -> BString {
+    if model.generator == Some(GeneratorKind::Ninja) {
+        let dir = object_dir(model, target, config);
+        if let Some(name) = object
+            .strip_prefix(dir.as_slice())
+            .and_then(|rest| rest.strip_prefix(b"/"))
+        {
+            return [dir.as_slice(), b"/./", name].concat().into();
+        }
+    }
+    object.into()
 }
 
 fn object_name(

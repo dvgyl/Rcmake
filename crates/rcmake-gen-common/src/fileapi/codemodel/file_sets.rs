@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_diag::Backtrace;
 use rcmake_genex::{EvalContext, TargetHandle};
-use rcmake_model::{FileSetKind, ProjectModel, Target, TargetId, UsageField, UsageScope};
+use rcmake_model::{
+    Directory, FileSetKind, ProjectModel, Target, TargetId, UsageField, UsageScope,
+};
 use rcmake_resolve::{ResolvedTarget, usage::UsageResolver};
 
 use crate::GenError;
@@ -26,6 +28,19 @@ pub(super) struct Membership {
     pub(super) header: bool,
     pub(super) interface: bool,
     pub(super) in_build: bool,
+    pub(super) source_group: Option<BString>,
+}
+
+pub(super) fn normalize_source_group_name(dir: &Directory, raw: &[u8]) -> BString {
+    let delimiters = dir
+        .vars
+        .get(b"SOURCE_GROUP_DELIMITER")
+        .map_or(b"\\/".as_slice(), |value| value.as_slice());
+    raw.split(|byte| delimiters.contains(byte))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(&b'\\')
+        .into()
 }
 
 impl Membership {
@@ -49,13 +64,20 @@ impl FileSets {
             return Ok(Self::default());
         };
         let mut result = Self::default();
-        let dir = &model.dir(raw.dir).source_dir;
+        let dir_model = model.dir(raw.dir);
+        let dir = &dir_model.source_dir;
         let context = EvalContext {
             config: target.config.clone(),
             head: u32::try_from(target.id.index()).ok().map(TargetHandle),
             ..Default::default()
         };
         for set in raw.file_sets.iter().filter_map(|id| model.file_set(*id)) {
+            let set_source_group = set
+                .props
+                .get(b"SOURCE_GROUP")
+                .filter(|value| !value.is_empty())
+                .map(|value| normalize_source_group_name(dir_model, value))
+                .or_else(|| set.props.get(b"\0source_group_file_set").cloned());
             let error =
                 |error: rcmake_resolve::ResolveError| GenError::Invalid(error.to_string().into());
             let bases = usage
@@ -96,6 +118,7 @@ impl FileSets {
                         header: false,
                         interface: false,
                         in_build: false,
+                        source_group: None,
                     }
                 });
                 if member.indexes.last() != Some(&index) {
@@ -105,6 +128,11 @@ impl FileSets {
                 member.header |= set.kind == FileSetKind::Headers;
                 member.interface = set.scope != UsageScope::Private;
                 member.in_build |= set.scope != UsageScope::Interface && !raw.is_imported();
+                if member.source_group.is_none()
+                    && let Some(group) = &set_source_group
+                {
+                    member.source_group = Some(group.clone());
+                }
             }
         }
         Ok(result)

@@ -32,21 +32,28 @@ impl Graph<'_> {
     }
 
     pub(super) fn prepare_link_commands(&mut self, host: &dyn Host) -> Result<(), GenError> {
-        for (step, nodes) in self.input.steps.iter().zip(&self.steps) {
+        for (step_index, (step, nodes)) in self.input.steps.iter().zip(&self.steps).enumerate() {
             let Some(output) = nodes.outputs.first() else {
                 continue;
             };
             let (raw, invocations, custom) = match step {
                 BuildStep::Link {
                     step, invocations, ..
-                } => (&step.output, invocations, false),
+                } => {
+                    let invocations = self
+                        .exe_symlinks
+                        .get(&step_index)
+                        .and_then(|sym| invocations.get(..sym.split_at))
+                        .unwrap_or(invocations.as_slice());
+                    (&step.output, invocations, false)
+                }
                 BuildStep::Custom(step)
                     if step
                         .invocations
                         .iter()
                         .any(|invocation| invocation.link_response.is_some()) =>
                 {
-                    (output, &step.invocations, true)
+                    (output, step.invocations.as_slice(), true)
                 }
                 _ => continue,
             };
@@ -55,7 +62,7 @@ impl Graph<'_> {
             if !self.use_response(dir, &ordinary) {
                 continue;
             }
-            let mut revised = invocations.clone();
+            let mut revised = invocations.to_vec();
             let mut files = Vec::new();
             for (index, (invocation, revised)) in invocations.iter().zip(&mut revised).enumerate() {
                 if invocation

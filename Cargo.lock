@@ -754,6 +754,7 @@ dependencies = [
  "rcmake-host",
  "rcmake-json",
  "rcmake-model",
+ "rcmake-regex",
  "rcmake-resolve",
  "thiserror",
 ]

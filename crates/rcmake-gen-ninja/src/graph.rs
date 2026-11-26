@@ -8,9 +8,10 @@ use rcmake_base::{BString, path_lex::Lexical, truth};
 use rcmake_gen_common::GenError;
 use rcmake_gen_common::export::ModuleExportJob;
 use rcmake_host::{Follow, Host, path};
-use rcmake_model::{DirId, ProjectModel};
+use rcmake_model::{DirId, ProjectModel, TargetKind};
 use rcmake_resolve::{
-    ArtifactSet, BuildGraph, BuildStep, GenerationResult, ScanResponse, progress,
+    ArtifactSet, BuildGraph, BuildStep, GenerationResult, LinkFragmentRole, LinkKind, LinkStep,
+    ScanResponse, progress,
 };
 
 use crate::commands::Commands;
@@ -132,6 +133,31 @@ pub(crate) struct Graph<'a> {
     steps: Vec<StepNodes<'a>>,
     order_only_alias_bytes: usize,
     compile_prerequisites: Vec<Vec<order::Prerequisite>>,
+    target_meta: Vec<TargetMeta>,
+    artifact_to_target: HashMap<BString, usize>,
+    step_owner: HashMap<usize, usize>,
+    exe_symlinks: BTreeMap<usize, ExecutableSymlink>,
+    root_all_inputs: Option<Vec<BString>>,
+}
+
+#[derive(Clone)]
+pub(super) struct TargetMeta {
+    pub(super) kind: TargetKind,
+    pub(super) dir_rel: BString,
+    pub(super) artifact_outputs: Vec<BString>,
+    pub(super) order_depends_target: Option<BString>,
+    pub(super) order_depends_private: Option<BString>,
+    pub(super) order_depends_inputs: Vec<BString>,
+    pub(super) order_depends_private_inputs: Vec<BString>,
+    pub(super) is_non_framework_shared: bool,
+    pub(super) linker_path: Option<BString>,
+}
+
+#[derive(Clone)]
+pub(super) struct ExecutableSymlink {
+    pub(super) split_at: usize,
+    pub(super) real_output: BString,
+    pub(super) symlink_output: BString,
 }
 
 #[derive(Clone, Default)]
@@ -146,7 +172,7 @@ struct StepNodes<'a> {
 enum OrderOnly<'a> {
     Targets(Cow<'a, [usize]>),
     StepOutputs(usize),
-    CompilePrerequisites(usize),
+    ObjectOrder(usize),
 }
 
 impl<'a> Graph<'a> {
@@ -167,6 +193,7 @@ impl<'a> Graph<'a> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_prefix(
         input: &'a BuildGraph,
         artifacts: &BTreeMap<&[u8], &ArtifactSet>,
@@ -174,6 +201,22 @@ impl<'a> Graph<'a> {
         config: Option<&'a [u8]>,
         prefix: &'a [u8],
         commands: Commands,
+    ) -> Result<Self, GenError> {
+        Self::with_context(
+            input, artifacts, build_dir, config, prefix, commands, None, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_context(
+        input: &'a BuildGraph,
+        artifacts: &BTreeMap<&[u8], &ArtifactSet>,
+        build_dir: &'a Path,
+        config: Option<&'a [u8]>,
+        prefix: &'a [u8],
+        commands: Commands,
+        model: Option<&ProjectModel>,
+        result: Option<&GenerationResult>,
     ) -> Result<Self, GenError> {
         let mut graph = Self {
             input,
@@ -201,7 +244,18 @@ impl<'a> Graph<'a> {
             steps: Vec::with_capacity(input.steps.len()),
             order_only_alias_bytes: 0,
             compile_prerequisites: Vec::new(),
+            target_meta: Vec::with_capacity(input.targets.len()),
+            artifact_to_target: HashMap::new(),
+            step_owner: HashMap::new(),
+            exe_symlinks: BTreeMap::new(),
+            root_all_inputs: None,
         };
+        let resolved_by_name: HashMap<&[u8], &rcmake_resolve::ResolvedTarget> = result
+            .into_iter()
+            .flat_map(|res| &res.targets)
+            .filter(|target| target.config == input.config)
+            .map(|target| (target.metadata.name.as_slice(), target))
+            .collect();
         for (index, target) in input.targets.iter().enumerate() {
             let name = graph.node(&target.name);
             if name.is_empty() || name == "all" || graph.names.insert(name.clone(), index).is_some()
@@ -211,14 +265,135 @@ impl<'a> Graph<'a> {
                     "Invalid or duplicate Ninja target name.",
                 ));
             }
-            graph.aliases.push(qualified(&name, config));
-            if artifacts
-                .get(target.name.as_slice())
-                .is_some_and(|artifacts| artifacts.file.is_some())
+            for &step_index in &target.steps {
+                graph.step_owner.entry(step_index).or_insert(index);
+            }
+            let raw = model.and_then(|model| {
+                input
+                    .target_ids
+                    .get(index)
+                    .and_then(|id| model.target(*id))
+                    .or_else(|| {
+                        model
+                            .find_target(DirId::ROOT, &target.name)
+                            .and_then(|id| model.target(id))
+                    })
+            });
+            let resolved = resolved_by_name.get(target.name.as_slice()).copied();
+            let dir_rel = if let (Some(model), Some(raw)) = (model, raw) {
+                if raw.dir == DirId::ROOT {
+                    BString::default()
+                } else {
+                    let node = graph.node(&model.dir(raw.dir).binary_dir);
+                    if node == b"." {
+                        BString::default()
+                    } else {
+                        node
+                    }
+                }
+            } else if let Some(resolved) = resolved {
+                let node = graph.node(&resolved.metadata.binary_dir);
+                if node == b"." || node.is_empty() {
+                    BString::default()
+                } else {
+                    node
+                }
+            } else {
+                BString::default()
+            };
+            let artifact_set = artifacts.get(target.name.as_slice()).copied();
+            let kind =
+                raw.map(|raw| raw.kind)
+                    .or_else(|| resolved.map(|resolved| resolved.metadata.kind))
+                    .unwrap_or_else(|| {
+                        if let Some(link_kind) = target.steps.iter().find_map(|&step_idx| {
+                            match input.steps.get(step_idx) {
+                                Some(BuildStep::Link { step, .. }) => Some(step.kind),
+                                _ => None,
+                            }
+                        }) {
+                            match link_kind {
+                                LinkKind::Executable => TargetKind::Executable,
+                                LinkKind::SharedLibrary => TargetKind::SharedLibrary,
+                                LinkKind::StaticArchive => TargetKind::StaticLibrary,
+                                LinkKind::ModuleLibrary => TargetKind::ModuleLibrary,
+                            }
+                        } else if artifact_set.is_some_and(|a| a.file.is_some()) {
+                            TargetKind::Executable
+                        } else if target.steps.iter().any(|&step_idx| {
+                            matches!(
+                                input.steps.get(step_idx),
+                                Some(BuildStep::Compile { .. } | BuildStep::Scan { .. })
+                            )
+                        }) {
+                            TargetKind::ObjectLibrary
+                        } else {
+                            TargetKind::Utility
+                        }
+                    });
+            let is_framework = model.is_some_and(|model| {
+                raw.is_some_and(|raw| {
+                    matches!(
+                        rcmake_resolve::ide::platform_bundle_kind(model, raw),
+                        rcmake_resolve::ide::BundleKind::Framework { .. }
+                    )
+                })
+            });
+            let is_non_framework_shared = kind == TargetKind::SharedLibrary && !is_framework;
+            let alias = if matches!(
+                kind,
+                TargetKind::Utility
+                    | TargetKind::InterfaceLibrary
+                    | TargetKind::ObjectLibrary
+                    | TargetKind::GlobalTarget
+            ) && !dir_rel.is_empty()
             {
+                let scoped = Lexical::new(&dir_rel).append(&target.name);
+                qualified(&graph.node(&scoped), config)
+            } else {
+                qualified(&name, config)
+            };
+            graph.aliases.push(alias);
+            if artifact_set.is_some_and(|artifacts| artifacts.file.is_some()) {
                 graph.artifact_targets.insert(index);
             }
+            if let Some(set) = artifact_set {
+                for path in [
+                    set.file.as_ref(),
+                    set.soname_file.as_ref(),
+                    set.linker_file.as_ref(),
+                    set.import_file.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    graph
+                        .artifact_to_target
+                        .entry(graph.node(path))
+                        .or_insert(index);
+                }
+            }
+            for &step_idx in &target.steps {
+                if let Some(BuildStep::Link { step, .. }) = input.steps.get(step_idx) {
+                    graph
+                        .artifact_to_target
+                        .entry(graph.node(&step.output))
+                        .or_insert(index);
+                }
+            }
+            graph.target_meta.push(TargetMeta {
+                kind,
+                dir_rel,
+                artifact_outputs: Vec::new(),
+                order_depends_target: None,
+                order_depends_private: None,
+                order_depends_inputs: Vec::new(),
+                order_depends_private_inputs: Vec::new(),
+                is_non_framework_shared,
+                linker_path: None,
+            });
         }
+        let mut used_synthetic = HashSet::new();
         for (index, step) in input.steps.iter().enumerate() {
             let mut nodes = StepNodes::default();
             match step {
@@ -230,13 +405,46 @@ impl<'a> Graph<'a> {
                         .byproducts
                         .extend(byproducts.iter().map(|output| graph.node(output)));
                 }
-                BuildStep::Link { step, .. } => {
-                    nodes.outputs.push(graph.node(&step.output));
+                BuildStep::Link {
+                    step, invocations, ..
+                } => {
+                    let real_output = graph.node(&step.output);
+                    nodes.outputs.push(real_output.clone());
                     if let Some(extra) = input.link_extra_outputs.get(&step.output) {
                         for output in extra {
                             let node = graph.node(output);
                             if !nodes.outputs.contains(&node) {
                                 nodes.outputs.push(node);
+                            }
+                        }
+                    }
+                    if step.kind == LinkKind::Executable
+                        && let Some(split_at) = invocations.iter().position(is_exe_symlink_call)
+                    {
+                        let symlink_raw = invocations
+                            .get(split_at)
+                            .and_then(|inv| inv.argv.get(4))
+                            .cloned()
+                            .or_else(|| {
+                                graph
+                                    .step_owner
+                                    .get(&index)
+                                    .and_then(|&owner| input.targets.get(owner))
+                                    .and_then(|target| artifacts.get(target.name.as_slice()))
+                                    .and_then(|set| set.linker_file.clone())
+                            });
+                        if let Some(symlink_raw) = symlink_raw {
+                            let symlink_output = graph.node(&symlink_raw);
+                            if symlink_output != real_output {
+                                nodes.outputs.retain(|out| out != &symlink_output);
+                                graph.exe_symlinks.insert(
+                                    index,
+                                    ExecutableSymlink {
+                                        split_at,
+                                        real_output,
+                                        symlink_output,
+                                    },
+                                );
                             }
                         }
                     }
@@ -286,6 +494,38 @@ impl<'a> Graph<'a> {
                     nodes
                         .byproducts
                         .extend(custom.byproducts.iter().map(|name| graph.node(name)));
+                    let owned_utility = if nodes.outputs.is_empty() {
+                        graph.step_owner.get(&index).copied().filter(|&owner| {
+                            graph.target_meta.get(owner).is_some_and(|meta| {
+                                matches!(
+                                    meta.kind,
+                                    TargetKind::Utility
+                                        | TargetKind::InterfaceLibrary
+                                        | TargetKind::GlobalTarget
+                                )
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(owner) = owned_utility
+                        && let Some(owner_target) = input.targets.get(owner)
+                        && let Some(owner_meta) = graph.target_meta.get(owner)
+                    {
+                        let owner_name = &owner_target.name;
+                        let dir_rel = &owner_meta.dir_rel;
+                        let mut synth = Vec::new();
+                        if !dir_rel.is_empty() {
+                            synth.extend_from_slice(dir_rel);
+                            synth.push(b'/');
+                        }
+                        synth.extend_from_slice(b"CMakeFiles/");
+                        synth.extend_from_slice(owner_name);
+                        let candidate = qualified(&graph.node(&synth), config);
+                        if used_synthetic.insert(candidate.clone()) {
+                            nodes.outputs.push(candidate);
+                        }
+                    }
                     if nodes.outputs.is_empty() && !nodes.byproducts.is_empty() {
                         nodes.outputs = std::mem::take(&mut nodes.byproducts);
                     }
@@ -313,9 +553,165 @@ impl<'a> Graph<'a> {
                 }
             }
         }
+        for (&index, sym) in &graph.exe_symlinks {
+            if graph
+                .producers
+                .insert(sym.symlink_output.clone(), index)
+                .is_some()
+            {
+                return Err(GenError::Invalid(
+                    format!("multiple rules generate {}", sym.symlink_output).into(),
+                ));
+            }
+            graph
+                .artifact_to_target
+                .entry(sym.symlink_output.clone())
+                .or_insert_with(|| graph.step_owner.get(&index).copied().unwrap_or(0));
+        }
         graph.disambiguate_aliases();
+        graph.compute_target_artifacts(artifacts, model);
         graph.connect_targets()?;
         Ok(graph)
+    }
+
+    fn compute_target_artifacts(
+        &mut self,
+        artifacts: &BTreeMap<&[u8], &ArtifactSet>,
+        model: Option<&ProjectModel>,
+    ) {
+        for (index, target) in self.input.targets.iter().enumerate() {
+            let Some(kind) = self.target_meta.get(index).map(|meta| meta.kind) else {
+                continue;
+            };
+            let raw = model.and_then(|model| {
+                self.input
+                    .target_ids
+                    .get(index)
+                    .and_then(|id| model.target(*id))
+                    .or_else(|| {
+                        model
+                            .find_target(DirId::ROOT, &target.name)
+                            .and_then(|id| model.target(id))
+                    })
+            });
+            let is_framework = model.is_some_and(|model| {
+                raw.is_some_and(|raw| {
+                    matches!(
+                        rcmake_resolve::ide::platform_bundle_kind(model, raw),
+                        rcmake_resolve::ide::BundleKind::Framework { .. }
+                    )
+                })
+            });
+            let set = artifacts.get(target.name.as_slice()).copied();
+            let link_step = target.steps.iter().copied().find(|&step_idx| {
+                self.steps.get(step_idx).is_some_and(|nodes| nodes.link)
+                    || matches!(self.input.steps.get(step_idx), Some(BuildStep::Link { .. }))
+            });
+            let link_output = link_step
+                .and_then(|step_idx| self.steps.get(step_idx))
+                .and_then(|nodes| nodes.outputs.first().cloned());
+            let exe_symlink_output = link_step
+                .and_then(|step_idx| self.exe_symlinks.get(&step_idx))
+                .map(|sym| sym.symlink_output.clone())
+                .or_else(|| {
+                    target.steps.iter().copied().find_map(|step_idx| {
+                        let BuildStep::Custom(custom) = self.input.steps.get(step_idx)? else {
+                            return None;
+                        };
+                        is_executable_symlink(custom).then(|| {
+                            self.steps
+                                .get(step_idx)
+                                .and_then(|nodes| nodes.outputs.first().cloned())
+                        })?
+                    })
+                });
+            let mut outputs = Vec::new();
+            let mut linker_path = None;
+            match kind {
+                TargetKind::SharedLibrary => {
+                    if let Some(set) = set {
+                        if let Some(import_file) = set
+                            .import_file
+                            .as_ref()
+                            .filter(|file| file.ends_with(b".tbd"))
+                        {
+                            outputs.push(self.node(import_file));
+                        }
+                        let main = if is_framework
+                            || set
+                                .linker_file
+                                .as_ref()
+                                .is_some_and(|f| set.import_file.as_ref() == Some(f))
+                        {
+                            set.file.as_ref()
+                        } else {
+                            set.linker_file.as_ref().or(set.file.as_ref())
+                        };
+                        if let Some(main) = main {
+                            let node = self.node(main);
+                            linker_path = Some(node.clone());
+                            if !outputs.contains(&node) {
+                                outputs.push(node);
+                            }
+                        }
+                    }
+                    if outputs.is_empty()
+                        && let Some(out) = link_output.clone()
+                    {
+                        linker_path = Some(out.clone());
+                        outputs.push(out);
+                    }
+                }
+                TargetKind::Executable => {
+                    if let Some(sym) = exe_symlink_output {
+                        outputs.push(sym);
+                    } else if let Some(set) = set {
+                        let main = if is_framework {
+                            set.file.as_ref()
+                        } else {
+                            set.linker_file
+                                .as_ref()
+                                .filter(|f| set.import_file.as_ref() != Some(*f))
+                                .or(set.file.as_ref())
+                        };
+                        if let Some(main) = main {
+                            outputs.push(self.node(main));
+                        }
+                    }
+                    if outputs.is_empty()
+                        && let Some(out) = link_output
+                    {
+                        outputs.push(out);
+                    }
+                }
+                TargetKind::StaticLibrary
+                | TargetKind::ModuleLibrary
+                | TargetKind::UnknownLibrary => {
+                    if let Some(file) = set.and_then(|set| set.file.as_ref()) {
+                        outputs.push(self.node(file));
+                    } else if let Some(out) = link_output {
+                        outputs.push(out);
+                    }
+                }
+                TargetKind::ObjectLibrary
+                | TargetKind::Utility
+                | TargetKind::InterfaceLibrary
+                | TargetKind::GlobalTarget => {
+                    if let Some(alias) = self.aliases.get(index) {
+                        outputs.push(alias.clone());
+                    }
+                }
+            }
+            if outputs.is_empty()
+                && let Some(alias) = self.aliases.get(index)
+            {
+                outputs.push(alias.clone());
+            }
+            if let Some(meta) = self.target_meta.get_mut(index) {
+                meta.artifact_outputs = outputs;
+                meta.linker_path = linker_path;
+            }
+        }
     }
 
     fn disambiguate_aliases(&mut self) {
@@ -361,6 +757,10 @@ impl<'a> Graph<'a> {
             .collect();
             let main = artifacts.file.as_ref().map(|file| self.node(file));
             for &index in &target.steps {
+                let exe_symlink_out = self
+                    .exe_symlinks
+                    .get(&index)
+                    .map(|sym| sym.symlink_output.clone());
                 if let Some(nodes) = self.steps.get_mut(index) {
                     nodes.link |=
                         matches!(self.input.steps.get(index), Some(BuildStep::Link { .. }))
@@ -371,6 +771,9 @@ impl<'a> Graph<'a> {
                         continue;
                     }
                     for path in &paths {
+                        if exe_symlink_out.as_ref() == Some(path) {
+                            continue;
+                        }
                         if !explicit.contains(path) && !nodes.byproducts.contains(path) {
                             nodes.byproducts.push(path.clone());
                         }
@@ -454,7 +857,10 @@ impl<'a> Graph<'a> {
             };
             let file = self.node(file);
             let filename = self.node(Lexical::new(&file).filename());
-            if name == &filename.as_slice() || self.names.contains_key(&filename) {
+            if name == &filename.as_slice()
+                || self.names.contains_key(&filename)
+                || self.producers.contains_key(&filename)
+            {
                 continue;
             }
             if self
@@ -469,23 +875,13 @@ impl<'a> Graph<'a> {
             self.extra_aliases.remove(&name);
         }
         let Some(model) = model else { return };
-        for (index, build_target) in self.input.targets.iter().enumerate() {
+        for build_target in &self.input.targets {
             let Some(target) = model
                 .find_target(DirId::ROOT, &build_target.name)
                 .and_then(|id| model.target(id))
             else {
                 continue;
             };
-            let directory = self.node(&model.dir(target.dir).binary_dir);
-            if target.kind == rcmake_model::TargetKind::Utility && target.dir != DirId::ROOT {
-                let name = Lexical::new(&directory).append(&build_target.name);
-                let alias = qualified(&name, self.config);
-                if !self.producers.contains_key(&alias)
-                    && let Some(primary) = self.aliases.get_mut(index)
-                {
-                    *primary = alias;
-                }
-            }
             for step in build_target
                 .steps
                 .iter()
@@ -536,41 +932,73 @@ impl<'a> Graph<'a> {
                 (id, Lexical::new(&directory).append(b"all"))
             })
             .collect();
-        for name in directories.values() {
-            self.extra_aliases.entry(name.clone()).or_default();
-        }
+        let mut dir_all: BTreeMap<DirId, Vec<BString>> =
+            model.dirs().map(|(id, _)| (id, Vec::new())).collect();
         let excluded_targets: HashSet<_> = result
             .targets
             .iter()
             .filter(|target| target.config == self.input.config && target.metadata.exclude_from_all)
             .map(|target| target.metadata.name.as_slice())
             .collect();
-        for (build_target, alias) in self.input.targets.iter().zip(&self.aliases) {
-            let Some(target) = model
-                .find_target(DirId::ROOT, &build_target.name)
-                .and_then(|id| model.target(id))
+        for (index, build_target) in self.input.targets.iter().enumerate() {
+            let Some(target) = self
+                .input
+                .target_ids
+                .get(index)
+                .and_then(|id| model.target(*id))
+                .or_else(|| {
+                    model
+                        .find_target(DirId::ROOT, &build_target.name)
+                        .and_then(|id| model.target(id))
+                })
             else {
+                if build_target.in_all
+                    && let Some(inputs) = dir_all.get_mut(&DirId::ROOT)
+                    && let Some(meta) = self.target_meta.get(index)
+                {
+                    inputs.extend(meta.artifact_outputs.iter().cloned());
+                }
                 continue;
             };
-            let excluded = target.props.get(b"EXCLUDE_FROM_ALL");
-            if build_target.steps.is_empty()
-                || excluded.is_some_and(|value| {
-                    excluded_targets.contains(build_target.name.as_slice()) || truth::is_on(value)
-                })
-            {
+            let excluded_prop = target.props.get(b"EXCLUDE_FROM_ALL");
+            let in_dir_all = if model.dir_excluded_from_all(target.dir) {
+                !build_target.steps.is_empty()
+                    && target.kind != TargetKind::Utility
+                    && !excluded_prop.is_some_and(|value| {
+                        excluded_targets.contains(build_target.name.as_slice())
+                            || truth::is_on(value)
+                    })
+            } else {
+                build_target.in_all
+                    && !excluded_prop.is_some_and(|value| {
+                        excluded_targets.contains(build_target.name.as_slice())
+                            || truth::is_on(value)
+                    })
+            };
+            if !in_dir_all {
                 continue;
             }
-            for ancestor in model.ancestors(target.dir) {
-                if let Some(name) = directories.get(&ancestor)
-                    && let Some(inputs) = self.extra_aliases.get_mut(name)
+            if let Some(inputs) = dir_all.get_mut(&target.dir)
+                && let Some(meta) = self.target_meta.get(index)
+            {
+                inputs.extend(meta.artifact_outputs.iter().cloned());
+            }
+        }
+        for (id, dir) in model.dirs() {
+            for &child in &dir.children {
+                if !model.dir(child).exclude_from_all
+                    && let Some(child_all) = directories.get(&child)
+                    && let Some(inputs) = dir_all.get_mut(&id)
                 {
-                    inputs.push(alias.clone());
-                }
-                if excluded.is_none() && model.dir(ancestor).exclude_from_all {
-                    break;
+                    inputs.push(qualified(child_all, self.config));
                 }
             }
         }
+        for (id, name) in &directories {
+            let inputs = dir_all.remove(id).unwrap_or_default();
+            self.extra_aliases.insert(name.clone(), unique_vec(inputs));
+        }
+        self.root_all_inputs = Some(unique_vec(dir_all.remove(&DirId::ROOT).unwrap_or_default()));
     }
 
     pub(crate) fn prep_output_is_reserved(&self, name: &BString) -> bool {
@@ -582,9 +1010,28 @@ impl<'a> Graph<'a> {
         self.producers.contains_key(&node).then_some(node)
     }
 
-    pub(crate) fn target_dependency(&self, name: &[u8]) -> Option<BString> {
-        let index = self.names.get(&self.node(name))?;
-        self.aliases.get(*index).cloned()
+    pub(crate) fn install_file_dependencies(&self, path: &[u8]) -> Vec<BString> {
+        let node = self.node(path);
+        if let Some(&index) = self.artifact_to_target.get(&node)
+            && let Some(meta) = self.target_meta.get(index)
+        {
+            return meta.artifact_outputs.clone();
+        }
+        self.producers
+            .contains_key(&node)
+            .then_some(node)
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn target_dependencies(&self, name: &[u8]) -> Vec<BString> {
+        let Some(&index) = self.names.get(&self.node(name)) else {
+            return Vec::new();
+        };
+        self.target_meta
+            .get(index)
+            .map(|meta| meta.artifact_outputs.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn resolve_custom_inputs(&mut self, model: Option<&ProjectModel>, host: &dyn Host) {
@@ -720,8 +1167,44 @@ impl<'a> Graph<'a> {
                     continue;
                 }
                 emitted.extend(nodes.outputs.iter().chain(&nodes.byproducts).cloned());
+                if let Some(sym) = self.exe_symlinks.get(&index) {
+                    emitted.insert(sym.symlink_output.clone());
+                }
             }
             planned_steps.push((index, step, PlannedStepNodes::Borrowed(nodes)));
+        }
+
+        for meta in &self.target_meta {
+            if let Some(order_target) = &meta.order_depends_target
+                && emitted
+                    .as_mut()
+                    .is_none_or(|nodes| nodes.insert(order_target.clone()))
+            {
+                let order_only: Vec<&BString> = meta.order_depends_inputs.iter().collect();
+                ninja.edge(
+                    b"phony",
+                    Edge {
+                        outputs: std::slice::from_ref(order_target),
+                        order_only: &order_only,
+                        ..Edge::default()
+                    },
+                );
+            }
+            if let Some(private_target) = &meta.order_depends_private
+                && emitted
+                    .as_mut()
+                    .is_none_or(|nodes| nodes.insert(private_target.clone()))
+            {
+                let order_only: Vec<&BString> = meta.order_depends_private_inputs.iter().collect();
+                ninja.edge(
+                    b"phony",
+                    Edge {
+                        outputs: std::slice::from_ref(private_target),
+                        order_only: &order_only,
+                        ..Edge::default()
+                    },
+                );
+            }
         }
 
         let step_workers = workers_override.unwrap_or_else(|| {
@@ -738,6 +1221,7 @@ impl<'a> Graph<'a> {
                 for &(index, step, ref nodes) in chunk {
                     self.emit_step(
                         &mut local,
+                        index,
                         step,
                         nodes.as_ref(),
                         cmake,
@@ -756,6 +1240,7 @@ impl<'a> Graph<'a> {
             for &(index, step, ref nodes) in &planned_steps {
                 self.emit_step(
                     ninja,
+                    index,
                     step,
                     nodes.as_ref(),
                     cmake,
@@ -771,6 +1256,7 @@ impl<'a> Graph<'a> {
             for &(index, step, ref nodes) in &planned_steps {
                 self.emit_step(
                     ninja,
+                    index,
                     step,
                     nodes.as_ref(),
                     cmake,
@@ -783,39 +1269,65 @@ impl<'a> Graph<'a> {
 
         let mut all = Vec::new();
         let mut phony_targets = Vec::new();
-        for (target, alias) in self.input.targets.iter().zip(&self.aliases) {
+        for (index, (target, alias)) in self.input.targets.iter().zip(&self.aliases).enumerate() {
             if !self.producers.contains_key(alias)
                 && emitted
                     .as_mut()
                     .is_none_or(|nodes| nodes.insert(alias.clone()))
             {
-                phony_targets.push((target, alias));
+                phony_targets.push((index, target, alias));
             }
-            if target.in_all {
-                all.push(alias.clone());
+            if target.in_all
+                && self.root_all_inputs.is_none()
+                && let Some(meta) = self.target_meta.get(index)
+            {
+                all.extend(meta.artifact_outputs.iter().cloned());
             }
         }
-        let emit_phony_target =
-            |out: &mut Ninja, target: &rcmake_resolve::GraphTarget, alias: &BString| {
-                let utilities = &self.input.utility_steps;
-                let utility_first = |index: &&usize| utilities.contains(*index);
-                let inputs: Vec<_> = target
+        let emit_phony_target = |out: &mut Ninja,
+                                 target_index: usize,
+                                 target: &rcmake_resolve::GraphTarget,
+                                 alias: &BString| {
+            let Some(meta) = self.target_meta.get(target_index) else {
+                return;
+            };
+            let inputs: Vec<BString> = match meta.kind {
+                TargetKind::Executable
+                | TargetKind::SharedLibrary
+                | TargetKind::StaticLibrary
+                | TargetKind::ModuleLibrary
+                | TargetKind::UnknownLibrary => meta.artifact_outputs.clone(),
+                TargetKind::ObjectLibrary => target
                     .steps
                     .iter()
-                    .filter(utility_first)
-                    .chain(target.steps.iter().filter(|index| !utility_first(index)))
-                    .filter_map(|&index| self.steps.get(index))
-                    .flat_map(|nodes| nodes.outputs.iter().chain(&nodes.byproducts))
-                    .cloned()
-                    .chain(
-                        target
-                            .depends
-                            .iter()
-                            .filter_map(|&index| self.aliases.get(index).cloned()),
-                    )
-                    .collect();
-                out.phony(alias, &unique_vec(inputs));
+                    .filter(|&&idx| {
+                        matches!(self.input.steps.get(idx), Some(BuildStep::Compile { .. }))
+                    })
+                    .filter_map(|&idx| self.steps.get(idx))
+                    .flat_map(|nodes| nodes.outputs.iter().cloned())
+                    .collect(),
+                TargetKind::Utility | TargetKind::InterfaceLibrary | TargetKind::GlobalTarget => {
+                    let utilities = &self.input.utility_steps;
+                    let utility_first = |index: &&usize| utilities.contains(*index);
+                    target
+                        .steps
+                        .iter()
+                        .filter(utility_first)
+                        .chain(target.steps.iter().filter(|index| !utility_first(index)))
+                        .filter_map(|&index| self.steps.get(index))
+                        .flat_map(|nodes| nodes.outputs.iter().chain(&nodes.byproducts))
+                        .cloned()
+                        .chain(target.depends.iter().flat_map(|&dep| {
+                            self.target_meta
+                                .get(dep)
+                                .map(|m| m.artifact_outputs.clone())
+                                .unwrap_or_default()
+                        }))
+                        .collect()
+                }
             };
+            out.phony(alias, &unique_vec(inputs));
+        };
         let target_workers = workers_override.unwrap_or_else(|| {
             render_worker_count(
                 phony_targets.len(),
@@ -827,8 +1339,8 @@ impl<'a> Graph<'a> {
         if target_workers > 1 && phony_targets.len() > 1 {
             let rendered = map_render_chunks(&phony_targets, target_workers, |chunk| {
                 let mut local = Ninja(Vec::with_capacity(chunk.len().saturating_mul(128)));
-                for &(target, alias) in chunk {
-                    emit_phony_target(&mut local, target, alias);
+                for &(index, target, alias) in chunk {
+                    emit_phony_target(&mut local, index, target, alias);
                 }
                 local
             });
@@ -836,22 +1348,26 @@ impl<'a> Graph<'a> {
                 ninja.0.extend_from_slice(&local.0);
             }
         } else {
-            for &(target, alias) in &phony_targets {
-                emit_phony_target(ninja, target, alias);
+            for &(index, target, alias) in &phony_targets {
+                emit_phony_target(ninja, index, target, alias);
             }
         }
         #[cfg(target_arch = "wasm32")]
         {
             let _ = target_workers;
-            for &(target, alias) in &phony_targets {
-                emit_phony_target(ninja, target, alias);
+            for &(index, target, alias) in &phony_targets {
+                emit_phony_target(ninja, index, target, alias);
             }
         }
         let all_alias = qualified(&self.node(b"all"), self.config);
         if let Some(nodes) = &mut emitted {
             nodes.insert(all_alias.clone());
         }
-        ninja.phony(&all_alias, &all);
+        let all_inputs = self
+            .root_all_inputs
+            .clone()
+            .unwrap_or_else(|| unique_vec(all));
+        ninja.phony(&all_alias, &all_inputs);
         for (name, inputs) in &self.extra_aliases {
             let alias = qualified(name, self.config);
             if !self.producers.contains_key(&alias)
@@ -870,6 +1386,7 @@ impl<'a> Graph<'a> {
             .steps
             .iter()
             .flat_map(|nodes| nodes.outputs.iter().chain(&nodes.byproducts))
+            .chain(self.exe_symlinks.values().map(|sym| &sym.symlink_output))
             .cloned()
             .collect::<Vec<_>>();
         ninja.phony(
@@ -927,6 +1444,7 @@ impl<'a> Graph<'a> {
     fn emit_step(
         &self,
         ninja: &mut Ninja,
+        step_index: usize,
         step: &BuildStep,
         nodes: &StepNodes<'_>,
         cmake: &[u8],
@@ -963,7 +1481,7 @@ impl<'a> Graph<'a> {
                 );
                 None
             }
-            _ => Some(self.plan_step(step, nodes, cmake, modmap_flag, exports)?),
+            _ => Some(self.plan_step(step_index, step, nodes, cmake, modmap_flag, exports)?),
         };
         let inputs = plan.as_mut().map_or_else(Vec::new, |plan| {
             unique_vec(std::mem::take(&mut plan.inputs))
@@ -976,18 +1494,86 @@ impl<'a> Graph<'a> {
         let planned = plan
             .as_ref()
             .map_or(&[][..], |plan| plan.order_only.as_slice());
-        let mut order_only = Vec::new();
-        if dyndep.is_some()
+        let is_link_step = matches!(step, BuildStep::Link { .. }) || nodes.link;
+        let is_utility_step = self.input.utility_steps.contains(&step_index);
+        let mut order_only: Vec<&BString> = Vec::new();
+        if is_link_step {
+            let self_outputs: HashSet<&BString> =
+                nodes.outputs.iter().chain(&nodes.byproducts).collect();
+            let mut part1_seen = self_outputs.clone();
+            let mut dep_artifacts: Vec<&BString> = Vec::new();
+            for entry in &nodes.order_only {
+                match entry {
+                    OrderOnly::Targets(indices) => {
+                        for &dep_index in indices.iter() {
+                            if let Some(meta) = self.target_meta.get(dep_index) {
+                                for output in &meta.artifact_outputs {
+                                    if part1_seen.insert(output) {
+                                        dep_artifacts.push(output);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    OrderOnly::StepOutputs(index) => {
+                        if let Some(step_nodes) = self.steps.get(*index) {
+                            for output in step_nodes.outputs.iter().chain(&step_nodes.byproducts) {
+                                if part1_seen.insert(output) {
+                                    dep_artifacts.push(output);
+                                }
+                            }
+                        }
+                    }
+                    OrderOnly::ObjectOrder(_) => {}
+                }
+            }
+            dep_artifacts.sort();
+            order_only.extend(dep_artifacts);
+            // Append versioning symlinks of linked non-framework shared libraries
+            // on non-DLL platforms for runtime binaries, preserving duplicates across
+            // the two parts (cmNinjaNormalTargetGenerator.cxx:1643-1658).
+            if let BuildStep::Link {
+                inputs: link_inputs,
+                step: link_step,
+                ..
+            } = step
+                && !self.commands.windows()
+                && !self.target_is_windows()
+                && matches!(
+                    link_step.kind,
+                    LinkKind::Executable | LinkKind::SharedLibrary | LinkKind::ModuleLibrary
+                )
+            {
+                let mut seen_shared = HashSet::new();
+                for dep_idx in self.linked_shared_targets(link_inputs, link_step) {
+                    if !seen_shared.insert(dep_idx) {
+                        continue;
+                    }
+                    if let Some(meta) = self.target_meta.get(dep_idx)
+                        && meta.is_non_framework_shared
+                        && let Some(lib) = &meta.linker_path
+                        && !implicit.contains(lib)
+                        && !self_outputs.contains(lib)
+                    {
+                        order_only.push(lib);
+                    }
+                }
+            }
+        } else if dyndep.is_some()
             || !nodes.order_only.is_empty()
             || !planned.is_empty()
             || custom_inputs.is_some()
         {
-            let mut seen: HashSet<_> = inputs
-                .iter()
-                .chain(&implicit)
-                .chain(&nodes.outputs)
-                .chain(&nodes.byproducts)
-                .collect();
+            let mut seen: HashSet<&BString> = if is_utility_step {
+                nodes.outputs.iter().chain(&nodes.byproducts).collect()
+            } else {
+                inputs
+                    .iter()
+                    .chain(&implicit)
+                    .chain(&nodes.outputs)
+                    .chain(&nodes.byproducts)
+                    .collect()
+            };
             order_only.extend(dyndep.into_iter().filter(|node| seen.insert(node)));
             order_only.extend(planned.iter().filter(|node| seen.insert(node)));
             order_only.extend(
@@ -998,12 +1584,20 @@ impl<'a> Graph<'a> {
             );
             for entry in &nodes.order_only {
                 match entry {
-                    OrderOnly::Targets(indices) => order_only.extend(
-                        indices
-                            .iter()
-                            .filter_map(|&index| self.aliases.get(index))
-                            .filter(|node| seen.insert(node)),
-                    ),
+                    OrderOnly::Targets(indices) => {
+                        let mut dep_artifacts: Vec<&BString> = Vec::new();
+                        for &dep_index in indices.iter() {
+                            if let Some(meta) = self.target_meta.get(dep_index) {
+                                for output in &meta.artifact_outputs {
+                                    if seen.insert(output) {
+                                        dep_artifacts.push(output);
+                                    }
+                                }
+                            }
+                        }
+                        dep_artifacts.sort();
+                        order_only.extend(dep_artifacts);
+                    }
                     OrderOnly::StepOutputs(index) => order_only.extend(
                         self.steps
                             .get(*index)
@@ -1011,10 +1605,17 @@ impl<'a> Graph<'a> {
                             .flat_map(|step| step.outputs.iter().chain(&step.byproducts))
                             .filter(|node| seen.insert(node)),
                     ),
-                    OrderOnly::CompilePrerequisites(index) => order_only.extend(
-                        self.compile_prerequisite_paths(*index)
-                            .filter(|node| seen.insert(node)),
-                    ),
+                    OrderOnly::ObjectOrder(target_index) => {
+                        if let Some(meta) = self.target_meta.get(*target_index)
+                            && let Some(order_target) = meta
+                                .order_depends_private
+                                .as_ref()
+                                .or(meta.order_depends_target.as_ref())
+                            && seen.insert(order_target)
+                        {
+                            order_only.push(order_target);
+                        }
+                    }
                 }
             }
         }
@@ -1070,8 +1671,109 @@ impl<'a> Graph<'a> {
         for (key, value) in &plan.bindings {
             ninja.binding(key, value);
         }
+
+        if let Some(sym) = self.exe_symlinks.get(&step_index)
+            && let BuildStep::Link { invocations, .. } = step
+        {
+            let sym_invocations = invocations.get(sym.split_at..).unwrap_or_default();
+            let command = self.commands.symlink_executable_line(
+                sym_invocations,
+                &path::from_native(self.build_dir),
+                !self.prefix.is_empty(),
+            );
+            ninja.edge(
+                b"CMAKE_SYMLINK_EXECUTABLE",
+                Edge {
+                    outputs: std::slice::from_ref(&sym.symlink_output),
+                    inputs: std::slice::from_ref(&sym.real_output),
+                    ..Edge::default()
+                },
+            );
+            ninja.binding(b"COMMAND", &command);
+            let mut desc = b"Creating executable symlink ".to_vec();
+            desc.extend_from_slice(&sym.symlink_output);
+            ninja.binding(b"DESC", &desc);
+        }
         Ok(())
     }
+
+    pub(super) fn is_link_library_input(&self, node: &BString, step: &LinkStep) -> bool {
+        if let Some(&target_idx) = self.artifact_to_target.get(node)
+            && matches!(
+                self.target_meta.get(target_idx).map(|m| m.kind),
+                Some(
+                    TargetKind::StaticLibrary
+                        | TargetKind::SharedLibrary
+                        | TargetKind::ModuleLibrary
+                )
+            )
+        {
+            return true;
+        }
+        if let Some(&producer) = self.producers.get(node) {
+            if matches!(
+                self.input.steps.get(producer),
+                Some(BuildStep::Compile { .. } | BuildStep::DeviceLink { .. })
+            ) {
+                return false;
+            }
+            if let Some(BuildStep::Link { step: dep_step, .. }) = self.input.steps.get(producer)
+                && matches!(
+                    dep_step.kind,
+                    LinkKind::StaticArchive | LinkKind::SharedLibrary | LinkKind::ModuleLibrary
+                )
+            {
+                return true;
+            }
+        }
+        if step.fragments.iter().any(|frag| {
+            frag.role == LinkFragmentRole::Libraries && self.node(&frag.text.value) == *node
+        }) {
+            return true;
+        }
+        looks_like_library_file(node)
+    }
+
+    fn linked_shared_targets(&self, link_inputs: &[BString], step: &LinkStep) -> Vec<usize> {
+        let mut out = Vec::new();
+        for input in link_inputs {
+            let node = self.node(input);
+            if let Some(&idx) = self.artifact_to_target.get(&node) {
+                out.push(idx);
+            }
+        }
+        for frag in &step.fragments {
+            if frag.role != LinkFragmentRole::Libraries {
+                continue;
+            }
+            let node = self.node(&frag.text.value);
+            if let Some(&idx) = self.artifact_to_target.get(&node) {
+                out.push(idx);
+            }
+        }
+        out
+    }
+
+    fn target_is_windows(&self) -> bool {
+        self.command_settings
+            .model
+            .and_then(|model| model.definition(DirId::ROOT, b"CMAKE_SYSTEM_NAME"))
+            .is_some_and(|sys| sys.eq_ignore_ascii_case(b"Windows"))
+    }
+}
+
+fn looks_like_library_file(path: &[u8]) -> bool {
+    let filename = Lexical::new(path).filename();
+    if filename.ends_with(b".a")
+        || filename.ends_with(b".lib")
+        || filename.ends_with(b".dylib")
+        || filename.ends_with(b".tbd")
+        || filename.ends_with(b".dll")
+        || filename.ends_with(b".so")
+    {
+        return true;
+    }
+    filename.windows(4).any(|w| w == b".so.")
 }
 
 /// A custom command input after target names map to Ninja nodes.
@@ -1088,6 +1790,17 @@ fn is_library_symlink(custom: &rcmake_resolve::CustomStep) -> bool {
             .get(2)
             .is_some_and(|word| word == b"cmake_symlink_library")
     })
+}
+
+fn is_executable_symlink(custom: &rcmake_resolve::CustomStep) -> bool {
+    custom.invocations.first().is_some_and(is_exe_symlink_call)
+}
+
+fn is_exe_symlink_call(invocation: &rcmake_resolve::Invocation) -> bool {
+    invocation
+        .argv
+        .get(2)
+        .is_some_and(|word| word == b"cmake_symlink_executable")
 }
 
 pub(crate) fn qualified(name: &BString, config: Option<&[u8]>) -> BString {

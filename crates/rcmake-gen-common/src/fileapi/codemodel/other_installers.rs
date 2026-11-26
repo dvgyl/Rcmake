@@ -1,6 +1,8 @@
-use rcmake_base::BString;
+use std::collections::BTreeSet;
+
+use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_diag::Backtrace;
-use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
+use rcmake_genex::{ConfigId, EvalContext, EvalSite, TargetHandle, evaluate, parse};
 use rcmake_model::{DirId, FileSet, InstallOptions, InstallRule, Target};
 use rcmake_resolve::{
     lower::{install_target_group_options, installs_unnamed_runtime_dependencies},
@@ -56,6 +58,26 @@ impl Rows<'_, '_, '_> {
         };
         let mut usage = UsageResolver::new(self.api.model);
         let bases = file_sets::set_files(self.api.model, &mut usage, raw, set, &self.config)?;
+        let source_dir = &self.api.model.dir(raw.dir).source_dir;
+        let context = EvalContext {
+            config: self.config.clone(),
+            head: u32::try_from(set.target.index()).ok().map(TargetHandle),
+            ..EvalContext::default()
+        };
+        let ordered_bases = if set.base_dirs.is_empty() {
+            vec![Lexical::new(source_dir).normalize()]
+        } else {
+            let raw_bases = usage
+                .file_set_paths(set.target, b"BASE_DIRS", &set.base_dirs, &context)
+                .map_err(|error| GenError::Invalid(error.to_string().into()))?;
+            let dir_lex = Lexical::new(source_dir);
+            let mut seen = BTreeSet::new();
+            raw_bases
+                .into_iter()
+                .map(|path| Lexical::new(&dir_lex.append(&path.value)).normalize())
+                .filter(|path| seen.insert(path.clone()))
+                .collect()
+        };
         row.insert(
             "paths".into(),
             array(
@@ -68,8 +90,8 @@ impl Rows<'_, '_, '_> {
         row.insert(
             "fileSetDirectories".into(),
             array(
-                bases
-                    .keys()
+                ordered_bases
+                    .iter()
                     .map(|base| Value::string(relative(base, self.api.source))),
             ),
         );
@@ -216,6 +238,17 @@ impl Rows<'_, '_, '_> {
                 .0
         } else {
             BString::from(destination)
+        };
+        let destination = {
+            let normalized = rcmake_base::path_lex::cmake_style(&destination);
+            let mut slice = normalized.as_slice();
+            while slice.len() > 1 && !slice.ends_with(b":/") {
+                let Some(trimmed) = slice.strip_suffix(b"/") else {
+                    break;
+                };
+                slice = trimmed;
+            }
+            BString::from(slice)
         };
         let component = options
             .component

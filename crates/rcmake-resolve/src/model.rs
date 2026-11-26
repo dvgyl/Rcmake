@@ -41,12 +41,17 @@ pub struct GenerationResult {
     pub compile_inputs: std::collections::BTreeMap<BString, Vec<BString>>,
     /// Install actions for `cmake_install.cmake`.
     pub install: InstallManifest,
+    /// Install facts of targets for the File API.
+    pub install_targets: crate::InstallTargetFacts,
     /// `install(EXPORT)` and `export()` plans.
     pub exports: Vec<ExportPlan>,
     /// Output paths that depend on the sources of a target that uses them.
     pub file_generate_cycles: IndexSet<(rcmake_model::DirId, BString)>,
     /// Generated command sources by target, in dependency trace order.
     pub traced_sources: IndexMap<TargetId, IndexSet<BString>>,
+    /// Target-level build order, utility items, and traced sources
+    /// (`cmComputeTargetDepends`, `cmTargetTraceDependencies`).
+    pub target_depends: crate::TargetDependGraph,
     /// Non-target metadata.
     pub metadata: ConfigureMetadata,
     /// Resolved entries for which the caller requested provenance.
@@ -725,6 +730,29 @@ pub enum BuildStep {
     Custom(CustomStep),
 }
 
+/// Targets that one custom command names (`cmCustomCommandGenerator::GetUtilities`
+/// and `cmTargetTraceDependencies::IsUtility`). Imported targets are included.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommandUtilities {
+    /// Executable targets used as a program and targets in generator expressions.
+    /// These utilities have the backtrace of the command.
+    pub commands: IndexSet<TargetId>,
+    /// Targets named in `DEPENDS`. These utilities have no backtrace.
+    pub depends: IndexSet<TargetId>,
+}
+
+/// The runtime path options of one link line, as POSIX or Windows shell text
+/// (`cmLinkLineComputer::ComputeLinkLibraries`). CMake writes the `-rpath` option
+/// before the link libraries and the `-rpath-link` option after them. A Ninja
+/// codemodel writes each `$` of this text as `$$`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkRuntimePaths {
+    /// The `-rpath` options (one combined option for a separator-based flag).
+    pub rpath: Option<BString>,
+    /// The `-rpath-link` option.
+    pub rpath_link: Option<BString>,
+}
+
 /// A buildable target of a [`BuildGraph`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GraphTarget {
@@ -790,6 +818,8 @@ pub struct BuildGraph {
     pub link_descriptions: IndexMap<BString, BString>,
     /// Ninja linker depfile paths keyed by primary link output path.
     pub link_depfiles: IndexMap<BString, BString>,
+    /// Runtime path options of each link line, keyed by primary link output path.
+    pub link_runtime_paths: IndexMap<BString, LinkRuntimePaths>,
     /// Custom rule indices that use the native configuration in a cross-config graph.
     pub native_custom_steps: IndexSet<usize>,
     /// Output command ownership indexed by graph step.
@@ -798,6 +828,8 @@ pub struct BuildGraph {
     pub custom_main_sources: IndexMap<usize, BString>,
     /// Custom output command steps in source dependency discovery order.
     pub custom_source_steps: IndexMap<TargetId, IndexSet<usize>>,
+    /// Targets that each lowered custom command names.
+    pub command_utilities: IndexMap<CommandId, CommandUtilities>,
     /// Project target identities in graph order, before synthetic targets.
     pub target_ids: Vec<TargetId>,
     /// Steps that run custom target commands.

@@ -284,7 +284,7 @@ fn resolve_project(
     }
     warn_link_flags(model, host, &targets);
     lower::cmp0128_warnings(model, host, &targets);
-    let mut install = lower::lower_install_manifest_with_configs(
+    let (mut install, install_targets) = lower::lower_install_manifest_with_configs(
         model,
         &targets,
         &configs,
@@ -366,6 +366,20 @@ fn resolve_project(
         toolchain.module_map_format = Some(format.as_str().into());
     }
     let traced_sources = crate::sources::traced_sources(model, &configs, &graphs)?;
+    let target_depends = crate::target_depends::compute(
+        model,
+        &configs,
+        (&targets, &graphs),
+        &paths,
+        &mut UsageResolver::with_source_paths(model, &paths).with_ide(options.ide),
+    )?;
+    for target in &mut targets {
+        target.dependencies = target_depends
+            .direct_depends(target.id)
+            .iter()
+            .map(|depend| depend.target)
+            .collect();
+    }
     crate::file_sets::clean_lint_fixes(model, host, &graphs);
     Ok(GenerationResult {
         configs,
@@ -374,9 +388,11 @@ fn resolve_project(
         cross_graphs,
         compile_inputs,
         install,
+        install_targets,
         exports,
         file_generate_cycles,
         traced_sources,
+        target_depends,
         metadata,
         provenance_entries: provenance.entries,
         chains: options.provenance.then(|| Box::new(provenance.chains)),

@@ -47,8 +47,9 @@ fn subdirectory_edit_cache_uses_top_level_paths() -> Result<(), Box<dyn std::err
     };
     super::generate_single_config_with_model(&result, &host, Path::new("/work/build"), &model)?;
     let manifest = read(&host, "build.ninja");
-    assert!(manifest.contains("build sub/edit_cache: phony"));
-    assert!(manifest.contains("cd -- sub && /tools/ccmake -S/work/src -B/work/build"));
+    assert!(manifest.contains("build sub/CMakeFiles/edit_cache.util: CUSTOM_COMMAND"));
+    assert!(manifest.contains("build sub/edit_cache: phony sub/CMakeFiles/edit_cache.util"));
+    assert!(manifest.contains("cd /work/build/sub && /tools/ccmake -S/work/src -B/work/build"));
     Ok(())
 }
 
@@ -143,7 +144,11 @@ fn single_config_writes_rules_edges_and_utilities() {
     assert!(
         rules.contains("rule CUSTOM_COMMAND\n  command = $COMMAND\n  description = $DESC\n\nrule")
     );
-    assert!(rules.contains("rule RERUN_CMAKE\n  command = $COMMAND\n  description = Re-running CMake\n  generator = 1\n  pool = console\n  restat = 1"));
+    assert!(rules.contains("rule RERUN_CMAKE\n  command = $COMMAND\n  description = Re-running CMake...\n  generator = 1\n  pool = console\n  restat = 1"));
+    assert!(rules.contains("rule CLEAN\n  command = ninja $FILE_ARG -t clean $TARGETS\n  description = Cleaning all built files..."));
+    assert!(rules.contains(
+        "rule HELP\n  command = ninja -t targets\n  description = All primary targets available:"
+    ));
     assert!(rules.contains("pool slow\n  depth = 3"));
     assert!(!rules.contains("pool ignored"));
     let build = read(&host, "build.ninja");
@@ -155,25 +160,27 @@ fn single_config_writes_rules_edges_and_utilities() {
         "  depfile = a $$:file.d",
         "  pool = console",
         "  pool = slow",
-        "build obj/a$ $$$:file.o: COMPILE_DEPFILE /work/src/a$ $$$:file.c || generated$ $$$:file",
+        "build cmake_object_order_depends_target_shared: phony || generate",
+        "build obj/a$ $$$:file.o: COMPILE_DEPFILE /work/src/a$ $$$:file.c || cmake_object_order_depends_target_shared",
         "  DEP_FILE = obj/a $$:file.d",
         "build libshared.so: LINK_SHARED_LIBRARY obj/a$ $$$:file.o || generate",
         "  DESC = Linking C shared library libshared.so",
-        "build shared: phony obj/a$ $$$:file.o libshared.so generate",
+        "build CMakeFiles/optional | /work/build/CMakeFiles/optional: CUSTOM_COMMAND",
+        "build shared: phony libshared.so",
         "build generate: phony generated$ $$$:file include${ninja_pipe}generated.h",
-        "build optional: phony CMakeFiles/rcmake-custom-3.util",
-        "build all: phony shared",
-        "build build.ninja CMakeFiles/rules.ninja: RERUN_CMAKE | /work/source$ dir/CMakeLists.txt /work/source$ dir/options$$$:file.cmake",
+        "build optional: phony CMakeFiles/optional",
+        "build all: phony libshared.so",
+        "build build.ninja: RERUN_CMAKE | /work/source$ dir/CMakeLists.txt /work/source$ dir/options$$$:file.cmake",
         "  COMMAND = cmake --regenerate-during-build -S'/work/source dir' -B/work/build",
+        "build /work/source$ dir/CMakeLists.txt /work/source$ dir/options$$$:file.cmake: phony",
         "build CMakeFiles/install.util: CUSTOM_COMMAND all",
-        "  COMMAND = cmake -P cmake_install.cmake",
+        "  COMMAND = cd /work/build && cmake -P cmake_install.cmake",
         "build install: phony CMakeFiles/install.util",
-        "  COMMAND = ctest --force-new-ctest-process",
+        "  COMMAND = cd /work/build && ctest",
         "build test: phony CMakeFiles/test.util",
-        "  COMMAND = ninja -t clean",
-        "  COMMAND = ninja -t targets",
-        "build clean: phony CMakeFiles/clean.util",
-        "  COMMAND = cmake -S'/work/source dir' -B/work/build",
+        "build clean: CLEAN",
+        "build help: HELP",
+        "  COMMAND = cd /work/build && cmake --regenerate-during-build -S'/work/source dir' -B/work/build",
         "build rebuild_cache: phony CMakeFiles/rebuild_cache.util",
         "default all",
     ] {
@@ -441,12 +448,13 @@ fn link_byproducts_use_unique_paths_on_the_link_edge() -> Result<(), Box<dyn std
         assert_eq!(
             manifest,
             concat!(
+                "build cmake_object_order_depends_target_libdemo.so_DEBUG: phony || .\n",
                 "build libdemo.so.1 | libdemo.so libdemo.lib: LINK_SHARED_LIBRARY\n",
                 "  COMMAND = : && :\n",
                 "  DESC = Linking C shared library libdemo.so.1\n",
                 "build check | /work/build/check: phony libdemo.so\n",
-                "build libdemo.so$:Debug: phony libdemo.so.1 libdemo.so libdemo.lib\n",
-                "build all$:Debug: phony libdemo.so$:Debug\n",
+                "build libdemo.so$:Debug: phony libdemo.so\n",
+                "build all$:Debug: phony libdemo.so\n",
                 "build all: phony all$:Debug\n"
             )
         );
@@ -540,13 +548,19 @@ fn target_dependencies_use_the_library_when_its_name_matches_an_executable_outpu
         let manifest = String::from_utf8(ninja.0)?;
         let executable_node = executable.replace(':', "$:");
         let suffix = config.map_or("", |_| "$:Debug");
+        let order_suffix = config.map_or("", |_| "_DEBUG");
         for line in [
             format!("build {library_alias}: phony libsqlite3.a"),
-            "build shell.o: COMPILE shell.c".to_owned(),
             format!(
-                "build {executable_node}: LINK_EXECUTABLE shell.o libsqlite3.a || {library_alias}"
+                "build cmake_object_order_depends_target_sqlite_shell{order_suffix}: phony || cmake_object_order_depends_target_sqlite3{order_suffix}"
             ),
-            format!("build all{suffix}: phony {library_alias} sqlite_shell{suffix}"),
+            format!(
+                "build shell.o: COMPILE shell.c || cmake_object_order_depends_target_sqlite_shell{order_suffix}"
+            ),
+            format!(
+                "build {executable_node}: LINK_EXECUTABLE shell.o | libsqlite3.a || libsqlite3.a"
+            ),
+            format!("build all{suffix}: phony libsqlite3.a {executable_node}"),
         ] {
             assert!(
                 manifest.lines().any(|candidate| candidate == line),
@@ -584,9 +598,9 @@ fn generator_commands_use_metadata_and_the_requested_build_cache() {
     let build = read(&host, "build.ninja");
     for line in [
         "  COMMAND = '/cache tools/cmake' --regenerate-during-build ",
-        "  COMMAND = '/cache tools/cmake' -P cmake_install.cmake",
-        "  COMMAND = '/cache tools/cmake' -S",
-        "  COMMAND = '/cache tools/ctest' --force-new-ctest-process",
+        "  COMMAND = cd /work/build && '/cache tools/cmake' -P cmake_install.cmake",
+        "  COMMAND = cd /work/build && '/cache tools/cmake' --regenerate-during-build -S",
+        "  COMMAND = cd /work/build && '/cache tools/ctest'\n",
     ] {
         assert!(build.contains(line), "Missing {line:?} in:\n{build}");
     }
@@ -600,15 +614,16 @@ fn generator_commands_use_metadata_and_the_requested_build_cache() {
     generate_multi_config(&result, &host, dir).unwrap_or_else(|error| panic!("{error}"));
     for file in ["build.ninja", "build-Debug.ninja"] {
         let build = read(&host, file);
-        let line = "  COMMAND = '/current tools/rcmake' -S";
+        let line =
+            "  COMMAND = cd /work/build && '/current tools/rcmake' --regenerate-during-build -S";
         assert!(build.contains(line), "Missing {line:?} in:\n{build}");
     }
     // The configuration utilities are in the implementation file.
     let implementation = read(&host, "CMakeFiles/impl-Debug.ninja");
     for line in [
         "  COMMAND = '/current tools/rcmake' --regenerate-during-build ",
-        "  COMMAND = '/current tools/rcmake' -DCMAKE_INSTALL_CONFIG_NAME=Debug",
-        "  COMMAND = '/current tools/ctest' --force-new-ctest-process -C Debug",
+        "  COMMAND = cd /work/build && '/current tools/rcmake' -DCMAKE_INSTALL_CONFIG_NAME=Debug",
+        "  COMMAND = cd /work/build && '/current tools/ctest' -C Debug",
     ] {
         assert!(
             implementation.contains(line),
@@ -1198,6 +1213,7 @@ fn custom_command_restat_depends_on_symbolic_outputs_and_byproducts() {
     generate_single_config(&result, &host, Path::new("/work/build"))
         .unwrap_or_else(|error| panic!("{error}"));
     let build = read(&host, "build.ninja");
+    let padded = format!("\n{build}");
     for (output, restat) in [
         ("ordinary", true),
         ("symbolic", false),
@@ -1205,14 +1221,18 @@ fn custom_command_restat_depends_on_symbolic_outputs_and_byproducts() {
         ("symbolic-with-byproduct", true),
         ("CMakeFiles/test.util", true),
     ] {
-        let edge = build
-            .split("build ")
+        let edge = padded
+            .split("\nbuild ")
             .find(|edge| {
                 edge.strip_prefix(output)
                     .is_some_and(|tail| tail.starts_with([' ', ':']))
             })
             .unwrap_or_else(|| panic!("Missing edge for {output}"));
-        assert_eq!(edge.contains("  restat = 1\n"), restat, "{edge}");
+        assert_eq!(
+            edge.lines().any(|line| line == "  restat = 1"),
+            restat,
+            "{edge}"
+        );
     }
 }
 
@@ -1395,15 +1415,23 @@ fn compile_launcher_preserves_distinct_programs_quoted_separator_and_prefix() {
         "{rules}"
     );
     assert!(
-        build.contains("build sub/CMakeFiles/a.dir/a.c.o: COMPILE_LAUNCHED /work/src/a.c\n")
+        build.contains(
+            "build sub/CMakeFiles/a.dir/a.c.o: COMPILE_LAUNCHED /work/src/a.c || sub/cmake_object_order_depends_target_a\n"
+        )
             && build.contains("  LAUNCH_ARGS = --option \"foo -- bar\"\n")
             && build.contains("  LAUNCHER = env USED_LAUNCHER=1\n"),
         "{build}"
     );
     assert!(
-        build.contains("build sub/CMakeFiles/b.dir/b.c.o: COMPILE_LAUNCHED_1 /work/src/b.c\n")
+        build.contains(
+            "build sub/CMakeFiles/b.dir/b.c.o: COMPILE_LAUNCHED_1 /work/src/b.c || sub/cmake_object_order_depends_target_b\n"
+        )
             && build.contains("  LAUNCH_ARGS = --target-name b\n")
             && build.contains("  LAUNCHER = env USED_LAUNCHER=2\n"),
+        "{build}"
+    );
+    assert!(
+        build.contains("build sub/all: phony sub/a sub/b\n"),
         "{build}"
     );
 }
@@ -1477,24 +1505,33 @@ fn compile_launcher_preserves_shell_expansion_in_program_word() {
         "{rules}"
     );
     assert!(
-        build.contains("build CMakeFiles/a.dir/a.c.o: COMPILE /work/src/a.c\n")
+        build.contains(
+            "build CMakeFiles/a.dir/a.c.o: COMPILE /work/src/a.c || cmake_object_order_depends_target_demo\n"
+        )
             && build.contains("  COMMAND = $$MY_LAUNCHER --launch --target a -- /usr/bin/cc"),
         "{build}"
     );
     assert!(
-        build.contains("build CMakeFiles/b.dir/b.c.o: COMPILE /work/src/b.c\n")
+        build.contains(
+            "build CMakeFiles/b.dir/b.c.o: COMPILE /work/src/b.c || cmake_object_order_depends_target_demo\n"
+        )
             && build.contains("  COMMAND = ~/bin/launcher --launch --target b -- /usr/bin/cc"),
         "{build}"
     );
     assert!(
-        build.contains("build CMakeFiles/c.dir/c.c.o: COMPILE /work/src/c.c\n")
+        build.contains(
+            "build CMakeFiles/c.dir/c.c.o: COMPILE /work/src/c.c || cmake_object_order_depends_target_demo\n"
+        )
             && build.contains("  COMMAND = \"$$QUOTED_VAR\" --launch --target c -- /usr/bin/cc"),
         "{build}"
     );
     assert!(
-        build.contains("build CMakeFiles/d.dir/d.c.o: COMPILE_LAUNCHED /work/src/d.c\n"),
+        build.contains(
+            "build CMakeFiles/d.dir/d.c.o: COMPILE_LAUNCHED /work/src/d.c || cmake_object_order_depends_target_demo\n"
+        ),
         "{build}"
     );
+    assert!(build.contains("build all: phony demo\n"), "{build}");
 }
 
 #[test]
@@ -1780,5 +1817,930 @@ fn parallel_emit_with_shared_outputs_byproducts_and_aliases_is_deterministic()
     assert!(!text.contains("build gen_10.c"));
     assert!(text.contains("build libt_20.so.1.0 | libt_20.so:"));
     assert!(!text.contains("build t_30: phony"));
+    Ok(())
+}
+
+#[test]
+fn wave_c2_regeneration_globs_and_builtin_utilities() -> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::{
+        DirId, GlobCheck, GlobKey, InstallKind, InstallOptions, InstallRule, ProjectModel,
+        TestEntry, TestKind,
+    };
+
+    let host = PureHost::default();
+    let dir = Path::new("/work/build");
+    host.seed_file(&dir.join("CMakeCache.txt"), b"")?;
+
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/src".into(), "/work/build".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_MAKE_PROGRAM".into(), "/opt/bin/ninja".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_TESTING_ENABLED".into(), "1".into());
+    let sub = model.add_directory(
+        DirId::ROOT,
+        "/work/src/sub".into(),
+        "/work/build/sub".into(),
+        Default::default(),
+    )?;
+    model.add_test(TestEntry {
+        name: "root_test".into(),
+        dir: DirId::ROOT,
+        backtrace: Default::default(),
+        command: vec!["true".into()],
+        configurations: vec![],
+        working_directory: None,
+        command_expand_lists: false,
+        old_style: false,
+        policies: Default::default(),
+        props: Default::default(),
+        build_depends: vec![],
+        kind: TestKind::Single,
+    })?;
+    model.add_test(TestEntry {
+        name: "sub_test".into(),
+        dir: sub,
+        backtrace: Default::default(),
+        command: vec!["true".into()],
+        configurations: vec![],
+        working_directory: None,
+        command_expand_lists: false,
+        old_style: false,
+        policies: Default::default(),
+        props: Default::default(),
+        build_depends: vec![],
+        kind: TestKind::Single,
+    })?;
+    for install_dir in [DirId::ROOT, sub] {
+        model.add_install(InstallRule {
+            dir: install_dir,
+            backtrace: Default::default(),
+            kind: InstallKind::Files(vec![rcmake_model::BT::new(
+                "/work/src/file.txt".into(),
+                Default::default(),
+            )]),
+            options: InstallOptions::default(),
+        });
+    }
+    model.glob_checks.insert(
+        GlobKey {
+            expression: "/work/src/*.c".into(),
+            recursive: false,
+            directories: false,
+            follow: false,
+            relative: None,
+        },
+        GlobCheck {
+            files: "/work/src/a.c".into(),
+            calls: Vec::new(),
+        },
+    );
+
+    let mut result = GenerationResult {
+        graphs: vec![BuildGraph::default()],
+        ..GenerationResult::default()
+    };
+    result.install = rcmake_resolve::lower::lower_install_manifest(&model, &result.targets);
+    result.metadata.listfiles = vec![
+        "/work/src/CMakeLists.txt".into(),
+        "/work/src/sub/CMakeLists.txt".into(),
+    ];
+
+    super::generate_single_config_with_model(&result, &host, dir, &model)?;
+    let rules = read(&host, "CMakeFiles/rules.ninja");
+    let build = read(&host, "build.ninja");
+
+    // E10 + E12 rule shapes.
+    assert!(
+        rules.contains("rule VERIFY_GLOBS\n  command = $COMMAND\n  description = Re-checking globbed directories...\n  generator = 1\n"),
+        "{rules}"
+    );
+    assert!(
+        rules.contains("rule CLEAN\n  command = /opt/bin/ninja $FILE_ARG -t clean $TARGETS\n  description = Cleaning all built files...\n"),
+        "{rules}"
+    );
+    assert!(
+        rules.contains("rule HELP\n  command = /opt/bin/ninja -t targets\n  description = All primary targets available:\n"),
+        "{rules}"
+    );
+    assert!(!rules.contains("rule CLEAN_CUSTOM"), "{rules}");
+
+    // E2 + E12 regeneration edges.
+    assert!(
+        build.contains(
+            "build CMakeFiles/VerifyGlobs.cmake_force: phony\nbuild CMakeFiles/cmake.verify_globs: VERIFY_GLOBS | CMakeFiles/VerifyGlobs.cmake_force\n"
+        ),
+        "{build}"
+    );
+    assert!(
+        build.contains("build build.ninja cmake_install.cmake sub/cmake_install.cmake CTestTestfile.cmake sub/CTestTestfile.cmake: RERUN_CMAKE CMakeFiles/cmake.verify_globs | /work/src/CMakeLists.txt /work/src/sub/CMakeLists.txt CMakeCache.txt CMakeFiles/VerifyGlobs.cmake\n"),
+        "{build}"
+    );
+    assert!(
+        !build.contains("build build.ninja CMakeFiles/rules.ninja:"),
+        "{build}"
+    );
+
+    // E1 combined multi-output phony for regeneration inputs.
+    assert!(
+        build.contains(
+            "build /work/src/CMakeLists.txt /work/src/sub/CMakeLists.txt CMakeCache.txt CMakeFiles/VerifyGlobs.cmake: phony\n"
+        ),
+        "{build}"
+    );
+
+    // E4 + E10 utilities.
+    for line in [
+        "build list_install_components: phony",
+        "build sub/list_install_components: phony",
+        "build sub/CMakeFiles/test.util: CUSTOM_COMMAND",
+        "  COMMAND = cd /work/build/sub && ctest",
+        "build sub/CMakeFiles/rebuild_cache.util: CUSTOM_COMMAND",
+        "  COMMAND = cd /work/build/sub && cmake --regenerate-during-build -S/work/src -B/work/build",
+        "build sub/CMakeFiles/install.util: CUSTOM_COMMAND sub/all",
+        "  COMMAND = cd /work/build/sub && cmake -P cmake_install.cmake",
+        "build clean: CLEAN",
+        "build help: HELP",
+    ] {
+        assert!(
+            build.lines().any(|candidate| candidate == line),
+            "Missing {line:?} in:\n{build}"
+        );
+    }
+    assert!(!build.contains("--force-new-ctest-process"), "{build}");
+
+    // E4 edit_cache fallback: escaped spaces and NO pool = console.
+    let padded = format!("\n{build}");
+    let edit_edge = padded
+        .split("\nbuild ")
+        .find(|edge| edge.starts_with("CMakeFiles/edit_cache.util:"))
+        .ok_or("Missing edit_cache.util edge")?;
+    assert!(
+        edit_edge.contains(
+            r"  COMMAND = cd /work/build && cmake -E echo No\ interactive\ CMake\ dialog\ available."
+        ),
+        "{edit_edge}"
+    );
+    assert!(!edit_edge.contains("pool = console"), "{edit_edge}");
+
+    // Configured edit_cache keeps pool = console.
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_EDIT_COMMAND".into(), "/tools/ccmake".into());
+    super::generate_single_config_with_model(&result, &host, dir, &model)?;
+    let configured = format!("\n{}", read(&host, "build.ninja"));
+    let configured_edit = configured
+        .split("\nbuild ")
+        .find(|edge| edge.starts_with("CMakeFiles/edit_cache.util:"))
+        .ok_or("Missing configured edit_cache.util edge")?;
+    assert!(
+        configured_edit.contains("pool = console"),
+        "{configured_edit}"
+    );
+    Ok(())
+}
+
+#[test]
+fn wave_c2_targets_aliases_order_depends_and_link_edges() -> Result<(), Box<dyn std::error::Error>>
+{
+    use rcmake_genex::ConfigId;
+    use rcmake_model::{
+        DirId, InstallKind, InstallOptions, InstallRule, ProjectModel, Target, TargetKind,
+        TargetOrigin,
+    };
+    use rcmake_resolve::{
+        FileSetOrder, InstallAction, InstallActionKind, LinkFragment, LinkFragmentRole,
+        ResolvedTarget, TargetMetadata,
+    };
+
+    let host = PureHost::default();
+    let dir = Path::new("/work/build");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/src".into(), "/work/build".into());
+    let sub = model.add_directory(
+        DirId::ROOT,
+        "/work/src/sub".into(),
+        "/work/build/sub".into(),
+        Default::default(),
+    )?;
+
+    let mk = |model: &mut ProjectModel, name: &str, kind: TargetKind, target_dir: DirId| {
+        model.add_target(Target::new(
+            name.into(),
+            kind,
+            TargetOrigin::Normal,
+            target_dir,
+            Default::default(),
+            Default::default(),
+        ))
+    };
+    let id_util = mk(&mut model, "sub_util", TargetKind::Utility, sub)?;
+    let id_obj = mk(&mut model, "sub_obj", TargetKind::ObjectLibrary, sub)?;
+    let id_sh = mk(&mut model, "sh", TargetKind::SharedLibrary, sub)?;
+    let id_st = mk(&mut model, "st", TargetKind::StaticLibrary, sub)?;
+    let id_app = mk(&mut model, "app", TargetKind::Executable, DirId::ROOT)?;
+    model.add_install(InstallRule {
+        dir: sub,
+        backtrace: Default::default(),
+        kind: InstallKind::Targets {
+            targets: vec![id_sh],
+            export: None,
+        },
+        options: InstallOptions {
+            component: Some("Runtime".into()),
+            ..InstallOptions::default()
+        },
+    });
+
+    let mut graph = BuildGraph {
+        steps: vec![
+            // 0: sub_util empty-output custom command (E3)
+            BuildStep::Custom(CustomStep {
+                invocations: vec![Invocation {
+                    argv: vec!["true".into()],
+                    ..Invocation::default()
+                }],
+                ..CustomStep::default()
+            }),
+            // 1: sub_obj compile
+            BuildStep::Compile {
+                byproducts: Vec::new(),
+                compile_input: None,
+                object: "sub/CMakeFiles/sub_obj.dir/o.c.o".into(),
+                source: "/work/src/sub/o.c".into(),
+                invocation: Invocation {
+                    shell: "cc -c /work/src/sub/o.c -o sub/CMakeFiles/sub_obj.dir/o.c.o".into(),
+                    ..Invocation::default()
+                },
+                depfile: None,
+                modmap: None,
+                dyndep: None,
+            },
+            // 2: sh compile
+            BuildStep::Compile {
+                byproducts: Vec::new(),
+                compile_input: None,
+                object: "sub/CMakeFiles/sh.dir/sh.c.o".into(),
+                source: "/work/src/sub/sh.c".into(),
+                invocation: Invocation {
+                    shell: "cc -c /work/src/sub/sh.c -o sub/CMakeFiles/sh.dir/sh.c.o".into(),
+                    ..Invocation::default()
+                },
+                depfile: None,
+                modmap: None,
+                dyndep: None,
+            },
+            // 3: sh link (real versioned output)
+            BuildStep::Link {
+                implicit_inputs: Vec::new(),
+                inputs: vec!["sub/CMakeFiles/sh.dir/sh.c.o".into()],
+                step: LinkStep {
+                    kind: LinkKind::SharedLibrary,
+                    language: "C".into(),
+                    fragments: Vec::new(),
+                    output: "sub/libsh.1.2.3.dylib".into(),
+                },
+                invocations: vec![Invocation {
+                    shell: "cc -shared -o sub/libsh.1.2.3.dylib sub/CMakeFiles/sh.dir/sh.c.o"
+                        .into(),
+                    ..Invocation::default()
+                }],
+            },
+            // 4: sh library symlink (E9: 2 outputs -> double space + && :)
+            BuildStep::Custom(CustomStep {
+                outputs: vec!["sub/libsh.1.dylib".into(), "sub/libsh.dylib".into()],
+                depends: vec!["sub/libsh.1.2.3.dylib".into()],
+                invocations: vec![Invocation {
+                    argv: vec![
+                        "cmake".into(),
+                        "-E".into(),
+                        "cmake_symlink_library".into(),
+                        "sub/libsh.1.2.3.dylib".into(),
+                        "sub/libsh.1.dylib".into(),
+                        "sub/libsh.dylib".into(),
+                    ],
+                    ..Invocation::default()
+                }],
+                ..CustomStep::default()
+            }),
+            // 5: st public generated header
+            BuildStep::Custom(CustomStep {
+                outputs: vec!["sub/pub.h".into()],
+                invocations: vec![Invocation {
+                    argv: vec!["touch".into(), "sub/pub.h".into()],
+                    ..Invocation::default()
+                }],
+                ..CustomStep::default()
+            }),
+            // 6: st private generated header (CMP0154 _private phony)
+            BuildStep::Custom(CustomStep {
+                outputs: vec!["sub/priv.h".into()],
+                invocations: vec![Invocation {
+                    argv: vec!["touch".into(), "sub/priv.h".into()],
+                    ..Invocation::default()
+                }],
+                ..CustomStep::default()
+            }),
+            // 7: st compile
+            BuildStep::Compile {
+                byproducts: Vec::new(),
+                compile_input: None,
+                object: "sub/CMakeFiles/st.dir/st.c.o".into(),
+                source: "/work/src/sub/st.c".into(),
+                invocation: Invocation {
+                    shell: "cc -c /work/src/sub/st.c -o sub/CMakeFiles/st.dir/st.c.o".into(),
+                    ..Invocation::default()
+                },
+                depfile: None,
+                modmap: None,
+                dyndep: None,
+            },
+            // 8: st archive
+            BuildStep::Link {
+                implicit_inputs: Vec::new(),
+                inputs: vec!["sub/CMakeFiles/st.dir/st.c.o".into()],
+                step: LinkStep {
+                    kind: LinkKind::StaticArchive,
+                    language: "C".into(),
+                    fragments: Vec::new(),
+                    output: "sub/libst.a".into(),
+                },
+                invocations: vec![Invocation {
+                    shell: "ar qc sub/libst.a sub/CMakeFiles/st.dir/st.c.o".into(),
+                    ..Invocation::default()
+                }],
+            },
+            // 9: app compile
+            BuildStep::Compile {
+                byproducts: Vec::new(),
+                compile_input: None,
+                object: "CMakeFiles/app.dir/main.c.o".into(),
+                source: "/work/src/main.c".into(),
+                invocation: Invocation {
+                    shell: "cc -c /work/src/main.c -o CMakeFiles/app.dir/main.c.o".into(),
+                    ..Invocation::default()
+                },
+                depfile: None,
+                modmap: None,
+                dyndep: None,
+            },
+            // 10: app link (E8: explicit objs, implicit libs + LINK_DEPENDS + abs full-path lib, order-only + dup sh symlink)
+            BuildStep::Link {
+                implicit_inputs: vec!["/work/src/script.ld".into()],
+                inputs: vec![
+                    "sub/CMakeFiles/sub_obj.dir/o.c.o".into(),
+                    "CMakeFiles/app.dir/main.c.o".into(),
+                    "sub/libsh.1.2.3.dylib".into(),
+                    "sub/libst.a".into(),
+                ],
+                step: LinkStep {
+                    kind: LinkKind::Executable,
+                    language: "C".into(),
+                    fragments: vec![LinkFragment {
+                        role: LinkFragmentRole::Libraries,
+                        text: rcmake_model::BT::new("/opt/ext/libfoo.a".into(), Default::default()),
+                    }],
+                    output: "app".into(),
+                },
+                invocations: vec![Invocation {
+                    shell: "cc -o app CMakeFiles/app.dir/main.c.o sub/libsh.1.2.3.dylib sub/libst.a /opt/ext/libfoo.a".into(),
+                    ..Invocation::default()
+                }],
+            },
+        ],
+        targets: vec![
+            GraphTarget {
+                name: "sub_util".into(),
+                steps: vec![0],
+                in_all: true,
+                ..GraphTarget::default()
+            },
+            GraphTarget {
+                name: "sub_obj".into(),
+                steps: vec![1],
+                in_all: true,
+                ..GraphTarget::default()
+            },
+            GraphTarget {
+                name: "sh".into(),
+                steps: vec![2, 3, 4],
+                in_all: true,
+                ..GraphTarget::default()
+            },
+            GraphTarget {
+                name: "st".into(),
+                steps: vec![5, 6, 7, 8],
+                in_all: true,
+                ..GraphTarget::default()
+            },
+            GraphTarget {
+                name: "app".into(),
+                steps: vec![9, 10],
+                depends: vec![0, 1, 2, 3],
+                in_all: true,
+            },
+        ],
+        target_ids: vec![id_util, id_obj, id_sh, id_st, id_app],
+        utility_steps: [0].into_iter().collect(),
+        ..BuildGraph::default()
+    };
+    graph.file_set_order.insert(
+        3,
+        FileSetOrder {
+            public: [BString::from("sub/pub.h")].into_iter().collect(),
+            independent: Default::default(),
+        },
+    );
+
+    let resolved = |id, name: &str, kind: TargetKind, target_dir: &str, artifacts: ArtifactSet| {
+        ResolvedTarget {
+            id,
+            config: ConfigId::default(),
+            metadata: TargetMetadata {
+                name: name.into(),
+                kind,
+                source_dir: format!("/work/src{target_dir}").into(),
+                binary_dir: format!("/work/build{target_dir}").into(),
+                backtrace: Default::default(),
+                folder: None,
+                exclude_from_all: false,
+                generator_provided: false,
+            },
+            artifacts,
+            compile_units: vec![],
+            compile_groups: vec![],
+            link: None,
+            dependencies: vec![],
+            cxx_modules: None,
+            fortran: None,
+            ide: None,
+        }
+    };
+    let mut result = GenerationResult {
+        graphs: vec![graph],
+        targets: vec![
+            resolved(
+                id_util,
+                "sub_util",
+                TargetKind::Utility,
+                "/sub",
+                ArtifactSet::default(),
+            ),
+            resolved(
+                id_obj,
+                "sub_obj",
+                TargetKind::ObjectLibrary,
+                "/sub",
+                ArtifactSet::default(),
+            ),
+            resolved(
+                id_sh,
+                "sh",
+                TargetKind::SharedLibrary,
+                "/sub",
+                ArtifactSet {
+                    file: Some("sub/libsh.1.2.3.dylib".into()),
+                    soname_file: Some("sub/libsh.1.dylib".into()),
+                    linker_file: Some("sub/libsh.dylib".into()),
+                    ..ArtifactSet::default()
+                },
+            ),
+            resolved(
+                id_st,
+                "st",
+                TargetKind::StaticLibrary,
+                "/sub",
+                ArtifactSet {
+                    file: Some("sub/libst.a".into()),
+                    ..ArtifactSet::default()
+                },
+            ),
+            resolved(
+                id_app,
+                "app",
+                TargetKind::Executable,
+                "",
+                ArtifactSet {
+                    file: Some("app".into()),
+                    ..ArtifactSet::default()
+                },
+            ),
+        ],
+        ..GenerationResult::default()
+    };
+    result.install.actions.push(InstallAction {
+        all_components: false,
+        exclude_from_all: false,
+        component: "Runtime".into(),
+        destination: "lib".into(),
+        configurations: Vec::new(),
+        kind: InstallActionKind::Files {
+            file_type: "SHARED_LIBRARY".into(),
+            files: vec![
+                "/work/build/sub/libsh.1.2.3.dylib".into(),
+                "/work/build/sub/libsh.1.dylib".into(),
+                "/work/build/sub/libsh.dylib".into(),
+            ],
+            rename: None,
+            permissions: Vec::new(),
+        },
+        optional: false,
+        message: BString::default(),
+    });
+
+    super::generate_single_config_with_model(&result, &host, dir, &model)?;
+    let build = read(&host, "build.ninja");
+    let padded = format!("\n{build}");
+
+    // E3: utility custom step output is sub/CMakeFiles/sub_util + abs alias, no restat.
+    let util_edge = padded
+        .split("\nbuild ")
+        .find(|edge| edge.starts_with("sub/CMakeFiles/sub_util |"))
+        .ok_or("Missing sub/CMakeFiles/sub_util edge")?;
+    assert!(
+        util_edge.starts_with(
+            "sub/CMakeFiles/sub_util | /work/build/sub/CMakeFiles/sub_util: CUSTOM_COMMAND\n"
+        ),
+        "{util_edge}"
+    );
+    assert!(!util_edge.contains("restat = 1"), "{util_edge}");
+
+    // E9: library symlink double space + && :, no implicit outputs, no restat.
+    let sym_edge = padded
+        .split("\nbuild ")
+        .find(|edge| edge.starts_with("sub/libsh.1.dylib sub/libsh.dylib:"))
+        .ok_or("Missing library symlink edge")?;
+    assert!(
+        sym_edge.starts_with(
+            "sub/libsh.1.dylib sub/libsh.dylib: CMAKE_SYMLINK_LIBRARY sub/libsh.1.2.3.dylib\n"
+        ),
+        "{sym_edge}"
+    );
+    assert!(
+        sym_edge.contains(
+            "  COMMAND = cmake -E cmake_symlink_library sub/libsh.1.2.3.dylib  sub/libsh.1.dylib sub/libsh.dylib && :\n"
+        ),
+        "{sym_edge}"
+    );
+    assert!(!sym_edge.contains("restat = 1"), "{sym_edge}");
+
+    // E5, E6, E7, E8, E11, E14 assertions.
+    for line in [
+        "build cmake_object_order_depends_target_sub_obj: phony || .",
+        "build cmake_object_order_depends_target_sh: phony || .",
+        "build cmake_object_order_depends_target_st: phony || sub/pub.h",
+        "build cmake_object_order_depends_target_st_private: phony || cmake_object_order_depends_target_st sub/priv.h",
+        "build sub/CMakeFiles/st.dir/st.c.o: COMPILE /work/src/sub/st.c || cmake_object_order_depends_target_st_private",
+        "build cmake_object_order_depends_target_app: phony || cmake_object_order_depends_target_sh cmake_object_order_depends_target_st cmake_object_order_depends_target_sub_obj sub/sub_util",
+        "build CMakeFiles/app.dir/main.c.o: COMPILE /work/src/main.c || cmake_object_order_depends_target_app",
+        "build app: LINK_EXECUTABLE sub/CMakeFiles/sub_obj.dir/o.c.o CMakeFiles/app.dir/main.c.o | sub/libsh.1.2.3.dylib sub/libst.a /work/src/script.ld /opt/ext/libfoo.a || sub/libsh.dylib sub/libst.a sub/sub_obj sub/sub_util sub/libsh.dylib",
+        "build sub/sub_util: phony sub/CMakeFiles/sub_util",
+        "build sub_util: phony sub/sub_util",
+        "build sub/sub_obj: phony sub/CMakeFiles/sub_obj.dir/o.c.o",
+        "build sub_obj: phony sub/sub_obj",
+        "build sh: phony sub/libsh.dylib",
+        "build st: phony sub/libst.a",
+        "build sub/all: phony sub/sub_util sub/sub_obj sub/libsh.dylib sub/libst.a",
+        "build all: phony app sub/all",
+        "build install_prep/Runtime: phony sub/libsh.dylib",
+    ] {
+        assert!(
+            build.lines().any(|candidate| candidate == line),
+            "Missing {line:?} in:\n{build}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn wave_c2_executable_symlinks_and_single_call_archive_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_resolve::{LinkResponse, ResponseQuoting, ResponseRole, ResponseSpan};
+
+    let host = PureHost::default();
+    let dir = Path::new("/work/build");
+
+    // 1. Both inline-split and pre-split versioned executables + 1-output library symlink.
+    let result = GenerationResult {
+        graphs: vec![BuildGraph {
+            steps: vec![
+                // Inline cmake_symlink_executable + post-build inside BuildStep::Link.
+                BuildStep::Link {
+                    implicit_inputs: Vec::new(),
+                    inputs: vec!["a.o".into()],
+                    step: LinkStep {
+                        kind: LinkKind::Executable,
+                        language: "C".into(),
+                        fragments: Vec::new(),
+                        output: "bin/inline-1.0".into(),
+                    },
+                    invocations: vec![
+                        Invocation {
+                            argv: vec![
+                                "cc".into(),
+                                "a.o".into(),
+                                "-o".into(),
+                                "bin/inline-1.0".into(),
+                            ],
+                            shell: "cc a.o -o bin/inline-1.0".into(),
+                            ..Invocation::default()
+                        },
+                        Invocation {
+                            argv: vec![
+                                "cmake".into(),
+                                "-E".into(),
+                                "cmake_symlink_executable".into(),
+                                "bin/inline-1.0".into(),
+                                "bin/inline".into(),
+                            ],
+                            shell: "cmake -E cmake_symlink_executable bin/inline-1.0 bin/inline"
+                                .into(),
+                            ..Invocation::default()
+                        },
+                        Invocation {
+                            argv: vec!["echo".into(), "post".into()],
+                            shell: "echo post".into(),
+                            ..Invocation::default()
+                        },
+                    ],
+                },
+                // Pre-split versioned executable link + separate Custom symlink step (no post-build).
+                BuildStep::Link {
+                    implicit_inputs: Vec::new(),
+                    inputs: vec!["b.o".into()],
+                    step: LinkStep {
+                        kind: LinkKind::Executable,
+                        language: "C".into(),
+                        fragments: Vec::new(),
+                        output: "bin/split-2.0".into(),
+                    },
+                    invocations: vec![Invocation {
+                        shell: "cc b.o -o bin/split-2.0".into(),
+                        ..Invocation::default()
+                    }],
+                },
+                BuildStep::Custom(CustomStep {
+                    outputs: vec!["bin/split".into()],
+                    depends: vec!["bin/split-2.0".into()],
+                    invocations: vec![Invocation {
+                        argv: vec![
+                            "cmake".into(),
+                            "-E".into(),
+                            "cmake_symlink_executable".into(),
+                            "bin/split-2.0".into(),
+                            "bin/split".into(),
+                        ],
+                        ..Invocation::default()
+                    }],
+                    ..CustomStep::default()
+                }),
+                // 1-output library symlink (single space + && :).
+                BuildStep::Custom(CustomStep {
+                    outputs: vec!["libone.so".into()],
+                    depends: vec!["libone.so.1".into()],
+                    invocations: vec![Invocation {
+                        argv: vec![
+                            "cmake".into(),
+                            "-E".into(),
+                            "cmake_symlink_library".into(),
+                            "libone.so.1".into(),
+                            "libone.so.1".into(),
+                            "libone.so".into(),
+                        ],
+                        ..Invocation::default()
+                    }],
+                    ..CustomStep::default()
+                }),
+            ],
+            targets: vec![
+                GraphTarget {
+                    name: "inline_exe".into(),
+                    steps: vec![0],
+                    in_all: true,
+                    ..GraphTarget::default()
+                },
+                GraphTarget {
+                    name: "split_exe".into(),
+                    steps: vec![1, 2],
+                    in_all: true,
+                    ..GraphTarget::default()
+                },
+            ],
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    generate_single_config(&result, &host, dir)?;
+    let rules = read(&host, "CMakeFiles/rules.ninja");
+    let build = read(&host, "build.ninja");
+    assert!(
+        rules.contains("rule CMAKE_SYMLINK_LIBRARY\n  command = $COMMAND\n  description = $DESC\n")
+            && !rules.contains(
+                "rule CMAKE_SYMLINK_LIBRARY\n  command = $COMMAND\n  description = $DESC\n  restat"
+            ),
+        "{rules}"
+    );
+    assert!(
+        rules.contains(
+            "rule CMAKE_SYMLINK_EXECUTABLE\n  command = $COMMAND\n  description = $DESC\n"
+        ),
+        "{rules}"
+    );
+    for line in [
+        "build bin/inline-1.0: LINK_EXECUTABLE a.o",
+        "  COMMAND = : && cc a.o -o bin/inline-1.0 && :",
+        "build bin/inline: CMAKE_SYMLINK_EXECUTABLE bin/inline-1.0",
+        "  COMMAND = cmake -E cmake_symlink_executable bin/inline-1.0 bin/inline && echo post",
+        "build bin/split: CMAKE_SYMLINK_EXECUTABLE bin/split-2.0",
+        "  COMMAND = cmake -E cmake_symlink_executable bin/split-2.0 bin/split && :",
+        "build libone.so: CMAKE_SYMLINK_LIBRARY libone.so.1",
+        "  COMMAND = cmake -E cmake_symlink_library libone.so.1 libone.so.1 libone.so && :",
+        "build inline_exe: phony bin/inline",
+        "build split_exe: phony bin/split",
+        "build all: phony bin/inline bin/split",
+    ] {
+        assert!(
+            build.lines().any(|candidate| candidate == line),
+            "Missing {line:?} in:\n{build}"
+        );
+    }
+
+    // 2. Single-call static archive response-file sizing:
+    //    (a) Forced response file with flag "@" -> STATIC_ARCHIVE_RSP.
+    //    (b) Empty flag "" -> no "@" emitted when forced; errors cleanly when oversized.
+    let make_archive = |count: usize, flag: &str| {
+        let objects: Vec<BString> = (0..count)
+            .map(|i| format!("CMakeFiles/big.dir/very_long_archive_unit_name_{i:04}.c.o").into())
+            .collect();
+        let mut argv = vec![BString::from("ar"), "qc".into(), "libbig.a".into()];
+        argv.extend(objects.iter().cloned());
+        let prefix_len = b"ar qc libbig.a ".len();
+        let mut shell = b"ar qc libbig.a".to_vec();
+        for obj in &objects {
+            shell.push(b' ');
+            shell.extend_from_slice(obj);
+        }
+        let shell_len = shell.len();
+        let argv_end = argv.len();
+        GenerationResult {
+            graphs: vec![BuildGraph {
+                steps: vec![BuildStep::Link {
+                    implicit_inputs: Vec::new(),
+                    inputs: objects,
+                    step: LinkStep {
+                        kind: LinkKind::StaticArchive,
+                        language: "C".into(),
+                        fragments: Vec::new(),
+                        output: "libbig.a".into(),
+                    },
+                    invocations: vec![Invocation {
+                        argv,
+                        shell: shell.into(),
+                        link_response: Some(Box::new(LinkResponse {
+                            flag: flag.into(),
+                            quoting: ResponseQuoting::Gnu,
+                            objects: None,
+                            libraries: None,
+                            spans: vec![ResponseSpan {
+                                role: ResponseRole::Objects,
+                                argv: 3..argv_end,
+                                shell: prefix_len..shell_len,
+                            }],
+                            archive_batch: false,
+                        })),
+                        ..Invocation::default()
+                    }],
+                }],
+                targets: vec![GraphTarget {
+                    name: "big".into(),
+                    steps: vec![0],
+                    in_all: true,
+                    ..GraphTarget::default()
+                }],
+                ..BuildGraph::default()
+            }],
+            ..GenerationResult::default()
+        }
+    };
+
+    // (a) Forced response file on single-call archive switches to STATIC_ARCHIVE_RSP.
+    let rsp_host = PureHost::default();
+    rsp_host.env_set(b"CMAKE_NINJA_FORCE_RESPONSE_FILE", Some(b"1"));
+    generate_single_config(&make_archive(4, "@"), &rsp_host, dir)?;
+    let rsp_build = read(&rsp_host, "build.ninja");
+    assert!(
+        rsp_build.contains("build libbig.a: STATIC_ARCHIVE_RSP"),
+        "{rsp_build}"
+    );
+    assert!(rsp_build.contains("  RSP_FILE = "), "{rsp_build}");
+    assert!(
+        rsp_build
+            .contains(r#"  RSP_ARGS = "CMakeFiles/big.dir/very_long_archive_unit_name_0000.c.o""#),
+        "{rsp_build}"
+    );
+
+    // (b) Toolchain with no response-file flag ("") never emits "@" when forced,
+    //     and returns an explicit error instead of panicking when oversized.
+    let no_flag_host = PureHost::default();
+    no_flag_host.env_set(b"CMAKE_NINJA_FORCE_RESPONSE_FILE", Some(b"1"));
+    generate_single_config(&make_archive(4, ""), &no_flag_host, dir)?;
+    let no_flag_build = read(&no_flag_host, "build.ninja");
+    assert!(
+        no_flag_build.contains("build libbig.a: STATIC_ARCHIVE "),
+        "{no_flag_build}"
+    );
+    assert!(!no_flag_build.contains("RSP_FILE"), "{no_flag_build}");
+    assert!(!no_flag_build.contains('@'), "{no_flag_build}");
+
+    let tiny_limit_host = PureHost::default();
+    let mut commands = crate::commands::Commands::default();
+    commands.posix_limit = 128;
+    let oversized =
+        super::generate_single(&make_archive(10, ""), &tiny_limit_host, dir, None, commands);
+    assert!(
+        oversized.is_err(),
+        "expected oversized single archive without response flag to fail"
+    );
+    Ok(())
+}
+
+#[test]
+fn link_absolute_library_fragments_deduplicate_in_insertion_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_genex::ConfigId;
+    use rcmake_resolve::{LinkFragment, LinkFragmentRole};
+
+    let dir = Path::new("/work/build");
+    let mut fragments = Vec::new();
+    for idx in 0..400 {
+        fragments.push(LinkFragment {
+            role: LinkFragmentRole::Libraries,
+            text: rcmake_model::BT::new(
+                format!("/opt/ext/lib{}.a", idx % 50).into(),
+                Default::default(),
+            ),
+        });
+    }
+    fragments.push(LinkFragment {
+        role: LinkFragmentRole::Libraries,
+        text: rcmake_model::BT::new("/work/src/script.ld".into(), Default::default()),
+    });
+    fragments.push(LinkFragment {
+        role: LinkFragmentRole::Libraries,
+        text: rcmake_model::BT::new("/opt/ext/lib0.a".into(), Default::default()),
+    });
+    let result = GenerationResult {
+        configs: vec![ConfigId("".into())],
+        graphs: vec![BuildGraph {
+            config: ConfigId("".into()),
+            steps: vec![BuildStep::Link {
+                implicit_inputs: vec!["/work/src/script.ld".into()],
+                inputs: vec!["CMakeFiles/app.dir/main.c.o".into()],
+                step: LinkStep {
+                    kind: LinkKind::Executable,
+                    language: "C".into(),
+                    fragments,
+                    output: "app".into(),
+                },
+                invocations: vec![Invocation {
+                    shell: "cc -o app CMakeFiles/app.dir/main.c.o".into(),
+                    ..Invocation::default()
+                }],
+            }],
+            targets: vec![GraphTarget {
+                name: "app".into(),
+                steps: vec![0],
+                in_all: true,
+                ..GraphTarget::default()
+            }],
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    let host = PureHost::default();
+    generate_single_config(&result, &host, dir)?;
+    let build = read(&host, "build.ninja");
+    let link_line = build
+        .lines()
+        .find(|line| line.starts_with("build app: "))
+        .ok_or("missing app link line")?;
+    let (_, implicit_part) = link_line
+        .split_once(" | ")
+        .ok_or("missing implicit inputs on link line")?;
+    let implicit_nodes: Vec<&str> = implicit_part
+        .split(" || ")
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    let mut expected = vec!["/work/src/script.ld".to_owned()];
+    expected.extend((0..50).map(|idx| format!("/opt/ext/lib{idx}.a")));
+    let expected_refs: Vec<&str> = expected.iter().map(String::as_str).collect();
+    assert_eq!(implicit_nodes, expected_refs);
     Ok(())
 }

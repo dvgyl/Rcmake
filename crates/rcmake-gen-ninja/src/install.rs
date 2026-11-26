@@ -8,33 +8,51 @@ pub(super) fn emit_utilities(
     rebuild: &[u8],
     scope: Scope<'_, '_>,
 ) {
+    let root_path = rcmake_host::path::from_native(graph.build_dir);
+    let root = graph.commands.path(&root_path);
     emit_directory_utilities(ninja, graph, programs, rebuild, scope);
-    let mut clean = programs.ninja.clone();
-    if entry != b"build.ninja" {
-        clean.extend_from_slice(b" -f ");
-        graph.commands.word(&graph.node(entry), &mut clean);
-    }
-    let mut help = clean.clone();
-    clean.extend_from_slice(b" -t clean");
-    let clean = clean_command(graph, &programs.cmake, clean, &graph.clean_files);
-    help.extend_from_slice(b" -t targets");
-    for (name, command, inputs, pool, rule) in [
-        ("clean", clean, vec![], b"".as_slice(), b"CLEAN".as_slice()),
-        ("help", help, vec![], b"".as_slice(), b"HELP".as_slice()),
-    ] {
-        if name == "clean" && graph.config.is_some() {
-            continue;
+    if graph.config.is_none() {
+        let clean_name = graph.node(b"clean");
+        if !graph.has_target(&clean_name) {
+            if graph.clean_files.is_empty() {
+                ninja.edge(
+                    b"CLEAN",
+                    Edge {
+                        outputs: std::slice::from_ref(&clean_name),
+                        ..Edge::default()
+                    },
+                );
+                if entry != b"build.ninja" {
+                    let mut file_arg = b"-f ".to_vec();
+                    graph.commands.word(&graph.node(entry), &mut file_arg);
+                    ninja.binding(b"FILE_ARG", &file_arg);
+                }
+            } else {
+                let mut clean = programs.ninja.clone();
+                if entry != b"build.ninja" {
+                    clean.extend_from_slice(b" -f ");
+                    graph.commands.word(&graph.node(entry), &mut clean);
+                }
+                clean.extend_from_slice(b" -t clean");
+                let clean = clean_command(graph, &programs.cmake, clean, &graph.clean_files);
+                ninja.edge(
+                    b"CLEAN_CUSTOM",
+                    Edge {
+                        outputs: std::slice::from_ref(&clean_name),
+                        ..Edge::default()
+                    },
+                );
+                ninja.binding(b"COMMAND", &clean);
+            }
         }
-        emit_utility(
-            ninja,
-            graph,
-            Utility {
-                name,
-                command: &command,
-                cwd: None,
-                inputs: &inputs,
-                pool,
-                rule,
+    }
+    let help_name = graph.node(b"help");
+    if !graph.has_target(&help_name) {
+        ninja.edge(
+            b"HELP",
+            Edge {
+                outputs: std::slice::from_ref(&help_name),
+                ..Edge::default()
             },
         );
     }
@@ -64,12 +82,15 @@ pub(super) fn emit_utilities(
                 ninja,
                 graph,
                 Utility {
+                    dir_prefix: "",
+                    utility: name,
                     name,
                     command: &command,
-                    cwd: None,
+                    cwd: Some(root.as_slice()),
                     inputs,
                     pool: b"console",
                     rule: b"CUSTOM_COMMAND",
+                    edit_fallback: false,
                 },
             );
         }
@@ -135,16 +156,25 @@ fn emit_directory_utilities(
                     ninja.phony(&qualified(&name, Some(b"all")), &inputs(all));
                 }
             }
+            _ if spec.rule == b"phony" => {
+                let name = graph.node(spec.name.as_bytes());
+                if !graph.has_target(&name) {
+                    ninja.phony(&name, &[]);
+                }
+            }
             _ => emit_utility(
                 ninja,
                 graph,
                 Utility {
+                    dir_prefix: &spec.dir_prefix,
+                    utility: &spec.utility,
                     name: &spec.name,
                     command: &spec.command,
                     cwd: spec.cwd.as_ref().map(|value| value.as_slice()),
                     inputs: &spec.inputs,
                     pool: spec.pool,
                     rule: spec.rule,
+                    edit_fallback: spec.edit_fallback,
                 },
             ),
         }
@@ -164,6 +194,8 @@ fn emit_directory_utilities(
 
 /// One utility of a directory.
 struct Spec {
+    dir_prefix: String,
+    utility: String,
     name: String,
     command: Vec<u8>,
     cwd: Option<BString>,
@@ -172,6 +204,8 @@ struct Spec {
     rule: &'static [u8],
     /// The command uses the configuration of the manifest.
     per_config: bool,
+    /// Fallback echo command when `CMAKE_EDIT_COMMAND` is not configured.
+    edit_fallback: bool,
 }
 
 fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -> Vec<Spec> {
@@ -201,17 +235,16 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
                 format!("{prefix}/{name}")
             }
         };
-        let cwd = (!directory.is_empty()).then(|| {
-            if graph.prefix.is_empty() {
-                directory.clone()
-            } else {
+        let cwd = if directory.is_empty() {
+            Some(root.clone())
+        } else {
+            Some(
                 graph
                     .commands
-                    .path(&[root.as_slice(), b"/", &directory].concat())
-            }
-        });
+                    .path(&[root.as_slice(), b"/", &directory].concat()),
+            )
+        };
         let mut test = programs.ctest.clone();
-        test.extend_from_slice(b" --force-new-ctest-process");
         for argument in &programs.ctest_arguments {
             test.push(b' ');
             graph.commands.word(argument, &mut test);
@@ -220,42 +253,74 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
             test.extend_from_slice(b" -C ");
             graph.commands.word(config, &mut test);
         }
-        let edit_cache =
+        let (edit_cache, edit_fallback) =
             if let (Some(editor), Some(source)) = (&programs.edit_cache, &programs.source_dir) {
                 let mut command = editor.clone();
                 for (option, dir) in [(b" -S".as_slice(), source.as_slice()), (b" -B", &root)] {
                     command.extend_from_slice(option);
                     graph.commands.word(dir, &mut command);
                 }
-                command
+                (command, false)
             } else {
                 let mut command = programs.cmake.clone();
                 command.extend_from_slice(b" -E echo ");
-                graph
-                    .commands
-                    .word(b"No interactive CMake dialog available.", &mut command);
-                command
+                if graph.commands.windows() {
+                    graph
+                        .commands
+                        .word(b"No interactive CMake dialog available.", &mut command);
+                } else {
+                    command.extend_from_slice(br"No\ interactive\ CMake\ dialog\ available.");
+                }
+                (command, true)
             };
 
         let all = BString::from(name("all"));
-        for (utility, command, enabled, per_config) in [
-            ("test", test, programs.testing, true),
-            ("rebuild_cache", rebuild.to_vec(), true, false),
-            ("edit_cache", edit_cache, true, false),
+        for (utility, command, enabled, per_config, pool, fallback) in [
+            (
+                "test",
+                test,
+                programs.testing,
+                true,
+                b"console".as_slice(),
+                false,
+            ),
+            (
+                "edit_cache",
+                edit_cache,
+                true,
+                false,
+                if edit_fallback {
+                    b"".as_slice()
+                } else {
+                    b"console".as_slice()
+                },
+                edit_fallback,
+            ),
+            (
+                "rebuild_cache",
+                rebuild.to_vec(),
+                true,
+                false,
+                b"console".as_slice(),
+                false,
+            ),
         ] {
             if enabled {
                 specs.push(Spec {
+                    dir_prefix: prefix.to_owned(),
+                    utility: utility.to_owned(),
                     name: name(utility),
                     command,
-                    cwd: cwd.clone().filter(|_| utility != "rebuild_cache"),
+                    cwd: cwd.clone(),
                     inputs: if utility == "test" && programs.test_depends_all {
                         vec![all.clone()]
                     } else {
                         Vec::new()
                     },
-                    pool: b"console",
+                    pool,
                     rule: b"CUSTOM_COMMAND",
                     per_config,
+                    edit_fallback: fallback,
                 });
             }
         }
@@ -268,6 +333,18 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
         {
             continue;
         }
+        specs.push(Spec {
+            dir_prefix: prefix.to_owned(),
+            utility: "list_install_components".to_owned(),
+            name: name("list_install_components"),
+            command: Vec::new(),
+            cwd: None,
+            inputs: Vec::new(),
+            pool: b"",
+            rule: b"phony",
+            per_config: false,
+            edit_fallback: false,
+        });
         let mut install = programs.cmake.clone();
         if let Some(config) = graph.config {
             install.push(b' ');
@@ -297,6 +374,8 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
             command.extend_from_slice(flags);
             command.extend_from_slice(b" -P cmake_install.cmake");
             specs.push(Spec {
+                dir_prefix: prefix.to_owned(),
+                utility: utility.to_owned(),
                 name: name(utility),
                 command,
                 cwd: cwd.clone(),
@@ -308,23 +387,38 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
                 },
                 rule: b"CUSTOM_COMMAND",
                 per_config: true,
+                edit_fallback: false,
             });
         }
     }
     specs
 }
 
-/// Write a utility with the output `CMakeFiles/<config>/<name>.util` and the
+fn utility_output_path(dir_prefix: &str, config: Option<&[u8]>, utility: &str) -> Vec<u8> {
+    let mut path = Vec::new();
+    if !dir_prefix.is_empty() {
+        path.extend_from_slice(dir_prefix.as_bytes());
+        path.push(b'/');
+    }
+    path.extend_from_slice(b"CMakeFiles/");
+    if let Some(config) = config {
+        path.extend_from_slice(config);
+        path.push(b'/');
+    }
+    path.extend_from_slice(utility.as_bytes());
+    path.extend_from_slice(b".util");
+    path
+}
+
+/// Write a utility with the output `<dir>/CMakeFiles/<config>/<utility>.util` and the
 /// alias `<name>:<config>`.
 fn emit_qualified_utility(ninja: &mut Ninja, graph: &Graph<'_>, spec: &Spec) {
-    let config = graph.config.unwrap_or_default();
     let name = graph.node(spec.name.as_bytes());
-    let mut output_path = b"CMakeFiles/".to_vec();
-    output_path.extend_from_slice(config);
-    output_path.push(b'/');
-    output_path.extend_from_slice(spec.name.as_bytes());
-    output_path.extend_from_slice(b".util");
-    let output = graph.node(&output_path);
+    let output = graph.node(&utility_output_path(
+        &spec.dir_prefix,
+        graph.config,
+        &spec.utility,
+    ));
     let inputs: Vec<_> = spec
         .inputs
         .iter()
@@ -341,25 +435,27 @@ fn emit_qualified_utility(ninja: &mut Ninja, graph: &Graph<'_>, spec: &Spec) {
     write_command(
         ninja,
         graph,
-        &spec.name,
         &spec.command,
         spec.cwd.as_ref().map(|value| value.as_slice()),
     );
     if !spec.pool.is_empty() {
         ninja.binding(b"pool", spec.pool);
     }
-    write_description(ninja, &spec.name, &name);
+    write_description(ninja, &spec.utility, &name, spec.edit_fallback);
     ninja.binding(b"restat", b"1");
     ninja.phony(&qualified(&name, graph.config), &[output]);
 }
 
 struct Utility<'a> {
+    dir_prefix: &'a str,
+    utility: &'a str,
     name: &'a str,
     command: &'a [u8],
     cwd: Option<&'a [u8]>,
     inputs: &'a [BString],
     pool: &'a [u8],
     rule: &'a [u8],
+    edit_fallback: bool,
 }
 
 fn emit_utility(ninja: &mut Ninja, graph: &Graph<'_>, utility: Utility<'_>) {
@@ -367,7 +463,11 @@ fn emit_utility(ninja: &mut Ninja, graph: &Graph<'_>, utility: Utility<'_>) {
     if graph.has_target(&name) {
         return;
     }
-    let output = graph.node(format!("CMakeFiles/{}.util", utility.name).as_bytes());
+    let output = graph.node(&utility_output_path(
+        utility.dir_prefix,
+        None,
+        utility.utility,
+    ));
     let inputs: Vec<_> = utility
         .inputs
         .iter()
@@ -381,12 +481,12 @@ fn emit_utility(ninja: &mut Ninja, graph: &Graph<'_>, utility: Utility<'_>) {
             ..Edge::default()
         },
     );
-    write_command(ninja, graph, utility.name, utility.command, utility.cwd);
+    write_command(ninja, graph, utility.command, utility.cwd);
     if !utility.pool.is_empty() {
         ninja.binding(b"pool", utility.pool);
     }
     if utility.rule == b"CUSTOM_COMMAND" {
-        write_description(ninja, utility.name, &name);
+        write_description(ninja, utility.utility, &name, utility.edit_fallback);
         ninja.binding(b"restat", b"1");
     }
     ninja.phony(&name, std::slice::from_ref(&output));
@@ -395,30 +495,32 @@ fn emit_utility(ninja: &mut Ninja, graph: &Graph<'_>, utility: Utility<'_>) {
     }
 }
 
-fn write_command(
-    ninja: &mut Ninja,
-    graph: &Graph<'_>,
-    name: &str,
-    command: &[u8],
-    cwd: Option<&[u8]>,
-) {
+fn write_command(ninja: &mut Ninja, graph: &Graph<'_>, command: &[u8], cwd: Option<&[u8]>) {
     if command.is_empty() {
         return;
     }
-    if matches!(name, "clean" | "help") {
-        ninja.binding(b"COMMAND", command);
-    } else if let Some(directory) = cwd {
-        ninja.binding(b"COMMAND", &graph.commands.in_directory(command, directory));
+    if let Some(directory) = cwd {
+        ninja.binding(
+            b"COMMAND",
+            &graph.commands.in_cmake_directory(command, directory),
+        );
     } else {
         ninja.binding(b"COMMAND", &graph.in_build_dir(command));
     }
 }
 
-fn write_description(ninja: &mut Ninja, name: &str, node: &[u8]) {
-    let description = if name.ends_with("install/local") {
-        b"Installing only the local directory...".as_slice()
-    } else {
-        node
+fn write_description(ninja: &mut Ninja, utility: &str, node: &[u8], edit_fallback: bool) {
+    let description: &[u8] = match utility {
+        "test" => b"Running tests...",
+        "edit_cache" if edit_fallback => b"No interactive CMake dialog available...",
+        "edit_cache" => b"Running CMake cache editor...",
+        "rebuild_cache" => b"Running CMake to regenerate build system...",
+        "install" => b"Install the project...",
+        "install/local" => b"Installing only the local directory...",
+        "install/strip" => b"Installing the project stripped...",
+        "package" => b"Run CPack packaging tool...",
+        "package_source" => b"Run CPack packaging tool for source...",
+        _ => node,
     };
     ninja.binding(b"DESC", description);
 }

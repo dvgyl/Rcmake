@@ -2,9 +2,11 @@ mod app_bundle;
 mod excluded_export;
 mod generation_rules;
 mod languages;
+mod link_lines;
 mod parallel_determinism;
 mod parity;
 mod runtime_paths;
+mod target_depends;
 mod wave7b;
 
 use std::path::Path;
@@ -843,7 +845,7 @@ fn keeps_local_dependency_order_and_links_imported_artifacts() -> TestResult {
     let utility = model.add_target(target("prepare", TargetKind::Utility, &[]))?;
     let mut interface = target("headers", TargetKind::InterfaceLibrary, &[]);
     interface.usage.interface_link_libraries = Some(vec![link_item("external")]);
-    let interface = model.add_target(interface)?;
+    model.add_target(interface)?;
     let mut app = target("app", TargetKind::Executable, &["main.c"]);
     app.props.set("EXCLUDE_FROM_ALL".into(), "ON".into());
     app.utility_deps.push(entry("prepare"));
@@ -854,7 +856,8 @@ fn keeps_local_dependency_order_and_links_imported_artifacts() -> TestResult {
     let result = resolve(&model, &host, &[])?;
     assert_eq!(result.targets.len(), 3);
     let app = &result.targets[2];
-    assert_eq!(app.dependencies, [utility, interface]);
+    // `headers` is not in the build system and has no utilities to follow.
+    assert_eq!(app.dependencies, [utility]);
     assert!(app.metadata.exclude_from_all);
     let graph = &result.graphs[0];
     let names: Vec<_> = graph

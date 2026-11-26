@@ -280,7 +280,7 @@ fn target_build_deps(
         }
         return;
     }
-    if let Some(node) = graph.target_dependency(&target.name) {
+    for node in graph.target_dependencies(&target.name) {
         out.insert(node);
     }
 }
@@ -598,7 +598,7 @@ fn install_dependency(
         .find_target(rule.dir, entry)
         .and_then(|id| model.target(id))
     {
-        return Ok(graph.target_dependency(&target.name));
+        return Ok(graph.target_dependencies(&target.name).into_iter().next());
     }
     let directory = model.dir(rule.dir);
     let source = Lexical::new(&Lexical::new(&directory.source_dir).append(entry)).normalize();
@@ -671,7 +671,7 @@ fn install_dependencies<'a>(
                     .iter()
                     .any(|config| graph.input.config.matches(config))
         })
-        .filter_map(|file| graph.file_dependency(file))
+        .flat_map(|file| graph.install_file_dependencies(file))
 }
 
 fn collect_tests(
@@ -720,9 +720,8 @@ fn collect_tests(
                         .target(id)
                         .filter(|target| target.kind == TargetKind::Executable)
                     && !executable.is_imported()
-                    && let Some(dep) = graph.target_dependency(&executable.name)
                 {
-                    deps.insert(dep);
+                    deps.extend(graph.target_dependencies(&executable.name));
                 }
                 if arg.windows(2).any(|pair| pair == b"$<")
                     && let Some(dep) = graph.file_dependency(&value)
@@ -766,7 +765,7 @@ fn test_dependency(
         .find_target(dir, input)
         .and_then(|id| model.target(id))
     {
-        return graph.target_dependency(&target.name);
+        return graph.target_dependencies(&target.name).into_iter().next();
     }
     let directory = model.dir(dir);
     let binary = Lexical::new(&directory.binary_dir).append(input);

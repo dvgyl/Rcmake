@@ -682,7 +682,9 @@ jobs:
           import tomllib
 
           sys.path.insert(0, "tools/measure")
+          sys.path.insert(0, "tools/corpus")
           from ninja_canon import Normalizer, canonicalize, differences, dry_run, row_key
+          from normalize import normalize_codemodel_abstract_target_ties
 
           # The File API members with backtrace indexes or reply file names.
           # An index changes when an unrelated node changes.
@@ -775,7 +777,7 @@ jobs:
                       return normalize.text(value)
                   return value
 
-              return [read(json.loads((reply / name).read_text()))]
+              return [normalize_codemodel_abstract_target_ties(read(json.loads((reply / name).read_text())))]
 
           def full_checks(name, cmake, checks):
               def check(label, command, timeout=3600):

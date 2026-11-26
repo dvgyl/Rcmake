@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use rcmake_base::BString;
 use rcmake_model::{CustomCommandKind, DirId, RuntimeDependencyInstall, TargetId};
-use rcmake_resolve::{BuildGraph, ResolvedTarget, TargetInstaller};
+use rcmake_resolve::{BuildGraph, ResolvedTarget, TargetFileInstaller, TargetInstaller};
 
 use super::{FileApi, Members, UInt, Value, array, members, object, paths, relative};
 use crate::GenError;
@@ -33,6 +33,8 @@ pub(super) struct ConfigIndices<'a> {
     pub(super) build_graph: Option<&'a BuildGraph>,
     pub(super) installers_by_target: HashMap<TargetId, Vec<&'a TargetInstaller>>,
     pub(super) installers_by_rule_target: HashMap<(usize, TargetId), Vec<&'a TargetInstaller>>,
+    pub(super) file_installers_by_rule_target:
+        HashMap<(usize, TargetId), Vec<&'a TargetFileInstaller>>,
     pub(super) custom_outputs_by_target: HashMap<TargetId, Vec<(usize, rcmake_model::CommandId)>>,
 }
 
@@ -50,7 +52,11 @@ impl FileApi<'_, '_> {
             .model
             .commands()
             .filter_map(|(_, command)| match command.kind {
-                CustomCommandKind::Utility(id) => Some(id),
+                CustomCommandKind::Utility(id)
+                    if !command.command_lines.is_empty() || !command.depends.is_empty() =>
+                {
+                    Some(id)
+                }
                 _ => None,
             })
             .collect();
@@ -98,12 +104,27 @@ impl FileApi<'_, '_> {
                     .entry(installer.target)
                     .or_default()
                     .push(installer);
-                if !installer.paths.is_empty() {
+                if installer.installs_for_config(config) && !installer.paths.is_empty() {
                     installers_by_rule_target
                         .entry((installer.rule, installer.target))
                         .or_default()
                         .push(installer);
                 }
+            }
+        }
+        let mut file_installers_by_rule_target: HashMap<
+            (usize, TargetId),
+            Vec<&TargetFileInstaller>,
+        > = HashMap::new();
+        for installer in &self.result.install_targets.file_installers {
+            if installer.config.matches(config)
+                && installer.installs_for_config(config)
+                && !installer.files.is_empty()
+            {
+                file_installers_by_rule_target
+                    .entry((installer.rule, installer.target))
+                    .or_default()
+                    .push(installer);
             }
         }
         let mut custom_outputs_by_target: HashMap<TargetId, Vec<(usize, rcmake_model::CommandId)>> =
@@ -123,6 +144,7 @@ impl FileApi<'_, '_> {
             build_graph,
             installers_by_target,
             installers_by_rule_target,
+            file_installers_by_rule_target,
             custom_outputs_by_target,
         };
         let abstract_targets = abstract_targets(self.model, config, &targets);

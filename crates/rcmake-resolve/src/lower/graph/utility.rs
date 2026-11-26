@@ -58,8 +58,11 @@ impl TargetPlan<'_> {
             self.resolved.id,
             events,
             usage,
-            &mut self.steps,
-            &mut self.dependencies,
+            (
+                &mut self.steps,
+                &mut self.dependencies,
+                &mut self.trace_roots,
+            ),
             self.ide_steps.as_mut(),
         )
     }

@@ -3,7 +3,7 @@
 pub(crate) mod apple;
 pub(crate) mod artifacts;
 pub(crate) mod autogen;
-mod compile;
+pub(crate) mod compile;
 pub(crate) mod cuda;
 pub use cuda::ide_flags as cuda_ide_flags;
 pub(crate) mod fortran;
@@ -41,7 +41,9 @@ use rcmake_model::{DirId, ProjectModel, Target};
 pub(crate) use artifacts::{
     build_relative, compile_object_path, install_object_name_strategy, is_darwin,
 };
-pub use artifacts::{compute_artifacts, linker_language, object_path, source_language};
+pub use artifacts::{
+    compute_artifacts, file_api_object_path, linker_language, object_path, source_language,
+};
 pub(crate) use artifacts::{object_dir, short_object_paths};
 pub use compile::codemodel_compile_info;
 pub(crate) use compile::{language_flags, msvc::debug_options as msvc_debug_options};
@@ -56,7 +58,8 @@ pub use install::{
 pub use launcher::instrumentation_launcher;
 pub use link::codemodel_link_flags;
 pub(crate) use link::{
-    ide_rpaths, install_name_dir, install_name_prefix, warn_install_name_policy,
+    SharedDependencyMode, ide_rpaths, install_name_dir, install_name_prefix,
+    links_shared_dependency, shared_dependency_mode, warn_install_name_policy,
 };
 pub(crate) use modules::scan_responses;
 pub use modules::{bmi_script_path, lower_modules};
@@ -128,6 +131,14 @@ pub(crate) fn join(base: &[u8], path: &[u8]) -> BString {
     } else {
         Lexical::new(base).append(path)
     }
+}
+
+/// Resolve `path` against `base` and collapse it (`cmSystemTools::CollapseFullPath`):
+/// remove `.` components, resolve `..`, merge separators, and remove a trailing `/`.
+pub(crate) fn collapse(base: &[u8], path: &[u8]) -> BString {
+    let joined = join(base, path);
+    let normalized = artifacts::model_path(&joined).normalize();
+    without_trailing_slashes(&normalized).into()
 }
 
 pub(crate) fn without_trailing_slashes(path: &[u8]) -> &[u8] {

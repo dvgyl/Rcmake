@@ -725,6 +725,11 @@ fn compile_flag_order_matches_the_lowering_contract() -> TestResult {
         ("CMAKE_OSX_ARCHITECTURES", "arm64;x86_64"),
         ("CMAKE_OSX_SYSROOT", "/SDK Dir"),
         ("CMAKE_OSX_DEPLOYMENT_TARGET", "12.0"),
+        ("CMAKE_CXX_COMPILE_OPTIONS_VISIBILITY", "-fvisibility="),
+        (
+            "CMAKE_CXX_COMPILE_OPTIONS_VISIBILITY_INLINES_HIDDEN",
+            "-fvisibility-inlines-hidden",
+        ),
     ] {
         var(&mut model, key, value);
     }
@@ -871,6 +876,37 @@ fn object_paths_use_the_project_source_and_build_trees() -> TestResult {
             expected.as_str()
         );
     }
+    Ok(())
+}
+
+#[test]
+fn file_api_object_path_keeps_the_ninja_intermediate_dir() -> TestResult {
+    use rcmake_model::GeneratorKind;
+    let mut model = fixture("Linux");
+    let mut raw = raw_target("ob", TargetKind::ObjectLibrary);
+    raw.dir = model.add_directory(
+        DirId::ROOT,
+        "/project/sub".into(),
+        "/build/sub".into(),
+        Default::default(),
+    )?;
+    let config = ConfigId("Debug".into());
+    let object = object_path(&model, &raw, &config, b"c.c");
+    assert_eq!(object, "sub/CMakeFiles/ob.dir/c.c.o");
+    for (generator, expected) in [
+        (None, "sub/CMakeFiles/ob.dir/c.c.o"),
+        (Some(GeneratorKind::Ninja), "sub/CMakeFiles/ob.dir/./c.c.o"),
+    ] {
+        model.generator = generator;
+        assert_eq!(
+            file_api_object_path(&model, &raw, &config, &object),
+            expected
+        );
+    }
+    model.generator = Some(GeneratorKind::NinjaMultiConfig);
+    let object = object_path(&model, &raw, &config, b"c.c");
+    assert_eq!(object, "sub/CMakeFiles/ob.dir/Debug/c.c.o");
+    assert_eq!(file_api_object_path(&model, &raw, &config, &object), object);
     Ok(())
 }
 

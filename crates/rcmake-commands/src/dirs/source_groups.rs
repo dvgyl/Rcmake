@@ -4,7 +4,7 @@ use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{Stream, path::from_native};
-use rcmake_model::{DirId, ProjectModel, TargetBinding, TargetId};
+use rcmake_model::{DirId, ProjectModel, SourceGroupDef, TargetBinding, TargetId};
 use rcmake_regex::MatchOptions;
 
 use super::values;
@@ -15,6 +15,10 @@ const RULE: &[u8] = b"\0source_group_regex:";
 const REGEX_GROUP: &[u8] = b"\0source_group_regex";
 const FILE_GROUP: &[u8] = b"\0source_group_file";
 const FILE_SET_GROUP: &[u8] = b"\0source_group_file_set";
+/// Maximum number of components in one source group name (`a\b\c` has 3).
+/// CMake has no limit. The limit keeps the nested group tree, and each walk
+/// and drop of it, bounded for untrusted input.
+const MAX_GROUP_DEPTH: usize = 256;
 
 pub(super) fn command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     if args.is_empty() {
@@ -27,22 +31,53 @@ pub(super) fn command(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     let options = parse(cx, args)?;
     let files = if let Some(root) = options.root {
         let cwd = from_native(&cx.host().initial_cwd());
-        tree(cx, &base, &cwd, root, options.prefix, &options.files)?
+        let files = tree(cx, &base, &cwd, root, options.prefix, &options.files)?;
+        let names = files
+            .iter()
+            .map(|(_, group)| group_names(group))
+            .collect::<Result<Vec<_>, _>>()?;
+        let groups = &mut cx.project().dir_mut(dir).source_groups;
+        for ((path, _), names) in files.iter().zip(&names) {
+            if let Some(found) = group_mut(groups, names) {
+                found.files.insert(path.clone());
+            }
+        }
+        files
     } else {
         let group = group_path(
             options
                 .group
                 .ok_or_else(|| CmdError::status("missing source group name."))?,
         );
+        let names = group_names(&group)?;
+        let valid_regex = options
+            .regex
+            .is_some_and(|pattern| cx.regex(pattern).is_ok());
         if let Some(pattern) = options.regex {
             register_regex(cx, dir, &group, pattern, options.legacy)?;
         }
-        assign_file_sets(cx, dir, &group, options.file_sets);
-        options
+        let files: Vec<_> = options
             .files
-            .into_iter()
+            .iter()
             .map(|path| (full_path(cx, &base, path), group.clone()))
-            .collect()
+            .collect();
+        let creates = options.legacy
+            || options.regex.is_some()
+            || !files.is_empty()
+            || !options.file_sets.is_empty();
+        if creates {
+            let groups = &mut cx.project().dir_mut(dir).source_groups;
+            if let Some(found) = group_mut(groups, &names) {
+                if valid_regex {
+                    found.regex = options.regex.map(BString::from);
+                }
+                found
+                    .files
+                    .extend(files.iter().map(|(path, _)| path.clone()));
+            }
+        }
+        assign_file_sets(cx, dir, &group, options.file_sets);
+        files
     };
 
     let directory = cx.project().dir_mut(dir);
@@ -373,6 +408,65 @@ fn full_path(cx: &Cx<'_>, base: &[u8], value: &[u8]) -> BString {
     }
 }
 
+/// Split a group name into its components. An empty name selects the default
+/// group `""`. A name with more than [`MAX_GROUP_DEPTH`] components is an error.
+fn group_names(group: &[u8]) -> Result<Vec<BString>, CmdError> {
+    let names: Vec<BString> = group
+        .split(|&byte| matches!(byte, b'/' | b'\\'))
+        .filter(|part| !part.is_empty())
+        .map(BString::from)
+        .collect();
+    if names.len() > MAX_GROUP_DEPTH {
+        return Err(CmdError::status(format!(
+            "group name has {} components.  The limit is {MAX_GROUP_DEPTH}.",
+            names.len()
+        )));
+    }
+    Ok(if names.is_empty() {
+        vec![BString::default()]
+    } else {
+        names
+    })
+}
+
+/// Find or create a group by its name components (`GetOrCreateSourceGroup`).
+/// A new top-level group goes after all existing groups; a new child goes after
+/// its siblings.
+fn group_mut<'a>(
+    groups: &'a mut Vec<SourceGroupDef>,
+    names: &[BString],
+) -> Option<&'a mut SourceGroupDef> {
+    if groups.is_empty() {
+        *groups = rcmake_resolve::ide::default_source_groups();
+    }
+    let (first, rest) = names.split_first()?;
+    let index = match groups.iter().position(|group| group.name == *first) {
+        Some(index) => index,
+        None => {
+            groups.push(SourceGroupDef {
+                name: first.clone(),
+                ..SourceGroupDef::default()
+            });
+            groups.len() - 1
+        }
+    };
+    let mut group = groups.get_mut(index)?;
+    for name in rest {
+        let index = match group.children.iter().position(|child| child.name == *name) {
+            Some(index) => index,
+            None => {
+                group.children.push(SourceGroupDef {
+                    name: name.clone(),
+                    ..SourceGroupDef::default()
+                });
+                group.children.len() - 1
+            }
+        };
+        group = group.children.get_mut(index)?;
+    }
+    Some(group)
+}
+
 fn group_path(path: &[u8]) -> BString {
     path.split(|&byte| matches!(byte, b'/' | b'\\'))
         .filter(|part| !part.is_empty())
@@ -467,4 +561,111 @@ fn apply_regex(cx: &mut Cx<'_>, dir: DirId, paths: BTreeSet<BString>) -> Result<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use rcmake_eval::{Interp, InterpConfig, RunMode};
+    use rcmake_host::{PureHost, Stream};
+    use rcmake_model::{DirId, SourceGroupDef};
+
+    use super::MAX_GROUP_DEPTH;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn configure(source: &str) -> Result<(Interp, Arc<PureHost>, i32), Box<dyn std::error::Error>> {
+        let src = PathBuf::from("/work/src");
+        let command = PathBuf::from("/bin/cmake");
+        let host = Arc::new(PureHost::new(src.clone(), command.clone()));
+        host.seed_file(&src.join("CMakeLists.txt"), source.as_bytes())?;
+        let mut interp = Interp::new(
+            InterpConfig::new(
+                host.clone(),
+                RunMode::Configure,
+                "/share/cmake-4.5",
+                command,
+                src.clone(),
+            ),
+            crate::register_all,
+        );
+        let outcome = interp.run_configure(&src, &PathBuf::from("/work/build"), &[]);
+        Ok((interp, host, outcome.exit_code))
+    }
+
+    fn depth(groups: &[SourceGroupDef], name: &[u8]) -> usize {
+        let mut depth = 0;
+        let mut current = groups.iter().find(|group| group.name == name);
+        while let Some(group) = current {
+            depth += 1;
+            current = group.children.first();
+        }
+        depth
+    }
+
+    #[test]
+    fn source_group_at_the_depth_limit_resolves_its_full_name() -> TestResult {
+        let name = vec!["g"; MAX_GROUP_DEPTH].join("/");
+        let (mut interp, host, exit) = configure(&format!(
+            "cmake_minimum_required(VERSION 4.5)\nproject(groups NONE)\n\
+             source_group(\"{name}\" FILES deep.c REGULAR_EXPRESSION \"[.]x$\")\n"
+        ))?;
+        assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+        let mut cx = interp.cx();
+        let dir = cx.project().dir(DirId::ROOT);
+        assert_eq!(depth(&dir.source_groups, b"g"), MAX_GROUP_DEPTH);
+        let expected = vec!["g"; MAX_GROUP_DEPTH].join("\\");
+        let mut never = |_: &[u8], _: &[u8]| false;
+        assert_eq!(
+            rcmake_resolve::ide::find_source_group(dir, b"/work/src/deep.c", &mut never),
+            expected.as_str()
+        );
+        let mut regex = |pattern: &[u8], path: &[u8]| pattern == b"[.]x$" && path.ends_with(b".x");
+        assert_eq!(
+            rcmake_resolve::ide::find_source_group(dir, b"/work/src/other.x", &mut regex),
+            expected.as_str()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_group_deeper_than_the_limit_is_an_error() -> TestResult {
+        let name = vec!["g"; MAX_GROUP_DEPTH + 1].join("\\\\");
+        let (mut interp, host, exit) = configure(&format!(
+            "cmake_minimum_required(VERSION 4.5)\nproject(groups NONE)\n\
+             source_group(\"{name}\" FILES deep.c)\n"
+        ))?;
+        assert_ne!(exit, 0);
+        let stderr = host.stream_bytes(Stream::Stderr).to_string();
+        assert!(
+            stderr.contains("group name has 257 components."),
+            "{stderr}"
+        );
+        let mut cx = interp.cx();
+        let dir = cx.project().dir(DirId::ROOT);
+        assert!(dir.source_groups.iter().all(|group| group.name != "g"));
+        assert!(dir.source_props.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn source_group_tree_deeper_than_the_limit_changes_nothing() -> TestResult {
+        let deep = vec!["d"; MAX_GROUP_DEPTH + 1].join("/");
+        let (mut interp, host, exit) = configure(&format!(
+            "cmake_minimum_required(VERSION 4.5)\nproject(groups NONE)\n\
+             source_group(TREE . FILES top.c {deep}/leaf.c)\n"
+        ))?;
+        assert_ne!(exit, 0);
+        assert!(
+            host.stream_bytes(Stream::Stderr)
+                .to_string()
+                .contains("The limit is 256.")
+        );
+        let mut cx = interp.cx();
+        let dir = cx.project().dir(DirId::ROOT);
+        assert!(dir.source_groups.iter().all(|group| group.files.is_empty()));
+        Ok(())
+    }
 }

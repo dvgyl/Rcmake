@@ -3,10 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use indexmap::IndexMap;
-use rcmake_base::{BString, list, path_lex::Lexical, truth::is_on};
+use rcmake_base::{BString, Limits, list, path_lex::Lexical, truth::is_on};
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_genex::EvalContext;
-use rcmake_model::{BT, Target, TargetId, TargetKind, UsageField};
+use rcmake_model::{BT, PropertyMap, Target, TargetId, TargetKind, UsageField};
 use rcmake_resolve::{
     BuildStep, CompileGroup, InterfaceInclude, ResolvedTarget,
     lower::{
@@ -21,7 +21,7 @@ use super::super::{Bool, FileApi, Members, Object, Value, array, members, relati
 use super::{
     ConfigIndices,
     backtraces::Backtraces,
-    file_sets::{FileSets, interface_sources},
+    file_sets::{FileSets, Membership, interface_sources, normalize_source_group_name},
     number, optional_array,
     targets::TargetRef,
 };
@@ -82,6 +82,31 @@ impl FileApi<'_, '_> {
             })
             .collect();
         let mut seen = BTreeSet::new();
+        if let Some(raw) = raw
+            && raw
+                .props
+                .get(b"UNITY_BUILD")
+                .is_some_and(|value| is_on(value))
+        {
+            let binary_root = Lexical::new(&target.metadata.binary_dir);
+            for unit in &target.compile_units {
+                let path = Lexical::new(&source_dir.append(&unit.source.value)).normalize();
+                if !binary_root.prefix(Lexical::new(&path))
+                    || !path
+                        .windows(b"/Unity/".len())
+                        .any(|window| window == b"/Unity/")
+                {
+                    continue;
+                }
+                if seen.insert(path.clone()) {
+                    let flags = pch
+                        .and_then(|pch| pch.use_flags.get(&unit.source.value))
+                        .cloned()
+                        .unwrap_or_default();
+                    sources.push(self.source(raw, path, &file_trace, Some((unit.group, flags))));
+                }
+            }
+        }
         if let Some(raw) = raw {
             for entry in &raw.sources {
                 for source in list::split(&entry.value, list::Empty::Drop) {
@@ -107,7 +132,12 @@ impl FileApi<'_, '_> {
                     if rcmake_genex::find_genex(&source).is_some() {
                         continue;
                     }
-                    let path = Lexical::new(&source_dir.append(&source)).normalize();
+                    let path = self
+                        .result
+                        .target_depends
+                        .resolved_source(target.id, &source)
+                        .cloned()
+                        .unwrap_or_else(|| Lexical::new(&source_dir.append(&source)).normalize());
                     if seen.insert(path.clone()) {
                         let unit = units.get(&path).copied();
                         sources.push(self.source(
@@ -200,7 +230,54 @@ impl FileApi<'_, '_> {
             }
         }
 
-        if let Some(build_graph) = build_graph
+        if target.metadata.kind == TargetKind::Utility
+            && config_indices.project.utility_commands.contains(&target.id)
+        {
+            let relative: BString = [b"CMakeFiles/".as_slice(), &target.metadata.name]
+                .concat()
+                .into();
+            let path = Lexical::new(&target.metadata.binary_dir).append(&relative);
+            seen.insert(path.clone());
+            let source_group = default_source_group(&path);
+            sources.push(Source {
+                path: path.clone(),
+                trace: target.metadata.backtrace.clone(),
+                generated: true,
+                source_group,
+                compile: None,
+            });
+            let mut rule_path = path.clone();
+            rule_path.extend_from_slice(b".rule");
+            seen.insert(rule_path);
+            add_rule(&mut sources, path, &file_trace);
+        }
+        if !self.result.target_depends.targets().is_empty() {
+            for traced in self.result.target_depends.traced_sources(target.id) {
+                if !seen.insert(traced.clone()) {
+                    continue;
+                }
+                if traced.ends_with(b".rule") {
+                    sources.push(Source {
+                        path: traced.clone(),
+                        trace: file_trace.clone(),
+                        generated: true,
+                        source_group: "CMake Rules".into(),
+                        compile: None,
+                    });
+                } else {
+                    sources.push(match raw {
+                        Some(raw) => self.source(raw, traced.clone(), &file_trace, None),
+                        None => Source {
+                            path: traced.clone(),
+                            trace: file_trace.clone(),
+                            generated: false,
+                            source_group: default_source_group(traced),
+                            compile: None,
+                        },
+                    });
+                }
+            }
+        } else if let Some(build_graph) = build_graph
             && let Some(owned_outputs) = config_indices.custom_outputs_by_target.get(&target.id)
         {
             for &(index, command_id) in owned_outputs {
@@ -217,25 +294,10 @@ impl FileApi<'_, '_> {
                 }
             }
         }
-        if target.metadata.kind == TargetKind::Utility
-            && config_indices.project.utility_commands.contains(&target.id)
-        {
-            let relative: BString = [b"CMakeFiles/".as_slice(), &target.metadata.name]
-                .concat()
-                .into();
-            let path = Lexical::new(&target.metadata.binary_dir).append(&relative);
-            sources.push(Source {
-                path: path.clone(),
-                trace: target.metadata.backtrace.clone(),
-                generated: true,
-                source_group: "".into(),
-                compile: None,
-            });
-            add_rule(&mut sources, path, &file_trace);
-        }
 
         let mut source_groups = IndexMap::<BString, (Vec<usize>, Vec<usize>)>::new();
         let mut compile_groups = IndexMap::<(usize, BString), Vec<usize>>::new();
+        let mut group_matcher = SourceGroupMatcher::default();
         let values = sources.into_iter().enumerate().map(|(index, source)| {
             let mut entry = members([("path", Value::string(relative(&source.path, self.source)))]);
             let member = file_sets.sources.get(&source.path);
@@ -243,7 +305,7 @@ impl FileApi<'_, '_> {
                 member.tag(&mut entry);
             }
             let group_name = raw.map_or(source.source_group.clone(), |raw| {
-                self.source_group(raw, &source, member.is_some_and(|member| member.header))
+                self.source_group(raw, &source, member, &mut group_matcher)
             });
             if let Some(compile) = source
                 .compile
@@ -304,7 +366,8 @@ impl FileApi<'_, '_> {
                     let group = source_groups.entry(self.source_group(
                         raw,
                         &source,
-                        member.is_some_and(|member| member.header),
+                        member,
+                        &mut group_matcher,
                     ));
                     entry.insert("sourceGroupIndex".into(), number(group.index()));
                     group.or_default().1.push(index);
@@ -368,20 +431,36 @@ impl FileApi<'_, '_> {
         Ok(())
     }
 
-    fn source_group(&self, raw: &Target, source: &Source, header: bool) -> BString {
-        self.model
-            .dir(raw.dir)
+    fn source_group(
+        &self,
+        raw: &Target,
+        source: &Source,
+        member: Option<&Membership>,
+        matcher: &mut SourceGroupMatcher,
+    ) -> BString {
+        if source.source_group == b"Object Libraries" {
+            return source.source_group.clone();
+        }
+        if let Some(group) = member.and_then(|member| member.source_group.as_ref()) {
+            return group.clone();
+        }
+        let dir = self.model.dir(raw.dir);
+        if let Some(group) = dir
             .source_props
             .get(&source.path)
-            .and_then(|props| props.get(b"SOURCE_GROUP"))
-            .cloned()
-            .unwrap_or_else(|| {
-                if header {
-                    "Header Files".into()
-                } else {
-                    source.source_group.clone()
-                }
-            })
+            .and_then(explicit_source_group)
+        {
+            return normalize_source_group_name(dir, group);
+        }
+        let group =
+            rcmake_resolve::ide::find_source_group(dir, &source.path, &mut |pattern, path| {
+                matcher.matches(pattern, path)
+            });
+        if group.is_empty() && member.is_some_and(|member| member.header) {
+            "Header Files".into()
+        } else {
+            group
+        }
     }
 
     fn source(
@@ -398,32 +477,105 @@ impl FileApi<'_, '_> {
                 .get(&path)
                 .and_then(|props| props.get(b"GENERATED"))
                 .is_some_and(|value| is_on(value));
-        let (stem, extension) = Lexical::new(&path).stem_extension(true);
-        let source_group =
-            match extension {
-                b".h" | b".hxx" if stem == b"cmake_pch" || stem.starts_with(b"cmake_pch_") => {
-                    "Precompile Header File"
-                }
-                b".h" | b".hh" | b".h++" | b".hm" | b".hpp" | b".hxx" | b".in" | b".txx"
-                | b".inl" => "Header Files",
-                b".C" | b".F" | b".M" | b".c" | b".c++" | b".cc" | b".cpp" | b".mpp" | b".cxx"
-                | b".ixx" | b".cppm" | b".ccm" | b".cxxm" | b".c++m" | b".cu" | b".f" | b".f90"
-                | b".for" | b".fpp" | b".ftn" | b".m" | b".mm" | b".rc" | b".def" | b".r"
-                | b".odl" | b".idl" | b".hpj" | b".bat" => "Source Files",
-                b".rule" => "CMake Rules",
-                b".pdf" | b".plist" | b".png" | b".jpeg" | b".jpg" | b".storyboard"
-                | b".xcassets" => "Resources",
-                b".lo" | b".o" | b".obj" => "Object Files",
-                _ => "",
-            };
         Source {
             path,
             trace: trace.clone(),
             generated,
-            source_group: source_group.into(),
+            source_group: BString::default(),
             compile,
         }
     }
+}
+
+fn explicit_source_group(props: &PropertyMap) -> Option<&BString> {
+    let group = props
+        .get(b"SOURCE_GROUP")
+        .filter(|value| !value.is_empty())?;
+    if props.get(b"\0source_group_file") == Some(group)
+        || props.get(b"\0source_group_regex") == Some(group)
+    {
+        return None;
+    }
+    Some(group)
+}
+
+struct SourceGroupMatcher {
+    compiled: HashMap<BString, Option<rcmake_regex::Regex>>,
+    scratch: rcmake_regex::Scratch,
+    budget: u64,
+}
+
+impl SourceGroupMatcher {
+    const MAX_CACHED_PATTERNS: usize = 4096;
+    const PER_MATCH_STEP_LIMIT: u64 = 250_000;
+
+    fn new(budget: u64) -> Self {
+        Self {
+            compiled: HashMap::new(),
+            scratch: rcmake_regex::Scratch::default(),
+            budget,
+        }
+    }
+
+    fn matches(&mut self, pattern: &[u8], path: &[u8]) -> bool {
+        if self.budget == 0 {
+            return false;
+        }
+        if !self.compiled.contains_key(pattern) {
+            if self.compiled.len() >= Self::MAX_CACHED_PATTERNS {
+                self.compiled.clear();
+            }
+            self.compiled.insert(
+                BString::from(pattern),
+                rcmake_regex::Regex::new(pattern).ok(),
+            );
+        }
+        let Some(Some(regex)) = self.compiled.get(pattern) else {
+            return false;
+        };
+        let mut step_budget = self.budget.min(Self::PER_MATCH_STEP_LIMIT);
+        let initial = step_budget;
+        let matched = regex
+            .find_at_with_scratch(
+                path,
+                0,
+                rcmake_regex::MatchOptions::default(),
+                &mut step_budget,
+                &mut self.scratch,
+            )
+            .is_ok_and(|found| found.is_some());
+        self.budget = self.budget.saturating_sub(initial - step_budget);
+        matched
+    }
+}
+
+impl Default for SourceGroupMatcher {
+    fn default() -> Self {
+        Self::new(Limits::default().regex_steps)
+    }
+}
+
+fn default_source_group(path: &[u8]) -> BString {
+    let (stem, extension) = Lexical::new(path).stem_extension(true);
+    match extension {
+        b".h" | b".hxx" if stem == b"cmake_pch" || stem.starts_with(b"cmake_pch_") => {
+            "Precompile Header File"
+        }
+        b".h" | b".hh" | b".h++" | b".hm" | b".hpp" | b".hxx" | b".in" | b".txx" | b".inl" => {
+            "Header Files"
+        }
+        b".C" | b".F" | b".M" | b".c" | b".c++" | b".cc" | b".cpp" | b".mpp" | b".cxx"
+        | b".ixx" | b".cppm" | b".ccm" | b".cxxm" | b".c++m" | b".cu" | b".f" | b".f90"
+        | b".for" | b".fpp" | b".ftn" | b".m" | b".mm" | b".rc" | b".def" | b".r" | b".odl"
+        | b".idl" | b".hpj" | b".bat" => "Source Files",
+        b".rule" => "CMake Rules",
+        b".pdf" | b".plist" | b".png" | b".jpeg" | b".jpg" | b".storyboard" | b".xcassets" => {
+            "Resources"
+        }
+        b".lo" | b".o" | b".obj" => "Object Files",
+        _ => "",
+    }
+    .into()
 }
 
 fn append_objects(
@@ -679,5 +831,36 @@ impl CompileData {
                 .map(tagged_include),
         );
         Object(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceGroupMatcher;
+
+    #[test]
+    fn source_group_matcher_handles_cmake_bracket_class_and_bounds_work() {
+        let mut matcher = SourceGroupMatcher::default();
+        assert!(matcher.matches(br"[\]", br"dir\file.c"));
+        assert!(!matcher.matches(br"[\]", b"dir/file.c"));
+        assert_eq!(matcher.compiled.len(), 1);
+
+        let long_path = vec![b'a'; 2000];
+        let before = matcher.budget;
+        assert!(!matcher.matches(b"a+b", &long_path));
+        let spent = before - matcher.budget;
+        assert!(
+            spent <= SourceGroupMatcher::PER_MATCH_STEP_LIMIT,
+            "spent {spent} steps"
+        );
+        assert!(
+            matcher.budget > 0,
+            "single bounded miss should preserve remaining budget for legitimate files"
+        );
+
+        let mut exhausted = SourceGroupMatcher::new(100);
+        assert!(!exhausted.matches(b"a+b", &long_path));
+        assert_eq!(exhausted.budget, 0);
+        assert!(!exhausted.matches(br"\.c$", b"main.c"));
     }
 }

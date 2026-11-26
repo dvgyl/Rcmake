@@ -90,8 +90,11 @@ pub(super) fn add_target(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
         );
     }
     let id = cx.project().add_target(target).map_err(model_error)?;
-    body.kind = CustomCommandKind::Utility(id);
-    record(cx, body)?;
+    // `cmMakefile::AddUtilityCommand` creates no command without COMMAND and DEPENDS.
+    if !body.command_lines.is_empty() || !body.depends.is_empty() {
+        body.kind = CustomCommandKind::Utility(id);
+        record(cx, body)?;
+    }
     crate::dirs::source_groups::apply_to_target(cx, id)?;
     crate::targets::schedule_generated_name_validation(cx, name);
     Ok(Flow::Normal)

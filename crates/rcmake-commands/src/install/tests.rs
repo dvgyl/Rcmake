@@ -173,7 +173,7 @@ install(TARGETS core ARCHIVE DESTINATION "./lib/../$<CONFIG>/")
     );
     for (rule, expected) in [
         (1, "$<PATH:CMAKE_PATH,NORMALIZE,./lib/../$<CONFIG>/>"),
-        (2, "./lib/../$<CONFIG>/"),
+        (2, "./lib/../$<CONFIG>"),
     ] {
         assert_eq!(
             model
@@ -183,6 +183,35 @@ install(TARGETS core ARCHIVE DESTINATION "./lib/../$<CONFIG>/")
             Some(&expected.into())
         );
     }
+    Ok(())
+}
+
+#[test]
+fn argument_group_destinations_drop_one_trailing_slash() -> TestResult {
+    let (_, mut interp) = configure(
+        r#"
+install(FILES header DESTINATION share/x/)
+install(DIRECTORY data DESTINATION share/d/)
+cmake_policy(SET CMP0177 OLD)
+install(FILES header DESTINATION share\\y//)
+"#,
+        0,
+    )?;
+    let mut cx = interp.cx();
+    let destinations: Vec<_> = cx
+        .project()
+        .installs
+        .iter()
+        .map(|rule| rule.options.destination.clone())
+        .collect();
+    assert_eq!(
+        destinations,
+        [
+            Some("share/x".into()),
+            Some("share/d/".into()),
+            Some("share/y".into())
+        ]
+    );
     Ok(())
 }
 

@@ -349,7 +349,9 @@ fn elf_link_paths_respect_origin_and_the_install_path_switch() -> TestResult {
             assert_eq!(output.install.actions.len(), 1);
         } else {
             assert!(
-                link.contains("/explicit:$ORIGIN/lib:/toolchain/runtime:/platform:"),
+                link.contains(
+                    r#"-Wl,-rpath,"/explicit:\$ORIGIN/lib:/toolchain/runtime:/platform:""#
+                ),
                 "{link}"
             );
             let code = output
@@ -407,7 +409,7 @@ fn darwin_rpath_follows_the_install_name_of_an_import_through_a_static_library()
         let link = recipe(&result, b"app")?;
         assert_eq!(link.contains("-Wl,-rpath,"), expected, "{link}");
         if expected {
-            assert!(link.contains("-Wl,-rpath,'/sdk with space'"), "{link}");
+            assert!(link.contains("-Wl,-rpath,\"/sdk with space\""), "{link}");
         }
     }
     Ok(())
@@ -473,6 +475,26 @@ fn elf_runtime_paths_exclude_implicit_directories_and_include_private_shared_dep
     let link = recipe(&result, b"app")?;
     assert!(link.contains("-Wl,-rpath-link,/opt/vendor/lib"), "{link}");
     assert!(link.contains("$ORIGIN:/opt/vendor/lib"), "{link}");
+    // `-rpath` precedes the link libraries and `-rpath-link` follows them.
+    let position = |text: &str| link.find(text).ok_or(text.to_owned());
+    assert!(
+        position("-Wl,-rpath,")? < position("libdirect.so")?,
+        "{link}"
+    );
+    assert!(
+        position("libdirect.so")? < position("-Wl,-rpath-link,")?,
+        "{link}"
+    );
+    let graph = &result.graphs[0];
+    let paths = graph
+        .link_runtime_paths
+        .iter()
+        .find_map(|(output, paths)| output.ends_with(b"app").then_some(paths))
+        .ok_or("Expected runtime paths")?;
+    assert_eq!(
+        paths.rpath_link.as_ref().map(|flag| flag.as_slice()),
+        Some(b"-Wl,-rpath-link,/opt/vendor/lib".as_slice())
+    );
     assert!(!link.contains("-Wl,-rpath,/usr"), "{link}");
     assert!(result.install.actions.iter().any(|action| {
         matches!(&action.kind, InstallActionKind::Code(code)
@@ -670,7 +692,10 @@ fn elf_runtime_paths_filter_implicit_symlinks_and_keep_origin_ancestor_slash() -
 
     let result = resolve(&model, &host, &[])?;
     let link = recipe(&result, b"app")?;
-    assert!(link.contains("/work/build/libAlways:$ORIGIN/../"), "{link}");
+    assert!(
+        link.contains(r#"-Wl,-rpath,"/work/build/libAlways:\$ORIGIN/../""#),
+        "{link}"
+    );
     assert!(!link.contains("$ORIGIN/../libLink"), "{link}");
     Ok(())
 }
@@ -708,6 +733,54 @@ fn link_what_you_use_adds_the_flag_and_check_for_ninja_and_make() -> TestResult 
             .ok_or("Missing unused-library check.")?;
         assert!(check.argv.iter().any(|arg| arg == "--lwyu=ldd;-u;-r"));
         assert!(check.argv.iter().any(|arg| arg == "--source=app"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn dependent_library_files_mode_links_private_shared_dependencies() -> TestResult {
+    for files in [false, true] {
+        let (mut model, host) = fixture("Linux")?;
+        model.global.props.set(
+            "CMAKE_SHARED_LIBRARY_RPATH_LINK_C_FLAG".into(),
+            "-Wl,-rpath-link,".into(),
+        );
+        if files {
+            model
+                .global
+                .props
+                .set("CMAKE_LINK_DEPENDENT_LIBRARY_FILES".into(), "1".into());
+        }
+        let mut inner = target("inner", TargetKind::SharedLibrary, &["lib.c"]);
+        inner
+            .props
+            .set("LIBRARY_OUTPUT_DIRECTORY".into(), "inner".into());
+        model.add_target(inner)?;
+        let mut outer = target("outer", TargetKind::SharedLibrary, &["lib.c"]);
+        let mut private = link_item("inner");
+        private.scope = Some(rcmake_model::UsageScope::Private);
+        outer.usage.link_libraries = Some(vec![private]);
+        model.add_target(outer)?;
+        let mut app = target("app", TargetKind::Executable, &["main.c"]);
+        app.usage.link_libraries = Some(vec![link_item("outer")]);
+        model.add_target(app)?;
+        let result = resolve(&model, &host, &[])?;
+        let link = recipe(&result, b"app")?;
+        let position = |needle: &str| link.find(needle);
+        if files {
+            // `SharedDepModeLink`: the dependency follows the library that
+            // lists it, and no `-rpath-link` directory is added.
+            let outer = position("libouter.so").ok_or("outer is not linked")?;
+            let inner = position("inner/libinner.so").ok_or("inner is not linked")?;
+            assert!(outer < inner, "{link}");
+            assert!(!link.contains("-rpath-link"), "{link}");
+        } else {
+            // `SharedDepModeDir`: only the directory of the dependency.
+            assert!(position("libinner.so").is_none(), "{link}");
+            assert!(link.contains("-Wl,-rpath-link,"), "{link}");
+            assert!(link.contains("/inner"), "{link}");
+        }
     }
     Ok(())
 }

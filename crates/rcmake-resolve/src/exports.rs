@@ -175,11 +175,7 @@ pub(crate) fn resolve_exports(
         if rule.options.export_package_dependencies {
             plan.package_dependencies = package_dependencies(model, &plan.set, packages);
         }
-        // The parent install omits excluded directories. Their export rules
-        // still take part in dependency resolution and validation.
-        if !model.dir_excluded_from_all(rule.dir) {
-            plans.push(plan);
-        }
+        plans.push(plan);
     }
 
     let build_plans = build_exports(model)?;

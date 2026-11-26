@@ -407,11 +407,13 @@ impl FileApi<'_, '_> {
             )
         });
         let main = if framework
-            || metadata.kind == TargetKind::SharedLibrary
-                && artifacts
-                    .linker_file
-                    .as_ref()
-                    .is_some_and(|file| file.ends_with(b".dylib") || file.ends_with(b".so"))
+            || (matches!(
+                metadata.kind,
+                TargetKind::SharedLibrary | TargetKind::Executable | TargetKind::ModuleLibrary
+            ) && artifacts
+                .linker_file
+                .as_ref()
+                .is_some_and(|file| artifacts.import_file.as_ref() != Some(file)))
         {
             artifacts.linker_file.as_ref().or(artifacts.file.as_ref())
         } else {
@@ -435,15 +437,27 @@ impl FileApi<'_, '_> {
         ]
         .into_iter()
         .flatten()
-        .map(|value| value.as_slice())
+        .map(|file| Lexical::new(&relative(file, self.build)).normalize())
         .chain(
             target
                 .compile_units
                 .iter()
                 .filter(|_| metadata.kind == TargetKind::ObjectLibrary)
-                .map(|unit| unit.object.as_slice()),
+                .map(|unit| {
+                    let object = raw.map_or_else(
+                        || unit.object.clone(),
+                        |raw| {
+                            rcmake_resolve::lower::file_api_object_path(
+                                self.model,
+                                raw,
+                                &target.config,
+                                &unit.object,
+                            )
+                        },
+                    );
+                    relative_preserve_dots(&object, self.build)
+                }),
         )
-        .map(|file| relative(file, self.build))
         .filter(|file| seen.insert(file.clone()))
         .map(|file| object([("path", Value::string(file))]));
         optional_array(&mut body, "artifacts", artifact_paths);
@@ -462,7 +476,32 @@ impl FileApi<'_, '_> {
                 Some(Object(destination))
             })
             .collect::<Vec<_>>();
-        if !destinations.is_empty() {
+        let has_install_rule = self
+            .result
+            .install_targets
+            .have_install_rule
+            .contains(&target.id);
+        let has_bmi_install = reference.abstract_target
+            && self
+                .model
+                .installs
+                .iter()
+                .enumerate()
+                .any(|(index, rule)| {
+                    matches!(&rule.kind, rcmake_model::InstallKind::Targets { targets: ids, .. } if ids.contains(&target.id))
+                        && rcmake_resolve::lower::install_target_group_options(
+                            self.model,
+                            index,
+                            b"CXX_MODULES_BMI",
+                        )
+                        .is_some_and(|options| {
+                            options
+                                .destination
+                                .as_ref()
+                                .is_some_and(|path| !path.is_empty())
+                        })
+                });
+        if !destinations.is_empty() || has_install_rule || has_bmi_install {
             body.insert(
                 "install".into(),
                 object([
@@ -536,15 +575,45 @@ impl FileApi<'_, '_> {
             if !static_archive {
                 fragments.extend(framework_flags);
                 fragments.extend(link.fragments.iter().filter_map(|fragment| {
-                    let role = match fragment.role {
-                        LinkFragmentRole::LibraryPath => "libraryPath",
-                        LinkFragmentRole::Libraries => "libraries",
-                        _ => return None,
-                    };
-                    let mut item = members([("role", Value::string(role))]);
+                    if fragment.role != LinkFragmentRole::LibraryPath {
+                        return None;
+                    }
+                    let mut item = members([("role", Value::string("libraryPath"))]);
                     graph.tagged_value(&mut item, "fragment", &fragment.text);
                     Some(Object(item))
                 }));
+                let ninja = self.generator().is_some_and(GeneratorKind::is_ninja);
+                let runtime_paths = config_indices
+                    .build_graph
+                    .and_then(|graph| graph.link_runtime_paths.get(&link.output));
+                if let Some(rpath) = runtime_paths
+                    .and_then(|paths| paths.rpath.as_deref())
+                    .map(|value| format_runtime_path_fragment(value, ninja))
+                    .filter(|value| !value.is_empty())
+                {
+                    fragments.push(object([
+                        ("role", Value::string("libraries")),
+                        ("fragment", Value::string(rpath)),
+                    ]));
+                }
+                fragments.extend(link.fragments.iter().filter_map(|fragment| {
+                    if fragment.role != LinkFragmentRole::Libraries {
+                        return None;
+                    }
+                    let mut item = members([("role", Value::string("libraries"))]);
+                    graph.tagged_value(&mut item, "fragment", &fragment.text);
+                    Some(Object(item))
+                }));
+                if let Some(rpath_link) = runtime_paths
+                    .and_then(|paths| paths.rpath_link.as_deref())
+                    .map(|value| format_runtime_path_fragment(value, ninja))
+                    .filter(|value| !value.is_empty())
+                {
+                    fragments.push(object([
+                        ("role", Value::string("libraries")),
+                        ("fragment", Value::string(rpath_link)),
+                    ]));
+                }
             }
             optional_array(&mut step, "commandFragments", fragments);
             body.insert(
@@ -599,7 +668,14 @@ impl FileApi<'_, '_> {
         }
         if let Some(raw) = raw {
             super::dependencies::write(
-                self.model, reference, targets, raw, usage, &mut graph, &mut body,
+                self.model,
+                &self.result.target_depends,
+                reference,
+                targets,
+                raw,
+                usage,
+                &mut graph,
+                &mut body,
             )?;
         }
         if raw.is_none() {
@@ -653,4 +729,52 @@ pub(super) fn dependency_backtraces<'a>(
 
 fn file_name(path: &[u8]) -> &[u8] {
     path.rsplit(|&byte| byte == b'/').next().unwrap_or(path)
+}
+
+fn format_runtime_path_fragment(raw: &[u8], ninja: bool) -> rcmake_base::BString {
+    let trimmed = raw.trim_ascii();
+    if !ninja || !trimmed.contains(&b'$') {
+        return trimmed.into();
+    }
+    let mut out = Vec::with_capacity(trimmed.len() + 4);
+    for &byte in trimmed {
+        if byte == b'$' {
+            out.push(b'$');
+        }
+        out.push(byte);
+    }
+    out.into()
+}
+
+fn relative_preserve_dots(path: &[u8], root: &[u8]) -> rcmake_base::BString {
+    let path = cmake_style(path);
+    let root = cmake_style(root);
+    if !root.is_empty() {
+        let trimmed = if root.len() > 1 {
+            root.strip_suffix(b"/").unwrap_or(&root)
+        } else {
+            root.as_slice()
+        };
+        if trimmed == b"/" {
+            if let Some(rest) = path.strip_prefix(b"/") {
+                return if rest.is_empty() {
+                    ".".into()
+                } else {
+                    rest.into()
+                };
+            }
+        } else if let Some(rest) = path.strip_prefix(trimmed) {
+            if rest.is_empty() {
+                return ".".into();
+            }
+            if let Some(after) = rest.strip_prefix(b"/") {
+                return if after.is_empty() {
+                    ".".into()
+                } else {
+                    after.into()
+                };
+            }
+        }
+    }
+    path
 }

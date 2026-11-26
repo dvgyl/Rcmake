@@ -331,7 +331,6 @@ impl UnityWriter<'_> {
                     sources
                         .chunks(size)
                         .enumerate()
-                        .rev()
                         .map(|(index, chunk)| (BString::from(index.to_string()), chunk.to_vec()))
                         .collect::<IndexMap<_, _>>()
                 }

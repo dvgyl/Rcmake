@@ -82,9 +82,6 @@ pub fn write_supplementary_outputs(
     }
     let mut usage: Option<UsageResolver<'_>> = None;
     for (index, rule) in model.installs.iter().enumerate() {
-        if dir_excluded_from_all(model, rule.dir) {
-            continue;
-        }
         let directory = to_native(&model.dir(rule.dir).binary_dir);
         match &rule.kind {
             InstallKind::PackageInfo(spec) => {
@@ -166,19 +163,6 @@ pub fn write_supplementary_outputs(
         host.write_out(Stream::Stderr, &warning);
     }
     Ok(outputs.manifest)
-}
-
-fn dir_excluded_from_all(model: &ProjectModel, mut dir: DirId) -> bool {
-    loop {
-        let info = model.dir(dir);
-        if info.exclude_from_all {
-            return true;
-        }
-        let Some(parent) = info.parent else {
-            return false;
-        };
-        dir = parent;
-    }
 }
 
 fn original_config(result: &GenerationResult, name: &[u8]) -> BString {

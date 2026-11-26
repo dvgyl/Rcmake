@@ -195,6 +195,9 @@ impl<'a> Graph<'a> {
         let dir = self.target_dir_for_output(&step.output);
         let language = &step.language;
         if self.command_settings.model.is_some()
+            || invocations
+                .iter()
+                .any(|invocation| invocation.link_response.is_some())
             || !self.use_response(dir, ordinary)
             || language == b"RC"
         {

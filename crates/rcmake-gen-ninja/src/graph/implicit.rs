@@ -73,17 +73,9 @@ impl Graph<'_> {
     }
 
     fn concrete_node(&self, index: usize) -> Option<BString> {
-        let target = self.input.targets.get(index)?;
-        target
-            .steps
-            .iter()
-            .find_map(|&index| {
-                let nodes = self.steps.get(index)?;
-                (nodes.link || matches!(self.input.steps.get(index), Some(BuildStep::Link { .. })))
-                    .then(|| nodes.outputs.first())
-                    .flatten()
-                    .cloned()
-            })
+        self.target_meta
+            .get(index)
+            .and_then(|meta| meta.artifact_outputs.first().cloned())
             .or_else(|| self.aliases.get(index).cloned())
     }
 
@@ -221,7 +213,7 @@ impl Graph<'_> {
                 let inputs = sources.entry(source).or_default();
                 if let Some(nodes) = self.steps.get(index) {
                     for entry in &nodes.order_only {
-                        if let OrderOnly::CompilePrerequisites(index) = entry {
+                        if let OrderOnly::ObjectOrder(index) = entry {
                             inputs.extend(self.compile_prerequisite_paths(*index));
                         }
                     }

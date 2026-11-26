@@ -307,6 +307,26 @@ fn autogen_writes_metadata_for_the_generated_sources() -> TestResult {
         if custom.invocations.iter().any(|command| command.argv.contains(info))))
     );
 
+    let autogen = first
+        .targets
+        .iter()
+        .find(|target| target.metadata.name == "app_autogen")
+        .ok_or("Missing AUTOGEN target.")?;
+    assert!(autogen.metadata.generator_provided);
+    let app = first
+        .targets
+        .iter()
+        .find(|target| target.metadata.name == "app")
+        .ok_or("Missing origin target.")?;
+    assert!(!app.metadata.generator_provided);
+    assert!(
+        first
+            .target_depends
+            .utility_items(app.id)
+            .iter()
+            .any(|item| item.target == autogen.id)
+    );
+
     resolve(&model, &host, &[])?;
     assert_eq!(read()?, data);
     Ok(())

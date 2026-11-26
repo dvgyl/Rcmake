@@ -365,6 +365,13 @@ impl<'a> UsageResolver<'a> {
         interface: bool,
         ctx: &EvalContext,
     ) -> Result<SharedLinks, ResolveError> {
+        if interface
+            && self
+                .target(owner)
+                .is_ok_and(|target| lacks_import_info(target, &ctx.config))
+        {
+            return Ok((Arc::from([]), EvalFlags::default()));
+        }
         let key = LinkMemoKey {
             owner,
             interface,
@@ -772,4 +779,20 @@ impl Injection {
         }
         Ok(())
     }
+}
+
+/// Return `true` for an imported target that is not available for `config`: it is
+/// not an interface library and has no location and no import library. Such a
+/// target has no link interface (`cmGeneratorTarget::GetImportLinkInterface`).
+fn lacks_import_info(target: &Target, config: &ConfigId) -> bool {
+    if !target.is_imported() || target.kind == TargetKind::InterfaceLibrary {
+        return false;
+    }
+    let location: &[u8] = if target.kind == TargetKind::ObjectLibrary {
+        b"IMPORTED_OBJECTS"
+    } else {
+        b"IMPORTED_LOCATION"
+    };
+    super::artifacts::imported_property(target, location, config).is_none()
+        && super::artifacts::imported_property(target, b"IMPORTED_IMPLIB", config).is_none()
 }

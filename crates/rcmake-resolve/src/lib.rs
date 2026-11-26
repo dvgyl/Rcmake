@@ -25,6 +25,7 @@ mod resolve_link;
 mod scoped_usage_host;
 mod sources;
 mod target;
+pub mod target_depends;
 mod unity;
 mod xcframework;
 
@@ -36,10 +37,12 @@ pub mod usage;
 
 pub use cxx_modules::query_ninja_cxx_dyndep;
 pub use install_manifest::{
-    InstallAction, InstallActionKind, InstallEntry, InstallManifest, NamelinkMode, TargetInstaller,
+    InstallAction, InstallActionKind, InstallEntry, InstallManifest, InstallTargetFacts,
+    NamelinkMode, TargetFileInstaller, TargetFileKind, TargetInstaller,
 };
 pub use model::*;
 pub use pipeline::{resolve, resolve_with_facts, resolve_with_options, validate_codegen_name};
+pub use target_depends::{TargetDepend, TargetDependGraph, UtilityItem};
 pub use usage::includes::finalize_current_dir_interfaces;
 
 /// Return `true` when CMake treats `path` as a full path (`cmSystemTools::FileIsFullPath`).

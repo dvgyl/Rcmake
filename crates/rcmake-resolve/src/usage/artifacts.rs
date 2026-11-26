@@ -453,10 +453,7 @@ impl UsageResolver<'_> {
             .artifact_property(id, config, "OUTPUT_DIRECTORY", &[config_dir, general_dir])?
             .or_else(|| {
                 matches!(category, "LIBRARY" | "ARCHIVE" | "RUNTIME")
-                    .then(|| {
-                        lower::artifacts::legacy_library_output_directory(self.model, target)
-                            .cloned()
-                    })
+                    .then(|| lower::artifacts::legacy_output_path(self.model, target).cloned())
                     .flatten()
             })
             .map_or_else(
@@ -474,7 +471,8 @@ impl UsageResolver<'_> {
         {
             dir = Lexical::new(&dir).append(&config.0);
         }
-        Ok(lower::artifacts::model_path(&dir).normalize())
+        let normalized = lower::artifacts::model_path(&dir).normalize();
+        Ok(lower::without_trailing_slashes(&normalized).into())
     }
 
     pub(crate) fn ide_artifacts(

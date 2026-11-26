@@ -2,9 +2,14 @@
 
 use std::collections::BTreeMap;
 
-use rcmake_base::{BString, path_lex::Lexical};
-use rcmake_genex::ConfigId;
+use rcmake_base::{
+    BString, list,
+    path_lex::{Lexical, cmake_style},
+};
+use rcmake_diag::Backtrace;
+use rcmake_genex::{ConfigId, EvalContext, EvalSite, evaluate, parse};
 use rcmake_model::{DirId, Directory, InstallKind, InstallRule, ProjectModel, TargetId};
+use rcmake_resolve::usage::UsageResolver;
 
 use crate::GenError;
 
@@ -158,22 +163,34 @@ impl FileApi<'_, '_> {
             }
             if let InstallKind::Targets { targets: ids, .. } = &rule.kind {
                 for id in ids {
-                    let Some(reference) = targets
-                        .get(id)
-                        .filter(|reference| !reference.abstract_target)
-                    else {
+                    let Some(reference) = targets.get(id) else {
                         continue;
                     };
-                    let projected = config_indices
-                        .installers_by_rule_target
+                    if !reference.abstract_target {
+                        let projected = config_indices
+                            .installers_by_rule_target
+                            .get(&(index, *id))
+                            .map(Vec::as_slice)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|installer| installers::target(installer, reference, self.build));
+                        other_installers::append(
+                            &mut installers,
+                            projected,
+                            &rule.backtrace,
+                            &mut graph,
+                        );
+                    }
+                    let file_rows = config_indices
+                        .file_installers_by_rule_target
                         .get(&(index, *id))
                         .map(Vec::as_slice)
                         .unwrap_or_default()
                         .iter()
-                        .map(|installer| installers::target(installer, reference, self.build));
+                        .map(|installer| installers::target_file(installer, self.source));
                     other_installers::append(
                         &mut installers,
-                        projected,
+                        file_rows,
                         &rule.backtrace,
                         &mut graph,
                     );
@@ -207,7 +224,6 @@ impl FileApi<'_, '_> {
                 "component",
                 Value::string(install_component(self.model, rule)),
             )]);
-            graph.tag(&mut base, &rule.backtrace);
             if rule.options.all_components {
                 base.insert("isForAllComponents".into(), Bool(true));
             }
@@ -217,7 +233,16 @@ impl FileApi<'_, '_> {
             if rule.options.exclude_from_all {
                 base.insert("isExcludeFromAll".into(), Bool(true));
             }
-            if let Some(destination) = &rule.options.destination {
+            let evaluated_destination = rule
+                .options
+                .destination
+                .as_ref()
+                .map(|destination| {
+                    eval_install_genex(self.model, rule.dir, config, &rule.backtrace, destination)
+                        .map(|evaluated| strip_trailing_slash(&evaluated))
+                })
+                .transpose()?;
+            if let Some(destination) = &evaluated_destination {
                 base.insert("destination".into(), Value::string(destination.clone()));
             }
             let kind = match &rule.kind {
@@ -235,26 +260,47 @@ impl FileApi<'_, '_> {
                 InstallKind::Files(files)
                 | InstallKind::Programs(files)
                 | InstallKind::Directory(files) => {
-                    if files.is_empty() {
+                    let mut expanded_files = Vec::new();
+                    for file in files {
+                        if file.value.windows(2).any(|pair| pair == b"$<") {
+                            let evaluated = eval_install_genex(
+                                self.model,
+                                rule.dir,
+                                config,
+                                &file.backtrace,
+                                &file.value,
+                            )?;
+                            expanded_files.extend(list::split(&evaluated, list::Empty::Drop));
+                        } else if !file.value.is_empty() {
+                            expanded_files.push(file.value.clone());
+                        }
+                    }
+                    if expanded_files.is_empty() {
                         continue;
                     }
                     let directory = matches!(rule.kind, InstallKind::Directory(_));
-                    let rename = rule
+                    let evaluated_rename = rule
                         .options
                         .rename
                         .as_ref()
-                        .filter(|name| !name.is_empty() && files.len() == 1);
-                    let files = files.iter().map(|file| {
+                        .map(|name| {
+                            eval_install_genex(self.model, rule.dir, config, &rule.backtrace, name)
+                        })
+                        .transpose()?;
+                    let rename = evaluated_rename
+                        .as_ref()
+                        .filter(|name| !name.is_empty() && expanded_files.len() == 1);
+                    let files = expanded_files.iter().map(|file| {
                         if directory {
-                            let (from, to) = file.value.strip_suffix(b"/").map_or_else(
-                                || (file.value.as_slice(), Lexical::new(&file.value).filename()),
+                            let (from, to) = file.strip_suffix(b"/").map_or_else(
+                                || (file.as_slice(), Lexical::new(file).filename()),
                                 |from| (from, b".".as_slice()),
                             );
                             installers::path(self.source, from, to)
                         } else if let Some(to) = rename {
-                            installers::path(self.source, &file.value, to)
+                            installers::path(self.source, file, to)
                         } else {
-                            Value::string(relative(&file.value, self.source))
+                            Value::string(relative(file, self.source))
                         }
                     });
                     base.insert("paths".into(), array(files));
@@ -275,26 +321,27 @@ impl FileApi<'_, '_> {
                     let file = file
                         .clone()
                         .unwrap_or_else(|| format!("{set}.cmake").into());
-                    let destination = rule
-                        .options
-                        .destination
-                        .as_ref()
-                        .map_or(b"".as_slice(), |value| value.as_slice());
+                    let destination = evaluated_destination
+                        .as_deref()
+                        .map_or(b"".as_slice(), Vec::as_slice);
+                    let dir_rel = relative(&dir.binary_dir, self.build);
                     base.insert(
                         "paths".into(),
-                        array([Value::string(installers::export_path(destination, &file))]),
+                        array([Value::string(installers::export_path(
+                            &dir_rel,
+                            destination,
+                            &file,
+                        ))]),
                     );
                     if let Some(export) = self.model.exports.get(set) {
                         base.insert(
                             "exportTargets".into(),
                             array(export.targets.iter().filter_map(|id| targets.get(id)).map(
                                 |target| {
-                                    let mut item =
-                                        members([("id", Value::string(target.id.as_str()))]);
-                                    if !target.abstract_target {
-                                        item.insert("index".into(), number(target.index));
-                                    }
-                                    Object(item)
+                                    object([
+                                        ("id", Value::string(target.id.as_str())),
+                                        ("index", number(target.index)),
+                                    ])
                                 },
                             )),
                         );
@@ -302,6 +349,7 @@ impl FileApi<'_, '_> {
                     "export"
                 }
             };
+            graph.tag(&mut base, &rule.backtrace);
             base.insert("type".into(), Value::string(kind));
             installers.push(Object(base));
         }
@@ -346,4 +394,41 @@ pub(super) fn applies(configurations: &[BString], config: &[u8]) -> bool {
         || configurations
             .iter()
             .any(|value| value.eq_ignore_ascii_case(config))
+}
+
+fn eval_install_genex(
+    model: &ProjectModel,
+    dir: DirId,
+    config: &[u8],
+    backtrace: &Backtrace,
+    value: &BString,
+) -> Result<BString, GenError> {
+    if !value.windows(2).any(|pair| pair == b"$<") {
+        return Ok(value.clone());
+    }
+    let context = EvalContext {
+        config: ConfigId(config.into()),
+        site: EvalSite {
+            backtrace: backtrace.clone(),
+            property: None,
+        },
+        ..EvalContext::default()
+    };
+    let genex = parse(value).map_err(|err| GenError::Invalid(err.to_string().into()))?;
+    let mut usage = UsageResolver::new(model);
+    evaluate(&genex, &context, &mut usage.host(dir))
+        .map(|(evaluated, _)| evaluated)
+        .map_err(|err| GenError::Invalid(err.to_string().into()))
+}
+
+fn strip_trailing_slash(path: &[u8]) -> BString {
+    let normalized = cmake_style(path);
+    let mut slice = normalized.as_slice();
+    while slice.len() > 1 && !slice.ends_with(b":/") {
+        let Some(trimmed) = slice.strip_suffix(b"/") else {
+            break;
+        };
+        slice = trimmed;
+    }
+    slice.into()
 }

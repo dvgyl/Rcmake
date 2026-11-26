@@ -64,6 +64,7 @@ pub fn lower_install_manifest(model: &ProjectModel, targets: &[ResolvedTarget]) 
             Ok(crate::sources::install_object_name(model, dir, source, config).unwrap_or_default())
         },
     )
+    .map(|(manifest, _)| manifest)
     .unwrap_or_default()
 }
 
@@ -74,7 +75,7 @@ pub(crate) fn lower_install_manifest_with_configs(
     ide: Option<crate::ide::IdeFlavor>,
     host: &dyn Host,
     languages: &IndexMap<(TargetId, ConfigId), IndexSet<BString>>,
-) -> Result<InstallManifest, ResolveError> {
+) -> Result<(InstallManifest, crate::InstallTargetFacts), ResolveError> {
     for (index, rule, _) in ordered_install_rules(model) {
         targets::warn_framework_change(model, index, rule, host)?;
         script_policy::warn(model, rule, host);
@@ -421,8 +422,9 @@ fn lower_install_rules(
     ),
     eval: &mut EvaluateInstall<'_>,
     object_name: &mut InstallObjectName<'_>,
-) -> Result<InstallManifest, ResolveError> {
+) -> Result<(InstallManifest, crate::InstallTargetFacts), ResolveError> {
     let mut manifest = InstallManifest::default();
+    let mut facts = crate::InstallTargetFacts::default();
     let mut strip = strip::Tools::new(host);
     let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
     for entry in ordered_entries(model) {
@@ -438,6 +440,10 @@ fn lower_install_rules(
                         .or_default()
                         .push(crate::InstallEntry::Actions(first..manifest.actions.len()));
                 }
+                continue;
+            }
+            InstallEntry::DetachedDirectory(dir) => {
+                manifest.directories.entry(dir).or_default();
                 continue;
             }
             InstallEntry::Directory(dir) => {
@@ -483,7 +489,7 @@ fn lower_install_rules(
                         &recorded,
                         &mut manifest,
                         &make_action,
-                        (eval, object_name),
+                        (eval, object_name, &mut facts),
                     )?;
                     return Ok(());
                 }
@@ -607,7 +613,7 @@ fn lower_install_rules(
         }
     }
     legacy::append_scripts(model, &mut manifest);
-    Ok(manifest)
+    Ok((manifest, facts))
 }
 
 fn action_configs<'a>(

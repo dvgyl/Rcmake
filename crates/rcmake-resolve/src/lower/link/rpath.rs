@@ -21,6 +21,72 @@ use crate::{
     usage::UsageResolver,
 };
 
+/// How a link step treats a shared library that the link reaches only as a
+/// dependency of another shared library (`LinkEntry::SharedDep`,
+/// `cmComputeLinkInformation::SharedDependencyMode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedDependencyMode {
+    /// Drop the dependency.
+    None,
+    /// Link to the dependency (`CMAKE_LINK_DEPENDENT_LIBRARY_FILES`).
+    Link,
+    /// Add the directory of the dependency to the linker search path
+    /// (`CMAKE_LINK_DEPENDENT_LIBRARY_DIRS`).
+    LibDir,
+    /// Add the directory of the dependency to the `-rpath-link` path
+    /// (`CMAKE_SHARED_LIBRARY_RPATH_LINK_<LANG>_FLAG`).
+    Dir,
+}
+
+/// Select the shared dependency mode of a target in `dir` that links with
+/// `language`. The variables have this precedence: dependent library files,
+/// dependent library directories, then the `-rpath-link` flag.
+pub(crate) fn shared_dependency_mode(
+    model: &ProjectModel,
+    dir: DirId,
+    language: Option<&[u8]>,
+) -> SharedDependencyMode {
+    let on = |name: &[u8]| definition(model, dir, name).is_some_and(|value| truth::is_on(value));
+    if on(b"CMAKE_LINK_DEPENDENT_LIBRARY_FILES") {
+        SharedDependencyMode::Link
+    } else if on(b"CMAKE_LINK_DEPENDENT_LIBRARY_DIRS") {
+        SharedDependencyMode::LibDir
+    } else if language.is_some_and(|language| rpath_link_variable(model, dir, language).is_some()) {
+        SharedDependencyMode::Dir
+    } else {
+        SharedDependencyMode::None
+    }
+}
+
+/// Return `true` when the link line keeps `item`, an entry that only a shared
+/// library dependency added, in the [`SharedDependencyMode::Link`] mode
+/// (`AddSharedDepItem`): a shared library target, or a full path to a file
+/// with a shared library name.
+pub(crate) fn links_shared_dependency(
+    model: &ProjectModel,
+    item: &crate::usage::ResolvedLinkItem,
+) -> bool {
+    match item.kind {
+        crate::usage::ResolvedLinkKind::Library(id) => model
+            .target(id)
+            .is_some_and(|target| target.kind == TargetKind::SharedLibrary),
+        crate::usage::ResolvedLinkKind::Raw => {
+            let path = Lexical::new(&item.text.value);
+            path.absolute() && shared_library(path.filename())
+        }
+        _ => false,
+    }
+}
+
+/// Runtime path options of a link line.
+#[derive(Default)]
+pub(super) struct RuntimeFlags {
+    /// `-rpath` options, which precede the link libraries.
+    pub(super) rpath: Vec<BString>,
+    /// The `-rpath-link` option, which follows the link libraries.
+    pub(super) rpath_link: Option<BString>,
+}
+
 pub(super) fn link_flags(
     model: &ProjectModel,
     target: &Target,
@@ -29,7 +95,7 @@ pub(super) fn link_flags(
     usage: &mut UsageResolver<'_>,
     libraries: &RuntimeLibraries,
     languages: &IndexSet<BString>,
-) -> Result<Vec<BString>, ResolveError> {
+) -> Result<RuntimeFlags, ResolveError> {
     let darwin = is_darwin(model, target.dir);
     let installed = crate::lower::install::has_target_install(model, target)
         || model
@@ -90,7 +156,16 @@ pub(super) fn link_flags(
     } else {
         b":"
     });
-    let format = |path: &[u8]| [prefix, quote(path).as_slice()].concat().into();
+    let windows = crate::lower::shell::windows_host(model, target.dir);
+    // `cmOutputConverter::EscapeForShell`: POSIX double quotes, `$` escaped.
+    let escape = |path: &[u8]| {
+        if windows {
+            quote(path)
+        } else {
+            crate::lower::shell::cmake_posix_quote(path)
+        }
+    };
+    let format = |path: &[u8]| [prefix, escape(path).as_slice()].concat().into();
     let mut flags = Vec::new();
     if !prefix.is_empty() {
         if separator.is_empty() {
@@ -104,16 +179,20 @@ pub(super) fn link_flags(
             flags.push(format(&join_paths(build, separator)));
         }
     }
-    if let Some(prefix) = rpath_link_flag(model, target, step)
-        && !libraries.dependent_dirs.is_empty()
-    {
-        flags.push(
-            [prefix, &quote(&join_paths(&libraries.dependent_dirs, b":"))]
-                .concat()
-                .into(),
-        );
-    }
-    Ok(flags)
+    let rpath_link = rpath_link_flag(model, target, step)
+        .filter(|_| !libraries.dependent_dirs.is_empty())
+        .map(|prefix| {
+            [
+                prefix,
+                &escape(&join_paths(&libraries.dependent_dirs, b":")),
+            ]
+            .concat()
+            .into()
+        });
+    Ok(RuntimeFlags {
+        rpath: flags,
+        rpath_link,
+    })
 }
 
 struct RuntimePaths {
@@ -342,7 +421,10 @@ pub(super) fn runtime_libraries(
     let build = &model.dir(DirId::ROOT).binary_dir;
     let absolute = |path: &[u8]| Lexical::new(&join(build, path)).normalize();
     let apple = on(model, target, b"CMAKE_PLATFORM_HAS_INSTALLNAME");
-    let rpath_link = rpath_link_flag(model, target, step).is_some();
+    // Only the `Dir` mode adds `-rpath-link` directories. The `Link` mode puts
+    // the dependencies on the link line in the link order.
+    let rpath_link = shared_dependency_mode(model, target.dir, Some(&step.language))
+        == SharedDependencyMode::Dir;
     let mut runtimes = BTreeMap::new();
     let mut shared = IndexSet::new();
     for id in usage.link_targets(id, &ctx)? {
@@ -517,13 +599,16 @@ fn rpath_link_flag<'a>(
     target: &Target,
     step: &LinkStep,
 ) -> Option<&'a [u8]> {
-    let key = [
-        b"CMAKE_SHARED_LIBRARY_RPATH_LINK_",
-        step.language.as_slice(),
-        b"_FLAG",
-    ]
-    .concat();
-    definition(model, target.dir, &key)
+    rpath_link_variable(model, target.dir, &step.language)
+}
+
+fn rpath_link_variable<'a>(
+    model: &'a ProjectModel,
+    dir: DirId,
+    language: &[u8],
+) -> Option<&'a [u8]> {
+    let key = [b"CMAKE_SHARED_LIBRARY_RPATH_LINK_", language, b"_FLAG"].concat();
+    definition(model, dir, &key)
         .filter(|flag| !flag.is_empty())
         .map(|flag| flag.as_slice())
 }

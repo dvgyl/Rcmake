@@ -131,6 +131,144 @@ class LargeProjectTests(unittest.TestCase):
         self.assertEqual(runner.model_data(reply, Normalizer(self.root)), {"targets": [{"name": "app", "data": {
             "name": "app", "sources": [{"path": "a.c"}], "dependencies": [{"id": "a"}, {"id": "b"}]}}]})
 
+    def test_model_data_normalizes_equal_name_abstract_target_ties_and_remaps_indexes(self):
+        import unseen_eval
+
+        def build_reply(root, abstract_entries, dir_indexes, proj_indexes, export_targets,
+                        fileset_ref, bmi_ref):
+            reply = root / ".cmake/api/v1/reply"
+            reply.mkdir(parents=True)
+            (reply / "index-1.json").write_text(json.dumps({
+                "objects": [{"kind": "codemodel", "jsonFile": "m.json"}],
+                "reply": {"codemodel-v2": {"jsonFile": "m.json"}},
+            }))
+            (reply / "t-build.json").write_text(json.dumps({"name": "app", "id": "app::@000"}))
+            for entry in abstract_entries:
+                (reply / entry["jsonFile"]).write_text(json.dumps({"name": entry["name"], "id": entry["id"]}))
+            (reply / "d0.json").write_text(json.dumps({
+                "installers": [
+                    {"type": "export", "exportTargets": export_targets},
+                    {"type": "fileSet", "fileSetTarget": fileset_ref},
+                    {"type": "cxxModuleBmi", "cxxModuleBmiTarget": bmi_ref},
+                ]
+            }))
+            (reply / "d1.json").write_text(json.dumps({"installers": []}))
+            (reply / "m.json").write_text(json.dumps({
+                "configurations": [{
+                    "name": "",
+                    "targets": [{"name": "app", "id": "app::@000", "jsonFile": "t-build.json"}],
+                    "abstractTargets": abstract_entries,
+                    "directories": [
+                        {"source": ".", "jsonFile": "d0.json", "abstractTargetIndexes": dir_indexes[0]},
+                        {"source": "sub", "jsonFile": "d1.json", "abstractTargetIndexes": dir_indexes[1]},
+                    ],
+                    "projects": [
+                        {"name": "P", "abstractTargetIndexes": proj_indexes},
+                    ],
+                }]
+            }))
+            return reply
+
+        a1 = {"name": "Threads::Threads", "id": "Threads::Threads::@111", "jsonFile": "a1.json"}
+        a2 = {"name": "Threads::Threads", "id": "Threads::Threads::@222", "jsonFile": "a2.json"}
+        b1 = {"name": "Zlib::Zlib", "id": "Zlib::Zlib::@333", "jsonFile": "b1.json"}
+
+        r1 = build_reply(
+            self.root / "o1", [a2, a1, b1],
+            dir_indexes=[[1], [0, 2]],
+            proj_indexes=[0, 1, 2],
+            export_targets=[
+                {"id": "app::@000", "index": 0},
+                {"id": "Threads::Threads::@222", "index": 0},
+                {"id": "Threads::Threads::@111", "index": 1},
+            ],
+            fileset_ref={"id": "Threads::Threads::@222", "index": 0},
+            bmi_ref={"id": "Threads::Threads::@111", "index": 1},
+        )
+        r2 = build_reply(
+            self.root / "o2", [a1, a2, b1],
+            dir_indexes=[[0], [1, 2]],
+            proj_indexes=[0, 1, 2],
+            export_targets=[
+                {"id": "app::@000", "index": 0},
+                {"id": "Threads::Threads::@222", "index": 1},
+                {"id": "Threads::Threads::@111", "index": 0},
+            ],
+            fileset_ref={"id": "Threads::Threads::@222", "index": 1},
+            bmi_ref={"id": "Threads::Threads::@111", "index": 0},
+        )
+        # Non-equal names out of order must remain unequal.
+        r3 = build_reply(
+            self.root / "o3", [b1, a1, a2],
+            dir_indexes=[[1], [2, 0]],
+            proj_indexes=[0, 1, 2],
+            export_targets=[
+                {"id": "app::@000", "index": 0},
+                {"id": "Threads::Threads::@222", "index": 2},
+                {"id": "Threads::Threads::@111", "index": 1},
+            ],
+            fileset_ref={"id": "Threads::Threads::@222", "index": 2},
+            bmi_ref={"id": "Threads::Threads::@111", "index": 1},
+        )
+
+        m1 = runner.model_data(r1, Normalizer(self.root))
+        m2 = runner.model_data(r2, Normalizer(self.root))
+        m3 = runner.model_data(r3, Normalizer(self.root))
+        self.assertEqual(m1, m2)
+        self.assertNotEqual(m1, m3)
+        # Build target index 0 must not be remapped; exportTargets order must be preserved.
+        inst = m1["configurations"][0]["directories"][0]["data"]["installers"]
+        self.assertEqual(inst[0]["exportTargets"], [
+            {"id": "app::@000", "index": 0},
+            {"id": "Threads::Threads::@222", "index": 1},
+            {"id": "Threads::Threads::@111", "index": 0},
+        ])
+        self.assertEqual(inst[1]["fileSetTarget"]["index"], 1)
+        self.assertEqual(inst[2]["cxxModuleBmiTarget"]["index"], 0)
+
+        u1 = unseen_eval.codemodel(self.root / "o1", Normalizer(self.root))
+        u2 = unseen_eval.codemodel(self.root / "o2", Normalizer(self.root))
+        u3 = unseen_eval.codemodel(self.root / "o3", Normalizer(self.root))
+        self.assertEqual(u1, u2)
+        self.assertNotEqual(u1, u3)
+
+    def test_shared_abstract_target_tie_normalizer_used_everywhere(self):
+        import normalize
+
+        sample = {
+            "configurations": [{
+                "abstractTargets": [
+                    {"name": "Dup", "id": "Dup::@b"},
+                    {"name": "Dup", "id": "Dup::@a"},
+                ],
+                "projects": [{"abstractTargetIndexes": [0, 1]}],
+                "directories": [{
+                    "abstractTargetIndexes": [0],
+                    "jsonFile": {
+                        "installers": [
+                            {"fileSetTarget": {"id": "Dup::@b", "index": 0}},
+                            {"cxxModuleBmiTarget": {"id": "Dup::@a", "index": 1}},
+                            {"exportTargets": [{"id": "Dup::@b", "index": 0}]},
+                        ]
+                    },
+                }],
+            }]
+        }
+        normalized = normalize.normalize_codemodel_abstract_target_ties(
+            sample, dir_data_key="jsonFile"
+        )
+        cfg = normalized["configurations"][0]
+        self.assertEqual([t["id"] for t in cfg["abstractTargets"]], ["Dup::@a", "Dup::@b"])
+        self.assertEqual(cfg["directories"][0]["abstractTargetIndexes"], [1])
+        inst = cfg["directories"][0]["jsonFile"]["installers"]
+        self.assertEqual(inst[0]["fileSetTarget"]["index"], 1)
+        self.assertEqual(inst[1]["cxxModuleBmiTarget"]["index"], 0)
+        self.assertEqual(inst[2]["exportTargets"][0]["index"], 1)
+
+        workflow = (runner.ROOT / ".github/workflows/ecosystem.yml").read_text(encoding="utf-8")
+        self.assertIn("from normalize import normalize_codemodel_abstract_target_ties", workflow)
+        self.assertNotIn("def normalize_abstract_ties(", workflow)
+
     def test_save_l1_hides_only_the_value_of_nondeterministic_cache_entries(self):
         log = self.root / "log"
         log.mkdir()

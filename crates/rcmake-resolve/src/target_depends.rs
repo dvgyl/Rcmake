@@ -1,0 +1,1331 @@
+//! Target-level build order (`cmComputeTargetDepends`).
+//!
+//! The graph has one node for each target in the build system, in directory and
+//! creation order. Its edges come from the link implementation, the transitive
+//! link interfaces, object library references, and the utility items of each
+//! target. Cycles among static libraries become one strongly connected component.
+//! The final graph orders the members of each component as a linked list and
+//! connects components from tail to head.
+
+use indexmap::{IndexMap, IndexSet};
+use rcmake_base::{BString, list, truth};
+use rcmake_diag::Backtrace;
+use rcmake_genex::{ConfigId, EvalContext, UsageTraversal};
+use rcmake_model::{CustomCommandKind, ProjectModel, Target, TargetId, TargetKind};
+
+use crate::sources::SourcePaths;
+use crate::usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver, handle};
+use crate::{BuildGraph, ResolveError, ResolvedTarget};
+
+/// One edge of the final target dependency graph (`cmTargetDepend`).
+#[derive(Clone, Debug)]
+pub struct TargetDepend {
+    /// The target that must build first.
+    pub target: TargetId,
+    /// `true` for a utility edge, `false` for a link edge.
+    pub strong: bool,
+    /// `true` when the dependency uses the command configuration.
+    pub cross: bool,
+    /// Where the project created the edge (empty for a linearization edge).
+    pub backtrace: Backtrace,
+}
+
+/// One utility item of a target (`cmGeneratorTarget::GetUtilityItems`).
+#[derive(Clone, Debug)]
+pub struct UtilityItem {
+    /// The target that the utility names. It can be an imported target.
+    pub target: TargetId,
+    /// `true` when the dependency uses the command configuration.
+    pub cross: bool,
+    /// Where the project named the utility (empty when CMake records none).
+    pub backtrace: Backtrace,
+}
+
+/// The target dependency graph of one generation.
+#[derive(Clone, Debug, Default)]
+pub struct TargetDependGraph {
+    nodes: Vec<TargetId>,
+    index: IndexMap<TargetId, usize>,
+    direct: Vec<Vec<TargetDepend>>,
+    utilities: IndexMap<TargetId, Vec<UtilityItem>>,
+    traced_sources: IndexMap<TargetId, Vec<BString>>,
+    source_paths: IndexMap<TargetId, IndexMap<BString, BString>>,
+}
+
+impl TargetDependGraph {
+    /// Targets in the build system, in `cmComputeTargetDepends::CollectTargets` order.
+    #[must_use]
+    pub fn targets(&self) -> &[TargetId] {
+        &self.nodes
+    }
+
+    /// Direct dependencies of `target` (`GetTargetDirectDepends`), one entry per
+    /// dependency, in final graph order. A repeated edge keeps the attributes of
+    /// its last occurrence, as `cmTargetDependSet` does.
+    #[must_use]
+    pub fn direct_depends(&self, target: TargetId) -> &[TargetDepend] {
+        self.index
+            .get(&target)
+            .and_then(|&node| self.direct.get(node))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// All utility items of `target`, in the order that the project created them.
+    #[must_use]
+    pub fn utility_items(&self, target: TargetId) -> &[UtilityItem] {
+        self.utilities.get(&target).map_or(&[], Vec::as_slice)
+    }
+
+    /// Utility items for the codemodel `orderDependencies`
+    /// (`cmFileAPICodemodel.cxx`): all utility items except reserved targets.
+    /// The target itself and imported targets stay.
+    pub fn order_dependencies<'a>(
+        &'a self,
+        model: &'a ProjectModel,
+        target: TargetId,
+    ) -> impl Iterator<Item = &'a UtilityItem> + 'a {
+        self.utility_items(target).iter().filter(move |item| {
+            model
+                .target(item.target)
+                .is_some_and(|dependency| !is_reserved_target(&dependency.name))
+        })
+    }
+
+    /// The full path that a source name of `target` resolves to
+    /// (`cmMakefile::GetSource`). A relative name resolves to an earlier
+    /// generated output in the binary directory before a file in the source
+    /// directory. `name` is one item of a `SOURCES` entry, as written.
+    #[must_use]
+    pub fn resolved_source(&self, target: TargetId, name: &[u8]) -> Option<&BString> {
+        self.source_paths.get(&target)?.get(name)
+    }
+
+    /// Sources that the dependency trace appends to the sources of `target`
+    /// (`cmGeneratorTarget::AddTracedSources`), in discovery order. Each entry is
+    /// the `MAIN_DEPENDENCY` of a custom command or `<output>.rule`.
+    #[must_use]
+    pub fn traced_sources(&self, target: TargetId) -> &[BString] {
+        self.traced_sources.get(&target).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// Return `true` for a name that a generator reserves
+/// (`cmGlobalGenerator::IsReservedTarget`).
+#[must_use]
+pub fn is_reserved_target(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"all"
+            | b"ALL_BUILD"
+            | b"help"
+            | b"install"
+            | b"INSTALL"
+            | b"preinstall"
+            | b"clean"
+            | b"edit_cache"
+            | b"rebuild_cache"
+            | b"ZERO_CHECK"
+    )
+}
+
+#[derive(Clone, Debug)]
+struct Edge {
+    to: usize,
+    strong: bool,
+    cross: bool,
+    backtrace: Backtrace,
+}
+
+type Graph = Vec<Vec<Edge>>;
+
+/// Compute the target dependency graph from the resolved targets and the
+/// lowered build graphs of all configurations.
+pub(crate) fn compute(
+    model: &ProjectModel,
+    configs: &[ConfigId],
+    (targets, graphs): (&[ResolvedTarget], &[BuildGraph]),
+    paths: &SourcePaths<'_>,
+    usage: &mut UsageResolver<'_>,
+) -> Result<TargetDependGraph, ResolveError> {
+    let mut graph = TargetDependGraph::default();
+    let mut by_dir = IndexMap::<_, Vec<TargetId>>::new();
+    for (id, target) in model.targets() {
+        if !target.is_imported() {
+            by_dir.entry(target.dir).or_default().push(id);
+        }
+    }
+    for (dir, _) in model.dirs() {
+        for &id in by_dir.get(&dir).into_iter().flatten() {
+            graph.index.insert(id, graph.nodes.len());
+            graph.nodes.push(id);
+        }
+    }
+    let resolved: IndexMap<(TargetId, &ConfigId), &ResolvedTarget> = targets
+        .iter()
+        .map(|target| ((target.id, &target.config), target))
+        .collect();
+    let link_items = LinkItems::collect(model, configs, &resolved, &graph.nodes, paths, usage)?;
+    let mut attached = IndexMap::<TargetId, Vec<rcmake_model::CommandId>>::new();
+    for (command_id, command) in model.commands() {
+        if let CustomCommandKind::Utility(owner)
+        | CustomCommandKind::TargetEvent { target: owner, .. } = command.kind
+        {
+            attached.entry(owner).or_default().push(command_id);
+        }
+    }
+    // An imported target is not a graph node, but a link to it follows its
+    // utility items (`AddTargetDepend` for a target outside the build system).
+    for (id, target) in model.targets() {
+        if target.is_imported() {
+            let utilities = utility_items(model, (id, target), &[], graphs);
+            if !utilities.is_empty() {
+                graph.utilities.insert(id, utilities);
+            }
+        }
+    }
+    for &id in &graph.nodes {
+        let Some(target) = model.target(id) else {
+            continue;
+        };
+        let commands = attached.get(&id).map_or(&[][..], Vec::as_slice);
+        let utilities = utility_items(model, (id, target), commands, graphs);
+        graph.utilities.insert(id, utilities);
+        let traced = traced_sources(model, id, target, graphs);
+        if !traced.is_empty() {
+            graph.traced_sources.insert(id, traced);
+        }
+        let dir = model.dir(target.dir);
+        let mut names = IndexMap::new();
+        for entry in &target.sources {
+            for name in list::split(&entry.value, list::Empty::Drop) {
+                if rcmake_genex::find_genex(&name).is_none()
+                    && !names.contains_key(&name)
+                    && let Some(path) = paths.find(dir, &name)
+                {
+                    names.insert(name, path);
+                }
+            }
+        }
+        if !names.is_empty() {
+            graph.source_paths.insert(id, names);
+        }
+    }
+    let mut collector = Collector {
+        model,
+        graph: &graph,
+        paths,
+        initial: vec![Vec::new(); graph.nodes.len()],
+        object_utilities: IndexMap::new(),
+    };
+    for (node, &id) in graph.nodes.iter().enumerate() {
+        collector.collect_target(node, id, &link_items, usage)?;
+    }
+    let initial = collector.initial;
+    for (id, owners) in collector.object_utilities {
+        let utilities = graph.utilities.entry(id).or_default();
+        for owner in owners {
+            if !utilities
+                .iter()
+                .any(|item| item.target == owner && !item.cross)
+            {
+                utilities.push(UtilityItem {
+                    target: owner,
+                    cross: false,
+                    backtrace: Backtrace::default(),
+                });
+            }
+        }
+    }
+    // The initial graph is the union of all configurations, so a cycle can
+    // exist here even when no single configuration has one.
+    check_components(
+        model,
+        &graph.nodes,
+        &initial,
+        &Components::compute(&initial),
+    )?;
+    let intermediate = intermediate_graph(model, &graph, targets, graphs, &initial);
+    let components = Components::compute(&intermediate);
+    check_components(model, &graph.nodes, &initial, &components)?;
+    graph.direct = final_graph(&initial, &components)
+        .map_err(|component| {
+            cycle_error(
+                model,
+                &graph.nodes,
+                &initial,
+                &components,
+                component,
+                "The component contains at least one cycle consisting of strong dependencies (created by add_dependencies) that cannot be broken.",
+            )
+        })?
+        .into_iter()
+        .map(|edges| {
+            let mut direct = IndexMap::<usize, Edge>::new();
+            for edge in edges {
+                direct.insert(edge.to, edge);
+            }
+            direct
+                .into_values()
+                .filter_map(|edge| {
+                    Some(TargetDepend {
+                        target: *graph.nodes.get(edge.to)?,
+                        strong: edge.strong,
+                        cross: edge.cross,
+                        backtrace: edge.backtrace,
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    Ok(graph)
+}
+
+/// The target items of one configuration's link implementation.
+struct ConfigLinks {
+    config: ConfigId,
+    /// `UseTo::Link` libraries with the backtrace of their entry.
+    link: Vec<(TargetId, Backtrace)>,
+    /// Object libraries of the `UseTo::Link` objects.
+    objects: Vec<TargetId>,
+    /// `UseTo::Compile` libraries.
+    compile: Vec<(TargetId, Backtrace)>,
+}
+
+/// Direct link items of each node for every configuration.
+#[derive(Default)]
+struct LinkItems {
+    implementation: IndexMap<TargetId, Vec<ConfigLinks>>,
+    /// Object libraries named by `$<TARGET_OBJECTS>` in the sources
+    /// (`GetExternalObjects`).
+    external_objects: IndexMap<TargetId, Vec<TargetId>>,
+}
+
+impl LinkItems {
+    fn collect(
+        model: &ProjectModel,
+        configs: &[ConfigId],
+        resolved: &IndexMap<(TargetId, &ConfigId), &ResolvedTarget>,
+        nodes: &[TargetId],
+        paths: &SourcePaths<'_>,
+        usage: &mut UsageResolver<'_>,
+    ) -> Result<Self, ResolveError> {
+        let mut items = Self::default();
+        for &id in nodes {
+            let Some(target) = model.target(id) else {
+                continue;
+            };
+            if !model.is_in_build_system(target) {
+                continue;
+            }
+            let mut external = IndexSet::new();
+            for entry in &target.sources {
+                for source in list::split(&entry.value, list::Empty::Drop) {
+                    if let Some(name) = source
+                        .strip_prefix(b"$<TARGET_OBJECTS:")
+                        .and_then(|name| name.strip_suffix(b">"))
+                        && let Some(owner) = model.find_target(target.dir, name)
+                    {
+                        external.insert(owner);
+                    }
+                }
+            }
+            items
+                .external_objects
+                .insert(id, external.into_iter().collect());
+            let mut per_config = Vec::new();
+            for config in configs {
+                let link_language = resolved
+                    .get(&(id, config))
+                    .and_then(|target| target.link.as_ref())
+                    .map(|link| link.language.clone());
+                let mut links = ConfigLinks {
+                    config: config.clone(),
+                    link: Vec::new(),
+                    objects: Vec::new(),
+                    compile: Vec::new(),
+                };
+                for traversal in [UsageTraversal::Link, UsageTraversal::Compile] {
+                    let ctx = EvalContext {
+                        config: config.clone(),
+                        traversal,
+                        link_language: link_language.clone(),
+                        ..EvalContext::default()
+                    };
+                    for item in usage.direct_link_items(id, false, &ctx)?.iter() {
+                        let owner = object_owner(item, paths);
+                        if traversal == UsageTraversal::Link
+                            && let Some(owner) = owner
+                        {
+                            links.objects.push(owner);
+                        }
+                        if item.kind == ResolvedLinkKind::ObjectFile {
+                            continue;
+                        }
+                        let found = item.targets().map(|dep| (dep, item.text.backtrace.clone()));
+                        if traversal == UsageTraversal::Link {
+                            links.link.extend(found);
+                        } else {
+                            links.compile.extend(found);
+                        }
+                    }
+                }
+                per_config.push(links);
+            }
+            items.implementation.insert(id, per_config);
+        }
+        Ok(items)
+    }
+}
+
+/// Collect the utility items of one target.
+fn utility_items(
+    model: &ProjectModel,
+    (id, target): (TargetId, &Target),
+    commands: &[rcmake_model::CommandId],
+    graphs: &[BuildGraph],
+) -> Vec<UtilityItem> {
+    // `cmTarget::Utilities` is keyed by name and cross flag. The first entry keeps its backtrace.
+    let mut items = IndexMap::<(TargetId, bool), Backtrace>::new();
+    let mut add = |dependency: TargetId, cross: bool, backtrace: &Backtrace| {
+        items
+            .entry((dependency, cross))
+            .or_insert_with(|| backtrace.clone());
+    };
+    for entry in &target.utility_deps {
+        if let Some(dependency) = model.find_target(target.dir, &entry.value) {
+            add(dependency, false, &entry.backtrace);
+        }
+    }
+    for &command_id in commands {
+        let Some(command) = model.command(command_id) else {
+            continue;
+        };
+        for graph in graphs {
+            add_command_utilities(graph, command_id, &command.backtrace, &mut add);
+        }
+    }
+    for graph in graphs {
+        for step in graph.custom_source_steps.get(&id).into_iter().flatten() {
+            let Some(command_id) = graph
+                .custom_output_owners
+                .get(step)
+                .map(|owners| owners.command)
+            else {
+                continue;
+            };
+            let Some(command) = model
+                .command(command_id)
+                .filter(|command| command.dir == target.dir)
+            else {
+                continue;
+            };
+            match command.kind {
+                CustomCommandKind::Utility(owner)
+                | CustomCommandKind::TargetEvent { target: owner, .. }
+                    if owner != id =>
+                {
+                    // A source that another target's command writes (`FollowName`).
+                    add(owner, false, &Backtrace::default());
+                }
+                _ => {}
+            }
+            add_command_utilities(graph, command_id, &command.backtrace, &mut add);
+        }
+    }
+    if let Some(reuse) = target
+        .props
+        .get(b"PRECOMPILE_HEADERS_REUSE_FROM")
+        .and_then(|name| model.find_target(target.dir, name))
+    {
+        add(reuse, false, &Backtrace::default());
+    }
+    items
+        .into_iter()
+        .map(|((target, cross), backtrace)| UtilityItem {
+            target,
+            cross,
+            backtrace,
+        })
+        .collect()
+}
+
+/// Add the utilities of one command: programs and generator expression targets
+/// first, then `DEPENDS` targets without a backtrace (`CheckCustomCommand`).
+fn add_command_utilities(
+    graph: &BuildGraph,
+    command: rcmake_model::CommandId,
+    backtrace: &Backtrace,
+    add: &mut impl FnMut(TargetId, bool, &Backtrace),
+) {
+    let Some(utilities) = graph.command_utilities.get(&command) else {
+        return;
+    };
+    for &dependency in &utilities.commands {
+        add(dependency, true, backtrace);
+    }
+    for &dependency in &utilities.depends {
+        add(dependency, true, &Backtrace::default());
+    }
+}
+
+/// Sources that the trace appends to a target (`cmTargetTraceDependencies`).
+/// The trace looks up outputs only in the directory of the target.
+fn traced_sources(
+    model: &ProjectModel,
+    id: TargetId,
+    target: &Target,
+    graphs: &[BuildGraph],
+) -> Vec<BString> {
+    let mut sources = IndexSet::new();
+    for graph in graphs {
+        for step in graph.custom_source_steps.get(&id).into_iter().flatten() {
+            let Some(owners) = graph.custom_output_owners.get(step) else {
+                continue;
+            };
+            let Some(command) = model
+                .command(owners.command)
+                .filter(|command| command.dir == target.dir)
+            else {
+                continue;
+            };
+            if let Some(main) = graph.custom_main_sources.get(step) {
+                sources.insert(main.clone());
+                continue;
+            }
+            let Some(crate::BuildStep::Custom(custom)) = graph.steps.get(*step) else {
+                continue;
+            };
+            let (Some(output), false) = (custom.outputs.first(), command.outputs.is_empty()) else {
+                continue;
+            };
+            let root = &model.dir(rcmake_model::DirId::ROOT).binary_dir;
+            let mut rule = crate::sources::absolute_path(root, output);
+            rule.extend_from_slice(b".rule");
+            sources.insert(rule);
+        }
+    }
+    sources.into_iter().collect()
+}
+
+/// Return the object library of an `Objects` item or of an object file path.
+fn object_owner(item: &ResolvedLinkItem, paths: &SourcePaths<'_>) -> Option<TargetId> {
+    match item.kind {
+        ResolvedLinkKind::Objects(owner) => Some(owner),
+        ResolvedLinkKind::ObjectFile => paths.object_owner(&item.text.value),
+        _ => None,
+    }
+}
+
+struct Collector<'a> {
+    model: &'a ProjectModel,
+    graph: &'a TargetDependGraph,
+    paths: &'a SourcePaths<'a>,
+    initial: Graph,
+    /// Object libraries that `AddObjectDepends` adds as utilities of the depender.
+    object_utilities: IndexMap<TargetId, Vec<TargetId>>,
+}
+
+type Emitted = IndexSet<(TargetId, bool)>;
+
+impl Collector<'_> {
+    fn in_build_system(&self, id: TargetId) -> bool {
+        self.model
+            .target(id)
+            .is_some_and(|target| self.model.is_in_build_system(target))
+    }
+
+    fn executable_without_exports(&self, id: TargetId) -> bool {
+        self.model.target(id).is_some_and(|target| {
+            target.kind == TargetKind::Executable
+                && !target
+                    .props
+                    .get(b"ENABLE_EXPORTS")
+                    .is_some_and(|value| truth::is_on(value))
+        })
+    }
+
+    fn links_objects(&self, id: TargetId) -> bool {
+        self.model.target(id).is_some_and(|target| {
+            matches!(
+                target.kind,
+                TargetKind::Executable
+                    | TargetKind::StaticLibrary
+                    | TargetKind::SharedLibrary
+                    | TargetKind::ModuleLibrary
+                    | TargetKind::ObjectLibrary
+            )
+        })
+    }
+
+    fn collect_target(
+        &mut self,
+        node: usize,
+        id: TargetId,
+        link_items: &LinkItems,
+        usage: &mut UsageResolver<'_>,
+    ) -> Result<(), ResolveError> {
+        if !self.in_build_system(id) {
+            return Ok(());
+        }
+        let mut emitted = Emitted::new();
+        emitted.insert((id, false));
+        emitted.insert((id, true));
+        for links in link_items.implementation.get(&id).into_iter().flatten() {
+            for (dependency, backtrace) in &links.link {
+                let dependency = (*dependency, backtrace);
+                self.add_link_depend(node, id, dependency, &links.config, &mut emitted, usage)?;
+            }
+            for &owner in &links.objects {
+                self.add_object_depends(id, owner, &mut emitted);
+            }
+            for (dependency, backtrace) in &links.compile {
+                let dependency = (*dependency, backtrace);
+                self.add_link_depend(node, id, dependency, &links.config, &mut emitted, usage)?;
+            }
+            for &owner in link_items.external_objects.get(&id).into_iter().flatten() {
+                self.add_object_depends(id, owner, &mut emitted);
+            }
+        }
+        let mut emitted = Emitted::new();
+        emitted.insert((id, false));
+        emitted.insert((id, true));
+        let objects = self.object_utilities.get(&id).cloned().unwrap_or_default();
+        let extra = objects.into_iter().map(|target| UtilityItem {
+            target,
+            cross: false,
+            backtrace: Backtrace::default(),
+        });
+        let items: Vec<_> = self
+            .graph
+            .utility_items(id)
+            .iter()
+            .cloned()
+            .chain(extra)
+            .collect();
+        for item in &items {
+            if emitted.insert((item.target, item.cross)) {
+                self.add_target_depend(
+                    node,
+                    item.target,
+                    &item.backtrace,
+                    false,
+                    item.cross,
+                    &mut emitted,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn add_link_depend(
+        &mut self,
+        node: usize,
+        depender: TargetId,
+        (dependency, backtrace): (TargetId, &Backtrace),
+        config: &ConfigId,
+        emitted: &mut Emitted,
+        usage: &mut UsageResolver<'_>,
+    ) -> Result<(), ResolveError> {
+        if emitted.insert((dependency, false)) {
+            self.add_target_depend(node, dependency, backtrace, true, false, emitted);
+            self.add_interface_depends(
+                node, depender, dependency, backtrace, config, emitted, usage,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `AddObjectDepends`: an object library that is not already a link item
+    /// becomes a utility of the depender.
+    fn add_object_depends(&mut self, depender: TargetId, owner: TargetId, emitted: &mut Emitted) {
+        if self.links_objects(depender) && emitted.insert((owner, false)) {
+            self.object_utilities
+                .entry(depender)
+                .or_default()
+                .push(owner);
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The walk carries the depender, the dependee, and its link context."
+    )]
+    fn add_interface_depends(
+        &mut self,
+        node: usize,
+        depender: TargetId,
+        dependee: TargetId,
+        backtrace: &Backtrace,
+        config: &ConfigId,
+        emitted: &mut Emitted,
+        usage: &mut UsageResolver<'_>,
+    ) -> Result<(), ResolveError> {
+        let ctx = EvalContext {
+            config: config.clone(),
+            traversal: UsageTraversal::Link,
+            head: Some(handle(depender)),
+            ..EvalContext::default()
+        };
+        if self.executable_without_exports(dependee) {
+            return Ok(());
+        }
+        // Each frame is one link interface and the position of its next item.
+        let mut stack = vec![(usage.direct_link_items(dependee, true, &ctx)?, 0usize)];
+        while let Some((items, position)) = stack.last_mut() {
+            let Some(item) = items.get(*position).cloned() else {
+                stack.pop();
+                continue;
+            };
+            *position += 1;
+            // `$<TARGET_OBJECTS>` in a link interface is an object item
+            // (`cmLinkInterface::Objects`); a linked object library is a library.
+            if item.kind == ResolvedLinkKind::ObjectFile {
+                if let Some(owner) = object_owner(&item, self.paths) {
+                    self.add_object_depends(depender, owner, emitted);
+                }
+                continue;
+            }
+            for dependency in item.targets() {
+                if !emitted.insert((dependency, false)) {
+                    continue;
+                }
+                self.add_target_depend(node, dependency, backtrace, true, false, emitted);
+                if !self.executable_without_exports(dependency)
+                    && self.model.target(dependency).is_some()
+                {
+                    stack.push((usage.direct_link_items(dependency, true, &ctx)?, 0));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_target_depend(
+        &mut self,
+        node: usize,
+        dependee: TargetId,
+        backtrace: &Backtrace,
+        linking: bool,
+        cross: bool,
+        emitted: &mut Emitted,
+    ) {
+        if linking && self.executable_without_exports(dependee) {
+            return;
+        }
+        if !self.in_build_system(dependee) {
+            // Follow the utilities of a target that is not in the build system.
+            let mut pending: Vec<_> = self.graph.utility_items(dependee).iter().rev().collect();
+            while let Some(item) = pending.pop() {
+                if !emitted.insert((item.target, item.cross)) {
+                    continue;
+                }
+                if self.in_build_system(item.target) {
+                    self.push_edge(node, item.target, &item.backtrace, false, item.cross);
+                } else {
+                    pending.extend(self.graph.utility_items(item.target).iter().rev());
+                }
+            }
+            return;
+        }
+        self.push_edge(node, dependee, backtrace, linking, cross);
+    }
+
+    fn push_edge(
+        &mut self,
+        node: usize,
+        dependee: TargetId,
+        backtrace: &Backtrace,
+        linking: bool,
+        cross: bool,
+    ) {
+        if let (Some(&to), Some(edges)) =
+            (self.graph.index.get(&dependee), self.initial.get_mut(node))
+        {
+            edges.push(Edge {
+                to,
+                strong: !linking,
+                cross,
+                backtrace: backtrace.clone(),
+            });
+        }
+    }
+}
+
+/// Apply `OPTIMIZE_DEPENDENCIES` to static and object libraries
+/// (`ComputeIntermediateGraph`).
+fn intermediate_graph(
+    model: &ProjectModel,
+    graph: &TargetDependGraph,
+    targets: &[ResolvedTarget],
+    graphs: &[BuildGraph],
+    initial: &Graph,
+) -> Graph {
+    let optimized: Vec<bool> = graph
+        .nodes
+        .iter()
+        .map(|&id| {
+            model.target(id).is_some_and(|target| {
+                matches!(
+                    target.kind,
+                    TargetKind::StaticLibrary | TargetKind::ObjectLibrary
+                ) && target
+                    .props
+                    .get(b"OPTIMIZE_DEPENDENCIES")
+                    .is_some_and(|value| truth::is_on(value))
+            })
+        })
+        .collect();
+    if !optimized.contains(&true) {
+        return initial.clone();
+    }
+    let languages: Vec<IndexSet<BString>> = graph
+        .nodes
+        .iter()
+        .map(|&id| {
+            targets
+                .iter()
+                .filter(|target| target.id == id)
+                .flat_map(|target| {
+                    target
+                        .compile_groups
+                        .iter()
+                        .map(|group| group.language.clone())
+                })
+                .collect()
+        })
+        .collect();
+    let side_effects = SideEffects::collect(model, graph, graphs, initial, &languages);
+    initial
+        .iter()
+        .enumerate()
+        .map(|(node, edges)| {
+            if !optimized.get(node).copied().unwrap_or(false) {
+                return edges.clone();
+            }
+            let mut output = Vec::new();
+            let mut emitted = IndexSet::new();
+            for edge in edges {
+                if edge.strong {
+                    output.push(edge.clone());
+                    continue;
+                }
+                let Some(effects) = side_effects.get(edge.to) else {
+                    continue;
+                };
+                let language_effects = languages
+                    .get(node)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|language| effects.languages.get(language).into_iter().flatten());
+                for &dependency in effects.custom.iter().chain(language_effects) {
+                    if emitted.insert(dependency) {
+                        output.push(Edge {
+                            to: dependency,
+                            strong: false,
+                            cross: edge.cross,
+                            backtrace: edge.backtrace.clone(),
+                        });
+                    }
+                }
+            }
+            output
+        })
+        .collect()
+}
+
+#[derive(Clone, Default)]
+struct SideEffects {
+    custom: IndexSet<usize>,
+    languages: IndexMap<BString, IndexSet<usize>>,
+}
+
+impl SideEffects {
+    fn collect(
+        model: &ProjectModel,
+        graph: &TargetDependGraph,
+        graphs: &[BuildGraph],
+        initial: &Graph,
+        languages: &[IndexSet<BString>],
+    ) -> Vec<Self> {
+        let own: Vec<Self> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(node, &id)| {
+                let mut effects = Self::default();
+                let commands = model.commands().any(|(_, command)| match command.kind {
+                    CustomCommandKind::TargetEvent { target, .. }
+                    | CustomCommandKind::Utility(target) => target == id,
+                    CustomCommandKind::Output => false,
+                }) || graphs.iter().any(|graph| {
+                    graph
+                        .custom_source_steps
+                        .get(&id)
+                        .is_some_and(|steps| !steps.is_empty())
+                });
+                if commands {
+                    effects.custom.insert(node);
+                }
+                for language in languages.get(node).into_iter().flatten() {
+                    if !matches!(
+                        language.as_slice(),
+                        b"ASM"
+                            | b"ASM-ATT"
+                            | b"ASM_MASM"
+                            | b"ASM_NASM"
+                            | b"ASM_MARMASM"
+                            | b"C"
+                            | b"CSharp"
+                            | b"CUDA"
+                            | b"CXX"
+                            | b"HIP"
+                            | b"ISPC"
+                            | b"OBJC"
+                            | b"OBJCXX"
+                            | b"RC"
+                            | b"Swift"
+                    ) {
+                        effects
+                            .languages
+                            .entry(language.clone())
+                            .or_default()
+                            .insert(node);
+                    }
+                }
+                effects
+            })
+            .collect();
+        // Propagate along the initial graph in post order (`CollectSideEffectsForTarget`).
+        let mut result: Vec<Option<Self>> = vec![None; own.len()];
+        for start in 0..own.len() {
+            let mut stack = vec![(start, 0usize)];
+            let mut on_stack = IndexSet::from([start]);
+            while let Some(&mut (node, ref mut next)) = stack.last_mut() {
+                if result.get(node).is_some_and(Option::is_some) {
+                    stack.pop();
+                    continue;
+                }
+                let edges = initial.get(node).map_or(&[][..], Vec::as_slice);
+                if let Some(edge) = edges.get(*next) {
+                    *next += 1;
+                    if result.get(edge.to).is_some_and(Option::is_none) && on_stack.insert(edge.to)
+                    {
+                        stack.push((edge.to, 0));
+                    }
+                    continue;
+                }
+                let mut effects = own.get(node).cloned().unwrap_or_default();
+                for edge in edges {
+                    if let Some(Some(dependency)) = result.get(edge.to) {
+                        effects.custom.extend(dependency.custom.iter().copied());
+                        for (language, targets) in &dependency.languages {
+                            effects
+                                .languages
+                                .entry(language.clone())
+                                .or_default()
+                                .extend(targets.iter().copied());
+                        }
+                    }
+                }
+                if let Some(slot) = result.get_mut(node) {
+                    *slot = Some(effects);
+                }
+                stack.pop();
+            }
+        }
+        result.into_iter().map(Option::unwrap_or_default).collect()
+    }
+}
+
+/// Strongly connected components (`cmComputeComponentGraph`, Tarjan).
+struct Components {
+    /// Members of each component, sorted by node index.
+    members: Vec<Vec<usize>>,
+    /// Component of each node.
+    map: Vec<usize>,
+    /// Inter-component edges with multiplicity.
+    edges: Vec<Vec<Edge>>,
+}
+
+impl Components {
+    fn compute(graph: &Graph) -> Self {
+        const UNSET: usize = usize::MAX;
+        let n = graph.len();
+        let mut root = vec![0usize; n];
+        let mut visit_index = vec![0usize; n];
+        let mut component = vec![UNSET; n];
+        let mut visited = vec![0usize; n];
+        let mut members: Vec<Vec<usize>> = Vec::new();
+        let mut walk = 0usize;
+        for start in 0..n {
+            if visited.get(start).copied().unwrap_or(1) != 0 {
+                continue;
+            }
+            walk += 1;
+            let mut counter = 0usize;
+            let mut stack = Vec::new();
+            let mut frames = vec![(start, 0usize)];
+            enter(
+                start,
+                walk,
+                &mut counter,
+                &mut visited,
+                &mut root,
+                &mut visit_index,
+                &mut component,
+                &mut stack,
+            );
+            while let Some(&mut (node, ref mut next)) = frames.last_mut() {
+                let edges = graph.get(node).map_or(&[][..], Vec::as_slice);
+                if let Some(edge) = edges.get(*next) {
+                    let j = edge.to;
+                    let state = visited.get(j).copied().unwrap_or(walk);
+                    if state > 0 && state < walk {
+                        *next += 1;
+                        continue;
+                    }
+                    if state == 0 {
+                        enter(
+                            j,
+                            walk,
+                            &mut counter,
+                            &mut visited,
+                            &mut root,
+                            &mut visit_index,
+                            &mut component,
+                            &mut stack,
+                        );
+                        frames.push((j, 0));
+                        continue;
+                    }
+                    *next += 1;
+                    improve_root(node, j, &mut root, &visit_index, &component);
+                    continue;
+                }
+                frames.pop();
+                if root.get(node) == Some(&node) {
+                    let index = members.len();
+                    let mut list = Vec::new();
+                    while let Some(member) = stack.pop() {
+                        if let Some(slot) = component.get_mut(member) {
+                            *slot = index;
+                        }
+                        if let Some(slot) = root.get_mut(member) {
+                            *slot = node;
+                        }
+                        list.push(member);
+                        if member == node {
+                            break;
+                        }
+                    }
+                    list.sort_unstable();
+                    members.push(list);
+                }
+                if let Some(&mut (parent, ref mut next)) = frames.last_mut() {
+                    *next += 1;
+                    improve_root(parent, node, &mut root, &visit_index, &component);
+                }
+            }
+        }
+        let mut edges = vec![Vec::new(); members.len()];
+        for (i, list) in graph.iter().enumerate() {
+            let from = component.get(i).copied().unwrap_or(UNSET);
+            for edge in list {
+                let to = component.get(edge.to).copied().unwrap_or(UNSET);
+                if from != to
+                    && let Some(out) = edges.get_mut(from)
+                {
+                    out.push(Edge { to, ..edge.clone() });
+                }
+            }
+        }
+        Self {
+            members,
+            map: component,
+            edges,
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tarjan state is split into parallel vectors."
+)]
+fn enter(
+    node: usize,
+    walk: usize,
+    counter: &mut usize,
+    visited: &mut [usize],
+    root: &mut [usize],
+    visit_index: &mut [usize],
+    component: &mut [usize],
+    stack: &mut Vec<usize>,
+) {
+    *counter += 1;
+    if let Some(slot) = visited.get_mut(node) {
+        *slot = walk;
+    }
+    if let Some(slot) = root.get_mut(node) {
+        *slot = node;
+    }
+    if let Some(slot) = component.get_mut(node) {
+        *slot = usize::MAX;
+    }
+    if let Some(slot) = visit_index.get_mut(node) {
+        *slot = *counter;
+    }
+    stack.push(node);
+}
+
+fn improve_root(
+    node: usize,
+    dependee: usize,
+    root: &mut [usize],
+    visit_index: &[usize],
+    component: &[usize],
+) {
+    if component.get(dependee) != Some(&usize::MAX) {
+        return;
+    }
+    let (Some(&dependee_root), Some(&node_root)) = (root.get(dependee), root.get(node)) else {
+        return;
+    };
+    if visit_index.get(dependee_root) < visit_index.get(node_root)
+        && let Some(slot) = root.get_mut(node)
+    {
+        *slot = dependee_root;
+    }
+}
+
+/// Reject a non-trivial component that is not only static libraries, or any
+/// non-trivial component when `GLOBAL_DEPENDS_NO_CYCLES` is on
+/// (`CheckComponents`).
+fn check_components(
+    model: &ProjectModel,
+    nodes: &[TargetId],
+    initial: &Graph,
+    components: &Components,
+) -> Result<(), ResolveError> {
+    let no_cycles = model
+        .global
+        .props
+        .get(b"GLOBAL_DEPENDS_NO_CYCLES")
+        .is_some_and(|value| truth::is_on(value));
+    for (index, members) in components.members.iter().enumerate() {
+        if members.len() < 2 {
+            continue;
+        }
+        let reason = if no_cycles {
+            "The GLOBAL_DEPENDS_NO_CYCLES global property is enabled, so cyclic dependencies are not allowed even among static libraries."
+        } else if members.iter().any(|&member| {
+            nodes
+                .get(member)
+                .and_then(|&id| model.target(id))
+                .is_none_or(|target| target.kind != TargetKind::StaticLibrary)
+        }) {
+            "At least one of these targets is not a STATIC_LIBRARY.  Cyclic dependencies are allowed only among static libraries."
+        } else {
+            continue;
+        };
+        return Err(cycle_error(
+            model, nodes, initial, components, index, reason,
+        ));
+    }
+    Ok(())
+}
+
+/// The message of `ComplainAboutBadComponent`. It lists the initial edges of
+/// each member that stay inside the component.
+fn cycle_error(
+    model: &ProjectModel,
+    nodes: &[TargetId],
+    initial: &Graph,
+    components: &Components,
+    component: usize,
+    reason: &str,
+) -> ResolveError {
+    use std::fmt::Write as _;
+    let mut message = String::from(
+        "The inter-target dependency graph contains the following strongly connected component (cycle):\n",
+    );
+    let name = |node: usize| nodes.get(node).and_then(|&id| model.target(id));
+    for &member in components.members.get(component).into_iter().flatten() {
+        let Some(depender) = name(member) else {
+            continue;
+        };
+        let _ = writeln!(
+            message,
+            "  \"{}\" of type {}",
+            depender.name,
+            depender.kind.as_str()
+        );
+        for edge in initial.get(member).into_iter().flatten() {
+            if components.map.get(edge.to) == Some(&component)
+                && let Some(dependee) = name(edge.to)
+            {
+                let strength = if edge.strong { "strong" } else { "weak" };
+                let _ = writeln!(message, "    depends on \"{}\" ({strength})", dependee.name);
+            }
+        }
+    }
+    message.push_str(reason);
+    ResolveError::Message(BString::from(message))
+}
+
+/// Linearize each component and connect components (`ComputeFinalDepends`).
+/// The error is the index of a component whose strong edges form a cycle.
+fn final_graph(initial: &Graph, components: &Components) -> Result<Graph, usize> {
+    let mut graph: Graph = vec![Vec::new(); initial.len()];
+    let mut heads = vec![usize::MAX; components.members.len()];
+    let mut tails = vec![usize::MAX; components.members.len()];
+    for (index, members) in components.members.iter().enumerate() {
+        let mut head = usize::MAX;
+        let mut emitted = IndexSet::new();
+        for &member in members.iter().rev() {
+            let linked = intra_component(
+                (initial, components, index),
+                member,
+                &mut head,
+                &mut emitted,
+                &mut graph,
+                tails.get_mut(index),
+            );
+            if !linked {
+                return Err(index);
+            }
+        }
+        if let Some(slot) = heads.get_mut(index) {
+            *slot = head;
+        }
+    }
+    for (component, edges) in components.edges.iter().enumerate() {
+        let Some(&tail) = tails.get(component) else {
+            continue;
+        };
+        for edge in edges {
+            if let (Some(&head), Some(out)) = (heads.get(edge.to), graph.get_mut(tail)) {
+                out.push(Edge {
+                    to: head,
+                    ..edge.clone()
+                });
+            }
+        }
+    }
+    Ok(graph)
+}
+
+/// Walk the strong edges inside one component from `root` in post order and
+/// prepend each new node to the linked list that starts at `head`
+/// (`IntraComponent`). The walk uses an explicit stack. Return `false` when the
+/// walk reaches a node a second time, as CMake does.
+fn intra_component(
+    (initial, components, component): (&Graph, &Components, usize),
+    root: usize,
+    head: &mut usize,
+    emitted: &mut IndexSet<usize>,
+    graph: &mut Graph,
+    mut tail: Option<&mut usize>,
+) -> bool {
+    let mut visited = IndexSet::new();
+    let mut enter = |node: usize, emitted: &mut IndexSet<usize>| -> Option<bool> {
+        if !visited.insert(node) {
+            return None;
+        }
+        Some(emitted.insert(node))
+    };
+    // Each frame is a node and the position of its next initial edge.
+    let mut frames = Vec::new();
+    match enter(root, emitted) {
+        None => return false,
+        Some(true) => frames.push((root, 0usize)),
+        Some(false) => {}
+    }
+    while let Some(&mut (node, ref mut next)) = frames.last_mut() {
+        let edges = initial.get(node).map_or(&[][..], Vec::as_slice);
+        if let Some(edge) = edges.get(*next) {
+            *next += 1;
+            if !edge.strong || components.map.get(edge.to) != Some(&component) {
+                continue;
+            }
+            if let Some(out) = graph.get_mut(node) {
+                out.push(edge.clone());
+            }
+            match enter(edge.to, emitted) {
+                None => return false,
+                Some(true) => frames.push((edge.to, 0)),
+                Some(false) => {}
+            }
+            continue;
+        }
+        frames.pop();
+        if *head == usize::MAX {
+            if let Some(tail) = tail.as_deref_mut() {
+                *tail = node;
+            }
+        } else if let Some(out) = graph.get_mut(node) {
+            out.push(Edge {
+                to: *head,
+                strong: false,
+                cross: false,
+                backtrace: Backtrace::default(),
+            });
+        }
+        *head = node;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edge(to: usize, strong: bool) -> Edge {
+        Edge {
+            to,
+            strong,
+            cross: false,
+            backtrace: Backtrace::default(),
+        }
+    }
+
+    #[test]
+    fn linearization_of_a_very_deep_strong_chain_uses_no_recursion() {
+        const COUNT: usize = 200_000;
+        // Node `i` depends strongly on `i - 1`; node 0 closes the cycle weakly.
+        let mut initial: Graph = (0..COUNT)
+            .map(|node| {
+                node.checked_sub(1)
+                    .map(|dep| edge(dep, true))
+                    .into_iter()
+                    .collect()
+            })
+            .collect();
+        if let Some(first) = initial.first_mut() {
+            first.push(edge(COUNT - 1, false));
+        }
+        let components = Components::compute(&initial);
+        assert_eq!(components.members.len(), 1);
+        let Ok(graph) = final_graph(&initial, &components) else {
+            panic!("the chain has no strong cycle");
+        };
+        assert!(graph.first().is_some_and(Vec::is_empty));
+        for (node, edges) in graph.iter().enumerate().skip(1) {
+            let targets: Vec<_> = edges.iter().map(|edge| (edge.to, edge.strong)).collect();
+            assert_eq!(targets, [(node - 1, true), (node - 1, false)]);
+        }
+    }
+
+    #[test]
+    fn strong_diamond_inside_a_component_fails_as_in_cmake() {
+        // `IntraComponent` keeps `visited` for the whole walk from one root.
+        // The walk starts at the last member: 3 -> 2 -> 0, then 3 -> 1 -> 0.
+        let initial: Graph = vec![
+            vec![edge(3, false)],
+            vec![edge(0, true)],
+            vec![edge(0, true)],
+            vec![edge(2, true), edge(1, true)],
+        ];
+        let components = Components::compute(&initial);
+        assert_eq!(final_graph(&initial, &components).err(), Some(0));
+    }
+}

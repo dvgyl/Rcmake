@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use rcmake_base::BString;
-use rcmake_diag::Backtrace;
+use rcmake_diag::{Backtrace, Frame};
 use rcmake_model::BT;
 
 use super::super::{Members, Object, UInt, Value, array, members, object, relative, strings};
@@ -42,33 +42,39 @@ impl<'a> Backtraces<'a> {
 
     pub(super) fn add(&mut self, trace: &Backtrace) -> Option<usize> {
         let frames: Vec<_> = trace.frames().collect();
-        let mut parent = None;
-        for frame in frames.into_iter().rev() {
-            let file = intern(
-                &mut self.files,
-                &mut self.file_indexes,
-                relative(&frame.file, self.source),
-            );
-            let command = frame
-                .name
-                .as_deref()
-                .map(|name| intern_slice(&mut self.commands, &mut self.command_indexes, name));
-            if parent.is_none() && frame.line != 0 {
-                parent = Some(self.node(BacktraceNode {
-                    file,
-                    line: 0,
-                    command: None,
-                    parent: None,
-                }));
-            }
-            parent = Some(self.node(BacktraceNode {
+        self.add_frames(&frames)
+    }
+
+    fn add_frames(&mut self, frames: &[&Frame]) -> Option<usize> {
+        let (&top, rest) = frames.split_first()?;
+        let file = intern(
+            &mut self.files,
+            &mut self.file_indexes,
+            relative(&top.file, self.source),
+        );
+        let command = top
+            .name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .map(|name| intern_slice(&mut self.commands, &mut self.command_indexes, name));
+        let parent = if !rest.is_empty() {
+            self.add_frames(rest)
+        } else if top.line != 0 {
+            Some(self.node(BacktraceNode {
                 file,
-                line: frame.line,
-                command,
-                parent,
-            }));
-        }
-        parent
+                line: 0,
+                command: None,
+                parent: None,
+            }))
+        } else {
+            None
+        };
+        Some(self.node(BacktraceNode {
+            file,
+            line: top.line,
+            command,
+            parent,
+        }))
     }
 
     fn node(&mut self, node: BacktraceNode) -> usize {

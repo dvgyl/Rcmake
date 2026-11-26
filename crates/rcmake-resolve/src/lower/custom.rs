@@ -43,6 +43,9 @@ pub(super) struct Commands<'a> {
     dependencies: Vec<IndexSet<TargetId>>,
     command_steps: IndexMap<CommandId, usize>,
     step_has_output: IndexSet<usize>,
+    /// Targets that each command names (`cmCustomCommandGenerator::GetUtilities`
+    /// and target `DEPENDS`), imported targets and the owning target included.
+    pub(super) utilities: std::sync::Mutex<IndexMap<CommandId, crate::CommandUtilities>>,
 }
 
 /// Combine the errors of several commands into one error, in order.
@@ -81,6 +84,7 @@ pub(crate) fn validate_custom_commands(
         dependencies: Vec::new(),
         command_steps: IndexMap::new(),
         step_has_output: IndexSet::new(),
+        utilities: std::sync::Mutex::default(),
     };
     for (id, command) in model.commands() {
         if let Err(error) = commands.lower_command(id, command, &mut usage) {
@@ -138,6 +142,7 @@ impl<'a> Commands<'a> {
             dependencies: Vec::new(),
             command_steps: IndexMap::new(),
             step_has_output: IndexSet::new(),
+            utilities: std::sync::Mutex::default(),
         };
         let mut errors = Vec::new();
         for (id, command) in model
@@ -270,9 +275,16 @@ impl<'a> Commands<'a> {
         let outputs = eval.paths(binary, &command.outputs)?;
         let byproducts = eval.paths(binary, &command.byproducts)?;
         eval.context.config = argument_config.clone();
-        let working_dir = eval
-            .optional(&command.working_directory)?
-            .map_or_else(|| binary.clone(), |dir| join(binary, &dir));
+        let working_dir = eval.optional(&command.working_directory)?.map_or_else(
+            || binary.clone(),
+            |dir| {
+                if dir.is_empty() {
+                    binary.clone()
+                } else {
+                    super::collapse(binary, &dir)
+                }
+            },
+        );
         let ninja_posix = self.model.generator.is_some_and(GeneratorKind::is_ninja)
             && !super::shell::windows_host(self.model, command.dir);
         let working_dir = (!working_dir.is_empty()
@@ -362,11 +374,15 @@ impl<'a> Commands<'a> {
                 artifact_dependencies
                     .borrow_mut()
                     .insert((id, command_config.clone()));
-                *program = file;
+                let crosscompiling = definition(self.model, command.dir, b"CMAKE_CROSSCOMPILING")
+                    .is_some_and(|value| truth::is_on(value));
+                let emulator = target.props.get(b"CROSSCOMPILING_EMULATOR");
+                if target.is_imported() || emulator.is_some() || !crosscompiling {
+                    *program = file;
+                }
                 if !target.is_imported()
-                    && definition(self.model, command.dir, b"CMAKE_CROSSCOMPILING")
-                        .is_some_and(|value| truth::is_on(value))
-                    && let Some(emulator) = target.props.get(b"CROSSCOMPILING_EMULATOR")
+                    && crosscompiling
+                    && let Some(emulator) = emulator
                 {
                     eval.context.config = command_config.clone();
                     let emulator = eval.value(emulator)?;
@@ -392,6 +408,19 @@ impl<'a> Commands<'a> {
             .write_warnings(errors.into_iter().map(|warning| warning.to_string().into()));
         eval.host.deferred_warnings = None;
         let mut artifact_dependencies = artifact_dependencies.into_inner();
+        {
+            let mut utilities = self
+                .utilities
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let utilities = utilities.entry(id).or_default();
+            utilities
+                .commands
+                .extend(artifact_dependencies.iter().map(|(target, _)| *target));
+            utilities
+                .depends
+                .extend(target_dependencies.iter().map(|(target, _)| *target));
+        }
         let mut next = 0;
         while let Some((id, config)) = artifact_dependencies.get_index(next).cloned() {
             next += 1;
@@ -534,8 +563,11 @@ impl<'a> Commands<'a> {
         id: TargetId,
         events: &[Option<TargetEvent>],
         usage: &mut UsageResolver<'_>,
-        steps: &mut IndexSet<usize>,
-        dependencies: &mut IndexSet<TargetId>,
+        (steps, dependencies, roots): (
+            &mut IndexSet<usize>,
+            &mut IndexSet<TargetId>,
+            &mut TraceRoots,
+        ),
         mut ide_steps: Option<&mut Vec<IdeCustomStep>>,
     ) -> Result<CustomStep, ResolveError> {
         let mut recipe = CustomStep::default();
@@ -554,24 +586,27 @@ impl<'a> Commands<'a> {
                 }
                 let (mut step, command_deps) = self.lower_command(command_id, command, usage)?;
                 if event.is_none()
-                    && self.model.generator == Some(GeneratorKind::NinjaMultiConfig)
+                    && self.model.generator.is_some_and(GeneratorKind::is_ninja)
                     && let Some(target) = self.model.target(id)
                 {
+                    // The utility command writes the symbolic `<dir>/CMakeFiles/<name>`.
                     let binary = &self.model.dir(command.dir).binary_dir;
                     let name = [b"CMakeFiles/", target.name.as_slice()].concat();
                     let mut output = command_path(self.model, binary, &name);
-                    if !shared {
+                    if self.model.generator == Some(GeneratorKind::NinjaMultiConfig) && !shared {
                         output.push(b'-');
                         output.extend_from_slice(&self.config.0);
                     }
                     step.outputs.push(output);
                 }
                 dependencies.extend(command_deps);
-                self.add_producers(
-                    step.depends.iter().filter_map(|path| self.producer(path)),
-                    steps,
-                    dependencies,
-                )?;
+                let producers = step.depends.iter().filter_map(|path| self.producer(path));
+                if event.is_some() {
+                    roots.events.extend(producers.clone());
+                } else {
+                    roots.utility.extend(producers.clone());
+                }
+                self.add_producers(producers, steps, dependencies)?;
                 if let Some(steps) = &mut ide_steps {
                     let phase = match event {
                         None => IdeCustomPhase::Rule,
@@ -660,10 +695,30 @@ impl<'a> Commands<'a> {
             })
     }
 
-    pub(super) fn ordered_source_steps(&self, roots: IndexSet<usize>) -> IndexSet<usize> {
-        let mut steps = roots;
+    /// The custom command steps that the dependency trace of one target
+    /// reaches, in the order of the `cmTargetTraceDependencies` queue.
+    ///
+    /// The queue starts with the producers of the `DEPENDS` of the target
+    /// event commands, then the commands of the target sources. The utility
+    /// command of a custom target is held by `CMakeFiles/<name>.rule`, which
+    /// the queue reaches after these, so the producers of its `DEPENDS` come
+    /// after the dependencies of the first queue entries.
+    pub(super) fn ordered_source_steps(&self, roots: TraceRoots) -> IndexSet<usize> {
+        let TraceRoots {
+            events: mut steps,
+            sources,
+            utility,
+        } = roots;
+        steps.extend(sources);
+        let first = steps.len();
         let mut next = 0;
-        while let Some(&step) = steps.get_index(next) {
+        loop {
+            if next == first {
+                steps.extend(utility.iter().copied());
+            }
+            let Some(&step) = steps.get_index(next) else {
+                break;
+            };
             steps.extend(self.input_producers(step));
             next += 1;
         }
@@ -692,6 +747,24 @@ impl<'a> Commands<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// The first custom command steps of the dependency trace of one target.
+#[derive(Default)]
+pub(super) struct TraceRoots {
+    /// Producers of the `DEPENDS` of the `PRE_BUILD`, `PRE_LINK`, and
+    /// `POST_BUILD` commands.
+    pub(super) events: IndexSet<usize>,
+    /// Commands of the target sources.
+    pub(super) sources: IndexSet<usize>,
+    /// Producers of the `DEPENDS` of the custom target command.
+    pub(super) utility: IndexSet<usize>,
+}
+
+impl TraceRoots {
+    pub(super) fn is_empty(&self) -> bool {
+        self.events.is_empty() && self.sources.is_empty() && self.utility.is_empty()
     }
 }
 

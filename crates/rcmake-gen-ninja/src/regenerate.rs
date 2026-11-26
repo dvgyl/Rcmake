@@ -20,6 +20,7 @@ pub(super) fn emit_regeneration(
     result: &GenerationResult,
     regenerate: &[u8],
     verify: Option<&[u8]>,
+    has_cache: bool,
 ) {
     let mut seen = HashSet::new();
     let mut listfiles: Vec<_> = result
@@ -29,17 +30,24 @@ pub(super) fn emit_regeneration(
         .map(|file| graph.node(file))
         .filter(|file| !outputs.contains(file) && seen.insert(file.clone()))
         .collect();
+    if has_cache {
+        let cache = graph.node(b"CMakeCache.txt");
+        if !outputs.contains(&cache) && seen.insert(cache.clone()) {
+            listfiles.push(cache);
+        }
+    }
 
+    let stamp_node = graph.node(rcmake_gen_common::glob::STAMP.as_bytes());
+    let mut rerun_inputs = Vec::new();
     if let Some(cmake) = verify {
         let script = graph.node(rcmake_gen_common::glob::SCRIPT.as_bytes());
-        let stamp = graph.node(rcmake_gen_common::glob::STAMP.as_bytes());
-        let force = graph.node(b"CMakeFiles/VerifyGlobs.force");
+        let force = graph.node(b"CMakeFiles/VerifyGlobs.cmake_force");
         ninja.phony(&force, &[]);
         ninja.edge(
             b"VERIFY_GLOBS",
             Edge {
-                outputs: std::slice::from_ref(&stamp),
-                implicit_inputs: &[script.clone(), force],
+                outputs: std::slice::from_ref(&stamp_node),
+                implicit_inputs: std::slice::from_ref(&force),
                 ..Edge::default()
             },
         );
@@ -51,26 +59,38 @@ pub(super) fn emit_regeneration(
             &mut command,
         );
         ninja.binding(b"COMMAND", &command);
-        listfiles.push(stamp);
+        ninja.binding(b"pool", b"console");
+        rerun_inputs.push(stamp_node.clone());
+        if !outputs.contains(&script) && seen.insert(script.clone()) {
+            listfiles.push(script);
+        }
     }
 
     ninja.edge(
         b"RERUN_CMAKE",
         Edge {
             outputs,
+            inputs: &rerun_inputs,
             implicit_inputs: &listfiles,
             ..Edge::default()
         },
     );
     ninja.binding(b"COMMAND", regenerate);
 
-    for listfile in &listfiles {
-        // Missing listfiles must trigger regeneration so CMake can check them.
-        if *listfile != graph.node(rcmake_gen_common::glob::STAMP.as_bytes())
-            && !graph.has_target(listfile)
-        {
-            ninja.phony(listfile, &[]);
-        }
+    // Missing listfiles must trigger regeneration so CMake can check them.
+    let missing_ok: Vec<_> = listfiles
+        .iter()
+        .filter(|listfile| **listfile != stamp_node && !graph.has_target(listfile))
+        .cloned()
+        .collect();
+    if !missing_ok.is_empty() {
+        ninja.edge(
+            b"phony",
+            Edge {
+                outputs: &missing_ok,
+                ..Edge::default()
+            },
+        );
     }
 }
 

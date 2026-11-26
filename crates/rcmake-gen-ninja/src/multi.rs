@@ -11,7 +11,7 @@ use rcmake_resolve::GenerationResult;
 use crate::graph::{self, Graph, qualified};
 use crate::syntax::{Edge, Ninja};
 use crate::{
-    Programs, RULES_PATH, add_install_scripts,
+    Programs, RULES_PATH, add_ctest_files, add_install_scripts,
     clean::clean_command,
     commands::Commands,
     config_artifacts, fortran, generation_error,
@@ -54,13 +54,15 @@ pub(super) fn generate_multi(
                 generation_error(build_dir, "A Ninja configuration has no build graph.")
             })?;
         let artifacts = config_artifacts(result, input);
-        let mut graph = Graph::with_prefix(
+        let mut graph = Graph::with_context(
             input,
             &artifacts,
             build_dir,
             Some(name),
             &prefix,
             commands.clone(),
+            model,
+            Some(result),
         )?;
         graph.add_aliases(&artifacts, model, result);
         graph.resolve_custom_inputs(model, host);
@@ -94,10 +96,7 @@ pub(super) fn generate_multi(
         .iter()
         .filter_map(|&index| configs.get(index).map(|(graph, _)| graph))
         .collect();
-    let mut manifests = vec![
-        default.node(b"build.ninja"),
-        default.node(RULES_PATH.as_bytes()),
-    ];
+    let mut manifests = vec![default.node(b"build.ninja")];
     for (_, files) in &configs {
         manifests.extend([
             default.node(&files.entry),
@@ -130,6 +129,7 @@ pub(super) fn generate_multi(
             .map(|file| default.node(file)),
     );
     add_install_scripts(&mut manifests, default, result, model);
+    add_ctest_files(&mut manifests, default, model);
     if uses_modules || graphs.iter().any(|graph| fortran::uses_fortran(graph)) {
         manifests.extend(
             modules::write_metadata(result, model, &graphs, host, build_dir, true)?
@@ -137,10 +137,25 @@ pub(super) fn generate_multi(
                 .map(|file| default.node(file)),
         );
     }
-    write_rules(result, host, build_dir, uses_modules, model, &commands)?;
+    let has_cache = host
+        .metadata(&build_dir.join("CMakeCache.txt"), rcmake_host::Follow::Yes)
+        .is_ok();
     let programs = Programs::new(result, host, build_dir, model, &commands);
-    let rebuild = configure_command(result, build_dir, &programs.cmake, &commands, false);
+    let custom_clean = configs
+        .iter()
+        .any(|(graph, _)| !graph.clean_files.is_empty());
+    write_rules(
+        result,
+        host,
+        build_dir,
+        uses_modules,
+        model,
+        &commands,
+        &programs.ninja,
+        custom_clean,
+    )?;
     let regenerate = configure_command(result, build_dir, &programs.cmake, &commands, true);
+    let rebuild = regenerate.clone();
     for (index, (graph, files)) in configs.iter().enumerate() {
         let mut ninja = graph.manifest();
         ninja.include(&graph.node(RULES_PATH.as_bytes()));
@@ -170,13 +185,15 @@ pub(super) fn generate_multi(
                 .flatten()
                 .map(|input| {
                     let artifacts = config_artifacts(result, input);
-                    let mut variant = Graph::with_prefix(
+                    let mut variant = Graph::with_context(
                         input,
                         &artifacts,
                         build_dir,
                         output.config,
                         &prefix,
                         commands.clone(),
+                        model,
+                        Some(result),
                     )?;
                     variant.add_aliases(&artifacts, model, result);
                     variant.resolve_custom_inputs(model, host);
@@ -223,6 +240,7 @@ pub(super) fn generate_multi(
             result,
             &regenerate,
             verify_globs.then_some(programs.cmake.as_slice()),
+            has_cache,
         );
         write_if_changed(
             host,
@@ -410,33 +428,55 @@ pub(crate) fn emit_clean<'a>(
     included: impl Iterator<Item = &'a Graph<'a>>,
     cross: &[&Graph<'_>],
 ) {
+    let mut file_arg = b"-f ".to_vec();
+    graph
+        .commands
+        .word(&graph.node(implementation), &mut file_arg);
     let mut base = programs.ninja.clone();
-    base.extend_from_slice(b" -f ");
-    graph.commands.word(&graph.node(implementation), &mut base);
+    base.extend_from_slice(b" ");
+    base.extend_from_slice(&file_arg);
     base.extend_from_slice(b" -t clean");
     let mut emit = |name, configs: &[&Graph<'_>]| {
-        let mut command = base.clone();
+        let mut targets = Vec::new();
         for config in configs {
-            command.push(b' ');
+            if !targets.is_empty() {
+                targets.push(b' ');
+            }
             graph.commands.word(
                 &qualified(&graph.node(b"CMakeFiles/rcmake-clean"), config.config),
-                &mut command,
+                &mut targets,
             );
         }
-        let command = clean_command(
-            graph,
-            &programs.cmake,
-            command,
-            configs.iter().flat_map(|graph| &graph.clean_files),
-        );
-        ninja.edge(
-            b"CLEAN",
-            Edge {
-                outputs: &[qualified(&graph.node(b"clean"), Some(name))],
-                ..Edge::default()
-            },
-        );
-        ninja.binding(b"COMMAND", &command);
+        let has_additional = configs.iter().any(|graph| !graph.clean_files.is_empty());
+        if !has_additional {
+            ninja.edge(
+                b"CLEAN",
+                Edge {
+                    outputs: &[qualified(&graph.node(b"clean"), Some(name))],
+                    ..Edge::default()
+                },
+            );
+            ninja.binding(b"FILE_ARG", &file_arg);
+            ninja.binding(b"TARGETS", &targets);
+        } else {
+            let mut command = base.clone();
+            command.push(b' ');
+            command.extend_from_slice(&targets);
+            let command = clean_command(
+                graph,
+                &programs.cmake,
+                command,
+                configs.iter().flat_map(|graph| &graph.clean_files),
+            );
+            ninja.edge(
+                b"CLEAN_CUSTOM",
+                Edge {
+                    outputs: &[qualified(&graph.node(b"clean"), Some(name))],
+                    ..Edge::default()
+                },
+            );
+            ninja.binding(b"COMMAND", &command);
+        }
         // Default aliases can run multiple clean edges that share outputs.
         ninja.binding(b"pool", b"console");
     };

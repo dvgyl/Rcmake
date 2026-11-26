@@ -14,9 +14,7 @@ use super::pch::PchFlags;
 use super::policy_flags::Flags;
 use super::shell::{command, join_words, raw_flags, rule_invocations};
 use super::standard::{LanguageStandard, checked_standard_flag, codemodel_standard};
-use super::{
-    definition, expand_rule, join, object_path, target_property, without_trailing_slashes,
-};
+use super::{definition, expand_rule, join, object_path, without_trailing_slashes};
 use crate::{
     ArtifactSet, BuildStep, CompileGroup, CompileUnit, ResolveError, usage::UsageResolver,
 };
@@ -52,19 +50,37 @@ fn compile_flags(
     group: &CompileGroup,
     required_standard: Option<&[u8]>,
     position_independent: Option<bool>,
-    (architecture, usage): (Option<&[u8]>, Option<&mut UsageResolver<'_>>),
+    options: (Option<&[u8]>, Option<&mut UsageResolver<'_>>),
 ) -> Result<Vec<BString>, ResolveError> {
-    let language = group.language.as_slice();
-    let mut flags = language_flags(model, target, config, language);
-    let standard = checked_standard_flag(model, target, language, required_standard)?;
-    flags.extend(standard);
-    flags.extend(super::apple::arch::flags(
+    let parts = compile_flag_parts(
         model,
         target,
         config,
-        language,
-        architecture,
-    )?);
+        group,
+        required_standard,
+        position_independent,
+        options,
+    )?;
+    Ok(parts.into_iter().flatten().collect())
+}
+
+/// The compile flags in three parts: the language and standard flags, the Apple
+/// architecture flags, and all later flags.
+fn compile_flag_parts(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    group: &CompileGroup,
+    required_standard: Option<&[u8]>,
+    position_independent: Option<bool>,
+    (architecture, usage): (Option<&[u8]>, Option<&mut UsageResolver<'_>>),
+) -> Result<[Vec<BString>; 3], ResolveError> {
+    let language = group.language.as_slice();
+    let mut leading = language_flags(model, target, config, language);
+    let standard = checked_standard_flag(model, target, language, required_standard)?;
+    leading.extend(standard);
+    let architectures = super::apple::arch::flags(model, target, config, language, architecture)?;
+    let mut flags = Vec::new();
     let policy = Flags::new(model, target, language);
     let ipo = if language == b"CUDA" {
         super::cuda::arch::ipo_enabled(model, target, config, language)
@@ -128,18 +144,58 @@ fn compile_flags(
         }
     }
 
+    // The target creation copied `CMAKE_<LANG>_VISIBILITY_PRESET`, so a later
+    // directory value does not apply (`cmLocalGenerator::AddVisibilityPresetFlags`).
     let preset_key = [language, b"_VISIBILITY_PRESET"].concat();
-    if let Some(preset) = target_property(model, target, &preset_key).filter(|p| !p.is_empty()) {
-        flags.push(quote(&[b"-fvisibility=", preset.as_slice()].concat()));
+    if let (Some(option), Some(preset)) = (
+        policy.option(b"COMPILE_OPTIONS_VISIBILITY"),
+        target.props.get(&preset_key),
+    ) {
+        flags.push(quote(&[option.as_slice(), preset.as_slice()].concat()));
     }
-    if matches!(language, b"CXX" | b"OBJCXX")
-        && target_property(model, target, b"VISIBILITY_INLINES_HIDDEN")
+    if matches!(language, b"CXX" | b"OBJCXX" | b"SYCL")
+        && target
+            .props
+            .get(b"VISIBILITY_INLINES_HIDDEN")
             .is_some_and(|v| truth::is_on(v))
+        && let Some(option) = policy.option(b"COMPILE_OPTIONS_VISIBILITY_INLINES_HIDDEN")
     {
-        flags.push("-fvisibility-inlines-hidden".into());
+        flags.push(option.clone());
     }
     policy.append_color(&mut flags);
-    Ok(flags)
+    let define_flags = &model.dir(target.dir).define_flags;
+    if !define_flags.iter().all(u8::is_ascii_whitespace) {
+        flags.push(raw_flags(model, target.dir, define_flags));
+    }
+    Ok([leading, architectures, flags])
+}
+
+/// Join compile flags as `cmLocalGenerator::GetTargetCompileFlags` does. Each
+/// piece keeps its own spaces, a piece of only spaces is skipped, and pieces are
+/// separated by one space. Each architecture flag word gets one leading space,
+/// also at the start of the string.
+fn codemodel_flag_text([leading, architectures, rest]: [Vec<BString>; 3]) -> BString {
+    let mut text = BString::default();
+    let append = |text: &mut BString, piece: &[u8]| {
+        if piece.iter().all(u8::is_ascii_whitespace) {
+            return;
+        }
+        if !text.is_empty() {
+            text.push(b' ');
+        }
+        text.extend_from_slice(piece);
+    };
+    for piece in &leading {
+        append(&mut text, piece);
+    }
+    for word in &architectures {
+        text.push(b' ');
+        text.extend_from_slice(word);
+    }
+    for piece in &rest {
+        append(&mut text, piece);
+    }
+    text
 }
 
 /// Compute the compiler flags and language standard for a File API compile group.
@@ -160,7 +216,7 @@ pub fn codemodel_compile_info(
     };
     let features = usage.collect(id, rcmake_model::UsageField::CompileFeatures, &context)?;
     let standard = super::required_standard(&group.language, &features.entries);
-    let flags = compile_flags(
+    let flags = compile_flag_parts(
         model,
         target,
         config,
@@ -170,7 +226,7 @@ pub fn codemodel_compile_info(
         (None, Some(usage)),
     )?;
     let standard = codemodel_standard(model, target, &group.language, &features.entries);
-    Ok((join_words(flags), standard))
+    Ok((codemodel_flag_text(flags), standard))
 }
 
 fn compile_argument(model: &ProjectModel, target: &Target, prefix: &[u8], value: &[u8]) -> BString {
@@ -185,27 +241,34 @@ fn compile_argument(model: &ProjectModel, target: &Target, prefix: &[u8], value:
         .into()
 }
 
-fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BString {
-    let darwin = is_darwin(model, target.dir);
-    let key = [
-        b"CMAKE_",
-        group.language.as_slice(),
-        b"_IMPLICIT_INCLUDE_DIRECTORIES",
-    ]
-    .concat();
-    let implicit: IndexSet<_> = definition(model, target.dir, &key)
+/// Return the identities of `CMAKE_<LANG>_IMPLICIT_INCLUDE_DIRECTORIES`.
+pub(crate) fn implicit_include_dirs(
+    model: &ProjectModel,
+    target: &Target,
+    language: &[u8],
+) -> IndexSet<BString> {
+    let key = [b"CMAKE_", language, b"_IMPLICIT_INCLUDE_DIRECTORIES"].concat();
+    definition(model, target.dir, &key)
         .into_iter()
         .flat_map(|value| list::split(value, list::Empty::Drop))
-        .map(|path| Lexical::new(&path).normalize())
-        .map(|path| BString::from(without_trailing_slashes(&path)))
-        .collect();
+        .map(|path| include_identity(&path))
+        .collect()
+}
+
+/// Return the comparison identity of an include directory.
+pub(crate) fn include_identity(path: &[u8]) -> BString {
+    let normalized = Lexical::new(path).normalize();
+    without_trailing_slashes(&normalized).into()
+}
+
+fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BString {
+    let darwin = is_darwin(model, target.dir);
+    let implicit = implicit_include_dirs(model, target, &group.language);
     let mut paths = IndexSet::new();
     let mut frameworks = implicit_frameworks(model, target);
     join_words(group.includes.iter().filter_map(|include| {
         let path = clean_include_path(&include.path.value);
-        let identity = Lexical::new(&path).normalize();
-        let identity = without_trailing_slashes(&identity);
-        if implicit.contains(identity) || !paths.insert(path.clone()) {
+        if implicit.contains(&include_identity(&path)) || !paths.insert(path.clone()) {
             return None;
         }
         if darwin && let Some(directory) = framework_directory(&path) {
@@ -637,10 +700,16 @@ pub(super) fn compile(
         ),
         _ => None,
     };
-    if let Some(dep_flags) = dep_flags {
-        flags.push(expand_rule(dep_flags, lookup_paths));
-    }
-    let flags = join_words(flags);
+    let ninja = model.generator.is_some_and(GeneratorKind::is_ninja);
+    let expanded_dep_flags = dep_flags.map(|dep_flags| expand_rule(dep_flags, lookup_paths));
+    let flags = if ninja {
+        // Ninja trims the `FLAGS` binding; the rule adds the dependency flags after it.
+        let flags = BString::from(join_words(flags).trim_ascii());
+        join_words([flags].into_iter().chain(expanded_dep_flags))
+    } else {
+        flags.extend(expanded_dep_flags);
+        join_words(flags)
+    };
     let mut invocations = rule_invocations(model, target.dir, template_text, |key| match key {
         b"FLAGS" => Some(if model.generator.is_some_and(GeneratorKind::is_ninja) {
             flags.trim_ascii().into()
@@ -725,4 +794,27 @@ pub(super) fn compile(
 
 fn has_placeholder(text: &[u8], key: &[u8]) -> bool {
     text.windows(key.len()).any(|part| part == key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(parts: [&[&str]; 3]) -> BString {
+        codemodel_flag_text(parts.map(|part| part.iter().map(|&piece| piece.into()).collect()))
+    }
+
+    #[test]
+    fn codemodel_flags_follow_the_cmake_append_rules() {
+        assert_eq!(
+            text([&[], &["-arch", "arm64"], &["-fno-color-diagnostics"]]),
+            " -arch arm64 -fno-color-diagnostics"
+        );
+        assert_eq!(text([&["  ", "-O3"], &[], &["-fPIC"]]), "-O3 -fPIC");
+        assert_eq!(text([&[" -Wall", "-g"], &[], &[]]), " -Wall -g");
+        assert_eq!(
+            text([&["-O2"], &["-arch", "x86_64"], &[]]),
+            "-O2 -arch x86_64"
+        );
+    }
 }

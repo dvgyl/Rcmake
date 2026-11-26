@@ -22,6 +22,9 @@ use crate::{
 mod rules;
 pub(crate) use rules::instantiate_rules;
 
+/// Internal property of a target that the generator creates (`isGeneratorProvided`).
+pub(crate) const GENERATOR_PROVIDED: &[u8] = b"_RCMAKE_GENERATOR_PROVIDED";
+
 pub(crate) fn resolve_target<'a>(
     model: &'a ProjectModel,
     paths: &SourcePaths<'_>,
@@ -39,7 +42,9 @@ pub(crate) fn resolve_target<'a>(
         backtrace: target.backtrace.clone(),
         folder: target.props.get(b"FOLDER").cloned(),
         exclude_from_all: excluded_from_all(model, usage, id, target, ctx)?,
-        generator_provided: target.kind == TargetKind::GlobalTarget || is_std_provider(target),
+        generator_provided: target.kind == TargetKind::GlobalTarget
+            || is_std_provider(target)
+            || target.props.get(GENERATOR_PROVIDED).is_some(),
     };
     if let Some(strategy) = lower::install_object_name_strategy(model, target)
         && !matches!(strategy.as_slice(), b"FULL" | b"SHORT")
@@ -139,8 +144,10 @@ pub(crate) fn resolve_target<'a>(
     let unity = paths.unity.as_ref().and_then(|plan| plan.get(&id));
     let collect_unity = paths.unity.is_none() && unity::enabled(target);
     let unity_sources = unity.into_iter().flat_map(|plan| {
+        // CMake prepends each unity file, so the last file comes first.
         plan.files
             .iter()
+            .rev()
             .map(|(path, file)| (BT::new(path.clone(), target.backtrace.clone()), Some(file)))
     });
     let original_sources = sources
@@ -298,7 +305,14 @@ pub(crate) fn resolve_target<'a>(
                 {
                     defines.insert(0, BT::new(symbol.clone(), Backtrace::default()));
                 }
-                let includes = usage.collect_includes_for_result(id, &compile_ctx)?;
+                let mut includes = usage.collect_includes_for_result(id, &compile_ctx)?;
+                if flavor.is_none() {
+                    // `cmLocalGenerator::GetIncludeDirectories` drops the implicit directories.
+                    let implicit = lower::compile::implicit_include_dirs(model, target, &language);
+                    includes.retain(|include| {
+                        !implicit.contains(&lower::compile::include_identity(&include.path.value))
+                    });
+                }
                 let group = entry.index();
                 let mut facts = CompileGroup {
                     language,

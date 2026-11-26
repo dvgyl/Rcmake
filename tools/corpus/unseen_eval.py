@@ -17,6 +17,7 @@ import sys
 import tempfile
 import tomllib
 
+from normalize import normalize_codemodel_abstract_target_ties
 from unseen_pool import CORPUS
 from unseen_select import validate_pin
 
@@ -74,7 +75,9 @@ def codemodel(build, normalize):
             return normalize.text(value)
         return value
 
-    return read_reply(model)
+    return normalize_codemodel_abstract_target_ties(
+        read_reply(model), dir_data_key="jsonFile"
+    )
 
 
 def capture_l1(build, source, tool_paths, configure):

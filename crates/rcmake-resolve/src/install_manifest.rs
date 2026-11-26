@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, ops::Range};
 
+use indexmap::IndexSet;
 use rcmake_base::BString;
 use rcmake_genex::ConfigId;
 use rcmake_model::{DirId, TargetId};
@@ -123,4 +124,79 @@ pub struct TargetInstaller {
     /// Empty if the installer selects no file, for example for `NAMELINK_ONLY`
     /// on a library without a version.
     pub paths: Vec<(BString, BString)>,
+    /// `CONFIGURATIONS` of the artifact group (empty means all).
+    ///
+    /// The installer is recorded for every resolved configuration, so that the
+    /// target `install` destinations are complete. Use
+    /// [`TargetInstaller::installs_for_config`] to select the installer rows.
+    pub configurations: Vec<BString>,
+}
+
+impl TargetInstaller {
+    /// Return `true` when the installer applies to `config`
+    /// (`cmInstallGenerator::InstallsForConfig`).
+    #[must_use]
+    pub fn installs_for_config(&self, config: &[u8]) -> bool {
+        let config = ConfigId(config.into());
+        self.configurations.is_empty()
+            || self.configurations.iter().any(|name| config.matches(name))
+    }
+}
+
+/// The file kind of a [`TargetFileInstaller`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetFileKind {
+    /// `PRIVATE_HEADER` files.
+    PrivateHeader,
+    /// `PUBLIC_HEADER` files.
+    PublicHeader,
+    /// `RESOURCE` files.
+    Resource,
+}
+
+/// The files that an `install(TARGETS)` rule copies from a target file list
+/// property (a `cmInstallFilesGenerator` with an owning target).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetFileInstaller {
+    /// Index of the rule in the project model.
+    pub rule: usize,
+    /// Target that owns the file list.
+    pub target: TargetId,
+    /// Resolved configuration of the destination.
+    pub config: ConfigId,
+    /// Property that lists the files.
+    pub kind: TargetFileKind,
+    /// Install destination.
+    pub destination: BString,
+    /// Install component.
+    pub component: BString,
+    /// Whether the files can be missing.
+    pub optional: bool,
+    /// Whether a full install skips this installer.
+    pub exclude_from_all: bool,
+    /// `CONFIGURATIONS` of the artifact group (empty means all).
+    pub configurations: Vec<BString>,
+    /// Absolute source paths in property order.
+    pub files: Vec<BString>,
+}
+
+impl TargetFileInstaller {
+    /// Return `true` when the installer applies to `config`.
+    #[must_use]
+    pub fn installs_for_config(&self, config: &[u8]) -> bool {
+        let config = ConfigId(config.into());
+        self.configurations.is_empty()
+            || self.configurations.iter().any(|name| config.matches(name))
+    }
+}
+
+/// Install facts of targets that the File API reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstallTargetFacts {
+    /// Targets for which an `install(TARGETS)` rule in any directory created a
+    /// target or C++ module BMI generator (`cmTarget::GetHaveInstallRule`).
+    pub have_install_rule: IndexSet<TargetId>,
+    /// Header and resource file installers in rule and generator order
+    /// (`PRIVATE_HEADER`, `PUBLIC_HEADER`, then `RESOURCE` for each target).
+    pub file_installers: Vec<TargetFileInstaller>,
 }

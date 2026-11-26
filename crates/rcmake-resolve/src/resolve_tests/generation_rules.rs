@@ -545,3 +545,159 @@ fn ninja_transformed_depfile_hashes_the_absolute_input_and_creates_its_directory
     assert_eq!(command.working_dir, transform.working_dir);
     Ok(())
 }
+
+/// Add an `install(TARGETS <name> <args>...)` rule with its recorded arguments.
+fn install_targets(
+    model: &mut ProjectModel,
+    (id, name): (TargetId, &str),
+    options: InstallOptions,
+    args: &[&str],
+) -> usize {
+    let rule = model.add_install(InstallRule {
+        dir: DirId::ROOT,
+        backtrace: backtrace(10),
+        kind: InstallKind::Targets {
+            targets: vec![id],
+            export: None,
+        },
+        options,
+    });
+    let recorded = ["TARGETS", name].into_iter().chain(args.iter().copied());
+    for (index, arg) in recorded.enumerate() {
+        model.global.props.set(
+            format!("_RCMAKE_INSTALL_{rule}_ARG{index}").into(),
+            arg.into(),
+        );
+    }
+    rule
+}
+
+#[test]
+fn multi_config_target_installers_keep_unselected_configurations() -> TestResult {
+    let (source, build) = roots();
+    let mut model = project_with_roots(&source, &build);
+    model.generator = Some(rcmake_model::GeneratorKind::NinjaMultiConfig);
+    let id = model.add_target(target("example", TargetKind::StaticLibrary, &["main.c"]))?;
+    let options = InstallOptions {
+        destination: Some("lib".into()),
+        configurations: vec!["Debug".into()],
+        ..InstallOptions::default()
+    };
+    let rule = install_targets(&mut model, (id, "example"), options, &[]);
+    let configs = [ConfigId("Debug".into()), ConfigId("Release".into())];
+    let result = resolve(&model, &seeded(&source, &["main.c"])?, &configs)?;
+    let installers: Vec<_> = result
+        .install
+        .target_installers
+        .iter()
+        .filter(|installer| installer.rule == rule && installer.target == id)
+        .map(|installer| {
+            (
+                installer.config.0.to_string(),
+                installer.destination.to_string(),
+                installer.installs_for_config(&installer.config.0),
+            )
+        })
+        .collect();
+    assert_eq!(
+        installers,
+        [
+            ("Debug".to_owned(), "lib".to_owned(), true),
+            ("Release".to_owned(), "lib".to_owned(), false),
+        ]
+    );
+    let configured: Vec<_> = result
+        .install
+        .actions
+        .iter()
+        .filter(|action| !matches!(action.kind, InstallActionKind::Code(_)))
+        .map(|action| action.configurations.clone())
+        .collect();
+    assert!(!configured.is_empty());
+    assert!(configured.iter().all(|names| names == &["Debug"]));
+    Ok(())
+}
+
+#[test]
+fn namelink_only_creates_no_dll_installer_or_header_installer() -> TestResult {
+    let (source, build) = roots();
+    for (system, installs) in [("Windows", false), ("Linux", true)] {
+        let mut model = project_with_roots(&source, &build);
+        model
+            .global
+            .props
+            .set("CMAKE_SYSTEM_NAME".into(), system.into());
+        let mut library = target("example", TargetKind::SharedLibrary, &["main.c"]);
+        library
+            .props
+            .set("PUBLIC_HEADER".into(), "example.h".into());
+        let id = model.add_target(library)?;
+        let args = ["LIBRARY", "NAMELINK_ONLY"];
+        install_targets(
+            &mut model,
+            (id, "example"),
+            InstallOptions::default(),
+            &args,
+        );
+        let result = resolve(&model, &seeded(&source, &["main.c"])?, &[])?;
+        assert_eq!(
+            result.install_targets.have_install_rule.contains(&id),
+            installs,
+            "{system}"
+        );
+        assert!(
+            result.install_targets.file_installers.is_empty(),
+            "{system}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn public_header_default_destination_needs_no_artifact_destination() -> TestResult {
+    let (source, build) = roots();
+    let mut model = project_with_roots(&source, &build);
+    let mut library = target("example", TargetKind::StaticLibrary, &["main.c"]);
+    library
+        .props
+        .set("PUBLIC_HEADER".into(), "example.h".into());
+    let id = model.add_target(library)?;
+    let rules = [
+        &[][..],
+        &["ARCHIVE", "DESTINATION", "lib"][..],
+        &[
+            "ARCHIVE",
+            "DESTINATION",
+            "lib",
+            "PUBLIC_HEADER",
+            "DESTINATION",
+            "inc",
+        ][..],
+        &["LIBRARY", "DESTINATION", "lib"][..],
+    ]
+    .map(|args| install_targets(&mut model, (id, "example"), InstallOptions::default(), args));
+    let generic = InstallOptions {
+        destination: Some("all".into()),
+        ..InstallOptions::default()
+    };
+    let generic = install_targets(&mut model, (id, "example"), generic, &[]);
+    let result = resolve(&model, &seeded(&source, &["main.c"])?, &[])?;
+    let headers: Vec<_> = result
+        .install_targets
+        .file_installers
+        .iter()
+        .map(|installer| (installer.rule, installer.destination.to_string()))
+        .collect();
+    // An ARCHIVE destination suppresses the default `include`; a LIBRARY
+    // destination is not an artifact destination of a static library.
+    assert_eq!(
+        headers,
+        [
+            (rules[0], "include".to_owned()),
+            (rules[2], "inc".to_owned()),
+            (rules[3], "include".to_owned()),
+            (generic, "all".to_owned()),
+        ]
+    );
+    Ok(())
+}

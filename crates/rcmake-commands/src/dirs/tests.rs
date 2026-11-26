@@ -547,3 +547,93 @@ fn add_subdirectory_sees_root_binary_dir_replaced_in_place() -> TestResult {
     assert_eq!(interp.cx().project().dirs().count(), 3);
     Ok(())
 }
+
+#[test]
+fn add_definitions_keeps_non_define_flags_raw_and_inherits_them() -> TestResult {
+    let (mut interp, host, exit) = source_group_model(
+        b"
+        cmake_minimum_required(VERSION 4.5)
+        project(defines NONE)
+        add_definitions(-D HAVE_COMPRESS)
+        add_definitions(-D THREAD -DGOOD -DVAL=1 -fno-common)
+        add_definitions(\"-fa\nb\")
+        remove_definitions(-fno-common)
+        add_definitions(-fno-common-x)
+        remove_definitions(-fno-common)
+    ",
+    )?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    let mut cx = interp.cx();
+    let root = cx.project().dir(DirId::ROOT);
+    assert_eq!(
+        root.define_flags.as_slice(),
+        b" -D HAVE_COMPRESS -D THREAD  -fa b -fno-common-x".as_slice()
+    );
+    assert_eq!(
+        root.usage.joined(UsageField::CompileDefinitions),
+        Some("GOOD;VAL=1".into())
+    );
+    Ok(())
+}
+
+#[test]
+fn source_groups_keep_creation_order_and_resolve_the_last_explicit_group() -> TestResult {
+    let (mut interp, host, exit) = source_group_model(
+        br#"
+        cmake_minimum_required(VERSION 4.5)
+        project(groups NONE)
+        source_group("Generated" FILES g1.c)
+        source_group("Source Files" FILES g1.c s1.c)
+        source_group("Zeta" FILES s1.c)
+        source_group("Source Files" FILES s1.c)
+        source_group("a\\b" FILES nested.c REGULAR_EXPRESSION "\\.x$")
+        source_group("unused")
+    "#,
+    )?;
+    assert_eq!(exit, 0, "{}", host.stream_bytes(Stream::Stderr));
+    let mut cx = interp.cx();
+    let dir = cx.project().dir(DirId::ROOT);
+    let names: Vec<_> = dir
+        .source_groups
+        .iter()
+        .map(|group| String::from_utf8_lossy(&group.name).into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "",
+            "Source Files",
+            "Header Files",
+            "Precompile Header File",
+            "CMake Rules",
+            "Resources",
+            "Object Files",
+            "Object Libraries",
+            "Generated",
+            "Zeta",
+            "a"
+        ]
+    );
+    let mut regex = |pattern: &[u8], path: &[u8]| {
+        rcmake_regex::Regex::new(pattern).is_ok_and(|regex| {
+            regex
+                .find_at(path, 0, rcmake_regex::MatchOptions::default(), &mut 100_000)
+                .is_ok_and(|found| found.is_some())
+        })
+    };
+    for (path, expected) in [
+        ("/work/src/g1.c", "Generated"),
+        ("/work/src/s1.c", "Zeta"),
+        ("/work/src/nested.c", r"a\b"),
+        ("/work/src/other.x", r"a\b"),
+        ("/work/src/other.cpp", "Source Files"),
+        ("/work/src/notes.txt", ""),
+    ] {
+        assert_eq!(
+            rcmake_resolve::ide::find_source_group(dir, path.as_bytes(), &mut regex),
+            expected,
+            "{path}"
+        );
+    }
+    Ok(())
+}

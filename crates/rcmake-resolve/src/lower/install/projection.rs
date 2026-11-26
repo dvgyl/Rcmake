@@ -22,9 +22,7 @@ impl Projection<'_> {
         namelink: NamelinkMode,
         paths: Vec<(BString, BString)>,
     ) {
-        if !paths.is_empty() {
-            self.push(manifest, action, import_library, namelink, paths);
-        }
+        self.push(manifest, action, import_library, namelink, paths);
     }
 
     fn push(
@@ -35,14 +33,6 @@ impl Projection<'_> {
         namelink: NamelinkMode,
         paths: Vec<(BString, BString)>,
     ) {
-        if !action.configurations.is_empty()
-            && !action
-                .configurations
-                .iter()
-                .any(|config| self.config.matches(config))
-        {
-            return;
-        }
         manifest.target_installers.push(TargetInstaller {
             rule: self.rule,
             target: self.target,
@@ -54,6 +44,7 @@ impl Projection<'_> {
             import_library,
             namelink,
             paths,
+            configurations: action.configurations.clone(),
         });
     }
 

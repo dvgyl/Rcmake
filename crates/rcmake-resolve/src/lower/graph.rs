@@ -9,7 +9,7 @@ use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{BT, DirId, GeneratorKind, ProjectModel, Target, TargetEvent, TargetId};
 
 use super::artifacts::build_relative;
-use super::custom::{Commands, attach_link_events, command_path, ide_custom_step};
+use super::custom::{Commands, TraceRoots, attach_link_events, command_path, ide_custom_step};
 use super::link::link;
 use super::pch;
 use super::{compute_artifacts, linker_language};
@@ -154,18 +154,11 @@ pub(crate) fn lower_with_inputs_workers(
     let mut unity_prerequisites = Vec::new();
     let mut strong_edges = Vec::new();
     graph.custom_output_owners = commands.owners.clone();
-    let has_file_generate_count = model
-        .global
-        .props
-        .get(b"_RCMAKE_FILE_GENERATE_COUNT")
-        .is_some();
-    if has_file_generate_count {
-        graph.custom_main_sources = commands
-            .owners
-            .keys()
-            .filter_map(|&index| Some((index, commands.main_source(index, usage.source_paths())?)))
-            .collect();
-    }
+    graph.custom_main_sources = commands
+        .owners
+        .keys()
+        .filter_map(|&index| Some((index, commands.main_source(index, usage.source_paths())?)))
+        .collect();
     graph.target_ids = local.iter().map(|(_, target)| target.id).collect();
     let workers = workers_override.unwrap_or_else(|| {
         crate::parallel::worker_count(
@@ -199,12 +192,6 @@ pub(crate) fn lower_with_inputs_workers(
                 &mut graph.steps,
                 &mut graph.custom_output_owners,
             )?;
-            if has_file_generate_count && !plan.source_command_roots.is_empty() {
-                graph.custom_source_steps.insert(
-                    resolved.id,
-                    commands.ordered_source_steps(std::mem::take(&mut plan.source_command_roots)),
-                );
-            }
             if let Some(traced) = traced_commands.and_then(|map| map.get(&resolved.id)) {
                 commands.add_traced_commands(traced, &mut plan.steps, &mut plan.dependencies)?;
                 source_commands::record_owners(
@@ -259,6 +246,7 @@ pub(crate) fn lower_with_inputs_workers(
                 step_offset: 0,
                 utility_steps: &mut graph.utility_steps,
                 link_depfiles: &mut graph.link_depfiles,
+                link_runtime_paths: &mut graph.link_runtime_paths,
                 install_name_dirs: &mut graph.install_name_dirs,
                 link_extra_outputs: &mut graph.link_extra_outputs,
                 swift_output_file_maps: &mut graph.swift_output_file_maps,
@@ -272,6 +260,9 @@ pub(crate) fn lower_with_inputs_workers(
                 &resolved_targets,
                 &mut sink,
             )?;
+            if let Some(steps) = plan.custom_source_steps(&commands) {
+                graph.custom_source_steps.insert(resolved.id, steps);
+            }
 
             source_commands::record_owners(
                 &mut graph.custom_output_owners,
@@ -358,7 +349,6 @@ pub(crate) fn lower_with_inputs_workers(
                         precompiled,
                         traced_commands,
                         rule_steps,
-                        has_file_generate_count,
                         target_ide_pch.clone(),
                         &mut worker_usage,
                     );
@@ -396,6 +386,7 @@ pub(crate) fn lower_with_inputs_workers(
             graph.compile_launchers.extend(out.compile_launchers);
             compile_inputs.extend(out.compile_inputs);
             graph.link_depfiles.extend(out.link_depfiles);
+            graph.link_runtime_paths.extend(out.link_runtime_paths);
             graph.install_name_dirs.extend(out.install_name_dirs);
             graph.link_extra_outputs.extend(out.link_extra_outputs);
             graph
@@ -456,6 +447,10 @@ pub(crate) fn lower_with_inputs_workers(
         remove_inherited_xcode_rules(&graph, &target_indices, rule_count, &mut ide.custom);
     }
     graph.native_custom_steps = commands.native_steps;
+    graph.command_utilities = commands
+        .utilities
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     Ok(graph)
 }
 
@@ -611,7 +606,7 @@ struct TargetPlan<'a> {
     resolved: &'a ResolvedTarget,
     inputs: Option<&'a TargetInputs>,
     steps: IndexSet<usize>,
-    source_command_roots: IndexSet<usize>,
+    trace_roots: TraceRoots,
     source_file_inputs: IndexMap<BString, IndexSet<BString>>,
     dependencies: IndexSet<TargetId>,
     ide_steps: Option<Vec<IdeCustomStep>>,
@@ -637,11 +632,18 @@ impl<'a> TargetPlan<'a> {
             resolved,
             inputs,
             steps: IndexSet::new(),
-            source_command_roots: IndexSet::new(),
+            trace_roots: TraceRoots::default(),
             source_file_inputs: IndexMap::new(),
             dependencies,
             ide_steps: resolved.ide.as_ref().map(|_| Vec::new()),
         }
+    }
+
+    /// The custom command steps of the dependency trace, after the source,
+    /// event, and utility commands are lowered.
+    fn custom_source_steps(&mut self, commands: &Commands<'_>) -> Option<IndexSet<usize>> {
+        let roots = std::mem::take(&mut self.trace_roots);
+        (!roots.is_empty()).then(|| commands.ordered_source_steps(roots))
     }
 
     fn add_source_commands(
@@ -714,16 +716,22 @@ impl<'a> TargetPlan<'a> {
                 resolved.id,
                 &[Some(TargetEvent::PreBuild), Some(TargetEvent::PreLink)],
                 usage,
-                &mut self.steps,
-                &mut self.dependencies,
+                (
+                    &mut self.steps,
+                    &mut self.dependencies,
+                    &mut self.trace_roots,
+                ),
                 self.ide_steps.as_mut(),
             )?;
             let mut after = commands.events(
                 resolved.id,
                 &[Some(TargetEvent::PostBuild)],
                 usage,
-                &mut self.steps,
-                &mut self.dependencies,
+                (
+                    &mut self.steps,
+                    &mut self.dependencies,
+                    &mut self.trace_roots,
+                ),
                 self.ide_steps.as_mut(),
             )?;
             let position_independent = self.inputs.and_then(|inputs| inputs.position_independent);
@@ -815,6 +823,9 @@ impl<'a> TargetPlan<'a> {
             if let BuildStep::Link { step, .. } = &link {
                 if let Some(depfile) = lowered.depfile {
                     sink.link_depfiles.insert(step.output.clone(), depfile);
+                }
+                if let Some(paths) = lowered.runtime_paths {
+                    sink.link_runtime_paths.insert(step.output.clone(), paths);
                 }
                 if !lowered.install_name_dir.is_empty() {
                     sink.install_name_dirs
@@ -947,12 +958,18 @@ fn separate_library_symlinks(link: &mut BuildStep, after: &mut CustomStep) -> Op
     else {
         return None;
     };
-    let index = invocations.iter().position(|invocation| {
-        invocation
-            .argv
-            .get(2)
-            .is_some_and(|word| word == b"cmake_symlink_library")
-    })?;
+    // A versioned library or executable gets its symlinks from a separate edge,
+    // which also runs the post-build commands (`cmNinjaNormalTargetGenerator`).
+    let (index, kind) = invocations
+        .iter()
+        .enumerate()
+        .find_map(|(index, invocation)| {
+            match invocation.argv.get(2).map(|word| word.as_slice()) {
+                Some(b"cmake_symlink_library") => Some((index, "library")),
+                Some(b"cmake_symlink_executable") => Some((index, "executable")),
+                _ => None,
+            }
+        })?;
     let mut symlink = std::mem::take(after);
     let command = invocations.remove(index);
     let links: IndexSet<_> = command
@@ -962,7 +979,7 @@ fn separate_library_symlinks(link: &mut BuildStep, after: &mut CustomStep) -> Op
         .filter(|path| **path != step.output)
         .cloned()
         .collect();
-    symlink.comment = Some(format!("Creating library symlink {}", list::join(&links)).into());
+    symlink.comment = Some(format!("Creating {kind} symlink {}", list::join(&links)).into());
     symlink.outputs.extend(links);
     symlink.depends.push(step.output.clone());
     symlink.invocations.insert(0, command);
@@ -1054,6 +1071,7 @@ pub(super) struct GraphSink<'a> {
     pub(super) step_offset: usize,
     pub(super) utility_steps: &'a mut IndexSet<usize>,
     pub(super) link_depfiles: &'a mut IndexMap<BString, BString>,
+    pub(super) link_runtime_paths: &'a mut IndexMap<BString, crate::LinkRuntimePaths>,
     pub(super) install_name_dirs: &'a mut IndexMap<BString, BString>,
     pub(super) link_extra_outputs: &'a mut IndexMap<BString, Vec<BString>>,
     pub(super) swift_output_file_maps: &'a mut IndexMap<BString, BString>,
@@ -1074,6 +1092,7 @@ struct TargetLowerOutput {
     compile_launchers: IndexMap<BString, BString>,
     compile_inputs: BTreeMap<BString, Vec<BString>>,
     link_depfiles: IndexMap<BString, BString>,
+    link_runtime_paths: IndexMap<BString, crate::LinkRuntimePaths>,
     install_name_dirs: IndexMap<BString, BString>,
     link_extra_outputs: IndexMap<BString, Vec<BString>>,
     swift_output_file_maps: IndexMap<BString, BString>,
@@ -1168,15 +1187,12 @@ fn lower_one_target_parallel(
     precompiled: &pch::Plans,
     traced_commands: Option<&IndexMap<TargetId, IndexSet<rcmake_model::CommandId>>>,
     rule_steps: &[BuildStep],
-    has_file_generate_count: bool,
     mut target_ide_pch: Option<Vec<crate::ide::IdePch>>,
     usage: &mut UsageResolver<'_>,
 ) -> Result<TargetLowerOutput, ResolveError> {
     let rule_count = rule_steps.len();
     let mut plan = TargetPlan::new(model, config, target, resolved, inputs.get(&resolved.id));
     let _ = plan.trace_source_commands(commands, None)?;
-    let custom_source_steps = (has_file_generate_count && !plan.source_command_roots.is_empty())
-        .then(|| commands.ordered_source_steps(std::mem::take(&mut plan.source_command_roots)));
     if let Some(traced) = traced_commands.and_then(|map| map.get(&resolved.id)) {
         commands.add_traced_commands(traced, &mut plan.steps, &mut plan.dependencies)?;
     }
@@ -1218,6 +1234,7 @@ fn lower_one_target_parallel(
     )?;
     let mut utility_steps = IndexSet::new();
     let mut link_depfiles = IndexMap::new();
+    let mut link_runtime_paths = IndexMap::new();
     let mut install_name_dirs = IndexMap::new();
     let mut link_extra_outputs = IndexMap::new();
     let mut swift_output_file_maps = IndexMap::new();
@@ -1227,6 +1244,7 @@ fn lower_one_target_parallel(
         step_offset: rule_count,
         utility_steps: &mut utility_steps,
         link_depfiles: &mut link_depfiles,
+        link_runtime_paths: &mut link_runtime_paths,
         install_name_dirs: &mut install_name_dirs,
         link_extra_outputs: &mut link_extra_outputs,
         swift_output_file_maps: &mut swift_output_file_maps,
@@ -1240,6 +1258,7 @@ fn lower_one_target_parallel(
         resolved_targets,
         &mut sink,
     )?;
+    let custom_source_steps = plan.custom_source_steps(commands);
     let ide_custom = plan.ide_steps.map(|events| {
         let rules = plan
             .steps
@@ -1268,6 +1287,7 @@ fn lower_one_target_parallel(
         compile_launchers,
         compile_inputs,
         link_depfiles,
+        link_runtime_paths,
         install_name_dirs,
         link_extra_outputs,
         swift_output_file_maps,

@@ -151,6 +151,17 @@ impl Commands {
         }
     }
 
+    pub(crate) fn in_cmake_directory(&self, command: &[u8], directory: &[u8]) -> Vec<u8> {
+        if self.windows() {
+            return self.in_directory(command, directory);
+        }
+        let mut out = b"cd ".to_vec();
+        out.extend_from_slice(&cmake_posix_quote(directory));
+        out.extend_from_slice(b" && ");
+        out.extend_from_slice(command);
+        out
+    }
+
     pub(crate) fn chain(&self, first: &[u8], second: &[u8]) -> Vec<u8> {
         let script = [first, b" && ", second].concat();
         if self.windows() {
@@ -231,7 +242,59 @@ impl Commands {
         posix_link_line(invocations, build_dir, prefix)
     }
 
-    pub(crate) fn symlink_line(
+    pub(crate) fn symlink_library_line(
+        &self,
+        invocations: &[Invocation],
+        output_count: usize,
+        build_dir: &[u8],
+        prefix: bool,
+    ) -> Vec<u8> {
+        if self.windows() {
+            return self.line(invocations, true, build_dir, prefix);
+        }
+        let mut out = Vec::new();
+        if prefix {
+            out.extend_from_slice(b"cd ");
+            out.extend_from_slice(&cmake_posix_quote(build_dir));
+            out.extend_from_slice(b" && ");
+        }
+        if let Some((first, rest)) = invocations.split_first() {
+            if let [cmake, dash_e, helper, real, soname, linker] = first.argv.as_slice()
+                && dash_e == b"-E"
+                && helper == b"cmake_symlink_library"
+            {
+                out.extend_from_slice(&cmake_posix_quote(cmake));
+                out.extend_from_slice(b" -E cmake_symlink_library ");
+                out.extend_from_slice(&cmake_posix_quote(real));
+                if output_count >= 2 {
+                    out.extend_from_slice(b"  ");
+                } else {
+                    out.push(b' ');
+                }
+                out.extend_from_slice(&cmake_posix_quote(soname));
+                out.push(b' ');
+                out.extend_from_slice(&cmake_posix_quote(linker));
+            } else {
+                out.extend(posix_commands(
+                    std::slice::from_ref(first),
+                    build_dir,
+                    false,
+                    false,
+                ));
+            }
+            out.extend_from_slice(b" && ");
+            if rest.is_empty() {
+                out.push(b':');
+            } else {
+                out.extend(posix_commands(rest, build_dir, false, true));
+            }
+        } else {
+            out.push(b':');
+        }
+        out
+    }
+
+    pub(crate) fn symlink_executable_line(
         &self,
         invocations: &[Invocation],
         build_dir: &[u8],
@@ -240,7 +303,29 @@ impl Commands {
         if self.windows() {
             return self.line(invocations, true, build_dir, prefix);
         }
-        posix_commands(invocations, build_dir, prefix, true)
+        let mut out = Vec::new();
+        if prefix {
+            out.extend_from_slice(b"cd ");
+            out.extend_from_slice(&cmake_posix_quote(build_dir));
+            out.extend_from_slice(b" && ");
+        }
+        if let Some((first, rest)) = invocations.split_first() {
+            out.extend(posix_commands(
+                std::slice::from_ref(first),
+                build_dir,
+                false,
+                false,
+            ));
+            out.extend_from_slice(b" && ");
+            if rest.is_empty() {
+                out.push(b':');
+            } else {
+                out.extend(posix_commands(rest, build_dir, false, true));
+            }
+        } else {
+            out.push(b':');
+        }
+        out
     }
 
     pub(crate) fn custom_script(

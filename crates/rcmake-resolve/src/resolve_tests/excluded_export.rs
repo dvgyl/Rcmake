@@ -61,28 +61,38 @@ fn install_export_can_reference_an_excluded_subdirectory_export() -> TestResult 
 
     let host = PureHost::default();
     let result = resolve(&model, &host, &[])?;
-    let [plan] = result.exports.as_slice() else {
-        return Err("Expected one parent export plan.".into());
-    };
+    let sets: Vec<_> = result.exports.iter().map(|plan| plan.set.clone()).collect();
+    assert_eq!(sets, ["DepTargets", "ConsumerTargets"]);
+    let plan = &result.exports[1];
     let [export] = plan.targets.as_slice() else {
         return Err("Expected one exported target.".into());
     };
-    assert_eq!(plan.set, "ConsumerTargets");
     assert_eq!(
         export
             .properties
             .get(b"INTERFACE_LINK_LIBRARIES".as_slice()),
         Some(&"Dep::dep".into())
     );
-    assert!(!result.install.directories.contains_key(&sub));
-    assert_eq!(result.install.actions.len(), 1);
+    // The excluded directory keeps its own script, but the root does not include it.
+    assert!(result.install.directories.contains_key(&sub));
     assert!(
-        result
+        !result
             .install
-            .actions
-            .iter()
-            .any(|action| matches!(action.kind, InstallActionKind::Export { plan: 0 }))
+            .directories
+            .get(&DirId::ROOT)
+            .ok_or("Missing root install script.")?
+            .contains(&crate::InstallEntry::Child(sub))
     );
+    let plans: Vec<_> = result
+        .install
+        .actions
+        .iter()
+        .filter_map(|action| match action.kind {
+            InstallActionKind::Export { plan } => Some(plan),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plans, [1, 0]);
 
     let rule = model
         .installs

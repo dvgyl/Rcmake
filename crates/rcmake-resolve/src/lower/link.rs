@@ -4,7 +4,7 @@ use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::{ConfigId, EvalContext, UsageTraversal, evaluate};
-use rcmake_model::{DirId, ProjectModel, Target};
+use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target};
 
 use super::artifacts::{build_relative, is_darwin, is_msvc};
 use super::compile::language_flags;
@@ -32,6 +32,7 @@ use driver::{
 };
 pub(crate) use frameworks::bundle_name as framework_bundle_name;
 pub(crate) use rpath::ide_rpaths;
+pub(crate) use rpath::{SharedDependencyMode, links_shared_dependency, shared_dependency_mode};
 
 fn creation_flags<'a>(
     model: &'a ProjectModel,
@@ -84,7 +85,8 @@ pub fn codemodel_link_flags(
                     .flat_map(|value| list::split(value, list::Empty::Drop)),
             );
         }
-        flags.push(join_words(language_flags));
+        // `DumpLinkCommandFragments` trims the language flags and drops them when empty.
+        flags.push(join_words(language_flags).trim_ascii().into());
     }
     let wrapper = LinkerDriver::new(model, target, language);
     if let Some(value) = creation_flags(model, target, kind, language) {
@@ -104,6 +106,10 @@ pub fn codemodel_link_flags(
                 definition(model, target.dir, key).map(|value| wrapper.driver_flags(value))
             }),
     ));
+    let mut flags: Vec<BString> = flags
+        .into_iter()
+        .map(|value| value.trim_ascii().into())
+        .collect();
     flags.retain(|value| !value.is_empty());
     Ok((flags, ipo))
 }
@@ -112,6 +118,7 @@ pub(super) struct LoweredLink {
     pub(super) step: BuildStep,
     pub(super) install_name_dir: BString,
     pub(super) depfile: Option<BString>,
+    pub(super) runtime_paths: Option<crate::LinkRuntimePaths>,
     pub(super) extra_outputs: Vec<BString>,
     pub(super) swift_output_file_map: Option<(BString, BString)>,
 }
@@ -382,6 +389,12 @@ pub(super) fn link(
         before_link.extend(definitions.invocation);
     }
     let flags = join_words(flags);
+    // Ninja trims each variable binding (`cmGlobalNinjaGenerator::WriteBuild`).
+    let flags = if model.generator.is_some_and(GeneratorKind::is_ninja) {
+        BString::from(flags.trim_ascii())
+    } else {
+        flags
+    };
     let source_paths = || {
         sources.map_or_else(
             || {
@@ -406,7 +419,7 @@ pub(super) fn link(
     let manifests = join_words(manifests.iter().map(|path| quote(path)));
     let runtime =
         super::cuda::runtime::host_args(model, target, config, &step, link_languages, usage)?;
-    let libraries = link_libraries(
+    let (libraries, runtime_paths) = link_libraries(
         model,
         target,
         config,
@@ -709,7 +722,11 @@ pub(super) fn link(
             &objects,
             cmake(),
             &policy,
-            (ipo, msvc),
+            (
+                ipo,
+                msvc,
+                model.generator.is_some_and(GeneratorKind::is_ninja),
+            ),
             template,
             expand,
         )
@@ -875,6 +892,7 @@ pub(super) fn link(
         },
         install_name_dir,
         depfile: depfile.map(|(path, _)| path),
+        runtime_paths,
         extra_outputs,
         swift_output_file_map,
     })
@@ -927,9 +945,9 @@ fn link_libraries(
     link_languages: &IndexSet<BString>,
     usage: &mut UsageResolver<'_>,
     ninja_posix: bool,
-) -> Result<BString, ResolveError> {
+) -> Result<(BString, Option<crate::LinkRuntimePaths>), ResolveError> {
     if step.kind == LinkKind::StaticArchive {
-        return Ok(BString::default());
+        return Ok((BString::default(), None));
     }
     let link_fragments = step
         .fragments
@@ -939,11 +957,16 @@ fn link_libraries(
     let named = frameworks::named_framework_files(model, target, config, step, &libraries);
     libraries.extend(named);
     let runtime = rpath::runtime_libraries(model, target, config, step, &libraries, usage)?;
-    let mut rpaths =
+    let runtime_flags =
         rpath::link_flags(model, target, config, step, usage, &runtime, link_languages)?;
+    let mut rpaths = runtime_flags.rpath;
     if ninja_posix && rpaths.len() > 1 {
         rpaths = vec![join_words(rpaths)];
     }
+    let runtime_paths = crate::LinkRuntimePaths {
+        rpath: (!rpaths.is_empty()).then(|| join_words(rpaths.iter().cloned())),
+        rpath_link: runtime_flags.rpath_link.clone(),
+    };
     inputs.extend(libraries);
     inputs.extend(runtime.link_stubs.iter().cloned());
     let (mut arguments, mut rpaths) = if darwin {
@@ -973,6 +996,7 @@ fn link_libraries(
     arguments.extend(rpaths.into_iter().flatten());
     arguments.extend(runtime.link_stubs.iter().map(|file| quote(file)));
     arguments.extend(runtime_args.iter().map(|arg| quote(arg)));
+    arguments.extend(runtime_flags.rpath_link);
     if let Some(standard) = definition(
         model,
         target.dir,
@@ -980,8 +1004,9 @@ fn link_libraries(
     ) {
         arguments.push(wrapper.driver_flags(standard));
     }
+    let runtime_paths = Some(runtime_paths);
     if !ninja_posix {
-        return Ok(join_words(arguments));
+        return Ok((join_words(arguments), runtime_paths));
     }
     let frameworks = join_words(framework_paths);
     let directories = library_paths.join(b"   ".as_slice());
@@ -998,7 +1023,7 @@ fn link_libraries(
     line.extend_from_slice(&directories);
     line.push(b' ');
     line.extend_from_slice(&libraries);
-    Ok(line)
+    Ok((line, runtime_paths))
 }
 
 fn darwin_versions(model: &ProjectModel, target: &Target, language: &[u8]) -> Vec<BString> {

@@ -14,7 +14,7 @@ use super::{
     ProjectModel, ResolveError, ResolvedTarget, RuntimeEdits, action_configs, add_bmi_include,
     definition, eval_destination, file_action, join, list, matches_config, target_options,
 };
-use crate::NamelinkMode;
+use crate::{NamelinkMode, TargetFileInstaller, TargetFileKind};
 
 pub(super) fn warn_framework_change(
     model: &ProjectModel,
@@ -124,7 +124,11 @@ pub(super) fn lower(
     recorded: &[&[u8]],
     manifest: &mut InstallManifest,
     make_action: &impl Fn(&InstallOptions, &[u8], InstallActionKind) -> InstallAction,
-    (eval, object_name): (&mut EvaluateInstall<'_>, &mut InstallObjectName<'_>),
+    (eval, object_name, facts): (
+        &mut EvaluateInstall<'_>,
+        &mut InstallObjectName<'_>,
+        &mut crate::InstallTargetFacts,
+    ),
 ) -> Result<(), ResolveError> {
     let options = &rule.options;
     let multi = configs.len() > 1 || model.generator.is_some_and(GeneratorKind::multi_config);
@@ -146,6 +150,22 @@ pub(super) fn lower(
                 t.id == *id && dependency_configs.is_none_or(|configs| configs.contains(&t.config))
             })
             .collect();
+        let framework = super::super::is_darwin(model, raw.dir)
+            && matches!(
+                crate::ide::bundle_kind(raw),
+                crate::ide::BundleKind::Framework { .. }
+            )
+            && !framework_added_after_install(model, index, *id, raw);
+        let plan = Generators::new(
+            model,
+            raw,
+            (&groups, options),
+            (runtime_only, framework),
+            &matching,
+        );
+        if plan.target {
+            facts.have_install_rule.insert(*id);
+        }
         if raw.kind == TargetKind::ObjectLibrary {
             let object_options = groups
                 .get(b"OBJECTS".as_slice())
@@ -158,9 +178,9 @@ pub(super) fn lower(
                 continue;
             }
             for target in &matching {
-                if !matches_config(&object_options, &target.config) {
-                    continue;
-                }
+                // The generator exists for every configuration. Only the
+                // installs of a matching configuration are actions.
+                let installs = matches_config(&object_options, &target.config);
                 let mut options = object_options.clone();
                 eval_destination(&mut options, raw.dir, &target.config, rule, eval)?;
                 let destination = options
@@ -189,9 +209,11 @@ pub(super) fn lower(
                         &custom_name,
                     );
                     paths.push(object.installer_path(destination));
-                    let mut action = object.action(&options, make_action);
-                    action.configurations = vec![target.config.0.clone()];
-                    manifest.actions.push(action);
+                    if installs {
+                        let mut action = object.action(&options, make_action);
+                        action.configurations = vec![target.config.0.clone()];
+                        manifest.actions.push(action);
+                    }
                 }
                 let action =
                     make_action(&options, b"", InstallActionKind::Code(BString::default()));
@@ -247,14 +269,14 @@ pub(super) fn lower(
                     ),
                 ] {
                     let Some(file) = file else { continue };
+                    let installs = matches_config(&options, &target.config);
                     if (runtime_only && file_type == b"STATIC_LIBRARY")
                         || (!runtime_only && explicit && !has_destination(&options))
-                        || ((configs.is_empty() || per_config)
-                            && !matches_config(&options, &target.config))
+                        || (configs.is_empty() && !installs)
                     {
                         continue;
                     }
-                    if per_config {
+                    if per_config && installs {
                         options.configurations = vec![target.config.0.clone()];
                     }
                     let default = definition(model, rule.dir, variable)
@@ -273,6 +295,9 @@ pub(super) fn lower(
                         NamelinkMode::None,
                         vec![path],
                     );
+                    if per_config && !installs {
+                        continue;
+                    }
                     let strip_action = (file_type == b"SHARED_LIBRARY")
                         .then(|| {
                             strip.action(
@@ -318,10 +343,15 @@ pub(super) fn lower(
             } else {
                 extra
             };
-            if (configs.is_empty() || per_config) && !matches_config(&options, &target.config) {
+            let installs = matches_config(&options, &target.config);
+            if configs.is_empty() && !installs {
                 continue;
             }
-            if per_config {
+            // In a multi-configuration build, a configuration that the rule
+            // does not select keeps the installer for the target destinations
+            // (`cmFileAPICodemodel.cxx`), but gets no install actions.
+            let record_only = per_config && !installs;
+            if per_config && installs {
                 options.configurations = vec![target.config.0.clone()];
             }
             let artifacts = if target.artifacts.file.is_some() {
@@ -394,7 +424,7 @@ pub(super) fn lower(
                 );
             }
             let namelink = take_namelink(&artifacts, extra, &mut files);
-            if !files.is_empty() {
+            if !record_only && !files.is_empty() {
                 let installed = artifacts.file.as_ref().and_then(|file| {
                     if files.contains(file) {
                         let name = options
@@ -461,9 +491,10 @@ pub(super) fn lower(
                 let group = groups.get(b"ARCHIVE".as_slice());
                 let mut stub_options =
                     group.map_or_else(|| rule.options.clone(), |group| group.merge(&rule.options));
-                if matches_config(&stub_options, &target.config) {
+                let stub_installs = matches_config(&stub_options, &target.config);
+                if stub_installs || per_config {
                     stub_options.optional = true;
-                    if per_config {
+                    if per_config && stub_installs {
                         stub_options.configurations = vec![target.config.0.clone()];
                     }
                     eval_destination(&mut stub_options, raw.dir, &target.config, rule, eval)?;
@@ -485,7 +516,7 @@ pub(super) fn lower(
                     projection.library(manifest, &stub_action, bin, (&stubs, group, true));
                     let mut files = artifact_paths(&stubs, group);
                     let namelink = take_namelink(&stubs, group, &mut files);
-                    if !files.is_empty() {
+                    if stub_installs && !files.is_empty() {
                         let kind = file_action(
                             b"STATIC_LIBRARY",
                             files.into_iter().map(|path| join(bin, path)).collect(),
@@ -495,7 +526,7 @@ pub(super) fn lower(
                             .actions
                             .push(make_action(&stub_options, default, kind));
                     }
-                    if let Some((component, linker)) = namelink {
+                    if let Some((component, linker)) = namelink.filter(|_| stub_installs) {
                         stub_options.component = Some(component.into());
                         let kind =
                             file_action(b"STATIC_LIBRARY", vec![join(bin, linker)], &stub_options);
@@ -505,7 +536,7 @@ pub(super) fn lower(
                     }
                 }
             }
-            if let Some((component, file)) = namelink {
+            if let Some((component, file)) = namelink.filter(|_| !record_only) {
                 options.component = Some(component.into());
                 let kind = file_action(file_type, vec![join(bin, file)], &options);
                 manifest.actions.push(make_action(&options, default, kind));
@@ -546,13 +577,14 @@ pub(super) fn lower(
                 }
             }
         }
-        if matches!(
-            crate::ide::bundle_kind(raw),
-            crate::ide::BundleKind::Framework { .. }
-        ) {
+        if !plan.files {
             continue;
         }
-        for key in [b"PRIVATE_HEADER".as_slice(), b"PUBLIC_HEADER", b"RESOURCE"] {
+        for (key, file_kind) in [
+            (b"PRIVATE_HEADER".as_slice(), TargetFileKind::PrivateHeader),
+            (b"PUBLIC_HEADER", TargetFileKind::PublicHeader),
+            (b"RESOURCE", TargetFileKind::Resource),
+        ] {
             let property = String::from_utf8_lossy(key);
             let snapshot = format!("_RCMAKE_INSTALL_{index}_{property}_{}", id.index());
             let Some(headers) = model
@@ -571,7 +603,13 @@ pub(super) fn lower(
                 let options = groups
                     .get(key)
                     .map_or_else(|| options.clone(), |extra| extra.merge(options));
-                if key == b"RESOURCE" && options.destination.is_none() {
+                // A header without its own destination installs to the
+                // default only when no artifact destination is given.
+                let own_destination = options
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| !path.is_empty());
+                if !own_destination && (key == b"RESOURCE" || plan.artifacts_specified) {
                     continue;
                 }
                 let default = definition(model, rule.dir, b"CMAKE_INSTALL_INCLUDEDIR")
@@ -579,6 +617,27 @@ pub(super) fn lower(
                 let mut options = options;
                 if !configs.is_empty() {
                     options.destination.get_or_insert_with(|| default.into());
+                }
+                for target in &matching {
+                    let mut resolved = options.clone();
+                    eval_destination(&mut resolved, rule.dir, &target.config, rule, eval)?;
+                    let action = make_action(
+                        &resolved,
+                        default,
+                        InstallActionKind::Code(BString::default()),
+                    );
+                    facts.file_installers.push(TargetFileInstaller {
+                        rule: index,
+                        target: *id,
+                        config: target.config.clone(),
+                        kind: file_kind,
+                        destination: action.destination,
+                        component: action.component,
+                        optional: action.optional,
+                        exclude_from_all: action.exclude_from_all,
+                        configurations: action.configurations,
+                        files: files.clone(),
+                    });
                 }
                 for config in action_configs(configs, &options, false, multi) {
                     let mut options = options.clone();
@@ -595,6 +654,111 @@ pub(super) fn lower(
         }
     }
     Ok(())
+}
+
+/// The generators that one `install(TARGETS)` rule creates for one target
+/// (`cmInstallCommand.cxx`, `HandleTargetsMode`). The decisions do not depend
+/// on the build configuration.
+struct Generators {
+    /// A target or C++ module BMI generator, which sets
+    /// `cmTarget::SetHaveInstallRule`.
+    target: bool,
+    /// The `PRIVATE_HEADER`, `PUBLIC_HEADER`, and `RESOURCE` generators can
+    /// exist: the target is not a framework and the rule is not namelink only.
+    files: bool,
+    /// An artifact destination was given (`artifactsSpecified`). Then a header
+    /// without its own destination gets no generator.
+    artifacts_specified: bool,
+}
+
+impl Generators {
+    fn new(
+        model: &ProjectModel,
+        raw: &Target,
+        (groups, options): (&IndexMap<&[u8], Group<'_>>, &InstallOptions),
+        (runtime_only, framework): (bool, bool),
+        targets: &[&ResolvedTarget],
+    ) -> Self {
+        let has_destination = |key: &[u8]| {
+            groups
+                .get(key)
+                .map_or_else(|| options.clone(), |group| group.merge(options))
+                .destination
+                .is_some_and(|path| !path.is_empty())
+        };
+        let namelink_only = |key: &[u8]| groups.get(key).is_some_and(|group| group.namelink_only);
+        let none = Self {
+            target: false,
+            files: false,
+            artifacts_specified: false,
+        };
+        if runtime_only {
+            return Self {
+                target: matches!(
+                    raw.kind,
+                    TargetKind::SharedLibrary | TargetKind::ModuleLibrary
+                ),
+                ..none
+            };
+        }
+        let dll = super::super::artifacts::is_dll_platform(model, raw.dir);
+        // (target generator, artifacts specified, namelink only)
+        let (target, artifacts_specified, namelink) = match raw.kind {
+            TargetKind::SharedLibrary | TargetKind::StaticLibrary
+                if (framework || (dll && raw.kind == TargetKind::SharedLibrary))
+                    && namelink_only(b"LIBRARY") =>
+            {
+                // `NAMELINK_ONLY` skips the target before any other generator.
+                return none;
+            }
+            TargetKind::SharedLibrary if framework => (true, false, false),
+            TargetKind::SharedLibrary if dll => (
+                true,
+                has_destination(b"ARCHIVE") || has_destination(b"RUNTIME"),
+                false,
+            ),
+            TargetKind::SharedLibrary => {
+                let stubs = targets.iter().any(|target| {
+                    target
+                        .artifacts
+                        .import_file
+                        .as_ref()
+                        .is_some_and(|file| file.ends_with(b".tbd"))
+                });
+                if stubs {
+                    (
+                        true,
+                        has_destination(b"LIBRARY") || has_destination(b"ARCHIVE"),
+                        namelink_only(b"ARCHIVE"),
+                    )
+                } else {
+                    (true, has_destination(b"LIBRARY"), namelink_only(b"LIBRARY"))
+                }
+            }
+            TargetKind::StaticLibrary if framework => (true, false, false),
+            TargetKind::StaticLibrary => (true, has_destination(b"ARCHIVE"), false),
+            TargetKind::ModuleLibrary => (true, false, namelink_only(b"LIBRARY")),
+            TargetKind::ObjectLibrary => (has_destination(b"OBJECTS"), false, false),
+            TargetKind::Executable => {
+                let exports = raw
+                    .props
+                    .get(b"ENABLE_EXPORTS")
+                    .is_some_and(|value| truth::is_on(value));
+                let app = matches!(
+                    crate::ide::bundle_kind(raw),
+                    crate::ide::BundleKind::App { .. }
+                ) && super::super::is_darwin(model, raw.dir);
+                let import = dll && exports && has_destination(b"ARCHIVE");
+                (true, !app && (has_destination(b"RUNTIME") || import), false)
+            }
+            _ => (false, false, false),
+        };
+        Self {
+            target: target || has_destination(b"CXX_MODULES_BMI"),
+            files: !framework && !namelink,
+            artifacts_specified,
+        }
+    }
 }
 
 type TargetInstallKind = (&'static [u8], &'static [u8], (&'static [u8], &'static [u8]));

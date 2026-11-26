@@ -83,27 +83,23 @@ rule CUSTOM_COMMAND
 rule VERIFY_GLOBS
   command = $COMMAND
   description = Re-checking globbed directories...
+  generator = 1
   restat = 1
 
 rule CMAKE_SYMLINK_LIBRARY
   command = $COMMAND
   description = $DESC
-  restat = 1
+
+rule CMAKE_SYMLINK_EXECUTABLE
+  command = $COMMAND
+  description = $DESC
 
 rule RERUN_CMAKE
   command = $COMMAND
-  description = Re-running CMake
+  description = Re-running CMake...
   generator = 1
   pool = console
   restat = 1
-
-rule CLEAN
-  command = $COMMAND
-  description = Cleaning built files
-
-rule HELP
-  command = $COMMAND
-  description = Listing available targets
 ";
 
 /// Write `build.ninja` and its rule file for the single configuration of `result`.
@@ -172,13 +168,15 @@ fn generate_single(
     let empty = BuildGraph::default();
     let input = result.graphs.first().unwrap_or(&empty);
     let artifacts = config_artifacts(result, input);
-    let mut graph = Graph::with_prefix(
+    let mut graph = Graph::with_context(
         input,
         &artifacts,
         build_dir,
         None,
         &prefix,
         commands.clone(),
+        model,
+        Some(result),
     )?;
     graph.add_aliases(&artifacts, model, result);
     graph.resolve_custom_inputs(model, host);
@@ -202,10 +200,7 @@ fn generate_single(
         .map(|model| write_module_exports(result, model, host, build_dir, false))
         .transpose()?
         .unwrap_or_default();
-    let mut manifests = vec![
-        graph.node(b"build.ninja"),
-        graph.node(RULES_PATH.as_bytes()),
-    ];
+    let mut manifests = vec![graph.node(b"build.ninja")];
     manifests.extend(exports.iter().map(|job| graph.node(&job.script)));
     manifests.extend(
         result
@@ -215,6 +210,7 @@ fn generate_single(
             .map(|file| graph.node(file)),
     );
     add_install_scripts(&mut manifests, &graph, result, model);
+    add_ctest_files(&mut manifests, &graph, model);
     if uses_modules || fortran::uses_fortran(input) {
         manifests.extend(
             modules::write_metadata(result, model, &[input], host, build_dir, false)?
@@ -222,6 +218,10 @@ fn generate_single(
                 .map(|file| graph.node(file)),
         );
     }
+    let has_cache = host
+        .metadata(&build_dir.join("CMakeCache.txt"), Follow::Yes)
+        .is_ok();
+    let regenerate = configure_command(result, build_dir, &programs.cmake, &commands, true);
     let mut ninja = graph.manifest();
     ninja.include(&graph.node(RULES_PATH.as_bytes()));
     graph.emit(&mut ninja, &programs.cmake, &module_flag, &exports)?;
@@ -233,22 +233,32 @@ fn generate_single(
         &graph,
         &manifests,
         result,
-        &configure_command(result, build_dir, &programs.cmake, &commands, true),
+        &regenerate,
         verify_globs.then_some(programs.cmake.as_slice()),
+        has_cache,
     );
     emit_utilities(
         &mut ninja,
         &graph,
         b"build.ninja",
         &programs,
-        &configure_command(result, build_dir, &programs.cmake, &commands, false),
+        &regenerate,
         install::Scope::Single,
     );
     if graph.prefix.is_empty() {
         ninja.0.extend_from_slice(b"default all\n");
     }
 
-    write_rules(result, host, build_dir, uses_modules, model, &commands)?;
+    write_rules(
+        result,
+        host,
+        build_dir,
+        uses_modules,
+        model,
+        &commands,
+        &programs.ninja,
+        !graph.clean_files.is_empty(),
+    )?;
     write_if_changed(host, &build_dir.join("build.ninja"), &ninja.0)
 }
 
@@ -303,6 +313,7 @@ fn prepare_directory(host: &dyn Host, build_dir: &Path) -> Result<(), GenError> 
         .map_err(|error| generation_error(&directory, error.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_rules(
     result: &GenerationResult,
     host: &dyn Host,
@@ -310,6 +321,8 @@ fn write_rules(
     uses_modules: bool,
     model: Option<&ProjectModel>,
     commands: &Commands,
+    ninja_cmd: &[u8],
+    custom_clean: bool,
 ) -> Result<(), GenError> {
     let uses_fortran = result.graphs.iter().any(fortran::uses_fortran);
     let mut ninja = if uses_modules || uses_fortran {
@@ -328,6 +341,25 @@ fn write_rules(
     } else {
         Ninja(RULES.as_bytes().to_vec())
     };
+    ninja.0.extend_from_slice(b"\nrule CLEAN\n");
+    let mut clean_cmd = ninja_cmd.to_vec();
+    clean_cmd.extend_from_slice(b" $FILE_ARG -t clean $TARGETS");
+    ninja.0.extend_from_slice(b"  command = ");
+    ninja.0.extend_from_slice(&clean_cmd);
+    ninja
+        .0
+        .extend_from_slice(b"\n  description = Cleaning all built files...\n");
+    if custom_clean {
+        ninja.0.extend_from_slice(
+            b"\nrule CLEAN_CUSTOM\n  command = $COMMAND\n  description = Cleaning all built files...\n",
+        );
+    }
+    ninja.0.extend_from_slice(b"\nrule HELP\n");
+    ninja.0.extend_from_slice(b"  command = ");
+    ninja.0.extend_from_slice(ninja_cmd);
+    ninja
+        .0
+        .extend_from_slice(b" -t targets\n  description = All primary targets available:\n");
     if result
         .graphs
         .iter()
@@ -428,6 +460,31 @@ fn add_install_scripts(
         let script = graph.node(&dir.append(b"cmake_install.cmake"));
         if seen.insert(script.clone()) {
             outputs.push(script);
+        }
+    }
+}
+
+fn add_ctest_files(outputs: &mut Vec<BString>, graph: &Graph<'_>, model: Option<&ProjectModel>) {
+    let Some(model) = model else {
+        return;
+    };
+    let root_testing = model
+        .definition(DirId::ROOT, b"CMAKE_TESTING_ENABLED")
+        .is_some_and(|value| rcmake_base::truth::is_on(value));
+    let mut seen: HashSet<_> = outputs.iter().cloned().collect();
+    for (_, dir) in model.dirs() {
+        if !root_testing
+            && !dir
+                .props
+                .get(b"CMAKE_TESTING_ENABLED")
+                .is_some_and(|value| rcmake_base::truth::is_on(value))
+        {
+            continue;
+        }
+        let dir_lex = rcmake_base::path_lex::Lexical::new(&dir.binary_dir);
+        let file = graph.node(&dir_lex.append(b"CTestTestfile.cmake"));
+        if seen.insert(file.clone()) {
+            outputs.push(file);
         }
     }
 }

@@ -73,7 +73,7 @@ pub(super) fn interface_includes(
             .map(|value| {
                 list::split(&value, list::Empty::Drop)
                     .into_iter()
-                    .map(|path| cmake_style(&path))
+                    .map(|path| without_trailing_slashes(cmake_style(&path)))
             })
         };
         let system = system_includes
@@ -106,4 +106,15 @@ pub(super) fn interface_includes(
             Object(entry)
         })
         .collect())
+}
+
+fn without_trailing_slashes(path: BString) -> BString {
+    let mut bytes = path.as_slice();
+    while bytes.len() > 1
+        && bytes.last() == Some(&b'/')
+        && !(bytes.len() == 3 && bytes.get(1) == Some(&b':'))
+    {
+        bytes = bytes.strip_suffix(b"/").unwrap_or(bytes);
+    }
+    BString::from(bytes)
 }

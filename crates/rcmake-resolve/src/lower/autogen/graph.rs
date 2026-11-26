@@ -728,6 +728,10 @@ fn add_utility(
         origin.policies.policies,
     );
     target.props.set("EXCLUDE_FROM_ALL".into(), "TRUE".into());
+    // `cmQtAutoGenInitializer` calls `SetIsGeneratorProvided(true)`.
+    target
+        .props
+        .set(crate::target::GENERATOR_PROVIDED.into(), "1".into());
     if !folder.is_empty() {
         target.props.set("FOLDER".into(), folder.clone());
     }

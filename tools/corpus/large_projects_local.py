@@ -30,6 +30,7 @@ import tomllib
 from typing import BinaryIO
 from xml.etree.ElementTree import ParseError
 
+from normalize import normalize_codemodel_abstract_target_ties
 from pathswap import check_exec_log, executable, write_json
 from ninja_canon import Normalizer, normalized_commands
 from path_swap_eval import (
@@ -380,7 +381,9 @@ def model_data(reply: Path, normalizer: Normalizer) -> dict:
         return normalizer.text(value) if isinstance(value, str) else value
 
     index = read(indexes[0].name)
-    return expand(read(index["reply"]["codemodel-v2"]["jsonFile"]))
+    return normalize_codemodel_abstract_target_ties(
+        expand(read(index["reply"]["codemodel-v2"]["jsonFile"]))
+    )
 
 
 def verify_configure(log: Path, build: Path, bin_dir: Path, peer: Path,

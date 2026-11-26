@@ -18,6 +18,7 @@ rcmake-genex.workspace = true
 rcmake-host.workspace = true
 rcmake-json.workspace = true
 rcmake-model.workspace = true
+rcmake-regex.workspace = true
 rcmake-resolve.workspace = true
 thiserror.workspace = true
 
