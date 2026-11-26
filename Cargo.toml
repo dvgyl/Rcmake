@@ -162,13 +162,13 @@ opt-level = "z"
 opt-level = "s"
 
 [profile.release.package.rcmake-cpack]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.rcmake-cps]
 opt-level = "s"
 
 [profile.release.package.rcmake-ctest]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.rcmake-fetch]
 opt-level = "s"
@@ -183,7 +183,7 @@ opt-level = "s"
 opt-level = "s"
 
 [profile.release.package.rcmake-lsp]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.rcmake-presets]
 opt-level = "s"
@@ -192,7 +192,7 @@ opt-level = "s"
 opt-level = "s"
 
 [profile.release.package.rcmake-tool-e]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.sevenz-rust2]
 opt-level = "z"
