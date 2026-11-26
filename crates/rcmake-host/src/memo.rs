@@ -736,6 +736,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn wait_until_entered(&self) {
             let mut state = self.state.lock().unwrap();
             while !state.0 {
@@ -743,6 +744,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn release(&self) {
             self.state.lock().unwrap().1 = true;
             self.changed.notify_all();
