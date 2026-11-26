@@ -24,7 +24,7 @@ pub(super) fn link_flags(
     target: &Target,
     config: &ConfigId,
     step: &LinkStep,
-    usage: &UsageResolver<'_>,
+    usage: &mut UsageResolver<'_>,
     libraries: &RuntimeLibraries,
     languages: &IndexSet<BString>,
 ) -> Result<Vec<BString>, ResolveError> {
@@ -51,7 +51,7 @@ pub(super) fn link_flags(
         && shared_runtime_setting(model, target, step, b"_FLAG").is_some_and(|value| {
             !value.is_empty() && !value.ends_with(b"-NOTFOUND") && value != b"NOTFOUND"
         })
-        && needs_tree_rpath(model, target, config, step)?
+        && needs_tree_rpath(model, target, config, step, usage)?
     {
         let message: BString = format!(
             "The install of the {} target requires changing an RPATH from the build tree, but this is not supported with the Ninja generator unless on an ELF-based or XCOFF-based platform.  The CMAKE_BUILD_WITH_INSTALL_RPATH variable may be set to avoid this relinking step.",
@@ -69,7 +69,15 @@ pub(super) fn link_flags(
         return Err(ResolveError::Message(message));
     }
     let prefix = runtime_setting(model, target, step, b"_FLAG").unwrap_or(b"-Wl,-rpath,");
-    let paths = RuntimePaths::new(model, target, config, step, darwin, libraries, languages)?;
+    let paths = RuntimePaths::new(
+        model,
+        target,
+        config,
+        step,
+        darwin,
+        languages,
+        (libraries, usage),
+    )?;
     let build = if build_with_install_rpath(model, target) {
         &paths.install
     } else {
@@ -118,11 +126,11 @@ impl RuntimePaths {
         config: &ConfigId,
         step: &LinkStep,
         darwin: bool,
-        libraries: &RuntimeLibraries,
         languages: &IndexSet<BString>,
+        (libraries, usage): (&RuntimeLibraries, &mut UsageResolver<'_>),
     ) -> Result<Self, ResolveError> {
         let implicit = implicit_directories(model, target, &step.language);
-        let paths = |installs, skip| {
+        let mut paths = |installs, skip| {
             if on(model, target, b"CMAKE_SKIP_RPATH") || skip {
                 return Ok(IndexSet::new());
             }
@@ -131,7 +139,7 @@ impl RuntimePaths {
             } else {
                 b"BUILD_RPATH"
             };
-            let value = rpath_value(model, target, config, step, property)?;
+            let value = rpath_value(model, target, config, step, property, usage)?;
             Ok::<_, ResolveError>(rpath_entries(
                 model, target, step, darwin, libraries, installs, &value, &implicit,
             ))
@@ -228,6 +236,7 @@ fn needs_tree_rpath(
     target: &Target,
     config: &ConfigId,
     step: &LinkStep,
+    usage: &mut UsageResolver<'_>,
 ) -> Result<bool, ResolveError> {
     let build = !property_on(model, target, b"SKIP_BUILD_RPATH")
         && (target_property(model, target, b"BUILD_RPATH").is_some()
@@ -237,7 +246,7 @@ fn needs_tree_rpath(
                 .any(|part| part.role == LinkFragmentRole::Libraries));
     Ok(build
         || (!on(model, target, b"CMAKE_SKIP_INSTALL_RPATH")
-            && !rpath_value(model, target, config, step, b"INSTALL_RPATH")?.is_empty()))
+            && !rpath_value(model, target, config, step, b"INSTALL_RPATH", usage)?.is_empty()))
 }
 
 fn build_with_install_rpath(model: &ProjectModel, target: &Target) -> bool {
@@ -258,6 +267,7 @@ fn rpath_value(
     config: &ConfigId,
     link: &LinkStep,
     property: &[u8],
+    usage: &mut UsageResolver<'_>,
 ) -> Result<BString, ResolveError> {
     let Some(value) = target_property(model, target, property) else {
         return Ok(BString::default());
@@ -270,7 +280,7 @@ fn rpath_value(
             link_language: Some(link.language.clone()),
             ..EvalContext::default()
         };
-        return UsageResolver::new(model).eval_ide_property(id, property, value, &ctx);
+        return usage.eval_ide_property(id, property, value, &ctx);
     }
     Ok(value.clone())
 }
@@ -571,7 +581,7 @@ fn open_link_paths(
     target: &Target,
     config: &ConfigId,
     step: &LinkStep,
-    host: Option<&dyn rcmake_host::Host>,
+    usage: &mut UsageResolver<'_>,
 ) -> Result<RuntimeLibraries, ResolveError> {
     let mut libraries = linked_libraries(step);
     if is_darwin(model, target.dir) {
@@ -579,12 +589,7 @@ fn open_link_paths(
             model, target, config, step, &libraries,
         ));
     }
-    let paths = host.map(crate::sources::SourcePaths::new);
-    let mut usage = paths.as_ref().map_or_else(
-        || UsageResolver::new(model),
-        |paths| UsageResolver::with_source_paths(model, paths),
-    );
-    runtime_libraries(model, target, config, step, &libraries, &mut usage)
+    runtime_libraries(model, target, config, step, &libraries, usage)
 }
 
 pub(in crate::lower) fn install_rpath(
@@ -593,7 +598,7 @@ pub(in crate::lower) fn install_rpath(
     resolved: &ResolvedTarget,
     languages: &IndexSet<BString>,
     targets: &IndexMap<(TargetId, &ConfigId), &ResolvedTarget>,
-    host: Option<&dyn rcmake_host::Host>,
+    usage: &mut UsageResolver<'_>,
 ) -> Result<Option<RuntimeEdit>, ResolveError> {
     let Some(link) = resolved
         .link
@@ -606,15 +611,15 @@ pub(in crate::lower) fn install_rpath(
     if !darwin && !elf_edit_enabled(model, target, link) {
         return Ok(None);
     }
-    let libraries = open_link_paths(model, target, &resolved.config, link, host)?;
+    let libraries = open_link_paths(model, target, &resolved.config, link, usage)?;
     let paths = RuntimePaths::new(
         model,
         target,
         &resolved.config,
         link,
         darwin,
-        &libraries,
         languages,
+        (&libraries, usage),
     )?;
     if darwin {
         let old_name =
@@ -636,7 +641,7 @@ pub(in crate::lower) fn install_rpath(
         } else {
             None
         };
-        let changes = linked_install_names(model, resolved, link, targets)?;
+        let changes = linked_install_names(model, resolved, link, targets, usage)?;
         let update_paths = !build_with_install_rpath(model, target)
             && !on(model, target, b"CMAKE_NO_BUILTIN_CHRPATH")
             && runtime_setting(model, target, link, b"_FLAG") != Some(b"")
@@ -671,6 +676,7 @@ fn linked_install_names(
     resolved: &ResolvedTarget,
     link: &LinkStep,
     targets: &IndexMap<(TargetId, &ConfigId), &ResolvedTarget>,
+    usage: &mut UsageResolver<'_>,
 ) -> Result<IndexMap<BString, BString>, ResolveError> {
     let context = EvalContext {
         config: resolved.config.clone(),
@@ -678,7 +684,6 @@ fn linked_install_names(
         ..Default::default()
     };
     let mut changes = IndexMap::new();
-    let mut usage = UsageResolver::new(model);
     for id in usage.link_targets(resolved.id, &context)? {
         let Some(dependency) = model
             .target(id)
@@ -726,7 +731,15 @@ pub(crate) fn ide_rpaths(
     usage: &mut UsageResolver<'_>,
 ) -> Result<Vec<BString>, ResolveError> {
     let libraries = runtime_libraries(model, target, config, step, libraries, usage)?;
-    let paths = RuntimePaths::new(model, target, config, step, true, &libraries, languages)?;
+    let paths = RuntimePaths::new(
+        model,
+        target,
+        config,
+        step,
+        true,
+        languages,
+        (&libraries, usage),
+    )?;
     Ok(if build_with_install_rpath(model, target) {
         paths.install
     } else {

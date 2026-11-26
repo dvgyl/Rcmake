@@ -12,8 +12,8 @@ use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, Limits, list, path_lex::Lexical, truth};
 use rcmake_diag::{Frame, Location, MessageKind};
 use rcmake_genex::{
-    EvalContext, EvalFlags, EvalSite, GenexError, GenexNode, TargetHandle, UsageTraversal,
-    evaluate, parse,
+    EvalContext, EvalFlags, EvalSite, GenexAst, GenexError, GenexNode, ParseCache, TargetHandle,
+    UsageTraversal, evaluate,
 };
 use rcmake_model::{
     BT, DirId, FileSet, FileSetId, FileSetKind, ProjectModel, Target, TargetId, TargetKind,
@@ -123,6 +123,7 @@ pub struct UsageResolver<'a> {
     artifact_properties: Vec<(TargetId, rcmake_genex::ConfigId, BString)>,
     source_paths: Option<&'a SourcePaths<'a>>,
     ids: Arc<[TargetId]>,
+    parsed: ParseCache,
     memo: HashMap<MemoKey<'static>, Arc<WalkValue>>,
     link_memo: HashMap<link::LinkMemoKey, link::SharedLinks>,
     debug_configs: Vec<BString>,
@@ -152,6 +153,7 @@ impl<'a> UsageResolver<'a> {
             runtime_install_targets: IndexSet::new(),
             source_paths: None,
             ids: model.targets().map(|(id, _)| id).collect(),
+            parsed: ParseCache::default(),
             memo: HashMap::new(),
             link_memo: HashMap::new(),
             debug_configs: model
@@ -202,6 +204,7 @@ impl<'a> UsageResolver<'a> {
             runtime_install_targets: IndexSet::new(),
             source_paths: None,
             ids: Arc::clone(&self.ids),
+            parsed: ParseCache::default(),
             memo: HashMap::new(),
             link_memo: HashMap::new(),
             debug_configs: self.debug_configs.clone(),
@@ -262,6 +265,10 @@ impl<'a> UsageResolver<'a> {
         self.source_paths
     }
 
+    pub(crate) fn parse_genex(&mut self, input: &[u8]) -> Result<Arc<GenexAst>, GenexError> {
+        self.parsed.parse(input)
+    }
+
     /// Borrow a generator expression host with the given default lookup directory.
     pub fn host(&mut self, lookup_dir: DirId) -> ModelGenexHost<'a, '_> {
         ModelGenexHost::new(self, lookup_dir)
@@ -310,14 +317,18 @@ impl<'a> UsageResolver<'a> {
         let name = field.name().as_bytes();
         let mut ctx = self.property_context(target, name, ctx)?;
         let mut chains = record.then(Vec::new);
-        let mut seen = HashSet::new();
         let mut value = if field == UsageField::LinkOptions
             && self.target(target)?.kind == TargetKind::StaticLibrary
         {
             let mut value = self.archive_options(target, &ctx)?;
-            value
-                .entries
-                .retain(|entry| seen.insert(entry.value.clone()));
+            let mut seen = IndexMap::new();
+            for entry in std::mem::take(&mut value.entries) {
+                seen.entry(entry.value).or_insert(entry.backtrace);
+            }
+            value.entries.extend(
+                seen.into_iter()
+                    .map(|(value, backtrace)| BT::new(value, backtrace)),
+            );
             if let Some(chains) = &mut chains {
                 chains.resize_with(value.entries.len(), Vec::new);
             }
@@ -333,6 +344,7 @@ impl<'a> UsageResolver<'a> {
                 entries: Vec::new(),
                 flags: result.flags,
             };
+            let mut seen = HashSet::new();
             for (owner, entries) in &result.contributions {
                 if field == UsageField::LinkDirectories
                     && self.property_reads == 0
@@ -347,7 +359,7 @@ impl<'a> UsageResolver<'a> {
                     )?;
                 }
                 for entry in &**entries {
-                    if seen.insert(entry.value.clone()) {
+                    if seen.insert(entry.value.as_slice()) {
                         let mut entry = entry.clone();
                         if self.codemodel_backtraces
                             && let Some(edge) = result
@@ -845,9 +857,21 @@ impl<'a> UsageResolver<'a> {
             backtrace: entry.backtrace.clone(),
             property: Some(property.into()),
         };
-        let mut ast = parse(&entry.value)?;
-        if link_edges || ctx.traversal == UsageTraversal::Compile {
-            prepare_nodes(&mut ast.nodes, ctx.traversal, link_edges);
+        let mut ast = self.parse_genex(&entry.value)?;
+        let may_rewrite = |name: &[u8]| entry.value.windows(name.len()).any(|value| value == name);
+        let rewrite = match ctx.traversal {
+            UsageTraversal::Compile => {
+                may_rewrite(b"LINK_ONLY")
+                    || (link_edges && (may_rewrite(b"LINK_LIBRARY") || may_rewrite(b"LINK_GROUP")))
+            }
+            UsageTraversal::Link => link_edges && may_rewrite(b"COMPILE_ONLY"),
+        };
+        if rewrite {
+            prepare_nodes(
+                &mut Arc::make_mut(&mut ast).nodes,
+                ctx.traversal,
+                link_edges,
+            );
         }
         let root = &self.model.dir(DirId::ROOT).source_dir;
         let mut host = self.host(dir);

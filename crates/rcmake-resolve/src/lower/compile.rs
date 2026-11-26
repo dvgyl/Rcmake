@@ -5,7 +5,7 @@ pub(crate) mod msvc;
 
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
-use rcmake_genex::{ConfigId, EvalContext, evaluate, parse};
+use rcmake_genex::{ConfigId, EvalContext, evaluate};
 use rcmake_model::{DirId, GeneratorKind, ProjectModel, Target};
 
 use super::artifacts::{compile_pdb, is_darwin};
@@ -44,7 +44,7 @@ fn compile_flags(
     group: &CompileGroup,
     required_standard: Option<&[u8]>,
     position_independent: Option<bool>,
-    architecture: Option<&[u8]>,
+    (architecture, usage): (Option<&[u8]>, Option<&mut UsageResolver<'_>>),
 ) -> Result<Vec<BString>, ResolveError> {
     let language = group.language.as_slice();
     let mut flags = language_flags(model, target, config, language);
@@ -91,8 +91,14 @@ fn compile_flags(
             language: Some(group.language.clone()),
             ..EvalContext::default()
         };
-        let mut usage = crate::usage::UsageResolver::new(model);
-        let (runtime, _) = evaluate(&parse(raw)?, &context, &mut usage.host(target.dir))?;
+        let evaluate_runtime = |usage: &mut UsageResolver<'_>| {
+            let ast = usage.parse_genex(raw)?;
+            evaluate(&ast, &context, &mut usage.host(target.dir))
+        };
+        let (runtime, _) = match usage {
+            Some(usage) => evaluate_runtime(usage)?,
+            None => evaluate_runtime(&mut UsageResolver::new(model))?,
+        };
         if !runtime.is_empty()
             && let Some(options) = definition(
                 model,
@@ -146,7 +152,15 @@ pub fn codemodel_compile_info(
     };
     let features = usage.collect(id, rcmake_model::UsageField::CompileFeatures, &context)?;
     let standard = super::required_standard(&group.language, &features.entries);
-    let flags = compile_flags(model, target, config, group, standard, None, None)?;
+    let flags = compile_flags(
+        model,
+        target,
+        config,
+        group,
+        standard,
+        None,
+        (None, Some(usage)),
+    )?;
     let standard = codemodel_standard(model, target, &group.language, &features.entries);
     Ok((join_words(flags), standard))
 }
@@ -304,7 +318,7 @@ pub(super) fn compile_arguments(
         required_standard,
         source,
         position_independent,
-        None,
+        (None, None),
     )
 }
 
@@ -320,7 +334,7 @@ fn compile_arguments_for_arch(
     required_standard: Option<&[u8]>,
     source: &[u8],
     position_independent: Option<bool>,
-    architecture: Option<&[u8]>,
+    architecture_and_usage: (Option<&[u8]>, Option<&mut UsageResolver<'_>>),
 ) -> Result<(Vec<BString>, BString, BString), ResolveError> {
     let language = group.language.as_slice();
     let mut flags = compile_flags(
@@ -330,7 +344,7 @@ fn compile_arguments_for_arch(
         group,
         required_standard,
         position_independent,
-        architecture,
+        architecture_and_usage,
     )?;
     flags.extend(
         group
@@ -439,7 +453,7 @@ pub(super) fn compile(
         settings.standard,
         &source,
         settings.position_independent,
-        settings.pch.and_then(PchFlags::architecture),
+        (settings.pch.and_then(PchFlags::architecture), Some(usage)),
     )?;
     let includes = join_words([
         includes,

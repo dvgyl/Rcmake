@@ -1,8 +1,35 @@
 //! Lexer and parser (`cmGeneratorExpressionLexer` and `cmGeneratorExpressionParser`).
 
+use std::{collections::HashMap, sync::Arc};
+
 use rcmake_base::BString;
 
 use crate::{GenexAst, GenexError, GenexExpr, GenexNode, MAX_NESTING};
+
+/// Reuse parsed generator expressions within a resolution session.
+#[derive(Default)]
+pub struct ParseCache {
+    entries: HashMap<BString, Arc<GenexAst>>,
+    key_bytes: usize,
+}
+
+impl ParseCache {
+    /// Return the parsed expression. Keep successful parses of common sizes.
+    pub fn parse(&mut self, input: &[u8]) -> Result<Arc<GenexAst>, GenexError> {
+        const MAX_ENTRIES: usize = 4_096;
+        const MAX_KEY_BYTES: usize = 1024 * 1024;
+
+        if let Some(ast) = self.entries.get(input) {
+            return Ok(Arc::clone(ast));
+        }
+        let ast = Arc::new(parse(input)?);
+        if self.entries.len() < MAX_ENTRIES && input.len() <= MAX_KEY_BYTES - self.key_bytes {
+            self.key_bytes += input.len();
+            self.entries.insert(input.into(), Arc::clone(&ast));
+        }
+        Ok(ast)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Token<'a> {
@@ -243,6 +270,19 @@ mod tests {
 
     fn text(s: &str) -> GenexNode {
         GenexNode::Text(s.into())
+    }
+
+    #[test]
+    fn repeated_input_reuses_the_parsed_tree() -> Result<(), GenexError> {
+        let mut cache = ParseCache::default();
+        let text = b"$<$<CONFIG:Debug>:-DDEBUG>";
+        let first = cache.parse(text)?;
+        let second = cache.parse(text)?;
+        let other = cache.parse(b"$<$<CONFIG:Release>:-DDEBUG>")?;
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_ne!(first, other);
+        assert_eq!(*second, parse(text)?);
+        Ok(())
     }
 
     #[test]

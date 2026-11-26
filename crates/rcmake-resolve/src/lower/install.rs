@@ -307,6 +307,8 @@ fn runtime_edits(
         .iter()
         .map(|target| ((target.id, &target.config), target))
         .collect();
+    let paths = host.map(crate::sources::SourcePaths::new);
+    let mut resolvers = IndexMap::new();
     let mut edits = IndexMap::new();
     for target in targets {
         let Some(raw) = model.target(target.id) else {
@@ -328,8 +330,14 @@ fn runtime_edits(
                 .collect();
             &fallback
         };
+        let usage = resolvers.entry(&target.config).or_insert_with(|| {
+            paths.as_ref().map_or_else(
+                || UsageResolver::new(model),
+                |paths| UsageResolver::with_source_paths(model, paths),
+            )
+        });
         if let Some(edit) =
-            super::link::rpath::install_rpath(model, raw, target, languages, &facts, host)?
+            super::link::rpath::install_rpath(model, raw, target, languages, &facts, usage)?
         {
             for rule in rules {
                 warn(rule, raw, &edit);

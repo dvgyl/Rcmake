@@ -77,7 +77,12 @@ fn eval(
     expression: &[u8],
     ctx: &EvalContext,
 ) -> Result<BString, GenexError> {
-    evaluate(&parse(expression)?, ctx, &mut resolver.host(DirId::ROOT)).map(|result| result.0)
+    evaluate(
+        &rcmake_genex::parse(expression)?,
+        ctx,
+        &mut resolver.host(DirId::ROOT),
+    )
+    .map(|result| result.0)
 }
 
 fn values(entries: &[BT<BString>]) -> BString {

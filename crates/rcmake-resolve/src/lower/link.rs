@@ -3,7 +3,7 @@
 use indexmap::IndexSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
-use rcmake_genex::{ConfigId, EvalContext, UsageTraversal, evaluate, parse};
+use rcmake_genex::{ConfigId, EvalContext, UsageTraversal, evaluate};
 use rcmake_model::{DirId, ProjectModel, Target};
 
 use super::artifacts::{build_relative, is_darwin, is_msvc};
@@ -551,8 +551,8 @@ pub(super) fn link(
                 traversal: UsageTraversal::Link,
                 ..EvalContext::default()
             };
-            let mut usage = UsageResolver::new(model);
-            evaluate(&parse(value)?, &ctx, &mut usage.host(target.dir))
+            let ast = usage.parse_genex(value)?;
+            evaluate(&ast, &ctx, &mut usage.host(target.dir))
                 .map(|(text, _)| text)
                 .map_err(ResolveError::from)
         })

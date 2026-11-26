@@ -144,6 +144,7 @@ pub(crate) fn resolve_target<'a>(
         .into_iter()
         .chain(members.values().map(|member| member.source.clone()))
         .map(|source| (source, None));
+    let mut compile_ctx = ctx.clone();
     let mut entry_start = 0;
     let mut entry_backtrace = None::<rcmake_diag::Backtrace>;
     for (mut source, unity_file) in unity_sources.chain(original_sources) {
@@ -241,10 +242,7 @@ pub(crate) fn resolve_target<'a>(
         let (group, facts) = match groups.entry(group_key) {
             Entry::Occupied(entry) => (entry.index(), entry.into_mut()),
             Entry::Vacant(entry) => {
-                let compile_ctx = EvalContext {
-                    language: Some(language.clone()),
-                    ..ctx.clone()
-                };
+                compile_ctx.language = Some(language.clone());
                 let features =
                     usage.collect_for_result(id, UsageField::CompileFeatures, &compile_ctx)?;
                 for feature in &features.entries {
@@ -907,16 +905,15 @@ fn expand_rule_patterns(
 /// to a compile line. A generator expression can produce such a value after the
 /// `target_compile_definitions()` command has removed the literal ones.
 fn strip_define_flags(defines: Vec<BT<BString>>) -> Vec<BT<BString>> {
-    let mut seen = std::collections::HashSet::new();
-    defines
-        .into_iter()
-        .map(|mut define| {
-            if let Some(name) = define.value.strip_prefix(b"-D") {
-                define.value = name.into();
-            }
-            define
-        })
-        .filter(|define| seen.insert(define.value.clone()))
+    let mut seen = IndexMap::new();
+    for mut define in defines {
+        if define.value.starts_with(b"-D") {
+            define.value.drain(..2);
+        }
+        seen.entry(define.value).or_insert(define.backtrace);
+    }
+    seen.into_iter()
+        .map(|(value, backtrace)| BT::new(value, backtrace))
         .collect()
 }
 

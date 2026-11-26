@@ -15,7 +15,7 @@ mod parse;
 mod preprocess;
 
 pub use eval::{evaluate, evaluate_diagnostics, evaluate_with_target_lookups};
-pub use parse::{parse, render};
+pub use parse::{ParseCache, parse, render};
 pub use preprocess::{PreprocessMode, find_genex, genex_strip, rewrite_install_prefix, strip};
 
 /// Maximum nesting depth of `$<...>` that [`parse`] accepts.
