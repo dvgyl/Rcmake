@@ -126,9 +126,9 @@ Differential runs also surfaced five subtle edge cases. `qtbase` parsed `try_com
 | --- | --- | --- |
 | Release commit | Git SHA and date | <!-- METRIC:release_commit -->`70c233134676`<!-- /METRIC --> (<!-- METRIC:release_date -->`2026-11-27`<!-- /METRIC -->) |
 | 3-OS CI and corpus smoke | `ubuntu-24.04`, `macos-15`, `windows-2025` | <!-- METRIC:ci_jobs -->6 of 6 jobs green<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, macOS arm64 | 371 suites run (`all-macos`) | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Linux | 362 suites run (`linux`) | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Windows | 367 suites run (`windows`) | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, macOS arm64 | 371 suites planned (`all-macos`) | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Linux | 362 suites planned (`linux`) | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Windows | 367 suites planned (`windows`) | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
 | Upstream Core-62 conformance | 62 core suites (`core`) | <!-- METRIC:runcmake_core62 -->pending frozen release run<!-- /METRIC --> |
 | Upstream policies | 35 policy suites for the 161 policies `CMP0066` to `CMP0226` | <!-- METRIC:runcmake_policies -->pending frozen release run<!-- /METRIC --> |
 | Independent black-box suite | 20 scenarios, 679 checks | <!-- METRIC:independent_scenarios -->20 / 20 scenarios (679 / 679 checks passed)<!-- /METRIC --> |

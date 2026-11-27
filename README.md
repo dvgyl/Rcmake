@@ -76,9 +76,9 @@ You can also try `rcmake` in the [browser playground](https://rcmake.github.io/r
 | Check | Result |
 | --- | --- |
 | 3-OS CI (`ubuntu-24.04`, `macos-15`, `windows-2025`) and corpus smoke (6 jobs) | <!-- METRIC:ci_jobs -->6 of 6 jobs green<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, macOS arm64 (371 of 463 suites run) | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Linux (362 of 463 suites run) | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Windows (367 of 463 suites run) | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, macOS arm64 (371 of 463 suites planned) | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Linux (362 of 463 suites planned) | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Windows (367 of 463 suites planned) | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
 | Independent black-box differential suite (20 scenarios, 679 checks) | <!-- METRIC:independent_scenarios -->20 / 20 scenarios (679 / 679 checks passed)<!-- /METRIC --> |
 | Large C++ projects, L1 configure parity (10 projects) | <!-- METRIC:large_projects_l1 -->0 / 10 passed<!-- /METRIC --> |
 | Large C++ projects, L2 Ninja build-graph and File API parity (10 projects) | <!-- METRIC:large_projects_l2 -->7 / 10 passed<!-- /METRIC --> |
