@@ -984,7 +984,7 @@ mod tests {
         let (code, _, err) = run(&host, &["import", "missing.tar.gz", "--sha256", "xyz"]);
         assert_eq!(code, 1);
         assert!(err.contains("64 hexadecimal digits"), "{err}");
-        host.seed_file(Path::new("/work/bad.tar.gz"), b"not an archive")?;
+        host.seed_file(&host.initial_cwd().join("bad.tar.gz"), b"not an archive")?;
         let (code, _, err) = run(&host, &["import", "bad.tar.gz"]);
         assert_eq!(code, 1);
         assert!(err.contains("Invalid archive"), "{err}");
