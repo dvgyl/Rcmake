@@ -23,6 +23,7 @@ use crate::{cache, emit_cli_error, new_interp_with_paths, presets};
 mod cache_glob;
 mod cache_setup;
 mod diagnostics;
+pub(crate) mod find_hints;
 mod graphviz;
 mod preloads;
 mod profiling;
@@ -128,10 +129,12 @@ struct Configured {
 /// Allows `ccmake` to run [`RetainedConfigure::generate`] directly on the
 /// configured [`Interp`] and model without re-executing `CMakeLists.txt` or
 /// spawning configure-time child processes a second time.
+#[cfg(any(unix, test))]
 pub(crate) struct RetainedConfigure {
     inner: Option<RetainedInner>,
 }
 
+#[cfg(any(unix, test))]
 struct RetainedInner {
     argv: Vec<BString>,
     host: Arc<dyn Host>,
@@ -149,6 +152,7 @@ struct RetainedInner {
     time: FileTime,
 }
 
+#[cfg(any(unix, test))]
 impl RetainedConfigure {
     /// Run the generate phase on the retained configured session and finalize
     /// runtime records, profiling, and SARIF output.
@@ -200,6 +204,7 @@ impl RetainedConfigure {
     }
 }
 
+#[cfg(any(unix, test))]
 impl Drop for RetainedConfigure {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
@@ -209,6 +214,7 @@ impl Drop for RetainedConfigure {
 }
 
 /// Resolve the target binary directory for `opts` without modifying disk state.
+#[cfg(any(unix, test))]
 pub(crate) fn resolve_binary_dir(opts: &Options, host: &dyn Host) -> PathBuf {
     let (mut src, mut bin) = resolve_directories(
         host,
@@ -246,6 +252,7 @@ pub(crate) fn resolve_binary_dir(opts: &Options, host: &dyn Host) -> PathBuf {
 /// preset variables, the cache arguments (`-C`, `-D`, `-U`) in order, and the
 /// `PreLoad.cmake` scripts (`cmCursesMainForm::LoadCache`). The function writes no
 /// file.
+#[cfg(any(unix, test))]
 pub(crate) fn prepare_cache(
     argv: Vec<BString>,
     mut opts: Options,
@@ -271,6 +278,7 @@ pub(crate) fn prepare_cache(
 
 /// Run ONLY the configure phase (writing `CMakeCache.txt` without generating
 /// build files) and return the retained session ready for [`RetainedConfigure::generate`].
+#[cfg(any(unix, test))]
 pub(crate) fn configure_only(
     argv: Vec<BString>,
     opts: Options,
@@ -423,6 +431,7 @@ fn configure_project(
         let time = session.host.now();
         let mut preloads = session.apply_cache_edits(&runtime, &mut interp);
         let mut results = std::mem::take(&mut preloads.results);
+        let mut ran = false;
         let outcome = (|| {
             if runtime.denied() {
                 return Err(Exit::Code(1));
@@ -450,6 +459,7 @@ fn configure_project(
                     crate::debugger::attach(active_debugger.as_ref(), &mut interp);
                 }
             }
+            ran = true;
             let configured = session.configure(
                 &mut runtime,
                 &mut interp,
@@ -496,6 +506,14 @@ fn configure_project(
             Err(Exit::Code(code)) => *code,
             Err(Exit::Message(_)) => 1,
         };
+        find_hints::finish(
+            session.host.as_ref(),
+            &session.opts,
+            &session.src,
+            &session.bin,
+            &mut interp,
+            ran,
+        );
         let profile = session.profiling.write(session.host.as_ref(), start);
         let sarif = session.write_sarif(&mut interp, results, time, code);
         let final_outcome = match (sarif, profile) {
@@ -701,6 +719,7 @@ impl<'a> ConfigureSession<'a> {
         let hermetic_active = speed.hermetic != rcmake_eval::HermeticMode::Off;
         let services = Services {
             speed,
+            find_trace: find_hints::level(&self.opts, self.host.as_ref()),
             ..Services::default()
         };
         let runtime = ConfigureRuntime::new(

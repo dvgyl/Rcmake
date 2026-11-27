@@ -37,13 +37,25 @@ pub enum PositionEncoding {
     /// Count UTF-16 code units. This is the LSP default.
     #[default]
     Utf16,
+    /// Count Unicode scalar values (UTF-32 code units).
+    Utf32,
 }
 
 impl PositionEncoding {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "utf-8" => Some(Self::Utf8),
+            "utf-16" => Some(Self::Utf16),
+            "utf-32" => Some(Self::Utf32),
+            _ => None,
+        }
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Utf8 => "utf-8",
             Self::Utf16 => "utf-16",
+            Self::Utf32 => "utf-32",
         }
     }
 
@@ -52,6 +64,8 @@ impl PositionEncoding {
             Self::Utf8 => text.len(),
             Self::Utf16 if text.is_ascii() => text.len(),
             Self::Utf16 => text.encode_utf16().count(),
+            Self::Utf32 if text.is_ascii() => text.len(),
+            Self::Utf32 => text.chars().count(),
         }
     }
 }
@@ -171,6 +185,23 @@ impl Lines {
         Position { line, character }
     }
 
+    pub(crate) fn exact_position(
+        &self,
+        text: &str,
+        offset: usize,
+        encoding: PositionEncoding,
+    ) -> Option<Position> {
+        if offset > text.len() || !text.is_char_boundary(offset) {
+            return None;
+        }
+        // Reject endpoints that split a CRLF pair.
+        if offset > 0 && text.as_bytes().get(offset - 1..=offset) == Some(b"\r\n") {
+            return None;
+        }
+        let pos = self.position(text, offset, encoding);
+        (self.edit_offset(text, pos, encoding) == Some(offset)).then_some(pos)
+    }
+
     pub(crate) fn range(
         &self,
         text: &str,
@@ -206,7 +237,11 @@ fn line_offset(line: &str, character: usize, encoding: PositionEncoding) -> (usi
         if units == character {
             return (offset, true);
         }
-        units += scalar.len_utf16();
+        units += match encoding {
+            PositionEncoding::Utf16 => scalar.len_utf16(),
+            PositionEncoding::Utf32 => 1,
+            PositionEncoding::Utf8 => scalar.len_utf8(),
+        };
         if units > character {
             return (offset, false);
         }

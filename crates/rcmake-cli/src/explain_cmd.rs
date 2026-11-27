@@ -8,12 +8,13 @@ use std::time::Duration;
 
 use jiff::tz::TimeZone;
 use rcmake_api::{
-    ApiError, CompletionState, ConfigureRequest, ExplainQuery, ExplainRenderOptions, ExplainReport,
-    LedgerLevel, ProcessPolicy, Services, WriteMode, render_explain_json, render_explain_terminal,
-    run_configure,
+    ApiError, CompletionState, ConfigureRequest, ExplainFilter, ExplainQuery, ExplainRenderOptions,
+    ExplainReport, LedgerLevel, ProcessPolicy, Services, WriteMode, render_explain_json,
+    render_explain_terminal, run_configure,
 };
 use rcmake_base::BString;
 use rcmake_diag::DiagOptions;
+use rcmake_eval::FindTraceLevel;
 use rcmake_host::{
     CopyOptions, DirEntry, FileKind, FileLockGuard, FileTime, Follow, GracefulTimeout, Host,
     HostResult, Metadata, ReadRange, RunOutput, RunRequest, Stream, SystemInfo,
@@ -27,22 +28,34 @@ const HELP: &str = "\
 Usage: rcmake explain <name> [-B <build-dir>] [--target | --var]
                       [--config <cfg>] [--filter <val>] [--json]
                       [--verbose] [--color=auto|always|never]
+       rcmake explain <target> --flag|--define|--include|--dep <val> [options]
+       rcmake explain --find <package> | why-not <package> [options]
+       rcmake explain --eval <expression> [options]
 
 Show where a target gets its build settings or where a variable gets its value.
 
-  -B <build-dir>  Read CMakeCache.txt from this directory. Default: current directory.
-  --target        Look up a target or alias.
-  --var           Look up a variable.
-  --config <cfg>  Select a target configuration. Implies --target.
-  --filter <val>  Select an exact target value or compiler flag. Implies --target.
-  --json          Write one JSON report to standard output.
-  --verbose       Show full values and call stacks in terminal output.
-  --color=<mode>  Set terminal color. Default: auto.
-  -h, --help      Show this help.
+  -B <build-dir>   Read CMakeCache.txt from this directory. Default: current directory.
+  --target         Look up a target or alias.
+  --var            Look up a variable.
+  --config <cfg>   Select a target configuration. Implies --target.
+  --filter <val>   Select an exact target value or compiler flag. Implies --target.
+  --flag <flag>    Show where a compile or link flag comes from. Implies --target.
+                   Use --flag=<flag> for a flag that starts with --.
+  --define <name>  Show where a preprocessor definition comes from. Use NAME or NAME=VALUE.
+  --include <dir>  Show where an include directory comes from.
+  --dep <target>   Show every link and order-only path from the target to <target>.
+  --json           Write one JSON report to standard output.
+  --verbose        Show full values and call stacks in terminal output.
+  --color=<mode>   Set terminal color. Default: auto.
+  -h, --help       Show this help. Use with --find or --eval for their help.
+
+The filter options --filter, --flag, --define, --include, and --dep exclude each other.
 
 Examples
   rcmake explain app
   rcmake explain app --filter -DFOO=1
+  rcmake explain app --define USE_SSL=1
+  rcmake explain app --dep zlib
   rcmake explain CMAKE_CXX_FLAGS --json
 
 Exit status
@@ -50,45 +63,17 @@ Exit status
      Check the configuration and entry lists in JSON or the selection message
      in terminal output.
   1  The query failed, found no item, matched both a target and a variable,
-     or named an unavailable configuration.
+     named an unavailable configuration, or a typed filter matched nothing.
   2  Invalid arguments or an unavailable configured build directory.
 ";
 
 const CONFIGURE_FIRST: &str = "Run configure first, or pass -B <build-dir>.";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Kind {
-    #[default]
-    Auto,
-    Target,
-    Variable,
-}
+mod args;
+mod eval;
+mod find;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Color {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Options {
-    name: BString,
-    build: Option<BString>,
-    kind: Kind,
-    config: Option<BString>,
-    filter: Option<BString>,
-    json: bool,
-    verbose: bool,
-    color: Color,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Invocation {
-    Help,
-    Query(Options),
-}
+use args::{Color, Invocation, Kind, Options, parse};
 
 /// Run explain after the Native dispatcher consumes the subcommand name.
 ///
@@ -99,6 +84,16 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
             host.write_out(Stream::Stdout, HELP.as_bytes());
             return 0;
         }
+        Ok(Invocation::FindHelp) => {
+            host.write_out(Stream::Stdout, find::HELP.as_bytes());
+            return 0;
+        }
+        Ok(Invocation::EvalHelp) => {
+            host.write_out(Stream::Stdout, eval::HELP.as_bytes());
+            return 0;
+        }
+        Ok(Invocation::Find(options)) => return find::run(argv0, &options, &host),
+        Ok(Invocation::Eval(options)) => return eval::run(argv0, &options, &host),
         Ok(Invocation::Query(options)) => options,
         Err(message) => {
             return error(
@@ -108,7 +103,7 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
             );
         }
     };
-    let request = match request(&options, argv0, &host) {
+    let request = match request(options.build.as_ref(), argv0, &host, FindTraceLevel::Off) {
         Ok(request) => request,
         Err(message) => return error(host.as_ref(), &message, 2),
     };
@@ -128,6 +123,48 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
             return error(host.as_ref(), &err.to_string(), code);
         }
     };
+    report_partial(host.as_ref(), &result, options.verbose);
+    let mut filter = options.typed.clone();
+    if let Some(ExplainFilter::Include(dir)) = &mut filter
+        && !path::to_native(dir).is_absolute()
+    {
+        let root = &result.model.dir(rcmake_model::DirId::ROOT).source_dir;
+        *dir =
+            rcmake_base::path_lex::Lexical::new(&[root.as_slice(), b"/", dir.as_slice()].concat())
+                .normalize();
+    }
+    let typed = filter.is_some() && options.filter.is_none();
+    let report = result.explain_with(&query, filter);
+    let code = write_report(host.as_ref(), &options, &report);
+    if code == 0 && typed && typed_filter_empty(&report, options.config.as_ref()) {
+        return 1;
+    }
+    code
+}
+
+fn typed_filter_empty(report: &ExplainReport, config: Option<&BString>) -> bool {
+    let ExplainReport::Target(target) = report else {
+        return false;
+    };
+    if let Some(dependency) = &target.dependency {
+        return dependency.paths.is_empty();
+    }
+    !target
+        .configurations
+        .iter()
+        .filter(|entry| config.is_none_or(|name| name.eq_ignore_ascii_case(&entry.name)))
+        .any(|entry| !entry.entries.is_empty())
+}
+
+/// Return the bundled CMake module directory, for attributing denied subprocesses.
+pub(super) fn module_root(host: &dyn Host, argv0: Option<&BString>) -> Option<BString> {
+    rcmake_host::discover_cmake_root(host, argv0)
+        .1
+        .map(|root| path::from_native_cmake(&root))
+}
+
+/// Print the partial-configure notice for an overlay result.
+pub(super) fn report_partial(host: &dyn Host, result: &rcmake_api::ConfigureResult, verbose: bool) {
     if let CompletionState::Partial {
         denied_processes,
         omitted_denials,
@@ -159,7 +196,7 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
             };
             host.write_out(Stream::Stderr, message.as_bytes());
         } else if count > 0 {
-            if options.verbose {
+            if verbose {
                 let message = cached_probes_note(count);
                 host.write_out(Stream::Stderr, message.as_bytes());
             }
@@ -170,8 +207,6 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
             );
         }
     }
-    let report = result.explain_filtered(&query, options.filter.clone());
-    write_report(host.as_ref(), &options, &report)
 }
 
 fn cached_probes_note(count: usize) -> String {
@@ -185,12 +220,14 @@ fn cached_probes_note(count: usize) -> String {
     )
 }
 
-fn request(
-    options: &Options,
+/// Build the overlay re-configure request for a configured build directory.
+pub(super) fn request(
+    build_arg: Option<&BString>,
     argv0: Option<&BString>,
     host: &Arc<dyn Host>,
+    find_trace: FindTraceLevel,
 ) -> Result<ConfigureRequest, String> {
-    let build = options.build.as_ref().map_or_else(
+    let build = build_arg.map_or_else(
         || host.initial_cwd(),
         |dir| resolve_cli_path(host.as_ref(), dir),
     );
@@ -205,7 +242,7 @@ fn request(
         .filter(|entry| !entry.value.is_empty())
         .map(|entry| path::to_native(&entry.value));
     let missing = || {
-        let hint = if options.build.is_none()
+        let hint = if build_arg.is_none()
             && host
                 .metadata(&build.join("CMakeCache.txt"), Follow::Yes)
                 .is_err_and(|err| err.kind == std::io::ErrorKind::NotFound)
@@ -263,6 +300,7 @@ fn request(
             .process_policy(ProcessPolicy::Deny)
             .services(Services {
                 provenance: LedgerLevel::Full { per_name_cap: 64 },
+                find_trace,
                 ..Services::default()
             })
             .diag(DiagOptions {
@@ -369,103 +407,12 @@ fn render_options<'a>(host: &dyn Host, options: &'a Options) -> ExplainRenderOpt
     render
 }
 
-fn error(host: &dyn Host, message: &str, code: i32) -> i32 {
+pub(super) fn error(host: &dyn Host, message: &str, code: i32) -> i32 {
     host.write_out(
         Stream::Stderr,
         format!("rcmake explain: {message}\n").as_bytes(),
     );
     code
-}
-
-fn parse(args: &[BString]) -> Result<Invocation, String> {
-    let mut options = Options::default();
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        let raw = arg.as_slice();
-        if raw == b"--" {
-            if let Some(name) = args.next() {
-                set_name(&mut options, name)?;
-            }
-            if args.next().is_some() {
-                return Err("Specify one name.".into());
-            }
-            break;
-        }
-        let mut parts = raw.splitn(2, |byte| *byte == b'=');
-        let flag = parts.next().unwrap_or(raw);
-        let attached = parts.next();
-        match (flag, attached) {
-            (b"--help" | b"-h", None) => return Ok(Invocation::Help),
-            (b"--target", None) => set_kind(&mut options, Kind::Target)?,
-            (b"--var", None) => set_kind(&mut options, Kind::Variable)?,
-            (b"--json", None) => options.json = true,
-            (b"--verbose", None) => options.verbose = true,
-            (b"--config", _) => options.config = Some(value(&mut args, attached, "--config")?),
-            (b"--filter", _) => options.filter = Some(value(&mut args, attached, "--filter")?),
-            (b"--color", _) => {
-                options.color = match value(&mut args, attached, "--color")?.as_slice() {
-                    b"auto" => Color::Auto,
-                    b"always" => Color::Always,
-                    b"never" => Color::Never,
-                    _ => return Err("Use --color=auto, --color=always, or --color=never.".into()),
-                };
-            }
-            (b"-B", _) => options.build = Some(value(&mut args, attached, "-B")?),
-            _ => {
-                if let Some(dir) = raw.strip_prefix(b"-B") {
-                    options.build = Some(dir.into());
-                } else if raw.starts_with(b"-") {
-                    return Err(format!("Unknown option {arg:?}."));
-                } else {
-                    set_name(&mut options, arg)?;
-                }
-            }
-        }
-    }
-    if options.name.is_empty() {
-        return Err("Specify the name of a target or variable.".into());
-    }
-    if options.filter.is_some() || options.config.is_some() {
-        if options.kind == Kind::Variable {
-            return Err(
-                "--config and --filter apply to targets. Omit --var to use either option.".into(),
-            );
-        }
-        options.kind = Kind::Target;
-    }
-    Ok(Invocation::Query(options))
-}
-
-fn value<'a>(
-    args: &mut impl Iterator<Item = &'a BString>,
-    attached: Option<&[u8]>,
-    flag: &str,
-) -> Result<BString, String> {
-    let value = attached.or_else(|| {
-        args.next()
-            .map(|value| value.as_slice())
-            .filter(|arg| !arg.starts_with(b"--") && !matches!(*arg, b"-B" | b"-h"))
-    });
-    value
-        .filter(|value| !value.is_empty())
-        .map(BString::from)
-        .ok_or_else(|| format!("Supply a value for {flag}."))
-}
-
-fn set_name(options: &mut Options, name: &BString) -> Result<(), String> {
-    if name.is_empty() || !options.name.is_empty() {
-        return Err("Specify one nonempty name.".into());
-    }
-    options.name = name.clone();
-    Ok(())
-}
-
-fn set_kind(options: &mut Options, kind: Kind) -> Result<(), String> {
-    if options.kind != Kind::Auto && options.kind != kind {
-        return Err("Use either --target or --var.".into());
-    }
-    options.kind = kind;
-    Ok(())
 }
 
 // Keep configure messages on stderr even when CMake writes them to stdout.
@@ -757,6 +704,7 @@ mod tests {
                 kind: Kind::Target,
                 config: Some("Debug".into()),
                 filter: Some("-DFOO=1".into()),
+                typed: Some(ExplainFilter::Any("-DFOO=1".into())),
                 json: true,
                 verbose: true,
                 color: Color::Always,
@@ -870,7 +818,7 @@ execute_process(COMMAND skipped RESULT_VARIABLE status)
             build: Some("out".into()),
             ..Options::default()
         };
-        let req = request(&options, None, &shared)?;
+        let req = request(options.build.as_ref(), None, &shared, FindTraceLevel::Off)?;
         assert_eq!(req.generator, Some(GeneratorKind::Ninja));
         assert_eq!(req.source_dir, root.join("src"));
         assert_eq!(req.build_dir, root.join("out"));
@@ -1016,6 +964,8 @@ execute_process(COMMAND skipped RESULT_VARIABLE status)
             sources: Vec::new(),
             roots: rcmake_api::ExplainRoots::default(),
             filter: None,
+            typed_filter: None,
+            dependency: None,
             configurations: vec![rcmake_api::ExplainConfig {
                 name: "Release".into(),
                 ..rcmake_api::ExplainConfig::default()

@@ -181,6 +181,19 @@ fn target_json(target: &ExplainTarget, config: Option<&[u8]>) -> Value {
             "filter",
             optional(target.filter.as_ref().map(|value| bytes(value))),
         ),
+        (
+            "filter_kind",
+            optional(
+                target
+                    .typed_filter
+                    .as_ref()
+                    .map(|filter| Value::string(filter.kind())),
+            ),
+        ),
+        (
+            "dependency",
+            optional(target.dependency.as_deref().map(dependency_json)),
+        ),
         ("configuration_selection", selection),
         ("configurations", array(configs)),
         ("properties", array(properties)),
@@ -190,6 +203,66 @@ fn target_json(target: &ExplainTarget, config: Option<&[u8]>) -> Value {
         ),
         ("provisional", Value::Bool(target.provisional)),
     ])
+}
+
+fn dependency_json(report: &crate::DependencyReport) -> Value {
+    let paths = report.paths.iter().map(|path| {
+        object([
+            ("config", bytes(&path.config)),
+            ("link_only", Value::Bool(path.link_only)),
+            ("order_only", Value::Bool(path.order_only)),
+            (
+                "hops",
+                array(path.hops.iter().map(|hop| {
+                    let (edge, scope, link_only) = match hop.edge {
+                        crate::DependencyEdge::Link { scope, link_only } => {
+                            ("link", Some(scope_name(scope)), link_only)
+                        }
+                        crate::DependencyEdge::OrderOnly => ("order_only", None, false),
+                    };
+                    object([
+                        ("from", bytes(&hop.from)),
+                        ("to", bytes(&hop.to)),
+                        ("edge", Value::string(edge)),
+                        ("scope", optional(scope.map(Value::string))),
+                        ("link_only", Value::Bool(link_only)),
+                        ("origin", trace(&hop.origin)),
+                    ])
+                })),
+            ),
+        ])
+    });
+    object([
+        ("target", bytes(&report.target)),
+        (
+            "resolved",
+            optional(report.resolved.as_ref().map(|name| bytes(name))),
+        ),
+        ("paths", array(paths)),
+        ("truncated", Value::Bool(report.truncated)),
+        ("cycles", Value::UInt(u64::from(report.cycles))),
+        (
+            "order_only_available",
+            Value::Bool(report.order_only_available),
+        ),
+        ("complete", Value::Bool(report.complete())),
+        (
+            "errors",
+            array(report.errors.iter().map(|error| bytes(error))),
+        ),
+        (
+            "suggestions",
+            array(report.suggestions.iter().map(|name| bytes(name))),
+        ),
+    ])
+}
+
+fn scope_name(scope: rcmake_model::UsageScope) -> &'static str {
+    match scope {
+        rcmake_model::UsageScope::Private => "PRIVATE",
+        rcmake_model::UsageScope::Public => "PUBLIC",
+        rcmake_model::UsageScope::Interface => "INTERFACE",
+    }
 }
 
 fn config_json(config: &ExplainConfig) -> Value {

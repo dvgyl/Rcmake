@@ -20,7 +20,7 @@ pub use codec::{
     FieldError, FromJson, Object, ToJson, array, array_bounded, bool, bytes, deny_unknown, i64,
     object, opt, opt_or_else, req, req_value, str, u64, usize,
 };
-pub use read::parse;
+pub use read::{ParseBudget, parse, parse_bounded};
 pub use write::{write_compact, write_pretty_utf8, write_string, write_styled};
 
 /// A JSON value following `jsoncpp`'s type distinctions (including signed vs unsigned

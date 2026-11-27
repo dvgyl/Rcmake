@@ -137,7 +137,9 @@ struct Renderer<'a> {
 impl Renderer<'_> {
     fn target(&mut self, target: &ExplainTarget) {
         let name = text(&target.name);
-        if let Some(filter) = &target.filter {
+        if let Some(dependency) = &target.dependency {
+            self.dependency(target, dependency);
+        } else if let Some(filter) = &target.filter {
             self.filter_headline(target, filter);
         }
         self.styled_row(0, &format!("{name} ({})", target.kind.as_str()), 1, None);
@@ -249,6 +251,56 @@ impl Renderer<'_> {
                 Some(true) => self.warning("The session discarded some property writes."),
                 None => self.row(2, "Property history is unavailable."),
             }
+        }
+    }
+
+    fn dependency(&mut self, target: &ExplainTarget, report: &crate::DependencyReport) {
+        let name = text(&target.name);
+        let Some(goal) = &report.resolved else {
+            self.row(0, &format!("{} is not a target.", quoted(&report.target)));
+            if !report.suggestions.is_empty() {
+                let names: Vec<String> = report.suggestions.iter().map(|name| text(name)).collect();
+                self.row(2, &format!("Similar targets  {}", names.join(", ")));
+            }
+            return;
+        };
+        if report.paths.is_empty() {
+            self.row(0, &format!("{} is not a dependency of {name}.", text(goal)));
+        }
+        for path in &report.paths {
+            self.styled_row(
+                0,
+                &format!("{name} -> {} ({})", text(goal), config_name(&path.config)),
+                1,
+                None,
+            );
+            self.row(2, &name);
+            for (depth, hop) in path.hops.iter().enumerate() {
+                let edge = match hop.edge {
+                    crate::DependencyEdge::Link { scope, link_only } => format!(
+                        "links {}{}",
+                        usage_scope(scope),
+                        if link_only { " link-only" } else { "" }
+                    ),
+                    crate::DependencyEdge::OrderOnly => "order-only".to_owned(),
+                };
+                let site = hop.origin.top().map_or_else(String::new, |frame| {
+                    format!("  {}", self.display_site(&frame.file, frame.line))
+                });
+                self.row(2 + 3 * depth, &format!("└─ {} {edge}{site}", text(&hop.to)));
+            }
+        }
+        if report.truncated {
+            self.row(0, "More paths exist. The path limit stopped the search.");
+        }
+        if !report.order_only_available {
+            self.row(
+                0,
+                "Order-only edges are unavailable because generation did not finish.",
+            );
+        }
+        for error in &report.errors {
+            self.row(0, &format!("Part of the graph is unknown. {}", text(error)));
         }
     }
 

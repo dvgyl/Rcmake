@@ -201,6 +201,8 @@ impl PreparedConfigure {
             &preload_sources,
         );
         diagnostics.extend_from_slice(interp.diag_engine().diagnostics());
+        let find_traces = (prepared.services.find_trace != rcmake_eval::FindTraceLevel::Off)
+            .then(|| interp.take_find_traces());
         let var_ledger = interp.take_var_ledger().map(|ledger| {
             VarLedgerSnapshot::from_ledger(ledger, prepared.services.provenance.clone())
         });
@@ -220,6 +222,7 @@ impl PreparedConfigure {
             sources,
             prepared.wants_index(),
         );
+        result.facts.find_traces = find_traces;
         if prepared.wants_index() {
             result.facts.callables = interp
                 .callable_definitions()
@@ -276,6 +279,7 @@ impl PreparedConfigure {
                     exit_code: outcome,
                     diagnostics: result.diagnostics,
                     sources: result.facts.source_map,
+                    find_traces: result.facts.find_traces.map(Box::new),
                 });
             }
         };
@@ -726,6 +730,7 @@ fn run_preloads(
                     },
                     diagnostics,
                     sources: Some(Arc::new(sources)),
+                    find_traces: None,
                 });
             }
             None => {}

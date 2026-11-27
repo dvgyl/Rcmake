@@ -919,3 +919,52 @@ fn parse_accepts_raw_control_characters_in_strings_like_jsoncpp() {
         Some(&Value::string("tab\there"))
     );
 }
+
+#[test]
+fn bounded_parse_rejects_each_exceeded_budget() {
+    use crate::{ParseBudget, parse_bounded};
+    let options = ReadOptions::default();
+    let base = ParseBudget::artifact(1 << 20);
+    let ok = parse_bounded(br#"{"a":[1,2,"xy"]}"#, &options, &base);
+    assert!(ok.is_ok());
+
+    let small_input = ParseBudget {
+        max_input_bytes: 4,
+        ..base
+    };
+    let err = parse_bounded(b"[1,2,3]", &options, &small_input).unwrap_err();
+    assert!(err.message.contains("input limit"), "{err}");
+
+    let deep = "[".repeat(65) + &"]".repeat(65);
+    let err = parse_bounded(deep.as_bytes(), &options, &base).unwrap_err();
+    assert!(err.message.contains("nesting limit of 64"), "{err}");
+
+    let few_nodes = ParseBudget {
+        max_nodes: 3,
+        ..base
+    };
+    let err = parse_bounded(b"[1,2,3]", &options, &few_nodes).unwrap_err();
+    assert!(err.message.contains("value limit"), "{err}");
+
+    let short_strings = ParseBudget {
+        max_string_bytes: 2,
+        ..base
+    };
+    let err = parse_bounded(br#"["abc"]"#, &options, &short_strings).unwrap_err();
+    assert!(err.message.contains("string limit"), "{err}");
+
+    let total = ParseBudget {
+        max_total_string_bytes: 5,
+        ..base
+    };
+    let err = parse_bounded(br#"{"ab":"cd","ef":1}"#, &options, &total).unwrap_err();
+    assert!(err.message.contains("total string limit"), "{err}");
+}
+
+#[test]
+fn unbounded_parse_keeps_legacy_depth_limit() {
+    let options = ReadOptions::default();
+    let deep = "[".repeat(1001) + &"]".repeat(1001);
+    let err = parse(deep.as_bytes(), &options).unwrap_err();
+    assert_eq!(err.message, "Exceeded the JSON nesting limit of 1000.");
+}

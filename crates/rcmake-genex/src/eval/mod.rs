@@ -15,9 +15,14 @@ mod properties;
 mod rules;
 mod strings;
 mod targets;
+mod trace;
+
+pub use trace::{GenexStep, GenexTrace, SkippedOperand};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_trace;
 
 type Value = Result<BString, GenexError>;
 
@@ -68,6 +73,39 @@ pub fn evaluate_with_target_lookups(
     let _root = targets::DAGChecker::root(ctx);
     let mut evaluator = Evaluator::new(host);
     evaluator.lookups = Some(seen);
+    let value = evaluator.nodes(&ast.nodes, ctx)?;
+    evaluator.validate_link_feature_output(ctx, &value)?;
+    Ok((value, evaluator.flags))
+}
+
+/// Evaluate `ast` like [`evaluate`] and record each `$<...>` node in `trace`.
+///
+/// The value, flags, and errors are the same as those of [`evaluate`].
+///
+/// # Errors
+///
+/// Returns the first evaluation error. The trace keeps the steps up to that error.
+pub fn evaluate_traced(
+    ast: &GenexAst,
+    ctx: &EvalContext,
+    host: &mut dyn GenexHost,
+    trace: &mut GenexTrace,
+) -> Result<(BString, EvalFlags), GenexError> {
+    match ast.nodes.as_slice() {
+        [] => return Ok((BString::default(), EvalFlags::default())),
+        [GenexNode::Text(text)] => {
+            if text.len() > host.limits().max_value_bytes {
+                return Err(Evaluator::limit_error(
+                    "Generator expression exceeds the value size limit.",
+                ));
+            }
+            return Ok((text.clone(), EvalFlags::default()));
+        }
+        _ => {}
+    }
+    let _root = targets::DAGChecker::root(ctx);
+    let mut evaluator = Evaluator::new(host);
+    evaluator.trace = Some(trace);
     let value = evaluator.nodes(&ast.nodes, ctx)?;
     evaluator.validate_link_feature_output(ctx, &value)?;
     Ok((value, evaluator.flags))
@@ -132,6 +170,8 @@ pub fn evaluate_diagnostics(
 struct Evaluator<'a> {
     host: &'a mut dyn GenexHost,
     lookups: Option<&'a mut Vec<(BString, TargetHandle)>>,
+    trace: Option<&'a mut GenexTrace>,
+    trace_stack: Vec<Option<u32>>,
     flags: EvalFlags,
     depth: u32,
     work: usize,
@@ -207,6 +247,8 @@ impl<'a> Evaluator<'a> {
         Self {
             host,
             lookups: None,
+            trace: None,
+            trace_stack: Vec::new(),
             flags: EvalFlags::default(),
             depth: 0,
             work: limits.max_value_bytes,
@@ -299,11 +341,43 @@ impl<'a> Evaluator<'a> {
     fn expression(&mut self, expr: &GenexExpr, ctx: &EvalContext) -> Value {
         let _depth = EvaluationDepth::enter(self.limits.max_recursion)?;
         self.depth += 1;
+        if self.trace.is_none() {
+            let result = self.dispatch(expr, ctx);
+            self.depth -= 1;
+            let value = result?;
+            self.charge(value.len().max(1))?;
+            return Ok(value);
+        }
+        let step = self.trace_enter(expr);
+        self.trace_stack.push(step);
         let result = self.dispatch(expr, ctx);
+        self.trace_stack.pop();
         self.depth -= 1;
-        let value = result?;
-        self.charge(value.len().max(1))?;
-        Ok(value)
+        let result = result.and_then(|value| {
+            self.charge(value.len().max(1))?;
+            Ok(value)
+        });
+        if let (Some(trace), Some(id)) = (self.trace.as_deref_mut(), step) {
+            trace.exit(id, result.as_ref().map_err(ToString::to_string));
+        }
+        result
+    }
+
+    fn trace_parent(&self) -> Option<u32> {
+        self.trace_stack.last().copied().flatten()
+    }
+
+    fn trace_enter(&mut self, expr: &GenexExpr) -> Option<u32> {
+        let parent = self.trace_parent();
+        let depth = self.depth;
+        self.trace.as_deref_mut()?.enter(parent, depth, expr)
+    }
+
+    fn trace_skip(&mut self, index: usize, nodes: &[GenexNode]) {
+        let parent = self.trace_parent();
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.skip(parent, index, nodes);
+        }
     }
 
     fn dispatch(&mut self, expr: &GenexExpr, ctx: &EvalContext) -> Value {
@@ -323,6 +397,12 @@ impl<'a> Evaluator<'a> {
             expr,
             ctx,
         };
+        if let (Some(trace), Some(id)) = (
+            self.trace.as_deref_mut(),
+            self.trace_stack.last().copied().flatten(),
+        ) {
+            trace.operator(id, name.as_ref());
+        }
         match name.as_ref() {
             b"0" | b"1" => {
                 if call.params() == 0 {
@@ -599,6 +679,7 @@ impl<'a> Evaluator<'a> {
                     .is_some_and(|condition| condition.as_slice() == skip_if)
             });
             let value = if skip {
+                self.trace_skip(index, nodes);
                 BString::default()
             } else {
                 self.nodes(nodes, call.ctx)?
@@ -643,12 +724,18 @@ impl<'a> Evaluator<'a> {
             )));
         }
         let mut raw = Vec::with_capacity(call.params());
-        for nodes in call.expr.params.iter().flatten() {
+        let params = call.expr.params.as_deref().unwrap_or_default();
+        for (index, nodes) in params.iter().enumerate() {
             let value = self.nodes(nodes, call.ctx)?;
             self.charge(value.len().max(1))?;
             let done = value == decisive;
             raw.push(value);
             if done {
+                if self.trace.is_some() {
+                    for (skipped, nodes) in params.iter().enumerate().skip(index + 1) {
+                        self.trace_skip(skipped, nodes);
+                    }
+                }
                 break;
             }
         }

@@ -75,6 +75,8 @@ pub enum ApiError {
         diagnostics: Vec<Diagnostic>,
         /// Source map for the diagnostic annotations, if available.
         sources: Option<Arc<rcmake_diag::SourceMap>>,
+        /// `find_package()` records up to the failure, when the services requested them.
+        find_traces: Option<Box<rcmake_eval::FindTraceStore>>,
     },
     /// Resolution or generation failed after evaluation.
     #[error("Generation failed. {message}")]

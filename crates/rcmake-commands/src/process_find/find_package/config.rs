@@ -10,6 +10,7 @@ use rcmake_model::{CacheEntry, CacheType};
 use super::super::cps_import;
 use super::super::search_paths::{is_file, relative_suffix, resolved_lexical_path};
 use super::log::{Mode, Reason, SearchReport};
+use super::native::Detail;
 use super::paths::{paths_from_vars, redirects_directory};
 use super::request::include_package_file;
 use super::{Bindings, Request, cat, flag, version_bindings};
@@ -270,11 +271,16 @@ impl<'a> ConfigSearch<'a> {
             };
             let accepted = checked.rejection.is_none();
             if let Some(message) = &checked.rejection {
-                report.log.candidate(
+                report.log.candidate_with(
                     || file.clone(),
                     mode,
                     Reason::InsufficientVersion,
                     message.clone(),
+                    Detail {
+                        found_version: Some(checked.version.clone()),
+                        unsuitable: checked.unsuitable,
+                        ..Detail::default()
+                    },
                 );
             }
             self.considered
@@ -525,6 +531,7 @@ impl<'a> ConfigSearch<'a> {
 struct VersionCheck {
     version: BString,
     rejection: Option<BString>,
+    unsuitable: bool,
 }
 
 fn check_version(
@@ -543,6 +550,7 @@ fn check_version(
         return Ok(VersionCheck {
             version: BString::default(),
             rejection: request.version.as_ref().map(|_| BString::default()),
+            unsuitable: false,
         });
     };
 
@@ -570,9 +578,11 @@ fn check_version(
         }
         let exact = cx.var_is_on(b"PACKAGE_VERSION_EXACT");
         let compatible = cx.var_is_on(b"PACKAGE_VERSION_COMPATIBLE");
-        let accepted = !cx.var_is_on(b"PACKAGE_VERSION_UNSUITABLE")
-            && (request.version.is_none() || exact || !request.exact && compatible);
+        let unsuitable = cx.var_is_on(b"PACKAGE_VERSION_UNSUITABLE");
+        let accepted =
+            !unsuitable && (request.version.is_none() || exact || !request.exact && compatible);
         Ok(VersionCheck {
+            unsuitable,
             version: cx.var_or_empty(b"PACKAGE_VERSION"),
             rejection: (!accepted)
                 .then(|| "The version found is not compatible with the version requested.".into()),

@@ -11,6 +11,53 @@ const EXPECT_COLON: &str = "Missing ':' after object member name";
 const EXPECT_ARRAY_END: &str = "Missing ',' or ']' in array declaration";
 const EXPECT_OBJECT_END: &str = "Missing ',' or '}' in object declaration";
 
+/// Resource limits that [`parse_bounded`] enforces before it allocates a value.
+///
+/// Every limit counts the whole document. A document that exceeds a limit fails with
+/// an error and never produces a partial value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParseBudget {
+    /// Largest accepted input size in bytes, including a byte order mark.
+    pub max_input_bytes: usize,
+    /// Deepest accepted container nesting.
+    pub max_depth: usize,
+    /// Largest accepted number of values, counting containers, members, and scalars.
+    pub max_nodes: usize,
+    /// Largest accepted encoded size of one string or object key in bytes.
+    pub max_string_bytes: usize,
+    /// Largest accepted encoded size of all strings and object keys together in bytes.
+    pub max_total_string_bytes: usize,
+}
+
+impl ParseBudget {
+    /// Limits of [`parse`]: nesting of 1000 containers and no other limit.
+    pub const UNLIMITED: Self = Self {
+        max_input_bytes: usize::MAX,
+        max_depth: MAX_DEPTH,
+        max_nodes: usize::MAX,
+        max_string_bytes: usize::MAX,
+        max_total_string_bytes: usize::MAX,
+    };
+
+    /// Limits for one untrusted build-tree artifact of at most `max_input_bytes` bytes.
+    #[must_use]
+    pub const fn artifact(max_input_bytes: usize) -> Self {
+        Self {
+            max_input_bytes,
+            max_depth: 64,
+            max_nodes: max_input_bytes / 2 + 16,
+            max_string_bytes: 16 << 20,
+            max_total_string_bytes: max_input_bytes,
+        }
+    }
+}
+
+impl Default for ParseBudget {
+    fn default() -> Self {
+        Self::UNLIMITED
+    }
+}
+
 /// Parse one JSON value from a byte slice. A leading UTF-8 byte order mark is optional.
 ///
 /// # Errors
@@ -18,11 +65,38 @@ const EXPECT_OBJECT_END: &str = "Missing ',' or '}' in object declaration";
 /// Returns the location and message of the first syntax error. Also rejects nesting
 /// beyond 1000 containers.
 pub fn parse(src: &[u8], options: &ReadOptions) -> Result<Value, JsonError> {
+    parse_bounded(src, options, &ParseBudget::UNLIMITED)
+}
+
+/// Parse one JSON value like [`parse`], and enforce `budget` before each allocation.
+///
+/// # Errors
+///
+/// Returns the first syntax error, or an error at the position where the document
+/// first exceeds a limit of `budget`.
+pub fn parse_bounded(
+    src: &[u8],
+    options: &ReadOptions,
+    budget: &ParseBudget,
+) -> Result<Value, JsonError> {
+    if src.len() > budget.max_input_bytes {
+        return Err(JsonError {
+            line: 1,
+            column: 1,
+            message: format!(
+                "Exceeded the JSON input limit of {} bytes.",
+                budget.max_input_bytes
+            ),
+        });
+    }
     let src = src.strip_prefix(b"\xef\xbb\xbf").unwrap_or(src);
     Parser {
         src,
         pos: 0,
         options,
+        budget,
+        nodes: 0,
+        string_bytes: 0,
     }
     .document()
 }
@@ -31,6 +105,9 @@ struct Parser<'a> {
     src: &'a [u8],
     pos: usize,
     options: &'a ReadOptions,
+    budget: &'a ParseBudget,
+    nodes: usize,
+    string_bytes: usize,
 }
 
 enum Frame {
@@ -45,9 +122,14 @@ impl Parser<'_> {
             self.skip_trivia()?;
             let start = self.pos;
             let token = self.peek();
-            if frames.len() == MAX_DEPTH && matches!(token, Some(b'[' | b'{')) {
-                return Err(self.error(start, "Exceeded the JSON nesting limit of 1000."));
+            let depth = self.budget.max_depth;
+            if frames.len() >= depth && matches!(token, Some(b'[' | b'{')) {
+                return Err(self.error(
+                    start,
+                    format!("Exceeded the JSON nesting limit of {depth}."),
+                ));
             }
+            self.count_node(start)?;
             let mut value = match token {
                 Some(b'[') => {
                     self.pos += 1;
@@ -124,6 +206,15 @@ impl Parser<'_> {
         Ok(key)
     }
 
+    fn count_node(&mut self, start: usize) -> Result<(), JsonError> {
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > self.budget.max_nodes {
+            let limit = self.budget.max_nodes;
+            return Err(self.error(start, format!("Exceeded the JSON value limit of {limit}.")));
+        }
+        Ok(())
+    }
+
     fn string(&mut self, token_error: &str) -> Result<BString, JsonError> {
         let start = self.pos;
         self.require(b'"', token_error)?;
@@ -132,6 +223,7 @@ impl Parser<'_> {
             match byte {
                 b'"' => {
                     let content = self.src.get(start + 1..self.pos - 1).unwrap_or_default();
+                    self.charge_string(start, content.len())?;
                     return decode_string(content).map_err(|message| self.error(start, message));
                 }
                 b'\\' if self.peek().is_some() => self.pos += 1,
@@ -139,6 +231,25 @@ impl Parser<'_> {
             }
         }
         Err(self.error(start, token_error))
+    }
+
+    fn charge_string(&mut self, start: usize, len: usize) -> Result<(), JsonError> {
+        if len > self.budget.max_string_bytes {
+            let limit = self.budget.max_string_bytes;
+            return Err(self.error(
+                start,
+                format!("Exceeded the JSON string limit of {limit} bytes."),
+            ));
+        }
+        self.string_bytes = self.string_bytes.saturating_add(len);
+        if self.string_bytes > self.budget.max_total_string_bytes {
+            let limit = self.budget.max_total_string_bytes;
+            return Err(self.error(
+                start,
+                format!("Exceeded the JSON total string limit of {limit} bytes."),
+            ));
+        }
+        Ok(())
     }
 
     fn number(&mut self) -> Result<Value, JsonError> {

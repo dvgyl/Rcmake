@@ -213,7 +213,7 @@ pub(super) fn error(position: Position, message: impl Into<BString>) -> ParseErr
     }
 }
 
-fn validate_flow_control(commands: &[CommandInvocation]) -> Result<(), ParseError> {
+pub(super) fn validate_flow_control(commands: &[CommandInvocation]) -> Result<(), ParseError> {
     let mut stack: Vec<(&CommandInvocation, bool)> = Vec::new();
     for command in commands {
         let name = command.lower.as_slice();

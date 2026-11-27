@@ -30,10 +30,15 @@
 pub struct ReadmeDoctests;
 
 mod config;
+mod eval_explain;
 mod explain;
+mod explain_deps;
 mod explain_entries;
+mod explain_filter;
 mod explain_json;
 mod explain_render;
+mod find_explain;
+mod find_trace_json;
 mod index;
 mod overlay_diff;
 mod result;
@@ -44,13 +49,27 @@ mod variable_history;
 pub use config::{
     ApiError, ConfigureRequest, PreparedConfigure, ProcessPolicy, WriteMode, observe_reads,
 };
+pub use eval_explain::{
+    EXPLAIN_EVAL_SCHEMA, EvalConfigResult, EvalReport, EvalRequest, render_eval_json,
+    render_eval_terminal,
+};
 pub use explain::{
     CompilePosition, ExplainCache, ExplainCompileGroup, ExplainConfig, ExplainEntry, ExplainHop,
     ExplainInput, ExplainItemKind, ExplainProperty, ExplainQuery, ExplainReport, ExplainRoots,
     ExplainSuggestion, ExplainTarget, ExplainVariable, ExplainWrite,
 };
+pub use explain_deps::{DependencyEdge, DependencyHop, DependencyPath, DependencyReport};
+pub use explain_filter::ExplainFilter;
 pub use explain_json::{EXPLAIN_SCHEMA, explain_json, render_explain_json};
 pub use explain_render::{ExplainRenderOptions, render_explain_terminal};
+pub use find_explain::{
+    EXPLAIN_FIND_SCHEMA, FindReport, FindSource, FindSuggestion, NearMissProbe, SuggestionKind,
+    render_find_json, render_find_terminal, suggest,
+};
+pub use find_trace_json::{
+    FIND_TRACE_MAX_BYTES, FIND_TRACE_PATH, FIND_TRACE_SCHEMA, FileStamp, FindTraceDocument,
+    Freshness,
+};
 pub use index::{
     CallableDefinition, Completion, CompletionKind, ExecutedSite, ExecutedSites, ExecutedSymbol,
     FileEdge, FileEdgeKind, SourceLocation, SourceRange, TargetDefinition, UsageSummary,

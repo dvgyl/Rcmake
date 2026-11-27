@@ -6,6 +6,9 @@ use rcmake_diag::{
     source::{SourceKind, SourceMap},
 };
 use rcmake_json::Value;
+use rcmake_language_tools::{
+    Finding, FormatError, FormatLimits, FormatStyle, Severity, format_bytes,
+};
 use rcmake_syntax::{
     ArgKind, CommandInvocation, PartialCommandInvocation, parse_list_file_with_warnings,
     parse_tolerant,
@@ -19,7 +22,7 @@ use crate::{
     features::{command_name, payload},
     json::{object, uint},
     lexical,
-    position::{Lines, Position, PositionEncoding},
+    position::{Lines, Position, PositionEncoding, range},
     roles::{Arguments, Role, Variable},
 };
 
@@ -94,14 +97,48 @@ impl Document {
         encoding: PositionEncoding,
         include_parse_error: bool,
         semantic: &[SemanticDiagnostic],
+        lint_findings: &[Finding],
     ) -> Vec<Value> {
-        let mut diagnostics: Vec<_> = self
-            .warnings
-            .iter()
-            .chain(semantic)
-            .take(1024)
-            .map(|warning| self.render_diagnostic(warning, encoding).0)
-            .collect();
+        let mut diagnostics = Vec::new();
+        let mut covered: Vec<(Range<usize>, Option<String>, bool)> = Vec::new();
+        for warning in self.warnings.iter().chain(semantic).take(1024) {
+            let (value, span) = self.render_diagnostic(warning, encoding);
+            let policy_code = warning.diagnostic.policy.map(|p| p.to_string());
+            let is_error = matches!(
+                warning.diagnostic.kind,
+                MessageKind::Error
+                    | MessageKind::InternalError
+                    | MessageKind::AuthorError
+                    | MessageKind::DeprecationError
+            );
+            covered.push((span, policy_code, is_error));
+            diagnostics.push(value);
+        }
+        for finding in lint_findings {
+            if diagnostics.len() >= 1024 {
+                break;
+            }
+            let span = self.clamped_span(finding.primary_span.clone());
+            if overlaps_equivalent_semantic(finding, &span, &covered) {
+                continue;
+            }
+            let severity = match finding.severity {
+                Severity::Error => 1,
+                Severity::Warning => 2,
+                Severity::Note => 3,
+            };
+            let message = match &finding.suggestion {
+                Some(suggestion) => format!("{} {suggestion}", finding.message),
+                None => finding.message.clone(),
+            };
+            diagnostics.push(object([
+                ("range", self.span(span, encoding)),
+                ("severity", uint(severity)),
+                ("code", Value::string(finding.rule)),
+                ("source", Value::string(finding.source)),
+                ("message", Value::string(message)),
+            ]));
+        }
         if include_parse_error && let Some(error) = &self.error {
             let span = point_span(&self.text, &self.lines, error.line, error.column);
             diagnostics.push(object([
@@ -115,6 +152,17 @@ impl Document {
             ]));
         }
         diagnostics
+    }
+
+    fn clamped_span(&self, span: Range<usize>) -> Range<usize> {
+        let start = self
+            .text
+            .floor_char_boundary(span.start.min(self.text.len()));
+        let end = self
+            .text
+            .ceil_char_boundary(span.end.min(self.text.len()))
+            .max(start);
+        start..end
     }
 
     fn render_diagnostic(
@@ -330,86 +378,60 @@ impl Document {
         found
     }
 
-    pub(crate) fn formatting(&self, encoding: PositionEncoding, indent: &str) -> Option<Value> {
-        if self.error.is_some() {
-            return Some(Value::Array(Vec::new()));
-        }
-        let mut verbatim = self.comments();
-        verbatim.extend(
-            self.commands
-                .iter()
-                .flat_map(|command| &command.args)
-                .filter(|arg| arg.kind != ArgKind::Unquoted)
-                .map(|arg| arg.span.clone()),
-        );
-        let mut protected = vec![false; self.lines.len()];
-        for span in verbatim {
-            let first = self.lines.line_at(span.start);
-            let last = self.lines.line_at(span.end.saturating_sub(1));
-            if let Some(lines) = protected.get_mut(first + 1..=last) {
-                lines.fill(true);
+    pub(crate) fn formatting(
+        &self,
+        encoding: PositionEncoding,
+        style: &FormatStyle,
+    ) -> Option<Value> {
+        // Parse actual raw buffer bytes (`SourceKind::File`) for strict format equivalence.
+        let limits = FormatLimits {
+            max_output_bytes: crate::rpc::MAX_MESSAGE_BYTES,
+            ..FormatLimits::default()
+        };
+        let result = match format_bytes(self.text.as_bytes(), style, &limits) {
+            Ok(result) => result,
+            Err(FormatError::Parse(_) | FormatError::VerificationFailed(_)) => {
+                return Some(Value::Array(Vec::new()));
             }
-        }
-        let mut edits = Vec::new();
-        let mut response_bytes = 1024;
-        let mut depth = 0usize;
-        let mut commands = self.commands.iter().peekable();
-        let mut continuation = None;
-        let indentation_byte = indent.as_bytes().first().copied().unwrap_or(b' ');
-        for line in 0..self.lines.len() {
-            let raw = self.lines.text(&self.text, line).unwrap_or_default();
-            let (bom, rest) = if line == 0 && raw.starts_with('\u{feff}') {
-                ("\u{feff}", raw.strip_prefix('\u{feff}').unwrap_or(raw))
-            } else {
-                ("", raw)
+            Err(FormatError::BudgetExceeded(_)) => return None,
+        };
+        let mut edits = Vec::with_capacity(result.edits.len());
+        let mut response_bytes = 1024usize;
+        for edit in &result.edits {
+            let Some(start) = self
+                .lines
+                .exact_position(&self.text, edit.range.start, encoding)
+            else {
+                return Some(Value::Array(Vec::new()));
             };
-            let trimmed = rest.trim_start_matches([' ', '\t']);
-            let is_blank = trimmed.trim_ascii().is_empty();
-            let mut line_depth = match continuation {
-                Some((end, opening_depth)) if line <= end => {
-                    opening_depth + usize::from(line < end || !closing_only(trimmed))
-                }
-                _ => depth,
+            let Some(end) = self
+                .lines
+                .exact_position(&self.text, edit.range.end, encoding)
+            else {
+                return Some(Value::Array(Vec::new()));
             };
-            let mut first = true;
-            while let Some(command) = commands.next_if(|command| command.line as usize == line + 1)
-            {
-                let name = command.lower.as_slice();
-                if block_end(name) || branch(name) {
-                    depth = depth.saturating_sub(1);
-                    if first {
-                        line_depth = depth;
+            let Ok(new_text) = std::str::from_utf8(edit.replacement.as_slice()) else {
+                return Some(Value::Array(Vec::new()));
+            };
+            let escaped_len: usize = new_text
+                .bytes()
+                .map(|b| {
+                    if matches!(b, b'\t' | b'\r' | b'\n' | b'"' | b'\\') {
+                        2
+                    } else {
+                        1
                     }
-                }
-                continuation = Some((command.close_line.saturating_sub(1) as usize, depth));
-                if block_start(name) || branch(name) {
-                    depth += 1;
-                }
-                first = false;
-            }
-            if is_blank || protected.get(line).copied().unwrap_or(false) {
-                continue;
-            }
-            let original_len = rest.len() - trimmed.len();
-            let line_depth = line_depth.min(1000);
-            let new_len = indent.len() * line_depth;
-            if original_len == new_len
-                && rest
-                    .as_bytes()
-                    .get(..original_len)
-                    .is_some_and(|prefix| prefix.iter().all(|&byte| byte == indentation_byte))
-            {
-                continue;
-            }
-            let escaped_len = if indent == "\t" { new_len * 2 } else { new_len };
-            response_bytes += 128 + escaped_len;
+                })
+                .sum();
+            response_bytes = response_bytes
+                .saturating_add(128)
+                .saturating_add(escaped_len);
             if response_bytes > crate::rpc::MAX_MESSAGE_BYTES {
                 return None;
             }
-            let start = self.lines.start(line).unwrap_or_default() + bom.len();
             edits.push(object([
-                ("range", self.span(start..start + original_len, encoding)),
-                ("newText", Value::string(indent.repeat(line_depth))),
+                ("range", range(start, end)),
+                ("newText", Value::string(new_text)),
             ]));
         }
         Some(Value::Array(edits))
@@ -490,40 +512,27 @@ fn syntax_warning(
     SemanticDiagnostic::new(diagnostic, source, annotations)
 }
 
-fn closing_only(line: &str) -> bool {
-    if !line.starts_with(')') {
-        return false;
-    }
-    let mut bytes = line.as_bytes();
-    loop {
-        match bytes {
-            [] => return true,
-            [b')' | b' ' | b'\t', tail @ ..] => bytes = tail,
-            [b'#', ..] => {
-                let end = lexical::comment_end(bytes, 0);
-                bytes = bytes.get(end..).unwrap_or_default();
-            }
-            _ => return false,
+fn overlaps_equivalent_semantic(
+    finding: &Finding,
+    span: &Range<usize>,
+    covered: &[(Range<usize>, Option<String>, bool)],
+) -> bool {
+    for (sem_span, policy_code, is_error) in covered {
+        let overlaps = sem_span.start <= span.end && span.start <= sem_span.end;
+        if !overlaps {
+            continue;
+        }
+        if finding.rule == "old-policy"
+            && let Some(code) = policy_code
+            && finding.message.contains(code.as_str())
+        {
+            return true;
+        }
+        if finding.rule == "obsolete-command" && *is_error {
+            return true;
         }
     }
-}
-
-fn block_start(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"if" | b"foreach" | b"while" | b"function" | b"macro" | b"block"
-    )
-}
-
-fn block_end(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"endif" | b"endforeach" | b"endwhile" | b"endfunction" | b"endmacro" | b"endblock"
-    )
-}
-
-fn branch(name: &[u8]) -> bool {
-    matches!(name, b"else" | b"elseif")
+    false
 }
 
 fn collect_comments(text: &str, span: Range<usize>, output: &mut Vec<Range<usize>>) {
@@ -762,9 +771,9 @@ mod tests {
     fn partial_edit_keeps_warning_and_its_quick_fix() -> Result<(), &'static str> {
         let doc = Document::new("x(\"é\"y)\nmessage(".into(), 2);
         let encoding = PositionEncoding::Utf16;
-        let immediate = doc.diagnostics(encoding, false, &[]);
+        let immediate = doc.diagnostics(encoding, false, &[], &[]);
         assert_eq!(immediate.len(), 1);
-        assert_eq!(doc.diagnostics(encoding, true, &[]).len(), 2);
+        assert_eq!(doc.diagnostics(encoding, true, &[], &[]).len(), 2);
         let start = Position {
             line: 0,
             character: 5,

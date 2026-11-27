@@ -1,12 +1,18 @@
 //! CLI debugger lifecycle tests: option checks, start errors, and one real socket
 //! session.
 
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use rcmake_eval::{Interp, InterpConfig, RunMode};
 use rcmake_host::{PureHost, Stream};
 
@@ -59,6 +65,7 @@ fn debugger_without_pipe_is_an_error() {
     assert!(stderr(&host).ends_with("for all supported options.\n"));
 }
 
+#[cfg(unix)]
 #[test]
 fn bind_failure_reports_the_adapter_error() {
     let host = host();
@@ -75,12 +82,14 @@ fn bind_failure_reports_the_adapter_error() {
     );
 }
 
+#[cfg(unix)]
 fn frame(stream: &mut UnixStream, body: &str) {
     let message = format!("Content-Length: {}\r\n\r\n{body}", body.len());
     stream.write_all(message.as_bytes()).unwrap();
 }
 
 /// Read messages until one contains `needle`.
+#[cfg(unix)]
 fn read_until(reader: &mut BufReader<UnixStream>, needle: &str) -> String {
     loop {
         let mut header = String::new();
@@ -107,6 +116,7 @@ fn read_until(reader: &mut BufReader<UnixStream>, needle: &str) -> String {
     }
 }
 
+#[cfg(unix)]
 fn connect(path: &Path) -> UnixStream {
     for _ in 0..3000 {
         if let Ok(stream) = UnixStream::connect(path) {
@@ -120,6 +130,7 @@ fn connect(path: &Path) -> UnixStream {
     panic!("no socket at {}", path.display());
 }
 
+#[cfg(unix)]
 #[test]
 // The test owns a real socket file next to the `PureHost` interpreter.
 #[allow(clippy::disallowed_methods)]

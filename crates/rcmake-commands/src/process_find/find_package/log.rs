@@ -3,6 +3,7 @@ use rcmake_eval::{Cx, RunMode};
 
 use super::super::search_paths::{cmake_paths, host_env_paths};
 use super::super::{RootMode, cat};
+use super::native::{Collector, Detail};
 use super::{Request, config::ConfigSearch, trace::SearchTrace};
 
 const ROOT_COUNTS: &[u8] = b"\0RCMAKE_FIND_PACKAGE_ROOT_COUNTS";
@@ -28,6 +29,7 @@ impl Mode {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum Reason {
     NoExist,
     Ignored,
@@ -75,6 +77,8 @@ pub(super) struct SearchLog {
     global: bool,
     use_modules: bool,
     outer_root_counts: BString,
+    /// Native trace consumer. It never changes what the configure log records.
+    pub(super) native: Option<Box<Collector>>,
 }
 
 impl SearchLog {
@@ -112,6 +116,7 @@ impl SearchLog {
             global: request.global || cx.var_is_on(b"CMAKE_FIND_PACKAGE_TARGETS_GLOBAL"),
             use_modules: request.config_options.is_empty(),
             outer_root_counts: cx.var_or_empty(ROOT_COUNTS),
+            native: Collector::start(cx, name, request),
         }
     }
 
@@ -144,9 +149,27 @@ impl SearchLog {
         reason: Reason,
         message: BString,
     ) {
+        self.candidate_with(path, mode, reason, message, Detail::default());
+    }
+
+    pub(super) fn candidate_with(
+        &mut self,
+        path: impl FnOnce() -> BString,
+        mode: Mode,
+        reason: Reason,
+        message: BString,
+        detail: Detail,
+    ) {
+        if !self.enabled && self.native.is_none() {
+            return;
+        }
+        let path = path();
+        if let Some(native) = &mut self.native {
+            native.candidate(&path, mode, reason, &message, detail);
+        }
         if self.enabled {
             self.candidates.push(Candidate {
-                path: path(),
+                path,
                 mode,
                 reason,
                 message,
@@ -154,7 +177,36 @@ impl SearchLog {
         }
     }
 
+    /// Record a native-only rejection that the configure log does not list.
+    pub(super) fn native_candidate(
+        &mut self,
+        path: &BString,
+        mode: Mode,
+        reason: Reason,
+        message: &BString,
+        detail: Detail,
+    ) {
+        if let Some(native) = &mut self.native {
+            native.candidate(path, mode, reason, message, detail);
+        }
+    }
+
+    pub(super) fn native_missing(&mut self) {
+        if let Some(native) = &mut self.native {
+            native.mark_missing();
+        }
+    }
+
+    pub(super) fn native_module_search(&mut self, considered: &[std::path::PathBuf]) {
+        if let Some(native) = &mut self.native {
+            native.module_search(considered);
+        }
+    }
+
     pub(super) fn selected(&mut self, path: BString, mode: Mode, version: BString) {
+        if let Some(native) = &mut self.native {
+            native.selected(&path, mode, &version);
+        }
         if self.enabled {
             self.selected = Some((path, mode, version));
         }

@@ -123,7 +123,7 @@ impl Server<'_> {
 
 fn glob_pattern(path: &Path, relative: bool) -> Option<Value> {
     let name = path.file_name()?.to_str()?;
-    if name == "CMakeLists.txt" || name.ends_with(".cmake") {
+    if name == "CMakeLists.txt" || name.ends_with(".cmake") || name == ".rcmake.toml" {
         return None;
     }
     let literal = |text: &str| !text.contains(['*', '?', '[', ']', '{', '}', '\\']);

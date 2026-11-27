@@ -493,7 +493,29 @@ fn formatter_preserves_multiline_literals_comments_and_line_endings() {
         "textDocument/formatting",
         &[("options", options)],
     );
-    assert_indent_edits(&response, &[1, 4, 7], "\t");
+    let edits = array(&response);
+    assert_eq!(edits.len(), 4);
+    for (edit, line) in edits.iter().take(3).zip([1u64, 4, 7]) {
+        assert_indent_edit(edit, line, "\t");
+    }
+    // Line 9 trailing horizontal whitespace on the blank line is stripped while CRLF is kept.
+    assert_eq!(get(&edits[3], "newText"), &Value::string(""));
+    assert_eq!(
+        get(get(get(&edits[3], "range"), "start"), "line"),
+        &Value::UInt(9)
+    );
+    assert_eq!(
+        get(get(get(&edits[3], "range"), "start"), "character"),
+        &Value::UInt(0)
+    );
+    assert_eq!(
+        get(get(get(&edits[3], "range"), "end"), "line"),
+        &Value::UInt(9)
+    );
+    assert_eq!(
+        get(get(get(&edits[3], "range"), "end"), "character"),
+        &Value::UInt(2)
+    );
 }
 
 #[test]
@@ -501,9 +523,9 @@ fn formatter_aligns_a_close_with_the_opener_when_no_argument_precedes_it() {
     let host = host();
     let mut server = initialized(&host, false);
     let text = concat!(
-        "if(ON)\rmessage(\rone\rtwo)\r",
-        "message(\rone\r) # close\r",
-        "message(\r(\rone\r) two)\rendif()\r",
+        "if(ON)\nmessage(\none\ntwo)\n",
+        "message(\none\n) # close\n",
+        "message(\n(\none\n) two)\nendif()\n",
     );
     assert!(array(get(&open(&mut server, text), "diagnostics")).is_empty());
     let response = request(
@@ -525,6 +547,337 @@ fn formatter_aligns_a_close_with_the_opener_when_no_argument_precedes_it() {
     for (line, (edit, indent)) in edits.iter().zip(expected).enumerate() {
         assert_indent_edit(edit, line as u64 + 1, indent);
     }
+}
+
+fn apply_lsp_edits(text: &str, edits: &[Value], encoding: &str) -> String {
+    let mut line_starts = vec![0usize];
+    for (idx, b) in text.bytes().enumerate() {
+        if b == b'\n' || (b == b'\r' && text.as_bytes().get(idx + 1) != Some(&b'\n')) {
+            line_starts.push(idx + 1);
+        }
+    }
+    let to_offset = |point: &Value| -> usize {
+        let Value::UInt(line) = get(point, "line") else {
+            panic!("expected uint line");
+        };
+        let Value::UInt(ch) = get(point, "character") else {
+            panic!("expected uint character");
+        };
+        let start = *line_starts.get(*line as usize).unwrap();
+        let end = line_starts
+            .get(*line as usize + 1)
+            .copied()
+            .unwrap_or(text.len());
+        let raw_line = text.get(start..end).unwrap();
+        let line_str = raw_line
+            .strip_suffix("\r\n")
+            .or_else(|| raw_line.strip_suffix(['\r', '\n']))
+            .unwrap_or(raw_line);
+        let ch = *ch as usize;
+        match encoding {
+            "utf-8" => start + ch,
+            "utf-16" => {
+                let mut units = 0usize;
+                for (off, c) in line_str.char_indices() {
+                    if units == ch {
+                        return start + off;
+                    }
+                    units += c.len_utf16();
+                }
+                start + line_str.len()
+            }
+            "utf-32" => {
+                for (units, (off, _)) in line_str.char_indices().enumerate() {
+                    if units == ch {
+                        return start + off;
+                    }
+                }
+                start + line_str.len()
+            }
+            other => panic!("unexpected encoding {other}"),
+        }
+    };
+    let mut byte_edits: Vec<(usize, usize, &str)> = edits
+        .iter()
+        .map(|edit| {
+            let range = get(edit, "range");
+            let start = to_offset(get(range, "start"));
+            let end = to_offset(get(range, "end"));
+            let Value::String(rep) = get(edit, "newText") else {
+                panic!("expected string newText");
+            };
+            (start, end, std::str::from_utf8(rep).unwrap())
+        })
+        .collect();
+    byte_edits.sort_by_key(|(s, e, _)| (*s, *e));
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for (s, e, rep) in byte_edits {
+        assert!(s >= cursor && s <= e);
+        out.push_str(text.get(cursor..s).unwrap());
+        out.push_str(rep);
+        cursor = e;
+    }
+    out.push_str(text.get(cursor..).unwrap());
+    out
+}
+
+#[test]
+fn p1_11_bare_cr_non_bmp_crlf_and_cli_lsp_formatting_equivalence() {
+    // 1. Bare CR between commands is a disk syntax error: LSP must refuse to format (empty edits).
+    let bare_host = host();
+    let mut server = initialized(&bare_host, false);
+    open(&mut server, "if(ON)\rmessage(hi)\rendif()\r");
+    let response = request(
+        &mut server,
+        "textDocument/formatting",
+        &[(
+            "options",
+            object(&[
+                ("tabSize", Value::Int(2)),
+                ("insertSpaces", Value::Bool(true)),
+            ]),
+        )],
+    );
+    assert!(array(&response).is_empty());
+
+    // 2. Non-BMP text + CRLF + protected bracket CR + `.rcmake.toml` overrides client indent
+    //    produce byte-for-byte identical results across UTF-8, UTF-16, UTF-32, and CLI!
+    let sample = concat!(
+        "IF(ON)\r\n",
+        "MESSAGE(STATUS   \"😀\"   [=[\r\nkeep\rraw\r\n]=])\r\n",
+        "ENDIF()\r\n",
+    );
+    let config_toml = "[fmt]\nindent_width = 4\ncommand_case = \"lower\"\nend_of_line = \"lf\"\n";
+    let expected_cli = rcmake_language_tools::format_bytes(
+        sample.as_bytes(),
+        &rcmake_language_tools::FormatStyle::from_config(
+            &rcmake_language_tools::parse_config(config_toml.as_bytes(), None)
+                .unwrap()
+                .fmt,
+        ),
+        &rcmake_language_tools::FormatLimits::default(),
+    )
+    .unwrap();
+    let expected_str = String::from_utf8(expected_cli.output).unwrap();
+    assert_eq!(
+        expected_str,
+        "if(ON)\n    message(STATUS \"😀\" [=[\r\nkeep\rraw\r\n]=])\nendif()\n"
+    );
+
+    for encoding in ["utf-8", "utf-16", "utf-32"] {
+        let host = host();
+        host.seed_file(
+            &Path::new(WORK_DIR).join(".rcmake.toml"),
+            config_toml.as_bytes(),
+        )
+        .unwrap();
+        let mut server = Server::new(&host);
+        let init = result(server.handle(decode(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"rootUri":"{WORK_URI}","capabilities":{{"general":{{"positionEncodings":["{encoding}"]}}}}}}}}"#
+        ))));
+        assert_eq!(
+            get(get(&init, "capabilities"), "positionEncoding"),
+            &Value::string(encoding)
+        );
+        server.handle(RpcMessage::notification("initialized", Value::object()));
+        open(&mut server, sample);
+        // Client passes tabSize=2, insertSpaces=false, but .rcmake.toml indent_width=4 wins.
+        let edits = request(
+            &mut server,
+            "textDocument/formatting",
+            &[(
+                "options",
+                object(&[
+                    ("tabSize", Value::Int(2)),
+                    ("insertSpaces", Value::Bool(false)),
+                ]),
+            )],
+        );
+        let applied = apply_lsp_edits(sample, array(&edits), encoding);
+        assert_eq!(applied, expected_str, "encoding={encoding}");
+    }
+}
+
+#[test]
+fn p1_12_live_workspace_lint_tracks_open_includes_globs_and_rcmake_toml_watches() {
+    let host = host();
+    let work = Path::new(WORK_DIR);
+    host.seed_file(&work.join("helpers.cmake"), b"set(UNRELATED 1)\n")
+        .unwrap();
+    let mut server = Server::new(&host);
+    result(server.handle(decode(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"rootUri":"{WORK_URI}","capabilities":{{"workspace":{{"didChangeWatchedFiles":{{"dynamicRegistration":true}}}}}}}}}}"#
+    ))));
+    let reg_msgs = server.handle(RpcMessage::notification("initialized", Value::object()));
+    // Verify watcher registration covers **/.rcmake.toml.
+    let reg_json = format!("{reg_msgs:?}");
+    assert!(
+        reg_json.contains(".rcmake.toml"),
+        "expected .rcmake.toml watcher in {reg_json}"
+    );
+
+    // 1. Open caller referencing MY_HELPER_VAR (typo of MY_HELPER_VA unless helpers.cmake defines it)
+    //    plus an overwritten glob (must NOT warn) and directory-options + unguarded-build-type.
+    let caller_uri = format!("{WORK_URI}/sub/CMakeLists.txt");
+    let caller_text = concat!(
+        "project(Sub)\n",
+        "include(\"${CMAKE_SOURCE_DIR}/helpers.cmake\")\n",
+        "set(MY_HELPER_VA 1)\n",
+        "message(STATUS \"${MY_HELPER_VAR}\")\n",
+        "file(GLOB OVERWRITTEN *.cpp)\n",
+        "set(OVERWRITTEN main.cpp)\n",
+        "add_executable(app ${OVERWRITTEN})\n",
+        "include_directories(inc)\n",
+        "set(CMAKE_BUILD_TYPE Release)\n",
+    );
+    let open_caller = published(server.handle(RpcMessage::notification(
+        "textDocument/didOpen",
+        object(&[(
+            "textDocument",
+            object(&[
+                ("uri", Value::string(caller_uri.as_str())),
+                ("version", Value::Int(1)),
+                ("text", Value::string(caller_text)),
+            ]),
+        )]),
+    )));
+    let codes = |params: &Value| -> Vec<String> {
+        array(get(params, "diagnostics"))
+            .iter()
+            .filter_map(|d| match d {
+                Value::Object(map) => map.get(b"code".as_slice()).and_then(|v| match v {
+                    Value::String(s) => Some(String::from_utf8_lossy(s).into_owned()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
+    };
+    let initial_codes = codes(&open_caller);
+    assert!(initial_codes.contains(&"undefined-variable".to_owned()));
+    assert!(initial_codes.contains(&"directory-options".to_owned()));
+    assert!(initial_codes.contains(&"unguarded-build-type".to_owned()));
+    assert!(
+        !initial_codes.contains(&"glob-without-configure-depends".to_owned()),
+        "overwritten glob must not warn: {initial_codes:?}"
+    );
+
+    // 2. Open helpers.cmake in memory (unsaved!) defining MY_HELPER_VAR -> caller republishes!
+    let helpers_uri = format!("{WORK_URI}/helpers.cmake");
+    let msgs = server.handle(RpcMessage::notification(
+        "textDocument/didOpen",
+        object(&[(
+            "textDocument",
+            object(&[
+                ("uri", Value::string(helpers_uri.as_str())),
+                ("version", Value::Int(1)),
+                ("text", Value::string("set(MY_HELPER_VAR 42)\n")),
+            ]),
+        )]),
+    ));
+    let caller_update = msgs
+        .iter()
+        .find_map(|m| match m {
+            RpcMessage::Call { method, params, .. }
+                if method == "textDocument/publishDiagnostics"
+                    && get(params, "uri") == &Value::string(caller_uri.as_str()) =>
+            {
+                Some(params)
+            }
+            _ => None,
+        })
+        .expect("caller should be republished when open include changes");
+    assert!(
+        !codes(caller_update).contains(&"undefined-variable".to_owned()),
+        "unsaved include buffer should resolve MY_HELPER_VAR: {:?}",
+        codes(caller_update)
+    );
+
+    // 3. Close helpers.cmake -> caller reverts to disk state and re-emits undefined-variable!
+    let close_msgs = server.handle(RpcMessage::notification(
+        "textDocument/didClose",
+        object(&[(
+            "textDocument",
+            object(&[("uri", Value::string(helpers_uri.as_str()))]),
+        )]),
+    ));
+    let caller_after_close = close_msgs
+        .iter()
+        .find_map(|m| match m {
+            RpcMessage::Call { method, params, .. }
+                if method == "textDocument/publishDiagnostics"
+                    && get(params, "uri") == &Value::string(caller_uri.as_str()) =>
+            {
+                Some(params)
+            }
+            _ => None,
+        })
+        .expect("caller should be republished when open include closes");
+    assert!(codes(caller_after_close).contains(&"undefined-variable".to_owned()));
+
+    // 4. Create root .rcmake.toml disabling directory-options + notify watched file change.
+    host.seed_file(
+        &work.join(".rcmake.toml"),
+        b"[lint]\ndisable = [\"directory-options\"]\n",
+    )
+    .unwrap();
+    let cfg_msgs = server.handle(RpcMessage::notification(
+        "workspace/didChangeWatchedFiles",
+        object(&[(
+            "changes",
+            Value::Array(vec![object(&[
+                ("uri", Value::string(format!("{WORK_URI}/.rcmake.toml"))),
+                ("type", Value::Int(1)),
+            ])]),
+        )]),
+    ));
+    let after_root_cfg = published(cfg_msgs);
+    assert_eq!(
+        get(&after_root_cfg, "uri"),
+        &Value::string(caller_uri.as_str())
+    );
+    assert!(!codes(&after_root_cfg).contains(&"directory-options".to_owned()));
+
+    // 5. Create nearer /work/sub/.rcmake.toml overriding severity to error -> republishes!
+    host.seed_file(
+        &work.join("sub/.rcmake.toml"),
+        b"[lint.severity]\nunguarded-build-type = \"error\"\n",
+    )
+    .unwrap();
+    let nearer_msgs = server.handle(RpcMessage::notification(
+        "workspace/didChangeWatchedFiles",
+        object(&[(
+            "changes",
+            Value::Array(vec![object(&[
+                ("uri", Value::string(format!("{WORK_URI}/sub/.rcmake.toml"))),
+                ("type", Value::Int(1)),
+            ])]),
+        )]),
+    ));
+    let after_nearer = published(nearer_msgs);
+    let nearer_codes = codes(&after_nearer);
+    assert!(nearer_codes.contains(&"directory-options".to_owned()));
+    let bt_sev = array(get(&after_nearer, "diagnostics"))
+        .iter()
+        .find(|d| get(d, "code") == &Value::string("unguarded-build-type"))
+        .map(|d| get(d, "severity"));
+    assert_eq!(bt_sev, Some(&Value::UInt(1)));
+
+    // 6. Delete nearer /work/sub/.rcmake.toml -> falls back to root .rcmake.toml!
+    host.remove_file(&work.join("sub/.rcmake.toml")).unwrap();
+    let del_msgs = server.handle(RpcMessage::notification(
+        "workspace/didChangeWatchedFiles",
+        object(&[(
+            "changes",
+            Value::Array(vec![object(&[
+                ("uri", Value::string(format!("{WORK_URI}/sub/.rcmake.toml"))),
+                ("type", Value::Int(3)),
+            ])]),
+        )]),
+    ));
+    let after_del = published(del_msgs);
+    assert!(!codes(&after_del).contains(&"directory-options".to_owned()));
 }
 
 #[test]

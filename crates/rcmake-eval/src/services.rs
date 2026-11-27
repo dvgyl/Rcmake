@@ -185,6 +185,8 @@ pub struct Services {
     pub cancel: Option<CancelToken>,
     /// Maximum command count for the session, when specified.
     pub step_budget: Option<u64>,
+    /// `find_package()` records for native diagnostics. Compatibility personas keep `Off`.
+    pub find_trace: crate::FindTraceLevel,
 }
 
 /// Position of a parsed command within a listfile or virtual source.
@@ -227,5 +229,6 @@ mod tests {
         assert!(matches!(services.provenance, LedgerLevel::Off));
         assert!(services.cancel.is_none());
         assert_eq!(services.step_budget, None);
+        assert_eq!(services.find_trace, crate::FindTraceLevel::Off);
     }
 }

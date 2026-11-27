@@ -1,9 +1,21 @@
 //! Synchronous language server and the interface for semantic analysis.
 
-use std::{cell::RefCell, collections::BTreeMap, ops::Range, path::PathBuf, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use rcmake_host::{Host, discover_cmake_root};
 use rcmake_json::Value;
+use rcmake_language_tools::{
+    Config, ConfigCache, Finding, FormatStyle, HostWorkspaceReader, LintDependencies, LintLimits,
+    ResolvedConfig,
+    discovery::{infer_project_root, normalize_lexical},
+    lint_bytes,
+};
 
 use crate::{
     analysis::{self, Document},
@@ -122,6 +134,8 @@ pub struct Server<'a> {
     versioned_edits: bool,
     bundled_modules: Option<PathBuf>,
     workspace_cache: RefCell<WorkspaceCache>,
+    config_cache: RefCell<ConfigCache>,
+    lint_deps: RefCell<BTreeMap<String, LintDependencies>>,
     documents: BTreeMap<String, OpenDocument>,
     open_bytes: usize,
     open_limit_reported: bool,
@@ -143,6 +157,8 @@ impl<'a> Server<'a> {
             versioned_edits: false,
             bundled_modules: None,
             workspace_cache: RefCell::default(),
+            config_cache: RefCell::default(),
+            lint_deps: RefCell::default(),
             documents: BTreeMap::new(),
             open_bytes: 0,
             open_limit_reported: false,
@@ -202,13 +218,13 @@ impl<'a> Server<'a> {
                 .and_then(|caps| get(caps, "general"))
                 .and_then(|general| get(general, "positionEncodings"))
                 .and_then(array)
-                .filter(|encodings| {
+                .and_then(|encodings| {
                     encodings
                         .iter()
                         .filter_map(string)
-                        .any(|value| value == "utf-8")
+                        .find_map(PositionEncoding::from_name)
                 })
-                .map_or(PositionEncoding::Utf16, |_| PositionEncoding::Utf8);
+                .unwrap_or(PositionEncoding::Utf16);
             self.markdown_hover = get(params, "capabilities")
                 .and_then(|caps| get(caps, "textDocument"))
                 .and_then(|document| get(document, "hover"))
@@ -274,12 +290,17 @@ impl<'a> Server<'a> {
                     .and_then(int)
                     .filter(|&size| (1..=32).contains(&size))
                     .ok_or(INVALID_PARAMS)?;
-                let indent = match get(options, "insertSpaces") {
-                    Some(Value::Bool(true)) => " ".repeat(tab_size as usize),
-                    Some(Value::Bool(false)) => "\t".into(),
+                let insert_spaces = match get(options, "insertSpaces") {
+                    Some(Value::Bool(flag)) => *flag,
                     _ => return Err(INVALID_PARAMS),
                 };
-                doc.formatting(self.encoding, &indent).ok_or((
+                let resolved = self.resolve_doc_config(uri);
+                let style = FormatStyle::from_config_with_client_fallback(
+                    &resolved.config.fmt,
+                    tab_size as usize,
+                    insert_spaces,
+                );
+                doc.formatting(self.encoding, &style).ok_or((
                     -32803,
                     "Formatting exceeds the 16 MiB response limit. Format a smaller file.",
                 ))
@@ -407,25 +428,52 @@ impl<'a> Server<'a> {
                 let doc = self.documents.remove(uri)?;
                 self.open_bytes -= doc.len();
                 self.workspace_cache.get_mut().invalidate_documents();
+                self.lint_deps.borrow_mut().remove(uri);
                 if doc.current().is_some()
                     && let Some(provider) = self.semantic()
                 {
                     provider.update(SemanticUpdate::Closed { uri });
                 }
-                Some(vec![self.publish(uri)])
+                let mut messages = vec![self.publish(uri)];
+                if let Some(path) = uri::path(uri) {
+                    for caller in self.affected_callers_for_file(&path, Some(uri)) {
+                        messages.push(self.publish(&caller));
+                    }
+                }
+                Some(messages)
             }
             "workspace/didChangeWatchedFiles" => {
-                for path in get(params, "changes")
+                let changes: Vec<PathBuf> = get(params, "changes")
                     .and_then(array)?
                     .iter()
                     .take(4096)
                     .filter_map(|change| get(change, "uri").and_then(string).and_then(uri::path))
-                {
+                    .collect();
+                let mut affected_uris = BTreeSet::new();
+                for path in changes {
                     self.workspace_cache
                         .get_mut()
                         .invalidate_file(self.host, &path);
+                    let is_config = path.file_name().is_some_and(|name| {
+                        name == rcmake_language_tools::config::CONFIG_FILE_NAME
+                    });
+                    if is_config {
+                        self.config_cache.borrow_mut().clear();
+                        affected_uris.extend(self.affected_docs_for_config(&path));
+                    } else {
+                        affected_uris.extend(self.affected_callers_for_file(&path, None));
+                    }
                 }
-                None
+                if affected_uris.is_empty() {
+                    None
+                } else {
+                    Some(
+                        affected_uris
+                            .into_iter()
+                            .map(|uri| self.publish(&uri))
+                            .collect(),
+                    )
+                }
             }
             "$/cancelRequest" => {
                 // Each synchronous request is complete before this notification arrives.
@@ -511,7 +559,7 @@ impl<'a> Server<'a> {
         let offset = lines
             .edit_offset(text, position, self.encoding)
             .ok_or(SyncFailure::InvalidChange)?;
-        if self.encoding == PositionEncoding::Utf16 {
+        if self.encoding != PositionEncoding::Utf8 {
             let start = lines
                 .start(position.line)
                 .ok_or(SyncFailure::InvalidChange)?;
@@ -530,7 +578,15 @@ impl<'a> Server<'a> {
         show_parse_error: bool,
     ) -> Vec<RpcMessage> {
         match text.and_then(|text| self.replace(uri, text, version, show_parse_error)) {
-            Ok(()) => vec![self.publish(uri)],
+            Ok(()) => {
+                let mut messages = vec![self.publish(uri)];
+                if let Some(path) = uri::path(uri) {
+                    for caller in self.affected_callers_for_file(&path, Some(uri)) {
+                        messages.push(self.publish(&caller));
+                    }
+                }
+                messages
+            }
             Err(failure) => self.desync(uri, version, failure),
         }
     }
@@ -584,11 +640,192 @@ impl<'a> Server<'a> {
             } = doc
             {
                 let semantic = self.semantic_diagnostics(&self.semantic_document(uri, doc));
-                diagnostics = doc.diagnostics(self.encoding, *show_parse_error, &semantic);
+                let lint_findings = self.lint_document(uri, doc);
+                diagnostics =
+                    doc.diagnostics(self.encoding, *show_parse_error, &semantic, &lint_findings);
+            } else {
+                self.lint_deps.borrow_mut().remove(uri);
             }
+        } else {
+            self.lint_deps.borrow_mut().remove(uri);
         }
         params.push(("diagnostics", Value::Array(diagnostics)));
         RpcMessage::notification("textDocument/publishDiagnostics", object(params))
+    }
+
+    fn root_for_path(&self, path: &Path) -> Option<PathBuf> {
+        let matched = self
+            .workspace_roots
+            .iter()
+            .map(|r| &r.path)
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned();
+        matched.or_else(|| {
+            let parent = path.parent().unwrap_or(path);
+            let cwd = self.host.initial_cwd();
+            Some(infer_project_root(self.host, parent, &cwd))
+        })
+    }
+
+    fn resolve_doc_config(&self, uri: &str) -> ResolvedConfig {
+        let Some(path) = uri::path(uri) else {
+            return ResolvedConfig {
+                config: Config::default(),
+                config_path: None,
+                checked_dirs: Vec::new(),
+            };
+        };
+        let dir = path.parent().unwrap_or(&path);
+        let boundary = self.root_for_path(&path);
+        match self
+            .config_cache
+            .borrow_mut()
+            .resolve(self.host, dir, boundary.as_deref())
+        {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                // Keep checked directories tracked even when a config file has an edit error so
+                // fixing it republishes diagnostics immediately.
+                let mut checked_dirs = Vec::new();
+                let mut cur = Some(dir);
+                while let Some(d) = cur {
+                    checked_dirs.push(d.to_owned());
+                    if boundary.as_deref() == Some(d) {
+                        break;
+                    }
+                    cur = d.parent();
+                }
+                ResolvedConfig {
+                    config: Config::default(),
+                    config_path: None,
+                    checked_dirs,
+                }
+            }
+        }
+    }
+
+    fn lint_document(&self, uri: &str, doc: &Document) -> Vec<Finding> {
+        let path = uri::path(uri).unwrap_or_else(|| PathBuf::from(uri));
+        let root = self.root_for_path(&path);
+        let resolved = self.resolve_doc_config(uri);
+
+        let mut readable_roots: Vec<PathBuf> = self
+            .workspace_roots
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
+        if let Some(root_dir) = &root
+            && !readable_roots.contains(root_dir)
+        {
+            readable_roots.push(root_dir.clone());
+        }
+
+        let mut reader =
+            HostWorkspaceReader::new(self.host, readable_roots, self.bundled_modules.clone());
+        // Prefer ALL open synced LSP buffers over disk state.
+        for (open_uri, open_doc) in &self.documents {
+            if let Some(synced) = open_doc.current()
+                && let Some(open_path) = uri::path(open_uri)
+            {
+                reader.insert_open_buffer(open_path, Arc::from(synced.text.as_bytes()));
+            }
+        }
+
+        let mut deps = LintDependencies {
+            included_files: BTreeSet::new(),
+            config_dirs: resolved
+                .checked_dirs
+                .into_iter()
+                .map(|d| normalize_lexical(&d))
+                .collect(),
+            config_file: resolved.config_path.map(|p| normalize_lexical(&p)),
+        };
+
+        let findings = match lint_bytes(
+            &path,
+            doc.text.as_bytes(),
+            &resolved.config.lint,
+            &LintLimits::default(),
+            &reader,
+            root.as_deref(),
+        ) {
+            Ok(result) => {
+                deps.included_files = result.dependencies.included_files;
+                result.findings
+            }
+            Err(_) => Vec::new(),
+        };
+
+        self.lint_deps.borrow_mut().insert(uri.to_owned(), deps);
+        findings
+    }
+
+    fn affected_callers_for_file(
+        &self,
+        changed_path: &Path,
+        exclude_uri: Option<&str>,
+    ) -> Vec<String> {
+        let norm = normalize_lexical(changed_path);
+        let canonical = self.host.canonicalize(&norm).ok();
+        let deps = self.lint_deps.borrow();
+        let mut affected = Vec::new();
+        for (uri, doc_deps) in deps.iter() {
+            if exclude_uri == Some(uri.as_str()) {
+                continue;
+            }
+            if !self
+                .documents
+                .get(uri)
+                .is_some_and(|doc| doc.current().is_some())
+            {
+                continue;
+            }
+            let matches_include = doc_deps.included_files.iter().any(|inc| {
+                inc == &norm
+                    || canonical.as_ref().is_some_and(|c| inc == c)
+                    || canonical
+                        .as_ref()
+                        .is_some_and(|c| self.host.canonicalize(inc).ok().as_ref() == Some(c))
+            });
+            if matches_include {
+                affected.push(uri.clone());
+            }
+        }
+        affected
+    }
+
+    fn affected_docs_for_config(&self, config_path: &Path) -> Vec<String> {
+        let norm_cfg = normalize_lexical(config_path);
+        let cfg_dir = norm_cfg.parent().map(normalize_lexical);
+        let canonical_dir = cfg_dir
+            .as_deref()
+            .and_then(|d| self.host.canonicalize(d).ok());
+        let deps = self.lint_deps.borrow();
+        let mut affected = Vec::new();
+        for (uri, doc_deps) in deps.iter() {
+            if !self
+                .documents
+                .get(uri)
+                .is_some_and(|doc| doc.current().is_some())
+            {
+                continue;
+            }
+            let same_file = doc_deps.config_file.as_ref() == Some(&norm_cfg);
+            let in_checked_dir = cfg_dir.as_ref().is_some_and(|dir| {
+                doc_deps.config_dirs.iter().any(|checked| {
+                    checked == dir
+                        || canonical_dir.as_ref().is_some_and(|c| checked == c)
+                        || canonical_dir.as_ref().is_some_and(|c| {
+                            self.host.canonicalize(checked).ok().as_ref() == Some(c)
+                        })
+                })
+            });
+            if same_file || in_checked_dir {
+                affected.push(uri.clone());
+            }
+        }
+        affected
     }
 
     fn semantic_document<'b>(&self, uri: &'b str, doc: &'b Document) -> SemanticDocument<'b> {
@@ -845,7 +1082,7 @@ fn show_warning(message: String) -> RpcMessage {
 }
 
 fn register_watchers() -> RpcMessage {
-    let watchers = ["**/CMakeLists.txt", "**/*.cmake"]
+    let watchers = ["**/CMakeLists.txt", "**/*.cmake", "**/.rcmake.toml"]
         .map(|pattern| object([("globPattern", Value::string(pattern))]));
     RpcMessage::request(
         RequestId::String("rcmake-watch-listfiles".into()),

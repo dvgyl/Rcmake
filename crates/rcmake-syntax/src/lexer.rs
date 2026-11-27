@@ -1,15 +1,34 @@
-//! Scan normalized tokens and retain offsets into the original byte buffer.
+//! Scan raw and normalized tokens while retaining byte offsets into the original buffer.
 
 use rcmake_base::BString;
 use rcmake_diag::source::SourceKind;
 
 use crate::ParseError;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Position {
     pub(super) offset: usize,
     pub(super) line: u32,
     pub(super) column: u32,
+}
+
+/// Lossless token classification covering every byte of a listfile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RawKind {
+    Bom,
+    Space,
+    Newline,
+    LineComment,
+    BracketComment,
+    Identifier,
+    Unquoted,
+    Quoted,
+    Bracket,
+    LeftParen,
+    RightParen,
+    UnterminatedQuote,
+    UnterminatedBracket,
+    BadCharacter,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,6 +64,30 @@ impl Kind {
             Self::BadCharacter => b"bad character",
         }
     }
+
+    pub(super) const fn from_raw(kind: RawKind) -> Option<Self> {
+        Some(match kind {
+            RawKind::Bom | RawKind::LineComment => return None,
+            RawKind::Space => Self::Space,
+            RawKind::Newline => Self::Newline,
+            RawKind::BracketComment => Self::BracketComment,
+            RawKind::Identifier => Self::Identifier,
+            RawKind::Unquoted => Self::Unquoted,
+            RawKind::Quoted => Self::Quoted,
+            RawKind::Bracket => Self::Bracket,
+            RawKind::LeftParen => Self::LeftParen,
+            RawKind::RightParen => Self::RightParen,
+            RawKind::UnterminatedQuote => Self::UnterminatedQuote,
+            RawKind::UnterminatedBracket => Self::UnterminatedBracket,
+            RawKind::BadCharacter => Self::BadCharacter,
+        })
+    }
+}
+
+pub(super) struct RawToken {
+    pub(super) kind: RawKind,
+    pub(super) start: Position,
+    pub(super) end: Position,
 }
 
 pub(super) struct Token {
@@ -54,15 +97,16 @@ pub(super) struct Token {
     pub(super) end: Position,
 }
 
-pub(super) struct Lexer<'a> {
+pub(super) struct RawLexer<'a> {
     rest: &'a [u8],
     normalize_crlf: bool,
+    pending_bom: bool,
     position: Position,
 }
 
-impl<'a> Lexer<'a> {
+impl<'a> RawLexer<'a> {
     pub(super) fn new(src: &'a [u8], kind: SourceKind) -> Result<Self, ParseError> {
-        let mut rest = src;
+        let mut pending_bom = false;
         if kind == SourceKind::File {
             if has_unsupported_file_bom(src) {
                 return Err(ParseError {
@@ -72,15 +116,16 @@ impl<'a> Lexer<'a> {
                     message: "File starts with a Byte-Order-Mark that is not UTF-8.".into(),
                 });
             }
-            if let Some(without_bom) = src.strip_prefix(b"\xef\xbb\xbf") {
-                rest = without_bom;
+            if src.starts_with(b"\xef\xbb\xbf") {
+                pending_bom = true;
             }
         }
         Ok(Self {
-            rest,
+            rest: src,
             normalize_crlf: kind == SourceKind::File,
+            pending_bom,
             position: Position {
-                offset: src.len() - rest.len(),
+                offset: 0,
                 line: 1,
                 column: 1,
             },
@@ -91,6 +136,7 @@ impl<'a> Lexer<'a> {
         Self {
             rest,
             normalize_crlf: true,
+            pending_bom: false,
             position,
         }
     }
@@ -99,56 +145,94 @@ impl<'a> Lexer<'a> {
         self.position
     }
 
-    pub(super) fn next(&mut self) -> Option<Token> {
-        loop {
+    pub(super) fn next_raw(&mut self) -> Option<RawToken> {
+        self.next_inner(false).map(|(token, _)| token)
+    }
+
+    pub(super) fn next_with_text(&mut self) -> Option<(RawToken, BString)> {
+        self.next_inner(true)
+    }
+
+    fn next_inner(&mut self, capture_text: bool) -> Option<(RawToken, BString)> {
+        if self.pending_bom {
+            self.pending_bom = false;
             let start = self.position;
-            let (kind, text) = match self.peek()?.0 {
-                b' ' | b'\t' | b'\r' => {
-                    while matches!(self.peek(), Some((b' ' | b'\t' | b'\r', _))) {
+            self.rest = self.rest.get(3..).unwrap_or_default();
+            self.position.offset += 3;
+            return Some((
+                RawToken {
+                    kind: RawKind::Bom,
+                    start,
+                    end: self.position,
+                },
+                BString::default(),
+            ));
+        }
+
+        let start = self.position;
+        let (kind, text) = match self.peek()?.0 {
+            b' ' | b'\t' | b'\r' => {
+                while matches!(self.peek(), Some((b' ' | b'\t' | b'\r', _))) {
+                    self.bump();
+                }
+                (RawKind::Space, BString::default())
+            }
+            b'\n' => {
+                self.bump();
+                let text = if capture_text {
+                    "\n".into()
+                } else {
+                    BString::default()
+                };
+                (RawKind::Newline, text)
+            }
+            b'(' => {
+                self.bump();
+                let text = if capture_text {
+                    "(".into()
+                } else {
+                    BString::default()
+                };
+                (RawKind::LeftParen, text)
+            }
+            b')' => {
+                self.bump();
+                let text = if capture_text {
+                    ")".into()
+                } else {
+                    BString::default()
+                };
+                (RawKind::RightParen, text)
+            }
+            b'"' => self.quoted(capture_text),
+            b'[' => match bracket_opener(self.rest) {
+                Some(equals) => self.bracket(equals, RawKind::Bracket, capture_text),
+                None => self.unquoted(capture_text),
+            },
+            b'#' => {
+                self.bump();
+                if let Some(equals) = bracket_opener(self.rest) {
+                    self.bracket(equals, RawKind::BracketComment, capture_text)
+                } else {
+                    while let Some((byte, _)) = self.peek() {
+                        if byte == b'\n' {
+                            break;
+                        }
                         self.bump();
                     }
-                    (Kind::Space, BString::default())
+                    (RawKind::LineComment, BString::default())
                 }
-                b'\n' => {
-                    self.bump();
-                    (Kind::Newline, "\n".into())
-                }
-                b'(' => {
-                    self.bump();
-                    (Kind::LeftParen, "(".into())
-                }
-                b')' => {
-                    self.bump();
-                    (Kind::RightParen, ")".into())
-                }
-                b'"' => self.quoted(),
-                b'[' => match bracket_opener(self.rest) {
-                    Some(equals) => self.bracket(equals, Kind::Bracket),
-                    None => self.unquoted(),
-                },
-                b'#' => {
-                    self.bump();
-                    if let Some(equals) = bracket_opener(self.rest) {
-                        self.bracket(equals, Kind::BracketComment)
-                    } else {
-                        while let Some((byte, _)) = self.peek() {
-                            if byte == b'\n' {
-                                break;
-                            }
-                            self.bump();
-                        }
-                        continue;
-                    }
-                }
-                _ => self.unquoted(),
-            };
-            return Some(Token {
+            }
+            _ => self.unquoted(capture_text),
+        };
+        Some((
+            RawToken {
                 kind,
-                text,
                 start,
                 end: self.position,
-            });
-        }
+            },
+            text,
+        ))
     }
 
     fn peek(&self) -> Option<(u8, usize)> {
@@ -180,24 +264,46 @@ impl<'a> Lexer<'a> {
         self.position.column = self.position.column.saturating_add(columns);
     }
 
-    fn quoted(&mut self) -> (Kind, BString) {
+    fn quoted(&mut self, capture_text: bool) -> (RawKind, BString) {
         self.bump();
         let mut text = Vec::new();
+        let mut has_nul = false;
         while let Some(byte) = self.bump() {
             match byte {
-                b'"' => return (check_nul(Kind::Quoted, &text), text.into()),
+                b'"' => {
+                    let kind = if has_nul {
+                        RawKind::BadCharacter
+                    } else {
+                        RawKind::Quoted
+                    };
+                    return (kind, text.into());
+                }
                 b'\\' => match self.bump() {
                     Some(b'\n') => {}
-                    Some(next) => text.extend_from_slice(&[byte, next]),
-                    None => text.push(byte),
+                    Some(next) => {
+                        has_nul |= next == 0;
+                        if capture_text {
+                            text.extend_from_slice(&[byte, next]);
+                        }
+                    }
+                    None => {
+                        if capture_text {
+                            text.push(byte);
+                        }
+                    }
                 },
-                _ => text.push(byte),
+                _ => {
+                    has_nul |= byte == 0;
+                    if capture_text {
+                        text.push(byte);
+                    }
+                }
             }
         }
-        (Kind::UnterminatedQuote, text.into())
+        (RawKind::UnterminatedQuote, text.into())
     }
 
-    fn bracket(&mut self, equals: usize, kind: Kind) -> (Kind, BString) {
+    fn bracket(&mut self, equals: usize, kind: RawKind, capture_text: bool) -> (RawKind, BString) {
         if let Some(after_opener) = self.rest.get(equals + 2..) {
             self.advance_inline(after_opener);
         }
@@ -206,6 +312,7 @@ impl<'a> Lexer<'a> {
         }
 
         let mut text = Vec::new();
+        let mut has_nul = false;
         while let Some(byte) = self.bump() {
             if byte == b']' {
                 let count = leading_equals(self.rest);
@@ -213,15 +320,19 @@ impl<'a> Lexer<'a> {
                     && let Some([b']', remaining @ ..]) = self.rest.get(count..)
                 {
                     self.advance_inline(remaining);
-                    return (check_nul(kind, &text), text.into());
+                    let final_kind = if has_nul { RawKind::BadCharacter } else { kind };
+                    return (final_kind, text.into());
                 }
             }
-            text.push(byte);
+            has_nul |= byte == 0;
+            if capture_text {
+                text.push(byte);
+            }
         }
-        (Kind::UnterminatedBracket, text.into())
+        (RawKind::UnterminatedBracket, text.into())
     }
 
-    fn unquoted(&mut self) -> (Kind, BString) {
+    fn unquoted(&mut self, capture_text: bool) -> (RawKind, BString) {
         let mut rest = self.rest;
         while let [byte, after @ ..] = rest {
             rest = match byte {
@@ -244,19 +355,69 @@ impl<'a> Lexer<'a> {
 
         let length = self.rest.len() - rest.len();
         if length == 0 {
-            return (Kind::BadCharacter, self.bump().into_iter().collect());
+            let byte = self.bump();
+            let text = if capture_text {
+                byte.into_iter().collect()
+            } else {
+                BString::default()
+            };
+            return (RawKind::BadCharacter, text);
         }
-        let text = self.rest.get(..length).unwrap_or_default();
+        let slice = self.rest.get(..length).unwrap_or_default();
         self.advance_inline(rest);
-        let kind = match text {
+        let kind = match slice {
             [first, tail @ ..]
                 if identifier_start(*first) && tail.iter().copied().all(identifier_byte) =>
             {
-                Kind::Identifier
+                RawKind::Identifier
             }
-            _ => check_nul(Kind::Unquoted, text),
+            _ => check_nul(RawKind::Unquoted, slice),
         };
-        (kind, text.into())
+        let text = if capture_text {
+            slice.into()
+        } else {
+            BString::default()
+        };
+        (kind, text)
+    }
+}
+
+pub(super) struct Lexer<'a> {
+    raw: RawLexer<'a>,
+}
+
+impl<'a> Lexer<'a> {
+    pub(super) fn new(src: &'a [u8], kind: SourceKind) -> Result<Self, ParseError> {
+        let mut raw = RawLexer::new(src, kind)?;
+        if raw.pending_bom {
+            let _ = raw.next_raw();
+        }
+        Ok(Self { raw })
+    }
+
+    pub(super) fn resume(rest: &'a [u8], position: Position) -> Self {
+        Self {
+            raw: RawLexer::resume(rest, position),
+        }
+    }
+
+    pub(super) fn position(&self) -> Position {
+        self.raw.position()
+    }
+
+    pub(super) fn next(&mut self) -> Option<Token> {
+        loop {
+            let (raw, text) = self.raw.next_with_text()?;
+            let Some(kind) = Kind::from_raw(raw.kind) else {
+                continue;
+            };
+            return Some(Token {
+                kind,
+                text,
+                start: raw.start,
+                end: raw.end,
+            });
+        }
     }
 }
 
@@ -269,9 +430,9 @@ fn has_unsupported_file_bom(src: &[u8]) -> bool {
     )
 }
 
-fn check_nul(kind: Kind, text: &[u8]) -> Kind {
+fn check_nul(kind: RawKind, text: &[u8]) -> RawKind {
     if text.contains(&0) {
-        Kind::BadCharacter
+        RawKind::BadCharacter
     } else {
         kind
     }

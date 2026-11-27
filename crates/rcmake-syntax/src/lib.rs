@@ -19,6 +19,7 @@ use rcmake_base::{BString, Limits};
 use rcmake_diag::{Diagnostic, SourceId, source::SourceKind};
 use thiserror::Error;
 
+pub mod concrete;
 mod lexer;
 mod parser;
 mod tolerant;

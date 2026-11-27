@@ -42,6 +42,41 @@ impl CompletionState {
     pub fn is_partial(&self) -> bool {
         matches!(self, Self::Partial { .. })
     }
+
+    /// Return whether the result can differ from a full configure of the project code.
+    ///
+    /// Denials whose recorded call sites are all under `module_root`, the bundled CMake
+    /// modules, only skip platform probes that the cache already answers. A cancelled
+    /// run, an early stop, an unattributed denial, or a denial in project code makes
+    /// the result provisional.
+    #[must_use]
+    pub fn provisional_outside(&self, module_root: Option<&[u8]>) -> bool {
+        let Self::Partial {
+            denied_processes,
+            omitted_denials,
+            module_denials,
+            project_denial_sites,
+            cancelled,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let total = denied_processes.len().saturating_add(*omitted_denials);
+        if *cancelled || total == 0 {
+            return true;
+        }
+        if total <= *module_denials {
+            return false;
+        }
+        let Some(root) = module_root.filter(|root| !root.is_empty()) else {
+            return true;
+        };
+        project_denial_sites.is_empty()
+            || project_denial_sites
+                .iter()
+                .any(|(file, _)| !file.starts_with(root))
+    }
 }
 
 /// An alias declaration recorded when the evaluator registered its name.
@@ -122,6 +157,8 @@ pub struct EvaluationFacts {
     pub variable_writes: BTreeMap<u64, VariableWriteDetails>,
     /// Ordered entries from the resolver stage that recorded provenance chains.
     pub resolved_entries: Vec<ResolvedEntry>,
+    /// `find_package()` records, when the services requested them.
+    pub find_traces: Option<rcmake_eval::FindTraceStore>,
 }
 
 /// Data produced by one configure session.
@@ -199,4 +236,35 @@ pub(crate) fn infer_cache_location(
         && preview.prefix == value)
         .then(|| SourceLocation::from_backtrace(&event.backtrace))
         .flatten()
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    fn partial(sites: &[&str], module_denials: usize, cancelled: bool) -> CompletionState {
+        CompletionState::Partial {
+            denied_processes: Vec::new(),
+            omitted_denials: 3,
+            omitted_denial_bytes: 0,
+            module_denials,
+            project_denial_sites: sites.iter().map(|site| (BString::from(*site), 1)).collect(),
+            cancelled,
+        }
+    }
+
+    #[test]
+    fn module_only_denials_are_not_provisional() {
+        let root = Some(b"/share/cmake".as_slice());
+        assert!(!CompletionState::Complete.provisional_outside(root));
+        assert!(
+            !partial(&["/share/cmake/Modules/Platform/Darwin.cmake"], 0, false)
+                .provisional_outside(root)
+        );
+        assert!(partial(&["/src/CMakeLists.txt"], 0, false).provisional_outside(root));
+        assert!(partial(&[], 0, false).provisional_outside(root));
+        assert!(!partial(&[], 3, false).provisional_outside(root));
+        assert!(partial(&["/share/cmake/Modules/X.cmake"], 0, true).provisional_outside(root));
+        assert!(partial(&["/share/cmake/Modules/X.cmake"], 0, false).provisional_outside(None));
+    }
 }

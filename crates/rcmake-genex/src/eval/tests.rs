@@ -22,7 +22,7 @@ const OBJECT_ROOTS: (&str, &str) = ("C:/src", "C:/build");
 #[cfg(not(windows))]
 const OBJECT_ROOTS: (&str, &str) = ("/src", "/out");
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Host {
     properties: HashMap<(TargetHandle, BString), BString>,
     definitions: HashMap<BString, BString>,
@@ -204,7 +204,17 @@ fn run(
     ctx: &EvalContext,
     host: &mut Host,
 ) -> Result<(BString, EvalFlags), GenexError> {
-    evaluate(&parse(input)?, ctx, host)
+    let ast = parse(input)?;
+    let mut traced_host = host.clone();
+    let mut trace = crate::GenexTrace::default();
+    let traced = crate::evaluate_traced(&ast, ctx, &mut traced_host, &mut trace);
+    let plain = evaluate(&ast, ctx, host);
+    assert_eq!(
+        format!("{traced:?}"),
+        format!("{plain:?}"),
+        "traced result differs"
+    );
+    plain
 }
 
 #[test]

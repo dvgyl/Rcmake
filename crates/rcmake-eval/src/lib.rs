@@ -43,6 +43,7 @@ pub mod debug;
 mod digest;
 mod env;
 mod file_lock;
+pub mod find_trace;
 mod flow;
 pub mod hermetic;
 mod hooks;
@@ -67,6 +68,7 @@ pub use configure_log::{FindEvent, TryBuildOutcome, TryCompileEvent, TryRunOutco
 pub use cx::Cx;
 pub use env::CxEnv;
 pub use file_lock::FileLockScope;
+pub use find_trace::{FindTraceLevel, FindTraceLimits, FindTraceStore};
 pub use flow::ForeachLookahead;
 pub use hooks::{TraceConfig, TraceFormat, WatchAccess};
 pub use interp::StopReason;

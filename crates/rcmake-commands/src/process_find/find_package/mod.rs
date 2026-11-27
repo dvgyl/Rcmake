@@ -1,5 +1,6 @@
 use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_diag::{Effect, MessageKind, PolicyId, PolicyStatus};
+use rcmake_eval::find_trace::FindOutcome;
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, LogLevel};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{Stream, path};
@@ -10,6 +11,7 @@ use super::{cat, cps_import};
 use config::ConfigSearch;
 use log::{Mode, Reason, SearchLog, SearchReport};
 use messages::report_missing;
+use native::{Collector, Detail};
 use paths::{package_roots, redirects_directory, resolve_package_root};
 use request::VersionRequest;
 use trace::SearchTrace;
@@ -19,6 +21,7 @@ pub(super) use request::{Bindings, Request, version_bindings};
 mod config;
 mod log;
 mod messages;
+mod native;
 mod paths;
 mod request;
 mod trace;
@@ -88,9 +91,10 @@ fn find_requested_package(
     let find = |suffix| cat(&[name, b"_FIND_", suffix]);
     if cx.var_is_on(&find(b"MODULE")) {
         if request.version.is_none() && cx.var_defined(&find(b"VERSION")) {
-            request.version = Some(VersionRequest::parse(
-                &cx.var_or_empty(&find(b"VERSION_COMPLETE")),
-            )?);
+            match VersionRequest::parse(&cx.var_or_empty(&find(b"VERSION_COMPLETE"))) {
+                Ok(version) => request.version = Some(version),
+                Err(error) => return fail_early(cx, name, &request, error),
+            }
             request.exact |= cx.var_is_on(&find(b"VERSION_EXACT"));
         }
         if request.components.is_empty() {
@@ -106,9 +110,8 @@ fn find_requested_package(
     if request.exact {
         match &request.version {
             Some(version) if version.max.is_some() => {
-                return Err(CmdError::status(
-                    "EXACT cannot be specified with a version range.",
-                ));
+                let error = CmdError::status("EXACT cannot be specified with a version range.");
+                return fail_early(cx, name, &request, error);
             }
             None => {
                 crate::author_warning(cx, "Ignoring EXACT since no version is requested.");
@@ -154,7 +157,9 @@ fn find_requested_package(
                 ]),
             );
         }
+        let native = log.native.take();
         log.emit(cx, name, &request, &outer_roots);
+        finish_native(cx, native, name, FindOutcome::Disabled);
         return Ok(Flow::Normal);
     }
 
@@ -173,13 +178,17 @@ fn find_requested_package(
         let called = cx.call_command(&provider, call);
         cx.end_replay_setup(called.is_ok());
         if let Err(error) = called {
+            let native = log.native.take();
             log.emit(cx, name, &request, &outer_roots);
+            finish_native(cx, native, name, FindOutcome::Error);
             return Err(error);
         }
         let path = cat(&[b"dependency_provider::", &provider]);
         if cx.var_is_on(&found_var) {
             log.selected(path, Mode::Provider, BString::default());
+            let native = log.native.take();
             log.emit(cx, name, &request, &outer_roots);
+            finish_native(cx, native, name, FindOutcome::Found);
             return finish(cx, name, &request, first_target, true);
         }
         log.candidate(
@@ -228,7 +237,7 @@ fn find_requested_package(
     if let Some(registry_view) = &request.registry_view {
         vars.add(find(b"REGISTRY_VIEW"), registry_view.clone());
     }
-    let found = vars.scoped(cx, |cx| {
+    let (found, native) = vars.scoped(cx, |cx| {
         let mut report = SearchReport {
             trace: SearchTrace::new(cx, name),
             log,
@@ -242,10 +251,17 @@ fn find_requested_package(
             dependency,
             &mut report,
         );
+        let native = report.log.native.take();
         report.log.emit(cx, name, &request, &outer_roots);
         report.trace.emit(cx);
-        result
+        (result, native)
     });
+    let outcome = match &found {
+        Ok(true) => FindOutcome::Found,
+        Ok(false) => FindOutcome::NotFound,
+        Err(_) => FindOutcome::Error,
+    };
+    finish_native(cx, native, name, outcome);
     match found {
         Ok(found) => finish(cx, name, &request, first_target, found),
         Err(err) => {
@@ -253,6 +269,23 @@ fn find_requested_package(
             Err(err)
         }
     }
+}
+
+fn finish_native(
+    cx: &mut Cx<'_>,
+    native: Option<Box<Collector>>,
+    name: &[u8],
+    outcome: FindOutcome,
+) {
+    if let Some(native) = native {
+        native.finish(cx, name, outcome);
+    }
+}
+
+fn fail_early(cx: &mut Cx<'_>, name: &[u8], request: &Request, error: CmdError) -> CmdResult {
+    let native = Collector::start(cx, name, request);
+    finish_native(cx, native, name, FindOutcome::Error);
+    Err(error)
 }
 
 fn flag(value: bool) -> &'static str {
@@ -458,6 +491,29 @@ fn search(
             }
             if !found {
                 let reason = cx.var_or_empty(&cat(&[name, b"_NOT_FOUND_MESSAGE"]));
+                if report.log.native.is_some() {
+                    let missing: Vec<BString> = request
+                        .components
+                        .iter()
+                        .filter(|(component, required)| {
+                            *required && !cx.var_is_on(&cat(&[name, b"_", component, b"_FOUND"]))
+                        })
+                        .map(|(component, _)| component.clone())
+                        .collect();
+                    let reject = if missing.is_empty() {
+                        Reason::NotFound
+                    } else {
+                        Reason::InsufficientComponents
+                    };
+                    let detail = Detail {
+                        found_version: cx.var(&cat(&[name, b"_VERSION"])),
+                        missing_components: missing,
+                        ..Detail::default()
+                    };
+                    report
+                        .log
+                        .native_candidate(&file, Mode::Config, reject, &reason, detail);
+                }
                 let message = cat(&[
                     b"Found package configuration file:\n  ",
                     &file,
@@ -476,6 +532,7 @@ fn search(
                 if let Some(diagnostics) = dependency {
                     diagnostics.push(cps_import::PackageDiagnostic::new(message));
                 } else {
+                    report.log.native_missing();
                     report_missing(cx, request, message)?;
                 }
             }
@@ -506,6 +563,7 @@ fn search(
     } else if let Some(diagnostics) = dependency {
         diagnostics.push(cps_import::PackageDiagnostic::new(message));
     } else {
+        report.log.native_missing();
         let result = report_missing(cx, request, message);
         if request.module && (request.required || !request.quiet && !request.optional) {
             messages::warn_module_path(cx, name);
@@ -580,6 +638,7 @@ fn load_module(
     report
         .trace
         .module(&filename, &considered, selected.as_deref());
+    report.log.native_module_search(&considered);
     let Some(module) = selected else {
         return Ok(None);
     };
@@ -725,3 +784,6 @@ mod bundled_caller_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod tests;

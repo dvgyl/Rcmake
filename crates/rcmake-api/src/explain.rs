@@ -15,7 +15,10 @@ use rcmake_resolve::{ChainKind, LinkFragmentRole};
 
 use crate::explain_entries::{build_entries, join_entries, set_spelling};
 use crate::explain_render::chain_kind;
-use crate::{ConfigureResult, PreviousValue, SourceLocation, VariableHistory};
+use crate::{
+    ConfigureResult, DependencyReport, ExplainFilter, PreviousValue, SourceLocation,
+    VariableHistory,
+};
 
 /// Select the name and kind of item to explain.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,6 +109,10 @@ pub struct ExplainTarget {
     pub roots: ExplainRoots,
     /// Value or compiler spelling selected by the caller, if any.
     pub filter: Option<BString>,
+    /// Typed filter selected by the caller, if any.
+    pub typed_filter: Option<ExplainFilter>,
+    /// Paths to the requested dependency for [`ExplainFilter::Dependency`].
+    pub dependency: Option<Box<DependencyReport>>,
     /// Resolved usage entries for each configuration.
     pub configurations: Vec<ExplainConfig>,
     /// Property writes on the target and contributors in its chains.
@@ -247,7 +254,15 @@ impl ExplainEntry {
         }
     }
 
-    fn matches_filter(&self, filter: &[u8]) -> bool {
+    pub(crate) fn tokens(&self) -> Vec<BString> {
+        let mut tokens = flag_tokens(&self.value);
+        if let Some(spelling) = &self.spelling {
+            tokens.extend(flag_tokens(spelling));
+        }
+        tokens
+    }
+
+    pub(crate) fn matches_filter(&self, filter: &[u8]) -> bool {
         if self.value.as_slice() == filter
             || self.spelling.as_ref().map(|value| value.as_slice()) == Some(filter)
         {
@@ -266,7 +281,7 @@ impl ExplainEntry {
             })
     }
 
-    fn is_flag_string(&self) -> bool {
+    pub(crate) fn is_flag_string(&self) -> bool {
         matches!(
             self.kind,
             ChainKind::Usage(UsageField::CompileOptions | UsageField::LinkOptions)
@@ -442,6 +457,16 @@ impl ConfigureResult {
         self.explain_in_filtered(dir, query, None)
     }
 
+    /// Explain an item and select target entries with a typed filter.
+    #[must_use]
+    pub fn explain_with(
+        &self,
+        query: &ExplainQuery,
+        filter: Option<ExplainFilter>,
+    ) -> ExplainReport {
+        self.explain_in_with(DirId::ROOT, query, filter)
+    }
+
     /// Explain an item in one directory with an optional exact target entry filter.
     #[must_use]
     pub fn explain_in_filtered(
@@ -449,6 +474,17 @@ impl ConfigureResult {
         dir: DirId,
         query: &ExplainQuery,
         filter: Option<BString>,
+    ) -> ExplainReport {
+        self.explain_in_with(dir, query, filter.map(ExplainFilter::Any))
+    }
+
+    /// Explain an item in one directory with an optional typed filter.
+    #[must_use]
+    pub fn explain_in_with(
+        &self,
+        dir: DirId,
+        query: &ExplainQuery,
+        filter: Option<ExplainFilter>,
     ) -> ExplainReport {
         let (name, targets, variables) = match query {
             ExplainQuery::Auto(name) => (name, true, true),
@@ -660,8 +696,9 @@ impl ConfigureResult {
         name: &BString,
         id: TargetId,
         target: &Target,
-        filter: Option<BString>,
+        typed_filter: Option<ExplainFilter>,
     ) -> ExplainTarget {
+        let filter = typed_filter.as_ref().map(ExplainFilter::text);
         let mut configs = IndexMap::<BString, ExplainConfig>::new();
         let resolved = self
             .generation
@@ -714,11 +751,34 @@ impl ConfigureResult {
             config.compile_groups = groups;
             config.entries = join_entries(build, core::mem::take(&mut config.entries));
         }
-        if let Some(filter) = &filter {
-            for config in configs.values_mut() {
-                config.entries.retain(|entry| entry.matches_filter(filter));
+        let dependency = match &typed_filter {
+            Some(ExplainFilter::Dependency(wanted)) => {
+                let names: Vec<BString> = configs.keys().cloned().collect();
+                let report = self.dependency_paths(dir, id, wanted, &names);
+                let reached: BTreeSet<TargetId> = report
+                    .paths
+                    .iter()
+                    .flat_map(|path| path.hops.iter().map(|hop| hop.id))
+                    .collect();
+                for config in configs.values_mut() {
+                    config.entries.retain(|entry| {
+                        entry.kind == ChainKind::LinkItem
+                            && entry
+                                .link_targets
+                                .iter()
+                                .any(|target| reached.contains(target))
+                    });
+                }
+                Some(Box::new(report))
             }
-        }
+            Some(typed) => {
+                for config in configs.values_mut() {
+                    config.entries.retain(|entry| typed.matches(entry));
+                }
+                None
+            }
+            None => None,
+        };
         let mut contributors = BTreeMap::<TargetId, Vec<&BString>>::new();
         let mut matched_properties = BTreeSet::new();
         for config in configs.values() {
@@ -793,6 +853,8 @@ impl ConfigureResult {
             sources,
             roots: self.roots(),
             filter,
+            typed_filter,
+            dependency,
             configurations: configs.into_values().collect(),
             properties,
             property_history_incomplete: ledger.map(|ledger| ledger.is_incomplete()),
