@@ -1408,9 +1408,14 @@ mod tests {
         }
     }
 
+    fn test_host() -> PureHost {
+        let root = PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
+        PureHost::new(root.clone(), root.join("bin/rcmake-lsp"))
+    }
+
     #[test]
     fn broken_rcmake_toml_emits_show_message_warning_and_re_warns_after_watch_change() {
-        let host = PureHost::default();
+        let host = test_host();
         let root = host.initial_cwd();
         let toml_path = root.join(".rcmake.toml");
         let lists_uri = uri::file(&root.join("CMakeLists.txt"));
@@ -1459,7 +1464,7 @@ mod tests {
 
     #[test]
     fn caller_refresh_prioritizes_edited_file_caps_sync_refreshes_and_shares_open_buffers() {
-        let host = PureHost::default();
+        let host = test_host();
         let root = host.initial_cwd();
         let shared_path = root.join("shared.cmake");
         let caller0_path = root.join("caller_00.cmake");

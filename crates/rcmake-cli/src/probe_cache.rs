@@ -728,9 +728,14 @@ mod tests {
         }
     }
 
+    fn test_host() -> PureHost {
+        let root = std::path::PathBuf::from(if cfg!(windows) { "C:/work" } else { "/work" });
+        PureHost::new(root.clone(), root.join("bin/rcmake"))
+    }
+
     #[test]
     fn dash_operands_need_a_separator_and_errors_name_the_reason() -> HostResult<()> {
-        let host = PureHost::default();
+        let host = test_host();
         seeded_store(&host, "producer")?;
         let (code, _, err) = run(&host, &["export", "--json"]);
         assert_eq!(code, 2);
@@ -884,7 +889,7 @@ mod tests {
 
     #[test]
     fn cache_export_and_trusted_import_round_trip_through_an_empty_store() -> HostResult<()> {
-        let host = PureHost::default();
+        let host = test_host();
         let key = seeded_store(&host, "producer")?;
         let (code, out, err) = run(&host, &["export", "probes.tar.gz"]);
         assert_eq!(code, 0, "{err}");
@@ -936,7 +941,7 @@ mod tests {
 
     #[test]
     fn cache_import_without_a_digest_stages_candidates_only() -> HostResult<()> {
-        let host = PureHost::default();
+        let host = test_host();
         let key = seeded_store(&host, "producer")?;
         assert_eq!(run(&host, &["export", "probes.tar.gz"]).0, 0);
         let consumer = path::from_native_cmake(&host.initial_cwd().join("consumer"));
@@ -959,7 +964,7 @@ mod tests {
 
     #[test]
     fn cache_export_and_import_reject_bad_operands() -> HostResult<()> {
-        let host = PureHost::default();
+        let host = test_host();
         seeded_store(&host, "producer")?;
         let inside = path::from_native_cmake(&host.initial_cwd().join("producer/probes.tar.gz"));
         let inside_str = String::from_utf8_lossy(&inside).into_owned();
