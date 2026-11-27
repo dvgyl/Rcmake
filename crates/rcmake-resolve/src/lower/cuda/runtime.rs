@@ -3,7 +3,11 @@ use rcmake_base::{BString, list, path_lex::Lexical};
 use rcmake_genex::{ConfigId, EvalContext};
 use rcmake_model::{ProjectModel, Target};
 
-use crate::{LinkKind, LinkStep, ResolveError, lower::definition, usage::UsageResolver};
+use crate::{
+    LinkKind, LinkStep, ResolveError,
+    lower::{definition, without_trailing_slashes},
+    usage::UsageResolver,
+};
 
 pub(crate) fn host_args(
     model: &ProjectModel,
@@ -13,41 +17,89 @@ pub(crate) fn host_args(
     languages: &IndexSet<BString>,
     usage: &mut UsageResolver<'_>,
 ) -> Result<Vec<BString>, ResolveError> {
+    Ok(
+        host_arg_roles(model, target, config, step, languages, usage)?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect(),
+    )
+}
+
+/// Return runtime and cross-language implicit link fragments (`("libraryPath" | "libraries", text)`)
+/// for File API `codemodel-v2`.
+pub fn codemodel_runtime_link_fragments(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    step: &LinkStep,
+    languages: &IndexSet<BString>,
+    usage: &mut UsageResolver<'_>,
+) -> Result<Vec<(&'static str, BString)>, ResolveError> {
+    host_arg_roles(model, target, config, step, languages, usage)
+}
+
+fn host_arg_roles(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    step: &LinkStep,
+    languages: &IndexSet<BString>,
+    usage: &mut UsageResolver<'_>,
+) -> Result<Vec<(&'static str, BString)>, ResolveError> {
     if step.kind == LinkKind::StaticArchive {
         return Ok(Vec::new());
     }
-    let mut args = IndexSet::new();
-    for lang in [b"CUDA".as_slice(), b"Fortran"] {
+    let mut args: IndexSet<(&'static str, BString)> = IndexSet::new();
+    let driver_libs = values(model, target, &step.language, b"_IMPLICIT_LINK_LIBRARIES");
+    let driver_dirs = implicit_link_dirs(model, target, &step.language);
+    let lang_order: &[&[u8]] = if matches!(step.language.as_slice(), b"CUDA" | b"HIP") {
+        &[b"CUDA", b"HIP", b"Fortran", b"CXX"]
+    } else {
+        &[b"CUDA", b"HIP", b"Fortran"]
+    };
+    for &lang in lang_order {
         if step.language != lang && !languages.contains(lang) {
             continue;
         }
         let implicit = values(model, target, lang, b"_IMPLICIT_LINK_LIBRARIES");
-        let driver_libs = values(model, target, &step.language, b"_IMPLICIT_LINK_LIBRARIES");
-        if lang == b"CUDA" {
-            let selected = selected_runtime(model, target, config, &step.language, usage)?;
-            let suffix = [b"_RUNTIME_LIBRARY_LINK_OPTIONS_", &selected[..]].concat();
-            args.extend(
-                values(model, target, lang, &suffix)
-                    .into_iter()
-                    .filter(|lib| !driver_libs.contains(lib))
-                    .map(|lib| library_argument(model, target, &step.language, lib)),
-            );
+        if matches!(lang, b"CUDA" | b"HIP") {
+            let selected = selected_runtime(model, target, config, lang, &step.language, usage)?;
+            if !selected.is_empty() {
+                let suffix = [b"_RUNTIME_LIBRARY_LINK_OPTIONS_", &selected[..]].concat();
+                args.extend(
+                    values(model, target, lang, &suffix)
+                        .into_iter()
+                        .filter(|lib| !driver_libs.contains(lib))
+                        .map(|lib| {
+                            (
+                                "libraries",
+                                library_argument(model, target, &step.language, lib),
+                            )
+                        }),
+                );
+            }
         }
         if step.language != lang {
             args.extend(
                 values(model, target, lang, b"_IMPLICIT_LINK_DIRECTORIES")
                     .into_iter()
+                    .filter(|dir| !driver_dirs.contains(&normalize_dir(dir)))
                     .map(|dir| {
                         let flag = definition(model, target.dir, b"CMAKE_LIBRARY_PATH_FLAG")
                             .map_or(b"-L".as_slice(), |value| value.as_slice());
-                        [flag, dir.as_slice()].concat().into()
+                        ("libraryPath", [flag, dir.as_slice()].concat().into())
                     }),
             );
             args.extend(
                 implicit
                     .into_iter()
                     .filter(|lib| !driver_libs.contains(lib))
-                    .map(|lib| library_argument(model, target, &step.language, lib)),
+                    .map(|lib| {
+                        (
+                            "libraries",
+                            library_argument(model, target, &step.language, lib),
+                        )
+                    }),
             );
         }
     }
@@ -58,15 +110,18 @@ pub(crate) fn selected_runtime(
     model: &ProjectModel,
     target: &Target,
     config: &ConfigId,
+    lang: &[u8],
     link_language: &[u8],
     usage: &mut UsageResolver<'_>,
 ) -> Result<Vec<u8>, ResolveError> {
-    let Some(default) = definition(model, target.dir, b"CMAKE_CUDA_RUNTIME_LIBRARY_DEFAULT")
-        .filter(|value| !value.is_empty())
+    let default_var = [b"CMAKE_", lang, b"_RUNTIME_LIBRARY_DEFAULT"].concat();
+    let Some(default) =
+        definition(model, target.dir, &default_var).filter(|value| !value.is_empty())
     else {
         return Ok(Vec::new());
     };
-    let Some(raw) = target.props.get(b"CUDA_RUNTIME_LIBRARY") else {
+    let prop = [lang, b"_RUNTIME_LIBRARY"].concat();
+    let Some(raw) = target.props.get(&prop) else {
         return Ok(default.to_ascii_uppercase());
     };
     let Some(id) = model.find_target(target.dir, &target.name) else {
@@ -78,8 +133,47 @@ pub(crate) fn selected_runtime(
         ..Default::default()
     };
     Ok(usage
-        .eval_ide_property(id, b"CUDA_RUNTIME_LIBRARY", raw, &context)?
+        .eval_ide_property(id, &prop, raw, &context)?
         .to_ascii_uppercase())
+}
+
+fn implicit_link_dirs(model: &ProjectModel, target: &Target, language: &[u8]) -> IndexSet<BString> {
+    let mut dirs = IndexSet::new();
+    let platform = definition(
+        model,
+        target.dir,
+        b"CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES",
+    )
+    .map_or_else(Vec::new, |value| list::split(value, list::Empty::Drop));
+    let library_arch =
+        definition(model, target.dir, b"CMAKE_LIBRARY_ARCHITECTURE").filter(|v| !v.is_empty());
+    for dir in platform {
+        if let Some(arch) = library_arch {
+            dirs.insert(normalize_dir(
+                &[dir.as_slice(), b"/", arch.as_slice()].concat(),
+            ));
+        }
+        dirs.insert(normalize_dir(&dir));
+    }
+    for key in [b"_CMAKE_OSX_SYSROOT_PATH".as_slice(), b"CMAKE_OSX_SYSROOT"] {
+        if let Some(sysroot) =
+            definition(model, target.dir, key).filter(|v| Lexical::new(v).absolute())
+        {
+            dirs.insert(normalize_dir(&[sysroot.as_slice(), b"/usr/lib"].concat()));
+            dirs.insert(normalize_dir(
+                &[sysroot.as_slice(), b"/usr/local/lib"].concat(),
+            ));
+        }
+    }
+    for dir in values(model, target, language, b"_IMPLICIT_LINK_DIRECTORIES") {
+        dirs.insert(normalize_dir(&dir));
+    }
+    dirs
+}
+
+fn normalize_dir(path: &[u8]) -> BString {
+    let normalized = Lexical::new(path).normalize();
+    without_trailing_slashes(&normalized).into()
 }
 
 fn values(model: &ProjectModel, target: &Target, language: &[u8], suffix: &[u8]) -> Vec<BString> {

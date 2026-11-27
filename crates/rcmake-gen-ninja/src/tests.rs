@@ -2744,3 +2744,348 @@ fn link_absolute_library_fragments_deduplicate_in_insertion_order()
     assert_eq!(implicit_nodes, expected_refs);
     Ok(())
 }
+
+#[test]
+fn utility_custom_target_inherits_transitive_dependency_artifacts_as_order_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_genex::ConfigId;
+    use rcmake_model::{DirId, ProjectModel, Target, TargetKind, TargetOrigin};
+    use rcmake_resolve::{ResolvedTarget, TargetMetadata};
+
+    let dir = Path::new("/work/build");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/src".into(), "/work/build".into());
+    let mk = |model: &mut ProjectModel, name: &str, kind: TargetKind| {
+        model.add_target(Target::new(
+            name.into(),
+            kind,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        ))
+    };
+    let lib_id = mk(&mut model, "jansson", TargetKind::StaticLibrary)?;
+    let test_id = mk(&mut model, "test_array", TargetKind::Executable)?;
+    let check_id = mk(&mut model, "check", TargetKind::Utility)?;
+    let graph = BuildGraph {
+        config: ConfigId::default(),
+        steps: vec![
+            BuildStep::Link {
+                implicit_inputs: vec![],
+                inputs: vec!["CMakeFiles/jansson.dir/j.c.o".into()],
+                step: LinkStep {
+                    kind: LinkKind::StaticArchive,
+                    language: "C".into(),
+                    fragments: vec![],
+                    output: "libjansson.a".into(),
+                },
+                invocations: vec![Invocation {
+                    shell: "ar qc libjansson.a CMakeFiles/jansson.dir/j.c.o".into(),
+                    ..Invocation::default()
+                }],
+            },
+            BuildStep::Link {
+                implicit_inputs: vec!["libjansson.a".into()],
+                inputs: vec!["CMakeFiles/test_array.dir/t.c.o".into()],
+                step: LinkStep {
+                    kind: LinkKind::Executable,
+                    language: "C".into(),
+                    fragments: vec![],
+                    output: "test_array".into(),
+                },
+                invocations: vec![Invocation {
+                    shell: "cc -o test_array CMakeFiles/test_array.dir/t.c.o libjansson.a".into(),
+                    ..Invocation::default()
+                }],
+            },
+            BuildStep::Custom(CustomStep {
+                outputs: vec!["CMakeFiles/check".into()],
+                byproducts: vec![],
+                depends: vec!["test_array".into()],
+                invocations: vec![Invocation {
+                    shell: "ctest".into(),
+                    ..Invocation::default()
+                }],
+                comment: Some("Running tests".into()),
+                uses_terminal: false,
+                job_pool: None,
+                depfile: None,
+                symbolic: true,
+                symbolic_outputs: Vec::new(),
+                target_dependencies: Vec::new(),
+            }),
+        ],
+        targets: vec![
+            GraphTarget {
+                name: "jansson".into(),
+                steps: vec![0],
+                depends: vec![],
+                in_all: true,
+            },
+            GraphTarget {
+                name: "test_array".into(),
+                steps: vec![1],
+                depends: vec![0],
+                in_all: true,
+            },
+            GraphTarget {
+                name: "check".into(),
+                steps: vec![2],
+                depends: vec![1],
+                in_all: false,
+            },
+        ],
+        target_ids: vec![lib_id, test_id, check_id],
+        utility_steps: [2].into_iter().collect(),
+        ..BuildGraph::default()
+    };
+    let resolved = |id, name: &str, kind: TargetKind, output: Option<&str>| ResolvedTarget {
+        id,
+        config: ConfigId::default(),
+        metadata: TargetMetadata {
+            name: name.into(),
+            kind,
+            source_dir: "/work/src".into(),
+            binary_dir: "/work/build".into(),
+            backtrace: Default::default(),
+            folder: None,
+            exclude_from_all: false,
+            generator_provided: false,
+        },
+        artifacts: output.map_or_else(ArtifactSet::default, |path| ArtifactSet {
+            file: Some(path.into()),
+            ..ArtifactSet::default()
+        }),
+        compile_units: vec![],
+        compile_groups: vec![],
+        link: None,
+        dependencies: vec![],
+        cxx_modules: None,
+        fortran: None,
+        ide: None,
+    };
+    let result = GenerationResult {
+        configs: vec![ConfigId::default()],
+        graphs: vec![graph],
+        targets: vec![
+            resolved(
+                lib_id,
+                "jansson",
+                TargetKind::StaticLibrary,
+                Some("libjansson.a"),
+            ),
+            resolved(
+                test_id,
+                "test_array",
+                TargetKind::Executable,
+                Some("test_array"),
+            ),
+            resolved(check_id, "check", TargetKind::Utility, None),
+        ],
+        ..GenerationResult::default()
+    };
+    let host = PureHost::default();
+    generate_single_config(&result, &host, dir)?;
+    let build = read(&host, "build.ninja");
+    let check_line = build
+        .lines()
+        .find(|line| {
+            line.starts_with("build CMakeFiles/check:")
+                || line.starts_with("build CMakeFiles/check ")
+        })
+        .ok_or("missing CMakeFiles/check edge")?;
+    assert!(
+        check_line.ends_with(": CUSTOM_COMMAND test_array || libjansson.a test_array"),
+        "unexpected check edge: {check_line}"
+    );
+    Ok(())
+}
+
+#[test]
+fn swift_split_build_emits_all_three_audit_11_ninja_edges_and_rsp()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_diag::{PolicyId, PolicyMap, PolicyStatus};
+    use rcmake_genex::ConfigId;
+    use rcmake_model::{
+        BT, DirId, GeneratorKind, LinkItem, ProjectModel, Target, TargetKind, TargetOrigin,
+        UsageScope,
+    };
+    use rcmake_resolve::resolve;
+
+    let host = PureHost::default();
+    host.create_dir_all(Path::new("/work/src"))?;
+    for src in ["a.swift", "b.swift", "main.swift"] {
+        host.write(
+            &Path::new("/work/src").join(src),
+            b"",
+            rcmake_host::WriteMode::Truncate,
+        )?;
+    }
+    let dir = Path::new("/work/build");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/src".into(), "/work/build".into());
+    model.generator = Some(GeneratorKind::Ninja);
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "Swift".into());
+    let root = model.dir_mut(DirId::ROOT);
+    root.vars.insert("PROJECT_NAME".into(), "SwiftApp".into());
+    root.vars
+        .insert("CMAKE_Swift_COMPILER".into(), "/usr/bin/swiftc".into());
+    root.vars
+        .insert("CMAKE_Swift_COMPILER_ID".into(), "Apple".into());
+    root.vars
+        .insert("CMAKE_Swift_COMPILER_VERSION".into(), "6.0".into());
+    root.vars.insert(
+        "CMAKE_Swift_MODULE_TRIPLE".into(),
+        "arm64-apple-macos".into(),
+    );
+    root.vars
+        .insert("CMAKE_Swift_SOURCE_FILE_EXTENSIONS".into(), "swift".into());
+    root.vars
+        .insert("CMAKE_Swift_OUTPUT_EXTENSION".into(), ".o".into());
+    root.vars
+        .insert("CMAKE_Swift_DEFINE_FLAG".into(), "-D".into());
+    root.vars
+        .insert("CMAKE_INCLUDE_FLAG_Swift".into(), "-I ".into());
+    root.vars
+        .insert("CMAKE_Swift_RESPONSE_FILE_FLAG".into(), "@".into());
+    root.vars
+        .insert("CMAKE_NINJA_FORCE_RESPONSE_FILE".into(), "1".into());
+    root.vars.insert(
+        "CMAKE_Swift_COMPILATION_MODE_DEFAULT".into(),
+        "incremental".into(),
+    );
+    root.vars
+        .insert("CMAKE_Swift_NUM_THREADS".into(), "4".into());
+    root.vars.insert("CMAKE_AR".into(), "/usr/bin/ar".into());
+    root.vars.insert(
+        "CMAKE_Swift_COMPILE_OBJECT".into(),
+        "<CMAKE_Swift_COMPILER> -j 4 -num-threads 4 <DEFINES> <FLAGS> <INCLUDES> <SOURCE>".into(),
+    );
+    root.vars.insert(
+        "CMAKE_Swift_ARCHIVE_CREATE".into(),
+        "<CMAKE_AR> crs <TARGET> <OBJECTS>".into(),
+    );
+    root.vars.insert(
+        "CMAKE_Swift_LINK_EXECUTABLE".into(),
+        "<CMAKE_Swift_COMPILER> -j 4 -num-threads 4 -emit-executable -o <TARGET> <FLAGS> <OBJECTS> <LINK_FLAGS> <LINK_LIBRARIES>".into(),
+    );
+    let mut policies = PolicyMap::default();
+    for id in [157u16, 195, 214, 215, 216] {
+        let _ = policies.set(PolicyId::new(id), PolicyStatus::New);
+    }
+
+    let mut lib_a = Target::new(
+        "libA".into(),
+        TargetKind::StaticLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        policies,
+    );
+    lib_a
+        .sources
+        .push(BT::new("a.swift".into(), Default::default()));
+    lib_a
+        .props
+        .set("Swift_MODULE_DIRECTORY".into(), "/work/build/mods".into());
+    model.add_target(lib_a)?;
+
+    let mut lib_b = Target::new(
+        "libB".into(),
+        TargetKind::StaticLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        policies,
+    );
+    let link_item = |name: &str| LinkItem {
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
+        scope: Some(UsageScope::Private),
+        text: BT::new(name.into(), Default::default()),
+        lookup_dir: DirId::ROOT,
+    };
+
+    lib_b
+        .sources
+        .push(BT::new("b.swift".into(), Default::default()));
+    lib_b
+        .usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(link_item("libA"));
+    model.add_target(lib_b)?;
+
+    let mut app = Target::new(
+        "app".into(),
+        TargetKind::Executable,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        policies,
+    );
+    app.sources
+        .push(BT::new("main.swift".into(), Default::default()));
+    app.usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(link_item("libB"));
+    model.add_target(app)?;
+
+    let result = resolve(&model, &host, &[ConfigId::default()])?;
+    super::generate_single_config_with_model(&result, &host, dir, &model)?;
+    let build = read(&host, "build.ninja");
+    let rules = read(&host, "CMakeFiles/rules.ninja");
+
+    // restat = 1 and response file on Swift rule.
+    assert!(rules.contains("restat = 1"), "{rules}");
+    assert!(rules.contains("rspfile = $RSP_FILE"), "{rules}");
+
+    // Edge #1: upstream .swiftmodule implicit input on libB module, libB objects, AND consumer app objects!
+    let mod_a = "mods/libA.swiftmodule/arm64-apple-macos.swiftmodule";
+    let mod_b = "libB.swiftmodule/arm64-apple-macos.swiftmodule";
+    let line_matching = |needle: &str| {
+        build
+            .lines()
+            .find(|line| line.starts_with("build ") && line.contains(needle))
+            .unwrap_or("")
+            .to_owned()
+    };
+    let lib_a_mod = line_matching(&format!("build {mod_a}:"));
+    let lib_a_obj = line_matching("build CMakeFiles/libA.dir/a.swift.o:");
+    let lib_a_link = line_matching("build liblibA.a:");
+    let lib_b_mod = line_matching(&format!("build {mod_b}:"));
+    let lib_b_obj = line_matching("build CMakeFiles/libB.dir/b.swift.o:");
+    let lib_b_link = line_matching("build liblibB.a:");
+    let app_obj = line_matching("build CMakeFiles/app.dir/main.swift.o:");
+
+    // Edge #1: imported upstream .swiftmodule as implicit inputs (`|`).
+    assert!(lib_b_mod.contains(&format!("| {mod_a}")), "{lib_b_mod}");
+    assert!(lib_b_obj.contains(&format!("| {mod_a}")), "{lib_b_obj}");
+    assert!(app_obj.contains(&format!("| {mod_b}")), "{app_obj}");
+    // Edge #2: object-order on both + own module order-only on split objects edge.
+    assert!(
+        lib_a_mod.contains("|| cmake_object_order_depends_target_libA"),
+        "{lib_a_mod}"
+    );
+    assert!(
+        lib_a_obj.contains("||")
+            && lib_a_obj.contains("cmake_object_order_depends_target_libA")
+            && lib_a_obj.contains(mod_a),
+        "{lib_a_obj}"
+    );
+    assert!(
+        lib_b_obj.contains("||")
+            && lib_b_obj.contains("cmake_object_order_depends_target_libB")
+            && lib_b_obj.contains(mod_b),
+        "{lib_b_obj}"
+    );
+    // Edge #3: final link/archive implicitly depends on own .swiftmodule.
+    assert!(lib_a_link.contains(&format!("| {mod_a}")), "{lib_a_link}");
+    assert!(lib_b_link.contains(&format!("| {mod_b}")), "{lib_b_link}");
+    Ok(())
+}

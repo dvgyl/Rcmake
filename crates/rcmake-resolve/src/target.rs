@@ -254,64 +254,94 @@ pub(crate) fn resolve_target<'a>(
             Entry::Occupied(entry) => (entry.index(), entry.into_mut()),
             Entry::Vacant(entry) => {
                 compile_ctx.language = Some(language.clone());
-                let features =
-                    usage.collect_for_result(id, UsageField::CompileFeatures, &compile_ctx)?;
-                for feature in &features.entries {
-                    if let Err(message) = model.validate_compile_feature(&feature.value, |key| {
-                        lower::definition(model, target.dir, key)
-                    }) {
-                        let mut message = message;
-                        if let Some(first) = message.first_mut() {
-                            first.make_ascii_uppercase();
+                let (features, flags, defines, includes) =
+                    usage.with_compile_group_language(id, &language, |usage| {
+                        let features = usage.collect_for_result(
+                            id,
+                            UsageField::CompileFeatures,
+                            &compile_ctx,
+                        )?;
+                        for feature in &features.entries {
+                            if let Err(message) = model
+                                .validate_compile_feature(&feature.value, |key| {
+                                    lower::definition(model, target.dir, key)
+                                })
+                            {
+                                let mut message = message;
+                                if let Some(first) = message.first_mut() {
+                                    first.make_ascii_uppercase();
+                                }
+                                let body = BString::from(format!(
+                                    "{message} for target \"{}\".",
+                                    target.name
+                                ));
+                                paths.emit(
+                                    model,
+                                    MessageKind::Error,
+                                    crate::cxx_modules::generation_location(model, target),
+                                    body.clone(),
+                                );
+                                return Err(ResolveError::Reported(body));
+                            }
                         }
-                        let body =
-                            BString::from(format!("{message} for target \"{}\".", target.name));
-                        paths.emit(
-                            model,
-                            MessageKind::Error,
-                            crate::cxx_modules::generation_location(model, target),
-                            body.clone(),
+                        let mut flags = Vec::new();
+                        if let Some(value) = target.props.get(b"COMPILE_FLAGS") {
+                            if ide_compile.is_some() {
+                                let value = usage.eval_ide_property(
+                                    id,
+                                    b"COMPILE_FLAGS",
+                                    value,
+                                    &compile_ctx,
+                                )?;
+                                sources::append_compile_flags(
+                                    &mut flags,
+                                    &value,
+                                    Backtrace::default(),
+                                );
+                            } else {
+                                sources::append_compile_flags(
+                                    &mut flags,
+                                    value,
+                                    Backtrace::default(),
+                                );
+                            }
+                        }
+                        flags.extend(
+                            usage
+                                .collect_for_result(id, UsageField::CompileOptions, &compile_ctx)?
+                                .entries,
                         );
-                        return Err(ResolveError::Reported(body));
-                    }
-                }
+                        let mut defines = strip_define_flags(
+                            usage
+                                .collect_for_result(
+                                    id,
+                                    UsageField::CompileDefinitions,
+                                    &compile_ctx,
+                                )?
+                                .entries,
+                        );
+                        if let Some(symbol) = &export_symbol
+                            && !defines.iter().any(|define| define.value == *symbol)
+                        {
+                            defines.insert(0, BT::new(symbol.clone(), Backtrace::default()));
+                        }
+                        let mut includes = usage.collect_includes_for_result(id, &compile_ctx)?;
+                        if flavor.is_none() {
+                            // `cmLocalGenerator::GetIncludeDirectories` drops the implicit directories.
+                            let implicit =
+                                lower::compile::implicit_include_dirs(model, target, &language);
+                            includes.retain(|include| {
+                                !implicit.contains(&lower::compile::include_identity(
+                                    &include.path.value,
+                                ))
+                            });
+                        }
+                        Ok((features, flags, defines, includes))
+                    })?;
                 if let Some(standard) = lower::required_standard(&language, &features.entries) {
                     inputs
                         .standard_requirements
                         .insert(language.clone(), standard);
-                }
-                let mut flags = Vec::new();
-                if let Some(value) = target.props.get(b"COMPILE_FLAGS") {
-                    if ide_compile.is_some() {
-                        let value =
-                            usage.eval_ide_property(id, b"COMPILE_FLAGS", value, &compile_ctx)?;
-                        sources::append_compile_flags(&mut flags, &value, Backtrace::default());
-                    } else {
-                        sources::append_compile_flags(&mut flags, value, Backtrace::default());
-                    }
-                }
-                flags.extend(
-                    usage
-                        .collect_for_result(id, UsageField::CompileOptions, &compile_ctx)?
-                        .entries,
-                );
-                let mut defines = strip_define_flags(
-                    usage
-                        .collect_for_result(id, UsageField::CompileDefinitions, &compile_ctx)?
-                        .entries,
-                );
-                if let Some(symbol) = &export_symbol
-                    && !defines.iter().any(|define| define.value == *symbol)
-                {
-                    defines.insert(0, BT::new(symbol.clone(), Backtrace::default()));
-                }
-                let mut includes = usage.collect_includes_for_result(id, &compile_ctx)?;
-                if flavor.is_none() {
-                    // `cmLocalGenerator::GetIncludeDirectories` drops the implicit directories.
-                    let implicit = lower::compile::implicit_include_dirs(model, target, &language);
-                    includes.retain(|include| {
-                        !implicit.contains(&lower::compile::include_identity(&include.path.value))
-                    });
                 }
                 let group = entry.index();
                 let mut facts = CompileGroup {

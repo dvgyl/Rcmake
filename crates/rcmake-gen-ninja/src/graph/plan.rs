@@ -61,6 +61,87 @@ impl<'a> Graph<'a> {
         modmap_flag: &[u8],
         exports: &[ModuleExportJob],
     ) -> Result<EdgePlan, GenError> {
+        if let Some(action) = self.input.swift_actions.get(&step_index) {
+            let invocations = match step {
+                BuildStep::Compile { invocation, .. } => std::slice::from_ref(invocation),
+                BuildStep::Custom(custom) => custom.invocations.as_slice(),
+                _ => &[],
+            };
+            if let Some(primary_invocation) = invocations.first() {
+                let inputs: Vec<BString> =
+                    action.sources.iter().map(|src| self.node(src)).collect();
+                let mut launched = None;
+                let (rule, special_command): (Cow<'static, [u8]>, Option<Vec<u8>>) =
+                    if invocations.len() == 1 && !self.commands.windows() {
+                        let (rule, command) =
+                            crate::instrumented::compile(primary_invocation, false, false);
+                        if command.is_some() {
+                            (Cow::Borrowed(rule), command)
+                        } else if let Some(info) = crate::instrumented::launched(
+                            primary_invocation,
+                            action
+                                .outputs
+                                .first()
+                                .and_then(|out| self.input.compile_launchers.get(out.as_slice())),
+                            &self.launcher_slots,
+                            false,
+                            false,
+                        ) {
+                            let rule = info.rule.clone();
+                            let cmd = info.command.clone();
+                            launched = Some(info);
+                            (rule, Some(cmd))
+                        } else {
+                            (Cow::Borrowed(rule), None)
+                        }
+                    } else {
+                        (Cow::Borrowed(b"COMPILE".as_slice()), None)
+                    };
+                let mut plan = EdgePlan::new(rule, inputs, nodes);
+                plan.implicit_inputs.clear();
+                plan.implicit_inputs
+                    .extend(action.implicit_inputs.iter().map(|path| self.node(path)));
+                for output in &action.outputs {
+                    plan.implicit_inputs.extend(
+                        self.compile_inputs
+                            .and_then(|inputs| inputs.get(output))
+                            .into_iter()
+                            .flatten()
+                            .map(|input| self.node(input)),
+                    );
+                }
+                // Serialize split object compiles after emit-module (which shares
+                // `output-file-map.json` `.swiftdeps`) alongside order.rs prerequisites.
+                plan.order_only
+                    .extend(action.order_only_inputs.iter().map(|path| self.node(path)));
+                plan.implicit_outputs.clear();
+                let ordinary_command = self.command_line(invocations, false);
+                let response = self.swift_response(action, invocations, &ordinary_command);
+                if response.is_some() {
+                    plan.bind_command(ordinary_command, response);
+                } else {
+                    let command = special_command.map_or(ordinary_command, |command| {
+                        if launched.is_some() {
+                            command
+                        } else {
+                            self.in_build_dir(&command).into()
+                        }
+                    });
+                    if let Some(info) = launched {
+                        plan.bind(b"LAUNCH_ARGS", info.launch_args);
+                        if let Some(launcher) = info.launcher {
+                            plan.bind(b"LAUNCHER", launcher);
+                        }
+                    }
+                    plan.bind(b"COMMAND", command);
+                }
+                plan.bind(b"DESC", action.description.clone());
+                if action.restat {
+                    plan.bind(b"restat", b"1");
+                }
+                return Ok(plan);
+            }
+        }
         let plan = match step {
             BuildStep::Compile {
                 object,

@@ -164,8 +164,6 @@ pub(crate) struct ReplayState {
     replayed_listfiles: BTreeSet<PathBuf>,
     pub(crate) executed_listfiles: Option<BTreeSet<PathBuf>>,
     pub(crate) observations: Option<ReplayObservations>,
-    /// Setup spans and checkpoints of the running incremental configure. This state
-    /// stays here while a listfile body has the session.
     pub(crate) setup: Option<SetupSession>,
     setup_miss: Option<String>,
     setup_sources: Vec<PathBuf>,
@@ -371,8 +369,6 @@ impl Interp {
         let (session, setup) = started.map_or((None, None), |(session, setup)| {
             (Some(session), Some(setup))
         });
-        // Each configure attempt records into a new session. A failed or restarted
-        // attempt publishes nothing.
         self.replay.session = session;
         self.replay.setup = setup;
         let result = self.run_configure(source, build, preloads);
@@ -448,16 +444,13 @@ impl Interp {
             && self.project.prop_ledger().is_none()
             && matches!(self.config.services.provenance, LedgerLevel::Off)
             && !self.config.services.collect_annotations
-            && self.command_profiler.is_none()
             && !self.trace_enabled()
-            && self.trace.is_none()
             && self.trace_stack.is_empty()
             && self.config.services.step_budget.is_none()
             && self.config.services.cancel.is_none()
             && self.config.limits.wall_budget.is_none()
             && self.config.services.speed.hermetic == HermeticMode::Off
             && !self.has_command_observers()
-            && !self.has_debugger()
     }
 
     pub(crate) fn note_replay_source(&mut self, abs: &[u8], text: &crate::code::SourceText) {

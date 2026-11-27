@@ -384,7 +384,6 @@ mod tests {
         assert_eq!(w.buffer(), b"bX");
         assert_eq!(w.handle_key(Key::Enter), EditAction::Commit("bX".into()));
 
-        // Enforce 64 KiB cap safely.
         let big = vec![b'a'; MAX_VALUE_BYTES];
         let mut capped = TextEditWidget::new(CacheType::String, &big);
         assert_eq!(capped.buffer().len(), MAX_VALUE_BYTES);

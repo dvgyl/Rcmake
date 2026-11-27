@@ -1700,3 +1700,158 @@ fn codemodel_source_group_precedence_unity_backtrace_and_cross_order_dependencie
     );
     Ok(())
 }
+
+#[test]
+fn file_api_reports_cuda_hip_and_swift_toolchains_and_compile_groups()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::{BT, Target, TargetKind, TargetOrigin};
+
+    let host = PureHost::default();
+    let build = Path::new("/work/build");
+    host.create_dir_all(Path::new("/work/src"))?;
+    for src in ["k.cu", "h.hip", "s.swift"] {
+        host.write(&Path::new("/work/src").join(src), b"", WriteMode::Truncate)?;
+    }
+    host.create_dir_all(&build.join(".cmake/api/v1/query"))?;
+    host.write(
+        &build.join(".cmake/api/v1/query/codemodel-v2"),
+        b"",
+        WriteMode::Truncate,
+    )?;
+    host.write(
+        &build.join(".cmake/api/v1/query/toolchains-v1"),
+        b"",
+        WriteMode::Truncate,
+    )?;
+
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/src".into(), "/work/build".into());
+    model.generator = Some(GeneratorKind::Ninja);
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "CUDA;HIP;Swift".into());
+    let root = model.dir_mut(DirId::ROOT);
+    root.vars.insert("PROJECT_NAME".into(), "MultiLang".into());
+    root.vars
+        .insert("CMAKE_CUDA_COMPILER".into(), "/opt/cuda/bin/nvcc".into());
+    root.vars
+        .insert("CMAKE_CUDA_COMPILER_ID".into(), "NVIDIA".into());
+    root.vars
+        .insert("CMAKE_CUDA_COMPILER_VERSION".into(), "12.6.85".into());
+    root.vars
+        .insert("CMAKE_CUDA_SOURCE_FILE_EXTENSIONS".into(), "cu".into());
+    root.vars
+        .insert("CMAKE_CUDA_OUTPUT_EXTENSION".into(), ".o".into());
+    root.vars
+        .insert("CMAKE_CUDA_ARCHITECTURES".into(), "75".into());
+    root.vars
+        .insert("CMAKE_CUDA_STANDARD_DEFAULT".into(), "17".into());
+    root.vars.insert(
+        "CMAKE_CUDA17_STANDARD_COMPILE_OPTION".into(),
+        "-std=c++17".into(),
+    );
+    root.vars.insert("CMAKE_HIP_PLATFORM".into(), "amd".into());
+    root.vars
+        .insert("CMAKE_HIP_COMPILER".into(), "/opt/rocm/bin/clang++".into());
+    root.vars
+        .insert("CMAKE_HIP_COMPILER_ID".into(), "Clang".into());
+    root.vars
+        .insert("CMAKE_HIP_COMPILER_VERSION".into(), "18.1.0".into());
+    root.vars
+        .insert("CMAKE_HIP_SOURCE_FILE_EXTENSIONS".into(), "hip".into());
+    root.vars
+        .insert("CMAKE_HIP_OUTPUT_EXTENSION".into(), ".o".into());
+    root.vars
+        .insert("CMAKE_HIP_ARCHITECTURES".into(), "gfx90a".into());
+    root.vars
+        .insert("CMAKE_HIP_STANDARD_DEFAULT".into(), "17".into());
+    root.vars.insert(
+        "CMAKE_HIP17_STANDARD_COMPILE_OPTION".into(),
+        "-std=c++17".into(),
+    );
+    root.vars
+        .insert("CMAKE_Swift_COMPILER".into(), "/usr/bin/swiftc".into());
+    root.vars
+        .insert("CMAKE_Swift_COMPILER_ID".into(), "Apple".into());
+    root.vars
+        .insert("CMAKE_Swift_COMPILER_VERSION".into(), "6.0".into());
+    root.vars
+        .insert("CMAKE_Swift_SOURCE_FILE_EXTENSIONS".into(), "swift".into());
+    root.vars
+        .insert("CMAKE_Swift_OUTPUT_EXTENSION".into(), ".o".into());
+    root.vars.insert(
+        "CMAKE_Swift_COMPILATION_MODE_DEFAULT".into(),
+        "incremental".into(),
+    );
+    root.vars
+        .insert("CMAKE_Swift_NUM_THREADS".into(), "2".into());
+    root.vars.insert(
+        "CMAKE_Swift_COMPILE_OBJECT".into(),
+        "<CMAKE_Swift_COMPILER> -j 2 -num-threads 2 <DEFINES> <FLAGS> <INCLUDES> <SOURCE>".into(),
+    );
+
+    let policies = rcmake_diag::PolicyMap::default();
+    for (name, src, props) in [
+        (
+            "cu_obj",
+            "k.cu",
+            [("CUDA_STANDARD", "17"), ("CUDA_ARCHITECTURES", "75")].as_slice(),
+        ),
+        (
+            "hip_obj",
+            "h.hip",
+            [("HIP_STANDARD", "17"), ("HIP_ARCHITECTURES", "gfx90a")].as_slice(),
+        ),
+        ("sw_obj", "s.swift", [].as_slice()),
+    ] {
+        let mut t = Target::new(
+            name.into(),
+            TargetKind::ObjectLibrary,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            policies,
+        );
+        t.sources.push(BT::new(src.into(), Default::default()));
+        for &(k, v) in props {
+            t.props.set(k.into(), v.into());
+        }
+        model.add_target(t)?;
+    }
+
+    let result = rcmake_resolve::resolve(&model, &host, &[rcmake_genex::ConfigId::default()])?;
+    super::write_replies(&model, &result, &host, build)?;
+
+    let reply_dir = build.join(".cmake/api/v1/reply");
+    let entries = host.read_dir(&reply_dir)?;
+    let read_prefix = |prefix: &str| -> Result<String, Box<dyn std::error::Error>> {
+        let file = entries
+            .iter()
+            .find(|e| e.name.starts_with(prefix.as_bytes()))
+            .ok_or_else(|| format!("missing reply with prefix {prefix}"))?;
+        let bytes = host.read(
+            &reply_dir.join(String::from_utf8_lossy(&file.name).as_ref()),
+            ReadRange::All { limit: 200_000 },
+        )?;
+        Ok(String::from_utf8(bytes)?)
+    };
+
+    let tc = read_prefix("toolchains-v1-")?;
+    assert!(tc.contains("\"language\" : \"CUDA\""), "{tc}");
+    assert!(tc.contains("\"language\" : \"HIP\""), "{tc}");
+    assert!(tc.contains("\"language\" : \"Swift\""), "{tc}");
+
+    let cu = read_prefix("target-cu_obj-")?;
+    assert!(cu.contains("\"language\" : \"CUDA\""), "{cu}");
+    assert!(cu.contains("\"standard\" : \"17\""), "{cu}");
+
+    let hip = read_prefix("target-hip_obj-")?;
+    assert!(hip.contains("\"language\" : \"HIP\""), "{hip}");
+    assert!(hip.contains("--offload-arch=gfx90a"), "{hip}");
+    assert!(hip.contains("\"standard\" : \"17\""), "{hip}");
+
+    let sw = read_prefix("target-sw_obj-")?;
+    assert!(sw.contains("\"language\" : \"Swift\""), "{sw}");
+    Ok(())
+}

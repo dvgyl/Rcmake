@@ -48,8 +48,9 @@ pub fn create(name: &[u8]) -> Option<Box<dyn PackageGenerator>> {
 /// Platform gating:
 /// - `NSIS`, `NSIS64`, `IFW`, `External`, and all archive generators are available on all platforms.
 /// - `productbuild` is available on macOS (`Darwin`).
-/// - `WIX` is available on Windows and Cygwin hosts (upstream CMake enables `WIX` on Windows and on
-///   Cygwin builds linked with `LibUUID`).
+/// - `WIX` is available on [`HostPlatform::Windows`], which also covers Cygwin, MSYS, and MinGW
+///   system names ([`installer::classify_sysname`]). Upstream CMake enables `WIX` on Windows,
+///   and on Cygwin only for builds linked with `LibUUID`.
 /// - `PureOS` (the default `PureHost` identity in existing unit tests) falls back to the
 ///   compile-time platform for platform-gated installers while keeping existing `DragNDrop`,
 ///   `Bundle`, `DEB`, and `RPM` tests working.

@@ -623,7 +623,7 @@ def main() -> int:
         sys.exit("ninja must be on PATH (source env/env.sh).")
 
     with tempfile.TemporaryDirectory(prefix="rcmake-ccmake-pty-") as tmp:
-        tmp_root = Path(tmp)
+        tmp_root = Path(tmp).resolve()
         rcmake_tools = make_rcmake_bin_dir(rcmake_bin, tmp_root)
         run_case_parity(oracle_ccmake, rcmake_tools, tmp_root)
         run_case_child_stdio_isolation(rcmake_tools, tmp_root)

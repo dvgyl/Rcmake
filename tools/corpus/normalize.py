@@ -853,96 +853,153 @@ def _remap_abstract_target_indexes(
     )
 
 
+def _sort_dependency_list(deps: list[Any]) -> tuple[list[Any], bool]:
+    """Symmetrically sort codemodel target dependencies[] by target id.
+
+    Upstream CMake orders cmTargetDependSet by raw C++ pointer address
+    (cmTargetDepend.h:34-37), so dependency array order is non-deterministic
+    across runs and processes.
+    """
+    if len(deps) < 2:
+        return deps, False
+    ordered = sorted(
+        deps,
+        key=lambda dep: dep.get("id", "") if isinstance(dep, dict) else "",
+    )
+    if ordered == deps:
+        return deps, False
+    return ordered, True
+
+
+def _sort_target_entry_dependencies(entry: Any) -> tuple[Any, bool]:
+    if not isinstance(entry, dict):
+        return entry, False
+    entry_changed = False
+    updated = entry
+    if isinstance(entry.get("dependencies"), list):
+        ordered, did_sort = _sort_dependency_list(entry["dependencies"])
+        if did_sort:
+            updated = {**updated, "dependencies": ordered}
+            entry_changed = True
+    child = entry.get("jsonFile")
+    if isinstance(child, dict) and isinstance(child.get("dependencies"), list):
+        ordered, did_sort = _sort_dependency_list(child["dependencies"])
+        if did_sort:
+            if updated is entry:
+                updated = dict(entry)
+            updated["jsonFile"] = {**child, "dependencies": ordered}
+            entry_changed = True
+    return updated, entry_changed
+
+
 def normalize_codemodel_abstract_target_ties(
     codemodel: Any,
     *,
     dir_key: str = "directories",
     dir_data_key: str = "data",
 ) -> Any:
-    """Canonicalize contiguous equal-name abstractTargets ties by target id.
+    """Canonicalize equal-name abstractTargets ties and pointer-ordered dependencies.
 
     Remaps matching abstractTargetIndexes and directory installer target
-    references without changing the order of targets with distinct names.
+    references without changing the order of targets with distinct names, and
+    symmetrically sorts each target's ``dependencies`` array by ``id``.
     """
     if not isinstance(codemodel, dict) or not isinstance(codemodel.get("configurations"), list):
         return codemodel
     configs = []
     changed = False
     for config in codemodel["configurations"]:
-        abstract = config.get("abstractTargets") if isinstance(config, dict) else None
-        if not isinstance(abstract, list):
+        if not isinstance(config, dict):
             configs.append(config)
             continue
-        ordered = []
-        i = 0
-        while i < len(abstract):
-            name = abstract[i].get("name", "") if isinstance(abstract[i], dict) else ""
-            j = i + 1
-            while j < len(abstract) and (
-                abstract[j].get("name", "") if isinstance(abstract[j], dict) else ""
-            ) == name:
-                j += 1
-            run = list(enumerate(abstract[i:j], start=i))
-            if j - i > 1:
-                run.sort(key=lambda pair: pair[1].get("id", "") if isinstance(pair[1], dict) else "")
-            ordered.extend(run)
-            i = j
-        old_to_new = {old: new for new, (old, _) in enumerate(ordered)}
-        if all(old == new for old, new in old_to_new.items()):
-            configs.append(config)
-            continue
-        changed = True
-        old_ids = {
-            old: item.get("id")
-            for old, item in enumerate(abstract)
-            if isinstance(item, dict)
-        }
-        new_config = {**config, "abstractTargets": [item for _, item in ordered]}
-        if isinstance(config.get("projects"), list):
-            new_config["projects"] = [
-                {
-                    **proj,
-                    "abstractTargetIndexes": _remap_abstract_target_indexes(
-                        proj["abstractTargetIndexes"], old_to_new
-                    ),
+        new_config = config
+        config_changed = False
+        abstract = config.get("abstractTargets")
+        if isinstance(abstract, list):
+            ordered = []
+            i = 0
+            while i < len(abstract):
+                name = abstract[i].get("name", "") if isinstance(abstract[i], dict) else ""
+                j = i + 1
+                while j < len(abstract) and (
+                    abstract[j].get("name", "") if isinstance(abstract[j], dict) else ""
+                ) == name:
+                    j += 1
+                run = list(enumerate(abstract[i:j], start=i))
+                if j - i > 1:
+                    run.sort(key=lambda pair: pair[1].get("id", "") if isinstance(pair[1], dict) else "")
+                ordered.extend(run)
+                i = j
+            old_to_new = {old: new for new, (old, _) in enumerate(ordered)}
+            if any(old != new for old, new in old_to_new.items()):
+                config_changed = True
+                old_ids = {
+                    old: item.get("id")
+                    for old, item in enumerate(abstract)
+                    if isinstance(item, dict)
                 }
-                if isinstance(proj, dict) and isinstance(proj.get("abstractTargetIndexes"), list)
-                else proj
-                for proj in config["projects"]
-            ]
-        if isinstance(config.get(dir_key), list):
-            new_dirs = []
-            for directory in config[dir_key]:
-                if not isinstance(directory, dict):
-                    new_dirs.append(directory)
-                    continue
-                new_dir = dict(directory)
-                if isinstance(directory.get("abstractTargetIndexes"), list):
-                    new_dir["abstractTargetIndexes"] = _remap_abstract_target_indexes(
-                        directory["abstractTargetIndexes"], old_to_new
-                    )
-                child = directory.get(dir_data_key)
-                if isinstance(child, dict) and isinstance(child.get("installers"), list):
-                    new_installers = []
-                    for inst in child["installers"]:
-                        if not isinstance(inst, dict):
-                            new_installers.append(inst)
+                new_config = {**new_config, "abstractTargets": [item for _, item in ordered]}
+                if isinstance(config.get("projects"), list):
+                    new_config["projects"] = [
+                        {
+                            **proj,
+                            "abstractTargetIndexes": _remap_abstract_target_indexes(
+                                proj["abstractTargetIndexes"], old_to_new
+                            ),
+                        }
+                        if isinstance(proj, dict) and isinstance(proj.get("abstractTargetIndexes"), list)
+                        else proj
+                        for proj in config["projects"]
+                    ]
+                if isinstance(config.get(dir_key), list):
+                    new_dirs = []
+                    for directory in config[dir_key]:
+                        if not isinstance(directory, dict):
+                            new_dirs.append(directory)
                             continue
-                        updated = dict(inst)
-                        for key in ("fileSetTarget", "cxxModuleBmiTarget"):
-                            if key in updated:
-                                updated[key] = _remap_abstract_target_ref(
-                                    updated[key], old_to_new, old_ids
-                                )
-                        if isinstance(updated.get("exportTargets"), list):
-                            updated["exportTargets"] = [
-                                _remap_abstract_target_ref(item, old_to_new, old_ids)
-                                for item in updated["exportTargets"]
-                            ]
-                        new_installers.append(updated)
-                    new_dir[dir_data_key] = {**child, "installers": new_installers}
-                new_dirs.append(new_dir)
-            new_config[dir_key] = new_dirs
+                        new_dir = dict(directory)
+                        if isinstance(directory.get("abstractTargetIndexes"), list):
+                            new_dir["abstractTargetIndexes"] = _remap_abstract_target_indexes(
+                                directory["abstractTargetIndexes"], old_to_new
+                            )
+                        child = directory.get(dir_data_key)
+                        if isinstance(child, dict) and isinstance(child.get("installers"), list):
+                            new_installers = []
+                            for inst in child["installers"]:
+                                if not isinstance(inst, dict):
+                                    new_installers.append(inst)
+                                    continue
+                                updated = dict(inst)
+                                for key in ("fileSetTarget", "cxxModuleBmiTarget"):
+                                    if key in updated:
+                                        updated[key] = _remap_abstract_target_ref(
+                                            updated[key], old_to_new, old_ids
+                                        )
+                                if isinstance(updated.get("exportTargets"), list):
+                                    updated["exportTargets"] = [
+                                        _remap_abstract_target_ref(item, old_to_new, old_ids)
+                                        for item in updated["exportTargets"]
+                                    ]
+                                new_installers.append(updated)
+                            new_dir[dir_data_key] = {**child, "installers": new_installers}
+                        new_dirs.append(new_dir)
+                    new_config[dir_key] = new_dirs
+        for list_key in ("targets", "abstractTargets"):
+            entries = new_config.get(list_key)
+            if not isinstance(entries, list):
+                continue
+            updated_entries = []
+            list_changed = False
+            for entry in entries:
+                updated_entry, entry_changed = _sort_target_entry_dependencies(entry)
+                updated_entries.append(updated_entry)
+                if entry_changed:
+                    list_changed = True
+            if list_changed:
+                new_config = {**new_config, list_key: updated_entries}
+                config_changed = True
+        if config_changed:
+            changed = True
         configs.append(new_config)
     return {**codemodel, "configurations": configs} if changed else codemodel
 

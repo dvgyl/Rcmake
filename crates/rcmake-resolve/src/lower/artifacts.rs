@@ -724,9 +724,20 @@ pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
             languages.entry(language).or_insert(DirId::ROOT);
         }
     }
+    let enabled_languages: Option<IndexSet<BString>> = model
+        .global
+        .props
+        .get(b"ENABLED_LANGUAGES")
+        .map(|value| list::split(value, list::Empty::Drop).into_iter().collect())
+        .filter(|set: &IndexSet<BString>| !set.is_empty());
     let toolchains = languages
         .into_iter()
         .filter_map(|(language, dir)| {
+            if let Some(enabled) = &enabled_languages
+                && !enabled.contains(&language)
+            {
+                return None;
+            }
             let read = |suffix: &[u8]| {
                 definition(
                     model,
@@ -735,7 +746,7 @@ pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
                 )
             };
             let compiler = read(b"COMPILER")?;
-            if rcmake_base::truth::is_off(compiler) {
+            if rcmake_base::truth::is_off(compiler) || rcmake_base::truth::is_on(compiler) {
                 return None;
             }
             let value = |suffix| read(suffix).cloned().unwrap_or_default();
@@ -778,5 +789,8 @@ pub fn collect_metadata(model: &ProjectModel) -> ConfigureMetadata {
 
 fn compiler_language(key: &[u8]) -> Option<BString> {
     let lang = key.strip_prefix(b"CMAKE_")?.strip_suffix(b"_COMPILER")?;
-    (!lang.is_empty()).then(|| lang.into())
+    if lang.is_empty() || lang.ends_with(b"_DEPENDS_USE") || lang.ends_with(b"_HOST") {
+        return None;
+    }
+    Some(lang.into())
 }

@@ -107,10 +107,8 @@ impl Terminal for NativeTerminal {
             return Err(TerminalError::NotATty);
         }
 
-        // 1. Capture original attributes BEFORE any mutation.
         let saved = tcgetattr(&stdin).map_err(|err| TerminalError::Io(io::Error::from(err)))?;
 
-        // 2. Arm emergency panic-hook cleanup before mutating terminal state.
         install_emergency_restore_hook();
         {
             let mut slot = ACTIVE_STATE
@@ -123,7 +121,7 @@ impl Terminal for NativeTerminal {
         }
         self.saved = Some(saved.clone());
 
-        // 3. Configure raw mode with VMIN=0, VTIME=2 (200 ms poll ticks).
+        // Raw mode with VMIN=0, VTIME=2 (200 ms poll ticks).
         let mut raw = saved;
         raw.local_modes
             .remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ISIG);
@@ -132,7 +130,6 @@ impl Terminal for NativeTerminal {
         raw.special_codes[SpecialCodeIndex::VTIME] = 2;
 
         if let Err(err) = tcsetattr(&stdin, OptionalActions::Now, &raw) {
-            // Roll back saved state since tcsetattr did not apply.
             self.saved = None;
             let mut slot = ACTIVE_STATE
                 .lock()
@@ -141,7 +138,7 @@ impl Terminal for NativeTerminal {
             return Err(TerminalError::Io(io::Error::from(err)));
         }
 
-        // 4. Mark alt_screen armed BEFORE writing enter sequence so partial writes roll back.
+        // Arm the alternate screen before its enter sequence, so a partial write rolls back.
         self.active = true;
         self.alt_screen = true;
         {
@@ -155,7 +152,6 @@ impl Terminal for NativeTerminal {
 
         let mut out = io::stdout();
         if let Err(err) = out.write_all(ENTER_ALT_SCREEN).and_then(|()| out.flush()) {
-            // Partial initialization failed: restore termios and alt screen immediately.
             self.leave_raw();
             return Err(TerminalError::Io(err));
         }

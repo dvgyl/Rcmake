@@ -249,7 +249,9 @@ pub(crate) fn language_for_extension(
         return Some(language.clone());
     }
     let definition = |key: &[u8]| crate::lower::definition(model, dir, key);
-    let defaults = ["C", "CXX", "OBJC", "OBJCXX", "ASM", "Fortran", "CUDA", "RC"];
+    let defaults = [
+        "C", "CXX", "OBJC", "OBJCXX", "ASM", "Fortran", "CUDA", "HIP", "Swift", "RC",
+    ];
     let enabled = model.global.props.get(b"ENABLED_LANGUAGES");
     let languages = enabled.map_or_else(
         || defaults.iter().map(|lang| BString::from(*lang)).collect(),
@@ -298,6 +300,8 @@ pub(crate) fn language_for_extension(
                 "ASM" => matches!(extension, b"s" | b"S" | b"asm"),
                 "Fortran" => matches!(extension, b"f" | b"F" | b"f90" | b"F90"),
                 "CUDA" => extension == b"cu",
+                "HIP" => extension == b"hip",
+                "Swift" => extension == b"swift",
                 _ => false,
             }
         })

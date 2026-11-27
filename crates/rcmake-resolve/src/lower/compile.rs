@@ -20,11 +20,12 @@ use crate::{
 };
 
 /// Return whether `target` uses CMake's bundled one-step Swift compilation mode
-/// (`CMAKE_Swift_COMPILE_OBJECT` set to `:`), where Swift sources are compiled directly
-/// by the link step rather than through per-source compile commands.
+/// (`CMAKE_Swift_COMPILE_OBJECT` set to `:` and `CMP0157` not `NEW`), where Swift
+/// sources are compiled directly by the link step rather than through grouped compile actions.
 pub(super) fn is_one_step_swift(model: &ProjectModel, target: &Target) -> bool {
-    definition(model, target.dir, b"CMAKE_Swift_COMPILE_OBJECT")
-        .is_some_and(|value| value.trim_ascii() == b":")
+    !super::swift::is_split_build(model, target)
+        && definition(model, target.dir, b"CMAKE_Swift_COMPILE_OBJECT")
+            .is_some_and(|value| value.trim_ascii() == b":")
 }
 
 pub(crate) fn language_flags(
@@ -60,12 +61,36 @@ fn compile_flags(
         required_standard,
         position_independent,
         options,
+        false,
     )?;
     Ok(parts.into_iter().flatten().collect())
 }
 
+pub(super) fn codemodel_flag_quote(model: &ProjectModel, target: &Target, flag: &[u8]) -> BString {
+    if super::shell::windows_host(model, target.dir) {
+        return quote(flag);
+    }
+    if flag.iter().any(|b| matches!(b, b'[' | b']')) {
+        let mut quoted = Vec::with_capacity(flag.len() + 2);
+        quoted.push(b'"');
+        for &byte in flag {
+            if matches!(byte, b'\\' | b'"' | b'`' | b'$') {
+                quoted.push(b'\\');
+            }
+            quoted.push(byte);
+        }
+        quoted.push(b'"');
+        return quoted.into();
+    }
+    super::shell::cmake_posix_quote(flag)
+}
+
 /// The compile flags in three parts: the language and standard flags, the Apple
 /// architecture flags, and all later flags.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compile flag assembly combines standard, architecture, policy, and language rules."
+)]
 fn compile_flag_parts(
     model: &ProjectModel,
     target: &Target,
@@ -74,6 +99,7 @@ fn compile_flag_parts(
     required_standard: Option<&[u8]>,
     position_independent: Option<bool>,
     (architecture, usage): (Option<&[u8]>, Option<&mut UsageResolver<'_>>),
+    for_codemodel: bool,
 ) -> Result<[Vec<BString>; 3], ResolveError> {
     let language = group.language.as_slice();
     let mut leading = language_flags(model, target, config, language);
@@ -82,7 +108,7 @@ fn compile_flag_parts(
     let architectures = super::apple::arch::flags(model, target, config, language, architecture)?;
     let mut flags = Vec::new();
     let policy = Flags::new(model, target, language);
-    let ipo = if language == b"CUDA" {
+    let ipo = if matches!(language, b"CUDA" | b"HIP") {
         super::cuda::arch::ipo_enabled(model, target, config, language)
     } else {
         policy.ipo(config)
@@ -93,12 +119,34 @@ fn compile_flag_parts(
             .iter()
             .map(|option| quote(option)),
     );
+    let mut usage = usage;
+    let quote_gpu = |flag: &BString| {
+        if for_codemodel {
+            codemodel_flag_quote(model, target, flag)
+        } else {
+            quote(flag)
+        }
+    };
     if language == b"CUDA" {
-        flags.extend(
+        let cuda_flags = if for_codemodel {
+            super::cuda::compile_flags_for_codemodel(model, target, config)
+        } else {
             super::cuda::compile_flags(model, target, config)
+        };
+        flags.extend(cuda_flags.iter().map(quote_gpu));
+    } else if language == b"HIP" {
+        flags.extend(
+            super::hip::compile_flags(model, target, config)
                 .iter()
-                .map(|flag| quote(flag)),
+                .map(quote_gpu),
         );
+    } else if language == b"Swift" {
+        flags.extend(super::swift::target_flags(
+            model,
+            target,
+            config,
+            usage.as_deref_mut(),
+        )?);
     }
 
     if let Some(default) = definition(model, target.dir, b"CMAKE_MSVC_RUNTIME_LIBRARY_DEFAULT")
@@ -153,11 +201,10 @@ fn compile_flag_parts(
     ) {
         flags.push(quote(&[option.as_slice(), preset.as_slice()].concat()));
     }
-    if matches!(language, b"CXX" | b"OBJCXX" | b"SYCL")
-        && target
-            .props
-            .get(b"VISIBILITY_INLINES_HIDDEN")
-            .is_some_and(|v| truth::is_on(v))
+    if target
+        .props
+        .get(b"VISIBILITY_INLINES_HIDDEN")
+        .is_some_and(|v| truth::is_on(v))
         && let Some(option) = policy.option(b"COMPILE_OPTIONS_VISIBILITY_INLINES_HIDDEN")
     {
         flags.push(option.clone());
@@ -224,6 +271,7 @@ pub fn codemodel_compile_info(
         standard,
         None,
         (None, Some(usage)),
+        true,
     )?;
     let standard = codemodel_standard(model, target, &group.language, &features.entries);
     Ok((codemodel_flag_text(flags), standard))
@@ -710,7 +758,7 @@ pub(super) fn compile(
         flags.extend(expanded_dep_flags);
         join_words(flags)
     };
-    let mut invocations = rule_invocations(model, target.dir, template_text, |key| match key {
+    let invocations = rule_invocations(model, target.dir, template_text, |key| match key {
         b"FLAGS" => Some(if model.generator.is_some_and(GeneratorKind::is_ninja) {
             flags.trim_ascii().into()
         } else {
@@ -727,20 +775,86 @@ pub(super) fn compile(
         source: Some(&source),
         language: &group.language,
     };
+    let compiler_index = compiler_command_index(template_text, language);
+    let (invocation, launcher_prefix) = finalize_compile_invocations(
+        model,
+        target,
+        &launch,
+        invocations,
+        compiler_index,
+        lookup_paths,
+        settings.skip_file_set_linting,
+        usage,
+    )?;
+    let writes_depfile = compiler_depfile
+        && (dep_flags.is_some_and(|f| has_placeholder(f, b"<DEP_FILE>"))
+            || has_placeholder(template_text, b"<DEP_FILE>"));
+    let byproducts = match settings.pch {
+        Some(PchFlags::Create(plan)) if plan.companion_object.is_some() => {
+            vec![plan.artifact.clone()]
+        }
+        _ => Vec::new(),
+    };
+    Ok((
+        BuildStep::Compile {
+            byproducts,
+            compile_input: None,
+            object,
+            source,
+            invocation,
+            depfile: writes_depfile.then_some(depfile),
+            modmap,
+            dyndep: None,
+        },
+        launcher_prefix,
+    ))
+}
+
+/// Locate the command in a semicolon-delimited compile rule template that invokes
+/// `<CMAKE_<LANG>_COMPILER>`, defaulting to the first command when absent.
+pub(super) fn compiler_command_index(template: &[u8], language: &[u8]) -> usize {
+    let marker = [b"<CMAKE_", language, b"_COMPILER>"].concat();
+    list::split(template, list::Empty::Drop)
+        .iter()
+        .position(|cmd| has_placeholder(cmd, &marker))
+        .unwrap_or(0)
+}
+
+/// Apply compiler launcher, rule launcher, multi-command chaining, and instrumentation wrapper
+/// to the expanded compile rule commands.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compile rule finalization wires launchers, rule wrappers, and instrumentation."
+)]
+pub(super) fn finalize_compile_invocations(
+    model: &ProjectModel,
+    target: &Target,
+    launch: &launcher::Command<'_>,
+    mut invocations: Vec<crate::Invocation>,
+    compiler_index: usize,
+    lookup_paths: impl Fn(&[u8]) -> Option<BString>,
+    skip_file_set_linting: Option<bool>,
+    usage: &mut UsageResolver<'_>,
+) -> Result<(crate::Invocation, Option<BString>), ResolveError> {
     let mut launcher_prefix = None;
-    if let Some(invocation) = invocations.first_mut() {
+    let slot_index = if compiler_index < invocations.len() {
+        compiler_index
+    } else {
+        0
+    };
+    if let Some(invocation) = invocations.get_mut(slot_index) {
         let (launched, prefix) = lint::launch(
             model,
             target,
-            &launch,
+            launch,
             std::mem::take(invocation),
-            settings.skip_file_set_linting,
+            skip_file_set_linting,
             usage,
         )?;
         *invocation = launched;
         launcher_prefix = prefix;
     }
-    if let Some(prefix) = lint::rule_launcher(model, target, &launch, usage)? {
+    if let Some(prefix) = lint::rule_launcher(model, target, launch, usage)? {
         let prefix = expand_rule(&prefix, lookup_paths);
         for invocation in &mut invocations {
             let working_dir = invocation.working_dir.take();
@@ -768,28 +882,7 @@ pub(super) fn compile(
         }
     };
     let invocation = launch.wrap(model, target, invocation);
-    let writes_depfile = compiler_depfile
-        && (dep_flags.is_some_and(|f| has_placeholder(f, b"<DEP_FILE>"))
-            || has_placeholder(template_text, b"<DEP_FILE>"));
-    let byproducts = match settings.pch {
-        Some(PchFlags::Create(plan)) if plan.companion_object.is_some() => {
-            vec![plan.artifact.clone()]
-        }
-        _ => Vec::new(),
-    };
-    Ok((
-        BuildStep::Compile {
-            byproducts,
-            compile_input: None,
-            object,
-            source,
-            invocation,
-            depfile: writes_depfile.then_some(depfile),
-            modmap,
-            dyndep: None,
-        },
-        launcher_prefix,
-    ))
+    Ok((invocation, launcher_prefix))
 }
 
 fn has_placeholder(text: &[u8], key: &[u8]) -> bool {

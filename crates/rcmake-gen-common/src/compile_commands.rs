@@ -106,7 +106,13 @@ fn render_with_directories<'a>(
     let mut out = BString::from(Vec::with_capacity(64 * 1024));
     out.push(b'[');
     let mut separator = b"\n".as_slice();
-    for step in graphs.into_iter().flat_map(|graph| &graph.steps) {
+    for (graph, step_idx, step) in graphs.into_iter().flat_map(|graph| {
+        graph
+            .steps
+            .iter()
+            .enumerate()
+            .map(move |(idx, step)| (graph, idx, step))
+    }) {
         let BuildStep::Compile {
             object,
             source,
@@ -120,8 +126,6 @@ fn render_with_directories<'a>(
             continue;
         }
         let shell = compiler_shell(&invocation.shell);
-        out.extend_from_slice(separator);
-        separator = b",\n";
         let (directory, command) = if let Some(&directory) = directories.get(object.as_slice()) {
             // Makefiles uses the target directory for the command and the build root for `output`.
             let absolute_object = Lexical::new(build_dir).append(object);
@@ -147,20 +151,45 @@ fn render_with_directories<'a>(
                 compile_command(shell, None),
             )
         };
-        // Preserve the compile database's field order and use the JSON writer for values.
-        out.extend_from_slice(b"{\n  \"directory\": ");
-        json_string(&mut out, directory);
-        out.extend_from_slice(b",\n  \"command\": ");
-        json_string(&mut out, &command);
-        out.extend_from_slice(b",\n  \"file\": ");
-        json_string(&mut out, source);
-        out.extend_from_slice(b",\n  \"output\": ");
-        if ninja_style && !Lexical::new(object).absolute() {
-            json_string(&mut out, &Lexical::new(build_dir).append(object));
+        let mut emit_record = |file: &[u8], out_object: &[u8]| {
+            out.extend_from_slice(separator);
+            separator = b",\n";
+            // Preserve the compile database's field order and use the JSON writer for values.
+            out.extend_from_slice(b"{\n  \"directory\": ");
+            json_string(&mut out, directory);
+            out.extend_from_slice(b",\n  \"command\": ");
+            json_string(&mut out, &command);
+            out.extend_from_slice(b",\n  \"file\": ");
+            json_string(&mut out, file);
+            out.extend_from_slice(b",\n  \"output\": ");
+            if ninja_style && !Lexical::new(out_object).absolute() {
+                json_string(&mut out, &Lexical::new(build_dir).append(out_object));
+            } else {
+                json_string(&mut out, out_object);
+            }
+            out.extend_from_slice(b"\n}");
+        };
+        if let Some(action) = graph.swift_actions.get(&step_idx) {
+            let sources = if action.abs_sources.is_empty() {
+                action.sources.as_slice()
+            } else {
+                action.abs_sources.as_slice()
+            };
+            if sources.is_empty() {
+                emit_record(source, object);
+            } else {
+                for (i, swift_source) in sources.iter().enumerate() {
+                    let row_object = if action.single_output {
+                        action.outputs.first().unwrap_or(object)
+                    } else {
+                        action.outputs.get(i).unwrap_or(object)
+                    };
+                    emit_record(swift_source, row_object);
+                }
+            }
         } else {
-            json_string(&mut out, object);
+            emit_record(source, object);
         }
-        out.extend_from_slice(b"\n}");
     }
     if separator == b",\n" {
         out.push(b'\n');
@@ -457,5 +486,131 @@ mod tests {
                 .trim_matches('"')
         );
         assert_eq!(invalid.to_string(), expected);
+    }
+
+    #[test]
+    fn emits_one_compile_database_row_per_swift_source() {
+        use rcmake_resolve::{SwiftAction, SwiftActionKind};
+
+        // 1. Multi-output incremental Swift step: two sources -> two rows with distinct objects.
+        let mut multi_graph = BuildGraph {
+            steps: vec![BuildStep::Compile {
+                object: "CMakeFiles/lib.dir/a.swift.o".into(),
+                byproducts: vec!["CMakeFiles/lib.dir/b.swift.o".into()],
+                source: "../src/a.swift".into(),
+                compile_input: None,
+                invocation: Invocation {
+                    shell: "swiftc -c -output-file-map map.json /src/a.swift /src/b.swift".into(),
+                    ..Invocation::default()
+                },
+                depfile: None,
+                modmap: None,
+                dyndep: None,
+            }],
+            ..BuildGraph::default()
+        };
+        multi_graph.swift_actions.insert(
+            0,
+            SwiftAction {
+                kind: SwiftActionKind::Objects,
+                module_name: "lib".into(),
+                sources: vec!["../src/a.swift".into(), "../src/b.swift".into()],
+                abs_sources: vec!["/src/a.swift".into(), "/src/b.swift".into()],
+                outputs: vec![
+                    "CMakeFiles/lib.dir/a.swift.o".into(),
+                    "CMakeFiles/lib.dir/b.swift.o".into(),
+                ],
+                implicit_inputs: Vec::new(),
+                order_only_inputs: Vec::new(),
+                description: "Building Swift Module 'lib' objects with 2 sources".into(),
+                rsp_file: "CMakeFiles/lib.dir/lib.o.swift.rsp".into(),
+                rsp_invocation: None,
+                rsp_args: None,
+                single_output: false,
+                restat: true,
+            },
+        );
+        let multi_out = render_with_directories(
+            std::iter::once(&multi_graph),
+            b"/out",
+            &HashMap::new(),
+            true,
+            None,
+        )
+        .unwrap()
+        .to_string();
+        assert_eq!(multi_out.matches("\"file\":").count(), 2, "{multi_out}");
+        assert!(
+            multi_out.contains("\"file\": \"/src/a.swift\""),
+            "{multi_out}"
+        );
+        assert!(
+            multi_out.contains("\"file\": \"/src/b.swift\""),
+            "{multi_out}"
+        );
+        assert!(
+            multi_out.contains("\"output\": \"/out/CMakeFiles/lib.dir/a.swift.o\""),
+            "{multi_out}"
+        );
+        assert!(
+            multi_out.contains("\"output\": \"/out/CMakeFiles/lib.dir/b.swift.o\""),
+            "{multi_out}"
+        );
+
+        // 2. Single-output whole-module Swift step: two sources reuse the single module object path.
+        let mut wmo_graph = BuildGraph {
+            steps: vec![BuildStep::Compile {
+                object: "CMakeFiles/wmo.dir/wmo.o".into(),
+                byproducts: vec!["wmo.swiftmodule".into()],
+                source: "../src/w1.swift".into(),
+                compile_input: None,
+                invocation: Invocation {
+                    shell: "swiftc -c -wmo -o CMakeFiles/wmo.dir/wmo.o /src/w1.swift /src/w2.swift"
+                        .into(),
+                    ..Invocation::default()
+                },
+                depfile: None,
+                modmap: None,
+                dyndep: None,
+            }],
+            ..BuildGraph::default()
+        };
+        wmo_graph.swift_actions.insert(
+            0,
+            SwiftAction {
+                kind: SwiftActionKind::Combined,
+                module_name: "wmo".into(),
+                sources: vec!["../src/w1.swift".into(), "../src/w2.swift".into()],
+                abs_sources: vec!["/src/w1.swift".into(), "/src/w2.swift".into()],
+                outputs: vec!["CMakeFiles/wmo.dir/wmo.o".into(), "wmo.swiftmodule".into()],
+                implicit_inputs: Vec::new(),
+                order_only_inputs: Vec::new(),
+                description: "Building Swift Module 'wmo' objects with 2 sources".into(),
+                rsp_file: "CMakeFiles/wmo.dir/wmo.o.swift.rsp".into(),
+                rsp_invocation: None,
+                rsp_args: None,
+                single_output: true,
+                restat: true,
+            },
+        );
+        let wmo_out = render_with_directories(
+            std::iter::once(&wmo_graph),
+            b"/out",
+            &HashMap::new(),
+            true,
+            None,
+        )
+        .unwrap()
+        .to_string();
+        assert_eq!(wmo_out.matches("\"file\":").count(), 2, "{wmo_out}");
+        assert!(wmo_out.contains("\"file\": \"/src/w1.swift\""), "{wmo_out}");
+        assert!(wmo_out.contains("\"file\": \"/src/w2.swift\""), "{wmo_out}");
+        assert_eq!(
+            wmo_out
+                .matches("\"output\": \"/out/CMakeFiles/wmo.dir/wmo.o\"")
+                .count(),
+            2,
+            "{wmo_out}"
+        );
     }
 }

@@ -26,7 +26,9 @@ use rcmake_model::CacheType;
 
 use crate::app::{App, Effect};
 use crate::keys::KeyDecoder;
-use crate::layout::{ERR_INIT_FAILED, ERR_LOAD_CACHE, ERR_WINDOW_TOO_SMALL, MIN_HEIGHT, MIN_WIDTH};
+use crate::layout::{
+    ERR_INIT_FAILED, ERR_LOAD_CACHE, ERR_WINDOW_TOO_SMALL, MIN_HEIGHT, MIN_WIDTH, fits_cell_budget,
+};
 use crate::screen::{Renderer, Screen};
 use crate::terminal::{RawGuard, Terminal};
 
@@ -102,6 +104,9 @@ pub struct RunReport {
     pub has_non_status: bool,
     /// Optional explicit set of newly created cache entry names.
     pub new_entries: BTreeSet<BString>,
+    /// `true` if the queued edits did not reach the cache that configure reads. The
+    /// editor then keeps the edits for the next configure.
+    pub edits_pending: bool,
 }
 
 /// Error returned by [`CacheDriver::load`].
@@ -136,7 +141,8 @@ pub trait CacheDriver {
     fn load(&mut self) -> Result<CacheSnapshot, DriverError>;
 
     /// Run configure with the queued edits, writing `CMakeCache.txt` without
-    /// generating build files.
+    /// generating build files. Set [`RunReport::edits_pending`] if the edits did not
+    /// reach the cache that configure reads.
     fn configure(&mut self, edits: &[EntryEdit]) -> RunReport;
 
     /// Run generation on the retained configured state without re-running configure.
@@ -171,7 +177,11 @@ pub fn run<T: Terminal, D: CacheDriver>(
         }
     };
 
-    let Some((mut cols, mut rows)) = guard.terminal_mut().size() else {
+    let Some((mut cols, mut rows)) = guard
+        .terminal_mut()
+        .size()
+        .filter(|&(cols, rows)| fits_cell_budget(cols, rows))
+    else {
         guard.leave();
         let _ = stderr.write_all(ERR_INIT_FAILED.as_bytes());
         let _ = stderr.flush();
@@ -229,6 +239,7 @@ pub fn run<T: Terminal, D: CacheDriver>(
             }
             if let Some((new_cols, new_rows)) = guard.terminal_mut().size()
                 && (new_cols != cols || new_rows != rows)
+                && fits_cell_budget(new_cols, new_rows)
             {
                 cols = new_cols;
                 rows = new_rows;
@@ -305,9 +316,12 @@ fn dispatch_key<T: Terminal, D: CacheDriver>(
             if draw_screen(terminal, renderer, app, cols, rows, Some("Configuring...")).is_err() {
                 return LoopAction::Exit(1);
             }
-            let edits = app.take_pending_edits();
-            let report = driver.configure(&edits);
-            let reloaded = driver.load().ok();
+            let report = driver.configure(&app.pending_edits());
+            let reloaded = if report.edits_pending {
+                None
+            } else {
+                driver.load().ok()
+            };
             app.finish_configure(report, reloaded);
             renderer.invalidate();
             LoopAction::Continue(true)
@@ -320,14 +334,7 @@ fn dispatch_key<T: Terminal, D: CacheDriver>(
             if report.exit_code == 0 && !report.has_non_status {
                 return LoopAction::Exit(0);
             }
-            let succeeded = report.exit_code == 0;
             app.finish_generate(report);
-            if succeeded {
-                // Generation succeeded with warnings; show the output screen so the
-                // user can inspect it, then exit cleanly when dismissed or immediately.
-                renderer.invalidate();
-                return LoopAction::Continue(true);
-            }
             renderer.invalidate();
             LoopAction::Continue(true)
         }

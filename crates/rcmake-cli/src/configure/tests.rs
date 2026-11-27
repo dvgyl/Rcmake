@@ -620,13 +620,27 @@ mod setup_replay {
         mutate: impl Fn(&mut World) -> TestResult,
         expect: Expect,
     ) -> Result<World, Box<dyn std::error::Error>> {
+        check_after(2, files, args, env, warm_hits, mutate, expect)
+    }
+
+    /// [`check`] with `configures` configures before the mutation.
+    fn check_after(
+        configures: usize,
+        files: &[(&str, String)],
+        args: &[&str],
+        env: &[(&str, &str)],
+        warm_hits: &[&str],
+        mutate: impl Fn(&mut World) -> TestResult,
+        expect: Expect,
+    ) -> Result<World, Box<dyn std::error::Error>> {
         let files: Vec<(&str, &str)> = files.iter().map(|(n, t)| (*n, t.as_str())).collect();
         let mut world = World::new(&files, args)?;
         for (key, value) in env {
             world.set_env(key, Some(value));
         }
-        world.ok()?;
-        world.ok()?;
+        for _ in 0..configures {
+            world.ok()?;
+        }
         let warm = world.replay();
         assert_eq!(warm.miss, None, "warm configure: {warm:?}");
         assert_eq!(leaves(&warm), warm_hits, "warm configure: {warm:?}");
@@ -810,6 +824,42 @@ mod setup_replay {
             &["other"],
             |w| w.write("src/tc.cmake", TOOLCHAIN),
             Expect::Miss("checkpoint 0"),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn m5_stock_command_defined_by_a_toolchain_edit_keeps_its_query_live() -> TestResult {
+        // `ProcessorCount.cmake` only defines a stock function, so the setup
+        // checkpoints stay equal. The leaf that queries the command runs live. A leaf
+        // with a condition keys on all visible variables, so a replayable leaf of this
+        // shape first hits in the fourth configure.
+        let mut files = toolchain_files(TOOLCHAIN);
+        for (name, text) in &mut files {
+            if *name == "src/leaf/CMakeLists.txt" {
+                *text = format!(
+                    "if(COMMAND ProcessorCount)\nelse()\n  add_library(pc STATIC leaf.c)\n\
+                     endif()\n{LEAF}"
+                );
+            }
+        }
+        check_after(
+            4,
+            &files,
+            &toolchain_args(),
+            &[],
+            &["other"],
+            |w| {
+                w.host.seed_file(
+                    &Path::new(MODULES).join("ProcessorCount.cmake"),
+                    include_bytes!("../../../../modules/cmake-4.5/Modules/ProcessorCount.cmake"),
+                )?;
+                w.write(
+                    "src/tc.cmake",
+                    &format!("{TOOLCHAIN}include(ProcessorCount)\n"),
+                )
+            },
+            Expect::Hits(&["other"]),
         )?;
         Ok(())
     }
@@ -1318,6 +1368,61 @@ fn cmake_edit_command_and_ninja_edit_cache_use_sibling_ccmake() -> HostResult<()
         "{ninja_text}"
     );
     assert!(ninja_text.contains("pool = console"), "{ninja_text}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cmake_edit_command_finds_ccmake_alongside_symlinked_rcmake() -> HostResult<()> {
+    let host = Arc::new(PureHost::new(
+        PathBuf::from("/work"),
+        PathBuf::from("/stage/bin/cmake"),
+    ));
+    host.seed_file(Path::new("/cellar/bin/rcmake"), b"")?;
+    host.set_permissions(Path::new("/cellar/bin/rcmake"), 0o755)?;
+    host.create_dir_all(Path::new("/stage/bin"))?;
+    host.symlink(
+        Path::new("/cellar/bin/rcmake"),
+        Path::new("/stage/bin/rcmake"),
+    )?;
+    host.symlink(Path::new("rcmake"), Path::new("/stage/bin/cmake"))?;
+    host.symlink(Path::new("rcmake"), Path::new("/stage/bin/ccmake"))?;
+    host.seed_file(Path::new("/tools/ninja"), b"")?;
+    host.set_permissions(Path::new("/tools/ninja"), 0o755)?;
+    let modules = Path::new("/stage/share/cmake-4.5/Modules");
+    for (name, contents) in [
+        ("CMakeDetermineSystem.cmake", ""),
+        ("CMakeSystemSpecificInitialize.cmake", ""),
+        ("CMakeSystemSpecificInformation.cmake", ""),
+        (
+            "CMakeNinjaFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM \"/tools/ninja\" CACHE FILEPATH \"\")\n",
+        ),
+    ] {
+        host.seed_file(&modules.join(name), contents.as_bytes())?;
+    }
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nproject(EditCmdSymlink NONE)\n",
+    )?;
+
+    let args = ["/stage/bin/cmake", "-S", ".", "-B", "out", "-G", "Ninja"].map(BString::from);
+    assert_eq!(
+        crate::run(&args, host.clone()),
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+
+    let cache = BString::from(host.read(
+        Path::new("/work/out/CMakeCache.txt"),
+        ReadRange::All { limit: 1 << 20 },
+    )?);
+    let cache_text = cache.to_string();
+    assert!(
+        cache_text.contains("CMAKE_EDIT_COMMAND:INTERNAL=/stage/bin/ccmake\n"),
+        "{cache_text}"
+    );
     Ok(())
 }
 

@@ -196,11 +196,15 @@ impl CacheView {
         Some(removed.name)
     }
 
-    /// Drain all pending edits in deterministic name order for the next configure run.
-    pub fn take_pending_edits(&mut self) -> Vec<EntryEdit> {
-        std::mem::take(&mut self.pending_edits)
-            .into_values()
-            .collect()
+    /// All pending edits in deterministic name order for the next configure run.
+    #[must_use]
+    pub fn pending_edits(&self) -> Vec<EntryEdit> {
+        self.pending_edits.values().cloned().collect()
+    }
+
+    /// Forget the pending edits after a configure consumed them.
+    pub fn clear_pending_edits(&mut self) {
+        self.pending_edits.clear();
     }
 
     /// Find the next visible entry index whose name contains `query` (ASCII case-insensitive),

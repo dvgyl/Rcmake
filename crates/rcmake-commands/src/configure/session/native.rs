@@ -260,7 +260,6 @@ fn replay_report(interp: &Interp) -> BString {
         .map(|path| rcmake_host::path::from_native_cmake(path))
         .collect();
     let paths = |set: BTreeSet<BString>| Value::Array(set.into_iter().map(Value::String).collect());
-    // `setup_miss` names the setup input or checkpoint that disabled replay hits.
     let miss = interp
         .replay_setup_miss()
         .map_or(Value::Null, |reason| Value::String(reason.into()));

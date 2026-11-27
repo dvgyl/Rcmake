@@ -41,7 +41,7 @@ fn destination(
     captures: &mut Vec<Capture>,
 ) -> HostResult<Destination> {
     Ok(match output {
-        Output::Capture => {
+        Output::Capture | Output::Stream => {
             let (read, write) = process_io(io::pipe())?;
             captures.push((stream, read));
             Destination::Handle(write.into())
@@ -299,23 +299,27 @@ impl Supervisor<'_> {
                                 active_captures -= 1;
                                 continue;
                             };
-                            if output
-                                .stdout
-                                .len()
-                                .saturating_add(output.stderr.len())
-                                .saturating_add(bytes.len())
-                                > self.output_limit
-                            {
-                                return process_io(Err(io::Error::other(
-                                    "Process output exceeds the size limit",
-                                )));
-                            }
-                            match stream {
-                                Stream::Stdout => output.stdout.extend_from_slice(&bytes),
-                                Stream::Stderr => output.stderr.extend_from_slice(&bytes),
-                            }
-                            if self.req.tee {
+                            if crate::is_streamed(self.req, stream) {
                                 on_output(stream, &bytes);
+                            } else {
+                                if output
+                                    .stdout
+                                    .len()
+                                    .saturating_add(output.stderr.len())
+                                    .saturating_add(bytes.len())
+                                    > self.output_limit
+                                {
+                                    return process_io(Err(io::Error::other(
+                                        "Process output exceeds the size limit",
+                                    )));
+                                }
+                                match stream {
+                                    Stream::Stdout => output.stdout.extend_from_slice(&bytes),
+                                    Stream::Stderr => output.stderr.extend_from_slice(&bytes),
+                                }
+                                if self.req.tee {
+                                    on_output(stream, &bytes);
+                                }
                             }
                             if let Some(delay) =
                                 update.as_mut().and_then(|update| update(stream, &bytes))

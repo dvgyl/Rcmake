@@ -87,7 +87,8 @@ def capture_l1(build, source, tool_paths, configure):
     # Map tool locations and module roots to stable labels. The cmake label has
     # priority when all three shim names resolve to the same executable.
     for key, name in (("CMAKE_ROOT", "modules"), ("CMAKE_CPACK_COMMAND", "cpack"),
-                      ("CMAKE_CTEST_COMMAND", "ctest"), ("CMAKE_COMMAND", "cmake")):
+                      ("CMAKE_CTEST_COMMAND", "ctest"), ("CMAKE_EDIT_COMMAND", "ccmake"),
+                      ("CMAKE_COMMAND", "cmake")):
         key += ":INTERNAL"
         label = f"<{name}>"
         if name in tool_paths:

@@ -2,14 +2,6 @@
 //! `PureHost`. Each test covers one frame or stepping rule of CMake 4.5.1, or one
 //! session lifecycle case.
 
-// Test helpers outside `#[test]` functions fail the test on unexpected data.
-#![allow(
-    clippy::panic,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing
-)]
-
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -61,8 +53,22 @@ fn register(reg: &mut Registry) {
         cx.run_subdirectory(&src, &bin, rcmake_eval::SubdirOptions::default())?;
         Ok(Flow::Normal)
     };
+    // `fill(NAME COUNT)` sets `NAME` to `COUNT` control bytes (0x01), which JSON sends
+    // as six bytes each (`\u0001`).
+    let fill: BuiltinFn = |cx, args| {
+        let (Some(name), Some(count)) = (args.first(), args.get(1)) else {
+            return Err(CmdError::status("needs a name and a count"));
+        };
+        let count = std::str::from_utf8(&count.value)
+            .ok()
+            .and_then(|count| count.parse::<usize>().ok())
+            .ok_or_else(|| CmdError::status("bad count"))?;
+        cx.set_var(&name.value, vec![1_u8; count].into());
+        Ok(Flow::Normal)
+    };
     let noop: BuiltinFn = |_, _| Ok(Flow::Normal);
     reg.add("set", set, flags);
+    reg.add("fill", fill, flags);
     reg.add("cmake_language", language, flags);
     reg.add(
         "add_subdirectory",
@@ -73,6 +79,7 @@ fn register(reg: &mut Registry) {
     reg.add("cmake_minimum_required", noop, flags);
 }
 
+#[allow(clippy::unwrap_used, reason = "a fixture failure fails the test")]
 fn host(files: &[(&str, &str)]) -> Arc<PureHost> {
     let host = Arc::new(PureHost::new(
         PathBuf::from("/w"),
@@ -119,6 +126,7 @@ struct Session {
     done: JoinHandle<(i32, Vec<u8>)>,
 }
 
+#[allow(clippy::unwrap_used, reason = "a fixture failure fails the test")]
 fn config(host: &Arc<PureHost>, stdout: &Arc<Mutex<Vec<u8>>>) -> Config {
     let sink = Arc::clone(stdout);
     Config {
@@ -130,6 +138,7 @@ fn config(host: &Arc<PureHost>, stdout: &Arc<Mutex<Vec<u8>>>) -> Config {
     }
 }
 
+#[allow(clippy::unwrap_used, reason = "a fixture failure fails the test")]
 fn start_with(files: &[(&str, &str)], run: Run, options: MemoryOptions) -> Session {
     let host = host(files);
     let (listener, client) = memory::pair(options);
@@ -151,6 +160,11 @@ fn start(files: &[(&str, &str)], run: Run) -> Session {
     start_with(files, run, MemoryOptions::default())
 }
 
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "a fixture failure fails the test"
+)]
 /// Run `test` with a time limit, so that a deadlock fails instead of hanging.
 fn bounded(test: impl FnOnce() + Send + 'static) {
     let (tx, rx) = mpsc::channel();
@@ -169,6 +183,7 @@ fn bounded(test: impl FnOnce() + Send + 'static) {
     }
 }
 
+#[allow(clippy::panic, reason = "a fixture failure fails the test")]
 fn get<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
     path.iter().fold(value, |value, key| {
         value
@@ -177,10 +192,12 @@ fn get<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
     })
 }
 
+#[allow(clippy::unwrap_used, reason = "a fixture failure fails the test")]
 fn text(value: &Value) -> String {
     String::from_utf8(rcmake_json::write_compact(value).to_vec()).unwrap()
 }
 
+#[allow(clippy::unwrap_used, reason = "a fixture failure fails the test")]
 fn string(value: &Value) -> String {
     value.as_str().unwrap().to_owned()
 }
@@ -194,6 +211,13 @@ struct Client {
     stopped: bool,
 }
 
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "a fixture failure fails the test"
+)]
 impl Client {
     fn new(inner: MemoryClient) -> Self {
         Self {
@@ -393,6 +417,7 @@ impl Client {
     }
 }
 
+#[allow(clippy::unwrap_used, reason = "a fixture failure fails the test")]
 fn wait(session: Session) -> (i32, String) {
     let (code, out) = session.done.join().unwrap();
     (code, String::from_utf8(out).unwrap())
@@ -561,6 +586,7 @@ fn function_and_macro_frames() {
         assert_eq!(client.reason(), "step");
         assert_eq!(client.stack(), ["set(M, 3) Line: 5", "m(3) Line: 8"]);
         client.action("stepOut");
+        assert_eq!(client.reason(), "step");
         assert_eq!(client.stack(), ["set(END, 1) Line: 9"]);
         assert_eq!(client.finish(), 0);
         wait(session);
@@ -572,6 +598,7 @@ fn function_and_macro_frames() {
         client.handshake(&[("/w/main.cmake", &[4])], &[]);
         client.stop();
         client.action("stepIn");
+        assert_eq!(client.reason(), "step");
         assert_eq!(client.stack(), ["set(L, ${a}) Line: 2", "f(1) Line: 4"]);
         let ids = client.frame_ids();
         assert_eq!(client.evaluate(ids[0], "a"), "1");
@@ -596,6 +623,7 @@ fn next_on_block_stops_inside_the_block() {
         assert_eq!(client.stack(), ["set(V, 1) Line: 2"]);
         // A normal `endblock()` does not stop.
         client.action("next");
+        assert_eq!(client.reason(), "step");
         assert_eq!(client.stack(), ["set(Z, 3) Line: 4"]);
         assert_eq!(client.finish(), 0);
         wait(session);
@@ -618,6 +646,7 @@ fn call_stops_twice_on_its_line() {
             ["g(7) Line: 4", "cmake_language(CALL, g, 7) Line: 4"]
         );
         client.action("stepIn");
+        assert_eq!(client.reason(), "step");
         assert_eq!(client.stack().len(), 3);
         assert_eq!(client.finish(), 0);
         wait(session);
@@ -860,37 +889,252 @@ fn session_error_ends_the_session() {
     });
 }
 
+/// The frame queries of the race tests and their cancelled response bodies.
+const QUERIES: [(&str, &str, &str); 3] = [
+    ("scopes", r#"{"frameId":FRAME}"#, r#"{"scopes":[]}"#),
+    (
+        "evaluate",
+        r#"{"expression":"A","frameId":FRAME}"#,
+        r#"{"result":"","variablesReference":0}"#,
+    ),
+    (
+        "variables",
+        r#"{"variablesReference":1}"#,
+        r#"{"variables":[]}"#,
+    ),
+];
+
 #[test]
-fn stale_queries_racing_with_resume_get_answers() {
+fn resume_retires_the_stop_and_cancels_later_queries() {
     bounded(|| {
         let main = "set(A 1)\nset(B 2)\nset(C 3)\n";
         let mut session = start(&[("/w/main.cmake", main)], Run::Script("main.cmake"));
         let client = &mut session.client;
-        client.handshake(&[("/w/main.cmake", &[1, 2, 3])], &[]);
-        for _ in 0..3 {
-            client.stop().unwrap();
-            let frame = client.frame_ids()[0];
-            // Queue queries and a resume without waiting. Every query gets a response.
+        client.handshake(&[("/w/main.cmake", &[2])], &[]);
+        client.stop().unwrap();
+        let frame = client.frame_ids()[0].to_string();
+        let queue = |client: &mut Client, count: usize| {
             let mut seqs = Vec::new();
-            for _ in 0..20 {
-                seqs.push(client.send("scopes", &format!(r#"{{"frameId":{frame}}}"#)));
-                seqs.push(client.send(
-                    "evaluate",
-                    &format!(r#"{{"expression":"A","frameId":{frame}}}"#),
-                ));
-                seqs.push(client.send("variables", r#"{"variablesReference":1}"#));
+            for _ in 0..count {
+                for (index, (command, arguments, _)) in QUERIES.iter().enumerate() {
+                    seqs.push((
+                        index,
+                        client.send(command, &arguments.replace("FRAME", &frame)),
+                    ));
+                }
             }
-            seqs.push(client.send("continue", r#"{"threadId":1}"#));
-            for _ in 0..5 {
-                seqs.push(client.send("variables", r#"{"variablesReference":1}"#));
-            }
-            for seq in seqs {
-                let response = client.response(seq);
-                assert!(get(&response, &["success"]).as_bool().unwrap());
-            }
+            seqs
+        };
+        let before = queue(client, 20);
+        let resume = client.send("continue", r#"{"threadId":1}"#);
+        let after = queue(client, 200);
+        for (index, seq) in before {
+            let response = client.response(seq);
+            assert!(get(&response, &["success"]).as_bool().unwrap());
+            let body = text(get(&response, &["body"]));
+            let served = match index {
+                0 => body.starts_with(r#"{"scopes":[{"#),
+                1 => body == r#"{"result":"1","type":"string","variablesReference":0}"#,
+                _ => body.starts_with(r#"{"variables":["#),
+            };
+            assert!(served || body == QUERIES[index].2, "{body}");
         }
+        let resumed = client.response(resume);
+        assert!(get(&resumed, &["success"]).as_bool().unwrap());
+        for (index, seq) in after {
+            let response = client.response(seq);
+            assert_eq!(text(get(&response, &["body"])), QUERIES[index].2);
+        }
+        let exited = client.event("exited");
+        assert_eq!(get(&exited, &["body", "exitCode"]).as_i64().unwrap(), 0);
+        client.request("disconnect", "{}");
+        assert_eq!(wait(session).0, 0);
+    });
+}
+
+#[test]
+fn disconnect_answers_the_queued_queries_first() {
+    bounded(|| {
+        let main = "set(A 1)\nset(B 2)\n";
+        let mut session = start(&[("/w/main.cmake", main)], Run::Script("main.cmake"));
+        let client = &mut session.client;
+        client.handshake(&[("/w/main.cmake", &[2])], &[]);
+        client.stop().unwrap();
+        let mut seqs = Vec::new();
+        for _ in 0..50 {
+            seqs.push(client.send("variables", r#"{"variablesReference":1}"#));
+        }
+        let disconnect = client.send("disconnect", "{}");
+        for seq in seqs {
+            let response = client.response(seq);
+            assert!(get(&response, &["success"]).as_bool().unwrap());
+        }
+        let response = client.response(disconnect);
+        assert!(get(&response, &["success"]).as_bool().unwrap());
+        assert_eq!(wait(session).0, 0);
+    });
+}
+
+#[test]
+fn oversize_breakpoint_requests_fail_and_the_session_continues() {
+    bounded(|| {
+        let mut session = start(
+            &[("/w/main.cmake", "set(A 1)\n")],
+            Run::Script("main.cmake"),
+        );
+        let client = &mut session.client;
+        client.handshake(&[], &[]);
+        let long = format!("/w/{}", "a".repeat(5000));
+        let response = client.request(
+            "setBreakpoints",
+            &format!(r#"{{"source":{{"path":"{long}"}},"breakpoints":[{{"line":1}}]}}"#),
+        );
+        assert_eq!(string(get(&response, &["message"])), "Source path too long");
+        let path = format!("/w/{}", "b".repeat(4000));
+        let lines = vec![r#"{"line":1}"#; 4096].join(",");
+        let response = client.request(
+            "setBreakpoints",
+            &format!(r#"{{"source":{{"path":"{path}"}},"breakpoints":[{lines}]}}"#),
+        );
+        assert!(!get(&response, &["success"]).as_bool().unwrap());
+        assert_eq!(
+            string(get(&response, &["message"])),
+            "Breakpoint response too large"
+        );
+        let response = client.request(
+            "setBreakpoints",
+            r#"{"source":{"path":"main.cmake"},"breakpoints":[{"line":1}]}"#,
+        );
+        let rows = get(&response, &["body", "breakpoints"]).as_array().unwrap();
+        assert_eq!(string(get(&rows[0], &["source", "path"])), "/w/main.cmake");
         assert_eq!(client.finish(), 0);
         wait(session);
+    });
+}
+
+/// Most bytes in the JSON text of one response body (`budget::MAX_RESPONSE_BYTES`).
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+#[test]
+fn deep_stack_with_huge_arguments_stays_in_the_response_budget() {
+    bounded(|| {
+        // 40 nested macro calls. A macro body has the substituted arguments, so each
+        // inner call has a 64 KiB argument of control bytes: 2.5 MiB of values, but
+        // 15 MiB of JSON text after escaping. The body of `m<n>` is on line 3 + 3n.
+        let mut main = String::from("fill(BIG 65536)\nmacro(m0 a)\n  set(STOP 1)\nendmacro()\n");
+        for depth in 1..40 {
+            main.push_str(&format!(
+                "macro(m{depth} a)\n  m{}(\"${{a}}\")\nendmacro()\n",
+                depth - 1
+            ));
+        }
+        main.push_str("m39(\"${BIG}\")\n");
+        let mut session = start(
+            &[("/w/main.cmake", main.as_str())],
+            Run::Script("main.cmake"),
+        );
+        let client = &mut session.client;
+        client.handshake(&[("/w/main.cmake", &[3])], &[]);
+        assert_eq!(client.reason(), "breakpoint");
+        let format = r#""format":{"parameters":true,"parameterValues":true,"line":true}"#;
+        let names = |client: &mut Client, arguments: &str| {
+            let response = client.request(
+                "stackTrace",
+                &format!(r#"{{"threadId":1,{arguments}{format}}}"#),
+            );
+            let body = get(&response, &["body"]);
+            assert!(text(body).len() <= MAX_RESPONSE_BYTES);
+            assert_eq!(get(body, &["totalFrames"]).as_i64(), Some(41));
+            get(body, &["stackFrames"])
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| string(get(row, &["name"])))
+                .collect::<Vec<String>>()
+        };
+        // Every frame is in the response. The outer frames whose values do not fit show
+        // `(...)`.
+        let all = names(client, "");
+        assert_eq!(all.len(), 41);
+        assert_eq!(all[0], "set(STOP, 1) Line: 3");
+        assert!(all[1].starts_with("m0(\u{1}\u{1}"));
+        assert!(all[1].ends_with("\u{1}) Line: 6"));
+        let omitted = all.iter().position(|name| name.contains("(...)")).unwrap();
+        assert!(omitted > 2, "{omitted}");
+        assert!(all[omitted..40].iter().all(|name| name.contains("(...)")));
+        // The outermost call has its short argument as written.
+        assert_eq!(all[40], "m39(${BIG}) Line: 122");
+        // A page of outer frames has room for their values.
+        let page = names(client, r#""startFrame":38,"levels":2,"#);
+        assert_eq!(page.len(), 2);
+        assert!(page[0].starts_with("m37(\u{1}"));
+        assert!(page[1].starts_with("m38(\u{1}") && page[1].ends_with(") Line: 120"));
+        let ids = client.frame_ids();
+        let response = client.request("stackTrace", r#"{"threadId":1,"startFrame":39,"levels":2}"#);
+        let paged: Vec<i64> = get(&response, &["body", "stackFrames"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| get(row, &["id"]).as_i64().unwrap())
+            .collect();
+        assert_eq!(paged, ids[39..]);
+        // The stop resumes and the run ends.
+        assert_eq!(client.finish(), 0);
+        assert_eq!(wait(session).0, 0);
+    });
+}
+
+#[test]
+fn large_variable_scope_pages_within_the_response_budget() {
+    bounded(|| {
+        // 400 variables of 8 KiB control bytes: 3.1 MiB of values, but 19 MiB of JSON
+        // text after escaping.
+        let mut main = String::from("fill(BIG 8192)\n");
+        for index in 0..400 {
+            main.push_str(&format!("set(V{index:03} \"${{BIG}}\")\n"));
+        }
+        main.push_str("set(STOP 1)\n");
+        let mut session = start(
+            &[("/w/main.cmake", main.as_str())],
+            Run::Script("main.cmake"),
+        );
+        let client = &mut session.client;
+        client.handshake(&[("/w/main.cmake", &[402])], &[]);
+        assert_eq!(client.reason(), "breakpoint");
+        let frame = client.frame_ids()[0];
+        let scopes = client.request("scopes", &format!(r#"{{"frameId":{frame}}}"#));
+        let scope = &get(&scopes, &["body", "scopes"]).as_array().unwrap()[0];
+        let root = client.rows(get(scope, &["variablesReference"]).as_i64().unwrap());
+        let (_, total, locals) = root.iter().find(|row| row.0 == "Locals").unwrap().clone();
+        let total: usize = total.parse().unwrap();
+        assert!(total > 400);
+        let page = |client: &mut Client, arguments: String| {
+            let response = client.request("variables", &arguments);
+            let body = get(&response, &["body"]).clone();
+            assert!(text(&body).len() <= MAX_RESPONSE_BYTES);
+            get(&body, &["variables"])
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| string(get(row, &["name"])))
+                .collect::<Vec<String>>()
+        };
+        let all = page(client, format!(r#"{{"variablesReference":{locals}}}"#));
+        assert!(all.len() > 100 && all.len() < 400, "{}", all.len());
+        // Each page starts at its `start` row and has at most `count` rows.
+        let start = all.iter().position(|name| name == "V010").unwrap();
+        let rows = page(
+            client,
+            format!(r#"{{"variablesReference":{locals},"start":{start},"count":3}}"#),
+        );
+        assert_eq!(rows, ["V010", "V011", "V012"]);
+        let rows = page(
+            client,
+            format!(r#"{{"variablesReference":{locals},"start":{}}}"#, all.len()),
+        );
+        assert!(!rows.is_empty() && rows.len() <= total - all.len());
+        assert_eq!(client.finish(), 0);
+        assert_eq!(wait(session).0, 0);
     });
 }
 

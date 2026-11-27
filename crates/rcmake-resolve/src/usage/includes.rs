@@ -138,8 +138,61 @@ impl UsageResolver<'_> {
             .flat_map(|_| [&directory.binary_dir, &directory.source_dir])
             .filter(|path| !path.is_empty())
             .map(|path| (BT::new(path.clone(), Default::default()), Vec::new()));
+        // CMake automatically adds Swift module output directories of linked Swift
+        // dependencies as include search paths (`cmGeneratorTarget_IncludeDirectories.cxx:96-139`).
+        let mut swift_module_dirs = Vec::new();
+        if ctx.language.as_deref().map(Vec::as_slice) == Some(b"Swift") {
+            let (direct, _) = self.usage_links(target, false, &ctx)?;
+            let mut visited_direct = HashSet::from([target]);
+            for dep_id in direct.iter().flat_map(|item| item.edge_targets()) {
+                if !visited_direct.insert(dep_id) {
+                    continue;
+                }
+                let dep = self.target(dep_id)?;
+                if dep.is_imported() {
+                    continue;
+                }
+                if !self
+                    .target_compile_languages(dep_id, &ctx.config)?
+                    .contains(b"Swift".as_slice())
+                {
+                    continue;
+                }
+                let dep = self.target(dep_id)?;
+                let mod_dir =
+                    crate::lower::swift::module_directory(self.model, dep, &ctx.config, self)?;
+                if !mod_dir.is_empty() {
+                    swift_module_dirs.push((BT::new(mod_dir, Default::default()), Vec::new()));
+                }
+                let mut seen_iface = HashSet::from([target, dep_id]);
+                self.collect_swift_interface_module_dirs(
+                    dep_id,
+                    &ctx,
+                    &mut seen_iface,
+                    &mut swift_module_dirs,
+                )?;
+            }
+        }
+        let mut standard_includes = Vec::new();
+        if let Some(lang) = ctx.language.as_deref() {
+            let key = [
+                b"CMAKE_".as_slice(),
+                lang.as_slice(),
+                b"_STANDARD_INCLUDE_DIRECTORIES",
+            ]
+            .concat();
+            if let Some(raw) = definition(self.model, owner.dir, &key) {
+                for dir in rcmake_base::list::split(raw, rcmake_base::list::Empty::Drop) {
+                    if !dir.is_empty() {
+                        standard_includes.push((BT::new(dir, Default::default()), Vec::new()));
+                    }
+                }
+            }
+        }
+        let has_standard = !standard_includes.is_empty();
         let mut seen = HashSet::new();
         let mut includes: Vec<_> = current_dirs
+            .chain(swift_module_dirs)
             .chain(
                 usage.entries.into_iter().zip(
                     chains
@@ -151,20 +204,26 @@ impl UsageResolver<'_> {
             .map(|(mut path, hops)| {
                 let len = without_trailing_slashes(&path.value).len();
                 path.value.truncate(len);
-                (path, hops)
+                (path, hops, false)
             })
-            .filter(|(path, _)| seen.insert(path.value.clone()))
-            .map(|(path, hops)| {
+            .chain(standard_includes.into_iter().map(|(mut path, hops)| {
+                let len = without_trailing_slashes(&path.value).len();
+                path.value.truncate(len);
+                (path, hops, true)
+            }))
+            .filter(|(path, _, _)| seen.insert(path.value.clone()))
+            .map(|(path, hops, standard_sys)| {
                 (
                     InterfaceInclude {
-                        system: has_system && system.contains(path.value.as_slice()),
+                        system: standard_sys
+                            || (has_system && system.contains(path.value.as_slice())),
                         path,
                     },
                     hops,
                 )
             })
             .collect();
-        if has_system {
+        if has_system || has_standard {
             includes.sort_by_key(|(include, _)| include.system);
         }
         if record && let Some(provenance) = self.provenance.as_mut() {
@@ -180,6 +239,41 @@ impl UsageResolver<'_> {
             }
         }
         Ok(includes.into_iter().map(|(include, _)| include).collect())
+    }
+
+    fn collect_swift_interface_module_dirs(
+        &mut self,
+        owner: TargetId,
+        ctx: &EvalContext,
+        seen: &mut HashSet<TargetId>,
+        out: &mut Vec<(BT<rcmake_base::BString>, Vec<crate::Hop>)>,
+    ) -> Result<(), ResolveError> {
+        let (iface_links, _) = self.usage_links(owner, true, ctx)?;
+        for dep_id in iface_links.iter().flat_map(|item| item.edge_targets()) {
+            if !seen.insert(dep_id) {
+                continue;
+            }
+            let dep = self.target(dep_id)?;
+            if !dep.is_imported()
+                && self
+                    .target_compile_languages(dep_id, &ctx.config)?
+                    .contains(b"Swift".as_slice())
+            {
+                let dep = self.target(dep_id)?;
+                // Mirrors `AddLangSpecificInterfaceIncludeDirectories` (`cmGeneratorTarget_IncludeDirectories.cxx:76`).
+                let raw_dir = dep
+                    .props
+                    .get(b"Swift_MODULE_DIRECTORY")
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| self.model.dir(dep.dir).binary_dir.clone());
+                if !raw_dir.is_empty() {
+                    out.push((BT::new(raw_dir, Default::default()), Vec::new()));
+                }
+            }
+            self.collect_swift_interface_module_dirs(dep_id, ctx, seen, out)?;
+        }
+        Ok(())
     }
 }
 

@@ -139,6 +139,66 @@ pub(crate) fn resolve_link(
         };
         fragments.push(link_fragment(text, option, LinkFragmentRole::Flags));
     }
+    if language == b"Swift" && kind != LinkKind::StaticArchive {
+        // Mirrors `cmLinkLineComputer::ComputeLinkPath` (`cmLinkLineComputer.cxx:132-159`):
+        // Swift links emit `<LIBRARY_PATH_FLAG><dir>` for every linked library target.
+        let mut swift_dirs = BString::default();
+        for item in link_items(&items) {
+            if let ResolvedLinkKind::Library(dep_id) = item.kind
+                && let Some(dep) = model.target(dep_id)
+                && matches!(
+                    dep.kind,
+                    rcmake_model::TargetKind::StaticLibrary
+                        | rcmake_model::TargetKind::SharedLibrary
+                )
+            {
+                let dep_file = resolved
+                    .get(&dep_id)
+                    .and_then(|facts| {
+                        facts
+                            .artifacts
+                            .import_file
+                            .as_ref()
+                            .or(facts.artifacts.file.as_ref())
+                    })
+                    .cloned()
+                    .or_else(|| {
+                        usage.artifact(
+                            dep_id,
+                            ArtifactKind::ImportFile,
+                            ArtifactPart::Full,
+                            &ctx.config,
+                        )
+                    })
+                    .or_else(|| {
+                        usage.artifact(dep_id, ArtifactKind::File, ArtifactPart::Full, &ctx.config)
+                    });
+                if let Some(file) = dep_file {
+                    let dir = Lexical::new(&file).parent();
+                    if !dir.is_empty() {
+                        if !swift_dirs.is_empty() {
+                            swift_dirs.push(b' ');
+                        }
+                        if naming.path.ends_with(b" ") {
+                            swift_dirs.extend_from_slice(naming.path);
+                            swift_dirs.extend_from_slice(&quote(dir));
+                            swift_dirs.extend_from_slice(naming.path_terminator);
+                        } else {
+                            swift_dirs.extend_from_slice(&quote(
+                                &[naming.path, dir, naming.path_terminator].concat(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if !swift_dirs.is_empty() {
+            fragments.push(LinkFragment {
+                text: BT::new(swift_dirs, Default::default()),
+                role: LinkFragmentRole::LibraryPath,
+            });
+        }
+    }
     for directory in &directories {
         let text = quote(&[naming.path, directory.value.as_slice()].concat());
         fragments.push(link_fragment(

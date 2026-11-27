@@ -6,11 +6,13 @@ pub(crate) mod autogen;
 pub(crate) mod compile;
 pub(crate) mod cuda;
 pub use cuda::ide_flags as cuda_ide_flags;
+pub use cuda::runtime::codemodel_runtime_link_fragments;
 pub(crate) mod fortran;
 pub use fortran::{fortran_depend_info_json, fortran_make_depend_info};
 pub(crate) mod custom;
 pub(crate) mod framework;
 mod graph;
+pub(crate) mod hip;
 mod install;
 mod install_rpath;
 mod launcher;
@@ -21,6 +23,8 @@ mod pch;
 mod policy_flags;
 mod shell;
 mod standard;
+pub(crate) mod swift;
+pub use swift::{swift_compilation_mode, swift_package_name};
 
 #[cfg(test)]
 mod property_tests;

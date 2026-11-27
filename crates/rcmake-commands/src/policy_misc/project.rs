@@ -18,8 +18,6 @@ const METADATA: [&str; 5] = [
 ];
 
 pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
-    // The include hooks and the language setup run in this span. The first outer
-    // `project()` that returns successfully ends the initial configure setup.
     cx.begin_replay_setup();
     let result = configure_project(cx, args);
     crate::configure::finish_probe_prelude(cx);

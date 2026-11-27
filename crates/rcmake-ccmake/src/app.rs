@@ -89,9 +89,11 @@ impl App {
             .map(|entry| entry.name.as_slice())
     }
 
-    /// Drain pending edits to pass to [`crate::CacheDriver::configure`].
-    pub fn take_pending_edits(&mut self) -> Vec<EntryEdit> {
-        self.cache.take_pending_edits()
+    /// The pending edits to pass to [`crate::CacheDriver::configure`]. They stay
+    /// pending until [`Self::finish_configure`] gets a report that consumed them.
+    #[must_use]
+    pub fn pending_edits(&self) -> Vec<EntryEdit> {
+        self.cache.pending_edits()
     }
 
     /// Feed directory entries back into an active path editor after [`Effect::CompletePath`].
@@ -107,6 +109,9 @@ impl App {
         let failed = report.exit_code != 0;
         let explicit_new = report.new_entries;
         self.log_lines = report.lines;
+        if !report.edits_pending {
+            self.cache.clear_pending_edits();
+        }
 
         let mut any_new = !explicit_new.is_empty();
         if let Some(snapshot) = reloaded {
@@ -151,7 +156,6 @@ impl App {
 
     /// Process a single [`Key`] event and return the requested [`Effect`].
     pub fn handle(&mut self, key: Key, cols: u16, rows: u16) -> Effect {
-        // If resized below minimum size mid-session, only allow quitting.
         if cols < MIN_WIDTH || rows < MIN_HEIGHT {
             return match key {
                 Key::Char('q') | Key::Ctrl(b'c') => Effect::Quit(0),
@@ -512,7 +516,6 @@ impl App {
             self.selected / page_size
         };
 
-        // Top-right page header on row 0.
         let header = page_header(current_page_zero + 1, total_pages);
         let header_w = u16::try_from(header.len()).unwrap_or(cols);
         screen.put_str(0, cols.saturating_sub(header_w), &header, Style::default());
@@ -584,7 +587,6 @@ impl App {
             }
         }
 
-        // Status bar at row `rows - 5` (reverse video).
         let status_row = rows.saturating_sub(5);
         let reverse = Style {
             bold: false,
@@ -610,7 +612,6 @@ impl App {
             screen.put_str(status_row, 0, "EMPTY CACHE: ", reverse);
         }
 
-        // Bottom 4 rows: key legend (or edit/search hints).
         let keys_top = rows.saturating_sub(4);
         match &self.mode {
             Mode::Browse if busy_message.is_none() => {

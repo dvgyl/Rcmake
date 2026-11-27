@@ -53,10 +53,17 @@ pub(crate) enum ArchPhase {
 /// assignment to that variable cannot change this target. Rcmake checks the syntax
 /// of an explicit target property before it passes architecture names to the compiler.
 pub(crate) fn target_architectures(target: &Target) -> Result<ArchSpec, BString> {
-    let value = target.props.get(b"CUDA_ARCHITECTURES");
+    target_architectures_for(target, b"CUDA")
+}
+
+/// Read the `<LANG>_ARCHITECTURES` property for `CUDA` or NVIDIA-platform `HIP`.
+pub(crate) fn target_architectures_for(target: &Target, lang: &[u8]) -> Result<ArchSpec, BString> {
+    let prop = [lang, b"_ARCHITECTURES"].concat();
+    let value = target.props.get(&prop);
     parse_architectures(value.map_or(b"".as_slice(), |value| value.as_slice())).map_err(|error| {
         format!(
-            "Invalid CUDA_ARCHITECTURES property for target \"{}\". {error}",
+            "Invalid {} property for target \"{}\". {error}",
+            BString::from(prop),
             target.name
         )
         .into()
@@ -151,19 +158,31 @@ pub(crate) fn expand_architectures(
     target: &Target,
     spec: &ArchSpec,
 ) -> Result<Vec<CudaArch>, BString> {
-    let key: &[u8] = match spec {
+    expand_architectures_for(model, target, spec, b"CUDA")
+}
+
+pub(crate) fn expand_architectures_for(
+    model: &ProjectModel,
+    target: &Target,
+    spec: &ArchSpec,
+    lang: &[u8],
+) -> Result<Vec<CudaArch>, BString> {
+    let suffix: &[u8] = match spec {
         ArchSpec::Empty | ArchSpec::Off => return Ok(Vec::new()),
         ArchSpec::List(list) => return Ok(list.clone()),
-        ArchSpec::All => b"CMAKE_CUDA_ARCHITECTURES_ALL",
-        ArchSpec::AllMajor => b"CMAKE_CUDA_ARCHITECTURES_ALL_MAJOR",
-        ArchSpec::Native => b"CMAKE_CUDA_ARCHITECTURES_NATIVE",
+        ArchSpec::All => b"_ARCHITECTURES_ALL",
+        ArchSpec::AllMajor => b"_ARCHITECTURES_ALL_MAJOR",
+        ArchSpec::Native => b"_ARCHITECTURES_NATIVE",
     };
+    let key = [b"CMAKE_", lang, suffix].concat();
     let values =
-        definition(model, target.dir, key).map_or(b"".as_slice(), |value| value.as_slice());
+        definition(model, target.dir, &key).map_or(b"".as_slice(), |value| value.as_slice());
     if matches!(spec, ArchSpec::Native) && values.is_empty() {
-        return Err(
-            "CUDA_ARCHITECTURES is set to \"native\", but no NVIDIA GPU was detected.".into(),
-        );
+        return Err(format!(
+            "{}_ARCHITECTURES is set to \"native\", but no NVIDIA GPU was detected.",
+            BString::from(lang)
+        )
+        .into());
     }
     parse_list(values)
 }
@@ -178,39 +197,66 @@ pub(crate) fn architecture_flags(
     config: &ConfigId,
     in_try_compile: bool,
 ) -> (Vec<BString>, Vec<Diagnostic>) {
-    let spec = match target_architectures(target) {
+    architecture_flags_for(model, target, b"CUDA", phase, config, in_try_compile)
+}
+
+/// Emit NVIDIA/Clang CUDA-grammar architecture flags for `lang` (`CUDA` or NVIDIA-platform `HIP`).
+pub(crate) fn architecture_flags_for(
+    model: &ProjectModel,
+    target: &Target,
+    lang: &[u8],
+    phase: ArchPhase,
+    config: &ConfigId,
+    in_try_compile: bool,
+) -> (Vec<BString>, Vec<Diagnostic>) {
+    let spec = match target_architectures_for(target, lang) {
         Ok(spec) => spec,
         Err(body) => return (Vec::new(), vec![fatal(target, None, body)]),
     };
+    let arch_prop = [lang, b"_ARCHITECTURES"].concat();
     if spec == ArchSpec::Empty {
         // Compiler checks can run before the parent selects an architecture.
-        if in_try_compile && target.props.get(b"CUDA_ARCHITECTURES").is_none() {
+        if in_try_compile && target.props.get(&arch_prop).is_none() {
             return (Vec::new(), Vec::new());
+        }
+        if lang == b"CUDA" {
+            return (
+                Vec::new(),
+                empty_diagnostic(target, in_try_compile)
+                    .into_iter()
+                    .collect(),
+            );
         }
         return (
             Vec::new(),
-            empty_diagnostic(target, in_try_compile)
-                .into_iter()
-                .collect(),
+            vec![fatal(
+                target,
+                None,
+                format!(
+                    "{}_ARCHITECTURES is empty for target \"{}\".",
+                    BString::from(lang),
+                    target.name
+                )
+                .into(),
+            )],
         );
     }
     if spec == ArchSpec::Off {
         return (Vec::new(), Vec::new());
     }
 
-    let get = |key: &[u8]| {
-        definition(model, target.dir, key).map_or(b"".as_slice(), |value| value.as_slice())
+    let get = |suffix: &[u8]| {
+        let key = [b"CMAKE_", lang, suffix].concat();
+        definition(model, target.dir, &key).map_or(b"".as_slice(), |value| value.as_slice())
     };
-    let compiler = get(b"CMAKE_CUDA_COMPILER_ID");
-    let version = get(b"CMAKE_CUDA_COMPILER_VERSION");
+    let compiler = get(b"_COMPILER_ID");
+    let version = get(b"_COMPILER_VERSION");
     let at_least = |minimum: &[u8]| version::compare(version, minimum).is_ge();
     if compiler == b"NVIDIA" {
         let mode = match spec {
             ArchSpec::All if at_least(b"11.5") => Some("-arch=all"),
             ArchSpec::AllMajor if at_least(b"11.5") => Some("-arch=all-major"),
-            ArchSpec::Native
-                if at_least(b"11.6") && !get(b"CMAKE_CUDA_ARCHITECTURES_NATIVE").is_empty() =>
-            {
+            ArchSpec::Native if at_least(b"11.6") && !get(b"_ARCHITECTURES_NATIVE").is_empty() => {
                 Some("-arch=native")
             }
             _ => None,
@@ -220,16 +266,16 @@ pub(crate) fn architecture_flags(
         }
     }
 
-    let architectures = match expand_architectures(model, target, &spec) {
+    let architectures = match expand_architectures_for(model, target, &spec, lang) {
         Ok(architectures) => architectures,
         Err(body) => return (Vec::new(), vec![fatal(target, None, body)]),
     };
     let mut flags = Vec::new();
     let mut diagnostics = Vec::new();
     if compiler == b"NVIDIA" {
-        let ipo = ipo_enabled(model, target, config, b"CUDA");
+        let ipo = ipo_enabled(model, target, config, lang);
         if ipo && phase == ArchPhase::Link {
-            flags.extend(shell_arguments(get(b"CMAKE_CUDA_LINK_OPTIONS_IPO")));
+            flags.extend(shell_arguments(get(b"_LINK_OPTIONS_IPO")));
         }
         flags.extend(
             architectures
@@ -237,9 +283,10 @@ pub(crate) fn architecture_flags(
                 .map(|arch| nvidia_flag(arch, phase, ipo)),
         );
     } else if compiler == b"Clang" && phase == ArchPhase::Compile {
+        let separable_prop = [lang, b"_SEPARABLE_COMPILATION"].concat();
         let separable = target
             .props
-            .get(b"CUDA_SEPARABLE_COMPILATION")
+            .get(&separable_prop)
             .is_some_and(|value| truth::is_on(value));
         let modern = at_least(b"20.0");
         for arch in &architectures {
@@ -264,10 +311,10 @@ pub(crate) fn ipo_enabled(
     config: &ConfigId,
     lang: &[u8],
 ) -> bool {
-    if lang == b"CUDA"
+    if matches!(lang, b"CUDA" | b"HIP")
         && [
-            b"CUDA_ARCHITECTURES".as_slice(),
-            b"CUDA_SEPARABLE_COMPILATION",
+            [lang, b"_ARCHITECTURES"].concat(),
+            [lang, b"_SEPARABLE_COMPILATION"].concat(),
         ]
         .iter()
         .any(|key| {

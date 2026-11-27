@@ -227,7 +227,9 @@ fn merge_probe_graphs(
                     cfg.0
                 )));
             };
-            if let BuildStep::Custom(custom) = step
+            let is_swift_action = graph.swift_actions.contains_key(&orig_step);
+            if !is_swift_action
+                && let BuildStep::Custom(custom) = step
                 && !custom.symbolic
                 && !custom.outputs.is_empty()
                 && let Some(&existing) = self.shared_custom.get(&custom.outputs)
@@ -237,7 +239,8 @@ fn merge_probe_graphs(
                 return Ok(existing);
             }
             let merged_idx = self.merged.steps.len();
-            if let BuildStep::Custom(custom) = step
+            if !is_swift_action
+                && let BuildStep::Custom(custom) = step
                 && !custom.symbolic
                 && !custom.outputs.is_empty()
             {
@@ -246,6 +249,9 @@ fn merge_probe_graphs(
                     .or_insert(merged_idx);
             }
             self.merged.steps.push(step.clone());
+            if let Some(action) = graph.swift_actions.get(&orig_step) {
+                self.merged.swift_actions.insert(merged_idx, action.clone());
+            }
             self.step_map.insert(key, merged_idx);
             Ok(merged_idx)
         }
@@ -268,6 +274,12 @@ fn merge_probe_graphs(
                     .swift_output_file_maps
                     .entry(path.clone())
                     .or_insert_with(|| content.clone());
+            }
+            for (path, extra) in &graph.link_extra_outputs {
+                self.merged
+                    .link_extra_outputs
+                    .entry(path.clone())
+                    .or_insert_with(|| extra.clone());
             }
             let merged_idx = self.merged.targets.len();
             self.target_map.insert(key, merged_idx);

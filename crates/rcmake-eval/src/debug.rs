@@ -213,7 +213,6 @@ impl Interp {
             return;
         };
         f(hook.as_mut(), &DebugView { interp: self });
-        // A hook method can not replace the hook, so the slot is still empty.
         self.debugger = Some(hook);
     }
 

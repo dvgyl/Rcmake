@@ -86,10 +86,15 @@ pub(crate) fn emit(
             invocation,
             response_file,
         } => {
+            // Match `cmNinjaNormalTargetGenerator.cxx:1114-1133`: ignore
+            // `CMAKE_NINJA_FORCE_RESPONSE_FILE` on CUDA device links and trigger a
+            // response file only when the full rendered command (including the fixed
+            // driver prefix and flags) exceeds the platform command-line length budget.
+            let rendered = graph.command_line(from_ref(invocation), false);
             let rsp: BString = [raw_output.as_slice(), b".rsp"].concat().into();
             let response = response_file
                 .as_ref()
-                .filter(|_| graph.command_settings.force || invocation.shell.len() > 7_500)
+                .filter(|_| graph.command_exceeds_budget(&rendered))
                 .and_then(|response| response.rewrite(invocation, &rsp));
             let rule: &[u8] = if response.is_some() {
                 b"CUDA_DEVICE_LINK_RSP"
@@ -296,7 +301,8 @@ mod tests {
     }
 
     #[test]
-    fn forced_device_response_file_preserves_input_order() -> Result<(), GenError> {
+    fn device_response_file_ignores_global_force_and_triggers_on_command_budget()
+    -> Result<(), GenError> {
         let build = Path::new(if cfg!(windows) { "C:/build" } else { "/build" });
         let input = BuildGraph::default();
         let mut graph = Graph::new(&input, &BTreeMap::new(), build, None)?;
@@ -316,12 +322,29 @@ mod tests {
                 }),
             },
         };
-        let mut ninja = Ninja::default();
-        assert!(emit(&mut ninja, &graph, &step, &[], &[]));
-        let text = String::from_utf8_lossy(&ninja.0);
-        assert!(text.contains("CUDA_DEVICE_LINK_RSP"));
-        assert!(text.contains("COMMAND = nvcc -dlink --options-file device.o.rsp -o device.o"));
-        assert!(text.contains("RSP_ARGS = 'a b.o' c.o -lcudart"));
+        // Short device link stays inline even when `CMAKE_NINJA_FORCE_RESPONSE_FILE` is set.
+        let mut short_ninja = Ninja::default();
+        assert!(emit(&mut short_ninja, &graph, &step, &[], &[]));
+        let short_text = String::from_utf8_lossy(&short_ninja.0);
+        assert!(short_text.contains("CUDA_DEVICE_LINK "), "{short_text}");
+        assert!(!short_text.contains("CUDA_DEVICE_LINK_RSP"), "{short_text}");
+
+        // Exceeding the platform command-line budget (deducting driver command prefix)
+        // switches to `CUDA_DEVICE_LINK_RSP` and preserves input order and flag.
+        graph.command_settings.force = false;
+        graph.commands.posix_limit = 40;
+        let mut long_ninja = Ninja::default();
+        assert!(emit(&mut long_ninja, &graph, &step, &[], &[]));
+        let long_text = String::from_utf8_lossy(&long_ninja.0);
+        assert!(long_text.contains("CUDA_DEVICE_LINK_RSP"), "{long_text}");
+        assert!(
+            long_text.contains("COMMAND = nvcc -dlink --options-file device.o.rsp -o device.o"),
+            "{long_text}"
+        );
+        assert!(
+            long_text.contains("RSP_ARGS = 'a b.o' c.o -lcudart"),
+            "{long_text}"
+        );
         Ok(())
     }
 }

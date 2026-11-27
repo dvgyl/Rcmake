@@ -539,14 +539,13 @@ fn explicit_plan_emits_one_registration_header() -> Result<(), ResolveError> {
             compile.argv.first().map(|arg| arg.as_slice()),
             Some(b"clang".as_slice())
         );
-        assert!(
-            compile
-                .argv
-                .iter()
-                .any(|arg| arg == b"-DFATBINFILE=\"CMakeFiles/cuda app.dir/cmake_cuda_fatbin.h\"")
-        );
-        assert!(compile.argv.iter().any(|arg| arg
-            == b"-DREGISTERLINKBINARYFILE=\"CMakeFiles/cuda app.dir/cmake_cuda_register.h\""));
+        assert!(compile.argv.iter().any(
+            |arg| arg == b"-DFATBINFILE=\"/build/CMakeFiles/cuda app.dir/cmake_cuda_fatbin.h\""
+        ));
+        assert!(compile.argv.iter().any(|arg| {
+            arg
+            == b"-DREGISTERLINKBINARYFILE=\"/build/CMakeFiles/cuda app.dir/cmake_cuda_register.h\""
+        }));
     } else {
         return Err(ResolveError::Message(
             "Expected explicit device linking.".into(),
@@ -593,5 +592,157 @@ fn clang_19_device_link_expands_named_architectures() -> Result<(), Box<dyn std:
                 .collect::<Vec<_>>(),
         );
     }
+    Ok(())
+}
+
+#[test]
+fn explicit_resolve_device_symbols_links_cuda_archive_by_path_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_host::{Host, PureHost, WriteMode};
+    use rcmake_model::{GeneratorKind, LinkItem, UsageScope};
+
+    let host = PureHost::default();
+    host.create_dir_all(std::path::Path::new("/src"))?;
+    host.write(
+        std::path::Path::new("/src/main.cpp"),
+        b"int main() { return 0; }\n",
+        WriteMode::Truncate,
+    )?;
+
+    let mut model = ProjectModel::default();
+    model.generator = Some(GeneratorKind::Ninja);
+    model.set_root_dirs("/src".into(), "/build".into());
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "CXX;CUDA".into());
+    let root = model.dir_mut(DirId::ROOT);
+    root.vars
+        .insert("CMAKE_CXX_COMPILER".into(), "/usr/bin/c++".into());
+    root.vars
+        .insert("CMAKE_CXX_SOURCE_FILE_EXTENSIONS".into(), "cpp".into());
+    root.vars.insert(
+        "CMAKE_CXX_LINK_EXECUTABLE".into(),
+        "<CMAKE_CXX_COMPILER> <FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>".into(),
+    );
+    root.vars
+        .insert("CMAKE_CUDA_COMPILER".into(), "/cuda/bin/nvcc".into());
+    root.vars
+        .insert("CMAKE_CUDA_COMPILER_ID".into(), "NVIDIA".into());
+    root.vars.insert(
+        "CMAKE_CUDA_COMPILER_HAS_DEVICE_LINK_PHASE".into(),
+        "ON".into(),
+    );
+    root.vars.insert(
+        "CMAKE_CUDA_DEVICE_LINK_EXECUTABLE".into(),
+        "<CMAKE_CUDA_COMPILER> -dlink <OBJECTS> -o <TARGET> <LINK_LIBRARIES>".into(),
+    );
+
+    let mut app = target("app", TargetKind::Executable);
+    app.sources
+        .push(BT::new("main.cpp".into(), Backtrace::default()));
+    app.props
+        .set("CUDA_RESOLVE_DEVICE_SYMBOLS".into(), "ON".into());
+    app.usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(LinkItem {
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
+            scope: Some(UsageScope::Private),
+            text: BT::new("/libs/libkernels.a".into(), Backtrace::default()),
+            lookup_dir: DirId::ROOT,
+        });
+    let mut plain_model = model.clone();
+    model.add_target(app)?;
+
+    let mut plain_app = target("plain_app", TargetKind::Executable);
+    plain_app
+        .sources
+        .push(BT::new("main.cpp".into(), Backtrace::default()));
+    plain_app
+        .usage
+        .link_libraries
+        .get_or_insert_with(Vec::new)
+        .push(LinkItem {
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
+            scope: Some(UsageScope::Private),
+            text: BT::new("/libs/libkernels.a".into(), Backtrace::default()),
+            lookup_dir: DirId::ROOT,
+        });
+    plain_model.add_target(plain_app)?;
+
+    let result = crate::resolve(&model, &host, &[ConfigId::default()])?;
+    let graph = result.graphs.first().ok_or("missing graph")?;
+    let device_steps: Vec<_> = graph
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            crate::BuildStep::DeviceLink {
+                lang,
+                output,
+                inputs,
+                ..
+            } => Some((lang, output, inputs)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(device_steps.len(), 1, "expected one CUDA DeviceLink step");
+    assert_eq!(device_steps[0].0, "CUDA");
+    let dlink_obj = device_steps[0].1;
+    assert!(
+        device_steps[0]
+            .2
+            .iter()
+            .any(|input| input == "/libs/libkernels.a"),
+        "expected /libs/libkernels.a in device-link inputs: {:?}",
+        device_steps[0].2
+    );
+
+    let link_step = graph
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            crate::BuildStep::Link {
+                inputs,
+                invocations,
+                ..
+            } => Some((inputs, invocations)),
+            _ => None,
+        })
+        .ok_or("missing host Link step")?;
+    assert_eq!(
+        link_step
+            .0
+            .iter()
+            .filter(|input| *input == dlink_obj)
+            .count(),
+        1,
+        "host link inputs must consume device-link object exactly once: {:?}",
+        link_step.0
+    );
+    let argv_count: usize = link_step
+        .1
+        .iter()
+        .map(|inv| inv.argv.iter().filter(|arg| *arg == dlink_obj).count())
+        .sum();
+    assert_eq!(
+        argv_count, 1,
+        "host link argv must consume device-link object exactly once: {:?}",
+        link_step.1
+    );
+
+    // Without CUDA_RESOLVE_DEVICE_SYMBOLS=ON, no CUDA target is in the link closure so
+    // no DeviceLink step is emitted.
+    let without = crate::resolve(&plain_model, &host, &[ConfigId::default()])?;
+    let without_graph = without.graphs.first().ok_or("missing graph")?;
+    assert!(
+        !without_graph
+            .steps
+            .iter()
+            .any(|step| matches!(step, crate::BuildStep::DeviceLink { .. })),
+        "unexpected DeviceLink without explicit CUDA_RESOLVE_DEVICE_SYMBOLS"
+    );
     Ok(())
 }

@@ -37,6 +37,9 @@ const SETUP_VERSION: u64 = 1;
 /// Most names in the cache ledger and the setup environment reads.
 const MAX_LEDGER: usize = 16384;
 
+/// Longest name in the setup environment reads.
+const MAX_ENV_NAME: usize = 4096;
+
 /// One named part of a setup digest.
 pub(super) type Domain = (String, JournalDigest);
 
@@ -219,7 +222,7 @@ impl SetupSession {
         if self.depth == 0 || self.record.env.iter().any(|(known, _)| known == name) {
             return;
         }
-        if self.record.env.len() >= MAX_LEDGER || name.len() > 4096 {
+        if self.record.env.len() >= MAX_LEDGER || name.len() > MAX_ENV_NAME {
             self.env_overflow = true;
         } else {
             self.record.env.push((name.to_vec(), digest));
@@ -254,7 +257,6 @@ impl SetupSession {
             ))
         });
         match previous {
-            // Without a previous record, no listfile can replay anyway.
             None if self.previous.is_none() => {}
             None => self.poison("new setup checkpoint"),
             Some((previous, was_determined)) => {
@@ -301,8 +303,6 @@ impl SetupSession {
         let mut ledger = changed.clone();
         if let Some(previous) = &self.previous {
             let known: BTreeMap<_, _> = previous.cache.iter().cloned().collect();
-            // The same edit in both configures is the same user input, so its value
-            // after setup can differ between a cold and a warm configure.
             let edits: BTreeMap<_, _> = self.record.edits.iter().cloned().collect();
             let same_edit = |name: &[u8]| {
                 edits
@@ -491,8 +491,6 @@ impl Interp {
 
         let mut hash = JournalHasher::new(b"setup-targets");
         for (_, target) in self.project.targets() {
-            // Each field that a listfile can observe. An internal change counter of
-            // the target is not part of the digest.
             let fields = (
                 (&target.name, &target.kind, &target.origin, &target.dir),
                 (&target.backtrace, &target.policies, &target.props),
@@ -517,10 +515,10 @@ impl Interp {
                     hash.field(2, format!("{flags:?} {raw}").as_bytes());
                 }
                 Command::User(user) => {
-                    // Listfile replay rejects every call of a scripted command, so a
-                    // definition can change a recorded listfile only through that
-                    // check. A stock module definition depends only on the module
-                    // tree, but the cold and warm configures define different sets.
+                    // Listfile replay rejects every call of a scripted command and
+                    // every `if(COMMAND)` query, so a stock module definition cannot
+                    // change a replayed listfile. A cold and a warm configure define
+                    // different sets of stock commands.
                     let file = &user.body.file;
                     if file.starts_with(modules)
                         && file.get(modules.len()).is_some_and(|byte| *byte == b'/')
@@ -598,10 +596,27 @@ fn encode_digests(
     })
 }
 
+fn decode_digest(item: &Value) -> Result<(Vec<u8>, Option<JournalDigest>), FieldError> {
+    let (name, digest) = codec::from_pair(item)?;
+    Ok((codec::from_bytes(name)?, Option::from_json(digest)?))
+}
+
 fn decode_digests(value: &Value) -> Result<Digests, FieldError> {
+    codec::from_list(value, decode_digest)
+}
+
+/// Decode a ledger with the limits of its writer: at most [`MAX_LEDGER`] names
+/// of at most `max_name` bytes each.
+fn decode_ledger(value: &Value, max_name: usize) -> Result<Digests, FieldError> {
+    if rcmake_json::array(value)?.len() > MAX_LEDGER {
+        return Err(FieldError::invalid("Too many setup ledger entries."));
+    }
     codec::from_list(value, |item| {
-        let (name, digest) = codec::from_pair(item)?;
-        Ok((codec::from_bytes(name)?, Option::from_json(digest)?))
+        let entry = decode_digest(item)?;
+        if entry.0.len() > max_name {
+            return Err(FieldError::invalid("Setup ledger name is too long."));
+        }
+        Ok(entry)
     })
 }
 
@@ -657,15 +672,22 @@ impl FromJson for SetupRecord {
         if codec::field(obj, "version", u64::from_json)? != SETUP_VERSION {
             return Err(FieldError::invalid("Unsupported setup record version."));
         }
+        let determined = codec::field(obj, "determined", Vec::<bool>::from_json)?;
+        let checkpoints = codec::field(obj, "checkpoints", |value| {
+            if rcmake_json::array(value)?.len() != determined.len() {
+                return Err(FieldError::invalid(
+                    "Setup checkpoints differ in number from their determinations.",
+                ));
+            }
+            codec::from_list(value, decode_domains)
+        })?;
         Ok(Self {
             inputs: codec::field(obj, "inputs", decode_domains)?,
-            cache: codec::field(obj, "cache", decode_digests)?,
-            checkpoints: codec::field(obj, "checkpoints", |value| {
-                codec::from_list(value, decode_domains)
-            })?,
-            determined: codec::field(obj, "determined", Vec::<bool>::from_json)?,
+            cache: codec::field(obj, "cache", |value| decode_ledger(value, usize::MAX))?,
+            checkpoints,
+            determined,
             edits: codec::field(obj, "edits", decode_digests)?,
-            env: codec::field(obj, "env", decode_digests)?,
+            env: codec::field(obj, "env", |value| decode_ledger(value, MAX_ENV_NAME))?,
             sources: codec::field(obj, "sources", |value| {
                 codec::from_list(value, |item| {
                     let (path, digest) = codec::from_pair(item)?;

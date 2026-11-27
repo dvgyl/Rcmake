@@ -1359,3 +1359,165 @@ fn mixed_c_cxx_swift_target_emits_swift_includes_even_with_per_language_flags() 
         "{shared_settings}"
     );
 }
+
+#[test]
+fn swift_cmp0157_cmp0216_cmp0226_and_defines_xcode_settings() {
+    use rcmake_diag::{PolicyId, PolicyStatus};
+
+    let host = PureHost::default();
+    let source = Path::new("/source");
+    let build = Path::new("/build");
+    let mut model = model(source, build);
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "Swift".into());
+    define(&mut model, "PROJECT_NAME", "DemoPkg");
+    define(&mut model, "XCODE_VERSION", "16.0");
+    define(&mut model, "CMAKE_Swift_COMPILER", "/usr/bin/swiftc");
+    define(&mut model, "CMAKE_Swift_SOURCE_FILE_EXTENSIONS", "swift");
+    define(
+        &mut model,
+        "CMAKE_Swift_COMPILATION_MODE_DEFAULT",
+        "incremental",
+    );
+    let mut policies = rcmake_diag::PolicyMap::default();
+    let _ = policies.set(PolicyId::new(157), PolicyStatus::New);
+    let _ = policies.set(PolicyId::new(216), PolicyStatus::New);
+    let _ = policies.set(PolicyId::new(226), PolicyStatus::New);
+    host.seed_file(&source.join("lib.swift"), b"")
+        .expect("seed swift");
+    let lib = add(
+        &mut model,
+        "swlib",
+        TargetKind::StaticLibrary,
+        Some("lib.swift"),
+    );
+    {
+        let target = model.target_mut(lib).expect("swlib");
+        target.policies.policies = policies;
+        target
+            .props
+            .set("Swift_COMPILATION_MODE".into(), "wholemodule".into());
+        target
+            .props
+            .set("Swift_LANGUAGE_VERSION".into(), "6".into());
+        target
+            .props
+            .set("Swift_MODULE_NAME".into(), "CustomMod".into());
+        target.usage.push(
+            rcmake_model::UsageField::CompileDefinitions,
+            BT::new("FEATURE_A=1".into(), Default::default()),
+        );
+        target.usage.push(
+            rcmake_model::UsageField::CompileDefinitions,
+            BT::new("FEATURE_B".into(), Default::default()),
+        );
+        target.usage.push(
+            rcmake_model::UsageField::CompileOptions,
+            BT::new("-warnings-as-errors".into(), Default::default()),
+        );
+    }
+
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, build).expect("generate project");
+    let pbx = read(&host, &build.join("DemoPkg.xcodeproj/project.pbxproj"));
+    let settings = debug_settings(&pbx, "swlib");
+    assert!(
+        settings.contains("SWIFT_COMPILATION_MODE = wholemodule;"),
+        "{settings}"
+    );
+    assert!(settings.contains("SWIFT_VERSION = 6;"), "{settings}");
+    assert!(
+        settings.contains("PRODUCT_MODULE_NAME = CustomMod;"),
+        "{settings}"
+    );
+    assert!(
+        settings.contains("SWIFT_PACKAGE_NAME = DemoPkg;"),
+        "{settings}"
+    );
+    let swift_conds = settings
+        .lines()
+        .find(|line| line.contains("SWIFT_ACTIVE_COMPILATION_CONDITIONS"))
+        .unwrap_or_default();
+    assert!(
+        swift_conds.contains("FEATURE_A")
+            && swift_conds.contains("FEATURE_B")
+            && !swift_conds.contains("FEATURE_A=1"),
+        "{settings}"
+    );
+    assert!(
+        settings.contains("OTHER_SWIFT_FLAGS") && settings.contains("-warnings-as-errors"),
+        "{settings}"
+    );
+}
+
+#[test]
+fn swift_empty_package_clears_cmp0216_and_compilation_mode_reports_warning_and_genex_error() {
+    use rcmake_diag::{PolicyId, PolicyStatus};
+
+    let host = PureHost::default();
+    let source = Path::new("/source");
+    let build = Path::new("/build");
+    let mut model = model(source, build);
+    model
+        .global
+        .props
+        .set("ENABLED_LANGUAGES".into(), "Swift".into());
+    define(&mut model, "PROJECT_NAME", "DemoPkg");
+    define(&mut model, "XCODE_VERSION", "16.0");
+    define(&mut model, "CMAKE_Swift_COMPILER", "/usr/bin/swiftc");
+    define(&mut model, "CMAKE_Swift_SOURCE_FILE_EXTENSIONS", "swift");
+    define(
+        &mut model,
+        "CMAKE_Swift_COMPILATION_MODE_DEFAULT",
+        "incremental",
+    );
+    let mut policies = rcmake_diag::PolicyMap::default();
+    let _ = policies.set(PolicyId::new(157), PolicyStatus::New);
+    let _ = policies.set(PolicyId::new(216), PolicyStatus::New);
+    host.seed_file(&source.join("lib.swift"), b"")
+        .expect("seed swift");
+    let lib = add(
+        &mut model,
+        "swlib",
+        TargetKind::StaticLibrary,
+        Some("lib.swift"),
+    );
+    {
+        let target = model.target_mut(lib).expect("swlib");
+        target.policies.policies = policies;
+        target.props.set("Swift_PACKAGE_NAME".into(), "".into());
+        target
+            .props
+            .set("Swift_COMPILATION_MODE".into(), "bogusmode".into());
+    }
+
+    let result = resolved(&model, &host);
+    generate(&result, &model, &host, build).expect("generate project");
+    let pbx = read(&host, &build.join("DemoPkg.xcodeproj/project.pbxproj"));
+    let settings = debug_settings(&pbx, "swlib");
+    assert!(
+        !settings.contains("SWIFT_PACKAGE_NAME"),
+        "Explicit empty Swift_PACKAGE_NAME should clear CMP0216 NEW fallback: {settings}"
+    );
+    let stderr =
+        String::from_utf8_lossy(&host.stream_bytes(rcmake_host::Stream::Stderr)).into_owned();
+    assert!(
+        stderr.contains("Unknown Swift_COMPILATION_MODE on target 'swlib'"),
+        "Expected unknown Swift_COMPILATION_MODE warning on stderr, got: {stderr}"
+    );
+
+    // Invalid generator expression in Swift_COMPILATION_MODE must return an error.
+    model
+        .target_mut(lib)
+        .expect("swlib")
+        .props
+        .set("Swift_COMPILATION_MODE".into(), "$<NOT_A_GENEX:1>".into());
+    let err = generate(&result, &model, &host, build)
+        .expect_err("Expected invalid Swift_COMPILATION_MODE genex to fail");
+    assert!(
+        !err.to_string().is_empty(),
+        "Expected non-empty error for invalid Swift_COMPILATION_MODE genex"
+    );
+}

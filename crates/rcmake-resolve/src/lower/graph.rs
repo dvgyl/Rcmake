@@ -235,10 +235,17 @@ pub(crate) fn lower_with_inputs_workers(
                 &artifacts,
                 &commands,
                 precompiled,
+                &resolved_targets,
                 (&lint, &framework_dirs),
                 fortran.get(&resolved.id),
                 usage,
-                (&mut graph.steps, 0, &mut graph.compile_launchers),
+                compile::CompileSink {
+                    steps: &mut graph.steps,
+                    step_offset: 0,
+                    compile_launchers: &mut graph.compile_launchers,
+                    swift_actions: &mut graph.swift_actions,
+                    swift_output_file_maps: &mut graph.swift_output_file_maps,
+                },
                 (compile_inputs, ide.pch.get_mut(&resolved.id)),
             )?;
             let mut sink = GraphSink {
@@ -392,6 +399,9 @@ pub(crate) fn lower_with_inputs_workers(
             graph
                 .swift_output_file_maps
                 .extend(out.swift_output_file_maps);
+            for (step, action) in out.swift_actions {
+                graph.swift_actions.insert(remap(step), action);
+            }
             graph.link_descriptions.extend(out.link_descriptions);
             if let Some(source_steps) = out.custom_source_steps {
                 graph.custom_source_steps.insert(out.id, source_steps);
@@ -610,6 +620,7 @@ struct TargetPlan<'a> {
     source_file_inputs: IndexMap<BString, IndexSet<BString>>,
     dependencies: IndexSet<TargetId>,
     ide_steps: Option<Vec<IdeCustomStep>>,
+    swift_module_output: Option<BString>,
 }
 
 impl<'a> TargetPlan<'a> {
@@ -636,6 +647,7 @@ impl<'a> TargetPlan<'a> {
             source_file_inputs: IndexMap::new(),
             dependencies,
             ide_steps: resolved.ide.as_ref().map(|_| Vec::new()),
+            swift_module_output: None,
         }
     }
 
@@ -846,7 +858,53 @@ impl<'a> TargetPlan<'a> {
                 ..
             } = &mut link
             {
+                // Ensure split Swift link/archive edges depend on the target's own
+                // config-specific `.swiftmodule`, including custom module directories.
+                if let Some(module_output) = &self.swift_module_output
+                    && !inputs.contains(module_output)
+                    && !implicit_inputs.contains(module_output)
+                {
+                    implicit_inputs.push(module_output.clone());
+                }
                 if step.language == b"Swift" && super::compile::is_one_step_swift(model, target) {
+                    let link_ctx = EvalContext {
+                        config: config.clone(),
+                        link_language: Some(step.language.clone()),
+                        traversal: rcmake_genex::UsageTraversal::Link,
+                        ..Default::default()
+                    };
+                    if let Ok(items) = usage.collect_link_items(resolved.id, &link_ctx) {
+                        for dep_id in items.iter().flat_map(|item| item.targets()) {
+                            if dep_id == resolved.id {
+                                continue;
+                            }
+                            let Some(dep) = model.target(dep_id) else {
+                                continue;
+                            };
+                            if dep.is_imported() || !super::swift::is_importable(dep) {
+                                continue;
+                            }
+                            let uses_swift = match resolved_targets.get(&dep_id) {
+                                Some(dep_resolved) => dep_resolved
+                                    .compile_groups
+                                    .iter()
+                                    .any(|group| group.language == b"Swift"),
+                                None => usage
+                                    .target_compile_languages(dep_id, config)
+                                    .is_ok_and(|langs| langs.contains(b"Swift".as_slice())),
+                            };
+                            if uses_swift {
+                                let mod_name = super::swift::module_name(dep);
+                                if let Ok(dep_mod) =
+                                    super::swift::module_path(model, dep, config, &mod_name, usage)
+                                    && !inputs.contains(&dep_mod)
+                                    && !implicit_inputs.contains(&dep_mod)
+                                {
+                                    implicit_inputs.push(dep_mod);
+                                }
+                            }
+                        }
+                    }
                     for unit in &resolved.compile_units {
                         let is_swift = resolved
                             .compile_groups
@@ -1096,6 +1154,7 @@ struct TargetLowerOutput {
     install_name_dirs: IndexMap<BString, BString>,
     link_extra_outputs: IndexMap<BString, Vec<BString>>,
     swift_output_file_maps: IndexMap<BString, BString>,
+    swift_actions: IndexMap<usize, crate::SwiftAction>,
     link_descriptions: IndexMap<BString, BString>,
     custom_source_steps: Option<IndexSet<usize>>,
     file_set_order: Option<crate::FileSetOrder>,
@@ -1222,14 +1281,23 @@ fn lower_one_target_parallel(
     let mut steps = Vec::new();
     let mut compile_launchers = IndexMap::new();
     let mut compile_inputs = BTreeMap::new();
+    let mut swift_actions = IndexMap::new();
+    let mut swift_output_file_maps = IndexMap::new();
     let objects = plan.add_compile_steps(
         &artifacts,
         commands,
         precompiled,
+        resolved_targets,
         (&lint, &framework_dirs),
         None,
         usage,
-        (&mut steps, rule_count, &mut compile_launchers),
+        compile::CompileSink {
+            steps: &mut steps,
+            step_offset: rule_count,
+            compile_launchers: &mut compile_launchers,
+            swift_actions: &mut swift_actions,
+            swift_output_file_maps: &mut swift_output_file_maps,
+        },
         (&mut compile_inputs, target_ide_pch.as_mut()),
     )?;
     let mut utility_steps = IndexSet::new();
@@ -1237,7 +1305,6 @@ fn lower_one_target_parallel(
     let mut link_runtime_paths = IndexMap::new();
     let mut install_name_dirs = IndexMap::new();
     let mut link_extra_outputs = IndexMap::new();
-    let mut swift_output_file_maps = IndexMap::new();
     let mut link_descriptions = IndexMap::new();
     let mut sink = GraphSink {
         steps: &mut steps,
@@ -1291,6 +1358,7 @@ fn lower_one_target_parallel(
         install_name_dirs,
         link_extra_outputs,
         swift_output_file_maps,
+        swift_actions,
         link_descriptions,
         custom_source_steps,
         file_set_order,

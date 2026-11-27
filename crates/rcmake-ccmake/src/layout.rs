@@ -8,6 +8,15 @@ pub const MIN_WIDTH: u16 = 65;
 /// Minimum required terminal height (rows).
 pub const MIN_HEIGHT: u16 = 6;
 
+/// Most screen cells (columns × rows) that the editor allocates.
+pub const MAX_CELLS: usize = 1 << 20;
+
+/// Return whether a `cols` × `rows` screen is inside [`MAX_CELLS`].
+#[must_use]
+pub const fn fits_cell_budget(cols: u16, rows: u16) -> bool {
+    (cols as usize).saturating_mul(rows as usize) <= MAX_CELLS
+}
+
 /// Error message emitted when terminal initialization fails.
 pub const ERR_INIT_FAILED: &str = "Error: ncurses initialization failed\n";
 

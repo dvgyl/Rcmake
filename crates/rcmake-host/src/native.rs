@@ -17,7 +17,7 @@ use crate::error::{HostError, HostResult, SyntheticError};
 use crate::{
     CopyOptions, DirEntry, FILE_CHUNK_SIZE, FileKind, FileLockGuard, FileTime, Follow,
     GracefulTimeout, Host, Metadata, ReadRange, RunOutput, RunRequest, Stream, SystemInfo,
-    WriteMode, validate_run,
+    WriteMode, WriteScope, validate_run,
 };
 
 #[cfg(unix)]
@@ -643,9 +643,27 @@ impl Host for NativeHost {
     }
 
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
+        self.run_bounded_streaming(req, limit, &mut |_, _| {})
+    }
+
+    fn run_bounded_streaming(
+        &self,
+        req: &RunRequest,
+        limit: usize,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
         validate_run(req, HostError::require_absolute)?;
-        process::run_pipeline(req, None, limit, &mut |_, _| {}, None, None)
-            .map(|result| result.output)
+        process::run_pipeline(req, None, limit, on_output, None, None).map(|result| result.output)
+    }
+
+    fn run_bounded_confined_streaming(
+        &self,
+        req: &RunRequest,
+        limit: usize,
+        _scope: WriteScope<'_>,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        self.run_bounded_streaming(req, limit, on_output)
     }
 
     fn write_out(&self, stream: Stream, bytes: &[u8]) {

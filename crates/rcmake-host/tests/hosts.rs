@@ -520,3 +520,54 @@ mod forwarding {
         assert!(!rcmake_host::Host::supports_process_execution(&host));
     }
 }
+
+#[test]
+fn pure_streamed_output_reaches_the_callback_and_not_the_capture() {
+    let host = PureHost::default();
+    host.set_command_handler(|_, _, emit| {
+        emit(Stream::Stderr, b"live");
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(0)],
+            stdout: vec![b'x'; 4096],
+            stderr: b"live".to_vec(),
+        })
+    })
+    .expect("handler");
+    let command = CommandSpec {
+        program: BString::from("scripted"),
+        args: Vec::new(),
+    };
+    let mut req = request(&host.initial_cwd(), vec![command]);
+    req.stdout = Output::Stream;
+    let mut chunks = Vec::new();
+    let output = host
+        .run_bounded_streaming(&req, 16, &mut |stream, bytes| {
+            chunks.push((stream, bytes.len()));
+        })
+        .expect("run");
+    assert_eq!(chunks, [(Stream::Stdout, 4096)]);
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"live");
+}
+
+#[cfg(unix)]
+#[test]
+fn native_streamed_output_is_outside_the_capture_limit() {
+    let host = NativeHost::new().expect("native host");
+    let mut req = request(
+        &host.initial_cwd(),
+        vec![shell("head -c 1048576 /dev/zero; printf err >&2")],
+    );
+    req.stdout = Output::Stream;
+    let mut streamed = 0;
+    let output = host
+        .run_bounded_streaming(&req, 8, &mut |stream, bytes| {
+            assert_eq!(stream, Stream::Stdout);
+            streamed += bytes.len();
+        })
+        .expect("run");
+    assert_eq!(streamed, 1 << 20);
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"err");
+    assert_eq!(output.results, [ProcessResult::Exited(0)]);
+}

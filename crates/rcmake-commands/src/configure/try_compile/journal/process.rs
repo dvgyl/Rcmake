@@ -131,8 +131,8 @@ impl JournalHost<'_> {
         });
         let private = self.private_path(&request.cwd)
             && request.stdin != Input::Inherit
-            && request.stdout != Output::Inherit
-            && request.stderr != Output::Inherit
+            && !request.stdout.is_live()
+            && !request.stderr.is_live()
             && (self.mode == JournalMode::Observe || !request.tee);
         if !bounded || !private {
             return self

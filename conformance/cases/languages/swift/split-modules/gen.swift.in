@@ -1,0 +1,2 @@
+// MOCK_EXPORT gen_val = 8
+public func genVal() -> Int { return 8 }

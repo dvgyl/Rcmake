@@ -668,6 +668,8 @@ fn initialize_linux_package(
 struct PublishStageDir<'a> {
     host: &'a dyn Host,
     path: PathBuf,
+    /// Backups that a failed rollback could not restore. They stay in the directory.
+    kept: Vec<PathBuf>,
 }
 
 impl<'a> PublishStageDir<'a> {
@@ -682,6 +684,7 @@ impl<'a> PublishStageDir<'a> {
                     return Ok(Self {
                         host,
                         path: candidate,
+                        kept: Vec::new(),
                     });
                 }
                 Err(err) if err.kind == ErrorKind::AlreadyExists => {}
@@ -694,7 +697,19 @@ impl<'a> PublishStageDir<'a> {
 
 impl Drop for PublishStageDir<'_> {
     fn drop(&mut self) {
-        let _ = self.host.remove_dir_all(&self.path);
+        if self.kept.is_empty() {
+            let _ = self.host.remove_dir_all(&self.path);
+            return;
+        }
+        let Ok(entries) = self.host.read_dir(&self.path) else {
+            return;
+        };
+        for entry in entries {
+            let path = self.path.join(to_native(&entry.name));
+            if !self.kept.contains(&path) {
+                let _ = self.host.remove_file(&path);
+            }
+        }
     }
 }
 
@@ -764,7 +779,8 @@ fn backup_existing_destination(
 ///    retain a backup of any pre-existing destination files inside the private staging directory.
 /// 3. Rename the staged package and every staged checksum into place in deterministic order.
 ///    If any rename fails, roll back all earlier replacements for that package (restoring backed-up
-///    files or removing newly created files) before returning the error.
+///    files or removing newly created files) before returning the error. A backup that the
+///    rollback cannot restore stays in the staging directory, and the error names its path.
 /// 4. Emit package and checksum success log lines only after the entire set commits.
 ///
 /// This provides lock-serialized replacement and error rollback across independent file renames;
@@ -802,7 +818,7 @@ fn publish(
             )));
         }
 
-        let stage_dir = PublishStageDir::new(host, output)?;
+        let mut stage_dir = PublishStageDir::new(host, output)?;
         let staged_package = if package != &dest {
             let tmp = stage_temp_path(host, &stage_dir.path, &file.to_string())?;
             let mut reader = host.open_read(package)?;
@@ -882,12 +898,23 @@ fn publish(
             if let Err(commit_err) = host.rename(&staged_tmp, &dest_path) {
                 let mut rollback_errors = Vec::new();
                 for (prev_dest, prev_backup) in committed.into_iter().rev() {
-                    let result = match prev_backup {
-                        Some(backup_path) => host.rename(&backup_path, &prev_dest),
+                    let result = match &prev_backup {
+                        Some(backup_path) => host.rename(backup_path, &prev_dest),
                         None => host.remove_file(&prev_dest),
                     };
-                    if let Err(err) = result {
-                        rollback_errors.push(format!("{}: {err}", prev_dest.display()));
+                    let Err(err) = result else {
+                        continue;
+                    };
+                    match prev_backup {
+                        Some(backup_path) => {
+                            rollback_errors.push(format!(
+                                "{}: {err} (previous file kept at {})",
+                                prev_dest.display(),
+                                backup_path.display()
+                            ));
+                            stage_dir.kept.push(backup_path);
+                        }
+                        None => rollback_errors.push(format!("{}: {err}", prev_dest.display())),
                     }
                 }
                 if rollback_errors.is_empty() {

@@ -111,7 +111,7 @@ impl Command<'_> {
     }
 
     pub(super) fn wrap(
-        self,
+        &self,
         model: &ProjectModel,
         target: &Target,
         invocation: Invocation,

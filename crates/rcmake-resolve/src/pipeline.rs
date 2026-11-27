@@ -1469,6 +1469,7 @@ fn resolve_config(
     let model = std_model.as_ref().map_or(model, |(model, _)| model);
     let mut usage = UsageResolver::with_source_paths(model, paths);
     usage.provenance = provenance;
+    usage.seed_target_languages(config, &resolved);
     let providers = std_model.as_ref().map(|(_, bindings)| bindings);
     let provider_ids = providers
         .into_iter()
@@ -1482,6 +1483,7 @@ fn resolve_config(
             inputs.insert(id, target_inputs);
         }
     }
+    usage.seed_target_languages(config, &resolved);
     if paths.ide == Some(ide::IdeFlavor::Xcode) {
         ide::check_xcode_sources(model, paths, xcode_sources, &inputs, config)?;
     }

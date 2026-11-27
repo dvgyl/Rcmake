@@ -163,8 +163,6 @@ pub(crate) fn enable_languages(
         .props
         .get(LANGUAGES_IN_PROGRESS)
         .is_some_and(|value| !value.is_empty());
-    // The toolchain file, the system and compiler modules, and the top-level includes
-    // run in this span, so configure replay restores no listfile here.
     cx.begin_replay_setup();
     let result = if nested {
         setup_languages(cx, languages, optional)

@@ -242,6 +242,33 @@ pub(crate) fn resolve_binary_dir(opts: &Options, host: &dyn Host) -> PathBuf {
     bin.unwrap_or(cwd)
 }
 
+/// Return the cache that a configure of `opts` starts from: the cache file, then the
+/// preset variables, the cache arguments (`-C`, `-D`, `-U`) in order, and the
+/// `PreLoad.cmake` scripts (`cmCursesMainForm::LoadCache`). The function writes no
+/// file.
+pub(crate) fn prepare_cache(
+    argv: Vec<BString>,
+    mut opts: Options,
+    host: Arc<dyn Host>,
+) -> Result<Cache, i32> {
+    let (cmake_command, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), argv.first());
+    let cmake_root = cmake_root.ok_or(1)?;
+    opts.view = true;
+    let exit_code = |exit: Exit| match exit {
+        Exit::Code(code) => code,
+        Exit::Message(_) => 1,
+    };
+    let (mut session, saved) =
+        ConfigureSession::resolve(&argv, opts, Arc::clone(&host)).map_err(exit_code)?;
+    let (runtime, mut interp, _) = session
+        .initialize(saved, cmake_command, cmake_root)
+        .map_err(exit_code)?;
+    let _ = session.apply_cache_edits(&runtime, &mut interp);
+    let cache = std::mem::take(interp.cx().cache());
+    let _ = runtime.finish(false);
+    Ok(cache)
+}
+
 /// Run ONLY the configure phase (writing `CMakeCache.txt` without generating
 /// build files) and return the retained session ready for [`RetainedConfigure::generate`].
 pub(crate) fn configure_only(
@@ -648,8 +675,6 @@ impl<'a> ConfigureSession<'a> {
         if self.opts.persona == Persona::Native {
             stick_diag_style(host, style);
         }
-        // `RCMAKE_REPLAY_SETUP=0` keeps the earlier setup gates. Otherwise the setup
-        // spans and checkpoints of configure replay make these inputs safe.
         if speed.incremental
             && speed::setup_replay_disabled(host)
             && (saved.contains(b"CMAKE_TOOLCHAIN_FILE")

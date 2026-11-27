@@ -171,6 +171,7 @@ struct StepNodes<'a> {
 #[derive(Clone)]
 enum OrderOnly<'a> {
     Targets(Cow<'a, [usize]>),
+    TargetClosure(Cow<'a, [usize]>),
     StepOutputs(usize),
     ObjectOrder(usize),
 }
@@ -396,142 +397,149 @@ impl<'a> Graph<'a> {
         let mut used_synthetic = HashSet::new();
         for (index, step) in input.steps.iter().enumerate() {
             let mut nodes = StepNodes::default();
-            match step {
-                BuildStep::Compile {
-                    object, byproducts, ..
-                } => {
-                    nodes.outputs.push(graph.node(object));
-                    nodes
-                        .byproducts
-                        .extend(byproducts.iter().map(|output| graph.node(output)));
-                }
-                BuildStep::Link {
-                    step, invocations, ..
-                } => {
-                    let real_output = graph.node(&step.output);
-                    nodes.outputs.push(real_output.clone());
-                    if let Some(extra) = input.link_extra_outputs.get(&step.output) {
-                        for output in extra {
-                            let node = graph.node(output);
-                            if !nodes.outputs.contains(&node) {
-                                nodes.outputs.push(node);
+            if let Some(action) = input.swift_actions.get(&index) {
+                nodes
+                    .outputs
+                    .extend(action.outputs.iter().map(|output| graph.node(output)));
+            } else {
+                match step {
+                    BuildStep::Compile {
+                        object, byproducts, ..
+                    } => {
+                        nodes.outputs.push(graph.node(object));
+                        nodes
+                            .byproducts
+                            .extend(byproducts.iter().map(|output| graph.node(output)));
+                    }
+                    BuildStep::Link {
+                        step, invocations, ..
+                    } => {
+                        let real_output = graph.node(&step.output);
+                        nodes.outputs.push(real_output.clone());
+                        if let Some(extra) = input.link_extra_outputs.get(&step.output) {
+                            for output in extra {
+                                let node = graph.node(output);
+                                if !nodes.outputs.contains(&node) {
+                                    nodes.outputs.push(node);
+                                }
+                            }
+                        }
+                        if step.kind == LinkKind::Executable
+                            && let Some(split_at) = invocations.iter().position(is_exe_symlink_call)
+                        {
+                            let symlink_raw = invocations
+                                .get(split_at)
+                                .and_then(|inv| inv.argv.get(4))
+                                .cloned()
+                                .or_else(|| {
+                                    graph
+                                        .step_owner
+                                        .get(&index)
+                                        .and_then(|&owner| input.targets.get(owner))
+                                        .and_then(|target| artifacts.get(target.name.as_slice()))
+                                        .and_then(|set| set.linker_file.clone())
+                                });
+                            if let Some(symlink_raw) = symlink_raw {
+                                let symlink_output = graph.node(&symlink_raw);
+                                if symlink_output != real_output {
+                                    nodes.outputs.retain(|out| out != &symlink_output);
+                                    graph.exe_symlinks.insert(
+                                        index,
+                                        ExecutableSymlink {
+                                            split_at,
+                                            real_output,
+                                            symlink_output,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
-                    if step.kind == LinkKind::Executable
-                        && let Some(split_at) = invocations.iter().position(is_exe_symlink_call)
-                    {
-                        let symlink_raw = invocations
-                            .get(split_at)
-                            .and_then(|inv| inv.argv.get(4))
-                            .cloned()
-                            .or_else(|| {
-                                graph
-                                    .step_owner
-                                    .get(&index)
-                                    .and_then(|&owner| input.targets.get(owner))
-                                    .and_then(|target| artifacts.get(target.name.as_slice()))
-                                    .and_then(|set| set.linker_file.clone())
-                            });
-                        if let Some(symlink_raw) = symlink_raw {
-                            let symlink_output = graph.node(&symlink_raw);
-                            if symlink_output != real_output {
-                                nodes.outputs.retain(|out| out != &symlink_output);
-                                graph.exe_symlinks.insert(
-                                    index,
-                                    ExecutableSymlink {
-                                        split_at,
-                                        real_output,
-                                        symlink_output,
-                                    },
-                                );
-                            }
+                    BuildStep::DeviceLink { output, mode, .. } => {
+                        nodes.outputs.push(graph.node(output));
+                        if let rcmake_resolve::DeviceLinkMode::Explicit {
+                            cubins,
+                            fatbin_header,
+                            register_header,
+                            ..
+                        } = mode
+                        {
+                            nodes
+                                .byproducts
+                                .extend(cubins.iter().map(|cubin| graph.node(&cubin.output)));
+                            nodes
+                                .byproducts
+                                .extend([graph.node(fatbin_header), graph.node(register_header)]);
                         }
                     }
-                }
-                BuildStep::DeviceLink { output, mode, .. } => {
-                    nodes.outputs.push(graph.node(output));
-                    if let rcmake_resolve::DeviceLinkMode::Explicit {
-                        cubins,
-                        fatbin_header,
-                        register_header,
-                        ..
-                    } = mode
-                    {
+                    BuildStep::Scan {
+                        ddi, preprocessed, ..
+                    } => {
+                        nodes.outputs.push(graph.node(ddi));
                         nodes
                             .byproducts
-                            .extend(cubins.iter().map(|cubin| graph.node(&cubin.output)));
-                        nodes
-                            .byproducts
-                            .extend([graph.node(fatbin_header), graph.node(register_header)]);
+                            .extend(preprocessed.iter().map(|output| graph.node(output)));
                     }
-                }
-                BuildStep::Scan {
-                    ddi, preprocessed, ..
-                } => {
-                    nodes.outputs.push(graph.node(ddi));
-                    nodes
-                        .byproducts
-                        .extend(preprocessed.iter().map(|output| graph.node(output)));
-                }
-                BuildStep::Collate {
-                    lang, dd, modmaps, ..
-                } => {
-                    nodes.outputs.push(graph.node(dd));
-                    nodes.byproducts.push(graph.node(&if lang == "Fortran" {
-                        Lexical::new(Lexical::new(dd).parent()).append(b"FortranModules.json")
-                    } else {
-                        modules::modules_json(dd)
-                    }));
-                    nodes
-                        .byproducts
-                        .extend(modmaps.iter().map(|map| graph.node(map)));
-                }
-                BuildStep::Custom(custom) => {
-                    nodes
-                        .outputs
-                        .extend(custom.outputs.iter().map(|name| graph.node(name)));
-                    nodes
-                        .byproducts
-                        .extend(custom.byproducts.iter().map(|name| graph.node(name)));
-                    let owned_utility = if nodes.outputs.is_empty() {
-                        graph.step_owner.get(&index).copied().filter(|&owner| {
-                            graph.target_meta.get(owner).is_some_and(|meta| {
-                                matches!(
-                                    meta.kind,
-                                    TargetKind::Utility
-                                        | TargetKind::InterfaceLibrary
-                                        | TargetKind::GlobalTarget
-                                )
+                    BuildStep::Collate {
+                        lang, dd, modmaps, ..
+                    } => {
+                        nodes.outputs.push(graph.node(dd));
+                        nodes.byproducts.push(graph.node(&if lang == "Fortran" {
+                            Lexical::new(Lexical::new(dd).parent()).append(b"FortranModules.json")
+                        } else {
+                            modules::modules_json(dd)
+                        }));
+                        nodes
+                            .byproducts
+                            .extend(modmaps.iter().map(|map| graph.node(map)));
+                    }
+                    BuildStep::Custom(custom) => {
+                        nodes
+                            .outputs
+                            .extend(custom.outputs.iter().map(|name| graph.node(name)));
+                        nodes
+                            .byproducts
+                            .extend(custom.byproducts.iter().map(|name| graph.node(name)));
+                        let owned_utility = if nodes.outputs.is_empty() {
+                            graph.step_owner.get(&index).copied().filter(|&owner| {
+                                graph.target_meta.get(owner).is_some_and(|meta| {
+                                    matches!(
+                                        meta.kind,
+                                        TargetKind::Utility
+                                            | TargetKind::InterfaceLibrary
+                                            | TargetKind::GlobalTarget
+                                    )
+                                })
                             })
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some(owner) = owned_utility
-                        && let Some(owner_target) = input.targets.get(owner)
-                        && let Some(owner_meta) = graph.target_meta.get(owner)
-                    {
-                        let owner_name = &owner_target.name;
-                        let dir_rel = &owner_meta.dir_rel;
-                        let mut synth = Vec::new();
-                        if !dir_rel.is_empty() {
-                            synth.extend_from_slice(dir_rel);
-                            synth.push(b'/');
+                        } else {
+                            None
+                        };
+                        if let Some(owner) = owned_utility
+                            && let Some(owner_target) = input.targets.get(owner)
+                            && let Some(owner_meta) = graph.target_meta.get(owner)
+                        {
+                            let owner_name = &owner_target.name;
+                            let dir_rel = &owner_meta.dir_rel;
+                            let mut synth = Vec::new();
+                            if !dir_rel.is_empty() {
+                                synth.extend_from_slice(dir_rel);
+                                synth.push(b'/');
+                            }
+                            synth.extend_from_slice(b"CMakeFiles/");
+                            synth.extend_from_slice(owner_name);
+                            let candidate = qualified(&graph.node(&synth), config);
+                            if used_synthetic.insert(candidate.clone()) {
+                                nodes.outputs.push(candidate);
+                            }
                         }
-                        synth.extend_from_slice(b"CMakeFiles/");
-                        synth.extend_from_slice(owner_name);
-                        let candidate = qualified(&graph.node(&synth), config);
-                        if used_synthetic.insert(candidate.clone()) {
-                            nodes.outputs.push(candidate);
+                        if nodes.outputs.is_empty() && !nodes.byproducts.is_empty() {
+                            nodes.outputs = std::mem::take(&mut nodes.byproducts);
                         }
-                    }
-                    if nodes.outputs.is_empty() && !nodes.byproducts.is_empty() {
-                        nodes.outputs = std::mem::take(&mut nodes.byproducts);
-                    }
-                    if nodes.outputs.is_empty() {
-                        let name = BString::from(format!("CMakeFiles/rcmake-custom-{index}.util"));
-                        nodes.outputs.push(qualified(&graph.node(&name), config));
+                        if nodes.outputs.is_empty() {
+                            let name =
+                                BString::from(format!("CMakeFiles/rcmake-custom-{index}.util"));
+                            nodes.outputs.push(qualified(&graph.node(&name), config));
+                        }
                     }
                 }
             }
@@ -1301,7 +1309,8 @@ impl<'a> Graph<'a> {
                     .steps
                     .iter()
                     .filter(|&&idx| {
-                        matches!(self.input.steps.get(idx), Some(BuildStep::Compile { .. }))
+                        self.input.swift_actions.contains_key(&idx)
+                            || matches!(self.input.steps.get(idx), Some(BuildStep::Compile { .. }))
                     })
                     .filter_map(|&idx| self.steps.get(idx))
                     .flat_map(|nodes| nodes.outputs.iter().cloned())
@@ -1515,6 +1524,25 @@ impl<'a> Graph<'a> {
                             }
                         }
                     }
+                    OrderOnly::TargetClosure(indices) => {
+                        let mut visited = HashSet::new();
+                        let mut stack: Vec<usize> = indices.iter().copied().collect();
+                        while let Some(dep_index) = stack.pop() {
+                            if !visited.insert(dep_index) {
+                                continue;
+                            }
+                            if let Some(meta) = self.target_meta.get(dep_index) {
+                                for output in &meta.artifact_outputs {
+                                    if part1_seen.insert(output) {
+                                        dep_artifacts.push(output);
+                                    }
+                                }
+                            }
+                            if let Some(dep_target) = self.input.targets.get(dep_index) {
+                                stack.extend(dep_target.depends.iter().copied());
+                            }
+                        }
+                    }
                     OrderOnly::StepOutputs(index) => {
                         if let Some(step_nodes) = self.steps.get(*index) {
                             for output in step_nodes.outputs.iter().chain(&step_nodes.byproducts) {
@@ -1593,6 +1621,28 @@ impl<'a> Graph<'a> {
                                         dep_artifacts.push(output);
                                     }
                                 }
+                            }
+                        }
+                        dep_artifacts.sort();
+                        order_only.extend(dep_artifacts);
+                    }
+                    OrderOnly::TargetClosure(indices) => {
+                        let mut dep_artifacts: Vec<&BString> = Vec::new();
+                        let mut visited = HashSet::new();
+                        let mut stack: Vec<usize> = indices.iter().copied().collect();
+                        while let Some(dep_index) = stack.pop() {
+                            if !visited.insert(dep_index) {
+                                continue;
+                            }
+                            if let Some(meta) = self.target_meta.get(dep_index) {
+                                for output in &meta.artifact_outputs {
+                                    if seen.insert(output) {
+                                        dep_artifacts.push(output);
+                                    }
+                                }
+                            }
+                            if let Some(dep_target) = self.input.targets.get(dep_index) {
+                                stack.extend(dep_target.depends.iter().copied());
                             }
                         }
                         dep_artifacts.sort();

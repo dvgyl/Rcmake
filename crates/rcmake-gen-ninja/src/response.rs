@@ -184,6 +184,90 @@ impl<'a> Graph<'a> {
         )
     }
 
+    /// Build a response-file invocation for a grouped Swift module or object action
+    /// when `CMAKE_NINJA_FORCE_RESPONSE_FILE` is set or the command exceeds the budget.
+    pub(super) fn swift_response(
+        &self,
+        action: &rcmake_resolve::SwiftAction,
+        invocations: &[Invocation],
+        ordinary: &[u8],
+    ) -> Option<Response> {
+        let dir = action
+            .outputs
+            .first()
+            .map_or(DirId::ROOT, |out| self.target_dir_for_output(out));
+        if !self.use_response(dir, ordinary) {
+            return None;
+        }
+        let file = action.rsp_file.as_slice();
+        if let (Some(rsp_invocation), Some(rsp_args)) = (&action.rsp_invocation, &action.rsp_args) {
+            let contents = if self.commands.windows() {
+                let argv = rcmake_resolve::lower::rule_arguments(rsp_args)?;
+                let mut out = Vec::new();
+                for arg in &argv {
+                    if !out.is_empty() {
+                        out.push(b' ');
+                    }
+                    windows_argument(arg, &mut out, false);
+                }
+                out.into()
+            } else {
+                rsp_args.clone()
+            };
+            if contents.is_empty() {
+                return None;
+            }
+            return Some(Response {
+                rule: response_rule(b"COMPILE")?,
+                file: self.node(file),
+                contents,
+                command: self.command_line(std::slice::from_ref(rsp_invocation), false),
+            });
+        }
+        let [invocation] = invocations else {
+            return None;
+        };
+        if invocation.working_dir.is_some() || invocation.argv.len() < 2 {
+            return None;
+        }
+        let flag = self
+            .language_setting(dir, b"Swift", b"_RESPONSE_FILE_FLAG")
+            .filter(|flag| !flag.is_empty())
+            .map_or(b"@".as_slice(), |value| value.as_slice());
+        let command_file = self.commands.path(file);
+        let mut revised = invocation.clone();
+        let mut contents = Vec::new();
+        for argument in invocation.argv.iter().skip(1) {
+            if !contents.is_empty() {
+                contents.push(b' ');
+            }
+            if self.commands.windows() {
+                windows_argument(argument, &mut contents, false);
+            } else {
+                self.commands.word(argument, &mut contents);
+            }
+        }
+        if contents.is_empty() {
+            return None;
+        }
+        let trimmed = flag.trim_ascii_end();
+        let reference = if trimmed.len() == flag.len() {
+            vec![BString::from([flag, command_file.as_slice()].concat())]
+        } else {
+            vec![BString::from(trimmed), command_file]
+        };
+        revised.argv.splice(1.., reference);
+        if !self.commands.windows() {
+            revised.shell = self.commands.argv(&revised.argv).into();
+        }
+        Some(Response {
+            rule: response_rule(b"COMPILE")?,
+            file: self.node(file),
+            contents: contents.into(),
+            command: self.command_line(std::slice::from_ref(&revised), false),
+        })
+    }
+
     pub(super) fn link_response(
         &self,
         rule: &[u8],
@@ -502,5 +586,70 @@ pub(super) fn emit_rules(ninja: &mut Ninja) {
         ninja.0.extend_from_slice(rule);
         ninja.0.extend_from_slice(b"\n  command = $COMMAND\n  description = $DESC\n  rspfile = $RSP_FILE\n  rspfile_content = $RSP_ARGS\n");
         ninja.0.extend_from_slice(deps);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, path::Path};
+
+    use rcmake_base::BString;
+    use rcmake_gen_common::GenError;
+    use rcmake_resolve::{BuildGraph, Invocation, SwiftAction, SwiftActionKind};
+
+    use super::*;
+
+    #[test]
+    fn swift_response_retains_multi_command_wrappers_and_moves_only_compiler_args()
+    -> Result<(), GenError> {
+        let input = BuildGraph::default();
+        let build = Path::new(if cfg!(windows) { "C:/build" } else { "/build" });
+        let mut graph = Graph::new(&input, &BTreeMap::new(), build, None)?;
+        graph.command_settings.force = true;
+
+        let action = SwiftAction {
+            kind: SwiftActionKind::Objects,
+            module_name: "demo".into(),
+            sources: vec!["../src/a.swift".into()],
+            abs_sources: vec!["/src/a.swift".into()],
+            outputs: vec!["CMakeFiles/demo.dir/a.swift.o".into()],
+            implicit_inputs: Vec::new(),
+            order_only_inputs: Vec::new(),
+            description: "Building Swift Module 'demo' objects with 1 source".into(),
+            rsp_file: "CMakeFiles/demo.dir/demo.o.swift.rsp".into(),
+            rsp_invocation: Some(Invocation {
+                shell: "rule-wrap setup && rule-wrap ccache swiftc -j 4 @CMakeFiles/demo.dir/demo.o.swift.rsp && rule-wrap post".into(),
+                ..Invocation::default()
+            }),
+            rsp_args: Some("-DFLAG -I /inc -c -module-name demo /src/a.swift".into()),
+            single_output: false,
+            restat: true,
+        };
+        let ordinary_inv = Invocation {
+            shell: "rule-wrap setup && rule-wrap ccache swiftc -j 4 -DFLAG -I /inc -c -module-name demo /src/a.swift && rule-wrap post".into(),
+            ..Invocation::default()
+        };
+        let ordinary = graph.command_line(std::slice::from_ref(&ordinary_inv), false);
+        let resp = graph
+            .swift_response(&action, std::slice::from_ref(&ordinary_inv), &ordinary)
+            .expect("expected Swift response file");
+        assert_eq!(resp.rule, b"COMPILE_RSP");
+        assert_eq!(
+            resp.file,
+            BString::from("CMakeFiles/demo.dir/demo.o.swift.rsp")
+        );
+        let cmd = String::from_utf8_lossy(&resp.command);
+        assert!(cmd.contains("rule-wrap setup"), "{cmd}");
+        assert!(
+            cmd.contains("rule-wrap ccache swiftc -j 4 @CMakeFiles/demo.dir/demo.o.swift.rsp"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("rule-wrap post"), "{cmd}");
+        assert!(!cmd.contains("/src/a.swift"), "{cmd}");
+        let args = String::from_utf8_lossy(&resp.contents);
+        assert!(args.contains("-DFLAG"), "{args}");
+        assert!(args.contains("/src/a.swift"), "{args}");
+        assert!(!args.contains("rule-wrap"), "{args}");
+        Ok(())
     }
 }

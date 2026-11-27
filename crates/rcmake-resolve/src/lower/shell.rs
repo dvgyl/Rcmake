@@ -411,6 +411,9 @@ impl RuleExpander<'_> {
             }
             b"CMAKE_RANLIB" => Some(quote(value.unwrap_or(b"ranlib"))),
             b"CMAKE_COMMAND" => Some(quote(value.unwrap_or(b"cmake"))),
+            b"CMAKE_HIP_HOST_LINK_LAUNCHER" | b"CMAKE_CUDA_HOST_LINK_LAUNCHER" => {
+                value.filter(|value| !value.is_empty()).map(quote)
+            }
             b"CMAKE_RC_COMPILER"
                 if self.sysroot == b"CMAKE_SYSROOT_COMPILE"
                     && value.is_some_and(|value| !truth::is_off(value)) =>

@@ -378,7 +378,8 @@ impl<'a> UsageResolver<'a> {
             debug: self.debug_config(ctx),
             traversal: ctx.traversal,
         };
-        if self.source_reads.is_none()
+        if !self.has_language_runtime_libraries
+            && self.source_reads.is_none()
             && let Some(links) = self.link_memo.get(&key)
             && (self.active.is_empty() || !links.1.context_sensitive)
         {
@@ -386,12 +387,16 @@ impl<'a> UsageResolver<'a> {
         }
         let (name, entries) = self.link_entries(owner, interface)?;
         let explicit = self.evaluate_links(owner, name, entries, ctx, !interface, false)?;
-        let (items, flags) =
+        let (mut items, flags) =
             self.effective_links(owner, interface, ctx, explicit.items, explicit.value.flags)?;
+        if self.has_language_runtime_libraries {
+            self.apply_language_runtime_libraries(owner, interface, ctx, &mut items)?;
+        }
         let links: SharedLinks = (items.into_iter().map(Arc::new).collect(), flags);
         // Other expressions can read target properties and enter a usage walk.
         // During a property walk, evaluate any remaining expression to check its depth.
-        if self.source_reads.is_none()
+        if !self.has_language_runtime_libraries
+            && self.source_reads.is_none()
             && (interface || !self.has_injections)
             && (self.active.is_empty() || !flags.context_sensitive)
             && entries.iter().all(|entry| literal_link(&entry.text.value))
@@ -399,6 +404,196 @@ impl<'a> UsageResolver<'a> {
             self.link_memo.insert(key, links.clone());
         }
         Ok(links)
+    }
+
+    /// Resolve `CMAKE_<LANG>_RUNTIME_LIBRARIES_<mode>` imported targets for `CUDA` and `HIP`
+    /// inside the usage and link dependency graph before compile/link lowering
+    /// (`cmGeneratorTarget_Link.cxx:814-864`, `cmEvaluatedTargetProperty.cxx:112-126`,
+    /// `cmComputeLinkDepends.cxx:867-872,1010-1015`).
+    fn apply_language_runtime_libraries(
+        &mut self,
+        owner: TargetId,
+        interface: bool,
+        ctx: &EvalContext,
+        items: &mut Vec<ResolvedLinkItem>,
+    ) -> Result<(), ResolveError> {
+        // Avoid cycles when evaluating SOURCES / INTERFACE_SOURCES or runtime properties
+        // (see `IncludeRuntimeInterface::No` in cmEvaluatedTargetProperty.h).
+        if self.active.iter().any(|(_, prop)| {
+            prop == b"SOURCES"
+                || prop == b"INTERFACE_SOURCES"
+                || prop.ends_with(b"_RUNTIME_LIBRARY")
+        }) {
+            return Ok(());
+        }
+        let target = self.target(owner)?;
+        if matches!(
+            target.kind,
+            TargetKind::Utility | TargetKind::InterfaceLibrary | TargetKind::GlobalTarget
+        ) {
+            return Ok(());
+        }
+        let mut runtime_items = Vec::new();
+        match ctx.traversal {
+            UsageTraversal::Compile => {
+                if interface {
+                    return Ok(());
+                }
+                let Some(lang) = ctx.language.as_deref().map(Vec::as_slice) else {
+                    return Ok(());
+                };
+                if !matches!(lang, b"CUDA" | b"HIP") {
+                    return Ok(());
+                }
+                let matches_active = self
+                    .active_compile_language
+                    .as_ref()
+                    .is_some_and(|(id, active)| *id == owner && active.as_slice() == lang);
+                let uses_lang = if matches_active {
+                    self.has_runtime_default(target, lang)
+                } else {
+                    self.target_uses_runtime_language(owner, lang, false, ctx)?
+                };
+                if uses_lang {
+                    runtime_items
+                        .extend(self.implicit_runtime_links(owner, target, lang, false, ctx)?);
+                }
+                if !runtime_items.is_empty() {
+                    // CMake evaluates LanguageRuntimeLibraries before impl->Libraries in
+                    // AddInterfaceEntries (cmEvaluatedTargetProperty.cxx:118-125).
+                    runtime_items.append(items);
+                    *items = runtime_items;
+                }
+            }
+            UsageTraversal::Link => {
+                for lang in [b"CUDA".as_slice(), b"HIP"] {
+                    if self.target_uses_runtime_language(owner, lang, interface, ctx)? {
+                        let target = self.target(owner)?;
+                        runtime_items.extend(
+                            self.implicit_runtime_links(owner, target, lang, interface, ctx)?,
+                        );
+                    }
+                }
+                if !runtime_items.is_empty() {
+                    items.extend(runtime_items);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn has_runtime_default(&self, target: &Target, lang: &[u8]) -> bool {
+        let default_var = [b"CMAKE_", lang, b"_RUNTIME_LIBRARY_DEFAULT"].concat();
+        super::definition(self.model, target.dir, &default_var)
+            .is_some_and(|value| !value.is_empty())
+    }
+
+    fn target_uses_runtime_language(
+        &mut self,
+        owner: TargetId,
+        lang: &[u8],
+        interface: bool,
+        ctx: &EvalContext,
+    ) -> Result<bool, ResolveError> {
+        let target = self.target(owner)?;
+        if !self.has_runtime_default(target, lang) {
+            return Ok(false);
+        }
+        if target.is_imported() {
+            if !interface {
+                return Ok(false);
+            }
+            return Ok(super::artifacts::imported_property(
+                target,
+                b"IMPORTED_LINK_INTERFACE_LANGUAGES",
+                &ctx.config,
+            )
+            .is_some_and(|(_, langs)| {
+                list::split(&langs, list::Empty::Drop)
+                    .iter()
+                    .any(|item| item.as_slice() == lang)
+            }));
+        }
+        if interface
+            && !matches!(
+                target.kind,
+                TargetKind::StaticLibrary | TargetKind::ObjectLibrary
+            )
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .target_compile_languages(owner, &ctx.config)?
+            .contains(lang))
+    }
+
+    fn implicit_runtime_links(
+        &mut self,
+        owner: TargetId,
+        target: &Target,
+        lang: &[u8],
+        interface: bool,
+        ctx: &EvalContext,
+    ) -> Result<Vec<ResolvedLinkItem>, ResolveError> {
+        let default_var = [b"CMAKE_", lang, b"_RUNTIME_LIBRARY_DEFAULT"].concat();
+        let Some(default) =
+            super::definition(self.model, target.dir, &default_var).filter(|v| !v.is_empty())
+        else {
+            return Ok(Vec::new());
+        };
+        let prop_name = [lang, b"_RUNTIME_LIBRARY"].concat();
+        let mode = if let Some(raw) = target.props.get(&prop_name) {
+            if rcmake_genex::find_genex(raw).is_some() {
+                let evaluated = self.with_property(owner, &prop_name, |this| {
+                    let ast = this.parse_genex(raw)?;
+                    let (value, _) = rcmake_genex::evaluate(&ast, ctx, &mut this.host(target.dir))?;
+                    Ok(value)
+                })?;
+                evaluated.to_ascii_uppercase()
+            } else {
+                raw.to_ascii_uppercase()
+            }
+        } else {
+            default.to_ascii_uppercase()
+        };
+        if mode.is_empty() {
+            return Ok(Vec::new());
+        }
+        let libs_var = [b"CMAKE_", lang, b"_RUNTIME_LIBRARIES_", mode.as_slice()].concat();
+        let Some(raw_libs) =
+            super::definition(self.model, target.dir, &libs_var).filter(|v| !v.is_empty())
+        else {
+            return Ok(Vec::new());
+        };
+        let mut resolved = Vec::new();
+        for name in list::split(raw_libs, list::Empty::Drop) {
+            let Some(id) = self.model.find_target(target.dir, &name) else {
+                continue;
+            };
+            if id == owner {
+                continue;
+            }
+            let kind = match self.target(id)?.kind {
+                TargetKind::ObjectLibrary if !interface => ResolvedLinkKind::Objects(id),
+                TargetKind::InterfaceLibrary | TargetKind::ObjectLibrary => {
+                    ResolvedLinkKind::Interface(id)
+                }
+                _ => ResolvedLinkKind::Library(id),
+            };
+            resolved.push(ResolvedLinkItem {
+                text: BT::new(name, Default::default()),
+                kind,
+                feature: None,
+                direct: !interface,
+                scope: if interface {
+                    UsageScope::Interface
+                } else {
+                    UsageScope::Private
+                },
+                injected_by: None,
+            });
+        }
+        Ok(resolved)
     }
 
     fn link_entries(

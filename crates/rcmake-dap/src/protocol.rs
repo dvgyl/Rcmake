@@ -64,6 +64,10 @@ pub enum RequestKind {
         thread: i64,
         /// `format`.
         format: FrameFormat,
+        /// `startFrame`: the number of innermost frames to skip. A negative value is 0.
+        start: u64,
+        /// `levels`: the most frames to return. Absent, 0, or negative means all.
+        levels: Option<u64>,
     },
     /// `scopes`.
     Scopes {
@@ -100,6 +104,32 @@ pub enum RequestKind {
     Launch,
     /// `disconnect`.
     Disconnect,
+}
+
+impl RequestKind {
+    /// The `command` name of the request.
+    #[must_use]
+    pub const fn command(&self) -> &'static str {
+        match self {
+            Self::Initialize { .. } => "initialize",
+            Self::SetBreakpoints { .. } => "setBreakpoints",
+            Self::SetExceptionBreakpoints { .. } => "setExceptionBreakpoints",
+            Self::ExceptionInfo => "exceptionInfo",
+            Self::ConfigurationDone => "configurationDone",
+            Self::Threads => "threads",
+            Self::StackTrace { .. } => "stackTrace",
+            Self::Scopes { .. } => "scopes",
+            Self::Variables { .. } => "variables",
+            Self::Evaluate { .. } => "evaluate",
+            Self::Pause => "pause",
+            Self::Continue => "continue",
+            Self::Next => "next",
+            Self::StepIn => "stepIn",
+            Self::StepOut => "stepOut",
+            Self::Launch => "launch",
+            Self::Disconnect => "disconnect",
+        }
+    }
 }
 
 /// A message that does not give a request the adapter can handle.
@@ -278,7 +308,16 @@ fn parse_kind(command: &str, args: &Args<'_>) -> Result<RequestKind, RequestErro
                 },
                 Some(_) => return Err(RequestError::Deserialize),
             };
-            RequestKind::StackTrace { thread, format }
+            let count = |name| {
+                args.opt_int(name)
+                    .map(|n| n.and_then(|n| u64::try_from(n).ok()))
+            };
+            RequestKind::StackTrace {
+                thread,
+                format,
+                start: count("startFrame")?.unwrap_or(0),
+                levels: count("levels")?.filter(|&n| n > 0),
+            }
         }
         "scopes" => RequestKind::Scopes {
             frame: args.int("frameId")?,
@@ -315,23 +354,33 @@ fn parse_kind(command: &str, args: &Args<'_>) -> Result<RequestKind, RequestErro
 /// Build a successful response body message (without `seq`).
 #[must_use]
 pub fn response(request: &Request, body: Value) -> Value {
-    Value::object_from([
-        ("type", Value::string("response")),
-        ("request_seq", Value::Int(request.seq)),
-        ("success", Value::Bool(true)),
-        ("command", Value::string(request.command.as_str())),
-        ("body", body),
-    ])
+    reply(request.seq, &request.command, body)
 }
 
 /// Build an error response message (without `seq`).
 #[must_use]
 pub fn error_response(request: &Request, message: &str) -> Value {
+    error_reply(request.seq, &request.command, message)
+}
+
+/// Build a successful response to the request `seq` named `command` (without `seq`).
+pub(crate) fn reply(seq: i64, command: &str, body: Value) -> Value {
     Value::object_from([
         ("type", Value::string("response")),
-        ("request_seq", Value::Int(request.seq)),
+        ("request_seq", Value::Int(seq)),
+        ("success", Value::Bool(true)),
+        ("command", Value::string(command)),
+        ("body", body),
+    ])
+}
+
+/// Build an error response to the request `seq` named `command` (without `seq`).
+pub(crate) fn error_reply(seq: i64, command: &str, message: &str) -> Value {
+    Value::object_from([
+        ("type", Value::string("response")),
+        ("request_seq", Value::Int(seq)),
         ("success", Value::Bool(false)),
-        ("command", Value::string(request.command.as_str())),
+        ("command", Value::string(command)),
         ("message", Value::string(message)),
     ])
 }
@@ -364,13 +413,9 @@ mod tests {
         parse_request(text.as_bytes())
     }
 
-    fn kind(text: &str) -> RequestKind {
-        parse(text).unwrap().kind
-    }
-
     #[test]
     fn each_request_type_parses() {
-        let cases: [(&str, RequestKind); 17] = [
+        let cases: [(&str, RequestKind); 19] = [
             (
                 r#"{"seq":1,"type":"request","command":"initialize","arguments":{"adapterID":"a","supportsVariableType":true}}"#,
                 RequestKind::Initialize {
@@ -411,6 +456,26 @@ mod tests {
                         parameter_values: false,
                         line: true,
                     },
+                    start: 0,
+                    levels: None,
+                },
+            ),
+            (
+                r#"{"seq":1,"type":"request","command":"stackTrace","arguments":{"threadId":1,"startFrame":2,"levels":3}}"#,
+                RequestKind::StackTrace {
+                    thread: 1,
+                    format: FrameFormat::default(),
+                    start: 2,
+                    levels: Some(3),
+                },
+            ),
+            (
+                r#"{"seq":1,"type":"request","command":"stackTrace","arguments":{"threadId":1,"startFrame":-2,"levels":0}}"#,
+                RequestKind::StackTrace {
+                    thread: 1,
+                    format: FrameFormat::default(),
+                    start: 0,
+                    levels: None,
                 },
             ),
             (
@@ -462,7 +527,9 @@ mod tests {
             ),
         ];
         for (text, expected) in cases {
-            assert_eq!(kind(text), expected, "{text}");
+            let request = parse(text).unwrap();
+            assert_eq!(request.kind.command(), request.command, "{text}");
+            assert_eq!(request.kind, expected, "{text}");
         }
     }
 

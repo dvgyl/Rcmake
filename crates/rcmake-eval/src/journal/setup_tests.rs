@@ -420,6 +420,76 @@ fn corrupt_manifests_and_setup_records_never_panic() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn setup_decode_rejects_records_beyond_the_writer_limits() -> TestResult {
+    let decode = |record: &SetupRecord| -> Result<SetupRecord, String> {
+        let mut text = Vec::new();
+        super::super::frame::write_json(record, &mut text, 1 << 24).ok_or("encode failed")?;
+        let options = rcmake_json::ReadOptions {
+            allow_comments: false,
+            dup_keys_last_wins: false,
+        };
+        let value = rcmake_json::parse(&text, &options).map_err(|err| err.to_string())?;
+        SetupRecord::from_json(&value).map_err(|err| err.to_string())
+    };
+    let digest = Some(JournalDigest::hash(b"value"));
+    let ledger = |len: usize| -> Digests {
+        (0..len)
+            .map(|i| (format!("NAME_{i}").into_bytes(), digest))
+            .collect()
+    };
+    let full = SetupRecord {
+        cache: ledger(MAX_LEDGER),
+        env: ledger(MAX_LEDGER),
+        checkpoints: vec![Vec::new(), Vec::new()],
+        determined: vec![true, false],
+        ..SetupRecord::default()
+    };
+    assert_eq!(decode(&full)?, full);
+    let long_name = vec![(vec![b'N'; MAX_ENV_NAME + 1], digest)];
+    for (field, record) in [
+        (
+            "cache",
+            SetupRecord {
+                cache: ledger(MAX_LEDGER + 1),
+                ..full.clone()
+            },
+        ),
+        (
+            "env",
+            SetupRecord {
+                env: ledger(MAX_LEDGER + 1),
+                ..full.clone()
+            },
+        ),
+        (
+            "env",
+            SetupRecord {
+                env: long_name,
+                ..full.clone()
+            },
+        ),
+        (
+            "checkpoints",
+            SetupRecord {
+                determined: vec![true],
+                ..full.clone()
+            },
+        ),
+        (
+            "checkpoints",
+            SetupRecord {
+                determined: vec![true; 3],
+                ..full.clone()
+            },
+        ),
+    ] {
+        let error = decode(&record).err().ok_or(field)?;
+        assert!(error.contains(field), "{field}: {error}");
+    }
+    Ok(())
+}
+
 /// Each class of interpreter state that a listfile can observe after setup changes
 /// exactly one domain digest. A new class of state must add a row here.
 #[test]
@@ -650,5 +720,58 @@ fn each_state_class_changes_exactly_its_domain() -> TestResult {
     let mut stock = fixture.interp();
     include(&mut stock, "share/Modules/defs.cmake");
     assert!(changed(&stock, &stock_empty.setup_domains()).is_empty());
+    Ok(())
+}
+
+/// A stock module definition is not part of the command domain. A leaf that queries
+/// a command must therefore run live after a same-path setup edit defines it.
+#[test]
+fn a_command_query_in_a_leaf_sees_a_new_stock_definition() -> TestResult {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    let fixture = Fixture::new(
+        "set(TOOLCHAIN /work/share/Modules/PC.cmake)\nproject(P)\nadd_subdirectory(late)\n",
+    )?;
+    fixture.file("share/Modules/PC.cmake", "")?;
+    let mut stale = Vec::new();
+    // Each leaf creates `pc` only while the command is not defined. A recorded leaf
+    // must create every target that it names.
+    for condition in [
+        "COMMAND ProcessorCount)\nelse(",
+        "NOT COMMAND ProcessorCount",
+        "0)\nelseif(NOT COMMAND ProcessorCount",
+    ] {
+        fixture.file(
+            "src/late/CMakeLists.txt",
+            &format!("if({condition})\nadd_library(pc STATIC pc.c)\nendif()\n"),
+        )?;
+        fixture.file("share/Modules/PC.cmake", "")?;
+        let (cold, _, _) = fixture.run(None);
+        let (warm, _, _) = fixture.run(cold.as_deref());
+        fixture.file(
+            "share/Modules/PC.cmake",
+            "function(ProcessorCount var)\nendfunction()\n",
+        )?;
+        let mut interp = fixture.interp();
+        fixture.run_with(&mut interp, warm.as_deref());
+        let replayed = interp.project.targets().any(|(_, t)| t.name == "pc");
+        let mut live = fixture.interp();
+        fixture.run_with(&mut live, None);
+        let expected = live.project.targets().any(|(_, t)| t.name == "pc");
+        if replayed != expected || !interp.replayed_listfiles().is_empty() {
+            stale.push(condition);
+        }
+    }
+    assert!(stale.is_empty(), "{stale:?}");
+    // A leaf with another condition still replays in this fixture.
+    fixture.file(
+        "src/late/CMakeLists.txt",
+        "add_library(late STATIC late.c)\nif(1)\nendif()\n",
+    )?;
+    let (cold, _, _) = fixture.run(None);
+    let (warm, _, _) = fixture.run(cold.as_deref());
+    let (_, hits, miss) = fixture.run(warm.as_deref());
+    assert_eq!((hits, miss), (1, None));
     Ok(())
 }

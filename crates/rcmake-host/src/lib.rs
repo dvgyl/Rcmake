@@ -224,6 +224,19 @@ pub enum Output {
     Null,
     /// Share the same pipe with stdout (valid for stderr only, preserving interleaving).
     SharedWithStdout,
+    /// Pass each chunk to the output callback as it arrives, and keep none of it in
+    /// [`RunOutput`]. The chunks do not count toward a capture limit, and they reach the
+    /// callback when [`RunRequest::tee`] is `false`.
+    Stream,
+}
+
+impl Output {
+    /// Return whether the output reaches the caller as it arrives, as
+    /// [`Output::Inherit`] and [`Output::Stream`] do.
+    #[must_use]
+    pub const fn is_live(&self) -> bool {
+        matches!(self, Self::Inherit | Self::Stream)
+    }
 }
 
 /// Single command stage inside a [`RunRequest`] pipeline.
@@ -651,12 +664,32 @@ pub trait Host: Send + Sync {
     /// Run a process with a byte limit for all captured output.
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
         let output = self.run(req, &mut |_, _| {})?;
-        if output.stdout.len().saturating_add(output.stderr.len()) > limit {
-            return Err(HostError::unsupported(
-                "Process output exceeds the size limit",
-            ));
-        }
-        Ok(output)
+        check_limit(output, limit)
+    }
+
+    /// Run a process with a byte limit for the [`Output::Capture`] output, and pass the
+    /// chunks of each [`Output::Stream`] stream to `on_output`. Streamed chunks do not
+    /// count toward `limit`.
+    fn run_bounded_streaming(
+        &self,
+        req: &RunRequest,
+        limit: usize,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        let output = self.run(req, on_output)?;
+        check_limit(output, limit)
+    }
+
+    /// [`Host::run_bounded_streaming`] with a caller-certified write scope.
+    fn run_bounded_confined_streaming(
+        &self,
+        req: &RunRequest,
+        limit: usize,
+        scope: WriteScope<'_>,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        let output = self.run_confined(req, scope, on_output)?;
+        check_limit(output, limit)
     }
 
     /// Write bytes directly to stdout or stderr.
@@ -700,6 +733,25 @@ pub trait Host: Send + Sync {
     /// refuses private cache directories, because their owners cannot be checked.
     fn effective_uid(&self) -> Option<u32> {
         None
+    }
+}
+
+/// Fail if the captured output of `output` is over `limit` bytes.
+fn check_limit(output: RunOutput, limit: usize) -> HostResult<RunOutput> {
+    if output.stdout.len().saturating_add(output.stderr.len()) > limit {
+        return Err(HostError::unsupported(
+            "Process output exceeds the size limit",
+        ));
+    }
+    Ok(output)
+}
+
+/// Return whether the chunks of `stream` go to the output callback and not to
+/// [`RunOutput`] ([`Output::Stream`]).
+pub(crate) fn is_streamed(req: &RunRequest, stream: Stream) -> bool {
+    match stream {
+        Stream::Stdout => req.stdout == Output::Stream,
+        Stream::Stderr => req.stderr == Output::Stream,
     }
 }
 

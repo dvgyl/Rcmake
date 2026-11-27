@@ -15,8 +15,8 @@ use rcmake_host::{
 
 use crate::config::{CpackConfig, absolute};
 use crate::source::{
-    SymlinkPolicy, canonical_checked_root, copy_checked_tree_expected, verify_contained_path,
-    verify_expected_root,
+    SymlinkPolicy, canonical_checked_root, copy_checked_tree_expected, validate_assembled_payload,
+    verify_contained_path, verify_expected_root,
 };
 use crate::{CpackError, InstalledComponent, error, safe_name};
 
@@ -456,7 +456,7 @@ pub(crate) fn copy_component_payload(
                 windows_rules,
             )?;
         }
-        return Ok(());
+        return validate_assembled_payload(host, dest_root, symlink_policy, windows_rules);
     }
     for staged in &component.staged_roots {
         let (src_dir, expected_canon) = if preserve_root_prefix {
@@ -484,7 +484,7 @@ pub(crate) fn copy_component_payload(
             windows_rules,
         )?;
     }
-    Ok(())
+    validate_assembled_payload(host, dest_root, symlink_policy, windows_rules)
 }
 
 /// Copy a validated monolithic staging tree into `dest_root`.
@@ -504,7 +504,8 @@ pub(crate) fn copy_monolithic_payload(
         dest_root,
         symlink_policy,
         windows_rules,
-    )
+    )?;
+    validate_assembled_payload(host, dest_root, symlink_policy, windows_rules)
 }
 
 /// Compute total regular file bytes under `dir` using checked no-follow traversal.

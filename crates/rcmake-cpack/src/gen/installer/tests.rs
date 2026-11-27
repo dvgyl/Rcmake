@@ -1560,9 +1560,10 @@ set(CPACK_IFW_REPOSITORY_R1_PASSWORD "TOP_SECRET_PWD_999")
 }
 
 #[test]
-fn ifw_shared_package_coalescing_collision_and_qrc_traversal_rejection() {
-    // 1) Shared IFW package with disjoint files succeeds; overlapping distinct files fails.
-    for (same_file, expect_ok) in [(false, true), (true, false)] {
+fn ifw_shared_package_coalescing_overlap_and_qrc_traversal_rejection() {
+    // 1) A shared IFW package merges disjoint files. An overlapping file takes the content
+    // of the later component in install order.
+    for (same_file, expect_ok) in [(false, true), (true, true)] {
         let host = make_profile_host(OsProfile::Linux);
         seed_tool(&host, OsProfile::Linux, "binarycreator");
         host.seed_file(Path::new("/work/payload/a.txt"), b"AAA")
@@ -1638,6 +1639,11 @@ set(CPACK_IFW_COMPONENT_C1_DEPENDS "my-dep:>=1.2")
                 xml_text(xml_find_all(&pkg_root, "Dependencies")[0]),
                 "my-dep:>=1.2"
             );
+            let shared = Path::new(
+                "/work/_CPack_Packages/IFW/Coal-1.0/packages/org.shared.pkg/data/bin/a.txt",
+            );
+            let expected: &[u8] = if same_file { b"BBB" } else { b"AAA" };
+            assert_eq!(read_bytes(host.as_ref(), shared), expected);
         }
     }
 
@@ -1923,6 +1929,7 @@ struct FaultInjectHost {
     fail_write_checksum_tmp: AtomicBool,
     partial_write_before_fail: AtomicBool,
     fail_rename_dest_suffix: Mutex<Option<String>>,
+    fail_rename_from_prefix: Mutex<Option<String>>,
 }
 
 impl Host for FaultInjectHost {
@@ -1954,8 +1961,22 @@ impl Host for FaultInjectHost {
     rcmake_host::forward_host!(@ inner, scratch_file_in);
 
     fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
-        if let Some(ref suffix) = *self.fail_rename_dest_suffix.lock().unwrap()
-            && to.to_string_lossy().ends_with(suffix.as_str())
+        let from_name = from
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        let from_fails = self
+            .fail_rename_from_prefix
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|prefix| from_name.is_some_and(|name| name.starts_with(prefix.as_str())));
+        if from_fails
+            || self
+                .fail_rename_dest_suffix
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|suffix| to.to_string_lossy().ends_with(suffix.as_str()))
         {
             return Err(HostError::from_io(
                 std::io::Error::new(
@@ -2106,6 +2127,7 @@ set(CPACK_PACKAGE_CHECKSUM "SHA256")
             fail_write_checksum_tmp: AtomicBool::new(fail_on_checksum),
             partial_write_before_fail: AtomicBool::new(true),
             fail_rename_dest_suffix: Mutex::new(None),
+            fail_rename_from_prefix: Mutex::new(None),
         });
 
         assert_eq!(run_unrestricted(wrapper.clone(), &[]), 1);
@@ -2550,6 +2572,7 @@ set(CPACK_PACKAGE_CHECKSUM "MD5;SHA256")
             fail_write_checksum_tmp: AtomicBool::new(false),
             partial_write_before_fail: AtomicBool::new(false),
             fail_rename_dest_suffix: Mutex::new(Some(".sha256".to_owned())),
+            fail_rename_from_prefix: Mutex::new(None),
         });
 
         assert_eq!(run_unrestricted(wrapper, &[]), 1);
@@ -2597,6 +2620,81 @@ set(CPACK_PACKAGE_CHECKSUM "MD5;SHA256")
             );
         }
     }
+}
+
+#[test]
+fn failed_rollback_keeps_the_backup_that_it_could_not_restore() {
+    let inner = make_profile_host(OsProfile::Linux);
+    seed_tool(&inner, OsProfile::Linux, "binarycreator");
+    inner
+        .seed_file(Path::new("/work/src/a.txt"), b"v2")
+        .unwrap();
+    let prev_installer = b"PREVIOUS_GOOD_INSTALLER_V1";
+    let prev_sha = format!(
+        "{}  App-1.0.run\n",
+        HashAlgo::Sha256.hex_digest(prev_installer)
+    );
+    inner
+        .seed_file(Path::new("/work/App-1.0.run"), prev_installer)
+        .unwrap();
+    inner
+        .seed_file(Path::new("/work/App-1.0.run.sha256"), prev_sha.as_bytes())
+        .unwrap();
+    inner
+        .seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "IFW")
+set(CPACK_PACKAGE_NAME "App")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "App-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+set(CPACK_PACKAGE_CHECKSUM "SHA256")
+"#,
+        )
+        .unwrap();
+    inner
+        .set_command_handler(|h, req, _| {
+            let out = to_native(req.pipeline[0].args.last().unwrap());
+            h.write(&out, b"NEW_INSTALLER_V2", WriteMode::CreateNew)?;
+            Ok(ok_output(b"ok"))
+        })
+        .unwrap();
+    let wrapper = Arc::new(FaultInjectHost {
+        inner: Arc::clone(&inner),
+        fail_write_from_tmp: AtomicBool::new(false),
+        fail_write_checksum_tmp: AtomicBool::new(false),
+        partial_write_before_fail: AtomicBool::new(false),
+        fail_rename_dest_suffix: Mutex::new(Some(".sha256".to_owned())),
+        fail_rename_from_prefix: Mutex::new(Some("backup-".to_owned())),
+    });
+
+    assert_eq!(run_unrestricted(wrapper, &[]), 1);
+
+    let stderr = String::from_utf8_lossy(&inner.stream_bytes(Stream::Stderr)).into_owned();
+    let kept = stderr
+        .split("(previous file kept at ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .unwrap_or_else(|| panic!("no kept backup path in: {stderr}"));
+    assert!(
+        stderr.contains("rollback failed for: /work/App-1.0.run: "),
+        "{stderr}"
+    );
+    assert_eq!(read_bytes(inner.as_ref(), Path::new(kept)), prev_installer);
+    let stage = Path::new(kept).parent().unwrap();
+    let names: Vec<_> = inner
+        .read_dir(stage)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert_eq!(names, [BString::from("backup-0")]);
+    assert_eq!(
+        read_utf8(inner.as_ref(), Path::new("/work/App-1.0.run.sha256")),
+        prev_sha
+    );
 }
 
 #[test]
@@ -3451,6 +3549,186 @@ set(CPACK_IFW_REPOSITORY_R1_PASSWORD "p&w<\"'1")
                 !log_text.contains(leaked),
                 "IFWOutput.log leaked {leaked}: {log_text}"
             );
+        }
+    }
+}
+
+fn seed_all_in_one(host: &PureHost, install_rules: &str) {
+    seed_tool(host, OsProfile::Linux, "binarycreator");
+    seed_component_project(host, install_rules);
+    host.seed_file(
+        Path::new("/work/CPackConfig.cmake"),
+        br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "IFW")
+set(CPACK_CMAKE_GENERATOR "Ninja")
+set(CPACK_PACKAGE_NAME "AllInOne")
+set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_FILE_NAME "AllInOne-1.0.0")
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;AllInOne;ALL;/")
+set(CPACK_COMPONENTS_ALL "Runtime;Devel")
+set(CPACK_COMPONENTS_GROUPING "ALL_COMPONENTS_IN_ONE")
+"#,
+    )
+    .unwrap();
+    host.set_command_handler(|h, req, _| {
+        let out = to_native(req.pipeline[0].args.last().unwrap());
+        h.write(&out, b"ifw-all-in-one", WriteMode::CreateNew)?;
+        Ok(ok_output(b""))
+    })
+    .unwrap();
+}
+
+#[test]
+fn ifw_all_in_one_later_component_replaces_a_shared_file() {
+    let host = make_profile_host(OsProfile::Linux);
+    host.seed_file(Path::new("/work/payload/runtime/shared.txt"), b"runtime")
+        .unwrap();
+    host.seed_file(Path::new("/work/payload/devel/shared.txt"), b"devel")
+        .unwrap();
+    seed_all_in_one(
+        &host,
+        r#"
+if(CMAKE_INSTALL_COMPONENT STREQUAL "Runtime")
+  file(INSTALL "/work/payload/runtime/shared.txt" DESTINATION "${CMAKE_INSTALL_PREFIX}/share")
+elseif(CMAKE_INSTALL_COMPONENT STREQUAL "Devel")
+  file(INSTALL "/work/payload/devel/shared.txt" DESTINATION "${CMAKE_INSTALL_PREFIX}/share")
+endif()
+"#,
+    );
+
+    assert_eq!(
+        run_unrestricted(host.clone(), &[]),
+        0,
+        "stderr={}",
+        String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr))
+    );
+    let data_dir = Path::new("/work/_CPack_Packages/IFW/AllInOne-1.0.0/packages/AllInOne/data");
+    assert_eq!(
+        read_bytes(host.as_ref(), &data_dir.join("share/shared.txt")),
+        b"devel"
+    );
+}
+
+#[test]
+fn ifw_rejects_a_merged_link_that_another_component_redirects_outside() {
+    let host = make_profile_host(OsProfile::Linux);
+    seed_all_in_one(
+        &host,
+        r#"
+file(MAKE_DIRECTORY "${CMAKE_INSTALL_PREFIX}/lib")
+if(CMAKE_INSTALL_COMPONENT STREQUAL "Runtime")
+  file(CREATE_LINK ".." "${CMAKE_INSTALL_PREFIX}/lib/q" SYMBOLIC)
+elseif(CMAKE_INSTALL_COMPONENT STREQUAL "Devel")
+  file(CREATE_LINK "q/../../x" "${CMAKE_INSTALL_PREFIX}/lib/m" SYMBOLIC)
+endif()
+"#,
+    );
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let invoked_ref = Arc::clone(&invoked);
+    host.set_command_handler(move |_, _, _| {
+        invoked_ref.fetch_add(1, Ordering::SeqCst);
+        Ok(ok_output(b""))
+    })
+    .unwrap();
+
+    assert_eq!(run_unrestricted(host.clone(), &[]), 1);
+    assert_eq!(invoked.load(Ordering::SeqCst), 0);
+    let stderr = String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned();
+    assert!(stderr.contains("escapes staging root"), "{stderr}");
+}
+
+#[test]
+fn component_payload_validates_links_across_its_merged_roots() {
+    let host = make_profile_host(OsProfile::MacOs);
+    let staging = Path::new("/work/stage");
+    for (root, link, target) in [("one", "q", ".."), ("two", "m", "q/../../x")] {
+        let lib = staging.join(root).join("lib");
+        host.create_dir_all(&lib).unwrap();
+        host.symlink(Path::new(target), &lib.join(link)).unwrap();
+    }
+    let canon_staging = host.canonicalize(staging).unwrap();
+    let staged_roots = ["one", "two"]
+        .into_iter()
+        .map(|name| crate::StagedRoot {
+            root: staging.join(name),
+            scanned: staging.join(name),
+            canon_root: canon_staging.join(name),
+            canon_scanned: canon_staging.join(name),
+            files: Vec::new(),
+        })
+        .collect();
+    let component = crate::InstalledComponent {
+        name: "app".into(),
+        staged_roots,
+        ..crate::InstalledComponent::default()
+    };
+    let err = crate::generators::installer::copy_component_payload(
+        host.as_ref(),
+        staging,
+        &canon_staging,
+        &component,
+        Path::new("/work/payload"),
+        crate::source::SymlinkPolicy::PreserveContained,
+        false,
+        true,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("escapes staging root"), "{err}");
+}
+
+#[test]
+fn ifw_skips_a_malformed_resource_descriptor_and_still_rejects_escapes() {
+    for (descriptor, succeeds) in [
+        (&b"<RCC><qresource><file>asset.txt</file>"[..], true),
+        (
+            b"<RCC><qresource><file>../outside.txt</file></qresource></RCC>",
+            false,
+        ),
+    ] {
+        let host = make_profile_host(OsProfile::Linux);
+        seed_tool(&host, OsProfile::Linux, "binarycreator");
+        host.seed_file(Path::new("/work/src/a.txt"), b"a").unwrap();
+        host.seed_file(Path::new("/work/res/asset.txt"), b"asset")
+            .unwrap();
+        host.seed_file(Path::new("/work/outside.txt"), b"outside")
+            .unwrap();
+        host.seed_file(Path::new("/work/res/app.qrc"), descriptor)
+            .unwrap();
+        host.seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "IFW")
+set(CPACK_PACKAGE_NAME "Res")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "Res-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+set(CPACK_IFW_PACKAGE_RESOURCES "/work/res/app.qrc")
+"#,
+        )
+        .unwrap();
+        host.set_command_handler(|h, req, _| {
+            assert!(find_arg_after(&req.pipeline[0].args, b"-r").is_none());
+            let out = to_native(req.pipeline[0].args.last().unwrap());
+            h.write(&out, b"ifw", WriteMode::CreateNew)?;
+            Ok(ok_output(b""))
+        })
+        .unwrap();
+
+        let code = run_unrestricted(host.clone(), &[]);
+        let stderr = String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned();
+        if succeeds {
+            assert_eq!(code, 0, "{stderr}");
+            assert!(
+                stderr.contains(
+                    "Can't copy resources from \"/work/res/app.qrc\". Resource will be skipped."
+                ),
+                "{stderr}"
+            );
+        } else {
+            assert_eq!(code, 1);
+            assert!(stderr.contains("escapes"), "{stderr}");
         }
     }
 }

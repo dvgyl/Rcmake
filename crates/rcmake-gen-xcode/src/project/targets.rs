@@ -137,6 +137,7 @@ impl Project<'_> {
             let settings = if native {
                 TargetSettings {
                     model: self.model,
+                    host: self.host,
                     indices: self.indices,
                     bin: self.bin,
                     config,
@@ -146,7 +147,7 @@ impl Project<'_> {
                     phase_links: &phase_links,
                     per_language_flags,
                 }
-                .build(&configured_product, plist.as_deref())
+                .build(&configured_product, plist.as_deref())?
             } else {
                 Attrs::new()
             };

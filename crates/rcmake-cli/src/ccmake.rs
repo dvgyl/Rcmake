@@ -205,14 +205,24 @@ impl CaptureLog {
 
 /// [`Host`] wrapper active during `ccmake` configure and generate runs.
 ///
-/// Intercepts BOTH [`Host::write_out`] AND all process execution methods so
-/// inherited child stdout/stderr streams are captured into the bounded TUI log
-/// and inherited stdin is replaced with non-interactive `/dev/null` (`Input::Null`).
-/// Explicit file redirections (`Output::File`) and output variables
-/// (`Output::Capture`) are preserved untouched.
+/// Diagnostics and the inherited output streams of child processes go to the bounded
+/// log, and an inherited child stdin becomes the null device. An inherited stream
+/// becomes [`Output::Stream`], so its bytes go to the log as they arrive and never
+/// count toward an explicit capture limit. Explicit captures, files, and the caller's
+/// `tee` setting stay as the caller requested them.
 struct CaptureHost {
     inner: Arc<dyn Host>,
     log: Mutex<CaptureLog>,
+}
+
+/// The streams of a request that [`CaptureHost`] sends to its log, by [`stream_index`].
+type Drained = [bool; 2];
+
+const fn stream_index(stream: Stream) -> usize {
+    match stream {
+        Stream::Stdout => 0,
+        Stream::Stderr => 1,
+    }
 }
 
 impl CaptureHost {
@@ -244,76 +254,46 @@ impl CaptureHost {
             .push(stream, bytes);
     }
 
-    fn run_captured(
+    /// Send a chunk of a drained stream to the log. Return `false` for a chunk of a
+    /// stream that the caller requested.
+    fn log_drained(&self, drained: Drained, stream: Stream, bytes: &[u8]) -> bool {
+        let logged = drained.get(stream_index(stream)).copied().unwrap_or(false);
+        if logged {
+            self.capture(stream, bytes);
+        }
+        logged
+    }
+
+    fn run_drained(
         &self,
         req: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
         exec: impl FnOnce(&RunRequest, &mut dyn FnMut(Stream, &[u8])) -> HostResult<RunOutput>,
     ) -> HostResult<RunOutput> {
-        let (req, cap_stdout, cap_stderr) = capture_request(req);
-        let mut saw_stdout = false;
-        let mut saw_stderr = false;
-        let mut output = exec(&req, &mut |stream, bytes| match stream {
-            Stream::Stdout if cap_stdout => {
-                saw_stdout = true;
-                self.capture(Stream::Stdout, bytes);
+        let (req, drained) = drain_request(req);
+        exec(&req, &mut |stream, bytes| {
+            if !self.log_drained(drained, stream, bytes) {
+                on_output(stream, bytes);
             }
-            Stream::Stderr if cap_stderr => {
-                saw_stderr = true;
-                self.capture(Stream::Stderr, bytes);
-            }
-            _ => on_output(stream, bytes),
-        })?;
-        if cap_stdout {
-            if !saw_stdout && !output.stdout.is_empty() {
-                self.capture(Stream::Stdout, &output.stdout);
-            }
-            output.stdout.clear();
-        }
-        if cap_stderr {
-            if !saw_stderr && !output.stderr.is_empty() {
-                self.capture(Stream::Stderr, &output.stderr);
-            }
-            output.stderr.clear();
-        }
-        Ok(output)
-    }
-
-    fn run_bounded_captured(
-        &self,
-        req: &RunRequest,
-        exec: impl FnOnce(&RunRequest) -> HostResult<RunOutput>,
-    ) -> HostResult<RunOutput> {
-        let (mut req, cap_stdout, cap_stderr) = capture_request(req);
-        req.tee = false;
-        let mut result = exec(&req)?;
-        if cap_stdout {
-            let bytes = std::mem::take(&mut result.stdout);
-            self.capture(Stream::Stdout, &bytes);
-        }
-        if cap_stderr {
-            let bytes = std::mem::take(&mut result.stderr);
-            self.capture(Stream::Stderr, &bytes);
-        }
-        Ok(result)
+        })
     }
 }
 
-fn capture_request(request: &RunRequest) -> (RunRequest, bool, bool) {
+/// Replace the inherited streams of `request` with [`Output::Stream`] and an inherited
+/// stdin with [`Input::Null`].
+fn drain_request(request: &RunRequest) -> (RunRequest, Drained) {
     let mut req = request.clone();
     if req.stdin == Input::Inherit {
         req.stdin = Input::Null;
     }
-    let cap_stdout = req.stdout == Output::Inherit;
-    let cap_stderr = req.stderr == Output::Inherit;
-    if cap_stdout {
-        req.stdout = Output::Capture;
-    }
-    if cap_stderr {
-        req.stderr = Output::Capture;
-    }
-    req.tee |= cap_stdout || cap_stderr;
-    (req, cap_stdout, cap_stderr)
+    let drained = [&mut req.stdout, &mut req.stderr].map(|output| {
+        let inherited = *output == Output::Inherit;
+        if inherited {
+            *output = Output::Stream;
+        }
+        inherited
+    });
+    (req, drained)
 }
 
 impl Host for CaptureHost {
@@ -342,7 +322,7 @@ impl Host for CaptureHost {
         req: &RunRequest,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        self.run_captured(req, on_output, |r, cb| self.inner.run(r, cb))
+        self.run_drained(req, on_output, |r, cb| self.inner.run(r, cb))
     }
 
     fn run_confined(
@@ -351,7 +331,7 @@ impl Host for CaptureHost {
         scope: WriteScope<'_>,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        self.run_captured(req, on_output, |r, cb| {
+        self.run_drained(req, on_output, |r, cb| {
             self.inner.run_confined(r, scope, cb)
         })
     }
@@ -362,7 +342,7 @@ impl Host for CaptureHost {
         timeout: GracefulTimeout,
         on_output: &mut dyn FnMut(Stream, &[u8]),
     ) -> HostResult<RunOutput> {
-        self.run_captured(req, on_output, |r, cb| {
+        self.run_drained(req, on_output, |r, cb| {
             self.inner.run_with_timeout_signal(r, timeout, cb)
         })
     }
@@ -374,42 +354,30 @@ impl Host for CaptureHost {
         hard_limit: Option<std::time::Duration>,
         update: &mut DeadlineUpdate<'_>,
     ) -> HostResult<ControlledOutput> {
-        let (req, cap_stdout, cap_stderr) = capture_request(req);
-        let mut saw_stdout = false;
-        let mut saw_stderr = false;
-        let mut result =
-            self.inner
-                .run_controlled(&req, graceful, hard_limit, &mut |stream, bytes| {
-                    match stream {
-                        Stream::Stdout if cap_stdout => {
-                            saw_stdout = true;
-                            self.capture(Stream::Stdout, bytes);
-                        }
-                        Stream::Stderr if cap_stderr => {
-                            saw_stderr = true;
-                            self.capture(Stream::Stderr, bytes);
-                        }
-                        _ => {}
-                    }
+        let (req, drained) = drain_request(req);
+        self.inner
+            .run_controlled(&req, graceful, hard_limit, &mut |stream, bytes| {
+                if self.log_drained(drained, stream, bytes) {
+                    None
+                } else {
                     update(stream, bytes)
-                })?;
-        if cap_stdout {
-            if !saw_stdout && !result.output.stdout.is_empty() {
-                self.capture(Stream::Stdout, &result.output.stdout);
-            }
-            result.output.stdout.clear();
-        }
-        if cap_stderr {
-            if !saw_stderr && !result.output.stderr.is_empty() {
-                self.capture(Stream::Stderr, &result.output.stderr);
-            }
-            result.output.stderr.clear();
-        }
-        Ok(result)
+                }
+            })
     }
 
     fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
-        self.run_bounded_captured(req, |r| self.inner.run_bounded(r, limit))
+        self.run_bounded_streaming(req, limit, &mut |_, _| {})
+    }
+
+    fn run_bounded_streaming(
+        &self,
+        req: &RunRequest,
+        limit: usize,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        self.run_drained(req, on_output, |r, cb| {
+            self.inner.run_bounded_streaming(r, limit, cb)
+        })
     }
 
     fn run_bounded_confined(
@@ -418,7 +386,20 @@ impl Host for CaptureHost {
         limit: usize,
         scope: WriteScope<'_>,
     ) -> HostResult<RunOutput> {
-        self.run_bounded_captured(req, |r| self.inner.run_bounded_confined(r, limit, scope))
+        self.run_bounded_confined_streaming(req, limit, scope, &mut |_, _| {})
+    }
+
+    fn run_bounded_confined_streaming(
+        &self,
+        req: &RunRequest,
+        limit: usize,
+        scope: WriteScope<'_>,
+        on_output: &mut dyn FnMut(Stream, &[u8]),
+    ) -> HostResult<RunOutput> {
+        self.run_drained(req, on_output, |r, cb| {
+            self.inner
+                .run_bounded_confined_streaming(r, limit, scope, cb)
+        })
     }
 
     fn registry_host_view(&self) -> Option<rcmake_host::RegistryView> {
@@ -534,42 +515,48 @@ impl CliCacheDriver {
     }
 }
 
+impl CliCacheDriver {
+    /// The report of a configure that did not run. The queued edits stay queued.
+    fn not_configured(&self, code: i32, message: Option<String>) -> RunReport {
+        let (mut lines, _) = self.capture_host.drain();
+        if let Some(message) = message {
+            lines.push(LogLine {
+                is_error: true,
+                text: BString::from(message),
+            });
+        }
+        RunReport {
+            exit_code: if code == 0 { 1 } else { code },
+            lines,
+            has_non_status: true,
+            new_entries: BTreeSet::new(),
+            edits_pending: true,
+        }
+    }
+}
+
 impl CacheDriver for CliCacheDriver {
+    /// Before the first configure that writes a cache, the form shows the cache that a
+    /// configure starts from (`cmCursesMainForm::LoadCache`). After it, the form shows
+    /// the cache file.
     fn load(&mut self) -> Result<CacheSnapshot, DriverError> {
         self.capture_host.reset();
-        let (bin, initial_opts) = if let Some(bin) = self.binary_dir.clone() {
-            (bin, None)
-        } else {
-            match self.resolve_bin_and_opts() {
-                Ok((bin, opts)) => (bin, Some(opts)),
-                Err(_) => {
-                    // Fall back to cwd if CLI args cannot be resolved yet; configure will report it.
-                    (self.base_host.initial_cwd(), None)
-                }
-            }
-        };
-
-        let mut loaded = cache::load(self.capture_host.as_ref(), &bin)
-            .map_err(|err| DriverError::new(err.to_string()))?;
-
-        // Before the first configure, reflect typed CLI -D/-U flags in the initial view.
         if !self.initial_configured
-            && let Some(opts) = initial_opts
+            && let Ok((_, opts)) = self.resolve_bin_and_opts()
         {
-            for edit in opts.cache_edits {
-                match edit {
-                    CacheEdit::Define(def) => {
-                        let def = cache::normalize_definition(self.base_host.as_ref(), def);
-                        cache::apply(&mut loaded, def);
-                    }
-                    CacheEdit::Remove(pattern) => {
-                        configure::remove_cache_glob(&mut loaded, &pattern);
-                    }
-                    CacheEdit::Preload(_) => {}
-                }
+            let host: Arc<dyn Host> = Arc::clone(&self.capture_host) as Arc<dyn Host>;
+            if let Ok(prepared) = configure::prepare_cache(self.build_argv(), opts, host) {
+                self.capture_host.reset();
+                return Ok(snapshot_from_cache(&prepared));
             }
         }
-
+        let bin = self
+            .binary_dir
+            .clone()
+            .unwrap_or_else(|| self.base_host.initial_cwd());
+        let loaded = cache::load(self.capture_host.as_ref(), &bin)
+            .map_err(|err| DriverError::new(err.to_string()))?;
+        self.capture_host.reset();
         Ok(snapshot_from_cache(&loaded))
     }
 
@@ -577,21 +564,17 @@ impl CacheDriver for CliCacheDriver {
         self.retained = None;
     }
 
+    /// Save the queued edits in the cache file, then configure from it with the
+    /// command-line cache arguments applied after the edits (`cmCursesMainForm::Write`
+    /// and `cmCursesMainForm::LoadCache`). As in CMake, `ccmake` never deletes the
+    /// cache, so `--fresh` has no effect.
     fn configure(&mut self, edits: &[EntryEdit]) -> RunReport {
         self.retained = None;
         self.capture_host.reset();
 
         let (bin, mut opts) = match self.resolve_bin_and_opts() {
             Ok(resolved) => resolved,
-            Err(code) => {
-                let (lines, has_non_status) = self.capture_host.drain();
-                return RunReport {
-                    exit_code: if code == 0 { 1 } else { code },
-                    lines,
-                    has_non_status: has_non_status || code != 0,
-                    new_entries: BTreeSet::new(),
-                };
-            }
+            Err(code) => return self.not_configured(code, None),
         };
 
         for (ignore_key, ignore) in [
@@ -614,40 +597,12 @@ impl CacheDriver for CliCacheDriver {
                 opts.cache_edits.push(CacheEdit::Remove(ignore_key.into()));
             }
         }
+        opts.fresh = false;
 
-        if self.initial_configured {
-            // Do not re-apply original CLI -D/-U/-C/--fresh after the initial configure.
-            opts.cache_edits.clear();
-            opts.fresh = false;
-        }
-
-        let cache_exists = self
-            .base_host
-            .metadata(&bin.join("CMakeCache.txt"), Follow::Yes)
-            .is_ok_and(|meta| meta.kind == FileKind::File);
-
-        if !edits.is_empty() {
-            if cache_exists {
-                if let Ok(mut disk_cache) = cache::load(self.capture_host.as_ref(), &bin) {
-                    apply_tui_edits(self.base_host.as_ref(), &mut disk_cache, edits);
-                    let _ = cache::save(self.capture_host.as_ref(), &bin, &disk_cache);
-                }
-            } else {
-                for edit in edits {
-                    match edit {
-                        EntryEdit::Set { name, ty, value } => {
-                            opts.cache_edits.push(CacheEdit::Define(CacheDefine {
-                                name: name.clone(),
-                                ty: Some(*ty),
-                                value: value.clone(),
-                            }));
-                        }
-                        EntryEdit::Remove { name } => {
-                            opts.cache_edits.push(CacheEdit::Remove(name.clone()));
-                        }
-                    }
-                }
-            }
+        if !edits.is_empty()
+            && let Err(message) = save_edits(self.capture_host.as_ref(), &bin, edits)
+        {
+            return self.not_configured(1, Some(message));
         }
 
         let argv = self.build_argv();
@@ -663,21 +618,22 @@ impl CacheDriver for CliCacheDriver {
         }
 
         let (lines, has_non_status) = self.capture_host.drain();
+        let report = RunReport {
+            exit_code: 0,
+            lines,
+            has_non_status,
+            new_entries: BTreeSet::new(),
+            edits_pending: false,
+        };
         match result {
             Ok(retained) => {
                 self.retained = Some(retained);
-                RunReport {
-                    exit_code: 0,
-                    lines,
-                    has_non_status,
-                    new_entries: BTreeSet::new(),
-                }
+                report
             }
             Err(code) => RunReport {
                 exit_code: if code == 0 { 1 } else { code },
-                lines,
                 has_non_status: true,
-                new_entries: BTreeSet::new(),
+                ..report
             },
         }
     }
@@ -692,7 +648,7 @@ impl CacheDriver for CliCacheDriver {
                     text: BString::from("CMake Error: Configure must succeed before generating."),
                 }],
                 has_non_status: true,
-                new_entries: BTreeSet::new(),
+                ..RunReport::default()
             };
         };
         let exit_code = retained.generate();
@@ -701,7 +657,7 @@ impl CacheDriver for CliCacheDriver {
             exit_code,
             lines,
             has_non_status: has_non_status || exit_code != 0,
-            new_entries: BTreeSet::new(),
+            ..RunReport::default()
         }
     }
 
@@ -733,6 +689,27 @@ impl CacheDriver for CliCacheDriver {
         items.sort_by(|a, b| a.name.cmp(&b.name));
         items
     }
+}
+
+/// Apply `edits` to the cache file in `bin` (`cmCursesMainForm::Write`). Return the
+/// error text if the cache cannot be read or written.
+fn save_edits(host: &dyn Host, bin: &Path, edits: &[EntryEdit]) -> Result<(), String> {
+    let file = bin.join("CMakeCache.txt");
+    let mut saved = cache::load(host, bin).map_err(|err| {
+        format!(
+            "CMake Error: Error processing file: {}: {err}",
+            file.display()
+        )
+    })?;
+    apply_tui_edits(host, &mut saved, edits);
+    host.create_dir_all(bin)
+        .and_then(|()| cache::save(host, bin, &saved))
+        .map_err(|err| {
+            format!(
+                "CMake Error: Unable to open cache file for save. {}: {err}",
+                file.display()
+            )
+        })
 }
 
 fn apply_tui_edits(host: &dyn Host, disk_cache: &mut rcmake_model::Cache, edits: &[EntryEdit]) {
@@ -789,7 +766,7 @@ mod tests {
     use rcmake_ccmake::terminal::scripted::ScriptedTerminal;
     use rcmake_host::{
         Follow, Host, HostResult, Input, Output, ProcessResult, PureHost, ReadRange, RunOutput,
-        Stream,
+        RunRequest, Stream,
     };
 
     use super::*;
@@ -838,10 +815,9 @@ endif()
         host.set_command_handler(move |_, req, _| {
             if req.pipeline[0].program == "/tools/probe" {
                 counter_ref.fetch_add(1, Ordering::SeqCst);
-                // Verify Audit Finding #7: inherited stdin became Null and outputs became Capture!
                 assert_eq!(req.stdin, Input::Null);
-                assert_eq!(req.stdout, Output::Capture);
-                assert_eq!(req.stderr, Output::Capture);
+                assert_eq!(req.stdout, Output::Stream);
+                assert_eq!(req.stderr, Output::Stream);
                 return Ok(RunOutput {
                     results: vec![ProcessResult::Exited(0)],
                     stdout: b"CHILD_STDOUT_MARKER\n".to_vec(),
@@ -864,7 +840,6 @@ execute_process(COMMAND /tools/probe)
 "#,
         )?;
 
-        // Phase 1: run ONLY `c` then `e` (dismiss stderr log) then `q` — assert NO build.ninja!
         let mut term1 = ScriptedTerminal::new(80, 24);
         term1.push_bytes(b"ceq");
         let args = argv(&["ccmake", "-S", "src", "-B", "bld", "-G", "Ninja"]);
@@ -892,19 +867,15 @@ execute_process(COMMAND /tools/probe)
             screen_bytes.contains("CHILD_STDERR_MARKER"),
             "log must capture child stderr: {screen_bytes}"
         );
-        // Host stdout/stderr must remain completely untouched by child output!
         assert!(host.stream_bytes(Stream::Stdout).is_empty());
         assert!(host.stream_bytes(Stream::Stderr).is_empty());
 
-        // Phase 2: open existing build dir, toggle OPT -> ON, press `c`, `e`, then `g`.
-        // Assert `g` writes build.ninja WITHOUT incrementing configure_count!
         let mut term2 = ScriptedTerminal::new(80, 24);
         term2.push_bytes(b"/OPT\n\rceg");
         assert_eq!(
             run_with_terminal(&args, Persona::Compat, host.clone(), &mut term2),
             0
         );
-        // Exactly ONE more configure ran (from `c`); `g` did NOT re-run configure!
         assert_eq!(configure_count.load(Ordering::SeqCst), 2);
         assert!(
             host.metadata(Path::new("/work/bld/build.ninja"), Follow::Yes)
@@ -1011,6 +982,214 @@ execute_process(COMMAND /tools/probe)
             read(&host_cmake, "build.ninja")?
         );
         assert_eq!(read(&host_ccmake, "feature.txt")?, b"enabled\n");
+        Ok(())
+    }
+
+    fn request(stdout: Output, stderr: Output, tee: bool) -> RunRequest {
+        RunRequest {
+            pipeline: vec![rcmake_host::CommandSpec {
+                program: "/tools/probe".into(),
+                args: Vec::new(),
+            }],
+            cwd: "/work".into(),
+            env: Vec::new(),
+            stdin: Input::Inherit,
+            stdout,
+            stderr,
+            timeout: None,
+            tee,
+        }
+    }
+
+    fn chatty_host() -> HostResult<Arc<PureHost>> {
+        let host = Arc::new(PureHost::default());
+        host.seed_file(Path::new("/tools/probe"), b"")?;
+        host.set_command_handler(|_, _, on_output| {
+            on_output(Stream::Stdout, b"live out\n");
+            on_output(Stream::Stderr, b"live err\n");
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                stdout: vec![b'o'; 1 << 20],
+                stderr: b"captured err\n".to_vec(),
+            })
+        })?;
+        Ok(host)
+    }
+
+    #[test]
+    fn capture_log_keeps_a_bounded_prefix() {
+        let mut log = CaptureLog::default();
+        let line = [vec![b'x'; 1023], vec![b'\n']].concat();
+        for _ in 0..(2 * MAX_CAPTURE_BYTES / line.len()) {
+            log.push(Stream::Stdout, &line);
+        }
+        assert!(log.truncated);
+        assert!(log.total_bytes <= MAX_CAPTURE_BYTES);
+        let (lines, _) = log.drain();
+        assert!(lines.len() <= MAX_CAPTURE_LINES + 1);
+        assert_eq!(
+            lines.last().map(|line| line.text.clone()),
+            Some(BString::from("... [output truncated]"))
+        );
+    }
+
+    #[test]
+    fn inherited_output_streams_to_the_log_outside_the_capture_limit() -> HostResult<()> {
+        let capture = CaptureHost::new(chatty_host()?);
+        let output = capture.run_bounded(&request(Output::Inherit, Output::Capture, false), 64)?;
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"captured err\n");
+        let (lines, _) = capture.drain();
+        assert_eq!(
+            lines.first().map(|line| line.text.clone()),
+            Some("live out".into())
+        );
+        assert!(lines.iter().all(|line| !line.is_error));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_capture_keeps_the_caller_tee_setting() -> HostResult<()> {
+        let capture = CaptureHost::new(chatty_host()?);
+        let mut forwarded = Vec::new();
+        let output = capture.run(
+            &request(Output::Inherit, Output::Capture, false),
+            &mut |stream, bytes| forwarded.push((stream, bytes.to_vec())),
+        )?;
+        assert!(forwarded.is_empty());
+        assert_eq!(output.stderr, b"captured err\n");
+        let output = capture.run(
+            &request(Output::Inherit, Output::Capture, true),
+            &mut |stream, bytes| forwarded.push((stream, bytes.to_vec())),
+        )?;
+        assert_eq!(forwarded, [(Stream::Stderr, b"live err\n".to_vec())]);
+        assert_eq!(output.stderr, b"captured err\n");
+        Ok(())
+    }
+
+    #[test]
+    fn deadline_updates_see_only_the_requested_streams() -> HostResult<()> {
+        let capture = CaptureHost::new(chatty_host()?);
+        let mut seen = Vec::new();
+        capture.run_controlled(
+            &request(Output::Inherit, Output::Capture, false),
+            None,
+            None,
+            &mut |stream, _| {
+                seen.push(stream);
+                None
+            },
+        )?;
+        assert_eq!(seen, [Stream::Stderr]);
+        Ok(())
+    }
+
+    fn driver(host: &Arc<PureHost>, args: &[&str]) -> CliCacheDriver {
+        CliCacheDriver::new(
+            "ccmake".into(),
+            argv(args),
+            Persona::Compat,
+            Arc::clone(host) as Arc<dyn Host>,
+        )
+    }
+
+    fn cache_text(host: &PureHost) -> HostResult<String> {
+        let bytes = host.read(
+            Path::new("/work/bld/CMakeCache.txt"),
+            ReadRange::All { limit: 1 << 20 },
+        )?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[test]
+    fn cli_cache_arguments_apply_after_ui_edits_on_every_configure() -> HostResult<()> {
+        let host = crate::driver_tests::project_host();
+        seed_two_option_project(&host)?;
+        let mut driver = driver(&host, &["-S", "src", "-B", "bld", "-DOPT=ON"]);
+        assert_eq!(driver.configure(&[]).exit_code, 0);
+        let edits = [
+            EntryEdit::Set {
+                name: "OPT".into(),
+                ty: CacheType::Bool,
+                value: "OFF".into(),
+            },
+            EntryEdit::Set {
+                name: "OTHER".into(),
+                ty: CacheType::Bool,
+                value: "OFF".into(),
+            },
+        ];
+        let report = driver.configure(&edits);
+        assert_eq!(report.exit_code, 0);
+        assert!(!report.edits_pending);
+        let text = cache_text(&host)?;
+        assert!(text.contains("OPT:BOOL=ON\n"), "{text}");
+        assert!(text.contains("OTHER:BOOL=OFF\n"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_cache_keeps_the_edits_and_skips_configure() -> HostResult<()> {
+        let host = crate::driver_tests::project_host();
+        seed_two_option_project(&host)?;
+        host.create_dir_all(Path::new("/work/bld/CMakeCache.txt"))?;
+        let mut driver = driver(&host, &["-S", "src", "-B", "bld"]);
+        let report = driver.configure(&[EntryEdit::Set {
+            name: "OPT".into(),
+            ty: CacheType::Bool,
+            value: "ON".into(),
+        }]);
+        assert_eq!(report.exit_code, 1);
+        assert!(report.edits_pending);
+        assert!(
+            report.lines.iter().any(|line| line.is_error
+                && line
+                    .text
+                    .starts_with(b"CMake Error: Error processing file: ")),
+            "{:?}",
+            report.lines
+        );
+        assert!(driver.retained.is_none());
+        assert!(
+            host.metadata(Path::new("/work/bld/feature.txt"), Follow::Yes)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_first_form_shows_initial_cache_scripts_and_preloads() -> HostResult<()> {
+        let host = crate::driver_tests::project_host();
+        seed_two_option_project(&host)?;
+        host.seed_file(
+            Path::new("/work/init.cmake"),
+            b"set(FROM_C \"c\" CACHE STRING \"From -C\")\n",
+        )?;
+        host.seed_file(
+            Path::new("/work/src/PreLoad.cmake"),
+            b"set(FROM_PRELOAD \"p\" CACHE STRING \"From PreLoad\")\n",
+        )?;
+        let mut driver = driver(
+            &host,
+            &["-S", "src", "-B", "bld", "-C", "init.cmake", "-DOPT=ON"],
+        );
+        let snapshot = driver
+            .load()
+            .map_err(|err| rcmake_host::HostError::unsupported(err.message))?;
+        let value = |name: &str| {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.value.clone())
+        };
+        assert_eq!(value("FROM_C"), Some("c".into()));
+        assert_eq!(value("FROM_PRELOAD"), Some("p".into()));
+        assert_eq!(value("OPT"), Some("ON".into()));
+        assert!(
+            host.metadata(Path::new("/work/bld/CMakeCache.txt"), Follow::Yes)
+                .is_err()
+        );
         Ok(())
     }
 }

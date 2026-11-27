@@ -75,6 +75,7 @@ pub fn codemodel_link_flags(
     if kind == LinkKind::StaticArchive {
         return Ok((flags, ipo));
     }
+    let split_swift = super::swift::is_split_build(model, target);
     if kind == LinkKind::Executable {
         let mut language_flags = language_flags(model, target, config, language);
         if ipo {
@@ -84,6 +85,37 @@ pub fn codemodel_link_flags(
                     .into_iter()
                     .flat_map(|value| list::split(value, list::Empty::Drop)),
             );
+        }
+        if language == b"CUDA" {
+            language_flags.extend(
+                super::cuda::link_flags(model, target, config)
+                    .iter()
+                    .map(|flag| super::compile::codemodel_flag_quote(model, target, flag)),
+            );
+        } else if language == b"HIP" {
+            language_flags.extend(
+                super::hip::link_flags(model, target, config)
+                    .iter()
+                    .map(|flag| super::compile::codemodel_flag_quote(model, target, flag)),
+            );
+        } else if language == b"Swift" && split_swift {
+            let compiler_version = definition(model, target.dir, b"CMAKE_Swift_COMPILER_VERSION")
+                .map_or(b"".as_slice(), |value| value.as_slice());
+            if compiler_version.is_empty()
+                || rcmake_base::version::compare(compiler_version, b"5.8").is_ge()
+            {
+                let package = super::swift::swift_package_name(model, target);
+                if !package.is_empty()
+                    && let Some(flag) =
+                        definition(model, target.dir, b"CMAKE_Swift_PACKAGE_NAME_FLAG")
+                            .filter(|value| !value.is_empty())
+                {
+                    language_flags.push(flag.clone());
+                    language_flags.push(super::compile::codemodel_flag_quote(
+                        model, target, &package,
+                    ));
+                }
+            }
         }
         // `DumpLinkCommandFragments` trims the language flags and drops them when empty.
         flags.push(join_words(language_flags).trim_ascii().into());
@@ -97,15 +129,26 @@ pub fn codemodel_link_flags(
         };
         flags.push(value);
     }
-    let base = [b"CMAKE_", kind.flag_class(), b"_LINKER_FLAGS"].concat();
-    let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
-    flags.push(join_words(
-        [base.as_slice(), &configured]
-            .into_iter()
-            .filter_map(|key| {
-                definition(model, target.dir, key).map(|value| wrapper.driver_flags(value))
-            }),
-    ));
+    let include_linker_flags = match kind {
+        LinkKind::Executable => {
+            language != b"Swift"
+                || (split_swift
+                    && target.policies.policies.get(PolicyId::new(214)) == PolicyStatus::New)
+        }
+        LinkKind::SharedLibrary | LinkKind::ModuleLibrary => language != b"Swift" || split_swift,
+        LinkKind::StaticArchive => language != b"Swift",
+    };
+    if include_linker_flags {
+        let base = [b"CMAKE_", kind.flag_class(), b"_LINKER_FLAGS"].concat();
+        let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
+        flags.push(join_words(
+            [base.as_slice(), &configured]
+                .into_iter()
+                .filter_map(|key| {
+                    definition(model, target.dir, key).map(|value| wrapper.driver_flags(value))
+                }),
+        ));
+    }
     let mut flags: Vec<BString> = flags
         .into_iter()
         .map(|value| value.trim_ascii().into())
@@ -180,15 +223,31 @@ pub(super) fn link(
         super::apple::arch::flags(model, target, config, language, None)?
     };
     let language_compile_flags = (ninja_posix && kind != LinkKind::Executable).then(|| {
+        let mut lang_flags = driver.clone();
+        if language == b"CUDA" {
+            lang_flags.extend(
+                super::cuda::link_flags(model, target, config)
+                    .iter()
+                    .map(|flag| quote(flag)),
+            );
+        } else if language == b"HIP" {
+            lang_flags.extend(
+                super::hip::link_flags(model, target, config)
+                    .iter()
+                    .map(|flag| quote(flag)),
+            );
+        }
         [
-            join_words(driver.iter().cloned()).trim_ascii_start(),
+            join_words(lang_flags).trim_ascii_start(),
             b" ",
             join_words(arch.iter().cloned()).as_slice(),
         ]
         .concat()
         .into()
     });
-    let swift_group = (language == b"Swift")
+    let split_swift = super::swift::is_split_build(model, target);
+    let one_step_swift = language == b"Swift" && super::compile::is_one_step_swift(model, target);
+    let swift_group = one_step_swift
         .then(|| {
             resolved
                 .compile_groups
@@ -213,6 +272,19 @@ pub(super) fn link(
             usage,
         )?)
     } else {
+        if language == b"CUDA" {
+            driver.extend(
+                super::cuda::link_flags(model, target, config)
+                    .iter()
+                    .map(|flag| quote(flag)),
+            );
+        } else if language == b"HIP" {
+            driver.extend(
+                super::hip::link_flags(model, target, config)
+                    .iter()
+                    .map(|flag| quote(flag)),
+            );
+        }
         driver.extend(arch);
         join_words(driver)
     };
@@ -230,22 +302,29 @@ pub(super) fn link(
     let create = creation_flags(model, target, step.kind, language)
         .map_or_else(|| kind.default_create_flag(darwin).into(), Clone::clone);
     flags.push(parse_flags(create)?);
-    let base = if kind == LinkKind::SharedLibrary
-        && darwin
-        && target
-            .props
-            .get(b"FRAMEWORK")
-            .is_some_and(|value| truth::is_on(value))
-        && model.generator == Some(rcmake_model::GeneratorKind::UnixMakefiles)
-    {
-        b"CMAKE_MACOSX_FRAMEWORK_LINKER_FLAGS".to_vec()
-    } else {
-        [b"CMAKE_", kind.flag_class(), b"_LINKER_FLAGS"].concat()
+    let include_linker_flags = match kind {
+        LinkKind::Executable => language != b"Swift" || (split_swift && policy_new(214)),
+        LinkKind::SharedLibrary | LinkKind::ModuleLibrary => language != b"Swift" || split_swift,
+        LinkKind::StaticArchive => language != b"Swift",
     };
-    let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
-    for key in [&base, &configured] {
-        if let Some(value) = definition(model, target.dir, key) {
-            flags.push(parse_flags(value.clone())?);
+    if include_linker_flags {
+        let base = if kind == LinkKind::SharedLibrary
+            && darwin
+            && target
+                .props
+                .get(b"FRAMEWORK")
+                .is_some_and(|value| truth::is_on(value))
+            && model.generator == Some(rcmake_model::GeneratorKind::UnixMakefiles)
+        {
+            b"CMAKE_MACOSX_FRAMEWORK_LINKER_FLAGS".to_vec()
+        } else {
+            [b"CMAKE_", kind.flag_class(), b"_LINKER_FLAGS"].concat()
+        };
+        let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
+        for key in [&base, &configured] {
+            if let Some(value) = definition(model, target.dir, key) {
+                flags.push(parse_flags(value.clone())?);
+            }
         }
     }
     if kind != LinkKind::StaticArchive && policy_new(210) {
@@ -491,7 +570,6 @@ pub(super) fn link(
     let output_ext = Lexical::new(&step.output).stem_extension(true).1;
     let output_base = quote(step.output.strip_suffix(output_ext).unwrap_or(&step.output));
     let object_dir = super::object_dir(model, target, config);
-    let one_step_swift = language == b"Swift" && super::compile::is_one_step_swift(model, target);
     let swift_defines = swift_group
         .map(|group| super::compile::formatted_defines(model, target, config, group))
         .unwrap_or_default();
@@ -501,7 +579,7 @@ pub(super) fn link(
     let mut extra_outputs = Vec::new();
     let mut swift_output_file_map = None;
     let mut driver = driver;
-    let swift_sources = (language == b"Swift").then(|| {
+    let swift_sources = one_step_swift.then(|| {
         let source_dir = &model.dir(target.dir).source_dir;
         let mut swift_unit_objects = IndexSet::new();
         let mut emitted_objects = IndexSet::new();
@@ -590,16 +668,16 @@ pub(super) fn link(
         }
         join_words(entries.iter().map(|path| quote(path)))
     });
-    let swift_library_name = if language == b"Swift" {
-        Some(swift_library_base_name(
+    let swift_library_name = if one_step_swift {
+        Some(super::swift::library_base_name(
             model, target, config, resolved, usage,
         )?)
     } else {
         None
     };
-    let swift_module_name = (language == b"Swift").then(|| swift_module_name(target));
-    let swift_module = if language == b"Swift" {
-        Some(swift_module_path(
+    let swift_module_name = one_step_swift.then(|| super::swift::module_name(target));
+    let swift_module = if one_step_swift {
+        Some(super::swift::module_path(
             model,
             target,
             config,
@@ -1080,142 +1158,4 @@ fn linked_libraries(step: &LinkStep) -> Vec<BString> {
         .flat_map(|fragment| simple_args(&fragment.text.value).into_iter().flatten())
         .filter(|arg| library_file(arg))
         .collect()
-}
-
-fn swift_library_base_name(
-    model: &ProjectModel,
-    target: &Target,
-    config: &ConfigId,
-    resolved: &ResolvedTarget,
-    usage: &mut UsageResolver<'_>,
-) -> Result<BString, ResolveError> {
-    if let Some(ide) = &resolved.ide
-        && !ide.naming.base_name.is_empty()
-    {
-        return Ok(ide.naming.base_name.clone());
-    }
-    let class = match target.kind {
-        rcmake_model::TargetKind::Executable => "RUNTIME",
-        rcmake_model::TargetKind::StaticLibrary => "ARCHIVE",
-        _ => "LIBRARY",
-    };
-    let config_upper = config.0.to_ascii_uppercase();
-    let raw_name = super::output_name_keys(class, &config_upper)
-        .into_iter()
-        .find_map(|key| {
-            target
-                .props
-                .get(key.as_slice())
-                .filter(|value| !value.is_empty())
-                .map(|value| (key, value))
-        });
-    let base = if let Some((key, value)) = raw_name {
-        if value.windows(2).any(|part| part == b"$<")
-            && let Some(id) = model.find_target(target.dir, &target.name)
-        {
-            let ctx = EvalContext {
-                config: config.clone(),
-                head: Some(crate::usage::handle(id)),
-                ..EvalContext::default()
-            };
-            usage.eval_ide_property(id, &key, value, &ctx)?
-        } else {
-            value.clone()
-        }
-    } else {
-        target.name.clone()
-    };
-    let postfix = if !config.0.is_empty() {
-        let postfix_key = [config_upper.as_slice(), b"_POSTFIX"].concat();
-        let value = if target.kind == rcmake_model::TargetKind::Executable {
-            target.props.get(&postfix_key)
-        } else {
-            super::target_property(model, target, &postfix_key)
-        };
-        value.map_or(b"".as_slice(), |value| value.as_slice())
-    } else {
-        b""
-    };
-    Ok([base.as_slice(), postfix].concat().into())
-}
-
-fn swift_module_name(target: &Target) -> BString {
-    if let Some(name) = target
-        .props
-        .get(b"Swift_MODULE_NAME")
-        .filter(|value| !value.is_empty())
-    {
-        return name.clone();
-    }
-    target
-        .name
-        .iter()
-        .map(|&byte| if byte == b'-' { b'_' } else { byte })
-        .collect::<Vec<_>>()
-        .into()
-}
-
-fn swift_module_path(
-    model: &ProjectModel,
-    target: &Target,
-    config: &ConfigId,
-    module_name: &[u8],
-    usage: &mut UsageResolver<'_>,
-) -> Result<BString, ResolveError> {
-    let mut filename = target
-        .props
-        .get(b"Swift_MODULE")
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .unwrap_or_else(|| [module_name, b".swiftmodule"].concat().into());
-    if target.policies.policies.get(PolicyId::new(195)) == PolicyStatus::New
-        && let Some(triple) =
-            definition(model, target.dir, b"CMAKE_Swift_MODULE_TRIPLE").filter(|v| !v.is_empty())
-    {
-        filename = [
-            filename.as_slice(),
-            b"/",
-            triple.as_slice(),
-            b".swiftmodule",
-        ]
-        .concat()
-        .into();
-    }
-    let binary_dir = &model.dir(target.dir).binary_dir;
-    let mut append_config = true;
-    let mut dir = if let Some(raw) = target
-        .props
-        .get(b"Swift_MODULE_DIRECTORY")
-        .filter(|value| !value.is_empty())
-    {
-        let evaluated = if raw.windows(2).any(|part| part == b"$<")
-            && let Some(id) = model.find_target(target.dir, &target.name)
-        {
-            let ctx = EvalContext {
-                config: config.clone(),
-                head: Some(crate::usage::handle(id)),
-                ..EvalContext::default()
-            };
-            usage.eval_ide_property(id, b"Swift_MODULE_DIRECTORY", raw, &ctx)?
-        } else {
-            raw.clone()
-        };
-        append_config = evaluated == *raw;
-        if evaluated.is_empty() {
-            binary_dir.clone()
-        } else {
-            join(binary_dir, &evaluated)
-        }
-    } else {
-        binary_dir.clone()
-    };
-    if append_config
-        && model
-            .generator
-            .is_some_and(rcmake_model::GeneratorKind::multi_config)
-        && !config.0.is_empty()
-    {
-        dir = join(&dir, &config.0);
-    }
-    Ok(build_relative(model, &join(&dir, &filename)))
 }

@@ -14,7 +14,8 @@ use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_model::{DirId, Directory, GeneratorKind, ProjectModel, Target, TargetId, TargetKind};
 use rcmake_resolve::{
     ArtifactSet, LinkFragmentRole, LinkKind, ResolvedTarget, TargetMetadata,
-    lower::codemodel_link_flags, usage::UsageResolver,
+    lower::{codemodel_link_flags, codemodel_runtime_link_fragments},
+    usage::UsageResolver,
 };
 
 use crate::{
@@ -573,6 +574,37 @@ impl FileApi<'_, '_> {
                     }),
             );
             if !static_archive {
+                let mut runtime_paths_frags = Vec::new();
+                let mut runtime_libs_frags = Vec::new();
+                if let Some(raw) = raw {
+                    let mut languages = indexmap::IndexSet::new();
+                    for group in &target.compile_groups {
+                        languages.insert(group.language.clone());
+                    }
+                    for &dep_id in &target.dependencies {
+                        if let Some(dep_ref) = targets.get(&dep_id) {
+                            for group in &dep_ref.target.compile_groups {
+                                languages.insert(group.language.clone());
+                            }
+                        }
+                    }
+                    let extra = codemodel_runtime_link_fragments(
+                        self.model,
+                        raw,
+                        &target.config,
+                        link,
+                        &languages,
+                        usage,
+                    )
+                    .map_err(|error| GenError::Invalid(error.to_string().into()))?;
+                    for (role, text) in extra {
+                        if role == "libraryPath" {
+                            runtime_paths_frags.push(text);
+                        } else {
+                            runtime_libs_frags.push(text);
+                        }
+                    }
+                }
                 fragments.extend(framework_flags);
                 fragments.extend(link.fragments.iter().filter_map(|fragment| {
                     if fragment.role != LinkFragmentRole::LibraryPath {
@@ -582,6 +614,12 @@ impl FileApi<'_, '_> {
                     graph.tagged_value(&mut item, "fragment", &fragment.text);
                     Some(Object(item))
                 }));
+                for text in runtime_paths_frags {
+                    fragments.push(object([
+                        ("role", Value::string("libraryPath")),
+                        ("fragment", Value::string(text)),
+                    ]));
+                }
                 let ninja = self.generator().is_some_and(GeneratorKind::is_ninja);
                 let runtime_paths = config_indices
                     .build_graph
@@ -601,9 +639,22 @@ impl FileApi<'_, '_> {
                         return None;
                     }
                     let mut item = members([("role", Value::string("libraries"))]);
-                    graph.tagged_value(&mut item, "fragment", &fragment.text);
+                    let mut entry = fragment.text.clone();
+                    if !ninja && !entry.value.starts_with(b"-") {
+                        let rel = relative_preserve_dots(&entry.value, self.build);
+                        if rel != entry.value {
+                            entry.value = rel;
+                        }
+                    }
+                    graph.tagged_value(&mut item, "fragment", &entry);
                     Some(Object(item))
                 }));
+                for text in runtime_libs_frags {
+                    fragments.push(object([
+                        ("role", Value::string("libraries")),
+                        ("fragment", Value::string(text)),
+                    ]));
+                }
                 if let Some(rpath_link) = runtime_paths
                     .and_then(|paths| paths.rpath_link.as_deref())
                     .map(|value| format_runtime_path_fragment(value, ninja))

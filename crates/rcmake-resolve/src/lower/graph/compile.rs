@@ -2,29 +2,41 @@ use super::*;
 use crate::lower::compile::{Settings, compile};
 use crate::lower::{fortran, modules, pch::PchFlags};
 
+pub(super) struct CompileSink<'a> {
+    pub(super) steps: &'a mut Vec<BuildStep>,
+    pub(super) step_offset: usize,
+    pub(super) compile_launchers: &'a mut IndexMap<BString, BString>,
+    pub(super) swift_actions: &'a mut IndexMap<usize, crate::SwiftAction>,
+    pub(super) swift_output_file_maps: &'a mut IndexMap<BString, BString>,
+}
+
 impl TargetPlan<'_> {
     #[expect(
         clippy::too_many_arguments,
-        reason = "Compile lowering writes graph steps and prerequisite inputs."
+        reason = "Compile lowering writes graph steps, Swift actions, and prerequisite inputs."
     )]
     pub(super) fn add_compile_steps(
         &mut self,
         artifacts: &ArtifactSet,
         commands: &Commands<'_>,
         precompiled: &pch::Plans,
+        resolved_targets: &IndexMap<TargetId, &ResolvedTarget>,
         (lint, framework_dirs): (&IndexMap<BString, bool>, &[(BString, bool)]),
         fortran: Option<&fortran::FortranPlan>,
         usage: &mut UsageResolver<'_>,
-        (graph_steps, step_offset, compile_launchers): (
-            &mut Vec<BuildStep>,
-            usize,
-            &mut IndexMap<BString, BString>,
-        ),
+        sink: CompileSink<'_>,
         (compile_inputs, ide_pch): (
             &mut BTreeMap<BString, Vec<BString>>,
             Option<&mut Vec<crate::ide::IdePch>>,
         ),
     ) -> Result<Vec<BString>, ResolveError> {
+        let CompileSink {
+            steps: graph_steps,
+            step_offset,
+            compile_launchers,
+            swift_actions,
+            swift_output_file_maps,
+        } = sink;
         let (model, config, target, resolved) =
             (self.model, self.config, self.target, self.resolved);
         let dir = model.dir(target.dir);
@@ -66,6 +78,54 @@ impl TargetPlan<'_> {
                 .link
                 .as_ref()
                 .is_some_and(|link| link.language == b"Swift");
+        let split_swift = super::super::swift::is_split_build(model, target);
+        if split_swift
+            && let Some(lowered_swift) = super::super::swift::lower_target(
+                model,
+                target,
+                config,
+                resolved,
+                resolved_targets,
+                self.inputs,
+                &self.dependencies,
+                framework_dirs,
+                position_independent,
+                usage,
+            )?
+        {
+            // Collect any per-source generated/OBJECT_DEPENDS inputs for Swift sources.
+            let mut swift_extra_inputs = IndexSet::new();
+            for unit in &resolved.compile_units {
+                let is_swift = resolved
+                    .compile_groups
+                    .get(unit.group)
+                    .is_some_and(|group| group.language == b"Swift");
+                if is_swift && let Some(extra) = self.source_file_inputs.get(&unit.source.value) {
+                    swift_extra_inputs.extend(extra.iter().cloned());
+                }
+            }
+            for (step, action, launcher) in lowered_swift.steps {
+                if let Some(primary) = action.outputs.first() {
+                    if let Some(launcher) = launcher {
+                        compile_launchers.insert(primary.clone(), launcher);
+                    }
+                    if !swift_extra_inputs.is_empty() {
+                        compile_inputs
+                            .entry(primary.clone())
+                            .or_default()
+                            .extend(swift_extra_inputs.iter().cloned());
+                    }
+                }
+                let idx = push_offset(graph_steps, step_offset, step);
+                self.steps.insert(idx);
+                swift_actions.insert(idx, action);
+            }
+            objects.extend(lowered_swift.objects);
+            if let Some((path, content)) = lowered_swift.output_file_map {
+                swift_output_file_maps.insert(path, content);
+            }
+            self.swift_module_output = lowered_swift.module_output;
+        }
 
         for unit in &resolved.compile_units {
             let Some(group) = resolved.compile_groups.get(unit.group) else {
@@ -79,8 +139,9 @@ impl TargetPlan<'_> {
                 ));
             };
             // In one-step Swift mode (`CMAKE_Swift_COMPILE_OBJECT == ":"`), Swift sources
-            // are compiled directly during the link step, which owns their `.o` outputs.
-            if one_step_swift && group.language == b"Swift" {
+            // are compiled directly during the link step; in split Swift mode (`CMP0157` NEW),
+            // Swift sources are compiled as grouped module/object actions above.
+            if (one_step_swift || split_swift) && group.language == b"Swift" {
                 continue;
             }
             let required_standard = self

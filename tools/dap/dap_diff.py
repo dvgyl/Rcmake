@@ -57,6 +57,7 @@ class Client:
         self.buf = b""
         self.seq = 0
         self.log: list[dict] = []
+        self.pending: list[dict] = []
 
     def send(self, command: str, arguments: dict | None = None) -> int:
         self.seq += 1
@@ -87,10 +88,15 @@ class Client:
         return message
 
     def until(self, predicate) -> dict | None:
+        for index, message in enumerate(self.pending):
+            if predicate(message):
+                return self.pending.pop(index)
         while True:
             message = self.recv()
             if message is None or predicate(message):
                 return message
+            if stop_or_end(message):
+                self.pending.append(message)
 
     def request(self, command: str, arguments: dict | None = None) -> dict | None:
         seq = self.send(command, arguments)
@@ -237,10 +243,33 @@ def filter_rows(message):
     return dict(message, body=dict(body, variables=rows))
 
 
+RESUME_COMMANDS = {"configurationDone", "continue", "next", "stepIn", "stepOut"}
+
+
+def canonicalize_resume_order(log: list) -> list:
+    """Place a resume response ahead of an immediately racing stop/end event."""
+    out = list(log)
+    index = 0
+    while index + 1 < len(out):
+        first, second = out[index], out[index + 1]
+        if (
+            isinstance(first, dict)
+            and isinstance(second, dict)
+            and stop_or_end(first)
+            and second.get("type") == "response"
+            and second.get("command") in RESUME_COMMANDS
+        ):
+            out[index], out[index + 1] = second, first
+            index += 2
+        else:
+            index += 1
+    return out
+
+
 def normalize(log: list, replacements) -> list[str]:
     normalizer = Normalizer(replacements)
     lines = []
-    for message in log:
+    for message in canonicalize_resume_order(log):
         message = filter_rows(normalizer.walk(message))
         lines.append(json.dumps(message, sort_keys=True))
     return lines

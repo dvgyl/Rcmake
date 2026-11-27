@@ -79,9 +79,28 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         [ProcessResult::Exited(0), ProcessResult::Exited(0)]
     );
     assert!(host.run_bounded(&req, 64).is_err());
+    let total = bytes.len();
+
+    req.stdout = Output::Stream;
+    let mut streamed = 0;
+    let output = host.run_bounded_streaming(&req, 64, &mut |stream, bytes| {
+        assert_eq!(stream, Stream::Stdout);
+        streamed += bytes.len();
+    })?;
+    assert_eq!(streamed, total);
+    assert!(output.stdout.is_empty());
 
     req.pipeline = vec![stage("report")];
     req.stdin = Input::Null;
+    let mut live = Vec::new();
+    let output = host.run(&req, &mut |stream, bytes| {
+        live.push((stream, bytes.to_vec()))
+    })?;
+    assert_eq!(live, [(Stream::Stdout, b"out".to_vec())]);
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"err");
+
+    req.stdout = Output::Capture;
     req.stderr = Output::SharedWithStdout;
     req.tee = true;
     let mut live = Vec::new();

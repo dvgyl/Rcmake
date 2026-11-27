@@ -315,6 +315,22 @@ fn launch_parts(invocation: &Invocation) -> Option<(BString, &[u8], &[u8])> {
     None
 }
 
+fn compile_step_invocation<'a>(
+    graph: &'a rcmake_resolve::BuildGraph,
+    step_index: usize,
+    step: &'a BuildStep,
+) -> Option<&'a Invocation> {
+    match step {
+        BuildStep::Compile { invocation, .. } => Some(invocation),
+        BuildStep::Custom(custom)
+            if graph.swift_actions.contains_key(&step_index) && custom.invocations.len() == 1 =>
+        {
+            custom.invocations.first()
+        }
+        _ => None,
+    }
+}
+
 /// Collect every distinct `--launch` program across `result` in deterministic
 /// first-seen order, returning both the ordered list and a program-to-slot map.
 pub(crate) fn collect_launchers(
@@ -322,16 +338,18 @@ pub(crate) fn collect_launchers(
 ) -> (Vec<BString>, BTreeMap<BString, usize>) {
     let mut ordered = Vec::new();
     let mut slots = BTreeMap::new();
-    for step in result.graphs.iter().flat_map(|graph| &graph.steps) {
-        let BuildStep::Compile { invocation, .. } = step else {
-            continue;
-        };
-        if let Some((program, _, _)) = launch_parts(invocation)
-            && !slots.contains_key(&program)
-        {
-            let slot = ordered.len();
-            ordered.push(program.clone());
-            slots.insert(program, slot);
+    for graph in &result.graphs {
+        for (step_index, step) in graph.steps.iter().enumerate() {
+            let Some(invocation) = compile_step_invocation(graph, step_index, step) else {
+                continue;
+            };
+            if let Some((program, _, _)) = launch_parts(invocation)
+                && !slots.contains_key(&program)
+            {
+                let slot = ordered.len();
+                ordered.push(program.clone());
+                slots.insert(program, slot);
+            }
         }
     }
     (ordered, slots)
@@ -397,17 +415,16 @@ pub(crate) fn emit_rules(
     in_build_dir: bool,
     commands: &Commands,
 ) {
-    if let Some(program) = result
-        .graphs
-        .iter()
-        .flat_map(|graph| &graph.steps)
-        .find_map(|step| {
-            let BuildStep::Compile { invocation, .. } = step else {
-                return None;
-            };
-            arguments(invocation).map(|(program, _)| program)
-        })
-    {
+    if let Some(program) = result.graphs.iter().find_map(|graph| {
+        graph
+            .steps
+            .iter()
+            .enumerate()
+            .find_map(|(step_index, step)| {
+                let invocation = compile_step_invocation(graph, step_index, step)?;
+                arguments(invocation).map(|(program, _)| program)
+            })
+    }) {
         for (_, rule, depfile) in RULES {
             ninja.0.extend_from_slice(b"\nrule ");
             ninja.0.extend_from_slice(rule);

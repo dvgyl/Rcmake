@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
 use rcmake_diag::{PolicyId, PolicyStatus};
 use rcmake_genex::ConfigId;
-use rcmake_model::{ProjectModel, Target, TargetKind};
+use rcmake_model::{DirId, ProjectModel, Target, TargetKind};
 
 mod rule;
 
@@ -27,6 +27,28 @@ pub(crate) struct DeviceLinkPlan {
     pub(crate) inputs: Vec<BString>,
     /// Process invocations and their outputs.
     pub(crate) mode: DeviceLinkMode,
+}
+
+/// Return whether any device-link language is enabled and supports a device-link phase for `target`.
+pub(crate) fn device_link_supported(model: &ProjectModel, target: &Target) -> bool {
+    if !matches!(
+        target.kind,
+        TargetKind::Executable
+            | TargetKind::StaticLibrary
+            | TargetKind::SharedLibrary
+            | TargetKind::ModuleLibrary
+    ) {
+        return false;
+    }
+    let Some(enabled) = model.global.props.get(b"ENABLED_LANGUAGES") else {
+        return false;
+    };
+    let enabled = list::split(enabled, list::Empty::Drop);
+    [b"CUDA".as_slice(), b"SYCL"].into_iter().any(|lang| {
+        enabled.iter().any(|language| language.as_slice() == lang)
+            && lang_definition(model, target, lang, b"_COMPILER_HAS_DEVICE_LINK_PHASE")
+                .is_some_and(|value| truth::is_on(value))
+    })
 }
 
 /// Return the first language that requires a device link.
@@ -514,9 +536,20 @@ fn explicit_plan(
             invocation: direct(argv, None),
         });
     }
+    let build_root = &rule.model.dir(DirId::ROOT).binary_dir;
+    let abs_fatbin = if build_root.is_empty() {
+        fatbin_header.clone()
+    } else {
+        join(build_root, &fatbin_header)
+    };
+    let abs_register = if build_root.is_empty() {
+        register_header.clone()
+    } else {
+        join(build_root, &register_header)
+    };
     let compile = rule.expand(
         get(b"CMAKE_CUDA_DEVICE_LINK_COMPILE")?,
-        Some((&fatbin_header, &register_header)),
+        Some((&abs_fatbin, &abs_register)),
     )?;
     Ok(DeviceLinkMode::Explicit {
         cubins,

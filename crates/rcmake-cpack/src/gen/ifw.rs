@@ -20,7 +20,10 @@ use super::installer::{
     verify_fresh_output, warn, write_tool_log,
 };
 use crate::config::{CpackConfig, absolute, script, snapshot};
-use crate::source::{SymlinkPolicy, copy_checked_tree, validate_staged_tree};
+use crate::source::{
+    SymlinkPolicy, copy_checked_tree, overlay_checked_tree, validate_assembled_payload,
+    validate_staged_tree,
+};
 use crate::{
     ComponentGrouping, ComponentMembers, CpackError, PackageContext, PackageGenerator, error, log,
     safe_name,
@@ -455,11 +458,18 @@ impl Ifw {
                     false,
                 )?;
             } else {
-                for comp_name in &pkg.source_components {
+                let mut sources: Vec<&BString> = pkg.source_components.iter().collect();
+                sources.sort_by_key(|name| {
+                    members
+                        .iter()
+                        .position(|member| &member.name == *name)
+                        .unwrap_or(usize::MAX)
+                });
+                for comp_name in sources {
                     let comp_snap =
                         snapshot_dir.join(crate::stage::component_dir_for_host(comp_name, false));
                     if host.metadata_fresh(&comp_snap, Follow::No).is_ok() {
-                        copy_checked_tree(
+                        overlay_checked_tree(
                             host,
                             &comp_snap,
                             &data_dir,
@@ -469,6 +479,7 @@ impl Ifw {
                     }
                 }
             }
+            validate_assembled_payload(host, &data_dir, SymlinkPolicy::PreserveContained, false)?;
         }
 
         log(host, "- Configuration");
@@ -2031,124 +2042,102 @@ fn write_config_xml(
     if !settings.resources_qrc.is_empty() {
         host.create_dir_all(resources_dir)?;
         for (idx, qrc_path) in settings.resources_qrc.iter().enumerate() {
-            if !host
-                .metadata_fresh(qrc_path, Follow::Yes)
-                .is_ok_and(|m| m.kind == FileKind::File)
-            {
-                warn(
+            match stage_qrc(host, qrc_path, &resources_dir.join(idx.to_string()))? {
+                Some(staged) => staged_qrc.push(staged),
+                None => warn(
                     host,
                     format!(
                         "Can't copy resources from \"{}\". Resource will be skipped.",
                         qrc_path.display()
                     ),
-                );
-                continue;
+                ),
             }
-            let bytes = match host.read(
-                qrc_path,
-                ReadRange::All {
-                    limit: 4 * 1024 * 1024,
-                },
-            ) {
-                Ok(b) => b,
-                Err(_) => {
-                    warn(
-                        host,
-                        format!(
-                            "Can't copy resources from \"{}\". Resource will be skipped.",
-                            qrc_path.display()
-                        ),
-                    );
-                    continue;
-                }
-            };
-            let root = parse_xml_bounded(&bytes, &qrc_path.display().to_string())?;
-            let qrc_base = qrc_path.parent().unwrap_or(Path::new("/"));
-            let canon_qrc_base = host.canonicalize_fresh(qrc_base)?;
-            let mut file_entries = Vec::new();
-            collect_qrc_files(&root, &mut file_entries);
-            if file_entries.is_empty() {
-                warn(
-                    host,
-                    format!(
-                        "Can't copy resources from \"{}\". Resource will be skipped.",
-                        qrc_path.display()
-                    ),
-                );
-                continue;
-            }
-            let mut validated_files = Vec::with_capacity(file_entries.len());
-            let mut missing_asset = false;
-            for rel_str in file_entries {
-                let rel = safe_relative_subpath(&rel_str, &qrc_path.display().to_string())?;
-                let src = qrc_base.join(&rel);
-                if !host
-                    .metadata_fresh(&src, Follow::Yes)
-                    .is_ok_and(|m| m.kind == FileKind::File)
-                {
-                    missing_asset = true;
-                    break;
-                }
-                let canon_src = host.canonicalize_fresh(&src)?;
-                if !canon_src.starts_with(&canon_qrc_base) {
-                    return Err(error(format!(
-                        "Path in {} escapes base directory: \"{rel_str}\"",
-                        qrc_path.display()
-                    )));
-                }
-                validated_files.push((rel, src));
-            }
-            if missing_asset {
-                warn(
-                    host,
-                    format!(
-                        "Can't copy resources from \"{}\". Resource will be skipped.",
-                        qrc_path.display()
-                    ),
-                );
-                continue;
-            }
-            let qrc_stage_dir = resources_dir.join(idx.to_string());
-            host.create_dir_all(&qrc_stage_dir)?;
-            let mut copy_failed = false;
-            for (rel, src) in validated_files {
-                let dst = qrc_stage_dir.join(&rel);
-                if let Some(parent) = dst.parent() {
-                    crate::stage::ensure_dir(host, &qrc_stage_dir, parent)?;
-                }
-                prepare_fresh_output(host, &dst)?;
-                if host
-                    .copy_file(
-                        &src,
-                        &dst,
-                        CopyOptions {
-                            preserve_permissions: true,
-                            preserve_mtime: true,
-                        },
-                    )
-                    .is_err()
-                {
-                    copy_failed = true;
-                    break;
-                }
-            }
-            if copy_failed {
-                let _ = host.remove_dir_all(&qrc_stage_dir);
-                warn(
-                    host,
-                    format!(
-                        "Can't copy resources from \"{}\". Resource will be skipped.",
-                        qrc_path.display()
-                    ),
-                );
-                continue;
-            }
-            let mut seen_qrc = BTreeMap::new();
-            let qrc_name = copy_meta_asset(host, qrc_path, &qrc_stage_dir, None, &mut seen_qrc)?;
-            staged_qrc.push(qrc_stage_dir.join(qrc_name));
         }
     }
     Ok(staged_qrc)
+}
+
+/// Stage the resource descriptor `qrc_path` and its files in `stage_dir`, and return the
+/// staged descriptor.
+///
+/// Return `Ok(None)` if the descriptor or one of its files cannot be read, parsed, or
+/// copied. CMake skips such a resource with a warning. A file path that escapes the
+/// directory of the descriptor is an error.
+fn stage_qrc(
+    host: &dyn Host,
+    qrc_path: &Path,
+    stage_dir: &Path,
+) -> Result<Option<PathBuf>, CpackError> {
+    let label = qrc_path.display().to_string();
+    let is_file = |path: &Path| {
+        host.metadata_fresh(path, Follow::Yes)
+            .is_ok_and(|m| m.kind == FileKind::File)
+    };
+    if !is_file(qrc_path) {
+        return Ok(None);
+    }
+    let Ok(bytes) = host.read(
+        qrc_path,
+        ReadRange::All {
+            limit: 4 * 1024 * 1024,
+        },
+    ) else {
+        return Ok(None);
+    };
+    let Ok(root) = parse_xml_bounded(&bytes, &label) else {
+        return Ok(None);
+    };
+    let qrc_base = qrc_path.parent().unwrap_or(Path::new("/"));
+    let Ok(canon_qrc_base) = host.canonicalize_fresh(qrc_base) else {
+        return Ok(None);
+    };
+    let mut file_entries = Vec::new();
+    collect_qrc_files(&root, &mut file_entries);
+    if file_entries.is_empty() {
+        return Ok(None);
+    }
+    let mut validated_files = Vec::with_capacity(file_entries.len());
+    for rel_str in file_entries {
+        let rel = safe_relative_subpath(&rel_str, &label)?;
+        let src = qrc_base.join(&rel);
+        if !is_file(&src) {
+            return Ok(None);
+        }
+        let Ok(canon_src) = host.canonicalize_fresh(&src) else {
+            return Ok(None);
+        };
+        if !canon_src.starts_with(&canon_qrc_base) {
+            return Err(error(format!(
+                "Path in {label} escapes base directory: \"{rel_str}\""
+            )));
+        }
+        validated_files.push((rel, src));
+    }
+    let staged = (|| -> Result<PathBuf, CpackError> {
+        host.create_dir_all(stage_dir)?;
+        for (rel, src) in validated_files {
+            let dst = stage_dir.join(&rel);
+            if let Some(parent) = dst.parent() {
+                crate::stage::ensure_dir(host, stage_dir, parent)?;
+            }
+            prepare_fresh_output(host, &dst)?;
+            host.copy_file(
+                &src,
+                &dst,
+                CopyOptions {
+                    preserve_permissions: true,
+                    preserve_mtime: true,
+                },
+            )?;
+        }
+        let mut seen_qrc = BTreeMap::new();
+        let qrc_name = copy_meta_asset(host, qrc_path, stage_dir, None, &mut seen_qrc)?;
+        Ok(stage_dir.join(qrc_name))
+    })();
+    if staged.is_err() {
+        let _ = host.remove_dir_all(stage_dir);
+    }
+    Ok(staged.ok())
 }
 
 fn collect_qrc_files(elem: &XmlElement, out: &mut Vec<String>) {

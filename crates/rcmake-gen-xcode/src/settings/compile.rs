@@ -1,7 +1,14 @@
+use rcmake_diag::{Diagnostic, Effect, Location, MessageKind, RenderOptions};
+use rcmake_host::Stream;
+
 use super::*;
 
 impl TargetSettings<'_> {
-    pub(super) fn add_compile_settings(&self, settings: &mut Attrs, ide: Option<&IdeFacts>) {
+    pub(super) fn add_compile_settings(
+        &self,
+        settings: &mut Attrs,
+        ide: Option<&IdeFacts>,
+    ) -> Result<(), GenError> {
         let include_lang = self.target.and_then(|target| {
             preferred_language(target)
                 .or_else(|| compile_group(target, b"Swift").map(|_| b"Swift".as_slice()))
@@ -154,6 +161,124 @@ impl TargetSettings<'_> {
                 inherited_paths(swift_sys_headers.into_vec()),
             );
         }
+        if has_swift {
+            self.add_swift_target_settings(settings)?;
+        }
+        Ok(())
+    }
+
+    fn add_swift_target_settings(&self, settings: &mut Attrs) -> Result<(), GenError> {
+        if let Some(swift_group) = self
+            .target
+            .and_then(|target| compile_group(target, b"Swift"))
+        {
+            // cmGlobalXCodeGenerator.cxx:2902-2926: strip `=value` suffixes from Swift defines.
+            let mut conditions = UniqueList::default();
+            for define in &swift_group.defines {
+                let raw = text(&define.value);
+                let name = raw.split('=').next().unwrap_or(&raw);
+                if !name.is_empty() {
+                    conditions.push_unique(xcode_flag(name));
+                }
+            }
+            if !conditions.is_empty() {
+                settings.insert(
+                    "SWIFT_ACTIVE_COMPILATION_CONDITIONS".into(),
+                    inherited_values(conditions.into_vec()),
+                );
+            }
+            let swift_flags: Vec<String> = swift_group
+                .flags
+                .iter()
+                .filter(|flag| !flag.value.is_empty())
+                .map(|flag| flag_text(&flag.value))
+                .collect();
+            if !swift_flags.is_empty() {
+                settings.insert(
+                    "OTHER_SWIFT_FLAGS".into(),
+                    flags_with_inherited(&swift_flags),
+                );
+            }
+        }
+        // CMP0157 NEW per-target SWIFT_COMPILATION_MODE (`cmGlobalXCodeGenerator.cxx:2928-2945`).
+        if let Some(evaluated) = rcmake_resolve::lower::swift_compilation_mode(
+            self.model,
+            self.raw,
+            self.config.as_bytes(),
+        )
+        .map_err(|error| {
+            let message = match error {
+                rcmake_resolve::ResolveError::Genex(error) => error.without_location().to_string(),
+                error => error.to_string(),
+            };
+            GenError::Invalid(message.into())
+        })? {
+            match evaluated.as_slice() {
+                b"wholemodule" => {
+                    settings.insert("SWIFT_COMPILATION_MODE".into(), "wholemodule".into());
+                }
+                b"incremental" | b"singlefile" => {}
+                _ => {
+                    let diagnostic = Diagnostic {
+                        annotations: None,
+                        kind: MessageKind::AuthorWarning,
+                        effect: Effect::None,
+                        category: None,
+                        policy: None,
+                        location: Location::Backtrace(self.raw.backtrace.clone()),
+                        body: format!(
+                            "Unknown Swift_COMPILATION_MODE on target '{}'",
+                            self.raw.name
+                        )
+                        .into(),
+                    };
+                    self.host.write_out(
+                        Stream::Stderr,
+                        &rcmake_diag::render(
+                            &diagnostic,
+                            &RenderOptions {
+                                relative_base: Some(self.model.dir(DirId::ROOT).source_dir.clone()),
+                                ..RenderOptions::default()
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+        // Per-target SWIFT_VERSION override.
+        if let Some(version) = self
+            .raw
+            .props
+            .get(b"Swift_LANGUAGE_VERSION")
+            .filter(|value| !value.is_empty())
+        {
+            settings.insert("SWIFT_VERSION".into(), text(version).into());
+        }
+        // CMP0226 NEW: PRODUCT_MODULE_NAME from Swift_MODULE_NAME (`cmGlobalXCodeGenerator.cxx:2948-2953`).
+        if let Some(module_name) = self
+            .raw
+            .props
+            .get(b"Swift_MODULE_NAME")
+            .filter(|value| !value.is_empty())
+            && self.raw.policies.policies.get(PolicyId::new(226)) == PolicyStatus::New
+        {
+            settings.insert("PRODUCT_MODULE_NAME".into(), text(module_name).into());
+        }
+        // SWIFT_PACKAGE_NAME on Xcode >= 15 (or default modern Xcode when version is unset)
+        // honoring Swift_PACKAGE_NAME and CMP0216 (`cmGlobalXCodeGenerator.cxx:2956-2962`).
+        let xcode_supports_package = self
+            .model
+            .definition(self.raw.dir, b"XCODE_VERSION")
+            .or_else(|| self.model.definition(DirId::ROOT, b"XCODE_VERSION"))
+            .filter(|value| !value.is_empty())
+            .is_none_or(|ver| rcmake_base::version::compare(ver, b"15.0").is_ge());
+        if xcode_supports_package {
+            let package = rcmake_resolve::lower::swift_package_name(self.model, self.raw);
+            if !package.is_empty() {
+                settings.insert("SWIFT_PACKAGE_NAME".into(), text(&package).into());
+            }
+        }
+        Ok(())
     }
 }
 

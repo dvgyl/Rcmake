@@ -75,8 +75,6 @@ pub(crate) fn settings(host: &dyn Host, opts: &Options, profiled: bool) -> (Spee
         && hermetic == HermeticMode::Off
         && !enabled(b"RCMAKE_FETCH_OFFLINE")
         && !env(b"RCMAKE_FETCH_PREFETCH").is_some_and(|value| value == b"0");
-    // `RCMAKE_REPLAY_SETUP=0` keeps the earlier gates for presets, `-C` scripts, and
-    // toolchain files. Without it, replay setup checkpoints make them safe.
     let setup_gates = setup_replay_disabled(host);
     let incremental = !profiled
         && !opts.fresh

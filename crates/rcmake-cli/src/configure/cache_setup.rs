@@ -181,12 +181,11 @@ fn initialize_cache_editor(cx: &mut Cx<'_>, host: &dyn Host) {
         return;
     }
     // Detect companion tools during startup, outside the project input roots.
-    let executable = to_native(&cx.var_or_empty(b"CMAKE_COMMAND"));
-    let executable = host.canonicalize(&executable).unwrap_or(executable);
-    let Some(directory) = executable.parent() else {
-        return;
-    };
-    let names = if executable
+    let raw_executable = to_native(&cx.var_or_empty(b"CMAKE_COMMAND"));
+    let canonical_executable = host
+        .canonicalize(&raw_executable)
+        .unwrap_or_else(|_| raw_executable.clone());
+    let names = if canonical_executable
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
     {
@@ -194,14 +193,28 @@ fn initialize_cache_editor(cx: &mut Cx<'_>, host: &dyn Host) {
     } else {
         ["ccmake", "cmake-gui"]
     };
-    if let Some(editor) = names
-        .into_iter()
-        .map(|name| directory.join(name))
-        .find(|file| {
-            host.metadata(file, Follow::Yes)
-                .is_ok_and(|metadata| metadata.kind == FileKind::File)
-        })
-    {
+    let mut directories = Vec::with_capacity(2);
+    if let Some(parent) = raw_executable.parent() {
+        let dir = host
+            .canonicalize(parent)
+            .unwrap_or_else(|_| parent.to_path_buf());
+        directories.push(dir);
+    }
+    if let Some(parent) = canonical_executable.parent() {
+        let dir = parent.to_path_buf();
+        if !directories.iter().any(|existing| existing == &dir) {
+            directories.push(dir);
+        }
+    }
+    if let Some(editor) = directories.into_iter().find_map(|directory| {
+        names
+            .into_iter()
+            .map(|name| directory.join(name))
+            .find(|file| {
+                host.metadata(file, Follow::Yes)
+                    .is_ok_and(|metadata| metadata.kind == FileKind::File)
+            })
+    }) {
         cache::insert_internal(
             cx.cache(),
             b"CMAKE_EDIT_COMMAND",

@@ -24,9 +24,7 @@ pub(super) fn plan(
     if !matches!(
         model.generator,
         Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig | GeneratorKind::UnixMakefiles)
-    ) || !languages
-        .iter()
-        .any(|lang| matches!(lang.as_slice(), b"CUDA" | b"SYCL"))
+    ) || !device_link::device_link_supported(model, target)
     {
         return Ok(None);
     }
@@ -75,14 +73,17 @@ pub(super) fn plan(
         .into_iter()
         .map(|entry| [b"-L", entry.value.as_slice()].concat().into())
         .collect::<Vec<_>>();
-    let compile_flags = language_flags(model, target, config, language)
+    let mut compile_flags = language_flags(model, target, config, language)
         .iter()
         .flat_map(|flag| shell_arguments(flag))
         .collect::<Vec<_>>();
+    if language == b"CUDA" {
+        compile_flags.extend(cuda::toolkit_flags(model, target));
+    }
     let mut libraries = libraries;
     if language == b"CUDA" {
         let runtime =
-            cuda::runtime::selected_runtime(model, target, config, &link.language, usage)?;
+            cuda::runtime::selected_runtime(model, target, config, b"CUDA", &link.language, usage)?;
         let key = [
             b"CMAKE_CUDA_RUNTIME_LIBRARY_LINK_OPTIONS_",
             runtime.as_slice(),

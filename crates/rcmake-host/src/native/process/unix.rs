@@ -40,6 +40,9 @@ impl Destination {
 struct Capture {
     pipe: PipeReader,
     stream: Stream,
+    /// The bytes go to [`RunOutput`] ([`Output::Capture`]), not only to the callback
+    /// ([`Output::Stream`]).
+    retain: bool,
 }
 
 fn nonblocking(fd: impl AsFd) -> io::Result<()> {
@@ -54,12 +57,13 @@ fn destination(
     capture: &mut Vec<Capture>,
 ) -> HostResult<Destination> {
     Ok(match output {
-        Output::Capture => {
+        Output::Capture | Output::Stream => {
             let (reader, writer) = io_at_process(io::pipe())?;
             io_at_process(nonblocking(&reader))?;
             capture.push(Capture {
                 pipe: reader,
                 stream,
+                retain: *output == Output::Capture,
             });
             Destination::Fd(writer.into())
         }
@@ -294,12 +298,15 @@ fn pump_input(feed: &mut Option<Feed<'_>>) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Read the ready capture pipes. A retained chunk goes to `output` and, if `tee` is
+/// set, to `on_chunk`. A streamed chunk goes only to `on_chunk`. The last argument of
+/// `on_chunk` tells whether the chunk was retained.
 fn pump_output(
     captures: &mut Vec<Capture>,
     output: &mut RunOutput,
     tee: bool,
     output_limit: usize,
-    on_output: &mut dyn FnMut(Stream, &[u8]),
+    on_chunk: &mut dyn FnMut(Stream, &[u8], bool),
 ) -> io::Result<bool> {
     let mut busy = false;
     let mut buffer = [0u8; 8192];
@@ -308,6 +315,11 @@ fn pump_output(
         Ok(0) => false,
         Ok(n) => {
             let bytes = buffer.get(..n).unwrap_or_default();
+            busy = true;
+            if !capture.retain {
+                on_chunk(capture.stream, bytes, false);
+                return true;
+            }
             if output
                 .stdout
                 .len()
@@ -323,9 +335,8 @@ fn pump_output(
                 Stream::Stderr => output.stderr.extend_from_slice(bytes),
             }
             if tee {
-                on_output(capture.stream, bytes);
+                on_chunk(capture.stream, bytes, true);
             }
-            busy = true;
             true
         }
         Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => true,
@@ -375,8 +386,8 @@ pub(in crate::native) fn run_pipeline(
             &mut output,
             req.tee || update.is_some(),
             output_limit,
-            &mut |stream, bytes| {
-                if req.tee {
+            &mut |stream, bytes, retained| {
+                if req.tee || !retained {
                     on_output(stream, bytes);
                 }
                 if timeout_signal.is_none()

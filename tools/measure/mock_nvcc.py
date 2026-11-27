@@ -20,6 +20,9 @@ import subprocess
 import sys
 
 TIMEOUT = 120
+MAX_RSP_DEPTH = 8
+MAX_RSP_BYTES = 1024 * 1024
+MAX_RSP_ARGS = 32768
 DEFAULT_VERSION = "12.6.85"
 ARCH_OPTIONS = {
     "-arch", "--gpu-architecture", "-gencode", "--generate-code", "-code", "--gpu-code",
@@ -108,9 +111,47 @@ def architecture(option: str, value: str) -> str:
     return f"{option}={value}"
 
 
-def expand_response_files(argv: list[str], depth: int = 0) -> list[str]:
-    if depth >= 8:
-        raise ValueError("The response file nesting limit is 8.")
+def _read_bounded_text(path: Path, max_bytes: int, label: str) -> tuple[str, int]:
+    with open(path, "rb") as stream:
+        st = os.fstat(stream.fileno())
+        if st.st_size > max_bytes:
+            raise ValueError(f"{label} exceeds {max_bytes} bytes: {path}")
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError(f"{label} exceeds {max_bytes} bytes: {path}")
+    return raw.decode("utf-8"), len(raw)
+
+
+@dataclass
+class _RspBudget:
+    remaining_bytes: int = MAX_RSP_BYTES
+    remaining_args: int = MAX_RSP_ARGS
+
+    def consume_arg(self, source: str) -> None:
+        if self.remaining_args <= 0:
+            raise ValueError(f"Response file argument budget exceeded: {source}")
+        self.remaining_args -= 1
+
+    def read_tokens(self, path: Path) -> list[str]:
+        if self.remaining_bytes <= 0:
+            raise ValueError(f"Response file byte budget exceeded: {path}")
+        content, nbytes = _read_bounded_text(path, self.remaining_bytes, "Response file")
+        self.remaining_bytes -= nbytes
+        tokens = shlex.split(content)
+        if len(tokens) > self.remaining_args:
+            raise ValueError(f"Response file argument budget exceeded: {path}")
+        return tokens
+
+
+def expand_response_files(
+    argv: list[str],
+    depth: int = 0,
+    budget: _RspBudget | None = None,
+) -> list[str]:
+    if depth >= MAX_RSP_DEPTH:
+        raise ValueError(f"The response file nesting limit is {MAX_RSP_DEPTH}.")
+    if budget is None:
+        budget = _RspBudget()
     result = []
     arguments = iter(argv)
     for argument in arguments:
@@ -120,17 +161,15 @@ def expand_response_files(argv: list[str], depth: int = 0) -> list[str]:
             if not value:
                 raise ValueError(f"Missing response file for {option}.")
             paths = value.split(",")
-        elif argument.startswith("@"):
+        elif argument.startswith("@") and len(argument) > 1:
             paths = [argument[1:]]
         else:
+            budget.consume_arg(argument)
             result.append(argument)
             continue
         for path in paths:
-            with open(path, "r", encoding="utf-8") as stream:
-                content = stream.read(1024 * 1024 + 1)
-            if len(content) > 1024 * 1024:
-                raise ValueError(f"Response file is too large: {path}.")
-            result.extend(expand_response_files(shlex.split(content), depth + 1))
+            tokens = budget.read_tokens(Path(path))
+            result.extend(expand_response_files(tokens, depth + 1, budget))
     return result
 
 
@@ -235,18 +274,52 @@ def parse(argv: list[str]) -> Invocation:
     return result
 
 
+def _is_self(candidate: str) -> bool:
+    try:
+        self_real = Path(__file__).resolve()
+        cand_path = Path(candidate)
+        return cand_path.resolve() == self_real or cand_path.parent.resolve() == self_real.parent
+    except OSError:
+        return False
+
+
+def _filtered_path() -> str:
+    self_dirs = {
+        str(Path(__file__).resolve().parent),
+        str(Path(sys.argv[0]).absolute().parent),
+    }
+    entries = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        try:
+            resolved = str(Path(entry).resolve())
+        except OSError:
+            resolved = entry
+        if entry in self_dirs or resolved in self_dirs:
+            continue
+        entries.append(entry)
+    return os.pathsep.join(entries)
+
+
 def host_compiler(preferred: str = "") -> str:
     compiler = preferred or os.environ.get("MOCK_NVCC_CXX", "")
     if compiler and Path(compiler).is_dir():
         compiler = str(Path(compiler) / "g++")
+    clean_path = _filtered_path()
     if compiler:
-        found = shutil.which(compiler)
-        if found:
+        found = shutil.which(compiler, path=clean_path) or (compiler if Path(compiler).is_file() else None)
+        if found and not _is_self(found):
             return found
         raise ValueError(f"Host compiler is unavailable: {compiler}")
+    saved = Path(sys.argv[0]).absolute().parent.parent / "mock" / "host_cxx.txt"
+    if saved.is_file():
+        recorded = saved.read_text(encoding="utf-8").strip()
+        if recorded and Path(recorded).is_file() and not _is_self(recorded):
+            return recorded
     for name in ("clang++", "g++"):
-        if compiler := shutil.which(name):
-            return compiler
+        if (found := shutil.which(name, path=clean_path)) and not _is_self(found):
+            return found
     raise ValueError("Install clang++ or g++.")
 
 
@@ -270,7 +343,19 @@ def install(root: Path, version: tuple[str, str, str]) -> None:
     shutil.copyfile(Path(__file__).resolve(), nvcc)
     nvcc.chmod(0o755)
     (root / "mock" / "host-link").symlink_to("../bin/nvcc")
-    (root / "bin/crt/link.stub").touch()
+    (root / "bin" / "clang++").symlink_to("nvcc")
+    (root / "bin" / "nvlink").symlink_to("nvcc")
+    (root / "bin" / "fatbinary").symlink_to("nvcc")
+    (root / "bin/crt/link.stub").write_text(
+        "#ifdef REGISTERLINKBINARYFILE\n"
+        "#include REGISTERLINKBINARYFILE\n"
+        "#endif\n"
+        "#ifdef FATBINFILE\n"
+        "#include FATBINFILE\n"
+        "#endif\n"
+        'extern "C" int rcmake_mock_clang_device_link() { return 42; }\n',
+        encoding="utf-8",
+    )
     (root / "include/cuda_runtime.h").write_text(RUNTIME_HEADER, encoding="utf-8")
     (root / "include/cuda.h").write_text(
         f"#define CUDA_VERSION {int(version[0]) * 1000 + int(version[1]) * 10}\n",
@@ -282,6 +367,7 @@ def install(root: Path, version: tuple[str, str, str]) -> None:
     )
 
     compiler = host_compiler()
+    (root / "mock" / "host_cxx.txt").write_text(compiler + "\n", encoding="utf-8")
     stub = root / "mock/stub.o"
     subprocess.run([compiler, "-x", "c++", "-c", "-", "-o", str(stub)],
                    input=b"", check=True, timeout=TIMEOUT)
@@ -323,7 +409,13 @@ def print_verbose(root: Path, compiler: str, options: Invocation) -> None:
     print("#$ " + shlex.join([compiler, "-o", str(output), *objects, *libraries]), file=sys.stderr)
 
 
-def record(argv: list[str], options: Invocation, phase: str, exit_code: int) -> int:
+def record(
+    argv: list[str],
+    options: Invocation,
+    phase: str,
+    exit_code: int,
+    expanded_argv: list[str] | None = None,
+) -> int:
     if log := os.environ.get("MOCK_NVCC_LOG"):
         entry = {
             "phase": phase,
@@ -334,6 +426,8 @@ def record(argv: list[str], options: Invocation, phase: str, exit_code: int) -> 
             "relocatable": options.relocatable,
             "exit_code": exit_code,
         }
+        if expanded_argv is not None:
+            entry["expanded_argv"] = expanded_argv
         with open(log, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry) + "\n")
     return exit_code
@@ -342,11 +436,12 @@ def record(argv: list[str], options: Invocation, phase: str, exit_code: int) -> 
 def host_link(argv: list[str]) -> int:
     if not argv:
         raise ValueError("Pass a link command to the mock launcher.")
-    options = parse(argv[1:])
+    expanded = expand_response_files(argv[1:])
+    options = parse(expanded)
     exit_code = subprocess.run(argv, timeout=TIMEOUT).returncode
     if options.mode == "device-link":
         return exit_code
-    return record(argv, options, "host-link", exit_code)
+    return record(argv, options, "host-link", exit_code, expanded_argv=[argv[0], *expanded])
 
 
 def device_link(argv: list[str], options: Invocation, compiler: str) -> int:
@@ -362,14 +457,299 @@ def device_link(argv: list[str], options: Invocation, compiler: str) -> int:
     return record(argv, options, "device-link", exit_code)
 
 
+def _log_raw(entry: dict) -> int:
+    if log := os.environ.get("MOCK_NVCC_LOG"):
+        with open(log, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry) + "\n")
+    return int(entry["exit_code"])
+
+
+def run_nvlink(argv: list[str]) -> int:
+    arch = ""
+    register_file: Path | None = None
+    output: Path | None = None
+    inputs: list[Path] = []
+    args = iter(expand_response_files(argv))
+    for arg in args:
+        if arg.startswith("-arch="):
+            arch = arg.split("=", 1)[1]
+            if not re.fullmatch(r"sm_[1-9][0-9]+[af]?", arch):
+                raise ValueError(f"Invalid nvlink architecture: {arch}")
+        elif arg == "-arch":
+            arch = next(args, "")
+            if not re.fullmatch(r"sm_[1-9][0-9]+[af]?", arch):
+                raise ValueError(f"Invalid nvlink architecture: {arch}")
+        elif arg.startswith("--register-link-binaries="):
+            register_file = Path(arg.split("=", 1)[1])
+        elif arg == "--register-link-binaries":
+            register_file = Path(next(args, ""))
+        elif arg.startswith("-o="):
+            output = Path(arg.split("=", 1)[1])
+        elif arg == "-o":
+            output = Path(next(args, ""))
+        elif arg.startswith("-"):
+            continue
+        else:
+            inputs.append(Path(arg))
+    if not arch:
+        raise ValueError("nvlink requires -arch=sm_XX.")
+    if output is None:
+        raise ValueError("nvlink requires -o=<cubin>.")
+    if not inputs:
+        raise ValueError("nvlink requires at least one input object or archive.")
+    for path in inputs:
+        if not path.is_file() or not path.stat().st_size:
+            raise ValueError(f"Invalid nvlink input {path}.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(f"cubin {arch}\n" + "\n".join(str(p) for p in inputs) + "\n", encoding="utf-8")
+    if register_file is not None:
+        register_file.parent.mkdir(parents=True, exist_ok=True)
+        register_file.write_text(f"#define RCMAKE_MOCK_NVLINK_ARCH \"{arch}\"\n", encoding="utf-8")
+    return _log_raw({
+        "phase": "nvlink",
+        "argv": argv,
+        "inputs": [str(p.resolve()) for p in inputs],
+        "output": str(output.resolve()),
+        "architectures": [arch],
+        "relocatable": True,
+        "exit_code": 0,
+    })
+
+
+def run_fatbinary(argv: list[str]) -> int:
+    output: Path | None = None
+    profiles: list[str] = []
+    inputs: list[Path] = []
+    for arg in expand_response_files(argv):
+        if arg.startswith("--embedded-fatbin="):
+            output = Path(arg.split("=", 1)[1])
+        elif arg.startswith("-im="):
+            spec = arg.split("=", 1)[1]
+            match = re.fullmatch(r"profile=(sm_[1-9][0-9]+[af]?),file=(.+)", spec)
+            if not match:
+                raise ValueError(f"Invalid fatbinary -im argument: {arg}")
+            profile, cubin = match.groups()
+            cubin_path = Path(cubin)
+            if not cubin_path.is_file() or not cubin_path.stat().st_size:
+                raise ValueError(f"Missing fatbinary cubin input: {cubin_path}")
+            profiles.append(profile)
+            inputs.append(cubin_path)
+    if output is None:
+        raise ValueError("fatbinary requires --embedded-fatbin=<file>.")
+    if not profiles:
+        raise ValueError("fatbinary requires at least one -im=profile=...,file=... input.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        f'#define RCMAKE_MOCK_FATBIN_PROFILES "{",".join(profiles)}"\n',
+        encoding="utf-8",
+    )
+    return _log_raw({
+        "phase": "fatbinary",
+        "argv": argv,
+        "inputs": [str(p.resolve()) for p in inputs],
+        "output": str(output.resolve()),
+        "architectures": profiles,
+        "relocatable": True,
+        "exit_code": 0,
+    })
+
+
+def run_clang_cuda(argv: list[str]) -> int:
+    clang_version = os.environ.get("MOCK_CLANG_CUDA_VERSION", "18.1.8")
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", clang_version)
+    if not match:
+        raise ValueError("Set MOCK_CLANG_CUDA_VERSION to major.minor.patch.")
+    major, minor, patch = match.groups()
+    if any(arg == "--version" for arg in argv):
+        print(f"clang version {clang_version} (mock-cuda)")
+        print(f"Target: {platform.machine()}-unknown-linux-gnu")
+        print("Thread model: posix")
+        return 0
+
+    root = Path(os.environ.get("MOCK_CUDA_ROOT", Path(sys.argv[0]).absolute().parent.parent))
+    expanded = expand_response_files(argv)
+    compiler = host_compiler()
+    architectures: list[str] = []
+    cuda_path: Path | None = None
+    relocatable = False
+    offload_link = False
+    device_only = False
+    compile_only = False
+    verbose = False
+    cuda_lang = False
+    host_cuda_lang = False
+    inputs: list[Path] = []
+    sources: list[Path] = []
+    output: Path | None = None
+    host_args: list[str] = []
+
+    args = iter(expanded)
+    for arg in args:
+        if arg.startswith(("--cuda-gpu-arch=", "--offload-arch=")):
+            arch = arg.split("=", 1)[1]
+            if not re.fullmatch(r"sm_[1-9][0-9]+[af]?", arch):
+                raise ValueError(f"Invalid Clang CUDA architecture: {arg}")
+            architectures.append(arg)
+            continue
+        if arg.startswith(("--cuda-include-ptx=", "--no-cuda-include-ptx=")):
+            arch = arg.split("=", 1)[1]
+            if not re.fullmatch(r"sm_[1-9][0-9]+[af]?|all", arch):
+                raise ValueError(f"Invalid Clang CUDA PTX option: {arg}")
+            continue
+        if arg.startswith("--cuda-path="):
+            cuda_path = Path(arg.split("=", 1)[1])
+            if not cuda_path.is_dir():
+                raise ValueError(f"Invalid --cuda-path directory: {cuda_path}")
+            continue
+        if arg == "--cuda-path":
+            cuda_path = Path(next(args, ""))
+            if not cuda_path.is_dir():
+                raise ValueError(f"Invalid --cuda-path directory: {cuda_path}")
+            continue
+        if arg in {"-fgpu-rdc", "-fcuda-rdc"}:
+            relocatable = True
+            continue
+        if arg in {"-fno-gpu-rdc", "-fno-cuda-rdc"}:
+            relocatable = False
+            continue
+        if arg in {"--cuda-device-only", "-fcuda-device-only", "--cuda-host-only", "-nogpulib",
+                   "--offload-link", "-fno-cuda-short-ptr"}:
+            if arg in {"--cuda-device-only", "-fcuda-device-only"}:
+                device_only = True
+            if arg == "--offload-link":
+                offload_link = True
+            continue
+        if arg in {"-v", "--verbose"}:
+            verbose = True
+            host_args.append("-v")
+            continue
+        if arg == "-c":
+            compile_only = True
+            host_args.append("-c")
+            continue
+        if arg == "-S":
+            host_args.append("-S")
+            continue
+        if arg == "-o":
+            val = next(args, "")
+            output = Path(val)
+            host_args.extend(["-o", val])
+            continue
+        if arg == "-x":
+            lang = next(args, "")
+            cuda_lang = lang in {"cuda", "cu"}
+            if not cuda_lang:
+                host_args.extend(["-x", lang])
+                host_cuda_lang = False
+            continue
+        if arg in HOST_VALUE_OPTIONS:
+            val = next(args, "")
+            host_args.extend([arg, val])
+            continue
+        if arg.startswith("-"):
+            host_args.append(arg)
+            continue
+        inputs.append(Path(arg))
+        is_cuda = cuda_lang or arg.endswith((".cu", "link.stub"))
+        if is_cuda != host_cuda_lang:
+            host_args.extend(["-x", "c++" if is_cuda else "none"])
+            host_cuda_lang = is_cuda
+        if is_cuda:
+            sources.append(Path(arg))
+        host_args.append(arg)
+
+    if device_only:
+        out = output or (Path(sources[0].name).with_suffix(".s") if sources else None)
+        if out is None:
+            raise ValueError("Specify an output for Clang CUDA device-only compilation.")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("ptx\n" + "\n".join(architectures or ["sm_52"]) + "\n", encoding="utf-8")
+        return _log_raw({
+            "phase": "ptx",
+            "argv": argv,
+            "inputs": [str(p.resolve()) for p in inputs],
+            "output": str(out.resolve()),
+            "architectures": architectures,
+            "relocatable": relocatable,
+            "cuda_path": str(cuda_path) if cuda_path else None,
+            "exit_code": 0,
+        })
+
+    if verbose:
+        for arch_flag in architectures:
+            sm = arch_flag.split("=", 1)[1]
+            print(f' "/mock/clang" "-cc1" "-triple" "nvptx64-nvidia-cuda" "-target-cpu" "{sm}"',
+                  file=sys.stderr)
+
+    toolkit = cuda_path or root
+    command = [compiler]
+    if sources:
+        command.extend([
+            f"-I{toolkit / 'include'}",
+            "-include", str(root / "mock/cuda_shim.h"),
+            "-Wno-macro-redefined",
+            "-U__apple_build_version__",
+            "-D__CUDACC__",
+            "-D__CUDA__",
+            f"-D__clang_major__={major}",
+            f"-D__clang_minor__={minor}",
+            f"-D__clang_patchlevel__={patch}",
+        ])
+    elif not compile_only:
+        command.append(f"-L{toolkit / 'lib64'}")
+    extra_cleanup: Path | None = None
+    if offload_link and not compile_only:
+        import tempfile
+        fd, stub_name = tempfile.mkstemp(prefix="mock-clang-offload-", suffix=".o")
+        os.close(fd)
+        extra_cleanup = Path(stub_name)
+        subprocess.run(
+            [compiler, "-fPIC", "-x", "c++", "-c", "-", "-o", str(extra_cleanup)],
+            input=b'extern "C" int rcmake_mock_clang_device_link() { return 42; }\n',
+            check=True,
+            timeout=TIMEOUT,
+        )
+        host_args.append(str(extra_cleanup))
+    try:
+        exit_code = subprocess.run([*command, *host_args], timeout=TIMEOUT).returncode
+    finally:
+        if extra_cleanup is not None:
+            extra_cleanup.unlink(missing_ok=True)
+    phase = "clang-stub" if any(s.name == "link.stub" for s in sources) else (
+        "compile" if compile_only else "link"
+    )
+    return _log_raw({
+        "phase": phase,
+        "argv": argv,
+        "inputs": [str(p.resolve()) for p in inputs],
+        "output": str(output.resolve()) if output else None,
+        "architectures": architectures,
+        "relocatable": relocatable,
+        "offload_link": offload_link,
+        "cuda_path": str(cuda_path) if cuda_path else None,
+        "exit_code": exit_code,
+    })
+
+
 def run(argv: list[str]) -> int:
     if argv == ["--help"]:
         print(__doc__)
         return 0
     if os.name != "posix":
         raise ValueError("The mock toolkit requires POSIX host tools.")
-    if Path(sys.argv[0]).name == "host-link":
+    depth = int(os.environ.get("MOCK_NVCC_DEPTH", "0"))
+    if depth >= 3:
+        raise ValueError(f"Recursive mock nvcc invocation detected (depth={depth}).")
+    os.environ["MOCK_NVCC_DEPTH"] = str(depth + 1)
+    tool_name = Path(sys.argv[0]).name
+    if tool_name == "host-link":
         return host_link(argv)
+    if tool_name == "nvlink":
+        return run_nvlink(argv)
+    if tool_name == "fatbinary":
+        return run_fatbinary(argv)
+    if tool_name == "clang++":
+        return run_clang_cuda(argv)
     version = version_parts()
     if argv[:1] == ["--install-mock-toolkit"]:
         if len(argv) != 2:

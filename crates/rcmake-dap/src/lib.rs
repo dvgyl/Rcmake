@@ -22,6 +22,7 @@ use rcmake_json::Value;
 
 mod adapter;
 pub mod breakpoints;
+mod budget;
 pub mod protocol;
 mod session;
 pub mod transport;
@@ -185,7 +186,7 @@ impl DebugServer {
             .first()
             .is_none_or(|writer| wait_finished(writer, SHUTDOWN_LIMIT));
         if !writer_done {
-            self.shared.out.close();
+            self.shared.out.discard();
         }
         if let Some(connection) = self.connection.take() {
             connection.shutdown();

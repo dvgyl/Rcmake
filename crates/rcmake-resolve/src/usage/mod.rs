@@ -132,6 +132,8 @@ pub struct UsageResolver<'a> {
     parsed: ParseCache,
     memo: HashMap<MemoKey<'static>, Arc<WalkValue>>,
     link_memo: HashMap<link::LinkMemoKey, link::SharedLinks>,
+    target_languages: HashMap<(TargetId, rcmake_genex::ConfigId), Arc<IndexSet<BString>>>,
+    active_compile_language: Option<(TargetId, BString)>,
     debug_configs: Vec<BString>,
     debug_properties: bool,
     codemodel_backtraces: bool,
@@ -141,6 +143,7 @@ pub struct UsageResolver<'a> {
     has_system_interface_includes: bool,
     has_compatible_decls: bool,
     has_interface_pic: bool,
+    has_language_runtime_libraries: bool,
     compatible: compatible::Properties,
     pub(crate) provenance: Option<provenance::Provenance>,
     pub(crate) runtime_install_targets: IndexSet<TargetId>,
@@ -167,6 +170,8 @@ pub(crate) struct WorkerUsageTemplate<'a> {
     has_system_interface_includes: bool,
     has_compatible_decls: bool,
     has_interface_pic: bool,
+    has_language_runtime_libraries: bool,
+    target_languages: HashMap<(TargetId, rcmake_genex::ConfigId), Arc<IndexSet<BString>>>,
     compatible_implied: HashMap<(TargetId, rcmake_genex::ConfigId), HashSet<BString>>,
 }
 
@@ -188,6 +193,8 @@ impl<'a> WorkerUsageTemplate<'a> {
             parsed: ParseCache::default(),
             memo: HashMap::new(),
             link_memo: HashMap::new(),
+            target_languages: self.target_languages.clone(),
+            active_compile_language: None,
             debug_configs: self.debug_configs.clone(),
             debug_properties: self.debug_properties,
             codemodel_backtraces: false,
@@ -197,6 +204,7 @@ impl<'a> WorkerUsageTemplate<'a> {
             has_system_interface_includes: self.has_system_interface_includes,
             has_compatible_decls: self.has_compatible_decls,
             has_interface_pic: self.has_interface_pic,
+            has_language_runtime_libraries: self.has_language_runtime_libraries,
             compatible: compatible::Properties::with_implied(self.compatible_implied.clone()),
             provenance: provenance.then(provenance::Provenance::default),
             runtime_install_targets: self.runtime_install_targets.clone(),
@@ -237,6 +245,12 @@ impl<'a> UsageResolver<'a> {
                 .get(b"INTERFACE_POSITION_INDEPENDENT_CODE")
                 .is_some();
         }
+        let has_language_runtime_libraries = model.dirs().any(|(id, _)| {
+            definition(model, id, b"CMAKE_HIP_RUNTIME_LIBRARY_DEFAULT")
+                .is_some_and(|value| !value.is_empty())
+                || definition(model, id, b"CMAKE_CUDA_RUNTIME_LIBRARY_DEFAULT")
+                    .is_some_and(|value| !value.is_empty())
+        });
         Self {
             model,
             ide: crate::ide::IdeFlavor::from_model(model),
@@ -250,6 +264,8 @@ impl<'a> UsageResolver<'a> {
             parsed: ParseCache::default(),
             memo: HashMap::new(),
             link_memo: HashMap::new(),
+            target_languages: HashMap::new(),
+            active_compile_language: None,
             debug_configs: model
                 .global
                 .props
@@ -270,6 +286,7 @@ impl<'a> UsageResolver<'a> {
             has_system_interface_includes,
             has_compatible_decls,
             has_interface_pic,
+            has_language_runtime_libraries,
         }
     }
 
@@ -287,8 +304,170 @@ impl<'a> UsageResolver<'a> {
             has_system_interface_includes: self.has_system_interface_includes,
             has_compatible_decls: self.has_compatible_decls,
             has_interface_pic: self.has_interface_pic,
+            has_language_runtime_libraries: self.has_language_runtime_libraries,
+            target_languages: self.target_languages.clone(),
             compatible_implied: self.compatible.implied.clone(),
         }
+    }
+
+    pub(crate) fn seed_target_languages(
+        &mut self,
+        config: &rcmake_genex::ConfigId,
+        resolved: &IndexMap<TargetId, crate::ResolvedTarget>,
+    ) {
+        for (&id, facts) in resolved {
+            let languages: IndexSet<BString> = facts
+                .compile_groups
+                .iter()
+                .map(|group| group.language.clone())
+                .collect();
+            self.target_languages
+                .insert((id, config.clone()), Arc::new(languages));
+        }
+    }
+
+    pub(crate) fn with_compile_group_language<T>(
+        &mut self,
+        target: TargetId,
+        language: &[u8],
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = self
+            .active_compile_language
+            .replace((target, language.into()));
+        let output = f(self);
+        self.active_compile_language = previous;
+        output
+    }
+
+    /// Return the resolved compile languages of `owner` in `config`, evaluating
+    /// generator expressions in `SOURCES` and `FILE_SET` entries when not yet seeded.
+    pub(crate) fn target_compile_languages(
+        &mut self,
+        owner: TargetId,
+        config: &rcmake_genex::ConfigId,
+    ) -> Result<Arc<IndexSet<BString>>, ResolveError> {
+        let target = self.target(owner)?;
+        if target.is_imported() || !target.kind.compiles_objects() {
+            return Ok(Arc::default());
+        }
+        if let Some(cached) = self.target_languages.get(&(owner, config.clone())) {
+            return Ok(Arc::clone(cached));
+        }
+        if self.active.iter().any(|(id, prop)| {
+            *id == owner
+                && matches!(
+                    prop.as_slice(),
+                    b"SOURCES" | b"INTERFACE_SOURCES" | b"\0rcmake-target-languages"
+                )
+        }) {
+            return Ok(Arc::default());
+        }
+        let languages = self.with_property(owner, b"\0rcmake-target-languages", |this| {
+            let src_ctx = EvalContext {
+                config: config.clone(),
+                head: Some(handle(owner)),
+                traversal: UsageTraversal::Compile,
+                ..EvalContext::default()
+            };
+            let sources = this.collect_property(owner, b"SOURCES", &src_ctx)?.entries;
+            let file_sets = this.source_file_sets(owner, &src_ctx)?;
+            let target = this.target(owner)?;
+            let dir = this.model.dir(target.dir);
+            let source_paths = this.source_paths;
+            let resolve_abs = |raw: &[u8]| {
+                source_paths
+                    .and_then(|paths| paths.find(dir, raw))
+                    .unwrap_or_else(|| crate::sources::absolute_path(&dir.source_dir, raw))
+            };
+            let mut header_set_files = HashSet::new();
+            let mut file_set_langs: HashMap<BString, Option<BString>> = HashMap::new();
+            let mut candidates: Vec<(BString, Option<BString>)> = Vec::new();
+            for entry in &sources {
+                candidates.push((resolve_abs(&entry.value), None));
+            }
+            for (_, set, _) in file_sets {
+                let files = this.file_set_target_sources(set, &src_ctx)?;
+                if set.kind == FileSetKind::Headers {
+                    for entry in files {
+                        header_set_files.insert(resolve_abs(&entry.value));
+                    }
+                } else {
+                    let set_lang = set
+                        .props
+                        .get(b"LANGUAGE")
+                        .filter(|value| !value.is_empty())
+                        .cloned();
+                    for entry in files {
+                        let abs = resolve_abs(&entry.value);
+                        file_set_langs
+                            .entry(abs.clone())
+                            .or_insert_with(|| set_lang.clone());
+                        candidates.push((abs, set_lang.clone()));
+                    }
+                }
+            }
+            if let Some(traced) = this.traced_sources.and_then(|map| map.get(&owner)) {
+                for path in traced {
+                    candidates.push((path.clone(), None));
+                }
+            }
+            let mut seen = HashSet::new();
+            let mut langs = IndexSet::new();
+            for (abs, set_lang) in candidates {
+                if !seen.insert(abs.clone()) {
+                    continue;
+                }
+                if let Some(obj_owner) = this.source_paths.and_then(|p| p.object_owner(&abs)) {
+                    if obj_owner != owner {
+                        let nested = this.target_compile_languages(obj_owner, config)?;
+                        langs.extend(nested.iter().cloned());
+                    }
+                    continue;
+                }
+                if crate::sources::external_object(dir, &abs)
+                    || this.source_paths.is_some_and(|p| p.is_directory(&abs))
+                    || header_set_files.contains(&abs)
+                {
+                    continue;
+                }
+                let source_props = crate::sources::properties(dir, &abs);
+                if source_props.get(b"MACOSX_PACKAGE_LOCATION").is_some()
+                    && crate::lower::is_darwin(this.model, target.dir)
+                    && crate::ide::bundle_kind(target) != crate::ide::BundleKind::None
+                {
+                    continue;
+                }
+                let header_only = source_props
+                    .get(b"HEADER_FILE_ONLY")
+                    .is_some_and(|value| truth::is_on(value))
+                    || this
+                        .source_paths
+                        .is_some_and(|p| p.is_header_only(target.dir, &abs));
+                if header_only {
+                    continue;
+                }
+                let lang = set_lang
+                    .or_else(|| file_set_langs.get(&abs).and_then(Clone::clone))
+                    .or_else(|| {
+                        source_props
+                            .get(b"LANGUAGE")
+                            .filter(|value| !value.is_empty())
+                            .cloned()
+                    })
+                    .or_else(|| crate::lower::source_language(this.model, target, &abs));
+                if let Some(lang) = lang {
+                    langs.insert(lang);
+                }
+            }
+            Ok(langs)
+        })?;
+        let languages = Arc::new(languages);
+        if self.source_reads.is_none() {
+            self.target_languages
+                .insert((owner, config.clone()), Arc::clone(&languages));
+        }
+        Ok(languages)
     }
 
     /// Use the generated rule sources when evaluating target source properties.
@@ -381,6 +560,8 @@ impl<'a> UsageResolver<'a> {
             parsed: ParseCache::default(),
             memo: HashMap::new(),
             link_memo: HashMap::new(),
+            target_languages: self.target_languages.clone(),
+            active_compile_language: None,
             debug_configs: self.debug_configs.clone(),
             debug_properties: self.debug_properties,
             codemodel_backtraces: false,
@@ -393,6 +574,7 @@ impl<'a> UsageResolver<'a> {
             has_system_interface_includes: self.has_system_interface_includes,
             has_compatible_decls: self.has_compatible_decls,
             has_interface_pic: self.has_interface_pic,
+            has_language_runtime_libraries: self.has_language_runtime_libraries,
             current_link_bt: None,
         }
     }

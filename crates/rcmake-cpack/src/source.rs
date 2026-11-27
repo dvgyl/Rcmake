@@ -810,6 +810,53 @@ fn copy_checked_tree_with_canon(
     )
 }
 
+/// Copy a validated tree from `source` over `dest`. A file or symbolic link of `source`
+/// replaces an entry of `dest` at the same relative path, as a later component install
+/// into a shared directory does.
+pub(crate) fn overlay_checked_tree(
+    host: &dyn Host,
+    source: &Path,
+    dest: &Path,
+    symlink_policy: SymlinkPolicy,
+    windows_rules: bool,
+) -> Result<(), CpackError> {
+    let canon_source = canonical_checked_root(host, source)?;
+    validate_dir_subtree(
+        host,
+        source,
+        &canon_source,
+        source,
+        symlink_policy,
+        windows_rules,
+    )?;
+    let mut remaining = MAX_WALK_ENTRIES;
+    copy_tree(
+        host,
+        source,
+        dest,
+        0,
+        &mut remaining,
+        None,
+        Some((source, &canon_source, symlink_policy)),
+        &mut |_, _| Ok(false),
+    )
+}
+
+/// Validate a payload at `root` after all of its copies and before a tool reads it.
+///
+/// A merge can complete the target of a symbolic link with an entry from another
+/// source root, so a check of each source root alone does not prove that the links
+/// of the assembled tree stay inside it.
+pub(crate) fn validate_assembled_payload(
+    host: &dyn Host,
+    root: &Path,
+    symlink_policy: SymlinkPolicy,
+    windows_rules: bool,
+) -> Result<(), CpackError> {
+    let canon_root = canonical_checked_root(host, root)?;
+    validate_dir_subtree(host, root, &canon_root, root, symlink_policy, windows_rules)
+}
+
 /// Copy the recorded `members` of the component at `source` into `dest`.
 ///
 /// Validates every parent component and symlink target against `source` before copying.

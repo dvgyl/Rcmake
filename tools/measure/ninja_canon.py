@@ -257,7 +257,11 @@ def canonicalize(
         row = {
             "outputs": sorted(map(normalize.path, edge.outputs)),
             "implicit_outputs": sorted(map(normalize.path, edge.implicit_outputs)),
-            "inputs": list(map(normalize.path, edge.inputs)),
+            "inputs": (
+                sorted(map(normalize.path, edge.inputs))
+                if not edge.rule
+                else list(map(normalize.path, edge.inputs))
+            ),
             "implicit_inputs": sorted(map(normalize.path, edge.implicit_inputs)),
             "order_only_inputs": sorted(map(normalize.path, edge.order_only_inputs)),
             "validations": sorted(map(normalize.path, edge.validations)),

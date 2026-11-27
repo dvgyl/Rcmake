@@ -279,7 +279,11 @@ fn project_defaults(model: &ProjectModel, root: DirId, bin: &Path, config: &str)
         };
         settings.insert(format!("{platform}_DEPLOYMENT_TARGET"), deployment.into());
     }
-    if config != "Debug" {
+    if config != "Debug"
+        && model
+            .definition(root, b"CMAKE_Swift_COMPILATION_MODE_DEFAULT")
+            .is_none_or(|value| value.is_empty())
+    {
         settings.insert("SWIFT_COMPILATION_MODE".into(), "wholemodule".into());
     }
     if model
@@ -355,6 +359,7 @@ fn attribute_value(value: &[u8]) -> Value {
 
 pub(crate) struct TargetSettings<'a> {
     pub(crate) model: &'a ProjectModel,
+    pub(crate) host: &'a dyn rcmake_host::Host,
     pub(crate) indices: &'a XcodeIndices<'a>,
     pub(crate) bin: &'a Path,
     pub(crate) config: &'a str,
@@ -366,7 +371,7 @@ pub(crate) struct TargetSettings<'a> {
 }
 
 impl TargetSettings<'_> {
-    pub(crate) fn build(&self, product: &Product, plist: Option<&Path>) -> Attrs {
+    pub(crate) fn build(&self, product: &Product, plist: Option<&Path>) -> Result<Attrs, GenError> {
         let mut settings = project_defaults(self.model, self.raw.dir, self.bin, self.config);
         let ide = self.target.and_then(|target| target.ide.as_deref());
         let arch_key = format!("OSX_ARCHITECTURES_{}", self.config.to_ascii_uppercase());
@@ -381,7 +386,7 @@ impl TargetSettings<'_> {
             settings.insert("ONLY_ACTIVE_ARCH".into(), "NO".into());
         }
         self.add_product_settings(&mut settings, product, plist);
-        self.add_compile_settings(&mut settings, ide);
+        self.add_compile_settings(&mut settings, ide)?;
         if let Some(target) = self.target
             && let Some(fortran) = &target.fortran
         {
@@ -423,7 +428,7 @@ impl TargetSettings<'_> {
                 attribute(&mut settings, key, value, "XCODE_ATTRIBUTE_", self.config);
             }
         }
-        settings
+        Ok(settings)
     }
 
     fn add_product_settings(&self, settings: &mut Attrs, product: &Product, plist: Option<&Path>) {

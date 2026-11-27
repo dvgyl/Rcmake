@@ -431,11 +431,28 @@ impl Host for PureHost {
             .handler
             .clone()
             .ok_or_else(|| HostError::unsupported("No command handler is registered"))?;
-        handler(self, req, &mut |stream, bytes| {
-            if req.tee {
+        let mut sent = Vec::new();
+        let mut output = handler(self, req, &mut |stream, bytes| {
+            let live = crate::is_streamed(req, stream);
+            if live && !sent.contains(&stream) {
+                sent.push(stream);
+            }
+            if req.tee || live {
                 on_output(stream, bytes);
             }
-        })
+        })?;
+        for (stream, bytes) in [
+            (Stream::Stdout, &mut output.stdout),
+            (Stream::Stderr, &mut output.stderr),
+        ] {
+            if crate::is_streamed(req, stream) {
+                let bytes = std::mem::take(bytes);
+                if !sent.contains(&stream) && !bytes.is_empty() {
+                    on_output(stream, &bytes);
+                }
+            }
+        }
+        Ok(output)
     }
 
     fn write_out(&self, stream: Stream, bytes: &[u8]) {

@@ -239,6 +239,7 @@ pub(crate) fn request_digest(request: &RunRequest) -> Digest {
             }
             Output::Null => key.field(14, &[]),
             Output::SharedWithStdout => key.field(15, &[]),
+            Output::Stream => key.field(18, &[]),
         }
     }
     if let Some(timeout) = request.timeout {

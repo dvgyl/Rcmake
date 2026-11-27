@@ -801,6 +801,48 @@ pub struct PchSource {
     pub flags: BString,
 }
 
+/// Kind of grouped Swift compiler action under `CMP0157` `NEW`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwiftActionKind {
+    /// Separate `-emit-module` action producing a `.swiftmodule`.
+    Module,
+    /// Grouped `-c` object compilation action producing one or more `.o` files.
+    Objects,
+    /// Combined compile + emit-module action (`Swift_SEPARATE_MODULE_EMISSION` off / `CMP0215` OLD).
+    Combined,
+}
+
+/// Metadata for one grouped Swift compiler action in [`BuildGraph::swift_actions`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwiftAction {
+    /// Role of this grouped Swift action.
+    pub kind: SwiftActionKind,
+    /// Swift module name (`Swift_MODULE_NAME` or target name with `-` replaced by `_`).
+    pub module_name: BString,
+    /// Explicit Swift source inputs (build-relative for generated files, absolute otherwise).
+    pub sources: Vec<BString>,
+    /// All explicit outputs produced by this action (build-relative paths).
+    pub outputs: Vec<BString>,
+    /// Upstream imported `.swiftmodule` files required as implicit inputs.
+    pub implicit_inputs: Vec<BString>,
+    /// Extra order-only inputs (for example, a target's own `.swiftmodule` on split object edges).
+    pub order_only_inputs: Vec<BString>,
+    /// Ninja progress description.
+    pub description: BString,
+    /// Response file path used when command length or response forcing applies.
+    pub rsp_file: BString,
+    /// Full rule invocation when compiler arguments are moved into [`Self::rsp_file`].
+    pub rsp_invocation: Option<Invocation>,
+    /// Arguments written to [`Self::rsp_file`] when [`Self::rsp_invocation`] is used.
+    pub rsp_args: Option<BString>,
+    /// Whether Ninja should set `restat = 1` on this edge.
+    pub restat: bool,
+    /// Whether single-output whole-module mode emits one shared module object.
+    pub single_output: bool,
+    /// Absolute source file paths corresponding to [`Self::sources`].
+    pub abs_sources: Vec<BString>,
+}
+
 /// Lowered build graph of one configuration (layer 3).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BuildGraph {
@@ -843,6 +885,8 @@ pub struct BuildGraph {
     pub link_extra_outputs: IndexMap<BString, Vec<BString>>,
     /// Generated Swift `output-file-map.json` files (build-relative path to JSON text).
     pub swift_output_file_maps: IndexMap<BString, BString>,
+    /// Grouped Swift compile/module action metadata indexed by step index in [`Self::steps`].
+    pub swift_actions: IndexMap<usize, SwiftAction>,
 }
 
 /// File set members that affect compile ordering under CMP0154.

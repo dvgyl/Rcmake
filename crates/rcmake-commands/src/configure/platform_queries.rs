@@ -544,7 +544,7 @@ pub(crate) fn run(cx: &Cx<'_>, request: &RunRequest) -> Option<HostResult<RunOut
         let result = RunOutput {
             results: vec![ProcessResult::Exited(0)],
             stdout: matched.stdout.clone(),
-            stderr: if request.stderr == Output::Inherit {
+            stderr: if request.stderr.is_live() {
                 Vec::new()
             } else {
                 matched.stderr_bytes.clone()

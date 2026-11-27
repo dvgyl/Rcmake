@@ -19,14 +19,15 @@ impl Graph<'_> {
         // for every target that compiles/scans/device-links sources.
         for (target_index, target) in self.input.targets.iter().enumerate() {
             let has_compile = target.steps.iter().any(|&index| {
-                matches!(
-                    self.input.steps.get(index),
-                    Some(
-                        BuildStep::Compile { .. }
-                            | BuildStep::Scan { .. }
-                            | BuildStep::DeviceLink { .. }
+                self.input.swift_actions.contains_key(&index)
+                    || matches!(
+                        self.input.steps.get(index),
+                        Some(
+                            BuildStep::Compile { .. }
+                                | BuildStep::Scan { .. }
+                                | BuildStep::DeviceLink { .. }
+                        )
                     )
-                )
             });
             let is_normal = self.target_meta.get(target_index).is_some_and(|meta| {
                 matches!(
@@ -139,29 +140,39 @@ impl Graph<'_> {
                         "Invalid Ninja build step index.",
                     ));
                 };
-                if matches!(
-                    step,
-                    BuildStep::Compile { .. }
-                        | BuildStep::Scan { .. }
-                        | BuildStep::DeviceLink { .. }
-                ) && let Some(nodes) = self.steps.get_mut(index)
+                if (self.input.swift_actions.contains_key(&index)
+                    || matches!(
+                        step,
+                        BuildStep::Compile { .. }
+                            | BuildStep::Scan { .. }
+                            | BuildStep::DeviceLink { .. }
+                    ))
+                    && let Some(nodes) = self.steps.get_mut(index)
                     && has_order_target
                 {
                     nodes.order_only.push(OrderOnly::ObjectOrder(target_index));
                 }
                 // Link and utility commands must wait for target dependencies.
+                // Utility commands (custom targets with COMMAND) inherit the
+                // transitive target dependency closure like cmLocalNinjaGenerator::
+                // WriteCustomCommandBuildStatement -> AppendTargetDependsClosure.
                 if !dependencies.is_empty()
                     && self.producers.get(alias) != Some(&index)
                     && let Some(nodes) = self.steps.get_mut(index)
-                    && (matches!(step, BuildStep::Link { .. })
-                        || nodes.link
-                        || self.input.utility_steps.contains(&index))
                 {
-                    nodes
-                        .order_only
-                        .push(OrderOnly::Targets(Cow::Borrowed(dependencies)));
-                    self.order_only_alias_bytes =
-                        self.order_only_alias_bytes.saturating_add(alias_bytes);
+                    if self.input.utility_steps.contains(&index) {
+                        nodes
+                            .order_only
+                            .push(OrderOnly::TargetClosure(Cow::Borrowed(dependencies)));
+                        self.order_only_alias_bytes =
+                            self.order_only_alias_bytes.saturating_add(alias_bytes);
+                    } else if matches!(step, BuildStep::Link { .. }) || nodes.link {
+                        nodes
+                            .order_only
+                            .push(OrderOnly::Targets(Cow::Borrowed(dependencies)));
+                        self.order_only_alias_bytes =
+                            self.order_only_alias_bytes.saturating_add(alias_bytes);
+                    }
                 }
             }
             if let Some(&producer) = self.producers.get(alias)
@@ -206,7 +217,9 @@ impl Graph<'_> {
         };
         let file_sets = self.input.file_set_order.get(&target_index);
         for &step in &target.steps {
-            if self.input.utility_steps.contains(&step) {
+            if self.input.utility_steps.contains(&step)
+                || self.input.swift_actions.contains_key(&step)
+            {
                 continue;
             }
             let Some(BuildStep::Custom(custom)) = self.input.steps.get(step) else {

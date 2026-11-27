@@ -19,7 +19,45 @@ pub(crate) fn in_try_compile(model: &ProjectModel) -> bool {
         .is_some_and(|value| truth::is_on(value))
 }
 
+pub(crate) fn toolkit_flags(model: &ProjectModel, target: &Target) -> Vec<BString> {
+    if definition(model, target.dir, b"CMAKE_CUDA_COMPILER_ID")
+        .is_none_or(|id| id.as_slice() != b"Clang")
+    {
+        return Vec::new();
+    }
+    let Some(root) = definition(model, target.dir, b"CMAKE_CUDA_COMPILER_LIBRARY_ROOT")
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    vec![
+        [b"--cuda-path=".as_slice(), root.as_slice()]
+            .concat()
+            .into(),
+    ]
+}
+
 pub(crate) fn compile_flags(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+) -> Vec<BString> {
+    let mut flags = compile_flags_for_codemodel(model, target, config);
+    if target
+        .props
+        .get(b"CUDA_SEPARABLE_COMPILATION")
+        .is_some_and(|value| truth::is_on(value))
+        && let Some(flag) = definition(model, target.dir, b"_CMAKE_CUDA_RDC_FLAG")
+    {
+        flags.extend(crate::usage::link_options::shell_arguments(flag));
+    }
+    flags
+}
+
+/// CUDA compile flags reported in File API `codemodel-v2` (excludes `<CUDA_COMPILE_MODE>`
+/// flags like `-rdc=true` / `-fgpu-rdc` that CMake expands in the rule template rather than
+/// `GetTargetCompileFlags`).
+pub(crate) fn compile_flags_for_codemodel(
     model: &ProjectModel,
     target: &Target,
     config: &ConfigId,
@@ -31,14 +69,19 @@ pub(crate) fn compile_flags(
         config,
         in_try_compile(model),
     );
-    if target
-        .props
-        .get(b"CUDA_SEPARABLE_COMPILATION")
-        .is_some_and(|value| truth::is_on(value))
-        && let Some(flag) = definition(model, target.dir, b"_CMAKE_CUDA_RDC_FLAG")
-    {
-        flags.extend(crate::usage::link_options::shell_arguments(flag));
-    }
+    flags.extend(toolkit_flags(model, target));
+    flags
+}
+
+pub(crate) fn link_flags(model: &ProjectModel, target: &Target, config: &ConfigId) -> Vec<BString> {
+    let (mut flags, _) = arch::architecture_flags(
+        model,
+        target,
+        arch::ArchPhase::Link,
+        config,
+        in_try_compile(model),
+    );
+    flags.extend(toolkit_flags(model, target));
     flags
 }
 

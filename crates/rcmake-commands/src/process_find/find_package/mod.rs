@@ -169,7 +169,6 @@ fn find_requested_package(
             line: cx.current_line(),
         });
         call.extend_from_slice(args);
-        // A provider call is setup: configure replay restores no listfile in it.
         cx.begin_replay_setup();
         let called = cx.call_command(&provider, call);
         cx.end_replay_setup(called.is_ok());

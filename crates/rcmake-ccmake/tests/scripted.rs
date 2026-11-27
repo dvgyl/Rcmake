@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use rcmake_base::BString;
 use rcmake_ccmake::layout::{
-    ERR_LOAD_CACHE, ERR_WINDOW_TOO_SMALL, KEYS_ROW_0, KEYS_ROW_1_GENERATE, KEYS_ROW_1_NO_GENERATE,
-    KEYS_ROW_2, KEYS_ROW_3_ADV_OFF, KEYS_ROW_3_ADV_ON,
+    ERR_INIT_FAILED, ERR_LOAD_CACHE, ERR_WINDOW_TOO_SMALL, KEYS_ROW_0, KEYS_ROW_1_GENERATE,
+    KEYS_ROW_1_NO_GENERATE, KEYS_ROW_2, KEYS_ROW_3_ADV_OFF, KEYS_ROW_3_ADV_ON,
 };
 use rcmake_ccmake::model::snapshot_entry;
 use rcmake_ccmake::terminal::scripted::ScriptedTerminal;
@@ -239,6 +239,7 @@ fn configure_with_new_entries_hides_generate_until_second_clean_configure() {
                 lines: Vec::new(),
                 has_non_status: false,
                 new_entries: new_set,
+                edits_pending: false,
             },
             Some(snap_after_first.clone()),
         ),
@@ -248,6 +249,7 @@ fn configure_with_new_entries_hides_generate_until_second_clean_configure() {
                 lines: Vec::new(),
                 has_non_status: false,
                 new_entries: BTreeSet::new(),
+                edits_pending: false,
             },
             Some(snap_after_first),
         ),
@@ -351,6 +353,7 @@ fn configure_error_opens_log_view_and_dismisses_with_e() {
             }],
             has_non_status: true,
             new_entries: BTreeSet::new(),
+            edits_pending: false,
         },
         None,
     )];
@@ -398,4 +401,57 @@ fn path_tab_completion_uses_driver_list_dir() {
             value: BString::from("/work/subdir/"),
         }]]
     );
+}
+
+#[test]
+fn edits_that_did_not_reach_the_cache_stay_queued() {
+    let mut term = ScriptedTerminal::new(80, 24);
+    term.push_bytes(b"\rcecq");
+    let mut driver = FakeDriver::new(base_snapshot());
+    driver.configure_responses = vec![(
+        RunReport {
+            exit_code: 1,
+            lines: vec![LogLine {
+                is_error: true,
+                text: BString::from("CMake Error: Unable to open cache file for save."),
+            }],
+            has_non_status: true,
+            new_entries: BTreeSet::new(),
+            edits_pending: true,
+        },
+        None,
+    )];
+    let mut stderr = Vec::new();
+
+    assert_eq!(run(&mut term, &mut driver, &mut stderr), 0);
+    let toggle = vec![EntryEdit::Set {
+        name: BString::from("ALPHA"),
+        ty: CacheType::Bool,
+        value: BString::from("ON"),
+    }];
+    assert_eq!(driver.configure_calls, [toggle.clone(), toggle]);
+}
+
+#[test]
+fn consumed_edits_are_not_sent_again() {
+    let mut term = ScriptedTerminal::new(80, 24);
+    term.push_bytes(b"\rccq");
+    let mut driver = FakeDriver::new(base_snapshot());
+    let mut stderr = Vec::new();
+
+    assert_eq!(run(&mut term, &mut driver, &mut stderr), 0);
+    assert_eq!(driver.configure_calls.len(), 2);
+    assert!(driver.configure_calls[1].is_empty());
+}
+
+#[test]
+fn a_screen_over_the_cell_budget_does_not_start() {
+    let mut term = ScriptedTerminal::new(1100, 1000);
+    let mut driver = FakeDriver::new(base_snapshot());
+    let mut stderr = Vec::new();
+
+    assert_eq!(run(&mut term, &mut driver, &mut stderr), 1);
+    assert_eq!(String::from_utf8_lossy(&stderr), ERR_INIT_FAILED);
+    assert!(!term.is_raw());
+    assert!(term.output_bytes().is_empty());
 }
