@@ -10,6 +10,7 @@ mod configure;
 mod ctest;
 mod debugger;
 mod diff_config_cmd;
+mod drift;
 mod exec_log;
 mod explain_cmd;
 mod find_package;
@@ -371,6 +372,16 @@ fn run_cmake(
     }
     if let Some(script) = opts.script.take() {
         return run_script(argv, &mut opts, &script, host);
+    }
+    if persona == persona::Persona::Native && opts.extensions.export_compile_commands {
+        opts.cache_edits.insert(
+            0,
+            options::CacheEdit::Define(rcmake_eval::CacheDefine {
+                name: "CMAKE_EXPORT_COMPILE_COMMANDS".into(),
+                ty: Some(CacheType::Bool),
+                value: "ON".into(),
+            }),
+        );
     }
     for (ignore_key, ignore) in [
         (

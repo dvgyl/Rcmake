@@ -978,7 +978,7 @@ impl<'a> ConfigureSession<'a> {
         let start = host.monotonic();
         let generate_step = crate::InstrumentationStep::start(host, sample);
         let result = self.profiling.measure(host, ProfilePhase::Generate, || {
-            crate::generate::run(interp, host, &self.bin, &queries)
+            crate::generate::run(interp, host, &self.bin, &queries, self.opts.persona)
         });
         use crate::generate::Outcome;
         let outcome = match result {

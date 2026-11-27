@@ -49,6 +49,7 @@ pub(crate) fn run(
     host: &dyn Host,
     bin: &Path,
     queries: &[Query],
+    _persona: crate::persona::Persona,
 ) -> Result<Outcome, Failure> {
     let outcome = generate(interp, host, bin, queries);
     if matches!(outcome, Err(_) | Ok(Outcome::DeferredError))
