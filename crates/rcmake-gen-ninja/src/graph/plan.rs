@@ -414,9 +414,45 @@ impl<'a> Graph<'a> {
                 let depfile = self.input.link_depfiles.get(&step.output);
                 let rule = depfile.map_or_else(|| step.kind.ninja_rule(), |_| b"LINK_DEPFILE");
                 let mut plan = EdgePlan::new(rule, explicit_inputs, nodes);
-                plan.implicit_inputs.extend(lib_implicit);
-                plan.implicit_inputs
-                    .extend(implicit_inputs.iter().map(|input| self.node(input)));
+                if let Some(event_byproducts) = self.input.link_event_byproducts.get(&step.output)
+                    && !event_byproducts.is_empty()
+                {
+                    for byproduct in event_byproducts {
+                        let node = self.node(byproduct);
+                        if let Some(alias) = self.absolute_alias(&node)
+                            && !plan.implicit_outputs.contains(&alias)
+                        {
+                            plan.implicit_outputs.push(alias);
+                        }
+                    }
+                    plan.bind(b"restat", b"1".as_slice());
+                }
+                let no_shared = step.kind != LinkKind::StaticArchive
+                    && self.step_link_depends_no_shared(step_index);
+                let explicit_link_depends: HashSet<BString> = if no_shared {
+                    implicit_inputs
+                        .iter()
+                        .map(|input| self.node(input))
+                        .collect()
+                } else {
+                    HashSet::new()
+                };
+                for node in lib_implicit {
+                    if no_shared
+                        && self.is_shared_library_input(&node)
+                        && !explicit_link_depends.contains(&node)
+                    {
+                        plan.order_only.push(node);
+                    } else {
+                        plan.implicit_inputs.push(node);
+                    }
+                }
+                for input in implicit_inputs {
+                    let node = self.node(input);
+                    if !plan.implicit_inputs.contains(&node) {
+                        plan.implicit_inputs.push(node);
+                    }
+                }
                 if step.kind != LinkKind::StaticArchive {
                     let mut seen: Option<HashSet<BString>> = None;
                     for frag in &step.fragments {
@@ -431,11 +467,22 @@ impl<'a> Graph<'a> {
                             && self.commands.absolute(token)
                         {
                             let seen = seen.get_or_insert_with(|| {
-                                plan.implicit_inputs.iter().cloned().collect()
+                                plan.implicit_inputs
+                                    .iter()
+                                    .chain(&plan.order_only)
+                                    .cloned()
+                                    .collect()
                             });
                             let node = self.node(token);
                             if seen.insert(node.clone()) {
-                                plan.implicit_inputs.push(node);
+                                if no_shared
+                                    && self.is_shared_library_input(&node)
+                                    && !explicit_link_depends.contains(&node)
+                                {
+                                    plan.order_only.push(node);
+                                } else {
+                                    plan.implicit_inputs.push(node);
+                                }
                             }
                         }
                     }
@@ -471,6 +518,11 @@ impl<'a> Graph<'a> {
                 let lib_symlink = is_library_symlink(custom);
                 let exe_symlink = is_executable_symlink(custom);
                 let is_symlink = lib_symlink || exe_symlink;
+                let is_util_output = self.input.utility_steps.contains(&step_index)
+                    && nodes
+                        .outputs
+                        .first()
+                        .is_some_and(|output| output.ends_with(b".util"));
                 let resolved = custom
                     .depends
                     .iter()
@@ -478,18 +530,34 @@ impl<'a> Graph<'a> {
                     .collect::<Vec<_>>();
                 // CMake also lists the absolute path of each file in the build tree,
                 // so a depfile that names the absolute path finds this edge.
-                // Symlink rules list explicit outputs only.
+                // Symlink rules, `.util` utility outputs, and link outputs do not get
+                // workdir aliases; byproducts on those edges still do.
                 let aliases = if is_symlink {
                     Vec::new()
                 } else {
                     nodes
                         .outputs
                         .iter()
+                        .enumerate()
+                        .filter(|(index, node)| {
+                            !(is_util_output && node.ends_with(b".util"))
+                                && !(nodes.link && *index == 0)
+                        })
+                        .map(|(_, node)| node)
                         .chain(&nodes.byproducts)
                         .filter_map(|node| self.absolute_alias(node))
                         .collect::<Vec<_>>()
                 };
                 if custom.invocations.is_empty() {
+                    if self.input.utility_steps.contains(&step_index) || custom.outputs.is_empty() {
+                        let (targets, files): (Vec<_>, Vec<_>) =
+                            resolved.into_iter().partition(|input| input.target_only);
+                        let inputs = files.into_iter().map(|input| input.node).collect();
+                        let mut plan = EdgePlan::new(b"phony", inputs, nodes);
+                        plan.order_only = targets.into_iter().map(|input| input.node).collect();
+                        plan.implicit_outputs.extend(aliases);
+                        return Ok(plan);
+                    }
                     let inputs = resolved.into_iter().map(|input| input.node).collect();
                     let mut plan = EdgePlan::new(b"phony", inputs, nodes);
                     plan.implicit_outputs.extend(aliases);
@@ -511,7 +579,9 @@ impl<'a> Graph<'a> {
                     || !custom.symbolic_outputs.is_empty()
                     || self.input.utility_steps.contains(&step_index)
                     || custom.outputs.is_empty();
-                if rule == b"CUSTOM_COMMAND" && (!symbolic || !custom.byproducts.is_empty()) {
+                if rule == b"CUSTOM_COMMAND"
+                    && (!symbolic || is_util_output || !custom.byproducts.is_empty())
+                {
                     plan.bind(b"restat", b"1".as_slice());
                 }
                 plan.order_only = targets.into_iter().map(|input| input.node).collect();
@@ -535,6 +605,10 @@ impl<'a> Graph<'a> {
                                 &rcmake_host::path::from_native(self.build_dir),
                                 !self.prefix.is_empty(),
                             )
+                        } else if nodes.link {
+                            self.link_command_line(&custom.invocations, false)
+                        } else if is_util_output {
+                            self.utility_command_line(&custom.invocations)
                         } else {
                             self.command_line(&custom.invocations, true)
                         }

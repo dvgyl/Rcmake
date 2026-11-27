@@ -228,6 +228,25 @@ type ToolKey = (PathBuf, PathBuf, BString, bool, Digest);
 type SearchKey = (PathBuf, Vec<BString>, Digest);
 type SearchMemo = Mutex<BTreeMap<SearchKey, (Vec<PathBuf>, Vec<bool>)>>;
 
+/// Hash environment variables that affect toolchain discovery, ignoring
+/// locale variables (`LC_ALL`, `LC_MESSAGES`, `LANG`, `LC_CTYPE`, `LANGUAGE`)
+/// that `CMakeDetermineCompilerABI` toggles around ABI probes. Probe recipes
+/// still hash the full process environment so cached probe outputs preserve
+/// locale-sensitive compiler diagnostics.
+fn tool_environment_fingerprint(environment: &[(BString, BString)]) -> Digest {
+    let filtered: Vec<_> = environment
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_slice(),
+                b"LC_ALL" | b"LC_MESSAGES" | b"LANG" | b"LC_CTYPE" | b"LANGUAGE"
+            )
+        })
+        .cloned()
+        .collect();
+    process_environment_fingerprint(&filtered)
+}
+
 #[derive(Default)]
 pub(super) struct SessionEvidence {
     tools: Mutex<BTreeMap<ToolKey, Arc<ToolchainEvidence>>>,
@@ -281,7 +300,7 @@ impl CompilerEvidence {
             sdk.clone(),
             id,
             cxx,
-            process_environment_fingerprint(&host.env_all()),
+            tool_environment_fingerprint(&host.env_all()),
         );
         let mut tools = session.tools.lock().ok()?;
         if tools.get(&key).is_some_and(|toolchain| {
@@ -433,7 +452,7 @@ impl CompilerEvidence {
             sdk.clone(),
             id,
             cxx,
-            process_environment_fingerprint(&host.env_all()),
+            tool_environment_fingerprint(&host.env_all()),
         );
         // Require already-verified cached toolchain evidence; defer discovery to foreground.
         let toolchain = {

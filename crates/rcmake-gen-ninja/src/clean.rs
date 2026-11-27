@@ -1,12 +1,14 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use rcmake_base::{BString, list};
 use rcmake_gen_common::GenError;
 use rcmake_genex::{EvalContext, TargetHandle, evaluate, parse};
+use rcmake_host::Host;
 use rcmake_model::{DirId, ProjectModel};
 use rcmake_resolve::usage::UsageResolver;
 
-use crate::{Graph, generation_error};
+use crate::{Graph, generation_error, write_if_changed};
 
 impl Graph<'_> {
     pub(crate) fn set_clean_files(
@@ -59,25 +61,45 @@ impl Graph<'_> {
     }
 }
 
-pub(crate) fn clean_command<'a>(
-    graph: &Graph<'_>,
-    cmake: &[u8],
-    tool: Vec<u8>,
-    additional_files: impl IntoIterator<Item = &'a BString>,
-) -> Vec<u8> {
-    let mut files = additional_files
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .peekable();
-    if files.peek().is_none() {
-        return tool;
+pub(crate) fn write_clean_additional_script(
+    host: &dyn Host,
+    build_dir: &Path,
+    graphs: &[&Graph<'_>],
+) -> Result<(), GenError> {
+    let mut script =
+        Vec::from(b"# Additional clean files\ncmake_minimum_required(VERSION 3.16)\n".as_slice());
+    for graph in graphs {
+        if graph.clean_files.is_empty() {
+            continue;
+        }
+        let config = graph.config.unwrap_or(graph.input.config.0.as_slice());
+        script.extend_from_slice(b"\nif(\"${CONFIG}\" STREQUAL \"\" OR \"${CONFIG}\" STREQUAL \"");
+        append_cmake_string(&mut script, config);
+        script.extend_from_slice(b"\")\n  file(REMOVE_RECURSE\n");
+        let entries: BTreeSet<BString> = graph
+            .clean_files
+            .iter()
+            .map(|file| graph.node(file))
+            .collect();
+        for entry in entries {
+            script.extend_from_slice(b"  \"");
+            append_cmake_string(&mut script, &entry);
+            script.extend_from_slice(b"\"\n");
+        }
+        script.extend_from_slice(b"  )\nendif()\n");
     }
-    let mut remove = cmake.to_vec();
-    remove.extend_from_slice(b" -E rm -rf --");
-    for file in files {
-        remove.push(b' ');
-        graph.commands.word(file, &mut remove);
+    write_if_changed(
+        host,
+        &build_dir.join("CMakeFiles/clean_additional.cmake"),
+        &script,
+    )
+}
+
+fn append_cmake_string(out: &mut Vec<u8>, value: &[u8]) {
+    for &byte in value {
+        if matches!(byte, b'\\' | b'"' | b'$') {
+            out.push(b'\\');
+        }
+        out.push(byte);
     }
-    graph.commands.chain(&remove, &tool)
 }

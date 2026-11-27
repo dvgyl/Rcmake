@@ -53,7 +53,7 @@ impl Graph<'_> {
                         .iter()
                         .any(|invocation| invocation.link_response.is_some()) =>
                 {
-                    (output, step.invocations.as_slice(), true)
+                    (output, step.invocations.as_slice(), !nodes.link)
                 }
                 _ => continue,
             };

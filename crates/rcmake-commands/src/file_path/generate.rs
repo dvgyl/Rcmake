@@ -49,6 +49,21 @@ pub(super) fn run(cx: &mut Cx<'_>, args: &[&[u8]]) -> Result {
     let input = parsed
         .single(input_kind)
         .ok_or_else(|| error("GENERATE requires INPUT or CONTENT option."))?;
+    if input_kind == "INPUT" && !input.windows(2).any(|window| window == b"$<") {
+        let base = if cx.policy(rcmake_diag::PolicyId::new(70)) == rcmake_diag::PolicyStatus::New {
+            cx.current_source_dir()
+        } else {
+            cx.host().initial_cwd()
+        };
+        let resolved =
+            crate::dirs::normalized_path(&base.join(rcmake_host::path::to_native(input)));
+        let dir = cx.current_dir_id();
+        let entry = rcmake_host::path::from_native_cmake(&resolved);
+        let listfiles = &mut cx.project().dir_mut(dir).listfiles;
+        if !listfiles.contains(&entry) {
+            listfiles.push(entry);
+        }
+    }
     let mut record = vec![b"OUTPUT".as_slice(), output, input_kind.as_bytes(), input];
     for keyword in ["CONDITION", "TARGET", "NEWLINE_STYLE"] {
         if let Some(value) = parsed.single(keyword) {

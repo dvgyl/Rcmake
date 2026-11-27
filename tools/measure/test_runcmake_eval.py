@@ -379,5 +379,196 @@ class VisualStudioRegistrationTests(unittest.TestCase):
                                  for arg in map(str, attempt.args[0])))
 
 
+class ShardingAndMergeTests(unittest.TestCase):
+    @staticmethod
+    def _make_shard_report(
+        expected_suites, index, count, *,
+        passed_per_suite=10, failed_per_suite=0,
+        commit="a" * 40, digest="b" * 64, run_id="999", attempt="1",
+        profile="linux",
+    ):
+        assigned = runcmake_eval.select_shard_suites(expected_suites, index, count)
+        suites = {}
+        for suite in assigned:
+            cases = [
+                {"name": f"Pass{i}", "occurrence": 1, "status": "passed",
+                 "oracle": {"passed": True, "detail": ""}, "rcmake": {"passed": True, "detail": ""}}
+                for i in range(passed_per_suite)
+            ] + [
+                {"name": f"Fail{i}", "occurrence": 1, "status": "failed",
+                 "oracle": {"passed": True, "detail": ""}, "rcmake": {"passed": False, "detail": "diff"}}
+                for i in range(failed_per_suite)
+            ]
+            counts = runcmake_eval.case_counts(cases)
+            driver = {"complete": True, "timed_out": False, "driver_errors": [], "skips": []}
+            suites[suite] = {**counts, "cases": cases, "oracle_driver": driver, "rcmake_driver": dict(driver)}
+        totals = {
+            k: sum(row[k] for row in suites.values())
+            for k in ("passed", "failed", "total", "missing", "reference_failed", "no_reference", "capability_excluded")
+        }
+        return {
+            "profile": profile,
+            "timeout_seconds": 180,
+            "min_pass_rate": None,
+            "rcmake_sha": commit,
+            "oracle_version": "4.5.1",
+            "tested_binary_sha256": digest,
+            "provenance": {"workflow_run_id": run_id, "workflow_run_attempt": attempt, "ci_binary_artifact": "bin"},
+            "shard": {"index": index, "count": count},
+            "generator": "Ninja",
+            "source": "/tmp/Tests/RunCMake",
+            "oracle": "/tmp/cmake",
+            "rcmake": "/tmp/rcmake",
+            "suite_inventory": {
+                "included": assigned,
+                "expected_profile_suites": list(expected_suites),
+                "profile_total_suites": len(expected_suites),
+                "excluded_external": {},
+                "registration_generators": ["Ninja"],
+                "configured_generators": ["Ninja"],
+                "suite_generators": {suite: ["Ninja"] for suite in assigned},
+            },
+            "suites": suites,
+            "totals": totals,
+            "pass_rate_percent": 100 * totals["passed"] / totals["total"] if totals["total"] else None,
+            "incomplete_suites": [],
+            "skips": [],
+        }
+
+    def test_select_shard_suites_partitions_without_gaps_or_overlaps(self):
+        all_suites = [f"Suite{i:02d}" for i in range(11)]
+        shards = [runcmake_eval.select_shard_suites(all_suites, k, 3) for k in (1, 2, 3)]
+        combined = [suite for shard in shards for suite in shard]
+        self.assertEqual(len(combined), len(all_suites))
+        self.assertEqual(set(combined), set(all_suites))
+        self.assertEqual(runcmake_eval.parse_shard("2/3"), (2, 3))
+        for bad in ("0/3", "4/3", "1/0", "abc", "1/2/3"):
+            with self.assertRaises(ValueError):
+                runcmake_eval.parse_shard(bad)
+
+    def test_merge_shard_reports_merges_three_shards_and_enforces_99_percent(self):
+        expected = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"]
+        reports = [self._make_shard_report(expected, k, 3, passed_per_suite=50) for k in (3, 1, 2)]
+        merged = runcmake_eval.merge_shard_reports(reports, expected_shards=3)
+        self.assertEqual(list(merged["suites"].keys()), expected)
+        self.assertEqual(merged["totals"]["passed"], 300)
+        self.assertEqual(merged["totals"]["total"], 300)
+        self.assertEqual(merged["pass_rate_percent"], 100.0)
+        self.assertEqual([s["index"] for s in merged["shards"]], [1, 2, 3])
+        self.assertEqual(merged["tested_binary_sha256"], "b" * 64)
+
+        with TemporaryDirectory() as tmp:
+            paths = []
+            for idx, rep in enumerate(reports, 1):
+                p = Path(tmp) / f"s{idx}.json"
+                p.write_text(json.dumps(rep), encoding="utf-8")
+                paths.append(p)
+            out = Path(tmp) / "merged.json"
+            argv = [
+                "runcmake_eval.py", "--merge", *(str(p) for p in paths),
+                "--expected-shards", "3", "--min-pass-rate", "99.0", "--json", str(out),
+            ]
+            with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(runcmake_eval.main(), 0)
+            written = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(list(written["suites"].keys()), expected)
+
+    def test_merge_rejects_missing_shard_mismatched_digest_tampered_counts_and_low_rate(self):
+        expected = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"]
+        good = [self._make_shard_report(expected, k, 3, passed_per_suite=50) for k in (1, 2, 3)]
+
+        with self.assertRaisesRegex(ValueError, "Missing RunCMake shard"):
+            runcmake_eval.merge_shard_reports(good[:2], expected_shards=3)
+
+        bad_digest = [self._make_shard_report(expected, k, 3, digest="c" * 64 if k == 2 else "b" * 64) for k in (1, 2, 3)]
+        with self.assertRaisesRegex(ValueError, "tested_binary_sha256"):
+            runcmake_eval.merge_shard_reports(bad_digest, expected_shards=3)
+
+        bad_run = [self._make_shard_report(expected, k, 3, run_id="1000" if k == 3 else "999") for k in (1, 2, 3)]
+        with self.assertRaisesRegex(ValueError, "workflow_run_id"):
+            runcmake_eval.merge_shard_reports(bad_run, expected_shards=3)
+
+        tampered = [self._make_shard_report(expected, k, 3, passed_per_suite=10) for k in (1, 2, 3)]
+        tampered[0]["suites"]["Alpha"]["passed"] = 9
+        with self.assertRaisesRegex(ValueError, "count passed"):
+            runcmake_eval.merge_shard_reports(tampered, expected_shards=3)
+
+        spoofed = [self._make_shard_report(expected, k, 3, passed_per_suite=10) for k in (1, 2, 3)]
+        spoofed[0]["suites"]["Alpha"]["cases"][0]["rcmake"]["passed"] = False
+        with self.assertRaisesRegex(ValueError, "inconsistent case status"):
+            runcmake_eval.merge_shard_reports(spoofed, expected_shards=3)
+
+        huge_count = self._make_shard_report(expected, 1, 3, passed_per_suite=1)
+        huge_count["shard"] = {"index": 1, "count": 10**9}
+        with self.assertRaisesRegex(ValueError, "Missing RunCMake shard"):
+            runcmake_eval.merge_shard_reports([huge_count])
+
+        no_prov = [self._make_shard_report(expected, k, 3, passed_per_suite=5) for k in (1, 2, 3)]
+        with self.assertRaisesRegex(ValueError, "ci_binary_run_id"):
+            runcmake_eval.merge_shard_reports(no_prov, expected_shards=3, require_provenance=True)
+
+        with TemporaryDirectory() as tmp:
+            low = [
+                self._make_shard_report(expected, k, 3, passed_per_suite=49, failed_per_suite=1)
+                for k in (1, 2, 3)
+            ]
+            paths = []
+            for idx, rep in enumerate(low, 1):
+                p = Path(tmp) / f"low{idx}.json"
+                p.write_text(json.dumps(rep), encoding="utf-8")
+                paths.append(p)
+            argv = [
+                "runcmake_eval.py", "--merge", *(str(p) for p in paths),
+                "--expected-shards", "3", "--min-pass-rate", "99.0",
+            ]
+            with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(runcmake_eval.main(), 1)
+
+            dup = Path(tmp) / "dup.json"
+            dup.write_text('{"a": 1, "a": 2}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Duplicate JSON key"):
+                runcmake_eval.load_strict_json(dup)
+
+    def test_defer_pass_rate_allows_ordinary_failures_but_rejects_missing_case(self):
+        with TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            source = work / "Tests" / "RunCMake"
+            for name in ("Alpha", "Beta", "Gamma"):
+                (source / name).mkdir(parents=True)
+                (source / name / "RunCMakeTest.cmake").touch()
+            (source / "RunCMake.cmake").touch()
+            driver, candidate = work / "oracle", work / "candidate"
+            candidate.write_bytes(b"fake-rcmake-binary")
+            candidate.chmod(0o755)
+            report = work / "shard1.json"
+            complete = {"complete": True, "timed_out": False, "driver_errors": [], "skips": []}
+            reg = runcmake_eval.Registration(
+                "Alpha", "Ninja", Path("Tests/RunCMake/Alpha/RunCMakeTest.cmake"),
+                work / "g0", (), Path("Tests/RunCMake"), 10,
+            )
+            oracle = {("CaseA", 1): {"passed": True, "detail": ""}}
+            failed_cand = {("CaseA", 1): {"passed": False, "detail": "ordinary diff"}}
+            missing_cand = {}
+            for cand, expected_rc in ((failed_cand, 0), (missing_cand, 1)):
+                argv = [
+                    "runcmake_eval.py", "--suite", "Alpha", "--suite", "Beta", "--suite", "Gamma",
+                    "--shard", "1/3", "--defer-pass-rate", "--rcmake-bin", str(candidate), "--json", str(report),
+                ]
+                with (patch.object(sys, "argv", argv),
+                      patch.dict(os.environ, RCMAKE_ORACLE_CMAKE=str(driver),
+                                 RCMAKE_ORACLE_RUNCMAKE_DIR=str(source)),
+                      patch.object(runcmake_eval.subprocess, "check_output", return_value="cmake version 4.5.1\n"),
+                      patch.object(runcmake_eval, "read_registrations", return_value={"Alpha": [reg]}),
+                      patch.object(runcmake_eval, "target_tools", return_value={"ctest": driver, "cpack": driver}),
+                      patch.object(runcmake_eval, "run_registered_suite", side_effect=[(oracle, complete), (cand, complete)]),
+                      redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                    self.assertEqual(runcmake_eval.main(), expected_rc)
+            written = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(written["shard"], {"index": 1, "count": 3})
+            self.assertEqual(written["suite_inventory"]["expected_profile_suites"], ["Alpha", "Beta", "Gamma"])
+            self.assertEqual(written["suite_inventory"]["included"], ["Alpha"])
+            self.assertEqual(len(written["tested_binary_sha256"]), 64)
+
+
 if __name__ == "__main__":
     unittest.main()

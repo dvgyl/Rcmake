@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
-use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext};
+use rcmake_genex::{ArtifactKind, ArtifactPart, ConfigId, EvalContext, UsageTraversal};
 use rcmake_host::path::to_native;
 use rcmake_model::{BT, DirId, ProjectModel, Target, TargetId, UsageField};
 
@@ -128,14 +128,22 @@ pub(crate) fn resolve_link(
         .0;
     let naming = LinkLibraryFlags::new(model, target, &language);
     let mut fragments = Vec::with_capacity(options.len() + directories.len() + items.len());
+    let windows_host = lower::windows_host(model, target.dir);
     for option in &options {
         let value = option.value.as_slice();
         let text = if value.starts_with(b"LINKER:") {
             value.into()
         } else {
-            value
-                .strip_prefix(b"SHELL:")
-                .map_or_else(|| quote(value), BString::from)
+            value.strip_prefix(b"SHELL:").map_or_else(
+                || {
+                    if windows_host {
+                        quote(value)
+                    } else {
+                        lower::cmake_posix_quote(value)
+                    }
+                },
+                BString::from,
+            )
         };
         fragments.push(link_fragment(text, option, LinkFragmentRole::Flags));
     }
@@ -484,11 +492,13 @@ fn xcframework_root(
 
 pub(crate) fn framework_dirs<'a>(
     model: &ProjectModel,
-    target: &Target,
+    (id, target): (TargetId, &Target),
     dependencies: &[TargetId],
     artifact: &impl Fn(TargetId) -> Option<&'a BString>,
     config: &ConfigId,
-) -> Vec<(BString, bool)> {
+    link_language: Option<&BString>,
+    usage: &mut UsageResolver<'_>,
+) -> Result<Vec<(BString, bool)>, ResolveError> {
     let mut directories: IndexMap<BString, bool> = IndexMap::new();
     for (root, system) in linked_framework_roots(model, target, dependencies, artifact, config) {
         directories
@@ -496,7 +506,135 @@ pub(crate) fn framework_dirs<'a>(
             .and_modify(|previous| *previous &= system)
             .or_insert(system);
     }
-    directories.into_iter().collect()
+    for root in direct_raw_framework_roots(model, target, id, config, link_language, usage)? {
+        let parent: BString = Lexical::new(&root).parent().into();
+        if !parent.is_empty() {
+            directories
+                .entry(parent)
+                .and_modify(|previous| *previous = false)
+                .or_insert(false);
+        }
+    }
+    Ok(directories.into_iter().collect())
+}
+
+fn direct_raw_framework_roots(
+    model: &ProjectModel,
+    target: &Target,
+    id: TargetId,
+    config: &ConfigId,
+    link_language: Option<&BString>,
+    usage: &mut UsageResolver<'_>,
+) -> Result<Vec<BString>, ResolveError> {
+    if !lower::is_darwin(model, target.dir) {
+        return Ok(Vec::new());
+    }
+    let mut roots = IndexSet::new();
+    for traversal in [UsageTraversal::Link, UsageTraversal::Compile] {
+        let context = EvalContext {
+            config: config.clone(),
+            head: Some(crate::usage::handle(id)),
+            traversal,
+            link_language: link_language.cloned(),
+            ..EvalContext::default()
+        };
+        let items = usage.direct_link_items(id, false, &context)?;
+        for item in items.iter() {
+            if matches!(item.kind, ResolvedLinkKind::Raw)
+                && let Some(root) = lower::framework::wrapper_root(&item.text.value, b".framework")
+            {
+                roots.insert(Lexical::new(root).normalize());
+            }
+        }
+    }
+    Ok(roots.into_iter().collect())
+}
+
+pub(crate) fn transitive_raw_framework_dirs(
+    model: &ProjectModel,
+    target: &Target,
+    id: TargetId,
+    config: &ConfigId,
+    usage: &mut UsageResolver<'_>,
+) -> Result<Vec<BString>, ResolveError> {
+    if !lower::is_darwin(model, target.dir) {
+        return Ok(Vec::new());
+    }
+    let head = Some(crate::usage::handle(id));
+    let link_language = if let Some(language) = target
+        .props
+        .get(b"LINKER_LANGUAGE")
+        .filter(|lang| !lang.is_empty())
+    {
+        Some(language.clone())
+    } else if target
+        .props
+        .get(b"HAS_CXX")
+        .is_some_and(|flag| truth::is_on(flag))
+    {
+        Some("CXX".into())
+    } else {
+        let source_languages: Vec<BString> = target
+            .sources
+            .iter()
+            .flat_map(|source| list::split(&source.value, list::Empty::Drop))
+            .filter_map(|source| lower::source_language(model, target, &source))
+            .collect();
+        let base_ctx = EvalContext {
+            config: config.clone(),
+            head,
+            traversal: UsageTraversal::Link,
+            ..EvalContext::default()
+        };
+        lower::linker_language(
+            model,
+            target,
+            source_languages.iter().map(|language| language.as_slice()),
+        )
+        .or_else(|| {
+            usage
+                .select_link_language(id, target, &IndexMap::new(), &base_ctx)
+                .ok()
+                .flatten()
+        })
+    };
+    let mut excluded: IndexSet<BString> = lower::definition(
+        model,
+        target.dir,
+        b"CMAKE_PLATFORM_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES",
+    )
+    .into_iter()
+    .flat_map(|value| list::split(value, list::Empty::Drop))
+    .map(|value| Lexical::new(&value).normalize())
+    .collect();
+    for root in
+        direct_raw_framework_roots(model, target, id, config, link_language.as_ref(), usage)?
+    {
+        excluded.insert(Lexical::new(Lexical::new(&root).parent()).normalize());
+    }
+    let context = EvalContext {
+        config: config.clone(),
+        head,
+        traversal: UsageTraversal::Link,
+        link_language,
+        ..EvalContext::default()
+    };
+    let deps = usage.link_targets(id, &context)?;
+    let mut dirs = IndexSet::new();
+    for dep in deps {
+        let items = usage.direct_link_items(dep, true, &context)?;
+        for item in items.iter() {
+            if matches!(item.kind, ResolvedLinkKind::Raw)
+                && let Some(root) = lower::framework::wrapper_root(&item.text.value, b".framework")
+            {
+                let parent = Lexical::new(Lexical::new(root).parent()).normalize();
+                if !parent.is_empty() && !excluded.contains(&parent) {
+                    dirs.insert(parent);
+                }
+            }
+        }
+    }
+    Ok(dirs.into_iter().collect())
 }
 
 fn linked_framework_roots<'a>(
@@ -575,19 +713,40 @@ pub fn codemodel_frameworks<'a>(
     }
     let context = EvalContext {
         config: resolved.config.clone(),
+        head: Some(crate::usage::handle(resolved.id)),
         link_language: resolved.link.as_ref().map(|link| link.language.clone()),
         ..EvalContext::default()
     };
     let dependencies = usage.compile_framework_targets(resolved.id, &context)?;
-    Ok(
+    let mut seen = IndexSet::new();
+    let mut frameworks = Vec::new();
+    for (path, system) in
         linked_framework_roots(model, target, &dependencies, &artifact, &resolved.config)
-            .into_iter()
-            .map(|(path, system)| InterfaceInclude {
+    {
+        let normalized = Lexical::new(&path).normalize();
+        if seen.insert(normalized) {
+            frameworks.push(InterfaceInclude {
                 path: BT::new(path, Default::default()),
                 system,
-            })
-            .collect(),
-    )
+            });
+        }
+    }
+    for path in direct_raw_framework_roots(
+        model,
+        target,
+        resolved.id,
+        &resolved.config,
+        context.link_language.as_ref(),
+        usage,
+    )? {
+        if seen.insert(path.clone()) {
+            frameworks.push(InterfaceInclude {
+                path: BT::new(path, Default::default()),
+                system: false,
+            });
+        }
+    }
+    Ok(frameworks)
 }
 
 fn append_link_item(
@@ -841,9 +1000,11 @@ impl<'a> LinkLibraryFlags<'a> {
     }
 
     fn library(&self, value: &[u8]) -> BString {
+        if value.starts_with(b"-") {
+            return value.into();
+        }
         let (_, extension) = Lexical::new(value).stem_extension(true);
-        if value.starts_with(b"-")
-            || value.contains(&b'/')
+        if value.contains(&b'/')
             || value.contains(&b'\\')
             || (self.msvc && !extension.is_empty())
             || extension.eq_ignore_ascii_case(b".lib")
@@ -906,5 +1067,125 @@ mod tests {
             b"/opt/Foo.framework/Versions/A/Helpers/helper.app/Contents/MacOS/helper";
         assert_eq!(framework_root(&app, true, helper), None);
         assert_eq!(framework_root(&app, false, helper), None);
+    }
+
+    #[test]
+    fn link_library_flags_preserves_raw_dash_flags_verbatim() {
+        use rcmake_model::{TargetKind, TargetOrigin};
+
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/out".into());
+        let target = Target::new(
+            "app".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        );
+        let flags = LinkLibraryFlags::new(&model, &target, b"CXX");
+        let raw = br#"-Wl,--no-as-needed,"/build/lib/libtorch.so" -Wl,--as-needed"#;
+        assert_eq!(flags.library(raw).as_slice(), raw);
+    }
+
+    #[test]
+    fn transitive_raw_framework_dirs_evaluates_against_consuming_target_head_and_link_language()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rcmake_model::{LinkItem, TargetKind, TargetOrigin, UsageScope};
+
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/out".into());
+        let root = model.dir_mut(DirId::ROOT);
+        root.vars
+            .insert("CMAKE_SYSTEM_NAME".into(), "Darwin".into());
+        root.vars
+            .insert("CMAKE_C_SOURCE_FILE_EXTENSIONS".into(), "c".into());
+        root.vars
+            .insert("CMAKE_CXX_SOURCE_FILE_EXTENSIONS".into(), "cpp".into());
+
+        let link_item = |text: &str, scope: UsageScope| LinkItem {
+            text: BT::new(text.into(), Default::default()),
+            lookup_dir: DirId::ROOT,
+            opens_lookup_scope: false,
+            closes_lookup_scope: false,
+            scope: Some(scope),
+        };
+
+        let mut iface = Target::new(
+            "iface".into(),
+            TargetKind::InterfaceLibrary,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        );
+        // Set USE_FOO on the dependency itself so evaluating against the dependency
+        // instead of the consuming head target would falsely enable Foo.framework for app_off.
+        iface.props.set("USE_FOO".into(), "ON".into());
+        iface.usage.interface_link_libraries = Some(vec![
+            link_item(
+                "$<$<BOOL:$<TARGET_PROPERTY:USE_FOO>>:/opt/Foo/Foo.framework>",
+                UsageScope::Interface,
+            ),
+            link_item(
+                "$<$<LINK_LANGUAGE:CXX>:/opt/Cxx/Bar.framework>",
+                UsageScope::Interface,
+            ),
+        ]);
+        model.add_target(iface)?;
+
+        let mut app_on = Target::new(
+            "app_on".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        );
+        app_on.props.set("USE_FOO".into(), "ON".into());
+        app_on
+            .sources
+            .push(BT::new("main.cpp".into(), Default::default()));
+        app_on.usage.link_libraries = Some(vec![link_item("iface", UsageScope::Private)]);
+        let on_id = model.add_target(app_on)?;
+
+        let mut app_off = Target::new(
+            "app_off".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        );
+        app_off.props.set("USE_FOO".into(), "OFF".into());
+        app_off
+            .sources
+            .push(BT::new("main.c".into(), Default::default()));
+        app_off.usage.link_libraries = Some(vec![link_item("iface", UsageScope::Private)]);
+        let off_id = model.add_target(app_off)?;
+
+        let mut usage = UsageResolver::new(&model);
+        let config = ConfigId::default();
+        let on_dirs = transitive_raw_framework_dirs(
+            &model,
+            model.target(on_id).ok_or("missing app_on")?,
+            on_id,
+            &config,
+            &mut usage,
+        )?;
+        assert_eq!(on_dirs, vec![BString::from("/opt/Foo"), "/opt/Cxx".into()]);
+
+        let off_dirs = transitive_raw_framework_dirs(
+            &model,
+            model.target(off_id).ok_or("missing app_off")?,
+            off_id,
+            &config,
+            &mut usage,
+        )?;
+        assert!(
+            off_dirs.is_empty(),
+            "app_off must evaluate TARGET_PROPERTY and LINK_LANGUAGE against itself, not iface: {off_dirs:?}"
+        );
+        Ok(())
     }
 }

@@ -1097,3 +1097,159 @@ fn compare_codemodel(
     );
     Ok(())
 }
+
+#[test]
+fn codemodel_deduplicates_identical_compile_groups_and_preserves_directory_and_fileset_rules()
+-> TestResult {
+    let host = PureHost::default();
+    let src = Path::new("/src");
+    let bld = Path::new("/bld");
+    write(&host, &src.join("a.c"), b"int a(void){return 0;}\n")?;
+    write(&host, &src.join("b.c"), b"int b(void){return 1;}\n")?;
+    write(&host, &src.join("z_dir/z1.h"), b"")?;
+    write(&host, &src.join("a_dir/a1.h"), b"")?;
+    write(&host, &src.join("z_dir/sub/z2.h"), b"")?;
+    write(&host, &src.join("a_dir/sub/a2.h"), b"")?;
+    write(&host, &bld.join(".cmake/api/v1/query/codemodel-v2"), b"")?;
+
+    let mut model = ProjectModel::default();
+    model.generator = Some(GeneratorKind::Ninja);
+    model.set_root_dirs("/src".into(), "/bld".into());
+    let root = model.dir_mut(DirId::ROOT);
+    root.vars.insert("CMAKE_C_COMPILER".into(), "cc".into());
+    // Give both a.c and b.c identical source-level COMPILE_FLAGS (no per-source backtrace diff).
+    root.source_props
+        .entry("/src/a.c".into())
+        .or_default()
+        .set("COMPILE_FLAGS".into(), "-Wno-unused".into());
+    root.source_props
+        .entry("/src/b.c".into())
+        .or_default()
+        .set("COMPILE_FLAGS".into(), "-Wno-unused".into());
+
+    let mut target = Target::new(
+        "mylib".into(),
+        TargetKind::StaticLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        trace(src, 1, "add_library"),
+        PolicyMap::default(),
+    );
+    target.sources.push(tagged(src, 1, "add_library", b"a.c"));
+    target.sources.push(tagged(src, 1, "add_library", b"b.c"));
+    let target_id = model.add_target(target)?;
+
+    let fset = rcmake_model::FileSet {
+        target: target_id,
+        name: "hdrs".into(),
+        kind: rcmake_model::FileSetKind::Headers,
+        scope: rcmake_model::UsageScope::Public,
+        base_dirs: vec![
+            tagged(src, 2, "target_sources", b"z_dir"),
+            tagged(src, 2, "target_sources", b"a_dir"),
+        ],
+        files: vec![
+            tagged(src, 2, "target_sources", b"z_dir/z1.h"),
+            tagged(src, 2, "target_sources", b"a_dir/a1.h"),
+            tagged(src, 2, "target_sources", b"z_dir/sub/z2.h"),
+            tagged(src, 2, "target_sources", b"a_dir/sub/a2.h"),
+        ],
+        props: Default::default(),
+    };
+    let set_id = model.add_file_set(fset)?;
+    model
+        .target_mut(target_id)
+        .expect("target exists")
+        .file_sets
+        .push(set_id);
+
+    // Install FILE_SET and two DIRECTORY rules (trailing slash and `dir/.`).
+    let rule_idx = model.installs.len();
+    model.installs.push(InstallRule {
+        dir: DirId::ROOT,
+        kind: InstallKind::Targets {
+            targets: vec![target_id],
+            export: None,
+        },
+        options: InstallOptions::default(),
+        backtrace: trace(src, 3, "install"),
+    });
+    for (i, arg) in [
+        "TARGETS",
+        "mylib",
+        "FILE_SET",
+        "hdrs",
+        "DESTINATION",
+        "include",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        model.global.props.set(
+            format!("_RCMAKE_INSTALL_{rule_idx}_ARG{i}").into(),
+            arg.into(),
+        );
+    }
+    model.installs.push(InstallRule {
+        dir: DirId::ROOT,
+        kind: InstallKind::Directory(vec![tagged(src, 4, "install", b"/src/z_dir/.")]),
+        options: InstallOptions {
+            destination: Some("share/cmake/Pkg/".into()),
+            ..InstallOptions::default()
+        },
+        backtrace: trace(src, 4, "install"),
+    });
+
+    let result = rcmake_resolve::resolve(&model, &host, &[])?;
+    write_replies(&model, &result, &host, bld)?;
+
+    let reply = bld.join(API_DIR).join("reply");
+    let (_, idx) = index(&host, &reply)?;
+    let cm_ref = entry(get(&idx, "objects"), "kind", "codemodel");
+    let cm = follow(&host, &reply, cm_ref)?;
+    let cfg = at(items(get(&cm, "configurations")), 0)?;
+
+    // 1. Both a.c and b.c merge into ONE compileGroup with sourceIndexes [0, 1].
+    let target_json = follow(&host, &reply, entry(get(cfg, "targets"), "name", "mylib"))?;
+    let groups = items(get(&target_json, "compileGroups"));
+    assert_eq!(groups.len(), 1, "identical compileGroups must merge");
+    let src_indices: Vec<usize> = items(get(&groups[0], "sourceIndexes"))
+        .iter()
+        .map(uint)
+        .collect::<TestResult<_>>()?;
+    assert_eq!(src_indices, vec![0, 1]);
+
+    // 2. Directory installer preserves trailing slash on destination and `z_dir/.` path;
+    //    fileSet installer groups paths by relative subdir while preserving declaration order.
+    let dir_json = follow(&host, &reply, at(items(get(cfg, "directories")), 0)?)?;
+    let installers = items(get(&dir_json, "installers"));
+    let fset_inst = entry(get(&dir_json, "installers"), "type", "fileSet");
+    let fset_paths: Vec<String> = items(get(fset_inst, "paths"))
+        .iter()
+        .map(|p| match p {
+            Value::String(s) => s.to_string(),
+            Object(_) => format!(
+                "{}->{}",
+                BString::from(string(get(p, "from"))),
+                BString::from(string(get(p, "to")))
+            ),
+            other => panic!("unexpected path {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        fset_paths,
+        vec![
+            "z_dir/z1.h",
+            "a_dir/a1.h",
+            "z_dir/sub/z2.h->sub/z2.h",
+            "a_dir/sub/a2.h->sub/a2.h",
+        ]
+    );
+    let dir_inst = installers
+        .iter()
+        .find(|inst| string(get(inst, "type")) == b"directory")
+        .expect("directory installer");
+    assert_eq!(string(get(dir_inst, "destination")), b"share/cmake/Pkg/");
+    assert_eq!(string(at(items(get(dir_inst, "paths")), 0)?), b"z_dir/.");
+    Ok(())
+}

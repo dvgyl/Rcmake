@@ -225,6 +225,8 @@ fn initialize_cache_editor(cx: &mut Cx<'_>, host: &dyn Host) {
 }
 
 const INSTALL_PREFIX_HELP: &str = "Install path prefix, prepended onto install directories.";
+const EXPORT_COMPILE_COMMANDS_HELP: &str =
+    "Enable/Disable output of compile commands during generation.";
 
 pub(super) fn apply_environment_defaults(host: &dyn Host, cache: &mut Cache, has_cache: bool) {
     for (name, ty) in [
@@ -252,12 +254,16 @@ pub(super) fn apply_environment_defaults(host: &dyn Host, cache: &mut Cache, has
                         "Default value for DISABLE_PRECOMPILE_HEADERS of targets.".into()
                     }
                     b"CMAKE_INSTALL_PREFIX" => INSTALL_PREFIX_HELP.into(),
+                    b"CMAKE_EXPORT_COMPILE_COMMANDS" => {
+                        entry.advanced = true;
+                        EXPORT_COMPILE_COMMANDS_HELP.into()
+                    }
                     _ => BString::default(),
                 };
             }
         }
         if let Some(entry) = cache.get_mut(name) {
-            if entry.ty == CacheType::Uninitialized {
+            if entry.ty == CacheType::Uninitialized && name != b"CMAKE_EXPORT_COMPILE_COMMANDS" {
                 entry.ty = ty;
                 if name == b"CMAKE_INSTALL_PREFIX" {
                     entry.help = INSTALL_PREFIX_HELP.into();
@@ -523,5 +529,37 @@ mod tests {
                 .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn export_compile_commands_preserves_untyped_cli_and_uses_env_default() {
+        let work = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let host = PureHost::new(work.into(), work.join("cmake"));
+        // Untyped CLI -DCMAKE_EXPORT_COMPILE_COMMANDS=ON stays UNINITIALIZED.
+        let mut cache = Cache::default();
+        cache::insert(
+            &mut cache,
+            b"CMAKE_EXPORT_COMPILE_COMMANDS",
+            "ON".into(),
+            Some(CacheType::Uninitialized),
+        );
+        apply_environment_defaults(&host, &mut cache, false);
+        let entry = cache
+            .get(b"CMAKE_EXPORT_COMPILE_COMMANDS")
+            .expect("entry should stay in cache");
+        assert_eq!(entry.ty, CacheType::Uninitialized);
+        assert_eq!(entry.value, "ON");
+
+        // When absent from cache and set in environment, defines advanced BOOL with help.
+        let mut env_cache = Cache::default();
+        host.env_set(b"CMAKE_EXPORT_COMPILE_COMMANDS", Some(b"ON"));
+        apply_environment_defaults(&host, &mut env_cache, false);
+        let entry = env_cache
+            .get(b"CMAKE_EXPORT_COMPILE_COMMANDS")
+            .expect("env default should be inserted");
+        assert_eq!(entry.ty, CacheType::Bool);
+        assert_eq!(entry.value, "ON");
+        assert!(entry.advanced);
+        assert_eq!(entry.help, EXPORT_COMPILE_COMMANDS_HELP);
     }
 }

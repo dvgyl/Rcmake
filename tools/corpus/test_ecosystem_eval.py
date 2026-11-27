@@ -653,6 +653,80 @@ class EcosystemEvalTests(unittest.TestCase):
                     build = row["files"]["ide"]["build_dirs"]["build/Release"]
                     self.assertEqual(build["compile_commands"]["status"], "fail")
 
+    def test_conan_normalizes_ccmake_when_both_installations_ship_it(self) -> None:
+        oracle_dir = self.root / "oracle-both" / "bin"
+        stage_dir = self.root / "stage-both" / "bin"
+        oracle_dir.mkdir(parents=True)
+        stage_dir.mkdir(parents=True)
+        for name in ("cmake", "ctest", "cpack", "ccmake"):
+            self._make_executable(oracle_dir / name)
+        rcmake_bin = self._make_executable(stage_dir / "rcmake")
+        for name in ("cmake", "ctest", "cpack", "ccmake"):
+            (stage_dir / name).symlink_to(rcmake_bin)
+
+        oracle_tree = self.root / "both-oracle-proj"
+        rcmake_tree = self.root / "both-rcmake-proj"
+        shared_project = self.root / "shared-project"
+        for tree, bin_dir, root_dir in (
+            (oracle_tree, oracle_dir, self.root / "oracle-both" / "share" / "cmake-4.5"),
+            (rcmake_tree, stage_dir, self.root / "stage-both" / "share" / "cmake-4.5"),
+        ):
+            build = tree / "build" / "Release"
+            (build / "CMakeFiles").mkdir(parents=True)
+            (build / "CMakeCache.txt").write_text(
+                "\n".join([
+                    f"CMAKE_COMMAND:INTERNAL={bin_dir / 'cmake'}",
+                    f"CMAKE_CTEST_COMMAND:INTERNAL={bin_dir / 'ctest'}",
+                    f"CMAKE_CPACK_COMMAND:INTERNAL={bin_dir / 'cpack'}",
+                    f"CMAKE_EDIT_COMMAND:INTERNAL={bin_dir / 'ccmake'}",
+                    f"CMAKE_ROOT:INTERNAL={root_dir}",
+                    f"CMAKE_HOME_DIRECTORY:INTERNAL={shared_project}",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            (build / "CMakeFiles" / "rules.ninja").write_text(
+                f"rule EDIT\n  command = cd {build} && {bin_dir / 'ccmake'} -S{shared_project} -B{build}\n",
+                encoding="utf-8",
+            )
+            (build / "build.ninja").write_text(
+                "include CMakeFiles/rules.ninja\n"
+                "build CMakeFiles/edit_cache.util: EDIT\n"
+                "build edit_cache: phony CMakeFiles/edit_cache.util\n",
+                encoding="utf-8",
+            )
+
+        tools = (pathswap.tool_paths(oracle_dir), pathswap.tool_paths(stage_dir, rcmake_bin))
+        self.assertIn(str(stage_dir / "ccmake"), tools[1]["ccmake"])
+        self.assertNotIn(str(rcmake_bin), tools[1]["ccmake"])
+        # Hardlinked ccmake alias must also be discovered without mapping rcmake itself to <ccmake>.
+        hard_dir = self.root / "stage-hard" / "bin"
+        hard_dir.mkdir(parents=True)
+        hard_rcmake = self._make_executable(hard_dir / "rcmake")
+        (hard_dir / "ccmake").hardlink_to(hard_rcmake)
+        hard_tools = pathswap.tool_paths(hard_dir, hard_rcmake)
+        self.assertIn(str(hard_dir / "ccmake"), hard_tools["ccmake"])
+        self.assertNotIn(str(hard_rcmake), hard_tools["ccmake"])
+
+        diff_report = normalize.compare(
+            oracle_tree, rcmake_tree, self.root / "both-diffs", tools=tools, oracle_root=oracle_tree,
+        )
+        for cls in ("CMakeCache.txt", "rules.ninja"):
+            self.assertEqual(diff_report["classes"][cls]["different"], 0, diff_report)
+            self.assertEqual(diff_report["classes"][cls]["identical_after_normalization"], 1, diff_report)
+        self.assertEqual(diff_report["classes"]["build.ninja"]["different"], 0, diff_report)
+
+        # Verify a bogus editor path is still caught as a substantive diff.
+        cache_path = rcmake_tree / "build" / "Release" / "CMakeCache.txt"
+        cache_path.write_text(
+            cache_path.read_text(encoding="utf-8").replace(
+                f"CMAKE_EDIT_COMMAND:INTERNAL={stage_dir / 'ccmake'}",
+                "CMAKE_EDIT_COMMAND:INTERNAL=/unexpected/bin/ccmake",
+            ),
+            encoding="utf-8",
+        )
+        bad_report = normalize.compare(oracle_tree, rcmake_tree, self.root / "both-diffs-bad", tools=tools)
+        self.assertEqual(bad_report["classes"]["CMakeCache.txt"]["different"], 1)
+
     def test_compare_normalizes_file_api_replies_tool_paths_and_config_switch(self) -> None:
         oracle_tree = self.root / "oracle-proj"
         rcmake_tree = self.root / "rcmake-proj"

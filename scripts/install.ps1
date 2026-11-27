@@ -82,7 +82,8 @@ function Test-RcmakeAlias {
     param(
         [Parameter(Mandatory)][string]$AliasPath,
         [Parameter(Mandatory)][string]$RcmakePath,
-        [AllowNull()][string]$RcmakeHash
+        [AllowNull()][string]$RcmakeHash,
+        [AllowNull()][string]$ShimHash = $null
     )
     $item = Get-ItemOrNull -Path $AliasPath
     if ($null -eq $item) {
@@ -117,11 +118,17 @@ function Test-RcmakeAlias {
             }
         }
     }
-    if ($item.PSIsContainer -or [string]::IsNullOrEmpty($RcmakeHash)) {
+    if ($item.PSIsContainer -or ([string]::IsNullOrEmpty($RcmakeHash) -and [string]::IsNullOrEmpty($ShimHash))) {
         return $false
     }
     $aliasHash = Get-FileSha256OrNull -Path $AliasPath
-    return (-not [string]::IsNullOrEmpty($aliasHash)) -and ($aliasHash -ceq $RcmakeHash)
+    if ([string]::IsNullOrEmpty($aliasHash)) {
+        return $false
+    }
+    if (-not [string]::IsNullOrEmpty($RcmakeHash) -and ($aliasHash -ceq $RcmakeHash)) {
+        return $true
+    }
+    return (-not [string]::IsNullOrEmpty($ShimHash)) -and ($aliasHash -ceq $ShimHash)
 }
 
 function Install-AliasExecutable {
@@ -251,7 +258,7 @@ function Expand-RcmakeArchive {
 
             $relParts = @($parts[1..($parts.Length - 1)])
             $relPosix = $relParts -join '/'
-            $isBinary = ($relPosix -ceq 'bin/rcmake.exe') -or ($relPosix -ceq 'bin/rcmake-lsp.exe') -or ($relPosix -ceq 'bin/rcmake-verify.exe')
+            $isBinary = ($relPosix -ceq 'bin/rcmake.exe') -or ($relPosix -ceq 'bin/rcmake-lsp.exe') -or ($relPosix -ceq 'bin/rcmake-verify.exe') -or ($relPosix -ceq 'bin/cmake.exe') -or ($relPosix -ceq 'bin/ctest.exe') -or ($relPosix -ceq 'bin/cpack.exe')
             $isData = ($relPosix -ceq 'share/cmake-4.5') -or $relPosix.StartsWith('share/cmake-4.5/', [StringComparison]::Ordinal)
             $isCompletion = ($relPosix -ceq 'share/rcmake/completions/rcmake.ps1')
             $isDocFile = ($relPosix -ceq 'LICENSE-APACHE') -or ($relPosix -ceq 'LICENSE-MIT') -or ($relPosix -ceq 'THIRD_PARTY_NOTICES.md')
@@ -432,6 +439,24 @@ $lspPath = Join-Path $binDir 'rcmake-lsp.exe'
 $verifyPath = Join-Path $binDir 'rcmake-verify.exe'
 $tools = @('cmake.exe', 'ctest.exe', 'cpack.exe')
 
+function Get-MarkerSha256 {
+    param(
+        [Parameter(Mandatory)][string]$MarkerPath,
+        [Parameter(Mandatory)][string]$Key
+    )
+    $markerItem = Get-ItemOrNull -Path $MarkerPath
+    if ($null -eq $markerItem -or $markerItem.PSIsContainer -or ($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        return $null
+    }
+    $pattern = '^' + [regex]::Escape($Key) + '=([0-9a-fA-F]{64})$'
+    foreach ($markerLine in [IO.File]::ReadAllLines($MarkerPath)) {
+        if ($markerLine.Trim() -match $pattern) {
+            return $Matches[1].ToLowerInvariant()
+        }
+    }
+    return $null
+}
+
 function Test-ManagedData {
     param([Parameter(Mandatory)][string]$Path)
     $data = Get-ItemOrNull -Path $Path
@@ -483,9 +508,10 @@ if ($Uninstall) {
 
     $removed = @()
     $rcmakeHash = Get-FileSha256OrNull -Path $rcmakePath
+    $shimHash = Get-MarkerSha256 -MarkerPath (Join-Path $dataDir $dataMarkerName) -Key 'shim_sha256'
     foreach ($tool in $tools) {
         $aliasPath = Join-Path $binDir $tool
-        if (Test-RcmakeAlias -AliasPath $aliasPath -RcmakePath $rcmakePath -RcmakeHash $rcmakeHash) {
+        if (Test-RcmakeAlias -AliasPath $aliasPath -RcmakePath $rcmakePath -RcmakeHash $rcmakeHash -ShimHash $shimHash) {
             Remove-Item -LiteralPath $aliasPath -Force
             $removed += $aliasPath
         }
@@ -601,10 +627,11 @@ if ($Archive -and $PSBoundParameters.ContainsKey('Version')) {
 # Pre-check all alias collisions before downloading or writing anything.
 # A partial alias set would run a mix of rcmake and another CMake.
 $existingRcmakeHash = Get-FileSha256OrNull -Path $rcmakePath
+$existingShimHash = Get-MarkerSha256 -MarkerPath (Join-Path $dataDir $dataMarkerName) -Key 'shim_sha256'
 $existingOwnedAliases = @()
 foreach ($tool in $tools) {
     $aliasPath = Join-Path $binDir $tool
-    if (Test-RcmakeAlias -AliasPath $aliasPath -RcmakePath $rcmakePath -RcmakeHash $existingRcmakeHash) {
+    if (Test-RcmakeAlias -AliasPath $aliasPath -RcmakePath $rcmakePath -RcmakeHash $existingRcmakeHash -ShimHash $existingShimHash) {
         $existingOwnedAliases += $tool
     }
 }
@@ -726,6 +753,17 @@ try {
     $hasLsp = Test-Path -LiteralPath $stagedLsp -PathType Leaf
     $stagedVerify = Join-Path (Join-Path $stageWork 'bin') 'rcmake-verify.exe'
     $hasVerify = Test-Path -LiteralPath $stagedVerify -PathType Leaf
+    $stagedShims = @{}
+    $stagedShimSha256 = $null
+    foreach ($tool in $tools) {
+        $candidateShim = Join-Path (Join-Path $stageWork 'bin') $tool
+        if (Test-Path -LiteralPath $candidateShim -PathType Leaf) {
+            $stagedShims[$tool] = $candidateShim
+            if ($null -eq $stagedShimSha256) {
+                $stagedShimSha256 = (Get-FileHash -LiteralPath $candidateShim -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        }
+    }
     $stagedCompletion = Join-Path (Join-Path (Join-Path (Join-Path $stageWork 'share') 'rcmake') 'completions') 'rcmake.ps1'
     $hasCompletion = Test-Path -LiteralPath $stagedCompletion -PathType Leaf
     $stagedDoc = Join-Path (Join-Path (Join-Path $stageWork 'share') 'doc') 'rcmake'
@@ -754,6 +792,9 @@ try {
     if ($hasVerify) {
         $stagedVerifySha256 = (Get-FileHash -LiteralPath $stagedVerify -Algorithm SHA256).Hash.ToLowerInvariant()
         $markerContent += "verify_sha256=$stagedVerifySha256`n"
+    }
+    if (-not [string]::IsNullOrEmpty($stagedShimSha256)) {
+        $markerContent += "shim_sha256=$stagedShimSha256`n"
     }
     [IO.File]::WriteAllText((Join-Path $stagedData $dataMarkerName), $markerContent)
     $stagedVersionOutput = & $stagedBin --version
@@ -904,8 +945,13 @@ try {
         foreach ($tool in $aliasesToWrite) {
             $aliasPath = Join-Path $binDir $tool
             & $backupDestination $aliasPath
-            $mode = Install-AliasExecutable -SourcePath $rcmakePath -AliasPath $aliasPath
-            $installed += "$aliasPath -> rcmake.exe ($mode)"
+            if ($stagedShims.ContainsKey($tool)) {
+                Move-Item -LiteralPath $stagedShims[$tool] -Destination $aliasPath -Force
+                $installed += "$aliasPath -> rcmake.exe (shim)"
+            } else {
+                $mode = Install-AliasExecutable -SourcePath $rcmakePath -AliasPath $aliasPath
+                $installed += "$aliasPath -> rcmake.exe ($mode)"
+            }
         }
         $installed += $dataDir
 

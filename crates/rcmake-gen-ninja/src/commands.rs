@@ -162,15 +162,6 @@ impl Commands {
         out
     }
 
-    pub(crate) fn chain(&self, first: &[u8], second: &[u8]) -> Vec<u8> {
-        let script = [first, b" && ", second].concat();
-        if self.windows() {
-            self.cmd(&script)
-        } else {
-            script
-        }
-    }
-
     pub(crate) fn raw_script<'a>(&self, invocation: &'a Invocation) -> Option<&'a [u8]> {
         if !self.windows() {
             return None;
@@ -240,6 +231,18 @@ impl Commands {
             return self.line(invocations, false, build_dir, prefix);
         }
         posix_link_line(invocations, build_dir, prefix)
+    }
+
+    pub(crate) fn utility_line(
+        &self,
+        invocations: &[Invocation],
+        build_dir: &[u8],
+        prefix: bool,
+    ) -> Vec<u8> {
+        if self.windows() {
+            return self.line(invocations, true, build_dir, prefix);
+        }
+        posix_commands(invocations, build_dir, prefix, true)
     }
 
     pub(crate) fn symlink_library_line(

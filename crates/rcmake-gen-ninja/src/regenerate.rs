@@ -76,6 +76,7 @@ pub(super) fn emit_regeneration(
         },
     );
     ninja.binding(b"COMMAND", regenerate);
+    ninja.binding(b"pool", b"console");
 
     // Missing listfiles must trigger regeneration so CMake can check them.
     let missing_ok: Vec<_> = listfiles

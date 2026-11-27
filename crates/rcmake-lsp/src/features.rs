@@ -483,7 +483,7 @@ fn command_hover(
     text
 }
 
-fn catalog_hover(topic: Topic, entry: &Entry, markdown: bool) -> String {
+fn catalog_hover(topic: Topic, entry: Entry, markdown: bool) -> String {
     let mut text = if markdown {
         format!("{}\n\n{}", code_span(entry.0), entry.1)
     } else {
@@ -498,7 +498,10 @@ fn catalog_hover(topic: Topic, entry: &Entry, markdown: bool) -> String {
         }
     }
     if markdown {
-        text.push_str(&format!("\n\n[CMake documentation]({})", topic.link(entry)));
+        text.push_str(&format!(
+            "\n\n[CMake documentation]({})",
+            topic.link(&entry)
+        ));
     }
     text
 }

@@ -94,12 +94,15 @@ impl UsageResolver<'_> {
         });
         let mut inferred = IndexMap::new();
         let mut edge_budget = Limits::default().max_value_bytes / 64;
-        graph.infer_raw_edges(
-            &mut inferred,
-            &mut edge_budget,
-            original.iter().map(|(id, _)| *id),
-        )?;
+        if original.iter().any(|(_, item)| raw_library(item)) {
+            graph.infer_raw_edges(
+                &mut inferred,
+                &mut edge_budget,
+                original.iter().map(|(id, _)| *id),
+            )?;
+        }
         let mut index = 0;
+        let mut indices_buf = Vec::new();
         while let Some((_, (item, _))) = graph.nodes.get_index(index) {
             let item = Arc::clone(item);
             let mut edges = IndexSet::new();
@@ -121,9 +124,21 @@ impl UsageResolver<'_> {
                         chains.entry(child.key()).or_insert_with(|| path.clone());
                     }
                 }
-                let indices: Vec<_> = items.iter().map(|item| graph.insert(item)).collect();
-                graph.infer_raw_edges(&mut inferred, &mut edge_budget, indices.iter().copied())?;
-                edges.extend(indices);
+                let need_infer = items.iter().any(|child| raw_library(child));
+                if need_infer {
+                    indices_buf.clear();
+                    indices_buf.extend(items.iter().map(|item| graph.insert(item)));
+                    graph.infer_raw_edges(
+                        &mut inferred,
+                        &mut edge_budget,
+                        indices_buf.iter().copied(),
+                    )?;
+                    edges.extend(indices_buf.iter().copied());
+                } else {
+                    for child in items.iter() {
+                        edges.insert(graph.insert(child));
+                    }
+                }
             }
             if let Some((_, (_, current_edges))) = graph.nodes.get_index_mut(index) {
                 *current_edges = edges;
@@ -217,6 +232,9 @@ impl UsageResolver<'_> {
         graph: &mut LinkGraph,
         ctx: &EvalContext,
     ) -> Result<HashSet<LinkKey>, ResolveError> {
+        if !self.has_shared_or_imported_targets {
+            return Ok(HashSet::new());
+        }
         let mut followed = HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         for index in 0..graph.nodes.len() {
@@ -320,6 +338,9 @@ impl UsageResolver<'_> {
         target: &Target,
         ctx: &EvalContext,
     ) -> Result<HashMap<BString, BString>, ResolveError> {
+        if !self.has_link_feature_overrides {
+            return Ok(HashMap::new());
+        }
         let mut overrides = HashMap::new();
         let mut ctx = ctx.clone();
         ctx.language.clone_from(&ctx.link_language);
@@ -628,6 +649,52 @@ impl LinkGraph {
         direct: Vec<(usize, Arc<ResolvedLinkItem>)>,
         strategy: LinkOrder,
     ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
+        self.order_with_limit(
+            model,
+            owner,
+            ctx,
+            direct,
+            strategy,
+            Limits::default().max_value_bytes / 64,
+        )
+    }
+
+    fn order_with_limit(
+        &self,
+        model: &ProjectModel,
+        owner: &Target,
+        ctx: &EvalContext,
+        direct: Vec<(usize, Arc<ResolvedLinkItem>)>,
+        strategy: LinkOrder,
+        max_len: usize,
+    ) -> Result<Vec<Arc<ResolvedLinkItem>>, ResolveError> {
+        // Fast path for a strict linear chain (`0 -> 1 -> ... -> n-1`, single direct item 0):
+        // every node is a singleton SCC in topological order 0..n, identical under Minimal and Free.
+        if direct.len() == 1
+            && direct.first().is_some_and(|(idx, _)| *idx == 0)
+            && !self.nodes.is_empty()
+            && self.nodes.values().enumerate().all(|(i, (_, edges))| {
+                if i + 1 < self.nodes.len() {
+                    edges.len() == 1 && edges.first() == Some(&(i + 1))
+                } else {
+                    edges.is_empty()
+                }
+            })
+        {
+            if self.nodes.len() > max_len {
+                return Err(ResolveError::Message(
+                    "The link line exceeds the size limit.".into(),
+                ));
+            }
+            let mut order = Vec::with_capacity(self.nodes.len());
+            if let Some((_, first)) = direct.into_iter().next() {
+                order.push(first);
+            }
+            for (_, (item, _)) in self.nodes.iter().skip(1) {
+                order.push(Arc::clone(item));
+            }
+            return Ok(order);
+        }
         let (component_ids, mut components) = self.components().ok_or_else(invalid_link_graph)?;
         for (&id, (_, edges)) in component_ids.iter().zip(self.nodes.values()) {
             let component = components.get_mut(id).ok_or_else(invalid_link_graph)?;
@@ -702,7 +769,7 @@ impl LinkGraph {
                 .ok_or_else(invalid_link_graph)?;
             let (item, _) = self.node(index).ok_or_else(invalid_link_graph)?;
             order.push(Arc::clone(item));
-            if order.len() > Limits::default().max_value_bytes / 64 {
+            if order.len() > max_len {
                 return Err(ResolveError::Message(
                     "The link line exceeds the size limit.".into(),
                 ));
@@ -1100,4 +1167,146 @@ fn deduplicate(
     let mut keep = keep.into_iter();
     items.retain(|_| keep.next().unwrap_or_default());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_diag::{Backtrace, PolicyMap};
+    use rcmake_model::{BT, DirId, LinkItem, TargetOrigin, UsageScope};
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn add_target(
+        model: &mut ProjectModel,
+        name: &str,
+        kind: TargetKind,
+    ) -> Result<TargetId, Box<dyn std::error::Error>> {
+        Ok(model.add_target(Target::new(
+            name.into(),
+            kind,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Backtrace::default(),
+            PolicyMap::default(),
+        ))?)
+    }
+
+    fn link_items(model: &mut ProjectModel, id: TargetId, interface: bool, items: &[&str]) {
+        let Some(target) = model.target_mut(id) else {
+            return;
+        };
+        let entries = if interface {
+            &mut target.usage.interface_link_libraries
+        } else {
+            &mut target.usage.link_libraries
+        };
+        entries
+            .get_or_insert_default()
+            .extend(items.iter().map(|name| LinkItem {
+                opens_lookup_scope: false,
+                closes_lookup_scope: false,
+                scope: None,
+                text: BT::new((*name).into(), Backtrace::default()),
+                lookup_dir: DirId::ROOT,
+            }));
+    }
+
+    #[test]
+    fn singleton_raw_library_clears_prior_inferred_edge() -> TestResult {
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/build".into());
+        let app = add_target(&mut model, "app", TargetKind::Executable)?;
+        let x = add_target(&mut model, "x", TargetKind::StaticLibrary)?;
+        // `app` lists `alpha;beta;x`, suggesting `alpha -> beta`, while `x` lists only `[alpha]`.
+        // The singleton raw library list `[alpha]` must record its empty successor set and clear
+        // the `alpha -> beta` suggestion so `beta` is not appended again after `x;alpha`.
+        link_items(&mut model, app, false, &["alpha", "beta", "x"]);
+        link_items(&mut model, x, true, &["alpha"]);
+
+        let mut resolver = UsageResolver::new(&model);
+        let ordered = resolver.ordered_links(app, &EvalContext::default())?;
+        let names: Vec<_> = ordered
+            .iter()
+            .map(|item| item.text.value.to_string())
+            .collect();
+        assert_eq!(names, vec!["alpha", "beta", "x", "alpha"]);
+        Ok(())
+    }
+
+    #[test]
+    fn singleton_direct_raw_library_blocks_later_inferred_edge() -> TestResult {
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/build".into());
+        let app = add_target(&mut model, "app", TargetKind::Executable)?;
+        let x = add_target(&mut model, "x", TargetKind::StaticLibrary)?;
+        let z = add_target(&mut model, "z", TargetKind::StaticLibrary)?;
+        // `app` lists only one raw library (`alpha`) alongside `x`, while `z` lists `alpha;beta`.
+        // Recording `alpha`'s empty successor set from `app` prevents inferring `alpha -> beta`.
+        link_items(&mut model, app, false, &["alpha", "x"]);
+        link_items(&mut model, x, true, &["beta", "z"]);
+        link_items(&mut model, z, true, &["alpha", "beta"]);
+
+        let mut resolver = UsageResolver::new(&model);
+        let ordered = resolver.ordered_links(app, &EvalContext::default())?;
+        let names: Vec<_> = ordered
+            .iter()
+            .map(|item| item.text.value.to_string())
+            .collect();
+        // Verified against CMake 4.5.1: `-lalpha libx.a libz.a -lalpha -lbeta`.
+        assert_eq!(names, vec!["alpha", "x", "z", "alpha", "beta"]);
+        Ok(())
+    }
+
+    #[test]
+    fn linear_chain_fast_path_enforces_size_limit() -> TestResult {
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/build".into());
+        let app_id = add_target(&mut model, "app", TargetKind::Executable)?;
+        let owner = model.target(app_id).ok_or("missing app target")?;
+
+        let mut graph = LinkGraph::default();
+        let mut items = Vec::new();
+        for idx in 0..5usize {
+            let item = Arc::new(ResolvedLinkItem {
+                text: BT::new(format!("lib{idx}").into(), Backtrace::default()),
+                kind: ResolvedLinkKind::Raw,
+                feature: None,
+                direct: idx == 0,
+                scope: UsageScope::Private,
+                injected_by: None,
+            });
+            let node = graph.insert(&item);
+            items.push((node, item));
+        }
+        for idx in 0..4usize {
+            if let Some((_, (_, edges))) = graph.nodes.get_index_mut(idx) {
+                edges.insert(idx + 1);
+            }
+        }
+        let first = vec![items.first().ok_or("missing first item")?.clone()];
+        let err = graph.order_with_limit(
+            &model,
+            owner,
+            &EvalContext::default(),
+            first.clone(),
+            LinkOrder::Minimal,
+            4,
+        );
+        assert!(
+            matches!(err, Err(ResolveError::Message(ref msg)) if msg == "The link line exceeds the size limit."),
+            "5-node linear chain must fail when max_len is 4: {err:?}"
+        );
+        let ok = graph.order_with_limit(
+            &model,
+            owner,
+            &EvalContext::default(),
+            first,
+            LinkOrder::Minimal,
+            5,
+        )?;
+        assert_eq!(ok.len(), 5);
+        Ok(())
+    }
 }

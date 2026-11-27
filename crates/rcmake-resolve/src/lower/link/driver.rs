@@ -31,6 +31,14 @@ impl<'a> LinkerDriver<'a> {
         }
     }
 
+    fn quote_arg(&self, arg: &[u8]) -> BString {
+        if self.windows {
+            quote(arg)
+        } else {
+            super::super::shell::cmake_posix_quote(arg)
+        }
+    }
+
     pub(super) fn driver_flags(&self, flags: &[u8]) -> BString {
         if self.windows {
             join_words(windows_arguments(flags).iter().map(|arg| quote(arg)))
@@ -53,7 +61,7 @@ impl<'a> LinkerDriver<'a> {
                 if arg.starts_with(b"LINKER:") {
                     self.argument(arg)
                 } else {
-                    Ok(quote(arg))
+                    Ok(self.quote_arg(arg))
                 }
             })
             .collect::<Result<Vec<_>, _>>()
@@ -75,10 +83,9 @@ impl<'a> LinkerDriver<'a> {
                 } else {
                     simple_args(&flag).unwrap_or_else(|| vec![flag])
                 };
-                Ok(join_words(
-                    args.iter()
-                        .map(|arg| quote(&arg.replace(b"<DEP_FILE>", path))),
-                ))
+                Ok(join_words(args.iter().map(|arg| {
+                    self.quote_arg(&arg.replace(b"<DEP_FILE>", path))
+                })))
             })
             .collect()
     }
@@ -89,14 +96,14 @@ impl<'a> LinkerDriver<'a> {
             for word in shell_arguments(payload) {
                 args.extend(self.wrapper.expand(&word)?);
             }
-            return Ok(join_words(args.iter().map(|arg| quote(arg))));
+            return Ok(join_words(args.iter().map(|arg| self.quote_arg(arg))));
         }
         if !argument.starts_with(b"LINKER:") {
             return Ok(argument.into());
         }
         self.wrapper
             .expand(argument)
-            .map(|args| join_words(args.iter().map(|arg| quote(arg))))
+            .map(|args| join_words(args.iter().map(|arg| self.quote_arg(arg))))
     }
 }
 
@@ -130,6 +137,51 @@ pub(super) struct DefinitionFile {
     pub(super) inputs: Vec<BString>,
 }
 
+pub(super) fn target_definition_files(
+    model: &ProjectModel,
+    target: &Target,
+    sources: Option<&IndexSet<BString>>,
+    dll_platform: bool,
+) -> Vec<BString> {
+    let eligible = match target.kind {
+        TargetKind::SharedLibrary | TargetKind::ModuleLibrary => true,
+        TargetKind::Executable => {
+            dll_platform
+                || target
+                    .props
+                    .get(b"ENABLE_EXPORTS")
+                    .is_some_and(|value| truth::is_on(value))
+        }
+        _ => false,
+    };
+    if !eligible {
+        return Vec::new();
+    }
+    let directory = model.dir(target.dir);
+    let fallback;
+    let sources = if let Some(sources) = sources {
+        sources
+    } else {
+        fallback = target
+            .sources
+            .iter()
+            .map(|source| join(&directory.source_dir, &source.value))
+            .collect::<IndexSet<_>>();
+        &fallback
+    };
+    sources
+        .iter()
+        .filter(|path| {
+            path.last_chunk::<4>()
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".def"))
+                && !crate::sources::properties(directory, path)
+                    .get(b"HEADER_FILE_ONLY")
+                    .is_some_and(|value| truth::is_on(value))
+        })
+        .map(|path| build_relative(model, path))
+        .collect()
+}
+
 pub(super) fn definition_file(
     model: &ProjectModel,
     target: &Target,
@@ -154,27 +206,8 @@ pub(super) fn definition_file(
     .filter(|flag| !flag.is_empty()) else {
         return Ok(DefinitionFile::default());
     };
-    let dir = &model.dir(target.dir).source_dir;
-    let fallback;
-    let sources = if let Some(sources) = sources {
-        sources
-    } else {
-        fallback = target
-            .sources
-            .iter()
-            .map(|source| join(dir, &source.value))
-            .collect::<IndexSet<_>>();
-        &fallback
-    };
     let mut result = DefinitionFile {
-        inputs: sources
-            .iter()
-            .filter(|path| {
-                path.last_chunk::<4>()
-                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".def"))
-            })
-            .map(|path| build_relative(model, path))
-            .collect(),
+        inputs: target_definition_files(model, target, sources, true),
         ..DefinitionFile::default()
     };
     let export_all = target

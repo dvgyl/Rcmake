@@ -716,6 +716,12 @@ impl<H: Host + ?Sized> Host for MemoHost<H> {
         )
     }
 
+    fn read_dir_bounded(&self, p: &Path, limit: usize) -> HostResult<(Vec<DirEntry>, bool)> {
+        // A bounded listing is a fresh observation: callers use it to enforce entry limits and
+        // to detect external changes, so a cached full listing must not answer it.
+        self.base.read_dir_bounded(p, limit)
+    }
+
     fn create_dir_all(&self, p: &Path) -> HostResult<()> {
         let _change = self.begin_change_for(&[p]);
         self.base.create_dir_all(p)
@@ -1143,6 +1149,24 @@ mod tests {
         assert_eq!(host.metadata(alias, Follow::No)?.len, 7);
         host.write(Path::new("/work/other"), b"new", WriteMode::CreateNew)?;
         assert_eq!(host.read_dir(root)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_listing_bypasses_cached_listing_and_respects_limit() -> HostResult<()> {
+        let base = Arc::new(ProbeHost::default());
+        base.base.seed_file(Path::new("/work/a"), b"a")?;
+        let host = MemoHost::from_shared(Arc::clone(&base));
+        let root = Path::new("/work");
+        assert_eq!(host.read_dir(root)?.len(), 1);
+        // An external change that the memo layer does not see.
+        base.base.seed_file(Path::new("/work/b"), b"b")?;
+        base.base.seed_file(Path::new("/work/c"), b"c")?;
+        assert_eq!(host.read_dir(root)?.len(), 1);
+        let (entries, truncated) = host.read_dir_bounded(root, 8)?;
+        assert_eq!((entries.len(), truncated), (3, false));
+        let (entries, truncated) = host.read_dir_bounded(root, 2)?;
+        assert_eq!((entries.len(), truncated), (2, true));
         Ok(())
     }
 

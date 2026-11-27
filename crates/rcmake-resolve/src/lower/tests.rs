@@ -340,17 +340,19 @@ fn windows_ninja_links_resources_and_import_libraries() -> TestResult {
         graph.steps.iter().find_map(|step| match step {
             BuildStep::Link {
                 inputs,
+                implicit_inputs,
                 step,
                 invocations,
                 ..
-            } if step.kind == kind => Some((inputs, invocations)),
+            } if step.kind == kind => Some((inputs, implicit_inputs, invocations)),
             _ => None,
         })
     };
-    let (inputs, dll) = link(LinkKind::SharedLibrary).ok_or("Missing DLL link command.")?;
+    let (inputs, implicit_inputs, dll) =
+        link(LinkKind::SharedLibrary).ok_or("Missing DLL link command.")?;
     assert!(inputs.contains(resource));
     assert!(
-        inputs
+        implicit_inputs
             .iter()
             .any(|arg| arg == b"C:/Source Tree/exports file.def")
     );
@@ -375,7 +377,7 @@ fn windows_ninja_links_resources_and_import_libraries() -> TestResult {
             dll.argv
         );
     }
-    let (inputs, app) = link(LinkKind::Executable).ok_or("Missing executable link command.")?;
+    let (inputs, _, app) = link(LinkKind::Executable).ok_or("Missing executable link command.")?;
     assert!(inputs.iter().any(|arg| arg == b"link files/shared.lib"));
     assert!(inputs.iter().any(|arg| arg == b"C:/SDK/link files/sdk.lib"));
     assert!(!inputs.iter().any(|arg| arg == b"C:/SDK/bin/sdk.dll"));
@@ -396,7 +398,7 @@ fn windows_ninja_links_resources_and_import_libraries() -> TestResult {
             .iter()
             .any(|arg| arg.starts_with(b"-l") || arg.starts_with(b"-L/") || arg == b"/implib:")
     );
-    let (_, archive) = link(LinkKind::StaticArchive).ok_or("Missing librarian command.")?;
+    let (_, _, archive) = link(LinkKind::StaticArchive).ok_or("Missing librarian command.")?;
     let [archive] = archive.as_slice() else {
         return Err("Expected one librarian command.".into());
     };
@@ -1383,14 +1385,27 @@ fn target_events_evaluate_artifacts_and_run_after_linker_symlinks() -> TestResul
     model.add_command(post)?;
 
     let graph = lower(&model, &[library], &config)?;
-    let [BuildStep::Compile { .. }, BuildStep::Custom(recipe)] = graph.steps.as_slice() else {
-        return Err("Expected one compile step and one link recipe with byproducts.".into());
+    let [
+        BuildStep::Compile { .. },
+        BuildStep::Link {
+            step,
+            inputs,
+            invocations,
+            ..
+        },
+    ] = graph.steps.as_slice()
+    else {
+        return Err("Expected one compile step and one link step with event byproducts.".into());
     };
-    assert_eq!(recipe.outputs, ["libpng16.16.50.0.dylib"]);
-    assert!(recipe.byproducts.contains(&"libpng.dylib".into()));
-    assert!(recipe.byproducts.contains(&"libpng16.dylib".into()));
-    assert!(recipe.depends.contains(&"input-Release.txt".into()));
-    let [pre, linker, symlinks, post] = recipe.invocations.as_slice() else {
+    assert_eq!(step.output, "libpng16.16.50.0.dylib");
+    assert_eq!(
+        graph
+            .link_event_byproducts
+            .get(b"libpng16.16.50.0.dylib".as_slice()),
+        Some(&vec![BString::from("libpng.dylib")])
+    );
+    assert!(inputs.contains(&"input-Release.txt".into()));
+    let [pre, linker, symlinks, post] = invocations.as_slice() else {
         return Err(
             "Expected the target events before linking and after the linker symlinks.".into(),
         );
@@ -1641,4 +1656,530 @@ fn ninja_multi_config_sorts_cmake_intdir_with_source_defines() {
         super::compile::formatted_defines(&model, &target, &config, &ordered_group),
         r#"-DTGT_A=1 -DTGT_Z=1 -DAAA=1 -DCMAKE_INTDIR -DCMAKE_INTDIR=\"Debug\" -DZZZ=1"#,
     );
+}
+
+#[test]
+fn two_token_link_flags_are_not_file_inputs_and_ipo_precedes_arch() -> TestResult {
+    let mut model = fixture("Darwin");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let config = ConfigId("Release".into());
+    var(&mut model, "CMAKE_C_FLAGS_RELEASE", "-O3 -DNDEBUG");
+    var(&mut model, "CMAKE_C_COMPILE_OPTIONS_IPO", "-flto=thin");
+    var(&mut model, "CMAKE_C_LINK_OPTIONS_IPO", "-fuse-ld=lld");
+    var(&mut model, "CMAKE_OSX_ARCHITECTURES", "arm64");
+    var(
+        &mut model,
+        "CMAKE_C_LINK_EXECUTABLE",
+        "<CMAKE_C_COMPILER> <FLAGS> <CMAKE_C_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>",
+    );
+    let mut app = raw_target("app", TargetKind::Executable);
+    app.policies.policies.set(
+        rcmake_diag::PolicyId::new(69),
+        rcmake_diag::PolicyStatus::New,
+    )?;
+    app.props
+        .set("INTERPROCEDURAL_OPTIMIZATION".into(), "ON".into());
+    let link_item = |text: &str| rcmake_model::LinkItem {
+        text: bt(text),
+        lookup_dir: DirId::ROOT,
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
+        scope: Some(rcmake_model::UsageScope::Private),
+    };
+    app.sources.push(bt("main.c"));
+    app.usage.link_libraries = Some(vec![
+        link_item("-F /System/Library/PrivateFrameworks"),
+        link_item("-L /opt/custom/lib"),
+        link_item("-Wl,--whole-archive /opt/custom/libfoo.a"),
+        link_item("/usr/lib/libIOReport.tbd"),
+    ]);
+    model.add_target(app)?;
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(std::path::Path::new("/project/main.c"), b"int main() {}")?;
+
+    let result = crate::resolve(&model, &host, &[config])?;
+    let Some(BuildStep::Link {
+        inputs,
+        invocations,
+        ..
+    }) = result.graphs[0].steps.last()
+    else {
+        return Err("Expected link step".into());
+    };
+    assert!(
+        !inputs
+            .iter()
+            .any(|p| p == b"/System/Library/PrivateFrameworks"
+                || p == b"/opt/custom/lib"
+                || p == b"/opt/custom/libfoo.a"),
+        "flag arguments must not become link inputs: {inputs:?}"
+    );
+    assert!(
+        inputs.iter().any(|p| p == b"/usr/lib/libIOReport.tbd"),
+        "real .tbd file must stay a link input: {inputs:?}"
+    );
+    let shell = invocations[0].shell.as_slice();
+    let flto = shell
+        .windows(b"-flto=thin".len())
+        .position(|w| w == b"-flto=thin")
+        .ok_or("missing -flto=thin")?;
+    let arch = shell
+        .windows(b"-arch arm64".len())
+        .position(|w| w == b"-arch arm64")
+        .ok_or("missing -arch arm64")?;
+    let lld = shell
+        .windows(b"-fuse-ld=lld".len())
+        .position(|w| w == b"-fuse-ld=lld")
+        .ok_or("missing -fuse-ld=lld")?;
+    assert!(
+        flto < arch && arch < lld,
+        "expected -flto=thin before -arch arm64 and -fuse-ld=lld after: {}",
+        invocations[0].shell
+    );
+    Ok(())
+}
+
+#[test]
+fn imported_frameworks_and_non_dll_def_files_populate_link_implicit_inputs() -> TestResult {
+    let mut model = fixture("Darwin");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let config = ConfigId::default();
+
+    let mut gl = Target::new(
+        "OpenGL::GL".into(),
+        TargetKind::UnknownLibrary,
+        TargetOrigin::Imported(rcmake_model::ImportedVisibility::Global),
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    gl.props.set(
+        "IMPORTED_LOCATION".into(),
+        "/SDK/System/Library/Frameworks/OpenGL.framework".into(),
+    );
+    model.add_target(gl)?;
+
+    let link_item = |text: &str| rcmake_model::LinkItem {
+        text: bt(text),
+        lookup_dir: DirId::ROOT,
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
+        scope: Some(rcmake_model::UsageScope::Private),
+    };
+    let mut shared = raw_target("rsgl", TargetKind::SharedLibrary);
+    shared
+        .sources
+        .extend([bt("gl.c"), bt("exports.def"), bt("ignored.def")]);
+    shared.usage.link_libraries = Some(vec![
+        link_item("OpenGL::GL"),
+        link_item("/SDK/System/Library/Frameworks/Cocoa.framework"),
+    ]);
+    model.add_target(shared)?;
+
+    let mut exe_plain = raw_target("plain_exe", TargetKind::Executable);
+    exe_plain.sources.extend([bt("gl.c"), bt("exports.def")]);
+    model.add_target(exe_plain)?;
+
+    let mut exe_exp = raw_target("export_exe", TargetKind::Executable);
+    exe_exp.props.set("ENABLE_EXPORTS".into(), "ON".into());
+    exe_exp.sources.extend([bt("gl.c"), bt("exports.def")]);
+    model.add_target(exe_exp)?;
+
+    model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/project/ignored.def".into())
+        .or_default()
+        .set("HEADER_FILE_ONLY".into(), "ON".into());
+
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(std::path::Path::new("/project/gl.c"), b"int main() {}")?;
+    host.seed_file(std::path::Path::new("/project/exports.def"), b"EXPORTS")?;
+    host.seed_file(std::path::Path::new("/project/ignored.def"), b"EXPORTS")?;
+
+    let result = crate::resolve(&model, &host, &[config])?;
+    let link_implicits = |name: &[u8]| -> Vec<BString> {
+        let target = result.graphs[0]
+            .targets
+            .iter()
+            .find(|t| t.name == name)
+            .expect("target");
+        target
+            .steps
+            .iter()
+            .find_map(|&idx| match &result.graphs[0].steps[idx] {
+                BuildStep::Link {
+                    implicit_inputs, ..
+                } => Some(implicit_inputs.clone()),
+                _ => None,
+            })
+            .expect("link step")
+    };
+    let rsgl = link_implicits(b"rsgl");
+    assert!(
+        rsgl.contains(&"/SDK/System/Library/Frameworks/OpenGL.framework".into()),
+        "imported .framework must be in implicit_inputs: {rsgl:?}"
+    );
+    assert!(
+        !rsgl.contains(&"/SDK/System/Library/Frameworks/Cocoa.framework".into()),
+        "raw .framework path must not be in implicit_inputs: {rsgl:?}"
+    );
+    assert!(
+        rsgl.contains(&"/project/exports.def".into()),
+        "shared library .def must be in implicit_inputs: {rsgl:?}"
+    );
+    assert!(
+        !rsgl.contains(&"/project/ignored.def".into()),
+        "HEADER_FILE_ONLY .def must not be in implicit_inputs: {rsgl:?}"
+    );
+    assert!(
+        !link_implicits(b"plain_exe").contains(&"/project/exports.def".into()),
+        "executable without ENABLE_EXPORTS must not include .def"
+    );
+    assert!(
+        link_implicits(b"export_exe").contains(&"/project/exports.def".into()),
+        "executable with ENABLE_EXPORTS must include .def"
+    );
+    Ok(())
+}
+
+#[test]
+fn posix_link_wildcards_use_double_quotes_and_asm_omits_bogus_color_flag() -> TestResult {
+    let mut model = fixture("Darwin");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let config = ConfigId::default();
+    var(&mut model, "CMAKE_HOST_SYSTEM_NAME", "Darwin");
+    var(&mut model, "CMAKE_C_LINKER_WRAPPER_FLAG", "-Xlinker; ");
+    var(&mut model, "CMAKE_COLOR_DIAGNOSTICS", "OFF");
+    var(&mut model, "CMAKE_ASM_COMPILER", "/usr/bin/cc");
+    var(&mut model, "CMAKE_ASM_COMPILER_ID", "AppleClang");
+    var(
+        &mut model,
+        "CMAKE_ASM_COMPILE_OBJECT",
+        "<CMAKE_ASM_COMPILER> <DEFINES> <INCLUDES> <FLAGS> -o <OBJECT> -c <SOURCE>",
+    );
+    var(&mut model, "CMAKE_ASM_SOURCE_FILE_EXTENSIONS", "S;s");
+
+    let mut lib = raw_target("usearch", TargetKind::SharedLibrary);
+    lib.sources.extend([bt("a.c"), bt("b.c"), bt("k.S")]);
+    lib.usage.push(
+        rcmake_model::UsageField::LinkOptions,
+        bt("LINKER:-exported_symbol,_usearch_*"),
+    );
+    lib.usage.push(
+        rcmake_model::UsageField::LinkOptions,
+        bt("-Wl,-exported_symbol,_extra_*"),
+    );
+    model.add_target(lib)?;
+
+    // Empty-evaluating per-source COMPILE_OPTIONS must split compile groups for codemodel
+    // without polluting Ninja compile commands.
+    let props = model
+        .dir_mut(DirId::ROOT)
+        .source_props
+        .entry("/project/b.c".into())
+        .or_default();
+    props.set_tracked(
+        "COMPILE_OPTIONS".into(),
+        "$<$<BOOL:OFF>:-fno-sanitize=function>".into(),
+        bt("set_source_files_properties").backtrace,
+    );
+
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(std::path::Path::new("/project/a.c"), b"void a() {}")?;
+    host.seed_file(std::path::Path::new("/project/b.c"), b"void b() {}")?;
+    host.seed_file(std::path::Path::new("/project/k.S"), b".text\n")?;
+
+    let result = crate::resolve(&model, &host, &[config])?;
+    let resolved = &result.targets[0];
+    let c_groups: Vec<_> = resolved
+        .compile_groups
+        .iter()
+        .filter(|g| g.language == b"C")
+        .collect();
+    assert_eq!(
+        c_groups.len(),
+        2,
+        "empty-genex per-source COMPILE_OPTIONS must stay a distinct compile group"
+    );
+    assert_eq!(c_groups[1].flags.len(), 1);
+    assert_eq!(c_groups[1].flags[0].value, "SHELL:");
+
+    for step in &result.graphs[0].steps {
+        if let BuildStep::Compile {
+            source, invocation, ..
+        } = step
+        {
+            if source.ends_with(b"k.S") {
+                assert!(
+                    !invocation
+                        .shell
+                        .windows(b"-fno-color-diagnostics".len())
+                        .any(|w| w == b"-fno-color-diagnostics"),
+                    "ASM without CMAKE_ASM_COMPILE_OPTIONS_COLOR_DIAGNOSTICS_OFF must not emit -fno-color-diagnostics: {}",
+                    invocation.shell
+                );
+            }
+            assert!(
+                !invocation
+                    .shell
+                    .windows(b"SHELL:".len())
+                    .any(|w| w == b"SHELL:"),
+                "SHELL: sentinel must never appear in compile commands: {}",
+                invocation.shell
+            );
+        }
+        if let BuildStep::Link { invocations, .. } = step {
+            let shell = &invocations[0].shell;
+            assert!(
+                shell
+                    .windows(b"-Xlinker \"_usearch_*\"".len())
+                    .any(|w| w == b"-Xlinker \"_usearch_*\""),
+                "wildcard LINKER: option must use double quotes: {shell}"
+            );
+            assert!(
+                shell
+                    .windows(b"\"-Wl,-exported_symbol,_extra_*\"".len())
+                    .any(|w| w == b"\"-Wl,-exported_symbol,_extra_*\""),
+                "wildcard link option must use double quotes: {shell}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn custom_command_preserves_duplicate_depends() -> TestResult {
+    let mut model = fixture("Linux");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let mut cmd = CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::Output,
+        Default::default(),
+        Default::default(),
+    );
+    cmd.outputs.push(bt("complete"));
+    cmd.depends
+        .extend([bt("install"), bt("mkdir"), bt("install")]);
+    cmd.command_lines.push(vec![
+        "cmake".into(),
+        "-E".into(),
+        "touch".into(),
+        "complete".into(),
+    ]);
+    model.add_command(cmd)?;
+    let host = rcmake_host::PureHost::default();
+    let result = crate::resolve(&model, &host, &[])?;
+    let Some(BuildStep::Custom(step)) = result.graphs[0].steps.first() else {
+        return Err("Expected custom step".into());
+    };
+    assert_eq!(step.depends, ["install", "mkdir", "install"]);
+    Ok(())
+}
+
+#[test]
+fn custom_target_depends_attaches_main_dependency_command_on_existing_source() -> TestResult {
+    let mut model = fixture("Linux");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let mut copy = CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::Output,
+        Default::default(),
+        Default::default(),
+    );
+    copy.outputs.push(bt("/build/data/unicode.txt"));
+    copy.main_dependency = Some("/project/data/unicode.txt".into());
+    copy.command_lines.push(vec![
+        "cmake".into(),
+        "-E".into(),
+        "copy".into(),
+        "/project/data/unicode.txt".into(),
+        "/build/data/unicode.txt".into(),
+    ]);
+    model.add_command(copy)?;
+    let target_id = model.add_target(raw_target("test_data", TargetKind::Utility))?;
+    let mut util = CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::Utility(target_id),
+        Default::default(),
+        Default::default(),
+    );
+    util.depends.push(bt("data/unicode.txt"));
+    model.add_command(util)?;
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(std::path::Path::new("/project/data/unicode.txt"), b"ok")?;
+
+    let result = crate::resolve(&model, &host, &[])?;
+    let graph = &result.graphs[0];
+    let target = graph
+        .targets
+        .iter()
+        .find(|t| t.name == "test_data")
+        .ok_or("missing test_data target")?;
+    assert_eq!(
+        target.steps.len(),
+        2,
+        "test_data must own both the copy custom command (via MAIN_DEPENDENCY) and its utility step: {:?}",
+        target.steps
+    );
+    let util_step = target
+        .steps
+        .iter()
+        .find_map(|&idx| match &graph.steps[idx] {
+            BuildStep::Custom(step) if step.outputs.contains(&"CMakeFiles/test_data".into()) => {
+                Some(step)
+            }
+            _ => None,
+        })
+        .ok_or("missing utility step")?;
+    assert_eq!(util_step.depends, ["/project/data/unicode.txt"]);
+    Ok(())
+}
+
+#[test]
+fn feature_wrapped_whole_archive_recovers_single_and_multi_token_and_ignores_raw_flags()
+-> TestResult {
+    let mut model = fixture("Linux");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let config = ConfigId::default();
+    var(&mut model, "CMAKE_C_LINKER_WRAPPER_FLAG", "-Wl,");
+    var(&mut model, "CMAKE_C_LINKER_WRAPPER_FLAG_SEP", ",");
+    var(
+        &mut model,
+        "CMAKE_C_LINK_LIBRARY_USING_WHOLE_MULTI_SUPPORTED",
+        "ON",
+    );
+    var(
+        &mut model,
+        "CMAKE_C_LINK_LIBRARY_USING_WHOLE_MULTI",
+        "-Wl,--whole-archive <LINK_ITEM> -Wl,--no-whole-archive",
+    );
+    var(
+        &mut model,
+        "CMAKE_C_LINK_LIBRARY_USING_WHOLE_SINGLE_SUPPORTED",
+        "ON",
+    );
+    var(
+        &mut model,
+        "CMAKE_C_LINK_LIBRARY_USING_WHOLE_SINGLE",
+        "LINKER:--whole-archive,<LINK_ITEM>,--no-whole-archive",
+    );
+
+    let link_item = |text: &str| rcmake_model::LinkItem {
+        text: bt(text),
+        lookup_dir: DirId::ROOT,
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
+        scope: Some(rcmake_model::UsageScope::Private),
+    };
+    let mut app = raw_target("app", TargetKind::Executable);
+    app.sources.push(bt("main.c"));
+    app.usage.link_libraries = Some(vec![
+        link_item("$<LINK_LIBRARY:WHOLE_MULTI,/opt/lib/libmulti.a>"),
+        link_item("$<LINK_LIBRARY:WHOLE_SINGLE,/opt/lib/libsingle.a>"),
+        link_item("-Wl,--whole-archive /opt/lib/libraw_multi.a"),
+        link_item("-Wl,--whole-archive,/opt/lib/libraw_single.a"),
+    ]);
+    model.add_target(app)?;
+
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(std::path::Path::new("/project/main.c"), b"int main() {}")?;
+
+    let result = crate::resolve(&model, &host, &[config])?;
+    let Some(BuildStep::Link { inputs, step, .. }) = result.graphs[0].steps.last() else {
+        return Err("Expected link step".into());
+    };
+    assert!(
+        step.fragments.iter().any(|f| {
+            f.role == crate::LinkFragmentRole::Libraries
+                && f.text.value == "-Wl,--whole-archive /opt/lib/libmulti.a -Wl,--no-whole-archive"
+        }),
+        "expected multi-token feature fragment: {:?}",
+        step.fragments
+    );
+    assert!(
+        step.fragments.iter().any(|f| {
+            f.role == crate::LinkFragmentRole::Libraries
+                && f.text.value == "-Wl,--whole-archive,/opt/lib/libsingle.a,--no-whole-archive"
+        }),
+        "expected single comma-joined feature fragment: {:?}",
+        step.fragments
+    );
+    assert!(
+        inputs.contains(&"/opt/lib/libmulti.a".into()),
+        "multi-token LINK_LIBRARY feature must recover /opt/lib/libmulti.a: {inputs:?}"
+    );
+    assert!(
+        inputs.contains(&"/opt/lib/libsingle.a".into()),
+        "single-token LINK_LIBRARY feature must recover /opt/lib/libsingle.a: {inputs:?}"
+    );
+    assert!(
+        !inputs.contains(&"/opt/lib/libraw_multi.a".into())
+            && !inputs.contains(&"/opt/lib/libraw_single.a".into()),
+        "raw -Wl flags without LINK_LIBRARY must not become link inputs: {inputs:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_link_depends_stays_in_implicit_inputs_when_also_linked() -> TestResult {
+    let mut model = fixture("Linux");
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let config = ConfigId::default();
+
+    let mut shared = raw_target("shared_b", TargetKind::SharedLibrary);
+    shared.sources.push(bt("lib.c"));
+    model.add_target(shared)?;
+
+    let mut app = raw_target("app", TargetKind::Executable);
+    app.sources.push(bt("main.c"));
+    app.props.set("LINK_DEPENDS_NO_SHARED".into(), "ON".into());
+    app.props
+        .set("LINK_DEPENDS".into(), "$<TARGET_FILE:shared_b>".into());
+    app.usage.link_libraries = Some(vec![rcmake_model::LinkItem {
+        text: bt("shared_b"),
+        lookup_dir: DirId::ROOT,
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
+        scope: Some(rcmake_model::UsageScope::Private),
+    }]);
+    model.add_target(app)?;
+
+    let host = rcmake_host::PureHost::default();
+    host.seed_file(
+        std::path::Path::new("/project/lib.c"),
+        b"int f() { return 1; }",
+    )?;
+    host.seed_file(
+        std::path::Path::new("/project/main.c"),
+        b"int main() { return 0; }",
+    )?;
+
+    let result = crate::resolve(&model, &host, &[config])?;
+    let app_target = result.graphs[0]
+        .targets
+        .iter()
+        .find(|t| t.name == "app")
+        .ok_or("missing app target")?;
+    let (inputs, implicit_inputs) = app_target
+        .steps
+        .iter()
+        .find_map(|&idx| match &result.graphs[0].steps[idx] {
+            BuildStep::Link {
+                inputs,
+                implicit_inputs,
+                ..
+            } => Some((inputs, implicit_inputs)),
+            _ => None,
+        })
+        .ok_or("missing app link step")?;
+    assert!(
+        inputs.contains(&"libshared_b.so".into()),
+        "linked shared library should appear in inputs: {inputs:?}"
+    );
+    assert!(
+        implicit_inputs.contains(&"libshared_b.so".into()),
+        "explicit LINK_DEPENDS must remain in implicit_inputs even when also in inputs: {implicit_inputs:?}"
+    );
+    Ok(())
 }

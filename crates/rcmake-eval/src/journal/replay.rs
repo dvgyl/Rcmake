@@ -11,8 +11,8 @@ use crate::Cx;
 use super::codec::fields;
 use super::frame::{EncodeError, EncodeJson, JsonSink, MAX_FRAME_BYTES, encoded_size, write_with};
 use super::region::{
-    EntryContext, JournalEffect, MAX_EFFECTS, MAX_INPUTS, OpaqueOperation, PropertyEdit, RegionKey,
-    RegionKind, RegionPayload, RegionRecord,
+    CallScope, EntryContext, JournalEffect, MAX_EFFECTS, MAX_INPUTS, OpaqueOperation, PropertyEdit,
+    RegionKey, RegionKind, RegionPayload, RegionRecord,
 };
 use super::trace::{
     JournalDigest, JournalInput, JournalStamp, PropertyOwner, StateKey, StateLookup, VariableScope,
@@ -38,7 +38,7 @@ const READ_OPTIONS: ReadOptions = ReadOptions {
 
 impl<M> ConfigureSnapshot<M> {
     /// Version of the replay records. The frame encoding and its file name still use version 1.
-    pub const SCHEMA: &'static str = "configure.v4";
+    pub const SCHEMA: &'static str = "configure.v5";
 
     /// File name for the manifest under `CMakeFiles/rcmake`.
     pub const FILE_NAME: &'static str = "configure.v1.bin";
@@ -132,6 +132,7 @@ impl<M: FromJson> ConfigureSnapshot<M> {
 
 impl<M: EncodeJson> EncodeJson for ConfigureSnapshot<M> {
     fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
+        let _calls = CallScope::encode();
         sink.object(|obj| {
             obj.field("model", |s| self.model.encode(s))?;
             obj.field("region", |s| self.region.encode(s))?;
@@ -143,6 +144,7 @@ impl<M: EncodeJson> EncodeJson for ConfigureSnapshot<M> {
 
 impl<M: FromJson> FromJson for ConfigureSnapshot<M> {
     fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let _calls = CallScope::decode();
         let obj = fields(value, &["schema", "replay_schema", "region", "model"])?;
         if req::<String>(obj, "schema")? != FRAME_SCHEMA {
             return Err(FieldError::invalid("unknown frame schema").in_field("schema"));

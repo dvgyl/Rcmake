@@ -190,8 +190,7 @@ impl UsageResolver<'_> {
             }
         }
         let has_standard = !standard_includes.is_empty();
-        let mut seen = HashSet::new();
-        let mut includes: Vec<_> = current_dirs
+        let mut raw: Vec<_> = current_dirs
             .chain(swift_module_dirs)
             .chain(
                 usage.entries.into_iter().zip(
@@ -211,16 +210,27 @@ impl UsageResolver<'_> {
                 path.value.truncate(len);
                 (path, hops, true)
             }))
-            .filter(|(path, _, _)| seen.insert(path.value.clone()))
-            .map(|(path, hops, standard_sys)| {
-                (
-                    InterfaceInclude {
-                        system: standard_sys
-                            || (has_system && system.contains(path.value.as_slice())),
-                        path,
-                    },
-                    hops,
-                )
+            .collect();
+        let keep: Vec<bool> = {
+            let mut seen = HashSet::with_capacity(raw.len());
+            raw.iter()
+                .map(|(path, _, _)| seen.insert(path.value.as_slice()))
+                .collect()
+        };
+        let mut includes: Vec<_> = raw
+            .drain(..)
+            .zip(keep)
+            .filter_map(|((path, hops, standard_sys), keep)| {
+                keep.then(|| {
+                    (
+                        InterfaceInclude {
+                            system: standard_sys
+                                || (has_system && system.contains(path.value.as_slice())),
+                            path,
+                        },
+                        hops,
+                    )
+                })
             })
             .collect();
         if has_system || has_standard {

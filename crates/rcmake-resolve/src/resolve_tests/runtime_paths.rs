@@ -734,6 +734,24 @@ fn link_what_you_use_adds_the_flag_and_check_for_ninja_and_make() -> TestResult 
             .ok_or("Missing unused-library check.")?;
         assert!(check.argv.iter().any(|arg| arg == "--lwyu=ldd;-u;-r"));
         assert!(check.argv.iter().any(|arg| arg == "--source=app"));
+        assert!(
+            check
+                .shell
+                .as_slice()
+                .windows(b"--lwyu=\"ldd;-u;-r\"".len())
+                .any(|w| w == b"--lwyu=\"ldd;-u;-r\""),
+            "POSIX lwyu check must double-quote value after --lwyu=: {}",
+            check.shell
+        );
+        assert!(
+            check
+                .shell
+                .as_slice()
+                .windows(b"--source=app".len())
+                .any(|w| w == b"--source=app"),
+            "POSIX lwyu check must keep --source=app: {}",
+            check.shell
+        );
     }
     Ok(())
 }

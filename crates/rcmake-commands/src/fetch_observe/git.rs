@@ -716,9 +716,41 @@ fn local_directory_copy(
 }
 
 fn bundled_executable(cx: &Cx<'_>, command: &CommandSpec) -> bool {
-    let host = cx.host();
-    host.current_exe()
-        .is_ok_and(|exe| same_file(host, &exe, &to_native(&command.program)))
+    bundled_program(cx.host(), &to_native(&command.program))
+}
+
+/// Return whether `program` is the running executable or its staged `cmake` sibling.
+///
+/// A staged install (for example the Windows release layout) places `cmake.exe` next to the
+/// `rcmake.exe` entry point. Both names start the same engine, so both may use the
+/// in-process fast path.
+fn bundled_program(host: &dyn Host, program: &Path) -> bool {
+    let Ok(exe) = host.current_exe() else {
+        return false;
+    };
+    if same_file(host, &exe, program) {
+        return true;
+    }
+    let (Ok(exe), Ok(target)) = (host.canonicalize(&exe), host.canonicalize(program)) else {
+        return false;
+    };
+    let is_file = host
+        .metadata(&target, Follow::No)
+        .is_ok_and(|meta| meta.kind == FileKind::File);
+    let sibling = exe.parent().is_some() && target.parent() == exe.parent();
+    let named_cmake = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            ["cmake", "cmake.exe"].iter().any(|expected| {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case(expected)
+                } else {
+                    name == *expected
+                }
+            })
+        });
+    is_file && sibling && named_cmake
 }
 
 fn cache_root(cx: &Cx<'_>, runtime: &Runtime) -> PathBuf {
@@ -870,6 +902,31 @@ mod tests {
         let invoked = host.current_exe()?;
         assert!(same_file(&host, &invoked, &executable));
         assert!(!same_file(&host, &invoked, &other));
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_the_staged_cmake_sibling_of_the_running_executable() -> HostResult<()> {
+        let root = Path::new(if cfg!(windows) { "C:/work" } else { "/work" });
+        let bin = root.join("bin");
+        let host = PureHost::new(root.into(), bin.join("rcmake.exe"));
+        host.seed_file(&bin.join("rcmake.exe"), b"rcmake")?;
+        host.seed_file(&bin.join("cmake.exe"), b"cmake")?;
+        host.seed_file(&bin.join("cmake"), b"cmake")?;
+        host.seed_file(&bin.join("ctest.exe"), b"ctest")?;
+        host.seed_file(&root.join("other/cmake.exe"), b"cmake")?;
+
+        assert!(bundled_program(&host, &bin.join("rcmake.exe")));
+        assert!(bundled_program(&host, &bin.join("cmake.exe")));
+        assert!(bundled_program(&host, &bin.join("cmake")));
+        assert!(!bundled_program(&host, &bin.join("ctest.exe")));
+        assert!(!bundled_program(&host, &root.join("other/cmake.exe")));
+        assert!(!bundled_program(&host, &bin.join("missing/cmake.exe")));
+
+        let host = PureHost::new(root.into(), bin.join("rcmake"));
+        host.seed_file(&bin.join("rcmake"), b"rcmake")?;
+        host.create_dir_all(&bin.join("cmake"))?;
+        assert!(!bundled_program(&host, &bin.join("cmake")));
         Ok(())
     }
 }

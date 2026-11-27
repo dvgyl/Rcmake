@@ -126,7 +126,9 @@ impl Fixture {
                 let source = command
                     .args
                     .iter()
-                    .find(|arg| arg.ends_with(b".c") || arg.ends_with(b".cpp"))
+                    .find(|arg| {
+                        arg.ends_with(b".c") || arg.ends_with(b".cpp") || arg.ends_with(b".cxx")
+                    })
                     .ok_or_else(|| HostError::unsupported("Expected a source file."))?;
                 host.seed_file(&deps, format!("out.o: {source}\n").as_bytes())?;
             }
@@ -172,6 +174,27 @@ impl Fixture {
         jobs: usize,
         names: &[&[u8]],
     ) -> TestResult<Vec<BString>> {
+        self.configure_in_with_languages(build, mode, jobs, None, names)
+    }
+
+    fn configure_with_languages(
+        &self,
+        mode: ProbeCacheMode,
+        jobs: usize,
+        languages: &str,
+        names: &[&[u8]],
+    ) -> TestResult<Vec<BString>> {
+        self.configure_in_with_languages("/work/build", mode, jobs, Some(languages), names)
+    }
+
+    fn configure_in_with_languages(
+        &self,
+        build: &str,
+        mode: ProbeCacheMode,
+        jobs: usize,
+        languages: Option<&str>,
+        names: &[&[u8]],
+    ) -> TestResult<Vec<BString>> {
         let root = Path::new("/work/probes");
         let build = Path::new(build);
         let mut services = Services::default();
@@ -179,10 +202,23 @@ impl Fixture {
         services.speed.probe_jobs = NonZeroUsize::new(jobs);
         let mut runtime = ConfigureRuntime::new(self.host.clone(), root, build, &services, true);
         let mut interp = interpreter(runtime.host(), root)?;
+        if let Some(languages) = languages {
+            interp
+                .cx()
+                .project()
+                .global
+                .props
+                .set("ENABLED_LANGUAGES".into(), languages.into());
+        }
         self.inner.sleep(Duration::from_secs(4));
         let outcome = runtime.run(&mut interp, &[]);
         runtime.finish(outcome.exit_code == 0);
-        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            outcome.exit_code,
+            0,
+            "stderr: {}",
+            self.inner.stream_bytes(rcmake_host::Stream::Stderr)
+        );
         let values = names
             .iter()
             .map(|name| interp.cx().var_or_empty(name))
@@ -308,7 +344,11 @@ try_compile(FIFTH SOURCE_FROM_CONTENT fifth.cpp [[int main() { return 5; }]] NO_
         assert!(parallel.speculative.load(Ordering::Relaxed) >= 2);
         assert_eq!(
             parallel.runs.load(Ordering::Relaxed),
-            serial.runs.load(Ordering::Relaxed)
+            serial.runs.load(Ordering::Relaxed),
+            "mode={mode:?} spec={} parallel={} serial={}",
+            parallel.speculative.load(Ordering::Relaxed),
+            parallel.runs.load(Ordering::Relaxed),
+            serial.runs.load(Ordering::Relaxed),
         );
         if mode == ProbeCacheMode::Off {
             let records = parallel.inner.read(
@@ -790,7 +830,11 @@ endforeach()
         );
         assert_eq!(
             parallel.runs.load(Ordering::Relaxed),
-            serial.runs.load(Ordering::Relaxed)
+            serial.runs.load(Ordering::Relaxed),
+            "mode={mode:?} spec={} parallel={} serial={}",
+            parallel.speculative.load(Ordering::Relaxed),
+            parallel.runs.load(Ordering::Relaxed),
+            serial.runs.load(Ordering::Relaxed),
         );
     }
     Ok(())
@@ -821,6 +865,186 @@ try_compile(${PREFIX}_C SOURCE_FROM_CONTENT c.c \"int main(void) { return 3; }\"
     assert_eq!(
         parallel.runs.load(Ordering::Relaxed),
         serial.runs.load(Ordering::Relaxed)
+    );
+    Ok(())
+}
+
+#[test]
+fn stock_check_compiler_flag_failing_probe_and_override_invalidation() -> TestResult {
+    let script = "\
+set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> <DEFINES> <FLAGS> -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -o <OBJECT> -c <SOURCE>\")
+include(CheckCCompilerFlag)
+check_c_compiler_flag(-Wall HAVE_GOOD_1)
+check_c_compiler_flag(-Wbad-flag-one HAVE_BAD_1)
+check_c_compiler_flag(-Wbad-flag-two HAVE_BAD_2)
+check_c_compiler_flag(-Wextra HAVE_GOOD_2)
+";
+    let make_fixture = |commands: &str| -> HostResult<Fixture> {
+        let fixture = Fixture::new(commands)?;
+        seed_all_stock_check_modules(&fixture)?;
+        let count = Arc::clone(&fixture.runs);
+        let worker_count = Arc::clone(&fixture.speculative);
+        fixture.inner.set_command_handler(move |host, request, _| {
+            let command = request
+                .pipeline
+                .first()
+                .ok_or_else(|| HostError::unsupported("Expected a process."))?;
+            if command.program == "/usr/bin/xcrun" {
+                let tool = command
+                    .args
+                    .last()
+                    .ok_or_else(|| HostError::unsupported("Expected a tool name."))?;
+                return Ok(success(format!("{TOOLCHAIN}/{tool}\n").into_bytes()));
+            }
+            if command.args.iter().any(|arg| arg == "-E")
+                && command.args.iter().any(|arg| arg == "-v")
+            {
+                let mut output = success(Vec::new());
+                output.stderr = format!(
+                    "#include <...> search starts here:\n {SDK}/usr/include\nEnd of search list.\n"
+                )
+                .into_bytes();
+                return Ok(output);
+            }
+            if command.program == format!("{TOOLCHAIN}/clang").as_str() {
+                if command.args.iter().any(|arg| arg == "-M") {
+                    if let Some(deps) = command.args.windows(2).find_map(|pair| match pair {
+                        [k, v] if k == "-MF" => Some(request.cwd.join(path::to_native(v))),
+                        _ => None,
+                    }) {
+                        let source = command
+                            .args
+                            .iter()
+                            .find(|arg| arg.ends_with(b".c"))
+                            .ok_or_else(|| HostError::unsupported("Expected source."))?;
+                        host.seed_file(&deps, format!("out.o: {source}\n").as_bytes())?;
+                    }
+                    return Ok(success(Vec::new()));
+                }
+                let data = match command.args.as_slice() {
+                    [flag] if flag == "-print-resource-dir" => {
+                        b"/fixture/clang/resource\n".to_vec()
+                    }
+                    [flag] if flag == "-print-target-triple" => b"arm64-apple-darwin\n".to_vec(),
+                    [flag] if flag == "-v" => Vec::new(),
+                    _ => return Err(HostError::unsupported("Unexpected compiler query.")),
+                };
+                return Ok(success(data));
+            }
+            if command.program != "/usr/bin/cc" {
+                return Err(HostError::unsupported("Unexpected process."));
+            }
+            count.fetch_add(1, Ordering::Relaxed);
+            if std::thread::current().name() == Some("rcmake-probe") {
+                worker_count.fetch_add(1, Ordering::Relaxed);
+            }
+            if command.args.iter().any(|arg| arg == "-M") {
+                if let Some(deps) = command.args.windows(2).find_map(|pair| match pair {
+                    [k, v] if k == "-MF" => Some(request.cwd.join(path::to_native(v))),
+                    _ => None,
+                }) {
+                    let source = command
+                        .args
+                        .iter()
+                        .find(|arg| arg.ends_with(b".c"))
+                        .ok_or_else(|| HostError::unsupported("Expected source."))?;
+                    host.seed_file(&deps, format!("out.o: {source}\n").as_bytes())?;
+                }
+                return Ok(success(Vec::new()));
+            }
+            if command.args.iter().any(|arg| arg.starts_with(b"-Wbad-")) {
+                return Ok(RunOutput {
+                    stdout: Vec::new(),
+                    stderr: b"error: unknown warning option\n".to_vec(),
+                    results: vec![ProcessResult::Exited(1)],
+                });
+            }
+            let argument = |flag: &[u8]| {
+                command.args.windows(2).find_map(|pair| match pair {
+                    [key, value] if key.as_slice() == flag => {
+                        Some(request.cwd.join(path::to_native(value)))
+                    }
+                    _ => None,
+                })
+            };
+            let out = argument(b"-o")
+                .ok_or_else(|| HostError::unsupported("Expected a compiler output."))?;
+            host.seed_file(&out, b"test binary")?;
+            if let Some(deps) = argument(b"-MF") {
+                let source = command
+                    .args
+                    .iter()
+                    .find(|arg| arg.ends_with(b".c"))
+                    .ok_or_else(|| HostError::unsupported("Expected a source file."))?;
+                host.seed_file(&deps, format!("out.o: {source}\n").as_bytes())?;
+            }
+            if command.args.iter().any(|arg| arg == "-dependency_info") {
+                let deps = command
+                    .args
+                    .last()
+                    .ok_or_else(|| HostError::unsupported("Expected linker evidence."))?;
+                let bytes = format!("\0fixture\0\u{10}{SDK}/usr/lib/libSystem.tbd\0");
+                host.seed_file(&request.cwd.join(path::to_native(deps)), bytes.as_bytes())?;
+            }
+            Ok(success(b"compiler output\n".to_vec()))
+        })?;
+        Ok(fixture)
+    };
+    let names = [
+        b"HAVE_GOOD_1".as_slice(),
+        b"HAVE_BAD_1",
+        b"HAVE_BAD_2",
+        b"HAVE_GOOD_2",
+    ];
+    let serial = make_fixture(script)?;
+    let expected = serial.configure_with_languages(ProbeCacheMode::ReadWrite, 1, "C", &names)?;
+    assert_eq!(
+        expected,
+        vec![
+            BString::from("1"),
+            BString::from(""),
+            BString::from(""),
+            BString::from("1"),
+        ]
+    );
+    for mode in [ProbeCacheMode::ReadWrite, ProbeCacheMode::Off] {
+        let parallel = make_fixture(script)?;
+        assert_eq!(
+            parallel.configure_with_languages(mode, 4, "C", &names)?,
+            expected
+        );
+        assert!(
+            parallel.speculative.load(Ordering::Relaxed) >= 2,
+            "expected failing and succeeding compiler flag probes to speculate in {mode:?}"
+        );
+        assert_eq!(
+            parallel.runs.load(Ordering::Relaxed),
+            serial.runs.load(Ordering::Relaxed),
+            "mode={mode:?} spec={}",
+            parallel.speculative.load(Ordering::Relaxed),
+        );
+    }
+
+    // Overriding check_c_compiler_flag must disable speculative lookahead cleanly.
+    let overridden = "\
+set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> <DEFINES> <FLAGS> -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -o <OBJECT> -c <SOURCE>\")
+include(CheckCCompilerFlag)
+macro(check_c_compiler_flag _f _v)
+  cmake_check_compiler_flag(C \"${_f}\" ${_v})
+endmacro()
+check_c_compiler_flag(-Wall HAVE_O1)
+check_c_compiler_flag(-Wextra HAVE_O2)
+";
+    let ov_names = [b"HAVE_O1".as_slice(), b"HAVE_O2"];
+    let ov = make_fixture(overridden)?;
+    assert_eq!(
+        ov.configure_with_languages(ProbeCacheMode::ReadWrite, 4, "C", &ov_names)?,
+        vec![BString::from("1"); 2]
+    );
+    assert_eq!(
+        ov.speculative.load(Ordering::Relaxed),
+        0,
+        "overridden check_c_compiler_flag must not speculate"
     );
     Ok(())
 }
@@ -994,6 +1218,224 @@ endforeach()
         parallel.runs.load(Ordering::Relaxed),
         serial.runs.load(Ordering::Relaxed)
     );
+    Ok(())
+}
+
+fn seed_all_stock_check_modules(fixture: &Fixture) -> HostResult<()> {
+    let modules = Path::new("/work/probes/cmake/Modules");
+    fixture.inner.create_dir_all(&modules.join("Internal"))?;
+    let files: &[(&str, &[u8])] = &[
+        (
+            "CheckIncludeFile.cmake",
+            include_bytes!("../../../../../../modules/cmake-4.5/Modules/CheckIncludeFile.cmake"),
+        ),
+        (
+            "CheckIncludeFile.c.in",
+            include_bytes!("../../../../../../modules/cmake-4.5/Modules/CheckIncludeFile.c.in"),
+        ),
+        (
+            "CheckSymbolExists.cmake",
+            include_bytes!("../../../../../../modules/cmake-4.5/Modules/CheckSymbolExists.cmake"),
+        ),
+        (
+            "CheckCCompilerFlag.cmake",
+            include_bytes!("../../../../../../modules/cmake-4.5/Modules/CheckCCompilerFlag.cmake"),
+        ),
+        (
+            "CheckCXXCompilerFlag.cmake",
+            include_bytes!(
+                "../../../../../../modules/cmake-4.5/Modules/CheckCXXCompilerFlag.cmake"
+            ),
+        ),
+        (
+            "CheckCSourceCompiles.cmake",
+            include_bytes!(
+                "../../../../../../modules/cmake-4.5/Modules/CheckCSourceCompiles.cmake"
+            ),
+        ),
+        (
+            "CheckCXXSourceCompiles.cmake",
+            include_bytes!(
+                "../../../../../../modules/cmake-4.5/Modules/CheckCXXSourceCompiles.cmake"
+            ),
+        ),
+        (
+            "CMakeCheckCompilerFlagCommonPatterns.cmake",
+            include_bytes!(
+                "../../../../../../modules/cmake-4.5/Modules/CMakeCheckCompilerFlagCommonPatterns.cmake"
+            ),
+        ),
+        (
+            "Internal/CheckCommon.cmake",
+            include_bytes!(
+                "../../../../../../modules/cmake-4.5/Modules/Internal/CheckCommon.cmake"
+            ),
+        ),
+        (
+            "Internal/CheckCompilerFlag.cmake",
+            include_bytes!(
+                "../../../../../../modules/cmake-4.5/Modules/Internal/CheckCompilerFlag.cmake"
+            ),
+        ),
+        (
+            "Internal/CheckSourceCompiles.cmake",
+            include_bytes!(
+                "../../../../../../modules/cmake-4.5/Modules/Internal/CheckSourceCompiles.cmake"
+            ),
+        ),
+        (
+            "Internal/CheckFlagCommonConfig.cmake",
+            include_bytes!(
+                "../../../../../../modules/cmake-4.5/Modules/Internal/CheckFlagCommonConfig.cmake"
+            ),
+        ),
+    ];
+    for (rel, bytes) in files {
+        fixture.inner.seed_file(&modules.join(rel), bytes)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn stock_check_include_file_straight_line_runs_speculatively() -> TestResult {
+    let script = "\
+include(CheckIncludeFile)
+check_include_file(\"a.h\" HAVE_A_H)
+check_include_file(\"b.h\" HAVE_B_H)
+check_include_file(\"c.h\" HAVE_C_H)
+check_include_file(\"d.h\" HAVE_D_H)
+";
+    let names = [
+        b"HAVE_A_H".as_slice(),
+        b"HAVE_B_H",
+        b"HAVE_C_H",
+        b"HAVE_D_H",
+    ];
+    let serial = Fixture::new(script)?;
+    seed_all_stock_check_modules(&serial)?;
+    let expected = serial.configure(ProbeCacheMode::ReadWrite, 1, &names)?;
+    assert_eq!(expected, vec![BString::from("1"); 4]);
+    assert_eq!(serial.speculative.load(Ordering::Relaxed), 0);
+
+    for mode in [ProbeCacheMode::ReadWrite, ProbeCacheMode::Off] {
+        let parallel = Fixture::new(script)?;
+        seed_all_stock_check_modules(&parallel)?;
+        assert_eq!(parallel.configure(mode, 4, &names)?, expected);
+        assert!(
+            parallel.speculative.load(Ordering::Relaxed) >= 2,
+            "expected straight-line check_include_file probes to speculate in {mode:?}"
+        );
+        assert_eq!(
+            parallel.runs.load(Ordering::Relaxed),
+            serial.runs.load(Ordering::Relaxed),
+            "mode={mode:?} spec={} parallel={} serial={}",
+            parallel.speculative.load(Ordering::Relaxed),
+            parallel.runs.load(Ordering::Relaxed),
+            serial.runs.load(Ordering::Relaxed),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stock_check_symbol_exists_straight_line_and_foreach_run_speculatively() -> TestResult {
+    let script = "\
+set(CMAKE_C_COMPILER_LOADED 1)
+include(CheckSymbolExists)
+check_symbol_exists(sym_one \"a.h\" HAVE_SYM_ONE)
+check_symbol_exists(sym_two \"a.h;b.h\" HAVE_SYM_TWO)
+check_symbol_exists(sym_three \"c.h\" HAVE_SYM_THREE)
+foreach(sym IN ITEMS alpha beta gamma)
+  check_symbol_exists(${sym} \"stdio.h\" HAVE_LOOP_${sym})
+endforeach()
+";
+    let names = [
+        b"HAVE_SYM_ONE".as_slice(),
+        b"HAVE_SYM_TWO",
+        b"HAVE_SYM_THREE",
+        b"HAVE_LOOP_alpha",
+        b"HAVE_LOOP_beta",
+        b"HAVE_LOOP_gamma",
+    ];
+    let serial = Fixture::new(script)?;
+    seed_all_stock_check_modules(&serial)?;
+    let expected = serial.configure(ProbeCacheMode::ReadWrite, 1, &names)?;
+    assert_eq!(expected, vec![BString::from("1"); 6]);
+    assert_eq!(serial.speculative.load(Ordering::Relaxed), 0);
+
+    for mode in [ProbeCacheMode::ReadWrite, ProbeCacheMode::Off] {
+        let parallel = Fixture::new(script)?;
+        seed_all_stock_check_modules(&parallel)?;
+        assert_eq!(parallel.configure(mode, 4, &names)?, expected);
+        assert!(
+            parallel.speculative.load(Ordering::Relaxed) >= 3,
+            "expected check_symbol_exists straight-line and foreach to speculate in {mode:?}"
+        );
+        assert_eq!(
+            parallel.runs.load(Ordering::Relaxed),
+            serial.runs.load(Ordering::Relaxed),
+            "mode={mode:?} spec={} parallel={} serial={}",
+            parallel.speculative.load(Ordering::Relaxed),
+            parallel.runs.load(Ordering::Relaxed),
+            serial.runs.load(Ordering::Relaxed),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stock_check_compiler_flags_straight_line_and_foreach_run_speculatively() -> TestResult {
+    let script = "\
+set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> <DEFINES> <FLAGS> -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -o <OBJECT> -c <SOURCE>\")
+set(CMAKE_CXX_COMPILER /usr/bin/c++)
+set(CMAKE_CXX_COMPILER_ID AppleClang)
+set(CMAKE_CXX_COMPILE_OBJECT \"<CMAKE_CXX_COMPILER> <DEFINES> <FLAGS> -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -o <OBJECT> -c <SOURCE>\")
+set(CMAKE_CXX_LINK_EXECUTABLE \"<CMAKE_CXX_COMPILER> -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -o <TARGET> <OBJECTS>\")
+include(CheckCCompilerFlag)
+include(CheckCXXCompilerFlag)
+check_c_compiler_flag(-Wall HAVE_C_WALL)
+check_c_compiler_flag(-Wextra HAVE_C_WEXTRA)
+check_c_compiler_flag(-Wshadow HAVE_C_WSHADOW)
+foreach(flag IN ITEMS -Wall -Wextra -Wshadow)
+  string(MAKE_C_IDENTIFIER \"HAVE_CXX_${flag}\" v)
+  check_cxx_compiler_flag(${flag} ${v})
+endforeach()
+";
+    let names = [
+        b"HAVE_C_WALL".as_slice(),
+        b"HAVE_C_WEXTRA",
+        b"HAVE_C_WSHADOW",
+        b"HAVE_CXX__Wall",
+        b"HAVE_CXX__Wextra",
+        b"HAVE_CXX__Wshadow",
+    ];
+    let serial = Fixture::new(script)?;
+    seed_all_stock_check_modules(&serial)?;
+    let expected =
+        serial.configure_with_languages(ProbeCacheMode::ReadWrite, 1, "C;CXX", &names)?;
+    assert_eq!(expected, vec![BString::from("1"); 6]);
+    assert_eq!(serial.speculative.load(Ordering::Relaxed), 0);
+
+    for mode in [ProbeCacheMode::ReadWrite, ProbeCacheMode::Off] {
+        let parallel = Fixture::new(script)?;
+        seed_all_stock_check_modules(&parallel)?;
+        assert_eq!(
+            parallel.configure_with_languages(mode, 4, "C;CXX", &names)?,
+            expected
+        );
+        assert!(
+            parallel.speculative.load(Ordering::Relaxed) >= 3,
+            "expected C and CXX compiler flag probes to speculate in {mode:?}"
+        );
+        assert_eq!(
+            parallel.runs.load(Ordering::Relaxed),
+            serial.runs.load(Ordering::Relaxed),
+            "mode={mode:?} spec={} parallel={} serial={}",
+            parallel.speculative.load(Ordering::Relaxed),
+            parallel.runs.load(Ordering::Relaxed),
+            serial.runs.load(Ordering::Relaxed),
+        );
+    }
     Ok(())
 }
 
@@ -1462,6 +1904,762 @@ file(GLOB_RECURSE SOURCE_FILES \"${CMAKE_SOURCE_DIR}/*\")
                 .metadata(session_parent, rcmake_host::Follow::No)
                 .is_err(),
             "session scratch directory {session_parent:?} should be cleaned up on drop"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn speculative_reuses_toolchain_evidence_across_abi_locale_changes() -> TestResult {
+    // Reproduces CMakeDetermineCompilerABI setting LC_ALL/LC_MESSAGES/LANG=C around
+    // compiler ABI probes and restoring them afterward before alternating C/C++ probes.
+    let script = "\
+set(CMAKE_CXX_COMPILER /usr/bin/c++)
+set(CMAKE_CXX_COMPILER_ID AppleClang)
+set(CMAKE_CXX_COMPILE_OBJECT \"<CMAKE_CXX_COMPILER> -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -o <OBJECT> -c <SOURCE>\")
+set(CMAKE_CXX_LINK_EXECUTABLE \"<CMAKE_CXX_COMPILER> -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -o <TARGET> <OBJECTS>\")
+set(ENV{LC_ALL} C)
+set(ENV{LC_MESSAGES} C)
+set(ENV{LANG} C)
+try_compile(ABI_C SOURCE_FROM_CONTENT abi.c [[int main(void) { return 0; }]] NO_CACHE NO_LOG)
+try_compile(ABI_CXX SOURCE_FROM_CONTENT abi.cpp [[int main() { return 0; }]] NO_CACHE NO_LOG)
+set(ENV{LC_ALL} \"\")
+set(ENV{LC_MESSAGES} \"\")
+set(ENV{LANG} \"\")
+try_compile(P1 SOURCE_FROM_CONTENT probe.c [[int main(void) { return 0; }]] NO_CACHE NO_LOG)
+try_compile(P2 SOURCE_FROM_CONTENT probe.cpp [[int main() { return 0; }]] NO_CACHE NO_LOG)
+try_compile(P3 SOURCE_FROM_CONTENT other.c [[int main(void) { return 1; }]] NO_CACHE NO_LOG)
+try_compile(P4 SOURCE_FROM_CONTENT last.cpp [[int main() { return 1; }]] NO_CACHE NO_LOG)
+";
+    let fixture = Fixture::new(script)?;
+    fixture
+        .inner
+        .env_set(b"RCMAKE_MEASURE_PROBE_INTERVALS", Some(b"1"));
+    let build = Path::new("/work/build-locale-overlap");
+    let mut services = Services::default();
+    services.speed.probe_cache = ProbeCacheMode::Off;
+    services.speed.probe_jobs = NonZeroUsize::new(4);
+    let mut runtime = ConfigureRuntime::new(
+        Arc::clone(&fixture.host),
+        Path::new("/work/probes"),
+        build,
+        &services,
+        true,
+    );
+    let mut interp = interpreter(runtime.host(), Path::new("/work/probes"))?;
+    let outcome = runtime.run(&mut interp, &[]);
+    runtime.finish(outcome.exit_code == 0);
+    assert_eq!(outcome.exit_code, 0);
+    for var in [b"P1".as_slice(), b"P2", b"P3", b"P4"] {
+        assert_eq!(interp.cx().var_or_empty(var), "TRUE");
+    }
+    let intervals_bytes = fixture.inner.read(
+        &build.join("CMakeFiles/rcmake-probe-intervals.txt"),
+        ReadRange::All { limit: 64 * 1024 },
+    )?;
+    let intervals_text = std::str::from_utf8(&intervals_bytes)?;
+    let mut intervals: Vec<(&str, u128, u128)> = Vec::new();
+    for line in intervals_text.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(tree), Some(start), Some(end)) = (parts.next(), parts.next(), parts.next()) {
+            intervals.push((tree, start.parse()?, end.parse()?));
+        }
+    }
+    let overlapping = intervals
+        .iter()
+        .enumerate()
+        .any(|(i, &(tree_a, s_a, e_a))| {
+            intervals[i + 1..]
+                .iter()
+                .any(|&(tree_b, s_b, e_b)| tree_a != tree_b && s_a < e_b && s_b < e_a)
+        });
+    assert!(
+        overlapping,
+        "expected overlapping worker intervals across C/C++ probes after locale restore:\n{intervals_text}"
+    );
+    Ok(())
+}
+
+/// Count reads of one watched file.
+struct ReadCountingHost {
+    inner: Arc<dyn Host>,
+    watched: PathBuf,
+    reads: Arc<AtomicUsize>,
+}
+
+impl Host for ReadCountingHost {
+    rcmake_host::forward_host!(inner, env, process, services);
+    rcmake_host::forward_host!(@method inner, metadata(p: &Path, follow: rcmake_host::Follow) -> HostResult<rcmake_host::Metadata>);
+    rcmake_host::forward_host!(@method inner, metadata_fresh(p: &Path, follow: rcmake_host::Follow) -> HostResult<rcmake_host::Metadata>);
+    rcmake_host::forward_host!(@ inner, read_with_origin);
+    rcmake_host::forward_host!(@ inner, read_chunks);
+    rcmake_host::forward_host!(@method inner, write(p: &Path, data: &[u8], mode: rcmake_host::WriteMode) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, read_dir(p: &Path) -> HostResult<Vec<rcmake_host::DirEntry>>);
+    rcmake_host::forward_host!(@method inner, create_dir_all(p: &Path) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, create_private_dir(p: &Path) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, remove_file(p: &Path) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, remove_dir(p: &Path) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, remove_dir_all(p: &Path) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, rename(from: &Path, to: &Path) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, rename_noreplace(from: &Path, to: &Path) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, lock_file(path: &Path, timeout: Option<Duration>) -> HostResult<Box<dyn rcmake_host::FileLockGuard>>);
+    rcmake_host::forward_host!(@method inner, copy_file(from: &Path, to: &Path, opts: rcmake_host::CopyOptions) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, symlink(target: &Path, link: &Path) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, hard_link(src: &Path, dst: &Path) -> HostResult<()>);
+    rcmake_host::forward_host!(@ inner, read_link);
+    rcmake_host::forward_host!(@method inner, canonicalize(p: &Path) -> HostResult<PathBuf>);
+    rcmake_host::forward_host!(@method inner, canonicalize_fresh(p: &Path) -> HostResult<PathBuf>);
+    rcmake_host::forward_host!(@method inner, set_permissions(p: &Path, mode: u32) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, set_times(p: &Path, atime: Option<rcmake_host::FileTime>, mtime: Option<rcmake_host::FileTime>) -> HostResult<()>);
+    rcmake_host::forward_host!(@method inner, set_symlink_times(path: &Path, atime: Option<rcmake_host::FileTime>, mtime: Option<rcmake_host::FileTime>) -> HostResult<()>);
+    rcmake_host::forward_host!(@ inner, open_read);
+    rcmake_host::forward_host!(@ inner, scratch_file);
+    rcmake_host::forward_host!(@ inner, scratch_file_in);
+    rcmake_host::forward_host!(@method inner, write_from(path: &Path, mode: rcmake_host::WriteMode, input: &mut dyn std::io::Read, len: u64) -> HostResult<()>);
+
+    fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
+        if p == self.watched {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.read(p, range)
+    }
+}
+
+#[test]
+fn prelude_snapshot_reuses_and_invalidates_on_compiler_file_change() -> TestResult {
+    let root = Path::new("/work/prelude-test");
+    let build = Path::new("/work/prelude-build");
+    let platform = build.join("CMakeFiles/4.5.1");
+    let executable = root.join("bin/rcmake");
+    let inner = Arc::new(PureHost::new(root.into(), executable.clone()));
+    inner.seed_file(&executable, b"fixture")?;
+    inner.seed_file(Path::new("/usr/bin/cc"), b"fixture")?;
+    let modules = root.join("cmake/Modules");
+    let c_info = modules.join("CMakeCInformation.cmake");
+    let opt_hook = modules.join("OptionalPreludeHook.cmake");
+    inner.seed_file(
+        &modules.join("CMakeDetermineSystem.cmake"),
+        b"set(CMAKE_SYSTEM \"Darwin-24\")\n",
+    )?;
+    inner.seed_file(
+        &modules.join("CMakeSystemSpecificInitialize.cmake"),
+        b"set(CMAKE_SYSTEM_SPECIFIC_INITIALIZE_LOADED 1)\n",
+    )?;
+    inner.seed_file(
+        &modules.join("CMakeSystemSpecificInformation.cmake"),
+        b"set(CMAKE_SYSTEM_SPECIFIC_INFORMATION_LOADED 1)\n",
+    )?;
+    inner.seed_file(
+        &c_info,
+        b"set(OPT_TAG \"none\")\n\
+          include(OptionalPreludeHook OPTIONAL)\n\
+          set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> -DMARKER=${PRELUDE_MARKER} -DINFO=info1 -DOPT=${OPT_TAG} -o <OBJECT> -c <SOURCE>\")\n\
+          set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> -o <TARGET> <OBJECTS>\")\n\
+          set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\n\
+          set(CMAKE_C_INFORMATION_LOADED 1)\n",
+    )?;
+    let platform_str = path::from_native_cmake(&platform);
+    let c_info_str = path::from_native_cmake(&c_info);
+    let opt_hook_str = path::from_native_cmake(&opt_hook);
+    let script = format!(
+        "\
+cmake_minimum_required(VERSION 4.5)
+project(Prelude NONE)
+set(CMAKE_PLATFORM_INFO_DIR \"{platform_str}\")
+file(WRITE \"{platform_str}/CMakeSystem.cmake\" \"set(CMAKE_SYSTEM \\\"Darwin-24\\\")\\nset(CMAKE_SYSTEM_NAME \\\"Darwin\\\")\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")
+file(WRITE \"{platform_str}/CMakeCCompiler.cmake\" \"set(CMAKE_C_COMPILER \\\"/usr/bin/cc\\\")\\nset(CMAKE_C_COMPILER_ID \\\"AppleClang\\\")\\nset(CMAKE_C_COMPILER_LOADED 1)\\nset(PRELUDE_MARKER \\\"v1\\\")\\n\")
+set(CMAKE_C_COMPILER /usr/bin/cc)
+set(CMAKE_C_COMPILER_ID AppleClang)
+set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)
+try_compile(P1 SOURCE_FROM_CONTENT p1.c [[int main(void) {{ return 0; }}]] NO_CACHE NO_LOG)
+try_compile(P2 SOURCE_FROM_CONTENT p2.c [[int main(void) {{ return 1; }}]] NO_CACHE NO_LOG)
+file(WRITE \"{platform_str}/CMakeCCompiler.cmake\" \"set(CMAKE_C_COMPILER \\\"/usr/bin/cc\\\")\\nset(CMAKE_C_COMPILER_ID \\\"AppleClang\\\")\\nset(CMAKE_C_COMPILER_LOADED 1)\\nset(PRELUDE_MARKER \\\"v2-updated\\\")\\n\")
+try_compile(P3 SOURCE_FROM_CONTENT p3.c [[int main(void) {{ return 2; }}]] NO_CACHE NO_LOG)
+file(WRITE \"{c_info_str}\" \"set(OPT_TAG \\\"none\\\")\\ninclude(OptionalPreludeHook OPTIONAL)\\nset(CMAKE_C_COMPILE_OBJECT \\\"<CMAKE_C_COMPILER> -DMARKER=\\${{PRELUDE_MARKER}} -DINFO=info2 -DOPT=\\${{OPT_TAG}} -o <OBJECT> -c <SOURCE>\\\")\\nset(CMAKE_C_LINK_EXECUTABLE \\\"<CMAKE_C_COMPILER> -o <TARGET> <OBJECTS>\\\")\\nset(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\\nset(CMAKE_C_INFORMATION_LOADED 1)\\n\")
+try_compile(P4 SOURCE_FROM_CONTENT p4.c [[int main(void) {{ return 3; }}]] NO_CACHE NO_LOG)
+try_compile(P5 SOURCE_FROM_CONTENT p5.c [[int main(void) {{ return 4; }}]] NO_CACHE NO_LOG)
+file(WRITE \"{opt_hook_str}\" \"set(OPT_TAG \\\"hooked\\\")\\n\")
+try_compile(P6 SOURCE_FROM_CONTENT p6.c [[int main(void) {{ return 5; }}]] NO_CACHE NO_LOG)
+"
+    );
+    inner.seed_file(&root.join("CMakeLists.txt"), script.as_bytes())?;
+
+    let seen_flags = Arc::new(std::sync::Mutex::new(Vec::<BString>::new()));
+    let flags_clone = Arc::clone(&seen_flags);
+    inner.set_command_handler(move |host, request, _| {
+        let command = request
+            .pipeline
+            .first()
+            .ok_or_else(|| HostError::unsupported("Expected a process."))?;
+        let mut marker = None;
+        let mut info = None;
+        let mut opt = None;
+        for arg in &command.args {
+            if let Some(v) = arg.strip_prefix(b"-DMARKER=") {
+                marker = Some(v);
+            } else if let Some(v) = arg.strip_prefix(b"-DINFO=") {
+                info = Some(v);
+            } else if let Some(v) = arg.strip_prefix(b"-DOPT=") {
+                opt = Some(v);
+            }
+        }
+        if let (Some(m), Some(i), Some(o)) = (marker, info, opt)
+            && let Ok(mut guard) = flags_clone.lock()
+        {
+            guard.push(
+                format!(
+                    "{}/{}/{}",
+                    String::from_utf8_lossy(m),
+                    String::from_utf8_lossy(i),
+                    String::from_utf8_lossy(o)
+                )
+                .into(),
+            );
+        }
+        if let Some(out) = command.args.windows(2).find_map(|pair| match pair {
+            [k, v] if k == "-o" => Some(request.cwd.join(path::to_native(v))),
+            _ => None,
+        }) {
+            host.seed_file(&out, b"obj")?;
+        }
+        Ok(success(Vec::new()))
+    })?;
+
+    let system = rcmake_host::SystemInfo {
+        sysname: "Darwin".into(),
+        ..inner.system()
+    };
+    let c_info_reads = Arc::new(AtomicUsize::new(0));
+    let base_host = CapturingHost::for_test(inner.clone(), root, system);
+    let host: Arc<dyn Host> = Arc::new(ReadCountingHost {
+        inner: base_host,
+        watched: c_info,
+        reads: Arc::clone(&c_info_reads),
+    });
+    let mut services = Services::default();
+    services.speed.probe_cache = ProbeCacheMode::Off;
+    services.speed.probe_jobs = NonZeroUsize::new(1);
+    let mut runtime = ConfigureRuntime::new(host, root, build, &services, true);
+    let mut interp = interpreter(runtime.host(), root)?;
+    let outcome = runtime.run(&mut interp, &[]);
+    runtime.finish(outcome.exit_code == 0);
+    assert_eq!(outcome.exit_code, 0);
+    for var in [b"P1".as_slice(), b"P2", b"P3", b"P4", b"P5", b"P6"] {
+        assert_eq!(interp.cx().var_or_empty(var), "TRUE");
+    }
+    let flags = seen_flags
+        .lock()
+        .map_err(|_| HostError::unsupported("lock poisoned"))?;
+    assert_eq!(
+        flags.as_slice(),
+        &[
+            BString::from("v1/info1/none"),
+            BString::from("v1/info1/none"),
+            BString::from("v2-updated/info1/none"),
+            BString::from("v2-updated/info2/none"),
+            BString::from("v2-updated/info2/none"),
+            BString::from("v2-updated/info2/hooked"),
+        ],
+        "prelude must reuse on P2 & P5 and invalidate on CMakeCCompiler, CMakeCInformation, and newly appearing optional module edits"
+    );
+    assert_eq!(
+        c_info_reads.load(Ordering::Relaxed),
+        4,
+        "CMakeCInformation.cmake should be evaluated for P1, P3, P4, and P6 (skipping P2 and P5 prelude hits)"
+    );
+    Ok(())
+}
+
+#[test]
+fn prelude_snapshot_rejects_silent_external_writes_and_unadmitted_processes() -> TestResult {
+    for (case, side_effect_stmt) in [
+        (
+            "external_file_write",
+            "file(APPEND \"/work/prelude-side-build/info-runs.txt\" \"x\")",
+        ),
+        (
+            "unadmitted_process",
+            "execute_process(COMMAND /usr/bin/custom_hook OUTPUT_QUIET)",
+        ),
+    ] {
+        let root = Path::new("/work/prelude-side-test");
+        let build = Path::new("/work/prelude-side-build");
+        let platform = build.join("CMakeFiles/4.5.1");
+        let info_log = build.join("info-runs.txt");
+        let executable = root.join("bin/rcmake");
+        let inner = Arc::new(PureHost::new(root.into(), executable.clone()));
+        inner.seed_file(&executable, b"fixture")?;
+        inner.seed_file(Path::new("/usr/bin/cc"), b"fixture")?;
+        inner.seed_file(Path::new("/usr/bin/custom_hook"), b"hook")?;
+        inner.set_permissions(Path::new("/usr/bin/custom_hook"), 0o755)?;
+        let modules = root.join("cmake/Modules");
+        inner.seed_file(
+            &modules.join("CMakeDetermineSystem.cmake"),
+            b"set(CMAKE_SYSTEM \"Darwin-24\")\n",
+        )?;
+        inner.seed_file(
+            &modules.join("CMakeSystemSpecificInitialize.cmake"),
+            b"set(CMAKE_SYSTEM_SPECIFIC_INITIALIZE_LOADED 1)\n",
+        )?;
+        inner.seed_file(
+            &modules.join("CMakeSystemSpecificInformation.cmake"),
+            b"set(CMAKE_SYSTEM_SPECIFIC_INFORMATION_LOADED 1)\n",
+        )?;
+        inner.seed_file(
+            &modules.join("CMakeCInformation.cmake"),
+            format!(
+                "{side_effect_stmt}\n\
+                 set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> -o <OBJECT> -c <SOURCE>\")\n\
+                 set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> -o <TARGET> <OBJECTS>\")\n\
+                 set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\n\
+                 set(CMAKE_C_INFORMATION_LOADED 1)\n",
+            )
+            .as_bytes(),
+        )?;
+        let platform_str = path::from_native_cmake(&platform);
+        let script = format!(
+            "\
+cmake_minimum_required(VERSION 4.5)
+project(PreludeSide NONE)
+set(CMAKE_PLATFORM_INFO_DIR \"{platform_str}\")
+file(WRITE \"{platform_str}/CMakeSystem.cmake\" \"set(CMAKE_SYSTEM \\\"Darwin-24\\\")\\nset(CMAKE_SYSTEM_NAME \\\"Darwin\\\")\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")
+file(WRITE \"{platform_str}/CMakeCCompiler.cmake\" \"set(CMAKE_C_COMPILER \\\"/usr/bin/cc\\\")\\nset(CMAKE_C_COMPILER_ID \\\"AppleClang\\\")\\nset(CMAKE_C_COMPILER_LOADED 1)\\n\")
+set(CMAKE_C_COMPILER /usr/bin/cc)
+set(CMAKE_C_COMPILER_ID AppleClang)
+set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)
+try_compile(P1 SOURCE_FROM_CONTENT p1.c [[int main(void) {{ return 0; }}]] NO_CACHE NO_LOG)
+try_compile(P2 SOURCE_FROM_CONTENT p2.c [[int main(void) {{ return 1; }}]] NO_CACHE NO_LOG)
+try_compile(P3 SOURCE_FROM_CONTENT p3.c [[int main(void) {{ return 2; }}]] NO_CACHE NO_LOG)
+"
+        );
+        inner.seed_file(&root.join("CMakeLists.txt"), script.as_bytes())?;
+
+        let hook_runs = Arc::new(AtomicUsize::new(0));
+        let hook_runs_clone = Arc::clone(&hook_runs);
+        inner.set_command_handler(move |host, request, _| {
+            let command = request
+                .pipeline
+                .first()
+                .ok_or_else(|| HostError::unsupported("Expected a process."))?;
+            if command.program == "/usr/bin/custom_hook" {
+                hook_runs_clone.fetch_add(1, Ordering::Relaxed);
+                return Ok(success(Vec::new()));
+            }
+            if let Some(out) = command.args.windows(2).find_map(|pair| match pair {
+                [k, v] if k == "-o" => Some(request.cwd.join(path::to_native(v))),
+                _ => None,
+            }) {
+                host.seed_file(&out, b"obj")?;
+            }
+            Ok(success(Vec::new()))
+        })?;
+
+        let system = rcmake_host::SystemInfo {
+            sysname: "Darwin".into(),
+            ..inner.system()
+        };
+        let host = CapturingHost::for_test(inner.clone(), root, system);
+        let mut services = Services::default();
+        services.speed.probe_cache = ProbeCacheMode::Off;
+        services.speed.probe_jobs = NonZeroUsize::new(1);
+        let mut runtime = ConfigureRuntime::new(host, root, build, &services, true);
+        let mut interp = interpreter(runtime.host(), root)?;
+        let outcome = runtime.run(&mut interp, &[]);
+        runtime.finish(outcome.exit_code == 0);
+        assert_eq!(outcome.exit_code, 0, "case={case}");
+        for var in [b"P1".as_slice(), b"P2", b"P3"] {
+            assert_eq!(interp.cx().var_or_empty(var), "TRUE", "case={case}");
+        }
+        if case == "external_file_write" {
+            let info_runs = inner.read(&info_log, ReadRange::All { limit: 1024 })?;
+            assert_eq!(
+                info_runs.as_slice(),
+                b"xxx",
+                "CMakeCInformation.cmake with external file writes must never be cached (must run 3/3 times)"
+            );
+        } else {
+            assert_eq!(
+                hook_runs.load(Ordering::Relaxed),
+                3,
+                "CMakeCInformation.cmake running an unadmitted process must never be cached (must run 3/3 times)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Compile lines and `CMakeCInformation.cmake` reads of one prelude fixture run.
+struct PreludeRun {
+    compiles: Vec<Vec<BString>>,
+    info_reads: usize,
+}
+
+/// Configure a project that runs `probes` with `c_info` as `CMakeCInformation.cmake`.
+fn run_prelude_fixture(
+    name: &str,
+    c_info: &str,
+    probes: &str,
+    seed: impl FnOnce(&PureHost) -> HostResult<()>,
+) -> TestResult<PreludeRun> {
+    let root = Path::new("/work").join(format!("{name}-test"));
+    let build = Path::new("/work").join(format!("{name}-build"));
+    let platform = build.join("CMakeFiles/4.5.1");
+    let executable = root.join("bin/rcmake");
+    let inner = Arc::new(PureHost::new(root.clone(), executable.clone()));
+    inner.seed_file(&executable, b"fixture")?;
+    inner.seed_file(Path::new("/usr/bin/cc"), b"fixture")?;
+    seed(&inner)?;
+    let modules = root.join("cmake/Modules");
+    let info_path = modules.join("CMakeCInformation.cmake");
+    inner.seed_file(
+        &modules.join("CMakeDetermineSystem.cmake"),
+        b"set(CMAKE_SYSTEM \"Darwin-24\")\n",
+    )?;
+    inner.seed_file(
+        &modules.join("CMakeSystemSpecificInitialize.cmake"),
+        b"set(CMAKE_SYSTEM_SPECIFIC_INITIALIZE_LOADED 1)\n",
+    )?;
+    inner.seed_file(
+        &modules.join("CMakeSystemSpecificInformation.cmake"),
+        b"set(CMAKE_SYSTEM_SPECIFIC_INFORMATION_LOADED 1)\n",
+    )?;
+    inner.seed_file(
+        &info_path,
+        format!(
+            "{c_info}\n\
+             set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> -o <TARGET> <OBJECTS>\")\n\
+             set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\n\
+             set(CMAKE_C_INFORMATION_LOADED 1)\n",
+        )
+        .as_bytes(),
+    )?;
+    let platform_str = path::from_native_cmake(&platform);
+    let script = format!(
+        "\
+cmake_minimum_required(VERSION 4.5)
+project(PreludeFixture NONE)
+set(CMAKE_PLATFORM_INFO_DIR \"{platform_str}\")
+file(WRITE \"{platform_str}/CMakeSystem.cmake\" \"set(CMAKE_SYSTEM \\\"Darwin-24\\\")\\nset(CMAKE_SYSTEM_NAME \\\"Darwin\\\")\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")
+file(WRITE \"{platform_str}/CMakeCCompiler.cmake\" \"set(CMAKE_C_COMPILER \\\"/usr/bin/cc\\\")\\nset(CMAKE_C_COMPILER_ID \\\"AppleClang\\\")\\nset(CMAKE_C_COMPILER_LOADED 1)\\n\")
+set(CMAKE_C_COMPILER /usr/bin/cc)
+set(CMAKE_C_COMPILER_ID AppleClang)
+set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)
+{probes}
+"
+    );
+    inner.seed_file(&root.join("CMakeLists.txt"), script.as_bytes())?;
+
+    let compiles = Arc::new(std::sync::Mutex::new(Vec::<Vec<BString>>::new()));
+    let seen = Arc::clone(&compiles);
+    inner.set_command_handler(move |host, request, _| {
+        let command = request
+            .pipeline
+            .first()
+            .ok_or_else(|| HostError::unsupported("Expected a process."))?;
+        if command.args.iter().any(|arg| arg == "-c")
+            && let Ok(mut guard) = seen.lock()
+        {
+            guard.push(command.args.clone());
+        }
+        if let Some(out) = command.args.windows(2).find_map(|pair| match pair {
+            [k, v] if k == "-o" => Some(request.cwd.join(path::to_native(v))),
+            _ => None,
+        }) {
+            host.seed_file(&out, b"obj")?;
+        }
+        Ok(success(Vec::new()))
+    })?;
+
+    let system = rcmake_host::SystemInfo {
+        sysname: "Darwin".into(),
+        ..inner.system()
+    };
+    let info_reads = Arc::new(AtomicUsize::new(0));
+    let host: Arc<dyn Host> = Arc::new(ReadCountingHost {
+        inner: CapturingHost::for_test(inner.clone(), &root, system),
+        watched: info_path,
+        reads: Arc::clone(&info_reads),
+    });
+    let mut services = Services::default();
+    services.speed.probe_cache = ProbeCacheMode::Off;
+    services.speed.probe_jobs = NonZeroUsize::new(1);
+    let mut runtime = ConfigureRuntime::new(host, &root, &build, &services, true);
+    let mut interp = interpreter(runtime.host(), &root)?;
+    let outcome = runtime.run(&mut interp, &[]);
+    runtime.finish(outcome.exit_code == 0);
+    assert_eq!(outcome.exit_code, 0, "fixture {name}");
+    let compiles = compiles
+        .lock()
+        .map_err(|_| HostError::unsupported("lock poisoned"))?
+        .clone();
+    Ok(PreludeRun {
+        compiles,
+        info_reads: info_reads.load(Ordering::Relaxed),
+    })
+}
+
+#[test]
+fn prelude_snapshot_refuses_root_directory_state_it_cannot_restore() -> TestResult {
+    let probes = "\
+try_compile(P1 SOURCE_FROM_CONTENT p1.c [[int main(void) { return 0; }]] NO_CACHE NO_LOG)
+try_compile(P2 SOURCE_FROM_CONTENT p2.c [[int main(void) { return 1; }]] NO_CACHE NO_LOG)
+try_compile(P3 SOURCE_FROM_CONTENT p3.c [[int main(void) { return 2; }]] NO_CACHE NO_LOG)";
+    let run = run_prelude_fixture(
+        "prelude-root-defs",
+        "add_definitions(-DROOTDEF=1 -fROOTFLAG)\n\
+         set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> <DEFINES> <FLAGS> -o <OBJECT> -c <SOURCE>\")",
+        probes,
+        |_| Ok(()),
+    )?;
+    assert_eq!(run.compiles.len(), 3);
+    for (index, args) in run.compiles.iter().enumerate() {
+        for expected in ["-DROOTDEF=1", "-fROOTFLAG"] {
+            assert!(
+                args.iter().any(|arg| arg == expected),
+                "probe {index} lost {expected}: {args:?}"
+            );
+        }
+    }
+    assert_eq!(
+        run.info_reads, 3,
+        "root add_definitions() in CMakeCInformation.cmake must never be cached"
+    );
+    Ok(())
+}
+
+#[test]
+fn prelude_snapshot_invalidates_on_mode_change() -> TestResult {
+    let tool = Path::new("/work/prelude-mode-tool");
+    let tool_str = path::from_native_cmake(tool);
+    let probes = format!(
+        "\
+try_compile(P1 SOURCE_FROM_CONTENT p1.c [[int main(void) {{ return 0; }}]] NO_CACHE NO_LOG)
+try_compile(P2 SOURCE_FROM_CONTENT p2.c [[int main(void) {{ return 1; }}]] NO_CACHE NO_LOG)
+file(CHMOD \"{tool_str}\" PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
+try_compile(P3 SOURCE_FROM_CONTENT p3.c [[int main(void) {{ return 2; }}]] NO_CACHE NO_LOG)"
+    );
+    let c_info = format!(
+        "if(IS_EXECUTABLE \"{tool_str}\")\n\
+         set(TOOL_TAG exec)\n\
+         else()\n\
+         set(TOOL_TAG plain)\n\
+         endif()\n\
+         set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> -DTOOL=${{TOOL_TAG}} -o <OBJECT> -c <SOURCE>\")"
+    );
+    let run = run_prelude_fixture("prelude-mode", &c_info, &probes, |host| {
+        host.seed_file(tool, b"tool")?;
+        host.set_permissions(tool, 0o644)
+    })?;
+    let tags: Vec<&BString> = run
+        .compiles
+        .iter()
+        .filter_map(|args| args.iter().find(|arg| arg.starts_with(b"-DTOOL=")))
+        .collect();
+    assert_eq!(
+        tags,
+        ["-DTOOL=plain", "-DTOOL=plain", "-DTOOL=exec"]
+            .map(BString::from)
+            .iter()
+            .collect::<Vec<_>>(),
+        "a +x mode change must invalidate the prelude snapshot"
+    );
+    assert_eq!(
+        run.info_reads, 2,
+        "P2 must reuse the snapshot and P3 must evaluate CMakeCInformation.cmake again"
+    );
+    Ok(())
+}
+
+#[test]
+fn project_signature_try_compile_skips_prewarming_before_project() -> TestResult {
+    use rcmake_model::GeneratorKind;
+
+    let root = Path::new("/work/proj-prewarm-test");
+    let build = Path::new("/work/proj-prewarm-build");
+    let sub_src = root.join("sub");
+    let executable = root.join("bin/rcmake");
+    let inner = Arc::new(PureHost::new(root.into(), executable.clone()));
+    inner.seed_file(&executable, b"fixture")?;
+    inner.seed_file(Path::new("/bin/ninja"), b"\x7fELF-ninja-v1")?;
+    inner.set_permissions(Path::new("/bin/ninja"), 0o755)?;
+    let modules = root.join("cmake/Modules");
+    inner.seed_file(
+        &modules.join("CMakeDetermineSystem.cmake"),
+        b"set(CMAKE_SYSTEM \"Darwin-24\")\n",
+    )?;
+    inner.seed_file(
+        &modules.join("CMakeSystemSpecificInitialize.cmake"),
+        b"set(CMAKE_SYSTEM_SPECIFIC_INITIALIZE_LOADED 1)\n",
+    )?;
+    inner.seed_file(
+        &modules.join("CMakeSystemSpecificInformation.cmake"),
+        b"set(CMAKE_SYSTEM_SPECIFIC_INFORMATION_LOADED 1)\n",
+    )?;
+    inner.seed_file(
+        &sub_src.join("CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nmessage(FATAL_ERROR \"abort before project()\")\nproject(SubProj NONE)\n",
+    )?;
+    let sub_bin = build.join("sub-bin");
+    let script = format!(
+        "\
+cmake_minimum_required(VERSION 4.5)
+set(CMAKE_MAKE_PROGRAM /bin/ninja CACHE FILEPATH \"\")
+project(Outer NONE)
+try_compile(RES PROJECT SubProj SOURCE_DIR \"{}\" BINARY_DIR \"{}\")
+",
+        path::from_native_cmake(&sub_src),
+        path::from_native_cmake(&sub_bin),
+    );
+    inner.seed_file(&root.join("CMakeLists.txt"), script.as_bytes())?;
+
+    let ninja_runs = Arc::new(AtomicUsize::new(0));
+    let ninja_clone = Arc::clone(&ninja_runs);
+    inner.set_command_handler(move |_, request, _| {
+        let command = request
+            .pipeline
+            .first()
+            .ok_or_else(|| HostError::unsupported("Expected a process."))?;
+        if command.program == "/bin/ninja" {
+            ninja_clone.fetch_add(1, Ordering::Relaxed);
+            return Ok(success(b"1.12.1\n".to_vec()));
+        }
+        Err(HostError::unsupported(format!(
+            "Unexpected process: {}",
+            command.program
+        )))
+    })?;
+
+    let mut services = Services::default();
+    services.speed.probe_cache = ProbeCacheMode::Off;
+    services.speed.probe_jobs = NonZeroUsize::new(1);
+    let mut runtime = ConfigureRuntime::new(inner.clone(), root, build, &services, true);
+    let mut interp = interpreter(runtime.host(), root)?;
+    interp.cx().project().generator = Some(GeneratorKind::Ninja);
+    let outcome = runtime.run(&mut interp, &[]);
+    runtime.finish(outcome.exit_code == 0);
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(
+        ninja_runs.load(Ordering::Relaxed),
+        0,
+        "project-signature try_compile failing before project() must not prewarm ninja"
+    );
+    Ok(())
+}
+
+#[test]
+fn direct_try_compile_never_replays_speculative_failure_on_path_mismatch() -> TestResult {
+    // Probe 2 simulates a path-dependent check (such as `_Static_assert(sizeof(__FILE__) < 128)`)
+    // that fails inside the speculative scratch dir (`Spec-*`) but succeeds in the foreground
+    // build scratch dir (`TryCompile-*`). Direct `try_compile` must NOT replay speculative
+    // failures, so `-j4` matches `-j1` (`TRUE`).
+    let script = "\
+try_compile(P1 SOURCE_FROM_CONTENT p1.c [[int main(void) { return 0; }]] NO_CACHE NO_LOG)
+try_compile(P2 SOURCE_FROM_CONTENT p2.c [[int main(void) { return 0; } /* path-sensitive */]] NO_CACHE NO_LOG)
+";
+    let make_fixture = || -> HostResult<Fixture> {
+        let fixture = Fixture::new(script)?;
+        let count = Arc::clone(&fixture.runs);
+        let worker_count = Arc::clone(&fixture.speculative);
+        fixture.inner.set_command_handler(move |host, request, _| {
+            let command = request
+                .pipeline
+                .first()
+                .ok_or_else(|| HostError::unsupported("Expected a process."))?;
+            if command.program == "/usr/bin/xcrun" {
+                let tool = command
+                    .args
+                    .last()
+                    .ok_or_else(|| HostError::unsupported("Expected a tool name."))?;
+                return Ok(success(format!("{TOOLCHAIN}/{tool}\n").into_bytes()));
+            }
+            if command.args.iter().any(|arg| arg == "-E")
+                && command.args.iter().any(|arg| arg == "-v")
+            {
+                let mut output = success(Vec::new());
+                output.stderr = format!(
+                    "#include <...> search starts here:\n {SDK}/usr/include\nEnd of search list.\n"
+                )
+                .into_bytes();
+                return Ok(output);
+            }
+            if command.program == format!("{TOOLCHAIN}/clang").as_str() {
+                let data = match command.args.as_slice() {
+                    [flag] if flag == "-print-resource-dir" => {
+                        b"/fixture/clang/resource\n".to_vec()
+                    }
+                    [flag] if flag == "-print-target-triple" => b"arm64-apple-darwin\n".to_vec(),
+                    [flag] if flag == "-v" => Vec::new(),
+                    _ => return Err(HostError::unsupported("Unexpected compiler query.")),
+                };
+                return Ok(success(data));
+            }
+            if command.program != "/usr/bin/cc" {
+                return Err(HostError::unsupported("Unexpected process."));
+            }
+            count.fetch_add(1, Ordering::Relaxed);
+            let is_worker = std::thread::current().name() == Some("rcmake-probe");
+            if is_worker {
+                worker_count.fetch_add(1, Ordering::Relaxed);
+            } else if command.args.iter().any(|arg| arg.ends_with(b"p1.c")) {
+                // Give the speculative worker time to run P2 before foreground reaches P2.
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if is_worker
+                && command.args.iter().any(|arg| arg.ends_with(b"p2.c"))
+                && request.cwd.to_string_lossy().contains("Spec-")
+            {
+                return Ok(RunOutput {
+                    stdout: Vec::new(),
+                    stderr: b"error: static_assert failed: __FILE__ too long\n".to_vec(),
+                    results: vec![ProcessResult::Exited(1)],
+                });
+            }
+            let argument = |flag: &[u8]| {
+                command.args.windows(2).find_map(|pair| match pair {
+                    [key, value] if key.as_slice() == flag => {
+                        Some(request.cwd.join(path::to_native(value)))
+                    }
+                    _ => None,
+                })
+            };
+            let out = argument(b"-o")
+                .ok_or_else(|| HostError::unsupported("Expected a compiler output."))?;
+            host.seed_file(&out, b"test binary")?;
+            if let Some(deps) = argument(b"-MF") {
+                let source = command
+                    .args
+                    .iter()
+                    .find(|arg| arg.ends_with(b".c"))
+                    .ok_or_else(|| HostError::unsupported("Expected a source file."))?;
+                host.seed_file(&deps, format!("out.o: {source}\n").as_bytes())?;
+            }
+            if command.args.iter().any(|arg| arg == "-dependency_info") {
+                let deps = command
+                    .args
+                    .last()
+                    .ok_or_else(|| HostError::unsupported("Expected linker evidence."))?;
+                let bytes = format!("\0fixture\0\u{10}{SDK}/usr/lib/libSystem.tbd\0");
+                host.seed_file(&request.cwd.join(path::to_native(deps)), bytes.as_bytes())?;
+            }
+            Ok(success(b"compiler output\n".to_vec()))
+        })?;
+        Ok(fixture)
+    };
+    let names = [b"P1".as_slice(), b"P2"];
+    let serial = make_fixture()?;
+    let expected = serial.configure(ProbeCacheMode::ReadWrite, 1, &names)?;
+    assert_eq!(expected, vec![BString::from("TRUE"), BString::from("TRUE")]);
+
+    for mode in [ProbeCacheMode::ReadWrite, ProbeCacheMode::Off] {
+        let parallel = make_fixture()?;
+        assert_eq!(
+            parallel.configure(mode, 4, &names)?,
+            expected,
+            "direct try_compile in mode {mode:?} must fall back to foreground instead of replaying a speculative failure"
+        );
+        assert!(
+            parallel.speculative.load(Ordering::Relaxed) >= 1,
+            "expected speculative worker to attempt P2 in mode {mode:?}"
         );
     }
     Ok(())

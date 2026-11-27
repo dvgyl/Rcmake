@@ -108,6 +108,7 @@ impl UsageResolver<'_> {
         self.language_dependencies(&direct, &mut dependencies);
 
         let mut visited = HashSet::new();
+        let mut propagates_cache = std::collections::HashMap::<BString, bool>::new();
         let mut index = 0;
         while let Some(&(dependency, contribution)) = dependencies.get(index) {
             index += 1;
@@ -134,17 +135,19 @@ impl UsageResolver<'_> {
                 languages.extend(inherited.iter().cloned());
                 preferred.extend(inherited.into_iter().filter(|language| {
                     contribution == Contribution::DirectObject
-                        || lower::definition(
-                            self.model,
-                            target.dir,
-                            &[
-                                b"CMAKE_",
-                                language.as_slice(),
-                                b"_LINKER_PREFERENCE_PROPAGATES",
-                            ]
-                            .concat(),
-                        )
-                        .map_or(language == "CXX", |value| truth::is_on(value))
+                        || *propagates_cache.entry(language.clone()).or_insert_with(|| {
+                            lower::definition(
+                                self.model,
+                                target.dir,
+                                &[
+                                    b"CMAKE_",
+                                    language.as_slice(),
+                                    b"_LINKER_PREFERENCE_PROPAGATES",
+                                ]
+                                .concat(),
+                            )
+                            .map_or(language == "CXX", |value| truth::is_on(value))
+                        })
                 }));
             }
             if object_dependencies

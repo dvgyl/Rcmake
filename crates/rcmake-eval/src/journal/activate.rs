@@ -473,26 +473,36 @@ impl Interp {
             return self.run_code(code, 0, code.len(), BodyMode::File);
         };
 
-        let result = if let Some((record, state, checked)) = self.find_candidate(&session, &plan)
+        // Restored backtraces keep the live nodes of the entry call stack, so that
+        // replayed and live values on one caller share the File API backtrace nodes.
+        let entry = super::region::EntryScope::enter(&self.bt);
+        let hit = if let Some((record, state, checked)) = self.find_candidate(&session, &plan)
             && state.restore(self, &plan.writes)
         {
-            checked
-                .replay_into(&mut self.cx())
-                .map_err(|error| crate::CmdError::status(error.to_string()))
-                .map(|()| (record.clone(), state.clone()))
-                .map(|(record, mut model)| {
-                    self.replay.hits += 1;
-                    self.replay.replayed_listfiles.insert(plan.source);
-                    if let Some((index, digest)) = model.variable_inputs {
-                        if let Some(index) = session.retain_variable_inputs(index) {
-                            model.variable_inputs = Some((index, digest));
-                            session.keep(record, model);
-                        }
-                    } else {
+            Some(
+                checked
+                    .replay_into(&mut self.cx())
+                    .map_err(|error| crate::CmdError::status(error.to_string()))
+                    .map(|()| (record.clone(), state.clone())),
+            )
+        } else {
+            None
+        };
+        drop(entry);
+        let result = if let Some(hit) = hit {
+            hit.map(|(record, mut model)| {
+                self.replay.hits += 1;
+                self.replay.replayed_listfiles.insert(plan.source);
+                if let Some((index, digest)) = model.variable_inputs {
+                    if let Some(index) = session.retain_variable_inputs(index) {
+                        model.variable_inputs = Some((index, digest));
                         session.keep(record, model);
                     }
-                    Flow::Normal
-                })
+                } else {
+                    session.keep(record, model);
+                }
+                Flow::Normal
+            })
         } else {
             self.record_region(code, &mut session, plan)
         };

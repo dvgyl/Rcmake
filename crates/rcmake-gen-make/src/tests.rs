@@ -288,3 +288,48 @@ fn subdirectory_makefile_builds_only_the_directory_and_included_children()
     }
     Ok(())
 }
+
+#[test]
+fn link_event_byproducts_are_cleaned_without_forcing_relink_outputs()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_resolve::{LinkKind, LinkStep};
+
+    let root = Path::new("/build");
+    let host = PureHost::new(root.into(), "/tools/rcmake".into());
+    let link_event_byproducts = [(BString::from("app"), vec![BString::from("post.stamp")])]
+        .into_iter()
+        .collect();
+    let result = GenerationResult {
+        graphs: vec![BuildGraph {
+            steps: vec![BuildStep::Link {
+                inputs: vec!["CMakeFiles/app.dir/main.c.o".into()],
+                implicit_inputs: Vec::new(),
+                step: LinkStep {
+                    kind: LinkKind::Executable,
+                    language: "C".into(),
+                    fragments: Vec::new(),
+                    output: "app".into(),
+                },
+                invocations: vec![
+                    invocation("cc -o app CMakeFiles/app.dir/main.c.o"),
+                    invocation("cmake -E touch post.stamp"),
+                ],
+            }],
+            targets: vec![graph_target("app", vec![0], Vec::new(), true)],
+            link_event_byproducts,
+            ..BuildGraph::default()
+        }],
+        ..GenerationResult::default()
+    };
+    generate_unix_makefiles(&result, &host, root)?;
+    let build = read(&host, &root.join("CMakeFiles/app.dir/build.make"));
+    assert!(
+        build.contains("rm -f -- 'post.stamp'") && build.contains("rm -f -- 'app'"),
+        "post-build byproducts must be emitted in the target clean rule:\n{build}"
+    );
+    assert!(
+        !build.contains("ifeq ($(wildcard post.stamp),)") && !build.contains("post.stamp: app"),
+        "post-build byproducts must not become link step outputs that trigger relinks:\n{build}"
+    );
+    Ok(())
+}

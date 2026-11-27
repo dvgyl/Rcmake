@@ -135,7 +135,9 @@ pub(crate) struct Graph<'a> {
     compile_prerequisites: Vec<Vec<order::Prerequisite>>,
     target_meta: Vec<TargetMeta>,
     artifact_to_target: HashMap<BString, usize>,
+    imported_shared_artifacts: HashSet<BString>,
     step_owner: HashMap<usize, usize>,
+    step_command_dir: HashMap<usize, DirId>,
     exe_symlinks: BTreeMap<usize, ExecutableSymlink>,
     root_all_inputs: Option<Vec<BString>>,
 }
@@ -143,6 +145,7 @@ pub(crate) struct Graph<'a> {
 #[derive(Clone)]
 pub(super) struct TargetMeta {
     pub(super) kind: TargetKind,
+    pub(super) dir: Option<DirId>,
     pub(super) dir_rel: BString,
     pub(super) artifact_outputs: Vec<BString>,
     pub(super) order_depends_target: Option<BString>,
@@ -150,6 +153,7 @@ pub(super) struct TargetMeta {
     pub(super) order_depends_inputs: Vec<BString>,
     pub(super) order_depends_private_inputs: Vec<BString>,
     pub(super) is_non_framework_shared: bool,
+    pub(super) link_depends_no_shared: bool,
     pub(super) linker_path: Option<BString>,
 }
 
@@ -247,10 +251,35 @@ impl<'a> Graph<'a> {
             compile_prerequisites: Vec::new(),
             target_meta: Vec::with_capacity(input.targets.len()),
             artifact_to_target: HashMap::new(),
+            imported_shared_artifacts: HashSet::new(),
             step_owner: HashMap::new(),
+            step_command_dir: HashMap::new(),
             exe_symlinks: BTreeMap::new(),
             root_all_inputs: None,
         };
+        if let Some(model) = model {
+            for (&step_index, owners) in &input.custom_output_owners {
+                if let Some(command) = model.command(owners.command) {
+                    graph.step_command_dir.insert(step_index, command.dir);
+                }
+            }
+            for (_, raw) in model.targets() {
+                if raw.is_imported() && raw.kind == TargetKind::SharedLibrary {
+                    let set = rcmake_resolve::lower::compute_artifacts(model, raw, &input.config);
+                    for path in [
+                        set.file.as_ref(),
+                        set.soname_file.as_ref(),
+                        set.linker_file.as_ref(),
+                        set.import_file.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        graph.imported_shared_artifacts.insert(graph.node(path));
+                    }
+                }
+            }
+        }
         let resolved_by_name: HashMap<&[u8], &rcmake_resolve::ResolvedTarget> = result
             .into_iter()
             .flat_map(|res| &res.targets)
@@ -341,6 +370,9 @@ impl<'a> Graph<'a> {
                 })
             });
             let is_non_framework_shared = kind == TargetKind::SharedLibrary && !is_framework;
+            let link_depends_no_shared = raw
+                .and_then(|raw| raw.props.get(b"LINK_DEPENDS_NO_SHARED"))
+                .is_some_and(|value| truth::is_on(value));
             let alias = if matches!(
                 kind,
                 TargetKind::Utility
@@ -384,6 +416,7 @@ impl<'a> Graph<'a> {
             }
             graph.target_meta.push(TargetMeta {
                 kind,
+                dir: raw.map(|raw| raw.dir),
                 dir_rel,
                 artifact_outputs: Vec::new(),
                 order_depends_target: None,
@@ -391,6 +424,7 @@ impl<'a> Graph<'a> {
                 order_depends_inputs: Vec::new(),
                 order_depends_private_inputs: Vec::new(),
                 is_non_framework_shared,
+                link_depends_no_shared,
                 linker_path: None,
             });
         }
@@ -418,6 +452,14 @@ impl<'a> Graph<'a> {
                         nodes.outputs.push(real_output.clone());
                         if let Some(extra) = input.link_extra_outputs.get(&step.output) {
                             for output in extra {
+                                let node = graph.node(output);
+                                if !nodes.outputs.contains(&node) {
+                                    nodes.outputs.push(node);
+                                }
+                            }
+                        }
+                        if let Some(byproducts) = input.link_event_byproducts.get(&step.output) {
+                            for output in byproducts {
                                 let node = graph.node(output);
                                 if !nodes.outputs.contains(&node) {
                                     nodes.outputs.push(node);
@@ -497,9 +539,6 @@ impl<'a> Graph<'a> {
                         nodes
                             .outputs
                             .extend(custom.outputs.iter().map(|name| graph.node(name)));
-                        nodes
-                            .byproducts
-                            .extend(custom.byproducts.iter().map(|name| graph.node(name)));
                         let owned_utility = if nodes.outputs.is_empty() {
                             graph.step_owner.get(&index).copied().filter(|&owner| {
                                 graph.target_meta.get(owner).is_some_and(|meta| {
@@ -532,8 +571,11 @@ impl<'a> Graph<'a> {
                                 nodes.outputs.push(candidate);
                             }
                         }
-                        if nodes.outputs.is_empty() && !nodes.byproducts.is_empty() {
-                            nodes.outputs = std::mem::take(&mut nodes.byproducts);
+                        for name in &custom.byproducts {
+                            let node = graph.node(name);
+                            if !nodes.outputs.contains(&node) {
+                                nodes.outputs.push(node);
+                            }
                         }
                         if nodes.outputs.is_empty() {
                             let name =
@@ -722,10 +764,44 @@ impl<'a> Graph<'a> {
         }
     }
 
+    pub(super) fn step_belongs_to_target_dir(
+        &self,
+        target_index: usize,
+        step_index: usize,
+    ) -> bool {
+        let Some(target_dir) = self.target_meta.get(target_index).and_then(|meta| meta.dir) else {
+            return true;
+        };
+        let Some(&command_dir) = self.step_command_dir.get(&step_index) else {
+            return true;
+        };
+        command_dir == target_dir
+    }
+
     fn disambiguate_aliases(&mut self) {
         let mut reserved: HashSet<_> = self.names.keys().chain(&self.aliases).cloned().collect();
         for (index, (target, alias)) in self.input.targets.iter().zip(&mut self.aliases).enumerate()
         {
+            // Normal artifact targets already expose their real build artifact
+            // path as `artifact_outputs`, so a colliding short phony alias is
+            // omitted (matching CMake) rather than given a synthetic `.util` name.
+            let has_concrete_artifact = self.target_meta.get(index).is_some_and(|meta| {
+                matches!(
+                    meta.kind,
+                    TargetKind::Executable
+                        | TargetKind::SharedLibrary
+                        | TargetKind::StaticLibrary
+                        | TargetKind::ModuleLibrary
+                        | TargetKind::UnknownLibrary
+                )
+            }) && (self.artifact_targets.contains(&index)
+                || target.steps.iter().any(|&step_idx| {
+                    self.steps.get(step_idx).is_some_and(|nodes| nodes.link)
+                        || matches!(self.input.steps.get(step_idx), Some(BuildStep::Link { .. }))
+                }));
+            if has_concrete_artifact {
+                continue;
+            }
             if let Some(producer) = self.producers.get(alias)
                 && !target.steps.contains(producer)
             {
@@ -846,6 +922,25 @@ impl<'a> Graph<'a> {
             &path::from_native(self.build_dir),
             !self.prefix.is_empty(),
         )
+    }
+
+    pub(super) fn utility_command_line(
+        &self,
+        invocations: &[rcmake_resolve::Invocation],
+    ) -> Vec<u8> {
+        self.commands.utility_line(
+            invocations,
+            &path::from_native(self.build_dir),
+            !self.prefix.is_empty(),
+        )
+    }
+
+    fn is_orphan_custom_step(&self, index: usize) -> bool {
+        self.input
+            .custom_output_owners
+            .get(&index)
+            .is_some_and(|owners| owners.targets.is_empty())
+            && !self.step_owner.contains_key(&index)
     }
 
     pub(crate) fn has_target(&self, name: &BString) -> bool {
@@ -1156,7 +1251,8 @@ impl<'a> Graph<'a> {
     ) -> Result<(), GenError> {
         let mut planned_steps = Vec::with_capacity(self.input.steps.len());
         for (index, (step, nodes)) in self.input.steps.iter().zip(&self.steps).enumerate() {
-            if self.input.native_custom_steps.contains(&index) {
+            if self.input.native_custom_steps.contains(&index) || self.is_orphan_custom_step(index)
+            {
                 continue;
             }
             if let Some(emitted) = &mut emitted {
@@ -1317,22 +1413,38 @@ impl<'a> Graph<'a> {
                     .collect(),
                 TargetKind::Utility | TargetKind::InterfaceLibrary | TargetKind::GlobalTarget => {
                     let utilities = &self.input.utility_steps;
-                    let utility_first = |index: &&usize| utilities.contains(*index);
-                    target
+                    let util_outputs: Vec<BString> = target
                         .steps
                         .iter()
-                        .filter(utility_first)
-                        .chain(target.steps.iter().filter(|index| !utility_first(index)))
+                        .filter(|&&index| utilities.contains(&index))
                         .filter_map(|&index| self.steps.get(index))
-                        .flat_map(|nodes| nodes.outputs.iter().chain(&nodes.byproducts))
+                        .flat_map(|nodes| nodes.outputs.iter())
+                        .filter(|output| output.ends_with(b".util"))
                         .cloned()
-                        .chain(target.depends.iter().flat_map(|&dep| {
-                            self.target_meta
-                                .get(dep)
-                                .map(|m| m.artifact_outputs.clone())
-                                .unwrap_or_default()
-                        }))
-                        .collect()
+                        .collect();
+                    if !util_outputs.is_empty() {
+                        util_outputs
+                    } else {
+                        let utility_first = |index: &&usize| utilities.contains(*index);
+                        target
+                            .steps
+                            .iter()
+                            .filter(utility_first)
+                            .chain(target.steps.iter().filter(|index| {
+                                !utility_first(index)
+                                    && self.step_belongs_to_target_dir(target_index, **index)
+                            }))
+                            .filter_map(|&index| self.steps.get(index))
+                            .flat_map(|nodes| nodes.outputs.iter().chain(&nodes.byproducts))
+                            .cloned()
+                            .chain(target.depends.iter().flat_map(|&dep| {
+                                self.target_meta
+                                    .get(dep)
+                                    .map(|m| m.artifact_outputs.clone())
+                                    .unwrap_or_default()
+                            }))
+                            .collect()
+                    }
                 }
             };
             out.phony(alias, &unique_vec(inputs));
@@ -1394,7 +1506,9 @@ impl<'a> Graph<'a> {
         let inputs = self
             .steps
             .iter()
-            .flat_map(|nodes| nodes.outputs.iter().chain(&nodes.byproducts))
+            .enumerate()
+            .filter(|(index, _)| !self.is_orphan_custom_step(*index))
+            .flat_map(|(_, nodes)| nodes.outputs.iter().chain(&nodes.byproducts))
             .chain(self.exe_symlinks.values().map(|sym| &sym.symlink_output))
             .cloned()
             .collect::<Vec<_>>();
@@ -1431,17 +1545,41 @@ impl<'a> Graph<'a> {
             return file(node);
         };
         // The resolver converts target dependencies with artifacts to file paths.
-        // Bare target names can still refer to targets without artifacts.
-        if let Some(producer) = self.producers.get(&node)
-            && (input != node.as_slice()
-                || self.artifact_targets.contains(&index)
-                || self
+        // Bare target names can still refer to targets without artifacts or to a
+        // library target whose name collides with another target's output file.
+        if let Some(producer) = self.producers.get(&node) {
+            let owned = self
+                .input
+                .targets
+                .get(index)
+                .is_some_and(|target| target.steps.contains(producer));
+            if input != node.as_slice() || owned || self.artifact_targets.contains(&index) {
+                return file(node);
+            }
+            if let Some(artifact) = self
+                .target_meta
+                .get(index)
+                .and_then(|meta| meta.artifact_outputs.first())
+                .filter(|artifact| *artifact != &node)
+            {
+                return file(artifact.clone());
+            }
+        }
+        if !self.artifact_targets.contains(&index)
+            && let Some(alias) = self.aliases.get(index)
+            && self.producers.get(alias).is_some_and(|producer| {
+                !self
                     .input
                     .targets
                     .get(index)
-                    .is_some_and(|target| target.steps.contains(producer)))
+                    .is_some_and(|target| target.steps.contains(producer))
+            })
+            && let Some(artifact) = self
+                .target_meta
+                .get(index)
+                .and_then(|meta| meta.artifact_outputs.first())
         {
-            return file(node);
+            return file(artifact.clone());
         }
         CustomInput {
             node: self.aliases.get(index).cloned().unwrap_or(node),
@@ -1493,11 +1631,21 @@ impl<'a> Graph<'a> {
             _ => Some(self.plan_step(step_index, step, nodes, cmake, modmap_flag, exports)?),
         };
         let inputs = plan.as_mut().map_or_else(Vec::new, |plan| {
-            unique_vec(std::mem::take(&mut plan.inputs))
+            if matches!(step, BuildStep::Custom(_)) {
+                std::mem::take(&mut plan.inputs)
+            } else {
+                unique_vec(std::mem::take(&mut plan.inputs))
+            }
         });
         let implicit = plan.as_mut().map_or_else(
             || unique_vec(language_inputs),
-            |plan| unique_vec(std::mem::take(&mut plan.implicit_inputs)),
+            |plan| {
+                if matches!(step, BuildStep::Link { .. }) {
+                    std::mem::take(&mut plan.implicit_inputs)
+                } else {
+                    unique_vec(std::mem::take(&mut plan.implicit_inputs))
+                }
+            },
         );
         let dyndep = plan.as_ref().and_then(|plan| plan.dyndep.as_ref());
         let planned = plan
@@ -1555,6 +1703,11 @@ impl<'a> Graph<'a> {
                     OrderOnly::ObjectOrder(_) => {}
                 }
             }
+            for output in planned {
+                if part1_seen.insert(output) {
+                    dep_artifacts.push(output);
+                }
+            }
             dep_artifacts.sort();
             order_only.extend(dep_artifacts);
             // Append versioning symlinks of linked non-framework shared libraries
@@ -1592,16 +1745,17 @@ impl<'a> Graph<'a> {
             || !planned.is_empty()
             || custom_inputs.is_some()
         {
-            let mut seen: HashSet<&BString> = if is_utility_step {
-                nodes.outputs.iter().chain(&nodes.byproducts).collect()
-            } else {
-                inputs
-                    .iter()
-                    .chain(&implicit)
-                    .chain(&nodes.outputs)
-                    .chain(&nodes.byproducts)
-                    .collect()
-            };
+            let mut seen: HashSet<&BString> =
+                if is_utility_step || matches!(step, BuildStep::Custom(_)) {
+                    nodes.outputs.iter().chain(&nodes.byproducts).collect()
+                } else {
+                    inputs
+                        .iter()
+                        .chain(&implicit)
+                        .chain(&nodes.outputs)
+                        .chain(&nodes.byproducts)
+                        .collect()
+                };
             order_only.extend(dyndep.into_iter().filter(|node| seen.insert(node)));
             order_only.extend(planned.iter().filter(|node| seen.insert(node)));
             order_only.extend(
@@ -1745,6 +1899,29 @@ impl<'a> Graph<'a> {
             ninja.binding(b"DESC", &desc);
         }
         Ok(())
+    }
+
+    pub(super) fn step_link_depends_no_shared(&self, step_index: usize) -> bool {
+        self.step_owner
+            .get(&step_index)
+            .and_then(|&owner| self.target_meta.get(owner))
+            .is_some_and(|meta| meta.link_depends_no_shared)
+    }
+
+    pub(super) fn is_shared_library_input(&self, node: &BString) -> bool {
+        if let Some(&target_idx) = self.artifact_to_target.get(node) {
+            return self
+                .target_meta
+                .get(target_idx)
+                .is_some_and(|meta| meta.kind == TargetKind::SharedLibrary);
+        }
+        if let Some(&producer) = self.producers.get(node) {
+            return matches!(
+                self.input.steps.get(producer),
+                Some(BuildStep::Link { step, .. }) if step.kind == LinkKind::SharedLibrary
+            );
+        }
+        self.imported_shared_artifacts.contains(node)
     }
 
     pub(super) fn is_link_library_input(&self, node: &BString, step: &LinkStep) -> bool {

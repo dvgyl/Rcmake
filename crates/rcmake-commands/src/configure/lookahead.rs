@@ -122,19 +122,16 @@ pub(crate) enum ExpandedProbeSpec {
         header: BString,
     },
     /// Stock `check_c_compiler_flag(<flag> <result>)`.
-    #[cfg_attr(not(test), allow(dead_code))]
     CCompilerFlag {
         /// Compiler flag string.
         flag: BString,
     },
     /// Stock `check_cxx_compiler_flag(<flag> <result>)`.
-    #[cfg_attr(not(test), allow(dead_code))]
     CxxCompilerFlag {
         /// Compiler flag string.
         flag: BString,
     },
     /// Stock `check_symbol_exists(<symbol> <headers> <result>)`.
-    #[cfg_attr(not(test), allow(dead_code))]
     SymbolExists {
         /// Symbol name.
         symbol: BString,
@@ -147,7 +144,6 @@ pub(crate) enum ExpandedProbeSpec {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExpandedProbeCandidate {
     /// The expected built-in or stock module command.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) kind: ProbeKind,
     /// The name of the result binding.
     pub(crate) result: BString,

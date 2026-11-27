@@ -58,6 +58,9 @@ pub struct GenerationResult {
     pub provenance_entries: Vec<ProvenanceEntry>,
     /// Dependency paths for recorded entries.
     pub chains: Option<Box<ResolveChains>>,
+    /// Post-overlay project model used during resolution (e.g., after autogen or rule
+    /// instantiation), when any overlay modified the input model.
+    pub resolved_model: Option<Box<rcmake_model::ProjectModel>>,
 }
 
 pub(crate) struct CrossConfiguration<'a> {
@@ -883,10 +886,15 @@ pub struct BuildGraph {
     /// Additional explicit outputs of a link edge (for example one-step Swift
     /// object files and `.swiftmodule`), keyed by primary link output path.
     pub link_extra_outputs: IndexMap<BString, Vec<BString>>,
+    /// Byproducts declared by `PRE_BUILD`, `PRE_LINK`, or `POST_BUILD` target
+    /// commands attached to a link edge, keyed by primary link output path.
+    pub link_event_byproducts: IndexMap<BString, Vec<BString>>,
     /// Generated Swift `output-file-map.json` files (build-relative path to JSON text).
     pub swift_output_file_maps: IndexMap<BString, BString>,
     /// Grouped Swift compile/module action metadata indexed by step index in [`Self::steps`].
     pub swift_actions: IndexMap<usize, SwiftAction>,
+    /// Ninja-formatted `compile_commands.json` command lines keyed by compile step index in [`Self::steps`].
+    pub compile_db_commands: BTreeMap<usize, BString>,
 }
 
 /// File set members that affect compile ordering under CMP0154.

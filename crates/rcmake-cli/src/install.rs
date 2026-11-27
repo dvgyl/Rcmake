@@ -8,7 +8,7 @@ use rcmake_host::{Host, Stream, discover_cmake_root, path};
 
 use crate::build::{invalid_value, job_count};
 use crate::options::{Options as ConfigureOptions, split_flag, take_value, unknown_mode_option};
-use crate::{cache, new_interp, resolve_cli_path};
+use crate::{cache, new_interp_with_paths, resolve_cli_path, resolve_cmake_command};
 
 const USAGE: &str = "Usage: cmake --install <dir> [options]
 Options:
@@ -170,6 +170,7 @@ pub(crate) fn run(
     argv: &[BString],
     args: &[BString],
     persona: crate::persona::Persona,
+    shim_handoff: bool,
     host: Arc<dyn Host>,
 ) -> i32 {
     let opts = match parse(args, host.as_ref()) {
@@ -196,7 +197,15 @@ pub(crate) fn run(
         argv,
         rcmake_instrument::SnippetRole::CMakeInstall,
         rcmake_instrument::Hook::PostCMakeInstall,
-        || crate::CommandExit::Code(install(argv, opts, Arc::clone(&host))),
+        || {
+            crate::CommandExit::Code(install(
+                argv,
+                opts,
+                persona,
+                shim_handoff,
+                Arc::clone(&host),
+            ))
+        },
     )
 }
 
@@ -210,10 +219,25 @@ impl Options {
     }
 }
 
-fn install(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
+fn install(
+    argv: &[BString],
+    opts: Options,
+    persona: crate::persona::Persona,
+    shim_handoff: bool,
+    host: Arc<dyn Host>,
+) -> i32 {
+    let (discovered_command, cmake_root) = discover_cmake_root(host.as_ref(), argv.first());
+    let cmake_command = resolve_cmake_command(
+        host.as_ref(),
+        persona,
+        discovered_command,
+        argv.first(),
+        shim_handoff,
+    );
+    let command = path::from_native(&cmake_command);
     let index = match parallel::Index::load(host.as_ref(), &opts.dir) {
         Ok(Some(index)) if index.parallel => {
-            return parallel::run(argv, &opts, host.as_ref(), index).unwrap_or_else(|error| {
+            return parallel::run(&opts, host.as_ref(), index, &command).unwrap_or_else(|error| {
                 crate::emit_cli_error(host.as_ref(), error);
                 1
             });
@@ -235,7 +259,12 @@ fn install(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
     } else {
         opts.components.iter().map(Some).collect()
     };
-    let command = path::from_native(&discover_cmake_root(host.as_ref(), argv.first()).0);
+    let cmake_root = cmake_root.unwrap_or_default();
+    let cfg_opts = ConfigureOptions {
+        persona,
+        shim_handoff,
+        ..ConfigureOptions::default()
+    };
     for (component, config) in components
         .into_iter()
         .flat_map(|component| configs.iter().map(move |config| (component, *config)))
@@ -269,11 +298,14 @@ fn install(argv: &[BString], opts: Options, host: Arc<dyn Host>) -> i32 {
             script_args.push(arg);
         }
         script_args.extend(["-P".into(), path::from_native(&script)]);
-        let mut interp = new_interp(
-            &script_args,
-            &ConfigureOptions::default(),
+        let mut interp = new_interp_with_paths(
+            &cfg_opts,
             RunMode::Script,
             Arc::clone(&host),
+            cmake_command.clone(),
+            cmake_root.clone(),
+            &script_args,
+            rcmake_eval::Services::default(),
         );
         for (key, value) in definitions {
             cache::insert(interp.cx().cache(), key, value.clone(), None);

@@ -20,7 +20,10 @@ const METADATA: [&str; 5] = [
 pub(super) fn project(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
     cx.begin_replay_setup();
     let result = configure_project(cx, args);
-    crate::configure::finish_probe_prelude(cx);
+    // A failed `project()` leaves partial state that a snapshot must not keep.
+    if result.is_ok() {
+        crate::configure::finish_probe_prelude(cx);
+    }
     cx.end_replay_project(result.is_ok());
     result
 }

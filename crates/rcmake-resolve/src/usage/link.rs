@@ -380,7 +380,11 @@ impl<'a> UsageResolver<'a> {
         };
         if !self.has_language_runtime_libraries
             && self.source_reads.is_none()
-            && let Some(links) = self.link_memo.get(&key)
+            && let Some(links) = self.link_memo.get(&key).or_else(|| {
+                self.shared_link_memo
+                    .as_deref()
+                    .and_then(|shared| shared.get(&key))
+            })
             && (self.active.is_empty() || !links.1.context_sensitive)
         {
             return Ok(links.clone());

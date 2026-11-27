@@ -28,7 +28,7 @@ pub(super) mod rpath;
 mod rpath_macho;
 use driver::{
     LinkerDriver, archive_commands, deduplicate_darwin_flags, definition_file, library_file,
-    shared_library, without_empty_output_flags,
+    shared_library, target_definition_files, without_empty_output_flags,
 };
 pub(crate) use frameworks::bundle_name as framework_bundle_name;
 pub(crate) use rpath::ide_rpaths;
@@ -60,6 +60,107 @@ fn creation_flags<'a>(
     })
 }
 
+/// Append a flag string using CMake's `cmLocalGenerator::AppendFlags` rules:
+/// ignore whitespace-only strings, separate non-empty values with a single
+/// space, and preserve any leading/trailing spaces on non-whitespace values.
+fn append_flag(out: &mut BString, piece: &[u8]) {
+    if piece.iter().all(u8::is_ascii_whitespace) {
+        return;
+    }
+    if !out.is_empty() {
+        out.push(b' ');
+    }
+    out.extend_from_slice(piece);
+}
+
+fn join_link_flags(pieces: impl IntoIterator<Item = BString>) -> BString {
+    let mut out = BString::default();
+    for piece in pieces {
+        append_flag(&mut out, &piece);
+    }
+    out
+}
+
+fn executable_extra_flags(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    language: &[u8],
+    wrapper: &LinkerDriver<'_>,
+    policy_181_new: bool,
+) -> Result<BString, ResolveError> {
+    let mut extra = BString::default();
+    let form = if target
+        .props
+        .get(b"WIN32_EXECUTABLE")
+        .is_some_and(|value| truth::is_on(value))
+    {
+        b"_CREATE_WIN32_EXE".as_slice()
+    } else {
+        b"_CREATE_CONSOLE_EXE"
+    };
+    if let Some(value) = definition(model, target.dir, &[b"CMAKE_", language, form].concat()) {
+        let parsed = if policy_181_new {
+            wrapper.flag_string(value)?
+        } else {
+            wrapper.driver_flags(value)
+        };
+        append_flag(&mut extra, &parsed);
+    }
+    let exports = target
+        .props
+        .get(b"ENABLE_EXPORTS")
+        .is_some_and(|v| truth::is_on(v));
+    if exports
+        && let Some(value) = definition(
+            model,
+            target.dir,
+            &[b"CMAKE_EXE_EXPORTS_", language, b"_FLAG"].concat(),
+        )
+    {
+        append_flag(&mut extra, &wrapper.driver_flags(value));
+    }
+    let shared_build =
+        definition(model, target.dir, b"BUILD_SHARED_LIBS").is_some_and(|v| truth::is_on(v));
+    if shared_build {
+        extra.push(b' ');
+        if let Some(value) = definition(
+            model,
+            target.dir,
+            &[b"CMAKE_SHARED_BUILD_", language, b"_FLAGS"].concat(),
+        ) {
+            extra.extend_from_slice(&wrapper.driver_flags(value));
+        }
+    }
+    let shared_exports = exports
+        && model
+            .global
+            .props
+            .get(b"TARGET_SUPPORTS_SHARED_LIBS")
+            .is_some_and(|v| truth::is_on(v))
+        && definition(model, target.dir, b"CMAKE_SYSTEM_NAME").is_none_or(|v| v != b"AIX");
+    if shared_exports {
+        if let Some(value) = definition(
+            model,
+            target.dir,
+            &[b"CMAKE_SHARED_LIBRARY_LINK_", language, b"_FLAGS"].concat(),
+        ) {
+            append_flag(&mut extra, &wrapper.driver_flags(value));
+        }
+        extra.push(b' ');
+    }
+    if let Some(value) = target.props.get(b"LINK_FLAGS") {
+        append_flag(&mut extra, &wrapper.driver_flags(value));
+    }
+    if let Some(value) = target
+        .props
+        .get(&[b"LINK_FLAGS_", config.0.to_ascii_uppercase().as_slice()].concat())
+    {
+        append_flag(&mut extra, &wrapper.driver_flags(value));
+    }
+    Ok(extra)
+}
+
 /// Return the untagged flag fragments and IPO status of a codemodel link step.
 pub fn codemodel_link_flags(
     model: &ProjectModel,
@@ -72,7 +173,39 @@ pub fn codemodel_link_flags(
     let mut flags = Vec::new();
     let policy = Flags::new(model, target, language);
     let ipo = policy.ipo(config);
+    let wrapper = LinkerDriver::new(model, target, language);
+    let policy_new =
+        |policy| target.policies.policies.get(PolicyId::new(policy)) == PolicyStatus::New;
+    let push_non_empty = |flags: &mut Vec<BString>, value: &[u8]| {
+        let trimmed = value.trim_ascii();
+        if !trimmed.is_empty() {
+            flags.push(trimmed.into());
+        }
+    };
     if kind == LinkKind::StaticArchive {
+        if language != b"Swift" {
+            let base = b"CMAKE_STATIC_LINKER_FLAGS".to_vec();
+            let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
+            let mut linker_flags = BString::default();
+            for key in [&base, &configured] {
+                if let Some(value) = definition(model, target.dir, key) {
+                    append_flag(&mut linker_flags, &wrapper.driver_flags(value));
+                }
+            }
+            push_non_empty(&mut flags, &linker_flags);
+        }
+        let mut target_flags = BString::default();
+        let raw_key = kind.target_flags_property();
+        if let Some(value) = target.props.get(raw_key) {
+            append_flag(&mut target_flags, &wrapper.driver_flags(value));
+        }
+        if let Some(value) = target
+            .props
+            .get(&[raw_key, b"_", config.0.to_ascii_uppercase().as_slice()].concat())
+        {
+            append_flag(&mut target_flags, &wrapper.driver_flags(value));
+        }
+        push_non_empty(&mut flags, &target_flags);
         return Ok((flags, ipo));
     }
     let split_swift = super::swift::is_split_build(model, target);
@@ -118,42 +251,63 @@ pub fn codemodel_link_flags(
             }
         }
         // `DumpLinkCommandFragments` trims the language flags and drops them when empty.
-        flags.push(join_words(language_flags).trim_ascii().into());
+        push_non_empty(&mut flags, &join_link_flags(language_flags));
     }
-    let wrapper = LinkerDriver::new(model, target, language);
     if let Some(value) = creation_flags(model, target, kind, language) {
-        let value = if target.policies.policies.get(PolicyId::new(181)) == PolicyStatus::New {
+        let value = if policy_new(181) {
             wrapper.flag_string(value)?
         } else {
             wrapper.driver_flags(value)
         };
-        flags.push(value);
+        push_non_empty(&mut flags, &value);
     }
     let include_linker_flags = match kind {
-        LinkKind::Executable => {
-            language != b"Swift"
-                || (split_swift
-                    && target.policies.policies.get(PolicyId::new(214)) == PolicyStatus::New)
-        }
+        LinkKind::Executable => language != b"Swift" || (split_swift && policy_new(214)),
         LinkKind::SharedLibrary | LinkKind::ModuleLibrary => language != b"Swift" || split_swift,
         LinkKind::StaticArchive => language != b"Swift",
     };
+    let mut linker_flags = BString::default();
     if include_linker_flags {
         let base = [b"CMAKE_", kind.flag_class(), b"_LINKER_FLAGS"].concat();
         let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
-        flags.push(join_words(
-            [base.as_slice(), &configured]
-                .into_iter()
-                .filter_map(|key| {
-                    definition(model, target.dir, key).map(|value| wrapper.driver_flags(value))
-                }),
-        ));
+        for key in [&base, &configured] {
+            if let Some(value) = definition(model, target.dir, key) {
+                append_flag(&mut linker_flags, &wrapper.driver_flags(value));
+            }
+        }
     }
-    let mut flags: Vec<BString> = flags
-        .into_iter()
-        .map(|value| value.trim_ascii().into())
-        .collect();
-    flags.retain(|value| !value.is_empty());
+    if policy_new(210) {
+        let base = [b"CMAKE_", language, b"_LINK_FLAGS"].concat();
+        let configured = [base.as_slice(), b"_", &config.0.to_ascii_uppercase()].concat();
+        for key in [&base, &configured] {
+            if let Some(value) = definition(model, target.dir, key) {
+                append_flag(&mut linker_flags, &wrapper.flag_string(value)?);
+            }
+        }
+    }
+    push_non_empty(&mut flags, &linker_flags);
+    if kind == LinkKind::Executable {
+        let extra =
+            executable_extra_flags(model, target, config, language, &wrapper, policy_new(181))?;
+        // CMake checks `!extraFlags.empty()` before trimming, so `BUILD_SHARED_LIBS=ON`
+        // with no other extra flags emits `{"fragment": "", "role": "flags"}`.
+        if !extra.is_empty() {
+            flags.push(extra.trim_ascii().into());
+        }
+    } else {
+        let mut extra = BString::default();
+        let raw_key = kind.target_flags_property();
+        if let Some(value) = target.props.get(raw_key) {
+            append_flag(&mut extra, &wrapper.driver_flags(value));
+        }
+        if let Some(value) = target
+            .props
+            .get(&[raw_key, b"_", config.0.to_ascii_uppercase().as_slice()].concat())
+        {
+            append_flag(&mut extra, &wrapper.driver_flags(value));
+        }
+        push_non_empty(&mut flags, &extra);
+    }
     Ok((flags, ipo))
 }
 
@@ -217,6 +371,15 @@ pub(super) fn link(
         .is_some_and(rcmake_model::GeneratorKind::is_ninja)
         && !super::shell::windows_host(model, target.dir);
     let mut driver = language_flags(model, target, config, language);
+    let linker_mode = definition(
+        model,
+        target.dir,
+        &[b"CMAKE_", language, b"_LINK_MODE"].concat(),
+    )
+    .is_some_and(|mode| mode == b"LINKER");
+    if kind != LinkKind::StaticArchive && !msvc && !linker_mode {
+        driver.extend(policy.ipo_compile(ipo));
+    }
     let arch = if kind == LinkKind::StaticArchive && language != b"Swift" {
         Vec::new()
     } else {
@@ -238,7 +401,7 @@ pub(super) fn link(
             );
         }
         [
-            join_words(lang_flags).trim_ascii_start(),
+            join_link_flags(lang_flags).trim_ascii(),
             b" ",
             join_words(arch.iter().cloned()).as_slice(),
         ]
@@ -341,64 +504,29 @@ pub(super) fn link(
         }
     }
     if kind == LinkKind::Executable {
-        let form = if target
-            .props
-            .get(b"WIN32_EXECUTABLE")
-            .is_some_and(|value| truth::is_on(value))
-        {
-            b"_CREATE_WIN32_EXE".as_slice()
-        } else {
-            b"_CREATE_CONSOLE_EXE"
-        };
-        if let Some(value) = definition(model, target.dir, &[b"CMAKE_", language, form].concat()) {
-            flags.push(parse_flags(value.clone())?);
-        }
-    }
-    if kind == LinkKind::Executable {
-        let exports = target
-            .props
-            .get(b"ENABLE_EXPORTS")
-            .is_some_and(|v| truth::is_on(v));
-        let shared_build =
-            definition(model, target.dir, b"BUILD_SHARED_LIBS").is_some_and(|v| truth::is_on(v));
-        let shared_exports = exports
-            && model
-                .global
+        flags.push(executable_extra_flags(
+            model,
+            target,
+            config,
+            language,
+            &wrapper,
+            policy_new(181),
+        )?);
+    } else {
+        let raw_flags = kind.target_flags_property();
+        flags.extend(
+            target
                 .props
-                .get(b"TARGET_SUPPORTS_SHARED_LIBS")
-                .is_some_and(|v| truth::is_on(v))
-            && definition(model, target.dir, b"CMAKE_SYSTEM_NAME").is_none_or(|v| v != b"AIX");
-        for (enabled, prefix, suffix) in [
-            (
-                exports,
-                b"CMAKE_EXE_EXPORTS_".as_slice(),
-                b"_FLAG".as_slice(),
-            ),
-            (shared_build, b"CMAKE_SHARED_BUILD_", b"_FLAGS"),
-            (shared_exports, b"CMAKE_SHARED_LIBRARY_LINK_", b"_FLAGS"),
-        ] {
-            if enabled
-                && let Some(value) =
-                    definition(model, target.dir, &[prefix, language, suffix].concat())
-                        .filter(|value| !value.is_empty())
-            {
-                flags.push(wrapper.driver_flags(value));
-            }
-        }
+                .get(raw_flags)
+                .map(|flags| wrapper.driver_flags(flags)),
+        );
+        flags.extend(
+            target
+                .props
+                .get(&[raw_flags, b"_", &config.0.to_ascii_uppercase()].concat())
+                .map(|flags| wrapper.driver_flags(flags)),
+        );
     }
-    let raw_flags = kind.target_flags_property();
-    flags.extend(
-        target
-            .props
-            .get(raw_flags)
-            .map(|flags| wrapper.driver_flags(flags)),
-    );
-    flags.extend(
-        target
-            .props
-            .get(&[raw_flags, b"_", &config.0.to_ascii_uppercase()].concat())
-            .map(|flags| wrapper.driver_flags(flags)),
-    );
     for fragment in step
         .fragments
         .iter()
@@ -444,13 +572,13 @@ pub(super) fn link(
         flags.extend(policy.pie_link(position_independent));
         flags.extend(policy.link(ipo));
     }
-    let lwyu = super::policy_flags::link_what_you_use(model, target, language);
-    if let Some(flag) = lwyu {
-        flags.push(wrapper.argument(flag)?);
-    }
     let depfile = ninja_link_depfile(model, target, config, kind, language);
     if let Some((path, depfile_flags)) = &depfile {
         flags.extend(wrapper.depfile_flags(depfile_flags, path)?);
+    }
+    let lwyu = super::policy_flags::link_what_you_use(model, target, language);
+    if let Some(flag) = lwyu {
+        flags.push(wrapper.argument(flag)?);
     }
     if kind == LinkKind::SharedLibrary && darwin {
         flags.extend(darwin_versions(model, target, language));
@@ -459,15 +587,28 @@ pub(super) fn link(
         deduplicate_darwin_flags(&mut flags);
     }
     let mut inputs = objects.clone();
+    let mut implicit_inputs = Vec::new();
     let mut before_link = Vec::new();
-    if kind != LinkKind::StaticArchive && super::artifacts::is_dll_platform(model, target.dir) {
-        let definitions =
-            definition_file(model, target, config, usage, sources, &objects, language)?;
-        inputs.extend(definitions.inputs);
-        flags.extend(definitions.flag);
-        before_link.extend(definitions.invocation);
+    if kind != LinkKind::StaticArchive {
+        if super::artifacts::is_dll_platform(model, target.dir) {
+            let definitions =
+                definition_file(model, target, config, usage, sources, &objects, language)?;
+            for path in definitions.inputs {
+                if !implicit_inputs.contains(&path) {
+                    implicit_inputs.push(path);
+                }
+            }
+            flags.extend(definitions.flag);
+            before_link.extend(definitions.invocation);
+        } else {
+            for path in target_definition_files(model, target, sources, false) {
+                if !implicit_inputs.contains(&path) {
+                    implicit_inputs.push(path);
+                }
+            }
+        }
     }
-    let flags = join_words(flags);
+    let flags = join_link_flags(flags);
     // Ninja trims each variable binding (`cmGlobalNinjaGenerator::WriteBuild`).
     let flags = if model.generator.is_some_and(GeneratorKind::is_ninja) {
         BString::from(flags.trim_ascii())
@@ -511,28 +652,34 @@ pub(super) fn link(
         usage,
         ninja_posix,
     )?;
-    let mut implicit_inputs = Vec::new();
-    if kind != LinkKind::StaticArchive
-        && let Some(id) = model.find_target(target.dir, &target.name)
-    {
-        let context = EvalContext {
-            config: config.clone(),
-            link_language: Some(step.language.clone()),
-            ..EvalContext::default()
-        };
-        for entry in usage
-            .collect_property_with(
-                id,
-                b"LINK_DEPENDS",
-                &context,
-                Some(link_property_traversal(target)),
-            )?
-            .entries
-        {
-            let path = join(&model.dir(target.dir).source_dir, &entry.value);
-            let path = build_relative(model, &path);
+    let mut explicit_link_depends = Vec::new();
+    if kind != LinkKind::StaticArchive {
+        for path in frameworks::imported_framework_files(model, target, config, &step, usage) {
             if !inputs.contains(&path) && !implicit_inputs.contains(&path) {
                 implicit_inputs.push(path);
+            }
+        }
+        if let Some(id) = model.find_target(target.dir, &target.name) {
+            let context = EvalContext {
+                config: config.clone(),
+                link_language: Some(step.language.clone()),
+                ..EvalContext::default()
+            };
+            for entry in usage
+                .collect_property_with(
+                    id,
+                    b"LINK_DEPENDS",
+                    &context,
+                    Some(link_property_traversal(target)),
+                )?
+                .entries
+            {
+                let path = join(&model.dir(target.dir).source_dir, &entry.value);
+                let path = build_relative(model, &path);
+                if !implicit_inputs.contains(&path) {
+                    implicit_inputs.push(path.clone());
+                }
+                explicit_link_depends.push(path);
             }
         }
     }
@@ -913,16 +1060,29 @@ pub(super) fn link(
         && let Some(check) = definition(model, target.dir, b"CMAKE_LINK_WHAT_YOU_USE_CHECK")
             .filter(|check| !check.is_empty())
     {
-        invocations.push(direct(
+        let program = cmake();
+        let mut invocation = direct(
             vec![
-                cmake(),
+                program.clone(),
                 "-E".into(),
                 "__run_co_compile".into(),
                 [b"--lwyu=".as_slice(), check].concat().into(),
                 [b"--source=".as_slice(), &step.output].concat().into(),
             ],
             None,
-        ));
+        );
+        if !super::shell::windows_host(model, target.dir) {
+            invocation.shell = [
+                super::shell::cmake_posix_quote(&program).as_slice(),
+                b" -E __run_co_compile --lwyu=",
+                super::shell::cmake_posix_quote(check).as_slice(),
+                b" --source=",
+                super::shell::cmake_posix_quote(&step.output).as_slice(),
+            ]
+            .concat()
+            .into();
+        }
+        invocations.push(invocation);
     }
     if kind == LinkKind::SharedLibrary
         && let (Some(file), Some(soname), Some(linker)) = (
@@ -960,7 +1120,7 @@ pub(super) fn link(
         ));
     }
     before_link.append(&mut invocations);
-    implicit_inputs.retain(|path| !inputs.contains(path));
+    implicit_inputs.retain(|path| explicit_link_depends.contains(path) || !inputs.contains(path));
     Ok(LoweredLink {
         step: BuildStep::Link {
             implicit_inputs,
@@ -1032,6 +1192,9 @@ fn link_libraries(
         .iter()
         .filter(|f| f.role != LinkFragmentRole::Flags);
     let mut libraries = linked_libraries(step);
+    let feature_files =
+        feature_wrapped_library_files(model, target, config, step, usage, &libraries);
+    libraries.extend(feature_files);
     let named = frameworks::named_framework_files(model, target, config, step, &libraries);
     libraries.extend(named);
     let runtime = rpath::runtime_libraries(model, target, config, step, &libraries, usage)?;
@@ -1151,11 +1314,311 @@ fn macho_version(value: &[u8]) -> Option<BString> {
     (major != 0 || minor != 0 || patch != 0).then(|| format!("{major}.{minor}.{patch}").into())
 }
 
+fn takes_separate_non_file_arg(arg: &[u8]) -> bool {
+    matches!(
+        arg,
+        b"-F"
+            | b"-L"
+            | b"-l"
+            | b"-framework"
+            | b"-weak_framework"
+            | b"-needed_framework"
+            | b"-reexport_framework"
+            | b"-lazy_framework"
+            | b"-rpath"
+            | b"-rpath-link"
+            | b"-install_name"
+            | b"-syslibroot"
+            | b"-isysroot"
+            | b"-soname"
+            | b"--soname"
+            | b"-h"
+            | b"-u"
+            | b"-e"
+            | b"-init"
+            | b"-z"
+            | b"-T"
+            | b"--script"
+            | b"-version-script"
+            | b"--version-script"
+            | b"--dynamic-list"
+            | b"-Map"
+            | b"-force_load"
+            | b"-weak_library"
+            | b"-reexport_library"
+            | b"-upward_library"
+            | b"-needed_library"
+            | b"-lazy_library"
+            | b"-load_hidden"
+            | b"-compatibility_version"
+            | b"-current_version"
+            | b"-undefined"
+            | b"-umbrella"
+            | b"-allowable_client"
+            | b"-exported_symbols_list"
+            | b"-unexported_symbols_list"
+            | b"-order_file"
+            | b"-alias_list"
+            | b"-bundle_loader"
+            | b"-segaddr"
+            | b"-pagezero_size"
+            | b"-stack_size"
+    )
+}
+
+fn feature_wrapped_library_files(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    step: &LinkStep,
+    usage: &mut UsageResolver<'_>,
+    existing: &[BString],
+) -> Vec<BString> {
+    let has_wrapped_feature = step.fragments.iter().any(|fragment| {
+        fragment.role == LinkFragmentRole::Libraries
+            && (fragment.text.value.starts_with(b"-Wl,")
+                || fragment.text.value.starts_with(b"LINKER:")
+                || simple_args(&fragment.text.value).is_some_and(|args| {
+                    args.iter().any(|arg| {
+                        arg.starts_with(b"-Wl,")
+                            || takes_separate_non_file_arg(arg)
+                            || arg.starts_with(b"-WHOLEARCHIVE:")
+                            || arg.starts_with(b"/WHOLEARCHIVE:")
+                    })
+                }))
+    });
+    if !has_wrapped_feature {
+        return Vec::new();
+    }
+    let Some(id) = model.find_target(target.dir, &target.name) else {
+        return Vec::new();
+    };
+    let ctx = EvalContext {
+        config: config.clone(),
+        link_language: Some(step.language.clone()),
+        ..EvalContext::default()
+    };
+    let Ok(items) = usage.ordered_links(id, &ctx) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    let mut collect = |item: &crate::usage::ResolvedLinkItem| {
+        if item
+            .feature
+            .as_deref()
+            .is_none_or(|feature| feature == b"DEFAULT")
+        {
+            return;
+        }
+        let path = match &item.kind {
+            crate::usage::ResolvedLinkKind::Raw if library_file(&item.text.value) => {
+                Some(build_relative(model, &item.text.value))
+            }
+            crate::usage::ResolvedLinkKind::Library(dep) => model
+                .target(*dep)
+                .and_then(|producer| super::compute_artifacts(model, producer, config).linker_file)
+                .map(|file| build_relative(model, &file)),
+            _ => None,
+        };
+        if let Some(path) = path
+            && !existing.contains(&path)
+            && !files.contains(&path)
+        {
+            files.push(path);
+        }
+    };
+    for item in &items {
+        if let crate::usage::ResolvedLinkKind::Group { members, .. } = &item.kind {
+            for member in members {
+                collect(member);
+            }
+        } else {
+            collect(item.as_ref());
+        }
+    }
+    files
+}
+
 fn linked_libraries(step: &LinkStep) -> Vec<BString> {
-    step.fragments
+    let mut libraries = Vec::new();
+    for fragment in step
+        .fragments
         .iter()
         .filter(|f| f.role == LinkFragmentRole::Libraries)
-        .flat_map(|fragment| simple_args(&fragment.text.value).into_iter().flatten())
-        .filter(|arg| library_file(arg))
-        .collect()
+    {
+        let Some(args) = simple_args(&fragment.text.value) else {
+            continue;
+        };
+        // A raw multi-word `-Wl,...` flag item passed via `target_link_libraries`
+        // (for example `"-Wl,--whole-archive /path/libfoo.a"`) is a linker flag,
+        // not a Ninja file dependency (`cmComputeLinkInformation::AddItem`).
+        if args.len() > 1 && args.first().is_some_and(|arg| arg.starts_with(b"-Wl,")) {
+            continue;
+        }
+        let mut skip_next = false;
+        for arg in args {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if takes_separate_non_file_arg(&arg) {
+                skip_next = true;
+                continue;
+            }
+            if library_file(&arg) {
+                libraries.push(arg);
+            }
+        }
+    }
+    libraries
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_model::{DirId, ProjectModel, Target, TargetKind, TargetOrigin};
+
+    use super::*;
+
+    #[test]
+    fn append_flag_skips_whitespace_only_and_preserves_non_blank_spaces() {
+        let mut out = BString::default();
+        append_flag(&mut out, b"-Wl,--no-undefined");
+        append_flag(&mut out, b"   ");
+        append_flag(&mut out, b"-Wl,--dependency-file=foo.d");
+        assert_eq!(out, "-Wl,--no-undefined -Wl,--dependency-file=foo.d");
+
+        let mut leading = BString::from("-Wl,--export-dynamic ");
+        append_flag(&mut leading, b" -Wl,-rpath-link,/foo");
+        assert_eq!(leading, "-Wl,--export-dynamic   -Wl,-rpath-link,/foo");
+    }
+
+    #[test]
+    fn codemodel_link_flags_matches_executable_extra_flags_and_static_flags() {
+        let make_model =
+            |shared_build: bool, exports: bool, shared_link: &str, link_flags: &str| {
+                let mut model = ProjectModel::default();
+                model.set_root_dirs("/src".into(), "/out".into());
+                model
+                    .global
+                    .props
+                    .set("TARGET_SUPPORTS_SHARED_LIBS".into(), "TRUE".into());
+                let root = model.dir_mut(DirId::ROOT);
+                root.vars
+                    .insert("CMAKE_EXE_LINKER_FLAGS".into(), "-Wl,--elf".into());
+                root.vars.insert(
+                    "CMAKE_EXE_EXPORTS_C_FLAG".into(),
+                    "-Wl,--export-dynamic".into(),
+                );
+                root.vars.insert(
+                    "CMAKE_SHARED_LIBRARY_LINK_C_FLAGS".into(),
+                    shared_link.into(),
+                );
+                if shared_build {
+                    root.vars.insert("BUILD_SHARED_LIBS".into(), "ON".into());
+                }
+                let mut target = Target::new(
+                    "app".into(),
+                    TargetKind::Executable,
+                    TargetOrigin::Normal,
+                    DirId::ROOT,
+                    Default::default(),
+                    Default::default(),
+                );
+                if exports {
+                    target.props.set("ENABLE_EXPORTS".into(), "ON".into());
+                }
+                if !link_flags.is_empty() {
+                    target.props.set("LINK_FLAGS".into(), link_flags.into());
+                }
+                (model, target)
+            };
+        let step = LinkStep {
+            kind: LinkKind::Executable,
+            language: "C".into(),
+            fragments: Vec::new(),
+            output: "app".into(),
+        };
+        let cfg = ConfigId("Release".into());
+
+        // e1: BUILD_SHARED_LIBS=ON, no exports, no LINK_FLAGS -> emits empty "" fragment.
+        let (m, t) = make_model(true, false, "", "");
+        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        assert_eq!(frags, vec![BString::from("-Wl,--elf"), BString::from("")]);
+
+        // e2: BUILD_SHARED_LIBS=ON, no exports, LINK_FLAGS="-Wl,--lf" -> trimmed "-Wl,--lf".
+        let (m, t) = make_model(true, false, "", "-Wl,--lf");
+        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        assert_eq!(
+            frags,
+            vec![BString::from("-Wl,--elf"), BString::from("-Wl,--lf")]
+        );
+
+        // e3: BUILD_SHARED_LIBS=ON, ENABLE_EXPORTS=ON, shared_link="", LINK_FLAGS="-Wl,--lf" -> 3 spaces.
+        let (m, t) = make_model(true, true, "", "-Wl,--lf");
+        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        assert_eq!(
+            frags,
+            vec![
+                BString::from("-Wl,--elf"),
+                BString::from("-Wl,--export-dynamic   -Wl,--lf"),
+            ]
+        );
+
+        // e4: BUILD_SHARED_LIBS=ON, ENABLE_EXPORTS=ON, shared_link="-rdynamic", LINK_FLAGS="-Wl,--lf".
+        let (m, t) = make_model(true, true, "-rdynamic", "-Wl,--lf");
+        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        assert_eq!(
+            frags,
+            vec![
+                BString::from("-Wl,--elf"),
+                BString::from("-Wl,--export-dynamic  -rdynamic  -Wl,--lf"),
+            ]
+        );
+
+        // e5: BUILD_SHARED_LIBS=OFF, ENABLE_EXPORTS=ON, shared_link="", LINK_FLAGS="-Wl,--lf".
+        let (m, t) = make_model(false, true, "", "-Wl,--lf");
+        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        assert_eq!(
+            frags,
+            vec![
+                BString::from("-Wl,--elf"),
+                BString::from("-Wl,--export-dynamic  -Wl,--lf"),
+            ]
+        );
+
+        // e6: BUILD_SHARED_LIBS=OFF, ENABLE_EXPORTS=ON, shared_link="-rdynamic", LINK_FLAGS="-Wl,--lf".
+        let (m, t) = make_model(false, true, "-rdynamic", "-Wl,--lf");
+        let (frags, _) = codemodel_link_flags(&m, &t, &cfg, &step).unwrap();
+        assert_eq!(
+            frags,
+            vec![
+                BString::from("-Wl,--elf"),
+                BString::from("-Wl,--export-dynamic -rdynamic  -Wl,--lf"),
+            ]
+        );
+
+        // Static archive includes STATIC_LIBRARY_FLAGS and STATIC_LIBRARY_FLAGS_<CONFIG>.
+        let mut sm = ProjectModel::default();
+        sm.set_root_dirs("/src".into(), "/out".into());
+        let mut st = Target::new(
+            "lib".into(),
+            TargetKind::StaticLibrary,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        );
+        st.props
+            .set("STATIC_LIBRARY_FLAGS".into(), "-Wl,--st".into());
+        st.props
+            .set("STATIC_LIBRARY_FLAGS_RELEASE".into(), "-Wl,--strel".into());
+        let sstep = LinkStep {
+            kind: LinkKind::StaticArchive,
+            language: "C".into(),
+            fragments: Vec::new(),
+            output: "libfoo.a".into(),
+        };
+        let (sfrags, _) = codemodel_link_flags(&sm, &st, &cfg, &sstep).unwrap();
+        assert_eq!(sfrags, vec![BString::from("-Wl,--st -Wl,--strel")]);
+    }
 }

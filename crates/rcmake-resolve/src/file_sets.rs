@@ -142,6 +142,26 @@ pub fn set_files(
     })
 }
 
+/// Group file set members by their relative destination subdirectory
+/// (`cmInstallFileSetGenerator`), sorted lexicographically by subdirectory with
+/// declaration order preserved within each subdirectory across all base dirs.
+pub fn set_files_by_subdir(
+    model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
+    target: &Target,
+    set: &FileSet,
+    config: &ConfigId,
+) -> Result<BTreeMap<BString, Vec<(BString, BString)>>, ResolveError> {
+    let context = EvalContext {
+        config: config.clone(),
+        head: Some(handle(set.target)),
+        ..EvalContext::default()
+    };
+    map_set_files_by_subdir(model, usage, target, set, &context, |_, body| {
+        ResolveError::Message(body)
+    })
+}
+
 pub(crate) fn validate_membership(
     model: &ProjectModel,
     paths: &SourcePaths<'_>,
@@ -243,14 +263,19 @@ pub(crate) fn validate_source_includes(
     Ok(())
 }
 
-fn map_set_files(
+struct CollectedSetFiles {
+    bases: IndexMap<BString, BString>,
+    entries: Vec<(BString, BString, BString)>,
+}
+
+fn collect_set_entries(
     model: &ProjectModel,
     usage: &mut UsageResolver<'_>,
     target: &Target,
     set: &FileSet,
     context: &EvalContext,
     error: impl Fn(&Backtrace, BString) -> ResolveError,
-) -> Result<BTreeMap<BString, Vec<(BString, BString)>>, ResolveError> {
+) -> Result<CollectedSetFiles, ResolveError> {
     let source = Lexical::new(&model.dir(target.dir).source_dir);
     let mut bases = IndexMap::<BString, BString>::new();
     if set.base_dirs.is_empty() {
@@ -272,11 +297,8 @@ fn map_set_files(
         }
         bases.entry(normalized).or_insert(path);
     }
-    let mut roots: BTreeMap<_, Vec<_>> = bases
-        .keys()
-        .cloned()
-        .map(|base| (base, Vec::new()))
-        .collect();
+    let mut seen = BTreeSet::new();
+    let mut entries = Vec::new();
     for file in usage.file_set_paths(set.target, b"SOURCES", &set.files, context)? {
         let path = source.append(&file.value);
         let normalized = Lexical::new(&path).normalize();
@@ -293,12 +315,53 @@ fn map_set_files(
                 }
                 error(&file.backtrace, body)
             })?;
-        let files = roots.entry(base.clone()).or_default();
-        if !files.iter().any(|(known, _)| known == &normalized) {
-            files.push((normalized, relative));
+        if seen.insert(normalized.clone()) {
+            entries.push((base.clone(), normalized, relative));
         }
     }
+    Ok(CollectedSetFiles { bases, entries })
+}
+
+fn map_set_files(
+    model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
+    target: &Target,
+    set: &FileSet,
+    context: &EvalContext,
+    error: impl Fn(&Backtrace, BString) -> ResolveError,
+) -> Result<BTreeMap<BString, Vec<(BString, BString)>>, ResolveError> {
+    let CollectedSetFiles { bases, entries } =
+        collect_set_entries(model, usage, target, set, context, error)?;
+    let mut roots: BTreeMap<_, Vec<_>> = bases
+        .keys()
+        .cloned()
+        .map(|base| (base, Vec::new()))
+        .collect();
+    for (base, normalized, relative) in entries {
+        roots.entry(base).or_default().push((normalized, relative));
+    }
     Ok(roots)
+}
+
+fn map_set_files_by_subdir(
+    model: &ProjectModel,
+    usage: &mut UsageResolver<'_>,
+    target: &Target,
+    set: &FileSet,
+    context: &EvalContext,
+    error: impl Fn(&Backtrace, BString) -> ResolveError,
+) -> Result<BTreeMap<BString, Vec<(BString, BString)>>, ResolveError> {
+    let CollectedSetFiles { entries, .. } =
+        collect_set_entries(model, usage, target, set, context, error)?;
+    let mut by_subdir: BTreeMap<BString, Vec<(BString, BString)>> = BTreeMap::new();
+    for (_, normalized, relative) in entries {
+        let subdir = BString::from(Lexical::new(&relative).parent());
+        by_subdir
+            .entry(subdir)
+            .or_default()
+            .push((normalized, relative));
+    }
+    Ok(by_subdir)
 }
 
 fn relative_member(base: &[u8], path: &[u8]) -> Option<BString> {

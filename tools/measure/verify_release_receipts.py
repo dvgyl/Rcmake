@@ -566,6 +566,31 @@ def check_runcmake(record: ReceiptRecord, findings: list[Finding]) -> None:
         cases_passed = 0
         cases_total = 0
         issues: list[str] = []
+        inv = payload.get("suite_inventory")
+        if isinstance(inv, dict) and isinstance(inv.get("expected_profile_suites"), list):
+            expected_suites = inv["expected_profile_suites"]
+            if (not all(isinstance(name, str) and name for name in expected_suites)
+                    or len(set(expected_suites)) != len(expected_suites)):
+                issues.append("suite_inventory:invalid expected_profile_suites")
+            elif set(suites.keys()) != set(expected_suites):
+                missing_s = sorted(set(expected_suites) - set(suites.keys()))
+                extra_s = sorted(set(suites.keys()) - set(expected_suites))
+                issues.append(f"suite_inventory:mismatch(missing={len(missing_s)},extra={len(extra_s)})")
+        if isinstance(payload.get("shards"), list) and payload["shards"]:
+            tested = payload.get("tested_binary_sha256")
+            if not isinstance(tested, str) or not normalize_sha256(tested):
+                issues.append("provenance:missing_or_invalid_tested_binary_sha256")
+            engine = payload.get("tested_engine_sha256")
+            if engine is not None and (not isinstance(engine, str) or not normalize_sha256(engine)):
+                issues.append("provenance:invalid_tested_engine_sha256")
+            prov = payload.get("provenance")
+            if not isinstance(prov, dict):
+                issues.append("provenance:missing")
+            else:
+                for pkey in ("workflow_run_id", "ci_binary_artifact", "ci_binary_run_id"):
+                    val = prov.get(pkey)
+                    if not isinstance(val, str) or not val.strip():
+                        issues.append(f"provenance:missing_{pkey}")
         for suite_name, row in suites.items():
             if not isinstance(row, dict):
                 issues.append(f"{suite_name}: invalid row")
@@ -575,6 +600,54 @@ def check_runcmake(record: ReceiptRecord, findings: list[Finding]) -> None:
             if not is_int(passed) or not is_int(total) or passed < 0 or total < passed:
                 issues.append(f"{suite_name}: invalid passed/total")
                 continue
+            if isinstance(row.get("cases"), list) and row["cases"]:
+                bad_status = False
+                for c in row["cases"]:
+                    if not isinstance(c, dict) or not isinstance(c.get("status"), str):
+                        bad_status = True
+                        break
+                    if "oracle" in c or "rcmake" in c:
+                        st = c["status"]
+                        o = c.get("oracle")
+                        r = c.get("rcmake")
+                        if st == "capability_excluded":
+                            if not (suite_name == "CommandLine" and isinstance(o, dict)
+                                    and o.get("passed") is True and r is None):
+                                bad_status = True
+                                break
+                        elif o is None:
+                            if suite_name == "CommandLine" and isinstance(r, dict):
+                                exp_st = "passed" if r.get("passed") is True else "failed"
+                                if st != exp_st:
+                                    bad_status = True
+                                    break
+                            elif st != "no_reference":
+                                bad_status = True
+                                break
+                        elif not isinstance(o, dict) or o.get("passed") is not True:
+                            if st != "reference_failed":
+                                bad_status = True
+                                break
+                        elif r is None:
+                            if st != "missing":
+                                bad_status = True
+                                break
+                        elif not isinstance(r, dict):
+                            bad_status = True
+                            break
+                        else:
+                            exp_st = "passed" if r.get("passed") is True else "failed"
+                            if st != exp_st:
+                                bad_status = True
+                                break
+                if bad_status:
+                    issues.append(f"{suite_name}: case_status_mismatch")
+                recomputed_passed = sum(1 for c in row["cases"] if isinstance(c, dict) and c.get("status") == "passed")
+                recomputed_failed = sum(
+                    1 for c in row["cases"] if isinstance(c, dict) and c.get("status") in ("failed", "missing")
+                )
+                if recomputed_passed != passed or (recomputed_passed + recomputed_failed) != total:
+                    issues.append(f"{suite_name}: case_counts_mismatch")
             cases_passed += passed
             cases_total += total
             for lane in ("oracle_driver", "rcmake_driver"):
@@ -582,6 +655,7 @@ def check_runcmake(record: ReceiptRecord, findings: list[Finding]) -> None:
                 if driver is not None and (
                     not isinstance(driver, dict)
                     or driver.get("complete") is not True
+                    or driver.get("timed_out") is True
                     or bool(driver.get("driver_errors"))
                 ):
                     issues.append(f"{suite_name}:{lane}")

@@ -1,0 +1,18 @@
+[package]
+name = "rcmake-shim"
+description = "Tiny launcher shim forwarding cmake, ctest, cpack, and rcmake-lsp invocations to sibling rcmake."
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rcmake-shim"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

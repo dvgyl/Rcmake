@@ -68,6 +68,7 @@ pub(crate) use link::{
 pub(crate) use modules::scan_responses;
 pub use modules::{bmi_script_path, lower_modules};
 pub(crate) use pch::{IdeLowering, Plans as PchPlans};
+pub(crate) use shell::windows_host;
 pub use shell::{
     cmake_posix_quote, custom_shell_operator, rule_command_chain, simple_args as rule_arguments,
 };

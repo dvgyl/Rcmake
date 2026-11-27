@@ -257,13 +257,49 @@ fn windows_multi_config_clean_uses_make_program_and_selected_paths()
         ..GenerationResult::default()
     };
     generate_multi(&result, &host, dir, Some(&model), windows(), None)?;
+    let rules = read(&host, "CMakeFiles/rules.ninja");
+    assert!(
+        rules.contains(r#"  command = "C:/Ninja Tools/ninja.exe" $FILE_ARG -t clean $TARGETS"#),
+        "{rules}"
+    );
+    assert!(
+        rules.contains("rule CLEAN_ADDITIONAL\n  command = cmake -DCONFIG=$CONFIG -P CMakeFiles/clean_additional.cmake\n"),
+        "{rules}"
+    );
+    let script = read(&host, "CMakeFiles/clean_additional.cmake");
+    assert!(
+        script.contains("if(\"${CONFIG}\" STREQUAL \"\" OR \"${CONFIG}\" STREQUAL \"Debug\")\n  file(REMOVE_RECURSE\n  \"extra Debug.txt\"\n  )\nendif()"),
+        "{script}"
+    );
+    assert!(
+        script.contains("if(\"${CONFIG}\" STREQUAL \"\" OR \"${CONFIG}\" STREQUAL \"Release\")\n  file(REMOVE_RECURSE\n  \"extra Release.txt\"\n  )\nendif()"),
+        "{script}"
+    );
     let manifest = read(&host, "CMakeFiles/impl-Debug.ninja");
-    assert!(manifest.contains(
-        r#" /C "cmake -E rm -rf -- "/work/build/extra Debug.txt" && "C:/Ninja Tools/ninja.exe" -f CMakeFiles/impl-Debug.ninja -t clean CMakeFiles/rcmake-clean:Debug""#
-    ));
-    assert!(manifest.contains(
-        r#" /C "cmake -E rm -rf -- "/work/build/extra Debug.txt" "/work/build/extra Release.txt" && "C:/Ninja Tools/ninja.exe" -f CMakeFiles/impl-Debug.ninja -t clean CMakeFiles/rcmake-clean:Debug CMakeFiles/rcmake-clean:Release""#
-    ));
+    assert!(
+        manifest.contains(
+            "build CMakeFiles/clean.additional$:Debug: CLEAN_ADDITIONAL\n  CONFIG = Debug\n"
+        ),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains(
+            "build CMakeFiles/clean.additional$:Release: CLEAN_ADDITIONAL\n  CONFIG = Release\n"
+        ),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains(
+            "build clean$:Debug: CLEAN CMakeFiles/clean.additional$:Debug\n  FILE_ARG = -f CMakeFiles/impl-Debug.ninja\n  TARGETS = CMakeFiles/rcmake-clean:Debug\n"
+        ),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains(
+            "build clean$:all: CLEAN CMakeFiles/clean.additional$:Debug CMakeFiles/clean.additional$:Release\n  FILE_ARG = -f CMakeFiles/impl-Debug.ninja\n  TARGETS = CMakeFiles/rcmake-clean:Debug CMakeFiles/rcmake-clean:Release\n"
+        ),
+        "{manifest}"
+    );
     Ok(())
 }
 

@@ -233,13 +233,20 @@ impl FileApi<'_, '_> {
             if rule.options.exclude_from_all {
                 base.insert("isExcludeFromAll".into(), Bool(true));
             }
+            let is_directory_rule = matches!(rule.kind, InstallKind::Directory(_));
             let evaluated_destination = rule
                 .options
                 .destination
                 .as_ref()
                 .map(|destination| {
                     eval_install_genex(self.model, rule.dir, config, &rule.backtrace, destination)
-                        .map(|evaluated| strip_trailing_slash(&evaluated))
+                        .map(|evaluated| {
+                            if is_directory_rule {
+                                cmake_style(&evaluated)
+                            } else {
+                                strip_trailing_slash(&evaluated)
+                            }
+                        })
                 })
                 .transpose()?;
             if let Some(destination) = &evaluated_destination {
@@ -292,11 +299,18 @@ impl FileApi<'_, '_> {
                         .filter(|name| !name.is_empty() && expanded_files.len() == 1);
                     let files = expanded_files.iter().map(|file| {
                         if directory {
-                            let (from, to) = file.strip_suffix(b"/").map_or_else(
-                                || (file.as_slice(), Lexical::new(file).filename()),
-                                |from| (from, b".".as_slice()),
-                            );
-                            installers::path(self.source, from, to)
+                            if let Some(dir_prefix) = file.strip_suffix(b"/.") {
+                                let rel = relative(dir_prefix, self.source);
+                                let mut path = rel;
+                                path.extend_from_slice(b"/.");
+                                Value::string(path)
+                            } else {
+                                let (from, to) = file.strip_suffix(b"/").map_or_else(
+                                    || (file.as_slice(), Lexical::new(file).filename()),
+                                    |from| (from, b".".as_slice()),
+                                );
+                                installers::path(self.source, from, to)
+                            }
                         } else if let Some(to) = rename {
                             installers::path(self.source, file, to)
                         } else {

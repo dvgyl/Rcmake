@@ -189,6 +189,16 @@ impl Interp {
         if !self.admit_call_arguments(u, args, true) {
             return Err(CmdError::Reported);
         }
+        let call_site = self
+            .cur_cmd
+            .as_ref()
+            .map(|(cmds, index)| crate::CallSiteFrame {
+                cmds: Arc::clone(cmds),
+                index: *index,
+                end: self.command_end,
+                scope_depth: self.vars.depth(),
+            });
+        self.call_frames.push(call_site);
         self.push_call_scope(u, true);
 
         let result = if self.bind_function_arguments(u, args) {
@@ -204,6 +214,7 @@ impl Interp {
         }
         let report = result.is_ok() && !self.fatal;
         self.pop_call_scope(true, report);
+        self.call_frames.pop();
         result.map(|_| Flow::Normal)
     }
 
@@ -422,10 +433,21 @@ impl Interp {
         }
         let body = u.body.with_cmds(cmds);
 
+        let call_site = self
+            .cur_cmd
+            .as_ref()
+            .map(|(cmds, index)| crate::CallSiteFrame {
+                cmds: Arc::clone(cmds),
+                index: *index,
+                end: self.command_end,
+                scope_depth: self.vars.depth(),
+            });
+        self.call_frames.push(call_site);
         self.push_call_scope(u, false);
         let result = self.run_code(&body, 0, body.len(), BodyMode::Macro);
         let report = result.is_ok() && !self.fatal;
         self.pop_call_scope(false, report);
+        self.call_frames.pop();
         drop(body);
         self.release_temp(reserved);
         result

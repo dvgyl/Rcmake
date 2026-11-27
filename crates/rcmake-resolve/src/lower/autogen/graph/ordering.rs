@@ -35,7 +35,7 @@ pub(super) fn origin_dependencies(
     };
     let mut usage = UsageResolver::new(model);
     'candidate: for &id in &first.link_targets {
-        let Some(target) = model.target(id).filter(|target| !target.is_imported()) else {
+        let Some(target) = model.target(id) else {
             continue;
         };
         if id == origin_id || !inventory.iter().all(|cfg| cfg.link_targets.contains(&id)) {

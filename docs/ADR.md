@@ -51,6 +51,7 @@ We verified each decision below against the pinned CMake 4.5.1 oracle.
 - [ADR-045 Isolated verify companion and native multi-configuration compile databases](#adr-045-isolated-verify-companion-and-native-multi-configuration-compile-databases)
 - [ADR-046 Stale CMakeCache.txt drift tracking and portable probe-cache exchange](#adr-046-stale-cmakecachetxt-drift-tracking-and-portable-probe-cache-exchange)
 - [ADR-047 Unified version banner and native build-time regeneration persona](#adr-047-unified-version-banner-and-native-build-time-regeneration-persona)
+- [ADR-048 Windows launcher shim and compressed LSP catalog](#adr-048-windows-launcher-shim-and-compressed-lsp-catalog)
 
 ---
 
@@ -863,3 +864,17 @@ Supersede the second `--version` line recorded in ADR-005 so every CLI tool, tes
 Preserve the active persona during build-time regeneration (`--regenerate-during-build`). Previously, `new_interp_with_paths` always substituted a sibling `cmake` symlink into `CMAKE_COMMAND`, causing `ninja` or `make` to re-invoke a native `rcmake` build tree under the compatibility persona. That silently disabled incremental replay, native multi-configuration compile database updates, drift receipt advancement, and find trace updates. Keeping `CMAKE_COMMAND` on `rcmake` for `Persona::Native` while keeping compatibility mode and `RCMAKE_ORACLE_MODE=1` on `cmake` preserves native behavior across build-time regenerations without weakening the compatibility firewall.
 
 Related source files are [CLI driver](../crates/rcmake-cli/src/lib.rs), [persona resolution](../crates/rcmake-cli/src/persona.rs), [help and version output](../crates/rcmake-cli/src/help.rs), [LSP CLI](../crates/rcmake-lsp/src/cli.rs), and [verify companion](../crates/rcmake-harness/src/verify/mod.rs).
+
+---
+
+## ADR-048 Windows launcher shim and compressed LSP catalog
+
+Accepted on 2026-11-27.
+
+Windows ZIP archives cannot represent symbolic links portably, so copying the full `rcmake.exe` engine five times inflated the v0.2.0 Windows archive past 55 MB. Add `crates/rcmake-shim`, a dependency-free safe Rust (`#![forbid(unsafe_code)]`) launcher binary that validates its own basename against a fixed allowlist (`cmake`, `ctest`, `cpack`, `rcmake-lsp`), verifies that a sibling regular file `rcmake.exe` exists in the same directory, and invokes that engine with the private four-argument prefix `--rcmake-internal-shim-tool=<tool> --rcmake-internal-shim-argv0 <orig_argv0> -- <user_args...>`.
+
+The engine strips that prefix only when launched through `rcmake` with all five header tokens matching, preserves the caller `argv[0]` for `CMAKE_ARGV0`, selects the sibling `cmake.exe` for `CMAKE_COMMAND` and parallel install workers, and keeps the launcher out of `PATH` searches. Keeping `rcmake-shim` free of `unsafe` code and external dependencies intentionally omits a Win32 job object, so an external caller that kills `cmake.exe` directly via `TerminateProcess` may leave the child `rcmake.exe` process running, while Ctrl+C and `rcmake` process timeouts terminate both processes together.
+
+Compress the static LSP reference catalog at build time in `crates/rcmake-lsp/build.rs` with a small clean-room LZSS encoder and decode it lazily at runtime in `crates/rcmake-lsp/src/catalog.rs` under strict decompressed-size and entry-count bounds, keeping `--no-default-features` and `wasm32-unknown-unknown` builds intact. Keep hot configure and hashing crates (`sha2`, `zstd`, `rcmake-cps`, `rcmake-instrument`, `rcmake-presets`) at `opt-level = 3` while applying `opt-level = "z"` selectively to cold packaging and language-tool crates.
+
+Related source files are [launcher shim](../crates/rcmake-shim/src/main.rs), [engine entrypoint](../crates/rcmake-cli/src/main.rs), [CLI driver](../crates/rcmake-cli/src/lib.rs), [LSP catalog encoder](../crates/rcmake-lsp/build.rs), [LSP catalog decoder](../crates/rcmake-lsp/src/catalog.rs), and [Windows installer](../scripts/install.ps1).

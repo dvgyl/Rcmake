@@ -1,4 +1,4 @@
-use super::{BString, Edge, Graph, Ninja, Programs, clean::clean_command, qualified};
+use super::{BString, Edge, Graph, Ninja, Programs, qualified};
 
 pub(super) fn emit_utilities(
     ninja: &mut Ninja,
@@ -8,41 +8,37 @@ pub(super) fn emit_utilities(
     rebuild: &[u8],
     scope: Scope<'_, '_>,
 ) {
-    let root_path = rcmake_host::path::from_native(graph.build_dir);
-    let root = graph.commands.path(&root_path);
     emit_directory_utilities(ninja, graph, programs, rebuild, scope);
     if graph.config.is_none() {
         let clean_name = graph.node(b"clean");
         if !graph.has_target(&clean_name) {
-            if graph.clean_files.is_empty() {
+            let mut clean_inputs = Vec::new();
+            if !graph.clean_files.is_empty() {
+                let additional_name = graph.node(b"CMakeFiles/clean.additional");
                 ninja.edge(
-                    b"CLEAN",
+                    b"CLEAN_ADDITIONAL",
                     Edge {
-                        outputs: std::slice::from_ref(&clean_name),
+                        outputs: std::slice::from_ref(&additional_name),
                         ..Edge::default()
                     },
                 );
-                if entry != b"build.ninja" {
-                    let mut file_arg = b"-f ".to_vec();
-                    graph.commands.word(&graph.node(entry), &mut file_arg);
-                    ninja.binding(b"FILE_ARG", &file_arg);
+                if !graph.input.config.0.is_empty() {
+                    ninja.binding(b"CONFIG", &graph.input.config.0);
                 }
-            } else {
-                let mut clean = programs.ninja.clone();
-                if entry != b"build.ninja" {
-                    clean.extend_from_slice(b" -f ");
-                    graph.commands.word(&graph.node(entry), &mut clean);
-                }
-                clean.extend_from_slice(b" -t clean");
-                let clean = clean_command(graph, &programs.cmake, clean, &graph.clean_files);
-                ninja.edge(
-                    b"CLEAN_CUSTOM",
-                    Edge {
-                        outputs: std::slice::from_ref(&clean_name),
-                        ..Edge::default()
-                    },
-                );
-                ninja.binding(b"COMMAND", &clean);
+                clean_inputs.push(additional_name);
+            }
+            ninja.edge(
+                b"CLEAN",
+                Edge {
+                    outputs: std::slice::from_ref(&clean_name),
+                    inputs: &clean_inputs,
+                    ..Edge::default()
+                },
+            );
+            if entry != b"build.ninja" {
+                let mut file_arg = b"-f ".to_vec();
+                graph.commands.word(&graph.node(entry), &mut file_arg);
+                ninja.binding(b"FILE_ARG", &file_arg);
             }
         }
     }
@@ -55,45 +51,6 @@ pub(super) fn emit_utilities(
                 ..Edge::default()
             },
         );
-    }
-    for (name, config_file, enabled, inputs) in [
-        (
-            "package",
-            b"./CPackConfig.cmake".as_slice(),
-            programs.package,
-            programs.package_inputs.as_slice(),
-        ),
-        (
-            "package_source",
-            b"./CPackSourceConfig.cmake",
-            programs.package_source,
-            &[],
-        ),
-    ] {
-        if enabled {
-            let mut command = programs.cpack.clone();
-            if let Some(config) = graph.config {
-                command.extend_from_slice(b" -C ");
-                graph.commands.word(config, &mut command);
-            }
-            command.extend_from_slice(b" --config ");
-            graph.commands.word(config_file, &mut command);
-            emit_utility(
-                ninja,
-                graph,
-                Utility {
-                    dir_prefix: "",
-                    utility: name,
-                    name,
-                    command: &command,
-                    cwd: Some(root.as_slice()),
-                    inputs,
-                    pool: b"console",
-                    rule: b"CUSTOM_COMMAND",
-                    edit_fallback: false,
-                },
-            );
-        }
     }
 }
 
@@ -321,6 +278,48 @@ fn directory_utilities(graph: &Graph<'_>, programs: &Programs, rebuild: &[u8]) -
                     rule: b"CUSTOM_COMMAND",
                     per_config,
                     edit_fallback: fallback,
+                });
+            }
+        }
+        for (utility, config_file, enabled, with_config, depends_all) in [
+            (
+                "package",
+                b"./CPackConfig.cmake".as_slice(),
+                programs.package,
+                true,
+                !programs.package_inputs.is_empty(),
+            ),
+            (
+                "package_source",
+                b"./CPackSourceConfig.cmake",
+                programs.package_source,
+                false,
+                false,
+            ),
+        ] {
+            if enabled {
+                let mut command = programs.cpack.clone();
+                if with_config && let Some(config) = graph.config {
+                    command.extend_from_slice(b" -C ");
+                    graph.commands.word(config, &mut command);
+                }
+                command.extend_from_slice(b" --config ");
+                graph.commands.word(config_file, &mut command);
+                specs.push(Spec {
+                    dir_prefix: prefix.to_owned(),
+                    utility: utility.to_owned(),
+                    name: name(utility),
+                    command,
+                    cwd: Some(root.clone()),
+                    inputs: if depends_all {
+                        vec![all.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    pool: b"console",
+                    rule: b"CUSTOM_COMMAND",
+                    per_config: true,
+                    edit_fallback: false,
                 });
             }
         }

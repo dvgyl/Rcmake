@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rcmake_base::BString;
@@ -1332,6 +1332,129 @@ fn explain_suggests_build_directory_when_default_cache_is_missing() -> rcmake_ho
         host.stream_bytes(Stream::Stderr)
             .to_string()
             .contains("Hint: found ./build/CMakeCache.txt. Try `rcmake explain ... -B build`.")
+    );
+    Ok(())
+}
+
+#[test]
+fn compat_shim_file_selects_sibling_cmake_while_preserving_native_and_mixed_installs()
+-> rcmake_host::HostResult<()> {
+    let prefix = if cfg!(windows) { "C:" } else { "" };
+    let bin = PathBuf::from(format!("{prefix}/opt/rcmake/bin"));
+    let work = PathBuf::from(format!("{prefix}/work"));
+    let rcmake_exe = bin.join("rcmake");
+    let cmake_shim = bin.join("cmake");
+    let host = Arc::new(PureHost::new(work.clone(), rcmake_exe.clone()));
+    let modules = PathBuf::from(format!("{prefix}/opt/rcmake/share/cmake-4.5/Modules"));
+    for (name, contents) in [
+        ("CMakeDetermineSystem.cmake", ""),
+        ("CMakeSystemSpecificInitialize.cmake", ""),
+        ("CMakeSystemSpecificInformation.cmake", ""),
+        (
+            "CMakeNinjaFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM /tools/ninja CACHE FILEPATH \"\")\n",
+        ),
+    ] {
+        host.seed_file(&modules.join(name), contents.as_bytes())?;
+    }
+    // Distinct regular files (not symlinks), modeling the Windows tiny launcher shim layout.
+    host.seed_file(&rcmake_exe, b"engine")?;
+    host.seed_file(&cmake_shim, b"shim")?;
+    host.seed_file(
+        &work.join("probe.cmake"),
+        b"message(STATUS \"ARGV0=${CMAKE_ARGV0} CMD=${CMAKE_COMMAND} CTEST=${CMAKE_CTEST_COMMAND} CPACK=${CMAKE_CPACK_COMMAND}\")\n",
+    )?;
+    let bin_str = format!("{prefix}/opt/rcmake/bin");
+    let cmake_arg = format!("{bin_str}/cmake");
+    let rcmake_arg = format!("{bin_str}/rcmake");
+
+    // 1. Shimmed compat invocation selects sibling cmake (not rcmake) and preserves argv[0].
+    let code = crate::run_compat(
+        crate::Tool::Cmake,
+        &argv(&[&cmake_arg, "-P", "probe.cmake"]),
+        host.clone(),
+    );
+    assert_eq!(code, 0, "{}", host.stream_bytes(Stream::Stderr));
+    let out = host.stream_bytes(Stream::Stdout).to_string();
+    assert!(
+        out.contains(&format!(
+            "ARGV0={bin_str}/cmake CMD={bin_str}/cmake CTEST={bin_str}/ctest CPACK={bin_str}/cpack"
+        )),
+        "unexpected compat shim output: {out}"
+    );
+
+    // 2. Direct Native rcmake keeps CMAKE_COMMAND pointing to rcmake.
+    let native_host = Arc::new(PureHost::new(work.clone(), rcmake_exe.clone()));
+    for (name, contents) in [
+        ("CMakeDetermineSystem.cmake", ""),
+        ("CMakeSystemSpecificInitialize.cmake", ""),
+        ("CMakeSystemSpecificInformation.cmake", ""),
+    ] {
+        native_host.seed_file(&modules.join(name), contents.as_bytes())?;
+    }
+    native_host.seed_file(&rcmake_exe, b"engine")?;
+    native_host.seed_file(&cmake_shim, b"shim")?;
+    native_host.seed_file(
+        &work.join("probe.cmake"),
+        b"message(STATUS \"CMD=${CMAKE_COMMAND}\")\n",
+    )?;
+    assert_eq!(invoke(&native_host, &[&rcmake_arg, "-P", "probe.cmake"]), 0);
+    assert_eq!(
+        native_host.stream_bytes(Stream::Stdout).to_string(),
+        format!("-- CMD={bin_str}/rcmake\n")
+    );
+
+    // 3. Direct rcmake under RCMAKE_ORACLE_MODE=1 must keep CMAKE_COMMAND pointing to rcmake,
+    // even when a sibling cmake file or symlink exists beside it (determinism.py invariant).
+    let oracle_host = Arc::new(PureHost::new(work.clone(), rcmake_exe.clone()));
+    for (name, contents) in [
+        ("CMakeDetermineSystem.cmake", ""),
+        ("CMakeSystemSpecificInitialize.cmake", ""),
+        ("CMakeSystemSpecificInformation.cmake", ""),
+    ] {
+        oracle_host.seed_file(&modules.join(name), contents.as_bytes())?;
+    }
+    oracle_host.seed_file(&rcmake_exe, b"engine")?;
+    oracle_host.symlink(&rcmake_exe, &cmake_shim)?;
+    oracle_host.seed_file(
+        &work.join("probe.cmake"),
+        b"message(STATUS \"CMD=${CMAKE_COMMAND}\")\n",
+    )?;
+    oracle_host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"1"));
+    assert_eq!(invoke(&oracle_host, &[&rcmake_arg, "-P", "probe.cmake"]), 0);
+    assert_eq!(
+        oracle_host.stream_bytes(Stream::Stdout).to_string(),
+        format!("-- CMD={bin_str}/rcmake\n")
+    );
+
+    // 4. `cmake --install` via compat shim exposes sibling cmake in CMAKE_ARGV0 and CMAKE_COMMAND.
+    let install_host = Arc::new(PureHost::new(work.clone(), rcmake_exe.clone()));
+    for (name, contents) in [
+        ("CMakeDetermineSystem.cmake", ""),
+        ("CMakeSystemSpecificInitialize.cmake", ""),
+        ("CMakeSystemSpecificInformation.cmake", ""),
+    ] {
+        install_host.seed_file(&modules.join(name), contents.as_bytes())?;
+    }
+    install_host.seed_file(&rcmake_exe, b"engine")?;
+    install_host.seed_file(&cmake_shim, b"shim")?;
+    install_host.seed_file(
+        &work.join("out/cmake_install.cmake"),
+        b"message(STATUS \"INSTALL_ARGV0=${CMAKE_ARGV0} INSTALL_CMD=${CMAKE_COMMAND}\")\n",
+    )?;
+    assert_eq!(
+        crate::run_compat(
+            crate::Tool::Cmake,
+            &argv(&[&cmake_arg, "--install", "out"]),
+            install_host.clone(),
+        ),
+        0,
+        "{}",
+        install_host.stream_bytes(Stream::Stderr)
+    );
+    assert_eq!(
+        install_host.stream_bytes(Stream::Stdout).to_string(),
+        format!("-- INSTALL_ARGV0={bin_str}/cmake INSTALL_CMD={bin_str}/cmake\n")
     );
     Ok(())
 }

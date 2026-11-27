@@ -1,6 +1,6 @@
 //! Build backtrace graphs for directory and target replies.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use rcmake_base::BString;
 use rcmake_diag::{Backtrace, Frame};
@@ -9,7 +9,7 @@ use rcmake_model::BT;
 use super::super::{Members, Object, UInt, Value, array, members, object, relative, strings};
 use super::number;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct BacktraceNode {
     file: usize,
     line: u32,
@@ -17,14 +17,28 @@ struct BacktraceNode {
     parent: Option<usize>,
 }
 
+/// Identity of a `backtraceGraph` node.
+///
+/// CMake keys nodes by the address of the `cmListFileContext` stack entry. Each
+/// command call has its own entry, so two calls with equal file, line, command,
+/// and caller are different nodes (for example one `install()` line that a
+/// `foreach()` loop runs three times). A frame without a line and a command only
+/// names a listfile; it is equal to all other frames of that file and caller.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum NodeKey {
+    Call(u64),
+    File(BacktraceNode),
+}
+
 pub(super) struct Backtraces<'a> {
     source: &'a [u8],
     files: Vec<BString>,
-    file_indexes: BTreeMap<BString, usize>,
+    file_indexes: HashMap<BString, usize>,
+    raw_file_indexes: HashMap<BString, usize>,
     commands: Vec<BString>,
-    command_indexes: BTreeMap<BString, usize>,
+    command_indexes: HashMap<BString, usize>,
     nodes: Vec<BacktraceNode>,
-    node_indexes: BTreeMap<BacktraceNode, usize>,
+    node_indexes: HashMap<NodeKey, usize>,
 }
 
 impl<'a> Backtraces<'a> {
@@ -32,53 +46,71 @@ impl<'a> Backtraces<'a> {
         Self {
             source,
             files: Vec::new(),
-            file_indexes: BTreeMap::new(),
+            file_indexes: HashMap::new(),
+            raw_file_indexes: HashMap::new(),
             commands: Vec::new(),
-            command_indexes: BTreeMap::new(),
+            command_indexes: HashMap::new(),
             nodes: Vec::new(),
-            node_indexes: BTreeMap::new(),
+            node_indexes: HashMap::new(),
         }
     }
 
     pub(super) fn add(&mut self, trace: &Backtrace) -> Option<usize> {
-        let frames: Vec<_> = trace.frames().collect();
-        self.add_frames(&frames)
+        let mut iter = trace.frame_nodes();
+        self.add_iter(&mut iter)
     }
 
-    fn add_frames(&mut self, frames: &[&Frame]) -> Option<usize> {
-        let (&top, rest) = frames.split_first()?;
-        let file = intern(
-            &mut self.files,
-            &mut self.file_indexes,
-            relative(&top.file, self.source),
-        );
+    fn intern_raw_file(&mut self, raw: &[u8]) -> usize {
+        if let Some(&index) = self.raw_file_indexes.get(raw) {
+            return index;
+        }
+        let rel = relative(raw, self.source);
+        let index = intern(&mut self.files, &mut self.file_indexes, rel);
+        self.raw_file_indexes.insert(BString::from(raw), index);
+        index
+    }
+
+    fn add_iter<'f>(
+        &mut self,
+        frames: &mut impl Iterator<Item = (u64, &'f Frame)>,
+    ) -> Option<usize> {
+        let (id, top) = frames.next()?;
+        let key = (top.line != 0 || top.name.as_deref().is_some_and(|name| !name.is_empty()))
+            .then_some(NodeKey::Call(id));
+        if let Some(&index) = key.as_ref().and_then(|key| self.node_indexes.get(key)) {
+            return Some(index);
+        }
+        let file = self.intern_raw_file(&top.file);
         let command = top
             .name
             .as_deref()
             .filter(|name| !name.is_empty())
             .map(|name| intern_slice(&mut self.commands, &mut self.command_indexes, name));
-        let parent = if !rest.is_empty() {
-            self.add_frames(rest)
+        let parent = if let Some(parent) = self.add_iter(frames) {
+            Some(parent)
         } else if top.line != 0 {
-            Some(self.node(BacktraceNode {
+            let sentinel = BacktraceNode {
                 file,
                 line: 0,
                 command: None,
                 parent: None,
-            }))
+            };
+            Some(self.node(NodeKey::File(sentinel), sentinel))
         } else {
             None
         };
-        Some(self.node(BacktraceNode {
+        let node = BacktraceNode {
             file,
             line: top.line,
             command,
             parent,
-        }))
+        };
+        Some(self.node(key.unwrap_or(NodeKey::File(node)), node))
     }
 
-    fn node(&mut self, node: BacktraceNode) -> usize {
-        *self.node_indexes.entry(node).or_insert_with(|| {
+    /// Return the index of `key`, and append `node` (after its parents) if it is new.
+    fn node(&mut self, key: NodeKey, node: BacktraceNode) -> usize {
+        *self.node_indexes.entry(key).or_insert_with(|| {
             let index = self.nodes.len();
             self.nodes.push(node);
             index
@@ -120,7 +152,7 @@ impl<'a> Backtraces<'a> {
 
 fn intern(
     values: &mut Vec<BString>,
-    indexes: &mut BTreeMap<BString, usize>,
+    indexes: &mut HashMap<BString, usize>,
     value: BString,
 ) -> usize {
     if let Some(&index) = indexes.get(&value) {
@@ -134,7 +166,7 @@ fn intern(
 
 fn intern_slice(
     values: &mut Vec<BString>,
-    indexes: &mut BTreeMap<BString, usize>,
+    indexes: &mut HashMap<BString, usize>,
     value: &[u8],
 ) -> usize {
     if let Some(&index) = indexes.get(value) {

@@ -1,6 +1,6 @@
 //! Source and compile group entries in a target reply.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 use rcmake_base::{BString, Limits, list, path_lex::Lexical, truth::is_on};
@@ -17,7 +17,7 @@ use rcmake_resolve::{
 
 use crate::GenError;
 
-use super::super::{Bool, FileApi, Members, Object, Value, array, members, relative};
+use super::super::{Bool, FileApi, Members, Object, Value, array, json_bytes, members, relative};
 use super::{
     ConfigIndices,
     backtraces::Backtraces,
@@ -82,6 +82,9 @@ impl FileApi<'_, '_> {
             })
             .collect();
         let mut seen = BTreeSet::new();
+        // Languages of the object libraries whose objects the target uses
+        // (`cmGeneratorTarget::GetLanguages` adds them to the target languages).
+        let mut object_languages = BTreeSet::<BString>::new();
         if let Some(raw) = raw
             && raw
                 .props
@@ -103,47 +106,75 @@ impl FileApi<'_, '_> {
                         .and_then(|pch| pch.use_flags.get(&unit.source.value))
                         .cloned()
                         .unwrap_or_default();
-                    sources.push(self.source(raw, path, &file_trace, Some((unit.group, flags))));
+                    sources.push(self.source(
+                        target.id,
+                        raw,
+                        path,
+                        &file_trace,
+                        Some((unit.group, flags)),
+                    ));
                 }
             }
         }
         if let Some(raw) = raw {
-            for entry in &raw.sources {
-                for source in list::split(&entry.value, list::Empty::Drop) {
-                    if let Some(name) = source
-                        .strip_prefix(b"$<TARGET_OBJECTS:")
-                        .and_then(|name| name.strip_suffix(b">"))
-                    {
-                        if let Some(dependency) = self
-                            .model
-                            .find_target(raw.dir, name)
-                            .and_then(|id| targets.get(&id))
-                        {
-                            append_objects(
-                                &mut sources,
-                                &mut seen,
-                                self.build,
-                                dependency.target,
-                                &entry.backtrace,
-                            );
-                        }
-                        continue;
-                    }
-                    if rcmake_genex::find_genex(&source).is_some() {
-                        continue;
-                    }
+            let src_ctx = EvalContext {
+                config: target.config.clone(),
+                head: u32::try_from(target.id.index())
+                    .ok()
+                    .map(rcmake_genex::TargetHandle),
+                traversal: rcmake_genex::UsageTraversal::Compile,
+                ..Default::default()
+            };
+            let mut object_files: Option<BTreeMap<BString, &BString>> = None;
+            let mut push_evaluated_source =
+                |source: &BString,
+                 backtrace: &Backtrace,
+                 sources: &mut Vec<Source>,
+                 seen: &mut BTreeSet<BString>,
+                 object_languages: &mut BTreeSet<BString>| {
                     let path = self
                         .result
                         .target_depends
-                        .resolved_source(target.id, &source)
+                        .resolved_source(target.id, source)
                         .cloned()
-                        .unwrap_or_else(|| Lexical::new(&source_dir.append(&source)).normalize());
+                        .unwrap_or_else(|| Lexical::new(&source_dir.append(source)).normalize());
+                    let objects = object_files.get_or_insert_with(|| {
+                        targets
+                            .values()
+                            .filter(|dep| dep.target.metadata.kind == TargetKind::ObjectLibrary)
+                            .flat_map(|dep| {
+                                dep.target.compile_units.iter().filter_map(|unit| {
+                                    let group = dep.target.compile_groups.get(unit.group)?;
+                                    Some((
+                                        Lexical::new(self.build).append(&unit.object),
+                                        &group.language,
+                                    ))
+                                })
+                            })
+                            .collect()
+                    });
+                    if let Some(&language) = objects.get(&path) {
+                        if !object_languages.contains(language) {
+                            object_languages.insert(language.clone());
+                        }
+                        if seen.insert(path.clone()) {
+                            sources.push(Source {
+                                path,
+                                trace: backtrace.clone(),
+                                generated: true,
+                                source_group: "Object Libraries".into(),
+                                compile: None,
+                            });
+                        }
+                        return;
+                    }
                     if seen.insert(path.clone()) {
                         let unit = units.get(&path).copied();
                         sources.push(self.source(
+                            target.id,
                             raw,
                             path,
-                            &entry.backtrace,
+                            backtrace,
                             unit.map(|unit| {
                                 (
                                     unit.group,
@@ -153,6 +184,119 @@ impl FileApi<'_, '_> {
                                 )
                             }),
                         ));
+                    }
+                };
+            for entry in &raw.sources {
+                for source in list::split(&entry.value, list::Empty::Drop) {
+                    if let Some(name) = source
+                        .strip_prefix(b"$<TARGET_OBJECTS:")
+                        .and_then(|name| name.strip_suffix(b">"))
+                        && rcmake_genex::find_genex(name).is_none()
+                    {
+                        if let Some(dependency) = self
+                            .model
+                            .find_target(raw.dir, name)
+                            .and_then(|id| targets.get(&id))
+                        {
+                            append_objects(
+                                &mut sources,
+                                &mut seen,
+                                &mut object_languages,
+                                self.build,
+                                dependency.target,
+                                &entry.backtrace,
+                            );
+                        }
+                        continue;
+                    }
+                    if rcmake_genex::find_genex(&source).is_some() {
+                        let single = [BT::new(source, entry.backtrace.clone())];
+                        if let Ok(evaluated) =
+                            usage.file_set_paths(target.id, b"SOURCES", &single, &src_ctx)
+                        {
+                            for item in evaluated {
+                                push_evaluated_source(
+                                    &item.value,
+                                    &item.backtrace,
+                                    &mut sources,
+                                    &mut seen,
+                                    &mut object_languages,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    push_evaluated_source(
+                        &source,
+                        &entry.backtrace,
+                        &mut sources,
+                        &mut seen,
+                        &mut object_languages,
+                    );
+                }
+            }
+            if !raw.is_imported()
+                && !matches!(
+                    raw.kind,
+                    TargetKind::InterfaceLibrary | TargetKind::GlobalTarget
+                )
+                && let Ok(collected) = usage.collect_property(target.id, b"SOURCES", &src_ctx)
+            {
+                for item in collected.entries {
+                    push_evaluated_source(
+                        &item.value,
+                        &item.backtrace,
+                        &mut sources,
+                        &mut seen,
+                        &mut object_languages,
+                    );
+                }
+            }
+        }
+        for unit in &target.compile_units {
+            let path = Lexical::new(&source_dir.append(&unit.source.value)).normalize();
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let flags = pch
+                .and_then(|pch| pch.use_flags.get(&unit.source.value))
+                .cloned()
+                .unwrap_or_default();
+            let compile = Some((unit.group, flags));
+            let trace = &unit.source.backtrace;
+            sources.push(match raw {
+                Some(raw) => self.source(target.id, raw, path, trace, compile),
+                None => Source {
+                    path,
+                    trace: trace.clone(),
+                    generated: false,
+                    source_group: "Source Files".into(),
+                    compile,
+                },
+            });
+        }
+
+        if let Some(raw) = raw {
+            for path in &file_sets.order {
+                if let Some(member) = file_sets.sources.get(path).filter(|member| member.in_build)
+                    && seen.insert(path.clone())
+                {
+                    let trace = member.traces.first().unwrap_or(&file_trace);
+                    sources.push(self.source(target.id, raw, path.clone(), trace, None));
+                }
+            }
+        }
+        for build_graph in &self.result.graphs {
+            if let Some(pch) = build_graph.pch_details.get(&target.id) {
+                for entry in &pch.create {
+                    if seen.insert(entry.header.clone()) {
+                        sources.push(Source {
+                            path: entry.header.clone(),
+                            trace: file_trace.clone(),
+                            generated: false,
+                            source_group: "Precompile Header File".into(),
+                            compile: None,
+                        });
                     }
                 }
             }
@@ -174,58 +318,11 @@ impl FileApi<'_, '_> {
                     append_objects(
                         &mut sources,
                         &mut seen,
+                        &mut object_languages,
                         self.build,
                         dependency.target,
                         &item.text.backtrace,
                     );
-                }
-            }
-        }
-        for unit in &target.compile_units {
-            let path = Lexical::new(&source_dir.append(&unit.source.value)).normalize();
-            if !seen.insert(path.clone()) {
-                continue;
-            }
-            let flags = pch
-                .and_then(|pch| pch.use_flags.get(&unit.source.value))
-                .cloned()
-                .unwrap_or_default();
-            let compile = Some((unit.group, flags));
-            let trace = &unit.source.backtrace;
-            sources.push(match raw {
-                Some(raw) => self.source(raw, path, trace, compile),
-                None => Source {
-                    path,
-                    trace: trace.clone(),
-                    generated: false,
-                    source_group: "Source Files".into(),
-                    compile,
-                },
-            });
-        }
-
-        if let Some(raw) = raw {
-            for path in &file_sets.order {
-                if let Some(member) = file_sets.sources.get(path).filter(|member| member.in_build)
-                    && seen.insert(path.clone())
-                {
-                    let trace = member.traces.first().unwrap_or(&file_trace);
-                    sources.push(self.source(raw, path.clone(), trace, None));
-                }
-            }
-        }
-        for build_graph in &self.result.graphs {
-            if let Some(pch) = build_graph.pch_details.get(&target.id) {
-                for entry in &pch.create {
-                    if seen.insert(entry.header.clone()) {
-                        sources.push(Source {
-                            path: entry.header.clone(),
-                            trace: file_trace.clone(),
-                            generated: false,
-                            source_group: "Precompile Header File".into(),
-                            compile: None,
-                        });
-                    }
                 }
             }
         }
@@ -252,7 +349,21 @@ impl FileApi<'_, '_> {
             add_rule(&mut sources, path, &file_trace);
         }
         if !self.result.target_depends.targets().is_empty() {
-            for traced in self.result.target_depends.traced_sources(target.id) {
+            let traced = self.result.target_depends.traced_sources(target.id);
+            let initial: Vec<&[u8]> = sources
+                .iter()
+                .map(|source| source.path.as_slice())
+                .collect();
+            let utility = (target.metadata.kind == TargetKind::Utility).then(|| {
+                Lexical::new(&target.metadata.binary_dir)
+                    .append(&[b"CMakeFiles/".as_slice(), &target.metadata.name].concat())
+            });
+            for traced in self.trace_order(
+                target.id,
+                &initial,
+                utility.as_ref().map(|path| path.as_slice()),
+                traced,
+            ) {
                 if !seen.insert(traced.clone()) {
                     continue;
                 }
@@ -266,7 +377,7 @@ impl FileApi<'_, '_> {
                     });
                 } else {
                     sources.push(match raw {
-                        Some(raw) => self.source(raw, traced.clone(), &file_trace, None),
+                        Some(raw) => self.source(target.id, raw, traced.clone(), &file_trace, None),
                         None => Source {
                             path: traced.clone(),
                             trace: file_trace.clone(),
@@ -296,9 +407,11 @@ impl FileApi<'_, '_> {
         }
 
         let mut source_groups = IndexMap::<BString, (Vec<usize>, Vec<usize>)>::new();
-        let mut compile_groups = IndexMap::<(usize, BString), Vec<usize>>::new();
         let mut group_matcher = SourceGroupMatcher::default();
-        let values = sources.into_iter().enumerate().map(|(index, source)| {
+        let mut source_entries = Vec::with_capacity(sources.len());
+        let mut source_traces = Vec::with_capacity(sources.len());
+        let mut source_compiles = Vec::with_capacity(sources.len());
+        for (index, source) in sources.into_iter().enumerate() {
             let mut entry = members([("path", Value::string(relative(&source.path, self.source)))]);
             let member = file_sets.sources.get(&source.path);
             if let Some(member) = member {
@@ -307,41 +420,20 @@ impl FileApi<'_, '_> {
             let group_name = raw.map_or(source.source_group.clone(), |raw| {
                 self.source_group(raw, &source, member, &mut group_matcher)
             });
-            if let Some(compile) = source
-                .compile
-                .filter(|(group, _)| *group < target.compile_groups.len())
-            {
-                let group = compile_groups.entry(compile);
-                entry.insert("compileGroupIndex".into(), number(group.index()));
-                group.or_default().push(index);
-            }
+            source_compiles.push(
+                source
+                    .compile
+                    .filter(|(group, _)| *group < target.compile_groups.len()),
+            );
             let group = source_groups.entry(group_name);
             entry.insert("sourceGroupIndex".into(), number(group.index()));
             group.or_default().0.push(index);
-            let backtraces: Vec<_> = match member {
-                Some(member) if !member.traces.is_empty() => member
-                    .traces
-                    .iter()
-                    .filter_map(|trace| graph.add(trace))
-                    .collect(),
-                _ => graph.add(&source.trace).into_iter().collect(),
-            };
-            if let Some(&first) = backtraces.first() {
-                entry.insert(
-                    "backtrace".into(),
-                    number(graph.add(&source.trace).unwrap_or(first)),
-                );
-                entry.insert(
-                    "backtraces".into(),
-                    array(backtraces.into_iter().map(number)),
-                );
-            }
             if source.generated {
                 entry.insert("isGenerated".into(), Bool(true));
             }
-            Object(entry)
-        });
-        body.insert("sources".into(), array(values));
+            source_traces.push((source.path, source.trace));
+            source_entries.push(entry);
+        }
         if let Some(raw) = raw {
             let interfaces = interface_sources(self.model, target.id, raw, &target.config, usage)?
                 .into_iter()
@@ -362,7 +454,7 @@ impl FileApi<'_, '_> {
                     if let Some(member) = member {
                         member.tag(&mut entry);
                     }
-                    let source = self.source(raw, path, &file_trace, None);
+                    let source = self.source(target.id, raw, path, &file_trace, None);
                     let group = source_groups.entry(self.source_group(
                         raw,
                         &source,
@@ -409,24 +501,138 @@ impl FileApi<'_, '_> {
                 },
             )
             .map_err(|error| GenError::Invalid(error.to_string().into()))?;
-        let groups = compile_groups
-            .into_iter()
-            .filter_map(|((index, flags), sources)| {
-                target
-                    .compile_groups
-                    .get(index)
-                    .map(|group| (group, flags, sources))
-            })
-            .map(|(group, flags, sources)| {
-                let context = EvalContext {
-                    config: target.config.clone(),
-                    language: Some(group.language.clone()),
-                    ..EvalContext::default()
-                };
-                let data = CompileData::new(self, target, raw, usage, context, group, flags)?;
-                Ok(data.write(sources, graph, apple, &linked_frameworks))
-            })
-            .collect::<Result<Vec<_>, GenError>>()?;
+        // `cmFileAPICodemodel` `Target::Dump` adds backtraces to the graph in this
+        // order: (1) `ProcessLanguages` computes the target-wide compile data of
+        // each target language, in sorted language order, also for languages
+        // that no compile group uses; (2) `DumpSources` adds the backtraces of
+        // each source, then the source-specific compile data of that source.
+        // Compute the compile data first, then add the backtraces in that order,
+        // then write the groups.
+        let mut compile_data = IndexMap::<(usize, BString), CompileData>::new();
+        let mut source_data = Vec::with_capacity(source_compiles.len());
+        for compile in source_compiles {
+            let Some(key) = compile else {
+                source_data.push(None);
+                continue;
+            };
+            if let Some(index) = compile_data.get_index_of(&key) {
+                source_data.push(Some(index));
+                continue;
+            }
+            let Some(group) = target.compile_groups.get(key.0) else {
+                source_data.push(None);
+                continue;
+            };
+            let context = EvalContext {
+                config: target.config.clone(),
+                language: Some(group.language.clone()),
+                ..EvalContext::default()
+            };
+            let pch_flags = key.1.clone();
+            let data = CompileData::new(self, target, raw, usage, context, group, pch_flags)?;
+            source_data.push(Some(compile_data.len()));
+            compile_data.insert(key, data);
+        }
+        let compiling = raw.filter(|raw| can_compile_sources(raw));
+        let mut languages = BTreeSet::new();
+        for data in compile_data.values() {
+            languages.insert(data.group.language.as_slice());
+        }
+        let mut extra_languages = BTreeSet::new();
+        if let Some(raw) = compiling {
+            for ((path, _), data) in source_traces.iter().zip(&source_data) {
+                if data.is_none()
+                    && let Some(language) =
+                        rcmake_resolve::lower::source_language(self.model, raw, path)
+                {
+                    extra_languages.insert(language);
+                }
+            }
+            extra_languages.extend(object_languages);
+        }
+        languages.extend(extra_languages.iter().map(|language| language.as_slice()));
+        for language in languages {
+            if let Some(data) = compile_data
+                .values()
+                .find(|data| data.group.language.as_slice() == language)
+            {
+                data.add_target_traces(graph, &linked_frameworks);
+            } else if let Some(raw) = compiling
+                && let Some(data) = self.language_data(target, raw, usage, language)
+            {
+                data.add_target_traces(graph, &linked_frameworks);
+            }
+        }
+        for ((entry, (path, trace)), data) in source_entries
+            .iter_mut()
+            .zip(&source_traces)
+            .zip(&source_data)
+        {
+            let member = file_sets.sources.get(path);
+            let backtraces: Vec<_> = match member {
+                Some(member) if !member.traces.is_empty() => member
+                    .traces
+                    .iter()
+                    .filter_map(|trace| graph.add(trace))
+                    .collect(),
+                _ => graph.add(trace).into_iter().collect(),
+            };
+            if let Some(&first) = backtraces.first() {
+                entry.insert(
+                    "backtrace".into(),
+                    number(graph.add(trace).unwrap_or(first)),
+                );
+                entry.insert(
+                    "backtraces".into(),
+                    array(backtraces.into_iter().map(number)),
+                );
+            }
+            if let Some(data) = data.and_then(|index| compile_data.get_index(index)) {
+                data.1.add_source_traces(graph);
+            }
+        }
+
+        // Equal compile data of different keys is one compile group.
+        let single = compile_data.len() == 1;
+        let mut groups = IndexMap::<BString, (Members, Vec<usize>)>::new();
+        let mut data_groups = Vec::with_capacity(compile_data.len());
+        for data in compile_data.into_values() {
+            let mut hidden = BString::default();
+            if !single {
+                data.hidden_key(graph, &mut hidden);
+            }
+            let rendered = data.into_members(graph, apple, &linked_frameworks);
+            let digest = if single {
+                BString::default()
+            } else {
+                let mut digest = json_bytes(&Object(rendered.clone()));
+                digest.extend_from_slice(&hidden);
+                digest
+            };
+            let entry = groups.entry(digest);
+            data_groups.push(entry.index());
+            entry.or_insert((rendered, Vec::new()));
+        }
+        for (src_idx, (entry, data)) in source_entries.iter_mut().zip(source_data).enumerate() {
+            let Some(group) = data.and_then(|index| data_groups.get(index).copied()) else {
+                continue;
+            };
+            if let Some((_, (_, indices))) = groups.get_index_mut(group) {
+                indices.push(src_idx);
+            }
+            entry.insert("compileGroupIndex".into(), number(group));
+        }
+        body.insert(
+            "sources".into(),
+            array(source_entries.into_iter().map(Object)),
+        );
+        let groups = groups.into_values().map(|(mut group_body, indices)| {
+            group_body.insert(
+                "sourceIndexes".into(),
+                array(indices.into_iter().map(number)),
+            );
+            Object(group_body)
+        });
         optional_array(body, "compileGroups", groups);
         Ok(())
     }
@@ -463,8 +669,101 @@ impl FileApi<'_, '_> {
         }
     }
 
+    /// Compute the target-level compile data of `language` for a target that
+    /// compiles no source of that language. CMake still computes this data
+    /// (for example for the languages of the object libraries whose objects a
+    /// target links), so its backtraces are in the graph. Return `None` if the
+    /// data cannot be computed; it adds only graph nodes.
+    fn language_data(
+        &self,
+        target: &ResolvedTarget,
+        raw: &Target,
+        usage: &mut UsageResolver<'_>,
+        language: &[u8],
+    ) -> Option<CompileData> {
+        let language = BString::from(language);
+        let context = EvalContext {
+            config: target.config.clone(),
+            language: Some(language.clone()),
+            ..EvalContext::default()
+        };
+        let flags = usage
+            .collect(target.id, UsageField::CompileOptions, &context)
+            .ok()?
+            .entries;
+        let mut defines = usage
+            .collect(target.id, UsageField::CompileDefinitions, &context)
+            .ok()?
+            .entries;
+        for define in &mut defines {
+            if let Some(name) = define.value.strip_prefix(b"-D") {
+                define.value = BString::from(name);
+            }
+        }
+        // `cmLocalGenerator::GetIncludeDirectories` drops the implicit directories.
+        let key = [
+            b"CMAKE_",
+            language.as_slice(),
+            b"_IMPLICIT_INCLUDE_DIRECTORIES",
+        ]
+        .concat();
+        let implicit: BTreeSet<_> = self
+            .model
+            .definition(raw.dir, &key)
+            .into_iter()
+            .flat_map(|value| list::split(value, list::Empty::Drop))
+            .map(|path| include_identity(&path))
+            .collect();
+        let mut includes = usage.collect_includes(target.id, &context).ok()?;
+        includes.retain(|include| !implicit.contains(&include_identity(&include.path.value)));
+        let group = CompileGroup {
+            language,
+            flags,
+            defines,
+            includes,
+            ..CompileGroup::default()
+        };
+        CompileData::new(
+            self,
+            target,
+            Some(raw),
+            usage,
+            context,
+            &group,
+            BString::default(),
+        )
+        .ok()
+    }
+
+    /// Order the traced sources of a target as `cmTargetTraceDependencies` does.
+    ///
+    /// The trace queue holds the source files of the target. It processes each
+    /// entry in order and appends the source that carries the custom command
+    /// that generates a file (the `.rule` file or the `MAIN_DEPENDENCY`).
+    /// `CheckCustomCommand` collects the `DEPENDS` of a command in a
+    /// `std::set<std::string>`, so it follows them in sorted path order. The
+    /// first entries of the trace keep their order; each command appends the
+    /// commands that generate its dependencies in sorted dependency order.
+    fn trace_order<'t>(
+        &self,
+        target_id: TargetId,
+        initial: &[&[u8]],
+        utility: Option<&[u8]>,
+        traced: &'t [BString],
+    ) -> Vec<&'t BString> {
+        trace_order_for_graphs(
+            &self.model.dir(rcmake_model::DirId::ROOT).binary_dir,
+            &self.result.graphs,
+            target_id,
+            initial,
+            utility,
+            traced,
+        )
+    }
+
     fn source(
         &self,
+        target_id: TargetId,
         raw: &Target,
         path: BString,
         trace: &Backtrace,
@@ -476,7 +775,11 @@ impl FileApi<'_, '_> {
                 .source_props
                 .get(&path)
                 .and_then(|props| props.get(b"GENERATED"))
-                .is_some_and(|value| is_on(value));
+                .is_some_and(|value| is_on(value))
+            || self
+                .result
+                .target_depends
+                .is_generated_source(target_id, &path);
         Source {
             path,
             trace: trace.clone(),
@@ -485,6 +788,212 @@ impl FileApi<'_, '_> {
             compile,
         }
     }
+}
+
+/// Order the traced sources of a target across all configuration graphs as
+/// `cmTargetTraceDependencies` does.
+fn trace_order_for_graphs<'t>(
+    binary_root: &[u8],
+    graphs: &[rcmake_resolve::BuildGraph],
+    target_id: TargetId,
+    initial: &[&[u8]],
+    utility: Option<&[u8]>,
+    traced: &'t [BString],
+) -> Vec<&'t BString> {
+    let mut rank = HashMap::<BString, usize>::new();
+    for graph in graphs {
+        let Some(steps) = graph.custom_source_steps.get(&target_id) else {
+            continue;
+        };
+        for carrier in trace_steps_for_graph(binary_root, graph, steps, initial, utility) {
+            let next = rank.len();
+            rank.entry(carrier).or_insert(next);
+        }
+    }
+    if rank.is_empty() {
+        return traced.iter().collect();
+    }
+    let fallback_base = rank.len();
+    let mut ordered: Vec<(usize, &BString)> = traced
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            (
+                rank.get(path.as_slice())
+                    .copied()
+                    .unwrap_or(fallback_base + index),
+                path,
+            )
+        })
+        .collect();
+    ordered.sort_by_key(|(rank, _)| *rank);
+    ordered.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Return the carrier sources of the custom command steps of one target in
+/// trace order. `steps` is the trace with `DEPENDS` in declared order.
+/// `utility` is the output of the custom target command, if any.
+fn trace_steps_for_graph(
+    binary_root: &[u8],
+    graph: &rcmake_resolve::BuildGraph,
+    steps: &indexmap::IndexSet<usize>,
+    initial: &[&[u8]],
+    utility: Option<&[u8]>,
+) -> Vec<BString> {
+    let root = Lexical::new(binary_root);
+    let absolute = |path: &[u8]| Lexical::new(&root.append(path)).normalize();
+    let sorted_depends = |custom: &rcmake_resolve::CustomStep| {
+        let mut depends: Vec<BString> = custom
+            .depends
+            .iter()
+            .map(|depend| absolute(depend))
+            .collect();
+        depends.sort();
+        depends.dedup();
+        depends
+    };
+    // The `DEPENDS` of the custom target command (`CMakeFiles/<name>.rule`).
+    let utility_depends = utility
+        .and_then(|utility| {
+            graph
+                .utility_steps
+                .iter()
+                .find_map(|&step| match graph.steps.get(step) {
+                    Some(BuildStep::Custom(custom))
+                        if custom
+                            .outputs
+                            .first()
+                            .is_some_and(|output| absolute(output).as_slice() == utility) =>
+                    {
+                        Some(sorted_depends(custom))
+                    }
+                    _ => None,
+                })
+        })
+        .unwrap_or_default();
+    let mut carriers = Vec::with_capacity(steps.len());
+    let mut producers = HashMap::<BString, usize>::new();
+    let mut inputs = Vec::with_capacity(steps.len());
+    for (position, &step) in steps.iter().enumerate() {
+        let custom = match graph.steps.get(step) {
+            Some(BuildStep::Custom(custom)) => Some(custom),
+            _ => None,
+        };
+        let main = graph.custom_main_sources.get(&step);
+        let carrier = match (main, custom.and_then(|custom| custom.outputs.first())) {
+            (Some(main), _) => main.clone(),
+            (None, Some(output)) => {
+                let mut rule = absolute(output);
+                rule.extend_from_slice(b".rule");
+                rule
+            }
+            (None, None) => BString::default(),
+        };
+        for output in custom.into_iter().flat_map(|custom| &custom.outputs) {
+            producers.entry(absolute(output)).or_insert(position);
+        }
+        if let Some(main) = main {
+            producers
+                .entry(Lexical::new(main).normalize())
+                .or_insert(position);
+        }
+        carriers.push(carrier);
+        inputs.push(custom.map(sorted_depends).unwrap_or_default());
+    }
+    // The producers of the dependencies of one step, in sorted dependency order.
+    let children = |position: usize| -> Vec<usize> {
+        inputs
+            .get(position)
+            .into_iter()
+            .flatten()
+            .filter_map(|depend| producers.get(depend).copied())
+            .filter(|&child| child != position)
+            .collect()
+    };
+    // The roots are the steps that generate an initial source of the
+    // target, and the steps that no earlier step reaches. Roots after the
+    // first reached step (the producers of the utility command `DEPENDS`)
+    // enter the queue when it has processed the first roots.
+    let source_roots: HashSet<usize> = initial
+        .iter()
+        .filter_map(|path| {
+            producers
+                .get(Lexical::new(path).normalize().as_slice())
+                .copied()
+        })
+        .collect();
+    let mut reached = HashSet::new();
+    // The producers of the custom target `DEPENDS`, in sorted dependency order.
+    let mut late: Vec<usize> = Vec::new();
+    for depend in &utility_depends {
+        if let Some(&position) = producers.get(depend)
+            && !late.contains(&position)
+        {
+            late.push(position);
+        }
+    }
+    let utility_roots: HashSet<usize> = late.iter().copied().collect();
+    let mut after_reached = false;
+    let mut early = Vec::new();
+    for position in 0..steps.len() {
+        let source_root = source_roots.contains(&position);
+        if !source_root && utility_roots.contains(&position) {
+            // Queued with the custom target command below.
+        } else if source_root || !reached.contains(&position) {
+            if source_root || !after_reached {
+                early.push(position);
+            } else {
+                late.push(position);
+            }
+        } else {
+            after_reached = true;
+        }
+        reached.extend(children(position));
+    }
+    let first = early.len();
+    let mut queue: indexmap::IndexSet<usize> = early.into_iter().collect();
+    let mut next = 0;
+    loop {
+        if next == first {
+            queue.extend(late.iter().copied());
+        }
+        let Some(&position) = queue.get_index(next) else {
+            break;
+        };
+        queue.extend(children(position));
+        next += 1;
+    }
+    queue.extend(0..steps.len());
+    queue
+        .into_iter()
+        .filter_map(|position| carriers.get(position).cloned())
+        .collect()
+}
+
+/// Return `true` if CMake computes compile data for the target
+/// (`cmGeneratorTarget::CanCompileSources`).
+fn can_compile_sources(raw: &Target) -> bool {
+    !raw.is_imported()
+        && matches!(
+            raw.kind,
+            TargetKind::Executable
+                | TargetKind::StaticLibrary
+                | TargetKind::SharedLibrary
+                | TargetKind::ModuleLibrary
+                | TargetKind::ObjectLibrary
+        )
+}
+
+/// Return the comparison identity of an include directory.
+fn include_identity(path: &[u8]) -> BString {
+    let normalized = Lexical::new(path).normalize();
+    let lexical = Lexical::new(&normalized);
+    let root = lexical.root_name().len() + lexical.root_directory().len();
+    let end = normalized
+        .iter()
+        .rposition(|&byte| byte != b'/')
+        .map_or(0, |index| index + 1);
+    BString::from(normalized.get(..end.max(root)).unwrap_or(&normalized))
 }
 
 fn explicit_source_group(props: &PropertyMap) -> Option<&BString> {
@@ -581,10 +1090,16 @@ fn default_source_group(path: &[u8]) -> BString {
 fn append_objects(
     sources: &mut Vec<Source>,
     seen: &mut BTreeSet<BString>,
+    languages: &mut BTreeSet<BString>,
     build: &[u8],
     dependency: &ResolvedTarget,
     trace: &Backtrace,
 ) {
+    for group in &dependency.compile_groups {
+        if !languages.contains(&group.language) {
+            languages.insert(group.language.clone());
+        }
+    }
     for unit in &dependency.compile_units {
         let path = Lexical::new(build).append(&unit.object);
         if seen.insert(path.clone()) {
@@ -615,6 +1130,13 @@ struct CompileData {
     standard: Option<LanguageStandard>,
     headers: Vec<BT<BString>>,
     flags: Vec<BT<BString>>,
+    /// Index of the first source-level entry in `flags`.
+    source_flags: usize,
+    /// Backtraces of the target-level definitions in sorted value order.
+    target_define_traces: Vec<Backtrace>,
+    /// Source-level definitions in sorted value order, before the merge with
+    /// the target-level definitions.
+    source_defines: Vec<BT<BString>>,
 }
 
 impl CompileData {
@@ -701,7 +1223,7 @@ impl CompileData {
                 if let Some(candidates) = by_value.get(entry.value.as_slice())
                     && let Some(&(_, link_bt)) = candidates
                         .iter()
-                        .find(|(orig_bt, _)| orig_bt.frames().eq(entry.backtrace.frames()))
+                        .find(|(orig_bt, _)| orig_bt.same_call(&entry.backtrace))
                 {
                     entry.backtrace.clone_from(link_bt);
                 }
@@ -721,7 +1243,11 @@ impl CompileData {
             .collect();
         let all_flags = std::mem::take(&mut group.flags);
         let mut index = 0;
+        let mut source_flags = None;
         while let Some(flag) = all_flags.get(index) {
+            if index >= target_flags && source_flags.is_none() {
+                source_flags = Some(flags.len());
+            }
             if let Some(&len) = option_groups.get(&index)
                 && let Some(slice) = all_flags.get(index..index + len)
             {
@@ -739,9 +1265,27 @@ impl CompileData {
                 index += 1;
             }
         }
+        let source_flags = source_flags.unwrap_or(flags.len());
         if !pch.is_empty() {
             flags.push(BT::new(pch, Backtrace::default()));
         }
+        // `GetTargetDefines` and `BuildCompileData` collect the definitions in
+        // a `std::set<BT<std::string>>`, which orders them by value and keeps
+        // the first entry of each value.
+        let sorted = |defines: &[BT<BString>]| {
+            let mut sorted: Vec<_> = defines.iter().collect();
+            sorted.sort_by(|a, b| a.value.cmp(&b.value));
+            sorted.dedup_by(|a, b| a.value == b.value);
+            sorted.into_iter().cloned().collect::<Vec<_>>()
+        };
+        let (target_level, source_level) = group
+            .defines
+            .split_at(target_defines.min(group.defines.len()));
+        let target_define_traces = sorted(target_level)
+            .into_iter()
+            .map(|define| define.backtrace)
+            .collect();
+        let source_defines = sorted(source_level);
         group.defines.sort_by(|a, b| a.value.cmp(&b.value));
         group.defines.dedup_by(|a, b| a.value == b.value);
         let mut seen = BTreeSet::new();
@@ -755,37 +1299,84 @@ impl CompileData {
             standard,
             headers,
             flags,
+            source_flags,
+            target_define_traces,
+            source_defines,
         })
     }
 
-    fn write(
+    /// Add the backtraces of the target-level compile data in the order of
+    /// `cmFileAPICodemodel` `Target::ProcessLanguage`: flags, definitions,
+    /// include directories and frameworks, precompiled headers, then the
+    /// language standard.
+    fn add_target_traces(
+        &self,
+        graph: &mut Backtraces<'_>,
+        linked_frameworks: &[InterfaceInclude],
+    ) {
+        for flag in self.flags.get(..self.source_flags).unwrap_or_default() {
+            graph.add(&flag.backtrace);
+        }
+        for trace in &self.target_define_traces {
+            graph.add(trace);
+        }
+        let includes = self.group.includes.get(self.group.source_include_count..);
+        for include in includes.unwrap_or_default().iter().chain(linked_frameworks) {
+            graph.add(&include.path.backtrace);
+        }
+        for header in &self.headers {
+            graph.add(&header.backtrace);
+        }
+        for trace in self
+            .standard
+            .iter()
+            .flat_map(|standard| &standard.backtraces)
+        {
+            graph.add(trace);
+        }
+    }
+
+    /// Add the backtraces of the source-level compile data in the order of
+    /// `cmFileAPICodemodel` `Target::BuildCompileData`: options, include
+    /// directories, then definitions.
+    fn add_source_traces(&self, graph: &mut Backtraces<'_>) {
+        for flag in self.flags.get(self.source_flags..).unwrap_or_default() {
+            graph.add(&flag.backtrace);
+        }
+        let includes = self.group.includes.get(..self.group.source_include_count);
+        for include in includes.unwrap_or_default() {
+            graph.add(&include.path.backtrace);
+        }
+        for define in &self.source_defines {
+            graph.add(&define.backtrace);
+        }
+    }
+
+    /// Append the part of the `CompileData` group key that the written group
+    /// does not show. CMake keys a group before it removes the source-level
+    /// definitions that repeat a target-level definition, so such a source has
+    /// its own group with equal JSON.
+    fn hidden_key(&self, graph: &mut Backtraces<'_>, key: &mut BString) {
+        for define in &self.source_defines {
+            key.push(0);
+            key.extend_from_slice(&define.value);
+            key.push(0);
+            if let Some(index) = graph.add(&define.backtrace) {
+                key.extend_from_slice(index.to_string().as_bytes());
+            }
+        }
+    }
+
+    fn into_members(
         self,
-        sources: Vec<usize>,
         graph: &mut Backtraces<'_>,
         apple: bool,
         linked_frameworks: &[InterfaceInclude],
-    ) -> Value {
-        let mut body = members([
-            ("language", Value::string(self.group.language)),
-            ("sourceIndexes", array(sources.into_iter().map(number))),
-        ]);
-        if let Some(standard) = self.standard {
-            let mut entry = members([("standard", Value::string(standard.value))]);
-            optional_array(
-                &mut entry,
-                "backtraces",
-                standard
-                    .backtraces
-                    .iter()
-                    .filter_map(|trace| graph.add(trace))
-                    .map(number),
-            );
-            body.insert("languageStandard".into(), Object(entry));
-        }
+    ) -> Members {
+        let mut body = members([("language", Value::string(self.group.language))]);
         for (field, key, items) in [
             ("compileCommandFragments", "fragment", self.flags),
             ("defines", "define", self.group.defines),
-            ("precompileHeaders", "header", self.headers),
         ] {
             optional_array(
                 &mut body,
@@ -830,13 +1421,38 @@ impl CompileData {
                 .filter(|entry| seen.insert(entry.path.value.as_slice()))
                 .map(tagged_include),
         );
-        Object(body)
+        optional_array(
+            &mut body,
+            "precompileHeaders",
+            self.headers.iter().map(|value| {
+                let mut item = Members::new();
+                graph.tagged_value(&mut item, "header", value);
+                Object(item)
+            }),
+        );
+        if let Some(standard) = self.standard {
+            let mut entry = members([("standard", Value::string(standard.value))]);
+            optional_array(
+                &mut entry,
+                "backtraces",
+                standard
+                    .backtraces
+                    .iter()
+                    .filter_map(|trace| graph.add(trace))
+                    .map(number),
+            );
+            body.insert("languageStandard".into(), Object(entry));
+        }
+        body
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SourceGroupMatcher;
+    use super::{SourceGroupMatcher, trace_order_for_graphs};
+    use rcmake_base::BString;
+    use rcmake_genex::ConfigId;
+    use rcmake_resolve::{BuildGraph, BuildStep, CustomStep};
 
     #[test]
     fn source_group_matcher_handles_cmake_bracket_class_and_bounds_work() {
@@ -862,5 +1478,86 @@ mod tests {
         assert!(!exhausted.matches(b"a+b", &long_path));
         assert_eq!(exhausted.budget, 0);
         assert!(!exhausted.matches(br"\.c$", b"main.c"));
+    }
+
+    #[test]
+    fn trace_order_unions_custom_steps_across_all_configurations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rcmake_model::{DirId, ProjectModel, Target, TargetKind, TargetOrigin};
+
+        let mut model = ProjectModel::default();
+        let target_id = model.add_target(Target::new(
+            "app".into(),
+            TargetKind::Executable,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Default::default(),
+            Default::default(),
+        ))?;
+        let mut debug_graph = BuildGraph {
+            config: ConfigId("Debug".into()),
+            steps: vec![BuildStep::Custom(CustomStep {
+                outputs: vec!["Debug/gen.h".into()],
+                ..CustomStep::default()
+            })],
+            ..BuildGraph::default()
+        };
+        debug_graph
+            .custom_source_steps
+            .insert(target_id, [0].into_iter().collect());
+
+        let mut release_graph = BuildGraph {
+            config: ConfigId("Release".into()),
+            steps: vec![
+                BuildStep::Custom(CustomStep {
+                    outputs: vec!["Release/gen.h".into()],
+                    depends: vec!["Release/z.in".into(), "Release/a.in".into()],
+                    ..CustomStep::default()
+                }),
+                BuildStep::Custom(CustomStep {
+                    outputs: vec!["Release/z.in".into()],
+                    ..CustomStep::default()
+                }),
+                BuildStep::Custom(CustomStep {
+                    outputs: vec!["Release/a.in".into()],
+                    ..CustomStep::default()
+                }),
+            ],
+            ..BuildGraph::default()
+        };
+        release_graph
+            .custom_source_steps
+            .insert(target_id, [0, 1, 2].into_iter().collect());
+
+        let traced: Vec<BString> = [
+            "/build/Debug/gen.h.rule",
+            "/build/Release/gen.h.rule",
+            "/build/Release/z.in.rule",
+            "/build/Release/a.in.rule",
+        ]
+        .into_iter()
+        .map(BString::from)
+        .collect();
+        let initial = [b"/build/Debug/gen.h".as_slice(), b"/build/Release/gen.h"];
+        let ordered = trace_order_for_graphs(
+            b"/build",
+            &[debug_graph, release_graph],
+            target_id,
+            &initial,
+            None,
+            &traced,
+        );
+        let names: Vec<&[u8]> = ordered.iter().map(|path| path.as_slice()).collect();
+        assert_eq!(
+            names,
+            vec![
+                b"/build/Debug/gen.h.rule".as_slice(),
+                b"/build/Release/gen.h.rule".as_slice(),
+                b"/build/Release/a.in.rule".as_slice(),
+                b"/build/Release/z.in.rule".as_slice(),
+            ],
+            "Release DEPENDS must be ordered from all config graphs, not only graphs[0]"
+        );
+        Ok(())
     }
 }

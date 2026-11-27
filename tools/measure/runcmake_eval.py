@@ -25,6 +25,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -269,10 +270,14 @@ def registration_generators(suites, driver, work, env, timeout):
     return generators
 
 
-def read_registrations(suites, driver, source, work, env, timeout, test_vars, use_upstream_timeout, inventory):
+def read_registrations(
+    suites, driver, source, work, env, timeout, test_vars, use_upstream_timeout, inventory,
+    *, registration_suites=None,
+):
     """Ask upstream CMake to register tests. Keep each registration with its arguments."""
     registrations = defaultdict(list)
-    generators = registration_generators(suites, driver, work, env, timeout)
+    profile_scope = suites if registration_suites is None else registration_suites
+    generators = registration_generators(profile_scope, driver, work, env, timeout)
     inventory["registration_generators"] = generators
     # The case mismatch tests require case-insensitive lookup and case preservation.
     probe = work / "FilesystemCase"
@@ -281,14 +286,14 @@ def read_registrations(suites, driver, source, work, env, timeout, test_vars, us
                           and any(entry.name == probe.name for entry in work.iterdir()))
     options = ["-DCMake_TEST_FindPython3=ON", "-DCMake_TEST_Qt5=OFF", "-DCMake_TEST_Qt6=OFF",
                "-DCMake_TEST_NO_NETWORK=ON", f"-DCMake_TEST_FILESYSTEM_CASE={filesystem_case}"]
-    if "Swift" not in suites:
+    if "Swift" not in profile_scope:
         options.extend(("-DCMake_TEST_Swift=OFF", "-DCMAKE_Swift_COMPILER=NOTFOUND"))
     options.append("-DCMAKE_Fortran_COMPILER=NOTFOUND")
-    if "CPack_NuGet" in suites and shutil.which("nuget"):
+    if "CPack_NuGet" in profile_scope and shutil.which("nuget"):
         options.append("-DCMake_TEST_CPACK_NUGET=ON")
-    if "CPack_WIX" in suites and shutil.which("wix"):
+    if "CPack_WIX" in profile_scope and shutil.which("wix"):
         options.append("-DCMake_TEST_CPACK_WIX4=ON")
-    if "CPack_WIX" in suites and all(shutil.which(tool) for tool in ("candle", "light")):
+    if "CPack_WIX" in profile_scope and all(shutil.which(tool) for tool in ("candle", "light")):
         options.append("-DCMake_TEST_CPACK_WIX3=ON")
     preferred_vs, instance = visual_studio_instance(env)
     configured_vs = False
@@ -364,6 +369,10 @@ def target_tools(driver, target, directory):
     """Select the CTest and CPack entry points for this target binary."""
     if target == driver:
         return {name: companion(driver, name) for name in ("ctest", "cpack")}
+    if os.name == "nt":
+        siblings = {name: target.with_name(name + EXE_SUFFIX) for name in ("ctest", "cpack")}
+        if all(path.is_file() for path in siblings.values()):
+            return siblings
     directory.mkdir()
     tools = {}
     for name in ("ctest", "cpack"):
@@ -623,7 +632,10 @@ def suite_environment(env, root):
     return result
 
 
-def evaluate(suites, driver, candidate, source, timeout, profile, test_vars, use_upstream_timeout, report, *, jobs=1):
+def evaluate(
+    suites, driver, candidate, source, timeout, profile, test_vars, use_upstream_timeout, report,
+    *, jobs=1, registration_suites=None,
+):
     """Run the selected suites in separate reference and candidate workspaces."""
     # A CLI case can print the test environment into the report.
     env = {key: os.environ[key] for key in TEST_ENVIRONMENT if key in os.environ}
@@ -669,8 +681,11 @@ def evaluate(suites, driver, candidate, source, timeout, profile, test_vars, use
         )
         legacy = set(SUITE_GROUPS["all"]) if profile in (None, "core", "wide") and os.name == "posix" else set()
         modern = [suite for suite in suites if suite not in legacy]
+        scope_suites = suites if registration_suites is None else registration_suites
+        modern_scope = [suite for suite in scope_suites if suite not in legacy]
         registered = read_registrations(
             modern, driver, source.parents[1], work, env, timeout, test_vars, use_upstream_timeout, inventory,
+            registration_suites=modern_scope,
         ) if modern else {}
         inventory["suite_generators"] = {
             suite: sorted({entry.generator for entry in entries}) for suite, entries in registered.items()
@@ -769,6 +784,334 @@ def evaluate(suites, driver, candidate, source, timeout, profile, test_vars, use
                 record(suite, by_lane)
 
 
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def sha256_file(path):
+    """Return the lowercase SHA-256 hex digest of a file."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def parse_shard(spec):
+    """Parse a 1-based shard specifier K/M."""
+    match = re.fullmatch(r"([1-9]\d*)/([1-9]\d*)", spec.strip())
+    if not match:
+        raise ValueError(f"--shard must be K/M with 1 <= K <= M, got {spec!r}.")
+    index, count = int(match.group(1)), int(match.group(2))
+    if index > count:
+        raise ValueError(f"--shard index {index} exceeds shard count {count}.")
+    return index, count
+
+
+def select_shard_suites(suites, index, count):
+    """Partition suites deterministically in round-robin order for shard index/count."""
+    if count < 1 or not 1 <= index <= count:
+        raise ValueError(f"Invalid shard {index}/{count}.")
+    return [suite for pos, suite in enumerate(suites) if pos % count == index - 1]
+
+
+def _reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key {key!r}.")
+        result[key] = value
+    return result
+
+
+def load_strict_json(path):
+    """Load one JSON object, rejecting duplicate keys."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: expected a JSON object.")
+    return payload
+
+
+def _provenance_from_env():
+    provenance = {}
+    for env_key, field in (
+        ("GITHUB_RUN_ID", "workflow_run_id"),
+        ("GITHUB_RUN_ATTEMPT", "workflow_run_attempt"),
+        ("CI_BINARY", "ci_binary_artifact"),
+        ("CI_BINARY_RUN_ID", "ci_binary_run_id"),
+        ("RUNNER_OS", "runner_os"),
+    ):
+        value = os.environ.get(env_key)
+        if value:
+            provenance[field] = value
+    return provenance
+
+
+def case_status_issue(suite_name, case):
+    """Verify a recorded case status matches its recorded oracle and rcmake outcomes."""
+    if not isinstance(case, dict):
+        return "invalid case entry"
+    status = case.get("status")
+    if not isinstance(status, str):
+        return "missing case status"
+    if "oracle" not in case and "rcmake" not in case:
+        return None
+    oracle = case.get("oracle")
+    rcmake = case.get("rcmake")
+    if status == "capability_excluded":
+        if not (suite_name == "CommandLine" and isinstance(oracle, dict)
+                and oracle.get("passed") is True and rcmake is None):
+            return f"invalid capability_excluded outcome on {case.get('name')!r}"
+        return None
+    if oracle is None:
+        if suite_name == "CommandLine" and isinstance(rcmake, dict):
+            expected = "passed" if rcmake.get("passed") is True else "failed"
+            return None if status == expected else f"status {status!r} != {expected!r} on {case.get('name')!r}"
+        return None if status == "no_reference" else f"status {status!r} != 'no_reference' on {case.get('name')!r}"
+    if not isinstance(oracle, dict):
+        return f"invalid oracle outcome on {case.get('name')!r}"
+    if oracle.get("passed") is not True:
+        return None if status == "reference_failed" else f"status {status!r} != 'reference_failed' on {case.get('name')!r}"
+    if rcmake is None:
+        return None if status == "missing" else f"status {status!r} != 'missing' on {case.get('name')!r}"
+    if not isinstance(rcmake, dict):
+        return f"invalid rcmake outcome on {case.get('name')!r}"
+    expected = "passed" if rcmake.get("passed") is True else "failed"
+    return None if status == expected else f"status {status!r} != {expected!r} on {case.get('name')!r}"
+
+
+def merge_shard_reports(reports, *, expected_shards=None, require_provenance=False):
+    """Validate and merge a complete set of sharded RunCMake reports for one OS profile."""
+    if not reports:
+        raise ValueError("At least one shard report is required.")
+    parsed = []
+    shard_count = None
+    seen_indices = set()
+    for pos, report in enumerate(reports):
+        if not isinstance(report, dict):
+            raise ValueError(f"Shard report #{pos + 1} is not a JSON object.")
+        if report.get("error"):
+            raise ValueError(f"Shard report #{pos + 1} recorded an error: {report['error']}")
+        shard = report.get("shard")
+        if (not isinstance(shard, dict) or type(shard.get("index")) is not int
+                or type(shard.get("count")) is not int):
+            raise ValueError(f"Shard report #{pos + 1} is missing integer shard index/count metadata.")
+        index, count = shard["index"], shard["count"]
+        if count < 1 or not 1 <= index <= count:
+            raise ValueError(f"Shard report #{pos + 1} has invalid shard {index}/{count}.")
+        if shard_count is None:
+            shard_count = count
+        elif count != shard_count:
+            raise ValueError(f"Shard count mismatch: saw {shard_count} and {count}.")
+        if expected_shards is not None and count != expected_shards:
+            raise ValueError(f"Expected {expected_shards} shards, found shard count {count}.")
+        if index in seen_indices:
+            raise ValueError(f"Duplicate shard index {index}/{count}.")
+        seen_indices.add(index)
+        parsed.append((index, report))
+
+    assert shard_count is not None
+    if len(parsed) != shard_count:
+        raise ValueError(
+            f"Missing RunCMake shard(s): expected {shard_count} shard reports, got {len(parsed)}."
+        )
+    expected_indices = set(range(1, shard_count + 1))
+    if seen_indices != expected_indices:
+        missing = sorted(expected_indices - seen_indices)
+        raise ValueError(f"Missing RunCMake shard(s): {', '.join(f'{i}/{shard_count}' for i in missing)}.")
+    parsed.sort(key=lambda item: item[0])
+
+    first = parsed[0][1]
+    profile = first.get("profile")
+    rcmake_sha = first.get("rcmake_sha")
+    tested_digest = first.get("tested_binary_sha256")
+    tested_engine_digest = first.get("tested_engine_sha256")
+    oracle_version = first.get("oracle_version")
+    first_prov = first.get("provenance") if isinstance(first.get("provenance"), dict) else {}
+    first_inv = first.get("suite_inventory")
+    if not isinstance(first_inv, dict):
+        raise ValueError("Shard 1 is missing suite_inventory.")
+    expected_suites = first_inv.get("expected_profile_suites")
+    if (not isinstance(expected_suites, list) or not expected_suites
+            or not all(isinstance(name, str) and name for name in expected_suites)
+            or len(set(expected_suites)) != len(expected_suites)):
+        raise ValueError("Shard 1 is missing a valid unique suite_inventory.expected_profile_suites list.")
+
+    if tested_digest is not None and (not isinstance(tested_digest, str) or not SHA256_RE.fullmatch(tested_digest)):
+        raise ValueError(f"Invalid tested_binary_sha256 {tested_digest!r}.")
+    if tested_engine_digest is not None and (
+            not isinstance(tested_engine_digest, str) or not SHA256_RE.fullmatch(tested_engine_digest)):
+        raise ValueError(f"Invalid tested_engine_sha256 {tested_engine_digest!r}.")
+    if require_provenance:
+        if not tested_digest:
+            raise ValueError("Missing tested_binary_sha256 in CI shard reports.")
+        for key in ("workflow_run_id", "ci_binary_artifact", "ci_binary_run_id"):
+            val = first_prov.get(key)
+            if not isinstance(val, str) or not val.strip():
+                raise ValueError(f"Missing provenance.{key} in CI shard reports.")
+    if oracle_version is not None and oracle_version != "4.5.1":
+        raise ValueError(f"Unexpected oracle_version {oracle_version!r}; expected '4.5.1'.")
+
+    merged_suites = {}
+    suite_generators = {}
+    registration_generators_merged = []
+    configured_generators_merged = []
+    excluded_external = dict(first_inv.get("excluded_external") or {})
+    shard_summaries = []
+
+    for index, report in parsed:
+        if report.get("profile") != profile:
+            raise ValueError(f"Shard {index}/{shard_count} profile {report.get('profile')!r} != {profile!r}.")
+        if report.get("rcmake_sha") != rcmake_sha:
+            raise ValueError(
+                f"Shard {index}/{shard_count} rcmake_sha {report.get('rcmake_sha')!r} != {rcmake_sha!r}."
+            )
+        if report.get("tested_binary_sha256") != tested_digest:
+            raise ValueError(
+                f"Shard {index}/{shard_count} tested_binary_sha256 {report.get('tested_binary_sha256')!r} "
+                f"!= {tested_digest!r}."
+            )
+        if report.get("tested_engine_sha256") != tested_engine_digest:
+            raise ValueError(
+                f"Shard {index}/{shard_count} tested_engine_sha256 {report.get('tested_engine_sha256')!r} "
+                f"!= {tested_engine_digest!r}."
+            )
+        if report.get("oracle_version") != oracle_version:
+            raise ValueError(
+                f"Shard {index}/{shard_count} oracle_version {report.get('oracle_version')!r} != {oracle_version!r}."
+            )
+        prov = report.get("provenance") if isinstance(report.get("provenance"), dict) else {}
+        for key in ("workflow_run_id", "ci_binary_artifact", "ci_binary_run_id"):
+            if prov.get(key) != first_prov.get(key):
+                raise ValueError(
+                    f"Shard {index}/{shard_count} provenance.{key} {prov.get(key)!r} != {first_prov.get(key)!r}."
+                )
+        inv = report.get("suite_inventory")
+        if not isinstance(inv, dict) or inv.get("expected_profile_suites") != expected_suites:
+            raise ValueError(f"Shard {index}/{shard_count} expected_profile_suites does not match shard 1.")
+        if report.get("incomplete_suites"):
+            raise ValueError(
+                f"Shard {index}/{shard_count} has incomplete suites: {', '.join(report['incomplete_suites'][:5])}."
+            )
+        assigned = select_shard_suites(expected_suites, index, shard_count)
+        if inv.get("included") != assigned:
+            raise ValueError(
+                f"Shard {index}/{shard_count} suite_inventory.included does not match its deterministic shard slice."
+            )
+        suites = report.get("suites")
+        if not isinstance(suites, dict):
+            raise ValueError(f"Shard {index}/{shard_count} is missing suites map.")
+        if set(suites.keys()) != set(assigned):
+            missing = sorted(set(assigned) - set(suites.keys()))
+            extra = sorted(set(suites.keys()) - set(assigned))
+            raise ValueError(
+                f"Shard {index}/{shard_count} suites mismatch (missing={missing[:5]}, extra={extra[:5]})."
+            )
+        for gen in inv.get("registration_generators") or ():
+            if gen not in registration_generators_merged:
+                registration_generators_merged.append(gen)
+        for gen in inv.get("configured_generators") or ():
+            if gen not in configured_generators_merged:
+                configured_generators_merged.append(gen)
+        shard_suite_gens = inv.get("suite_generators") or {}
+
+        shard_passed = 0
+        shard_total = 0
+        for suite_name in assigned:
+            if suite_name in merged_suites:
+                raise ValueError(f"Duplicate suite {suite_name!r} across RunCMake shards.")
+            row = suites[suite_name]
+            if not isinstance(row, dict) or not isinstance(row.get("cases"), list):
+                raise ValueError(f"Shard {index}/{shard_count} suite {suite_name!r} is missing cases list.")
+            for lane in ("oracle_driver", "rcmake_driver"):
+                driver_meta = row.get(lane)
+                if (not isinstance(driver_meta, dict) or driver_meta.get("complete") is not True
+                        or driver_meta.get("timed_out") is True or bool(driver_meta.get("driver_errors"))):
+                    raise ValueError(f"Shard {index}/{shard_count} suite {suite_name!r} failed {lane} completion.")
+            if issue := strict_case_issue(suite_name, row):
+                raise ValueError(f"Shard {index}/{shard_count} suite {suite_name!r} failed strict check: {issue}.")
+            for case in row["cases"]:
+                if issue := case_status_issue(suite_name, case):
+                    raise ValueError(
+                        f"Shard {index}/{shard_count} suite {suite_name!r} has inconsistent case status: {issue}."
+                    )
+            recomputed = case_counts(row["cases"])
+            for count_key, expected_val in recomputed.items():
+                if row.get(count_key) != expected_val:
+                    raise ValueError(
+                        f"Shard {index}/{shard_count} suite {suite_name!r} count {count_key} "
+                        f"is {row.get(count_key)!r}, expected {expected_val} from cases."
+                    )
+            shard_passed += recomputed["passed"]
+            shard_total += recomputed["total"]
+            merged_suites[suite_name] = row
+            if suite_name in shard_suite_gens:
+                suite_generators[suite_name] = shard_suite_gens[suite_name]
+
+        shard_summaries.append({
+            "index": index,
+            "count": shard_count,
+            "suites": len(assigned),
+            "passed": shard_passed,
+            "total": shard_total,
+            **({"tested_binary_sha256": tested_digest} if tested_digest is not None else {}),
+            **({"workflow_run_attempt": prov["workflow_run_attempt"]} if "workflow_run_attempt" in prov else {}),
+        })
+
+    if set(merged_suites.keys()) != set(expected_suites):
+        missing = sorted(set(expected_suites) - set(merged_suites.keys()))
+        raise ValueError(f"Merged suites missing expected profile suite(s): {', '.join(missing[:5])}.")
+
+    ordered_suites = {name: merged_suites[name] for name in expected_suites}
+    totals = {
+        key: sum(suite[key] for suite in ordered_suites.values())
+        for key in ("passed", "failed", "total", "missing", "reference_failed", "no_reference",
+                    "capability_excluded")
+    }
+    pass_rate = 100 * totals["passed"] / totals["total"] if totals["total"] else None
+    merged_skips = [
+        {"suite": name, "engine": lane, **skip}
+        for name, suite in ordered_suites.items()
+        for lane in ("oracle", "rcmake")
+        for skip in suite[f"{lane}_driver"].get("skips", [])
+    ]
+    merged_inventory = {
+        "included": list(expected_suites),
+        "expected_profile_suites": list(expected_suites),
+        "profile_total_suites": len(expected_suites),
+        "excluded_external": excluded_external,
+        "registration_generators": registration_generators_merged,
+        "configured_generators": configured_generators_merged,
+        "suite_generators": {
+            name: suite_generators[name] for name in expected_suites if name in suite_generators
+        },
+    }
+    merged = {
+        "profile": profile,
+        "timeout_seconds": first.get("timeout_seconds"),
+        "min_pass_rate": first.get("min_pass_rate"),
+        "rcmake_sha": rcmake_sha,
+        "oracle_version": oracle_version or "4.5.1",
+        "generator": first.get("generator"),
+        "source": first.get("source"),
+        "oracle": first.get("oracle"),
+        "rcmake": first.get("rcmake"),
+        "suite_inventory": merged_inventory,
+        "suites": ordered_suites,
+        "totals": totals,
+        "pass_rate_percent": pass_rate,
+        "incomplete_suites": [],
+        "skips": merged_skips,
+        "shards": shard_summaries,
+    }
+    if tested_digest is not None:
+        merged["tested_binary_sha256"] = tested_digest
+    if tested_engine_digest is not None:
+        merged["tested_engine_sha256"] = tested_engine_digest
+    if first_prov:
+        merged["provenance"] = first_prov
+    return merged
+
+
 def main():
     """Parse options, run the comparison, and write the report."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -785,7 +1128,8 @@ def main():
                         help="Select all suites in the selected profile or group.")
     parser.add_argument("--list", "--list-suites", action="store_true",
                         help="List the selected upstream suites.")
-    parser.add_argument("--json", type=Path, metavar="PATH", help="Write the case report to PATH.")
+    parser.add_argument("--json", "--out", dest="json", type=Path, metavar="PATH",
+                        help="Write the case report to PATH.")
     parser.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
                         help="Run up to N suites at the same time. The default is 1.")
     parser.add_argument(
@@ -794,6 +1138,24 @@ def main():
     )
     parser.add_argument("--min-pass-rate", type=float, metavar="PERCENT",
                         help="Require this case pass rate and completion of every selected suite.")
+    parser.add_argument("--shard", metavar="K/M",
+                        help="Run deterministic round-robin shard K of M (1 <= K <= M) of the selected suites.")
+    parser.add_argument(
+        "--defer-pass-rate", action="store_true",
+        help="In shard mode, gate completion and strict case integrity per shard while deferring pass rate to --merge.",
+    )
+    parser.add_argument(
+        "--merge", nargs="+", type=Path, metavar="REPORT",
+        help="Merge and verify a complete set of sharded RunCMake JSON reports into --json/--out.",
+    )
+    parser.add_argument(
+        "--expected-shards", type=int, metavar="N",
+        help="With --merge, require exactly N shards.",
+    )
+    parser.add_argument(
+        "--require-provenance", action="store_true",
+        help="With --merge, require tested_binary_sha256 and CI run provenance on every shard.",
+    )
     binary = parser.add_mutually_exclusive_group()
     binary.add_argument(
         "--rcmake-bin", "--bin", type=Path, metavar="PATH",
@@ -813,11 +1175,57 @@ def main():
         parser.error("--test-var requires CMake_TEST_NAME=VALUE.")
     if args.min_pass_rate is not None and not 0 <= args.min_pass_rate <= 100:
         parser.error("--min-pass-rate must be a percentage from 0 to 100.")
+    if args.expected_shards is not None and args.expected_shards < 1:
+        parser.error("--expected-shards must be at least 1.")
+    if args.defer_pass_rate and not args.shard:
+        parser.error("--defer-pass-rate requires --shard K/M.")
+    if args.merge and (args.shard or args.suite or args.list):
+        parser.error("--merge cannot be combined with --shard, --suite, or --list.")
 
-    inventory = {"included": [], "excluded_external": {}, "registration_generators": [],
+    if args.merge:
+        try:
+            reports = [load_strict_json(path) for path in args.merge]
+            merged = merge_shard_reports(
+                reports,
+                expected_shards=args.expected_shards,
+                require_provenance=args.require_provenance,
+            )
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            print(f"{parser.prog}: {exc}", file=sys.stderr)
+            return 2
+        merged["min_pass_rate"] = args.min_pass_rate
+        if args.json:
+            args.json.parent.mkdir(parents=True, exist_ok=True)
+            args.json.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+        totals = merged["totals"]
+        rate = merged["pass_rate_percent"]
+        print(
+            f"{'Overall':<32} {totals['passed']:>6} {totals['failed']:>6} "
+            f"{totals['total']:>6} {totals['reference_failed']:>9}"
+        )
+        print(f"Pass rate: {rate:.2f}%" if rate is not None else "Pass rate unavailable.")
+        if rate is None:
+            return 2
+        if args.min_pass_rate is not None:
+            return int(rate < args.min_pass_rate)
+        return int(bool(totals["failed"]))
+
+    shard_spec = None
+    if args.shard:
+        try:
+            shard_spec = parse_shard(args.shard)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    inventory = {"included": [], "expected_profile_suites": [], "profile_total_suites": 0,
+                 "excluded_external": {}, "registration_generators": [],
                  "configured_generators": [], "suite_generators": {}}
     report = {"profile": args.profile, "timeout_seconds": timeout, "min_pass_rate": args.min_pass_rate,
-              "rcmake_sha": os.environ.get("GITHUB_SHA"), "suite_inventory": inventory, "suites": {}}
+              "rcmake_sha": os.environ.get("GITHUB_SHA"), "oracle_version": "4.5.1",
+              "suite_inventory": inventory, "suites": {}}
+    provenance = _provenance_from_env()
+    if provenance:
+        report["provenance"] = provenance
     try:
         source_value = os.environ.get("RCMAKE_ORACLE_RUNCMAKE_DIR")
         if source_value is None and "RCMAKE_ORACLE_SRC" in os.environ:
@@ -829,20 +1237,28 @@ def main():
         if source.parts[-2:] != ("Tests", "RunCMake") or not (source / "RunCMake.cmake").is_file():
             raise ValueError("RCMAKE_ORACLE_RUNCMAKE_DIR must select Tests/RunCMake in the CMake source tree.")
         group = profile_suites(source, args.profile) if args.profile else SUITE_GROUPS[args.suite_group]
-        suites = list(dict.fromkeys(
+        full_suites = list(dict.fromkeys(
             suite for name in (args.suite or ["all"])
             for suite in (group if name == "all" else ALIASES.get(name, (name,)))
         ))
-        inventory["included"] = suites
-        inventory["excluded_external"] = {
-            name: "Requires an external tool, package, or test fixture outside the standard profile."
-            for name in sorted(EXTERNAL_SUITES - set(suites))
-            if (source / name / "RunCMakeTest.cmake").is_file()
-        }
-        for suite in suites:
+        for suite in full_suites:
             if (not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*", suite)
                     or not (source / suite / "RunCMakeTest.cmake").is_file()):
                 raise ValueError(f"Unknown upstream RunCMake suite {suite!r}.")
+        inventory["expected_profile_suites"] = list(full_suites)
+        inventory["profile_total_suites"] = len(full_suites)
+        inventory["excluded_external"] = {
+            name: "Requires an external tool, package, or test fixture outside the standard profile."
+            for name in sorted(EXTERNAL_SUITES - set(full_suites))
+            if (source / name / "RunCMakeTest.cmake").is_file()
+        }
+        if shard_spec is not None:
+            shard_index, shard_count = shard_spec
+            suites = select_shard_suites(full_suites, shard_index, shard_count)
+            report["shard"] = {"index": shard_index, "count": shard_count}
+        else:
+            suites = full_suites
+        inventory["included"] = suites
         if args.list:
             print("\n".join(suites))
             return 0
@@ -867,8 +1283,14 @@ def main():
             raise ValueError("RCMAKE_ORACLE_CMAKE must select CMake 4.5.1.")
         if not candidate.is_file() or not os.access(candidate, os.X_OK):
             raise ValueError(f"Rcmake binary is missing or cannot run: {candidate}")
+        report["tested_binary_sha256"] = sha256_file(candidate)
+        engine_sibling = candidate.with_name("rcmake" + EXE_SUFFIX)
+        if engine_sibling.is_file() and engine_sibling != candidate:
+            engine_digest = sha256_file(engine_sibling)
+            if engine_digest != report["tested_binary_sha256"]:
+                report["tested_engine_sha256"] = engine_digest
         evaluate(suites, driver, candidate, source, timeout, args.profile, args.test_var,
-                 args.timeout is None, report, jobs=args.jobs)
+                 args.timeout is None, report, jobs=args.jobs, registration_suites=full_suites)
     except (KeyError, OSError, ValueError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
         error = (f"Source env/env.sh to set {exc.args[0]}." if isinstance(exc, KeyError)
                  else str(exc) or "Run interrupted.")
@@ -913,6 +1335,8 @@ def main():
     if issues:
         print(f"RunCMake case issues: {', '.join(issues)}", file=sys.stderr)
         return 1
+    if args.defer_pass_rate:
+        return 0
     if args.min_pass_rate is not None:
         return int(rate < args.min_pass_rate)
     return int(bool(totals["failed"]))

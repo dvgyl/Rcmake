@@ -232,7 +232,7 @@ jobs:
         name: Stage the Rcmake tools and data
         run: |
           timeout 10s chmod +x target/stage/bin/rcmake
-          for tool in cmake ctest cpack rcmake-lsp; do
+          for tool in cmake ctest cpack ccmake rcmake-lsp; do
             timeout 10s ln -sfn rcmake "target/stage/bin/$tool"
           done
           timeout 10s mkdir -p target/stage/share
@@ -598,6 +598,7 @@ jobs:
           path: |
             ${{ runner.temp }}/conan-report/conan.json
             ${{ runner.temp }}/conan-report/conan.md
+            ${{ runner.temp }}/conan-report/conan-*
           if-no-files-found: error
 
   large-projects:
@@ -973,16 +974,22 @@ jobs:
           path: ${{ runner.temp }}/large-projects/report
           if-no-files-found: ignore
 
-  runcmake-linux:
-    name: Full RunCMake on Linux
+  runcmake-linux-shards:
+    name: Full RunCMake on Linux (shard ${{ matrix.shard }}/3)
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-linux'
     needs: prepare
     runs-on: ubuntu-24.04
-    timeout-minutes: 350
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     env:
       CI_BINARY: rcmake-ci-ubuntu-24.04
+      CI_BINARY_RUN_ID: ${{ needs.prepare.outputs.run_id }}
       RUNCMAKE_PROFILE: linux
-      RUNCMAKE_REPORT: runcmake-linux.json
+      RUNCMAKE_SHARD: ${{ matrix.shard }}/3
+      RUNCMAKE_REPORT: runcmake-linux-shard-${{ matrix.shard }}.json
     steps:
       - *checkout
       - *python
@@ -1013,20 +1020,24 @@ jobs:
         run: |
           mkdir -p target/stage/share
           if [[ "$RUNNER_OS" == Windows ]]; then
+            alias_src=target/stage/bin/rcmake.exe
+            if [[ -f target/stage/bin/rcmake-shim.exe ]]; then
+              alias_src=target/stage/bin/rcmake-shim.exe
+            fi
             for tool in cmake ctest cpack; do
-              cp target/stage/bin/rcmake.exe "target/stage/bin/$tool.exe"
+              cp "$alias_src" "target/stage/bin/$tool.exe"
             done
             cp -R modules/cmake-4.5 target/stage/share/
           else
             chmod +x target/stage/bin/rcmake
-            for tool in cmake ctest cpack; do
+            for tool in cmake ctest cpack ccmake; do
               ln -f target/stage/bin/rcmake "target/stage/bin/$tool"
             done
             ln -sfn "$GITHUB_WORKSPACE/modules/cmake-4.5" target/stage/share/cmake-4.5
           fi
       - &runcmake_run
         name: Compare RunCMake cases with CMake 4.5.1
-        timeout-minutes: 330
+        timeout-minutes: 165
         run: |
           source env/env.sh
           oracle_env="$(scripts/fetch-oracle.sh --print-env)"
@@ -1047,24 +1058,59 @@ jobs:
                      --test-var "CMake_TEST_CPACK_APPIMAGE_RUNTIME_FILE=$RUNNER_TEMP/appimage-runtime")
           fi
           python tools/measure/runcmake_eval.py --profile "$RUNCMAKE_PROFILE" --jobs 3 \
-            --stage target/stage/bin --json "$RUNCMAKE_REPORT" --min-pass-rate 99.0 "${options[@]}"
+            --shard "$RUNCMAKE_SHARD" --defer-pass-rate \
+            --stage target/stage/bin --json "$RUNCMAKE_REPORT" "${options[@]}"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: runcmake-linux-shard-${{ matrix.shard }}
+          path: ${{ env.RUNCMAKE_REPORT }}
+          if-no-files-found: error
+
+  runcmake-linux:
+    name: Full RunCMake on Linux
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-linux') && needs.runcmake-linux-shards.result != 'skipped' }}
+    needs: runcmake-linux-shards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RUNCMAKE_REPORT: runcmake-linux.json
+    steps:
+      - *checkout
+      - *python
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: runcmake-linux-shard-*
+          path: runcmake-shards
+          merge-multiple: true
+      - name: Merge and verify Linux RunCMake shards
+        run: |
+          python3 tools/measure/runcmake_eval.py \
+            --merge runcmake-shards/runcmake-linux-shard-*.json \
+            --expected-shards 3 --require-provenance --min-pass-rate 99.0 --json "$RUNCMAKE_REPORT"
       - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: runcmake-linux-full
           path: ${{ env.RUNCMAKE_REPORT }}
-          if-no-files-found: error
+          if-no-files-found: ignore
 
-  runcmake-macos:
-    name: Full RunCMake on macOS
+  runcmake-macos-shards:
+    name: Full RunCMake on macOS (shard ${{ matrix.shard }}/3)
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-macos'
     needs: prepare
     runs-on: macos-15
-    timeout-minutes: 350
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     env:
       CI_BINARY: rcmake-ci-macos-15
+      CI_BINARY_RUN_ID: ${{ needs.prepare.outputs.run_id }}
       RUNCMAKE_PROFILE: all-macos
-      RUNCMAKE_REPORT: runcmake-macos.json
+      RUNCMAKE_SHARD: ${{ matrix.shard }}/3
+      RUNCMAKE_REPORT: runcmake-macos-shard-${{ matrix.shard }}.json
     steps:
       - *checkout
       - *python
@@ -1084,20 +1130,54 @@ jobs:
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: runcmake-macos-full
+          name: runcmake-macos-shard-${{ matrix.shard }}
           path: ${{ env.RUNCMAKE_REPORT }}
           if-no-files-found: error
 
-  runcmake-windows:
-    name: Full RunCMake on Windows
+  runcmake-macos:
+    name: Full RunCMake on macOS
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-macos') && needs.runcmake-macos-shards.result != 'skipped' }}
+    needs: runcmake-macos-shards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RUNCMAKE_REPORT: runcmake-macos.json
+    steps:
+      - *checkout
+      - *python
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: runcmake-macos-shard-*
+          path: runcmake-shards
+          merge-multiple: true
+      - name: Merge and verify macOS RunCMake shards
+        run: |
+          python3 tools/measure/runcmake_eval.py \
+            --merge runcmake-shards/runcmake-macos-shard-*.json \
+            --expected-shards 3 --require-provenance --min-pass-rate 99.0 --json "$RUNCMAKE_REPORT"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: runcmake-macos-full
+          path: ${{ env.RUNCMAKE_REPORT }}
+          if-no-files-found: ignore
+
+  runcmake-windows-shards:
+    name: Full RunCMake on Windows (shard ${{ matrix.shard }}/3)
     if: github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-windows'
     needs: prepare
     runs-on: windows-2025
-    timeout-minutes: 350
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     env:
       CI_BINARY: rcmake-ci-windows-2025
+      CI_BINARY_RUN_ID: ${{ needs.prepare.outputs.run_id }}
       RUNCMAKE_PROFILE: windows
-      RUNCMAKE_REPORT: runcmake-windows.json
+      RUNCMAKE_SHARD: ${{ matrix.shard }}/3
+      RUNCMAKE_REPORT: runcmake-windows-shard-${{ matrix.shard }}.json
     steps:
       - *checkout
       - *python
@@ -1151,9 +1231,37 @@ jobs:
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: runcmake-windows
+          name: runcmake-windows-shard-${{ matrix.shard }}
           path: ${{ env.RUNCMAKE_REPORT }}
           if-no-files-found: error
+
+  runcmake-windows:
+    name: Full RunCMake on Windows
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'runcmake' || inputs.lane == 'runcmake-windows') && needs.runcmake-windows-shards.result != 'skipped' }}
+    needs: runcmake-windows-shards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RUNCMAKE_REPORT: runcmake-windows.json
+    steps:
+      - *checkout
+      - *python
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: runcmake-windows-shard-*
+          path: runcmake-shards
+          merge-multiple: true
+      - name: Merge and verify Windows RunCMake shards
+        run: |
+          python3 tools/measure/runcmake_eval.py \
+            --merge runcmake-shards/runcmake-windows-shard-*.json \
+            --expected-shards 3 --require-provenance --min-pass-rate 99.0 --json "$RUNCMAKE_REPORT"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: runcmake-windows
+          path: ${{ env.RUNCMAKE_REPORT }}
+          if-no-files-found: ignore
 
   conformance:
     name: CLI and differential conformance

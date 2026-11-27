@@ -7,7 +7,7 @@ use std::time::Duration;
 use rcmake_base::{BString, Limits, hash::HashAlgo};
 use rcmake_host::{
     CommandSpec, Follow, Host, Input, Output, ProcessResult, ReadRange, RunRequest, Stream,
-    WriteMode, discover_cmake_root, path,
+    WriteMode, path,
 };
 use rcmake_json::{ReadOptions, Value, parse};
 
@@ -75,12 +75,11 @@ fn strings(value: Option<&Value>, field: &str) -> Result<Vec<BString>, String> {
 }
 
 pub(super) fn run(
-    argv: &[BString],
     opts: &Options,
     host: &dyn Host,
     index: Index,
+    executable: &BString,
 ) -> Result<i32, String> {
-    let executable = path::from_native(&discover_cmake_root(host, argv.first()).0);
     let enabled = !rcmake_instrument::query::read_queries(host, &opts.dir)
         .map_err(|error| error.to_string())?
         .is_empty();
@@ -110,7 +109,7 @@ pub(super) fn run(
             let tasks = Tasks {
                 host,
                 opts,
-                executable: &executable,
+                executable,
                 scripts: &index.scripts,
                 config: *config,
                 component,

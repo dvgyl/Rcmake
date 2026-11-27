@@ -110,7 +110,7 @@ jobs:
           )
           Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
           $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]31
-          cargo build --locked --release -p rcmake-cli --bin rcmake -p rcmake-harness --bin rcmake-verify --target $env:RELEASE_TARGET --target-dir $targetDir
+          cargo build --locked --release -p rcmake-cli --bin rcmake -p rcmake-shim --bin rcmake-shim -p rcmake-harness --bin rcmake-verify --target $env:RELEASE_TARGET --target-dir $targetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $binaries = "$targetDir/$env:RELEASE_TARGET/release"
@@ -119,8 +119,9 @@ jobs:
           $package = Join-Path $work $name
           try {
             New-Item -ItemType Directory -Path "$package/bin", "$package/share/rcmake/completions", "$package/third_party", 'dist' -Force | Out-Null
-            foreach ($tool in 'rcmake', 'cmake', 'ctest', 'cpack', 'rcmake-lsp') {
-              Copy-Item "$binaries/rcmake.exe" "$package/bin/$tool.exe"
+            Copy-Item "$binaries/rcmake.exe" "$package/bin/rcmake.exe"
+            foreach ($tool in 'cmake', 'ctest', 'cpack', 'rcmake-lsp') {
+              Copy-Item "$binaries/rcmake-shim.exe" "$package/bin/$tool.exe"
             }
             Copy-Item "$binaries/rcmake-verify.exe" "$package/bin/rcmake-verify.exe"
             Copy-Item modules/cmake-4.5 "$package/share/" -Recurse

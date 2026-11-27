@@ -44,7 +44,12 @@ RULES = {
     "file_api.tool_path": "The File API records the executable and share paths of the selected CMake installation.",
     "compile_commands.order": "Compilation database entries are independent translation units whose array order is not significant.",
 }
-CACHE_TOOLS = {"CMAKE_COMMAND": "cmake", "CMAKE_CTEST_COMMAND": "ctest", "CMAKE_CPACK_COMMAND": "cpack"}
+CACHE_TOOLS = {
+    "CMAKE_COMMAND": "cmake",
+    "CMAKE_CTEST_COMMAND": "ctest",
+    "CMAKE_CPACK_COMMAND": "cpack",
+    "CMAKE_EDIT_COMMAND": "ccmake",
+}
 CACHE_ENTRY = re.compile(r"(.+?):([^:=]+)=(.*)")
 EDIT_COMMAND = "CMAKE_EDIT_COMMAND"
 CONAN_BUILD_HASH = re.compile(r"(<conan-home>/p/b/[a-z0-9_+.-]+)[0-9a-f]{13}(?=/)")

@@ -33,6 +33,8 @@ pub(crate) enum DirectoryArg {
 #[derive(Default)]
 pub(crate) struct Options {
     pub persona: Persona,
+    /// True only when invoked via a recognized `rcmake-shim` launcher prefix.
+    pub shim_handoff: bool,
     pub extensions: extensions::RcmakeExt,
     pub directories: Vec<DirectoryArg>,
     pub cache_edits: Vec<CacheEdit>,

@@ -250,7 +250,7 @@ fn source_copy_error(cx: &mut Cx<'_>, file: &[u8], error: &rcmake_host::HostErro
 /// Policies that the test project takes from the calling project. They can affect the
 /// toolchain file (`CMP0126`), language extensions (`CMP0128`), and the linker flags
 /// (`CMP0181`, `CMP0210`).
-fn outer_policies(cx: &Cx<'_>) -> [(u16, PolicyStatus); 4] {
+pub(super) fn outer_policies(cx: &Cx<'_>) -> [(u16, PolicyStatus); 4] {
     [126, 128, 181, 210].map(|id| (id, cx.policy(PolicyId::new(id))))
 }
 

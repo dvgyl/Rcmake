@@ -326,6 +326,15 @@ pub struct SubdirOptions {
     pub system: bool,
 }
 
+/// Active function or macro call site captured before entering the callee body.
+#[derive(Debug)]
+pub(crate) struct CallSiteFrame {
+    pub(crate) cmds: Arc<[CommandInvocation]>,
+    pub(crate) index: usize,
+    pub(crate) end: usize,
+    pub(crate) scope_depth: usize,
+}
+
 /// One active directory on [`Interp`]'s directory stack.
 #[derive(Debug)]
 pub(crate) struct DirFrame {
@@ -557,6 +566,7 @@ pub struct Interp {
     /// The listfile command being executed (raw arguments for [`Cx::raw_args`]).
     cur_cmd: Option<(Arc<[CommandInvocation]>, usize)>,
     command_end: usize,
+    call_frames: Vec<Option<CallSiteFrame>>,
     foreach_frames: Vec<flow::ForeachFrame>,
     session_data: services::SessionData,
     /// Mirrored from `session_data` to avoid per-command `BTreeMap<TypeId>` lookups.
@@ -702,6 +712,7 @@ impl Interp {
             find_debug_packages: Vec::new(),
             cur_cmd: None,
             command_end: 0,
+            call_frames: Vec::new(),
             foreach_frames: Vec::new(),
             session_data: services::SessionData::default(),
             hermetic: None,

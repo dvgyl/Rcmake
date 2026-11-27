@@ -133,19 +133,29 @@ def evaluate(bin_dir: Path, source: Path, project: Path, stages: list[Stage],
     return result
 
 
+def _same_tool(candidate: Path, target: Path) -> bool:
+    if candidate.resolve() == target:
+        return True
+    try:
+        return candidate.exists() and target.exists() and candidate.samefile(target)
+    except OSError:
+        return False
+
+
 def tool_paths(directory: Path, binary: Path | None = None) -> dict[str, set[str]]:
     """Return selected tool names and their resolved executable paths."""
-    paths = {name: {str(directory / name)} for name in TOOLS}
+    names = (*TOOLS, "ccmake")
+    paths = {name: {str(directory / name)} for name in names}
     if binary is None:
-        for name in TOOLS:
+        for name in names:
             paths[name].add(str((directory / name).resolve()))
     else:
         resolved = binary.resolve()
         paths["cmake"].add(str(resolved))
-        for name in TOOLS:
-            alias = resolved.with_name(name)
-            if alias.resolve() == resolved:
-                paths[name].add(str(alias))
+        for name in names:
+            for alias in (resolved.with_name(name), binary.with_name(name)):
+                if _same_tool(alias, resolved):
+                    paths[name].add(str(alias))
     return paths
 
 

@@ -288,7 +288,7 @@ fn executable_link_flags_include_export_flags_in_cmake_order() -> TestResult {
     for (name, flags) in [
         (
             "app",
-            b"-export -shared-build -shared-link -user-flag".as_slice(),
+            b"-export -shared-build -shared-link  -user-flag".as_slice(),
         ),
         ("other", b"-shared-build -user-flag"),
     ] {

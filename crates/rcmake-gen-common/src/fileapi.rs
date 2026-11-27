@@ -56,6 +56,7 @@ fn write_index(
     build_dir: &Path,
     failed: bool,
 ) -> Result<(), GenError> {
+    let model = result.resolved_model.as_deref().unwrap_or(model);
     let api_dir = build_dir.join(API_DIR);
     let reply_dir = api_dir.join("reply");
     let old_entries = read_dir(host, &reply_dir)?;
@@ -147,14 +148,22 @@ struct ReplyWriter<'a> {
 impl ReplyWriter<'_> {
     fn hashed(&mut self, prefix: &str, value: &Value) -> Result<Value, GenError> {
         let bytes = json_bytes(value);
-        let name = format!("{prefix}-{}.json", hash_prefix(&bytes));
+        self.hashed_bytes(prefix, &bytes)
+    }
+
+    fn hashed_bytes(&mut self, prefix: &str, bytes: &[u8]) -> Result<Value, GenError> {
+        let name = format!("{prefix}-{}.json", hash_prefix(bytes));
+        self.write_hashed(&name, bytes)
+    }
+
+    fn write_hashed(&mut self, name: &str, bytes: &[u8]) -> Result<Value, GenError> {
         // The name holds the content hash. Like CMake, keep an existing file with this name.
         if self.existing.contains(name.as_bytes()) {
-            self.files.insert(name.as_str().into());
+            self.files.insert(name.into());
         } else {
-            self.write(&name, &bytes)?;
+            self.write(name, bytes)?;
         }
-        Ok(Value::string(name.as_str()))
+        Ok(Value::string(name))
     }
 
     fn write(&mut self, name: &str, bytes: &[u8]) -> Result<(), GenError> {

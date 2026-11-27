@@ -11,6 +11,7 @@ pub mod cli;
 pub mod eval_provider;
 mod expression;
 mod features;
+#[cfg(test)]
 mod generated_catalog;
 mod json;
 mod lexical;

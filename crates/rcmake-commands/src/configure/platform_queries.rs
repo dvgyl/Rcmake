@@ -36,6 +36,9 @@ struct Query {
     env: Digest,
     stderr: u8,
     missing_programs: Vec<PathBuf>,
+    /// `true` for fixed-path native Apple system tools (`/usr/bin/*`, `/usr/sbin/*`),
+    /// `false` for PATH-selected launchers such as `brew --prefix`.
+    fixed_path: bool,
 }
 
 impl Query {
@@ -152,11 +155,11 @@ impl PlatformQueries {
         let Ok(mut memo) = self.0.lock() else {
             return;
         };
-        let digest = environment_fingerprint(env);
+        let digest = query_env_fingerprint(env);
         let pending: Vec<_> = memo
             .0
             .iter()
-            .filter(|(query, _)| query.env != digest)
+            .filter(|(query, _)| query.fixed_path && query.env != digest)
             .map(|(_, observation)| RunRequest {
                 env: env.to_vec(),
                 ..observation.request.clone()
@@ -173,7 +176,7 @@ impl PlatformQueries {
         for xcrun in [false, true] {
             let mut ready: Vec<(Query, RunRequest)> = Vec::new();
             for request in pending.iter().filter(|request| is_xcrun(request) == xcrun) {
-                let Some(key) = query(host, request) else {
+                let Some(key) = query(host, request).filter(|key| key.fixed_path) else {
                     continue;
                 };
                 if key.is_absent() {
@@ -219,10 +222,16 @@ impl PlatformQueries {
         host: &dyn Host,
         env: &[(BString, BString)],
     ) -> Option<RecordedQueries> {
-        let digest = environment_fingerprint(env);
+        let fixed_digest = query_env_fingerprint(env);
+        let full_digest = environment_fingerprint(env);
         let mut snapshot = self.0.lock().ok()?.clone();
         snapshot.0.retain(|query, _| {
-            query.env == digest
+            let expected_env = if query.fixed_path {
+                fixed_digest
+            } else {
+                full_digest
+            };
+            query.env == expected_env
                 && query
                     .missing_programs
                     .iter()
@@ -883,6 +892,7 @@ fn query(host: &dyn Host, request: &RunRequest) -> Option<Query> {
         _ => return None,
     };
     let fixed = fixed.map(Path::new);
+    let fixed_path = fixed.is_some();
     let (selected, missing_programs) = if requested.is_absolute() {
         if fixed.is_some_and(|fixed| requested != fixed) || !is_executable(host, &requested) {
             return None;
@@ -895,13 +905,35 @@ fn query(host: &dyn Host, request: &RunRequest) -> Option<Query> {
         let value = &request.env.iter().find(|(key, _)| key == "PATH")?.1;
         search_query_path(host, name, fixed, value).ok()?
     };
+    let env = if fixed_path {
+        query_env_fingerprint(&request.env)
+    } else {
+        environment_fingerprint(&request.env)
+    };
     Some(Query {
         program: selected,
         args: command.args.clone(),
-        env: environment_fingerprint(&request.env),
+        env,
         stderr,
         missing_programs,
+        fixed_path,
     })
+}
+
+fn is_locale_env_var(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"LC_ALL" | b"LC_MESSAGES" | b"LANG" | b"LC_CTYPE" | b"LANGUAGE"
+    )
+}
+
+fn query_env_fingerprint(env: &[(BString, BString)]) -> Digest {
+    let filtered: Vec<_> = env
+        .iter()
+        .filter(|(key, _)| !is_locale_env_var(key))
+        .cloned()
+        .collect();
+    environment_fingerprint(&filtered)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2371,6 +2403,206 @@ mod tests {
             assert!(memo.0.is_empty());
         }
         assert!(unstable_queries.render_persisted().is_none());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn locale_env_toggles_reuse_cached_darwin_platform_queries() -> HostResult<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let host = Arc::new(PureHost::default());
+        let brew = Path::new("/opt/homebrew/bin/brew");
+        let xcode_select = Path::new("/usr/bin/xcode-select");
+        let xcrun = Path::new("/usr/bin/xcrun");
+        let sw_vers = Path::new("/usr/bin/sw_vers");
+        let sysctl = Path::new("/usr/sbin/sysctl");
+        let uname = Path::new("/usr/bin/uname");
+        for (path, content) in [
+            (brew, b"brew-bin".as_slice()),
+            (xcode_select, b"xcode-select-bin".as_slice()),
+            (xcrun, b"xcrun-bin".as_slice()),
+            (sw_vers, b"sw_vers-bin".as_slice()),
+            (sysctl, b"sysctl-bin".as_slice()),
+            (uname, b"uname-bin".as_slice()),
+        ] {
+            host.seed_file(path, content)?;
+            host.set_permissions(path, 0o755)?;
+        }
+        host.create_dir_all(Path::new("/opt/homebrew"))?;
+        let dev_dir = Path::new("/Applications/Xcode.app/Contents/Developer");
+        let sdk_dir = Path::new("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk");
+        host.create_dir_all(dev_dir)?;
+        host.create_dir_all(sdk_dir)?;
+        host.seed_file(&dev_dir.join("SDKSettings.plist"), b"plist")?;
+        host.seed_file(&sdk_dir.join("SDKSettings.plist"), b"plist")?;
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let brew_runs = Arc::new(AtomicUsize::new(0));
+        let runs_hook = Arc::clone(&runs);
+        let brew_runs_hook = Arc::clone(&brew_runs);
+        host.set_command_handler(move |_, request, _| {
+            runs_hook.fetch_add(1, Ordering::SeqCst);
+            let program = request.pipeline.first().map(|c| c.program.as_slice());
+            let stdout = match program {
+                Some(p) if p.ends_with(b"brew") => {
+                    brew_runs_hook.fetch_add(1, Ordering::SeqCst);
+                    b"/opt/homebrew\n".to_vec()
+                }
+                Some(p) if p.ends_with(b"xcode-select") => {
+                    b"/Applications/Xcode.app/Contents/Developer\n".to_vec()
+                }
+                Some(p) if p.ends_with(b"xcrun") => {
+                    b"/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk\n".to_vec()
+                }
+                Some(p) if p.ends_with(b"sw_vers") => b"15.0\n".to_vec(),
+                Some(p) if p.ends_with(b"sysctl") => b"1\n".to_vec(),
+                Some(p) if p.ends_with(b"uname") => b"arm64\n".to_vec(),
+                _ => Vec::new(),
+            };
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                stdout,
+                stderr: Vec::new(),
+            })
+        })?;
+
+        let base_env = vec![(
+            BString::from("PATH"),
+            BString::from("/opt/homebrew/bin:/usr/bin:/usr/sbin"),
+        )];
+        let locale_c_env = vec![
+            (
+                BString::from("PATH"),
+                BString::from("/opt/homebrew/bin:/usr/bin:/usr/sbin"),
+            ),
+            (BString::from("LC_ALL"), BString::from("C")),
+            (BString::from("LC_MESSAGES"), BString::from("C")),
+            (BString::from("LANG"), BString::from("C")),
+            (BString::from("LC_CTYPE"), BString::from("C")),
+            (BString::from("LANGUAGE"), BString::from("C")),
+        ];
+        let custom_env = vec![
+            (
+                BString::from("PATH"),
+                BString::from("/opt/homebrew/bin:/usr/bin:/usr/sbin"),
+            ),
+            (BString::from("HOMEBREW_PREFIX"), BString::from("/custom")),
+        ];
+
+        let make_req = |program: &str, args: &[&str], env: &[(BString, BString)]| RunRequest {
+            pipeline: vec![CommandSpec {
+                program: program.into(),
+                args: args.iter().map(|&a| a.into()).collect(),
+            }],
+            cwd: PathBuf::from("/work"),
+            env: env.to_vec(),
+            stdin: Input::Inherit,
+            stdout: Output::Capture,
+            stderr: Output::Capture,
+            timeout: None,
+            tee: false,
+        };
+
+        let queries = PlatformQueries::default();
+        // Fixed-path native Apple system tools ignore locale toggles in their cache key.
+        for (program, args) in [
+            ("xcode-select", &["-print-path"][..]),
+            ("xcrun", &["--show-sdk-path"][..]),
+            ("sw_vers", &["-productVersion"][..]),
+            ("sysctl", &["-q", "hw.optional.arm64"][..]),
+            ("uname", &["-m"][..]),
+        ] {
+            let req = make_req(program, args, &base_env);
+            let key = query(host.as_ref(), &req)
+                .ok_or_else(|| rcmake_host::HostError::unsupported("valid fixed-path query"))?;
+            assert!(key.fixed_path, "{program} must be marked fixed_path");
+            let key_c = query(host.as_ref(), &make_req(program, args, &locale_c_env))
+                .ok_or_else(|| rcmake_host::HostError::unsupported("valid locale-C query"))?;
+            assert_eq!(
+                key.env, key_c.env,
+                "locale vars must not bust fixed-path {program}"
+            );
+            let key_custom = query(host.as_ref(), &make_req(program, args, &custom_env))
+                .ok_or_else(|| rcmake_host::HostError::unsupported("valid custom query"))?;
+            assert_ne!(
+                key.env, key_custom.env,
+                "non-locale vars must still bust {program}"
+            );
+            let launched = launch_observed(None, host.as_ref(), &key, &req);
+            if let Ok(mut memo) = queries.0.lock() {
+                let _ = record(None, host.as_ref(), &mut memo, key, &req, launched, |_| {})?;
+            }
+        }
+        // PATH-selected `brew --prefix` MUST keep locale variables in its key.
+        let brew_req = make_req("brew", &["--prefix"], &base_env);
+        let brew_key = query(host.as_ref(), &brew_req)
+            .ok_or_else(|| rcmake_host::HostError::unsupported("valid brew query"))?;
+        assert!(!brew_key.fixed_path, "brew must not be marked fixed_path");
+        let brew_key_c = query(
+            host.as_ref(),
+            &make_req("brew", &["--prefix"], &locale_c_env),
+        )
+        .ok_or_else(|| rcmake_host::HostError::unsupported("valid locale-C brew query"))?;
+        assert_ne!(
+            brew_key.env, brew_key_c.env,
+            "PATH-selected brew --prefix must keep locale vars in its fingerprint"
+        );
+        let brew_launched = launch_observed(None, host.as_ref(), &brew_key, &brew_req);
+        if let Ok(mut memo) = queries.0.lock() {
+            let _ = record(
+                None,
+                host.as_ref(),
+                &mut memo,
+                brew_key,
+                &brew_req,
+                brew_launched,
+                |_| {},
+            )?;
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 6);
+        assert_eq!(brew_runs.load(Ordering::SeqCst), 1);
+
+        // Full base_env snapshot includes all 5 fixed-path queries plus brew.
+        let base_snap = queries
+            .snapshot(host.as_ref(), &base_env)
+            .ok_or_else(|| rcmake_host::HostError::unsupported("base snapshot"))?;
+        assert_eq!(base_snap.0.len(), 6);
+
+        // Switching locale to `C` (as `CMakeDetermineCompilerABI.cmake` does)
+        // must reuse all 5 fixed-path queries with zero extra process spawns and
+        // must NOT eagerly spawn `brew` or alias `brew` across locale changes.
+        queries.refresh(host.as_ref(), &locale_c_env);
+        assert_eq!(runs.load(Ordering::SeqCst), 6);
+        assert_eq!(brew_runs.load(Ordering::SeqCst), 1);
+        let locale_snap = queries
+            .snapshot(host.as_ref(), &locale_c_env)
+            .ok_or_else(|| rcmake_host::HostError::unsupported("locale snapshot"))?;
+        assert_eq!(locale_snap.0.len(), 5);
+        assert!(
+            locale_snap.0.keys().all(|k| k.fixed_path),
+            "brew must not alias into a different-locale snapshot"
+        );
+
+        // Non-locale env changes are not served from the old snapshot, and refresh()
+        // refreshes ONLY fixed-path native tools — never eagerly launching `brew`.
+        let custom_snap_before = queries
+            .snapshot(host.as_ref(), &custom_env)
+            .ok_or_else(|| rcmake_host::HostError::unsupported("custom snapshot before refresh"))?;
+        assert!(custom_snap_before.0.is_empty());
+        queries.refresh(host.as_ref(), &custom_env);
+        assert_eq!(
+            brew_runs.load(Ordering::SeqCst),
+            1,
+            "refresh() must never eagerly spawn PATH-selected brew"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 11);
+        let custom_snap_after = queries
+            .snapshot(host.as_ref(), &custom_env)
+            .ok_or_else(|| rcmake_host::HostError::unsupported("custom snapshot after refresh"))?;
+        assert_eq!(custom_snap_after.0.len(), 5);
+        assert!(custom_snap_after.0.keys().all(|k| k.fixed_path));
         Ok(())
     }
 }

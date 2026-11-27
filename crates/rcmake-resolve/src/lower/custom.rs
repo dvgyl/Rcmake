@@ -295,14 +295,14 @@ impl<'a> Commands<'a> {
             .optional(&command.depfile)?
             .filter(|path| !path.is_empty());
         let mut dependencies = IndexSet::new();
-        let mut depends = IndexSet::new();
+        let mut depends = Vec::new();
         eval.host.artifact_dependencies = Some(&artifact_dependencies);
         eval.host.warning_site = Some(command.backtrace.clone());
 
         let mut target_dependencies = IndexSet::new();
         for dep in command.depends.iter().map(|entry| &entry.value) {
             for dep in list::split(&eval.value(dep)?, list::Empty::Drop) {
-                depends.insert(self.dependency_path(
+                depends.push(self.dependency_path(
                     command.dir,
                     &dep,
                     paths,
@@ -317,7 +317,10 @@ impl<'a> Commands<'a> {
             .chain(command.implicit_depends.iter().map(|(_, file)| file))
         {
             for dep in list::split(&eval.value(dep)?, list::Empty::Drop) {
-                depends.insert(self.file_dependency(command.dir, &dep, paths));
+                let path = self.file_dependency(command.dir, &dep, paths);
+                if !depends.contains(&path) {
+                    depends.push(path);
+                }
             }
         }
         let mut invocations = Vec::new();
@@ -441,7 +444,10 @@ impl<'a> Commands<'a> {
             target_dependencies.insert((id, config.clone()));
             // File inputs also order custom commands whose target has no compile steps.
             if let Some(file) = self.artifact(id, target, &config) {
-                depends.insert(build_relative(self.model, &file));
+                let path = build_relative(self.model, &file);
+                if !depends.contains(&path) {
+                    depends.push(path);
+                }
             }
         }
         dependencies.extend(
@@ -544,7 +550,16 @@ impl<'a> Commands<'a> {
         let binary = absolute_path(&dir.binary_dir, dep);
         let in_source = paths.map_or_else(
             || dir.source_props.contains_key(&source),
-            |paths| paths.is_source_dependency(dir, &source, &binary),
+            |paths| {
+                paths
+                    .host
+                    .metadata(
+                        &rcmake_host::path::to_native(&source),
+                        rcmake_host::Follow::Yes,
+                    )
+                    .is_ok()
+                    || paths.is_source_dependency(dir, &source, &binary)
+            },
         );
         build_relative(self.model, if in_source { &source } else { &binary })
     }
@@ -600,11 +615,19 @@ impl<'a> Commands<'a> {
                     step.outputs.push(output);
                 }
                 dependencies.extend(command_deps);
-                let producers = step.depends.iter().filter_map(|path| self.producer(path));
+                let producers: Vec<_> = step
+                    .depends
+                    .iter()
+                    .flat_map(|path| {
+                        self.producer(path)
+                            .into_iter()
+                            .chain(self.source_attachment(command.dir, path))
+                    })
+                    .collect();
                 if event.is_some() {
-                    roots.events.extend(producers.clone());
+                    roots.events.extend(producers.iter().copied());
                 } else {
-                    roots.utility.extend(producers.clone());
+                    roots.utility.extend(producers.iter().copied());
                 }
                 self.add_producers(producers, steps, dependencies)?;
                 if let Some(steps) = &mut ide_steps {
@@ -982,7 +1005,6 @@ pub(super) fn remove_own_outputs(recipe: &mut CustomStep) {
     recipe
         .byproducts
         .retain(|path| !recipe.outputs.contains(path));
-    recipe.depends = unique(std::mem::take(&mut recipe.depends));
     recipe
         .depends
         .retain(|path| !recipe.outputs.contains(path) && !recipe.byproducts.contains(path));
@@ -1003,6 +1025,7 @@ pub(super) fn attach_link_events(
     mut before: CustomStep,
     after: CustomStep,
     descriptions: &mut IndexMap<BString, BString>,
+    link_event_byproducts: &mut IndexMap<BString, Vec<BString>>,
 ) -> BuildStep {
     let BuildStep::Link {
         step,
@@ -1029,19 +1052,30 @@ pub(super) fn attach_link_events(
     before.invocations.extend(invocations);
     merge(&mut before, after);
 
-    // A link step has one output. Use a custom edge when the recipe must
-    // publish more outputs or carry custom rule settings.
+    // Keep link edges as `BuildStep::Link` even when attached target commands
+    // declare `BYPRODUCTS` so objects stay in explicit inputs and linked
+    // libraries stay in implicit inputs (`|`). Only fall back to a custom edge
+    // when custom outputs or custom rule settings (`DEPFILE`, `USES_TERMINAL`,
+    // `JOB_POOL`) require `CUSTOM_COMMAND`.
     if before.outputs.is_empty()
-        && before.byproducts.is_empty()
         && before.depfile.is_none()
         && !before.uses_terminal
         && before.job_pool.is_none()
     {
+        let mut byproducts = unique(before.byproducts);
+        byproducts.retain(|path| *path != step.output);
+        if !byproducts.is_empty() {
+            link_event_byproducts
+                .entry(step.output.clone())
+                .or_default()
+                .extend(byproducts.iter().cloned());
+        }
         let mut inputs = inputs;
         for dependency in before.depends {
             if !inputs.contains(&dependency)
                 && !implicit_inputs.contains(&dependency)
                 && dependency != step.output
+                && !byproducts.contains(&dependency)
             {
                 inputs.push(dependency);
             }

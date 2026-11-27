@@ -100,8 +100,6 @@ rule RERUN_CMAKE
   command = $COMMAND
   description = Re-running CMake...
   generator = 1
-  pool = console
-  restat = 1
 ";
 
 /// Write `build.ninja` and its rule file for the single configuration of `result`.
@@ -251,6 +249,9 @@ fn generate_single(
         ninja.0.extend_from_slice(b"default all\n");
     }
 
+    if !graph.clean_files.is_empty() {
+        clean::write_clean_additional_script(host, build_dir, &[&graph])?;
+    }
     write_rules(
         result,
         host,
@@ -258,10 +259,69 @@ fn generate_single(
         uses_modules,
         model,
         &commands,
+        &programs.cmake,
         &programs.ninja,
         !graph.clean_files.is_empty(),
     )?;
-    write_always(host, &build_dir.join("build.ninja"), &ninja.0)
+    write_always(host, &build_dir.join("build.ninja"), &ninja.0)?;
+    refresh_manifest_outputs(
+        host,
+        build_dir,
+        graph.prefix,
+        &manifests,
+        &[graph.node(b"build.ninja")],
+    );
+    Ok(())
+}
+
+pub(crate) fn refresh_manifest_outputs(
+    host: &dyn Host,
+    build_dir: &Path,
+    prefix: &[u8],
+    manifests: &[BString],
+    written: &[BString],
+) {
+    let manifest_path = |node: &BString| -> std::path::PathBuf {
+        let stripped = if !prefix.is_empty() {
+            node.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix(b"/"))
+                .unwrap_or(node.as_slice())
+        } else {
+            node.as_slice()
+        };
+        let native = path::to_native(stripped);
+        if native.is_absolute() {
+            native
+        } else {
+            build_dir.join(native)
+        }
+    };
+    let mut target_mtime = None;
+    for candidate in written.iter().map(&manifest_path).chain([
+        build_dir.join(rcmake_gen_common::glob::STAMP),
+        build_dir.join(rcmake_gen_common::glob::SCRIPT),
+    ]) {
+        if let Ok(meta) = host.metadata(&candidate, Follow::Yes) {
+            target_mtime = Some(match target_mtime {
+                Some(current) if current >= meta.mtime => current,
+                _ => meta.mtime,
+            });
+        }
+    }
+    let Some(target_mtime) = target_mtime else {
+        return;
+    };
+    for node in manifests {
+        if written.contains(node) {
+            continue;
+        }
+        let path = manifest_path(node);
+        if let Ok(meta) = host.metadata(&path, Follow::Yes)
+            && meta.mtime < target_mtime
+        {
+            let _ = host.set_times(&path, None, Some(target_mtime));
+        }
+    }
 }
 
 pub(crate) fn write_always(host: &dyn Host, target: &Path, content: &[u8]) -> Result<(), GenError> {
@@ -356,6 +416,10 @@ fn prepare_directory(host: &dyn Host, build_dir: &Path) -> Result<(), GenError> 
 }
 
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Rule generation gathers generator metadata, programs, and clean settings."
+)]
 fn write_rules(
     result: &GenerationResult,
     host: &dyn Host,
@@ -363,6 +427,7 @@ fn write_rules(
     uses_modules: bool,
     model: Option<&ProjectModel>,
     commands: &Commands,
+    cmake_cmd: &[u8],
     ninja_cmd: &[u8],
     custom_clean: bool,
 ) -> Result<(), GenError> {
@@ -391,10 +456,29 @@ fn write_rules(
     ninja
         .0
         .extend_from_slice(b"\n  description = Cleaning all built files...\n");
+    let prefix = output_prefix(model, commands);
     if custom_clean {
-        ninja.0.extend_from_slice(
-            b"\nrule CLEAN_CUSTOM\n  command = $COMMAND\n  description = Cleaning all built files...\n",
-        );
+        let script = if prefix.is_empty() {
+            BString::from("CMakeFiles/clean_additional.cmake")
+        } else {
+            commands.path(&[prefix.as_slice(), b"/CMakeFiles/clean_additional.cmake"].concat())
+        };
+        let mut quoted_script = Vec::new();
+        commands.word(&script, &mut quoted_script);
+        ninja
+            .0
+            .extend_from_slice(b"\nrule CLEAN_ADDITIONAL\n  command = ");
+        ninja.0.extend_from_slice(cmake_cmd);
+        ninja.0.extend_from_slice(b" -DCONFIG=$CONFIG -P ");
+        for &byte in &quoted_script {
+            if byte == b'$' {
+                ninja.0.push(b'$');
+            }
+            ninja.0.push(byte);
+        }
+        ninja
+            .0
+            .extend_from_slice(b"\n  description = Cleaning additional files...\n");
     }
     ninja.0.extend_from_slice(b"\nrule HELP\n");
     ninja.0.extend_from_slice(b"  command = ");
@@ -412,7 +496,6 @@ fn write_rules(
     }
     response::emit_rules(&mut ninja);
     if !commands.windows() {
-        let prefix = output_prefix(model, commands);
         instrumented::emit_rules(&mut ninja, result, build_dir, !prefix.is_empty(), commands);
     }
     if let Some(prefix) = model
@@ -514,13 +597,16 @@ fn add_ctest_files(outputs: &mut Vec<BString>, graph: &Graph<'_>, model: Option<
         .definition(DirId::ROOT, b"CMAKE_TESTING_ENABLED")
         .is_some_and(|value| rcmake_base::truth::is_on(value));
     let mut seen: HashSet<_> = outputs.iter().cloned().collect();
-    for (_, dir) in model.dirs() {
-        if !root_testing
-            && !dir
+    for (id, dir) in model.dirs() {
+        let testing_enabled = model
+            .definition(id, b"CMAKE_TESTING_ENABLED")
+            .is_some_and(|value| rcmake_base::truth::is_on(value))
+            || (dir.vars.is_empty() && root_testing)
+            || dir
                 .props
                 .get(b"CMAKE_TESTING_ENABLED")
-                .is_some_and(|value| rcmake_base::truth::is_on(value))
-        {
+                .is_some_and(|value| rcmake_base::truth::is_on(value));
+        if !testing_enabled {
             continue;
         }
         let dir_lex = rcmake_base::path_lex::Lexical::new(&dir.binary_dir);

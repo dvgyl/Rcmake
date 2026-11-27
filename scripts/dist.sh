@@ -176,35 +176,61 @@ set(CPACK_PACKAGE_FILE_NAME release-smoke)
 set(CPACK_GENERATOR ZIP)
 include(CPack)
 ''', encoding="utf-8")
-    # Exercise public `rcmake verify` companion discovery and typed stdin/stdout JSON protocol.
-    verify_smoke = subprocess.run(
-        [rcmake_bin, "verify", "--json", "--oracle", rcmake_bin, "--", "-S", source],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=30,
-    )
-    if verify_smoke.returncode != 2:
-        sys.exit(
-            f"Expected rcmake verify recursive-oracle smoke to exit 2, got {verify_smoke.returncode}.\n"
-            f"stdout={verify_smoke.stdout}\nstderr={verify_smoke.stderr}"
+    # Exercise public `rcmake verify` companion discovery and typed stdin/stdout JSON protocol,
+    # ensuring both rcmake and cmake (symlink or launcher shim) reject recursive --oracle.
+    for recursive_oracle in (rcmake_bin, cmake):
+        verify_smoke = subprocess.run(
+            [rcmake_bin, "verify", "--json", "--oracle", recursive_oracle, "--", "-S", source],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
         )
-    try:
-        verify_report = json.loads(verify_smoke.stdout)
-    except json.JSONDecodeError as exc:
-        sys.exit(
-            f"rcmake verify smoke did not return JSON from companion discovery ({exc}).\n"
-            f"stdout={verify_smoke.stdout}\nstderr={verify_smoke.stderr}"
-        )
-    if (
-        verify_report.get("schema_version") != 1
-        or verify_report.get("verdict") != "invalid_input"
-        or verify_report.get("exit_code") != 2
-        or not verify_report.get("error")
-    ):
-        sys.exit(f"Unexpected rcmake verify smoke report: {verify_report}")
+        if verify_smoke.returncode != 2:
+            sys.exit(
+                f"Expected rcmake verify recursive-oracle smoke ({recursive_oracle.name}) to exit 2, got {verify_smoke.returncode}.\n"
+                f"stdout={verify_smoke.stdout}\nstderr={verify_smoke.stderr}"
+            )
+        try:
+            verify_report = json.loads(verify_smoke.stdout)
+        except json.JSONDecodeError as exc:
+            sys.exit(
+                f"rcmake verify smoke ({recursive_oracle.name}) did not return JSON from companion discovery ({exc}).\n"
+                f"stdout={verify_smoke.stdout}\nstderr={verify_smoke.stderr}"
+            )
+        if (
+            verify_report.get("schema_version") != 1
+            or verify_report.get("verdict") != "invalid_input"
+            or verify_report.get("exit_code") != 2
+            or not verify_report.get("error")
+        ):
+            sys.exit(f"Unexpected rcmake verify smoke report ({recursive_oracle.name}): {verify_report}")
     print("Verified rcmake verify companion discovery and typed protocol.", flush=True)
+
+    probe_script = source / "probe_command.cmake"
+    probe_script.write_text('''file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/cmake-command.txt" "${CMAKE_COMMAND}")
+execute_process(
+  COMMAND "${CMAKE_COMMAND}" --version
+  RESULT_VARIABLE _rc
+  OUTPUT_VARIABLE _out
+  ERROR_VARIABLE _err
+)
+if(NOT _rc EQUAL 0)
+  message(FATAL_ERROR "Recursive CMAKE_COMMAND failed (${_rc}): ${_err}")
+endif()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/recursive-version.txt" "${_out}")
+''', encoding="utf-8")
+    subprocess.run([cmake, "-P", probe_script], cwd=source, env=env, check=True, timeout=30)
+    cmake_command = Path((source / "cmake-command.txt").read_text(encoding="utf-8"))
+    if not cmake_command.is_absolute() or cmake_command.name.lower() != ("cmake" + suffix):
+        sys.exit(f"Expected CMAKE_COMMAND to point to cmake{suffix}. Found {cmake_command}.")
+    if cmake_command.parent.resolve() != bin_dir.resolve():
+        sys.exit(f"Expected CMAKE_COMMAND inside {bin_dir}. Found {cmake_command}.")
+    recursive_version = (source / "recursive-version.txt").read_text(encoding="utf-8")
+    if not recursive_version.startswith("cmake version ") or "rcmake" not in recursive_version.lower():
+        sys.exit(f"Unexpected recursive CMAKE_COMMAND --version output: {recursive_version!r}")
+    print("Verified cmake -P CMAKE_COMMAND and recursive invocation.", flush=True)
     subprocess.run([cmake, "-S", source, "-B", build, "-G", "Ninja"],
                    env=env, check=True, timeout=30)
     cmake_root = Path((build / "cmake-root.txt").read_text(encoding="utf-8"))

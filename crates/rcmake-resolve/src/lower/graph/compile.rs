@@ -6,6 +6,7 @@ pub(super) struct CompileSink<'a> {
     pub(super) steps: &'a mut Vec<BuildStep>,
     pub(super) step_offset: usize,
     pub(super) compile_launchers: &'a mut IndexMap<BString, BString>,
+    pub(super) compile_db_commands: &'a mut BTreeMap<usize, BString>,
     pub(super) swift_actions: &'a mut IndexMap<usize, crate::SwiftAction>,
     pub(super) swift_output_file_maps: &'a mut IndexMap<BString, BString>,
 }
@@ -34,6 +35,7 @@ impl TargetPlan<'_> {
             steps: graph_steps,
             step_offset,
             compile_launchers,
+            compile_db_commands,
             swift_actions,
             swift_output_file_maps,
         } = sink;
@@ -215,7 +217,7 @@ impl TargetPlan<'_> {
                                 .clone(),
                             ..CompileUnit::default()
                         };
-                        let (step, launcher) = compile(
+                        let lowered = compile(
                             model,
                             target,
                             config,
@@ -233,7 +235,7 @@ impl TargetPlan<'_> {
                             },
                             usage,
                         )?;
-                        if let Some(launcher) = launcher {
+                        if let Some(launcher) = lowered.launcher {
                             compile_launchers.insert(unit.object.clone(), launcher);
                         }
                         let mut requires = vec![plan.header.clone()];
@@ -250,15 +252,18 @@ impl TargetPlan<'_> {
                         if let Some(object) = &plan.companion_object {
                             objects.push(object.clone());
                         }
-                        self.steps
-                            .insert(push_offset(graph_steps, step_offset, step));
+                        let step_idx = push_offset(graph_steps, step_offset, lowered.step);
+                        if let Some(cmd) = lowered.compile_db_command {
+                            compile_db_commands.insert(step_idx, cmd);
+                        }
+                        self.steps.insert(step_idx);
                     }
                 }
             }
             let fortran_group = fortran
                 .filter(|_| group.language == "Fortran")
                 .map(|plan| plan.compile_group(model, target, unit, group));
-            let (mut step, launcher) = compile(
+            let lowered = compile(
                 model,
                 target,
                 config,
@@ -278,6 +283,8 @@ impl TargetPlan<'_> {
                 },
                 usage,
             )?;
+            let mut step = lowered.step;
+            let launcher = lowered.launcher;
             if let BuildStep::Compile { object, dyndep, .. } = &mut step {
                 if let Some(launcher) = launcher {
                     compile_launchers.insert(object.clone(), launcher);
@@ -315,8 +322,11 @@ impl TargetPlan<'_> {
             if let Some(plan) = fortran {
                 plan.bind_compile(&mut step);
             }
-            self.steps
-                .insert(push_offset(graph_steps, step_offset, step));
+            let step_idx = push_offset(graph_steps, step_offset, step);
+            if let Some(cmd) = lowered.compile_db_command {
+                compile_db_commands.insert(step_idx, cmd);
+            }
+            self.steps.insert(step_idx);
         }
         Ok(objects
             .into_iter()

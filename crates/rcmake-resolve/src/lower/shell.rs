@@ -91,7 +91,7 @@ pub(super) fn ninja_custom(
     }
 }
 
-pub(super) fn windows_host(model: &ProjectModel, dir: DirId) -> bool {
+pub(crate) fn windows_host(model: &ProjectModel, dir: DirId) -> bool {
     definition(model, dir, b"CMAKE_HOST_SYSTEM_NAME").map_or_else(
         || {
             definition(model, dir, b"CMAKE_HOST_WIN32")

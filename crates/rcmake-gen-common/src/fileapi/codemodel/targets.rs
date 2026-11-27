@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rcmake_base::{
+    BString,
     hash::HashAlgo,
     list,
     path_lex::{Lexical, cmake_style},
@@ -312,30 +313,100 @@ impl FileApi<'_, '_> {
         targets: &BTreeMap<TargetId, TargetRef<'_>>,
         config_indices: &ConfigIndices<'_>,
     ) -> Result<Vec<Value>, GenError> {
+        let refs: Vec<&TargetRef<'_>> = ids.iter().filter_map(|id| targets.get(id)).collect();
         let mut usage = UsageResolver::for_codemodel(self.model);
-        ids.iter()
-            .filter_map(|id| targets.get(id))
-            .map(|reference| {
-                let mut value =
-                    self.target_object(reference, targets, &mut usage, config_indices)?;
-                if let Some(target) = self.model.target(reference.target.id) {
-                    let includes =
-                        interface_includes(self.model, &mut usage, reference.target, target)?;
-                    optional_array(&mut value, "interfaceIncludes", includes);
-                }
-                let name = &reference.target.metadata.name;
-                let file = self
-                    .writer
-                    .hashed(&file_prefix("target", name, config), &Object(value))?;
-                Ok(object([
-                    ("name", Value::string(name.clone())),
-                    ("id", Value::string(reference.id.as_str())),
-                    ("directoryIndex", number(reference.dir_index)),
-                    ("projectIndex", number(reference.project_index)),
-                    ("jsonFile", file),
-                ]))
-            })
-            .collect()
+        if refs.len() < 32 {
+            return refs
+                .into_iter()
+                .map(|reference| {
+                    let mut value =
+                        self.target_object(reference, targets, &mut usage, config_indices)?;
+                    if let Some(target) = self.model.target(reference.target.id) {
+                        let includes =
+                            interface_includes(self.model, &mut usage, reference.target, target)?;
+                        optional_array(&mut value, "interfaceIncludes", includes);
+                    }
+                    let name = &reference.target.metadata.name;
+                    let file = self
+                        .writer
+                        .hashed(&file_prefix("target", name, config), &Object(value))?;
+                    Ok(object([
+                        ("name", Value::string(name.clone())),
+                        ("id", Value::string(reference.id.as_str())),
+                        ("directoryIndex", number(reference.dir_index)),
+                        ("projectIndex", number(reference.project_index)),
+                        ("jsonFile", file),
+                    ]))
+                })
+                .collect();
+        }
+        let mut payloads: Vec<(&TargetRef<'_>, String, Value)> = Vec::with_capacity(refs.len());
+        for reference in refs {
+            let mut value = self.target_object(reference, targets, &mut usage, config_indices)?;
+            if let Some(target) = self.model.target(reference.target.id) {
+                let includes =
+                    interface_includes(self.model, &mut usage, reference.target, target)?;
+                optional_array(&mut value, "interfaceIncludes", includes);
+            }
+            let prefix = file_prefix("target", &reference.target.metadata.name, config);
+            payloads.push((reference, prefix, Object(value)));
+        }
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .clamp(1, 4)
+            .min(payloads.len());
+        let encoded: Vec<(String, BString)> = if workers <= 1 {
+            payloads
+                .iter()
+                .map(|(_, prefix, value)| {
+                    let bytes = super::super::json_bytes(value);
+                    let file = format!("{prefix}-{}.json", super::super::hash_prefix(&bytes));
+                    (file, bytes)
+                })
+                .collect()
+        } else {
+            let chunk_size = payloads.len().div_ceil(workers);
+            let chunks: Vec<Vec<(String, BString)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = payloads
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|(_, prefix, value)| {
+                                    let bytes = super::super::json_bytes(value);
+                                    let file = format!(
+                                        "{prefix}-{}.json",
+                                        super::super::hash_prefix(&bytes)
+                                    );
+                                    (file, bytes)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap_or_default())
+                    .collect()
+            });
+            chunks.into_iter().flatten().collect()
+        };
+        let mut out = Vec::with_capacity(payloads.len());
+        for ((reference, _, _), (file_name, bytes)) in payloads.into_iter().zip(encoded) {
+            let file = self.writer.write_hashed(&file_name, &bytes)?;
+            out.push(object([
+                (
+                    "name",
+                    Value::string(reference.target.metadata.name.clone()),
+                ),
+                ("id", Value::string(reference.id.as_str())),
+                ("directoryIndex", number(reference.dir_index)),
+                ("projectIndex", number(reference.project_index)),
+                ("jsonFile", file),
+            ]));
+        }
+        Ok(out)
     }
 
     fn target_object(

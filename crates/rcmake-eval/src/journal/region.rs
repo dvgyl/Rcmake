@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use rcmake_diag::{Backtrace, Frame, FrameKind};
 use rcmake_json::{FieldError, FromJson, Object, Value, req};
@@ -158,6 +160,139 @@ pub struct PropertyOrigin {
     /// Absolute binary directory of the caller.
     pub binary_dir: PathBuf,
     frames: Vec<RecordedFrame>,
+    calls: CallIds,
+}
+
+/// Bit that marks a call identity read from a manifest. Live identities from
+/// [`Backtrace::frame_nodes`] are smaller, so the two kinds never collide.
+const DECODED_CALL: u64 = 1 << 63;
+
+/// Restored call stack frames of one manifest, by call identity.
+type RestoreTable = Mutex<HashMap<u64, Backtrace>>;
+
+/// Call identity of each recorded frame (`cmListFileBacktrace` node identity).
+///
+/// Values that one command call records share the call stack nodes of that
+/// call, and two calls with equal frames (for example two iterations of one
+/// `foreach()` body) have different nodes. The File API `backtraceGraph` shows
+/// this difference, so a replayed configure restores the same sharing.
+///
+/// The identities do not change what an origin records: equality and debug
+/// output ignore them.
+#[derive(Clone, Default)]
+struct CallIds {
+    /// One identity per frame, in frame order. Empty when unknown.
+    ids: Vec<u64>,
+    /// Frames already restored from the same manifest.
+    table: Option<Arc<RestoreTable>>,
+}
+
+impl PartialEq for CallIds {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for CallIds {}
+
+impl std::fmt::Debug for CallIds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CallIds")
+    }
+}
+
+thread_local! {
+    /// Ordinals of the call identities in the manifest being encoded.
+    static ENCODE_CALLS: RefCell<Option<HashMap<u64, u64>>> = const { RefCell::new(None) };
+    /// Restore table of the manifest being decoded.
+    static DECODE_TABLE: RefCell<Option<Arc<RestoreTable>>> = const { RefCell::new(None) };
+    /// Live call stack at the entry of the region that is being replayed.
+    static REPLAY_ENTRY: RefCell<Option<Backtrace>> = const { RefCell::new(None) };
+}
+
+/// Scope of one region replay hit.
+///
+/// The entry context of a region hashes its entry call stack, so on a hit the recorded
+/// entry frames equal the live entry frames. While the scope exists, a restored
+/// backtrace starts from the live entry nodes instead of new copies. Then a target
+/// that the replayed region creates and a later live command on that target share
+/// their caller nodes (for example one function call node) in the File API graph.
+pub(super) struct EntryScope {
+    previous: Option<Backtrace>,
+}
+
+impl EntryScope {
+    /// Use `entry` as the live entry call stack until the scope ends.
+    pub(super) fn enter(entry: &Backtrace) -> Self {
+        let previous = REPLAY_ENTRY.with(|slot| slot.replace(Some(entry.clone())));
+        Self { previous }
+    }
+}
+
+impl Drop for EntryScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        REPLAY_ENTRY.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Scope of one manifest encode or decode. Call identities share one ordinal
+/// space (encode) or one restore table (decode) in the scope.
+pub(super) struct CallScope {
+    encode: bool,
+}
+
+impl CallScope {
+    /// Number the call identities in first-seen order while the scope exists.
+    pub(super) fn encode() -> Self {
+        ENCODE_CALLS.with(|calls| *calls.borrow_mut() = Some(HashMap::new()));
+        Self { encode: true }
+    }
+
+    /// Share one restore table among the origins decoded while the scope exists.
+    pub(super) fn decode() -> Self {
+        DECODE_TABLE.with(|table| *table.borrow_mut() = Some(Arc::default()));
+        Self { encode: false }
+    }
+}
+
+impl Drop for CallScope {
+    fn drop(&mut self) {
+        if self.encode {
+            ENCODE_CALLS.with(|calls| *calls.borrow_mut() = None);
+        } else {
+            DECODE_TABLE.with(|table| *table.borrow_mut() = None);
+        }
+    }
+}
+
+impl CallIds {
+    /// Return the deterministic ordinals to write. Outside an encode scope, the
+    /// ordinals are local to this origin.
+    fn ordinals(&self) -> Vec<u64> {
+        ENCODE_CALLS.with(|calls| {
+            let mut scope = calls.borrow_mut();
+            let mut local = HashMap::new();
+            let calls = scope.as_mut().unwrap_or(&mut local);
+            self.ids
+                .iter()
+                .map(|id| {
+                    let next = calls.len() as u64 + 1;
+                    *calls.entry(*id).or_insert(next)
+                })
+                .collect()
+        })
+    }
+
+    fn decoded(ordinals: Vec<u64>) -> Self {
+        Self {
+            ids: ordinals
+                .into_iter()
+                .map(|ordinal| ordinal | DECODED_CALL)
+                .collect(),
+            table: DECODE_TABLE.with(|table| table.borrow().clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,19 +324,26 @@ impl PropertyOrigin {
     /// Capture the caller directory and its current backtrace.
     #[must_use]
     pub fn new(binary_dir: PathBuf, backtrace: &Backtrace) -> Self {
-        let frames = backtrace.frames().map(|frame| RecordedFrame {
-            file: frame.file.to_vec(),
-            line: frame.line,
-            name: frame.name.as_deref().map(<[u8]>::to_vec),
-            kind: match frame.kind {
-                FrameKind::Command => RecordedFrameKind::Command,
-                FrameKind::Deferred => RecordedFrameKind::Deferred,
-                FrameKind::ModuleInclude => RecordedFrameKind::ModuleInclude,
-            },
-        });
+        let (ids, frames) = backtrace
+            .frame_nodes()
+            .map(|(id, frame)| {
+                let frame = RecordedFrame {
+                    file: frame.file.to_vec(),
+                    line: frame.line,
+                    name: frame.name.as_deref().map(<[u8]>::to_vec),
+                    kind: match frame.kind {
+                        FrameKind::Command => RecordedFrameKind::Command,
+                        FrameKind::Deferred => RecordedFrameKind::Deferred,
+                        FrameKind::ModuleInclude => RecordedFrameKind::ModuleInclude,
+                    },
+                };
+                (id, frame)
+            })
+            .unzip();
         Self {
             binary_dir,
-            frames: frames.collect(),
+            frames,
+            calls: CallIds { ids, table: None },
         }
     }
 
@@ -225,23 +367,84 @@ impl PropertyOrigin {
     }
 
     /// Reconstruct the call stack for the project model's property mutation API.
+    ///
+    /// Origins decoded from one manifest share the restored frame of each
+    /// recorded call, as the live configure did. Inside an `EntryScope`, the
+    /// frames of the live entry call stack keep their live nodes.
     #[must_use]
     pub fn backtrace(&self) -> Backtrace {
-        self.frames
+        let ids = (self.calls.ids.len() == self.frames.len()).then_some(&self.calls.ids);
+        let mut table = self
+            .calls
+            .table
+            .as_ref()
+            .filter(|_| ids.is_some())
+            .and_then(|table| table.lock().ok());
+        let (mut trace, inner) =
+            REPLAY_ENTRY.with(|entry| self.live_entry(entry.borrow().as_ref()));
+        for (index, frame) in self.frames.iter().enumerate().take(inner).rev() {
+            let frame = frame.to_frame();
+            let (Some(table), Some(&id)) = (table.as_mut(), ids.and_then(|ids| ids.get(index)))
+            else {
+                trace = trace.push(frame);
+                continue;
+            };
+            let parent = trace.frame_nodes().next().map(|(id, _)| id);
+            match table.get(&id) {
+                // Reuse the frame only if it restores the same frame on the same caller.
+                Some(restored)
+                    if restored.top() == Some(&frame)
+                        && restored.frame_nodes().nth(1).map(|(id, _)| id) == parent =>
+                {
+                    trace = restored.clone();
+                }
+                _ => {
+                    trace = trace.push(frame);
+                    table.insert(id, trace.clone());
+                }
+            }
+        }
+        trace
+    }
+}
+
+impl PropertyOrigin {
+    /// Return the live entry stack and the number of recorded frames above it, when the
+    /// outermost recorded frames equal the frames of `entry`.
+    fn live_entry(&self, entry: Option<&Backtrace>) -> (Backtrace, usize) {
+        let all = (Backtrace::default(), self.frames.len());
+        let Some(entry) = entry.filter(|entry| !entry.is_empty()) else {
+            return all;
+        };
+        let depth = entry.frames().count();
+        let Some(inner) = self.frames.len().checked_sub(depth) else {
+            return all;
+        };
+        let outer = self.frames.get(inner..).unwrap_or_default();
+        if outer
             .iter()
-            .rev()
-            .fold(Backtrace::default(), |trace, frame| {
-                trace.push(Frame {
-                    file: frame.file.as_slice().into(),
-                    line: frame.line,
-                    name: frame.name.as_deref().map(Into::into),
-                    kind: match frame.kind {
-                        RecordedFrameKind::Command => FrameKind::Command,
-                        RecordedFrameKind::Deferred => FrameKind::Deferred,
-                        RecordedFrameKind::ModuleInclude => FrameKind::ModuleInclude,
-                    },
-                })
-            })
+            .map(RecordedFrame::to_frame)
+            .eq(entry.frames().cloned())
+        {
+            (entry.clone(), inner)
+        } else {
+            all
+        }
+    }
+}
+
+impl RecordedFrame {
+    fn to_frame(&self) -> Frame {
+        Frame {
+            file: self.file.as_slice().into(),
+            line: self.line,
+            name: self.name.as_deref().map(Into::into),
+            kind: match self.kind {
+                RecordedFrameKind::Command => FrameKind::Command,
+                RecordedFrameKind::Deferred => FrameKind::Deferred,
+                RecordedFrameKind::ModuleInclude => FrameKind::ModuleInclude,
+            },
+        }
     }
 }
 
@@ -658,6 +861,7 @@ impl EncodeJson for PropertyOrigin {
     fn encode(&self, sink: &mut JsonSink<'_>) -> Result<(), EncodeError> {
         sink.object(|obj| {
             obj.field("binary_dir", |s| s.path(&self.binary_dir))?;
+            obj.field("calls", |s| self.calls.ordinals().encode(s))?;
             obj.field("frames", |s| self.frames.encode(s))
         })
     }
@@ -665,10 +869,16 @@ impl EncodeJson for PropertyOrigin {
 
 impl FromJson for PropertyOrigin {
     fn from_json(value: &Value) -> Result<Self, FieldError> {
-        let obj = fields(value, &["binary_dir", "frames"])?;
+        let obj = fields(value, &["binary_dir", "calls", "frames"])?;
+        let frames: Vec<RecordedFrame> = req(obj, "frames")?;
+        let calls: Vec<u64> = req(obj, "calls")?;
+        if calls.len() != frames.len() || calls.iter().any(|&call| call & DECODED_CALL != 0) {
+            return Err(FieldError::invalid("one call per frame").in_field("calls"));
+        }
         Ok(Self {
             binary_dir: field(obj, "binary_dir", codec::from_path)?,
-            frames: req(obj, "frames")?,
+            frames,
+            calls: CallIds::decoded(calls),
         })
     }
 }
@@ -836,5 +1046,156 @@ impl FromJson for RegionRecord {
             context: req(obj, "context")?,
             payload: req(obj, "payload")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod call_tests {
+    use std::path::PathBuf;
+
+    use rcmake_diag::{Backtrace, Frame, FrameKind};
+    use rcmake_json::{FromJson, ReadOptions, parse};
+
+    use super::super::frame::{EncodeJson, MAX_FRAME_BYTES, write_with};
+    use super::{CallScope, PropertyOrigin};
+
+    fn call(line: u32) -> Frame {
+        Frame {
+            file: b"/s/CMakeLists.txt".as_slice().into(),
+            line,
+            name: Some(b"install".as_slice().into()),
+            kind: FrameKind::Command,
+        }
+    }
+
+    fn top_id(trace: &Backtrace) -> Option<u64> {
+        trace.frame_nodes().next().map(|(id, _)| id)
+    }
+
+    #[test]
+    fn manifest_round_trip_keeps_call_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let file = Backtrace::default().push(Frame {
+            file: b"/s/CMakeLists.txt".as_slice().into(),
+            line: 0,
+            name: None,
+            kind: FrameKind::ModuleInclude,
+        });
+        let first = file.push(call(5));
+        // An equal frame of another call, as in the next `foreach()` iteration.
+        let second = file.push(call(5));
+        let bin = PathBuf::from("/b");
+        let origins = vec![
+            PropertyOrigin::new(bin.clone(), &first),
+            PropertyOrigin::new(bin.clone(), &first),
+            PropertyOrigin::new(bin, &second),
+        ];
+        let encode = || -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let _scope = CallScope::encode();
+            let mut bytes = Vec::new();
+            write_with(&mut bytes, MAX_FRAME_BYTES, |sink| origins.encode(sink)).ok_or("encode")?;
+            Ok(bytes)
+        };
+        let bytes = encode()?;
+        assert_eq!(bytes, encode()?, "the ordinals are deterministic");
+
+        let decoded: Vec<PropertyOrigin> = {
+            let _scope = CallScope::decode();
+            Vec::from_json(&parse(&bytes, &ReadOptions::default())?)?
+        };
+        assert_eq!(decoded, origins);
+        let traces: Vec<Backtrace> = decoded.iter().map(PropertyOrigin::backtrace).collect();
+        let [a, b, c] = traces.as_slice() else {
+            return Err("three traces".into());
+        };
+        assert_eq!(top_id(a), top_id(b), "one call shares one node");
+        assert_ne!(top_id(a), top_id(c), "two calls have two nodes");
+        assert_eq!(
+            a.frame_nodes().nth(1).map(|(id, _)| id),
+            c.frame_nodes().nth(1).map(|(id, _)| id),
+            "both calls share the file frame"
+        );
+        assert!(a.frames().eq(c.frames()));
+        Ok(())
+    }
+
+    fn module(line: u32, name: &[u8]) -> Frame {
+        Frame {
+            file: b"/s/cmake/helper.cmake".as_slice().into(),
+            line,
+            name: Some(name.into()),
+            kind: FrameKind::Command,
+        }
+    }
+
+    #[test]
+    fn replayed_origins_share_live_entry_caller_nodes() -> Result<(), Box<dyn std::error::Error>> {
+        let file = Backtrace::default().push(Frame {
+            file: b"/s/CMakeLists.txt".as_slice().into(),
+            line: 0,
+            name: None,
+            kind: FrameKind::ModuleInclude,
+        });
+        // `make_lib()` calls `include(lib.cmake)`; `lib.cmake` calls `add_library()`.
+        let function_call = file.push(call(3));
+        let entry = function_call.push(module(2, b"include"));
+        let created = entry.push(Frame {
+            file: b"/s/cmake/lib.cmake".as_slice().into(),
+            line: 1,
+            name: Some(b"add_library".as_slice().into()),
+            kind: FrameKind::Command,
+        });
+        let bin = PathBuf::from("/b");
+        let origins = [
+            PropertyOrigin::new(bin.clone(), &created),
+            PropertyOrigin::new(bin.clone(), &entry),
+        ];
+        let bytes = {
+            let _scope = CallScope::encode();
+            let mut bytes = Vec::new();
+            write_with(&mut bytes, MAX_FRAME_BYTES, |sink| origins.encode(sink)).ok_or("encode")?;
+            bytes
+        };
+
+        // A later configure reaches the same entry through new live nodes.
+        let live_call = file.push(call(3));
+        let live_entry = live_call.push(module(2, b"include"));
+        // The live command after the replayed region, on the same function call node.
+        let live_after = live_call.push(module(3, b"target_compile_definitions"));
+        let node =
+            |trace: &Backtrace, depth: usize| trace.frame_nodes().nth(depth).map(|(id, _)| id);
+
+        for decoded in [false, true] {
+            let restored: Vec<Backtrace> = {
+                let _entry = super::EntryScope::enter(&live_entry);
+                let origins: Vec<PropertyOrigin> = if decoded {
+                    let _scope = CallScope::decode();
+                    Vec::from_json(&parse(&bytes, &ReadOptions::default())?)?
+                } else {
+                    origins.to_vec()
+                };
+                origins.iter().map(PropertyOrigin::backtrace).collect()
+            };
+            let [target, at_entry] = restored.as_slice() else {
+                return Err("two traces".into());
+            };
+            assert!(target.frames().eq(created.frames()), "decoded={decoded}");
+            assert!(at_entry.same_call(&live_entry), "decoded={decoded}");
+            assert_eq!(
+                node(target, 2),
+                node(&live_after, 1),
+                "the replayed target and the live command share the function call node (decoded={decoded})"
+            );
+            assert_eq!(node(target, 1), node(&live_entry, 0), "decoded={decoded}");
+        }
+
+        // Without a live entry, or with other entry frames, restore new nodes.
+        let other_entry = live_call.push(module(9, b"include"));
+        for scope in [None, Some(&other_entry)] {
+            let _entry = scope.map(super::EntryScope::enter);
+            let target = origins[0].backtrace();
+            assert!(target.frames().eq(created.frames()));
+            assert_ne!(node(&target, 2), node(&live_after, 1));
+        }
+        Ok(())
     }
 }

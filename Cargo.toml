@@ -36,6 +36,7 @@ members = [
     "crates/rcmake-gen-xcode",
     "crates/rcmake-gen-vs",
     "crates/rcmake-cli",
+    "crates/rcmake-shim",
     "crates/rcmake-harness",
     "crates/rcmake-fuzz",
     "crates/rcmake-api",
@@ -44,7 +45,7 @@ members = [
 
 [workspace.package]
 publish = false
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -151,10 +152,19 @@ strip = "symbols"
 debug = false
 incremental = false
 
+[profile.release.package.bzip2]
+opt-level = "z"
+
+[profile.release.package.flate2]
+opt-level = "z"
+
 [profile.release.package.jiff]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.libbz2-rs-sys]
+opt-level = "z"
+
+[profile.release.package.liblzma]
 opt-level = "z"
 
 [profile.release.package.liblzma-sys]
@@ -163,7 +173,16 @@ opt-level = "z"
 [profile.release.package.lzma-rust2]
 opt-level = "z"
 
+[profile.release.package.md-5]
+opt-level = "z"
+
+[profile.release.package.miniz_oxide]
+opt-level = "z"
+
 [profile.release.package.ppmd-turbo]
+opt-level = "z"
+
+[profile.release.package.rcmake-archive]
 opt-level = "z"
 
 [profile.release.package.rcmake-buildinfo]
@@ -175,32 +194,32 @@ opt-level = "z"
 [profile.release.package.rcmake-ccmake]
 opt-level = "z"
 
+[profile.release.package.rcmake-ctest]
+opt-level = "z"
+
+[profile.release.package.rcmake-cxxmodules]
+opt-level = "z"
+
 [profile.release.package.rcmake-dap]
+opt-level = "z"
+
+[profile.release.package.rcmake-fortran]
+opt-level = "z"
+
+[profile.release.package.rcmake-gen-vs]
+opt-level = "z"
+
+[profile.release.package.rcmake-gen-xcode]
 opt-level = "z"
 
 [profile.release.package.rcmake-language-tools]
 opt-level = "z"
 
-[profile.release.package.rcmake-cps]
-opt-level = "s"
-
-[profile.release.package.rcmake-ctest]
-opt-level = "z"
-
-[profile.release.package.rcmake-gen-vs]
-opt-level = "s"
-
-[profile.release.package.rcmake-gen-xcode]
-opt-level = "s"
-
-[profile.release.package.rcmake-instrument]
-opt-level = "s"
-
 [profile.release.package.rcmake-lsp]
 opt-level = "z"
 
-[profile.release.package.rcmake-presets]
-opt-level = "s"
+[profile.release.package.rcmake-shim]
+opt-level = "z"
 
 [profile.release.package.rcmake-tool-e]
 opt-level = "z"
@@ -208,7 +227,22 @@ opt-level = "z"
 [profile.release.package.sevenz-rust2]
 opt-level = "z"
 
+[profile.release.package.sha1]
+opt-level = "z"
+
+[profile.release.package.sha3]
+opt-level = "z"
+
+[profile.release.package.similar]
+opt-level = "z"
+
+[profile.release.package.tar]
+opt-level = "z"
+
 [profile.release.package.zip]
+opt-level = "z"
+
+[profile.release.package.zstd-sys]
 opt-level = "z"
 
 [profile.size-probe]

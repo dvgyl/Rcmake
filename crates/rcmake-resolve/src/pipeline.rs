@@ -23,7 +23,7 @@ use crate::{
     },
     target::resolve_target,
     unity,
-    usage::{ResolvedLinkItem, ResolvedLinkKind, UsageResolver, handle},
+    usage::{MemoSnapshot, ResolvedLinkItem, ResolvedLinkKind, UsageResolver, handle},
 };
 
 mod autogen;
@@ -185,6 +185,7 @@ fn resolve_project(
     let prepared = header_verify::prepare(model, &paths, &configs, &configured_targets)?;
     let model = if let Some(prepared) = &prepared {
         for (config, configured) in configs.iter().zip(&mut configured_targets) {
+            configured.memos = MemoSnapshot::default();
             resolve_verification_targets(model, &prepared.model, &mut paths, config, configured)?;
         }
         &prepared.model
@@ -241,6 +242,7 @@ fn resolve_project(
     let mut compile_inputs = BTreeMap::new();
     let mut xcode_link_error = None;
     let mut xcode_sources = IndexMap::new();
+    let mut shared_memos = MemoSnapshot::default();
     for (config, configured) in configs.iter().zip(configured_targets) {
         if configs.len() != 1 {
             paths.index_generated(model, config)?;
@@ -256,6 +258,9 @@ fn resolve_project(
             &plan,
             workers_override,
         )?;
+        if let Some(memos) = output.memos {
+            shared_memos.merge_from(memos);
+        }
         provenance.extend(output.provenance.unwrap_or_default());
         runtime_languages.extend(
             output
@@ -298,7 +303,9 @@ fn resolve_project(
     })?;
     let exports = resolve_exports(
         model,
-        &mut UsageResolver::new(model).with_ide(options.ide),
+        &mut UsageResolver::new(model)
+            .with_ide(options.ide)
+            .with_memos(&shared_memos),
         &targets,
         &install,
         &configs,
@@ -371,7 +378,9 @@ fn resolve_project(
         &configs,
         (&targets, &graphs),
         &paths,
-        &mut UsageResolver::with_source_paths(model, &paths).with_ide(options.ide),
+        &mut UsageResolver::with_source_paths(model, &paths)
+            .with_ide(options.ide)
+            .with_memos(&shared_memos),
     )?;
     for target in &mut targets {
         target.dependencies = target_depends
@@ -381,6 +390,13 @@ fn resolve_project(
             .collect();
     }
     crate::file_sets::clean_lint_fixes(model, host, &graphs);
+    let resolved_model = prepared
+        .map(|prepared| Box::new(prepared.model))
+        .or_else(|| autogen.map(|autogen| Box::new(autogen.model)))
+        .or_else(|| strategies.map(Box::new))
+        .or_else(|| rules.map(Box::new))
+        .or_else(|| output_sets.map(Box::new))
+        .or_else(|| includes.map(Box::new));
     Ok(GenerationResult {
         configs,
         targets,
@@ -396,6 +412,7 @@ fn resolve_project(
         metadata,
         provenance_entries: provenance.entries,
         chains: options.provenance.then(|| Box::new(provenance.chains)),
+        resolved_model,
     })
 }
 
@@ -405,6 +422,7 @@ struct ConfigOutput {
     runtime_languages: IndexMap<TargetId, IndexSet<BString>>,
     graph: Result<BuildGraph, ResolveError>,
     cross_graphs: IndexMap<(ConfigId, ConfigId), BuildGraph>,
+    memos: Option<MemoSnapshot>,
 }
 
 struct ConfigurationPlan<'a> {
@@ -512,6 +530,7 @@ struct ConfigTargets {
     inputs: IndexMap<TargetId, TargetInputs>,
     linked_object_sources: IndexSet<TargetId>,
     file_generate_cycles: IndexSet<(DirId, BString)>,
+    memos: MemoSnapshot,
 }
 
 /// Print a target evaluation error that permits the next target to resolve.
@@ -796,34 +815,37 @@ fn resolve_targets(
                     outcome,
                 });
             }
-            outputs
+            (outputs, worker_usage.take_local_memos())
         });
-        for work in chunks.into_iter().flatten() {
-            paths.replay_events(work.diag_events);
-            if let (Some(dest), Some(src)) = (&mut usage.provenance, work.provenance) {
-                dest.extend(src);
-            }
-            let (facts, target_inputs) = match work.outcome {
-                TargetResolveOutcome::Ok(boxed) => *boxed,
-                TargetResolveOutcome::ResolveErr(error) => {
-                    failed = Some(report_target_error(paths, error)?);
-                    continue;
+        for (outputs, worker_memos) in chunks {
+            usage.absorb_memos(worker_memos);
+            for work in outputs {
+                paths.replay_events(work.diag_events);
+                if let (Some(dest), Some(src)) = (&mut usage.provenance, work.provenance) {
+                    dest.extend(src);
                 }
-                TargetResolveOutcome::ObjectSourcesErr(error) => return Err(error),
-            };
-            for source in &target_inputs.sources {
-                if paths
-                    .output_source_reads
-                    .get(source)
-                    .is_some_and(|reads| reads.contains(&work.id))
-                {
-                    configured
-                        .file_generate_cycles
-                        .insert((work.dir, source.clone()));
+                let (facts, target_inputs) = match work.outcome {
+                    TargetResolveOutcome::Ok(boxed) => *boxed,
+                    TargetResolveOutcome::ResolveErr(error) => {
+                        failed = Some(report_target_error(paths, error)?);
+                        continue;
+                    }
+                    TargetResolveOutcome::ObjectSourcesErr(error) => return Err(error),
+                };
+                for source in &target_inputs.sources {
+                    if paths
+                        .output_source_reads
+                        .get(source)
+                        .is_some_and(|reads| reads.contains(&work.id))
+                    {
+                        configured
+                            .file_generate_cycles
+                            .insert((work.dir, source.clone()));
+                    }
                 }
+                configured.targets.insert(work.id, facts);
+                configured.inputs.insert(work.id, target_inputs);
             }
-            configured.targets.insert(work.id, facts);
-            configured.inputs.insert(work.id, target_inputs);
         }
     }
     if let Some(error) = failed {
@@ -854,7 +876,8 @@ fn resolve_targets(
             configured.linked_object_sources.insert(id);
         }
     }
-    configured.provenance = usage.provenance;
+    configured.provenance = usage.provenance.take();
+    configured.memos = usage.memo_snapshot();
     Ok(configured)
 }
 
@@ -1459,6 +1482,7 @@ fn resolve_config(
         targets: mut resolved,
         mut inputs,
         provenance,
+        memos,
         ..
     } = configured;
     let ctx = EvalContext {
@@ -1468,6 +1492,9 @@ fn resolve_config(
     let std_model = stdlib::providers(model, paths.host, &resolved, config)?;
     let model = std_model.as_ref().map_or(model, |(model, _)| model);
     let mut usage = UsageResolver::with_source_paths(model, paths);
+    if std_model.is_none() {
+        usage = usage.with_memos(&memos);
+    }
     usage.provenance = provenance;
     usage.seed_target_languages(config, &resolved);
     let providers = std_model.as_ref().map(|(_, bindings)| bindings);
@@ -1516,6 +1543,7 @@ fn resolve_config(
                 runtime_languages: IndexMap::new(),
                 graph: Err(error),
                 cross_graphs: IndexMap::new(),
+                memos: None,
             });
         }
         result => result?,
@@ -1585,6 +1613,7 @@ fn resolve_config(
             }
         }
     }
+    let output_memos = std_model.is_none().then(|| usage.memo_snapshot());
     Ok(ConfigOutput {
         provenance: usage.provenance,
         targets: resolved,
@@ -1594,5 +1623,6 @@ fn resolve_config(
             .collect(),
         graph: Ok(graph),
         cross_graphs,
+        memos: output_memos,
     })
 }

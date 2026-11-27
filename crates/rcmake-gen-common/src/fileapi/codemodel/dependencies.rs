@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use indexmap::IndexMap;
+
 use rcmake_base::{list, truth::is_on};
 use rcmake_diag::Backtrace;
 use rcmake_genex::{EvalContext, UsageTraversal};
@@ -38,7 +40,7 @@ pub(super) fn write(
     let use_depend_graph = !target_depends.targets().is_empty();
     let emit_dependencies = !reference.abstract_target && !raw.is_imported();
     let dep_backtraces = super::targets::dependency_backtraces(model, raw);
-    let mut dependencies: BTreeMap<TargetId, (&str, Option<Backtrace>)> = if emit_dependencies {
+    let mut dependencies: IndexMap<TargetId, (&str, Option<Backtrace>)> = if emit_dependencies {
         if use_depend_graph {
             target_depends
                 .direct_depends(target.id)
@@ -79,8 +81,9 @@ pub(super) fn write(
                 .collect()
         }
     } else {
-        BTreeMap::new()
+        IndexMap::new()
     };
+    let mut link_fields = Vec::with_capacity(4);
     for (field, interface, traversal) in [
         ("linkLibraries", false, UsageTraversal::Link),
         ("interfaceLinkLibraries", true, UsageTraversal::Link),
@@ -115,6 +118,30 @@ pub(super) fn write(
                 }
             }
         }
+        link_fields.push((field, traversal, items));
+    }
+
+    // `cmFileAPICodemodel` `Target::Dump` writes `dependencies` before the link
+    // and compile dependency fields, so it adds those backtraces to the graph
+    // first. CMake orders the dependency set by `cmGeneratorTarget` address,
+    // which follows the order in which CMake creates the generator targets:
+    // directory by directory, and targets in definition order in each one.
+    if emit_dependencies {
+        dependencies.sort_by_cached_key(|id, _| creation_order(model, *id));
+        optional_array(
+            body,
+            "dependencies",
+            dependencies.into_values().map(|(id, trace)| {
+                let mut entry = members([("id", Value::string(id))]);
+                if let Some(trace) = trace {
+                    graph.tag(&mut entry, &trace);
+                }
+                Object(entry)
+            }),
+        );
+    }
+
+    for (field, traversal, items) in link_fields {
         optional_array(
             body,
             field,
@@ -131,20 +158,6 @@ pub(super) fn write(
                 }
                 graph.tag(&mut value, &item.text.backtrace);
                 Some(Object(value))
-            }),
-        );
-    }
-
-    if emit_dependencies {
-        optional_array(
-            body,
-            "dependencies",
-            dependencies.into_values().map(|(id, trace)| {
-                let mut entry = members([("id", Value::string(id))]);
-                if let Some(trace) = trace {
-                    graph.tag(&mut entry, &trace);
-                }
-                Object(entry)
             }),
         );
     }
@@ -175,13 +188,16 @@ pub(super) fn write(
             .filter_map(|(&id, trace)| tagged_dependency(Value::string(id), trace, graph)),
     );
 
-    let mut ordered = BTreeMap::<(&str, bool), Option<&Backtrace>>::new();
+    let mut ordered = IndexMap::<(&str, bool), (Option<usize>, Option<&Backtrace>)>::new();
     if use_depend_graph {
         for item in target_depends.order_dependencies(model, target.id) {
             if let Some(target_ref) = targets.get(&item.target) {
                 ordered
                     .entry((target_ref.id.as_str(), item.cross))
-                    .or_insert((!item.backtrace.is_empty()).then_some(&item.backtrace));
+                    .or_insert((
+                        target_depends.target_index(item.target),
+                        (!item.backtrace.is_empty()).then_some(&item.backtrace),
+                    ));
             }
         }
     } else {
@@ -197,7 +213,7 @@ pub(super) fn write(
             {
                 ordered
                     .entry((target_ref.id.as_str(), false))
-                    .or_insert(Some(&entry.backtrace));
+                    .or_insert((None, Some(&entry.backtrace)));
             }
         }
         for &id in object_dependencies.keys() {
@@ -205,21 +221,35 @@ pub(super) fn write(
                 .split_once("::@")
                 .map_or(id.as_bytes(), |(n, _)| n.as_bytes());
             if !is_reserved_target(name) {
-                ordered.entry((id, false)).or_insert(None);
+                ordered.entry((id, false)).or_insert((None, None));
             }
         }
+    }
+    let mut ordered: Vec<_> = ordered.into_iter().collect();
+    if use_depend_graph {
+        ordered.sort_by_key(|((_, cross), (rank, _))| (rank.unwrap_or(usize::MAX), *cross));
     }
     optional_array(
         body,
         "orderDependencies",
         ordered
             .into_iter()
-            .filter_map(|((id, _), trace)| match trace {
+            .filter_map(|((id, _), (_, trace))| match trace {
                 Some(trace) => tagged_dependency(Value::string(id), trace, graph),
                 None => Some(Object(members([("id", Value::string(id))]))),
             }),
     );
     Ok(())
+}
+
+/// Return the position of the generator target of `id` in CMake's creation order.
+fn creation_order(model: &ProjectModel, id: TargetId) -> (usize, usize) {
+    (
+        model
+            .target(id)
+            .map_or(usize::MAX, |target| target.dir.index()),
+        id.index(),
+    )
 }
 
 fn is_reserved_target(name: &[u8]) -> bool {

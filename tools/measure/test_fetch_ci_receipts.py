@@ -497,7 +497,7 @@ def workflow_jobs(text: str) -> dict[str, str]:
 
 def workflow_uploads(job: str) -> list[tuple[str, list[str]]]:
     """Return (name, paths) for each actions/upload-artifact step in one job."""
-    env = dict(re.findall(r"^      ([A-Z_]+): (\S+)$", job, flags=re.M))
+    env = dict(re.findall(r"^      ([A-Z_]+): (.+)$", job, flags=re.M))
     uploads = []
     lines = job.splitlines()
     for index, line in enumerate(lines):
@@ -589,6 +589,24 @@ class EcosystemWorkflowParityTests(unittest.TestCase):
         self.assertIn("--scenario " + ",".join(verifier.REQUIRED_CONAN_SCENARIOS), job)
         receipt = next(path for path in self.uploads["conan"][1] if path.endswith("/conan.json"))
         self.assertIn(f'--out-json "{receipt.replace("${{ runner.temp }}", "$RUNNER_TEMP")}"', job)
+
+    def test_runcmake_jobs_shard_three_ways_and_merge_with_99_percent_gate(self) -> None:
+        for os_name, artifact in (
+            ("linux", "runcmake-linux-full"),
+            ("macos", "runcmake-macos-full"),
+            ("windows", "runcmake-windows"),
+        ):
+            with self.subTest(os=os_name):
+                shard_job = self.jobs[f"runcmake-{os_name}-shards"]
+                self.assertIn("shard: [1, 2, 3]", shard_job)
+                self.assertIn(f"name: runcmake-{os_name}-shard-${{{{ matrix.shard }}}}", shard_job)
+                merge_job = self.jobs[f"runcmake-{os_name}"]
+                self.assertIn(f"needs: runcmake-{os_name}-shards", merge_job)
+                self.assertIn("--merge", merge_job)
+                self.assertIn("--expected-shards 3", merge_job)
+                self.assertIn("--min-pass-rate 99.0", merge_job)
+                self.assertEqual(self.uploads[artifact][0], f"runcmake-{os_name}")
+        self.assertIn("ccmake", ECOSYSTEM_YML.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

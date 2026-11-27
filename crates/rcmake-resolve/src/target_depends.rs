@@ -50,6 +50,7 @@ pub struct TargetDependGraph {
     utilities: IndexMap<TargetId, Vec<UtilityItem>>,
     traced_sources: IndexMap<TargetId, Vec<BString>>,
     source_paths: IndexMap<TargetId, IndexMap<BString, BString>>,
+    generated_sources: IndexMap<TargetId, IndexSet<BString>>,
 }
 
 impl TargetDependGraph {
@@ -57,6 +58,13 @@ impl TargetDependGraph {
     #[must_use]
     pub fn targets(&self) -> &[TargetId] {
         &self.nodes
+    }
+
+    /// Return the `cmComputeTargetDepends::CollectTargets` index of `target`,
+    /// or `None` for targets outside the build system (such as imported targets).
+    #[must_use]
+    pub fn target_index(&self, target: TargetId) -> Option<usize> {
+        self.index.get(&target).copied()
     }
 
     /// Direct dependencies of `target` (`GetTargetDirectDepends`), one entry per
@@ -98,6 +106,16 @@ impl TargetDependGraph {
     #[must_use]
     pub fn resolved_source(&self, target: TargetId, name: &[u8]) -> Option<&BString> {
         self.source_paths.get(&target)?.get(name)
+    }
+
+    /// Return whether `path` (normalized absolute path) is a generated source
+    /// visible to `target`, including custom-command outputs/byproducts under
+    /// CMP0118/CMP0163 and `file(GENERATE)` outputs.
+    #[must_use]
+    pub fn is_generated_source(&self, target: TargetId, path: &[u8]) -> bool {
+        self.generated_sources
+            .get(&target)
+            .is_some_and(|set| set.contains(path))
     }
 
     /// Sources that the dependency trace appends to the sources of `target`
@@ -195,19 +213,89 @@ pub(crate) fn compute(
             graph.traced_sources.insert(id, traced);
         }
         let dir = model.dir(target.dir);
-        let mut names = IndexMap::new();
+        let mut names = IndexMap::<BString, BString>::new();
+        let mut generated = IndexSet::<BString>::new();
+        let record_name = |name: BString,
+                           names: &mut IndexMap<BString, BString>,
+                           generated: &mut IndexSet<BString>| {
+            let resolved_path = if let Some(existing) = names.get(&name) {
+                Some(existing.clone())
+            } else if let Some(path) = paths.find(dir, &name) {
+                names.insert(name.clone(), path.clone());
+                Some(path)
+            } else {
+                None
+            };
+            let check_path = resolved_path.unwrap_or_else(|| {
+                rcmake_base::path_lex::Lexical::new(&crate::sources::absolute_path(
+                    &dir.source_dir,
+                    &name,
+                ))
+                .normalize()
+            });
+            if paths.is_generated(dir, &check_path) {
+                generated.insert(check_path);
+            }
+        };
         for entry in &target.sources {
             for name in list::split(&entry.value, list::Empty::Drop) {
-                if rcmake_genex::find_genex(&name).is_none()
-                    && !names.contains_key(&name)
-                    && let Some(path) = paths.find(dir, &name)
-                {
-                    names.insert(name, path);
+                if rcmake_genex::find_genex(&name).is_none() {
+                    record_name(name, &mut names, &mut generated);
+                }
+            }
+        }
+        if !matches!(
+            target.kind,
+            TargetKind::InterfaceLibrary | TargetKind::GlobalTarget
+        ) {
+            for config in configs {
+                let ctx = EvalContext {
+                    config: config.clone(),
+                    head: Some(handle(id)),
+                    traversal: UsageTraversal::Compile,
+                    ..EvalContext::default()
+                };
+                if let Ok(collected) = usage.collect_property(id, b"SOURCES", &ctx) {
+                    for entry in collected.entries {
+                        if paths.object_owner(&entry.value).is_none() {
+                            record_name(entry.value, &mut names, &mut generated);
+                        }
+                    }
+                }
+                if let Some(resolved_target) = resolved.get(&(id, config)) {
+                    for unit in &resolved_target.compile_units {
+                        let abs = rcmake_base::path_lex::Lexical::new(
+                            &crate::sources::absolute_path(&dir.source_dir, &unit.source.value),
+                        )
+                        .normalize();
+                        if paths.is_generated(dir, &abs) {
+                            generated.insert(abs);
+                        }
+                    }
+                }
+                for &set_id in &target.file_sets {
+                    if let Some(set) = model.file_set(set_id)
+                        && let Ok(files) =
+                            usage.file_set_paths(set.target, b"SOURCES", &set.files, &ctx)
+                    {
+                        for file in files {
+                            let abs = rcmake_base::path_lex::Lexical::new(
+                                &crate::sources::absolute_path(&dir.source_dir, &file.value),
+                            )
+                            .normalize();
+                            if paths.is_generated(dir, &abs) {
+                                generated.insert(abs);
+                            }
+                        }
+                    }
                 }
             }
         }
         if !names.is_empty() {
             graph.source_paths.insert(id, names);
+        }
+        if !generated.is_empty() {
+            graph.generated_sources.insert(id, generated);
         }
     }
     let mut collector = Collector {
@@ -216,6 +304,7 @@ pub(crate) fn compute(
         paths,
         initial: vec![Vec::new(); graph.nodes.len()],
         object_utilities: IndexMap::new(),
+        emitted: Emitted::new(graph.nodes.len()),
     };
     for (node, &id) in graph.nodes.iter().enumerate() {
         collector.collect_target(node, id, &link_items, usage)?;
@@ -238,17 +327,27 @@ pub(crate) fn compute(
     }
     // The initial graph is the union of all configurations, so a cycle can
     // exist here even when no single configuration has one.
-    check_components(
-        model,
-        &graph.nodes,
-        &initial,
-        &Components::compute(&initial),
-    )?;
-    let intermediate = intermediate_graph(model, &graph, targets, graphs, &initial);
-    let components = Components::compute(&intermediate);
-    check_components(model, &graph.nodes, &initial, &components)?;
-    graph.direct = final_graph(&initial, &components)
-        .map_err(|component| {
+    let initial_components = Components::compute(&initial);
+    check_components(model, &graph.nodes, &initial, &initial_components)?;
+    let (components, optimized) =
+        if let Some(intermediate) = intermediate_graph(model, &graph, targets, graphs, &initial) {
+            let components = Components::compute(&intermediate);
+            check_components(model, &graph.nodes, &initial, &components)?;
+            (components, Some(intermediate))
+        } else {
+            (initial_components, None)
+        };
+    let final_edges = if components.all_singletons {
+        if let Some(mut intermediate) = optimized {
+            for (node, edges) in intermediate.iter_mut().enumerate() {
+                edges.retain(|edge| edge.to != node);
+            }
+            intermediate
+        } else {
+            initial
+        }
+    } else {
+        final_graph(&initial, &components).map_err(|component| {
             cycle_error(
                 model,
                 &graph.nodes,
@@ -258,23 +357,40 @@ pub(crate) fn compute(
                 "The component contains at least one cycle consisting of strong dependencies (created by add_dependencies) that cannot be broken.",
             )
         })?
+    };
+    let mut pos = vec![usize::MAX; graph.nodes.len()];
+    let mut touched = Vec::new();
+    graph.direct = final_edges
         .into_iter()
         .map(|edges| {
-            let mut direct = IndexMap::<usize, Edge>::new();
+            let mut out: Vec<TargetDepend> = Vec::with_capacity(edges.len());
+            touched.clear();
             for edge in edges {
-                direct.insert(edge.to, edge);
+                let Some(&target) = graph.nodes.get(edge.to) else {
+                    continue;
+                };
+                let depend = TargetDepend {
+                    target,
+                    strong: edge.strong,
+                    cross: edge.cross,
+                    backtrace: edge.backtrace,
+                };
+                if let Some(slot) = pos.get_mut(edge.to) {
+                    if *slot == usize::MAX {
+                        *slot = out.len();
+                        touched.push(edge.to);
+                        out.push(depend);
+                    } else if let Some(existing) = out.get_mut(*slot) {
+                        *existing = depend;
+                    }
+                }
             }
-            direct
-                .into_values()
-                .filter_map(|edge| {
-                    Some(TargetDepend {
-                        target: *graph.nodes.get(edge.to)?,
-                        strong: edge.strong,
-                        cross: edge.cross,
-                        backtrace: edge.backtrace,
-                    })
-                })
-                .collect()
+            for &idx in &touched {
+                if let Some(slot) = pos.get_mut(idx) {
+                    *slot = usize::MAX;
+                }
+            }
+            out
         })
         .collect();
     Ok(graph)
@@ -523,9 +639,56 @@ struct Collector<'a> {
     initial: Graph,
     /// Object libraries that `AddObjectDepends` adds as utilities of the depender.
     object_utilities: IndexMap<TargetId, Vec<TargetId>>,
+    emitted: Emitted,
 }
 
-type Emitted = IndexSet<(TargetId, bool)>;
+/// Epoch-stamped dense visited set for build-system nodes with a sparse fallback
+/// for targets outside the build system (such as imported targets).
+struct Emitted {
+    normal_marks: Vec<u32>,
+    cross_marks: Vec<u32>,
+    epoch: u32,
+    extra: IndexSet<(TargetId, bool)>,
+}
+
+impl Emitted {
+    fn new(nodes: usize) -> Self {
+        Self {
+            normal_marks: vec![0; nodes],
+            cross_marks: vec![0; nodes],
+            epoch: 0,
+            extra: IndexSet::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.normal_marks.fill(0);
+            self.cross_marks.fill(0);
+            self.epoch = 1;
+        }
+        self.extra.clear();
+    }
+
+    fn insert(&mut self, graph: &TargetDependGraph, id: TargetId, cross: bool) -> bool {
+        if let Some(&node) = graph.index.get(&id) {
+            let marks = if cross {
+                &mut self.cross_marks
+            } else {
+                &mut self.normal_marks
+            };
+            if let Some(slot) = marks.get_mut(node) {
+                if *slot == self.epoch {
+                    return false;
+                }
+                *slot = self.epoch;
+                return true;
+            }
+        }
+        self.extra.insert((id, cross))
+    }
+}
 
 impl Collector<'_> {
     fn in_build_system(&self, id: TargetId) -> bool {
@@ -567,28 +730,28 @@ impl Collector<'_> {
         if !self.in_build_system(id) {
             return Ok(());
         }
-        let mut emitted = Emitted::new();
-        emitted.insert((id, false));
-        emitted.insert((id, true));
+        self.emitted.reset();
+        self.emitted.insert(self.graph, id, false);
+        self.emitted.insert(self.graph, id, true);
         for links in link_items.implementation.get(&id).into_iter().flatten() {
             for (dependency, backtrace) in &links.link {
                 let dependency = (*dependency, backtrace);
-                self.add_link_depend(node, id, dependency, &links.config, &mut emitted, usage)?;
+                self.add_link_depend(node, id, dependency, &links.config, usage)?;
             }
             for &owner in &links.objects {
-                self.add_object_depends(id, owner, &mut emitted);
+                self.add_object_depends(id, owner);
             }
             for (dependency, backtrace) in &links.compile {
                 let dependency = (*dependency, backtrace);
-                self.add_link_depend(node, id, dependency, &links.config, &mut emitted, usage)?;
+                self.add_link_depend(node, id, dependency, &links.config, usage)?;
             }
             for &owner in link_items.external_objects.get(&id).into_iter().flatten() {
-                self.add_object_depends(id, owner, &mut emitted);
+                self.add_object_depends(id, owner);
             }
         }
-        let mut emitted = Emitted::new();
-        emitted.insert((id, false));
-        emitted.insert((id, true));
+        self.emitted.reset();
+        self.emitted.insert(self.graph, id, false);
+        self.emitted.insert(self.graph, id, true);
         let objects = self.object_utilities.get(&id).cloned().unwrap_or_default();
         let extra = objects.into_iter().map(|target| UtilityItem {
             target,
@@ -603,15 +766,8 @@ impl Collector<'_> {
             .chain(extra)
             .collect();
         for item in &items {
-            if emitted.insert((item.target, item.cross)) {
-                self.add_target_depend(
-                    node,
-                    item.target,
-                    &item.backtrace,
-                    false,
-                    item.cross,
-                    &mut emitted,
-                );
+            if self.emitted.insert(self.graph, item.target, item.cross) {
+                self.add_target_depend(node, item.target, &item.backtrace, false, item.cross);
             }
         }
         Ok(())
@@ -623,22 +779,19 @@ impl Collector<'_> {
         depender: TargetId,
         (dependency, backtrace): (TargetId, &Backtrace),
         config: &ConfigId,
-        emitted: &mut Emitted,
         usage: &mut UsageResolver<'_>,
     ) -> Result<(), ResolveError> {
-        if emitted.insert((dependency, false)) {
-            self.add_target_depend(node, dependency, backtrace, true, false, emitted);
-            self.add_interface_depends(
-                node, depender, dependency, backtrace, config, emitted, usage,
-            )?;
+        if self.emitted.insert(self.graph, dependency, false) {
+            self.add_target_depend(node, dependency, backtrace, true, false);
+            self.add_interface_depends(node, depender, dependency, backtrace, config, usage)?;
         }
         Ok(())
     }
 
     /// `AddObjectDepends`: an object library that is not already a link item
     /// becomes a utility of the depender.
-    fn add_object_depends(&mut self, depender: TargetId, owner: TargetId, emitted: &mut Emitted) {
-        if self.links_objects(depender) && emitted.insert((owner, false)) {
+    fn add_object_depends(&mut self, depender: TargetId, owner: TargetId) {
+        if self.links_objects(depender) && self.emitted.insert(self.graph, owner, false) {
             self.object_utilities
                 .entry(depender)
                 .or_default()
@@ -646,10 +799,6 @@ impl Collector<'_> {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The walk carries the depender, the dependee, and its link context."
-    )]
     fn add_interface_depends(
         &mut self,
         node: usize,
@@ -657,7 +806,6 @@ impl Collector<'_> {
         dependee: TargetId,
         backtrace: &Backtrace,
         config: &ConfigId,
-        emitted: &mut Emitted,
         usage: &mut UsageResolver<'_>,
     ) -> Result<(), ResolveError> {
         let ctx = EvalContext {
@@ -681,15 +829,15 @@ impl Collector<'_> {
             // (`cmLinkInterface::Objects`); a linked object library is a library.
             if item.kind == ResolvedLinkKind::ObjectFile {
                 if let Some(owner) = object_owner(&item, self.paths) {
-                    self.add_object_depends(depender, owner, emitted);
+                    self.add_object_depends(depender, owner);
                 }
                 continue;
             }
             for dependency in item.targets() {
-                if !emitted.insert((dependency, false)) {
+                if !self.emitted.insert(self.graph, dependency, false) {
                     continue;
                 }
-                self.add_target_depend(node, dependency, backtrace, true, false, emitted);
+                self.add_target_depend(node, dependency, backtrace, true, false);
                 if !self.executable_without_exports(dependency)
                     && self.model.target(dependency).is_some()
                 {
@@ -707,7 +855,6 @@ impl Collector<'_> {
         backtrace: &Backtrace,
         linking: bool,
         cross: bool,
-        emitted: &mut Emitted,
     ) {
         if linking && self.executable_without_exports(dependee) {
             return;
@@ -716,7 +863,7 @@ impl Collector<'_> {
             // Follow the utilities of a target that is not in the build system.
             let mut pending: Vec<_> = self.graph.utility_items(dependee).iter().rev().collect();
             while let Some(item) = pending.pop() {
-                if !emitted.insert((item.target, item.cross)) {
+                if !self.emitted.insert(self.graph, item.target, item.cross) {
                     continue;
                 }
                 if self.in_build_system(item.target) {
@@ -759,7 +906,7 @@ fn intermediate_graph(
     targets: &[ResolvedTarget],
     graphs: &[BuildGraph],
     initial: &Graph,
-) -> Graph {
+) -> Option<Graph> {
     let optimized: Vec<bool> = graph
         .nodes
         .iter()
@@ -776,7 +923,7 @@ fn intermediate_graph(
         })
         .collect();
     if !optimized.contains(&true) {
-        return initial.clone();
+        return None;
     }
     let languages: Vec<IndexSet<BString>> = graph
         .nodes
@@ -795,42 +942,44 @@ fn intermediate_graph(
         })
         .collect();
     let side_effects = SideEffects::collect(model, graph, graphs, initial, &languages);
-    initial
-        .iter()
-        .enumerate()
-        .map(|(node, edges)| {
-            if !optimized.get(node).copied().unwrap_or(false) {
-                return edges.clone();
-            }
-            let mut output = Vec::new();
-            let mut emitted = IndexSet::new();
-            for edge in edges {
-                if edge.strong {
-                    output.push(edge.clone());
-                    continue;
+    Some(
+        initial
+            .iter()
+            .enumerate()
+            .map(|(node, edges)| {
+                if !optimized.get(node).copied().unwrap_or(false) {
+                    return edges.clone();
                 }
-                let Some(effects) = side_effects.get(edge.to) else {
-                    continue;
-                };
-                let language_effects = languages
-                    .get(node)
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|language| effects.languages.get(language).into_iter().flatten());
-                for &dependency in effects.custom.iter().chain(language_effects) {
-                    if emitted.insert(dependency) {
-                        output.push(Edge {
-                            to: dependency,
-                            strong: false,
-                            cross: edge.cross,
-                            backtrace: edge.backtrace.clone(),
-                        });
+                let mut output = Vec::new();
+                let mut emitted = IndexSet::new();
+                for edge in edges {
+                    if edge.strong {
+                        output.push(edge.clone());
+                        continue;
+                    }
+                    let Some(effects) = side_effects.get(edge.to) else {
+                        continue;
+                    };
+                    let language_effects = languages
+                        .get(node)
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|language| effects.languages.get(language).into_iter().flatten());
+                    for &dependency in effects.custom.iter().chain(language_effects) {
+                        if emitted.insert(dependency) {
+                            output.push(Edge {
+                                to: dependency,
+                                strong: false,
+                                cross: edge.cross,
+                                backtrace: edge.backtrace.clone(),
+                            });
+                        }
                     }
                 }
-            }
-            output
-        })
-        .collect()
+                output
+            })
+            .collect(),
+    )
 }
 
 #[derive(Clone, Default)]
@@ -943,8 +1092,10 @@ struct Components {
     members: Vec<Vec<usize>>,
     /// Component of each node.
     map: Vec<usize>,
-    /// Inter-component edges with multiplicity.
+    /// Inter-component edges with multiplicity (empty when `all_singletons` is true).
     edges: Vec<Vec<Edge>>,
+    /// True when every strongly connected component has exactly one node (DAG).
+    all_singletons: bool,
 }
 
 impl Components {
@@ -1027,15 +1178,18 @@ impl Components {
                 }
             }
         }
+        let all_singletons = members.len() == n && members.iter().all(|list| list.len() == 1);
         let mut edges = vec![Vec::new(); members.len()];
-        for (i, list) in graph.iter().enumerate() {
-            let from = component.get(i).copied().unwrap_or(UNSET);
-            for edge in list {
-                let to = component.get(edge.to).copied().unwrap_or(UNSET);
-                if from != to
-                    && let Some(out) = edges.get_mut(from)
-                {
-                    out.push(Edge { to, ..edge.clone() });
+        if !all_singletons {
+            for (i, list) in graph.iter().enumerate() {
+                let from = component.get(i).copied().unwrap_or(UNSET);
+                for edge in list {
+                    let to = component.get(edge.to).copied().unwrap_or(UNSET);
+                    if from != to
+                        && let Some(out) = edges.get_mut(from)
+                    {
+                        out.push(Edge { to, ..edge.clone() });
+                    }
                 }
             }
         }
@@ -1043,6 +1197,7 @@ impl Components {
             members,
             map: component,
             edges,
+            all_singletons,
         }
     }
 }
@@ -1327,5 +1482,140 @@ mod tests {
         ];
         let components = Components::compute(&initial);
         assert_eq!(final_graph(&initial, &components).err(), Some(0));
+    }
+
+    fn make_target(
+        model: &mut ProjectModel,
+        name: &str,
+        kind: TargetKind,
+    ) -> Result<TargetId, Box<dyn std::error::Error>> {
+        Ok(model.add_target(Target::new(
+            name.into(),
+            kind,
+            rcmake_model::TargetOrigin::Normal,
+            rcmake_model::DirId::ROOT,
+            Backtrace::default(),
+            rcmake_diag::PolicyMap::default(),
+        ))?)
+    }
+
+    fn link_target(model: &mut ProjectModel, id: TargetId, dep: &str) {
+        let Some(dir) = model.target(id).map(|target| target.dir) else {
+            return;
+        };
+        if let Some(target) = model.target_mut(id) {
+            target
+                .usage
+                .link_libraries
+                .get_or_insert_default()
+                .push(rcmake_model::LinkItem {
+                    opens_lookup_scope: false,
+                    closes_lookup_scope: false,
+                    scope: None,
+                    text: rcmake_model::BT::new(dep.into(), Backtrace::default()),
+                    lookup_dir: dir,
+                });
+        }
+    }
+
+    fn add_utility_command(model: &mut ProjectModel, owner: TargetId) {
+        assert!(
+            model
+                .add_command(rcmake_model::CustomCommand::new(
+                    rcmake_model::DirId::ROOT,
+                    CustomCommandKind::Utility(owner),
+                    Backtrace::default(),
+                    rcmake_diag::PolicyMap::default(),
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn optimize_dependencies_preserves_strong_and_side_effect_edges_on_acyclic_graph()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/build".into());
+        let codegen = make_target(&mut model, "codegen", TargetKind::Utility)?;
+        let plain = make_target(&mut model, "plain", TargetKind::StaticLibrary)?;
+        let gen_lib = make_target(&mut model, "gen_lib", TargetKind::StaticLibrary)?;
+        add_utility_command(&mut model, gen_lib);
+        let a = make_target(&mut model, "a", TargetKind::StaticLibrary)?;
+        if let Some(target) = model.target_mut(a) {
+            target
+                .props
+                .set("OPTIMIZE_DEPENDENCIES".into(), "ON".into());
+            target.utility_deps.push(rcmake_model::BT::new(
+                "codegen".into(),
+                Backtrace::default(),
+            ));
+        }
+        link_target(&mut model, a, "plain");
+        link_target(&mut model, a, "gen_lib");
+
+        let host = rcmake_host::PureHost::default();
+        let configs = vec![ConfigId::default()];
+        let paths = SourcePaths::new(&host);
+        let mut usage = UsageResolver::new(&model);
+        let depends = compute(&model, &configs, (&[], &[]), &paths, &mut usage)?;
+        let a_deps: Vec<(TargetId, bool)> = depends
+            .direct_depends(a)
+            .iter()
+            .map(|dep| (dep.target, dep.strong))
+            .collect();
+        assert!(
+            a_deps.contains(&(codegen, true)),
+            "strong add_dependencies edge a -> codegen must be preserved: {a_deps:?}"
+        );
+        assert!(
+            a_deps.contains(&(gen_lib, false)),
+            "side-effect link edge a -> gen_lib must be preserved: {a_deps:?}"
+        );
+        assert!(
+            !a_deps.iter().any(|(target, _)| *target == plain),
+            "side-effect-free static lib edge a -> plain should be optimized away: {a_deps:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn optimize_dependencies_drops_self_loops_on_singleton_components()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/build".into());
+        let a = make_target(&mut model, "a", TargetKind::StaticLibrary)?;
+        let b = make_target(&mut model, "b", TargetKind::StaticLibrary)?;
+        add_utility_command(&mut model, a);
+        for id in [a, b] {
+            if let Some(target) = model.target_mut(id) {
+                target
+                    .props
+                    .set("OPTIMIZE_DEPENDENCIES".into(), "ON".into());
+            }
+        }
+        link_target(&mut model, a, "b");
+        link_target(&mut model, b, "a");
+
+        let host = rcmake_host::PureHost::default();
+        let configs = vec![ConfigId::default()];
+        let paths = SourcePaths::new(&host);
+        let mut usage = UsageResolver::new(&model);
+        let depends = compute(&model, &configs, (&[], &[]), &paths, &mut usage)?;
+        let a_deps: Vec<TargetId> = depends
+            .direct_depends(a)
+            .iter()
+            .map(|dep| dep.target)
+            .collect();
+        let b_deps: Vec<TargetId> = depends
+            .direct_depends(b)
+            .iter()
+            .map(|dep| dep.target)
+            .collect();
+        assert!(
+            !a_deps.contains(&a),
+            "singleton optimized component must not retain self-loop a -> a: {a_deps:?}"
+        );
+        assert_eq!(b_deps, vec![a]);
+        Ok(())
     }
 }

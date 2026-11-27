@@ -113,14 +113,31 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     } else {
         persona::persona_from_argv0(name)
     };
+    run_with_persona(argv, tool, persona, false, host)
+}
+
+/// Run the Rcmake CLI in compatibility persona for an explicit [`Tool`], preserving the
+/// caller's `argv[0]` for `CMAKE_ARGV0` and `RCMAKE_EXEC_LOG` (used by `rcmake-shim`).
+#[must_use]
+pub fn run_compat(tool: Tool, argv: &[BString], host: Arc<dyn Host>) -> i32 {
+    run_with_persona(argv, tool, persona::Persona::Compat, true, host)
+}
+
+fn run_with_persona(
+    argv: &[BString],
+    tool: Tool,
+    persona: persona::Persona,
+    shim_handoff: bool,
+    host: Arc<dyn Host>,
+) -> i32 {
     let Some(log) = host
         .env_get(b"RCMAKE_EXEC_LOG")
         .filter(|value| !value.is_empty())
     else {
-        return run_tool(argv, tool, persona, host);
+        return run_tool(argv, tool, persona, shim_handoff, host);
     };
     let start = host.monotonic();
-    let code = run_tool(argv, tool, persona, Arc::clone(&host));
+    let code = run_tool(argv, tool, persona, shim_handoff, Arc::clone(&host));
     exec_log::append_exec_log(
         host.as_ref(),
         &log,
@@ -138,11 +155,17 @@ pub fn run(argv: &[BString], host: Arc<dyn Host>) -> i32 {
     code
 }
 
-fn run_tool(argv: &[BString], tool: Tool, persona: persona::Persona, host: Arc<dyn Host>) -> i32 {
+fn run_tool(
+    argv: &[BString],
+    tool: Tool,
+    persona: persona::Persona,
+    shim_handoff: bool,
+    host: Arc<dyn Host>,
+) -> i32 {
     let rest = argv.get(1..).unwrap_or(&[]);
     if tool == Tool::Cmake {
         // `cmake` reads `--version` anywhere before `--`, through `help::run`.
-        return run_cmake(argv, rest, persona, host);
+        return run_cmake(argv, rest, persona, shim_handoff, host);
     }
     if tool == Tool::Ccmake {
         return ccmake::run(argv, persona, host);
@@ -278,6 +301,7 @@ fn run_cmake(
     argv: &[BString],
     rest: &[BString],
     persona: persona::Persona,
+    shim_handoff: bool,
     host: Arc<dyn Host>,
 ) -> i32 {
     if persona == persona::Persona::Native
@@ -301,7 +325,7 @@ fn run_cmake(
                 let mut sub_argv = Vec::with_capacity(args.len() + 1);
                 sub_argv.push(sibling_tool_argv0(argv.first(), tool_name, host.as_ref()));
                 sub_argv.extend_from_slice(args);
-                return run_tool(&sub_argv, tool, persona, host);
+                return run_tool(&sub_argv, tool, persona, false, host);
             }
             _ => {}
         }
@@ -333,7 +357,11 @@ fn run_cmake(
         let cwd = host.initial_cwd();
         let exe = host
             .current_exe()
-            .map(|p| rcmake_host::path::from_native(&p))
+            .map(|p| {
+                let resolved =
+                    resolve_cmake_command(host.as_ref(), persona, p, argv.first(), shim_handoff);
+                rcmake_host::path::from_native(&resolved)
+            })
             .unwrap_or_else(|_| BString::from("cmake"));
         let ctx = rcmake_tool_e::ToolCtx {
             host: host.as_ref(),
@@ -348,7 +376,7 @@ fn run_cmake(
         return build::run(argv, args, persona, host.as_ref());
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--install")]) {
-        return install::run(argv, args, persona, host);
+        return install::run(argv, args, persona, shim_handoff, host);
     }
     if let Some(args) = rest.strip_prefix(&[BString::from("--open")]) {
         return open::run(args, persona, host.as_ref());
@@ -369,6 +397,7 @@ fn run_cmake(
         ParseResult::Run(opts) => *opts,
         ParseResult::Exit(code) => return code,
     };
+    opts.shim_handoff = shim_handoff;
     if opts.find_package && opts.script.is_none() {
         return find_package::run(argv, opts, host);
     }
@@ -534,6 +563,63 @@ fn new_interp(argv: &[BString], opts: &Options, mode: RunMode, host: Arc<dyn Hos
     )
 }
 
+/// Resolve the public `CMAKE_COMMAND` path for an interpreter session.
+///
+/// Native persona preserves `rcmake` so build-time regeneration (`RERUN_CMAKE` /
+/// `--regenerate-during-build`) stays in Native persona instead of dropping into Compat.
+/// Compat persona selects a sibling `cmake` / `cmake.exe` only when invoked through a
+/// compat tool name (`cmake`/`ctest`/`cpack`/`ccmake`) or a recognized `rcmake-shim`
+/// launcher handoff (`shim_handoff == true`): POSIX symlinks/hardlinks must canonicalize
+/// to `cmake_command`, while a distinct regular-file sibling is accepted only under
+/// `shim_handoff == true`. Invoking `rcmake` directly under `RCMAKE_ORACLE_MODE=1` keeps
+/// `CMAKE_COMMAND` pointing to `rcmake`.
+pub(crate) fn resolve_cmake_command(
+    host: &dyn Host,
+    persona: persona::Persona,
+    cmake_command: PathBuf,
+    argv0: Option<&BString>,
+    shim_handoff: bool,
+) -> PathBuf {
+    if persona == persona::Persona::Native {
+        return cmake_command;
+    }
+    let invoked_compat_tool = argv0.is_some_and(|raw| {
+        let native = rcmake_host::path::to_native(raw);
+        native.file_stem().is_some_and(|stem| {
+            stem.eq_ignore_ascii_case("cmake")
+                || stem.eq_ignore_ascii_case("ctest")
+                || stem.eq_ignore_ascii_case("cpack")
+                || stem.eq_ignore_ascii_case("ccmake")
+        })
+    });
+    if !shim_handoff && !invoked_compat_tool {
+        return cmake_command;
+    }
+    let name = if host.system().sysname.eq_ignore_ascii_case(b"Windows") {
+        "cmake.exe"
+    } else {
+        "cmake"
+    };
+    let alias = cmake_command.with_file_name(name);
+    if alias == cmake_command {
+        return cmake_command;
+    }
+    if host
+        .canonicalize(&alias)
+        .is_ok_and(|path| path == cmake_command)
+    {
+        return alias;
+    }
+    if shim_handoff
+        && host
+            .metadata(&alias, Follow::No)
+            .is_ok_and(|meta| meta.kind == FileKind::File)
+    {
+        return alias;
+    }
+    cmake_command
+}
+
 fn new_interp_with_paths(
     opts: &Options,
     mode: RunMode,
@@ -543,24 +629,13 @@ fn new_interp_with_paths(
     argv: &[BString],
     services: rcmake_eval::Services,
 ) -> Interp {
-    let name = if host.system().sysname == b"Windows" {
-        "cmake.exe"
-    } else {
-        "cmake"
-    };
-    let alias = cmake_command.with_file_name(name);
-    // Preserve `rcmake` in Native persona so build-time regeneration (`RERUN_CMAKE` /
-    // `--regenerate-during-build`) stays in Native persona instead of dropping into Compat.
-    let cmake_command = if opts.persona != persona::Persona::Native
-        && alias != cmake_command
-        && host
-            .canonicalize(&alias)
-            .is_ok_and(|path| path == cmake_command)
-    {
-        alias
-    } else {
-        cmake_command
-    };
+    let cmake_command = resolve_cmake_command(
+        host.as_ref(),
+        opts.persona,
+        cmake_command,
+        argv.first(),
+        opts.shim_handoff,
+    );
     let cfg = InterpConfig {
         services: services.into(),
         cwd: host.initial_cwd(),
@@ -861,7 +936,7 @@ mod tests {
         );
         assert_eq!(code, 0);
         let out = host.stream_bytes(Stream::Stdout);
-        assert_eq!(out, b"cmake version 4.5.1\nrcmake 0.2.0\n");
+        assert_eq!(out, b"cmake version 4.5.1\nrcmake 0.2.1\n");
     }
 
     #[test]

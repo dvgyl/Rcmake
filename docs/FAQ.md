@@ -19,7 +19,7 @@ Direct answers on CMake 4.5.1 parity, native developer tooling, caching, install
 
 ## Is rcmake a drop-in replacement for CMake 4.5.1 in Rust?
 
-Yes. `rcmake` is an independent reimplementation of CMake 4.5.1 in safe Rust with no copied or translated CMake C++ code, and the core engine never calls an upstream `cmake` binary at runtime. One multi-call binary provides `cmake`, `ccmake` on Unix, `ctest`, `cpack`, and `rcmake-lsp`, selecting its tool from `argv[0]`, while the isolated sibling binary `rcmake-verify` runs explicit side-by-side comparisons when you invoke `rcmake verify`.
+Yes. `rcmake` is an independent reimplementation of CMake 4.5.1 in safe Rust with no copied or translated CMake C++ code, and the core engine never calls an upstream `cmake` binary at runtime. On Unix, one multi-call binary provides `cmake`, `ccmake`, `ctest`, `cpack`, and `rcmake-lsp` through symbolic links that select the tool from `argv[0]`, while Windows packages ship one `rcmake.exe` engine beside tiny safe-Rust launcher shims for `cmake.exe`, `ctest.exe`, `cpack.exe`, and `rcmake-lsp.exe`. The isolated sibling binary `rcmake-verify` runs explicit side-by-side comparisons when you invoke `rcmake verify`.
 
 `rcmake` reads existing `CMakeLists.txt` files, Presets v13 (`CMakePresets.json` and `CMakeUserPresets.json`), and `CMakeCache.txt`, then writes compatible build trees. `rcmake` is not affiliated with Kitware, and CMake is a trademark of Kitware, Inc.
 

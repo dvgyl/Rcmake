@@ -8,8 +8,8 @@ use rcmake_genex::{EvalContext, evaluate, parse};
 use rcmake_host::{Follow, Host, path::to_native};
 use rcmake_model::{DirId, InstallKind, InstallRule, ProjectModel, TargetKind};
 use rcmake_resolve::{
-    GenerationResult, InstallAction, InstallActionKind, lower::lower_install_manifest,
-    usage::UsageResolver,
+    GenerationResult, InstallAction, InstallActionKind, InstallEntry, InstallManifest,
+    lower::lower_install_manifest, usage::UsageResolver,
 };
 
 use crate::generation_error;
@@ -119,6 +119,25 @@ fn install_component(component: &[u8]) -> bool {
         })
 }
 
+fn action_directories(manifest: &InstallManifest) -> Vec<Option<DirId>> {
+    let mut dirs = vec![None; manifest.actions.len()];
+    for (&dir, entries) in &manifest.directories {
+        for entry in entries {
+            if let InstallEntry::Actions(range) = entry {
+                for slot in dirs.get_mut(range.clone()).into_iter().flatten() {
+                    *slot = Some(dir);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+fn is_empty_install_action(action: &InstallAction) -> bool {
+    matches!(&action.kind, InstallActionKind::Files { files, .. } if files.is_empty())
+        || matches!(&action.kind, InstallActionKind::Directory { dirs, .. } if dirs.is_empty())
+}
+
 fn collect_install(
     graph: &Graph<'_>,
     result: &GenerationResult,
@@ -128,13 +147,20 @@ fn collect_install(
     if result.install.actions.is_empty() && model.is_none_or(|model| model.installs.is_empty()) {
         return;
     }
-    if let Some(model) = model {
-        for component in model.install_components() {
-            add_component(graph, targets, &component);
+    let dirs = action_directories(&result.install);
+    for (index, action) in result.install.actions.iter().enumerate() {
+        if is_empty_install_action(action) {
+            continue;
         }
-    }
-    for action in &result.install.actions {
-        if let Some(deps) = add_component(graph, targets, &action.component) {
+        let excluded_dir = model.is_some_and(|model| {
+            dirs.get(index)
+                .copied()
+                .flatten()
+                .is_some_and(|dir| model.dir_excluded_from_all(dir))
+        });
+        if let Some(deps) = add_component(graph, targets, &action.component)
+            && !excluded_dir
+        {
             deps.extend(install_dependencies(graph, action));
         }
     }
@@ -159,12 +185,27 @@ fn collect_install(
             lower_install_manifest(&model, &result.targets)
         });
     let manifest = filtered.as_ref().unwrap_or(&result.install);
-    // An artifact group can be excluded from the default installation.
+    let manifest_dirs = if filtered.is_some() {
+        action_directories(manifest)
+    } else {
+        dirs
+    };
+    // An artifact group or directory can be excluded from the default installation.
     let inputs = manifest
         .actions
         .iter()
-        .filter(|action| !action.exclude_from_all)
-        .flat_map(|action| install_dependencies(graph, action))
+        .enumerate()
+        .filter(|(index, action)| {
+            !action.exclude_from_all
+                && !model.is_some_and(|model| {
+                    manifest_dirs
+                        .get(*index)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|dir| model.dir_excluded_from_all(dir))
+                })
+        })
+        .flat_map(|(_, action)| install_dependencies(graph, action))
         .collect();
     targets.insert(all, inputs);
 }
@@ -180,7 +221,6 @@ fn collect_install_inputs(
         ..EvalContext::default()
     };
     let mut usage = UsageResolver::new(model);
-    let components = model.install_components();
     let all = BString::from("install_prep/all");
     for rule in &model.installs {
         let options = &rule.options;
@@ -222,8 +262,8 @@ fn collect_install_inputs(
             })
             .map_or(b"Unspecified".as_slice(), |value| value.as_slice());
         if options.all_components {
-            for component in &components {
-                if let Some(inputs) = add_component(graph, targets, component) {
+            for (target_name, inputs) in targets.iter_mut() {
+                if target_name.starts_with(b"install_prep/") && target_name != &all {
                     inputs.extend(deps.iter().cloned());
                 }
             }
@@ -526,15 +566,13 @@ fn collect_file_set_installs(graph: &Graph<'_>, model: &ProjectModel, targets: &
     let mut usage = UsageResolver::new(model);
     let all = BString::from("install_prep/all");
     for (index, rule) in model.installs.iter().enumerate() {
-        for component in rule_components(model, index) {
-            add_component(graph, targets, &component);
-        }
         let InstallKind::Targets {
             targets: installed, ..
         } = &rule.kind
         else {
             continue;
         };
+        let excluded_dir = model.dir_excluded_from_all(rule.dir);
         for target in installed.iter().filter_map(|id| model.target(*id)) {
             for set in target.file_sets.iter().filter_map(|id| model.file_set(*id)) {
                 let Some(options) =
@@ -542,28 +580,6 @@ fn collect_file_set_installs(graph: &Graph<'_>, model: &ProjectModel, targets: &
                 else {
                     continue;
                 };
-                if !options.configurations.is_empty()
-                    && !options
-                        .configurations
-                        .iter()
-                        .any(|config| graph.input.config.matches(config))
-                {
-                    continue;
-                }
-                let Ok(files) = rcmake_resolve::file_sets::set_files(
-                    model,
-                    &mut usage,
-                    target,
-                    set,
-                    &graph.input.config,
-                ) else {
-                    continue;
-                };
-                let deps: BTreeSet<_> = files
-                    .values()
-                    .flatten()
-                    .filter_map(|(file, _)| graph.file_dependency(file))
-                    .collect();
                 let component = options
                     .component
                     .as_ref()
@@ -573,6 +589,30 @@ fn collect_file_set_installs(graph: &Graph<'_>, model: &ProjectModel, targets: &
                             .filter(|value| !value.is_empty())
                     })
                     .map_or(b"Unspecified".as_slice(), |value| value.as_slice());
+                let config_matches = options.configurations.is_empty()
+                    || options
+                        .configurations
+                        .iter()
+                        .any(|config| graph.input.config.matches(config));
+                if !config_matches || excluded_dir {
+                    add_component(graph, targets, component);
+                    continue;
+                }
+                let Ok(files) = rcmake_resolve::file_sets::set_files(
+                    model,
+                    &mut usage,
+                    target,
+                    set,
+                    &graph.input.config,
+                ) else {
+                    add_component(graph, targets, component);
+                    continue;
+                };
+                let deps: BTreeSet<_> = files
+                    .values()
+                    .flatten()
+                    .filter_map(|(file, _)| graph.file_dependency(file))
+                    .collect();
                 if !options.exclude_from_all && available(graph, &all) {
                     targets
                         .entry(all.clone())

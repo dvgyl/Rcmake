@@ -219,11 +219,13 @@ pub(crate) fn lower_with_inputs_workers(
                         usage.compile_framework_targets(resolved.id, &context)?;
                     crate::resolve_link::framework_dirs(
                         model,
-                        target,
+                        (resolved.id, target),
                         &framework_dependencies,
                         &|id| resolved_targets.get(&id)?.artifacts.file.as_ref(),
                         config,
-                    )
+                        context.link_language.as_ref(),
+                        usage,
+                    )?
                 } else {
                     Vec::new()
                 };
@@ -243,6 +245,7 @@ pub(crate) fn lower_with_inputs_workers(
                     steps: &mut graph.steps,
                     step_offset: 0,
                     compile_launchers: &mut graph.compile_launchers,
+                    compile_db_commands: &mut graph.compile_db_commands,
                     swift_actions: &mut graph.swift_actions,
                     swift_output_file_maps: &mut graph.swift_output_file_maps,
                 },
@@ -256,6 +259,7 @@ pub(crate) fn lower_with_inputs_workers(
                 link_runtime_paths: &mut graph.link_runtime_paths,
                 install_name_dirs: &mut graph.install_name_dirs,
                 link_extra_outputs: &mut graph.link_extra_outputs,
+                link_event_byproducts: &mut graph.link_event_byproducts,
                 swift_output_file_maps: &mut graph.swift_output_file_maps,
                 link_descriptions: &mut graph.link_descriptions,
             };
@@ -391,11 +395,17 @@ pub(crate) fn lower_with_inputs_workers(
                 graph.utility_steps.insert(remap(step));
             }
             graph.compile_launchers.extend(out.compile_launchers);
+            for (step, cmd) in out.compile_db_commands {
+                graph.compile_db_commands.insert(remap(step), cmd);
+            }
             compile_inputs.extend(out.compile_inputs);
             graph.link_depfiles.extend(out.link_depfiles);
             graph.link_runtime_paths.extend(out.link_runtime_paths);
             graph.install_name_dirs.extend(out.install_name_dirs);
             graph.link_extra_outputs.extend(out.link_extra_outputs);
+            graph
+                .link_event_byproducts
+                .extend(out.link_event_byproducts);
             graph
                 .swift_output_file_maps
                 .extend(out.swift_output_file_maps);
@@ -670,6 +680,13 @@ impl<'a> TargetPlan<'a> {
         let (model, resolved) = (self.model, self.resolved);
         let unity_inputs = self.trace_source_commands(commands, unity)?;
         source_commands::record_owners(owners, resolved.id, &self.steps);
+
+        // Ninja orders compiled unity sources via `cmake_object_order_depends_target_<name>`,
+        // which already lists the target's own custom-command outputs without needing a
+        // synthetic `cmake_object_order_depends_unity_*` target or phony unity source edges.
+        if model.generator.is_some_and(GeneratorKind::is_ninja) {
+            return Ok(None);
+        }
 
         let unity_prerequisite =
             if !self.steps.is_empty() && unity.is_some_and(|plan| !plan.files.is_empty()) {
@@ -965,6 +982,7 @@ impl<'a> TargetPlan<'a> {
                 before,
                 after,
                 sink.link_descriptions,
+                sink.link_event_byproducts,
             );
             self.steps.insert(sink.push(link));
             if let Some(symlink) = symlink {
@@ -1028,7 +1046,12 @@ fn separate_library_symlinks(link: &mut BuildStep, after: &mut CustomStep) -> Op
                 _ => None,
             }
         })?;
+    // Keep target-event `BYPRODUCTS` on the main link edge (matching CMake's
+    // `cmNinjaNormalTargetGenerator`), while moving `POST_BUILD` commands to the
+    // symlink edge.
+    let byproducts = std::mem::take(&mut after.byproducts);
     let mut symlink = std::mem::take(after);
+    after.byproducts = byproducts;
     let command = invocations.remove(index);
     let links: IndexSet<_> = command
         .argv
@@ -1132,6 +1155,7 @@ pub(super) struct GraphSink<'a> {
     pub(super) link_runtime_paths: &'a mut IndexMap<BString, crate::LinkRuntimePaths>,
     pub(super) install_name_dirs: &'a mut IndexMap<BString, BString>,
     pub(super) link_extra_outputs: &'a mut IndexMap<BString, Vec<BString>>,
+    pub(super) link_event_byproducts: &'a mut IndexMap<BString, Vec<BString>>,
     pub(super) swift_output_file_maps: &'a mut IndexMap<BString, BString>,
     pub(super) link_descriptions: &'a mut IndexMap<BString, BString>,
 }
@@ -1148,11 +1172,13 @@ struct TargetLowerOutput {
     steps: Vec<BuildStep>,
     utility_steps: IndexSet<usize>,
     compile_launchers: IndexMap<BString, BString>,
+    compile_db_commands: BTreeMap<usize, BString>,
     compile_inputs: BTreeMap<BString, Vec<BString>>,
     link_depfiles: IndexMap<BString, BString>,
     link_runtime_paths: IndexMap<BString, crate::LinkRuntimePaths>,
     install_name_dirs: IndexMap<BString, BString>,
     link_extra_outputs: IndexMap<BString, Vec<BString>>,
+    link_event_byproducts: IndexMap<BString, Vec<BString>>,
     swift_output_file_maps: IndexMap<BString, BString>,
     swift_actions: IndexMap<usize, crate::SwiftAction>,
     link_descriptions: IndexMap<BString, BString>,
@@ -1268,11 +1294,13 @@ fn lower_one_target_parallel(
             let framework_dependencies = usage.compile_framework_targets(resolved.id, &context)?;
             crate::resolve_link::framework_dirs(
                 model,
-                target,
+                (resolved.id, target),
                 &framework_dependencies,
                 &|id| resolved_targets.get(&id)?.artifacts.file.as_ref(),
                 config,
-            )
+                context.link_language.as_ref(),
+                usage,
+            )?
         } else {
             Vec::new()
         };
@@ -1280,6 +1308,7 @@ fn lower_one_target_parallel(
     let pch_details = (!pch.create.is_empty() || !pch.use_flags.is_empty()).then_some(pch);
     let mut steps = Vec::new();
     let mut compile_launchers = IndexMap::new();
+    let mut compile_db_commands = BTreeMap::new();
     let mut compile_inputs = BTreeMap::new();
     let mut swift_actions = IndexMap::new();
     let mut swift_output_file_maps = IndexMap::new();
@@ -1295,6 +1324,7 @@ fn lower_one_target_parallel(
             steps: &mut steps,
             step_offset: rule_count,
             compile_launchers: &mut compile_launchers,
+            compile_db_commands: &mut compile_db_commands,
             swift_actions: &mut swift_actions,
             swift_output_file_maps: &mut swift_output_file_maps,
         },
@@ -1305,6 +1335,7 @@ fn lower_one_target_parallel(
     let mut link_runtime_paths = IndexMap::new();
     let mut install_name_dirs = IndexMap::new();
     let mut link_extra_outputs = IndexMap::new();
+    let mut link_event_byproducts = IndexMap::new();
     let mut link_descriptions = IndexMap::new();
     let mut sink = GraphSink {
         steps: &mut steps,
@@ -1314,6 +1345,7 @@ fn lower_one_target_parallel(
         link_runtime_paths: &mut link_runtime_paths,
         install_name_dirs: &mut install_name_dirs,
         link_extra_outputs: &mut link_extra_outputs,
+        link_event_byproducts: &mut link_event_byproducts,
         swift_output_file_maps: &mut swift_output_file_maps,
         link_descriptions: &mut link_descriptions,
     };
@@ -1352,11 +1384,13 @@ fn lower_one_target_parallel(
         steps,
         utility_steps,
         compile_launchers,
+        compile_db_commands,
         compile_inputs,
         link_depfiles,
         link_runtime_paths,
         install_name_dirs,
         link_extra_outputs,
+        link_event_byproducts,
         swift_output_file_maps,
         swift_actions,
         link_descriptions,

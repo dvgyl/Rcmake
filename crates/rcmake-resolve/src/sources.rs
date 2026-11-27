@@ -136,13 +136,20 @@ pub(crate) fn apply_compile_properties(
             for entry in source_props.tracked_entries(name) {
                 let items =
                     usage.file_set_paths(target, name, std::slice::from_ref(&entry), &ctx)?;
-                if !items.is_empty() {
-                    let start = group.flags.len();
-                    group.flags.extend(items);
+                let start = group.flags.len();
+                if items.is_empty() {
+                    // CMake records an empty `compileCommandFragments` entry with the
+                    // `set_source_files_properties` backtrace even when the value or
+                    // generator expression evaluates to empty, splitting the compile group.
                     group
-                        .source_option_groups
-                        .push((start, group.flags.len() - start));
+                        .flags
+                        .push(BT::new(BString::from("SHELL:"), entry.backtrace));
+                } else {
+                    group.flags.extend(items);
                 }
+                group
+                    .source_option_groups
+                    .push((start, group.flags.len() - start));
             }
             if let Some(member) = member {
                 let owner = member.set.target;

@@ -730,17 +730,20 @@ fn write_common(
             )?;
         }
     }
-    let testing = interp.cx().var_is_on(b"CMAKE_TESTING_ENABLED");
+    let root_testing = interp.cx().var_is_on(b"CMAKE_TESTING_ENABLED");
     {
         let mut cx = interp.cx();
         let model = cx.project();
         for (id, dir) in model.dirs() {
-            if !testing
-                && !dir
+            let testing_enabled = model
+                .definition(id, b"CMAKE_TESTING_ENABLED")
+                .is_some_and(|value| rcmake_base::truth::is_on(value))
+                || (dir.vars.is_empty() && root_testing)
+                || dir
                     .props
                     .get(b"CMAKE_TESTING_ENABLED")
-                    .is_some_and(|value| rcmake_base::truth::is_on(value))
-            {
+                    .is_some_and(|value| rcmake_base::truth::is_on(value));
+            if !testing_enabled {
                 continue;
             }
             let test_file = path::to_native(&dir.binary_dir).join("CTestTestfile.cmake");

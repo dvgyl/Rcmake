@@ -163,10 +163,12 @@ jobs:
             scripts/stage.sh
           else
             source env/env.sh
-            cargo build --locked --bin rcmake --target-dir target
+            cargo build --locked --bin rcmake --bin rcmake-shim --target-dir target
             mkdir -p target/stage/bin target/stage/share
-            for tool in rcmake cmake ctest cpack; do
-              cp target/debug/rcmake.exe "target/stage/bin/$tool.exe"
+            cp target/debug/rcmake.exe target/stage/bin/rcmake.exe
+            cp target/debug/rcmake-shim.exe target/stage/bin/rcmake-shim.exe
+            for tool in cmake ctest cpack; do
+              cp target/debug/rcmake-shim.exe "target/stage/bin/$tool.exe"
             done
             cp -R modules/cmake-4.5 target/stage/share/
           fi
@@ -248,6 +250,7 @@ jobs:
           path: |
             target/stage/bin/rcmake
             target/stage/bin/rcmake.exe
+            target/stage/bin/rcmake-shim.exe
           if-no-files-found: error
           retention-days: 3
 
@@ -303,9 +306,11 @@ jobs:
           suffix = ".exe" if os.name == "nt" else ""
           rcmake = stage / f"rcmake{suffix}"
           rcmake.chmod(0o755)
+          shim = stage / "rcmake-shim.exe"
+          alias_src = shim if (os.name == "nt" and shim.is_file()) else rcmake
           cmake, ctest = (stage / f"{tool}{suffix}" for tool in ("cmake", "ctest"))
           for tool in (cmake, ctest):
-              shutil.copyfile(rcmake, tool)
+              shutil.copyfile(alias_src, tool)
               tool.chmod(0o755)
 
           pins = {pin["name"]: pin for pin in tomllib.loads(MANIFEST.read_text())["project"]}

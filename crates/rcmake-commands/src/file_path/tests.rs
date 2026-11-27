@@ -2110,3 +2110,43 @@ fn raw_archive_create_validates_encoding_and_entries() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn file_generate_input_records_listfile_dependency() -> TestResult {
+    let (host, mut interp) = interpreter();
+    let src = host.initial_cwd().join("src");
+    let build = host.initial_cwd().join("build");
+    host.create_dir_all(&src)?;
+    host.create_dir_all(&build)?;
+    host.seed_file(&src.join("in.pc.in"), b"Name: demo\n")?;
+    let version =
+        rcmake_base::version::Version::parse_strict(b"4.5").ok_or("invalid test version")?;
+    interp.cx().set_cmake_minimum_required(b"4.5", &version)?;
+    host.seed_file(
+        &src.join("CMakeLists.txt"),
+        b"file(GENERATE OUTPUT out.pc INPUT in.pc.in CONDITION 0)\n",
+    )?;
+    let outcome = interp.run_configure(&src, &build, &[]);
+    assert_eq!(
+        outcome.exit_code,
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+    let expected = rcmake_host::path::from_native_cmake(&src.join("in.pc.in"));
+    assert!(
+        interp
+            .cx()
+            .project()
+            .dir(rcmake_model::DirId::ROOT)
+            .listfiles
+            .contains(&expected),
+        "expected {expected} in {:?}",
+        interp
+            .cx()
+            .project()
+            .dir(rcmake_model::DirId::ROOT)
+            .listfiles
+    );
+    Ok(())
+}

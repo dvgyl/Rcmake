@@ -13,7 +13,7 @@ $PREFIX/share/doc/rcmake, and any bundled shell completions and man page
 under $PREFIX/share. The default PREFIX is $HOME/.local.
 
 Sources (select one, the default is the latest GitHub Release):
-  --version <v>      Download GitHub Release <v>, for example v0.2.0 or 0.2.0.
+  --version <v>      Download GitHub Release <v>, for example v0.2.1 or 0.2.1.
   --from-source      Build a release archive from this checkout (needs Cargo).
   --archive <path>   Install a local .tar.gz archive. The script checks
                      <path>.sha256 if that file exists.
@@ -94,7 +94,7 @@ if [[ -n "$version" ]]; then
     exit 2
   fi
   if [[ ! "${version#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$ ]]; then
-    printf 'Invalid version %s. Use a release version such as v0.2.0.\n' "$version" >&2
+    printf 'Invalid version %s. Use a release version such as v0.2.1.\n' "$version" >&2
     exit 2
   fi
   version="${version#v}"

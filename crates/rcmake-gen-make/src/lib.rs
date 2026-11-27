@@ -311,23 +311,26 @@ fn plan_targets<'a>(
                 }
             }
             let mut step = plan_step(action, step_index, result, build_dir, &build_prefix)?;
-            if matches!(action, BuildStep::Link { .. })
-                && let Some(artifacts) = artifacts.get(target.name)
-            {
+            if let BuildStep::Link { step: link, .. } = action {
                 let make_path =
                     |value: &BString| build_path_with_prefix(value, build_dir, &build_prefix);
-                step.outputs.extend(
-                    [&artifacts.linker_file, &artifacts.soname_file]
-                        .into_iter()
-                        .filter_map(Option::as_ref)
-                        .map(make_path),
-                );
-                target.products.extend(
-                    [&artifacts.file, &artifacts.import_file, &artifacts.pdb_file]
-                        .into_iter()
-                        .filter_map(Option::as_ref)
-                        .map(make_path),
-                );
+                if let Some(artifacts) = artifacts.get(target.name) {
+                    step.outputs.extend(
+                        [&artifacts.linker_file, &artifacts.soname_file]
+                            .into_iter()
+                            .filter_map(Option::as_ref)
+                            .map(make_path),
+                    );
+                    target.products.extend(
+                        [&artifacts.file, &artifacts.import_file, &artifacts.pdb_file]
+                            .into_iter()
+                            .filter_map(Option::as_ref)
+                            .map(make_path),
+                    );
+                }
+                if let Some(byproducts) = graph.link_event_byproducts.get(&link.output) {
+                    target.products.extend(byproducts.iter().map(make_path));
+                }
             }
 
             let mut seen = HashSet::with_capacity(step.outputs.len());

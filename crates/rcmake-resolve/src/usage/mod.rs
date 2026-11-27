@@ -78,10 +78,26 @@ pub struct UsageValue {
 struct WalkValue {
     contributions: Vec<(TargetId, Arc<[BT<BString>]>)>,
     chains: Option<IndexMap<TargetId, Vec<crate::Hop>>>,
+    /// Range-encoded direct consumer link backtrace for each inherited contribution slice
+    /// (`(start, end, link_bt)` covering `contributions[start..end]`).
+    first_links: Vec<(usize, usize, Backtrace)>,
     flags: EvalFlags,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+impl WalkValue {
+    fn first_link_bt(&self, contrib_index: usize) -> Option<&Backtrace> {
+        if self.first_links.is_empty() {
+            return None;
+        }
+        let pos = self
+            .first_links
+            .partition_point(|&(_, end, _)| end <= contrib_index);
+        let (start, end, bt) = self.first_links.get(pos)?;
+        (*start..*end).contains(&contrib_index).then_some(bt)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct MemoKey<'a> {
     target: TargetId,
     property: Cow<'a, [u8]>,
@@ -131,7 +147,9 @@ pub struct UsageResolver<'a> {
     ids: Arc<[TargetId]>,
     parsed: ParseCache,
     memo: HashMap<MemoKey<'static>, Arc<WalkValue>>,
+    shared_memo: Option<Arc<HashMap<MemoKey<'static>, Arc<WalkValue>>>>,
     link_memo: HashMap<link::LinkMemoKey, link::SharedLinks>,
+    shared_link_memo: Option<Arc<HashMap<link::LinkMemoKey, link::SharedLinks>>>,
     target_languages: HashMap<(TargetId, rcmake_genex::ConfigId), Arc<IndexSet<BString>>>,
     active_compile_language: Option<(TargetId, BString)>,
     debug_configs: Vec<BString>,
@@ -144,6 +162,8 @@ pub struct UsageResolver<'a> {
     has_compatible_decls: bool,
     has_interface_pic: bool,
     has_language_runtime_libraries: bool,
+    has_shared_or_imported_targets: bool,
+    has_link_feature_overrides: bool,
     compatible: compatible::Properties,
     pub(crate) provenance: Option<provenance::Provenance>,
     pub(crate) runtime_install_targets: IndexSet<TargetId>,
@@ -153,6 +173,43 @@ pub struct UsageResolver<'a> {
     property_reads: usize,
     /// Backtrace of the outermost link edge being traversed for policy warnings.
     current_link_bt: Option<Backtrace>,
+}
+
+/// Read-only snapshot of memoized usage walks and link lists that can be shared
+/// across worker threads and resolution phases for the same [`ProjectModel`].
+#[derive(Clone, Default)]
+pub(crate) struct MemoSnapshot {
+    memo: Option<Arc<HashMap<MemoKey<'static>, Arc<WalkValue>>>>,
+    link_memo: Option<Arc<HashMap<link::LinkMemoKey, link::SharedLinks>>>,
+}
+
+impl MemoSnapshot {
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        if let Some(other_memo) = other.memo {
+            match &mut self.memo {
+                None => self.memo = Some(other_memo),
+                Some(existing) => {
+                    let mut merged = existing.as_ref().clone();
+                    merged.extend(other_memo.iter().map(|(k, v)| (k.clone(), Arc::clone(v))));
+                    *existing = Arc::new(merged);
+                }
+            }
+        }
+        if let Some(other_links) = other.link_memo {
+            match &mut self.link_memo {
+                None => self.link_memo = Some(other_links),
+                Some(existing) => {
+                    let mut merged = existing.as_ref().clone();
+                    merged.extend(
+                        other_links
+                            .iter()
+                            .map(|(&k, (v, f))| (k, (Arc::clone(v), *f))),
+                    );
+                    *existing = Arc::new(merged);
+                }
+            }
+        }
+    }
 }
 
 /// Thread-safe snapshot of immutable per-model metadata used to instantiate
@@ -171,6 +228,10 @@ pub(crate) struct WorkerUsageTemplate<'a> {
     has_compatible_decls: bool,
     has_interface_pic: bool,
     has_language_runtime_libraries: bool,
+    has_shared_or_imported_targets: bool,
+    has_link_feature_overrides: bool,
+    shared_memo: Option<Arc<HashMap<MemoKey<'static>, Arc<WalkValue>>>>,
+    shared_link_memo: Option<Arc<HashMap<link::LinkMemoKey, link::SharedLinks>>>,
     target_languages: HashMap<(TargetId, rcmake_genex::ConfigId), Arc<IndexSet<BString>>>,
     compatible_implied: HashMap<(TargetId, rcmake_genex::ConfigId), HashSet<BString>>,
 }
@@ -192,7 +253,9 @@ impl<'a> WorkerUsageTemplate<'a> {
             ids: Arc::clone(&self.ids),
             parsed: ParseCache::default(),
             memo: HashMap::new(),
+            shared_memo: self.shared_memo.clone(),
             link_memo: HashMap::new(),
+            shared_link_memo: self.shared_link_memo.clone(),
             target_languages: self.target_languages.clone(),
             active_compile_language: None,
             debug_configs: self.debug_configs.clone(),
@@ -205,6 +268,8 @@ impl<'a> WorkerUsageTemplate<'a> {
             has_compatible_decls: self.has_compatible_decls,
             has_interface_pic: self.has_interface_pic,
             has_language_runtime_libraries: self.has_language_runtime_libraries,
+            has_shared_or_imported_targets: self.has_shared_or_imported_targets,
+            has_link_feature_overrides: self.has_link_feature_overrides,
             compatible: compatible::Properties::with_implied(self.compatible_implied.clone()),
             provenance: provenance.then(provenance::Provenance::default),
             runtime_install_targets: self.runtime_install_targets.clone(),
@@ -223,6 +288,8 @@ impl<'a> UsageResolver<'a> {
         let mut has_system_interface_includes = false;
         let mut has_compatible_decls = false;
         let mut has_interface_pic = false;
+        let mut has_shared_or_imported_targets = false;
+        let mut has_link_feature_overrides = false;
         for (id, target) in model.targets() {
             ids.push(id);
             has_injections |= target.props.get(link::DIRECT).is_some()
@@ -244,6 +311,16 @@ impl<'a> UsageResolver<'a> {
                 .props
                 .get(b"INTERFACE_POSITION_INDEPENDENT_CODE")
                 .is_some();
+            has_shared_or_imported_targets |=
+                target.is_imported() || target.kind == TargetKind::SharedLibrary;
+            if !has_link_feature_overrides {
+                has_link_feature_overrides = target.props.get(b"LINK_LIBRARY_OVERRIDE").is_some()
+                    || target
+                        .props
+                        .names()
+                        .iter()
+                        .any(|key| key.starts_with(b"LINK_LIBRARY_OVERRIDE_"));
+            }
         }
         let has_language_runtime_libraries = model.dirs().any(|(id, _)| {
             definition(model, id, b"CMAKE_HIP_RUNTIME_LIBRARY_DEFAULT")
@@ -263,7 +340,9 @@ impl<'a> UsageResolver<'a> {
             ids: ids.into(),
             parsed: ParseCache::default(),
             memo: HashMap::new(),
+            shared_memo: None,
             link_memo: HashMap::new(),
+            shared_link_memo: None,
             target_languages: HashMap::new(),
             active_compile_language: None,
             debug_configs: model
@@ -287,10 +366,38 @@ impl<'a> UsageResolver<'a> {
             has_compatible_decls,
             has_interface_pic,
             has_language_runtime_libraries,
+            has_shared_or_imported_targets,
+            has_link_feature_overrides,
         }
     }
 
     pub(crate) fn worker_template(&self) -> WorkerUsageTemplate<'a> {
+        let shared_memo = if !self.memo.is_empty() {
+            let mut merged = self
+                .shared_memo
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| HashMap::with_capacity(self.memo.len()));
+            merged.extend(self.memo.iter().map(|(k, v)| (k.clone(), Arc::clone(v))));
+            Some(Arc::new(merged))
+        } else {
+            self.shared_memo.clone()
+        };
+        let shared_link_memo = if !self.link_memo.is_empty() {
+            let mut merged = self
+                .shared_link_memo
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| HashMap::with_capacity(self.link_memo.len()));
+            merged.extend(
+                self.link_memo
+                    .iter()
+                    .map(|(&k, (v, f))| (k, (Arc::clone(v), *f))),
+            );
+            Some(Arc::new(merged))
+        } else {
+            self.shared_link_memo.clone()
+        };
         WorkerUsageTemplate {
             model: self.model,
             ide: self.ide,
@@ -305,8 +412,93 @@ impl<'a> UsageResolver<'a> {
             has_compatible_decls: self.has_compatible_decls,
             has_interface_pic: self.has_interface_pic,
             has_language_runtime_libraries: self.has_language_runtime_libraries,
+            has_shared_or_imported_targets: self.has_shared_or_imported_targets,
+            has_link_feature_overrides: self.has_link_feature_overrides,
+            shared_memo,
+            shared_link_memo,
             target_languages: self.target_languages.clone(),
             compatible_implied: self.compatible.implied.clone(),
+        }
+    }
+
+    /// Extract a read-only [`MemoSnapshot`] combining local and shared memos.
+    pub(crate) fn memo_snapshot(&self) -> MemoSnapshot {
+        let memo = if !self.memo.is_empty() {
+            let mut merged = self
+                .shared_memo
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| HashMap::with_capacity(self.memo.len()));
+            merged.extend(self.memo.iter().map(|(k, v)| (k.clone(), Arc::clone(v))));
+            Some(Arc::new(merged))
+        } else {
+            self.shared_memo.clone()
+        };
+        let link_memo = if !self.link_memo.is_empty() {
+            let mut merged = self
+                .shared_link_memo
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| HashMap::with_capacity(self.link_memo.len()));
+            merged.extend(
+                self.link_memo
+                    .iter()
+                    .map(|(&k, (v, f))| (k, (Arc::clone(v), *f))),
+            );
+            Some(Arc::new(merged))
+        } else {
+            self.shared_link_memo.clone()
+        };
+        MemoSnapshot { memo, link_memo }
+    }
+
+    /// Install a read-only [`MemoSnapshot`] from an earlier phase on the same model.
+    pub(crate) fn with_memos(mut self, memos: &MemoSnapshot) -> Self {
+        self.shared_memo = memos.memo.clone();
+        self.shared_link_memo = memos.link_memo.clone();
+        self
+    }
+
+    /// Extract the worker's locally learned memos into an owned [`MemoSnapshot`].
+    pub(crate) fn take_local_memos(&mut self) -> MemoSnapshot {
+        MemoSnapshot {
+            memo: (!self.memo.is_empty()).then(|| Arc::new(std::mem::take(&mut self.memo))),
+            link_memo: (!self.link_memo.is_empty())
+                .then(|| Arc::new(std::mem::take(&mut self.link_memo))),
+        }
+    }
+
+    /// Merge read-only memo entries learned by a worker back into this resolver.
+    pub(crate) fn absorb_memos(&mut self, other: MemoSnapshot) {
+        if let Some(memo) = other.memo {
+            match Arc::try_unwrap(memo) {
+                Ok(map) => {
+                    if self.memo.is_empty() {
+                        self.memo = map;
+                    } else {
+                        self.memo.extend(map);
+                    }
+                }
+                Err(shared) => {
+                    self.memo
+                        .extend(shared.iter().map(|(k, v)| (k.clone(), Arc::clone(v))));
+                }
+            }
+        }
+        if let Some(link_memo) = other.link_memo {
+            match Arc::try_unwrap(link_memo) {
+                Ok(map) => {
+                    if self.link_memo.is_empty() {
+                        self.link_memo = map;
+                    } else {
+                        self.link_memo.extend(map);
+                    }
+                }
+                Err(shared) => {
+                    self.link_memo
+                        .extend(shared.iter().map(|(&k, (v, f))| (k, (Arc::clone(v), *f))));
+                }
+            }
         }
     }
 
@@ -508,16 +700,11 @@ impl<'a> UsageResolver<'a> {
         }
         let result = self.walk(target, name, &ctx)?;
         let mut pairs = Vec::new();
-        for (owner, entries) in &result.contributions {
+        for (contrib_idx, (owner, entries)) in result.contributions.iter().enumerate() {
             if *owner == target {
                 continue;
             }
-            let Some(edge) = result
-                .chains
-                .as_ref()
-                .and_then(|paths| paths.get(owner))
-                .and_then(|path| path.first())
-            else {
+            let Some(link_bt) = result.first_link_bt(contrib_idx) else {
                 continue;
             };
             for entry in &**entries {
@@ -529,10 +716,7 @@ impl<'a> UsageResolver<'a> {
                 } else {
                     entry.value.clone()
                 };
-                pairs.push((
-                    BT::new(value, entry.backtrace.clone()),
-                    edge.link_bt.clone(),
-                ));
+                pairs.push((BT::new(value, entry.backtrace.clone()), link_bt.clone()));
             }
         }
         Ok(pairs)
@@ -559,7 +743,9 @@ impl<'a> UsageResolver<'a> {
             ids: Arc::clone(&self.ids),
             parsed: ParseCache::default(),
             memo: HashMap::new(),
+            shared_memo: self.shared_memo.clone(),
             link_memo: HashMap::new(),
+            shared_link_memo: self.shared_link_memo.clone(),
             target_languages: self.target_languages.clone(),
             active_compile_language: None,
             debug_configs: self.debug_configs.clone(),
@@ -575,6 +761,8 @@ impl<'a> UsageResolver<'a> {
             has_compatible_decls: self.has_compatible_decls,
             has_interface_pic: self.has_interface_pic,
             has_language_runtime_libraries: self.has_language_runtime_libraries,
+            has_shared_or_imported_targets: self.has_shared_or_imported_targets,
+            has_link_feature_overrides: self.has_link_feature_overrides,
             current_link_bt: None,
         }
     }
@@ -700,12 +888,17 @@ impl<'a> UsageResolver<'a> {
             }
             let result = self.walk(target, name, &ctx)?;
             self.log_usage(target, name, &result);
+            let total_entries: usize = result
+                .contributions
+                .iter()
+                .map(|(_, entries)| entries.len())
+                .sum();
             let mut value = UsageValue {
-                entries: Vec::new(),
+                entries: Vec::with_capacity(total_entries),
                 flags: result.flags,
             };
-            let mut seen = HashSet::new();
-            for (owner, entries) in &result.contributions {
+            let mut seen = HashSet::with_capacity(total_entries);
+            for (contrib_idx, (owner, entries)) in result.contributions.iter().enumerate() {
                 if field == UsageField::LinkDirectories
                     && self.property_reads == 0
                     && let Some(paths) = self.source_paths()
@@ -718,17 +911,16 @@ impl<'a> UsageResolver<'a> {
                         entries,
                     )?;
                 }
+                let codemodel_bt = if self.codemodel_backtraces {
+                    result.first_link_bt(contrib_idx)
+                } else {
+                    None
+                };
                 for entry in &**entries {
                     if seen.insert(entry.value.as_slice()) {
                         let mut entry = entry.clone();
-                        if self.codemodel_backtraces
-                            && let Some(edge) = result
-                                .chains
-                                .as_ref()
-                                .and_then(|paths| paths.get(owner))
-                                .and_then(|path| path.first())
-                        {
-                            entry.backtrace.clone_from(&edge.link_bt);
+                        if let Some(link_bt) = codemodel_bt {
+                            entry.backtrace.clone_from(link_bt);
                         }
                         value.entries.push(entry);
                         if let Some(chains) = &mut chains {
@@ -913,13 +1105,24 @@ impl<'a> UsageResolver<'a> {
         }
     }
 
+    fn memo_get(&self, key: &MemoKey<'_>) -> Option<Arc<WalkValue>> {
+        self.memo
+            .get(key)
+            .or_else(|| {
+                self.shared_memo
+                    .as_deref()
+                    .and_then(|shared| shared.get(key))
+            })
+            .cloned()
+    }
+
     fn is_memoized(&self, target: TargetId, name: &[u8], ctx: &EvalContext) -> bool {
         let mut key = self.memo_key(target, name, ctx);
-        if self.memo.contains_key(&key) {
+        if self.memo_get(&key).is_some() {
             return true;
         }
         key.head = ctx.head.and_then(|id| self.ids.get(id.0 as usize).copied());
-        key.head.is_some() && self.memo.contains_key(&key)
+        key.head.is_some() && self.memo_get(&key).is_some()
     }
 
     /// Targets that a walk of `name` on `target` visits next.
@@ -957,10 +1160,22 @@ impl<'a> UsageResolver<'a> {
         } else {
             interface_property_name(name)
         };
+        let (root_links, _) = self.usage_links(target, name.starts_with(b"INTERFACE_"), ctx)?;
+        if root_links
+            .iter()
+            .flat_map(|item| item.edge_targets())
+            .all(|dep| dep == target || self.is_memoized(dep, &dependency_name, ctx))
+        {
+            return Ok(());
+        }
         // Depth of each finished node; `None` marks a node on the search path.
         let mut depth: HashMap<TargetId, Option<usize>> = HashMap::from([(target, None)]);
         let mut order = Vec::new();
-        let mut stack = vec![(target, self.edge_targets(target, name, ctx)?, 0usize)];
+        let root_edges: Vec<TargetId> = root_links
+            .iter()
+            .flat_map(|item| item.edge_targets())
+            .collect();
+        let mut stack = vec![(target, root_edges, 0usize)];
         while let Some((node, edges, next)) = stack.last_mut() {
             let Some(&dependency) = edges.get(*next) else {
                 let node = *node;
@@ -1021,11 +1236,11 @@ impl<'a> UsageResolver<'a> {
         let is_iface = name.starts_with(b"INTERFACE_");
         let start_seq = visited.len();
         let mut key = self.memo_key(target, name, ctx);
-        let lookup_cached = |memo: &HashMap<MemoKey<'static>, Arc<WalkValue>>,
+        let lookup_cached = |this: &Self,
                              key: &MemoKey<'_>,
                              visited: &mut HashMap<(TargetId, bool), usize>|
          -> Option<Arc<WalkValue>> {
-            let value = memo.get(key)?;
+            let value = this.memo_get(key)?;
             if ctx.traversal == UsageTraversal::Link && !visited.is_empty() {
                 if visited.contains_key(&(target, is_iface))
                     || value
@@ -1042,16 +1257,16 @@ impl<'a> UsageResolver<'a> {
                     visited.entry((*owner, true)).or_insert(seq);
                 }
             }
-            Some(Arc::clone(value))
+            Some(value)
         };
         if self.source_reads.is_none()
-            && let Some(value) = lookup_cached(&self.memo, &key, visited)
+            && let Some(value) = lookup_cached(self, &key, visited)
         {
             return Ok((value, usize::MAX));
         }
         key.head = ctx.head.and_then(|id| self.ids.get(id.0 as usize).copied());
         if self.source_reads.is_none()
-            && let Some(value) = lookup_cached(&self.memo, &key, visited)
+            && let Some(value) = lookup_cached(self, &key, visited)
         {
             return Ok((value, usize::MAX));
         }
@@ -1167,7 +1382,11 @@ impl<'a> UsageResolver<'a> {
         {
             result.contributions.push((id, own.entries.into()));
         }
-        let mut seen = (ctx.traversal == UsageTraversal::Compile).then(HashSet::new);
+        let direct_edge_count = links.iter().flat_map(|item| item.edges()).take(2).count();
+        let mut seen =
+            (ctx.traversal == UsageTraversal::Compile && direct_edge_count > 1).then(HashSet::new);
+        let track_full_chains = self.provenance.is_some() || self.debug_properties;
+        let track_first_links = self.codemodel_backtraces || name == b"SOURCES";
         let mut min_dep_seq = usize::MAX;
         for (dependency, edge) in links.iter().flat_map(|item| item.edges()) {
             if ctx.traversal == UsageTraversal::Link
@@ -1196,16 +1415,14 @@ impl<'a> UsageResolver<'a> {
             let (value, child_min_dep) = value?;
             min_dep_seq = min_dep_seq.min(child_min_dep);
             result.flags = result.flags.union(value.flags);
+            let start = result.contributions.len();
+            result.contributions.reserve(value.contributions.len());
             for (owner, entries) in &value.contributions {
                 if *owner == id || seen.as_mut().is_some_and(|seen| !seen.insert(*owner)) {
                     continue;
                 }
                 result.contributions.push((*owner, Arc::clone(entries)));
-                if self.provenance.is_some()
-                    || self.debug_properties
-                    || self.codemodel_backtraces
-                    || name == b"SOURCES"
-                {
+                if track_full_chains {
                     let mut chain = vec![edge.hop(dependency)];
                     if let Some(path) = value.chains.as_ref().and_then(|chains| chains.get(owner)) {
                         chain.extend_from_slice(path);
@@ -1215,6 +1432,12 @@ impl<'a> UsageResolver<'a> {
                         .get_or_insert_with(IndexMap::new)
                         .insert(*owner, chain);
                 }
+            }
+            let end = result.contributions.len();
+            if track_first_links && end > start {
+                result
+                    .first_links
+                    .push((start, end, edge.text.backtrace.clone()));
             }
         }
         Ok((result, min_dep_seq))
@@ -1232,16 +1455,10 @@ impl<'a> UsageResolver<'a> {
         Ok(owners
             .contributions
             .iter()
-            .filter_map(|(owner, _)| {
+            .enumerate()
+            .filter_map(|(contrib_idx, (owner, _))| {
                 let link_bt = (*owner != target)
-                    .then(|| {
-                        owners
-                            .chains
-                            .as_ref()
-                            .and_then(|chains| chains.get(owner))
-                            .and_then(|chain| chain.first())
-                            .map(|hop| hop.link_bt.clone())
-                    })
+                    .then(|| owners.first_link_bt(contrib_idx).cloned())
                     .flatten();
                 Some((model.target(*owner)?, link_bt))
             })

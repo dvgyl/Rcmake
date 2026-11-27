@@ -76,6 +76,65 @@ pub(super) fn named_framework_files(
     files
 }
 
+/// Return `.framework` bundle locations of imported library targets linked into
+/// `target`.
+///
+/// CMake emits `-framework Name` on the link command line for imported targets
+/// whose `IMPORTED_LOCATION` is a `.framework` bundle (for example
+/// `OpenGL::GL`), while still recording the full `.framework` path as a Ninja
+/// implicit input (`|`).
+pub(super) fn imported_framework_files(
+    model: &ProjectModel,
+    target: &Target,
+    config: &ConfigId,
+    step: &LinkStep,
+    usage: &mut UsageResolver<'_>,
+) -> Vec<BString> {
+    if !is_darwin(model, target.dir) || step.kind == crate::LinkKind::StaticArchive {
+        return Vec::new();
+    }
+    let Some(id) = model.find_target(target.dir, &target.name) else {
+        return Vec::new();
+    };
+    let ctx = EvalContext {
+        config: config.clone(),
+        link_language: Some(step.language.clone()),
+        ..EvalContext::default()
+    };
+    let Ok(dependencies) = usage.link_targets(id, &ctx) else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+    for dependency in dependencies {
+        let Some(producer) = model.target(dependency) else {
+            continue;
+        };
+        if !producer.is_imported()
+            || matches!(
+                producer.kind,
+                rcmake_model::TargetKind::InterfaceLibrary
+                    | rcmake_model::TargetKind::Utility
+                    | rcmake_model::TargetKind::GlobalTarget
+                    | rcmake_model::TargetKind::ObjectLibrary
+            )
+        {
+            continue;
+        }
+        let Some(file) = super::super::compute_artifacts(model, producer, config).linker_file
+        else {
+            continue;
+        };
+        if Lexical::new(&file).filename().ends_with(b".framework") {
+            let path = build_relative(model, &file);
+            if seen.insert(path.clone()) {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
 /// Return the bundle name of a framework file path, for example `Foo` for
 /// `/build/Foo.framework/Versions/A/Foo`. A leading shell quote is ignored.
 pub(crate) fn bundle_name(path: &[u8]) -> Option<&[u8]> {

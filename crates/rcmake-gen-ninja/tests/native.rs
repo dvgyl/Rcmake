@@ -367,6 +367,30 @@ fn ninja_builds_an_executable_whose_output_name_matches_its_library()
         .command_lines
         .push(vec!["sh".into(), "-c".into(), "./sqlite3 > check".into()]);
     model.add_command(check)?;
+    // Attach a utility target so `check` is referenced by the build graph
+    // (CMake does not emit Ninja edges for unreferenced `add_custom_command(OUTPUT)`).
+    let mut run_check_target = Target::new(
+        "run_check".into(),
+        TargetKind::Utility,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    );
+    run_check_target
+        .props
+        .set("EXCLUDE_FROM_ALL".into(), "1".into());
+    let run_check = model.add_target(run_check_target)?;
+    let mut run_check_cmd = CustomCommand::new(
+        DirId::ROOT,
+        CustomCommandKind::Utility(run_check),
+        Default::default(),
+        Default::default(),
+    );
+    run_check_cmd
+        .depends
+        .push(BT::new("check".into(), Default::default()));
+    model.add_command(run_check_cmd)?;
 
     let result = resolve(&model, &project.host, &[])?;
     generate_single_config(&result, &project.host, &build)?;

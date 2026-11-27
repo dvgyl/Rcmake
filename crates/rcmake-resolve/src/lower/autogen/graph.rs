@@ -433,10 +433,13 @@ fn add_autogen(
             }
         }
     }
+    let mut tool_targets = IndexSet::new();
     for tool in [&plan.moc, &plan.uic] {
         order_tool(model, tool, &mut ordering);
+        order_tool(model, tool, &mut tool_targets);
         tool_files.extend(tool_dependencies(tool, plan.cross && plan.better));
     }
+    tool_files.extend(tool_targets);
     if plan.moc.enabled {
         let file = plan.compilation_file(configured);
         add_source(
@@ -672,7 +675,7 @@ fn order_tool(model: &ProjectModel, tool: &ToolPlan, ordering: &mut IndexSet<BSt
         .into_iter()
         .chain(tool.artifact_deps.iter().map(|(id, _)| *id))
     {
-        if let Some(tool_target) = model.target(id).filter(|target| !target.is_imported()) {
+        if let Some(tool_target) = model.target(id) {
             ordering.insert(tool_target.name.clone());
         }
     }

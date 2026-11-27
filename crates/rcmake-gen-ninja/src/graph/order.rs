@@ -219,6 +219,7 @@ impl Graph<'_> {
         for &step in &target.steps {
             if self.input.utility_steps.contains(&step)
                 || self.input.swift_actions.contains_key(&step)
+                || !self.step_belongs_to_target_dir(target_index, step)
             {
                 continue;
             }
@@ -232,16 +233,15 @@ impl Graph<'_> {
                 continue;
             }
             if let Some(file_sets) = file_sets {
-                let outputs = custom.outputs.iter().zip(&nodes.outputs);
-                let byproducts = custom.byproducts.iter().zip(&nodes.byproducts);
-                for (name, node) in outputs.chain(byproducts) {
+                for name in custom.outputs.iter().chain(&custom.byproducts) {
                     if file_sets.independent.contains(name) {
                         continue;
                     }
+                    let node = self.node(name);
                     if file_sets.public.contains(name) {
-                        public.push(node.clone());
+                        public.push(node);
                     } else {
-                        private.push(node.clone());
+                        private.push(node);
                     }
                 }
             } else {

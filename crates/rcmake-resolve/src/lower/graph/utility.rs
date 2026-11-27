@@ -13,29 +13,37 @@ impl TargetPlan<'_> {
         usage: &mut UsageResolver<'_>,
         sink: &mut GraphSink<'_>,
     ) -> Result<(), ResolveError> {
+        let ninja = self.model.generator.is_some_and(GeneratorKind::is_ninja);
         let multi = self.model.generator == Some(GeneratorKind::NinjaMultiConfig);
         let events @ [pre_build, post_build] =
             [Some(TargetEvent::PreBuild), Some(TargetEvent::PostBuild)];
         let both = [None, pre_build, post_build];
         let mut utility =
-            self.utility_recipe(commands, usage, if multi { &[None] } else { &both })?;
-        if multi {
+            self.utility_recipe(commands, usage, if ninja { &[None] } else { &both })?;
+        if ninja {
             let mut after = self.utility_recipe(commands, usage, &events)?;
             if after != CustomStep::default() {
                 after.depends.extend(utility.outputs.iter().cloned());
+                after.depends.extend(utility.byproducts.iter().cloned());
                 if after.comment.is_none() {
                     after.comment =
                         Some(format!("Running utility command for {}", self.target.name).into());
                 }
-                let path: BString = [
-                    b"CMakeFiles/".as_slice(),
-                    &self.config.0,
-                    b"/",
-                    &self.target.name,
-                    b".util",
-                ]
-                .concat()
-                .into();
+                let path: BString = if multi {
+                    [
+                        b"CMakeFiles/".as_slice(),
+                        &self.config.0,
+                        b"/",
+                        &self.target.name,
+                        b".util",
+                    ]
+                    .concat()
+                    .into()
+                } else {
+                    [b"CMakeFiles/".as_slice(), &self.target.name, b".util"]
+                        .concat()
+                        .into()
+                };
                 let dir = &self.model.dir(self.target.dir).binary_dir;
                 after
                     .outputs

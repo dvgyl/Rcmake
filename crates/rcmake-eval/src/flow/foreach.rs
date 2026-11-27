@@ -49,6 +49,10 @@ impl ForeachFrame {
     pub(crate) fn contains_command(&self, cmds: &Arc<[CommandInvocation]>, index: usize) -> bool {
         Arc::ptr_eq(&self.cmds, cmds) && (self.start..self.end).contains(&index)
     }
+
+    pub(crate) fn scope_depth(&self) -> usize {
+        self.scope_depth
+    }
 }
 
 /// Read-only view of the innermost active `foreach()` loop for speculative probe lookahead.

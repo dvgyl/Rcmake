@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rcmake_base::{BString, ByteSlice, list};
@@ -9,7 +10,8 @@ use rcmake_diag::{FrameKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, Cx, FindEvent, HermeticMode, RunMode, hermetic::HermeticContext};
 use rcmake_expr::ExpandedArg;
 use rcmake_host::{
-    CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, ReadRange, RunRequest, path,
+    CommandSpec, DirEntry, FileKind, FileTime, Follow, Host, Input, Output, ProcessResult,
+    ReadRange, RunRequest, path,
 };
 use rcmake_syntax::ArgKind;
 
@@ -79,6 +81,102 @@ enum SearchPass {
     AppBundle,
 }
 
+const MAX_FIND_DIR_CACHE_ENTRIES: usize = 4096;
+const MAX_FIND_DIR_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const FIND_DIR_LIST_LIMIT: usize = 16_384;
+/// Minimum age before caching a directory listing so same-tick mutations on
+/// coarse-timestamp filesystems (e.g. ext4/tmpfs/HFS+) are never served stale.
+const FIND_DIR_CACHE_MIN_AGE_SECS: i64 = 2;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DirStamp {
+    mtime: FileTime,
+    ctime: Option<FileTime>,
+    dev: u64,
+    ino: u64,
+}
+
+struct CachedSearchDir {
+    stamp: DirStamp,
+    directory: Arc<SearchDirectory>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct FindDirCache {
+    entries: HashMap<PathBuf, CachedSearchDir>,
+    total_bytes: usize,
+}
+
+impl FindDirCache {
+    fn remove(&mut self, dir: &Path) {
+        if let Some(old) = self.entries.remove(dir) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.bytes);
+        }
+    }
+
+    fn insert(&mut self, dir: PathBuf, stamp: DirStamp, directory: Arc<SearchDirectory>) {
+        self.insert_with_budget(dir, stamp, directory, MAX_FIND_DIR_CACHE_BYTES);
+    }
+
+    fn insert_with_budget(
+        &mut self,
+        dir: PathBuf,
+        stamp: DirStamp,
+        directory: Arc<SearchDirectory>,
+        max_bytes: usize,
+    ) {
+        let bytes = std::mem::size_of::<PathBuf>()
+            .saturating_add(dir.as_os_str().len())
+            .saturating_add(std::mem::size_of::<CachedSearchDir>())
+            .saturating_add(directory.estimated_bytes());
+        let existing_bytes = self.entries.get(&dir).map_or(0, |old| old.bytes);
+        let existing = self.entries.contains_key(&dir);
+        if !existing && self.entries.len() >= MAX_FIND_DIR_CACHE_ENTRIES {
+            return;
+        }
+        let next_total = self
+            .total_bytes
+            .saturating_sub(existing_bytes)
+            .saturating_add(bytes);
+        if next_total > max_bytes {
+            if existing {
+                self.remove(&dir);
+            }
+            return;
+        }
+        self.total_bytes = next_total;
+        self.entries.insert(
+            dir,
+            CachedSearchDir {
+                stamp,
+                directory,
+                bytes,
+            },
+        );
+    }
+}
+
+enum DirSlot {
+    Unlisted,
+    Existing,
+    Unknown,
+    Missing,
+    Cached(Arc<SearchDirectory>),
+}
+
+impl DirSlot {
+    fn as_dir(&self) -> &SearchDirectory {
+        match self {
+            Self::Unlisted => &SearchDirectory::Unlisted,
+            Self::Existing => &SearchDirectory::Existing,
+            Self::Unknown => &SearchDirectory::Unknown,
+            Self::Missing => &SearchDirectory::Missing,
+            Self::Cached(directory) => directory,
+        }
+    }
+}
+
 enum SearchDirectory {
     Unlisted,
     Existing,
@@ -88,51 +186,123 @@ enum SearchDirectory {
         names: Option<HashSet<Box<[u8]>>>,
         frameworks: Vec<PathBuf>,
         has_framework: bool,
+        has_app_bundle: bool,
+        frameworks_complete: bool,
+        names_bytes: usize,
     },
 }
 
 impl SearchDirectory {
-    fn read(host: &dyn Host, root: &Path, build_name_set: bool) -> Self {
-        match host.read_dir(root) {
-            Ok(entries) => {
-                let mut framework_entries = Vec::new();
-                let mut has_framework = false;
-                let mut ascii = build_name_set && !cfg!(windows) && !unlisted_filesystem(root);
-                for entry in &entries {
-                    if entry.kind != FileKind::File {
-                        if entry.name.ends_with(b".framework") {
-                            framework_entries.push(entry.name.clone());
-                            has_framework = true;
-                        } else if ends_with_ignore_ascii_case(&entry.name, b".framework") {
-                            has_framework = true;
-                        }
-                    }
-                    if ascii && !entry.name.is_ascii() {
-                        ascii = false;
-                    }
+    fn from_entries(
+        root: &Path,
+        entries: Vec<DirEntry>,
+        truncated: bool,
+        build_name_set: bool,
+    ) -> Self {
+        if truncated {
+            return Self::Listed {
+                names: None,
+                frameworks: Vec::new(),
+                has_framework: true,
+                has_app_bundle: true,
+                frameworks_complete: false,
+                names_bytes: 0,
+            };
+        }
+        let mut framework_entries = Vec::new();
+        let mut has_framework = false;
+        let mut has_app_bundle = false;
+        let mut ascii = build_name_set && !cfg!(windows) && !unlisted_filesystem(root);
+        for entry in &entries {
+            if entry.kind != FileKind::File {
+                if entry.name.ends_with(b".framework") {
+                    framework_entries.push(entry.name.clone());
+                    has_framework = true;
+                } else if ends_with_ignore_ascii_case(&entry.name, b".framework")
+                    || ends_with_ignore_ascii_case(&entry.name, b".xcframework")
+                {
+                    has_framework = true;
                 }
-                framework_entries.sort_unstable();
-                let frameworks = framework_entries
-                    .into_iter()
-                    .map(|name| root.join(path::to_native(&name)).join("Headers"))
-                    .collect();
-                let names = ascii.then(|| {
-                    let mut set = HashSet::with_capacity(entries.len().min(4096));
-                    for entry in entries {
-                        let mut bytes: Vec<u8> = entry.name.into();
-                        bytes.make_ascii_lowercase();
-                        set.insert(bytes.into_boxed_slice());
-                    }
-                    set
-                });
-                Self::Listed {
-                    names,
-                    frameworks,
-                    has_framework,
+                if !has_app_bundle && ends_with_ignore_ascii_case(&entry.name, b".app") {
+                    has_app_bundle = true;
                 }
             }
+            if ascii && !entry.name.is_ascii() {
+                ascii = false;
+            }
+        }
+        framework_entries.sort_unstable();
+        let frameworks = framework_entries
+            .into_iter()
+            .map(|name| root.join(path::to_native(&name)).join("Headers"))
+            .collect();
+        let mut names_bytes = 0usize;
+        let names = ascii.then(|| {
+            let mut set = HashSet::with_capacity(entries.len().min(4096));
+            for entry in entries {
+                let mut bytes: Vec<u8> = entry.name.into();
+                bytes.make_ascii_lowercase();
+                let boxed = bytes.into_boxed_slice();
+                let len = boxed.len();
+                if set.insert(boxed) {
+                    names_bytes = names_bytes.saturating_add(len);
+                }
+            }
+            names_bytes = names_bytes.saturating_add(
+                set.capacity()
+                    .saturating_mul(std::mem::size_of::<Box<[u8]>>().saturating_add(16)),
+            );
+            set
+        });
+        Self::Listed {
+            names,
+            frameworks,
+            has_framework,
+            has_app_bundle,
+            frameworks_complete: true,
+            names_bytes,
+        }
+    }
+
+    fn read(host: &dyn Host, root: &Path, build_name_set: bool) -> Self {
+        match host.read_dir(root) {
+            Ok(entries) => Self::from_entries(root, entries, false, build_name_set),
             Err(error) if missing_directory(error.kind) => Self::Missing,
             Err(_) => Self::Unknown,
+        }
+    }
+
+    fn frameworks_complete(&self) -> bool {
+        matches!(
+            self,
+            Self::Listed {
+                frameworks_complete: true,
+                ..
+            }
+        )
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        let base = std::mem::size_of::<Self>();
+        match self {
+            Self::Listed {
+                frameworks,
+                names_bytes,
+                ..
+            } => {
+                let frameworks_bytes = frameworks
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PathBuf>())
+                    .saturating_add(
+                        frameworks
+                            .iter()
+                            .map(|path| path.as_os_str().len())
+                            .fold(0usize, usize::saturating_add),
+                    );
+                base.saturating_add(*names_bytes)
+                    .saturating_add(frameworks_bytes)
+            }
+            _ => base,
         }
     }
 
@@ -185,6 +355,69 @@ impl SearchDirectory {
             _ => true,
         }
     }
+}
+
+fn read_cached_dir(cx: &mut Cx<'_>, dir: &Path, list_frameworks: bool) -> DirSlot {
+    let meta = match cx.host().metadata_fresh(dir, Follow::Yes) {
+        Ok(meta) if meta.kind == FileKind::Dir => meta,
+        Ok(_) => {
+            if let Some(cache) = cx.session_data_mut_or_init::<FindDirCache>() {
+                cache.remove(dir);
+            }
+            return DirSlot::Missing;
+        }
+        Err(error) if missing_directory(error.kind) => {
+            if let Some(cache) = cx.session_data_mut_or_init::<FindDirCache>() {
+                cache.remove(dir);
+            }
+            return DirSlot::Missing;
+        }
+        Err(_) => return DirSlot::Unknown,
+    };
+    let stamp = DirStamp {
+        mtime: meta.mtime,
+        ctime: meta.ctime,
+        dev: meta.dev,
+        ino: meta.ino,
+    };
+    let now_secs = cx.host().now().secs;
+    let is_windows = cx.host().system().sysname.eq_ignore_ascii_case(b"Windows");
+    let mtime_stable = now_secs.saturating_sub(meta.mtime.secs) >= FIND_DIR_CACHE_MIN_AGE_SECS;
+    let ctime_stable = if is_windows {
+        meta.ctime
+            .is_none_or(|c| now_secs.saturating_sub(c.secs) >= FIND_DIR_CACHE_MIN_AGE_SECS)
+    } else {
+        meta.ctime
+            .is_some_and(|c| now_secs.saturating_sub(c.secs) >= FIND_DIR_CACHE_MIN_AGE_SECS)
+    };
+    let stable = mtime_stable && ctime_stable;
+    if stable
+        && let Some(cache) = cx.session_data_mut_or_init::<FindDirCache>()
+        && let Some(cached) = cache.entries.get(dir)
+        && cached.stamp == stamp
+        && (!list_frameworks || cached.directory.frameworks_complete())
+    {
+        return DirSlot::Cached(Arc::clone(&cached.directory));
+    }
+    if !stable && let Some(cache) = cx.session_data_mut_or_init::<FindDirCache>() {
+        cache.remove(dir);
+    }
+    let directory = if list_frameworks {
+        SearchDirectory::read(cx.host(), dir, true)
+    } else {
+        match cx.host().read_dir_bounded(dir, FIND_DIR_LIST_LIMIT) {
+            Ok((entries, truncated)) => {
+                SearchDirectory::from_entries(dir, entries, truncated, true)
+            }
+            Err(error) if missing_directory(error.kind) => return DirSlot::Missing,
+            Err(_) => return DirSlot::Unknown,
+        }
+    };
+    let arc = Arc::new(directory);
+    if stable && let Some(cache) = cx.session_data_mut_or_init::<FindDirCache>() {
+        cache.insert(dir.to_path_buf(), stamp, Arc::clone(&arc));
+    }
+    DirSlot::Cached(arc)
 }
 
 fn unlisted_filesystem(path: &Path) -> bool {
@@ -364,9 +597,9 @@ impl<'a> Search<'a> {
         let mut directories = Vec::with_capacity(dirs.len());
         directories.resize_with(dirs.len(), || {
             if arch_rewritten {
-                SearchDirectory::Existing
+                DirSlot::Existing
             } else {
-                SearchDirectory::Unlisted
+                DirSlot::Unlisted
             }
         });
         for &pass in passes {
@@ -386,7 +619,7 @@ impl<'a> Search<'a> {
         names: &[PathBuf],
         pass: SearchPass,
         passes_len: usize,
-        directories: &mut [SearchDirectory],
+        directories: &mut [DirSlot],
     ) -> Result<Option<PathBuf>, CmdError> {
         let search = match pass {
             SearchPass::Regular => Self::in_directory,
@@ -397,6 +630,7 @@ impl<'a> Search<'a> {
             SearchPass::AppBundle => Self::app_bundle,
         };
         let speculative = passes_len > 1;
+        let use_dir_cache = cx.host().directory_times_track_names();
         let precheck_dir = !self.hermetic
             && self.options.validator.is_none()
             && (names.len() > 1 || passes_len > 1 || matches!(self.kind, Kind::Library));
@@ -408,28 +642,44 @@ impl<'a> Search<'a> {
             |this: &mut Self, cx: &mut Cx<'_>, dir_idx: Option<usize>, dir: &Path, name: &Path| {
                 // A validator can change the filesystem before the next candidate.
                 // Hermetic mode can permit an exact candidate without granting its parent directory.
-                let directory = if this.hermetic
-                    || this.options.validator.is_some()
-                    || !dir.is_absolute()
-                {
-                    &unknown
-                } else if let Some(slot) = dir_idx.and_then(|idx| directories.get_mut(idx)) {
-                    if list_frameworks {
-                        if matches!(slot, SearchDirectory::Unlisted | SearchDirectory::Existing) {
-                            *slot = SearchDirectory::read(cx.host(), dir, build_name_set);
+                let directory =
+                    if this.hermetic || this.options.validator.is_some() || !dir.is_absolute() {
+                        &unknown
+                    } else if let Some(slot) = dir_idx.and_then(|idx| directories.get_mut(idx)) {
+                        if use_dir_cache && !unlisted_filesystem(dir) {
+                            let needs_load = match slot {
+                                DirSlot::Unlisted | DirSlot::Existing => true,
+                                DirSlot::Cached(cached)
+                                    if list_frameworks && !cached.frameworks_complete() =>
+                                {
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if needs_load {
+                                *slot = read_cached_dir(cx, dir, list_frameworks);
+                            }
+                        } else if list_frameworks {
+                            if matches!(slot, DirSlot::Unlisted | DirSlot::Existing) {
+                                *slot = match SearchDirectory::read(cx.host(), dir, build_name_set)
+                                {
+                                    SearchDirectory::Missing => DirSlot::Missing,
+                                    SearchDirectory::Unknown => DirSlot::Unknown,
+                                    listed => DirSlot::Cached(Arc::new(listed)),
+                                };
+                            }
+                        } else if precheck_dir && matches!(slot, DirSlot::Unlisted) {
+                            *slot = match cx.host().metadata(dir, Follow::Yes) {
+                                Ok(meta) if meta.kind == FileKind::Dir => DirSlot::Existing,
+                                Ok(_) => DirSlot::Missing,
+                                Err(error) if missing_directory(error.kind) => DirSlot::Missing,
+                                Err(_) => DirSlot::Unknown,
+                            };
                         }
-                    } else if precheck_dir && matches!(slot, SearchDirectory::Unlisted) {
-                        *slot = match cx.host().metadata(dir, Follow::Yes) {
-                            Ok(meta) if meta.kind == FileKind::Dir => SearchDirectory::Existing,
-                            Ok(_) => SearchDirectory::Missing,
-                            Err(error) if missing_directory(error.kind) => SearchDirectory::Missing,
-                            Err(_) => SearchDirectory::Unknown,
-                        };
-                    }
-                    &*slot
-                } else {
-                    &unknown
-                };
+                        slot.as_dir()
+                    } else {
+                        &unknown
+                    };
                 search(this, cx, dir, name, directory, speculative)
             };
         if self.options.names_per_dir
@@ -607,6 +857,16 @@ impl<'a> Search<'a> {
         speculative: bool,
     ) -> Result<Option<PathBuf>, CmdError> {
         if matches!(directory, SearchDirectory::Missing) && is_relative_descendant(name) {
+            return Ok(None);
+        }
+        if matches!(
+            directory,
+            SearchDirectory::Listed {
+                has_app_bundle: false,
+                ..
+            }
+        ) && single_component(name).is_some()
+        {
             return Ok(None);
         }
         let Some(stem) = name.file_name() else {
@@ -1639,7 +1899,7 @@ fn directory_path(dir: &Path) -> BString {
 
 #[cfg(test)]
 mod plist_tests {
-    use super::{PlistExecutable, parse_xml_plist_executable};
+    use super::*;
 
     #[test]
     fn accepts_verified_utf8_top_level_key_and_ignores_nested_dicts() {
@@ -1755,5 +2015,413 @@ mod plist_tests {
                 PlistExecutable::Fallback
             );
         }
+    }
+
+    #[test]
+    fn dir_cache_reuses_stable_listings_and_invalidates_on_stamp_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rcmake_host::{HostError, HostResult, Metadata, PureHost};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TrackingHost {
+            inner: PureHost,
+            read_dir_calls: AtomicUsize,
+            stat_calls: AtomicUsize,
+            fresh_stat_calls: AtomicUsize,
+            drop_ctime: bool,
+            stale_metadata_override: Option<(PathBuf, Metadata)>,
+        }
+
+        impl Host for TrackingHost {
+            fn metadata(&self, path: &Path, follow: Follow) -> HostResult<Metadata> {
+                self.stat_calls.fetch_add(1, Ordering::Relaxed);
+                if let Some((stale_path, stale)) = &self.stale_metadata_override
+                    && path == stale_path
+                {
+                    return Ok(stale.clone());
+                }
+                let mut meta = self.inner.metadata(path, follow)?;
+                if self.drop_ctime {
+                    meta.ctime = None;
+                }
+                Ok(meta)
+            }
+            fn metadata_fresh(&self, path: &Path, follow: Follow) -> HostResult<Metadata> {
+                self.fresh_stat_calls.fetch_add(1, Ordering::Relaxed);
+                let mut meta = self.inner.metadata_fresh(path, follow)?;
+                if self.drop_ctime {
+                    meta.ctime = None;
+                }
+                Ok(meta)
+            }
+            fn read(&self, path: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
+                self.inner.read(path, range)
+            }
+            fn write(
+                &self,
+                path: &Path,
+                bytes: &[u8],
+                mode: rcmake_host::WriteMode,
+            ) -> HostResult<()> {
+                self.inner.write(path, bytes, mode)
+            }
+            fn read_dir(&self, path: &Path) -> HostResult<Vec<DirEntry>> {
+                self.read_dir_calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.read_dir(path)
+            }
+            fn read_dir_bounded(
+                &self,
+                path: &Path,
+                limit: usize,
+            ) -> HostResult<(Vec<DirEntry>, bool)> {
+                self.read_dir_calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.read_dir_bounded(path, limit)
+            }
+            fn create_dir_all(&self, path: &Path) -> HostResult<()> {
+                self.inner.create_dir_all(path)
+            }
+            fn remove_file(&self, path: &Path) -> HostResult<()> {
+                self.inner.remove_file(path)
+            }
+            fn remove_dir(&self, path: &Path) -> HostResult<()> {
+                self.inner.remove_dir(path)
+            }
+            fn remove_dir_all(&self, path: &Path) -> HostResult<()> {
+                self.inner.remove_dir_all(path)
+            }
+            fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
+                self.inner.rename(from, to)
+            }
+            fn copy_file(
+                &self,
+                from: &Path,
+                to: &Path,
+                options: rcmake_host::CopyOptions,
+            ) -> HostResult<()> {
+                self.inner.copy_file(from, to, options)
+            }
+            fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
+                self.inner.symlink(target, link)
+            }
+            fn hard_link(&self, source: &Path, destination: &Path) -> HostResult<()> {
+                self.inner.hard_link(source, destination)
+            }
+            fn read_link(&self, path: &Path) -> HostResult<PathBuf> {
+                self.inner.read_link(path)
+            }
+            fn canonicalize(&self, path: &Path) -> HostResult<PathBuf> {
+                self.inner.canonicalize(path)
+            }
+            fn set_permissions(&self, path: &Path, mode: u32) -> HostResult<()> {
+                self.inner.set_permissions(path, mode)
+            }
+            fn set_times(
+                &self,
+                path: &Path,
+                atime: Option<FileTime>,
+                mtime: Option<FileTime>,
+            ) -> HostResult<()> {
+                self.inner.set_times(path, atime, mtime)
+            }
+            fn env_get(&self, name: &[u8]) -> Option<BString> {
+                self.inner.env_get(name)
+            }
+            fn env_set(&self, name: &[u8], value: Option<&[u8]>) {
+                self.inner.env_set(name, value);
+            }
+            fn env_all(&self) -> Vec<(BString, BString)> {
+                self.inner.env_all()
+            }
+            fn run(
+                &self,
+                request: &RunRequest,
+                output: &mut dyn for<'a> FnMut(rcmake_host::Stream, &'a [u8]),
+            ) -> HostResult<rcmake_host::RunOutput> {
+                self.inner.run(request, output)
+            }
+            fn read_stdin(&self, limit: u64) -> HostResult<Vec<u8>> {
+                self.inner.read_stdin(limit)
+            }
+            fn write_out(&self, stream: rcmake_host::Stream, bytes: &[u8]) {
+                self.inner.write_out(stream, bytes);
+            }
+            fn is_terminal(&self, stream: rcmake_host::Stream) -> bool {
+                self.inner.is_terminal(stream)
+            }
+            fn now(&self) -> FileTime {
+                self.inner.now()
+            }
+            fn time_zone(&self) -> rcmake_host::TimeZone {
+                self.inner.time_zone()
+            }
+            fn monotonic(&self) -> Duration {
+                self.inner.monotonic()
+            }
+            fn sleep(&self, duration: Duration) {
+                self.inner.sleep(duration);
+            }
+            fn system(&self) -> rcmake_host::SystemInfo {
+                self.inner.system()
+            }
+            fn initial_cwd(&self) -> PathBuf {
+                self.inner.initial_cwd()
+            }
+            fn current_exe(&self) -> HostResult<PathBuf> {
+                self.inner.current_exe()
+            }
+            fn directory_times_track_names(&self) -> bool {
+                true
+            }
+            fn read_chunks(&self, path: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
+                let bytes = self.read(path, ReadRange::All { limit: 1 << 20 })?;
+                consume(&bytes);
+                Ok(())
+            }
+            fn lock_file(
+                &self,
+                _path: &Path,
+                _timeout: Option<Duration>,
+            ) -> HostResult<Box<dyn rcmake_host::FileLockGuard>> {
+                Err(HostError::unsupported("locks unsupported in test"))
+            }
+        }
+
+        let (work_str, cmake_root_str, bin_str) = if cfg!(windows) {
+            ("C:/work", "C:/cmake", "C:/opt/tools/bin")
+        } else {
+            ("/work", "/cmake", "/opt/tools/bin")
+        };
+        let work = path::to_native(work_str.as_bytes());
+        let cmake_root = path::to_native(cmake_root_str.as_bytes());
+        let bin = path::to_native(bin_str.as_bytes());
+        let inner = PureHost::new(work.clone(), work.join("cmake"));
+        inner.create_dir_all(&bin)?;
+        inner.seed_file(&bin.join("tool_a"), b"#!/bin/sh\n")?;
+        inner.set_permissions(&bin.join("tool_a"), 0o755)?;
+        // Advance clock past FIND_DIR_CACHE_MIN_AGE_SECS so the directory is stable.
+        inner.sleep(Duration::from_secs(5));
+
+        let host = Arc::new(TrackingHost {
+            inner,
+            read_dir_calls: AtomicUsize::new(0),
+            stat_calls: AtomicUsize::new(0),
+            fresh_stat_calls: AtomicUsize::new(0),
+            drop_ctime: false,
+            stale_metadata_override: None,
+        });
+        let config = rcmake_eval::InterpConfig::new(
+            host.clone(),
+            RunMode::Script,
+            cmake_root.clone(),
+            work.join("cmake"),
+            work.clone(),
+        );
+        let mut interp = rcmake_eval::Interp::new(config, crate::register_all);
+        let script = format!(
+            "find_program(P1 tool_a PATHS {bin_str} NO_DEFAULT_PATH)\n\
+             find_program(P2 missing_x PATHS {bin_str} NO_DEFAULT_PATH)\n\
+             find_program(P3 missing_y PATHS {bin_str} NO_DEFAULT_PATH)\n"
+        );
+        host.inner
+            .seed_file(&work.join("test.cmake"), script.as_bytes())?;
+        let outcome = interp.run_script(&work.join("test.cmake"));
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            interp.cx().var_or_empty(b"P1"),
+            format!("{bin_str}/tool_a").as_bytes()
+        );
+        assert_eq!(interp.cx().var_or_empty(b"P2"), "P2-NOTFOUND");
+        assert_eq!(interp.cx().var_or_empty(b"P3"), "P3-NOTFOUND");
+        assert_eq!(
+            host.read_dir_calls.load(Ordering::Relaxed),
+            1,
+            "stable directory should be listed once and reused across find_program calls"
+        );
+        assert!(
+            host.fresh_stat_calls.load(Ordering::Relaxed) >= 3,
+            "read_cached_dir must validate directory stamps through metadata_fresh"
+        );
+
+        // Backdating mtime while ctime is fresh must NOT reuse or cache the listing.
+        let old_mtime = FileTime {
+            secs: host.inner.now().secs.saturating_sub(100),
+            nanos: 0,
+        };
+        host.inner.seed_file(&bin.join("tool_b"), b"#!/bin/sh\n")?;
+        host.inner.set_permissions(&bin.join("tool_b"), 0o755)?;
+        host.inner.set_times(&bin, None, Some(old_mtime))?;
+        host.inner.seed_file(
+            &work.join("test2.cmake"),
+            format!(
+                "find_program(P4 tool_b PATHS {bin_str} NO_DEFAULT_PATH)\n\
+                 find_program(P5 missing_z PATHS {bin_str} NO_DEFAULT_PATH)\n"
+            )
+            .as_bytes(),
+        )?;
+        let outcome2 = interp.run_script(&work.join("test2.cmake"));
+        assert_eq!(outcome2.exit_code, 0);
+        assert_eq!(
+            interp.cx().var_or_empty(b"P4"),
+            format!("{bin_str}/tool_b").as_bytes()
+        );
+        assert!(
+            host.read_dir_calls.load(Ordering::Relaxed) >= 3,
+            "fresh ctime must invalidate and refuse caching even when mtime is backdated"
+        );
+
+        // On a non-Windows host whose metadata lacks ctime (e.g. an overlay host), never cache.
+        let no_ctime_inner = PureHost::new(work.clone(), work.join("cmake"));
+        no_ctime_inner.create_dir_all(&bin)?;
+        no_ctime_inner.seed_file(&bin.join("tool_a"), b"#!/bin/sh\n")?;
+        no_ctime_inner.set_permissions(&bin.join("tool_a"), 0o755)?;
+        no_ctime_inner.sleep(Duration::from_secs(5));
+        let no_ctime_host = Arc::new(TrackingHost {
+            inner: no_ctime_inner,
+            read_dir_calls: AtomicUsize::new(0),
+            stat_calls: AtomicUsize::new(0),
+            fresh_stat_calls: AtomicUsize::new(0),
+            drop_ctime: true,
+            stale_metadata_override: None,
+        });
+        let no_ctime_config = rcmake_eval::InterpConfig::new(
+            no_ctime_host.clone(),
+            RunMode::Script,
+            cmake_root.clone(),
+            work.join("cmake"),
+            work.clone(),
+        );
+        let mut no_ctime_interp = rcmake_eval::Interp::new(no_ctime_config, crate::register_all);
+        no_ctime_host
+            .inner
+            .seed_file(&work.join("no_ctime.cmake"), script.as_bytes())?;
+        let no_ctime_outcome = no_ctime_interp.run_script(&work.join("no_ctime.cmake"));
+        assert_eq!(no_ctime_outcome.exit_code, 0);
+        assert_eq!(
+            no_ctime_host.read_dir_calls.load(Ordering::Relaxed),
+            3,
+            "non-Windows host without ctime must never cache directory listings"
+        );
+
+        // A stale metadata() cache must not mask a directory change seen by metadata_fresh().
+        let stale_inner = PureHost::new(work.clone(), work.join("cmake"));
+        stale_inner.create_dir_all(&bin)?;
+        stale_inner.seed_file(&bin.join("tool_a"), b"#!/bin/sh\n")?;
+        stale_inner.set_permissions(&bin.join("tool_a"), 0o755)?;
+        stale_inner.sleep(Duration::from_secs(5));
+        let stale_meta = stale_inner.metadata(&bin, Follow::Yes)?;
+        let stale_host = Arc::new(TrackingHost {
+            inner: stale_inner,
+            read_dir_calls: AtomicUsize::new(0),
+            stat_calls: AtomicUsize::new(0),
+            fresh_stat_calls: AtomicUsize::new(0),
+            drop_ctime: false,
+            stale_metadata_override: Some((bin.clone(), stale_meta)),
+        });
+        let stale_config = rcmake_eval::InterpConfig::new(
+            stale_host.clone(),
+            RunMode::Script,
+            cmake_root,
+            work.join("cmake"),
+            work.clone(),
+        );
+        let mut stale_interp = rcmake_eval::Interp::new(stale_config, crate::register_all);
+        stale_host.inner.seed_file(
+            &work.join("stale1.cmake"),
+            format!("find_program(S1 missing_b PATHS {bin_str} NO_DEFAULT_PATH)\n").as_bytes(),
+        )?;
+        assert_eq!(
+            stale_interp
+                .run_script(&work.join("stale1.cmake"))
+                .exit_code,
+            0
+        );
+        assert_eq!(stale_interp.cx().var_or_empty(b"S1"), "S1-NOTFOUND");
+        stale_host.inner.sleep(Duration::from_secs(5));
+        stale_host
+            .inner
+            .seed_file(&bin.join("tool_b"), b"#!/bin/sh\n")?;
+        stale_host
+            .inner
+            .set_permissions(&bin.join("tool_b"), 0o755)?;
+        stale_host
+            .inner
+            .set_times(&bin, None, Some(stale_host.inner.now()))?;
+        stale_host.inner.seed_file(
+            &work.join("stale2.cmake"),
+            format!("find_program(S2 tool_b PATHS {bin_str} NO_DEFAULT_PATH)\n").as_bytes(),
+        )?;
+        assert_eq!(
+            stale_interp
+                .run_script(&work.join("stale2.cmake"))
+                .exit_code,
+            0
+        );
+        assert!(
+            stale_host.read_dir_calls.load(Ordering::Relaxed) >= 2,
+            "metadata_fresh must detect directory mutation even if metadata() is stale"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dir_cache_enforces_retained_byte_budget() {
+        let mut cache = FindDirCache::default();
+        let stamp = DirStamp {
+            mtime: FileTime { secs: 10, nanos: 0 },
+            ctime: Some(FileTime { secs: 10, nanos: 0 }),
+            dev: 1,
+            ino: 1,
+        };
+        let make_dir = |count: usize| {
+            let mut names = HashSet::with_capacity(count);
+            let mut names_bytes = 0usize;
+            for idx in 0..count {
+                let boxed = format!("entry_{idx:06}").into_bytes().into_boxed_slice();
+                names_bytes = names_bytes.saturating_add(boxed.len());
+                names.insert(boxed);
+            }
+            names_bytes = names_bytes.saturating_add(
+                names
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Box<[u8]>>().saturating_add(16)),
+            );
+            Arc::new(SearchDirectory::Listed {
+                names: Some(names),
+                frameworks: Vec::new(),
+                has_framework: false,
+                has_app_bundle: false,
+                frameworks_complete: true,
+                names_bytes,
+            })
+        };
+        let small = make_dir(4);
+        let dir_a = PathBuf::from("/opt/a");
+        let dir_b = PathBuf::from("/opt/b");
+        let small_budget = 2048;
+        cache.insert_with_budget(dir_a.clone(), stamp, Arc::clone(&small), small_budget);
+        assert_eq!(cache.entries.len(), 1);
+        let after_a = cache.total_bytes;
+        assert!(after_a > 0 && after_a <= small_budget);
+
+        // An oversized directory is rejected without corrupting total_bytes.
+        let huge = make_dir(500);
+        cache.insert_with_budget(dir_b.clone(), stamp, Arc::clone(&huge), small_budget);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.total_bytes, after_a);
+
+        // Replacing an existing entry with an oversized listing evicts the stale entry.
+        cache.insert_with_budget(dir_a.clone(), stamp, huge, small_budget);
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.total_bytes, 0);
+
+        // Normal replace and remove keep total_bytes exact.
+        cache.insert_with_budget(dir_a.clone(), stamp, Arc::clone(&small), small_budget);
+        cache.insert_with_budget(dir_a.clone(), stamp, make_dir(8), small_budget);
+        assert_eq!(
+            cache.total_bytes,
+            cache.entries.get(&dir_a).map_or(0, |e| e.bytes)
+        );
+        cache.remove(&dir_a);
+        assert_eq!(cache.total_bytes, 0);
     }
 }

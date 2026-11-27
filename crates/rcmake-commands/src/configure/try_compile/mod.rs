@@ -31,6 +31,8 @@ pub(super) mod journal;
 mod log;
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub(super) mod plan;
+#[cfg(all(feature = "native", any(unix, windows)))]
+mod prelude;
 mod project;
 mod run;
 mod seed;
@@ -408,6 +410,21 @@ fn build_probe(
     let journaled = journal.is_some();
     #[cfg(not(all(feature = "native", any(unix, windows))))]
     let journaled = false;
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    let (prewarm, prelude) = {
+        let (defines, enabled_languages) = child.seed_inputs();
+        prelude::prepare(
+            cx,
+            defines,
+            enabled_languages,
+            probe_languages.as_deref().unwrap_or(&[]),
+            &dirs.source,
+            &dirs.binary,
+            source_signature,
+            save_cache,
+            journaled,
+        )
+    };
     let (result, recursion_exceeded) = child.run(
         parent,
         dirs,
@@ -417,6 +434,10 @@ fn build_probe(
             save_cache,
             source_signature,
             generator_facts,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            prewarm,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            prelude,
         },
         |child, capture| initialize_probe(cx, child, journaled, capture),
     );

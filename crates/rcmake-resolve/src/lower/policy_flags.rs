@@ -42,11 +42,16 @@ impl<'a> Flags<'a> {
                 .is_some_and(|value| truth::is_on(value))
     }
 
-    pub(super) fn compile(&self, ipo: bool, position_independent: Option<bool>) -> Vec<BString> {
+    pub(super) fn ipo_compile(&self, ipo: bool) -> Vec<BString> {
         let mut flags = Vec::new();
         if ipo {
             self.extend(&mut flags, b"COMPILE_OPTIONS_IPO");
         }
+        flags
+    }
+
+    pub(super) fn compile(&self, position_independent: Option<bool>) -> Vec<BString> {
+        let mut flags = Vec::new();
         let pic = position_independent
             .or_else(|| self.position_independent())
             .unwrap_or(matches!(
@@ -102,13 +107,6 @@ impl<'a> Flags<'a> {
             };
             if self.option(key).is_some() {
                 self.extend(flags, key);
-            } else if !enabled
-                && matches!(
-                    self.option(b"COMPILER_ID").map(|id| id.as_slice()),
-                    Some(b"Clang" | b"AppleClang")
-                )
-            {
-                flags.push("-fno-color-diagnostics".into());
             }
         }
     }
@@ -116,7 +114,6 @@ impl<'a> Flags<'a> {
     pub(super) fn link(&self, ipo: bool) -> Vec<BString> {
         let mut flags = Vec::new();
         if ipo {
-            self.extend(&mut flags, b"COMPILE_OPTIONS_IPO");
             self.extend(&mut flags, b"LINK_OPTIONS_IPO");
         }
         flags

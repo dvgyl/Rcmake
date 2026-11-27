@@ -1,8 +1,12 @@
 //! Runtime paths for link rules and installed executables and libraries.
 
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{
+    cell::RefCell,
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap, HashMap},
+};
 
-use rcmake_host::{Host, path};
+use rcmake_host::{Follow, Host, path};
 
 use indexmap::{IndexMap, IndexSet};
 use rcmake_base::{BString, list, path_lex::Lexical, shell::quote, truth};
@@ -210,12 +214,8 @@ impl RuntimePaths {
         languages: &IndexSet<BString>,
         (libraries, usage): (&RuntimeLibraries, &mut UsageResolver<'_>),
     ) -> Result<Self, ResolveError> {
-        let implicit = implicit_directories(
-            model,
-            target,
-            &step.language,
-            usage.source_paths().map(|paths| paths.host),
-        );
+        let host = usage.source_paths().map(|paths| paths.host);
+        let implicit = implicit_directories(model, target, &step.language, host);
         let mut paths = |installs, skip| {
             if on(model, target, b"CMAKE_SKIP_RPATH") || skip {
                 return Ok(IndexSet::new());
@@ -227,7 +227,7 @@ impl RuntimePaths {
             };
             let value = rpath_value(model, target, config, step, property, usage)?;
             Ok::<_, ResolveError>(rpath_entries(
-                model, target, step, darwin, libraries, installs, &value, &implicit,
+                model, target, step, darwin, libraries, installs, &value, &implicit, host,
             ))
         };
         let mut build = paths(false, property_on(model, target, b"SKIP_BUILD_RPATH"))?;
@@ -897,6 +897,7 @@ fn rpath_entries(
     installs: bool,
     value: &[u8],
     implicit: &ImplicitDirs<'_>,
+    host: Option<&dyn Host>,
 ) -> IndexSet<BString> {
     let mut paths: IndexSet<BString> = list::split(value, list::Empty::Drop).into_iter().collect();
     if !installs {
@@ -931,11 +932,19 @@ fn rpath_entries(
             }
             directory.into()
         };
-        paths.extend(libraries.user_dirs.iter().map(|dir| runtime_directory(dir)));
+        let mut raw_entries: IndexMap<BString, BString> =
+            paths.into_iter().map(|dir| (dir.clone(), dir)).collect();
+        for dir in &libraries.user_dirs {
+            raw_entries
+                .entry(dir.clone())
+                .or_insert_with(|| runtime_directory(dir));
+        }
+        let mut conflict_items: Vec<(BString, BString)> = Vec::new();
         for library in &libraries.files {
             let path = Lexical::new(&join(build, library)).normalize();
             let file = Lexical::new(&path);
-            if implicit.contains(&Lexical::new(file.parent()).normalize()) {
+            let parent_norm = Lexical::new(file.parent()).normalize();
+            if implicit.contains(&parent_norm) {
                 continue;
             }
             if darwin
@@ -944,12 +953,29 @@ fn rpath_entries(
             {
                 let directory =
                     crate::lower::install_rpath::translated_link_directory(model, target, parent);
-                paths.insert(directory.unwrap_or_else(|| parent.into()));
+                raw_entries
+                    .entry(parent.into())
+                    .or_insert_with(|| directory.unwrap_or_else(|| parent.into()));
             } else if shared_library(file.filename()) && (path.starts_with(b"/") || file.absolute())
             {
-                paths.insert(runtime_directory(file.parent()));
+                let raw_dir: BString = file.parent().into();
+                raw_entries
+                    .entry(raw_dir.clone())
+                    .or_insert_with(|| runtime_directory(file.parent()));
+                conflict_items.push((raw_dir, file.filename().into()));
             }
         }
+        if raw_entries.len() > 1
+            && !conflict_items.is_empty()
+            && let Some(host) = host
+        {
+            let order = order_runtime_directories(host, &raw_entries, &conflict_items);
+            return order
+                .into_iter()
+                .filter_map(|idx| raw_entries.get_index(idx).map(|(_, out)| out.clone()))
+                .collect();
+        }
+        return raw_entries.into_values().collect();
     } else if target_property(model, target, b"INSTALL_RPATH_USE_LINK_PATH")
         .is_some_and(|value| truth::is_on(value))
     {
@@ -976,4 +1002,125 @@ fn rpath_entries(
         ));
     }
     paths
+}
+
+/// Order build runtime search directories using CMake's `cmOrderDirectories`
+/// conflict rule: if a linked shared library `item_dir/filename` also exists in
+/// another candidate directory `other_dir`, then `item_dir` must precede
+/// `other_dir`. Unconstrained pairs retain their original relative order.
+fn order_runtime_directories(
+    host: &dyn Host,
+    dirs: &IndexMap<BString, BString>,
+    items: &[(BString, BString)],
+) -> Vec<usize> {
+    let n = dirs.len();
+    let mut adj: Vec<IndexSet<usize>> = vec![IndexSet::new(); n];
+    let mut in_degree = vec![0usize; n];
+    let mut exists_cache: HashMap<(usize, &[u8]), bool> = HashMap::new();
+    for (item_dir, filename) in items {
+        let Some(idx_a) = dirs.get_index_of(item_dir) else {
+            continue;
+        };
+        for (idx_b, (dir_b, _)) in dirs.iter().enumerate() {
+            if idx_b == idx_a || !Lexical::new(dir_b).absolute() {
+                continue;
+            }
+            let conflict = *exists_cache
+                .entry((idx_b, filename.as_slice()))
+                .or_insert_with(|| {
+                    let probe = join(dir_b, filename);
+                    host.metadata(&path::to_native(&probe), Follow::Yes).is_ok()
+                });
+            if conflict
+                && adj.get_mut(idx_a).is_some_and(|edges| edges.insert(idx_b))
+                && let Some(deg) = in_degree.get_mut(idx_b)
+            {
+                *deg += 1;
+            }
+        }
+    }
+    let mut ready: BinaryHeap<Reverse<usize>> = in_degree
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &deg)| (deg == 0).then_some(Reverse(i)))
+        .collect();
+    let mut visited = vec![false; n];
+    let mut result = Vec::with_capacity(n);
+    while result.len() < n {
+        let u = if let Some(Reverse(u)) = ready.pop() {
+            u
+        } else if let Some(u) = visited.iter().position(|&v| !v) {
+            u
+        } else {
+            break;
+        };
+        let Some(slot) = visited.get_mut(u) else {
+            break;
+        };
+        if *slot {
+            continue;
+        }
+        *slot = true;
+        result.push(u);
+        for &v in adj.get(u).into_iter().flatten() {
+            if visited.get(v) == Some(&false)
+                && let Some(deg) = in_degree.get_mut(v)
+            {
+                *deg = deg.saturating_sub(1);
+                if *deg == 0 {
+                    ready.push(Reverse(v));
+                }
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use rcmake_host::PureHost;
+
+    use super::*;
+
+    #[test]
+    fn order_runtime_directories_places_build_dir_before_conflicting_external_dir() {
+        let host = PureHost::default();
+        host.seed_file(Path::new("/opt/ros/lib/librclcpp.so"), b"")
+            .unwrap();
+        host.seed_file(Path::new("/opt/ros/lib/libbenchmark.so"), b"")
+            .unwrap();
+        host.seed_file(Path::new("/build/rclcpp/librclcpp.so"), b"")
+            .unwrap();
+
+        let mut dirs = IndexMap::new();
+        dirs.insert(BString::from("/opt/ros/lib"), BString::from("/opt/ros/lib"));
+        dirs.insert(
+            BString::from("/build/rclcpp"),
+            BString::from("/build/rclcpp"),
+        );
+        let items = vec![
+            (
+                BString::from("/opt/ros/lib"),
+                BString::from("libbenchmark.so"),
+            ),
+            (
+                BString::from("/build/rclcpp"),
+                BString::from("librclcpp.so"),
+            ),
+        ];
+        let order = order_runtime_directories(&host, &dirs, &items);
+        let ordered: Vec<_> = order
+            .into_iter()
+            .map(|idx| dirs.get_index(idx).unwrap().0.clone())
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                BString::from("/build/rclcpp"),
+                BString::from("/opt/ros/lib")
+            ]
+        );
+    }
 }

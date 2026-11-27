@@ -1860,3 +1860,609 @@ fn file_api_reports_cuda_hip_and_swift_toolchains_and_compile_groups()
     assert!(sw.contains("\"language\" : \"Swift\""), "{sw}");
     Ok(())
 }
+
+#[test]
+fn codemodel_order_dependencies_and_backtrace_graph_match_cmake_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_diag::{Backtrace, Frame, FrameKind};
+    use rcmake_model::{
+        BT, DirId, ImportedVisibility, LinkItem, ProjectModel, Target, TargetKind, TargetOrigin,
+        UsageField,
+    };
+
+    let host = PureHost::default();
+    let src = Path::new("/src");
+    let build = Path::new("/build");
+    host.seed_file(&src.join("main.cpp"), b"int main() { return 0; }\n")?;
+    host.seed_file(&src.join("late.cpp"), b"int late() { return 0; }\n")?;
+    host.seed_file(&src.join("obj.cpp"), b"int obj() { return 0; }\n")?;
+    let query_dir = build.join(".cmake/api/v1/query");
+    host.create_dir_all(&query_dir)?;
+    host.write(&query_dir.join("codemodel-v2"), b"", WriteMode::Truncate)?;
+
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/src".into(), "/build".into());
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let root = model.dir_mut(DirId::ROOT);
+    root.vars
+        .insert("CMAKE_SYSTEM_NAME".into(), "Darwin".into());
+    root.vars
+        .insert("CMAKE_CXX_COMPILER".into(), "/usr/bin/c++".into());
+    root.vars
+        .insert("CMAKE_CXX_COMPILER_ID".into(), "AppleClang".into());
+    root.vars
+        .insert("CMAKE_CXX_STANDARD_DEFAULT".into(), "14".into());
+    root.vars.insert(
+        "CMAKE_CXX17_EXTENSION_COMPILE_OPTION".into(),
+        "-std=gnu++17".into(),
+    );
+    root.vars
+        .insert("CMAKE_CXX_COMPILE_FEATURES".into(), "cxx_std_17".into());
+    root.vars
+        .insert("CMAKE_CXX_COMPILER_LOADED".into(), "1".into());
+    root.vars
+        .insert("CMAKE_OSX_ARCHITECTURES".into(), "arm64".into());
+
+    let sub_dir = model.add_directory(
+        DirId::ROOT,
+        "/src/sub".into(),
+        "/build/sub".into(),
+        Backtrace::default(),
+    )?;
+
+    let trace = |cmd: &str, line: u32| {
+        Backtrace::default().push(Frame {
+            file: b"/src/CMakeLists.txt".as_slice().into(),
+            line,
+            name: Some(cmd.as_bytes().into()),
+            kind: FrameKind::Command,
+        })
+    };
+
+    // Creation order across root & sub: root has [t_m, t_a, obj_z, app], sub has [sub_z, sub_a], plus imported imp_tool.
+    for (name, dir, kind) in [
+        ("t_m", DirId::ROOT, TargetKind::Utility),
+        ("sub_z", sub_dir, TargetKind::Utility),
+        ("sub_a", sub_dir, TargetKind::Utility),
+        ("t_a", DirId::ROOT, TargetKind::Utility),
+        ("obj_z", DirId::ROOT, TargetKind::ObjectLibrary),
+    ] {
+        let mut t = Target::new(
+            name.into(),
+            kind,
+            TargetOrigin::Normal,
+            dir,
+            trace("add_custom_target", 2),
+            Default::default(),
+        );
+        if kind == TargetKind::ObjectLibrary {
+            t.sources
+                .push(BT::new("/src/obj.cpp".into(), trace("add_library", 3)));
+        }
+        model.add_target(t)?;
+    }
+    let mut imp = Target::new(
+        "imp_tool".into(),
+        TargetKind::UnknownLibrary,
+        TargetOrigin::Imported(ImportedVisibility::Global),
+        DirId::ROOT,
+        trace("add_library", 4),
+        Default::default(),
+    );
+    imp.props
+        .set("IMPORTED_LOCATION".into(), "/usr/lib/libz.tbd".into());
+    model.add_target(imp)?;
+
+    let mut app = Target::new(
+        "app".into(),
+        TargetKind::Executable,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        trace("add_executable", 10),
+        Default::default(),
+    );
+    app.sources
+        .push(BT::new("/src/main.cpp".into(), trace("add_executable", 10)));
+    app.sources.push(BT::new(
+        "$<TARGET_OBJECTS:obj_z>".into(),
+        trace("target_sources", 11),
+    ));
+    app.sources
+        .push(BT::new("/src/late.cpp".into(), trace("target_sources", 20)));
+    app.usage.push(
+        UsageField::CompileOptions,
+        BT::new("-Wall".into(), trace("target_compile_options", 12)),
+    );
+    app.usage.push(
+        UsageField::CompileDefinitions,
+        BT::new("MY_DEF=1".into(), trace("target_compile_definitions", 13)),
+    );
+    app.usage.push(
+        UsageField::IncludeDirectories,
+        BT::new("/src/inc".into(), trace("target_include_directories", 14)),
+    );
+    app.usage.push(
+        UsageField::PrecompileHeaders,
+        BT::new("<vector>".into(), trace("target_precompile_headers", 15)),
+    );
+    app.usage.push(
+        UsageField::CompileFeatures,
+        BT::new("cxx_std_17".into(), trace("target_compile_features", 16)),
+    );
+    app.usage.link_libraries = Some(vec![LinkItem {
+        text: BT::new(
+            "/SDK/System/Library/Frameworks/ApplicationServices.framework".into(),
+            trace("target_link_libraries", 17),
+        ),
+        lookup_dir: DirId::ROOT,
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
+        scope: None,
+    }]);
+    for dep in ["sub_a", "t_a", "t_m", "sub_z", "imp_tool"] {
+        app.utility_deps
+            .push(BT::new(dep.into(), trace("add_dependencies", 18)));
+    }
+    model.add_target(app)?;
+
+    let result = rcmake_resolve::resolve(&model, &host, &[rcmake_genex::ConfigId::default()])?;
+    super::write_replies(&model, &result, &host, build)?;
+
+    let reply_dir = build.join(".cmake/api/v1/reply");
+    let entries = host.read_dir(&reply_dir)?;
+    let app_file = entries
+        .iter()
+        .find(|e| e.name.starts_with(b"target-app-"))
+        .ok_or("missing target-app reply")?;
+    let bytes = host.read(
+        &reply_dir.join(String::from_utf8_lossy(&app_file.name).as_ref()),
+        ReadRange::All { limit: 200_000 },
+    )?;
+    let parsed = rcmake_json::parse(&bytes, &Default::default())?;
+    let Value::Object(obj) = parsed else {
+        return Err("expected target object".into());
+    };
+
+    // 1. orderDependencies must follow CollectTargets (root creation order, then sub, then imported), NOT alphabetical.
+    let Some(Value::Array(ord_deps)) = obj.get(b"orderDependencies".as_slice()) else {
+        return Err("missing orderDependencies".into());
+    };
+    let ord_names: Vec<String> = ord_deps
+        .iter()
+        .filter_map(|item| match item {
+            Value::Object(m) => match m.get(b"id".as_slice())? {
+                Value::String(id) => {
+                    Some(String::from_utf8_lossy(id).split_once("::@").map_or_else(
+                        || String::from_utf8_lossy(id).into_owned(),
+                        |(n, _)| n.to_owned(),
+                    ))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ord_names,
+        vec!["t_m", "t_a", "obj_z", "sub_z", "sub_a", "imp_tool"]
+    );
+
+    // 2. backtraceGraph nodes must visit compileGroups (options -> defines -> includes -> pch -> standard)
+    // BEFORE late source entries (line 20).
+    let Some(Value::Object(bt_graph)) = obj.get(b"backtraceGraph".as_slice()) else {
+        return Err("missing backtraceGraph".into());
+    };
+    let Some(Value::Array(nodes)) = bt_graph.get(b"nodes".as_slice()) else {
+        return Err("missing nodes".into());
+    };
+    let lines: Vec<u64> = nodes
+        .iter()
+        .filter_map(|n| match n {
+            Value::Object(m) => match m.get(b"line".as_slice())? {
+                Value::Int(v) => u64::try_from(*v).ok(),
+                Value::UInt(v) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let pos = |line: u64| {
+        lines
+            .iter()
+            .position(|&l| l == line)
+            .ok_or_else(|| format!("missing line {line} in {lines:?}"))
+    };
+    assert!(
+        pos(12)? < pos(13)?,
+        "compile_options before defines: {lines:?}"
+    );
+    assert!(pos(13)? < pos(14)?, "defines before includes: {lines:?}");
+    assert!(pos(14)? < pos(15)?, "includes before pch: {lines:?}");
+    assert!(
+        pos(15)? < pos(16)?,
+        "pch before languageStandard: {lines:?}"
+    );
+    assert!(
+        pos(16)? < pos(20)?,
+        "compileGroups before late target_sources: {lines:?}"
+    );
+
+    // 3. Direct raw macOS .framework appears in compileGroups.frameworks.
+    let Some(Value::Array(groups)) = obj.get(b"compileGroups".as_slice()) else {
+        return Err("missing compileGroups".into());
+    };
+    let Value::Object(group) = &groups[0] else {
+        return Err("expected compileGroup object".into());
+    };
+    let Some(Value::Array(fws)) = group.get(b"frameworks".as_slice()) else {
+        return Err("missing frameworks in compileGroup".into());
+    };
+    assert!(
+        fws.iter().any(|fw| matches!(
+            fw,
+            Value::Object(m) if m.get(b"path".as_slice())
+                == Some(&Value::string("/SDK/System/Library/Frameworks/ApplicationServices.framework"))
+        )),
+        "expected ApplicationServices.framework in compileGroups.frameworks: {fws:?}"
+    );
+    Ok(())
+}
+
+/// Read the reply whose file name starts with `prefix`.
+fn reply_object(
+    host: &PureHost,
+    build: &Path,
+    prefix: &str,
+) -> Result<Members, Box<dyn std::error::Error>> {
+    let reply_dir = build.join(".cmake/api/v1/reply");
+    let entries = host.read_dir(&reply_dir)?;
+    let file = entries
+        .iter()
+        .find(|entry| entry.name.starts_with(prefix.as_bytes()))
+        .ok_or_else(|| format!("missing {prefix} reply"))?;
+    let bytes = host.read(
+        &reply_dir.join(String::from_utf8_lossy(&file.name).as_ref()),
+        ReadRange::All { limit: 1_000_000 },
+    )?;
+    match rcmake_json::parse(&bytes, &Default::default())? {
+        Value::Object(object) => Ok(object),
+        _ => Err(format!("{prefix} reply is not an object").into()),
+    }
+}
+
+fn member<'a>(object: &'a Members, key: &str) -> Option<&'a Value> {
+    object.get(key.as_bytes())
+}
+
+fn array_of<'a>(object: &'a Members, key: &str) -> &'a [Value] {
+    match member(object, key) {
+        Some(Value::Array(items)) => items,
+        _ => &[],
+    }
+}
+
+fn uint_of(value: Option<&Value>) -> Option<u64> {
+    match value? {
+        Value::UInt(value) => Some(*value),
+        Value::Int(value) => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+/// Return the `line` of each `backtraceGraph` node (`0` for a file-only node).
+fn graph_lines(object: &Members) -> Vec<u64> {
+    let Some(Value::Object(graph)) = member(object, "backtraceGraph") else {
+        return Vec::new();
+    };
+    array_of(graph, "nodes")
+        .iter()
+        .map(|node| match node {
+            Value::Object(node) => uint_of(member(node, "line")).unwrap_or(0),
+            _ => u64::MAX,
+        })
+        .collect()
+}
+
+/// Return the `backtrace` index of each entry of `key`.
+fn entry_backtraces(object: &Members, key: &str) -> Vec<Option<u64>> {
+    array_of(object, key)
+        .iter()
+        .map(|item| match item {
+            Value::Object(item) => uint_of(member(item, "backtrace")),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn codemodel_backtrace_graph_uses_call_identity_and_cmake_registration_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_diag::{Backtrace, Frame, FrameKind};
+    use rcmake_model::{
+        BT, DirId, InstallKind, InstallOptions, InstallRule, LinkItem, ProjectModel, Target,
+        TargetKind, TargetOrigin, UsageField, UsageScope,
+    };
+
+    let host = PureHost::default();
+    let src = Path::new("/src");
+    let build = Path::new("/build");
+    for file in ["obj.c", "y.c", "s.c"] {
+        host.seed_file(&src.join(file), b"int f(void) { return 0; }\n")?;
+    }
+    let query_dir = build.join(".cmake/api/v1/query");
+    host.create_dir_all(&query_dir)?;
+    host.write(&query_dir.join("codemodel-v2"), b"", WriteMode::Truncate)?;
+
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/src".into(), "/build".into());
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let root = model.dir_mut(DirId::ROOT);
+    root.vars.insert("CMAKE_C_COMPILER".into(), "cc".into());
+    root.vars
+        .insert("CMAKE_C_COMPILER_LOADED".into(), "1".into());
+    // One call of `set_source_files_properties` at line 14.
+    root.source_props
+        .entry("/src/s.c".into())
+        .or_default()
+        .set_tracked(
+            "COMPILE_DEFINITIONS".into(),
+            "SRC_DEF".into(),
+            Backtrace::default().push(Frame {
+                file: b"/src/CMakeLists.txt".as_slice().into(),
+                line: 14,
+                name: Some(b"set_source_files_properties".as_slice().into()),
+                kind: FrameKind::Command,
+            }),
+        );
+
+    // Each call creates a new call instance, also for an equal file, line, and command.
+    let call = |command: &str, line: u32| {
+        Backtrace::default().push(Frame {
+            file: b"/src/CMakeLists.txt".as_slice().into(),
+            line,
+            name: Some(command.as_bytes().into()),
+            kind: FrameKind::Command,
+        })
+    };
+    let target = |name: &str, kind, line, sources: &[&str]| {
+        let trace = call("add_library", line);
+        let mut target = Target::new(
+            name.into(),
+            kind,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            trace.clone(),
+            Default::default(),
+        );
+        for source in sources {
+            target
+                .sources
+                .push(BT::new((*source).into(), trace.clone()));
+        }
+        target
+    };
+    // Creation order: u0, obj, y, s, so.
+    model.add_target(target("u0", TargetKind::Utility, 2, &[]))?;
+    model.add_target(target("obj", TargetKind::ObjectLibrary, 3, &["/src/obj.c"]))?;
+    model.add_target(target("y", TargetKind::StaticLibrary, 4, &["/src/y.c"]))?;
+
+    let mut s = target("s", TargetKind::StaticLibrary, 10, &["/src/s.c"]);
+    let link = |text: &str, trace: &Backtrace| LinkItem {
+        text: BT::new(text.into(), trace.clone()),
+        lookup_dir: DirId::ROOT,
+        opens_lookup_scope: false,
+        closes_lookup_scope: false,
+        scope: Some(UsageScope::Private),
+    };
+    let shared_call = call("target_link_libraries", 20);
+    s.usage.link_libraries = Some(vec![
+        link("y", &call("target_link_libraries", 13)),
+        // One call with two items: one node.
+        link("m", &shared_call),
+        link("dl", &shared_call),
+        // Two iterations of one `foreach()` body line: two nodes.
+        link("p1", &call("target_link_libraries", 21)),
+        link("p2", &call("target_link_libraries", 21)),
+    ]);
+    s.utility_deps
+        .push(BT::new("u0".into(), call("add_dependencies", 15)));
+    s.usage.push(
+        UsageField::CompileDefinitions,
+        BT::new("B_DEF".into(), call("target_compile_definitions", 17)),
+    );
+    // `add_definitions()` sets the directory definitions.
+    model.dir_mut(DirId::ROOT).usage.push(
+        UsageField::CompileDefinitions,
+        BT::new("A_DEF".into(), call("add_definitions", 16)),
+    );
+    model.add_target(s)?;
+
+    // A shared library that only links the objects of `obj`.
+    let mut so = target(
+        "so",
+        TargetKind::SharedLibrary,
+        30,
+        &["$<TARGET_OBJECTS:obj>"],
+    );
+    so.usage.push(
+        UsageField::IncludeDirectories,
+        BT::new("/src/inc".into(), call("target_include_directories", 31)),
+    );
+    model.add_target(so)?;
+
+    // Three iterations of one `foreach()` body line `install(FILES ...)`.
+    for _ in 0..3 {
+        let trace = call("install", 5);
+        model.installs.push(InstallRule {
+            dir: DirId::ROOT,
+            kind: InstallKind::Files(vec![BT::new("/src/s.c".into(), trace.clone())]),
+            options: InstallOptions {
+                destination: Some("share".into()),
+                ..InstallOptions::default()
+            },
+            backtrace: trace,
+        });
+    }
+
+    let result = rcmake_resolve::resolve(&model, &host, &[rcmake_genex::ConfigId::default()])?;
+    super::write_replies(&model, &result, &host, build)?;
+
+    // Rule 1: one node per call instance, all with one file-only root node.
+    let directory = reply_object(&host, build, "directory-.-")?;
+    assert_eq!(graph_lines(&directory), vec![0, 5, 5, 5]);
+    assert_eq!(
+        entry_backtraces(&directory, "installers"),
+        vec![Some(1), Some(2), Some(3)]
+    );
+
+    // Rule 2: `dependencies` (creation order: u0 at line 15, then y at line 13),
+    // then the link fields, then the target compile data (sorted definitions:
+    // A_DEF at line 16, B_DEF at line 17), then the source (line 10) and its
+    // source-level definition (line 14).
+    let s = reply_object(&host, build, "target-s-")?;
+    assert_eq!(
+        graph_lines(&s),
+        vec![0, 10, 15, 13, 20, 21, 21, 16, 17, 14],
+        "backtraceGraph node lines of s"
+    );
+    assert_eq!(
+        entry_backtraces(&s, "linkLibraries"),
+        vec![Some(3), Some(4), Some(4), Some(5), Some(6)]
+    );
+
+    // Rule 3: CMake computes the compile data of the object library language,
+    // so the include directory of `so` is in its graph without a compile group.
+    let so = reply_object(&host, build, "target-so-")?;
+    assert!(array_of(&so, "compileGroups").is_empty());
+    assert!(
+        graph_lines(&so).contains(&31),
+        "target_include_directories node of so: {:?}",
+        graph_lines(&so)
+    );
+    Ok(())
+}
+
+#[test]
+fn codemodel_traced_rule_sources_follow_sorted_custom_command_depends()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_diag::{Backtrace, PolicyMap};
+    use rcmake_model::{
+        BT, CustomCommand, CustomCommandKind, DirId, ProjectModel, Target, TargetKind, TargetOrigin,
+    };
+
+    let host = PureHost::default();
+    let build = Path::new("/build");
+    let query_dir = build.join(".cmake/api/v1/query");
+    host.create_dir_all(&query_dir)?;
+    host.write(&query_dir.join("codemodel-v2"), b"", WriteMode::Truncate)?;
+
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/src".into(), "/build".into());
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let ep_target = model.add_target(Target::new(
+        "ep".into(),
+        TargetKind::Utility,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Backtrace::default(),
+        PolicyMap::default(),
+    ))?;
+    let gen_target = model.add_target(Target::new(
+        "gen".into(),
+        TargetKind::Utility,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Backtrace::default(),
+        PolicyMap::default(),
+    ))?;
+    let path = |name: &str| {
+        BT::new(
+            BString::from(format!("/build/{name}")),
+            Backtrace::default(),
+        )
+    };
+    let mut command = |outputs: &[&str], depends: &[&str], kind| {
+        let mut command = CustomCommand::new(
+            DirId::ROOT,
+            kind,
+            Backtrace::default(),
+            PolicyMap::default(),
+        );
+        command.outputs = outputs.iter().map(|name| path(name)).collect();
+        command.depends = depends.iter().map(|name| path(name)).collect();
+        command
+            .command_lines
+            .push(vec!["echo".into(), "step".into()]);
+        model.add_command(command)
+    };
+    // `ExternalProject_Add` declares the step dependencies of the complete
+    // step in step order, not in path order.
+    command(
+        &["CMakeFiles/ep"],
+        &["CMakeFiles/ep-complete"],
+        CustomCommandKind::Utility(ep_target),
+    )?;
+    command(
+        &["CMakeFiles/ep-complete"],
+        &["stamp/ep-install", "stamp/ep-mkdir", "stamp/ep-build"],
+        CustomCommandKind::Output,
+    )?;
+    command(&["stamp/ep-mkdir"], &[], CustomCommandKind::Output)?;
+    command(
+        &["stamp/ep-build"],
+        &["stamp/ep-mkdir"],
+        CustomCommandKind::Output,
+    )?;
+    command(
+        &["stamp/ep-install"],
+        &["stamp/ep-build"],
+        CustomCommandKind::Output,
+    )?;
+
+    // `add_custom_target(gen DEPENDS z.out a.out)`.
+    command(
+        &["CMakeFiles/gen"],
+        &["z.out", "a.out"],
+        CustomCommandKind::Utility(gen_target),
+    )?;
+    command(&["z.out"], &[], CustomCommandKind::Output)?;
+    command(&["a.out"], &[], CustomCommandKind::Output)?;
+
+    let result = rcmake_resolve::resolve(&model, &host, &[rcmake_genex::ConfigId::default()])?;
+    super::write_replies(&model, &result, &host, build)?;
+
+    let source_paths = |prefix: &str| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        Ok(array_of(&reply_object(&host, build, prefix)?, "sources")
+            .iter()
+            .filter_map(|source| match source {
+                Value::Object(source) => match member(source, "path")? {
+                    Value::String(path) => Some(String::from_utf8_lossy(path).into_owned()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect())
+    };
+    assert_eq!(
+        source_paths("target-gen-")?,
+        vec![
+            "/build/CMakeFiles/gen",
+            "/build/CMakeFiles/gen.rule",
+            "/build/a.out.rule",
+            "/build/z.out.rule",
+        ]
+    );
+    let paths = source_paths("target-ep-")?;
+    assert_eq!(
+        paths,
+        vec![
+            "/build/CMakeFiles/ep",
+            "/build/CMakeFiles/ep.rule",
+            "/build/CMakeFiles/ep-complete.rule",
+            "/build/stamp/ep-build.rule",
+            "/build/stamp/ep-install.rule",
+            "/build/stamp/ep-mkdir.rule",
+        ]
+    );
+    Ok(())
+}

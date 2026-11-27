@@ -111,6 +111,10 @@ impl ChildConfig {
             save_cache,
             source_signature,
             generator_facts,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            prewarm,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            prelude,
         } = build;
         let mut recursion_exceeded = false;
         let mut failure = None;
@@ -129,41 +133,71 @@ impl ChildConfig {
             let mut config = self.config;
             config.cwd = dirs.binary.clone();
             config.host = host.clone();
-            let mut child = Interp::with_registry(config, child_registry());
-            initialize(&mut child, &host);
-            if let Some(cache) = self.parse_cache {
-                child.set_parse_cache(cache);
-            }
-            if let Some(profile) = &profile {
-                child.add_session_data(profile.clone());
-            }
-            child.set_project_injection(!source_signature);
-            child.inherit_recursion_depth(self.depth);
-            if let Some(mut trace) = self.trace {
-                let redirect = trace.redirect.replace(PathBuf::new());
-                child.set_trace_config(Some(trace));
-                let _ = host.trace_output.set(redirect);
-            }
-            let mut context = child.cx();
-            let model = context.project();
-            model.generator = self.generator;
-            model.generator_spec = self.generator_spec;
-            model.global.props.set("IN_TRY_COMPILE".into(), "1".into());
-            if !self.enabled_languages.is_empty() {
-                model
-                    .global
-                    .props
-                    .set("ENABLED_LANGUAGES".into(), self.enabled_languages);
-            }
-            for (imported, aliases) in imports {
-                let id = model
-                    .add_target(imported)
-                    .map_err(|error| ChildError::Build(error.to_string()))?;
-                for alias in aliases {
-                    model
-                        .add_alias(DirId::ROOT, alias, id)
-                        .map_err(|error| ChildError::Build(error.to_string()))?;
+            let build_interp = || {
+                let mut child = Interp::with_registry(config, child_registry());
+                initialize(&mut child, &host);
+                if let Some(cache) = self.parse_cache {
+                    child.set_parse_cache(cache);
                 }
+                if let Some(profile) = &profile {
+                    child.add_session_data(profile.clone());
+                }
+                child.set_project_injection(!source_signature);
+                child.inherit_recursion_depth(self.depth);
+                if let Some(mut trace) = self.trace {
+                    let redirect = trace.redirect.replace(PathBuf::new());
+                    child.set_trace_config(Some(trace));
+                    let _ = host.trace_output.set(redirect);
+                }
+                child
+            };
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            let (ninja_verified, mut child) = if let Some(prewarm) = prewarm {
+                let (verified, child) =
+                    crate::configure::concurrent::join(|| prewarm.run(&dirs.binary), build_interp);
+                (verified.unwrap_or(false), child)
+            } else {
+                let verified = !matches!(
+                    self.generator,
+                    Some(GeneratorKind::Ninja | GeneratorKind::NinjaMultiConfig)
+                );
+                (verified, build_interp())
+            };
+            #[cfg(not(all(feature = "native", any(unix, windows))))]
+            let mut child = build_interp();
+            {
+                let mut context = child.cx();
+                let model = context.project();
+                model.generator = self.generator;
+                model.generator_spec = self.generator_spec;
+                model.global.props.set("IN_TRY_COMPILE".into(), "1".into());
+                if !self.enabled_languages.is_empty() {
+                    model
+                        .global
+                        .props
+                        .set("ENABLED_LANGUAGES".into(), self.enabled_languages);
+                }
+                for (imported, aliases) in imports {
+                    let id = model
+                        .add_target(imported)
+                        .map_err(|error| ChildError::Build(error.to_string()))?;
+                    for alias in aliases {
+                        model
+                            .add_alias(DirId::ROOT, alias, id)
+                            .map_err(|error| ChildError::Build(error.to_string()))?;
+                    }
+                }
+                #[cfg(all(feature = "native", any(unix, windows)))]
+                if let super::prelude::PreludePlan::Hit(snapshot) = &prelude
+                    && ninja_verified
+                {
+                    snapshot.apply(&mut context);
+                }
+            }
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            if let super::prelude::PreludePlan::Capture(capture) = prelude {
+                capture.attach_host(Arc::clone(&host));
+                child.add_session_data(capture);
             }
             let configure = child.run_configure(&dirs.source, &dirs.binary, &[]);
             max_start_depth = child.max_inherited_recursion_depth();
@@ -247,10 +281,14 @@ impl ChildConfig {
 }
 
 pub(crate) fn finish_probe_prelude(cx: &Cx<'_>) {
-    if cx.current_dir_id() == DirId::ROOT
-        && let Some(profile) = cx.session_data::<Arc<ProbeProfile>>()
-    {
-        profile.prelude_end.get_or_init(|| profile.now());
+    if cx.current_dir_id() == DirId::ROOT {
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if let Some(capture) = cx.session_data::<Arc<super::prelude::PreludeCapture>>() {
+            capture.finish(cx);
+        }
+        if let Some(profile) = cx.session_data::<Arc<ProbeProfile>>() {
+            profile.prelude_end.get_or_init(|| profile.now());
+        }
     }
 }
 
@@ -289,4 +327,8 @@ pub(super) struct ChildBuild<'a> {
     pub(super) save_cache: bool,
     pub(super) source_signature: bool,
     pub(super) generator_facts: Option<Arc<dyn rcmake_resolve::GeneratorFacts>>,
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    pub(super) prewarm: Option<super::prelude::PrewarmContext>,
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    pub(super) prelude: super::prelude::PreludePlan,
 }

@@ -57,7 +57,14 @@ impl Rows<'_, '_, '_> {
             return Ok(None);
         };
         let mut usage = UsageResolver::new(self.api.model);
-        let bases = file_sets::set_files(self.api.model, &mut usage, raw, set, &self.config)?;
+        let by_subdir = rcmake_resolve::file_sets::set_files_by_subdir(
+            self.api.model,
+            &mut usage,
+            raw,
+            set,
+            &self.config,
+        )
+        .map_err(|error| GenError::Invalid(error.to_string().into()))?;
         let source_dir = &self.api.model.dir(raw.dir).source_dir;
         let context = EvalContext {
             config: self.config.clone(),
@@ -81,7 +88,7 @@ impl Rows<'_, '_, '_> {
         row.insert(
             "paths".into(),
             array(
-                bases
+                by_subdir
                     .values()
                     .flatten()
                     .map(|(from, to)| installers::path(self.api.source, from, to)),

@@ -213,20 +213,25 @@ impl Graph<'_> {
                 let inputs = sources.entry(source).or_default();
                 if let Some(nodes) = self.steps.get(index) {
                     for entry in &nodes.order_only {
-                        if let OrderOnly::ObjectOrder(index) = entry {
-                            inputs.extend(self.compile_prerequisite_paths(*index));
+                        if let OrderOnly::ObjectOrder(target_index) = entry {
+                            if let Some(order_target) =
+                                self.target_meta.get(*target_index).and_then(|meta| {
+                                    meta.order_depends_private
+                                        .as_ref()
+                                        .or(meta.order_depends_target.as_ref())
+                                })
+                            {
+                                inputs.insert(order_target);
+                            } else {
+                                inputs.extend(self.compile_prerequisite_paths(*target_index));
+                            }
                         }
                     }
                 }
             }
         }
         for (source, inputs) in sources {
-            let relative = self.node(source);
-            let outputs = if relative == *source {
-                vec![relative]
-            } else {
-                vec![relative, source.clone()]
-            };
+            let outputs = [self.node(source)];
             ninja.edge(
                 b"phony",
                 Edge {

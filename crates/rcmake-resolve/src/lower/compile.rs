@@ -105,15 +105,16 @@ fn compile_flag_parts(
     let mut leading = language_flags(model, target, config, language);
     let standard = checked_standard_flag(model, target, language, required_standard)?;
     leading.extend(standard);
-    let architectures = super::apple::arch::flags(model, target, config, language, architecture)?;
-    let mut flags = Vec::new();
     let policy = Flags::new(model, target, language);
     let ipo = if language == b"CUDA" {
         super::cuda::arch::ipo_enabled(model, target, config, language)
     } else {
         policy.ipo(config)
     };
-    flags.extend(policy.compile(ipo, position_independent));
+    leading.extend(policy.ipo_compile(ipo));
+    let architectures = super::apple::arch::flags(model, target, config, language, architecture)?;
+    let mut flags = Vec::new();
+    flags.extend(policy.compile(position_independent));
     flags.extend(
         msvc::debug_options(model, target, config, language)?
             .iter()
@@ -167,7 +168,7 @@ fn compile_flag_parts(
             let ast = usage.parse_genex(raw)?;
             evaluate(&ast, &context, &mut usage.host(target.dir))
         };
-        let (runtime, _) = match usage {
+        let (runtime, _) = match &mut usage {
             Some(usage) => evaluate_runtime(usage)?,
             None => evaluate_runtime(&mut UsageResolver::new(model))?,
         };
@@ -209,10 +210,22 @@ fn compile_flag_parts(
     {
         flags.push(option.clone());
     }
+    if is_darwin(model, target.dir)
+        && let Some(usage) = usage
+        && let Some(target_id) = model.find_target(target.dir, &target.name)
+    {
+        for dir in crate::resolve_link::transitive_raw_framework_dirs(
+            model, target, target_id, config, usage,
+        )? {
+            flags.push(framework_flag(model, target, language, &dir, false));
+        }
+    }
     policy.append_color(&mut flags);
     let define_flags = &model.dir(target.dir).define_flags;
     if !define_flags.iter().all(u8::is_ascii_whitespace) {
-        flags.push(raw_flags(model, target.dir, define_flags));
+        let mut piece = raw_flags(model, target.dir, define_flags);
+        piece.insert(0, b' ');
+        flags.push(piece);
     }
     Ok([leading, architectures, flags])
 }
@@ -313,7 +326,7 @@ fn includes(model: &ProjectModel, target: &Target, group: &CompileGroup) -> BStr
     let darwin = is_darwin(model, target.dir);
     let implicit = implicit_include_dirs(model, target, &group.language);
     let mut paths = IndexSet::new();
-    let mut frameworks = implicit_frameworks(model, target);
+    let mut frameworks = implicit_frameworks();
     join_words(group.includes.iter().filter_map(|include| {
         let path = clean_include_path(&include.path.value);
         if implicit.contains(&include_identity(&path)) || !paths.insert(path.clone()) {
@@ -385,16 +398,10 @@ fn framework_flag(
     }
 }
 
-fn implicit_frameworks(model: &ProjectModel, target: &Target) -> IndexSet<BString> {
-    definition(
-        model,
-        target.dir,
-        b"CMAKE_PLATFORM_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES",
-    )
-    .into_iter()
-    .flat_map(|value| list::split(value, list::Empty::Drop))
-    .map(|value| Lexical::new(&value).normalize())
-    .collect()
+fn implicit_frameworks() -> IndexSet<BString> {
+    // CMake's compile include flags omit only `/System/Library/Frameworks`
+    // (not SDK framework directories in `CMAKE_PLATFORM_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES`).
+    IndexSet::from([BString::from("/System/Library/Frameworks")])
 }
 
 fn linked_framework_includes(
@@ -406,7 +413,7 @@ fn linked_framework_includes(
     if directories.is_empty() {
         return BString::default();
     }
-    let mut emitted = implicit_frameworks(model, target);
+    let mut emitted = implicit_frameworks();
     emitted.extend(group.includes.iter().filter_map(|include| {
         let path = clean_include_path(&include.path.value);
         framework_directory(&path).map(|path| Lexical::new(path).normalize())
@@ -509,7 +516,7 @@ pub(super) fn swift_compile_flags(
         group
             .flags
             .iter()
-            .filter(|flag| !flag.value.is_empty())
+            .filter(|flag| !flag.value.is_empty() && flag.value.as_slice() != b"SHELL:")
             .map(|flag| {
                 flag.value
                     .strip_prefix(b"SHELL:")
@@ -517,6 +524,13 @@ pub(super) fn swift_compile_flags(
             }),
     );
     Ok(flags)
+}
+
+struct CompileArguments {
+    base_parts: [Vec<BString>; 3],
+    extra_flags: Vec<BString>,
+    defines: BString,
+    includes: BString,
 }
 
 pub(super) fn compile_arguments(
@@ -528,7 +542,12 @@ pub(super) fn compile_arguments(
     source: &[u8],
     position_independent: Option<bool>,
 ) -> Result<(Vec<BString>, BString, BString), ResolveError> {
-    compile_arguments_for_arch(
+    let CompileArguments {
+        base_parts,
+        extra_flags,
+        defines,
+        includes,
+    } = compile_arguments_for_arch(
         model,
         target,
         config,
@@ -537,7 +556,10 @@ pub(super) fn compile_arguments(
         source,
         position_independent,
         (None, None),
-    )
+    )?;
+    let mut flags: Vec<BString> = base_parts.into_iter().flatten().collect();
+    flags.extend(extra_flags);
+    Ok((flags, defines, includes))
 }
 
 #[expect(
@@ -553,9 +575,9 @@ fn compile_arguments_for_arch(
     source: &[u8],
     position_independent: Option<bool>,
     architecture_and_usage: (Option<&[u8]>, Option<&mut UsageResolver<'_>>),
-) -> Result<(Vec<BString>, BString, BString), ResolveError> {
+) -> Result<CompileArguments, ResolveError> {
     let language = group.language.as_slice();
-    let mut flags = compile_flags(
+    let base_parts = compile_flag_parts(
         model,
         target,
         config,
@@ -563,18 +585,18 @@ fn compile_arguments_for_arch(
         required_standard,
         position_independent,
         architecture_and_usage,
+        false,
     )?;
-    flags.extend(
-        group
-            .flags
-            .iter()
-            .filter(|flag| !flag.value.is_empty())
-            .map(|flag| {
-                flag.value
-                    .strip_prefix(b"SHELL:")
-                    .map_or_else(|| quote(&flag.value), BString::from)
-            }),
-    );
+    let mut extra_flags: Vec<BString> = group
+        .flags
+        .iter()
+        .filter(|flag| !flag.value.is_empty() && flag.value.as_slice() != b"SHELL:")
+        .map(|flag| {
+            flag.value
+                .strip_prefix(b"SHELL:")
+                .map_or_else(|| quote(&flag.value), BString::from)
+        })
+        .collect();
     let defines = formatted_defines(model, target, config, group);
     let includes = includes(model, target, group);
     let explicit_language = model
@@ -603,13 +625,24 @@ fn compile_arguments_for_arch(
             &[b"CMAKE_", language, b"_COMPILE_OPTIONS_EXPLICIT_LANGUAGE"].concat(),
         )
     {
-        flags.extend(
+        extra_flags.extend(
             list::split(options, list::Empty::Drop)
                 .into_iter()
                 .map(|value| quote(&value)),
         );
     }
-    Ok((flags, defines, includes))
+    Ok(CompileArguments {
+        base_parts,
+        extra_flags,
+        defines,
+        includes,
+    })
+}
+
+pub(super) struct LoweredCompile {
+    pub(super) step: BuildStep,
+    pub(super) launcher: Option<BString>,
+    pub(super) compile_db_command: Option<BString>,
 }
 
 #[derive(Default)]
@@ -636,10 +669,15 @@ pub(super) fn compile(
     group: &CompileGroup,
     settings: Settings<'_>,
     usage: &mut UsageResolver<'_>,
-) -> Result<(BuildStep, Option<BString>), ResolveError> {
+) -> Result<LoweredCompile, ResolveError> {
     let language = group.language.as_slice();
     let source = join(&model.dir(target.dir).source_dir, &unit.source.value);
-    let (mut flags, defines, includes) = compile_arguments_for_arch(
+    let CompileArguments {
+        base_parts,
+        mut extra_flags,
+        defines,
+        includes,
+    } = compile_arguments_for_arch(
         model,
         target,
         config,
@@ -654,7 +692,7 @@ pub(super) fn compile(
         linked_framework_includes(model, target, group, settings.extra_framework_dirs),
     ]);
     if let Some(pch) = settings.pch {
-        flags.extend(pch.options(model, target, language));
+        extra_flags.extend(pch.options(model, target, language));
     }
     let object = if unit.object.is_empty() {
         object_path(model, target, config, &source)
@@ -688,14 +726,14 @@ pub(super) fn compile(
     .concat();
     if bmi_only {
         if let Some(flag) = definition(model, target.dir, b"CMAKE_CXX_MODULE_BMI_ONLY_FLAG") {
-            flags.push(flag.clone());
+            extra_flags.push(flag.clone());
         } else if gcc {
-            flags.push("-fmodule-only".into());
+            extra_flags.push("-fmodule-only".into());
         }
     }
     let modmap = unit.scan.then(|| super::modules::modmap_path(&object));
     if let Some(path) = &modmap {
-        flags.push(super::modules::module_map_flag(model, target, path));
+        extra_flags.push(super::modules::module_map_flag(model, target, path));
     }
     let template_text = template.map_or(fallback.as_slice(), |v| v.as_slice());
     let compile_pdb = if let Some(path) = settings.pch_compile_pdb {
@@ -758,16 +796,18 @@ pub(super) fn compile(
     };
     let ninja = model.generator.is_some_and(GeneratorKind::is_ninja);
     let expanded_dep_flags = dep_flags.map(|dep_flags| expand_rule(dep_flags, lookup_paths));
+    let mut all_flags: Vec<BString> = base_parts.iter().flatten().cloned().collect();
+    all_flags.extend(extra_flags.iter().cloned());
     let flags = if ninja {
         // Ninja trims the `FLAGS` binding; the rule adds the dependency flags after it.
-        let flags = BString::from(join_words(flags).trim_ascii());
+        let flags = BString::from(join_words(all_flags).trim_ascii());
         join_words([flags].into_iter().chain(expanded_dep_flags))
     } else {
-        flags.extend(expanded_dep_flags);
-        join_words(flags)
+        all_flags.extend(expanded_dep_flags);
+        join_words(all_flags)
     };
     let invocations = rule_invocations(model, target.dir, template_text, |key| match key {
-        b"FLAGS" => Some(if model.generator.is_some_and(GeneratorKind::is_ninja) {
+        b"FLAGS" => Some(if ninja {
             flags.trim_ascii().into()
         } else {
             flags.clone()
@@ -784,7 +824,7 @@ pub(super) fn compile(
         language: &group.language,
     };
     let compiler_index = compiler_command_index(template_text, language);
-    let (invocation, launcher_prefix) = finalize_compile_invocations(
+    let (invocation, launcher_prefix, rule_launcher_prefix) = finalize_compile_invocations_inner(
         model,
         target,
         &launch,
@@ -794,6 +834,54 @@ pub(super) fn compile(
         settings.skip_file_set_linting,
         usage,
     )?;
+    let compile_db_command = ninja.then(|| {
+        let mut db_flags = codemodel_flag_text(base_parts);
+        for piece in &extra_flags {
+            if !piece.iter().all(u8::is_ascii_whitespace) {
+                if !db_flags.is_empty() {
+                    db_flags.push(b' ');
+                }
+                db_flags.extend_from_slice(piece);
+            }
+        }
+        if db_flags.iter().all(u8::is_ascii_whitespace) {
+            db_flags.clear();
+        }
+        let db_template = strip_empty_ninja_compile_db_placeholders(
+            template_text,
+            defines.is_empty(),
+            includes.is_empty(),
+            db_flags.is_empty(),
+        );
+        let mut db_invocations =
+            rule_invocations(model, target.dir, &db_template, |key| match key {
+                b"FLAGS" => Some(db_flags.clone()),
+                b"DEFINES" => Some(defines.clone()),
+                b"INCLUDES" => Some(includes.clone()),
+                _ => lookup_paths(key),
+            });
+        let slot_index = if compiler_index < db_invocations.len() {
+            compiler_index
+        } else {
+            0
+        };
+        if let (Some(prefix), Some(inv)) = (&launcher_prefix, db_invocations.get_mut(slot_index)) {
+            inv.shell = join_words([prefix.clone(), std::mem::take(&mut inv.shell)]);
+        }
+        if let Some(prefix) = &rule_launcher_prefix {
+            for inv in &mut db_invocations {
+                inv.shell = join_words([prefix.clone(), std::mem::take(&mut inv.shell)]);
+            }
+        }
+        let mut line = BString::default();
+        for inv in db_invocations {
+            if !line.is_empty() {
+                line.extend_from_slice(b" && ");
+            }
+            line.extend_from_slice(&inv.shell);
+        }
+        line
+    });
     let writes_depfile = compiler_depfile
         && (dep_flags.is_some_and(|f| has_placeholder(f, b"<DEP_FILE>"))
             || has_placeholder(template_text, b"<DEP_FILE>"));
@@ -803,8 +891,8 @@ pub(super) fn compile(
         }
         _ => Vec::new(),
     };
-    Ok((
-        BuildStep::Compile {
+    Ok(LoweredCompile {
+        step: BuildStep::Compile {
             byproducts,
             compile_input: None,
             object,
@@ -814,8 +902,44 @@ pub(super) fn compile(
             modmap,
             dyndep: None,
         },
-        launcher_prefix,
-    ))
+        launcher: launcher_prefix,
+        compile_db_command,
+    })
+}
+
+/// Remove empty `<DEFINES>`, `<INCLUDES>`, and `<FLAGS>` placeholders (along
+/// with one adjacent space) from a Ninja compile rule template when building
+/// `compile_commands.json` entries (`cmGlobalNinjaGenerator::AddCXXCompileCommand`).
+fn strip_empty_ninja_compile_db_placeholders(
+    template: &[u8],
+    defines_empty: bool,
+    includes_empty: bool,
+    flags_empty: bool,
+) -> BString {
+    let mut out = BString::from(template);
+    for (empty, placeholder) in [
+        (defines_empty, b"<DEFINES>".as_slice()),
+        (includes_empty, b"<INCLUDES>"),
+        (flags_empty, b"<FLAGS>"),
+    ] {
+        if !empty {
+            continue;
+        }
+        while let Some(pos) = out
+            .windows(placeholder.len())
+            .position(|window| window == placeholder)
+        {
+            let end = pos + placeholder.len();
+            if out.get(end) == Some(&b' ') {
+                out.drain(pos..=end);
+            } else if pos > 0 && out.get(pos - 1) == Some(&b' ') {
+                out.drain(pos - 1..end);
+            } else {
+                out.drain(pos..end);
+            }
+        }
+    }
+    out
 }
 
 /// Locate the command in a semicolon-delimited compile rule template that invokes
@@ -838,12 +962,39 @@ pub(super) fn finalize_compile_invocations(
     model: &ProjectModel,
     target: &Target,
     launch: &launcher::Command<'_>,
-    mut invocations: Vec<crate::Invocation>,
+    invocations: Vec<crate::Invocation>,
     compiler_index: usize,
     lookup_paths: impl Fn(&[u8]) -> Option<BString>,
     skip_file_set_linting: Option<bool>,
     usage: &mut UsageResolver<'_>,
 ) -> Result<(crate::Invocation, Option<BString>), ResolveError> {
+    let (invocation, launcher_prefix, _) = finalize_compile_invocations_inner(
+        model,
+        target,
+        launch,
+        invocations,
+        compiler_index,
+        lookup_paths,
+        skip_file_set_linting,
+        usage,
+    )?;
+    Ok((invocation, launcher_prefix))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Compile rule finalization wires launchers, rule wrappers, and instrumentation."
+)]
+fn finalize_compile_invocations_inner(
+    model: &ProjectModel,
+    target: &Target,
+    launch: &launcher::Command<'_>,
+    mut invocations: Vec<crate::Invocation>,
+    compiler_index: usize,
+    lookup_paths: impl Fn(&[u8]) -> Option<BString>,
+    skip_file_set_linting: Option<bool>,
+    usage: &mut UsageResolver<'_>,
+) -> Result<(crate::Invocation, Option<BString>, Option<BString>), ResolveError> {
     let mut launcher_prefix = None;
     let slot_index = if compiler_index < invocations.len() {
         compiler_index
@@ -862,6 +1013,7 @@ pub(super) fn finalize_compile_invocations(
         *invocation = launched;
         launcher_prefix = prefix;
     }
+    let mut rule_launcher_prefix = None;
     if let Some(prefix) = lint::rule_launcher(model, target, launch, usage)? {
         let prefix = expand_rule(&prefix, lookup_paths);
         for invocation in &mut invocations {
@@ -870,6 +1022,7 @@ pub(super) fn finalize_compile_invocations(
             *invocation = command(shell);
             invocation.working_dir = working_dir;
         }
+        rule_launcher_prefix = Some(prefix);
     }
     let invocation = match invocations.len() {
         0 => {
@@ -890,7 +1043,7 @@ pub(super) fn finalize_compile_invocations(
         }
     };
     let invocation = launch.wrap(model, target, invocation);
-    Ok((invocation, launcher_prefix))
+    Ok((invocation, launcher_prefix, rule_launcher_prefix))
 }
 
 fn has_placeholder(text: &[u8], key: &[u8]) -> bool {

@@ -125,7 +125,15 @@ fn render_with_directories<'a>(
         if objects.is_some_and(|objects| !objects.contains(object.as_slice())) {
             continue;
         }
-        let shell = compiler_shell(&invocation.shell);
+        let raw_shell = if ninja_style {
+            graph
+                .compile_db_commands
+                .get(&step_idx)
+                .map_or(invocation.shell.as_slice(), |cmd| cmd.as_slice())
+        } else {
+            invocation.shell.as_slice()
+        };
+        let shell = compiler_shell(raw_shell);
         let (directory, command) = if let Some(&directory) = directories.get(object.as_slice()) {
             // Makefiles uses the target directory for the command and the build root for `output`.
             let absolute_object = Lexical::new(build_dir).append(object);
@@ -494,12 +502,154 @@ mod tests {
             r#"[
 {
   "directory": "/out",
-  "command": "cc   -o sub/CMakeFiles/sublib.dir/a.c.o -c /src/sub/a.c",
+  "command": "cc -o sub/CMakeFiles/sublib.dir/a.c.o -c /src/sub/a.c",
   "file": "/src/sub/a.c",
   "output": "/out/sub/CMakeFiles/sublib.dir/a.c.o"
 }
 ]
 "#
+        );
+    }
+
+    #[test]
+    fn ninja_and_makefiles_compile_db_spacing_across_all_placeholder_combinations() {
+        use rcmake_model::UsageField;
+
+        let build_cmd = |generator: GeneratorKind, def: bool, inc: bool, flags: Option<&str>| {
+            let mut model = ProjectModel::default();
+            model.generator = Some(generator);
+            model.set_root_dirs("/src".into(), "/out".into());
+            let root = model.dir_mut(DirId::ROOT);
+            root.vars.insert("CMAKE_C_COMPILER".into(), "cc".into());
+            if let Some(flags) = flags {
+                root.vars.insert("CMAKE_C_FLAGS".into(), flags.into());
+            }
+            let mut target = Target::new(
+                "app".into(),
+                TargetKind::StaticLibrary,
+                TargetOrigin::Normal,
+                DirId::ROOT,
+                Default::default(),
+                Default::default(),
+            );
+            target
+                .sources
+                .push(BT::new("a.c".into(), Default::default()));
+            if def {
+                target.usage.push(
+                    UsageField::CompileDefinitions,
+                    BT::new("FOO=1".into(), Default::default()),
+                );
+            }
+            if inc {
+                target.usage.push(
+                    UsageField::IncludeDirectories,
+                    BT::new("/inc".into(), Default::default()),
+                );
+            }
+            model.add_target(target).unwrap();
+            let host = PureHost::default();
+            host.seed_file(Path::new("/src/a.c"), b"").unwrap();
+            let result = rcmake_resolve::resolve(&model, &host, &[]).unwrap();
+            let output =
+                render_for_generator(&result, &result.graphs[0], b"/out", generator).unwrap();
+            let parsed = rcmake_json::parse(&output, &rcmake_json::ReadOptions::default()).unwrap();
+            let rcmake_json::Value::Array(items) = parsed else {
+                panic!("expected array");
+            };
+            let rcmake_json::Value::Object(obj) = &items[0] else {
+                panic!("expected object");
+            };
+            let rcmake_json::Value::String(cmd) = &obj[b"command".as_slice()] else {
+                panic!("expected string command");
+            };
+            cmd.to_string()
+        };
+
+        // All 8 (DEFINES, INCLUDES, FLAGS) combinations for Ninja: empty placeholders drop 1 space.
+        let ninja_cases = [
+            (
+                false,
+                false,
+                None,
+                "cc -o CMakeFiles/app.dir/a.c.o -c /src/a.c",
+            ),
+            (
+                true,
+                false,
+                None,
+                "cc -DFOO=1 -o CMakeFiles/app.dir/a.c.o -c /src/a.c",
+            ),
+            (
+                false,
+                true,
+                None,
+                "cc -I/inc -o CMakeFiles/app.dir/a.c.o -c /src/a.c",
+            ),
+            (
+                false,
+                false,
+                Some("-Wall"),
+                "cc -Wall -o CMakeFiles/app.dir/a.c.o -c /src/a.c",
+            ),
+            (
+                true,
+                true,
+                None,
+                "cc -DFOO=1 -I/inc -o CMakeFiles/app.dir/a.c.o -c /src/a.c",
+            ),
+            (
+                true,
+                false,
+                Some("-Wall"),
+                "cc -DFOO=1 -Wall -o CMakeFiles/app.dir/a.c.o -c /src/a.c",
+            ),
+            (
+                false,
+                true,
+                Some("-Wall"),
+                "cc -I/inc -Wall -o CMakeFiles/app.dir/a.c.o -c /src/a.c",
+            ),
+            (
+                true,
+                true,
+                Some("-Wall"),
+                "cc -DFOO=1 -I/inc -Wall -o CMakeFiles/app.dir/a.c.o -c /src/a.c",
+            ),
+            // Leading and internal spaces in non-empty FLAGS are preserved.
+            (
+                false,
+                false,
+                Some("  -O2   -DNDEBUG"),
+                "cc   -O2   -DNDEBUG -o CMakeFiles/app.dir/a.c.o -c /src/a.c",
+            ),
+            (
+                false,
+                true,
+                Some("  -O2   -DNDEBUG"),
+                "cc -I/inc   -O2   -DNDEBUG -o CMakeFiles/app.dir/a.c.o -c /src/a.c",
+            ),
+        ];
+        for (def, inc, flags, expected) in ninja_cases {
+            assert_eq!(
+                build_cmd(GeneratorKind::Ninja, def, inc, flags),
+                expected,
+                "Ninja mismatch for def={def} inc={inc} flags={flags:?}"
+            );
+        }
+
+        // Unix Makefiles preserves template spaces for empty placeholders.
+        assert_eq!(
+            build_cmd(GeneratorKind::UnixMakefiles, false, false, None),
+            "cc   -o CMakeFiles/app.dir/a.c.o -c /src/a.c"
+        );
+        assert_eq!(
+            build_cmd(GeneratorKind::UnixMakefiles, false, true, None),
+            "cc  -I/inc -o CMakeFiles/app.dir/a.c.o -c /src/a.c"
+        );
+        assert_eq!(
+            build_cmd(GeneratorKind::UnixMakefiles, true, false, Some("-Wall")),
+            "cc -DFOO=1  -Wall -o CMakeFiles/app.dir/a.c.o -c /src/a.c"
         );
     }
 

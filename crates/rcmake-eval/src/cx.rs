@@ -110,6 +110,61 @@ impl Cx<'_> {
         self.interp.vars.depth()
     }
 
+    /// Read-only view of an enclosing function or macro call site for speculative lookahead.
+    ///
+    /// `skip_calls == 0` inspects the currently executing command; `skip_calls == 1` inspects
+    /// the call site of the immediately enclosing function or macro, and so on. Returns the
+    /// raw call invocation, the remaining commands in its active sequence, the caller's
+    /// variable scope depth, and the enclosing `foreach()` loop frame when that call sits
+    /// directly inside the loop body at that scope depth.
+    #[must_use]
+    pub fn caller_lookahead(
+        &self,
+        skip_calls: usize,
+    ) -> Option<(
+        &CommandInvocation,
+        &[CommandInvocation],
+        usize,
+        Option<crate::ForeachLookahead<'_>>,
+    )> {
+        let (cmds, index, end, scope_depth) = if skip_calls == 0 {
+            let (cmds, index) = self.interp.cur_cmd.as_ref()?;
+            (
+                cmds,
+                *index,
+                self.interp.command_end,
+                self.interp.vars.depth(),
+            )
+        } else {
+            let frame_index = self.interp.call_frames.len().checked_sub(skip_calls)?;
+            let frame = self.interp.call_frames.get(frame_index)?.as_ref()?;
+            (&frame.cmds, frame.index, frame.end, frame.scope_depth)
+        };
+        let current = cmds.get(index)?;
+        let remaining = cmds.get(index.saturating_add(1)..end).unwrap_or_default();
+        let foreach = self
+            .interp
+            .foreach_frames
+            .iter()
+            .rev()
+            .find(|frame| frame.contains_command(cmds, index) && frame.scope_depth() == scope_depth)
+            .map(crate::ForeachLookahead::new);
+        Some((current, remaining, scope_depth, foreach))
+    }
+
+    /// Look up a normal or cache variable as visible at `scope_depth` without triggering
+    /// watches, usage tracking, or replay observations.
+    #[must_use]
+    pub fn peek_var_at_depth(&self, scope_depth: usize, name: &[u8]) -> Option<&BString> {
+        self.interp.vars.get_in(scope_depth, name).or_else(|| {
+            self.interp
+                .project
+                .cache
+                .get(name)
+                .map(|entry| &entry.value)
+        })
+    }
+
     /// Look up a normal or cache variable without triggering watches, usage tracking,
     /// or replay observations (for side-effect-free speculative lookahead).
     #[must_use]

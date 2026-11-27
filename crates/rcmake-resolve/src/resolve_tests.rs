@@ -1231,7 +1231,7 @@ fn relative_custom_dependencies_resolve_to_source_files_or_generated_outputs() -
         recipe.depends,
         [
             "/src/source.txt",
-            "both.txt",
+            "/src/both.txt",
             "generated.txt",
             "byproduct.txt",
             "missing.txt"
@@ -2728,6 +2728,262 @@ fn std_module_providers_follow_effective_consumer_settings() -> TestResult {
             .filter(|target| target.metadata.generator_provided)
             .count(),
         3
+    );
+    Ok(())
+}
+
+#[test]
+fn ipo_compile_flag_precedes_apple_architecture_flags() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    for (name, value) in [
+        ("CMAKE_SYSTEM_NAME", "Darwin"),
+        ("CMAKE_OSX_ARCHITECTURES", "arm64"),
+        ("CMAKE_C_COMPILER_ID", "AppleClang"),
+        ("CMAKE_C_COMPILE_OPTIONS_IPO", "-flto=thin"),
+        ("CMAKE_C_STANDARD_DEFAULT", "17"),
+        ("CMAKE_C23_EXTENSION_COMPILE_OPTION", "-std=gnu2x"),
+        ("CMAKE_C_FLAGS", "-O3 -DNDEBUG"),
+    ] {
+        model.global.props.set(name.into(), value.into());
+    }
+    let mut app = target("app", TargetKind::Executable, &["main.c"]);
+    let _ = app.policies.policies.set(
+        rcmake_diag::PolicyId::new(69),
+        rcmake_diag::PolicyStatus::New,
+    );
+    app.props
+        .set("INTERPROCEDURAL_OPTIMIZATION".into(), "ON".into());
+    app.props.set("C_STANDARD".into(), "23".into());
+    app.props
+        .set("POSITION_INDEPENDENT_CODE".into(), "ON".into());
+    let app_id = model.add_target(app)?;
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/main.c"), b"int main(void) { return 0; }\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let compile = result.graphs[0]
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            BuildStep::Compile { invocation, .. } => Some(invocation.shell.to_string()),
+            _ => None,
+        })
+        .ok_or("missing compile step")?;
+    assert!(
+        compile.contains("-std=gnu2x -flto=thin -arch arm64"),
+        "IPO flag must precede -arch arm64:\n{compile}"
+    );
+    let raw = model.target(app_id).ok_or("missing app target")?;
+    let resolved = result
+        .targets
+        .iter()
+        .find(|t| t.id == app_id)
+        .ok_or("missing resolved app")?;
+    let mut usage = crate::usage::UsageResolver::new(&model);
+    let (cm_flags, _) = crate::lower::codemodel_compile_info(
+        &model,
+        raw,
+        &resolved.config,
+        &resolved.compile_groups[0],
+        &mut usage,
+    )?;
+    assert!(
+        cm_flags
+            .as_slice()
+            .windows(b"-std=gnu2x -flto=thin -arch arm64".len())
+            .any(|w| w == b"-std=gnu2x -flto=thin -arch arm64"),
+        "codemodel flags must place IPO before -arch: {cm_flags}"
+    );
+
+    // When language flags and C_STANDARD are empty, IPO still precedes -arch with no leading space.
+    model.global.props.set("CMAKE_C_FLAGS".into(), "".into());
+    if let Some(raw_mut) = model.target_mut(app_id) {
+        raw_mut.props.unset(b"C_STANDARD");
+        raw_mut.props.unset(b"POSITION_INDEPENDENT_CODE");
+    }
+    let result_empty = resolve(&model, &host, &[])?;
+    let raw = model.target(app_id).ok_or("missing app target")?;
+    let resolved = result_empty
+        .targets
+        .iter()
+        .find(|t| t.id == app_id)
+        .ok_or("missing resolved app")?;
+    let mut usage = crate::usage::UsageResolver::new(&model);
+    let (cm_empty, _) = crate::lower::codemodel_compile_info(
+        &model,
+        raw,
+        &resolved.config,
+        &resolved.compile_groups[0],
+        &mut usage,
+    )?;
+    assert_eq!(cm_empty, "-flto=thin -arch arm64");
+    Ok(())
+}
+
+#[test]
+fn darwin_direct_raw_framework_emits_compile_includes_and_codemodel_frameworks() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    model
+        .global
+        .props
+        .set("CMAKE_SYSTEM_NAME".into(), "Darwin".into());
+    model.global.props.set(
+        "CMAKE_PLATFORM_IMPLICIT_LINK_FRAMEWORK_DIRECTORIES".into(),
+        "/SDK/System/Library/Frameworks;/System/Library/Frameworks".into(),
+    );
+
+    let mut base = target("base", TargetKind::StaticLibrary, &["base.c"]);
+    base.usage.link_libraries = Some(vec![
+        link_item("/SDK/System/Library/Frameworks/ApplicationServices.framework"),
+        link_item("/System/Library/Frameworks/CoreFoundation.framework"),
+        link_item("/custom/Custom.framework/Custom"),
+    ]);
+    base.usage.interface_link_libraries = Some(vec![
+        link_item("/SDK/System/Library/Frameworks/ApplicationServices.framework"),
+        link_item("/transitive/Trans.framework"),
+    ]);
+    let base_id = model.add_target(base)?;
+
+    let mut consumer = target("consumer", TargetKind::Executable, &["main.c"]);
+    consumer.usage.link_libraries = Some(vec![link_item("base")]);
+    let consumer_id = model.add_target(consumer)?;
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/base.c"), b"int b(void) { return 0; }\n")?;
+    host.seed_file(Path::new("/src/main.c"), b"int main(void) { return 0; }\n")?;
+    let result = resolve(&model, &host, &[])?;
+
+    let compile_for = |stem: &str| -> Result<String, Box<dyn std::error::Error>> {
+        result.graphs[0]
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                BuildStep::Compile {
+                    source, invocation, ..
+                } if source.ends_with(stem.as_bytes()) => Some(invocation.shell.to_string()),
+                _ => None,
+            })
+            .ok_or_else(|| format!("missing compile step for {stem}").into())
+    };
+    let base_cmd = compile_for("base.c")?;
+    assert!(
+        base_cmd.contains("-F/SDK/System/Library/Frameworks"),
+        "direct SDK framework must emit -F in INCLUDES:\n{base_cmd}"
+    );
+    assert!(
+        base_cmd.contains("-F/custom"),
+        "direct custom framework binary must emit -F in INCLUDES:\n{base_cmd}"
+    );
+    assert!(
+        !base_cmd.contains("-F/System/Library/Frameworks"),
+        "/System/Library/Frameworks must be omitted from INCLUDES:\n{base_cmd}"
+    );
+
+    let consumer_cmd = compile_for("main.c")?;
+    assert!(
+        consumer_cmd.contains("-F/transitive"),
+        "non-implicit transitive raw framework must emit -F in compile flags:\n{consumer_cmd}"
+    );
+    assert!(
+        !consumer_cmd.contains("-F/SDK/System/Library/Frameworks"),
+        "implicit SDK transitive raw framework must not emit -F on consumer:\n{consumer_cmd}"
+    );
+
+    let raw_base = model.target(base_id).ok_or("missing base")?;
+    let res_base = result
+        .targets
+        .iter()
+        .find(|t| t.id == base_id)
+        .ok_or("missing resolved base")?;
+    let mut usage = crate::usage::UsageResolver::new(&model);
+    let fws = crate::lower::codemodel_frameworks(&model, raw_base, res_base, |_| None, &mut usage)?;
+    let paths: Vec<_> = fws.iter().map(|fw| fw.path.value.as_slice()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            b"/SDK/System/Library/Frameworks/ApplicationServices.framework".as_slice(),
+            b"/System/Library/Frameworks/CoreFoundation.framework".as_slice(),
+            b"/custom/Custom.framework".as_slice(),
+        ]
+    );
+
+    let raw_consumer = model.target(consumer_id).ok_or("missing consumer")?;
+    let res_consumer = result
+        .targets
+        .iter()
+        .find(|t| t.id == consumer_id)
+        .ok_or("missing resolved consumer")?;
+    let consumer_fws = crate::lower::codemodel_frameworks(
+        &model,
+        raw_consumer,
+        res_consumer,
+        |_| None,
+        &mut usage,
+    )?;
+    assert!(
+        consumer_fws.is_empty(),
+        "transitive raw frameworks do not populate consumer compileGroups.frameworks"
+    );
+    Ok(())
+}
+
+#[test]
+fn ninja_unity_build_orders_generated_sources_without_synthetic_unity_targets() -> TestResult {
+    let mut model = project();
+    model.generator = Some(rcmake_model::GeneratorKind::Ninja);
+    let mut cmd = rcmake_model::CustomCommand::new(
+        DirId::ROOT,
+        rcmake_model::CustomCommandKind::Output,
+        Default::default(),
+        Default::default(),
+    );
+    cmd.outputs
+        .push(BT::new("/out/gen.c".into(), Default::default()));
+    cmd.command_lines.push(vec![
+        "cmake".into(),
+        "-E".into(),
+        "touch".into(),
+        "gen.c".into(),
+    ]);
+    model.add_command(cmd)?;
+
+    let mut lib = target("u", TargetKind::StaticLibrary, &["a.c", "/out/gen.c"]);
+    lib.props.set("UNITY_BUILD".into(), "ON".into());
+    model.add_target(lib)?;
+
+    let host = PureHost::default();
+    host.seed_file(Path::new("/src/a.c"), b"int a(void) { return 0; }\n")?;
+    let result = resolve(&model, &host, &[])?;
+    let graph = &result.graphs[0];
+    assert!(
+        !graph
+            .targets
+            .iter()
+            .any(|t| t.name.starts_with(b"cmake_object_order_depends_unity_")),
+        "Ninja unity builds must not emit synthetic cmake_object_order_depends_unity_* targets"
+    );
+    assert!(
+        !graph.steps.iter().any(|step| matches!(
+            step,
+            BuildStep::Custom(custom)
+                if custom.invocations.is_empty()
+                    && custom.outputs.iter().any(|o| o.ends_with(b"unity_0_c.c"))
+        )),
+        "Ninja unity builds must not emit phony custom edges for Unity/*.c"
+    );
+    let u_target = graph
+        .targets
+        .iter()
+        .find(|t| t.name == b"u")
+        .ok_or("missing target u")?;
+    assert!(
+        u_target.steps.iter().any(|&idx| matches!(
+            graph.steps.get(idx),
+            Some(BuildStep::Custom(custom)) if custom.outputs.iter().any(|o| o == "gen.c")
+        )),
+        "target u must keep ownership of generated source custom step"
     );
     Ok(())
 }

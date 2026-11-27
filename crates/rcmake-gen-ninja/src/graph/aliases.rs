@@ -48,10 +48,24 @@ impl Graph<'_> {
                     if name == self.node(b"all") || graph.extra_aliases.contains_key(&name) {
                         Some(qualified(&name, graph.config))
                     } else {
-                        graph
-                            .names
-                            .get(&name)
-                            .and_then(|&index| graph.aliases.get(index).cloned())
+                        graph.names.get(&name).and_then(|&index| {
+                            let alias = graph.aliases.get(index)?;
+                            let collides = graph.producers.get(alias).is_some_and(|producer| {
+                                !graph
+                                    .input
+                                    .targets
+                                    .get(index)
+                                    .is_some_and(|target| target.steps.contains(producer))
+                            });
+                            if collides {
+                                graph
+                                    .target_meta
+                                    .get(index)
+                                    .and_then(|meta| meta.artifact_outputs.first().cloned())
+                            } else {
+                                Some(alias.clone())
+                            }
+                        })
                     }
                 })
                 .collect::<Vec<_>>();
