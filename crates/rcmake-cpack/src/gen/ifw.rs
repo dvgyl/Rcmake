@@ -12,11 +12,12 @@ use rcmake_host::{CopyOptions, FileKind, Follow, Host, ReadRange, WriteMode};
 
 use super::ScratchDir;
 use super::installer::{
-    BUILD_TIMEOUT, ComponentCatalog, ComponentMeta, GroupMeta, XmlElement, XmlNode, XmlWriter,
-    check_tool_outcome, copy_component_payload, copy_monolithic_payload, find_program_on_host,
-    is_macos_host, is_set_to_empty, is_set_to_off, option_set, parse_xml_bounded,
-    prepare_fresh_output, require_utf8, run_installer_tool, safe_relative_subpath,
-    validate_extension, verify_fresh_output, warn, write_tool_log,
+    BUILD_TIMEOUT, ComponentCatalog, ComponentMeta, GroupMeta, MAX_COMPONENT_GROUP_DEPTH,
+    VisitState, XmlElement, XmlNode, XmlWriter, check_tool_outcome, copy_component_payload,
+    copy_monolithic_payload, escape_xml_attr, escape_xml_text, find_program_on_host, is_macos_host,
+    is_set_to_empty, is_set_to_off, option_set, parse_xml_bounded, prepare_fresh_output,
+    require_utf8, run_installer_tool, safe_relative_subpath, validate_extension,
+    verify_fresh_output, warn, write_tool_log,
 };
 use crate::config::{CpackConfig, absolute, script, snapshot};
 use crate::source::{SymlinkPolicy, copy_checked_tree, validate_staged_tree};
@@ -286,7 +287,6 @@ impl PackageGenerator for Ifw {
             }
         }
 
-        // Fallback search via CPACK_IFW_ROOT, QTIFWDIR, and PATH when not already resolved.
         let cfg = snapshot(interp);
         let mut roots = Vec::new();
         if let Some(v) = option_set(&cfg, b"CPACK_IFW_ROOT") {
@@ -317,7 +317,6 @@ impl PackageGenerator for Ifw {
         }
         let _ = FrameworkVersion::parse(option_set(&cfg, b"CPACK_IFW_FRAMEWORK_VERSION"))?;
 
-        // Check remote repository requirement for repogen early.
         let (remote, _) = collect_repositories(host, &cfg)?;
         if !remote.is_empty() && option_set(&cfg, b"CPACK_IFW_REPOGEN_EXECUTABLE").is_none() {
             return Err(error(
@@ -360,6 +359,8 @@ impl Ifw {
         };
         let host = cx.host;
         let cwd = host.initial_cwd();
+        let canon_work = cx.expected_work_root()?;
+        let canon_staging = cx.expected_staging_root()?;
 
         if let Some(abs_files) = option_set(&cfg, b"CPACK_ABSOLUTE_DESTINATION_FILES") {
             return Err(error(format!(
@@ -368,10 +369,10 @@ impl Ifw {
             )));
         }
 
-        // Audit Finding #9: re-validate the entire staged tree after pre-build hooks.
         validate_staged_tree(
             host,
             cx.staging_dir,
+            &canon_staging,
             members,
             SymlinkPolicy::PreserveContained,
             false,
@@ -382,16 +383,16 @@ impl Ifw {
         let (packages, external_deps) =
             build_package_plans(host, &cfg, &cwd, &settings, &catalog, cx.grouping)?;
 
-        // Snapshot validated payloads into a private scratch dir BEFORE laying out config/
-        // and packages/ inside staging_dir so we never mix metadata and payload trees.
         let scratch = ScratchDir::for_generator(host, cx.output_dir, "ifw")?;
         let snapshot_dir = scratch.path.join("snapshot");
         host.create_dir_all(&snapshot_dir)?;
 
-        if catalog.components.is_empty() || cx.grouping == ComponentGrouping::AllComponentsInOne {
+        let is_monolithic = catalog.components.is_empty();
+        if is_monolithic {
             copy_monolithic_payload(
                 host,
                 cx.staging_dir,
+                &canon_staging,
                 &snapshot_dir.join("monolithic"),
                 SymlinkPolicy::PreserveContained,
                 false,
@@ -404,6 +405,7 @@ impl Ifw {
                     copy_component_payload(
                         host,
                         cx.staging_dir,
+                        &canon_staging,
                         member,
                         &comp_snap,
                         SymlinkPolicy::PreserveContained,
@@ -411,12 +413,24 @@ impl Ifw {
                         false,
                     )?;
                 } else {
-                    host.create_dir_all(&comp_snap)?;
+                    let fallback = crate::InstalledComponent {
+                        name: comp_name.clone(),
+                        ..Default::default()
+                    };
+                    copy_component_payload(
+                        host,
+                        cx.staging_dir,
+                        &canon_staging,
+                        &fallback,
+                        &comp_snap,
+                        SymlinkPolicy::PreserveContained,
+                        false,
+                        false,
+                    )?;
                 }
             }
         }
 
-        // Prepare clean config/ and packages/ layout at staging_dir (CPACK_TEMPORARY_DIRECTORY).
         let config_dir = cx.staging_dir.join("config");
         let packages_dir = cx.staging_dir.join("packages");
         let resources_dir = cx.staging_dir.join("resources");
@@ -426,10 +440,6 @@ impl Ifw {
         host.create_dir_all(&config_dir)?;
         host.create_dir_all(&packages_dir)?;
 
-        // Merge validated payloads into packages/<id>/data (with collision detection when
-        // multiple components coalesce into a shared IFW package).
-        let is_monolithic =
-            catalog.components.is_empty() || cx.grouping == ComponentGrouping::AllComponentsInOne;
         for pkg in packages.values() {
             let pkg_root = packages_dir.join(safe_name(pkg.id.as_bytes())?);
             let data_dir = pkg_root.join("data");
@@ -461,11 +471,9 @@ impl Ifw {
             }
         }
 
-        // Write config/config.xml and copy installer assets + QRC resources.
         log(host, "- Configuration");
         let staged_qrc = write_config_xml(host, &settings, &config_dir, &resources_dir)?;
 
-        // Write packages/<id>/meta/package.xml for every planned package.
         for pkg in packages.values() {
             let pkg_root = packages_dir.join(safe_name(pkg.id.as_bytes())?);
             write_package_xml(host, &settings, pkg, &pkg_root.join("meta"))?;
@@ -475,7 +483,6 @@ impl Ifw {
         let log_path = cx.output_dir.join("IFWOutput.log");
         let repo_dir = cx.staging_dir.join("repository");
 
-        // Run repogen when remote repositories are configured.
         let downloaded_ids: Vec<String> = packages
             .values()
             .filter(|p| p.downloaded)
@@ -518,8 +525,16 @@ impl Ifw {
             }
             check_tool_outcome(&outcome, repogen, "repogen", Some(&log_path), &secrets)?;
 
-            if !settings.repository_updates.is_empty() {
-                patch_updates_xml(host, &settings, &repo_dir)?;
+            if !settings.repository_updates.is_empty()
+                && let Err(err) = patch_updates_xml(host, &settings, &repo_dir)
+            {
+                warn(
+                    host,
+                    format!(
+                        "Problem patch IFW \"Updates\" file: \"{}\" ({err})",
+                        repo_dir.join("Updates.xml").display()
+                    ),
+                );
             }
             log(
                 host,
@@ -527,7 +542,6 @@ impl Ifw {
             );
         }
 
-        // Run binarycreator into a fresh installer output file (repository dir stays separate).
         let ext = self.output_extension_for(&cfg, host)?;
         let out_installer = cx
             .output_dir
@@ -538,7 +552,6 @@ impl Ifw {
             host,
             &settings,
             &config_dir.join("config.xml"),
-            &resources_dir,
             &staged_qrc,
             &packages_dir,
             &binary_ids,
@@ -572,7 +585,13 @@ impl Ifw {
             Some(&log_path),
             &secrets,
         )?;
-        verify_fresh_output(host, cx.output_dir, &out_installer, "binarycreator")?;
+        verify_fresh_output(
+            host,
+            cx.output_dir,
+            &canon_work,
+            &out_installer,
+            "binarycreator",
+        )?;
         Ok(vec![out_installer])
     }
 }
@@ -982,20 +1001,101 @@ fn collect_repositories(
     Ok((remote, updates))
 }
 
+fn push_secret_variants(secrets: &mut BTreeSet<BString>, raw: &str) {
+    if raw.is_empty() {
+        return;
+    }
+    secrets.insert(BString::from(raw));
+    if let Ok(xml_text) = escape_xml_text(raw) {
+        secrets.insert(BString::from(xml_text.as_str()));
+        secrets.insert(BString::from(xml_text.replace('\'', "&apos;")));
+    }
+    if let Ok(xml_attr) = escape_xml_attr(raw) {
+        secrets.insert(BString::from(xml_attr.as_str()));
+        secrets.insert(BString::from(xml_attr.replace('\'', "&apos;")));
+    }
+    if let Some(decoded) = percent_decode_utf8(raw)
+        && decoded != raw
+    {
+        secrets.insert(BString::from(decoded.as_str()));
+        if let Ok(xml_text) = escape_xml_text(&decoded) {
+            secrets.insert(BString::from(xml_text));
+        }
+        if let Ok(xml_attr) = escape_xml_attr(&decoded) {
+            secrets.insert(BString::from(xml_attr.as_str()));
+            secrets.insert(BString::from(xml_attr.replace('\'', "&apos;")));
+        }
+    }
+}
+
+fn percent_decode_utf8(input: &str) -> Option<String> {
+    if !input.contains('%') {
+        return None;
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes.get(i) == Some(&b'%')
+            && let (Some(&h1), Some(&h2)) = (bytes.get(i + 1), bytes.get(i + 2))
+            && let (Some(n1), Some(n2)) = (hex_value(h1), hex_value(h2))
+        {
+            out.push((n1 << 4) | n2);
+            i += 3;
+            continue;
+        }
+        if let Some(&b) = bytes.get(i) {
+            out.push(b);
+        }
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn extract_url_credentials(url: &str, secrets: &mut BTreeSet<BString>) {
+    let Some(scheme_end) = url.find("://") else {
+        return;
+    };
+    let rest = url.get(scheme_end + 3..).unwrap_or("");
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = rest.get(..auth_end).unwrap_or("");
+    let Some(at_pos) = authority.rfind('@') else {
+        return;
+    };
+    let userinfo = authority.get(..at_pos).unwrap_or("");
+    if userinfo.is_empty() {
+        return;
+    }
+    push_secret_variants(secrets, userinfo);
+    if let Some((_, password)) = userinfo.split_once(':') {
+        push_secret_variants(secrets, password);
+    }
+}
+
 fn collect_repo_secrets(settings: &InstallerSettings) -> Vec<BString> {
-    let mut secrets = Vec::new();
+    let mut secrets = BTreeSet::new();
     for repo in settings
         .remote_repositories
         .iter()
         .chain(&settings.repository_updates)
     {
-        if let Some(ref pwd) = repo.password
-            && !pwd.is_empty()
-        {
-            secrets.push(pwd.clone().into());
+        if let Some(ref pwd) = repo.password {
+            push_secret_variants(&mut secrets, pwd);
         }
+        extract_url_credentials(&repo.url, &mut secrets);
+        extract_url_credentials(&repo.old_url, &mut secrets);
+        extract_url_credentials(&repo.new_url, &mut secrets);
     }
-    secrets
+    secrets.into_iter().collect()
 }
 
 type PackagePlanOutput = (
@@ -1015,13 +1115,17 @@ fn build_package_plans(
     let mut external_deps = BTreeMap::<String, DependencySpec>::new();
 
     if catalog.components.is_empty() || grouping == ComponentGrouping::AllComponentsInOne {
-        let root_plan = build_root_package_plan(host, cfg, cwd, settings)?;
+        let mut root_plan = build_root_package_plan(host, cfg, cwd, settings)?;
         let _ = safe_name(root_plan.id.as_bytes())?;
+        if !catalog.components.is_empty() {
+            root_plan
+                .source_components
+                .extend(catalog.components.keys().cloned());
+        }
         plans.insert(root_plan.id.clone(), root_plan);
         return Ok((plans, external_deps));
     }
 
-    // Resolve group package IDs first (in topological parent-before-child order).
     let mut group_pkg_ids = BTreeMap::<BString, String>::new();
     for group_name in catalog.groups.keys() {
         resolve_group_pkg_id(
@@ -1033,7 +1137,6 @@ fn build_package_plans(
         )?;
     }
 
-    // Create group packages.
     for (group_name, group) in &catalog.groups {
         let pkg_id = group_pkg_ids
             .get(group_name)
@@ -1054,7 +1157,6 @@ fn build_package_plans(
         }
     }
 
-    // Resolve component package IDs (handling ONE_PER_GROUP and COMMON coalescing).
     let mut comp_pkg_ids = BTreeMap::<BString, String>::new();
     for (comp_name, comp) in &catalog.components {
         let upper = BString::from(comp_name.to_ascii_uppercase());
@@ -1083,14 +1185,12 @@ fn build_package_plans(
         comp_pkg_ids.insert(comp_name.clone(), pkg_id);
     }
 
-    // Create or coalesce component packages.
     for (comp_name, comp) in &catalog.components {
         let pkg_id = comp_pkg_ids
             .get(comp_name)
             .cloned()
             .unwrap_or_else(|| comp_name.to_string());
         if let Some(existing) = plans.get_mut(&pkg_id) {
-            // Coalesce payload into shared/group package.
             existing.source_components.push(comp_name.clone());
             if comp.downloaded {
                 existing.downloaded = true;
@@ -1137,29 +1237,56 @@ fn resolve_group_pkg_id(
     if let Some(existing) = resolved.get(group_name) {
         return Ok(existing.clone());
     }
-    let upper = BString::from(group_name.to_ascii_uppercase());
-    let key = format!("CPACK_IFW_COMPONENT_GROUP_{upper}_NAME");
-    let base = option_set(cfg, key.as_bytes())
-        .map(|v| require_utf8(v, &key).map(str::to_owned))
-        .transpose()?
-        .unwrap_or_else(|| group_name.to_string());
-    let full = if let Some(parent_name) = catalog
-        .groups
-        .get(group_name)
-        .and_then(|g| g.parent_group.as_ref())
-    {
-        let parent_id =
-            resolve_group_pkg_id(cfg, catalog, parent_name, resolve_duplicates, resolved)?;
-        if !resolve_duplicates && !base.starts_with(&parent_id) {
-            format!("{parent_id}.{base}")
+    let mut chain: Vec<&BString> = Vec::new();
+    let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
+    let mut cursor = Some(group_name);
+    while let Some(name) = cursor {
+        if resolved.contains_key(name) {
+            break;
+        }
+        if !seen.insert(name.as_slice()) {
+            return Err(error(format!(
+                "Cycle detected in CPack component group hierarchy involving \"{name}\""
+            )));
+        }
+        if chain.len() >= MAX_COMPONENT_GROUP_DEPTH {
+            return Err(error(format!(
+                "CPack component group hierarchy exceeds maximum depth ({MAX_COMPONENT_GROUP_DEPTH}) involving \"{group_name}\""
+            )));
+        }
+        chain.push(name);
+        cursor = catalog
+            .groups
+            .get(name)
+            .and_then(|g| g.parent_group.as_ref());
+    }
+    for name in chain.into_iter().rev() {
+        let upper = BString::from(name.to_ascii_uppercase());
+        let key = format!("CPACK_IFW_COMPONENT_GROUP_{upper}_NAME");
+        let base = option_set(cfg, key.as_bytes())
+            .map(|v| require_utf8(v, &key).map(str::to_owned))
+            .transpose()?
+            .unwrap_or_else(|| name.to_string());
+        let full = if let Some(parent_name) = catalog
+            .groups
+            .get(name)
+            .and_then(|g| g.parent_group.as_ref())
+            && let Some(parent_id) = resolved.get(parent_name)
+        {
+            if !resolve_duplicates && !base.starts_with(parent_id) {
+                format!("{parent_id}.{base}")
+            } else {
+                base
+            }
         } else {
             base
-        }
-    } else {
-        base
-    };
-    resolved.insert(group_name.clone(), full.clone());
-    Ok(full)
+        };
+        resolved.insert(name.clone(), full);
+    }
+    Ok(resolved
+        .get(group_name)
+        .cloned()
+        .unwrap_or_else(|| group_name.to_string()))
 }
 
 fn build_root_package_plan(
@@ -1545,39 +1672,96 @@ fn expand_localized_list(
     Ok(())
 }
 
-fn check_ifw_package_cycles(plans: &BTreeMap<String, PackagePlan>) -> Result<(), CpackError> {
-    let mut state = BTreeMap::<&str, u8>::new();
-    for id in plans.keys() {
-        if state.get(id.as_str()).copied().unwrap_or(0) == 0 {
-            dfs_ifw_pkg(plans, id, &mut state)?;
+#[cfg(test)]
+pub(super) fn check_deep_package_chain(count: usize, cyclic: bool) -> Result<(), CpackError> {
+    let mut plans = BTreeMap::new();
+    for i in 0..count {
+        let id = format!("pkg.{i}");
+        let mut dependencies = BTreeSet::new();
+        if i + 1 < count {
+            dependencies.insert(DependencySpec::parse(&format!("pkg.{}", i + 1)));
+        } else if cyclic && count > 1 {
+            dependencies.insert(DependencySpec::parse("pkg.0"));
         }
+        plans.insert(
+            id.clone(),
+            PackagePlan {
+                id,
+                display_name: BTreeMap::new(),
+                description: BTreeMap::new(),
+                version: "1.0".to_owned(),
+                release_date: None,
+                script: None,
+                licenses: Vec::new(),
+                user_interfaces: Vec::new(),
+                translations: Vec::new(),
+                dependencies,
+                auto_depend_on: BTreeSet::new(),
+                sorting_priority: None,
+                update_text: None,
+                default_selected: None,
+                essential: None,
+                is_virtual: None,
+                forced_installation: None,
+                replaces: Vec::new(),
+                requires_admin_rights: None,
+                checkable: None,
+                downloaded: false,
+                source_components: Vec::new(),
+            },
+        );
     }
-    Ok(())
+    check_ifw_package_cycles(&plans)
 }
 
-fn dfs_ifw_pkg<'a>(
-    plans: &'a BTreeMap<String, PackagePlan>,
-    id: &'a str,
-    state: &mut BTreeMap<&'a str, u8>,
-) -> Result<(), CpackError> {
-    state.insert(id, 1);
-    if let Some(pkg) = plans.get(id) {
-        for dep in pkg.dependencies.iter().chain(&pkg.auto_depend_on) {
-            if let Some(target_pkg) = plans.get(dep.name.as_str()) {
-                match state.get(target_pkg.id.as_str()).copied().unwrap_or(0) {
-                    1 => {
+fn check_ifw_package_cycles(plans: &BTreeMap<String, PackagePlan>) -> Result<(), CpackError> {
+    let mut state = BTreeMap::<&str, VisitState>::new();
+    let internal_deps = |id: &str| -> std::vec::IntoIter<&str> {
+        plans
+            .get(id)
+            .map(|pkg| {
+                pkg.dependencies
+                    .iter()
+                    .chain(&pkg.auto_depend_on)
+                    .filter_map(|dep| {
+                        plans
+                            .get(dep.name.as_str())
+                            .map(|target| target.id.as_str())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+            .into_iter()
+    };
+
+    for start in plans.keys() {
+        let start_id = start.as_str();
+        if state.contains_key(start_id) {
+            continue;
+        }
+        state.insert(start_id, VisitState::Visiting);
+        let mut stack = vec![(start_id, internal_deps(start_id))];
+        while let Some((node_id, deps_iter)) = stack.last_mut() {
+            if let Some(target_id) = deps_iter.next() {
+                match state.get(target_id) {
+                    Some(VisitState::Visiting) => {
                         return Err(error(format!(
-                            "Cycle detected in IFW package dependencies involving \"{id}\" and \"{}\"",
-                            target_pkg.id
+                            "Cycle detected in IFW package dependencies involving \"{node_id}\" and \"{target_id}\""
                         )));
                     }
-                    0 => dfs_ifw_pkg(plans, &target_pkg.id, state)?,
-                    _ => {}
+                    Some(VisitState::Visited) => {}
+                    None => {
+                        state.insert(target_id, VisitState::Visiting);
+                        stack.push((target_id, internal_deps(target_id)));
+                    }
                 }
+            } else {
+                let finished = *node_id;
+                stack.pop();
+                state.insert(finished, VisitState::Visited);
             }
         }
     }
-    state.insert(id, 2);
     Ok(())
 }
 
@@ -1646,7 +1830,7 @@ fn write_config_xml(
     settings: &InstallerSettings,
     config_dir: &Path,
     resources_dir: &Path,
-) -> Result<Vec<String>, CpackError> {
+) -> Result<Vec<PathBuf>, CpackError> {
     let mut w = XmlWriter::new("    ", 0);
     w.declaration();
     w.comment(&generated_by_comment(settings))?;
@@ -1843,31 +2027,58 @@ fn write_config_xml(
     prepare_fresh_output(host, &config_path)?;
     host.write(&config_path, xml.as_bytes(), WriteMode::CreateNew)?;
 
-    // Stage QRC resources via bounded XML parser (rejecting DTDs/external entities and escapes).
     let mut staged_qrc = Vec::new();
     if !settings.resources_qrc.is_empty() {
         host.create_dir_all(resources_dir)?;
-        let mut seen_qrc = BTreeMap::new();
-        for qrc_path in &settings.resources_qrc {
+        for (idx, qrc_path) in settings.resources_qrc.iter().enumerate() {
             if !host
                 .metadata_fresh(qrc_path, Follow::Yes)
                 .is_ok_and(|m| m.kind == FileKind::File)
             {
-                return Err(error(format!(
-                    "Missing IFW resource file: {}",
-                    qrc_path.display()
-                )));
+                warn(
+                    host,
+                    format!(
+                        "Can't copy resources from \"{}\". Resource will be skipped.",
+                        qrc_path.display()
+                    ),
+                );
+                continue;
             }
-            let bytes = host.read(
+            let bytes = match host.read(
                 qrc_path,
                 ReadRange::All {
                     limit: 4 * 1024 * 1024,
                 },
-            )?;
+            ) {
+                Ok(b) => b,
+                Err(_) => {
+                    warn(
+                        host,
+                        format!(
+                            "Can't copy resources from \"{}\". Resource will be skipped.",
+                            qrc_path.display()
+                        ),
+                    );
+                    continue;
+                }
+            };
             let root = parse_xml_bounded(&bytes, &qrc_path.display().to_string())?;
             let qrc_base = qrc_path.parent().unwrap_or(Path::new("/"));
+            let canon_qrc_base = host.canonicalize_fresh(qrc_base)?;
             let mut file_entries = Vec::new();
             collect_qrc_files(&root, &mut file_entries);
+            if file_entries.is_empty() {
+                warn(
+                    host,
+                    format!(
+                        "Can't copy resources from \"{}\". Resource will be skipped.",
+                        qrc_path.display()
+                    ),
+                );
+                continue;
+            }
+            let mut validated_files = Vec::with_capacity(file_entries.len());
+            let mut missing_asset = false;
             for rel_str in file_entries {
                 let rel = safe_relative_subpath(&rel_str, &qrc_path.display().to_string())?;
                 let src = qrc_base.join(&rel);
@@ -1875,28 +2086,66 @@ fn write_config_xml(
                     .metadata_fresh(&src, Follow::Yes)
                     .is_ok_and(|m| m.kind == FileKind::File)
                 {
+                    missing_asset = true;
+                    break;
+                }
+                let canon_src = host.canonicalize_fresh(&src)?;
+                if !canon_src.starts_with(&canon_qrc_base) {
                     return Err(error(format!(
-                        "Missing file referenced by QRC {}: {}",
-                        qrc_path.display(),
-                        src.display()
+                        "Path in {} escapes base directory: \"{rel_str}\"",
+                        qrc_path.display()
                     )));
                 }
-                let dst = resources_dir.join(&rel);
+                validated_files.push((rel, src));
+            }
+            if missing_asset {
+                warn(
+                    host,
+                    format!(
+                        "Can't copy resources from \"{}\". Resource will be skipped.",
+                        qrc_path.display()
+                    ),
+                );
+                continue;
+            }
+            let qrc_stage_dir = resources_dir.join(idx.to_string());
+            host.create_dir_all(&qrc_stage_dir)?;
+            let mut copy_failed = false;
+            for (rel, src) in validated_files {
+                let dst = qrc_stage_dir.join(&rel);
                 if let Some(parent) = dst.parent() {
-                    crate::stage::ensure_dir(host, resources_dir, parent)?;
+                    crate::stage::ensure_dir(host, &qrc_stage_dir, parent)?;
                 }
                 prepare_fresh_output(host, &dst)?;
-                host.copy_file(
-                    &src,
-                    &dst,
-                    CopyOptions {
-                        preserve_permissions: true,
-                        preserve_mtime: true,
-                    },
-                )?;
+                if host
+                    .copy_file(
+                        &src,
+                        &dst,
+                        CopyOptions {
+                            preserve_permissions: true,
+                            preserve_mtime: true,
+                        },
+                    )
+                    .is_err()
+                {
+                    copy_failed = true;
+                    break;
+                }
             }
-            let qrc_name = copy_meta_asset(host, qrc_path, resources_dir, None, &mut seen_qrc)?;
-            staged_qrc.push(qrc_name);
+            if copy_failed {
+                let _ = host.remove_dir_all(&qrc_stage_dir);
+                warn(
+                    host,
+                    format!(
+                        "Can't copy resources from \"{}\". Resource will be skipped.",
+                        qrc_path.display()
+                    ),
+                );
+                continue;
+            }
+            let mut seen_qrc = BTreeMap::new();
+            let qrc_name = copy_meta_asset(host, qrc_path, &qrc_stage_dir, None, &mut seen_qrc)?;
+            staged_qrc.push(qrc_stage_dir.join(qrc_name));
         }
     }
     Ok(staged_qrc)
@@ -2110,8 +2359,7 @@ fn build_binarycreator_args(
     host: &dyn Host,
     settings: &InstallerSettings,
     config_xml: &Path,
-    resources_dir: &Path,
-    staged_qrc: &[String],
+    staged_qrc: &[PathBuf],
     packages_dir: &Path,
     binary_ids: &[String],
     downloaded_ids: &[String],
@@ -2136,7 +2384,7 @@ fn build_binarycreator_args(
     if !staged_qrc.is_empty() {
         let joined = staged_qrc
             .iter()
-            .map(|name| from_native_cmake(&resources_dir.join(name)).to_string())
+            .map(|path| from_native_cmake(path).to_string())
             .collect::<Vec<_>>()
             .join(",");
         args.extend(["-r".into(), joined.into()]);
@@ -2202,8 +2450,13 @@ fn patch_updates_xml(
 
     let tmp_path = repo_dir.join("UpdatesPatch.xml");
     prepare_fresh_output(host, &tmp_path)?;
-    host.write(&tmp_path, xml.as_bytes(), WriteMode::CreateNew)?;
-    host.rename(&tmp_path, &updates_path)?;
+    if let Err(err) = host
+        .write(&tmp_path, xml.as_bytes(), WriteMode::CreateNew)
+        .and_then(|()| host.rename(&tmp_path, &updates_path))
+    {
+        let _ = host.remove_file(&tmp_path);
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -2220,9 +2473,8 @@ fn rewrite_updates_element(
     for child in &elem.children {
         match child {
             XmlNode::Text(t) => {
-                let trimmed = t.trim();
-                if !trimmed.is_empty() {
-                    w.text(trimmed)?;
+                if !t.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n')) {
+                    w.text(t)?;
                 }
             }
             XmlNode::Element(sub) => {

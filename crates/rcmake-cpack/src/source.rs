@@ -1,7 +1,8 @@
 //! Stage source files, validate post-hook staged-tree containment, and apply CMake regular
 //! expressions to source paths.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
@@ -132,6 +133,25 @@ pub(crate) fn canonical_checked_root(host: &dyn Host, root: &Path) -> Result<Pat
     Ok(host.canonicalize_fresh(root)?)
 }
 
+/// Verify that `root` is still a real directory (no-follow) whose freshly canonicalized path
+/// equals the pre-hook `expected_canon` root.
+pub(crate) fn verify_expected_root(
+    host: &dyn Host,
+    root: &Path,
+    expected_canon: &Path,
+) -> Result<PathBuf, CpackError> {
+    let actual = canonical_checked_root(host, root)?;
+    if actual != expected_canon {
+        return Err(error(format!(
+            "CPack directory changed canonical root: {} (expected {}, got {})",
+            root.display(),
+            expected_canon.display(),
+            actual.display()
+        )));
+    }
+    Ok(actual)
+}
+
 /// Verify that every parent component from `root` down to `rel` is a real directory
 /// inside `canon_root`, and validate the final component against `symlink_policy`.
 pub(crate) fn verify_contained_path(
@@ -210,295 +230,315 @@ pub(crate) fn verify_contained_path(
     )))
 }
 
-/// Validate a symbolic link at `link_path` inside `root` (`canon_root`), following chained
-/// links up to [`MAX_SYMLINK_HOPS`] and rejecting absolute targets, parent escapes,
-/// symlinked intermediate directories outside `root`, and cycles.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PathStep {
+    Normal(OsString),
+    Parent,
+}
+
+fn parse_relative_steps(target: &Path, link_path: &Path) -> Result<Vec<PathStep>, CpackError> {
+    let raw_target = from_native(target);
+    if raw_target.is_empty()
+        || raw_target.contains(&0)
+        || target.is_absolute()
+        || raw_target.starts_with(b"/")
+        || raw_target.starts_with(b"\\")
+    {
+        return Err(error(format!(
+            "CPack payload symbolic link escapes staging root: {} -> {}",
+            link_path.display(),
+            target.display()
+        )));
+    }
+    let mut steps = Vec::new();
+    for comp in target.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(seg) => steps.push(PathStep::Normal(seg.to_os_string())),
+            Component::ParentDir => steps.push(PathStep::Parent),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(error(format!(
+                    "CPack payload symbolic link uses absolute target: {} -> {}",
+                    link_path.display(),
+                    target.display()
+                )));
+            }
+        }
+    }
+    Ok(steps)
+}
+
+/// Validate a symbolic link at `link_path` inside `root` (`canon_root`), resolving each path
+/// component and symbolic link in order before applying subsequent `..` traversals. Rejects
+/// absolute targets, parent escapes at any step, symlinked parents outside `root`, cycles,
+/// and chains exceeding [`MAX_SYMLINK_HOPS`].
 pub(crate) fn validate_contained_symlink(
     host: &dyn Host,
     root: &Path,
     canon_root: &Path,
     link_path: &Path,
 ) -> Result<PathBuf, CpackError> {
-    let mut hops_left = MAX_SYMLINK_HOPS;
-    let mut visited = BTreeSet::new();
-    validate_contained_symlink_inner(
-        host,
-        root,
-        canon_root,
-        link_path,
-        &mut hops_left,
-        &mut visited,
-    )
-}
-
-fn validate_contained_symlink_inner(
-    host: &dyn Host,
-    root: &Path,
-    canon_root: &Path,
-    link_path: &Path,
-    hops_left: &mut usize,
-    visited: &mut BTreeSet<PathBuf>,
-) -> Result<PathBuf, CpackError> {
     let initial_target = host.read_link(link_path)?;
-    let mut current_link = link_path.to_owned();
-    let mut first = true;
+    let initial_steps = parse_relative_steps(&initial_target, link_path)?;
 
-    loop {
-        if *hops_left == 0 {
-            return Err(error(format!(
-                "CPack payload symbolic link chain exceeds limit: {}",
-                link_path.display()
-            )));
+    let parent = link_path.parent().ok_or_else(|| {
+        error(format!(
+            "CPack payload symbolic link has no parent: {}",
+            link_path.display()
+        ))
+    })?;
+    let rel_parent = parent.strip_prefix(root).map_err(|_| {
+        error(format!(
+            "CPack payload symbolic link is outside root: {}",
+            link_path.display()
+        ))
+    })?;
+
+    let mut stack: Vec<OsString> = Vec::new();
+    let mut parent_check = root.to_owned();
+    for comp in rel_parent.components() {
+        if let Component::Normal(seg) = comp {
+            parent_check.push(seg);
+            let meta = host.metadata_fresh(&parent_check, Follow::No)?;
+            if meta.kind != FileKind::Dir
+                || !host
+                    .canonicalize_fresh(&parent_check)?
+                    .starts_with(canon_root)
+            {
+                return Err(error(format!(
+                    "CPack payload symbolic link parent escapes staging root: {}",
+                    parent_check.display()
+                )));
+            }
+            stack.push(seg.to_os_string());
         }
-        *hops_left -= 1;
-        if !visited.insert(current_link.clone()) {
-            return Err(error(format!(
-                "CPack payload symbolic link cycle detected: {}",
-                link_path.display()
-            )));
-        }
-        let target = if first {
-            first = false;
-            initial_target.clone()
-        } else {
-            host.read_link(&current_link)?
-        };
-        let raw_target = from_native(&target);
-        if raw_target.is_empty()
-            || raw_target.contains(&0)
-            || target.is_absolute()
-            || raw_target.starts_with(b"/")
-            || raw_target.starts_with(b"\\")
-        {
-            return Err(error(format!(
-                "CPack payload symbolic link escapes staging root: {} -> {}",
-                current_link.display(),
-                target.display()
-            )));
-        }
-        let parent = current_link.parent().ok_or_else(|| {
-            error(format!(
-                "CPack payload symbolic link has no parent: {}",
-                current_link.display()
-            ))
-        })?;
-        let rel_parent = parent.strip_prefix(root).map_err(|_| {
-            error(format!(
-                "CPack payload symbolic link is outside root: {}",
-                current_link.display()
-            ))
-        })?;
-        let mut stack: Vec<std::ffi::OsString> = rel_parent
-            .components()
-            .filter_map(|c| match c {
-                Component::Normal(s) => Some(s.to_os_string()),
-                _ => None,
-            })
-            .collect();
-        for comp in target.components() {
-            match comp {
-                Component::CurDir => {}
-                Component::Normal(s) => stack.push(s.to_os_string()),
-                Component::ParentDir => {
-                    if stack.pop().is_none() {
-                        return Err(error(format!(
-                            "CPack payload symbolic link escapes staging root: {} -> {}",
-                            current_link.display(),
-                            target.display()
-                        )));
-                    }
-                }
-                Component::RootDir | Component::Prefix(_) => {
+    }
+
+    let mut pending: VecDeque<PathStep> = initial_steps.into();
+    let mut hops_left = MAX_SYMLINK_HOPS.saturating_sub(1);
+    let mut seen_states: BTreeSet<(PathBuf, VecDeque<PathStep>)> = BTreeSet::new();
+    seen_states.insert((link_path.to_path_buf(), VecDeque::new()));
+
+    while let Some(step) = pending.pop_front() {
+        match step {
+            PathStep::Parent => {
+                if stack.pop().is_none() {
                     return Err(error(format!(
-                        "CPack payload symbolic link uses absolute target: {} -> {}",
-                        current_link.display(),
-                        target.display()
+                        "CPack payload symbolic link escapes staging root: {} -> {}",
+                        link_path.display(),
+                        initial_target.display()
                     )));
                 }
             }
-        }
-        let mut resolved = root.to_owned();
-        let mut next_link: Option<PathBuf> = None;
-        for (idx, seg) in stack.iter().enumerate() {
-            resolved.push(seg);
-            let is_last = idx + 1 == stack.len();
-            match host.metadata_fresh(&resolved, Follow::No) {
-                Ok(meta) => {
-                    if meta.kind == FileKind::Symlink {
-                        if !is_last {
-                            let rest: PathBuf =
-                                stack.get(idx + 1..).unwrap_or(&[]).iter().collect();
-                            let mid_target = host.read_link(&resolved)?;
-                            let mid_parent = resolved.parent().unwrap_or(root);
-                            let mid_rel = mid_parent.strip_prefix(root).map_err(|_| {
-                                error(format!(
-                                    "CPack symlink intermediate parent outside root: {}",
-                                    resolved.display()
-                                ))
-                            })?;
-                            let mut mid_stack: Vec<std::ffi::OsString> = mid_rel
-                                .components()
-                                .filter_map(|c| match c {
-                                    Component::Normal(s) => Some(s.to_os_string()),
-                                    _ => None,
-                                })
-                                .collect();
-                            for c in mid_target.components().chain(rest.components()) {
-                                match c {
-                                    Component::CurDir => {}
-                                    Component::Normal(s) => mid_stack.push(s.to_os_string()),
-                                    Component::ParentDir => {
-                                        if mid_stack.pop().is_none() {
-                                            return Err(error(format!(
-                                                "CPack payload symbolic link escapes staging root via {}: {}",
-                                                resolved.display(),
-                                                link_path.display()
-                                            )));
-                                        }
-                                    }
-                                    Component::RootDir | Component::Prefix(_) => {
-                                        return Err(error(format!(
-                                            "CPack payload symbolic link escapes staging root via absolute intermediate link: {}",
-                                            resolved.display()
-                                        )));
-                                    }
-                                }
+            PathStep::Normal(seg) => {
+                let mut candidate = root.to_owned();
+                for part in &stack {
+                    candidate.push(part);
+                }
+                candidate.push(&seg);
+                match host.metadata_fresh(&candidate, Follow::No) {
+                    Ok(meta) => match meta.kind {
+                        FileKind::Symlink => {
+                            if !seen_states.insert((candidate.clone(), pending.clone())) {
+                                return Err(error(format!(
+                                    "CPack payload symbolic link cycle detected: {}",
+                                    link_path.display()
+                                )));
                             }
-                            let _ = validate_contained_symlink_inner(
-                                host, root, canon_root, &resolved, hops_left, visited,
-                            )?;
-                            let mut combined = root.to_owned();
-                            for part in &mid_stack {
-                                combined.push(part);
+                            if hops_left == 0 {
+                                return Err(error(format!(
+                                    "CPack payload symbolic link chain exceeds limit: {}",
+                                    link_path.display()
+                                )));
                             }
-                            if let Ok(m) = host.metadata_fresh(&combined, Follow::No) {
-                                if m.kind == FileKind::Symlink {
-                                    next_link = Some(combined);
-                                    break;
-                                }
-                                let canon = host.canonicalize_fresh(&combined)?;
-                                if !canon.starts_with(canon_root) {
-                                    return Err(error(format!(
-                                        "CPack payload symbolic link escapes staging root: {}",
-                                        link_path.display()
-                                    )));
-                                }
+                            hops_left -= 1;
+                            let next_target = host.read_link(&candidate)?;
+                            let next_steps = parse_relative_steps(&next_target, &candidate)?;
+                            for next in next_steps.into_iter().rev() {
+                                pending.push_front(next);
                             }
-                            return Ok(initial_target);
                         }
-                        next_link = Some(resolved.clone());
-                        break;
+                        FileKind::Dir => {
+                            let canon = host.canonicalize_fresh(&candidate)?;
+                            if !canon.starts_with(canon_root) {
+                                return Err(error(format!(
+                                    "CPack payload symbolic link escapes staging root: {}",
+                                    link_path.display()
+                                )));
+                            }
+                            stack.push(seg);
+                        }
+                        FileKind::File => {
+                            let canon = host.canonicalize_fresh(&candidate)?;
+                            if !canon.starts_with(canon_root) {
+                                return Err(error(format!(
+                                    "CPack payload symbolic link escapes staging root: {}",
+                                    link_path.display()
+                                )));
+                            }
+                            if !pending.is_empty() {
+                                return Err(error(format!(
+                                    "CPack payload symbolic link traverses non-directory: {}",
+                                    candidate.display()
+                                )));
+                            }
+                            stack.push(seg);
+                        }
+                        FileKind::Other => {
+                            return Err(error(format!(
+                                "Unsupported special file in CPack staging tree: {}",
+                                candidate.display()
+                            )));
+                        }
+                    },
+                    Err(err) if err.kind == ErrorKind::NotFound => {
+                        stack.push(seg);
                     }
-                    if !is_last && meta.kind != FileKind::Dir {
-                        return Err(error(format!(
-                            "CPack payload symbolic link traverses non-directory: {}",
-                            resolved.display()
-                        )));
-                    }
-                    let canon = host.canonicalize_fresh(&resolved)?;
-                    if !canon.starts_with(canon_root) {
-                        return Err(error(format!(
-                            "CPack payload symbolic link escapes staging root: {}",
-                            link_path.display()
-                        )));
-                    }
+                    Err(err) => return Err(err.into()),
                 }
-                Err(err) if err.kind == ErrorKind::NotFound => {
-                    return Ok(initial_target);
-                }
-                Err(err) => return Err(err.into()),
             }
         }
-        match next_link {
-            Some(link) => current_link = link,
-            None => return Ok(initial_target),
-        }
     }
+
+    let mut final_path = root.to_owned();
+    for part in &stack {
+        final_path.push(part);
+    }
+    match host.metadata_fresh(&final_path, Follow::No) {
+        Ok(_) => {
+            let canon = host.canonicalize_fresh(&final_path)?;
+            if !canon.starts_with(canon_root) {
+                return Err(error(format!(
+                    "CPack payload symbolic link escapes staging root: {}",
+                    link_path.display()
+                )));
+            }
+        }
+        Err(err) if err.kind == ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(initial_target)
 }
 
-/// Re-validate the staged tree after pre-build hooks run (Audit Finding #9).
+/// Re-validate the staged tree after pre-build hooks run against the pre-hook canonical staging
+/// root.
 ///
-/// For component installs (`!members.is_empty()`), validates every recorded component
-/// root and every recorded member path (including all intermediate parent directories and
-/// symlink targets) plus any live tree entries under each component root. For monolithic
-/// installs, validates the full `staging_root` tree.
+/// For component installs (`!members.is_empty()`), validates every component's pre-hook root
+/// and scanned directory against its captured canonical root and walks the full live tree under
+/// each component root. For monolithic installs, validates the full `staging_root` tree.
 pub(crate) fn validate_staged_tree(
     host: &dyn Host,
     staging_root: &Path,
+    expected_canon_staging: &Path,
     members: &[InstalledComponent],
     symlink_policy: SymlinkPolicy,
     windows_rules: bool,
 ) -> Result<(), CpackError> {
-    let canon_staging = canonical_checked_root(host, staging_root)?;
+    let canon_staging = verify_expected_root(host, staging_root, expected_canon_staging)?;
     if members.is_empty() {
-        let mut remaining = MAX_WALK_ENTRIES;
-        let mut seen_case = BTreeMap::new();
-        validate_dir_walk(
+        return validate_dir_subtree(
             host,
             staging_root,
             &canon_staging,
             staging_root,
-            Path::new(""),
-            0,
-            &mut remaining,
             symlink_policy,
             windows_rules,
-            &mut seen_case,
-        )?;
-        return Ok(());
+        );
     }
     for component in members {
         for staged in &component.staged_roots {
-            let rel_scanned = staged.scanned.strip_prefix(staging_root).map_err(|_| {
+            let rel_root = staged.root.strip_prefix(staging_root).map_err(|_| {
                 error(format!(
                     "CPack component staging root escapes staging directory: {}",
+                    staged.root.display()
+                ))
+            })?;
+            if !rel_root.as_os_str().is_empty() {
+                verify_contained_path(
+                    host,
+                    staging_root,
+                    &canon_staging,
+                    rel_root,
+                    SymlinkPolicy::Reject,
+                    false,
+                )?;
+            }
+            let canon_root = if !staged.canon_root.as_os_str().is_empty() {
+                verify_expected_root(host, &staged.root, &staged.canon_root)?
+            } else {
+                canonical_checked_root(host, &staged.root)?
+            };
+            if !canon_root.starts_with(&canon_staging) {
+                return Err(error(format!(
+                    "CPack component root escapes staging directory: {}",
+                    staged.root.display()
+                )));
+            }
+
+            let rel_scanned = staged.scanned.strip_prefix(&staged.root).map_err(|_| {
+                error(format!(
+                    "CPack component scanned root escapes component directory: {}",
                     staged.scanned.display()
                 ))
             })?;
             if !rel_scanned.as_os_str().is_empty() {
                 verify_contained_path(
                     host,
-                    staging_root,
-                    &canon_staging,
+                    &staged.root,
+                    &canon_root,
                     rel_scanned,
                     SymlinkPolicy::Reject,
                     false,
                 )?;
             }
-            let canon_root = canonical_checked_root(host, &staged.scanned)?;
-            if !canon_root.starts_with(&canon_staging) {
+            let canon_scanned = if !staged.canon_scanned.as_os_str().is_empty() {
+                verify_expected_root(host, &staged.scanned, &staged.canon_scanned)?
+            } else {
+                canonical_checked_root(host, &staged.scanned)?
+            };
+            if !canon_scanned.starts_with(&canon_root) {
                 return Err(error(format!(
-                    "CPack component root escapes staging directory: {}",
+                    "CPack component scanned root escapes component directory: {}",
                     staged.scanned.display()
                 )));
             }
-            for member in &staged.files {
-                verify_contained_path(
-                    host,
-                    &staged.scanned,
-                    &canon_root,
-                    member,
-                    symlink_policy,
-                    windows_rules,
-                )?;
-            }
-            let mut remaining = MAX_WALK_ENTRIES;
-            let mut seen_case = BTreeMap::new();
-            validate_dir_walk(
+
+            validate_dir_subtree(
                 host,
-                &staged.scanned,
+                &staged.root,
                 &canon_root,
-                &staged.scanned,
-                Path::new(""),
-                0,
-                &mut remaining,
+                &staged.root,
                 symlink_policy,
                 windows_rules,
-                &mut seen_case,
             )?;
         }
     }
     Ok(())
+}
+
+/// Validate every directory, file, and symbolic link below `start` against `(root, canon_root)`.
+pub(crate) fn validate_dir_subtree(
+    host: &dyn Host,
+    root: &Path,
+    canon_root: &Path,
+    start: &Path,
+    symlink_policy: SymlinkPolicy,
+    windows_rules: bool,
+) -> Result<(), CpackError> {
+    let mut remaining = MAX_WALK_ENTRIES;
+    let mut seen_case = BTreeMap::new();
+    validate_dir_walk(
+        host,
+        root,
+        canon_root,
+        start,
+        Path::new(""),
+        0,
+        &mut remaining,
+        symlink_policy,
+        windows_rules,
+        &mut seen_case,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -710,19 +750,52 @@ pub(crate) fn copy_checked_tree(
     windows_rules: bool,
 ) -> Result<(), CpackError> {
     let canon_source = canonical_checked_root(host, source)?;
-    let mut remaining = MAX_WALK_ENTRIES;
-    let mut seen_case = BTreeMap::new();
-    validate_dir_walk(
+    copy_checked_tree_with_canon(
         host,
         source,
         &canon_source,
-        source,
-        Path::new(""),
-        0,
-        &mut remaining,
+        dest,
         symlink_policy,
         windows_rules,
-        &mut seen_case,
+    )
+}
+
+/// Copy a validated tree from `source` into `dest` after verifying `source` still resolves
+/// to `expected_canon_source`.
+pub(crate) fn copy_checked_tree_expected(
+    host: &dyn Host,
+    source: &Path,
+    expected_canon_source: &Path,
+    dest: &Path,
+    symlink_policy: SymlinkPolicy,
+    windows_rules: bool,
+) -> Result<(), CpackError> {
+    let canon_source = verify_expected_root(host, source, expected_canon_source)?;
+    copy_checked_tree_with_canon(
+        host,
+        source,
+        &canon_source,
+        dest,
+        symlink_policy,
+        windows_rules,
+    )
+}
+
+fn copy_checked_tree_with_canon(
+    host: &dyn Host,
+    source: &Path,
+    canon_source: &Path,
+    dest: &Path,
+    symlink_policy: SymlinkPolicy,
+    windows_rules: bool,
+) -> Result<(), CpackError> {
+    validate_dir_subtree(
+        host,
+        source,
+        canon_source,
+        source,
+        symlink_policy,
+        windows_rules,
     )?;
     let mut remaining = MAX_WALK_ENTRIES;
     copy_tree(
@@ -732,7 +805,7 @@ pub(crate) fn copy_checked_tree(
         0,
         &mut remaining,
         Some(source),
-        Some((source, &canon_source, symlink_policy)),
+        Some((source, canon_source, symlink_policy)),
         &mut |_, _| Ok(false),
     )
 }
@@ -746,12 +819,14 @@ pub(crate) fn copy_checked_tree(
 pub(crate) fn merge_recorded(
     host: &dyn Host,
     source: &Path,
+    expected_canon_source: &Path,
     members: &BTreeSet<PathBuf>,
     dest: &Path,
 ) -> Result<(), CpackError> {
     merge_recorded_checked(
         host,
         source,
+        expected_canon_source,
         members,
         dest,
         SymlinkPolicy::PreserveContained,
@@ -764,12 +839,13 @@ pub(crate) fn merge_recorded(
 pub(crate) fn merge_recorded_checked(
     host: &dyn Host,
     source: &Path,
+    expected_canon_source: &Path,
     members: &BTreeSet<PathBuf>,
     dest: &Path,
     symlink_policy: SymlinkPolicy,
     windows_rules: bool,
 ) -> Result<(), CpackError> {
-    let canon_source = canonical_checked_root(host, source)?;
+    let canon_source = verify_expected_root(host, source, expected_canon_source)?;
     let mut directories = Vec::new();
     let mut seen_case = BTreeMap::new();
     for member in members {

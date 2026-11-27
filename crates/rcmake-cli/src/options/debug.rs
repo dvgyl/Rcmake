@@ -11,14 +11,26 @@ pub(super) fn parse<'a>(
     profile_format: &mut Option<&'a [u8]>,
 ) -> Result<bool, String> {
     match arg.flag {
-        b"--debugger" => return Err("CMake was not built with support for --debugger".into()),
+        b"--debugger" => {
+            if !rcmake_dap::TRANSPORT_SUPPORTED {
+                return Err("CMake was not built with support for --debugger".into());
+            }
+            out(host, "Running with debugger on.\n");
+            opts.debugger = true;
+        }
         b"--debugger-pipe" => {
-            arg.required("No path specified for --debugger-pipe")?;
-            return Err("CMake was not built with support for --debugger-pipe".into());
+            let path = arg.required("No path specified for --debugger-pipe")?;
+            if !rcmake_dap::TRANSPORT_SUPPORTED {
+                return Err("CMake was not built with support for --debugger-pipe".into());
+            }
+            opts.debugger_pipe = Some(rcmake_host::path::to_native(path));
         }
         b"--debugger-dap-log" => {
-            arg.required("No file specified for --debugger-dap-log")?;
-            return Err("CMake was not built with support for --debugger-dap-log".into());
+            let path = arg.required("No file specified for --debugger-dap-log")?;
+            if !rcmake_dap::TRANSPORT_SUPPORTED {
+                return Err("CMake was not built with support for --debugger-dap-log".into());
+            }
+            opts.debugger_dap_log = Some(resolve_cli_path(host, path));
         }
         b"--debug-output" => {
             out(host, "Running with debug output on.\n");

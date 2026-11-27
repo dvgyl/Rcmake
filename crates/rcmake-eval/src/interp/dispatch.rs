@@ -313,6 +313,10 @@ impl Interp {
         self.depth = self.depth.saturating_add(1);
         let saved_line = core::mem::replace(&mut self.cur_line, line);
         let saved_failed = core::mem::replace(&mut self.cmd_failed, false);
+        // `CallScope` pushes the debugger frame before the recursion check.
+        if self.debug_attached {
+            self.debug_begin_command(file, line, &name);
+        }
 
         let limit = self.recursion_limit();
         self.note_recursion_limit(limit);
@@ -371,6 +375,10 @@ impl Interp {
         } else {
             self.finish_command(&name, result)
         };
+        // The frame stays on the debugger stack through the command diagnostics.
+        if self.debug_attached {
+            self.debug_end_command();
+        }
 
         self.cmd_failed = saved_failed;
         self.cur_line = saved_line;
@@ -569,6 +577,9 @@ impl Interp {
         };
         let saved = self.cur_cmd.replace((Arc::clone(&code.cmds), 0));
         let vars = self.push_list_file_vars(&code.file);
+        if self.debug_attached {
+            self.debug_note_raw_args(&cmd.args);
+        }
         let _ = self.with_frame_arc(&code.file, cmd.line, code.name_arc(0), Some(id), |this| {
             this.dispatch(cmd, &code.file)
         });
@@ -794,6 +805,9 @@ impl Interp {
             };
             (Arc::from(vec![cmd]), 0)
         });
+        if self.debug_attached {
+            self.debug_note_values(args.iter().map(|arg| arg.value.clone()));
+        }
         let args = if raw.is_some() { Vec::new() } else { args };
         let saved = core::mem::replace(&mut self.cur_cmd, raw);
         let result = self.with_command_frame(&file, line, name, |this| {
@@ -864,6 +878,9 @@ impl Interp {
         let Some(cmd) = code.cmds.get(i) else {
             return (Ok(Flow::Normal), i + 1);
         };
+        if self.debug_attached {
+            self.debug_note_raw_args(&cmd.args);
+        }
         let result = match cmd.lower.as_slice() {
             b"if" => self.exec_if(code, i),
             b"foreach" => {

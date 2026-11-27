@@ -18,3 +18,7 @@ rcmake-model.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The transcript tests check that an attached debugger turns off incremental replay.
+rcmake-eval = { workspace = true, features = ["replay"] }

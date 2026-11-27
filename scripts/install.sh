@@ -20,7 +20,7 @@ Sources (select one, the default is the latest GitHub Release):
 
 Options:
   --prefix <dir>     Set the installation root (default: $PREFIX or $HOME/.local).
-  --alias-cmake      Also create cmake, ctest, and cpack links to rcmake.
+  --alias-cmake      Also create cmake, ctest, cpack, and ccmake links to rcmake.
   --force            Allow replacement of unmarked share/cmake-4.5 data.
                      With --alias-cmake, also replace existing aliases.
   --uninstall        Remove rcmake, rcmake-lsp, the links to rcmake,
@@ -104,7 +104,7 @@ bin_dir="$prefix/bin"
 data_dir="$prefix/share/cmake-4.5"
 data_marker="$data_dir/.rcmake-managed"
 doc_dir="$prefix/share/doc/rcmake"
-tools=(cmake ctest cpack)
+tools=(cmake ctest cpack ccmake)
 extra_share_files=(
   "$prefix/share/man/man1/rcmake.1"
   "$prefix/share/bash-completion/completions/rcmake"
@@ -405,7 +405,7 @@ import tempfile
 
 archive, checksum, prefix, aliases, force = sys.argv[1:]
 archive, prefix = Path(archive), Path(prefix)
-tools = ("cmake", "ctest", "cpack")
+tools = ("cmake", "ctest", "cpack", "ccmake")
 data_dir = Path("share/cmake-4.5")
 data_marker = Path(".rcmake-managed")
 doc_dir = Path("share/doc/rcmake")

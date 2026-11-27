@@ -286,6 +286,7 @@ fn creates_native_disk_images_without_mounting() {
         vars: &vars,
         file_name: b"sample",
         grouping: crate::ComponentGrouping::default(),
+        canonical_roots: None,
     };
     let artifacts = DragNDropGenerator.package(&cx).unwrap();
     assert_eq!(artifacts, [scratch.path.join("sample.dmg")]);

@@ -39,6 +39,7 @@ mod builtins;
 mod code;
 mod configure_log;
 mod cx;
+pub mod debug;
 mod digest;
 mod env;
 mod file_lock;
@@ -571,6 +572,12 @@ pub struct Interp {
     listfiles: Vec<Arc<[u8]>>,
     file_locks: Vec<file_lock::ScopeLocks>,
     function_locks: Vec<file_lock::ScopeLocks>,
+    /// Attached debugger (`--debugger`). It is out of its slot while a hook method runs.
+    debugger: Option<Box<dyn debug::DebugHook>>,
+    /// A debugger is attached ([`Interp::has_debugger`]), also while the hook runs.
+    debug_attached: bool,
+    /// Arguments of the command that starts the next debugger frame.
+    debug_call_args: Option<Vec<BString>>,
 }
 
 impl Interp {
@@ -705,6 +712,9 @@ impl Interp {
             listfiles: Vec::new(),
             file_locks: Vec::new(),
             function_locks: Vec::new(),
+            debugger: None,
+            debug_attached: false,
+            debug_call_args: None,
         };
         interp.init_default_vars();
         interp

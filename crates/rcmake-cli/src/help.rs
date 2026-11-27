@@ -5,6 +5,10 @@ use crate::{Tool, options, resolve_cli_path};
 
 const COMPAT_USAGE: &[u8] = include_bytes!("../help/usage.txt");
 const NATIVE_USAGE: &[u8] = include_bytes!("../help/native_usage.txt");
+const CCMAKE_USAGE: &[u8] = include_bytes!("../help/ccmake_usage.txt");
+
+/// Short usage printed by `ccmake` when invoked with no arguments.
+pub(crate) const CCMAKE_SHORT_USAGE: &[u8] = b"Usage\n\n  ccmake <path-to-source>\n  ccmake <path-to-existing-build>\n\nSpecify a source directory to (re-)generate a build system for it in the\ncurrent working directory.  Specify an existing build directory to\nre-generate its build system.\n\nRun 'ccmake --help' for more information.\n\n";
 
 const MISSING_MANUAL: &str =
     "is not an available manual.  Use --help-manual-list to see all available manuals.";
@@ -98,9 +102,9 @@ pub(crate) fn run(
     persona: crate::persona::Persona,
     host: &dyn Host,
 ) -> Option<i32> {
-    // `cmake` stops at `--` and `cpack` stops at `-G`. `ctest` reads every argument.
+    // `cmake` and `ccmake` stop at `--` and `cpack` stops at `-G`. `ctest` reads every argument.
     let exit_option: Option<&[u8]> = match tool {
-        Tool::Cmake => Some(b"--".as_slice()),
+        Tool::Cmake | Tool::Ccmake => Some(b"--".as_slice()),
         Tool::Ctest => None,
         Tool::Cpack => Some(b"-G".as_slice()),
     };
@@ -168,7 +172,7 @@ pub(crate) fn run(
     if requests.is_empty() && !removed_option {
         return None;
     }
-    if tool != Tool::Cmake && !needs_reference && !removed_option {
+    if !matches!(tool, Tool::Cmake | Tool::Ccmake) && !needs_reference && !removed_option {
         return None;
     }
     let reference = if needs_reference {
@@ -194,9 +198,16 @@ pub(crate) fn run(
     let mut stdout = false;
     let mut status = 0;
     for (request, output) in requests {
-        if matches!(request, Request::Usage) && tool != Tool::Cmake {
+        if matches!(request, Request::Usage) && !matches!(tool, Tool::Cmake | Tool::Ccmake) {
             separate(host, &mut stdout);
             host.write_out(Stream::Stdout, tool_usage(tool));
+            continue;
+        }
+        if matches!(request, Request::Usage) && tool == Tool::Ccmake {
+            separate(host, &mut stdout);
+            host.write_out(Stream::Stdout, CCMAKE_USAGE);
+            options::print_help_generators(host);
+            host.write_out(Stream::Stdout, b"\n");
             continue;
         }
         if matches!(request, Request::Usage) {
@@ -254,6 +265,7 @@ pub(crate) fn run(
 fn tool_usage(tool: Tool) -> &'static [u8] {
     match tool {
         Tool::Cmake => COMPAT_USAGE,
+        Tool::Ccmake => CCMAKE_USAGE,
         Tool::Ctest => rcmake_ctest::USAGE,
         Tool::Cpack => rcmake_cpack::USAGE,
     }
@@ -546,5 +558,50 @@ mod tests {
             stdout,
             BString::from("ctest version 4.5.1\nrcmake 0.1.0\n\n\nset text\n")
         );
+    }
+
+    #[test]
+    fn ccmake_prints_usage_version_help_and_topics_without_a_tty() {
+        let entries = [("command\tset", "set text\n")];
+
+        let host = host_with_reference(&entries);
+        let (code, stdout, stderr) = invoke(&host, &["ccmake"]);
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout, BString::from(super::CCMAKE_SHORT_USAGE));
+
+        let host = host_with_reference(&entries);
+        let (code, stdout, stderr) = invoke(&host, &["ccmake", "--version"]);
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            stdout,
+            BString::from("ccmake version 4.5.1\nrcmake 0.1.0\n")
+        );
+
+        let host = host_with_reference(&entries);
+        let (code, stdout, stderr) = invoke(&host, &["ccmake", "--version=json-v1"]);
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("\"name\" : \"ccmake\""),
+            "{stdout}"
+        );
+
+        let host = host_with_reference(&entries);
+        let (code, stdout, stderr) = invoke(&host, &["ccmake", "--help"]);
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty());
+        let help = String::from_utf8_lossy(&stdout);
+        assert!(
+            help.starts_with("Usage\n\n  ccmake <path-to-source>"),
+            "{help}"
+        );
+        assert!(help.contains("Options\n"), "{help}");
+        assert!(help.contains("Generators\n"), "{help}");
+
+        let host = host_with_reference(&entries);
+        let (code, stdout, _) = invoke(&host, &["ccmake", "--help-command", "set"]);
+        assert_eq!((code, stdout), (0, BString::from("set text\n")));
     }
 }

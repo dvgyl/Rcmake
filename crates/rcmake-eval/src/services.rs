@@ -66,10 +66,10 @@ impl Interp {
         self.parse_cache = Some(cache);
     }
 
-    /// Return whether tracing or command profiling is active.
+    /// Return whether tracing, command profiling, or a debugger is active.
     #[must_use]
     pub fn has_command_observers(&self) -> bool {
-        self.trace.is_some() || self.command_profiler.is_some()
+        self.trace.is_some() || self.command_profiler.is_some() || self.has_debugger()
     }
 }
 

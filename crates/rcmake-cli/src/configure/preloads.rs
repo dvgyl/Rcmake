@@ -158,6 +158,12 @@ impl ConfigureSession<'_> {
         *interp.cx().diag_state_mut() = *configure.cx().diag_state();
         *interp.cx().cache() = std::mem::take(configure.cx().cache());
         set_directory_vars(&mut interp, &self.src, &self.bin);
+        // After a cache reset the debugger session is active: the preload reports to it
+        // through the hook of the configure interpreter, which gets the hook back after.
+        let debugger = configure.take_debug_hook();
+        if debugger.is_some() {
+            interp.set_debug_hook(debugger);
+        }
         let pending = configure
             .unread_variables()
             .map(BString::from)
@@ -176,6 +182,9 @@ impl ConfigureSession<'_> {
             .map(BString::from)
             .collect::<BTreeSet<_>>();
         configure.untrack_variable_reads(pending.difference(&unread).cloned());
+        if let Some(hook) = interp.take_debug_hook() {
+            configure.set_debug_hook(Some(hook));
+        }
         *configure.cx().cache() = std::mem::take(interp.cx().cache());
         let name = b"_RCMAKE_FILE_API_PROJECT_QUERIES";
         let mut preload = interp.cx();

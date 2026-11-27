@@ -159,12 +159,13 @@ impl ProductBuild {
         let host = cx.host;
         let cwd = host.initial_cwd();
         let settings = Settings::from_config(&cfg, &cwd)?;
+        let canon_work = cx.expected_work_root()?;
+        let canon_staging = cx.expected_staging_root()?;
 
-        // Audit Finding #9: re-validate the entire staged tree after pre-build hooks before
-        // touching any payload or invoking external tools.
         validate_staged_tree(
             host,
             cx.staging_dir,
+            &canon_staging,
             members,
             SymlinkPolicy::PreserveContained,
             false,
@@ -175,9 +176,6 @@ impl ProductBuild {
         let payload_base = scratch.path.join("payload");
         host.create_dir_all(&payload_base)?;
 
-        // Copy validated payload snapshots into the isolated scratch directory BEFORE creating
-        // Contents/ inside staging_dir so resources and leaf .pkg outputs can never become
-        // payload entries.
         let mut leaf_plans = Vec::new();
         let mut used_leaf_names = BTreeSet::new();
         let mut used_script_dirs = BTreeSet::new();
@@ -189,6 +187,7 @@ impl ProductBuild {
             copy_monolithic_payload(
                 host,
                 cx.staging_dir,
+                &canon_staging,
                 &mono_payload,
                 SymlinkPolicy::PreserveContained,
                 false,
@@ -218,6 +217,7 @@ impl ProductBuild {
                     copy_component_payload(
                         host,
                         cx.staging_dir,
+                        &canon_staging,
                         member,
                         &comp_payload,
                         SymlinkPolicy::PreserveContained,
@@ -225,7 +225,20 @@ impl ProductBuild {
                         true,
                     )?;
                 } else {
-                    host.create_dir_all(&comp_payload)?;
+                    let fallback = crate::InstalledComponent {
+                        name: comp_name.clone(),
+                        ..Default::default()
+                    };
+                    copy_component_payload(
+                        host,
+                        cx.staging_dir,
+                        &canon_staging,
+                        &fallback,
+                        &comp_payload,
+                        SymlinkPolicy::PreserveContained,
+                        false,
+                        true,
+                    )?;
                 }
                 let size_bytes = checked_tree_size_bytes(host, &comp_payload)?;
                 let leaf_name = leaf_pkg_file_name(file_stem, comp_meta)?;
@@ -266,8 +279,14 @@ impl ProductBuild {
             }
         }
 
-        // Now create Contents/Packages safely inside staging_dir.
         crate::stage::ensure_dir(host, cx.staging_dir, &packages_dir)?;
+        let canon_packages = crate::source::canonical_checked_root(host, &packages_dir)?;
+        if !canon_packages.starts_with(&canon_staging) {
+            return Err(error(format!(
+                "CPack productbuild packages directory escapes staging directory: {}",
+                packages_dir.display()
+            )));
+        }
 
         let log_path = cx.output_dir.join("ProductBuildOutput.log");
         let mut comp_pkg_info: BTreeMap<BString, (String, u64)> = BTreeMap::new();
@@ -293,6 +312,7 @@ impl ProductBuild {
                 &settings,
                 leaf,
                 &packages_dir,
+                &canon_packages,
                 &log_path,
             )?;
             if let Some(ref name) = leaf.component_name {
@@ -303,13 +323,11 @@ impl ProductBuild {
             }
         }
 
-        // Stage resources into Contents/ (rejecting collisions with Packages or distribution.dist).
-        stage_resources(host, &cfg, &cwd, &settings, &contents_dir)?;
+        stage_resources(host, &settings, &contents_dir)?;
         let welcome_nopath = copy_resource_file(host, &cfg, &cwd, "Welcome", &contents_dir)?;
         let readme_nopath = copy_resource_file(host, &cfg, &cwd, "ReadMe", &contents_dir)?;
         let license_nopath = copy_resource_file(host, &cfg, &cwd, "License", &contents_dir)?;
 
-        // Write Contents/distribution.dist via vendored CPack.distribution.dist.in.
         let dist_path = contents_dir.join("distribution.dist");
         write_distribution_file(
             host,
@@ -325,7 +343,6 @@ impl ProductBuild {
             &license_nopath,
         )?;
 
-        // Run final productbuild into a fresh .pkg file inside output_dir.
         let out_name = safe_name(&[cx.file_name, b".pkg"].concat())?;
         let final_pkg = cx.output_dir.join(out_name);
         prepare_fresh_output(host, &final_pkg)?;
@@ -376,7 +393,7 @@ impl ProductBuild {
             Some(&log_path),
             &[],
         )?;
-        verify_fresh_output(host, cx.output_dir, &final_pkg, "productbuild")?;
+        verify_fresh_output(host, cx.output_dir, &canon_work, &final_pkg, "productbuild")?;
         Ok(vec![final_pkg])
     }
 }
@@ -530,6 +547,7 @@ fn build_component_pkg(
     settings: &Settings,
     leaf: &ComponentPkg,
     packages_dir: &Path,
+    canon_packages: &Path,
     log_path: &Path,
 ) -> Result<(), CpackError> {
     prepare_fresh_output(host, &leaf.leaf_path)?;
@@ -575,21 +593,24 @@ fn build_component_pkg(
         Some(log_path),
         &[],
     )?;
-    verify_fresh_output(host, packages_dir, &leaf.leaf_path, "pkgbuild")?;
+    verify_fresh_output(
+        host,
+        packages_dir,
+        canon_packages,
+        &leaf.leaf_path,
+        "pkgbuild",
+    )?;
     Ok(())
 }
 
 fn stage_resources(
     host: &dyn Host,
-    _cfg: &CpackConfig,
-    _cwd: &Path,
     settings: &Settings,
     contents_dir: &Path,
 ) -> Result<(), CpackError> {
     let Some(ref res_src) = settings.resources_dir else {
         return Ok(());
     };
-    // Reject collisions with reserved generated entries under Contents/.
     for entry in host.read_dir(res_src)? {
         if entry.name == b"Packages" || entry.name == b"distribution.dist" {
             return Err(error(format!(
@@ -742,7 +763,6 @@ fn write_distribution_file(
         xout.end_element("domains")?;
     }
 
-    // Choice outline
     xout.start_element("choices-outline")?;
     for group in catalog.groups.values() {
         if group.parent_group.is_none() {
@@ -760,17 +780,14 @@ fn write_distribution_file(
     }
     xout.end_element("choices-outline")?;
 
-    // Group choices
     for group in catalog.groups.values() {
         write_group_choice(group, &mut xout)?;
     }
 
-    // Component choices & pkg-refs
     for comp in catalog.components.values() {
         write_component_choice(settings, catalog, comp, comp_pkg_info, &mut xout)?;
     }
 
-    // Background & darkAqua background
     write_background(host, cfg, contents_dir, None, &mut xout)?;
     write_background(host, cfg, contents_dir, Some("darkAqua"), &mut xout)?;
 
@@ -800,27 +817,43 @@ fn write_distribution_file(
     Ok(())
 }
 
+enum ChoiceOutlineStep<'a> {
+    Enter(&'a GroupMeta),
+    EmitComponentsAndClose(&'a GroupMeta),
+}
+
 fn write_choice_outline(
     catalog: &ComponentCatalog,
-    group: &GroupMeta,
+    root_group: &GroupMeta,
     xout: &mut XmlWriter,
 ) -> Result<(), CpackError> {
-    let name = require_utf8(&group.name, "CPack group name")?;
-    xout.start_element("line")?;
-    xout.attr("choice", &format!("{name}Choice"))?;
-    for sub_name in &group.subgroups {
-        if let Some(sub) = catalog.groups.get(sub_name) {
-            write_choice_outline(catalog, sub, xout)?;
+    let mut stack = vec![ChoiceOutlineStep::Enter(root_group)];
+    while let Some(step) = stack.pop() {
+        match step {
+            ChoiceOutlineStep::Enter(group) => {
+                let name = require_utf8(&group.name, "CPack group name")?;
+                xout.start_element("line")?;
+                xout.attr("choice", &format!("{name}Choice"))?;
+                stack.push(ChoiceOutlineStep::EmitComponentsAndClose(group));
+                for sub_name in group.subgroups.iter().rev() {
+                    if let Some(sub) = catalog.groups.get(sub_name) {
+                        stack.push(ChoiceOutlineStep::Enter(sub));
+                    }
+                }
+            }
+            ChoiceOutlineStep::EmitComponentsAndClose(group) => {
+                for comp_name in &group.components {
+                    let comp = require_utf8(comp_name, "CPack component name")?;
+                    xout.start_element("line")?;
+                    xout.attr("choice", &format!("{comp}Choice"))?;
+                    xout.force_non_self_closing();
+                    xout.end_element("line")?;
+                }
+                xout.end_element("line")?;
+            }
         }
     }
-    for comp_name in &group.components {
-        let comp = require_utf8(comp_name, "CPack component name")?;
-        xout.start_element("line")?;
-        xout.attr("choice", &format!("{comp}Choice"))?;
-        xout.force_non_self_closing();
-        xout.end_element("line")?;
-    }
-    xout.end_element("line")
+    Ok(())
 }
 
 fn write_group_choice(group: &GroupMeta, xout: &mut XmlWriter) -> Result<(), CpackError> {
@@ -909,21 +942,29 @@ fn write_component_choice(
     xout.end_element("pkg-ref")
 }
 
-fn append_dep_expr(
+pub(super) fn append_dep_expr(
     catalog: &ComponentCatalog,
-    comp: &ComponentMeta,
+    root_comp: &ComponentMeta,
     visited: &mut BTreeSet<BString>,
     out: &mut String,
 ) -> Result<(), CpackError> {
-    if !visited.insert(comp.name.clone()) {
+    if !visited.insert(root_comp.name.clone()) {
         return Ok(());
     }
-    for dep_name in &comp.depends {
-        let dep_str = require_utf8(dep_name, "CPack component dependency")?;
-        let escaped = escape_js_single_quoted(&format!("{dep_str}Choice"))?;
-        out.push_str(&format!(" && choices['{escaped}'].selected"));
-        if let Some(dep) = catalog.components.get(dep_name) {
-            append_dep_expr(catalog, dep, visited, out)?;
+    let mut stack = vec![(root_comp, 0_usize)];
+    while let Some((comp, next_idx)) = stack.last_mut() {
+        if let Some(dep_name) = comp.depends.get(*next_idx) {
+            *next_idx += 1;
+            let dep_str = require_utf8(dep_name, "CPack component dependency")?;
+            let escaped = escape_js_single_quoted(&format!("{dep_str}Choice"))?;
+            out.push_str(&format!(" && choices['{escaped}'].selected"));
+            if visited.insert(dep_name.clone())
+                && let Some(dep) = catalog.components.get(dep_name)
+            {
+                stack.push((dep, 0));
+            }
+        } else {
+            stack.pop();
         }
     }
     Ok(())
@@ -931,19 +972,27 @@ fn append_dep_expr(
 
 fn append_reverse_dep_expr(
     catalog: &ComponentCatalog,
-    comp: &ComponentMeta,
+    root_comp: &ComponentMeta,
     visited: &mut BTreeSet<BString>,
     out: &mut String,
 ) -> Result<(), CpackError> {
-    if !visited.insert(comp.name.clone()) {
+    if !visited.insert(root_comp.name.clone()) {
         return Ok(());
     }
-    for rdep_name in &comp.reverse_depends {
-        let rdep_str = require_utf8(rdep_name, "CPack component dependency")?;
-        let escaped = escape_js_single_quoted(&format!("{rdep_str}Choice"))?;
-        out.push_str(&format!(" || choices['{escaped}'].selected"));
-        if let Some(rdep) = catalog.components.get(rdep_name) {
-            append_reverse_dep_expr(catalog, rdep, visited, out)?;
+    let mut stack = vec![(root_comp, 0_usize)];
+    while let Some((comp, next_idx)) = stack.last_mut() {
+        if let Some(rdep_name) = comp.reverse_depends.get(*next_idx) {
+            *next_idx += 1;
+            let rdep_str = require_utf8(rdep_name, "CPack component dependency")?;
+            let escaped = escape_js_single_quoted(&format!("{rdep_str}Choice"))?;
+            out.push_str(&format!(" || choices['{escaped}'].selected"));
+            if visited.insert(rdep_name.clone())
+                && let Some(rdep) = catalog.components.get(rdep_name)
+            {
+                stack.push((rdep, 0));
+            }
+        } else {
+            stack.pop();
         }
     }
     Ok(())

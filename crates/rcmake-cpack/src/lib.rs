@@ -122,8 +122,19 @@ pub(crate) struct StagedRoot {
     pub(crate) root: PathBuf,
     /// Directory scanned for membership (`root` in `DESTDIR` mode, otherwise `root/<prefix>`).
     pub(crate) scanned: PathBuf,
+    /// Canonical path of `root` captured before pre-build hooks run.
+    pub(crate) canon_root: PathBuf,
+    /// Canonical path of `scanned` captured before pre-build hooks run.
+    pub(crate) canon_scanned: PathBuf,
     /// Paths added below `scanned` during project installation, in install order.
     pub(crate) files: Vec<PathBuf>,
+}
+
+/// Pre-hook canonical paths for the generator work and staging roots.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CanonicalRoots<'a> {
+    pub(crate) work: &'a Path,
+    pub(crate) staging: &'a Path,
 }
 
 /// One component that the project installs staged.
@@ -158,6 +169,26 @@ pub struct PackageContext<'a> {
     pub file_name: &'a [u8],
     /// Component grouping.
     pub grouping: ComponentGrouping,
+    /// Canonical work and staging roots captured before pre-build hooks ran.
+    pub(crate) canonical_roots: Option<CanonicalRoots<'a>>,
+}
+
+impl PackageContext<'_> {
+    /// Verify `output_dir` and return its expected canonical root.
+    pub(crate) fn expected_work_root(&self) -> Result<PathBuf, CpackError> {
+        match self.canonical_roots {
+            Some(roots) => source::verify_expected_root(self.host, self.output_dir, roots.work),
+            None => source::canonical_checked_root(self.host, self.output_dir),
+        }
+    }
+
+    /// Verify `staging_dir` and return its expected canonical root.
+    pub(crate) fn expected_staging_root(&self) -> Result<PathBuf, CpackError> {
+        match self.canonical_roots {
+            Some(roots) => source::verify_expected_root(self.host, self.staging_dir, roots.staging),
+            None => source::canonical_checked_root(self.host, self.staging_dir),
+        }
+    }
 }
 
 /// One CPack generator (`CPACK_GENERATOR` entry).
@@ -438,6 +469,14 @@ fn package(
     let staging = work.join(file);
     stage::remove_entry(host.as_ref(), &staging)?;
     host.create_dir_all(&staging)?;
+    let canon_work = source::canonical_checked_root(host.as_ref(), &work)?;
+    let canon_staging = source::canonical_checked_root(host.as_ref(), &staging)?;
+    if !canon_staging.starts_with(&canon_work) {
+        return Err(error(format!(
+            "CPack staging directory escapes work directory: {}",
+            staging.display()
+        )));
+    }
     let package_file = work.join(final_package_name);
     for (key, path) in [
         (b"CPACK_TOPLEVEL_DIRECTORY".as_slice(), &work),
@@ -471,7 +510,9 @@ fn package(
             format!("CPack {level}: Staging files in {}\n", staging.display()).as_bytes(),
         );
     }
-    let members = stage::install(host, cwd, cli, interp, &staging)?;
+    let members = stage::install(host, cwd, cli, interp, &staging, &canon_staging)?;
+    source::verify_expected_root(host.as_ref(), &work, &canon_work)?;
+    source::verify_expected_root(host.as_ref(), &staging, &canon_staging)?;
     let vars = snapshot(interp);
     log(host.as_ref(), "Create package");
     let mut packages = generator.package_with_interp(
@@ -482,6 +523,10 @@ fn package(
             output_dir: &work,
             file_name: name,
             grouping: stage::grouping(&vars),
+            canonical_roots: Some(CanonicalRoots {
+                work: &canon_work,
+                staging: &canon_staging,
+            }),
         },
         &members,
         interp,
@@ -489,7 +534,15 @@ fn package(
     if generator.name() == "External" {
         generators::external::run_script(host.as_ref(), cwd, interp, &mut packages)?;
     }
-    validate_generated_packages(host.as_ref(), &packages, generator.name() != "External")?;
+    let work_check =
+        (generator.name() != "External").then_some((work.as_path(), canon_work.as_path()));
+    source::verify_expected_root(host.as_ref(), &work, &canon_work)?;
+    validate_generated_packages(
+        host.as_ref(),
+        &packages,
+        work_check,
+        generator.name() != "External",
+    )?;
     interp.cx().set_var(
         b"CPACK_PACKAGE_FILES",
         list::join(packages.iter().map(|path| from_native_cmake(path))),
@@ -501,7 +554,13 @@ fn package(
         b"CPACK_POST_BUILD_SCRIPTS",
         "Executing post-build script",
     )?;
-    validate_generated_packages(host.as_ref(), &packages, generator.name() != "External")?;
+    source::verify_expected_root(host.as_ref(), &work, &canon_work)?;
+    validate_generated_packages(
+        host.as_ref(),
+        &packages,
+        work_check,
+        generator.name() != "External",
+    )?;
     let vars = snapshot(interp);
     let publish_dir = vars
         .get(b"CPACK_OUTPUT_FILE_PREFIX")
@@ -513,8 +572,12 @@ fn package(
 fn validate_generated_packages(
     host: &dyn Host,
     packages: &[PathBuf],
+    expected_work_root: Option<(&Path, &Path)>,
     disallow_symlinks: bool,
 ) -> Result<(), CpackError> {
+    if let Some((work, canon_work)) = expected_work_root {
+        source::verify_expected_root(host, work, canon_work)?;
+    }
     for package in packages {
         let name = package
             .file_name()
@@ -536,6 +599,22 @@ fn validate_generated_packages(
                 "Expected a regular package file at {}",
                 package.display()
             )));
+        }
+        if let Some((work, canon_work)) = expected_work_root {
+            let rel = package.strip_prefix(work).map_err(|_| {
+                error(format!(
+                    "Generated package path escapes work directory: {}",
+                    package.display()
+                ))
+            })?;
+            source::verify_contained_path(
+                host,
+                work,
+                canon_work,
+                rel,
+                source::SymlinkPolicy::Reject,
+                false,
+            )?;
         }
     }
     Ok(())
@@ -586,44 +665,47 @@ fn initialize_linux_package(
     Ok(())
 }
 
-struct TempCleanup<'a> {
+struct PublishStageDir<'a> {
     host: &'a dyn Host,
-    paths: Vec<PathBuf>,
+    path: PathBuf,
 }
 
-impl<'a> TempCleanup<'a> {
-    fn new(host: &'a dyn Host) -> Self {
-        Self {
-            host,
-            paths: Vec::new(),
+impl<'a> PublishStageDir<'a> {
+    fn new(host: &'a dyn Host, output: &Path) -> Result<Self, CpackError> {
+        static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+        let pid = host.system().pid;
+        for _ in 0..100 {
+            let seq = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+            let candidate = output.join(format!(".rcmake-pub-{pid}-{seq}"));
+            match host.create_private_dir(&candidate) {
+                Ok(()) => {
+                    return Ok(Self {
+                        host,
+                        path: candidate,
+                    });
+                }
+                Err(err) if err.kind == ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err.into()),
+            }
         }
-    }
-
-    fn track(&mut self, path: PathBuf) {
-        self.paths.push(path);
-    }
-
-    fn disarm(&mut self, path: &Path) {
-        self.paths.retain(|entry| entry != path);
+        Err(error("Cannot allocate temporary publication directory"))
     }
 }
 
-impl Drop for TempCleanup<'_> {
+impl Drop for PublishStageDir<'_> {
     fn drop(&mut self) {
-        for path in &self.paths {
-            let _ = self.host.remove_file(path);
-        }
+        let _ = self.host.remove_dir_all(&self.path);
     }
 }
 
-fn create_stage_temp_path(host: &dyn Host, dir: &Path, label: &str) -> Result<PathBuf, CpackError> {
+fn stage_temp_path(host: &dyn Host, stage_dir: &Path, label: &str) -> Result<PathBuf, CpackError> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let pid = host.system().pid;
     let tag = HashAlgo::Md5.hex_digest(label.as_bytes());
     let short_tag = tag.get(..12).unwrap_or(&tag);
     for _ in 0..100 {
         let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let candidate = dir.join(format!(".rcmake-pub-{pid}-{seq}-{short_tag}.tmp"));
+        let candidate = stage_dir.join(format!(".rcmake-pub-{pid}-{seq}-{short_tag}.tmp"));
         match host.metadata_fresh(&candidate, Follow::No) {
             Err(err) if err.kind == ErrorKind::NotFound => return Ok(candidate),
             Err(err) => return Err(err.into()),
@@ -645,14 +727,48 @@ fn verify_destination_replaceable(host: &dyn Host, dest: &Path) -> Result<(), Cp
     }
 }
 
-/// Atomically publish each generated package and its checksums (Audit Finding #10).
+fn backup_existing_destination(
+    host: &dyn Host,
+    dest: &Path,
+    backup: &Path,
+) -> Result<bool, CpackError> {
+    match host.metadata_fresh(dest, Follow::No) {
+        Ok(meta) if meta.kind == FileKind::File => {
+            if host.hard_link(dest, backup).is_ok() {
+                return Ok(true);
+            }
+            let mut reader = host.open_read(dest)?;
+            host.write_from(backup, WriteMode::CreateNew, &mut *reader, meta.len)?;
+            host.set_permissions(backup, meta.mode & 0o7777)?;
+            host.set_times(backup, Some(meta.atime), Some(meta.mtime))?;
+            Ok(true)
+        }
+        Ok(_) => Err(error(format!(
+            "Expected a regular package file at {}",
+            dest.display()
+        ))),
+        Err(err) if err.kind == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Publish each generated package and its checksums under a per-package destination lock
+/// with staged preparation and rollback on rename failure.
 ///
-/// Commit order per package under the per-output destination lock:
-/// 1. Stage the installer and every checksum into private temporary files (`WriteMode::CreateNew`)
-///    on the destination volume, verifying no-follow metadata and byte lengths before committing.
-/// 2. Atomically replace the published installer (`Host::rename`), preserving the previous
-///    published file untouched if any earlier copy, validation, or checksum preparation fails.
-/// 3. Atomically replace each checksum file in deterministic algorithm order.
+/// Commit protocol per package:
+/// 1. Stage the package and all checksums inside a private scoped temporary directory on the
+///    destination volume (`WriteMode::CreateNew`), verifying no-follow metadata and byte lengths
+///    before touching any live destination. Dropping the staging directory removes all temporary
+///    files, including partial writes left by failed I/O.
+/// 2. Acquire the per-package advisory lock, re-verify every destination is replaceable, and
+///    retain a backup of any pre-existing destination files inside the private staging directory.
+/// 3. Rename the staged package and every staged checksum into place in deterministic order.
+///    If any rename fails, roll back all earlier replacements for that package (restoring backed-up
+///    files or removing newly created files) before returning the error.
+/// 4. Emit package and checksum success log lines only after the entire set commits.
+///
+/// This provides lock-serialized replacement and error rollback across independent file renames;
+/// it is not a crash-consistent single-syscall transaction across multiple files.
 fn publish(
     host: &dyn Host,
     cfg: &CpackConfig,
@@ -686,12 +802,11 @@ fn publish(
             )));
         }
 
-        let mut cleanup = TempCleanup::new(host);
+        let stage_dir = PublishStageDir::new(host, output)?;
         let staged_package = if package != &dest {
-            let tmp = create_stage_temp_path(host, output, &file.to_string())?;
+            let tmp = stage_temp_path(host, &stage_dir.path, &file.to_string())?;
             let mut reader = host.open_read(package)?;
             host.write_from(&tmp, WriteMode::CreateNew, &mut *reader, src_meta.len)?;
-            cleanup.track(tmp.clone());
             host.set_permissions(&tmp, src_meta.mode & 0o7777)?;
             host.set_times(&tmp, Some(src_meta.atime), Some(src_meta.mtime))?;
             let tmp_meta = host.metadata_fresh(&tmp, Follow::No)?;
@@ -715,13 +830,12 @@ fn publish(
                 let checksum_dest = output.join(safe_name(&checksum_name)?);
                 verify_destination_replaceable(host, &checksum_dest)?;
                 let text = format!("{digest}  {file}\n");
-                let tmp = create_stage_temp_path(
+                let tmp = stage_temp_path(
                     host,
-                    output,
+                    &stage_dir.path,
                     &BString::from(checksum_name).to_string(),
                 )?;
                 host.write(&tmp, text.as_bytes(), WriteMode::CreateNew)?;
-                cleanup.track(tmp.clone());
                 let tmp_meta = host.metadata_fresh(&tmp, Follow::No)?;
                 if tmp_meta.kind != FileKind::File || tmp_meta.len != text.len() as u64 {
                     return Err(error(format!(
@@ -742,19 +856,53 @@ fn publish(
         };
 
         verify_destination_replaceable(host, &dest)?;
-        for (_, checksum_dest) in &staged_checksums {
+        let checksum_dests: Vec<PathBuf> = staged_checksums
+            .iter()
+            .map(|(_, checksum_dest)| checksum_dest.clone())
+            .collect();
+        for checksum_dest in &checksum_dests {
             verify_destination_replaceable(host, checksum_dest)?;
         }
 
+        let mut replacements = Vec::with_capacity(staged_checksums.len() + 1);
         if let Some(tmp) = staged_package {
-            host.rename(&tmp, &dest)?;
-            cleanup.disarm(&tmp);
+            replacements.push((tmp, dest.clone()));
         }
-        log(host, format!("- package: {} generated.", dest.display()));
+        replacements.extend(staged_checksums);
 
-        for (tmp, checksum_dest) in staged_checksums {
-            host.rename(&tmp, &checksum_dest)?;
-            cleanup.disarm(&tmp);
+        let mut backups = Vec::with_capacity(replacements.len());
+        for (idx, (_, dest_path)) in replacements.iter().enumerate() {
+            let backup_path = stage_dir.path.join(format!("backup-{idx}"));
+            let existed = backup_existing_destination(host, dest_path, &backup_path)?;
+            backups.push(existed.then_some(backup_path));
+        }
+
+        let mut committed: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(replacements.len());
+        for ((staged_tmp, dest_path), backup) in replacements.into_iter().zip(backups) {
+            if let Err(commit_err) = host.rename(&staged_tmp, &dest_path) {
+                let mut rollback_errors = Vec::new();
+                for (prev_dest, prev_backup) in committed.into_iter().rev() {
+                    let result = match prev_backup {
+                        Some(backup_path) => host.rename(&backup_path, &prev_dest),
+                        None => host.remove_file(&prev_dest),
+                    };
+                    if let Err(err) = result {
+                        rollback_errors.push(format!("{}: {err}", prev_dest.display()));
+                    }
+                }
+                if rollback_errors.is_empty() {
+                    return Err(commit_err.into());
+                }
+                return Err(error(format!(
+                    "{commit_err} (rollback failed for: {})",
+                    rollback_errors.join(", ")
+                )));
+            }
+            committed.push((dest_path, backup));
+        }
+
+        log(host, format!("- package: {} generated.", dest.display()));
+        for checksum_dest in &checksum_dests {
             log(
                 host,
                 format!("- checksum file: {} generated.", checksum_dest.display()),

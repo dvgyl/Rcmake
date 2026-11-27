@@ -101,20 +101,36 @@ impl Interp {
                 diag
             };
             if self.engine.record(diag, state) {
-                self.write_rich(diag, options);
+                let bytes = self.write_rich(diag, options);
+                if self.debug_attached {
+                    self.debug_diagnostic(diag.kind, &bytes);
+                }
             }
         } else if let Some(bytes) = self.engine.issue(diag, state, &self.render) {
             self.config.host.write_out(Stream::Stderr, &bytes);
+            if self.debug_attached {
+                self.debug_diagnostic(diag.kind, &bytes);
+            }
         }
     }
 
-    fn write_rich(&self, diag: &Diagnostic, options: RichOptions) {
+    /// Report a shown diagnostic to the debugger (`cmMessenger::DisplayMessage`).
+    ///
+    /// The debugger gets the message without the line end that the display adds.
+    fn debug_diagnostic(&mut self, kind: MessageKind, text: &[u8]) {
+        if let Some(kind) = crate::debug::DebugMessageKind::from_diagnostic(kind) {
+            self.debug_message(kind, text.strip_suffix(b"\n").unwrap_or(text));
+        }
+    }
+
+    fn write_rich(&self, diag: &Diagnostic, options: RichOptions) -> Vec<u8> {
         let lookup = DiagnosticSources {
             sources: &self.sources,
             cmake_root: &self.config.cmake_root,
         };
         let bytes = render_rich(diag, None, &lookup, options);
         self.config.host.write_out(Stream::Stderr, &bytes);
+        bytes.into()
     }
 
     /// Issue a diagnostic at the current backtrace.

@@ -1,6 +1,6 @@
 //! Portable end-to-end tests for native installer generators (`productbuild`, `NSIS`,
-//! `NSIS64`, `WIX` v3/v4, `IFW`), Audit Finding #9 (post-hook staged-tree containment),
-//! Audit Finding #10 (atomic installer & checksum publication), and failure-path matrices.
+//! `NSIS64`, `WIX` v3/v4, `IFW`), post-hook staged-tree containment, publication rollback,
+//! and failure-path matrices.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -1774,7 +1774,7 @@ set(CPACK_IFW_PACKAGE_RESOURCES "/work/res/bad.qrc")
 }
 
 // ===========================================================================
-// 6. Audit Finding #9 — Post-Hook Staged-Tree Containment Regression Tests
+// 6. Post-Hook Staged-Tree Containment Regression Tests
 // ===========================================================================
 
 #[test]
@@ -1913,14 +1913,16 @@ set(CPACK_PRE_BUILD_SCRIPTS "/work/hook.cmake")
 }
 
 // ===========================================================================
-// 7. Audit Finding #10 — Atomic Publication Fault-Injection Tests
+// 7. Publication Fault-Injection and Rollback Tests
 // ===========================================================================
 
-/// Host wrapper injecting a controlled I/O fault during temporary publication staging.
+/// Host wrapper injecting controlled I/O faults during publication staging and rename.
 struct FaultInjectHost {
     inner: Arc<PureHost>,
     fail_write_from_tmp: AtomicBool,
     fail_write_checksum_tmp: AtomicBool,
+    partial_write_before_fail: AtomicBool,
+    fail_rename_dest_suffix: Mutex<Option<String>>,
 }
 
 impl Host for FaultInjectHost {
@@ -1936,7 +1938,6 @@ impl Host for FaultInjectHost {
     rcmake_host::forward_host!(@method inner, remove_file(p: &Path) -> HostResult<()>);
     rcmake_host::forward_host!(@method inner, remove_dir(p: &Path) -> HostResult<()>);
     rcmake_host::forward_host!(@method inner, remove_dir_all(p: &Path) -> HostResult<()>);
-    rcmake_host::forward_host!(@method inner, rename(from: &Path, to: &Path) -> HostResult<()>);
     rcmake_host::forward_host!(@method inner, rename_noreplace(from: &Path, to: &Path) -> HostResult<()>);
     rcmake_host::forward_host!(@method inner, lock_file(path: &Path, timeout: Option<core::time::Duration>) -> HostResult<Box<dyn rcmake_host::FileLockGuard>>);
     rcmake_host::forward_host!(@method inner, copy_file(from: &Path, to: &Path, opts: rcmake_host::CopyOptions) -> HostResult<()>);
@@ -1952,9 +1953,27 @@ impl Host for FaultInjectHost {
     rcmake_host::forward_host!(@ inner, scratch_file);
     rcmake_host::forward_host!(@ inner, scratch_file_in);
 
+    fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
+        if let Some(ref suffix) = *self.fail_rename_dest_suffix.lock().unwrap()
+            && to.to_string_lossy().ends_with(suffix.as_str())
+        {
+            return Err(HostError::from_io(
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected publication rename fault",
+                ),
+                Some(to.to_path_buf()),
+            ));
+        }
+        self.inner.rename(from, to)
+    }
+
     fn write(&self, path: &Path, data: &[u8], mode: WriteMode) -> HostResult<()> {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if self.fail_write_checksum_tmp.load(Ordering::SeqCst) && name.starts_with(".rcmake-pub-") {
+            if self.partial_write_before_fail.load(Ordering::SeqCst) {
+                let _ = self.inner.write(path, b"partial", mode);
+            }
             return Err(HostError::from_io(
                 std::io::Error::new(
                     std::io::ErrorKind::StorageFull,
@@ -1975,6 +1994,9 @@ impl Host for FaultInjectHost {
     ) -> HostResult<()> {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if self.fail_write_from_tmp.load(Ordering::SeqCst) && name.starts_with(".rcmake-pub-") {
+            if self.partial_write_before_fail.load(Ordering::SeqCst) {
+                let _ = self.inner.write(path, b"partial", mode);
+            }
             return Err(HostError::from_io(
                 std::io::Error::new(
                     std::io::ErrorKind::StorageFull,
@@ -2082,6 +2104,8 @@ set(CPACK_PACKAGE_CHECKSUM "SHA256")
             inner: Arc::clone(&inner),
             fail_write_from_tmp: AtomicBool::new(!fail_on_checksum),
             fail_write_checksum_tmp: AtomicBool::new(fail_on_checksum),
+            partial_write_before_fail: AtomicBool::new(true),
+            fail_rename_dest_suffix: Mutex::new(None),
         });
 
         assert_eq!(run_unrestricted(wrapper.clone(), &[]), 1);
@@ -2464,4 +2488,969 @@ set(CPACK_COMMAND_PRODUCTBUILD "{prod}")
         host.metadata(&native_dir.join("ParityApp-1.0.0.pkg"), Follow::No)
             .is_ok()
     );
+}
+
+// ===========================================================================
+// 11. Review Regression Tests (P1 #2-#7 and CPack P2s)
+// ===========================================================================
+
+#[test]
+fn publish_rolls_back_installer_and_checksums_on_rename_fault() {
+    for had_previous in [true, false] {
+        let inner = make_profile_host(OsProfile::Linux);
+        seed_tool(&inner, OsProfile::Linux, "binarycreator");
+        inner
+            .seed_file(Path::new("/work/src/a.txt"), b"v2")
+            .unwrap();
+        let prev_installer = b"PREVIOUS_GOOD_INSTALLER_V1";
+        let prev_md5 = format!(
+            "{}  App-1.0.run\n",
+            HashAlgo::Md5.hex_digest(prev_installer)
+        );
+        let prev_sha = format!(
+            "{}  App-1.0.run\n",
+            HashAlgo::Sha256.hex_digest(prev_installer)
+        );
+        if had_previous {
+            inner
+                .seed_file(Path::new("/work/App-1.0.run"), prev_installer)
+                .unwrap();
+            inner
+                .seed_file(Path::new("/work/App-1.0.run.md5"), prev_md5.as_bytes())
+                .unwrap();
+            inner
+                .seed_file(Path::new("/work/App-1.0.run.sha256"), prev_sha.as_bytes())
+                .unwrap();
+        }
+        inner
+            .seed_file(
+                Path::new("/work/CPackConfig.cmake"),
+                br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "IFW")
+set(CPACK_PACKAGE_NAME "App")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "App-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+set(CPACK_PACKAGE_CHECKSUM "MD5;SHA256")
+"#,
+            )
+            .unwrap();
+        inner
+            .set_command_handler(|h, req, _| {
+                let out = to_native(req.pipeline[0].args.last().unwrap());
+                h.write(&out, b"NEW_INSTALLER_V2", WriteMode::CreateNew)?;
+                Ok(ok_output(b"ok"))
+            })
+            .unwrap();
+
+        let wrapper = Arc::new(FaultInjectHost {
+            inner: Arc::clone(&inner),
+            fail_write_from_tmp: AtomicBool::new(false),
+            fail_write_checksum_tmp: AtomicBool::new(false),
+            partial_write_before_fail: AtomicBool::new(false),
+            fail_rename_dest_suffix: Mutex::new(Some(".sha256".to_owned())),
+        });
+
+        assert_eq!(run_unrestricted(wrapper, &[]), 1);
+
+        let stdout = String::from_utf8_lossy(&inner.stream_bytes(Stream::Stdout)).into_owned();
+        assert!(
+            !stdout.contains("- package: /work/App-1.0.run generated."),
+            "must not emit package success log on failed checksum rename: {stdout}"
+        );
+        if had_previous {
+            assert_eq!(
+                read_bytes(inner.as_ref(), Path::new("/work/App-1.0.run")),
+                prev_installer
+            );
+            assert_eq!(
+                read_utf8(inner.as_ref(), Path::new("/work/App-1.0.run.md5")),
+                prev_md5
+            );
+            assert_eq!(
+                read_utf8(inner.as_ref(), Path::new("/work/App-1.0.run.sha256")),
+                prev_sha
+            );
+        } else {
+            assert!(
+                inner
+                    .metadata(Path::new("/work/App-1.0.run"), Follow::No)
+                    .is_err()
+            );
+            assert!(
+                inner
+                    .metadata(Path::new("/work/App-1.0.run.md5"), Follow::No)
+                    .is_err()
+            );
+            assert!(
+                inner
+                    .metadata(Path::new("/work/App-1.0.run.sha256"), Follow::No)
+                    .is_err()
+            );
+        }
+        for entry in inner.read_dir(Path::new("/work")).unwrap() {
+            assert!(
+                !entry.name.starts_with(b".rcmake-pub-"),
+                "stray publication temp entry left behind: {}",
+                entry.name
+            );
+        }
+    }
+}
+
+#[test]
+fn post_hook_ancestor_symlink_swap_rejected_for_installers_and_archives() {
+    for (gen_name, extra_cfg, tools) in [
+        ("productbuild", "", &["pkgbuild", "productbuild"][..]),
+        ("NSIS", "", &["makensis"][..]),
+        ("WIX", "set(CPACK_WIX_VERSION \"4\")\n", &["wix"][..]),
+        ("IFW", "", &["binarycreator"][..]),
+        ("TGZ", "", &[][..]),
+    ] {
+        let host = make_profile_host(OsProfile::Linux);
+        for tool in tools {
+            seed_tool(&host, OsProfile::Linux, tool);
+        }
+        host.seed_file(Path::new("/work/src/real.txt"), b"real")
+            .unwrap();
+        // Prepare an outside tree that has a regular directory at the staging leaf name.
+        host.seed_file(
+            Path::new("/work/evil_work/Swap-1.0/secret.txt"),
+            b"OUTSIDE_SECRET",
+        )
+        .unwrap();
+        // Pre-build hook swaps the ancestor `_CPack_Packages/<gen>` with a symlink to `/work/evil_work`.
+        host.seed_file(
+            Path::new("/work/swap_ancestor.cmake"),
+            br#"
+file(RENAME "${CPACK_TOPLEVEL_DIRECTORY}" "${CPACK_TOPLEVEL_DIRECTORY}_orig")
+file(CREATE_LINK "/work/evil_work" "${CPACK_TOPLEVEL_DIRECTORY}" SYMBOLIC)
+"#,
+        )
+        .unwrap();
+        host.seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            format!(
+                r#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "{gen_name}")
+set(CPACK_PACKAGE_NAME "Swap")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "Swap-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+set(CPACK_PRE_BUILD_SCRIPTS "/work/swap_ancestor.cmake")
+{extra_cfg}
+"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        let build_calls = Arc::new(AtomicUsize::new(0));
+        let build_calls_ref = Arc::clone(&build_calls);
+        host.set_command_handler(move |_, req, _| {
+            let spec = &req.pipeline[0];
+            if spec.args == [BString::from("-VERSION")] || spec.args == [BString::from("/VERSION")]
+            {
+                return Ok(ok_output(b"v3.08\n"));
+            }
+            build_calls_ref.fetch_add(1, Ordering::SeqCst);
+            Ok(ok_output(b""))
+        })
+        .unwrap();
+
+        assert_eq!(
+            run_unrestricted(host.clone(), &[]),
+            1,
+            "ancestor symlink swap must fail for {gen_name}"
+        );
+        assert_eq!(
+            build_calls.load(Ordering::SeqCst),
+            0,
+            "external build tool must not run after ancestor swap for {gen_name}"
+        );
+    }
+
+    // Post-build hook replacing the work directory with a symlink must also be rejected.
+    let host_post = make_profile_host(OsProfile::Linux);
+    host_post
+        .seed_file(Path::new("/work/src/real.txt"), b"real")
+        .unwrap();
+    host_post
+        .seed_file(
+            Path::new("/work/evil_post/PostSwap-1.0.tar.gz"),
+            b"EVIL_ARCHIVE",
+        )
+        .unwrap();
+    host_post
+        .seed_file(
+            Path::new("/work/post_swap.cmake"),
+            br#"
+file(RENAME "${CPACK_TOPLEVEL_DIRECTORY}" "${CPACK_TOPLEVEL_DIRECTORY}_orig")
+file(CREATE_LINK "/work/evil_post" "${CPACK_TOPLEVEL_DIRECTORY}" SYMBOLIC)
+"#,
+        )
+        .unwrap();
+    host_post
+        .seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "TGZ")
+set(CPACK_PACKAGE_NAME "PostSwap")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "PostSwap-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+set(CPACK_POST_BUILD_SCRIPTS "/work/post_swap.cmake")
+"#,
+        )
+        .unwrap();
+    assert_eq!(run_unrestricted(host_post.clone(), &[]), 1);
+    assert!(
+        host_post
+            .metadata(Path::new("/work/PostSwap-1.0.tar.gz"), Follow::No)
+            .is_err()
+    );
+}
+
+#[test]
+fn symlink_validator_resolves_links_before_parent_traversal() {
+    let host = make_profile_host(OsProfile::Linux);
+    let root = Path::new("/work/staging");
+    host.create_dir_all(&root.join("dir/sub/nested")).unwrap();
+    host.seed_file(Path::new("/work/secret.txt"), b"SECRET")
+        .unwrap();
+    host.seed_file(&root.join("outside"), b"harmless-in-root")
+        .unwrap();
+    host.seed_file(&root.join("dir/inside.txt"), b"ok-in-root")
+        .unwrap();
+    let canon = host.canonicalize_fresh(root).unwrap();
+
+    // Case 1: dir/link -> sub/nested followed by dir/link/../../outside where dir/outside escapes.
+    // Lexical collapse turns dir/link/../../outside into `outside` (harmless file inside root),
+    // while true component-by-component resolution resolves to `dir/outside` -> escape!
+    host.symlink(Path::new("sub/nested"), &root.join("dir/link"))
+        .unwrap();
+    host.symlink(Path::new("../../secret.txt"), &root.join("dir/outside"))
+        .unwrap();
+    host.symlink(Path::new("dir/link/../../outside"), &root.join("escape1"))
+        .unwrap();
+    let err1 = crate::source::validate_contained_symlink(
+        host.as_ref(),
+        root,
+        &canon,
+        &root.join("escape1"),
+    )
+    .unwrap_err();
+    assert!(
+        err1.to_string().contains("escapes staging root"),
+        "unexpected error: {err1}"
+    );
+
+    // Case 2: dir/up -> .. followed by dir/up/../outside escapes immediately after resolving dir/up.
+    host.symlink(Path::new(".."), &root.join("dir/up")).unwrap();
+    host.symlink(Path::new("dir/up/../outside"), &root.join("escape2"))
+        .unwrap();
+    let err2 = crate::source::validate_contained_symlink(
+        host.as_ref(),
+        root,
+        &canon,
+        &root.join("escape2"),
+    )
+    .unwrap_err();
+    assert!(
+        err2.to_string().contains("escapes staging root"),
+        "unexpected error: {err2}"
+    );
+
+    // Case 3: Chained symlink a -> b/c, b -> ../outside escapes.
+    host.symlink(Path::new("../secret.txt"), &root.join("b"))
+        .unwrap();
+    host.symlink(Path::new("b/c"), &root.join("a")).unwrap();
+    let err3 =
+        crate::source::validate_contained_symlink(host.as_ref(), root, &canon, &root.join("a"))
+            .unwrap_err();
+    assert!(
+        err3.to_string().contains("escapes staging root"),
+        "unexpected error: {err3}"
+    );
+
+    // Case 4: Valid contained link through dir/link/../../inside.txt succeeds.
+    host.symlink(Path::new("dir/link/../../inside.txt"), &root.join("valid"))
+        .unwrap();
+    assert!(
+        crate::source::validate_contained_symlink(host.as_ref(), root, &canon, &root.join("valid"))
+            .is_ok()
+    );
+}
+
+#[test]
+fn ifw_all_in_one_merges_components_without_component_prefix() {
+    let host = make_profile_host(OsProfile::Linux);
+    seed_tool(&host, OsProfile::Linux, "binarycreator");
+    host.seed_file(Path::new("/work/payload/app"), b"app-bin")
+        .unwrap();
+    host.seed_file(Path::new("/work/payload/api.h"), b"header")
+        .unwrap();
+    seed_component_project(
+        &host,
+        r#"
+if(CMAKE_INSTALL_COMPONENT STREQUAL "Runtime")
+  file(INSTALL "/work/payload/app" DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
+elseif(CMAKE_INSTALL_COMPONENT STREQUAL "Devel")
+  file(INSTALL "/work/payload/api.h" DESTINATION "${CMAKE_INSTALL_PREFIX}/include")
+endif()
+"#,
+    );
+    host.seed_file(
+        Path::new("/work/CPackConfig.cmake"),
+        br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "IFW")
+set(CPACK_CMAKE_GENERATOR "Ninja")
+set(CPACK_PACKAGE_NAME "AllInOne")
+set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_FILE_NAME "AllInOne-1.0.0")
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;AllInOne;ALL;/")
+set(CPACK_COMPONENTS_ALL "Runtime;Devel")
+set(CPACK_COMPONENTS_GROUPING "ALL_COMPONENTS_IN_ONE")
+"#,
+    )
+    .unwrap();
+    host.set_command_handler(|h, req, _| {
+        let out = to_native(req.pipeline[0].args.last().unwrap());
+        h.write(&out, b"ifw-all-in-one", WriteMode::CreateNew)?;
+        Ok(ok_output(b""))
+    })
+    .unwrap();
+
+    assert_eq!(
+        run_unrestricted(host.clone(), &[]),
+        0,
+        "stderr={}",
+        String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr))
+    );
+    let data_dir = Path::new("/work/_CPack_Packages/IFW/AllInOne-1.0.0/packages/AllInOne/data");
+    assert_eq!(
+        read_bytes(host.as_ref(), &data_dir.join("bin/app")),
+        b"app-bin"
+    );
+    assert_eq!(
+        read_bytes(host.as_ref(), &data_dir.join("include/api.h")),
+        b"header"
+    );
+    assert!(
+        host.metadata(&data_dir.join("Runtime"), Follow::No)
+            .is_err(),
+        "component staging dir prefix Runtime/ must not appear in all-in-one IFW data/"
+    );
+    assert!(
+        host.metadata(&data_dir.join("Devel"), Follow::No).is_err(),
+        "component staging dir prefix Devel/ must not appear in all-in-one IFW data/"
+    );
+}
+
+#[test]
+fn productbuild_component_includes_hook_added_and_replaced_files() {
+    let host = make_profile_host(OsProfile::MacOs);
+    seed_tool(&host, OsProfile::MacOs, "pkgbuild");
+    seed_tool(&host, OsProfile::MacOs, "productbuild");
+    host.seed_file(Path::new("/work/payload/orig.txt"), b"original-v1")
+        .unwrap();
+    seed_component_project(
+        &host,
+        r#"
+if(CMAKE_INSTALL_COMPONENT STREQUAL "app")
+  file(INSTALL "/work/payload/orig.txt" DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
+endif()
+"#,
+    );
+    host.seed_file(
+        Path::new("/work/pre_hook.cmake"),
+        br#"
+file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/app/Applications/bin/orig.txt" "replaced-v2")
+file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/app/Applications/bin/hook_added.txt" "added-by-hook")
+file(WRITE "${CPACK_TEMPORARY_DIRECTORY}/emptycomp/Applications/share/from_hook.txt" "hook-only-comp")
+"#,
+    )
+    .unwrap();
+    host.seed_file(
+        Path::new("/work/CPackConfig.cmake"),
+        br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "productbuild")
+set(CPACK_CMAKE_GENERATOR "Ninja")
+set(CPACK_PACKAGE_NAME "HookPkg")
+set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_FILE_NAME "HookPkg-1.0.0")
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;HookPkg;ALL;/")
+set(CPACK_COMPONENTS_ALL "app;emptycomp")
+set(CPACK_PRE_BUILD_SCRIPTS "/work/pre_hook.cmake")
+"#,
+    )
+    .unwrap();
+
+    let saw_app = Arc::new(AtomicBool::new(false));
+    let saw_empty = Arc::new(AtomicBool::new(false));
+    let saw_app_ref = Arc::clone(&saw_app);
+    let saw_empty_ref = Arc::clone(&saw_empty);
+    host.set_command_handler(move |h, req, _| {
+        let spec = &req.pipeline[0];
+        let prog = String::from_utf8_lossy(&spec.program).into_owned();
+        if prog.contains("pkgbuild") {
+            let id = String::from_utf8_lossy(find_arg_after(&spec.args, b"--identifier").unwrap())
+                .into_owned();
+            let root = to_native(find_arg_after(&spec.args, b"--root").unwrap());
+            if id.ends_with(".app") {
+                assert_eq!(
+                    read_bytes(h, &root.join("Applications/bin/orig.txt")),
+                    b"replaced-v2"
+                );
+                assert_eq!(
+                    read_bytes(h, &root.join("Applications/bin/hook_added.txt")),
+                    b"added-by-hook"
+                );
+                saw_app_ref.store(true, Ordering::SeqCst);
+            } else if id.ends_with(".emptycomp") {
+                assert_eq!(
+                    read_bytes(h, &root.join("Applications/share/from_hook.txt")),
+                    b"hook-only-comp"
+                );
+                saw_empty_ref.store(true, Ordering::SeqCst);
+            }
+            let out = to_native(spec.args.last().unwrap());
+            h.write(&out, b"leaf-pkg", WriteMode::CreateNew)?;
+            Ok(ok_output(b""))
+        } else {
+            let out = to_native(spec.args.last().unwrap());
+            h.write(&out, b"final-pkg", WriteMode::CreateNew)?;
+            Ok(ok_output(b""))
+        }
+    })
+    .unwrap();
+
+    assert_eq!(
+        run_unrestricted(host.clone(), &[]),
+        0,
+        "stderr={}",
+        String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr))
+    );
+    assert!(saw_app.load(Ordering::SeqCst));
+    assert!(saw_empty.load(Ordering::SeqCst));
+}
+
+#[test]
+fn deep_acyclic_dependency_chain_and_group_depth_limit() {
+    // 1) 5,000-component acyclic dependency chain must not overflow the stack across catalog,
+    // productbuild dependency expression expansion, NSIS dependency macro expansion, or IFW.
+    const CHAIN_LEN: usize = 5_000;
+    let mut vars = BTreeMap::new();
+    let mut names = Vec::with_capacity(CHAIN_LEN);
+    for i in 0..CHAIN_LEN {
+        let name = format!("c{i}");
+        names.push(name);
+    }
+    vars.insert(
+        BString::from("CPACK_INSTALL_CMAKE_PROJECTS"),
+        BString::from("/work/build;Deep;ALL;/"),
+    );
+    vars.insert(BString::from("CPACK_GENERATOR"), BString::from("NSIS"));
+    vars.insert(
+        BString::from("CPACK_COMPONENTS_ALL"),
+        BString::from(names.join(";")),
+    );
+    for i in 0..CHAIN_LEN - 1 {
+        vars.insert(
+            BString::from(format!("CPACK_COMPONENT_C{i}_DEPENDS")),
+            BString::from(format!("c{}", i + 1)),
+        );
+    }
+    let cfg = crate::config::CpackConfig { vars };
+    let catalog = super::ComponentCatalog::from_config(&cfg, &[]).unwrap();
+    assert_eq!(catalog.components.len(), CHAIN_LEN);
+
+    let first = catalog.components.get(&BString::from("c0")).unwrap();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut js_expr = String::new();
+    crate::generators::productbuild::append_dep_expr(&catalog, first, &mut visited, &mut js_expr)
+        .unwrap();
+    assert!(js_expr.contains("c4999Choice"));
+
+    visited.clear();
+    let mut nsis_deps = String::new();
+    crate::generators::nsis::append_select_deps(&catalog, first, &mut visited, &mut nsis_deps)
+        .unwrap();
+    assert!(nsis_deps.contains("${c4999}"));
+
+    crate::generators::ifw::check_deep_package_chain(CHAIN_LEN, false).unwrap();
+    let cyc_err = crate::generators::ifw::check_deep_package_chain(CHAIN_LEN, true).unwrap_err();
+    assert!(cyc_err.to_string().contains("Cycle detected"));
+
+    // 2) 5,000-deep acyclic group hierarchy must fail cleanly with a depth-limit configuration error.
+    let mut gvars = BTreeMap::new();
+    gvars.insert(
+        BString::from("CPACK_INSTALL_CMAKE_PROJECTS"),
+        BString::from("/work/build;DeepG;ALL;/"),
+    );
+    gvars.insert(BString::from("CPACK_GENERATOR"), BString::from("WIX"));
+    gvars.insert(BString::from("CPACK_COMPONENTS_ALL"), BString::from("leaf"));
+    gvars.insert(
+        BString::from("CPACK_COMPONENT_LEAF_GROUP"),
+        BString::from("g0"),
+    );
+    for i in 0..CHAIN_LEN - 1 {
+        gvars.insert(
+            BString::from(format!("CPACK_COMPONENT_GROUP_G{i}_PARENT_GROUP")),
+            BString::from(format!("g{}", i + 1)),
+        );
+    }
+    let gcfg = crate::config::CpackConfig { vars: gvars };
+    let gerr = super::ComponentCatalog::from_config(&gcfg, &[]).unwrap_err();
+    assert!(
+        gerr.to_string().contains("exceeds maximum depth"),
+        "unexpected group depth error: {gerr}"
+    );
+}
+
+#[test]
+fn nsis_registry_order_and_decimal_version_parity() {
+    // Decimal version rule: 3.1 >= 3.03 is accepted; 3.029 and 3.02 are rejected.
+    assert!(crate::generators::nsis::validate_nsis_version("v3.1\n").is_ok());
+    assert!(crate::generators::nsis::validate_nsis_version("v3.03\n").is_ok());
+    assert!(crate::generators::nsis::validate_nsis_version("v3.031\n").is_ok());
+    assert!(crate::generators::nsis::validate_nsis_version("v3.029\n").is_err());
+    assert!(crate::generators::nsis::validate_nsis_version("v3.02\n").is_err());
+    assert!(crate::generators::nsis::validate_nsis_version("v3.0\n").is_err());
+
+    // NSIS checks native-view Unicode key BEFORE 32-bit standard key.
+    let host = make_profile_host(OsProfile::Windows);
+    host.env_set(b"PATH", Some(b"/empty"));
+    host.seed_file(Path::new("/nsis32-std/makensis.exe"), b"std")
+        .unwrap();
+    host.seed_file(Path::new("/nsis-native-uni/makensis.exe"), b"uni")
+        .unwrap();
+    host.seed_registry_value(
+        RegistryRoot::LocalMachine,
+        b"SOFTWARE\\NSIS",
+        None,
+        RegistryView::Bits32,
+        b"/nsis32-std",
+    )
+    .unwrap();
+    host.seed_registry_value(
+        RegistryRoot::LocalMachine,
+        b"SOFTWARE\\NSIS\\Unicode",
+        None,
+        RegistryView::Bits64,
+        b"/nsis-native-uni",
+    )
+    .unwrap();
+    host.seed_file(Path::new("/work/src/a.txt"), b"a").unwrap();
+    host.seed_file(
+        Path::new("/work/CPackConfig.cmake"),
+        br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "NSIS")
+set(CPACK_PACKAGE_NAME "RegOrder")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "RegOrder-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+"#,
+    )
+    .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls_ref = Arc::clone(&calls);
+    host.set_command_handler(move |h, req, _| {
+        let spec = record_cmd(&calls_ref, req);
+        if spec.args == [BString::from("/VERSION")] {
+            return Ok(ok_output(b"v3.1\n"));
+        }
+        h.write(
+            &req.cwd.join("RegOrder-1.0.exe"),
+            b"exe",
+            WriteMode::CreateNew,
+        )?;
+        Ok(ok_output(b"ok"))
+    })
+    .unwrap();
+
+    assert_eq!(
+        run_unrestricted(host.clone(), &[]),
+        0,
+        "stderr={}",
+        String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr))
+    );
+    let recorded = calls.lock().unwrap();
+    assert_eq!(
+        recorded[0].program,
+        BString::from("/nsis-native-uni/makensis.exe")
+    );
+
+    // NSIS64 checks 64-bit keys first before 32-bit Unicode key.
+    let host64 = make_profile_host(OsProfile::Windows);
+    host64.env_set(b"PATH", Some(b"/empty"));
+    host64
+        .seed_file(Path::new("/nsis64-std/makensis.exe"), b"64std")
+        .unwrap();
+    host64
+        .seed_file(Path::new("/nsis32-uni/makensis.exe"), b"32uni")
+        .unwrap();
+    host64
+        .seed_registry_value(
+            RegistryRoot::LocalMachine,
+            b"SOFTWARE\\NSIS",
+            None,
+            RegistryView::Bits64,
+            b"/nsis64-std",
+        )
+        .unwrap();
+    host64
+        .seed_registry_value(
+            RegistryRoot::LocalMachine,
+            b"SOFTWARE\\NSIS\\Unicode",
+            None,
+            RegistryView::Bits32,
+            b"/nsis32-uni",
+        )
+        .unwrap();
+    host64
+        .seed_file(Path::new("/work/src/a.txt"), b"a")
+        .unwrap();
+    host64
+        .seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "NSIS64")
+set(CPACK_PACKAGE_NAME "RegOrder64")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "RegOrder64-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+"#,
+        )
+        .unwrap();
+    let calls64 = Arc::new(Mutex::new(Vec::new()));
+    let calls64_ref = Arc::clone(&calls64);
+    host64
+        .set_command_handler(move |h, req, _| {
+            let spec = record_cmd(&calls64_ref, req);
+            if spec.args == [BString::from("/VERSION")] {
+                return Ok(ok_output(b"v3.1\n"));
+            }
+            h.write(
+                &req.cwd.join("RegOrder64-1.0.exe"),
+                b"exe64",
+                WriteMode::CreateNew,
+            )?;
+            Ok(ok_output(b"ok"))
+        })
+        .unwrap();
+    assert_eq!(run_unrestricted(host64.clone(), &[]), 0);
+    assert_eq!(
+        calls64.lock().unwrap()[0].program,
+        BString::from("/nsis64-std/makensis.exe")
+    );
+}
+
+#[test]
+fn wix_legacy_license_bytes_and_xml_whitespace_patch() {
+    let host = make_profile_host(OsProfile::Windows);
+    seed_tool(&host, OsProfile::Windows, "wix");
+    // Legacy non-UTF-8 license bytes (0xA9 Latin-1 copyright, 0xFF invalid lead byte).
+    host.seed_file(
+        Path::new("/work/legacy_license.txt"),
+        b"Copyright \xA9 2026 \xFF\n",
+    )
+    .unwrap();
+    host.seed_file(Path::new("/work/src/app.exe"), b"MZ")
+        .unwrap();
+    // Patch text with NBSP (\u{00A0}) surrounded by XML whitespace.
+    let patch_xml = "<CPackWiXPatch>\n  <CPackWiXFragment Id=\"#PRODUCT\">\n    <CustomAction Id=\"CA1\">  \u{00A0}KeepNBSP\u{00A0}\r\n\t</CustomAction>\n  </CPackWiXFragment>\n</CPackWiXPatch>\n";
+    host.seed_file(Path::new("/work/patch.xml"), patch_xml.as_bytes())
+        .unwrap();
+    host.seed_file(
+        Path::new("/work/CPackConfig.cmake"),
+        br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "WIX")
+set(CPACK_WIX_VERSION "4")
+set(CPACK_WIX_TEST_FIXED_GUIDS "11111111-1111-4111-8111-111111111111;22222222-2222-4222-8222-222222222222")
+set(CPACK_PACKAGE_NAME "LegacyWix")
+set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_FILE_NAME "LegacyWix-1.0.0")
+set(CPACK_RESOURCE_FILE_LICENSE "/work/legacy_license.txt")
+set(CPACK_WIX_PATCH_FILE "/work/patch.xml")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+"#,
+    )
+    .unwrap();
+    host.set_command_handler(|h, req, _| {
+        let out = to_native(find_arg_after(&req.pipeline[0].args, b"-out").unwrap());
+        h.write(&out, b"msi", WriteMode::CreateNew)?;
+        Ok(ok_output(b"ok"))
+    })
+    .unwrap();
+
+    assert_eq!(
+        run_unrestricted(host.clone(), &[]),
+        0,
+        "stderr={}",
+        String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr))
+    );
+    let rtf_bytes = read_bytes(
+        host.as_ref(),
+        Path::new("/work/_CPack_Packages/WIX/License.rtf"),
+    );
+    let rtf_str = String::from_utf8_lossy(&rtf_bytes);
+    assert!(
+        rtf_str.contains(
+            r"Copyright \cf1 [INVALID-BYTE-169]\cf0  2026 \cf1 [INVALID-BYTE-255]\cf0 \par"
+        ),
+        "unexpected RTF: {rtf_str}"
+    );
+    let prod_wxi = read_utf8(
+        host.as_ref(),
+        Path::new("/work/_CPack_Packages/WIX/product_fragment.wxi"),
+    );
+    assert!(
+        prod_wxi.contains(">\u{00A0}KeepNBSP\u{00A0}</CustomAction>"),
+        "NBSP was unexpectedly stripped in patch text: {prod_wxi}"
+    );
+}
+
+#[test]
+fn ifw_updates_warning_qrc_isolation_and_extended_redaction() {
+    // 1) Missing Updates.xml warns and continues; empty/missing QRC skipped; two QRCs with same
+    // asset path are isolated in distinct directories without overwriting each other.
+    {
+        let host = make_profile_host(OsProfile::Linux);
+        seed_tool(&host, OsProfile::Linux, "binarycreator");
+        seed_tool(&host, OsProfile::Linux, "repogen");
+        host.seed_file(Path::new("/work/src/a.txt"), b"a").unwrap();
+        host.seed_file(Path::new("/work/empty.qrc"), b"<RCC><qresource/></RCC>")
+            .unwrap();
+        host.seed_file(
+            Path::new("/work/q1/res.qrc"),
+            b"<RCC><qresource><file>asset.txt</file></qresource></RCC>",
+        )
+        .unwrap();
+        host.seed_file(Path::new("/work/q1/asset.txt"), b"FROM_Q1")
+            .unwrap();
+        host.seed_file(
+            Path::new("/work/q2/res.qrc"),
+            b"<RCC><qresource><file>asset.txt</file></qresource></RCC>",
+        )
+        .unwrap();
+        host.seed_file(Path::new("/work/q2/asset.txt"), b"FROM_Q2")
+            .unwrap();
+        host.seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "IFW")
+set(CPACK_IFW_FRAMEWORK_VERSION "4.2.0")
+set(CPACK_PACKAGE_NAME "IfwP2")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "IfwP2-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+set(CPACK_IFW_PACKAGE_RESOURCES "/work/missing.qrc;/work/empty.qrc;/work/q1/res.qrc;/work/q2/res.qrc")
+set(CPACK_IFW_REPOSITORIES_ALL "r1;radd")
+set(CPACK_IFW_REPOSITORY_R1_URL "https://repo.example.test/main")
+set(CPACK_IFW_REPOSITORY_RADD_ADD ON)
+set(CPACK_IFW_REPOSITORY_RADD_URL "https://repo.example.test/extra")
+"#,
+        )
+        .unwrap();
+        let qrc_arg = Arc::new(Mutex::new(String::new()));
+        let qrc_arg_ref = Arc::clone(&qrc_arg);
+        host.set_command_handler(move |h, req, _| {
+            let spec = &req.pipeline[0];
+            let prog = String::from_utf8_lossy(&spec.program).into_owned();
+            if prog.contains("repogen") {
+                // Intentionally omit Updates.xml to verify warning-and-continue behavior.
+                let repo_dir = to_native(spec.args.last().unwrap());
+                h.create_dir_all(&repo_dir)?;
+                Ok(ok_output(b"repogen ok"))
+            } else {
+                if let Some(r) = find_arg_after(&spec.args, b"-r") {
+                    *qrc_arg_ref.lock().unwrap() = String::from_utf8_lossy(r).into_owned();
+                }
+                let out = to_native(spec.args.last().unwrap());
+                h.write(&out, b"ifw-ok", WriteMode::CreateNew)?;
+                Ok(ok_output(b"bc ok"))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            run_unrestricted(host.clone(), &[]),
+            0,
+            "stderr={}",
+            String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr))
+        );
+        let stderr = String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned();
+        assert!(stderr.contains("Problem patch IFW \"Updates\" file"));
+        assert!(stderr.contains("/work/missing.qrc"));
+        assert!(stderr.contains("/work/empty.qrc"));
+
+        let qrc_list: Vec<String> = qrc_arg
+            .lock()
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(qrc_list.len(), 2, "expected 2 valid QRCs, got {qrc_list:?}");
+        let p0 = PathBuf::from(&qrc_list[0])
+            .parent()
+            .unwrap()
+            .join("asset.txt");
+        let p1 = PathBuf::from(&qrc_list[1])
+            .parent()
+            .unwrap()
+            .join("asset.txt");
+        assert_ne!(p0, p1);
+        assert_eq!(read_bytes(host.as_ref(), &p0), b"FROM_Q1");
+        assert_eq!(read_bytes(host.as_ref(), &p1), b"FROM_Q2");
+    }
+
+    // 2) Updates.xml patching preserves nonblank whitespace in text nodes.
+    {
+        let host = make_profile_host(OsProfile::Linux);
+        seed_tool(&host, OsProfile::Linux, "binarycreator");
+        seed_tool(&host, OsProfile::Linux, "repogen");
+        host.seed_file(Path::new("/work/src/a.txt"), b"a").unwrap();
+        host.seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "IFW")
+set(CPACK_PACKAGE_NAME "IfwText")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "IfwText-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+set(CPACK_IFW_REPOSITORIES_ALL "r1;radd")
+set(CPACK_IFW_REPOSITORY_R1_URL "https://repo.example.test/main")
+set(CPACK_IFW_REPOSITORY_RADD_ADD ON)
+set(CPACK_IFW_REPOSITORY_RADD_URL "https://repo.example.test/extra")
+"#,
+        )
+        .unwrap();
+        host.set_command_handler(|h, req, _| {
+            let spec = &req.pipeline[0];
+            let prog = String::from_utf8_lossy(&spec.program).into_owned();
+            if prog.contains("repogen") {
+                let repo_dir = to_native(spec.args.last().unwrap());
+                h.create_dir_all(&repo_dir)?;
+                h.write(
+                    &repo_dir.join("Updates.xml"),
+                    b"<Updates><Checksum>true</Checksum><Description>  keep edges  </Description></Updates>",
+                    WriteMode::CreateNew,
+                )?;
+                Ok(ok_output(b""))
+            } else {
+                let out = to_native(spec.args.last().unwrap());
+                h.write(&out, b"ok", WriteMode::CreateNew)?;
+                Ok(ok_output(b""))
+            }
+        })
+        .unwrap();
+        assert_eq!(run_unrestricted(host.clone(), &[]), 0);
+        let patched = read_utf8(
+            host.as_ref(),
+            Path::new("/work/_CPack_Packages/IFW/IfwText-1.0/repository/Updates.xml"),
+        );
+        assert!(
+            patched.contains("<Description>  keep edges  </Description>"),
+            "nonblank text whitespace was stripped: {patched}"
+        );
+    }
+
+    // 3) QRC referencing a symlink pointing outside the QRC base directory is rejected.
+    {
+        let host = make_profile_host(OsProfile::Linux);
+        seed_tool(&host, OsProfile::Linux, "binarycreator");
+        host.seed_file(Path::new("/work/src/a.txt"), b"a").unwrap();
+        host.seed_file(Path::new("/work/outside/secret.txt"), b"SECRET")
+            .unwrap();
+        host.seed_file(
+            Path::new("/work/qdir/link.qrc"),
+            b"<RCC><qresource><file>escape.txt</file></qresource></RCC>",
+        )
+        .unwrap();
+        host.symlink(
+            Path::new("/work/outside/secret.txt"),
+            Path::new("/work/qdir/escape.txt"),
+        )
+        .unwrap();
+        host.seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "IFW")
+set(CPACK_PACKAGE_NAME "QrcLink")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "QrcLink-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+set(CPACK_IFW_PACKAGE_RESOURCES "/work/qdir/link.qrc")
+"#,
+        )
+        .unwrap();
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let invoked_ref = Arc::clone(&invoked);
+        host.set_command_handler(move |_, _, _| {
+            invoked_ref.fetch_add(1, Ordering::SeqCst);
+            Ok(ok_output(b""))
+        })
+        .unwrap();
+        assert_eq!(run_unrestricted(host.clone(), &[]), 1);
+        assert_eq!(invoked.load(Ordering::SeqCst), 0);
+        assert!(
+            String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr))
+                .contains("escapes base directory")
+        );
+    }
+
+    // 4) XML-escaped passwords and URL-embedded credentials are redacted in logs and stderr.
+    {
+        let host = make_profile_host(OsProfile::Linux);
+        seed_tool(&host, OsProfile::Linux, "binarycreator");
+        seed_tool(&host, OsProfile::Linux, "repogen");
+        host.seed_file(Path::new("/work/src/a.txt"), b"a").unwrap();
+        host.seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "IFW")
+set(CPACK_PACKAGE_NAME "RedactExt")
+set(CPACK_PACKAGE_VERSION "1.0")
+set(CPACK_PACKAGE_FILE_NAME "RedactExt-1.0")
+set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
+set(CPACK_IFW_REPOSITORIES_ALL "r1")
+set(CPACK_IFW_REPOSITORY_R1_URL "https://bob:URL_SECRET_77&x@repo.example.test/main")
+set(CPACK_IFW_REPOSITORY_R1_PASSWORD "p&w<\"'1")
+"#,
+        )
+        .unwrap();
+        host.set_command_handler(|_, _, _| {
+            Ok(fail_output(
+                1,
+                b"xml=<Password>p&amp;w&lt;&quot;&apos;1</Password> url=https://bob:URL_SECRET_77&amp;x@repo.example.test/main raw=https://bob:URL_SECRET_77&x@repo.example.test/main\n",
+            ))
+        })
+        .unwrap();
+        assert_eq!(run_unrestricted(host.clone(), &[]), 1);
+        let stderr = String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned();
+        let log_text = read_utf8(
+            host.as_ref(),
+            Path::new("/work/_CPack_Packages/IFW/IFWOutput.log"),
+        );
+        for leaked in ["p&w", "p&amp;w", "URL_SECRET_77", "bob:URL_SECRET_77"] {
+            assert!(!stderr.contains(leaked), "stderr leaked {leaked}: {stderr}");
+            assert!(
+                !log_text.contains(leaked),
+                "IFWOutput.log leaked {leaked}: {log_text}"
+            );
+        }
+    }
 }

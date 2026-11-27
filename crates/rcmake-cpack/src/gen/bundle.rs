@@ -22,6 +22,8 @@ impl PackageGenerator for BundleGenerator {
     }
 
     fn package(&self, cx: &PackageContext<'_>) -> Result<Vec<PathBuf>, CpackError> {
+        let _canon_work = cx.expected_work_root()?;
+        let canon_staging = cx.expected_staging_root()?;
         let name = required(cx, "CPACK_BUNDLE_NAME")?;
         let plist = required(cx, "CPACK_BUNDLE_PLIST")?;
         let icon = required(cx, "CPACK_BUNDLE_ICON")?;
@@ -34,7 +36,14 @@ impl PackageGenerator for BundleGenerator {
         let host = cx.host;
         host.create_dir_all(&macos)?;
         host.create_dir_all(&resources)?;
-        crate::source::merge_component(host, cx.staging_dir, &resources)?;
+        crate::source::copy_checked_tree_expected(
+            host,
+            cx.staging_dir,
+            &canon_staging,
+            &resources,
+            crate::source::SymlinkPolicy::PreserveContained,
+            false,
+        )?;
         copy_asset(host, plist, &contents.join("Info.plist"))?;
         copy_asset(
             host,

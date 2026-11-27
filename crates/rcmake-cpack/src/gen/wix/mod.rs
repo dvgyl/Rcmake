@@ -191,7 +191,6 @@ impl PackageGenerator for Wix {
             }
         }
 
-        // Run vendored Modules/Internal/CPack/CPackWIX.cmake when CMAKE_ROOT provides it.
         let cmake_root = interp.cx().var_or_empty(b"CMAKE_ROOT");
         let module_path = (!cmake_root.is_empty())
             .then(|| absolute(cwd, &cmake_root).join("Modules/Internal/CPack/CPackWIX.cmake"));
@@ -207,10 +206,8 @@ impl PackageGenerator for Wix {
         }
 
         let cfg = snapshot(interp);
-        // Validate scope + version compatibility immediately.
         let _ = InstallScope::parse(option_set(&cfg, b"CPACK_WIX_INSTALL_SCOPE"), version)?;
 
-        // Verify required tools were found or explicitly configured.
         match version {
             WixVersion::V4 => {
                 if option_set(&cfg, b"CPACK_WIX_EXECUTABLE").is_none() {
@@ -244,6 +241,8 @@ impl PackageGenerator for Wix {
         };
         let host = cx.host;
         let cwd = host.initial_cwd();
+        let canon_work = cx.expected_work_root()?;
+        let canon_staging = cx.expected_staging_root()?;
 
         if let Some(abs_files) = option_set(&cfg, b"CPACK_ABSOLUTE_DESTINATION_FILES") {
             return Err(error(format!(
@@ -252,15 +251,20 @@ impl PackageGenerator for Wix {
             )));
         }
 
-        // Audit Finding #9: re-validate the entire staged tree after pre-build hooks.
-        validate_staged_tree(host, cx.staging_dir, members, SymlinkPolicy::Reject, true)?;
+        validate_staged_tree(
+            host,
+            cx.staging_dir,
+            &canon_staging,
+            members,
+            SymlinkPolicy::Reject,
+            true,
+        )?;
 
         let catalog = ComponentCatalog::from_config(&cfg, members)?;
         let version = WixVersion::parse(option_set(&cfg, b"CPACK_WIX_VERSION"))?;
         let install_scope =
             InstallScope::parse(option_set(&cfg, b"CPACK_WIX_INSTALL_SCOPE"), version)?;
 
-        // Deterministic injectable GUID sequence for tests (or host-backed entropy in production).
         let mut fixed_guids = cfg
             .list(b"CPACK_WIX_TEST_FIXED_GUIDS")
             .into_iter()
@@ -284,17 +288,14 @@ impl PackageGenerator for Wix {
             &mut next_guid,
         )?;
 
-        // Load and validate all XML patch files.
         let mut patches = WixPatchSet::default();
         for patch_entry in cfg.list(b"CPACK_WIX_PATCH_FILE") {
             let patch_path = absolute(&cwd, &patch_entry);
             patches.load_file(host, &patch_path)?;
         }
 
-        // Read staged install properties (CPackProperties.cmake) from interpreter.
         let install_props = collect_install_props(interp)?;
 
-        // Emit include files.
         let vars_wxi = render_variables_wxi(&wix_cfg)?;
         write_wix_file(host, &cx.output_dir.join("cpack_variables.wxi"), &vars_wxi)?;
         let props_wxi = render_properties_wxi(&wix_cfg)?;
@@ -302,10 +303,10 @@ impl PackageGenerator for Wix {
         let prod_wxi = render_product_fragment_wxi(&wix_cfg, &catalog, &mut patches)?;
         write_wix_file(host, &cx.output_dir.join("product_fragment.wxi"), &prod_wxi)?;
 
-        // Emit directories.wxs, files.wxs, features.wxs.
         let rendered = render_wix_sources(
             host,
             cx.staging_dir,
+            &canon_staging,
             &wix_cfg,
             &catalog,
             &install_props,
@@ -319,7 +320,6 @@ impl PackageGenerator for Wix {
         write_wix_file(host, &files_path, &rendered.files_wxs)?;
         write_wix_file(host, &feats_path, &rendered.features_wxs)?;
 
-        // Render main.wxs from custom CPACK_WIX_TEMPLATE or vendored template.
         let main_template_path = match option_set(&cfg, b"CPACK_WIX_TEMPLATE") {
             Some(tpl) => absolute(&cwd, tpl),
             None => {
@@ -340,10 +340,8 @@ impl PackageGenerator for Wix {
         let main_path = cx.output_dir.join("main.wxs");
         write_wix_file(host, &main_path, &main_wxs)?;
 
-        // Reject any unapplied patch fragments.
         patches.check_all_applied()?;
 
-        // Collect all source files (generated + CPACK_WIX_EXTRA_SOURCES).
         let mut sources = vec![dirs_path, files_path, feats_path, main_path];
         for extra in cfg.list(b"CPACK_WIX_EXTRA_SOURCES") {
             sources.push(absolute(&cwd, &extra));
@@ -363,6 +361,7 @@ impl PackageGenerator for Wix {
                     host,
                     &cfg,
                     cx.output_dir,
+                    &canon_work,
                     &cwd,
                     &wix_cfg,
                     &sources,
@@ -382,7 +381,7 @@ impl PackageGenerator for Wix {
                 )?;
             }
         }
-        verify_fresh_output(host, cx.output_dir, &out_msi, "WiX")?;
+        verify_fresh_output(host, cx.output_dir, &canon_work, &out_msi, "WiX")?;
         Ok(vec![out_msi])
     }
 }
@@ -745,8 +744,7 @@ fn create_license_rtf(
                     limit: 4 * 1024 * 1024,
                 },
             )?;
-            let text = require_utf8(&bytes, "CPACK_RESOURCE_FILE_LICENSE")?;
-            let rtf_bytes = rtf::plain_text_to_rtf(text);
+            let rtf_bytes = rtf::plain_text_bytes_to_rtf(&bytes);
             host.write(dest, &rtf_bytes, WriteMode::CreateNew)?;
         }
         _ => {
@@ -769,6 +767,7 @@ fn run_wix_v3(
     host: &dyn Host,
     cfg: &CpackConfig,
     work_dir: &Path,
+    canon_work: &Path,
     cwd: &Path,
     wix_cfg: &WixConfig,
     sources: &[PathBuf],
@@ -818,7 +817,7 @@ fn run_wix_v3(
         let outcome = run_installer_tool(host, work_dir, candle, &args, BUILD_TIMEOUT)?;
         write_tool_log(host, log_path, candle, &args, &outcome.output, &[], true)?;
         check_tool_outcome(&outcome, candle, "WiX candle", Some(log_path), &[])?;
-        verify_fresh_output(host, work_dir, &obj, "WiX candle")?;
+        verify_fresh_output(host, work_dir, canon_work, &obj, "WiX candle")?;
         object_files.push(obj);
     }
 

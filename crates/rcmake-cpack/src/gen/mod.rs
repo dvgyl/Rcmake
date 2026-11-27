@@ -45,10 +45,11 @@ pub fn create(name: &[u8]) -> Option<Box<dyn PackageGenerator>> {
 
 /// Resolve a generator for the runtime host reported by [`Host::system`].
 ///
-/// Matches CMake 4.5.1's `cmCPackGeneratorFactory` platform availability:
+/// Platform gating:
 /// - `NSIS`, `NSIS64`, `IFW`, `External`, and all archive generators are available on all platforms.
 /// - `productbuild` is available on macOS (`Darwin`).
-/// - `WIX` is available on Windows.
+/// - `WIX` is available on Windows and Cygwin hosts (upstream CMake enables `WIX` on Windows and on
+///   Cygwin builds linked with `LibUUID`).
 /// - `PureOS` (the default `PureHost` identity in existing unit tests) falls back to the
 ///   compile-time platform for platform-gated installers while keeping existing `DragNDrop`,
 ///   `Bundle`, `DEB`, and `RPM` tests working.

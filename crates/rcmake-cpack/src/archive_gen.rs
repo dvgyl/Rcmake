@@ -11,7 +11,7 @@ use rcmake_archive::{
 use rcmake_base::BString;
 use rcmake_base::parse_source_date_epoch;
 use rcmake_host::path::to_native;
-use rcmake_host::{FileKind, Follow, Host};
+use rcmake_host::{FileKind, Host};
 
 use crate::config::CpackConfig;
 
@@ -249,6 +249,8 @@ impl ArchiveGenerator {
             .then(|| stgz::header(cx, &cfg))
             .transpose()?;
         let header = header.as_ref().map(|header| header.as_slice());
+        let _canon_work = cx.expected_work_root()?;
+        let canon_staging = cx.expected_staging_root()?;
         // Components that the install recorded do not depend on the configuration that
         // the pre-build scripts leave.
         let archives = match members.filter(|members| !members.is_empty()) {
@@ -256,6 +258,14 @@ impl ArchiveGenerator {
             None => component_archives(&cfg, archive_name, self.name())?,
         };
         if archives.is_empty() {
+            crate::source::validate_staged_tree(
+                cx.host,
+                cx.staging_dir,
+                &canon_staging,
+                &[],
+                crate::source::SymlinkPolicy::PreserveContained,
+                false,
+            )?;
             let (base, inputs) = if header.is_none()
                 && (cfg.get(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY").is_none()
                     || cfg.on(b"CPACK_INCLUDE_TOPLEVEL_DIRECTORY"))
@@ -304,9 +314,11 @@ impl ArchiveGenerator {
             match &archive.source {
                 ArchiveSource::Live(roots) => {
                     let prefix = component_prefix(cx, &cfg)?;
-                    write_component_archive(cx, &output, &prefix, roots)?;
+                    write_component_archive(cx, &canon_staging, &output, &prefix, roots)?;
                 }
-                ArchiveSource::Recorded(roots) => write_recorded_archive(cx, &output, roots)?,
+                ArchiveSource::Recorded(roots) => {
+                    write_recorded_archive(cx, &canon_staging, &output, roots)?;
+                }
             }
         }
         Ok(paths)
@@ -333,6 +345,7 @@ enum ArchiveSource {
 
 struct RecordedRoot {
     dir: PathBuf,
+    expected_canon: Option<PathBuf>,
     paths: Vec<PathBuf>,
 }
 
@@ -346,15 +359,24 @@ fn recorded_archives(
     members: &[InstalledComponent],
 ) -> Result<Vec<ComponentArchive>, CpackError> {
     let prefix = recorded_prefix(cx, cfg)?;
-    let root = |component: &InstalledComponent| RecordedRoot {
-        dir: cx
+    let root = |component: &InstalledComponent| {
+        let dir = cx
             .staging_dir
-            .join(crate::stage::component_dir(&component.name)),
-        paths: component
-            .files
+            .join(crate::stage::component_dir(&component.name));
+        let expected_canon = component
+            .staged_roots
             .iter()
-            .map(|file| prefix.join(file))
-            .collect(),
+            .find(|staged| staged.root == dir && !staged.canon_root.as_os_str().is_empty())
+            .map(|staged| staged.canon_root.clone());
+        RecordedRoot {
+            dir,
+            expected_canon,
+            paths: component
+                .files
+                .iter()
+                .map(|file| prefix.join(file))
+                .collect(),
+        }
     };
     let grouping = crate::stage::grouping(cfg);
     if grouping == ComponentGrouping::AllComponentsInOne {
@@ -523,24 +545,61 @@ fn component_prefix(cx: &PackageContext<'_>, cfg: &CpackConfig) -> Result<PathBu
     Ok(prefix)
 }
 
-fn component_root(cx: &PackageContext<'_>, root: &Path) -> Result<(), CpackError> {
-    let metadata = cx.host.metadata(root, Follow::No).map_err(|err| {
+fn component_root(
+    cx: &PackageContext<'_>,
+    canon_staging: &Path,
+    root: &Path,
+    expected_canon: Option<&Path>,
+) -> Result<PathBuf, CpackError> {
+    let rel = root.strip_prefix(cx.staging_dir).map_err(|_| {
         error(format!(
-            "Failed to change working directory to {}: {err}",
+            "Failed to change working directory to {}",
             root.display()
         ))
     })?;
-    if metadata.kind != FileKind::Dir {
+    if !rel.as_os_str().is_empty() {
+        let kind = crate::source::verify_contained_path(
+            cx.host,
+            cx.staging_dir,
+            canon_staging,
+            rel,
+            crate::source::SymlinkPolicy::Reject,
+            false,
+        )
+        .map_err(|err| {
+            error(format!(
+                "Failed to change working directory to {}: {err}",
+                root.display()
+            ))
+        })?;
+        if kind != FileKind::Dir {
+            return Err(error(format!(
+                "Failed to change working directory to {}",
+                root.display()
+            )));
+        }
+    }
+    let canon_root = match expected_canon {
+        Some(expected) => crate::source::verify_expected_root(cx.host, root, expected)?,
+        None => crate::source::canonical_checked_root(cx.host, root).map_err(|err| {
+            error(format!(
+                "Failed to change working directory to {}: {err}",
+                root.display()
+            ))
+        })?,
+    };
+    if !canon_root.starts_with(canon_staging) {
         return Err(error(format!(
-            "Failed to change working directory to {}",
+            "CPack component staging root escapes staging directory: {}",
             root.display()
         )));
     }
-    Ok(())
+    Ok(canon_root)
 }
 
 fn write_component_archive(
     cx: &PackageContext<'_>,
+    canon_staging: &Path,
     output: &ArchiveOutput<'_>,
     prefix: &Path,
     roots: &[PathBuf],
@@ -554,13 +613,42 @@ fn write_component_archive(
         return Err(error("CPack component group is empty"));
     };
     let first = cx.staging_dir.join(first);
-    let component_inputs = |root: &Path| {
-        component_root(cx, root)?;
-        children(cx.host, &root.join(prefix))
-            .map(|files| files.into_iter().map(|file| prefix.join(file)))
+    let component_inputs = |root: &Path| -> Result<Vec<PathBuf>, CpackError> {
+        let canon_root = component_root(cx, canon_staging, root, None)?;
+        let start = if !prefix.as_os_str().is_empty() {
+            let kind = crate::source::verify_contained_path(
+                cx.host,
+                root,
+                &canon_root,
+                prefix,
+                crate::source::SymlinkPolicy::Reject,
+                false,
+            )?;
+            if kind != FileKind::Dir {
+                return Err(error(format!(
+                    "CPack expected an install prefix directory at {}",
+                    root.join(prefix).display()
+                )));
+            }
+            root.join(prefix)
+        } else {
+            root.to_owned()
+        };
+        crate::source::validate_dir_subtree(
+            cx.host,
+            root,
+            &canon_root,
+            &start,
+            crate::source::SymlinkPolicy::PreserveContained,
+            false,
+        )?;
+        Ok(children(cx.host, &start)?
+            .into_iter()
+            .map(|file| prefix.join(file))
+            .collect())
     };
     if rest.is_empty() {
-        let inputs = component_inputs(&first)?.collect::<Vec<_>>();
+        let inputs = component_inputs(&first)?;
         return write_archive(cx, path, &first, &inputs, options, header);
     }
     let merged = component_workspace(cx)?;
@@ -569,7 +657,11 @@ fn write_component_archive(
         let mut inputs = Vec::new();
         for root in std::iter::once(first).chain(rest.iter().map(|root| cx.staging_dir.join(root)))
         {
-            inputs.extend(component_inputs(&root)?.filter(|file| seen.insert(file.clone())));
+            inputs.extend(
+                component_inputs(&root)?
+                    .into_iter()
+                    .filter(|file| seen.insert(file.clone())),
+            );
             crate::source::merge_component(cx.host, &root, &merged)?;
         }
         write_archive(cx, path, &merged, &inputs, options, header)
@@ -583,6 +675,7 @@ fn write_component_archive(
 /// Archive only the paths that the component installs recorded, with their current data.
 fn write_recorded_archive(
     cx: &PackageContext<'_>,
+    canon_staging: &Path,
     output: &ArchiveOutput<'_>,
     roots: &[RecordedRoot],
 ) -> Result<(), CpackError> {
@@ -591,10 +684,13 @@ fn write_recorded_archive(
         .map(|root| root.paths.iter().cloned().collect::<BTreeSet<_>>())
         .collect::<Vec<_>>();
     let mut members = BTreeSet::new();
+    let mut canon_roots = Vec::with_capacity(roots.len());
     let mut complete = true;
     for (root, recorded) in roots.iter().zip(&sets) {
-        component_root(cx, &root.dir)?;
-        complete &= check_recorded(cx.host, &root.dir, recorded)?;
+        let canon_root =
+            component_root(cx, canon_staging, &root.dir, root.expected_canon.as_deref())?;
+        complete &= check_recorded(cx.host, &root.dir, &canon_root, recorded)?;
+        canon_roots.push(canon_root);
         members.extend(recorded.iter().cloned());
     }
     let inputs = top_members(&members, roots.iter().flat_map(|root| &root.paths));
@@ -610,8 +706,8 @@ fn write_recorded_archive(
     }
     let merged = component_workspace(cx)?;
     let result: Result<(), CpackError> = (|| {
-        for (root, recorded) in roots.iter().zip(&sets) {
-            crate::source::merge_recorded(cx.host, &root.dir, recorded, &merged)?;
+        for ((root, recorded), canon_root) in roots.iter().zip(&sets).zip(&canon_roots) {
+            crate::source::merge_recorded(cx.host, &root.dir, canon_root, recorded, &merged)?;
         }
         write_archive(
             cx,
@@ -634,15 +730,15 @@ fn write_recorded_archive(
 fn check_recorded(
     host: &dyn Host,
     root: &Path,
+    canon_root: &Path,
     recorded: &BTreeSet<PathBuf>,
 ) -> Result<bool, CpackError> {
-    let canon_root = crate::source::canonical_checked_root(host, root)?;
     let mut complete = true;
     for member in recorded {
         let kind = crate::source::verify_contained_path(
             host,
             root,
-            &canon_root,
+            canon_root,
             member,
             crate::source::SymlinkPolicy::PreserveContained,
             false,

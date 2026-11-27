@@ -599,6 +599,56 @@ impl VarStack {
         )
     }
 
+    /// Number of scopes that directory `dir` sees in its live state: the scopes up to the
+    /// first directory boundary above the innermost boundary of `dir`. A suspended parent
+    /// directory does not see the scopes of the child directory that runs.
+    pub(crate) fn directory_extent(&self, dir: DirId) -> usize {
+        let Some(start) = self
+            .scopes
+            .iter()
+            .rposition(|scope| scope.directory == Some(dir))
+        else {
+            return self.scopes.len();
+        };
+        self.scopes
+            .iter()
+            .enumerate()
+            .skip(start.saturating_add(1))
+            .find(|(_, scope)| scope.directory.is_some())
+            .map_or(self.scopes.len(), |(index, _)| index)
+    }
+
+    /// Set values visible from scope `extent - 1` and below, sorted by name.
+    pub(crate) fn visible_in(&self, extent: usize) -> BTreeMap<&BString, &BString> {
+        let mut seen: BTreeMap<&BString, Option<&BString>> = BTreeMap::new();
+        for scope in self.scopes.iter().take(extent).rev() {
+            for (name, binding) in scope.bindings.iter() {
+                seen.entry(name).or_insert(match binding {
+                    Binding::Set(value) => Some(value),
+                    Binding::Unset => None,
+                });
+            }
+        }
+        seen.into_iter()
+            .filter_map(|(name, value)| Some((name, value?)))
+            .collect()
+    }
+
+    /// Value of `name` visible from scope `extent - 1` and below.
+    pub(crate) fn get_in(&self, extent: usize, name: &[u8]) -> Option<&BString> {
+        let mut shard = None;
+        let binding = self
+            .scopes
+            .iter()
+            .take(extent)
+            .rev()
+            .find_map(|scope| scope.bindings.get(name, &mut shard));
+        match binding {
+            Some(Binding::Set(value)) => Some(value),
+            Some(Binding::Unset) | None => None,
+        }
+    }
+
     /// All names with a [`Binding::Set`] value visible from the innermost scope, sorted.
     pub(crate) fn visible_names(&self) -> Vec<BString> {
         let mut seen: BTreeMap<&BString, bool> = BTreeMap::new();

@@ -1255,3 +1255,127 @@ mod setup_replay {
         Ok(())
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn cmake_edit_command_and_ninja_edit_cache_use_sibling_ccmake() -> HostResult<()> {
+    let host = Arc::new(PureHost::new(
+        PathBuf::from("/work"),
+        PathBuf::from("/pkg/bin/cmake"),
+    ));
+    host.seed_file(Path::new("/pkg/bin/rcmake"), b"")?;
+    host.set_permissions(Path::new("/pkg/bin/rcmake"), 0o755)?;
+    host.symlink(Path::new("rcmake"), Path::new("/pkg/bin/cmake"))?;
+    host.symlink(Path::new("rcmake"), Path::new("/pkg/bin/ccmake"))?;
+    host.seed_file(Path::new("/tools/ninja"), b"")?;
+    host.set_permissions(Path::new("/tools/ninja"), 0o755)?;
+    let modules = Path::new("/pkg/share/cmake-4.5/Modules");
+    for (name, contents) in [
+        ("CMakeDetermineSystem.cmake", ""),
+        ("CMakeSystemSpecificInitialize.cmake", ""),
+        ("CMakeSystemSpecificInformation.cmake", ""),
+        (
+            "CMakeNinjaFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM \"/tools/ninja\" CACHE FILEPATH \"\")\n",
+        ),
+    ] {
+        host.seed_file(&modules.join(name), contents.as_bytes())?;
+    }
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nproject(EditCmd NONE)\n",
+    )?;
+
+    let args = ["/pkg/bin/cmake", "-S", ".", "-B", "out", "-G", "Ninja"].map(BString::from);
+    assert_eq!(
+        crate::run(&args, host.clone()),
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+
+    let cache = BString::from(host.read(
+        Path::new("/work/out/CMakeCache.txt"),
+        ReadRange::All { limit: 1 << 20 },
+    )?);
+    let cache_text = cache.to_string();
+    assert!(
+        cache_text.contains("CMAKE_EDIT_COMMAND:INTERNAL=/pkg/bin/ccmake\n"),
+        "{cache_text}"
+    );
+
+    let ninja = BString::from(host.read(
+        Path::new("/work/out/build.ninja"),
+        ReadRange::All { limit: 1 << 20 },
+    )?);
+    let ninja_text = ninja.to_string();
+    assert!(
+        ninja_text.contains("build edit_cache: phony CMakeFiles/edit_cache.util"),
+        "{ninja_text}"
+    );
+    assert!(
+        ninja_text.contains("/pkg/bin/ccmake -S/work -B/work/out"),
+        "{ninja_text}"
+    );
+    assert!(ninja_text.contains("pool = console"), "{ninja_text}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cmake_edit_command_and_ninja_edit_cache_fallback_without_ccmake() -> HostResult<()> {
+    let host = Arc::new(PureHost::new(
+        PathBuf::from("/work"),
+        PathBuf::from("/pkg/bin/cmake"),
+    ));
+    host.seed_file(Path::new("/pkg/bin/rcmake"), b"")?;
+    host.set_permissions(Path::new("/pkg/bin/rcmake"), 0o755)?;
+    host.symlink(Path::new("rcmake"), Path::new("/pkg/bin/cmake"))?;
+    host.seed_file(Path::new("/tools/ninja"), b"")?;
+    host.set_permissions(Path::new("/tools/ninja"), 0o755)?;
+    let modules = Path::new("/pkg/share/cmake-4.5/Modules");
+    for (name, contents) in [
+        ("CMakeDetermineSystem.cmake", ""),
+        ("CMakeSystemSpecificInitialize.cmake", ""),
+        ("CMakeSystemSpecificInformation.cmake", ""),
+        (
+            "CMakeNinjaFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM \"/tools/ninja\" CACHE FILEPATH \"\")\n",
+        ),
+    ] {
+        host.seed_file(&modules.join(name), contents.as_bytes())?;
+    }
+    host.seed_file(
+        Path::new("/work/CMakeLists.txt"),
+        b"cmake_minimum_required(VERSION 4.5)\nproject(EditCmdFallback NONE)\n",
+    )?;
+
+    let args = ["/pkg/bin/cmake", "-S", ".", "-B", "out", "-G", "Ninja"].map(BString::from);
+    assert_eq!(
+        crate::run(&args, host.clone()),
+        0,
+        "{}",
+        host.stream_bytes(Stream::Stderr)
+    );
+
+    let cache = BString::from(host.read(
+        Path::new("/work/out/CMakeCache.txt"),
+        ReadRange::All { limit: 1 << 20 },
+    )?);
+    let cache_text = cache.to_string();
+    assert!(
+        !cache_text.contains("CMAKE_EDIT_COMMAND:INTERNAL="),
+        "{cache_text}"
+    );
+
+    let ninja = BString::from(host.read(
+        Path::new("/work/out/build.ninja"),
+        ReadRange::All { limit: 1 << 20 },
+    )?);
+    let ninja_text = ninja.to_string();
+    assert!(
+        ninja_text.contains("No interactive CMake dialog available."),
+        "{ninja_text}"
+    );
+    Ok(())
+}

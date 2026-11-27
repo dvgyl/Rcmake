@@ -457,6 +457,7 @@ impl Interp {
             && self.config.limits.wall_budget.is_none()
             && self.config.services.speed.hermetic == HermeticMode::Off
             && !self.has_command_observers()
+            && !self.has_debugger()
     }
 
     pub(crate) fn note_replay_source(&mut self, abs: &[u8], text: &crate::code::SourceText) {

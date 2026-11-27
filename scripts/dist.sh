@@ -21,11 +21,13 @@ package = Path(package).resolve(strict=True)
 windows = target.endswith("-windows-msvc")
 suffix = ".exe" if windows else ""
 bin_dir = package / "bin"
-tools = [bin_dir / (tool + suffix) for tool in ("rcmake", "cmake", "ctest", "cpack")]
+tool_names = ("rcmake", "cmake", "ctest", "cpack") if windows else ("rcmake", "cmake", "ctest", "cpack", "ccmake")
+tools = [bin_dir / (tool + suffix) for tool in tool_names]
 lsp = bin_dir / ("rcmake-lsp" + suffix)
 executables = [*tools, lsp]
+expected_count = "four" if windows else "five"
 if set(bin_dir.iterdir()) != set(executables) or not all(tool.is_file() for tool in executables):
-    sys.exit("Expected the four CLI entry points and rcmake-lsp in the extracted package.")
+    sys.exit(f"Expected the {expected_count} CLI entry points and rcmake-lsp in the extracted package.")
 
 for notice in (
     "LICENSE-MIT",
@@ -100,8 +102,10 @@ if target != f"{machine}-{native_suffix}":
 env = os.environ.copy()
 for variable in ("RCMAKE_VENDORED_DATA_ROOT", "DESTDIR", "CMAKE_INSTALL_MODE"):
     env.pop(variable, None)
-_, cmake, _, cpack = tools
-for tool, expected in zip(tools, ("cmake", "cmake", "ctest", "cpack")):
+cmake = bin_dir / ("cmake" + suffix)
+cpack = bin_dir / ("cpack" + suffix)
+expected_versions = ("cmake", "cmake", "ctest", "cpack") if windows else ("cmake", "cmake", "ctest", "cpack", "ccmake")
+for tool, expected in zip(tools, expected_versions):
     version = subprocess.check_output([tool, "--version"], env=env, text=True, timeout=15)
     if not version.startswith(f"{expected} version ") or "rcmake" not in version.lower():
         sys.exit(f"Unexpected version output from {tool.name}. Found {version}")
@@ -292,7 +296,7 @@ package = work / name
 bin_dir = package / "bin"
 bin_dir.mkdir(parents=True)
 shutil.copyfile(binaries / "rcmake", bin_dir / "rcmake")
-for tool in ("cmake", "ctest", "cpack", "rcmake-lsp"):
+for tool in ("cmake", "ctest", "cpack", "ccmake", "rcmake-lsp"):
     (bin_dir / tool).symlink_to("rcmake")
 ignore = shutil.ignore_patterns("._*", ".DS_Store")
 shutil.copytree(root / "modules/cmake-4.5", package / "share/cmake-4.5", ignore=ignore)

@@ -16,7 +16,9 @@ use super::installer::{
     run_installer_tool, to_windows_slashes, verify_fresh_output, warn, write_tool_log,
 };
 use crate::config::{CpackConfig, absolute, snapshot};
-use crate::source::{SymlinkPolicy, canonical_checked_root, validate_staged_tree};
+use crate::source::{
+    SymlinkPolicy, canonical_checked_root, validate_staged_tree, verify_contained_path,
+};
 use crate::{
     ComponentMembers, CpackError, PackageContext, PackageGenerator, error, log, safe_name,
 };
@@ -157,7 +159,6 @@ impl PackageGenerator for Nsis {
             return Err(reason);
         }
 
-        // Populate standard defaults honoring bitness and unset vs empty semantics.
         let mut cx = interp.cx();
         if !cx.var_defined(b"CPACK_INSTALLER_PROGRAM") {
             cx.set_var(b"CPACK_INSTALLER_PROGRAM", makensis_bytes);
@@ -235,16 +236,19 @@ impl PackageGenerator for Nsis {
 }
 
 fn lookup_nsis_registry(host: &dyn Host, is_64: bool) -> Option<BString> {
+    let host_view = host.registry_host_view();
     let mut queries = Vec::new();
     if is_64 {
         queries.push((b"SOFTWARE\\NSIS\\Unicode".as_slice(), RegistryView::Bits64));
         queries.push((b"SOFTWARE\\NSIS".as_slice(), RegistryView::Bits64));
     }
     queries.push((b"SOFTWARE\\NSIS\\Unicode".as_slice(), RegistryView::Bits32));
+    if let Some(view) = host_view {
+        queries.push((b"SOFTWARE\\NSIS\\Unicode".as_slice(), view));
+    }
     queries.push((b"SOFTWARE\\NSIS".as_slice(), RegistryView::Bits32));
-    if let Some(host_view) = host.registry_host_view() {
-        queries.push((b"SOFTWARE\\NSIS\\Unicode".as_slice(), host_view));
-        queries.push((b"SOFTWARE\\NSIS".as_slice(), host_view));
+    if let Some(view) = host_view {
+        queries.push((b"SOFTWARE\\NSIS".as_slice(), view));
     }
 
     for (key, view) in queries {
@@ -257,7 +261,30 @@ fn lookup_nsis_registry(host: &dyn Host, is_64: bool) -> Option<BString> {
     None
 }
 
-/// Validate `makensis` version output: require integer version `>= 3.03` or legacy `v*.cvs`.
+/// Compare decimal `major.frac` against `3.03` (matching CMake's floating-point `>= 3.03` check).
+fn nsis_version_at_least_3_03(major: u64, frac_digits: &str) -> bool {
+    if major > 3 {
+        return true;
+    }
+    if major < 3 {
+        return false;
+    }
+    let min_frac = b"03";
+    let frac = frac_digits.as_bytes();
+    let len = frac.len().max(min_frac.len());
+    for i in 0..len {
+        let a = frac.get(i).copied().unwrap_or(b'0');
+        let b = min_frac.get(i).copied().unwrap_or(b'0');
+        match a.cmp(&b) {
+            std::cmp::Ordering::Greater => return true,
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    true
+}
+
+/// Validate `makensis` version output: require decimal version `>= 3.03` or legacy `v*.cvs`.
 pub(crate) fn validate_nsis_version(output: &str) -> Result<(), CpackError> {
     let trimmed = output.trim();
     if let Some(v_pos) = trimmed.find('v') {
@@ -274,10 +301,7 @@ pub(crate) fn validate_nsis_version(output: &str) -> Result<(), CpackError> {
                 let major = maj_digits
                     .parse::<u64>()
                     .map_err(|_| error(format!("Malformed NSIS version string: \"{trimmed}\"")))?;
-                let minor = min_digits
-                    .parse::<u64>()
-                    .map_err(|_| error(format!("Malformed NSIS version string: \"{trimmed}\"")))?;
-                if major > 3 || (major == 3 && minor >= 3) {
+                if nsis_version_at_least_3_03(major, &min_digits) {
                     return Ok(());
                 }
                 return Err(error(format!(
@@ -303,6 +327,8 @@ impl Nsis {
         let host = cx.host;
         let cwd = host.initial_cwd();
         let settings = Settings::from_config(&cfg, host)?;
+        let canon_work = cx.expected_work_root()?;
+        let canon_staging = cx.expected_staging_root()?;
 
         // NSIS does not support absolute install destinations.
         if let Some(abs_files) = option_set(&cfg, b"CPACK_ABSOLUTE_DESTINATION_FILES") {
@@ -318,9 +344,15 @@ impl Nsis {
             );
         }
 
-        // Audit Finding #9: re-validate the entire staged tree after pre-build hooks.
         // NSIS packages Windows files (reject POSIX symlinks and enforce Windows path rules).
-        validate_staged_tree(host, cx.staging_dir, members, SymlinkPolicy::Reject, true)?;
+        validate_staged_tree(
+            host,
+            cx.staging_dir,
+            &canon_staging,
+            members,
+            SymlinkPolicy::Reject,
+            true,
+        )?;
 
         let catalog = ComponentCatalog::from_config(&cfg, members)?;
         for name in catalog.components.keys() {
@@ -330,14 +362,13 @@ impl Nsis {
             validate_nsis_identifier(require_utf8(name, "NSIS group ID")?, "component group")?;
         }
 
-        // Collect validated payload files and post-order subdirectories.
         let mut comp_files: BTreeMap<BString, Vec<String>> = BTreeMap::new();
         let mut comp_dirs: BTreeMap<BString, Vec<String>> = BTreeMap::new();
         let mut delete_files = String::new();
         let mut delete_dirs = String::new();
 
         if catalog.components.is_empty() {
-            let (files, dirs) = walk_nsis_tree(host, cx.staging_dir)?;
+            let (files, dirs) = walk_nsis_tree(host, cx.staging_dir, &canon_staging)?;
             for rel in &files {
                 reject_nsis_glob_hazard(rel, "NSIS payload file")?;
                 let win = escape_nsis_literal(&rel.replace('/', "\\"), false)?;
@@ -357,7 +388,22 @@ impl Nsis {
                 if host.metadata_fresh(&comp_path, Follow::No).is_err() {
                     continue;
                 }
-                let (files, dirs) = walk_nsis_tree(host, &comp_path)?;
+                verify_contained_path(
+                    host,
+                    cx.staging_dir,
+                    &canon_staging,
+                    &comp_dir,
+                    SymlinkPolicy::Reject,
+                    false,
+                )?;
+                let canon_comp = canonical_checked_root(host, &comp_path)?;
+                if !canon_comp.starts_with(&canon_staging) {
+                    return Err(error(format!(
+                        "NSIS component root escapes staging directory: {}",
+                        comp_path.display()
+                    )));
+                }
+                let (files, dirs) = walk_nsis_tree(host, &comp_path, &canon_comp)?;
                 let out_dir_token = custom_component_install_dir(&cfg, comp_str)?;
                 for rel in &files {
                     reject_nsis_glob_hazard(rel, "NSIS component file")?;
@@ -374,7 +420,6 @@ impl Nsis {
             }
         }
 
-        // Build complete substitution table for NSIS.InstallOptions.ini and project.nsi.
         let mut subs = build_base_substitutions(&cfg, cx, &cwd, &settings)?;
         if !cfg.vars.contains_key(b"CPACK_NSIS_DELETE_FILES".as_slice()) {
             subs.insert("CPACK_NSIS_DELETE_FILES".to_owned(), delete_files);
@@ -386,14 +431,12 @@ impl Nsis {
             subs.insert("CPACK_NSIS_DELETE_DIRECTORIES".to_owned(), delete_dirs);
         }
 
-        // Shortcuts (executables, desktop links, menu links).
         let (create_icons, delete_icons) = render_shortcuts(&cfg, &settings)?;
         subs.entry("CPACK_NSIS_CREATE_ICONS".to_owned())
             .or_insert(create_icons);
         subs.entry("CPACK_NSIS_DELETE_ICONS".to_owned())
             .or_insert(delete_icons);
 
-        // Components, sections, groups, install types, download sections.
         if catalog.components.is_empty() {
             subs.entry("CPACK_NSIS_INSTALLATION_TYPES".to_owned())
                 .or_default();
@@ -423,7 +466,6 @@ impl Nsis {
             )?;
         }
 
-        // Render NSIS.InstallOptions.ini and project.nsi via vendored templates.
         let ini_tpl_path = find_template(host, &cfg, &cwd, "NSIS.InstallOptions.ini.in", None)?;
         let nsi_tpl_path = find_template(host, &cfg, &cwd, "NSIS.template.in", None)?;
         let ini_rendered = render_at_template(&read_template(host, &ini_tpl_path)?, &subs);
@@ -441,7 +483,6 @@ impl Nsis {
             .join(safe_name(&[cx.file_name, b".exe"].concat())?);
         prepare_fresh_output(host, &out_exe)?;
 
-        // Build direct argv vector: makensis [pre-args...] project.nsi [post-args...]
         let mut argv = Vec::new();
         argv.extend(settings.pre_args.iter().cloned());
         argv.push(from_native(&nsi_out));
@@ -471,7 +512,7 @@ impl Nsis {
             Some(&log_path),
             &[],
         )?;
-        verify_fresh_output(host, cx.output_dir, &out_exe, "makensis")?;
+        verify_fresh_output(host, cx.output_dir, &canon_work, &out_exe, "makensis")?;
         Ok(vec![out_exe])
     }
 }
@@ -663,8 +704,12 @@ fn custom_component_install_dir(cfg: &CpackConfig, component: &str) -> Result<St
     }
 }
 
-fn walk_nsis_tree(host: &dyn Host, root: &Path) -> Result<(Vec<String>, Vec<String>), CpackError> {
-    let canon = canonical_checked_root(host, root)?;
+fn walk_nsis_tree(
+    host: &dyn Host,
+    root: &Path,
+    expected_canon: &Path,
+) -> Result<(Vec<String>, Vec<String>), CpackError> {
+    let canon = crate::source::verify_expected_root(host, root, expected_canon)?;
     let mut files = Vec::new();
     let mut dirs = Vec::new();
     let mut remaining = 100_000_usize;
@@ -767,7 +812,6 @@ fn build_base_substitutions(
     let mut subs = BTreeMap::new();
     let _ = settings.opt_prefix;
 
-    // Escaped literal fields (never enter raw code channels).
     subs.insert(
         "CPACK_PACKAGE_VERSION".to_owned(),
         escape_nsis_literal(&settings.package_version, false)?,
@@ -871,7 +915,6 @@ fn build_base_substitutions(
         subs.insert(key.to_owned(), val);
     }
 
-    // MUI icons
     if let Some(raw_override) = option_set(cfg, b"CPACK_NSIS_INSTALLER_MUI_ICON_CODE") {
         subs.insert(
             "CPACK_NSIS_INSTALLER_MUI_ICON_CODE".to_owned(),
@@ -914,7 +957,6 @@ fn build_base_substitutions(
         subs.insert("CPACK_NSIS_INSTALLER_ICON_CODE".to_owned(), String::new());
     }
 
-    // Welcome/Finish bitmaps
     if let Some(v) = option_set(cfg, b"CPACK_NSIS_MUI_WELCOMEFINISHPAGE_BITMAP") {
         subs.insert(
             "CPACK_NSIS_INSTALLER_MUI_WELCOMEFINISH_CODE".to_owned(),
@@ -934,7 +976,6 @@ fn build_base_substitutions(
         );
     }
 
-    // Finish page run
     if let Some(v) = option_set(cfg, b"CPACK_NSIS_MUI_FINISHPAGE_RUN") {
         let exe = escape_nsis_literal(
             &require_utf8(v, "CPACK_NSIS_MUI_FINISHPAGE_RUN")?.replace('/', "\\"),
@@ -947,7 +988,6 @@ fn build_base_substitutions(
         );
     }
 
-    // Welcome / Finish titles
     if let Some(v) = option_set(cfg, b"CPACK_NSIS_WELCOME_TITLE") {
         let escaped = escape_nsis_literal(require_utf8(v, "CPACK_NSIS_WELCOME_TITLE")?, true)?;
         subs.insert(
@@ -975,7 +1015,6 @@ fn build_base_substitutions(
         );
     }
 
-    // DPI manifest
     if cfg.on(b"CPACK_NSIS_MANIFEST_DPI_AWARE") {
         subs.insert(
             "CPACK_NSIS_MANIFEST_DPI_AWARE_CODE".to_owned(),
@@ -983,7 +1022,6 @@ fn build_base_substitutions(
         );
     }
 
-    // Branding text + trim position validation
     if let Some(v) = option_set(cfg, b"CPACK_NSIS_BRANDING_TEXT") {
         let pos = match option_set(cfg, b"CPACK_NSIS_BRANDING_TEXT_TRIM_POSITION") {
             Some(raw) => {
@@ -1004,7 +1042,6 @@ fn build_base_substitutions(
         );
     }
 
-    // CRC check validation
     if let Some(v) = option_set(cfg, b"CPACK_NSIS_CRC_CHECK") {
         let crc = require_utf8(v, "CPACK_NSIS_CRC_CHECK")?;
         let lower = crc.to_ascii_lowercase();
@@ -1019,7 +1056,6 @@ fn build_base_substitutions(
         );
     }
 
-    // License page
     if !cfg.on(b"CPACK_NSIS_IGNORE_LICENSE_PAGE")
         && let Some(license) = option_set(cfg, b"CPACK_RESOURCE_FILE_LICENSE")
     {
@@ -1273,6 +1309,11 @@ fn render_components(
     Ok(())
 }
 
+enum GroupSectionStep<'a> {
+    Enter(&'a GroupMeta),
+    EmitComponentsAndClose(&'a GroupMeta),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_group_section(
     host: &dyn Host,
@@ -1281,50 +1322,61 @@ fn render_group_section(
     cwd: &Path,
     settings: &Settings,
     catalog: &ComponentCatalog,
-    group: &GroupMeta,
+    root_group: &GroupMeta,
     comp_files: &BTreeMap<BString, Vec<String>>,
     comp_dirs: &BTreeMap<BString, Vec<String>>,
     macros_out: &mut String,
 ) -> Result<String, CpackError> {
-    if group.components.is_empty() && group.subgroups.is_empty() {
-        return Ok(String::new());
-    }
-    let gname = require_utf8(&group.name, "NSIS group name")?;
-    let display = escape_nsis_literal(
-        require_utf8(&group.display_name, "NSIS group display name")?,
-        false,
-    )?;
-    let expanded = if group.expanded { "/e " } else { "" };
-    let bold = if group.bold_title { "!" } else { "" };
-    let mut out = format!("SectionGroup {expanded}\"{bold}{display}\" {gname}\n");
-    for sub_name in &group.subgroups {
-        if let Some(sub) = catalog.groups.get(sub_name) {
-            out.push_str(&render_group_section(
-                host, cfg, cx, cwd, settings, catalog, sub, comp_files, comp_dirs, macros_out,
-            )?);
+    let mut out = String::new();
+    let mut stack = vec![GroupSectionStep::Enter(root_group)];
+    while let Some(step) = stack.pop() {
+        match step {
+            GroupSectionStep::Enter(group) => {
+                if group.components.is_empty() && group.subgroups.is_empty() {
+                    continue;
+                }
+                let gname = require_utf8(&group.name, "NSIS group name")?;
+                let display = escape_nsis_literal(
+                    require_utf8(&group.display_name, "NSIS group display name")?,
+                    false,
+                )?;
+                let expanded = if group.expanded { "/e " } else { "" };
+                let bold = if group.bold_title { "!" } else { "" };
+                out.push_str(&format!(
+                    "SectionGroup {expanded}\"{bold}{display}\" {gname}\n"
+                ));
+                stack.push(GroupSectionStep::EmitComponentsAndClose(group));
+                for sub_name in group.subgroups.iter().rev() {
+                    if let Some(sub) = catalog.groups.get(sub_name) {
+                        stack.push(GroupSectionStep::Enter(sub));
+                    }
+                }
+            }
+            GroupSectionStep::EmitComponentsAndClose(group) => {
+                for comp_name in &group.components {
+                    let files = comp_files.get(comp_name).map_or(&[][..], Vec::as_slice);
+                    if files.is_empty() {
+                        continue;
+                    }
+                    if let Some(comp) = catalog.components.get(comp_name) {
+                        out.push_str(&render_component_section(
+                            host,
+                            cfg,
+                            cx,
+                            cwd,
+                            settings,
+                            catalog,
+                            comp,
+                            files,
+                            comp_dirs.get(comp_name).map_or(&[][..], Vec::as_slice),
+                            macros_out,
+                        )?);
+                    }
+                }
+                out.push_str("SectionGroupEnd\n");
+            }
         }
     }
-    for comp_name in &group.components {
-        let files = comp_files.get(comp_name).map_or(&[][..], Vec::as_slice);
-        if files.is_empty() {
-            continue;
-        }
-        if let Some(comp) = catalog.components.get(comp_name) {
-            out.push_str(&render_component_section(
-                host,
-                cfg,
-                cx,
-                cwd,
-                settings,
-                catalog,
-                comp,
-                files,
-                comp_dirs.get(comp_name).map_or(&[][..], Vec::as_slice),
-                macros_out,
-            )?);
-        }
-    }
-    out.push_str("SectionGroupEnd\n");
     Ok(out)
 }
 
@@ -1436,7 +1488,6 @@ fn render_component_section(
     }
     macros_out.push_str(&format!("  noremove_{cname}:\n!macroend\n"));
 
-    // Dependency selection/deselection macros.
     let mut visited = BTreeSet::new();
     macros_out.push_str(&format!("!macro Select_{cname}_depends\n"));
     append_select_deps(catalog, comp, &mut visited, macros_out)?;
@@ -1450,22 +1501,30 @@ fn render_component_section(
     Ok(code)
 }
 
-fn append_select_deps(
+pub(super) fn append_select_deps(
     catalog: &ComponentCatalog,
-    comp: &ComponentMeta,
+    root_comp: &ComponentMeta,
     visited: &mut BTreeSet<BString>,
     out: &mut String,
 ) -> Result<(), CpackError> {
-    if !visited.insert(comp.name.clone()) {
+    if !visited.insert(root_comp.name.clone()) {
         return Ok(());
     }
-    for dep_name in &comp.depends {
-        let d = require_utf8(dep_name, "NSIS dependency")?;
-        out.push_str(&format!(
-            "  SectionGetFlags ${{{d}}} $0\n  IntOp $0 $0 | ${{SF_SELECTED}}\n  SectionSetFlags ${{{d}}} $0\n  IntOp ${d}_selected 0 + ${{SF_SELECTED}}\n"
-        ));
-        if let Some(dep) = catalog.components.get(dep_name) {
-            append_select_deps(catalog, dep, visited, out)?;
+    let mut stack = vec![(root_comp, 0_usize)];
+    while let Some((comp, next_idx)) = stack.last_mut() {
+        if let Some(dep_name) = comp.depends.get(*next_idx) {
+            *next_idx += 1;
+            let d = require_utf8(dep_name, "NSIS dependency")?;
+            out.push_str(&format!(
+                "  SectionGetFlags ${{{d}}} $0\n  IntOp $0 $0 | ${{SF_SELECTED}}\n  SectionSetFlags ${{{d}}} $0\n  IntOp ${d}_selected 0 + ${{SF_SELECTED}}\n"
+            ));
+            if visited.insert(dep_name.clone())
+                && let Some(dep) = catalog.components.get(dep_name)
+            {
+                stack.push((dep, 0));
+            }
+        } else {
+            stack.pop();
         }
     }
     Ok(())
@@ -1473,20 +1532,28 @@ fn append_select_deps(
 
 fn append_deselect_rdeps(
     catalog: &ComponentCatalog,
-    comp: &ComponentMeta,
+    root_comp: &ComponentMeta,
     visited: &mut BTreeSet<BString>,
     out: &mut String,
 ) -> Result<(), CpackError> {
-    if !visited.insert(comp.name.clone()) {
+    if !visited.insert(root_comp.name.clone()) {
         return Ok(());
     }
-    for rdep_name in &comp.reverse_depends {
-        let d = require_utf8(rdep_name, "NSIS reverse dependency")?;
-        out.push_str(&format!(
-            "  SectionGetFlags ${{{d}}} $0\n  IntOp $1 ${{SF_SELECTED}} ~\n  IntOp $0 $0 & $1\n  SectionSetFlags ${{{d}}} $0\n  IntOp ${d}_selected 0 + 0\n"
-        ));
-        if let Some(rdep) = catalog.components.get(rdep_name) {
-            append_deselect_rdeps(catalog, rdep, visited, out)?;
+    let mut stack = vec![(root_comp, 0_usize)];
+    while let Some((comp, next_idx)) = stack.last_mut() {
+        if let Some(rdep_name) = comp.reverse_depends.get(*next_idx) {
+            *next_idx += 1;
+            let d = require_utf8(rdep_name, "NSIS reverse dependency")?;
+            out.push_str(&format!(
+                "  SectionGetFlags ${{{d}}} $0\n  IntOp $1 ${{SF_SELECTED}} ~\n  IntOp $0 $0 & $1\n  SectionSetFlags ${{{d}}} $0\n  IntOp ${d}_selected 0 + 0\n"
+            ));
+            if visited.insert(rdep_name.clone())
+                && let Some(rdep) = catalog.components.get(rdep_name)
+            {
+                stack.push((rdep, 0));
+            }
+        } else {
+            stack.pop();
         }
     }
     Ok(())

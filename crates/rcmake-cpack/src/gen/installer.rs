@@ -1,16 +1,5 @@
 //! Shared infrastructure for native CPack installer generators (`productbuild`, `NSIS`,
 //! `NSIS64`, `WIX`, and `IFW`).
-//!
-//! Provides:
-//! - Host platform classification from [`Host::system`] (never compile-time `cfg!`).
-//! - Shared component, component-group, and install-type catalog with cycle and reference
-//!   validation.
-//! - Typed XML 1.0 writer and bounded safe XML parser (forbidding DTD/external entities).
-//! - Context-specific escaping for NSIS literals, WiX preprocessor values, JavaScript
-//!   choice expressions, and URL paths.
-//! - Single-pass `@VAR@` template rendering and template discovery.
-//! - Bounded external tool execution with null stdin, timeouts, secret redaction, log
-//!   retention, and no-follow output verification.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
@@ -26,7 +15,8 @@ use rcmake_host::{
 
 use crate::config::{CpackConfig, absolute};
 use crate::source::{
-    SymlinkPolicy, canonical_checked_root, copy_checked_tree, merge_recorded_checked,
+    SymlinkPolicy, canonical_checked_root, copy_checked_tree_expected, verify_contained_path,
+    verify_expected_root,
 };
 use crate::{CpackError, InstalledComponent, error, safe_name};
 
@@ -39,6 +29,8 @@ pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default timeout for installer build tool invocations (300 seconds).
 pub(crate) const BUILD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Maximum allowed nesting depth for CPack component group hierarchies.
+pub(crate) const MAX_COMPONENT_GROUP_DEPTH: usize = 256;
 
 const MAX_XML_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_XML_DEPTH: usize = 128;
@@ -108,10 +100,6 @@ pub(crate) fn require_utf8<'a>(bytes: &'a [u8], label: &str) -> Result<&'a str, 
     }
     std::str::from_utf8(bytes).map_err(|_| error(format!("{label} must be valid UTF-8")))
 }
-
-// ---------------------------------------------------------------------------
-// Component, group, and install-type metadata catalog
-// ---------------------------------------------------------------------------
 
 /// Metadata for one CPack installation type.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,7 +180,6 @@ impl ComponentCatalog {
             return Ok(catalog);
         }
 
-        // First pass: load component fields and register groups/install types.
         for name in &names {
             let upper = BString::from(name.to_ascii_uppercase());
             let prefix = format!("CPACK_COMPONENT_{upper}_");
@@ -243,7 +230,6 @@ impl ComponentCatalog {
             );
         }
 
-        // Second pass: validate dependency references and build reverse dependency links.
         let dep_edges: Vec<(BString, BString)> = catalog
             .components
             .values()
@@ -267,10 +253,8 @@ impl ComponentCatalog {
             }
         }
 
-        // Validate acyclic component dependencies.
         catalog.check_component_cycles()?;
-        // Validate acyclic group parent links.
-        catalog.check_group_cycles()?;
+        catalog.check_group_hierarchy()?;
 
         Ok(catalog)
     }
@@ -308,6 +292,11 @@ impl ComponentCatalog {
             if !visiting.insert(current.clone()) {
                 return Err(error(format!(
                     "Cycle detected in CPack component group hierarchy involving \"{current}\""
+                )));
+            }
+            if visiting.len() > MAX_COMPONENT_GROUP_DEPTH {
+                return Err(error(format!(
+                    "CPack component group hierarchy exceeds maximum depth ({MAX_COMPONENT_GROUP_DEPTH}) involving \"{start}\""
                 )));
             }
             let upper = BString::from(current.to_ascii_uppercase());
@@ -351,47 +340,57 @@ impl ComponentCatalog {
     }
 
     fn check_component_cycles(&self) -> Result<(), CpackError> {
-        // 0 = unvisited, 1 = visiting, 2 = done
-        let mut state: BTreeMap<&[u8], u8> = BTreeMap::new();
-        for name in self.components.keys() {
-            if state.get(name.as_slice()).copied().unwrap_or(0) == 0 {
-                self.dfs_component(name, &mut state)?;
+        let mut state: BTreeMap<&[u8], VisitState> = BTreeMap::new();
+        for start in self.components.keys() {
+            if state.contains_key(start.as_slice()) {
+                continue;
             }
-        }
-        Ok(())
-    }
-
-    fn dfs_component<'a>(
-        &'a self,
-        name: &'a BString,
-        state: &mut BTreeMap<&'a [u8], u8>,
-    ) -> Result<(), CpackError> {
-        state.insert(name.as_slice(), 1);
-        if let Some(comp) = self.components.get(name) {
-            for dep in &comp.depends {
-                match state.get(dep.as_slice()).copied().unwrap_or(0) {
-                    1 => {
-                        return Err(error(format!(
-                            "Cycle detected in CPack component dependencies involving \"{name}\" and \"{dep}\""
-                        )));
+            state.insert(start.as_slice(), VisitState::Visiting);
+            let mut stack: Vec<(&BString, usize)> = vec![(start, 0)];
+            while let Some((node, next_idx)) = stack.last_mut() {
+                let deps = self
+                    .components
+                    .get(*node)
+                    .map_or(&[][..], |comp| comp.depends.as_slice());
+                if let Some(dep) = deps.get(*next_idx) {
+                    *next_idx += 1;
+                    match state.get(dep.as_slice()) {
+                        Some(VisitState::Visiting) => {
+                            return Err(error(format!(
+                                "Cycle detected in CPack component dependencies involving \"{node}\" and \"{dep}\""
+                            )));
+                        }
+                        Some(VisitState::Visited) => {}
+                        None => {
+                            state.insert(dep.as_slice(), VisitState::Visiting);
+                            stack.push((dep, 0));
+                        }
                     }
-                    0 => self.dfs_component(dep, state)?,
-                    _ => {}
+                } else {
+                    let finished = *node;
+                    stack.pop();
+                    state.insert(finished.as_slice(), VisitState::Visited);
                 }
             }
         }
-        state.insert(name.as_slice(), 2);
         Ok(())
     }
 
-    fn check_group_cycles(&self) -> Result<(), CpackError> {
+    fn check_group_hierarchy(&self) -> Result<(), CpackError> {
         for name in self.groups.keys() {
             let mut seen = BTreeSet::new();
             let mut cur = Some(name);
+            let mut depth = 0_usize;
             while let Some(group_name) = cur {
                 if !seen.insert(group_name.as_slice()) {
                     return Err(error(format!(
                         "Cycle detected in CPack component group hierarchy involving \"{group_name}\""
+                    )));
+                }
+                depth += 1;
+                if depth > MAX_COMPONENT_GROUP_DEPTH {
+                    return Err(error(format!(
+                        "CPack component group hierarchy exceeds maximum depth ({MAX_COMPONENT_GROUP_DEPTH}) involving \"{name}\""
                     )));
                 }
                 cur = self
@@ -404,14 +403,24 @@ impl ComponentCatalog {
     }
 }
 
-/// Copy a component's validated staged payload into `dest_root` using the checked traversal.
+/// Traversal state for iterative dependency cycle checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisitState {
+    Visiting,
+    Visited,
+}
+
+/// Copy a component's validated live staged root into `dest_root`.
 ///
-/// When `member` has recorded `staged_roots`, copies the validated files from those actual
-/// roots (preserving the path prefix between `staged.root` and `staged.scanned` when
-/// `preserve_root_prefix` is true). Otherwise falls back to checking `<staging>/<comp_dir>`.
+/// When `preserve_root_prefix` is true (`productbuild`), copies each pre-hook `staged.root`
+/// tree directly so install prefixes and hook-added/hook-replaced files remain intact.
+/// When false (`IFW`), copies each pre-hook `staged.scanned` payload root directly without
+/// retaining the component staging directory prefix.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn copy_component_payload(
     host: &dyn Host,
     staging_dir: &Path,
+    canon_staging: &Path,
     component: &InstalledComponent,
     dest_root: &Path,
     symlink_policy: SymlinkPolicy,
@@ -420,40 +429,57 @@ pub(crate) fn copy_component_payload(
 ) -> Result<(), CpackError> {
     host.create_dir_all(dest_root)?;
     if component.staged_roots.is_empty() {
-        let dir = staging_dir.join(crate::stage::component_dir_for_host(
-            &component.name,
-            windows_rules,
-        ));
+        let comp_rel = crate::stage::component_dir_for_host(&component.name, windows_rules);
+        let dir = staging_dir.join(&comp_rel);
         if host.metadata_fresh(&dir, Follow::No).is_ok() {
-            copy_checked_tree(host, &dir, dest_root, symlink_policy, windows_rules)?;
+            verify_contained_path(
+                host,
+                staging_dir,
+                canon_staging,
+                &comp_rel,
+                SymlinkPolicy::Reject,
+                false,
+            )?;
+            let canon_dir = canonical_checked_root(host, &dir)?;
+            if !canon_dir.starts_with(canon_staging) {
+                return Err(error(format!(
+                    "CPack component staging root escapes staging directory: {}",
+                    dir.display()
+                )));
+            }
+            copy_checked_tree_expected(
+                host,
+                &dir,
+                &canon_dir,
+                dest_root,
+                symlink_policy,
+                windows_rules,
+            )?;
         }
         return Ok(());
     }
     for staged in &component.staged_roots {
-        let target = if preserve_root_prefix {
-            let suffix = staged
-                .scanned
-                .strip_prefix(&staged.root)
-                .unwrap_or(Path::new(""));
-            if suffix.as_os_str().is_empty() {
-                dest_root.to_owned()
-            } else {
-                let d = dest_root.join(suffix);
-                host.create_dir_all(&d)?;
-                d
-            }
+        let (src_dir, expected_canon) = if preserve_root_prefix {
+            (&staged.root, &staged.canon_root)
         } else {
-            dest_root.to_owned()
+            (&staged.scanned, &staged.canon_scanned)
         };
-        if staged.files.is_empty() {
-            continue;
+        let canon = if expected_canon.as_os_str().is_empty() {
+            canonical_checked_root(host, src_dir)?
+        } else {
+            expected_canon.clone()
+        };
+        if !canon.starts_with(canon_staging) {
+            return Err(error(format!(
+                "CPack component root escapes staging directory: {}",
+                src_dir.display()
+            )));
         }
-        let recorded: BTreeSet<PathBuf> = staged.files.iter().cloned().collect();
-        merge_recorded_checked(
+        copy_checked_tree_expected(
             host,
-            &staged.scanned,
-            &recorded,
-            &target,
+            src_dir,
+            &canon,
+            dest_root,
             symlink_policy,
             windows_rules,
         )?;
@@ -465,12 +491,20 @@ pub(crate) fn copy_component_payload(
 pub(crate) fn copy_monolithic_payload(
     host: &dyn Host,
     staging_dir: &Path,
+    expected_canon_staging: &Path,
     dest_root: &Path,
     symlink_policy: SymlinkPolicy,
     windows_rules: bool,
 ) -> Result<(), CpackError> {
     host.create_dir_all(dest_root)?;
-    copy_checked_tree(host, staging_dir, dest_root, symlink_policy, windows_rules)
+    copy_checked_tree_expected(
+        host,
+        staging_dir,
+        expected_canon_staging,
+        dest_root,
+        symlink_policy,
+        windows_rules,
+    )
 }
 
 /// Compute total regular file bytes under `dir` using checked no-follow traversal.
@@ -526,10 +560,6 @@ fn sum_dir_bytes(
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Typed XML 1.0 Writer
-// ---------------------------------------------------------------------------
 
 /// Validate that every character in `text` is a legal XML 1.0 character.
 pub(crate) fn validate_xml_text(text: &str, label: &str) -> Result<(), CpackError> {
@@ -822,10 +852,6 @@ impl XmlWriter {
         Ok(self.buf)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Bounded Safe XML Parser (forbids DTD / ENTITY / external resolution)
-// ---------------------------------------------------------------------------
 
 /// A parsed XML element node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1153,10 +1179,6 @@ impl<'a> XmlParser<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Context-specific literal escaping (NSIS, Apple JS, URLs)
-// ---------------------------------------------------------------------------
-
 /// Escape a metadata string for placement inside a double-quoted NSIS string literal.
 ///
 /// Escapes `$` as `$$`, `"` as `$\"`, `\t` as `$\t`, and newlines as `$\r$\n` (when
@@ -1240,7 +1262,7 @@ pub(crate) fn escape_js_single_quoted(value: &str) -> Result<String, CpackError>
     Ok(out)
 }
 
-/// Percent-encode a relative URL path (preserving `/`), matching `cmSystemTools::EncodeURL`.
+/// Percent-encode a relative URL path, preserving RFC 3986 unreserved characters and `/`.
 pub(crate) fn encode_url_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
@@ -1254,10 +1276,6 @@ pub(crate) fn encode_url_path(path: &str) -> String {
     }
     out
 }
-
-// ---------------------------------------------------------------------------
-// Templates and single-pass @VAR@ substitution
-// ---------------------------------------------------------------------------
 
 /// Find a CPack template file in `CPACK_MODULE_PATH` / `CMAKE_MODULE_PATH` or `CMAKE_ROOT`.
 pub(crate) fn find_template(
@@ -1346,10 +1364,6 @@ pub(crate) fn render_at_template(template: &str, values: &BTreeMap<String, Strin
     out.push_str(rest);
     out
 }
-
-// ---------------------------------------------------------------------------
-// Host program lookup & bounded tool execution
-// ---------------------------------------------------------------------------
 
 /// Find an executable `name` on `extra_paths` and the host `PATH`.
 pub(crate) fn find_program_on_host(
@@ -1452,13 +1466,20 @@ pub(crate) fn run_installer_tool(
 }
 
 /// Redact any non-empty secrets from `text` before writing logs or diagnostics.
+///
+/// Secrets are matched longest-first so XML-escaped or composite forms are scrubbed
+/// before shorter substrings.
 pub(crate) fn redact_secrets(text: &[u8], secrets: &[BString]) -> BString {
+    let mut ordered: Vec<&[u8]> = secrets
+        .iter()
+        .map(|s| s.as_slice())
+        .filter(|s| !s.is_empty())
+        .collect();
+    ordered.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    ordered.dedup();
     let mut buf = text.to_vec();
-    for secret in secrets {
-        if secret.is_empty() {
-            continue;
-        }
-        buf = replace_bytes(&buf, secret.as_slice(), b"***");
+    for secret in ordered {
+        buf = replace_bytes(&buf, secret, b"***");
     }
     BString::from(buf)
 }
@@ -1553,15 +1574,16 @@ pub(crate) fn prepare_fresh_output(host: &dyn Host, output: &Path) -> Result<(),
     }
 }
 
-/// Verify after a tool exits 0 that `output` now exists as a regular file (no-follow)
-/// strictly inside `expected_parent`.
+/// Verify after a tool exits 0 that `expected_parent` still matches `expected_canon_parent`
+/// and that `output` now exists as a regular file (no-follow) strictly inside it.
 pub(crate) fn verify_fresh_output(
     host: &dyn Host,
     expected_parent: &Path,
+    expected_canon_parent: &Path,
     output: &Path,
     phase: &str,
 ) -> Result<(), CpackError> {
-    let canon_parent = canonical_checked_root(host, expected_parent)?;
+    let canon_parent = verify_expected_root(host, expected_parent, expected_canon_parent)?;
     let meta = host.metadata_fresh(output, Follow::No).map_err(|err| {
         error(format!(
             "{phase} exited with status 0 but did not create expected output {}: {err}",
@@ -1574,6 +1596,20 @@ pub(crate) fn verify_fresh_output(
             output.display()
         )));
     }
+    let rel = output.strip_prefix(expected_parent).map_err(|_| {
+        error(format!(
+            "{phase} output escapes expected directory: {}",
+            output.display()
+        ))
+    })?;
+    verify_contained_path(
+        host,
+        expected_parent,
+        &canon_parent,
+        rel,
+        SymlinkPolicy::Reject,
+        false,
+    )?;
     let canon_out = host.canonicalize_fresh(output)?;
     if !canon_out.starts_with(&canon_parent) {
         return Err(error(format!(
@@ -1584,7 +1620,8 @@ pub(crate) fn verify_fresh_output(
     Ok(())
 }
 
-/// Convert a [`ToolOutcome`] into `Ok(())` on `Exited(0)` or a detailed [`CpackError`].
+/// Convert a [`ToolOutcome`] into `Ok(())` on `Exited(0)` or a detailed [`CpackError`]
+/// with all configured secrets redacted.
 pub(crate) fn check_tool_outcome(
     outcome: &ToolOutcome,
     program: &[u8],
@@ -1592,32 +1629,29 @@ pub(crate) fn check_tool_outcome(
     log_path: Option<&Path>,
     secrets: &[BString],
 ) -> Result<(), CpackError> {
-    match &outcome.status {
-        ProcessResult::Exited(0) => Ok(()),
+    let raw_message = match &outcome.status {
+        ProcessResult::Exited(0) => return Ok(()),
         ProcessResult::TimedOut => {
             let log_hint = log_path
                 .map(|p| format!(" Please check {} for errors.", p.display()))
                 .unwrap_or_default();
-            Err(error(format!(
-                "{phase}: {} timed out.{log_hint}",
-                BString::from(program)
-            )))
+            format!("{phase}: {} timed out.{log_hint}", BString::from(program))
         }
-        ProcessResult::SpawnFailed(err) => Err(error(format!(
-            "{phase}: cannot start {}: {err}",
-            BString::from(program)
-        ))),
+        ProcessResult::SpawnFailed(err) => {
+            format!("{phase}: cannot start {}: {err}", BString::from(program))
+        }
         status => {
             let redacted = redact_secrets(&outcome.output, secrets);
             let log_hint = log_path
                 .map(|p| format!("\nPlease check {} for errors", p.display()))
                 .unwrap_or_default();
-            Err(error(format!(
+            format!(
                 "{phase}: {} failed ({status:?}){log_hint}\n{redacted}",
                 BString::from(program)
-            )))
+            )
         }
-    }
+    };
+    Err(error(redact_secrets(raw_message.as_bytes(), secrets)))
 }
 
 /// Emit a CPack warning on stderr.

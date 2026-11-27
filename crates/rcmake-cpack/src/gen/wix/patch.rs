@@ -62,7 +62,7 @@ impl WixPatchSet {
         for child in root.children {
             match child {
                 XmlNode::Text(text) => {
-                    if !text.trim().is_empty() {
+                    if !trim_xml_whitespace(&text).is_empty() {
                         return Err(error(format!(
                             "Error while processing XML patch file '{label}': Unexpected text outside CPackWiXFragment"
                         )));
@@ -139,12 +139,16 @@ impl WixPatchSet {
     }
 }
 
+fn trim_xml_whitespace(text: &str) -> &str {
+    text.trim_matches([' ', '\t', '\r', '\n'])
+}
+
 fn trim_patch_children(children: Vec<XmlNode>) -> Vec<XmlNode> {
     let mut out = Vec::with_capacity(children.len());
     for node in children {
         match node {
             XmlNode::Text(text) => {
-                let trimmed = text.trim();
+                let trimmed = trim_xml_whitespace(&text);
                 if !trimmed.is_empty() {
                     out.push(XmlNode::Text(trimmed.to_owned()));
                 }

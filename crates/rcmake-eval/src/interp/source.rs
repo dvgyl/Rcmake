@@ -36,7 +36,24 @@ impl Interp {
 
     /// Read and parse a listfile. Reports read and parse errors. Returns `None` when the
     /// file is missing, is a directory, or does not parse.
+    ///
+    /// An attached debugger shows a frame at line `0` for the file while it parses
+    /// (`OnBeginFileParse`). It gets the command spans after that frame ends
+    /// (`OnFileParsedSuccessfully`), before any command runs.
     pub(crate) fn parse_file(&mut self, abs: &[u8]) -> Option<Code> {
+        if !self.debug_attached {
+            return self.read_and_parse(abs);
+        }
+        self.debug_begin_parse(abs);
+        let code = self.read_and_parse(abs);
+        self.debug_end_parse();
+        if let Some(code) = &code {
+            self.debug_file_parsed(abs, code);
+        }
+        code
+    }
+
+    fn read_and_parse(&mut self, abs: &[u8]) -> Option<Code> {
         // Under hermetic auditing keep the pre-check so directory/missing diagnostics stay identical.
         if self.hermetic.is_some() && !self.is_regular_file(abs) {
             return None;
@@ -253,6 +270,10 @@ impl Interp {
         self.push_snapshot();
         let result = match self.parse_source(&abs, src, SourceKind::VirtualEval) {
             Some(code) => {
+                // A virtual source has no parse frame (`ReadListFileAsString`).
+                if self.debug_attached {
+                    self.debug_file_parsed(&abs, &code);
+                }
                 let r = self.run_code(&code, 0, code.len(), BodyMode::File);
                 if let Ok(Flow::Return {
                     propagate: Some(names),
@@ -262,7 +283,8 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            None => Err(CmdError::Reported),
+            // `cmake_language(EVAL)` reports `unknown error.` after the parse error.
+            None => Err(CmdError::Status("unknown error.".into())),
         };
         let report = !self.fatal;
         self.pop_list_file_vars(vars);

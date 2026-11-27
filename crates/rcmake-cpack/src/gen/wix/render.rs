@@ -15,7 +15,7 @@ use crate::generators::installer::{
     ComponentCatalog, ComponentMeta, GroupMeta, XmlWriter, escape_wix_preprocessor, require_utf8,
     to_windows_slashes,
 };
-use crate::source::canonical_checked_root;
+use crate::source::verify_expected_root;
 use crate::{CpackError, error};
 
 /// Structured install properties read from `CPackProperties.cmake` for one install-relative path.
@@ -426,6 +426,7 @@ pub(super) struct RenderedWixSources {
 pub(super) fn render_wix_sources(
     host: &dyn Host,
     staging_dir: &Path,
+    expected_canon_staging: &Path,
     cfg: &WixConfig,
     catalog: &ComponentCatalog,
     install_props: &BTreeMap<String, InstallFileProps>,
@@ -478,7 +479,6 @@ pub(super) fn render_wix_sources(
 
     let root_remove_comp = emit_remove_folder_on_user_install(&mut dirs_w, cfg, "INSTALL_ROOT")?;
 
-    // Root ProductFeature
     feats_w.start_element("Feature")?;
     feats_w.attr("Id", "ProductFeature")?;
     feats_w.attr("Display", "expand")?;
@@ -502,7 +502,6 @@ pub(super) fn render_wix_sources(
         emit_component_ref(&mut feats_w, comp_id)?;
     }
 
-    // Feature hierarchy
     for group in catalog.groups.values() {
         if group.parent_group.is_none() {
             emit_group_feature(&mut feats_w, cfg, catalog, group, patches)?;
@@ -518,7 +517,7 @@ pub(super) fn render_wix_sources(
     let mut allocator = PathIdAllocator::default();
     let mut emitted_shortcut_kinds = BTreeSet::new();
     let mut global_shortcuts = ShortcutTable::default();
-    let canon_staging = canonical_checked_root(host, staging_dir)?;
+    let canon_staging = verify_expected_root(host, staging_dir, expected_canon_staging)?;
 
     if catalog.components.is_empty() {
         feats_w.start_element("FeatureRef")?;
@@ -604,7 +603,6 @@ pub(super) fn render_wix_sources(
         &mut feats_w,
     )?;
 
-    // Close install prefix directories
     for _ in 0..install_segments.len() {
         dirs_w.end_element("Directory")?;
     }
@@ -726,40 +724,56 @@ fn emit_component_ref(feats_w: &mut XmlWriter, id: &str) -> Result<(), CpackErro
     feats_w.end_element("ComponentRef")
 }
 
+enum FeatureGroupStep<'a> {
+    Enter(&'a GroupMeta),
+    EmitComponentsAndClose(&'a GroupMeta),
+}
+
 fn emit_group_feature(
     feats_w: &mut XmlWriter,
     cfg: &WixConfig,
     catalog: &ComponentCatalog,
-    group: &GroupMeta,
+    root_group: &GroupMeta,
     patches: &mut WixPatchSet,
 ) -> Result<(), CpackError> {
-    let gname = require_utf8(&group.name, "WiX group name")?;
-    let id = format!("CM_G_{gname}");
-    feats_w.start_element("Feature")?;
-    feats_w.attr("Id", &id)?;
-    if group.expanded {
-        feats_w.attr("Display", "expand")?;
-    }
-    let title = require_utf8(&group.display_name, "WiX group display name")?;
-    if !title.is_empty() {
-        feats_w.attr("Title", &escape_wix_preprocessor(title))?;
-    }
-    let desc = require_utf8(&group.description, "WiX group description")?;
-    if !desc.is_empty() {
-        feats_w.attr("Description", &escape_wix_preprocessor(desc))?;
-    }
-    patches.apply(&id, feats_w)?;
-    for sub_name in &group.subgroups {
-        if let Some(sub) = catalog.groups.get(sub_name) {
-            emit_group_feature(feats_w, cfg, catalog, sub, patches)?;
+    let mut stack = vec![FeatureGroupStep::Enter(root_group)];
+    while let Some(step) = stack.pop() {
+        match step {
+            FeatureGroupStep::Enter(group) => {
+                let gname = require_utf8(&group.name, "WiX group name")?;
+                let id = format!("CM_G_{gname}");
+                feats_w.start_element("Feature")?;
+                feats_w.attr("Id", &id)?;
+                if group.expanded {
+                    feats_w.attr("Display", "expand")?;
+                }
+                let title = require_utf8(&group.display_name, "WiX group display name")?;
+                if !title.is_empty() {
+                    feats_w.attr("Title", &escape_wix_preprocessor(title))?;
+                }
+                let desc = require_utf8(&group.description, "WiX group description")?;
+                if !desc.is_empty() {
+                    feats_w.attr("Description", &escape_wix_preprocessor(desc))?;
+                }
+                patches.apply(&id, feats_w)?;
+                stack.push(FeatureGroupStep::EmitComponentsAndClose(group));
+                for sub_name in group.subgroups.iter().rev() {
+                    if let Some(sub) = catalog.groups.get(sub_name) {
+                        stack.push(FeatureGroupStep::Enter(sub));
+                    }
+                }
+            }
+            FeatureGroupStep::EmitComponentsAndClose(group) => {
+                for comp_name in &group.components {
+                    if let Some(comp) = catalog.components.get(comp_name) {
+                        emit_component_feature(feats_w, cfg, comp, patches)?;
+                    }
+                }
+                feats_w.end_element("Feature")?;
+            }
         }
     }
-    for comp_name in &group.components {
-        if let Some(comp) = catalog.components.get(comp_name) {
-            emit_component_feature(feats_w, cfg, comp, patches)?;
-        }
-    }
-    feats_w.end_element("Feature")
+    Ok(())
 }
 
 fn emit_component_feature(

@@ -714,6 +714,9 @@ fn cmd_message(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
             let mut out = indent_text(interp, &text);
             out.push(b'\n');
             interp.config.host.write_out(Stream::Stderr, &out);
+            if interp.has_debugger() {
+                interp.debug_message(crate::debug::DebugMessageKind::Message, &text);
+            }
         }
         Display::CheckStart => {
             display_status(interp, &text);

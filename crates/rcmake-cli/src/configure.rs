@@ -123,6 +123,251 @@ struct Configured {
     sample: bool,
 }
 
+/// Retained state from a completed interactive `ccmake` configure phase.
+///
+/// Allows `ccmake` to run [`RetainedConfigure::generate`] directly on the
+/// configured [`Interp`] and model without re-executing `CMakeLists.txt` or
+/// spawning configure-time child processes a second time.
+pub(crate) struct RetainedConfigure {
+    inner: Option<RetainedInner>,
+}
+
+struct RetainedInner {
+    argv: Vec<BString>,
+    host: Arc<dyn Host>,
+    opts: Options,
+    src: PathBuf,
+    bin: PathBuf,
+    list_file: BString,
+    preset: presets::Application,
+    profiling: Profilers,
+    runtime: ConfigureRuntime,
+    interp: Interp,
+    configured: Configured,
+    results: Vec<Value>,
+    start: Duration,
+    time: FileTime,
+}
+
+impl RetainedConfigure {
+    /// Run the generate phase on the retained configured session and finalize
+    /// runtime records, profiling, and SARIF output.
+    pub(crate) fn generate(mut self) -> i32 {
+        let Some(mut inner) = self.inner.take() else {
+            return 1;
+        };
+        let host = Arc::clone(&inner.host);
+        let session = ConfigureSession {
+            argv: &inner.argv,
+            host: Arc::clone(&inner.host),
+            opts: inner.opts,
+            src: inner.src,
+            bin: inner.bin,
+            list_file: inner.list_file,
+            preset: inner.preset,
+            profiling: inner.profiling,
+        };
+        let outcome = session.generate(&mut inner.interp, inner.configured, &mut inner.results);
+        let finish = inner.runtime.finish(outcome.is_ok() && !session.opts.view);
+        let outcome = match (outcome, finish) {
+            (Ok(()), Some(err)) => {
+                inner.interp.cx().issue(
+                    MessageKind::Error,
+                    Effect::Fatal,
+                    None,
+                    err.to_string().into(),
+                );
+                Err(Exit::Code(1))
+            }
+            (outcome, _) => outcome,
+        };
+        let code = match &outcome {
+            Ok(()) => 0,
+            Err(Exit::Code(code)) => *code,
+            Err(Exit::Message(_)) => 1,
+        };
+        let profile = session.profiling.write(session.host.as_ref(), inner.start);
+        let sarif = session.write_sarif(&mut inner.interp, inner.results, inner.time, code);
+        let final_outcome = match (sarif, profile) {
+            (Err(err), _) | (_, Err(err)) => Err(err),
+            (Ok(()), Ok(())) => outcome,
+        };
+        match final_outcome {
+            Ok(()) => 0,
+            Err(Exit::Code(code)) => code,
+            Err(Exit::Message(message)) => error(host.as_ref(), message),
+        }
+    }
+}
+
+impl Drop for RetainedConfigure {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let _ = inner.runtime.finish(false);
+        }
+    }
+}
+
+/// Resolve the target binary directory for `opts` without modifying disk state.
+pub(crate) fn resolve_binary_dir(opts: &Options, host: &dyn Host) -> PathBuf {
+    let (mut src, mut bin) = resolve_directories(
+        host,
+        &opts.directories,
+        opts.extensions.bare_profile_arg.as_deref(),
+    );
+    let cwd = host.initial_cwd();
+    if let Some(bin_dir) = bin {
+        return bin_dir;
+    }
+    if src.is_none()
+        && let Ok(saved) = cache::load(host, &cwd)
+    {
+        src = saved
+            .get(HOME_DIR)
+            .map(|entry| path::to_native(&entry.value));
+    }
+    if opts.preset.is_some() {
+        let src_dir = src.unwrap_or_else(|| cwd.clone());
+        let mut probe_opts = Options {
+            preset: opts.preset.clone(),
+            presets_file: opts.presets_file.clone(),
+            ..Options::default()
+        };
+        if let Ok(mut applied) = presets::apply(host, &src_dir, &mut probe_opts)
+            && let Some(dir) = applied.binary.take()
+        {
+            bin = Some(dir);
+        }
+    }
+    bin.unwrap_or(cwd)
+}
+
+/// Run ONLY the configure phase (writing `CMakeCache.txt` without generating
+/// build files) and return the retained session ready for [`RetainedConfigure::generate`].
+pub(crate) fn configure_only(
+    argv: Vec<BString>,
+    opts: Options,
+    host: Arc<dyn Host>,
+) -> Result<RetainedConfigure, i32> {
+    let (cmake_command, cmake_root) = rcmake_host::discover_cmake_root(host.as_ref(), argv.first());
+    let Some(cmake_root) = cmake_root else {
+        return Err(crate::missing_cmake_root(
+            host.as_ref(),
+            &cmake_command,
+            true,
+        ));
+    };
+    let start = host.monotonic();
+    let (mut session, mut saved) = match ConfigureSession::resolve(&argv, opts, Arc::clone(&host)) {
+        Ok(resolved) => resolved,
+        Err(Exit::Code(code)) => return Err(code),
+        Err(Exit::Message(message)) => return Err(error(host.as_ref(), message)),
+    };
+    for attempt in 0..=1 {
+        let selection = restart::selection(&saved);
+        let (mut runtime, mut interp, has_cache) =
+            match session.initialize(saved, cmake_command.clone(), cmake_root.clone()) {
+                Ok(initialized) => initialized,
+                Err(Exit::Code(code)) => return Err(code),
+                Err(Exit::Message(message)) => return Err(error(host.as_ref(), message)),
+            };
+        interp.add_session_data(Arc::clone(&selection));
+        let configure_start = session.host.monotonic();
+        let time = session.host.now();
+        let mut preloads = session.apply_cache_edits(&runtime, &mut interp);
+        let results = std::mem::take(&mut preloads.results);
+        let outcome = (|| {
+            if runtime.denied() {
+                return Err(Exit::Code(1));
+            }
+            if session.opts.view {
+                session.list_cache(&mut interp);
+                return Err(Exit::Code(0));
+            }
+            if preloads.fatal {
+                return Err(Exit::Code(preloads.exit_code));
+            }
+            if let Err(exit) = session.check_source() {
+                session.list_cache(&mut interp);
+                return Err(exit);
+            }
+            if preloads.missing {
+                return Err(Exit::Code(1));
+            }
+            session.configure(
+                &mut runtime,
+                &mut interp,
+                has_cache,
+                configure_start,
+                preloads,
+                &selection,
+            )
+        })();
+        let changes = selection.take_changes();
+        if !changes.is_empty() && !runtime.denied() {
+            let _ = runtime.finish(false);
+            if attempt != 0 {
+                return Err(error(
+                    host.as_ref(),
+                    "The platform selection changed again during configure.".into(),
+                ));
+            }
+            saved = match restart::reset(&session, &mut interp, changes) {
+                Ok(saved) => saved,
+                Err(Exit::Code(code)) => return Err(code),
+                Err(Exit::Message(message)) => return Err(error(host.as_ref(), message)),
+            };
+            continue;
+        }
+        match outcome {
+            Ok(configured) => {
+                let ConfigureSession {
+                    host: session_host,
+                    opts,
+                    src,
+                    bin,
+                    list_file,
+                    preset,
+                    profiling,
+                    ..
+                } = session;
+                return Ok(RetainedConfigure {
+                    inner: Some(RetainedInner {
+                        argv,
+                        host: session_host,
+                        opts,
+                        src,
+                        bin,
+                        list_file,
+                        preset,
+                        profiling,
+                        runtime,
+                        interp,
+                        configured,
+                        results,
+                        start,
+                        time,
+                    }),
+                });
+            }
+            Err(exit) => {
+                let _ = runtime.finish(false);
+                let code = match &exit {
+                    Exit::Code(code) => *code,
+                    Exit::Message(_) => 1,
+                };
+                let _ = session.profiling.write(session.host.as_ref(), start);
+                let _ = session.write_sarif(&mut interp, results, time, code);
+                return match exit {
+                    Exit::Code(code) => Err(code),
+                    Exit::Message(message) => Err(error(host.as_ref(), message)),
+                };
+            }
+        }
+    }
+    Err(1)
+}
+
 fn configure_project(
     argv: &[BString],
     opts: Options,

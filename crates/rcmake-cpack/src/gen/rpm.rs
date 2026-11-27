@@ -8,7 +8,7 @@ use rcmake_eval::Interp;
 use rcmake_host::{FileKind, path::to_native};
 
 use super::ScratchDir;
-use super::linux::{passes, verify_path};
+use super::linux::{passes, verify_path_in_root};
 use crate::config::CpackConfig;
 use crate::stage::{component_dir, remove_entry};
 use crate::{ComponentMembers, CpackError, PackageContext, PackageGenerator, error};
@@ -33,6 +33,7 @@ impl PackageGenerator for Rpm {
         _: &ComponentMembers,
         interp: &mut Interp,
     ) -> Result<Vec<PathBuf>, CpackError> {
+        let canon_work = cx.expected_work_root()?;
         let cfg = CpackConfig {
             vars: cx.vars.clone(),
         };
@@ -151,7 +152,7 @@ impl PackageGenerator for Rpm {
                 {
                     return Err(error(format!("Invalid RPM output: {}", path.display())));
                 }
-                verify_path(cx.host, cx.output_dir, &path, FileKind::File)?;
+                verify_path_in_root(cx.host, cx.output_dir, &canon_work, &path, FileKind::File)?;
                 let name = path
                     .file_name()
                     .ok_or_else(|| error("Missing RPM file name"))?;

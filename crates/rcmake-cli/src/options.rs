@@ -52,6 +52,14 @@ pub(crate) struct Options {
     pub debug_find: bool,
     pub debug_find_variables: Vec<BString>,
     pub debug_find_packages: Vec<BString>,
+    /// `--debugger`.
+    pub debugger: bool,
+    /// `--debugger-pipe <path>`.
+    pub debugger_pipe: Option<PathBuf>,
+    /// `--debugger-dap-log <path>`.
+    pub debugger_dap_log: Option<PathBuf>,
+    /// `-P` was given. Unlike [`Options::script`], the run does not take this out.
+    pub script_mode: bool,
     pub sarif: Option<PathBuf>,
     pub script: Option<PathBuf>,
     /// `--find-package`: run `CMakeFindPackageMode.cmake` (find-package tool mode).
@@ -348,6 +356,9 @@ fn script_mode_flag(flag: &[u8]) -> bool {
             | b"--log-level"
             | b"--loglevel"
             | b"--log-context"
+            | b"--debugger"
+            | b"--debugger-pipe"
+            | b"--debugger-dap-log"
     )
 }
 
@@ -415,6 +426,7 @@ fn parse_project(
                     return Err(String::new());
                 };
                 opts.script = Some(resolve_cli_path(host, script));
+                opts.script_mode = true;
             }
             _ => return Ok(false),
         },
@@ -491,7 +503,7 @@ fn validate_script_mode(opts: &Options, host: &dyn Host) -> Result<(), String> {
     Ok(())
 }
 
-fn cli_usage_error_only(host: &dyn Host, persona: Persona) -> String {
+pub(crate) fn cli_usage_error_only(host: &dyn Host, persona: Persona) -> String {
     let message = if persona == Persona::Native {
         b"CMake Error: Run 'rcmake --help' for all supported options.\n".as_slice()
     } else {

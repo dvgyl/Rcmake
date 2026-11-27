@@ -41,7 +41,16 @@ pub fn stage(
         interp.cx().set_var(name, value.clone());
     }
     host.create_dir_all(staging_dir)?;
-    install(host, &cwd, &options, &mut interp, staging_dir).map(|_| ())
+    let canon_staging = crate::source::canonical_checked_root(host.as_ref(), staging_dir)?;
+    install(
+        host,
+        &cwd,
+        &options,
+        &mut interp,
+        staging_dir,
+        &canon_staging,
+    )
+    .map(|_| ())
 }
 
 /// Stage the configured files and run the pre-build scripts.
@@ -54,6 +63,7 @@ pub(crate) fn install(
     options: &CPackOptions,
     interp: &mut Interp,
     staging: &Path,
+    canon_staging: &Path,
 ) -> Result<ComponentMembers, CpackError> {
     let cfg = snapshot(interp);
     staging_directory_mode(&cfg)?;
@@ -92,7 +102,8 @@ pub(crate) fn install(
     } else {
         cfg
     };
-    let (members, destinations) = install_projects(host, cwd, options, &cfg, staging)?;
+    let (members, destinations) =
+        install_projects(host, cwd, options, &cfg, staging, canon_staging)?;
     if matches!(
         cfg.get(b"CPACK_GENERATOR"),
         Some(b"RPM" | b"NSIS" | b"NSIS64" | b"WIX" | b"IFW")
@@ -111,6 +122,7 @@ pub(crate) fn install(
                 .set_var(b"CPACK_ABSOLUTE_DESTINATION_FILES", list::join(&all));
         }
     }
+    crate::source::verify_expected_root(host.as_ref(), staging, canon_staging)?;
     run_hooks(
         host.as_ref(),
         cwd,
@@ -118,6 +130,7 @@ pub(crate) fn install(
         b"CPACK_PRE_BUILD_SCRIPTS",
         "Executing pre-build script",
     )?;
+    crate::source::verify_expected_root(host.as_ref(), staging, canon_staging)?;
     Ok(members)
 }
 
@@ -143,6 +156,7 @@ fn install_projects(
     options: &CPackOptions,
     cfg: &CpackConfig,
     staging: &Path,
+    canon_staging: &Path,
 ) -> Result<(ComponentMembers, AbsoluteDestinations), CpackError> {
     let mut members = ComponentMembers::new();
     let mut absolute_files = AbsoluteDestinations::new();
@@ -237,6 +251,18 @@ fn install_projects(
                             members.len() - 1
                         }
                     };
+                    let canon_root =
+                        crate::source::canonical_checked_root(host.as_ref(), destination)?;
+                    let canon_scanned =
+                        crate::source::canonical_checked_root(host.as_ref(), &scanned)?;
+                    if !canon_root.starts_with(canon_staging)
+                        || !canon_scanned.starts_with(&canon_root)
+                    {
+                        return Err(error(format!(
+                            "CPack component root escapes staging directory: {}",
+                            destination.display()
+                        )));
+                    }
                     if let Some(item) = members.get_mut(index) {
                         item.files.extend(added.iter().cloned());
                         if let Some(existing_root) = item
@@ -249,6 +275,8 @@ fn install_projects(
                             item.staged_roots.push(crate::StagedRoot {
                                 root: destination.clone(),
                                 scanned,
+                                canon_root,
+                                canon_scanned,
                                 files: added,
                             });
                         }
@@ -260,7 +288,6 @@ fn install_projects(
     Ok((members, absolute_files))
 }
 
-// Archive and native installer generators record each component's staged members.
 fn records_members(cfg: &CpackConfig) -> bool {
     cfg.get(b"CPACK_GENERATOR").is_some_and(|name| {
         matches!(

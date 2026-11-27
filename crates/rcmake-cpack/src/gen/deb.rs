@@ -11,7 +11,7 @@ use rcmake_host::path::{from_native, from_native_cmake, to_native};
 use rcmake_host::{CopyOptions, FileKind, Follow, Host, Stream, WriteMode};
 
 use super::ScratchDir;
-use super::linux::{passes, verify_path};
+use super::linux::{passes, verify_path_in_root};
 use crate::config::{CpackConfig, absolute};
 use crate::{ComponentMembers, CpackError, PackageContext, PackageGenerator, error, safe_name};
 
@@ -35,6 +35,7 @@ impl PackageGenerator for Deb {
         _: &ComponentMembers,
         interp: &mut Interp,
     ) -> Result<Vec<PathBuf>, CpackError> {
+        let canon_work = cx.expected_work_root()?;
         let cfg = CpackConfig {
             vars: cx.vars.clone(),
         };
@@ -75,7 +76,7 @@ impl PackageGenerator for Deb {
                 }
                 let path = cx.output_dir.join(name);
                 let payload = to_native(required(&vars, dir)?);
-                verify_path(cx.host, cx.output_dir, &payload, FileKind::Dir)?;
+                verify_path_in_root(cx.host, cx.output_dir, &canon_work, &payload, FileKind::Dir)?;
                 build(cx, &vars, &payload, &path, debug)?;
                 packages.push(path);
             }

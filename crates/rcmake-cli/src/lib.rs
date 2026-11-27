@@ -4,6 +4,7 @@
 
 mod build;
 mod cache;
+mod ccmake;
 mod configure;
 #[cfg(test)]
 mod ctest;
@@ -57,6 +58,8 @@ use rcmake_model::CacheType;
 pub enum Tool {
     /// `cmake` (or default `rcmake`).
     Cmake,
+    /// `ccmake`.
+    Ccmake,
     /// `ctest`.
     Ctest,
     /// `cpack`.
@@ -69,6 +72,7 @@ impl Tool {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Cmake => "cmake",
+            Self::Ccmake => "ccmake",
             Self::Ctest => "ctest",
             Self::Cpack => "cpack",
         }
@@ -86,6 +90,8 @@ pub fn tool_from_argv0(argv0: &OsStr) -> Tool {
         Tool::Ctest
     } else if base.eq_ignore_ascii_case("cpack") {
         Tool::Cpack
+    } else if base.eq_ignore_ascii_case("ccmake") {
+        Tool::Ccmake
     } else {
         Tool::Cmake
     }
@@ -132,6 +138,9 @@ fn run_tool(argv: &[BString], tool: Tool, persona: persona::Persona, host: Arc<d
     if tool == Tool::Cmake {
         // `cmake` reads `--version` anywhere before `--`, through `help::run`.
         return run_cmake(argv, rest, persona, host);
+    }
+    if tool == Tool::Ccmake {
+        return ccmake::run(argv, persona, host);
     }
     // Reference topics come first, so that `ctest --version --help-command set`
     // prints both. `ctest --launch` passes its arguments to the command.
@@ -271,6 +280,16 @@ fn run_cmake(
             sub_argv.push(BString::from("cpack"));
             sub_argv.extend_from_slice(args);
             return run_tool(&sub_argv, Tool::Cpack, persona, host);
+        }
+        if let Some(args) = rest.strip_prefix(&[BString::from("ccmake")])
+            && !host
+                .metadata(&resolve_cli_path(host.as_ref(), b"ccmake"), Follow::Yes)
+                .is_ok_and(|meta| meta.kind == FileKind::Dir)
+        {
+            let mut sub_argv = Vec::with_capacity(args.len() + 1);
+            sub_argv.push(BString::from("ccmake"));
+            sub_argv.extend_from_slice(args);
+            return run_tool(&sub_argv, Tool::Ccmake, persona, host);
         }
     }
     if let Some(sub_args) = rest.strip_prefix(&[BString::from("-E")]) {

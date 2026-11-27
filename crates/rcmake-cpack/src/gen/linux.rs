@@ -85,11 +85,26 @@ impl Pass {
         filename_suffix: Option<&[u8]>,
         extra: &[(&[u8], Option<BString>)],
     ) -> Result<CpackConfig, CpackError> {
+        let canon_work = cx.expected_work_root()?;
+        let canon_staging = cx.expected_staging_root()?;
         let directory = self.suffix.as_ref().map_or_else(
             || cx.staging_dir.to_owned(),
             |suffix| cx.staging_dir.join(suffix),
         );
-        verify_path(cx.host, cx.output_dir, &directory, FileKind::Dir)?;
+        verify_path_in_root(
+            cx.host,
+            cx.staging_dir,
+            &canon_staging,
+            &directory,
+            FileKind::Dir,
+        )?;
+        verify_path_in_root(
+            cx.host,
+            cx.output_dir,
+            &canon_work,
+            &directory,
+            FileKind::Dir,
+        )?;
         let mut filename = BString::from(cx.file_name);
         if let Some(suffix) = filename_suffix {
             filename.push(b'-');
@@ -184,17 +199,17 @@ impl Pass {
     }
 }
 
-pub(super) fn verify_path(
+pub(super) fn verify_path_in_root(
     host: &dyn Host,
     root: &Path,
+    expected_canon_root: &Path,
     path: &Path,
     kind: FileKind,
 ) -> Result<(), CpackError> {
+    let canon_root = crate::source::verify_expected_root(host, root, expected_canon_root)?;
     if !path.starts_with(root)
-        || host.metadata(path, Follow::No)?.kind != kind
-        || !host
-            .canonicalize(path)?
-            .starts_with(host.canonicalize(root)?)
+        || host.metadata_fresh(path, Follow::No)?.kind != kind
+        || !host.canonicalize_fresh(path)?.starts_with(&canon_root)
     {
         return Err(error(format!(
             "Invalid CPack work path: {}",

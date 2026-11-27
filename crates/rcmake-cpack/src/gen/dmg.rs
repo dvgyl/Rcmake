@@ -28,11 +28,21 @@ impl PackageGenerator for DragNDropGenerator {
     }
 
     fn package(&self, cx: &PackageContext<'_>) -> Result<Vec<PathBuf>, CpackError> {
+        let _canon_work = cx.expected_work_root()?;
+        let canon_staging = cx.expected_staging_root()?;
         let cfg = CpackConfig {
             vars: cx.vars.clone(),
         };
         let roots = component_roots(&cfg)?;
         if roots.is_empty() {
+            crate::source::validate_staged_tree(
+                cx.host,
+                cx.staging_dir,
+                &canon_staging,
+                &[],
+                crate::source::SymlinkPolicy::PreserveContained,
+                false,
+            )?;
             return create_image(cx, cx.staging_dir);
         }
         let mut images = BTreeMap::<_, BTreeSet<_>>::new();
@@ -75,7 +85,32 @@ impl PackageGenerator for DragNDropGenerator {
         for (output, roots) in images {
             let scratch = ScratchDir::new(cx.host, cx.output_dir)?;
             for root in roots {
-                crate::source::merge_component(cx.host, &cx.staging_dir.join(root), &scratch.path)?;
+                let comp_root = cx.staging_dir.join(&root);
+                if !root.as_os_str().is_empty() {
+                    crate::source::verify_contained_path(
+                        cx.host,
+                        cx.staging_dir,
+                        &canon_staging,
+                        &root,
+                        crate::source::SymlinkPolicy::Reject,
+                        false,
+                    )?;
+                }
+                let canon_comp = crate::source::canonical_checked_root(cx.host, &comp_root)?;
+                if !canon_comp.starts_with(&canon_staging) {
+                    return Err(error(format!(
+                        "CPack component staging root escapes staging directory: {}",
+                        comp_root.display()
+                    )));
+                }
+                crate::source::copy_checked_tree_expected(
+                    cx.host,
+                    &comp_root,
+                    &canon_comp,
+                    &scratch.path,
+                    crate::source::SymlinkPolicy::PreserveContained,
+                    false,
+                )?;
             }
             write_image(cx, &scratch.path, &output)?;
             outputs.push(output);
