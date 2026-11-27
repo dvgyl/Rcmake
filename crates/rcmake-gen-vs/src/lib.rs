@@ -9,14 +9,19 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use rcmake_base::{BString, list, path_lex::Lexical};
-use rcmake_gen_common::{GenError, write_output};
+use rcmake_gen_common::{
+    GenError,
+    compile_commands_native::{ConfigDatabase, MultiConfigCompileDatabase},
+    write_output,
+};
 use rcmake_host::{FileKind, Follow, Host, SystemInfo, path::from_native};
-use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, VsVersion};
+use rcmake_model::{DirId, ParsedToolset, ProjectModel, Target, TargetId, VsVersion};
 use rcmake_resolve::{GenerationResult, usage::UsageResolver};
 
 use plan::Project;
 
 pub mod build;
+mod compile_db;
 mod cuda;
 pub mod filters;
 pub mod flags_table;
@@ -85,9 +90,38 @@ pub fn generate_with_restore_requirements(
     host: &dyn Host,
     bin: &Path,
 ) -> Result<Vec<String>, GenError> {
+    generate_with_compile_db(version, result, model, host, bin, None).map(|(names, _)| names)
+}
+
+/// Write the Visual Studio files, return the NuGet restore requirements, and when
+/// `export_targets` is `Some`, collect per-configuration native compile database rows
+/// directly from the resolved project plans.
+///
+/// # Errors
+///
+/// Returns an error if the project data is invalid or the host cannot write a file.
+pub fn generate_with_compile_db(
+    version: VsVersion,
+    result: &GenerationResult,
+    model: &ProjectModel,
+    host: &dyn Host,
+    bin: &Path,
+    export_targets: Option<&HashSet<TargetId>>,
+) -> Result<(Vec<String>, Option<MultiConfigCompileDatabase>), GenError> {
     let plan = plan::plan(version, result, model, host, bin)?;
     let mut usage: Option<UsageResolver<'_>> = None;
     let mut nasm_props_template: Option<String> = None;
+    let mut databases = export_targets.map(|_| {
+        plan.settings
+            .configs
+            .iter()
+            .map(|name| ConfigDatabase {
+                config: BString::from(name.as_str()),
+                rows: Vec::new(),
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut diagnostics = Vec::new();
     for project in &plan.projects {
         let facts = project.target.and_then(|id| plan.resolved.get(&id));
         let context = vcxproj::Context {
@@ -99,7 +133,12 @@ pub fn generate_with_restore_requirements(
             model,
             inputs: &plan.inputs,
         };
-        write_project(host, &context, &mut usage, &mut nasm_props_template)?;
+        let proj_plan = write_project(host, &context, &mut usage, &mut nasm_props_template)?;
+        if let (Some(selected), Some(dbs)) = (export_targets, databases.as_mut())
+            && project.target.is_some_and(|id| selected.contains(&id))
+        {
+            compile_db::collect_project(&context, &proj_plan, result, dbs, &mut diagnostics);
+        }
     }
     if plan.regenerate {
         let list = format!("{}\n", plan.inputs.join("\n"));
@@ -129,7 +168,12 @@ pub fn generate_with_restore_requirements(
             data.as_bytes(),
         )?;
     }
-    Ok(restore_requirements(&plan.projects, model))
+    let db = databases.map(|configs| MultiConfigCompileDatabase {
+        configs,
+        default_index: 0,
+        diagnostics,
+    });
+    Ok((restore_requirements(&plan.projects, model), db))
 }
 
 /// Target property that lists NuGet packages as `<name>_<version>` items.
@@ -191,7 +235,7 @@ fn write_project<'a>(
     context: &vcxproj::Context<'a>,
     usage: &mut Option<UsageResolver<'a>>,
     nasm_props_template: &mut Option<String>,
-) -> Result<(), GenError> {
+) -> Result<vcxproj::Plan, GenError> {
     let plan = context.plan(usage)?;
     context.write_tool_imports(host, &plan, nasm_props_template)?;
     for item in plan.items.values().filter(|item| item.synthetic) {
@@ -203,7 +247,8 @@ fn write_project<'a>(
         host,
         &format!("{path}.filters"),
         filters::render(context, &plan).as_bytes(),
-    )
+    )?;
+    Ok(plan)
 }
 
 impl Settings {

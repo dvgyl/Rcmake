@@ -192,16 +192,28 @@ fn single_config_writes_rules_edges_and_utilities() {
 
     assert!(build.contains("  depfile = a $$:file.d\n  deps = gcc\n"));
     let manifest = dir.join("build.ninja");
-    let original = host
+    let rules_file = dir.join("CMakeFiles/rules.ninja");
+    let original_manifest_mtime = host
         .metadata(&manifest, Follow::Yes)
+        .map(|metadata| metadata.mtime);
+    let original_rules_mtime = host
+        .metadata(&rules_file, Follow::Yes)
         .map(|metadata| metadata.mtime);
     host.sleep(std::time::Duration::from_secs(1));
     generate_single_config(&result, &host, dir).unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(
-        original,
+    // `build.ninja` is rewritten unconditionally (matching cmGlobalNinjaGenerator::OpenFileStream)
+    // so RERUN_CMAKE always advances its mtime past touched inputs, while rules.ninja stays stable.
+    assert_ne!(
+        original_manifest_mtime,
         host.metadata(&manifest, Follow::Yes)
             .map(|metadata| metadata.mtime)
     );
+    assert_eq!(
+        original_rules_mtime,
+        host.metadata(&rules_file, Follow::Yes)
+            .map(|metadata| metadata.mtime)
+    );
+    assert_eq!(read(&host, "/work/build/build.ninja"), build);
 }
 
 #[test]

@@ -49,9 +49,9 @@ pub(crate) fn run(
     host: &dyn Host,
     bin: &Path,
     queries: &[Query],
-    _persona: crate::persona::Persona,
+    persona: crate::persona::Persona,
 ) -> Result<Outcome, Failure> {
-    let outcome = generate(interp, host, bin, queries);
+    let outcome = generate(interp, host, bin, queries, persona);
     if matches!(outcome, Err(_) | Ok(Outcome::DeferredError))
         && let Err(error) = common::fileapi::write_error_replies(interp.cx().project(), host, bin)
     {
@@ -60,11 +60,52 @@ pub(crate) fn run(
     outcome
 }
 
+enum CompileDbMode {
+    /// Compat mode or single-config generator: existing `write_common` writer owns
+    /// root `compile_commands.json` and IDE generators emit nothing.
+    CompatOrSingleConfig,
+    /// Native multi-config mode with export enabled: backend supplies per-config rows,
+    /// published after common generation, backend generation, and File API succeed.
+    NativeMultiConfigPublish(std::collections::HashSet<rcmake_model::TargetId>),
+    /// Native multi-config mode with export disabled: retire only unmodified owned files
+    /// after generation and File API succeed.
+    NativeMultiConfigRetire,
+}
+
+fn select_compile_db_mode(
+    interp: &mut Interp,
+    kind: GeneratorKind,
+    persona: crate::persona::Persona,
+) -> CompileDbMode {
+    if persona != crate::persona::Persona::Native || !kind.multi_config() {
+        return CompileDbMode::CompatOrSingleConfig;
+    }
+    let selected: std::collections::HashSet<_> = interp
+        .cx()
+        .project()
+        .targets()
+        .filter_map(|(id, target)| {
+            target
+                .props
+                .get(b"EXPORT_COMPILE_COMMANDS")
+                .is_some_and(|value| rcmake_base::truth::is_on(value))
+                .then_some(id)
+        })
+        .collect();
+    let global_on = interp.cx().var_is_on(b"CMAKE_EXPORT_COMPILE_COMMANDS");
+    if global_on || !selected.is_empty() {
+        CompileDbMode::NativeMultiConfigPublish(selected)
+    } else {
+        CompileDbMode::NativeMultiConfigRetire
+    }
+}
+
 fn generate(
     interp: &mut Interp,
     host: &dyn Host,
     bin: &Path,
     queries: &[Query],
+    persona: crate::persona::Persona,
 ) -> Result<Outcome, Failure> {
     let Some(kind) = interp.cx().project().generator else {
         return Ok(Outcome::Unsupported);
@@ -230,25 +271,46 @@ fn generate(
     if !queries.is_empty() && !kind.is_ide() {
         instrument::wrap_custom_commands(&mut result, interp.cx().project(), host, bin);
     }
+    let compdb_mode = select_compile_db_mode(interp, kind, persona);
+    let native_export_targets = match &compdb_mode {
+        CompileDbMode::NativeMultiConfigPublish(targets) => Some(targets),
+        CompileDbMode::CompatOrSingleConfig | CompileDbMode::NativeMultiConfigRetire => None,
+    };
+    let mut native_compdb: Option<common::compile_commands_native::MultiConfigCompileDatabase> =
+        None;
     let ide_result: Option<Result<(), GenError>> = match kind {
         #[cfg(any(target_os = "macos", feature = "xcode-cross"))]
         GeneratorKind::Xcode => {
-            let generated = rcmake_gen_xcode::generate(&result, interp.cx().project(), host, bin);
-            if generated.is_ok() {
-                rcmake_gen_xcode::populate_guid_cache(&result, interp.cx().project(), host);
+            let generated = rcmake_gen_xcode::generate_with_compile_db(
+                &result,
+                interp.cx().project(),
+                host,
+                bin,
+                native_export_targets,
+            );
+            match generated {
+                Ok(db) => {
+                    native_compdb = db;
+                    rcmake_gen_xcode::populate_guid_cache(&result, interp.cx().project(), host);
+                    Some(Ok(()))
+                }
+                Err(err) => Some(Err(err)),
             }
-            Some(generated)
         }
         #[cfg(any(windows, feature = "vs-cross"))]
         GeneratorKind::VisualStudio(version) => {
-            let generated = rcmake_gen_vs::generate_with_restore_requirements(
+            let generated = rcmake_gen_vs::generate_with_compile_db(
                 version,
                 &result,
                 interp.cx().project(),
                 host,
                 bin,
+                native_export_targets,
             );
-            Some(generated.map(|names| record_package_restore(interp.cx().cache(), &names)))
+            Some(generated.map(|(names, db)| {
+                native_compdb = db;
+                record_package_restore(interp.cx().cache(), &names);
+            }))
         }
         #[cfg(not(any(target_os = "macos", feature = "xcode-cross")))]
         GeneratorKind::Xcode => {
@@ -265,16 +327,19 @@ fn generate(
     if let Some(Err(err)) = ide_result {
         return Err(err.to_string().into());
     }
-    write_common(interp, host, bin, &result, kind).map_err(|err| match err {
-        GenError::Invalid(message) if message.starts_with(b"\nCMake Error") => {
-            host.write_out(
-                Stream::Stderr,
-                message.strip_prefix(b"\n").unwrap_or(&message),
-            );
-            Failure::Reported
-        }
-        error => Failure::Message(error.to_string()),
-    })?;
+    let write_compat_compdb = matches!(compdb_mode, CompileDbMode::CompatOrSingleConfig);
+    write_common(interp, host, bin, &result, kind, write_compat_compdb).map_err(
+        |err| match err {
+            GenError::Invalid(message) if message.starts_with(b"\nCMake Error") => {
+                host.write_out(
+                    Stream::Stderr,
+                    message.strip_prefix(b"\n").unwrap_or(&message),
+                );
+                Failure::Reported
+            }
+            error => Failure::Message(error.to_string()),
+        },
+    )?;
     let generated = match kind {
         GeneratorKind::Ninja => rcmake_gen_ninja::generate_single_config_with_model(
             &result,
@@ -282,12 +347,21 @@ fn generate(
             bin,
             interp.cx().project(),
         ),
-        GeneratorKind::NinjaMultiConfig => rcmake_gen_ninja::generate_multi_config_with_model(
-            &result,
-            host,
-            bin,
-            interp.cx().project(),
-        ),
+        GeneratorKind::NinjaMultiConfig => {
+            match rcmake_gen_ninja::generate_multi_config_with_compile_db(
+                &result,
+                host,
+                bin,
+                interp.cx().project(),
+                native_export_targets,
+            ) {
+                Ok(db) => {
+                    native_compdb = db;
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
+        }
         GeneratorKind::UnixMakefiles => {
             rcmake_gen_make::generate_with_model(&result, host, bin, interp.cx().project())
         }
@@ -309,6 +383,41 @@ fn generate(
             }
             common::fileapi::write_replies(interp.cx().project(), &result, host, bin)
                 .map_err(|err| err.to_string())?;
+            match compdb_mode {
+                CompileDbMode::CompatOrSingleConfig => {}
+                CompileDbMode::NativeMultiConfigPublish(_) => {
+                    if let Some(db) = native_compdb {
+                        for notice in &db.diagnostics {
+                            let warning = Diagnostic {
+                                annotations: None,
+                                kind: MessageKind::Warning,
+                                effect: Effect::None,
+                                category: None,
+                                policy: None,
+                                location: Location::FileLine {
+                                    file: Arc::from(b"CMakeLists.txt".as_slice()),
+                                    line: 0,
+                                },
+                                body: format!(
+                                    "Incomplete compile_commands.json export for target '{}' (configuration '{}'): {}",
+                                    notice.target, notice.config, notice.reason
+                                )
+                                .into(),
+                            };
+                            host.write_out(
+                                Stream::Stderr,
+                                &render(&warning, &RenderOptions::default()),
+                            );
+                        }
+                        common::compile_commands_native::publish(host, bin, &db)
+                            .map_err(|err| err.to_string())?;
+                    }
+                }
+                CompileDbMode::NativeMultiConfigRetire => {
+                    common::compile_commands_native::retire(host, bin)
+                        .map_err(|err| err.to_string())?;
+                }
+            }
             Ok(Outcome::Complete)
         }
         Err(GenError::Unimplemented(_)) => Ok(Outcome::Unsupported),
@@ -514,6 +623,7 @@ fn write_common(
     bin: &Path,
     result: &GenerationResult,
     generator: GeneratorKind,
+    write_compat_compdb: bool,
 ) -> Result<(), GenError> {
     let binary_dir = path::from_native(bin);
     let prefix = interp.cx().var(b"CMAKE_INSTALL_PREFIX");
@@ -583,36 +693,38 @@ fn write_common(
         common::write_if_changed(host, &log_path, &content)?;
     }
 
-    let export_commands: std::collections::HashSet<_> = interp
-        .cx()
-        .project()
-        .targets()
-        .filter_map(|(id, target)| {
-            target
-                .props
-                .get(b"EXPORT_COMPILE_COMMANDS")
-                .is_some_and(|value| rcmake_base::truth::is_on(value))
-                .then_some(id)
-        })
-        .collect();
-    if result
-        .targets
-        .iter()
-        .any(|target| export_commands.contains(&target.id) && !target.compile_units.is_empty())
-        && !generator.is_ide()
-        && let Some(graph) = result.graphs.first()
-    {
-        write(
-            host,
-            &bin.join("compile_commands.json"),
-            common::compile_commands::render_selected(
-                result,
-                graph,
-                &binary_dir,
-                generator,
-                Some(&export_commands),
-            ),
-        )?;
+    if write_compat_compdb {
+        let export_commands: std::collections::HashSet<_> = interp
+            .cx()
+            .project()
+            .targets()
+            .filter_map(|(id, target)| {
+                target
+                    .props
+                    .get(b"EXPORT_COMPILE_COMMANDS")
+                    .is_some_and(|value| rcmake_base::truth::is_on(value))
+                    .then_some(id)
+            })
+            .collect();
+        if result
+            .targets
+            .iter()
+            .any(|target| export_commands.contains(&target.id) && !target.compile_units.is_empty())
+            && !generator.is_ide()
+            && let Some(graph) = result.graphs.first()
+        {
+            write(
+                host,
+                &bin.join("compile_commands.json"),
+                common::compile_commands::render_selected(
+                    result,
+                    graph,
+                    &binary_dir,
+                    generator,
+                    Some(&export_commands),
+                ),
+            )?;
+        }
     }
     let testing = interp.cx().var_is_on(b"CMAKE_TESTING_ENABLED");
     {
@@ -1014,6 +1126,395 @@ file(GENERATE OUTPUT conflict.txt CONTENT "second")
             )?,
             sentinel
         );
+        Ok(())
+    }
+
+    fn seed_c_toolchain_host() -> Result<Arc<rcmake_host::PureHost>, Box<dyn std::error::Error>> {
+        let host = crate::driver_tests::project_host();
+        for (module, content) in [
+            (
+                "CMakeDetermineCCompiler.cmake",
+                concat!(
+                    "file(WRITE \"${CMAKE_PLATFORM_INFO_DIR}/CMakeCCompiler.cmake\" \"",
+                    "set(CMAKE_C_COMPILER /tools/cc)\\n",
+                    "set(CMAKE_C_COMPILER_ID Clang)\\n",
+                    "set(CMAKE_C_COMPILER_LOADED 1)\\n",
+                    "set(CMAKE_C_SOURCE_FILE_EXTENSIONS c)\\n",
+                    "set(CMAKE_C_OUTPUT_EXTENSION .o)\\n",
+                    "\")\n",
+                ),
+            ),
+            (
+                "CMakeCInformation.cmake",
+                concat!(
+                    "set(CMAKE_C_COMPILE_OBJECT \"<CMAKE_C_COMPILER> <DEFINES> <INCLUDES> <FLAGS> -o <OBJECT> -c <SOURCE>\")\n",
+                    "set(CMAKE_C_LINK_EXECUTABLE \"<CMAKE_C_COMPILER> <OBJECTS> -o <TARGET>\")\n",
+                ),
+            ),
+            ("CMakeTestCCompiler.cmake", ""),
+        ] {
+            host.seed_file(
+                &Path::new("/usr/local/share/cmake-4.5/Modules").join(module),
+                content.as_bytes(),
+            )?;
+        }
+        host.seed_file(Path::new("/tools/cc"), b"")?;
+        host.set_command_handler(|_, request, _| {
+            let Some(command) = request.pipeline.first() else {
+                return Err(HostError::unsupported("Missing command."));
+            };
+            if command.args.as_slice() == [BString::from("--version")] {
+                return Ok(RunOutput {
+                    stdout: b"1.12.1\n".to_vec(),
+                    results: vec![ProcessResult::Exited(0)],
+                    ..RunOutput::default()
+                });
+            }
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                ..RunOutput::default()
+            })
+        })?;
+        Ok(host)
+    }
+
+    #[test]
+    fn native_ninja_multi_config_compile_commands_lifecycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = seed_c_toolchain_host()?;
+        let source = Path::new("/work/CMakeLists.txt");
+        let bin = Path::new("/work/out");
+        let project = br#"cmake_minimum_required(VERSION 4.5)
+set(CMAKE_C_COMPILER /tools/cc)
+project(multi LANGUAGES C)
+add_executable(app "sub dir/main.c")
+target_compile_definitions(app PRIVATE $<$<CONFIG:Debug>:MODE_DBG> $<$<CONFIG:Release>:MODE_REL>)
+set_source_files_properties("sub dir/main.c" PROPERTIES COMPILE_DEFINITIONS PER_FILE_DEF=1)
+add_executable(muted muted.c)
+set_target_properties(muted PROPERTIES EXPORT_COMPILE_COMMANDS OFF)
+"#;
+        host.seed_file(source, project)?;
+        host.seed_file(
+            Path::new("/work/sub dir/main.c"),
+            b"int main(void) { return 0; }\n",
+        )?;
+        host.seed_file(
+            Path::new("/work/muted.c"),
+            b"int main(void) { return 0; }\n",
+        )?;
+
+        let run_ok = |args: &[&str]| {
+            let argv: Vec<_> = args.iter().copied().map(BString::from).collect();
+            assert_eq!(
+                crate::run(&argv, host.clone()),
+                0,
+                "stderr={}",
+                host.stream_bytes(Stream::Stderr)
+            );
+        };
+        let read_str = |name: &str| -> Result<String, Box<dyn std::error::Error>> {
+            let bytes = host.read(&bin.join(name), ReadRange::All { limit: 256 * 1024 })?;
+            Ok(String::from_utf8(bytes)?)
+        };
+
+        // 1. Native --export-compile-commands with CMAKE_DEFAULT_BUILD_TYPE=Release.
+        run_ok(&[
+            "rcmake",
+            "--export-compile-commands",
+            "-S",
+            ".",
+            "-B",
+            "out",
+            "-G",
+            "Ninja Multi-Config",
+            "-DCMAKE_MAKE_PROGRAM=ninja",
+            "-DCMAKE_CONFIGURATION_TYPES=Debug;Release",
+            "-DCMAKE_DEFAULT_BUILD_TYPE=Release",
+        ]);
+        let dbg = read_str("compile_commands_Debug.json")?;
+        let rel = read_str("compile_commands_Release.json")?;
+        let root = read_str("compile_commands.json")?;
+        assert_eq!(root, rel, "root must match selected default config Release");
+        assert!(
+            dbg.contains("MODE_DBG") && !dbg.contains("MODE_REL"),
+            "{dbg}"
+        );
+        assert!(
+            rel.contains("MODE_REL") && !rel.contains("MODE_DBG"),
+            "{rel}"
+        );
+        assert!(dbg.contains("PER_FILE_DEF=1"), "{dbg}");
+        assert!(dbg.contains("sub dir/main.c"), "{dbg}");
+        assert!(dbg.contains("\"arguments\""), "{dbg}");
+        assert!(
+            !dbg.contains("muted.c"),
+            "explicit OFF target must be omitted: {dbg}"
+        );
+        assert!(
+            !rel.contains("muted.c"),
+            "explicit OFF target must be omitted: {rel}"
+        );
+
+        // 2. Switch default config to Debug -> root updates to Debug bytes.
+        run_ok(&[
+            "rcmake",
+            "-S",
+            ".",
+            "-B",
+            "out",
+            "-DCMAKE_DEFAULT_BUILD_TYPE=Debug",
+        ]);
+        let root_dbg = read_str("compile_commands.json")?;
+        let dbg2 = read_str("compile_commands_Debug.json")?;
+        assert_eq!(root_dbg, dbg2, "root must switch to Debug");
+
+        // 3. Remove Release config -> unmodified owned compile_commands_Release.json is retired.
+        run_ok(&[
+            "rcmake",
+            "-S",
+            ".",
+            "-B",
+            "out",
+            "-DCMAKE_CONFIGURATION_TYPES=Debug",
+        ]);
+        assert!(
+            host.metadata(&bin.join("compile_commands_Release.json"), Follow::No)
+                .is_err(),
+            "removed unmodified config file should be retired"
+        );
+        assert!(
+            host.metadata(&bin.join("compile_commands_Debug.json"), Follow::No)
+                .is_ok()
+        );
+
+        // 4. Generation failure preserves prior published compile_commands files.
+        let mut failing = project.to_vec();
+        failing.extend_from_slice(
+            b"\nfile(GENERATE OUTPUT conflict.txt CONTENT \"a\")\nfile(GENERATE OUTPUT conflict.txt CONTENT \"b\")\n",
+        );
+        host.seed_file(source, &failing)?;
+        let fail_argv = ["rcmake", "-S", ".", "-B", "out"].map(BString::from);
+        assert_ne!(crate::run(&fail_argv, host.clone()), 0);
+        assert_eq!(read_str("compile_commands.json")?, root_dbg);
+
+        // Restore valid CMakeLists.txt, then explicitly disable export -> retires owned files.
+        host.seed_file(source, project)?;
+        run_ok(&[
+            "rcmake",
+            "-S",
+            ".",
+            "-B",
+            "out",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF",
+        ]);
+        assert!(
+            host.metadata(&bin.join("compile_commands.json"), Follow::No)
+                .is_err()
+        );
+        assert!(
+            host.metadata(&bin.join("compile_commands_Debug.json"), Follow::No)
+                .is_err()
+        );
+
+        // 5. Compat reconfigure with Debug;Release writes aggregate root compile_commands.json.
+        run_ok(&[
+            "cmake",
+            "-S",
+            ".",
+            "-B",
+            "out",
+            "-DCMAKE_CONFIGURATION_TYPES=Debug;Release",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        ]);
+        let compat_root = read_str("compile_commands.json")?;
+        assert!(
+            compat_root.contains("MODE_DBG") && compat_root.contains("MODE_REL"),
+            "compat Ninja Multi-Config must keep aggregate compile_commands.json: {compat_root}"
+        );
+        assert!(
+            host.metadata(&bin.join("compile_commands_Debug.json"), Follow::No)
+                .is_err(),
+            "compat mode must not emit native per-config files"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", feature = "xcode-cross"))]
+    #[test]
+    fn native_vs_compat_xcode_compile_commands() -> Result<(), Box<dyn std::error::Error>> {
+        let host = seed_c_toolchain_host()?;
+        let bin = Path::new("/work/out-xcode");
+        host.seed_file(
+            Path::new("/work/CMakeLists.txt"),
+            br#"cmake_minimum_required(VERSION 4.5)
+set(CMAKE_C_COMPILER /tools/cc)
+set(CMAKE_SYSTEM_NAME Darwin)
+set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
+set(CMAKE_OSX_SYSROOT /SDKs/MacOSX.sdk)
+project(xc LANGUAGES C)
+add_executable(app main.c)
+target_compile_definitions(app PRIVATE $<$<CONFIG:Debug>:XC_DBG> $<$<CONFIG:Release>:XC_REL>)
+set_source_files_properties(main.c PROPERTIES COMPILE_FLAGS "-Wall")
+"#,
+        )?;
+        host.seed_file(Path::new("/work/main.c"), b"int main(void) { return 0; }\n")?;
+
+        // Compat Xcode must NOT emit compile_commands*.json.
+        let compat = [
+            "cmake",
+            "-S",
+            ".",
+            "-B",
+            "out-xcode",
+            "-G",
+            "Xcode",
+            "-DCMAKE_MAKE_PROGRAM=xcodebuild",
+            "-DCMAKE_CONFIGURATION_TYPES=Debug;Release",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        ]
+        .map(BString::from);
+        assert_eq!(
+            crate::run(&compat, host.clone()),
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        assert!(
+            host.metadata(&bin.join("compile_commands.json"), Follow::No)
+                .is_err()
+        );
+        assert!(
+            host.metadata(&bin.join("compile_commands_Debug.json"), Follow::No)
+                .is_err()
+        );
+
+        // Native Xcode exports per-config files with -arch, -isysroot, per-source flag, and root=Debug.
+        let native = [
+            "rcmake",
+            "--export-compile-commands",
+            "-S",
+            ".",
+            "-B",
+            "out-xcode",
+            "-G",
+            "Xcode",
+            "-DCMAKE_MAKE_PROGRAM=xcodebuild",
+            "-DCMAKE_CONFIGURATION_TYPES=Debug;Release",
+        ]
+        .map(BString::from);
+        assert_eq!(
+            crate::run(&native, host.clone()),
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        let dbg = String::from_utf8(host.read(
+            &bin.join("compile_commands_Debug.json"),
+            ReadRange::All { limit: 256 * 1024 },
+        )?)?;
+        let rel = String::from_utf8(host.read(
+            &bin.join("compile_commands_Release.json"),
+            ReadRange::All { limit: 256 * 1024 },
+        )?)?;
+        let root = String::from_utf8(host.read(
+            &bin.join("compile_commands.json"),
+            ReadRange::All { limit: 256 * 1024 },
+        )?)?;
+        assert_eq!(
+            root, dbg,
+            "Xcode root compile_commands.json must equal Debug"
+        );
+        assert!(dbg.contains("XC_DBG") && !dbg.contains("XC_REL"), "{dbg}");
+        assert!(rel.contains("XC_REL") && !rel.contains("XC_DBG"), "{rel}");
+        assert!(
+            dbg.contains("-isysroot") && dbg.contains("/SDKs/MacOSX.sdk"),
+            "{dbg}"
+        );
+        assert!(dbg.contains("arm64") && dbg.contains("x86_64"), "{dbg}");
+        assert!(dbg.contains("-Wall"), "{dbg}");
+        Ok(())
+    }
+
+    #[cfg(any(windows, feature = "vs-cross"))]
+    #[test]
+    fn native_vs_compat_vs_compile_commands() -> Result<(), Box<dyn std::error::Error>> {
+        let host = seed_c_toolchain_host()?;
+        let bin = Path::new("/work/out-vs");
+        host.seed_file(
+            Path::new("/work/CMakeLists.txt"),
+            br#"cmake_minimum_required(VERSION 4.5)
+set(CMAKE_C_COMPILER /tools/cc)
+set(CMAKE_C_COMPILER_ID MSVC)
+project(vsdemo LANGUAGES C)
+add_executable(app main.c)
+target_compile_definitions(app PRIVATE $<$<CONFIG:Debug>:VS_DBG> $<$<CONFIG:Release>:VS_REL>)
+set_source_files_properties(main.c PROPERTIES COMPILE_DEFINITIONS SRC_ONLY=1)
+"#,
+        )?;
+        host.seed_file(Path::new("/work/main.c"), b"int main(void) { return 0; }\n")?;
+
+        // Compat VS must NOT emit compile_commands*.json.
+        let compat = [
+            "cmake",
+            "-S",
+            ".",
+            "-B",
+            "out-vs",
+            "-G",
+            "Visual Studio 17 2022",
+            "-DCMAKE_MAKE_PROGRAM=MSBuild.exe",
+            "-DCMAKE_CONFIGURATION_TYPES=Debug;Release",
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        ]
+        .map(BString::from);
+        assert_eq!(
+            crate::run(&compat, host.clone()),
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        assert!(
+            host.metadata(&bin.join("compile_commands.json"), Follow::No)
+                .is_err()
+        );
+
+        // Native VS exports per-config files and root=Debug.
+        let native = [
+            "rcmake",
+            "--export-compile-commands",
+            "-S",
+            ".",
+            "-B",
+            "out-vs",
+            "-G",
+            "Visual Studio 17 2022",
+            "-DCMAKE_MAKE_PROGRAM=MSBuild.exe",
+            "-DCMAKE_CONFIGURATION_TYPES=Debug;Release",
+        ]
+        .map(BString::from);
+        assert_eq!(
+            crate::run(&native, host.clone()),
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        let dbg = String::from_utf8(host.read(
+            &bin.join("compile_commands_Debug.json"),
+            ReadRange::All { limit: 256 * 1024 },
+        )?)?;
+        let rel = String::from_utf8(host.read(
+            &bin.join("compile_commands_Release.json"),
+            ReadRange::All { limit: 256 * 1024 },
+        )?)?;
+        let root = String::from_utf8(host.read(
+            &bin.join("compile_commands.json"),
+            ReadRange::All { limit: 256 * 1024 },
+        )?)?;
+        assert_eq!(root, dbg, "VS root compile_commands.json must equal Debug");
+        assert!(dbg.contains("VS_DBG") && !dbg.contains("VS_REL"), "{dbg}");
+        assert!(rel.contains("VS_REL") && !rel.contains("VS_DBG"), "{rel}");
+        assert!(dbg.contains("SRC_ONLY=1"), "{dbg}");
+        assert!(dbg.contains("CMAKE_INTDIR"), "{dbg}");
         Ok(())
     }
 }

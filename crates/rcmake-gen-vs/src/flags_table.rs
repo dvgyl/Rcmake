@@ -26,6 +26,14 @@ impl Settings {
         self.values.contains_key(key)
     }
 
+    pub(crate) fn list_values(&self, key: &str) -> &[String] {
+        self.lists.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn additional_options(&self) -> &[String] {
+        self.options.as_slice()
+    }
+
     pub(crate) fn list(&mut self, key: &'static str, value: impl Into<String>) {
         let value = value.into();
         if let Some(seen) = self.list_seen.as_mut().and_then(|map| map.get_mut(key)) {

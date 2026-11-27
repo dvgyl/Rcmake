@@ -9,17 +9,17 @@ use crate::cuda::{self, Assembler, CompileMode, ImportKind, OptionText, SourceOp
 use super::*;
 
 #[derive(Default)]
-pub(super) struct CudaConfig {
-    includes: Vec<String>,
-    defines: Vec<String>,
-    options: String,
-    architectures: Vec<String>,
-    device_options: String,
-    runtime: Option<String>,
-    separable: bool,
-    mode: Option<CompileMode>,
-    device_link: bool,
-    dependencies: Vec<String>,
+pub(crate) struct CudaConfig {
+    pub(crate) includes: Vec<String>,
+    pub(crate) defines: Vec<String>,
+    pub(crate) options: String,
+    pub(crate) architectures: Vec<String>,
+    pub(crate) device_options: String,
+    pub(crate) runtime: Option<String>,
+    pub(crate) separable: bool,
+    pub(crate) mode: Option<CompileMode>,
+    pub(crate) device_link: bool,
+    pub(crate) dependencies: Vec<String>,
 }
 
 impl<'a> Context<'a> {

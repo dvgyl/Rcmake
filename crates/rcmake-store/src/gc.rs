@@ -15,7 +15,7 @@ pub struct GcReport {
     pub entries_removed: usize,
     /// Number of removed blobs.
     pub blobs_removed: usize,
-    /// Number of removed staging files.
+    /// Number of removed staging files and expired import candidates.
     pub staging_removed: usize,
     /// Combined file size freed in bytes.
     pub bytes_removed: u64,
@@ -28,14 +28,16 @@ pub struct StoreStats {
     pub entries: usize,
     /// Number of blobs.
     pub blobs: usize,
-    /// Combined size of entries and blobs in bytes.
+    /// Number of imported candidate entries and blobs that are not yet in use.
+    pub candidates: usize,
+    /// Combined size of entries, blobs, and candidates in bytes.
     pub bytes: u64,
 }
 
-struct CachedFile {
-    path: PathBuf,
-    digest: Digest,
-    stat: Metadata,
+pub(crate) struct CachedFile {
+    pub(crate) path: PathBuf,
+    pub(crate) digest: Digest,
+    pub(crate) stat: Metadata,
 }
 
 struct BlobReferences {
@@ -72,17 +74,23 @@ impl Store<'_> {
                 stats.bytes = stats.bytes.saturating_add(file.stat.len);
             }
         }
+        for (directory, extension) in self.candidate_locations() {
+            for file in self.cache_files(&directory, extension)? {
+                stats.candidates += 1;
+                stats.bytes = stats.bytes.saturating_add(file.stat.len);
+            }
+        }
         Ok(stats)
     }
 
-    /// Remove entries and blobs under the cache lock. Return the space freed.
+    /// Remove entries, blobs, and candidates under the cache lock. Return the space freed.
     pub fn clear(&self) -> HostResult<GcReport> {
         let mut report = GcReport::default();
         if !self.writable() || !self.readable()? {
             return Ok(report);
         }
         let locked = self.lock_cache(crate::PUBLISH_WAIT)?;
-        for (directory, extension) in self.data_locations() {
+        for (directory, extension) in self.data_locations().chain(self.candidate_locations()) {
             for file in self.cache_files(&directory, extension)? {
                 if locked.remove_if_unchanged(&file.path, &file.stat)? {
                     if extension == "entry" {
@@ -141,6 +149,16 @@ impl Store<'_> {
                     report.bytes_removed = report.bytes_removed.saturating_add(stat.len);
                 } else {
                     total = total.saturating_add(stat.len);
+                }
+            }
+        }
+        for (directory, extension) in self.candidate_locations() {
+            for file in self.cache_files(&directory, extension)? {
+                if older_than(now, file.stat.mtime, crate::portable::CANDIDATE_TTL)
+                    && locked.remove_if_unchanged(&file.path, &file.stat)?
+                {
+                    report.staging_removed += 1;
+                    report.bytes_removed = report.bytes_removed.saturating_add(file.stat.len);
                 }
             }
         }
@@ -211,7 +229,11 @@ impl Store<'_> {
         Ok(report)
     }
 
-    fn cache_files(&self, directory: &Path, extension: &str) -> HostResult<Vec<CachedFile>> {
+    pub(crate) fn cache_files(
+        &self,
+        directory: &Path,
+        extension: &str,
+    ) -> HostResult<Vec<CachedFile>> {
         let mut files = Vec::new();
         for shard in self.list_dir(directory)? {
             if shard.kind != FileKind::Dir || !lower_hex(&shard.name, 2) {

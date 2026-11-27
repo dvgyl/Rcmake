@@ -11,6 +11,7 @@ use rcmake_genex::{EvalContext, PreprocessMode};
 use rcmake_host::{Host, HostError, path::from_native};
 
 pub mod compile_commands;
+pub mod compile_commands_native;
 pub mod configure_log;
 pub mod cpack_properties;
 pub mod ctest_file;

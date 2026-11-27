@@ -1,7 +1,10 @@
+use rcmake_archive::{PortableLimits, PortableName, read_portable, write_portable};
 use rcmake_base::BString;
 use rcmake_eval::ProbeCacheMode;
-use rcmake_host::{Host, HostResult, Stream, discover_cmake_root, path};
-use rcmake_store::{Store, StoreConfig, StoreMode};
+use rcmake_host::{
+    FileKind, Follow, Host, HostResult, ReadRange, Stream, WriteMode, discover_cmake_root, path,
+};
+use rcmake_store::{Digest, ImportError, ImportTrust, ProbeBundle, Store, StoreConfig, StoreMode};
 
 use crate::{configure::speed, options::Options, persona::Persona};
 
@@ -19,16 +22,21 @@ fn open(host: &dyn Host) -> HostResult<Store<'_>> {
     Store::new(host, config)
 }
 
+const CACHE_USAGE: &[u8] =
+    b"Usage: rcmake cache [status|dir|clear|export <file>|import <file> [--sha256 <hex>]]\n";
+
 pub(crate) fn cache(args: &[BString], host: &dyn Host) -> i32 {
     if let [flag] | [_, flag] = args
         && is_help(flag)
     {
         let help: &[u8] = match args {
             [_] => {
-                b"Usage: rcmake cache [status|dir|clear]\n\
+                b"Usage: rcmake cache [status|dir|clear|export <file>|import <file>]\n\
                 status  Show cache size and entry counts (default).\n\
                 dir     Print the cache directory.\n\
-                clear   Remove cache entries and blobs.\n"
+                clear   Remove cache entries and blobs.\n\
+                export  Write the probe entries to a portable archive.\n\
+                import  Read probe entries from a portable archive.\n"
             }
             [action, _] if action == b"status" => {
                 b"Usage: rcmake cache status\nShow cache size and entry counts.\n"
@@ -38,6 +46,17 @@ pub(crate) fn cache(args: &[BString], host: &dyn Host) -> i32 {
             }
             [action, _] if action == b"clear" => {
                 b"Usage: rcmake cache clear\nRemove cache entries and blobs.\n"
+            }
+            [action, _] if action == b"export" => {
+                b"Usage: rcmake cache export <file>\n\
+                Write the probe entries and their blobs to a gzip tar archive.\n\
+                The archive contains compiler paths, arguments, and captured compiler output.\n"
+            }
+            [action, _] if action == b"import" => {
+                b"Usage: rcmake cache import <file> [--sha256 <hex>]\n\
+                Read probe entries from an archive made by rcmake cache export.\n\
+                With a matching --sha256 digest, the entries are used directly.\n\
+                Without it, the entries are kept as candidates and are not used for cache hits.\n"
             }
             _ => b"",
         };
@@ -50,36 +69,41 @@ pub(crate) fn cache(args: &[BString], host: &dyn Host) -> i32 {
             return 0;
         }
     }
-    let action = match args {
-        [] => b"status".as_slice(),
-        [action] if matches!(action.as_slice(), b"dir" | b"status" | b"clear") => action,
-        _ => {
-            host.write_out(Stream::Stderr, b"Usage: rcmake cache [status|dir|clear]\n");
-            return 2;
-        }
+    let Some(action) = Action::parse(args) else {
+        host.write_out(Stream::Stderr, CACHE_USAGE);
+        return 2;
     };
     let result = open(host).and_then(|store| {
         let root = store.root();
         if root.as_os_str().is_empty() {
-            return Ok("No cache directory is configured.\n".to_owned());
+            return Ok(Err("No cache directory is configured.".to_owned()));
         }
-        let root = path::from_native_cmake(root);
-        match action {
-            b"dir" => Ok(format!("{root}\n")),
-            b"clear" => {
+        let shown = path::from_native_cmake(root);
+        Ok(match action {
+            Action::Dir => Ok(format!("{shown}\n")),
+            Action::Clear => {
                 let report = store.clear()?;
                 Ok(format!(
                     "Removed {} entries and {} blobs. Reclaimed {} bytes.\n",
                     report.entries_removed, report.blobs_removed, report.bytes_removed
                 ))
             }
-            _ => Ok(format!("Cache directory: {root}\n{}", inventory(&store)?)),
-        }
+            Action::Status => Ok(format!("Cache directory: {shown}\n{}", inventory(&store)?)),
+            Action::Export(file) => export(host, &store, file),
+            Action::Import { file, sha256 } => import(host, &store, file, sha256),
+        })
     });
     match result {
-        Ok(text) => {
+        Ok(Ok(text)) => {
             host.write_out(Stream::Stdout, text.as_bytes());
             0
+        }
+        Ok(Err(message)) => {
+            host.write_out(
+                Stream::Stderr,
+                format!("rcmake cache: {message}\n").as_bytes(),
+            );
+            1
         }
         Err(error) => {
             host.write_out(
@@ -91,16 +115,234 @@ pub(crate) fn cache(args: &[BString], host: &dyn Host) -> i32 {
     }
 }
 
+enum Action<'a> {
+    Status,
+    Dir,
+    Clear,
+    Export(&'a [u8]),
+    Import {
+        file: &'a [u8],
+        sha256: Option<&'a [u8]>,
+    },
+}
+
+impl<'a> Action<'a> {
+    fn parse(args: &'a [BString]) -> Option<Self> {
+        let operand = |value: &'a BString| (!value.is_empty()).then_some(value.as_slice());
+        match args {
+            [] => Some(Self::Status),
+            [action] if action == b"status" => Some(Self::Status),
+            [action] if action == b"dir" => Some(Self::Dir),
+            [action] if action == b"clear" => Some(Self::Clear),
+            [action, file] if action == b"export" => operand(file).map(Self::Export),
+            [action, rest @ ..] if action == b"import" => {
+                let mut file = None;
+                let mut sha256 = None;
+                let mut rest = rest.iter();
+                while let Some(arg) = rest.next() {
+                    if arg == b"--sha256" && sha256.is_none() {
+                        sha256 = Some(operand(rest.next()?)?);
+                    } else if let Some(value) = arg.strip_prefix(b"--sha256=")
+                        && sha256.is_none()
+                    {
+                        sha256 = Some(value).filter(|value| !value.is_empty());
+                        sha256?;
+                    } else if file.is_none() && !arg.starts_with(b"-") {
+                        file = operand(arg);
+                    } else {
+                        return None;
+                    }
+                }
+                Some(Self::Import {
+                    file: file?,
+                    sha256,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Write the verified probe entries of `store` to a portable archive at `file`.
+///
+/// The archive is written to a temporary file in the destination directory and
+/// renamed after it is complete.
+fn export(host: &dyn Host, store: &Store<'_>, file: &[u8]) -> Result<String, String> {
+    let destination = host.initial_cwd().join(path::to_native(file));
+    let (Some(parent), Some(name)) = (destination.parent(), destination.file_name()) else {
+        return Err("The export destination must name a file.".into());
+    };
+    let parent = host
+        .canonicalize(parent)
+        .map_err(|_| format!("The directory {} does not exist.", parent.display()))?;
+    if parent.starts_with(store.root()) {
+        return Err("Choose an export destination outside the cache directory.".into());
+    }
+    let destination = parent.join(name);
+    if host
+        .metadata(&destination, Follow::No)
+        .is_ok_and(|meta| meta.kind != FileKind::File)
+    {
+        return Err(format!(
+            "{} exists and is not a regular file.",
+            destination.display()
+        ));
+    }
+    let export = store.export_probes().map_err(|error| error.to_string())?;
+    let manifest = export
+        .manifest
+        .to_json()
+        .map_err(|error| error.to_string())?;
+    let mut members = vec![(PortableName::Manifest, manifest.as_slice())];
+    members.extend(
+        export
+            .entries
+            .iter()
+            .map(|(key, frame)| (PortableName::Entry(*key.as_bytes()), frame.as_slice())),
+    );
+    members.extend(
+        export
+            .blobs
+            .iter()
+            .map(|(digest, frame)| (PortableName::Blob(*digest.as_bytes()), frame.as_slice())),
+    );
+    let archive = write_portable(&members).map_err(|error| error.to_string())?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        name.to_string_lossy(),
+        host.system().pid
+    ));
+    host.write(&temp, &archive, WriteMode::Truncate)
+        .and_then(|()| host.rename(&temp, &destination))
+        .map_err(|error| {
+            let _ = host.remove_file(&temp);
+            error.to_string()
+        })?;
+    let mut text = format!(
+        "Exported {} probe entries and {} blobs to {}.\nSHA-256: {}\n",
+        export.entries.len(),
+        export.blobs.len(),
+        path::from_native_cmake(&destination),
+        Digest::hash(&archive)
+    );
+    let skipped = export.skipped;
+    if skipped.total() > 0 {
+        text.push_str(&format!(
+            "Skipped {} entries: {} stale, {} invalid, {} with missing blobs, {} over the size limit.\n",
+            skipped.total(),
+            skipped.stale,
+            skipped.invalid,
+            skipped.missing_blob,
+            skipped.over_budget
+        ));
+    }
+    Ok(text)
+}
+
+/// Check a portable archive and import its probe entries into `store`.
+fn import(
+    host: &dyn Host,
+    store: &Store<'_>,
+    file: &[u8],
+    sha256: Option<&[u8]>,
+) -> Result<String, String> {
+    let expected = match sha256 {
+        None => None,
+        Some(hex) => Some(
+            std::str::from_utf8(hex)
+                .ok()
+                .and_then(Digest::from_hex)
+                .ok_or("--sha256 needs 64 hexadecimal digits.")?,
+        ),
+    };
+    let source = host.initial_cwd().join(path::to_native(file));
+    let limits = PortableLimits::default();
+    let meta = host
+        .metadata(&source, Follow::Yes)
+        .map_err(|error| error.to_string())?;
+    if meta.kind != FileKind::File {
+        return Err(format!("{} is not a regular file.", source.display()));
+    }
+    if meta.len > limits.archive_bytes {
+        return Err(format!(
+            "The archive exceeds {} bytes.",
+            limits.archive_bytes
+        ));
+    }
+    // Check and parse one private copy, so a concurrent change cannot alter it.
+    let archive = host
+        .read(
+            &source,
+            ReadRange::All {
+                limit: limits.archive_bytes,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let actual = Digest::hash(&archive);
+    let trust = match expected {
+        Some(expected) if expected != actual => {
+            return Err(format!(
+                "The archive SHA-256 is {actual}, but --sha256 is {expected}. Nothing was imported."
+            ));
+        }
+        Some(_) => ImportTrust::Trusted,
+        None => ImportTrust::Untrusted,
+    };
+    let members = read_portable(&archive, &limits)
+        .map_err(|error| format!("Invalid archive: {error} Nothing was imported."))?;
+    let mut bundle = ProbeBundle::default();
+    for member in members {
+        match member.name {
+            PortableName::Manifest => bundle.manifest = member.data,
+            PortableName::Entry(key) => {
+                bundle.entries.insert(Digest::from_bytes(key), member.data);
+            }
+            PortableName::Blob(digest) => {
+                bundle.blobs.insert(Digest::from_bytes(digest), member.data);
+            }
+        }
+    }
+    let report = store
+        .import_probes(&bundle, trust)
+        .map_err(|error| match error {
+            ImportError::Invalid(reason) => {
+                format!("Invalid archive: {reason} Nothing was imported.")
+            }
+            ImportError::Store(error) => error.to_string(),
+        })?;
+    let mut text = format!(
+        "Imported {} probe entries and {} blobs from {}.\nUnchanged: {}. Recovered: {}. Staged: {}. Conflicts: {}.\n",
+        report.entries_published,
+        report.blobs_published,
+        path::from_native_cmake(&source),
+        report.unchanged,
+        report.recovered,
+        report.staged,
+        report.conflicts
+    );
+    if trust == ImportTrust::Untrusted && report.staged > 0 {
+        text.push_str(
+            "No --sha256 digest was given. Staged entries are not used for cache hits. \
+             They can restore missing blobs of matching local entries.\n",
+        );
+    }
+    Ok(text)
+}
+
 fn is_help(flag: &[u8]) -> bool {
     matches!(flag, b"-h" | b"--help")
 }
 
 fn inventory(store: &Store<'_>) -> HostResult<String> {
     let stats = store.stats()?;
-    Ok(format!(
+    let mut text = format!(
         "Size: {} bytes\nEntries: {}\nBlobs: {}\n",
         stats.bytes, stats.entries, stats.blobs
-    ))
+    );
+    if stats.candidates > 0 {
+        text.push_str(&format!("Import candidates: {}\n", stats.candidates));
+    }
+    Ok(text)
 }
 
 pub(crate) fn doctor(argv0: Option<&BString>, args: &[BString], host: &dyn Host) -> i32 {
@@ -111,12 +353,22 @@ pub(crate) fn doctor(argv0: Option<&BString>, args: &[BString], host: &dyn Host)
     {
         host.write_out(
             Stream::Stdout,
-            b"Usage: rcmake doctor\nShow the CMake root, available tools, and probe cache status.\n",
+            b"Usage: rcmake doctor [-B <build>]\nShow the CMake root, available tools, and probe cache status.\n\
+            With -B, also compare the build directory with its last successful configure.\n",
         );
         return 0;
     }
-    if !args.is_empty() {
-        host.write_out(Stream::Stderr, b"Usage: rcmake doctor\n");
+    let build = match args {
+        [] => None,
+        [flag, dir] if flag == b"-B" && !dir.is_empty() => Some(dir.as_slice()),
+        [arg] => match arg.strip_prefix(b"-B") {
+            Some(dir) if !dir.is_empty() => Some(dir),
+            _ => None,
+        },
+        _ => None,
+    };
+    if !args.is_empty() && build.is_none() {
+        host.write_out(Stream::Stderr, b"Usage: rcmake doctor [-B <build>]\n");
         return 2;
     }
 
@@ -199,12 +451,19 @@ pub(crate) fn doctor(argv0: Option<&BString>, args: &[BString], host: &dyn Host)
                 .join(", ")
         }
     );
+    let code = build.map_or(0, |dir| {
+        text.push('\n');
+        let dir = host.initial_cwd().join(path::to_native(dir));
+        crate::drift::doctor(host, &dir, &mut text)
+    });
     host.write_out(Stream::Stdout, text.as_bytes());
-    0
+    code
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use rcmake_host::{Follow, PureHost};
 
@@ -276,5 +535,158 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    fn run(host: &PureHost, args: &[&str]) -> (i32, String, String) {
+        let before_out = host.stream_bytes(Stream::Stdout).len();
+        let before_err = host.stream_bytes(Stream::Stderr).len();
+        let args: Vec<BString> = args.iter().copied().map(BString::from).collect();
+        let code = cache(&args, host);
+        let tail = |stream, before: usize| {
+            host.stream_bytes(stream)
+                .get(before..)
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default()
+        };
+        (
+            code,
+            tail(Stream::Stdout, before_out),
+            tail(Stream::Stderr, before_err),
+        )
+    }
+
+    fn seeded_store(host: &PureHost, dir: &str) -> HostResult<rcmake_store::Digest> {
+        use rcmake_store::{Domain, Entry};
+        let root = host.initial_cwd().join(dir);
+        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(&path::from_native(&root)));
+        let store = open(host)?;
+        let blob = store.put_blob(b"artifact")?;
+        let key = Domain::ProbeV1.key(b"probe");
+        let entry = Entry {
+            trace: Vec::new(),
+            blobs: vec![blob],
+            payload: "probe".to_owned(),
+        };
+        store.put_entry(Domain::ProbeV1, key, &entry)?;
+        Ok(key)
+    }
+
+    #[test]
+    fn cache_export_and_trusted_import_round_trip_through_an_empty_store() -> HostResult<()> {
+        let host = PureHost::default();
+        let key = seeded_store(&host, "producer")?;
+        let (code, out, err) = run(&host, &["export", "probes.tar.gz"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            out.starts_with("Exported 1 probe entries and 1 blobs to "),
+            "{out}"
+        );
+        let digest = out
+            .lines()
+            .find_map(|line| line.strip_prefix("SHA-256: "))
+            .unwrap_or_default()
+            .to_owned();
+        let archive = host.read(
+            &host.initial_cwd().join("probes.tar.gz"),
+            ReadRange::All { limit: 1 << 20 },
+        )?;
+        assert_eq!(rcmake_store::Digest::hash(&archive).to_hex(), digest);
+
+        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(b"/work/consumer"));
+        let wrong = "0".repeat(64);
+        let (code, _, err) = run(&host, &["import", "probes.tar.gz", "--sha256", &wrong]);
+        assert_eq!(code, 1);
+        assert!(err.contains("Nothing was imported."), "{err}");
+        assert!(
+            host.metadata(Path::new("/work/consumer"), Follow::No)
+                .is_err()
+        );
+
+        let flag = format!("--sha256={digest}");
+        let (code, out, err) = run(&host, &["import", &flag, "probes.tar.gz"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            out.starts_with("Imported 1 probe entries and 1 blobs"),
+            "{out}"
+        );
+        let store = open(&host)?;
+        assert!(
+            store
+                .get_entry::<String>(rcmake_store::Domain::ProbeV1, key)?
+                .is_some()
+        );
+        let (_, out, _) = run(&host, &["import", "probes.tar.gz", "--sha256", &digest]);
+        assert!(
+            out.contains("Imported 0 probe entries and 0 blobs"),
+            "{out}"
+        );
+        assert!(out.contains("Unchanged: 1."), "{out}");
+        Ok(())
+    }
+
+    #[test]
+    fn cache_import_without_a_digest_stages_candidates_only() -> HostResult<()> {
+        let host = PureHost::default();
+        let key = seeded_store(&host, "producer")?;
+        assert_eq!(run(&host, &["export", "probes.tar.gz"]).0, 0);
+        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(b"/work/consumer"));
+        let (code, out, _) = run(&host, &["import", "probes.tar.gz"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("Staged: 1."), "{out}");
+        assert!(out.contains("not used for cache hits"), "{out}");
+        let store = open(&host)?;
+        assert!(
+            store
+                .get_entry::<String>(rcmake_store::Domain::ProbeV1, key)?
+                .is_none()
+        );
+        let (_, status, _) = run(&host, &[]);
+        assert!(status.contains("Entries: 0\n"), "{status}");
+        assert!(status.contains("Import candidates: 2\n"), "{status}");
+        Ok(())
+    }
+
+    #[test]
+    fn cache_export_and_import_reject_bad_operands() -> HostResult<()> {
+        let host = PureHost::default();
+        seeded_store(&host, "producer")?;
+        let (code, _, err) = run(&host, &["export", "producer/probes.tar.gz"]);
+        assert_eq!(code, 1);
+        assert!(err.contains("outside the cache directory"), "{err}");
+        for args in [
+            &["export"][..],
+            &["export", "a", "b"],
+            &["import"],
+            &["import", "a", "--sha256"],
+            &["import", "a", "--sha256", "b", "--sha256", "c"],
+            &["import", "a", "--unknown"],
+        ] {
+            assert_eq!(run(&host, args).0, 2, "{args:?}");
+        }
+        let (code, _, err) = run(&host, &["import", "missing.tar.gz", "--sha256", "xyz"]);
+        assert_eq!(code, 1);
+        assert!(err.contains("64 hexadecimal digits"), "{err}");
+        host.seed_file(Path::new("/work/bad.tar.gz"), b"not an archive")?;
+        let (code, _, err) = run(&host, &["import", "bad.tar.gz"]);
+        assert_eq!(code, 1);
+        assert!(err.contains("Invalid archive"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_accepts_both_build_directory_forms() {
+        for args in [&["-B", "missing"][..], &["-Bmissing"]] {
+            let host = PureHost::default();
+            let args: Vec<BString> = args.iter().copied().map(BString::from).collect();
+            assert_eq!(doctor(None, &args, &host), 1);
+            let out = host.stream_bytes(Stream::Stdout).to_string();
+            assert!(out.contains("Build directory: /work/missing"), "{out}");
+            assert!(out.contains("no CMakeCache.txt found"), "{out}");
+        }
+        for args in [&["-B"][..], &["-B", ""], &["--build", "x"]] {
+            let host = PureHost::default();
+            let args: Vec<BString> = args.iter().copied().map(BString::from).collect();
+            assert_eq!(doctor(None, &args, &host), 2);
+        }
     }
 }

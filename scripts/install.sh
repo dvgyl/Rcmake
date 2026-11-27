@@ -7,7 +7,7 @@ usage() {
 Usage: install.sh [--version <v> | --from-source | --archive <path>] [--prefix <dir>] [--alias-cmake] [--force]
        install.sh --uninstall [--prefix <dir>]
 
-Install rcmake and rcmake-lsp into $PREFIX/bin, the bundled CMake 4.5.1
+Install rcmake, rcmake-lsp, and rcmake-verify into $PREFIX/bin, the bundled CMake 4.5.1
 data into $PREFIX/share/cmake-4.5, licences and third-party notices into
 $PREFIX/share/doc/rcmake, and any bundled shell completions and man page
 under $PREFIX/share. The default PREFIX is $HOME/.local.
@@ -23,7 +23,7 @@ Options:
   --alias-cmake      Also create cmake, ctest, cpack, and ccmake links to rcmake.
   --force            Allow replacement of unmarked share/cmake-4.5 data.
                      With --alias-cmake, also replace existing aliases.
-  --uninstall        Remove rcmake, rcmake-lsp, the links to rcmake,
+  --uninstall        Remove rcmake, rcmake-lsp, rcmake-verify, the links to rcmake,
                      managed share/cmake-4.5 data, share/doc/rcmake, and the rcmake
                      completions and man page from $PREFIX.
   -h, --help         Show this help.
@@ -235,6 +235,10 @@ if "$uninstall"; then
     rm -f "$bin_dir/rcmake-lsp"
     removed+=("$bin_dir/rcmake-lsp")
   fi
+  if [[ -f "$bin_dir/rcmake-verify" && ! -L "$bin_dir/rcmake-verify" ]]; then
+    rm -f "$bin_dir/rcmake-verify"
+    removed+=("$bin_dir/rcmake-verify")
+  fi
   if [[ -d "$data_dir" ]]; then
     if [[ -L "$data_dir" || ! -f "$data_marker" || -L "$data_marker" ]]; then
       printf 'Kept %s because it has no rcmake ownership marker.\n' "$data_dir"
@@ -417,7 +421,8 @@ doc_files = (
 licences_dir = Path("third_party/licences")
 rcmake_rel = Path("bin/rcmake")
 lsp_rel = Path("bin/rcmake-lsp")
-binaries = (rcmake_rel, lsp_rel)
+verify_rel = Path("bin/rcmake-verify")
+binaries = (rcmake_rel, lsp_rel, verify_rel)
 extra_share_files = (
     Path("share/man/man1/rcmake.1"),
     Path("share/bash-completion/completions/rcmake"),
@@ -524,6 +529,10 @@ try:
         staged_lsp_is_file = staged_lsp.is_file() and not staged_lsp_is_link
         if staged_lsp_is_file:
             staged_lsp.chmod(0o755)
+        staged_verify = work / verify_rel
+        staged_verify_is_file = staged_verify.is_file() and not staged_verify.is_symlink()
+        if staged_verify_is_file:
+            staged_verify.chmod(0o755)
         for required in ("Modules/CMake.cmake", "Templates/CPackConfig.cmake.in"):
             if not (work / data_dir / required).is_file():
                 raise ValueError(f"Missing {required} in the archive.")
@@ -575,7 +584,11 @@ try:
                     f"{installed_data} has no rcmake ownership marker. Another CMake installation may own it. "
                     "Use --prefix <separate-dir> or --force to replace the data."
                 )
-        for target_name, present in (("rcmake", True), ("rcmake-lsp", staged_lsp_is_link or staged_lsp_is_file)):
+        for target_name, present in (
+            ("rcmake", True),
+            ("rcmake-lsp", staged_lsp_is_link or staged_lsp_is_file),
+            ("rcmake-verify", staged_verify_is_file),
+        ):
             if present:
                 target_path = bin_dir / target_name
                 if target_path.is_dir() and not target_path.is_symlink():
@@ -663,6 +676,11 @@ try:
                 record_and_backup(bin_dir / "rcmake-lsp")
                 staged_lsp.replace(bin_dir / "rcmake-lsp")
                 installed.append(bin_dir / "rcmake-lsp")
+
+            if staged_verify_is_file:
+                record_and_backup(bin_dir / "rcmake-verify")
+                staged_verify.replace(bin_dir / "rcmake-verify")
+                installed.append(bin_dir / "rcmake-verify")
 
             if aliases == "true":
                 for tool in tools:

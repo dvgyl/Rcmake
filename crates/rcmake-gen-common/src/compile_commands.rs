@@ -290,7 +290,16 @@ pub fn write_compile_commands(
     write_if_changed(host, &build_dir.join("compile_commands.json"), &content)
 }
 
-fn json_string(out: &mut BString, value: &[u8]) {
+/// Strip `cmake -E __run_co_compile ... --` wrapper prefix and compiler depfile
+/// flags (`-MD`, `-MMD`, `-MT`, `-MF`) from a shell compile command.
+#[must_use]
+pub fn clean_compile_shell(shell: &[u8]) -> BString {
+    compile_command(compiler_shell(shell), None)
+        .into_owned()
+        .into()
+}
+
+pub(crate) fn json_string(out: &mut BString, value: &[u8]) {
     out.push(b'"');
     for chunk in value.utf8_chunks() {
         // CMake's compile database stores valid UTF-8 directly and escapes JSON control,

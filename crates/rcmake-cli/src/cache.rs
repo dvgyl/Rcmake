@@ -398,6 +398,16 @@ pub(crate) fn save(host: &dyn Host, dir: &Path, cache: &Cache) -> HostResult<()>
         }
     }
     data.push(b'\n');
+    let dest = dir.join("CMakeCache.txt");
+    if let Ok(existing) = host.read(
+        &dest,
+        ReadRange::All {
+            limit: MAX_CACHE_BYTES,
+        },
+    ) && existing == data.as_slice()
+    {
+        return Ok(());
+    }
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let time = host.now();
     let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -408,7 +418,7 @@ pub(crate) fn save(host: &dyn Host, dir: &Path, cache: &Cache) -> HostResult<()>
         time.nanos
     ));
     host.write(&tmp, &data, WriteMode::CreateNew)?;
-    let result = host.rename(&tmp, &dir.join("CMakeCache.txt"));
+    let result = host.rename(&tmp, &dest);
     if result.is_err() {
         let _ = host.remove_file(&tmp);
     }
@@ -738,5 +748,40 @@ MULTI-ADVANCED:INTERNAL=1
         ] {
             assert_eq!(path(ty, "~/a;;b\\"), BString::from("~/a;;b\\"));
         }
+    }
+
+    #[test]
+    fn save_is_copy_if_different_preserving_mtime() {
+        let host = PureHost::default();
+        host.create_dir_all(Path::new("/b")).unwrap_or_default();
+        let mut cache = Cache::default();
+        cache.insert("FOO".into(), entry(CacheType::String, "one", "help"));
+        save(&host, Path::new("/b"), &cache).unwrap_or_else(|error| panic!("{error}"));
+        let first_mtime = host
+            .metadata(Path::new("/b/CMakeCache.txt"), rcmake_host::Follow::No)
+            .expect("first metadata")
+            .mtime;
+
+        host.sleep(std::time::Duration::from_secs(5));
+        save(&host, Path::new("/b"), &cache).unwrap_or_else(|error| panic!("{error}"));
+        let second_mtime = host
+            .metadata(Path::new("/b/CMakeCache.txt"), rcmake_host::Follow::No)
+            .expect("second metadata")
+            .mtime;
+        assert_eq!(
+            first_mtime, second_mtime,
+            "unchanged CMakeCache.txt save must preserve mtime"
+        );
+
+        cache.insert("FOO".into(), entry(CacheType::String, "two", "help"));
+        save(&host, Path::new("/b"), &cache).unwrap_or_else(|error| panic!("{error}"));
+        let third_mtime = host
+            .metadata(Path::new("/b/CMakeCache.txt"), rcmake_host::Follow::No)
+            .expect("third metadata")
+            .mtime;
+        assert_ne!(
+            first_mtime, third_mtime,
+            "modified CMakeCache.txt save must update mtime"
+        );
     }
 }

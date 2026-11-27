@@ -24,7 +24,8 @@ mod link;
 mod pch;
 mod render;
 
-use fallback::source_language;
+pub(crate) use extensions::CudaConfig;
+pub(crate) use fallback::source_language;
 pub(crate) use render::render;
 
 pub(crate) struct Context<'a> {
@@ -75,7 +76,7 @@ impl Kind {
         }
     }
 
-    fn compiles(self) -> bool {
+    pub(crate) fn compiles(self) -> bool {
         matches!(self, Self::Compile | Self::Cuda | Self::Masm | Self::Nasm)
     }
 
@@ -94,42 +95,42 @@ pub(crate) struct Item {
     pub(crate) path: String,
     pub(crate) group: String,
     pub(crate) synthetic: bool,
-    configs: BTreeMap<String, SourceConfig>,
+    pub(crate) configs: BTreeMap<String, SourceConfig>,
 }
 
 #[derive(Default)]
-struct SourceConfig {
-    excluded: bool,
-    language: String,
-    object: String,
-    compile: Option<flags_table::Settings>,
-    tool_compile: Option<IdeCompileSettings>,
-    rule: Option<Rule>,
+pub(crate) struct SourceConfig {
+    pub(crate) excluded: bool,
+    pub(crate) language: String,
+    pub(crate) object: String,
+    pub(crate) compile: Option<flags_table::Settings>,
+    pub(crate) tool_compile: Option<IdeCompileSettings>,
+    pub(crate) rule: Option<Rule>,
 }
 
 #[derive(Default)]
 pub(crate) struct Plan {
     pub(crate) items: BTreeMap<(Kind, String), Item>,
-    configs: BTreeMap<String, Config>,
+    pub(crate) configs: BTreeMap<String, Config>,
 }
 
 #[derive(Default)]
-struct Config {
-    compile: flags_table::Settings,
-    resource: flags_table::Settings,
-    link: flags_table::Settings,
-    link_output_dirs: Vec<String>,
-    events: [Vec<Rule>; 3],
-    dir: String,
-    int_dir: String,
-    name: String,
-    extension: String,
-    gui: bool,
-    link_incremental: Option<String>,
-    generate_manifest: Option<String>,
-    debugger: Vec<(&'static str, String)>,
-    dpi_aware: Option<&'static str>,
-    cuda: Option<extensions::CudaConfig>,
+pub(crate) struct Config {
+    pub(crate) compile: flags_table::Settings,
+    pub(crate) resource: flags_table::Settings,
+    pub(crate) link: flags_table::Settings,
+    pub(crate) link_output_dirs: Vec<String>,
+    pub(crate) events: [Vec<Rule>; 3],
+    pub(crate) dir: String,
+    pub(crate) int_dir: String,
+    pub(crate) name: String,
+    pub(crate) extension: String,
+    pub(crate) gui: bool,
+    pub(crate) link_incremental: Option<String>,
+    pub(crate) generate_manifest: Option<String>,
+    pub(crate) debugger: Vec<(&'static str, String)>,
+    pub(crate) dpi_aware: Option<&'static str>,
+    pub(crate) cuda: Option<extensions::CudaConfig>,
 }
 
 impl Plan {

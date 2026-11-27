@@ -256,7 +256,7 @@ fn windows_multi_config_clean_uses_make_program_and_selected_paths()
         configs,
         ..GenerationResult::default()
     };
-    generate_multi(&result, &host, dir, Some(&model), windows())?;
+    generate_multi(&result, &host, dir, Some(&model), windows(), None)?;
     let manifest = read(&host, "CMakeFiles/impl-Debug.ninja");
     assert!(manifest.contains(
         r#" /C "cmake -E rm -rf -- "/work/build/extra Debug.txt" && "C:/Ninja Tools/ninja.exe" -f CMakeFiles/impl-Debug.ninja -t clean CMakeFiles/rcmake-clean:Debug""#

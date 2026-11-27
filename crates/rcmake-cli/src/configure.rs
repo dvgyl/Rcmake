@@ -117,6 +117,7 @@ struct ConfigureSession<'a> {
     list_file: BString,
     preset: presets::Application,
     profiling: Profilers,
+    drift: crate::drift::Tracker,
 }
 
 struct Configured {
@@ -144,6 +145,7 @@ struct RetainedInner {
     list_file: BString,
     preset: presets::Application,
     profiling: Profilers,
+    drift: crate::drift::Tracker,
     runtime: ConfigureRuntime,
     interp: Interp,
     configured: Configured,
@@ -170,9 +172,13 @@ impl RetainedConfigure {
             list_file: inner.list_file,
             preset: inner.preset,
             profiling: inner.profiling,
+            drift: inner.drift,
         };
         let outcome = session.generate(&mut inner.interp, inner.configured, &mut inner.results);
         let finish = inner.runtime.finish(outcome.is_ok() && !session.opts.view);
+        session
+            .drift
+            .finish(outcome.is_ok() && finish.is_none() && !session.opts.view);
         let outcome = match (outcome, finish) {
             (Ok(()), Some(err)) => {
                 inner.interp.cx().issue(
@@ -329,6 +335,7 @@ pub(crate) fn configure_only(
             if preloads.missing {
                 return Err(Exit::Code(1));
             }
+            session.drift.check(interp.cx().cache(), !has_cache);
             session.configure(
                 &mut runtime,
                 &mut interp,
@@ -364,6 +371,7 @@ pub(crate) fn configure_only(
                     list_file,
                     preset,
                     profiling,
+                    drift,
                     ..
                 } = session;
                 return Ok(RetainedConfigure {
@@ -376,6 +384,7 @@ pub(crate) fn configure_only(
                         list_file,
                         preset,
                         profiling,
+                        drift,
                         runtime,
                         interp,
                         configured,
@@ -460,6 +469,7 @@ fn configure_project(
                 }
             }
             ran = true;
+            session.drift.check(interp.cx().cache(), !has_cache);
             let configured = session.configure(
                 &mut runtime,
                 &mut interp,
@@ -489,6 +499,9 @@ fn configure_project(
             continue;
         }
         let finish = runtime.finish(outcome.is_ok() && !session.opts.view);
+        session
+            .drift
+            .finish(outcome.is_ok() && finish.is_none() && !session.opts.view);
         let outcome = match (outcome, finish) {
             (Ok(()), Some(error)) => {
                 interp.cx().issue(
@@ -595,6 +608,14 @@ impl<'a> ConfigureSession<'a> {
             );
         }
         let bin = bin.unwrap_or(cwd);
+        // Read the drift baseline before a cache cleanup can remove it.
+        let drift = crate::drift::Tracker::begin(
+            &host,
+            opts.persona == Persona::Native,
+            opts.view,
+            &bin,
+            &src,
+        );
         if opts.fresh && !opts.view {
             cache_setup::clear(host.as_ref(), &bin).map_err(|err| {
                 Exit::Message(format!(
@@ -627,6 +648,7 @@ impl<'a> ConfigureSession<'a> {
                 list_file,
                 preset,
                 profiling,
+                drift,
             },
             saved,
         ))
@@ -1023,6 +1045,9 @@ impl<'a> ConfigureSession<'a> {
         }
         cache::save(host, &self.bin, interp.cx().cache())
             .map_err(|err| Exit::Message(format!("Could not write CMakeCache.txt: {err}")))?;
+        if generated {
+            self.drift.generated(interp.cx().cache());
+        }
         if generated && !queries.is_empty() {
             rcmake_instrument::hooks::run_hook(
                 host,

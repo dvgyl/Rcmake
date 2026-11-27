@@ -24,10 +24,11 @@ bin_dir = package / "bin"
 tool_names = ("rcmake", "cmake", "ctest", "cpack") if windows else ("rcmake", "cmake", "ctest", "cpack", "ccmake")
 tools = [bin_dir / (tool + suffix) for tool in tool_names]
 lsp = bin_dir / ("rcmake-lsp" + suffix)
-executables = [*tools, lsp]
+verify_bin = bin_dir / ("rcmake-verify" + suffix)
+executables = [*tools, lsp, verify_bin]
 expected_count = "four" if windows else "five"
 if set(bin_dir.iterdir()) != set(executables) or not all(tool.is_file() for tool in executables):
-    sys.exit(f"Expected the {expected_count} CLI entry points and rcmake-lsp in the extracted package.")
+    sys.exit(f"Expected the {expected_count} CLI entry points, rcmake-lsp, and rcmake-verify in the extracted package.")
 
 for notice in (
     "LICENSE-MIT",
@@ -139,6 +140,14 @@ if not replies.get(1, {}).get("result", {}).get("capabilities") or (
         "result" not in replies.get(2, {}) or replies[2]["result"] is not None):
     sys.exit("The packaged rcmake-lsp failed the initialize or shutdown request.")
 print("Verified rcmake-lsp initialize and shutdown.")
+
+verify_version = subprocess.check_output([verify_bin, "--version"], env=env, text=True, timeout=15)
+if not verify_version.startswith("rcmake-verify "):
+    sys.exit(f"Unexpected version output from {verify_bin.name}. Found {verify_version}")
+print(verify_version, end="", flush=True)
+rcmake_bin = bin_dir / ("rcmake" + suffix)
+subprocess.run([rcmake_bin, "verify", "--help"], env=env, check=True, timeout=15,
+               stdout=subprocess.DEVNULL)
 
 with TemporaryDirectory(prefix="rcmake-release-smoke-") as temporary:
     source = Path(temporary)
@@ -277,7 +286,7 @@ done
 export CARGO_ENCODED_RUSTFLAGS="$flags"
 unset RUSTFLAGS
 
-cargo build --locked --release -p rcmake-cli --bin rcmake --target "$target" --target-dir "$target_dir"
+cargo build --locked --release -p rcmake-cli --bin rcmake -p rcmake-harness --bin rcmake-verify --target "$target" --target-dir "$target_dir"
 
 name="rcmake-$version-$target"
 work="$(mktemp -d "$out_dir/.rcmake-dist.XXXXXXXX")"
@@ -296,6 +305,7 @@ package = work / name
 bin_dir = package / "bin"
 bin_dir.mkdir(parents=True)
 shutil.copyfile(binaries / "rcmake", bin_dir / "rcmake")
+shutil.copyfile(binaries / "rcmake-verify", bin_dir / "rcmake-verify")
 for tool in ("cmake", "ctest", "cpack", "ccmake", "rcmake-lsp"):
     (bin_dir / tool).symlink_to("rcmake")
 ignore = shutil.ignore_patterns("._*", ".DS_Store")
@@ -319,7 +329,7 @@ def normalize(member):
     member.uname = member.gname = ""
     if member.issym():
         member.mode = 0o777
-    elif member.isdir() or member.name == f"{name}/bin/rcmake" or (member.mode & 0o111):
+    elif member.isdir() or member.name in (f"{name}/bin/rcmake", f"{name}/bin/rcmake-verify") or (member.mode & 0o111):
         member.mode = 0o755
     else:
         member.mode = 0o644

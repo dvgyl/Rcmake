@@ -224,7 +224,7 @@ fn sorted_blobs(mut blobs: Vec<Digest>) -> Vec<Digest> {
     blobs.dedup();
     blobs
 }
-pub(super) fn decode_entry<T: FromJson>(
+pub(crate) fn decode_entry<T: FromJson>(
     kind: CacheEntryKind,
     key: Digest,
     encoded: &[u8],
@@ -309,7 +309,7 @@ fn publish_pinned(
     }
     Ok(true)
 }
-pub(super) fn read_frame(store: &Store<'_>, path: &Path, limit: usize) -> FrameResult {
+pub(crate) fn read_frame(store: &Store<'_>, path: &Path, limit: usize) -> FrameResult {
     if store
         .file_metadata(path)
         .map_err(|_| LOCAL_STORE)?
@@ -324,7 +324,7 @@ pub(super) fn read_frame(store: &Store<'_>, path: &Path, limit: usize) -> FrameR
         Err(_) => Err(LOCAL_STORE),
     }
 }
-pub(super) fn decode_blob(
+pub(crate) fn decode_blob(
     encoded: &[u8],
     digest: Digest,
     budget: &mut usize,

@@ -19,11 +19,13 @@ mod create;
 mod external_filter;
 mod extract;
 mod pattern;
+mod portable;
 mod seven_zip;
 mod tar_budget;
 mod timestamp;
 mod zip_codec;
 
+pub use portable::{PortableLimits, PortableMember, PortableName, read_portable, write_portable};
 pub use timestamp::parse_archive_mtime;
 
 #[cfg(test)]

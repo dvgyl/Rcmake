@@ -110,7 +110,7 @@ jobs:
           )
           Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
           $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]31
-          cargo build --locked --release -p rcmake-cli --bin rcmake --target $env:RELEASE_TARGET --target-dir $targetDir
+          cargo build --locked --release -p rcmake-cli --bin rcmake -p rcmake-harness --bin rcmake-verify --target $env:RELEASE_TARGET --target-dir $targetDir
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $binaries = "$targetDir/$env:RELEASE_TARGET/release"
@@ -122,6 +122,7 @@ jobs:
             foreach ($tool in 'rcmake', 'cmake', 'ctest', 'cpack', 'rcmake-lsp') {
               Copy-Item "$binaries/rcmake.exe" "$package/bin/$tool.exe"
             }
+            Copy-Item "$binaries/rcmake-verify.exe" "$package/bin/rcmake-verify.exe"
             Copy-Item modules/cmake-4.5 "$package/share/" -Recurse
             Copy-Item completions/rcmake.ps1 "$package/share/rcmake/completions/rcmake.ps1"
             Copy-Item third_party/licences "$package/third_party/" -Recurse

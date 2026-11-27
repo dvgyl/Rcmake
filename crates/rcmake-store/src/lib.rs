@@ -7,6 +7,7 @@ mod digest;
 mod entry_publish;
 mod frame;
 mod gc;
+mod portable;
 mod private_dir;
 pub mod remote;
 mod stamp;
@@ -29,6 +30,7 @@ use rcmake_json::{
 
 pub use digest::{Digest, Domain, KeyHasher};
 pub use gc::{GcReport, StoreStats, gc};
+pub use portable::{ExportSkips, ImportError, ImportReport, ImportTrust, ProbeBundle, ProbeExport};
 pub use private_dir::{PrivateDir, canonical_path, ensure_private_dir, verify_private_dir};
 pub use stamp::{
     FastStat, InputStamp, MissReason, Trace, TraceMemo, TreePolicy, VerifyOutcome,
@@ -239,6 +241,8 @@ enum TestEvent {
     InvalidRead,
     BeforeRemove,
     FallbackRename,
+    ImportStep,
+    ImportBlobsStaged,
 }
 
 #[cfg(test)]
@@ -466,7 +470,11 @@ impl<'a> Store<'a> {
         else {
             return Ok(None);
         };
-        if !self.entry_matches(&entry, blob_limit, diagnose)? {
+        if !self.entry_matches(&entry, blob_limit, diagnose)?
+            && !(domain == Domain::ProbeV1
+                && self.recover_from_candidate(key, &entry)
+                && self.entry_matches(&entry, blob_limit, diagnose)?)
+        {
             return Ok(None);
         }
         if self.writable() {

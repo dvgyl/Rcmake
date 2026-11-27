@@ -2,18 +2,21 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use rcmake_gen_common::{
     GenError,
+    compile_commands_native::MultiConfigCompileDatabase,
     ide::{UtilityKind, project_roots, utility_targets},
     write_output,
 };
 use rcmake_host::{Host, path::to_native};
-use rcmake_model::{DirId, GeneratorKind, ProjectModel};
+use rcmake_model::{DirId, GeneratorKind, ProjectModel, TargetId};
 use rcmake_resolve::GenerationResult;
 
 pub mod build;
+mod compile_db;
 #[allow(
     dead_code,
     reason = "The language activation wave uses this emitter or planner"
@@ -47,6 +50,22 @@ pub fn generate(
     host: &dyn Host,
     bin: &Path,
 ) -> Result<(), GenError> {
+    generate_with_compile_db(result, model, host, bin, None).map(drop)
+}
+
+/// Write the Xcode project files of `result` into `bin` and, when `export_targets` is
+/// `Some`, collect per-configuration native compile database rows.
+///
+/// # Errors
+///
+/// Returns an error if the project data is invalid or an output cannot be written.
+pub fn generate_with_compile_db(
+    result: &GenerationResult,
+    model: &ProjectModel,
+    host: &dyn Host,
+    bin: &Path,
+    export_targets: Option<&HashSet<TargetId>>,
+) -> Result<Option<MultiConfigCompileDatabase>, GenError> {
     for (dir, _) in model.dirs() {
         validate_link_phase_mode(model.definition(dir, b"CMAKE_XCODE_LINK_BUILD_PHASE_MODE"))?;
     }
@@ -79,7 +98,10 @@ pub fn generate(
             verify_globs,
         )?;
     }
-    Ok(())
+    let db = export_targets
+        .map(|selected| compile_db::collect(result, model, host, bin, &indices, selected))
+        .transpose()?;
+    Ok(db)
 }
 
 fn validate_link_phase_mode(mode: Option<&rcmake_base::BString>) -> Result<(), GenError> {

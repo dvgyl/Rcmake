@@ -18,7 +18,7 @@ function Show-Usage {
 Usage: install.ps1 [-Version <version>] [-Prefix <dir>] [-Archive <path>] [-AliasCmake] [-Force]
        install.ps1 -Uninstall [-Prefix <dir>]
 
-Install rcmake.exe and rcmake-lsp.exe into <Prefix>\bin, the bundled CMake 4.5.1
+Install rcmake.exe, rcmake-lsp.exe, and rcmake-verify.exe into <Prefix>\bin, the bundled CMake 4.5.1
 data into <Prefix>\share\cmake-4.5, licences and third-party notices into
 <Prefix>\share\doc\rcmake, and the PowerShell completion script into
 <Prefix>\share\rcmake\completions\rcmake.ps1 when present in the archive.
@@ -33,7 +33,7 @@ Options:
                      from rcmake.exe (hardlink, falling back to copy).
   -Force             Allow replacement of unmarked share\cmake-4.5 data.
                      With -AliasCmake, also replace existing aliases.
-  -Uninstall         Remove rcmake.exe, rcmake-lsp.exe, rcmake-owned aliases,
+  -Uninstall         Remove rcmake.exe, rcmake-lsp.exe, rcmake-verify.exe, rcmake-owned aliases,
                      managed share\cmake-4.5 data, share\doc\rcmake, and
                      share\rcmake\completions\rcmake.ps1 from Prefix.
   -Help              Show this help.
@@ -251,7 +251,7 @@ function Expand-RcmakeArchive {
 
             $relParts = @($parts[1..($parts.Length - 1)])
             $relPosix = $relParts -join '/'
-            $isBinary = ($relPosix -ceq 'bin/rcmake.exe') -or ($relPosix -ceq 'bin/rcmake-lsp.exe')
+            $isBinary = ($relPosix -ceq 'bin/rcmake.exe') -or ($relPosix -ceq 'bin/rcmake-lsp.exe') -or ($relPosix -ceq 'bin/rcmake-verify.exe')
             $isData = ($relPosix -ceq 'share/cmake-4.5') -or $relPosix.StartsWith('share/cmake-4.5/', [StringComparison]::Ordinal)
             $isCompletion = ($relPosix -ceq 'share/rcmake/completions/rcmake.ps1')
             $isDocFile = ($relPosix -ceq 'LICENSE-APACHE') -or ($relPosix -ceq 'LICENSE-MIT') -or ($relPosix -ceq 'THIRD_PARTY_NOTICES.md')
@@ -408,6 +408,7 @@ $completionDir = Join-Path (Join-Path (Join-Path $prefixFull 'share') 'rcmake') 
 $completionPath = Join-Path $completionDir 'rcmake.ps1'
 $rcmakePath = Join-Path $binDir 'rcmake.exe'
 $lspPath = Join-Path $binDir 'rcmake-lsp.exe'
+$verifyPath = Join-Path $binDir 'rcmake-verify.exe'
 $tools = @('cmake.exe', 'ctest.exe', 'cpack.exe')
 
 function Test-ManagedData {
@@ -469,7 +470,7 @@ if ($Uninstall) {
         }
     }
 
-    foreach ($binaryPath in @($rcmakePath, $lspPath)) {
+    foreach ($binaryPath in @($rcmakePath, $lspPath, $verifyPath)) {
         $item = Get-ItemOrNull -Path $binaryPath
         if ($null -ne $item -and -not $item.PSIsContainer) {
             Remove-Item -LiteralPath $binaryPath -Force
@@ -702,6 +703,8 @@ try {
     }
     $stagedLsp = Join-Path (Join-Path $stageWork 'bin') 'rcmake-lsp.exe'
     $hasLsp = Test-Path -LiteralPath $stagedLsp -PathType Leaf
+    $stagedVerify = Join-Path (Join-Path $stageWork 'bin') 'rcmake-verify.exe'
+    $hasVerify = Test-Path -LiteralPath $stagedVerify -PathType Leaf
     $stagedCompletion = Join-Path (Join-Path (Join-Path (Join-Path $stageWork 'share') 'rcmake') 'completions') 'rcmake.ps1'
     $hasCompletion = Test-Path -LiteralPath $stagedCompletion -PathType Leaf
     $stagedDoc = Join-Path (Join-Path (Join-Path $stageWork 'share') 'doc') 'rcmake'
@@ -744,6 +747,7 @@ try {
     foreach ($checkTarget in @(
         @{ Path = $rcmakePath; Present = $true },
         @{ Path = $lspPath; Present = $hasLsp },
+        @{ Path = $verifyPath; Present = $hasVerify },
         @{ Path = $completionPath; Present = $hasCompletion }
     )) {
         if ($checkTarget.Present) {
@@ -823,6 +827,12 @@ try {
             & $backupDestination $lspPath
             Move-Item -LiteralPath $stagedLsp -Destination $lspPath -Force
             $installed += $lspPath
+        }
+
+        if ($hasVerify) {
+            & $backupDestination $verifyPath
+            Move-Item -LiteralPath $stagedVerify -Destination $verifyPath -Force
+            $installed += $verifyPath
         }
 
         $aliasesToWrite = if ($AliasCmake) { $tools } else { $existingOwnedAliases }

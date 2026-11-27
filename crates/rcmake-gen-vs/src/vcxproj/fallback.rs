@@ -488,7 +488,7 @@ impl Context<'_> {
     }
 }
 
-pub(super) fn source_language(path: &str) -> &'static str {
+pub(crate) fn source_language(path: &str) -> &'static str {
     if path.to_ascii_lowercase().ends_with(".c") {
         "C"
     } else {

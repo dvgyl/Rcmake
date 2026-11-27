@@ -2,10 +2,12 @@ use std::{collections::HashSet, path::Path};
 
 use rcmake_base::{BString, list};
 use rcmake_diag::{RenderOptions, format_paragraphs};
-use rcmake_gen_common::{GenError, export::write_module_exports, write_if_changed};
+use rcmake_gen_common::{
+    GenError, compile_commands_native::MultiConfigCompileDatabase, export::write_module_exports,
+};
 use rcmake_genex::ConfigId;
 use rcmake_host::{Host, path};
-use rcmake_model::{DirId, ProjectModel};
+use rcmake_model::{DirId, ProjectModel, TargetId};
 use rcmake_resolve::GenerationResult;
 
 use crate::graph::{self, Graph, qualified};
@@ -29,7 +31,8 @@ pub(super) fn generate_multi(
     build_dir: &Path,
     model: Option<&ProjectModel>,
     commands: Commands,
-) -> Result<(), GenError> {
+    export_targets: Option<&HashSet<TargetId>>,
+) -> Result<Option<MultiConfigCompileDatabase>, GenError> {
     let prefix = output_prefix(model, &commands);
     let mut configs = Vec::new();
     let mut names = HashSet::new();
@@ -242,7 +245,7 @@ pub(super) fn generate_multi(
             verify_globs.then_some(programs.cmake.as_slice()),
             has_cache,
         );
-        write_if_changed(
+        crate::write_always(
             host,
             &build_dir.join(path::to_native(&files.implementation)),
             &ninja.0,
@@ -270,10 +273,13 @@ pub(super) fn generate_multi(
             )?;
         }
     }
-    Ok(())
+    let db = export_targets.map(|selected| {
+        crate::compile_db::collect(&configs, selection.default, build_dir, selected)
+    });
+    Ok(db)
 }
 
-struct ConfigFiles {
+pub(crate) struct ConfigFiles {
     entry: BString,
     implementation: BString,
     prep: PrepTargets,
@@ -326,7 +332,7 @@ fn write_entry(
     if graph.prefix.is_empty() {
         ninja.0.extend_from_slice(b"default all\n");
     }
-    write_if_changed(host, &build_dir.join(path::to_native(entry)), &ninja.0)
+    crate::write_always(host, &build_dir.join(path::to_native(entry)), &ninja.0)
 }
 
 pub(crate) struct Selection {

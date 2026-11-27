@@ -15,7 +15,7 @@ use rcmake_host::{Host, Stream};
 use crate::persona::Persona;
 use crate::{Tool, help};
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use session::run_with_terminal;
 
 /// Entry point for the `ccmake` tool persona.

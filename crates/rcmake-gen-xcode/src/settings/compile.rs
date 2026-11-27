@@ -363,7 +363,11 @@ pub(crate) fn supported(language: &[u8]) -> bool {
         .any(|(family, _)| family.contains(&language))
 }
 
-fn implicit_includes(model: &ProjectModel, dir: DirId, language: &[u8]) -> BTreeSet<BString> {
+pub(crate) fn implicit_includes(
+    model: &ProjectModel,
+    dir: DirId,
+    language: &[u8],
+) -> BTreeSet<BString> {
     let key = [b"CMAKE_", language, b"_IMPLICIT_INCLUDE_DIRECTORIES"].concat();
     let mut set: BTreeSet<BString> = model
         .definition(dir, &key)
@@ -396,7 +400,7 @@ fn normalize_include_key(path: &[u8]) -> BString {
     }
 }
 
-fn is_implicit_include(path: &[u8], implicit: &BTreeSet<BString>) -> bool {
+pub(crate) fn is_implicit_include(path: &[u8], implicit: &BTreeSet<BString>) -> bool {
     implicit.contains(&normalize_include_key(path))
 }
 

@@ -25,7 +25,8 @@ mod manifest;
 
 pub use manifest::{CacheEntryKind, CacheManifest, ManifestEntry, export_blob, export_entry};
 
-use manifest::{attach_blobs, decode_blob, decode_entry, read_frame, valid_record};
+use manifest::{attach_blobs, valid_record};
+pub(crate) use manifest::{decode_blob, decode_entry, read_frame};
 
 const PROBE_BLOB_BYTES: usize = 16 * 1024 * 1024;
 const SESSION_BLOB_BYTES: usize = 64 * 1024 * 1024;

@@ -5,6 +5,7 @@
 mod build;
 mod clean;
 mod commands;
+mod compile_db;
 mod cuda;
 mod fortran;
 mod graph;
@@ -28,10 +29,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use rcmake_base::BString;
+use rcmake_gen_common::compile_commands_native::MultiConfigCompileDatabase;
 use rcmake_gen_common::export::write_module_exports;
 use rcmake_gen_common::{GenError, write_if_changed};
-use rcmake_host::{FileKind, Follow, Host, path};
-use rcmake_model::{DirId, ProjectModel};
+use rcmake_host::{FileKind, Follow, Host, WriteMode, path};
+use rcmake_model::{DirId, ProjectModel, TargetId};
 use rcmake_resolve::{ArtifactSet, BuildGraph, BuildStep, GenerationResult};
 
 use commands::Commands;
@@ -259,7 +261,15 @@ fn generate_single(
         &programs.ninja,
         !graph.clean_files.is_empty(),
     )?;
-    write_if_changed(host, &build_dir.join("build.ninja"), &ninja.0)
+    write_always(host, &build_dir.join("build.ninja"), &ninja.0)
+}
+
+pub(crate) fn write_always(host: &dyn Host, target: &Path, content: &[u8]) -> Result<(), GenError> {
+    host.write(target, content, WriteMode::Truncate)
+        .map_err(|error| GenError::Write {
+            path: path::from_native(target),
+            message: error.to_string().into(),
+        })
 }
 
 /// Write a Ninja entry file and implementation file for each configuration.
@@ -277,7 +287,7 @@ pub fn generate_multi_config(
     host: &dyn Host,
     build_dir: &Path,
 ) -> Result<(), GenError> {
-    multi::generate_multi(result, host, build_dir, None, Commands::new(host))
+    multi::generate_multi(result, host, build_dir, None, Commands::new(host), None).map(drop)
 }
 
 /// Write Ninja Multi-Config manifests with test preparation targets from the
@@ -292,7 +302,39 @@ pub fn generate_multi_config_with_model(
     build_dir: &Path,
     model: &ProjectModel,
 ) -> Result<(), GenError> {
-    multi::generate_multi(result, host, build_dir, Some(model), Commands::new(host))
+    multi::generate_multi(
+        result,
+        host,
+        build_dir,
+        Some(model),
+        Commands::new(host),
+        None,
+    )
+    .map(drop)
+}
+
+/// Write Ninja Multi-Config manifests and, when `export_targets` is `Some`, collect
+/// per-configuration native compile database rows using the generator's selected default
+/// configuration.
+///
+/// # Errors
+///
+/// Returns an error if input resolution fails or the host cannot write a file.
+pub fn generate_multi_config_with_compile_db(
+    result: &GenerationResult,
+    host: &dyn Host,
+    build_dir: &Path,
+    model: &ProjectModel,
+    export_targets: Option<&HashSet<TargetId>>,
+) -> Result<Option<MultiConfigCompileDatabase>, GenError> {
+    multi::generate_multi(
+        result,
+        host,
+        build_dir,
+        Some(model),
+        Commands::new(host),
+        export_targets,
+    )
 }
 
 fn config_artifacts<'a>(
