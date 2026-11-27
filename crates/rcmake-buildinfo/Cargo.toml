@@ -1,0 +1,17 @@
+[package]
+name = "rcmake-buildinfo"
+description = "Bounded readers and comparators for CMake File API, cache, and compile database artifacts."
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rcmake-base.workspace = true
+rcmake-host.workspace = true
+rcmake-json.workspace = true
+
+[lints]
+workspace = true

@@ -17,7 +17,9 @@ path = "src/main.rs"
 
 [dependencies]
 jiff.workspace = true
+rcmake-archive.workspace = true
 rcmake-base.workspace = true
+rcmake-buildinfo.workspace = true
 rcmake-api = { workspace = true, features = ["native", "archive"] }
 rcmake-commands = { workspace = true, features = ["native", "archive"] }
 rcmake-ccmake.workspace = true
@@ -33,6 +35,7 @@ rcmake-genex.workspace = true
 rcmake-host.workspace = true
 rcmake-instrument.workspace = true
 rcmake-json.workspace = true
+rcmake-language-tools.workspace = true
 rcmake-lsp = { workspace = true, features = ["eval", "stdio"] }
 rcmake-model.workspace = true
 rcmake-presets.workspace = true

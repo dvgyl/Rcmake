@@ -13,6 +13,7 @@ members = [
     "crates/rcmake-eval",
     "crates/rcmake-resolve",
     "crates/rcmake-build",
+    "crates/rcmake-buildinfo",
     "crates/rcmake-presets",
     "crates/rcmake-archive",
     "crates/rcmake-commands",
@@ -25,6 +26,7 @@ members = [
     "crates/rcmake-fortran",
     "crates/rcmake-store",
     "crates/rcmake-fetch",
+    "crates/rcmake-language-tools",
     "crates/rcmake-lsp",
     "crates/rcmake-instrument",
     "crates/rcmake-cpack",
@@ -90,6 +92,7 @@ rcmake-tool-e = { path = "crates/rcmake-tool-e" }
 rcmake-genex = { path = "crates/rcmake-genex" }
 rcmake-resolve = { path = "crates/rcmake-resolve" }
 rcmake-build = { path = "crates/rcmake-build" }
+rcmake-buildinfo = { path = "crates/rcmake-buildinfo" }
 rcmake-gen-common = { path = "crates/rcmake-gen-common" }
 rcmake-gen-ninja = { path = "crates/rcmake-gen-ninja" }
 rcmake-gen-make = { path = "crates/rcmake-gen-make" }
@@ -101,6 +104,7 @@ rcmake-cxxmodules = { path = "crates/rcmake-cxxmodules" }
 rcmake-fortran = { path = "crates/rcmake-fortran" }
 rcmake-store = { path = "crates/rcmake-store" }
 rcmake-fetch = { path = "crates/rcmake-fetch", default-features = false }
+rcmake-language-tools = { path = "crates/rcmake-language-tools" }
 rcmake-lsp = { path = "crates/rcmake-lsp", default-features = false }
 rcmake-instrument = { path = "crates/rcmake-instrument" }
 rcmake-cpack = { path = "crates/rcmake-cpack" }
@@ -162,6 +166,9 @@ opt-level = "z"
 [profile.release.package.ppmd-turbo]
 opt-level = "z"
 
+[profile.release.package.rcmake-buildinfo]
+opt-level = "z"
+
 [profile.release.package.rcmake-cpack]
 opt-level = "z"
 
@@ -169,6 +176,9 @@ opt-level = "z"
 opt-level = "z"
 
 [profile.release.package.rcmake-dap]
+opt-level = "z"
+
+[profile.release.package.rcmake-language-tools]
 opt-level = "z"
 
 [profile.release.package.rcmake-cps]

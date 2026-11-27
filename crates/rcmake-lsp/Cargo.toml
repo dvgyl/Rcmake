@@ -24,6 +24,7 @@ rcmake-diag.workspace = true
 rcmake-genex = { workspace = true, optional = true }
 rcmake-host.workspace = true
 rcmake-json.workspace = true
+rcmake-language-tools.workspace = true
 rcmake-model = { workspace = true, optional = true }
 rcmake-resolve = { workspace = true, optional = true }
 rcmake-syntax.workspace = true

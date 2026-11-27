@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod binfmt;
+pub mod cmdline;
 pub mod curl;
 pub mod hash;
 pub mod limits;

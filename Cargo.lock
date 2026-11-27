@@ -559,6 +559,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcmake-buildinfo"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-host",
+ "rcmake-json",
+]
+
+[[package]]
 name = "rcmake-ccmake"
 version = "0.1.0"
 dependencies = [
@@ -573,7 +582,9 @@ version = "0.1.0"
 dependencies = [
  "jiff",
  "rcmake-api",
+ "rcmake-archive",
  "rcmake-base",
+ "rcmake-buildinfo",
  "rcmake-ccmake",
  "rcmake-commands",
  "rcmake-cpack",
@@ -590,6 +601,7 @@ dependencies = [
  "rcmake-host",
  "rcmake-instrument",
  "rcmake-json",
+ "rcmake-language-tools",
  "rcmake-lsp",
  "rcmake-model",
  "rcmake-presets",
@@ -851,6 +863,10 @@ dependencies = [
 name = "rcmake-harness"
 version = "0.1.0"
 dependencies = [
+ "rcmake-base",
+ "rcmake-buildinfo",
+ "rcmake-host",
+ "rcmake-json",
  "serde",
  "serde_json",
  "similar",
@@ -890,6 +906,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcmake-language-tools"
+version = "0.1.0"
+dependencies = [
+ "rcmake-base",
+ "rcmake-diag",
+ "rcmake-expr",
+ "rcmake-host",
+ "rcmake-json",
+ "rcmake-syntax",
+ "similar",
+]
+
+[[package]]
 name = "rcmake-lsp"
 version = "0.1.0"
 dependencies = [
@@ -900,6 +929,7 @@ dependencies = [
  "rcmake-genex",
  "rcmake-host",
  "rcmake-json",
+ "rcmake-language-tools",
  "rcmake-model",
  "rcmake-resolve",
  "rcmake-syntax",

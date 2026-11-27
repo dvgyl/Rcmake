@@ -13,7 +13,7 @@ use rcmake_model::{
     BT, ImportedVisibility, LinkItem, Target, TargetKind, TargetOrigin, UsageField,
 };
 
-use crate::vars_list::separate::Arguments;
+use rcmake_base::cmdline::Arguments;
 
 use self::options::{Mode, Request, Settings};
 use self::pc::{InvalidFile, Package, matches_version, requirements, version_part};

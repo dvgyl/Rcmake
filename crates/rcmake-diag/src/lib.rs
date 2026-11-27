@@ -13,6 +13,7 @@ pub mod policy;
 mod policy_warnings;
 pub mod render;
 pub mod rich;
+pub mod sarif;
 mod sarif_location;
 pub mod source;
 pub mod suggest;

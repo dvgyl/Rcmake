@@ -9,13 +9,16 @@ mod configure;
 #[cfg(test)]
 mod ctest;
 mod debugger;
+mod diff_config_cmd;
 mod exec_log;
 mod explain_cmd;
 mod find_package;
+mod fmt_cmd;
 mod generate;
 mod help;
 mod install;
 mod instrumentation;
+mod lint_cmd;
 mod make_depends;
 mod open;
 mod options;
@@ -26,6 +29,7 @@ mod profile;
 mod resource;
 mod sarif;
 mod system_information;
+mod verify_cmd;
 mod workflow;
 
 #[cfg(test)]
@@ -255,15 +259,22 @@ fn run_cmake(
 ) -> i32 {
     if persona == persona::Persona::Native {
         if let [command, args @ ..] = rest
-            && matches!(command.as_slice(), b"doctor" | b"cache")
+            && matches!(
+                command.as_slice(),
+                b"doctor" | b"cache" | b"diff-config" | b"fmt" | b"lint" | b"verify"
+            )
             && !host
                 .metadata(&resolve_cli_path(host.as_ref(), command), Follow::Yes)
                 .is_ok_and(|meta| meta.kind == FileKind::Dir)
         {
-            return if command == b"doctor" {
-                probe_cache::doctor(argv.first(), args, host.as_ref())
-            } else {
-                probe_cache::cache(args, host.as_ref())
+            return match command.as_slice() {
+                b"doctor" => probe_cache::doctor(argv.first(), args, host.as_ref()),
+                b"cache" => probe_cache::cache(args, host.as_ref()),
+                b"diff-config" => diff_config_cmd::run(argv.first(), args, host),
+                b"fmt" => fmt_cmd::run(argv.first(), args, host),
+                b"lint" => lint_cmd::run(argv.first(), args, host),
+                b"verify" => verify_cmd::run(argv.first(), args, host),
+                _ => 2,
             };
         }
         if let Some(args) = rest.strip_prefix(&[BString::from("explain")]) {

@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use rcmake_base::cmdline::Arguments;
 use rcmake_base::{BString, list};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow};
 use rcmake_expr::ExpandedArg;
@@ -146,84 +147,3 @@ pub(crate) fn find_program(cx: &Cx<'_>, token: &[u8]) -> Option<BString> {
     }
     None
 }
-
-pub(crate) struct Arguments<'a> {
-    input: &'a [u8],
-    offset: usize,
-    windows: bool,
-}
-
-impl<'a> Arguments<'a> {
-    pub(crate) fn new(input: &'a [u8], windows: bool) -> Self {
-        Self {
-            input,
-            offset: 0,
-            windows,
-        }
-    }
-
-    fn rest(&self) -> &'a [u8] {
-        self.input.get(self.offset..).unwrap_or_default()
-    }
-}
-
-impl Iterator for Arguments<'_> {
-    type Item = BString;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut input = self.rest().iter().copied().peekable();
-        let mut consumed = 0;
-        while input.peek().is_some_and(|byte| space(*byte)) {
-            input.next();
-            consumed += 1;
-        }
-        input.peek()?;
-        let mut quote = None;
-        let mut quoted = false;
-        let mut token = Vec::new();
-        while let Some(byte) = input.next_if(|byte| quote.is_some() || !space(*byte)) {
-            consumed += 1;
-            match byte {
-                b'\\' if !self.windows => {
-                    if let Some(escaped) = input.next() {
-                        token.push(escaped);
-                        consumed += 1;
-                    }
-                }
-                b'\\' => {
-                    let mut slashes = 1;
-                    while input.next_if_eq(&b'\\').is_some() {
-                        consumed += 1;
-                        slashes += 1;
-                    }
-                    if input.next_if_eq(&b'"').is_some() {
-                        consumed += 1;
-                        token.extend(std::iter::repeat_n(b'\\', slashes / 2));
-                        if slashes % 2 == 0 {
-                            quote = if quote.is_some() { None } else { Some(b'"') };
-                        } else {
-                            token.push(b'"');
-                        }
-                    } else {
-                        token.extend(std::iter::repeat_n(b'\\', slashes));
-                    }
-                }
-                b'"' | b'\'' if byte == b'"' || !self.windows => {
-                    quoted = true;
-                    if quote == Some(byte) {
-                        quote = None;
-                    } else if quote.is_none() {
-                        quote = Some(byte);
-                    } else {
-                        token.push(byte);
-                    }
-                }
-                _ => token.push(byte),
-            }
-        }
-        self.offset += consumed;
-        (quoted || !token.is_empty()).then(|| token.into())
-    }
-}
-
-use rcmake_base::list_ops::is_space as space;

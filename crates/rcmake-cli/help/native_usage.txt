@@ -1,11 +1,20 @@
 
 rcmake extensions
   rcmake explain <name> [-B <build-dir>] [--target|--var]
+                 [--flag|--define|--include|--dep <val>]
                  [--config <cfg>] [--filter <val>] [--json]
                  [--verbose] [--color=auto|always|never]
-  rcmake doctor               Show tool paths and probe cache status.
-  rcmake cache [status|dir|clear]
-                               Inspect or clear the cache.
+  rcmake explain --find <pkg> | why-not <pkg> [-B <build-dir>] [--json]
+  rcmake explain --eval '<genex>' [-B <build-dir>] [--target <t>] [--config <cfg>]
+  rcmake diff-config <dirA> <dirB> [--config <cfg>] [--section <name>] [--json]
+  rcmake fmt [--check] [--diff] [--stdin] [paths...]
+  rcmake lint [--sarif] [paths...]
+  rcmake verify [--json] --oracle <path> -- <configure args>
+  rcmake doctor [-B <build-dir>]
+                               Show tool paths, probe cache, and build drift.
+  rcmake cache [status|dir|clear|export <file>|import <file> [--sha256 <hex>]]
+                               Inspect, clear, export, or import probe cache.
+  rcmake ccmake [options]      Start the interactive cache editor TUI.
   rcmake ctest [options]       Run the bundled ctest driver.
   rcmake cpack [options]       Run the bundled cpack driver.
   rcmake lsp [options]         Start the CMake language server over stdio.
@@ -14,6 +23,8 @@ rcmake extensions
                                stacks.folded in <dir>, and keep each run in
                                <dir>/run-*. Default: rcmake-profile in build.
   --no-probe-cache             Disable the probe cache for this configure.
+  --export-compile-commands    Export compile_commands.json (and per-config
+                               databases for multi-config generators).
   --fetch-lock=off|auto|update|frozen
                                Select the fetch lock mode.
   --hermetic[=warn|strict]     Check for undeclared inputs. The default mode

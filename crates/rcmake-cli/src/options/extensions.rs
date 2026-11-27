@@ -57,6 +57,8 @@ pub(crate) struct RcmakeExt {
     pub(crate) fetch_lock: Option<FetchLockMode>,
     /// Hermetic mode requested on the command line.
     pub(crate) hermetic: Option<HermeticMode>,
+    /// Export compile commands (including per-config multi-config databases in Native mode).
+    pub(crate) export_compile_commands: bool,
 }
 
 /// `true` if the Native extension `flag` (without its value) also applies in `-P`
@@ -126,6 +128,10 @@ pub(crate) fn parse_native_extension_flag(
                 Some(b"strict") => HermeticMode::Strict,
                 _ => return Err("Use --hermetic=warn or --hermetic=strict.".into()),
             });
+        }
+        b"--export-compile-commands" if value.is_none() => ext.export_compile_commands = true,
+        b"--export-compile-commands" => {
+            return Err("Use --export-compile-commands without a value.".into());
         }
         _ => return Ok(false),
     }
