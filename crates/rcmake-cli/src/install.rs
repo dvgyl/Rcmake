@@ -234,7 +234,7 @@ fn install(
         argv.first(),
         shim_handoff,
     );
-    let command = path::from_native(&cmake_command);
+    let command = path::from_native_cmake(&cmake_command);
     let index = match parallel::Index::load(host.as_ref(), &opts.dir) {
         Ok(Some(index)) if index.parallel => {
             return parallel::run(&opts, host.as_ref(), index, &command).unwrap_or_else(|error| {

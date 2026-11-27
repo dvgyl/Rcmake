@@ -400,7 +400,11 @@ def check_project(args, source: Path, work: Path, compat: Path, native: Path,
     """Compare stable output and report whether parallel workers ran."""
     work.mkdir()
     env = {**env, "RCMAKE_MEASURE_PROBE_INTERVALS": "1"}
-    paths = {compat: "<cmake-command>", native: "<cmake-command>"}
+    paths = {
+        compat: "<cmake-command>",
+        compat.parent.resolve() / compat.name: "<cmake-command>",
+        native: "<cmake-command>",
+    }
     build = work / "compat-jobs-1"
     streams = configure(args, compat, source, build, {**env, "RCMAKE_PROBE_JOBS": "1"})
     baseline = snapshot(build, paths)

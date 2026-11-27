@@ -2961,6 +2961,10 @@ fn swift_split_build_emits_all_three_audit_11_ninja_edges_and_rsp()
     let dir = Path::new("/work/build");
     let mut model = ProjectModel::default();
     model.set_root_dirs("/work/src".into(), "/work/build".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_HOST_SYSTEM_NAME".into(), "Linux".into());
     model.generator = Some(GeneratorKind::Ninja);
     model
         .global
@@ -3824,6 +3828,10 @@ fn single_config_utility_events_emit_util_suffix_and_per_event_cd_chaining()
     let dir = Path::new("/work/build");
     let mut model = ProjectModel::default();
     model.set_root_dirs("/work/src".into(), "/work/build".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_HOST_SYSTEM_NAME".into(), "Linux".into());
     model.generator = Some(GeneratorKind::Ninja);
 
     let u0 = model.add_target(Target::new(
@@ -3936,6 +3944,10 @@ fn orphan_custom_output_command_emits_no_ninja_edge() -> Result<(), Box<dyn std:
     let dir = Path::new("/work/build");
     let mut model = ProjectModel::default();
     model.set_root_dirs("/work/src".into(), "/work/build".into());
+    model
+        .dir_mut(DirId::ROOT)
+        .vars
+        .insert("CMAKE_HOST_SYSTEM_NAME".into(), "Linux".into());
     model.generator = Some(GeneratorKind::Ninja);
 
     let mut orphan = CustomCommand::new(

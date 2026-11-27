@@ -1022,7 +1022,7 @@ fn order_runtime_directories(
             continue;
         };
         for (idx_b, (dir_b, _)) in dirs.iter().enumerate() {
-            if idx_b == idx_a || !Lexical::new(dir_b).absolute() {
+            if idx_b == idx_a || (!dir_b.starts_with(b"/") && !Lexical::new(dir_b).absolute()) {
                 continue;
             }
             let conflict = *exists_cache

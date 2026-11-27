@@ -520,6 +520,8 @@ mod tests {
             model.generator = Some(generator);
             model.set_root_dirs("/src".into(), "/out".into());
             let root = model.dir_mut(DirId::ROOT);
+            root.vars
+                .insert("CMAKE_HOST_SYSTEM_NAME".into(), "Linux".into());
             root.vars.insert("CMAKE_C_COMPILER".into(), "cc".into());
             if let Some(flags) = flags {
                 root.vars.insert("CMAKE_C_FLAGS".into(), flags.into());

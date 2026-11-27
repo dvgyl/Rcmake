@@ -707,6 +707,7 @@ fn link_what_you_use_adds_the_flag_and_check_for_ninja_and_make() -> TestResult 
         let (mut model, host) = fixture("Linux")?;
         model.generator = Some(generator);
         for (name, value) in [
+            ("CMAKE_HOST_SYSTEM_NAME", "Linux"),
             ("CMAKE_C_LINK_WHAT_YOU_USE_FLAG", "-Wl,--no-as-needed"),
             ("CMAKE_LINK_WHAT_YOU_USE_CHECK", "ldd;-u;-r"),
         ] {

@@ -155,11 +155,19 @@ impl PlatformQueries {
         let Ok(mut memo) = self.0.lock() else {
             return;
         };
-        let digest = query_env_fingerprint(env);
+        let fixed_digest = query_env_fingerprint(env);
+        let full_digest = environment_fingerprint(env);
         let pending: Vec<_> = memo
             .0
             .iter()
-            .filter(|(query, _)| query.fixed_path && query.env != digest)
+            .filter(|(query, _)| {
+                let expected = if query.fixed_path {
+                    fixed_digest
+                } else {
+                    full_digest
+                };
+                query.env != expected
+            })
             .map(|(_, observation)| RunRequest {
                 env: env.to_vec(),
                 ..observation.request.clone()
@@ -176,7 +184,7 @@ impl PlatformQueries {
         for xcrun in [false, true] {
             let mut ready: Vec<(Query, RunRequest)> = Vec::new();
             for request in pending.iter().filter(|request| is_xcrun(request) == xcrun) {
-                let Some(key) = query(host, request).filter(|key| key.fixed_path) else {
+                let Some(key) = query(host, request) else {
                     continue;
                 };
                 if key.is_absent() {
@@ -2570,39 +2578,40 @@ mod tests {
             .ok_or_else(|| rcmake_host::HostError::unsupported("base snapshot"))?;
         assert_eq!(base_snap.0.len(), 6);
 
-        // Switching locale to `C` (as `CMakeDetermineCompilerABI.cmake` does)
-        // must reuse all 5 fixed-path queries with zero extra process spawns and
-        // must NOT eagerly spawn `brew` or alias `brew` across locale changes.
+        // Before refresh, switching locale to `C` (as `CMakeDetermineCompilerABI.cmake`
+        // does) reuses all 5 fixed-path queries without aliasing `brew`.
+        let locale_snap_before = queries
+            .snapshot(host.as_ref(), &locale_c_env)
+            .ok_or_else(|| rcmake_host::HostError::unsupported("locale snapshot before refresh"))?;
+        assert_eq!(locale_snap_before.0.len(), 5);
+        assert!(
+            locale_snap_before.0.keys().all(|k| k.fixed_path),
+            "brew must not alias into a different-locale snapshot"
+        );
+        // `refresh()` spawns ZERO fixed-path tools on a locale toggle while re-sampling
+        // already-observed PATH-selected `brew` in the new environment so try_compile
+        // children keep pure probe-cache eligibility.
         queries.refresh(host.as_ref(), &locale_c_env);
-        assert_eq!(runs.load(Ordering::SeqCst), 6);
-        assert_eq!(brew_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 7);
+        assert_eq!(brew_runs.load(Ordering::SeqCst), 2);
         let locale_snap = queries
             .snapshot(host.as_ref(), &locale_c_env)
             .ok_or_else(|| rcmake_host::HostError::unsupported("locale snapshot"))?;
-        assert_eq!(locale_snap.0.len(), 5);
-        assert!(
-            locale_snap.0.keys().all(|k| k.fixed_path),
-            "brew must not alias into a different-locale snapshot"
-        );
+        assert_eq!(locale_snap.0.len(), 6);
 
         // Non-locale env changes are not served from the old snapshot, and refresh()
-        // refreshes ONLY fixed-path native tools — never eagerly launching `brew`.
+        // re-samples all previously observed queries under the new environment.
         let custom_snap_before = queries
             .snapshot(host.as_ref(), &custom_env)
             .ok_or_else(|| rcmake_host::HostError::unsupported("custom snapshot before refresh"))?;
         assert!(custom_snap_before.0.is_empty());
         queries.refresh(host.as_ref(), &custom_env);
-        assert_eq!(
-            brew_runs.load(Ordering::SeqCst),
-            1,
-            "refresh() must never eagerly spawn PATH-selected brew"
-        );
-        assert_eq!(runs.load(Ordering::SeqCst), 11);
+        assert_eq!(brew_runs.load(Ordering::SeqCst), 3);
+        assert_eq!(runs.load(Ordering::SeqCst), 13);
         let custom_snap_after = queries
             .snapshot(host.as_ref(), &custom_env)
             .ok_or_else(|| rcmake_host::HostError::unsupported("custom snapshot after refresh"))?;
-        assert_eq!(custom_snap_after.0.len(), 5);
-        assert!(custom_snap_after.0.keys().all(|k| k.fixed_path));
+        assert_eq!(custom_snap_after.0.len(), 6);
         Ok(())
     }
 }
