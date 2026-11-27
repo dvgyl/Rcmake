@@ -176,6 +176,7 @@ impl Graph<'_> {
                 }
             }
             if let Some(&producer) = self.producers.get(alias)
+                && target.steps.contains(&producer)
                 && let Some(nodes) = self.steps.get_mut(producer)
             {
                 // A real output can also be the target name, such as a root executable.

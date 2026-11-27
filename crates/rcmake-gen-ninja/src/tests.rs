@@ -4546,12 +4546,141 @@ fn link_event_byproducts_custom_byproducts_dup_depends_and_assumed_source()
         build.contains("  restat = 1\n"),
         "link edge with event byproducts must set restat = 1:\n{build}"
     );
-    // Assumed generated source has 1 output and depends on cmake_object_order_depends_target_<name>.
+    // Assumed generated source keeps its normalized absolute path (matching CMake 4.5.1's
+    // `RunCMake/Ninja/AssumedSources` rule) and depends on `cmake_object_order_depends_target_<name>`.
     assert!(
         build.contains(
-            "build gen/sqlite3.c: phony || cmake_object_order_depends_target_btop_test\n"
+            "build CMakeFiles/btop_test.dir/sqlite3.c.o: COMPILE /work/build/gen/sqlite3.c || cmake_object_order_depends_target_btop_test\n"
         ),
         "{build}"
+    );
+    assert!(
+        build.contains(
+            "build /work/build/gen/sqlite3.c: phony || cmake_object_order_depends_target_btop_test\n"
+        ),
+        "{build}"
+    );
+    Ok(())
+}
+
+#[test]
+fn colliding_output_name_does_not_leak_order_only_deps_across_targets()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rcmake_model::{DirId, ProjectModel, Target, TargetKind, TargetOrigin};
+
+    let host = PureHost::default();
+    let dir = Path::new("/work/build");
+    let mut model = ProjectModel::default();
+    model.set_root_dirs("/work/src".into(), "/work/build".into());
+    let obj_id = model.add_target(Target::new(
+        "duckdb_obj".into(),
+        TargetKind::ObjectLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    ))?;
+    let lib_id = model.add_target(Target::new(
+        "duckdb".into(),
+        TargetKind::SharedLibrary,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    ))?;
+    let shell_id = model.add_target(Target::new(
+        "shell".into(),
+        TargetKind::Executable,
+        TargetOrigin::Normal,
+        DirId::ROOT,
+        Default::default(),
+        Default::default(),
+    ))?;
+
+    let graph = BuildGraph {
+        steps: vec![
+            BuildStep::Compile {
+                source: "/work/src/obj.cpp".into(),
+                compile_input: None,
+                object: "CMakeFiles/duckdb_obj.dir/obj.cpp.o".into(),
+                byproducts: Vec::new(),
+                invocation: Invocation {
+                    shell: "c++ -c /work/src/obj.cpp -o CMakeFiles/duckdb_obj.dir/obj.cpp.o".into(),
+                    ..Default::default()
+                },
+                depfile: None,
+                dyndep: None,
+                modmap: None,
+            },
+            BuildStep::Link {
+                inputs: vec!["CMakeFiles/duckdb_obj.dir/obj.cpp.o".into()],
+                implicit_inputs: Vec::new(),
+                step: LinkStep {
+                    kind: LinkKind::SharedLibrary,
+                    language: "CXX".into(),
+                    fragments: Vec::new(),
+                    output: "src/libduckdb.so".into(),
+                },
+                invocations: vec![Invocation {
+                    shell: "c++ -shared CMakeFiles/duckdb_obj.dir/obj.cpp.o -o src/libduckdb.so"
+                        .into(),
+                    ..Default::default()
+                }],
+            },
+            BuildStep::Link {
+                inputs: vec!["CMakeFiles/shell.dir/shell.cpp.o".into()],
+                implicit_inputs: vec!["src/libduckdb.so".into()],
+                step: LinkStep {
+                    kind: LinkKind::Executable,
+                    language: "CXX".into(),
+                    fragments: Vec::new(),
+                    output: "duckdb".into(),
+                },
+                invocations: vec![Invocation {
+                    shell: "c++ CMakeFiles/shell.dir/shell.cpp.o -o duckdb src/libduckdb.so".into(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        targets: vec![
+            GraphTarget {
+                name: "duckdb_obj".into(),
+                steps: vec![0],
+                depends: Vec::new(),
+                in_all: true,
+            },
+            GraphTarget {
+                name: "duckdb".into(),
+                steps: vec![1],
+                depends: vec![0],
+                in_all: true,
+            },
+            GraphTarget {
+                name: "shell".into(),
+                steps: vec![2],
+                depends: vec![1],
+                in_all: true,
+            },
+        ],
+        target_ids: vec![obj_id, lib_id, shell_id],
+        ..BuildGraph::default()
+    };
+    let result = GenerationResult {
+        graphs: vec![graph],
+        ..GenerationResult::default()
+    };
+    super::generate_single_config_with_model(&result, &host, dir, &model)?;
+    let build = read(&host, "build.ninja");
+
+    let shell_edge = build
+        .lines()
+        .find(|line| line.starts_with("build duckdb: LINK_EXECUTABLE"))
+        .expect("shell link edge");
+    assert!(
+        !shell_edge.contains("duckdb_obj")
+            && !shell_edge.contains("obj.cpp.o")
+            && shell_edge.ends_with("|| src/libduckdb.so"),
+        "shared library `duckdb` must not attach its dependencies to `shell`'s output `duckdb`: {shell_edge}"
     );
     Ok(())
 }

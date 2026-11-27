@@ -188,11 +188,13 @@ impl<'a> Graph<'a> {
                     }
                 };
                 let response_rule_name = rule.clone();
-                let mut plan = EdgePlan::new(
-                    rule,
-                    vec![self.node(compile_input.as_ref().unwrap_or(source))],
-                    nodes,
-                );
+                let raw_source = compile_input.as_ref().unwrap_or(source);
+                let source_node = if self.assumed_sources.contains(raw_source) {
+                    self.commands.path(raw_source)
+                } else {
+                    self.node(raw_source)
+                };
+                let mut plan = EdgePlan::new(rule, vec![source_node], nodes);
                 plan.implicit_inputs
                     .extend(modmap.iter().map(|map| self.node(map)));
                 plan.implicit_inputs.extend(
@@ -277,7 +279,12 @@ impl<'a> Graph<'a> {
                     (false, true) => b"CXX_SCAN_RSP_NO_DEPFILE",
                     (false, false) => b"CXX_SCAN_NO_DEPFILE",
                 };
-                let mut plan = EdgePlan::new(rule, vec![self.node(source)], nodes);
+                let source_node = if self.assumed_sources.contains(source) {
+                    self.commands.path(source)
+                } else {
+                    self.node(source)
+                };
+                let mut plan = EdgePlan::new(rule, vec![source_node], nodes);
                 plan.implicit_inputs.extend(
                     self.compile_inputs
                         .and_then(|inputs| inputs.get(object))

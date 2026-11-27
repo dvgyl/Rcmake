@@ -8,7 +8,7 @@ use rcmake_base::{BString, path_lex::Lexical, truth};
 use rcmake_gen_common::GenError;
 use rcmake_gen_common::export::ModuleExportJob;
 use rcmake_host::{Follow, Host, path};
-use rcmake_model::{DirId, ProjectModel, TargetKind};
+use rcmake_model::{DirId, ProjectModel, PropScope, TargetKind};
 use rcmake_resolve::{
     ArtifactSet, BuildGraph, BuildStep, GenerationResult, LinkFragmentRole, LinkKind, LinkStep,
     ScanResponse, progress,
@@ -128,6 +128,7 @@ pub(crate) struct Graph<'a> {
     extra_aliases: BTreeMap<BString, Vec<BString>>,
     artifact_targets: HashSet<usize>,
     producers: HashMap<BString, usize>,
+    assumed_sources: HashSet<BString>,
     generated_inputs: HashMap<BString, BString>,
     pub(crate) pools: HashMap<BString, BString>,
     steps: Vec<StepNodes<'a>>,
@@ -244,6 +245,7 @@ impl<'a> Graph<'a> {
             extra_aliases: BTreeMap::new(),
             artifact_targets: HashSet::new(),
             producers: HashMap::with_capacity(input.steps.len()),
+            assumed_sources: HashSet::new(),
             generated_inputs: HashMap::new(),
             pools: HashMap::new(),
             steps: Vec::with_capacity(input.steps.len()),
@@ -620,8 +622,45 @@ impl<'a> Graph<'a> {
         }
         graph.disambiguate_aliases();
         graph.compute_target_artifacts(artifacts, model);
+        graph.collect_assumed_sources(model);
         graph.connect_targets()?;
         Ok(graph)
+    }
+
+    fn collect_assumed_sources(&mut self, model: Option<&ProjectModel>) {
+        let Some(model) = model else { return };
+        for target in &self.input.targets {
+            let Some(target_id) = model.find_target(DirId::ROOT, &target.name) else {
+                continue;
+            };
+            let Some(owner) = model.target(target_id) else {
+                continue;
+            };
+            for &index in &target.steps {
+                let Some(BuildStep::Compile { source, .. } | BuildStep::Scan { source, .. }) =
+                    self.input.steps.get(index)
+                else {
+                    continue;
+                };
+                if self.has_target(&self.node(source))
+                    || self.has_target(&self.commands.path(source))
+                {
+                    continue;
+                }
+                if model
+                    .get_prop(
+                        &PropScope::Source {
+                            dir: owner.dir,
+                            path: source.clone(),
+                        },
+                        b"GENERATED",
+                    )
+                    .is_some_and(|value| truth::is_on(&value))
+                {
+                    self.assumed_sources.insert(source.clone());
+                }
+            }
+        }
     }
 
     fn compute_target_artifacts(

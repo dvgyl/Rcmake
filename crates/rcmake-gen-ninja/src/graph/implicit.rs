@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use rcmake_base::{BString, truth};
-use rcmake_model::{CommandId, DirId, ProjectModel, PropScope, TargetId};
+use rcmake_base::BString;
+use rcmake_model::{CommandId, ProjectModel, TargetId};
 use rcmake_resolve::BuildStep;
 
 use super::{Graph, OrderOnly};
@@ -181,33 +181,19 @@ impl Graph<'_> {
         nodes
     }
 
-    pub(crate) fn emit_assumed_sources(&self, ninja: &mut Ninja, model: Option<&ProjectModel>) {
-        let Some(model) = model else { return };
+    pub(crate) fn emit_assumed_sources(&self, ninja: &mut Ninja, _model: Option<&ProjectModel>) {
+        if self.assumed_sources.is_empty() {
+            return;
+        }
         let mut sources = BTreeMap::<&BString, BTreeSet<&BString>>::new();
         for target in &self.input.targets {
-            let Some(target_id) = model.find_target(DirId::ROOT, &target.name) else {
-                continue;
-            };
-            let Some(owner) = model.target(target_id) else {
-                continue;
-            };
             for &index in &target.steps {
                 let Some(BuildStep::Compile { source, .. } | BuildStep::Scan { source, .. }) =
                     self.input.steps.get(index)
                 else {
                     continue;
                 };
-                if self.has_target(&self.node(source))
-                    || !model
-                        .get_prop(
-                            &PropScope::Source {
-                                dir: owner.dir,
-                                path: source.clone(),
-                            },
-                            b"GENERATED",
-                        )
-                        .is_some_and(|value| truth::is_on(&value))
-                {
+                if !self.assumed_sources.contains(source) {
                     continue;
                 }
                 let inputs = sources.entry(source).or_default();
@@ -231,7 +217,7 @@ impl Graph<'_> {
             }
         }
         for (source, inputs) in sources {
-            let outputs = [self.node(source)];
+            let outputs = [self.commands.path(source)];
             ninja.edge(
                 b"phony",
                 Edge {
