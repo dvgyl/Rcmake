@@ -868,8 +868,8 @@ mod tests {
 
     fn seeded_store(host: &PureHost, dir: &str) -> HostResult<rcmake_store::Digest> {
         use rcmake_store::{Domain, Entry};
-        let root = format!("/work/{dir}");
-        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(root.as_bytes()));
+        let root = path::from_native_cmake(&host.initial_cwd().join(dir));
+        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(root.as_slice()));
         let store = open(host)?;
         let blob = store.put_blob(b"artifact")?;
         let key = Domain::ProbeV1.key(b"probe");
@@ -903,15 +903,14 @@ mod tests {
         )?;
         assert_eq!(rcmake_store::Digest::hash(&archive).to_hex(), digest);
 
-        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(b"/work/consumer"));
+        let consumer = host.initial_cwd().join("consumer");
+        let consumer_env = path::from_native_cmake(&consumer);
+        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(consumer_env.as_slice()));
         let wrong = "0".repeat(64);
         let (code, _, err) = run(&host, &["import", "probes.tar.gz", "--sha256", &wrong]);
         assert_eq!(code, 1);
         assert!(err.contains("Nothing was imported."), "{err}");
-        assert!(
-            host.metadata(Path::new("/work/consumer"), Follow::No)
-                .is_err()
-        );
+        assert!(host.metadata(&consumer, Follow::No).is_err());
 
         let flag = format!("--sha256={digest}");
         let (code, out, err) = run(&host, &["import", &flag, "probes.tar.gz"]);
@@ -940,7 +939,8 @@ mod tests {
         let host = PureHost::default();
         let key = seeded_store(&host, "producer")?;
         assert_eq!(run(&host, &["export", "probes.tar.gz"]).0, 0);
-        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(b"/work/consumer"));
+        let consumer = path::from_native_cmake(&host.initial_cwd().join("consumer"));
+        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(consumer.as_slice()));
         let (code, out, _) = run(&host, &["import", "probes.tar.gz"]);
         assert_eq!(code, 0);
         assert!(out.contains("Staged: 1."), "{out}");
@@ -961,8 +961,9 @@ mod tests {
     fn cache_export_and_import_reject_bad_operands() -> HostResult<()> {
         let host = PureHost::default();
         seeded_store(&host, "producer")?;
-        // A full operand keeps POSIX test paths free of the Windows separator from `Path::join`.
-        let (code, _, err) = run(&host, &["export", "/work/producer/probes.tar.gz"]);
+        let inside = path::from_native_cmake(&host.initial_cwd().join("producer/probes.tar.gz"));
+        let inside_str = String::from_utf8_lossy(&inside).into_owned();
+        let (code, _, err) = run(&host, &["export", &inside_str]);
         assert_eq!(code, 1);
         assert!(err.contains("outside the cache directory"), "{err}");
         for args in [

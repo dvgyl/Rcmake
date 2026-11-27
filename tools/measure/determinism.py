@@ -409,7 +409,9 @@ def check_project(args, source: Path, work: Path, compat: Path, native: Path,
         raise ValueError("Parallel probe workers ran with RCMAKE_PROBE_JOBS=1.")
     if reference:
         build = work / "stderr-reference"
-        streams = configure(args, reference, source, build, env)
+        # Upstream CMake honors CLICOLOR_FORCE=1 even when CMAKE_COLOR_DIAGNOSTICS=OFF.
+        ref_env = {key: value for key, value in env.items() if key != "CLICOLOR_FORCE"}
+        streams = configure(args, reference, source, build, ref_env)
         reference_stderr = configure_streams(streams, build, {reference: "<cmake-command>"})["stderr"]
         compare({"stderr": reference_stderr}, {"stderr": baseline_streams["stderr"]}, "Compat jobs 1")
 

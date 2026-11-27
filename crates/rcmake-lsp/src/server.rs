@@ -1353,11 +1353,12 @@ mod tests {
 
     fn init_server(host: &PureHost) -> Server<'_> {
         let mut server = Server::new(host);
+        let root_uri = uri::file(&host.initial_cwd());
         let init = RpcMessage::Call {
             id: Some(RequestId::Int(1)),
             method: "initialize".to_owned(),
             params: object([
-                ("rootUri", Value::string("file:///work")),
+                ("rootUri", Value::string(root_uri)),
                 ("capabilities", object([])),
             ]),
         };
@@ -1410,18 +1411,15 @@ mod tests {
     #[test]
     fn broken_rcmake_toml_emits_show_message_warning_and_re_warns_after_watch_change() {
         let host = PureHost::default();
-        host.seed_file(
-            Path::new("/work/.rcmake.toml"),
-            b"[unknown_table]\nfoo = 1\n",
-        )
-        .unwrap();
+        let root = host.initial_cwd();
+        let toml_path = root.join(".rcmake.toml");
+        let lists_uri = uri::file(&root.join("CMakeLists.txt"));
+        let toml_uri = uri::file(&toml_path);
+        host.seed_file(&toml_path, b"[unknown_table]\nfoo = 1\n")
+            .unwrap();
         let mut server = init_server(&host);
 
-        let msgs = server.handle(did_open(
-            "file:///work/CMakeLists.txt",
-            1,
-            "project(Demo)\n",
-        ));
+        let msgs = server.handle(did_open(&lists_uri, 1, "project(Demo)\n"));
         let warnings: Vec<_> = msgs
             .iter()
             .filter(|m| matches!(m, RpcMessage::Call { id: None, method, .. } if method == "window/showMessage"))
@@ -1433,29 +1431,22 @@ mod tests {
         }
 
         // Subsequent edit without changing .rcmake.toml does not spam duplicate warnings.
-        let msgs2 = server.handle(did_change_full(
-            "file:///work/CMakeLists.txt",
-            2,
-            "project(Demo2)\n",
-        ));
+        let msgs2 = server.handle(did_change_full(&lists_uri, 2, "project(Demo2)\n"));
         assert!(
             !msgs2.iter().any(|m| matches!(m, RpcMessage::Call { id: None, method, .. } if method == "window/showMessage")),
             "duplicate warning should be suppressed: {msgs2:?}"
         );
 
         // Watched change to .rcmake.toml clears the dedup set so a new parse error warns again.
-        host.seed_file(
-            Path::new("/work/.rcmake.toml"),
-            b"[fmt]\nindent_width = 0\n",
-        )
-        .unwrap();
+        host.seed_file(&toml_path, b"[fmt]\nindent_width = 0\n")
+            .unwrap();
         let msgs3 = server.handle(RpcMessage::Call {
             id: None,
             method: "workspace/didChangeWatchedFiles".to_owned(),
             params: object([(
                 "changes",
                 Value::Array(vec![object([
-                    ("uri", Value::string("file:///work/.rcmake.toml")),
+                    ("uri", Value::string(toml_uri)),
                     ("type", Value::Int(2)),
                 ])]),
             )]),
@@ -1469,17 +1460,20 @@ mod tests {
     #[test]
     fn caller_refresh_prioritizes_edited_file_caps_sync_refreshes_and_shares_open_buffers() {
         let host = PureHost::default();
-        host.seed_file(Path::new("/work/shared.cmake"), b"set(SHARED_VAR 1)\n")
+        let root = host.initial_cwd();
+        let shared_path = root.join("shared.cmake");
+        let caller0_path = root.join("caller_00.cmake");
+        host.seed_file(&shared_path, b"set(SHARED_VAR 1)\n")
             .unwrap();
         let mut server = init_server(&host);
 
-        let shared_uri = "file:///work/shared.cmake";
-        let _ = server.handle(did_open(shared_uri, 1, "set(SHARED_VAR 1)\n"));
+        let shared_uri = uri::file(&shared_path);
+        let _ = server.handle(did_open(&shared_uri, 1, "set(SHARED_VAR 1)\n"));
 
         // Open more callers than MAX_SYNC_CALLER_REFRESHES that all include shared.cmake.
         let total_callers = MAX_SYNC_CALLER_REFRESHES + 8;
         for i in 0..total_callers {
-            let uri = format!("file:///work/caller_{i:02}.cmake");
+            let uri = uri::file(&root.join(format!("caller_{i:02}.cmake")));
             let _ = server.handle(did_open(
                 &uri,
                 1,
@@ -1488,16 +1482,17 @@ mod tests {
         }
 
         // Snapshot Arc entries for unchanged open documents are shared by pointer across edits.
+        let caller0_key = uri::path(&uri::file(&caller0_path)).expect("caller0 path");
         let caller0_before = server
             .open_buffers
-            .get(Path::new("/work/caller_00.cmake"))
+            .get(&caller0_key)
             .cloned()
             .expect("caller_00 in open_buffers");
 
-        let msgs = server.handle(did_change_full(shared_uri, 2, "set(OTHER 1)\n"));
+        let msgs = server.handle(did_change_full(&shared_uri, 2, "set(OTHER 1)\n"));
         let caller0_after = server
             .open_buffers
-            .get(Path::new("/work/caller_00.cmake"))
+            .get(&caller0_key)
             .cloned()
             .expect("caller_00 still in open_buffers");
         assert!(
@@ -1518,7 +1513,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(published_uris.first().copied(), Some(shared_uri));
+        assert_eq!(published_uris.first().copied(), Some(shared_uri.as_str()));
         assert_eq!(
             published_uris.len(),
             1 + MAX_SYNC_CALLER_REFRESHES,

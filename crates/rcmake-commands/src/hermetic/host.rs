@@ -121,11 +121,12 @@ impl Host for HermeticHost {
     }
 
     fn canonicalize(&self, path: &Path) -> HostResult<PathBuf> {
-        self.inner.canonicalize(&self.guard_path(path)?)
+        self.inner.canonicalize(&self.guard_metadata_path(path)?)
     }
 
     fn canonicalize_fresh(&self, path: &Path) -> HostResult<PathBuf> {
-        self.inner.canonicalize_fresh(&self.guard_path(path)?)
+        self.inner
+            .canonicalize_fresh(&self.guard_metadata_path(path)?)
     }
 
     fn set_permissions(&self, path: &Path, mode: u32) -> HostResult<()> {

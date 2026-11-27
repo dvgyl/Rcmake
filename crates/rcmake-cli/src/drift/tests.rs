@@ -517,8 +517,11 @@ fn a_relative_toolchain_file_uses_the_binary_then_the_source_directory() -> Test
         Lookup::Relative(&bases),
     );
     assert_eq!(
-        found.resolved,
-        Some(path::from_native(&tree.src.join("tc.cmake")))
+        found
+            .resolved
+            .as_deref()
+            .map(|p| rcmake_base::path_lex::cmake_style(p)),
+        Some(path::from_native_cmake(&tree.src.join("tc.cmake")))
     );
     tree.host.seed_file(&tree.bin.join("tc.cmake"), b"binary")?;
     let found = tool(
@@ -528,8 +531,11 @@ fn a_relative_toolchain_file_uses_the_binary_then_the_source_directory() -> Test
         Lookup::Relative(&bases),
     );
     assert_eq!(
-        found.resolved,
-        Some(path::from_native(&tree.bin.join("tc.cmake")))
+        found
+            .resolved
+            .as_deref()
+            .map(|p| rcmake_base::path_lex::cmake_style(p)),
+        Some(path::from_native_cmake(&tree.bin.join("tc.cmake")))
     );
     Ok(())
 }

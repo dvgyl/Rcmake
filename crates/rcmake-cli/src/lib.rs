@@ -1292,7 +1292,7 @@ mod tests {
         let host = rcmake_host::PureHost::default();
         assert_eq!(
             sibling_tool_argv0(Some(&BString::from("/opt/bin/rcmake")), "ctest", &host),
-            BString::from("/opt/bin/ctest")
+            rcmake_host::path::from_native(&Path::new("/opt/bin").join("ctest"))
         );
         assert_eq!(
             sibling_tool_argv0(Some(&BString::from("rcmake")), "cpack", &host),

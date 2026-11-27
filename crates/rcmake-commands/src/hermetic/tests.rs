@@ -1408,6 +1408,10 @@ fn strict_linux_standard_lib_dirs_are_metadata_only_and_reject_escaping_symlinks
         ErrorKind::NotFound
     );
     assert_eq!(
+        guarded.canonicalize(Path::new("/lib32")).unwrap_err().kind,
+        ErrorKind::NotFound
+    );
+    assert_eq!(
         guarded.metadata(Path::new("/usr/lib"), Follow::Yes)?.kind,
         FileKind::Dir
     );
