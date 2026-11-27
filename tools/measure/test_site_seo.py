@@ -438,7 +438,7 @@ class SiteSeoTests(unittest.TestCase):
         self.assertEqual(app.get("name"), "rcmake")
         self.assertEqual(app.get("applicationCategory"), "DeveloperApplication")
         self.assertEqual(app.get("operatingSystem"), "macOS, Linux, Windows, WebAssembly")
-        self.assertEqual(app.get("softwareVersion"), "0.1.0")
+        self.assertEqual(app.get("softwareVersion"), "0.2.0")
         self.assertEqual(
             app.get("license"),
             [

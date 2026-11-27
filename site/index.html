@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>rcmake, a drop-in CMake 4.5.1 replacement in safe Rust</title>
-  <meta name="description" content="rcmake replaces CMake 4.5.1 in safe Rust. One binary runs cmake, ctest, cpack, and rcmake-lsp with Ninja, Xcode, Visual Studio, explain, and WebAssembly.">
+  <meta name="description" content="rcmake replaces CMake 4.5.1 in safe Rust. One binary runs cmake, ccmake, ctest, cpack, and rcmake-lsp with Ninja, Xcode, Visual Studio, explain, fmt, lint, and Wasm.">
   <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f6f4f0" media="(prefers-color-scheme: light)">
@@ -14,17 +14,17 @@
   <meta property="og:site_name" content="rcmake">
   <meta property="og:type" content="website">
   <meta property="og:title" content="rcmake, a drop-in CMake 4.5.1 replacement in safe Rust">
-  <meta property="og:description" content="rcmake replaces CMake 4.5.1 in safe Rust. One binary runs cmake, ctest, cpack, and rcmake-lsp with Ninja, Xcode, Visual Studio, explain, and WebAssembly.">
+  <meta property="og:description" content="rcmake replaces CMake 4.5.1 in safe Rust. One binary runs cmake, ccmake, ctest, cpack, and rcmake-lsp with Ninja, Xcode, Visual Studio, explain, fmt, lint, and Wasm.">
   <meta property="og:url" content="https://rcmake.github.io/rcmake/">
   <meta property="og:image" content="https://rcmake.github.io/rcmake/assets/og-card.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, and cpack.">
+  <meta property="og:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ccmake, ctest, and cpack.">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="rcmake, a drop-in CMake 4.5.1 replacement in safe Rust">
-  <meta name="twitter:description" content="rcmake replaces CMake 4.5.1 in safe Rust. One binary runs cmake, ctest, cpack, and rcmake-lsp with Ninja, Xcode, Visual Studio, explain, and WebAssembly.">
+  <meta name="twitter:description" content="rcmake replaces CMake 4.5.1 in safe Rust. One binary runs cmake, ccmake, ctest, cpack, and rcmake-lsp with Ninja, Xcode, Visual Studio, explain, fmt, lint, and Wasm.">
   <meta name="twitter:image" content="https://rcmake.github.io/rcmake/assets/og-card.png">
-  <meta name="twitter:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, and cpack.">
+  <meta name="twitter:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ccmake, ctest, and cpack.">
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
   <link rel="stylesheet" href="./styles.css">
   <script type="application/ld+json">
@@ -43,12 +43,12 @@
           "@type": "SoftwareApplication",
           "@id": "https://rcmake.github.io/rcmake/#software",
           "name": "rcmake",
-          "alternateName": ["rcmake-lsp", "Rcmake"],
-          "description": "rcmake is an independent drop-in reimplementation of CMake 4.5.1 in safe Rust. One binary runs as cmake, ctest, and cpack, reads existing CMakeLists.txt files, presets, and caches, and writes compatible build trees.",
+          "alternateName": ["rcmake-lsp", "ccmake", "rcmake-verify"],
+          "description": "rcmake is an independent drop-in reimplementation of CMake 4.5.1 in safe Rust. One binary runs as cmake, ccmake on Unix, ctest, cpack, and rcmake-lsp, reading existing CMakeLists.txt files, presets, and caches and writing compatible build trees.",
           "url": "https://rcmake.github.io/rcmake/",
           "applicationCategory": "DeveloperApplication",
           "operatingSystem": "macOS, Linux, Windows, WebAssembly",
-          "softwareVersion": "0.1.0",
+          "softwareVersion": "0.2.0",
           "license": [
             "https://spdx.org/licenses/MIT.html",
             "https://spdx.org/licenses/Apache-2.0.html"
@@ -63,15 +63,13 @@
             "priceCurrency": "USD"
           },
           "featureList": [
-            "One binary runs cmake, ctest, cpack, and rcmake-lsp with CMake 4.5.1 compatibility",
-            "Generates build trees for Ninja, Ninja Multi-Config, Unix Makefiles, Xcode, Visual Studio 17 2022, and Visual Studio 18 2026",
-            "Implements policies CMP0000 to CMP0226, Presets schema v13, File API codemodel v2.12, CPS 0.15.0, SPDX 3.0.1 SBOM, Instrumentation API v1, and SARIF 2.1.0 diagnostics",
-            "Caches verified compiler probe results across projects using SHA-256 input checks and runs up to four compile probes in parallel",
-            "Replays unchanged directory subtrees during incremental reconfigures",
-            "Traces target flags and variable provenance with rcmake explain in terminal text or JSON",
-            "Profiles configure runs with --profile to write trace.json, stacks.folded, and flamegraph.html",
-            "Audits configure inputs with --hermetic and pins FetchContent dependencies with --fetch-lock",
-            "Serves CMakeLists.txt and *.cmake files over stdio through rcmake-lsp or rcmake lsp",
+            "One binary runs cmake, Unix ccmake, ctest, cpack, and rcmake-lsp with CMake 4.5.1 compatibility",
+            "Generates Ninja, Ninja Multi-Config, Unix Makefiles, Xcode, Visual Studio 17 2022, and Visual Studio 18 2026 build trees",
+            "Supports policies CMP0000 to CMP0226, Presets v13, File API codemodel v2.12, CPS 0.15.0, SPDX 3.0.1 SBOM, Instrumentation API v1, Unix --debugger DAP, and SARIF 2.1.0",
+            "Supports C, C++20 named modules, Objective-C, Fortran, CUDA, HIP, Swift, Qt AUTOGEN, and CPack archives plus productbuild, NSIS, NSIS64, WIX, and IFW",
+            "Caches verified compiler probes across projects with portable CI cache export and import plus sound incremental replay under toolchains and presets",
+            "Includes rcmake explain, rcmake diff-config, lossless rcmake fmt, 8-rule rcmake lint, isolated rcmake verify, rcmake doctor drift detection, and multi-config compile_commands.json",
+            "Profiles configures with --profile, audits inputs with --hermetic, and pins dependencies with --fetch-lock",
             "Provides an in-process Rust API in rcmake-api and compiles to wasm32-unknown-unknown and wasm32-wasip1"
           ]
         },
@@ -84,7 +82,7 @@
               "name": "Is rcmake a drop-in replacement for CMake 4.5.1?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "Yes. A single rcmake binary inspects argv[0] to run as cmake, ctest, or cpack. It reads existing CMakeLists.txt files, Presets v13, and CMakeCache.txt, then writes compatible build trees. When you start it as cmake, ctest, or cpack, or set RCMAKE_ORACLE_MODE=1, it enters compatibility mode and matches CMake 4.5.1 behavior and diagnostics."
+                "text": "Yes. A single rcmake binary inspects argv[0] to run as cmake, ccmake on Unix, ctest, cpack, or rcmake-lsp. It reads existing CMakeLists.txt files, Presets v13, and CMakeCache.txt, then writes compatible build trees. Starting it as cmake, ccmake, ctest, or cpack, or setting RCMAKE_ORACLE_MODE=1, selects compatibility mode matching CMake 4.5.1."
               }
             },
             {
@@ -92,31 +90,31 @@
               "name": "Which generators, languages, and package managers does rcmake support?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "rcmake generates build files for Ninja, Ninja Multi-Config, Unix Makefiles, Xcode on macOS, and Visual Studio 17 2022 and Visual Studio 18 2026 on Windows. It supports C, C++ including C++20 and C++23 named modules with Ninja dyndep, Objective-C, Objective-C++, Fortran, ASM, MASM, NASM, Windows RC, and Qt AUTOMOC, AUTOUIC, and AUTORCC. It also works with existing vcpkg toolchains, Conan fixtures, and FetchContent projects."
+                "text": "rcmake generates Ninja, Ninja Multi-Config, Unix Makefiles, Xcode on macOS, and Visual Studio 17 2022 and Visual Studio 18 2026 on Windows. It supports C, C++ with C++20 and C++23 named modules, Objective-C, Objective-C++, Fortran, CUDA, HIP, Swift, ASM, MASM, NASM, Windows RC, and Qt AUTOGEN. CPack covers archives, DEB, RPM, External, Bundle, DragNDrop, productbuild, NSIS, NSIS64, WIX v3 and v4, and IFW, alongside vcpkg, Conan, and FetchContent."
               }
             },
             {
               "@type": "Question",
-              "name": "How do the shared probe cache and incremental replay speed up configure?",
+              "name": "How do the probe cache, incremental replay, and drift checks work?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "In native mode, rcmake stores verified compiler check results in a shared cache across build trees and projects. Before reusing an entry, it checks the SHA-256 digest of every recorded input file, including the compiler binary itself, and runs up to four literal compile probes in parallel by default. When you reconfigure after editing a file, incremental replay re-evaluates the edited region and replays unchanged directory subtrees whose entry context and inputs still match. Replay turns off automatically when a toolchain file such as vcpkg, a configure preset, -C, or PreLoad.cmake is active because those inputs can change evaluation outside local directory state."
+                "text": "In native mode, rcmake caches verified compiler probes across projects after checking SHA-256 input digests, runs up to four literal compile probes in parallel, and shares caches across CI runners via rcmake cache export and import. Incremental replay reuses unchanged directory subtrees even with vcpkg toolchains, configure presets, -C scripts, and PreLoad.cmake by validating setup checkpoints. Native configures and rcmake doctor -B also detect stale CMakeCache.txt drift when compilers or toolchains change."
               }
             },
             {
               "@type": "Question",
-              "name": "What does rcmake explain do?",
+              "name": "What native developer tools come with rcmake 0.2.0?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "The rcmake explain <NAME> -B <build> command shows where a target gets each compile flag, definition, include directory, or link dependency, including transitive usage requirements. For a variable, it lists every write across listfiles, macros, functions, cache entries, and command-line defines. It prints plain text for the terminal or structured JSON when you pass --json, and you can test it directly in the browser playground."
+                "text": "Opt-in native tools include rcmake explain for flags, definitions, includes, dependency paths, find_package rejections, and generator expressions, rcmake diff-config to compare any two cmake or rcmake build directories, rcmake fmt and 8-rule rcmake lint configured by .rcmake.toml, rcmake verify for side-by-side CMake 4.5.1 checks in an isolated companion binary, multi-config compile_commands.json export, --profile flame graphs, --hermetic audits, and --fetch-lock."
               }
             },
             {
               "@type": "Question",
-              "name": "How do I install rcmake and alias cmake, ctest, and cpack?",
+              "name": "How do I install rcmake and alias cmake, ctest, cpack, and ccmake?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "On Linux and macOS, run curl -fsSL https://raw.githubusercontent.com/rcmake/rcmake/main/scripts/install.sh | bash to install rcmake, rcmake-lsp, shell completions, and the man page into ~/.local. Append -s -- --alias-cmake after bash to also symlink cmake, ctest, and cpack. On Windows, run scripts/install.ps1 with -AliasCmake for aliases, or extract the x86_64-pc-windows-msvc ZIP archive from GitHub Releases. Intel Macs can build from source with scripts/install.sh --from-source."
+                "text": "On Linux and macOS, run curl -fsSL https://raw.githubusercontent.com/rcmake/rcmake/main/scripts/install.sh | bash to install rcmake, rcmake-lsp, rcmake-verify, shell completions, and man pages into ~/.local. Append -s -- --alias-cmake after bash to symlink cmake, ctest, cpack, and ccmake. On Windows, run scripts/install.ps1 with -AliasCmake for aliases, or extract the x86_64-pc-windows-msvc ZIP archive from GitHub Releases. Intel Macs build from source with scripts/install.sh --from-source."
               }
             },
             {
@@ -124,7 +122,7 @@
               "name": "What is intentionally different or not implemented in rcmake?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "rcmake leaves out interactive front ends such as cmake-gui and ccmake, along with the --debugger DAP server, because it focuses on headless builds and editor integration through LSP. It omits legacy extra generators for CodeBlocks, CodeLite, Eclipse CDT4, Kate, and Sublime Text 2, older Makefile variants and Visual Studio 14 to 16, and the CPack platform installers NSIS, WIX, productbuild, and IFW. Archive generators, External, macOS DragNDrop and Bundle, and Linux DEB and RPM packages are implemented. For reproducible output, tar and CPack archive writers always record uid 0 and gid 0. The try_compile command runs in-process rather than spawning Ninja, Make, MSBuild, or xcodebuild, and Swift builds along with full CUDA and HIP toolchain runs are not yet verified."
+                "text": "ccmake and the --debugger DAP server work on macOS and Linux, while Windows ccmake TUI and Windows debugger named pipes are deferred and cmake-gui is not included. CPack installer generators invoke native host packagers, and rcmake verify requires a user-supplied CMake 4.5.1 binary. Legacy extra generators, older Makefile variants, and Visual Studio 14 to 16 are omitted. Tar and CPack archives record uid 0 and gid 0, and try_compile runs in-process."
               }
             },
             {
@@ -132,7 +130,7 @@
               "name": "Does rcmake contain any unsafe Rust or copied CMake C++ code?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "No. rcmake contains no copied or translated CMake C++ code, and all 35 workspace crates enforce #![forbid(unsafe_code)]. Some third-party Rust dependencies such as rustix and memchr use unsafe internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8 for compression. rcmake bundles the upstream CMake 4.5.1 Modules/, Templates/, and Help/ files verbatim under BSD-3-Clause, while the Rust and Python code in this repository is dual-licensed under MIT OR Apache-2.0."
+                "text": "No. rcmake contains no copied or translated CMake C++ code, and all 39 workspace crates enforce #![forbid(unsafe_code)]. External Rust crates such as rustix and memchr use unsafe internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8. Bundled CMake 4.5.1 Modules/, Templates/, and Help/ files stay under BSD-3-Clause, while Rust and Python code in this repository uses MIT OR Apache-2.0."
               }
             },
             {
@@ -140,7 +138,7 @@
               "name": "Can I run rcmake in WebAssembly or use an editor language server?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "Yes. All filesystem, environment, process, and clock access goes through the rcmake_host::Host trait, so rcmake-api compiles with --no-default-features to wasm32-unknown-unknown and wasm32-wasip1 on PureHost. That WebAssembly build powers the browser playground with no backend server, supporting live configure, Ninja generation, and explain. For editors, the same binary runs as a language server over stdio when started as rcmake-lsp or rcmake lsp, accepting --help and --version. It provides hover with evaluated values, completion, go to definition, document symbols, semantic tokens, and formatting in VS Code, Neovim, Helix, Zed, Emacs, and CLion."
+                "text": "Yes. All OS access goes through rcmake_host::Host, so rcmake-api compiles with --no-default-features to wasm32-unknown-unknown and wasm32-wasip1 on PureHost, powering the zero-server browser playground. For editors, rcmake-lsp (or rcmake lsp) runs over stdio and provides hover with evaluated values, completion, go to definition, symbols, semantic tokens, quick fixes, lossless formatting, and all 8 static lint rules in VS Code, Neovim, Helix, Zed, Emacs, and CLion."
               }
             }
           ]
@@ -203,7 +201,7 @@
       <div class="hero-glow" aria-hidden="true"><span class="glow-a"></span><span class="glow-b"></span></div>
       <div class="container hero-inner">
         <h1 class="hero-title">Drop-in CMake&nbsp;4.5.1 in safe&nbsp;Rust.</h1>
-        <p class="hero-sub">One binary runs as cmake, ctest, cpack, and rcmake-lsp.</p>
+        <p class="hero-sub">One binary runs as cmake, ccmake, ctest, cpack, and rcmake-lsp.</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="./playground.html" data-test="hero-try-cta">
             <svg class="i" aria-hidden="true"><use href="#i-play"/></svg>
@@ -237,13 +235,22 @@
             </button>
           </div>
         </div>
+
+        <nav class="jump-nav" aria-label="On this page">
+          <a href="#checked">Verification</a>
+          <a href="#speed">Speed</a>
+          <a href="#compare">Compare</a>
+          <a href="#pipeline">Pipeline</a>
+          <a href="#generators">Generators</a>
+          <a href="#faq">FAQ</a>
+        </nav>
       </div>
     </section>
 
     <noscript>
       <div class="container">
         <div class="noscript-banner">
-          <strong>JavaScript is disabled.</strong> Live charts and interactive filters need JavaScript, while the comparison tables, generator matrix, and common questions below stay readable. rcmake supports <code>Ninja</code>, <code>Ninja Multi-Config</code>, <code>Unix Makefiles</code>, <code>Xcode</code>, <code>Visual Studio 17 2022</code>, and <code>Visual Studio 18 2026</code>. Native mode adds a shared compiler probe cache, parallel probes, incremental replay, <code>rcmake explain</code>, <code>--profile</code>, <code>--diagnostics=rich</code>, <code>--hermetic</code>, <code>--fetch-lock</code>, and <code>rcmake-lsp</code>. Read <a href="./llms.txt">llms.txt</a>, <a href="./llms-full.txt">llms-full.txt</a>, or the <a href="https://github.com/rcmake/rcmake">GitHub repository</a>.
+          <strong>JavaScript is disabled.</strong> Live charts and interactive filters need JavaScript, while the comparison tables, generator matrix, and common questions below stay readable. rcmake 0.2.0 supports <code>Ninja</code>, <code>Ninja Multi-Config</code>, <code>Unix Makefiles</code>, <code>Xcode</code>, <code>Visual Studio 17 2022</code>, and <code>Visual Studio 18 2026</code>. Native mode adds a shared probe cache with portable CI archives, sound incremental replay under toolchains and presets, drift checks, <code>explain</code>, <code>diff-config</code>, <code>fmt</code>, <code>lint</code>, <code>verify</code>, multi-config <code>compile_commands.json</code>, <code>--profile</code>, <code>--hermetic</code>, <code>--fetch-lock</code>, and <code>rcmake-lsp</code>. Read <a href="./llms.txt">llms.txt</a>, <a href="./llms-full.txt">llms-full.txt</a>, or the <a href="https://github.com/rcmake/rcmake">GitHub repository</a>.
         </div>
       </div>
     </noscript>
@@ -358,12 +365,7 @@
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
               <tr data-group="same" data-hl>
-                <td>Presets schema v13</td>
-                <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
-                <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
-              </tr>
-              <tr data-group="same">
-                <td>File API <code>codemodel</code> v2.12</td>
+                <td>Presets schema v13 and File API <code>codemodel</code> v2.12</td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
@@ -377,14 +379,19 @@
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
-              <tr data-group="same">
-                <td>CPack archive, <code>External</code>, macOS <code>DragNDrop</code> and <code>Bundle</code>, and Linux <code>DEB</code> and <code>RPM</code> generators</td>
+              <tr data-group="same" data-hl>
+                <td>CPack archives, <code>DEB</code>, <code>RPM</code>, <code>Bundle</code>, <code>DragNDrop</code>, <code>productbuild</code>, <code>NSIS</code>, <code>NSIS64</code>, <code>WIX</code>, and <code>IFW</code></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
               <tr data-group="same" data-hl>
                 <td>Ninja, Unix Makefiles, Xcode, and Visual Studio 2022 and 2026 generators</td>
                 <td class="cmp-cell" data-cmp-gate="generators"><span class="cmp-cell-diff st-pending"><svg class="i" aria-hidden="true"><use href="#i-pending"/></svg><span>verification pending</span></span></td>
+                <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
+              </tr>
+              <tr data-group="different" data-hl>
+                <td><code>ccmake</code> TUI and <code>--debugger</code> DAP server</td>
+                <td class="cmp-cell"><span class="cmp-cell-diff st-partial"><svg class="i" aria-hidden="true"><use href="#i-differs"/></svg><span class="visually-hidden">differs</span><span>macOS and Linux, Windows deferred</span></span></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
               <tr data-group="different">
@@ -397,58 +404,53 @@
                 <td class="cmp-cell">uid 0, gid 0</td>
                 <td class="cmp-cell muted">host owner</td>
               </tr>
-              <tr data-group="different" data-hl>
-                <td>Swift targets</td>
-                <td class="cmp-cell"><span class="cmp-cell-diff st-partial"><svg class="i" aria-hidden="true"><use href="#i-differs"/></svg><span class="visually-hidden">differs</span><span>parsed, builds unverified</span></span></td>
+              <tr data-group="different">
+                <td>CUDA, HIP, and Swift targets</td>
+                <td class="cmp-cell"><span class="cmp-cell-diff st-partial"><svg class="i" aria-hidden="true"><use href="#i-differs"/></svg><span class="visually-hidden">differs</span><span>lowering shipped, CI lacks GPU and Swift runners</span></span></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
               <tr data-group="rcmake-only" data-hl>
-                <td>Probe cache</td>
-                <td class="cmp-cell">shared across projects</td>
+                <td>Probe cache and portable CI archives</td>
+                <td class="cmp-cell">shared across projects plus <code>cache export</code> and <code>import</code></td>
                 <td class="cmp-cell muted">per build tree</td>
               </tr>
               <tr data-group="rcmake-only" data-hl>
-                <td>Reconfigure after a one-file edit</td>
-                <td class="cmp-cell">re-runs the edited file, replays the rest</td>
+                <td>Incremental configure replay</td>
+                <td class="cmp-cell">replays unchanged subtrees including toolchains and presets</td>
                 <td class="cmp-cell muted">full reconfigure</td>
               </tr>
               <tr data-group="rcmake-only" data-hl>
-                <td>Where a value came from</td>
-                <td class="cmp-cell"><code>rcmake explain</code></td>
+                <td>Provenance, find diagnosis, and genex eval</td>
+                <td class="cmp-cell"><code>rcmake explain</code> (<code>--flag</code>, <code>--dep</code>, <code>--find</code>, <code>--eval</code>)</td>
                 <td class="cmp-cell muted"><code>--trace-format=json-v1</code>, File API backtraces</td>
               </tr>
+              <tr data-group="rcmake-only" data-hl>
+                <td>Build comparison and parity verification</td>
+                <td class="cmp-cell"><code>rcmake diff-config</code> and isolated <code>rcmake verify</code></td>
+                <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
+              </tr>
+              <tr data-group="rcmake-only" data-hl>
+                <td>Lossless formatter and 8-rule static linter</td>
+                <td class="cmp-cell"><code>rcmake fmt</code>, <code>rcmake lint</code>, <code>.rcmake.toml</code>, and LSP</td>
+                <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
+              </tr>
               <tr data-group="rcmake-only">
-                <td><code>--hermetic</code> input audit</td>
+                <td>Multi-config <code>compile_commands.json</code> and drift detection</td>
+                <td class="cmp-cell"><code>--export-compile-commands</code> and <code>rcmake doctor -B</code></td>
+                <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
+              </tr>
+              <tr data-group="rcmake-only">
+                <td><code>--hermetic</code> input audit and <code>--fetch-lock</code></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
                 <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
               </tr>
               <tr data-group="rcmake-only">
-                <td><code>--fetch-lock</code> for FetchContent</td>
+                <td>Built-in language server (<code>rcmake-lsp</code>) and WebAssembly</td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
                 <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
-              </tr>
-              <tr data-group="rcmake-only">
-                <td>Language server</td>
-                <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
-                <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
-              </tr>
-              <tr data-group="rcmake-only">
-                <td>Runs as wasm32 and WASI</td>
-                <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
-                <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
-              </tr>
-              <tr data-group="not-in-rcmake">
-                <td><code>ccmake</code></td>
-                <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
-                <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
               <tr data-group="not-in-rcmake" data-hl>
                 <td><code>cmake-gui</code></td>
-                <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
-                <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
-              </tr>
-              <tr data-group="not-in-rcmake">
-                <td><code>--debugger</code> DAP server</td>
                 <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
@@ -464,11 +466,6 @@
               </tr>
               <tr data-group="not-in-rcmake">
                 <td>Visual Studio 2015 to 2019 generators</td>
-                <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
-                <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
-              </tr>
-              <tr data-group="not-in-rcmake" data-hl>
-                <td>CPack <code>NSIS</code>, <code>WIX</code>, <code>productbuild</code>, and <code>IFW</code></td>
                 <td class="cmp-cell dim"><svg class="i" aria-hidden="true"><use href="#i-gap"/></svg><span class="visually-hidden">not available</span></td>
                 <td class="cmp-cell st-pass"><svg class="i" aria-hidden="true"><use href="#i-check"/></svg><span class="visually-hidden">yes</span></td>
               </tr>
@@ -525,12 +522,12 @@
               <li title="Apple frameworks and Mach-O RPATH">Objective-C</li>
               <li title="Apple frameworks and Mach-O RPATH">Objective-C++</li>
               <li title="Scans .mod files and orders compilation by module">Fortran</li>
+              <li title="NVCC and Clang lowering, separable compilation, and device linking">CUDA</li>
+              <li title="AMD ROCm, SPIR-V, and NVIDIA target lowering">HIP</li>
+              <li title="CMP0157 split compilation, CMP0195, CMP0215, CMP0216, Ninja and Xcode lowering">Swift</li>
               <li title="Assembler languages">ASM, MASM, NASM</li>
               <li title="Windows resource files">RC</li>
               <li title="AUTOMOC, AUTOUIC, AUTORCC">Qt</li>
-              <li class="is-partial" title="One end-to-end fixture runs in the ecosystem workflow.">CUDA <span class="pill-note">partial</span></li>
-              <li class="is-partial" title="Rule wiring exists, with no toolchain test yet.">HIP <span class="pill-note">partial</span></li>
-              <li class="is-partial" title="Target properties are parsed, and toolchain builds are not yet verified.">Swift <span class="pill-note">partial</span></li>
             </ul>
           </div>
         </div>
@@ -543,35 +540,35 @@
         <div class="faq-list" data-test="faq-list" data-reveal-stagger>
         <details class="faq-item">
           <summary>Is rcmake a drop-in replacement for CMake 4.5.1?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p>Yes. A single <code>rcmake</code> binary inspects <code>argv[0]</code> to run as <code>cmake</code>, <code>ctest</code>, or <code>cpack</code>. It reads existing <code>CMakeLists.txt</code> files, Presets v13, and <code>CMakeCache.txt</code>, then writes compatible build trees. When you start it as <code>cmake</code>, <code>ctest</code>, or <code>cpack</code>, or set <code>RCMAKE_ORACLE_MODE=1</code>, it enters compatibility mode and matches CMake 4.5.1 behavior and diagnostics.</p></div></div>
+          <div class="faq-answer"><div class="faq-inner"><p>Yes. A single <code>rcmake</code> binary inspects <code>argv[0]</code> to run as <code>cmake</code>, <code>ccmake</code> on Unix, <code>ctest</code>, <code>cpack</code>, or <code>rcmake-lsp</code>. It reads existing <code>CMakeLists.txt</code> files, Presets v13, and <code>CMakeCache.txt</code>, then writes compatible build trees. Starting it as <code>cmake</code>, <code>ccmake</code>, <code>ctest</code>, or <code>cpack</code>, or setting <code>RCMAKE_ORACLE_MODE=1</code>, selects compatibility mode matching CMake 4.5.1.</p></div></div>
         </details>
         <details class="faq-item">
           <summary>Which generators, languages, and package managers does rcmake support?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p><code>rcmake</code> generates build files for <code>Ninja</code>, <code>Ninja Multi-Config</code>, <code>Unix Makefiles</code>, <code>Xcode</code> on macOS, and <code>Visual Studio 17 2022</code> and <code>Visual Studio 18 2026</code> on Windows. It supports C, C++ including C++20 and C++23 named modules with Ninja <code>dyndep</code>, Objective-C, Objective-C++, Fortran, ASM, MASM, NASM, Windows RC, and Qt <code>AUTOMOC</code>, <code>AUTOUIC</code>, and <code>AUTORCC</code>. It also works with existing <code>vcpkg</code> toolchains, Conan fixtures, and <code>FetchContent</code> projects.</p></div></div>
+          <div class="faq-answer"><div class="faq-inner"><p><code>rcmake</code> generates <code>Ninja</code>, <code>Ninja Multi-Config</code>, <code>Unix Makefiles</code>, <code>Xcode</code> on macOS, and <code>Visual Studio 17 2022</code> and <code>Visual Studio 18 2026</code> on Windows. It supports C, C++ with C++20 and C++23 named modules, Objective-C, Objective-C++, Fortran, CUDA, HIP, Swift, ASM, MASM, NASM, Windows RC, and Qt AUTOGEN. CPack covers archives, <code>DEB</code>, <code>RPM</code>, <code>External</code>, <code>Bundle</code>, <code>DragNDrop</code>, <code>productbuild</code>, <code>NSIS</code>, <code>NSIS64</code>, <code>WIX</code> v3 and v4, and <code>IFW</code>, alongside <code>vcpkg</code>, Conan, and <code>FetchContent</code>.</p></div></div>
         </details>
         <details class="faq-item">
-          <summary>How do the shared probe cache and incremental replay speed up configure?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p>In native mode, <code>rcmake</code> stores verified compiler check results in a shared cache across build trees and projects. Before reusing an entry, it checks the SHA-256 digest of every recorded input file, including the compiler binary itself, and runs up to four literal compile probes in parallel by default. When you reconfigure after editing a file, incremental replay re-evaluates the edited region and replays unchanged directory subtrees whose entry context and inputs still match. Replay turns off automatically when a toolchain file such as <code>vcpkg</code>, a configure preset, <code>-C</code>, or <code>PreLoad.cmake</code> is active because those inputs can change evaluation outside local directory state.</p></div></div>
+          <summary>How do the probe cache, incremental replay, and drift checks work?</summary>
+          <div class="faq-answer"><div class="faq-inner"><p>In native mode, <code>rcmake</code> caches verified compiler probes across projects after checking SHA-256 input digests, runs up to four literal compile probes in parallel, and shares caches across CI runners via <code>rcmake cache export</code> and <code>import</code>. Incremental replay reuses unchanged directory subtrees even with <code>vcpkg</code> toolchains, configure presets, <code>-C</code> scripts, and <code>PreLoad.cmake</code> by validating setup checkpoints. Native configures and <code>rcmake doctor -B</code> also detect stale <code>CMakeCache.txt</code> drift when compilers or toolchains change.</p></div></div>
         </details>
         <details class="faq-item">
-          <summary>What does rcmake explain do?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p>The <code>rcmake explain &lt;NAME&gt; -B &lt;build&gt;</code> command shows where a target gets each compile flag, definition, include directory, or link dependency, including transitive usage requirements. For a variable, it lists every write across listfiles, macros, functions, cache entries, and command-line defines. It prints plain text for the terminal or structured JSON when you pass <code>--json</code>, and you can test it directly in the browser playground.</p></div></div>
+          <summary>What native developer tools come with rcmake 0.2.0?</summary>
+          <div class="faq-answer"><div class="faq-inner"><p>Opt-in native tools include <code>rcmake explain</code> for flags, definitions, includes, dependency paths, <code>find_package</code> rejections, and generator expressions, <code>rcmake diff-config</code> to compare any two <code>cmake</code> or <code>rcmake</code> build directories, <code>rcmake fmt</code> and 8-rule <code>rcmake lint</code> configured by <code>.rcmake.toml</code>, <code>rcmake verify</code> for side-by-side CMake 4.5.1 checks in an isolated companion binary, multi-config <code>compile_commands.json</code> export, <code>--profile</code> flame graphs, <code>--hermetic</code> audits, and <code>--fetch-lock</code>.</p></div></div>
         </details>
         <details class="faq-item">
-          <summary>How do I install rcmake and alias cmake, ctest, and cpack?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p>On Linux and macOS, run <code>curl -fsSL https://raw.githubusercontent.com/rcmake/rcmake/main/scripts/install.sh | bash</code> to install <code>rcmake</code>, <code>rcmake-lsp</code>, shell completions, and the man page into <code>~/.local</code>. Append <code>-s -- --alias-cmake</code> after <code>bash</code> to also symlink <code>cmake</code>, <code>ctest</code>, and <code>cpack</code>. On Windows, run <code>scripts/install.ps1</code> with <code>-AliasCmake</code> for aliases, or extract the <code>x86_64-pc-windows-msvc</code> ZIP archive from GitHub Releases. Intel Macs can build from source with <code>scripts/install.sh --from-source</code>.</p></div></div>
+          <summary>How do I install rcmake and alias cmake, ctest, cpack, and ccmake?</summary>
+          <div class="faq-answer"><div class="faq-inner"><p>On Linux and macOS, run <code>curl -fsSL https://raw.githubusercontent.com/rcmake/rcmake/main/scripts/install.sh | bash</code> to install <code>rcmake</code>, <code>rcmake-lsp</code>, <code>rcmake-verify</code>, shell completions, and man pages into <code>~/.local</code>. Append <code>-s -- --alias-cmake</code> after <code>bash</code> to symlink <code>cmake</code>, <code>ctest</code>, <code>cpack</code>, and <code>ccmake</code>. On Windows, run <code>scripts/install.ps1</code> with <code>-AliasCmake</code> for aliases, or extract the <code>x86_64-pc-windows-msvc</code> ZIP archive from GitHub Releases. Intel Macs build from source with <code>scripts/install.sh --from-source</code>.</p></div></div>
         </details>
         <details class="faq-item">
           <summary>What is intentionally different or not implemented in rcmake?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p><code>rcmake</code> leaves out interactive front ends such as <code>cmake-gui</code> and <code>ccmake</code>, along with the <code>--debugger</code> DAP server, because it focuses on headless builds and editor integration through LSP. It omits legacy extra generators for CodeBlocks, CodeLite, Eclipse CDT4, Kate, and Sublime Text 2, older Makefile variants and Visual Studio 14 to 16, and the CPack platform installers <code>NSIS</code>, <code>WIX</code>, <code>productbuild</code>, and <code>IFW</code>. Archive generators, <code>External</code>, macOS <code>DragNDrop</code> and <code>Bundle</code>, and Linux <code>DEB</code> and <code>RPM</code> packages are implemented. For reproducible output, <code>tar</code> and CPack archive writers always record uid 0 and gid 0. The <code>try_compile</code> command runs in-process rather than spawning Ninja, Make, MSBuild, or xcodebuild, and Swift builds along with full CUDA and HIP toolchain runs are not yet verified.</p></div></div>
+          <div class="faq-answer"><div class="faq-inner"><p><code>ccmake</code> and the <code>--debugger</code> DAP server work on macOS and Linux, while Windows <code>ccmake</code> TUI and Windows debugger named pipes are deferred and <code>cmake-gui</code> is not included. CPack installer generators invoke native host packagers, and <code>rcmake verify</code> requires a user-supplied CMake 4.5.1 binary. Legacy extra generators, older Makefile variants, and Visual Studio 14 to 16 are omitted. Tar and CPack archives record uid 0 and gid 0, and <code>try_compile</code> runs in-process.</p></div></div>
         </details>
         <details class="faq-item">
           <summary>Does rcmake contain any unsafe Rust or copied CMake C++ code?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p>No. <code>rcmake</code> contains no copied or translated CMake C++ code, and all 35 workspace crates enforce <code>#![forbid(unsafe_code)]</code>. Some third-party Rust dependencies such as <code>rustix</code> and <code>memchr</code> use <code>unsafe</code> internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8 for compression. <code>rcmake</code> bundles the upstream CMake 4.5.1 <code>Modules/</code>, <code>Templates/</code>, and <code>Help/</code> files verbatim under <code>BSD-3-Clause</code>, while the Rust and Python code in this repository is dual-licensed under <code>MIT OR Apache-2.0</code>.</p></div></div>
+          <div class="faq-answer"><div class="faq-inner"><p>No. <code>rcmake</code> contains no copied or translated CMake C++ code, and all 39 workspace crates enforce <code>#![forbid(unsafe_code)]</code>. External Rust crates such as <code>rustix</code> and <code>memchr</code> use <code>unsafe</code> internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8. Bundled CMake 4.5.1 <code>Modules/</code>, <code>Templates/</code>, and <code>Help/</code> files stay under <code>BSD-3-Clause</code>, while Rust and Python code in this repository uses <code>MIT OR Apache-2.0</code>.</p></div></div>
         </details>
         <details class="faq-item">
           <summary>Can I run rcmake in WebAssembly or use an editor language server?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p>Yes. All filesystem, environment, process, and clock access goes through the <code>rcmake_host::Host</code> trait, so <code>rcmake-api</code> compiles with <code>--no-default-features</code> to <code>wasm32-unknown-unknown</code> and <code>wasm32-wasip1</code> on <code>PureHost</code>. That WebAssembly build powers the browser playground with no backend server, supporting live configure, Ninja generation, and <code>explain</code>. For editors, the same binary runs as a language server over stdio when started as <code>rcmake-lsp</code> or <code>rcmake lsp</code>, accepting <code>--help</code> and <code>--version</code>. It provides hover with evaluated values, completion, go to definition, document symbols, semantic tokens, and formatting in VS Code, Neovim, Helix, Zed, Emacs, and CLion.</p></div></div>
+          <div class="faq-answer"><div class="faq-inner"><p>Yes. All OS access goes through <code>rcmake_host::Host</code>, so <code>rcmake-api</code> compiles with <code>--no-default-features</code> to <code>wasm32-unknown-unknown</code> and <code>wasm32-wasip1</code> on <code>PureHost</code>, powering the zero-server browser playground. For editors, <code>rcmake-lsp</code> (or <code>rcmake lsp</code>) runs over stdio and provides hover with evaluated values, completion, go to definition, symbols, semantic tokens, quick fixes, lossless formatting, and all 8 static lint rules in VS Code, Neovim, Helix, Zed, Emacs, and CLion.</p></div></div>
         </details>
         </div>
       </div>
@@ -587,7 +584,7 @@
       </a>
       <nav class="footer-nav" aria-label="Footer">
         <a href="https://github.com/rcmake/rcmake">GitHub</a>
-        <a href="https://github.com/rcmake/rcmake/tree/main/docs">Docs</a>
+        <a href="https://github.com/rcmake/rcmake/blob/main/docs/README.md">Docs</a>
         <a href="./dashboard.html">Compatibility</a>
         <a href="./playground.html">Playground</a>
         <a href="./llms.txt">LLMs.txt</a>

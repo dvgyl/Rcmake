@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>rcmake compatibility report for CMake 4.5.1 parity and benchmarks</title>
-  <meta name="description" content="Differential test results comparing rcmake with CMake 4.5.1 across RunCMake on three operating systems, 10 large C++ projects, 64 vcpkg shards, and speed.">
+  <meta name="description" content="Differential test results comparing rcmake 0.2.0 with CMake 4.5.1 across RunCMake on three operating systems, 10 large C++ projects, 64 vcpkg shards, and speed.">
   <meta name="robots" content="index,follow,max-image-preview:large,max-snippet:-1">
   <meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f6f4f0" media="(prefers-color-scheme: light)">
@@ -14,17 +14,17 @@
   <meta property="og:site_name" content="rcmake">
   <meta property="og:type" content="website">
   <meta property="og:title" content="rcmake compatibility report for CMake 4.5.1 parity and benchmarks">
-  <meta property="og:description" content="Differential test results comparing rcmake with CMake 4.5.1 across RunCMake on three operating systems, 10 large C++ projects, 64 vcpkg shards, and speed.">
+  <meta property="og:description" content="Differential test results comparing rcmake 0.2.0 with CMake 4.5.1 across RunCMake on three operating systems, 10 large C++ projects, 64 vcpkg shards, and speed.">
   <meta property="og:url" content="https://rcmake.github.io/rcmake/dashboard.html">
   <meta property="og:image" content="https://rcmake.github.io/rcmake/assets/og-card.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, and cpack.">
+  <meta property="og:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ccmake, ctest, and cpack.">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="rcmake compatibility report for CMake 4.5.1 parity and benchmarks">
-  <meta name="twitter:description" content="Differential test results comparing rcmake with CMake 4.5.1 across RunCMake on three operating systems, 10 large C++ projects, 64 vcpkg shards, and speed.">
+  <meta name="twitter:description" content="Differential test results comparing rcmake 0.2.0 with CMake 4.5.1 across RunCMake on three operating systems, 10 large C++ projects, 64 vcpkg shards, and speed.">
   <meta name="twitter:image" content="https://rcmake.github.io/rcmake/assets/og-card.png">
-  <meta name="twitter:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, and cpack.">
+  <meta name="twitter:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ccmake, ctest, and cpack.">
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
   <link rel="stylesheet" href="./styles.css">
   <script type="application/ld+json">
@@ -35,9 +35,9 @@
           "@type": "Dataset",
           "@id": "https://rcmake.github.io/rcmake/dashboard.html#dataset",
           "name": "rcmake CMake 4.5.1 compatibility and benchmark report",
-          "description": "Machine-readable differential compatibility, soundness, and benchmark dataset comparing rcmake 0.1.0 with CMake 4.5.1 across Tests/RunCMake on macOS, Linux, and Windows, 62 core suites, 35 policy suites, 10 large C++ projects, a 240-repository blind holdout, 64 vcpkg shards, seeded generative fuzzing, and WebAssembly and WASI checks.",
+          "description": "Machine-readable differential compatibility, soundness, and benchmark dataset comparing rcmake 0.2.0 with CMake 4.5.1 across Tests/RunCMake on macOS, Linux, and Windows, 62 core suites, 35 policy suites, 10 large C++ projects, a 240-repository blind holdout, 64 vcpkg shards, seeded generative fuzzing, and WebAssembly and WASI checks.",
           "url": "https://rcmake.github.io/rcmake/dashboard.html",
-          "version": "0.1.0",
+          "version": "0.2.0",
           "license": [
             "https://spdx.org/licenses/MIT.html",
             "https://spdx.org/licenses/Apache-2.0.html"
@@ -60,7 +60,7 @@
             "62 core conformance suites",
             "35 policy suites covering CMake policies CMP0066 to CMP0226",
             "L1 configure and L2 Ninja build-graph and File API parity across 10 large C++ projects",
-            "Aggregate L2 parity across a 240-repository sealed unseen holdout",
+            "Aggregate parity across a 240-repository sealed unseen holdout",
             "64 vcpkg port matrix shards",
             "Configure wall time and peak RSS compared with CMake 4.5.1",
             "Seeded generative fuzzing across 14 targets and WebAssembly and WASI checks"
@@ -144,11 +144,21 @@
             <span id="report-meta">commit pending · CMake 4.5.1 · not yet generated</span>
             <a class="report-json-link" href="./data/latest.json"><svg class="i" aria-hidden="true"><use href="#i-file"/></svg><span>latest.json</span></a>
           </div>
+          <nav class="jump-nav jump-nav-left" aria-label="Jump to section">
+            <a href="#summary">Summary</a>
+            <a href="#runcmake">RunCMake</a>
+            <a href="#core">Core and policies</a>
+            <a href="#projects">Large projects</a>
+            <a href="#holdout">Holdout</a>
+            <a href="#vcpkg">vcpkg</a>
+            <a href="#speed">Speed</a>
+            <a href="#gates">Soundness</a>
+          </nav>
         </header>
         <nav class="rail-mobile" id="report-rail-mobile" aria-label="Report sections"></nav>
         <noscript>
           <div class="noscript-banner">
-            <strong>JavaScript is required to render the interactive charts.</strong> This report compares <code>rcmake</code> 0.1.0 against CMake 4.5.1 across upstream <code>Tests/RunCMake</code> with 371 macOS arm64, 362 Linux x86_64, and 367 Windows x86_64 suites, 62 core suites, and 35 policy suites covering <code>CMP0066</code> to <code>CMP0226</code>. It also tracks 20 black-box scenarios with 679 checks, L1 configure and L2 Ninja and File API parity on 10 large C++ projects, a 240-repository blind holdout, 64 <code>vcpkg</code> shards, seeded generative fuzzing across 14 targets, WebAssembly and WASI checks, probe-cache and mutation-replay soundness gates, and configure speed benchmarks. Inspect the raw dataset in <a href="./data/latest.json">data/latest.json</a> or read <a href="./llms.txt">llms.txt</a>.
+            <strong>JavaScript is required to render the interactive charts.</strong> This report compares <code>rcmake</code> 0.2.0 against CMake 4.5.1 across upstream <code>Tests/RunCMake</code> (371 macOS arm64, 362 Linux x86_64, and 367 Windows x86_64 suites), 62 core suites, and 35 policy suites covering <code>CMP0066</code> to <code>CMP0226</code>. It also tracks 20 black-box scenarios (679 checks), L1 configure and L2 Ninja and File API parity on 10 large C++ projects, a 240-repository blind holdout, 64 <code>vcpkg</code> shards, seeded generative fuzzing across 14 targets, WebAssembly and WASI checks, probe-cache and mutation-replay soundness gates, and configure speed benchmarks. Inspect the raw dataset in <a href="./data/latest.json">data/latest.json</a> or read <a href="./llms.txt">llms.txt</a>.
           </div>
         </noscript>
         <div id="report" class="is-loading" data-test="report-body"></div>
@@ -165,7 +175,7 @@
       </a>
       <nav class="footer-nav" aria-label="Footer">
         <a href="https://github.com/rcmake/rcmake">GitHub</a>
-        <a href="https://github.com/rcmake/rcmake/tree/main/docs">Docs</a>
+        <a href="https://github.com/rcmake/rcmake/blob/main/docs/README.md">Docs</a>
         <a href="./index.html">Overview</a>
         <a href="./playground.html">Playground</a>
         <a href="./llms.txt">LLMs.txt</a>

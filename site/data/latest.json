@@ -1,100 +1,100 @@
 {
   "$schema": "./dashboard.schema.json",
   "schemaVersion": 1,
-  "generatedAt": "2026-11-26T18:40:05Z",
-  "commit": "8d9182957c829008aeff644ef029a64395d4dd5c",
-  "rcmakeVersion": "0.1.0",
+  "generatedAt": "2026-11-27T15:13:31Z",
+  "commit": "70c2331346761105d3a608a8acb4e31c75311564",
+  "rcmakeVersion": "0.2.0",
   "targetCmakeVersion": "4.5.1",
   "statusNote": "CI reports 6 of 6 completed runs as successful. Open runs total 0.",
   "tracks": {
     "coreConformance": {
       "label": "Core suites",
-      "status": "fail",
+      "status": "pending",
       "suitesTotal": 62,
-      "suitesAt100": 58,
-      "casesPassed": 3702,
-      "casesTotal": 3747,
-      "passRate": 98.8,
-      "note": "Case counts include each reported OS run of a matching suite.",
+      "suitesAt100": null,
+      "casesPassed": null,
+      "casesTotal": null,
+      "passRate": null,
+      "note": "Pending verification for this commit.",
       "highlights": [
         {
           "suite": "CommandLine",
-          "passed": 404,
-          "total": 407,
-          "status": "fail"
+          "passed": null,
+          "total": null,
+          "status": "pending"
         },
         {
           "suite": "CMakePresets",
-          "passed": 209,
-          "total": 209,
-          "status": "pass"
+          "passed": null,
+          "total": null,
+          "status": "pending"
         },
         {
           "suite": "CTestCommandLine",
-          "passed": 202,
-          "total": 202,
-          "status": "pass"
+          "passed": null,
+          "total": null,
+          "status": "pending"
         },
         {
           "suite": "CPack",
-          "passed": 609,
-          "total": 643,
-          "status": "fail"
+          "passed": null,
+          "total": null,
+          "status": "pending"
         },
         {
           "suite": "CommandLineTar",
-          "passed": 91,
-          "total": 91,
-          "status": "pass"
+          "passed": null,
+          "total": null,
+          "status": "pending"
         },
         {
           "suite": "File_Archive",
-          "passed": 65,
-          "total": 65,
-          "status": "pass"
+          "passed": null,
+          "total": null,
+          "status": "pending"
         },
         {
           "suite": "Instrumentation",
-          "passed": 149,
-          "total": 156,
-          "status": "fail"
+          "passed": null,
+          "total": null,
+          "status": "pending"
         },
         {
           "suite": "SarifOutput",
-          "passed": 7,
-          "total": 7,
-          "status": "pass"
+          "passed": null,
+          "total": null,
+          "status": "pending"
         },
         {
           "suite": "cmake_language",
-          "passed": 182,
-          "total": 182,
-          "status": "pass"
+          "passed": null,
+          "total": null,
+          "status": "pending"
         },
         {
           "suite": "GoogleTest",
-          "passed": 123,
-          "total": 123,
-          "status": "pass"
+          "passed": null,
+          "total": null,
+          "status": "pending"
         }
       ]
     },
     "policies": {
       "label": "Policies (CMP0066-CMP0226)",
-      "status": "partial",
+      "status": "pending",
       "baselineAlwaysNew": "CMP0000-CMP0065",
       "activeRange": "CMP0066-CMP0226",
       "suitesTotal": 35,
-      "suitesPassed": 32,
-      "casesPassed": 401,
-      "casesTotal": 401,
-      "passRate": 100.0,
-      "note": "Case counts include each reported OS run of a matching suite."
+      "suitesPassed": null,
+      "casesPassed": null,
+      "casesTotal": null,
+      "passRate": null,
+      "note": "Pending verification for this commit."
     },
     "runCmakeOs": {
       "label": "Tests/RunCMake by OS",
-      "status": "partial",
-      "note": "Results from the OS reports.",
+      "status": "pending",
+      "note": "Pending verification for this commit.",
       "platforms": [
         {
           "id": "macos-arm64",
@@ -113,15 +113,12 @@
           "name": "Linux x86_64",
           "toolchain": "GCC + Clang + Ninja, Unix Makefiles",
           "suitesTotal": 362,
-          "suitesPassed": 352,
-          "casesPassed": 9312,
-          "casesTotal": 9373,
-          "passRate": 99.35,
-          "status": "pass",
-          "note": "Full OS report: 362 suites completed (minimum 362).",
-          "expectedSuites": 362,
-          "completedSuites": 362,
-          "partial": false
+          "suitesPassed": null,
+          "casesPassed": null,
+          "casesTotal": null,
+          "passRate": null,
+          "status": "pending",
+          "note": "Pending verification for this commit."
         },
         {
           "id": "windows-x86_64",
@@ -142,7 +139,7 @@
       "status": "fail",
       "projectsTotal": 10,
       "l1Passed": 0,
-      "l2Passed": 1,
+      "l2Passed": 7,
       "note": "L1 compares configure output. L2 compares Ninja dry-run commands. L3 builds targets. L4 runs tests and install checks.",
       "projects": [
         {
@@ -155,7 +152,7 @@
             "shell"
           ],
           "l1": "fail",
-          "l2": "fail",
+          "l2": "pass",
           "l3": "pending",
           "l4": "pending"
         },
@@ -184,7 +181,7 @@
             "FiltersCore"
           ],
           "l1": "fail",
-          "l2": "fail",
+          "l2": "pass",
           "l3": "pending",
           "l4": "pending"
         },
@@ -198,7 +195,7 @@
             "Network"
           ],
           "l1": "fail",
-          "l2": "fail",
+          "l2": "pass",
           "l3": "pending",
           "l4": "pending"
         },
@@ -224,7 +221,7 @@
             "torch_cpu"
           ],
           "l1": "fail",
-          "l2": "fail",
+          "l2": "pass",
           "l3": "pending",
           "l4": "pending"
         },
@@ -237,7 +234,7 @@
             "KF6CoreAddons"
           ],
           "l1": "fail",
-          "l2": "fail",
+          "l2": "pass",
           "l3": "pending",
           "l4": "pending"
         },
@@ -263,7 +260,7 @@
             "rclcpp"
           ],
           "l1": "fail",
-          "l2": "fail",
+          "l2": "pass",
           "l3": "pending",
           "l4": "pending"
         },
@@ -288,9 +285,9 @@
       "label": "Blind holdout (240 sealed repositories)",
       "sealed": true,
       "status": "fail",
-      "reposTotal": 74,
-      "reposPassed": 0,
-      "passRate": 0.0,
+      "reposTotal": 67,
+      "reposPassed": 18,
+      "passRate": 26.87,
       "policy": "Blind holdout corpus. Individual repository identities are never published, and only aggregate pass rates and category counts are reported.",
       "note": "Repository counts from the blind holdout report.",
       "categories": [
@@ -339,212 +336,174 @@
       ],
       "levelPassRates": {
         "L1": {
-          "passed": 0,
-          "eligible": 74,
-          "passRate": 0.0
-        },
-        "L2": {
-          "passed": 0,
-          "eligible": 0,
-          "passRate": null
+          "passed": 18,
+          "eligible": 67,
+          "passRate": 26.87
         }
       },
       "failureCategories": {
-        "configure": 2,
         "find-module": 3,
-        "generator": 58,
-        "oracle-red": 132,
-        "policy": 10,
+        "generator": 38,
+        "oracle-red": 131,
+        "policy": 8,
         "source": 2,
-        "timeout": 33
+        "timeout": 10
       }
     },
     "vcpkgMatrix": {
       "label": "vcpkg CMake port comparisons (64 shards)",
-      "status": "fail",
+      "status": "pending",
       "shardsTotal": 64,
-      "shardsCompleted": 16,
-      "shardsPassed": 7,
-      "portsTotal": 332,
-      "portsPassed": 319,
-      "passRate": 96.08,
-      "note": "The pass rate uses 332 scored CMake ports. 656 / 656 expected ports inspected in the reported shards.",
+      "shardsCompleted": 0,
+      "shardsPassed": null,
+      "portsTotal": null,
+      "portsPassed": null,
+      "passRate": null,
+      "note": "Pending verification for this commit.",
       "shards": [
         {
           "shard": 0,
-          "status": "fail",
-          "portsTotal": 23,
-          "portsPassed": 20,
-          "portsFailed": 3,
-          "durationSeconds": 2750.34,
-          "note": "23 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 1,
-          "status": "fail",
-          "portsTotal": 17,
-          "portsPassed": 16,
-          "portsFailed": 1,
-          "durationSeconds": 3277.826,
-          "note": "17 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 2,
-          "status": "pass",
-          "portsTotal": 21,
-          "portsPassed": 21,
-          "portsFailed": 0,
-          "durationSeconds": 3605.512,
-          "note": "21 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 3,
-          "status": "fail",
-          "portsTotal": 22,
-          "portsPassed": 21,
-          "portsFailed": 1,
-          "durationSeconds": 3404.732,
-          "note": "22 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 4,
-          "status": "pass",
-          "portsTotal": 23,
-          "portsPassed": 23,
-          "portsFailed": 0,
-          "durationSeconds": 2482.609,
-          "note": "23 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 5,
-          "status": "pass",
-          "portsTotal": 22,
-          "portsPassed": 22,
-          "portsFailed": 0,
-          "durationSeconds": 4111.244,
-          "note": "22 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 6,
-          "status": "pass",
-          "portsTotal": 17,
-          "portsPassed": 17,
-          "portsFailed": 0,
-          "durationSeconds": 3587.337,
-          "note": "17 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 7,
-          "status": "pass",
-          "portsTotal": 15,
-          "portsPassed": 15,
-          "portsFailed": 0,
-          "durationSeconds": 4139.522,
-          "note": "15 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 8,
-          "status": "fail",
-          "portsTotal": 16,
-          "portsPassed": 13,
-          "portsFailed": 3,
-          "durationSeconds": 3682.476,
-          "note": "16 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 9,
-          "status": "fail",
-          "portsTotal": 20,
-          "portsPassed": 19,
-          "portsFailed": 1,
-          "durationSeconds": 4666.201,
-          "note": "20 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 10,
-          "status": "fail",
-          "portsTotal": 21,
-          "portsPassed": 20,
-          "portsFailed": 1,
-          "durationSeconds": 3962.284,
-          "note": "21 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 11,
-          "status": "fail",
-          "portsTotal": 25,
-          "portsPassed": 24,
-          "portsFailed": 1,
-          "durationSeconds": 3319.735,
-          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 12,
-          "status": "fail",
-          "portsTotal": 22,
-          "portsPassed": 21,
-          "portsFailed": 1,
-          "durationSeconds": 2736.209,
-          "note": "22 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 13,
-          "status": "pass",
-          "portsTotal": 20,
-          "portsPassed": 20,
-          "portsFailed": 0,
-          "durationSeconds": 4235.874,
-          "note": "20 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 14,
-          "status": "fail",
-          "portsTotal": 26,
-          "portsPassed": 25,
-          "portsFailed": 1,
-          "durationSeconds": 3079.142,
-          "note": "26 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 15,
-          "status": "pass",
-          "portsTotal": 22,
-          "portsPassed": 22,
-          "portsFailed": 0,
-          "durationSeconds": 3102.197,
-          "note": "22 scored CMake ports. 41 / 41 expected ports inspected.",
-          "portsInspected": 41,
-          "portsExpected": 41
+          "status": "pending",
+          "portsTotal": null,
+          "portsPassed": null,
+          "portsFailed": null,
+          "durationSeconds": null,
+          "note": "Pending verification for this commit."
         },
         {
           "shard": 16,
@@ -978,16 +937,14 @@
           "durationSeconds": null,
           "note": "Pending verification for this commit."
         }
-      ],
-      "portsInspected": 656,
-      "portsExpected": 656
+      ]
     },
     "benchmarksAndGates": {
       "label": "Benchmarks and soundness gates",
       "benchmarks": {
         "warmProbeSpeedup": {
           "label": "New tree, shared probe cache",
-          "value": 5.8,
+          "value": 5.7,
           "unit": "x",
           "baseline": "vs CMake 4.5.1 new build tree (CMake has no cross-tree probe cache)",
           "status": "pass",
@@ -995,15 +952,15 @@
         },
         "incrementalLeafP95Ms": {
           "label": "Leaf edit reconfigure (p95)",
-          "value": 110.0461249880027,
+          "value": 59.792833984829485,
           "unit": "ms",
           "baseline": "single-file change replay",
-          "status": "fail",
+          "status": "pass",
           "note": "Highest project p95 in the report."
         },
         "coldConfigureSpeedup": {
           "label": "Cold 500-target configure (empty probe cache)",
-          "value": 2.027744551946719,
+          "value": 1.9571500671751603,
           "unit": "x",
           "baseline": "vs CMake 4.5.1, synthetic 500-library C project",
           "status": "pass",
@@ -1011,7 +968,7 @@
         },
         "peakRssMiB": {
           "label": "500-target peak RSS",
-          "value": 132.7,
+          "value": 135.2,
           "unit": "MiB",
           "baseline": "native release binary, cold configure",
           "status": "pass",
@@ -1107,16 +1064,16 @@
         "status": "pass",
         "runs": 3,
         "reproducer": "python3 tools/measure/bench_giants.py --projects duckdb,opencv,protobuf,qtbase,llvm-project --runs 3",
-        "generatedAt": "2026-11-26T17:03:58Z",
+        "generatedAt": "2026-11-27T14:06:32Z",
         "summary": {
           "projectsTotal": 5,
           "projectsPassed": 5,
-          "coldSpeedupGeomean": 1.02,
-          "warmProbeSpeedupGeomean": 1.41,
-          "incrementalLeafSpeedupGeomean": 1.21,
-          "incrementalLeafMaxP95Ms": 9347.36,
-          "rcmakeMaxPeakRssMiB": 391.88,
-          "cmakeMaxPeakRssMiB": 391.33
+          "coldSpeedupGeomean": 0.98,
+          "warmProbeSpeedupGeomean": 1.26,
+          "incrementalLeafSpeedupGeomean": 1.1,
+          "incrementalLeafMaxP95Ms": 7656.4,
+          "rcmakeMaxPeakRssMiB": 393.14,
+          "cmakeMaxPeakRssMiB": 391.31
         },
         "projects": [
           {
@@ -1125,28 +1082,28 @@
             "version": "v1.3.2",
             "status": "pass",
             "cold": {
-              "cmakeMedianMs": 1880.19,
-              "rcmakeMedianMs": 2082.91,
-              "speedup": 0.9,
+              "cmakeMedianMs": 1713.83,
+              "rcmakeMedianMs": 2079.73,
+              "speedup": 0.82,
               "cmakePeakRssMiB": 73.02,
-              "rcmakePeakRssMiB": 103.78
+              "rcmakePeakRssMiB": 94.02
             },
             "warmProbe": {
-              "cmakeMedianMs": 1877.76,
-              "rcmakeMedianMs": 1560.91,
-              "speedup": 1.2,
-              "cmakePeakRssMiB": 73.09,
-              "rcmakePeakRssMiB": 104.38,
+              "cmakeMedianMs": 1709.63,
+              "rcmakeMedianMs": 1602.23,
+              "speedup": 1.07,
+              "cmakePeakRssMiB": 72.88,
+              "rcmakePeakRssMiB": 94.05,
               "probeCacheHits": null,
               "probeCacheMisses": 0
             },
             "incrementalLeaf": {
-              "cmakeMedianMs": 928.73,
-              "rcmakeMedianMs": 832.02,
-              "rcmakeP95Ms": 915.39,
-              "speedup": 1.12,
-              "cmakePeakRssMiB": 68.97,
-              "rcmakePeakRssMiB": 111.06,
+              "cmakeMedianMs": 862.47,
+              "rcmakeMedianMs": 885.4,
+              "rcmakeP95Ms": 885.83,
+              "speedup": 0.97,
+              "cmakePeakRssMiB": 69.25,
+              "rcmakePeakRssMiB": 90.25,
               "leafFile": "extension/core_functions/aggregate/algebraic/CMakeLists.txt"
             }
           },
@@ -1156,28 +1113,28 @@
             "version": "4.12.0",
             "status": "pass",
             "cold": {
-              "cmakeMedianMs": 26639.97,
-              "rcmakeMedianMs": 20182.73,
-              "speedup": 1.32,
-              "cmakePeakRssMiB": 179.75,
-              "rcmakePeakRssMiB": 179.66
+              "cmakeMedianMs": 23502.07,
+              "rcmakeMedianMs": 16516.57,
+              "speedup": 1.42,
+              "cmakePeakRssMiB": 179.56,
+              "rcmakePeakRssMiB": 179.53
             },
             "warmProbe": {
-              "cmakeMedianMs": 25076.49,
-              "rcmakeMedianMs": 17240.11,
-              "speedup": 1.45,
-              "cmakePeakRssMiB": 179.52,
-              "rcmakePeakRssMiB": 179.53,
+              "cmakeMedianMs": 23964.48,
+              "rcmakeMedianMs": 16751.43,
+              "speedup": 1.43,
+              "cmakePeakRssMiB": 179.84,
+              "rcmakePeakRssMiB": 179.58,
               "probeCacheHits": null,
               "probeCacheMisses": 0
             },
             "incrementalLeaf": {
-              "cmakeMedianMs": 2515.78,
-              "rcmakeMedianMs": 1394.19,
-              "rcmakeP95Ms": 2404.97,
-              "speedup": 1.8,
-              "cmakePeakRssMiB": 179.38,
-              "rcmakePeakRssMiB": 179.58,
+              "cmakeMedianMs": 2414.64,
+              "rcmakeMedianMs": 1384.28,
+              "rcmakeP95Ms": 2399.53,
+              "speedup": 1.74,
+              "cmakePeakRssMiB": 179.48,
+              "rcmakePeakRssMiB": 179.53,
               "leafFile": "3rdparty/libjpeg-turbo/simd/CMakeLists.txt"
             }
           },
@@ -1187,28 +1144,28 @@
             "version": "v36.2",
             "status": "pass",
             "cold": {
-              "cmakeMedianMs": 1433.4,
-              "rcmakeMedianMs": 1684.7,
-              "speedup": 0.85,
+              "cmakeMedianMs": 1373.44,
+              "rcmakeMedianMs": 1667.65,
+              "speedup": 0.82,
               "cmakePeakRssMiB": 43.72,
-              "rcmakePeakRssMiB": 77.56
+              "rcmakePeakRssMiB": 59.22
             },
             "warmProbe": {
-              "cmakeMedianMs": 1410.69,
-              "rcmakeMedianMs": 952.21,
-              "speedup": 1.48,
-              "cmakePeakRssMiB": 43.78,
-              "rcmakePeakRssMiB": 77.84,
+              "cmakeMedianMs": 1365.95,
+              "rcmakeMedianMs": 1338.74,
+              "speedup": 1.02,
+              "cmakePeakRssMiB": 43.75,
+              "rcmakePeakRssMiB": 63.52,
               "probeCacheHits": null,
               "probeCacheMisses": 0
             },
             "incrementalLeaf": {
-              "cmakeMedianMs": 264.04,
-              "rcmakeMedianMs": 282.22,
-              "rcmakeP95Ms": 284.12,
-              "speedup": 0.94,
-              "cmakePeakRssMiB": 23.95,
-              "rcmakePeakRssMiB": 70.42,
+              "cmakeMedianMs": 262.83,
+              "rcmakeMedianMs": 320.15,
+              "rcmakeP95Ms": 344.66,
+              "speedup": 0.82,
+              "cmakePeakRssMiB": 24.03,
+              "rcmakePeakRssMiB": 52.55,
               "leafFile": "third_party/utf8_range/CMakeLists.txt"
             }
           },
@@ -1218,28 +1175,28 @@
             "version": "v6.8.3",
             "status": "pass",
             "cold": {
-              "cmakeMedianMs": 23016.07,
-              "rcmakeMedianMs": 20758.61,
-              "speedup": 1.11,
-              "cmakePeakRssMiB": 249.25,
-              "rcmakePeakRssMiB": 352.53
+              "cmakeMedianMs": 21912.49,
+              "rcmakeMedianMs": 21969.0,
+              "speedup": 1.0,
+              "cmakePeakRssMiB": 251.12,
+              "rcmakePeakRssMiB": 274.91
             },
             "warmProbe": {
-              "cmakeMedianMs": 22017.1,
-              "rcmakeMedianMs": 19614.68,
-              "speedup": 1.12,
-              "cmakePeakRssMiB": 249.05,
-              "rcmakePeakRssMiB": 353.89,
+              "cmakeMedianMs": 21348.43,
+              "rcmakeMedianMs": 18014.55,
+              "speedup": 1.19,
+              "cmakePeakRssMiB": 250.95,
+              "rcmakePeakRssMiB": 273.75,
               "probeCacheHits": null,
               "probeCacheMisses": 0
             },
             "incrementalLeaf": {
-              "cmakeMedianMs": 10402.0,
-              "rcmakeMedianMs": 7164.16,
-              "rcmakeP95Ms": 9347.36,
-              "speedup": 1.45,
-              "cmakePeakRssMiB": 239.22,
-              "rcmakePeakRssMiB": 391.88,
+              "cmakeMedianMs": 10190.08,
+              "rcmakeMedianMs": 7645.19,
+              "rcmakeP95Ms": 7656.4,
+              "speedup": 1.33,
+              "cmakePeakRssMiB": 241.25,
+              "rcmakePeakRssMiB": 267.19,
               "leafFile": "cmake/QtBuildInternals/QtStandaloneTestTemplateProject/CMakeLists.txt"
             }
           },
@@ -1249,28 +1206,28 @@
             "version": "llvmorg-20.1.8",
             "status": "pass",
             "cold": {
-              "cmakeMedianMs": 27457.49,
-              "rcmakeMedianMs": 27366.31,
-              "speedup": 1.0,
-              "cmakePeakRssMiB": 391.33,
-              "rcmakePeakRssMiB": 357.0
+              "cmakeMedianMs": 21077.62,
+              "rcmakeMedianMs": 21710.58,
+              "speedup": 0.97,
+              "cmakePeakRssMiB": 391.31,
+              "rcmakePeakRssMiB": 393.14
             },
             "warmProbe": {
-              "cmakeMedianMs": 25352.28,
-              "rcmakeMedianMs": 13278.94,
-              "speedup": 1.91,
-              "cmakePeakRssMiB": 391.25,
-              "rcmakePeakRssMiB": 359.78,
+              "cmakeMedianMs": 23532.25,
+              "rcmakeMedianMs": 13928.46,
+              "speedup": 1.69,
+              "cmakePeakRssMiB": 391.3,
+              "rcmakePeakRssMiB": 390.83,
               "probeCacheHits": null,
               "probeCacheMisses": 0
             },
             "incrementalLeaf": {
-              "cmakeMedianMs": 6592.96,
-              "rcmakeMedianMs": 6973.1,
-              "rcmakeP95Ms": 8138.16,
-              "speedup": 0.95,
-              "cmakePeakRssMiB": 382.23,
-              "rcmakePeakRssMiB": 379.77,
+              "cmakeMedianMs": 6209.07,
+              "rcmakeMedianMs": 7003.49,
+              "rcmakeP95Ms": 7214.22,
+              "speedup": 0.89,
+              "cmakePeakRssMiB": 383.52,
+              "rcmakePeakRssMiB": 385.22,
               "leafFile": "benchmarks/CMakeLists.txt"
             }
           }
@@ -1296,19 +1253,18 @@
       }
     }
   },
-  "releaseSha": "8d9182957c829008aeff644ef029a64395d4dd5c",
-  "binarySha256": "0a1e47ade3d183af55e015b7a04850cb171e973bc5e73c5edd2ebef6e5bd80e2",
+  "releaseSha": "70c2331346761105d3a608a8acb4e31c75311564",
+  "binarySha256": "fb653e67257ca1a36337fdb6d57a00f015e444a7d49ae248c78502a7328c4460",
   "knownParityGaps": [
-    "Full RunCMake on macOS and Windows and 48 of 64 vcpkg shards were still running on GitHub Actions at the v0.1.0 cutoff. Linux Full RunCMake passed 99.35 percent across 362 suites and 16 completed vcpkg shards are recorded.",
-    "Synthetic incremental leaf reconfigure recorded 110.05 ms p95 under host load average 3.94 against the 100 ms target, while staying 1.46x faster by median (106.89 ms vs 155.66 ms) and 2.47x faster at p95 (110.05 ms vs 272.34 ms) than CMake 4.5.1.",
-    "Conan fixtures passed all 6 stages including build and ctest with byte-identical package config and targets files, while the test runner failed the strict compile_commands.json path diff because CONAN_HOME was not normalized.",
-    "All 10 large C++ projects configured cleanly, while strict L1 and L2 diffing failed on absent ccmake, codemodel abstractTargets ordering, Ninja phony listfile grouping, and cmake_symlink_library spacing.",
-    "The sealed 240-repository unseen holdout on macOS arm64 recorded 132 oracle-red repositories, 33 total timeouts (32 before L1 and 1 during L1), 2 source errors, and 0 of 74 strict L1 matches across failure categories (58 generator, 10 policy, 3 find-module, 2 configure, and 1 L1 timeout).",
-    "The Linux CLI strict-mode check rejected /lib32 on Ubuntu while macOS CLI checks passed 31 of 31 subchecks, and the macOS probe cache requires /usr/sbin on PATH and bypasses unmodeled CC or CXX wrappers."
+    "Full RunCMake on Linux, macOS, and Windows and the 64-shard vcpkg matrix were still running in GitHub Actions ecosystem run 46013031088 at the v0.2.0 tag cutoff, while Linux extended conformance passed 495 of 496 cases (99.80 percent) and CLI conformance, Qt 6 AUTOGEN, and Linux T2 toolchains passed.",
+    "All 10 large C++ projects configured cleanly with matching dry-runs and diagnostics, and 7 of 10 passed strict L2 parity (duckdb, vtk, qtbase, rclcpp, boost, pytorch, and kcoreaddons, up from 1 of 10 in v0.1.0), while Linux CI strict L1 cache diffing failed because ecosystem.yml omitted the ccmake symlink from Linux staging.",
+    "Conan fixtures passed all 6 stages including build and ctest with byte-identical package config and targets files and passing IDE compile_commands checks, while strict raw file diffs remained on CMakeCache.txt, build.ninja, rules.ninja, and compile_commands.json.",
+    "The sealed 240-repository unseen holdout on macOS arm64 completed 210 of 240 repositories across 5 shards before cutoff and passed 18 of 67 oracle-green repositories at strict L1 parity (26.87 percent, up from 0 of 74 in v0.1.0), with 131 oracle-red repositories, 10 timeouts, 2 source errors, and 49 L1 differences (38 generator, 8 policy, and 3 find-module).",
+    "Quiet-host benchmarks passed the synthetic incremental leaf gate at 59.79 ms p95 (2.24x faster than CMake 4.5.1), 5.70x warm probe cache, 1.96x 500-target cold configure, and 1.26x warm giant geomean across all 5 giants, while cold configure on small synthetic projects and cold duckdb, protobuf, and llvm-project remained between 0.82x and 0.97x and determinism.py passed all output comparisons while observing no overlapping parallel probe workers."
   ],
   "receipt": {
-    "commit": "8d9182957c829008aeff644ef029a64395d4dd5c",
-    "binarySha256": "0a1e47ade3d183af55e015b7a04850cb171e973bc5e73c5edd2ebef6e5bd80e2",
-    "binarySizeBytes": 15018896
+    "commit": "70c2331346761105d3a608a8acb4e31c75311564",
+    "binarySha256": "fb653e67257ca1a36337fdb6d57a00f015e444a7d49ae248c78502a7328c4460",
+    "binarySizeBytes": 16959248
   }
 }

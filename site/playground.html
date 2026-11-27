@@ -19,12 +19,12 @@
   <meta property="og:image" content="https://rcmake.github.io/rcmake/assets/og-card.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, and cpack.">
+  <meta property="og:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ccmake, ctest, and cpack.">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="rcmake WebAssembly playground for CMake 4.5.1 and Ninja">
   <meta name="twitter:description" content="Configure CMake 4.5.1 projects, generate Ninja build files, inspect diagnostics, and run rcmake explain locally in your browser with WebAssembly.">
   <meta name="twitter:image" content="https://rcmake.github.io/rcmake/assets/og-card.png">
-  <meta name="twitter:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ctest, and cpack.">
+  <meta name="twitter:image:alt" content="rcmake is a drop-in CMake 4.5.1 replacement in safe Rust. One binary runs as cmake, ccmake, ctest, and cpack.">
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg">
   <link rel="stylesheet" href="./styles.css">
   <link rel="modulepreload" href="./playground.js">
@@ -39,11 +39,11 @@
           "@id": "https://rcmake.github.io/rcmake/playground.html#app",
           "name": "rcmake WebAssembly playground",
           "url": "https://rcmake.github.io/rcmake/playground.html",
-          "description": "Browser workbench that runs the rcmake CMake 4.5.1 configure engine, Ninja and Ninja Multi-Config generation, diagnostics, and rcmake explain locally in WebAssembly on PureHost with no server.",
+          "description": "Browser workbench that runs the rcmake 0.2.0 CMake 4.5.1 configure engine, Ninja and Ninja Multi-Config generation, diagnostics, and rcmake explain locally in WebAssembly on PureHost with no server.",
           "applicationCategory": "DeveloperApplication",
           "operatingSystem": "Any browser with WebAssembly support",
           "browserRequirements": "Requires JavaScript and WebAssembly",
-          "softwareVersion": "0.1.0",
+          "softwareVersion": "0.2.0",
           "license": [
             "https://spdx.org/licenses/MIT.html",
             "https://spdx.org/licenses/Apache-2.0.html"
@@ -140,7 +140,13 @@
         <strong>JavaScript and WebAssembly are required for the live playground.</strong> This page loads <code>rcmake_wasm.wasm</code> on <code>PureHost</code> to run CMake 4.5.1 configure, <code>Ninja</code> and <code>Ninja Multi-Config</code> generation, diagnostics, and <code>rcmake explain</code> locally in your browser with no server. Enable JavaScript to run it, or read the <a href="./index.html">overview</a>, <a href="./llms.txt">llms.txt</a>, or the <a href="https://github.com/rcmake/rcmake">GitHub repository</a>.
       </div>
     </noscript>
-    <div class="toolbar">
+    <nav class="jump-nav jump-nav-compact" aria-label="Jump to workbench section">
+      <a href="#toolbar">Controls</a>
+      <a href="#pane-editor">Source editor</a>
+      <a href="#pane-output">Build output</a>
+      <a href="#playground-legal">Notices</a>
+    </nav>
+    <div class="toolbar" id="toolbar">
       <label>Example <select id="example-select" data-test="example-select"><option value="hello-cpp20">Hello C++20</option></select></label>
       <div class="seg" role="radiogroup" aria-label="Generator" id="generator-group" data-test="generator-group">
         <button type="button" role="radio" aria-checked="true" data-gen="Ninja"><svg class="i" aria-hidden="true"><use href="#i-graph"/></svg>Ninja</button>
@@ -216,9 +222,9 @@
         </div>
       </section>
     </div>
-    <footer class="bench-legal" aria-label="License and notices">
+    <footer id="playground-legal" class="bench-legal" aria-label="License and notices">
       <span>MIT OR Apache-2.0. Bundles CMake 4.5.1 Modules/, Templates/, and Help/ under BSD-3-Clause. Not affiliated with Kitware. CMake is a trademark of Kitware, Inc.</span>
-      <span class="bench-legal-links"><a href="./index.html">Overview</a> · <a href="./dashboard.html">Compatibility</a> · <a href="https://github.com/rcmake/rcmake">GitHub</a></span>
+      <span class="bench-legal-links"><a href="./index.html">Overview</a> · <a href="./dashboard.html">Compatibility</a> · <a href="https://github.com/rcmake/rcmake/blob/main/docs/README.md">Docs</a> · <a href="https://github.com/rcmake/rcmake">GitHub</a></span>
     </footer>
   </main>
 
