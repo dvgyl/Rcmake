@@ -771,12 +771,13 @@ impl ConfigureResult {
             Some(ExplainFilter::Dependency(wanted)) => {
                 let names: Vec<BString> = configs.keys().cloned().collect();
                 let report = self.dependency_paths(dir, id, wanted, &names);
-                let reached: BTreeSet<TargetId> = report
-                    .paths
-                    .iter()
-                    .flat_map(|path| path.hops.iter().map(|hop| hop.id))
-                    .collect();
                 for config in configs.values_mut() {
+                    // Keep the link entries that reach a hop of a path in this
+                    // configuration only.
+                    let reached: BTreeSet<TargetId> = report
+                        .paths_for(Some(&config.name))
+                        .flat_map(|path| path.hops.iter().map(|hop| hop.id))
+                        .collect();
                     config.entries.retain(|entry| {
                         entry.kind == ChainKind::LinkItem
                             && entry

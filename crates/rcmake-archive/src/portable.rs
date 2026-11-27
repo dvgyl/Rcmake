@@ -180,6 +180,24 @@ pub fn read_portable(
     archive: &[u8],
     limits: &PortableLimits,
 ) -> Result<Vec<PortableMember>, ArchiveError> {
+    read_portable_checked(archive, limits, &mut |_| Ok(()))
+}
+
+/// Read a portable cache archive like [`read_portable`] and give each member to
+/// `check` as soon as it is read.
+///
+/// The reader stops at the first member that `check` rejects, before it
+/// decompresses the rest of the archive. A caller uses `check` to charge an
+/// aggregate budget, for example the declared decoded size of each entry.
+///
+/// # Errors
+///
+/// Returns the errors of [`read_portable`] and the first error message of `check`.
+pub fn read_portable_checked(
+    archive: &[u8],
+    limits: &PortableLimits,
+    check: &mut dyn FnMut(&PortableMember) -> Result<(), String>,
+) -> Result<Vec<PortableMember>, ArchiveError> {
     if archive.len() as u64 > limits.archive_bytes {
         return Err(ArchiveError::new(format!(
             "The archive exceeds {} bytes.",
@@ -191,7 +209,7 @@ pub fn read_portable(
         inner: &mut decoder,
         left: limits.tar_bytes,
     };
-    let members = read_members(&mut stream, limits)?;
+    let members = read_members(&mut stream, limits, check)?;
     let trailing = decoder.into_inner();
     if !trailing.is_empty() {
         return Err(ArchiveError::new(
@@ -204,6 +222,7 @@ pub fn read_portable(
 fn read_members(
     stream: &mut impl Read,
     limits: &PortableLimits,
+    check: &mut dyn FnMut(&PortableMember) -> Result<(), String>,
 ) -> Result<Vec<PortableMember>, ArchiveError> {
     let mut members = Vec::new();
     let mut seen = BTreeSet::new();
@@ -267,7 +286,9 @@ fn read_members(
         if pad.iter().any(|&byte| byte != 0) {
             return Err(ArchiveError::new("A member has nonzero padding."));
         }
-        members.push(PortableMember { name, data });
+        let member = PortableMember { name, data };
+        check(&member).map_err(ArchiveError::new)?;
+        members.push(member);
     }
     if members.is_empty() {
         return Err(ArchiveError::new("The archive has no manifest."));

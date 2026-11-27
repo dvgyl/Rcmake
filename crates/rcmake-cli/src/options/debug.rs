@@ -11,7 +11,7 @@ pub(super) fn parse<'a>(
     profile_format: &mut Option<&'a [u8]>,
 ) -> Result<bool, String> {
     match arg.flag {
-        b"--debugger" => {
+        b"--debugger" if arg.inline.is_none() => {
             if !rcmake_dap::TRANSPORT_SUPPORTED {
                 return Err("CMake was not built with support for --debugger".into());
             }

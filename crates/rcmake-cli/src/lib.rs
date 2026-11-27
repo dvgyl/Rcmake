@@ -252,54 +252,58 @@ pub(crate) fn version_text(tool: Tool, json: bool) -> Vec<u8> {
     text.into()
 }
 
+fn is_existing_dir_operand(host: &dyn Host, operand: &[u8]) -> bool {
+    host.metadata(&resolve_cli_path(host, operand), Follow::Yes)
+        .is_ok_and(|meta| meta.kind == FileKind::Dir)
+}
+
+fn sibling_tool_argv0(argv0: Option<&BString>, tool: &str, host: &dyn Host) -> BString {
+    if let Some(raw) = argv0 {
+        let p = rcmake_host::path::to_native(raw);
+        if p.parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+        {
+            let leaf = if host.system().sysname == b"Windows" {
+                format!("{tool}.exe")
+            } else {
+                tool.to_owned()
+            };
+            return rcmake_host::path::from_native(&p.with_file_name(leaf));
+        }
+    }
+    BString::from(tool)
+}
+
 fn run_cmake(
     argv: &[BString],
     rest: &[BString],
     persona: persona::Persona,
     host: Arc<dyn Host>,
 ) -> i32 {
-    if persona == persona::Persona::Native {
-        if let [command, args @ ..] = rest
-            && matches!(
-                command.as_slice(),
-                b"doctor" | b"cache" | b"diff-config" | b"explain" | b"fmt" | b"lint" | b"verify"
-            )
-            && !host
-                .metadata(&resolve_cli_path(host.as_ref(), command), Follow::Yes)
-                .is_ok_and(|meta| meta.kind == FileKind::Dir)
-        {
-            return match command.as_slice() {
-                b"doctor" => probe_cache::doctor(argv.first(), args, host.as_ref()),
-                b"cache" => probe_cache::cache(args, host.as_ref()),
-                b"diff-config" => diff_config_cmd::run(argv.first(), args, host),
-                b"explain" => explain_cmd::run(argv.first(), args, host),
-                b"fmt" => fmt_cmd::run(argv.first(), args, host),
-                b"lint" => lint_cmd::run(argv.first(), args, host),
-                b"verify" => verify_cmd::run(argv.first(), args, host),
-                _ => 2,
-            };
-        }
-        if let Some(args) = rest.strip_prefix(&[BString::from("ctest")]) {
-            let mut sub_argv = Vec::with_capacity(args.len() + 1);
-            sub_argv.push(BString::from("ctest"));
-            sub_argv.extend_from_slice(args);
-            return run_tool(&sub_argv, Tool::Ctest, persona, host);
-        }
-        if let Some(args) = rest.strip_prefix(&[BString::from("cpack")]) {
-            let mut sub_argv = Vec::with_capacity(args.len() + 1);
-            sub_argv.push(BString::from("cpack"));
-            sub_argv.extend_from_slice(args);
-            return run_tool(&sub_argv, Tool::Cpack, persona, host);
-        }
-        if let Some(args) = rest.strip_prefix(&[BString::from("ccmake")])
-            && !host
-                .metadata(&resolve_cli_path(host.as_ref(), b"ccmake"), Follow::Yes)
-                .is_ok_and(|meta| meta.kind == FileKind::Dir)
-        {
-            let mut sub_argv = Vec::with_capacity(args.len() + 1);
-            sub_argv.push(BString::from("ccmake"));
-            sub_argv.extend_from_slice(args);
-            return run_tool(&sub_argv, Tool::Ccmake, persona, host);
+    if persona == persona::Persona::Native
+        && let [command, args @ ..] = rest
+        && !is_existing_dir_operand(host.as_ref(), command)
+    {
+        match command.as_slice() {
+            b"doctor" => return probe_cache::doctor(argv.first(), args, host.as_ref()),
+            b"cache" => return probe_cache::cache(args, host.as_ref()),
+            b"diff-config" => return diff_config_cmd::run(argv.first(), args, host),
+            b"explain" => return explain_cmd::run(argv.first(), args, host),
+            b"fmt" => return fmt_cmd::run(argv.first(), args, host),
+            b"lint" => return lint_cmd::run(argv.first(), args, host),
+            b"verify" => return verify_cmd::run(argv.first(), args, host),
+            b"ctest" | b"cpack" | b"ccmake" => {
+                let (tool_name, tool) = match command.as_slice() {
+                    b"ctest" => ("ctest", Tool::Ctest),
+                    b"cpack" => ("cpack", Tool::Cpack),
+                    _ => ("ccmake", Tool::Ccmake),
+                };
+                let mut sub_argv = Vec::with_capacity(args.len() + 1);
+                sub_argv.push(sibling_tool_argv0(argv.first(), tool_name, host.as_ref()));
+                sub_argv.extend_from_slice(args);
+                return run_tool(&sub_argv, tool, persona, host);
+            }
+            _ => {}
         }
     }
     if let Some(sub_args) = rest.strip_prefix(&[BString::from("-E")]) {
@@ -545,7 +549,10 @@ fn new_interp_with_paths(
         "cmake"
     };
     let alias = cmake_command.with_file_name(name);
-    let cmake_command = if alias != cmake_command
+    // Preserve `rcmake` in Native persona so build-time regeneration (`RERUN_CMAKE` /
+    // `--regenerate-during-build`) stays in Native persona instead of dropping into Compat.
+    let cmake_command = if opts.persona != persona::Persona::Native
+        && alias != cmake_command
         && host
             .canonicalize(&alias)
             .is_ok_and(|path| path == cmake_command)
@@ -854,7 +861,7 @@ mod tests {
         );
         assert_eq!(code, 0);
         let out = host.stream_bytes(Stream::Stdout);
-        assert_eq!(out, b"cmake version 4.5.1\nrcmake 0.1.0\n");
+        assert_eq!(out, b"cmake version 4.5.1\nrcmake 0.2.0\n");
     }
 
     #[test]
@@ -1090,6 +1097,8 @@ mod tests {
             "lint",
             "verify",
             "ccmake",
+            "ctest",
+            "cpack",
         ];
 
         for name in subcommands {
@@ -1146,5 +1155,148 @@ mod tests {
                 "native without dir for {name} unexpectedly fell into configure: stderr={native_err}"
             );
         }
+    }
+
+    #[test]
+    fn native_configure_preserves_rcmake_cmake_command_with_sibling_cmake_symlink() {
+        let rcmake_exe = Path::new("/usr/local/bin/rcmake");
+        let cmake_link = Path::new("/usr/local/bin/cmake");
+        let host = Arc::new(rcmake_host::PureHost::new(
+            PathBuf::from("/work"),
+            rcmake_exe.to_path_buf(),
+        ));
+        let modules = Path::new("/usr/local/share/cmake-4.5/Modules");
+        for (name, contents) in [
+            ("CMakeDetermineSystem.cmake", ""),
+            ("CMakeSystemSpecificInitialize.cmake", ""),
+            ("CMakeSystemSpecificInformation.cmake", ""),
+            (
+                "CMakeNinjaFindMake.cmake",
+                "set(CMAKE_MAKE_PROGRAM /tools/ninja CACHE FILEPATH \"\")\n",
+            ),
+        ] {
+            host.seed_file(&modules.join(name), contents.as_bytes())
+                .unwrap();
+        }
+        host.seed_file(rcmake_exe, b"bin").unwrap();
+        host.symlink(rcmake_exe, cmake_link).unwrap();
+        host.seed_file(
+            Path::new("/work/CMakeLists.txt"),
+            b"cmake_minimum_required(VERSION 3.10)\nproject(NativeRegen NONE)\nmessage(STATUS \"cmd=${CMAKE_COMMAND}\")\n",
+        )
+        .unwrap();
+
+        // Native persona keeps CMAKE_COMMAND pointing to rcmake even when sibling cmake symlink exists.
+        let native_args = [
+            "/usr/local/bin/rcmake",
+            "-S",
+            ".",
+            "-B",
+            "build_native",
+            "-G",
+            "Ninja",
+            "-DCMAKE_MAKE_PROGRAM=ninja",
+        ]
+        .map(BString::from);
+        assert_eq!(
+            run(&native_args, host.clone()),
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        let native_cache = String::from_utf8_lossy(
+            &host
+                .read(
+                    Path::new("/work/build_native/CMakeCache.txt"),
+                    rcmake_host::ReadRange::All { limit: 1 << 20 },
+                )
+                .unwrap(),
+        )
+        .into_owned();
+        assert!(
+            native_cache.contains("CMAKE_COMMAND:INTERNAL=/usr/local/bin/rcmake"),
+            "native cache should keep rcmake path: {native_cache}"
+        );
+        let build_ninja = String::from_utf8_lossy(
+            &host
+                .read(
+                    Path::new("/work/build_native/build.ninja"),
+                    rcmake_host::ReadRange::All { limit: 1 << 20 },
+                )
+                .unwrap(),
+        )
+        .into_owned();
+        assert!(
+            build_ninja.contains("/usr/local/bin/rcmake"),
+            "build.ninja RERUN_CMAKE should invoke rcmake: {build_ninja}"
+        );
+
+        // Re-running build-time regeneration with the recorded CMAKE_COMMAND stays in Native persona.
+        let regen_args = [
+            "/usr/local/bin/rcmake",
+            "--regenerate-during-build",
+            "-S/work",
+            "-B/work/build_native",
+        ]
+        .map(BString::from);
+        assert_eq!(
+            run(&regen_args, host.clone()),
+            0,
+            "{}",
+            host.stream_bytes(Stream::Stderr)
+        );
+        let regen_cache = String::from_utf8_lossy(
+            &host
+                .read(
+                    Path::new("/work/build_native/CMakeCache.txt"),
+                    rcmake_host::ReadRange::All { limit: 1 << 20 },
+                )
+                .unwrap(),
+        )
+        .into_owned();
+        assert!(
+            regen_cache.contains("CMAKE_COMMAND:INTERNAL=/usr/local/bin/rcmake"),
+            "regenerated cache must stay native: {regen_cache}"
+        );
+
+        // Compat persona still rewrites CMAKE_COMMAND to sibling cmake symlink.
+        let compat_args = [
+            "/usr/local/bin/cmake",
+            "-S",
+            ".",
+            "-B",
+            "build_compat",
+            "-G",
+            "Ninja",
+            "-DCMAKE_MAKE_PROGRAM=ninja",
+        ]
+        .map(BString::from);
+        assert_eq!(run(&compat_args, host.clone()), 0);
+        let compat_cache = String::from_utf8_lossy(
+            &host
+                .read(
+                    Path::new("/work/build_compat/CMakeCache.txt"),
+                    rcmake_host::ReadRange::All { limit: 1 << 20 },
+                )
+                .unwrap(),
+        )
+        .into_owned();
+        assert!(
+            compat_cache.contains("CMAKE_COMMAND:INTERNAL=/usr/local/bin/cmake"),
+            "compat cache should rewrite to sibling cmake: {compat_cache}"
+        );
+    }
+
+    #[test]
+    fn sibling_tool_argv0_preserves_parent_dir() {
+        let host = rcmake_host::PureHost::default();
+        assert_eq!(
+            sibling_tool_argv0(Some(&BString::from("/opt/bin/rcmake")), "ctest", &host),
+            BString::from("/opt/bin/ctest")
+        );
+        assert_eq!(
+            sibling_tool_argv0(Some(&BString::from("rcmake")), "cpack", &host),
+            BString::from("cpack")
+        );
     }
 }

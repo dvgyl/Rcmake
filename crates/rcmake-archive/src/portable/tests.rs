@@ -365,3 +365,22 @@ fn writer_applies_the_reader_limits() -> TestResult {
     assert_eq!(read_portable(&archive, &exact)?.len(), 3);
     Ok(())
 }
+
+#[test]
+fn member_check_stops_the_read_at_the_first_rejected_member() -> TestResult {
+    let archive = sample()?;
+    let mut seen = Vec::new();
+    let result = read_portable_checked(&archive, &LIMITS, &mut |member| {
+        seen.push(member.name);
+        if matches!(member.name, PortableName::Entry(_)) {
+            Err("over budget".to_owned())
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.is_err());
+    assert_eq!(seen, [PortableName::Manifest, PortableName::Entry(KEY)]);
+    let all = read_portable_checked(&archive, &LIMITS, &mut |_| Ok(()))?;
+    assert_eq!(all, read_portable(&archive, &LIMITS)?);
+    Ok(())
+}

@@ -37,6 +37,9 @@ impl Evaluator<'_> {
                 Ok(ctx.config.0.clone())
             }
             b"OUTPUT_CONFIG" | b"COMMAND_CONFIG" => {
+                if let Some(trace) = self.trace.as_deref_mut() {
+                    trace.cross_config(call.name);
+                }
                 let config = if call.name == b"OUTPUT_CONFIG" {
                     &ctx.output_config
                 } else {

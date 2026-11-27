@@ -137,3 +137,15 @@ fn host_operators_are_marked() {
     let (_, trace) = traced("$<CONFIG:Debug>", &debug(), 16);
     assert!(!trace.steps[0].host);
 }
+
+#[test]
+fn cross_config_operators_are_flagged_past_the_step_limit() {
+    let (_, trace) = traced("$<1:$<1:$<COMMAND_CONFIG:x>>>", &debug(), 1);
+    assert_eq!(trace.steps.len(), 1);
+    assert!(trace.command_config_used);
+    assert!(!trace.output_config_used);
+    let (_, trace) = traced("$<OUTPUT_CONFIG:x>", &debug(), 0);
+    assert!(trace.steps.is_empty());
+    assert!(trace.output_config_used);
+    assert!(!trace.command_config_used);
+}

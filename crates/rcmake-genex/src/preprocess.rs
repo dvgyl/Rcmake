@@ -133,14 +133,24 @@ fn strip_nodes(nodes: &[GenexNode], mode: PreprocessMode, prefix: &[u8]) -> Vec<
     out
 }
 
+/// Prefix each relative list item of `payload`. A `;` separates items only outside
+/// square brackets, with the signed bracket depth of the CMake list rules.
 fn prefix_items(payload: Vec<GenexNode>, prefix: &[u8], out: &mut Vec<GenexNode>) {
     let mut start = true;
     let mut escaped = false;
+    let mut depth = 0_isize;
     for node in payload {
         if let GenexNode::Text(text) = node {
             let mut offset = 0;
             for (i, &byte) in text.iter().enumerate() {
-                if byte == b';' && !escaped {
+                if !escaped {
+                    match byte {
+                        b'[' => depth = depth.saturating_add(1),
+                        b']' => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                if byte == b';' && !escaped && depth == 0 {
                     push_path_text(
                         text.get(offset..=i).unwrap_or_default(),
                         prefix,
@@ -159,9 +169,11 @@ fn prefix_items(payload: Vec<GenexNode>, prefix: &[u8], out: &mut Vec<GenexNode>
                 out,
             );
         } else {
+            // CMake splits the text on each side of an expression separately.
             out.push(node);
             start = false;
             escaped = false;
+            depth = 0;
         }
     }
 }
@@ -255,6 +267,17 @@ fn prefixes_install_paths_before_joining_adjacent_text() -> Result<(), crate::Ge
     assert_eq!(
         render(&ast.strip_install_paths(b"${_IMPORT_PREFIX}/").nodes),
         "${_IMPORT_PREFIX}/include/api;${_IMPORT_PREFIX}/a;/opt/b;$<INSTALL_PREFIX>/c;${_IMPORT_PREFIX}/d$<CONFIG>;bare"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn install_prefix_items_keep_bracketed_semicolons() -> Result<(), crate::GenexError> {
+    let ast = crate::parse(b"$<INSTALL_INTERFACE:a[x;y];b;]c;d>")?;
+    assert_eq!(
+        render(&ast.strip_install_paths(b"P/").nodes),
+        "P/a[x;y];P/b;P/]c;d"
     );
     Ok(())
 }

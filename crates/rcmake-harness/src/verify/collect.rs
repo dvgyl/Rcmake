@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rcmake_base::{BString, cmdline::Arguments, path_lex::Lexical};
@@ -32,6 +33,8 @@ const MAX_NINJA_DIR_ENTRIES: usize = 4096;
 const MAX_NINJA_MANIFESTS: usize = 64;
 const MAX_NINJA_INCLUDE_DEPTH: usize = 8;
 const MAX_NINJA_SUBFILES: usize = 128;
+const MAX_NINJA_GRAPH_BYTES: usize = 32 << 20;
+const MAX_NINJA_GRAPH_WORK: usize = 2_000_000;
 const MAX_NINJA_OUTPUT_BYTES: usize = 32 << 20;
 const MAX_TAIL_CHARS: usize = 4096;
 const NINJA_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -175,12 +178,64 @@ pub(crate) struct CompileDbEvidence {
     pub(crate) opaque_count: usize,
 }
 
+/// Compact, non-quadratic build-edge dependency graph for one Ninja manifest.
+///
+/// Each build edge's input list is stored once in [`Self::edge_inputs`] (`Arc<[BString]>`)
+/// and referenced by edge index from [`Self::output_edges`], avoiding quadratic memory
+/// blowup on multi-output build edges.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NinjaDepGraph {
+    pub(crate) edge_inputs: Vec<Arc<[BString]>>,
+    pub(crate) output_edges: BTreeMap<BString, Vec<usize>>,
+}
+
+/// Shared retained-memory and work budget across Ninja manifest scans for a run.
+pub(crate) struct NinjaGraphBudget {
+    retained_bytes: usize,
+    work_units: usize,
+    max_bytes: usize,
+    max_work: usize,
+}
+
+impl NinjaGraphBudget {
+    pub(crate) fn new(max_bytes: usize, max_work: usize) -> Self {
+        Self {
+            retained_bytes: 0,
+            work_units: 0,
+            max_bytes,
+            max_work,
+        }
+    }
+
+    fn charge_bytes(&mut self, bytes: usize) -> Result<(), String> {
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        if self.retained_bytes > self.max_bytes {
+            return Err(format!(
+                "Ninja manifest dependency graph exceeded retained memory budget ({} > {} bytes).",
+                self.retained_bytes, self.max_bytes
+            ));
+        }
+        Ok(())
+    }
+
+    fn charge_work(&mut self, units: usize) -> Result<(), String> {
+        self.work_units = self.work_units.saturating_add(units);
+        if self.work_units > self.max_work {
+            return Err(format!(
+                "Ninja manifest dependency graph exceeded work budget ({} > {} units).",
+                self.work_units, self.max_work
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One manifest's Ninja dry-run commands plus lightweight build-graph dependencies.
 #[derive(Clone, Debug)]
 pub(crate) struct NinjaManifestEvidence {
     pub(crate) commands: Vec<BString>,
-    /// Map from produced output path to all direct inputs (explicit + implicit + order-only).
-    pub(crate) dep_edges: BTreeMap<BString, BTreeSet<BString>>,
+    /// Shared-edge dependency graph mapping produced output paths to edge input slices.
+    pub(crate) dep_edges: NinjaDepGraph,
 }
 
 /// Result of the Ninja dry-run stage.
@@ -1582,6 +1637,7 @@ fn collect_ninja_dry_run(
     };
 
     let mut out = BTreeMap::new();
+    let mut graph_budget = NinjaGraphBudget::new(MAX_NINJA_GRAPH_BYTES, MAX_NINJA_GRAPH_WORK);
     for (label, filename) in manifests {
         let Some(timeout) = deadline.step_timeout(host, NINJA_DRY_RUN_TIMEOUT) else {
             return NinjaDryRunEvidence::Unavailable(
@@ -1589,7 +1645,7 @@ fn collect_ninja_dry_run(
             );
         };
 
-        let mut dep_edges: BTreeMap<BString, BTreeSet<BString>> = BTreeMap::new();
+        let mut dep_edges = NinjaDepGraph::default();
         let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
         if let Err(reason) = scan_ninja_manifest(
             reader,
@@ -1597,6 +1653,7 @@ fn collect_ninja_dry_run(
             0,
             &mut visited,
             &mut dep_edges,
+            &mut graph_budget,
         ) {
             return NinjaDryRunEvidence::Unavailable(reason);
         }
@@ -1921,12 +1978,13 @@ fn looks_like_ninja_version(line: &str) -> bool {
 
 /// Inspect Ninja manifests via `ArtifactReader` to verify complete containment, detect
 /// unresolved `dyndep` files, and collect build-edge dependencies.
-fn scan_ninja_manifest(
+pub(crate) fn scan_ninja_manifest(
     reader: &mut ArtifactReader<'_>,
     rel_path: &Path,
     depth: usize,
     visited: &mut BTreeSet<PathBuf>,
-    dep_edges: &mut BTreeMap<BString, BTreeSet<BString>>,
+    dep_edges: &mut NinjaDepGraph,
+    budget: &mut NinjaGraphBudget,
 ) -> Result<(), String> {
     if depth > MAX_NINJA_INCLUDE_DEPTH {
         return Err(format!(
@@ -1957,6 +2015,7 @@ fn scan_ninja_manifest(
     let mut logical_lines: Vec<String> = Vec::new();
     let mut current = String::new();
     for raw in text.lines() {
+        budget.charge_work(1)?;
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         if let Some(prefix) = line.strip_suffix('$') {
             current.push_str(prefix);
@@ -2020,7 +2079,7 @@ fn scan_ninja_manifest(
             continue;
         }
         if let Some(rest) = line.strip_prefix("build ") {
-            parse_ninja_build_edge(rest, dep_edges);
+            parse_ninja_build_edge(rest, dep_edges, budget)?;
         }
     }
 
@@ -2032,35 +2091,74 @@ fn scan_ninja_manifest(
                 sub.display()
             ));
         }
-        scan_ninja_manifest(reader, &sub, depth + 1, visited, dep_edges)?;
+        scan_ninja_manifest(reader, &sub, depth + 1, visited, dep_edges, budget)?;
     }
     Ok(())
 }
 
-fn parse_ninja_build_edge(rest: &str, dep_edges: &mut BTreeMap<BString, BTreeSet<BString>>) {
+fn parse_ninja_build_edge(
+    rest: &str,
+    dep_edges: &mut NinjaDepGraph,
+    budget: &mut NinjaGraphBudget,
+) -> Result<(), String> {
     let Some((lhs, rhs)) = split_ninja_colon(rest) else {
-        return;
+        return Ok(());
     };
     let outputs = split_ninja_paths(lhs);
     let mut rhs_tokens = split_ninja_paths(rhs).into_iter();
     // First token after `:` is the rule name.
     let _rule = rhs_tokens.next();
-    let inputs: Vec<BString> = rhs_tokens
-        .filter(|tok| tok != "|" && tok != "||")
-        .map(BString::from)
-        .collect();
-    if inputs.is_empty() {
-        return;
-    }
-    for out in outputs {
-        if out == "|" {
+    let mut seen_inputs: BTreeSet<BString> = BTreeSet::new();
+    let mut inputs: Vec<BString> = Vec::new();
+    for tok in rhs_tokens {
+        budget.charge_work(1)?;
+        if tok == "|" || tok == "||" {
             continue;
         }
-        let entry = dep_edges.entry(BString::from(out)).or_default();
-        for inp in &inputs {
-            entry.insert(inp.clone());
+        let b = BString::from(tok);
+        if seen_inputs.insert(b.clone()) {
+            inputs.push(b);
         }
     }
+    if inputs.is_empty() {
+        return Ok(());
+    }
+
+    let valid_outputs: Vec<BString> = outputs
+        .into_iter()
+        .filter(|out| out != "|")
+        .map(BString::from)
+        .collect();
+    if valid_outputs.is_empty() {
+        return Ok(());
+    }
+    budget.charge_work(valid_outputs.len())?;
+
+    let input_bytes: usize = inputs
+        .iter()
+        .map(|inp| std::mem::size_of::<BString>().saturating_add(inp.len()))
+        .fold(std::mem::size_of::<Arc<[BString]>>(), usize::saturating_add);
+    budget.charge_bytes(input_bytes)?;
+
+    let edge_idx = dep_edges.edge_inputs.len();
+    dep_edges.edge_inputs.push(Arc::from(inputs));
+
+    for out in valid_outputs {
+        let is_new_key = !dep_edges.output_edges.contains_key(&out);
+        let key_bytes = if is_new_key {
+            std::mem::size_of::<BString>()
+                .saturating_add(out.len())
+                .saturating_add(64)
+        } else {
+            0
+        };
+        budget.charge_bytes(key_bytes.saturating_add(std::mem::size_of::<usize>()))?;
+        let refs = dep_edges.output_edges.entry(out).or_default();
+        if refs.last().copied() != Some(edge_idx) {
+            refs.push(edge_idx);
+        }
+    }
+    Ok(())
 }
 
 fn split_ninja_colon(s: &str) -> Option<(&str, &str)> {

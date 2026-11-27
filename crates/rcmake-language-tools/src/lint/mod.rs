@@ -168,7 +168,7 @@ pub struct HostWorkspaceReader<'a> {
     host: &'a dyn Host,
     readable_roots: Vec<PathBuf>,
     bundled_modules: Option<PathBuf>,
-    open_buffers: BTreeMap<PathBuf, Arc<[u8]>>,
+    open_buffers: Arc<BTreeMap<PathBuf, Arc<[u8]>>>,
 }
 
 impl<'a> HostWorkspaceReader<'a> {
@@ -197,14 +197,20 @@ impl<'a> HostWorkspaceReader<'a> {
             host,
             readable_roots: canonical_roots,
             bundled_modules: bundled,
-            open_buffers: BTreeMap::new(),
+            open_buffers: Arc::new(BTreeMap::new()),
         }
     }
 
     /// Register an open in-memory buffer that takes precedence over disk for `path`.
     pub fn insert_open_buffer(&mut self, path: PathBuf, bytes: Arc<[u8]>) {
         let norm = normalize_lexical(&path);
-        self.open_buffers.insert(norm, bytes);
+        Arc::make_mut(&mut self.open_buffers).insert(norm, bytes);
+    }
+
+    /// Share a pre-built immutable snapshot of open in-memory buffers without cloning
+    /// individual file contents.
+    pub fn set_open_buffers(&mut self, buffers: Arc<BTreeMap<PathBuf, Arc<[u8]>>>) {
+        self.open_buffers = buffers;
     }
 
     fn is_within_roots(&self, canonical: &Path) -> bool {

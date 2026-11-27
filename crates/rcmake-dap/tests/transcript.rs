@@ -1320,3 +1320,31 @@ fn attached_debugger_disables_incremental_replay() {
     client.finish();
     assert_eq!(worker.join().unwrap(), (true, true));
 }
+
+/// A listener whose client never connects.
+struct RefusingListener;
+
+impl rcmake_dap::transport::Listener for RefusingListener {
+    fn accept(self: Box<Self>) -> std::io::Result<Box<dyn rcmake_dap::transport::Connection>> {
+        Err(std::io::Error::other("connection refused"))
+    }
+}
+
+#[test]
+#[allow(clippy::unwrap_used, reason = "a fixture failure fails the test")]
+fn accept_failure_reports_the_error_and_not_a_connection() {
+    bounded(|| {
+        let host = host(&[]);
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let server = DebugServer::start(Box::new(RefusingListener), config(&host, &stdout));
+        assert!(!server.is_active());
+        server.finish(0);
+        let out = String::from_utf8(stdout.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            out,
+            "Waiting for debugger client to connect...\n\
+             Error: Failed to accept the debugger client connection.\n\
+             connection refused\n"
+        );
+    });
+}

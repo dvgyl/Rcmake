@@ -21,18 +21,23 @@ use rcmake_presets::{EnvSnapshot, PresetKind, PresetSettings};
 use crate::options::split_flag;
 use crate::resolve_cli_path;
 
-/// Overall launcher deadline for the companion process (gives companion's 600s deadline room to emit reports).
-const VERIFY_LAUNCHER_TIMEOUT: Duration = Duration::from_secs(660);
+/// Default wall-clock timeout in seconds for the full verify workflow.
+const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 600;
+/// Extra grace seconds granted to the launcher above the companion's overall deadline so the
+/// companion can finish cleanly and emit its structured report.
+const VERIFY_LAUNCHER_GRACE_SECS: u64 = 60;
 
 const HELP: &str = "\
-Usage: rcmake verify [--json] --oracle <path> -- <configure arguments>
+Usage: rcmake verify [--json] [--timeout <secs>] [--oracle <path>] -- <configure arguments>
 
 Run both rcmake (in compatibility mode) and an explicit upstream CMake binary
 against identical staged copies of a project, then compare File API codemodel,
 CMakeCache.txt, compile_commands.json, and Ninja dry-run output.
 
 Options:
-  --oracle <path>   Path to the reference CMake 4.5.1 executable (required).
+  --oracle <path>   Path to the reference CMake 4.5.1 executable
+                    (optional when the companion reads the oracle environment variable).
+  --timeout <secs>  Overall timeout in seconds (default: 600; env: RCMAKE_VERIFY_TIMEOUT).
   --json            Write one machine-readable JSON report to standard output.
   -h, --help        Show this help.
 
@@ -40,6 +45,8 @@ Notes:
   verify stages a pristine copy of the source tree into a private scratch
   directory and never writes to the caller's source or build directory.
   Configure project code executes twice (once per engine).
+  Progress phase messages are written to standard error; standard output
+  contains only the final report (pure JSON when --json is set).
 
 Exit status:
   0  Parity across all applicable sections (with CMake 4.5.1).
@@ -49,7 +56,8 @@ Exit status:
 
 #[derive(Debug)]
 struct VerifyCli {
-    oracle: BString,
+    oracle: Option<BString>,
+    timeout_secs: u64,
     json: bool,
     configure_args: Vec<BString>,
 }
@@ -109,51 +117,95 @@ enum ConfigureOption {
 #[derive(Debug)]
 struct TypedVerifyRequest {
     rcmake_exe: PathBuf,
-    oracle_exe: PathBuf,
+    oracle_exe: Option<PathBuf>,
     source_dir: PathBuf,
     excluded_build_dir: Option<PathBuf>,
     cwd_rel_to_source: Option<BString>,
     args: Vec<ConfigureOption>,
     json: bool,
+    timeout_secs: u64,
     request_compile_commands: bool,
     compile_commands_user_disabled: bool,
     generator_hint: Option<BString>,
     external_inputs: Vec<BString>,
 }
 
+fn wants_json_output(args: &[BString]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_slice() != b"--")
+        .any(|arg| arg.as_slice() == b"--json")
+}
+
 /// Execute `rcmake verify`.
 pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>) -> i32 {
-    let cli = match parse_verify_cli(args) {
+    let json_requested = wants_json_output(args);
+    let cli = match parse_verify_cli(host.as_ref(), args) {
         Ok(CliAction::Help) => {
             host.write_out(Stream::Stdout, HELP.as_bytes());
             return 0;
         }
         Ok(CliAction::Run(cli)) => cli,
-        Err(message) => return emit_error(host.as_ref(), &message),
+        Err(message) => return emit_error(host.as_ref(), json_requested, None, None, &message),
     };
 
+    let cli_oracle_disp = cli
+        .oracle
+        .as_deref()
+        .map(|raw| String::from_utf8_lossy(raw).into_owned());
     let (rcmake_exe, companion) = match locate_executables(host.as_ref(), argv0) {
         Ok(pair) => pair,
-        Err(message) => return emit_error(host.as_ref(), &message),
+        Err(message) => {
+            return emit_error(
+                host.as_ref(),
+                cli.json,
+                None,
+                cli_oracle_disp.as_deref(),
+                &message,
+            );
+        }
     };
 
-    let oracle_exe = match resolve_oracle_path(host.as_ref(), &cli.oracle) {
-        Ok(path) => path,
-        Err(message) => return emit_error(host.as_ref(), &message),
+    let oracle_exe = match &cli.oracle {
+        Some(raw) => match resolve_oracle_path(host.as_ref(), raw) {
+            Ok(path) => Some(path),
+            Err(message) => {
+                return emit_error(
+                    host.as_ref(),
+                    cli.json,
+                    Some(&rcmake_exe.display().to_string()),
+                    cli_oracle_disp.as_deref(),
+                    &message,
+                );
+            }
+        },
+        None => None,
     };
 
+    let rcmake_disp = rcmake_exe.display().to_string();
+    let oracle_disp = oracle_exe.as_ref().map(|path| path.display().to_string());
     let request = match build_typed_request(
         host.as_ref(),
         rcmake_exe,
         oracle_exe,
         cli.json,
+        cli.timeout_secs,
         &cli.configure_args,
     ) {
         Ok(req) => req,
-        Err(message) => return emit_error(host.as_ref(), &message),
+        Err(message) => {
+            return emit_error(
+                host.as_ref(),
+                cli.json,
+                Some(&rcmake_disp),
+                oracle_disp.as_deref(),
+                &message,
+            );
+        }
     };
 
     let payload = serialize_request(&request);
+    let launcher_timeout =
+        Duration::from_secs(cli.timeout_secs.saturating_add(VERIFY_LAUNCHER_GRACE_SECS));
     let run_req = RunRequest {
         pipeline: vec![rcmake_host::CommandSpec {
             program: path::from_native(&companion),
@@ -163,12 +215,17 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
         env: host.env_all(),
         stdin: Input::Bytes(payload.into()),
         stdout: Output::Capture,
-        stderr: Output::Capture,
-        timeout: Some(VERIFY_LAUNCHER_TIMEOUT),
+        stderr: Output::Stream,
+        timeout: Some(launcher_timeout),
         tee: false,
     };
 
-    match host.run(&run_req, &mut |_, _| {}) {
+    let host_ref = host.as_ref();
+    match host.run(&run_req, &mut |stream, chunk| {
+        if stream == Stream::Stderr && !chunk.is_empty() {
+            host_ref.write_out(Stream::Stderr, chunk);
+        }
+    }) {
         Ok(output) => {
             if !output.stdout.is_empty() {
                 host.write_out(Stream::Stdout, &output.stdout);
@@ -176,39 +233,166 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
             if !output.stderr.is_empty() {
                 host.write_out(Stream::Stderr, &output.stderr);
             }
+            let emitted_stdout = !output.stdout.is_empty();
             match output.results.first() {
                 Some(ProcessResult::Exited(code)) => *code,
                 Some(ProcessResult::Signaled(sig)) => emit_error(
                     host.as_ref(),
+                    cli.json && !emitted_stdout,
+                    Some(&rcmake_disp),
+                    oracle_disp.as_deref(),
                     &format!("rcmake-verify was terminated by signal {sig}."),
                 ),
-                Some(ProcessResult::TimedOut) => {
-                    emit_error(host.as_ref(), "rcmake-verify timed out.")
-                }
+                Some(ProcessResult::TimedOut) => emit_error(
+                    host.as_ref(),
+                    cli.json && !emitted_stdout,
+                    Some(&rcmake_disp),
+                    oracle_disp.as_deref(),
+                    &format!(
+                        "rcmake-verify timed out after {} seconds.",
+                        cli.timeout_secs
+                    ),
+                ),
                 Some(ProcessResult::SpawnFailed(err)) => emit_error(
                     host.as_ref(),
+                    cli.json && !emitted_stdout,
+                    Some(&rcmake_disp),
+                    oracle_disp.as_deref(),
                     &format!("Could not start {}: {err}", companion.display()),
                 ),
-                None => emit_error(host.as_ref(), "rcmake-verify produced no exit status."),
+                None => emit_error(
+                    host.as_ref(),
+                    cli.json && !emitted_stdout,
+                    Some(&rcmake_disp),
+                    oracle_disp.as_deref(),
+                    "rcmake-verify produced no exit status.",
+                ),
             }
         }
         Err(err) => emit_error(
             host.as_ref(),
+            cli.json,
+            Some(&rcmake_disp),
+            oracle_disp.as_deref(),
             &format!("Could not execute {}: {err}", companion.display()),
         ),
     }
 }
 
-fn emit_error(host: &dyn Host, message: &str) -> i32 {
-    host.write_out(
-        Stream::Stderr,
-        format!("rcmake verify: {message}\n").as_bytes(),
-    );
+fn emit_error(
+    host: &dyn Host,
+    json: bool,
+    rcmake_exe: Option<&str>,
+    oracle_exe: Option<&str>,
+    message: &str,
+) -> i32 {
+    if json {
+        let skipped = || {
+            let mut sec = BTreeMap::new();
+            sec.insert(BString::from("status"), Value::string("skipped"));
+            sec.insert(BString::from("compared"), Value::UInt(0));
+            sec.insert(BString::from("differences"), Value::UInt(0));
+            sec.insert(BString::from("examples"), Value::Array(Vec::new()));
+            sec.insert(
+                BString::from("notes"),
+                Value::Array(vec![Value::string("Not executed due to invalid input.")]),
+            );
+            Value::Object(sec)
+        };
+        let mut oracle_obj = BTreeMap::new();
+        oracle_obj.insert(
+            BString::from("executable"),
+            Value::string(oracle_exe.unwrap_or("")),
+        );
+        oracle_obj.insert(BString::from("version"), Value::string("unknown"));
+        oracle_obj.insert(
+            BString::from("expected_version"),
+            Value::string(rcmake_base::CMAKE_VERSION_STR),
+        );
+
+        let mut rcmake_obj = BTreeMap::new();
+        rcmake_obj.insert(
+            BString::from("executable"),
+            Value::string(rcmake_exe.unwrap_or("")),
+        );
+        rcmake_obj.insert(BString::from("version"), Value::string("unknown"));
+        rcmake_obj.insert(BString::from("persona"), Value::string("compat"));
+
+        let mut engines = BTreeMap::new();
+        engines.insert(BString::from("oracle"), Value::Object(oracle_obj));
+        engines.insert(BString::from("rcmake"), Value::Object(rcmake_obj));
+
+        let mut scope = BTreeMap::new();
+        scope.insert(BString::from("generator"), Value::Null);
+        scope.insert(
+            BString::from("compile_commands_injected"),
+            Value::Bool(false),
+        );
+        scope.insert(BString::from("external_inputs"), Value::Array(Vec::new()));
+        scope.insert(
+            BString::from("volatile_cache_exceptions"),
+            Value::Array(Vec::new()),
+        );
+
+        let mut timings = BTreeMap::new();
+        timings.insert(
+            BString::from("observation"),
+            Value::string("single_paired_observation"),
+        );
+        timings.insert(
+            BString::from("run_order"),
+            Value::Array(vec![Value::string("oracle"), Value::string("rcmake")]),
+        );
+        timings.insert(BString::from("oracle_ms"), Value::UInt(0));
+        timings.insert(BString::from("rcmake_ms"), Value::UInt(0));
+        timings.insert(BString::from("speedup"), Value::Null);
+
+        let mut sections = BTreeMap::new();
+        sections.insert(BString::from("configure"), skipped());
+        sections.insert(BString::from("codemodel"), skipped());
+        sections.insert(BString::from("cache"), skipped());
+        sections.insert(BString::from("compile_commands"), skipped());
+        sections.insert(BString::from("ninja_dry_run"), skipped());
+
+        let mut root = BTreeMap::new();
+        root.insert(BString::from("schema_version"), Value::UInt(1));
+        root.insert(BString::from("verdict"), Value::string("invalid_input"));
+        root.insert(BString::from("exit_code"), Value::UInt(2));
+        root.insert(BString::from("engines"), Value::Object(engines));
+        root.insert(BString::from("scope"), Value::Object(scope));
+        root.insert(BString::from("timings"), Value::Object(timings));
+        root.insert(BString::from("sections"), Value::Object(sections));
+        root.insert(BString::from("error"), Value::string(message));
+
+        let mut out = rcmake_json::write_styled(&Value::Object(root), "  ");
+        out.push(b'\n');
+        host.write_out(Stream::Stdout, out.as_slice());
+    } else {
+        host.write_out(
+            Stream::Stderr,
+            format!("rcmake verify: {message}\n").as_bytes(),
+        );
+    }
     2
 }
 
-fn parse_verify_cli(args: &[BString]) -> Result<CliAction, String> {
+fn parse_timeout_secs(raw: &[u8], source: &str) -> Result<u64, String> {
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| format!("Invalid {source}: expected a positive integer number of seconds."))?;
+    let secs = text.trim().parse::<u64>().map_err(|_| {
+        format!("Invalid {source} '{text}': expected a positive integer number of seconds.")
+    })?;
+    if secs == 0 {
+        return Err(format!(
+            "Invalid {source} '0': timeout must be at least 1 second."
+        ));
+    }
+    Ok(secs)
+}
+
+fn parse_verify_cli(host: &dyn Host, args: &[BString]) -> Result<CliAction, String> {
     let mut oracle: Option<BString> = None;
+    let mut timeout_secs: Option<u64> = None;
     let mut json = false;
     let mut configure_args = Vec::new();
     let mut iter = args.iter().peekable();
@@ -252,6 +436,21 @@ fn parse_verify_cli(args: &[BString]) -> Result<CliAction, String> {
                 }
                 oracle = Some(BString::from(value));
             }
+            b"--timeout" => {
+                let value = match inline {
+                    Some(v) => Some(v),
+                    None => iter.next().map(|v| v.as_slice()),
+                };
+                let value = value
+                    .filter(|v| !v.is_empty() && *v != b"--")
+                    .ok_or_else(|| {
+                        "Supply a positive integer in seconds for --timeout.".to_owned()
+                    })?;
+                if timeout_secs.is_some() {
+                    return Err("Specify --timeout only once.".into());
+                }
+                timeout_secs = Some(parse_timeout_secs(value, "--timeout")?);
+            }
             _ if raw.starts_with(b"--") && !is_known_cmake_long_flag(flag) => {
                 return Err(format!(
                     "Unknown verify option {}. Pass configure arguments after '--'.",
@@ -267,11 +466,19 @@ fn parse_verify_cli(args: &[BString]) -> Result<CliAction, String> {
         }
     }
 
-    let Some(oracle) = oracle else {
-        return Err("Missing required --oracle <path> option. Run 'rcmake verify --help'.".into());
+    let timeout_secs = match timeout_secs {
+        Some(secs) => secs,
+        None => match host
+            .env_get(b"RCMAKE_VERIFY_TIMEOUT")
+            .filter(|v| !v.is_empty())
+        {
+            Some(env_val) => parse_timeout_secs(&env_val, "RCMAKE_VERIFY_TIMEOUT")?,
+            None => DEFAULT_VERIFY_TIMEOUT_SECS,
+        },
     };
     Ok(CliAction::Run(VerifyCli {
         oracle,
+        timeout_secs,
         json,
         configure_args,
     }))
@@ -352,7 +559,7 @@ fn locate_executables(
         }
     }
     Err(format!(
-        "Companion binary '{companion_name}' was not found next to {}. Install or build rcmake-verify (for example: cargo build -p rcmake-harness --bin rcmake-verify).",
+        "Companion binary '{companion_name}' was not found next to {}. Reinstall rcmake from a complete release bundle that includes {companion_name} (from a source checkout, build it with: cargo build -p rcmake-harness --bin rcmake-verify).",
         exe.display()
     ))
 }
@@ -426,8 +633,9 @@ enum ParsedForward {
 fn build_typed_request(
     host: &dyn Host,
     rcmake_exe: PathBuf,
-    oracle_exe: PathBuf,
+    oracle_exe: Option<PathBuf>,
     json: bool,
+    timeout_secs: u64,
     configure_args: &[BString],
 ) -> Result<TypedVerifyRequest, String> {
     let mut dirs = Vec::new();
@@ -847,6 +1055,7 @@ fn build_typed_request(
         cwd_rel_to_source,
         args,
         json,
+        timeout_secs,
         request_compile_commands,
         compile_commands_user_disabled,
         generator_hint,
@@ -1184,7 +1393,10 @@ fn serialize_request(req: &TypedVerifyRequest) -> BString {
     );
     root.insert(
         BString::from("oracle_exe"),
-        Value::string(path::from_native_cmake(&req.oracle_exe)),
+        match &req.oracle_exe {
+            Some(oracle) => Value::string(path::from_native_cmake(oracle)),
+            None => Value::Null,
+        },
     );
     root.insert(
         BString::from("source_dir"),
@@ -1203,6 +1415,7 @@ fn serialize_request(req: &TypedVerifyRequest) -> BString {
         );
     }
     root.insert(BString::from("json"), Value::Bool(req.json));
+    root.insert(BString::from("timeout_secs"), Value::UInt(req.timeout_secs));
     root.insert(
         BString::from("request_compile_commands"),
         Value::Bool(req.request_compile_commands),
@@ -1523,7 +1736,12 @@ mod tests {
             rcmake_base::path_lex::cmake_style(&calls[0].0),
             "/bin/rcmake-verify"
         );
-        assert_eq!(calls[0].2, Some(VERIFY_LAUNCHER_TIMEOUT));
+        assert_eq!(
+            calls[0].2,
+            Some(Duration::from_secs(
+                DEFAULT_VERIFY_TIMEOUT_SECS + VERIFY_LAUNCHER_GRACE_SECS
+            ))
+        );
         let parsed = rcmake_json::parse(&calls[0].1, &rcmake_json::ReadOptions::default())?;
         assert_eq!(
             parsed.get("schema_version").and_then(Value::as_u64),
@@ -1636,6 +1854,160 @@ mod tests {
                 .iter()
                 .all(|p| !p.to_string().contains("rcmake-verify")),
             "ordinary configure must never launch rcmake-verify: {calls:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supports_oracle_env_timeout_flag_env_and_json_prelaunch_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 1. Pre-launch --json error when companion is missing emits valid schema_version=1 JSON on stdout.
+        let no_comp = Arc::new(PureHost::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/bin/rcmake"),
+        ));
+        no_comp.seed_file(Path::new("/bin/rcmake"), b"")?;
+        no_comp.seed_file(Path::new("/work/CMakeLists.txt"), b"project(x NONE)\n")?;
+        let code = run(
+            None,
+            &bargs(&["--json", "--oracle", "/opt/cmake", "--", "-S", "."]),
+            no_comp.clone(),
+        );
+        assert_eq!(code, 2);
+        assert!(no_comp.stream_bytes(Stream::Stderr).is_empty());
+        let doc = rcmake_json::parse(
+            &no_comp.stream_bytes(Stream::Stdout),
+            &rcmake_json::ReadOptions::default(),
+        )?;
+        assert_eq!(doc.get("schema_version").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            doc.get("verdict").and_then(Value::as_str),
+            Some("invalid_input")
+        );
+        assert_eq!(doc.get("exit_code").and_then(Value::as_u64), Some(2));
+        let err_msg = doc.get("error").and_then(Value::as_str).unwrap_or("");
+        assert!(err_msg.contains("Reinstall rcmake"), "{err_msg}");
+
+        // 2. Pre-launch --json error on unknown verify option emits valid JSON report on stdout.
+        let bad_flag = Arc::new(PureHost::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/bin/rcmake"),
+        ));
+        bad_flag.seed_file(Path::new("/bin/rcmake"), b"")?;
+        bad_flag.seed_file(Path::new("/bin/rcmake-verify"), b"")?;
+        assert_eq!(
+            run(
+                None,
+                &bargs(&["--json", "--bogus-flag", "--", "-S", "."]),
+                bad_flag.clone()
+            ),
+            2
+        );
+        let doc_bad_flag = rcmake_json::parse(
+            &bad_flag.stream_bytes(Stream::Stdout),
+            &rcmake_json::ReadOptions::default(),
+        )?;
+        assert_eq!(
+            doc_bad_flag.get("verdict").and_then(Value::as_str),
+            Some("invalid_input")
+        );
+
+        // 3. Omitting --oracle delegates resolution to rcmake-verify (oracle_exe: null) while
+        // RCMAKE_VERIFY_TIMEOUT and --timeout override thread through.
+        let host = Arc::new(PureHost::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/bin/rcmake"),
+        ));
+        host.seed_file(Path::new("/bin/rcmake"), b"")?;
+        host.seed_file(Path::new("/bin/rcmake-verify"), b"")?;
+        host.seed_file(Path::new("/work/CMakeLists.txt"), b"project(x NONE)\n")?;
+        host.env_set(b"RCMAKE_VERIFY_TIMEOUT", Some(b"900"));
+
+        let captured = Arc::new(std::sync::Mutex::new((Vec::<u8>::new(), None::<Duration>)));
+        let cap_ref = Arc::clone(&captured);
+        host.set_command_handler(move |_host, req, _| {
+            if let Input::Bytes(bytes) = &req.stdin
+                && let Ok(mut guard) = cap_ref.lock()
+            {
+                *guard = (bytes.to_vec(), req.timeout);
+            }
+            Ok(RunOutput {
+                results: vec![ProcessResult::Exited(0)],
+                stdout: b"{\"verdict\":\"pass\"}\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        })?;
+
+        assert_eq!(
+            run(None, &bargs(&["--json", "--", "-S", "."]), host.clone()),
+            0
+        );
+        {
+            let (raw, timeout) = captured.lock().expect("lock").clone();
+            assert_eq!(
+                timeout,
+                Some(Duration::from_secs(900 + VERIFY_LAUNCHER_GRACE_SECS))
+            );
+            let parsed = rcmake_json::parse(&raw, &rcmake_json::ReadOptions::default())?;
+            assert_eq!(parsed.get("oracle_exe"), Some(&Value::Null));
+            assert_eq!(
+                parsed.get("timeout_secs").and_then(Value::as_u64),
+                Some(900)
+            );
+        }
+
+        // Explicit --timeout overrides RCMAKE_VERIFY_TIMEOUT.
+        assert_eq!(
+            run(
+                None,
+                &bargs(&["--json", "--timeout", "180", "--", "-S", "."]),
+                host.clone()
+            ),
+            0
+        );
+        {
+            let (raw, timeout) = captured.lock().expect("lock").clone();
+            assert_eq!(
+                timeout,
+                Some(Duration::from_secs(180 + VERIFY_LAUNCHER_GRACE_SECS))
+            );
+            let parsed = rcmake_json::parse(&raw, &rcmake_json::ReadOptions::default())?;
+            assert_eq!(
+                parsed.get("timeout_secs").and_then(Value::as_u64),
+                Some(180)
+            );
+        }
+
+        // Invalid --timeout=0 fails pre-launch cleanly with JSON invalid_input.
+        let bad_to = Arc::new(PureHost::new(
+            PathBuf::from("/work"),
+            PathBuf::from("/bin/rcmake"),
+        ));
+        bad_to.seed_file(Path::new("/bin/rcmake"), b"")?;
+        bad_to.seed_file(Path::new("/bin/rcmake-verify"), b"")?;
+        assert_eq!(
+            run(
+                None,
+                &bargs(&[
+                    "--json",
+                    "--timeout=0",
+                    "--oracle",
+                    "/opt/cmake",
+                    "--",
+                    "-S",
+                    "."
+                ]),
+                bad_to.clone()
+            ),
+            2
+        );
+        let bad_doc = rcmake_json::parse(
+            &bad_to.stream_bytes(Stream::Stdout),
+            &rcmake_json::ReadOptions::default(),
+        )?;
+        assert_eq!(
+            bad_doc.get("verdict").and_then(Value::as_str),
+            Some("invalid_input")
         );
         Ok(())
     }

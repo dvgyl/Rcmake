@@ -93,6 +93,10 @@ Options
                                  Supported formats: google-trace
   --profiling-output=<file>    = Select an output path for the profiling data
                                  enabled through --profiling-format.
+  --debugger                   = Enable interactive debugging of CMake language.
+  --debugger-pipe=<path>       = Name of the pipe (Windows) or domain socket
+                                 (Unix) to use for debugger communication.
+  --debugger-dap-log=<file>    = Write DAP debugger protocol traffic to a file.
   -h,-H,--help,-help,-usage,/? = Print usage information and exit.
   --version[=json-v1],-version[=json-v1],/V[=json-v1],/version[=json-v1] [<file>]
                                = Print version number and exit.

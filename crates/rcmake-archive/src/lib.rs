@@ -25,7 +25,10 @@ mod tar_budget;
 mod timestamp;
 mod zip_codec;
 
-pub use portable::{PortableLimits, PortableMember, PortableName, read_portable, write_portable};
+pub use portable::{
+    PortableLimits, PortableMember, PortableName, read_portable, read_portable_checked,
+    write_portable,
+};
 pub use timestamp::parse_archive_mtime;
 
 #[cfg(test)]

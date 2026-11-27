@@ -10,10 +10,10 @@ use rcmake_base::BString;
 use rcmake_host::{FileKind, Follow, Host, ReadRange, Stream, discover_cmake_root};
 use rcmake_language_tools::config::ConfigCache;
 use rcmake_language_tools::discovery::{
-    DiscoveryLimits, discover_files_with_limits, infer_project_root,
+    DiscoveryLimits, ProjectRootCache, discover_files_with_config,
 };
 use rcmake_language_tools::lint::{
-    Finding, HostWorkspaceReader, LintLimits, Severity, lint_bytes, render_terminal,
+    ALL_RULES, Finding, HostWorkspaceReader, LintLimits, Severity, lint_bytes, render_terminal,
     sort_and_dedup_findings, to_sarif_document,
 };
 
@@ -41,13 +41,26 @@ Usage: rcmake lint [OPTIONS] [PATHS...]
 Run static lint rules on CMakeLists.txt and *.cmake files.
 
 Options:
-  --sarif       Emit SARIF 2.1.0 JSON to standard output
-  -h, --help    Show this help message
+  --sarif          Emit SARIF 2.1.0 JSON to standard output
+  --deny-warnings  Exit with status 1 on warnings as well as errors
+  --list-rules     List all available lint rules with default severities and exit
+  -h, --help       Show this help message
+
+Configuration:
+  Nearest ancestor .rcmake.toml (up to project root) configures top-level
+  exclude = [...], [lint] disable = [...], and [lint.severity] overrides.
+
+Exit codes:
+  0  No error findings (and no warnings when --deny-warnings is set)
+  1  One or more error findings (or warnings with --deny-warnings)
+  2  Invalid CLI usage, configuration error, budget exhaustion, or I/O failure
 ";
 
 #[derive(Default)]
 struct LintCliArgs {
     sarif: bool,
+    deny_warnings: bool,
+    list_rules: bool,
     help: bool,
     operands: Vec<PathBuf>,
 }
@@ -64,6 +77,8 @@ fn parse_args(args: &[BString]) -> Result<LintCliArgs, String> {
         if !positional_only && bytes.starts_with(b"-") {
             match bytes {
                 b"--sarif" => parsed.sarif = true,
+                b"--deny-warnings" => parsed.deny_warnings = true,
+                b"--list-rules" => parsed.list_rules = true,
                 b"-h" | b"--help" => parsed.help = true,
                 _ => {
                     return Err(format!(
@@ -77,6 +92,20 @@ fn parse_args(args: &[BString]) -> Result<LintCliArgs, String> {
         parsed.operands.push(rcmake_host::path::to_native(bytes));
     }
     Ok(parsed)
+}
+
+fn render_rule_list() -> String {
+    let mut out = String::new();
+    for rule in ALL_RULES {
+        let info = rule.info();
+        out.push_str(&format!(
+            "{:<30} {:<8} {}\n",
+            info.id,
+            info.default_severity.as_str(),
+            info.short_description
+        ));
+    }
+    out
 }
 
 /// Execute `rcmake lint`.
@@ -108,13 +137,21 @@ fn run_with_budgets(
         host.write_out(Stream::Stdout, USAGE.as_bytes());
         return 0;
     }
+    if parsed.list_rules {
+        host.write_out(Stream::Stdout, render_rule_list().as_bytes());
+        return 0;
+    }
 
     let cwd = host.initial_cwd();
-    let files = match discover_files_with_limits(
+    let mut cfg_cache = ConfigCache::default();
+    let mut root_cache = ProjectRootCache::default();
+    let files = match discover_files_with_config(
         host.as_ref(),
         &cwd,
         &parsed.operands,
         &discovery_limits,
+        &mut cfg_cache,
+        &mut root_cache,
     ) {
         Ok(files) => files,
         Err(err) => {
@@ -128,7 +165,6 @@ fn run_with_budgets(
         .1
         .map(|root| root.join("Modules"));
 
-    let mut cfg_cache = ConfigCache::default();
     let mut all_findings: Vec<Finding> = Vec::new();
     let mut any_tool_error = false;
     let mut total_read_bytes = 0usize;
@@ -136,11 +172,11 @@ fn run_with_budgets(
 
     // Precompute readable roots so project-local static includes work across all operands.
     let mut roots_set = BTreeSet::new();
-    roots_set.insert(infer_project_root(host.as_ref(), &cwd, &cwd));
+    roots_set.insert(root_cache.infer(host.as_ref(), &cwd, &cwd));
     let mut file_roots: Vec<PathBuf> = Vec::with_capacity(files.len());
     for path in &files {
         let dir = path.parent().unwrap_or(&cwd);
-        let root = infer_project_root(host.as_ref(), dir, &cwd);
+        let root = root_cache.infer(host.as_ref(), dir, &cwd);
         roots_set.insert(root.clone());
         file_roots.push(root);
     }
@@ -312,7 +348,9 @@ fn run_with_budgets(
 
     if any_tool_error {
         2
-    } else if all_findings.iter().any(|f| f.severity == Severity::Error) {
+    } else if all_findings.iter().any(|f| {
+        f.severity == Severity::Error || (parsed.deny_warnings && f.severity == Severity::Warning)
+    }) {
         1
     } else {
         0
@@ -491,6 +529,78 @@ mod tests {
             stderr_str(&byte_host).contains("shared lint input budget"),
             "stderr={}",
             stderr_str(&byte_host)
+        );
+    }
+
+    #[test]
+    fn lint_supports_list_rules_deny_warnings_and_exclude() {
+        let work = Path::new("/work");
+        let list_host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        assert_eq!(
+            run(
+                None,
+                &bargs(&["--list-rules"]),
+                Arc::clone(&list_host) as Arc<dyn Host>,
+            ),
+            0
+        );
+        let rules_out = stdout_str(&list_host);
+        for rule in ALL_RULES {
+            assert!(rules_out.contains(rule.as_str()), "{rules_out}");
+        }
+
+        // Warning-only finding exits 0 normally, 1 with --deny-warnings.
+        let warn_host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        warn_host
+            .seed_file(
+                &work.join("CMakeLists.txt"),
+                b"cmake_policy(SET CMP0077 OLD)\n",
+            )
+            .unwrap();
+        assert_eq!(run(None, &[], Arc::clone(&warn_host) as Arc<dyn Host>), 0);
+
+        let deny_host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        deny_host
+            .seed_file(
+                &work.join("CMakeLists.txt"),
+                b"cmake_policy(SET CMP0077 OLD)\n",
+            )
+            .unwrap();
+        assert_eq!(
+            run(
+                None,
+                &bargs(&["--deny-warnings"]),
+                Arc::clone(&deny_host) as Arc<dyn Host>,
+            ),
+            1
+        );
+
+        // .rcmake.toml exclude skips matching files during lint discovery.
+        let excl_host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        excl_host
+            .seed_file(
+                &work.join(".rcmake.toml"),
+                b"exclude = [\"third_party/**\"]\n",
+            )
+            .unwrap();
+        excl_host
+            .seed_file(&work.join("CMakeLists.txt"), b"project(Clean)\n")
+            .unwrap();
+        excl_host
+            .seed_file(
+                &work.join("third_party/old.cmake"),
+                b"cmake_policy(SET CMP0077 OLD)\n",
+            )
+            .unwrap();
+        assert_eq!(
+            run(
+                None,
+                &bargs(&["--deny-warnings"]),
+                Arc::clone(&excl_host) as Arc<dyn Host>,
+            ),
+            0,
+            "stdout={}",
+            stdout_str(&excl_host)
         );
     }
 }

@@ -242,7 +242,7 @@ impl fmt::Display for VerifyMismatchReport {
         }
         write!(
             f,
-            "Rcmake used the fresh result. Use --no-probe-cache to bypass the cache. If you report this issue, include the probe key, Rcmake version, generator, and toolchain."
+            "rcmake used the fresh result. Use --no-probe-cache to bypass the cache. If you report this issue, include the probe key, rcmake version, generator, and toolchain."
         )
     }
 }
@@ -969,6 +969,67 @@ mod payload_shape_tests {
             blobs: Vec::new(),
             payload: Value::string("probe"),
         }));
+        Ok(())
+    }
+
+    /// The store check and the typed `checks` record accept the same values.
+    #[test]
+    fn journal_checks_match_the_store_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let probe = |checks: Value| -> Result<Value, Box<dyn std::error::Error>> {
+            let outcome = ProbeOutcome {
+                max_start_depth: 0,
+                compiled: false,
+                exit_code: 1,
+                output: Templated::literal(b"").ok_or("template")?,
+                artifact: None,
+                diagnostics: Vec::new(),
+            };
+            Ok(Value::object_from([
+                ("outcome", outcome.to_json()),
+                ("checks", checks),
+            ]))
+        };
+        let store_accepts = |payload: Value| {
+            probe_payload_valid(&Entry {
+                trace: Vec::new(),
+                blobs: Vec::new(),
+                payload,
+            })
+        };
+        let every = JournalChecks::every_variant().to_json();
+        let typed_round_trip = JournalChecks::from_json(&every)?;
+        assert_eq!(typed_round_trip, JournalChecks::every_variant());
+        assert!(store_accepts(probe(every.clone())?));
+        let digest = Digest::from_bytes([1; 32]).to_json();
+        let pair = |check: Value| Value::array_from([Value::array_from([check, digest.clone()])]);
+        let samples = [
+            every,
+            Value::Array(Vec::new()),
+            Value::object(),
+            pair(Value::string("Unknown")),
+            pair(Value::object_from([("Link", Value::Bool(true))])),
+            pair(Value::object_from([("Request", Value::Int(-1))])),
+            pair(Value::object_from([(
+                "Metadata",
+                Value::array_from([Value::string("/a")]),
+            )])),
+            pair(Value::object_from([(
+                "Slice",
+                Value::array_from([Value::string("/a"), Value::object()]),
+            )])),
+            Value::array_from([Value::array_from([Value::string("System")])]),
+            Value::array_from([Value::array_from([
+                Value::string("System"),
+                Value::string("short"),
+            ])]),
+        ];
+        for sample in samples {
+            assert_eq!(
+                JournalChecks::from_json(&sample).is_ok(),
+                store_accepts(probe(sample.clone())?),
+                "{sample:?}"
+            );
+        }
         Ok(())
     }
 }

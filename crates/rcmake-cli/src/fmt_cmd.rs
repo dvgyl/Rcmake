@@ -10,7 +10,8 @@ use rcmake_base::BString;
 use rcmake_host::{FileKind, Follow, Host, ReadRange, Stream};
 use rcmake_language_tools::config::ConfigCache;
 use rcmake_language_tools::discovery::{
-    FileStamp, discover_files, infer_project_root, write_atomic_checked,
+    DiscoveryLimits, FileStamp, ProjectRootCache, discover_files_with_config, infer_project_root,
+    resolve_operand, write_atomic_checked,
 };
 use rcmake_language_tools::fmt::{
     DEFAULT_MAX_DIFF_BYTES, FormatLimits, FormatStyle, format_bytes, unified_diff,
@@ -25,10 +26,20 @@ Usage: rcmake fmt [OPTIONS] [PATHS...]
 Losslessly format CMakeLists.txt and *.cmake files.
 
 Options:
-  --check       Report files that would change without writing (exit 1 if changes needed)
-  --diff        Print a unified diff without writing (exit 1 if changes needed)
-  --stdin       Read CMake input from standard input and write formatted bytes to stdout
-  -h, --help    Show this help message
+  --check                  Report files that would change without writing (exit 1 if changes needed)
+  --diff                   Print a unified diff without writing (exit 1 if changes needed)
+  --stdin                  Read CMake input from standard input and write formatted bytes to stdout
+  --stdin-filepath <path>  Virtual path for --stdin (used to locate .rcmake.toml and label diffs)
+  -h, --help               Show this help message
+
+Configuration:
+  Nearest ancestor .rcmake.toml (up to project root) configures [fmt] settings
+  (indent_width, line_width, command_case, end_of_line) and top-level exclude = [...].
+
+Exit codes:
+  0  All files already formatted (or formatted cleanly in place)
+  1  One or more files need formatting (--check or --diff)
+  2  Invalid CLI usage, parse/configuration error, or I/O failure
 ";
 
 #[derive(Default)]
@@ -36,6 +47,7 @@ struct FmtCliArgs {
     check: bool,
     diff: bool,
     stdin: bool,
+    stdin_filepath: Option<PathBuf>,
     help: bool,
     operands: Vec<PathBuf>,
 }
@@ -43,17 +55,40 @@ struct FmtCliArgs {
 fn parse_args(args: &[BString]) -> Result<FmtCliArgs, String> {
     let mut parsed = FmtCliArgs::default();
     let mut positional_only = false;
-    for arg in args {
+    let mut index = 0usize;
+    while let Some(arg) = args.get(index) {
+        index += 1;
         let bytes = arg.as_slice();
         if !positional_only && bytes == b"--" {
             positional_only = true;
             continue;
         }
         if !positional_only && bytes.starts_with(b"-") {
+            if let Some(val) = bytes.strip_prefix(b"--stdin-filepath=") {
+                if val.is_empty() {
+                    return Err("rcmake fmt: --stdin-filepath requires a non-empty path.\n".into());
+                }
+                parsed.stdin_filepath = Some(rcmake_host::path::to_native(val));
+                continue;
+            }
             match bytes {
                 b"--check" => parsed.check = true,
                 b"--diff" => parsed.diff = true,
                 b"--stdin" => parsed.stdin = true,
+                b"--stdin-filepath" => {
+                    let Some(next) = args.get(index) else {
+                        return Err(
+                            "rcmake fmt: --stdin-filepath requires a path argument.\n".into()
+                        );
+                    };
+                    if next.is_empty() {
+                        return Err(
+                            "rcmake fmt: --stdin-filepath requires a non-empty path.\n".into()
+                        );
+                    }
+                    parsed.stdin_filepath = Some(rcmake_host::path::to_native(next.as_slice()));
+                    index += 1;
+                }
                 b"-h" | b"--help" => parsed.help = true,
                 _ => {
                     return Err(format!(
@@ -70,6 +105,9 @@ fn parse_args(args: &[BString]) -> Result<FmtCliArgs, String> {
         return Err(
             "rcmake fmt: --stdin cannot be combined with file or directory paths.\n".into(),
         );
+    }
+    if parsed.stdin_filepath.is_some() && !parsed.stdin {
+        return Err("rcmake fmt: --stdin-filepath requires --stdin.\n".into());
     }
     Ok(parsed)
 }
@@ -95,7 +133,16 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
         return run_stdin(host.as_ref(), &cwd, &parsed, &limits);
     }
 
-    let files = match discover_files(host.as_ref(), &cwd, &parsed.operands) {
+    let mut cfg_cache = ConfigCache::default();
+    let mut root_cache = ProjectRootCache::default();
+    let files = match discover_files_with_config(
+        host.as_ref(),
+        &cwd,
+        &parsed.operands,
+        &DiscoveryLimits::default(),
+        &mut cfg_cache,
+        &mut root_cache,
+    ) {
         Ok(files) => files,
         Err(err) => {
             let msg = format!("rcmake fmt: {}: {}\n", err.path.display(), err.message);
@@ -109,11 +156,10 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
     }
 
     // Resolve and cache `.rcmake.toml` per parent directory up front.
-    let mut cfg_cache = ConfigCache::default();
     let mut tasks: Vec<(PathBuf, Result<FormatStyle, String>)> = Vec::with_capacity(files.len());
     for path in files {
         let dir = path.parent().unwrap_or(&cwd);
-        let root = infer_project_root(host.as_ref(), dir, &cwd);
+        let root = root_cache.infer(host.as_ref(), dir, &cwd);
         let style = cfg_cache
             .resolve(host.as_ref(), dir, Some(&root))
             .map(|resolved| FormatStyle::from_config(&resolved.config.fmt))
@@ -127,6 +173,7 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
     let mut any_changed = false;
     let mut any_error = false;
     let mut diff_budget = DEFAULT_MAX_DIFF_BYTES;
+    let mut diff_truncated = false;
 
     for outcome in results {
         let display = display_rel(&cwd, &outcome.path);
@@ -140,8 +187,13 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
                 if parsed.diff {
                     if diff_budget > 0 {
                         let rendered = unified_diff(&display, &original, &formatted, diff_budget);
+                        if rendered.len() >= diff_budget {
+                            diff_truncated = true;
+                        }
                         diff_budget = diff_budget.saturating_sub(rendered.len());
                         host.write_out(Stream::Stdout, &rendered);
+                    } else {
+                        diff_truncated = true;
                     }
                 } else if parsed.check {
                     let line = format!("{display}\n");
@@ -159,6 +211,13 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
         }
     }
 
+    if diff_truncated {
+        host.write_out(
+            Stream::Stderr,
+            b"rcmake fmt: diff output truncated after reaching the 4 MiB diff budget.\n",
+        );
+    }
+
     if any_error {
         2
     } else if (parsed.check || parsed.diff) && any_changed {
@@ -169,8 +228,21 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
 }
 
 fn run_stdin(host: &dyn Host, cwd: &Path, parsed: &FmtCliArgs, limits: &FormatLimits) -> i32 {
-    let root = infer_project_root(host, cwd, cwd);
-    let style = match rcmake_language_tools::config::resolve_config(host, cwd, Some(&root)) {
+    let (config_dir, display_label) = match &parsed.stdin_filepath {
+        Some(fp) => {
+            let resolved = resolve_operand(cwd, fp);
+            let dir = resolved
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cwd.to_path_buf());
+            let label = fp.display().to_string();
+            (dir, label)
+        }
+        None => (cwd.to_path_buf(), "<stdin>".to_owned()),
+    };
+    let root = infer_project_root(host, &config_dir, cwd);
+    let style = match rcmake_language_tools::config::resolve_config(host, &config_dir, Some(&root))
+    {
         Ok(resolved) => FormatStyle::from_config(&resolved.config.fmt),
         Err(err) => {
             let msg = format!("rcmake fmt: configuration error: {err}\n");
@@ -192,7 +264,7 @@ fn run_stdin(host: &dyn Host, cwd: &Path, parsed: &FmtCliArgs, limits: &FormatLi
     let formatted = match format_bytes(&input, &style, limits) {
         Ok(res) => res,
         Err(err) => {
-            let msg = format!("rcmake fmt: <stdin>: {err}\n");
+            let msg = format!("rcmake fmt: {display_label}: {err}\n");
             host.write_out(Stream::Stderr, msg.as_bytes());
             return 2;
         }
@@ -200,8 +272,19 @@ fn run_stdin(host: &dyn Host, cwd: &Path, parsed: &FmtCliArgs, limits: &FormatLi
 
     if parsed.diff {
         if formatted.changed() {
-            let diff = unified_diff("<stdin>", &input, &formatted.output, DEFAULT_MAX_DIFF_BYTES);
+            let diff = unified_diff(
+                &display_label,
+                &input,
+                &formatted.output,
+                DEFAULT_MAX_DIFF_BYTES,
+            );
             host.write_out(Stream::Stdout, &diff);
+            if diff.len() >= DEFAULT_MAX_DIFF_BYTES {
+                host.write_out(
+                    Stream::Stderr,
+                    b"rcmake fmt: diff output truncated after reaching the 4 MiB diff budget.\n",
+                );
+            }
             return 1;
         }
         return 0;
@@ -716,5 +799,60 @@ mod tests {
                 .unwrap(),
             unformatted
         );
+    }
+
+    #[test]
+    fn fmt_stdin_filepath_resolves_config_and_labels_diff_and_exclude_skips_files() {
+        let work = Path::new("/work");
+        let host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        host.seed_file(&work.join("sub/.rcmake.toml"), b"[fmt]\nindent_width = 4\n")
+            .unwrap();
+        host.seed_stdin(b"if(ON)\nset(X 1)\nendif()\n").unwrap();
+        let code = run(
+            None,
+            &bargs(&[
+                "--stdin",
+                "--stdin-filepath",
+                "sub/CMakeLists.txt",
+                "--diff",
+            ]),
+            Arc::clone(&host) as Arc<dyn Host>,
+        );
+        assert_eq!(code, 1);
+        let out = stdout_str(&host);
+        assert!(out.contains("sub/CMakeLists.txt"), "{out}");
+        assert!(out.contains("+    set(X 1)"), "{out}");
+
+        // --stdin-filepath without --stdin fails with exit 2.
+        let bad_host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        assert_eq!(
+            run(
+                None,
+                &bargs(&["--stdin-filepath=sub/CMakeLists.txt"]),
+                Arc::clone(&bad_host) as Arc<dyn Host>,
+            ),
+            2
+        );
+
+        // .rcmake.toml exclude skips matching files during directory formatting.
+        let excl_host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        excl_host
+            .seed_file(&work.join(".rcmake.toml"), b"exclude = [\"vendor/**\"]\n")
+            .unwrap();
+        excl_host
+            .seed_file(&work.join("CMakeLists.txt"), b"project(Clean)\n")
+            .unwrap();
+        excl_host
+            .seed_file(
+                &work.join("vendor/third.cmake"),
+                b"if(ON)\nset(UNFORMATTED   1)\nendif()\n",
+            )
+            .unwrap();
+        let excl_code = run(
+            None,
+            &bargs(&["--check"]),
+            Arc::clone(&excl_host) as Arc<dyn Host>,
+        );
+        assert_eq!(excl_code, 0, "stdout={}", stdout_str(&excl_host));
     }
 }

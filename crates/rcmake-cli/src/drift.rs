@@ -68,6 +68,29 @@ struct Compiler {
     identified: bool,
 }
 
+/// Compiler files that a collection could not read. The receipt does not store it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum Unread {
+    /// Every compiler file was read, so a missing language was removed.
+    #[default]
+    Nothing,
+    /// The compiler files of these languages exist but could not be read.
+    Languages(BTreeSet<String>),
+    /// The compiler directory could not be listed. No removal is confirmed.
+    Directory,
+}
+
+impl Unread {
+    /// Return whether the collection cannot confirm that `lang` was removed.
+    fn covers(&self, lang: &str) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Languages(languages) => languages.contains(lang),
+            Self::Directory => true,
+        }
+    }
+}
+
 /// Current or recorded toolchain inputs of one build tree.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Facts {
@@ -75,6 +98,7 @@ pub(crate) struct Facts {
     prefix_cache: Option<Vec<BString>>,
     prefix_env: Option<Vec<BString>>,
     languages: BTreeMap<String, Compiler>,
+    unread: Unread,
 }
 
 /// A receipt that belongs to one build tree.
@@ -93,7 +117,7 @@ pub(crate) enum Baseline {
     /// The receipt exists but cannot be used.
     Bad(String),
     /// A valid receipt for this build tree.
-    Loaded(Receipt),
+    Loaded(Box<Receipt>),
 }
 
 /// One changed field.
@@ -117,8 +141,6 @@ impl Drift {
         )
     }
 }
-
-// JSON encoding.
 
 fn digest_json(digest: Option<Digest>) -> Value {
     digest.map_or(Value::Null, |digest| digest.to_json())
@@ -238,12 +260,11 @@ impl FromJson for Receipt {
                 prefix_cache: opt(prefix, "cache")?.flatten(),
                 prefix_env: opt(prefix, "environment")?.flatten(),
                 languages: req(obj, "languages")?,
+                unread: Unread::Nothing,
             },
         })
     }
 }
-
-// Reading the build tree.
 
 fn receipt_path(bin: &Path) -> PathBuf {
     bin.join(path::to_native(RECEIPT.as_bytes()))
@@ -296,7 +317,7 @@ pub(crate) fn load(host: &dyn Host, bin: &Path, source: &Path) -> (Baseline, Opt
         Ok(receipt) if !source.as_os_str().is_empty() && !same(&receipt.source, source) => {
             Baseline::Bad("The receipt belongs to another source directory.".into())
         }
-        Ok(receipt) => Baseline::Loaded(receipt),
+        Ok(receipt) => Baseline::Loaded(Box::new(receipt)),
     };
     (baseline, Some(bytes))
 }
@@ -431,39 +452,76 @@ fn compiler_file_values(text: &[u8]) -> BTreeMap<BString, BString> {
     values
 }
 
-/// Digests of tool files for one collection.
+/// File identity that decides whether a saved digest is still valid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    len: u64,
+    mtime: (i64, u32),
+    dev: u64,
+    ino: u64,
+}
+
+/// Digests of tool files, reused while the file identity stays the same.
 ///
-/// Each phase makes a new memo, so a digest never outlives the phase that read it.
+/// One configure uses one memo for its checks before and after generation, so a
+/// large compiler is hashed once. A digest is reused only when the length, the
+/// modification time, the device, and the inode still match.
 #[derive(Default)]
-pub(crate) struct DigestMemo(RefCell<BTreeMap<PathBuf, Option<Digest>>>);
+pub(crate) struct DigestMemo(RefCell<BTreeMap<PathBuf, (FileIdentity, Option<Digest>)>>);
 
 impl DigestMemo {
     fn digest(&self, host: &dyn Host, file: &Path) -> Option<Digest> {
-        if let Some(digest) = self.0.borrow().get(file) {
+        let identity = host
+            .metadata(file, Follow::Yes)
+            .ok()
+            .map(|meta| FileIdentity {
+                len: meta.len,
+                mtime: (meta.mtime.secs, meta.mtime.nanos),
+                dev: meta.dev,
+                ino: meta.ino,
+            });
+        if let Some(identity) = identity
+            && let Some((saved, digest)) = self.0.borrow().get(file)
+            && *saved == identity
+        {
             return *digest;
         }
         let digest = rcmake_store::file_digest(host, file).ok();
-        self.0.borrow_mut().insert(file.to_owned(), digest);
+        if let Some(identity) = identity {
+            self.0
+                .borrow_mut()
+                .insert(file.to_owned(), (identity, digest));
+        }
         digest
     }
 }
 
+/// How a relative tool path from the cache is found.
+#[derive(Clone, Copy)]
+enum Lookup<'a> {
+    /// A compiler name. A single path component is found on `PATH`.
+    Program,
+    /// A file relative to these directories in order, for example
+    /// `CMAKE_TOOLCHAIN_FILE` relative to the binary and then the source directory.
+    Relative(&'a [&'a Path]),
+}
+
 /// Resolve a tool path from the cache without running it.
-fn tool(host: &dyn Host, memo: &DigestMemo, value: &[u8], bases: &[&Path]) -> Tool {
+fn tool(host: &dyn Host, memo: &DigestMemo, value: &[u8], lookup: Lookup<'_>) -> Tool {
     let native = path::to_native(value);
     let found = if native.is_absolute() {
         Some(native)
-    } else if native.components().count() == 1
-        && let Some(found) = std::str::from_utf8(value)
-            .ok()
-            .and_then(|name| path::executable_on_absolute_path(host, name))
-    {
-        Some(found)
     } else {
-        bases
-            .iter()
-            .map(|base| base.join(&native))
-            .find(|candidate| host.metadata(candidate, Follow::Yes).is_ok())
+        match lookup {
+            Lookup::Program if native.components().count() == 1 => std::str::from_utf8(value)
+                .ok()
+                .and_then(|name| path::executable_on_absolute_path(host, name)),
+            Lookup::Program => None,
+            Lookup::Relative(bases) => bases
+                .iter()
+                .map(|base| base.join(&native))
+                .find(|candidate| host.metadata(candidate, Follow::Yes).is_ok()),
+        }
     };
     let resolved = found
         .and_then(|file| host.canonicalize(&file).ok())
@@ -497,15 +555,21 @@ pub(crate) fn collect(host: &dyn Host, memo: &DigestMemo, bin: &Path, cache: &Ca
         .unwrap_or_default();
     let toolchain = value(b"CMAKE_TOOLCHAIN_FILE")
         .filter(|file| !file.is_empty())
-        .map(|file| tool(host, memo, &file, &[bin, &source]));
+        .map(|file| tool(host, memo, &file, Lookup::Relative(&[bin, &source])));
     let env_separator = if host.system().sysname == "Windows" {
         b';'
     } else {
         b':'
     };
     let mut languages = BTreeMap::new();
+    let mut unread = BTreeSet::new();
     let dir = platform_dir(bin);
-    for entry in host.read_dir(&dir).unwrap_or_default() {
+    let entries = match host.read_dir(&dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    };
+    for entry in entries.as_deref().unwrap_or_default() {
         let Some(lang) = compiler_language(&entry.name).filter(|_| entry.kind == FileKind::File)
         else {
             continue;
@@ -515,6 +579,7 @@ pub(crate) fn collect(host: &dyn Host, memo: &DigestMemo, bin: &Path, cache: &Ca
             &dir.join(path::to_native(&entry.name)),
             COMPILER_FILE_LIMIT,
         ) else {
+            unread.insert(lang);
             continue;
         };
         let values = compiler_file_values(&text);
@@ -529,7 +594,7 @@ pub(crate) fn collect(host: &dyn Host, memo: &DigestMemo, bin: &Path, cache: &Ca
         languages.insert(
             lang.clone(),
             Compiler {
-                tool: tool(host, memo, &selected, &[]),
+                tool: tool(host, memo, &selected, Lookup::Program),
                 launcher,
                 id: from_file("_ID"),
                 version: from_file("_VERSION"),
@@ -545,10 +610,13 @@ pub(crate) fn collect(host: &dyn Host, memo: &DigestMemo, bin: &Path, cache: &Ca
             .env_get(b"CMAKE_PREFIX_PATH")
             .map(|list| split_list(&list, env_separator)),
         languages,
+        unread: match entries {
+            None => Unread::Directory,
+            Some(_) if unread.is_empty() => Unread::Nothing,
+            Some(_) => Unread::Languages(unread),
+        },
     }
 }
-
-// Comparison.
 
 fn short(digest: Option<Digest>) -> String {
     digest.map_or_else(
@@ -737,7 +805,9 @@ pub(crate) fn compare(previous: &Facts, current: &Facts, skip: &BTreeSet<String>
 ///
 /// `fresh` means the configure started without a cache. Each language in
 /// `identified` has an identification record from this configure. Other fields
-/// keep the previous baseline, so unresolved drift stays visible.
+/// keep the previous baseline, so unresolved drift stays visible. A language
+/// whose compiler file could not be read keeps its baseline, because a read
+/// error does not prove that the language was removed.
 fn advance(
     previous: Option<&Facts>,
     mut current: Facts,
@@ -760,17 +830,41 @@ fn advance(
             *compiler = before.clone();
         }
     }
+    for (lang, before) in &previous.languages {
+        if current.unread.covers(lang) && !current.languages.contains_key(lang) {
+            current.languages.insert(lang.clone(), before.clone());
+        }
+    }
     current
 }
 
-fn recovery(bin: &Path) -> String {
-    format!(
-        "Run 'rcmake --fresh -B {}' or configure a new build directory.",
-        path::from_native_cmake(bin)
-    )
+/// Quote a path for a POSIX shell command line in a message.
+fn quoted(path: &Path) -> String {
+    let text = path::from_native_cmake(path).to_string();
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for character in text.chars() {
+        if matches!(character, '"' | '\\' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out.push('"');
+    out
 }
 
-// Configure integration.
+/// Recovery advice with the full command. `source` can be empty when it is unknown.
+fn recovery(source: &Path, bin: &Path) -> String {
+    let source = if source.as_os_str().is_empty() {
+        String::new()
+    } else {
+        format!("-S {} ", quoted(source))
+    };
+    format!(
+        "Run 'rcmake --fresh {source}-B {}' or configure a new build directory. --fresh removes CMakeCache.txt, so give each -D option again.",
+        quoted(bin)
+    )
+}
 
 /// Drift state for one native configure, from directory resolution to the end.
 pub(crate) struct Tracker {
@@ -785,6 +879,8 @@ pub(crate) struct Tracker {
     fresh: Cell<bool>,
     pending: RefCell<Option<Receipt>>,
     finished: Cell<bool>,
+    /// Tool digests shared by [`Self::check`] and [`Self::generated`].
+    memo: DigestMemo,
 }
 
 impl Tracker {
@@ -824,6 +920,7 @@ impl Tracker {
             warned: RefCell::new(BTreeSet::new()),
             fresh: Cell::new(false),
             pending: RefCell::new(None),
+            memo: DigestMemo::default(),
         }
     }
 
@@ -862,7 +959,7 @@ impl Tracker {
                     &format!(
                         "{}\n  The build tree was configured with the previous value. {}",
                         drift.render(),
-                        recovery(&self.bin)
+                        recovery(&self.source, &self.bin)
                     ),
                 );
             }
@@ -890,7 +987,7 @@ impl Tracker {
             );
         }
         if let Some(baseline) = self.baseline() {
-            let current = collect(host, &DigestMemo::default(), &self.bin, cache);
+            let current = collect(host, &self.memo, &self.bin, cache);
             self.warn(host, compare(baseline, &current, &BTreeSet::new()));
         }
     }
@@ -900,7 +997,7 @@ impl Tracker {
         let Some(host) = self.host.as_deref() else {
             return;
         };
-        let current = collect(host, &DigestMemo::default(), &self.bin, cache);
+        let current = collect(host, &self.memo, &self.bin, cache);
         let identified =
             identified_languages(host, &self.bin, &self.stale_identifications, &current);
         let fresh = self.fresh.get();
@@ -960,8 +1057,6 @@ impl Drop for Tracker {
         self.finish(false);
     }
 }
-
-// Doctor report.
 
 /// Write the drift report for `rcmake doctor -B <bin>`. Return the exit code.
 ///
@@ -1023,7 +1118,11 @@ pub(crate) fn doctor(host: &dyn Host, bin: &Path, text: &mut String) -> i32 {
             return i32::from(missing_tools > 0);
         }
         Baseline::Bad(reason) => {
-            let _ = writeln!(text, "Drift receipt: invalid. {reason}\n{}", recovery(bin));
+            let _ = writeln!(
+                text,
+                "Drift receipt: invalid. {reason}\n{}",
+                recovery(&source, bin)
+            );
             return 1;
         }
         Baseline::Loaded(receipt) => receipt,
@@ -1054,7 +1153,7 @@ pub(crate) fn doctor(host: &dyn Host, bin: &Path, text: &mut String) -> i32 {
             drifts.len()
         );
     }
-    let _ = writeln!(text, "{}", recovery(bin));
+    let _ = writeln!(text, "{}", recovery(&source, bin));
     1
 }
 

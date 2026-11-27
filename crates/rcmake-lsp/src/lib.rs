@@ -34,7 +34,7 @@ pub fn install_stdio_panic_hook() {
         default_hook(info);
         let _ = std::io::Write::write_all(
             &mut std::io::stderr(),
-            b"CMake Internal Error (please report a bug)\n",
+            b"rcmake-lsp: internal error (please report a bug)\n",
         );
         #[expect(
             clippy::disallowed_methods,

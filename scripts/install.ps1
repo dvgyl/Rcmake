@@ -750,13 +750,21 @@ try {
         }
     }
 
-    [IO.File]::WriteAllText((Join-Path $stagedData $dataMarkerName), "Managed by rcmake.`n")
+    $markerContent = "Managed by rcmake.`n"
+    if ($hasVerify) {
+        $stagedVerifySha256 = (Get-FileHash -LiteralPath $stagedVerify -Algorithm SHA256).Hash.ToLowerInvariant()
+        $markerContent += "verify_sha256=$stagedVerifySha256`n"
+    }
+    [IO.File]::WriteAllText((Join-Path $stagedData $dataMarkerName), $markerContent)
     $stagedVersionOutput = & $stagedBin --version
     if ($LASTEXITCODE -ne 0) {
         Stop-Install "Staged rcmake.exe failed --version check (exit code $LASTEXITCODE)."
     }
     $stagedRcmakeVer = Get-VersionToken -Lines $stagedVersionOutput -PrefixName 'rcmake'
     if ($hasVerify) {
+        if ([string]::IsNullOrEmpty($stagedRcmakeVer)) {
+            Stop-Install 'Staged rcmake.exe --version did not report a version.'
+        }
         $stagedVerifyOutput = & $stagedVerify --version
         if ($LASTEXITCODE -ne 0) {
             Stop-Install "Staged rcmake-verify.exe failed --version check (exit code $LASTEXITCODE)."
@@ -765,7 +773,7 @@ try {
         if ([string]::IsNullOrEmpty($stagedVerifyVer)) {
             Stop-Install 'Staged rcmake-verify.exe --version did not report a version.'
         }
-        if (-not [string]::IsNullOrEmpty($stagedRcmakeVer) -and ($stagedVerifyVer -cne $stagedRcmakeVer)) {
+        if ($stagedVerifyVer -cne $stagedRcmakeVer) {
             Stop-Install "Staged rcmake-verify.exe version ($stagedVerifyVer) does not match rcmake.exe version ($stagedRcmakeVer)."
         }
     }
@@ -846,6 +854,17 @@ try {
     }
 
     $hadPriorRcmake = ($null -ne (Get-ItemOrNull -Path $rcmakePath)) -or (Test-ManagedData -Path $dataDir)
+    $priorVerifySha256 = $null
+    $priorMarkerPath = Join-Path $dataDir $dataMarkerName
+    $priorMarkerItem = Get-ItemOrNull -Path $priorMarkerPath
+    if ($null -ne $priorMarkerItem -and -not $priorMarkerItem.PSIsContainer -and -not ($priorMarkerItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        foreach ($markerLine in [IO.File]::ReadAllLines($priorMarkerPath)) {
+            if ($markerLine.Trim() -match '^verify_sha256=([0-9a-fA-F]{64})$') {
+                $priorVerifySha256 = $Matches[1].ToLowerInvariant()
+                break
+            }
+        }
+    }
     $removedStaleVerify = $false
     $installed = @()
     $versionOutput = $null
@@ -870,11 +889,14 @@ try {
             & $backupDestination $verifyPath
             Move-Item -LiteralPath $stagedVerify -Destination $verifyPath -Force
             $installed += $verifyPath
-        } elseif ($hadPriorRcmake) {
+        } elseif ($hadPriorRcmake -and -not [string]::IsNullOrEmpty($priorVerifySha256)) {
             $oldVerifyItem = Get-ItemOrNull -Path $verifyPath
             if ($null -ne $oldVerifyItem -and -not $oldVerifyItem.PSIsContainer -and -not ($oldVerifyItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-                & $backupDestination $verifyPath
-                $removedStaleVerify = $true
+                $oldVerifySha256 = (Get-FileHash -LiteralPath $verifyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($oldVerifySha256 -ceq $priorVerifySha256) {
+                    & $backupDestination $verifyPath
+                    $removedStaleVerify = $true
+                }
             }
         }
 
@@ -945,6 +967,9 @@ try {
         }
         $installedRcmakeVer = Get-VersionToken -Lines $versionOutput -PrefixName 'rcmake'
         if ($hasVerify) {
+            if ([string]::IsNullOrEmpty($installedRcmakeVer)) {
+                Stop-Install 'Installed rcmake.exe --version did not report a version.'
+            }
             $verifyOutput = & $verifyPath --version
             if ($LASTEXITCODE -ne 0) {
                 Stop-Install "Installed rcmake-verify.exe failed --version check (exit code $LASTEXITCODE)."
@@ -953,7 +978,7 @@ try {
             if ([string]::IsNullOrEmpty($installedVerifyVer)) {
                 Stop-Install 'Installed rcmake-verify.exe --version did not report a version.'
             }
-            if (-not [string]::IsNullOrEmpty($installedRcmakeVer) -and ($installedVerifyVer -cne $installedRcmakeVer)) {
+            if ($installedVerifyVer -cne $installedRcmakeVer) {
                 Stop-Install "Installed rcmake-verify.exe version ($installedVerifyVer) does not match rcmake.exe version ($installedRcmakeVer)."
             }
         }

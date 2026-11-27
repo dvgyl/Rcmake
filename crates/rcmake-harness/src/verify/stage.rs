@@ -10,11 +10,38 @@ use rcmake_host::{FileKind, Follow, Host, WriteMode, path};
 
 use super::protocol::{is_host_absolute, validate_source_relative};
 
-const MAX_STAGE_FILES: usize = 20_000;
+const MAX_STAGE_FILES: usize = 100_000;
 const MAX_STAGE_DEPTH: usize = 64;
-const MAX_STAGE_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_STAGE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_STAGE_FILE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_STAGE_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+const READ_DIR_SKIP_SLACK: usize = 256;
 const COPY_CHUNK_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct StageLimits {
+    max_files: usize,
+    max_depth: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+}
+
+impl Default for StageLimits {
+    fn default() -> Self {
+        Self {
+            max_files: MAX_STAGE_FILES,
+            max_depth: MAX_STAGE_DEPTH,
+            max_file_bytes: MAX_STAGE_FILE_BYTES,
+            max_total_bytes: MAX_STAGE_TOTAL_BYTES,
+        }
+    }
+}
+
+fn is_skipped_stage_dir_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b".git" | b".hg" | b".svn" | b".bzr" | b"CMakeFiles" | b"Testing"
+    )
+}
 
 /// Owned private scratch directory that cleans itself up via [`Self::cleanup`] or on drop.
 pub(crate) struct ScratchWorkspace<'h> {
@@ -406,6 +433,26 @@ fn stage_tree(
     scratch_root: Option<&Path>,
     validate_symlinks: bool,
 ) -> Result<(), String> {
+    stage_tree_with_limits(
+        host,
+        source_root,
+        dst_root,
+        excluded,
+        scratch_root,
+        validate_symlinks,
+        StageLimits::default(),
+    )
+}
+
+fn stage_tree_with_limits(
+    host: &dyn Host,
+    source_root: &Path,
+    dst_root: &Path,
+    excluded: Option<&Path>,
+    scratch_root: Option<&Path>,
+    validate_symlinks: bool,
+    limits: StageLimits,
+) -> Result<(), String> {
     let mut budget = StageBudget::default();
     let mut symlinks = Vec::new();
     copy_tree_bounded(
@@ -418,6 +465,7 @@ fn stage_tree(
         0,
         &mut budget,
         validate_symlinks,
+        limits,
         &mut symlinks,
     )?;
     create_deferred_symlinks(host, symlinks)
@@ -434,31 +482,35 @@ fn copy_tree_bounded(
     depth: usize,
     budget: &mut StageBudget,
     validate_symlinks: bool,
+    limits: StageLimits,
     symlinks: &mut Vec<DeferredSymlink>,
 ) -> Result<(), String> {
-    if depth > MAX_STAGE_DEPTH {
+    if depth > limits.max_depth {
         return Err(format!(
-            "Source tree exceeds verify staging depth limit ({MAX_STAGE_DEPTH})."
+            "Source tree exceeds verify staging depth limit ({depth} > {}).",
+            limits.max_depth
         ));
     }
-    let mut entries = host
-        .read_dir(src_dir)
+    let remaining_slots = limits.max_files.saturating_sub(budget.files);
+    let read_limit = remaining_slots.saturating_add(READ_DIR_SKIP_SLACK);
+    let (mut entries, truncated) = host
+        .read_dir_bounded(src_dir, read_limit)
         .map_err(|err| format!("Could not list {}: {err}", src_dir.display()))?;
-    let remaining_slots = MAX_STAGE_FILES.saturating_sub(budget.files);
-    if entries
-        .iter()
-        .filter(|e| !e.name.starts_with(b"._"))
-        .count()
-        > remaining_slots
-    {
+    if truncated {
+        let measured = budget.files.saturating_add(entries.len()).saturating_add(1);
         return Err(format!(
-            "Source tree exceeds verify staging file limit ({MAX_STAGE_FILES} entries)."
+            "Source tree exceeds verify staging file limit (at least {measured} > {} entries while reading {}).",
+            limits.max_files,
+            src_dir.display()
         ));
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     for entry in entries {
         if entry.name.starts_with(b"._") {
+            continue;
+        }
+        if entry.kind == FileKind::Dir && is_skipped_stage_dir_name(&entry.name) {
             continue;
         }
         let child_src = src_dir.join(path::to_native(&entry.name));
@@ -472,12 +524,22 @@ fn copy_tree_bounded(
         if excluded.is_some_and(matches_excluded) || scratch_root.is_some_and(matches_excluded) {
             continue;
         }
-        budget.files += 1;
-        if budget.files > MAX_STAGE_FILES {
+        // Skip nested CMake build trees (subdirectories containing a CMakeCache.txt).
+        if entry.kind == FileKind::Dir
+            && host
+                .metadata(&child_src.join("CMakeCache.txt"), Follow::No)
+                .is_ok_and(|meta| meta.kind == FileKind::File)
+        {
+            continue;
+        }
+        let next_files = budget.files.saturating_add(1);
+        if next_files > limits.max_files {
             return Err(format!(
-                "Source tree exceeds verify staging file limit ({MAX_STAGE_FILES} entries)."
+                "Source tree exceeds verify staging file limit ({next_files} > {} entries).",
+                limits.max_files
             ));
         }
+        budget.files = next_files;
         let child_dst = dst_dir.join(path::to_native(&entry.name));
         match entry.kind {
             FileKind::Dir => {
@@ -493,11 +555,12 @@ fn copy_tree_bounded(
                     depth + 1,
                     budget,
                     validate_symlinks,
+                    limits,
                     symlinks,
                 )?;
             }
             FileKind::File => {
-                copy_file_bounded(host, &child_src, &child_dst, budget)?;
+                copy_file_bounded(host, &child_src, &child_dst, budget, limits)?;
             }
             FileKind::Symlink => {
                 let target = host.read_link(&child_src).map_err(|err| {
@@ -531,6 +594,7 @@ fn copy_file_bounded(
     src: &Path,
     dst: &Path,
     budget: &mut StageBudget,
+    limits: StageLimits,
 ) -> Result<(), String> {
     let pre_meta = host
         .metadata_fresh(src, Follow::No)
@@ -541,15 +605,20 @@ fn copy_file_bounded(
             src.display()
         ));
     }
-    if pre_meta.len > MAX_STAGE_FILE_BYTES {
+    if pre_meta.len > limits.max_file_bytes {
         return Err(format!(
-            "Source file {} exceeds verify staging file limit ({MAX_STAGE_FILE_BYTES} bytes).",
-            src.display()
+            "Source file {} ({} bytes) exceeds verify staging file limit ({} bytes).",
+            src.display(),
+            pre_meta.len,
+            limits.max_file_bytes
         ));
     }
-    if budget.bytes.saturating_add(pre_meta.len) > MAX_STAGE_TOTAL_BYTES {
+    let projected_total = budget.bytes.saturating_add(pre_meta.len);
+    if projected_total > limits.max_total_bytes {
         return Err(format!(
-            "Source tree exceeds verify staging total size limit ({MAX_STAGE_TOTAL_BYTES} bytes)."
+            "Source tree ({projected_total} bytes including {}) exceeds verify staging total size limit ({} bytes).",
+            src.display(),
+            limits.max_total_bytes
         ));
     }
 
@@ -578,23 +647,26 @@ fn copy_file_bounded(
         };
         let chunk = buf.get(..n).unwrap_or(&[]);
         file_bytes = file_bytes.saturating_add(n as u64);
-        if file_bytes > MAX_STAGE_FILE_BYTES {
+        if file_bytes > limits.max_file_bytes {
             if created {
                 let _ = host.remove_file(dst);
             }
             return Err(format!(
-                "Source file {} grew beyond verify staging file limit ({MAX_STAGE_FILE_BYTES} bytes).",
-                src.display()
+                "Source file {} grew to {file_bytes} bytes, exceeding verify staging file limit ({} bytes).",
+                src.display(),
+                limits.max_file_bytes
             ));
         }
         budget.bytes = budget.bytes.saturating_add(n as u64);
-        if budget.bytes > MAX_STAGE_TOTAL_BYTES {
+        if budget.bytes > limits.max_total_bytes {
             if created {
                 let _ = host.remove_file(dst);
             }
             return Err(format!(
-                "Source tree exceeded verify staging total size limit ({MAX_STAGE_TOTAL_BYTES} bytes) while copying {}.",
-                src.display()
+                "Source tree reached {} bytes while copying {}, exceeding verify staging total size limit ({} bytes).",
+                budget.bytes,
+                src.display(),
+                limits.max_total_bytes
             ));
         }
         let write_mode = if created {
@@ -711,4 +783,110 @@ fn check_internal_symlink(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_host::PureHost;
+
+    use super::*;
+
+    #[test]
+    fn stages_source_skipping_vcs_build_trees_and_oversized_git_objects() {
+        let host = PureHost::default();
+        host.seed_file(
+            Path::new("/repo/CMakeLists.txt"),
+            b"cmake_minimum_required(VERSION 4.5)\nproject(Demo NONE)\n",
+        )
+        .expect("seed CMakeLists");
+        host.seed_file(
+            Path::new("/repo/src/main.c"),
+            b"int main(void) { return 0; }\n",
+        )
+        .expect("seed main.c");
+        // Oversized packfile inside .git plus other VCS/build/testing dirs must be skipped.
+        host.seed_file(
+            Path::new("/repo/.git/objects/pack/huge.pack"),
+            &vec![b'P'; 2048],
+        )
+        .expect("seed .git pack");
+        host.seed_file(Path::new("/repo/.hg/store/data.bin"), &vec![b'H'; 2048])
+            .expect("seed .hg");
+        host.seed_file(Path::new("/repo/.svn/wc.db"), &vec![b'S'; 2048])
+            .expect("seed .svn");
+        host.seed_file(Path::new("/repo/.bzr/branch.conf"), &vec![b'B'; 2048])
+            .expect("seed .bzr");
+        host.seed_file(Path::new("/repo/CMakeFiles/cache.dat"), &vec![b'C'; 2048])
+            .expect("seed CMakeFiles");
+        host.seed_file(
+            Path::new("/repo/Testing/Temporary/LastTest.log"),
+            &vec![b'T'; 2048],
+        )
+        .expect("seed Testing");
+        host.seed_file(
+            Path::new("/repo/out-build/CMakeCache.txt"),
+            b"CMAKE_BUILD_TYPE:STRING=Debug\n",
+        )
+        .expect("seed nested build cache");
+        host.seed_file(Path::new("/repo/out-build/big.o"), &vec![b'O'; 2048])
+            .expect("seed nested build obj");
+
+        host.create_dir_all(Path::new("/dst")).expect("mkdir dst");
+        let tight = StageLimits {
+            max_files: 10,
+            max_depth: 16,
+            max_file_bytes: 256,
+            max_total_bytes: 512,
+        };
+        stage_tree_with_limits(
+            &host,
+            Path::new("/repo"),
+            Path::new("/dst"),
+            None,
+            None,
+            true,
+            tight,
+        )
+        .expect("source tree with oversized .git and nested build dir should stage cleanly");
+
+        assert!(
+            host.metadata(Path::new("/dst/CMakeLists.txt"), Follow::No)
+                .is_ok()
+        );
+        assert!(
+            host.metadata(Path::new("/dst/src/main.c"), Follow::No)
+                .is_ok()
+        );
+        for skipped in [
+            "/dst/.git",
+            "/dst/.hg",
+            "/dst/.svn",
+            "/dst/.bzr",
+            "/dst/CMakeFiles",
+            "/dst/Testing",
+            "/dst/out-build",
+        ] {
+            assert!(
+                host.metadata(Path::new(skipped), Follow::No).is_err(),
+                "skipped directory {skipped} must not be staged"
+            );
+        }
+
+        // Non-skipped oversized file reports measured byte size in the limit error.
+        host.seed_file(Path::new("/repo/src/big.bin"), &vec![b'X'; 300])
+            .expect("seed big.bin");
+        host.create_dir_all(Path::new("/dst2")).expect("mkdir dst2");
+        let err = stage_tree_with_limits(
+            &host,
+            Path::new("/repo"),
+            Path::new("/dst2"),
+            None,
+            None,
+            true,
+            tight,
+        )
+        .expect_err("oversized regular file should fail");
+        assert!(err.contains("300 bytes"), "{err}");
+        assert!(err.contains("256 bytes"), "{err}");
+    }
 }

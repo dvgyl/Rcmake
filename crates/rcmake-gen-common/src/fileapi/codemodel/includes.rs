@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use indexmap::IndexMap;
 use rcmake_base::{BString, list, path_lex::cmake_style, truth::is_on};
-use rcmake_genex::{EvalContext, EvalSite, PreprocessMode, TargetHandle};
+use rcmake_genex::{EvalContext, EvalSite, TargetHandle};
 use rcmake_model::{ProjectModel, Target, UsageField};
 use rcmake_resolve::{ResolvedTarget, usage::UsageResolver};
 
@@ -63,14 +63,7 @@ pub(super) fn interface_includes(
     {
         context.language = language.cloned();
         let mut evaluate = |value: &[u8]| {
-            genex(
-                usage,
-                target.dir,
-                &context,
-                value,
-                Some(PreprocessMode::Build),
-            )
-            .map(|value| {
+            genex(usage, target.dir, &context, value, None).map(|value| {
                 list::split(&value, list::Empty::Drop)
                     .into_iter()
                     .map(|path| without_trailing_slashes(cmake_style(&path)))
@@ -117,4 +110,63 @@ fn without_trailing_slashes(path: BString) -> BString {
         bytes = bytes.strip_suffix(b"/").unwrap_or(bytes);
     }
     BString::from(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_diag::{Backtrace, PolicyMap};
+    use rcmake_genex::ConfigId;
+    use rcmake_host::PureHost;
+    use rcmake_model::{BT, DirId, ProjectModel, Target, TargetKind, TargetOrigin, UsageField};
+    use rcmake_resolve::usage::UsageResolver;
+
+    use super::*;
+
+    #[test]
+    fn preserves_build_local_interface_and_drops_install_interface() {
+        let mut model = ProjectModel::default();
+        model.set_root_dirs("/src".into(), "/build".into());
+        model
+            .global
+            .props
+            .set("ENABLED_LANGUAGES".into(), "CXX".into());
+        let mut target = Target::new(
+            "iface".into(),
+            TargetKind::InterfaceLibrary,
+            TargetOrigin::Normal,
+            DirId::ROOT,
+            Backtrace::default(),
+            PolicyMap::default(),
+        );
+        target.usage.push(
+            UsageField::InterfaceIncludeDirectories,
+            BT::new(
+                "$<BUILD_INTERFACE:/src/build_inc>;$<BUILD_LOCAL_INTERFACE:/src/local_inc>;$<INSTALL_INTERFACE:include>".into(),
+                Backtrace::default(),
+            ),
+        );
+        let id = model.add_target(target).expect("add target");
+        let host = PureHost::default();
+        let resolved_all =
+            rcmake_resolve::resolve(&model, &host, &[ConfigId::default()]).expect("resolve");
+        let resolved = resolved_all
+            .targets
+            .iter()
+            .find(|t| t.id == id)
+            .expect("resolved target");
+        let raw = model.target(id).expect("raw target");
+        let mut usage = UsageResolver::new(&model);
+        let entries = interface_includes(&model, &mut usage, resolved, raw).expect("includes");
+        let paths: Vec<String> = entries
+            .into_iter()
+            .filter_map(|v| match v {
+                Value::Object(map) => match map.get(b"path".as_slice()) {
+                    Some(Value::String(s)) => Some(s.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec!["/src/build_inc", "/src/local_inc"]);
+    }
 }

@@ -161,7 +161,8 @@ fn drift_from_an_in_place_compiler_replacement_stays_until_a_fresh_configure() -
         "{warning}"
     );
     assert!(warning.contains("still describe Fake 2.0"), "{warning}");
-    assert!(warning.contains("rcmake --fresh -B"), "{warning}");
+    assert!(warning.contains("rcmake --fresh -S \""), "{warning}");
+    assert!(warning.contains("give each -D option again"), "{warning}");
     assert_eq!(
         tree.receipt().as_ref(),
         Some(&baseline),
@@ -452,5 +453,101 @@ fn receipt_write_and_restore_errors_are_reported() -> TestResult {
         output.contains("Cannot restore the drift receipt"),
         "{output}"
     );
+    Ok(())
+}
+
+#[test]
+fn recovery_quotes_both_directories() {
+    let advice = recovery(Path::new("/w/my src"), Path::new("/w/b$x"));
+    assert!(
+        advice.starts_with(r#"Run 'rcmake --fresh -S "/w/my src" -B "/w/b\$x"'"#),
+        "{advice}"
+    );
+    assert!(recovery(Path::new(""), Path::new("/w/b")).contains("--fresh -B \"/w/b\""));
+}
+
+#[test]
+fn an_unreadable_compiler_file_keeps_the_language_baseline() -> TestResult {
+    let tree = Tree::new()?;
+    let cache = tree.cache(None);
+    tree.configure(&cache, true, true, false, true);
+    let baseline = tree.receipt().ok_or("receipt")?;
+    let file = platform_dir(&tree.bin).join("CMakeCCompiler.cmake");
+    let saved = tree.host.read(&file, ReadRange::All { limit: 4096 })?;
+
+    // A compiler file over the read limit is a read error, not a removal.
+    let oversized = vec![b'#'; usize::try_from(COMPILER_FILE_LIMIT)? + 1];
+    tree.host.write(&file, &oversized, WriteMode::Truncate)?;
+    tree.configure(&cache, false, true, false, true);
+    assert_eq!(tree.receipt().as_ref(), Some(&baseline));
+
+    // A compiler directory that cannot be listed is not a removal either.
+    tree.host.write(&file, &saved, WriteMode::Truncate)?;
+    let dir = platform_dir(&tree.bin);
+    tree.host.remove_dir_all(&dir)?;
+    tree.host.seed_file(&dir, b"not a directory")?;
+    tree.configure(&cache, false, true, false, true);
+    assert_eq!(tree.receipt().as_ref(), Some(&baseline));
+
+    // A missing compiler file in a readable directory removes the language.
+    tree.host.remove_file(&dir)?;
+    tree.host.create_dir_all(&dir)?;
+    tree.configure(&cache, false, true, false, true);
+    let receipt = String::from_utf8(tree.receipt().ok_or("receipt")?)?;
+    assert!(!receipt.contains("\"C\""), "{receipt}");
+    Ok(())
+}
+
+#[test]
+fn a_relative_toolchain_file_uses_the_binary_then_the_source_directory() -> TestResult {
+    let tree = Tree::new()?;
+    let on_path = tree.host.initial_cwd().join("pathbin");
+    tree.host.seed_file(&on_path.join("tc.cmake"), b"path")?;
+    tree.host
+        .set_permissions(&on_path.join("tc.cmake"), 0o755)?;
+    tree.host
+        .env_set(b"PATH", Some(&path::from_native(&on_path)));
+    tree.host.seed_file(&tree.src.join("tc.cmake"), b"source")?;
+    let memo = DigestMemo::default();
+    let bases = [tree.bin.as_path(), tree.src.as_path()];
+    let found = tool(
+        tree.host.as_ref(),
+        &memo,
+        b"tc.cmake",
+        Lookup::Relative(&bases),
+    );
+    assert_eq!(
+        found.resolved,
+        Some(path::from_native(&tree.src.join("tc.cmake")))
+    );
+    tree.host.seed_file(&tree.bin.join("tc.cmake"), b"binary")?;
+    let found = tool(
+        tree.host.as_ref(),
+        &memo,
+        b"tc.cmake",
+        Lookup::Relative(&bases),
+    );
+    assert_eq!(
+        found.resolved,
+        Some(path::from_native(&tree.bin.join("tc.cmake")))
+    );
+    Ok(())
+}
+
+#[test]
+fn digests_are_reused_only_while_the_file_identity_matches() -> TestResult {
+    let tree = Tree::new()?;
+    let memo = DigestMemo::default();
+    let first = memo.digest(tree.host.as_ref(), &tree.cc).ok_or("digest")?;
+    let sentinel = Digest::from_bytes([9; 32]);
+    for (_, digest) in memo.0.borrow_mut().values_mut() {
+        *digest = Some(sentinel);
+    }
+    assert_eq!(memo.digest(tree.host.as_ref(), &tree.cc), Some(sentinel));
+    tree.host
+        .write(&tree.cc, b"a longer compiler", WriteMode::Truncate)?;
+    let changed = memo.digest(tree.host.as_ref(), &tree.cc).ok_or("digest")?;
+    assert_ne!(changed, sentinel);
+    assert_ne!(changed, first);
     Ok(())
 }

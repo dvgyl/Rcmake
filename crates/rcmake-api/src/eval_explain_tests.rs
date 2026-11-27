@@ -179,3 +179,89 @@ fn same_named_imported_targets_resolve_in_one_directory() {
     assert_eq!(value(&report), [Ok(BString::from("a"))]);
     assert_eq!(report.directory, BString::from("a"));
 }
+
+#[test]
+fn unavailable_evidence_does_not_depend_on_the_step_limit() {
+    let result = configure("");
+    let deep = format!("{}$<COMMAND_CONFIG:x>{}", "$<1:".repeat(8), ">".repeat(8));
+    for step_limit in [0, 1, 4] {
+        let request = EvalRequest {
+            expression: Some(deep.clone().into()),
+            step_limit,
+            ..EvalRequest::default()
+        };
+        let report = result.evaluate_genex(&request).expect("report");
+        assert_eq!(
+            report.results[0].unavailable,
+            [BString::from("COMMAND_CONFIG")],
+            "step limit {step_limit}"
+        );
+        assert!(!report.success(), "step limit {step_limit}");
+    }
+}
+
+#[test]
+fn no_steps_json_has_no_steps_and_no_truncation() {
+    let result = configure("");
+    let request = EvalRequest {
+        expression: Some("$<1:$<1:x>>".into()),
+        step_limit: 0,
+        ..EvalRequest::default()
+    };
+    let report = result.evaluate_genex(&request).expect("report");
+    let json = render_eval_json(&report);
+    let parsed = rcmake_json::parse(&json, &rcmake_json::ReadOptions::default()).expect("json");
+    assert_eq!(
+        parsed
+            .get("steps_recorded")
+            .and_then(rcmake_json::Value::as_bool),
+        Some(false)
+    );
+    let first = parsed
+        .get("results")
+        .and_then(rcmake_json::Value::as_array)
+        .and_then(|results| results.first())
+        .expect("one result");
+    assert_eq!(
+        first
+            .get("steps")
+            .and_then(rcmake_json::Value::as_array)
+            .map(<[rcmake_json::Value]>::len),
+        Some(0)
+    );
+    assert_eq!(
+        first
+            .get("steps_truncated")
+            .and_then(rcmake_json::Value::as_bool),
+        Some(false)
+    );
+}
+
+#[test]
+fn terminal_header_names_the_expression_once_with_the_active_context() {
+    let result = configure("add_library(liba INTERFACE)\nset_property(TARGET liba PROPERTY TAG v)");
+    let plain = EvalRequest {
+        expression: Some("x".into()),
+        ..EvalRequest::default()
+    };
+    let report = result.evaluate_genex(&plain).expect("report");
+    let text = render_eval_terminal(&report, false, false);
+    assert!(text.starts_with("x\n\n"), "{text:?}");
+
+    let property = EvalRequest {
+        owner: Some("liba".into()),
+        property: Some("TAG".into()),
+        language: Some("CXX".into()),
+        link_language: Some("C".into()),
+        link: true,
+        ..EvalRequest::default()
+    };
+    let report = result.evaluate_genex(&property).expect("report");
+    let text = render_eval_terminal(&report, false, false);
+    let header = text.lines().next().unwrap_or_default();
+    assert_eq!(
+        header,
+        "TAG = v   owner liba, language CXX, link language C, link traversal"
+    );
+    assert_eq!(text.matches("TAG = v").count(), 1, "{text}");
+}

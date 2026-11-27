@@ -20,10 +20,10 @@ use self::render::{
     render_variables_wxi, render_wix_sources,
 };
 use super::installer::{
-    BUILD_TIMEOUT, ComponentCatalog, check_tool_outcome, escape_xml_attr, find_program_on_host,
-    find_template, is_windows_host, option_set, prepare_fresh_output, read_template,
-    render_at_template, require_utf8, run_installer_tool, validate_xml_ncname, verify_fresh_output,
-    warn, write_tool_log,
+    ComponentCatalog, build_tool_timeout, check_tool_outcome, escape_xml_attr,
+    find_program_on_host, find_template, is_windows_host, option_set, prepare_fresh_output,
+    read_template, render_at_template, require_utf8, run_installer_tool, validate_xml_ncname,
+    verify_fresh_output, warn, write_tool_log,
 };
 use crate::config::{CpackConfig, absolute, script, snapshot};
 use crate::source::{SymlinkPolicy, validate_staged_tree};
@@ -814,7 +814,7 @@ fn run_wix_v3(
         args.extend(candle_flags.iter().cloned());
         args.push(from_native_cmake(source));
 
-        let outcome = run_installer_tool(host, work_dir, candle, &args, BUILD_TIMEOUT)?;
+        let outcome = run_installer_tool(host, work_dir, candle, &args, build_tool_timeout(host))?;
         write_tool_log(host, log_path, candle, &args, &outcome.output, &[], true)?;
         check_tool_outcome(&outcome, candle, "WiX candle", Some(log_path), &[])?;
         verify_fresh_output(host, work_dir, canon_work, &obj, "WiX candle")?;
@@ -838,7 +838,7 @@ fn run_wix_v3(
         light_args.push(from_native_cmake(&path));
     }
 
-    let outcome = run_installer_tool(host, work_dir, light, &light_args, BUILD_TIMEOUT)?;
+    let outcome = run_installer_tool(host, work_dir, light, &light_args, build_tool_timeout(host))?;
     write_tool_log(
         host,
         log_path,
@@ -888,7 +888,7 @@ fn run_wix_v4(
         args.extend(["-i".into(), from_native_cmake(work_dir)]);
     }
 
-    let outcome = run_installer_tool(host, work_dir, wix, &args, BUILD_TIMEOUT)?;
+    let outcome = run_installer_tool(host, work_dir, wix, &args, build_tool_timeout(host))?;
     write_tool_log(host, log_path, wix, &args, &outcome.output, &[], true)?;
     check_tool_outcome(&outcome, wix, "WiX build", Some(log_path), &[])?;
     Ok(())

@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,11 +15,7 @@ use rcmake_api::{
 use rcmake_base::BString;
 use rcmake_diag::DiagOptions;
 use rcmake_eval::FindTraceLevel;
-use rcmake_host::{
-    CopyOptions, DirEntry, FileKind, FileLockGuard, FileTime, Follow, GracefulTimeout, Host,
-    HostResult, Metadata, ReadRange, RunOutput, RunRequest, Stream, SystemInfo,
-    WriteMode as HostWriteMode, path,
-};
+use rcmake_host::{FileKind, FileTime, Follow, Host, HostResult, Stream, SystemInfo, path};
 use rcmake_model::GeneratorKind;
 
 use crate::{cache, configure::initialize_diagnostics, resolve_cli_path};
@@ -149,7 +145,10 @@ fn typed_filter_empty(report: &ExplainReport, config: Option<&BString>) -> bool 
         return false;
     };
     if let Some(dependency) = &target.dependency {
-        return dependency.paths.is_empty();
+        return dependency
+            .paths_for(config.map(|name| name.as_slice()))
+            .next()
+            .is_none();
     }
     !target
         .configurations
@@ -424,110 +423,7 @@ struct ReportHost {
 }
 
 impl Host for ReportHost {
-    fn metadata(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
-        self.base.metadata(p, follow)
-    }
-
-    fn read(&self, p: &Path, range: ReadRange) -> HostResult<Vec<u8>> {
-        self.base.read(p, range)
-    }
-
-    fn read_chunks(&self, p: &Path, consume: &mut dyn FnMut(&[u8])) -> HostResult<()> {
-        self.base.read_chunks(p, consume)
-    }
-
-    fn write(&self, p: &Path, data: &[u8], mode: HostWriteMode) -> HostResult<()> {
-        self.base.write(p, data, mode)
-    }
-
-    fn read_dir(&self, p: &Path) -> HostResult<Vec<DirEntry>> {
-        self.base.read_dir(p)
-    }
-
-    fn create_dir_all(&self, p: &Path) -> HostResult<()> {
-        self.base.create_dir_all(p)
-    }
-
-    fn create_private_dir(&self, p: &Path) -> HostResult<()> {
-        self.base.create_private_dir(p)
-    }
-
-    fn metadata_fresh(&self, p: &Path, follow: Follow) -> HostResult<Metadata> {
-        self.base.metadata_fresh(p, follow)
-    }
-
-    fn remove_file(&self, p: &Path) -> HostResult<()> {
-        self.base.remove_file(p)
-    }
-
-    fn remove_dir(&self, p: &Path) -> HostResult<()> {
-        self.base.remove_dir(p)
-    }
-
-    fn remove_dir_all(&self, p: &Path) -> HostResult<()> {
-        self.base.remove_dir_all(p)
-    }
-
-    fn rename(&self, from: &Path, to: &Path) -> HostResult<()> {
-        self.base.rename(from, to)
-    }
-
-    fn rename_noreplace(&self, from: &Path, to: &Path) -> HostResult<()> {
-        self.base.rename_noreplace(from, to)
-    }
-
-    fn lock_file(&self, p: &Path, timeout: Option<Duration>) -> HostResult<Box<dyn FileLockGuard>> {
-        self.base.lock_file(p, timeout)
-    }
-
-    fn copy_file(&self, from: &Path, to: &Path, opts: CopyOptions) -> HostResult<()> {
-        self.base.copy_file(from, to, opts)
-    }
-
-    fn symlink(&self, target: &Path, link: &Path) -> HostResult<()> {
-        self.base.symlink(target, link)
-    }
-
-    fn hard_link(&self, src: &Path, dst: &Path) -> HostResult<()> {
-        self.base.hard_link(src, dst)
-    }
-
-    fn read_link(&self, p: &Path) -> HostResult<PathBuf> {
-        self.base.read_link(p)
-    }
-
-    fn canonicalize(&self, p: &Path) -> HostResult<PathBuf> {
-        self.base.canonicalize(p)
-    }
-
-    fn canonicalize_fresh(&self, p: &Path) -> HostResult<PathBuf> {
-        self.base.canonicalize_fresh(p)
-    }
-
-    fn set_permissions(&self, p: &Path, mode: u32) -> HostResult<()> {
-        self.base.set_permissions(p, mode)
-    }
-
-    fn set_times(
-        &self,
-        p: &Path,
-        atime: Option<FileTime>,
-        mtime: Option<FileTime>,
-    ) -> HostResult<()> {
-        self.base.set_times(p, atime, mtime)
-    }
-
-    fn env_get(&self, key: &[u8]) -> Option<BString> {
-        self.base.env_get(key)
-    }
-
-    fn env_set(&self, key: &[u8], value: Option<&[u8]>) {
-        self.base.env_set(key, value);
-    }
-
-    fn env_all(&self) -> Vec<(BString, BString)> {
-        self.base.env_all()
-    }
+    rcmake_host::forward_host!(base, fs, env, process);
 
     fn registry_host_view(&self) -> Option<rcmake_host::RegistryView> {
         self.base.registry_host_view()
@@ -541,77 +437,6 @@ impl Host for ReportHost {
         view: rcmake_host::RegistryView,
     ) -> HostResult<Option<BString>> {
         self.base.registry_value(root, subkey, name, view)
-    }
-
-    fn open_read(&self, p: &Path) -> HostResult<Box<dyn rcmake_host::ReadSeek + '_>> {
-        self.base.open_read(p)
-    }
-
-    fn scratch_file(&self) -> HostResult<Box<dyn rcmake_host::ScratchFile + '_>> {
-        self.base.scratch_file()
-    }
-
-    fn scratch_file_in(&self, dir: &Path) -> HostResult<Box<dyn rcmake_host::ScratchFile + '_>> {
-        self.base.scratch_file_in(dir)
-    }
-
-    fn write_from(
-        &self,
-        p: &Path,
-        mode: HostWriteMode,
-        input: &mut dyn std::io::Read,
-        len: u64,
-    ) -> HostResult<()> {
-        self.base.write_from(p, mode, input, len)
-    }
-
-    fn run_controlled(
-        &self,
-        req: &RunRequest,
-        graceful: Option<GracefulTimeout>,
-        hard_limit: Option<std::time::Duration>,
-        update: &mut rcmake_host::DeadlineUpdate<'_>,
-    ) -> HostResult<rcmake_host::ControlledOutput> {
-        self.base.run_controlled(req, graceful, hard_limit, update)
-    }
-
-    fn run(
-        &self,
-        req: &RunRequest,
-        on_output: &mut dyn FnMut(Stream, &[u8]),
-    ) -> HostResult<RunOutput> {
-        self.base.run(req, on_output)
-    }
-
-    fn run_with_timeout_signal(
-        &self,
-        req: &RunRequest,
-        timeout: GracefulTimeout,
-        on_output: &mut dyn FnMut(Stream, &[u8]),
-    ) -> HostResult<RunOutput> {
-        self.base.run_with_timeout_signal(req, timeout, on_output)
-    }
-
-    fn run_confined(
-        &self,
-        req: &RunRequest,
-        scope: rcmake_host::WriteScope<'_>,
-        on_output: &mut dyn FnMut(Stream, &[u8]),
-    ) -> HostResult<RunOutput> {
-        self.base.run_confined(req, scope, on_output)
-    }
-
-    fn run_bounded_confined(
-        &self,
-        req: &RunRequest,
-        limit: usize,
-        scope: rcmake_host::WriteScope<'_>,
-    ) -> HostResult<RunOutput> {
-        self.base.run_bounded_confined(req, limit, scope)
-    }
-
-    fn run_bounded(&self, req: &RunRequest, limit: usize) -> HostResult<RunOutput> {
-        self.base.run_bounded(req, limit)
     }
 
     fn write_out(&self, _stream: Stream, bytes: &[u8]) {
@@ -665,6 +490,8 @@ impl Host for ReportHost {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use rcmake_api::{ExplainItemKind, ExplainSuggestion};
     use rcmake_base::ByteSlice;
     use rcmake_host::PureHost;
@@ -757,6 +584,28 @@ mod tests {
             assert!(output.contains_str(example));
         }
         assert!(host.stream_bytes(Stream::Stderr).is_empty());
+    }
+
+    #[test]
+    fn dependency_exit_status_follows_the_requested_configuration() -> Result<(), String> {
+        let root = Path::new(if cfg!(windows) { "C:/" } else { "/" });
+        let host = Arc::new(PureHost::new(root.to_owned(), root.join("bin/rcmake")));
+        host.seed_file(
+            &root.join("src/CMakeLists.txt"),
+            b"cmake_minimum_required(VERSION 4.5)\nproject(Deps LANGUAGES NONE)\nset(CMAKE_CONFIGURATION_TYPES Debug Release)\nadd_library(dbg INTERFACE)\nadd_library(top INTERFACE)\ntarget_link_libraries(top INTERFACE $<$<CONFIG:Debug>:dbg>)\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let mut request = ConfigureRequest::new("src", "build", "cmake", host);
+        request.generator = Some(GeneratorKind::NinjaMultiConfig);
+        let result = run_configure(request).map_err(|error| error.to_string())?;
+        let report = result.explain_with(
+            &ExplainQuery::Target("top".into()),
+            Some(ExplainFilter::Dependency("dbg".into())),
+        );
+        assert!(!typed_filter_empty(&report, None));
+        assert!(!typed_filter_empty(&report, Some(&"debug".into())));
+        assert!(typed_filter_empty(&report, Some(&"Release".into())));
+        Ok(())
     }
 
     #[test]

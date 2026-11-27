@@ -3,7 +3,7 @@
 //! The query walks resolved edges per configuration. It does not use the resolver's
 //! provenance chains, because those keep only the first chain for each link item.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rcmake_base::BString;
 use rcmake_diag::{
@@ -109,6 +109,14 @@ impl DependencyReport {
     pub fn complete(&self) -> bool {
         self.order_only_available && !self.truncated && self.errors.is_empty()
     }
+
+    /// Return the paths of the configuration `requested` (ASCII case-insensitive), or
+    /// every path when `requested` is `None`.
+    pub fn paths_for(&self, requested: Option<&[u8]>) -> impl Iterator<Item = &DependencyPath> {
+        self.paths.iter().filter(move |path| {
+            requested.is_none_or(|name| name.eq_ignore_ascii_case(&path.config))
+        })
+    }
 }
 
 struct Edge {
@@ -125,6 +133,8 @@ struct Walk<'r, 'm> {
     visits: usize,
     found: Vec<DependencyPath>,
     report: DependencyReport,
+    /// Link language of each consumer in this configuration.
+    languages: HashMap<TargetId, Option<BString>>,
 }
 
 impl ConfigureResult {
@@ -171,6 +181,7 @@ impl ConfigureResult {
                 visits: 0,
                 found: Vec::new(),
                 report: std::mem::take(&mut report),
+                languages: HashMap::new(),
             };
             let mut on_path = HashSet::from([head]);
             let mut hops = Vec::new();
@@ -263,15 +274,50 @@ impl Walk<'_, '_> {
         }
     }
 
+    /// Return the link language of `consumer` in this configuration, for
+    /// `$<LINK_LANGUAGE>`. The generated link step has the resolved language. Without
+    /// a link step, an explicit `LINKER_LANGUAGE` property gives the language.
+    fn link_language(&mut self, consumer: TargetId) -> Option<BString> {
+        if let Some(language) = self.languages.get(&consumer) {
+            return language.clone();
+        }
+        let generated = self.result.generation.as_ref().and_then(|generation| {
+            let single = generation.configs.len() == 1;
+            generation
+                .targets
+                .iter()
+                .find(|target| {
+                    target.id == consumer
+                        && (target.config.0.eq_ignore_ascii_case(&self.config)
+                            || (single && self.config.is_empty()))
+                })
+                .and_then(|target| target.link.as_ref())
+                .map(|link| link.language.clone())
+        });
+        let language = generated
+            .or_else(|| {
+                self.result
+                    .model
+                    .target(consumer)
+                    .and_then(|target| target.props.get(b"LINKER_LANGUAGE"))
+                    .cloned()
+            })
+            .filter(|language| !language.is_empty());
+        self.languages.insert(consumer, language.clone());
+        language
+    }
+
     /// Edges out of `node`, evaluated for `consumer`. A node that builds on its own
     /// uses its link implementation. A node reached through a link edge uses its
     /// link interface.
     fn edges(&mut self, node: TargetId, consumer: TargetId, builds: bool) -> Vec<Edge> {
         let head = u32::try_from(consumer.index()).ok().map(TargetHandle);
+        let link_language = self.link_language(consumer);
         let ctx = |traversal| EvalContext {
             config: ConfigId(self.config.clone()),
             head,
             traversal,
+            link_language: link_language.clone(),
             quiet: true,
             ..EvalContext::default()
         };

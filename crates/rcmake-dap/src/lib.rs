@@ -74,8 +74,9 @@ impl DebugServer {
     /// Print `Waiting for debugger client to connect...`, accept the client, and serve
     /// it until `configurationDone`. Then start the debugger thread.
     ///
-    /// If the client closes the connection before `configurationDone`, this returns an
-    /// ended session and the run continues without a debugger.
+    /// If no client connects, this prints the accept error and returns an ended
+    /// session. If the client closes the connection before `configurationDone`, this
+    /// returns an ended session. In both cases the run continues without a debugger.
     #[must_use]
     pub fn start(listener: Box<dyn Listener>, config: Config) -> Self {
         let shared = Arc::new(Shared::new(
@@ -90,12 +91,19 @@ impl DebugServer {
             exit_limit: config.exit_limit,
         };
         (config.stdout)(b"Waiting for debugger client to connect...\n");
-        let accepted = listener.accept();
-        (config.stdout)(b"Debugger client connected.\n");
-        let Ok(connection) = accepted else {
-            shared.terminate();
-            return server;
+        let connection = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) => {
+                let text = format!(
+                    "Error: Failed to accept the debugger client connection.\n{}\n",
+                    transport::error_text(&error)
+                );
+                (config.stdout)(text.as_bytes());
+                shared.terminate();
+                return server;
+            }
         };
+        (config.stdout)(b"Debugger client connected.\n");
         let (Ok(reader), Ok(writer)) = (connection.reader(), connection.writer()) else {
             shared.terminate();
             return server;

@@ -579,6 +579,7 @@ pub(super) fn normalize(input: &Path) -> PathBuf {
 }
 
 pub(crate) struct ResolvedProgram {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) path: PathBuf,
     pub(crate) cmake_spelling: BString,
     pub(crate) tail: BString,

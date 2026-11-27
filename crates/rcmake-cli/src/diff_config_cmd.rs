@@ -127,22 +127,31 @@ fn parse(args: &[BString]) -> Result<Invocation, String> {
             b"-S" => options.source = Some(value(&mut iter, attached, "-S")?),
             b"--config" => {
                 let text = value(&mut iter, attached, "--config")?;
-                options.config = Some(match text.iter().position(|byte| *byte == b':') {
+                let pair: (BString, BString) = match text.iter().position(|byte| *byte == b':') {
                     Some(split) => (
                         text.get(..split).unwrap_or_default().into(),
                         text.get(split + 1..).unwrap_or_default().into(),
                     ),
                     None => (text.clone(), text),
-                });
+                };
+                if pair.0.is_empty() || pair.1.is_empty() {
+                    return Err("Give a configuration on each side of : in --config.".into());
+                }
+                options.config = Some(pair);
             }
             b"--target" => options
                 .targets
                 .push(value(&mut iter, attached, "--target")?),
             b"--only" => {
                 let text = value(&mut iter, attached, "--only")?;
+                if text.split(|byte| *byte == b',').any(<[u8]>::is_empty) {
+                    return Err(
+                        "Give section names separated by commas, with no empty name, to --only."
+                            .into(),
+                    );
+                }
                 let sections = text
                     .split(|byte| *byte == b',')
-                    .filter(|part| !part.is_empty())
                     .map(|part| {
                         Section::parse(part).ok_or_else(|| {
                             format!("Unknown section {}. Use targets, compile, link, toolchain, packages, or cache.", String::from_utf8_lossy(part))
@@ -159,9 +168,12 @@ fn parse(args: &[BString]) -> Result<Invocation, String> {
                     _ => return Err("Use --cache key, --cache all, or --cache none.".into()),
                 };
             }
-            b"--no-normalize" if attached.is_none() => options.normalize = false,
-            b"--prepare" if attached.is_none() => options.prepare = true,
-            b"--json" if attached.is_none() => options.json = true,
+            b"--no-normalize" | b"--prepare" | b"--json" if attached.is_some() => {
+                return Err(format!("{} takes no value.", String::from_utf8_lossy(flag)));
+            }
+            b"--no-normalize" => options.normalize = false,
+            b"--prepare" => options.prepare = true,
+            b"--json" => options.json = true,
             b"--color" => {
                 options.color = match value(&mut iter, attached, "--color")?.as_slice() {
                     b"auto" => Color::Auto,
@@ -321,6 +333,19 @@ fn trace_input(host: &dyn Host, dir: &Path) -> TraceInput {
     }
 }
 
+/// Quote a path for a shell command line in a message.
+fn quoted(dir: &[u8]) -> String {
+    let mut out = String::from("\"");
+    for character in String::from_utf8_lossy(dir).chars() {
+        if matches!(character, '"' | '\\' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out.push('"');
+    out
+}
+
 /// Execute `rcmake diff-config`.
 pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>) -> i32 {
     let host = host.as_ref();
@@ -347,16 +372,16 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
                 Err(message) => return error(host, &message),
             }
         }
-        let dirs: Vec<String> = options
+        let commands: Vec<String> = options
             .dirs
             .iter()
-            .map(|dir| String::from_utf8_lossy(dir).into_owned())
+            .map(|dir| format!("rcmake -B {}", quoted(dir)))
             .collect();
         host.write_out(
             Stream::Stdout,
             format!(
                 "Configure each directory again, for example: {}\nFor a cmake older than 3.14, configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON instead.\n",
-                dirs.iter().map(|dir| format!("cmake -B {dir}")).collect::<Vec<_>>().join("   ")
+                commands.join("   ")
             )
             .as_bytes(),
         );
@@ -384,8 +409,16 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
     let [a, b] = snapshots.as_slice() else {
         return error(host, "Give two build directories.");
     };
+    let sections: std::collections::BTreeSet<Section> = options.only.map_or_else(
+        || Section::ALL.into_iter().collect(),
+        |sections| sections.into_iter().collect(),
+    );
+    // Only the target, compile, and link sections read the File API reply.
+    let needs_file_api = sections
+        .iter()
+        .any(|section| matches!(section, Section::Targets | Section::Compile | Section::Link));
     for snapshot in [a, b] {
-        if !snapshot.evidence(Section::Compile).complete() && !options.json {
+        if needs_file_api && !snapshot.evidence(Section::Compile).complete() && !options.json {
             host.write_out(
                 Stream::Stderr,
                 format!(
@@ -398,10 +431,7 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
         }
     }
     let diff_options = DiffOptions {
-        sections: options.only.map_or_else(
-            || Section::ALL.into_iter().collect(),
-            |sections| sections.into_iter().collect(),
-        ),
+        sections,
         targets: options.targets,
         cache: options.cache,
         normalize: options.normalize,
@@ -457,6 +487,10 @@ mod tests {
             &["a", "b", "--only", "nope"],
             &["--prepare"],
             &["a", "b", "--cache", "x"],
+            &["a", "b", "--only", ","],
+            &["a", "b", "--only=compile,"],
+            &["a", "b", "--config", ":Release"],
+            &["a", "b", "--config=Debug:"],
         ] {
             assert!(parse_args(bad).is_err(), "{bad:?}");
         }
@@ -465,6 +499,51 @@ mod tests {
             Ok(Invocation::Run(_))
         ));
         assert_eq!(parse_args(&["-h"]), Ok(Invocation::Help));
+        for flag in ["--json=1", "--prepare=1", "--no-normalize=1"] {
+            let name = flag.split('=').next().unwrap_or_default();
+            assert_eq!(
+                parse_args(&["a", "b", flag]),
+                Err(format!("{name} takes no value.")),
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_suggests_rcmake_with_quoted_directories() {
+        let host = Arc::new(PureHost::default());
+        host.seed_file(Path::new("/my b/CMakeCache.txt"), b"")
+            .expect("seed");
+        assert_eq!(
+            run(None, &["--prepare".into(), "/my b".into()], host.clone()),
+            0
+        );
+        assert!(
+            host.stream_bytes(Stream::Stdout)
+                .contains_str("for example: rcmake -B \"/my b\"")
+        );
+    }
+
+    #[test]
+    fn file_api_note_appears_only_for_sections_that_read_it() {
+        let host = Arc::new(PureHost::default());
+        let cache = "CMAKE_HOME_DIRECTORY:INTERNAL=/src\nCMAKE_BUILD_TYPE:STRING=Debug\n";
+        for dir in ["/a", "/b"] {
+            host.seed_file(&Path::new(dir).join("CMakeCache.txt"), cache.as_bytes())
+                .expect("seed");
+        }
+        let args = |only: &str| {
+            ["/a", "/b", "--only", only]
+                .into_iter()
+                .map(BString::from)
+                .collect::<Vec<_>>()
+        };
+        run(None, &args("cache"), host.clone());
+        assert!(host.stream_bytes(Stream::Stderr).is_empty());
+        run(None, &args("compile"), host.clone());
+        assert!(
+            host.stream_bytes(Stream::Stderr)
+                .contains_str("has no current File API reply")
+        );
     }
 
     #[test]

@@ -2,6 +2,56 @@
 
 We verified each decision below against the pinned CMake 4.5.1 oracle.
 
+## Contents
+
+- [ADR-001 Toolchain, workspace layout, strict lints, and dependency policy](#adr-001-toolchain-workspace-layout-strict-lints-and-dependency-policy)
+- [ADR-002 Byte-oriented value model, lists, truthiness, and versions](#adr-002-byte-oriented-value-model-lists-truthiness-and-versions)
+- [ADR-003 Diagnostics, policy registry CMP0000 to CMP0226, and SARIF 2.1.0](#adr-003-diagnostics-policy-registry-cmp0000-to-cmp0226-and-sarif-210)
+- [ADR-004 Deterministic Host abstraction with NativeHost and PureHost](#adr-004-deterministic-host-abstraction-with-nativehost-and-purehost)
+- [ADR-005 Lexer, parser, clean-room regex VM, evaluator, and oracle harness](#adr-005-lexer-parser-clean-room-regex-vm-evaluator-and-oracle-harness)
+- [ADR-006 Generator expression engine in rcmake-genex](#adr-006-generator-expression-engine-in-rcmake-genex)
+- [ADR-007 Arena-based ProjectModel, directory scopes, and transitive usage resolution](#adr-007-arena-based-projectmodel-directory-scopes-and-transitive-usage-resolution)
+- [ADR-008 Compiler bootstrap, vendored Modules, and in-process try_compile](#adr-008-compiler-bootstrap-vendored-modules-and-in-process-try_compile)
+- [ADR-009 Three-layer resolution IR, generators, File API v2.12, and minimal ctest](#adr-009-three-layer-resolution-ir-generators-file-api-v212-and-minimal-ctest)
+- [ADR-010 Native cpack engine and archive and macOS packaging in rcmake-cpack](#adr-010-native-cpack-engine-and-archive-and-macos-packaging-in-rcmake-cpack)
+- [ADR-011 Full rcmake-ctest, discover_tests, and cmake --workflow](#adr-011-full-rcmake-ctest-discover_tests-and-cmake---workflow)
+- [ADR-012 C++20 named modules and Ninja dyndep](#adr-012-c20-named-modules-and-ninja-dyndep)
+- [ADR-013 Common Package Specification, SPDX 3.0.1 SBOM, and Instrumentation API v1](#adr-013-common-package-specification-spdx-301-sbom-and-instrumentation-api-v1)
+- [ADR-014 Native Xcode generator in rcmake-gen-xcode](#adr-014-native-xcode-generator-in-rcmake-gen-xcode)
+- [ADR-015 Native Visual Studio generator in rcmake-gen-vs](#adr-015-native-visual-studio-generator-in-rcmake-gen-vs)
+- [ADR-016 Benchmarks, safe-Rust fuzzing, and release hardening](#adr-016-benchmarks-safe-rust-fuzzing-and-release-hardening)
+- [ADR-017 Windows host services and 7-Zip archives](#adr-017-windows-host-services-and-7-zip-archives)
+- [ADR-018 Native compiler probe cache](#adr-018-native-compiler-probe-cache)
+- [ADR-019 Verified probe lookahead](#adr-019-verified-probe-lookahead)
+- [ADR-020 Incremental configure replay in creation order](#adr-020-incremental-configure-replay-in-creation-order)
+- [ADR-021 FetchContent lockfiles and frozen reuse](#adr-021-fetchcontent-lockfiles-and-frozen-reuse)
+- [ADR-022 Native and compatibility command lines](#adr-022-native-and-compatibility-command-lines)
+- [ADR-023 In-process configure API and evaluated editor queries](#adr-023-in-process-configure-api-and-evaluated-editor-queries)
+- [ADR-024 WebAssembly configure engine](#adr-024-webassembly-configure-engine)
+- [ADR-025 CUDA, Fortran, and Qt AUTOGEN build rules](#adr-025-cuda-fortran-and-qt-autogen-build-rules)
+- [ADR-026 ELF runtime dependency scans and install runtime paths](#adr-026-elf-runtime-dependency-scans-and-install-runtime-paths)
+- [ADR-027 File API reply reuse by content hash](#adr-027-file-api-reply-reuse-by-content-hash)
+- [ADR-028 CMake runtime policy warning summaries](#adr-028-cmake-runtime-policy-warning-summaries)
+- [ADR-029 Stable legacy regex install order](#adr-029-stable-legacy-regex-install-order)
+- [ADR-030 Xcode per-language source flags](#adr-030-xcode-per-language-source-flags)
+- [ADR-031 Install strip guard for CMAKE_STRIP](#adr-031-install-strip-guard-for-cmake_strip)
+- [ADR-032 Probe compiler write scope](#adr-032-probe-compiler-write-scope)
+- [ADR-033 Direct dependencies without an earlier record](#adr-033-direct-dependencies-without-an-earlier-record)
+- [ADR-034 Release builds abort on panic](#adr-034-release-builds-abort-on-panic)
+- [ADR-035 Private local cache root](#adr-035-private-local-cache-root)
+- [ADR-036 Command argument caps and live variable budget](#adr-036-command-argument-caps-and-live-variable-budget)
+- [ADR-037 Native stack guard](#adr-037-native-stack-guard)
+- [ADR-038 GNU make jobserver access](#adr-038-gnu-make-jobserver-access)
+- [ADR-039 Sound incremental replay under toolchains, presets, preload scripts, and PreLoad.cmake](#adr-039-sound-incremental-replay-under-toolchains-presets-preload-scripts-and-preloadcmake)
+- [ADR-040 Clean-room Rust ccmake terminal interface](#adr-040-clean-room-rust-ccmake-terminal-interface)
+- [ADR-041 CMake 4.5.1 debugger DAP server](#adr-041-cmake-451-debugger-dap-server)
+- [ADR-042 CPack native installer generators and CUDA, HIP, and Swift lowering](#adr-042-cpack-native-installer-generators-and-cuda-hip-and-swift-lowering)
+- [ADR-043 Expanded explain queries and diff-config in rcmake-buildinfo](#adr-043-expanded-explain-queries-and-diff-config-in-rcmake-buildinfo)
+- [ADR-044 Lossless concrete syntax, language tools, and LSP integration](#adr-044-lossless-concrete-syntax-language-tools-and-lsp-integration)
+- [ADR-045 Isolated verify companion and native multi-configuration compile databases](#adr-045-isolated-verify-companion-and-native-multi-configuration-compile-databases)
+- [ADR-046 Stale CMakeCache.txt drift tracking and portable probe-cache exchange](#adr-046-stale-cmakecachetxt-drift-tracking-and-portable-probe-cache-exchange)
+- [ADR-047 Unified version banner and native build-time regeneration persona](#adr-047-unified-version-banner-and-native-build-time-regeneration-persona)
+
 ---
 
 ## ADR-001 Toolchain, workspace layout, strict lints, and dependency policy
@@ -103,7 +153,7 @@ Accepted on 2026-11-23.
    - Macros perform ordered textual substitution on non-bracket raw body arguments with `CMP0219` call-site backslash preservation, while functions bind `ARGC`, `ARGNC` (added in CMake 4.5), `ARGV0` through `ARGVN`, `ARGV`, and `ARGN`.
 4. **Staged on-disk `CMAKE_ROOT` and version banner.**
    - Keep CMake modules on disk in `share/cmake-4.5/Modules` and `share/cmake-4.5/Templates` beside `bin/rcmake`, `bin/cmake`, `bin/ctest`, and `bin/cpack`, staged by `scripts/stage.sh` into `target/stage/`.
-   - Print `cmake version 4.5.1\n\nRcmake native Rust drop-in replacement for CMake 4.5.1.\n` for `--version`. This matches the version line byte for byte without falsely claiming Kitware maintenance, and `rcmake-harness` normalizes the attribution line.
+   - Print `cmake version 4.5.1\n\nRcmake native Rust drop-in replacement for CMake 4.5.1.\n` for `--version` (later simplified by ADR-047 to print `rcmake <version>` on the second line). This matches the version line byte for byte without falsely claiming Kitware maintenance, and `rcmake-harness` normalizes the attribution line.
 5. **Black-box oracle harness (`rcmake-harness`).**
    - Link no core engine crates. Run staged `rcmake` and pinned `$RCMAKE_ORACLE_CMAKE` side by side in fresh `/tmp` sandboxes with a controlled environment, normalizing `<TMP>`, `<CMAKE_EXE>`, `<CMAKE_ROOT>`, and the version attribution line.
    - Store test suites in compact txtar-style `.case` files alongside recorded JSON baselines in `conformance/baselines/`.
@@ -689,3 +739,127 @@ Related source files are [stack guard](../crates/rcmake-eval/src/stack_guard.rs)
 Accepted.
 
 CTest reads GNU make tokens through `Host::open_jobserver`. Unix hosts open a FIFO or reopen inherited pipe descriptors using safe file APIs. One test uses the implicit token, and each additional test returns its pipe token upon completion. Hosts without a jobserver fall back to the local parallel limit.
+
+---
+
+## ADR-039 Sound incremental replay under toolchains, presets, preload scripts, and PreLoad.cmake
+
+Accepted on 2026-11-27.
+
+ADR-020 originally disabled configure replay whenever a build used a toolchain file, a configure preset, a `-C` initial cache script, or a `PreLoad.cmake` file. Many real projects, including every `vcpkg` build, use at least one of those inputs and therefore missed replay completely.
+
+Replace those broad disables with setup spans and setup checkpoints inside the replay manifest. Setup covers toolchain files, system and compiler determination modules, project include hooks, dependency providers, configure presets, `-C` scripts, and `PreLoad.cmake`. Setup always executes live on every configure. Replay never consumes a recorded listfile while a setup span is open, before the first outer `project()` call succeeds, or after any difference in setup inputs or setup checkpoints.
+
+Each time an outermost setup span closes, `rcmake` computes a setup checkpoint digest over the observable interpreter state, including effective cache entries, variables, environment reads, and scripted command overrides, and compares it against the checkpoint at the same position in the previous successful configure. A difference disables replay hits for the rest of the run while keeping earlier valid hits intact. Leaf replay also restores `record_source_order` deltas and invalidates recorded regions when `if(COMMAND ...)` observes a scripted wrapper such as a `vcpkg` toolchain override. Setting `RCMAKE_REPLAY_SETUP=0` restores the earlier setup gates as an explicit escape hatch.
+
+Related source files are [setup replay](../crates/rcmake-eval/src/journal/setup.rs), [setup inputs](../crates/rcmake-eval/src/journal/inputs.rs), [replay activation](../crates/rcmake-eval/src/journal/activate.rs), [speed settings](../crates/rcmake-cli/src/configure/speed.rs), and [preload execution](../crates/rcmake-cli/src/configure/preloads.rs).
+
+---
+
+## ADR-040 Clean-room Rust ccmake terminal interface
+
+Accepted on 2026-11-27.
+
+Add `crates/rcmake-ccmake` to provide an interactive terminal cache editor matching CMake 4.5.1 `ccmake` in pure safe Rust (`#![forbid(unsafe_code)]`) with no `ncurses` dependency. On macOS and Linux, the binary ships as a `ccmake` symlink to `rcmake` and as `rcmake ccmake`, which also populates `CMAKE_EDIT_COMMAND` and enables `edit_cache` build targets.
+
+The terminal crate isolates all OS terminal input and output behind a `Terminal` trait (`rustix::termios` raw mode with pre-armed restoration on exit or panic) and all CMake state behind a `CacheDriver` trait so the state machine, VT100 and xterm key decoder, and double-buffered cell renderer test deterministically without a live TTY.
+
+In `rcmake-cli`, `ccmake` splits configure and generate into two distinct phases using `configure::configure_only` and `RetainedConfigure::generate`. Pressing `c` saves queued edits to `CMakeCache.txt` and runs configure without writing build files, and pressing `g` generates from the retained configure session once no new cache entries remain. `CaptureHost` routes diagnostics and inherited child process streams into a bounded scrollback buffer (4 MiB and 16,384 lines) and binds inherited child standard input to the null device so child processes cannot corrupt the screen. Windows terminal support is deferred to a future ADR.
+
+Related source files are [ccmake library](../crates/rcmake-ccmake/src/lib.rs), [TUI state machine](../crates/rcmake-ccmake/src/app.rs), [native Unix terminal](../crates/rcmake-ccmake/src/terminal/native.rs), and [CLI ccmake driver](../crates/rcmake-cli/src/ccmake.rs).
+
+---
+
+## ADR-041 CMake 4.5.1 debugger DAP server
+
+Accepted on 2026-11-27.
+
+Add `crates/rcmake-dap` (`#![forbid(unsafe_code)]`) and `rcmake_eval::debug::DebugHook` to implement CMake 4.5.1 `--debugger`, `--debugger-pipe`, and `--debugger-dap-log` for configure and `-P` script runs.
+
+Each top-level invocation owns at most one `DebugServer` session started after `-C` and `PreLoad.cmake` finish in configure mode, or before script execution in `-P` mode. Every top-level interpreter attaches a hook from that session while nested `try_compile` interpreters stay unattached. The evaluator checks an inline optional hook so unattached runs incur negligible overhead, and incremental replay turns off whenever the debugger is active so breakpoints always hit live execution.
+
+Because the connected client is untrusted, `rcmake-dap` uses a dedicated nonblocking outbound writer thread, bounded wire frames (1 KiB header, 16 MiB body), compact-JSON response budgets (8 MiB), bounded breakpoints, and canonical source-key breakpoint calibration. On macOS and Linux, `UnixEndpoint` listens on a Unix domain socket and removes the socket path after accepting the client. Windows named-pipe transport requires a vetted safe wrapper and is deferred. Until then, Windows builds report `"debugger": false` in `-E capabilities` and reject `--debugger*` flags.
+
+Related source files are [DAP server](../crates/rcmake-dap/src/lib.rs), [DAP session](../crates/rcmake-dap/src/session.rs), [response budgets](../crates/rcmake-dap/src/budget.rs), [breakpoints](../crates/rcmake-dap/src/breakpoints.rs), [Unix socket transport](../crates/rcmake-dap/src/transport/unix.rs), and [CLI debugger lifecycle](../crates/rcmake-cli/src/debugger.rs).
+
+---
+
+## ADR-042 CPack native installer generators and CUDA, HIP, and Swift lowering
+
+Accepted on 2026-11-27.
+
+Extend `crates/rcmake-cpack` (updating ADR-010) with native installer generators for macOS `productbuild`, Windows `WIX` (supporting both WiX v3 `candle` with `light` and WiX v4 `wix build`), and cross-platform `NSIS`, `NSIS64`, and Qt Installer Framework (`IFW`). All five share `gen/installer.rs`, which validates component dependency graphs and group hierarchies iteratively (depth cap 256), parses XML under strict node, depth, and byte limits while forbidding DTDs and external entities, verifies post-hook staged payload containment against pre-hook canonical roots, redacts secrets before writing tool logs, and publishes final installers and checksums atomically under per-package locks with rollback on rename failure. External installer tools honor an optional `RCMAKE_CPACK_TOOL_TIMEOUT` override.
+
+Complete GPU and Apple language lowering in `crates/rcmake-resolve`. CUDA supports NVCC and Clang toolkits, architecture policy validation, separable compilation, and explicit device-link steps. HIP supports AMD ROCm `--offload-arch`, SPIR-V, and NVIDIA platform targeting alongside language runtime libraries. Swift implements `CMP0157` split compilation (`wholemodule`, `singlefile`, and `incremental`), `CMP0195`, `CMP0215`, `CMP0216`, output file maps, target-level module command flags, multi-edge Ninja lowering, and Xcode settings.
+
+Related source files are [CPack installer core](../crates/rcmake-cpack/src/gen/installer.rs), [productbuild](../crates/rcmake-cpack/src/gen/productbuild.rs), [NSIS](../crates/rcmake-cpack/src/gen/nsis.rs), [WiX](../crates/rcmake-cpack/src/gen/wix/mod.rs), [IFW](../crates/rcmake-cpack/src/gen/ifw.rs), [CUDA lowering](../crates/rcmake-resolve/src/lower/cuda.rs), [HIP lowering](../crates/rcmake-resolve/src/lower/hip.rs), and [Swift lowering](../crates/rcmake-resolve/src/lower/swift.rs).
+
+---
+
+## ADR-043 Expanded explain queries and diff-config in rcmake-buildinfo
+
+Accepted on 2026-11-27.
+
+Expand native `rcmake explain` with three additional diagnostic modes that evaluate the project in an in-memory overlay without spawning external processes or writing to the build directory.
+
+1. **Typed provenance filters.** `--flag`, `--define`, `--include`, and `--dep` isolate specific compile flags, preprocessor definitions, include directories, or link and order-only dependency paths (bounded at 16 paths, depth 32, and 20,000 edges) for a target and optional configuration.
+2. **Package search diagnosis.** `rcmake explain --find <pkg>` and `rcmake explain why-not <pkg>` report why `find_package()` succeeded or rejected candidates, reading `CMakeFiles/rcmake/find-trace.v1.json` saved by native configures when fresh or re-evaluating in memory otherwise, plus bounded near-miss directory probes.
+3. **Generator expression evaluation.** `rcmake explain --eval <expr>` and `rcmake explain <target> --eval-property <prop>` evaluate expressions across configurations with explicit language, link, directory, and cross-config context overrides and optional step traces.
+
+Add `crates/rcmake-buildinfo` (`#![forbid(unsafe_code)]`) to read File API replies, `CMakeCache.txt`, `compile_commands.json`, and saved native find traces through `Host` with strict byte, depth, and containment limits, never invoking `cmake`. `rcmake diff-config` uses `rcmake-buildinfo` to compare any two build trees created by `cmake` or `rcmake` across six sections (`targets`, `compile`, `link`, `toolchain`, `packages`, and `cache`). Each section tracks evidence completeness so missing File API data returns exit code 2 instead of claiming parity, and `rcmake diff-config --prepare` writes the four stateless File API query files into target build trees.
+
+Related source files are [buildinfo crate](../crates/rcmake-buildinfo/src/lib.rs), [diff engine](../crates/rcmake-buildinfo/src/diff.rs), [explain command](../crates/rcmake-cli/src/explain_cmd.rs), [explain find](../crates/rcmake-cli/src/explain_cmd/find.rs), [explain eval](../crates/rcmake-cli/src/explain_cmd/eval.rs), [diff-config command](../crates/rcmake-cli/src/diff_config_cmd.rs), and [saved find traces](../crates/rcmake-cli/src/configure/find_hints.rs).
+
+---
+
+## ADR-044 Lossless concrete syntax, language tools, and LSP integration
+
+Accepted on 2026-11-27.
+
+Add `rcmake_syntax::concrete` to produce a flat, contiguous byte-covering token stream (`0..src.len()`) paired with strict `ListFile` command associations. It preserves leading UTF-8 BOMs, horizontal space, physical newlines, and line or bracket comments while keeping the runtime evaluator parser unchanged.
+
+Add `crates/rcmake-language-tools` (`#![forbid(unsafe_code)]`) to own `.rcmake.toml` configuration (a bounded TOML subset covering `[fmt]`, `[lint]`, `[lint.severity]`, and `exclude` patterns), bounded file discovery, atomic checked writes that refuse in-place symbolic link overwrites, lossless formatting (`rcmake fmt`), and 8 static lint rules (`rcmake lint`). Every formatting edit modifies only whitespace and optional command identifier case and must pass independent pre-write verification of AST equivalence, protected token bytes, and comment attachment. `rcmake lint` supports `--sarif`, `--list-rules`, `--deny-warnings`, `.rcmake.toml` overrides, and `# rcmake-lint: disable=<rule>` one-command directives.
+
+Wire both the lossless formatter and static linter directly into `crates/rcmake-lsp` so editors and CLI tools produce identical formatting bytes and lint diagnostics. The language server resolves the nearest `.rcmake.toml` inside the workspace root, falls back to editor `tabSize` and `insertSpaces` only when `indent_width` is unset, watches `.rcmake.toml` and statically included project files, warns on malformed configuration, and accepts `-h`, `--help`, `-V`, `--version`, `--stdio`, and `--clientProcessId=<pid>`.
+
+Related source files are [concrete syntax](../crates/rcmake-syntax/src/concrete.rs), [config parser](../crates/rcmake-language-tools/src/config.rs), [formatter](../crates/rcmake-language-tools/src/fmt/mod.rs), [linter](../crates/rcmake-language-tools/src/lint/mod.rs), [fmt CLI](../crates/rcmake-cli/src/fmt_cmd.rs), [lint CLI](../crates/rcmake-cli/src/lint_cmd.rs), [LSP server](../crates/rcmake-lsp/src/server.rs), and [LSP CLI](../crates/rcmake-lsp/src/cli.rs).
+
+---
+
+## ADR-045 Isolated verify companion and native multi-configuration compile databases
+
+Accepted on 2026-11-27.
+
+Keep the clean-room runtime firewall intact by placing all upstream oracle execution for `rcmake verify` inside an isolated companion binary, `rcmake-verify`, built from `crates/rcmake-harness`. `rcmake verify` parses and validates configure-only arguments, resolves `--oracle` (falling back to `RCMAKE_ORACLE_CMAKE`), rewrites source-relative paths, rejects non-configure actions and external output redirects, and pipes a typed JSON request to the sibling `rcmake-verify` binary over standard input. `rcmake-cli` never discovers or executes upstream `cmake`.
+
+`rcmake-verify` rejects recursive `rcmake` oracles, requires CMake 4.5.1 for a parity verdict, stages pristine source copies (skipping VCS metadata and nested build trees) into a private scratch directory with isolated environments, runs both engines under a shared configurable deadline (`--timeout` or `RCMAKE_VERIFY_TIMEOUT`), and compares configure exit status, File API codemodel, `CMakeCache.txt`, `compile_commands.json`, and Ninja dry-run output.
+
+In native mode only, add multi-configuration `compile_commands.json` export (`--export-compile-commands` or `CMAKE_EXPORT_COMPILE_COMMANDS`) for `Ninja Multi-Config`, `Xcode`, and `Visual Studio`. `crates/rcmake-gen-common/src/compile_commands_native.rs` publishes per-configuration `compile_commands_<Config>.json` files alongside the default root `compile_commands.json` atomically under a lock and tracks owned file digests in `CMakeFiles/rcmake/compile-commands-v1.json` so externally modified files are never overwritten or retired. Compatibility mode remains untouched.
+
+Related source files are [verify launcher](../crates/rcmake-cli/src/verify_cmd.rs), [verify companion](../crates/rcmake-harness/src/verify/mod.rs), [native multi-config compile database](../crates/rcmake-gen-common/src/compile_commands_native.rs), and [generator dispatch](../crates/rcmake-cli/src/generate.rs).
+
+---
+
+## ADR-046 Stale CMakeCache.txt drift tracking and portable probe-cache exchange
+
+Accepted on 2026-11-27.
+
+Every native configure that completes generation publishes a drift receipt at `CMakeFiles/rcmake/toolchain-inputs-v1.json` recording `CMAKE_TOOLCHAIN_FILE` (path, resolved file, and SHA-256), cache and environment `CMAKE_PREFIX_PATH` lists, and each enabled language's compiler binary, SHA-256 digest, launcher, ID, and version. Subsequent native configures compare current inputs against the receipt and warn on changed fields. The baseline advances only on fresh configures or when `enable_language()` writes a fresh native identification record during that run, so stale compiler results stay visible until re-identified. `rcmake doctor -B <dir>` evaluates the receipt without running compilers or project code.
+
+Add `rcmake cache export <file>` and `rcmake cache import <file> [--sha256 <hex>]` for sharing compiler probe caches across machines and CI jobs. Both commands use a strict deterministic gzip tar profile (`manifest.json`, `entries/<hex>`, and `blobs/<hex>`) with pre-allocation archive, tar, member, decoded-entry, and blob budgets. Export validates the finished archive before atomically replacing the destination outside the cache root.
+
+Import separates trusted and untrusted archives by `--sha256`. A matching 64-hex-digit digest from a trusted producer publishes verified entries and blobs into the live probe cache without replacing valid local entries. Without `--sha256`, entries are staged outside the live cache as untrusted candidates that never cause cache hits and can only repair missing blobs of matching local entries.
+
+Related source files are [drift tracker](../crates/rcmake-cli/src/drift.rs), [cache and doctor CLI](../crates/rcmake-cli/src/probe_cache.rs), [portable archive format](../crates/rcmake-archive/src/portable.rs), [portable store exchange](../crates/rcmake-store/src/portable.rs), and [caching guide](CACHING.md).
+
+---
+
+## ADR-047 Unified version banner and native build-time regeneration persona
+
+Accepted on 2026-11-27.
+
+Supersede the second `--version` line recorded in ADR-005 so every CLI tool, test, and document agrees on one format. Each CMake-persona entry point (`cmake`, `ccmake`, `ctest`, `cpack`, and `rcmake`) prints `<tool> version 4.5.1\nrcmake <package-version>\n` derived from `rcmake_base::CMAKE_VERSION_STR` and `CARGO_PKG_VERSION` (`rcmake 0.2.0` for `v0.2.0`), while `--version=json-v1` conforms to CMake 4.5.1 schema 1.0. Companion entry points report `rcmake-lsp <package-version> (CMake 4.5.1 language)` and `rcmake-verify <package-version>`.
+
+Preserve the active persona during build-time regeneration (`--regenerate-during-build`). Previously, `new_interp_with_paths` always substituted a sibling `cmake` symlink into `CMAKE_COMMAND`, causing `ninja` or `make` to re-invoke a native `rcmake` build tree under the compatibility persona. That silently disabled incremental replay, native multi-configuration compile database updates, drift receipt advancement, and find trace updates. Keeping `CMAKE_COMMAND` on `rcmake` for `Persona::Native` while keeping compatibility mode and `RCMAKE_ORACLE_MODE=1` on `cmake` preserves native behavior across build-time regenerations without weakening the compatibility firewall.
+
+Related source files are [CLI driver](../crates/rcmake-cli/src/lib.rs), [persona resolution](../crates/rcmake-cli/src/persona.rs), [help and version output](../crates/rcmake-cli/src/help.rs), [LSP CLI](../crates/rcmake-lsp/src/cli.rs), and [verify companion](../crates/rcmake-harness/src/verify/mod.rs).

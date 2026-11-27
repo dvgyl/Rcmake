@@ -546,6 +546,46 @@ impl FromJson for JournalChecks {
 }
 
 impl JournalChecks {
+    /// Return one check of each variant, for the store schema parity test.
+    #[cfg(all(test, unix))]
+    pub(crate) fn every_variant() -> Self {
+        let path = || PathBuf::from("/work/input");
+        let digest = Digest::from_bytes([0x5a; 32]);
+        Self(
+            [
+                Check::Metadata(path(), true),
+                Check::Slice(
+                    path(),
+                    Slice {
+                        offset: 4,
+                        len: Some(8),
+                    },
+                ),
+                Check::Slice(
+                    path(),
+                    Slice {
+                        offset: 0,
+                        len: None,
+                    },
+                ),
+                Check::Chunks(path()),
+                Check::DirectoryOrder(path()),
+                Check::OrderedDirectoryMissing(path()),
+                Check::FollowMissing(path()),
+                Check::Link(path()),
+                Check::Canonical(path()),
+                Check::Environment,
+                Check::Executable,
+                Check::WorkingDirectory,
+                Check::System,
+                Check::Request(2),
+            ]
+            .into_iter()
+            .map(|check| (check, digest))
+            .collect(),
+        )
+    }
+
     /// Estimate the serialized byte count without allocating a frame.
     pub(crate) fn encoded_size_bound(&self) -> usize {
         self.0.iter().fold(16usize, |sum, (check, _)| {

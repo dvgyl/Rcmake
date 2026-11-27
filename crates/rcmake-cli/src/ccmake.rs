@@ -31,7 +31,9 @@ pub(crate) fn run(argv: &[BString], persona: Persona, host: Arc<dyn Host>) -> i3
 
     #[cfg(unix)]
     {
-        if !host.is_terminal(Stream::Stdout) {
+        use std::io::IsTerminal as _;
+
+        if !host.is_terminal(Stream::Stdout) || !std::io::stdin().is_terminal() {
             host.write_out(Stream::Stderr, ERR_INIT_FAILED.as_bytes());
             return 1;
         }
@@ -47,8 +49,14 @@ pub(crate) fn run(argv: &[BString], persona: Persona, host: Arc<dyn Host>) -> i3
 
     #[cfg(not(unix))]
     {
-        let _ = (persona,);
-        host.write_out(Stream::Stderr, ERR_INIT_FAILED.as_bytes());
+        if persona == Persona::Native {
+            host.write_out(
+                Stream::Stderr,
+                b"rcmake ccmake: the interactive cache editor TUI is only available on Unix platforms.\n",
+            );
+        } else {
+            host.write_out(Stream::Stderr, ERR_INIT_FAILED.as_bytes());
+        }
         1
     }
 }

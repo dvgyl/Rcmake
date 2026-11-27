@@ -1401,25 +1401,35 @@ fn compare_ninja_manifest(
 }
 
 fn normalize_dep_edges(
-    edges: &BTreeMap<BString, BTreeSet<BString>>,
+    edges: &super::collect::NinjaDepGraph,
     norm: &PathNormalizer,
-) -> BTreeMap<BString, BTreeSet<BString>> {
-    edges
+) -> super::collect::NinjaDepGraph {
+    let edge_inputs = edges
+        .edge_inputs
         .iter()
-        .map(|(k, deps)| {
-            (
-                norm.normalize(k),
-                deps.iter().map(|d| norm.normalize(d)).collect(),
-            )
+        .map(|inputs| {
+            let normalized: Vec<BString> = inputs.iter().map(|d| norm.normalize(d)).collect();
+            std::sync::Arc::from(normalized)
         })
-        .collect()
+        .collect();
+    let mut output_edges: BTreeMap<BString, Vec<usize>> = BTreeMap::new();
+    for (k, edge_ids) in &edges.output_edges {
+        output_edges
+            .entry(norm.normalize(k))
+            .or_default()
+            .extend(edge_ids.iter().copied());
+    }
+    super::collect::NinjaDepGraph {
+        edge_inputs,
+        output_edges,
+    }
 }
 
 fn find_dependency_order_inversions(
     o_cmds: &[BString],
     r_cmds: &[BString],
-    o_edges: &BTreeMap<BString, BTreeSet<BString>>,
-    r_edges: &BTreeMap<BString, BTreeSet<BString>>,
+    o_edges: &super::collect::NinjaDepGraph,
+    r_edges: &super::collect::NinjaDepGraph,
 ) -> Vec<(BString, BString)> {
     // Map each command occurrence to its index in r_cmds.
     let mut r_positions: BTreeMap<&BString, Vec<usize>> = BTreeMap::new();
@@ -1439,7 +1449,11 @@ fn find_dependency_order_inversions(
     }
 
     // Collect tokens mentioned in each command that match known graph outputs.
-    let known_outputs: BTreeSet<&BString> = o_edges.keys().chain(r_edges.keys()).collect();
+    let known_outputs: BTreeSet<&BString> = o_edges
+        .output_edges
+        .keys()
+        .chain(r_edges.output_edges.keys())
+        .collect();
     let cmd_outputs: Vec<Vec<&BString>> = o_cmds
         .iter()
         .map(|cmd| {
@@ -1484,7 +1498,7 @@ fn find_dependency_order_inversions(
 fn commands_dependent(
     producer_outs: &[&BString],
     consumer_outs: &[&BString],
-    edges: &BTreeMap<BString, BTreeSet<BString>>,
+    edges: &super::collect::NinjaDepGraph,
 ) -> bool {
     if producer_outs.is_empty() || consumer_outs.is_empty() {
         return false;
@@ -1493,21 +1507,30 @@ fn commands_dependent(
     // Bounded BFS from consumer_outs back through dependency inputs.
     let mut queue: Vec<&BString> = consumer_outs.to_vec();
     let mut seen: BTreeSet<&BString> = consumer_outs.iter().copied().collect();
+    let mut seen_edges: BTreeSet<usize> = BTreeSet::new();
     let mut steps = 0usize;
     while let Some(node) = queue.pop() {
         steps += 1;
         if steps > 512 {
             break;
         }
-        let Some(deps) = edges.get(node) else {
+        let Some(edge_ids) = edges.output_edges.get(node) else {
             continue;
         };
-        for dep in deps {
-            if prod_set.contains(dep) {
-                return true;
+        for &edge_id in edge_ids {
+            if !seen_edges.insert(edge_id) {
+                continue;
             }
-            if seen.insert(dep) {
-                queue.push(dep);
+            let Some(deps) = edges.edge_inputs.get(edge_id) else {
+                continue;
+            };
+            for dep in deps.iter() {
+                if prod_set.contains(dep) {
+                    return true;
+                }
+                if seen.insert(dep) {
+                    queue.push(dep);
+                }
             }
         }
     }

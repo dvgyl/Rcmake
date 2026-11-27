@@ -55,7 +55,7 @@ pub(crate) fn start_if_enabled(
         handshake_limit: None,
         exit_limit: None,
     };
-    match listen(pipe, &host) {
+    match listen(pipe, &host, opts.persona) {
         Ok(listener) => Ok(Some(Session {
             server: DebugServer::start(listener, config),
         })),
@@ -80,17 +80,32 @@ fn script_mode_failure(host: &dyn Host, opts: &Options) -> i32 {
 fn listen(
     pipe: &std::path::Path,
     host: &Arc<dyn Host>,
+    _persona: crate::persona::Persona,
 ) -> Result<Box<dyn rcmake_dap::transport::Listener>, String> {
     rcmake_dap::transport::unix::UnixEndpoint::bind(pipe, Arc::clone(host))
         .map(|endpoint| Box::new(endpoint) as Box<dyn rcmake_dap::transport::Listener>)
 }
 
+/// Report the missing Windows named-pipe transport. The compat persona keeps the
+/// exact CMake text.
 #[cfg(not(unix))]
 fn listen(
     _pipe: &std::path::Path,
     _host: &Arc<dyn Host>,
+    persona: crate::persona::Persona,
 ) -> Result<Box<dyn rcmake_dap::transport::Listener>, String> {
-    Err("CMake was not built with support for --debugger".into())
+    Err(unsupported_transport_reason(persona).into())
+}
+
+/// Reason text when the platform has no debugger pipe transport.
+#[cfg_attr(unix, allow(dead_code))]
+fn unsupported_transport_reason(persona: crate::persona::Persona) -> &'static str {
+    match persona {
+        crate::persona::Persona::Compat => "CMake was not built with support for --debugger",
+        crate::persona::Persona::Native => {
+            "Windows named-pipe debugger transport is not yet supported in rcmake"
+        }
+    }
 }
 
 fn stdout_sink(host: &Arc<dyn Host>) -> rcmake_dap::OutputSink {

@@ -547,7 +547,13 @@ impl MacroEnv {
     }
 
     fn expand(&self, raw: &str) -> String {
-        raw.replace("$(CONFIGURATION)", &self.config)
+        self.expand_with_inherited(raw, "")
+    }
+
+    fn expand_with_inherited(&self, raw: &str, inherited: &str) -> String {
+        raw.replace("$(inherited)", inherited)
+            .replace("${inherited}", inherited)
+            .replace("$(CONFIGURATION)", &self.config)
             .replace("$(EFFECTIVE_PLATFORM_NAME)", "")
             .replace("$(PROJECT_DIR)", &self.project_dir)
             .replace("$(SRCROOT)", &self.project_dir)
@@ -555,7 +561,6 @@ impl MacroEnv {
             .replace("$(TARGET_TEMP_DIR)", &self.target_temp_dir)
             .replace("$(CONFIGURATION_BUILD_DIR)", &self.config_build_dir)
             .replace("$(NATIVE_ARCH_ACTUAL)", &self.native_arch)
-            .replace("$(inherited)", "")
     }
 }
 
@@ -593,14 +598,26 @@ fn resolve_xcode_attr(
     project_attrs: &BTreeMap<BString, BString>,
     env: &MacroEnv,
 ) -> Result<Option<String>, BString> {
-    let raw = target_attrs
-        .get(name)
-        .cloned()
-        .or_else(|| project_attrs.get(name.as_bytes()).map(|v| text(v)));
-    let Some(raw) = raw else {
-        return Ok(None);
+    let expanded = match target_attrs.get(name) {
+        Some(target_raw) => {
+            let inherited =
+                if target_raw.contains("$(inherited)") || target_raw.contains("${inherited}") {
+                    project_attrs
+                        .get(name.as_bytes())
+                        .map(|v| env.expand(&text(v)))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+            env.expand_with_inherited(target_raw, &inherited)
+        }
+        None => {
+            let Some(project_raw) = project_attrs.get(name.as_bytes()) else {
+                return Ok(None);
+            };
+            env.expand(&text(project_raw))
+        }
     };
-    let expanded = env.expand(&raw);
     if contains_unresolved_ide_macro(expanded.as_bytes()) {
         return Err(format!("Unresolved Xcode macro in {name}: {expanded}").into());
     }
@@ -841,4 +858,99 @@ fn xcode_object_path(
         text(target_name)
     );
     absolute_path(build_root, rel.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_env() -> MacroEnv {
+        MacroEnv {
+            config: "Debug".to_owned(),
+            project_dir: "/work/src".to_owned(),
+            symroot: "/work/build".to_owned(),
+            target_temp_dir: "/work/build/build/app.build/Debug".to_owned(),
+            config_build_dir: "/work/build/Debug".to_owned(),
+            native_arch: "arm64".to_owned(),
+        }
+    }
+
+    #[test]
+    fn resolves_inherited_against_project_level_xcode_attributes() {
+        let env = test_env();
+        let mut project_attrs = BTreeMap::new();
+        project_attrs.insert(
+            BString::from("OTHER_CFLAGS"),
+            BString::from("$(inherited) -Wproj-c -DPROJ_CFG=$(CONFIGURATION)"),
+        );
+        project_attrs.insert(
+            BString::from("OTHER_CPLUSPLUSFLAGS"),
+            BString::from("-Wproj-cxx"),
+        );
+        project_attrs.insert(
+            BString::from("HEADER_SEARCH_PATHS"),
+            BString::from("$(PROJECT_DIR)/proj_inc"),
+        );
+        project_attrs.insert(
+            BString::from("GCC_PREPROCESSOR_DEFINITIONS"),
+            BString::from("PROJ_DEF=1"),
+        );
+
+        let mut target_attrs = BTreeMap::new();
+        target_attrs.insert(
+            "OTHER_CFLAGS".to_owned(),
+            "$(inherited) -Wtarget-c".to_owned(),
+        );
+        target_attrs.insert(
+            "OTHER_CPLUSPLUSFLAGS".to_owned(),
+            "-Wtarget-cxx ${inherited}".to_owned(),
+        );
+        target_attrs.insert(
+            "HEADER_SEARCH_PATHS".to_owned(),
+            "$(inherited) $(SRCROOT)/target_inc".to_owned(),
+        );
+        target_attrs.insert(
+            "GCC_PREPROCESSOR_DEFINITIONS".to_owned(),
+            "$(inherited) TARGET_DEF=2".to_owned(),
+        );
+
+        assert_eq!(
+            resolve_xcode_attr("OTHER_CFLAGS", &target_attrs, &project_attrs, &env)
+                .expect("OTHER_CFLAGS")
+                .as_deref(),
+            Some("-Wproj-c -DPROJ_CFG=Debug -Wtarget-c")
+        );
+        assert_eq!(
+            resolve_xcode_attr("OTHER_CPLUSPLUSFLAGS", &target_attrs, &project_attrs, &env)
+                .expect("OTHER_CPLUSPLUSFLAGS")
+                .as_deref(),
+            Some("-Wtarget-cxx -Wproj-cxx")
+        );
+        assert_eq!(
+            resolve_xcode_attr("HEADER_SEARCH_PATHS", &target_attrs, &project_attrs, &env)
+                .expect("HEADER_SEARCH_PATHS")
+                .as_deref(),
+            Some("/work/src/proj_inc /work/src/target_inc")
+        );
+        assert_eq!(
+            resolve_xcode_attr(
+                "GCC_PREPROCESSOR_DEFINITIONS",
+                &target_attrs,
+                &project_attrs,
+                &env
+            )
+            .expect("GCC_PREPROCESSOR_DEFINITIONS")
+            .as_deref(),
+            Some("PROJ_DEF=1 TARGET_DEF=2")
+        );
+
+        // Overriding without $(inherited) replaces the project value cleanly.
+        target_attrs.insert("OTHER_CFLAGS".to_owned(), "-O2".to_owned());
+        assert_eq!(
+            resolve_xcode_attr("OTHER_CFLAGS", &target_attrs, &project_attrs, &env)
+                .expect("override OTHER_CFLAGS")
+                .as_deref(),
+            Some("-O2")
+        );
+    }
 }

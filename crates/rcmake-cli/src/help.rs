@@ -391,7 +391,7 @@ mod tests {
     use rcmake_base::BString;
     use rcmake_host::{PureHost, Stream};
 
-    const VERSION: &str = "cmake version 4.5.1\nrcmake 0.1.0\n";
+    const VERSION: &str = "cmake version 4.5.1\nrcmake 0.2.0\n";
 
     /// A host with a small reference database in the default `CMAKE_ROOT`.
     fn host_with_reference(entries: &[(&str, &str)]) -> Arc<PureHost> {
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(
             stdout,
-            BString::from("ctest version 4.5.1\nrcmake 0.1.0\n\n\nset text\n")
+            BString::from("ctest version 4.5.1\nrcmake 0.2.0\n\n\nset text\n")
         );
     }
 
@@ -576,7 +576,7 @@ mod tests {
         assert!(stderr.is_empty());
         assert_eq!(
             stdout,
-            BString::from("ccmake version 4.5.1\nrcmake 0.1.0\n")
+            BString::from("ccmake version 4.5.1\nrcmake 0.2.0\n")
         );
 
         let host = host_with_reference(&entries);

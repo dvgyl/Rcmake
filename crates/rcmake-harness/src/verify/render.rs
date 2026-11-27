@@ -24,7 +24,7 @@ pub(crate) fn render_json(report: &VerifyReport) -> String {
             "oracle": {
                 "executable": report.oracle_exe,
                 "version": report.oracle_version,
-                "expected_version": "4.5.1"
+                "expected_version": rcmake_base::CMAKE_VERSION_STR
             },
             "rcmake": {
                 "executable": report.rcmake_exe,

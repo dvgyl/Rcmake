@@ -378,8 +378,8 @@ set(CPACK_PACKAGE_CHECKSUM "MD5;SHA256")
             recorded[0].program
         );
         assert_eq!(
-            recorded[0].cwd,
-            Path::new("/work/_CPack_Packages/productbuild")
+            from_native_cmake(&recorded[0].cwd),
+            BString::from("/work/_CPack_Packages/productbuild")
         );
         assert_eq!(
             find_arg_after(&recorded[0].args, b"--identifier"),
@@ -391,10 +391,7 @@ set(CPACK_PACKAGE_CHECKSUM "MD5;SHA256")
         );
         // Monolithic leaf package name matches CMake 4.5.1 (CPACK_PACKAGE_NAME, no .pkg).
         assert!(
-            recorded[0]
-                .args
-                .last()
-                .unwrap()
+            rcmake_base::path_lex::cmake_style(recorded[0].args.last().unwrap())
                 .ends_with(b"/Contents/Packages/MyApp")
         );
 
@@ -532,8 +529,9 @@ set(CPACK_PRODUCTBUILD_KEYCHAIN_PATH "/work/prod.keychain")
                 assert_eq!(pre.mode & 0o777, 0o755);
                 assert_eq!(post.mode & 0o777, 0o755);
                 assert_eq!(
-                    find_arg_after(&spec.args, b"--component-plist"),
-                    Some(b"/work/core.plist".as_slice())
+                    find_arg_after(&spec.args, b"--component-plist")
+                        .map(rcmake_base::path_lex::cmake_style),
+                    Some(BString::from("/work/core.plist"))
                 );
             } else {
                 // Component scripts must NOT leak into other components.
@@ -573,8 +571,8 @@ set(CPACK_PRODUCTBUILD_KEYCHAIN_PATH "/work/prod.keychain")
         Some(b"Dev ID Installer".as_slice())
     );
     assert_eq!(
-        find_arg_after(&recorded[0].args, b"--keychain"),
-        Some(b"/work/keys.keychain".as_slice())
+        find_arg_after(&recorded[0].args, b"--keychain").map(rcmake_base::path_lex::cmake_style),
+        Some(BString::from("/work/keys.keychain"))
     );
     assert_eq!(
         find_arg_after(&recorded[3].args, b"--identifier"),
@@ -585,8 +583,8 @@ set(CPACK_PRODUCTBUILD_KEYCHAIN_PATH "/work/prod.keychain")
         Some(b"Prod ID Installer".as_slice())
     );
     assert_eq!(
-        find_arg_after(&recorded[3].args, b"--keychain"),
-        Some(b"/work/prod.keychain".as_slice())
+        find_arg_after(&recorded[3].args, b"--keychain").map(rcmake_base::path_lex::cmake_style),
+        Some(BString::from("/work/prod.keychain"))
     );
 
     let dist_path =
@@ -2681,7 +2679,9 @@ set(CPACK_PACKAGE_CHECKSUM "SHA256")
         .and_then(|rest| rest.split(')').next())
         .unwrap_or_else(|| panic!("no kept backup path in: {stderr}"));
     assert!(
-        stderr.contains("rollback failed for: /work/App-1.0.run: "),
+        stderr
+            .replace('\\', "/")
+            .contains("rollback failed for: /work/App-1.0.run: "),
         "{stderr}"
     );
     assert_eq!(read_bytes(inner.as_ref(), Path::new(kept)), prev_installer);
@@ -3183,7 +3183,7 @@ set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
     );
     let recorded = calls.lock().unwrap();
     assert_eq!(
-        recorded[0].program,
+        rcmake_base::path_lex::cmake_style(&recorded[0].program),
         BString::from("/nsis-native-uni/makensis.exe")
     );
 
@@ -3248,7 +3248,7 @@ set(CPACK_INSTALLED_DIRECTORIES "/work/src;/")
         .unwrap();
     assert_eq!(run_unrestricted(host64.clone(), &[]), 0);
     assert_eq!(
-        calls64.lock().unwrap()[0].program,
+        rcmake_base::path_lex::cmake_style(&calls64.lock().unwrap()[0].program),
         BString::from("/nsis64-std/makensis.exe")
     );
 }
@@ -3390,9 +3390,10 @@ set(CPACK_IFW_REPOSITORY_RADD_URL "https://repo.example.test/extra")
             String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr))
         );
         let stderr = String::from_utf8_lossy(&host.stream_bytes(Stream::Stderr)).into_owned();
-        assert!(stderr.contains("Problem patch IFW \"Updates\" file"));
-        assert!(stderr.contains("/work/missing.qrc"));
-        assert!(stderr.contains("/work/empty.qrc"));
+        let norm_stderr = stderr.replace('\\', "/");
+        assert!(norm_stderr.contains("Problem patch IFW \"Updates\" file"));
+        assert!(norm_stderr.contains("/work/missing.qrc"), "{stderr}");
+        assert!(norm_stderr.contains("/work/empty.qrc"), "{stderr}");
 
         let qrc_list: Vec<String> = qrc_arg
             .lock()
@@ -3723,7 +3724,7 @@ set(CPACK_IFW_PACKAGE_RESOURCES "/work/res/app.qrc")
         if succeeds {
             assert_eq!(code, 0, "{stderr}");
             assert!(
-                stderr.contains(
+                stderr.replace('\\', "/").contains(
                     "Can't copy resources from \"/work/res/app.qrc\". Resource will be skipped."
                 ),
                 "{stderr}"
@@ -3733,4 +3734,199 @@ set(CPACK_IFW_PACKAGE_RESOURCES "/work/res/app.qrc")
             assert!(stderr.contains("escapes"), "{stderr}");
         }
     }
+}
+
+#[test]
+fn installer_tool_defaults_to_no_timeout_honors_env_override_and_truncates_over_16mib() {
+    use std::time::Duration;
+
+    use super::{MAX_TOOL_OUTPUT_BYTES, TOOL_TIMEOUT_ENV, build_tool_timeout, run_installer_tool};
+
+    let host = make_profile_host(OsProfile::Linux);
+    assert_eq!(build_tool_timeout(host.as_ref()), None);
+    host.env_set(TOOL_TIMEOUT_ENV, Some(b"0"));
+    assert_eq!(build_tool_timeout(host.as_ref()), None);
+    host.env_set(TOOL_TIMEOUT_ENV, Some(b"45"));
+    assert_eq!(
+        build_tool_timeout(host.as_ref()),
+        Some(Duration::from_secs(45))
+    );
+    host.env_set(TOOL_TIMEOUT_ENV, None);
+
+    let seen_timeout = Arc::new(Mutex::new(Some(Duration::from_secs(999))));
+    let seen_ref = Arc::clone(&seen_timeout);
+    host.set_command_handler(move |_, req, on_output| {
+        *seen_ref.lock().unwrap() = req.timeout;
+        let chunk = vec![b'A'; 1024 * 1024];
+        for _ in 0..17 {
+            on_output(Stream::Stdout, &chunk);
+        }
+        Ok(ok_output(b""))
+    })
+    .unwrap();
+
+    let outcome = run_installer_tool(
+        host.as_ref(),
+        Path::new("/work"),
+        b"/usr/bin/tool",
+        &[],
+        build_tool_timeout(host.as_ref()),
+    )
+    .expect("oversized tool output must truncate cleanly instead of failing");
+    assert_eq!(*seen_timeout.lock().unwrap(), None);
+    assert!(matches!(outcome.status, ProcessResult::Exited(0)));
+    assert!(outcome.output.len() > MAX_TOOL_OUTPUT_BYTES);
+    assert!(
+        outcome
+            .output
+            .ends_with(b"\n... [output truncated at 16 MiB]\n")
+    );
+}
+
+#[test]
+fn nsis_propagates_non_notfound_component_dir_io_errors() {
+    use std::io::ErrorKind;
+
+    struct DenyComponentStat {
+        inner: Arc<PureHost>,
+        denied_suffix: String,
+    }
+
+    impl Host for DenyComponentStat {
+        rcmake_host::forward_host!(inner, env, process);
+        rcmake_host::forward_host!(@method inner, metadata(p: &Path, follow: Follow) -> HostResult<rcmake_host::Metadata>);
+        fn metadata_fresh(&self, p: &Path, follow: Follow) -> HostResult<rcmake_host::Metadata> {
+            if rcmake_host::path::from_native_cmake(p)
+                .to_string()
+                .ends_with(&self.denied_suffix)
+            {
+                return Err(HostError::from_io(
+                    std::io::Error::new(ErrorKind::PermissionDenied, "denied"),
+                    Some(p.to_path_buf()),
+                ));
+            }
+            self.inner.metadata_fresh(p, follow)
+        }
+        rcmake_host::forward_host!(@ inner, read);
+        rcmake_host::forward_host!(@ inner, read_with_origin);
+        rcmake_host::forward_host!(@ inner, read_chunks);
+        rcmake_host::forward_host!(@method inner, write(p: &Path, data: &[u8], mode: WriteMode) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, read_dir(p: &Path) -> HostResult<Vec<rcmake_host::DirEntry>>);
+        rcmake_host::forward_host!(@method inner, create_dir_all(p: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, create_private_dir(p: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, remove_file(p: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, remove_dir(p: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, remove_dir_all(p: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, rename(from: &Path, to: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, rename_noreplace(from: &Path, to: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, lock_file(path: &Path, timeout: Option<core::time::Duration>) -> HostResult<Box<dyn rcmake_host::FileLockGuard>>);
+        rcmake_host::forward_host!(@method inner, copy_file(from: &Path, to: &Path, opts: rcmake_host::CopyOptions) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, symlink(target: &Path, link: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, hard_link(src: &Path, dst: &Path) -> HostResult<()>);
+        rcmake_host::forward_host!(@ inner, read_link);
+        rcmake_host::forward_host!(@method inner, canonicalize(p: &Path) -> HostResult<PathBuf>);
+        rcmake_host::forward_host!(@method inner, canonicalize_fresh(p: &Path) -> HostResult<PathBuf>);
+        rcmake_host::forward_host!(@method inner, set_permissions(p: &Path, mode: u32) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, set_times(p: &Path, atime: Option<rcmake_host::FileTime>, mtime: Option<rcmake_host::FileTime>) -> HostResult<()>);
+        rcmake_host::forward_host!(@method inner, set_symlink_times(path: &Path, atime: Option<rcmake_host::FileTime>, mtime: Option<rcmake_host::FileTime>) -> HostResult<()>);
+        rcmake_host::forward_host!(@ inner, open_read);
+        rcmake_host::forward_host!(@ inner, scratch_file);
+        rcmake_host::forward_host!(@ inner, scratch_file_in);
+
+        fn registry_host_view(&self) -> Option<RegistryView> {
+            self.inner.registry_host_view()
+        }
+        fn registry_value(
+            &self,
+            root: RegistryRoot,
+            subkey: &[u8],
+            name: Option<&[u8]>,
+            view: RegistryView,
+        ) -> HostResult<Option<BString>> {
+            self.inner.registry_value(root, subkey, name, view)
+        }
+        fn write_out(&self, stream: Stream, bytes: &[u8]) {
+            self.inner.write_out(stream, bytes);
+        }
+        fn read_stdin(&self, limit: u64) -> HostResult<Vec<u8>> {
+            self.inner.read_stdin(limit)
+        }
+        fn is_terminal(&self, stream: Stream) -> bool {
+            self.inner.is_terminal(stream)
+        }
+        fn terminal_width(&self, stream: Stream) -> Option<usize> {
+            self.inner.terminal_width(stream)
+        }
+        fn now(&self) -> rcmake_host::FileTime {
+            self.inner.now()
+        }
+        fn monotonic(&self) -> std::time::Duration {
+            self.inner.monotonic()
+        }
+        fn sleep(&self, duration: std::time::Duration) {
+            self.inner.sleep(duration);
+        }
+        fn time_zone(&self) -> rcmake_host::TimeZone {
+            self.inner.time_zone()
+        }
+        fn current_exe(&self) -> HostResult<PathBuf> {
+            self.inner.current_exe()
+        }
+        fn initial_cwd(&self) -> PathBuf {
+            self.inner.initial_cwd()
+        }
+        fn system(&self) -> SystemInfo {
+            self.inner.system()
+        }
+    }
+
+    let inner = make_profile_host(OsProfile::Windows);
+    seed_tool(&inner, OsProfile::Windows, "makensis");
+    seed_component_project(
+        &inner,
+        r#"
+if(CMAKE_INSTALL_COMPONENT STREQUAL "Runtime")
+  file(WRITE "${CMAKE_INSTALL_PREFIX}/bin.txt" "ok")
+endif()
+"#,
+    );
+    inner
+        .seed_file(
+            Path::new("/work/CPackConfig.cmake"),
+            br#"
+set(CMAKE_ROOT "/cmake")
+set(CPACK_GENERATOR "NSIS")
+set(CPACK_CMAKE_GENERATOR "Ninja")
+set(CPACK_PACKAGE_NAME "NsisErr")
+set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_FILE_NAME "NsisErr-1.0.0")
+set(CPACK_INSTALL_CMAKE_PROJECTS "/work/build;NsisErr;ALL;/")
+set(CPACK_COMPONENTS_ALL "Runtime;Devel")
+"#,
+        )
+        .unwrap();
+    inner
+        .set_command_handler(|_, req, _| {
+            if req
+                .pipeline
+                .first()
+                .is_some_and(|cmd| cmd.args == [BString::from("/VERSION")])
+            {
+                return Ok(ok_output(b"v3.08\n"));
+            }
+            Ok(ok_output(b"ok"))
+        })
+        .unwrap();
+
+    let wrapper = Arc::new(DenyComponentStat {
+        inner: Arc::clone(&inner),
+        denied_suffix: "/NsisErr-1.0.0/Devel".to_owned(),
+    });
+    assert_eq!(run_unrestricted(wrapper, &[]), 1);
+    let stderr = String::from_utf8_lossy(&inner.stream_bytes(Stream::Stderr)).into_owned();
+    assert!(
+        stderr.to_ascii_lowercase().contains("denied")
+            || stderr.to_ascii_lowercase().contains("permission"),
+        "expected permission error to propagate instead of skipping: {stderr}"
+    );
 }

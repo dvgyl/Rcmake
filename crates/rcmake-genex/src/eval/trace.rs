@@ -21,6 +21,10 @@ pub struct GenexTrace {
     pub skipped: Vec<SkippedOperand>,
     /// Number of steps and skipped operands that the limit kept out of the record.
     pub omitted: u32,
+    /// The evaluation reached `$<COMMAND_CONFIG:...>`. The step limit does not apply.
+    pub command_config_used: bool,
+    /// The evaluation reached `$<OUTPUT_CONFIG:...>`. The step limit does not apply.
+    pub output_config_used: bool,
     limit: usize,
 }
 
@@ -32,12 +36,17 @@ impl Default for GenexTrace {
 
 impl GenexTrace {
     /// Create a trace that keeps at most `limit` steps and `limit` skipped operands.
+    ///
+    /// A limit of 0 records no steps. The operator flags, such as
+    /// [`Self::command_config_used`], are recorded for every limit.
     #[must_use]
     pub const fn with_limit(limit: usize) -> Self {
         Self {
             steps: Vec::new(),
             skipped: Vec::new(),
             omitted: 0,
+            command_config_used: false,
+            output_config_used: false,
             limit,
         }
     }
@@ -70,6 +79,14 @@ impl GenexTrace {
             host: false,
         });
         Some(id)
+    }
+
+    pub(super) fn cross_config(&mut self, name: &[u8]) {
+        match name {
+            b"COMMAND_CONFIG" => self.command_config_used = true,
+            b"OUTPUT_CONFIG" => self.output_config_used = true,
+            _ => {}
+        }
     }
 
     pub(super) fn operator(&mut self, id: u32, name: &[u8]) {

@@ -492,41 +492,57 @@ pub(crate) fn lower_target(
     }
     let required_standard =
         inputs.and_then(|i| i.standard_requirements.get(b"Swift".as_slice()).copied());
-    let mut base_compile_flags = swift_compile_flags(
+    // Swift module compilation uses target-level flags, defines, and includes
+    // (`cmNinjaTargetGenerator.cxx:2226`) so per-source `COMPILE_OPTIONS`,
+    // `COMPILE_DEFINITIONS`, or `INCLUDE_DIRECTORIES` on one Swift file never leak
+    // into sibling Swift files in the same module invocation.
+    let target_flag_end = primary_group
+        .source_flag_start
+        .unwrap_or(primary_group.flags.len())
+        .min(primary_group.flags.len());
+    let target_define_end = primary_group
+        .source_define_start
+        .unwrap_or(primary_group.defines.len())
+        .min(primary_group.defines.len());
+    let target_include_start = primary_group
+        .source_include_count
+        .min(primary_group.includes.len());
+    let target_group = crate::CompileGroup {
+        language: primary_group.language.clone(),
+        flags: primary_group
+            .flags
+            .get(..target_flag_end)
+            .unwrap_or_default()
+            .to_vec(),
+        source_flag_start: None,
+        source_option_groups: Vec::new(),
+        defines: primary_group
+            .defines
+            .get(..target_define_end)
+            .unwrap_or_default()
+            .to_vec(),
+        source_define_start: None,
+        includes: primary_group
+            .includes
+            .get(target_include_start..)
+            .unwrap_or_default()
+            .to_vec(),
+        source_include_count: 0,
+        units: primary_group.units.clone(),
+    };
+    let base_compile_flags = swift_compile_flags(
         model,
         target,
         config,
-        primary_group,
+        &target_group,
         required_standard,
         position_independent,
         usage,
     )?;
-    // Preserve any source-level compile options from additional Swift groups.
-    let mut seen_groups: IndexSet<usize> = swift_units
-        .first()
-        .map(|unit| unit.group)
-        .into_iter()
-        .collect();
-    for unit in swift_units.iter().skip(1) {
-        if seen_groups.insert(unit.group)
-            && let Some(group) = resolved.compile_groups.get(unit.group)
-            && let Some(start) = group.source_flag_start
-        {
-            for flag in group.flags.get(start..).into_iter().flatten() {
-                if !flag.value.is_empty() {
-                    base_compile_flags.push(
-                        flag.value
-                            .strip_prefix(b"SHELL:")
-                            .map_or_else(|| quote(&flag.value), BString::from),
-                    );
-                }
-            }
-        }
-    }
     common_flags.extend(base_compile_flags);
 
-    let defines = formatted_defines(model, target, config, primary_group);
-    let includes = formatted_includes(model, target, primary_group, framework_dirs);
+    let defines = formatted_defines(model, target, config, &target_group);
+    let includes = formatted_includes(model, target, &target_group, framework_dirs);
 
     let source_dir = &model.dir(target.dir).source_dir;
     let dir_props = &model.dir(target.dir).source_props;
@@ -1351,6 +1367,110 @@ mod tests {
             app_shell.contains("-I/work/build/custom_mods"),
             "app missing custom module search path -I: {app_shell}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn split_swift_module_command_uses_target_flags_without_leaking_source_options()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = PureHost::default();
+        host.create_dir_all(std::path::Path::new("/work/src"))?;
+        host.write(
+            std::path::Path::new("/work/src/first.swift"),
+            b"",
+            WriteMode::Truncate,
+        )?;
+        host.write(
+            std::path::Path::new("/work/src/second.swift"),
+            b"",
+            WriteMode::Truncate,
+        )?;
+
+        let mut model = swift_model(PolicyStatus::New);
+        let policies = swift_policies(PolicyStatus::New, PolicyStatus::New, PolicyStatus::New);
+        let lib = add_swift_target(
+            &mut model,
+            "mylib",
+            TargetKind::StaticLibrary,
+            &["first.swift", "second.swift"],
+            policies,
+        )?;
+        {
+            let raw = model.target_mut(lib).ok_or("missing lib")?;
+            raw.usage.push(
+                UsageField::CompileOptions,
+                BT::new("-DTARGET_ONLY".into(), Default::default()),
+            );
+            raw.usage.push(
+                UsageField::CompileDefinitions,
+                BT::new("TARGET_DEF=1".into(), Default::default()),
+            );
+            raw.usage.push(
+                UsageField::IncludeDirectories,
+                BT::new("/work/src/target_inc".into(), Default::default()),
+            );
+        }
+        {
+            let root = model.dir_mut(DirId::ROOT);
+            root.source_props
+                .entry("/work/src/first.swift".into())
+                .or_default()
+                .set("COMPILE_OPTIONS".into(), "-D;FIRST_ONLY".into());
+            let second_props = root
+                .source_props
+                .entry("/work/src/second.swift".into())
+                .or_default();
+            second_props.set("COMPILE_OPTIONS".into(), "-D;SECOND_ONLY".into());
+            second_props.set("COMPILE_DEFINITIONS".into(), "SECOND_DEF=1".into());
+            second_props.set("INCLUDE_DIRECTORIES".into(), "/work/src/second_inc".into());
+        }
+
+        let result = resolve(&model, &host, &[ConfigId::default()])?;
+        let graph = result.graphs.first().ok_or("missing graph")?;
+        assert_eq!(graph.swift_actions.len(), 2);
+
+        for (&idx, action) in &graph.swift_actions {
+            let shell = match &graph.steps[idx] {
+                BuildStep::Custom(step) => step.invocations[0].shell.to_string(),
+                BuildStep::Compile { invocation, .. } => invocation.shell.to_string(),
+                _ => return Err("unexpected step kind for swift action".into()),
+            };
+            assert!(
+                shell.contains("-DTARGET_ONLY"),
+                "{:?} missing target flag: {shell}",
+                action.kind
+            );
+            assert!(
+                shell.contains("-DTARGET_DEF=1"),
+                "{:?} missing target define: {shell}",
+                action.kind
+            );
+            assert!(
+                shell.contains("-I/work/src/target_inc"),
+                "{:?} missing target include: {shell}",
+                action.kind
+            );
+            assert!(
+                !shell.contains("FIRST_ONLY"),
+                "{:?} leaked first.swift COMPILE_OPTIONS: {shell}",
+                action.kind
+            );
+            assert!(
+                !shell.contains("SECOND_ONLY"),
+                "{:?} leaked second.swift COMPILE_OPTIONS: {shell}",
+                action.kind
+            );
+            assert!(
+                !shell.contains("SECOND_DEF"),
+                "{:?} leaked second.swift COMPILE_DEFINITIONS: {shell}",
+                action.kind
+            );
+            assert!(
+                !shell.contains("second_inc"),
+                "{:?} leaked second.swift INCLUDE_DIRECTORIES: {shell}",
+                action.kind
+            );
+        }
         Ok(())
     }
 }

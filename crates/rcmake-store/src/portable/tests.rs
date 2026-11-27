@@ -40,7 +40,7 @@ fn payload(name: &str, artifact: Option<Digest>) -> Value {
                 ("diagnostics", Value::Array(Vec::new())),
             ]),
         ),
-        ("checks", Value::object()),
+        ("checks", Value::Array(Vec::new())),
     ])
 }
 
@@ -701,6 +701,10 @@ fn export_stays_inside_the_import_limits() -> TestResult {
             ..LIMITS
         },
         ArchiveLimits {
+            entry_decoded_bytes: 1,
+            ..LIMITS
+        },
+        ArchiveLimits {
             manifest_bytes: one.manifest.len() as u64 / 2,
             ..LIMITS
         },
@@ -716,7 +720,84 @@ fn export_stays_inside_the_import_limits() -> TestResult {
         bundle(&export)?.check(&limits)?;
     }
     assert!(one.check(&tight[0]).is_err());
+    match one.check(&ArchiveLimits {
+        entry_decoded_bytes: 1,
+        ..LIMITS
+    }) {
+        Err(ImportError::Invalid(reason)) => {
+            assert!(reason.contains("decoded size limit"), "{reason}");
+        }
+        other => panic!("expected an entry budget rejection, got {other:?}"),
+    }
     Ok(())
+}
+
+#[test]
+fn probe_payload_check_types_each_journal_check() {
+    let with_checks = |checks: Value| {
+        let mut payload = payload("probe", None);
+        if let Value::Object(fields) = &mut payload {
+            fields.insert("checks".into(), checks);
+        }
+        probe_payload_valid(&Entry {
+            trace: Vec::new(),
+            blobs: Vec::new(),
+            payload,
+        })
+    };
+    let digest = Digest::from_bytes([7; 32]).to_json();
+    let pair = |check: Value| Value::array_from([check, digest.clone()]);
+    let valid = [
+        Value::string("Environment"),
+        Value::object_from([(
+            "Metadata",
+            Value::array_from([Value::string("/a"), Value::Bool(true)]),
+        )]),
+        Value::object_from([(
+            "Slice",
+            Value::array_from([
+                Value::string("/a"),
+                Value::object_from([("offset", 0u64.to_json()), ("len", Value::Null)]),
+            ]),
+        )]),
+        Value::object_from([("Canonical", Value::string("/a"))]),
+        Value::object_from([("Request", 3u32.to_json())]),
+    ];
+    assert!(with_checks(Value::array_from(valid.into_iter().map(pair))));
+    let invalid = [
+        Value::string("Unknown"),
+        Value::object_from([("Link", 1u32.to_json())]),
+        Value::object_from([("Request", Value::string("x"))]),
+        Value::object_from([(
+            "Slice",
+            Value::array_from([
+                Value::string("/a"),
+                Value::object_from([("offset", 0u64.to_json()), ("extra", Value::Null)]),
+            ]),
+        )]),
+        Value::object_from([
+            ("Chunks", Value::string("/a")),
+            ("Link", Value::string("/b")),
+        ]),
+    ];
+    for check in invalid {
+        assert!(
+            !with_checks(Value::array_from([pair(check.clone())])),
+            "{check:?}"
+        );
+    }
+    assert!(!with_checks(Value::array_from([Value::array_from([
+        Value::string("System")
+    ])])));
+    assert!(!with_checks(Value::array_from([Value::array_from([
+        Value::string("System"),
+        Value::string("not a digest"),
+    ])])));
+    assert!(!with_checks(Value::object()));
+    let too_many = Value::array_from(
+        std::iter::repeat_with(|| pair(Value::string("System"))).take(MAX_PROBE_CHECKS + 1),
+    );
+    assert!(!with_checks(too_many));
 }
 
 #[test]

@@ -67,8 +67,8 @@ pub use find_explain::{
     render_find_json, render_find_terminal, suggest,
 };
 pub use find_trace_json::{
-    FIND_TRACE_MAX_BYTES, FIND_TRACE_PATH, FIND_TRACE_SCHEMA, FileStamp, FindTraceDocument,
-    Freshness,
+    EnvStamp, FIND_SEARCH_ENV, FIND_TRACE_MAX_BYTES, FIND_TRACE_PATH, FIND_TRACE_SCHEMA, FileStamp,
+    FindTraceDocument, Freshness, find_search_env_names,
 };
 pub use index::{
     CallableDefinition, Completion, CompletionKind, ExecutedSite, ExecutedSites, ExecutedSymbol,

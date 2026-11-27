@@ -172,17 +172,22 @@ fn flag_name(raw: &[u8]) -> (&[u8], Option<&[u8]>) {
 
 fn scan(args: &[BString]) -> Scan {
     let mut scan = Scan::default();
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        let (flag, attached) = flag_name(arg);
-        match flag {
-            b"--" => break,
+    let options = args.iter().take_while(|arg| arg.as_slice() != b"--");
+    // A value never starts with `--` and is never `-h`, so the mode flags are known
+    // before the values are skipped.
+    for arg in options.clone() {
+        match flag_name(arg).0 {
             b"--help" | b"-h" => scan.help = true,
             b"--eval" | b"--eval-property" => scan.eval = true,
             b"--find" => scan.find = true,
             _ => {}
         }
-        if attached.is_none() && VALUED.contains(&flag) {
+    }
+    let mut iter = options.peekable();
+    while let Some(arg) = iter.next() {
+        let (flag, attached) = flag_name(arg);
+        let valued = VALUED.contains(&flag) || (scan.eval && flag == b"--target");
+        if attached.is_none() && valued {
             iter.next_if(|next| !matches!(next.as_slice(), b"--help" | b"-h"));
         } else if !flag.starts_with(b"-") && scan.first_positional.is_none() {
             scan.first_positional = Some(arg.clone());
@@ -196,19 +201,29 @@ fn value<'a>(
     attached: Option<&[u8]>,
     flag: &str,
 ) -> Result<BString, String> {
-    let value = attached.or_else(|| {
-        args.next()
-            .map(|value| value.as_slice())
-            .filter(|arg| !arg.starts_with(b"--") && !matches!(*arg, b"-B" | b"-h"))
-    });
-    value
-        .filter(|value| !value.is_empty())
-        .map(BString::from)
-        .ok_or_else(|| {
-            format!(
-                "Supply a value for {flag}. Use {flag}=<value> for a value that starts with --."
-            )
-        })
+    let value = match attached {
+        Some(value) => value,
+        None => match args.next().map(|value| value.as_slice()) {
+            None => return Err(format!("Supply a value for {flag}.")),
+            Some(next) if next.starts_with(b"--") => {
+                return Err(format!(
+                    "Supply a value for {flag}. Use {flag}=<value> for a value that starts with --."
+                ));
+            }
+            // `-h` never reaches this point, because it selects the help text first.
+            Some(next @ (b"-B" | b"-h")) => {
+                let next = String::from_utf8_lossy(next);
+                return Err(format!(
+                    "Supply a value for {flag}. Use {flag}={next} to give {next} as the value."
+                ));
+            }
+            Some(next) => next,
+        },
+    };
+    if value.is_empty() {
+        return Err(format!("Supply a value for {flag}."));
+    }
+    Ok(BString::from(value))
 }
 
 fn once(slot: &mut Option<BString>, value: BString, flag: &str) -> Result<(), String> {
@@ -407,6 +422,14 @@ fn select(parsed: Parsed, why_not: bool) -> Result<Invocation, String> {
     let eval = parsed.eval.is_some() || parsed.eval_property.is_some();
     if (parsed.find.is_some() || find_alias) && eval {
         return Err("Use one of --find, --eval, or --eval-property.".into());
+    }
+    if why_not
+        && !find_alias
+        && !eval
+        && parsed.find.is_none()
+        && parsed.used.iter().any(|flag| FIND_ONLY.contains(flag))
+    {
+        return Err("Specify one package: rcmake explain why-not <package>.".into());
     }
     if parsed.find.is_some() || find_alias {
         reject(&parsed.used, QUERY_ONLY, "--find")?;
@@ -657,6 +680,52 @@ mod tests {
             Ok(Invocation::Query(Options { typed: Some(ExplainFilter::Flag(ref value)), .. })) if value == "-O2"
         ));
         assert!(parse_args(&["app", "--filter", "x", "--flag", "-O2"]).is_err());
+    }
+
+    #[test]
+    fn eval_target_value_is_not_the_first_positional() {
+        assert_eq!(
+            parse_args(&["--target", "why-not", "--eval", "x", "-h"]),
+            Ok(Invocation::EvalHelp)
+        );
+        assert_eq!(
+            parse_args(&["--target", "why-not", "Boost", "-h"]),
+            Ok(Invocation::FindHelp),
+            "--target is a flag outside eval mode"
+        );
+    }
+
+    #[test]
+    fn why_not_without_a_package_names_the_missing_package() {
+        let message = parse_args(&["why-not", "--all-candidates"]).map(|_| ());
+        assert_eq!(
+            message,
+            Err("Specify one package: rcmake explain why-not <package>.".into())
+        );
+    }
+
+    #[test]
+    fn value_errors_name_the_rejected_token() {
+        assert_eq!(
+            parse_args(&["app", "--config", "-h"]),
+            Ok(Invocation::Help),
+            "-h asks for help in every position"
+        );
+        assert_eq!(
+            parse_args(&["app", "--config", "-B"]).map(|_| ()),
+            Err("Supply a value for --config. Use --config=-B to give -B as the value.".into())
+        );
+        assert_eq!(
+            parse_args(&["app", "--config", "--json"]).map(|_| ()),
+            Err(
+                "Supply a value for --config. Use --config=<value> for a value that starts with --."
+                    .into()
+            )
+        );
+        assert_eq!(
+            parse_args(&["app", "--config"]).map(|_| ()),
+            Err("Supply a value for --config.".into())
+        );
     }
 
     #[test]

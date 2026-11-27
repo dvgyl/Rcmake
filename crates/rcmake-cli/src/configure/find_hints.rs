@@ -10,7 +10,10 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rcmake_api::{FIND_TRACE_MAX_BYTES, FIND_TRACE_PATH, FileStamp, FindTraceDocument, Freshness};
+use rcmake_api::{
+    EnvStamp, FIND_TRACE_MAX_BYTES, FIND_TRACE_PATH, FileStamp, FindTraceDocument, Freshness,
+    find_search_env_names,
+};
 use rcmake_base::{BString, path_lex::Lexical};
 use rcmake_buildinfo::{ArtifactReader, ReadLimits};
 use rcmake_eval::find_trace::{FindOutcome, FindPackageTrace, Rejection};
@@ -100,9 +103,13 @@ pub(crate) fn load_saved(host: &dyn Host, build: &Path) -> Option<SavedTrace> {
     document.build = Lexical::new(&document.build).normalize();
     document.source = Lexical::new(&document.source).normalize();
     let cache = cache_path(&root);
-    let freshness = document.freshness(&Lexical::new(&root).normalize(), &source, &cache, |file| {
-        stamp(host, file)
-    });
+    let freshness = document.freshness(
+        &Lexical::new(&root).normalize(),
+        &source,
+        &cache,
+        |file| stamp(host, file),
+        |name| host.env_get(name),
+    );
     Some(SavedTrace {
         document,
         freshness,
@@ -116,6 +123,17 @@ fn cache_path(build: &[u8]) -> BString {
     }
     cache.extend_from_slice(b"CMakeCache.txt");
     cache
+}
+
+/// Record the search environment variables that the calls of a run can read.
+fn search_environment(host: &dyn Host, calls: &[FindPackageTrace]) -> Vec<EnvStamp> {
+    find_search_env_names(calls.iter().map(|call| call.name.as_slice()))
+        .into_iter()
+        .map(|name| EnvStamp {
+            value: host.env_get(&name),
+            name,
+        })
+        .collect()
 }
 
 /// Collect the input stamps of a run. Return the stamps and whether they are complete.
@@ -195,6 +213,7 @@ pub(super) fn finish(
         cache: stamp(host, &cache_path(&build)).filter(|stamp| stamp.exists),
         inputs,
         inputs_complete: inputs_complete && store.all_calls_kept(),
+        environment: Some(search_environment(host, &store.calls)),
         build,
         source,
         completed,
@@ -477,6 +496,17 @@ mod tests {
             b"set(Widget_VERSION 3.0)\n",
         )
         .expect("seed");
+        assert!(matches!(freshness(&host), Some(Freshness::Past(_))));
+        assert_eq!(configure(&host, "rcmake"), 0);
+        assert_eq!(freshness(&host), Some(Freshness::Current));
+
+        // A search environment variable changes where the search looks. A miss
+        // that the configure saved is then no longer current.
+        host.env_set(b"CMAKE_PREFIX_PATH", Some(b"/opt/new"));
+        assert!(matches!(freshness(&host), Some(Freshness::Past(_))));
+        host.env_set(b"CMAKE_PREFIX_PATH", None);
+        assert_eq!(freshness(&host), Some(Freshness::Current));
+        host.env_set(b"Widget_ROOT", Some(b"/opt/widget"));
         assert!(matches!(freshness(&host), Some(Freshness::Past(_))));
         assert_eq!(configure(&host, "rcmake"), 0);
         assert_eq!(freshness(&host), Some(Freshness::Current));

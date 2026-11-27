@@ -197,3 +197,16 @@ fn socket_session_stops_and_finishes() {
     );
     let _ = std::fs::remove_file(&socket);
 }
+
+#[test]
+fn unsupported_transport_text_depends_on_the_persona() {
+    use crate::persona::Persona;
+    assert_eq!(
+        unsupported_transport_reason(Persona::Compat),
+        "CMake was not built with support for --debugger"
+    );
+    assert_eq!(
+        unsupported_transport_reason(Persona::Native),
+        "Windows named-pipe debugger transport is not yet supported in rcmake"
+    );
+}

@@ -108,7 +108,7 @@ fn compile_flag_parts(
     let architectures = super::apple::arch::flags(model, target, config, language, architecture)?;
     let mut flags = Vec::new();
     let policy = Flags::new(model, target, language);
-    let ipo = if matches!(language, b"CUDA" | b"HIP") {
+    let ipo = if language == b"CUDA" {
         super::cuda::arch::ipo_enabled(model, target, config, language)
     } else {
         policy.ipo(config)
@@ -434,25 +434,27 @@ pub(super) fn formatted_defines(
         .defines
         .split_at_checked(boundary)
         .unwrap_or((&group.defines, &[]));
-    fn sort_dedup(definitions: &[rcmake_model::BT<BString>]) -> Vec<&[u8]> {
-        let mut definitions: Vec<_> = definitions
-            .iter()
-            .map(|define| define.value.as_slice())
-            .collect();
-        definitions.sort_unstable();
-        definitions.dedup();
-        definitions
+    let mut target_defs: Vec<&[u8]> = target_defines
+        .iter()
+        .map(|define| define.value.as_slice())
+        .collect();
+    target_defs.sort_unstable();
+    target_defs.dedup();
+    let intdir_define = (model.generator == Some(GeneratorKind::NinjaMultiConfig))
+        .then(|| [b"CMAKE_INTDIR=\"".as_slice(), &config.0, b"\""].concat());
+    let mut source_defs: Vec<&[u8]> = source_defines
+        .iter()
+        .map(|define| define.value.as_slice())
+        .collect();
+    if let Some(intdir) = intdir_define.as_deref() {
+        source_defs.push(intdir);
     }
-    let target_defs = sort_dedup(target_defines);
-    let source_defs = sort_dedup(source_defines);
+    source_defs.sort_unstable();
+    source_defs.dedup();
     let define_key = [b"CMAKE_".as_slice(), &group.language, b"_DEFINE_FLAG"].concat();
     let prefix = definition(model, target.dir, &define_key)
         .filter(|flag| !flag.is_empty())
         .map_or(b"-D".as_slice(), |flag| flag.as_slice());
-    let intdir = (model.generator == Some(GeneratorKind::NinjaMultiConfig)).then(|| {
-        let value = [b"CMAKE_INTDIR=\"".as_slice(), &config.0, b"\""].concat();
-        compile_argument(model, target, prefix, &value)
-    });
     let ninja_posix = model.generator.is_some_and(GeneratorKind::is_ninja)
         && !super::shell::windows_host(model, target.dir);
     let format_define = |define: &[u8]| {
@@ -469,7 +471,6 @@ pub(super) fn formatted_defines(
         target_defs
             .into_iter()
             .map(format_define)
-            .chain(intdir)
             .chain(source_defs.into_iter().map(format_define)),
     )
 }

@@ -130,3 +130,95 @@ fn parallel_matches_stop_at_the_path_limit() {
     assert!(report.paths.len() <= 16);
     assert!(!report.complete());
 }
+
+#[test]
+fn link_language_edges_use_the_consumer_link_language() {
+    let result = configure(
+        "add_library(backend INTERFACE)\nadd_library(cbackend INTERFACE)\nadd_library(top INTERFACE)\nset_property(TARGET top PROPERTY LINKER_LANGUAGE CXX)\ntarget_link_libraries(top INTERFACE $<$<LINK_LANGUAGE:CXX>:backend> $<$<LINK_LANGUAGE:C>:cbackend>)",
+    );
+    assert_eq!(
+        paths(&result, "top", "backend"),
+        [vec![hop("backend", "link")]]
+    );
+    assert!(
+        paths(&result, "top", "cbackend").is_empty(),
+        "a C-only edge is not a path of a CXX consumer"
+    );
+}
+
+fn configure_multi(body: &str) -> ConfigureResult {
+    let root = Path::new(if cfg!(windows) { "C:/" } else { "/" });
+    let host = Arc::new(PureHost::new(root.to_owned(), root.join("bin/rcmake")));
+    let script =
+        format!("cmake_minimum_required(VERSION 4.5)\nproject(Deps LANGUAGES NONE)\n{body}\n");
+    host.seed_file(&root.join("src/CMakeLists.txt"), script.as_bytes())
+        .expect("seed");
+    let mut request = ConfigureRequest::new("src", "build", "cmake", host);
+    request.generator = Some(rcmake_model::GeneratorKind::NinjaMultiConfig);
+    run_configure(request).expect("configure")
+}
+
+#[test]
+fn dependency_output_and_status_follow_the_requested_configuration() {
+    let result = configure_multi(
+        "set(CMAKE_CONFIGURATION_TYPES Debug Release)\nadd_library(dbg INTERFACE)\nadd_library(top INTERFACE)\ntarget_link_libraries(top INTERFACE $<$<CONFIG:Debug>:dbg>)",
+    );
+    let report = result.explain_with(
+        &crate::ExplainQuery::Target("top".into()),
+        Some(crate::ExplainFilter::Dependency("dbg".into())),
+    );
+    let dependency = match &report {
+        crate::ExplainReport::Target(target) => target.dependency.as_deref(),
+        _ => None,
+    }
+    .expect("dependency report");
+    assert_eq!(dependency.paths_for(Some(b"debug")).count(), 1);
+    assert_eq!(dependency.paths_for(Some(b"Release")).count(), 0);
+
+    let render = |config: &'static [u8]| {
+        crate::render_explain_terminal(
+            &report,
+            crate::ExplainRenderOptions {
+                config: Some(config),
+                ..crate::ExplainRenderOptions::default()
+            },
+        )
+    };
+    let release = render(b"Release");
+    assert!(
+        release.contains("dbg is not a dependency of top in Release."),
+        "{release}"
+    );
+    assert!(!release.contains("top -> dbg"), "{release}");
+    assert!(
+        !release.contains("No entry matches the filter."),
+        "{release}"
+    );
+    let debug = render(b"Debug");
+    assert!(debug.contains("top -> dbg (Debug)"), "{debug}");
+    assert!(!debug.contains("not a dependency"), "{debug}");
+
+    let paths = |config: &'static [u8]| {
+        crate::explain_json(&report, Some(config))
+            .get("details")
+            .and_then(|details| details.get("dependency"))
+            .and_then(|dependency| dependency.get("paths"))
+            .and_then(rcmake_json::Value::as_array)
+            .map(<[rcmake_json::Value]>::len)
+    };
+    assert_eq!(paths(b"Release"), Some(0));
+    assert_eq!(paths(b"Debug"), Some(1));
+}
+
+#[test]
+fn order_only_dependency_has_no_contradicting_filter_message() {
+    let result =
+        configure("add_custom_target(gen)\nadd_custom_target(app)\nadd_dependencies(app gen)");
+    let report = result.explain_with(
+        &crate::ExplainQuery::Target("app".into()),
+        Some(crate::ExplainFilter::Dependency("gen".into())),
+    );
+    let text = crate::render_explain_terminal(&report, crate::ExplainRenderOptions::default());
+    assert!(text.contains("order-only"), "{text}");
+    assert!(!text.contains("No entry matches the filter."), "{text}");
+}

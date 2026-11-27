@@ -14,16 +14,13 @@ mod stage;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rcmake_base::BString;
 use rcmake_host::{
-    CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, ReadRange, RunRequest,
-    Stream, path,
+    CommandSpec, FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, Stream, path,
 };
-use rcmake_json::{ParseBudget, ReadOptions, Value};
 
 use self::collect::{ConfigureOutcome, ProcessOutcome, bounded_tail, collect_run_evidence};
 use self::compare::{PairedTimings, SectionReport, Verdict, VerifyReport, compare_runs};
@@ -31,14 +28,10 @@ use self::protocol::{PathArg, VerifyRequest};
 use self::render::{render_json, render_text};
 use self::stage::ScratchWorkspace;
 
-const TARGET_ORACLE_VERSION: &str = "4.5.1";
+const TARGET_ORACLE_VERSION: &str = rcmake_base::CMAKE_VERSION_STR;
 const MAX_STDIN_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_PRESET_FILE_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_PRESET_FILES: usize = 64;
-const MAX_PRESET_INCLUDE_DEPTH: usize = 8;
 const OVERALL_VERIFY_TIMEOUT: Duration = Duration::from_secs(600);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
-const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CONFIGURE_OUTPUT_BYTES: usize = 32 << 20;
 
 const HELP: &str = "\
@@ -116,7 +109,17 @@ pub(crate) fn run(host: &dyn Host, args: &[BString]) -> i32 {
         }
     };
 
-    execute_request_with_deadline(host, &req, OVERALL_VERIFY_TIMEOUT)
+    let overall_limit = req
+        .timeout_secs
+        .map_or(OVERALL_VERIFY_TIMEOUT, Duration::from_secs);
+    execute_request_with_deadline(host, &req, overall_limit)
+}
+
+fn emit_progress(host: &dyn Host, phase: &str) {
+    host.write_out(
+        Stream::Stderr,
+        format!("rcmake verify: {phase}\n").as_bytes(),
+    );
 }
 
 pub(crate) fn execute_request_with_deadline(
@@ -131,13 +134,31 @@ pub(crate) fn execute_request_with_deadline(
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .collect();
 
-    let (oracle_version, rcmake_version) = match validate_engines(host, req, &deadline) {
+    let oracle_exe = match resolve_oracle_from_request(host, req) {
+        Ok(exe) => exe,
+        Err(msg) => {
+            return emit_invalid_input(
+                host,
+                req,
+                "",
+                "unknown".to_owned(),
+                "unknown".to_owned(),
+                external_inputs,
+                msg,
+            );
+        }
+    };
+    let oracle_disp = oracle_exe.display().to_string();
+
+    let (oracle_version, rcmake_version) = match validate_engines(host, req, &oracle_exe, &deadline)
+    {
         Ok(versions) => versions,
         Err((o_ver, r_ver, msg)) => {
-            return emit_invalid_input(host, req, o_ver, r_ver, external_inputs, msg);
+            return emit_invalid_input(host, req, &oracle_disp, o_ver, r_ver, external_inputs, msg);
         }
     };
 
+    emit_progress(host, "staging source");
     let ws =
         match ScratchWorkspace::create(host, &req.source_dir, req.excluded_build_dir.as_deref()) {
             Ok(ws) => ws,
@@ -145,6 +166,7 @@ pub(crate) fn execute_request_with_deadline(
                 return emit_invalid_input(
                     host,
                     req,
+                    &oracle_disp,
                     oracle_version,
                     rcmake_version,
                     external_inputs,
@@ -166,6 +188,7 @@ pub(crate) fn execute_request_with_deadline(
             return emit_invalid_input(
                 host,
                 req,
+                &oracle_disp,
                 oracle_version,
                 rcmake_version,
                 external_inputs,
@@ -174,11 +197,13 @@ pub(crate) fn execute_request_with_deadline(
         }
     };
 
-    if let Err(msg) = validate_staged_presets(host, req, ws.staged_src()) {
+    let oracle_env = ws.child_env(false);
+    if let Err(msg) = validate_staged_presets(host, req, ws.staged_src(), &oracle_env) {
         let _ = ws.cleanup();
         return emit_invalid_input(
             host,
             req,
+            &oracle_disp,
             oracle_version,
             rcmake_version,
             external_inputs,
@@ -186,10 +211,10 @@ pub(crate) fn execute_request_with_deadline(
         );
     }
 
-    let oracle_env = ws.child_env(false);
+    emit_progress(host, "running oracle configure");
     let oracle_outcome = run_configure(
         host,
-        &req.oracle_exe,
+        &oracle_exe,
         &cli_args,
         &oracle_cwd,
         &oracle_env,
@@ -216,6 +241,7 @@ pub(crate) fn execute_request_with_deadline(
             return emit_invalid_input(
                 host,
                 req,
+                &oracle_disp,
                 oracle_version,
                 rcmake_version,
                 external_inputs,
@@ -224,6 +250,7 @@ pub(crate) fn execute_request_with_deadline(
         }
     };
     let rcmake_env = ws.child_env(true);
+    emit_progress(host, "running rcmake configure");
     let rcmake_outcome = run_configure(
         host,
         &req.rcmake_exe,
@@ -245,9 +272,10 @@ pub(crate) fn execute_request_with_deadline(
         &deadline,
     );
 
+    emit_progress(host, "comparing artifacts");
     let mut report = compare_runs(
         host,
-        &req.oracle_exe,
+        &oracle_exe,
         oracle_version,
         &req.rcmake_exe,
         rcmake_version,
@@ -280,151 +308,117 @@ pub(crate) fn execute_request_with_deadline(
     report.verdict.exit_code()
 }
 
-/// Reject configure presets that enable `graphviz` or `trace.redirect` before either engine runs,
-/// enforcing the same configure-only containment contract for direct `--request-stdin` callers.
+/// Resolve the requested configure preset via the production `rcmake-presets` loader against
+/// the staged source tree and exact child environment, rejecting unresolved presets or any
+/// preset that enables `graphviz` or `trace.redirect` before either engine executes.
 fn validate_staged_presets(
     host: &dyn Host,
     req: &VerifyRequest,
     staged_src: &Path,
+    child_env: &[(BString, BString)],
 ) -> Result<(), String> {
     let Some(preset_name) = req.preset_name() else {
         return Ok(());
     };
-    let initial_files: Vec<PathBuf> = match req.presets_file() {
-        Some(PathArg::SourceRel(rel)) => vec![staged_src.join(path::to_native(rel))],
-        Some(PathArg::ExternalAbsolute(abs)) => vec![path::to_native(abs)],
-        None => vec![
-            staged_src.join("CMakePresets.json"),
-            staged_src.join("CMakeUserPresets.json"),
-        ],
-    };
-
-    let mut presets: BTreeMap<BString, PresetRedirectInfo> = BTreeMap::new();
-    let mut visited_files: BTreeSet<PathBuf> = BTreeSet::new();
-    for file in initial_files {
-        load_preset_redirects(host, &file, 0, &mut visited_files, &mut presets)?;
-    }
-
-    let mut queue = vec![preset_name.clone()];
-    let mut seen_presets: BTreeSet<BString> = BTreeSet::new();
-    while let Some(name) = queue.pop() {
-        if !seen_presets.insert(name.clone()) {
-            continue;
+    let presets = match req.presets_file() {
+        Some(PathArg::SourceRel(rel)) => {
+            let file = staged_src.join(path::to_native(rel));
+            rcmake_presets::load_file(staged_src, &file, host)
         }
-        let Some(info) = presets.get(&name) else {
-            continue;
-        };
-        if info.has_graphviz {
+        Some(PathArg::ExternalAbsolute(abs)) => {
+            let file = path::to_native(abs);
+            rcmake_presets::load_file(staged_src, &file, host)
+        }
+        None => rcmake_presets::load(staged_src, host),
+    }
+    .map_err(|err| format!("Failed to load configure presets: {err}"))?;
+
+    let env = rcmake_presets::EnvSnapshot {
+        vars: child_env.iter().cloned().collect(),
+    };
+    let resolved = rcmake_presets::resolve(
+        &presets,
+        rcmake_presets::PresetKind::Configure,
+        preset_name,
+        &env,
+    )
+    .map_err(|err| {
+        format!(
+            "Failed to resolve configure preset '{}': {err}",
+            String::from_utf8_lossy(preset_name)
+        )
+    })?;
+
+    if let rcmake_presets::PresetSettings::Configure(cfg) = &resolved.settings {
+        if cfg.graphviz.is_some() {
             return Err(format!(
                 "Configure preset '{}' enables graphviz output, which writes outside the verify scratch tree.",
                 String::from_utf8_lossy(preset_name)
             ));
         }
-        if info.has_trace_redirect {
+        if cfg
+            .trace
+            .as_ref()
+            .and_then(|trace| trace.redirect.as_ref())
+            .is_some()
+        {
             return Err(format!(
                 "Configure preset '{}' enables trace.redirect, which writes outside the verify scratch tree.",
                 String::from_utf8_lossy(preset_name)
             ));
         }
-        queue.extend(info.inherits.iter().cloned());
     }
     Ok(())
 }
 
-#[derive(Default)]
-struct PresetRedirectInfo {
-    inherits: Vec<BString>,
-    has_graphviz: bool,
-    has_trace_redirect: bool,
-}
-
-fn load_preset_redirects(
-    host: &dyn Host,
-    file: &Path,
-    depth: usize,
-    visited_files: &mut BTreeSet<PathBuf>,
-    presets: &mut BTreeMap<BString, PresetRedirectInfo>,
-) -> Result<(), String> {
-    if depth > MAX_PRESET_INCLUDE_DEPTH {
-        return Err(format!(
-            "Presets include depth exceeded limit ({MAX_PRESET_INCLUDE_DEPTH}) at {}.",
-            file.display()
-        ));
+fn resolve_oracle_from_request(host: &dyn Host, req: &VerifyRequest) -> Result<PathBuf, String> {
+    if let Some(exe) = &req.oracle_exe {
+        return Ok(exe.clone());
     }
-    if host.metadata(file, Follow::Yes).is_err() {
-        return Ok(());
+    let raw = host
+        .env_get(b"RCMAKE_ORACLE_CMAKE")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            "Missing required --oracle <path> option (or set RCMAKE_ORACLE_CMAKE). Run 'rcmake verify --help'."
+                .to_owned()
+        })?;
+    if raw.contains(&b'/') || raw.contains(&b'\\') {
+        let native = path::to_native(&raw);
+        return Ok(if native.is_absolute() {
+            native
+        } else {
+            host.initial_cwd().join(native)
+        });
     }
-    let key = host
-        .canonicalize(file)
-        .unwrap_or_else(|_| file.to_path_buf());
-    if !visited_files.insert(key) {
-        return Ok(());
-    }
-    if visited_files.len() > MAX_PRESET_FILES {
-        return Err(format!(
-            "Presets file count exceeded limit ({MAX_PRESET_FILES})."
-        ));
-    }
-    let bytes = host
-        .read(
-            file,
-            ReadRange::All {
-                limit: MAX_PRESET_FILE_BYTES,
-            },
-        )
-        .map_err(|err| format!("Could not read preset file {}: {err}", file.display()))?;
-    let budget = ParseBudget::artifact(MAX_PRESET_FILE_BYTES as usize);
-    let root = rcmake_json::parse_bounded(&bytes, &ReadOptions::default(), &budget)
-        .map_err(|err| format!("Invalid preset JSON {}: {}", file.display(), err.message))?;
-
-    if let Some(includes) = root.get("include").and_then(Value::as_array) {
-        let base_dir = file.parent().unwrap_or_else(|| Path::new(""));
-        for inc in includes {
-            if let Some(inc_bytes) = inc.as_bytes().filter(|b| !b.is_empty()) {
-                let inc_path = if protocol::is_host_absolute(host, inc_bytes) {
-                    path::to_native(inc_bytes)
-                } else {
-                    base_dir.join(path::to_native(inc_bytes))
-                };
-                load_preset_redirects(host, &inc_path, depth + 1, visited_files, presets)?;
-            }
-        }
-    }
-
-    if let Some(entries) = root.get("configurePresets").and_then(Value::as_array) {
-        for entry in entries {
-            let Some(name) = entry.get("name").and_then(Value::as_bytes) else {
-                continue;
-            };
-            let mut info = PresetRedirectInfo::default();
-            match entry.get("inherits") {
-                Some(Value::String(single)) => info.inherits.push(single.clone()),
-                Some(Value::Array(list)) => {
-                    for parent in list {
-                        if let Some(p) = parent.as_bytes() {
-                            info.inherits.push(BString::from(p));
-                        }
-                    }
+    let windows = host.system().sysname.eq_ignore_ascii_case(b"Windows");
+    let sep = if windows { b';' } else { b':' };
+    if let Some(path_var) = host.env_get(b"PATH") {
+        let name = String::from_utf8_lossy(&raw);
+        let with_exe = if windows && !name.to_ascii_lowercase().ends_with(".exe") {
+            Some(format!("{name}.exe"))
+        } else {
+            None
+        };
+        for dir in path_var.split(|&b| b == sep).filter(|d| !d.is_empty()) {
+            let base = path::to_native(dir);
+            for leaf in std::iter::once(name.as_ref()).chain(with_exe.as_deref()) {
+                let candidate = base.join(leaf);
+                if host
+                    .metadata(&candidate, Follow::Yes)
+                    .is_ok_and(|meta| meta.kind == FileKind::File)
+                {
+                    return Ok(candidate);
                 }
-                _ => {}
             }
-            if matches!(entry.get("graphviz"), Some(val) if !matches!(val, Value::Null)) {
-                info.has_graphviz = true;
-            }
-            if let Some(trace) = entry.get("trace")
-                && matches!(trace.get("redirect"), Some(val) if !matches!(val, Value::Null))
-            {
-                info.has_trace_redirect = true;
-            }
-            presets.insert(BString::from(name), info);
         }
     }
-    Ok(())
+    Ok(host.initial_cwd().join(path::to_native(&raw)))
 }
 
 fn emit_invalid_input(
     host: &dyn Host,
     req: &VerifyRequest,
+    oracle_exe: &str,
     oracle_version: String,
     rcmake_version: String,
     external_inputs: Vec<String>,
@@ -434,7 +428,7 @@ fn emit_invalid_input(
         let skipped = SectionReport::skipped("Not executed due to invalid input.");
         let report = VerifyReport {
             verdict: Verdict::InvalidInput,
-            oracle_exe: req.oracle_exe.display().to_string(),
+            oracle_exe: oracle_exe.to_owned(),
             oracle_version,
             rcmake_exe: req.rcmake_exe.display().to_string(),
             rcmake_version,
@@ -471,6 +465,7 @@ fn emit_invalid_input(
 fn validate_engines(
     host: &dyn Host,
     req: &VerifyRequest,
+    oracle_exe: &Path,
     deadline: &Deadline,
 ) -> Result<(String, String), (String, String, String)> {
     let mut oracle_ver_out = "unknown".to_owned();
@@ -490,7 +485,7 @@ fn validate_engines(
         ));
     }
     if !host
-        .metadata(&req.oracle_exe, Follow::Yes)
+        .metadata(oracle_exe, Follow::Yes)
         .is_ok_and(|meta| meta.kind == FileKind::File)
     {
         return Err((
@@ -498,7 +493,7 @@ fn validate_engines(
             rcmake_ver_out,
             format!(
                 "Oracle executable '{}' does not exist.",
-                req.oracle_exe.display()
+                oracle_exe.display()
             ),
         ));
     }
@@ -507,15 +502,15 @@ fn validate_engines(
         .canonicalize(&req.rcmake_exe)
         .unwrap_or_else(|_| req.rcmake_exe.clone());
     let oracle_canon = host
-        .canonicalize(&req.oracle_exe)
-        .unwrap_or_else(|_| req.oracle_exe.clone());
+        .canonicalize(oracle_exe)
+        .unwrap_or_else(|_| oracle_exe.to_path_buf());
     if rcmake_canon == oracle_canon {
         return Err((
             oracle_ver_out,
             rcmake_ver_out,
             format!(
                 "Oracle path '{}' resolves to the same executable as rcmake. Supply an upstream CMake {} executable.",
-                req.oracle_exe.display(),
+                oracle_exe.display(),
                 TARGET_ORACLE_VERSION
             ),
         ));
@@ -533,13 +528,13 @@ fn validate_engines(
     })?;
     rcmake_ver_out = extract_version_line(&rcmake_banner);
 
-    let oracle_banner = probe_version(host, &req.oracle_exe, deadline).map_err(|err| {
+    let oracle_banner = probe_version(host, oracle_exe, deadline).map_err(|err| {
         (
             oracle_ver_out.clone(),
             rcmake_ver_out.clone(),
             format!(
                 "Could not read version from oracle '{}': {err}",
-                req.oracle_exe.display()
+                oracle_exe.display()
             ),
         )
     })?;
@@ -551,7 +546,7 @@ fn validate_engines(
             rcmake_ver_out,
             format!(
                 "Oracle executable '{}' identifies as rcmake. Supply an upstream CMake {} executable.",
-                req.oracle_exe.display(),
+                oracle_exe.display(),
                 TARGET_ORACLE_VERSION
             ),
         ));
@@ -563,7 +558,7 @@ fn validate_engines(
             rcmake_ver_out,
             format!(
                 "Oracle executable '{}' did not report a CMake version ('{}').",
-                req.oracle_exe.display(),
+                oracle_exe.display(),
                 extract_version_line(&oracle_banner)
             ),
         ));
@@ -574,8 +569,8 @@ fn validate_engines(
             parsed_oracle.clone(),
             rcmake_ver_out,
             format!(
-                "Oracle executable '{}' reported CMake {parsed_oracle}, but rcmake verify requires CMake {TARGET_ORACLE_VERSION} for a parity verdict.",
-                req.oracle_exe.display()
+                "Oracle executable '{}' version mismatch: detected CMake {parsed_oracle}, expected CMake {TARGET_ORACLE_VERSION}.",
+                oracle_exe.display()
             ),
         ));
     }
@@ -646,7 +641,7 @@ fn run_configure(
     env: &[(BString, BString)],
     deadline: &Deadline,
 ) -> ConfigureOutcome {
-    let Some(timeout) = deadline.step_timeout(host, CONFIGURE_TIMEOUT) else {
+    let Some(timeout) = deadline.remaining(host) else {
         return ConfigureOutcome {
             status: ProcessOutcome::TimedOut,
             elapsed_ns: 0,

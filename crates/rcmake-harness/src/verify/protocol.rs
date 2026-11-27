@@ -130,7 +130,7 @@ pub(crate) enum ConfigureOption {
 #[derive(Clone, Debug)]
 pub(crate) struct VerifyRequest {
     pub(crate) rcmake_exe: PathBuf,
-    pub(crate) oracle_exe: PathBuf,
+    pub(crate) oracle_exe: Option<PathBuf>,
     pub(crate) source_dir: PathBuf,
     pub(crate) excluded_build_dir: Option<PathBuf>,
     pub(crate) cwd_rel_to_source: Option<BString>,
@@ -140,6 +140,7 @@ pub(crate) struct VerifyRequest {
     pub(crate) compile_commands_user_disabled: bool,
     pub(crate) generator_hint: Option<BString>,
     pub(crate) external_inputs: Vec<BString>,
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 impl VerifyRequest {
@@ -170,7 +171,19 @@ impl VerifyRequest {
         };
 
         let rcmake_exe = req_path("rcmake_exe")?;
-        let oracle_exe = req_path("oracle_exe")?;
+        let oracle_exe = match root.get("oracle_exe") {
+            None | Some(Value::Null) => None,
+            Some(val) => {
+                let raw = val
+                    .as_bytes()
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| "Field 'oracle_exe' must be a non-empty string.".to_owned())?;
+                if !is_host_absolute(host, raw) {
+                    return Err("Field 'oracle_exe' must be an absolute path.".into());
+                }
+                Some(path::to_native(raw))
+            }
+        };
         let source_dir = req_path("source_dir")?;
 
         let excluded_build_dir = match root.get("excluded_build_dir") {
@@ -204,6 +217,16 @@ impl VerifyRequest {
         };
 
         let json = root.get("json").and_then(Value::as_bool).unwrap_or(false);
+        let timeout_secs = match root.get("timeout_secs") {
+            None | Some(Value::Null) => None,
+            Some(val) => {
+                let secs = val
+                    .as_u64()
+                    .filter(|&s| s > 0)
+                    .ok_or_else(|| "Field 'timeout_secs' must be a positive integer.".to_owned())?;
+                Some(secs)
+            }
+        };
         let mut request_compile_commands = root
             .get("request_compile_commands")
             .and_then(Value::as_bool)
@@ -295,6 +318,7 @@ impl VerifyRequest {
             compile_commands_user_disabled,
             generator_hint,
             external_inputs,
+            timeout_secs,
         })
     }
 

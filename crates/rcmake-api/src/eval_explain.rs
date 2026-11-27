@@ -15,9 +15,6 @@ use crate::ConfigureResult;
 /// Schema of `rcmake explain --eval --json`.
 pub const EXPLAIN_EVAL_SCHEMA: &str = "rcmake-explain-eval-v1";
 
-/// Operators whose value needs a `Ninja Multi-Config` command or output configuration.
-const CROSS_CONFIG: [&[u8]; 2] = [b"COMMAND_CONFIG", b"OUTPUT_CONFIG"];
-
 /// Input of one evaluation request.
 #[derive(Clone, Debug, Default)]
 pub struct EvalRequest {
@@ -43,7 +40,8 @@ pub struct EvalRequest {
     pub command_config: Option<BString>,
     /// `$<OUTPUT_CONFIG>` configuration.
     pub output_config: Option<BString>,
-    /// Most recorded steps per configuration.
+    /// Most recorded steps per configuration. 0 records no steps. Unavailable
+    /// operators are reported for every limit.
     pub step_limit: usize,
     /// Directory of the bundled CMake modules, for denial attribution.
     pub module_root: Option<BString>,
@@ -91,6 +89,12 @@ pub struct EvalReport {
     pub link_language: Option<BString>,
     /// Usage traversal.
     pub link: bool,
+    /// `$<COMMAND_CONFIG>` value.
+    pub command_config: Option<BString>,
+    /// `$<OUTPUT_CONFIG>` value.
+    pub output_config: Option<BString>,
+    /// The request recorded steps (`step_limit` above 0).
+    pub steps_recorded: bool,
     /// One result per configuration.
     pub results: Vec<EvalConfigResult>,
     /// The context came from a partial evaluation. Values can differ from a full configure.
@@ -195,7 +199,6 @@ impl ConfigureResult {
             );
         }
         let (command_config, output_config) = self.cross_context(request)?;
-        let cross_evidence = command_config.is_some() || output_config.is_some();
         let ast = rcmake_genex::parse(&expression).map_err(|error| error.to_string())?;
         let objects = ObjectPaths::new(self.generation.iter().flat_map(|result| &result.targets));
         let mut resolver = UsageResolver::new(model);
@@ -224,21 +227,24 @@ impl ConfigureResult {
                 },
                 ..EvalContext::default()
             };
-            let mut trace = GenexTrace::with_limit(request.step_limit.max(1));
+            let mut trace = GenexTrace::with_limit(request.step_limit);
             let evaluated = rcmake_genex::evaluate_traced(&ast, &ctx, &mut host, &mut trace);
-            let unavailable: Vec<BString> = CROSS_CONFIG
-                .iter()
-                .filter(|name| {
-                    trace
-                        .steps
-                        .iter()
-                        .any(|step| step.operator.as_slice() == **name)
-                        && (!cross_evidence
-                            || (**name == b"COMMAND_CONFIG" && ctx.command_config.is_none())
-                            || (**name == b"OUTPUT_CONFIG" && ctx.output_config.is_none()))
-                })
-                .map(|name| BString::from(*name))
-                .collect();
+            // An operator without a configuration in the context has no evidence in this
+            // tree. The trace flags do not depend on the step limit.
+            let unavailable: Vec<BString> = [
+                (
+                    "COMMAND_CONFIG",
+                    trace.command_config_used && ctx.command_config.is_none(),
+                ),
+                (
+                    "OUTPUT_CONFIG",
+                    trace.output_config_used && ctx.output_config.is_none(),
+                ),
+            ]
+            .into_iter()
+            .filter(|(_, missing)| *missing)
+            .map(|(name, _)| BString::from(name))
+            .collect();
             let (value, flags) = match evaluated {
                 Ok((value, flags)) => (Ok(value), Some(flags)),
                 Err(error) => (Err(BString::from(error.to_string())), None),
@@ -249,7 +255,11 @@ impl ConfigureResult {
                 head_sensitive: flags.is_some_and(|flags| flags.head_sensitive),
                 context_sensitive: flags.is_some_and(|flags| flags.context_sensitive),
                 link_language_sensitive: flags.is_some_and(|flags| flags.link_language_sensitive),
-                omitted: trace.omitted,
+                omitted: if request.step_limit == 0 {
+                    0
+                } else {
+                    trace.omitted
+                },
                 steps: trace.steps,
                 skipped: trace.skipped,
                 unavailable,
@@ -265,6 +275,9 @@ impl ConfigureResult {
             language: request.language.clone(),
             link_language: request.link_language.clone(),
             link: request.link,
+            command_config,
+            output_config,
+            steps_recorded: request.step_limit > 0,
             results,
             provisional,
             notes,
@@ -427,36 +440,16 @@ fn paint(text: String, code: u8, color: bool) -> String {
 #[must_use]
 pub fn render_eval_terminal(report: &EvalReport, steps: bool, color: bool) -> String {
     let mut out = String::new();
-    let mut context = Vec::new();
-    if let Some(owner) = &report.owner {
-        context.push(format!("owner {}", display(owner)));
+    let head = match &report.property {
+        Some(property) => format!("{} = {}", display(property), display(&report.expression)),
+        None => display(&report.expression),
+    };
+    let context = header_context(report);
+    if context.is_empty() {
+        let _ = writeln!(out, "{head}\n");
+    } else {
+        let _ = writeln!(out, "{head}   {}\n", context.join(", "));
     }
-    if let Some(consumer) = &report.consumer
-        && report.owner.as_ref() != Some(consumer)
-    {
-        context.push(format!("consumer {}", display(consumer)));
-    } else if report.owner.is_none()
-        && let Some(consumer) = &report.consumer
-    {
-        context.push(format!("target {}", display(consumer)));
-    }
-    if let Some(language) = &report.language {
-        context.push(format!("language {}", display(language)));
-    }
-    if let Some(property) = &report.property {
-        let _ = writeln!(
-            out,
-            "{} = {}",
-            display(property),
-            display(&report.expression)
-        );
-    }
-    let _ = writeln!(
-        out,
-        "{}   {}\n",
-        display(&report.expression),
-        context.join(", ")
-    );
     for result in &report.results {
         let value = match &result.value {
             Ok(value) if value.is_empty() => paint("(empty)".to_owned(), 2, color),
@@ -532,6 +525,40 @@ pub fn render_eval_terminal(report: &EvalReport, steps: bool, color: bool) -> St
 
 fn opt(value: Option<&BString>) -> Value {
     value.map_or(Value::Null, |value| Value::String(value.clone()))
+}
+
+/// Return the active evaluation context of `report` for the terminal header.
+fn header_context(report: &EvalReport) -> Vec<String> {
+    let mut context = Vec::new();
+    if let Some(owner) = &report.owner {
+        context.push(format!("owner {}", display(owner)));
+    }
+    match (&report.owner, &report.consumer) {
+        (Some(owner), Some(consumer)) if owner != consumer => {
+            context.push(format!("consumer {}", display(consumer)));
+        }
+        (None, Some(consumer)) => context.push(format!("target {}", display(consumer))),
+        _ => {}
+    }
+    if report.directory.as_slice() != b"." {
+        context.push(format!("directory {}", display(&report.directory)));
+    }
+    if let Some(language) = &report.language {
+        context.push(format!("language {}", display(language)));
+    }
+    if let Some(language) = &report.link_language {
+        context.push(format!("link language {}", display(language)));
+    }
+    if report.link {
+        context.push("link traversal".to_owned());
+    }
+    if let Some(config) = &report.command_config {
+        context.push(format!("command config {}", display(config)));
+    }
+    if let Some(config) = &report.output_config {
+        context.push(format!("output config {}", display(config)));
+    }
+    context
 }
 
 /// Render the report as `rcmake-explain-eval-v1` JSON.
@@ -622,6 +649,8 @@ pub fn render_eval_json(report: &EvalReport) -> BString {
                 ("target", opt(report.consumer.as_ref())),
                 ("language", opt(report.language.as_ref())),
                 ("link_language", opt(report.link_language.as_ref())),
+                ("command_config", opt(report.command_config.as_ref())),
+                ("output_config", opt(report.output_config.as_ref())),
                 ("directory", Value::String(report.directory.clone())),
                 (
                     "traversal",
@@ -629,6 +658,7 @@ pub fn render_eval_json(report: &EvalReport) -> BString {
                 ),
             ]),
         ),
+        ("steps_recorded", Value::Bool(report.steps_recorded)),
         ("results", Value::array_from(results)),
         (
             "notes",

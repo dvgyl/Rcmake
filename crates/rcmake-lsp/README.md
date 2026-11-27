@@ -1,21 +1,35 @@
 # rcmake language server
 
-`rcmake-lsp` is a Language Server Protocol server for `CMakeLists.txt` and `*.cmake` files. It provides hover, completion, go to definition, document symbols, semantic tokens, and formatting. When you build it with the `eval` feature, hover also shows evaluated variables, targets, and generator expressions.
+`rcmake-lsp` is a Language Server Protocol server for `CMakeLists.txt` and `*.cmake` files. It provides hover, completion, go to definition, document symbols, semantic tokens, quick fixes, lossless formatting, and diagnostics covering syntax errors, all 8 static `rcmake lint` rules, and bounded in-memory project evaluation.
+
+## Contents
+
+- [Get the server](#get-the-server)
+- [Configure your editor](#configure-your-editor)
+  - [VS Code](#vs-code)
+  - [Neovim 0.11 and later](#neovim-011-and-later)
+  - [Neovim with nvim-lspconfig](#neovim-with-nvim-lspconfig)
+  - [Helix](#helix)
+  - [Zed](#zed)
+  - [Emacs with Eglot](#emacs-with-eglot)
+  - [CLion and other JetBrains IDEs](#clion-and-other-jetbrains-ides)
+  - [Other editors](#other-editors)
+- [Editor behavior](#editor-behavior)
 
 ## Get the server
 
-The release archives and `scripts/install.sh` install `rcmake-lsp` next to `rcmake`, in `~/.local/bin` by default. You can also build it from the repository root with these commands.
+The release archives and `scripts/install.sh` install `rcmake-lsp` next to `rcmake`, in `~/.local/bin` by default. You can also start the same server as `rcmake lsp`, or build the standalone binary from the repository root with these commands.
 
 ```sh
 source env/env.sh
 cargo build --locked --release -p rcmake-lsp --features eval,stdio
 ```
 
-The build writes `target/release/rcmake-lsp`, or `rcmake-lsp.exe` on Windows. If you set `CARGO_TARGET_DIR`, look inside its `release` directory instead. Building with `--features stdio` alone produces a lexical-only server without project evaluation.
+The build writes `target/release/rcmake-lsp`, or `rcmake-lsp.exe` on Windows. If you set `CARGO_TARGET_DIR`, look inside its `release` directory instead. Building with `--features stdio` alone produces a lexical and static-analysis server without project evaluation.
 
-The server takes no command-line arguments. It reads LSP messages from standard input and writes responses to standard output, so starting it directly in a terminal waits for input.
+The server accepts `-h`, `--help`, `-V`, `--version`, `--stdio`, and `--clientProcessId=<pid>`. Starting it with no flags, or with `--stdio`, waits for JSON-RPC `Content-Length` messages on standard input and writes responses to standard output.
 
-By default, the server looks for bundled CMake modules in `share/cmake-4.5/Modules` next to its installation. If you run it from a source checkout, set `RCMAKE_VENDORED_DATA_ROOT` in the server environment to the absolute path of `modules/cmake-4.5`.
+By default, the server looks for bundled CMake 4.5.1 modules in `share/cmake-4.5/Modules` next to its installation. If you run it from a source checkout, set `RCMAKE_VENDORED_DATA_ROOT` in the server environment to the absolute path of `modules/cmake-4.5`.
 
 ## Configure your editor
 
@@ -33,7 +47,7 @@ Install the [Generic LSP Client](https://marketplace.visualstudio.com/items?item
 }
 ```
 
-Generic LSP Client runs one server for one language ID.
+Generic LSP Client runs one server for one language ID. Editors that automatically pass `--stdio` or `--clientProcessId=<pid>` work without extra wrappers.
 
 ### Neovim 0.11 and later
 
@@ -128,18 +142,22 @@ CLion includes its own CMake support, so LSP4IJ shows results from `rcmake-lsp` 
 
 Any LSP client can connect to `rcmake-lsp` using these settings.
 
-- **Command.** The absolute path to `rcmake-lsp` with an empty argument list.
+- **Command.** The absolute path to `rcmake-lsp` with no arguments, or with `--stdio`.
 - **Transport.** Standard input and standard output.
 - **Files.** `CMakeLists.txt` and `*.cmake`.
 - **Workspace root.** The directory that contains the top-level `CMakeLists.txt`.
 
 ## Editor behavior
 
-With `eval,stdio`, the server evaluates the project in memory whenever it finds the workspace listfile and the CMake modules. It reads unsaved edits instead of files on disk and blocks configure from starting external processes. In this mode, hover can show evaluated variables, targets, and generator expressions, and generator expression hover reports the result for each build configuration in the snapshot. When a result comes from an incomplete configure or an earlier edit, the server marks it as provisional.
+With `eval,stdio`, the server evaluates the project in memory whenever it finds the workspace listfile and the CMake 4.5.1 modules. It reads unsaved edits instead of files on disk, isolates writes in an in-memory overlay, blocks configure from starting external processes, and cancels stale evaluations when new edits arrive. In this mode, the server publishes bounded evaluated diagnostics, and hover can show evaluated variables, targets, and generator expressions across each build configuration in the snapshot. When a result comes from an incomplete configure or an earlier edit, the server marks it as provisional.
 
-With `stdio` alone, the server uses lexical analysis. The `eval,stdio` build also falls back to lexical analysis whenever it has no evaluated result for a query. The lexical analyzer follows literal `include()` and `add_subdirectory()` calls from the project root and reads open document text, including unsaved edits, instead of reading from disk. It recognizes literal module search paths along with the `${CMAKE_CURRENT_LIST_DIR}` and `${CMAKE_CURRENT_SOURCE_DIR}` path prefixes. When a file has conditional declarations or multiple path choices, go to definition can return more than one possible definition.
+With `stdio` alone, the server uses lexical analysis and static linting. The `eval,stdio` build also falls back to lexical analysis whenever it has no evaluated result for a query. The lexical analyzer follows literal `include()` and `add_subdirectory()` calls from the project root and reads open document text, including unsaved edits, instead of reading from disk. It recognizes literal module search paths along with the `${CMAKE_CURRENT_LIST_DIR}` and `${CMAKE_CURRENT_SOURCE_DIR}` path prefixes. When a file has conditional declarations or multiple path choices, go to definition can return more than one possible definition.
 
-Document symbols, completion, navigation, and semantic tokens still work on available source text while a call or block is incomplete. Formatting adjusts only the leading indentation of files that parse cleanly. It leaves blank lines and the interior lines of quoted arguments, bracket arguments, and bracket comments untouched, and returns an error if the formatted response exceeds 16 MiB.
+The server runs all 8 static `rcmake lint` rules on every synced open document, namely `undefined-variable`, `glob-without-configure-depends`, `single-config-condition`, `unguarded-build-type`, `directory-options`, `obsolete-command`, `old-policy`, and `fragile-if-expansion`. It honors `# rcmake-lint: disable=<rule>` one-command directives and resolves the nearest `.rcmake.toml` inside the workspace root. When the client supports file watching, the server watches `CMakeLists.txt`, `*.cmake`, `.rcmake.toml`, and statically included project files so diagnostics refresh when a shared include or configuration changes. If `.rcmake.toml` has a syntax or schema error, the server warns the client and falls back to default settings until you fix the file.
+
+Formatting uses the same lossless formatter in `rcmake-language-tools` as `rcmake fmt`. It edits only whitespace and optional command identifier case on files that parse cleanly, verifies AST equivalence, protected tokens, and comment attachment before returning edits, and rejects formatted responses above 16 MiB. Project `[fmt]` settings in `.rcmake.toml` (`indent_width`, `line_width`, `command_case`, and `end_of_line`) control formatting. When `.rcmake.toml` omits `indent_width`, the server uses the editor's `tabSize` and `insertSpaces` formatting options.
+
+Document symbols, completion, navigation, and semantic tokens still work on available source text while a call or block is incomplete.
 
 If the server loses synchronization with a document, save the file with full text, send a full-text change, or reopen the document. A save notification without document text cannot restore synchronization. The server accepts up to 16 MiB per document and 64 MiB across all open documents.
 

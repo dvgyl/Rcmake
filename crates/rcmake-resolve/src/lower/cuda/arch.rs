@@ -273,7 +273,7 @@ pub(crate) fn architecture_flags_for(
     let mut flags = Vec::new();
     let mut diagnostics = Vec::new();
     if compiler == b"NVIDIA" {
-        let ipo = ipo_enabled(model, target, config, lang);
+        let ipo = lang == b"CUDA" && ipo_enabled(model, target, config, lang);
         if ipo && phase == ArchPhase::Link {
             flags.extend(shell_arguments(get(b"_LINK_OPTIONS_IPO")));
         }
@@ -304,26 +304,31 @@ pub(crate) fn architecture_flags_for(
     (flags, diagnostics)
 }
 
-/// Check the target's interprocedural optimization property for this configuration.
+/// Check whether CUDA device-LTO / interprocedural optimization is active for this target.
+///
+/// Matches `cmGeneratorTarget::IsIPOEnabled` (`cmGeneratorTarget.cxx:816,2853,3052`):
+/// CUDA device-LTO requires `CUDA_ARCHITECTURES` and `CUDA_SEPARABLE_COMPILATION`, and
+/// HIP never uses CUDA device-LTO (`lto_`) code targets.
 pub(crate) fn ipo_enabled(
     model: &ProjectModel,
     target: &Target,
     config: &ConfigId,
     lang: &[u8],
 ) -> bool {
-    if matches!(lang, b"CUDA" | b"HIP")
-        && [
-            [lang, b"_ARCHITECTURES"].concat(),
-            [lang, b"_SEPARABLE_COMPILATION"].concat(),
-        ]
-        .iter()
-        .any(|key| {
-            target
-                .props
-                .get(key)
-                .is_none_or(|value| truth::is_off(value))
-        })
-    {
+    if lang != b"CUDA" {
+        return false;
+    }
+    if [
+        b"CUDA_ARCHITECTURES".as_slice(),
+        b"CUDA_SEPARABLE_COMPILATION".as_slice(),
+    ]
+    .iter()
+    .any(|key| {
+        target
+            .props
+            .get(key)
+            .is_none_or(|value| truth::is_off(value))
+    }) {
         return false;
     }
     Flags::new(model, target, lang).ipo(config)

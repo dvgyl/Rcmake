@@ -314,6 +314,24 @@ impl Host for NativeHost {
             .collect()
     }
 
+    fn read_dir_bounded(&self, p: &Path, limit: usize) -> HostResult<(Vec<DirEntry>, bool)> {
+        HostError::require_absolute(p)?;
+        let iter = io_at(fs::read_dir(p), p)?;
+        let mut entries = Vec::with_capacity(limit.min(1024));
+        for entry in iter {
+            if entries.len() == limit {
+                let _ = io_at(entry, p)?;
+                return Ok((entries, true));
+            }
+            let entry = io_at(entry, p)?;
+            entries.push(DirEntry {
+                name: crate::path::from_native(Path::new(&entry.file_name())),
+                kind: file_kind(io_at(entry.file_type(), &entry.path())?),
+            });
+        }
+        Ok((entries, false))
+    }
+
     fn create_dir_all(&self, p: &Path) -> HostResult<()> {
         HostError::require_absolute(p)?;
         // `fs::create_dir_all` fails for a missing parent when the path ends in `/.`.
@@ -857,6 +875,36 @@ mod tests {
         host.create_dir_all(&target)?;
         let created = host.metadata(&dir.path().join("prefix").join("nested"), Follow::No)?;
         assert_eq!(created.kind, FileKind::Dir);
+        Ok(())
+    }
+
+    #[test]
+    fn read_dir_bounded_stops_at_limit_and_reports_truncation() -> HostResult<()> {
+        let dir = tempfile::tempdir().map_err(|err| HostError::from_io(err, None))?;
+        let host = NativeHost::new()?;
+        for i in 0..5 {
+            host.write(
+                &dir.path().join(format!("file_{i}.txt")),
+                b"x",
+                WriteMode::CreateNew,
+            )?;
+        }
+
+        let (zero, trunc_zero) = host.read_dir_bounded(dir.path(), 0)?;
+        assert!(zero.is_empty());
+        assert!(trunc_zero);
+
+        let (subset, trunc_sub) = host.read_dir_bounded(dir.path(), 3)?;
+        assert_eq!(subset.len(), 3);
+        assert!(trunc_sub);
+
+        let (exact, trunc_exact) = host.read_dir_bounded(dir.path(), 5)?;
+        assert_eq!(exact.len(), 5);
+        assert!(!trunc_exact);
+
+        let (more, trunc_more) = host.read_dir_bounded(dir.path(), 10)?;
+        assert_eq!(more.len(), 5);
+        assert!(!trunc_more);
         Ok(())
     }
 }

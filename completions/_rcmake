@@ -15,24 +15,272 @@ _rcmake_generators() {
   _describe -t generators 'generator' generators
 }
 
+_rcmake_cpack_generators() {
+  local -a generators
+  generators=(
+    'TGZ:Tar GZip compression'
+    'TXZ:Tar XZ compression'
+    'TZST:Tar Zstandard compression'
+    'TBZ2:Tar BZip2 compression'
+    'TZ:Tar Compress compression'
+    'TAR:Tar without compression'
+    'STGZ:Self extracting Tar GZip archive'
+    'ZIP:ZIP archive with default compression'
+    'ZIP_DEFLATE:ZIP archive with Deflate compression'
+    'ZIP_STORE:ZIP archive without compression'
+    'ZIP_BZ2:ZIP archive with BZip2 compression'
+    'ZIP_LZMA:ZIP archive with LZMA compression'
+    'ZIP_LZMA2:ZIP archive with LZMA2 compression'
+    'ZIP_ZSTD:ZIP archive with Zstandard compression'
+    '7Z:7-Zip archive with default compression'
+    '7Z_STORE:7-Zip archive without compression'
+    '7Z_DEFLATE:7-Zip archive with Deflate compression'
+    '7Z_BZ2:7-Zip archive with BZip2 compression'
+    '7Z_LZMA:7-Zip archive with LZMA compression'
+    '7Z_LZMA2:7-Zip archive with LZMA2 compression'
+    '7Z_ZSTD:7-Zip archive with Zstandard compression'
+    '7Z_PPMD:7-Zip archive with PPMd compression'
+    'DEB:Debian packages'
+    'RPM:RPM packages'
+    'External:CPack External packages'
+    'Bundle:macOS application bundle'
+    'DragNDrop:macOS disk image'
+    'productbuild:macOS installer package'
+    'NSIS:Nullsoft Installer'
+    'NSIS64:Nullsoft Installer (64-bit)'
+    'WIX:Windows MSI via WiX v3 or v4'
+    'IFW:Qt Installer Framework'
+  )
+  _describe -t generators 'cpack generator' generators
+}
+
 _rcmake_configs() {
   local -a configs
   configs=(Debug Release RelWithDebInfo MinSizeRel)
   _describe -t configs 'configuration' configs
 }
 
+_rcmake_langs() {
+  local -a langs
+  langs=(C CXX CUDA HIP Fortran OBJC OBJCXX Swift ASM)
+  _describe -t langs 'language' langs
+}
+
 _rcmake_explain() {
   _arguments -s -S \
     '-B+[Read CMakeCache.txt from this build directory]:build directory:_directories' \
-    '(--var)--target[Look up a target or alias]' \
-    '(--target --config --filter)--var[Look up a variable]' \
-    '(--var)--config=[Select a target configuration]:configuration:_rcmake_configs' \
-    '(--var)--filter=[Select an exact target value or compiler flag]:value:' \
+    '--target=[Look up a target or alias (or consumer target in eval mode)]::target:' \
+    '--var[Look up a variable]' \
+    '--config=[Select a target configuration]:configuration:_rcmake_configs' \
+    '--filter=[Select an exact target value or compiler flag]:value:' \
+    '--flag=[Show where a compile or link flag comes from]:flag:' \
+    '--define=[Show where a preprocessor definition comes from]:define:' \
+    '--include=[Show where an include directory comes from]:directory:_directories' \
+    '--dep=[Show link and order-only dependency paths to target]:target:' \
+    '--find=[Explain how find_package searched for a package]:package:' \
+    '--call=[Show only the Nth find_package call]:call number:' \
+    '--all-candidates[Show every tested path in find_package]' \
+    '--fresh[Re-evaluate find_package instead of reading saved trace]' \
+    '--eval=[Evaluate a generator expression]:expression:' \
+    '--eval-property=[Evaluate a property owned by the target]:property:' \
+    '--lang=[Set $<COMPILE_LANGUAGE>]:language:_rcmake_langs' \
+    '--link-lang=[Set $<LINK_LANGUAGE>]:language:_rcmake_langs' \
+    '--directory=[Look up target names from this source directory]:directory:_directories' \
+    '--link[Follow $<LINK_ONLY:...> usage]' \
+    '--command-config=[Set $<COMMAND_CONFIG>]:configuration:_rcmake_configs' \
+    '--output-config=[Set $<OUTPUT_CONFIG>]:configuration:_rcmake_configs' \
+    '--no-steps[Show only the final evaluated result]' \
     '--json[Write one JSON report to standard output]' \
     '--verbose[Show full values and call stacks]' \
     '--color=[Set terminal color]:mode:(auto always never)' \
     '(-h --help)'{-h,--help}'[Show explain help]' \
-    '1:target or variable name:'
+    '1:target, variable, or why-not:((why-not\:"Explain why find_package failed for a package"))' \
+    '2:package name:'
+}
+
+_rcmake_diff_config() {
+  _arguments -s -S \
+    '*--preset=[Use binary directory of a configure preset]:preset:' \
+    '-S+[Read presets from this source directory]:source directory:_directories' \
+    '--config=[Compare configurations (a or a:b)]:configuration:_rcmake_configs' \
+    '*--target=[Compare only this target]:target:' \
+    '--only=[Compare only these comma-separated sections]:sections:_values -s , section targets compile link toolchain packages cache' \
+    '--cache=[Cache entries to compare]:set:(key all none)' \
+    '--no-normalize[Keep absolute paths without root normalization]' \
+    '--prepare[Create File API query files in each directory and exit]' \
+    '--json[Write one JSON report to standard output]' \
+    '--color=[Set terminal color]:mode:(auto always never)' \
+    '(-h --help)'{-h,--help}'[Show diff-config help]' \
+    '*:build directory:_directories'
+}
+
+_rcmake_fmt() {
+  _arguments -s -S \
+    '--check[Report files that would change without writing]' \
+    '--diff[Print unified diffs without writing]' \
+    '--stdin[Read from standard input and write formatted bytes to standard output]' \
+    '--stdin-filepath=[Resolve .rcmake.toml using this path for --stdin]:file:_files' \
+    '(-h --help)'{-h,--help}'[Show fmt help]' \
+    '*:path:_files'
+}
+
+_rcmake_lint() {
+  _arguments -s -S \
+    '--sarif[Emit SARIF 2.1.0 JSON to standard output]' \
+    '--list-rules[List all built-in lint rules and default severities]' \
+    '--deny-warnings[Exit with status 1 on warning findings]' \
+    '(-h --help)'{-h,--help}'[Show lint help]' \
+    '*:path:_files'
+}
+
+_rcmake_verify() {
+  _arguments -s -S \
+    '--oracle=[Path to the reference CMake 4.5.1 executable]:cmake executable:_files' \
+    '--timeout=[Overall wall-clock timeout in seconds]:seconds:' \
+    '--json[Write one JSON report to standard output]' \
+    '(-h --help)'{-h,--help}'[Show verify help]' \
+    '*::configure arguments:_files'
+}
+
+_rcmake_doctor() {
+  _arguments -s -S \
+    '-B+[Inspect build directory drift]:build directory:_directories' \
+    '(-h --help)'{-h,--help}'[Show doctor help]'
+}
+
+_rcmake_cache() {
+  if (( CURRENT == 2 )); then
+    local -a actions
+    actions=(
+      'status:Show cache size and entry counts (default)'
+      'dir:Print the probe cache directory'
+      'clear:Remove cache entries, blobs, and staged candidates'
+      'export:Write valid probe entries to a portable archive'
+      'import:Read probe entries from a portable archive'
+    )
+    _arguments -s -S \
+      '(-h --help)'{-h,--help}'[Show cache help]' \
+      '1:action:->action'
+    if [[ "$state" == action ]]; then
+      _describe -t actions 'cache action' actions
+    fi
+    return
+  fi
+  case "${words[2]}" in
+    export)
+      _arguments -s -S \
+        '(-h --help)'{-h,--help}'[Show export help]' \
+        '1:archive file:_files'
+      ;;
+    import)
+      _arguments -s -S \
+        '--sha256=[Expected 64-hex-digit SHA-256 digest for trusted import]:sha256:' \
+        '(-h --help)'{-h,--help}'[Show import help]' \
+        '1:archive file:_files'
+      ;;
+    *)
+      _arguments -s -S '(-h --help)'{-h,--help}'[Show help]'
+      ;;
+  esac
+}
+
+_rcmake_ccmake() {
+  local -a warning_categories
+  warning_categories=(
+    dev author deprecated policy strict experimental
+    non-target-directive install-absolute-destination uninitialized unused-cli
+  )
+  _arguments -s -S \
+    '-S+[Specify source directory]:source directory:_directories' \
+    '-B+[Specify build directory]:build directory:_directories' \
+    '-C+[Pre-load a script to populate the cache]:script file:_files' \
+    '*-D+[Create or update a CMake cache entry]:VAR[:TYPE]=VALUE:' \
+    '*-U+[Remove matching entries from CMake cache]:globbing expression:' \
+    '-G+[Specify a build system generator]:generator:_rcmake_generators' \
+    '-T+[Specify generator toolset]:toolset:' \
+    '-A+[Specify generator platform]:platform:' \
+    '--toolchain=[Specify toolchain file]:file:_files' \
+    '--install-prefix=[Specify CMAKE_INSTALL_PREFIX]:directory:_directories' \
+    '--project-file=[Specify alternate project file name]:file:_files' \
+    '*-W+[Enable warning category]:category:('"${warning_categories[*]}"')' \
+    '*-Wno-[Suppress warning category]:category:('"${warning_categories[*]}"')' \
+    '*-Werror=[Make warning category an error]:category:('"${warning_categories[*]}"')' \
+    '*-Wno-error=[Make warning category not an error]:category:('"${warning_categories[*]}"')' \
+    '(-h -H --help)'{-h,-H,--help}'[Print usage information and exit]' \
+    '--version=[Print version information and exit]::format:(json-v1)' \
+    '*:path:_directories'
+}
+
+_rcmake_ctest() {
+  _arguments -s -S \
+    '--test-dir=[Directory in which to look for tests]:directory:_directories' \
+    '-C+[Choose configuration to test]:configuration:_rcmake_configs' \
+    '-R+[Run tests matching regular expression]:regex:' \
+    '-E+[Exclude tests matching regular expression]:regex:' \
+    '-L+[Run tests with labels matching regular expression]:regex:' \
+    '-LE+[Exclude tests with labels matching regular expression]:regex:' \
+    '-I+[Run specific tests by index range]:range:' \
+    '(-U --union)'{-U,--union}'[Take the union of -I and -R]' \
+    '-FA+[Exclude fixtures matching regex]:regex:' \
+    '-FS+[Exclude fixture setup matching regex]:regex:' \
+    '-FC+[Exclude fixture cleanup matching regex]:regex:' \
+    '(-j --parallel)'{-j+,--parallel=}'[Run tests in parallel]::jobs:' \
+    '--output-on-failure[Output anything printed by failed tests]' \
+    '--output-junit=[Write test results to JUnit XML]:file:_files' \
+    '--preset=[Specify a test preset]:preset:' \
+    '--presets-file=[Specify path to a presets file]:file:_files' \
+    '--list-presets=[List test presets]::mode:(defined)' \
+    '--rerun-failed[Run only tests that failed previously]' \
+    '--stop-on-failure[Stop running tests after first failure]' \
+    '--tests-from-file=[Run tests listed in file]:file:_files' \
+    '--exclude-from-file=[Exclude tests listed in file]:file:_files' \
+    '--repeat=[Repeat tests]:mode:n:' \
+    '--schedule-random[Use a random order for scheduling tests]' \
+    '--test-load=[Avoid starting tests when system load exceeds value]:load:' \
+    '--stop-time=[Set time at which all tests should stop]:time:' \
+    '--timeout=[Default test timeout in seconds]:seconds:' \
+    '-N[Disable actual execution of tests]' \
+    '--show-only=[Disable execution and show tests]::format:(human json-v1 json-v1-raw)' \
+    '--out-of-date[Run only tests whose executables changed]' \
+    '--print-labels[Print all available test labels]' \
+    '-O+[Output log to file]:file:_files' \
+    '-T+[Set CTest action]:action:' \
+    '-S+[Run a CTest dashboard script]:script:_files' \
+    '-V[Enable verbose output]' \
+    '-VV[Enable extra verbose output]' \
+    '-Q[Make CTest quiet]' \
+    '--progress[Enable short progress output]' \
+    '--version=[Print version information and exit]::format:(json-v1)' \
+    '(-h --help)'{-h,--help}'[Print CTest usage]'
+}
+
+_rcmake_cpack() {
+  _arguments -s -S \
+    '-G+[Override CPACK_GENERATOR]:generator:_rcmake_cpack_generators' \
+    '-C+[Select build configurations]:configuration:_rcmake_configs' \
+    '*-D+[Set a CPack variable]:VAR=VALUE:' \
+    '--config=[Select the CPack config file]:file:_files' \
+    '-P+[Set the package name]:name:' \
+    '-R+[Set the package version]:version:' \
+    '-B+[Set the package output directory]:directory:_directories' \
+    '--vendor=[Set the package vendor]:vendor:' \
+    '--preset=[Use a package preset]:preset:' \
+    '--presets-file=[Select a presets file]:file:_files' \
+    '--list-presets=[List package presets]::mode:(defined)' \
+    '(-V --verbose)'{-V,--verbose}'[Enable verbose output]' \
+    '--debug[Enable debug output]' \
+    '--trace[Trace CMake scripts]' \
+    '--trace-expand[Trace CMake scripts with variable expansion]' \
+    '--version=[Print version information and exit]::format:(json-v1)' \
+    '(-h --help)'{-h,--help}'[Print CPack usage]'
+}
+
+_rcmake_lsp() {
+  _arguments -s -S \
+    '--stdio[Communicate over standard input and standard output]' \
+    '--clientProcessId=[Parent client process identifier]:pid:' \
+    '(-h --help)'{-h,--help}'[Print language server help]' \
+    '(-V --version)'{-V,--version}'[Print language server version]'
 }
 
 _rcmake_build() {
@@ -126,6 +374,66 @@ _rcmake() {
         _rcmake_explain
         return
         ;;
+      diff-config)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_diff_config
+        return
+        ;;
+      fmt)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_fmt
+        return
+        ;;
+      lint)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_lint
+        return
+        ;;
+      verify)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_verify
+        return
+        ;;
+      doctor)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_doctor
+        return
+        ;;
+      cache)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_cache
+        return
+        ;;
+      ccmake)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_ccmake
+        return
+        ;;
+      ctest)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_ctest
+        return
+        ;;
+      cpack)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_cpack
+        return
+        ;;
+      lsp)
+        shift words
+        (( CURRENT-- ))
+        _rcmake_lsp
+        return
+        ;;
       --build)
         shift words
         (( CURRENT-- ))
@@ -142,6 +450,10 @@ _rcmake() {
         shift words
         (( CURRENT-- ))
         _rcmake_workflow
+        return
+        ;;
+      --open)
+        _directories
         return
         ;;
       -E)
@@ -163,6 +475,7 @@ _rcmake() {
     '--diagnostics=-[Select diagnostic format]:format:(cmake rich)' \
     '--profile=-[Write configure profile to directory]::directory:_directories' \
     '--no-probe-cache[Disable the compiler probe cache for this configure]' \
+    '--export-compile-commands[Export compile_commands.json (including per-config multi-config files)]' \
     '--fetch-lock=-[Select FetchContent lock mode]:mode:(off auto update frozen)' \
     '--hermetic=-[Check for undeclared configure inputs]::mode:(warn strict)' \
     '-S+[Specify source directory]:source directory:_directories' \
@@ -182,6 +495,7 @@ _rcmake() {
     '--fresh[Configure a fresh build tree, removing existing cache]' \
     '--build[Build a CMake-generated project binary tree]:build directory:_directories' \
     '--install[Install a CMake-generated project binary tree]:build directory:_directories' \
+    '--open[Open generated project in associated application]:build directory:_directories' \
     '--workflow[Run a workflow preset]' \
     '-E[CMake command mode]' \
     '-P+[Process script mode]:script file:_files' \
@@ -206,6 +520,9 @@ _rcmake() {
     '--debug-find[Enable debug output for find commands]' \
     '*--debug-find-pkg=[Limit debug-find to packages]:packages:' \
     '*--debug-find-var=[Limit debug-find to result variables]:variables:' \
+    '--debugger[Enable the Debug Adapter Protocol server (Unix)]' \
+    '--debugger-pipe=[Unix domain socket path for the debugger]:socket path:_files' \
+    '--debugger-dap-log=[Write DAP traffic log to file]:log file:_files' \
     '--trace[Put cmake in trace mode]' \
     '--trace-expand[Trace mode with variable expansion]' \
     '--trace-format=[Set trace output format]:format:(human json-v1)' \
@@ -245,7 +562,7 @@ _rcmake() {
     '--help-variable[Print help for one variable]:variable:' \
     '--help-variable-list[List variables with help available]::file:_files' \
     '--help-variables[Print cmake-variables manual]::file:_files' \
-    '1:subcommand or path:((explain\:"Explain target flags or variable provenance"))' \
+    '1:subcommand or path:((explain\:"Explain targets, variables, find_package, or genex" diff-config\:"Compare two configured build directories" fmt\:"Losslessly format CMake listfiles" lint\:"Run static lint rules on CMake listfiles" verify\:"Verify configure parity against CMake 4.5.1" doctor\:"Inspect tools, probe cache, and build drift" cache\:"Manage the compiler probe cache" ccmake\:"Start the interactive cache editor TUI" ctest\:"Run the bundled CTest driver" cpack\:"Run the bundled CPack driver" lsp\:"Start the CMake language server over stdio"))' \
     '*:path:_directories'
 }
 

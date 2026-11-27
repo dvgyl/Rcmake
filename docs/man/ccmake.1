@@ -1,0 +1,276 @@
+.\" SPDX-License-Identifier: MIT OR Apache-2.0
+.TH CCMAKE 1 "2026-11-27" "rcmake 0.2.0" "User Commands"
+.SH NAME
+ccmake \- interactive terminal cache editor provided by rcmake
+.SH SYNOPSIS
+.B ccmake
+.RI [ options ]
+.I path-to-source
+.br
+.B ccmake
+.RI [ options ]
+.I path-to-existing-build
+.br
+.B ccmake
+.RI [ options ]
+.B \-S
+.I path-to-source
+.B \-B
+.I path-to-build
+.br
+.B rcmake ccmake
+.RI [ options ]
+.I path-to-source
+|
+.I path-to-existing-build
+.SH DESCRIPTION
+.B ccmake
+is a clean-room Rust interactive terminal cache editor matching CMake 4.5.1
+.BR ccmake .
+It is built into the multi-call
+.B rcmake
+binary with no
+.B ncurses
+or
+.B unsafe
+code dependencies, and starts through the
+.B ccmake
+symlink or as
+.BR "rcmake ccmake" .
+.PP
+The editor runs configure and generate in two separate phases over a retained
+in-process session.
+Pressing
+.B c
+saves queued cache edits into
+.I CMakeCache.txt
+and runs configure without writing build files.
+Once a configure succeeds with no new cache entries, pressing
+.B g
+generates the build system from the retained configure session and exits.
+Diagnostics and inherited child process output streams go into a bounded
+scrollback buffer, and child standard input binds to the null device so
+configure commands never corrupt the terminal display.
+Terminal raw mode is restored on exit and on unexpected termination.
+.PP
+.B ccmake
+requires an interactive Unix terminal (macOS or Linux) of at least 65 columns
+by 6 rows.
+Windows is not yet supported in
+.BR "rcmake 0.2.0" .
+When invoked with no arguments,
+.B ccmake
+prints short usage text and exits with status 0.
+.SH OPTIONS
+.TP
+.BI \-S " path-to-source"
+Explicitly specify the source directory.
+.TP
+.BI \-B " path-to-build"
+Explicitly specify the build directory.
+.TP
+.BI \-C " initial-cache"
+Preload a script to populate the cache before configuring.
+.TP
+.BI \-D " var" "[:" type "]=" value
+Create or update a CMake cache entry.
+.TP
+.BI \-U " globbing-expr"
+Remove matching entries from the CMake cache.
+.TP
+.BI \-G " generator-name"
+Select a build system generator
+.RB ( Ninja ,
+.BR "Ninja Multi-Config" ,
+.BR "Unix Makefiles" ,
+or
+.B Xcode
+on macOS).
+.TP
+.BI \-T " toolset-name"
+Specify the generator toolset where supported.
+.TP
+.BI \-A " platform-name"
+Specify the generator platform where supported.
+.TP
+.BI \-\-toolchain " file"
+Specify a toolchain file
+.RB ( CMAKE_TOOLCHAIN_FILE ).
+.TP
+.BI \-\-install-prefix " dir"
+Specify the installation prefix
+.RB ( CMAKE_INSTALL_PREFIX ).
+.TP
+.BI \-\-project-file " name"
+Specify an alternate top-level project listfile name.
+.TP
+.BI \-W category "\fR, \fP" \-Wno- category "\fR, \fP" \-Werror= category "\fR, \fP" \-Wno-error= category
+Enable, suppress, or promote diagnostic warning categories.
+.TP
+.B \-debug
+Accepted and ignored for compatibility with upstream CMake 4.5.1.
+.TP
+.BR \-h ", " \-H ", " \-\-help ", " \-\-version [ =json-v1 ] ", " \-\-help-*
+Print usage, version information
+.RB ( "ccmake version 4.5.1"
+and
+.BR "rcmake 0.2.0" ),
+or bundled CMake 4.5.1 reference topics.
+.PP
+Matching upstream CMake 4.5.1,
+.B ccmake
+never deletes an existing
+.I CMakeCache.txt
+before starting, so
+.B \-\-fresh
+has no effect.
+.SH INTERACTIVE KEYS
+.SS Navigation
+.TP
+.BR Up ", " k ", " Ctrl-p
+Move to the previous cache entry.
+.TP
+.BR Down ", " j ", " Ctrl-n
+Move to the next cache entry.
+.TP
+.BR PageUp ", " Ctrl-u
+Move to the previous page.
+.TP
+.BR PageDown ", " Ctrl-d
+Move to the next page.
+.TP
+.BR Home ", " End
+Jump to the first or last visible entry.
+.SS Editing
+.TP
+.B Enter
+Toggle a
+.B BOOL
+entry, advance an enumerated
+.B STRINGS
+entry, or edit a text,
+.BR PATH ,
+or
+.B FILEPATH
+entry.
+While editing,
+.B Enter
+confirms the change and
+.B Esc
+cancels it.
+.TP
+.B Space
+Toggle a
+.B BOOL
+entry.
+.TP
+.B i
+Edit a non-boolean text or path entry.
+.TP
+.BR Left ", " Ctrl-b ", " Right ", " Ctrl-f
+Cycle backward or forward through values listed in the entry's
+.B STRINGS
+property.
+.TP
+.B Tab
+Complete directory and file names while editing a
+.B PATH
+or
+.B FILEPATH
+entry.
+.TP
+.B d
+Delete the selected cache entry.
+.SS Search and actions
+.TP
+.B /
+Search cache entry names and values.
+Press
+.B Enter
+to jump to the first match or
+.B Esc
+to cancel.
+.TP
+.BR n ", " N
+Jump to the next or previous search match.
+.TP
+.B t
+Toggle display of advanced cache entries.
+.TP
+.B c
+Save pending edits and run configure.
+.TP
+.B g
+Generate build files from the retained configure session and exit.
+Available only after a configure succeeds with no new cache entries.
+.TP
+.BR l ", " w
+Open the captured configure or generate output log.
+.TP
+.B h
+Open the help screen showing key bindings and the selected entry's help text.
+.TP
+.B e
+Exit the log or help screen and return to the cache list.
+.TP
+.BR q ", " Ctrl-c
+Quit without generating.
+.SH ENVIRONMENT
+.TP
+.B RCMAKE_ORACLE_MODE
+Set to
+.B 1
+to disable native
+.B rcmake
+subcommands, including
+.BR "rcmake ccmake" .
+Invoking through the
+.B ccmake
+symlink always runs in compatibility mode.
+.TP
+.B RCMAKE_VENDORED_DATA_ROOT
+Override the directory containing bundled CMake 4.5.1
+.IR Modules/ ,
+.IR Templates/ ,
+and
+.I Help/
+files.
+.TP
+.B CMAKE_GENERATOR
+Default build system generator when
+.B \-G
+is omitted.
+.SH EXIT STATUS
+.TP
+.B 0
+The user exited normally, generation completed, or usage, version, or help
+output succeeded.
+.TP
+.B 1
+Standard output is not an interactive terminal, the terminal is smaller than 65
+columns by 6 rows, the platform does not support the TUI, or loading the cache
+failed.
+.SH FILES
+.TP
+.I CMakeCache.txt
+Cache file loaded on startup and updated when configuring.
+.TP
+.I CMakeLists.txt
+Top-level project listfile configured by the session.
+.SH EXAMPLES
+Configure an existing build directory interactively.
+.PP
+.EX
+ccmake -B build
+.EE
+.PP
+Start an out-of-source Ninja configure from a source tree.
+.PP
+.EX
+ccmake -S . -B build -G Ninja
+.EE
+.SH SEE ALSO
+.BR rcmake (1),
+.BR cmake (1),
+.BR ctest (1),
+.BR cpack (1)

@@ -17,17 +17,22 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rcmake_host::HostError;
-use rcmake_json::{FieldError, Value, deny_unknown, object, req, req_value, write_compact};
+use rcmake_json::{
+    FieldError, FromJson, Value, deny_unknown, object, req, req_value, write_compact,
+};
 
 use crate::remote::{CacheEntryKind, CacheManifest, ManifestEntry, RemoteError};
 use crate::remote::{decode_blob, decode_entry, read_frame};
 use crate::{
     CacheRead, Digest, Domain, Entry, LockedStore, Store, VerifyOutcome, blob_limit, frame, io_at,
-    shard,
+    path_from_json, shard,
 };
 
 const IMPORT_WAIT: Duration = Duration::from_secs(10);
 const PROBE_BLOB_BYTES: usize = 16 * 1024 * 1024;
+/// Most journal checks of one probe record. `MAX_OBSERVATIONS` in `rcmake-commands`
+/// has the same value, and a parity test there keeps both checks in agreement.
+const MAX_PROBE_CHECKS: usize = 16_384;
 const BLOCK: u64 = 512;
 /// Candidates that no live entry used within this time are removed by collection.
 pub(crate) const CANDIDATE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -52,6 +57,12 @@ pub struct ArchiveLimits {
     pub members: usize,
     /// Maximum combined decoded size of all blobs.
     pub decoded_bytes: u64,
+    /// Maximum combined decoded size of all entry frames, as their headers declare it.
+    ///
+    /// A decoded entry holds the input trace that an import keeps until it publishes
+    /// the entry. Export and import charge each entry against this one aggregate
+    /// budget before they decompress it.
+    pub entry_decoded_bytes: u64,
 }
 
 impl ArchiveLimits {
@@ -66,6 +77,7 @@ impl ArchiveLimits {
             total_bytes: 256 * MIB,
             members: 65_536,
             decoded_bytes: 1024 * MIB,
+            entry_decoded_bytes: 512 * MIB,
         }
     };
 
@@ -82,6 +94,48 @@ impl ArchiveLimits {
 impl Default for ArchiveLimits {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+/// Aggregate budget of decoded entry bytes for one export or import.
+///
+/// The budget reads the decoded size from the entry frame header, so a caller
+/// charges an entry before it decompresses the entry.
+#[derive(Clone, Copy, Debug)]
+pub struct EntryBudget {
+    left: u64,
+}
+
+impl EntryBudget {
+    /// Start a budget of [`ArchiveLimits::entry_decoded_bytes`].
+    #[must_use]
+    pub const fn new(limits: &ArchiveLimits) -> Self {
+        Self {
+            left: limits.entry_decoded_bytes,
+        }
+    }
+
+    /// Return the decoded size that an entry frame declares, or `None` for a frame
+    /// without a valid entry header.
+    #[must_use]
+    pub fn declared(frame: &[u8]) -> Option<u64> {
+        frame::payload_len(frame::ENTRY_MAGIC, frame).map(|len| len as u64)
+    }
+
+    /// Charge the declared decoded size of `frame`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImportError::Invalid`] for a frame without a valid entry header,
+    /// or when the charge exceeds the remaining budget. A failed charge changes
+    /// nothing.
+    pub fn charge(&mut self, frame: &[u8]) -> Result<u64, ImportError> {
+        let size = Self::declared(frame).ok_or_else(|| invalid("An entry frame is invalid."))?;
+        self.left = self
+            .left
+            .checked_sub(size)
+            .ok_or_else(|| invalid("The archive entries exceed the decoded size limit."))?;
+        Ok(size)
     }
 }
 
@@ -223,12 +277,15 @@ fn frame_error(path: &Path) -> impl FnOnce(RemoteError) -> HostError + '_ {
     }
 }
 
-/// Check the probe payload fields that the store relies on.
+/// Check the complete persisted probe payload schema.
 ///
-/// A probe payload is `{"outcome": {...}, "checks": ...}`. Only a compiled
-/// outcome can name an artifact, and its blob is then the only blob of the
-/// entry. An outcome without an artifact has no blobs. `rcmake-commands` owns
-/// the full typed schema and tests that its records pass this check.
+/// A probe payload is `{"outcome": {...}, "checks": [...]}`. The check follows
+/// the typed records of `rcmake-commands` field by field: the outcome fields, the
+/// diagnostics, the artifact reference, and each journal check with its digest.
+/// The `output`, `message`, and `relative_path` templates must be present. Only a
+/// compiled outcome can name an artifact, and its blob is then the only blob of
+/// the entry. An outcome without an artifact has no blobs. A parity test in
+/// `rcmake-commands` keeps this check in agreement with the typed records.
 pub fn probe_payload_valid(entry: &Entry<Value>) -> bool {
     probe_artifact(entry).is_ok_and(|artifact| match artifact {
         Some(blob) => entry.blobs.as_slice() == [blob],
@@ -240,7 +297,7 @@ pub fn probe_payload_valid(entry: &Entry<Value>) -> bool {
 fn probe_artifact(entry: &Entry<Value>) -> Result<Option<Digest>, FieldError> {
     let payload = object(&entry.payload)?;
     deny_unknown(payload, &["outcome", "checks"])?;
-    req_value(payload, "checks")?;
+    probe_checks(req_value(payload, "checks")?)?;
     let outcome = object(req_value(payload, "outcome")?)?;
     deny_unknown(
         outcome,
@@ -256,8 +313,18 @@ fn probe_artifact(entry: &Entry<Value>) -> Result<Option<Digest>, FieldError> {
     req::<u32>(outcome, "max_start_depth")?;
     req::<i32>(outcome, "exit_code")?;
     req_value(outcome, "output")?;
-    if !matches!(req_value(outcome, "diagnostics")?, Value::Array(_)) {
-        return Err(FieldError::invalid("diagnostics must be an array"));
+    for diagnostic in rcmake_json::array(req_value(outcome, "diagnostics")?)? {
+        let diagnostic = object(diagnostic)?;
+        deny_unknown(diagnostic, &["stream", "message"])?;
+        match rcmake_json::str(req_value(diagnostic, "stream")?)? {
+            "Stdout" | "Stderr" => {}
+            other => {
+                return Err(FieldError::invalid(format!(
+                    "unknown diagnostic stream '{other}'"
+                )));
+            }
+        }
+        req_value(diagnostic, "message")?;
     }
     let compiled: bool = req(outcome, "compiled")?;
     let artifact = match req_value(outcome, "artifact")? {
@@ -278,6 +345,89 @@ fn probe_artifact(entry: &Entry<Value>) -> Result<Option<Digest>, FieldError> {
     Ok(artifact)
 }
 
+/// Return the two items of a 2-element array.
+fn pair(value: &Value) -> Result<(&Value, &Value), FieldError> {
+    match rcmake_json::array(value)? {
+        [first, second] => Ok((first, second)),
+        items => Err(FieldError::invalid(format!(
+            "expected 2-element array, found {}",
+            items.len()
+        ))),
+    }
+}
+
+/// Check the journal checks of a probe: a bounded array of `[check, digest]` pairs.
+fn probe_checks(value: &Value) -> Result<(), FieldError> {
+    let items = rcmake_json::array(value)?;
+    if items.len() > MAX_PROBE_CHECKS {
+        return Err(FieldError::invalid(format!(
+            "journal check count {} exceeds limit of {MAX_PROBE_CHECKS}",
+            items.len()
+        )));
+    }
+    for item in items {
+        let (check, digest) = pair(item)?;
+        probe_check(check)?;
+        Digest::from_json(digest)?;
+    }
+    Ok(())
+}
+
+/// Check one journal check: a unit variant name, or an object with one variant key.
+fn probe_check(value: &Value) -> Result<(), FieldError> {
+    let obj = match value {
+        Value::String(_) => {
+            return match rcmake_json::str(value)? {
+                "Environment" | "Executable" | "WorkingDirectory" | "System" => Ok(()),
+                other => Err(FieldError::invalid(format!(
+                    "unknown journal check '{other}'"
+                ))),
+            };
+        }
+        Value::Object(obj) => obj,
+        _ => return Err(FieldError::expected("string or object", value)),
+    };
+    let mut fields = obj.iter();
+    let (Some((tag, payload)), None) = (fields.next(), fields.next()) else {
+        return Err(FieldError::invalid(
+            "expected single-key journal check object",
+        ));
+    };
+    match tag.as_slice() {
+        b"Metadata" => {
+            let (path, follow) = pair(payload)?;
+            path_from_json(path)?;
+            rcmake_json::bool(follow)?;
+        }
+        b"Slice" => {
+            let (path, range) = pair(payload)?;
+            path_from_json(path)?;
+            let range = object(range)?;
+            deny_unknown(range, &["offset", "len"])?;
+            req::<u64>(range, "offset")?;
+            req::<Option<u64>>(range, "len")?;
+        }
+        b"Chunks"
+        | b"DirectoryOrder"
+        | b"OrderedDirectoryMissing"
+        | b"FollowMissing"
+        | b"Link"
+        | b"Canonical" => {
+            path_from_json(payload)?;
+        }
+        b"Request" => {
+            u32::from_json(payload)?;
+        }
+        other => {
+            return Err(FieldError::invalid(format!(
+                "unknown journal check '{}'",
+                String::from_utf8_lossy(other)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// One checked archive entry.
 struct Checked<'a> {
     pin: ManifestEntry,
@@ -296,6 +446,7 @@ struct ExportBudget<'a> {
     manifest: u64,
     members: usize,
     decoded: u64,
+    entries: EntryBudget,
 }
 
 impl<'a> ExportBudget<'a> {
@@ -310,11 +461,20 @@ impl<'a> ExportBudget<'a> {
             manifest: empty,
             members: 1,
             decoded: 0,
+            entries: EntryBudget::new(limits),
         }
     }
 
     /// Add one entry with its new blobs. Return `false` and change nothing if it does not fit.
-    fn admit(&mut self, pin: &ManifestEntry, entry: u64, blobs: &[u64], decoded: u64) -> bool {
+    ///
+    /// `frame` is the entry frame. Its declared decoded size counts against the
+    /// entry budget that import applies.
+    fn admit(&mut self, pin: &ManifestEntry, frame: &[u8], blobs: &[u64], decoded: u64) -> bool {
+        let entry = frame.len() as u64;
+        let mut entries = self.entries;
+        if entries.charge(frame).is_err() {
+            return false;
+        }
         // Each record after the first adds one comma to the manifest array.
         let record = write_compact(&rcmake_json::ToJson::to_json(pin)).len() as u64
             + u64::from(self.members > 1);
@@ -340,6 +500,7 @@ impl<'a> ExportBudget<'a> {
         if fits {
             (self.tar, self.data, self.manifest) = (tar, data, manifest);
             (self.members, self.decoded) = (members, decoded_total);
+            self.entries = entries;
         }
         fits
     }
@@ -378,6 +539,11 @@ impl Store<'_> {
                     continue;
                 }
             };
+            // Check the declared decoded size before the decompression.
+            if EntryBudget::new(limits).charge(&encoded).is_err() {
+                export.skipped.over_budget += 1;
+                continue;
+            }
             let Ok(entry) = decode_entry::<Value>(CacheEntryKind::Probe, key, &encoded, Some(&pin))
             else {
                 export.skipped.invalid += 1;
@@ -426,7 +592,7 @@ impl Store<'_> {
                 .map(|(_, frame, _)| frame.len() as u64)
                 .collect();
             if entry_decoded > PROBE_BLOB_BYTES
-                || !budget.admit(&pin, encoded.len() as u64, &sizes, new_decoded)
+                || !budget.admit(&pin, &encoded, &sizes, new_decoded)
                 || export.manifest.insert(pin).is_err()
             {
                 export.skipped.over_budget += 1;
@@ -766,6 +932,12 @@ fn check_bundle<'a>(
             .any(|frame| frame.len() as u64 > limits.member_bytes)
     {
         return Err(invalid("The archive members exceed the size limits."));
+    }
+    // Charge every entry before the first decompression, so that the decoded
+    // entries and the traces that the import keeps stay inside one budget.
+    let mut entry_budget = EntryBudget::new(limits);
+    for frame in bundle.entries.values() {
+        entry_budget.charge(frame)?;
     }
     let mut sizes = BTreeMap::new();
     let mut decoded = 0u64;

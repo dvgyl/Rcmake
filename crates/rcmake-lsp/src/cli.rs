@@ -24,12 +24,29 @@ pub enum Startup {
 #[must_use]
 pub fn startup(program: &str, args: &[impl AsRef<[u8]>]) -> Startup {
     let mut startup = Startup::Serve;
-    for arg in args {
+    let mut index = 0usize;
+    while let Some(arg) = args.get(index) {
         let arg = arg.as_ref();
+        index += 1;
         let text: fn(&str) -> String = match arg {
             b"-h" | b"--help" => help_text,
             b"-V" | b"--version" => |_| version_text(),
             b"--stdio" => continue,
+            b"--clientProcessId" => {
+                let Some(pid) = args.get(index).map(AsRef::as_ref) else {
+                    return Startup::InvalidArgument(format!(
+                        "{program}: Expected a numeric process ID after --clientProcessId. Run {program} --help.\n"
+                    ));
+                };
+                if pid.is_empty() || !pid.iter().all(u8::is_ascii_digit) {
+                    return Startup::InvalidArgument(format!(
+                        "{program}: Invalid --clientProcessId value {}. Run {program} --help.\n",
+                        String::from_utf8_lossy(pid)
+                    ));
+                }
+                index += 1;
+                continue;
+            }
             _ if arg
                 .strip_prefix(b"--clientProcessId=")
                 .is_some_and(|pid| !pid.is_empty() && pid.iter().all(u8::is_ascii_digit)) =>
@@ -55,13 +72,15 @@ pub fn startup(program: &str, args: &[impl AsRef<[u8]>]) -> Startup {
 
 fn help_text(program: &str) -> String {
     format!(
-        "Usage: {program} [--help | --version]\n\
+        "Usage: {program} [--stdio] [--clientProcessId <pid>] [--help | --version]\n\
 \n\
 Run the CMake language server. An editor starts this program.\n\
 The server reads LSP messages on standard input and writes replies on standard output.\n\
 \n\
-  -h, --help     Print this help and exit.\n\
-  -V, --version  Print the version and exit.\n\
+  --stdio                       Communicate over standard input and output (default).\n\
+  --clientProcessId <pid>       Accept editor client process ID (also --clientProcessId=<pid>).\n\
+  -h, --help                    Print this help and exit.\n\
+  -V, --version                 Print the version and exit.\n\
 \n\
 Editor setup: https://github.com/rcmake/rcmake/blob/main/crates/rcmake-lsp/README.md\n"
     )
@@ -91,7 +110,11 @@ mod tests {
                 panic!("expected Exit for {flag}");
             };
             assert_eq!(code, 0);
-            assert!(stdout.starts_with("Usage: rcmake-lsp [--help | --version]\n"));
+            assert!(stdout.starts_with(
+                "Usage: rcmake-lsp [--stdio] [--clientProcessId <pid>] [--help | --version]\n"
+            ));
+            assert!(stdout.contains("--stdio"));
+            assert!(stdout.contains("--clientProcessId"));
             assert!(stdout.contains("--help"));
             assert!(stdout.contains("--version"));
         }
@@ -121,5 +144,21 @@ mod tests {
             startup("rcmake-lsp", &["--stdio", "--clientProcessId=12"]),
             Startup::Serve
         );
+        assert_eq!(
+            startup("rcmake-lsp", &["--stdio", "--clientProcessId", "42"]),
+            Startup::Serve
+        );
+        assert!(matches!(
+            startup("rcmake-lsp", &["--clientProcessId"]),
+            Startup::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            startup("rcmake-lsp", &["--clientProcessId", "abc"]),
+            Startup::InvalidArgument(_)
+        ));
+        assert!(matches!(
+            startup("rcmake-lsp", &["--clientProcessId="]),
+            Startup::InvalidArgument(_)
+        ));
     }
 }

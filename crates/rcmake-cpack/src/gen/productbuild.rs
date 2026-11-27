@@ -10,7 +10,7 @@ use rcmake_host::{CopyOptions, FileKind, Follow, Host, WriteMode};
 
 use super::ScratchDir;
 use super::installer::{
-    BUILD_TIMEOUT, ComponentCatalog, ComponentMeta, GroupMeta, XmlWriter, check_tool_outcome,
+    ComponentCatalog, ComponentMeta, GroupMeta, XmlWriter, build_tool_timeout, check_tool_outcome,
     checked_tree_size_bytes, copy_component_payload, copy_monolithic_payload, encode_url_path,
     escape_js_single_quoted, escape_xml_attr, escape_xml_text, find_program_on_host, find_template,
     option_set, prepare_fresh_output, read_template, render_at_template, require_utf8,
@@ -373,7 +373,7 @@ impl ProductBuild {
             cx.output_dir,
             &settings.productbuild,
             &args,
-            BUILD_TIMEOUT,
+            build_tool_timeout(host),
         )?;
         if !matches!(outcome.status, rcmake_host::ProcessResult::Exited(0)) {
             write_tool_log(
@@ -574,7 +574,13 @@ fn build_component_pkg(
         args.extend(["--component-plist".into(), from_native(plist)]);
     }
 
-    let outcome = run_installer_tool(host, output_dir, &settings.pkgbuild, &args, BUILD_TIMEOUT)?;
+    let outcome = run_installer_tool(
+        host,
+        output_dir,
+        &settings.pkgbuild,
+        &args,
+        build_tool_timeout(host),
+    )?;
     if !matches!(outcome.status, rcmake_host::ProcessResult::Exited(0)) {
         write_tool_log(
             host,

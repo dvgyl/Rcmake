@@ -394,6 +394,18 @@ pub trait Host: Send + Sync {
     /// List entries of an absolute directory path (order unspecified; callers sort bytewise).
     fn read_dir(&self, p: &Path) -> HostResult<Vec<DirEntry>>;
 
+    /// List up to `limit` entries of an absolute directory path, returning `(entries, truncated)`.
+    ///
+    /// When the directory contains more than `limit` entries, `truncated` is `true` and
+    /// `entries.len() == limit`. Native hosts override this to stop reading without
+    /// allocating the full directory listing.
+    fn read_dir_bounded(&self, p: &Path, limit: usize) -> HostResult<(Vec<DirEntry>, bool)> {
+        let mut entries = self.read_dir(p)?;
+        let truncated = entries.len() > limit;
+        entries.truncate(limit);
+        Ok((entries, truncated))
+    }
+
     /// Recursively create directory `p` and missing parents.
     fn create_dir_all(&self, p: &Path) -> HostResult<()>;
 

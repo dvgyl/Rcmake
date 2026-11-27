@@ -127,7 +127,7 @@ pub(super) fn run(argv0: Option<&BString>, options: &EvalOptions, host: &Arc<dyn
         link: options.link,
         command_config: options.command_config.clone(),
         output_config: options.output_config.clone(),
-        step_limit: if options.no_steps { 1 } else { 1024 },
+        step_limit: if options.no_steps { 0 } else { 1024 },
         module_root: super::module_root(host.as_ref(), argv0),
     };
     let report = match result.evaluate_genex(&eval) {

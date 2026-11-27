@@ -570,7 +570,10 @@ fn validate_dir_walk(
             current.display()
         )));
     }
-    let mut entries = host.read_dir(current)?;
+    let (mut entries, truncated) = host.read_dir_bounded(current, *remaining)?;
+    if truncated {
+        return Err(error("CPack staging file count exceeds the limit"));
+    }
     entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     for entry in entries {
         *remaining = remaining
@@ -980,7 +983,10 @@ fn copy_tree(
             )));
         }
     }
-    let mut entries = host.read_dir(source)?;
+    let (mut entries, truncated) = host.read_dir_bounded(source, *remaining)?;
+    if truncated {
+        return Err(error("CPack source file count exceeds the limit"));
+    }
     entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     for entry in entries {
         *remaining = remaining

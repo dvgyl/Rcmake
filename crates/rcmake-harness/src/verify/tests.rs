@@ -951,13 +951,14 @@ fn receiver_rejects_injected_raw_options_escaping_cwd_and_preset_redirects() {
     assert_eq!(cp, 2);
     assert!(errp.contains("--project-file"), "{errp}");
 
-    // Direct caller cannot bypass preset redirect rejection (`graphviz` / `trace.redirect`).
+    // Direct caller cannot bypass preset redirect rejection (`graphviz` / `trace.redirect`)
+    // or unresolved presets when resolved via production `rcmake-presets`.
     let env_pr = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
     env_pr
         .host
         .seed_file(
             Path::new("/proj/CMakePresets.json"),
-            br#"{"version":6,"configurePresets":[{"name":"bad","graphviz":"/tmp/g.dot"}]}"#,
+            br#"{"version":10,"configurePresets":[{"name":"base","hidden":true,"graphviz":"/tmp/g.dot"},{"name":"bad","inherits":"base"}]}"#,
         )
         .expect("seed presets");
     let (cpr, outpr, _) = env_pr.run_verify(
@@ -972,6 +973,46 @@ fn receiver_rejects_injected_raw_options_escaping_cwd_and_preset_redirects() {
             .as_str()
             .is_some_and(|e| e.contains("graphviz")),
         "{outpr}"
+    );
+
+    // Unresolved configure preset is rejected before either engine runs.
+    let env_missing = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    env_missing
+        .host
+        .seed_file(
+            Path::new("/proj/CMakePresets.json"),
+            br#"{"version":10,"configurePresets":[{"name":"base","hidden":true}]}"#,
+        )
+        .expect("seed presets");
+    let (c_missing, out_missing, _) = env_missing.run_verify(
+        true,
+        json!({ "args": [{ "kind": "preset", "value": "does-not-exist" }] }),
+    );
+    assert_eq!(c_missing, 2, "{out_missing}");
+    let d_missing: Value = serde_json::from_str(&out_missing).expect("json");
+    assert_eq!(d_missing["verdict"], "invalid_input");
+
+    // Inherited trace.redirect is also rejected via rcmake-presets.
+    let env_tr = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    env_tr
+        .host
+        .seed_file(
+            Path::new("/proj/CMakePresets.json"),
+            br#"{"version":7,"configurePresets":[{"name":"bad-trace","trace":{"mode":"on","redirect":"$env{HOME}/trace.log"}}]}"#,
+        )
+        .expect("seed trace preset");
+    let (ctr, outtr, _) = env_tr.run_verify(
+        true,
+        json!({ "args": [{ "kind": "preset", "value": "bad-trace" }] }),
+    );
+    assert_eq!(ctr, 2, "{outtr}");
+    let dtr: Value = serde_json::from_str(&outtr).expect("json");
+    assert_eq!(dtr["verdict"], "invalid_input");
+    assert!(
+        dtr["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("trace.redirect")),
+        "{outtr}"
     );
 }
 
@@ -1048,4 +1089,123 @@ fn rejects_wrong_oracle_version_and_recursive_oracle_and_respects_user_disabled_
     assert_eq!(cs, 0, "{outs}");
     let docs: Value = serde_json::from_str(&outs).expect("json");
     assert_eq!(docs["sections"]["compile_commands"]["status"], "skipped");
+}
+
+#[test]
+fn emits_stderr_progress_phases_keeping_json_stdout_pure_and_honors_timeout_secs() {
+    let env = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    let (code, stdout, stderr) = env.run_verify(true, json!({ "timeout_secs": 120 }));
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    // Stdout must remain pure valid JSON.
+    let doc: Value = serde_json::from_str(&stdout).expect("pure json stdout");
+    assert_eq!(doc["verdict"], "parity");
+    assert_eq!(
+        doc["engines"]["oracle"]["expected_version"],
+        rcmake_base::CMAKE_VERSION_STR
+    );
+    for phase in [
+        "staging source",
+        "running oracle configure",
+        "running rcmake configure",
+        "comparing artifacts",
+    ] {
+        assert!(
+            stderr.contains(phase),
+            "missing progress phase '{phase}' in stderr: {stderr}"
+        );
+    }
+
+    // Request timeout_secs=1 stops a 2-second configure cleanly with incomplete_evidence.
+    let slow = FakeRunSpec {
+        configure_sleep: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let env_to = FakeEnv::new(slow.clone(), slow);
+    let (code_to, out_to, _) = env_to.run_verify(true, json!({ "timeout_secs": 3 }));
+    assert_eq!(code_to, 2, "{out_to}");
+    let doc_to: Value = serde_json::from_str(&out_to).expect("json");
+    assert_eq!(doc_to["verdict"], "incomplete_evidence");
+}
+
+#[test]
+fn ninja_dep_graph_shares_multi_output_inputs_and_enforces_budget() {
+    let host = PureHost::default();
+    let outputs: String = (0..200)
+        .map(|i| format!("out_{i}.o"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let inputs: String = (0..200)
+        .map(|i| format!("in_{i}.c"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let manifest = format!("build {outputs}: CC {inputs}\n");
+    host.seed_file(Path::new("/bin/build.ninja"), manifest.as_bytes())
+        .expect("seed manifest");
+
+    let mut reader = rcmake_buildinfo::ArtifactReader::new(
+        &host,
+        Path::new("/bin"),
+        rcmake_buildinfo::ReadLimits::default(),
+    )
+    .expect("reader");
+    let mut graph = super::collect::NinjaDepGraph::default();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut budget = super::collect::NinjaGraphBudget::new(1 << 20, 100_000);
+    super::collect::scan_ninja_manifest(
+        &mut reader,
+        Path::new("build.ninja"),
+        0,
+        &mut visited,
+        &mut graph,
+        &mut budget,
+    )
+    .expect("multi-output edge should fit comfortably in non-quadratic budget");
+    // All 200 outputs share a single edge input slice instead of cloning 200x200 strings.
+    assert_eq!(graph.edge_inputs.len(), 1);
+    assert_eq!(graph.edge_inputs[0].len(), 200);
+    assert_eq!(graph.output_edges.len(), 200);
+
+    // Exhausting retained memory budget returns an error (mapped to Unavailable by caller).
+    let mut tiny_graph = super::collect::NinjaDepGraph::default();
+    let mut tiny_visited = std::collections::BTreeSet::new();
+    let mut tiny_budget = super::collect::NinjaGraphBudget::new(512, 100_000);
+    let err = super::collect::scan_ninja_manifest(
+        &mut reader,
+        Path::new("build.ninja"),
+        0,
+        &mut tiny_visited,
+        &mut tiny_graph,
+        &mut tiny_budget,
+    )
+    .expect_err("tiny memory budget must reject oversized graph");
+    assert!(err.contains("budget"), "{err}");
+}
+
+#[test]
+fn resolves_null_oracle_exe_from_env_or_reports_json_invalid_input() {
+    let missing_env = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    let (code, stdout, _) = missing_env.run_verify(true, json!({ "oracle_exe": null }));
+    assert_eq!(code, 2, "{stdout}");
+    let doc: Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(doc["verdict"], "invalid_input");
+    assert!(
+        doc["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("RCMAKE_ORACLE_CMAKE"),
+        "{doc}"
+    );
+
+    let with_env = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    with_env
+        .host
+        .env_set(b"RCMAKE_ORACLE_CMAKE", Some(b"/opt/cmake/bin/cmake"));
+    let (code, stdout, _) = with_env.run_verify(true, json!({ "oracle_exe": null }));
+    assert_eq!(code, 0, "{stdout}");
+    let doc: Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(doc["verdict"], "parity");
+    assert_eq!(
+        doc["engines"]["oracle"]["executable"],
+        "/opt/cmake/bin/cmake"
+    );
 }

@@ -13,7 +13,7 @@ $PREFIX/share/doc/rcmake, and any bundled shell completions and man page
 under $PREFIX/share. The default PREFIX is $HOME/.local.
 
 Sources (select one, the default is the latest GitHub Release):
-  --version <v>      Download GitHub Release <v>, for example v0.1.0 or 0.1.0.
+  --version <v>      Download GitHub Release <v>, for example v0.2.0 or 0.2.0.
   --from-source      Build a release archive from this checkout (needs Cargo).
   --archive <path>   Install a local .tar.gz archive. The script checks
                      <path>.sha256 if that file exists.
@@ -94,7 +94,7 @@ if [[ -n "$version" ]]; then
     exit 2
   fi
   if [[ ! "${version#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9.+-]+)?$ ]]; then
-    printf 'Invalid version %s. Use a release version such as v0.1.0.\n' "$version" >&2
+    printf 'Invalid version %s. Use a release version such as v0.2.0.\n' "$version" >&2
     exit 2
   fi
   version="${version#v}"
@@ -107,6 +107,7 @@ doc_dir="$prefix/share/doc/rcmake"
 tools=(cmake ctest cpack ccmake)
 extra_share_files=(
   "$prefix/share/man/man1/rcmake.1"
+  "$prefix/share/man/man1/ccmake.1"
   "$prefix/share/bash-completion/completions/rcmake"
   "$prefix/share/zsh/site-functions/_rcmake"
   "$prefix/share/fish/vendor_completions.d/rcmake.fish"
@@ -176,6 +177,7 @@ if "$uninstall"; then
   doc_manifest="$doc_dir/.rcmake-manifest"
   extra_share_files=(
     "$prefix/share/man/man1/rcmake.1"
+    "$prefix/share/man/man1/ccmake.1"
     "$prefix/share/bash-completion/completions/rcmake"
     "$prefix/share/zsh/site-functions/_rcmake"
     "$prefix/share/fish/vendor_completions.d/rcmake.fish"
@@ -425,6 +427,7 @@ verify_rel = Path("bin/rcmake-verify")
 binaries = (rcmake_rel, lsp_rel, verify_rel)
 extra_share_files = (
     Path("share/man/man1/rcmake.1"),
+    Path("share/man/man1/ccmake.1"),
     Path("share/bash-completion/completions/rcmake"),
     Path("share/zsh/site-functions/_rcmake"),
     Path("share/fish/vendor_completions.d/rcmake.fish"),
@@ -536,7 +539,25 @@ try:
         for required in ("Modules/CMake.cmake", "Templates/CPackConfig.cmake.in"):
             if not (work / data_dir / required).is_file():
                 raise ValueError(f"Missing {required} in the archive.")
-        (work / data_dir / data_marker).write_text("Managed by rcmake.\n", encoding="ascii")
+        marker_lines = ["Managed by rcmake."]
+        if staged_verify_is_file:
+            staged_verify_sha256 = hashlib.sha256(staged_verify.read_bytes()).hexdigest()
+            marker_lines.append(f"verify_sha256={staged_verify_sha256}")
+        (work / data_dir / data_marker).write_text(
+            "\n".join(marker_lines) + "\n", encoding="ascii"
+        )
+
+        def read_recorded_verify_sha256(marker_path: Path) -> str | None:
+            if not (marker_path.is_file() and not marker_path.is_symlink()):
+                return None
+            for raw_line in marker_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                stripped = raw_line.strip()
+                if stripped.startswith("verify_sha256="):
+                    digest = stripped.split("=", 1)[1].strip().lower()
+                    if re.fullmatch(r"[0-9a-f]{64}", digest):
+                        return digest
+            return None
+
         def version_token(lines: list[str], prefix_name: str) -> str | None:
             want = f"{prefix_name.lower()} "
             for raw_line in lines:
@@ -556,6 +577,8 @@ try:
         ).stdout.splitlines()
         staged_rcmake_ver = version_token(staged_bin_out, "rcmake")
         if staged_verify_is_file:
+            if not staged_rcmake_ver:
+                raise ValueError("Staged rcmake --version did not report a version.")
             staged_verify_out = subprocess.run(
                 [staged_verify, "--version"],
                 check=True,
@@ -566,7 +589,7 @@ try:
             staged_verify_ver = version_token(staged_verify_out, "rcmake-verify")
             if not staged_verify_ver:
                 raise ValueError("Staged rcmake-verify --version did not report a version.")
-            if staged_rcmake_ver and staged_verify_ver != staged_rcmake_ver:
+            if staged_verify_ver != staged_rcmake_ver:
                 raise ValueError(
                     f"Staged rcmake-verify version ({staged_verify_ver}) does not match rcmake version ({staged_rcmake_ver})."
                 )
@@ -693,6 +716,7 @@ try:
             os.path.lexists(bin_dir / "rcmake")
             or (installed_data / data_marker).is_file()
         )
+        prior_verify_sha256 = read_recorded_verify_sha256(installed_data / data_marker)
         installed: list[object] = []
         removed_stale_verify = False
         try:
@@ -718,9 +742,13 @@ try:
                 record_and_backup(bin_dir / "rcmake-verify")
                 staged_verify.replace(bin_dir / "rcmake-verify")
                 installed.append(bin_dir / "rcmake-verify")
-            elif had_prior_rcmake:
+            elif had_prior_rcmake and prior_verify_sha256 is not None:
                 old_verify = bin_dir / "rcmake-verify"
-                if old_verify.is_file() and not old_verify.is_symlink():
+                if (
+                    old_verify.is_file()
+                    and not old_verify.is_symlink()
+                    and hashlib.sha256(old_verify.read_bytes()).hexdigest() == prior_verify_sha256
+                ):
                     record_and_backup(old_verify)
                     removed_stale_verify = True
 
@@ -778,6 +806,8 @@ try:
                                      stdout=subprocess.PIPE, text=True).stdout.splitlines()
             installed_rcmake_ver = version_token(version, "rcmake")
             if staged_verify_is_file:
+                if not installed_rcmake_ver:
+                    raise ValueError("Installed rcmake --version did not report a version.")
                 verify_out = subprocess.run(
                     [bin_dir.resolve() / "rcmake-verify", "--version"],
                     check=True,
@@ -788,7 +818,7 @@ try:
                 installed_verify_ver = version_token(verify_out, "rcmake-verify")
                 if not installed_verify_ver:
                     raise ValueError("Installed rcmake-verify --version did not report a version.")
-                if installed_rcmake_ver and installed_verify_ver != installed_rcmake_ver:
+                if installed_verify_ver != installed_rcmake_ver:
                     raise ValueError(
                         f"Installed rcmake-verify version ({installed_verify_ver}) does not match rcmake version ({installed_rcmake_ver})."
                     )

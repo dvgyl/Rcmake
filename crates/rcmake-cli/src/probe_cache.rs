@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rcmake_archive::{PortableLimits, PortableName, read_portable, write_portable};
+use rcmake_archive::{PortableLimits, PortableName, read_portable_checked, write_portable};
 use rcmake_base::BString;
 use rcmake_eval::ProbeCacheMode;
 use rcmake_host::{
@@ -9,8 +9,8 @@ use rcmake_host::{
     discover_cmake_root, path,
 };
 use rcmake_store::{
-    ArchiveLimits, Digest, ImportError, ImportReport, ImportTrust, ProbeBundle, Store, StoreConfig,
-    StoreMode,
+    ArchiveLimits, Digest, EntryBudget, ImportError, ImportReport, ImportTrust, ProbeBundle, Store,
+    StoreConfig, StoreMode,
 };
 
 use crate::{configure::speed, options::Options, persona::Persona};
@@ -22,63 +22,95 @@ fn open(host: &dyn Host) -> HostResult<Store<'_>> {
         .filter(|value| !value.is_empty())
     {
         config.root = host.initial_cwd().join(path::to_native(&root));
-        if config.root.is_absolute() {
+        // A Windows path such as `\cache` has a root but no drive prefix. It names
+        // a directory on the current drive, so it is a fixed location too.
+        if config.root.has_root() {
             config.mode = StoreMode::ReadWrite;
         }
     }
     Store::new(host, config)
 }
 
-const CACHE_USAGE: &[u8] =
-    b"Usage: rcmake cache [status|dir|clear|export <file>|import <file> [--sha256 <hex>]]\n";
+const CACHE_USAGE: &str =
+    "Usage: rcmake cache [status|dir|clear|export <file>|import <file> [--sha256 <hex>]]\n";
+
+const CACHE_HELP: &str = "\
+Usage: rcmake cache [status|dir|clear|export <file>|import <file> [--sha256 <hex>]]
+  status  Show cache size and entry counts (default).
+  dir     Print the cache directory.
+  clear   Remove cache entries and blobs.
+  export  Write the probe entries to a portable archive.
+  import  Read probe entries from a portable archive.
+Put -- before a file name that starts with -.
+";
+
+const CACHE_ENV_HELP: &str = "\
+Set RCMAKE_CACHE_DIR to select the cache directory.
+Set RCMAKE_PROBE_CACHE_DIR to use another probe cache directory. It has priority.
+";
+
+/// Return the help text of `action`, or `None` for an unknown action.
+fn action_help(action: Option<&[u8]>) -> Option<&'static str> {
+    Some(match action {
+        None => CACHE_HELP,
+        Some(b"status") => "Usage: rcmake cache status\nShow cache size and entry counts.\n",
+        Some(b"dir") => "Usage: rcmake cache dir\nPrint the cache directory.\n",
+        Some(b"clear") => "Usage: rcmake cache clear\nRemove cache entries and blobs.\n",
+        Some(b"export") => {
+            "\
+Usage: rcmake cache export [--] <file>
+Write the probe entries and their blobs to a gzip tar archive.
+The archive contains compiler paths, arguments, and captured compiler output.
+"
+        }
+        Some(b"import") => {
+            "\
+Usage: rcmake cache import [--sha256 <hex>] [--] <file>
+Read probe entries from an archive made by rcmake cache export.
+With a matching --sha256 digest, the entries are used directly.
+Without it, the entries are kept as candidates and are not used for cache hits.
+"
+        }
+        Some(_) => return None,
+    })
+}
+
+/// Write a usage error with its reason and return exit code 2.
+fn usage_error(host: &dyn Host, command: &str, reason: &str, usage: &str) -> i32 {
+    host.write_out(
+        Stream::Stderr,
+        format!("rcmake {command}: {reason}\n{usage}").as_bytes(),
+    );
+    2
+}
+
+/// Return whether a help flag appears before the first `--`.
+fn asks_for_help(args: &[BString]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_slice() != b"--")
+        .any(|arg| is_help(arg))
+}
 
 pub(crate) fn cache(args: &[BString], host: &dyn Host) -> i32 {
-    if let [flag] | [_, flag] = args
-        && is_help(flag)
-    {
-        let help: &[u8] = match args {
-            [_] => {
-                b"Usage: rcmake cache [status|dir|clear|export <file>|import <file>]\n\
-                status  Show cache size and entry counts (default).\n\
-                dir     Print the cache directory.\n\
-                clear   Remove cache entries and blobs.\n\
-                export  Write the probe entries to a portable archive.\n\
-                import  Read probe entries from a portable archive.\n"
-            }
-            [action, _] if action == b"status" => {
-                b"Usage: rcmake cache status\nShow cache size and entry counts.\n"
-            }
-            [action, _] if action == b"dir" => {
-                b"Usage: rcmake cache dir\nPrint the cache directory.\n"
-            }
-            [action, _] if action == b"clear" => {
-                b"Usage: rcmake cache clear\nRemove cache entries and blobs.\n"
-            }
-            [action, _] if action == b"export" => {
-                b"Usage: rcmake cache export <file>\n\
-                Write the probe entries and their blobs to a gzip tar archive.\n\
-                The archive contains compiler paths, arguments, and captured compiler output.\n"
-            }
-            [action, _] if action == b"import" => {
-                b"Usage: rcmake cache import <file> [--sha256 <hex>]\n\
-                Read probe entries from an archive made by rcmake cache export.\n\
-                With a matching --sha256 digest, the entries are used directly.\n\
-                Without it, the entries are kept as candidates and are not used for cache hits.\n"
-            }
-            _ => b"",
-        };
-        if !help.is_empty() {
-            host.write_out(Stream::Stdout, help);
-            host.write_out(
-                Stream::Stdout,
-                b"Set RCMAKE_CACHE_DIR to select the cache directory.\n",
+    if asks_for_help(args) {
+        let action = args
+            .first()
+            .filter(|arg| !is_help(arg))
+            .map(|arg| arg.as_slice());
+        let Some(help) = action_help(action) else {
+            let reason = format!(
+                "Unknown action {}.",
+                String::from_utf8_lossy(action.unwrap_or_default())
             );
-            return 0;
-        }
+            return usage_error(host, "cache", &reason, CACHE_USAGE);
+        };
+        host.write_out(Stream::Stdout, help.as_bytes());
+        host.write_out(Stream::Stdout, CACHE_ENV_HELP.as_bytes());
+        return 0;
     }
-    let Some(action) = Action::parse(args) else {
-        host.write_out(Stream::Stderr, CACHE_USAGE);
-        return 2;
+    let action = match Action::parse(args) {
+        Ok(action) => action,
+        Err(reason) => return usage_error(host, "cache", &reason, CACHE_USAGE),
     };
     let result = open(host).and_then(|store| {
         let root = store.root();
@@ -134,39 +166,98 @@ enum Action<'a> {
 }
 
 impl<'a> Action<'a> {
-    fn parse(args: &'a [BString]) -> Option<Self> {
-        let operand = |value: &'a BString| (!value.is_empty()).then_some(value.as_slice());
-        match args {
-            [] => Some(Self::Status),
-            [action] if action == b"status" => Some(Self::Status),
-            [action] if action == b"dir" => Some(Self::Dir),
-            [action] if action == b"clear" => Some(Self::Clear),
-            [action, file] if action == b"export" => operand(file).map(Self::Export),
-            [action, rest @ ..] if action == b"import" => {
-                let mut file = None;
-                let mut sha256 = None;
-                let mut rest = rest.iter();
-                while let Some(arg) = rest.next() {
-                    if arg == b"--sha256" && sha256.is_none() {
-                        sha256 = Some(operand(rest.next()?)?);
-                    } else if let Some(value) = arg.strip_prefix(b"--sha256=")
-                        && sha256.is_none()
-                    {
-                        sha256 = Some(value).filter(|value| !value.is_empty());
-                        sha256?;
-                    } else if file.is_none() && !arg.starts_with(b"-") {
-                        file = operand(arg);
-                    } else {
-                        return None;
-                    }
-                }
-                Some(Self::Import {
-                    file: file?,
-                    sha256,
+    /// Parse the action and its operands. Return the reason for a usage error.
+    fn parse(args: &'a [BString]) -> Result<Self, String> {
+        let Some((action, rest)) = args.split_first() else {
+            return Ok(Self::Status);
+        };
+        let simple = |parsed: Self| {
+            if rest.is_empty() {
+                Ok(parsed)
+            } else {
+                Err(format!(
+                    "{} takes no arguments.",
+                    String::from_utf8_lossy(action)
+                ))
+            }
+        };
+        match action.as_slice() {
+            b"status" => simple(Self::Status),
+            b"dir" => simple(Self::Dir),
+            b"clear" => simple(Self::Clear),
+            b"export" => {
+                let mut parsed = Operands::default();
+                parsed.parse(rest, false)?;
+                Ok(Self::Export(
+                    parsed.file.ok_or("export needs a file name.")?,
+                ))
+            }
+            b"import" => {
+                let mut parsed = Operands::default();
+                parsed.parse(rest, true)?;
+                Ok(Self::Import {
+                    file: parsed.file.ok_or("import needs a file name.")?,
+                    sha256: parsed.sha256,
                 })
             }
-            _ => None,
+            other => Err(format!(
+                "Unknown action {}.",
+                String::from_utf8_lossy(other)
+            )),
         }
+    }
+}
+
+/// File and digest operands of `export` and `import`.
+#[derive(Default)]
+struct Operands<'a> {
+    file: Option<&'a [u8]>,
+    sha256: Option<&'a [u8]>,
+}
+
+impl<'a> Operands<'a> {
+    /// Read `args`. A value that starts with `-` is a file only after `--`, so an
+    /// option is never written as a file.
+    fn parse(&mut self, args: &'a [BString], digest: bool) -> Result<(), String> {
+        let mut args = args.iter();
+        let mut options = true;
+        while let Some(arg) = args.next() {
+            let arg = arg.as_slice();
+            if options && arg == b"--" {
+                options = false;
+                continue;
+            }
+            if options && digest && arg == b"--sha256" {
+                let value = args.next().map(|arg| arg.as_slice());
+                self.digest(value.filter(|value| !value.starts_with(b"-")))?;
+            } else if options && digest && arg.starts_with(b"--sha256=") {
+                self.digest(arg.strip_prefix(b"--sha256="))?;
+            } else if options && arg.starts_with(b"-") {
+                return Err(format!(
+                    "Unknown option {}. Put -- before a file name that starts with -.",
+                    String::from_utf8_lossy(arg)
+                ));
+            } else if arg.is_empty() {
+                return Err("The file name is empty.".into());
+            } else if self.file.is_some() {
+                return Err("Give one file name.".into());
+            } else {
+                self.file = Some(arg);
+            }
+        }
+        Ok(())
+    }
+
+    fn digest(&mut self, value: Option<&'a [u8]>) -> Result<(), String> {
+        if self.sha256.is_some() {
+            return Err("Give --sha256 once.".into());
+        }
+        self.sha256 = Some(
+            value
+                .filter(|value| !value.is_empty())
+                .ok_or("--sha256 needs a value.")?,
+        );
+        Ok(())
     }
 }
 
@@ -186,8 +277,19 @@ fn portable_limits(limits: &ArchiveLimits) -> PortableLimits {
 }
 
 /// Read an archive and collect its members into a bundle.
+///
+/// Each entry is charged against the shared decoded entry budget as soon as the
+/// reader reaches it, before any entry is decompressed.
 fn read_bundle(archive: &[u8], limits: &ArchiveLimits) -> Result<ProbeBundle, String> {
-    let members = read_portable(archive, &portable_limits(limits))
+    let mut entries = EntryBudget::new(limits);
+    let mut charge = |member: &rcmake_archive::PortableMember| match member.name {
+        PortableName::Entry(_) => entries
+            .charge(&member.data)
+            .map(drop)
+            .map_err(|error| error.to_string()),
+        _ => Ok(()),
+    };
+    let members = read_portable_checked(archive, &portable_limits(limits), &mut charge)
         .map_err(|error| format!("Invalid archive: {error} Nothing was imported."))?;
     let mut bundle = ProbeBundle::default();
     for member in members {
@@ -417,32 +519,53 @@ fn inventory(store: &Store<'_>) -> HostResult<String> {
     Ok(text)
 }
 
+const DOCTOR_USAGE: &str = "Usage: rcmake doctor [-B <build>]\n";
+
+const DOCTOR_HELP: &str = "\
+Usage: rcmake doctor [-B <build>]
+Show the CMake root, available tools, and probe cache status.
+With -B, also compare the build directory with its last successful configure.
+-B accepts -B <build>, -B<build>, and -B=<build>.
+Exit status
+  0  The report has no problem.
+  1  The build directory is not configured, or it changed after the last configure.
+  2  Invalid arguments.
+";
+
+/// Return the `-B` directory of `rcmake doctor`, or the reason for a usage error.
+fn doctor_build(args: &[BString]) -> Result<Option<&[u8]>, String> {
+    let dir = match args {
+        [] => return Ok(None),
+        [flag, dir] if flag == b"-B" => dir.as_slice(),
+        [arg] if arg.starts_with(b"-B") => {
+            let rest = arg.get(2..).unwrap_or_default();
+            rest.strip_prefix(b"=").unwrap_or(rest)
+        }
+        [arg, ..] if !arg.starts_with(b"-B") => {
+            return Err(format!(
+                "Unknown argument {}.",
+                String::from_utf8_lossy(arg)
+            ));
+        }
+        _ => return Err("Give -B once, with one build directory.".into()),
+    };
+    if dir.is_empty() {
+        return Err("-B needs a build directory.".into());
+    }
+    Ok(Some(dir))
+}
+
 pub(crate) fn doctor(argv0: Option<&BString>, args: &[BString], host: &dyn Host) -> i32 {
     use std::fmt::Write as _;
 
-    if let [flag] = args
-        && is_help(flag)
-    {
-        host.write_out(
-            Stream::Stdout,
-            b"Usage: rcmake doctor [-B <build>]\nShow the CMake root, available tools, and probe cache status.\n\
-            With -B, also compare the build directory with its last successful configure.\n",
-        );
+    if asks_for_help(args) {
+        host.write_out(Stream::Stdout, DOCTOR_HELP.as_bytes());
         return 0;
     }
-    let build = match args {
-        [] => None,
-        [flag, dir] if flag == b"-B" && !dir.is_empty() => Some(dir.as_slice()),
-        [arg] => match arg.strip_prefix(b"-B") {
-            Some(dir) if !dir.is_empty() => Some(dir),
-            _ => None,
-        },
-        _ => None,
+    let build = match doctor_build(args) {
+        Ok(build) => build,
+        Err(reason) => return usage_error(host, "doctor", &reason, DOCTOR_USAGE),
     };
-    if !args.is_empty() && build.is_none() {
-        host.write_out(Stream::Stderr, b"Usage: rcmake doctor [-B <build>]\n");
-        return 2;
-    }
 
     let (_, root) = discover_cmake_root(host, argv0);
     let root = root
@@ -575,8 +698,73 @@ mod tests {
         assert!(host.stream_bytes(Stream::Stdout).is_empty());
         assert!(
             host.stream_bytes(Stream::Stderr)
-                .starts_with(b"Usage: rcmake cache")
+                .starts_with(b"rcmake cache: Unknown action unknown.\nUsage: rcmake cache")
         );
+    }
+
+    #[test]
+    fn help_is_accepted_in_any_position() {
+        for args in [
+            &["export", "file", "--help"][..],
+            &["export", "-h", "file"],
+            &["import", "file", "--sha256", "x", "--help"],
+        ] {
+            let host = PureHost::default();
+            let args: Vec<BString> = args.iter().copied().map(BString::from).collect();
+            assert_eq!(cache(&args, &host), 0, "{args:?}");
+            let out = host.stream_bytes(Stream::Stdout).to_string();
+            assert!(out.starts_with("Usage: rcmake cache "), "{out}");
+            assert!(out.contains("RCMAKE_PROBE_CACHE_DIR"), "{out}");
+        }
+        let host = PureHost::default();
+        let args: Vec<BString> = ["--", "-h"].into_iter().map(BString::from).collect();
+        assert_eq!(cache(&args, &host), 2, "-h after -- is an operand");
+        for args in [&["-B", "dir", "--help"][..], &["--help", "-B", "dir"]] {
+            let host = PureHost::default();
+            let args: Vec<BString> = args.iter().copied().map(BString::from).collect();
+            assert_eq!(doctor(None, &args, &host), 0);
+            let out = host.stream_bytes(Stream::Stdout).to_string();
+            assert!(out.contains("Exit status"), "{out}");
+        }
+    }
+
+    #[test]
+    fn dash_operands_need_a_separator_and_errors_name_the_reason() -> HostResult<()> {
+        let host = PureHost::default();
+        seeded_store(&host, "producer")?;
+        let (code, _, err) = run(&host, &["export", "--json"]);
+        assert_eq!(code, 2);
+        assert!(
+            err.starts_with("rcmake cache: Unknown option --json."),
+            "{err}"
+        );
+        assert!(
+            host.metadata(&host.initial_cwd().join("--json"), Follow::No)
+                .is_err(),
+            "an option is never written as a file"
+        );
+        let (code, out, err) = run(&host, &["export", "--", "-dash.tar.gz"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.starts_with("Exported 1 probe entries"), "{out}");
+        for (args, reason) in [
+            (&["export"][..], "export needs a file name."),
+            (&["export", "a", "b"], "Give one file name."),
+            (&["import", "a", "--sha256"], "--sha256 needs a value."),
+            (
+                &["import", "a", "--sha256", "b", "--sha256", "c"],
+                "Give --sha256 once.",
+            ),
+            (&["status", "x"], "status takes no arguments."),
+            (&["unknown"], "Unknown action unknown."),
+        ] {
+            let (code, _, err) = run(&host, args);
+            assert_eq!(code, 2, "{args:?}");
+            assert!(
+                err.starts_with(&format!("rcmake cache: {reason}\n")),
+                "{err}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -642,7 +830,7 @@ mod tests {
             ("artifact", artifact),
             ("diagnostics", Value::Array(Vec::new())),
         ]);
-        Value::object_from([("outcome", outcome), ("checks", Value::object())])
+        Value::object_from([("outcome", outcome), ("checks", Value::Array(Vec::new()))])
     }
 
     #[test]
@@ -798,8 +986,8 @@ mod tests {
     }
 
     #[test]
-    fn doctor_accepts_both_build_directory_forms() {
-        for args in [&["-B", "missing"][..], &["-Bmissing"]] {
+    fn doctor_accepts_every_build_directory_form() {
+        for args in [&["-B", "missing"][..], &["-Bmissing"], &["-B=missing"]] {
             let host = PureHost::default();
             let args: Vec<BString> = args.iter().copied().map(BString::from).collect();
             assert_eq!(doctor(None, &args, &host), 1);
@@ -807,7 +995,13 @@ mod tests {
             assert!(out.contains("Build directory: /work/missing"), "{out}");
             assert!(out.contains("no CMakeCache.txt found"), "{out}");
         }
-        for args in [&["-B"][..], &["-B", ""], &["--build", "x"]] {
+        for args in [
+            &["-B"][..],
+            &["-B", ""],
+            &["-B="],
+            &["--build", "x"],
+            &["-B", "a", "b"],
+        ] {
             let host = PureHost::default();
             let args: Vec<BString> = args.iter().copied().map(BString::from).collect();
             assert_eq!(doctor(None, &args, &host), 2);

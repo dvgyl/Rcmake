@@ -22,13 +22,13 @@ pub fn compiler_reuse_warning(host: &dyn Host, cxx: bool) -> Option<String> {
             "{variable} selects {selected}. The wrapper has too many possible argument lists, so {language} compiler probes will bypass the probe cache."
         ),
         ReuseWarningReason::UnverifiableWrapperScript => format!(
-            "{variable} selects {selected}. Rcmake cannot verify this wrapper script, so {language} compiler probes will bypass the probe cache."
+            "{variable} selects {selected}. rcmake cannot verify this wrapper script, so {language} compiler probes will bypass the probe cache."
         ),
         ReuseWarningReason::UnreadableWrapper => format!(
-            "{variable} selects {selected}. Rcmake cannot read the compiler or wrapper, so {language} compiler probes will bypass the probe cache."
+            "{variable} selects {selected}. rcmake cannot read the compiler or wrapper, so {language} compiler probes will bypass the probe cache."
         ),
         ReuseWarningReason::UnverifiedAppleDriver => format!(
-            "{variable} selects {selected}. Rcmake must verify this driver with the configured toolchain before confirming probe cache reuse."
+            "{variable} selects {selected}. rcmake must verify this driver with the configured toolchain before confirming probe cache reuse."
         ),
     };
     Some(message)

@@ -1600,7 +1600,7 @@ fn ninja_compile_definitions_quote_the_value() {
 }
 
 #[test]
-fn ninja_multi_config_places_cmake_intdir_between_target_and_source_defines() {
+fn ninja_multi_config_sorts_cmake_intdir_with_source_defines() {
     let config = ConfigId("Debug".into());
     let mut model = fixture("Linux");
     model.generator = Some(rcmake_model::GeneratorKind::NinjaMultiConfig);
@@ -1620,5 +1620,25 @@ fn ninja_multi_config_places_cmake_intdir_between_target_and_source_defines() {
     assert_eq!(
         super::compile::formatted_defines(&model, &target, &config, &group),
         r#"-DAAA=1 -DFOO=1 -DZZZ=1 -DCMAKE_INTDIR=\"Debug\" -DSRC_A=1 -DSRC_Z=1"#,
+    );
+
+    // Source defines sorting before (`AAA=1`), equal (`CMAKE_INTDIR` / exact duplicate),
+    // and after (`ZZZ=1`) share one sorted/deduped set with `CMAKE_INTDIR`, while
+    // target defines stay first.
+    let ordered_group = CompileGroup {
+        defines: vec![
+            bt("TGT_Z=1"),
+            bt("TGT_A=1"),
+            bt("ZZZ=1"),
+            bt("CMAKE_INTDIR"),
+            bt("CMAKE_INTDIR=\"Debug\""),
+            bt("AAA=1"),
+        ],
+        source_define_start: Some(2),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::compile::formatted_defines(&model, &target, &config, &ordered_group),
+        r#"-DTGT_A=1 -DTGT_Z=1 -DAAA=1 -DCMAKE_INTDIR -DCMAKE_INTDIR=\"Debug\" -DZZZ=1"#,
     );
 }

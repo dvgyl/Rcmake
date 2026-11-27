@@ -10,10 +10,11 @@ use rcmake_host::path::{from_native, from_native_cmake, to_native};
 use rcmake_host::{FileKind, Follow, Host, ProcessResult, RegistryRoot, RegistryView, WriteMode};
 
 use super::installer::{
-    BUILD_TIMEOUT, ComponentCatalog, ComponentMeta, GroupMeta, PROBE_TIMEOUT, check_tool_outcome,
-    escape_nsis_literal, find_program_on_host, find_template, is_windows_host, option_set,
-    prepare_fresh_output, read_template, reject_nsis_glob_hazard, render_at_template, require_utf8,
-    run_installer_tool, to_windows_slashes, verify_fresh_output, warn, write_tool_log,
+    ComponentCatalog, ComponentMeta, GroupMeta, PROBE_TIMEOUT, build_tool_timeout,
+    check_tool_outcome, escape_nsis_literal, find_program_on_host, find_template, is_windows_host,
+    option_set, prepare_fresh_output, read_template, reject_nsis_glob_hazard, render_at_template,
+    require_utf8, run_installer_tool, to_windows_slashes, verify_fresh_output, warn,
+    write_tool_log,
 };
 use crate::config::{CpackConfig, absolute, snapshot};
 use crate::source::{
@@ -122,7 +123,7 @@ impl PackageGenerator for Nsis {
             cwd,
             &makensis_bytes,
             std::slice::from_ref(&version_arg),
-            PROBE_TIMEOUT,
+            Some(PROBE_TIMEOUT),
         )?;
         let log_dir = cfg
             .get(b"CPACK_TOPLEVEL_DIRECTORY")
@@ -385,8 +386,10 @@ impl Nsis {
                 let comp_dir =
                     crate::stage::component_dir_for_host(comp_name, settings.windows_host);
                 let comp_path = cx.staging_dir.join(&comp_dir);
-                if host.metadata_fresh(&comp_path, Follow::No).is_err() {
-                    continue;
+                match host.metadata_fresh(&comp_path, Follow::No) {
+                    Ok(_) => {}
+                    Err(err) if err.kind == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err.into()),
                 }
                 verify_contained_path(
                     host,
@@ -494,7 +497,7 @@ impl Nsis {
             cx.output_dir,
             &settings.makensis,
             &argv,
-            BUILD_TIMEOUT,
+            build_tool_timeout(host),
         )?;
         write_tool_log(
             host,
@@ -745,7 +748,10 @@ fn walk_nsis_dir(
     } else {
         root.join(rel)
     };
-    let mut entries = host.read_dir(&current)?;
+    let (mut entries, truncated) = host.read_dir_bounded(&current, *remaining)?;
+    if truncated {
+        return Err(error("NSIS staging entry count exceeds the limit"));
+    }
     entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     for entry in entries {
         *remaining = remaining

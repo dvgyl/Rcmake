@@ -972,7 +972,7 @@ pub fn sysctl_path_warning(host: &dyn Host) -> Option<String> {
             program.display(),
         )),
         Err(QueryPathError::Rejected | QueryPathError::Blocked(_)) => Some(String::from(
-            "Rcmake cannot verify the macOS sysctl probe with the current PATH. Use absolute directories and the system sysctl.",
+            "rcmake cannot verify the macOS sysctl probe with the current PATH. Use absolute directories and the system sysctl.",
         )),
     }
 }

@@ -192,7 +192,12 @@ fn target_json(target: &ExplainTarget, config: Option<&[u8]>) -> Value {
         ),
         (
             "dependency",
-            optional(target.dependency.as_deref().map(dependency_json)),
+            optional(
+                target
+                    .dependency
+                    .as_deref()
+                    .map(|report| dependency_json(report, config)),
+            ),
         ),
         ("configuration_selection", selection),
         ("configurations", array(configs)),
@@ -205,8 +210,8 @@ fn target_json(target: &ExplainTarget, config: Option<&[u8]>) -> Value {
     ])
 }
 
-fn dependency_json(report: &crate::DependencyReport) -> Value {
-    let paths = report.paths.iter().map(|path| {
+fn dependency_json(report: &crate::DependencyReport, config: Option<&[u8]>) -> Value {
+    let paths = report.paths_for(config).map(|path| {
         object([
             ("config", bytes(&path.config)),
             ("link_only", Value::Bool(path.link_only)),

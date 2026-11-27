@@ -27,10 +27,20 @@ mod tests;
 pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 /// Default timeout for version probes (30 seconds).
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Default timeout for installer build tool invocations (300 seconds).
-pub(crate) const BUILD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Environment variable specifying an optional wall-clock timeout in seconds for installer build tools.
+pub(crate) const TOOL_TIMEOUT_ENV: &[u8] = b"RCMAKE_CPACK_TOOL_TIMEOUT";
 /// Maximum allowed nesting depth for CPack component group hierarchies.
 pub(crate) const MAX_COMPONENT_GROUP_DEPTH: usize = 256;
+
+/// Resolve the optional build-tool timeout from `RCMAKE_CPACK_TOOL_TIMEOUT` (seconds).
+///
+/// Defaults to `None` (no timeout, matching upstream CMake). Setting `RCMAKE_CPACK_TOOL_TIMEOUT`
+/// to a positive integer enables that wall-clock limit; `0` or unset disables the timeout.
+pub(crate) fn build_tool_timeout(host: &dyn Host) -> Option<Duration> {
+    let raw = host.env_get(TOOL_TIMEOUT_ENV)?;
+    let secs = std::str::from_utf8(&raw).ok()?.trim().parse::<u64>().ok()?;
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
 
 const MAX_XML_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_XML_DEPTH: usize = 128;
@@ -528,7 +538,11 @@ fn sum_dir_bytes(
     if depth >= 256 {
         return Err(error("CPack payload depth exceeds the limit"));
     }
-    for entry in host.read_dir(dir)? {
+    let (entries, truncated) = host.read_dir_bounded(dir, *remaining)?;
+    if truncated {
+        return Err(error("CPack payload file count exceeds the limit"));
+    }
+    for entry in entries {
         *remaining = remaining
             .checked_sub(1)
             .ok_or_else(|| error("CPack payload file count exceeds the limit"))?;
@@ -1432,15 +1446,16 @@ pub(crate) struct ToolOutcome {
     pub(crate) output: Vec<u8>,
 }
 
-/// Run an external installer tool through [`Host::run_bounded`] with null stdin, explicit
-/// timeout, output cap, and optional secret redaction.
+/// Run an external installer tool through [`Host::run`] with null stdin, optional timeout,
+/// and streaming capture that truncates cleanly past [`MAX_TOOL_OUTPUT_BYTES`] instead of failing.
 pub(crate) fn run_installer_tool(
     host: &dyn Host,
     cwd: &Path,
     program: &[u8],
     args: &[BString],
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<ToolOutcome, CpackError> {
+    const TRUNCATED_NOTICE: &[u8] = b"\n... [output truncated at 16 MiB]\n";
     let req = RunRequest {
         pipeline: vec![CommandSpec {
             program: program.into(),
@@ -1449,21 +1464,36 @@ pub(crate) fn run_installer_tool(
         cwd: cwd.to_owned(),
         env: host.env_all(),
         stdin: Input::Null,
-        stdout: Output::Capture,
+        stdout: Output::Stream,
         stderr: Output::SharedWithStdout,
-        timeout: Some(timeout),
+        timeout,
         tee: false,
     };
-    let out = host.run_bounded(&req, MAX_TOOL_OUTPUT_BYTES)?;
+    let mut output = Vec::new();
+    let mut truncated = false;
+    let out = host.run(&req, &mut |_, chunk| {
+        if truncated {
+            return;
+        }
+        let remaining = MAX_TOOL_OUTPUT_BYTES.saturating_sub(output.len());
+        if chunk.len() <= remaining {
+            output.extend_from_slice(chunk);
+        } else {
+            if let Some(prefix) = chunk.get(..remaining) {
+                output.extend_from_slice(prefix);
+            }
+            truncated = true;
+        }
+    })?;
+    if truncated {
+        output.extend_from_slice(TRUNCATED_NOTICE);
+    }
     let status = out
         .results
         .into_iter()
         .next()
         .unwrap_or(ProcessResult::Exited(1));
-    Ok(ToolOutcome {
-        status,
-        output: out.stdout,
-    })
+    Ok(ToolOutcome { status, output })
 }
 
 /// Redact any non-empty secrets from `text` before writing logs or diagnostics.

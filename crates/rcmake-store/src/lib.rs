@@ -31,8 +31,8 @@ use rcmake_json::{
 pub use digest::{Digest, Domain, KeyHasher};
 pub use gc::{GcReport, StoreStats, gc};
 pub use portable::{
-    ArchiveLimits, ExportSkips, ImportError, ImportReport, ImportTrust, ProbeBundle, ProbeExport,
-    probe_payload_valid,
+    ArchiveLimits, EntryBudget, ExportSkips, ImportError, ImportReport, ImportTrust, ProbeBundle,
+    ProbeExport, probe_payload_valid,
 };
 pub use private_dir::{PrivateDir, canonical_path, ensure_private_dir, verify_private_dir};
 pub use stamp::{

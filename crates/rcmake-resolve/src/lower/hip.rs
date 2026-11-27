@@ -595,4 +595,60 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn nvidia_hip_excludes_cuda_device_lto_targets_when_ipo_is_enabled() {
+        let mut model = hip_model("nvidia");
+        {
+            let root = model.dir_mut(DirId::ROOT);
+            root.vars
+                .insert("CMAKE_HIP_COMPILER_ID".into(), "NVIDIA".into());
+            root.vars
+                .insert("CMAKE_HIP_COMPILER_VERSION".into(), "12.4".into());
+            root.vars
+                .insert("CMAKE_HIP_COMPILE_OPTIONS_IPO".into(), "-dlto".into());
+            root.vars
+                .insert("CMAKE_HIP_LINK_OPTIONS_IPO".into(), "-dlto".into());
+        }
+        let mut target = make_target("hip_nv", TargetKind::StaticLibrary, TargetOrigin::Normal);
+        target
+            .props
+            .set("HIP_ARCHITECTURES".into(), "75-real;75-virtual".into());
+        target
+            .props
+            .set("HIP_SEPARABLE_COMPILATION".into(), "ON".into());
+        target
+            .props
+            .set("INTERPROCEDURAL_OPTIMIZATION".into(), "ON".into());
+
+        let (compile_flags, compile_diags) = architecture_flags(
+            &model,
+            &target,
+            ArchPhase::Compile,
+            &ConfigId("Release".into()),
+            false,
+        );
+        assert!(compile_diags.is_empty());
+        let expected = vec![
+            BString::from("--generate-code=arch=compute_75,code=[sm_75]"),
+            BString::from("--generate-code=arch=compute_75,code=[compute_75]"),
+        ];
+        assert_eq!(compile_flags, expected);
+        assert!(
+            !compile_flags
+                .iter()
+                .any(|flag| flag.as_slice().windows(4).any(|w| w == b"lto_")),
+            "HIP must not emit CUDA device-LTO targets: {compile_flags:?}"
+        );
+
+        let (link_flags, link_diags) = architecture_flags(
+            &model,
+            &target,
+            ArchPhase::Link,
+            &ConfigId("Release".into()),
+            false,
+        );
+        assert!(link_diags.is_empty());
+        assert_eq!(link_flags, expected);
+    }
 }

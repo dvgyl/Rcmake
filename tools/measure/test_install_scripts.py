@@ -22,6 +22,7 @@ INSTALL_SH = ROOT / "scripts" / "install.sh"
 INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 EXTRA_SHARE_FILES = (
     "share/man/man1/rcmake.1",
+    "share/man/man1/ccmake.1",
     "share/bash-completion/completions/rcmake",
     "share/zsh/site-functions/_rcmake",
     "share/fish/vendor_completions.d/rcmake.fish",
@@ -59,6 +60,7 @@ def _make_fake_archive(
     extra_doc_files: dict[str, str] | None = None,
     include_module_helpers: bool = False,
     fail_installed_version: bool = False,
+    omit_rcmake_version_token: bool = False,
     symlink_extra_path: str | None = None,
 ) -> Path:
     """Create a synthetic release .tar.gz archive and optional .sha256 sidecar."""
@@ -70,11 +72,16 @@ def _make_fake_archive(
         if fail_installed_version
         else ""
     )
+    version_banner = (
+        '  printf "cmake version 4.5.1\\n"\n'
+        if omit_rcmake_version_token
+        else f'  printf "cmake version 4.5.1\\nrcmake {version}\\n"\n'
+    )
     rcmake_script = (
         "#!/bin/sh\n"
         'if [ "$1" = "--version" ]; then\n'
         f"{fail_check}"
-        f'  printf "cmake version 4.5.1\\nrcmake {version}\\n"\n'
+        f"{version_banner}"
         "  exit 0\n"
         "fi\n"
         f'printf "rcmake-fake {version} {extra_marker}\\n"\n'
@@ -979,7 +986,12 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(probe.returncode, 0, probe.stderr)
         self.assertIn("rcmake 0.1.0", probe.stdout)
 
-        # Installing an older archive that omits rcmake-verify removes the stale owned companion.
+        # Installing an older archive that omits rcmake-verify removes the stale owned companion
+        # when its SHA-256 digest matches the marker recorded during install.
+        marker = self.prefix / "share" / "cmake-4.5" / ".rcmake-managed"
+        expected_sha = hashlib.sha256(verify_bin.read_bytes()).hexdigest()
+        self.assertIn(f"verify_sha256={expected_sha}", marker.read_text(encoding="utf-8"))
+
         v0_old = _make_fake_archive(
             self.archives,
             version="0.0.9",
@@ -992,6 +1004,33 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertFalse(os.path.lexists(verify_bin))
         self.assertIn("omits rcmake-verify", res.stdout)
+
+        # Reinstall v1, then replace bin/rcmake-verify with a user-owned custom binary:
+        # downgrading to v0 must NOT delete an unowned/modified rcmake-verify.
+        res = self.run_install("--archive", str(v1))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        custom_verify = "#!/bin/sh\necho user-custom-verify\n"
+        verify_bin.write_text(custom_verify, encoding="utf-8")
+        verify_bin.chmod(0o755)
+        res = self.run_install("--archive", str(v0_old))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(verify_bin.is_file())
+        self.assertEqual(verify_bin.read_text(encoding="utf-8"), custom_verify)
+        self.assertNotIn("omits rcmake-verify", res.stdout)
+
+        # Missing main rcmake version token must fail companion version validation.
+        v2_empty_main_ver = _make_fake_archive(
+            self.archives,
+            version="0.2.0",
+            archive_name="rcmake-verify-v2-no-main-ver.tar.gz",
+            lsp_mode="symlink",
+            verify_mode="matching",
+            omit_rcmake_version_token=True,
+            extra_marker="v2",
+        )
+        res = self.run_install("--archive", str(v2_empty_main_ver))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Staged rcmake --version did not report a version", res.stderr)
 
 
 class DistShTests(unittest.TestCase):
@@ -1106,6 +1145,7 @@ class DistShTests(unittest.TestCase):
             src.chmod(0o755)
         for source_rel in (
             "docs/man/rcmake.1",
+            "docs/man/ccmake.1",
             "completions/rcmake.bash",
             "completions/_rcmake",
             "completions/rcmake.fish",
@@ -1223,6 +1263,9 @@ class InstallPs1Tests(unittest.TestCase):
             "bin/rcmake-lsp.exe",
             "bin/rcmake-verify.exe",
             "Get-VersionToken",
+            "verify_sha256=",
+            "Staged rcmake.exe --version did not report a version.",
+            "Installed rcmake.exe --version did not report a version.",
             "does not match rcmake.exe version",
             "omits rcmake-verify.exe",
             "share/cmake-4.5",

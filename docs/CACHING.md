@@ -19,6 +19,8 @@ A native configure keeps the results of compiler checks (`try_compile`, `check_i
 rcmake cache export probes.tar.gz
 ```
 
+A file name that starts with `-` must come after `--`, for example `rcmake cache export -- -probes.tar.gz`. Without `--`, the command reports an unknown option and writes no file.
+
 The command:
 
 1. Reads only probe entries and the blobs that they reference. It does not copy other cache data, lock files, temporary files, or credentials.
@@ -43,9 +45,9 @@ The command reads one private copy of the archive and calculates its SHA-256 dig
 - Each member must be a regular file named `manifest.json`, `entries/<64 hex digits>`, or `blobs/<64 hex digits>`. Links, devices, directories, extension headers, duplicate names, and other names are errors.
 - The manifest must name only probe entries. The archive must hold exactly those entries and their blobs.
 - Each entry and blob must match its digest, record format, key, and size limits.
-- Each entry must hold a valid probe record. Only a compiled check can keep an artifact, and the artifact blob must be the only blob of the entry.
+- Each entry must hold a valid probe record. The check covers every field of the record, including each recorded input check and its digest. Only a compiled check can keep an artifact, and the artifact blob must be the only blob of the entry.
 
-The size limits apply before memory is allocated. The limits are 256 MiB for the archive, 272 MiB for the decompressed tar stream, 64 MiB for one member, 16 MiB for the manifest, 256 MiB for all members, 65,536 members, and 1 GiB for all decoded blobs. Export uses the same limits, so an archive from `rcmake cache export` always passes these checks.
+The size limits apply before memory is allocated. The limits are 256 MiB for the archive, 272 MiB for the decompressed tar stream, 64 MiB for one member, 16 MiB for the manifest, 256 MiB for all members, 65,536 members, 1 GiB for all decoded blobs, and 512 MiB for all decoded entries. Each entry frame declares its decoded size in its header. The import adds that size to the entry total as soon as it reads the entry, before it decompresses any entry. Export uses the same limits, so an archive from `rcmake cache export` always passes these checks.
 
 If a check fails, the command prints the reason and changes nothing.
 
@@ -152,6 +154,9 @@ The receipt changes only when the new values come from new evidence:
 - A fresh configure (`--fresh`, a new build directory, or a cache reset) records all current values.
 - A compiler identification during the configure records the new compiler.
 - A warm configure that loads the saved compiler results keeps the old receipt. Thus a compiler that was replaced at the same path gives a warning on each configure until a fresh configure.
+- A compiler file or compiler directory that cannot be read keeps the recorded values of its language. Only a compiler file that is missing from a readable directory removes the language from the receipt.
+
+A relative `CMAKE_TOOLCHAIN_FILE` resolves against the build directory first and then the source directory, as in CMake. A configure hashes each compiler file once. The check after generation reuses the digest when the file length, modification time, device, and inode are the same.
 
 A failed configure, `-N`, and an incomplete generation do not change the receipt. If a cache cleanup removed the receipt and the configure then fails, `rcmake` writes the previous receipt again.
 
@@ -170,4 +175,6 @@ The report reads the cache, the receipt, and the tool files. It does not run a c
 - Changed fields.
 - No drift.
 
-The exit code is 1 when the report finds a missing build directory, an invalid receipt, a missing tool, or a changed field. `rcmake doctor` never removes or changes the cache. To recover, run `rcmake --fresh -B build` or configure a new build directory.
+The exit code is 0 when the report finds no problem. It is 1 when the report finds a missing build directory, an invalid receipt, a missing tool, or a changed field. It is 2 for invalid arguments. `-B` accepts `-B build`, `-Bbuild`, and `-B=build`. `rcmake doctor` never removes or changes the cache.
+
+To recover, run `rcmake --fresh -S "<source>" -B "<build>"` or configure a new build directory. `--fresh` removes `CMakeCache.txt`, so give each `-D` option again.

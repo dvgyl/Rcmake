@@ -12,8 +12,8 @@ use rcmake_host::{CopyOptions, FileKind, Follow, Host, ReadRange, WriteMode};
 
 use super::ScratchDir;
 use super::installer::{
-    BUILD_TIMEOUT, ComponentCatalog, ComponentMeta, GroupMeta, MAX_COMPONENT_GROUP_DEPTH,
-    VisitState, XmlElement, XmlNode, XmlWriter, check_tool_outcome, copy_component_payload,
+    ComponentCatalog, ComponentMeta, GroupMeta, MAX_COMPONENT_GROUP_DEPTH, VisitState, XmlElement,
+    XmlNode, XmlWriter, build_tool_timeout, check_tool_outcome, copy_component_payload,
     copy_monolithic_payload, escape_xml_attr, escape_xml_text, find_program_on_host, is_macos_host,
     is_set_to_empty, is_set_to_off, option_set, parse_xml_bounded, prepare_fresh_output,
     require_utf8, run_installer_tool, safe_relative_subpath, validate_extension,
@@ -521,8 +521,13 @@ impl Ifw {
                 &repo_dir,
             );
             log(host, "- Generate repository");
-            let outcome =
-                run_installer_tool(host, cx.output_dir, repogen, &repogen_args, BUILD_TIMEOUT)?;
+            let outcome = run_installer_tool(
+                host,
+                cx.output_dir,
+                repogen,
+                &repogen_args,
+                build_tool_timeout(host),
+            )?;
             if !matches!(outcome.status, rcmake_host::ProcessResult::Exited(0)) {
                 write_tool_log(
                     host,
@@ -576,7 +581,7 @@ impl Ifw {
             cx.output_dir,
             &settings.binarycreator,
             &bc_args,
-            BUILD_TIMEOUT,
+            build_tool_timeout(host),
         )?;
         if !matches!(outcome.status, rcmake_host::ProcessResult::Exited(0)) {
             write_tool_log(

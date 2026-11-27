@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rcmake_base::{BString, cmdline::Arguments, path_lex::Lexical};
-use rcmake_json::Value;
+use rcmake_json::{ParseBudget, ReadOptions, Value};
 
 use crate::reader::{ArtifactReader, ReadError};
 use crate::snapshot::{Attribution, CompileSettings, IncludeDir, TargetSnapshot};
@@ -355,6 +355,91 @@ pub(crate) fn infer_target(
     Some((config, name.into()))
 }
 
+/// Byte ranges of the top-level array items of a JSON document.
+struct TopLevelItems {
+    /// Ranges of the first [`MAX_ENTRIES`] items.
+    items: Vec<std::ops::Range<usize>>,
+    /// The array has more than [`MAX_ENTRIES`] items.
+    more: bool,
+}
+
+/// Split a top-level JSON array into item byte ranges without building values.
+///
+/// The scan follows strings and nesting only. Each kept item is parsed on its own
+/// later, so a database with too many rows never becomes one value tree. The scan
+/// stops counting after [`MAX_ENTRIES`] items, but it still checks the brackets to
+/// the end of the document.
+fn split_top_level(bytes: &[u8]) -> Result<TopLevelItems, ReadError> {
+    let malformed = || ReadError::Json("The compile database is not a valid JSON array.".into());
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let open = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .filter(|at| bytes.get(*at) == Some(&b'['))
+        .ok_or_else(malformed)?;
+    let mut result = TopLevelItems {
+        items: Vec::new(),
+        more: false,
+    };
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = open + 1;
+    let mut close = None;
+    let push = |range: std::ops::Range<usize>, result: &mut TopLevelItems| {
+        let item = bytes.get(range.clone()).unwrap_or_default();
+        let blank = item.iter().all(u8::is_ascii_whitespace);
+        if blank {
+            return blank;
+        }
+        if result.items.len() < MAX_ENTRIES {
+            result.items.push(range);
+        } else {
+            result.more = true;
+        }
+        false
+    };
+    for (at, &byte) in bytes.iter().enumerate().skip(open + 1) {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' if depth > 0 => depth -= 1,
+            b']' => {
+                let blank = push(start..at, &mut result);
+                // `[]` is empty. `[1,]` has an empty last item.
+                if blank && !result.items.is_empty() {
+                    return Err(malformed());
+                }
+                close = Some(at);
+                break;
+            }
+            b'}' => return Err(malformed()),
+            b',' if depth == 0 => {
+                if push(start..at, &mut result) {
+                    return Err(malformed());
+                }
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    let close = close.ok_or_else(malformed)?;
+    let trailing = bytes.get(close + 1..).unwrap_or_default();
+    if !trailing.iter().all(u8::is_ascii_whitespace) {
+        return Err(malformed());
+    }
+    Ok(result)
+}
+
 /// Counts of rows that stay opaque or incomplete, for the partial note.
 #[derive(Default)]
 struct RowNotes {
@@ -369,13 +454,11 @@ pub(crate) fn load(
     compilers: &[Compiler],
     configs: &[BString],
 ) -> Result<CompileDatabase, ReadError> {
-    let value = reader.json(Path::new("compile_commands.json"))?;
-    let entries = value.as_array().ok_or(ReadError::Json(
-        "The compile database is not an array.".into(),
-    ))?;
+    let bytes = reader.read(Path::new("compile_commands.json"))?;
+    let split = split_top_level(&bytes)?;
     let mut database = CompileDatabase::default();
     let mut notes = Vec::new();
-    if entries.len() > MAX_ENTRIES {
+    if split.more {
         notes.push(format!(
             "compile_commands.json has more than {MAX_ENTRIES} entries."
         ));
@@ -384,8 +467,12 @@ pub(crate) fn load(
     let mut expander = Expander { reader, used: 0 };
     let mut shared: HashSet<Arc<CompileSettings>> = HashSet::new();
     let mut rows = RowNotes::default();
-    for value in entries.iter().take(MAX_ENTRIES) {
-        let Some(entry) = parse_entry(value) else {
+    for range in split.items {
+        let item = bytes.get(range).unwrap_or_default();
+        let budget = ParseBudget::artifact(item.len());
+        let value = rcmake_json::parse_bounded(item, &ReadOptions::default(), &budget)
+            .map_err(|error| ReadError::Json(error.message))?;
+        let Some(entry) = parse_entry(&value) else {
             rows.skipped += 1;
             continue;
         };
@@ -705,6 +792,29 @@ mod tests {
             [BString::from("ONE"), BString::from("TWO")]
         );
         assert!(by_file("deep.c").opaque, "too deep");
+    }
+
+    #[test]
+    fn top_level_split_follows_strings_nesting_and_the_row_limit() {
+        let split = split_top_level(br#" [ {"a":"x,]}\"y"}, [1,[2]] ,3 ] "#).expect("split");
+        assert_eq!(split.items.len(), 3);
+        assert!(!split.more);
+        assert!(split_top_level(b"[]").expect("empty").items.is_empty());
+        for bad in [&b"{}"[..], b"[1,]", b"[,1]", b"[1", b"[1]x", b"[1}"] {
+            assert!(
+                split_top_level(bad).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        let mut many = b"[".to_vec();
+        for _ in 0..=MAX_ENTRIES {
+            many.extend_from_slice(b"{},");
+        }
+        many.extend_from_slice(b"{}]");
+        let split = split_top_level(&many).expect("split");
+        assert_eq!(split.items.len(), MAX_ENTRIES);
+        assert!(split.more);
     }
 
     #[test]

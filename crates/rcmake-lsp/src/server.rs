@@ -13,7 +13,7 @@ use rcmake_json::Value;
 use rcmake_language_tools::{
     Config, ConfigCache, Finding, FormatStyle, HostWorkspaceReader, LintDependencies, LintLimits,
     ResolvedConfig,
-    discovery::{infer_project_root, normalize_lexical},
+    discovery::{ProjectRootCache, normalize_lexical},
     lint_bytes,
 };
 
@@ -40,6 +40,7 @@ const MAX_OPEN_BYTES: usize = MAX_BUFFER_BYTES * 4;
 const MAX_CHANGES: usize = 1024;
 // Limit the estimated bytes that a batch scans or moves.
 const MAX_CHANGE_WORK: usize = 2 * 1024 * 1024 * 1024;
+const MAX_SYNC_CALLER_REFRESHES: usize = 32;
 const WATCH_METHOD: &str = "workspace/didChangeWatchedFiles";
 const LINT_WATCH_REGISTRATION_ID: &str = "rcmake-watch-lint-includes";
 
@@ -155,6 +156,7 @@ enum State {
 enum OpenDocument {
     Synced {
         doc: Arc<Document>,
+        bytes: Arc<[u8]>,
         show_parse_error: bool,
     },
     Desynced(i64),
@@ -234,8 +236,12 @@ pub struct Server<'a> {
     bundled_modules: Option<PathBuf>,
     workspace_cache: RefCell<WorkspaceCache>,
     config_cache: RefCell<ConfigCache>,
+    root_cache: RefCell<ProjectRootCache>,
+    reported_config_errors: RefCell<BTreeSet<String>>,
+    pending_warnings: RefCell<Vec<RpcMessage>>,
     lint_deps: RefCell<BTreeMap<String, LintDependencies>>,
     documents: BTreeMap<String, OpenDocument>,
+    open_buffers: Arc<BTreeMap<PathBuf, Arc<[u8]>>>,
     open_bytes: usize,
     open_limit_reported: bool,
 }
@@ -259,8 +265,12 @@ impl<'a> Server<'a> {
             bundled_modules: None,
             workspace_cache: RefCell::default(),
             config_cache: RefCell::default(),
+            root_cache: RefCell::default(),
+            reported_config_errors: RefCell::default(),
+            pending_warnings: RefCell::default(),
             lint_deps: RefCell::default(),
             documents: BTreeMap::new(),
+            open_buffers: Arc::new(BTreeMap::new()),
             open_bytes: 0,
             open_limit_reported: false,
         }
@@ -301,7 +311,9 @@ impl<'a> Server<'a> {
                 Ok(result) => RpcMessage::Result { id, result },
                 Err((code, message)) => RpcMessage::error(id, code, message),
             };
-            vec![response]
+            let mut out = vec![response];
+            out.extend(self.drain_pending_warnings());
+            out
         } else {
             self.notification(&method, &params).unwrap_or_default()
         }
@@ -520,6 +532,7 @@ impl<'a> Server<'a> {
                     }
                     let mut messages = vec![self.publish(uri)];
                     messages.extend(self.reconcile_lint_watches());
+                    messages.extend(self.drain_pending_warnings());
                     Some(messages)
                 }
             }
@@ -527,6 +540,7 @@ impl<'a> Server<'a> {
                 let uri = document_uri(params)?;
                 let doc = self.documents.remove(uri)?;
                 self.open_bytes -= doc.len();
+                self.rebuild_open_buffers();
                 self.workspace_cache.get_mut().invalidate_documents();
                 self.lint_deps.borrow_mut().remove(uri);
                 if doc.current().is_some()
@@ -536,11 +550,16 @@ impl<'a> Server<'a> {
                 }
                 let mut messages = vec![self.publish(uri)];
                 if let Some(path) = uri::path(uri) {
-                    for caller in self.affected_callers_for_file(&path, Some(uri)) {
+                    for caller in self
+                        .affected_callers_for_file(&path, Some(uri))
+                        .into_iter()
+                        .take(MAX_SYNC_CALLER_REFRESHES)
+                    {
                         messages.push(self.publish(&caller));
                     }
                 }
                 messages.extend(self.reconcile_lint_watches());
+                messages.extend(self.drain_pending_warnings());
                 Some(messages)
             }
             "workspace/didChangeWatchedFiles" => {
@@ -555,11 +574,13 @@ impl<'a> Server<'a> {
                     self.workspace_cache
                         .get_mut()
                         .invalidate_file(self.host, &path);
+                    self.root_cache.borrow_mut().clear();
                     let is_config = path.file_name().is_some_and(|name| {
                         name == rcmake_language_tools::config::CONFIG_FILE_NAME
                     });
                     if is_config {
                         self.config_cache.borrow_mut().clear();
+                        self.reported_config_errors.borrow_mut().clear();
                         affected_uris.extend(self.affected_docs_for_config(&path));
                     } else {
                         affected_uris.extend(self.affected_callers_for_file(&path, None));
@@ -567,9 +588,11 @@ impl<'a> Server<'a> {
                 }
                 let mut messages: Vec<RpcMessage> = affected_uris
                     .into_iter()
+                    .take(MAX_SYNC_CALLER_REFRESHES)
                     .map(|uri| self.publish(&uri))
                     .collect();
                 messages.extend(self.reconcile_lint_watches());
+                messages.extend(self.drain_pending_warnings());
                 if messages.is_empty() {
                     None
                 } else {
@@ -589,6 +612,7 @@ impl<'a> Server<'a> {
             .documents
             .insert(uri.to_owned(), OpenDocument::Desynced(version));
         self.open_bytes -= previous.as_ref().map_or(0, OpenDocument::len);
+        self.rebuild_open_buffers();
         self.workspace_cache.get_mut().invalidate_documents();
         let was_synced = matches!(previous, Some(OpenDocument::Synced { .. }));
         if was_synced && let Some(provider) = self.semantic() {
@@ -596,11 +620,16 @@ impl<'a> Server<'a> {
         }
         let mut messages = vec![self.publish(uri)];
         if was_synced && let Some(path) = uri::path(uri) {
-            for caller in self.affected_callers_for_file(&path, Some(uri)) {
+            for caller in self
+                .affected_callers_for_file(&path, Some(uri))
+                .into_iter()
+                .take(MAX_SYNC_CALLER_REFRESHES)
+            {
                 messages.push(self.publish(&caller));
             }
         }
         messages.extend(self.reconcile_lint_watches());
+        messages.extend(self.drain_pending_warnings());
         if !matches!(previous, Some(OpenDocument::Desynced(_))) {
             messages.push(show_warning(format!(
                 "rcmake lost synchronization with {uri}. {}",
@@ -685,17 +714,40 @@ impl<'a> Server<'a> {
     ) -> Vec<RpcMessage> {
         match text.and_then(|text| self.replace(uri, text, version, show_parse_error)) {
             Ok(()) => {
+                // Prioritize publishing the edited document first, then refresh a bounded
+                // batch of affected open callers synchronously.
                 let mut messages = vec![self.publish(uri)];
                 if let Some(path) = uri::path(uri) {
-                    for caller in self.affected_callers_for_file(&path, Some(uri)) {
+                    for caller in self
+                        .affected_callers_for_file(&path, Some(uri))
+                        .into_iter()
+                        .take(MAX_SYNC_CALLER_REFRESHES)
+                    {
                         messages.push(self.publish(&caller));
                     }
                 }
                 messages.extend(self.reconcile_lint_watches());
+                messages.extend(self.drain_pending_warnings());
                 messages
             }
             Err(failure) => self.desync(uri, version, failure),
         }
+    }
+
+    fn drain_pending_warnings(&self) -> Vec<RpcMessage> {
+        std::mem::take(&mut *self.pending_warnings.borrow_mut())
+    }
+
+    fn rebuild_open_buffers(&mut self) {
+        let mut snapshot = BTreeMap::new();
+        for (open_uri, open_doc) in &self.documents {
+            if let OpenDocument::Synced { bytes, .. } = open_doc
+                && let Some(open_path) = uri::path(open_uri)
+            {
+                snapshot.insert(normalize_lexical(&open_path), Arc::clone(bytes));
+            }
+        }
+        self.open_buffers = Arc::new(snapshot);
     }
 
     fn reconcile_lint_watches(&mut self) -> Vec<RpcMessage> {
@@ -723,6 +775,7 @@ impl<'a> Server<'a> {
         let other_bytes = self.open_bytes - old_len;
         check_buffer_size(text.len(), other_bytes)?;
         self.open_bytes = other_bytes + text.len();
+        let bytes: Arc<[u8]> = Arc::from(text.as_bytes());
         let doc = Arc::new(Document::new(text, version));
         if let Some(provider) = self.semantic() {
             provider.update(SemanticUpdate::Changed {
@@ -735,9 +788,13 @@ impl<'a> Server<'a> {
             uri.to_owned(),
             OpenDocument::Synced {
                 doc,
+                bytes: Arc::clone(&bytes),
                 show_parse_error,
             },
         );
+        if let Some(path) = uri::path(uri) {
+            Arc::make_mut(&mut self.open_buffers).insert(normalize_lexical(&path), bytes);
+        }
         self.workspace_cache.get_mut().invalidate_documents();
         Ok(())
     }
@@ -758,6 +815,7 @@ impl<'a> Server<'a> {
             if let OpenDocument::Synced {
                 doc,
                 show_parse_error,
+                ..
             } = doc
             {
                 let semantic = self.semantic_diagnostics(&self.semantic_document(uri, doc));
@@ -785,7 +843,7 @@ impl<'a> Server<'a> {
         matched.or_else(|| {
             let parent = path.parent().unwrap_or(path);
             let cwd = self.host.initial_cwd();
-            Some(infer_project_root(self.host, parent, &cwd))
+            Some(self.root_cache.borrow_mut().infer(self.host, parent, &cwd))
         })
     }
 
@@ -805,7 +863,19 @@ impl<'a> Server<'a> {
             .resolve(self.host, dir, boundary.as_deref())
         {
             Ok(resolved) => resolved,
-            Err(_) => {
+            Err(err) => {
+                let message = format!(
+                    "Failed to parse .rcmake.toml; falling back to default settings: {err}"
+                );
+                if self
+                    .reported_config_errors
+                    .borrow_mut()
+                    .insert(message.clone())
+                {
+                    self.pending_warnings
+                        .borrow_mut()
+                        .push(show_warning(message));
+                }
                 // Track checked ancestor directories even when a config file fails to parse so
                 // fixing it republishes diagnostics immediately.
                 let mut checked_dirs = Vec::new();
@@ -855,13 +925,7 @@ impl<'a> Server<'a> {
 
         let mut reader =
             HostWorkspaceReader::new(self.host, readable_roots, self.bundled_modules.clone());
-        for (open_uri, open_doc) in &self.documents {
-            if let Some(synced) = open_doc.current()
-                && let Some(open_path) = uri::path(open_uri)
-            {
-                reader.insert_open_buffer(open_path, Arc::from(synced.text.as_bytes()));
-            }
-        }
+        reader.set_open_buffers(Arc::clone(&self.open_buffers));
 
         let mut deps = LintDependencies {
             included_files: BTreeSet::new(),
@@ -1279,4 +1343,187 @@ fn edit_position(span: &Value, endpoint: &str) -> Result<Position, SyncFailure> 
     get(span, endpoint)
         .and_then(Position::parse)
         .ok_or(SyncFailure::InvalidChange)
+}
+
+#[cfg(test)]
+mod tests {
+    use rcmake_host::PureHost;
+
+    use super::*;
+
+    fn init_server(host: &PureHost) -> Server<'_> {
+        let mut server = Server::new(host);
+        let init = RpcMessage::Call {
+            id: Some(RequestId::Int(1)),
+            method: "initialize".to_owned(),
+            params: object([
+                ("rootUri", Value::string("file:///work")),
+                ("capabilities", object([])),
+            ]),
+        };
+        let _ = server.handle(init);
+        let initialized = RpcMessage::Call {
+            id: None,
+            method: "initialized".to_owned(),
+            params: object([]),
+        };
+        let _ = server.handle(initialized);
+        server
+    }
+
+    fn did_open(uri: &str, version: i64, text: &str) -> RpcMessage {
+        RpcMessage::Call {
+            id: None,
+            method: "textDocument/didOpen".to_owned(),
+            params: object([(
+                "textDocument",
+                object([
+                    ("uri", Value::string(uri)),
+                    ("languageId", Value::string("cmake")),
+                    ("version", Value::Int(version)),
+                    ("text", Value::string(text)),
+                ]),
+            )]),
+        }
+    }
+
+    fn did_change_full(uri: &str, version: i64, text: &str) -> RpcMessage {
+        RpcMessage::Call {
+            id: None,
+            method: "textDocument/didChange".to_owned(),
+            params: object([
+                (
+                    "textDocument",
+                    object([
+                        ("uri", Value::string(uri)),
+                        ("version", Value::Int(version)),
+                    ]),
+                ),
+                (
+                    "contentChanges",
+                    Value::Array(vec![object([("text", Value::string(text))])]),
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn broken_rcmake_toml_emits_show_message_warning_and_re_warns_after_watch_change() {
+        let host = PureHost::default();
+        host.seed_file(
+            Path::new("/work/.rcmake.toml"),
+            b"[unknown_table]\nfoo = 1\n",
+        )
+        .unwrap();
+        let mut server = init_server(&host);
+
+        let msgs = server.handle(did_open(
+            "file:///work/CMakeLists.txt",
+            1,
+            "project(Demo)\n",
+        ));
+        let warnings: Vec<_> = msgs
+            .iter()
+            .filter(|m| matches!(m, RpcMessage::Call { id: None, method, .. } if method == "window/showMessage"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "expected 1 config warning: {msgs:?}");
+        if let RpcMessage::Call { params, .. } = warnings[0] {
+            let text = get(params, "message").and_then(string).unwrap_or("");
+            assert!(text.contains(".rcmake.toml"), "unexpected warning: {text}");
+        }
+
+        // Subsequent edit without changing .rcmake.toml does not spam duplicate warnings.
+        let msgs2 = server.handle(did_change_full(
+            "file:///work/CMakeLists.txt",
+            2,
+            "project(Demo2)\n",
+        ));
+        assert!(
+            !msgs2.iter().any(|m| matches!(m, RpcMessage::Call { id: None, method, .. } if method == "window/showMessage")),
+            "duplicate warning should be suppressed: {msgs2:?}"
+        );
+
+        // Watched change to .rcmake.toml clears the dedup set so a new parse error warns again.
+        host.seed_file(
+            Path::new("/work/.rcmake.toml"),
+            b"[fmt]\nindent_width = 0\n",
+        )
+        .unwrap();
+        let msgs3 = server.handle(RpcMessage::Call {
+            id: None,
+            method: "workspace/didChangeWatchedFiles".to_owned(),
+            params: object([(
+                "changes",
+                Value::Array(vec![object([
+                    ("uri", Value::string("file:///work/.rcmake.toml")),
+                    ("type", Value::Int(2)),
+                ])]),
+            )]),
+        });
+        assert!(
+            msgs3.iter().any(|m| matches!(m, RpcMessage::Call { id: None, method, .. } if method == "window/showMessage")),
+            "expected fresh warning after .rcmake.toml change: {msgs3:?}"
+        );
+    }
+
+    #[test]
+    fn caller_refresh_prioritizes_edited_file_caps_sync_refreshes_and_shares_open_buffers() {
+        let host = PureHost::default();
+        host.seed_file(Path::new("/work/shared.cmake"), b"set(SHARED_VAR 1)\n")
+            .unwrap();
+        let mut server = init_server(&host);
+
+        let shared_uri = "file:///work/shared.cmake";
+        let _ = server.handle(did_open(shared_uri, 1, "set(SHARED_VAR 1)\n"));
+
+        // Open more callers than MAX_SYNC_CALLER_REFRESHES that all include shared.cmake.
+        let total_callers = MAX_SYNC_CALLER_REFRESHES + 8;
+        for i in 0..total_callers {
+            let uri = format!("file:///work/caller_{i:02}.cmake");
+            let _ = server.handle(did_open(
+                &uri,
+                1,
+                "include(\"shared.cmake\")\nmessage(STATUS \"${SHARED_VAR}\")\n",
+            ));
+        }
+
+        // Snapshot Arc entries for unchanged open documents are shared by pointer across edits.
+        let caller0_before = server
+            .open_buffers
+            .get(Path::new("/work/caller_00.cmake"))
+            .cloned()
+            .expect("caller_00 in open_buffers");
+
+        let msgs = server.handle(did_change_full(shared_uri, 2, "set(OTHER 1)\n"));
+        let caller0_after = server
+            .open_buffers
+            .get(Path::new("/work/caller_00.cmake"))
+            .cloned()
+            .expect("caller_00 still in open_buffers");
+        assert!(
+            Arc::ptr_eq(&caller0_before, &caller0_after),
+            "unchanged open buffer must share its Arc allocation without deep copying"
+        );
+
+        let published_uris: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                RpcMessage::Call {
+                    id: None,
+                    method,
+                    params,
+                } if method == "textDocument/publishDiagnostics" => {
+                    get(params, "uri").and_then(string)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(published_uris.first().copied(), Some(shared_uri));
+        assert_eq!(
+            published_uris.len(),
+            1 + MAX_SYNC_CALLER_REFRESHES,
+            "expected edited file + MAX_SYNC_CALLER_REFRESHES callers, got {}",
+            published_uris.len()
+        );
+    }
 }

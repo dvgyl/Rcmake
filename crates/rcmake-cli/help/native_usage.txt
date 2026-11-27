@@ -6,10 +6,11 @@ rcmake extensions
                  [--verbose] [--color=auto|always|never]
   rcmake explain --find <pkg> | why-not <pkg> [-B <build-dir>] [--json]
   rcmake explain --eval '<genex>' [-B <build-dir>] [--target <t>] [--config <cfg>]
-  rcmake diff-config <dirA> <dirB> [--config <cfg>] [--section <name>] [--json]
-  rcmake fmt [--check] [--diff] [--stdin] [paths...]
-  rcmake lint [--sarif] [paths...]
-  rcmake verify [--json] --oracle <path> -- <configure args>
+                 [--eval-property <prop>] [--json]
+  rcmake diff-config <dirA> <dirB> [--config <cfg>] [--only <sections>] [--json]
+  rcmake fmt [--check] [--diff] [--stdin [--stdin-filepath <path>]] [paths...]
+  rcmake lint [--sarif] [--deny-warnings] [--list-rules] [paths...]
+  rcmake verify [--json] [--timeout <secs>] [--oracle <path>] -- <configure args>
   rcmake doctor [-B <build-dir>]
                                Show tool paths, probe cache, and build drift.
   rcmake cache [status|dir|clear|export <file>|import <file> [--sha256 <hex>]]

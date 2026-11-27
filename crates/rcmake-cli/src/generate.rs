@@ -396,10 +396,7 @@ fn generate(
                                 effect: Effect::None,
                                 category: None,
                                 policy: None,
-                                location: Location::FileLine {
-                                    file: Arc::from(b"CMakeLists.txt".as_slice()),
-                                    line: 0,
-                                },
+                                location: Location::None,
                                 body: format!(
                                     "Incomplete compile_commands.json export for target '{}' (configuration '{}'): {}",
                                     notice.target, notice.config, notice.reason

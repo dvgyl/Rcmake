@@ -2,11 +2,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rcmake_host::{FileKind, FileTime, Follow, Host, Metadata, WriteMode};
+
+use crate::config::ConfigCache;
 
 /// Maximum number of discovered CMake files per run.
 pub const MAX_DISCOVERED_FILES: usize = 50_000;
@@ -124,7 +126,8 @@ pub fn resolve_operand(cwd: &Path, operand: &Path) -> PathBuf {
 /// Infer a project root boundary for `.rcmake.toml` lookup from a starting directory.
 ///
 /// Walks upward looking for a VCS marker (`.git`) or the highest contiguous ancestor
-/// containing `CMakeLists.txt`, falling back to `fallback_root`.
+/// containing `CMakeLists.txt` (stopping at the first ancestor without `CMakeLists.txt`
+/// once a `CMakeLists.txt` chain has started), falling back to `fallback_root`.
 #[must_use]
 pub fn infer_project_root(host: &dyn Host, start_dir: &Path, fallback_root: &Path) -> PathBuf {
     let mut best_cmake: Option<PathBuf> = None;
@@ -143,10 +146,177 @@ pub fn infer_project_root(host: &dyn Host, start_dir: &Path, fallback_root: &Pat
             .is_ok_and(|meta| meta.kind == FileKind::File)
         {
             best_cmake = Some(dir.to_owned());
+        } else if best_cmake.is_some() {
+            break;
         }
         current = dir.parent();
     }
     best_cmake.unwrap_or_else(|| fallback_root.to_owned())
+}
+
+/// Directory-keyed cache for [`infer_project_root`].
+#[derive(Clone, Debug, Default)]
+pub struct ProjectRootCache {
+    by_dir: BTreeMap<(PathBuf, PathBuf), PathBuf>,
+}
+
+impl ProjectRootCache {
+    /// Resolve and cache the project root for `start_dir` with `fallback_root`.
+    #[must_use]
+    pub fn infer(&mut self, host: &dyn Host, start_dir: &Path, fallback_root: &Path) -> PathBuf {
+        let key = (
+            normalize_lexical(start_dir),
+            normalize_lexical(fallback_root),
+        );
+        if let Some(cached) = self.by_dir.get(&key) {
+            return cached.clone();
+        }
+        let resolved = infer_project_root(host, &key.0, &key.1);
+        self.by_dir.insert(key, resolved.clone());
+        resolved
+    }
+
+    /// Clear all cached project root mappings.
+    pub fn clear(&mut self) {
+        self.by_dir.clear();
+    }
+}
+
+/// Return `true` if `candidate` matches any `.rcmake.toml` `exclude` pattern relative to `base_dir`.
+#[must_use]
+pub fn matches_exclude_patterns(base_dir: &Path, candidate: &Path, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let norm_base = normalize_lexical(base_dir);
+    let norm_cand = normalize_lexical(candidate);
+    let Ok(rel) = norm_cand.strip_prefix(&norm_base) else {
+        return false;
+    };
+    let rel_posix: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if rel_posix.is_empty() {
+        return false;
+    }
+    let rel_joined = rel_posix.join("/");
+    let file_name = rel_posix.last().map(String::as_str).unwrap_or("");
+    patterns
+        .iter()
+        .any(|pat| match_exclude_pattern(&rel_posix, &rel_joined, file_name, pat))
+}
+
+fn match_exclude_pattern(
+    rel_segments: &[String],
+    rel_joined: &str,
+    file_name: &str,
+    raw_pattern: &str,
+) -> bool {
+    let mut pat = raw_pattern.trim().replace('\\', "/");
+    while let Some(rest) = pat.strip_prefix("./") {
+        pat = rest.to_owned();
+    }
+    while let Some(rest) = pat.strip_prefix('/') {
+        pat = rest.to_owned();
+    }
+    let trimmed = pat.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return false;
+    }
+    let has_slash = trimmed.contains('/');
+    let has_glob = trimmed.contains('*') || trimmed.contains('?');
+    if !has_slash {
+        if !has_glob {
+            return rel_segments.iter().any(|seg| seg == trimmed);
+        }
+        return glob_match_segment(trimmed, file_name)
+            || rel_segments
+                .iter()
+                .any(|seg| glob_match_segment(trimmed, seg));
+    }
+    let pat_segs: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+    if pat_segs.is_empty() {
+        return false;
+    }
+    if glob_match_segments(&pat_segs, rel_segments) {
+        return true;
+    }
+    // A path pattern without trailing wildcard also excludes children beneath that directory.
+    if !has_glob
+        && rel_joined
+            .strip_prefix(trimmed)
+            .is_some_and(|rest| rest.starts_with('/'))
+    {
+        return true;
+    }
+    false
+}
+
+fn glob_match_segments(pat: &[&str], path: &[String]) -> bool {
+    let n = path.len();
+    let mut dp = vec![false; n + 1];
+    if let Some(first) = dp.first_mut() {
+        *first = true;
+    }
+    for &p in pat {
+        let mut next = vec![false; n + 1];
+        if p == "**" {
+            let mut seen = false;
+            for (dst, &src) in next.iter_mut().zip(dp.iter()) {
+                seen |= src;
+                *dst = seen;
+            }
+        } else {
+            for ((dst, &prev), seg) in next.iter_mut().skip(1).zip(dp.iter()).zip(path.iter()) {
+                if prev && glob_match_segment(p, seg) {
+                    *dst = true;
+                }
+            }
+        }
+        dp = next;
+    }
+    if dp.last().copied().unwrap_or(false) {
+        return true;
+    }
+    // Also match a directory prefix when pattern ends with `/**` and candidate IS that directory.
+    if pat.len() >= 2
+        && pat.last() == Some(&"**")
+        && let Some(prefix) = pat.get(..pat.len() - 1)
+    {
+        return glob_match_segments(prefix, path);
+    }
+    false
+}
+
+fn glob_match_segment(pat: &str, text: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let n = t.len();
+    let mut dp = vec![false; n + 1];
+    if let Some(first) = dp.first_mut() {
+        *first = true;
+    }
+    for pc in pat.chars() {
+        let mut next = vec![false; n + 1];
+        if pc == '*' {
+            let mut seen = false;
+            for (dst, &src) in next.iter_mut().zip(dp.iter()) {
+                seen |= src;
+                *dst = seen;
+            }
+        } else {
+            for ((dst, &prev), &tc) in next.iter_mut().skip(1).zip(dp.iter()).zip(t.iter()) {
+                if prev && (pc == '?' || pc == tc) {
+                    *dst = true;
+                }
+            }
+        }
+        dp = next;
+    }
+    dp.last().copied().unwrap_or(false)
 }
 
 /// Discover CMake listfiles from CLI operands (or `cwd` if `operands` is empty) using default
@@ -175,6 +345,35 @@ pub fn discover_files_with_limits(
     cwd: &Path,
     operands: &[PathBuf],
     limits: &DiscoveryLimits,
+) -> Result<Vec<PathBuf>, DiscoveryError> {
+    discover_files_inner(host, cwd, operands, limits, None)
+}
+
+/// Discover CMake listfiles honoring `.rcmake.toml` `exclude` patterns via cached
+/// project-root and configuration resolution.
+pub fn discover_files_with_config(
+    host: &dyn Host,
+    cwd: &Path,
+    operands: &[PathBuf],
+    limits: &DiscoveryLimits,
+    config_cache: &mut ConfigCache,
+    root_cache: &mut ProjectRootCache,
+) -> Result<Vec<PathBuf>, DiscoveryError> {
+    discover_files_inner(
+        host,
+        cwd,
+        operands,
+        limits,
+        Some((config_cache, root_cache)),
+    )
+}
+
+fn discover_files_inner(
+    host: &dyn Host,
+    cwd: &Path,
+    operands: &[PathBuf],
+    limits: &DiscoveryLimits,
+    mut exclude_ctx: Option<(&mut ConfigCache, &mut ProjectRootCache)>,
 ) -> Result<Vec<PathBuf>, DiscoveryError> {
     let targets: Vec<PathBuf> = if operands.is_empty() {
         vec![normalize_lexical(cwd)]
@@ -210,11 +409,13 @@ pub fn discover_files_with_limits(
             FileKind::Dir => {
                 walk_directory(
                     host,
+                    cwd,
                     &target,
                     limits,
                     &mut visited_entries,
                     &mut seen_canonical,
                     &mut files,
+                    exclude_ctx.as_mut(),
                 )?;
             }
             _ => {
@@ -253,26 +454,56 @@ fn record_file(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_directory(
     host: &dyn Host,
+    cwd: &Path,
     root: &Path,
     limits: &DiscoveryLimits,
     visited_entries: &mut usize,
     seen: &mut BTreeSet<PathBuf>,
     files: &mut Vec<PathBuf>,
+    exclude_ctx: Option<&mut (&mut ConfigCache, &mut ProjectRootCache)>,
 ) -> Result<(), DiscoveryError> {
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
         if depth > limits.max_depth {
             continue;
         }
-        let mut entries = host.read_dir(&dir).map_err(|err| DiscoveryError {
-            path: dir.clone(),
-            message: format!("Cannot read directory: {err}"),
-        })?;
+        let exclude_rule: Option<(PathBuf, Vec<String>)> =
+            if let Some(&mut (ref mut config_cache, ref mut root_cache)) = exclude_ctx {
+                let boundary = root_cache.infer(host, &dir, cwd);
+                let resolved =
+                    config_cache
+                        .resolve(host, &dir, Some(&boundary))
+                        .map_err(|err| DiscoveryError {
+                            path: err.path.clone().unwrap_or_else(|| dir.clone()),
+                            message: err.to_string(),
+                        })?;
+                if !resolved.config.exclude.is_empty() {
+                    let base_dir = resolved
+                        .config_path
+                        .as_deref()
+                        .and_then(Path::parent)
+                        .unwrap_or(&dir)
+                        .to_path_buf();
+                    Some((base_dir, resolved.config.exclude))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let remaining = limits.max_visited_entries.saturating_sub(*visited_entries);
+        let (mut entries, truncated) =
+            host.read_dir_bounded(&dir, remaining)
+                .map_err(|err| DiscoveryError {
+                    path: dir.clone(),
+                    message: format!("Cannot read directory: {err}"),
+                })?;
         // Charge the visited-entry budget before sorting or retaining any entry from `dir`.
         let next_visited = visited_entries.saturating_add(entries.len());
-        if next_visited > limits.max_visited_entries {
+        if truncated || next_visited > limits.max_visited_entries {
             return Err(DiscoveryError {
                 path: dir,
                 message: format!(
@@ -297,6 +528,11 @@ fn walk_directory(
                 continue;
             }
             let child = dir.join(rcmake_host::path::to_native(name));
+            if let Some((base_dir, patterns)) = &exclude_rule
+                && matches_exclude_patterns(base_dir, &child, patterns)
+            {
+                continue;
+            }
             match entry.kind {
                 FileKind::Dir => {
                     if is_skipped_dir_name(name) {
@@ -769,6 +1005,102 @@ mod tests {
         assert_eq!(
             sym_race_host.metadata_fresh(file, Follow::No).unwrap().kind,
             FileKind::Symlink
+        );
+    }
+
+    #[test]
+    fn infer_project_root_stops_at_first_ancestor_without_cmakelists_and_caches() {
+        let host = PureHost::default();
+        // Unrelated parent CMakeLists.txt separated by an intermediate directory with none.
+        host.seed_file(Path::new("/home/CMakeLists.txt"), b"project(Stray)\n")
+            .unwrap();
+        host.create_dir_all(Path::new("/home/workspace")).unwrap();
+        host.seed_file(
+            Path::new("/home/workspace/proj/CMakeLists.txt"),
+            b"project(Proj)\n",
+        )
+        .unwrap();
+        host.seed_file(
+            Path::new("/home/workspace/proj/sub/CMakeLists.txt"),
+            b"add_library(s INTERFACE)\n",
+        )
+        .unwrap();
+        host.seed_file(
+            Path::new("/home/workspace/proj/cmake/Helper.cmake"),
+            b"set(X 1)\n",
+        )
+        .unwrap();
+
+        let fallback = Path::new("/fallback");
+        assert_eq!(
+            infer_project_root(&host, Path::new("/home/workspace/proj/sub"), fallback),
+            PathBuf::from("/home/workspace/proj")
+        );
+        // Subdirectory without its own CMakeLists.txt climbs into the project, then stops at workspace.
+        assert_eq!(
+            infer_project_root(&host, Path::new("/home/workspace/proj/cmake"), fallback),
+            PathBuf::from("/home/workspace/proj")
+        );
+
+        let mut cache = ProjectRootCache::default();
+        let first = cache.infer(&host, Path::new("/home/workspace/proj/sub"), fallback);
+        assert_eq!(first, PathBuf::from("/home/workspace/proj"));
+        // Cached entry returns the memoized root without re-walking until cleared.
+        host.seed_file(
+            Path::new("/home/workspace/CMakeLists.txt"),
+            b"project(NewParent)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cache.infer(&host, Path::new("/home/workspace/proj/sub"), fallback),
+            PathBuf::from("/home/workspace/proj")
+        );
+        cache.clear();
+        assert_eq!(
+            cache.infer(&host, Path::new("/home/workspace/proj/sub"), fallback),
+            PathBuf::from("/home")
+        );
+    }
+
+    #[test]
+    fn discovery_honors_rcmake_toml_exclude_patterns() {
+        let host = PureHost::default();
+        host.seed_file(
+            Path::new("/work/.rcmake.toml"),
+            b"exclude = [\"third_party/**\", \"gen/*.cmake\", \"skip.cmake\"]\n",
+        )
+        .unwrap();
+        host.seed_file(Path::new("/work/CMakeLists.txt"), b"project(A)\n")
+            .unwrap();
+        host.seed_file(Path::new("/work/src/CMakeLists.txt"), b"set(A 1)\n")
+            .unwrap();
+        host.seed_file(Path::new("/work/src/skip.cmake"), b"set(SKIP 1)\n")
+            .unwrap();
+        host.seed_file(
+            Path::new("/work/third_party/lib/CMakeLists.txt"),
+            b"project(ThirdParty)\n",
+        )
+        .unwrap();
+        host.seed_file(Path::new("/work/gen/auto.cmake"), b"set(G 1)\n")
+            .unwrap();
+
+        let mut cfg_cache = ConfigCache::default();
+        let mut root_cache = ProjectRootCache::default();
+        let found = discover_files_with_config(
+            &host,
+            Path::new("/work"),
+            &[],
+            &DiscoveryLimits::default(),
+            &mut cfg_cache,
+            &mut root_cache,
+        )
+        .unwrap();
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("/work/CMakeLists.txt"),
+                PathBuf::from("/work/src/CMakeLists.txt"),
+            ]
         );
     }
 }

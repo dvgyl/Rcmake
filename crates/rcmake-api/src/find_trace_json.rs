@@ -1,6 +1,8 @@
 //! `CMakeFiles/rcmake/find-trace.v1.json`: persisted `find_package()` records of one
 //! native configure, with the identity and stamps that decide whether they are current.
 
+use std::collections::BTreeSet;
+
 use rcmake_base::BString;
 use rcmake_eval::FindTraceStore;
 use rcmake_eval::find_trace::{
@@ -57,6 +59,65 @@ impl FileStamp {
     }
 }
 
+/// Value of one search environment variable when the trace was written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvStamp {
+    /// Variable name.
+    pub name: BString,
+    /// Value, or `None` for an unset variable.
+    pub value: Option<BString>,
+}
+
+impl EnvStamp {
+    fn cost(&self) -> u64 {
+        STAMP_COST
+            .saturating_add(text_cost(self.name.len()))
+            .saturating_add(
+                self.value
+                    .as_ref()
+                    .map_or(0, |value| text_cost(value.len())),
+            )
+    }
+}
+
+/// Environment variables that every `find_package()` call can search, whatever the
+/// package name is. `PATH` gives the `<prefix>/bin` and `<prefix>/sbin` prefixes.
+pub const FIND_SEARCH_ENV: [&str; 7] = [
+    "CMAKE_PREFIX_PATH",
+    "CMAKE_FRAMEWORK_PATH",
+    "CMAKE_APPBUNDLE_PATH",
+    "CMAKE_PROGRAM_PATH",
+    "CMAKE_INCLUDE_PATH",
+    "CMAKE_LIBRARY_PATH",
+    "PATH",
+];
+
+/// Return the search environment variables of a run that searched for `packages`.
+///
+/// The set holds [`FIND_SEARCH_ENV`] and, for each package `<Pkg>`, `<Pkg>_ROOT`,
+/// `<PKG>_ROOT` (policy `CMP0144`), and `<Pkg>_DIR`.
+#[must_use]
+pub fn find_search_env_names<'a>(
+    packages: impl IntoIterator<Item = &'a [u8]>,
+) -> BTreeSet<BString> {
+    let mut names: BTreeSet<BString> = FIND_SEARCH_ENV
+        .iter()
+        .map(|name| BString::from(*name))
+        .collect();
+    for package in packages {
+        for (base, suffix) in [
+            (package.to_vec(), b"_ROOT".as_slice()),
+            (package.to_ascii_uppercase(), b"_ROOT"),
+            (package.to_vec(), b"_DIR"),
+        ] {
+            let mut name = base;
+            name.extend_from_slice(suffix);
+            names.insert(name.into());
+        }
+    }
+    names
+}
+
 /// Contents of the persisted file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FindTraceDocument {
@@ -73,6 +134,9 @@ pub struct FindTraceDocument {
     pub inputs: Vec<FileStamp>,
     /// `inputs` holds every input. A `false` value means freshness cannot be proved.
     pub inputs_complete: bool,
+    /// Search environment variables of the run. `None` means freshness cannot be
+    /// proved, for example in a file from an earlier version.
+    pub environment: Option<Vec<EnvStamp>>,
     /// The configure ran to its end. A `false` value means later calls are unknown.
     pub completed: bool,
     /// Recorded calls.
@@ -93,13 +157,15 @@ impl FindTraceDocument {
     ///
     /// `cache` is the path of the `CMakeCache.txt` of the build directory. A cache
     /// stamp for another path does not match. `stamp` returns the current stamp of a
-    /// path, or `None` when the path cannot be checked.
+    /// path, or `None` when the path cannot be checked. `env` returns the current
+    /// value of an environment variable, or `None` when it is unset.
     pub fn freshness(
         &self,
         build: &[u8],
         source: &[u8],
         cache: &[u8],
         mut stamp: impl FnMut(&[u8]) -> Option<FileStamp>,
+        mut env: impl FnMut(&[u8]) -> Option<BString>,
     ) -> Freshness {
         if self.build != build {
             return Freshness::Past("The trace belongs to another build directory.");
@@ -128,6 +194,17 @@ impl FindTraceDocument {
                 "A listfile, package file, or search location changed after the trace was written.",
             );
         }
+        let Some(environment) = &self.environment else {
+            return Freshness::Past("The trace does not record the search environment.");
+        };
+        if environment
+            .iter()
+            .any(|variable| env(&variable.name) != variable.value)
+        {
+            return Freshness::Past(
+                "A search environment variable, for example CMAKE_PREFIX_PATH, changed after the trace was written.",
+            );
+        }
         Freshness::Current
     }
 
@@ -138,7 +215,15 @@ impl FindTraceDocument {
             .iter()
             .chain(&self.inputs)
             .fold(0_u64, |total, stamp| total.saturating_add(stamp.cost()));
+        let environment = self
+            .environment
+            .iter()
+            .flatten()
+            .fold(0_u64, |total, variable| {
+                total.saturating_add(variable.cost())
+            });
         HEADER_COST
+            .saturating_add(environment)
             .saturating_add(text_cost(self.producer.len()))
             .saturating_add(text_cost(self.build.len()))
             .saturating_add(text_cost(self.source.len()))
@@ -149,16 +234,19 @@ impl FindTraceDocument {
     ///
     /// The size check uses upper bounds and runs before any JSON is built. Calls past
     /// the limit are dropped from the end and counted as omitted. When the stamps
-    /// alone do not fit, the stamps are dropped and the inputs are marked incomplete.
+    /// alone do not fit, the stamps and the environment are dropped and the inputs are
+    /// marked incomplete.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let max = u64::try_from(FIND_TRACE_MAX_BYTES).unwrap_or(u64::MAX);
         let mut header = self.header_cost();
         let mut inputs: &[FileStamp] = &self.inputs;
         let mut inputs_complete = self.inputs_complete;
+        let mut environment = self.environment.as_deref();
         if header > max {
             inputs = &[];
             inputs_complete = false;
+            environment = None;
             header = HEADER_COST
                 .saturating_add(text_cost(self.producer.len()))
                 .saturating_add(text_cost(self.build.len()))
@@ -188,6 +276,17 @@ impl FindTraceDocument {
             ),
             ("inputs", Value::array_from(inputs.iter().map(stamp_value))),
             ("inputs_complete", Value::Bool(inputs_complete)),
+            (
+                "environment",
+                environment.map_or(Value::Null, |variables| {
+                    Value::array_from(variables.iter().map(|variable| {
+                        Value::object_from([
+                            ("name", Value::String(variable.name.clone())),
+                            ("value", opt_text(variable.value.as_ref())),
+                        ])
+                    }))
+                }),
+            ),
             ("completed", Value::Bool(self.completed)),
             (
                 "calls_started",
@@ -253,6 +352,21 @@ impl FindTraceDocument {
                 .map(stamp_from)
                 .collect::<Option<_>>()?,
             inputs_complete: value.get("inputs_complete")?.as_bool()?,
+            environment: match value.get("environment") {
+                None | Some(Value::Null) => None,
+                Some(variables) => Some(
+                    variables
+                        .as_array()?
+                        .iter()
+                        .map(|variable| {
+                            Some(EnvStamp {
+                                name: text(variable.get("name")?)?,
+                                value: opt_from(variable.get("value"))?,
+                            })
+                        })
+                        .collect::<Option<_>>()?,
+                ),
+            },
             completed: value.get("completed")?.as_bool()?,
             store,
         })
@@ -575,6 +689,16 @@ mod tests {
                 FileStamp::absent("/opt/empty/lib/cmake/Boost"),
             ],
             inputs_complete: true,
+            environment: Some(vec![
+                EnvStamp {
+                    name: "CMAKE_PREFIX_PATH".into(),
+                    value: None,
+                },
+                EnvStamp {
+                    name: "Boost_ROOT".into(),
+                    value: Some("/opt/boost".into()),
+                },
+            ]),
             completed: false,
             store: FindTraceStore {
                 calls: vec![call(2)],
@@ -595,6 +719,62 @@ mod tests {
         move |path: &[u8]| stamps.iter().find(|stamp| stamp.path == path).cloned()
     }
 
+    fn env(document: &FindTraceDocument) -> impl FnMut(&[u8]) -> Option<BString> {
+        let variables = document.environment.clone().unwrap_or_default();
+        move |name: &[u8]| {
+            variables
+                .iter()
+                .find(|variable| variable.name == name)
+                .and_then(|variable| variable.value.clone())
+        }
+    }
+
+    #[test]
+    fn search_environment_changes_make_the_trace_past() {
+        let document = document();
+        let parsed = FindTraceDocument::parse(&document.to_bytes()).expect("parse");
+        assert_eq!(parsed.environment, document.environment);
+        let cache = b"/b/CMakeCache.txt";
+        let mut base = env(&document);
+        let prefix_set = |name: &[u8]| {
+            if name == b"CMAKE_PREFIX_PATH" {
+                Some(BString::from("/opt/new"))
+            } else {
+                base(name)
+            }
+        };
+        assert!(matches!(
+            parsed.freshness(b"/b", b"/s", cache, current(&document), prefix_set),
+            Freshness::Past(_)
+        ));
+        let root_unset = |_: &[u8]| None;
+        assert!(matches!(
+            parsed.freshness(b"/b", b"/s", cache, current(&document), root_unset),
+            Freshness::Past(_)
+        ));
+        let mut legacy = document.clone();
+        legacy.environment = None;
+        let reparsed = FindTraceDocument::parse(&legacy.to_bytes()).expect("parse");
+        assert!(matches!(
+            reparsed.freshness(b"/b", b"/s", cache, current(&document), env(&document)),
+            Freshness::Past(_)
+        ));
+    }
+
+    #[test]
+    fn search_env_names_cover_the_package_roots() {
+        let names = find_search_env_names([b"Boost".as_slice()]);
+        for name in [
+            "CMAKE_PREFIX_PATH",
+            "PATH",
+            "Boost_ROOT",
+            "BOOST_ROOT",
+            "Boost_DIR",
+        ] {
+            assert!(names.contains(&BString::from(name)), "{name}");
+        }
+    }
+
     #[test]
     fn round_trips_and_checks_identity_and_stamps() {
         let document = document();
@@ -602,11 +782,11 @@ mod tests {
         assert_eq!(parsed, document);
         let cache = b"/b/CMakeCache.txt";
         assert_eq!(
-            parsed.freshness(b"/b", b"/s", cache, current(&document)),
+            parsed.freshness(b"/b", b"/s", cache, current(&document), env(&document)),
             Freshness::Current
         );
         assert!(matches!(
-            parsed.freshness(b"/other", b"/s", cache, current(&document)),
+            parsed.freshness(b"/other", b"/s", cache, current(&document), env(&document)),
             Freshness::Past(_)
         ));
         assert!(matches!(
@@ -614,7 +794,8 @@ mod tests {
                 b"/b",
                 b"/s",
                 b"/elsewhere/CMakeCache.txt",
-                current(&document)
+                current(&document),
+                env(&document)
             ),
             Freshness::Past(_)
         ));
@@ -627,7 +808,7 @@ mod tests {
             }
         };
         assert!(matches!(
-            parsed.freshness(b"/b", b"/s", cache, listfile_edit),
+            parsed.freshness(b"/b", b"/s", cache, listfile_edit, env(&document)),
             Freshness::Past(_)
         ));
         let mut base = current(&document);
@@ -642,13 +823,13 @@ mod tests {
             }
         };
         assert!(matches!(
-            parsed.freshness(b"/b", b"/s", cache, new_package),
+            parsed.freshness(b"/b", b"/s", cache, new_package, env(&document)),
             Freshness::Past(_)
         ));
         let mut incomplete = document.clone();
         incomplete.inputs_complete = false;
         assert!(matches!(
-            incomplete.freshness(b"/b", b"/s", cache, current(&document)),
+            incomplete.freshness(b"/b", b"/s", cache, current(&document), env(&document)),
             Freshness::Past(_)
         ));
     }

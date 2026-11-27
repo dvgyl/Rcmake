@@ -34,15 +34,20 @@ impl ExplainRenderOptions<'_> {
     /// Use the host's terminal and color settings for this output stream.
     ///
     /// `CLICOLOR_FORCE=1` enables color. Otherwise, color requires a terminal
-    /// and an unset `NO_COLOR`.
+    /// and an unset or empty `NO_COLOR` (<https://no-color.org>).
     /// Links require a terminal with a known hyperlink capability.
     #[must_use]
     pub fn for_host(host: &dyn Host, stream: Stream) -> Self {
         let terminal = host.is_terminal(stream);
-        let forced = host
-            .env_get(b"CLICOLOR_FORCE")
-            .is_some_and(|value| value == "1");
-        let disabled = host.env_get(b"NO_COLOR").is_some();
+        let color = color_enabled(
+            terminal,
+            host.env_get(b"CLICOLOR_FORCE")
+                .as_ref()
+                .map(|value| value.as_slice()),
+            host.env_get(b"NO_COLOR")
+                .as_ref()
+                .map(|value| value.as_slice()),
+        );
         let hyperlinks = terminal
             && (host.env_get(b"VTE_VERSION").is_some_and(|value| {
                 core::str::from_utf8(&value)
@@ -59,7 +64,7 @@ impl ExplainRenderOptions<'_> {
                     )
                 }));
         Self {
-            color: forced || (!disabled && terminal),
+            color,
             hyperlinks,
             bundled_modules: discover_cmake_root(host, None)
                 .1
@@ -67,6 +72,14 @@ impl ExplainRenderOptions<'_> {
             ..Self::default()
         }
     }
+}
+
+/// Return whether terminal output uses color. `CLICOLOR_FORCE=1` forces color. A
+/// non-empty `NO_COLOR` disables it. An empty `NO_COLOR` counts as unset.
+fn color_enabled(terminal: bool, clicolor_force: Option<&[u8]>, no_color: Option<&[u8]>) -> bool {
+    let forced = clicolor_force == Some(b"1".as_slice());
+    let disabled = no_color.is_some_and(|value| !value.is_empty());
+    forced || (!disabled && terminal)
 }
 
 /// Render an explanation as terminal text.
@@ -174,6 +187,11 @@ impl Renderer<'_> {
             );
         }
         for config in target.configurations_for(self.options.config) {
+            // A dependency query shows its paths above. Its link entries are extra
+            // evidence, so a configuration without them shows nothing.
+            if target.dependency.is_some() && config.entries.is_empty() {
+                continue;
+            }
             self.row(2, &format!("Configuration {}", config_name(&config.name)));
             if target.filter.is_some() && config.entries.is_empty() {
                 self.row(4, "No entry matches the filter.");
@@ -264,10 +282,18 @@ impl Renderer<'_> {
             }
             return;
         };
-        if report.paths.is_empty() {
-            self.row(0, &format!("{} is not a dependency of {name}.", text(goal)));
+        let mut paths = report.paths_for(self.options.config).peekable();
+        if paths.peek().is_none() {
+            let scope = self
+                .options
+                .config
+                .map_or_else(String::new, |config| format!(" in {}", config_name(config)));
+            self.row(
+                0,
+                &format!("{} is not a dependency of {name}{scope}.", text(goal)),
+            );
         }
-        for path in &report.paths {
+        for path in paths {
             self.styled_row(
                 0,
                 &format!("{name} -> {} ({})", text(goal), config_name(&path.config)),
@@ -860,4 +886,19 @@ fn is_format(ch: char) -> bool {
         '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}' |
         '\u{e0001}' | '\u{e0020}'..='\u{e007f}'
     )
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::color_enabled;
+
+    #[test]
+    fn empty_no_color_counts_as_unset() {
+        assert!(color_enabled(true, None, None));
+        assert!(color_enabled(true, None, Some(b"")));
+        assert!(!color_enabled(true, None, Some(b"1")));
+        assert!(!color_enabled(false, None, None));
+        assert!(color_enabled(false, Some(b"1"), Some(b"1")));
+        assert!(!color_enabled(false, Some(b"0"), None));
+    }
 }

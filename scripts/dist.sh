@@ -43,6 +43,7 @@ for notice in (
 if not windows:
     for extra in (
         "share/man/man1/rcmake.1",
+        "share/man/man1/ccmake.1",
         "share/bash-completion/completions/rcmake",
         "share/zsh/site-functions/_rcmake",
         "share/fish/vendor_completions.d/rcmake.fish",
@@ -152,7 +153,9 @@ verify_version = subprocess.check_output([verify_bin, "--version"], env=env, tex
 if not verify_version.startswith("rcmake-verify "):
     sys.exit(f"Unexpected version output from {verify_bin.name}. Found {verify_version}")
 verify_pkg_version = verify_version.splitlines()[0].strip().split(None, 1)[1].strip()
-if rcmake_pkg_version is not None and verify_pkg_version != rcmake_pkg_version:
+if not rcmake_pkg_version:
+    sys.exit("rcmake --version did not report a package version token.")
+if verify_pkg_version != rcmake_pkg_version:
     sys.exit(
         f"Mismatched companion version: rcmake {rcmake_pkg_version} vs rcmake-verify {verify_pkg_version}."
     )
@@ -353,6 +356,7 @@ ignore = shutil.ignore_patterns("._*", ".DS_Store")
 shutil.copytree(root / "modules/cmake-4.5", package / "share/cmake-4.5", ignore=ignore)
 for source_rel, target_rel in (
     ("docs/man/rcmake.1", "share/man/man1/rcmake.1"),
+    ("docs/man/ccmake.1", "share/man/man1/ccmake.1"),
     ("completions/rcmake.bash", "share/bash-completion/completions/rcmake"),
     ("completions/_rcmake", "share/zsh/site-functions/_rcmake"),
     ("completions/rcmake.fish", "share/fish/vendor_completions.d/rcmake.fish"),

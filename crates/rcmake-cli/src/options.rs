@@ -98,6 +98,7 @@ const NATIVE_FLAGS: &[&[u8]] = &[
     b"--diagnostics",
     b"--fetch-lock",
     b"--no-probe-cache",
+    b"--export-compile-commands",
 ];
 
 /// Options that CMake 4.5.1 suggests for an unknown configure argument, in the
@@ -359,6 +360,7 @@ fn script_mode_flag(flag: &[u8]) -> bool {
             | b"--debugger"
             | b"--debugger-pipe"
             | b"--debugger-dap-log"
+            | b"--diagnostics"
     )
 }
 
@@ -994,6 +996,36 @@ mod tests {
         assert_eq!(
             unknown_option(b"--hermtic", Persona::Compat),
             "Unknown argument --hermtic"
+        );
+        assert_eq!(
+            unknown_option(b"--export-compile-command", Persona::Native),
+            "Unknown argument --export-compile-command. Did you mean: --export-compile-commands?"
+        );
+        assert_eq!(
+            unknown_option(b"--export-compile-command", Persona::Compat),
+            "Unknown argument --export-compile-command"
+        );
+    }
+
+    #[test]
+    fn debugger_rejects_inline_values_and_script_mode_flag_includes_diagnostics() {
+        assert!(super::script_mode_flag(b"--diagnostics"));
+        // Configure mode rejects `--debugger=foo` as an unknown argument.
+        let (host, result) = parse_with(Persona::Compat, &["--debugger=foo"]);
+        assert_eq!(result.err(), Some(1));
+        assert!(
+            stderr(&host).contains("Unknown argument --debugger=foo"),
+            "stderr={}",
+            stderr(&host)
+        );
+        // Script mode does not enable the debugger for `--debugger=foo`.
+        let (_, script_dbg) = parse_with(Persona::Compat, &["--debugger=foo", "-P", "x.cmake"]);
+        assert!(!run_options(script_dbg).debugger);
+        // `--diagnostics` after `-P` is still recognized in Native script mode.
+        let (_, post_p) = parse_with(Persona::Native, &["-P", "x.cmake", "--diagnostics=rich"]);
+        assert_eq!(
+            run_options(post_p).extensions.diagnostics,
+            Some(crate::persona::DiagStyle::Rich)
         );
     }
 

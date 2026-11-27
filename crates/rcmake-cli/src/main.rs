@@ -7,6 +7,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rcmake_base::BString;
 use rcmake_host::{Host, NativeHost, Stream};
@@ -18,10 +19,14 @@ const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// `math`, JSON, and syntax parsing).
 const STACK_RESERVE_BYTES: usize = 8 * 1024 * 1024;
 
+static PANIC_BANNER_PRINTED: AtomicBool = AtomicBool::new(false);
+
 fn install_panic_hook(is_lsp: bool, is_native: bool) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if std::env::var_os("RUST_BACKTRACE").is_some_and(|v| !v.is_empty() && v != "0") {
+        let backtrace =
+            std::env::var_os("RUST_BACKTRACE").is_some_and(|v| !v.is_empty() && v != "0");
+        if backtrace {
             default_hook(info);
         } else {
             let message = info
@@ -40,14 +45,17 @@ fn install_panic_hook(is_lsp: bool, is_native: bool) {
                 format!("CMake Internal Error: {message}\n")
             };
             let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+            PANIC_BANNER_PRINTED.store(true, Ordering::Relaxed);
         }
         #[cfg(panic = "abort")]
         {
-            if !is_lsp {
-                let _ = std::io::Write::write_all(
-                    &mut std::io::stderr(),
-                    b"CMake Internal Error (please report a bug)\n",
-                );
+            if !is_lsp && backtrace {
+                let banner: &[u8] = if is_native {
+                    b"rcmake: internal error (please report a bug)\n"
+                } else {
+                    b"CMake Internal Error (please report a bug)\n"
+                };
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), banner);
             }
             #[expect(
                 clippy::exit,
@@ -105,16 +113,20 @@ fn main() -> ExitCode {
     let is_rcmake = program
         .as_deref()
         .is_some_and(|path| stem_is(path, "rcmake"));
+    let is_native = is_rcmake && !oracle_mode;
     let lsp_program = program.as_deref().and_then(|path| {
         if stem_is(path, "rcmake-lsp") {
             Some("rcmake-lsp")
-        } else if first.as_deref() == Some(OsStr::new("lsp")) && is_rcmake && !oracle_mode {
+        } else if first.as_deref() == Some(OsStr::new("lsp"))
+            && is_native
+            && !Path::new("lsp").is_dir()
+        {
             Some("rcmake lsp")
         } else {
             None
         }
     });
-    install_panic_hook(lsp_program.is_some(), is_rcmake && !oracle_mode);
+    install_panic_hook(lsp_program.is_some(), is_native);
     if let Some(lsp_program) = lsp_program {
         let lsp_args: Vec<_> = if lsp_program == "rcmake-lsp" {
             first
@@ -138,7 +150,12 @@ fn main() -> ExitCode {
     let host = match NativeHost::new() {
         Ok(h) => Arc::new(h),
         Err(err) => {
-            let msg = format!("CMake Internal Error: failed to initialize host: {err}\n");
+            let prefix = if is_native {
+                "rcmake: internal error"
+            } else {
+                "CMake Internal Error"
+            };
+            let msg = format!("{prefix}: failed to initialize host: {err}\n");
             let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
             return ExitCode::from(1);
         }
@@ -158,8 +175,12 @@ fn main() -> ExitCode {
     let result = match spawned {
         Ok(handle) => handle.join(),
         Err(error) => {
-            let message =
-                format!("CMake Internal Error: failed to start the worker thread: {error}\n");
+            let prefix = if is_native {
+                "rcmake: internal error"
+            } else {
+                "CMake Internal Error"
+            };
+            let message = format!("{prefix}: failed to start the worker thread: {error}\n");
             host_for_panic.write_out(Stream::Stderr, message.as_bytes());
             return ExitCode::from(1);
         }
@@ -171,10 +192,14 @@ fn main() -> ExitCode {
         #[cfg(not(windows))]
         Ok(code) => ExitCode::from((code & 0xff) as u8),
         Err(_) => {
-            host_for_panic.write_out(
-                Stream::Stderr,
-                b"CMake Internal Error (please report a bug)\n",
-            );
+            if !PANIC_BANNER_PRINTED.load(Ordering::Relaxed) {
+                let banner: &[u8] = if is_native {
+                    b"rcmake: internal error (please report a bug)\n"
+                } else {
+                    b"CMake Internal Error (please report a bug)\n"
+                };
+                host_for_panic.write_out(Stream::Stderr, banner);
+            }
             ExitCode::from(1)
         }
     }

@@ -171,6 +171,8 @@ impl LintConfig {
 /// Complete parsed `.rcmake.toml` configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
+    /// Glob/path patterns excluded during directory discovery (`fmt` and `lint`).
+    pub exclude: Vec<String>,
     /// Formatter settings (`[fmt]`).
     pub fmt: FmtConfig,
     /// Linter settings (`[lint]` and `[lint.severity]`).
@@ -862,11 +864,35 @@ impl<'a> TomlParser<'a> {
         val_col: u32,
     ) -> Result<(), ConfigError> {
         match table {
-            Table::Root => Err(self.err(
-                key_line,
-                key_col,
-                format!("Top-level key '{key}' is not supported; place settings under [fmt], [lint], or [lint.severity]."),
-            )),
+            Table::Root => match key {
+                "exclude" => {
+                    let TomlValue::StringArray(items) = value else {
+                        return Err(self.err(
+                            val_line,
+                            val_col,
+                            "Expected an array of path/glob pattern strings for exclude.",
+                        ));
+                    };
+                    for (pattern, line, col) in items {
+                        if pattern.trim().is_empty() {
+                            return Err(self.err(
+                                line,
+                                col,
+                                "Exclude pattern in 'exclude' must not be empty.",
+                            ));
+                        }
+                        config.exclude.push(pattern);
+                    }
+                    Ok(())
+                }
+                _ => Err(self.err(
+                    key_line,
+                    key_col,
+                    format!(
+                        "Top-level key '{key}' is not supported; only 'exclude' is allowed at top level (place other settings under [fmt], [lint], or [lint.severity])."
+                    ),
+                )),
+            },
             Table::Fmt => match key {
                 "indent_width" => {
                     let TomlValue::Int(n) = value else {
@@ -1024,6 +1050,11 @@ mod tests {
     fn parses_valid_rcmake_toml() {
         let src = br#"
 # Project config
+exclude = [
+  "third_party/**",
+  "generated/*.cmake",
+]
+
 [fmt]
 indent_width = 4
 line_width = 120
@@ -1040,6 +1071,10 @@ unguarded-build-type = "error"
 old-policy = 'note'
 "#;
         let cfg = parse_config(src, Some(Path::new("/work/.rcmake.toml"))).expect("valid config");
+        assert_eq!(
+            cfg.exclude,
+            vec!["third_party/**".to_owned(), "generated/*.cmake".to_owned()]
+        );
         assert_eq!(cfg.fmt.indent_width, Some(4));
         assert_eq!(cfg.fmt.line_width, Some(120));
         assert_eq!(cfg.fmt.command_case, Some(CommandCase::Lower));
@@ -1080,6 +1115,8 @@ old-policy = 'note'
             ),
             ("[unknown]\nfoo = 1\n", "Unknown configuration table"),
             ("indent_width = 2\n", "Top-level key"),
+            ("exclude = \"vendor\"\n", "Expected an array"),
+            ("exclude = [\"\"]\n", "must not be empty"),
         ];
         for &(src, expected) in cases {
             let err = parse_config(src.as_bytes(), None).expect_err(src);
