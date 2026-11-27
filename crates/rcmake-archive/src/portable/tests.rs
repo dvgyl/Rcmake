@@ -10,13 +10,24 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 const KEY: [u8; 32] = [0xab; 32];
 const BLOB: [u8; 32] = [0x01; 32];
+const LIMITS: PortableLimits = PortableLimits {
+    archive_bytes: 256 * 1024 * 1024,
+    tar_bytes: 272 * 1024 * 1024,
+    member_bytes: 64 * 1024 * 1024,
+    manifest_bytes: 16 * 1024 * 1024,
+    total_bytes: 256 * 1024 * 1024,
+    members: 65_536,
+};
 
 fn sample() -> Result<Vec<u8>, ArchiveError> {
-    write_portable(&[
-        (PortableName::Manifest, b"{}\n".as_slice()),
-        (PortableName::Entry(KEY), b"entry frame".as_slice()),
-        (PortableName::Blob(BLOB), b"blob frame".as_slice()),
-    ])
+    write_portable(
+        &[
+            (PortableName::Manifest, b"{}\n".as_slice()),
+            (PortableName::Entry(KEY), b"entry frame".as_slice()),
+            (PortableName::Blob(BLOB), b"blob frame".as_slice()),
+        ],
+        &LIMITS,
+    )
 }
 
 fn gzip(tar: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -50,7 +61,7 @@ fn foreign_tar(members: &[(&str, EntryType, &[u8])]) -> Result<Vec<u8>, Box<dyn 
 }
 
 fn rejects(archive: &[u8], needle: &str) {
-    match read_portable(archive, &PortableLimits::default()) {
+    match read_portable(archive, &LIMITS) {
         Ok(members) => panic!("expected rejection containing {needle:?}, got {members:?}"),
         Err(error) => assert!(
             error.message.contains(needle),
@@ -64,7 +75,7 @@ fn rejects(archive: &[u8], needle: &str) {
 fn round_trip_is_deterministic_and_ordered() -> TestResult {
     let first = sample()?;
     assert_eq!(first, sample()?);
-    let members = read_portable(&first, &PortableLimits::default())?;
+    let members = read_portable(&first, &LIMITS)?;
     let names: Vec<_> = members.iter().map(|member| member.name).collect();
     assert_eq!(
         names,
@@ -91,10 +102,7 @@ fn foreign_ustar_regular_files_are_accepted() -> TestResult {
             b"x",
         ),
     ])?;
-    assert_eq!(
-        read_portable(&gzip(&tar)?, &PortableLimits::default())?.len(),
-        2
-    );
+    assert_eq!(read_portable(&gzip(&tar)?, &LIMITS)?.len(), 2);
     Ok(())
 }
 
@@ -114,7 +122,7 @@ fn writer_rejects_unsorted_or_duplicate_names() {
             (PortableName::Entry(KEY), b""),
         ],
     ] {
-        assert!(write_portable(&members).is_err());
+        assert!(write_portable(&members, &LIMITS).is_err());
     }
 }
 
@@ -273,7 +281,7 @@ fn corrupt_headers_are_rejected() -> TestResult {
 fn limits_apply_before_allocation() -> TestResult {
     let archive = sample()?;
     let strict = |change: fn(&mut PortableLimits)| {
-        let mut limits = PortableLimits::default();
+        let mut limits = LIMITS;
         change(&mut limits);
         read_portable(&archive, &limits)
     };
@@ -286,21 +294,74 @@ fn limits_apply_before_allocation() -> TestResult {
     assert!(strict(|_| {}).is_ok());
 
     // A small archive that inflates to a large declared member stops at the tar limit.
-    let bomb = write_portable(&[
-        (PortableName::Manifest, b"{}".as_slice()),
-        (
-            PortableName::Blob(BLOB),
-            vec![0u8; 4 * 1024 * 1024].as_slice(),
-        ),
-    ])?;
+    let bomb = write_portable(
+        &[
+            (PortableName::Manifest, b"{}".as_slice()),
+            (
+                PortableName::Blob(BLOB),
+                vec![0u8; 4 * 1024 * 1024].as_slice(),
+            ),
+        ],
+        &LIMITS,
+    )?;
     assert!(bomb.len() < 64 * 1024);
     let limits = PortableLimits {
         tar_bytes: 1024 * 1024,
-        ..PortableLimits::default()
+        ..LIMITS
     };
     let error = read_portable(&bomb, &limits)
         .err()
         .ok_or("expected a limit error")?;
     assert!(error.message.contains("size limit"), "{}", error.message);
+    Ok(())
+}
+
+#[test]
+fn writer_applies_the_reader_limits() -> TestResult {
+    let members = [
+        (PortableName::Manifest, b"{}\n".as_slice()),
+        (PortableName::Entry(KEY), b"entry frame".as_slice()),
+        (PortableName::Blob(BLOB), b"blob frame".as_slice()),
+    ];
+    let archive = write_portable(&members, &LIMITS)?;
+    let tar = 5 * BLOCK as u64 + 3 * BLOCK as u64;
+    for limits in [
+        PortableLimits {
+            members: 2,
+            ..LIMITS
+        },
+        PortableLimits {
+            member_bytes: 10,
+            ..LIMITS
+        },
+        PortableLimits {
+            manifest_bytes: 2,
+            ..LIMITS
+        },
+        PortableLimits {
+            total_bytes: 20,
+            ..LIMITS
+        },
+        PortableLimits {
+            tar_bytes: tar - 1,
+            ..LIMITS
+        },
+        PortableLimits {
+            archive_bytes: archive.len() as u64 - 1,
+            ..LIMITS
+        },
+    ] {
+        assert!(write_portable(&members, &limits).is_err(), "{limits:?}");
+        assert!(read_portable(&archive, &limits).is_err(), "{limits:?}");
+    }
+    let exact = PortableLimits {
+        tar_bytes: tar,
+        archive_bytes: archive.len() as u64,
+        total_bytes: 24,
+        members: 3,
+        ..LIMITS
+    };
+    assert_eq!(write_portable(&members, &exact)?, archive);
+    assert_eq!(read_portable(&archive, &exact)?.len(), 3);
     Ok(())
 }

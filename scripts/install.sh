@@ -537,7 +537,39 @@ try:
             if not (work / data_dir / required).is_file():
                 raise ValueError(f"Missing {required} in the archive.")
         (work / data_dir / data_marker).write_text("Managed by rcmake.\n", encoding="ascii")
-        subprocess.run([staged_bin, "--version"], check=True, stdout=subprocess.DEVNULL, timeout=30)
+        def version_token(lines: list[str], prefix_name: str) -> str | None:
+            want = f"{prefix_name.lower()} "
+            for raw_line in lines:
+                stripped = raw_line.strip()
+                if stripped.lower().startswith(want):
+                    token = stripped.split(None, 1)[1].strip()
+                    if token:
+                        return token
+            return None
+
+        staged_bin_out = subprocess.run(
+            [staged_bin, "--version"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        ).stdout.splitlines()
+        staged_rcmake_ver = version_token(staged_bin_out, "rcmake")
+        if staged_verify_is_file:
+            staged_verify_out = subprocess.run(
+                [staged_verify, "--version"],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            ).stdout.splitlines()
+            staged_verify_ver = version_token(staged_verify_out, "rcmake-verify")
+            if not staged_verify_ver:
+                raise ValueError("Staged rcmake-verify --version did not report a version.")
+            if staged_rcmake_ver and staged_verify_ver != staged_rcmake_ver:
+                raise ValueError(
+                    f"Staged rcmake-verify version ({staged_verify_ver}) does not match rcmake version ({staged_rcmake_ver})."
+                )
 
         staged_extras = [rel for rel in extra_share_files if (work / rel).is_file()]
         staged_doc = work / doc_dir
@@ -657,7 +689,12 @@ try:
                 owned.append(Path(*posix.parts))
             return owned
 
+        had_prior_rcmake = (
+            os.path.lexists(bin_dir / "rcmake")
+            or (installed_data / data_marker).is_file()
+        )
         installed: list[object] = []
+        removed_stale_verify = False
         try:
             ensure_dir(bin_dir)
             ensure_dir(installed_data.parent)
@@ -681,6 +718,11 @@ try:
                 record_and_backup(bin_dir / "rcmake-verify")
                 staged_verify.replace(bin_dir / "rcmake-verify")
                 installed.append(bin_dir / "rcmake-verify")
+            elif had_prior_rcmake:
+                old_verify = bin_dir / "rcmake-verify"
+                if old_verify.is_file() and not old_verify.is_symlink():
+                    record_and_backup(old_verify)
+                    removed_stale_verify = True
 
             if aliases == "true":
                 for tool in tools:
@@ -734,6 +776,22 @@ try:
 
             version = subprocess.run([bin_dir.resolve() / "rcmake", "--version"], check=True, timeout=30,
                                      stdout=subprocess.PIPE, text=True).stdout.splitlines()
+            installed_rcmake_ver = version_token(version, "rcmake")
+            if staged_verify_is_file:
+                verify_out = subprocess.run(
+                    [bin_dir.resolve() / "rcmake-verify", "--version"],
+                    check=True,
+                    timeout=30,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                ).stdout.splitlines()
+                installed_verify_ver = version_token(verify_out, "rcmake-verify")
+                if not installed_verify_ver:
+                    raise ValueError("Installed rcmake-verify --version did not report a version.")
+                if installed_rcmake_ver and installed_verify_ver != installed_rcmake_ver:
+                    raise ValueError(
+                        f"Installed rcmake-verify version ({installed_verify_ver}) does not match rcmake version ({installed_rcmake_ver})."
+                    )
         except Exception:
             for destination, saved in reversed(backups):
                 if os.path.lexists(destination):
@@ -755,6 +813,8 @@ try:
         print(f"Installed {name.lower()} into {prefix}:")
         for item in installed:
             print(f"  {item}")
+        if removed_stale_verify:
+            print(f"Removed previous {bin_dir / 'rcmake-verify'} because this archive omits rcmake-verify.")
 except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:
     sys.exit(f"Install failed. {error}")
 PY

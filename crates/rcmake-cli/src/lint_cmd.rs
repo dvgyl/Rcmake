@@ -7,13 +7,33 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_host::{Host, ReadRange, Stream, discover_cmake_root};
+use rcmake_host::{FileKind, Follow, Host, ReadRange, Stream, discover_cmake_root};
 use rcmake_language_tools::config::ConfigCache;
-use rcmake_language_tools::discovery::{discover_files, infer_project_root};
+use rcmake_language_tools::discovery::{
+    DiscoveryLimits, discover_files_with_limits, infer_project_root,
+};
 use rcmake_language_tools::lint::{
     Finding, HostWorkspaceReader, LintLimits, Severity, lint_bytes, render_terminal,
     sort_and_dedup_findings, to_sarif_document,
 };
+
+const MAX_TOTAL_READ_BYTES: usize = 256 * 1024 * 1024;
+const MAX_TOTAL_FINDINGS: usize = 16_384;
+
+#[derive(Clone, Copy)]
+struct LintRunBudget {
+    max_total_read_bytes: usize,
+    max_total_findings: usize,
+}
+
+impl Default for LintRunBudget {
+    fn default() -> Self {
+        Self {
+            max_total_read_bytes: MAX_TOTAL_READ_BYTES,
+            max_total_findings: MAX_TOTAL_FINDINGS,
+        }
+    }
+}
 
 const USAGE: &str = "\
 Usage: rcmake lint [OPTIONS] [PATHS...]
@@ -61,6 +81,22 @@ fn parse_args(args: &[BString]) -> Result<LintCliArgs, String> {
 
 /// Execute `rcmake lint`.
 pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>) -> i32 {
+    run_with_budgets(
+        args,
+        host,
+        DiscoveryLimits::default(),
+        LintLimits::default(),
+        LintRunBudget::default(),
+    )
+}
+
+fn run_with_budgets(
+    args: &[BString],
+    host: Arc<dyn Host>,
+    discovery_limits: DiscoveryLimits,
+    limits: LintLimits,
+    run_budget: LintRunBudget,
+) -> i32 {
     let parsed = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(msg) => {
@@ -74,7 +110,12 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
     }
 
     let cwd = host.initial_cwd();
-    let files = match discover_files(host.as_ref(), &cwd, &parsed.operands) {
+    let files = match discover_files_with_limits(
+        host.as_ref(),
+        &cwd,
+        &parsed.operands,
+        &discovery_limits,
+    ) {
         Ok(files) => files,
         Err(err) => {
             let msg = format!("rcmake lint: {}: {}\n", err.path.display(), err.message);
@@ -86,11 +127,12 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
     let bundled_modules = discover_cmake_root(host.as_ref(), None)
         .1
         .map(|root| root.join("Modules"));
-    let limits = LintLimits::default();
 
     let mut cfg_cache = ConfigCache::default();
     let mut all_findings: Vec<Finding> = Vec::new();
     let mut any_tool_error = false;
+    let mut total_read_bytes = 0usize;
+    let mut analyzed_files = 0usize;
 
     // Precompute readable roots so project-local static includes work across all operands.
     let mut roots_set = BTreeSet::new();
@@ -109,7 +151,18 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
         bundled_modules,
     );
 
-    for (path, root) in files.iter().zip(&file_roots) {
+    let total_files = files.len();
+    for (idx, (path, root)) in files.iter().zip(&file_roots).enumerate() {
+        if all_findings.len() >= run_budget.max_total_findings {
+            any_tool_error = true;
+            let msg = format!(
+                "rcmake lint: stopped after reaching the {} finding budget ({analyzed_files} of {total_files} files analyzed).\n",
+                run_budget.max_total_findings
+            );
+            host.write_out(Stream::Stderr, msg.as_bytes());
+            break;
+        }
+
         let dir = path.parent().unwrap_or(&cwd);
         let resolved_cfg = match cfg_cache.resolve(host.as_ref(), dir, Some(root)) {
             Ok(cfg) => cfg,
@@ -120,6 +173,47 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
                 continue;
             }
         };
+
+        let meta = match host.metadata(path, Follow::Yes) {
+            Ok(meta) if meta.kind == FileKind::File => meta,
+            Ok(_) => {
+                any_tool_error = true;
+                let msg = format!(
+                    "rcmake lint: {}: path is not a regular file.\n",
+                    path.display()
+                );
+                host.write_out(Stream::Stderr, msg.as_bytes());
+                continue;
+            }
+            Err(err) => {
+                any_tool_error = true;
+                let msg = format!("rcmake lint: {}: cannot stat file: {err}\n", path.display());
+                host.write_out(Stream::Stderr, msg.as_bytes());
+                continue;
+            }
+        };
+        if meta.len > limits.max_input_bytes as u64 {
+            any_tool_error = true;
+            let msg = format!(
+                "rcmake lint: {}: file exceeds the {} byte limit.\n",
+                path.display(),
+                limits.max_input_bytes
+            );
+            host.write_out(Stream::Stderr, msg.as_bytes());
+            continue;
+        }
+        let file_size = usize::try_from(meta.len).unwrap_or(usize::MAX);
+        if total_read_bytes.saturating_add(file_size) > run_budget.max_total_read_bytes {
+            any_tool_error = true;
+            let msg = format!(
+                "rcmake lint: stopped at {}: shared lint input budget ({} bytes) exceeded ({analyzed_files} of {total_files} files analyzed).\n",
+                path.display(),
+                run_budget.max_total_read_bytes
+            );
+            host.write_out(Stream::Stderr, msg.as_bytes());
+            break;
+        }
+        total_read_bytes = total_read_bytes.saturating_add(file_size);
 
         let bytes = match host.read(
             path,
@@ -139,16 +233,60 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
             }
         };
 
+        let remaining_findings = run_budget
+            .max_total_findings
+            .saturating_sub(all_findings.len());
+        let file_limits = LintLimits {
+            max_findings: limits.max_findings.min(remaining_findings),
+            ..limits
+        };
+
         match lint_bytes(
             path,
             &bytes,
             &resolved_cfg.config.lint,
-            &limits,
+            &file_limits,
             &reader,
             Some(root),
         ) {
             Ok(result) => {
+                analyzed_files += 1;
                 all_findings.extend(result.findings);
+                if result.scope_truncated {
+                    any_tool_error = true;
+                    let msg = format!(
+                        "rcmake lint: {}: scope tracking reached a resource limit; analysis for this file may be incomplete.\n",
+                        path.display()
+                    );
+                    host.write_out(Stream::Stderr, msg.as_bytes());
+                }
+                if result.findings_truncated {
+                    any_tool_error = true;
+                    if all_findings.len() >= run_budget.max_total_findings {
+                        let msg = format!(
+                            "rcmake lint: stopped after reaching the {} finding budget ({analyzed_files} of {total_files} files analyzed).\n",
+                            run_budget.max_total_findings
+                        );
+                        host.write_out(Stream::Stderr, msg.as_bytes());
+                        break;
+                    }
+                    let msg = format!(
+                        "rcmake lint: {}: findings truncated at the {} per-file limit.\n",
+                        path.display(),
+                        limits.max_findings
+                    );
+                    host.write_out(Stream::Stderr, msg.as_bytes());
+                } else if all_findings.len() >= run_budget.max_total_findings
+                    && idx + 1 < total_files
+                {
+                    any_tool_error = true;
+                    let msg = format!(
+                        "rcmake lint: stopped after reaching the {} finding budget ({analyzed_files} of {total_files} files analyzed).\n",
+                        run_budget.max_total_findings
+                    );
+                    host.write_out(Stream::Stderr, msg.as_bytes());
+                    break;
+                }
             }
             Err(err) => {
                 any_tool_error = true;
@@ -294,5 +432,65 @@ mod tests {
         let code = run(None, &[], Arc::clone(&host) as Arc<dyn Host>);
         assert_eq!(code, 2);
         assert!(stderr_str(&host).contains("Unknown lint rule"));
+    }
+
+    #[test]
+    fn lint_enforces_invocation_finding_and_input_byte_budgets_with_stderr_notice() {
+        let work = Path::new("/work");
+        let host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        for i in 0..4 {
+            host.seed_file(
+                &work.join(format!("mod_{i}.cmake")),
+                b"cmake_policy(SET CMP0077 OLD)\ncmake_policy(SET CMP0077 OLD)\n",
+            )
+            .unwrap();
+        }
+        let code = run_with_budgets(
+            &[],
+            Arc::clone(&host) as Arc<dyn Host>,
+            DiscoveryLimits::default(),
+            LintLimits::default(),
+            LintRunBudget {
+                max_total_read_bytes: MAX_TOTAL_READ_BYTES,
+                max_total_findings: 3,
+            },
+        );
+        assert_eq!(code, 2);
+        let err = stderr_str(&host);
+        assert!(err.contains("finding budget"), "stderr={err}");
+        let out = stdout_str(&host);
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.contains("[old-policy]"))
+                .count(),
+            3,
+            "stdout={out}"
+        );
+
+        let byte_host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        for i in 0..3 {
+            byte_host
+                .seed_file(
+                    &work.join(format!("big_{i}.cmake")),
+                    b"cmake_policy(SET CMP0077 OLD)\n",
+                )
+                .unwrap();
+        }
+        let byte_code = run_with_budgets(
+            &[],
+            Arc::clone(&byte_host) as Arc<dyn Host>,
+            DiscoveryLimits::default(),
+            LintLimits::default(),
+            LintRunBudget {
+                max_total_read_bytes: 40,
+                max_total_findings: MAX_TOTAL_FINDINGS,
+            },
+        );
+        assert_eq!(byte_code, 2);
+        assert!(
+            stderr_str(&byte_host).contains("shared lint input budget"),
+            "stderr={}",
+            stderr_str(&byte_host)
+        );
     }
 }

@@ -1598,3 +1598,27 @@ fn ninja_compile_definitions_quote_the_value() {
         r#"-DEMPTY="" -DPLAIN -DWORDS="long long""#,
     );
 }
+
+#[test]
+fn ninja_multi_config_places_cmake_intdir_between_target_and_source_defines() {
+    let config = ConfigId("Debug".into());
+    let mut model = fixture("Linux");
+    model.generator = Some(rcmake_model::GeneratorKind::NinjaMultiConfig);
+    var(&mut model, "CMAKE_HOST_SYSTEM_NAME", "Linux");
+    let target = raw_target("app", TargetKind::Executable);
+    let group = CompileGroup {
+        defines: vec![
+            bt("ZZZ=1"),
+            bt("FOO=1"),
+            bt("AAA=1"),
+            bt("SRC_Z=1"),
+            bt("SRC_A=1"),
+        ],
+        source_define_start: Some(3),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::compile::formatted_defines(&model, &target, &config, &group),
+        r#"-DAAA=1 -DFOO=1 -DZZZ=1 -DCMAKE_INTDIR=\"Debug\" -DSRC_A=1 -DSRC_Z=1"#,
+    );
+}

@@ -1,6 +1,7 @@
 //! Deterministic `PureHost` unit tests for `rcmake-verify` covering parity, semantic
-//! divergences, File API containment (`P1-09`), Ninja dry-run guards (`P1-13`), version
-//! validation, and scratch isolation.
+//! divergences, File API containment, compile-db bounds, receiver-side typed option
+//! validation, trusted Ninja dry-run guards, version validation, deadline enforcement,
+//! and scratch isolation.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,8 @@ use rcmake_base::BString;
 use rcmake_host::{Host, HostError, ProcessResult, PureHost, RunOutput, RunRequest, Stream, path};
 use serde_json::{Value, json};
 
-use super::run;
+use super::protocol::VerifyRequest;
+use super::{execute_request_with_deadline, run};
 
 #[derive(Clone)]
 struct FakeRunSpec {
@@ -24,12 +26,19 @@ struct FakeRunSpec {
     write_fileapi: bool,
     symlink_escape_reply: bool,
     write_compdb: bool,
+    compdb_raw_override: Option<String>,
     compdb_extra_flag: Option<String>,
+    compdb_files: Vec<(String, Vec<u8>)>,
     make_program: String,
     ninja_dyndep_missing: bool,
+    ninja_extra_manifest_lines: Vec<String>,
+    ninja_extra_files: Vec<(String, String)>,
     ninja_commands: Vec<String>,
+    ninja_stdout_override: Option<String>,
     ninja_regen_only: bool,
+    ninja_mixed_regen: bool,
     two_targets_same_source: bool,
+    configure_sleep: Duration,
 }
 
 impl Default for FakeRunSpec {
@@ -48,20 +57,28 @@ impl Default for FakeRunSpec {
             write_fileapi: true,
             symlink_escape_reply: false,
             write_compdb: true,
+            compdb_raw_override: None,
             compdb_extra_flag: None,
+            compdb_files: Vec::new(),
             make_program: "/usr/bin/ninja".to_owned(),
             ninja_dyndep_missing: false,
+            ninja_extra_manifest_lines: Vec::new(),
+            ninja_extra_files: Vec::new(),
             ninja_commands: vec![
                 "/usr/bin/cc -DFOO=1 -c <SRC>/main.c -o CMakeFiles/app.dir/main.c.o".to_owned(),
                 "/usr/bin/cc CMakeFiles/app.dir/main.c.o -o app".to_owned(),
             ],
+            ninja_stdout_override: None,
             ninja_regen_only: false,
+            ninja_mixed_regen: false,
             two_targets_same_source: false,
+            configure_sleep: Duration::from_millis(5),
         }
     }
 }
 
-type RecordedRuns = Arc<Mutex<Vec<(String, String, String, bool)>>>;
+type RecordedRuns = Arc<Mutex<Vec<(String, String, String, bool, Vec<(BString, BString)>)>>>;
+type ExecutedPrograms = Arc<Mutex<Vec<String>>>;
 
 struct FakeEnv {
     host: Arc<PureHost>,
@@ -71,11 +88,13 @@ struct FakeEnv {
     oracle_spec: FakeRunSpec,
     rcmake_spec: FakeRunSpec,
     recorded_staged_paths: RecordedRuns,
+    executed_programs: ExecutedPrograms,
 }
 
 impl FakeEnv {
     fn new(oracle_spec: FakeRunSpec, rcmake_spec: FakeRunSpec) -> Self {
         let host = Arc::new(PureHost::default());
+        host.env_set(b"PATH", Some(b"/usr/bin"));
         host.seed_file(Path::new("/bin/rcmake"), b"#!/bin/sh\n")
             .expect("seed rcmake");
         host.seed_file(Path::new("/opt/cmake/bin/cmake"), b"#!/bin/sh\n")
@@ -101,6 +120,7 @@ impl FakeEnv {
             oracle_spec,
             rcmake_spec,
             recorded_staged_paths: Arc::new(Mutex::new(Vec::new())),
+            executed_programs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -111,6 +131,7 @@ impl FakeEnv {
         let oracle_spec = self.oracle_spec.clone();
         let rcmake_spec = self.rcmake_spec.clone();
         let recorded = Arc::clone(&self.recorded_staged_paths);
+        let executed = Arc::clone(&self.executed_programs);
 
         self.host
             .set_command_handler(move |host_ref, req: &RunRequest, _| {
@@ -118,6 +139,7 @@ impl FakeEnv {
                     return Err(HostError::unsupported("empty pipeline"));
                 };
                 let prog = String::from_utf8_lossy(&cmd.program).into_owned();
+                executed.lock().expect("lock").push(prog.clone());
                 let args: Vec<String> = cmd
                     .args
                     .iter()
@@ -167,13 +189,25 @@ impl FakeEnv {
                     } else {
                         &oracle_spec
                     };
+                    if let Some(raw_out) = &spec.ninja_stdout_override {
+                        return Ok(exited_out(0, raw_out.as_bytes()));
+                    }
                     let src = req.cwd.parent().map(|p| p.join("src")).unwrap_or_default();
-                    let src_s = src.display().to_string();
+                    let src_s = String::from_utf8_lossy(&path::from_native_cmake(&src)).into_owned();
                     let mut stdout = String::new();
                     if spec.ninja_regen_only {
                         stdout.push_str(
                             "[1/1] /opt/cmake/bin/cmake --regenerate-during-build -S/s -B/b\n",
                         );
+                    } else if spec.ninja_mixed_regen {
+                        stdout.push_str(
+                            "[1/2] /opt/cmake/bin/cmake --regenerate-during-build -S/s -B/b\n",
+                        );
+                        stdout.push_str(&format!(
+                            "[2/2] /usr/bin/cc -DFOO=1 -c {src_s}/main.c -o CMakeFiles/app.dir/main.c.o\n"
+                        ));
+                    } else if spec.ninja_commands.is_empty() {
+                        stdout.push_str("ninja: no work to do.\n");
                     } else {
                         let total = spec.ninja_commands.len();
                         for (idx, line) in spec.ninja_commands.iter().enumerate() {
@@ -202,9 +236,15 @@ impl FakeEnv {
                     src.clone(),
                     bin.clone(),
                     oracle_mode,
+                    req.env.clone(),
                 ));
 
-                host_ref.sleep(Duration::from_millis(if is_rcmake { 5 } else { 15 }));
+                let sleep = if is_rcmake {
+                    spec.configure_sleep
+                } else {
+                    spec.configure_sleep.saturating_mul(3)
+                };
+                host_ref.sleep(sleep);
 
                 if spec.timed_out {
                     return Ok(RunOutput {
@@ -233,8 +273,7 @@ impl FakeEnv {
             .expect("handler");
     }
 
-    fn run_verify(&self, json_out: bool, extra_req: Value) -> (i32, String, String) {
-        self.install_runner();
+    fn build_request_json(&self, json_out: bool, extra_req: Value) -> Value {
         let mut req = json!({
             "schema_version": 1,
             "rcmake_exe": "/bin/rcmake",
@@ -243,8 +282,7 @@ impl FakeEnv {
             "excluded_build_dir": "/proj/build",
             "cwd_rel_to_source": "",
             "args": [
-                { "kind": "literal", "value": "-G" },
-                { "kind": "literal", "value": self.oracle_spec.generator }
+                { "kind": "generator", "value": self.oracle_spec.generator }
             ],
             "json": json_out,
             "request_compile_commands": true,
@@ -257,6 +295,12 @@ impl FakeEnv {
                 base.insert(k.clone(), v.clone());
             }
         }
+        req
+    }
+
+    fn run_verify(&self, json_out: bool, extra_req: Value) -> (i32, String, String) {
+        self.install_runner();
+        let req = self.build_request_json(json_out, extra_req);
         self.host
             .seed_stdin(req.to_string().as_bytes())
             .expect("stdin");
@@ -425,7 +469,16 @@ fn materialize_run(
         }
     }
 
-    if spec.write_compdb {
+    for (rel, contents) in &spec.compdb_files {
+        host.seed_file(&bin.join(rel), contents)
+            .expect("seed compdb helper file");
+    }
+
+    if let Some(raw_compdb) = &spec.compdb_raw_override {
+        let rendered = raw_compdb.replace("<SRC>", src).replace("<BIN>", &bin_s);
+        host.seed_file(&bin.join("compile_commands.json"), rendered.as_bytes())
+            .expect("seed override compdb");
+    } else if spec.write_compdb {
         let mut rows = Vec::new();
         let extra = spec
             .compdb_extra_flag
@@ -474,14 +527,25 @@ fn materialize_run(
         if spec.ninja_dyndep_missing {
             ninja.push_str("  dyndep = CMakeFiles/app.dir/CXX.dd\n");
         }
+        for line in &spec.ninja_extra_manifest_lines {
+            ninja.push_str(line);
+            ninja.push('\n');
+        }
         host.seed_file(&bin.join("build.ninja"), ninja.as_bytes())
             .expect("seed build.ninja");
+        for (rel, body) in &spec.ninja_extra_files {
+            host.seed_file(&bin.join(rel), body.as_bytes())
+                .expect("seed extra ninja file");
+        }
     }
 }
 
 #[test]
-fn parity_passes_with_identical_staged_paths_and_leaves_caller_trees_intact() {
+fn parity_passes_with_identical_staged_paths_and_isolated_tool_envs() {
     let env = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    env.host.env_set(b"CCACHE_DIR", Some(b"/shared/ccache"));
+    env.host.env_set(b"SCCACHE_DIR", Some(b"/shared/sccache"));
+    env.host.env_set(b"USERPROFILE", Some(b"/shared/profile"));
     let (code, stdout, stderr) = env.run_verify(true, json!({}));
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let doc: Value = serde_json::from_str(&stdout).expect("json");
@@ -495,13 +559,36 @@ fn parity_passes_with_identical_staged_paths_and_leaves_caller_trees_intact() {
     assert_eq!(doc["sections"]["compile_commands"]["status"], "equal");
     assert_eq!(doc["sections"]["ninja_dry_run"]["status"], "equal");
 
-    // Verify BOTH engines ran against identical staged absolute paths and rcmake used compat mode.
+    // Verify BOTH engines ran against identical staged absolute paths and isolated writable envs.
     let runs = env.recorded_staged_paths.lock().expect("lock");
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].1, runs[1].1, "staged source path must be identical");
     assert_eq!(runs[0].2, runs[1].2, "staged build path must be identical");
     assert!(!runs[0].3, "oracle should not receive RCMAKE_ORACLE_MODE=1");
     assert!(runs[1].3, "rcmake must run under RCMAKE_ORACLE_MODE=1");
+
+    for (_, _, _, _, child_env) in runs.iter() {
+        let lookup = |key: &[u8]| {
+            child_env
+                .iter()
+                .find(|(k, _)| k.as_slice() == key)
+                .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+        };
+        for var in [
+            b"USERPROFILE".as_slice(),
+            b"APPDATA",
+            b"LOCALAPPDATA",
+            b"CCACHE_DIR",
+            b"SCCACHE_DIR",
+        ] {
+            let val = lookup(var).expect("isolated env var must be present");
+            assert!(
+                val.contains("rcmake-verify-") && !val.starts_with("/shared"),
+                "expected isolated scratch path for {}, got {val}",
+                String::from_utf8_lossy(var)
+            );
+        }
+    }
 
     // Original source and build trees are untouched.
     assert_eq!(
@@ -601,7 +688,7 @@ fn handles_missing_fileapi_symlink_escape_matched_failure_and_timeout() {
     assert_eq!(d2["verdict"], "incomplete_evidence");
     assert_eq!(d2["sections"]["codemodel"]["status"], "unavailable");
 
-    // Symlink escaping reply directory rejected by ArtifactReader (P1-09) -> exit 2.
+    // Symlink escaping reply directory rejected by ArtifactReader -> exit 2.
     let r_sym = FakeRunSpec {
         symlink_escape_reply: true,
         ..Default::default()
@@ -637,7 +724,7 @@ fn handles_missing_fileapi_symlink_escape_matched_failure_and_timeout() {
 }
 
 #[test]
-fn ninja_dry_run_guards_wrapper_dyndep_regen_and_non_ninja_generator() {
+fn ninja_dry_run_never_executes_cached_make_program_and_rejects_incomplete_manifests() {
     // Non-Ninja generator -> inapplicable (exit 0).
     let make_spec = FakeRunSpec {
         generator: "Unix Makefiles".to_owned(),
@@ -649,15 +736,70 @@ fn ninja_dry_run_guards_wrapper_dyndep_regen_and_non_ninja_generator() {
     let dm: Value = serde_json::from_str(&outm).expect("json");
     assert_eq!(dm["sections"]["ninja_dry_run"]["status"], "inapplicable");
 
-    // Non-Ninja wrapper make program -> unavailable (exit 2, P1-13).
-    let mut env_wrap = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
-    env_wrap.ninja_valid = false;
+    // Custom wrapper recorded in CMAKE_MAKE_PROGRAM -> unavailable AND NEVER executed.
+    let wrapper_spec = FakeRunSpec {
+        make_program: "/tmp/custom-wrapper".to_owned(),
+        ..Default::default()
+    };
+    let env_wrap = FakeEnv::new(wrapper_spec.clone(), wrapper_spec);
     let (cw, outw, _) = env_wrap.run_verify(true, json!({}));
-    assert_eq!(cw, 2);
+    assert_eq!(cw, 2, "{outw}");
     let dw: Value = serde_json::from_str(&outw).expect("json");
     assert_eq!(dw["sections"]["ninja_dry_run"]["status"], "unavailable");
+    assert!(
+        env_wrap
+            .executed_programs
+            .lock()
+            .expect("lock")
+            .iter()
+            .all(|p| !p.contains("custom-wrapper")),
+        "cached CMAKE_MAKE_PROGRAM wrapper must never be executed"
+    );
 
-    // Unresolved dyndep in build.ninja -> unavailable (exit 2, P1-13).
+    // Variable-dependent include -> unavailable (exit 2).
+    let var_inc = FakeRunSpec {
+        ninja_extra_manifest_lines: vec!["include $EXTRA_RULES".to_owned()],
+        ..Default::default()
+    };
+    let env_var = FakeEnv::new(var_inc.clone(), var_inc);
+    let (cv, outv, _) = env_var.run_verify(true, json!({}));
+    assert_eq!(cv, 2, "{outv}");
+    let dv: Value = serde_json::from_str(&outv).expect("json");
+    assert_eq!(dv["sections"]["ninja_dry_run"]["status"], "unavailable");
+
+    // Missing/external include -> unavailable (exit 2).
+    let ext_inc = FakeRunSpec {
+        ninja_extra_manifest_lines: vec!["include ../outside.ninja".to_owned()],
+        ..Default::default()
+    };
+    let env_ext = FakeEnv::new(ext_inc.clone(), ext_inc);
+    let (ce, oute, _) = env_ext.run_verify(true, json!({}));
+    assert_eq!(ce, 2, "{oute}");
+    let de: Value = serde_json::from_str(&oute).expect("json");
+    assert_eq!(de["sections"]["ninja_dry_run"]["status"], "unavailable");
+
+    // Include depth beyond limit (10 nested includes) -> unavailable (exit 2).
+    let mut chain_files = Vec::new();
+    for i in 1..=10 {
+        let next = if i < 10 {
+            format!("include inc{}.ninja\n", i + 1)
+        } else {
+            String::new()
+        };
+        chain_files.push((format!("inc{i}.ninja"), next));
+    }
+    let deep_inc = FakeRunSpec {
+        ninja_extra_manifest_lines: vec!["include inc1.ninja".to_owned()],
+        ninja_extra_files: chain_files,
+        ..Default::default()
+    };
+    let env_deep = FakeEnv::new(deep_inc.clone(), deep_inc);
+    let (cd, outd, _) = env_deep.run_verify(true, json!({}));
+    assert_eq!(cd, 2, "{outd}");
+    let ddeep: Value = serde_json::from_str(&outd).expect("json");
+    assert_eq!(ddeep["sections"]["ninja_dry_run"]["status"], "unavailable");
+
+    // Unresolved dyndep -> unavailable (exit 2).
     let dd = FakeRunSpec {
         ninja_dyndep_missing: true,
         ..Default::default()
@@ -668,16 +810,210 @@ fn ninja_dry_run_guards_wrapper_dyndep_regen_and_non_ninja_generator() {
     let ddd: Value = serde_json::from_str(&outdd).expect("json");
     assert_eq!(ddd["sections"]["ninja_dry_run"]["status"], "unavailable");
 
-    // Regeneration-only Ninja output -> unavailable (exit 2, P1-13).
-    let rg = FakeRunSpec {
-        ninja_regen_only: true,
+    // Regeneration-only AND mixed regen+build output -> unavailable (exit 2).
+    for spec in [
+        FakeRunSpec {
+            ninja_regen_only: true,
+            ..Default::default()
+        },
+        FakeRunSpec {
+            ninja_mixed_regen: true,
+            ..Default::default()
+        },
+        FakeRunSpec {
+            ninja_stdout_override: Some("unexpected wrapper chatter\n".to_owned()),
+            ..Default::default()
+        },
+        FakeRunSpec {
+            ninja_stdout_override: Some(String::new()),
+            ..Default::default()
+        },
+    ] {
+        let env_bad = FakeEnv::new(spec.clone(), spec);
+        let (code, out, _) = env_bad.run_verify(true, json!({}));
+        assert_eq!(code, 2, "{out}");
+        let doc: Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(doc["sections"]["ninja_dry_run"]["status"], "unavailable");
+    }
+}
+
+#[test]
+fn compile_db_marks_malformed_truncated_and_deep_nested_responses_incomplete() {
+    // Malformed row (missing `file`) must NEVER be silently skipped into parity.
+    let missing_file = FakeRunSpec {
+        compdb_raw_override: Some(
+            r#"[{"directory":"<BIN>","command":"/usr/bin/cc -c <SRC>/main.c"}]"#.to_owned(),
+        ),
         ..Default::default()
     };
-    let env_rg = FakeEnv::new(rg.clone(), rg);
-    let (crg, outrg, _) = env_rg.run_verify(true, json!({}));
-    assert_eq!(crg, 2);
-    let drg: Value = serde_json::from_str(&outrg).expect("json");
-    assert_eq!(drg["sections"]["ninja_dry_run"]["status"], "unavailable");
+    let env_mf = FakeEnv::new(missing_file.clone(), missing_file);
+    let (cmf, outmf, _) = env_mf.run_verify(true, json!({}));
+    assert_eq!(cmf, 2, "{outmf}");
+    let dmf: Value = serde_json::from_str(&outmf).expect("json");
+    assert_eq!(dmf["verdict"], "incomplete_evidence");
+    assert_eq!(dmf["sections"]["compile_commands"]["status"], "unavailable");
+
+    // Non-string element inside `arguments` must NOT be dropped silently.
+    let bad_arg = FakeRunSpec {
+        compdb_raw_override: Some(
+            r#"[{"directory":"<BIN>","file":"<SRC>/main.c","arguments":["/usr/bin/cc",42,"-c","<SRC>/main.c"]}]"#
+                .to_owned(),
+        ),
+        ..Default::default()
+    };
+    let env_ba = FakeEnv::new(bad_arg.clone(), bad_arg);
+    let (cba, outba, _) = env_ba.run_verify(true, json!({}));
+    assert_eq!(cba, 2, "{outba}");
+    let dba: Value = serde_json::from_str(&outba).expect("json");
+    assert_eq!(dba["sections"]["compile_commands"]["status"], "unavailable");
+
+    // Single `@big.rsp` with 65,537 tokens (1 token past MAX_COMPDB_TOKENS) must be detected.
+    let over_limit: String = (0..65_537)
+        .map(|i| format!("-DX{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let truncated_rsp = FakeRunSpec {
+        compdb_raw_override: Some(
+            r#"[{"directory":"<BIN>","file":"<SRC>/main.c","arguments":["@big.rsp"]}]"#.to_owned(),
+        ),
+        compdb_files: vec![("big.rsp".to_owned(), over_limit.into_bytes())],
+        ..Default::default()
+    };
+    let env_tr = FakeEnv::new(truncated_rsp.clone(), truncated_rsp);
+    let (ctr, outtr, _) = env_tr.run_verify(true, json!({}));
+    assert_eq!(ctr, 2, "{outtr}");
+    let dtr: Value = serde_json::from_str(&outtr).expect("json");
+    assert_eq!(dtr["verdict"], "incomplete_evidence");
+    assert_eq!(dtr["sections"]["compile_commands"]["status"], "unavailable");
+
+    // Bounded nested `@a.rsp` -> `@b.rsp` resolves cleanly and achieves parity.
+    let nested_ok = FakeRunSpec {
+        compdb_raw_override: Some(
+            r#"[{"directory":"<BIN>","file":"<SRC>/main.c","arguments":["/usr/bin/cc","@a.rsp","-c","<SRC>/main.c","-o","CMakeFiles/app.dir/main.c.o"]}]"#
+                .to_owned(),
+        ),
+        compdb_files: vec![
+            ("a.rsp".to_owned(), b"-DFOO=1 @b.rsp".to_vec()),
+            ("b.rsp".to_owned(), b"-DBAR=2".to_vec()),
+        ],
+        ..Default::default()
+    };
+    let env_ok = FakeEnv::new(nested_ok.clone(), nested_ok);
+    let (cok, outok, _) = env_ok.run_verify(true, json!({}));
+    assert_eq!(cok, 0, "{outok}");
+
+    // Cyclic `@a.rsp` -> `@b.rsp` -> `@a.rsp` must report incomplete_evidence (exit 2).
+    let cyclic = FakeRunSpec {
+        compdb_raw_override: Some(
+            r#"[{"directory":"<BIN>","file":"<SRC>/main.c","arguments":["/usr/bin/cc","@a.rsp"]}]"#
+                .to_owned(),
+        ),
+        compdb_files: vec![
+            ("a.rsp".to_owned(), b"@b.rsp".to_vec()),
+            ("b.rsp".to_owned(), b"@a.rsp".to_vec()),
+        ],
+        ..Default::default()
+    };
+    let env_cyc = FakeEnv::new(cyclic.clone(), cyclic);
+    let (ccyc, outcyc, _) = env_cyc.run_verify(true, json!({}));
+    assert_eq!(ccyc, 2, "{outcyc}");
+    let dcyc: Value = serde_json::from_str(&outcyc).expect("json");
+    assert_eq!(dcyc["verdict"], "incomplete_evidence");
+    assert_eq!(
+        dcyc["sections"]["compile_commands"]["status"],
+        "unavailable"
+    );
+}
+
+#[test]
+fn receiver_rejects_injected_raw_options_escaping_cwd_and_preset_redirects() {
+    // Direct `--request-stdin` callers cannot pass legacy raw literal options.
+    let env_lit = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    let (cl, _, errl) = env_lit.run_verify(
+        true,
+        json!({ "args": [{ "kind": "literal", "value": "--graphviz=/tmp/out.dot" }] }),
+    );
+    assert_eq!(cl, 2);
+    assert!(errl.contains("Unsupported or disallowed"), "{errl}");
+
+    // Direct caller cannot escape source via `cwd_rel_to_source`.
+    let env_cwd = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    let (cc, _, errc) = env_cwd.run_verify(true, json!({ "cwd_rel_to_source": "../outside" }));
+    assert_eq!(cc, 2);
+    assert!(errc.contains("staged source"), "{errc}");
+
+    // Direct caller cannot inject path separators in `project_file`.
+    let env_pf = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    let (cp, _, errp) = env_pf.run_verify(
+        true,
+        json!({ "args": [{ "kind": "project_file", "value": "../evil.txt" }] }),
+    );
+    assert_eq!(cp, 2);
+    assert!(errp.contains("--project-file"), "{errp}");
+
+    // Direct caller cannot bypass preset redirect rejection (`graphviz` / `trace.redirect`).
+    let env_pr = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    env_pr
+        .host
+        .seed_file(
+            Path::new("/proj/CMakePresets.json"),
+            br#"{"version":6,"configurePresets":[{"name":"bad","graphviz":"/tmp/g.dot"}]}"#,
+        )
+        .expect("seed presets");
+    let (cpr, outpr, _) = env_pr.run_verify(
+        true,
+        json!({ "args": [{ "kind": "preset", "value": "bad" }] }),
+    );
+    assert_eq!(cpr, 2, "{outpr}");
+    let dpr: Value = serde_json::from_str(&outpr).expect("json");
+    assert_eq!(dpr["verdict"], "invalid_input");
+    assert!(
+        dpr["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("graphviz")),
+        "{outpr}"
+    );
+}
+
+#[test]
+fn skips_tmpdir_inside_source_and_enforces_overall_deadline() {
+    // TMPDIR pointing inside `/proj` must be skipped so scratch is placed outside `/proj`.
+    let env = FakeEnv::new(FakeRunSpec::default(), FakeRunSpec::default());
+    env.host
+        .seed_file(Path::new("/proj/tmp/marker.txt"), b"keep")
+        .expect("seed inner tmp");
+    env.host.env_set(b"TMPDIR", Some(b"/proj/tmp"));
+    // Also verify relative directory symlinks (even alphabetically before their target) stage cleanly.
+    env.host
+        .seed_file(Path::new("/proj/zzz_dir/hdr.h"), b"#define OK 1\n")
+        .expect("seed target dir");
+    env.host
+        .symlink(Path::new("zzz_dir"), Path::new("/proj/aaa_link"))
+        .expect("seed relative dir symlink");
+    let (code, stdout, stderr) = env.run_verify(true, json!({}));
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let runs = env.recorded_staged_paths.lock().expect("lock");
+    assert!(
+        !runs[0].1.starts_with("/proj/"),
+        "scratch must be outside source: {}",
+        runs[0].1
+    );
+
+    // Overall deadline expiry stops the second configure cleanly with incomplete_evidence.
+    let slow_spec = FakeRunSpec {
+        configure_sleep: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let env_dl = FakeEnv::new(slow_spec.clone(), slow_spec);
+    env_dl.install_runner();
+    let req_json = env_dl.build_request_json(true, json!({}));
+    let req = VerifyRequest::parse_json(env_dl.host.as_ref(), req_json.to_string().as_bytes())
+        .expect("parse req");
+    let code_dl = execute_request_with_deadline(env_dl.host.as_ref(), &req, Duration::from_secs(3));
+    let out_dl = String::from_utf8_lossy(&env_dl.host.stream_bytes(Stream::Stdout)).into_owned();
+    assert_eq!(code_dl, 2, "{out_dl}");
+    let doc_dl: Value = serde_json::from_str(&out_dl).expect("json");
+    assert_eq!(doc_dl["verdict"], "incomplete_evidence");
 }
 
 #[test]

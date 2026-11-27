@@ -170,7 +170,9 @@ fn push_path_text(text: &[u8], prefix: &[u8], start: &mut bool, out: &mut Vec<Ge
     if text.is_empty() {
         return;
     }
-    if *start && text != b";" && !Lexical::new(text).absolute() {
+    // CMake treats a leading `/` as a full path on every platform, also on Windows.
+    let full = text.starts_with(b"/") || Lexical::new(text).absolute();
+    if *start && text != b";" && !full {
         out.push(GenexNode::Text(prefix.into()));
     }
     out.push(GenexNode::Text(text.into()));

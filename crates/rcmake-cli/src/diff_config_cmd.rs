@@ -6,13 +6,16 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rcmake_api::Freshness;
 use rcmake_base::BString;
 use rcmake_buildinfo::{
-    CacheSet, DiffOptions, QUERY_FILES, Section, compare, load, render_json, render_text,
+    CacheSet, DiffOptions, PackageObservation, QUERY_FILES, Section, TraceCall, TraceInput,
+    compare, load, render_json, render_text, validate,
 };
 use rcmake_host::{FileKind, Follow, Host, Stream, WriteMode};
 use rcmake_presets::{EnvSnapshot, PresetKind};
 
+use crate::configure::find_hints;
 use crate::resolve_cli_path;
 
 const HELP: &str = "\
@@ -48,11 +51,11 @@ Examples
   rcmake diff-config --prepare build-a build-b
 
 Exit status
-  0  No differences.
+  0  No differences, and every requested section had complete evidence.
   1  Differences found.
-  2  Invalid arguments or an unreadable build directory.
-  3  No differences in the compared sections, but a requested section had no
-     usable data on one side.
+  2  The evidence is incomplete for a requested section, so parity is not
+     proved. Also invalid arguments, an unknown target or configuration, or an
+     unreadable build directory. Use --only to limit the compared sections.
 ";
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -67,6 +70,15 @@ struct Options {
     normalize: bool,
     prepare: bool,
     json: bool,
+    color: Color,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Color {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -151,12 +163,12 @@ fn parse(args: &[BString]) -> Result<Invocation, String> {
             b"--prepare" if attached.is_none() => options.prepare = true,
             b"--json" if attached.is_none() => options.json = true,
             b"--color" => {
-                if !matches!(
-                    value(&mut iter, attached, "--color")?.as_slice(),
-                    b"auto" | b"always" | b"never"
-                ) {
-                    return Err("Use --color=auto, --color=always, or --color=never.".into());
-                }
+                options.color = match value(&mut iter, attached, "--color")?.as_slice() {
+                    b"auto" => Color::Auto,
+                    b"always" => Color::Always,
+                    b"never" => Color::Never,
+                    _ => return Err("Use --color=auto, --color=always, or --color=never.".into()),
+                };
             }
             _ if raw.starts_with(b"-") => return Err(format!("Unknown option {arg:?}.")),
             _ => options.dirs.push(arg.clone()),
@@ -203,16 +215,13 @@ fn preset_dir(host: &dyn Host, source: &Path, name: &[u8]) -> Result<PathBuf, St
     })
 }
 
-/// Create the shared stateless query files. Existing links and non-directories stop it.
-fn prepare(host: &dyn Host, dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let meta = host
-        .metadata(dir, Follow::Yes)
-        .map_err(|_| format!("{} does not exist.", dir.display()))?;
-    if meta.kind != FileKind::Dir {
-        return Err(format!("{} is not a directory.", dir.display()));
-    }
-    let mut current = host.canonicalize(dir).map_err(|err| err.to_string())?;
-    for part in [".cmake", "api", "v1", "query"] {
+const QUERY_PARTS: [&str; 4] = [".cmake", "api", "v1", "query"];
+
+/// Check that each query directory under `root` is a real directory. Return the
+/// query directory. With `create`, make the missing directories one at a time.
+fn query_dir(host: &dyn Host, root: &Path, create: bool) -> Result<PathBuf, String> {
+    let mut current = root.to_path_buf();
+    for part in QUERY_PARTS {
         current.push(part);
         match host.metadata(&current, Follow::No) {
             Ok(meta) if meta.kind == FileKind::Dir => {}
@@ -222,13 +231,39 @@ fn prepare(host: &dyn Host, dir: &Path) -> Result<Vec<PathBuf>, String> {
                     current.display()
                 ));
             }
-            Err(err) if err.kind == ErrorKind::NotFound => {
+            Err(err) if err.kind == ErrorKind::NotFound && create => {
                 host.create_dir_all(&current)
                     .map_err(|err| err.to_string())?;
+                let meta = host
+                    .metadata(&current, Follow::No)
+                    .map_err(|err| err.to_string())?;
+                if meta.kind != FileKind::Dir {
+                    return Err(format!(
+                        "{} changed while rcmake created it.",
+                        current.display()
+                    ));
+                }
             }
             Err(err) => return Err(err.to_string()),
         }
     }
+    Ok(current)
+}
+
+/// Create the shared stateless query files. Existing links and non-directories stop it.
+///
+/// The host creates files by path, so a parent directory can change between a check
+/// and a create. rcmake checks the parents again before and after each file and
+/// removes a file that was created through a changed path.
+fn prepare(host: &dyn Host, dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let meta = host
+        .metadata(dir, Follow::Yes)
+        .map_err(|_| format!("{} does not exist.", dir.display()))?;
+    if meta.kind != FileKind::Dir {
+        return Err(format!("{} is not a directory.", dir.display()));
+    }
+    let root = host.canonicalize(dir).map_err(|err| err.to_string())?;
+    let current = query_dir(host, &root, true)?;
     let mut created = Vec::new();
     for file in QUERY_FILES {
         let path = current.join(file);
@@ -236,14 +271,54 @@ fn prepare(host: &dyn Host, dir: &Path) -> Result<Vec<PathBuf>, String> {
             Ok(meta) if meta.kind == FileKind::File => {}
             Ok(_) => return Err(format!("{} must be a regular file.", path.display())),
             Err(err) if err.kind == ErrorKind::NotFound => {
+                query_dir(host, &root, false)?;
                 host.write(&path, b"", WriteMode::CreateNew)
                     .map_err(|err| err.to_string())?;
+                let moved = query_dir(host, &root, false).is_err()
+                    || !host
+                        .canonicalize(&path)
+                        .is_ok_and(|canonical| canonical == path);
+                if moved {
+                    let _ = host.remove_file(&path);
+                    return Err(format!(
+                        "{} changed while rcmake created query files.",
+                        current.display()
+                    ));
+                }
                 created.push(path);
             }
             Err(err) => return Err(err.to_string()),
         }
     }
     Ok(created)
+}
+
+/// Load the native find trace of `dir` with the shared typed parser and freshness check.
+fn trace_input(host: &dyn Host, dir: &Path) -> TraceInput {
+    let Some(saved) = find_hints::load_saved(host, dir) else {
+        return TraceInput::Missing;
+    };
+    match saved.freshness {
+        Freshness::Past(reason) => TraceInput::Past(reason.into()),
+        Freshness::Current => {
+            let store = &saved.document.store;
+            let complete = saved.document.completed && store.all_calls_kept();
+            let calls = store
+                .calls
+                .iter()
+                .map(|call| TraceCall {
+                    name: call.name.clone(),
+                    observation: PackageObservation {
+                        package_call: call.package_call,
+                        outcome: call.outcome.label().into(),
+                        version: call.version.clone(),
+                        selected: call.selected.as_ref().map(|selected| selected.file.clone()),
+                    },
+                })
+                .collect();
+            TraceInput::Current { calls, complete }
+        }
+    }
 }
 
 /// Execute `rcmake diff-config`.
@@ -301,7 +376,7 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
     dirs.extend(options.dirs.iter().map(|dir| resolve_cli_path(host, dir)));
     let mut snapshots = Vec::new();
     for dir in &dirs {
-        match load(host, dir) {
+        match load(host, dir, trace_input(host, dir)) {
             Ok(snapshot) => snapshots.push(snapshot),
             Err(err) => return error(host, &err.to_string()),
         }
@@ -332,11 +407,19 @@ pub(crate) fn run(_argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host
         normalize: options.normalize,
         config_pair: options.config,
     };
+    if let Err(message) = validate(a, b, &diff_options) {
+        return error(host, &message);
+    }
     let diff = compare(a, b, &diff_options);
     if options.json {
         host.write_out(Stream::Stdout, &render_json(a, b, &diff));
     } else {
-        host.write_out(Stream::Stdout, render_text(a, b, &diff).as_bytes());
+        let color = match options.color {
+            Color::Auto => rcmake_api::ExplainRenderOptions::for_host(host, Stream::Stdout).color,
+            Color::Always => true,
+            Color::Never => false,
+        };
+        host.write_out(Stream::Stdout, render_text(a, b, &diff, color).as_bytes());
     }
     diff.exit_code()
 }
@@ -459,9 +542,22 @@ mod tests {
         };
         assert_eq!(run_args(&["/a", "/b", "--only", "cache"]), 0);
         assert_eq!(run_args(&["/a", "/c", "--only", "cache"]), 1);
-        assert_eq!(run_args(&["/a", "/b"]), 3);
+        assert_eq!(run_args(&["/a", "/b"]), 2);
         assert_eq!(run_args(&["/a", "/missing"]), 2);
         assert_eq!(run_args(&["/a"]), 2);
+        assert_eq!(
+            run_args(&["/a", "/b", "--only", "cache", "--config", "Release"]),
+            2,
+            "a Debug tree has no Release configuration"
+        );
+        assert_eq!(
+            run_args(&["/a", "/b", "--only", "cache", "--color=always"]),
+            0
+        );
+        assert!(
+            host.stream_bytes(Stream::Stdout)
+                .contains_str("\x1b[32mNo differences.\x1b[0m")
+        );
     }
 
     #[test]

@@ -144,7 +144,14 @@ pub(super) fn symlink(target: &Path, link: &Path) -> io::Result<()> {
     let resolved = link
         .parent()
         .map_or_else(|| target.to_path_buf(), |parent| parent.join(target));
-    if resolved.is_dir() {
+    let target_is_dir = resolved.is_dir()
+        || fs::symlink_metadata(&resolved).is_ok_and(|meta| meta.file_type().is_symlink_dir())
+        || target
+            .as_os_str()
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|&b| b == b'/' || b == b'\\');
+    if target_is_dir {
         symlink_dir(target, link)
     } else {
         symlink_file(target, link)

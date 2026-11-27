@@ -203,8 +203,7 @@ fn replayed_leaf_restores_directory_source_registrations() -> HostResult<()> {
     let source = path("/project");
     let build = path("/build");
     let host = Arc::new(PureHost::new(source.clone(), path("/tools/rcmake")));
-    let absolute = source.join("core/b.c");
-    let leaf = format!("add_library(core STATIC a {} a.c)\n", absolute.display());
+    let leaf = "add_library(core STATIC a /project/core/b.c a.c)\n";
     seed_project(&host, &source, leaf.as_bytes())?;
     let mut services = Services::default();
     services.speed.incremental = true;

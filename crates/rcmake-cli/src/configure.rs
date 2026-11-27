@@ -118,6 +118,7 @@ struct ConfigureSession<'a> {
     preset: presets::Application,
     profiling: Profilers,
     drift: crate::drift::Tracker,
+    prior_compdb: rcmake_gen_common::compile_commands_native::OwnedSnapshot,
 }
 
 struct Configured {
@@ -146,6 +147,7 @@ struct RetainedInner {
     preset: presets::Application,
     profiling: Profilers,
     drift: crate::drift::Tracker,
+    prior_compdb: rcmake_gen_common::compile_commands_native::OwnedSnapshot,
     runtime: ConfigureRuntime,
     interp: Interp,
     configured: Configured,
@@ -173,6 +175,7 @@ impl RetainedConfigure {
             preset: inner.preset,
             profiling: inner.profiling,
             drift: inner.drift,
+            prior_compdb: inner.prior_compdb,
         };
         let outcome = session.generate(&mut inner.interp, inner.configured, &mut inner.results);
         let finish = inner.runtime.finish(outcome.is_ok() && !session.opts.view);
@@ -354,7 +357,7 @@ pub(crate) fn configure_only(
                     "The platform selection changed again during configure.".into(),
                 ));
             }
-            saved = match restart::reset(&session, &mut interp, changes) {
+            saved = match restart::reset(&mut session, &mut interp, changes) {
                 Ok(saved) => saved,
                 Err(Exit::Code(code)) => return Err(code),
                 Err(Exit::Message(message)) => return Err(error(host.as_ref(), message)),
@@ -372,6 +375,7 @@ pub(crate) fn configure_only(
                     preset,
                     profiling,
                     drift,
+                    prior_compdb,
                     ..
                 } = session;
                 return Ok(RetainedConfigure {
@@ -385,6 +389,7 @@ pub(crate) fn configure_only(
                         preset,
                         profiling,
                         drift,
+                        prior_compdb,
                         runtime,
                         interp,
                         configured,
@@ -489,7 +494,7 @@ fn configure_project(
                     "The platform selection changed again during configure.".into(),
                 ));
             }
-            saved = match restart::reset(&session, &mut interp, changes) {
+            saved = match restart::reset(&mut session, &mut interp, changes) {
                 Ok(saved) => saved,
                 Err(exit) => {
                     crate::debugger::finish(active_debugger, 1);
@@ -608,7 +613,7 @@ impl<'a> ConfigureSession<'a> {
             );
         }
         let bin = bin.unwrap_or(cwd);
-        // Read the drift baseline before a cache cleanup can remove it.
+        // Read drift and native compile-db ownership baselines before cache cleanup can remove `CMakeFiles`.
         let drift = crate::drift::Tracker::begin(
             &host,
             opts.persona == Persona::Native,
@@ -616,6 +621,11 @@ impl<'a> ConfigureSession<'a> {
             &bin,
             &src,
         );
+        let prior_compdb = if opts.view {
+            rcmake_gen_common::compile_commands_native::OwnedSnapshot::default()
+        } else {
+            rcmake_gen_common::compile_commands_native::snapshot_owned(host.as_ref(), &bin)
+        };
         if opts.fresh && !opts.view {
             cache_setup::clear(host.as_ref(), &bin).map_err(|err| {
                 Exit::Message(format!(
@@ -649,6 +659,7 @@ impl<'a> ConfigureSession<'a> {
                 preset,
                 profiling,
                 drift,
+                prior_compdb,
             },
             saved,
         ))
@@ -742,6 +753,7 @@ impl<'a> ConfigureSession<'a> {
         let services = Services {
             speed,
             find_trace: find_hints::level(&self.opts, self.host.as_ref()),
+            track_compiler_identifications: self.drift.is_enabled(),
             ..Services::default()
         };
         let runtime = ConfigureRuntime::new(
@@ -1000,7 +1012,14 @@ impl<'a> ConfigureSession<'a> {
         let start = host.monotonic();
         let generate_step = crate::InstrumentationStep::start(host, sample);
         let result = self.profiling.measure(host, ProfilePhase::Generate, || {
-            crate::generate::run(interp, host, &self.bin, &queries, self.opts.persona)
+            crate::generate::run(
+                interp,
+                host,
+                &self.bin,
+                &queries,
+                self.opts.persona,
+                Some(&self.prior_compdb),
+            )
         });
         use crate::generate::Outcome;
         let outcome = match result {

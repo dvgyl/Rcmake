@@ -50,8 +50,9 @@ pub(crate) fn run(
     bin: &Path,
     queries: &[Query],
     persona: crate::persona::Persona,
+    prior_compdb: Option<&common::compile_commands_native::OwnedSnapshot>,
 ) -> Result<Outcome, Failure> {
-    let outcome = generate(interp, host, bin, queries, persona);
+    let outcome = generate(interp, host, bin, queries, persona, prior_compdb);
     if matches!(outcome, Err(_) | Ok(Outcome::DeferredError))
         && let Err(error) = common::fileapi::write_error_replies(interp.cx().project(), host, bin)
     {
@@ -106,6 +107,7 @@ fn generate(
     bin: &Path,
     queries: &[Query],
     persona: crate::persona::Persona,
+    prior_compdb: Option<&common::compile_commands_native::OwnedSnapshot>,
 ) -> Result<Outcome, Failure> {
     let Some(kind) = interp.cx().project().generator else {
         return Ok(Outcome::Unsupported);
@@ -409,12 +411,17 @@ fn generate(
                                 &render(&warning, &RenderOptions::default()),
                             );
                         }
-                        common::compile_commands_native::publish(host, bin, &db)
-                            .map_err(|err| err.to_string())?;
+                        common::compile_commands_native::publish_with_prior(
+                            host,
+                            bin,
+                            &db,
+                            prior_compdb,
+                        )
+                        .map_err(|err| err.to_string())?;
                     }
                 }
                 CompileDbMode::NativeMultiConfigRetire => {
-                    common::compile_commands_native::retire(host, bin)
+                    common::compile_commands_native::retire_with_prior(host, bin, prior_compdb)
                         .map_err(|err| err.to_string())?;
                 }
             }

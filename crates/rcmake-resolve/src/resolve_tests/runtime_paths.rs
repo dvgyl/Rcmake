@@ -305,6 +305,7 @@ fn elf_link_paths_respect_origin_and_the_install_path_switch() -> TestResult {
     for build_with_install in [false, true] {
         let (mut model, host) = fixture("Linux")?;
         for (key, value) in [
+            ("CMAKE_HOST_SYSTEM_NAME", "Linux"),
             ("CMAKE_EXECUTABLE_FORMAT", "ELF"),
             ("CMAKE_SHARED_LIBRARY_RUNTIME_C_FLAG_SEP", ":"),
             ("CMAKE_EXECUTABLE_RUNTIME_C_FLAG", "-Wl,-rpath,"),

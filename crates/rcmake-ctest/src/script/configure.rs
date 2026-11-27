@@ -5,8 +5,8 @@ use rcmake_expr::ExpandedArg;
 use rcmake_host::{FileKind, Follow, Stream, path};
 
 use super::{
-    HandlerResult, directory, error, handler_process, prior_start, process_code, split_command,
-    verbose, with_capture,
+    HandlerResult, directory, error, handler_process_with, prior_start, process_code,
+    split_command, verbose, with_capture,
 };
 
 pub(super) fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResult {
@@ -46,7 +46,8 @@ pub(super) fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
             } else {
                 build.clone()
             };
-            let command = if custom.is_empty() || preset.is_some() {
+            let builtin = custom.is_empty() || preset.is_some();
+            let command = if builtin {
                 let generator = cx.var_or_empty(b"CTEST_CMAKE_GENERATOR");
                 if generator.is_empty() && preset.is_none() {
                     return Err(error(
@@ -105,7 +106,7 @@ pub(super) fn ctest_configure(cx: &mut Cx<'_>, args: &[ExpandedArg]) -> CmdResul
             if verbose() && !args.flag(b"QUIET") {
                 cx.host().write_out(Stream::Stdout, b"Configure project\n");
             }
-            let output = handler_process(cx, args, cwd, &build, command)?;
+            let output = handler_process_with(cx, args, cwd, &build, command, builtin)?;
             let code = process_code(&output).unwrap_or(-1);
             if code != 0 {
                 cx.host()

@@ -13,6 +13,7 @@ mod verify;
 
 use core::fmt;
 use core::ops::Range;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use rcmake_base::{BString, Limits};
@@ -91,15 +92,18 @@ impl FormatStyle {
         }
     }
 
-    fn indent_bytes(&self, depth: usize) -> Vec<u8> {
+    fn indent_len(&self, depth: usize) -> usize {
         if depth == 0 {
-            return Vec::new();
-        }
-        if self.use_tabs {
-            vec![b'\t'; depth]
+            0
+        } else if self.use_tabs {
+            depth
         } else {
-            vec![b' '; depth.saturating_mul(self.indent_width)]
+            depth.saturating_mul(self.indent_width)
         }
+    }
+
+    fn indent_byte(&self) -> u8 {
+        if self.use_tabs { b'\t' } else { b' ' }
     }
 
     fn indent_cols(&self, depth: usize) -> usize {
@@ -262,6 +266,11 @@ pub fn apply_edits(
     max_output_bytes: usize,
 ) -> Result<Vec<u8>, FormatError> {
     if edits.is_empty() {
+        if src.len() > max_output_bytes {
+            return Err(FormatError::BudgetExceeded(format!(
+                "Formatted output exceeds the {max_output_bytes} byte limit."
+            )));
+        }
         return Ok(src.to_vec());
     }
     let mut out = Vec::with_capacity(src.len().min(max_output_bytes));
@@ -306,6 +315,9 @@ struct Planner<'a> {
     limits: &'a FormatLimits,
     edits: Vec<TextEdit>,
     newline_positions: Vec<(usize, &'static [u8])>,
+    output_cursor: usize,
+    output_bytes_so_far: usize,
+    edit_payload_bytes: usize,
 }
 
 impl<'a> Planner<'a> {
@@ -333,6 +345,9 @@ impl<'a> Planner<'a> {
             limits,
             edits: Vec::new(),
             newline_positions,
+            output_cursor: 0,
+            output_bytes_so_far: 0,
+            edit_payload_bytes: 0,
         }
     }
 
@@ -367,9 +382,44 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// Charge finalized output bytes and edit payload bytes before allocating replacement storage.
+    fn charge_output(
+        &mut self,
+        range: &Range<usize>,
+        replacement_len: usize,
+        is_change: bool,
+    ) -> Result<(), FormatError> {
+        let max_out = self.limits.max_output_bytes;
+        if is_change && self.edit_payload_bytes.saturating_add(replacement_len) > max_out {
+            return Err(FormatError::BudgetExceeded(format!(
+                "Formatted output exceeds the {max_out} byte limit."
+            )));
+        }
+        if range.start >= self.output_cursor {
+            let unchanged = range.start - self.output_cursor;
+            let next_out = self
+                .output_bytes_so_far
+                .saturating_add(unchanged)
+                .saturating_add(replacement_len);
+            if next_out > max_out {
+                return Err(FormatError::BudgetExceeded(format!(
+                    "Formatted output exceeds the {max_out} byte limit."
+                )));
+            }
+            self.output_bytes_so_far = next_out;
+            self.output_cursor = range.end;
+        }
+        if is_change {
+            self.edit_payload_bytes = self.edit_payload_bytes.saturating_add(replacement_len);
+        }
+        Ok(())
+    }
+
     fn push_edit(&mut self, range: Range<usize>, replacement: &[u8]) -> Result<(), FormatError> {
         let original = self.src.get(range.clone()).unwrap_or_default();
-        if original == replacement {
+        let is_change = original != replacement;
+        self.charge_output(&range, replacement.len(), is_change)?;
+        if !is_change {
             return Ok(());
         }
         if self.edits.len() >= self.limits.max_edits {
@@ -381,6 +431,63 @@ impl<'a> Planner<'a> {
         self.edits.push(TextEdit {
             range,
             replacement: BString::from(replacement),
+        });
+        Ok(())
+    }
+
+    fn push_indent_edit(&mut self, range: Range<usize>, depth: usize) -> Result<(), FormatError> {
+        let len = self.style.indent_len(depth);
+        let fill = self.style.indent_byte();
+        let original = self.src.get(range.clone()).unwrap_or_default();
+        let is_change = original.len() != len || original.iter().any(|&b| b != fill);
+        self.charge_output(&range, len, is_change)?;
+        if !is_change {
+            return Ok(());
+        }
+        if self.edits.len() >= self.limits.max_edits {
+            return Err(FormatError::BudgetExceeded(format!(
+                "Formatter edit count exceeds the {} limit.",
+                self.limits.max_edits
+            )));
+        }
+        self.edits.push(TextEdit {
+            range,
+            replacement: BString::from(vec![fill; len]),
+        });
+        Ok(())
+    }
+
+    fn push_break_indent_edit(
+        &mut self,
+        range: Range<usize>,
+        nl: &[u8],
+        depth: usize,
+    ) -> Result<(), FormatError> {
+        let indent_len = self.style.indent_len(depth);
+        let total_len = nl.len().saturating_add(indent_len);
+        let fill = self.style.indent_byte();
+        let original = self.src.get(range.clone()).unwrap_or_default();
+        let is_change = original.len() != total_len
+            || !original.starts_with(nl)
+            || original
+                .get(nl.len()..)
+                .is_none_or(|rest| rest.iter().any(|&b| b != fill));
+        self.charge_output(&range, total_len, is_change)?;
+        if !is_change {
+            return Ok(());
+        }
+        if self.edits.len() >= self.limits.max_edits {
+            return Err(FormatError::BudgetExceeded(format!(
+                "Formatter edit count exceeds the {} limit.",
+                self.limits.max_edits
+            )));
+        }
+        let mut rep = Vec::with_capacity(total_len);
+        rep.extend_from_slice(nl);
+        rep.resize(total_len, fill);
+        self.edits.push(TextEdit {
+            range,
+            replacement: BString::from(rep),
         });
         Ok(())
     }
@@ -453,8 +560,7 @@ impl<'a> Planner<'a> {
                                 depth = depth.saturating_sub(1);
                             }
                             let cmd_depth = depth;
-                            let indent = self.style.indent_bytes(cmd_depth);
-                            self.push_edit(indent_span, &indent)?;
+                            self.push_indent_edit(indent_span, cmd_depth)?;
                             self.format_command(cmd, cmd_depth)?;
                             if is_block_start(lower) || is_block_branch(lower) {
                                 depth += 1;
@@ -472,8 +578,7 @@ impl<'a> Planner<'a> {
                         }
 
                         // Standalone comment (LineComment or BracketComment) at top level.
-                        let indent = self.style.indent_bytes(depth);
-                        self.push_edit(indent_span, &indent)?;
+                        self.push_indent_edit(indent_span, depth)?;
                         let _ = next_tok;
                         idx = next_idx + 1;
                         at_line_start = false;
@@ -501,6 +606,14 @@ impl<'a> Planner<'a> {
             idx += 1;
         }
 
+        let tail = self.src.len().saturating_sub(self.output_cursor);
+        if self.output_bytes_so_far.saturating_add(tail) > self.limits.max_output_bytes {
+            return Err(FormatError::BudgetExceeded(format!(
+                "Formatted output exceeds the {} byte limit.",
+                self.limits.max_output_bytes
+            )));
+        }
+
         Ok(())
     }
 
@@ -520,16 +633,14 @@ impl<'a> Planner<'a> {
             return Ok(());
         }
 
-        // 1. Optional command name ASCII case normalization.
         let raw_name = name_tok.slice(self.src);
-        let formatted_name: Vec<u8> = match self.style.command_case {
-            CommandCase::Preserve => raw_name.to_vec(),
-            CommandCase::Lower => raw_name.to_ascii_lowercase(),
-            CommandCase::Upper => raw_name.to_ascii_uppercase(),
+        let formatted_name: Cow<'a, [u8]> = match self.style.command_case {
+            CommandCase::Preserve => Cow::Borrowed(raw_name),
+            CommandCase::Lower => Cow::Owned(raw_name.to_ascii_lowercase()),
+            CommandCase::Upper => Cow::Owned(raw_name.to_ascii_uppercase()),
         };
         self.push_edit(name_tok.span.clone(), &formatted_name)?;
 
-        // 2. Remove horizontal spaces between command name and '('.
         if name_tok.span.end < open_tok.span.start {
             self.push_edit(name_tok.span.end..open_tok.span.start, b"")?;
         }
@@ -595,8 +706,7 @@ impl<'a> Planner<'a> {
                 self.emit_newline_token(tok)?;
             } else if tok.kind == TokenKind::Space {
                 if pos + 1 == inner_end {
-                    let indent = self.style.indent_bytes(cmd_depth);
-                    self.push_edit(tok.span.clone(), &indent)?;
+                    self.push_indent_edit(tok.span.clone(), cmd_depth)?;
                 } else {
                     self.push_edit(tok.span.clone(), b"")?;
                 }
@@ -606,8 +716,7 @@ impl<'a> Planner<'a> {
         if inner.last().is_some_and(|t| t.kind == TokenKind::Newline)
             && let Some(close_tok) = tokens.get(inner_end)
         {
-            let indent = self.style.indent_bytes(cmd_depth);
-            self.push_edit(close_tok.span.start..close_tok.span.start, &indent)?;
+            self.push_indent_edit(close_tok.span.start..close_tok.span.start, cmd_depth)?;
         }
         Ok(())
     }
@@ -672,17 +781,16 @@ impl<'a> Planner<'a> {
 
         // Wrap onto multiple lines at proven safe argument separators.
         let nl = self.inserted_newline(open_tok.span.start);
-        let base_indent = self.style.indent_bytes(cmd_depth);
-        let cont_indent = self.style.indent_bytes(cmd_depth + 1);
-        let cont_cols = self.style.indent_cols(cmd_depth + 1);
-
-        let mut break_and_cont = Vec::with_capacity(nl.len() + cont_indent.len());
-        break_and_cont.extend_from_slice(nl);
-        break_and_cont.extend_from_slice(&cont_indent);
+        let cont_depth = cmd_depth + 1;
+        let cont_cols = self.style.indent_cols(cont_depth);
 
         let broke_after_open = line1_prefix_cols + first_atom.display_width > self.style.line_width;
         let mut col = if broke_after_open {
-            self.push_edit(open_tok.span.end..first_atom.start_offset, &break_and_cont)?;
+            self.push_break_indent_edit(
+                open_tok.span.end..first_atom.start_offset,
+                nl,
+                cont_depth,
+            )?;
             cont_cols + first_atom.display_width
         } else {
             if open_tok.span.end < first_atom.start_offset {
@@ -705,17 +813,14 @@ impl<'a> Planner<'a> {
                 self.push_edit(sep_span, b" ")?;
                 col += 1 + atom.display_width;
             } else {
-                self.push_edit(sep_span, &break_and_cont)?;
+                self.push_break_indent_edit(sep_span, nl, cont_depth)?;
                 col = cont_cols + atom.display_width;
             }
             self.emit_atom_internal_collapses(atom)?;
         }
 
         if broke_after_open {
-            let mut break_and_base = Vec::with_capacity(nl.len() + base_indent.len());
-            break_and_base.extend_from_slice(nl);
-            break_and_base.extend_from_slice(&base_indent);
-            self.push_edit(last_atom.end_offset..close_tok.span.start, &break_and_base)?;
+            self.push_break_indent_edit(last_atom.end_offset..close_tok.span.start, nl, cmd_depth)?;
         } else if last_atom.end_offset < close_tok.span.start {
             self.push_edit(last_atom.end_offset..close_tok.span.start, b"")?;
         }
@@ -743,9 +848,8 @@ impl<'a> Planner<'a> {
         let base_cols = self.style.indent_cols(cmd_depth);
         let name_cols = display_width(formatted_name, self.style.indent_width);
         let line1_prefix_cols = base_cols + name_cols + 1;
-        let cont_indent = self.style.indent_bytes(cmd_depth + 1);
-        let cont_cols = self.style.indent_cols(cmd_depth + 1);
-        let base_indent = self.style.indent_bytes(cmd_depth);
+        let cont_depth = cmd_depth + 1;
+        let cont_cols = self.style.indent_cols(cont_depth);
 
         // Split `inner_start..inner_end` into physical lines separated by `TokenKind::Newline`.
         let mut seg_start = inner_start;
@@ -811,7 +915,7 @@ impl<'a> Planner<'a> {
                             seg_end,
                             seg_end_offset,
                             line1_prefix_cols,
-                            &cont_indent,
+                            cont_depth,
                             cont_cols,
                             is_last_seg,
                             is_line_sensitive,
@@ -823,8 +927,11 @@ impl<'a> Planner<'a> {
                 match first_non_ws {
                     None => {
                         if is_last_seg {
-                            // Closing ')' is the first non-whitespace token on its line!
-                            self.push_edit(seg_start_offset..close_tok.span.start, &base_indent)?;
+                            // Closing ')' is the first non-whitespace token on its line.
+                            self.push_indent_edit(
+                                seg_start_offset..close_tok.span.start,
+                                cmd_depth,
+                            )?;
                         } else if seg_start_offset < seg_end_offset {
                             // Blank line inside command: strip horizontal spaces.
                             self.push_edit(seg_start_offset..seg_end_offset, b"")?;
@@ -838,23 +945,26 @@ impl<'a> Planner<'a> {
                             && seg.iter().all(|t| {
                                 t.kind == TokenKind::Space || t.kind == TokenKind::RightParen
                             });
-                        let indent = if closing_only_line {
-                            &base_indent
+                        let indent_depth = if closing_only_line {
+                            cmd_depth
                         } else {
-                            &cont_indent
+                            cont_depth
                         };
                         let prefix_cols = if closing_only_line {
                             base_cols
                         } else {
                             cont_cols
                         };
-                        self.push_edit(seg_start_offset..first_tok.span.start, indent)?;
+                        self.push_indent_edit(
+                            seg_start_offset..first_tok.span.start,
+                            indent_depth,
+                        )?;
                         self.format_multiline_segment_body(
                             first_idx,
                             seg_end,
                             seg_end_offset,
                             prefix_cols,
-                            &cont_indent,
+                            cont_depth,
                             cont_cols,
                             is_last_seg,
                             is_line_sensitive,
@@ -883,7 +993,7 @@ impl<'a> Planner<'a> {
         seg_end: usize,
         seg_end_offset: usize,
         line_prefix_cols: usize,
-        cont_indent: &[u8],
+        cont_depth: usize,
         cont_cols: usize,
         is_last_seg: bool,
         is_line_sensitive: bool,
@@ -917,9 +1027,6 @@ impl<'a> Planner<'a> {
             self.emit_single_line_atoms(&atoms)?;
         } else {
             let nl = self.inserted_newline(last_atom.start_offset);
-            let mut break_and_cont = Vec::with_capacity(nl.len() + cont_indent.len());
-            break_and_cont.extend_from_slice(nl);
-            break_and_cont.extend_from_slice(cont_indent);
 
             let Some(first_atom) = atoms.first() else {
                 return Ok(());
@@ -938,7 +1045,7 @@ impl<'a> Planner<'a> {
                     self.push_edit(sep_span, b" ")?;
                     col += 1 + atom.display_width;
                 } else {
-                    self.push_edit(sep_span, &break_and_cont)?;
+                    self.push_break_indent_edit(sep_span, nl, cont_depth)?;
                     col = cont_cols + atom.display_width;
                 }
                 self.emit_atom_internal_collapses(atom)?;
@@ -1224,6 +1331,56 @@ mod tests {
         assert_eq!(
             res.output.as_slice(),
             b"set(X \"a\\\"b\\\nc\"\n  \"d\") #[=[eof]=]"
+        );
+    }
+
+    #[test]
+    fn enforces_max_output_bytes_before_allocating_large_edit_payloads() {
+        let mut src = String::new();
+        for _ in 0..40 {
+            src.push_str("if(ON)\n");
+        }
+        for _ in 0..40 {
+            src.push_str("message(A)\n");
+        }
+        for _ in 0..40 {
+            src.push_str("endif()\n");
+        }
+        let style = FormatStyle {
+            indent_width: 16,
+            ..FormatStyle::default()
+        };
+        let limits = FormatLimits {
+            max_output_bytes: 2048,
+            ..FormatLimits::default()
+        };
+        let err = format_bytes(src.as_bytes(), &style, &limits)
+            .expect_err("expanded indentation must exceed max_output_bytes during planning");
+        assert!(matches!(err, FormatError::BudgetExceeded(_)), "got {err:?}");
+
+        // Planner itself must reject before allocating edits beyond `max_output_bytes`.
+        let mut sources = SourceMap::default();
+        let sid = sources
+            .add("".into(), SourceKind::File, Arc::from(b"".as_slice()))
+            .unwrap();
+        let concrete = parse_concrete_with_budget(
+            src.as_bytes(),
+            sid,
+            SourceKind::File,
+            &Limits::default(),
+            limits.max_tokens,
+        )
+        .unwrap();
+        let mut planner = Planner::new(src.as_bytes(), &concrete, &style, &limits);
+        let plan_err = planner
+            .plan()
+            .expect_err("planner must stop at max_output_bytes before allocating further edits");
+        assert!(matches!(plan_err, FormatError::BudgetExceeded(_)));
+        let allocated_payload: usize = planner.edits.iter().map(|e| e.replacement.len()).sum();
+        assert!(
+            allocated_payload <= limits.max_output_bytes,
+            "allocated {allocated_payload} bytes > {}",
+            limits.max_output_bytes
         );
     }
 }

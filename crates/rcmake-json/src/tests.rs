@@ -962,6 +962,18 @@ fn bounded_parse_rejects_each_exceeded_budget() {
 }
 
 #[test]
+fn artifact_budget_caps_the_value_count_for_large_inputs() {
+    use crate::{ParseBudget, parse_bounded};
+    assert_eq!(ParseBudget::artifact(1 << 20).max_nodes, (1 << 17) + 16);
+    let large = ParseBudget::artifact(64 << 20);
+    assert_eq!(large.max_nodes, ParseBudget::MAX_ARTIFACT_NODES);
+    let small = ParseBudget::artifact(128);
+    let dense = format!("[{}0]", "0,".repeat(40));
+    let err = parse_bounded(dense.as_bytes(), &ReadOptions::default(), &small).unwrap_err();
+    assert!(err.message.contains("value limit"), "{err}");
+}
+
+#[test]
 fn unbounded_parse_keeps_legacy_depth_limit() {
     let options = ReadOptions::default();
     let deep = "[".repeat(1001) + &"]".repeat(1001);

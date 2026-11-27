@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rcmake_base::{BString, ByteSlice};
-use rcmake_gen_common::compile_commands::clean_compile_shell;
+use rcmake_gen_common::compile_commands::clean_compile_shell_for_dialect;
 use rcmake_gen_common::compile_commands_native::{
     CommandEncoding, CompileRow, ConfigDatabase, MultiConfigCompileDatabase, absolute_path,
-    strip_co_compile_argv, strip_depfile_argv,
+    strip_co_compile_argv, strip_depfile_argv_if,
 };
 use rcmake_host::path;
 use rcmake_model::TargetId;
@@ -43,6 +43,7 @@ pub(crate) fn collect(
                 object,
                 source,
                 invocation,
+                depfile,
                 ..
             } = step
             else {
@@ -55,7 +56,7 @@ pub(crate) fn collect(
                 .working_dir
                 .as_deref()
                 .map_or_else(|| build_root.clone(), |dir| absolute_path(&build_root, dir));
-            let encoding = encode_invocation(graph, invocation);
+            let encoding = encode_invocation(graph, object, invocation, depfile.is_some());
             if let Some(action) = graph.input.swift_actions.get(&step_idx) {
                 let sources = if action.abs_sources.is_empty() {
                     action.sources.as_slice()
@@ -113,20 +114,30 @@ pub(crate) fn collect(
     }
 }
 
-fn encode_invocation(graph: &Graph<'_>, invocation: &Invocation) -> CommandEncoding {
+fn encode_invocation(
+    graph: &Graph<'_>,
+    object: &BString,
+    invocation: &Invocation,
+    has_depfile: bool,
+) -> CommandEncoding {
+    let strip_gnu_depfiles = has_depfile && !graph.msvc_deps(object, invocation);
     if is_complete_argv(graph, invocation) {
         let stripped = strip_co_compile_argv(&invocation.argv);
-        let cleaned = strip_depfile_argv(stripped);
+        let cleaned = strip_depfile_argv_if(stripped, strip_gnu_depfiles);
         if !cleaned.is_empty() {
             return CommandEncoding::Arguments(cleaned);
         }
     }
     if !invocation.shell.is_empty() {
-        return CommandEncoding::Command(clean_compile_shell(&invocation.shell));
+        return CommandEncoding::Command(clean_compile_shell_for_dialect(
+            &invocation.shell,
+            strip_gnu_depfiles,
+        ));
     }
-    let command = graph
-        .commands
-        .argv(&strip_depfile_argv(strip_co_compile_argv(&invocation.argv)));
+    let command = graph.commands.argv(&strip_depfile_argv_if(
+        strip_co_compile_argv(&invocation.argv),
+        strip_gnu_depfiles,
+    ));
     CommandEncoding::Command(BString::from(command))
 }
 

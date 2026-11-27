@@ -373,6 +373,27 @@ function Assert-DirectoryAncestors {
     }
 }
 
+function Get-VersionToken {
+    param(
+        [AllowNull()][object[]]$Lines,
+        [Parameter(Mandatory)][string]$PrefixName
+    )
+    $want = ($PrefixName.ToLowerInvariant() + ' ')
+    foreach ($entry in @($Lines)) {
+        if ($null -eq $entry) {
+            continue
+        }
+        $trimmed = $entry.ToString().Trim()
+        if ($trimmed.ToLowerInvariant().StartsWith($want)) {
+            $token = $trimmed.Substring($want.Length).Trim()
+            if (-not [string]::IsNullOrEmpty($token)) {
+                return $token
+            }
+        }
+    }
+    return $null
+}
+
 function Normalize-PathEntry {
     param([AllowNull()][string]$Entry)
     if ([string]::IsNullOrWhiteSpace($Entry)) {
@@ -730,9 +751,23 @@ try {
     }
 
     [IO.File]::WriteAllText((Join-Path $stagedData $dataMarkerName), "Managed by rcmake.`n")
-    $null = & $stagedBin --version
+    $stagedVersionOutput = & $stagedBin --version
     if ($LASTEXITCODE -ne 0) {
         Stop-Install "Staged rcmake.exe failed --version check (exit code $LASTEXITCODE)."
+    }
+    $stagedRcmakeVer = Get-VersionToken -Lines $stagedVersionOutput -PrefixName 'rcmake'
+    if ($hasVerify) {
+        $stagedVerifyOutput = & $stagedVerify --version
+        if ($LASTEXITCODE -ne 0) {
+            Stop-Install "Staged rcmake-verify.exe failed --version check (exit code $LASTEXITCODE)."
+        }
+        $stagedVerifyVer = Get-VersionToken -Lines $stagedVerifyOutput -PrefixName 'rcmake-verify'
+        if ([string]::IsNullOrEmpty($stagedVerifyVer)) {
+            Stop-Install 'Staged rcmake-verify.exe --version did not report a version.'
+        }
+        if (-not [string]::IsNullOrEmpty($stagedRcmakeVer) -and ($stagedVerifyVer -cne $stagedRcmakeVer)) {
+            Stop-Install "Staged rcmake-verify.exe version ($stagedVerifyVer) does not match rcmake.exe version ($stagedRcmakeVer)."
+        }
     }
 
     # Validate all destination paths and parent directories before modifying any installed file.
@@ -810,6 +845,8 @@ try {
         }
     }
 
+    $hadPriorRcmake = ($null -ne (Get-ItemOrNull -Path $rcmakePath)) -or (Test-ManagedData -Path $dataDir)
+    $removedStaleVerify = $false
     $installed = @()
     $versionOutput = $null
     try {
@@ -833,6 +870,12 @@ try {
             & $backupDestination $verifyPath
             Move-Item -LiteralPath $stagedVerify -Destination $verifyPath -Force
             $installed += $verifyPath
+        } elseif ($hadPriorRcmake) {
+            $oldVerifyItem = Get-ItemOrNull -Path $verifyPath
+            if ($null -ne $oldVerifyItem -and -not $oldVerifyItem.PSIsContainer -and -not ($oldVerifyItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                & $backupDestination $verifyPath
+                $removedStaleVerify = $true
+            }
         }
 
         $aliasesToWrite = if ($AliasCmake) { $tools } else { $existingOwnedAliases }
@@ -900,6 +943,20 @@ try {
         if ($LASTEXITCODE -ne 0) {
             Stop-Install "Installed rcmake.exe failed --version check (exit code $LASTEXITCODE)."
         }
+        $installedRcmakeVer = Get-VersionToken -Lines $versionOutput -PrefixName 'rcmake'
+        if ($hasVerify) {
+            $verifyOutput = & $verifyPath --version
+            if ($LASTEXITCODE -ne 0) {
+                Stop-Install "Installed rcmake-verify.exe failed --version check (exit code $LASTEXITCODE)."
+            }
+            $installedVerifyVer = Get-VersionToken -Lines $verifyOutput -PrefixName 'rcmake-verify'
+            if ([string]::IsNullOrEmpty($installedVerifyVer)) {
+                Stop-Install 'Installed rcmake-verify.exe --version did not report a version.'
+            }
+            if (-not [string]::IsNullOrEmpty($installedRcmakeVer) -and ($installedVerifyVer -cne $installedRcmakeVer)) {
+                Stop-Install "Installed rcmake-verify.exe version ($installedVerifyVer) does not match rcmake.exe version ($installedRcmakeVer)."
+            }
+        }
     } catch {
         for ($i = $rollbackOps.Count - 1; $i -ge 0; $i--) {
             $op = $rollbackOps[$i]
@@ -937,6 +994,9 @@ try {
     Write-Host "Installed $displayName into ${prefixFull}:"
     foreach ($item in $installed) {
         Write-Host "  $item"
+    }
+    if ($removedStaleVerify) {
+        Write-Host "Removed previous $verifyPath because this archive omits rcmake-verify.exe."
     }
 } finally {
     if ($stageWork -and (Test-Path -LiteralPath $stageWork)) {

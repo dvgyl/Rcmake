@@ -3,18 +3,80 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rcmake_base::{BString, list};
-use rcmake_host::{FileKind, Follow, Host};
+use rcmake_base::{BString, list, path_lex::Lexical};
+use rcmake_host::{FileKind, FileTime, Follow, Host};
 
-use crate::compdb::{self, Compiler, Dialect};
+use crate::compdb::{self, Compiler, Frontend};
 use crate::reader::{ArtifactReader, ReadError, ReadLimits};
 use crate::snapshot::{
     BuildSnapshot, CacheRecord, DataSource, Evidence, Producer, Section, ToolchainSnapshot,
+    TraceInput,
 };
 use crate::{cache_file, fileapi, packages};
 
-const STALE_TOLERANCE_SECS: i64 = 5;
 const COMPILER_FILE_LIMIT: u64 = 256 << 10;
+/// Most `cmakeFiles-v1` inputs whose modification time the freshness check reads.
+const MAX_INPUT_CHECKS: usize = 20_000;
+
+fn time_key(time: FileTime) -> (i64, u32) {
+    (time.secs, time.nanos)
+}
+
+/// Why the File API reply does not describe the current tree, or `None` when it
+/// does. The check uses full nanosecond times and no tolerance.
+fn reply_staleness(
+    host: &dyn Host,
+    api: &fileapi::FileApiData,
+    cache_mtime: Option<FileTime>,
+) -> Option<BString> {
+    let Some(index) = api.index_mtime else {
+        return Some("The File API index has no readable time.".into());
+    };
+    match cache_mtime {
+        Some(cache) if time_key(index) < time_key(cache) => {
+            return Some(
+                "File API reply is older than CMakeCache.txt. Re-run cmake to refresh it.".into(),
+            );
+        }
+        None => return Some("CMakeCache.txt has no readable time.".into()),
+        Some(_) => {}
+    }
+    let inputs = api.inputs.as_deref()?;
+    let root: &[u8] = api
+        .inputs_root
+        .as_deref()
+        .map_or(b"", |root| root.as_slice());
+    let project: Vec<_> = inputs.iter().filter(|input| !input.cmake).collect();
+    if project.len() > MAX_INPUT_CHECKS {
+        return Some(
+            format!("The File API lists more than {MAX_INPUT_CHECKS} project inputs, so freshness is unknown.")
+                .into(),
+        );
+    }
+    for input in project {
+        let path = if input.path.starts_with(b"/")
+            || matches!(input.path.as_slice(), [letter, b':', ..] if letter.is_ascii_alphabetic())
+            || root.is_empty()
+        {
+            input.path.clone()
+        } else {
+            Lexical::new(&[root, b"/", input.path.as_slice()].concat()).normalize()
+        };
+        let newer = host
+            .metadata(&rcmake_host::path::to_native(&path), Follow::Yes)
+            .is_ok_and(|meta| time_key(meta.mtime) > time_key(index));
+        if newer {
+            return Some(
+                format!(
+                    "{} changed after the File API reply was written. Re-run cmake to refresh it.",
+                    String::from_utf8_lossy(&path)
+                )
+                .into(),
+            );
+        }
+    }
+    None
+}
 
 /// Reason why a directory cannot be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,8 +125,10 @@ fn scrape_compilers(
     .map(|name| value(cache, name).cloned())
     .collect::<Option<Vec<_>>>()
     .map(|parts| BString::from(parts.join(&b'.')));
-    let dirs: Vec<BString> = reader
-        .list(Path::new("CMakeFiles"), 4096)
+    let Ok(listing) = reader.list_checked(Path::new("CMakeFiles"), 4096) else {
+        return Vec::new();
+    };
+    let dirs: Vec<BString> = listing
         .into_iter()
         .filter(|(name, kind)| {
             *kind == FileKind::Dir && name.first().is_some_and(u8::is_ascii_digit)
@@ -78,7 +142,10 @@ fn scrape_compilers(
     };
     let base = Path::new("CMakeFiles").join(String::from_utf8_lossy(&dir).as_ref());
     let mut out = Vec::new();
-    for (name, kind) in reader.list(&base, 256) {
+    let Ok(listing) = reader.list_checked(&base, 256) else {
+        return Vec::new();
+    };
+    for (name, kind) in listing {
         let Some(language) = name
             .strip_prefix(b"CMake")
             .and_then(|rest| rest.strip_suffix(b"Compiler.cmake"))
@@ -143,12 +210,13 @@ fn literal_set(rest: &[u8]) -> Option<(&[u8], BString)> {
     (!literal.contains(&b'$')).then(|| (key, BString::from(literal)))
 }
 
-/// Read one build directory.
+/// Read one build directory. `trace` is the native find trace of the directory,
+/// already decoded and checked for freshness by the caller.
 ///
 /// # Errors
 ///
 /// Returns [`LoadError::NotConfigured`] when the directory has no readable cache.
-pub fn load(host: &dyn Host, dir: &Path) -> Result<BuildSnapshot, LoadError> {
+pub fn load(host: &dyn Host, dir: &Path, trace: TraceInput) -> Result<BuildSnapshot, LoadError> {
     let given = rcmake_host::path::from_native_cmake(dir);
     let mut reader = ArtifactReader::new(host, dir, ReadLimits::default())
         .ok_or_else(|| LoadError::NotConfigured(given.clone()))?;
@@ -165,8 +233,14 @@ pub fn load(host: &dyn Host, dir: &Path) -> Result<BuildSnapshot, LoadError> {
     let api = fileapi::load(&mut reader);
     let mut warnings = Vec::new();
     let mut evidence = BTreeMap::new();
+    // Freshness comes first, so a stale reply never marks a section complete.
+    let stale = api
+        .as_ref()
+        .filter(|api| api.unusable.is_none() && !api.failed_generation)
+        .and_then(|api| reply_staleness(host, api, cache_mtime));
+    let current_api = api.as_ref().filter(|_| stale.is_none());
 
-    let cache = match api.as_ref().and_then(|api| api.cache.clone()) {
+    let cache = match current_api.and_then(|api| api.cache.clone()) {
         Some(cache) => {
             evidence.insert(Section::Cache, Evidence::Complete(DataSource::FileApi));
             cache
@@ -221,39 +295,42 @@ pub fn load(host: &dyn Host, dir: &Path) -> Result<BuildSnapshot, LoadError> {
         ],
     };
 
-    let (toolchains, toolchain_source) = match api.as_ref().and_then(|api| api.toolchains.clone()) {
-        Some(toolchains) => (toolchains, Some(DataSource::FileApi)),
+    let (toolchains, toolchain_evidence) = match current_api.and_then(|api| api.toolchains.clone())
+    {
+        Some(toolchains) => (toolchains, Evidence::Complete(DataSource::FileApi)),
         None => {
             let scraped = scrape_compilers(&mut reader, &cache);
-            let source = (!scraped.is_empty()).then_some(DataSource::CompilerFiles);
-            (scraped, source)
+            if !scraped.is_empty() {
+                (scraped, Evidence::Complete(DataSource::CompilerFiles))
+            } else if let (Some(reason), Some(toolchains)) =
+                (&stale, api.as_ref().and_then(|api| api.toolchains.clone()))
+            {
+                (
+                    toolchains,
+                    Evidence::Partial(DataSource::FileApi, reason.clone()),
+                )
+            } else {
+                (
+                    Vec::new(),
+                    Evidence::Unavailable("No toolchains-v1 reply and no compiler files.".into()),
+                )
+            }
         }
     };
-    evidence.insert(
-        Section::Toolchain,
-        toolchain_source.map_or_else(
-            || Evidence::Unavailable("No toolchains-v1 reply and no compiler files.".into()),
-            Evidence::Complete,
-        ),
-    );
+    evidence.insert(Section::Toolchain, toolchain_evidence);
 
-    let stale = match (api.as_ref().and_then(|api| api.index_mtime), cache_mtime) {
-        (Some(index), Some(cache)) => index.secs.saturating_add(STALE_TOLERANCE_SECS) < cache.secs,
-        _ => false,
-    };
     let mut targets = BTreeMap::new();
     let graph_evidence = match &api {
+        Some(api) if api.unusable.is_some() => {
+            Evidence::Unavailable(api.unusable.clone().unwrap_or_default())
+        }
         Some(api) if api.failed_generation => Evidence::Unavailable(
             "The last generation failed. Older File API replies do not describe this tree.".into(),
         ),
         Some(api) if api.targets.is_some() => {
             targets = api.targets.clone().unwrap_or_default();
-            if stale {
-                Evidence::Partial(
-                    DataSource::FileApi,
-                    "File API reply is older than CMakeCache.txt. Re-run cmake to refresh it."
-                        .into(),
-                )
+            if let Some(reason) = &stale {
+                Evidence::Partial(DataSource::FileApi, reason.clone())
             } else if let Some(reason) = &api.targets_partial {
                 Evidence::Partial(DataSource::FileApi, reason.clone())
             } else {
@@ -274,11 +351,11 @@ pub fn load(host: &dyn Host, dir: &Path) -> Result<BuildSnapshot, LoadError> {
                     Some(Compiler {
                         language: toolchain.language.clone(),
                         path,
-                        dialect: toolchain.frontend.as_deref().map(|frontend| {
+                        frontend: toolchain.frontend.as_deref().map(|frontend| {
                             if frontend.as_slice() == b"MSVC" {
-                                Dialect::Msvc
+                                Frontend::Msvc
                             } else {
-                                Dialect::Gnu
+                                Frontend::Gnu
                             }
                         }),
                     })
@@ -327,15 +404,19 @@ pub fn load(host: &dyn Host, dir: &Path) -> Result<BuildSnapshot, LoadError> {
         warnings.push("No File API reply. Run rcmake diff-config --prepare and configure again for exact data.".into());
     }
 
-    let mut packages = packages::from_cache(host, &cache);
+    let (mut packages, hints_complete) = packages::from_cache(host, &cache);
     let mut packages_unknown = true;
-    let package_evidence = match packages::trace(&mut reader, &build_root) {
-        Some(Ok(trace)) => {
-            packages_unknown = !trace.complete;
-            for (name, observation) in trace.calls {
-                packages.entry(name).or_default().observed.push(observation);
+    let mut package_evidence = match trace {
+        TraceInput::Current { calls, complete } => {
+            packages_unknown = !complete;
+            for call in calls {
+                packages
+                    .entry(call.name)
+                    .or_default()
+                    .observed
+                    .push(call.observation);
             }
-            if trace.complete {
+            if complete {
                 Evidence::Complete(DataSource::FindTrace)
             } else {
                 Evidence::Partial(
@@ -345,18 +426,33 @@ pub fn load(host: &dyn Host, dir: &Path) -> Result<BuildSnapshot, LoadError> {
                 )
             }
         }
-        Some(Err(note)) => {
+        TraceInput::Past(reason) => {
+            let mut note = BString::from("The rcmake find trace is from a past run. ");
+            note.extend_from_slice(&reason);
+            note.extend_from_slice(b" Package outcomes are unknown.");
             warnings.push(note);
             Evidence::Partial(
                 DataSource::Cache,
                 "Only cached package directories are known. Outcomes are unknown.".into(),
             )
         }
-        None => Evidence::Partial(
+        TraceInput::Missing => Evidence::Partial(
             DataSource::Cache,
             "Only cached package directories are known. Outcomes are unknown.".into(),
         ),
     };
+    if !hints_complete {
+        let reason: BString = "Version hints stopped at the read budget.".into();
+        package_evidence = match package_evidence {
+            Evidence::Complete(source) => Evidence::Partial(source, reason),
+            Evidence::Partial(source, mut existing) => {
+                existing.push(b' ');
+                existing.extend_from_slice(&reason);
+                Evidence::Partial(source, existing)
+            }
+            other => other,
+        };
+    }
     evidence.insert(Section::Packages, package_evidence);
 
     Ok(BuildSnapshot {

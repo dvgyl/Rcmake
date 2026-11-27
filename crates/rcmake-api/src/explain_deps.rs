@@ -10,14 +10,17 @@ use rcmake_diag::{
     Backtrace,
     suggest::{Namespace, suggest_candidates_in},
 };
-use rcmake_genex::{ConfigId, EvalContext, UsageTraversal};
+use rcmake_genex::{ConfigId, EvalContext, TargetHandle, UsageTraversal};
 use rcmake_model::{DirId, TargetId, TargetKind, UsageScope};
 use rcmake_resolve::usage::UsageResolver;
 
 use crate::ConfigureResult;
 
 const MAX_PATHS: usize = 16;
+/// Most paths that the walk keeps before it sorts and removes duplicates.
+const MAX_FOUND: usize = 4 * MAX_PATHS;
 const MAX_DEPTH: usize = 32;
+/// Most edges that the walk examines in one configuration.
 const MAX_VISITS: usize = 20_000;
 
 /// Kind of one dependency edge.
@@ -87,7 +90,8 @@ pub struct DependencyReport {
     pub resolved: Option<BString>,
     /// Distinct paths, shortest first.
     pub paths: Vec<DependencyPath>,
-    /// The path, depth, or visit limit stopped the walk.
+    /// The path, depth, or edge limit stopped the walk. The paths are then a
+    /// bounded sample and not every path.
     pub truncated: bool,
     /// Number of edges skipped because they close a cycle on the current path.
     pub cycles: u32,
@@ -170,7 +174,7 @@ impl ConfigureResult {
             };
             let mut on_path = HashSet::from([head]);
             let mut hops = Vec::new();
-            walk.visit(head, true, &mut on_path, &mut hops);
+            walk.visit(head, head, true, &mut on_path, &mut hops);
             paths.append(&mut walk.found);
             report = walk.report;
         }
@@ -202,20 +206,27 @@ impl Walk<'_, '_> {
         )
     }
 
+    /// Walk the edges out of `node`. `consumer` is the target that builds and
+    /// consumes the link interface of `node`. It is `node` itself for a target that
+    /// builds on its own, and the consumer of the previous hop for a link edge.
     fn visit(
         &mut self,
         node: TargetId,
+        consumer: TargetId,
         builds: bool,
         on_path: &mut HashSet<TargetId>,
         hops: &mut Vec<DependencyHop>,
     ) {
-        if hops.len() >= MAX_DEPTH || self.visits >= MAX_VISITS || self.found.len() > 4 * MAX_PATHS
-        {
+        if hops.len() >= MAX_DEPTH {
             self.report.truncated = true;
             return;
         }
-        self.visits += 1;
-        for edge in self.edges(node, builds) {
+        for edge in self.edges(node, consumer, builds) {
+            if self.visits >= MAX_VISITS || self.found.len() >= MAX_FOUND {
+                self.report.truncated = true;
+                return;
+            }
+            self.visits += 1;
             if !on_path.insert(edge.to) {
                 self.report.cycles = self.report.cycles.saturating_add(1);
                 continue;
@@ -242,20 +253,24 @@ impl Walk<'_, '_> {
                     order_only: hops.iter().any(|hop| hop.edge == DependencyEdge::OrderOnly),
                     hops: hops.clone(),
                 });
+            } else if edge.edge == DependencyEdge::OrderOnly {
+                self.visit(edge.to, edge.to, true, on_path, hops);
             } else {
-                let next_builds = edge.edge == DependencyEdge::OrderOnly;
-                self.visit(edge.to, next_builds, on_path, hops);
+                self.visit(edge.to, consumer, false, on_path, hops);
             }
             hops.pop();
             on_path.remove(&edge.to);
         }
     }
 
-    /// Edges out of `node`. A node that builds on its own uses its link
-    /// implementation. A node reached through a link edge uses its link interface.
-    fn edges(&mut self, node: TargetId, builds: bool) -> Vec<Edge> {
+    /// Edges out of `node`, evaluated for `consumer`. A node that builds on its own
+    /// uses its link implementation. A node reached through a link edge uses its
+    /// link interface.
+    fn edges(&mut self, node: TargetId, consumer: TargetId, builds: bool) -> Vec<Edge> {
+        let head = u32::try_from(consumer.index()).ok().map(TargetHandle);
         let ctx = |traversal| EvalContext {
             config: ConfigId(self.config.clone()),
+            head,
             traversal,
             quiet: true,
             ..EvalContext::default()

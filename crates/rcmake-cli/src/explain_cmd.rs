@@ -43,7 +43,9 @@ Show where a target gets its build settings or where a variable gets its value.
                    Use --flag=<flag> for a flag that starts with --.
   --define <name>  Show where a preprocessor definition comes from. Use NAME or NAME=VALUE.
   --include <dir>  Show where an include directory comes from.
-  --dep <target>   Show every link and order-only path from the target to <target>.
+  --dep <target>   Show link and order-only paths from the target to <target>.
+                   The search stops at 16 paths, depth 32, or 20000 edges, and
+                   then reports that it is incomplete.
   --json           Write one JSON report to standard output.
   --verbose        Show full values and call stacks in terminal output.
   --color=<mode>   Set terminal color. Default: auto.

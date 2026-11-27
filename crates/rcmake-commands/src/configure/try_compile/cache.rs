@@ -692,22 +692,31 @@ pub(super) fn verify_remote_payload(
     entry: &Entry<CachedProbe>,
 ) -> bool {
     let outcome = &entry.payload.outcome;
-    let checks = &entry.payload.checks;
-    if !entry_fits(&entry.trace, checks, outcome) || !checks.verify(host) {
+    // A remote probe that compiled always carries its artifact.
+    outcome.compiled == outcome.artifact.is_some()
+        && payload_fits_recipe(host, recipe, entry)
+        && entry.payload.checks.verify(host)
+}
+
+/// Check the size limits, the artifact role, and the artifact path for `recipe`.
+///
+/// Only a compiled outcome can keep an artifact, and its blob is the only blob.
+fn payload_fits_recipe(host: &dyn Host, recipe: &ProbeRecipe, entry: &Entry<CachedProbe>) -> bool {
+    let outcome = &entry.payload.outcome;
+    if !entry_fits(&entry.trace, &entry.payload.checks, outcome) {
         return false;
     }
-    if !outcome.compiled {
-        return outcome.artifact.is_none() && entry.blobs.is_empty();
+    match (&outcome.artifact, entry.blobs.as_slice()) {
+        (None, []) => true,
+        (Some(artifact), [blob]) if outcome.compiled && artifact.blob == *blob => {
+            let bindings = recipe.bindings.clone().with_canonical(host);
+            artifact
+                .relative_path
+                .render(&bindings)
+                .is_some_and(|bytes| is_relative_artifact(&path::to_native(&bytes)))
+        }
+        _ => false,
     }
-    let (Some(artifact), [blob]) = (&outcome.artifact, entry.blobs.as_slice()) else {
-        return false;
-    };
-    let bindings = recipe.bindings.clone().with_canonical(host);
-    artifact.blob == *blob
-        && artifact
-            .relative_path
-            .render(&bindings)
-            .is_some_and(|bytes| is_relative_artifact(&path::to_native(&bytes)))
 }
 
 fn read_outcome(
@@ -715,8 +724,10 @@ fn read_outcome(
     store: &Store<'_>,
     recipe: &ProbeRecipe,
 ) -> Option<ObservedOutcome> {
+    // The recipe check runs before the store restores blobs from an import candidate.
+    let accept = |entry: &Entry<CachedProbe>| payload_fits_recipe(host, recipe, entry);
     let entry = store
-        .get_entry::<CachedProbe>(Domain::ProbeV1, compute_probe_key(recipe))
+        .get_entry_accepted::<CachedProbe>(Domain::ProbeV1, compute_probe_key(recipe), &accept)
         .ok()??;
     decode_outcome(host, store, recipe, &entry)
 }
@@ -892,3 +903,72 @@ pub(crate) mod test_support;
 #[path = "cache_tests.rs"]
 /// Test fixtures shared by the cache and the worker pool.
 pub(in super::super) mod tests;
+
+#[cfg(all(test, unix))]
+mod payload_shape_tests {
+    use rcmake_host::PureHost;
+    use rcmake_store::probe_payload_valid;
+
+    use super::super::journal::{JournalHost, JournalMode};
+    use super::*;
+
+    fn shape(probe: &CachedProbe, blobs: Vec<Digest>) -> bool {
+        probe_payload_valid(&Entry {
+            trace: Vec::new(),
+            blobs,
+            payload: probe.to_json(),
+        })
+    }
+
+    /// The store admits imported probe entries by its payload check. Each typed
+    /// record must pass it, and a record with a wrong artifact role must fail it.
+    #[test]
+    fn typed_probe_records_match_the_store_payload_check() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let host = PureHost::default();
+        let scratch = std::path::Path::new("/work/scratch");
+        host.create_dir_all(scratch)?;
+        let journal = JournalHost::new(&host, scratch, JournalMode::Observe, None)?.finish();
+        let (_, checks) = journal.verified_inputs(&host).ok_or("checks")?;
+        let blob = Digest::from_bytes([0x44; 32]);
+        let mut probe = CachedProbe {
+            outcome: ProbeOutcome {
+                max_start_depth: 3,
+                compiled: true,
+                exit_code: 0,
+                output: Templated::literal(b"ok").ok_or("template")?,
+                artifact: Some(ArtifactRef {
+                    blob,
+                    relative_path: Templated::literal(b"bin/cmTC_1").ok_or("template")?,
+                    mode: 0o755,
+                }),
+                diagnostics: Vec::new(),
+            },
+            checks: checks.clone(),
+        };
+        assert!(shape(&probe, vec![blob]));
+        assert!(!shape(&probe, Vec::new()));
+        assert!(!shape(&probe, vec![Digest::from_bytes([0x45; 32])]));
+        assert!(!shape(&probe, vec![blob, Digest::from_bytes([0x45; 32])]));
+
+        probe.outcome.compiled = false;
+        assert!(
+            !shape(&probe, vec![blob]),
+            "a failed outcome has no artifact"
+        );
+        probe.outcome.artifact = None;
+        assert!(shape(&probe, Vec::new()));
+        assert!(!shape(&probe, vec![blob]));
+        probe.outcome.compiled = true;
+        assert!(
+            shape(&probe, Vec::new()),
+            "a compiled outcome can keep no artifact"
+        );
+        assert!(!probe_payload_valid(&Entry {
+            trace: Vec::new(),
+            blobs: Vec::new(),
+            payload: Value::string("probe"),
+        }));
+        Ok(())
+    }
+}

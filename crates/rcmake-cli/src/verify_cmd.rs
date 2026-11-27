@@ -10,8 +10,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use rcmake_base::{BString, truth};
+use rcmake_base::{BString, path_lex::Lexical, truth};
 use rcmake_buildinfo::{ArtifactReader, ReadLimits, parse_cache};
 use rcmake_host::{FileKind, Follow, Host, Input, Output, ProcessResult, RunRequest, Stream, path};
 use rcmake_json::{Value, write_compact};
@@ -19,6 +20,9 @@ use rcmake_presets::{EnvSnapshot, PresetKind, PresetSettings};
 
 use crate::options::split_flag;
 use crate::resolve_cli_path;
+
+/// Overall launcher deadline for the companion process (gives companion's 600s deadline room to emit reports).
+const VERIFY_LAUNCHER_TIMEOUT: Duration = Duration::from_secs(660);
 
 const HELP: &str = "\
 Usage: rcmake verify [--json] --oracle <path> -- <configure arguments>
@@ -56,15 +60,50 @@ enum CliAction {
     Run(VerifyCli),
 }
 
-/// Typed argument forwarded to `rcmake-verify`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ForwardArg {
-    /// Verbatim configure argument.
+enum PathArg {
+    SourceRel(BString),
+    ExternalAbsolute(BString),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DefineValue {
     Literal(BString),
-    /// Separate flag plus path relative to the staged source directory.
-    FlagSourceRel { flag: BString, rel: BString },
-    /// Attached `<prefix><staged_src>/<rel>` argument (for example `-DCMAKE_TOOLCHAIN_FILE:FILEPATH=...`).
-    PrefixSourceRel { prefix: BString, rel: BString },
+    SourceRel(BString),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TraceSourceArg {
+    SourceRel(BString),
+    ExternalAbsolute(BString),
+    RelativeName(BString),
+}
+
+/// Typed configure-only option serialized to `rcmake-verify`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConfigureOption {
+    Generator(BString),
+    Architecture(BString),
+    Toolset(BString),
+    Preset(BString),
+    PresetsFile(PathArg),
+    PreloadScript(PathArg),
+    Toolchain(PathArg),
+    InstallPrefix(BString),
+    Define {
+        name: BString,
+        ty: Option<BString>,
+        value: DefineValue,
+    },
+    Undefine(BString),
+    Flag(&'static str),
+    Warning(BString),
+    LogLevel(BString),
+    DebugFindPkg(BString),
+    DebugFindVar(BString),
+    TraceFormat(BString),
+    TraceSource(TraceSourceArg),
+    ProjectFile(BString),
 }
 
 #[derive(Debug)]
@@ -74,7 +113,7 @@ struct TypedVerifyRequest {
     source_dir: PathBuf,
     excluded_build_dir: Option<PathBuf>,
     cwd_rel_to_source: Option<BString>,
-    args: Vec<ForwardArg>,
+    args: Vec<ConfigureOption>,
     json: bool,
     request_compile_commands: bool,
     compile_commands_user_disabled: bool,
@@ -125,7 +164,7 @@ pub(crate) fn run(argv0: Option<&BString>, args: &[BString], host: Arc<dyn Host>
         stdin: Input::Bytes(payload.into()),
         stdout: Output::Capture,
         stderr: Output::Capture,
-        timeout: None,
+        timeout: Some(VERIFY_LAUNCHER_TIMEOUT),
         tee: false,
     };
 
@@ -360,18 +399,28 @@ enum ParsedDir {
 
 #[derive(Clone, Debug)]
 enum ParsedForward {
-    Literal(BString),
+    Generator(BString),
+    Architecture(BString),
+    Toolset(BString),
+    Preset(BString),
     PreloadScript(PathBuf),
     ToolchainFlag(PathBuf),
     InstallPrefixFlag(PathBuf),
     PresetsFileFlag(PathBuf),
     Define {
-        raw: BString,
         name: BString,
         ty: Option<BString>,
         value: BString,
     },
     Undefine(BString),
+    Flag(&'static str),
+    Warning(BString),
+    LogLevel(BString),
+    DebugFindPkg(BString),
+    DebugFindVar(BString),
+    TraceFormat(BString),
+    TraceSource(BString),
+    ProjectFile(BString),
 }
 
 fn build_typed_request(
@@ -387,6 +436,7 @@ fn build_typed_request(
     let mut presets_file: Option<PathBuf> = None;
     let mut generator_hint: Option<BString> = None;
     let mut explicit_compdb_state: Option<bool> = None;
+    let mut seen_project_file = false;
     let mut iter = configure_args.iter().peekable();
 
     // Reject leading non-configure subcommands or mode flags immediately.
@@ -436,7 +486,7 @@ fn build_typed_request(
             (f, (!tail.is_empty()).then_some(tail))
         };
 
-        // Reject non-configure actions and unsupported output/path redirects before launch (P1-13).
+        // Reject non-configure actions and unsupported output/path redirects before launch.
         if let Some(reason) = rejected_configure_option(bytes, flag) {
             return Err(reason);
         }
@@ -463,13 +513,15 @@ fn build_typed_request(
             b"-G" => {
                 let val = take_req("No generator specified for -G.")?;
                 generator_hint = Some(BString::from(val));
-                forwarded.push(ParsedForward::Literal(BString::from("-G")));
-                forwarded.push(ParsedForward::Literal(BString::from(val)));
+                forwarded.push(ParsedForward::Generator(BString::from(val)));
             }
-            b"-A" | b"-T" => {
-                let val = take_req("Missing value for -A or -T.")?;
-                forwarded.push(ParsedForward::Literal(BString::from(flag)));
-                forwarded.push(ParsedForward::Literal(BString::from(val)));
+            b"-A" => {
+                let val = take_req("Missing value for -A.")?;
+                forwarded.push(ParsedForward::Architecture(BString::from(val)));
+            }
+            b"-T" => {
+                let val = take_req("Missing value for -T.")?;
+                forwarded.push(ParsedForward::Toolset(BString::from(val)));
             }
             b"-C" => {
                 let val = match inline {
@@ -497,8 +549,7 @@ fn build_typed_request(
             b"--preset" => {
                 let val = take_req("No preset specified for --preset.")?;
                 preset = Some(BString::from(val));
-                forwarded.push(ParsedForward::Literal(BString::from("--preset")));
-                forwarded.push(ParsedForward::Literal(BString::from(val)));
+                forwarded.push(ParsedForward::Preset(BString::from(val)));
             }
             b"--presets-file" => {
                 let val = take_req("No file specified for --presets-file.")?;
@@ -514,12 +565,7 @@ fn build_typed_request(
                 if name.as_slice() == b"CMAKE_EXPORT_COMPILE_COMMANDS" {
                     explicit_compdb_state = Some(truth::is_on(&value));
                 }
-                forwarded.push(ParsedForward::Define {
-                    raw: BString::from(raw_def),
-                    name,
-                    ty,
-                    value,
-                });
+                forwarded.push(ParsedForward::Define { name, ty, value });
             }
             b"-U" => {
                 let pat = take_req("-U must be followed with VAR.")?;
@@ -547,18 +593,63 @@ fn build_typed_request(
                         String::from_utf8_lossy(flag)
                     ));
                 }
-                forwarded.push(ParsedForward::Literal(BString::from(flag)));
+                let wire_name = simple_flag_wire_name(flag).ok_or_else(|| {
+                    format!(
+                        "Unsupported configure flag '{}' for verify.",
+                        String::from_utf8_lossy(flag)
+                    )
+                })?;
+                forwarded.push(ParsedForward::Flag(wire_name));
             }
             b"-W" => {
                 let val = take_req("-W must be followed with [no-]<name>.")?;
-                forwarded.push(ParsedForward::Literal(
-                    [b"-W".as_slice(), val].concat().into(),
-                ));
+                validate_warning_value(val)?;
+                forwarded.push(ParsedForward::Warning(BString::from(val)));
             }
-            b"--log-level" | b"--loglevel" | b"--debug-find-pkg" | b"--debug-find-var"
-            | b"--trace-format" | b"--trace-source" | b"--project-file" => {
-                let val = take_req("Missing value for configure option.")?;
-                forwarded.push(ParsedForward::Literal([flag, b"=", val].concat().into()));
+            b"--log-level" | b"--loglevel" => {
+                let val = take_req("Missing value for --log-level.")?;
+                validate_log_level(val)?;
+                forwarded.push(ParsedForward::LogLevel(BString::from(val)));
+            }
+            b"--debug-find-pkg" => {
+                let val = take_req("Missing value for --debug-find-pkg.")?;
+                if val.contains(&b'/') || val.contains(&b'\\') {
+                    return Err("--debug-find-pkg must not contain path separators.".into());
+                }
+                forwarded.push(ParsedForward::DebugFindPkg(BString::from(val)));
+            }
+            b"--debug-find-var" => {
+                let val = take_req("Missing value for --debug-find-var.")?;
+                if val.contains(&b'/') || val.contains(&b'\\') {
+                    return Err("--debug-find-var must not contain path separators.".into());
+                }
+                forwarded.push(ParsedForward::DebugFindVar(BString::from(val)));
+            }
+            b"--trace-format" => {
+                let val = take_req("Missing value for --trace-format.")?;
+                if !matches!(val, b"human" | b"json-v1") {
+                    return Err(format!(
+                        "Invalid --trace-format '{}': expected 'human' or 'json-v1'.",
+                        String::from_utf8_lossy(val)
+                    ));
+                }
+                forwarded.push(ParsedForward::TraceFormat(BString::from(val)));
+            }
+            b"--trace-source" => {
+                let val = take_req("Missing value for --trace-source.")?;
+                if val.contains(&0) {
+                    return Err("--trace-source must not contain NUL bytes.".into());
+                }
+                forwarded.push(ParsedForward::TraceSource(BString::from(val)));
+            }
+            b"--project-file" => {
+                let val = take_req("Missing value for --project-file.")?;
+                if seen_project_file {
+                    return Err("Specify --project-file only once.".into());
+                }
+                validate_plain_filename(val)?;
+                seen_project_file = true;
+                forwarded.push(ParsedForward::ProjectFile(BString::from(val)));
             }
             _ => {
                 return Err(format!(
@@ -597,7 +688,7 @@ fn build_typed_request(
             && let Some(bin) = resolved.binary_dir
         {
             let native = path::to_native(&bin);
-            excluded_build_dir = Some(if native.is_absolute() {
+            excluded_build_dir = Some(if is_host_absolute(host, &bin) || native.is_absolute() {
                 native
             } else {
                 source_dir.join(native)
@@ -652,92 +743,95 @@ fn build_typed_request(
             .map(path::from_native_cmake)
     });
 
-    // Rewrite path-bearing read arguments against staged source, recording external inputs.
+    // Classify and rewrite path-bearing read options against staged source, recording external inputs.
     let mut external_inputs = Vec::new();
     let mut args = Vec::new();
     for item in forwarded {
         match item {
-            ParsedForward::Literal(val) => args.push(ForwardArg::Literal(val)),
-            ParsedForward::Undefine(pat) => {
-                args.push(ForwardArg::Literal(BString::from("-U")));
-                args.push(ForwardArg::Literal(pat));
-            }
+            ParsedForward::Generator(v) => args.push(ConfigureOption::Generator(v)),
+            ParsedForward::Architecture(v) => args.push(ConfigureOption::Architecture(v)),
+            ParsedForward::Toolset(v) => args.push(ConfigureOption::Toolset(v)),
+            ParsedForward::Preset(v) => args.push(ConfigureOption::Preset(v)),
+            ParsedForward::Undefine(pat) => args.push(ConfigureOption::Undefine(pat)),
+            ParsedForward::Flag(name) => args.push(ConfigureOption::Flag(name)),
+            ParsedForward::Warning(w) => args.push(ConfigureOption::Warning(w)),
+            ParsedForward::LogLevel(l) => args.push(ConfigureOption::LogLevel(l)),
+            ParsedForward::DebugFindPkg(p) => args.push(ConfigureOption::DebugFindPkg(p)),
+            ParsedForward::DebugFindVar(v) => args.push(ConfigureOption::DebugFindVar(v)),
+            ParsedForward::TraceFormat(f) => args.push(ConfigureOption::TraceFormat(f)),
+            ParsedForward::ProjectFile(name) => args.push(ConfigureOption::ProjectFile(name)),
             ParsedForward::PreloadScript(script) => {
-                push_path_arg(
+                args.push(ConfigureOption::PreloadScript(classify_path_arg(
                     host,
                     &source_canonical,
                     &script,
-                    b"-C",
-                    &mut args,
                     &mut external_inputs,
-                    true,
-                );
+                )));
             }
             ParsedForward::ToolchainFlag(tc) => {
-                push_path_arg(
+                args.push(ConfigureOption::Toolchain(classify_path_arg(
                     host,
                     &source_canonical,
                     &tc,
-                    b"--toolchain",
-                    &mut args,
                     &mut external_inputs,
-                    true,
-                );
+                )));
             }
             ParsedForward::PresetsFileFlag(file) => {
-                push_path_arg(
+                args.push(ConfigureOption::PresetsFile(classify_path_arg(
                     host,
                     &source_canonical,
                     &file,
-                    b"--presets-file",
-                    &mut args,
                     &mut external_inputs,
-                    true,
-                );
+                )));
             }
             ParsedForward::InstallPrefixFlag(dir) => {
-                args.push(ForwardArg::Literal(BString::from("--install-prefix")));
-                args.push(ForwardArg::Literal(path::from_native_cmake(&dir)));
+                args.push(ConfigureOption::InstallPrefix(path::from_native_cmake(
+                    &dir,
+                )));
             }
-            ParsedForward::Define {
-                raw,
-                name,
-                ty,
-                value,
-            } => {
-                let path_like = name.as_slice() == b"CMAKE_TOOLCHAIN_FILE"
-                    || ty.as_deref().is_some_and(|t| {
-                        t.eq_ignore_ascii_case(b"PATH") || t.eq_ignore_ascii_case(b"FILEPATH")
-                    });
-                if path_like && !value.is_empty() {
+            ParsedForward::TraceSource(raw) => {
+                let classified =
+                    classify_trace_source(host, &source_canonical, &raw, &mut external_inputs)?;
+                args.push(ConfigureOption::TraceSource(classified));
+            }
+            ParsedForward::Define { name, ty, value } => {
+                let explicit_path_var = matches!(
+                    name.as_slice(),
+                    b"CMAKE_TOOLCHAIN_FILE"
+                        | b"CMAKE_PROJECT_INCLUDE"
+                        | b"CMAKE_PROJECT_INCLUDE_BEFORE"
+                        | b"CMAKE_PROJECT_TOP_LEVEL_INCLUDES"
+                        | b"CMAKE_USER_MAKE_RULES_OVERRIDE"
+                );
+                let typed_path = ty.as_deref().is_some_and(|t| {
+                    t.eq_ignore_ascii_case(b"PATH") || t.eq_ignore_ascii_case(b"FILEPATH")
+                });
+                let single_path_like = !value.is_empty()
+                    && !value.contains(&b';')
+                    && (explicit_path_var || typed_path);
+                let typed_value = if single_path_like {
                     let resolved = resolve_setup_candidate(host, &source_canonical, &value);
-                    if let Some(rel) = relative_under(host, &source_canonical, &resolved) {
-                        let mut prefix = BString::from("-D");
-                        prefix.extend_from_slice(&name);
-                        if let Some(ty) = &ty {
-                            prefix.push(b':');
-                            prefix.extend_from_slice(ty);
-                        }
-                        prefix.push(b'=');
-                        args.push(ForwardArg::PrefixSourceRel { prefix, rel });
-                    } else {
+                    if let Some(rel) =
+                        relative_under(host, &source_canonical, &resolved).filter(|r| !r.is_empty())
+                    {
+                        DefineValue::SourceRel(rel)
+                    } else if name.as_slice() == b"CMAKE_TOOLCHAIN_FILE" || typed_path {
+                        let abs = path::from_native_cmake(&resolved);
                         if name.as_slice() == b"CMAKE_TOOLCHAIN_FILE" {
-                            external_inputs.push(path::from_native_cmake(&resolved));
+                            external_inputs.push(abs.clone());
                         }
-                        let mut full = BString::from("-D");
-                        full.extend_from_slice(&name);
-                        if let Some(ty) = &ty {
-                            full.push(b':');
-                            full.extend_from_slice(ty);
-                        }
-                        full.push(b'=');
-                        full.extend_from_slice(&path::from_native_cmake(&resolved));
-                        args.push(ForwardArg::Literal(full));
+                        DefineValue::Literal(abs)
+                    } else {
+                        DefineValue::Literal(value)
                     }
                 } else {
-                    args.push(ForwardArg::Literal(BString::from("-D")));
-                    args.push(ForwardArg::Literal(raw));
-                }
+                    DefineValue::Literal(value)
+                };
+                args.push(ConfigureOption::Define {
+                    name,
+                    ty,
+                    value: typed_value,
+                });
             }
         }
     }
@@ -758,6 +852,117 @@ fn build_typed_request(
         generator_hint,
         external_inputs,
     })
+}
+
+fn simple_flag_wire_name(flag: &[u8]) -> Option<&'static str> {
+    Some(match flag {
+        b"--fresh" => "fresh",
+        b"--warn-uninitialized" => "warn-uninitialized",
+        b"--warn-unused-vars" => "warn-unused-vars",
+        b"--no-warn-unused-cli" => "no-warn-unused-cli",
+        b"--check-system-vars" => "check-system-vars",
+        b"--compile-no-warning-as-error" => "compile-no-warning-as-error",
+        b"--link-no-warning-as-error" => "link-no-warning-as-error",
+        b"--debug-output" => "debug-output",
+        b"--debug-trycompile" => "debug-trycompile",
+        b"--debug-find" => "debug-find",
+        b"--log-context" => "log-context",
+        b"--trace" => "trace",
+        b"--trace-expand" => "trace-expand",
+        _ => return None,
+    })
+}
+
+fn validate_warning_value(val: &[u8]) -> Result<(), String> {
+    let rest = val.strip_prefix(b"no-").unwrap_or(val);
+    let name = rest.strip_prefix(b"error=").unwrap_or(rest);
+    if !matches!(name, b"dev" | b"deprecated") {
+        return Err(format!(
+            "Unsupported warning flag '-W{}' for verify.",
+            String::from_utf8_lossy(val)
+        ));
+    }
+    Ok(())
+}
+
+fn validate_log_level(val: &[u8]) -> Result<(), String> {
+    let upper = val.to_ascii_uppercase();
+    if !matches!(
+        upper.as_slice(),
+        b"ERROR" | b"WARNING" | b"NOTICE" | b"STATUS" | b"VERBOSE" | b"DEBUG" | b"TRACE"
+    ) {
+        return Err(format!(
+            "Invalid --log-level '{}': expected ERROR, WARNING, NOTICE, STATUS, VERBOSE, DEBUG, or TRACE.",
+            String::from_utf8_lossy(val)
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plain_filename(name: &[u8]) -> Result<(), String> {
+    if name.is_empty()
+        || name == b"."
+        || name == b".."
+        || name.contains(&0)
+        || name.contains(&b'/')
+        || name.contains(&b'\\')
+        || name.contains(&b':')
+    {
+        return Err(format!(
+            "Option '--project-file' value '{}' must be a plain file name with no path separators.",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    Ok(())
+}
+
+fn is_host_absolute(host: &dyn Host, raw: &[u8]) -> bool {
+    if raw.is_empty() || raw.contains(&0) {
+        return false;
+    }
+    if host.system().sysname.eq_ignore_ascii_case(b"Windows") {
+        let fwd: Vec<u8> = raw
+            .iter()
+            .map(|&b| if b == b'\\' { b'/' } else { b })
+            .collect();
+        Lexical::windows(&fwd).absolute()
+    } else {
+        raw.starts_with(b"/")
+    }
+}
+
+fn classify_trace_source(
+    host: &dyn Host,
+    source_root: &Path,
+    raw: &[u8],
+    external_inputs: &mut Vec<BString>,
+) -> Result<TraceSourceArg, String> {
+    let is_abs = is_host_absolute(host, raw);
+    let has_sep = raw.contains(&b'/') || raw.contains(&b'\\');
+    if is_abs || has_sep {
+        let resolved = resolve_setup_candidate(host, source_root, raw);
+        if let Some(rel) = relative_under(host, source_root, &resolved).filter(|r| !r.is_empty()) {
+            return Ok(TraceSourceArg::SourceRel(rel));
+        }
+        if is_abs || raw.split(|&b| b == b'/' || b == b'\\').any(|p| p == b"..") {
+            let abs = path::from_native_cmake(&resolved);
+            external_inputs.push(abs.clone());
+            return Ok(TraceSourceArg::ExternalAbsolute(abs));
+        }
+    }
+    if raw == b"."
+        || raw == b".."
+        || matches!(raw, [drive, b':', ..] if drive.is_ascii_alphabetic())
+        || raw
+            .split(|&b| b == b'/' || b == b'\\')
+            .any(|part| part == b"..")
+    {
+        return Err(format!(
+            "Invalid --trace-source filter '{}': relative filter must not escape the source tree.",
+            String::from_utf8_lossy(raw)
+        ));
+    }
+    Ok(TraceSourceArg::RelativeName(BString::from(raw)))
 }
 
 fn rejected_configure_option(raw: &[u8], flag: &[u8]) -> Option<String> {
@@ -838,10 +1043,23 @@ fn split_define(raw: &[u8]) -> Result<(BString, Option<BString>, BString), Strin
     let lhs = raw.get(..eq).unwrap_or_default();
     let value = BString::from(raw.get(eq + 1..).unwrap_or_default());
     let (name, ty) = match lhs.iter().position(|&b| b == b':') {
-        Some(colon) => (
-            BString::from(lhs.get(..colon).unwrap_or_default()),
-            Some(BString::from(lhs.get(colon + 1..).unwrap_or_default())),
-        ),
+        Some(colon) => {
+            let ty_bytes = lhs.get(colon + 1..).unwrap_or_default();
+            if ty_bytes.is_empty()
+                || !ty_bytes
+                    .iter()
+                    .all(|&b| b.is_ascii_alphabetic() || b == b'_')
+            {
+                return Err(format!(
+                    "Invalid -D cache type in '{}'.",
+                    String::from_utf8_lossy(raw)
+                ));
+            }
+            (
+                BString::from(lhs.get(..colon).unwrap_or_default()),
+                Some(BString::from(ty_bytes)),
+            )
+        }
         None => (BString::from(lhs), None),
     };
     if name.is_empty() {
@@ -903,7 +1121,7 @@ fn resolve_verify_dirs(
 
 fn resolve_setup_candidate(host: &dyn Host, source_root: &Path, raw: &[u8]) -> PathBuf {
     let native = path::to_native(raw);
-    if native.is_absolute() {
+    if is_host_absolute(host, raw) || native.is_absolute() {
         return native;
     }
     let from_cwd = resolve_cli_path(host, raw);
@@ -929,27 +1147,31 @@ fn relative_under(host: &dyn Host, source_root: &Path, candidate: &Path) -> Opti
         .map(path::from_native_cmake)
 }
 
-fn push_path_arg(
+fn classify_path_arg(
     host: &dyn Host,
     source_root: &Path,
     candidate: &Path,
-    flag: &[u8],
-    out: &mut Vec<ForwardArg>,
     external_inputs: &mut Vec<BString>,
-    track_external: bool,
-) {
-    if let Some(rel) = relative_under(host, source_root, candidate) {
-        out.push(ForwardArg::FlagSourceRel {
-            flag: BString::from(flag),
-            rel,
-        });
+) -> PathArg {
+    if let Some(rel) = relative_under(host, source_root, candidate).filter(|r| !r.is_empty()) {
+        PathArg::SourceRel(rel)
     } else {
         let abs = path::from_native_cmake(candidate);
-        if track_external {
-            external_inputs.push(abs.clone());
+        external_inputs.push(abs.clone());
+        PathArg::ExternalAbsolute(abs)
+    }
+}
+
+fn insert_path_arg_fields(obj: &mut BTreeMap<BString, Value>, arg: &PathArg) {
+    match arg {
+        PathArg::SourceRel(rel) => {
+            obj.insert(BString::from("path_kind"), Value::string("source_rel"));
+            obj.insert(BString::from("value"), Value::string(rel.clone()));
         }
-        out.push(ForwardArg::Literal(BString::from(flag)));
-        out.push(ForwardArg::Literal(abs));
+        PathArg::ExternalAbsolute(abs) => {
+            obj.insert(BString::from("path_kind"), Value::string("external_abs"));
+            obj.insert(BString::from("value"), Value::string(abs.clone()));
+        }
     }
 }
 
@@ -958,20 +1180,20 @@ fn serialize_request(req: &TypedVerifyRequest) -> BString {
     root.insert(BString::from("schema_version"), Value::UInt(1));
     root.insert(
         BString::from("rcmake_exe"),
-        Value::string(path::from_native(&req.rcmake_exe)),
+        Value::string(path::from_native_cmake(&req.rcmake_exe)),
     );
     root.insert(
         BString::from("oracle_exe"),
-        Value::string(path::from_native(&req.oracle_exe)),
+        Value::string(path::from_native_cmake(&req.oracle_exe)),
     );
     root.insert(
         BString::from("source_dir"),
-        Value::string(path::from_native(&req.source_dir)),
+        Value::string(path::from_native_cmake(&req.source_dir)),
     );
     if let Some(excluded) = &req.excluded_build_dir {
         root.insert(
             BString::from("excluded_build_dir"),
-            Value::string(path::from_native(excluded)),
+            Value::string(path::from_native_cmake(excluded)),
         );
     }
     if let Some(cwd_rel) = &req.cwd_rel_to_source {
@@ -1010,19 +1232,103 @@ fn serialize_request(req: &TypedVerifyRequest) -> BString {
         .map(|arg| {
             let mut obj = BTreeMap::new();
             match arg {
-                ForwardArg::Literal(value) => {
-                    obj.insert(BString::from("kind"), Value::string("literal"));
-                    obj.insert(BString::from("value"), Value::string(value.clone()));
+                ConfigureOption::Generator(v) => {
+                    obj.insert(BString::from("kind"), Value::string("generator"));
+                    obj.insert(BString::from("value"), Value::string(v.clone()));
                 }
-                ForwardArg::FlagSourceRel { flag, rel } => {
-                    obj.insert(BString::from("kind"), Value::string("flag_source_rel"));
-                    obj.insert(BString::from("flag"), Value::string(flag.clone()));
-                    obj.insert(BString::from("rel"), Value::string(rel.clone()));
+                ConfigureOption::Architecture(v) => {
+                    obj.insert(BString::from("kind"), Value::string("architecture"));
+                    obj.insert(BString::from("value"), Value::string(v.clone()));
                 }
-                ForwardArg::PrefixSourceRel { prefix, rel } => {
-                    obj.insert(BString::from("kind"), Value::string("prefix_source_rel"));
-                    obj.insert(BString::from("prefix"), Value::string(prefix.clone()));
-                    obj.insert(BString::from("rel"), Value::string(rel.clone()));
+                ConfigureOption::Toolset(v) => {
+                    obj.insert(BString::from("kind"), Value::string("toolset"));
+                    obj.insert(BString::from("value"), Value::string(v.clone()));
+                }
+                ConfigureOption::Preset(v) => {
+                    obj.insert(BString::from("kind"), Value::string("preset"));
+                    obj.insert(BString::from("value"), Value::string(v.clone()));
+                }
+                ConfigureOption::PresetsFile(p) => {
+                    obj.insert(BString::from("kind"), Value::string("presets_file"));
+                    insert_path_arg_fields(&mut obj, p);
+                }
+                ConfigureOption::PreloadScript(p) => {
+                    obj.insert(BString::from("kind"), Value::string("preload_script"));
+                    insert_path_arg_fields(&mut obj, p);
+                }
+                ConfigureOption::Toolchain(p) => {
+                    obj.insert(BString::from("kind"), Value::string("toolchain"));
+                    insert_path_arg_fields(&mut obj, p);
+                }
+                ConfigureOption::InstallPrefix(v) => {
+                    obj.insert(BString::from("kind"), Value::string("install_prefix"));
+                    obj.insert(BString::from("value"), Value::string(v.clone()));
+                }
+                ConfigureOption::Define { name, ty, value } => {
+                    obj.insert(BString::from("kind"), Value::string("define"));
+                    obj.insert(BString::from("name"), Value::string(name.clone()));
+                    if let Some(ty) = ty {
+                        obj.insert(BString::from("type"), Value::string(ty.clone()));
+                    }
+                    match value {
+                        DefineValue::Literal(v) => {
+                            obj.insert(BString::from("value_kind"), Value::string("literal"));
+                            obj.insert(BString::from("value"), Value::string(v.clone()));
+                        }
+                        DefineValue::SourceRel(rel) => {
+                            obj.insert(BString::from("value_kind"), Value::string("source_rel"));
+                            obj.insert(BString::from("value"), Value::string(rel.clone()));
+                        }
+                    }
+                }
+                ConfigureOption::Undefine(pat) => {
+                    obj.insert(BString::from("kind"), Value::string("undefine"));
+                    obj.insert(BString::from("pattern"), Value::string(pat.clone()));
+                }
+                ConfigureOption::Flag(name) => {
+                    obj.insert(BString::from("kind"), Value::string("flag"));
+                    obj.insert(BString::from("name"), Value::string(*name));
+                }
+                ConfigureOption::Warning(w) => {
+                    obj.insert(BString::from("kind"), Value::string("warning"));
+                    obj.insert(BString::from("value"), Value::string(w.clone()));
+                }
+                ConfigureOption::LogLevel(l) => {
+                    obj.insert(BString::from("kind"), Value::string("log_level"));
+                    obj.insert(BString::from("value"), Value::string(l.clone()));
+                }
+                ConfigureOption::DebugFindPkg(p) => {
+                    obj.insert(BString::from("kind"), Value::string("debug_find_pkg"));
+                    obj.insert(BString::from("value"), Value::string(p.clone()));
+                }
+                ConfigureOption::DebugFindVar(v) => {
+                    obj.insert(BString::from("kind"), Value::string("debug_find_var"));
+                    obj.insert(BString::from("value"), Value::string(v.clone()));
+                }
+                ConfigureOption::TraceFormat(f) => {
+                    obj.insert(BString::from("kind"), Value::string("trace_format"));
+                    obj.insert(BString::from("value"), Value::string(f.clone()));
+                }
+                ConfigureOption::TraceSource(src) => {
+                    obj.insert(BString::from("kind"), Value::string("trace_source"));
+                    match src {
+                        TraceSourceArg::SourceRel(rel) => {
+                            obj.insert(BString::from("path_kind"), Value::string("source_rel"));
+                            obj.insert(BString::from("value"), Value::string(rel.clone()));
+                        }
+                        TraceSourceArg::ExternalAbsolute(abs) => {
+                            obj.insert(BString::from("path_kind"), Value::string("external_abs"));
+                            obj.insert(BString::from("value"), Value::string(abs.clone()));
+                        }
+                        TraceSourceArg::RelativeName(rel) => {
+                            obj.insert(BString::from("path_kind"), Value::string("relative_name"));
+                            obj.insert(BString::from("value"), Value::string(rel.clone()));
+                        }
+                    }
+                }
+                ConfigureOption::ProjectFile(name) => {
+                    obj.insert(BString::from("kind"), Value::string("project_file"));
+                    obj.insert(BString::from("value"), Value::string(name.clone()));
                 }
             }
             Value::Object(obj)
@@ -1056,7 +1362,7 @@ mod tests {
         // Missing --oracle -> exit 2
         assert_eq!(run(None, &bargs(&["--", "-S", "."]), host.clone()), 2);
 
-        // Non-configure actions and path-bearing redirects -> exit 2 before launching companion
+        // Non-configure actions, path redirects, and unsafe project-file paths -> exit 2 before launch
         for bad in [
             &["--oracle", "/opt/cmake", "--", "--build", "out"][..],
             &["--oracle", "/opt/cmake", "--", "--install", "out"][..],
@@ -1102,6 +1408,22 @@ mod tests {
                 ".",
                 "--export-compile-commands",
             ][..],
+            &[
+                "--oracle",
+                "/opt/cmake",
+                "--",
+                "-S",
+                ".",
+                "--project-file=../evil.txt",
+            ][..],
+            &[
+                "--oracle",
+                "/opt/cmake",
+                "--",
+                "-S",
+                ".",
+                "--project-file=/abs/CMakeLists.txt",
+            ][..],
         ] {
             let code = run(None, &bargs(bad), host.clone());
             assert_eq!(code, 2, "expected exit 2 for {bad:?}");
@@ -1126,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_source_relative_preload_and_toolchain_and_passes_typed_request()
+    fn rewrites_source_relative_options_and_passes_typed_request()
     -> Result<(), Box<dyn std::error::Error>> {
         let host = Arc::new(PureHost::new(
             PathBuf::from("/work"),
@@ -1143,8 +1465,13 @@ mod tests {
             b"set(FOO 1 CACHE STRING \"\")\n",
         )?;
         host.seed_file(Path::new("/work/src/tc.cmake"), b"")?;
+        host.seed_file(Path::new("/work/src/sub/mod.cmake"), b"")?;
 
-        let captured = Arc::new(std::sync::Mutex::new(Vec::<(BString, Vec<u8>)>::new()));
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<(
+            BString,
+            Vec<u8>,
+            Option<Duration>,
+        )>::new()));
         let sink = Arc::clone(&captured);
         host.set_command_handler(move |_host, req, _| {
             let bytes = match &req.stdin {
@@ -1152,7 +1479,7 @@ mod tests {
                 _ => Vec::new(),
             };
             if let Ok(mut guard) = sink.lock() {
-                guard.push((req.pipeline[0].program.clone(), bytes));
+                guard.push((req.pipeline[0].program.clone(), bytes, req.timeout));
             }
             Ok(RunOutput {
                 results: vec![ProcessResult::Exited(0)],
@@ -1178,6 +1505,8 @@ mod tests {
                 "src/init.cmake",
                 "--toolchain",
                 "src/tc.cmake",
+                "--trace-source=/work/src/sub/mod.cmake",
+                "--project-file=AltLists.txt",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF",
             ]),
             host.clone(),
@@ -1190,7 +1519,11 @@ mod tests {
         );
         let calls = captured.lock().expect("lock");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "/bin/rcmake-verify");
+        assert_eq!(
+            rcmake_base::path_lex::cmake_style(&calls[0].0),
+            "/bin/rcmake-verify"
+        );
+        assert_eq!(calls[0].2, Some(VERIFY_LAUNCHER_TIMEOUT));
         let parsed = rcmake_json::parse(&calls[0].1, &rcmake_json::ReadOptions::default())?;
         assert_eq!(
             parsed.get("schema_version").and_then(Value::as_u64),
@@ -1218,14 +1551,33 @@ mod tests {
         );
         let args = parsed.get("args").and_then(Value::as_array).expect("args");
         assert!(args.iter().any(|a| {
-            a.get("kind").and_then(Value::as_str) == Some("flag_source_rel")
-                && a.get("flag").and_then(Value::as_str) == Some("-C")
-                && a.get("rel").and_then(Value::as_str) == Some("init.cmake")
+            a.get("kind").and_then(Value::as_str) == Some("generator")
+                && a.get("value").and_then(Value::as_str) == Some("Ninja")
         }));
         assert!(args.iter().any(|a| {
-            a.get("kind").and_then(Value::as_str) == Some("flag_source_rel")
-                && a.get("flag").and_then(Value::as_str) == Some("--toolchain")
-                && a.get("rel").and_then(Value::as_str) == Some("tc.cmake")
+            a.get("kind").and_then(Value::as_str) == Some("preload_script")
+                && a.get("path_kind").and_then(Value::as_str) == Some("source_rel")
+                && a.get("value").and_then(Value::as_str) == Some("init.cmake")
+        }));
+        assert!(args.iter().any(|a| {
+            a.get("kind").and_then(Value::as_str) == Some("toolchain")
+                && a.get("path_kind").and_then(Value::as_str) == Some("source_rel")
+                && a.get("value").and_then(Value::as_str) == Some("tc.cmake")
+        }));
+        assert!(args.iter().any(|a| {
+            a.get("kind").and_then(Value::as_str) == Some("trace_source")
+                && a.get("path_kind").and_then(Value::as_str) == Some("source_rel")
+                && a.get("value").and_then(Value::as_str) == Some("sub/mod.cmake")
+        }));
+        assert!(args.iter().any(|a| {
+            a.get("kind").and_then(Value::as_str) == Some("project_file")
+                && a.get("value").and_then(Value::as_str) == Some("AltLists.txt")
+        }));
+        assert!(args.iter().any(|a| {
+            a.get("kind").and_then(Value::as_str) == Some("define")
+                && a.get("name").and_then(Value::as_str) == Some("CMAKE_EXPORT_COMPILE_COMMANDS")
+                && a.get("value_kind").and_then(Value::as_str) == Some("literal")
+                && a.get("value").and_then(Value::as_str) == Some("OFF")
         }));
         Ok(())
     }

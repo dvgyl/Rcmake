@@ -22,10 +22,12 @@ rcmake cache export probes.tar.gz
 The command:
 
 1. Reads only probe entries and the blobs that they reference. It does not copy other cache data, lock files, temporary files, or credentials.
-2. Exports an entry only when its frame, its recorded inputs, and all of its blobs are valid now. It counts the other entries as skipped (stale, invalid, missing blobs, or too large).
-3. Writes a gzip tar file with fixed names, modes, owners, and times. The same cache content gives the same bytes.
-4. Writes to a temporary file in the destination directory, then renames it. It refuses a destination inside the cache directory.
-5. Prints the SHA-256 digest of the archive.
+2. Exports an entry only when its frame, its probe record, its recorded inputs, and all of its blobs are valid now. It counts the other entries as skipped (stale, invalid, missing blobs, or too large).
+3. Keeps the archive inside the import size limits. An entry that does not fit is skipped as too large.
+4. Writes a gzip tar file with fixed names, modes, owners, and times. The same cache content gives the same bytes.
+5. Runs the import checks on the finished archive. If a check fails, the command fails and leaves the destination unchanged.
+6. Writes to a new temporary file with a unique name in the destination directory, then renames it. It refuses a destination inside the cache directory.
+7. Prints the SHA-256 digest of the archive.
 
 The archive contains compiler paths, compiler arguments, and the captured compiler output of each check. The export command is the approval to put this data in a file. Treat the archive like other build logs from the same machine. The remote cache has a separate rule: an upload also needs `RCMAKE_CACHE_REMOTE_EXPORT_CAPTURED_OUTPUT=1`.
 
@@ -41,8 +43,9 @@ The command reads one private copy of the archive and calculates its SHA-256 dig
 - Each member must be a regular file named `manifest.json`, `entries/<64 hex digits>`, or `blobs/<64 hex digits>`. Links, devices, directories, extension headers, duplicate names, and other names are errors.
 - The manifest must name only probe entries. The archive must hold exactly those entries and their blobs.
 - Each entry and blob must match its digest, record format, key, and size limits.
+- Each entry must hold a valid probe record. Only a compiled check can keep an artifact, and the artifact blob must be the only blob of the entry.
 
-The size limits apply before memory is allocated. The limits are 256 MiB for the archive, 640 MiB for the decompressed tar stream, 64 MiB for one member, and 512 MiB for all members.
+The size limits apply before memory is allocated. The limits are 256 MiB for the archive, 272 MiB for the decompressed tar stream, 64 MiB for one member, 16 MiB for the manifest, 256 MiB for all members, 65,536 members, and 1 GiB for all decoded blobs. Export uses the same limits, so an archive from `rcmake cache export` always passes these checks.
 
 If a check fails, the command prints the reason and changes nothing.
 
@@ -51,7 +54,13 @@ The `--sha256` option selects how the import uses the entries:
 - **With `--sha256`.** The digest must match the archive. The digest must come from a source that you trust, for example a protected producer job. The import then publishes the entries under the cache collection lock. It writes the blobs of an entry before the entry, so collection cannot remove a blob that a new entry needs. A valid local entry is never replaced.
 - **Without `--sha256`.** The archive digest proves only that the file is complete, not who made it. The import keeps the entries as candidates outside the live probe cache. A candidate never causes a cache hit and cannot act as its own trusted record. A candidate can only restore a missing blob of a local entry that has the same content. On a cold runner, configure runs the checks again.
 
-A repeated import of the same archive changes nothing. The command reports the published, unchanged, recovered, staged, and conflicting entries. Collection removes candidates that are not used for 7 days. `rcmake cache clear` removes them at once.
+An entry counts as unchanged only when the local entry has the same content and each of its blobs on disk matches its digest. The import replaces a missing or damaged blob with the checked copy from the archive and counts the entry as recovered.
+
+A repeated import of the same archive changes nothing. The command reports the published, unchanged, recovered, staged, and conflicting entries.
+
+If a write fails during the import, the command reports the entries that it finished before the failure and then the error. Each finished entry is complete and usable. Run the same import again to finish the rest. The second run counts the finished entries as unchanged.
+
+Collection removes candidates that are not used for 7 days. A candidate blob stays as long as a candidate entry that uses it. Candidates also count toward the cache size limit, and collection removes them first when the cache is too large. `rcmake cache clear` removes them at once.
 
 An imported entry is a hit only when its recorded inputs match on the new machine. The recorded inputs include absolute paths. Thus a hit needs the same compiler at the same path, with the same content. A different compiler, a compiler update, or a different install path gives a miss, and configure runs the check again.
 

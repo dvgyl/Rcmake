@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 
 use rcmake_base::BString;
+use rcmake_eval::FindTraceStore;
 use rcmake_eval::find_trace::{FindMode, FindOutcome, FindPackageTrace, Rejection};
 use rcmake_json::Value;
 
@@ -101,10 +102,18 @@ pub struct FindReport {
     pub source: FindSource,
     /// Why saved records are evidence from a past run, when they are.
     pub stale_reason: Option<&'static str>,
-    /// Calls for the package, in call order, with their suggestions.
+    /// Calls for the package, in entry order, with their suggestions.
     pub calls: Vec<(FindPackageTrace, Vec<FindSuggestion>)>,
-    /// Calls of the run that the record limits left out. Their packages are unknown.
+    /// Started calls of the run without a record. Their packages are unknown.
     pub omitted_calls: u32,
+    /// Number of calls that the run started.
+    pub calls_started: u32,
+    /// Calls for the package with a record but without a known per-package position.
+    pub unnumbered_calls: u32,
+    /// Highest per-package position among the recorded calls for the package.
+    pub last_package_call: Option<u32>,
+    /// Requested 1-based call for the package, from `--call`.
+    pub requested_call: Option<u32>,
     /// The configure ran to its end. Calls after a failure are unknown.
     pub completed: bool,
     /// The evaluation was partial, for example because a subprocess was denied.
@@ -112,43 +121,127 @@ pub struct FindReport {
 }
 
 impl FindReport {
-    /// Build the report from all calls of a run. `call` selects one 1-based call.
+    /// Build the report from all calls of a run. `call` selects one 1-based call
+    /// among the calls for the package, by entry order.
     pub fn new(
         package: &[u8],
-        calls: &[FindPackageTrace],
-        call: Option<usize>,
+        store: &FindTraceStore,
+        call: Option<u32>,
         probe: &mut dyn NearMissProbe,
     ) -> Self {
-        let matching = calls
+        let for_package: Vec<&FindPackageTrace> = store
+            .calls
             .iter()
             .filter(|trace| trace.name == package)
-            .enumerate()
-            .filter(|(index, _)| call.is_none_or(|wanted| wanted == index + 1))
-            .map(|(_, trace)| (trace.clone(), suggest(trace, probe)))
             .collect();
+        let matching = for_package
+            .iter()
+            .filter(|trace| call.is_none() || trace.package_call == call)
+            .map(|trace| ((*trace).clone(), suggest(trace, probe)))
+            .collect();
+        let unnumbered = for_package
+            .iter()
+            .filter(|trace| trace.package_call.is_none())
+            .count();
         Self {
             package: package.into(),
             source: FindSource::Saved,
             stale_reason: None,
             calls: matching,
-            omitted_calls: 0,
+            omitted_calls: store.omitted_calls.saturating_add(store.unfinished_calls()),
+            calls_started: store.calls_started,
+            unnumbered_calls: u32::try_from(unnumbered).unwrap_or(u32::MAX),
+            last_package_call: for_package
+                .iter()
+                .filter_map(|trace| trace.package_call)
+                .max(),
+            requested_call: call,
             completed: true,
             provisional: false,
         }
     }
 
-    /// Return whether the last selected call found the package.
+    /// Return the call that decides the result: the requested call, or the last
+    /// recorded call for the package.
+    #[must_use]
+    pub fn selected(&self) -> Option<&FindPackageTrace> {
+        self.calls.last().map(|(trace, _)| trace)
+    }
+
+    /// Return whether the selected call found the package.
     #[must_use]
     pub fn found(&self) -> bool {
-        self.calls
-            .last()
-            .is_some_and(|(trace, _)| trace.outcome == FindOutcome::Found)
+        self.selected()
+            .is_some_and(|trace| trace.outcome == FindOutcome::Found)
+    }
+
+    /// Return why the evidence cannot establish the result, or `None` when it can.
+    ///
+    /// A past or partial evaluation never establishes a result. Without `--call`,
+    /// the last recorded call decides only when no later call can be missing. A
+    /// run that stopped early is attributed to the selected call only when that
+    /// call is the last call of the run and a required search failed.
+    #[must_use]
+    pub fn uncertainty(&self) -> Option<&'static str> {
+        if self.source == FindSource::Past {
+            return Some("The records are evidence from a past run.");
+        }
+        if self.provisional {
+            return Some(
+                "The evaluation was partial, so a call or its result can differ in a full run.",
+            );
+        }
+        let Some(selected) = self.selected() else {
+            if let Some(call) = self.requested_call
+                && (self.last_package_call.is_some_and(|last| last > call)
+                    || self.unnumbered_calls > 0)
+            {
+                return Some("That call has no record because a record limit was reached.");
+            }
+            return (self.omitted_calls > 0 || !self.completed).then_some(
+                "The run stopped early or left calls without a record, so the project can make more calls.",
+            );
+        };
+        if self.requested_call.is_some() {
+            return None;
+        }
+        let later_kept = self
+            .calls
+            .iter()
+            .filter(|(trace, _)| trace.ordinal > selected.ordinal)
+            .count();
+        let later_started = self.calls_started.saturating_sub(selected.ordinal);
+        let all_later_known = self.omitted_calls == 0
+            || u32::try_from(later_kept).unwrap_or(u32::MAX) >= later_started;
+        if !all_later_known {
+            return Some("A later call has no record, so the final result is unknown.");
+        }
+        let stopped_here = selected.ordinal == self.calls_started
+            && selected.outcome != FindOutcome::Found
+            && selected.request.required;
+        if !self.completed && !stopped_here {
+            return Some("The run stopped early, so a later call can change the result.");
+        }
+        None
+    }
+
+    /// Exit status: 0 when the package was found, 1 when it was not found or never
+    /// requested, and 2 when the evidence cannot establish the result.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        if self.uncertainty().is_some() {
+            2
+        } else if self.found() {
+            0
+        } else {
+            1
+        }
     }
 
     /// Return whether the absence of a call can mean an unrecorded call.
     #[must_use]
     pub fn absence_unknown(&self) -> bool {
-        self.calls.is_empty() && (self.omitted_calls > 0 || !self.completed)
+        self.calls.is_empty() && self.uncertainty().is_some()
     }
 }
 
@@ -460,27 +553,44 @@ fn candidate_reason(
     }
 }
 
-/// Render the report for a terminal.
+fn paint(text: &str, code: u8, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Render the report for a terminal. `color` adds ANSI color to the result lines.
 #[must_use]
-pub fn render_find_terminal(report: &FindReport, all_candidates: bool) -> String {
+pub fn render_find_terminal(report: &FindReport, all_candidates: bool, color: bool) -> String {
     let mut out = String::new();
     let package = display(&report.package);
     if report.calls.is_empty() {
-        if report.absence_unknown() {
-            let _ = writeln!(
-                out,
-                "No record of find_package({package}). The record of this run is incomplete, so the project can still call it."
-            );
-        } else {
-            let _ = writeln!(out, "The project never called find_package({package}).");
+        match (report.requested_call, report.absence_unknown()) {
+            (Some(call), true) => {
+                let _ = writeln!(out, "No record of call {call} of find_package({package}).");
+            }
+            (Some(call), false) => {
+                let _ = writeln!(
+                    out,
+                    "The project calls find_package({package}) fewer than {call} times."
+                );
+            }
+            (None, true) => {
+                let _ = writeln!(out, "No record of find_package({package}).");
+            }
+            (None, false) => {
+                let _ = writeln!(out, "The project never called find_package({package}).");
+            }
         }
     }
     for (trace, suggestions) in &report.calls {
         let state = match trace.outcome {
-            FindOutcome::Found => "was found",
-            FindOutcome::NotFound => "was not found",
-            FindOutcome::Disabled => "was disabled by CMAKE_DISABLE_FIND_PACKAGE",
-            FindOutcome::Error => "failed with an error",
+            FindOutcome::Found => paint("was found", 32, color),
+            FindOutcome::NotFound => paint("was not found", 31, color),
+            FindOutcome::Disabled => paint("was disabled by CMAKE_DISABLE_FIND_PACKAGE", 33, color),
+            FindOutcome::Error => paint("failed with an error", 31, color),
         };
         let site = trace.call.first().map_or_else(String::new, |frame| {
             format!("  {}:{}", display(&frame.file), frame.line)
@@ -575,8 +685,8 @@ pub fn render_find_terminal(report: &FindReport, all_candidates: bool) -> String
         }
         FindSource::Saved => {}
     }
-    if report.provisional {
-        out.push_str("The evaluation was partial, so this result is provisional.\n");
+    if let Some(reason) = report.uncertainty() {
+        let _ = writeln!(out, "{} {reason}", paint("Result unknown.", 33, color));
     }
     out
 }
@@ -616,9 +726,24 @@ pub fn render_find_json(report: &FindReport) -> BString {
             "omitted_calls",
             Value::UInt(u64::from(report.omitted_calls)),
         ),
+        (
+            "calls_started",
+            Value::UInt(u64::from(report.calls_started)),
+        ),
+        (
+            "requested_call",
+            report
+                .requested_call
+                .map_or(Value::Null, |call| Value::UInt(u64::from(call))),
+        ),
         ("completed", Value::Bool(report.completed)),
         ("absence_unknown", Value::Bool(report.absence_unknown())),
         ("provisional", Value::Bool(report.provisional)),
+        ("outcome_known", Value::Bool(report.uncertainty().is_none())),
+        (
+            "uncertainty",
+            report.uncertainty().map_or(Value::Null, Value::string),
+        ),
     ]);
     let mut out = rcmake_json::write_styled(&value, "  ");
     out.push(b'\n');

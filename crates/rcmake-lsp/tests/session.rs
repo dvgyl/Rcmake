@@ -881,6 +881,285 @@ fn p1_12_live_workspace_lint_tracks_open_includes_globs_and_rcmake_toml_watches(
 }
 
 #[test]
+fn finding_15_loss_of_sync_non_cmake_watchers_dep_cap_and_unresolved_include_globs() {
+    let diag_codes = |params: &Value| -> Vec<String> {
+        array(get(params, "diagnostics"))
+            .iter()
+            .filter_map(|d| match d {
+                Value::Object(map) => map.get(b"code".as_slice()).and_then(|v| match v {
+                    Value::String(s) => Some(String::from_utf8_lossy(s).into_owned()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
+    };
+    fn find_publish<'a>(messages: &'a [RpcMessage], target_uri: &str) -> Option<&'a Value> {
+        messages.iter().find_map(|m| match m {
+            RpcMessage::Call { method, params, .. }
+                if method == "textDocument/publishDiagnostics"
+                    && get(params, "uri") == &Value::string(target_uri) =>
+            {
+                Some(params)
+            }
+            _ => None,
+        })
+    }
+
+    // 1. Loss of sync on an open included buffer drops its overlay and refreshes callers!
+    {
+        let host = host();
+        let work = Path::new(WORK_DIR);
+        host.seed_file(&work.join("helpers.cmake"), b"set(UNRELATED 1)\n")
+            .unwrap();
+        let mut server = initialized(&host, false);
+        let caller_uri = format!("{WORK_URI}/CMakeLists.txt");
+        let helpers_uri = format!("{WORK_URI}/helpers.cmake");
+        let caller_text = concat!(
+            "project(SyncLoss)\n",
+            "include(helpers.cmake)\n",
+            "set(MY_HELPER_VA 1)\n",
+            "message(STATUS \"${MY_HELPER_VAR}\")\n",
+        );
+        let open_caller = published(server.handle(RpcMessage::notification(
+            "textDocument/didOpen",
+            object(&[(
+                "textDocument",
+                object(&[
+                    ("uri", Value::string(caller_uri.as_str())),
+                    ("version", Value::Int(1)),
+                    ("text", Value::string(caller_text)),
+                ]),
+            )]),
+        )));
+        assert!(diag_codes(&open_caller).contains(&"undefined-variable".to_owned()));
+
+        // Open unsaved helpers.cmake defining MY_HELPER_VAR -> caller becomes clean.
+        let open_helpers = server.handle(RpcMessage::notification(
+            "textDocument/didOpen",
+            object(&[(
+                "textDocument",
+                object(&[
+                    ("uri", Value::string(helpers_uri.as_str())),
+                    ("version", Value::Int(1)),
+                    ("text", Value::string("set(MY_HELPER_VAR 42)\n")),
+                ]),
+            )]),
+        ));
+        let clean = find_publish(&open_helpers, &caller_uri).expect("caller republished on open");
+        assert!(
+            !diag_codes(clean).contains(&"undefined-variable".to_owned()),
+            "got {:?}",
+            diag_codes(clean)
+        );
+
+        // Send invalid incremental edit to helpers.cmake -> loss of sync drops overlay AND
+        // immediately republishes caller against disk state (re-emitting undefined-variable)!
+        let bad_edit = decode(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{helpers_uri}","version":2}},"contentChanges":[{{"range":{{"start":{{"line":99,"character":0}},"end":{{"line":99,"character":0}}}},"text":"x"}}]}}}}"#
+        ));
+        let desync_msgs = server.handle(bad_edit);
+        let refreshed = find_publish(&desync_msgs, &caller_uri)
+            .expect("caller must be republished when included buffer loses synchronization");
+        assert!(
+            diag_codes(refreshed).contains(&"undefined-variable".to_owned()),
+            "caller should revert to disk facts on loss of sync: {:?}",
+            diag_codes(refreshed)
+        );
+    }
+
+    // 2. Non-.cmake consumed include file gets dynamically watched and refreshes caller on change,
+    //    and unresolved include clears glob origin (no false glob-without-configure-depends).
+    {
+        let host = host();
+        let work = Path::new(WORK_DIR);
+        host.seed_file(&work.join("defs.inc"), b"set(OTHER 1)\n")
+            .unwrap();
+        let mut server = Server::new(&host);
+        result(server.handle(decode(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"rootUri":"{WORK_URI}","capabilities":{{"workspace":{{"didChangeWatchedFiles":{{"dynamicRegistration":true}}}}}}}}}}"#
+        ))));
+        server.handle(RpcMessage::notification("initialized", Value::object()));
+
+        let caller_uri = format!("{WORK_URI}/CMakeLists.txt");
+        let caller_text = concat!(
+            "project(NonCmakeInclude)\n",
+            "include(defs.inc)\n",
+            "set(MY_INC_VA 1)\n",
+            "message(STATUS \"${MY_INC_VAR}\")\n",
+            "file(GLOB SRCS src/*.cpp)\n",
+            "include(unresolved_override.cmake)\n",
+            "add_executable(app ${SRCS})\n",
+        );
+        let open_msgs = server.handle(RpcMessage::notification(
+            "textDocument/didOpen",
+            object(&[(
+                "textDocument",
+                object(&[
+                    ("uri", Value::string(caller_uri.as_str())),
+                    ("version", Value::Int(1)),
+                    ("text", Value::string(caller_text)),
+                ]),
+            )]),
+        ));
+        let initial = find_publish(&open_msgs, &caller_uri).expect("initial publish");
+        let codes = diag_codes(initial);
+        assert!(codes.contains(&"undefined-variable".to_owned()));
+        assert!(
+            !codes.contains(&"glob-without-configure-depends".to_owned()),
+            "unresolved include must clear glob origins: {codes:?}"
+        );
+        // Must have dynamically registered a watcher covering defs.inc!
+        let has_inc_watch = open_msgs.iter().any(|m| match m {
+            RpcMessage::Call {
+                id: Some(_),
+                method,
+                params,
+            } if method == "client/registerCapability" => {
+                format!("{params:?}").contains("defs.inc")
+            }
+            _ => false,
+        });
+        assert!(
+            has_inc_watch,
+            "expected dynamic watcher registration for defs.inc in {open_msgs:?}"
+        );
+
+        // Update defs.inc on disk and deliver didChangeWatchedFiles -> caller republishes clean!
+        host.seed_file(&work.join("defs.inc"), b"set(MY_INC_VAR 1)\n")
+            .unwrap();
+        let watch_msgs = server.handle(RpcMessage::notification(
+            "workspace/didChangeWatchedFiles",
+            object(&[(
+                "changes",
+                Value::Array(vec![object(&[
+                    ("uri", Value::string(format!("{WORK_URI}/defs.inc"))),
+                    ("type", Value::Int(2)),
+                ])]),
+            )]),
+        ));
+        let after_watch =
+            find_publish(&watch_msgs, &caller_uri).expect("caller refreshed after defs.inc edit");
+        assert!(
+            !diag_codes(after_watch).contains(&"undefined-variable".to_owned()),
+            "defs.inc update should clear undefined-variable: {:?}",
+            diag_codes(after_watch)
+        );
+    }
+
+    // 3. Dep-cap overflow marks dependencies incomplete so creating a file beyond the probe cap
+    //    still triggers conservative refresh!
+    {
+        let host = host();
+        let work = Path::new(WORK_DIR);
+        let mut server = Server::new(&host);
+        result(server.handle(decode(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"rootUri":"{WORK_URI}","capabilities":{{"workspace":{{"didChangeWatchedFiles":{{"dynamicRegistration":true}}}}}}}}}}"#
+        ))));
+        server.handle(RpcMessage::notification("initialized", Value::object()));
+
+        // Exceed default probe miss cap (64 * 4 = 256) before probing tail_probe.cmake.
+        let mut caller_text = String::from("project(CapTest)\n");
+        for i in 0..260 {
+            caller_text.push_str(&format!("include(missing_{i}.cmake OPTIONAL)\n"));
+        }
+        caller_text.push_str("include(tail_probe.cmake OPTIONAL)\n");
+        caller_text.push_str("set(TAIL_VA 1)\nmessage(STATUS \"${TAIL_VAR}\")\n");
+
+        let caller_uri = format!("{WORK_URI}/CMakeLists.txt");
+        let open_msgs = server.handle(RpcMessage::notification(
+            "textDocument/didOpen",
+            object(&[(
+                "textDocument",
+                object(&[
+                    ("uri", Value::string(caller_uri.as_str())),
+                    ("version", Value::Int(1)),
+                    ("text", Value::string(caller_text)),
+                ]),
+            )]),
+        ));
+        let initial = find_publish(&open_msgs, &caller_uri).expect("initial publish");
+        assert!(diag_codes(initial).contains(&"undefined-variable".to_owned()));
+
+        // Create tail_probe.cmake (probe #261, beyond cap!) and notify watcher.
+        host.seed_file(&work.join("tail_probe.cmake"), b"set(TAIL_VAR 1)\n")
+            .unwrap();
+        let watch_msgs = server.handle(RpcMessage::notification(
+            "workspace/didChangeWatchedFiles",
+            object(&[(
+                "changes",
+                Value::Array(vec![object(&[
+                    ("uri", Value::string(format!("{WORK_URI}/tail_probe.cmake"))),
+                    ("type", Value::Int(1)),
+                ])]),
+            )]),
+        ));
+        let refreshed = find_publish(&watch_msgs, &caller_uri).expect(
+            "incomplete dependency set must conservatively refresh on workspace file event",
+        );
+        assert!(
+            !diag_codes(refreshed).contains(&"undefined-variable".to_owned()),
+            "conservative refresh should pick up tail_probe.cmake: {:?}",
+            diag_codes(refreshed)
+        );
+    }
+
+    // 4. Creating a nearer .rcmake.toml in an intermediate ancestor directory immediately updates
+    //    diagnostics for deeply nested open documents.
+    {
+        let host = host();
+        let work = Path::new(WORK_DIR);
+        host.seed_file(
+            &work.join(".rcmake.toml"),
+            b"[lint]\ndisable = [\"directory-options\"]\n",
+        )
+        .unwrap();
+        let mut server = Server::new(&host);
+        result(server.handle(decode(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"rootUri":"{WORK_URI}","capabilities":{{"workspace":{{"didChangeWatchedFiles":{{"dynamicRegistration":true}}}}}}}}}}"#
+        ))));
+        server.handle(RpcMessage::notification("initialized", Value::object()));
+
+        let nested_uri = format!("{WORK_URI}/pkg/sub/CMakeLists.txt");
+        let open_nested = published(server.handle(RpcMessage::notification(
+            "textDocument/didOpen",
+            object(&[(
+                "textDocument",
+                object(&[
+                    ("uri", Value::string(nested_uri.as_str())),
+                    ("version", Value::Int(1)),
+                    (
+                        "text",
+                        Value::string("project(Nested)\ninclude_directories(inc)\n"),
+                    ),
+                ]),
+            )]),
+        )));
+        assert!(!diag_codes(&open_nested).contains(&"directory-options".to_owned()));
+
+        // Create nearer /work/pkg/.rcmake.toml (re-enabling directory-options).
+        host.seed_file(
+            &work.join("pkg/.rcmake.toml"),
+            b"[lint.severity]\ndirectory-options = \"error\"\n",
+        )
+        .unwrap();
+        let nearer_msgs = server.handle(RpcMessage::notification(
+            "workspace/didChangeWatchedFiles",
+            object(&[(
+                "changes",
+                Value::Array(vec![object(&[
+                    ("uri", Value::string(format!("{WORK_URI}/pkg/.rcmake.toml"))),
+                    ("type", Value::Int(1)),
+                ])]),
+            )]),
+        ));
+        let refreshed = find_publish(&nearer_msgs, &nested_uri)
+            .expect("nested doc must refresh when intermediate .rcmake.toml is created");
+        assert!(diag_codes(refreshed).contains(&"directory-options".to_owned()));
+    }
+}
+
+#[test]
 fn formatter_reports_the_response_limit() {
     let host = host();
     let mut server = initialized(&host, false);

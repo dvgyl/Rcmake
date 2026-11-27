@@ -106,10 +106,17 @@ for variable in ("RCMAKE_VENDORED_DATA_ROOT", "DESTDIR", "CMAKE_INSTALL_MODE"):
 cmake = bin_dir / ("cmake" + suffix)
 cpack = bin_dir / ("cpack" + suffix)
 expected_versions = ("cmake", "cmake", "ctest", "cpack") if windows else ("cmake", "cmake", "ctest", "cpack", "ccmake")
+rcmake_pkg_version = None
 for tool, expected in zip(tools, expected_versions):
     version = subprocess.check_output([tool, "--version"], env=env, text=True, timeout=15)
     if not version.startswith(f"{expected} version ") or "rcmake" not in version.lower():
         sys.exit(f"Unexpected version output from {tool.name}. Found {version}")
+    if tool.name == "rcmake" + suffix:
+        for line in version.splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith("rcmake "):
+                rcmake_pkg_version = stripped.split(None, 1)[1].strip()
+                break
     print(version, end="", flush=True)
 subprocess.run([cmake, "--help-command", "install"], env=env, check=True, timeout=15,
                stdout=subprocess.DEVNULL)
@@ -144,6 +151,11 @@ print("Verified rcmake-lsp initialize and shutdown.")
 verify_version = subprocess.check_output([verify_bin, "--version"], env=env, text=True, timeout=15)
 if not verify_version.startswith("rcmake-verify "):
     sys.exit(f"Unexpected version output from {verify_bin.name}. Found {verify_version}")
+verify_pkg_version = verify_version.splitlines()[0].strip().split(None, 1)[1].strip()
+if rcmake_pkg_version is not None and verify_pkg_version != rcmake_pkg_version:
+    sys.exit(
+        f"Mismatched companion version: rcmake {rcmake_pkg_version} vs rcmake-verify {verify_pkg_version}."
+    )
 print(verify_version, end="", flush=True)
 rcmake_bin = bin_dir / ("rcmake" + suffix)
 subprocess.run([rcmake_bin, "verify", "--help"], env=env, check=True, timeout=15,
@@ -161,6 +173,35 @@ set(CPACK_PACKAGE_FILE_NAME release-smoke)
 set(CPACK_GENERATOR ZIP)
 include(CPack)
 ''', encoding="utf-8")
+    # Exercise public `rcmake verify` companion discovery and typed stdin/stdout JSON protocol.
+    verify_smoke = subprocess.run(
+        [rcmake_bin, "verify", "--json", "--oracle", rcmake_bin, "--", "-S", source],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    if verify_smoke.returncode != 2:
+        sys.exit(
+            f"Expected rcmake verify recursive-oracle smoke to exit 2, got {verify_smoke.returncode}.\n"
+            f"stdout={verify_smoke.stdout}\nstderr={verify_smoke.stderr}"
+        )
+    try:
+        verify_report = json.loads(verify_smoke.stdout)
+    except json.JSONDecodeError as exc:
+        sys.exit(
+            f"rcmake verify smoke did not return JSON from companion discovery ({exc}).\n"
+            f"stdout={verify_smoke.stdout}\nstderr={verify_smoke.stderr}"
+        )
+    if (
+        verify_report.get("schema_version") != 1
+        or verify_report.get("verdict") != "invalid_input"
+        or verify_report.get("exit_code") != 2
+        or not verify_report.get("error")
+    ):
+        sys.exit(f"Unexpected rcmake verify smoke report: {verify_report}")
+    print("Verified rcmake verify companion discovery and typed protocol.", flush=True)
     subprocess.run([cmake, "-S", source, "-B", build, "-G", "Ninja"],
                    env=env, check=True, timeout=30)
     cmake_root = Path((build / "cmake-root.txt").read_text(encoding="utf-8"))

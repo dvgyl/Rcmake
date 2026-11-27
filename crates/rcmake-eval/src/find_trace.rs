@@ -5,6 +5,10 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rcmake_base::BString;
 
 use crate::Cx;
@@ -30,7 +34,12 @@ pub struct FindTraceLimits {
     pub max_candidates: u32,
     /// Longest kept text field in bytes.
     pub max_detail_bytes: u32,
-    /// Largest estimated serialized size of all kept calls together in bytes.
+    /// Most items kept in one list field, such as components or call frames.
+    pub max_list_items: u32,
+    /// Largest serialized size of all active and kept calls together in bytes.
+    ///
+    /// The collector charges each field against this limit before it copies the
+    /// field. The charge is an upper bound of the compact JSON size of the field.
     pub max_total_bytes: u64,
 }
 
@@ -41,6 +50,7 @@ impl Default for FindTraceLimits {
             max_roots: 256,
             max_candidates: 128,
             max_detail_bytes: 2048,
+            max_list_items: 256,
             max_total_bytes: 8 << 20,
         }
     }
@@ -214,6 +224,11 @@ pub struct CallFrame {
 /// Record of one `find_package()` call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FindPackageTrace {
+    /// 1-based position of the call among all calls of the session, in entry order.
+    pub ordinal: u32,
+    /// 1-based position of the call among the calls for this package, in entry
+    /// order. `None` when the session cannot count the calls for the package.
+    pub package_call: Option<u32>,
     /// Package name.
     pub name: BString,
     /// Call stack, innermost first, at most 16 frames.
@@ -230,6 +245,8 @@ pub struct FindPackageTrace {
     pub candidates_omitted: u32,
     /// Text fields that the limit cut.
     pub fields_cut: u32,
+    /// List items and text fields left out at a count or byte limit.
+    pub items_omitted: u32,
     /// File that the search selected, before the package script ran.
     pub selected: Option<FindSelection>,
     /// Final result of the call.
@@ -238,90 +255,273 @@ pub struct FindPackageTrace {
     pub version: Option<BString>,
 }
 
+/// Upper bound of the compact JSON size of one text field or list item.
+///
+/// The JSON writer can write one input byte as six output bytes, for example
+/// `\u0001`. The constant part covers the quotes, the separator, and the key.
+#[must_use]
+pub const fn text_cost(len: usize) -> u64 {
+    (len as u64).saturating_mul(6).saturating_add(32)
+}
+
+/// Upper bound of the JSON size of one call record without its text and lists.
+pub const CALL_COST: u64 = 1024;
+/// Upper bound of the JSON size of one candidate without its text and lists.
+pub const CANDIDATE_COST: u64 = 256;
+/// Upper bound of the JSON size of one call frame without its text.
+pub const FRAME_COST: u64 = 96;
+/// Upper bound of the JSON size of one search root without its text.
+pub const ROOT_COST: u64 = 64;
+/// Upper bound of the JSON size of one selection without its text.
+pub const SELECTION_COST: u64 = 96;
+
+fn opt_cost(value: Option<&BString>) -> u64 {
+    value.map_or(0, |value| text_cost(value.len()))
+}
+
+fn list_cost(values: &[BString]) -> u64 {
+    values.iter().fold(0, |total: u64, value| {
+        total.saturating_add(text_cost(value.len()))
+    })
+}
+
 impl FindPackageTrace {
-    /// Estimated serialized size in bytes.
+    /// Upper bound of the compact JSON size of this record in bytes.
     #[must_use]
     pub fn estimated_bytes(&self) -> u64 {
-        let text = |value: &[u8]| value.len() as u64 + 8;
-        let list = |values: &[BString]| values.iter().map(|value| text(value)).sum::<u64>();
         let request = &self.request;
-        let mut total = 512 + text(&self.name) + text(&self.root_path_mode);
-        total += self
-            .call
-            .iter()
-            .map(|frame| text(&frame.file) + 48)
-            .sum::<u64>();
-        total += list(&request.components)
-            + list(&request.optional_components)
-            + list(&request.names)
-            + list(&request.config_files)
-            + request.version.as_deref().map_or(0, |value| text(value))
-            + request
-                .dir_value_before
-                .as_deref()
-                .map_or(0, |value| text(value))
-            + text(&request.dir_var);
-        total += self
-            .roots
-            .iter()
-            .map(|root| text(&root.category) + 24)
-            .sum::<u64>();
-        total += self
-            .candidates
-            .iter()
-            .map(|candidate| {
-                128 + text(&candidate.path)
-                    + list(&candidate.missing_components)
-                    + candidate
-                        .found_version
-                        .as_deref()
-                        .map_or(0, |value| text(value))
-                    + candidate.detail.as_deref().map_or(0, |value| text(value))
-            })
-            .sum::<u64>();
+        let mut total = CALL_COST
+            .saturating_add(text_cost(self.name.len()))
+            .saturating_add(text_cost(self.root_path_mode.len()))
+            .saturating_add(text_cost(request.dir_var.len()))
+            .saturating_add(opt_cost(request.version.as_ref()))
+            .saturating_add(opt_cost(request.dir_value_before.as_ref()))
+            .saturating_add(list_cost(&request.components))
+            .saturating_add(list_cost(&request.optional_components))
+            .saturating_add(list_cost(&request.names))
+            .saturating_add(list_cost(&request.config_files))
+            .saturating_add(opt_cost(self.version.as_ref()));
+        for frame in &self.call {
+            total = total
+                .saturating_add(FRAME_COST)
+                .saturating_add(text_cost(frame.file.len()))
+                .saturating_add(opt_cost(frame.command.as_ref()));
+        }
+        for root in &self.roots {
+            total = total
+                .saturating_add(ROOT_COST)
+                .saturating_add(text_cost(root.category.len()));
+        }
+        for candidate in &self.candidates {
+            total = total.saturating_add(candidate_cost(candidate));
+        }
+        if let Some(selected) = &self.selected {
+            total = total.saturating_add(selection_cost(selected));
+        }
         total
-            + self
-                .selected
-                .as_ref()
-                .map_or(0, |selected| 64 + text(&selected.file))
     }
 }
 
-/// Records of a session, in call order.
+/// Upper bound of the compact JSON size of one candidate.
+#[must_use]
+pub fn candidate_cost(candidate: &FindCandidate) -> u64 {
+    CANDIDATE_COST
+        .saturating_add(text_cost(candidate.path.len()))
+        .saturating_add(list_cost(&candidate.missing_components))
+        .saturating_add(opt_cost(candidate.found_version.as_ref()))
+        .saturating_add(opt_cost(candidate.detail.as_ref()))
+}
+
+/// Upper bound of the compact JSON size of one selection.
+#[must_use]
+pub fn selection_cost(selected: &FindSelection) -> u64 {
+    SELECTION_COST
+        .saturating_add(text_cost(selected.file.len()))
+        .saturating_add(opt_cost(selected.version.as_ref()))
+}
+
+/// Records of a session, in entry order of the calls.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FindTraceStore {
-    /// Kept calls.
+    /// Kept calls, sorted by [`FindPackageTrace::ordinal`].
     pub calls: Vec<FindPackageTrace>,
-    /// Calls past the count or byte limit. Their outcome is unknown.
+    /// Number of calls that started. The ordinals `1..=calls_started` exist.
+    pub calls_started: u32,
+    /// Started calls that a count or byte limit left out. Their outcome is unknown.
     pub omitted_calls: u32,
-    /// Estimated serialized size of the kept calls.
+    /// Upper bound of the serialized size of the kept calls.
     pub bytes: u64,
 }
 
 impl FindTraceStore {
-    /// Add `trace` when it fits in `limits`. Count it as omitted otherwise.
-    pub fn push(&mut self, trace: FindPackageTrace, limits: &FindTraceLimits) {
-        let bytes = trace.estimated_bytes();
-        let fits = self.calls.len() < usize::try_from(limits.max_calls).unwrap_or(usize::MAX)
-            && self.bytes.saturating_add(bytes) <= limits.max_total_bytes;
-        if fits {
-            self.bytes += bytes;
-            self.calls.push(trace);
-        } else {
+    /// Add a finished record and keep the store sorted by ordinal.
+    ///
+    /// The store keeps the charge of `budget` when it keeps the record. When the
+    /// call limit is full, the store counts the call as omitted and `budget`
+    /// returns its charge to the session ledger.
+    pub fn push(
+        &mut self,
+        trace: FindPackageTrace,
+        mut budget: TraceBudget,
+        limits: &FindTraceLimits,
+    ) {
+        let max = usize::try_from(limits.max_calls).unwrap_or(usize::MAX);
+        if self.calls.len() >= max {
             self.omitted_calls = self.omitted_calls.saturating_add(1);
+            return;
         }
+        self.bytes = self.bytes.saturating_add(budget.keep());
+        let index = self
+            .calls
+            .partition_point(|call| call.ordinal < trace.ordinal);
+        self.calls.insert(index, trace);
+    }
+
+    /// Count a call that started but left no record.
+    pub fn omit(&mut self) {
+        self.omitted_calls = self.omitted_calls.saturating_add(1);
+    }
+
+    /// Started calls with neither a kept record nor an omitted count, for example a
+    /// call that a fatal error stopped before it finished.
+    #[must_use]
+    pub fn unfinished_calls(&self) -> u32 {
+        let kept = u32::try_from(self.calls.len()).unwrap_or(u32::MAX);
+        self.calls_started
+            .saturating_sub(kept)
+            .saturating_sub(self.omitted_calls)
+    }
+
+    /// Return whether every started call has a kept record.
+    #[must_use]
+    pub fn all_calls_kept(&self) -> bool {
+        self.omitted_calls == 0 && self.unfinished_calls() == 0
     }
 }
 
-/// Cut `value` at `limit` bytes on a UTF-8 boundary. Return whether it was cut.
-pub fn cut_text(value: &mut BString, limit: u32) -> bool {
+/// Most package names for which a session counts calls.
+const MAX_COUNTED_PACKAGES: usize = 4096;
+
+/// Session state that is shared by the active records of one session.
+#[derive(Debug, Default)]
+struct FindTraceSession {
+    /// Bytes charged by active and kept records.
+    used: Arc<AtomicU64>,
+    /// Calls for each package name, for [`FindPackageTrace::package_call`].
+    per_package: BTreeMap<BString, u32>,
+}
+
+/// Byte allowance of one active record.
+///
+/// Each charge goes to the session ledger at once, so active nested records count
+/// against the same limit. A budget that is dropped before the store keeps it
+/// returns its charge.
+#[derive(Debug)]
+pub struct TraceBudget {
+    used: Arc<AtomicU64>,
+    max: u64,
+    charged: u64,
+    exhausted: bool,
+}
+
+impl TraceBudget {
+    /// Make a budget with its own ledger, for tests and standalone records.
+    #[must_use]
+    pub fn standalone(max: u64) -> Self {
+        Self {
+            used: Arc::default(),
+            max,
+            charged: 0,
+            exhausted: false,
+        }
+    }
+
+    /// Charge `bytes` when the session ledger has room. Return whether it did.
+    ///
+    /// The first failed charge marks the budget as exhausted, and every later
+    /// charge fails too. The record then keeps its fields as they are.
+    pub fn charge(&mut self, bytes: u64) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        let max = self.max;
+        let charged = self
+            .used
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes).filter(|total| *total <= max)
+            })
+            .is_ok();
+        if charged {
+            self.charged = self.charged.saturating_add(bytes);
+        } else {
+            self.exhausted = true;
+        }
+        charged
+    }
+
+    /// Return `bytes` of an earlier charge, for example for a replaced field.
+    pub fn refund(&mut self, bytes: u64) {
+        let bytes = bytes.min(self.charged);
+        self.charged -= bytes;
+        let _ = self
+            .used
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+
+    /// Return whether a charge failed.
+    #[must_use]
+    pub const fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Keep the charge in the ledger for good and return it.
+    fn keep(&mut self) -> u64 {
+        std::mem::take(&mut self.charged)
+    }
+}
+
+impl Drop for TraceBudget {
+    fn drop(&mut self) {
+        let charged = self.charged;
+        self.refund(charged);
+    }
+}
+
+/// Identity and allowance of one call, reserved when the call starts.
+#[derive(Debug)]
+pub struct FindTraceTicket {
+    /// See [`FindPackageTrace::ordinal`].
+    pub ordinal: u32,
+    /// See [`FindPackageTrace::package_call`].
+    pub package_call: Option<u32>,
+    /// Limits of the session.
+    pub limits: FindTraceLimits,
+    /// Byte allowance of the record.
+    pub budget: TraceBudget,
+}
+
+/// Return the length of the prefix of `value` that fits in `limit` bytes and
+/// ends on a UTF-8 boundary.
+#[must_use]
+pub fn cut_len(value: &[u8], limit: u32) -> usize {
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     if value.len() <= limit {
-        return false;
+        return value.len();
     }
     let mut end = limit;
     while end > 0 && value.get(end).is_some_and(|byte| byte & 0xc0 == 0x80) {
         end -= 1;
+    }
+    end
+}
+
+/// Cut `value` at `limit` bytes on a UTF-8 boundary. Return whether it was cut.
+pub fn cut_text(value: &mut BString, limit: u32) -> bool {
+    let end = cut_len(value, limit);
+    if end == value.len() {
+        return false;
     }
     value.truncate(end);
     true
@@ -337,20 +537,70 @@ impl Cx<'_> {
         }
     }
 
-    /// Add one finished call record to the session store.
-    pub fn push_find_trace(&mut self, trace: FindPackageTrace) {
+    /// Reserve the identity of a call that starts now.
+    ///
+    /// Call this once when a `find_package()` call starts, before the call can fail.
+    /// Return `None` when the session keeps no find traces.
+    pub fn begin_find_trace(&mut self, name: &[u8]) -> Option<FindTraceTicket> {
+        let limits = self.find_trace_limits()?;
+        let store = self.session_data_mut_or_init::<FindTraceStore>()?;
+        store.calls_started = store.calls_started.saturating_add(1);
+        let ordinal = store.calls_started;
+        let session = self.session_data_mut_or_init::<FindTraceSession>()?;
+        let countable = name.len() <= usize::try_from(limits.max_detail_bytes).unwrap_or(0);
+        let package_call = if !countable {
+            None
+        } else if let Some(count) = session.per_package.get_mut(name) {
+            *count = count.saturating_add(1);
+            Some(*count)
+        } else if session.per_package.len() < MAX_COUNTED_PACKAGES {
+            session.per_package.insert(name.into(), 1);
+            Some(1)
+        } else {
+            None
+        };
+        let budget = TraceBudget {
+            used: Arc::clone(&session.used),
+            max: limits.max_total_bytes,
+            charged: 0,
+            exhausted: false,
+        };
+        Some(FindTraceTicket {
+            ordinal,
+            package_call,
+            limits,
+            budget,
+        })
+    }
+
+    /// Add one finished call record and the charge of its budget to the session store.
+    pub fn push_find_trace(&mut self, trace: FindPackageTrace, budget: TraceBudget) {
         let Some(limits) = self.find_trace_limits() else {
             return;
         };
         if let Some(store) = self.session_data_mut_or_init::<FindTraceStore>() {
-            store.push(trace, &limits);
+            store.push(trace, budget, &limits);
+        }
+    }
+
+    /// Count a started call that leaves no record.
+    pub fn omit_find_trace(&mut self) {
+        if self.find_trace_limits().is_some()
+            && let Some(store) = self.session_data_mut_or_init::<FindTraceStore>()
+        {
+            store.omit();
         }
     }
 }
 
 impl crate::Interp {
     /// Remove and return the find traces that this interpreter collected.
+    ///
+    /// Later calls start a new store with new ordinals and a new byte ledger.
     pub fn take_find_traces(&mut self) -> FindTraceStore {
+        if let Some(session) = self.session_data_mut_or_init::<FindTraceSession>() {
+            *session = FindTraceSession::default();
+        }
         self.session_data_mut_or_init::<FindTraceStore>()
             .map(std::mem::take)
             .unwrap_or_default()
@@ -361,8 +611,10 @@ impl crate::Interp {
 mod tests {
     use super::*;
 
-    fn trace(name: &str, candidates: usize) -> FindPackageTrace {
+    fn trace(ordinal: u32, name: &str, candidates: usize) -> FindPackageTrace {
         FindPackageTrace {
+            ordinal,
+            package_call: Some(1),
             name: name.into(),
             call: Vec::new(),
             request: FindRequestSummary::default(),
@@ -380,35 +632,76 @@ mod tests {
                 .collect(),
             candidates_omitted: 0,
             fields_cut: 0,
+            items_omitted: 0,
             selected: None,
             outcome: FindOutcome::NotFound,
             version: None,
         }
     }
 
+    fn charged(ledger: &Arc<AtomicU64>, max: u64, trace: &FindPackageTrace) -> TraceBudget {
+        let mut budget = TraceBudget {
+            used: Arc::clone(ledger),
+            max,
+            charged: 0,
+            exhausted: false,
+        };
+        budget.charge(trace.estimated_bytes());
+        budget
+    }
+
     #[test]
-    fn store_enforces_call_and_byte_budgets() {
+    fn store_enforces_call_limit_and_sorts_by_entry_order() {
         let limits = FindTraceLimits {
             max_calls: 2,
             ..FindTraceLimits::default()
         };
-        let mut store = FindTraceStore::default();
-        for name in ["A", "B", "C"] {
-            store.push(trace(name, 1), &limits);
-        }
-        assert_eq!(store.calls.len(), 2);
-        assert_eq!(store.omitted_calls, 1);
-
-        let tight = FindTraceLimits {
-            max_total_bytes: trace("A", 10).estimated_bytes() + 10,
-            ..FindTraceLimits::default()
+        let ledger = Arc::default();
+        let mut store = FindTraceStore {
+            calls_started: 3,
+            ..FindTraceStore::default()
         };
-        let mut store = FindTraceStore::default();
-        store.push(trace("A", 10), &tight);
-        store.push(trace("B", 10), &tight);
-        assert_eq!(store.calls.len(), 1);
+        for (ordinal, name) in [(2, "Inner"), (1, "Outer"), (3, "Late")] {
+            let trace = trace(ordinal, name, 1);
+            let budget = charged(&ledger, u64::MAX, &trace);
+            store.push(trace, budget, &limits);
+        }
+        let names: Vec<_> = store.calls.iter().map(|call| call.ordinal).collect();
+        assert_eq!(names, [1, 2]);
         assert_eq!(store.omitted_calls, 1);
-        assert!(store.bytes <= tight.max_total_bytes);
+        assert!(!store.all_calls_kept());
+        assert_eq!(ledger.load(Ordering::Relaxed), store.bytes);
+    }
+
+    #[test]
+    fn budget_counts_active_records_and_refunds_dropped_ones() {
+        let ledger = Arc::new(AtomicU64::new(0));
+        let mut outer = TraceBudget {
+            used: Arc::clone(&ledger),
+            max: 100,
+            charged: 0,
+            exhausted: false,
+        };
+        let mut inner = TraceBudget {
+            used: Arc::clone(&ledger),
+            max: 100,
+            charged: 0,
+            exhausted: false,
+        };
+        assert!(outer.charge(60));
+        assert!(!inner.charge(50), "the active outer record holds 60 bytes");
+        assert!(inner.exhausted());
+        assert!(!inner.charge(1), "an exhausted budget stays exhausted");
+        drop(outer);
+        assert_eq!(ledger.load(Ordering::Relaxed), 0);
+        assert!(!inner.charge(0));
+    }
+
+    #[test]
+    fn estimate_bounds_escaped_text() {
+        let mut call = trace(1, "A", 1);
+        call.name = BString::from(vec![1_u8; 100]);
+        assert!(call.estimated_bytes() >= 600);
     }
 
     #[test]

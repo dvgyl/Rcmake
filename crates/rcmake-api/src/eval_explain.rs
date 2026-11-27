@@ -4,8 +4,7 @@ use std::fmt::Write as _;
 
 use rcmake_base::{BString, list};
 use rcmake_genex::{
-    ConfigId, EvalContext, EvalSite, GenexHost, GenexStep, GenexTrace, SkippedOperand,
-    UsageTraversal,
+    ConfigId, EvalContext, EvalSite, GenexStep, GenexTrace, SkippedOperand, UsageTraversal,
 };
 use rcmake_json::Value;
 use rcmake_model::{DirId, PropScope};
@@ -121,23 +120,10 @@ impl ConfigureResult {
     /// Returns a message when a target, directory, property, or configuration is unknown.
     pub fn evaluate_genex(&self, request: &EvalRequest) -> Result<EvalReport, String> {
         let model = &self.model;
-        let find = |name: &BString| {
-            model
-                .targets()
-                .find(|(_, target)| target.name == *name)
-                .map(|(id, target)| (id, target.dir))
-                .or_else(|| {
-                    model
-                        .find_target(DirId::ROOT, name)
-                        .and_then(|id| model.target(id).map(|target| (id, target.dir)))
-                })
-                .ok_or_else(|| format!("Unknown target {}.", String::from_utf8_lossy(name)))
-        };
-        let owner = request.owner.as_ref().map(find).transpose()?;
-        let consumer = request.consumer.as_ref().map(find).transpose()?;
         let root = &model.dir(DirId::ROOT).source_dir;
-        let lookup_dir = match &request.directory {
-            Some(relative) => {
+        let named = request.consumer.as_ref().or(request.owner.as_ref());
+        let lookup_dir = match (&request.directory, named) {
+            (Some(relative), _) => {
                 let wanted = if relative.as_slice() == b"." || relative.is_empty() {
                     root.clone()
                 } else {
@@ -157,11 +143,25 @@ impl ConfigureResult {
                         )
                     })?
             }
-            None => consumer.or(owner).map_or(DirId::ROOT, |(_, dir)| dir),
+            (None, Some(name)) => definition_dir(model, name)?,
+            (None, None) => DirId::ROOT,
         };
+        // Resolve each role once, in the lookup directory, so the property and the
+        // evaluation context always describe the same target.
+        let scoped = |name: &BString| {
+            model.find_target(lookup_dir, name).ok_or_else(|| {
+                format!(
+                    "Unknown target {} in source directory {}.",
+                    String::from_utf8_lossy(name),
+                    display(&relative_dir(model, lookup_dir))
+                )
+            })
+        };
+        let owner = request.owner.as_ref().map(scoped).transpose()?;
+        let consumer = request.consumer.as_ref().map(scoped).transpose()?;
         let (expression, property) = match (&request.expression, &request.property, owner) {
             (Some(expression), None, _) => (expression.clone(), None),
-            (None, Some(property), Some((id, _))) => {
+            (None, Some(property), Some(id)) => {
                 let value = model
                     .get_prop(&PropScope::Target(id), property)
                     .ok_or_else(|| {
@@ -194,52 +194,24 @@ impl ConfigureResult {
                     .into(),
             );
         }
-        let cross_evidence = self
-            .generation
-            .as_ref()
-            .is_some_and(|generation| !generation.cross_graphs.is_empty());
-        for value in [&request.command_config, &request.output_config]
-            .into_iter()
-            .flatten()
-        {
-            if !cross_evidence {
-                notes.push(format!(
-                    "This tree has no cross-configuration commands, so configuration {} has no evidence.",
-                    String::from_utf8_lossy(value)
-                ).into());
-            }
-        }
+        let (command_config, output_config) = self.cross_context(request)?;
+        let cross_evidence = command_config.is_some() || output_config.is_some();
         let ast = rcmake_genex::parse(&expression).map_err(|error| error.to_string())?;
         let objects = ObjectPaths::new(self.generation.iter().flat_map(|result| &result.targets));
         let mut resolver = UsageResolver::new(model);
         let mut results = Vec::new();
+        let owner_handle = owner.map(target_handle).transpose()?;
+        let consumer_handle = consumer.map(target_handle).transpose()?.or(owner_handle);
         for config in configs {
             let mut host = resolver.host(lookup_dir).with_object_paths(&objects);
-            let owner_handle = request
-                .owner
-                .as_ref()
-                .and_then(|name| host.find_target(name));
-            let consumer_handle = request
-                .consumer
-                .as_ref()
-                .and_then(|name| host.find_target(name))
-                .or(owner_handle);
             let ctx = EvalContext {
                 config: ConfigId(config.clone()),
                 head: consumer_handle,
                 current: owner_handle.or(consumer_handle),
                 language: request.language.clone(),
                 link_language: request.link_language.clone(),
-                command_config: request
-                    .command_config
-                    .clone()
-                    .filter(|_| cross_evidence)
-                    .map(ConfigId),
-                output_config: request
-                    .output_config
-                    .clone()
-                    .filter(|_| cross_evidence)
-                    .map(ConfigId),
+                command_config: command_config.clone().map(ConfigId),
+                output_config: output_config.clone().map(ConfigId),
                 traversal: if request.link {
                     UsageTraversal::Link
                 } else {
@@ -283,13 +255,7 @@ impl ConfigureResult {
                 unavailable,
             });
         }
-        let relative = model
-            .dir(lookup_dir)
-            .source_dir
-            .strip_prefix(root.as_slice())
-            .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest))
-            .filter(|rest| !rest.is_empty())
-            .map_or_else(|| BString::from("."), BString::from);
+        let relative = relative_dir(model, lookup_dir);
         Ok(EvalReport {
             expression,
             property,
@@ -336,14 +302,13 @@ impl ConfigureResult {
                     .iter()
                     .find(|config| config.eq_ignore_ascii_case(wanted))
                     .cloned()
-                    .or_else(|| (known.len() == 1).then(|| wanted.clone()))
                     .ok_or_else(|| {
                         format!(
                             "Unknown configuration {}. Available: {}.",
                             String::from_utf8_lossy(wanted),
                             known
                                 .iter()
-                                .map(|c| String::from_utf8_lossy(c).into_owned())
+                                .map(|c| config_label(c))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         )
@@ -351,6 +316,91 @@ impl ConfigureResult {
             })
             .collect()
     }
+
+    /// Return the command and output configurations for the request.
+    ///
+    /// A name must match a cross-configuration graph of this tree. When both
+    /// names are given, the pair must match one graph.
+    fn cross_context(
+        &self,
+        request: &EvalRequest,
+    ) -> Result<(Option<BString>, Option<BString>), String> {
+        if request.command_config.is_none() && request.output_config.is_none() {
+            return Ok((None, None));
+        }
+        let pairs: Vec<(&BString, &BString)> = self
+            .generation
+            .iter()
+            .flat_map(|generation| generation.cross_graphs.keys())
+            .map(|(command, output)| (&command.0, &output.0))
+            .collect();
+        if pairs.is_empty() {
+            return Err(
+                "This tree has no cross-configuration commands. Omit --command-config and --output-config."
+                    .to_owned(),
+            );
+        }
+        let matches = |wanted: Option<&BString>, actual: &BString| {
+            wanted.is_none_or(|wanted| wanted.eq_ignore_ascii_case(actual))
+        };
+        let found = pairs.iter().find(|(command, output)| {
+            matches(request.command_config.as_ref(), command)
+                && matches(request.output_config.as_ref(), output)
+        });
+        let Some((command, output)) = found else {
+            let available: Vec<String> = pairs
+                .iter()
+                .map(|(command, output)| format!("{}:{}", display(command), display(output)))
+                .collect();
+            return Err(format!(
+                "No cross-configuration command matches the requested configurations. Available command:output pairs: {}.",
+                available.join(", ")
+            ));
+        };
+        Ok((
+            request.command_config.as_ref().map(|_| (*command).clone()),
+            request.output_config.as_ref().map(|_| (*output).clone()),
+        ))
+    }
+}
+
+/// Return the directory that defines the only target named `name`.
+fn definition_dir(model: &rcmake_model::ProjectModel, name: &BString) -> Result<DirId, String> {
+    let mut dirs: Vec<DirId> = model
+        .targets()
+        .filter(|(_, target)| target.name == *name)
+        .map(|(_, target)| target.dir)
+        .collect();
+    dirs.dedup();
+    match dirs.as_slice() {
+        [dir] => Ok(*dir),
+        [] => model
+            .find_target(DirId::ROOT, name)
+            .and_then(|id| model.target(id))
+            .map(|target| target.dir)
+            .ok_or_else(|| format!("Unknown target {}.", String::from_utf8_lossy(name))),
+        _ => Err(format!(
+            "More than one directory defines a target named {}. Give --directory to choose one.",
+            String::from_utf8_lossy(name)
+        )),
+    }
+}
+
+fn relative_dir(model: &rcmake_model::ProjectModel, dir: DirId) -> BString {
+    let root = &model.dir(DirId::ROOT).source_dir;
+    model
+        .dir(dir)
+        .source_dir
+        .strip_prefix(root.as_slice())
+        .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest))
+        .filter(|rest| !rest.is_empty())
+        .map_or_else(|| BString::from("."), BString::from)
+}
+
+fn target_handle(id: rcmake_model::TargetId) -> Result<rcmake_genex::TargetHandle, String> {
+    u32::try_from(id.index())
+        .map(rcmake_genex::TargetHandle)
+        .map_err(|_| "The project has too many targets.".to_owned())
 }
 
 fn display(value: &[u8]) -> String {
@@ -365,9 +415,17 @@ fn config_label(config: &[u8]) -> String {
     }
 }
 
-/// Render the report for a terminal.
+fn paint(text: String, code: u8, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text
+    }
+}
+
+/// Render the report for a terminal. `color` adds ANSI color to the values.
 #[must_use]
-pub fn render_eval_terminal(report: &EvalReport, steps: bool) -> String {
+pub fn render_eval_terminal(report: &EvalReport, steps: bool, color: bool) -> String {
     let mut out = String::new();
     let mut context = Vec::new();
     if let Some(owner) = &report.owner {
@@ -401,9 +459,9 @@ pub fn render_eval_terminal(report: &EvalReport, steps: bool) -> String {
     );
     for result in &report.results {
         let value = match &result.value {
-            Ok(value) if value.is_empty() => "(empty)".to_owned(),
-            Ok(value) => display(value),
-            Err(error) => format!("error: {}", display(error)),
+            Ok(value) if value.is_empty() => paint("(empty)".to_owned(), 2, color),
+            Ok(value) => paint(display(value), 32, color),
+            Err(error) => paint(format!("error: {}", display(error)), 31, color),
         };
         let _ = writeln!(out, "{:<8} {value}", config_label(&result.config));
         if steps {

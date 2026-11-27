@@ -5,7 +5,7 @@ use rcmake_base::BString;
 use rcmake_eval::FindTraceStore;
 use rcmake_eval::find_trace::{
     CallFrame, FindCandidate, FindMode, FindOutcome, FindPackageTrace, FindRequestSummary,
-    FindSelection, Rejection, SearchRoot,
+    FindSelection, Rejection, SearchRoot, text_cost,
 };
 use rcmake_json::{ParseBudget, ReadOptions, Value};
 
@@ -13,19 +13,48 @@ use rcmake_json::{ParseBudget, ReadOptions, Value};
 pub const FIND_TRACE_SCHEMA: &str = "rcmake-find-trace-v1";
 /// Path of the persisted file relative to the build directory.
 pub const FIND_TRACE_PATH: &str = "CMakeFiles/rcmake/find-trace.v1.json";
-/// Largest file that the reader accepts.
-pub const FIND_TRACE_MAX_BYTES: usize = 32 << 20;
-const WRITE_BUDGET: usize = 16 << 20;
+/// Largest file that the writer produces and the reader accepts.
+pub const FIND_TRACE_MAX_BYTES: usize = 16 << 20;
+/// Upper bound of the JSON size of the document without its text, stamps, and calls.
+const HEADER_COST: u64 = 1024;
+/// Upper bound of the JSON size of one stamp without its path.
+const STAMP_COST: u64 = 160;
 
-/// Size and modification time of one file.
+/// State of one input path when the trace was written.
+///
+/// A file stamp holds the size and modification time. A directory stamp holds the
+/// modification time, which changes when an entry is added or removed. An absent
+/// stamp records a path that did not exist, for example an empty search location.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileStamp {
     /// Absolute path.
     pub path: BString,
-    /// Size in bytes.
+    /// The path existed.
+    pub exists: bool,
+    /// The path was a directory.
+    pub directory: bool,
+    /// Size in bytes. 0 for an absent path.
     pub size: u64,
-    /// Modification time in nanoseconds since the Unix epoch.
+    /// Modification time in nanoseconds since the Unix epoch. 0 for an absent path.
     pub mtime_ns: i64,
+}
+
+impl FileStamp {
+    /// Stamp of a path that does not exist.
+    #[must_use]
+    pub fn absent(path: impl Into<BString>) -> Self {
+        Self {
+            path: path.into(),
+            exists: false,
+            directory: false,
+            size: 0,
+            mtime_ns: 0,
+        }
+    }
+
+    fn cost(&self) -> u64 {
+        STAMP_COST.saturating_add(text_cost(self.path.len()))
+    }
 }
 
 /// Contents of the persisted file.
@@ -39,8 +68,11 @@ pub struct FindTraceDocument {
     pub source: BString,
     /// `CMakeCache.txt` stamp after the configure saved the cache.
     pub cache: Option<FileStamp>,
-    /// Stamps of the package files that calls selected.
+    /// Stamps of the listfiles, the selected package files, and the searched
+    /// locations of the run.
     pub inputs: Vec<FileStamp>,
+    /// `inputs` holds every input. A `false` value means freshness cannot be proved.
+    pub inputs_complete: bool,
     /// The configure ran to its end. A `false` value means later calls are unknown.
     pub completed: bool,
     /// Recorded calls.
@@ -59,11 +91,14 @@ pub enum Freshness {
 impl FindTraceDocument {
     /// Compare the identity and stamps with the current tree.
     ///
-    /// `stamp` returns the current stamp of a path, or `None` when it cannot be read.
+    /// `cache` is the path of the `CMakeCache.txt` of the build directory. A cache
+    /// stamp for another path does not match. `stamp` returns the current stamp of a
+    /// path, or `None` when the path cannot be checked.
     pub fn freshness(
         &self,
         build: &[u8],
         source: &[u8],
+        cache: &[u8],
         mut stamp: impl FnMut(&[u8]) -> Option<FileStamp>,
     ) -> Freshness {
         if self.build != build {
@@ -72,42 +107,105 @@ impl FindTraceDocument {
         if self.source != source {
             return Freshness::Past("The trace belongs to another source directory.");
         }
-        let Some(cache) = &self.cache else {
+        let Some(recorded) = &self.cache else {
             return Freshness::Past("The trace has no cache stamp.");
         };
-        if stamp(&cache.path).as_ref() != Some(cache) {
+        if recorded.path != cache {
+            return Freshness::Past("The trace names another cache file.");
+        }
+        if stamp(cache).as_ref() != Some(recorded) || !recorded.exists {
             return Freshness::Past("CMakeCache.txt changed after the trace was written.");
+        }
+        if !self.inputs_complete {
+            return Freshness::Past("The trace does not record every input of the run.");
         }
         if self
             .inputs
             .iter()
             .any(|input| stamp(&input.path).as_ref() != Some(input))
         {
-            return Freshness::Past("A package file changed after the trace was written.");
+            return Freshness::Past(
+                "A listfile, package file, or search location changed after the trace was written.",
+            );
         }
         Freshness::Current
     }
 
-    /// Serialize the document. Drop calls from the end to stay within the write budget.
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut document = self.clone();
-        loop {
-            let bytes = rcmake_json::write_compact(&document.to_value());
-            if bytes.len() <= WRITE_BUDGET || document.store.calls.is_empty() {
-                return bytes.into();
-            }
-            let keep = document.store.calls.len() / 2;
-            let dropped = document.store.calls.len() - keep;
-            document.store.calls.truncate(keep);
-            document.store.omitted_calls = document
-                .store
-                .omitted_calls
-                .saturating_add(u32::try_from(dropped).unwrap_or(u32::MAX));
-        }
+    /// Upper bound of the serialized size of everything except the calls.
+    fn header_cost(&self) -> u64 {
+        let stamps = self
+            .cache
+            .iter()
+            .chain(&self.inputs)
+            .fold(0_u64, |total, stamp| total.saturating_add(stamp.cost()));
+        HEADER_COST
+            .saturating_add(text_cost(self.producer.len()))
+            .saturating_add(text_cost(self.build.len()))
+            .saturating_add(text_cost(self.source.len()))
+            .saturating_add(stamps)
     }
 
-    /// Parse a saved document. Return `None` for a missing, oversized, or foreign file.
+    /// Serialize the document within [`FIND_TRACE_MAX_BYTES`].
+    ///
+    /// The size check uses upper bounds and runs before any JSON is built. Calls past
+    /// the limit are dropped from the end and counted as omitted. When the stamps
+    /// alone do not fit, the stamps are dropped and the inputs are marked incomplete.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let max = u64::try_from(FIND_TRACE_MAX_BYTES).unwrap_or(u64::MAX);
+        let mut header = self.header_cost();
+        let mut inputs: &[FileStamp] = &self.inputs;
+        let mut inputs_complete = self.inputs_complete;
+        if header > max {
+            inputs = &[];
+            inputs_complete = false;
+            header = HEADER_COST
+                .saturating_add(text_cost(self.producer.len()))
+                .saturating_add(text_cost(self.build.len()))
+                .saturating_add(text_cost(self.source.len()))
+                .saturating_add(self.cache.as_ref().map_or(0, FileStamp::cost));
+        }
+        let mut total = header;
+        let mut keep = 0;
+        for call in &self.store.calls {
+            let next = total.saturating_add(call.estimated_bytes());
+            if next > max {
+                break;
+            }
+            total = next;
+            keep += 1;
+        }
+        let calls = self.store.calls.get(..keep).unwrap_or_default();
+        let dropped = u32::try_from(self.store.calls.len() - keep).unwrap_or(u32::MAX);
+        let value = Value::object_from([
+            ("schema", Value::string(FIND_TRACE_SCHEMA)),
+            ("producer", Value::String(self.producer.clone())),
+            ("build", Value::String(self.build.clone())),
+            ("source", Value::String(self.source.clone())),
+            (
+                "cache",
+                self.cache.as_ref().map_or(Value::Null, stamp_value),
+            ),
+            ("inputs", Value::array_from(inputs.iter().map(stamp_value))),
+            ("inputs_complete", Value::Bool(inputs_complete)),
+            ("completed", Value::Bool(self.completed)),
+            (
+                "calls_started",
+                Value::UInt(u64::from(self.store.calls_started)),
+            ),
+            (
+                "omitted_calls",
+                Value::UInt(u64::from(self.store.omitted_calls.saturating_add(dropped))),
+            ),
+            ("calls", Value::array_from(calls.iter().map(call_value))),
+        ]);
+        rcmake_json::write_compact(&value).into()
+    }
+
+    /// Parse a saved document. Return `None` for an oversized, foreign, or invalid file.
+    ///
+    /// The calls must have increasing ordinals within `calls_started`, and the kept
+    /// and omitted calls must not exceed the started calls.
     #[must_use]
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let budget = ParseBudget {
@@ -125,55 +223,47 @@ impl FindTraceDocument {
                 .iter()
                 .map(call_from)
                 .collect::<Option<_>>()?,
+            calls_started: u32::try_from(value.get("calls_started")?.as_u64()?).ok()?,
             omitted_calls: u32::try_from(value.get("omitted_calls")?.as_u64()?).ok()?,
             bytes: 0,
         };
+        let ordered = store.calls.windows(2).all(|pair| {
+            pair.first().map(|call| call.ordinal) < pair.get(1).map(|call| call.ordinal)
+        });
+        let in_range = store
+            .calls
+            .iter()
+            .all(|call| (1..=store.calls_started).contains(&call.ordinal));
+        let kept = u32::try_from(store.calls.len()).ok()?;
+        if !ordered || !in_range || kept.checked_add(store.omitted_calls)? > store.calls_started {
+            return None;
+        }
         Some(Self {
             producer: text(value.get("producer")?)?,
             build: text(value.get("build")?)?,
             source: text(value.get("source")?)?,
-            cache: value.get("cache").and_then(stamp_from),
+            cache: match value.get("cache")? {
+                Value::Null => None,
+                cache => Some(stamp_from(cache)?),
+            },
             inputs: value
                 .get("inputs")?
                 .as_array()?
                 .iter()
                 .map(stamp_from)
                 .collect::<Option<_>>()?,
+            inputs_complete: value.get("inputs_complete")?.as_bool()?,
             completed: value.get("completed")?.as_bool()?,
             store,
         })
-    }
-
-    fn to_value(&self) -> Value {
-        Value::object_from([
-            ("schema", Value::string(FIND_TRACE_SCHEMA)),
-            ("producer", Value::String(self.producer.clone())),
-            ("build", Value::String(self.build.clone())),
-            ("source", Value::String(self.source.clone())),
-            (
-                "cache",
-                self.cache.as_ref().map_or(Value::Null, stamp_value),
-            ),
-            (
-                "inputs",
-                Value::array_from(self.inputs.iter().map(stamp_value)),
-            ),
-            ("completed", Value::Bool(self.completed)),
-            (
-                "omitted_calls",
-                Value::UInt(u64::from(self.store.omitted_calls)),
-            ),
-            (
-                "calls",
-                Value::array_from(self.store.calls.iter().map(call_value)),
-            ),
-        ])
     }
 }
 
 fn stamp_value(stamp: &FileStamp) -> Value {
     Value::object_from([
         ("path", Value::String(stamp.path.clone())),
+        ("exists", Value::Bool(stamp.exists)),
+        ("directory", Value::Bool(stamp.directory)),
         ("size", Value::UInt(stamp.size)),
         ("mtime_ns", Value::Int(stamp.mtime_ns)),
     ])
@@ -182,6 +272,8 @@ fn stamp_value(stamp: &FileStamp) -> Value {
 fn stamp_from(value: &Value) -> Option<FileStamp> {
     Some(FileStamp {
         path: text(value.get("path")?)?,
+        exists: value.get("exists")?.as_bool()?,
+        directory: value.get("directory")?.as_bool()?,
         size: value.get("size")?.as_u64()?,
         mtime_ns: value.get("mtime_ns")?.as_i64()?,
     })
@@ -251,6 +343,13 @@ fn outcome_from(label: &str) -> Option<FindOutcome> {
 pub(crate) fn call_value(call: &FindPackageTrace) -> Value {
     let request = &call.request;
     Value::object_from([
+        ("ordinal", Value::UInt(u64::from(call.ordinal))),
+        (
+            "package_call",
+            call.package_call
+                .map_or(Value::Null, |index| Value::UInt(u64::from(index))),
+        ),
+        ("items_omitted", Value::UInt(u64::from(call.items_omitted))),
         ("name", Value::String(call.name.clone())),
         (
             "call",
@@ -332,6 +431,16 @@ pub(crate) fn call_value(call: &FindPackageTrace) -> Value {
 fn call_from(value: &Value) -> Option<FindPackageTrace> {
     let request = value.get("request")?;
     Some(FindPackageTrace {
+        ordinal: u32::try_from(value.get("ordinal")?.as_u64()?).ok()?,
+        package_call: match value.get("package_call")? {
+            Value::Null => None,
+            index => Some(
+                u32::try_from(index.as_u64()?)
+                    .ok()
+                    .filter(|index| *index > 0)?,
+            ),
+        },
+        items_omitted: u32::try_from(value.get("items_omitted")?.as_u64()?).ok()?,
         name: text(value.get("name")?)?,
         call: value
             .get("call")?
@@ -407,8 +516,10 @@ fn call_from(value: &Value) -> Option<FindPackageTrace> {
 mod tests {
     use super::*;
 
-    fn document() -> FindTraceDocument {
-        let call = FindPackageTrace {
+    fn call(ordinal: u32) -> FindPackageTrace {
+        FindPackageTrace {
+            ordinal,
+            package_call: Some(ordinal),
             name: "Boost".into(),
             call: vec![CallFrame {
                 file: "/src/CMakeLists.txt".into(),
@@ -436,27 +547,52 @@ mod tests {
             }],
             candidates_omitted: 3,
             fields_cut: 0,
+            items_omitted: 1,
             selected: None,
             outcome: FindOutcome::NotFound,
             version: None,
-        };
+        }
+    }
+
+    fn stamp(path: &str, size: u64) -> FileStamp {
+        FileStamp {
+            path: path.into(),
+            exists: true,
+            directory: false,
+            size,
+            mtime_ns: 5,
+        }
+    }
+
+    fn document() -> FindTraceDocument {
         FindTraceDocument {
             producer: "rcmake 0.1.0".into(),
             build: "/b".into(),
             source: "/s".into(),
-            cache: Some(FileStamp {
-                path: "/b/CMakeCache.txt".into(),
-                size: 10,
-                mtime_ns: 5,
-            }),
-            inputs: Vec::new(),
+            cache: Some(stamp("/b/CMakeCache.txt", 10)),
+            inputs: vec![
+                stamp("/s/CMakeLists.txt", 40),
+                FileStamp::absent("/opt/empty/lib/cmake/Boost"),
+            ],
+            inputs_complete: true,
             completed: false,
             store: FindTraceStore {
-                calls: vec![call],
+                calls: vec![call(2)],
+                calls_started: 4,
                 omitted_calls: 2,
                 bytes: 0,
             },
         }
+    }
+
+    fn current(document: &FindTraceDocument) -> impl FnMut(&[u8]) -> Option<FileStamp> {
+        let stamps: Vec<FileStamp> = document
+            .cache
+            .iter()
+            .chain(&document.inputs)
+            .cloned()
+            .collect();
+        move |path: &[u8]| stamps.iter().find(|stamp| stamp.path == path).cloned()
     }
 
     #[test]
@@ -464,28 +600,102 @@ mod tests {
         let document = document();
         let parsed = FindTraceDocument::parse(&document.to_bytes()).expect("parse");
         assert_eq!(parsed, document);
-        let current = |_: &[u8]| document.cache.clone();
-        assert_eq!(parsed.freshness(b"/b", b"/s", current), Freshness::Current);
+        let cache = b"/b/CMakeCache.txt";
+        assert_eq!(
+            parsed.freshness(b"/b", b"/s", cache, current(&document)),
+            Freshness::Current
+        );
         assert!(matches!(
-            parsed.freshness(b"/other", b"/s", current),
+            parsed.freshness(b"/other", b"/s", cache, current(&document)),
             Freshness::Past(_)
         ));
-        let changed = |_: &[u8]| {
-            Some(FileStamp {
-                size: 11,
-                ..document.cache.clone().expect("cache")
-            })
+        assert!(matches!(
+            parsed.freshness(
+                b"/b",
+                b"/s",
+                b"/elsewhere/CMakeCache.txt",
+                current(&document)
+            ),
+            Freshness::Past(_)
+        ));
+        let mut changed = current(&document);
+        let listfile_edit = |path: &[u8]| {
+            if path == b"/s/CMakeLists.txt" {
+                Some(stamp("/s/CMakeLists.txt", 41))
+            } else {
+                changed(path)
+            }
         };
         assert!(matches!(
-            parsed.freshness(b"/b", b"/s", changed),
+            parsed.freshness(b"/b", b"/s", cache, listfile_edit),
+            Freshness::Past(_)
+        ));
+        let mut base = current(&document);
+        let new_package = |path: &[u8]| {
+            if path == b"/opt/empty/lib/cmake/Boost" {
+                Some(FileStamp {
+                    directory: true,
+                    ..stamp("/opt/empty/lib/cmake/Boost", 0)
+                })
+            } else {
+                base(path)
+            }
+        };
+        assert!(matches!(
+            parsed.freshness(b"/b", b"/s", cache, new_package),
+            Freshness::Past(_)
+        ));
+        let mut incomplete = document.clone();
+        incomplete.inputs_complete = false;
+        assert!(matches!(
+            incomplete.freshness(b"/b", b"/s", cache, current(&document)),
             Freshness::Past(_)
         ));
     }
 
     #[test]
-    fn rejects_foreign_schema_and_deep_files() {
+    fn writer_stays_within_the_shared_limit_before_building_json() {
+        let mut document = document();
+        let huge = BString::from(vec![b'\x01'; 1 << 20]);
+        let mut big = call(1);
+        big.candidates[0].detail = Some(huge);
+        let count = FIND_TRACE_MAX_BYTES / (6 << 20) + 2;
+        document.store.calls = (1..=u32::try_from(count).unwrap_or(4))
+            .map(|ordinal| FindPackageTrace {
+                ordinal,
+                ..big.clone()
+            })
+            .collect();
+        document.store.calls_started = 20;
+        document.store.omitted_calls = 0;
+        let bytes = document.to_bytes();
+        assert!(bytes.len() <= FIND_TRACE_MAX_BYTES);
+        let parsed = FindTraceDocument::parse(&bytes).expect("parse");
+        assert!(parsed.store.calls.len() < count);
+        assert_eq!(
+            parsed.store.calls.len() + parsed.store.omitted_calls as usize,
+            count
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_schema_deep_files_and_invalid_ordinals() {
         assert!(FindTraceDocument::parse(br#"{"schema":"other"}"#).is_none());
         let deep = "[".repeat(40) + &"]".repeat(40);
         assert!(FindTraceDocument::parse(deep.as_bytes()).is_none());
+        let mut document = document();
+        document.store.calls = vec![call(3), call(2)];
+        assert!(FindTraceDocument::parse(&document.to_bytes()).is_none());
+        document.store.calls = vec![call(9)];
+        assert!(FindTraceDocument::parse(&document.to_bytes()).is_none());
+        let mut bad = call(1);
+        bad.outcome = FindOutcome::Found;
+        let text = String::from_utf8_lossy(&{
+            let mut document = self::document();
+            document.store.calls = vec![bad];
+            document.to_bytes()
+        })
+        .replace("\"found\"", "\"maybe\"");
+        assert!(FindTraceDocument::parse(text.as_bytes()).is_none());
     }
 }

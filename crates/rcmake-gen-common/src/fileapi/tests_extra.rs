@@ -1636,7 +1636,12 @@ fn codemodel_source_group_precedence_unity_backtrace_and_cross_order_dependencie
     assert_eq!(group_of(b"fs_prop.h"), Some(br"FileSet\Prop".as_slice()));
     assert_eq!(group_of(b"fs.h"), Some(br"FileSet\Cmd".as_slice()));
     assert_eq!(group_of(b"plain_header"), Some(b"Header Files".as_slice()));
-    assert_eq!(group_of(br"back\slash.c"), Some(b"Backslash".as_slice()));
+    let backslash_path: &[u8] = if cfg!(windows) {
+        b"back/slash.c"
+    } else {
+        br"back\slash.c"
+    };
+    assert_eq!(group_of(backslash_path), Some(b"Backslash".as_slice()));
     assert_eq!(group_of(b"a.c"), Some(b"RegexAll".as_slice()));
     assert_eq!(group_of(long_name.as_bytes()), Some(b"".as_slice()));
 

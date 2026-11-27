@@ -29,13 +29,16 @@ pub(crate) struct DirectiveIssue {
 pub(crate) struct DirectiveMap {
     /// Map from `command_index` to set of suppressed [`RuleId`]s.
     suppressed: BTreeMap<usize, BTreeSet<RuleId>>,
-    /// Malformed or unknown directives to emit as findings.
+    /// Malformed or unknown directives to emit as findings (bounded by `max_issues`).
     pub(crate) issues: Vec<DirectiveIssue>,
+    /// `true` if additional invalid directive issues were dropped at `max_issues`.
+    pub(crate) issues_truncated: bool,
 }
 
 impl DirectiveMap {
-    /// Parse all `# rcmake-lint:` line-comment directives in `concrete`.
-    pub(crate) fn parse(src: &[u8], concrete: &ConcreteListFile) -> Self {
+    /// Parse all `# rcmake-lint:` line-comment directives in `concrete`, retaining at most
+    /// `max_issues` invalid-directive diagnostics.
+    pub(crate) fn parse(src: &[u8], concrete: &ConcreteListFile, max_issues: usize) -> Self {
         let mut map = Self::default();
         let tokens = &concrete.tokens;
         let commands = &concrete.commands;
@@ -89,14 +92,19 @@ impl DirectiveMap {
             let body_offset = prefix_end_offset + ws_after_colon;
 
             let Some(after_disable) = body.strip_prefix(b"disable=") else {
-                map.issues.push(DirectiveIssue {
-                    span: body_offset..tok.span.end,
-                    message: "Malformed rcmake-lint directive; expected 'disable=<rule>'.".into(),
-                    suggestion: Some(
-                        "Use '# rcmake-lint: disable=<rule-id>' with a known rule identifier."
+                if map.issues.len() < max_issues {
+                    map.issues.push(DirectiveIssue {
+                        span: body_offset..tok.span.end,
+                        message: "Malformed rcmake-lint directive; expected 'disable=<rule>'."
                             .into(),
-                    ),
-                });
+                        suggestion: Some(
+                            "Use '# rcmake-lint: disable=<rule-id>' with a known rule identifier."
+                                .into(),
+                        ),
+                    });
+                } else {
+                    map.issues_truncated = true;
+                }
                 continue;
             };
 
@@ -108,11 +116,15 @@ impl DirectiveMap {
                 .unwrap_or(after_disable.len());
             let rules_slice = after_disable.get(..rules_len).unwrap_or_default();
             if rules_slice.is_empty() {
-                map.issues.push(DirectiveIssue {
-                    span: body_offset..rules_offset,
-                    message: "Empty rule list in '# rcmake-lint: disable=' directive.".into(),
-                    suggestion: Some("Specify at least one valid lint rule ID.".into()),
-                });
+                if map.issues.len() < max_issues {
+                    map.issues.push(DirectiveIssue {
+                        span: body_offset..rules_offset,
+                        message: "Empty rule list in '# rcmake-lint: disable=' directive.".into(),
+                        suggestion: Some("Specify at least one valid lint rule ID.".into()),
+                    });
+                } else {
+                    map.issues_truncated = true;
+                }
                 continue;
             }
 
@@ -125,7 +137,7 @@ impl DirectiveMap {
                 let name = core::str::from_utf8(part).unwrap_or("");
                 if let Some(rule) = RuleId::parse(name) {
                     parsed_rules.push(rule);
-                } else {
+                } else if map.issues.len() < max_issues {
                     let display = String::from_utf8_lossy(part);
                     let valid = crate::rules_meta::ALL_RULES
                         .iter()
@@ -142,6 +154,8 @@ impl DirectiveMap {
                         message: format!("Unknown lint rule '{display}' in rcmake-lint directive."),
                         suggestion,
                     });
+                } else {
+                    map.issues_truncated = true;
                 }
             }
 

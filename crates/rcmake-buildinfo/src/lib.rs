@@ -20,14 +20,14 @@ mod source;
 pub use cache_file::parse as parse_cache;
 pub use diff::{
     CacheChange, CacheSet, CompileChange, ConfigDiff, DiffOptions, ListChange, PackageChange, Pair,
-    TargetChange, TargetEntry, ToolchainChange, compare, normalize,
+    TargetChange, TargetEntry, ToolchainChange, compare, normalize, validate,
 };
 pub use reader::{ArtifactReader, ReadError, ReadLimits};
 pub use render::{DIFF_CONFIG_SCHEMA, render_json, render_text};
 pub use snapshot::{
     Attribution, BuildSnapshot, CacheRecord, CompileSettings, DataSource, Evidence, IncludeDir,
-    LinkFragment, PackageObservation, PackageSnapshot, Producer, Section, TargetSnapshot,
-    ToolchainSnapshot,
+    LinkFragment, PackageObservation, PackageSnapshot, Producer, Section, SourceInvocations,
+    TargetSnapshot, ToolchainSnapshot, TraceCall, TraceInput,
 };
 pub use source::{LoadError, load};
 

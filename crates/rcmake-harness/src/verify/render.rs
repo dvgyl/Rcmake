@@ -58,6 +58,11 @@ pub(crate) fn render_json(report: &VerifyReport) -> String {
     {
         obj.insert("error".to_owned(), Value::String(err.clone()));
     }
+    if let Some(warn) = &report.cleanup_warning
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("cleanup_warning".to_owned(), Value::String(warn.clone()));
+    }
     let mut rendered = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_owned());
     rendered.push('\n');
     rendered
@@ -135,6 +140,9 @@ pub(crate) fn render_text(report: &VerifyReport) -> String {
         for ex in &sec.examples {
             out.push_str(&format!("    diff: {ex}\n"));
         }
+    }
+    if let Some(warn) = &report.cleanup_warning {
+        out.push_str(&format!("  warning: {warn}\n"));
     }
     out
 }

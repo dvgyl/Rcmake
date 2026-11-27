@@ -320,13 +320,14 @@ fn configure(
         host.write_out(Stream::Stdout, b"Configure project\n");
     }
     let program = path::from_native(&crate::script::cmake_executable(host));
+    let env = crate::script::builtin_cmake_env(host, &program);
     let command = rcmake_host::CommandSpec { program, args };
     let output = host
         .run(
             &RunRequest {
                 pipeline: vec![command.clone()],
                 cwd: source.clone(),
-                env: host.env_all(),
+                env,
                 stdin: Input::Null,
                 stdout: Output::Capture,
                 stderr: Output::SharedWithStdout,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rcmake_base::{BString, list};
 use rcmake_genex::{ConfigId, EvalContext, EvalFlags, GenexError, UsageTraversal};
-use rcmake_model::{BT, LinkItem, ProjectModel, Target, TargetId, TargetKind, UsageScope};
+use rcmake_model::{BT, DirId, LinkItem, ProjectModel, Target, TargetId, TargetKind, UsageScope};
 
 use super::{Limits, UsageResolver, UsageValue, context, handle};
 use crate::ResolveError;
@@ -789,7 +789,12 @@ impl<'a> UsageResolver<'a> {
                     }
                     _ => ResolvedLinkKind::Library(id),
                 }
-            } else if rcmake_base::path_lex::Lexical::new(value).absolute()
+            } else if (rcmake_base::path_lex::Lexical::new(value).absolute()
+                || self
+                    .source_paths
+                    .is_some_and(|paths| paths.object_owner(value).is_some())
+                || (value.starts_with(b"/")
+                    && self.model.dir(DirId::ROOT).binary_dir.starts_with(b"/")))
                 && (value.ends_with(b".o") || value.ends_with(b".obj"))
             {
                 ResolvedLinkKind::ObjectFile

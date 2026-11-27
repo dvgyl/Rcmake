@@ -58,7 +58,10 @@ impl PortableName {
     }
 }
 
-/// Size limits for [`read_portable`]. Each limit applies before allocation.
+/// Size limits for [`read_portable`] and [`write_portable`].
+///
+/// The reader applies each limit before allocation. Give the writer the same
+/// value as the reader, so that every written archive passes the read checks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortableLimits {
     /// Maximum size of the compressed archive.
@@ -75,20 +78,6 @@ pub struct PortableLimits {
     pub members: usize,
 }
 
-impl Default for PortableLimits {
-    fn default() -> Self {
-        const MIB: u64 = 1024 * 1024;
-        Self {
-            archive_bytes: 256 * MIB,
-            tar_bytes: 640 * MIB,
-            member_bytes: 64 * MIB,
-            manifest_bytes: 16 * MIB,
-            total_bytes: 512 * MIB,
-            members: 65_536,
-        }
-    }
-}
-
 /// One member read from a portable cache archive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortableMember {
@@ -101,13 +90,17 @@ pub struct PortableMember {
 /// Write a portable cache archive with deterministic bytes.
 ///
 /// The names must be unique and in [`PortableName`] order. The first member
-/// must be the manifest.
+/// must be the manifest. The archive must fit in `limits`, which the writer
+/// checks before it returns any bytes.
 ///
 /// # Errors
 ///
-/// Returns an error for unsorted or duplicate names, a missing manifest, a
-/// member larger than the default member limit, or a compression failure.
-pub fn write_portable(members: &[(PortableName, &[u8])]) -> Result<Vec<u8>, ArchiveError> {
+/// Returns an error for unsorted or duplicate names, a missing manifest, an
+/// archive or member over `limits`, or a compression failure.
+pub fn write_portable(
+    members: &[(PortableName, &[u8])],
+    limits: &PortableLimits,
+) -> Result<Vec<u8>, ArchiveError> {
     if members.first().map(|(name, _)| *name) != Some(PortableName::Manifest) {
         return Err(ArchiveError::new(
             "A portable archive must start with its manifest.",
@@ -118,19 +111,41 @@ pub fn write_portable(members: &[(PortableName, &[u8])]) -> Result<Vec<u8>, Arch
             "Portable archive members must be unique and sorted.",
         ));
     }
-    let limit = PortableLimits::default().member_bytes;
-    let mut encoder = GzBuilder::new()
-        .mtime(0)
-        .operating_system(255)
-        .write(Vec::new(), Compression::new(6));
+    if members.len() > limits.members {
+        return Err(ArchiveError::new(format!(
+            "A portable archive can hold at most {} members.",
+            limits.members
+        )));
+    }
+    let mut total = 0u64;
+    let mut tar = 2 * BLOCK as u64;
     for (name, data) in members {
         let size = data.len() as u64;
+        let limit = if *name == PortableName::Manifest {
+            limits.manifest_bytes
+        } else {
+            limits.member_bytes
+        };
         if size > limit {
             return Err(ArchiveError::new(format!(
                 "Portable archive member {} exceeds {limit} bytes.",
                 name.to_name()
             )));
         }
+        total = total.saturating_add(size);
+        tar = tar.saturating_add(BLOCK as u64 + size + padding(size) as u64);
+    }
+    if total > limits.total_bytes || tar > limits.tar_bytes {
+        return Err(ArchiveError::new(
+            "The portable archive members exceed the archive size limits.",
+        ));
+    }
+    let mut encoder = GzBuilder::new()
+        .mtime(0)
+        .operating_system(255)
+        .write(Vec::new(), Compression::new(6));
+    for (name, data) in members {
+        let size = data.len() as u64;
         let header = ustar_header(name.to_name().as_bytes(), size)?;
         encoder.write_all(&header).map_err(io_error)?;
         encoder.write_all(data).map_err(io_error)?;
@@ -140,7 +155,14 @@ pub fn write_portable(members: &[(PortableName, &[u8])]) -> Result<Vec<u8>, Arch
             .map_err(io_error)?;
     }
     encoder.write_all(&[0; 2 * BLOCK]).map_err(io_error)?;
-    encoder.finish().map_err(io_error)
+    let archive = encoder.finish().map_err(io_error)?;
+    if archive.len() as u64 > limits.archive_bytes {
+        return Err(ArchiveError::new(format!(
+            "The portable archive exceeds {} bytes.",
+            limits.archive_bytes
+        )));
+    }
+    Ok(archive)
 }
 
 /// Read and check a complete portable cache archive.

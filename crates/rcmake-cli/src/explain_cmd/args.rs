@@ -42,7 +42,7 @@ pub(super) struct Options {
 pub(super) struct FindOptions {
     pub(super) package: BString,
     pub(super) build: Option<BString>,
-    pub(super) call: Option<usize>,
+    pub(super) call: Option<u32>,
     pub(super) all_candidates: bool,
     pub(super) fresh: bool,
     pub(super) json: bool,
@@ -127,10 +127,12 @@ struct Parsed {
     config: Option<BString>,
     filter: Option<BString>,
     typed: Option<ExplainFilter>,
+    /// Option that set `typed`. A repeat of the same option replaces the value.
+    typed_flag: Option<&'static [u8]>,
     find: Option<BString>,
     eval: Option<BString>,
     eval_property: Option<BString>,
-    call: Option<usize>,
+    call: Option<u32>,
     language: Option<BString>,
     link_language: Option<BString>,
     directory: Option<BString>,
@@ -158,6 +160,9 @@ fn flag_name(raw: &[u8]) -> (&[u8], Option<&[u8]>) {
     if raw.starts_with(b"--") {
         let mut parts = raw.splitn(2, |byte| *byte == b'=');
         (parts.next().unwrap_or(raw), parts.next())
+    } else if let Some(rest) = raw.strip_prefix(b"-B=") {
+        // The legacy grammar splits `-B=<dir>` at the first equals sign.
+        (b"-B", Some(rest))
     } else if raw.len() > 2 && raw.starts_with(b"-B") {
         (b"-B", raw.get(2..))
     } else {
@@ -317,11 +322,13 @@ pub(super) fn parse(args: &[BString]) -> Result<Invocation, String> {
             b"--filter" | b"--flag" | b"--define" | b"--include" | b"--dep" => {
                 let name = String::from_utf8_lossy(flag).into_owned();
                 let text = value(&mut args, attached, &name)?;
-                if parsed.typed.is_some() {
+                let kind = intern(flag);
+                if parsed.typed_flag.is_some_and(|previous| previous != kind) {
                     return Err(
                         "Use only one of --filter, --flag, --define, --include, or --dep.".into(),
                     );
                 }
+                parsed.typed_flag = Some(kind);
                 parsed.typed = Some(match flag {
                     b"--filter" => {
                         parsed.filter = Some(text.clone());
@@ -353,7 +360,7 @@ pub(super) fn parse(args: &[BString]) -> Result<Invocation, String> {
                 let text = value(&mut args, attached, "--call")?;
                 let call = std::str::from_utf8(&text)
                     .ok()
-                    .and_then(|text| text.parse::<usize>().ok())
+                    .and_then(|text| text.parse::<u32>().ok())
                     .filter(|call| *call > 0)
                     .ok_or("Give --call a positive number.")?;
                 parsed.call = Some(call);
@@ -609,6 +616,47 @@ mod tests {
         for args in cases {
             assert!(parse_args(args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn legacy_build_and_repeated_filter_forms_keep_their_meaning() {
+        let query = |build: Option<&str>, filter: Option<&str>| {
+            Ok(Invocation::Query(Options {
+                name: "app".into(),
+                build: build.map(BString::from),
+                kind: if filter.is_some() {
+                    Kind::Target
+                } else {
+                    Kind::Auto
+                },
+                filter: filter.map(BString::from),
+                typed: filter.map(|text| ExplainFilter::Any(text.into())),
+                ..Options::default()
+            }))
+        };
+        for args in [
+            &["app", "-B=build"][..],
+            &["app", "-B", "build"],
+            &["app", "-Bbuild"],
+            &["-B=build", "app"],
+        ] {
+            assert_eq!(parse_args(args), query(Some("build"), None), "{args:?}");
+        }
+        assert_eq!(
+            parse_args(&["app", "-Bdir=x"]),
+            query(Some("dir=x"), None),
+            "the legacy grammar keeps an equals sign after an attached directory"
+        );
+        assert_eq!(
+            parse_args(&["app", "--filter", "first", "--filter=second"]),
+            query(None, Some("second"))
+        );
+        let flags = parse_args(&["app", "--flag", "-O1", "--flag", "-O2"]);
+        assert!(matches!(
+            flags,
+            Ok(Invocation::Query(Options { typed: Some(ExplainFilter::Flag(ref value)), .. })) if value == "-O2"
+        ));
+        assert!(parse_args(&["app", "--filter", "x", "--flag", "-O2"]).is_err());
     }
 
     #[test]

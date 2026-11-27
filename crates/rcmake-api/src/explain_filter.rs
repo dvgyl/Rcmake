@@ -75,7 +75,15 @@ impl ExplainFilter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn matches(&self, entry: &ExplainEntry) -> bool {
+        self.matches_in(entry, None)
+    }
+
+    /// Return whether `entry` matches. `command_dir` is the working directory of
+    /// the compile command. A relative include token in a flag is resolved against
+    /// it, as the compiler does.
+    pub(crate) fn matches_in(&self, entry: &ExplainEntry, command_dir: Option<&[u8]>) -> bool {
         match self {
             Self::Any(filter) => entry.matches_filter(filter),
             Self::Flag(filter) => {
@@ -95,17 +103,33 @@ impl ExplainFilter {
                 if entry.kind == ChainKind::Usage(UsageField::CompileDefinitions) {
                     return wanted(&entry.value);
                 }
-                entry.is_flag_string()
-                    && entry.tokens().iter().any(|token| {
-                        token
-                            .strip_prefix(b"-D")
-                            .or_else(|| token.strip_prefix(b"/D"))
-                            .is_some_and(wanted)
-                    })
+                if !entry.is_flag_string() {
+                    return false;
+                }
+                let tokens = entry.tokens();
+                tokens.iter().enumerate().any(|(index, token)| {
+                    match token
+                        .strip_prefix(b"-D")
+                        .or_else(|| token.strip_prefix(b"/D"))
+                    {
+                        Some(rest) if !rest.is_empty() => wanted(rest),
+                        Some(_) => tokens.get(index + 1).is_some_and(|next| wanted(next)),
+                        None => false,
+                    }
+                })
             }
             Self::Include(dir) => {
                 let wanted = Lexical::new(dir).normalize();
-                let same = |candidate: &[u8]| Lexical::new(candidate).normalize() == wanted;
+                let same = |candidate: &[u8]| {
+                    let relative =
+                        !candidate.starts_with(b"/") && !Lexical::windows(candidate).absolute();
+                    match command_dir {
+                        Some(base) if relative => {
+                            Lexical::new(&[base, b"/", candidate].concat()).normalize() == wanted
+                        }
+                        _ => Lexical::new(candidate).normalize() == wanted,
+                    }
+                };
                 if entry.kind == ChainKind::Usage(UsageField::IncludeDirectories) {
                     return same(&entry.value);
                 }
@@ -170,13 +194,30 @@ mod tests {
         assert!(!any.matches(&entry(UsageField::CompileDefinitions, "FOOBAR")));
         assert!(one.matches(&entry(UsageField::CompileDefinitions, "FOO=1")));
         assert!(!one.matches(&entry(UsageField::CompileDefinitions, "FOO")));
-        for flags in ["-DFOO=1 -O2", "/DFOO", "-DFOO"] {
+        for flags in ["-DFOO=1 -O2", "/DFOO", "-DFOO", "-D FOO=1", "/D FOO"] {
             assert!(
                 any.matches(&entry(UsageField::CompileOptions, flags)),
                 "{flags}"
             );
         }
         assert!(!any.matches(&entry(UsageField::CompileOptions, "-DFOOBAR")));
+        assert!(!any.matches(&entry(UsageField::CompileOptions, "-D FOOBAR")));
+        assert!(one.matches(&entry(UsageField::CompileOptions, "-D FOO=1")));
+        assert!(!one.matches(&entry(UsageField::CompileOptions, "-D FOO=2")));
+        assert!(!any.matches(&entry(UsageField::CompileOptions, "-D")));
+    }
+
+    #[test]
+    fn relative_include_tokens_resolve_against_the_command_directory() {
+        let filter = ExplainFilter::Include("/build/sub/inc".into());
+        let flags = entry(UsageField::CompileOptions, "-I inc");
+        assert!(filter.matches_in(&flags, Some(b"/build/sub")));
+        assert!(!filter.matches_in(&flags, Some(b"/build")));
+        assert!(filter.matches_in(
+            &entry(UsageField::CompileOptions, "-Iinc"),
+            Some(b"/build/sub")
+        ));
+        assert!(!filter.matches(&flags));
     }
 
     #[test]

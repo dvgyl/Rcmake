@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rcmake_base::{BString, cmdline::Arguments};
 use rcmake_host::{FileKind, FileTime, Follow};
@@ -17,6 +18,16 @@ use crate::snapshot::{
 const REPLY: &str = ".cmake/api/v1/reply";
 const MAX_TARGETS: usize = 100_000;
 const MAX_REPLY_FILES: usize = 200_000;
+const MAX_FRAGMENT_TOKENS: usize = 65_536;
+
+/// One input of the `cmakeFiles-v1` reply.
+#[derive(Debug, Clone)]
+pub(crate) struct ReplyInput {
+    /// Path as the reply gives it, relative to the source root or absolute.
+    pub(crate) path: BString,
+    /// The input is a CMake module outside the project.
+    pub(crate) cmake: bool,
+}
 
 /// Data from the current reply index.
 #[derive(Debug, Default)]
@@ -32,7 +43,12 @@ pub(crate) struct FileApiData {
     pub(crate) targets_partial: Option<BString>,
     pub(crate) cache: Option<BTreeMap<BString, CacheRecord>>,
     pub(crate) toolchains: Option<Vec<ToolchainSnapshot>>,
-    pub(crate) inputs: Option<Vec<BString>>,
+    /// Project inputs from `cmakeFiles-v1`, used to check that the reply is current.
+    pub(crate) inputs: Option<Vec<ReplyInput>>,
+    /// Source root of the `cmakeFiles-v1` reply.
+    pub(crate) inputs_root: Option<BString>,
+    /// The reply directory cannot be used, with the reason.
+    pub(crate) unusable: Option<BString>,
     pub(crate) warnings: Vec<BString>,
 }
 
@@ -111,6 +127,32 @@ impl Reply<'_, '_> {
     }
 }
 
+impl Reply<'_, '_> {
+    /// Read a reply object and check its structure: an object whose `kind` is
+    /// `kind`, when the reply gives one, with an array member `array`. A malformed
+    /// object is ignored with a warning, so it never stands for an empty section.
+    fn object_of(&mut self, name: &[u8], kind: &str, array: &str) -> Option<Value> {
+        let value = self.object(name)?;
+        let kind_ok = value
+            .get("kind")
+            .is_none_or(|found| found.as_str() == Some(kind));
+        if value.as_object().is_none()
+            || !kind_ok
+            || value.get(array).and_then(Value::as_array).is_none()
+        {
+            self.warnings.push(
+                format!(
+                    "Ignored File API reply file {} because it is not a valid {kind} object.",
+                    String::from_utf8_lossy(name)
+                )
+                .into(),
+            );
+            return None;
+        }
+        Some(value)
+    }
+}
+
 /// Supported major versions by kind.
 fn supported(kind: &[u8]) -> Option<u64> {
     match kind {
@@ -167,11 +209,24 @@ fn references(index: &Value) -> BTreeMap<BString, (u64, BString)> {
 /// Read the current reply index and the objects it references.
 pub(crate) fn load(reader: &mut ArtifactReader<'_>) -> Option<FileApiData> {
     let dir = PathBuf::from(REPLY);
-    let names = reader
-        .list(&dir, MAX_REPLY_FILES)
-        .into_iter()
-        .filter(|(_, kind)| *kind == FileKind::File)
-        .map(|(name, _)| name);
+    let names = match reader.list_checked(&dir, MAX_REPLY_FILES) {
+        Ok(entries) => entries
+            .into_iter()
+            .filter(|(_, kind)| *kind == FileKind::File)
+            .map(|(name, _)| name),
+        // A cut listing can hide the newest index, so it selects no index at all.
+        Err(_) => {
+            return Some(FileApiData {
+                unusable: Some(
+                    format!(
+                        "The File API reply directory has more than {MAX_REPLY_FILES} entries."
+                    )
+                    .into(),
+                ),
+                ..FileApiData::default()
+            });
+        }
+    };
     let (index_name, failed) = current_index(names)?;
     let index_path = dir.join(String::from_utf8_lossy(&index_name).as_ref());
     let index_mtime = reader
@@ -222,34 +277,35 @@ pub(crate) fn load(reader: &mut ArtifactReader<'_>) -> Option<FileApiData> {
         files: 0,
     };
     if let Some((_, file)) = refs.get(b"cache".as_slice())
-        && let Some(cache) = reply.object(file)
+        && let Some(cache) = reply.object_of(file, "cache", "entries")
     {
         data.cache = Some(cache_entries(&cache));
     }
     if let Some((_, file)) = refs.get(b"toolchains".as_slice())
-        && let Some(toolchains) = reply.object(file)
+        && let Some(toolchains) = reply.object_of(file, "toolchains", "toolchains")
     {
         data.toolchains = Some(toolchain_entries(&toolchains));
     }
     if let Some((_, file)) = refs.get(b"cmakeFiles".as_slice())
-        && let Some(files) = reply.object(file)
+        && let Some(files) = reply.object_of(file, "cmakeFiles", "inputs")
     {
+        data.inputs_root = text(files.get("paths").and_then(|paths| paths.get("source")));
         data.inputs = Some(
             items(files.get("inputs"))
                 .iter()
-                .filter_map(|input| text(input.get("path")))
+                .filter_map(|input| {
+                    Some(ReplyInput {
+                        path: text(input.get("path"))?,
+                        cmake: input.get("isCMake").and_then(Value::as_bool) == Some(true),
+                    })
+                })
                 .collect(),
         );
     }
     if let Some((_, file)) = refs.get(b"codemodel".as_slice())
-        && let Some(codemodel) = reply.object(file)
+        && let Some(codemodel) = reply.object_of(file, "codemodel", "configurations")
     {
-        let msvc = data.toolchains.as_ref().is_some_and(|toolchains| {
-            toolchains
-                .iter()
-                .any(|toolchain| toolchain.frontend.as_deref().is_some_and(|f| f == b"MSVC"))
-        });
-        codemodel_targets(&mut reply, &codemodel, msvc, &mut data);
+        codemodel_targets(&mut reply, &codemodel, &mut data);
     }
     data.warnings.append(&mut reply.warnings);
     Some(data)
@@ -304,20 +360,23 @@ fn toolchain_entries(toolchains: &Value) -> Vec<ToolchainSnapshot> {
         .collect()
 }
 
-fn split(fragments: impl Iterator<Item = BString>, msvc: bool) -> Vec<BString> {
-    crate::compdb::group_pairs(fragments.flat_map(|fragment| {
-        Arguments::new(&fragment, msvc)
-            .take(65_536)
-            .collect::<Vec<_>>()
-    }))
+/// Split command fragments into tokens. Return `None` past the token limit.
+fn split(fragments: &[BString], windows: bool) -> Option<Vec<BString>> {
+    let mut tokens = Vec::new();
+    for fragment in fragments {
+        let room = MAX_FRAGMENT_TOKENS
+            .saturating_sub(tokens.len())
+            .saturating_add(1);
+        let before = tokens.len();
+        tokens.extend(Arguments::new(fragment, windows).take(room));
+        if tokens.len() - before >= room {
+            return None;
+        }
+    }
+    Some(crate::compdb::group_pairs(tokens))
 }
 
-fn codemodel_targets(
-    reply: &mut Reply<'_, '_>,
-    codemodel: &Value,
-    msvc: bool,
-    data: &mut FileApiData,
-) {
+fn codemodel_targets(reply: &mut Reply<'_, '_>, codemodel: &Value, data: &mut FileApiData) {
     data.source_root = text(codemodel.get("paths").and_then(|paths| paths.get("source")));
     let mut configs = Vec::new();
     let mut targets = BTreeMap::new();
@@ -340,7 +399,10 @@ fn codemodel_targets(
             else {
                 continue;
             };
-            let Some(target) = reply.object(&file) else {
+            let Some(target) = reply
+                .object(&file)
+                .filter(|target| target.get("name").is_some() && target.get("type").is_some())
+            else {
                 data.targets_partial = Some(
                     format!(
                         "Target {} has no readable reply file.",
@@ -353,7 +415,7 @@ fn codemodel_targets(
             let root = data.source_root.as_deref().map(|root| root.as_slice());
             targets.insert(
                 (config.clone(), name),
-                target_snapshot(&target, &names, msvc, root),
+                target_snapshot(&target, &names, root),
             );
         }
     }
@@ -381,44 +443,60 @@ fn source_path(path: BString, root: Option<&[u8]>) -> BString {
     }
 }
 
+/// Return whether `root` is a Windows path. The File API writes fragments with the
+/// quoting rules of the platform that generated them.
+fn windows_root(root: Option<&[u8]>) -> bool {
+    root.is_some_and(|root| matches!(root, [letter, b':', ..] if letter.is_ascii_alphabetic()))
+}
+
 fn target_snapshot(
     target: &Value,
     names: &HashMap<BString, BString>,
-    msvc: bool,
     root: Option<&[u8]>,
 ) -> TargetSnapshot {
-    let groups: Vec<CompileSettings> = items(target.get("compileGroups"))
+    let windows = windows_root(root);
+    let groups: Vec<Arc<CompileSettings>> = items(target.get("compileGroups"))
         .iter()
-        .map(|group| CompileSettings {
-            language: text(group.get("language")),
-            standard: text(
-                group
-                    .get("languageStandard")
-                    .and_then(|s| s.get("standard")),
-            ),
-            defines: items(group.get("defines"))
+        .map(|group| {
+            let raw: Vec<BString> = items(group.get("compileCommandFragments"))
                 .iter()
-                .filter_map(|define| text(define.get("define")))
-                .collect(),
-            includes: items(group.get("includes"))
-                .iter()
-                .filter_map(|include| {
-                    Some(IncludeDir {
-                        path: text(include.get("path"))?,
-                        system: include
-                            .get("isSystem")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    })
-                })
-                .collect(),
-            fragments: split(
-                items(group.get("compileCommandFragments"))
+                .filter_map(|fragment| text(fragment.get("fragment")))
+                .collect();
+            let (fragments, opaque) = match split(&raw, windows) {
+                Some(tokens) => (tokens, false),
+                None => (raw, true),
+            };
+            (group, fragments, opaque)
+        })
+        .map(|(group, fragments, opaque)| {
+            Arc::new(CompileSettings {
+                language: text(group.get("language")),
+                standard: text(
+                    group
+                        .get("languageStandard")
+                        .and_then(|s| s.get("standard")),
+                ),
+                defines: items(group.get("defines"))
                     .iter()
-                    .filter_map(|fragment| text(fragment.get("fragment"))),
-                msvc,
-            ),
-            opaque: false,
+                    .filter_map(|define| text(define.get("define")))
+                    .collect(),
+                includes: items(group.get("includes"))
+                    .iter()
+                    .filter_map(|include| {
+                        Some(IncludeDir {
+                            path: text(include.get("path"))?,
+                            system: include
+                                .get("isSystem")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        })
+                    })
+                    .collect(),
+                fragments,
+                opaque,
+                compiler: None,
+                launcher: Vec::new(),
+            })
         })
         .collect();
     let sources = items(target.get("sources"))
@@ -427,7 +505,7 @@ fn target_snapshot(
             let group = usize::try_from(source.get("compileGroupIndex")?.as_u64()?).ok()?;
             Some((
                 source_path(text(source.get("path"))?, root),
-                groups.get(group)?.clone(),
+                vec![Arc::clone(groups.get(group)?)],
             ))
         })
         .collect();

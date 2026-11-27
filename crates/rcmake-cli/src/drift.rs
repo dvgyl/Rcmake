@@ -9,8 +9,12 @@
 //! A later configure compares the current inputs with the receipt and warns
 //! about each changed field. The baseline advances only when the evidence is
 //! new: a fresh configure, or a compiler identification during this configure.
-//! A warm configure that loads saved detection results keeps the old baseline,
-//! so the drift stays visible until a fresh configure resolves it.
+//! `enable_language()` writes an identification record next to each compiler
+//! file that it identifies. The tracker removes old records before the configure
+//! runs, so a record at the end proves an identification in this configure. A
+//! warm configure that loads saved detection results, or that only rewrites a
+//! compiler file, keeps the old baseline. The drift stays visible until a
+//! configure identifies the compiler again.
 
 #![forbid(unsafe_code)]
 
@@ -21,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_host::{FileKind, Follow, Host, ReadRange, WriteMode, path};
+use rcmake_host::{FileKind, Follow, Host, ReadRange, path};
 use rcmake_json::{
     FieldError, FromJson, ReadOptions, ToJson, Value, deny_unknown, object, opt, parse, req,
     write_styled,
@@ -34,6 +38,7 @@ pub(crate) const RECEIPT: &str = "CMakeFiles/rcmake/toolchain-inputs-v1.json";
 const VERSION: u32 = 1;
 const RECEIPT_LIMIT: u64 = 1024 * 1024;
 const COMPILER_FILE_LIMIT: u64 = 1024 * 1024;
+const IDENTIFICATION_LIMIT: u64 = 4096;
 const READ_OPTIONS: ReadOptions = ReadOptions {
     allow_comments: false,
     dup_keys_last_wins: false,
@@ -313,8 +318,37 @@ fn compiler_language(name: &[u8]) -> Option<String> {
     .then(|| String::from_utf8_lossy(lang).into_owned())
 }
 
-/// Return the digests of the saved compiler files by language.
-pub(crate) fn evidence(host: &dyn Host, bin: &Path) -> BTreeMap<String, Option<Digest>> {
+/// Return the language name of a `CMake<LANG>Compiler.identification-v1.json` file name.
+fn identification_language(name: &[u8]) -> Option<String> {
+    let base = name.strip_suffix(b".identification-v1.json")?;
+    compiler_language(&[base, b".cmake"].concat())
+}
+
+/// One record that `enable_language()` wrote when it identified a compiler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Identification {
+    /// SHA-256 of the compiler file that the identification wrote.
+    evidence: Digest,
+}
+
+impl FromJson for Identification {
+    fn from_json(value: &Value) -> Result<Self, FieldError> {
+        let obj = object(value)?;
+        deny_unknown(obj, &["version", "evidence_sha256"])?;
+        let version: u32 = req(obj, "version")?;
+        if version != 1 {
+            return Err(FieldError::invalid(format!(
+                "unsupported version {version}"
+            )));
+        }
+        Ok(Self {
+            evidence: req(obj, "evidence_sha256")?,
+        })
+    }
+}
+
+/// The identification record files of `bin` by language, with their bytes.
+fn identification_files(host: &dyn Host, bin: &Path) -> BTreeMap<String, (PathBuf, Vec<u8>)> {
     let dir = platform_dir(bin);
     let Ok(entries) = host.read_dir(&dir) else {
         return BTreeMap::new();
@@ -323,14 +357,53 @@ pub(crate) fn evidence(host: &dyn Host, bin: &Path) -> BTreeMap<String, Option<D
         .into_iter()
         .filter(|entry| entry.kind == FileKind::File)
         .filter_map(|entry| {
-            let lang = compiler_language(&entry.name)?;
-            let bytes = read_bounded(
-                host,
-                &dir.join(path::to_native(&entry.name)),
-                COMPILER_FILE_LIMIT,
-            );
-            Some((lang, bytes.map(|bytes| Digest::hash(&bytes))))
+            let lang = identification_language(&entry.name)?;
+            let file = dir.join(path::to_native(&entry.name));
+            let bytes = read_bounded(host, &file, IDENTIFICATION_LIMIT)?;
+            Some((lang, (file, bytes)))
         })
+        .collect()
+}
+
+/// Remove the identification records of earlier configures.
+///
+/// Return the bytes of each record that could not be removed, so that it does
+/// not count as new evidence.
+fn clear_identifications(host: &dyn Host, bin: &Path) -> BTreeMap<String, Vec<u8>> {
+    identification_files(host, bin)
+        .into_iter()
+        .filter(|(_, (file, _))| {
+            host.remove_file(file)
+                .is_err_and(|error| error.kind != std::io::ErrorKind::NotFound)
+        })
+        .map(|(lang, (_, bytes))| (lang, bytes))
+        .collect()
+}
+
+/// Return the languages that this configure identified.
+///
+/// A language counts only if its record is not left from an earlier configure
+/// and still describes the compiler file that `current` loaded.
+fn identified_languages(
+    host: &dyn Host,
+    bin: &Path,
+    stale: &BTreeMap<String, Vec<u8>>,
+    current: &Facts,
+) -> BTreeSet<String> {
+    let records = identification_files(host, bin);
+    current
+        .languages
+        .iter()
+        .filter(|(lang, compiler)| {
+            records.get(*lang).is_some_and(|(_, bytes)| {
+                stale.get(*lang) != Some(bytes)
+                    && parse(bytes, &READ_OPTIONS)
+                        .ok()
+                        .and_then(|value| Identification::from_json(&value).ok())
+                        .is_some_and(|record| compiler.evidence == Some(record.evidence))
+            })
+        })
+        .map(|(lang, _)| lang.clone())
         .collect()
 }
 
@@ -358,7 +431,9 @@ fn compiler_file_values(text: &[u8]) -> BTreeMap<BString, BString> {
     values
 }
 
-/// Digests of tool files, computed once per configure.
+/// Digests of tool files for one collection.
+///
+/// Each phase makes a new memo, so a digest never outlives the phase that read it.
 #[derive(Default)]
 pub(crate) struct DigestMemo(RefCell<BTreeMap<PathBuf, Option<Digest>>>);
 
@@ -661,8 +736,8 @@ pub(crate) fn compare(previous: &Facts, current: &Facts, skip: &BTreeSet<String>
 /// Build the next baseline.
 ///
 /// `fresh` means the configure started without a cache. Each language in
-/// `identified` wrote new detection results during this configure. Other
-/// fields keep the previous baseline, so unresolved drift stays visible.
+/// `identified` has an identification record from this configure. Other fields
+/// keep the previous baseline, so unresolved drift stays visible.
 fn advance(
     previous: Option<&Facts>,
     mut current: Facts,
@@ -671,7 +746,7 @@ fn advance(
 ) -> Facts {
     let Some(previous) = previous.filter(|_| !fresh) else {
         for (lang, compiler) in &mut current.languages {
-            compiler.identified = fresh || identified.contains(lang);
+            compiler.identified = identified.contains(lang);
         }
         return current;
     };
@@ -704,8 +779,8 @@ pub(crate) struct Tracker {
     source: PathBuf,
     baseline: Baseline,
     prior_bytes: Option<Vec<u8>>,
-    evidence_before: BTreeMap<String, Option<Digest>>,
-    memo: DigestMemo,
+    /// Identification records of earlier configures that could not be removed.
+    stale_identifications: BTreeMap<String, Vec<u8>>,
     warned: RefCell<BTreeSet<String>>,
     fresh: Cell<bool>,
     pending: RefCell<Option<Receipt>>,
@@ -723,15 +798,20 @@ impl Tracker {
         )
     }
 
+    /// Whether drift tracking is enabled for this configure.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.host.is_some()
+    }
+
     fn new(
         host: Option<Arc<dyn Host>>,
         bin: &Path,
         source: &Path,
         (baseline, prior_bytes): (Baseline, Option<Vec<u8>>),
     ) -> Self {
-        let evidence_before = host
+        let stale_identifications = host
             .as_deref()
-            .map(|host| evidence(host, bin))
+            .map(|host| clear_identifications(host, bin))
             .unwrap_or_default();
         Self {
             finished: Cell::new(host.is_none()),
@@ -740,15 +820,15 @@ impl Tracker {
             source: source.to_owned(),
             baseline,
             prior_bytes,
-            evidence_before,
-            memo: DigestMemo::default(),
+            stale_identifications,
             warned: RefCell::new(BTreeSet::new()),
             fresh: Cell::new(false),
             pending: RefCell::new(None),
         }
     }
 
-    /// Read the receipt and the saved compiler files before any cache cleanup.
+    /// Read the receipt before any cache cleanup, and remove the identification
+    /// records of earlier configures.
     ///
     /// Return a disabled tracker for the compatibility persona, oracle mode, and
     /// cache views.
@@ -810,7 +890,7 @@ impl Tracker {
             );
         }
         if let Some(baseline) = self.baseline() {
-            let current = collect(host, &self.memo, &self.bin, cache);
+            let current = collect(host, &DigestMemo::default(), &self.bin, cache);
             self.warn(host, compare(baseline, &current, &BTreeSet::new()));
         }
     }
@@ -820,15 +900,9 @@ impl Tracker {
         let Some(host) = self.host.as_deref() else {
             return;
         };
-        let current = collect(host, &self.memo, &self.bin, cache);
-        let identified: BTreeSet<String> = current
-            .languages
-            .iter()
-            .filter(|(lang, compiler)| {
-                self.evidence_before.get(*lang).copied().flatten() != compiler.evidence
-            })
-            .map(|(lang, _)| lang.clone())
-            .collect();
+        let current = collect(host, &DigestMemo::default(), &self.bin, cache);
+        let identified =
+            identified_languages(host, &self.bin, &self.stale_identifications, &current);
         let fresh = self.fresh.get();
         if !fresh && let Some(baseline) = self.baseline() {
             self.warn(host, compare(baseline, &current, &identified));
@@ -851,20 +925,33 @@ impl Tracker {
             return;
         }
         let pending = self.pending.borrow_mut().take();
-        let bytes = match (success, pending) {
+        let file = receipt_path(&self.bin);
+        let (bytes, action) = match (success, pending) {
             (true, Some(receipt)) => {
                 let mut bytes: Vec<u8> = write_styled(&receipt.to_json(), "  ").into();
                 bytes.push(b'\n');
-                bytes
+                (bytes, "write")
             }
             _ => match &self.prior_bytes {
-                Some(bytes) if host.metadata(&receipt_path(&self.bin), Follow::No).is_err() => {
-                    bytes.clone()
+                Some(bytes) if host.metadata(&file, Follow::No).is_err() => {
+                    (bytes.clone(), "restore")
                 }
                 _ => return,
             },
         };
-        let _ = write_atomic(host, &receipt_path(&self.bin), &bytes);
+        let written = file
+            .parent()
+            .map_or(Ok(()), |dir| host.create_dir_all(dir))
+            .and_then(|()| crate::probe_cache::replace_file(host, &file, &bytes));
+        if let Err(error) = written {
+            crate::options::warn(
+                host,
+                &format!(
+                    "Cannot {action} the drift receipt {}: {error}",
+                    path::from_native_cmake(&file)
+                ),
+            );
+        }
     }
 }
 
@@ -872,19 +959,6 @@ impl Drop for Tracker {
     fn drop(&mut self) {
         self.finish(false);
     }
-}
-
-fn write_atomic(host: &dyn Host, file: &Path, bytes: &[u8]) -> rcmake_host::HostResult<()> {
-    let dir = file.parent().unwrap_or(Path::new("."));
-    host.create_dir_all(dir)?;
-    let temp = dir.join(format!(
-        ".toolchain-inputs-v1.json.{}.tmp",
-        host.system().pid
-    ));
-    host.write(&temp, bytes, WriteMode::Truncate)?;
-    host.rename(&temp, file).inspect_err(|_| {
-        let _ = host.remove_file(&temp);
-    })
 }
 
 // Doctor report.

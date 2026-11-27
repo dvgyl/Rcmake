@@ -30,7 +30,10 @@ use rcmake_json::{
 
 pub use digest::{Digest, Domain, KeyHasher};
 pub use gc::{GcReport, StoreStats, gc};
-pub use portable::{ExportSkips, ImportError, ImportReport, ImportTrust, ProbeBundle, ProbeExport};
+pub use portable::{
+    ArchiveLimits, ExportSkips, ImportError, ImportReport, ImportTrust, ProbeBundle, ProbeExport,
+    probe_payload_valid,
+};
 pub use private_dir::{PrivateDir, canonical_path, ensure_private_dir, verify_private_dir};
 pub use stamp::{
     FastStat, InputStamp, MissReason, Trace, TraceMemo, TreePolicy, VerifyOutcome,
@@ -427,6 +430,20 @@ impl<'a> Store<'a> {
         self.get_entry_with_blob_limit(domain, key, blob_limit())
     }
 
+    /// Read and verify an entry that also passes `accept`.
+    ///
+    /// `accept` runs on the decoded entry before any blob check or candidate
+    /// recovery. Use it for checks that depend on the caller, so an entry that
+    /// the caller cannot use never restores blobs. A rejected entry is a miss.
+    pub fn get_entry_accepted<T: FromJson>(
+        &self,
+        domain: Domain,
+        key: Digest,
+        accept: &dyn Fn(&Entry<T>) -> bool,
+    ) -> HostResult<Option<Entry<T>>> {
+        self.lookup_entry(domain, key, blob_limit(), false, accept)
+    }
+
     /// Read an entry and apply a byte limit to reference checks in verify mode.
     ///
     /// In verify mode, an oversized referenced blob causes a cache miss. In
@@ -437,7 +454,7 @@ impl<'a> Store<'a> {
         key: Digest,
         blob_limit: usize,
     ) -> HostResult<Option<Entry<T>>> {
-        self.lookup_entry(domain, key, blob_limit, false)
+        self.lookup_entry(domain, key, blob_limit, false, &|_| true)
     }
 
     /// Read an entry and report invalid cache data or a blocked path.
@@ -450,7 +467,7 @@ impl<'a> Store<'a> {
         key: Digest,
         blob_limit: usize,
     ) -> HostResult<Option<Entry<T>>> {
-        self.lookup_entry(domain, key, blob_limit, true)
+        self.lookup_entry(domain, key, blob_limit, true, &|_| true)
     }
 
     fn lookup_entry<T: FromJson>(
@@ -459,6 +476,7 @@ impl<'a> Store<'a> {
         key: Digest,
         blob_limit: usize,
         diagnose: bool,
+        accept: &dyn Fn(&Entry<T>) -> bool,
     ) -> HostResult<Option<Entry<T>>> {
         if !self.readable()? {
             return Ok(None);
@@ -470,6 +488,9 @@ impl<'a> Store<'a> {
         else {
             return Ok(None);
         };
+        if !accept(&entry) {
+            return Ok(None);
+        }
         if !self.entry_matches(&entry, blob_limit, diagnose)?
             && !(domain == Domain::ProbeV1
                 && self.recover_from_candidate(key, &entry)

@@ -222,8 +222,75 @@ fn compiler_shell(shell: &[u8]) -> &[u8] {
     shell
 }
 
+fn is_msvc_style_shell(shell: &[u8]) -> bool {
+    let mut rest = shell;
+    let mut word_index = 0usize;
+    while !rest.is_empty() {
+        rest = rest.trim_ascii_start();
+        if rest.is_empty() {
+            break;
+        }
+        let len = shell_word_len(rest);
+        let (raw_word, tail) = rest.split_at_checked(len).unwrap_or((rest, b""));
+        let word = raw_word
+            .strip_prefix(b"\"")
+            .and_then(|s| s.strip_suffix(b"\""))
+            .or_else(|| {
+                raw_word
+                    .strip_prefix(b"'")
+                    .and_then(|s| s.strip_suffix(b"'"))
+            })
+            .unwrap_or(raw_word);
+        if word_index < 2 {
+            let base = word
+                .rsplit(|&b| b == b'/' || b == b'\\')
+                .next()
+                .unwrap_or(word);
+            let stem = base
+                .strip_suffix(b".exe")
+                .or_else(|| base.strip_suffix(b".EXE"))
+                .unwrap_or(base);
+            if stem.eq_ignore_ascii_case(b"cl")
+                || stem.eq_ignore_ascii_case(b"clang-cl")
+                || stem.eq_ignore_ascii_case(b"icl")
+                || stem.eq_ignore_ascii_case(b"icx-cl")
+                || stem.eq_ignore_ascii_case(b"intel-cl")
+            {
+                return true;
+            }
+        }
+        if word.eq_ignore_ascii_case(b"/showIncludes")
+            || word.eq_ignore_ascii_case(b"-showIncludes")
+            || matches!(
+                word,
+                b"/nologo" | b"-nologo" | b"/MD" | b"/MDd" | b"/MT" | b"/MTd" | b"-MDd" | b"-MTd"
+            )
+            || word.starts_with(b"/Fo")
+            || word.starts_with(b"-Fo")
+            || word.starts_with(b"/Fd")
+            || word.starts_with(b"-Fd")
+            || word.starts_with(b"/Fe")
+            || word.starts_with(b"/Zc:")
+            || word.starts_with(b"/EH")
+        {
+            return true;
+        }
+        word_index += 1;
+        rest = tail;
+    }
+    false
+}
+
 fn compile_command<'a>(shell: &'a [u8], object_paths: Option<(&[u8], &[u8])>) -> Cow<'a, [u8]> {
-    if object_paths.is_none() && shell.find(b"-M").is_none() {
+    compile_command_with_depfiles(shell, object_paths, !is_msvc_style_shell(shell))
+}
+
+fn compile_command_with_depfiles<'a>(
+    shell: &'a [u8],
+    object_paths: Option<(&[u8], &[u8])>,
+    strip_gnu_depfiles: bool,
+) -> Cow<'a, [u8]> {
+    if object_paths.is_none() && (!strip_gnu_depfiles || shell.find(b"-M").is_none()) {
         return Cow::Borrowed(shell);
     }
     let mut command = Vec::with_capacity(shell.len());
@@ -234,8 +301,10 @@ fn compile_command<'a>(shell: &'a [u8], object_paths: Option<(&[u8], &[u8])>) ->
         let (word, following) = rest
             .split_at_checked(shell_word_len(rest))
             .unwrap_or((rest, b""));
-        if matches!(word, b"-MD" | b"-MMD" | b"-MT" | b"-MF") || skip_value {
-            skip_value = !skip_value && matches!(word, b"-MT" | b"-MF");
+        if strip_gnu_depfiles
+            && (matches!(word, b"-MD" | b"-MMD" | b"-MT" | b"-MF" | b"-MQ") || skip_value)
+        {
+            skip_value = !skip_value && matches!(word, b"-MT" | b"-MF" | b"-MQ");
             removed_depfile_flags = true;
             let spaces = following
                 .iter()
@@ -290,13 +359,29 @@ pub fn write_compile_commands(
     write_if_changed(host, &build_dir.join("compile_commands.json"), &content)
 }
 
-/// Strip `cmake -E __run_co_compile ... --` wrapper prefix and compiler depfile
-/// flags (`-MD`, `-MMD`, `-MT`, `-MF`) from a shell compile command.
+/// Strip `cmake -E __run_co_compile ... --` wrapper prefix and GNU/Clang depfile
+/// flags (`-MD`, `-MMD`, `-MT`, `-MF`, `-MQ`) from a shell compile command while
+/// preserving MSVC runtime flags (`-MD`, `-MDd`, `-MT`, `-MTd`).
 #[must_use]
 pub fn clean_compile_shell(shell: &[u8]) -> BString {
     compile_command(compiler_shell(shell), None)
         .into_owned()
         .into()
+}
+
+/// Strip `cmake -E __run_co_compile ... --` wrapper prefix and optionally strip
+/// GNU/Clang depfile flags when `strip_gnu_depfiles` is `true` and the command
+/// does not target an MSVC-style compiler.
+#[must_use]
+pub fn clean_compile_shell_for_dialect(shell: &[u8], strip_gnu_depfiles: bool) -> BString {
+    let inner = compiler_shell(shell);
+    compile_command_with_depfiles(
+        inner,
+        None,
+        strip_gnu_depfiles && !is_msvc_style_shell(inner),
+    )
+    .into_owned()
+    .into()
 }
 
 pub(crate) fn json_string(out: &mut BString, value: &[u8]) {
@@ -621,5 +706,24 @@ mod tests {
             2,
             "{wmo_out}"
         );
+    }
+
+    #[test]
+    fn clean_compile_shell_preserves_msvc_runtime_flags() {
+        let msvc_md = b"C:/MSVC/bin/cl.exe /nologo -MD -DAPP=1 /c main.c /Fomain.obj";
+        assert_eq!(clean_compile_shell(msvc_md), msvc_md.as_slice());
+
+        let msvc_mt = b"\"C:/MSVC/bin/cl.exe\" -MT -DKEEP_ME=1 /c main.c /Fomain.obj";
+        assert_eq!(clean_compile_shell(msvc_mt), msvc_mt.as_slice());
+
+        let clang_cl = b"clang-cl.exe -MD -MT -DFOO=1 -c main.c";
+        assert_eq!(clean_compile_shell(clang_cl), clang_cl.as_slice());
+
+        let gnu = b"/usr/bin/cc -DFOO=1 -MD -MT main.c.o -MF main.c.o.d -o main.c.o -c main.c";
+        assert_eq!(
+            clean_compile_shell(gnu),
+            b"/usr/bin/cc -DFOO=1 -o main.c.o -c main.c".as_slice()
+        );
+        assert_eq!(clean_compile_shell_for_dialect(gnu, false), gnu.as_slice());
     }
 }

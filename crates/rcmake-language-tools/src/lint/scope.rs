@@ -30,7 +30,19 @@ use super::rules::{
     check_old_policy_call, classify_add_definitions, is_builtin_or_external_var,
     lookup_obsolete_command, parse_file_glob, parse_version_arg,
 };
-use super::{Finding, LintDependencies, LintLimits, WorkspaceReader};
+use super::{Finding, LintDependencies, LintLimits, LintResult, WorkspaceReader};
+
+const MAX_PROPAGATE_VARS: usize = 256;
+const MAX_ELSE_DEFINED: usize = 64;
+const MAX_GLOB_ORIGINS_PER_VAR: usize = 8;
+const MAX_MODULE_PATHS: usize = 32;
+
+#[derive(Clone, Copy, Debug)]
+struct ScopeBudget {
+    max_vars: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
 
 /// Abstract binding state for a variable in the 4-valued lattice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,8 +69,9 @@ impl BindingState {
 }
 
 /// Active `CMP0054` policy status for `fragile-if-expansion` guidance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Cmp0054State {
+    #[default]
     Unknown,
     Old,
     New,
@@ -84,7 +97,7 @@ struct GlobOrigin {
 }
 
 /// Abstract scope state propagated in source order through commands and includes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct ScopeState {
     bindings: BTreeMap<BString, BindingState>,
     /// Variables explicitly `unset(... CACHE)` in this scope.
@@ -107,55 +120,268 @@ struct ScopeState {
     build_type_guard_depth: usize,
     /// User-defined macro names (invoking them may dynamically bind variables in caller scope).
     defined_macros: BTreeSet<BString>,
-}
-
-impl Default for ScopeState {
-    fn default() -> Self {
-        Self {
-            bindings: BTreeMap::new(),
-            unset_cache_vars: BTreeSet::new(),
-            multi_config_vars: BTreeSet::new(),
-            glob_origins: BTreeMap::new(),
-            module_paths: Vec::new(),
-            project_source_dir: None,
-            cmp0054: Cmp0054State::Unknown,
-            effective_version: None,
-            single_config_guard_depth: 0,
-            build_type_guard_depth: 0,
-            defined_macros: BTreeSet::new(),
-        }
-    }
+    /// Tracked retained entries across all collections in this scope.
+    entries: usize,
+    /// Tracked retained bytes across all collections in this scope.
+    bytes: usize,
 }
 
 impl ScopeState {
-    fn set_var(&mut self, name: BString, state: BindingState, max_vars: usize) {
-        if self.bindings.len() < max_vars || self.bindings.contains_key(&name) {
-            self.bindings.insert(name.clone(), state);
+    fn usage(&self) -> (usize, usize) {
+        (self.entries, self.bytes)
+    }
+
+    fn shallow_scalars(&self) -> Self {
+        Self {
+            project_source_dir: self.project_source_dir.clone(),
+            cmp0054: self.cmp0054,
+            effective_version: self.effective_version.clone(),
+            single_config_guard_depth: self.single_config_guard_depth,
+            build_type_guard_depth: self.build_type_guard_depth,
+            ..Self::default()
         }
-        // Overwriting or unsetting a variable kills any prior unguarded glob origin on it!
-        self.glob_origins.remove(&name);
     }
 
-    fn set_definite(&mut self, name: impl Into<BString>, max_vars: usize) {
+    fn can_fit(&self, added_entries: usize, added_bytes: usize, budget: ScopeBudget) -> bool {
+        self.entries.saturating_add(added_entries) <= budget.max_entries
+            && self.bytes.saturating_add(added_bytes) <= budget.max_bytes
+    }
+
+    fn insert_binding(
+        &mut self,
+        name: BString,
+        state: BindingState,
+        budget: ScopeBudget,
+        truncated: &mut bool,
+    ) {
+        if let Some(existing) = self.bindings.get_mut(&name) {
+            *existing = state;
+            return;
+        }
+        let added_bytes = name.len();
+        if self.bindings.len() < budget.max_vars && self.can_fit(1, added_bytes, budget) {
+            self.bindings.insert(name, state);
+            self.entries = self.entries.saturating_add(1);
+            self.bytes = self.bytes.saturating_add(added_bytes);
+        } else {
+            *truncated = true;
+        }
+    }
+
+    fn set_var(
+        &mut self,
+        name: BString,
+        state: BindingState,
+        budget: ScopeBudget,
+        truncated: &mut bool,
+    ) {
+        // Overwriting or unsetting a variable kills any prior unguarded glob origin on it.
+        self.remove_glob_origins(&name);
+        self.insert_binding(name, state, budget, truncated);
+    }
+
+    fn set_definite(
+        &mut self,
+        name: impl Into<BString>,
+        budget: ScopeBudget,
+        truncated: &mut bool,
+    ) {
         let name = name.into();
-        self.unset_cache_vars.remove(&name);
-        self.set_var(name, BindingState::Definite, max_vars);
+        self.remove_unset_cache(&name);
+        self.set_var(name, BindingState::Definite, budget, truncated);
     }
 
-    fn set_absent(&mut self, name: impl Into<BString>, max_vars: usize) {
-        self.set_var(name.into(), BindingState::Absent, max_vars);
+    fn set_absent(&mut self, name: impl Into<BString>, budget: ScopeBudget, truncated: &mut bool) {
+        self.set_var(name.into(), BindingState::Absent, budget, truncated);
     }
 
-    /// After an unresolved dynamic effect (`set(${X} ...)`, unresolved `include()`,
-    /// `cmake_parse_arguments` with dynamic prefix, macro call, etc.), any `Absent`
-    /// variable may now have been bound dynamically, so widen `Absent` to `Unknown`.
-    fn widen_absent_to_unknown(&mut self) {
+    fn insert_unset_cache(&mut self, name: BString, budget: ScopeBudget, truncated: &mut bool) {
+        if self.unset_cache_vars.contains(&name) {
+            return;
+        }
+        let added_bytes = name.len();
+        if self.can_fit(1, added_bytes, budget) {
+            self.unset_cache_vars.insert(name);
+            self.entries = self.entries.saturating_add(1);
+            self.bytes = self.bytes.saturating_add(added_bytes);
+        } else {
+            *truncated = true;
+        }
+    }
+
+    fn remove_unset_cache(&mut self, name: &BString) {
+        if self.unset_cache_vars.remove(name) {
+            self.entries = self.entries.saturating_sub(1);
+            self.bytes = self.bytes.saturating_sub(name.len());
+        }
+    }
+
+    fn clear_unset_cache(&mut self) {
+        let count = self.unset_cache_vars.len();
+        let removed_bytes: usize = self.unset_cache_vars.iter().map(|k| k.len()).sum();
+        self.unset_cache_vars.clear();
+        self.entries = self.entries.saturating_sub(count);
+        self.bytes = self.bytes.saturating_sub(removed_bytes);
+    }
+
+    fn insert_multi_config(&mut self, name: BString, budget: ScopeBudget, truncated: &mut bool) {
+        if self.multi_config_vars.contains(&name) {
+            return;
+        }
+        let added_bytes = name.len();
+        if self.can_fit(1, added_bytes, budget) {
+            self.multi_config_vars.insert(name);
+            self.entries = self.entries.saturating_add(1);
+            self.bytes = self.bytes.saturating_add(added_bytes);
+        } else {
+            *truncated = true;
+        }
+    }
+
+    fn insert_defined_macro(&mut self, name: BString, budget: ScopeBudget, truncated: &mut bool) {
+        if self.defined_macros.contains(&name) {
+            return;
+        }
+        let added_bytes = name.len();
+        if self.can_fit(1, added_bytes, budget) {
+            self.defined_macros.insert(name);
+            self.entries = self.entries.saturating_add(1);
+            self.bytes = self.bytes.saturating_add(added_bytes);
+        } else {
+            *truncated = true;
+        }
+    }
+
+    fn remove_glob_origins(&mut self, name: &BString) {
+        if let Some(removed) = self.glob_origins.remove(name) {
+            let count = removed.len();
+            let origin_bytes: usize = removed.iter().map(|o| o.var_name.len()).sum();
+            self.entries = self.entries.saturating_sub(count);
+            self.bytes = self
+                .bytes
+                .saturating_sub(name.len().saturating_add(origin_bytes));
+        }
+    }
+
+    fn clear_glob_origins(&mut self) {
+        let mut count = 0usize;
+        let mut removed_bytes = 0usize;
+        for (k, origins) in &self.glob_origins {
+            count = count.saturating_add(origins.len());
+            removed_bytes = removed_bytes.saturating_add(k.len());
+            for origin in origins {
+                removed_bytes = removed_bytes.saturating_add(origin.var_name.len());
+            }
+        }
+        self.glob_origins.clear();
+        self.entries = self.entries.saturating_sub(count);
+        self.bytes = self.bytes.saturating_sub(removed_bytes);
+    }
+
+    fn add_glob_origin(
+        &mut self,
+        var: BString,
+        origin: GlobOrigin,
+        budget: ScopeBudget,
+        truncated: &mut bool,
+    ) {
+        if let Some(slot) = self.glob_origins.get(&var) {
+            if slot.contains(&origin) || slot.len() >= MAX_GLOB_ORIGINS_PER_VAR {
+                return;
+            }
+            let added_bytes = origin.var_name.len();
+            if self.can_fit(1, added_bytes, budget) {
+                if let Some(slot_mut) = self.glob_origins.get_mut(&var) {
+                    slot_mut.push(origin);
+                    self.entries = self.entries.saturating_add(1);
+                    self.bytes = self.bytes.saturating_add(added_bytes);
+                }
+            } else {
+                *truncated = true;
+            }
+        } else {
+            let added_bytes = var.len().saturating_add(origin.var_name.len());
+            if self.can_fit(1, added_bytes, budget) {
+                self.glob_origins.insert(var, vec![origin]);
+                self.entries = self.entries.saturating_add(1);
+                self.bytes = self.bytes.saturating_add(added_bytes);
+            } else {
+                *truncated = true;
+            }
+        }
+    }
+
+    fn clear_module_paths(&mut self) {
+        let count = self.module_paths.len();
+        let removed_bytes: usize = self.module_paths.iter().map(|p| p.as_os_str().len()).sum();
+        self.module_paths.clear();
+        self.entries = self.entries.saturating_sub(count);
+        self.bytes = self.bytes.saturating_sub(removed_bytes);
+    }
+
+    fn push_module_path(
+        &mut self,
+        path: PathBuf,
+        budget: ScopeBudget,
+        truncated: &mut bool,
+    ) -> bool {
+        if self.module_paths.len() >= MAX_MODULE_PATHS {
+            return false;
+        }
+        let added_bytes = path.as_os_str().len();
+        if self.can_fit(1, added_bytes, budget) {
+            self.module_paths.push(path);
+            self.entries = self.entries.saturating_add(1);
+            self.bytes = self.bytes.saturating_add(added_bytes);
+            true
+        } else {
+            *truncated = true;
+            false
+        }
+    }
+
+    /// Conservatively invalidate scope facts after an unresolved dynamic effect
+    /// (`set(${X} ...)`, unresolved `include()`, macro invocation, etc.).
+    ///
+    /// Any `Absent` variable may now have been bound dynamically, and any active
+    /// `file(GLOB)` variable may have been overwritten, so widen `Absent -> Unknown`
+    /// and clear tracked unset-cache and glob-origin facts.
+    fn widen_unknown_scope_effect(&mut self) {
         for state in self.bindings.values_mut() {
             if *state == BindingState::Absent {
                 *state = BindingState::Unknown;
             }
         }
-        self.unset_cache_vars.clear();
+        self.clear_unset_cache();
+        self.clear_glob_origins();
+    }
+
+    /// Conservatively invalidate only bindings/globs under `prefix_` (for
+    /// `cmake_parse_arguments` with a known prefix and dynamic keyword list).
+    fn widen_prefix_scope_effect(&mut self, prefix_with_underscore: &[u8]) {
+        for (k, state) in &mut self.bindings {
+            if k.as_slice().starts_with(prefix_with_underscore) && *state == BindingState::Absent {
+                *state = BindingState::Unknown;
+            }
+        }
+        let drop_cache: Vec<BString> = self
+            .unset_cache_vars
+            .iter()
+            .filter(|k| k.as_slice().starts_with(prefix_with_underscore))
+            .cloned()
+            .collect();
+        for k in drop_cache {
+            self.remove_unset_cache(&k);
+        }
+        let drop_globs: Vec<BString> = self
+            .glob_origins
+            .keys()
+            .filter(|k| k.as_slice().starts_with(prefix_with_underscore))
+            .cloned()
+            .collect();
+        for k in drop_globs {
+            self.remove_glob_origins(&k);
+        }
     }
 
     fn visible_bound_names(&self) -> Vec<&[u8]> {
@@ -167,89 +393,63 @@ impl ScopeState {
             .collect()
     }
 
-    fn join_branches(branches: &[Self], max_vars: usize) -> Self {
-        let Some(first) = branches.first() else {
-            return Self::default();
-        };
-        if branches.len() == 1 {
-            return first.clone();
-        }
-
-        let mut all_keys = BTreeSet::new();
-        for branch in branches {
-            for key in branch.bindings.keys() {
-                if all_keys.len() >= max_vars {
-                    break;
-                }
-                all_keys.insert(key.clone());
-            }
-        }
-
-        let mut joined = first.clone();
-        joined.bindings.clear();
-        for key in all_keys {
-            let mut acc: Option<BindingState> = None;
-            for branch in branches {
-                let st = branch
-                    .bindings
-                    .get(&key)
-                    .copied()
-                    .unwrap_or(BindingState::Unknown);
-                acc = Some(match acc {
-                    None => st,
-                    Some(prev) => prev.join(st),
-                });
-            }
-            if let Some(st) = acc {
-                joined.bindings.insert(key, st);
-            }
-        }
-
-        // Unset cache vars: only still unset if unset on ALL branches.
-        joined.unset_cache_vars = first
-            .unset_cache_vars
-            .iter()
-            .filter(|k| {
-                branches
-                    .iter()
-                    .skip(1)
-                    .all(|b| b.unset_cache_vars.contains(*k))
-            })
-            .cloned()
-            .collect();
-
-        // Multi-config vars: union (conservatively recognize guard vars bound on any branch).
-        for branch in branches.iter().skip(1) {
-            joined
-                .multi_config_vars
-                .extend(branch.multi_config_vars.iter().cloned());
-            joined
-                .defined_macros
-                .extend(branch.defined_macros.iter().cloned());
-        }
-
-        // Glob origins: union across reaching branches (if any path reaches a target with an
-        // unguarded glob without overwriting it, the def-use chain is still live; if ALL
-        // branches overwrite the variable, none contain it so it is cleared!).
-        let mut joined_globs: BTreeMap<BString, Vec<GlobOrigin>> = BTreeMap::new();
-        for branch in branches {
-            for (var, origins) in &branch.glob_origins {
-                let slot = joined_globs.entry(var.clone()).or_default();
-                for origin in origins {
-                    if !slot.contains(origin) && slot.len() < 8 {
-                        slot.push(origin.clone());
-                    }
-                }
-            }
-        }
-        joined.glob_origins = joined_globs;
-
-        // CMP0054: keep New only if New on all branches.
-        if !branches.iter().all(|b| b.cmp0054 == Cmp0054State::New) {
-            if branches.iter().all(|b| b.cmp0054 == Cmp0054State::Old) {
-                joined.cmp0054 = Cmp0054State::Old;
+    /// Incrementally join two reaching branch states under `budget`.
+    fn join_two(left: Self, right: Self, budget: ScopeBudget, truncated: &mut bool) -> Self {
+        let mut joined = Self {
+            project_source_dir: left.project_source_dir,
+            cmp0054: if left.cmp0054 == right.cmp0054 {
+                left.cmp0054
             } else {
-                joined.cmp0054 = Cmp0054State::Unknown;
+                Cmp0054State::Unknown
+            },
+            effective_version: left.effective_version,
+            single_config_guard_depth: left.single_config_guard_depth,
+            build_type_guard_depth: left.build_type_guard_depth,
+            ..Self::default()
+        };
+
+        for path in left.module_paths {
+            joined.push_module_path(path, budget, truncated);
+        }
+
+        for (key, st_left) in left.bindings {
+            let st_right = right
+                .bindings
+                .get(&key)
+                .copied()
+                .unwrap_or(BindingState::Unknown);
+            joined.insert_binding(key, st_left.join(st_right), budget, truncated);
+        }
+        for (key, st_right) in right.bindings {
+            if !joined.bindings.contains_key(&key) {
+                joined.insert_binding(key, BindingState::Unknown.join(st_right), budget, truncated);
+            }
+        }
+
+        // Unset cache vars stay unset only when unset on both branches.
+        for key in left.unset_cache_vars {
+            if right.unset_cache_vars.contains(&key) {
+                joined.insert_unset_cache(key, budget, truncated);
+            }
+        }
+
+        for key in left
+            .multi_config_vars
+            .into_iter()
+            .chain(right.multi_config_vars)
+        {
+            joined.insert_multi_config(key, budget, truncated);
+        }
+
+        for key in left.defined_macros.into_iter().chain(right.defined_macros) {
+            joined.insert_defined_macro(key, budget, truncated);
+        }
+
+        // Glob origins: union across reaching branches so any un-overwritten glob path stays live,
+        // while overwriting on all branches clears it.
+        for (var, origins) in left.glob_origins.into_iter().chain(right.glob_origins) {
+            for origin in origins {
+                joined.add_glob_origin(var.clone(), origin, budget, truncated);
             }
         }
 
@@ -260,8 +460,9 @@ impl ScopeState {
 enum ControlFrame {
     If {
         pre_state: ScopeState,
-        completed_branches: Vec<ScopeState>,
+        joined_branches: Option<Box<ScopeState>>,
         has_else: bool,
+        degraded: bool,
         /// Negated guards from the opening `if` for `else()`.
         else_defined: Vec<BString>,
         else_single_config: bool,
@@ -283,6 +484,42 @@ enum ControlFrame {
     },
 }
 
+impl ControlFrame {
+    fn usage(&self) -> (usize, usize) {
+        match self {
+            Self::If {
+                pre_state,
+                joined_branches,
+                else_defined,
+                ..
+            } => {
+                let (pe, pb) = pre_state.usage();
+                let (je, jb) = joined_branches.as_deref().map_or((0, 0), ScopeState::usage);
+                let ed_bytes: usize = else_defined.iter().map(|s| s.len()).sum();
+                (
+                    pe.saturating_add(je).saturating_add(else_defined.len()),
+                    pb.saturating_add(jb).saturating_add(ed_bytes),
+                )
+            }
+            Self::Loop { pre_state } | Self::Function { pre_state } | Self::Macro { pre_state } => {
+                pre_state.usage()
+            }
+            Self::Block {
+                pre_state,
+                propagate_vars,
+                ..
+            } => {
+                let (pe, pb) = pre_state.usage();
+                let prop_bytes: usize = propagate_vars.iter().map(|s| s.len()).sum();
+                (
+                    pe.saturating_add(propagate_vars.len()),
+                    pb.saturating_add(prop_bytes),
+                )
+            }
+        }
+    }
+}
+
 pub(crate) struct Analyzer<'a> {
     primary_path: &'a Path,
     primary_src: &'a [u8],
@@ -295,11 +532,18 @@ pub(crate) struct Analyzer<'a> {
     state: ScopeState,
     mode: ExecutionMode,
     findings: Vec<Finding>,
+    findings_truncated: bool,
+    scope_truncated: bool,
     emitted_glob_sites: BTreeSet<usize>,
     dependencies: LintDependencies,
+    probed_misses: usize,
     active_includes: BTreeSet<PathBuf>,
     include_files_read: usize,
     include_bytes_read: usize,
+    active_flow_depth: usize,
+    frame_entries: usize,
+    frame_bytes: usize,
+    scope_ops: usize,
 }
 
 impl<'a> Analyzer<'a> {
@@ -314,8 +558,9 @@ impl<'a> Analyzer<'a> {
         workspace_root: Option<&'a Path>,
     ) -> Self {
         let mode = infer_initial_mode(primary_path, &concrete.list_file.commands);
-        let primary_directives = DirectiveMap::parse(primary_src, concrete);
+        let primary_directives = DirectiveMap::parse(primary_src, concrete, limits.max_findings);
         let primary_lines = LineIndex::new(primary_src);
+        let findings_truncated = primary_directives.issues_truncated;
         Self {
             primary_path,
             primary_src,
@@ -328,17 +573,89 @@ impl<'a> Analyzer<'a> {
             state: ScopeState::default(),
             mode,
             findings: Vec::new(),
+            findings_truncated,
+            scope_truncated: false,
             emitted_glob_sites: BTreeSet::new(),
             dependencies: LintDependencies::default(),
+            probed_misses: 0,
             active_includes: BTreeSet::new(),
             include_files_read: 0,
             include_bytes_read: 0,
+            active_flow_depth: 0,
+            frame_entries: 0,
+            frame_bytes: 0,
+            scope_ops: 0,
         }
     }
 
-    pub(crate) fn run(mut self, concrete: &ConcreteListFile) -> (Vec<Finding>, LintDependencies) {
-        // Emit any unknown/malformed `# rcmake-lint:` directive diagnostics first.
+    fn state_budget(&self) -> ScopeBudget {
+        ScopeBudget {
+            max_vars: self.limits.max_vars,
+            max_entries: self
+                .limits
+                .max_total_scope_entries
+                .saturating_sub(self.frame_entries),
+            max_bytes: self
+                .limits
+                .max_total_scope_bytes
+                .saturating_sub(self.frame_bytes),
+        }
+    }
+
+    fn max_scope_ops(&self) -> usize {
+        self.limits
+            .max_total_scope_entries
+            .saturating_mul(16)
+            .max(65_536)
+    }
+
+    fn can_retain_clone(
+        &self,
+        state: &ScopeState,
+        extra_entries: usize,
+        extra_bytes: usize,
+    ) -> bool {
+        let (se, sb) = state.usage();
+        let (ce, cb) = self.state.usage();
+        let next_entries = self
+            .frame_entries
+            .saturating_add(ce)
+            .saturating_add(se)
+            .saturating_add(extra_entries);
+        let next_bytes = self
+            .frame_bytes
+            .saturating_add(cb)
+            .saturating_add(sb)
+            .saturating_add(extra_bytes);
+        let next_ops = self.scope_ops.saturating_add(se.max(1));
+        next_entries <= self.limits.max_total_scope_entries
+            && next_bytes <= self.limits.max_total_scope_bytes
+            && next_ops <= self.max_scope_ops()
+    }
+
+    fn push_frame(&mut self, frames: &mut Vec<ControlFrame>, frame: ControlFrame) {
+        let (fe, fb) = frame.usage();
+        self.frame_entries = self.frame_entries.saturating_add(fe);
+        self.frame_bytes = self.frame_bytes.saturating_add(fb);
+        self.active_flow_depth = self.active_flow_depth.saturating_add(1);
+        frames.push(frame);
+    }
+
+    fn pop_frame(&mut self, frames: &mut Vec<ControlFrame>) -> Option<ControlFrame> {
+        let frame = frames.pop()?;
+        let (fe, fb) = frame.usage();
+        self.frame_entries = self.frame_entries.saturating_sub(fe);
+        self.frame_bytes = self.frame_bytes.saturating_sub(fb);
+        self.active_flow_depth = self.active_flow_depth.saturating_sub(1);
+        Some(frame)
+    }
+
+    pub(crate) fn run(mut self, concrete: &ConcreteListFile) -> LintResult {
         for issue in &self.primary_directives.issues {
+            if self.findings.len() >= self.limits.max_findings {
+                self.findings_truncated = true;
+                break;
+            }
             let (start, end) = self
                 .primary_lines
                 .span_coords(self.primary_src, issue.span.clone());
@@ -366,7 +683,12 @@ impl<'a> Analyzer<'a> {
             true,
             0,
         );
-        (self.findings, self.dependencies)
+        LintResult {
+            findings: self.findings,
+            dependencies: self.dependencies,
+            findings_truncated: self.findings_truncated,
+            scope_truncated: self.scope_truncated,
+        }
     }
 
     fn emit(
@@ -384,6 +706,7 @@ impl<'a> Analyzer<'a> {
             return;
         }
         if self.findings.len() >= self.limits.max_findings {
+            self.findings_truncated = true;
             return;
         }
         let severity = self.config.effective_severity(rule);
@@ -414,219 +737,395 @@ impl<'a> Analyzer<'a> {
         include_depth: usize,
     ) {
         let mut frames: Vec<ControlFrame> = Vec::new();
-        let max_vars = self.limits.max_vars;
+        let mut untracked_depth = 0usize;
 
         for (cmd_idx, cmd) in commands.iter().enumerate() {
             let lower = cmd.lower.as_slice();
 
-            // 1. Check variable references in expansion positions for `undefined-variable`
-            //    (before updating scope with this command's own outputs!).
+            // Check variable reads and glob consumers before applying this command's outputs.
             if is_primary {
                 self.check_undefined_variables(cmd_idx, cmd, src);
             }
-
-            // 2. Check target source consumers for active unguarded `file(GLOB)` def-use chains.
             self.check_glob_consumers(cmd, src);
 
-            // 3. Handle flow-control scope transitions & condition rules.
-            match lower {
-                b"if" => {
-                    let cond = analyze_if_condition(&cmd.args, src, &self.state.multi_config_vars);
-                    if is_primary {
-                        self.emit_condition_rules(cmd_idx, &cond);
-                    }
-                    let pre_state = self.state.clone();
-                    for name in &cond.defined_when_true {
-                        self.state.set_definite(name.clone(), max_vars);
-                    }
-                    if cond.single_config_when_true {
-                        self.state.single_config_guard_depth += 1;
-                    }
-                    if cond.guards_build_type_init {
-                        self.state.build_type_guard_depth += 1;
-                    }
-                    frames.push(ControlFrame::If {
-                        pre_state,
-                        completed_branches: Vec::new(),
-                        has_else: false,
-                        else_defined: cond.defined_when_false,
-                        else_single_config: cond.single_config_when_false,
-                    });
-                    continue;
-                }
-                b"elseif" => {
-                    if let Some(ControlFrame::If {
-                        pre_state,
-                        completed_branches,
-                        else_defined,
-                        else_single_config,
-                        ..
-                    }) = frames.last_mut()
-                    {
-                        completed_branches.push(self.state.clone());
-                        self.state = pre_state.clone();
-                        // Negate prior branch guarantees that could become invalid on elseif.
-                        else_defined.clear();
-                        *else_single_config = false;
-                    }
-                    let cond = analyze_if_condition(&cmd.args, src, &self.state.multi_config_vars);
-                    if is_primary {
-                        self.emit_condition_rules(cmd_idx, &cond);
-                    }
-                    for name in &cond.defined_when_true {
-                        self.state.set_definite(name.clone(), max_vars);
-                    }
-                    if cond.single_config_when_true {
-                        self.state.single_config_guard_depth += 1;
-                    }
-                    if cond.guards_build_type_init {
-                        self.state.build_type_guard_depth += 1;
-                    }
-                    continue;
-                }
-                b"else" => {
-                    if let Some(ControlFrame::If {
-                        pre_state,
-                        completed_branches,
-                        has_else,
-                        else_defined,
-                        else_single_config,
-                    }) = frames.last_mut()
-                    {
-                        completed_branches.push(self.state.clone());
-                        *has_else = true;
-                        self.state = pre_state.clone();
-                        for name in else_defined.iter() {
-                            self.state.set_definite(name.clone(), max_vars);
+            if untracked_depth > 0 {
+                match lower {
+                    b"if" => {
+                        let cond =
+                            analyze_if_condition(&cmd.args, src, &self.state.multi_config_vars);
+                        if is_primary {
+                            self.emit_condition_rules(cmd_idx, &cond);
                         }
-                        if *else_single_config {
+                        untracked_depth = untracked_depth.saturating_add(1);
+                        continue;
+                    }
+                    b"elseif" => {
+                        let cond =
+                            analyze_if_condition(&cmd.args, src, &self.state.multi_config_vars);
+                        if is_primary {
+                            self.emit_condition_rules(cmd_idx, &cond);
+                        }
+                        self.state.widen_unknown_scope_effect();
+                        continue;
+                    }
+                    b"else" => {
+                        self.state.widen_unknown_scope_effect();
+                        continue;
+                    }
+                    b"foreach" | b"while" | b"function" | b"macro" | b"block" => {
+                        untracked_depth = untracked_depth.saturating_add(1);
+                        continue;
+                    }
+                    b"endif" | b"endforeach" | b"endwhile" | b"endfunction" | b"endmacro"
+                    | b"endblock" => {
+                        untracked_depth -= 1;
+                        if untracked_depth == 0 {
+                            self.state.widen_unknown_scope_effect();
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            } else {
+                match lower {
+                    b"if" => {
+                        let cond =
+                            analyze_if_condition(&cmd.args, src, &self.state.multi_config_vars);
+                        if is_primary {
+                            self.emit_condition_rules(cmd_idx, &cond);
+                        }
+                        let mut else_defined = cond.defined_when_false;
+                        else_defined.truncate(MAX_ELSE_DEFINED);
+                        let extra_entries = else_defined.len();
+                        let extra_bytes: usize = else_defined.iter().map(|s| s.len()).sum();
+                        if self.active_flow_depth < self.limits.max_flow_depth
+                            && self.can_retain_clone(&self.state, extra_entries, extra_bytes)
+                        {
+                            self.scope_ops =
+                                self.scope_ops.saturating_add(self.state.entries.max(1));
+                            let pre_state = self.state.clone();
+                            self.push_frame(
+                                &mut frames,
+                                ControlFrame::If {
+                                    pre_state,
+                                    joined_branches: None,
+                                    has_else: false,
+                                    degraded: false,
+                                    else_defined,
+                                    else_single_config: cond.single_config_when_false,
+                                },
+                            );
+                            let budget = self.state_budget();
+                            for name in &cond.defined_when_true {
+                                self.state.set_definite(
+                                    name.clone(),
+                                    budget,
+                                    &mut self.scope_truncated,
+                                );
+                            }
+                            if cond.single_config_when_true {
+                                self.state.single_config_guard_depth += 1;
+                            }
+                            if cond.guards_build_type_init {
+                                self.state.build_type_guard_depth += 1;
+                            }
+                        } else {
+                            self.scope_truncated = true;
+                            self.state.widen_unknown_scope_effect();
+                            untracked_depth = 1;
+                        }
+                        continue;
+                    }
+                    b"elseif" => {
+                        self.transition_if_branch(&mut frames, false);
+                        let cond =
+                            analyze_if_condition(&cmd.args, src, &self.state.multi_config_vars);
+                        if is_primary {
+                            self.emit_condition_rules(cmd_idx, &cond);
+                        }
+                        let budget = self.state_budget();
+                        for name in &cond.defined_when_true {
+                            self.state.set_definite(
+                                name.clone(),
+                                budget,
+                                &mut self.scope_truncated,
+                            );
+                        }
+                        if cond.single_config_when_true {
                             self.state.single_config_guard_depth += 1;
                         }
-                    }
-                    continue;
-                }
-                b"endif" => {
-                    if let Some(ControlFrame::If {
-                        pre_state,
-                        mut completed_branches,
-                        has_else,
-                        ..
-                    }) = frames.pop()
-                    {
-                        let base_sc = pre_state.single_config_guard_depth;
-                        let base_bt = pre_state.build_type_guard_depth;
-                        completed_branches.push(self.state.clone());
-                        if !has_else {
-                            completed_branches.push(pre_state);
+                        if cond.guards_build_type_init {
+                            self.state.build_type_guard_depth += 1;
                         }
-                        self.state = ScopeState::join_branches(&completed_branches, max_vars);
-                        self.state.single_config_guard_depth = base_sc;
-                        self.state.build_type_guard_depth = base_bt;
+                        continue;
                     }
-                    continue;
-                }
-                b"foreach" => {
-                    let pre_state = self.state.clone();
-                    bind_foreach_vars(cmd, &mut self.state, max_vars);
-                    frames.push(ControlFrame::Loop { pre_state });
-                    continue;
-                }
-                b"while" => {
-                    let pre_state = self.state.clone();
-                    frames.push(ControlFrame::Loop { pre_state });
-                    continue;
-                }
-                b"endforeach" | b"endwhile" => {
-                    if let Some(ControlFrame::Loop { pre_state }) = frames.pop() {
-                        let branches = [pre_state, self.state.clone()];
-                        self.state = ScopeState::join_branches(&branches, max_vars);
+                    b"else" => {
+                        self.transition_if_branch(&mut frames, true);
+                        continue;
                     }
-                    continue;
-                }
-                b"function" => {
-                    let pre_state = self.state.clone();
-                    bind_callable_params(cmd, true, &mut self.state, max_vars);
-                    frames.push(ControlFrame::Function { pre_state });
-                    continue;
-                }
-                b"endfunction" => {
-                    if let Some(ControlFrame::Function { pre_state }) = frames.pop() {
-                        self.state = pre_state;
-                    }
-                    continue;
-                }
-                b"macro" => {
-                    if let Some(name) = cmd.args.first()
-                        && !name.text.is_empty()
-                    {
-                        self.state
-                            .defined_macros
-                            .insert(BString::from(name.text.as_slice().to_ascii_lowercase()));
-                    }
-                    let pre_state = self.state.clone();
-                    bind_callable_params(cmd, false, &mut self.state, max_vars);
-                    frames.push(ControlFrame::Macro { pre_state });
-                    continue;
-                }
-                b"endmacro" => {
-                    if let Some(ControlFrame::Macro { pre_state }) = frames.pop() {
-                        self.state = pre_state;
-                    }
-                    continue;
-                }
-                b"block" => {
-                    let (isolate_vars, isolate_policies, propagate_vars) = parse_block_options(cmd);
-                    let pre_state = self.state.clone();
-                    frames.push(ControlFrame::Block {
-                        pre_state,
-                        isolate_vars,
-                        isolate_policies,
-                        propagate_vars,
-                    });
-                    continue;
-                }
-                b"endblock" => {
-                    if let Some(ControlFrame::Block {
-                        mut pre_state,
-                        isolate_vars,
-                        isolate_policies,
-                        propagate_vars,
-                    }) = frames.pop()
-                    {
-                        if !isolate_vars {
-                            pre_state.bindings = self.state.bindings.clone();
-                            pre_state.unset_cache_vars = self.state.unset_cache_vars.clone();
-                            pre_state.glob_origins = self.state.glob_origins.clone();
-                            pre_state.multi_config_vars = self.state.multi_config_vars.clone();
-                        } else {
-                            for var in &propagate_vars {
-                                if let Some(&st) = self.state.bindings.get(var) {
-                                    pre_state.bindings.insert(var.clone(), st);
+                    b"endif" => {
+                        if let Some(ControlFrame::If {
+                            mut pre_state,
+                            joined_branches,
+                            has_else,
+                            degraded,
+                            ..
+                        }) = self.pop_frame(&mut frames)
+                        {
+                            let base_sc = pre_state.single_config_guard_depth;
+                            let base_bt = pre_state.build_type_guard_depth;
+                            if degraded {
+                                pre_state.widen_unknown_scope_effect();
+                                self.state = pre_state;
+                            } else {
+                                let budget = self.state_budget();
+                                let current = std::mem::take(&mut self.state);
+                                let mut acc = match joined_branches {
+                                    None => current,
+                                    Some(prev) => {
+                                        let prev = *prev;
+                                        self.scope_ops = self.scope_ops.saturating_add(
+                                            prev.entries.max(current.entries).max(1),
+                                        );
+                                        ScopeState::join_two(
+                                            prev,
+                                            current,
+                                            budget,
+                                            &mut self.scope_truncated,
+                                        )
+                                    }
+                                };
+                                if !has_else {
+                                    self.scope_ops = self
+                                        .scope_ops
+                                        .saturating_add(acc.entries.max(pre_state.entries).max(1));
+                                    acc = ScopeState::join_two(
+                                        acc,
+                                        pre_state,
+                                        budget,
+                                        &mut self.scope_truncated,
+                                    );
                                 }
-                                if let Some(origins) = self.state.glob_origins.get(var) {
-                                    pre_state.glob_origins.insert(var.clone(), origins.clone());
-                                } else {
-                                    pre_state.glob_origins.remove(var);
+                                self.state = acc;
+                            }
+                            self.state.single_config_guard_depth = base_sc;
+                            self.state.build_type_guard_depth = base_bt;
+                        }
+                        continue;
+                    }
+                    b"foreach" => {
+                        if self.active_flow_depth < self.limits.max_flow_depth
+                            && self.can_retain_clone(&self.state, 0, 0)
+                        {
+                            self.scope_ops =
+                                self.scope_ops.saturating_add(self.state.entries.max(1));
+                            let pre_state = self.state.clone();
+                            self.push_frame(&mut frames, ControlFrame::Loop { pre_state });
+                            let budget = self.state_budget();
+                            bind_foreach_vars(
+                                cmd,
+                                &mut self.state,
+                                budget,
+                                &mut self.scope_truncated,
+                            );
+                        } else {
+                            self.scope_truncated = true;
+                            self.state.widen_unknown_scope_effect();
+                            untracked_depth = 1;
+                        }
+                        continue;
+                    }
+                    b"while" => {
+                        if self.active_flow_depth < self.limits.max_flow_depth
+                            && self.can_retain_clone(&self.state, 0, 0)
+                        {
+                            self.scope_ops =
+                                self.scope_ops.saturating_add(self.state.entries.max(1));
+                            let pre_state = self.state.clone();
+                            self.push_frame(&mut frames, ControlFrame::Loop { pre_state });
+                        } else {
+                            self.scope_truncated = true;
+                            self.state.widen_unknown_scope_effect();
+                            untracked_depth = 1;
+                        }
+                        continue;
+                    }
+                    b"endforeach" | b"endwhile" => {
+                        if let Some(ControlFrame::Loop { pre_state }) = self.pop_frame(&mut frames)
+                        {
+                            let budget = self.state_budget();
+                            let current = std::mem::take(&mut self.state);
+                            self.scope_ops = self
+                                .scope_ops
+                                .saturating_add(pre_state.entries.max(current.entries).max(1));
+                            self.state = ScopeState::join_two(
+                                pre_state,
+                                current,
+                                budget,
+                                &mut self.scope_truncated,
+                            );
+                        }
+                        continue;
+                    }
+                    b"function" => {
+                        if self.active_flow_depth < self.limits.max_flow_depth
+                            && self.can_retain_clone(&self.state, 0, 0)
+                        {
+                            self.scope_ops =
+                                self.scope_ops.saturating_add(self.state.entries.max(1));
+                            let pre_state = self.state.clone();
+                            self.push_frame(&mut frames, ControlFrame::Function { pre_state });
+                            let budget = self.state_budget();
+                            bind_callable_params(
+                                cmd,
+                                true,
+                                &mut self.state,
+                                budget,
+                                &mut self.scope_truncated,
+                            );
+                        } else {
+                            self.scope_truncated = true;
+                            self.state.widen_unknown_scope_effect();
+                            untracked_depth = 1;
+                        }
+                        continue;
+                    }
+                    b"endfunction" => {
+                        if let Some(ControlFrame::Function { pre_state }) =
+                            self.pop_frame(&mut frames)
+                        {
+                            self.state = pre_state;
+                        }
+                        continue;
+                    }
+                    b"macro" => {
+                        if let Some(name) = cmd.args.first()
+                            && !name.text.is_empty()
+                        {
+                            let budget = self.state_budget();
+                            self.state.insert_defined_macro(
+                                BString::from(name.text.as_slice().to_ascii_lowercase()),
+                                budget,
+                                &mut self.scope_truncated,
+                            );
+                        }
+                        if self.active_flow_depth < self.limits.max_flow_depth
+                            && self.can_retain_clone(&self.state, 0, 0)
+                        {
+                            self.scope_ops =
+                                self.scope_ops.saturating_add(self.state.entries.max(1));
+                            let pre_state = self.state.clone();
+                            self.push_frame(&mut frames, ControlFrame::Macro { pre_state });
+                            let budget = self.state_budget();
+                            bind_callable_params(
+                                cmd,
+                                false,
+                                &mut self.state,
+                                budget,
+                                &mut self.scope_truncated,
+                            );
+                        } else {
+                            self.scope_truncated = true;
+                            self.state.widen_unknown_scope_effect();
+                            untracked_depth = 1;
+                        }
+                        continue;
+                    }
+                    b"endmacro" => {
+                        if let Some(ControlFrame::Macro { pre_state }) = self.pop_frame(&mut frames)
+                        {
+                            self.state = pre_state;
+                        }
+                        continue;
+                    }
+                    b"block" => {
+                        let (isolate_vars, isolate_policies, mut propagate_vars) =
+                            parse_block_options(cmd);
+                        if propagate_vars.len() > MAX_PROPAGATE_VARS {
+                            propagate_vars.truncate(MAX_PROPAGATE_VARS);
+                            self.scope_truncated = true;
+                        }
+                        let extra_entries = propagate_vars.len();
+                        let extra_bytes: usize = propagate_vars.iter().map(|s| s.len()).sum();
+                        if self.active_flow_depth < self.limits.max_flow_depth
+                            && self.can_retain_clone(&self.state, extra_entries, extra_bytes)
+                        {
+                            self.scope_ops =
+                                self.scope_ops.saturating_add(self.state.entries.max(1));
+                            let pre_state = self.state.clone();
+                            self.push_frame(
+                                &mut frames,
+                                ControlFrame::Block {
+                                    pre_state,
+                                    isolate_vars,
+                                    isolate_policies,
+                                    propagate_vars,
+                                },
+                            );
+                        } else {
+                            self.scope_truncated = true;
+                            self.state.widen_unknown_scope_effect();
+                            untracked_depth = 1;
+                        }
+                        continue;
+                    }
+                    b"endblock" => {
+                        if let Some(ControlFrame::Block {
+                            mut pre_state,
+                            isolate_vars,
+                            isolate_policies,
+                            propagate_vars,
+                        }) = self.pop_frame(&mut frames)
+                        {
+                            let inner = std::mem::take(&mut self.state);
+                            if !isolate_vars {
+                                let saved_cmp = pre_state.cmp0054;
+                                let saved_ver = pre_state.effective_version;
+                                pre_state = inner;
+                                if isolate_policies {
+                                    pre_state.cmp0054 = saved_cmp;
+                                    pre_state.effective_version = saved_ver;
+                                }
+                            } else {
+                                let budget = self.state_budget();
+                                for var in &propagate_vars {
+                                    if let Some(&st) = inner.bindings.get(var) {
+                                        pre_state.insert_binding(
+                                            var.clone(),
+                                            st,
+                                            budget,
+                                            &mut self.scope_truncated,
+                                        );
+                                    }
+                                    pre_state.remove_glob_origins(var);
+                                    if let Some(origins) = inner.glob_origins.get(var) {
+                                        for origin in origins {
+                                            pre_state.add_glob_origin(
+                                                var.clone(),
+                                                origin.clone(),
+                                                budget,
+                                                &mut self.scope_truncated,
+                                            );
+                                        }
+                                    }
+                                }
+                                if !isolate_policies {
+                                    pre_state.cmp0054 = inner.cmp0054;
+                                    pre_state.effective_version = inner.effective_version;
                                 }
                             }
+                            self.state = pre_state;
                         }
-                        if !isolate_policies {
-                            pre_state.cmp0054 = self.state.cmp0054;
-                            pre_state.effective_version = self.state.effective_version.clone();
-                        }
-                        self.state = pre_state;
+                        continue;
                     }
-                    continue;
+                    _ => {}
                 }
-                _ => {}
             }
 
-            // 4. Command-specific lint checks (only emitted for the primary file).
+            // Emit command rules only for the primary file; still transfer scope effects for includes.
             if is_primary {
                 self.check_command_rules(cmd_idx, cmd);
             }
-
-            // 5. Transfer command effects into `self.state` in source order (including static includes).
             self.apply_command_effects(
                 file_path,
                 cmd_idx,
@@ -636,6 +1135,113 @@ impl<'a> Analyzer<'a> {
                 include_depth,
                 &mut frames,
             );
+        }
+
+        // Release any unclosed frames so caller accounting remains exact after included files.
+        while self.pop_frame(&mut frames).is_some() {}
+    }
+
+    fn transition_if_branch(&mut self, frames: &mut [ControlFrame], is_else: bool) {
+        let Some(frame) = frames.last_mut() else {
+            return;
+        };
+        let old_usage = frame.usage();
+        let ControlFrame::If {
+            pre_state,
+            joined_branches,
+            has_else,
+            degraded,
+            else_defined,
+            else_single_config,
+        } = frame
+        else {
+            return;
+        };
+
+        self.frame_entries = self.frame_entries.saturating_sub(old_usage.0);
+        self.frame_bytes = self.frame_bytes.saturating_sub(old_usage.1);
+
+        if is_else {
+            *has_else = true;
+        }
+
+        let finished = std::mem::take(&mut self.state);
+        if !*degraded {
+            let other_entries = self.frame_entries.saturating_add(pre_state.entries);
+            let other_bytes = self.frame_bytes.saturating_add(pre_state.bytes);
+            let join_budget = ScopeBudget {
+                max_vars: self.limits.max_vars,
+                max_entries: self
+                    .limits
+                    .max_total_scope_entries
+                    .saturating_sub(other_entries),
+                max_bytes: self
+                    .limits
+                    .max_total_scope_bytes
+                    .saturating_sub(other_bytes),
+            };
+            let next_joined = match joined_branches.take() {
+                None => finished,
+                Some(acc) => {
+                    let acc = *acc;
+                    self.scope_ops = self
+                        .scope_ops
+                        .saturating_add(acc.entries.max(finished.entries).max(1));
+                    ScopeState::join_two(acc, finished, join_budget, &mut self.scope_truncated)
+                }
+            };
+            *joined_branches = Some(Box::new(next_joined));
+        }
+
+        let after_join_entries = self
+            .frame_entries
+            .saturating_add(pre_state.entries)
+            .saturating_add(joined_branches.as_deref().map_or(0, |j| j.entries));
+        let after_join_bytes = self
+            .frame_bytes
+            .saturating_add(pre_state.bytes)
+            .saturating_add(joined_branches.as_deref().map_or(0, |j| j.bytes));
+
+        let next_entries = after_join_entries.saturating_add(pre_state.entries);
+        let next_bytes = after_join_bytes.saturating_add(pre_state.bytes);
+        let next_ops = self.scope_ops.saturating_add(pre_state.entries.max(1));
+
+        if !*degraded
+            && next_entries <= self.limits.max_total_scope_entries
+            && next_bytes <= self.limits.max_total_scope_bytes
+            && next_ops <= self.max_scope_ops()
+        {
+            self.scope_ops = next_ops;
+            self.state = pre_state.clone();
+        } else {
+            self.scope_truncated = true;
+            *degraded = true;
+            *joined_branches = None;
+            self.state = pre_state.shallow_scalars();
+        }
+
+        let apply_else_defined = if is_else {
+            else_defined.clone()
+        } else {
+            else_defined.clear();
+            *else_single_config = false;
+            Vec::new()
+        };
+        let apply_else_single_config = is_else && *else_single_config;
+
+        let new_usage = frame.usage();
+        self.frame_entries = self.frame_entries.saturating_add(new_usage.0);
+        self.frame_bytes = self.frame_bytes.saturating_add(new_usage.1);
+
+        if is_else {
+            let budget = self.state_budget();
+            for name in apply_else_defined {
+                self.state
+                    .set_definite(name, budget, &mut self.scope_truncated);
+            }
+            if apply_else_single_config {
+                self.state.single_config_guard_depth += 1;
+            }
         }
     }
 
@@ -833,6 +1439,10 @@ impl<'a> Analyzer<'a> {
         for origin in triggered {
             if !origin.in_primary_file {
                 continue;
+            }
+            if self.findings.len() >= self.limits.max_findings {
+                self.findings_truncated = true;
+                break;
             }
             if !self.emitted_glob_sites.insert(origin.command_index) {
                 continue;
@@ -1056,6 +1666,54 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn mutate_nearest_parent_scope(
+        &mut self,
+        frames: &mut [ControlFrame],
+        mutate: impl FnOnce(&mut ScopeState, ScopeBudget, &mut bool),
+    ) {
+        let Some(idx) = frames.iter().rposition(|frame| {
+            matches!(
+                frame,
+                ControlFrame::Function { .. }
+                    | ControlFrame::Block {
+                        isolate_vars: true,
+                        ..
+                    }
+            )
+        }) else {
+            return;
+        };
+        let Some(frame) = frames.get_mut(idx) else {
+            return;
+        };
+        let old_usage = frame.usage();
+        self.frame_entries = self.frame_entries.saturating_sub(old_usage.0);
+        self.frame_bytes = self.frame_bytes.saturating_sub(old_usage.1);
+        let (cur_e, cur_b) = self.state.usage();
+        let budget = ScopeBudget {
+            max_vars: self.limits.max_vars,
+            max_entries: self
+                .limits
+                .max_total_scope_entries
+                .saturating_sub(self.frame_entries)
+                .saturating_sub(cur_e),
+            max_bytes: self
+                .limits
+                .max_total_scope_bytes
+                .saturating_sub(self.frame_bytes)
+                .saturating_sub(cur_b),
+        };
+        match frame {
+            ControlFrame::Function { pre_state } | ControlFrame::Block { pre_state, .. } => {
+                mutate(pre_state, budget, &mut self.scope_truncated);
+            }
+            _ => {}
+        }
+        let new_usage = frame.usage();
+        self.frame_entries = self.frame_entries.saturating_add(new_usage.0);
+        self.frame_bytes = self.frame_bytes.saturating_add(new_usage.1);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn apply_command_effects(
         &mut self,
@@ -1068,7 +1726,7 @@ impl<'a> Analyzer<'a> {
         frames: &mut [ControlFrame],
     ) {
         let lower = cmd.lower.as_slice();
-        let max_vars = self.limits.max_vars;
+        let budget = self.state_budget();
 
         match lower {
             b"cmake_minimum_required" | b"cmake_policy" => {
@@ -1101,7 +1759,7 @@ impl<'a> Analyzer<'a> {
                         .is_some_and(|a| a.text.as_slice() == b"GET")
                     && let Some(out) = cmd.args.get(2)
                 {
-                    bind_output_arg(out, &mut self.state, max_vars);
+                    bind_output_arg(out, &mut self.state, budget, &mut self.scope_truncated);
                 }
             }
             b"project" => {
@@ -1129,7 +1787,11 @@ impl<'a> Analyzer<'a> {
                         let mut full = Vec::with_capacity(proj.len() + suffix.len());
                         full.extend_from_slice(proj);
                         full.extend_from_slice(suffix);
-                        self.state.set_definite(BString::from(full), max_vars);
+                        self.state.set_definite(
+                            BString::from(full),
+                            budget,
+                            &mut self.scope_truncated,
+                        );
                     }
                 }
             }
@@ -1145,7 +1807,7 @@ impl<'a> Analyzer<'a> {
                     return;
                 }
                 if raw.contains(&b'$') {
-                    self.state.widen_absent_to_unknown();
+                    self.state.widen_unknown_scope_effect();
                     return;
                 }
                 let is_parent_scope = cmd
@@ -1162,8 +1824,7 @@ impl<'a> Analyzer<'a> {
                     var_arg.text.clone()
                 };
 
-                // Propagate glob taint if RHS references an active glob variable (and this isn't
-                // an empty unset-like `set(VAR)`).
+                // Propagate glob taint if RHS references an active glob variable.
                 let value_end = if is_parent_scope {
                     cmd.args.len().saturating_sub(1)
                 } else {
@@ -1184,40 +1845,50 @@ impl<'a> Analyzer<'a> {
                     }
                 }
 
-                // Track CMAKE_MODULE_PATH updates for static include resolution.
                 if name.as_slice() == b"CMAKE_MODULE_PATH" && !is_parent_scope {
-                    update_module_paths(
-                        &mut self.state.module_paths,
+                    let overflowed = update_module_paths(
+                        &mut self.state,
                         file_path,
                         self.workspace_root,
-                        self.state.project_source_dir.as_deref(),
                         value_args,
                         false,
+                        budget,
+                        &mut self.scope_truncated,
                     );
+                    if overflowed {
+                        self.dependencies.incomplete = true;
+                    }
                 }
 
                 if is_parent_scope {
-                    // Apply to the nearest enclosing function/block parent snapshot if any.
-                    if let Some(parent_state) = nearest_parent_scope_state(frames) {
-                        if value_args.is_empty() {
-                            parent_state.set_absent(name, max_vars);
+                    let is_unset = value_args.is_empty();
+                    self.mutate_nearest_parent_scope(frames, |parent_state, p_budget, trunc| {
+                        if is_unset {
+                            parent_state.set_absent(name, p_budget, trunc);
                         } else {
-                            parent_state.set_definite(name.clone(), max_vars);
-                            if !copied_globs.is_empty() {
-                                parent_state.glob_origins.insert(name, copied_globs);
+                            parent_state.set_definite(name.clone(), p_budget, trunc);
+                            for origin in copied_globs {
+                                parent_state.add_glob_origin(name.clone(), origin, p_budget, trunc);
                             }
                         }
-                    }
+                    });
                     return;
                 }
 
-                // `set(VAR)` with no value arguments unsets `VAR` in CMake!
+                // `set(VAR)` with no value arguments unsets `VAR` in CMake.
                 if !is_cache && value_args.is_empty() {
-                    self.state.set_absent(name, max_vars);
+                    self.state
+                        .set_absent(name, budget, &mut self.scope_truncated);
                 } else {
-                    self.state.set_definite(name.clone(), max_vars);
-                    if !copied_globs.is_empty() {
-                        self.state.glob_origins.insert(name, copied_globs);
+                    self.state
+                        .set_definite(name.clone(), budget, &mut self.scope_truncated);
+                    for origin in copied_globs {
+                        self.state.add_glob_origin(
+                            name.clone(),
+                            origin,
+                            budget,
+                            &mut self.scope_truncated,
+                        );
                     }
                 }
             }
@@ -1226,7 +1897,12 @@ impl<'a> Analyzer<'a> {
                     return;
                 };
                 let raw = var_arg.text.as_slice();
-                if raw.starts_with(b"ENV{") || raw.contains(&b'$') {
+                if raw.starts_with(b"ENV{") {
+                    return;
+                }
+                if raw.contains(&b'$') {
+                    // Dynamic unset can clear any glob variable's value.
+                    self.state.clear_glob_origins();
                     return;
                 }
                 let is_cache = raw.starts_with(b"CACHE{")
@@ -1247,38 +1923,49 @@ impl<'a> Analyzer<'a> {
                     var_arg.text.clone()
                 };
                 if is_parent_scope {
-                    if let Some(parent_state) = nearest_parent_scope_state(frames) {
-                        parent_state.set_absent(name, max_vars);
-                    }
+                    self.mutate_nearest_parent_scope(frames, |parent_state, p_budget, trunc| {
+                        parent_state.set_absent(name, p_budget, trunc);
+                    });
                 } else {
                     if is_cache {
-                        self.state.unset_cache_vars.insert(name.clone());
+                        self.state.insert_unset_cache(
+                            name.clone(),
+                            budget,
+                            &mut self.scope_truncated,
+                        );
                     }
-                    self.state.set_absent(name, max_vars);
+                    self.state
+                        .set_absent(name, budget, &mut self.scope_truncated);
                 }
             }
             b"option" => {
                 if let Some(arg) = cmd.args.first() {
-                    bind_output_arg(arg, &mut self.state, max_vars);
+                    bind_output_arg(arg, &mut self.state, budget, &mut self.scope_truncated);
                 }
             }
             b"file" => {
                 if let Some(glob) = parse_file_glob(cmd) {
-                    self.state.set_definite(glob.output_var.clone(), max_vars);
+                    self.state.set_definite(
+                        glob.output_var.clone(),
+                        budget,
+                        &mut self.scope_truncated,
+                    );
                     if !glob.has_configure_depends {
-                        self.state.glob_origins.insert(
+                        self.state.add_glob_origin(
                             glob.output_var.clone(),
-                            vec![GlobOrigin {
+                            GlobOrigin {
                                 command_index: cmd_idx,
                                 span: cmd.span.clone(),
                                 var_name: glob.output_var,
                                 is_recurse: glob.is_recurse,
                                 in_primary_file: is_primary,
-                            }],
+                            },
+                            budget,
+                            &mut self.scope_truncated,
                         );
                     }
                 } else {
-                    bind_file_output(cmd, &mut self.state, max_vars);
+                    bind_file_output(cmd, &mut self.state, budget, &mut self.scope_truncated);
                 }
             }
             b"list" => {
@@ -1287,19 +1974,22 @@ impl<'a> Analyzer<'a> {
                     if matches!(sub_bytes, b"APPEND" | b"PREPEND")
                         && var_arg.text.as_slice() == b"CMAKE_MODULE_PATH"
                     {
-                        update_module_paths(
-                            &mut self.state.module_paths,
+                        let overflowed = update_module_paths(
+                            &mut self.state,
                             file_path,
                             self.workspace_root,
-                            self.state.project_source_dir.as_deref(),
                             cmd.args.get(2..).unwrap_or_default(),
                             true,
+                            budget,
+                            &mut self.scope_truncated,
                         );
+                        if overflowed {
+                            self.dependencies.incomplete = true;
+                        }
                     }
                     if matches!(sub_bytes, b"APPEND" | b"PREPEND" | b"INSERT")
                         && !var_arg.text.as_slice().contains(&b'$')
                     {
-                        // Propagate glob taint if appending a globbed variable into another list.
                         let mut added_globs = Vec::new();
                         for arg in cmd.args.iter().skip(2) {
                             let exp = scan_arg_expansions(arg, src);
@@ -1311,31 +2001,26 @@ impl<'a> Analyzer<'a> {
                                 }
                             }
                         }
-                        if self.state.bindings.len() < max_vars
-                            || self.state.bindings.contains_key(&var_arg.text)
-                        {
-                            self.state
-                                .bindings
-                                .insert(var_arg.text.clone(), BindingState::Definite);
-                        }
-                        if !added_globs.is_empty() {
-                            let entry = self
-                                .state
-                                .glob_origins
-                                .entry(var_arg.text.clone())
-                                .or_default();
-                            for origin in added_globs {
-                                if !entry.contains(&origin) && entry.len() < 8 {
-                                    entry.push(origin);
-                                }
-                            }
+                        self.state.insert_binding(
+                            var_arg.text.clone(),
+                            BindingState::Definite,
+                            budget,
+                            &mut self.scope_truncated,
+                        );
+                        for origin in added_globs {
+                            self.state.add_glob_origin(
+                                var_arg.text.clone(),
+                                origin,
+                                budget,
+                                &mut self.scope_truncated,
+                            );
                         }
                     } else if matches!(
                         sub_bytes,
                         b"LENGTH" | b"GET" | b"JOIN" | b"SUBLIST" | b"FIND"
                     ) && let Some(out) = cmd.args.last()
                     {
-                        bind_output_arg(out, &mut self.state, max_vars);
+                        bind_output_arg(out, &mut self.state, budget, &mut self.scope_truncated);
                     } else if sub_bytes == b"TRANSFORM"
                         && let Some(pos) = cmd
                             .args
@@ -1343,13 +2028,13 @@ impl<'a> Analyzer<'a> {
                             .position(|a| a.text.as_slice() == b"OUTPUT_VARIABLE")
                         && let Some(out) = cmd.args.get(pos + 1)
                     {
-                        bind_output_arg(out, &mut self.state, max_vars);
+                        bind_output_arg(out, &mut self.state, budget, &mut self.scope_truncated);
                     }
                 }
             }
             b"get_property" => {
                 if let Some(out) = cmd.args.first() {
-                    bind_output_arg(out, &mut self.state, max_vars);
+                    bind_output_arg(out, &mut self.state, budget, &mut self.scope_truncated);
                     if cmd
                         .args
                         .get(1)
@@ -1360,20 +2045,28 @@ impl<'a> Analyzer<'a> {
                             .any(|a| a.text.as_slice() == b"GENERATOR_IS_MULTI_CONFIG")
                         && !out.text.as_slice().contains(&b'$')
                     {
-                        self.state.multi_config_vars.insert(out.text.clone());
+                        self.state.insert_multi_config(
+                            out.text.clone(),
+                            budget,
+                            &mut self.scope_truncated,
+                        );
                     }
                 }
             }
             b"get_cmake_property" => {
                 if let Some(out) = cmd.args.first() {
-                    bind_output_arg(out, &mut self.state, max_vars);
+                    bind_output_arg(out, &mut self.state, budget, &mut self.scope_truncated);
                     if cmd
                         .args
                         .get(1)
                         .is_some_and(|a| a.text.as_slice() == b"GENERATOR_IS_MULTI_CONFIG")
                         && !out.text.as_slice().contains(&b'$')
                     {
-                        self.state.multi_config_vars.insert(out.text.clone());
+                        self.state.insert_multi_config(
+                            out.text.clone(),
+                            budget,
+                            &mut self.scope_truncated,
+                        );
                     }
                 }
             }
@@ -1390,15 +2083,15 @@ impl<'a> Analyzer<'a> {
             | b"site_name"
             | b"try_compile" => {
                 if let Some(out) = cmd.args.first() {
-                    bind_output_arg(out, &mut self.state, max_vars);
+                    bind_output_arg(out, &mut self.state, budget, &mut self.scope_truncated);
                 }
             }
             b"try_run" => {
                 if let Some(a) = cmd.args.first() {
-                    bind_output_arg(a, &mut self.state, max_vars);
+                    bind_output_arg(a, &mut self.state, budget, &mut self.scope_truncated);
                 }
                 if let Some(b) = cmd.args.get(1) {
-                    bind_output_arg(b, &mut self.state, max_vars);
+                    bind_output_arg(b, &mut self.state, budget, &mut self.scope_truncated);
                 }
             }
             b"math" => {
@@ -1408,20 +2101,20 @@ impl<'a> Analyzer<'a> {
                     .is_some_and(|a| a.text.as_slice() == b"EXPR")
                     && let Some(out) = cmd.args.get(1)
                 {
-                    bind_output_arg(out, &mut self.state, max_vars);
+                    bind_output_arg(out, &mut self.state, budget, &mut self.scope_truncated);
                 }
             }
             b"string" => {
-                bind_string_output(cmd, &mut self.state, max_vars);
+                bind_string_output(cmd, &mut self.state, budget, &mut self.scope_truncated);
             }
             b"cmake_path" => {
-                bind_cmake_path_output(cmd, &mut self.state, max_vars);
+                bind_cmake_path_output(cmd, &mut self.state, budget, &mut self.scope_truncated);
             }
             b"cmake_host_system_information" => {
                 if let Some(pos) = cmd.args.iter().position(|a| a.text.as_slice() == b"RESULT")
                     && let Some(out) = cmd.args.get(pos + 1)
                 {
-                    bind_output_arg(out, &mut self.state, max_vars);
+                    bind_output_arg(out, &mut self.state, budget, &mut self.scope_truncated);
                 }
             }
             b"execute_process" => {
@@ -1434,7 +2127,7 @@ impl<'a> Analyzer<'a> {
                     if let Some(pos) = cmd.args.iter().position(|a| a.text.as_slice() == kw)
                         && let Some(out) = cmd.args.get(pos + 1)
                     {
-                        bind_output_arg(out, &mut self.state, max_vars);
+                        bind_output_arg(out, &mut self.state, budget, &mut self.scope_truncated);
                     }
                 }
             }
@@ -1460,14 +2153,18 @@ impl<'a> Analyzer<'a> {
                             let mut full = Vec::with_capacity(prefix.len() + suffix.len());
                             full.extend_from_slice(prefix);
                             full.extend_from_slice(suffix);
-                            self.state.set_definite(BString::from(full), max_vars);
+                            self.state.set_definite(
+                                BString::from(full),
+                                budget,
+                                &mut self.scope_truncated,
+                            );
                         }
                     }
                 }
-                self.state.widen_absent_to_unknown();
+                self.state.widen_unknown_scope_effect();
             }
             b"cmake_parse_arguments" => {
-                bind_parse_arguments(cmd, &mut self.state, max_vars);
+                bind_parse_arguments(cmd, &mut self.state, budget, &mut self.scope_truncated);
             }
             b"include" => {
                 self.handle_include(file_path, cmd, include_depth);
@@ -1477,25 +2174,24 @@ impl<'a> Analyzer<'a> {
                 if (lower.starts_with(b"check_") || lower.starts_with(b"cmake_check_"))
                     && let Some(last) = cmd.args.last()
                 {
-                    bind_output_arg(last, &mut self.state, max_vars);
+                    bind_output_arg(last, &mut self.state, budget, &mut self.scope_truncated);
                 } else if self.state.defined_macros.contains(lower) {
                     // User-defined macro executes in caller scope.
-                    self.state.widen_absent_to_unknown();
+                    self.state.widen_unknown_scope_effect();
                 }
             }
         }
     }
 
     fn handle_include(&mut self, file_path: &Path, cmd: &CommandInvocation, include_depth: usize) {
-        let max_vars = self.limits.max_vars;
-        // Bind RESULT_VARIABLE if requested.
+        let budget = self.state_budget();
         if let Some(pos) = cmd
             .args
             .iter()
             .position(|a| a.text.as_slice() == b"RESULT_VARIABLE")
             && let Some(out) = cmd.args.get(pos + 1)
         {
-            bind_output_arg(out, &mut self.state, max_vars);
+            bind_output_arg(out, &mut self.state, budget, &mut self.scope_truncated);
         }
 
         let Some(target_arg) = cmd.args.first() else {
@@ -1512,51 +2208,71 @@ impl<'a> Analyzer<'a> {
             .skip(1)
             .any(|a| a.text.as_slice() == b"NO_POLICY_SCOPE");
 
-        // Resolve statically known include path(s).
         let Some(candidates) = self.resolve_include_candidates(file_path, target_arg) else {
-            // Dynamic include path: mark unresolved effects as unknown.
-            self.state.widen_absent_to_unknown();
+            // Dynamic include path cannot be tracked statically; mark dependencies incomplete
+            // and invalidate scope facts (including active glob origins).
+            self.dependencies.incomplete = true;
+            self.state.widen_unknown_scope_effect();
             return;
         };
 
+        let max_probe_misses = self.limits.max_include_files.saturating_mul(4);
+        let max_consumed = self.limits.max_include_files.max(1).saturating_mul(4);
         let mut chosen: Option<PathBuf> = None;
         for cand in candidates {
             let norm = normalize_lexical(&cand);
-            // Record every probed candidate in `dependencies.included_files` so creating a
-            // shadowing include file later also triggers LSP refresh!
-            if self.dependencies.included_files.len() < self.limits.max_include_files * 4 {
-                self.dependencies.included_files.insert(norm.clone());
-            }
             if self.reader.file_exists(&norm) {
+                let is_bundled = self
+                    .reader
+                    .bundled_modules_dir()
+                    .is_some_and(|dir| norm.starts_with(dir));
+                // Record consumed files independently of missed-probe counts so failed probes
+                // can never evict an actually read dependency.
+                if is_bundled {
+                    self.dependencies.included_files.insert(norm.clone());
+                } else if self.dependencies.consumed_files.len() < max_consumed
+                    || self.dependencies.consumed_files.contains(&norm)
+                {
+                    self.dependencies.consumed_files.insert(norm.clone());
+                    self.dependencies.included_files.insert(norm.clone());
+                } else {
+                    self.dependencies.incomplete = true;
+                }
                 chosen = Some(norm);
                 break;
+            }
+            if self.probed_misses < max_probe_misses {
+                if self.dependencies.included_files.insert(norm) {
+                    self.probed_misses += 1;
+                }
+            } else {
+                self.dependencies.incomplete = true;
             }
         }
 
         let Some(inc_path) = chosen else {
-            // Unresolved project/module include: widen Absent -> Unknown.
-            self.state.widen_absent_to_unknown();
+            self.state.widen_unknown_scope_effect();
             return;
         };
 
-        // Bundled CMake standard modules: do not parse whole stdlib on every keystroke;
-        // treat as external/known effects instead.
+        // Bundled CMake standard modules: avoid parsing stdlib on every keystroke;
+        // invalidate scope conservatively instead.
         if self
             .reader
             .bundled_modules_dir()
             .is_some_and(|dir| inc_path.starts_with(dir))
         {
-            self.state.widen_absent_to_unknown();
+            self.state.widen_unknown_scope_effect();
             return;
         }
 
-        // Enforce cycle, depth, file count, and total byte limits.
         if include_depth >= self.limits.max_include_depth
             || self.include_files_read >= self.limits.max_include_files
             || self.include_bytes_read >= self.limits.max_include_bytes
             || self.active_includes.contains(&inc_path)
         {
-            self.state.widen_absent_to_unknown();
+            self.dependencies.incomplete = true;
+            self.state.widen_unknown_scope_effect();
             return;
         }
 
@@ -1565,7 +2281,8 @@ impl<'a> Analyzer<'a> {
             .max_include_bytes
             .saturating_sub(self.include_bytes_read);
         let Some(inc_bytes) = self.reader.read_file(&inc_path, remaining_bytes as u64) else {
-            self.state.widen_absent_to_unknown();
+            self.dependencies.incomplete = true;
+            self.state.widen_unknown_scope_effect();
             return;
         };
 
@@ -1575,7 +2292,8 @@ impl<'a> Analyzer<'a> {
         let mut sources = SourceMap::default();
         let Some(source_id) = sources.add("".into(), SourceKind::File, Arc::from(b"".as_slice()))
         else {
-            self.state.widen_absent_to_unknown();
+            self.dependencies.incomplete = true;
+            self.state.widen_unknown_scope_effect();
             return;
         };
         let parse_limits = Limits {
@@ -1589,11 +2307,28 @@ impl<'a> Analyzer<'a> {
             &parse_limits,
             100_000,
         ) else {
-            self.state.widen_absent_to_unknown();
+            self.dependencies.incomplete = true;
+            self.state.widen_unknown_scope_effect();
             return;
         };
 
-        let saved_state_for_optional = is_optional.then(|| self.state.clone());
+        let mut optional_degraded = false;
+        let saved_state_for_optional = if is_optional {
+            if self.can_retain_clone(&self.state, 0, 0) {
+                self.scope_ops = self.scope_ops.saturating_add(self.state.entries.max(1));
+                let saved = self.state.clone();
+                let (se, sb) = saved.usage();
+                self.frame_entries = self.frame_entries.saturating_add(se);
+                self.frame_bytes = self.frame_bytes.saturating_add(sb);
+                Some(saved)
+            } else {
+                self.scope_truncated = true;
+                optional_degraded = true;
+                None
+            }
+        } else {
+            None
+        };
         let saved_cmp0054 = self.state.cmp0054;
         let saved_version = self.state.effective_version.clone();
 
@@ -1613,8 +2348,18 @@ impl<'a> Analyzer<'a> {
         }
 
         if let Some(before) = saved_state_for_optional {
-            let branches = [before, self.state.clone()];
-            self.state = ScopeState::join_branches(&branches, max_vars);
+            let (be, bb) = before.usage();
+            self.frame_entries = self.frame_entries.saturating_sub(be);
+            self.frame_bytes = self.frame_bytes.saturating_sub(bb);
+            let join_budget = self.state_budget();
+            let current = std::mem::take(&mut self.state);
+            self.scope_ops = self
+                .scope_ops
+                .saturating_add(before.entries.max(current.entries).max(1));
+            self.state =
+                ScopeState::join_two(before, current, join_budget, &mut self.scope_truncated);
+        } else if optional_degraded {
+            self.state.widen_unknown_scope_effect();
         }
     }
 
@@ -1694,21 +2439,6 @@ fn infer_initial_mode(path: &Path, commands: &[CommandInvocation]) -> ExecutionM
     }
 }
 
-fn nearest_parent_scope_state(frames: &mut [ControlFrame]) -> Option<&mut ScopeState> {
-    for frame in frames.iter_mut().rev() {
-        match frame {
-            ControlFrame::Function { pre_state } => return Some(pre_state),
-            ControlFrame::Block {
-                pre_state,
-                isolate_vars: true,
-                ..
-            } => return Some(pre_state),
-            _ => {}
-        }
-    }
-    None
-}
-
 fn has_cache_clause(cmd: &CommandInvocation) -> bool {
     let len = cmd.args.len();
     let force = usize::from(
@@ -1723,22 +2453,32 @@ fn has_cache_clause(cmd: &CommandInvocation) -> bool {
             .is_some_and(|a| a.text.as_slice() == b"CACHE")
 }
 
-fn bind_output_arg(arg: &rcmake_syntax::Argument, state: &mut ScopeState, max_vars: usize) {
+fn bind_output_arg(
+    arg: &rcmake_syntax::Argument,
+    state: &mut ScopeState,
+    budget: ScopeBudget,
+    truncated: &mut bool,
+) {
     if arg.text.is_empty() {
         return;
     }
     if arg.text.as_slice().contains(&b'$') {
-        state.widen_absent_to_unknown();
+        state.widen_unknown_scope_effect();
     } else {
-        state.set_definite(arg.text.clone(), max_vars);
+        state.set_definite(arg.text.clone(), budget, truncated);
     }
 }
 
-fn bind_foreach_vars(cmd: &CommandInvocation, state: &mut ScopeState, max_vars: usize) {
+fn bind_foreach_vars(
+    cmd: &CommandInvocation,
+    state: &mut ScopeState,
+    budget: ScopeBudget,
+    truncated: &mut bool,
+) {
     let Some(first) = cmd.args.first() else {
         return;
     };
-    bind_output_arg(first, state, max_vars);
+    bind_output_arg(first, state, budget, truncated);
     // Handle `foreach(v1 v2 ... IN ZIP_LISTS ...)`.
     if let Some(in_pos) = cmd.args.iter().position(|a| a.text.as_slice() == b"IN")
         && cmd
@@ -1747,7 +2487,7 @@ fn bind_foreach_vars(cmd: &CommandInvocation, state: &mut ScopeState, max_vars: 
             .is_some_and(|a| a.text.as_slice() == b"ZIP_LISTS")
     {
         for var in cmd.args.iter().take(in_pos) {
-            bind_output_arg(var, state, max_vars);
+            bind_output_arg(var, state, budget, truncated);
         }
     }
 }
@@ -1756,15 +2496,16 @@ fn bind_callable_params(
     cmd: &CommandInvocation,
     is_function: bool,
     state: &mut ScopeState,
-    max_vars: usize,
+    budget: ScopeBudget,
+    truncated: &mut bool,
 ) {
     for param in cmd.args.iter().skip(1) {
         if !param.text.is_empty() && !param.text.as_slice().contains(&b'$') {
-            state.set_definite(param.text.clone(), max_vars);
+            state.set_definite(param.text.clone(), budget, truncated);
         }
     }
     for builtin in [b"ARGC".as_slice(), b"ARGV", b"ARGN"] {
-        state.set_definite(BString::from(builtin), max_vars);
+        state.set_definite(BString::from(builtin), budget, truncated);
     }
     if is_function {
         for builtin in [
@@ -1773,7 +2514,7 @@ fn bind_callable_params(
             b"CMAKE_CURRENT_FUNCTION_LIST_FILE",
             b"CMAKE_CURRENT_FUNCTION_LIST_LINE",
         ] {
-            state.set_definite(BString::from(builtin), max_vars);
+            state.set_definite(BString::from(builtin), budget, truncated);
         }
     }
 }
@@ -1814,7 +2555,12 @@ fn parse_block_options(cmd: &CommandInvocation) -> (bool, bool, Vec<BString>) {
     (isolate_vars, isolate_policies, propagate)
 }
 
-fn bind_file_output(cmd: &CommandInvocation, state: &mut ScopeState, max_vars: usize) {
+fn bind_file_output(
+    cmd: &CommandInvocation,
+    state: &mut ScopeState,
+    budget: ScopeBudget,
+    truncated: &mut bool,
+) {
     let Some(sub) = cmd.args.first().map(|a| a.text.as_slice()) else {
         return;
     };
@@ -1828,7 +2574,7 @@ fn bind_file_output(cmd: &CommandInvocation, state: &mut ScopeState, max_vars: u
     if let Some(idx) = out_index
         && let Some(arg) = cmd.args.get(idx)
     {
-        bind_output_arg(arg, state, max_vars);
+        bind_output_arg(arg, state, budget, truncated);
     }
     if sub == b"GET_RUNTIME_DEPENDENCIES" {
         for kw in [
@@ -1839,13 +2585,18 @@ fn bind_file_output(cmd: &CommandInvocation, state: &mut ScopeState, max_vars: u
             if let Some(pos) = cmd.args.iter().position(|a| a.text.as_slice() == kw)
                 && let Some(out) = cmd.args.get(pos + 1)
             {
-                bind_output_arg(out, state, max_vars);
+                bind_output_arg(out, state, budget, truncated);
             }
         }
     }
 }
 
-fn bind_string_output(cmd: &CommandInvocation, state: &mut ScopeState, max_vars: usize) {
+fn bind_string_output(
+    cmd: &CommandInvocation,
+    state: &mut ScopeState,
+    budget: ScopeBudget,
+    truncated: &mut bool,
+) {
     let Some(sub) = cmd.args.first().map(|a| a.text.as_slice()) else {
         return;
     };
@@ -1869,11 +2620,16 @@ fn bind_string_output(cmd: &CommandInvocation, state: &mut ScopeState, max_vars:
     if let Some(idx) = out_idx
         && let Some(arg) = cmd.args.get(idx)
     {
-        bind_output_arg(arg, state, max_vars);
+        bind_output_arg(arg, state, budget, truncated);
     }
 }
 
-fn bind_cmake_path_output(cmd: &CommandInvocation, state: &mut ScopeState, max_vars: usize) {
+fn bind_cmake_path_output(
+    cmd: &CommandInvocation,
+    state: &mut ScopeState,
+    budget: ScopeBudget,
+    truncated: &mut bool,
+) {
     let Some(sub) = cmd.args.first().map(|a| a.text.as_slice()) else {
         return;
     };
@@ -1883,108 +2639,123 @@ fn bind_cmake_path_output(cmd: &CommandInvocation, state: &mut ScopeState, max_v
         .position(|a| a.text.as_slice() == b"OUTPUT_VARIABLE")
         && let Some(out) = cmd.args.get(pos + 1)
     {
-        bind_output_arg(out, state, max_vars);
+        bind_output_arg(out, state, budget, truncated);
         return;
     }
     match sub {
         b"SET" | b"APPEND" | b"APPEND_STRING" | b"REMOVE_FILENAME" | b"REPLACE_FILENAME"
         | b"REMOVE_EXTENSION" | b"REPLACE_EXTENSION" | b"NORMAL_PATH" => {
             if let Some(arg) = cmd.args.get(1) {
-                bind_output_arg(arg, state, max_vars);
+                bind_output_arg(arg, state, budget, truncated);
             }
         }
         b"GET" | b"COMPARE" | b"HASH" | b"RELATIVE_PATH" | b"ABSOLUTE_PATH" | b"NATIVE_PATH"
         | b"CONVERT" => {
             if let Some(arg) = cmd.args.last() {
-                bind_output_arg(arg, state, max_vars);
+                bind_output_arg(arg, state, budget, truncated);
             }
         }
         s if s.starts_with(b"IS_") || s.starts_with(b"HAS_") => {
             if let Some(arg) = cmd.args.last() {
-                bind_output_arg(arg, state, max_vars);
+                bind_output_arg(arg, state, budget, truncated);
             }
         }
         _ => {}
     }
 }
 
-fn bind_parse_arguments(cmd: &CommandInvocation, state: &mut ScopeState, max_vars: usize) {
+fn bind_parse_arguments(
+    cmd: &CommandInvocation,
+    state: &mut ScopeState,
+    budget: ScopeBudget,
+    truncated: &mut bool,
+) {
     let offset = usize::from(
         cmd.args
             .first()
             .is_some_and(|a| a.text.as_slice() == b"PARSE_ARGV"),
     ) * 2;
     let Some(prefix_arg) = cmd.args.get(offset) else {
-        state.widen_absent_to_unknown();
+        state.widen_unknown_scope_effect();
         return;
     };
     if prefix_arg.text.is_empty() || prefix_arg.text.as_slice().contains(&b'$') {
-        state.widen_absent_to_unknown();
+        state.widen_unknown_scope_effect();
         return;
     }
     let prefix = prefix_arg.text.as_slice();
+    let mut prefix_under = Vec::with_capacity(prefix.len() + 1);
+    prefix_under.extend_from_slice(prefix);
+    prefix_under.push(b'_');
+
     for suffix in [b"UNPARSED_ARGUMENTS".as_slice(), b"KEYWORDS_MISSING_VALUES"] {
-        let mut full = Vec::with_capacity(prefix.len() + 1 + suffix.len());
-        full.extend_from_slice(prefix);
-        full.push(b'_');
+        let mut full = Vec::with_capacity(prefix_under.len() + suffix.len());
+        full.extend_from_slice(&prefix_under);
         full.extend_from_slice(suffix);
-        state.set_definite(BString::from(full), max_vars);
+        state.set_definite(BString::from(full), budget, truncated);
     }
     for group_idx in [offset + 1, offset + 2, offset + 3] {
         let Some(group) = cmd.args.get(group_idx) else {
             continue;
         };
         if group.text.as_slice().contains(&b'$') {
-            state.widen_absent_to_unknown();
+            state.widen_prefix_scope_effect(&prefix_under);
             continue;
         }
         for key in group.text.as_slice().split(|&b| b == b';') {
             if !key.is_empty() {
-                let mut full = Vec::with_capacity(prefix.len() + 1 + key.len());
-                full.extend_from_slice(prefix);
-                full.push(b'_');
+                let mut full = Vec::with_capacity(prefix_under.len() + key.len());
+                full.extend_from_slice(&prefix_under);
                 full.extend_from_slice(key);
-                state.set_definite(BString::from(full), max_vars);
+                state.set_definite(BString::from(full), budget, truncated);
             }
         }
     }
 }
 
 fn update_module_paths(
-    paths: &mut Vec<PathBuf>,
+    state: &mut ScopeState,
     current_file: &Path,
     workspace_root: Option<&Path>,
-    project_source_dir: Option<&Path>,
     args: &[rcmake_syntax::Argument],
     append: bool,
-) {
+    budget: ScopeBudget,
+    truncated: &mut bool,
+) -> bool {
+    let project_source_dir = state.project_source_dir.clone();
     if !append {
-        paths.clear();
+        state.clear_module_paths();
     }
+    let mut overflowed = false;
     for arg in args {
         let Ok(text) = core::str::from_utf8(arg.text.as_slice()) else {
             continue;
         };
         for part in text.split(';').filter(|p| !p.is_empty()) {
-            if paths.len() >= 32 {
-                return;
+            if state.module_paths.len() >= MAX_MODULE_PATHS {
+                overflowed = true;
+                return overflowed;
             }
             if let Some(resolved) = resolve_literal_path(
                 part,
                 arg.kind,
                 current_file,
                 workspace_root,
-                project_source_dir,
+                project_source_dir.as_deref(),
             ) {
                 let full = if resolved.is_absolute() {
                     resolved
                 } else {
                     current_file.parent().unwrap_or(current_file).join(resolved)
                 };
-                paths.push(normalize_lexical(&full));
+                if !state.push_module_path(normalize_lexical(&full), budget, truncated) {
+                    overflowed = true;
+                    return overflowed;
+                }
             }
         }
     }
+    overflowed
 }
 
 fn resolve_literal_path(
@@ -2018,4 +2789,86 @@ fn resolve_literal_path(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recompute_usage(state: &ScopeState) -> (usize, usize) {
+        let mut entries = 0usize;
+        let mut bytes = 0usize;
+        for k in state.bindings.keys() {
+            entries += 1;
+            bytes += k.len();
+        }
+        for k in &state.unset_cache_vars {
+            entries += 1;
+            bytes += k.len();
+        }
+        for k in &state.multi_config_vars {
+            entries += 1;
+            bytes += k.len();
+        }
+        for k in &state.defined_macros {
+            entries += 1;
+            bytes += k.len();
+        }
+        for (k, origins) in &state.glob_origins {
+            bytes += k.len();
+            for o in origins {
+                entries += 1;
+                bytes += o.var_name.len();
+            }
+        }
+        for p in &state.module_paths {
+            entries += 1;
+            bytes += p.as_os_str().len();
+        }
+        (entries, bytes)
+    }
+
+    #[test]
+    fn scope_state_entry_and_byte_accounting_matches_recomputed_usage() {
+        let budget = ScopeBudget {
+            max_vars: 128,
+            max_entries: 128,
+            max_bytes: 8192,
+        };
+        let mut truncated = false;
+        let mut left = ScopeState::default();
+        left.set_definite("ALPHA", budget, &mut truncated);
+        left.insert_unset_cache(BString::from("CACHE_X"), budget, &mut truncated);
+        left.insert_multi_config(BString::from("IS_MULTI"), budget, &mut truncated);
+        left.insert_defined_macro(BString::from("my_mac"), budget, &mut truncated);
+        left.push_module_path(PathBuf::from("/work/cmake"), budget, &mut truncated);
+        left.add_glob_origin(
+            BString::from("SRCS"),
+            GlobOrigin {
+                command_index: 1,
+                span: 0..10,
+                var_name: BString::from("SRCS"),
+                is_recurse: false,
+                in_primary_file: true,
+            },
+            budget,
+            &mut truncated,
+        );
+        assert_eq!(left.usage(), recompute_usage(&left));
+
+        let mut right = left.clone();
+        right.set_absent("ALPHA", budget, &mut truncated);
+        right.remove_glob_origins(&BString::from("SRCS"));
+        right.set_definite("BETA", budget, &mut truncated);
+        assert_eq!(right.usage(), recompute_usage(&right));
+
+        let mut joined = ScopeState::join_two(left, right, budget, &mut truncated);
+        assert_eq!(joined.usage(), recompute_usage(&joined));
+
+        joined.widen_unknown_scope_effect();
+        assert_eq!(joined.usage(), recompute_usage(&joined));
+        assert!(joined.glob_origins.is_empty());
+        assert!(joined.unset_cache_vars.is_empty());
+        assert!(!truncated);
+    }
 }

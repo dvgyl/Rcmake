@@ -44,6 +44,7 @@ jobs:
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
           sudo apt-get update
           sudo apt-get install -y gcc g++ clang ninja-build make binutils libzstd1
       - &macos_tools
@@ -277,6 +278,7 @@ jobs:
       - if: runner.os == 'Linux'
         name: Install Ninja on Linux
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
           sudo apt-get update
           sudo apt-get install -y ninja-build
       - *macos_tools

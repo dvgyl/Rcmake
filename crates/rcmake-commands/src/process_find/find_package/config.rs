@@ -181,14 +181,23 @@ impl<'a> ConfigSearch<'a> {
         );
         let redirects = redirects_directory(cx);
         for (prefix, spelling) in self.prefixes(cx, package_roots, mode, &mut report.trace)? {
-            if ignored.contains(&prefix)
-                || ignored_prefixes.contains(&prefix)
-                || Some(&prefix) != redirects.as_ref()
-                    && !cx
-                        .host()
-                        .metadata(&prefix, Follow::Yes)
-                        .is_ok_and(|meta| meta.kind == FileKind::Dir)
+            if ignored.contains(&prefix) || ignored_prefixes.contains(&prefix) {
+                continue;
+            }
+            if Some(&prefix) != redirects.as_ref()
+                && !cx
+                    .host()
+                    .metadata(&prefix, Follow::Yes)
+                    .is_ok_and(|meta| meta.kind == FileKind::Dir)
             {
+                let path = path::from_native_cmake(spelling.as_deref().unwrap_or(&prefix));
+                report.log.native_candidate(
+                    &path,
+                    Mode::Config,
+                    Reason::NoExist,
+                    &BString::default(),
+                    Detail::default(),
+                );
                 continue;
             }
             for (dir, cps) in self.layout(cx, &prefix) {

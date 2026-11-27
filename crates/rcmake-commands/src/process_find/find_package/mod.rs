@@ -50,24 +50,34 @@ fn find_package_with_options(
     parent: Option<(&Request, bool)>,
     dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
 ) -> CmdResult {
-    cx.check_package_find(false)?;
+    let context = cx.check_package_find(false);
     let Some((package, parameters)) = args.split_first() else {
+        context?;
         return Err(CmdError::status(
             "called with incorrect number of arguments",
         ));
     };
     let name = &package.value;
-    let mut request = Request::parse(parameters)?;
+    let mut native = Collector::begin(cx, name);
+    if let Err(error) = context {
+        return fail_native(cx, native, name, None, error);
+    }
+    let mut request = match Request::parse(parameters) {
+        Ok(request) => request,
+        Err(error) => return fail_native(cx, native, name, None, error),
+    };
     if let Some((parent, needed)) = parent {
         request.inherit(cx, parent, needed);
     } else {
         request.snapshot_search(cx);
     }
     let unwind = request.unwind_include;
-    cx.check_package_find(unwind)?;
+    if let Err(error) = cx.check_package_find(unwind) {
+        return fail_native(cx, native.take(), name, Some(&request), error);
+    }
     cx.project().package_lookups.insert(name.clone());
     let prefix = cx.var_normal_only(b"PACKAGE_PREFIX_DIR");
-    let result = find_requested_package(cx, args, name, request, dependency);
+    let result = find_requested_package(cx, args, name, request, dependency, native);
     if cx.var_normal_only(b"PACKAGE_PREFIX_DIR") != prefix {
         if let Some(prefix) = prefix {
             cx.set_var(b"PACKAGE_PREFIX_DIR", prefix);
@@ -87,13 +97,14 @@ fn find_requested_package(
     name: &BString,
     mut request: Request,
     dependency: Option<&mut Vec<cps_import::PackageDiagnostic>>,
+    mut native: Option<Box<Collector>>,
 ) -> CmdResult {
     let find = |suffix| cat(&[name, b"_FIND_", suffix]);
     if cx.var_is_on(&find(b"MODULE")) {
         if request.version.is_none() && cx.var_defined(&find(b"VERSION")) {
             match VersionRequest::parse(&cx.var_or_empty(&find(b"VERSION_COMPLETE"))) {
                 Ok(version) => request.version = Some(version),
-                Err(error) => return fail_early(cx, name, &request, error),
+                Err(error) => return fail_native(cx, native, name, Some(&request), error),
             }
             request.exact |= cx.var_is_on(&find(b"VERSION_EXACT"));
         }
@@ -111,7 +122,7 @@ fn find_requested_package(
         match &request.version {
             Some(version) if version.max.is_some() => {
                 let error = CmdError::status("EXACT cannot be specified with a version range.");
-                return fail_early(cx, name, &request, error);
+                return fail_native(cx, native, name, Some(&request), error);
             }
             None => {
                 crate::author_warning(cx, "Ignoring EXACT since no version is requested.");
@@ -123,7 +134,7 @@ fn find_requested_package(
     request.apply_requiredness(cx, name);
 
     let found_var = cat(&[name, b"_FOUND"]);
-    let mut log = SearchLog::new(cx, name, &found_var, &request);
+    let mut log = SearchLog::new(cx, name, &found_var, &request, native.take());
     let outer_roots = cmake_paths(cx, PACKAGE_ROOT_SPELLINGS);
     let disable = cat(&[b"CMAKE_DISABLE_FIND_PACKAGE_", name]);
     if cx.var_is_on(&disable) {
@@ -282,8 +293,17 @@ fn finish_native(
     }
 }
 
-fn fail_early(cx: &mut Cx<'_>, name: &[u8], request: &Request, error: CmdError) -> CmdResult {
-    let native = Collector::start(cx, name, request);
+/// Finish the native record of a call that fails before its search starts.
+fn fail_native(
+    cx: &mut Cx<'_>,
+    mut native: Option<Box<Collector>>,
+    name: &[u8],
+    request: Option<&Request>,
+    error: CmdError,
+) -> CmdResult {
+    if let (Some(collector), Some(request)) = (&mut native, request) {
+        collector.describe(cx, name, request);
+    }
     finish_native(cx, native, name, FindOutcome::Error);
     Err(error)
 }
@@ -462,6 +482,9 @@ fn search(
         {
             return Ok(false);
         }
+        if !found && let Some(file) = &config_file {
+            record_config_rejection(cx, name, request, file, report);
+        }
         if !found
             && try_module
             && prefer_config
@@ -491,29 +514,6 @@ fn search(
             }
             if !found {
                 let reason = cx.var_or_empty(&cat(&[name, b"_NOT_FOUND_MESSAGE"]));
-                if report.log.native.is_some() {
-                    let missing: Vec<BString> = request
-                        .components
-                        .iter()
-                        .filter(|(component, required)| {
-                            *required && !cx.var_is_on(&cat(&[name, b"_", component, b"_FOUND"]))
-                        })
-                        .map(|(component, _)| component.clone())
-                        .collect();
-                    let reject = if missing.is_empty() {
-                        Reason::NotFound
-                    } else {
-                        Reason::InsufficientComponents
-                    };
-                    let detail = Detail {
-                        found_version: cx.var(&cat(&[name, b"_VERSION"])),
-                        missing_components: missing,
-                        ..Detail::default()
-                    };
-                    report
-                        .log
-                        .native_candidate(&file, Mode::Config, reject, &reason, detail);
-                }
                 let message = cat(&[
                     b"Found package configuration file:\n  ",
                     &file,
@@ -571,6 +571,41 @@ fn search(
         result?;
     }
     Ok(false)
+}
+
+/// Record natively why a loaded config file did not provide the package.
+fn record_config_rejection(
+    cx: &mut Cx<'_>,
+    name: &[u8],
+    request: &Request,
+    file: &BString,
+    report: &mut SearchReport,
+) {
+    if report.log.native.is_none() {
+        return;
+    }
+    let reason = cx.var_or_empty(&cat(&[name, b"_NOT_FOUND_MESSAGE"]));
+    let missing: Vec<BString> = request
+        .components
+        .iter()
+        .filter(|(component, required)| {
+            *required && !cx.var_is_on(&cat(&[name, b"_", component, b"_FOUND"]))
+        })
+        .map(|(component, _)| component.clone())
+        .collect();
+    let reject = if missing.is_empty() {
+        Reason::NotFound
+    } else {
+        Reason::InsufficientComponents
+    };
+    let detail = Detail {
+        found_version: cx.var(&cat(&[name, b"_VERSION"])),
+        missing_components: missing,
+        ..Detail::default()
+    };
+    report
+        .log
+        .native_candidate(file, Mode::Config, reject, &reason, detail);
 }
 
 fn load_module(
@@ -655,6 +690,12 @@ fn load_module(
     let result = vars.scoped(cx, |cx| request.include_file(cx, &module));
     let defined = cx.var_defined(found_var);
     if defined && !cx.var_is_on(found_var) {
+        // The module ran, so it is the selection, whatever result it reported.
+        report.log.native_selected(
+            &path::from_native_cmake(&module),
+            Mode::Module,
+            &cx.var_or_empty(&cat(&[name, b"_VERSION"])),
+        );
         report.log.candidate(
             || path::from_native_cmake(&module),
             Mode::Module,

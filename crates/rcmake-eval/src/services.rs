@@ -187,6 +187,9 @@ pub struct Services {
     pub step_budget: Option<u64>,
     /// `find_package()` records for native diagnostics. Compatibility personas keep `Off`.
     pub find_trace: crate::FindTraceLevel,
+    /// Record per-language compiler identification proofs for native drift tracking.
+    /// Compatibility personas keep this `false` so build trees match CMake exactly.
+    pub track_compiler_identifications: bool,
 }
 
 /// Position of a parsed command within a listfile or virtual source.
@@ -230,5 +233,6 @@ mod tests {
         assert!(services.cancel.is_none());
         assert_eq!(services.step_budget, None);
         assert_eq!(services.find_trace, crate::FindTraceLevel::Off);
+        assert!(!services.track_compiler_identifications);
     }
 }

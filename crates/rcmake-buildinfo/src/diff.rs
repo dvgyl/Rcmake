@@ -1,13 +1,18 @@
 //! Comparison of two build snapshots.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use rcmake_base::BString;
 
 use crate::snapshot::{
     Attribution, BuildSnapshot, CacheRecord, CompileSettings, Evidence, IncludeDir, LinkFragment,
-    PackageSnapshot, Section, TargetSnapshot,
+    PackageObservation, PackageSnapshot, Section, SourceInvocations, TargetSnapshot,
 };
+
+/// Most changed sources that one comparison records. A larger result is cut and
+/// marked partial.
+const MAX_CHANGED_SOURCES: usize = 200_000;
 
 /// Cache entries to compare.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,6 +123,12 @@ pub struct CompileChange {
     pub fragments: ListChange<BString>,
     /// A side was compared as opaque command text.
     pub opaque: bool,
+    /// Compiler token, when both sides name one and it changed.
+    pub compiler: Option<Pair<BString>>,
+    /// Launcher tokens, when both sides name a compiler.
+    pub launcher: ListChange<BString>,
+    /// Number of invocations of each source, when it changed.
+    pub invocations: Option<(usize, usize)>,
 }
 
 /// Change of one target.
@@ -233,16 +244,23 @@ impl ConfigDiff {
             || !self.cache.is_empty()
     }
 
-    /// Exit status: 1 with differences, 3 when a requested section was not compared,
-    /// and 0 otherwise.
+    /// Return whether every requested section was compared with complete evidence.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.incomplete.is_empty() && self.partial.is_empty()
+    }
+
+    /// Exit status, the same contract as `rcmake verify`: 1 for an established
+    /// difference, 0 for complete parity over the requested scope, and 2 when the
+    /// evidence is insufficient.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         if self.has_changes() {
             1
-        } else if self.incomplete.is_empty() {
+        } else if self.complete() {
             0
         } else {
-            3
+            2
         }
     }
 }
@@ -285,18 +303,32 @@ pub fn normalize(snapshot: &mut BuildSnapshot) {
             replace_root(value, root, token);
         }
     };
+    // Shared settings are normalized once, so sharing survives normalization.
+    let mut done: HashMap<usize, Arc<CompileSettings>> = HashMap::new();
     let targets = std::mem::take(&mut snapshot.targets);
     for (key, mut target) in targets {
         let sources = std::mem::take(&mut target.sources);
-        for (mut path, mut settings) in sources {
+        for (mut path, invocations) in sources {
             fix(&mut path);
-            settings
-                .includes
-                .iter_mut()
-                .for_each(|include| fix(&mut include.path));
-            settings.fragments.iter_mut().for_each(&fix);
-            settings.defines.iter_mut().for_each(&fix);
-            target.sources.insert(path, settings);
+            let invocations: SourceInvocations = invocations
+                .into_iter()
+                .map(|settings| {
+                    let id = Arc::as_ptr(&settings) as usize;
+                    Arc::clone(done.entry(id).or_insert_with(|| {
+                        let mut settings = (*settings).clone();
+                        settings
+                            .includes
+                            .iter_mut()
+                            .for_each(|include| fix(&mut include.path));
+                        settings.fragments.iter_mut().for_each(&fix);
+                        settings.defines.iter_mut().for_each(&fix);
+                        settings.compiler.iter_mut().for_each(&fix);
+                        settings.launcher.iter_mut().for_each(&fix);
+                        Arc::new(settings)
+                    }))
+                })
+                .collect();
+            target.sources.insert(path, invocations);
         }
         for fragment in target.link.iter_mut().flatten() {
             fix(&mut fragment.fragment);
@@ -357,7 +389,15 @@ fn pair_configs(
     diff: &mut ConfigDiff,
 ) {
     if let Some((left, right)) = &options.config_pair {
-        diff.config_pairs.push((left.clone(), right.clone()));
+        let actual = |snapshot: &BuildSnapshot, wanted: &BString| {
+            snapshot
+                .configs
+                .iter()
+                .find(|config| config.eq_ignore_ascii_case(wanted))
+                .cloned()
+                .unwrap_or_else(|| wanted.clone())
+        };
+        diff.config_pairs.push((actual(a, left), actual(b, right)));
         return;
     }
     if let ([left], [right]) = (a.configs.as_slice(), b.configs.as_slice()) {
@@ -391,14 +431,30 @@ fn pair_configs(
     }
 }
 
+/// Return whether two settings differ. Compiler and launcher take part only when
+/// both sides name a compiler, because File API compile groups do not name one.
+fn settings_differ(a: &CompileSettings, b: &CompileSettings) -> bool {
+    if a.compiler.is_some() && b.compiler.is_some() {
+        return a != b;
+    }
+    a.language != b.language
+        || a.standard != b.standard
+        || a.defines != b.defines
+        || a.includes != b.includes
+        || a.fragments != b.fragments
+        || a.opaque != b.opaque
+}
+
 fn settings_change(
     sources: Vec<BString>,
     a: &CompileSettings,
     b: &CompileSettings,
+    invocations: Option<(usize, usize)>,
 ) -> CompileChange {
     let differs =
         |x: &Option<BString>, y: &Option<BString>| (x != y).then(|| (x.clone(), y.clone()));
     let opaque = a.opaque || b.opaque;
+    let both_named = a.compiler.is_some() && b.compiler.is_some();
     CompileChange {
         sources,
         language: differs(&a.language, &b.language),
@@ -407,7 +463,44 @@ fn settings_change(
         includes: list_change(&a.includes, &b.includes),
         fragments: list_change(&a.fragments, &b.fragments),
         opaque,
+        compiler: if both_named {
+            differs(&a.compiler, &b.compiler)
+        } else {
+            None
+        },
+        launcher: if both_named {
+            list_change(&a.launcher, &b.launcher)
+        } else {
+            ListChange::default()
+        },
+        invocations,
     }
+}
+
+/// Key of one group of identical source changes.
+type ChangeKey = (
+    Arc<CompileSettings>,
+    Arc<CompileSettings>,
+    Option<(usize, usize)>,
+);
+
+/// Evidence state of each side for one comparison.
+#[derive(Clone, Copy)]
+struct Sides {
+    /// Side `a` has complete evidence, so an absence there is a fact.
+    a_complete: bool,
+    /// Side `b` has complete evidence, so an absence there is a fact.
+    b_complete: bool,
+}
+
+/// State that the target comparisons of one compare call share.
+struct Scope {
+    /// Compile evidence of each side.
+    compile: Sides,
+    /// Changed sources that can still be recorded.
+    budget: usize,
+    /// Notes for the partial list.
+    notes: Vec<BString>,
 }
 
 fn target_change(
@@ -416,38 +509,78 @@ fn target_change(
     a: &TargetSnapshot,
     b: &TargetSnapshot,
     options: &DiffOptions,
+    scope: &mut Scope,
 ) -> Option<TargetChange> {
+    let compile_sides = scope.compile;
     let compile_on = options.sections.contains(&Section::Compile);
     let link_on = options.sections.contains(&Section::Link);
-    let mut groups: Vec<((CompileSettings, CompileSettings), Vec<BString>)> = Vec::new();
+    let mut groups: HashMap<ChangeKey, usize> = HashMap::new();
+    let mut ordered: Vec<(ChangeKey, Vec<BString>)> = Vec::new();
     let mut sources_added = Vec::new();
     let mut sources_removed = Vec::new();
+    let mut unknown_sources = 0_usize;
     if compile_on {
         for (path, left) in &a.sources {
             match b.sources.get(path) {
-                Some(right) if right != left => {
-                    match groups
-                        .iter_mut()
-                        .find(|(key, _)| key.0 == *left && key.1 == *right)
-                    {
-                        Some((_, sources)) => sources.push(path.clone()),
-                        None => groups.push(((left.clone(), right.clone()), vec![path.clone()])),
+                Some(right) => {
+                    let count = (left.len() != right.len()).then_some((left.len(), right.len()));
+                    for (index, l) in left.iter().enumerate() {
+                        let r = right.get(index).or_else(|| right.last());
+                        let Some(r) = r else { continue };
+                        if !settings_differ(l, r) && count.is_none() {
+                            continue;
+                        }
+                        if scope.budget == 0 {
+                            break;
+                        }
+                        scope.budget -= 1;
+                        let key = (Arc::clone(l), Arc::clone(r), count);
+                        match groups.get(&key) {
+                            Some(&at) => {
+                                if let Some((_, sources)) = ordered.get_mut(at)
+                                    && sources.last() != Some(path)
+                                {
+                                    sources.push(path.clone());
+                                }
+                            }
+                            None => {
+                                groups.insert(key.clone(), ordered.len());
+                                ordered.push((key, vec![path.clone()]));
+                            }
+                        }
+                        if count.is_some() {
+                            break;
+                        }
                     }
                 }
-                Some(_) => {}
-                None => sources_removed.push(path.clone()),
+                None if compile_sides.b_complete => sources_removed.push(path.clone()),
+                None => unknown_sources += 1,
             }
         }
-        sources_added = b
+        for path in b
             .sources
             .keys()
             .filter(|path| !a.sources.contains_key(*path))
-            .cloned()
-            .collect();
+        {
+            if compile_sides.a_complete {
+                sources_added.push(path.clone());
+            } else {
+                unknown_sources += 1;
+            }
+        }
     }
-    let compile: Vec<CompileChange> = groups
+    if unknown_sources > 0 {
+        scope.notes.push(
+            format!(
+                "Target {} has {unknown_sources} sources on only one side, and the other side has partial compile evidence.",
+                String::from_utf8_lossy(name)
+            )
+            .into(),
+        );
+    }
+    let compile: Vec<CompileChange> = ordered
         .into_iter()
-        .map(|((left, right), sources)| settings_change(sources, &left, &right))
+        .map(|((left, right, count), sources)| settings_change(sources, &left, &right, count))
         .collect();
     let link = if link_on {
         match (&a.link, &b.link) {
@@ -499,6 +632,19 @@ fn compare_targets(
     diff: &mut ConfigDiff,
 ) {
     let wanted = |name: &BString| options.targets.is_empty() || options.targets.contains(name);
+    let target_sides = Sides {
+        a_complete: a.evidence(Section::Targets).complete(),
+        b_complete: b.evidence(Section::Targets).complete(),
+    };
+    let compile_sides = Sides {
+        a_complete: a.evidence(Section::Compile).complete(),
+        b_complete: b.evidence(Section::Compile).complete(),
+    };
+    let mut scope = Scope {
+        compile: compile_sides,
+        budget: MAX_CHANGED_SOURCES,
+        notes: Vec::new(),
+    };
     for pair in diff.config_pairs.clone() {
         let left: BTreeMap<&BString, &TargetSnapshot> = a
             .targets
@@ -513,32 +659,60 @@ fn compare_targets(
             .map(|((_, name), target)| (name, target))
             .collect();
         if options.sections.contains(&Section::Targets) {
+            let mut unknown = 0_usize;
             for (name, target) in &right {
-                if !left.contains_key(name) {
+                if left.contains_key(name) {
+                    continue;
+                }
+                if target_sides.a_complete {
                     diff.targets_added.push(TargetEntry {
                         name: (*name).clone(),
                         config: pair.1.clone(),
                         kind: target.kind.clone(),
                     });
+                } else {
+                    unknown += 1;
                 }
             }
             for (name, target) in &left {
-                if !right.contains_key(name) {
+                if right.contains_key(name) {
+                    continue;
+                }
+                if target_sides.b_complete {
                     diff.targets_removed.push(TargetEntry {
                         name: (*name).clone(),
                         config: pair.0.clone(),
                         kind: target.kind.clone(),
                     });
+                } else {
+                    unknown += 1;
                 }
+            }
+            if unknown > 0 {
+                diff.partial.push((
+                    Section::Targets,
+                    format!(
+                        "{unknown} targets exist on only one side, and the other side has partial target evidence. They are not reported as added or removed."
+                    )
+                    .into(),
+                ));
             }
         }
         for (name, target) in &left {
             if let Some(other) = right.get(name)
-                && let Some(change) = target_change(name, &pair, target, other, options)
+                && let Some(change) = target_change(name, &pair, target, other, options, &mut scope)
             {
                 diff.targets_changed.push(change);
             }
         }
+    }
+    if scope.budget == 0 {
+        scope.notes.push(
+            format!("The comparison stopped after {MAX_CHANGED_SOURCES} changed sources.").into(),
+        );
+    }
+    for note in scope.notes {
+        diff.partial.push((Section::Compile, note));
     }
 }
 
@@ -579,7 +753,39 @@ fn compare_toolchains(a: &BuildSnapshot, b: &BuildSnapshot, diff: &mut ConfigDif
     }
 }
 
+/// Compare the observed calls of one package.
+///
+/// A call with a known position is compared with the call at the same position on
+/// the other side. A side with a complete trace makes the absence of a call a fact.
+/// Without that, only calls that both sides recorded are compared.
+fn outcomes_differ(
+    left: &[PackageObservation],
+    right: &[PackageObservation],
+    left_complete: bool,
+    right_complete: bool,
+) -> bool {
+    let numbered = |seen: &[PackageObservation]| -> Option<BTreeMap<u32, PackageObservation>> {
+        seen.iter()
+            .map(|observation| Some((observation.package_call?, observation.clone())))
+            .collect()
+    };
+    match (numbered(left), numbered(right)) {
+        (Some(l), Some(r)) => {
+            let shared = l
+                .iter()
+                .any(|(call, value)| r.get(call).is_some_and(|other| other != value));
+            let only_left = l.keys().any(|call| !r.contains_key(call));
+            let only_right = r.keys().any(|call| !l.contains_key(call));
+            shared || (only_left && right_complete) || (only_right && left_complete)
+        }
+        _ if left_complete && right_complete => left != right,
+        _ => false,
+    }
+}
+
 fn compare_packages(a: &BuildSnapshot, b: &BuildSnapshot, diff: &mut ConfigDiff) {
+    let a_complete = !a.packages_unknown && a.evidence(Section::Packages).complete();
+    let b_complete = !b.packages_unknown && b.evidence(Section::Packages).complete();
     let names: BTreeSet<&BString> = a.packages.keys().chain(b.packages.keys()).collect();
     for name in names {
         let left = a.packages.get(name);
@@ -599,12 +805,7 @@ fn compare_packages(a: &BuildSnapshot, b: &BuildSnapshot, diff: &mut ConfigDiff)
             side.map(|package| package.observed.clone())
                 .unwrap_or_default()
         };
-        let (left_seen, right_seen) = (observed(left), observed(right));
-        let known = |snapshot: &BuildSnapshot, seen: &[crate::snapshot::PackageObservation]| {
-            !seen.is_empty()
-                || (!snapshot.packages_unknown && snapshot.evidence(Section::Packages).complete())
-        };
-        if known(a, &left_seen) && known(b, &right_seen) && left_seen != right_seen {
+        if outcomes_differ(&observed(left), &observed(right), a_complete, b_complete) {
             fields.push("outcome");
         }
         if !fields.is_empty() {
@@ -650,6 +851,62 @@ fn compare_cache(a: &BuildSnapshot, b: &BuildSnapshot, set: CacheSet, diff: &mut
             });
         }
     }
+}
+
+/// Check that the requested configurations and targets exist.
+///
+/// # Errors
+///
+/// Returns a message for a configuration that a side does not have, or for a
+/// target that no side with target data has.
+pub fn validate(a: &BuildSnapshot, b: &BuildSnapshot, options: &DiffOptions) -> Result<(), String> {
+    let has = |snapshot: &BuildSnapshot, wanted: &BString| {
+        snapshot
+            .configs
+            .iter()
+            .any(|config| config.eq_ignore_ascii_case(wanted))
+    };
+    if let Some((left, right)) = &options.config_pair {
+        for (snapshot, wanted) in [(a, left), (b, right)] {
+            if !has(snapshot, wanted) {
+                let available: Vec<String> = snapshot
+                    .configs
+                    .iter()
+                    .map(|config| {
+                        if config.is_empty() {
+                            "(default)".to_owned()
+                        } else {
+                            String::from_utf8_lossy(config).into_owned()
+                        }
+                    })
+                    .collect();
+                return Err(format!(
+                    "{} has no configuration {}. Available: {}.",
+                    String::from_utf8_lossy(&snapshot.path),
+                    String::from_utf8_lossy(wanted),
+                    available.join(", ")
+                ));
+            }
+        }
+    }
+    let with_data: Vec<&BuildSnapshot> = [a, b]
+        .into_iter()
+        .filter(|snapshot| snapshot.evidence(Section::Targets).comparable())
+        .collect();
+    if !with_data.is_empty() {
+        for wanted in &options.targets {
+            let known = with_data
+                .iter()
+                .any(|snapshot| snapshot.targets.keys().any(|(_, name)| name == wanted));
+            if !known {
+                return Err(format!(
+                    "No compared build directory has a target named {}.",
+                    String::from_utf8_lossy(wanted)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compare two snapshots.

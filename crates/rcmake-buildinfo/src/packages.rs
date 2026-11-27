@@ -1,26 +1,35 @@
-//! Package evidence: cached `<Pkg>_DIR` entries, literal version hints, and the
-//! observed outcomes of a current native `rcmake` find trace.
+//! Package evidence: cached `<Pkg>_DIR` entries and literal version hints.
+//!
+//! The observed outcomes come from a native `rcmake` find trace that the caller
+//! decodes and checks, as [`crate::TraceInput`].
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
-use rcmake_base::{BString, path_lex::Lexical};
-use rcmake_host::{FileKind, Follow, Host};
-use rcmake_json::Value;
+use rcmake_base::BString;
+use rcmake_host::Host;
 
 use crate::reader::{ArtifactReader, ReadLimits};
-use crate::snapshot::{CacheRecord, PackageObservation, PackageSnapshot};
+use crate::snapshot::{CacheRecord, PackageSnapshot};
 
 const HELP_PREFIX: &[u8] = b"The directory containing a CMake configuration file for ";
-const TRACE: &str = "CMakeFiles/rcmake/find-trace.v1.json";
 const VERSION_FILE_LIMIT: u64 = 256 << 10;
+/// Most bytes that version hints read across all package directories together.
+const HINT_TOTAL_LIMIT: u64 = 16 << 20;
+/// Most package directories that version hints read.
+const MAX_HINT_PACKAGES: usize = 4096;
 
 /// Collect packages from cache entries and literal version files.
+///
+/// All directories share one read budget. Return the packages and whether every
+/// version hint fit in the budget.
 pub(crate) fn from_cache(
     host: &dyn Host,
     cache: &BTreeMap<BString, CacheRecord>,
-) -> BTreeMap<BString, PackageSnapshot> {
+) -> (BTreeMap<BString, PackageSnapshot>, bool) {
     let mut packages = BTreeMap::new();
+    let mut remaining = HINT_TOTAL_LIMIT;
+    let mut hinted = 0_usize;
+    let mut complete = true;
     for (name, record) in cache {
         let Some(package) = record
             .help
@@ -34,9 +43,15 @@ pub(crate) fn from_cache(
         }
         let missing =
             record.value.ends_with(b"-NOTFOUND") || record.value.as_slice() == b"NOTFOUND";
-        let version_hint = (!missing)
-            .then(|| version_hint(host, &record.value, package))
-            .flatten();
+        let version_hint = if missing {
+            None
+        } else if hinted >= MAX_HINT_PACKAGES || remaining == 0 {
+            complete = false;
+            None
+        } else {
+            hinted += 1;
+            version_hint(host, &record.value, package, &mut remaining, &mut complete)
+        };
         packages.insert(
             BString::from(package),
             PackageSnapshot {
@@ -46,17 +61,23 @@ pub(crate) fn from_cache(
             },
         );
     }
-    packages
+    (packages, complete)
 }
 
-fn version_hint(host: &dyn Host, dir: &[u8], package: &[u8]) -> Option<BString> {
+fn version_hint(
+    host: &dyn Host,
+    dir: &[u8],
+    package: &[u8],
+    remaining: &mut u64,
+    complete: &mut bool,
+) -> Option<BString> {
     let root = rcmake_host::path::to_native(dir);
     let mut reader = ArtifactReader::new(
         host,
         &root,
         ReadLimits {
-            max_file_bytes: VERSION_FILE_LIMIT,
-            max_total_bytes: 3 * VERSION_FILE_LIMIT,
+            max_file_bytes: VERSION_FILE_LIMIT.min(*remaining),
+            max_total_bytes: (3 * VERSION_FILE_LIMIT).min(*remaining),
         },
     )?;
     let lower = package.to_ascii_lowercase();
@@ -65,12 +86,22 @@ fn version_hint(host: &dyn Host, dir: &[u8], package: &[u8]) -> Option<BString> 
         [package, b"-config-version.cmake"].concat(),
         [&lower[..], b"-config-version.cmake"].concat(),
     ];
-    names.iter().find_map(|name| {
-        let bytes = reader
-            .read(Path::new(&String::from_utf8_lossy(name).into_owned()))
-            .ok()?;
-        literal_version(&bytes)
-    })
+    let mut found = None;
+    for name in &names {
+        match reader.read(&rcmake_host::path::to_native(name)) {
+            Ok(bytes) => {
+                found = literal_version(&bytes);
+                break;
+            }
+            Err(crate::ReadError::TooLarge) => {
+                *complete = false;
+                break;
+            }
+            Err(_) => {}
+        }
+    }
+    *remaining = remaining.saturating_sub(reader.used());
+    found
 }
 
 /// Return the version that a version file sets with one top-level literal
@@ -130,90 +161,42 @@ pub(crate) fn literal_version(text: &[u8]) -> Option<BString> {
     found
 }
 
-/// Observations from a native trace whose identity and stamps match the tree.
-pub(crate) struct TraceEvidence {
-    pub(crate) calls: Vec<(BString, PackageObservation)>,
-    pub(crate) complete: bool,
-}
-
-fn stamp_matches(host: &dyn Host, stamp: &Value) -> bool {
-    let (Some(path), Some(size), Some(mtime)) = (
-        stamp.get("path").and_then(Value::as_bytes),
-        stamp.get("size").and_then(Value::as_u64),
-        stamp.get("mtime_ns").and_then(Value::as_i64),
-    ) else {
-        return false;
-    };
-    host.metadata(&rcmake_host::path::to_native(path), Follow::Yes)
-        .is_ok_and(|meta| {
-            meta.kind == FileKind::File
-                && meta.len == size
-                && meta
-                    .mtime
-                    .secs
-                    .saturating_mul(1_000_000_000)
-                    .saturating_add(i64::from(meta.mtime.nanos))
-                    == mtime
-        })
-}
-
-/// Read the native trace. Return `Err` with a note when it exists but is not current.
-pub(crate) fn trace(
-    reader: &mut ArtifactReader<'_>,
-    build: &[u8],
-) -> Option<Result<TraceEvidence, BString>> {
-    let value = reader.json(Path::new(TRACE)).ok()?;
-    if value.get("schema").and_then(Value::as_str) != Some("rcmake-find-trace-v1") {
-        return None;
-    }
-    let host = reader.host();
-    let same_build = value
-        .get("build")
-        .and_then(Value::as_bytes)
-        .is_some_and(|recorded| {
-            Lexical::new(recorded).normalize() == Lexical::new(build).normalize()
-        });
-    let current = same_build
-        && value
-            .get("cache")
-            .is_some_and(|cache| stamp_matches(host, cache))
-        && value
-            .get("inputs")
-            .and_then(Value::as_array)
-            .is_some_and(|inputs| inputs.iter().all(|input| stamp_matches(host, input)));
-    if !current {
-        return Some(Err(
-            "The rcmake find trace is from a past run. Package outcomes are unknown.".into(),
-        ));
-    }
-    let complete = value.get("completed").and_then(Value::as_bool) == Some(true)
-        && value.get("omitted_calls").and_then(Value::as_u64) == Some(0);
-    let calls = value
-        .get("calls")
-        .and_then(Value::as_array)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|call| {
-            let bytes = |value: Option<&Value>| value.and_then(Value::as_bytes).map(BString::from);
-            Some((
-                bytes(call.get("name"))?,
-                PackageObservation {
-                    outcome: bytes(call.get("outcome"))?,
-                    version: bytes(call.get("version")),
-                    selected: bytes(
-                        call.get("selected")
-                            .and_then(|selected| selected.get("file")),
-                    ),
-                },
-            ))
-        })
-        .collect();
-    Some(Ok(TraceEvidence { calls, complete }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::path::Path;
+
+    #[test]
+    fn version_hints_share_one_read_budget() {
+        let host = rcmake_host::PureHost::default();
+        let mut cache = BTreeMap::new();
+        let version = format!("set(PACKAGE_VERSION 1.0)\n#{}\n", "x".repeat(200 << 10));
+        for index in 0..100 {
+            let dir = format!("/p/{index}");
+            host.seed_file(
+                Path::new(&format!("{dir}/Pkg{index}ConfigVersion.cmake")),
+                version.as_bytes(),
+            )
+            .expect("seed");
+            cache.insert(
+                BString::from(format!("Pkg{index}_DIR")),
+                CacheRecord {
+                    ty: "PATH".into(),
+                    value: dir.into(),
+                    help: format!("{}Pkg{index}.", String::from_utf8_lossy(HELP_PREFIX)).into(),
+                },
+            );
+        }
+        let (packages, complete) = from_cache(&host, &cache);
+        assert_eq!(packages.len(), 100);
+        assert!(!complete, "100 files of 200 KiB exceed the 16 MiB budget");
+        let hinted = packages
+            .values()
+            .filter(|package| package.version_hint.is_some())
+            .count();
+        assert!(hinted > 0 && hinted < 100, "{hinted}");
+    }
 
     #[test]
     fn literal_version_rejects_conditional_and_computed_values() {

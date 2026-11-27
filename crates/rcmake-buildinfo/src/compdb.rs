@@ -1,13 +1,16 @@
 //! `compile_commands.json` reader with target inference from object paths.
 //!
-//! A `command` string is split only with a dialect that toolchain evidence supports.
-//! Without that evidence, or when a response file cannot be read, the command stays
-//! opaque and only its raw text is compared.
+//! A `command` string is split with the quoting rules of the platform that wrote
+//! the database. Flags are classified only with a compiler frontend that toolchain
+//! evidence supports. Without that evidence, past a limit, with a response file that
+//! cannot be read, or with a malformed row, the command stays opaque and only its raw
+//! text or its ordered tokens are compared.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
-use rcmake_base::{BString, cmdline::Arguments};
+use rcmake_base::{BString, cmdline::Arguments, path_lex::Lexical};
 use rcmake_json::Value;
 
 use crate::reader::{ArtifactReader, ReadError};
@@ -17,14 +20,23 @@ const MAX_ENTRIES: usize = 200_000;
 const MAX_TOKENS: usize = 65_536;
 const MAX_RESPONSE_FILE: u64 = 1 << 20;
 const MAX_RESPONSE_TOTAL: u64 = 16 << 20;
+/// Deepest chain of response files inside response files that the reader expands.
+const MAX_RESPONSE_DEPTH: usize = 4;
 
-/// Command-line dialect of a compiler.
+/// Flag style of a compiler frontend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Dialect {
-    /// POSIX shell quoting and GNU-style flags.
+pub(crate) enum Frontend {
+    /// GNU-style flags such as `-I` and `-o`.
     Gnu,
-    /// Windows quoting and MSVC-style flags.
+    /// MSVC-style flags such as `/I` and `/Fo`.
     Msvc,
+}
+
+/// Quoting rules of a command line. They depend on the platform, not on the compiler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Quoting {
+    Posix,
+    Windows,
 }
 
 /// A compiler that toolchain evidence names.
@@ -32,7 +44,7 @@ pub(crate) enum Dialect {
 pub(crate) struct Compiler {
     pub(crate) language: BString,
     pub(crate) path: BString,
-    pub(crate) dialect: Option<Dialect>,
+    pub(crate) frontend: Option<Frontend>,
 }
 
 /// Result of reading the compile database.
@@ -58,41 +70,76 @@ fn stem(path: &[u8]) -> BString {
     BString::from(name)
 }
 
+/// Arguments of one row: the ordered tokens, or why the row is uncertain.
+enum RowArguments {
+    Tokens(Vec<BString>),
+    /// The array has more tokens than the limit.
+    TooMany,
+    /// An array item is not a string.
+    Malformed,
+}
+
 struct Entry<'a> {
     directory: BString,
     file: BString,
     output: Option<BString>,
-    arguments: Option<Vec<BString>>,
+    arguments: Option<RowArguments>,
     command: Option<&'a [u8]>,
 }
 
 fn parse_entry(value: &Value) -> Option<Entry<'_>> {
     let field = |name| value.get(name).and_then(Value::as_bytes);
+    let arguments = match value.get("arguments") {
+        None => None,
+        Some(Value::Array(items)) if items.len() > MAX_TOKENS => Some(RowArguments::TooMany),
+        Some(Value::Array(items)) => Some(
+            items
+                .iter()
+                .map(|item| item.as_bytes().map(BString::from))
+                .collect::<Option<Vec<_>>>()
+                .map_or(RowArguments::Malformed, RowArguments::Tokens),
+        ),
+        Some(_) => Some(RowArguments::Malformed),
+    };
     Some(Entry {
         directory: field("directory").map(BString::from).unwrap_or_default(),
         file: BString::from(field("file")?),
         output: field("output").map(BString::from),
-        arguments: value
-            .get("arguments")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_bytes)
-                    .take(MAX_TOKENS)
-                    .map(BString::from)
-                    .collect()
-            }),
+        arguments,
         command: field("command"),
     })
 }
 
+/// Return whether `path` uses a Windows drive or UNC root, with either separator.
+fn windows_path(path: &[u8]) -> bool {
+    matches!(path, [letter, b':', ..] if letter.is_ascii_alphabetic())
+        || path.starts_with(b"\\\\")
+        || path.starts_with(b"//")
+}
+
+fn forward(path: &[u8]) -> BString {
+    path.iter()
+        .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+        .collect::<Vec<u8>>()
+        .into()
+}
+
+/// Make `path` absolute against `directory` with the path rules of the platform
+/// that wrote the row. A Windows path keeps its drive or UNC root.
 fn absolute(directory: &[u8], path: &[u8]) -> BString {
-    if path.starts_with(b"/") || path.get(1) == Some(&b':') || directory.is_empty() {
-        return rcmake_base::path_lex::Lexical::new(path).normalize();
+    if windows_path(directory) || windows_path(path) {
+        let (directory, path) = (forward(directory), forward(path));
+        if Lexical::windows(&path).absolute() || directory.is_empty() {
+            return Lexical::windows(&path).normalize();
+        }
+        let joined = Lexical::windows(&directory).append(&path);
+        return Lexical::windows(&joined).normalize();
+    }
+    if path.starts_with(b"/") || directory.is_empty() {
+        return Lexical::new(path).normalize();
     }
     let joined = [directory, b"/", path].concat();
-    rcmake_base::path_lex::Lexical::new(&joined).normalize()
+    Lexical::new(&joined).normalize()
 }
 
 /// Locate the compiler token. Tokens before it belong to a launcher.
@@ -115,30 +162,47 @@ struct Expander<'r, 'h> {
 }
 
 impl Expander<'_, '_> {
-    /// Expand `@file` tokens once. Return `None` when a response file is unreadable.
+    /// Expand `@file` tokens. A response file inside a response file is expanded
+    /// up to [`MAX_RESPONSE_DEPTH`] levels. Return `None` when a response file is
+    /// unreadable, a link, too deep, or when the result has more than [`MAX_TOKENS`]
+    /// tokens.
     fn expand(
         &mut self,
         tokens: Vec<BString>,
         directory: &[u8],
-        dialect: Dialect,
+        frontend: Frontend,
+        depth: usize,
     ) -> Option<Vec<BString>> {
-        let mut out = Vec::with_capacity(tokens.len());
+        let mut out = Vec::with_capacity(tokens.len().min(MAX_TOKENS));
         for token in tokens {
             let Some(file) = token.strip_prefix(b"@") else {
                 out.push(token);
+                if out.len() > MAX_TOKENS {
+                    return None;
+                }
                 continue;
             };
-            let path = absolute(directory, file);
-            let relative = self
-                .reader
-                .relative(Path::new(&String::from_utf8_lossy(&path).into_owned()))?;
+            if depth >= MAX_RESPONSE_DEPTH {
+                return None;
+            }
+            let path = rcmake_host::path::to_native(&absolute(directory, file));
+            let relative = self.reader.artifact_relative(&path)?;
             if self.used >= MAX_RESPONSE_TOTAL {
                 return None;
             }
             let limit = MAX_RESPONSE_FILE.min(MAX_RESPONSE_TOTAL - self.used);
             let bytes = self.reader.read_limited(&relative, limit).ok()?;
             self.used += bytes.len() as u64;
-            out.extend(Arguments::new(&bytes, dialect == Dialect::Msvc).take(MAX_TOKENS));
+            // Read one token past the room that is left, so a cut expansion is visible.
+            let room = MAX_TOKENS.saturating_sub(out.len()).saturating_add(1);
+            let inner: Vec<BString> = Arguments::new(&bytes, frontend == Frontend::Msvc)
+                .take(room)
+                .collect();
+            if inner.len() >= room {
+                return None;
+            }
+            let inner = self.expand(inner, directory, frontend, depth + 1)?;
+            out.extend(inner);
             if out.len() > MAX_TOKENS {
                 return None;
             }
@@ -151,7 +215,7 @@ fn classify(
     tokens: &[BString],
     source: &[u8],
     directory: &[u8],
-    dialect: Dialect,
+    frontend: Frontend,
     language: Option<BString>,
 ) -> (CompileSettings, Option<BString>) {
     let mut settings = CompileSettings {
@@ -160,7 +224,7 @@ fn classify(
     };
     let mut output = None;
     let mut iter = tokens.iter().peekable();
-    let msvc = dialect == Dialect::Msvc;
+    let msvc = frontend == Frontend::Msvc;
     while let Some(token) = iter.next() {
         let t = token.as_slice();
         let is_source = absolute(directory, t) == absolute(directory, source);
@@ -291,6 +355,14 @@ pub(crate) fn infer_target(
     Some((config, name.into()))
 }
 
+/// Counts of rows that stay opaque or incomplete, for the partial note.
+#[derive(Default)]
+struct RowNotes {
+    too_many: usize,
+    malformed: usize,
+    skipped: usize,
+}
+
 /// Read `compile_commands.json` from the build root.
 pub(crate) fn load(
     reader: &mut ArtifactReader<'_>,
@@ -302,47 +374,70 @@ pub(crate) fn load(
         "The compile database is not an array.".into(),
     ))?;
     let mut database = CompileDatabase::default();
+    let mut notes = Vec::new();
     if entries.len() > MAX_ENTRIES {
-        database.partial =
-            Some(format!("compile_commands.json has more than {MAX_ENTRIES} entries.").into());
+        notes.push(format!(
+            "compile_commands.json has more than {MAX_ENTRIES} entries."
+        ));
     }
     let default_config = configs.first().cloned().unwrap_or_default();
     let mut expander = Expander { reader, used: 0 };
-    for entry in entries.iter().take(MAX_ENTRIES).filter_map(parse_entry) {
-        let (tokens, known) = match (&entry.arguments, entry.command) {
-            (Some(arguments), _) => (Some(arguments.clone()), None),
+    let mut shared: HashSet<Arc<CompileSettings>> = HashSet::new();
+    let mut rows = RowNotes::default();
+    for value in entries.iter().take(MAX_ENTRIES) {
+        let Some(entry) = parse_entry(value) else {
+            rows.skipped += 1;
+            continue;
+        };
+        let quoting = if windows_path(&entry.directory) {
+            Quoting::Windows
+        } else {
+            Quoting::Posix
+        };
+        let (tokens, from_command) = match (&entry.arguments, entry.command) {
+            (Some(RowArguments::Tokens(arguments)), _) => (Some(arguments.clone()), false),
+            (Some(RowArguments::TooMany), _) => {
+                rows.too_many += 1;
+                (None, false)
+            }
+            (Some(RowArguments::Malformed), _) => {
+                rows.malformed += 1;
+                (None, false)
+            }
             (None, Some(command)) => {
-                let probe: Vec<BString> = Arguments::new(command, false).take(8).collect();
-                let windows: Vec<BString> = Arguments::new(command, true).take(8).collect();
-                let found = locate(&probe, compilers).or_else(|| locate(&windows, compilers));
-                match found.and_then(|(_, compiler)| compiler.dialect) {
-                    Some(dialect) => (
-                        Some(
-                            Arguments::new(command, dialect == Dialect::Msvc)
-                                .take(MAX_TOKENS + 1)
-                                .collect(),
-                        ),
-                        Some(dialect),
-                    ),
-                    None => (None, None),
+                let split: Vec<BString> = Arguments::new(command, quoting == Quoting::Windows)
+                    .take(MAX_TOKENS + 1)
+                    .collect();
+                if split.len() > MAX_TOKENS {
+                    rows.too_many += 1;
+                    (None, true)
+                } else {
+                    (Some(split), true)
                 }
             }
-            (None, None) => continue,
+            (None, None) => {
+                rows.skipped += 1;
+                continue;
+            }
         };
         let mut settings = None;
         let mut output = entry.output.clone();
-        if let Some(tokens) = tokens.filter(|tokens| tokens.len() <= MAX_TOKENS) {
-            let located = locate(&tokens, compilers);
-            let dialect = known
-                .or_else(|| located.and_then(|(_, compiler)| compiler.dialect))
-                .or(entry.arguments.as_ref().map(|_| Dialect::Gnu));
-            let start = located.map_or(1, |(index, _)| index + 1);
+        if let Some(tokens) = &tokens {
+            let located = locate(tokens, compilers);
+            // A command string needs frontend evidence. An argument array names its
+            // tokens, so GNU flags are the documented default.
+            let frontend = located
+                .and_then(|(_, compiler)| compiler.frontend)
+                .or((!from_command).then_some(Frontend::Gnu));
+            let compiler_at = located.map_or(0, |(index, _)| index);
             let language = located.map(|(_, compiler)| compiler.language.clone());
-            if let Some(dialect) = dialect {
-                let rest = tokens.get(start..).unwrap_or_default().to_vec();
-                if let Some(rest) = expander.expand(rest, &entry.directory, dialect) {
-                    let (classified, from_flags) =
-                        classify(&rest, &entry.file, &entry.directory, dialect, language);
+            if let Some(frontend) = frontend {
+                let rest = tokens.get(compiler_at + 1..).unwrap_or_default().to_vec();
+                if let Some(rest) = expander.expand(rest, &entry.directory, frontend, 0) {
+                    let (mut classified, from_flags) =
+                        classify(&rest, &entry.file, &entry.directory, frontend, language);
+                    classified.compiler = tokens.get(compiler_at).cloned();
+                    classified.launcher = tokens.get(..compiler_at).unwrap_or_default().to_vec();
                     output = output.or(from_flags);
                     settings = Some(classified);
                 }
@@ -350,22 +445,25 @@ pub(crate) fn load(
         }
         let settings = settings.unwrap_or_else(|| {
             database.opaque += 1;
+            let fragments = match (&entry.arguments, entry.command) {
+                (Some(RowArguments::Tokens(arguments)), _) => arguments.clone(),
+                (_, Some(command)) => vec![BString::from(command)],
+                _ => Vec::new(),
+            };
             CompileSettings {
-                fragments: vec![entry.command.map_or_else(
-                    || {
-                        entry
-                            .arguments
-                            .as_ref()
-                            .map(|args| args.join(&b' '))
-                            .map(BString::from)
-                            .unwrap_or_default()
-                    },
-                    BString::from,
-                )],
+                fragments,
                 opaque: true,
                 ..CompileSettings::default()
             }
         });
+        let settings = match shared.get(&settings) {
+            Some(existing) => Arc::clone(existing),
+            None => {
+                let settings = Arc::new(settings);
+                shared.insert(Arc::clone(&settings));
+                settings
+            }
+        };
         let object = output
             .as_ref()
             .map(|output| absolute(&entry.directory, output));
@@ -396,7 +494,30 @@ pub(crate) fn load(
             });
         target
             .sources
-            .insert(absolute(&entry.directory, &entry.file), settings);
+            .entry(absolute(&entry.directory, &entry.file))
+            .or_default()
+            .push(settings);
+    }
+    if rows.too_many > 0 {
+        notes.push(format!(
+            "{} rows had more than {MAX_TOKENS} arguments and are compared as text.",
+            rows.too_many
+        ));
+    }
+    if rows.malformed > 0 {
+        notes.push(format!(
+            "{} rows had malformed arguments and are compared as text.",
+            rows.malformed
+        ));
+    }
+    if rows.skipped > 0 {
+        notes.push(format!(
+            "{} rows had no file or no command and were skipped.",
+            rows.skipped
+        ));
+    }
+    if !notes.is_empty() {
+        database.partial = Some(notes.join(" ").into());
     }
     Ok(database)
 }
@@ -409,7 +530,7 @@ mod tests {
         vec![Compiler {
             language: "CXX".into(),
             path: "/usr/bin/c++".into(),
-            dialect: Some(Dialect::Gnu),
+            frontend: Some(Frontend::Gnu),
         }]
     }
 
@@ -458,7 +579,7 @@ mod tests {
             rest,
             b"/src/main.cpp",
             b"/b",
-            Dialect::Gnu,
+            Frontend::Gnu,
             Some(compiler.language.clone()),
         );
         assert_eq!(settings.defines, [BString::from("FOO=1")]);
@@ -477,9 +598,144 @@ mod tests {
         let tokens: Vec<BString> = ["/DWIN=1", "/Iinc", "/usr/share/x", "/Fooutput.obj"]
             .map(BString::from)
             .to_vec();
-        let (settings, output) = classify(&tokens, b"main.c", b"C:/b", Dialect::Msvc, None);
+        let (settings, output) = classify(&tokens, b"main.c", b"C:/b", Frontend::Msvc, None);
         assert_eq!(settings.defines, [BString::from("WIN=1")]);
         assert_eq!(settings.fragments, [BString::from("/usr/share/x")]);
         assert_eq!(output, Some("output.obj".into()));
+    }
+
+    fn database(rows: &str, files: &[(&str, &[u8])]) -> CompileDatabase {
+        let host = rcmake_host::PureHost::default();
+        host.seed_file(Path::new("/b/compile_commands.json"), rows.as_bytes())
+            .expect("seed");
+        for (path, bytes) in files {
+            host.seed_file(Path::new(path), bytes).expect("seed");
+        }
+        let mut reader = ArtifactReader::new(&host, Path::new("/b"), crate::ReadLimits::default())
+            .expect("root");
+        load(&mut reader, &gnu(), &[BString::default()]).expect("database")
+    }
+
+    fn sources(database: &CompileDatabase) -> Vec<Arc<CompileSettings>> {
+        database
+            .targets
+            .values()
+            .flat_map(|target| target.sources.values().flatten().cloned())
+            .collect()
+    }
+
+    #[test]
+    fn rows_for_one_source_keep_each_invocation_and_the_compiler_identity() {
+        let rows = r#"[
+          {"directory":"/b","file":"/src/a.c","arguments":["ccache","/usr/bin/c++","-arch","x86_64","-o","CMakeFiles/app.dir/a.c.o","-c","/src/a.c"]},
+          {"directory":"/b","file":"/src/a.c","arguments":["ccache","/usr/bin/c++","-arch","arm64","-o","CMakeFiles/app.dir/a.c.o.arm64","-c","/src/a.c"]}
+        ]"#;
+        let database = database(rows, &[]);
+        let target = &database.targets[&(BString::default(), BString::from("app"))];
+        let invocations = &target.sources[b"/src/a.c".as_slice()];
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].fragments, [BString::from("-arch x86_64")]);
+        assert_eq!(invocations[1].fragments, [BString::from("-arch arm64")]);
+        assert_eq!(invocations[0].compiler, Some("/usr/bin/c++".into()));
+        assert_eq!(invocations[0].launcher, [BString::from("ccache")]);
+    }
+
+    #[test]
+    fn oversized_and_malformed_rows_stay_opaque_and_partial() {
+        let many: Vec<String> = (0..=MAX_TOKENS)
+            .map(|index| format!("\"-D{index}\""))
+            .collect();
+        let rows = format!(
+            r#"[{{"directory":"/b","file":"/src/a.c","arguments":["/usr/bin/c++",{}]}},
+               {{"directory":"/b","file":"/src/b.c","arguments":["/usr/bin/c++",1,"-c","/src/b.c"]}},
+               {{"directory":"/b"}}]"#,
+            many.join(",")
+        );
+        let database = database(&rows, &[]);
+        assert_eq!(database.opaque, 2);
+        let partial = database.partial.expect("partial").to_string();
+        assert!(partial.contains("more than 65536 arguments"), "{partial}");
+        assert!(partial.contains("malformed"), "{partial}");
+        assert!(partial.contains("skipped"), "{partial}");
+    }
+
+    #[test]
+    fn response_files_detect_cut_nested_and_linked_expansions() {
+        let full: Vec<String> = (0..=MAX_TOKENS).map(|index| format!("-D{index}")).collect();
+        let full = full.join(" ");
+        let row = |file: &str, response: &str| {
+            format!(
+                r#"{{"directory":"/b","file":"/src/{file}","arguments":["/usr/bin/c++","@{response}","-o","CMakeFiles/app.dir/{file}.o","-c","/src/{file}"]}}"#
+            )
+        };
+        let rows = format!(
+            "[{},{},{}]",
+            row("big.c", "big.rsp"),
+            row("nested.c", "one.rsp"),
+            row("deep.c", "d1.rsp")
+        );
+        let database = database(
+            &rows,
+            &[
+                ("/b/big.rsp", full.as_bytes()),
+                ("/b/one.rsp", b"-DONE @two.rsp"),
+                ("/b/two.rsp", b"-DTWO"),
+                ("/b/d1.rsp", b"@d2.rsp"),
+                ("/b/d2.rsp", b"@d3.rsp"),
+                ("/b/d3.rsp", b"@d4.rsp"),
+                ("/b/d4.rsp", b"@d5.rsp"),
+                ("/b/d5.rsp", b"-DDEEP"),
+            ],
+        );
+        let by_file = |name: &str| {
+            let key = BString::from(format!("/src/{name}"));
+            database
+                .targets
+                .values()
+                .find_map(|target| target.sources.get(&key))
+                .and_then(|invocations| invocations.first().cloned())
+                .expect("source")
+        };
+        assert!(
+            by_file("big.c").opaque,
+            "one token past the limit is visible"
+        );
+        assert_eq!(
+            by_file("nested.c").defines,
+            [BString::from("ONE"), BString::from("TWO")]
+        );
+        assert!(by_file("deep.c").opaque, "too deep");
+    }
+
+    #[test]
+    fn linked_response_file_is_rejected() {
+        let host = rcmake_host::PureHost::default();
+        host.seed_file(Path::new("/b/real.rsp"), b"-DLINK")
+            .expect("seed");
+        rcmake_host::Host::symlink(&host, Path::new("/b/real.rsp"), Path::new("/b/alias.rsp"))
+            .expect("link");
+        host.seed_file(
+            Path::new("/b/compile_commands.json"),
+            br#"[{"directory":"/b","file":"/src/a.c","arguments":["/usr/bin/c++","@alias.rsp","-o","CMakeFiles/app.dir/a.c.o","-c","/src/a.c"]}]"#,
+        )
+        .expect("seed");
+        let mut reader = ArtifactReader::new(&host, Path::new("/b"), crate::ReadLimits::default())
+            .expect("root");
+        let database = load(&mut reader, &gnu(), &[BString::default()]).expect("database");
+        let settings = sources(&database);
+        assert!(settings[0].opaque);
+    }
+
+    #[test]
+    fn windows_paths_keep_drive_and_unc_roots() {
+        assert_eq!(
+            absolute(b"C:/b", br"\\server\share\x.rsp"),
+            BString::from("//server/share/x.rsp")
+        );
+        assert_eq!(
+            absolute(br"C:\b", b"sub/x.rsp"),
+            BString::from("C:/b/sub/x.rsp")
+        );
+        assert_eq!(absolute(b"/b", b"x.rsp"), BString::from("/b/x.rsp"));
     }
 }

@@ -262,7 +262,7 @@ fn run_cmake(
         if let [command, args @ ..] = rest
             && matches!(
                 command.as_slice(),
-                b"doctor" | b"cache" | b"diff-config" | b"fmt" | b"lint" | b"verify"
+                b"doctor" | b"cache" | b"diff-config" | b"explain" | b"fmt" | b"lint" | b"verify"
             )
             && !host
                 .metadata(&resolve_cli_path(host.as_ref(), command), Follow::Yes)
@@ -272,14 +272,12 @@ fn run_cmake(
                 b"doctor" => probe_cache::doctor(argv.first(), args, host.as_ref()),
                 b"cache" => probe_cache::cache(args, host.as_ref()),
                 b"diff-config" => diff_config_cmd::run(argv.first(), args, host),
+                b"explain" => explain_cmd::run(argv.first(), args, host),
                 b"fmt" => fmt_cmd::run(argv.first(), args, host),
                 b"lint" => lint_cmd::run(argv.first(), args, host),
                 b"verify" => verify_cmd::run(argv.first(), args, host),
                 _ => 2,
             };
-        }
-        if let Some(args) = rest.strip_prefix(&[BString::from("explain")]) {
-            return explain_cmd::run(argv.first(), args, host);
         }
         if let Some(args) = rest.strip_prefix(&[BString::from("ctest")]) {
             let mut sub_argv = Vec::with_capacity(args.len() + 1);
@@ -1079,5 +1077,74 @@ mod tests {
             )
         );
         assert!(!configure::is_dir(host.as_ref(), Path::new("/work/build")));
+    }
+
+    #[test]
+    fn native_subcommand_names_configure_existing_directories_under_both_personas() {
+        let subcommands = [
+            "doctor",
+            "cache",
+            "diff-config",
+            "explain",
+            "fmt",
+            "lint",
+            "verify",
+            "ccmake",
+        ];
+
+        for name in subcommands {
+            for (argv0, build_dir) in [("rcmake", "out_native"), ("cmake", "out_compat")] {
+                let host = crate::driver_tests::project_host();
+                host.seed_file(
+                    &Path::new("/work").join(name).join("CMakeLists.txt"),
+                    format!(
+                        "cmake_minimum_required(VERSION 3.10)\nproject(DirOperand NONE)\nmessage(STATUS \"configured:{name}:{argv0}\")\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+
+                let args = [argv0, name, "-B", build_dir, "-G", "Ninja"].map(BString::from);
+                let code = run(&args, host.clone());
+                assert_eq!(
+                    code,
+                    0,
+                    "argv0={argv0} name={name} stderr={}",
+                    host.stream_bytes(Stream::Stderr)
+                );
+                let stdout = host.stream_bytes(Stream::Stdout).to_string();
+                assert!(
+                    stdout.contains(&format!("-- configured:{name}:{argv0}")),
+                    "argv0={argv0} name={name} stdout={stdout}"
+                );
+            }
+
+            // Without a matching directory, Compat persona never dispatches native subcommands.
+            let compat_host = crate::driver_tests::project_host();
+            let compat_code = run(
+                &[BString::from("cmake"), BString::from(name)],
+                compat_host.clone(),
+            );
+            assert_eq!(compat_code, 1, "compat without dir for {name}");
+            let compat_err = compat_host.stream_bytes(Stream::Stderr).to_string();
+            assert!(
+                compat_err.contains("The source directory"),
+                "compat without dir for {name}: stderr={compat_err}"
+            );
+
+            // Without a matching directory, Native persona dispatches the subcommand.
+            let native_host = crate::driver_tests::project_host();
+            let native_args = [
+                BString::from("rcmake"),
+                BString::from(name),
+                BString::from("--help"),
+            ];
+            let _ = run(&native_args, native_host.clone());
+            let native_err = native_host.stream_bytes(Stream::Stderr).to_string();
+            assert!(
+                !native_err.contains("The source directory"),
+                "native without dir for {name} unexpectedly fell into configure: stderr={native_err}"
+            );
+        }
     }
 }

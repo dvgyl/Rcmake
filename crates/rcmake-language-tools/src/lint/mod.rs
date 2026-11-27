@@ -60,6 +60,12 @@ pub struct LintLimits {
     pub max_tokens: usize,
     /// Maximum tracked variables per scope.
     pub max_vars: usize,
+    /// Maximum tracked flow-control nesting depth (`if`/`foreach`/`while`/`function`/`macro`/`block`).
+    pub max_flow_depth: usize,
+    /// Maximum cumulative retained scope entries across active state and stacked control frames.
+    pub max_total_scope_entries: usize,
+    /// Maximum cumulative retained scope bytes across active state and stacked control frames.
+    pub max_total_scope_bytes: usize,
     /// Maximum static include recursion depth.
     pub max_include_depth: usize,
     /// Maximum statically included files read per linted file.
@@ -76,6 +82,9 @@ impl Default for LintLimits {
             max_input_bytes: 16 * 1024 * 1024,
             max_tokens: 500_000,
             max_vars: 8192,
+            max_flow_depth: 128,
+            max_total_scope_entries: 65_536,
+            max_total_scope_bytes: 8 * 1024 * 1024,
             max_include_depth: 16,
             max_include_files: 64,
             max_include_bytes: 2 * 1024 * 1024,
@@ -90,8 +99,19 @@ impl Default for LintLimits {
 /// or an ancestor `.rcmake.toml` is created, edited, or deleted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LintDependencies {
-    /// Every included path probed or loaded during static analysis.
+    /// Included paths probed or loaded during static analysis.
+    ///
+    /// Successfully consumed include files are recorded independently of the failed-probe cap
+    /// so missed probes cannot evict an actual dependency.
     pub included_files: BTreeSet<PathBuf>,
+    /// Workspace include files that existed and were consumed (excluding bundled stdlib).
+    ///
+    /// LSP registers file watchers for non-`.cmake` entries in this set.
+    pub consumed_files: BTreeSet<PathBuf>,
+    /// `true` if dependency tracking hit a probe/include budget or saw a dynamic `include()`.
+    ///
+    /// When `true`, LSP conservatively refreshes the document on workspace file events.
+    pub incomplete: bool,
     /// Every ancestor directory checked for `.rcmake.toml`.
     pub config_dirs: Vec<PathBuf>,
     /// Active `.rcmake.toml` path, if one was loaded.
@@ -105,6 +125,10 @@ pub struct LintResult {
     pub findings: Vec<Finding>,
     /// Reachable include and configuration dependencies observed during analysis.
     pub dependencies: LintDependencies,
+    /// `true` if one or more findings (including invalid directives) were dropped at `max_findings`.
+    pub findings_truncated: bool,
+    /// `true` if static scope tracking degraded after hitting flow-depth, entry, or byte budgets.
+    pub scope_truncated: bool,
 }
 
 /// Bounded read-only workspace reader shared by CLI and LSP lint.
@@ -294,12 +318,9 @@ pub fn lint_concrete(
 ) -> LintResult {
     let analyzer =
         scope::Analyzer::new(path, src, concrete, config, limits, reader, workspace_root);
-    let (mut findings, dependencies) = analyzer.run(concrete);
-    sort_and_dedup_findings(&mut findings);
-    LintResult {
-        findings,
-        dependencies,
-    }
+    let mut result = analyzer.run(concrete);
+    sort_and_dedup_findings(&mut result.findings);
+    result
 }
 
 /// Sort findings deterministically by `(path, span.start, span.end, rule, message)` and
@@ -655,5 +676,163 @@ mod tests {
         let json = rcmake_json::write_compact(&doc).to_string();
         assert!(json.contains(r#""ruleId":"old-policy""#));
         assert!(json.contains(r#""uri":"/work/CMakeLists.txt""#));
+    }
+
+    #[test]
+    fn deeply_nested_if_and_many_elseif_branches_stay_strictly_bounded() {
+        let mut nested = String::new();
+        for i in 0..300 {
+            nested.push_str(&format!("set(VAR_{i} {i})\n"));
+        }
+        for _ in 0..400 {
+            nested.push_str("if(ON)\n");
+        }
+        nested.push_str("message(STATUS \"${VAR_0}\")\n");
+        for _ in 0..400 {
+            nested.push_str("endif()\n");
+        }
+        let limits = LintLimits {
+            max_flow_depth: 64,
+            max_total_scope_entries: 4096,
+            max_total_scope_bytes: 256 * 1024,
+            ..LintLimits::default()
+        };
+        let res = lint_bytes(
+            Path::new("/work/CMakeLists.txt"),
+            nested.as_bytes(),
+            &LintConfig::default(),
+            &limits,
+            &EmptyWorkspaceReader,
+            Some(Path::new("/work")),
+        )
+        .unwrap();
+        assert!(res.scope_truncated, "expected nested scope truncation");
+
+        // Many elseif branches with many bindings join incrementally without storing every branch.
+        let mut chain = String::new();
+        for i in 0..200 {
+            chain.push_str(&format!("set(B_{i} {i})\n"));
+        }
+        chain.push_str("if(C0)\n  set(OUT 1)\n");
+        for i in 1..200 {
+            chain.push_str(&format!("elseif(C{i})\n  set(OUT {i})\n"));
+        }
+        chain.push_str("else()\n  set(OUT 0)\nendif()\nmessage(STATUS \"${OUT}\")\n");
+        let chain_res = lint_bytes(
+            Path::new("/work/CMakeLists.txt"),
+            chain.as_bytes(),
+            &LintConfig::default(),
+            &limits,
+            &EmptyWorkspaceReader,
+            Some(Path::new("/work")),
+        )
+        .unwrap();
+        assert!(
+            chain_res.findings.is_empty(),
+            "got {:?}",
+            chain_res.findings
+        );
+    }
+
+    #[test]
+    fn invalid_directives_are_charged_against_max_findings_and_report_truncation() {
+        let mut src = String::new();
+        for i in 0..50 {
+            src.push_str(&format!("# rcmake-lint: disable=unknown-rule-{i}\n"));
+        }
+        src.push_str("cmake_policy(SET CMP0077 OLD)\n");
+        let limits = LintLimits {
+            max_findings: 5,
+            ..LintLimits::default()
+        };
+        let res = lint_bytes(
+            Path::new("/work/CMakeLists.txt"),
+            src.as_bytes(),
+            &LintConfig::default(),
+            &limits,
+            &EmptyWorkspaceReader,
+            Some(Path::new("/work")),
+        )
+        .unwrap();
+        assert_eq!(res.findings.len(), 5);
+        assert!(res.findings_truncated);
+    }
+
+    #[test]
+    fn unresolved_include_invalidates_glob_origins_to_prevent_false_positives() {
+        let src = concat!(
+            "file(GLOB SRCS src/*.cpp)\n",
+            "include(missing_override.cmake)\n",
+            "add_executable(app ${SRCS})\n",
+            "file(GLOB DYN_SRCS src/*.cpp)\n",
+            "include(\"${DYNAMIC_FILE}\")\n",
+            "add_executable(app2 ${DYN_SRCS})\n",
+            "file(GLOB SET_DYN src/*.cpp)\n",
+            "set(${TARGET_VAR} main.cpp)\n",
+            "add_executable(app3 ${SET_DYN})\n",
+        );
+        let res = lint_bytes(
+            Path::new("/work/CMakeLists.txt"),
+            src.as_bytes(),
+            &LintConfig::default(),
+            &LintLimits::default(),
+            &EmptyWorkspaceReader,
+            Some(Path::new("/work")),
+        )
+        .unwrap();
+        let globs: Vec<_> = res
+            .findings
+            .iter()
+            .filter(|f| f.rule == "glob-without-configure-depends")
+            .collect();
+        assert!(
+            globs.is_empty(),
+            "expected no false glob finding: {globs:?}"
+        );
+        assert!(res.dependencies.incomplete);
+    }
+
+    #[test]
+    fn probe_cap_marks_dependencies_incomplete_without_dropping_consumed_includes() {
+        let host = PureHost::default();
+        host.seed_file(Path::new("/work/real_helper.inc"), b"set(REAL_VAR 1)\n")
+            .unwrap();
+        let mut src = String::new();
+        for i in 0..20 {
+            src.push_str(&format!("include(missing_{i}.cmake OPTIONAL)\n"));
+        }
+        src.push_str("include(real_helper.inc)\n");
+        src.push_str("set(REAL_VA 1)\nmessage(STATUS \"${REAL_VAR}\")\n");
+
+        let reader = HostWorkspaceReader::new(&host, vec![PathBuf::from("/work")], None);
+        let limits = LintLimits {
+            max_include_files: 2, // probe miss cap = 8
+            ..LintLimits::default()
+        };
+        let res = lint_bytes(
+            Path::new("/work/CMakeLists.txt"),
+            src.as_bytes(),
+            &LintConfig::default(),
+            &limits,
+            &reader,
+            Some(Path::new("/work")),
+        )
+        .unwrap();
+        assert!(res.findings.is_empty(), "got {:?}", res.findings);
+        assert!(res.dependencies.incomplete);
+        assert!(
+            res.dependencies
+                .consumed_files
+                .contains(Path::new("/work/real_helper.inc")),
+            "consumed_files={:?}",
+            res.dependencies.consumed_files
+        );
+        assert!(
+            res.dependencies
+                .included_files
+                .contains(Path::new("/work/real_helper.inc")),
+            "included_files={:?}",
+            res.dependencies.included_files
+        );
     }
 }

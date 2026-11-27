@@ -86,9 +86,17 @@ fn pair(values: &Pair<BString>) -> String {
     format!("{} -> {}", opt(values.0.as_ref()), opt(values.1.as_ref()))
 }
 
-/// Render the comparison for a terminal.
+fn paint(text: String, code: u8, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text
+    }
+}
+
+/// Render the comparison for a terminal. `color` adds ANSI color to the summary.
 #[must_use]
-pub fn render_text(a: &BuildSnapshot, b: &BuildSnapshot, diff: &ConfigDiff) -> String {
+pub fn render_text(a: &BuildSnapshot, b: &BuildSnapshot, diff: &ConfigDiff, color: bool) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{}\n  vs  {}\n", header(a), header(b));
     if !diff.unmatched_configs.is_empty() {
@@ -165,6 +173,15 @@ pub fn render_text(a: &BuildSnapshot, b: &BuildSnapshot, diff: &ConfigDiff) -> S
                 String::new()
             };
             let _ = writeln!(out, "  sources    {}{more}", shown.join(", "));
+            if let Some((left, right)) = compile.invocations {
+                let _ = writeln!(out, "  invocations {left} -> {right}");
+            }
+            if let Some(compiler) = &compile.compiler {
+                let _ = writeln!(out, "  compiler   {}", pair(compiler));
+            }
+            list_line(&mut out, "launcher", &compile.launcher, |item| {
+                display(item)
+            });
             if let Some(language) = &compile.language {
                 let _ = writeln!(out, "  language   {}", pair(language));
             }
@@ -268,13 +285,17 @@ pub fn render_text(a: &BuildSnapshot, b: &BuildSnapshot, diff: &ConfigDiff) -> S
             diff.toolchain.len(),
             diff.cache.len()
         )
-    } else if diff.incomplete.is_empty() {
+    } else if diff.complete() {
         "No differences.".to_owned()
     } else {
-        "No differences in the compared sections. Some requested sections were not compared."
-            .to_owned()
+        "No differences found, but the evidence is incomplete, so parity is not proved.".to_owned()
     };
-    let _ = writeln!(out, "\n{summary}");
+    let code = match diff.exit_code() {
+        0 => 32,
+        1 => 31,
+        _ => 33,
+    };
+    let _ = writeln!(out, "\n{}", paint(summary, code, color));
     out
 }
 
@@ -355,6 +376,12 @@ fn package_json(package: Option<&PackageSnapshot>) -> Value {
                 "observed",
                 Value::array_from(package.observed.iter().map(|observation| {
                     Value::object_from([
+                        (
+                            "package_call",
+                            observation
+                                .package_call
+                                .map_or(Value::Null, |call| Value::UInt(u64::from(call))),
+                        ),
                         ("outcome", string(&observation.outcome)),
                         ("version", nullable(observation.version.as_ref())),
                         ("selected", nullable(observation.selected.as_ref())),
@@ -429,6 +456,23 @@ pub fn render_json(a: &BuildSnapshot, b: &BuildSnapshot, diff: &ConfigDiff) -> B
                         ),
                         ("flags", list_json(&compile.fragments, |item| string(item))),
                         ("opaque", Value::Bool(compile.opaque)),
+                        (
+                            "compiler",
+                            compile.compiler.as_ref().map_or(Value::Null, pair_json),
+                        ),
+                        (
+                            "launcher",
+                            list_json(&compile.launcher, |item| string(item)),
+                        ),
+                        (
+                            "invocations",
+                            compile.invocations.map_or(Value::Null, |(left, right)| {
+                                Value::object_from([
+                                    ("a", Value::UInt(left as u64)),
+                                    ("b", Value::UInt(right as u64)),
+                                ])
+                            }),
+                        ),
                     ])
                 })),
             ),
@@ -504,7 +548,8 @@ pub fn render_json(a: &BuildSnapshot, b: &BuildSnapshot, diff: &ConfigDiff) -> B
                 ("toolchain_changed", Value::Bool(!diff.toolchain.is_empty())),
                 ("cache_changed", Value::UInt(diff.cache.len() as u64)),
                 ("differences", Value::Bool(diff.has_changes())),
-                ("complete", Value::Bool(diff.incomplete.is_empty())),
+                ("complete", Value::Bool(diff.complete())),
+                ("exit_code", Value::Int(i64::from(diff.exit_code()))),
             ]),
         ),
         (

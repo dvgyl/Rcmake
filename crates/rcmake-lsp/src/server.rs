@@ -40,6 +40,103 @@ const MAX_OPEN_BYTES: usize = MAX_BUFFER_BYTES * 4;
 const MAX_CHANGES: usize = 1024;
 // Limit the estimated bytes that a batch scans or moves.
 const MAX_CHANGE_WORK: usize = 2 * 1024 * 1024 * 1024;
+const WATCH_METHOD: &str = "workspace/didChangeWatchedFiles";
+const LINT_WATCH_REGISTRATION_ID: &str = "rcmake-watch-lint-includes";
+
+pub(super) struct DynamicWatches {
+    registration_id: &'static str,
+    request_prefix: &'static str,
+    paths: Vec<PathBuf>,
+    request: u64,
+}
+
+impl DynamicWatches {
+    pub(super) const fn new(registration_id: &'static str, request_prefix: &'static str) -> Self {
+        Self {
+            registration_id,
+            request_prefix,
+            paths: Vec::new(),
+            request: 0,
+        }
+    }
+
+    pub(super) fn reconcile(&mut self, mut paths: Vec<PathBuf>, relative: bool) -> Vec<RpcMessage> {
+        paths.sort();
+        paths.dedup();
+        let (paths, watchers): (Vec<_>, Vec<_>) = paths
+            .into_iter()
+            .filter_map(|path| {
+                let pattern = glob_pattern(&path, relative)?;
+                Some((
+                    path,
+                    object([("globPattern", pattern), ("kind", Value::Int(7))]),
+                ))
+            })
+            .take(256)
+            .unzip();
+        if paths == self.paths {
+            return Vec::new();
+        }
+        let mut messages = Vec::new();
+        let mut request_id = || {
+            self.request += 1;
+            RequestId::String(format!("{}{}", self.request_prefix, self.request))
+        };
+        if !self.paths.is_empty() {
+            messages.push(RpcMessage::request(
+                request_id(),
+                "client/unregisterCapability",
+                object([(
+                    "unregisterations",
+                    Value::Array(vec![object([
+                        ("id", Value::string(self.registration_id)),
+                        ("method", Value::string(WATCH_METHOD)),
+                    ])]),
+                )]),
+            ));
+        }
+        if !watchers.is_empty() {
+            messages.push(RpcMessage::request(
+                request_id(),
+                "client/registerCapability",
+                object([(
+                    "registrations",
+                    Value::Array(vec![object([
+                        ("id", Value::string(self.registration_id)),
+                        ("method", Value::string(WATCH_METHOD)),
+                        (
+                            "registerOptions",
+                            object([("watchers", Value::Array(watchers))]),
+                        ),
+                    ])]),
+                )]),
+            ));
+        }
+        self.paths = paths;
+        messages
+    }
+}
+
+fn glob_pattern(path: &Path, relative: bool) -> Option<Value> {
+    let name = path.file_name()?.to_str()?;
+    if name == "CMakeLists.txt" || name.ends_with(".cmake") || name == ".rcmake.toml" {
+        return None;
+    }
+    let literal = |text: &str| !text.contains(['*', '?', '[', ']', '{', '}', '\\']);
+    if relative {
+        return literal(name).then(|| {
+            object([
+                (
+                    "baseUri",
+                    Value::string(uri::file(path.parent().unwrap_or(path))),
+                ),
+                ("pattern", Value::string(name)),
+            ])
+        });
+    }
+    let path = path.to_str()?.replace('\\', "/");
+    literal(&path).then(|| Value::string(path))
+}
 
 pub use crate::{
     HoverDoc, SemanticContext, SemanticDefinition, SemanticDiagnostic, SemanticDocument,
@@ -129,6 +226,8 @@ pub struct Server<'a> {
     markdown_hover: bool,
     workspace_roots: Vec<uri::Root>,
     watch_files: bool,
+    relative_watch_patterns: bool,
+    lint_watches: DynamicWatches,
     #[cfg(all(feature = "eval", feature = "stdio"))]
     disk_watches: evaluated_stdio::DiskWatches,
     versioned_edits: bool,
@@ -152,6 +251,8 @@ impl<'a> Server<'a> {
             markdown_hover: false,
             workspace_roots: Vec::new(),
             watch_files: false,
+            relative_watch_patterns: false,
+            lint_watches: DynamicWatches::new(LINT_WATCH_REGISTRATION_ID, "rcmake-lint-watch-"),
             #[cfg(all(feature = "eval", feature = "stdio"))]
             disk_watches: evaluated_stdio::DiskWatches::default(),
             versioned_edits: false,
@@ -240,13 +341,10 @@ impl<'a> Server<'a> {
                 .and_then(|caps| get(caps, "didChangeWatchedFiles"))
                 .and_then(|caps| get(caps, "dynamicRegistration"))
                 == Some(&Value::Bool(true));
-            #[cfg(all(feature = "eval", feature = "stdio"))]
-            {
-                self.disk_watches.relative = workspace
-                    .and_then(|caps| get(caps, "didChangeWatchedFiles"))
-                    .and_then(|caps| get(caps, "relativePatternSupport"))
-                    == Some(&Value::Bool(true));
-            }
+            self.relative_watch_patterns = workspace
+                .and_then(|caps| get(caps, "didChangeWatchedFiles"))
+                .and_then(|caps| get(caps, "relativePatternSupport"))
+                == Some(&Value::Bool(true));
             self.versioned_edits = workspace
                 .and_then(|caps| get(caps, "workspaceEdit"))
                 .and_then(|caps| get(caps, "documentChanges"))
@@ -420,7 +518,9 @@ impl<'a> Server<'a> {
                     {
                         *show_parse_error = true;
                     }
-                    Some(vec![self.publish(uri)])
+                    let mut messages = vec![self.publish(uri)];
+                    messages.extend(self.reconcile_lint_watches());
+                    Some(messages)
                 }
             }
             "textDocument/didClose" => {
@@ -440,6 +540,7 @@ impl<'a> Server<'a> {
                         messages.push(self.publish(&caller));
                     }
                 }
+                messages.extend(self.reconcile_lint_watches());
                 Some(messages)
             }
             "workspace/didChangeWatchedFiles" => {
@@ -464,15 +565,15 @@ impl<'a> Server<'a> {
                         affected_uris.extend(self.affected_callers_for_file(&path, None));
                     }
                 }
-                if affected_uris.is_empty() {
+                let mut messages: Vec<RpcMessage> = affected_uris
+                    .into_iter()
+                    .map(|uri| self.publish(&uri))
+                    .collect();
+                messages.extend(self.reconcile_lint_watches());
+                if messages.is_empty() {
                     None
                 } else {
-                    Some(
-                        affected_uris
-                            .into_iter()
-                            .map(|uri| self.publish(&uri))
-                            .collect(),
-                    )
+                    Some(messages)
                 }
             }
             "$/cancelRequest" => {
@@ -489,12 +590,17 @@ impl<'a> Server<'a> {
             .insert(uri.to_owned(), OpenDocument::Desynced(version));
         self.open_bytes -= previous.as_ref().map_or(0, OpenDocument::len);
         self.workspace_cache.get_mut().invalidate_documents();
-        if matches!(previous, Some(OpenDocument::Synced { .. }))
-            && let Some(provider) = self.semantic()
-        {
+        let was_synced = matches!(previous, Some(OpenDocument::Synced { .. }));
+        if was_synced && let Some(provider) = self.semantic() {
             provider.update(SemanticUpdate::Closed { uri });
         }
         let mut messages = vec![self.publish(uri)];
+        if was_synced && let Some(path) = uri::path(uri) {
+            for caller in self.affected_callers_for_file(&path, Some(uri)) {
+                messages.push(self.publish(&caller));
+            }
+        }
+        messages.extend(self.reconcile_lint_watches());
         if !matches!(previous, Some(OpenDocument::Desynced(_))) {
             messages.push(show_warning(format!(
                 "rcmake lost synchronization with {uri}. {}",
@@ -585,10 +691,25 @@ impl<'a> Server<'a> {
                         messages.push(self.publish(&caller));
                     }
                 }
+                messages.extend(self.reconcile_lint_watches());
                 messages
             }
             Err(failure) => self.desync(uri, version, failure),
         }
+    }
+
+    fn reconcile_lint_watches(&mut self) -> Vec<RpcMessage> {
+        if !self.watch_files || self.state != State::Running {
+            return Vec::new();
+        }
+        let paths: Vec<PathBuf> = self
+            .lint_deps
+            .borrow()
+            .values()
+            .flat_map(|deps| deps.consumed_files.iter().cloned())
+            .collect();
+        self.lint_watches
+            .reconcile(paths, self.relative_watch_patterns)
     }
 
     fn replace(
@@ -685,16 +806,27 @@ impl<'a> Server<'a> {
         {
             Ok(resolved) => resolved,
             Err(_) => {
-                // Keep checked directories tracked even when a config file has an edit error so
+                // Track checked ancestor directories even when a config file fails to parse so
                 // fixing it republishes diagnostics immediately.
                 let mut checked_dirs = Vec::new();
                 let mut cur = Some(dir);
+                let mut depth = 0usize;
                 while let Some(d) = cur {
+                    if depth >= 64 {
+                        break;
+                    }
+                    depth += 1;
                     checked_dirs.push(d.to_owned());
                     if boundary.as_deref() == Some(d) {
                         break;
                     }
                     cur = d.parent();
+                    if let Some(next) = cur
+                        && let Some(root) = boundary.as_deref()
+                        && !next.starts_with(root)
+                    {
+                        break;
+                    }
                 }
                 ResolvedConfig {
                     config: Config::default(),
@@ -723,7 +855,6 @@ impl<'a> Server<'a> {
 
         let mut reader =
             HostWorkspaceReader::new(self.host, readable_roots, self.bundled_modules.clone());
-        // Prefer ALL open synced LSP buffers over disk state.
         for (open_uri, open_doc) in &self.documents {
             if let Some(synced) = open_doc.current()
                 && let Some(open_path) = uri::path(open_uri)
@@ -734,6 +865,8 @@ impl<'a> Server<'a> {
 
         let mut deps = LintDependencies {
             included_files: BTreeSet::new(),
+            consumed_files: BTreeSet::new(),
+            incomplete: false,
             config_dirs: resolved
                 .checked_dirs
                 .into_iter()
@@ -752,6 +885,8 @@ impl<'a> Server<'a> {
         ) {
             Ok(result) => {
                 deps.included_files = result.dependencies.included_files;
+                deps.consumed_files = result.dependencies.consumed_files;
+                deps.incomplete = result.dependencies.incomplete;
                 result.findings
             }
             Err(_) => Vec::new(),
@@ -781,13 +916,14 @@ impl<'a> Server<'a> {
             {
                 continue;
             }
-            let matches_include = doc_deps.included_files.iter().any(|inc| {
-                inc == &norm
-                    || canonical.as_ref().is_some_and(|c| inc == c)
-                    || canonical
-                        .as_ref()
-                        .is_some_and(|c| self.host.canonicalize(inc).ok().as_ref() == Some(c))
-            });
+            let matches_include = doc_deps.incomplete
+                || doc_deps.included_files.iter().any(|inc| {
+                    inc == &norm
+                        || canonical.as_ref().is_some_and(|c| inc == c)
+                        || canonical
+                            .as_ref()
+                            .is_some_and(|c| self.host.canonicalize(inc).ok().as_ref() == Some(c))
+                });
             if matches_include {
                 affected.push(uri.clone());
             }

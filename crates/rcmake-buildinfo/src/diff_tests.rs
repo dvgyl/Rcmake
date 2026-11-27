@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rcmake_base::BString;
-use rcmake_host::PureHost;
+use rcmake_host::{Host as _, PureHost};
 
 use super::*;
 use crate::{BuildSnapshot, load};
@@ -53,6 +53,12 @@ fn seed(
     targets: &[Target<'_>],
     extra_index: Option<&str>,
 ) {
+    // CMake saves the cache before generation writes the reply, so the reply is newer.
+    host.seed_file(
+        Path::new(&format!("{root}/CMakeCache.txt")),
+        CACHE.as_bytes(),
+    )
+    .expect("cache");
     let reply = format!("{root}/.cmake/api/v1/reply");
     let file = |name: &str, text: &str| {
         host.seed_file(Path::new(&format!("{reply}/{name}")), text.as_bytes())
@@ -90,15 +96,10 @@ fn seed(
     if let Some(error) = extra_index {
         file("error-2026-02-01T00-00-00-0000.json", error);
     }
-    host.seed_file(
-        Path::new(&format!("{root}/CMakeCache.txt")),
-        CACHE.as_bytes(),
-    )
-    .expect("cache");
 }
 
 fn snapshot(host: &PureHost, root: &str) -> BuildSnapshot {
-    load(host, Path::new(root)).expect("load")
+    load(host, Path::new(root), crate::TraceInput::Missing).expect("load")
 }
 
 fn core<'a>(groups: &'a [(&'a str, &'a [&'a str])], link: &'a [(&'a str, &'a str)]) -> Target<'a> {
@@ -277,7 +278,7 @@ fn error_index_after_success_makes_graph_sections_incomplete() {
     assert!(!b.evidence(Section::Compile).comparable());
     let diff = compare(&snapshot(&host, "/ba"), &b, &DiffOptions::default());
     assert!(!diff.has_changes());
-    assert_eq!(diff.exit_code(), 3);
+    assert_eq!(diff.exit_code(), 2);
     assert!(
         diff.incomplete
             .iter()
@@ -300,7 +301,7 @@ fn cache_only_directory_cannot_prove_equal_compile_settings() {
         ..DiffOptions::default()
     };
     let diff = compare(&snapshot(&host, "/ca"), &snapshot(&host, "/cb"), &options);
-    assert_eq!(diff.exit_code(), 3);
+    assert_eq!(diff.exit_code(), 2);
     let cache_only = DiffOptions {
         sections: [Section::Cache].into_iter().collect(),
         ..DiffOptions::default()
@@ -413,7 +414,7 @@ fn json_is_deterministic_and_typed() {
         value.get("schema").and_then(rcmake_json::Value::as_str),
         Some(crate::DIFF_CONFIG_SCHEMA)
     );
-    assert!(crate::render_text(&a, &b, &diff).contains("defines"));
+    assert!(crate::render_text(&a, &b, &diff, false).contains("defines"));
 }
 
 #[test]
@@ -451,4 +452,155 @@ fn compile_database_fallback_infers_targets_with_a_launcher() {
     let change = &diff.targets_changed[0];
     assert_eq!(change.name, "app");
     assert_eq!(change.compile[0].defines.added, [BString::from("B")]);
+}
+
+fn only(sections: &[Section]) -> DiffOptions {
+    DiffOptions {
+        sections: sections.iter().copied().collect(),
+        ..DiffOptions::default()
+    }
+}
+
+#[test]
+fn equal_partial_evidence_is_not_parity() {
+    let host = host();
+    let groups: &[(&str, &[&str])] = &[("CXX", &[]), ("CXX", &[])];
+    seed(&host, "/ba", &["Debug"], &[core(groups, &[])], None);
+    seed(&host, "/bb", &["Debug"], &[core(groups, &[])], None);
+    let (a, b) = (snapshot(&host, "/ba"), snapshot(&host, "/bb"));
+    let complete = compare(&a, &b, &only(&[Section::Targets, Section::Compile]));
+    assert_eq!(complete.exit_code(), 0, "{complete:?}");
+    let packages = compare(&a, &b, &only(&[Section::Packages]));
+    assert!(!packages.has_changes());
+    assert_eq!(
+        packages.exit_code(),
+        2,
+        "package outcomes are unknown without a trace"
+    );
+}
+
+#[test]
+fn stale_reply_never_supplies_cache_or_complete_graph_data() {
+    let host = host();
+    let groups: &[(&str, &[&str])] = &[("CXX", &[]), ("CXX", &[])];
+    seed(&host, "/ba", &["Debug"], &[core(groups, &[])], None);
+    host.seed_file(
+        Path::new("/ba/.cmake/api/v1/reply/cache-v2-1.json"),
+        br#"{"kind":"cache","entries":[{"name":"CMAKE_BUILD_TYPE","type":"STRING","value":"Stale","properties":[]}]}"#,
+    )
+    .expect("seed");
+    host.seed_file(
+        Path::new("/ba/.cmake/api/v1/reply/index-2026-01-01T00-00-00-0000.json"),
+        br#"{"objects":[{"kind":"codemodel","version":{"major":2,"minor":9},"jsonFile":"codemodel-v2-1.json"},
+                       {"kind":"cache","version":{"major":2,"minor":0},"jsonFile":"cache-v2-1.json"}]}"#,
+    )
+    .expect("seed");
+    let fresh = snapshot(&host, "/ba");
+    assert_eq!(fresh.cache[b"CMAKE_BUILD_TYPE".as_slice()].value, "Stale");
+    host.set_times(
+        Path::new("/ba/CMakeCache.txt"),
+        None,
+        Some(rcmake_host::FileTime {
+            secs: 9_999_999_999,
+            nanos: 1,
+        }),
+    )
+    .expect("touch");
+    let stale = snapshot(&host, "/ba");
+    assert_eq!(stale.cache[b"CMAKE_BUILD_TYPE".as_slice()].value, "Debug");
+    assert_eq!(
+        stale.evidence(Section::Cache),
+        Evidence::Complete(crate::DataSource::Cache)
+    );
+    assert!(matches!(
+        stale.evidence(Section::Compile),
+        Evidence::Partial(..)
+    ));
+}
+
+#[test]
+fn malformed_codemodel_is_not_an_empty_complete_graph() {
+    let host = host();
+    seed(&host, "/ba", &["Debug"], &[], None);
+    host.seed_file(
+        Path::new("/ba/.cmake/api/v1/reply/codemodel-v2-1.json"),
+        b"{}",
+    )
+    .expect("seed");
+    let snapshot = snapshot(&host, "/ba");
+    assert!(!snapshot.evidence(Section::Targets).comparable());
+    assert!(
+        snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.ends_with(b"is not a valid codemodel object."))
+    );
+}
+
+#[test]
+fn unknown_configurations_and_targets_are_rejected() {
+    let host = host();
+    let groups: &[(&str, &[&str])] = &[("CXX", &[]), ("CXX", &[])];
+    seed(&host, "/ba", &["Debug"], &[core(groups, &[])], None);
+    seed(&host, "/bb", &["Debug"], &[core(groups, &[])], None);
+    let (a, b) = (snapshot(&host, "/ba"), snapshot(&host, "/bb"));
+    let pair = DiffOptions {
+        config_pair: Some(("Debug".into(), "Release".into())),
+        ..DiffOptions::default()
+    };
+    assert!(validate(&a, &b, &pair).is_err());
+    let lower = DiffOptions {
+        config_pair: Some(("debug".into(), "DEBUG".into())),
+        ..DiffOptions::default()
+    };
+    assert!(validate(&a, &b, &lower).is_ok());
+    let target = DiffOptions {
+        targets: vec!["nope".into()],
+        ..DiffOptions::default()
+    };
+    assert!(validate(&a, &b, &target).is_err());
+}
+
+#[test]
+fn absence_needs_complete_evidence_on_the_side_without_the_target() {
+    let host = host();
+    let groups: &[(&str, &[&str])] = &[("CXX", &[]), ("CXX", &[])];
+    seed(&host, "/ba", &["Debug"], &[core(groups, &[])], None);
+    let extra = Target {
+        name: "extra",
+        ..core(groups, &[])
+    };
+    seed(&host, "/bb", &["Debug"], &[core(groups, &[]), extra], None);
+    let mut a = snapshot(&host, "/ba");
+    let b = snapshot(&host, "/bb");
+    let options = only(&[Section::Targets]);
+    assert_eq!(compare(&a, &b, &options).targets_added.len(), 1);
+    a.evidence.insert(
+        Section::Targets,
+        Evidence::Partial(crate::DataSource::FileApi, "cut".into()),
+    );
+    let diff = compare(&a, &b, &options);
+    assert!(diff.targets_added.is_empty());
+    assert_eq!(diff.exit_code(), 2);
+}
+
+fn observation(call: u32, outcome: &str) -> crate::PackageObservation {
+    crate::PackageObservation {
+        package_call: Some(call),
+        outcome: outcome.into(),
+        version: None,
+        selected: None,
+    }
+}
+
+#[test]
+fn package_outcomes_compare_known_calls_only() {
+    let complete = [observation(1, "not_found"), observation(2, "found")];
+    let prefix = [observation(1, "not_found")];
+    assert!(!outcomes_differ(&prefix, &complete, false, true));
+    assert!(outcomes_differ(&prefix, &complete, true, true));
+    let changed = [observation(1, "found")];
+    assert!(outcomes_differ(&changed, &complete, false, true));
+    assert!(!outcomes_differ(&[], &complete, false, true));
+    assert!(outcomes_differ(&[], &complete, true, true));
 }

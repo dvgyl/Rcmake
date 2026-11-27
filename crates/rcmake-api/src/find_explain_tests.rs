@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use rcmake_base::BString;
+use rcmake_eval::FindTraceStore;
 use rcmake_eval::find_trace::{
     FindCandidate, FindMode, FindOutcome, FindPackageTrace, FindRequestSummary, Rejection,
     SearchRoot,
@@ -28,6 +29,9 @@ impl NearMissProbe for Probe {
 
 fn trace(candidates: Vec<FindCandidate>) -> FindPackageTrace {
     FindPackageTrace {
+        ordinal: 1,
+        package_call: Some(1),
+        items_omitted: 0,
         name: "Boost".into(),
         call: Vec::new(),
         request: FindRequestSummary {
@@ -149,21 +153,45 @@ fn near_miss_probe_gives_exact_prefix_and_dir() {
     assert_eq!(nothing[1].kind, SuggestionKind::ReenableRoot);
 }
 
+fn store(calls: Vec<FindPackageTrace>, started: u32, omitted: u32) -> FindTraceStore {
+    FindTraceStore {
+        calls,
+        calls_started: started,
+        omitted_calls: omitted,
+        bytes: 0,
+    }
+}
+
+fn numbered(ordinal: u32, package_call: u32, outcome: FindOutcome) -> FindPackageTrace {
+    FindPackageTrace {
+        ordinal,
+        package_call: Some(package_call),
+        outcome,
+        ..trace(Vec::new())
+    }
+}
+
 #[test]
 fn report_selects_calls_and_marks_unknown_absence() {
-    let calls = vec![trace(Vec::new()), {
-        let mut found = trace(Vec::new());
-        found.outcome = FindOutcome::Found;
-        found
-    }];
+    let calls = store(
+        vec![
+            numbered(1, 1, FindOutcome::NotFound),
+            numbered(2, 2, FindOutcome::Found),
+        ],
+        2,
+        0,
+    );
     let mut probe = Probe::default();
     let report = FindReport::new(b"Boost", &calls, Some(2), &mut probe);
     assert_eq!(report.calls.len(), 1);
     assert!(report.found());
+    assert_eq!(report.exit_code(), 0);
     let mut absent = FindReport::new(b"Qt6", &calls, None, &mut probe);
     assert!(!absent.absence_unknown());
+    assert_eq!(absent.exit_code(), 1);
     absent.completed = false;
     assert!(absent.absence_unknown());
+    assert_eq!(absent.exit_code(), 2);
     let json = render_find_json(&absent);
     let value = rcmake_json::parse(&json, &rcmake_json::ReadOptions::default()).expect("json");
     assert_eq!(
@@ -174,4 +202,53 @@ fn report_selects_calls_and_marks_unknown_absence() {
         value.get("schema").and_then(rcmake_json::Value::as_str),
         Some(EXPLAIN_FIND_SCHEMA)
     );
+}
+
+#[test]
+fn call_numbers_follow_entry_order_and_skip_omitted_records() {
+    let mut probe = Probe::default();
+    let gap = store(vec![numbered(3, 3, FindOutcome::Found)], 3, 2);
+    let first = FindReport::new(b"Boost", &gap, Some(1), &mut probe);
+    assert!(first.calls.is_empty());
+    assert!(first.absence_unknown());
+    assert_eq!(first.exit_code(), 2);
+    let third = FindReport::new(b"Boost", &gap, Some(3), &mut probe);
+    assert_eq!(third.selected().map(|call| call.ordinal), Some(3));
+    assert_eq!(third.exit_code(), 0);
+    let complete = store(vec![numbered(1, 1, FindOutcome::Found)], 1, 0);
+    let beyond = FindReport::new(b"Boost", &complete, Some(4), &mut probe);
+    assert!(!beyond.absence_unknown());
+    assert_eq!(beyond.exit_code(), 1);
+    let mut stopped = FindReport::new(b"Boost", &complete, Some(4), &mut probe);
+    stopped.completed = false;
+    assert_eq!(stopped.exit_code(), 2, "a stopped run can make more calls");
+}
+
+#[test]
+fn partial_or_past_evidence_never_gives_a_definitive_result() {
+    let mut probe = Probe::default();
+    let found = store(vec![numbered(1, 1, FindOutcome::Found)], 1, 0);
+    let mut provisional = FindReport::new(b"Boost", &found, None, &mut probe);
+    provisional.provisional = true;
+    assert_eq!(provisional.exit_code(), 2);
+    let mut past = FindReport::new(b"Boost", &found, None, &mut probe);
+    past.source = FindSource::Past;
+    assert_eq!(past.exit_code(), 2);
+    let later_missing = store(vec![numbered(1, 1, FindOutcome::Found)], 3, 2);
+    let report = FindReport::new(b"Boost", &later_missing, None, &mut probe);
+    assert_eq!(report.exit_code(), 2);
+    assert!(render_find_terminal(&report, false, false).contains("Result unknown."));
+
+    let mut required = numbered(2, 2, FindOutcome::NotFound);
+    required.request.required = true;
+    let failed = store(vec![numbered(1, 1, FindOutcome::Found), required], 2, 0);
+    let mut stop = FindReport::new(b"Boost", &failed, None, &mut probe);
+    stop.completed = false;
+    assert_eq!(stop.exit_code(), 1, "the run stopped at this required call");
+    let mut quiet = numbered(1, 1, FindOutcome::NotFound);
+    quiet.request.required = false;
+    let quiet_store = store(vec![quiet], 1, 0);
+    let mut unknown = FindReport::new(b"Boost", &quiet_store, None, &mut probe);
+    unknown.completed = false;
+    assert_eq!(unknown.exit_code(), 2);
 }

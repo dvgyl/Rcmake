@@ -1,4 +1,4 @@
-use rcmake_host::{PureHost, Stream};
+use rcmake_host::{PureHost, Stream, WriteMode};
 use rcmake_model::CacheType;
 
 use super::*;
@@ -43,6 +43,35 @@ impl Tree {
         self.host.write(&file, text.as_bytes(), WriteMode::Truncate)
     }
 
+    /// Write the compiler file and the identification record, as `enable_language()`
+    /// does when it identifies the compiler.
+    fn identify(&self, version: &str) -> TestResult {
+        self.write_compiler_file(version)?;
+        let dir = platform_dir(&self.bin);
+        let text = self.host.read(
+            &dir.join("CMakeCCompiler.cmake"),
+            ReadRange::All { limit: 4096 },
+        )?;
+        let record = format!(
+            "{{\"version\":1,\"evidence_sha256\":\"{}\"}}\n",
+            Digest::hash(&text)
+        );
+        let file = dir.join("CMakeCCompiler.identification-v1.json");
+        let _ = self.host.remove_file(&file);
+        self.host
+            .write(&file, record.as_bytes(), WriteMode::CreateNew)?;
+        Ok(())
+    }
+
+    /// Add a comment to the saved compiler file without a compiler identification.
+    fn touch_compiler_file(&self) -> TestResult {
+        let file = platform_dir(&self.bin).join("CMakeCCompiler.cmake");
+        let mut text = b"# rewritten\n".to_vec();
+        text.extend(self.host.read(&file, ReadRange::All { limit: 4096 })?);
+        self.host.write(&file, &text, WriteMode::Truncate)?;
+        Ok(())
+    }
+
     fn cache(&self, prefix: Option<&str>) -> Cache {
         let mut cache = Cache::default();
         let mut set = |name: &[u8], value: BString| {
@@ -85,7 +114,7 @@ impl Tree {
         if fresh {
             // A fresh configure removes the cache files and identifies the compiler again.
             let _ = self.host.remove_dir_all(&self.bin.join("CMakeFiles"));
-            let _ = self.write_compiler_file("2.0");
+            let _ = self.identify("2.0");
         }
         tracker.check(cache, fresh);
         tracker.check(cache, fresh);
@@ -299,5 +328,129 @@ fn drift_receipt_from_another_build_directory_is_not_used() -> TestResult {
         load(tree.host.as_ref(), &copy, &tree.src).0,
         Baseline::Bad(_)
     ));
+    Ok(())
+}
+
+#[test]
+fn a_rewritten_compiler_file_without_identification_keeps_the_baseline() -> TestResult {
+    let tree = Tree::new()?;
+    let cache = tree.cache(None);
+    assert_eq!(tree.configure(&cache, true, true, false, true), "");
+    let baseline = tree.receipt().ok_or("receipt")?;
+    tree.host
+        .write(&tree.cc, b"compiler two", WriteMode::Truncate)?;
+
+    // A warm configure loads the saved detection results and rewrites the compiler file.
+    let before = tree.stderr().len();
+    let tracker = Tracker::begin(&tree.dyn_host(), true, false, &tree.bin, &tree.src);
+    tracker.check(&cache, false);
+    tree.touch_compiler_file()?;
+    tracker.generated(&cache);
+    tracker.finish(true);
+    let warning = tree.stderr().get(before..).unwrap_or_default().to_owned();
+    assert!(
+        warning.contains("content changed after compiler detection"),
+        "{warning}"
+    );
+    assert_eq!(tree.receipt().as_ref(), Some(&baseline));
+
+    let again = tree.configure(&cache, false, true, false, true);
+    assert!(
+        again.contains("content changed after compiler detection"),
+        "{again}"
+    );
+    assert_eq!(tree.receipt().as_ref(), Some(&baseline));
+    Ok(())
+}
+
+#[test]
+fn an_identification_records_the_tool_digest_of_the_same_phase() -> TestResult {
+    let tree = Tree::new()?;
+    let cache = tree.cache(None);
+    tree.configure(&cache, true, true, false, true);
+    let baseline = tree.receipt().ok_or("receipt")?;
+
+    // The first check hashes the old compiler. The compiler then changes and is identified.
+    let tracker = Tracker::begin(&tree.dyn_host(), true, false, &tree.bin, &tree.src);
+    tracker.check(&cache, false);
+    tree.host
+        .write(&tree.cc, b"compiler two", WriteMode::Truncate)?;
+    tree.identify("3.0")?;
+    tracker.generated(&cache);
+    tracker.finish(true);
+    assert_ne!(tree.receipt().as_ref(), Some(&baseline));
+
+    assert_eq!(tree.configure(&cache, false, true, false, true), "");
+    Ok(())
+}
+
+#[test]
+fn an_identification_record_from_an_earlier_configure_is_not_new_evidence() -> TestResult {
+    let tree = Tree::new()?;
+    let cache = tree.cache(None);
+    tree.configure(&cache, true, true, false, true);
+    let baseline = tree.receipt().ok_or("receipt")?;
+    let record = platform_dir(&tree.bin).join("CMakeCCompiler.identification-v1.json");
+    let old = tree.host.read(&record, ReadRange::All { limit: 4096 })?;
+    tree.host
+        .write(&tree.cc, b"compiler two", WriteMode::Truncate)?;
+
+    // The tracker removes the record of the earlier configure before this one runs.
+    let warning = tree.configure(&cache, false, true, false, true);
+    assert!(tree.host.metadata(&record, Follow::No).is_err());
+    assert!(warning.contains("content changed"), "{warning}");
+    assert_eq!(tree.receipt().as_ref(), Some(&baseline));
+
+    // A record that could not be removed is never new evidence.
+    tree.host.seed_file(&record, &old)?;
+    let current = collect(
+        tree.host.as_ref(),
+        &DigestMemo::default(),
+        &tree.bin,
+        &cache,
+    );
+    let stale = BTreeMap::from([("C".to_owned(), old)]);
+    assert!(identified_languages(tree.host.as_ref(), &tree.bin, &stale, &current).is_empty());
+    assert_eq!(
+        identified_languages(tree.host.as_ref(), &tree.bin, &BTreeMap::new(), &current),
+        BTreeSet::from(["C".to_owned()])
+    );
+    Ok(())
+}
+
+#[test]
+fn receipt_write_and_restore_errors_are_reported() -> TestResult {
+    let tree = Tree::new()?;
+    let cache = tree.cache(None);
+    tree.configure(&cache, true, true, false, true);
+    let blocker = tree.bin.join("CMakeFiles/rcmake");
+
+    // A successful configure cannot publish the new receipt.
+    let before = tree.stderr().len();
+    let tracker = Tracker::begin(&tree.dyn_host(), true, false, &tree.bin, &tree.src);
+    tree.host.remove_dir_all(&blocker)?;
+    tree.host.seed_file(&blocker, b"not a directory")?;
+    tracker.check(&cache, false);
+    tracker.generated(&cache);
+    tracker.finish(true);
+    let output = tree.stderr().get(before..).unwrap_or_default().to_owned();
+    assert!(
+        output.contains("Cannot write the drift receipt"),
+        "{output}"
+    );
+
+    // A failed configure cannot restore the receipt that it loaded.
+    tree.host.remove_file(&blocker)?;
+    tree.configure(&cache, true, true, false, true);
+    let before = tree.stderr().len();
+    let tracker = Tracker::begin(&tree.dyn_host(), true, false, &tree.bin, &tree.src);
+    tree.host.remove_dir_all(&blocker)?;
+    tree.host.seed_file(&blocker, b"not a directory")?;
+    tracker.finish(false);
+    let output = tree.stderr().get(before..).unwrap_or_default().to_owned();
+    assert!(
+        output.contains("Cannot restore the drift receipt"),
+        "{output}"
+    );
     Ok(())
 }

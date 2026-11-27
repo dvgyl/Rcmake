@@ -205,9 +205,10 @@ pub(crate) fn cmake_executable(host: &dyn Host) -> Result<PathBuf, CpackError> {
     let exe = host
         .current_exe()
         .map_err(|err| error(format!("Cannot find the CPack executable: {err}")))?;
+    // A rooted path without a drive prefix is a full path in a POSIX-style test host on Windows.
     let bin = exe
         .parent()
-        .filter(|path| path.is_absolute())
+        .filter(|path| path.is_absolute() || path.has_root())
         .ok_or_else(|| error("Cannot find the directory of the CPack executable"))?;
     Ok(bin.join(if cfg!(windows) { "cmake.exe" } else { "cmake" }))
 }

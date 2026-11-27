@@ -1,6 +1,7 @@
 //! Normalized build settings of one configured build directory.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use rcmake_base::BString;
 
@@ -137,7 +138,7 @@ pub enum Attribution {
 }
 
 /// One include directory.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IncludeDir {
     /// Directory path.
     pub path: BString,
@@ -146,7 +147,9 @@ pub struct IncludeDir {
 }
 
 /// Compile settings that apply to a set of sources.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Sources of one File API compile group share one value through an [`Arc`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CompileSettings {
     /// Compile language, when known.
     pub language: Option<BString>,
@@ -158,12 +161,24 @@ pub struct CompileSettings {
     pub includes: Vec<IncludeDir>,
     /// Remaining command fragments in order, with duplicates.
     pub fragments: Vec<BString>,
-    /// The command could not be split with a known dialect. `fragments` holds the raw command.
+    /// The command could not be split with a known dialect, or a limit, a response
+    /// file, or the row structure made it uncertain. `fragments` then holds the raw
+    /// command text or the ordered argument tokens.
     pub opaque: bool,
+    /// Compiler token of a compile database row, when the row names a known compiler.
+    pub compiler: Option<BString>,
+    /// Launcher tokens before the compiler token, for example `ccache`.
+    pub launcher: Vec<BString>,
 }
 
+/// Compile invocations of one source, in the order of the evidence.
+///
+/// A File API source has one invocation. A compile database can have more, for
+/// example one row for each architecture or object file.
+pub type SourceInvocations = Vec<Arc<CompileSettings>>;
+
 /// Ordered link fragment with its role.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LinkFragment {
     /// Role from the File API, for example `libraries` or `flags`.
     pub role: BString,
@@ -178,8 +193,8 @@ pub struct TargetSnapshot {
     pub kind: Option<BString>,
     /// How the target name is known.
     pub attribution: Attribution,
-    /// Compile settings of each source, keyed by source path.
-    pub sources: BTreeMap<BString, CompileSettings>,
+    /// Compile invocations of each source, keyed by source path.
+    pub sources: BTreeMap<BString, SourceInvocations>,
     /// Link fragments in order, when the target links.
     pub link: Option<Vec<LinkFragment>>,
     /// Names of the targets this target depends on.
@@ -207,9 +222,11 @@ pub struct ToolchainSnapshot {
     pub frontend: Option<BString>,
 }
 
-/// Observed result of a package search from a current trace.
+/// Observed result of one package search from a current trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageObservation {
+    /// 1-based position of the call among the calls for the package, when known.
+    pub package_call: Option<u32>,
     /// Final outcome: `found`, `not_found`, `disabled`, or `error`.
     pub outcome: BString,
     /// Final version, when found.
@@ -231,6 +248,35 @@ pub struct PackageSnapshot {
     pub version_hint: Option<BString>,
     /// Observations of each call from a current trace, in call order.
     pub observed: Vec<PackageObservation>,
+}
+
+/// One call of a validated native find trace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceCall {
+    /// Package name.
+    pub name: BString,
+    /// Observation of the call.
+    pub observation: PackageObservation,
+}
+
+/// Native find trace evidence for [`crate::load`].
+///
+/// The caller decodes the trace with the typed parser and checks its freshness, so
+/// this crate never trusts unvalidated trace rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TraceInput {
+    /// The build tree has no valid trace.
+    #[default]
+    Missing,
+    /// The trace is evidence from a past run, with the reason.
+    Past(BString),
+    /// The trace describes the current tree.
+    Current {
+        /// Recorded calls in entry order.
+        calls: Vec<TraceCall>,
+        /// The run finished and every started call has a record.
+        complete: bool,
+    },
 }
 
 /// One cache entry.

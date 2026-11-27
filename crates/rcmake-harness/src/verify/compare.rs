@@ -170,6 +170,7 @@ pub(crate) struct VerifyReport {
     pub(crate) compile_commands: SectionReport,
     pub(crate) ninja_dry_run: SectionReport,
     pub(crate) error: Option<String>,
+    pub(crate) cleanup_warning: Option<String>,
 }
 
 /// Boundary-aware path normalizer for one engine's run.
@@ -455,6 +456,7 @@ pub(crate) fn compare_runs(
             compile_commands: skipped.clone(),
             ninja_dry_run: skipped,
             error: None,
+            cleanup_warning: None,
         };
     }
 
@@ -516,6 +518,7 @@ pub(crate) fn compare_runs(
         compile_commands: compdb_report,
         ninja_dry_run: ninja_report,
         error: None,
+        cleanup_warning: None,
     }
 }
 
@@ -1262,9 +1265,12 @@ fn compare_compdb_entries(
 
     if o.opaque_count > 0 || r.opaque_count > 0 {
         rep.notes.push(format!(
-            "Opaque unparsed compile commands compared by raw text: oracle={}, rcmake={}.",
+            "Opaque unparsed compile commands prevented complete token comparison: oracle={}, rcmake={}.",
             o.opaque_count, r.opaque_count
         ));
+        if rep.status == SectionStatus::Equal {
+            rep.status = SectionStatus::Unavailable;
+        }
     }
     if uncomparable_mixed && rep.status == SectionStatus::Equal {
         rep.status = SectionStatus::Unavailable;

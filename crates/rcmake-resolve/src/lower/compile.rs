@@ -434,17 +434,17 @@ pub(super) fn formatted_defines(
         .defines
         .split_at_checked(boundary)
         .unwrap_or((&group.defines, &[]));
-    let defines = [target_defines, source_defines]
-        .into_iter()
-        .flat_map(|definitions| {
-            let mut definitions: Vec<_> = definitions
-                .iter()
-                .map(|define| define.value.as_slice())
-                .collect();
-            definitions.sort_unstable();
-            definitions.dedup();
-            definitions
-        });
+    fn sort_dedup(definitions: &[rcmake_model::BT<BString>]) -> Vec<&[u8]> {
+        let mut definitions: Vec<_> = definitions
+            .iter()
+            .map(|define| define.value.as_slice())
+            .collect();
+        definitions.sort_unstable();
+        definitions.dedup();
+        definitions
+    }
+    let target_defs = sort_dedup(target_defines);
+    let source_defs = sort_dedup(source_defines);
     let define_key = [b"CMAKE_".as_slice(), &group.language, b"_DEFINE_FLAG"].concat();
     let prefix = definition(model, target.dir, &define_key)
         .filter(|flag| !flag.is_empty())
@@ -455,7 +455,7 @@ pub(super) fn formatted_defines(
     });
     let ninja_posix = model.generator.is_some_and(GeneratorKind::is_ninja)
         && !super::shell::windows_host(model, target.dir);
-    join_words(intdir.into_iter().chain(defines.map(|define| {
+    let format_define = |define: &[u8]| {
         if ninja_posix && let Some(eq) = define.iter().position(|&byte| byte == b'=') {
             let (name, value) = define.split_at(eq + 1);
             let prefix = compile_argument(model, target, prefix, name);
@@ -464,7 +464,14 @@ pub(super) fn formatted_defines(
                 .into();
         }
         compile_argument(model, target, prefix, define)
-    })))
+    };
+    join_words(
+        target_defs
+            .into_iter()
+            .map(format_define)
+            .chain(intdir)
+            .chain(source_defs.into_iter().map(format_define)),
+    )
 }
 
 pub(super) fn formatted_includes(

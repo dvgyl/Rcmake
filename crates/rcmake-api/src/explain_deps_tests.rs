@@ -99,3 +99,34 @@ fn link_only_edges_are_marked_and_unknown_targets_get_suggestions() {
     assert!(report.resolved.is_none());
     assert_eq!(report.suggestions, [BString::from("top")]);
 }
+
+#[test]
+fn consumer_sensitive_interface_edges_use_the_consuming_target() {
+    let result = configure(
+        "add_library(z INTERFACE)\nadd_library(w INTERFACE)\nadd_library(iface INTERFACE)\ntarget_link_libraries(iface INTERFACE $<$<STREQUAL:$<TARGET_PROPERTY:NAME>,top>:z> $<$<STREQUAL:$<TARGET_PROPERTY:NAME>,iface>:w>)\nadd_library(left INTERFACE)\ntarget_link_libraries(left INTERFACE iface)\nadd_library(top INTERFACE)\ntarget_link_libraries(top INTERFACE left iface)",
+    );
+    assert_eq!(
+        paths(&result, "top", "z"),
+        [
+            vec![hop("iface", "link"), hop("z", "link")],
+            vec![hop("left", "link"), hop("iface", "link"), hop("z", "link")],
+        ]
+    );
+    assert!(
+        paths(&result, "top", "w").is_empty(),
+        "an edge for another consumer is not a path of top"
+    );
+}
+
+#[test]
+fn parallel_matches_stop_at_the_path_limit() {
+    let items = vec!["z"; 200].join(" ");
+    let result = configure(&format!(
+        "add_library(z INTERFACE)\nadd_library(top INTERFACE)\ntarget_link_libraries(top INTERFACE {items})"
+    ));
+    let head = result.model.find_target(DirId::ROOT, b"top").expect("head");
+    let report = result.dependency_paths(DirId::ROOT, head, b"z", &[BString::default()]);
+    assert!(report.truncated, "{report:?}");
+    assert!(report.paths.len() <= 16);
+    assert!(!report.complete());
+}

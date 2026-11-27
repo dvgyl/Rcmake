@@ -13,7 +13,7 @@ pub(crate) enum Persona {
     /// Use the CMake command-line surface.
     #[default]
     Compat,
-    /// Accept Rcmake extension flags and subcommands.
+    /// Accept rcmake extension flags and subcommands.
     Native,
 }
 

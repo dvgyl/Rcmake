@@ -1,10 +1,17 @@
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rcmake_archive::{PortableLimits, PortableName, read_portable, write_portable};
 use rcmake_base::BString;
 use rcmake_eval::ProbeCacheMode;
 use rcmake_host::{
-    FileKind, Follow, Host, HostResult, ReadRange, Stream, WriteMode, discover_cmake_root, path,
+    FileKind, Follow, Host, HostError, HostResult, ReadRange, Stream, WriteMode,
+    discover_cmake_root, path,
 };
-use rcmake_store::{Digest, ImportError, ImportTrust, ProbeBundle, Store, StoreConfig, StoreMode};
+use rcmake_store::{
+    ArchiveLimits, Digest, ImportError, ImportReport, ImportTrust, ProbeBundle, Store, StoreConfig,
+    StoreMode,
+};
 
 use crate::{configure::speed, options::Options, persona::Persona};
 
@@ -163,10 +170,45 @@ impl<'a> Action<'a> {
     }
 }
 
+/// The archive limits of `rcmake cache export` and `rcmake cache import`.
+const LIMITS: ArchiveLimits = ArchiveLimits::DEFAULT;
+
+/// The archive reader and writer form of [`LIMITS`].
+fn portable_limits(limits: &ArchiveLimits) -> PortableLimits {
+    PortableLimits {
+        archive_bytes: limits.archive_bytes,
+        tar_bytes: limits.tar_bytes,
+        member_bytes: limits.member_bytes,
+        manifest_bytes: limits.manifest_bytes,
+        total_bytes: limits.total_bytes,
+        members: limits.members,
+    }
+}
+
+/// Read an archive and collect its members into a bundle.
+fn read_bundle(archive: &[u8], limits: &ArchiveLimits) -> Result<ProbeBundle, String> {
+    let members = read_portable(archive, &portable_limits(limits))
+        .map_err(|error| format!("Invalid archive: {error} Nothing was imported."))?;
+    let mut bundle = ProbeBundle::default();
+    for member in members {
+        match member.name {
+            PortableName::Manifest => bundle.manifest = member.data,
+            PortableName::Entry(key) => {
+                bundle.entries.insert(Digest::from_bytes(key), member.data);
+            }
+            PortableName::Blob(digest) => {
+                bundle.blobs.insert(Digest::from_bytes(digest), member.data);
+            }
+        }
+    }
+    Ok(bundle)
+}
+
 /// Write the verified probe entries of `store` to a portable archive at `file`.
 ///
-/// The archive is written to a temporary file in the destination directory and
-/// renamed after it is complete.
+/// The archive must pass the same checks as `rcmake cache import` before it
+/// replaces the destination. It is written to a temporary file in the
+/// destination directory and renamed after it is complete.
 fn export(host: &dyn Host, store: &Store<'_>, file: &[u8]) -> Result<String, String> {
     let destination = host.initial_cwd().join(path::to_native(file));
     let (Some(parent), Some(name)) = (destination.parent(), destination.file_name()) else {
@@ -188,7 +230,9 @@ fn export(host: &dyn Host, store: &Store<'_>, file: &[u8]) -> Result<String, Str
             destination.display()
         ));
     }
-    let export = store.export_probes().map_err(|error| error.to_string())?;
+    let export = store
+        .export_probes(&LIMITS)
+        .map_err(|error| error.to_string())?;
     let manifest = export
         .manifest
         .to_json()
@@ -206,18 +250,14 @@ fn export(host: &dyn Host, store: &Store<'_>, file: &[u8]) -> Result<String, Str
             .iter()
             .map(|(digest, frame)| (PortableName::Blob(*digest.as_bytes()), frame.as_slice())),
     );
-    let archive = write_portable(&members).map_err(|error| error.to_string())?;
-    let temp = parent.join(format!(
-        ".{}.{}.tmp",
-        name.to_string_lossy(),
-        host.system().pid
-    ));
-    host.write(&temp, &archive, WriteMode::Truncate)
-        .and_then(|()| host.rename(&temp, &destination))
+    let archive = write_portable(&members, &portable_limits(&LIMITS))
+        .map_err(|error| format!("{error} Nothing was exported."))?;
+    read_bundle(&archive, &LIMITS)
+        .and_then(|bundle| bundle.check(&LIMITS).map_err(|error| error.to_string()))
         .map_err(|error| {
-            let _ = host.remove_file(&temp);
-            error.to_string()
+            format!("The archive does not pass the import checks: {error} Nothing was exported.")
         })?;
+    replace_file(host, &destination, &archive).map_err(|error| error.to_string())?;
     let mut text = format!(
         "Exported {} probe entries and {} blobs to {}.\nSHA-256: {}\n",
         export.entries.len(),
@@ -256,7 +296,7 @@ fn import(
         ),
     };
     let source = host.initial_cwd().join(path::to_native(file));
-    let limits = PortableLimits::default();
+    let limits = portable_limits(&LIMITS);
     let meta = host
         .metadata(&source, Follow::Yes)
         .map_err(|error| error.to_string())?;
@@ -288,38 +328,20 @@ fn import(
         Some(_) => ImportTrust::Trusted,
         None => ImportTrust::Untrusted,
     };
-    let members = read_portable(&archive, &limits)
-        .map_err(|error| format!("Invalid archive: {error} Nothing was imported."))?;
-    let mut bundle = ProbeBundle::default();
-    for member in members {
-        match member.name {
-            PortableName::Manifest => bundle.manifest = member.data,
-            PortableName::Entry(key) => {
-                bundle.entries.insert(Digest::from_bytes(key), member.data);
-            }
-            PortableName::Blob(digest) => {
-                bundle.blobs.insert(Digest::from_bytes(digest), member.data);
-            }
-        }
-    }
+    let bundle = read_bundle(&archive, &LIMITS)?;
+    let shown = path::from_native_cmake(&source);
     let report = store
-        .import_probes(&bundle, trust)
+        .import_probes(&bundle, trust, &LIMITS)
         .map_err(|error| match error {
             ImportError::Invalid(reason) => {
                 format!("Invalid archive: {reason} Nothing was imported.")
             }
-            ImportError::Store(error) => error.to_string(),
+            ImportError::Store { error, completed } => format!(
+                "{}The import stopped: {error}\nRun the same import again to finish it.",
+                import_counts(&completed, &shown)
+            ),
         })?;
-    let mut text = format!(
-        "Imported {} probe entries and {} blobs from {}.\nUnchanged: {}. Recovered: {}. Staged: {}. Conflicts: {}.\n",
-        report.entries_published,
-        report.blobs_published,
-        path::from_native_cmake(&source),
-        report.unchanged,
-        report.recovered,
-        report.staged,
-        report.conflicts
-    );
+    let mut text = import_counts(&report, &shown);
     if trust == ImportTrust::Untrusted && report.staged > 0 {
         text.push_str(
             "No --sha256 digest was given. Staged entries are not used for cache hits. \
@@ -327,6 +349,56 @@ fn import(
         );
     }
     Ok(text)
+}
+
+/// Replace `file` with `bytes` through a new temporary file in the same directory.
+///
+/// The temporary file gets a unique name and is created exclusively, so an existing
+/// path or link is never opened. On failure, only that temporary file is removed.
+pub(crate) fn replace_file(host: &dyn Host, file: &Path, bytes: &[u8]) -> HostResult<()> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
+        return Err(HostError::unsupported("The destination must name a file."));
+    };
+    let pid = host.system().pid;
+    let mut last = None;
+    for _ in 0..16 {
+        let now = host.now();
+        let temp = dir.join(format!(
+            ".{}.{pid}.{}{:09}.{}.tmp",
+            name.to_string_lossy(),
+            now.secs,
+            now.nanos,
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match host.write(&temp, bytes, WriteMode::CreateNew) {
+            Ok(()) => {}
+            Err(error) if error.kind == std::io::ErrorKind::AlreadyExists => {
+                last = Some(error);
+                continue;
+            }
+            Err(error) => {
+                let _ = host.remove_file(&temp);
+                return Err(error);
+            }
+        }
+        return host.rename(&temp, file).inspect_err(|_| {
+            let _ = host.remove_file(&temp);
+        });
+    }
+    Err(last.unwrap_or_else(|| HostError::unsupported("No temporary file name is free.")))
+}
+
+fn import_counts(report: &ImportReport, source: &BString) -> String {
+    format!(
+        "Imported {} probe entries and {} blobs from {source}.\nUnchanged: {}. Recovered: {}. Staged: {}. Conflicts: {}.\n",
+        report.entries_published,
+        report.blobs_published,
+        report.unchanged,
+        report.recovered,
+        report.staged,
+        report.conflicts
+    )
 }
 
 fn is_help(flag: &[u8]) -> bool {
@@ -462,7 +534,6 @@ pub(crate) fn doctor(argv0: Option<&BString>, args: &[BString], host: &dyn Host)
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
 
     use super::*;
     use rcmake_host::{Follow, PureHost};
@@ -555,17 +626,69 @@ mod tests {
         )
     }
 
+    /// A compiled probe payload whose artifact is `blob`.
+    fn probe_payload(blob: Digest) -> rcmake_json::Value {
+        use rcmake_json::{ToJson, Value};
+        let artifact = Value::object_from([
+            ("blob", blob.to_json()),
+            ("relative_path", "a.out".to_json()),
+            ("mode", 0o755u32.to_json()),
+        ]);
+        let outcome = Value::object_from([
+            ("max_start_depth", 0u32.to_json()),
+            ("compiled", true.to_json()),
+            ("exit_code", 0i32.to_json()),
+            ("output", "probe".to_json()),
+            ("artifact", artifact),
+            ("diagnostics", Value::Array(Vec::new())),
+        ]);
+        Value::object_from([("outcome", outcome), ("checks", Value::object())])
+    }
+
+    #[test]
+    fn replace_file_never_opens_an_existing_path_and_cleans_only_its_own_file() -> HostResult<()> {
+        let host = PureHost::default();
+        let dir = Path::new("/work/out");
+        let destination = dir.join("probes.tar.gz");
+        let pid = host.system().pid;
+        let old_name = dir.join(format!(".probes.tar.gz.{pid}.tmp"));
+        let target = Path::new("/work/target");
+        host.seed_file(target, b"keep")?;
+        host.create_dir_all(dir)?;
+        host.symlink(target, &old_name)?;
+
+        replace_file(&host, &destination, b"first")?;
+        replace_file(&host, &destination, b"second")?;
+        let read = |file: &Path| host.read(file, ReadRange::All { limit: 64 });
+        assert_eq!(read(&destination)?, b"second");
+        assert_eq!(read(target)?, b"keep");
+        let names: Vec<_> = host
+            .read_dir(dir)?
+            .into_iter()
+            .map(|entry| entry.name.to_string())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+
+        // A failed rename removes the new temporary file and nothing else.
+        let blocked = dir.join("blocked");
+        host.create_dir_all(&blocked.join("child"))?;
+        assert!(replace_file(&host, &blocked, b"data").is_err());
+        assert_eq!(host.read_dir(dir)?.len(), 3);
+        assert_eq!(read(target)?, b"keep");
+        Ok(())
+    }
+
     fn seeded_store(host: &PureHost, dir: &str) -> HostResult<rcmake_store::Digest> {
         use rcmake_store::{Domain, Entry};
-        let root = host.initial_cwd().join(dir);
-        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(&path::from_native(&root)));
+        let root = format!("/work/{dir}");
+        host.env_set(b"RCMAKE_PROBE_CACHE_DIR", Some(root.as_bytes()));
         let store = open(host)?;
         let blob = store.put_blob(b"artifact")?;
         let key = Domain::ProbeV1.key(b"probe");
         let entry = Entry {
             trace: Vec::new(),
             blobs: vec![blob],
-            payload: "probe".to_owned(),
+            payload: probe_payload(blob),
         };
         store.put_entry(Domain::ProbeV1, key, &entry)?;
         Ok(key)
@@ -612,7 +735,7 @@ mod tests {
         let store = open(&host)?;
         assert!(
             store
-                .get_entry::<String>(rcmake_store::Domain::ProbeV1, key)?
+                .get_entry::<rcmake_json::Value>(rcmake_store::Domain::ProbeV1, key)?
                 .is_some()
         );
         let (_, out, _) = run(&host, &["import", "probes.tar.gz", "--sha256", &digest]);
@@ -637,7 +760,7 @@ mod tests {
         let store = open(&host)?;
         assert!(
             store
-                .get_entry::<String>(rcmake_store::Domain::ProbeV1, key)?
+                .get_entry::<rcmake_json::Value>(rcmake_store::Domain::ProbeV1, key)?
                 .is_none()
         );
         let (_, status, _) = run(&host, &[]);
@@ -650,7 +773,8 @@ mod tests {
     fn cache_export_and_import_reject_bad_operands() -> HostResult<()> {
         let host = PureHost::default();
         seeded_store(&host, "producer")?;
-        let (code, _, err) = run(&host, &["export", "producer/probes.tar.gz"]);
+        // A full operand keeps POSIX test paths free of the Windows separator from `Path::join`.
+        let (code, _, err) = run(&host, &["export", "/work/producer/probes.tar.gz"]);
         assert_eq!(code, 1);
         assert!(err.contains("outside the cache directory"), "{err}");
         for args in [

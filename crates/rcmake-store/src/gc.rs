@@ -15,7 +15,7 @@ pub struct GcReport {
     pub entries_removed: usize,
     /// Number of removed blobs.
     pub blobs_removed: usize,
-    /// Number of removed staging files and expired import candidates.
+    /// Number of removed staging files and import candidate entries and blobs.
     pub staging_removed: usize,
     /// Combined file size freed in bytes.
     pub bytes_removed: u64,
@@ -33,6 +33,11 @@ pub struct StoreStats {
     /// Combined size of entries, blobs, and candidates in bytes.
     pub bytes: u64,
 }
+
+/// Blob files by digest, with the number of kept entries that reference each one.
+type CountedBlobs = BTreeMap<Digest, (CachedFile, usize)>;
+/// An entry file with the blobs that it references.
+type Referencing = (CachedFile, Vec<Digest>);
 
 pub(crate) struct CachedFile {
     pub(crate) path: PathBuf,
@@ -152,16 +157,8 @@ impl Store<'_> {
                 }
             }
         }
-        for (directory, extension) in self.candidate_locations() {
-            for file in self.cache_files(&directory, extension)? {
-                if older_than(now, file.stat.mtime, crate::portable::CANDIDATE_TTL)
-                    && locked.remove_if_unchanged(&file.path, &file.stat)?
-                {
-                    report.staging_removed += 1;
-                    report.bytes_removed = report.bytes_removed.saturating_add(file.stat.len);
-                }
-            }
-        }
+        let (mut candidate_blobs, candidates) =
+            self.inventory_candidates(&locked, now, &mut report, &mut total)?;
         let mut entries = Vec::new();
         for domain in Domain::ALL {
             let directory = self.config.root.join("entries").join(domain.as_str());
@@ -203,30 +200,136 @@ impl Store<'_> {
             return Ok(report);
         }
         let goal = self.config.max_bytes - self.config.max_bytes / 5;
-        entries.sort_unstable_by(|(left, _), (right, _)| {
-            (left.stat.mtime, &left.path).cmp(&(right.stat.mtime, &right.path))
+        for (blob, count) in candidate_blobs.values() {
+            if *count == 0 && total > goal && locked.remove_if_unchanged(&blob.path, &blob.stat)? {
+                report.staging_removed += 1;
+                report.bytes_removed = report.bytes_removed.saturating_add(blob.stat.len);
+                total = total.saturating_sub(blob.stat.len);
+            }
+        }
+        // Candidates are never cache hits, so they go first, then the least recently used entries.
+        let mut evictable: Vec<_> = candidates
+            .into_iter()
+            .map(|(file, references)| (true, file, references))
+            .chain(
+                entries
+                    .into_iter()
+                    .map(|(file, references)| (false, file, references)),
+            )
+            .collect();
+        evictable.sort_unstable_by(|(left_candidate, left, _), (right_candidate, right, _)| {
+            (!left_candidate, left.stat.mtime, &left.path).cmp(&(
+                !right_candidate,
+                right.stat.mtime,
+                &right.path,
+            ))
         });
 
-        for (entry, references) in entries {
+        for (candidate, entry, references) in evictable {
             if total <= goal {
                 break;
             }
-            if locked.remove_if_unchanged(&entry.path, &entry.stat)? {
+            if !locked.remove_if_unchanged(&entry.path, &entry.stat)? {
+                continue;
+            }
+            if candidate {
+                report.staging_removed += 1;
+            } else {
                 report.entries_removed += 1;
-                report.bytes_removed = report.bytes_removed.saturating_add(entry.stat.len);
-                total = total.saturating_sub(entry.stat.len);
-                for digest in references {
-                    if let Some((blob, count)) = blobs.get_mut(&digest) {
+            }
+            report.bytes_removed = report.bytes_removed.saturating_add(entry.stat.len);
+            total = total.saturating_sub(entry.stat.len);
+            for digest in references {
+                if candidate {
+                    if let Some((blob, count)) = candidate_blobs.get_mut(&digest) {
                         *count -= 1;
-                        if *count == 0 {
-                            total =
-                                total.saturating_sub(locked.sweep_blob(blob, now, &mut report)?);
+                        if *count == 0 && locked.remove_if_unchanged(&blob.path, &blob.stat)? {
+                            report.staging_removed += 1;
+                            report.bytes_removed =
+                                report.bytes_removed.saturating_add(blob.stat.len);
+                            total = total.saturating_sub(blob.stat.len);
                         }
+                    }
+                } else if let Some((blob, count)) = blobs.get_mut(&digest) {
+                    *count -= 1;
+                    if *count == 0 {
+                        total = total.saturating_sub(locked.sweep_blob(blob, now, &mut report)?);
                     }
                 }
             }
         }
         Ok(report)
+    }
+
+    /// Remove expired and invalid candidates. Add the size of the others to `total`.
+    ///
+    /// A candidate blob is kept while a kept candidate entry references it.
+    /// Return the kept blobs with their reference counts and the kept entries
+    /// with their references.
+    fn inventory_candidates(
+        &self,
+        locked: &LockedStore<'_, '_>,
+        now: FileTime,
+        report: &mut GcReport,
+        total: &mut u64,
+    ) -> HostResult<(CountedBlobs, Vec<Referencing>)> {
+        let [(entry_dir, _), (blob_dir, _)] = self.candidate_locations();
+        let removed = |file: &CachedFile, report: &mut GcReport| -> HostResult<bool> {
+            let gone = locked.remove_if_unchanged(&file.path, &file.stat)?;
+            if gone {
+                report.staging_removed += 1;
+                report.bytes_removed = report.bytes_removed.saturating_add(file.stat.len);
+            }
+            Ok(gone)
+        };
+        let mut blobs: BTreeMap<_, _> = self
+            .cache_files(&blob_dir, "blob")?
+            .into_iter()
+            .map(|blob| (blob.digest, (blob, 0usize)))
+            .collect();
+        let mut entries = Vec::new();
+        for file in self.cache_files(&entry_dir, "entry")? {
+            if older_than(now, file.stat.mtime, crate::portable::CANDIDATE_TTL) {
+                if !removed(&file, report)? {
+                    *total = total.saturating_add(file.stat.len);
+                }
+                continue;
+            }
+            let references = match self.read_entry::<BlobReferences>(
+                Domain::ProbeV1,
+                file.digest,
+                &file.path,
+                false,
+            )? {
+                CacheRead::Found(entry) => entry.blobs,
+                CacheRead::Missing => continue,
+                CacheRead::Invalid => {
+                    if !removed(&file, report)? {
+                        *total = total.saturating_add(file.stat.len);
+                    }
+                    continue;
+                }
+            };
+            for digest in &references {
+                if let Some((_, count)) = blobs.get_mut(digest) {
+                    *count += 1;
+                }
+            }
+            *total = total.saturating_add(file.stat.len);
+            entries.push((file, references));
+        }
+        let mut kept = BTreeMap::new();
+        for (digest, (blob, count)) in blobs {
+            if count == 0
+                && older_than(now, blob.stat.mtime, crate::portable::CANDIDATE_TTL)
+                && removed(&blob, report)?
+            {
+                continue;
+            }
+            *total = total.saturating_add(blob.stat.len);
+            kept.insert(digest, (blob, count));
+        }
+        Ok((kept, entries))
     }
 
     pub(crate) fn cache_files(

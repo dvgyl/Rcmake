@@ -1,5 +1,5 @@
 //! Native multi-configuration `compile_commands.json` planning, rendering,
-//! atomic publication, and ownership-tracked retirement (Phase 3 §3, P1-14).
+//! atomic publication, and ownership-tracked retirement.
 
 #![forbid(unsafe_code)]
 
@@ -154,10 +154,65 @@ pub fn strip_co_compile_argv(argv: &[BString]) -> &[BString] {
     argv
 }
 
-/// Remove compiler dependency-file generation flags (`-MD`, `-MMD`, `-MT <arg>`,
-/// `-MF <arg>`) from an argument vector while keeping all other arguments intact.
+/// Return whether `argv` invokes an MSVC-style compiler driver (where `-MD` and `-MT`
+/// select the C runtime library rather than GNU dependency-file generation).
+#[must_use]
+pub fn is_msvc_style_argv(argv: &[BString]) -> bool {
+    for tok in argv.iter().take(2) {
+        let base = tok
+            .rsplit(|&b| b == b'/' || b == b'\\')
+            .next()
+            .unwrap_or(tok.as_slice());
+        let stem = base
+            .strip_suffix(b".exe")
+            .or_else(|| base.strip_suffix(b".EXE"))
+            .unwrap_or(base);
+        if stem.eq_ignore_ascii_case(b"cl")
+            || stem.eq_ignore_ascii_case(b"clang-cl")
+            || stem.eq_ignore_ascii_case(b"icl")
+            || stem.eq_ignore_ascii_case(b"icx-cl")
+            || stem.eq_ignore_ascii_case(b"intel-cl")
+        {
+            return true;
+        }
+    }
+    argv.iter().any(|arg| {
+        let s = arg.as_slice();
+        s.eq_ignore_ascii_case(b"/showIncludes")
+            || s.eq_ignore_ascii_case(b"-showIncludes")
+            || matches!(
+                s,
+                b"/nologo" | b"-nologo" | b"/MD" | b"/MDd" | b"/MT" | b"/MTd" | b"-MDd" | b"-MTd"
+            )
+            || s.starts_with(b"/Fo")
+            || s.starts_with(b"-Fo")
+            || s.starts_with(b"/Fd")
+            || s.starts_with(b"-Fd")
+            || s.starts_with(b"/Fe")
+            || s.starts_with(b"/Zc:")
+            || s.starts_with(b"/EH")
+    })
+}
+
+/// Remove GNU/Clang compiler dependency-file generation flags (`-MD`, `-MMD`,
+/// `-MT <arg>`, `-MF <arg>`, `-MQ <arg>`) from an argument vector when the
+/// invocation uses a GNU/Clang-style compiler dialect.
+///
+/// MSVC-style compiler invocations are returned unchanged so `-MD`, `-MDd`,
+/// `-MT`, and `-MTd` runtime library flags and their following arguments are
+/// never stripped.
 #[must_use]
 pub fn strip_depfile_argv(argv: &[BString]) -> Vec<BString> {
+    strip_depfile_argv_if(argv, true)
+}
+
+/// Remove GNU/Clang dependency-file generation flags when `strip_gnu_depfiles`
+/// is `true` and `argv` is not an MSVC-style compiler invocation.
+#[must_use]
+pub fn strip_depfile_argv_if(argv: &[BString], strip_gnu_depfiles: bool) -> Vec<BString> {
+    if !strip_gnu_depfiles || is_msvc_style_argv(argv) {
+        return argv.to_vec();
+    }
     let mut out = Vec::with_capacity(argv.len());
     let mut skip_next = false;
     for arg in argv {
@@ -167,11 +222,244 @@ pub fn strip_depfile_argv(argv: &[BString]) -> Vec<BString> {
         }
         match arg.as_slice() {
             b"-MD" | b"-MMD" => {}
-            b"-MT" | b"-MF" => skip_next = true,
+            b"-MT" | b"-MF" | b"-MQ" => skip_next = true,
             _ => out.push(arg.clone()),
         }
     }
     out
+}
+
+/// Compute a filesystem-safe canonical name key that folds Unicode case and
+/// common NFC/NFD canonical decompositions (Latin, Greek, Cyrillic, Hangul) so
+/// case-insensitive and normalization-insensitive volumes (APFS, HFS+, NTFS)
+/// detect collisions and spelling-only renames consistently.
+#[must_use]
+pub fn fs_name_key(name: &str) -> String {
+    let mut decomposed = Vec::with_capacity(name.len() * 2);
+    for ch in name.chars() {
+        decompose_and_fold_char(ch, &mut decomposed);
+    }
+    canonical_order_combining(&mut decomposed);
+    decomposed.into_iter().collect()
+}
+
+fn decompose_and_fold_char(ch: char, out: &mut Vec<char>) {
+    match ch {
+        'ß' | 'ẞ' => {
+            out.push('s');
+            out.push('s');
+        }
+        'ς' => out.push('σ'),
+        'ſ' => out.push('s'),
+        'K' => out.push('k'),
+        'Å' => {
+            out.push('a');
+            out.push('\u{030a}');
+        }
+        'İ' => {
+            out.push('i');
+            out.push('\u{0307}');
+        }
+        // Algorithmic Hangul syllable NFD decomposition (Unicode §3.12).
+        '\u{AC00}'..='\u{D7A3}' => {
+            let s_index = (ch as u32) - 0xAC00;
+            let l = 0x1100 + s_index / 588;
+            let v = 0x1161 + (s_index % 588) / 28;
+            let t = s_index % 28;
+            if let Some(c) = char::from_u32(l) {
+                out.push(c);
+            }
+            if let Some(c) = char::from_u32(v) {
+                out.push(c);
+            }
+            if t != 0
+                && let Some(c) = char::from_u32(0x11A7 + t)
+            {
+                out.push(c);
+            }
+        }
+        _ => {
+            // Apply uppercase -> lowercase so pairs like `µ` (U+00B5) and `μ` (U+03BC)
+            // fold identically, then apply canonical NFD decomposition for precomposed chars.
+            for folded in ch.to_uppercase().flat_map(char::to_lowercase) {
+                if let Some(parts) = canonical_decompose_folded(folded) {
+                    out.extend_from_slice(parts);
+                } else {
+                    out.push(folded);
+                }
+            }
+        }
+    }
+}
+
+fn canonical_decompose_folded(ch: char) -> Option<&'static [char]> {
+    Some(match ch {
+        // Latin-1 Supplement (lowercase precomposed forms after case folding).
+        'à' => &['a', '\u{0300}'],
+        'á' => &['a', '\u{0301}'],
+        'â' => &['a', '\u{0302}'],
+        'ã' => &['a', '\u{0303}'],
+        'ä' => &['a', '\u{0308}'],
+        'å' => &['a', '\u{030a}'],
+        'ç' => &['c', '\u{0327}'],
+        'è' => &['e', '\u{0300}'],
+        'é' => &['e', '\u{0301}'],
+        'ê' => &['e', '\u{0302}'],
+        'ë' => &['e', '\u{0308}'],
+        'ì' => &['i', '\u{0300}'],
+        'í' => &['i', '\u{0301}'],
+        'î' => &['i', '\u{0302}'],
+        'ï' => &['i', '\u{0308}'],
+        'ñ' => &['n', '\u{0303}'],
+        'ò' => &['o', '\u{0300}'],
+        'ó' => &['o', '\u{0301}'],
+        'ô' => &['o', '\u{0302}'],
+        'õ' => &['o', '\u{0303}'],
+        'ö' => &['o', '\u{0308}'],
+        'ù' => &['u', '\u{0300}'],
+        'ú' => &['u', '\u{0301}'],
+        'û' => &['u', '\u{0302}'],
+        'ü' => &['u', '\u{0308}'],
+        'ý' => &['y', '\u{0301}'],
+        'ÿ' => &['y', '\u{0308}'],
+        // Latin Extended-A common precomposed forms.
+        'ā' => &['a', '\u{0304}'],
+        'ă' => &['a', '\u{0306}'],
+        'ą' => &['a', '\u{0328}'],
+        'ć' => &['c', '\u{0301}'],
+        'ĉ' => &['c', '\u{0302}'],
+        'ċ' => &['c', '\u{0307}'],
+        'č' => &['c', '\u{030c}'],
+        'ď' => &['d', '\u{030c}'],
+        'ē' => &['e', '\u{0304}'],
+        'ĕ' => &['e', '\u{0306}'],
+        'ė' => &['e', '\u{0307}'],
+        'ę' => &['e', '\u{0328}'],
+        'ě' => &['e', '\u{030c}'],
+        'ĝ' => &['g', '\u{0302}'],
+        'ğ' => &['g', '\u{0306}'],
+        'ġ' => &['g', '\u{0307}'],
+        'ģ' => &['g', '\u{0327}'],
+        'ĥ' => &['h', '\u{0302}'],
+        'ĩ' => &['i', '\u{0303}'],
+        'ī' => &['i', '\u{0304}'],
+        'ĭ' => &['i', '\u{0306}'],
+        'į' => &['i', '\u{0328}'],
+        'ĵ' => &['j', '\u{0302}'],
+        'ķ' => &['k', '\u{0327}'],
+        'ĺ' => &['l', '\u{0301}'],
+        'ļ' => &['l', '\u{0327}'],
+        'ľ' => &['l', '\u{030c}'],
+        'ń' => &['n', '\u{0301}'],
+        'ņ' => &['n', '\u{0327}'],
+        'ň' => &['n', '\u{030c}'],
+        'ō' => &['o', '\u{0304}'],
+        'ŏ' => &['o', '\u{0306}'],
+        'ő' => &['o', '\u{030b}'],
+        'ŕ' => &['r', '\u{0301}'],
+        'ŗ' => &['r', '\u{0327}'],
+        'ř' => &['r', '\u{030c}'],
+        'ś' => &['s', '\u{0301}'],
+        'ŝ' => &['s', '\u{0302}'],
+        'ş' => &['s', '\u{0327}'],
+        'š' => &['s', '\u{030c}'],
+        'ţ' => &['t', '\u{0327}'],
+        'ť' => &['t', '\u{030c}'],
+        'ũ' => &['u', '\u{0303}'],
+        'ū' => &['u', '\u{0304}'],
+        'ŭ' => &['u', '\u{0306}'],
+        'ů' => &['u', '\u{030a}'],
+        'ű' => &['u', '\u{030b}'],
+        'ų' => &['u', '\u{0328}'],
+        'ŵ' => &['w', '\u{0302}'],
+        'ŷ' => &['y', '\u{0302}'],
+        'ź' => &['z', '\u{0301}'],
+        'ż' => &['z', '\u{0307}'],
+        'ž' => &['z', '\u{030c}'],
+        // Common Greek & Cyrillic precomposed forms.
+        'ά' => &['α', '\u{0301}'],
+        'έ' => &['ε', '\u{0301}'],
+        'ή' => &['η', '\u{0301}'],
+        'ί' => &['ι', '\u{0301}'],
+        'ό' => &['ο', '\u{0301}'],
+        'ύ' => &['υ', '\u{0301}'],
+        'ώ' => &['ω', '\u{0301}'],
+        'ϊ' => &['ι', '\u{0308}'],
+        'ϋ' => &['υ', '\u{0308}'],
+        'ё' => &['е', '\u{0308}'],
+        'й' => &['и', '\u{0306}'],
+        'ї' => &['і', '\u{0308}'],
+        'ў' => &['у', '\u{0306}'],
+        _ => return None,
+    })
+}
+
+fn combining_class(ch: char) -> u8 {
+    match ch {
+        '\u{0300}'..='\u{0314}'
+        | '\u{033d}'..='\u{0344}'
+        | '\u{0346}'
+        | '\u{034a}'..='\u{034c}' => 230,
+        '\u{0316}'..='\u{0319}'
+        | '\u{031c}'..='\u{0320}'
+        | '\u{0323}'..='\u{0326}'
+        | '\u{0329}'..='\u{0333}'
+        | '\u{0339}'..='\u{033c}' => 220,
+        '\u{0327}' | '\u{0328}' => 202,
+        '\u{0334}'..='\u{0338}' => 1,
+        _ => 0,
+    }
+}
+
+fn canonical_order_combining(chars: &mut [char]) {
+    let mut i = 0;
+    while i < chars.len() {
+        let Some(&ch) = chars.get(i) else { break };
+        if combining_class(ch) == 0 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars.get(i).is_some_and(|&c| combining_class(c) != 0) {
+            i += 1;
+        }
+        if let Some(run) = chars.get_mut(start..i) {
+            run.sort_by_key(|&c| combining_class(c));
+        }
+    }
+}
+
+/// Snapshot of prior `rcmake`-owned native compile database files captured
+/// before cache cleanup (such as `--fresh`, environment refresh, toolchain
+/// refresh, or platform restart) can remove `CMakeFiles`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnedSnapshot {
+    owned: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl OwnedSnapshot {
+    /// Return whether any prior owned compile-database entries were recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.owned.is_empty()
+    }
+
+    /// Merge another ownership snapshot into `self`.
+    pub fn merge(&mut self, other: Self) {
+        for (name, digests) in other.owned {
+            self.owned.entry(name).or_default().extend(digests);
+        }
+    }
+}
+
+/// Capture the current native compile-database ownership manifest before cache
+/// cleanup can delete `CMakeFiles`.
+#[must_use]
+pub fn snapshot_owned(host: &dyn Host, build_dir: &Path) -> OwnedSnapshot {
+    let manifest_path = build_dir.join(MANIFEST_REL_DIR).join(MANIFEST_FILE);
+    OwnedSnapshot {
+        owned: read_manifest_owned(host, &manifest_path),
+    }
 }
 
 /// Validate and map every configuration in `configs` to its destination filename
@@ -179,7 +467,7 @@ pub fn strip_depfile_argv(argv: &[BString]) -> Vec<BString> {
 ///
 /// Rejects empty names, non-UTF-8 names, path separators, traversal components,
 /// control or Windows-forbidden characters, reserved device names, and
-/// case-insensitive filename collisions before any file is written.
+/// case/normalization filename collisions before any file is written.
 ///
 /// # Errors
 ///
@@ -191,8 +479,9 @@ pub fn preflight_config_filenames(configs: &[ConfigDatabase]) -> Result<Vec<Stri
                 .into(),
         ));
     }
+    let root_key = fs_name_key("compile_commands.json");
     let mut filenames = Vec::with_capacity(configs.len());
-    let mut seen_lower: BTreeMap<String, String> = BTreeMap::new();
+    let mut seen_keys: BTreeMap<String, String> = BTreeMap::new();
     for entry in configs {
         let name = std::str::from_utf8(&entry.config).map_err(|_| {
             GenError::Invalid(
@@ -205,8 +494,8 @@ pub fn preflight_config_filenames(configs: &[ConfigDatabase]) -> Result<Vec<Stri
         })?;
         validate_config_name(name)?;
         let filename = format!("compile_commands_{name}.json");
-        let lower = filename.to_ascii_lowercase();
-        if lower == "compile_commands.json" {
+        let key = fs_name_key(&filename);
+        if key == root_key {
             return Err(GenError::Invalid(
                 format!(
                     "Cannot export compile_commands.json: configuration name {name:?} collides with compile_commands.json."
@@ -214,10 +503,10 @@ pub fn preflight_config_filenames(configs: &[ConfigDatabase]) -> Result<Vec<Stri
                 .into(),
             ));
         }
-        if let Some(previous) = seen_lower.insert(lower, name.to_owned()) {
+        if let Some(previous) = seen_keys.insert(key, name.to_owned()) {
             return Err(GenError::Invalid(
                 format!(
-                    "Cannot export compile_commands.json: configurations {previous:?} and {name:?} collide on case-insensitive filename {filename:?}."
+                    "Cannot export compile_commands.json: configurations {previous:?} and {name:?} collide on case/normalization-insensitive filename {filename:?}."
                 )
                 .into(),
             ));
@@ -287,6 +576,22 @@ pub fn publish(
     build_dir: &Path,
     db: &MultiConfigCompileDatabase,
 ) -> Result<(), GenError> {
+    publish_with_prior(host, build_dir, db, None)
+}
+
+/// Like [`publish`], merging a pre-cleanup [`OwnedSnapshot`] so files owned
+/// before `--fresh` or a platform restart are still tracked for retirement.
+///
+/// # Errors
+///
+/// Returns [`GenError::Invalid`] if configuration names are invalid or collide, or
+/// [`GenError::Write`] if locking, staging, or atomic rename fails.
+pub fn publish_with_prior(
+    host: &dyn Host,
+    build_dir: &Path,
+    db: &MultiConfigCompileDatabase,
+    prior: Option<&OwnedSnapshot>,
+) -> Result<(), GenError> {
     let filenames = preflight_config_filenames(&db.configs)?;
     let default_index = if db.default_index < db.configs.len() {
         db.default_index
@@ -302,7 +607,6 @@ pub fn publish(
         .config
         .clone();
 
-    // Serialize all per-config databases and compute their digests before any write.
     let mut payloads: Vec<(String, BString, String)> = Vec::with_capacity(db.configs.len() + 1);
     let mut default_bytes = BString::default();
     let mut default_hash = String::new();
@@ -317,10 +621,16 @@ pub fn publish(
     }
 
     let mut new_files: BTreeMap<String, String> = BTreeMap::new();
+    let mut new_by_key: BTreeMap<String, String> = BTreeMap::new();
     for (filename, _, digest) in &payloads {
         new_files.insert(filename.clone(), digest.clone());
+        new_by_key.insert(fs_name_key(filename), filename.clone());
     }
     new_files.insert("compile_commands.json".to_owned(), default_hash.clone());
+    new_by_key.insert(
+        fs_name_key("compile_commands.json"),
+        "compile_commands.json".to_owned(),
+    );
 
     let state_dir = build_dir.join(MANIFEST_REL_DIR);
     host.create_dir_all(&state_dir)
@@ -328,10 +638,28 @@ pub fn publish(
     let _lock = acquire_lock(host, &state_dir)?;
 
     let manifest_path = state_dir.join(MANIFEST_FILE);
-    let prior_owned = read_manifest_owned(host, &manifest_path);
+    let mut prior_owned = read_manifest_owned(host, &manifest_path);
+    if let Some(snapshot) = prior {
+        for (name, digests) in &snapshot.owned {
+            prior_owned
+                .entry(name.clone())
+                .or_default()
+                .extend(digests.iter().cloned());
+        }
+    }
+
+    // Group prior spellings by their filesystem-safe key so spelling-only renames
+    // (for example `Debug` -> `debug` or NFC <-> NFD) are resolved before retirement.
+    let mut prior_by_key: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for old_name in prior_owned.keys() {
+        prior_by_key
+            .entry(fs_name_key(old_name))
+            .or_default()
+            .push(old_name.clone());
+    }
 
     // Record `state: "publishing"` with both new target hashes and prior owned hashes
-    // BEFORE modifying any output file so an interrupted publish can recover cleanly.
+    // before modifying any output file so an interrupted publish can recover cleanly.
     let publishing = Manifest {
         state: ManifestState::Publishing,
         default_config: String::from_utf8_lossy(&default_config).into_owned(),
@@ -340,24 +668,62 @@ pub fn publish(
     };
     write_manifest_atomic(host, &state_dir, &manifest_path, &publishing)?;
 
-    // Write changed per-config files atomically first.
+    let existing_entries = dir_entry_names(host, build_dir);
+    let mut renamed_in_place: BTreeSet<String> = BTreeSet::new();
+
+    // Publish per-config databases before updating root `compile_commands.json` so
+    // readers never observe a root pointing to a missing or stale per-config file.
     for (index, (filename, bytes, _)) in payloads.iter().enumerate() {
         let dest = build_dir.join(filename);
-        write_atomic_if_changed(host, build_dir, &dest, bytes, index)?;
-    }
-
-    // Atomically replace root `compile_commands.json` last with identical bytes to default.
-    let root_dest = build_dir.join("compile_commands.json");
-    write_atomic_if_changed(host, build_dir, &root_dest, &default_bytes, payloads.len())?;
-
-    // Retire owned files from removed configurations only if unmodified on disk.
-    for (old_name, allowed_hashes) in &prior_owned {
-        if !new_files.contains_key(old_name) {
-            retire_if_unmodified(host, build_dir, old_name, allowed_hashes)?;
+        let key = fs_name_key(filename);
+        let alias_old = prior_by_key.get(&key).and_then(|olds| {
+            olds.iter().find(|old| {
+                old.as_str() != filename.as_str()
+                    && is_spelling_only_alias(host, build_dir, &existing_entries, old, filename)
+            })
+        });
+        if let Some(old_name) = alias_old {
+            replace_spelling_alias(
+                host,
+                build_dir,
+                &build_dir.join(old_name),
+                &dest,
+                bytes,
+                index,
+            )?;
+            renamed_in_place.insert(old_name.clone());
+        } else {
+            write_atomic_if_changed(host, build_dir, &dest, bytes, index)?;
         }
     }
 
-    // Commit final `state: "complete"` manifest.
+    let root_dest = build_dir.join("compile_commands.json");
+    write_atomic_if_changed(host, build_dir, &root_dest, &default_bytes, payloads.len())?;
+
+    // Collect active file identities and exact directory spellings so retirement can
+    // never delete a newly published file on a case- or normalization-insensitive volume.
+    let current_entries = dir_entry_names(host, build_dir);
+    let active_inodes: BTreeSet<(u64, u64)> = new_files
+        .keys()
+        .filter_map(|name| {
+            let meta = host
+                .metadata_fresh(&build_dir.join(name), Follow::No)
+                .ok()?;
+            (meta.ino != 0).then_some((meta.dev, meta.ino))
+        })
+        .collect();
+
+    for (old_name, allowed_hashes) in &prior_owned {
+        if new_files.contains_key(old_name) || renamed_in_place.contains(old_name) {
+            continue;
+        }
+        let old_key = fs_name_key(old_name);
+        if new_by_key.contains_key(&old_key) && !current_entries.contains(old_name.as_bytes()) {
+            continue;
+        }
+        retire_if_unmodified(host, build_dir, old_name, allowed_hashes, &active_inodes)?;
+    }
+
     let complete = Manifest {
         state: ManifestState::Complete,
         default_config: String::from_utf8_lossy(&default_config).into_owned(),
@@ -378,25 +744,67 @@ pub fn publish(
 ///
 /// Returns [`GenError::Write`] if locking or file removal fails unexpectedly.
 pub fn retire(host: &dyn Host, build_dir: &Path) -> Result<(), GenError> {
+    retire_with_prior(host, build_dir, None)
+}
+
+/// Like [`retire`], merging a pre-cleanup [`OwnedSnapshot`] so disabling export
+/// after `--fresh` or a platform restart still removes unmodified owned databases.
+///
+/// # Errors
+///
+/// Returns [`GenError::Write`] if locking or file removal fails unexpectedly.
+pub fn retire_with_prior(
+    host: &dyn Host,
+    build_dir: &Path,
+    prior: Option<&OwnedSnapshot>,
+) -> Result<(), GenError> {
     let state_dir = build_dir.join(MANIFEST_REL_DIR);
     let manifest_path = state_dir.join(MANIFEST_FILE);
-    match host.metadata(&manifest_path, Follow::No) {
-        Ok(meta) if meta.kind == FileKind::File => {}
-        Ok(_) => return Ok(()),
-        Err(err) if err.kind == ErrorKind::NotFound => return Ok(()),
+    let has_manifest = match host.metadata(&manifest_path, Follow::No) {
+        Ok(meta) => meta.kind == FileKind::File,
+        Err(err) if err.kind == ErrorKind::NotFound => false,
         Err(err) => return Err(write_error(&manifest_path, err)),
+    };
+    let has_prior = prior.is_some_and(|snap| !snap.is_empty());
+    if !has_manifest && !has_prior {
+        return Ok(());
     }
 
-    let _lock = acquire_lock(host, &state_dir)?;
-    let owned = read_manifest_owned(host, &manifest_path);
+    let _lock = if host
+        .metadata(&state_dir, Follow::No)
+        .is_ok_and(|meta| meta.kind == FileKind::Dir)
+    {
+        acquire_lock(host, &state_dir)?
+    } else {
+        None
+    };
+
+    let mut owned = if has_manifest {
+        read_manifest_owned(host, &manifest_path)
+    } else {
+        BTreeMap::new()
+    };
+    if let Some(snapshot) = prior {
+        for (name, digests) in &snapshot.owned {
+            owned
+                .entry(name.clone())
+                .or_default()
+                .extend(digests.iter().cloned());
+        }
+    }
+
+    let empty_active = BTreeSet::new();
     for (filename, allowed_hashes) in &owned {
-        retire_if_unmodified(host, build_dir, filename, allowed_hashes)?;
+        retire_if_unmodified(host, build_dir, filename, allowed_hashes, &empty_active)?;
     }
-    match host.remove_file(&manifest_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(write_error(&manifest_path, err)),
+    if has_manifest {
+        match host.remove_file(&manifest_path) {
+            Ok(()) => {}
+            Err(err) if err.kind == ErrorKind::NotFound => {}
+            Err(err) => return Err(write_error(&manifest_path, err)),
+        }
     }
+    Ok(())
 }
 
 /// Normalize a path relative to `base` into an absolute lexical CMake-style path.
@@ -559,11 +967,63 @@ fn is_plain_compdb_filename(name: &str) -> bool {
     validate_config_name(config).is_ok()
 }
 
+fn dir_entry_names(host: &dyn Host, dir: &Path) -> BTreeSet<BString> {
+    host.read_dir(dir)
+        .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+        .unwrap_or_default()
+}
+
+fn is_spelling_only_alias(
+    host: &dyn Host,
+    build_dir: &Path,
+    existing_entries: &BTreeSet<BString>,
+    old_name: &str,
+    new_name: &str,
+) -> bool {
+    let old_path = build_dir.join(old_name);
+    let new_path = build_dir.join(new_name);
+    let Ok(old_meta) = host.metadata_fresh(&old_path, Follow::No) else {
+        return false;
+    };
+    let Ok(new_meta) = host.metadata_fresh(&new_path, Follow::No) else {
+        return false;
+    };
+    if old_meta.ino != 0 && new_meta.ino != 0 {
+        return old_meta.dev == new_meta.dev && old_meta.ino == new_meta.ino;
+    }
+    existing_entries.contains(old_name.as_bytes())
+        && !existing_entries.contains(new_name.as_bytes())
+}
+
+fn replace_spelling_alias(
+    host: &dyn Host,
+    build_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    content: &[u8],
+    ordinal: usize,
+) -> Result<(), GenError> {
+    let new_tmp = allocate_temp_file(host, build_dir, content, &format!("rename-{ordinal}"))?;
+    let backup = unique_temp_path(host, build_dir, &format!("backup-{ordinal}"))?;
+    if let Err(err) = host.rename(old_path, &backup) {
+        let _ = host.remove_file(&new_tmp);
+        return Err(write_error(old_path, err));
+    }
+    if let Err(err) = host.rename(&new_tmp, new_path) {
+        let _ = host.rename(&backup, old_path);
+        let _ = host.remove_file(&new_tmp);
+        return Err(write_error(new_path, err));
+    }
+    let _ = host.remove_file(&backup);
+    Ok(())
+}
+
 fn retire_if_unmodified(
     host: &dyn Host,
     build_dir: &Path,
     filename: &str,
     allowed_hashes: &BTreeSet<String>,
+    active_inodes: &BTreeSet<(u64, u64)>,
 ) -> Result<(), GenError> {
     if !is_plain_compdb_filename(filename) || allowed_hashes.is_empty() {
         return Ok(());
@@ -575,6 +1035,9 @@ fn retire_if_unmodified(
         Err(err) => return Err(write_error(&path, err)),
     };
     if meta.kind != FileKind::File || meta.len > OWNED_FILE_READ_LIMIT {
+        return Ok(());
+    }
+    if meta.ino != 0 && active_inodes.contains(&(meta.dev, meta.ino)) {
         return Ok(());
     }
     let bytes = match host.read(
@@ -642,6 +1105,47 @@ fn write_atomic_if_changed(
     write_atomic_replace(host, staging_dir, dest, content, &format!("db-{ordinal}"))
 }
 
+fn allocate_temp_file(
+    host: &dyn Host,
+    staging_dir: &Path,
+    content: &[u8],
+    tag: &str,
+) -> Result<PathBuf, GenError> {
+    let pid = host.system().pid;
+    let stamp = host.monotonic().as_nanos();
+    for attempt in 0..64u32 {
+        let candidate =
+            staging_dir.join(format!(".rcmake-compdb-{tag}-{pid}-{stamp}-{attempt}.tmp"));
+        match host.write(&candidate, content, WriteMode::CreateNew) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(write_error(&candidate, err)),
+        }
+    }
+    Err(GenError::Write {
+        path: from_native(staging_dir),
+        message: "Could not allocate a unique temporary file for compile_commands.json.".into(),
+    })
+}
+
+fn unique_temp_path(host: &dyn Host, staging_dir: &Path, tag: &str) -> Result<PathBuf, GenError> {
+    let pid = host.system().pid;
+    let stamp = host.monotonic().as_nanos();
+    for attempt in 0..64u32 {
+        let candidate =
+            staging_dir.join(format!(".rcmake-compdb-{tag}-{pid}-{stamp}-{attempt}.tmp"));
+        match host.metadata_fresh(&candidate, Follow::No) {
+            Err(err) if err.kind == ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(err) => return Err(write_error(&candidate, err)),
+        }
+    }
+    Err(GenError::Write {
+        path: from_native(staging_dir),
+        message: "Could not allocate a unique backup path for compile_commands.json.".into(),
+    })
+}
+
 fn write_atomic_replace(
     host: &dyn Host,
     staging_dir: &Path,
@@ -649,27 +1153,7 @@ fn write_atomic_replace(
     content: &[u8],
     tag: &str,
 ) -> Result<(), GenError> {
-    let pid = host.system().pid;
-    let stamp = host.monotonic().as_nanos();
-    let mut temp_path: Option<PathBuf> = None;
-    for attempt in 0..64u32 {
-        let candidate =
-            staging_dir.join(format!(".rcmake-compdb-{tag}-{pid}-{stamp}-{attempt}.tmp"));
-        match host.write(&candidate, content, WriteMode::CreateNew) {
-            Ok(()) => {
-                temp_path = Some(candidate);
-                break;
-            }
-            Err(err) if err.kind == ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(write_error(&candidate, err)),
-        }
-    }
-    let Some(temp) = temp_path else {
-        return Err(GenError::Write {
-            path: from_native(dest),
-            message: "Could not allocate a unique temporary file for compile_commands.json.".into(),
-        });
-    };
+    let temp = allocate_temp_file(host, staging_dir, content, tag)?;
     if let Err(err) = host.rename(&temp, dest) {
         let _ = host.remove_file(&temp);
         return Err(write_error(dest, err));
@@ -928,5 +1412,219 @@ mod tests {
         assert!(contains_unresolved_ide_macro(b"$(SDKROOT)/usr/include"));
         assert!(!contains_unresolved_ide_macro(b"-DFOO=1 -I/opt/include"));
         assert!(!contains_unresolved_ide_macro(b"$<CONFIG:Debug>"));
+    }
+
+    #[test]
+    fn preflight_detects_non_ascii_case_and_normalization_collisions() {
+        for (a, b) in [
+            ("Élite", "élite"),
+            ("Straße", "STRASSE"),
+            ("Café", "Cafe\u{0301}"),
+            ("Übung", "U\u{0308}bung"),
+            ("한글", "\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}"),
+        ] {
+            let colliding = vec![
+                ConfigDatabase {
+                    config: a.into(),
+                    rows: Vec::new(),
+                },
+                ConfigDatabase {
+                    config: b.into(),
+                    rows: Vec::new(),
+                },
+            ];
+            let err = preflight_config_filenames(&colliding)
+                .expect_err(&format!("expected collision for ({a:?}, {b:?})"));
+            assert!(err.to_string().contains("collide"), "{err}");
+        }
+    }
+
+    #[test]
+    fn spelling_only_rename_preserves_empty_db_on_case_insensitive_and_sensitive_fs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 1. PureHost (case-sensitive): Debug -> debug writes debug and retires Debug.
+        let host = PureHost::default();
+        let build = Path::new("/build");
+        host.create_dir_all(build)?;
+        let db1 = MultiConfigCompileDatabase {
+            configs: vec![ConfigDatabase {
+                config: "Debug".into(),
+                rows: Vec::new(),
+            }],
+            default_index: 0,
+            diagnostics: Vec::new(),
+        };
+        publish(&host, build, &db1)?;
+        let db2 = MultiConfigCompileDatabase {
+            configs: vec![ConfigDatabase {
+                config: "debug".into(),
+                rows: Vec::new(),
+            }],
+            default_index: 0,
+            diagnostics: Vec::new(),
+        };
+        publish(&host, build, &db2)?;
+        assert_eq!(
+            host.read(
+                &build.join("compile_commands_debug.json"),
+                ReadRange::All { limit: 1024 }
+            )?,
+            b"[]\n"
+        );
+        assert!(
+            host.metadata(&build.join("compile_commands_Debug.json"), Follow::No)
+                .is_err()
+        );
+
+        // 2. NativeHost (tests case-insensitive APFS/NTFS too): Debug -> debug with identical `[]\n`
+        // must NEVER delete the active file and must leave the new spelling on disk.
+        #[cfg(any(unix, windows))]
+        {
+            let native = rcmake_host::NativeHost::new()?;
+            let temp = std::env::temp_dir().join(format!(
+                "rcmake-compdb-case-{}-{}",
+                std::process::id(),
+                native.monotonic().as_nanos()
+            ));
+            native.create_dir_all(&temp)?;
+            let res = (|| -> Result<(), Box<dyn std::error::Error>> {
+                publish(&native, &temp, &db1)?;
+                publish(&native, &temp, &db2)?;
+                let entries = dir_entry_names(&native, &temp);
+                assert!(
+                    entries.contains(b"compile_commands_debug.json".as_slice()),
+                    "missing new spelling in {entries:?}"
+                );
+                assert!(
+                    !entries.contains(b"compile_commands_Debug.json".as_slice()),
+                    "stale spelling remained in {entries:?}"
+                );
+                assert_eq!(
+                    native.read(
+                        &temp.join("compile_commands_debug.json"),
+                        ReadRange::All { limit: 1024 }
+                    )?,
+                    b"[]\n"
+                );
+                Ok(())
+            })();
+            let _ = native.remove_dir_all(&temp);
+            res?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prior_snapshot_preserves_retirement_across_cache_cleanup_with_digest_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let host = PureHost::default();
+        let build = Path::new("/build");
+        host.create_dir_all(build)?;
+
+        let db = MultiConfigCompileDatabase {
+            configs: vec![
+                ConfigDatabase {
+                    config: "Debug".into(),
+                    rows: vec![row("Debug", "/src/a.c", "/build/Debug/a.o", &["cc", "-O0"])],
+                },
+                ConfigDatabase {
+                    config: "Release".into(),
+                    rows: vec![row(
+                        "Release",
+                        "/src/a.c",
+                        "/build/Release/a.o",
+                        &["cc", "-O2"],
+                    )],
+                },
+            ],
+            default_index: 0,
+            diagnostics: Vec::new(),
+        };
+        publish(&host, build, &db)?;
+
+        // User edits Release externally; Debug and root remain owned and unmodified.
+        host.write(
+            &build.join("compile_commands_Release.json"),
+            b"/* user modified */\n[]\n",
+            WriteMode::Truncate,
+        )?;
+
+        // Capture ownership before `--fresh` deletes `CMakeFiles`.
+        let snapshot = snapshot_owned(&host, build);
+        assert!(!snapshot.is_empty());
+        host.remove_dir_all(&build.join("CMakeFiles"))?;
+
+        // Disable transition with snapshot retires unmodified Debug and root, keeps edited Release.
+        retire_with_prior(&host, build, Some(&snapshot))?;
+        assert!(
+            host.metadata(&build.join("compile_commands_Debug.json"), Follow::No)
+                .is_err()
+        );
+        assert!(
+            host.metadata(&build.join("compile_commands.json"), Follow::No)
+                .is_err()
+        );
+        assert_eq!(
+            host.read(
+                &build.join("compile_commands_Release.json"),
+                ReadRange::All { limit: 1024 }
+            )?,
+            b"/* user modified */\n[]\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn strip_depfile_argv_preserves_msvc_runtime_flags_and_strips_gnu_depfiles() {
+        let msvc: Vec<BString> = [
+            "C:/MSVC/bin/cl.exe",
+            "/nologo",
+            "-MD",
+            "-MT",
+            "-DAPP=1",
+            "-c",
+            "main.c",
+            "/Fomain.obj",
+        ]
+        .into_iter()
+        .map(BString::from)
+        .collect();
+        assert_eq!(strip_depfile_argv(&msvc), msvc);
+
+        let msvc_d: Vec<BString> = ["clang-cl.exe", "-MDd", "-MTd", "-DFOO=1", "-c", "main.c"]
+            .into_iter()
+            .map(BString::from)
+            .collect();
+        assert_eq!(strip_depfile_argv(&msvc_d), msvc_d);
+
+        let gnu: Vec<BString> = [
+            "/usr/bin/cc",
+            "-DFOO=1",
+            "-MD",
+            "-MT",
+            "main.c.o",
+            "-MF",
+            "main.c.o.d",
+            "-o",
+            "main.c.o",
+            "-c",
+            "main.c",
+        ]
+        .into_iter()
+        .map(BString::from)
+        .collect();
+        assert_eq!(
+            strip_depfile_argv(&gnu),
+            vec![
+                BString::from("/usr/bin/cc"),
+                BString::from("-DFOO=1"),
+                BString::from("-o"),
+                BString::from("main.c.o"),
+                BString::from("-c"),
+                BString::from("main.c"),
+            ]
+        );
+        // Explicitly disabling GNU depfile stripping keeps flags intact even for generic names.
+        assert_eq!(strip_depfile_argv_if(&gnu, false), gnu);
     }
 }

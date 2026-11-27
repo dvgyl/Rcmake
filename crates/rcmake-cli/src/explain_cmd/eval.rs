@@ -52,7 +52,8 @@ Exit status
   0  The expression evaluated in every selected configuration.
   1  Evaluation failed in at least one configuration, an operator had no evidence,
      or the evaluation context is provisional.
-  2  Invalid arguments or an unavailable configured build directory.
+  2  Invalid arguments, a target, directory, or configuration that the tree does
+     not have, or an unavailable configured build directory.
 ";
 
 const MAX_EXPRESSION: u64 = 64 << 10;
@@ -131,12 +132,13 @@ pub(super) fn run(argv0: Option<&BString>, options: &EvalOptions, host: &Arc<dyn
     };
     let report = match result.evaluate_genex(&eval) {
         Ok(report) => report,
-        Err(message) => return error(host.as_ref(), &message, 1),
+        Err(message) => return error(host.as_ref(), &message, 2),
     };
     if options.json {
         host.write_out(Stream::Stdout, &render_eval_json(&report));
     } else {
-        let text = render_eval_terminal(&report, !options.no_steps);
+        let color = super::find::use_color(host.as_ref(), options.color);
+        let text = render_eval_terminal(&report, !options.no_steps, color);
         host.write_out(Stream::Stdout, text.as_bytes());
     }
     if report.success() { 0 } else { 1 }

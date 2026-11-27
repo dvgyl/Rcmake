@@ -39,13 +39,27 @@ impl ParseBudget {
         max_total_string_bytes: usize::MAX,
     };
 
+    /// Most values that [`ParseBudget::artifact`] accepts for any input size.
+    ///
+    /// One value uses about 32 bytes before its string data, so this cap keeps the
+    /// value tree of one artifact near 128 MiB.
+    pub const MAX_ARTIFACT_NODES: usize = 1 << 22;
+
     /// Limits for one untrusted build-tree artifact of at most `max_input_bytes` bytes.
+    ///
+    /// The value limit is one value for each 8 input bytes, and at most
+    /// [`ParseBudget::MAX_ARTIFACT_NODES`].
     #[must_use]
     pub const fn artifact(max_input_bytes: usize) -> Self {
+        let nodes = max_input_bytes / 8 + 16;
         Self {
             max_input_bytes,
             max_depth: 64,
-            max_nodes: max_input_bytes / 2 + 16,
+            max_nodes: if nodes < Self::MAX_ARTIFACT_NODES {
+                nodes
+            } else {
+                Self::MAX_ARTIFACT_NODES
+            },
             max_string_bytes: 16 << 20,
             max_total_string_bytes: max_input_bytes,
         }

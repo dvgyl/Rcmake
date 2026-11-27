@@ -243,3 +243,162 @@ fn required_miss_is_not_found_and_stops_later_calls() {
         .collect();
     assert_eq!(names, [("Need".to_owned(), FindOutcome::NotFound, true)]);
 }
+
+#[test]
+fn invalid_requests_with_a_name_record_an_error() {
+    let run = configure(
+        "find_package(Both REQUIRED OPTIONAL)\nfind_package(Later QUIET MODULE)",
+        &[],
+        collect(128),
+    );
+    let calls: Vec<_> = run
+        .traces
+        .calls
+        .iter()
+        .map(|call| (call.ordinal, call.name.to_string(), call.outcome.clone()))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            (1, "Both".to_owned(), FindOutcome::Error),
+            (2, "Later".to_owned(), FindOutcome::NotFound),
+        ]
+    );
+    assert_eq!(run.traces.calls_started, 2);
+    assert!(run.traces.all_calls_kept());
+}
+
+#[test]
+fn nested_calls_keep_entry_order_and_package_ordinals() {
+    let files = [
+        (
+            "/outer/FindWidget.cmake",
+            "find_package(Widget CONFIG QUIET NO_DEFAULT_PATH PATHS /inner)",
+        ),
+        ("/inner/WidgetConfig.cmake", "set(Widget_VERSION 1.0)"),
+    ];
+    let run = configure(
+        "list(APPEND CMAKE_MODULE_PATH /outer)\nfind_package(Widget MODULE)",
+        &files,
+        collect(128),
+    );
+    let calls: Vec<_> = run
+        .traces
+        .calls
+        .iter()
+        .map(|call| {
+            (
+                call.ordinal,
+                call.package_call,
+                call.selected.as_ref().map(|selected| selected.file.clone()),
+            )
+        })
+        .collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!((calls[0].0, calls[0].1), (1, Some(1)));
+    assert_eq!((calls[1].0, calls[1].1), (2, Some(2)));
+    assert!(
+        calls[0]
+            .2
+            .as_ref()
+            .is_some_and(|file| file.ends_with(b"/outer/FindWidget.cmake"))
+    );
+    assert!(
+        calls[1]
+            .2
+            .as_ref()
+            .is_some_and(|file| file.ends_with(b"/inner/WidgetConfig.cmake"))
+    );
+}
+
+#[test]
+fn module_that_reports_not_found_is_still_the_selection() {
+    let files = [(
+        "/mods/FindGizmo.cmake",
+        "set(Gizmo_FOUND FALSE)\nset(Gizmo_NOT_FOUND_MESSAGE \"no headers\")",
+    )];
+    let run = configure(
+        "list(APPEND CMAKE_MODULE_PATH /mods)\nfind_package(Gizmo MODULE QUIET)",
+        &files,
+        collect(128),
+    );
+    let call = &run.traces.calls[0];
+    let selected = call.selected.as_ref().expect("selection");
+    assert!(selected.file.ends_with(b"/mods/FindGizmo.cmake"));
+    assert_eq!(selected.mode, FindMode::Module);
+    assert_eq!(call.outcome, FindOutcome::NotFound);
+    let rejected = call
+        .candidates
+        .iter()
+        .find(|candidate| candidate.reason == Rejection::NotFound)
+        .expect("rejection");
+    assert_eq!(rejected.detail.clone(), Some(BString::from("no headers")));
+}
+
+#[test]
+fn config_rejection_survives_a_module_fallback() {
+    let files = [
+        (
+            "/pkg/GizmoConfig.cmake",
+            "set(Gizmo_FOUND FALSE)\nset(Gizmo_NOT_FOUND_MESSAGE \"bad build\")",
+        ),
+        ("/mods/FindGizmo.cmake", "set(Gizmo_FOUND TRUE)"),
+    ];
+    let run = configure(
+        "set(CMAKE_FIND_PACKAGE_PREFER_CONFIG ON)\nlist(APPEND CMAKE_MODULE_PATH /mods)\nset(Gizmo_DIR /pkg)\nfind_package(Gizmo)",
+        &files,
+        collect(128),
+    );
+    let call = &run.traces.calls[0];
+    assert_eq!(call.outcome, FindOutcome::Found);
+    let rejected = call
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate.mode == FindMode::Config && candidate.reason == Rejection::NotFound
+        })
+        .expect("config rejection");
+    assert_eq!(rejected.detail.clone(), Some(BString::from("bad build")));
+    let selected = call.selected.as_ref().expect("selection");
+    assert!(selected.file.ends_with(b"/mods/FindGizmo.cmake"));
+}
+
+#[test]
+fn request_lists_are_capped_before_they_are_copied() {
+    let components: Vec<String> = (0..600).map(|index| format!("c{index}")).collect();
+    let script = format!(
+        "find_package(Many CONFIG QUIET NO_DEFAULT_PATH COMPONENTS {})",
+        components.join(" ")
+    );
+    let level = FindTraceLevel::Collect(FindTraceLimits {
+        max_list_items: 8,
+        ..FindTraceLimits::default()
+    });
+    let run = configure(&script, &[], level);
+    let call = &run.traces.calls[0];
+    assert_eq!(call.request.components.len(), 8);
+    assert!(call.items_omitted >= 592);
+    assert!(run.traces.bytes >= call.estimated_bytes());
+}
+
+#[test]
+fn byte_budget_omits_calls_that_do_not_fit() {
+    let level = FindTraceLevel::Collect(FindTraceLimits {
+        max_total_bytes: 4096,
+        ..FindTraceLimits::default()
+    });
+    let calls = (0..8)
+        .map(|index| format!("find_package(P{index} CONFIG QUIET NO_DEFAULT_PATH)"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let run = configure(&calls, &[], level);
+    assert_eq!(run.traces.calls_started, 8);
+    assert!(run.traces.omitted_calls > 0);
+    assert!(run.traces.bytes <= 4096);
+    let ordinals: Vec<_> = run.traces.calls.iter().map(|call| call.ordinal).collect();
+    assert!(ordinals.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(
+        u32::try_from(run.traces.calls.len()).unwrap_or(0) + run.traces.omitted_calls,
+        8
+    );
+}

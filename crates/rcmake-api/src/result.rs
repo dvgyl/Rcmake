@@ -45,10 +45,12 @@ impl CompletionState {
 
     /// Return whether the result can differ from a full configure of the project code.
     ///
-    /// Denials whose recorded call sites are all under `module_root`, the bundled CMake
-    /// modules, only skip platform probes that the cache already answers. A cancelled
-    /// run, an early stop, an unattributed denial, or a denial in project code makes
-    /// the result provisional.
+    /// A denial counts as covered only with positive attribution: it reused a cached
+    /// probe result, or it has its own recorded call site under `module_root`, the
+    /// bundled CMake modules. A recorded site stands for at least one denial, so the
+    /// recorded sites must be at least as many as the denials without a cached
+    /// result. A cancelled run, an early stop, an unattributed denial, or a denial in
+    /// project code makes the result provisional.
     #[must_use]
     pub fn provisional_outside(&self, module_root: Option<&[u8]>) -> bool {
         let Self::Partial {
@@ -72,11 +74,19 @@ impl CompletionState {
         let Some(root) = module_root.filter(|root| !root.is_empty()) else {
             return true;
         };
-        project_denial_sites.is_empty()
+        let uncovered = total - *module_denials;
+        project_denial_sites.len() < uncovered
             || project_denial_sites
                 .iter()
-                .any(|(file, _)| !file.starts_with(root))
+                .any(|(file, _)| !under(file, root))
     }
+}
+
+/// Return whether `file` is `root` or a path below it, on a component boundary.
+fn under(file: &[u8], root: &[u8]) -> bool {
+    let root = root.strip_suffix(b"/").unwrap_or(root);
+    file.strip_prefix(root)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
 }
 
 /// An alias declaration recorded when the evaluator registered its name.
@@ -257,9 +267,16 @@ mod completion_tests {
     fn module_only_denials_are_not_provisional() {
         let root = Some(b"/share/cmake".as_slice());
         assert!(!CompletionState::Complete.provisional_outside(root));
+        let darwin = "/share/cmake/Modules/Platform/Darwin.cmake";
+        assert!(!partial(&[darwin], 2, false).provisional_outside(root));
         assert!(
-            !partial(&["/share/cmake/Modules/Platform/Darwin.cmake"], 0, false)
-                .provisional_outside(root)
+            partial(&[darwin], 0, false).provisional_outside(root),
+            "one site cannot attribute three denials"
+        );
+        assert!(!partial(&[darwin, darwin, darwin], 0, false).provisional_outside(root));
+        assert!(
+            partial(&["/share/cmake-extra/X.cmake"], 2, false).provisional_outside(root),
+            "a sibling directory is not under the module root"
         );
         assert!(partial(&["/src/CMakeLists.txt"], 0, false).provisional_outside(root));
         assert!(partial(&[], 0, false).provisional_outside(root));

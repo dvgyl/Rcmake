@@ -674,3 +674,91 @@ fn ctest_submit_verbose_redacts_scheme_relative_and_invalid_submit_urls()
     }
     Ok(())
 }
+
+type RecordedChildren = Arc<std::sync::Mutex<Vec<(PathBuf, Option<BString>)>>>;
+
+/// Record the program and the `RCMAKE_ORACLE_MODE` value of each child.
+fn record_children(host: &PureHost) -> Result<RecordedChildren, Box<dyn Error>> {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    host.set_command_handler(move |_, request, _| {
+        let command = request
+            .pipeline
+            .first()
+            .ok_or_else(|| HostError::unsupported("Missing configure command"))?;
+        let mode = request
+            .env
+            .iter()
+            .find(|(key, _)| key == "RCMAKE_ORACLE_MODE")
+            .map(|(_, value)| value.clone());
+        record
+            .lock()
+            .map_err(|_| HostError::unsupported("Poisoned record"))?
+            .push((path::to_native(&command.program), mode));
+        Ok(RunOutput {
+            results: vec![ProcessResult::Exited(1)],
+            ..RunOutput::default()
+        })
+    })?;
+    Ok(seen)
+}
+
+#[test]
+fn builtin_configure_children_keep_compatibility_mode() -> Result<(), Box<dyn Error>> {
+    let cmake_name = if cfg!(windows) { "cmake.exe" } else { "cmake" };
+    for sibling in [false, true] {
+        let host = Arc::new(PureHost::new("/work".into(), "/work/ctest".into()));
+        let binary = Path::new("/install/bin/rcmake");
+        host.seed_file(binary, b"")?;
+        host.symlink(binary, Path::new("/work/ctest"))?;
+        let cmake = Path::new("/install/bin").join(cmake_name);
+        if sibling {
+            host.symlink(binary, &cmake)?;
+        }
+        host.env_set(b"RCMAKE_ORACLE_MODE", Some(b"0"));
+        host.seed_file(
+            Path::new("/work/src/CMakeLists.txt"),
+            b"project(sample NONE)\nfind_package(Missing REQUIRED)\n",
+        )?;
+        host.seed_file(
+            Path::new("/work/build/DartConfiguration.tcl"),
+            b"SourceDirectory: /work/src\n",
+        )?;
+        host.seed_file(
+            Path::new("/work/dashboard.cmake"),
+            br#"
+            set(CTEST_SOURCE_DIRECTORY "/work/src")
+            set(CTEST_BINARY_DIRECTORY "/work/build")
+            set(CTEST_CMAKE_GENERATOR Ninja)
+            ctest_start(Experimental)
+            ctest_configure(CAPTURE_CMAKE_ERROR captured)
+            set(CTEST_CONFIGURE_COMMAND "/install/bin/rcmake -S /work/src -B /work/build")
+            ctest_configure(CAPTURE_CMAKE_ERROR captured)
+        "#,
+        )?;
+        let seen = record_children(&host)?;
+        invoke(host.clone(), &["-S", "dashboard.cmake"]);
+        invoke(
+            host.clone(),
+            &["--build-dir", "/work/build", "-T", "Configure"],
+        );
+        let seen = seen.lock().map_err(|_| "poisoned record")?.clone();
+        let one = Some(BString::from("1"));
+        let zero = Some(BString::from("0"));
+        let expected = if sibling {
+            vec![
+                (cmake.clone(), zero.clone()),
+                (binary.to_path_buf(), zero.clone()),
+                (cmake.clone(), zero),
+            ]
+        } else {
+            vec![
+                (binary.to_path_buf(), one.clone()),
+                (binary.to_path_buf(), zero),
+                (binary.to_path_buf(), one),
+            ]
+        };
+        assert_eq!(seen, expected, "sibling cmake: {sibling}");
+    }
+    Ok(())
+}

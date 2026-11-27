@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rcmake_base::BString;
-use rcmake_host::{Follow, Host, ReadRange, Stream};
+use rcmake_host::{FileKind, Follow, Host, ReadRange, Stream};
 use rcmake_language_tools::config::ConfigCache;
 use rcmake_language_tools::discovery::{
     FileStamp, discover_files, infer_project_root, write_atomic_checked,
@@ -316,13 +316,58 @@ fn process_one(
         }
     };
 
-    let meta = match host.metadata_fresh(path, Follow::Yes) {
+    // Check link identity without following symlinks first. In-place writes refuse symbolic link
+    // operands so links are never silently replaced with regular files; read-only modes
+    // (`--check` and `--diff`) follow explicit symlink operands to inspect their targets.
+    let link_meta = match host.metadata_fresh(path, Follow::No) {
         Ok(meta) => meta,
         Err(err) => {
             return FileResult {
                 path: path.to_owned(),
                 status: FileOutcome::Error(format!(
                     "rcmake fmt: {}: cannot stat file: {err}",
+                    path.display()
+                )),
+            };
+        }
+    };
+    let meta = match link_meta.kind {
+        FileKind::Symlink if write_file => {
+            return FileResult {
+                path: path.to_owned(),
+                status: FileOutcome::Error(format!(
+                    "rcmake fmt: {}: refusing to overwrite symbolic link in place; format the target file directly.",
+                    path.display()
+                )),
+            };
+        }
+        FileKind::Symlink => match host.metadata_fresh(path, Follow::Yes) {
+            Ok(target_meta) if target_meta.kind == FileKind::File => target_meta,
+            Ok(_) => {
+                return FileResult {
+                    path: path.to_owned(),
+                    status: FileOutcome::Error(format!(
+                        "rcmake fmt: {}: symbolic link target is not a regular file.",
+                        path.display()
+                    )),
+                };
+            }
+            Err(err) => {
+                return FileResult {
+                    path: path.to_owned(),
+                    status: FileOutcome::Error(format!(
+                        "rcmake fmt: {}: cannot stat symbolic link target: {err}",
+                        path.display()
+                    )),
+                };
+            }
+        },
+        FileKind::File => link_meta,
+        _ => {
+            return FileResult {
+                path: path.to_owned(),
+                status: FileOutcome::Error(format!(
+                    "rcmake fmt: {}: path is not a regular file.",
                     path.display()
                 )),
             };
@@ -369,6 +414,41 @@ fn process_one(
             };
         }
     };
+
+    if write_file {
+        let after_read = match host.metadata_fresh(path, Follow::No) {
+            Ok(meta) => meta,
+            Err(err) => {
+                return FileResult {
+                    path: path.to_owned(),
+                    status: FileOutcome::Error(format!(
+                        "rcmake fmt: {}: cannot re-stat file after read: {err}",
+                        path.display()
+                    )),
+                };
+            }
+        };
+        if after_read.kind == FileKind::Symlink {
+            return FileResult {
+                path: path.to_owned(),
+                status: FileOutcome::Error(format!(
+                    "rcmake fmt: {}: refusing to overwrite symbolic link in place; format the target file directly.",
+                    path.display()
+                )),
+            };
+        }
+        if after_read.kind != FileKind::File
+            || !stamp.matches_identity(&FileStamp::from_metadata(&after_read))
+        {
+            return FileResult {
+                path: path.to_owned(),
+                status: FileOutcome::Error(format!(
+                    "rcmake fmt: Refusing to overwrite {}: file changed on disk during read.",
+                    path.display()
+                )),
+            };
+        }
+    }
 
     let result = match format_bytes(&original, style, limits) {
         Ok(res) => res,
@@ -561,5 +641,80 @@ mod tests {
             Arc::clone(&compat_host) as Arc<dyn Host>,
         );
         assert!(!stdout_str(&compat_host).contains("Usage: rcmake fmt"));
+    }
+
+    #[test]
+    fn fmt_skips_recursive_symlinks_and_refuses_inplace_overwrite_of_direct_symlink() {
+        let work = Path::new("/work");
+        let host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        let real_target = Path::new("/outside/target.cmake");
+        let link = work.join("linked.cmake");
+        let unformatted = b"if(ON)\nset(A   1)\nendif()\n";
+        host.seed_file(real_target, unformatted).unwrap();
+        host.seed_file(&work.join("CMakeLists.txt"), b"project(Clean)\n")
+            .unwrap();
+        host.symlink(real_target, &link).unwrap();
+
+        // Recursive discovery skips file symlinks; neither link nor target is modified.
+        let code = run(None, &[], Arc::clone(&host) as Arc<dyn Host>);
+        assert_eq!(code, 0);
+        assert_eq!(
+            host.metadata_fresh(&link, Follow::No).unwrap().kind,
+            FileKind::Symlink
+        );
+        assert_eq!(
+            host.read(real_target, ReadRange::All { limit: 1024 })
+                .unwrap(),
+            unformatted
+        );
+
+        // Direct symlink operand works cleanly in read-only --check and --diff modes.
+        let check_host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        check_host.seed_file(real_target, unformatted).unwrap();
+        check_host.symlink(real_target, &link).unwrap();
+        let check_code = run(
+            None,
+            &bargs(&["--check", "linked.cmake"]),
+            Arc::clone(&check_host) as Arc<dyn Host>,
+        );
+        assert_eq!(check_code, 1);
+        assert!(stdout_str(&check_host).contains("linked.cmake"));
+
+        let diff_host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        diff_host.seed_file(real_target, unformatted).unwrap();
+        diff_host.symlink(real_target, &link).unwrap();
+        let diff_code = run(
+            None,
+            &bargs(&["--diff", "linked.cmake"]),
+            Arc::clone(&diff_host) as Arc<dyn Host>,
+        );
+        assert_eq!(diff_code, 1);
+        assert!(stdout_str(&diff_host).contains("+  set(A 1)"));
+
+        // Direct symlink operand in in-place write mode is refused with exit 2 and preserves link.
+        let write_host = Arc::new(PureHost::new(work.into(), work.join("bin/rcmake")));
+        write_host.seed_file(real_target, unformatted).unwrap();
+        write_host.symlink(real_target, &link).unwrap();
+        let write_code = run(
+            None,
+            &bargs(&["linked.cmake"]),
+            Arc::clone(&write_host) as Arc<dyn Host>,
+        );
+        assert_eq!(write_code, 2);
+        assert!(
+            stderr_str(&write_host).contains("symbolic link"),
+            "stderr={}",
+            stderr_str(&write_host)
+        );
+        assert_eq!(
+            write_host.metadata_fresh(&link, Follow::No).unwrap().kind,
+            FileKind::Symlink
+        );
+        assert_eq!(
+            write_host
+                .read(real_target, ReadRange::All { limit: 1024 })
+                .unwrap(),
+            unformatted
+        );
     }
 }

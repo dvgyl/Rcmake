@@ -288,6 +288,32 @@ pub(crate) fn cmake_executable(host: &dyn Host) -> PathBuf {
     .unwrap_or(executable)
 }
 
+/// Return the environment for a CMake child that ctest selects itself.
+///
+/// The `rcmake` program name selects the native persona. That persona can
+/// write native find traces and print native hints. A child that ctest selects
+/// on its own must behave like CMake, so the child gets `RCMAKE_ORACLE_MODE=1`.
+/// A command that the project names explicitly does not use this function.
+pub(crate) fn builtin_cmake_env(host: &dyn Host, program: &[u8]) -> Vec<(BString, BString)> {
+    let mut env = host.env_all();
+    if selects_native_persona(&path::to_native(program)) {
+        env.retain(|(key, _)| !key.eq_ignore_ascii_case(b"RCMAKE_ORACLE_MODE"));
+        env.push(("RCMAKE_ORACLE_MODE".into(), "1".into()));
+    }
+    env
+}
+
+/// Return whether `program` has the program name of the native persona.
+fn selects_native_persona(program: &Path) -> bool {
+    program.file_stem().is_some_and(|stem| {
+        if cfg!(windows) {
+            stem.eq_ignore_ascii_case("rcmake")
+        } else {
+            stem == "rcmake"
+        }
+    })
+}
+
 fn register(registry: &mut Registry) {
     rcmake_commands::register_all(registry);
     for (name, command) in [
@@ -599,6 +625,18 @@ fn handler_process(
     build: &Path,
     command: Vec<BString>,
 ) -> Result<RunOutput, CmdError> {
+    handler_process_with(cx, args, cwd, build, command, false)
+}
+
+/// Run a handler command. `builtin` marks a CMake child that ctest selects.
+fn handler_process_with(
+    cx: &Cx<'_>,
+    args: &Arguments<'_>,
+    cwd: PathBuf,
+    build: &Path,
+    command: Vec<BString>,
+    builtin: bool,
+) -> Result<RunOutput, CmdError> {
     let mut command = command.into_iter();
     let program = command
         .next()
@@ -621,7 +659,13 @@ fn handler_process(
         spec.args.push("-DCTEST_USE_LAUNCHERS:BOOL=TRUE".into());
     }
     let report_command = configure.then(|| spec.clone());
-    let mut env: BTreeMap<_, _> = host.env_all().into_iter().collect();
+    let mut env: BTreeMap<_, _> = if builtin {
+        builtin_cmake_env(host, &spec.program)
+    } else {
+        host.env_all()
+    }
+    .into_iter()
+    .collect();
     if !configure && cx.var_is_on(b"CTEST_USE_LAUNCHERS") {
         env.insert(
             "CTEST_LAUNCH_LOGS".into(),

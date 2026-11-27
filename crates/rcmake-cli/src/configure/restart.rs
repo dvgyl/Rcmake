@@ -19,7 +19,7 @@ pub(super) fn selection(saved: &Cache) -> Arc<ConfigureSelection> {
 }
 
 pub(super) fn reset(
-    session: &ConfigureSession<'_>,
+    session: &mut ConfigureSession<'_>,
     interp: &mut Interp,
     changes: BTreeMap<BString, BString>,
 ) -> Result<Cache, Exit> {
@@ -38,6 +38,12 @@ pub(super) fn reset(
             saved.insert(name.into(), entry.clone());
         }
     }
+    session
+        .prior_compdb
+        .merge(rcmake_gen_common::compile_commands_native::snapshot_owned(
+            host,
+            &session.bin,
+        ));
     cache_setup::clear(host, &session.bin).map_err(Exit::message)?;
     let mut notice = String::from(
         "You have changed variables that require your cache to be deleted.\n\

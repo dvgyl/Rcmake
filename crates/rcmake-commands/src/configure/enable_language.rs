@@ -14,13 +14,14 @@
 
 use std::path::{Path, PathBuf};
 
+use rcmake_base::hash::HashAlgo;
 use rcmake_base::list::{self, Empty};
 use rcmake_base::truth::is_off;
 use rcmake_base::{BString, CMAKE_VERSION_STR};
 use rcmake_diag::{DiagCategory, Effect, MessageKind, PolicyId, PolicyStatus};
 use rcmake_eval::{CmdError, CmdResult, Cx, Flow, IncludeOptions};
 use rcmake_expr::ExpandedArg;
-use rcmake_host::{Follow, Stream, path};
+use rcmake_host::{FileKind, Follow, ReadRange, Stream, WriteMode, path};
 use rcmake_model::{CacheEntry, CacheType, GeneratorKind};
 
 use crate::policy_misc::properties::known_features;
@@ -651,6 +652,7 @@ impl Bootstrap {
             if !read_list_file(cx, &compiler_file)? {
                 return Err(missing_module(cx, &compiler_file));
             }
+            record_identification(cx, &self.root_bin, lang);
             set_language_enabled(cx, lang);
             need_test = true;
         }
@@ -1056,6 +1058,59 @@ pub(super) fn add_cache(cx: &mut Cx<'_>, name: &[u8], value: BString, ty: CacheT
     }
 }
 
+/// Largest `CMake<LANG>Compiler.cmake` file that an identification record describes.
+const COMPILER_FILE_LIMIT: u64 = 1024 * 1024;
+
+/// Path of the identification record for `lang` in the platform information directory.
+///
+/// The drift tracker in `rcmake-cli` (`drift.rs`) removes old records before a native
+/// configure and reads them after generation. A record whose `evidence_sha256`
+/// matches the current compiler file is the only proof that this configure
+/// identified the compiler. A changed compiler file alone is not proof.
+fn identification_record(root_bin: &[u8], lang: &[u8]) -> BString {
+    cat(&[
+        root_bin,
+        b"/CMake",
+        lang,
+        b"Compiler.identification-v1.json",
+    ])
+}
+
+/// Record that `CMakeDetermine<LANG>Compiler.cmake` ran in this configure and wrote
+/// the compiler file that is now on disk.
+///
+/// The record depends only on the compiler file, so equal configures write equal
+/// build trees. The previous record is removed first, so a failed write leaves no
+/// stale proof.
+fn record_identification(cx: &mut Cx<'_>, root_bin: &[u8], lang: &[u8]) {
+    if !cx.services().track_compiler_identifications {
+        return;
+    }
+    let host = cx.host();
+    let record = path::to_native(&identification_record(root_bin, lang));
+    let compiler_file = path::to_native(&cat(&[root_bin, b"/CMake", lang, b"Compiler.cmake"]));
+    let _ = host.remove_file(&record);
+    let bytes = match host.metadata(&compiler_file, Follow::No) {
+        Ok(meta) if meta.kind == FileKind::File && meta.len <= COMPILER_FILE_LIMIT => host
+            .read(
+                &compiler_file,
+                ReadRange::All {
+                    limit: COMPILER_FILE_LIMIT,
+                },
+            )
+            .ok(),
+        _ => None,
+    };
+    let Some(bytes) = bytes else {
+        return;
+    };
+    let text = format!(
+        "{{\"version\":1,\"evidence_sha256\":\"{}\"}}\n",
+        HashAlgo::Sha256.hex_digest(&bytes)
+    );
+    let _ = host.write(&record, text.as_bytes(), WriteMode::CreateNew);
+}
+
 fn lang_var(lang: &[u8], suffix: &[u8]) -> BString {
     cat(&[b"CMAKE_", lang, suffix])
 }
@@ -1084,4 +1139,116 @@ fn absolute_path(file: &[u8], base: &[u8]) -> BString {
 
 fn cat(parts: &[&[u8]]) -> BString {
     parts.concat().into()
+}
+
+#[cfg(test)]
+mod identification_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use rcmake_eval::{CacheDefine, Interp, InterpConfig, RunMode};
+    use rcmake_host::{Host, PureHost, ReadRange};
+    use rcmake_model::CacheType;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const MODULES: &str = "/share/cmake-4.5/Modules";
+    const RECORD: &str = "/work/build/CMakeFiles/4.5.1/CMakeCCompiler.identification-v1.json";
+    const COMPILER_FILE: &str = "/work/build/CMakeFiles/4.5.1/CMakeCCompiler.cmake";
+
+    fn configure(host: &Arc<PureHost>, defines: Vec<CacheDefine>, track: bool) -> TestResult {
+        let services = rcmake_eval::Services {
+            track_compiler_identifications: track,
+            ..Default::default()
+        };
+        let mut interp = Interp::new(
+            InterpConfig {
+                services: Arc::new(services),
+                host: host.clone(),
+                mode: RunMode::Configure,
+                cmake_root: "/share/cmake-4.5".into(),
+                cmake_command: "/bin/cmake".into(),
+                cwd: "/work".into(),
+                limits: Default::default(),
+                diag: Default::default(),
+                defines,
+                script_args: Vec::new(),
+            },
+            crate::register_all,
+        );
+        let outcome = interp.run_configure(Path::new("/work/src"), Path::new("/work/build"), &[]);
+        assert_eq!(outcome.exit_code, 0);
+        Ok(())
+    }
+
+    fn seed(host: &PureHost) -> TestResult {
+        let module = |name: &str, body: &str| {
+            host.seed_file(&Path::new(MODULES).join(name), body.as_bytes())
+        };
+        module(
+            "CMakeDetermineSystem.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeSystem.cmake \"set(CMAKE_SYSTEM_NAME Fake)\\nset(CMAKE_SYSTEM_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeUnixFindMake.cmake",
+            "set(CMAKE_MAKE_PROGRAM /bin/make CACHE FILEPATH \"\")\n",
+        )?;
+        module("CMakeSystemSpecificInitialize.cmake", "")?;
+        module("CMakeSystemSpecificInformation.cmake", "")?;
+        module(
+            "CMakeDetermineCCompiler.cmake",
+            "file(WRITE ${CMAKE_PLATFORM_INFO_DIR}/CMakeCCompiler.cmake \"set(CMAKE_C_COMPILER /bin/cc)\\nset(CMAKE_C_COMPILER_LOADED 1)\\n\")\n",
+        )?;
+        module(
+            "CMakeCInformation.cmake",
+            "set(CMAKE_C_INFORMATION_LOADED 1)\n",
+        )?;
+        module(
+            "CMakeTestCCompiler.cmake",
+            "set(CMAKE_C_COMPILER_WORKS TRUE)\n",
+        )?;
+        host.seed_file(Path::new("/bin/cc"), b"")?;
+        host.seed_file(Path::new("/work/src/CMakeLists.txt"), b"project(P C)\n")?;
+        Ok(())
+    }
+
+    fn read(host: &PureHost, file: &str) -> Option<Vec<u8>> {
+        host.read(&PathBuf::from(file), ReadRange::All { limit: 1 << 16 })
+            .ok()
+    }
+
+    /// Only a real compiler identification writes a record. The record names the
+    /// digest of the compiler file that the identification wrote.
+    #[test]
+    fn only_a_compiler_identification_writes_a_record() -> TestResult {
+        let host = Arc::new(PureHost::new("/work".into(), "/bin/cmake".into()));
+        seed(&host)?;
+        // Compatibility configures leave tracking disabled and write no record.
+        configure(&host, Vec::new(), false)?;
+        assert_eq!(read(&host, RECORD), None);
+
+        configure(&host, Vec::new(), true)?;
+        let record = read(&host, RECORD).ok_or("record")?;
+        let compiler_file = read(&host, COMPILER_FILE).ok_or("compiler file")?;
+        let expected = format!(
+            "{{\"version\":1,\"evidence_sha256\":\"{}\"}}\n",
+            rcmake_base::hash::HashAlgo::Sha256.hex_digest(&compiler_file)
+        );
+        assert_eq!(String::from_utf8(record.clone())?, expected);
+
+        // A warm configure loads the saved results and writes no record.
+        host.remove_file(Path::new(RECORD))?;
+        let warm = CacheDefine {
+            name: "CMAKE_PLATFORM_INFO_INITIALIZED".into(),
+            ty: Some(CacheType::Internal),
+            value: "1".into(),
+        };
+        configure(&host, vec![warm], true)?;
+        assert_eq!(read(&host, RECORD), None);
+
+        // A new identification writes the same bytes for the same compiler file.
+        configure(&host, Vec::new(), true)?;
+        assert_eq!(read(&host, RECORD), Some(record));
+        Ok(())
+    }
 }

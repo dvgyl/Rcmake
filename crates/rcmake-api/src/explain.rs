@@ -690,6 +690,22 @@ impl ConfigureResult {
         }
     }
 
+    /// Working directory of the compile commands of `target`.
+    ///
+    /// Makefile and Visual Studio generators run a command in the binary directory
+    /// of the target. Ninja and the other generators run it in the top build directory.
+    fn command_dir(&self, target: &Target) -> BString {
+        let per_target = self
+            .model
+            .cache
+            .get(b"CMAKE_GENERATOR")
+            .is_some_and(|entry| {
+                entry.value.ends_with(b"Makefiles") || entry.value.starts_with(b"Visual Studio")
+            });
+        let dir = if per_target { target.dir } else { DirId::ROOT };
+        self.model.dir(dir).binary_dir.clone()
+    }
+
     fn explain_target(
         &self,
         dir: DirId,
@@ -772,8 +788,11 @@ impl ConfigureResult {
                 Some(Box::new(report))
             }
             Some(typed) => {
+                let command_dir = self.command_dir(target);
                 for config in configs.values_mut() {
-                    config.entries.retain(|entry| typed.matches(entry));
+                    config
+                        .entries
+                        .retain(|entry| typed.matches_in(entry, Some(&command_dir)));
                 }
                 None
             }

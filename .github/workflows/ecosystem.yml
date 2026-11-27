@@ -254,6 +254,7 @@ jobs:
       - name: Install vcpkg tools
         run: |
           source env/env.sh
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
           timeout 120s sudo apt-get update
           timeout 300s sudo apt-get install -y --no-install-recommends \
             autoconf automake bison curl flex g++ gperf libtool nasm ninja-build \
@@ -486,6 +487,7 @@ jobs:
       - name: Install Conan and Ninja
         run: |
           source env/env.sh
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
           timeout 120s sudo apt-get update
           timeout 180s sudo apt-get install -y --no-install-recommends gcc-13 g++-13 ninja-build
           timeout 180s python3 -m pip install 'conan==2.18.1'
@@ -633,6 +635,7 @@ jobs:
             timeout 15s sha256sum --check <<< "f31d84adf5054c7d60ded0e82c0f776a77ea33af53d08f40b9ad7c94cca55296  $ros_package"
             timeout 60s sudo dpkg -i "$ros_package"
           fi
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
           timeout 120s sudo apt-get update
           timeout 25m python3 - <<'PY'
           import os
@@ -992,6 +995,7 @@ jobs:
           github-token: ${{ github.token }}
       - name: Install Linux build tools
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
           sudo apt-get update
           sudo apt-get install -y gcc g++ clang ninja-build make binutils libzstd1 pkg-config rpm elfutils
           curl --fail --location --retry 3 --output "$RUNNER_TEMP/appimagetool" \
@@ -1165,6 +1169,7 @@ jobs:
       - *oracle
       - name: Install Ninja
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
           sudo apt-get update
           sudo apt-get install -y ninja-build
       - name: Check CLI behavior and the language server
@@ -1213,6 +1218,7 @@ jobs:
         timeout-minutes: 15
         run: |
           source env/env.sh
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
           timeout --kill-after=10s 120s sudo apt-get update
           timeout --kill-after=10s 300s sudo apt-get install -y --no-install-recommends gcc g++ gfortran ninja-build make binutils
           timeout --kill-after=10s 15m scripts/fetch-oracle.sh --print-env > "$RUNNER_TEMP/rcmake-linux-oracle.env"
@@ -1241,6 +1247,7 @@ jobs:
       - *stage
       - name: Build and test Qt 6 offscreen
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
           timeout 120s sudo apt-get update
           timeout 300s sudo apt-get install -y --no-install-recommends ninja-build g++ qt6-base-dev qt6-base-dev-tools
           scripts/linux-vm-test.sh --qt-only target/stage/bin
@@ -1262,6 +1269,7 @@ jobs:
       - name: Install Linux toolchains
         run: |
           source env/env.sh
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources || true
           timeout 120s sudo apt-get update
           timeout 600s sudo apt-get install -y --no-install-recommends \
             gcc g++ gfortran gcc-arm-none-eabi gcc-arm-linux-gnueabihf \

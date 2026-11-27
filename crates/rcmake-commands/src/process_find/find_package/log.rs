@@ -82,7 +82,16 @@ pub(super) struct SearchLog {
 }
 
 impl SearchLog {
-    pub(super) fn new(cx: &mut Cx<'_>, name: &[u8], found_var: &[u8], request: &Request) -> Self {
+    pub(super) fn new(
+        cx: &mut Cx<'_>,
+        name: &[u8],
+        found_var: &[u8],
+        request: &Request,
+        mut native: Option<Box<Collector>>,
+    ) -> Self {
+        if let Some(native) = &mut native {
+            native.describe(cx, name, request);
+        }
         let debug = cx.find_package_debug(name);
         let enabled = cx.mode() == RunMode::Configure
             && (debug || !cx.var_is_on(b"CMAKE_FIND_DEBUG_MODE_NO_IMPLICIT_CONFIGURE_LOG"));
@@ -116,7 +125,7 @@ impl SearchLog {
             global: request.global || cx.var_is_on(b"CMAKE_FIND_PACKAGE_TARGETS_GLOBAL"),
             use_modules: request.config_options.is_empty(),
             outer_root_counts: cx.var_or_empty(ROOT_COUNTS),
-            native: Collector::start(cx, name, request),
+            native,
         }
     }
 
@@ -200,6 +209,13 @@ impl SearchLog {
     pub(super) fn native_module_search(&mut self, considered: &[std::path::PathBuf]) {
         if let Some(native) = &mut self.native {
             native.module_search(considered);
+        }
+    }
+
+    /// Record a native-only selection that the configure log does not list.
+    pub(super) fn native_selected(&mut self, path: &BString, mode: Mode, version: &BString) {
+        if let Some(native) = &mut self.native {
+            native.selected(path, mode, version);
         }
     }
 

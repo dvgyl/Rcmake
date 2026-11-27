@@ -922,10 +922,12 @@ fn compressed_ar_archives_list_and_extract_within_bounds() -> TestResult {
     let host = test_host();
     let archive = Path::new("/archive.ar.grz");
     host.seed_file(archive, b"GRZipII\0payload")?;
-    let grzip = Path::new("/bin/grzip");
-    host.seed_file(grzip, b"")?;
-    host.set_permissions(grzip, 0o755)?;
-    host.env_set(b"PATH", Some(b"/bin"));
+    // `PATH` lookup accepts only native absolute directories and adds the native executable suffix.
+    let tools = if cfg!(windows) { "C:/bin" } else { "/bin" };
+    let grzip = Path::new(tools).join(format!("grzip{}", std::env::consts::EXE_SUFFIX));
+    host.seed_file(&grzip, b"")?;
+    host.set_permissions(&grzip, 0o755)?;
+    host.env_set(b"PATH", Some(tools.as_bytes()));
     let plain_copy = plain.clone();
     host.set_command_handler(move |_, _, _| {
         Ok(rcmake_host::RunOutput {

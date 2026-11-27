@@ -49,6 +49,8 @@ def _make_fake_archive(
     archive_name: str | None = None,
     lsp_mode: str = "standalone",
     lsp_link_target: str = "rcmake",
+    verify_mode: str = "absent",
+    verify_version: str | None = None,
     rcmake_is_symlink: bool = False,
     sidecar: str = "valid",
     extra_marker: str = "v1",
@@ -78,6 +80,24 @@ def _make_fake_archive(
         f'printf "rcmake-fake {version} {extra_marker}\\n"\n'
     )
     lsp_script = f'#!/bin/sh\nprintf "standalone-lsp {version} {extra_marker}\\n"\n'
+    v_ver = verify_version if verify_version is not None else version
+    if verify_mode == "broken-staged":
+        verify_script = "#!/bin/sh\necho 'broken staged verify' >&2\nexit 1\n"
+    elif verify_mode == "broken-installed":
+        verify_script = (
+            "#!/bin/sh\n"
+            'case "$0" in *.rcmake-install-*) printf "rcmake-verify %s\\n" '
+            f'"{v_ver}"; exit 0 ;; *) echo "broken installed verify" >&2; exit 1 ;; esac\n'
+        )
+    else:
+        verify_script = (
+            "#!/bin/sh\n"
+            'if [ "$1" = "--version" ]; then\n'
+            f'  printf "rcmake-verify {v_ver}\\n"\n'
+            "  exit 0\n"
+            "fi\n"
+            f'printf "verify-fake {v_ver} {extra_marker}\\n"\n'
+        )
 
     def add_bytes(tar: tarfile.TarFile, relpath: str, data: bytes, mode: int) -> None:
         info = tarfile.TarInfo(name=f"{top}/{relpath}")
@@ -104,6 +124,11 @@ def _make_fake_archive(
             add_symlink(tar, "bin/rcmake-lsp", lsp_link_target)
         elif lsp_mode != "absent":
             raise ValueError(f"Unsupported lsp_mode: {lsp_mode}")
+
+        if verify_mode in ("matching", "broken-staged", "broken-installed"):
+            add_bytes(tar, "bin/rcmake-verify", verify_script.encode("utf-8"), 0o755)
+        elif verify_mode != "absent":
+            raise ValueError(f"Unsupported verify_mode: {verify_mode}")
 
         # Release archives also include cmake/ctest/cpack symlinks; install.sh must
         # only install them when --alias-cmake is passed.
@@ -905,6 +930,69 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("0.1.0 v1", (self.prefix / "share" / "doc" / "rcmake" / "LICENSE-MIT").read_text())
         self.assertEqual(keep_file.read_text(encoding="utf-8"), "keep during rollback\n")
 
+    def test_verify_companion_version_check_rollback_and_older_archive_cleanup(self) -> None:
+        v1 = _make_fake_archive(
+            self.archives,
+            version="0.1.0",
+            archive_name="rcmake-verify-v1.tar.gz",
+            lsp_mode="symlink",
+            verify_mode="matching",
+            extra_marker="v1",
+        )
+        res = self.run_install("--archive", str(v1))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        verify_bin = self.prefix / "bin" / "rcmake-verify"
+        self.assertTrue(verify_bin.is_file() and not verify_bin.is_symlink())
+        self.assertIn("rcmake-verify 0.1.0", verify_bin.read_text(encoding="utf-8"))
+
+        # Mismatched companion version in staged archive fails before touching v1.
+        v2_mismatch = _make_fake_archive(
+            self.archives,
+            version="0.2.0",
+            archive_name="rcmake-verify-v2-mismatch.tar.gz",
+            lsp_mode="symlink",
+            verify_mode="matching",
+            verify_version="0.1.9",
+            extra_marker="v2",
+        )
+        res = self.run_install("--archive", str(v2_mismatch))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("does not match rcmake version", res.stderr)
+        self.assertIn("rcmake-verify 0.1.0", verify_bin.read_text(encoding="utf-8"))
+
+        # Broken companion after install triggers full rollback to v1.
+        v2_broken = _make_fake_archive(
+            self.archives,
+            version="0.2.0",
+            archive_name="rcmake-verify-v2-broken.tar.gz",
+            lsp_mode="symlink",
+            verify_mode="broken-installed",
+            extra_marker="v2",
+        )
+        res = self.run_install("--archive", str(v2_broken))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("rcmake-verify 0.1.0", verify_bin.read_text(encoding="utf-8"))
+        probe = subprocess.run(
+            [str(self.prefix / "bin" / "rcmake"), "--version"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertIn("rcmake 0.1.0", probe.stdout)
+
+        # Installing an older archive that omits rcmake-verify removes the stale owned companion.
+        v0_old = _make_fake_archive(
+            self.archives,
+            version="0.0.9",
+            archive_name="rcmake-verify-v0-old.tar.gz",
+            lsp_mode="symlink",
+            verify_mode="absent",
+            extra_marker="v0",
+        )
+        res = self.run_install("--archive", str(v0_old))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(os.path.lexists(verify_bin))
+        self.assertIn("omits rcmake-verify", res.stdout)
+
 
 class DistShTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -919,7 +1007,10 @@ class DistShTests(unittest.TestCase):
         rcmake = bin_dir / "rcmake"
         rcmake.write_bytes(b"#!/bin/sh\necho rcmake\n")
         rcmake.chmod(0o755)
-        for alias in ("cmake", "ctest", "cpack", "rcmake-lsp"):
+        verify = bin_dir / "rcmake-verify"
+        verify.write_bytes(b"#!/bin/sh\necho rcmake-verify 0.1.0\n")
+        verify.chmod(0o755)
+        for alias in ("cmake", "ctest", "cpack", "ccmake", "rcmake-lsp"):
             (bin_dir / alias).symlink_to("rcmake")
         for relpath in EXTRA_SHARE_FILES:
             dest = pkg / relpath
@@ -1002,6 +1093,9 @@ class DistShTests(unittest.TestCase):
         fake_exe = fake_bin / "rcmake"
         fake_exe.write_bytes(b"#!/bin/sh\necho fake-rcmake-binary\n")
         fake_exe.chmod(0o755)
+        fake_verify = fake_bin / "rcmake-verify"
+        fake_verify.write_bytes(b"#!/bin/sh\necho rcmake-verify 0.1.0\n")
+        fake_verify.chmod(0o755)
         (fake_root / "modules/cmake-4.5/Modules").mkdir(parents=True)
         (fake_root / "modules/cmake-4.5/Modules/CMake.cmake").write_text("# regular\n", encoding="utf-8")
         (fake_root / "modules/cmake-4.5/Modules/CMake.cmake").chmod(0o644)
@@ -1127,6 +1221,10 @@ class InstallPs1Tests(unittest.TestCase):
             "$part -eq '..'",
             "bin/rcmake.exe",
             "bin/rcmake-lsp.exe",
+            "bin/rcmake-verify.exe",
+            "Get-VersionToken",
+            "does not match rcmake.exe version",
+            "omits rcmake-verify.exe",
             "share/cmake-4.5",
             "share/rcmake/completions/rcmake.ps1",
             "LICENSE-APACHE",

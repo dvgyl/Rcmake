@@ -1,9 +1,14 @@
 //! Bounded, contained reads of build-tree artifacts.
 //!
-//! Every read checks the file kind and containment at open time. The path must name a
-//! regular file, must not be a symbolic link or a reparse point, and its canonical
-//! path must stay under the canonical root. A file replaced between the check and the
-//! read is still bounded by the per-file and cumulative byte limits.
+//! Every read checks the file kind and containment before it opens the file. Each
+//! path component under the root must be a real directory, the last component must
+//! be a regular file, and no component can be a symbolic link or a reparse point.
+//! The canonical path must stay under the canonical root.
+//!
+//! The [`Host`] trait opens files by path, so a concurrent replacement can still
+//! change a path between the check and the read. After each read, the reader checks
+//! the file identity again and rejects the data when the file changed. A replaced
+//! file is also bounded by the per-file and cumulative byte limits.
 
 use std::path::{Path, PathBuf};
 
@@ -57,20 +62,36 @@ impl Default for ReadLimits {
 pub struct ArtifactReader<'h> {
     host: &'h dyn Host,
     root: PathBuf,
+    /// Root as the caller spelled it, lexically normalized, for paths in artifacts.
+    given: PathBuf,
     limits: ReadLimits,
     used: u64,
+}
+
+/// File identity that must stay the same during a read.
+#[derive(PartialEq, Eq)]
+struct Identity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: rcmake_host::FileTime,
 }
 
 impl<'h> ArtifactReader<'h> {
     /// Confine reads to `root`. Return `None` when `root` is not a directory.
     pub fn new(host: &'h dyn Host, root: &Path, limits: ReadLimits) -> Option<Self> {
-        let root = host.canonicalize(root).ok()?;
-        host.metadata(&root, Follow::Yes)
+        let canonical = host.canonicalize(root).ok()?;
+        host.metadata(&canonical, Follow::Yes)
             .ok()
             .filter(|meta| meta.kind == FileKind::Dir)?;
+        let given = rcmake_host::path::to_native(
+            &rcmake_base::path_lex::Lexical::new(&rcmake_host::path::from_native_cmake(root))
+                .normalize(),
+        );
         Some(Self {
             host,
-            root,
+            root: canonical,
+            given,
             limits,
             used: 0,
         })
@@ -117,19 +138,36 @@ impl<'h> ArtifactReader<'h> {
                 "The path must stay inside the build tree.",
             ));
         }
-        let path = self.root.join(relative);
+        let mut path = self.root.clone();
+        let parts: Vec<_> = relative
+            .components()
+            .filter(|part| matches!(part, std::path::Component::Normal(_)))
+            .collect();
+        for (index, part) in parts.iter().enumerate() {
+            path.push(part);
+            let meta = self
+                .host
+                .metadata(&path, Follow::No)
+                .map_err(|_| ReadError::Missing)?;
+            let last = index + 1 == parts.len();
+            match meta.kind {
+                FileKind::Symlink => {
+                    return Err(ReadError::Rejected(
+                        "Links are not followed in the build tree.",
+                    ));
+                }
+                FileKind::Dir if !last => {}
+                FileKind::File if last => {}
+                _ if last => return Err(ReadError::Rejected("The path is not a regular file.")),
+                _ => return Err(ReadError::Rejected("A path component is not a directory.")),
+            }
+        }
         let meta = self
             .host
             .metadata(&path, Follow::No)
             .map_err(|_| ReadError::Missing)?;
-        match meta.kind {
-            FileKind::File => {}
-            FileKind::Symlink => {
-                return Err(ReadError::Rejected(
-                    "Links are not followed in the build tree.",
-                ));
-            }
-            _ => return Err(ReadError::Rejected("The path is not a regular file.")),
+        if meta.kind != FileKind::File {
+            return Err(ReadError::Rejected("The path is not a regular file."));
         }
         let canonical = self
             .host
@@ -160,6 +198,7 @@ impl<'h> ArtifactReader<'h> {
     /// Returns the same errors as [`Self::read`].
     pub fn read_limited(&mut self, relative: &Path, limit: u64) -> Result<Vec<u8>, ReadError> {
         let (path, len) = self.checked(relative)?;
+        let before = self.identity(&path)?;
         let limit = limit.min(self.limits.max_file_bytes);
         let remaining = self.limits.max_total_bytes.saturating_sub(self.used);
         if len > limit || len > remaining {
@@ -186,7 +225,46 @@ impl<'h> ArtifactReader<'h> {
             return Err(ReadError::TooLarge);
         }
         self.used += len;
+        let after = self.identity(&path)?;
+        if before != after || after.len != len {
+            return Err(ReadError::Rejected(
+                "The file changed while rcmake read it.",
+            ));
+        }
         Ok(bytes)
+    }
+
+    fn identity(&self, path: &Path) -> Result<Identity, ReadError> {
+        let meta = self
+            .host
+            .metadata(path, Follow::No)
+            .map_err(|_| ReadError::Missing)?;
+        if meta.kind != FileKind::File {
+            return Err(ReadError::Rejected("The path is not a regular file."));
+        }
+        Ok(Identity {
+            dev: meta.dev,
+            ino: meta.ino,
+            len: meta.len,
+            mtime: meta.mtime,
+        })
+    }
+
+    /// Return the root-relative path of an absolute path that an artifact names,
+    /// such as a response file. The path is compared lexically with the canonical
+    /// root and with the root as the caller spelled it. Links are not resolved here,
+    /// so the read rejects a link in any component under the root.
+    #[must_use]
+    pub fn artifact_relative(&self, absolute: &Path) -> Option<PathBuf> {
+        let normalized = rcmake_host::path::to_native(
+            &rcmake_base::path_lex::Lexical::new(&rcmake_host::path::from_native_cmake(absolute))
+                .normalize(),
+        );
+        normalized
+            .strip_prefix(&self.root)
+            .or_else(|_| normalized.strip_prefix(&self.given))
+            .ok()
+            .map(Path::to_path_buf)
     }
 
     /// Read and parse a JSON file with a parse budget sized to the file limit.
@@ -201,6 +279,25 @@ impl<'h> ArtifactReader<'h> {
         );
         rcmake_json::parse_bounded(&bytes, &ReadOptions::default(), &budget)
             .map_err(|error| ReadError::Json(error.message))
+    }
+
+    /// Return the names of a directory under the root, or [`ReadError::TooLarge`]
+    /// when it has more than `max` entries. A caller that needs the whole listing,
+    /// for example to find the newest index, must not use a cut listing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError::TooLarge`] for more than `max` entries.
+    pub fn list_checked(
+        &self,
+        relative: &Path,
+        max: usize,
+    ) -> Result<Vec<(BString, FileKind)>, ReadError> {
+        let entries = self.list(relative, max.saturating_add(1));
+        if entries.len() > max {
+            return Err(ReadError::TooLarge);
+        }
+        Ok(entries)
     }
 
     /// Return the names of a directory under the root. Links and missing entries are skipped.
@@ -298,6 +395,47 @@ mod tests {
         assert_eq!(reader.read(Path::new("big.txt")), Err(ReadError::TooLarge));
         assert!(reader.read(Path::new("ok.json")).is_ok());
         assert_eq!(reader.read(Path::new("ok.json")), Err(ReadError::TooLarge));
+    }
+
+    #[test]
+    fn rejects_links_in_any_component_and_resolves_artifact_paths_lexically() {
+        let host = host();
+        host.seed_file(Path::new("/b/real/rsp.txt"), b"-O2")
+            .expect("seed");
+        host.symlink(Path::new("/b/real"), Path::new("/b/linked"))
+            .expect("link");
+        host.symlink(Path::new("/b/real/rsp.txt"), Path::new("/b/real/alias.txt"))
+            .expect("link");
+        let mut reader = ArtifactReader::new(host.as_ref(), Path::new("/b"), ReadLimits::default())
+            .expect("root");
+        assert!(reader.read(Path::new("real/rsp.txt")).is_ok());
+        for bad in ["linked/rsp.txt", "real/alias.txt"] {
+            assert!(
+                matches!(reader.read(Path::new(bad)), Err(ReadError::Rejected(_))),
+                "{bad}"
+            );
+        }
+        let relative = reader
+            .artifact_relative(Path::new("/b/sub/../real/alias.txt"))
+            .expect("relative");
+        assert_eq!(relative, Path::new("real/alias.txt"));
+        assert!(matches!(
+            reader.read(&relative),
+            Err(ReadError::Rejected(_))
+        ));
+        assert!(reader.artifact_relative(Path::new("/outside/x")).is_none());
+    }
+
+    #[test]
+    fn checked_listing_reports_overflow() {
+        let host = host();
+        let reader = ArtifactReader::new(host.as_ref(), Path::new("/b"), ReadLimits::default())
+            .expect("root");
+        assert_eq!(
+            reader.list_checked(Path::new("."), 1),
+            Err(ReadError::TooLarge)
+        );
+        assert!(reader.list_checked(Path::new("."), 16).is_ok());
     }
 
     #[test]
