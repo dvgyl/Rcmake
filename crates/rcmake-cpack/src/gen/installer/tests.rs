@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use rcmake_base::BString;
 use rcmake_base::hash::HashAlgo;
-use rcmake_host::path::to_native;
 #[cfg(target_os = "macos")]
-use rcmake_host::path::{from_native, from_native_cmake};
+use rcmake_host::path::from_native;
+use rcmake_host::path::{from_native_cmake, to_native};
 use rcmake_host::{
     CommandSpec, Follow, Host, HostError, HostResult, ProcessResult, PureHost, ReadRange,
     RegistryRoot, RegistryView, RunOutput, RunRequest, Stream, SystemInfo, WriteMode,
