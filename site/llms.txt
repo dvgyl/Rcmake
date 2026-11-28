@@ -2,7 +2,7 @@
 
 > Independent drop-in reimplementation of CMake 4.5.1 in safe Rust. One multi-call binary runs as `cmake`, `ccmake` on Unix, `ctest`, `cpack`, and `rcmake-lsp`, reading existing `CMakeLists.txt` files, presets, and caches and writing compatible build trees.
 
-`rcmake` 0.2.0 contains no copied or translated CMake C++ source code, and the core engine never invokes an upstream `cmake` binary at runtime. All 39 workspace crates enforce `#![forbid(unsafe_code)]`. External Rust crates such as `rustix` and `memchr` use `unsafe` internally, and the native binary statically links `zstd` 1.5.7 and `liblzma` 5.8. Rust and Python code in this repository is dual-licensed under `MIT OR Apache-2.0`, while bundled CMake 4.5.1 `Modules/`, `Templates/`, `Help/`, and derived tables stay under `BSD-3-Clause`. `rcmake` is not affiliated with Kitware, and CMake is a trademark of Kitware, Inc.
+`rcmake` 0.2.1 contains no copied or translated CMake C++ source code, and the core engine never invokes an upstream `cmake` binary at runtime. All 40 workspace crates enforce `#![forbid(unsafe_code)]`. External Rust crates such as `rustix` and `memchr` use `unsafe` internally, and the native binary statically links `zstd` 1.5.7 and `liblzma` 5.8. Rust and Python code in this repository is dual-licensed under `MIT OR Apache-2.0`, while bundled CMake 4.5.1 `Modules/`, `Templates/`, `Help/`, and derived tables stay under `BSD-3-Clause`. `rcmake` is not affiliated with Kitware, and CMake is a trademark of Kitware, Inc.
 
 ## CMake 4.5.1 parity
 
@@ -35,10 +35,10 @@
 
 ## Intentional differences and limits
 
-- Windows `ccmake` terminal UI and Windows `--debugger` named-pipe transport are deferred in `0.2.0` (both work on macOS and Linux), and `cmake-gui` is not included.
+- Windows `ccmake` terminal UI and Windows `--debugger` named-pipe transport are deferred in `0.2.1` (both work on macOS and Linux), and `cmake-gui` is not included.
 - CPack installer generators require the host packaging tool (`pkgbuild` and `productbuild`, `makensis`, `wix`, `binarycreator`), and `rcmake verify` requires a user-supplied CMake 4.5.1 binary.
 - Legacy extra generators (`CodeBlocks`, `CodeLite`, `Eclipse CDT4`, `Kate`, `Sublime Text 2`), older Makefile variants, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14 to 16 are omitted.
-- Reproducible `tar` and CPack archives record uid 0 and gid 0, `try_compile` runs in-process, and `--version` prints `<tool> version 4.5.1` on line 1 and `rcmake 0.2.0` on line 2.
+- Reproducible `tar` and CPack archives record uid 0 and gid 0, `try_compile` runs in-process, and `--version` prints `<tool> version 4.5.1` on line 1 and `rcmake 0.2.1` on line 2.
 - CUDA, HIP, and Swift target lowering are shipped, while standard CI runners lack GPU hardware and full Swift or HIP toolchains.
 
 ## Site and documentation
@@ -47,5 +47,5 @@
 - [Browser playground](https://rcmake.github.io/rcmake/playground.html) runs WebAssembly configure, Ninja generation, diagnostics, and `rcmake explain` locally.
 - [Compatibility report](https://rcmake.github.io/rcmake/dashboard.html) and [latest.json](https://rcmake.github.io/rcmake/data/latest.json) publish differential test results and benchmarks.
 - [Full technical reference](https://rcmake.github.io/rcmake/llms-full.txt) documents all CLI tools, architecture, caching, limits, and common questions.
-- [Documentation index](https://github.com/rcmake/rcmake/blob/main/docs/README.md) links to [README](https://github.com/rcmake/rcmake/blob/main/README.md), [TOOLING.md](https://github.com/rcmake/rcmake/blob/main/docs/TOOLING.md), [CACHING.md](https://github.com/rcmake/rcmake/blob/main/docs/CACHING.md), [FAQ.md](https://github.com/rcmake/rcmake/blob/main/docs/FAQ.md), [ENV_VARS.md](https://github.com/rcmake/rcmake/blob/main/docs/ENV_VARS.md), [ARCHITECTURE.md](https://github.com/rcmake/rcmake/blob/main/docs/ARCHITECTURE.md), [ADR.md](https://github.com/rcmake/rcmake/blob/main/docs/ADR.md) (47 ADRs), [BUILD_WRITEUP.md](https://github.com/rcmake/rcmake/blob/main/docs/BUILD_WRITEUP.md), [PRIOR_ART.md](https://github.com/rcmake/rcmake/blob/main/docs/PRIOR_ART.md), [rcmake-lsp README](https://github.com/rcmake/rcmake/blob/main/crates/rcmake-lsp/README.md), and [rcmake-api README](https://github.com/rcmake/rcmake/blob/main/crates/rcmake-api/README.md).
+- [Documentation index](https://github.com/rcmake/rcmake/blob/main/docs/README.md) links to [README](https://github.com/rcmake/rcmake/blob/main/README.md), [TOOLING.md](https://github.com/rcmake/rcmake/blob/main/docs/TOOLING.md), [CACHING.md](https://github.com/rcmake/rcmake/blob/main/docs/CACHING.md), [FAQ.md](https://github.com/rcmake/rcmake/blob/main/docs/FAQ.md), [ENV_VARS.md](https://github.com/rcmake/rcmake/blob/main/docs/ENV_VARS.md), [ARCHITECTURE.md](https://github.com/rcmake/rcmake/blob/main/docs/ARCHITECTURE.md), [ADR.md](https://github.com/rcmake/rcmake/blob/main/docs/ADR.md) (48 ADRs), [BUILD_WRITEUP.md](https://github.com/rcmake/rcmake/blob/main/docs/BUILD_WRITEUP.md), [PRIOR_ART.md](https://github.com/rcmake/rcmake/blob/main/docs/PRIOR_ART.md), [rcmake-lsp README](https://github.com/rcmake/rcmake/blob/main/crates/rcmake-lsp/README.md), and [rcmake-api README](https://github.com/rcmake/rcmake/blob/main/crates/rcmake-api/README.md).
 - [GitHub repository](https://github.com/rcmake/rcmake) hosts source code, prebuilt releases, and parity bug reports.

@@ -5,7 +5,7 @@
 ## Contents
 
 - [Motivation, scope, and implementation rules](#motivation-scope-and-implementation-rules)
-- [Architecture across 39 crates and one Host trait](#architecture-across-39-crates-and-one-host-trait)
+- [Architecture across 40 crates and one Host trait](#architecture-across-40-crates-and-one-host-trait)
 - [Timeline and multi-agent division of work](#timeline-and-multi-agent-division-of-work)
 - [The differential oracle method](#the-differential-oracle-method)
 - [Hard bugs differential testing exposed](#hard-bugs-differential-testing-exposed)
@@ -25,7 +25,7 @@ The implementation covers `cmake` (including `-P`, `-E`, `--build`, `--install`,
 
 A build system parses untrusted `CMakeLists.txt` files, caches, presets, downloaded archives, binary headers, and compiler output. The workspace forbids `unsafe_code` in [`Cargo.toml`](../Cargo.toml) and every crate root, and Clippy rejects `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `indexing_slicing`, `string_slice`, `iter_over_hash_type`, and direct `std` filesystem, environment, process, and clock calls in engine crates. Reachable input paths return structured diagnostics bounded by `rcmake_base::Limits`.
 
-This rule covers all 39 `rcmake` crates. External crates such as `rustix` and `memchr` use `unsafe` internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8 (documented in [PRIOR_ART.md](PRIOR_ART.md)). Because Rust 2024 marks `std::env::set_var` as `unsafe`, `NativeHost` snapshots the process environment once at startup, tracks `ENV{...}` mutations in an in-memory overlay, and passes the merged map explicitly to child processes.
+This rule covers all 40 `rcmake` crates. External crates such as `rustix` and `memchr` use `unsafe` internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8 (documented in [PRIOR_ART.md](PRIOR_ART.md)). Because Rust 2024 marks `std::env::set_var` as `unsafe`, `NativeHost` snapshots the process environment once at startup, tracks `ENV{...}` mutations in an in-memory overlay, and passes the merged map explicitly to child processes.
 
 ### Implementation boundary and licensing
 
@@ -33,9 +33,9 @@ Rust code in `crates/` and Python tools in `tools/` use `MIT OR Apache-2.0`. Fiv
 
 Three rules enforce the boundary. First, no CMake C++ code is copied or translated into Rust. Second, the `rcmake` engine never runs an upstream `cmake` binary at runtime, and only `rcmake-harness` (including the isolated `rcmake-verify` companion) and `tools/` read `RCMAKE_ORACLE_CMAKE`. Third, [`tools/measure/licence_scan.py`](../tools/measure/licence_scan.py) checks dependency licences, forbids `unsafe` in `crates/`, rejects oracle references outside `rcmake-harness`, and checks Git hygiene on every gate. We do not call the codebase clean-room in the strict legal sense because coding models wrote most of the Rust code and their training data probably includes public CMake sources. Upstream C++ symbol names cited below only label behavior confirmed by live CMake 4.5.1 probes.
 
-## Architecture across 39 crates and one `Host` trait
+## Architecture across 40 crates and one `Host` trait
 
-The workspace holds 39 acyclic safe-Rust crates and 47 Architecture Decision Records in [`docs/ADR.md`](ADR.md). [ARCHITECTURE.md](ARCHITECTURE.md) maps every crate and dependency. Five design choices carry most of the engine.
+The workspace holds 40 acyclic safe-Rust crates and 48 Architecture Decision Records in [`docs/ADR.md`](ADR.md). [ARCHITECTURE.md](ARCHITECTURE.md) maps every crate and dependency. Five design choices carry most of the engine.
 
 1. **Byte strings end to end.** `rcmake-base` stores raw `BString` values, list splitting (`;` with `\;` escapes and bracket awareness), CMake truthiness, lexical paths, and `Limits`. `rcmake-syntax` preserves raw bytes, spans, and a lossless concrete token stream (`0..src.len()`) for `fmt`, `lint`, and `lsp`.
 2. **An independent KWSys regex engine.** `rcmake-regex` implements CMake's regex dialect (no non-greedy quantifiers, distinct anchor rules, `CMAKE_MATCH_<n>` side effects) in pure Rust with a step budget.
@@ -54,8 +54,9 @@ One human maintainer set the goals, boundaries, and review gates, coordinating c
 - **2026-11-25.** Large-project corpus parity, 20 independent black-box scenarios, cross-platform CI recovery, diagnostic and File API v2.12 alignment, WebAssembly smoke checks, brand assets, and static site.
 - **2026-11-26 (`v0.1.0`).** `rcmake-json` replacing `serde_json`, probe and evaluation performance work, shell completions, man page, release receipts, and `v0.1.0` documentation.
 - **2026-11-27 (`v0.2.0`).** Sound setup-checkpoint incremental replay (`vcpkg`, presets, `-C`, `PreLoad.cmake`), clean-room Unix `ccmake`, Unix `--debugger` DAP server, CPack `productbuild`, `NSIS`, `NSIS64`, `WIX`, and `IFW` installers, CUDA, HIP, and Swift lowering, expanded `explain`, `diff-config`, lossless `fmt` and 8-rule `lint` wired into `rcmake-lsp`, isolated `rcmake-verify`, multi-config `compile_commands.json`, drift tracking, and portable probe-cache archives.
+- **2026-11-28 (`v0.2.1`).** Parallel probe lookahead, in-memory `try_compile` prelude cache, `MemoHost` and `FindDirCache` reuse across configure, File API `BacktraceGraph` parity, Ninja dependency and alias-collision fixes reaching 10 of 10 large-project L2 parity and 97.32 percent across all 64 `vcpkg` shards, LZSS-compressed LSP catalog trimming 896 KiB from the release binary, and the tiny safe-Rust `rcmake-shim` launcher cutting the Windows ZIP archive size (ADR-048).
 
-By 2026-11-27, the repository holds over 545 commits across 39 crates, 1,073 Rust files, and 470,335 lines of Rust (check the live count with the command in [One command for each claim](#one-command-for-each-claim)). A human did not read most of this code line by line. Cross-model review, the differential oracle, and the seven test layers below verified it instead.
+By 2026-11-28, the repository holds over 550 commits across 40 crates, 1,077 Rust files, and 483,697 lines of Rust (check the live count with the command in [One command for each claim](#one-command-for-each-claim)). A human did not read most of this code line by line. Cross-model review, the differential oracle, and the seven test layers below verified it instead.
 
 - **Gemini 4 Neon** coordinated shared contracts (`Cargo.toml`, `rcmake-base`, `rcmake-syntax`, `rcmake-diag`, `rcmake-model`, ADRs), triaged differential failures into disjoint crate slices, audited diffs, and authored docs and site tooling.
 - **Opus 5.5** handled deep architectural design, tricky semantic subsystems, and high-stakes reviews on resolution, caching, and tooling slices.
@@ -124,43 +125,43 @@ Differential runs also surfaced five subtle edge cases. `qtbase` parsed `try_com
 
 | Area | Scope | Frozen release binary |
 | --- | --- | --- |
-| Release commit | Git SHA and date | <!-- METRIC:release_commit -->`70c233134676`<!-- /METRIC --> (<!-- METRIC:release_date -->`2026-11-27`<!-- /METRIC -->) |
+| Release commit | Git SHA and date | <!-- METRIC:release_commit -->`2a16da12e77c`<!-- /METRIC --> (<!-- METRIC:release_date -->`2026-11-28`<!-- /METRIC -->) |
 | 3-OS CI and corpus smoke | `ubuntu-24.04`, `macos-15`, `windows-2025` | <!-- METRIC:ci_jobs -->6 of 6 jobs green<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, macOS arm64 | 371 suites planned (`all-macos`) | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Linux | 362 suites planned (`linux`) | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Windows | 367 suites planned (`windows`) | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
-| Upstream Core-62 conformance | 62 core suites (`core`) | <!-- METRIC:runcmake_core62 -->pending frozen release run<!-- /METRIC --> |
-| Upstream policies | 35 policy suites for the 161 policies `CMP0066` to `CMP0226` | <!-- METRIC:runcmake_policies -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, macOS arm64 | 371 suites (`all-macos`) | <!-- METRIC:runcmake_macos -->99.33% (348 / 371 suites, 9,641 / 9,706 cases)<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Linux | 362 suites (`linux`) | <!-- METRIC:runcmake_linux -->99.33% (341 / 362 suites, 9,310 / 9,373 cases)<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Windows | 122 of 367 suites completed (`windows`, shard 3 of 3) | <!-- METRIC:runcmake_windows -->89.19% (68 / 367 suites, 2,401 / 2,692 cases)<!-- /METRIC --> |
+| Upstream Core-62 conformance | 62 core suites (`core`) | <!-- METRIC:runcmake_core62 -->97.61% (46 / 62 suites at 100%, 8,539 / 8,748 cases)<!-- /METRIC --> |
+| Upstream policies | 35 policy suites for the 161 policies `CMP0066` to `CMP0226` | <!-- METRIC:runcmake_policies -->97.75% (30 / 35 suites, 911 / 932 cases)<!-- /METRIC --> |
 | Independent black-box suite | 20 scenarios, 679 checks | <!-- METRIC:independent_scenarios -->20 / 20 scenarios (679 / 679 checks passed)<!-- /METRIC --> |
-| Large C++ projects (L1) | 10 projects, configure stderr parity | <!-- METRIC:large_projects_l1 -->0 / 10 passed<!-- /METRIC --> |
-| Large C++ projects (L2) | 10 projects, Ninja graph and File API parity for the listed targets | <!-- METRIC:large_projects_l2 -->7 / 10 passed<!-- /METRIC --> |
-| Sealed unseen holdout | 240 repositories, L1 strict parity on oracle-green repos | <!-- METRIC:unseen_holdout -->26.87% (18 / 67 repositories)<!-- /METRIC --> |
-| `vcpkg` ecosystem matrix | 64 shards on Linux | <!-- METRIC:vcpkg_matrix -->pending frozen release run<!-- /METRIC --> |
-| Conan and ecosystem fixtures | `ecosystem_eval.py` | <!-- METRIC:conan_ecosystem -->0 / 2 scenarios passed<!-- /METRIC --> |
+| Large C++ projects (L1) | 10 projects, configure stderr parity | <!-- METRIC:large_projects_l1 -->2 / 10 passed<!-- /METRIC --> |
+| Large C++ projects (L2) | 10 projects, Ninja graph and File API parity for the listed targets | <!-- METRIC:large_projects_l2 -->10 / 10 passed<!-- /METRIC --> |
+| Sealed unseen holdout | 240 repositories, L1 strict parity on oracle-green repos | <!-- METRIC:unseen_holdout -->39.24% (31 / 79 repositories)<!-- /METRIC --> |
+| `vcpkg` ecosystem matrix | 64 shards on Linux | <!-- METRIC:vcpkg_matrix -->97.32% (1,488 / 1,529 scored CMake ports across 64 / 64 shards). 2,621 ports inspected<!-- /METRIC --> |
+| Conan and ecosystem fixtures | `ecosystem_eval.py` | <!-- METRIC:conan_ecosystem -->2 / 2 scenarios passed<!-- /METRIC --> |
 | Silent `PATH` swap | `path_swap_eval.py` | <!-- METRIC:path_swap_eval -->pass (0 differences)<!-- /METRIC --> |
 | Probe-cache soundness | 16 baseline checks (12 invalidation triggers, cache control, concurrent configures, crash and corruption recovery) | <!-- METRIC:probe_cache_soundness -->16 / 16 checks passed<!-- /METRIC --> |
 | Mutation replay soundness | 20 seeded leaf edits, replay equivalence | <!-- METRIC:mutation_replay_soundness -->20 / 20 edits verified<!-- /METRIC --> |
 | Seeded generative fuzzing | 14 targets, 1,000,000 inputs each, not coverage-guided | <!-- METRIC:fuzz_failures -->14,000,000 inputs, 0 failures<!-- /METRIC --> |
 | WebAssembly and WASI checks | `wasm32-unknown-unknown` and `wasm32-wasip1` | <!-- METRIC:wasm_smoke -->6 of 6 checks passed<!-- /METRIC --> |
-| Cold configure | Synthetic C project with 500 static libraries, new build tree, empty probe cache, median of 5 runs, speedup over CMake 4.5.1 | <!-- METRIC:bench_cold_configure -->1.96x<!-- /METRIC --> |
-| New build tree with shared probe cache | Synthetic 24-probe project speedup over a CMake new build tree (CMake has no cache across build trees) | <!-- METRIC:bench_warm_probe -->5.70x<!-- /METRIC --> |
-| Leaf edit reconfigure | Synthetic 64-directory project, p95 wall time of 5 runs | <!-- METRIC:bench_incremental_leaf_p95 -->59.8 ms<!-- /METRIC --> |
-| Peak memory (synthetic 500-library cold configure) | Resident set size (MiB) | <!-- METRIC:bench_peak_rss -->135.2 MiB<!-- /METRIC --> |
-| Release binary size | `rcmake` on macOS arm64 | <!-- METRIC:binary_size_macos -->16.17 MiB (16,959,248 bytes)<!-- /METRIC --> |
+| Cold configure | Synthetic C project with 500 static libraries, new build tree, empty probe cache, median of 5 runs, speedup over CMake 4.5.1 | <!-- METRIC:bench_cold_configure -->2.13x<!-- /METRIC --> |
+| New build tree with shared probe cache | Synthetic 24-probe project speedup over a CMake new build tree (CMake has no cache across build trees) | <!-- METRIC:bench_warm_probe -->5.42x<!-- /METRIC --> |
+| Leaf edit reconfigure | Synthetic 64-directory project, p95 wall time of 5 runs | <!-- METRIC:bench_incremental_leaf_p95 -->82.5 ms<!-- /METRIC --> |
+| Peak memory (synthetic 500-library cold configure) | Resident set size (MiB) | <!-- METRIC:bench_peak_rss -->140.6 MiB<!-- /METRIC --> |
+| Release binary size | `rcmake` on macOS arm64 | <!-- METRIC:binary_size_macos -->15.32 MiB (16,062,544 bytes)<!-- /METRIC --> |
 
 Per-project giant benchmark speedups and peak memory across `duckdb`, `opencv`, `protobuf`, `qtbase`, and `llvm-project` appear on the [compatibility report](https://rcmake.github.io/rcmake/dashboard.html#speed). Benchmark runs record N, generator, flags, CPU, RAM, OS, and power source with warm OS file caches. Cold configure clears inherited `RCMAKE_*` variables and starts with an empty private probe store (`--probe-jobs 1` isolates serial probes), while `--leaf-edit compile-definition` measures a leaf edit that alters target flags.
 
-For known parity gaps from the frozen release run, the verification receipt reports <!-- METRIC:known_parity_gaps -->Full RunCMake on Linux, macOS, and Windows and the 64-shard vcpkg matrix were still running in GitHub Actions ecosystem run 46013031088 at the v0.2.0 tag cutoff, while Linux extended conformance passed 495 of 496 cases (99.80 percent) and CLI conformance, Qt 6 AUTOGEN, and Linux T2 toolchains passed. All 10 large C++ projects configured cleanly with matching dry-runs and diagnostics, and 7 of 10 passed strict L2 parity (duckdb, vtk, qtbase, rclcpp, boost, pytorch, and kcoreaddons, up from 1 of 10 in v0.1.0), while Linux CI strict L1 cache diffing failed because ecosystem.yml omitted the ccmake symlink from Linux staging. Conan fixtures passed all 6 stages including build and ctest with byte-identical package config and targets files and passing IDE compile_commands checks, while strict raw file diffs remained on CMakeCache.txt, build.ninja, rules.ninja, and compile_commands.json. The sealed 240-repository unseen holdout on macOS arm64 completed 210 of 240 repositories across 5 shards before cutoff and passed 18 of 67 oracle-green repositories at strict L1 parity (26.87 percent, up from 0 of 74 in v0.1.0), with 131 oracle-red repositories, 10 timeouts, 2 source errors, and 49 L1 differences (38 generator, 8 policy, and 3 find-module). Quiet-host benchmarks passed the synthetic incremental leaf gate at 59.79 ms p95 (2.24x faster than CMake 4.5.1), 5.70x warm probe cache, 1.96x 500-target cold configure, and 1.26x warm giant geomean across all 5 giants, while cold configure on small synthetic projects and cold duckdb, protobuf, and llvm-project remained between 0.82x and 0.97x and determinism.py passed all output comparisons while observing no overlapping parallel probe workers.<!-- /METRIC -->
+For known parity gaps from the frozen release run, the verification receipt reports <!-- METRIC:known_parity_gaps -->Full RunCMake passed 9,310 of 9,373 cases (99.33 percent) across all 362 Linux suites with zero incomplete suites and 496 of 496 (100 percent) on Linux extended conformance, and passed 9,641 of 9,706 cases (99.33 percent) across all 371 macOS suites with zero incomplete suites after fixing RunCMake check-script SEND_ERROR attribution on the verbatim CI log (cross-checked locally on Apple Silicon at 9,641 passes). On Windows, RunCMake shard 3 of 3 completed 122 of 367 suites at 2,401 of 2,692 cases (89.19 percent) with 7 incomplete suites (4 where CMake 4.5.1 itself errored on Windows temp paths plus EnvSbom, InstallSbom, and Ninja), while shards 1 and 2 hit the 168-minute runner timeout before writing JSON and remain tracked for expanded Windows sharding in v0.2.2. All 10 large C++ projects passed strict L2 dry-run parity alongside matching diagnostics and CMakeCache.txt (10 of 10, up from 7 of 10 in v0.2.0), with duckdb and opencv passing full strict L1 and L2 parity while codemodel or edge differences remain on the other 8 projects. All 64 vcpkg shards completed across 2,621 ports with 1,488 of 1,529 observed CMake configures passing (97.32 percent, 41 configure mismatches, 436 non-CMake ports, 656 oracle-blocked ports, and 1,782 vs 1,831 installs). The sealed 240-repository unseen holdout completed all 6 shards at 31 of 79 oracle-green repositories passing strict L1 parity (39.24 percent, up from 26.87 percent in v0.2.0), with 151 oracle-red, 8 timeouts, 2 source errors, and 48 L1 differences (34 generator, 10 policy, 3 configure, and 1 find-module). Quiet-host unloaded benchmarks passed all 5 giants at 1.06x cold geomean, 1.36x warm probe-cache geomean, 1.09x incremental leaf geomean, and 391.4 MiB peak RSS (below CMake 4.5.1 at 392.3 MiB), while cold protobuf (0.86x), cold llvm-project (0.99x), and warm qtbase (0.90x) remain targets for further speedup.<!-- /METRIC -->
 
 ### What `rcmake` does not support
 
-- **Windows `ccmake` and Windows `--debugger` transport.** Both `ccmake` and `--debugger` DAP work on macOS and Linux in `0.2.0`, while Windows terminal UI and Windows named-pipe transport are deferred, so Windows builds report `"debugger": false`.
+- **Windows `ccmake` and Windows `--debugger` transport.** Both `ccmake` and `--debugger` DAP work on macOS and Linux in `0.2.1`, while Windows terminal UI and Windows named-pipe transport are deferred, so Windows builds report `"debugger": false`.
 - **No `cmake-gui`.** Graphical desktop setup is not included.
 - **External installer and verify binaries.** CPack installer generators invoke the host packager (`pkgbuild` and `productbuild`, `makensis`, `wix` or `candle` and `light`, `binarycreator`), and `rcmake verify` requires a user-supplied CMake 4.5.1 binary.
 - **Legacy and niche generators.** Supported generators are `Ninja`, `Ninja Multi-Config`, `Unix Makefiles`, `Xcode`, `Visual Studio 17 2022`, and `Visual Studio 18 2026`. Legacy extra generators (`CodeBlocks`, `CodeLite`, `Eclipse CDT4`, `Kate`, `Sublime Text 2`), older Makefile variants, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14 to 16 are omitted.
 - **GPU and Swift CI runner hardware.** CUDA, HIP, and Swift lowering and build-graph generation are implemented, while standard CI runners lack GPU hardware and full Swift or HIP toolchains.
 - **Reproducible `tar` ownership.** `cmake -E tar` and CPack archives write uid 0 and gid 0.
-- **`--version` line 2.** Line 1 prints `<tool> version 4.5.1` and line 2 prints `rcmake 0.2.0`.
+- **`--version` line 2.** Line 1 prints `<tool> version 4.5.1` and line 2 prints `rcmake 0.2.1`.
 - **In-process `try_compile`.** Probes execute via `rcmake-build` instead of Ninja, Make, MSBuild, or xcodebuild, so MSBuild-only and Xcode-only attributes (`CMAKE_GENERATOR_TOOLSET`, `CMAKE_XCODE_ATTRIBUTE_*`) do not affect probes.
 - **Large-project option subsets and Windows ZIP aliases.** The 10 large projects configure reduced option sets for CI limits, and manual Windows ZIP extraction places `cmake.exe`, `ctest.exe`, and `cpack.exe` directly in `bin`.
 

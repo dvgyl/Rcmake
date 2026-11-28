@@ -48,7 +48,7 @@
           "url": "https://rcmake.github.io/rcmake/",
           "applicationCategory": "DeveloperApplication",
           "operatingSystem": "macOS, Linux, Windows, WebAssembly",
-          "softwareVersion": "0.2.0",
+          "softwareVersion": "0.2.1",
           "license": [
             "https://spdx.org/licenses/MIT.html",
             "https://spdx.org/licenses/Apache-2.0.html"
@@ -103,7 +103,7 @@
             },
             {
               "@type": "Question",
-              "name": "What native developer tools come with rcmake 0.2.0?",
+              "name": "What native developer tools come with rcmake 0.2.1?",
               "acceptedAnswer": {
                 "@type": "Answer",
                 "text": "Opt-in native tools include rcmake explain for flags, definitions, includes, dependency paths, find_package rejections, and generator expressions, rcmake diff-config to compare any two cmake or rcmake build directories, rcmake fmt and 8-rule rcmake lint configured by .rcmake.toml, rcmake verify for side-by-side CMake 4.5.1 checks in an isolated companion binary, multi-config compile_commands.json export, --profile flame graphs, --hermetic audits, and --fetch-lock."
@@ -130,7 +130,7 @@
               "name": "Does rcmake contain any unsafe Rust or copied CMake C++ code?",
               "acceptedAnswer": {
                 "@type": "Answer",
-                "text": "No. rcmake contains no copied or translated CMake C++ code, and all 39 workspace crates enforce #![forbid(unsafe_code)]. External Rust crates such as rustix and memchr use unsafe internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8. Bundled CMake 4.5.1 Modules/, Templates/, and Help/ files stay under BSD-3-Clause, while Rust and Python code in this repository uses MIT OR Apache-2.0."
+                "text": "No. rcmake contains no copied or translated CMake C++ code, and all 40 workspace crates enforce #![forbid(unsafe_code)]. External Rust crates such as rustix and memchr use unsafe internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8. Bundled CMake 4.5.1 Modules/, Templates/, and Help/ files stay under BSD-3-Clause, while Rust and Python code in this repository uses MIT OR Apache-2.0."
               }
             },
             {
@@ -250,7 +250,7 @@
     <noscript>
       <div class="container">
         <div class="noscript-banner">
-          <strong>JavaScript is disabled.</strong> Live charts and interactive filters need JavaScript, while the comparison tables, generator matrix, and common questions below stay readable. rcmake 0.2.0 supports <code>Ninja</code>, <code>Ninja Multi-Config</code>, <code>Unix Makefiles</code>, <code>Xcode</code>, <code>Visual Studio 17 2022</code>, and <code>Visual Studio 18 2026</code>. Native mode adds a shared probe cache with portable CI archives, sound incremental replay under toolchains and presets, drift checks, <code>explain</code>, <code>diff-config</code>, <code>fmt</code>, <code>lint</code>, <code>verify</code>, multi-config <code>compile_commands.json</code>, <code>--profile</code>, <code>--hermetic</code>, <code>--fetch-lock</code>, and <code>rcmake-lsp</code>. Read <a href="./llms.txt">llms.txt</a>, <a href="./llms-full.txt">llms-full.txt</a>, or the <a href="https://github.com/rcmake/rcmake">GitHub repository</a>.
+          <strong>JavaScript is disabled.</strong> Live charts and interactive filters need JavaScript, while the comparison tables, generator matrix, and common questions below stay readable. rcmake 0.2.1 supports <code>Ninja</code>, <code>Ninja Multi-Config</code>, <code>Unix Makefiles</code>, <code>Xcode</code>, <code>Visual Studio 17 2022</code>, and <code>Visual Studio 18 2026</code>. Native mode adds a shared probe cache with portable CI archives, sound incremental replay under toolchains and presets, drift checks, <code>explain</code>, <code>diff-config</code>, <code>fmt</code>, <code>lint</code>, <code>verify</code>, multi-config <code>compile_commands.json</code>, <code>--profile</code>, <code>--hermetic</code>, <code>--fetch-lock</code>, and <code>rcmake-lsp</code>. Read <a href="./llms.txt">llms.txt</a>, <a href="./llms-full.txt">llms-full.txt</a>, or the <a href="https://github.com/rcmake/rcmake">GitHub repository</a>.
         </div>
       </div>
     </noscript>
@@ -551,7 +551,7 @@
           <div class="faq-answer"><div class="faq-inner"><p>In native mode, <code>rcmake</code> caches verified compiler probes across projects after checking SHA-256 input digests, runs up to four literal compile probes in parallel, and shares caches across CI runners via <code>rcmake cache export</code> and <code>import</code>. Incremental replay reuses unchanged directory subtrees even with <code>vcpkg</code> toolchains, configure presets, <code>-C</code> scripts, and <code>PreLoad.cmake</code> by validating setup checkpoints. Native configures and <code>rcmake doctor -B</code> also detect stale <code>CMakeCache.txt</code> drift when compilers or toolchains change.</p></div></div>
         </details>
         <details class="faq-item">
-          <summary>What native developer tools come with rcmake 0.2.0?</summary>
+          <summary>What native developer tools come with rcmake 0.2.1?</summary>
           <div class="faq-answer"><div class="faq-inner"><p>Opt-in native tools include <code>rcmake explain</code> for flags, definitions, includes, dependency paths, <code>find_package</code> rejections, and generator expressions, <code>rcmake diff-config</code> to compare any two <code>cmake</code> or <code>rcmake</code> build directories, <code>rcmake fmt</code> and 8-rule <code>rcmake lint</code> configured by <code>.rcmake.toml</code>, <code>rcmake verify</code> for side-by-side CMake 4.5.1 checks in an isolated companion binary, multi-config <code>compile_commands.json</code> export, <code>--profile</code> flame graphs, <code>--hermetic</code> audits, and <code>--fetch-lock</code>.</p></div></div>
         </details>
         <details class="faq-item">
@@ -564,7 +564,7 @@
         </details>
         <details class="faq-item">
           <summary>Does rcmake contain any unsafe Rust or copied CMake C++ code?</summary>
-          <div class="faq-answer"><div class="faq-inner"><p>No. <code>rcmake</code> contains no copied or translated CMake C++ code, and all 39 workspace crates enforce <code>#![forbid(unsafe_code)]</code>. External Rust crates such as <code>rustix</code> and <code>memchr</code> use <code>unsafe</code> internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8. Bundled CMake 4.5.1 <code>Modules/</code>, <code>Templates/</code>, and <code>Help/</code> files stay under <code>BSD-3-Clause</code>, while Rust and Python code in this repository uses <code>MIT OR Apache-2.0</code>.</p></div></div>
+          <div class="faq-answer"><div class="faq-inner"><p>No. <code>rcmake</code> contains no copied or translated CMake C++ code, and all 40 workspace crates enforce <code>#![forbid(unsafe_code)]</code>. External Rust crates such as <code>rustix</code> and <code>memchr</code> use <code>unsafe</code> internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8. Bundled CMake 4.5.1 <code>Modules/</code>, <code>Templates/</code>, and <code>Help/</code> files stay under <code>BSD-3-Clause</code>, while Rust and Python code in this repository uses <code>MIT OR Apache-2.0</code>.</p></div></div>
         </details>
         <details class="faq-item">
           <summary>Can I run rcmake in WebAssembly or use an editor language server?</summary>

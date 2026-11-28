@@ -1,6 +1,6 @@
 # rcmake FAQ
 
-Direct answers on CMake 4.5.1 parity, native developer tooling, caching, installation, and limits in `rcmake` 0.2.0.
+Direct answers on CMake 4.5.1 parity, native developer tooling, caching, installation, and limits in `rcmake` 0.2.1.
 
 ## Contents
 
@@ -74,7 +74,7 @@ Yes.
 
 ## Does rcmake use unsafe Rust or copied CMake C++ code, and what is the licence?
 
-`rcmake` contains no copied or translated CMake C++ code, and all 39 workspace crates enforce `#![forbid(unsafe_code)]`. External Rust dependencies such as `rustix` and `memchr` use `unsafe` internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8. Rust and Python code in `crates/` and `tools/` is dual-licensed `MIT OR Apache-2.0`. Bundled CMake 4.5.1 `Modules/`, `Templates/`, `Help/`, and five derived tables stay under `BSD-3-Clause` with original copyright notices intact. See [PRIOR_ART.md](PRIOR_ART.md) and [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+`rcmake` contains no copied or translated CMake C++ code, and all 40 workspace crates enforce `#![forbid(unsafe_code)]`. External Rust dependencies such as `rustix` and `memchr` use `unsafe` internally, and the native binary statically links zstd 1.5.7 and liblzma 5.8. Rust and Python code in `crates/` and `tools/` is dual-licensed `MIT OR Apache-2.0`. Bundled CMake 4.5.1 `Modules/`, `Templates/`, `Help/`, and five derived tables stay under `BSD-3-Clause` with original copyright notices intact. See [PRIOR_ART.md](PRIOR_ART.md) and [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 
 ## How do I install rcmake and alias cmake, ctest, cpack, and ccmake?
 
@@ -87,14 +87,14 @@ Prebuilt releases cover `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aar
 
 ## What is intentionally different or not implemented in rcmake?
 
-- **Windows `ccmake` and Windows `--debugger`.** Both `ccmake` and `--debugger` DAP server work on macOS and Linux in `0.2.0`. Windows terminal UI and Windows named-pipe DAP transport are deferred, and Windows builds report `"debugger": false` in `-E capabilities`.
+- **Windows `ccmake` and Windows `--debugger`.** Both `ccmake` and `--debugger` DAP server work on macOS and Linux in `0.2.1`. Windows terminal UI and Windows named-pipe DAP transport are deferred, and Windows builds report `"debugger": false` in `-E capabilities`.
 - **No `cmake-gui`.** Graphical desktop setup is not included.
 - **External tools for CPack installers and `rcmake verify`.** CPack installer generators invoke the host packaging binary (`pkgbuild` and `productbuild`, `makensis`, `wix` or `candle` and `light`, `binarycreator`), and `rcmake verify` requires a user-supplied CMake 4.5.1 binary.
 - **Omitted legacy and niche generators.** Legacy extra generators (CodeBlocks, CodeLite, Eclipse CDT4, Kate, Sublime Text 2), older Makefile variants (`NMake`, `MSYS`, `MinGW`, `Borland`, `Watcom`), `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14 to 16 are omitted.
 - **GPU and Swift CI coverage.** CUDA, HIP, and Swift target lowering and build-graph generation are implemented, while standard CI runners lack GPU hardware and full Swift or HIP toolchains.
 - **Reproducible archives.** `cmake -E tar` and CPack archive writers record uid 0 and gid 0 for deterministic output.
 - **In-process `try_compile`.** Probes run through `rcmake-build` instead of Ninja, Make, MSBuild, or xcodebuild, so MSBuild-only and Xcode-only attributes (`CMAKE_GENERATOR_TOOLSET`, `CMAKE_XCODE_ATTRIBUTE_*`) do not affect probes.
-- **`--version` line 2.** Line 1 prints `<tool> version 4.5.1` and line 2 prints `rcmake 0.2.0` instead of Kitware's maintainer line.
+- **`--version` line 2.** Line 1 prints `<tool> version 4.5.1` and line 2 prints `rcmake 0.2.1` instead of Kitware's maintainer line.
 - **`CMAKE_STRIP` install guard.** `cmake --install --strip` emits a strip step only when `CMAKE_STRIP` is not a CMake false value.
 
 ## How do I check parity on my project or report a bug?

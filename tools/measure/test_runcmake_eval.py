@@ -570,5 +570,56 @@ class ShardingAndMergeTests(unittest.TestCase):
             self.assertEqual(len(written["tested_binary_sha256"]), 64)
 
 
+class CheckScriptErrorTests(unittest.TestCase):
+    def test_check_script_send_error_fails_following_case_without_driver_error(self):
+        log = (
+            "-- XcodeIOSInstallCombined-build - PASSED\n"
+            "CMake Error at /tmp/src/Tests/RunCMake/XcodeProject-Device/XcodeIOSInstallCombined-install-check.cmake:26 (message):\n"
+            "  The actual library contains the architectures:\n\n"
+            "  which do not match expected ones:\n\n"
+            "   arm64;x86_64\n\n"
+            "Call Stack (most recent call first):\n"
+            "  /tmp/src/Tests/RunCMake/XcodeProject-Device/XcodeIOSInstallCombined-install-check.cmake:33 (verify_architectures)\n"
+            "  /tmp/src/Tests/RunCMake/XcodeProject-Device/XcodeIOSInstallCombined-cmakeinstall-check.cmake:2 (include)\n"
+            "  /tmp/src/Tests/RunCMake/RunCMake.cmake:275 (include)\n"
+            "  /tmp/src/Tests/RunCMake/RunCMake.cmake:314 (run_cmake)\n"
+            "  /tmp/src/Tests/RunCMake/XcodeProject-Device/RunCMakeTest.cmake:140 (run_cmake_command)\n"
+            "  /tmp/driver.cmake:11 (include)\n\n"
+            "-- XcodeIOSInstallCombined-cmakeinstall - PASSED\n"
+            "-- runcmake_eval: suite complete\n"
+        )
+        cases, result = runcmake_eval.case_results(1, False, log)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["driver_errors"], [])
+        self.assertTrue(cases["XcodeIOSInstallCombined-build", 1]["passed"])
+        failed_case = cases["XcodeIOSInstallCombined-cmakeinstall", 1]
+        self.assertFalse(failed_case["passed"])
+        self.assertIn("The actual library contains the architectures:", failed_case["detail"])
+
+    def test_driver_error_and_fatal_check_error_still_fail_driver(self):
+        driver_err_log = (
+            "-- CaseA - PASSED\n"
+            "CMake Error at /tmp/src/Tests/RunCMake/Ninja/RunCMakeTest.cmake:287 (message):\n"
+            "  Dependencies for an assumed source did not hook up.\n"
+            "Call Stack (most recent call first):\n"
+            "  /tmp/driver.cmake:11 (include)\n\n"
+            "-- runcmake_eval: suite complete\n"
+        )
+        _, result = runcmake_eval.case_results(1, False, driver_err_log)
+        self.assertEqual(len(result["driver_errors"]), 1)
+
+        fatal_check_log = (
+            "-- CaseA - PASSED\n"
+            "CMake Error at /tmp/src/Tests/RunCMake/Foo/CaseB-check.cmake:5 (message):\n"
+            "  fatal abort in check script\n"
+            "Call Stack (most recent call first):\n"
+            "  /tmp/src/Tests/RunCMake/RunCMake.cmake:275 (include)\n"
+            "  /tmp/src/Tests/RunCMake/RunCMake.cmake:314 (run_cmake)\n"
+        )
+        _, fatal_result = runcmake_eval.case_results(1, False, fatal_check_log)
+        self.assertFalse(fatal_result["complete"])
+        self.assertEqual(len(fatal_result["driver_errors"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

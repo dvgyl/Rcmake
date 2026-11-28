@@ -52,7 +52,7 @@ Check the installed binary and environment.
 ```sh
 rcmake --version
 # cmake version 4.5.1
-# rcmake 0.2.0
+# rcmake 0.2.1
 rcmake doctor
 ```
 
@@ -71,30 +71,30 @@ You can also try `rcmake` in the [browser playground](https://rcmake.github.io/r
 
 ## Status
 
-`rcmake` is at version `0.2.0`. The script `tools/measure/stamp_metrics.py` fills in the table below from one verification run of the frozen release binary at commit <!-- METRIC:release_commit -->`70c233134676`<!-- /METRIC --> on <!-- METRIC:release_date -->`2026-11-27`<!-- /METRIC -->. No value is estimated. The [compatibility report](https://rcmake.github.io/rcmake/dashboard.html) publishes the same dataset along with per-project giant benchmark timings and memory figures.
+`rcmake` is at version `0.2.1`. The script `tools/measure/stamp_metrics.py` fills in the table below from one verification run of the frozen release binary at commit <!-- METRIC:release_commit -->`2a16da12e77c`<!-- /METRIC --> on <!-- METRIC:release_date -->`2026-11-28`<!-- /METRIC -->. No value is estimated. The [compatibility report](https://rcmake.github.io/rcmake/dashboard.html) publishes the same dataset along with per-project giant benchmark timings and memory figures.
 
 | Check | Result |
 | --- | --- |
 | 3-OS CI (`ubuntu-24.04`, `macos-15`, `windows-2025`) and corpus smoke (6 jobs) | <!-- METRIC:ci_jobs -->6 of 6 jobs green<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, macOS arm64 (371 of 463 suites planned) | <!-- METRIC:runcmake_macos -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Linux (362 of 463 suites planned) | <!-- METRIC:runcmake_linux -->pending frozen release run<!-- /METRIC --> |
-| Upstream `Tests/RunCMake`, Windows (367 of 463 suites planned) | <!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, macOS arm64 (371 of 463 suites) | <!-- METRIC:runcmake_macos -->99.33% (348 / 371 suites, 9,641 / 9,706 cases)<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Linux (362 of 463 suites) | <!-- METRIC:runcmake_linux -->99.33% (341 / 362 suites, 9,310 / 9,373 cases)<!-- /METRIC --> |
+| Upstream `Tests/RunCMake`, Windows (122 of 367 suites completed, shard 3 of 3) | <!-- METRIC:runcmake_windows -->89.19% (68 / 367 suites, 2,401 / 2,692 cases)<!-- /METRIC --> |
 | Independent black-box differential suite (20 scenarios, 679 checks) | <!-- METRIC:independent_scenarios -->20 / 20 scenarios (679 / 679 checks passed)<!-- /METRIC --> |
-| Large C++ projects, L1 configure parity (10 projects) | <!-- METRIC:large_projects_l1 -->0 / 10 passed<!-- /METRIC --> |
-| Large C++ projects, L2 Ninja build-graph and File API parity (10 projects) | <!-- METRIC:large_projects_l2 -->7 / 10 passed<!-- /METRIC --> |
-| `vcpkg` ecosystem matrix (64 shards) | <!-- METRIC:vcpkg_matrix -->pending frozen release run<!-- /METRIC --> |
-| Conan and ecosystem fixtures | <!-- METRIC:conan_ecosystem -->0 / 2 scenarios passed<!-- /METRIC --> |
+| Large C++ projects, L1 configure parity (10 projects) | <!-- METRIC:large_projects_l1 -->2 / 10 passed<!-- /METRIC --> |
+| Large C++ projects, L2 Ninja build-graph and File API parity (10 projects) | <!-- METRIC:large_projects_l2 -->10 / 10 passed<!-- /METRIC --> |
+| `vcpkg` ecosystem matrix (64 shards) | <!-- METRIC:vcpkg_matrix -->97.32% (1,488 / 1,529 scored CMake ports across 64 / 64 shards). 2,621 ports inspected<!-- /METRIC --> |
+| Conan and ecosystem fixtures | <!-- METRIC:conan_ecosystem -->2 / 2 scenarios passed<!-- /METRIC --> |
 | Silent `PATH` swap verification | <!-- METRIC:path_swap_eval -->pass (0 differences)<!-- /METRIC --> |
-| Sealed unseen holdout (240 repositories, L1 strict parity on oracle-green repos) | <!-- METRIC:unseen_holdout -->26.87% (18 / 67 repositories)<!-- /METRIC --> |
-| Cold configure speedup over CMake 4.5.1 (synthetic 500-library C project, empty probe cache, median of 5 runs) | <!-- METRIC:bench_cold_configure -->1.96x<!-- /METRIC --> |
-| New build tree speedup over CMake 4.5.1 (synthetic 24-probe project with shared probe cache) | <!-- METRIC:bench_warm_probe -->5.70x<!-- /METRIC --> |
-| Leaf edit reconfigure (synthetic 64-directory project, p95 wall time of 5 runs) | <!-- METRIC:bench_incremental_leaf_p95 -->59.8 ms<!-- /METRIC --> |
+| Sealed unseen holdout (240 repositories, L1 strict parity on oracle-green repos) | <!-- METRIC:unseen_holdout -->39.24% (31 / 79 repositories)<!-- /METRIC --> |
+| Cold configure speedup over CMake 4.5.1 (synthetic 500-library C project, empty probe cache, median of 5 runs) | <!-- METRIC:bench_cold_configure -->2.13x<!-- /METRIC --> |
+| New build tree speedup over CMake 4.5.1 (synthetic 24-probe project with shared probe cache) | <!-- METRIC:bench_warm_probe -->5.42x<!-- /METRIC --> |
+| Leaf edit reconfigure (synthetic 64-directory project, p95 wall time of 5 runs) | <!-- METRIC:bench_incremental_leaf_p95 -->82.5 ms<!-- /METRIC --> |
 | Seeded generative fuzzing, not coverage-guided (14 targets, 1,000,000 inputs each) | <!-- METRIC:fuzz_failures -->14,000,000 inputs, 0 failures<!-- /METRIC --> |
 | WebAssembly and WASI checks (`wasm32-unknown-unknown` and `wasm32-wasip1`) | <!-- METRIC:wasm_smoke -->6 of 6 checks passed<!-- /METRIC --> |
 
 L1 parity checks configure success and matching standard error against CMake 4.5.1. L2 parity also compares `CMakeCache.txt`, Ninja commands and graph edges, and File API replies for the listed targets. Full methodology, RunCMake exclusions, and benchmark rules live in [docs/BUILD_WRITEUP.md](docs/BUILD_WRITEUP.md#the-differential-oracle-method).
 
-For known parity gaps from the frozen release run, the verification receipt reports <!-- METRIC:known_parity_gaps -->Full RunCMake on Linux, macOS, and Windows and the 64-shard vcpkg matrix were still running in GitHub Actions ecosystem run 46013031088 at the v0.2.0 tag cutoff, while Linux extended conformance passed 495 of 496 cases (99.80 percent) and CLI conformance, Qt 6 AUTOGEN, and Linux T2 toolchains passed. All 10 large C++ projects configured cleanly with matching dry-runs and diagnostics, and 7 of 10 passed strict L2 parity (duckdb, vtk, qtbase, rclcpp, boost, pytorch, and kcoreaddons, up from 1 of 10 in v0.1.0), while Linux CI strict L1 cache diffing failed because ecosystem.yml omitted the ccmake symlink from Linux staging. Conan fixtures passed all 6 stages including build and ctest with byte-identical package config and targets files and passing IDE compile_commands checks, while strict raw file diffs remained on CMakeCache.txt, build.ninja, rules.ninja, and compile_commands.json. The sealed 240-repository unseen holdout on macOS arm64 completed 210 of 240 repositories across 5 shards before cutoff and passed 18 of 67 oracle-green repositories at strict L1 parity (26.87 percent, up from 0 of 74 in v0.1.0), with 131 oracle-red repositories, 10 timeouts, 2 source errors, and 49 L1 differences (38 generator, 8 policy, and 3 find-module). Quiet-host benchmarks passed the synthetic incremental leaf gate at 59.79 ms p95 (2.24x faster than CMake 4.5.1), 5.70x warm probe cache, 1.96x 500-target cold configure, and 1.26x warm giant geomean across all 5 giants, while cold configure on small synthetic projects and cold duckdb, protobuf, and llvm-project remained between 0.82x and 0.97x and determinism.py passed all output comparisons while observing no overlapping parallel probe workers.<!-- /METRIC --> Report any other difference from CMake 4.5.1 with the [parity bug form](https://github.com/rcmake/rcmake/issues/new?template=bug_report.yml).
+For known parity gaps from the frozen release run, the verification receipt reports <!-- METRIC:known_parity_gaps -->Full RunCMake passed 9,310 of 9,373 cases (99.33 percent) across all 362 Linux suites with zero incomplete suites and 496 of 496 (100 percent) on Linux extended conformance, and passed 9,641 of 9,706 cases (99.33 percent) across all 371 macOS suites with zero incomplete suites after fixing RunCMake check-script SEND_ERROR attribution on the verbatim CI log (cross-checked locally on Apple Silicon at 9,641 passes). On Windows, RunCMake shard 3 of 3 completed 122 of 367 suites at 2,401 of 2,692 cases (89.19 percent) with 7 incomplete suites (4 where CMake 4.5.1 itself errored on Windows temp paths plus EnvSbom, InstallSbom, and Ninja), while shards 1 and 2 hit the 168-minute runner timeout before writing JSON and remain tracked for expanded Windows sharding in v0.2.2. All 10 large C++ projects passed strict L2 dry-run parity alongside matching diagnostics and CMakeCache.txt (10 of 10, up from 7 of 10 in v0.2.0), with duckdb and opencv passing full strict L1 and L2 parity while codemodel or edge differences remain on the other 8 projects. All 64 vcpkg shards completed across 2,621 ports with 1,488 of 1,529 observed CMake configures passing (97.32 percent, 41 configure mismatches, 436 non-CMake ports, 656 oracle-blocked ports, and 1,782 vs 1,831 installs). The sealed 240-repository unseen holdout completed all 6 shards at 31 of 79 oracle-green repositories passing strict L1 parity (39.24 percent, up from 26.87 percent in v0.2.0), with 151 oracle-red, 8 timeouts, 2 source errors, and 48 L1 differences (34 generator, 10 policy, 3 configure, and 1 find-module). Quiet-host unloaded benchmarks passed all 5 giants at 1.06x cold geomean, 1.36x warm probe-cache geomean, 1.09x incremental leaf geomean, and 391.4 MiB peak RSS (below CMake 4.5.1 at 392.3 MiB), while cold protobuf (0.86x), cold llvm-project (0.99x), and warm qtbase (0.90x) remain targets for further speedup.<!-- /METRIC --> Report any other difference from CMake 4.5.1 with the [parity bug form](https://github.com/rcmake/rcmake/issues/new?template=bug_report.yml).
 
 ## Compatibility and native tools
 
@@ -156,13 +156,13 @@ Set `RCMAKE_ORACLE_MODE=1` to force compatibility mode when invoking `rcmake`.
 
 ## Intentional differences and limits
 
-- **Windows TUI and debugger transport.** `ccmake` and `--debugger` DAP support work on macOS and Linux in `0.2.0`. Windows `ccmake` terminal support and Windows `--debugger` named-pipe transport are deferred, and Windows builds report `"debugger": false` in `-E capabilities`.
+- **Windows TUI and debugger transport.** `ccmake` and `--debugger` DAP support work on macOS and Linux in `0.2.1`. Windows `ccmake` terminal support and Windows `--debugger` named-pipe transport are deferred, and Windows builds report `"debugger": false` in `-E capabilities`.
 - **No `cmake-gui`.** Graphical desktop setup is not included. Use `ccmake` on Unix or editor tooling through `rcmake-lsp`.
 - **External tools for installers and verify.** CPack installer generators require the native packaging tool on the host (`pkgbuild` and `productbuild` on macOS, `makensis` for NSIS, `wix` or `candle` and `light` for WiX, and `binarycreator` for Qt IFW). `rcmake verify` requires a user-supplied CMake 4.5.1 binary passed via `--oracle` or `RCMAKE_ORACLE_CMAKE`.
 - **Omitted legacy generators.** Supported generators are `Ninja`, `Ninja Multi-Config`, `Unix Makefiles`, `Xcode`, `Visual Studio 17 2022`, and `Visual Studio 18 2026`. Legacy extra generators (CodeBlocks, CodeLite, Eclipse CDT4, Kate, Sublime Text 2) and older Makefile or Visual Studio 14 to 16 generators are omitted.
 - **GPU and Swift CI coverage.** CUDA, HIP, and Swift target lowering and build-graph generation are implemented, while standard GitHub Actions runners lack GPU hardware and full Swift or HIP toolchains.
 - **Reproducible archives.** `cmake -E tar` and CPack archive generators record uid 0 and gid 0 so archive bytes stay deterministic across machines.
-- **`--version` line 2.** Line 1 prints `<tool> version 4.5.1` and line 2 prints `rcmake 0.2.0` so the binary never misattributes itself to Kitware.
+- **`--version` line 2.** Line 1 prints `<tool> version 4.5.1` and line 2 prints `rcmake 0.2.1` so the binary never misattributes itself to Kitware.
 - **In-process `try_compile`.** Probes execute through `rcmake-build` instead of Ninja, Make, MSBuild, or xcodebuild so probes stay fast and traceable under `JournalHost`. MSBuild-only and Xcode-only attributes (`CMAKE_GENERATOR_TOOLSET`, `CMAKE_XCODE_ATTRIBUTE_*`) do not apply to probes.
 - **`CMAKE_STRIP` install guard.** `cmake --install --strip` writes a strip rule only when `CMAKE_STRIP` is not a CMake false value (`OFF`, `NOTFOUND`, `strip-NOTFOUND`).
 - **Windows ZIP aliases.** Extracting the Windows ZIP archive places `cmake.exe`, `ctest.exe`, and `cpack.exe` in `bin`, whereas `install.sh` and `install.ps1` create aliases only with `--alias-cmake` or `-AliasCmake`.

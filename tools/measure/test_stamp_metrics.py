@@ -84,15 +84,15 @@ class StampMetricsTests(unittest.TestCase):
         self.assertEqual(readme_keys | writeup_keys, stamper.EXPECTED_KEYS)
         self.assertTrue(readme_keys.issubset(writeup_keys))
 
-        # Running --check against the current repo latest.json (commit: null) must refuse cleanly.
-        code, _, stderr = self.run_cli(
+        # Running --check against the current repo latest.json must verify all 25 stamped metrics.
+        code, stdout, stderr = self.run_cli(
             "--dashboard", str(stamper.DEFAULT_DASHBOARD),
             "--file", str(self.readme),
             "--file", str(self.writeup),
             "--check",
         )
-        self.assertEqual(code, 1)
-        self.assertIn("commit: null", stderr)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("OK: verified 25 metrics", stdout)
 
     def test_valid_full_stamp_check_and_round_trip_idempotency(self):
         common = (
@@ -101,7 +101,15 @@ class StampMetricsTests(unittest.TestCase):
             "--file", str(self.readme),
             "--file", str(self.writeup),
         )
-        # Before stamping, --check must reject pending markers.
+        # Seed a pending marker in the temp copy and confirm --check rejects it before stamping.
+        self.readme.write_text(
+            stamper.MARKER_RE.sub(
+                lambda m: f"<!-- METRIC:{m.group(1)} -->pending frozen release run<!-- /METRIC -->",
+                self.readme.read_text(encoding="utf-8"),
+                count=1,
+            ),
+            encoding="utf-8",
+        )
         code, _, stderr = self.run_cli(*common, "--check")
         self.assertEqual(code, 1)
         self.assertIn("[pending]", stderr)
@@ -167,7 +175,17 @@ class StampMetricsTests(unittest.TestCase):
         self.assertEqual(self.readme.read_text(encoding="utf-8"), original_readme)
 
     def test_refuses_missing_key_without_allow_partial_and_permits_with_flag(self):
-        original_writeup = self.writeup.read_text(encoding="utf-8")
+        # Reset the two tested keys to pending in the temp copy so the test is independent of live docs.
+        seeded = stamper.MARKER_RE.sub(
+            lambda m: (
+                f"<!-- METRIC:{m.group(1)} -->pending frozen release run<!-- /METRIC -->"
+                if m.group(1) in {"runcmake_windows", "known_parity_gaps"}
+                else m.group(0)
+            ),
+            self.writeup.read_text(encoding="utf-8"),
+        )
+        self.writeup.write_text(seeded, encoding="utf-8")
+        original_writeup = seeded
         dash = make_full_dashboard()
         del dash["knownParityGaps"]
         dash["tracks"]["runCmakeOs"]["platforms"][2].update(status="pending", suitesPassed=None, passRate=None)

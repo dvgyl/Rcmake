@@ -1,6 +1,6 @@
 # rcmake technical reference
 
-> Technical reference for `rcmake` 0.2.0, an independent drop-in reimplementation of CMake 4.5.1 in safe Rust.
+> Technical reference for `rcmake` 0.2.1, an independent drop-in reimplementation of CMake 4.5.1 in safe Rust.
 
 The canonical website is https://rcmake.github.io/rcmake/ and the GitHub repository is https://github.com/rcmake/rcmake. The browser playground lives at https://rcmake.github.io/rcmake/playground.html, the compatibility report lives at https://rcmake.github.io/rcmake/dashboard.html with its machine-readable dataset at https://rcmake.github.io/rcmake/data/latest.json, and the concise index lives at https://rcmake.github.io/rcmake/llms.txt.
 
@@ -10,7 +10,7 @@ The canonical website is https://rcmake.github.io/rcmake/ and the GitHub reposit
 
 `rcmake` is not affiliated with Kitware, and CMake is a trademark of Kitware, Inc.
 
-- All 39 workspace crates in `crates/rcmake-*` enforce `#![forbid(unsafe_code)]` and workspace `unsafe_code = "forbid"` in `Cargo.toml`.
+- All 40 workspace crates in `crates/rcmake-*` enforce `#![forbid(unsafe_code)]` and workspace `unsafe_code = "forbid"` in `Cargo.toml`.
 - Workspace Clippy lints reject `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `indexing_slicing`, `string_slice`, `iter_over_hash_type`, and direct `std` filesystem, environment, process, and clock calls in engine crates.
 - Reachable input paths return structured diagnostics bounded by `rcmake_base::Limits` on recursion depth, macro expansion, loops, regular expression steps, and file sizes.
 - External Rust crates such as `rustix` and `memchr` use `unsafe` internally, and the native binary statically links `zstd` 1.5.7 (`zstd-sys`) and `liblzma` 5.8 (`liblzma-sys`). Gzip uses `flate2` with `miniz_oxide`, and bzip2 uses `libbz2-rs-sys` in Rust.
@@ -113,14 +113,14 @@ Every completed native configure writes `CMakeFiles/rcmake/toolchain-inputs-v1.j
 - **Hermetic checks (`--hermetic=warn` or `strict`).** Audits undeclared environment, file, process, and network access with `RCMAKE_HERMETIC_ALLOW_*` allowlists.
 - **FetchContent lockfiles (`--fetch-lock=off`, `auto`, `update`, `frozen`).** Pins archive hashes and Git commits in `rcmake-fetch.lock`, with native prefetch for declared pinned sources and `RCMAKE_FETCH_OFFLINE=1` for offline builds.
 
-## 5. Architecture across 39 crates and the `Host` trait
+## 5. Architecture across 40 crates and the `Host` trait
 
-`rcmake` is an acyclic workspace of 39 crates and 47 ADRs in `docs/ADR.md`.
+`rcmake` is an acyclic workspace of 40 crates and 48 ADRs in `docs/ADR.md`.
 
 1. **Foundation and language.** `rcmake-base`, `rcmake-json`, `rcmake-diag`, `rcmake-host`, `rcmake-syntax` (including lossless concrete tokens), `rcmake-regex` (independent KWSys dialect), `rcmake-expr`, and `rcmake-genex`.
 2. **Configure and resolution.** `rcmake-model`, `rcmake-eval` (with `DebugHook` and setup-checkpoint replay), `rcmake-commands`, `rcmake-presets`, `rcmake-resolve` (transitive usage, RPATH, CUDA, HIP, Swift, Fortran, Qt AUTOGEN, `BuildGraph`), `rcmake-build`, `rcmake-cxxmodules`, and `rcmake-fortran`.
 3. **Generators, test, package, and storage.** `rcmake-gen-common`, `rcmake-gen-ninja`, `rcmake-gen-make`, `rcmake-gen-xcode`, `rcmake-gen-vs`, `rcmake-ctest`, `rcmake-cpack`, `rcmake-cps`, `rcmake-instrument`, `rcmake-tool-e`, `rcmake-archive`, `rcmake-store`, and `rcmake-fetch`.
-4. **Developer tools, front ends, and verification.** `rcmake-buildinfo`, `rcmake-language-tools`, `rcmake-ccmake`, `rcmake-dap`, `rcmake-cli`, `rcmake-api`, `rcmake-lsp`, `rcmake-wasm`, `rcmake-harness` (including `rcmake-verify`), and `rcmake-fuzz`.
+4. **Developer tools, front ends, and verification.** `rcmake-buildinfo`, `rcmake-language-tools`, `rcmake-ccmake`, `rcmake-dap`, `rcmake-cli`, `rcmake-shim`, `rcmake-api`, `rcmake-lsp`, `rcmake-wasm`, `rcmake-harness` (including `rcmake-verify`), and `rcmake-fuzz`.
 
 All OS access flows through `Arc<dyn rcmake_host::Host>` (`NativeHost` using `rustix` and Windows job objects, and in-memory `PureHost`). Wrapping `Host` enables deterministic tests, `--hermetic`, `JournalHost`, `CaptureHost`, `rcmake-lsp` unsaved-buffer overlays, and WebAssembly without modifying the evaluator core.
 
@@ -139,12 +139,12 @@ Prebuilt releases target `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aa
 
 ## 8. Intentional differences, limits, and troubleshooting
 
-1. **Windows `ccmake` and `--debugger`.** Both work on macOS and Linux in `0.2.0`, while Windows `ccmake` TUI and Windows debugger named pipes are deferred and Windows builds report `"debugger": false`.
+1. **Windows `ccmake` and `--debugger`.** Both work on macOS and Linux in `0.2.1`, while Windows `ccmake` TUI and Windows debugger named pipes are deferred and Windows builds report `"debugger": false`.
 2. **No `cmake-gui`.** Graphical desktop setup is not included.
 3. **External tools for installers and verify.** CPack installer generators invoke host packaging tools (`pkgbuild` and `productbuild`, `makensis`, `wix`, `binarycreator`), and `rcmake verify` requires a user-supplied CMake 4.5.1 binary.
 4. **Omitted legacy generators.** CodeBlocks, CodeLite, Eclipse CDT4, Kate, Sublime Text 2, `NMake`, `MSYS`, `MinGW`, `Borland`, `Watcom`, `Green Hills MULTI`, `FASTBuild`, and Visual Studio 14 to 16 are omitted.
 5. **GPU and Swift CI coverage.** CUDA, HIP, and Swift target lowering are shipped, while standard CI runners lack GPU hardware and full Swift or HIP toolchains.
-6. **Reproducible archives, in-process `try_compile`, `--version`, and `CMAKE_STRIP`.** Archives record uid 0 and gid 0, `try_compile` runs in-process without MSBuild-only or Xcode-only probe attributes, `--version` line 2 prints `rcmake 0.2.0`, and `--install --strip` skips CMake false `CMAKE_STRIP` values.
+6. **Reproducible archives, in-process `try_compile`, `--version`, and `CMAKE_STRIP`.** Archives record uid 0 and gid 0, `try_compile` runs in-process without MSBuild-only or Xcode-only probe attributes, `--version` line 2 prints `rcmake 0.2.1`, and `--install --strip` skips CMake false `CMAKE_STRIP` values.
 
 Troubleshooting tips cover `type -a cmake` for PATH precedence, `RCMAKE_VENDORED_DATA_ROOT` for `CMAKE_ROOT`, invoking `rcmake` (not `cmake`) for native flags, `rcmake doctor -B <build>` for cache drift, `RCMAKE_PROBE_CACHE=verify` for probe checks, and `rcmake verify` or `RCMAKE_ORACLE_MODE=1` for parity bug triage.
 

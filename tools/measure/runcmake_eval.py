@@ -127,6 +127,14 @@ CASE_RESULT = re.compile(
     r"(?P<detail>(?:^[ \t].*\n|^\n)*)",
     re.MULTILINE,
 )
+CHECK_SCRIPT_ERROR = re.compile(
+    r"^CMake Error at (?P<location>.+?):\n"
+    r"(?P<body>(?:^[ \t].*\n|^\n)*)"
+    r"^Call Stack \(most recent call first\):\n"
+    r"(?P<stack>(?:^[ \t].*\n)+)",
+    re.MULTILINE,
+)
+CHECK_SCRIPT_FRAME = re.compile(r"[/\\]RunCMake\.cmake:\d+ \(include\)\s*$", re.MULTILINE)
 
 RUN_CMAKE_SKIP = re.compile(
     r"^-- (?P<name>.+?)(?: - | )(?:All checks )?SKIPPED\b(?P<reason>.*)$",
@@ -476,18 +484,54 @@ def case_results(code, timed_out, log):
     """Read the case messages and detect errors in the upstream driver."""
     cases = {}
     occurrences = Counter()
-    for match in CASE_RESULT.finditer(log):
+    case_matches = list(CASE_RESULT.finditer(log))
+    case_spans = [(m.start(), m.end()) for m in case_matches]
+
+    def overlaps_case(start, end):
+        return any(start < c_end and end > c_start for c_start, c_end in case_spans)
+
+    check_errors_by_case = defaultdict(list)
+    consumed_spans = list(case_spans)
+    for err in CHECK_SCRIPT_ERROR.finditer(log):
+        if overlaps_case(err.start(), err.end()) or not CHECK_SCRIPT_FRAME.search(err["stack"]):
+            continue
+        next_case = next((idx for idx, m in enumerate(case_matches) if m.start() >= err.end()), None)
+        if next_case is None:
+            continue
+        body = "\n".join(line.removeprefix("  ") for line in err["body"].rstrip().splitlines())
+        snippet = f"CMake Error at {err['location']}:\n{body}" if body else f"CMake Error at {err['location']}:"
+        check_errors_by_case[next_case].append(snippet)
+        consumed_spans.append((err.start(), err.end()))
+
+    for idx, match in enumerate(case_matches):
         name = match["passed"] or match["failed"]
         occurrences[name] += 1
+        extra_errors = check_errors_by_case.get(idx)
+        detail_parts = []
+        raw_detail = "\n".join(
+            line.removeprefix("  ") for line in (match["detail"] or "").rstrip().splitlines()
+        )
+        if raw_detail:
+            detail_parts.append(raw_detail)
+        if extra_errors:
+            detail_parts.extend(extra_errors)
         cases[name, occurrences[name]] = {
-            "passed": match["passed"] is not None,
-            "detail": "\n".join(
-                line.removeprefix("  ") for line in (match["detail"] or "").rstrip().splitlines()
-            ),
+            "passed": match["passed"] is not None and not extra_errors,
+            "detail": "\n\n".join(detail_parts),
         }
+
+    consumed_spans.sort()
+    pieces, cursor = [], 0
+    for start, end in consumed_spans:
+        if start > cursor:
+            pieces.append(log[cursor:start])
+        cursor = max(cursor, end)
+    pieces.append(log[cursor:])
+    remainder = "".join(pieces)
+
     complete = COMPLETE in log.splitlines() and code in (0, 1) and not timed_out
     other_errors, skips = [], []
-    for line in CASE_RESULT.sub("", log).splitlines():
+    for line in remainder.splitlines():
         if line.startswith(("CMake Error", "CMake Internal Error")):
             other_errors.append(line)
         match = RUN_CMAKE_SKIP.fullmatch(line) or CTEST_SKIP.fullmatch(line)

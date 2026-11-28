@@ -1,136 +1,145 @@
 {
   "$schema": "./dashboard.schema.json",
   "schemaVersion": 1,
-  "generatedAt": "2026-11-27T15:13:31Z",
-  "commit": "70c2331346761105d3a608a8acb4e31c75311564",
-  "rcmakeVersion": "0.2.0",
+  "generatedAt": "2026-11-28T05:02:16Z",
+  "commit": "2a16da12e77c7d0c982fbe075db05873b9785e9e",
+  "rcmakeVersion": "0.2.1",
   "targetCmakeVersion": "4.5.1",
   "statusNote": "CI reports 6 of 6 completed runs as successful. Open runs total 0.",
   "tracks": {
     "coreConformance": {
       "label": "Core suites",
-      "status": "pending",
+      "status": "fail",
       "suitesTotal": 62,
-      "suitesAt100": null,
-      "casesPassed": null,
-      "casesTotal": null,
-      "passRate": null,
-      "note": "Pending verification for this commit.",
+      "suitesAt100": 46,
+      "casesPassed": 8539,
+      "casesTotal": 8748,
+      "passRate": 97.61,
+      "note": "Case counts include each reported OS run of a matching suite.",
       "highlights": [
         {
           "suite": "CommandLine",
-          "passed": null,
-          "total": null,
-          "status": "pending"
+          "passed": 1168,
+          "total": 1196,
+          "status": "fail"
         },
         {
           "suite": "CMakePresets",
-          "passed": null,
-          "total": null,
-          "status": "pending"
+          "passed": 620,
+          "total": 628,
+          "status": "fail"
         },
         {
           "suite": "CTestCommandLine",
-          "passed": null,
-          "total": null,
-          "status": "pending"
+          "passed": 580,
+          "total": 606,
+          "status": "fail"
         },
         {
           "suite": "CPack",
-          "passed": null,
-          "total": null,
-          "status": "pending"
+          "passed": 1012,
+          "total": 1027,
+          "status": "fail"
         },
         {
           "suite": "CommandLineTar",
-          "passed": null,
-          "total": null,
-          "status": "pending"
+          "passed": 182,
+          "total": 182,
+          "status": "pass"
         },
         {
           "suite": "File_Archive",
-          "passed": null,
-          "total": null,
-          "status": "pending"
+          "passed": 130,
+          "total": 130,
+          "status": "pass"
         },
         {
           "suite": "Instrumentation",
-          "passed": null,
-          "total": null,
-          "status": "pending"
+          "passed": 311,
+          "total": 324,
+          "status": "fail"
         },
         {
           "suite": "SarifOutput",
-          "passed": null,
-          "total": null,
-          "status": "pending"
+          "passed": 14,
+          "total": 14,
+          "status": "pass"
         },
         {
           "suite": "cmake_language",
-          "passed": null,
-          "total": null,
-          "status": "pending"
+          "passed": 364,
+          "total": 364,
+          "status": "pass"
         },
         {
           "suite": "GoogleTest",
-          "passed": null,
-          "total": null,
-          "status": "pending"
+          "passed": 359,
+          "total": 360,
+          "status": "fail"
         }
       ]
     },
     "policies": {
       "label": "Policies (CMP0066-CMP0226)",
-      "status": "pending",
+      "status": "fail",
       "baselineAlwaysNew": "CMP0000-CMP0065",
       "activeRange": "CMP0066-CMP0226",
       "suitesTotal": 35,
-      "suitesPassed": null,
-      "casesPassed": null,
-      "casesTotal": null,
-      "passRate": null,
-      "note": "Pending verification for this commit."
+      "suitesPassed": 30,
+      "casesPassed": 911,
+      "casesTotal": 932,
+      "passRate": 97.75,
+      "note": "Case counts include each reported OS run of a matching suite."
     },
     "runCmakeOs": {
       "label": "Tests/RunCMake by OS",
-      "status": "pending",
-      "note": "Pending verification for this commit.",
+      "status": "fail",
+      "note": "Results from the OS reports.",
       "platforms": [
         {
           "id": "macos-arm64",
           "name": "macOS arm64",
           "toolchain": "AppleClang + Ninja, Unix Makefiles, Xcode",
           "suitesTotal": 371,
-          "suitesPassed": null,
-          "casesPassed": null,
-          "casesTotal": null,
-          "passRate": null,
-          "status": "pending",
-          "note": "Pending verification for this commit."
+          "suitesPassed": 348,
+          "casesPassed": 9641,
+          "casesTotal": 9706,
+          "passRate": 99.33,
+          "status": "pass",
+          "note": "Full OS report: 371 suites completed (minimum 371).",
+          "expectedSuites": 371,
+          "completedSuites": 371,
+          "partial": false
         },
         {
           "id": "linux-x86_64",
           "name": "Linux x86_64",
           "toolchain": "GCC + Clang + Ninja, Unix Makefiles",
           "suitesTotal": 362,
-          "suitesPassed": null,
-          "casesPassed": null,
-          "casesTotal": null,
-          "passRate": null,
-          "status": "pending",
-          "note": "Pending verification for this commit."
+          "suitesPassed": 341,
+          "casesPassed": 9310,
+          "casesTotal": 9373,
+          "passRate": 99.33,
+          "status": "pass",
+          "note": "Full OS report: 362 suites completed (minimum 362).",
+          "expectedSuites": 362,
+          "completedSuites": 362,
+          "partial": false
         },
         {
           "id": "windows-x86_64",
           "name": "Windows x86_64",
           "toolchain": "MSVC with Ninja and Visual Studio 17 and 18",
           "suitesTotal": 367,
-          "suitesPassed": null,
-          "casesPassed": null,
-          "casesTotal": null,
-          "passRate": null,
-          "status": "pending",
-          "note": "Pending verification for this commit."
+          "suitesPassed": 68,
+          "casesPassed": 2401,
+          "casesTotal": 2692,
+          "passRate": 89.19,
+          "status": "fail",
+          "note": "Partial OS report: 122 of 367 expected suites completed.",
+          "expectedSuites": 367,
+          "completedSuites": 122,
+          "partial": true
         }
       ]
     },
@@ -138,8 +147,8 @@
       "label": "Large projects",
       "status": "fail",
       "projectsTotal": 10,
-      "l1Passed": 0,
-      "l2Passed": 7,
+      "l1Passed": 2,
+      "l2Passed": 10,
       "note": "L1 compares configure output. L2 compares Ninja dry-run commands. L3 builds targets. L4 runs tests and install checks.",
       "projects": [
         {
@@ -151,7 +160,7 @@
             "duckdb",
             "shell"
           ],
-          "l1": "fail",
+          "l1": "pass",
           "l2": "pass",
           "l3": "pending",
           "l4": "pending"
@@ -166,8 +175,8 @@
             "opencv_imgproc",
             "opencv_imgcodecs"
           ],
-          "l1": "fail",
-          "l2": "fail",
+          "l1": "pass",
+          "l2": "pass",
           "l3": "pending",
           "l4": "pending"
         },
@@ -208,7 +217,7 @@
             "clang"
           ],
           "l1": "fail",
-          "l2": "fail",
+          "l2": "pass",
           "l3": "pending",
           "l4": "pending"
         },
@@ -273,7 +282,7 @@
             "blender"
           ],
           "l1": "fail",
-          "l2": "fail",
+          "l2": "pass",
           "l3": "pending",
           "l4": "pending"
         }
@@ -285,9 +294,9 @@
       "label": "Blind holdout (240 sealed repositories)",
       "sealed": true,
       "status": "fail",
-      "reposTotal": 67,
-      "reposPassed": 18,
-      "passRate": 26.87,
+      "reposTotal": 79,
+      "reposPassed": 31,
+      "passRate": 39.24,
       "policy": "Blind holdout corpus. Individual repository identities are never published, and only aggregate pass rates and category counts are reported.",
       "note": "Repository counts from the blind holdout report.",
       "categories": [
@@ -336,615 +345,746 @@
       ],
       "levelPassRates": {
         "L1": {
-          "passed": 18,
-          "eligible": 67,
-          "passRate": 26.87
+          "passed": 31,
+          "eligible": 79,
+          "passRate": 39.24
         }
       },
       "failureCategories": {
-        "find-module": 3,
-        "generator": 38,
-        "oracle-red": 131,
-        "policy": 8,
+        "configure": 3,
+        "find-module": 1,
+        "generator": 34,
+        "oracle-red": 151,
+        "policy": 10,
         "source": 2,
-        "timeout": 10
+        "timeout": 8
       }
     },
     "vcpkgMatrix": {
       "label": "vcpkg CMake port comparisons (64 shards)",
-      "status": "pending",
+      "status": "fail",
       "shardsTotal": 64,
-      "shardsCompleted": 0,
-      "shardsPassed": null,
-      "portsTotal": null,
-      "portsPassed": null,
-      "passRate": null,
-      "note": "Pending verification for this commit.",
+      "shardsCompleted": 64,
+      "shardsPassed": 34,
+      "portsTotal": 1529,
+      "portsPassed": 1488,
+      "passRate": 97.32,
+      "note": "The pass rate uses 1,529 scored CMake ports. 2,621 / 2,621 expected ports inspected in the reported shards.",
       "shards": [
         {
           "shard": 0,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 24,
+          "portsPassed": 24,
+          "portsFailed": 0,
+          "durationSeconds": 4159.378,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 1,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 19,
+          "portsPassed": 18,
+          "portsFailed": 1,
+          "durationSeconds": 5493.109,
+          "note": "19 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 2,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 27,
+          "portsPassed": 26,
+          "portsFailed": 1,
+          "durationSeconds": 4011.758,
+          "note": "27 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 3,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 23,
+          "portsPassed": 23,
+          "portsFailed": 0,
+          "durationSeconds": 4806.262,
+          "note": "23 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 4,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 24,
+          "portsPassed": 24,
+          "portsFailed": 0,
+          "durationSeconds": 3030.169,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 5,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 24,
+          "portsPassed": 23,
+          "portsFailed": 1,
+          "durationSeconds": 5380.554,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 6,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 20,
+          "portsPassed": 20,
+          "portsFailed": 0,
+          "durationSeconds": 4520.016,
+          "note": "20 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 7,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 17,
+          "portsPassed": 17,
+          "portsFailed": 0,
+          "durationSeconds": 5126.692,
+          "note": "17 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 8,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 18,
+          "portsPassed": 17,
+          "portsFailed": 1,
+          "durationSeconds": 4659.455,
+          "note": "18 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 9,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 24,
+          "portsPassed": 24,
+          "portsFailed": 0,
+          "durationSeconds": 5082.66,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 10,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 25,
+          "portsPassed": 25,
+          "portsFailed": 0,
+          "durationSeconds": 4939.401,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 11,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 28,
+          "portsPassed": 28,
+          "portsFailed": 0,
+          "durationSeconds": 4426.017,
+          "note": "28 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 12,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 23,
+          "portsPassed": 23,
+          "portsFailed": 0,
+          "durationSeconds": 3670.103,
+          "note": "23 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 13,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 21,
+          "portsPassed": 21,
+          "portsFailed": 0,
+          "durationSeconds": 6175.09,
+          "note": "21 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 14,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 26,
+          "portsPassed": 26,
+          "portsFailed": 0,
+          "durationSeconds": 4903.254,
+          "note": "26 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 15,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 22,
+          "portsPassed": 22,
+          "portsFailed": 0,
+          "durationSeconds": 4592.984,
+          "note": "22 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 16,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 25,
+          "portsPassed": 25,
+          "portsFailed": 0,
+          "durationSeconds": 2782.246,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 17,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 20,
+          "portsPassed": 20,
+          "portsFailed": 0,
+          "durationSeconds": 5265.646,
+          "note": "20 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 18,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 24,
+          "portsPassed": 23,
+          "portsFailed": 1,
+          "durationSeconds": 4670.773,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 19,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 28,
+          "portsPassed": 28,
+          "portsFailed": 0,
+          "durationSeconds": 2787.768,
+          "note": "28 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 20,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 17,
+          "portsPassed": 17,
+          "portsFailed": 0,
+          "durationSeconds": 4759.62,
+          "note": "17 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 21,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 24,
+          "portsPassed": 24,
+          "portsFailed": 0,
+          "durationSeconds": 2911.793,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 22,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 25,
+          "portsPassed": 25,
+          "portsFailed": 0,
+          "durationSeconds": 3465.981,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 23,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 27,
+          "portsPassed": 27,
+          "portsFailed": 0,
+          "durationSeconds": 2716.845,
+          "note": "27 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 24,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 25,
+          "portsPassed": 25,
+          "portsFailed": 0,
+          "durationSeconds": 2845.505,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 25,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 20,
+          "portsPassed": 19,
+          "portsFailed": 1,
+          "durationSeconds": 3698.136,
+          "note": "20 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 26,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 25,
+          "portsPassed": 24,
+          "portsFailed": 1,
+          "durationSeconds": 3837.111,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 27,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 24,
+          "portsPassed": 23,
+          "portsFailed": 1,
+          "durationSeconds": 4242.381,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 28,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 30,
+          "portsPassed": 30,
+          "portsFailed": 0,
+          "durationSeconds": 3418.119,
+          "note": "30 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 29,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 26,
+          "portsPassed": 24,
+          "portsFailed": 2,
+          "durationSeconds": 5321.2,
+          "note": "26 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 30,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 25,
+          "portsPassed": 24,
+          "portsFailed": 1,
+          "durationSeconds": 5151.403,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 31,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 24,
+          "portsPassed": 23,
+          "portsFailed": 1,
+          "durationSeconds": 4964.466,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 32,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 29,
+          "portsPassed": 28,
+          "portsFailed": 1,
+          "durationSeconds": 4396.644,
+          "note": "29 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 33,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 23,
+          "portsPassed": 21,
+          "portsFailed": 2,
+          "durationSeconds": 5863.555,
+          "note": "23 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 34,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 19,
+          "portsPassed": 18,
+          "portsFailed": 1,
+          "durationSeconds": 2919.529,
+          "note": "19 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 35,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 25,
+          "portsPassed": 24,
+          "portsFailed": 1,
+          "durationSeconds": 5277.97,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 36,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 23,
+          "portsPassed": 22,
+          "portsFailed": 1,
+          "durationSeconds": 4482.752,
+          "note": "23 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 37,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 25,
+          "portsPassed": 23,
+          "portsFailed": 2,
+          "durationSeconds": 3795.636,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 38,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 25,
+          "portsPassed": 24,
+          "portsFailed": 1,
+          "durationSeconds": 4860.494,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 39,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 31,
+          "portsPassed": 30,
+          "portsFailed": 1,
+          "durationSeconds": 2509.994,
+          "note": "31 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 40,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 23,
+          "portsPassed": 22,
+          "portsFailed": 1,
+          "durationSeconds": 5273.175,
+          "note": "23 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 41,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 29,
+          "portsPassed": 27,
+          "portsFailed": 2,
+          "durationSeconds": 4416.484,
+          "note": "29 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 42,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 24,
+          "portsPassed": 22,
+          "portsFailed": 2,
+          "durationSeconds": 4071.87,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 43,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 25,
+          "portsPassed": 23,
+          "portsFailed": 2,
+          "durationSeconds": 5072.462,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 44,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 25,
+          "portsPassed": 23,
+          "portsFailed": 2,
+          "durationSeconds": 5078.629,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 45,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 27,
+          "portsPassed": 27,
+          "portsFailed": 0,
+          "durationSeconds": 3581.491,
+          "note": "27 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 46,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 25,
+          "portsPassed": 25,
+          "portsFailed": 0,
+          "durationSeconds": 5192.717,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 47,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 19,
+          "portsPassed": 19,
+          "portsFailed": 0,
+          "durationSeconds": 5558.005,
+          "note": "19 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 48,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 22,
+          "portsPassed": 22,
+          "portsFailed": 0,
+          "durationSeconds": 4217.994,
+          "note": "22 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 49,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 25,
+          "portsPassed": 23,
+          "portsFailed": 2,
+          "durationSeconds": 4606.08,
+          "note": "25 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 50,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 24,
+          "portsPassed": 23,
+          "portsFailed": 1,
+          "durationSeconds": 5249.146,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 51,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 23,
+          "portsPassed": 23,
+          "portsFailed": 0,
+          "durationSeconds": 4168.101,
+          "note": "23 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 52,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 29,
+          "portsPassed": 27,
+          "portsFailed": 2,
+          "durationSeconds": 4215.264,
+          "note": "29 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 53,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 30,
+          "portsPassed": 30,
+          "portsFailed": 0,
+          "durationSeconds": 3998.006,
+          "note": "30 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 54,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 29,
+          "portsPassed": 29,
+          "portsFailed": 0,
+          "durationSeconds": 4291.743,
+          "note": "29 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 55,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 29,
+          "portsPassed": 29,
+          "portsFailed": 0,
+          "durationSeconds": 5432.014,
+          "note": "29 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 56,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 24,
+          "portsPassed": 23,
+          "portsFailed": 1,
+          "durationSeconds": 4137.923,
+          "note": "24 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 57,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 20,
+          "portsPassed": 20,
+          "portsFailed": 0,
+          "durationSeconds": 3942.602,
+          "note": "20 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 58,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 16,
+          "portsPassed": 16,
+          "portsFailed": 0,
+          "durationSeconds": 4681.632,
+          "note": "16 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 59,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 19,
+          "portsPassed": 17,
+          "portsFailed": 2,
+          "durationSeconds": 3995.436,
+          "note": "19 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 60,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 20,
+          "portsPassed": 20,
+          "portsFailed": 0,
+          "durationSeconds": 5700.302,
+          "note": "20 scored CMake ports. 41 / 41 expected ports inspected.",
+          "portsInspected": 41,
+          "portsExpected": 41
         },
         {
           "shard": 61,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 24,
+          "portsPassed": 24,
+          "portsFailed": 0,
+          "durationSeconds": 3696.73,
+          "note": "24 scored CMake ports. 40 / 40 expected ports inspected.",
+          "portsInspected": 40,
+          "portsExpected": 40
         },
         {
           "shard": 62,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "pass",
+          "portsTotal": 20,
+          "portsPassed": 20,
+          "portsFailed": 0,
+          "durationSeconds": 5819.634,
+          "note": "20 scored CMake ports. 40 / 40 expected ports inspected.",
+          "portsInspected": 40,
+          "portsExpected": 40
         },
         {
           "shard": 63,
-          "status": "pending",
-          "portsTotal": null,
-          "portsPassed": null,
-          "portsFailed": null,
-          "durationSeconds": null,
-          "note": "Pending verification for this commit."
+          "status": "fail",
+          "portsTotal": 24,
+          "portsPassed": 22,
+          "portsFailed": 2,
+          "durationSeconds": 4652.875,
+          "note": "24 scored CMake ports. 40 / 40 expected ports inspected.",
+          "portsInspected": 40,
+          "portsExpected": 40
         }
-      ]
+      ],
+      "portsInspected": 2621,
+      "portsExpected": 2621
     },
     "benchmarksAndGates": {
       "label": "Benchmarks and soundness gates",
       "benchmarks": {
         "warmProbeSpeedup": {
           "label": "New tree, shared probe cache",
-          "value": 5.7,
+          "value": 5.42,
           "unit": "x",
           "baseline": "vs CMake 4.5.1 new build tree (CMake has no cross-tree probe cache)",
           "status": "pass",
@@ -952,7 +1092,7 @@
         },
         "incrementalLeafP95Ms": {
           "label": "Leaf edit reconfigure (p95)",
-          "value": 59.792833984829485,
+          "value": 82.51679199747741,
           "unit": "ms",
           "baseline": "single-file change replay",
           "status": "pass",
@@ -960,7 +1100,7 @@
         },
         "coldConfigureSpeedup": {
           "label": "Cold 500-target configure (empty probe cache)",
-          "value": 1.9571500671751603,
+          "value": 2.130958394065779,
           "unit": "x",
           "baseline": "vs CMake 4.5.1, synthetic 500-library C project",
           "status": "pass",
@@ -968,7 +1108,7 @@
         },
         "peakRssMiB": {
           "label": "500-target peak RSS",
-          "value": 135.2,
+          "value": 140.6,
           "unit": "MiB",
           "baseline": "native release binary, cold configure",
           "status": "pass",
@@ -1051,11 +1191,11 @@
         {
           "id": "conan-ecosystem",
           "label": "Conan Ecosystem",
-          "status": "fail",
-          "passed": 0,
+          "status": "pass",
+          "passed": 2,
           "total": 2,
-          "failures": 2,
-          "summary": "0 / 2 checks passed",
+          "failures": 0,
+          "summary": "2 / 2 checks passed",
           "detail": "Counts include the ecosystem scenarios that ran."
         }
       ],
@@ -1064,16 +1204,16 @@
         "status": "pass",
         "runs": 3,
         "reproducer": "python3 tools/measure/bench_giants.py --projects duckdb,opencv,protobuf,qtbase,llvm-project --runs 3",
-        "generatedAt": "2026-11-27T14:06:32Z",
+        "generatedAt": "2026-11-27T23:03:49Z",
         "summary": {
           "projectsTotal": 5,
           "projectsPassed": 5,
-          "coldSpeedupGeomean": 0.98,
-          "warmProbeSpeedupGeomean": 1.26,
-          "incrementalLeafSpeedupGeomean": 1.1,
-          "incrementalLeafMaxP95Ms": 7656.4,
-          "rcmakeMaxPeakRssMiB": 393.14,
-          "cmakeMaxPeakRssMiB": 391.31
+          "coldSpeedupGeomean": 1.06,
+          "warmProbeSpeedupGeomean": 1.36,
+          "incrementalLeafSpeedupGeomean": 1.09,
+          "incrementalLeafMaxP95Ms": 12427.77,
+          "rcmakeMaxPeakRssMiB": 391.36,
+          "cmakeMaxPeakRssMiB": 392.33
         },
         "projects": [
           {
@@ -1082,28 +1222,28 @@
             "version": "v1.3.2",
             "status": "pass",
             "cold": {
-              "cmakeMedianMs": 1713.83,
-              "rcmakeMedianMs": 2079.73,
-              "speedup": 0.82,
-              "cmakePeakRssMiB": 73.02,
-              "rcmakePeakRssMiB": 94.02
+              "cmakeMedianMs": 2293.15,
+              "rcmakeMedianMs": 2265.67,
+              "speedup": 1.01,
+              "cmakePeakRssMiB": 73.2,
+              "rcmakePeakRssMiB": 90.45
             },
             "warmProbe": {
-              "cmakeMedianMs": 1709.63,
-              "rcmakeMedianMs": 1602.23,
-              "speedup": 1.07,
-              "cmakePeakRssMiB": 72.88,
-              "rcmakePeakRssMiB": 94.05,
+              "cmakeMedianMs": 1978.12,
+              "rcmakeMedianMs": 1511.46,
+              "speedup": 1.31,
+              "cmakePeakRssMiB": 73.16,
+              "rcmakePeakRssMiB": 89.27,
               "probeCacheHits": null,
               "probeCacheMisses": 0
             },
             "incrementalLeaf": {
-              "cmakeMedianMs": 862.47,
-              "rcmakeMedianMs": 885.4,
-              "rcmakeP95Ms": 885.83,
-              "speedup": 0.97,
-              "cmakePeakRssMiB": 69.25,
-              "rcmakePeakRssMiB": 90.25,
+              "cmakeMedianMs": 957.23,
+              "rcmakeMedianMs": 867.32,
+              "rcmakeP95Ms": 963.59,
+              "speedup": 1.1,
+              "cmakePeakRssMiB": 69.22,
+              "rcmakePeakRssMiB": 86.06,
               "leafFile": "extension/core_functions/aggregate/algebraic/CMakeLists.txt"
             }
           },
@@ -1113,28 +1253,28 @@
             "version": "4.12.0",
             "status": "pass",
             "cold": {
-              "cmakeMedianMs": 23502.07,
-              "rcmakeMedianMs": 16516.57,
-              "speedup": 1.42,
-              "cmakePeakRssMiB": 179.56,
-              "rcmakePeakRssMiB": 179.53
+              "cmakeMedianMs": 29932.97,
+              "rcmakeMedianMs": 20322.21,
+              "speedup": 1.47,
+              "cmakePeakRssMiB": 179.55,
+              "rcmakePeakRssMiB": 179.58
             },
             "warmProbe": {
-              "cmakeMedianMs": 23964.48,
-              "rcmakeMedianMs": 16751.43,
-              "speedup": 1.43,
-              "cmakePeakRssMiB": 179.84,
-              "rcmakePeakRssMiB": 179.58,
+              "cmakeMedianMs": 27784.57,
+              "rcmakeMedianMs": 18576.24,
+              "speedup": 1.5,
+              "cmakePeakRssMiB": 179.56,
+              "rcmakePeakRssMiB": 179.38,
               "probeCacheHits": null,
               "probeCacheMisses": 0
             },
             "incrementalLeaf": {
-              "cmakeMedianMs": 2414.64,
-              "rcmakeMedianMs": 1384.28,
-              "rcmakeP95Ms": 2399.53,
-              "speedup": 1.74,
-              "cmakePeakRssMiB": 179.48,
-              "rcmakePeakRssMiB": 179.53,
+              "cmakeMedianMs": 3048.87,
+              "rcmakeMedianMs": 1505.89,
+              "rcmakeP95Ms": 4218.67,
+              "speedup": 2.02,
+              "cmakePeakRssMiB": 179.53,
+              "rcmakePeakRssMiB": 179.42,
               "leafFile": "3rdparty/libjpeg-turbo/simd/CMakeLists.txt"
             }
           },
@@ -1144,28 +1284,28 @@
             "version": "v36.2",
             "status": "pass",
             "cold": {
-              "cmakeMedianMs": 1373.44,
-              "rcmakeMedianMs": 1667.65,
-              "speedup": 0.82,
-              "cmakePeakRssMiB": 43.72,
-              "rcmakePeakRssMiB": 59.22
+              "cmakeMedianMs": 1485.18,
+              "rcmakeMedianMs": 1726.97,
+              "speedup": 0.86,
+              "cmakePeakRssMiB": 43.58,
+              "rcmakePeakRssMiB": 55.39
             },
             "warmProbe": {
-              "cmakeMedianMs": 1365.95,
-              "rcmakeMedianMs": 1338.74,
-              "speedup": 1.02,
-              "cmakePeakRssMiB": 43.75,
-              "rcmakePeakRssMiB": 63.52,
+              "cmakeMedianMs": 1487.76,
+              "rcmakeMedianMs": 928.68,
+              "speedup": 1.6,
+              "cmakePeakRssMiB": 43.67,
+              "rcmakePeakRssMiB": 57.03,
               "probeCacheHits": null,
               "probeCacheMisses": 0
             },
             "incrementalLeaf": {
-              "cmakeMedianMs": 262.83,
-              "rcmakeMedianMs": 320.15,
-              "rcmakeP95Ms": 344.66,
-              "speedup": 0.82,
-              "cmakePeakRssMiB": 24.03,
-              "rcmakePeakRssMiB": 52.55,
+              "cmakeMedianMs": 282.22,
+              "rcmakeMedianMs": 370.36,
+              "rcmakeP95Ms": 375.68,
+              "speedup": 0.76,
+              "cmakePeakRssMiB": 24.0,
+              "rcmakePeakRssMiB": 40.58,
               "leafFile": "third_party/utf8_range/CMakeLists.txt"
             }
           },
@@ -1175,28 +1315,28 @@
             "version": "v6.8.3",
             "status": "pass",
             "cold": {
-              "cmakeMedianMs": 21912.49,
-              "rcmakeMedianMs": 21969.0,
-              "speedup": 1.0,
-              "cmakePeakRssMiB": 251.12,
-              "rcmakePeakRssMiB": 274.91
+              "cmakeMedianMs": 25088.04,
+              "rcmakeMedianMs": 23286.14,
+              "speedup": 1.08,
+              "cmakePeakRssMiB": 252.27,
+              "rcmakePeakRssMiB": 295.78
             },
             "warmProbe": {
-              "cmakeMedianMs": 21348.43,
-              "rcmakeMedianMs": 18014.55,
-              "speedup": 1.19,
-              "cmakePeakRssMiB": 250.95,
-              "rcmakePeakRssMiB": 273.75,
+              "cmakeMedianMs": 23839.33,
+              "rcmakeMedianMs": 26347.51,
+              "speedup": 0.9,
+              "cmakePeakRssMiB": 251.81,
+              "rcmakePeakRssMiB": 297.12,
               "probeCacheHits": null,
               "probeCacheMisses": 0
             },
             "incrementalLeaf": {
-              "cmakeMedianMs": 10190.08,
-              "rcmakeMedianMs": 7645.19,
-              "rcmakeP95Ms": 7656.4,
-              "speedup": 1.33,
-              "cmakePeakRssMiB": 241.25,
-              "rcmakePeakRssMiB": 267.19,
+              "cmakeMedianMs": 11488.09,
+              "rcmakeMedianMs": 11910.66,
+              "rcmakeP95Ms": 12427.77,
+              "speedup": 0.96,
+              "cmakePeakRssMiB": 242.45,
+              "rcmakePeakRssMiB": 289.0,
               "leafFile": "cmake/QtBuildInternals/QtStandaloneTestTemplateProject/CMakeLists.txt"
             }
           },
@@ -1206,28 +1346,28 @@
             "version": "llvmorg-20.1.8",
             "status": "pass",
             "cold": {
-              "cmakeMedianMs": 21077.62,
-              "rcmakeMedianMs": 21710.58,
-              "speedup": 0.97,
-              "cmakePeakRssMiB": 391.31,
-              "rcmakePeakRssMiB": 393.14
+              "cmakeMedianMs": 24864.89,
+              "rcmakeMedianMs": 25226.07,
+              "speedup": 0.99,
+              "cmakePeakRssMiB": 392.33,
+              "rcmakePeakRssMiB": 385.56
             },
             "warmProbe": {
-              "cmakeMedianMs": 23532.25,
-              "rcmakeMedianMs": 13928.46,
-              "speedup": 1.69,
-              "cmakePeakRssMiB": 391.3,
-              "rcmakePeakRssMiB": 390.83,
+              "cmakeMedianMs": 23325.12,
+              "rcmakeMedianMs": 14151.39,
+              "speedup": 1.65,
+              "cmakePeakRssMiB": 391.42,
+              "rcmakePeakRssMiB": 391.36,
               "probeCacheHits": null,
               "probeCacheMisses": 0
             },
             "incrementalLeaf": {
-              "cmakeMedianMs": 6209.07,
-              "rcmakeMedianMs": 7003.49,
-              "rcmakeP95Ms": 7214.22,
-              "speedup": 0.89,
-              "cmakePeakRssMiB": 383.52,
-              "rcmakePeakRssMiB": 385.22,
+              "cmakeMedianMs": 6832.63,
+              "rcmakeMedianMs": 7130.15,
+              "rcmakeP95Ms": 9187.83,
+              "speedup": 0.96,
+              "cmakePeakRssMiB": 382.5,
+              "rcmakePeakRssMiB": 374.19,
               "leafFile": "benchmarks/CMakeLists.txt"
             }
           }
@@ -1253,18 +1393,14 @@
       }
     }
   },
-  "releaseSha": "70c2331346761105d3a608a8acb4e31c75311564",
-  "binarySha256": "fb653e67257ca1a36337fdb6d57a00f015e444a7d49ae248c78502a7328c4460",
+  "releaseSha": "2a16da12e77c7d0c982fbe075db05873b9785e9e",
+  "binarySha256": "65dd838bc16209894c636d45839bc2e379f9fee8424f7972e2d17b8658a1b8fd",
   "knownParityGaps": [
-    "Full RunCMake on Linux, macOS, and Windows and the 64-shard vcpkg matrix were still running in GitHub Actions ecosystem run 46013031088 at the v0.2.0 tag cutoff, while Linux extended conformance passed 495 of 496 cases (99.80 percent) and CLI conformance, Qt 6 AUTOGEN, and Linux T2 toolchains passed.",
-    "All 10 large C++ projects configured cleanly with matching dry-runs and diagnostics, and 7 of 10 passed strict L2 parity (duckdb, vtk, qtbase, rclcpp, boost, pytorch, and kcoreaddons, up from 1 of 10 in v0.1.0), while Linux CI strict L1 cache diffing failed because ecosystem.yml omitted the ccmake symlink from Linux staging.",
-    "Conan fixtures passed all 6 stages including build and ctest with byte-identical package config and targets files and passing IDE compile_commands checks, while strict raw file diffs remained on CMakeCache.txt, build.ninja, rules.ninja, and compile_commands.json.",
-    "The sealed 240-repository unseen holdout on macOS arm64 completed 210 of 240 repositories across 5 shards before cutoff and passed 18 of 67 oracle-green repositories at strict L1 parity (26.87 percent, up from 0 of 74 in v0.1.0), with 131 oracle-red repositories, 10 timeouts, 2 source errors, and 49 L1 differences (38 generator, 8 policy, and 3 find-module).",
-    "Quiet-host benchmarks passed the synthetic incremental leaf gate at 59.79 ms p95 (2.24x faster than CMake 4.5.1), 5.70x warm probe cache, 1.96x 500-target cold configure, and 1.26x warm giant geomean across all 5 giants, while cold configure on small synthetic projects and cold duckdb, protobuf, and llvm-project remained between 0.82x and 0.97x and determinism.py passed all output comparisons while observing no overlapping parallel probe workers."
+    "Full RunCMake passed 9,310 of 9,373 cases (99.33 percent) across all 362 Linux suites with zero incomplete suites and 496 of 496 (100 percent) on Linux extended conformance, and passed 9,641 of 9,706 cases (99.33 percent) across all 371 macOS suites with zero incomplete suites after fixing RunCMake check-script SEND_ERROR attribution on the verbatim CI log (cross-checked locally on Apple Silicon at 9,641 passes). On Windows, RunCMake shard 3 of 3 completed 122 of 367 suites at 2,401 of 2,692 cases (89.19 percent) with 7 incomplete suites (4 where CMake 4.5.1 itself errored on Windows temp paths plus EnvSbom, InstallSbom, and Ninja), while shards 1 and 2 hit the 168-minute runner timeout before writing JSON and remain tracked for expanded Windows sharding in v0.2.2. All 10 large C++ projects passed strict L2 dry-run parity alongside matching diagnostics and CMakeCache.txt (10 of 10, up from 7 of 10 in v0.2.0), with duckdb and opencv passing full strict L1 and L2 parity while codemodel or edge differences remain on the other 8 projects. All 64 vcpkg shards completed across 2,621 ports with 1,488 of 1,529 observed CMake configures passing (97.32 percent, 41 configure mismatches, 436 non-CMake ports, 656 oracle-blocked ports, and 1,782 vs 1,831 installs). The sealed 240-repository unseen holdout completed all 6 shards at 31 of 79 oracle-green repositories passing strict L1 parity (39.24 percent, up from 26.87 percent in v0.2.0), with 151 oracle-red, 8 timeouts, 2 source errors, and 48 L1 differences (34 generator, 10 policy, 3 configure, and 1 find-module). Quiet-host unloaded benchmarks passed all 5 giants at 1.06x cold geomean, 1.36x warm probe-cache geomean, 1.09x incremental leaf geomean, and 391.4 MiB peak RSS (below CMake 4.5.1 at 392.3 MiB), while cold protobuf (0.86x), cold llvm-project (0.99x), and warm qtbase (0.90x) remain targets for further speedup."
   ],
   "receipt": {
-    "commit": "70c2331346761105d3a608a8acb4e31c75311564",
-    "binarySha256": "fb653e67257ca1a36337fdb6d57a00f015e444a7d49ae248c78502a7328c4460",
-    "binarySizeBytes": 16959248
+    "commit": "2a16da12e77c7d0c982fbe075db05873b9785e9e",
+    "binarySha256": "65dd838bc16209894c636d45839bc2e379f9fee8424f7972e2d17b8658a1b8fd",
+    "binarySizeBytes": 16062544
   }
 }

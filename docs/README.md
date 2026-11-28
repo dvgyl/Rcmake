@@ -1,6 +1,6 @@
 # rcmake documentation
 
-Use this index to find guides, flag references, architecture notes, and verification details for `rcmake` 0.2.0.
+Use this index to find guides, flag references, architecture notes, and verification details for `rcmake` 0.2.1.
 
 ## Contents
 
@@ -54,13 +54,13 @@ Use this index to find guides, flag references, architecture notes, and verifica
 
 ## Architecture and design
 
-- [Architecture](ARCHITECTURE.md). Execution pipeline, resolution layers, all 39 crates, `Host` trait, and native stack guard.
+- [Architecture](ARCHITECTURE.md). Execution pipeline, resolution layers, all 40 crates, `Host` trait, and native stack guard.
   - [Execution pipeline](ARCHITECTURE.md#execution-pipeline)
   - [Workspace crate map](ARCHITECTURE.md#workspace-crate-map)
   - [The `Host` abstraction](ARCHITECTURE.md#the-host-abstraction)
   - [CMake 4.5.1 invariants](ARCHITECTURE.md#cmake-451-invariants)
   - [Native stack use](ARCHITECTURE.md#native-stack-use)
-- [Architecture decision records](ADR.md). 47 ADRs documenting storage, generators, host isolation, replay checkpoints, `ccmake`, DAP, and native tooling.
+- [Architecture decision records](ADR.md). 48 ADRs documenting storage, generators, host isolation, replay checkpoints, `ccmake`, DAP, Windows launcher shims, and native tooling.
 - [Prior art and dependency licence log](PRIOR_ART.md). Vendored CMake 4.5.1 assets, direct Rust dependencies, archive codecs, and Windows libraries.
   - [Vendored third-party assets](PRIOR_ART.md#vendored-third-party-assets)
   - [Direct third-party dependencies](PRIOR_ART.md#direct-third-party-dependencies)

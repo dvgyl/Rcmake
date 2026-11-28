@@ -1,6 +1,6 @@
 # Prior art and dependency licence log
 
-The crate versions and licence expressions below come from the locked Cargo graph for `rcmake` 0.2.0.
+The crate versions and licence expressions below come from the locked Cargo graph for `rcmake` 0.2.1.
 
 ## Contents
 
@@ -65,7 +65,7 @@ Archive feature choices omit `zopfli`, `bumpalo`, and `xattr` from the lockfile.
 
 ## Internal workspace crates
 
-All 39 workspace crates use `MIT OR Apache-2.0` and enforce `#![forbid(unsafe_code)]`. The 35 shared library crates appear in `[workspace.dependencies]` of root `Cargo.toml`, alongside four leaf crates (`rcmake-cli`, `rcmake-harness`, `rcmake-fuzz`, and `rcmake-wasm`).
+All 40 workspace crates use `MIT OR Apache-2.0` and enforce `#![forbid(unsafe_code)]`. The 35 shared library crates appear in `[workspace.dependencies]` of root `Cargo.toml`, alongside five leaf crates (`rcmake-cli`, `rcmake-shim`, `rcmake-harness`, `rcmake-fuzz`, and `rcmake-wasm`).
 
 | Crate | Purpose |
 | --- | --- |
@@ -101,6 +101,7 @@ All 39 workspace crates use `MIT OR Apache-2.0` and enforce `#![forbid(unsafe_co
 | `rcmake-presets` | CMake Presets schema v13 loader and resolver |
 | `rcmake-regex` | KWSys regular expression engine and glob converter |
 | `rcmake-resolve` | Target resolution, transitive usage graphs, CUDA, HIP, Swift, RPATH, and `BuildGraph` lowering |
+| `rcmake-shim` | Tiny dependency-free safe-Rust Windows launcher shim forwarding `cmake`, `ctest`, `cpack`, and `rcmake-lsp` to `rcmake.exe` |
 | `rcmake-store` | Content-addressed probe store, input stamps, GC, and portable exchange |
 | `rcmake-syntax` | Raw-byte listfile parser and lossless concrete token stream |
 | `rcmake-tool-e` | Built-in `cmake -E` utilities and Fortran and Qt tool drivers |

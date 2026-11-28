@@ -160,11 +160,11 @@ rcmake -S . -B build -G "Ninja Multi-Config" --export-compile-commands
 
 ### Terminal cache editor (`ccmake`)
 
-On macOS and Linux, `ccmake` (or `rcmake ccmake`) launches a clean-room safe-Rust terminal cache editor with no `ncurses` dependency. It runs configure (`c`) and generate (`g`) in separate phases over a retained in-process configure session, captures child output in a bounded scrollback buffer, and restores terminal raw mode on exit. See [docs/man/ccmake.1](man/ccmake.1) for all options and key bindings. Windows terminal support is deferred in `0.2.0`.
+On macOS and Linux, `ccmake` (or `rcmake ccmake`) launches a clean-room safe-Rust terminal cache editor with no `ncurses` dependency. It runs configure (`c`) and generate (`g`) in separate phases over a retained in-process configure session, captures child output in a bounded scrollback buffer, and restores terminal raw mode on exit. See [docs/man/ccmake.1](man/ccmake.1) for all options and key bindings. Windows terminal support is deferred in `0.2.1`.
 
 ### Debug Adapter Protocol server (`--debugger`)
 
-On macOS and Linux, `--debugger`, `--debugger-pipe=<path>`, and `--debugger-dap-log=<file>` start a CMake 4.5.1 Debug Adapter Protocol server over a Unix domain socket for configure runs and `-P` scripts. `-E capabilities` reports `"debugger": true` on Unix. Incremental replay turns off automatically whenever a debugger attaches so breakpoints always pause live execution. Windows named-pipe transport is deferred in `0.2.0`.
+On macOS and Linux, `--debugger`, `--debugger-pipe=<path>`, and `--debugger-dap-log=<file>` start a CMake 4.5.1 Debug Adapter Protocol server over a Unix domain socket for configure runs and `-P` scripts. `-E capabilities` reports `"debugger": true` on Unix. Incremental replay turns off automatically whenever a debugger attaches so breakpoints always pause live execution. Windows named-pipe transport is deferred in `0.2.1`.
 
 ## Profiling, hermetic audits, FetchContent lockfiles, and diagnostics
 

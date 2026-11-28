@@ -708,6 +708,17 @@ class AssembleReleaseReceiptsTests(unittest.TestCase):
         write_json(self.receipts / "runcmake-macos.json", make_runcmake_payload(371, head_sha, DIGEST))
         write_json(self.receipts / "path-swap.json", {**ident, "status": "pass", "differences": []})
 
+        # Seed runcmake_windows as pending in the temp copy so the test is independent of live docs.
+        import re
+        self.writeup.write_text(
+            re.sub(
+                r"<!-- METRIC:runcmake_windows -->.*?<!-- /METRIC -->",
+                "<!-- METRIC:runcmake_windows -->pending frozen release run<!-- /METRIC -->",
+                self.writeup.read_text(encoding="utf-8"),
+                count=1,
+            ),
+            encoding="utf-8",
+        )
         partial_res = self.run_script(
             ASSEMBLER_SCRIPT,
             "--receipts-dir", self.receipts,

@@ -1,6 +1,6 @@
 # Architecture
 
-`rcmake` splits into 39 acyclic safe-Rust crates (`#![forbid(unsafe_code)]`) matching the four-stage execution model of CMake 4.5.1, plus clean-room interactive, diagnostic, and language tooling.
+`rcmake` splits into 40 acyclic safe-Rust crates (`#![forbid(unsafe_code)]`) matching the four-stage execution model of CMake 4.5.1, plus clean-room interactive, diagnostic, Windows shim, and language tooling.
 
 ## Contents
 
@@ -107,6 +107,7 @@ The "Depends on" column lists workspace crates only. Every crate except `rcmake-
 | `rcmake-ccmake` | Clean-room Unix terminal cache editor (`ccmake`) with `Terminal` and `CacheDriver` traits, no `ncurses` (ADR-040) | `base`, `model` |
 | `rcmake-dap` | CMake 4.5.1 `--debugger` Debug Adapter Protocol server over Unix domain sockets with bounded frames and nonblocking writer (ADR-041) | `base`, `diag`, `eval`, `host`, `json`, `model` |
 | `rcmake-cli` | Multi-call `rcmake` binary dispatching `cmake`, `ccmake`, `ctest`, `cpack`, `rcmake-lsp`, and native subcommands (`explain`, `diff-config`, `fmt`, `lint`, `verify`, `doctor`, `cache`) | `api`, `archive`, `base`, `buildinfo`, `ccmake`, `commands`, `cpack`, `ctest`, `dap`, `diag`, `eval`, `gen-common`, `gen-make`, `gen-ninja`, `gen-vs` (Windows or `vs-cross`), `gen-xcode` (macOS or `xcode-cross`), `genex`, `host`, `instrument`, `json`, `language-tools`, `lsp`, `model`, `presets`, `resolve`, `store`, `syntax`, `tool-e` |
+| `rcmake-shim` | Tiny dependency-free safe-Rust Windows launcher shim forwarding `cmake.exe`, `ctest.exe`, `cpack.exe`, and `rcmake-lsp.exe` to sibling `rcmake.exe` (ADR-048) | none |
 | `rcmake-api` | In-process `run_configure`, workspace index, provenance, and `explain` queries, compiling to WebAssembly with `--no-default-features` (ADR-023, ADR-024) | `base`, `commands`, `diag`, `eval`, `genex`, `host`, `json`, `model`, `resolve`, `syntax` |
 | `rcmake-lsp` | CMake LSP server sharing `rcmake-language-tools` formatting and 8 lint rules plus optional `eval` snapshot hover and `stdio` binary | `api` (opt), `base`, `diag`, `genex` (opt), `host`, `json`, `language-tools`, `model` (opt), `resolve` (opt), `syntax` |
 | `rcmake-wasm` | Browser playground WASI runtime on `PureHost`, built into `site/wasm/` with no `unsafe` and no `wasm-bindgen` | `api`, `base`, `diag`, `gen-common`, `gen-ninja`, `host`, `json`, `model`, `presets`, `resolve` |
